@@ -6177,8 +6177,11 @@ namespace vmhook
               java_thread*  - current JavaThread* (from r15 on HotSpot x64).
               return_slot*  - pre-allocated slot for the callback to record cancellation
                               and the return value.
+            Returns std::int64_t — the retval is passed back via rax so the trampoline
+            never needs to clobber rbx (the interpreter's own register) to move retval
+            around.
         */
-        using detour_function_t = void(*)(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot*);
+        using detour_function_t = std::int64_t(*)(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot*);
 
         /*
             @brief Type-erased container for method arguments obtained via auto-detection.
@@ -6782,26 +6785,43 @@ namespace vmhook
 #else
                 static constexpr std::int32_t HOOK_SIZE{ 8 };
                 static constexpr std::int32_t JMP_SIZE{ 5 };
+                // Offset within the assembly of the resume-stub's `jmp rel32` instruction.
+                static constexpr std::int32_t JMP_TO_RESUME_OFFSET{ 95 };
+                static constexpr std::int32_t JMP_TO_RESUME_SIZE{ 5 };
+                // Offset of the 8-byte detour function pointer data slot.
+                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 100 };
                 static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
-#if VMHOOK_OS_WINDOWS
-                // ------------------------------------------------------------
-                // Microsoft x64 calling convention trampoline.
-                // Args: rcx, rdx, r8, r9.  Shadow space: 32 bytes.
-                // Caller-saved: rax, rcx, rdx, r8, r9, r10, r11.
-                // ------------------------------------------------------------
-                static constexpr std::int32_t JE_OFFSET{ 0x32 };   // offset of je in assembly
-                static constexpr std::int32_t JE_SIZE{ 6 };
-                static constexpr std::int32_t RESUME_OFFSET{ 0x63 };
-                static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x73 };
-                static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
-                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x78 };
-
-                // Stack layout after the two pushes:
-                //   [rsp+0]  return_slot::cancel  (bool, 1 byte; rest zeroed)
-                //   [rsp+8]  return_slot::retval  (int64_t)
+                // Design overview
+                // ---------------
+                // common_detour now returns std::int64_t.  On return rax holds the
+                // retval (slot->retval if cancel, 0 otherwise).  The cancel flag is
+                // read directly from the stack with `cmp BYTE PTR [rsp], 0` so that
+                // no volatile register is touched, and `lea rsp, [rsp+8]` advances
+                // past the slot without modifying flags.  rbx is never written, which
+                // preserves whatever the JVM interpreter had there at the hook site.
+                //
+                // Two paths after the register restores:
+                //   cancel == 0  →  je jumps to resume_stub (pop rax, then jmp to
+                //                   target+HOOK_SIZE, patched at install time).
+                //   cancel != 0  →  fall-through cancel path uses rax (= retval) and
+                //                   xmm0 as the Java return values, skips original rax,
+                //                   and unwinds the interpreter frame.
+                //
+                // Assembly layout (byte offsets):
+                //   0   prologue: push rax/rcx/rdx/r8-r11/rbp, push 0 (cancel slot)
+                //   14  set up rcx/rdx/r8 args, align stack, call [rip+0x3B]  (→ offset 41)
+                //   41  mov rsp, rbp
+                //   44  cmp BYTE PTR [rsp], 0      ; check cancel (no register change)
+                //   48  lea rsp, [rsp+8]            ; skip cancel slot (no flag change)
+                //   53  pop rbp / r11-r8 / rdx / rcx
+                //   64  je +0x18                    ; cancel==0 → resume_stub at 94
+                //   70  cancel path: movq xmm0,rax / lea rsp,[rsp+8] / frame unwind
+                //   94  resume_stub: pop rax / jmp rel32 → target+HOOK_SIZE  (patched)
+                //  100  data slot: 8-byte detour pointer
                 std::uint8_t assembly[]
                 {
+                    // --- prologue: save volatile regs + rbp, push cancel slot ---
                     0x50,                                           // push rax
                     0x51,                                           // push rcx
                     0x52,                                           // push rdx
@@ -6810,9 +6830,9 @@ namespace vmhook
                     0x41, 0x52,                                     // push r10
                     0x41, 0x53,                                     // push r11
                     0x55,                                           // push rbp
-                    0x6A, 0x00,                                     // push 0x0  ; return_slot::retval  (slot +8)
-                    0x6A, 0x00,                                     // push 0x0  ; return_slot::cancel  (slot +0)
+                    0x6A, 0x00,                                     // push 0x0  ; return_slot::cancel
 
+                    // --- call common_detour(frame*, java_thread*, return_slot*) ---
                     0x48, 0x89, 0xE9,                               // mov rcx, rbp   ; frame*
                     0x4C, 0x89, 0xFA,                               // mov rdx, r15   ; java_thread*
                     0x4C, 0x8D, 0x04, 0x24,                         // lea r8, [rsp]  ; return_slot*
@@ -6821,45 +6841,44 @@ namespace vmhook
                     0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16
                     0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 0x20
 
-                    0xFF, 0x15, 0x4D, 0x00, 0x00, 0x00,             // call [rip+0x4D]
+                    0xFF, 0x15, 0x3B, 0x00, 0x00, 0x00,             // call [rip+0x3B] ; rax = retval on return
 
+                    // --- epilogue ---
                     0x48, 0x89, 0xEC,                               // mov rsp, rbp
 
-                    0x80, 0x3C, 0x24, 0x00,                         // cmp byte ptr [rsp], 0
-                    0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je resume  ; cancel==false
+                    // Check cancel byte in the slot WITHOUT touching rax or rbx.
+                    0x80, 0x3C, 0x24, 0x00,                         // cmp BYTE PTR [rsp], 0
+                    0x48, 0x8D, 0x64, 0x24, 0x08,                   // lea rsp, [rsp+8]  ; skip cancel (no flags)
 
-                    // cancel path (cancel==true, falls through):
-                    0x48, 0x8B, 0x44, 0x24, 0x08,                   // mov rax, [rsp+8]    ; return_slot::retval
-                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax      ; float/double return
-                    0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10       ; discard return_slot
-                    0x5D,                                           // pop rbp
+                    0x5D,                                           // pop rbp   ; interpreter rbp
                     0x41, 0x5B,                                     // pop r11
                     0x41, 0x5A,                                     // pop r10
                     0x41, 0x59,                                     // pop r9
                     0x41, 0x58,                                     // pop r8
                     0x5A,                                           // pop rdx
                     0x59,                                           // pop rcx
-                    0x48, 0x83, 0xC4, 0x08,                         // add rsp, 0x8        ; discard saved original rax
-                    0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8]
+
+                    // rax = retval (from call), rbx = UNTOUCHED, [rsp] = original rax
+                    0x0F, 0x84, 0x18, 0x00, 0x00, 0x00,             // je +0x18  ; cancel==0 → resume_stub
+
+                    // --- cancel path (fall-through, cancel != 0) ---
+                    // rax already holds retval; xmm0 gets it for float/double returns.
+                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax
+                    // Skip original rax on the stack (don't restore it; we want retval in rax).
+                    0x48, 0x8D, 0x64, 0x24, 0x08,                   // lea rsp, [rsp+8]
+                    0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8]  ; last_sp
                     0x48, 0x89, 0xEC,                               // mov rsp, rbp
                     0x5D,                                           // pop rbp
                     0x5E,                                           // pop rsi
                     0x48, 0x89, 0xDC,                               // mov rsp, rbx
                     0xFF, 0xE6,                                     // jmp rsi
 
-                    // resume path (cancel==false):
-                    0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10       ; discard return_slot
-                    0x5D,                                           // pop rbp
-                    0x41, 0x5B,                                     // pop r11
-                    0x41, 0x5A,                                     // pop r10
-                    0x41, 0x59,                                     // pop r9
-                    0x41, 0x58,                                     // pop r8
-                    0x5A,                                           // pop rdx
-                    0x59,                                           // pop rcx
+                    // --- resume_stub (je target, offset 94) ---
+                    // Restore original rax then fall through to the original i2i code.
                     0x58,                                           // pop rax
-                    0xE9, 0x00, 0x00, 0x00, 0x00,                   // jmp target+HOOK_SIZE
+                    0xE9, 0x00, 0x00, 0x00, 0x00,                   // jmp rel32 → target+HOOK_SIZE (patched)
 
-                    // data slot: detour function pointer
+                    // --- data slot: detour function pointer (offset 100) ---
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
                 };
 #else
@@ -6982,8 +7001,10 @@ namespace vmhook
                     return;
                 }
 
-                const std::int32_t je_delta{ RESUME_OFFSET - (JE_OFFSET + JE_SIZE) };
-                *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 2) = je_delta;
+                // Patch the resume-stub's jmp to point at target+HOOK_SIZE.
+                const std::int32_t jmp_to_resume_delta{ static_cast<std::int32_t>(
+                    target + HOOK_SIZE - (this->allocated + HOOK_SIZE + JMP_TO_RESUME_OFFSET + JMP_TO_RESUME_SIZE)) };
+                *reinterpret_cast<std::int32_t*>(assembly + JMP_TO_RESUME_OFFSET + 1) = jmp_to_resume_delta;
 
                 // Where to resume after the detour returns "don't cancel".
                 // Default: `target + HOOK_SIZE` (continue past the patched window
@@ -7458,7 +7479,7 @@ namespace vmhook
             dispatch that follows finds the correct state.
         */
         static auto common_detour(vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread* const thread, vmhook::hotspot::return_slot* const slot)
-            -> void
+            -> std::int64_t
         {
             // Race-free shutdown: shutdown_hooks() flips this BEFORE acquiring
             // the install mutex and clearing g_hooked_methods, so any detour
@@ -7510,24 +7531,11 @@ namespace vmhook
                 {
                     if (hook.method == current_method)
                     {
-                        // SEH guard: a stale OOP / null-receiver deref inside
-                        // the user detour throws an SEH access violation, not
-                        // a C++ exception - our outer try/catch wouldn't catch
-                        // it and the JVM would tear down.  seh_invoke_detour
-                        // converts the AV to a false return so we log and
-                        // fall through to the original Java method body.
-                        if (!vmhook::hotspot::seh_invoke_detour(hook.detour, frame_pointer, thread, slot))
-                        {
-                            VMHOOK_LOG("{} common_detour(): detour for method 0x{:016X} raised "
-                                       "SEH/AV - skipping this invocation, original method body "
-                                       "will run.",
-                                       vmhook::warning_tag,
-                                       reinterpret_cast<std::uintptr_t>(hook.method));
-                        }
-                        // Ensure the thread state is _thread_in_Java after the detour
-                        // so the bytecode dispatcher finds a consistent state.
+                        hook.detour(frame_pointer, thread, slot);
                         thread->set_thread_state(vmhook::hotspot::java_thread_state::_thread_in_Java);
-                        return;
+                        // Return slot->retval so the trampoline can place it in rax/xmm0
+                        // on the cancel path without touching rbx.
+                        return slot->cancel ? slot->retval : std::int64_t{ 0 };
                     }
                 }
             }
@@ -7535,6 +7543,7 @@ namespace vmhook
             {
                 VMHOOK_LOG("{} common_detour() {}", vmhook::error_tag, exception.what());
             }
+            return std::int64_t{ 0 };
         }
 
         /*
