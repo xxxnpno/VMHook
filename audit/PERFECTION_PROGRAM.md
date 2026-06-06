@@ -433,15 +433,21 @@ de-tags chain pointers with `untag_pointer` (HIGH-bit GC mask only) then `is_val
 can carry a low CDS/shared marker bit → that entry is deemed invalid → the chain is cut early,
 dropping every later class (non-deterministic by bucket layout). The 5 Wave-1 modules grew the
 class universe + reshuffled chains so ForEachLoadedClass fell past a cut. Same quirk b697209
-already gated for java.lang.String. **HEADER FIX APPLIED (commit pending):** added a localized `untag_hashtable_entry(p)` helper
-(`untag_pointer(p) & ~1`, clears the JDK8 bit-0 CDS marker; no-op on aligned/JDK9+ pointers,
-does NOT modify the shared untag_pointer) and applied it at the 4 chain-pointer sites (bucket
-head + `_next` in both `dictionary::find_klass` and `for_each_klass`); klass-oop reads keep
-untag_pointer. Full -Werror build of all 127 targets exit 0. **VALIDATION:** the
-for_each_loaded_class module's java8 [INFO] lines will now show whether the fixture is
-enumerated; if so, REMOVE the JDK8 best-effort gate in for_each_loaded_class.cpp (restore HARD
-coverage). The test gate stays for now so master holds green either way. FIRST library fix of
-the serial pass — landed via a fresh-context agent + full -Werror review.
+already gated for java.lang.String. **HEADER FIX ATTEMPTED @3dd56b6 then REVERTED @(next) — DO NOT re-apply naively.** Added a
+localized `untag_hashtable_entry(p) = untag_pointer(p) & ~1` at the 4 chain sites. Full -Werror
+build was clean, BUT on CI: (a) it did NOT achieve its goal — JDK8 still missed the fixture
+(enumeration surfaced 156 vmhook/* classes incl Example/Main/$Inner but the fixture/String/arrays
+remained missed, "non-deterministic" — so bit-0 was not the whole story), AND (b) it CORRELATED
+WITH A NEW CRASH: windows·mingw·java8 crashed after field_introspection (GREEN at fb0df4a before
+the fix). **Mechanism:** clearing bit 0 makes find_klass/for_each_klass ACCEPT chain entries that
+is_valid_pointer previously rejected; if a recovered (bit-0-cleared) pointer passes is_valid_pointer
+but is actually garbage (bit 0 set for a non-CDS reason / end-of-chain sentinel), the klass read at
++16 derefs garbage → crash. Loosening pointer validation in the enumeration is unsafe without a
+TIGHTER post-recovery validity check. **LESSON:** library fixes that loosen pointer validation MUST
+be runtime-validated on the exact JDK (java8) — compile-clean is not enough; a hypothesis-fix in the
+crown-jewel header that correlates with a crash gets reverted. Re-attempt later WITH: a stricter
+check on the recovered klass pointer (e.g. verify it points at a real Klass) + java8 CI iteration,
+owned by a dictionary/heap specialist. The for_each_loaded_class JDK8 gate STAYS (correct).
 **Test fix (landed):** for_each_loaded_class.cpp gates the 5 fragile per-entry checks best-effort
 on JDK8 (HARD on JDK9+, HARD on JDK8 when the fixture WAS enumerated, [INFO] on a genuine miss)
 with NON-vacuous hard floors on EVERY JDK: `own_fixture_resolvable_via_find_class` (rides

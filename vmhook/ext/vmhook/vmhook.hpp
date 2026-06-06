@@ -1818,30 +1818,6 @@ namespace vmhook
         }
 
         /*
-            @brief Recovers a SystemDictionary hashtable chain pointer (bucket head
-                   or BasicHashtableEntry::_next), stripping both the high GC tag
-                   bits and the low CDS/"shared" marker bit.
-            @details
-            On JDK8 HotSpot, BasicHashtableEntry::_next can carry a LOW marker bit
-            (the shared/CDS flag stored in bit 0; the real accessor masks it off
-            with ~1).  untag_pointer() only clears the high GC tag bits, so a
-            low-bit-marked _next survives with bit 0 set and is then rejected by
-            is_valid_pointer() (which requires bit 0 == 0), truncating the bucket
-            chain and silently dropping later loaded classes.  Real entries are
-            8-aligned, so clearing only bit 0 is a strict no-op for any genuine
-            pointer and for JDK9+ where _next is already a clean aligned pointer;
-            it recovers exactly the JDK8 low-bit case.  Use this ONLY for chain
-            pointers (bucket head + _next); keep untag_pointer() for the klass oop.
-        */
-        inline static auto untag_hashtable_entry(const void* const pointer) noexcept
-            -> const void*
-        {
-            return reinterpret_cast<const void*>(
-                reinterpret_cast<std::uintptr_t>(vmhook::hotspot::untag_pointer(pointer))
-                    & ~static_cast<std::uintptr_t>(1));
-        }
-
-        /*
             @brief Reads a 32-bit pointer field from a JVM structure and zero-extends it.
         */
         template<typename structure_type>
@@ -3368,7 +3344,7 @@ namespace vmhook
 
                 for (std::int32_t bucket_index{ 0 }; bucket_index < table_size; ++bucket_index)
                 {
-                    const std::uint8_t* dict_entry{ reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_hashtable_entry(vmhook::hotspot::safe_read_pointer(buckets + bucket_index * 8))) };
+                    const std::uint8_t* dict_entry{ reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_pointer(vmhook::hotspot::safe_read_pointer(buckets + bucket_index * 8))) };
 
                     while (vmhook::hotspot::is_valid_pointer(dict_entry))
                     {
@@ -3388,7 +3364,7 @@ namespace vmhook
                             }
                         }
 
-                        dict_entry = reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_hashtable_entry(vmhook::hotspot::safe_read_pointer(dict_entry)));
+                        dict_entry = reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_pointer(vmhook::hotspot::safe_read_pointer(dict_entry)));
                     }
                 }
 
@@ -3418,7 +3394,7 @@ namespace vmhook
 
                 for (std::int32_t bucket_index{ 0 }; bucket_index < table_size; ++bucket_index)
                 {
-                    const std::uint8_t* dict_entry{ reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_hashtable_entry(vmhook::hotspot::safe_read_pointer(buckets + bucket_index * 8))) };
+                    const std::uint8_t* dict_entry{ reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_pointer(vmhook::hotspot::safe_read_pointer(buckets + bucket_index * 8))) };
 
                     std::int32_t chain_visited{ 0 };
                     while (vmhook::hotspot::is_valid_pointer(dict_entry) && chain_visited < 1048576)
@@ -3437,7 +3413,7 @@ namespace vmhook
                             }
                         }
 
-                        dict_entry = reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_hashtable_entry(vmhook::hotspot::safe_read_pointer(dict_entry)));
+                        dict_entry = reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_pointer(vmhook::hotspot::safe_read_pointer(dict_entry)));
                     }
                 }
             }
