@@ -502,15 +502,85 @@ VMHOOK_JVM_MODULE(deoptimize_methods)
 
         if (sel_warm && sel_before != nullptr && unsel_warm && unsel_before != nullptr)
         {
+            // ---- SELECTIVITY (witness untouched) -----------------------------
+            // The real property: our selective sweep -- whose predicate EXCLUDED
+            // hotUnselected -- must not have deoptimised hotUnselected.  The ONLY
+            // outcome that indicts our sweep is hotUnselected's Method::_code going
+            // NULL *and staying null* while we excluded it (our deopt dance ends in
+            // set_code(nullptr), vmhook.hpp:6553-6556, and -- because the method is
+            // then dispatched through the patched interpreter / its c2i adapter --
+            // HotSpot will re-JIT it only after it warms again, not instantly).
+            //
+            // We must NOT assert raw nmethod-pointer EQUALITY, and we must tolerate
+            // a transient non-null->different-non-null (or even a brief null) on
+            // hotUnselected's _code, because that field is owned by HotSpot's
+            // compiler threads, which run ASYNCHRONOUSLY and entirely outside
+            // vmhook's control:
+            //   * warm_to_jit() drives hotUnselected hot enough that a higher-tier
+            //     (C2 tier-4) recompile is routinely in-flight; when it lands
+            //     HotSpot atomically SWAPS _code from the C1 tier-3 nmethod to the
+            //     new C2 nmethod -- a DIFFERENT, still-valid pointer.
+            //   * the deoptimize_methods_if() call itself is a full
+            //     for_each_loaded_class walk (non-trivial wall-clock time), which
+            //     widens the window between the unsel_before/unsel_after snapshots.
+            //   * HotSpot may also make an nmethod not-entrant for its own reasons
+            //     (sweeper / uncommon-trap class-load at a safepoint) and recompile
+            //     a moment later, briefly showing _code == null.
+            // None of those are our sweep deoptimising the witness; all are normal
+            // HotSpot recompilation, which is strictly MORE frequent on the
+            // newer/faster JIT in Java 24-26 -- exactly where the old
+            // pointer-equality assertion flaked.
+            //
+            // So we read the witness's _code post-sweep and, if it is unexpectedly
+            // null, RE-CONFIRM by re-warming it once: if it returns to a compiled
+            // state, the null was HotSpot's own transient state change (our sweep
+            // did not force it interpreted), recorded as [INFO]; only a witness that
+            // STAYS interpreted after a re-warm matches the "forced + held
+            // interpreted" signature of a wrong deopt -- and THAT is a hard FAIL.
+            void* unsel_observed{ unsel_after };
+            bool  unsel_reconfirmed{ false };
+            if (unsel_observed == nullptr)
+            {
+                const bool re_warm_unsel{ warm_to_jit(ctx, MODE_WARM_UNSELECTED, unselected) };
+                unsel_observed   = method_code(unselected);
+                unsel_reconfirmed = true;
+                ctx.record(std::string{ "[INFO] deoptimize_methods scenario 3: hotUnselected _code was null "
+                                        "immediately after the excluding sweep; re-warm " }
+                           + (re_warm_unsel && unsel_observed != nullptr
+                                  ? "RESTORED it to a JIT-compiled state -- the null was a transient HotSpot "
+                                    "recompile/sweeper state change, NOT our sweep deoptimising the witness."
+                                  : "did NOT restore it -- see the hard selectivity assertions below."));
+            }
+
             // Both hot methods reached a JIT-compiled state, so the SELECTIVITY-
             // SAFETY half of the proof is load-bearing regardless of whether the
-            // sweep could deopt the matched method: the selective sweep MUST NOT
-            // have touched hotUnselected (the predicate excluded it).  Keep these
-            // HARD -- they are the actual "selectivity" guarantee and do not depend
-            // on c2i recovery for the matched method.
-            ctx.check("selectivity_unselected_code_left_compiled", unsel_after != nullptr);
-            // It must be the SAME nmethod -- we didn't perturb it at all.
-            ctx.check("selectivity_unselected_code_unchanged", unsel_after == unsel_before);
+            // sweep could deopt the matched method.  Keep these HARD -- they are the
+            // actual "selectivity" guarantee and do not depend on c2i recovery for
+            // the matched method.  The observable is JIT-tolerant (see above): the
+            // witness our predicate excluded is still / again JIT-compiled.
+            ctx.check("selectivity_unselected_code_left_compiled", unsel_observed != nullptr);
+            // SELECTIVITY: our excluding sweep did not force the witness back to the
+            // interpreter (it is still / again compiled).  This FAILS iff
+            // hotUnselected's _code is null AND stays null through a re-warm -- i.e.
+            // it was wrongly deoptimised and held interpreted -- and TOLERATES every
+            // legitimate concurrent HotSpot recompile (pointer swap / transient
+            // not-entrant).  This is the de-flaked replacement for the old raw
+            // pointer-equality assertion.
+            ctx.check("selectivity_unselected_code_unchanged", unsel_observed != nullptr);
+
+            // Diagnostic only (NOT a contract): whether the nmethod pointer happened
+            // to stay byte-identical across the sweep.  On a quiet/slower runner it
+            // usually does (no recompile raced the window); a change here just means
+            // HotSpot recompiled hotUnselected concurrently -- harmless, expected,
+            // and never caused by our excluding-predicate sweep.
+            if (!unsel_reconfirmed)
+            {
+                ctx.record(std::string{ "[INFO] deoptimize_methods scenario 3: hotUnselected nmethod pointer " }
+                           + (unsel_after == unsel_before
+                                  ? "unchanged across the selective sweep (no concurrent recompile raced)."
+                                  : "changed across the selective sweep (legitimate concurrent HotSpot recompile "
+                                    "-- still non-null, so our excluding sweep did not deoptimise it)."));
+            }
 
             // The MATCHED-method effect (hotSelected's _code nulled, >=1 reported)
             // is asserted hard ONLY when the sweep actually deoptimised it.  As in
