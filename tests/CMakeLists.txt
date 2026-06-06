@@ -103,3 +103,4 @@ vmhook_add_test(collection_type_tags           SOURCES test_collection_type_tags
 vmhook_add_test(global_ref                      SOURCES test_global_ref.cpp)
 vmhook_add_test(method_enumeration             SOURCES test_method_enumeration.cpp)
 vmhook_add_test(classloader_reanchor           SOURCES test_classloader_reanchor.cpp)
+vmhook_add_test(jni_forwarders                  SOURCES test_jni_forwarders.cpp)
