@@ -289,6 +289,58 @@ class_load_watcher→on_class_loaded.
 asserts ≥ what the legacy test did (don't lose coverage). Then delete the legacy section +
 legacy top-level fixtures, shrinking example.cpp to a thin modular-only driver.
 
+## Wave 2+ strategy (refined after Wave 1)
+
+Two parallel agent-wave types to reach ≥100 defs AND grow real test coverage:
+- **def-only wave (cheap, fast — grows roster 42→~63+):** features that ALREADY have an
+  exhaustive module but no `.claude/agents/*.md`: collection_{list,set,map,linked_list,
+  hash_tree_map}, on_exception, read_java_string, make_java_string, enum_singleton,
+  interface_polymorphism, nested_classes, poly_inherited_oop, method_{static,return_types,
+  enumeration,is_reference,call_return_void,overload_java_dispatch}, field_arrays_object,
+  return_value_cancel, hook_unhook_double_free. Agent reads the existing module+header, writes
+  the def (flaws/test-angles/JDK-sensitivities). No code edits → zero CI risk; commit in bulk.
+- **module-gap wave (heavier — new module+fixture+def):** wrapper_pattern, register_class,
+  find_class_context_loader, collection_iteration_safety, hook_chaining,
+  hook_reinstall_after_shutdown — then the hard **G9 internals** (own focused wave):
+  vmstructs_offset_resolution, compressed_oops/klass_decode, const_method_bounds,
+  method_flags_width (pairs with FIX E), klass_introspection, interpreter_frame_walk,
+  method_entry_points_i2i_i2c, adapter_recovery_c2i, instanceklass_methods_walk, constantpool_access.
+
+**Wave-2 prompt MUST add Wave-1 lessons:** (a) a wrapper's STATIC helper (e.g. get_instance())
+name-HIDES the inherited object_base instance accessor — use explicit base qualification
+`w.vmhook::object_base::get_instance()` when you mean the instance one; (b) gate platform/JDK-
+variant behavior best-effort, keep only universal invariants as hard ctx.check.
+
+**Java-26 edit (ready):** `ci.yml:18` → `JAVA_VERSIONS: '["8","11","17","21","24","25","26"]'`
++ reword comment (6-month cadence; next 27≈Sept 2026). Single point; propagates to all 3 jvm jobs.
+
+## Wave 2 def-only result + agent-reported library bugs (roster 42 → 64; task #5)
+
+22 specialist agent-defs authored for already-tested features (collection_*, method_*,
+field_arrays_object, enum_singleton, interface_polymorphism, nested_classes, poly_inherited_oop,
+read_java_string, make_java_string, on_exception, return_value_cancel, hook_unhook_double_free).
+Full bug detail lives in each `.claude/agents/<f>-specialist.md` "Flaws I found"; highlights:
+- **[medium] collection::to_vector routes by FIRST-matching field name w/ no klass-type check**
+  (vmhook.hpp ~14803-14872): `Collections.newSetFromMap(HashMap)` (backing field `m`) is mis-routed
+  to tree_map_walk_keys → HashMap has no `root` → silently decodes to EMPTY. Any Set/Map impl
+  exposing size/elementData/first/map/m on itself or a super is mis-decoded.
+- **[medium] no uncompressed-OOP path** in collection/array/oop decode (decode_oop_pointer
+  ~4288-4352): with `-XX:-UseCompressedOops` (>~32GB heap) refs are 8 bytes; code reads 4 →
+  to_vector silently returns empty. CI can't see it (default compressed heaps).
+- **[low] LinkedHashSet/Map iteration order lost** (bucket order, not insertion); per-bucket/
+  total element caps can silently truncate; walkers don't cross-check emitted count vs `size`.
+- (make_java_array Java-visible store is GC-fragile late in a heavy sweep — see below; gated.)
+
+## make_java_array — GC-timing finding (Java-visible recv layer gated best-effort)
+
+On windows·java11, `make_java_array`'s recv-store for the LAST descriptors (D/Obj/Str) didn't
+land (`stored=false`, recv held its sentinel) — the heavy unrooted-allocation sweep (35 arrays
+before D) hits GC that invalidates late witnesses. NATIVE invariants (alloc/valid/length/element
+round-trip + [B/[C make_java_string deps) pass on EVERY JDK → feature works. Fix (test): gate the
+Java-visible recv checks on `stored` (HARD when the array landed, [INFO] when not) + a HARD
+majority floor (≥5/10 stored-correct). HARDENING for the make_java_array specialist's future pass:
+root each witness into recv* FIRST (before the length sweep) to eliminate the unrooted window.
+
 ## Wave 1 agent-reported library bugs (pinned by tests; fix in serial header pass — task #5)
 
 - **[medium] `make_java_array` leaks a PENDING JNI exception on the miss path**
