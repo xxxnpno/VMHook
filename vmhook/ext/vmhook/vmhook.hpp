@@ -14832,53 +14832,32 @@ namespace vmhook
         return reinterpret_cast<vmhook::hotspot::klass*>(decoded);
     }
 
-    // Forward declarations of the templated walk helpers used by
-    // collection::to_vector below.  The bodies live further down in this
-    // header (after the wrapper classes) so they can be reused by every
-    // wrapper that inherits from collection.  Declaring them up here lets
-    // GCC's first-phase lookup find the qualified names inside the
-    // templated collection::to_vector body.
-    template<typename element_type, typename out_t>
-    inline auto linked_list_walk_items(void* list_oop, std::int32_t size, out_t& out) -> void;
-    template<typename key_type, typename value_type, typename out_t>
-    inline auto hash_map_walk_entries(void* map_oop, out_t& out) -> void;
-    template<typename element_type, typename out_t>
-    inline auto hash_map_walk_keys(void* map_oop, out_t& out) -> void;
-    template<typename key_type, typename value_type, typename out_t>
-    inline auto tree_map_walk_entries(void* map_oop, out_t& out) -> void;
-    template<typename element_type, typename out_t>
-    inline auto tree_map_walk_keys(void* map_oop, out_t& out) -> void;
-
     /*
-        @brief C++ wrapper for java.util.Collection objects.
+        @brief Shared base for wrappers that resolve fields/methods from the
+               LIVE OOP's klass header rather than the C++ type registry.
+        @details
+        vmhook::collection and vmhook::map both need to look up fields and
+        methods through the concrete runtime klass read out of the object
+        header (so a single wrapper works for ArrayList / LinkedList / HashSet
+        / HashMap / TreeMap / ... without a register_class<T>() call).  The
+        three helpers below used to be copy-pasted verbatim into each of those
+        classes; they are hoisted here so there is exactly one implementation.
 
-        Uses the live OOP's klass pointer (read from its object header) to
-        resolve fields and methods, so no register_class<T>() call is needed
-        and it works with any concrete Collection implementation
-        (ArrayList, LinkedList, HashSet, etc.).
+        This adds no data members and inherits object_base's constructors, so
+        every wrapper that derives from it has the same object layout, the same
+        (defaulted) copy/move semantics, and the same dynamic type under
+        typeid(*this) as before.  collection and map derive from this in place
+        of object_base; list / set / linked_list / hash_map keep deriving from
+        collection / map and inherit these helpers transitively, exactly as
+        when the helpers lived directly in collection / map.
 
-        Typical usage (from a hook detour where you received a List OOP):
-
-            collection col{ list_oop };
-            std::int32_t n = col.size();
+        The helpers are protected: they remain an implementation detail of the
+        container wrappers and are not part of the public API.
     */
-    class collection : public vmhook::object_base
+    class oop_reflective_base : public vmhook::object_base
     {
     public:
-        /*
-            @brief Wraps a decoded OOP that refers to any java.util.Collection implementation.
-            @details
-            The oop must be a fully decoded 64-bit heap pointer (not a compressed OOP).
-            The constructor does not validate the pointer; pass nullptr for a null-safe
-            collection that returns empty/zero for all operations.
-
-            Exception safety: noexcept.
-            @param oop  Decoded OOP of the Java Collection object, or nullptr.
-        */
-        explicit collection(vmhook::oop_t oop) noexcept
-            : vmhook::object_base{ oop }
-        {
-        }
+        using object_base::object_base;
 
     protected:
         /*
@@ -14954,8 +14933,59 @@ namespace vmhook
             }
             return std::nullopt;
         }
+    };
 
+    // Forward declarations of the templated walk helpers used by
+    // collection::to_vector below.  The bodies live further down in this
+    // header (after the wrapper classes) so they can be reused by every
+    // wrapper that inherits from collection.  Declaring them up here lets
+    // GCC's first-phase lookup find the qualified names inside the
+    // templated collection::to_vector body.
+    template<typename element_type, typename out_t>
+    inline auto linked_list_walk_items(void* list_oop, std::int32_t size, out_t& out) -> void;
+    template<typename key_type, typename value_type, typename out_t>
+    inline auto hash_map_walk_entries(void* map_oop, out_t& out) -> void;
+    template<typename element_type, typename out_t>
+    inline auto hash_map_walk_keys(void* map_oop, out_t& out) -> void;
+    template<typename key_type, typename value_type, typename out_t>
+    inline auto tree_map_walk_entries(void* map_oop, out_t& out) -> void;
+    template<typename element_type, typename out_t>
+    inline auto tree_map_walk_keys(void* map_oop, out_t& out) -> void;
+
+    /*
+        @brief C++ wrapper for java.util.Collection objects.
+
+        Uses the live OOP's klass pointer (read from its object header) to
+        resolve fields and methods, so no register_class<T>() call is needed
+        and it works with any concrete Collection implementation
+        (ArrayList, LinkedList, HashSet, etc.).
+
+        Typical usage (from a hook detour where you received a List OOP):
+
+            collection col{ list_oop };
+            std::int32_t n = col.size();
+    */
+    class collection : public vmhook::oop_reflective_base
+    {
     public:
+        /*
+            @brief Wraps a decoded OOP that refers to any java.util.Collection implementation.
+            @details
+            The oop must be a fully decoded 64-bit heap pointer (not a compressed OOP).
+            The constructor does not validate the pointer; pass nullptr for a null-safe
+            collection that returns empty/zero for all operations.
+
+            Exception safety: noexcept.
+            @param oop  Decoded OOP of the Java Collection object, or nullptr.
+        */
+        explicit collection(vmhook::oop_t oop) noexcept
+            : vmhook::oop_reflective_base{ oop }
+        {
+        }
+
+        // oop_klass() / get_field_by_oop_klass() / get_method_by_oop_klass()
+        // are inherited (protected) from vmhook::oop_reflective_base.
+
         /*
             @brief Returns the number of elements via the Java size() method.
             Resolves through the concrete class's virtual dispatch table,
@@ -15205,7 +15235,7 @@ namespace vmhook
             map m{ map_oop };
             auto entries = m.to_entries<key_wrapper, value_wrapper>();
     */
-    class map : public vmhook::object_base
+    class map : public vmhook::oop_reflective_base
     {
     public:
         /*
@@ -15213,88 +15243,15 @@ namespace vmhook
             @param oop  Decoded OOP of the Java Map object, or nullptr.
         */
         explicit map(vmhook::oop_t oop) noexcept
-            : vmhook::object_base{ oop }
+            : vmhook::oop_reflective_base{ oop }
         {
         }
 
-    protected:
-        /*
-            @brief Returns the klass by reading the narrow klass slot in the OOP header.
-        */
-        auto oop_klass() const noexcept -> vmhook::hotspot::klass*
-        {
-            return vmhook::klass_from_oop(this->instance);
-        }
+        // oop_klass() / get_field_by_oop_klass() / get_method_by_oop_klass()
+        // are inherited (protected) from vmhook::oop_reflective_base — the same
+        // single implementation collection uses.  (Map is not a Collection in
+        // Java, but both wrappers need identical live-OOP klass reflection.)
 
-        /*
-            @brief get_field variant that uses the live OOP's klass, not the C++ type registry.
-            @details
-            Mirrors vmhook::collection::get_field_by_oop_klass — duplicated here so map
-            does not need to share a base with collection (Map is not a Collection in Java).
-        */
-        auto get_field_by_oop_klass(const std::string_view name) const
-            -> std::optional<vmhook::field_proxy>
-        {
-            vmhook::hotspot::klass* const k{ oop_klass() };
-            if (!k)
-            {
-                return std::nullopt;
-            }
-            const auto entry{ vmhook::find_field(k, name) };
-            if (!entry)
-            {
-                return std::nullopt;
-            }
-            if (entry->is_static)
-            {
-                // Inherited static: use the declaring klass's mirror (see the
-                // note on field_entry_t::declaring_klass).  `k` here is the live
-                // OOP's leaf klass; for a static inherited from a super the
-                // offset only indexes the super's mirror.
-                vmhook::hotspot::klass* const mirror_klass{ entry->declaring_klass ? entry->declaring_klass : k };
-                void* const mirror{ mirror_klass->get_java_mirror() };
-                if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
-                {
-                    return std::nullopt;
-                }
-                void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
-                return vmhook::field_proxy{ field_pointer, entry->signature, true };
-            }
-            if (!this->instance)
-            {
-                return std::nullopt;
-            }
-            void* const field_pointer{ reinterpret_cast<std::uint8_t*>(this->instance) + entry->offset };
-            return vmhook::field_proxy{ field_pointer, entry->signature, false };
-        }
-
-        /*
-            @brief get_method variant that searches the live OOP's klass hierarchy.
-        */
-        auto get_method_by_oop_klass(const std::string_view method_name) const
-            -> std::optional<vmhook::method_proxy>
-        {
-            for (vmhook::hotspot::klass* k{ oop_klass() }; k != nullptr; k = k->get_super())
-            {
-                const std::int32_t method_count{ k->get_methods_count() };
-                vmhook::hotspot::method** const methods_array{ k->get_methods_ptr() };
-                if (!methods_array || method_count <= 0)
-                {
-                    continue;
-                }
-                for (std::int32_t i{ 0 }; i < method_count; ++i)
-                {
-                    vmhook::hotspot::method* const m{ methods_array[i] };
-                    if (m && vmhook::hotspot::is_valid_pointer(m) && m->get_name() == method_name)
-                    {
-                        return vmhook::method_proxy{ this->instance, m, m->get_signature() };
-                    }
-                }
-            }
-            return std::nullopt;
-        }
-
-    public:
         /*
             @brief Returns the number of entries via the Java size() method.
         */
