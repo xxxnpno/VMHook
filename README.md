@@ -69,7 +69,7 @@ Notes:
   breakpoints, which we currently wire up only on Windows × x86_64.
   See `VMHOOK_HAS_HW_DATA_BREAKPOINTS`.
 - The CI matrix runs the full JVM integration test for Java 8, 11, 17,
-  21, 24, and 25 against every compiler that produces a working
+  21, 24, 25, and 26 against every compiler that produces a working
   artefact on a hosted runner.
 
 ### Building with CMake (recommended)
