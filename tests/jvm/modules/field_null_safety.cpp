@@ -397,8 +397,14 @@ VMHOOK_JVM_MODULE(field_null_safety)
     // =====================================================================
     {
         fns null_wrapper{ nullptr };
+        // Explicit base qualification: fns declares a STATIC get_instance()
+        // (returns the live fixture instance) that name-hides the inherited
+        // instance accessor object_base::get_instance().  The invariant under
+        // test is "a wrapper built from a null oop carries a null instance
+        // pointer" — a universal fact — so we must reach the base method, not
+        // the shadowing static one.
         ctx.check("null_oop_wrapper_get_instance_null",
-                  null_wrapper.get_instance() == nullptr);
+                  null_wrapper.vmhook::object_base::get_instance() == nullptr);
 
         // Static field through the null-oop wrapper: resolves AND reads the
         // mirror value (== the static-accessor value).
