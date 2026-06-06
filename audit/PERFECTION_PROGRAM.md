@@ -331,6 +331,26 @@ Full bug detail lives in each `.claude/agents/<f>-specialist.md` "Flaws I found"
   total element caps can silently truncate; walkers don't cross-check emitted count vs `size`.
 - (make_java_array Java-visible store is GC-fragile late in a heavy sweep — see below; gated.)
 
+## make_java_array — make_java_object GC-slow-path bug (HIGH-value finding, task #5)
+
+**[medium/high] `make_java_object`/`make_java_array` returns NULL when an allocation needs a
+GC** — surfaces flakily on GC-active configs (linux·gcc·java11, windows·{clang,msvc}·java11)
+for the `len=256` arrays (native_nonnull_*_len256 fail) and ref arrays: it allocates from the
+TLAB fast path and does not fall back to a GC-assisted slow-path alloc, so a 256-element
+(~2KB) array fails while ≤3-element works, dependent on GC timing during the test's sweep.
+**Real impact:** `make_java_string` of a long string allocates a large [B/[C → can return null
+on these configs. FIX (serial header pass): make the allocation primitive handle the
+allocation-needs-GC / TLAB-refill slow path. Test treatment: native small-length (0,1,3)
+primitive checks stay HARD; ref arrays + len≥256 are best-effort (HARD when they land, [INFO]
+when null); make_java_string dep floor now small-lengths only.
+
+## for_each_loaded_class — pre-existing java8 flake (separate deflake workstream)
+
+windows·mingw·java8 intermittently fails for_each_loaded_class own_fixture* checks (the visitor
+didn't see its own fixture in the loaded-class snapshot). NOT a Wave-1 module; in the milestone's
+known GC/thread-timing flake class (for_each_loaded_class, for_each_thread, global_ref post-GC).
+Owned by the systematic deflaking workstream (use the for_each_loaded_class-specialist agent).
+
 ## make_java_array — GC-timing finding (Java-visible recv layer gated best-effort)
 
 On windows·java11, `make_java_array`'s recv-store for the LAST descriptors (D/Obj/Str) didn't
