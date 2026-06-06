@@ -433,9 +433,15 @@ de-tags chain pointers with `untag_pointer` (HIGH-bit GC mask only) then `is_val
 can carry a low CDS/shared marker bit → that entry is deemed invalid → the chain is cut early,
 dropping every later class (non-deterministic by bucket layout). The 5 Wave-1 modules grew the
 class universe + reshuffled chains so ForEachLoadedClass fell past a cut. Same quirk b697209
-already gated for java.lang.String. **Proposed header fix (serial pass):** clear the low tag bit
-on the `_next`/bucket value (`untag_hashtable_next(p) = untag_pointer(p) & ~1`) at 3397/3416 (+
-3347/3367) → recovers dropped JDK8 entries; then the test's JDK8 gating can be removed.
+already gated for java.lang.String. **HEADER FIX APPLIED (commit pending):** added a localized `untag_hashtable_entry(p)` helper
+(`untag_pointer(p) & ~1`, clears the JDK8 bit-0 CDS marker; no-op on aligned/JDK9+ pointers,
+does NOT modify the shared untag_pointer) and applied it at the 4 chain-pointer sites (bucket
+head + `_next` in both `dictionary::find_klass` and `for_each_klass`); klass-oop reads keep
+untag_pointer. Full -Werror build of all 127 targets exit 0. **VALIDATION:** the
+for_each_loaded_class module's java8 [INFO] lines will now show whether the fixture is
+enumerated; if so, REMOVE the JDK8 best-effort gate in for_each_loaded_class.cpp (restore HARD
+coverage). The test gate stays for now so master holds green either way. FIRST library fix of
+the serial pass — landed via a fresh-context agent + full -Werror review.
 **Test fix (landed):** for_each_loaded_class.cpp gates the 5 fragile per-entry checks best-effort
 on JDK8 (HARD on JDK9+, HARD on JDK8 when the fixture WAS enumerated, [INFO] on a genuine miss)
 with NON-vacuous hard floors on EVERY JDK: `own_fixture_resolvable_via_find_class` (rides
