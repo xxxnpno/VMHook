@@ -4,8 +4,6 @@ cmake-build*/
 etc/
 out/
 x64/
-injector/x64/
-vmhook/x64/
 
 scratch/
 
@@ -26,8 +24,8 @@ Thumbs.db
 *.swp
 *.swo
 
-# Local Java fixtures
-out/
+# IDE-local per-user project state (must never be version-controlled)
+*.vcxproj.user
 
 # Test artefacts the integration test drops in cwd
 test_results.txt

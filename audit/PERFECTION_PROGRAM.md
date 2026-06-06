@@ -4,6 +4,31 @@
 > A sustained, multi-agent engineering program. This file is the **durable spine** —
 > it survives context compaction and session restarts. Update it every wave.
 
+## SUCCESS SCORECARD (from the /goal stop-hook — ALL must hold to finish)
+
+1. **≥100 specialized agents** — ✅ **MET: roster 109** (69 + 40 from the def wave; all
+   substantive). Every roster feature now has a `.claude/agents/<feature>-specialist.md`.
+2. **Exhaustive unit tests for EVERY possible input of each feature** — 7 live modules (~520
+   checks) + 28 pure-logic tests; Wave 3 (6 modules) quarantined → rework + re-enable. The def
+   wave MAPPED each feature's remaining test gaps (in each .md "Exhaustive test angles") +
+   surfaced **216 library bugs** (32 high) now catalogued in **audit/LIBRARY_BUGS.md** — the
+   "improve every feature" roadmap. NEXT: serial lib-fix pass (high first) + test-gap waves +
+   Wave-3 rework until every feature has exhaustive every-input coverage. [IN PROGRESS]
+3. **Every feature works Java 8 → latest** — Java 8-25 green; Java 26 blocked by make_java_object
+   (fix DRAFTED + patch saved, apply carefully → re-add 26). [CLOSING via the staged patch]
+4. **Full repo refactor + remove unused + improve structure; completely refactor the JVMs; every
+   file audited + improved** — per-file AUDIT WAVE IN FLIGHT (wf_05ca5f2d, 14 read-only clusters
+   covering every tracked file → findings: dead/unused, structure, bugs, improvements, doc).
+   On completion: consolidate → audit/AUDIT_FINDINGS.md → then EXECUTE: (a) Rework D = retire
+   legacy inline test_*() driver + legacy top-level fixtures from example.cpp (parity from the
+   example-driver audit cluster) → thin modular-only JVM harness; (b) delete dead code/files;
+   (c) per-file improvements (careful serial waves). [AUDIT IN PROGRESS → refactor next]
+5. **Tests on GitHub Actions only, never locally** — SATISFIED (local = compile-only throughout).
+
+EXECUTION ORDER from here: roster def wave (1) → commit → apply make_java_object (3) → re-add
+Java 26 → suite-safe Wave-3 rework + test-gap waves (2) → Rework D + dead-code purge + per-file
+audit wave (4) → loop until the scorecard holds.
+
 ## The mandate (verbatim intent)
 
 1. **≥100 specialized agents**, one per vmhook feature (decomposed finely). Each agent
