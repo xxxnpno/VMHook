@@ -263,9 +263,54 @@ Status: `green` (in CI, passing) · `thin` (exists, needs exhaustive expansion) 
 - **Phase 4 — Repo refactor**: delete dead code, build dirs, dead fixtures; restructure.
 - **Phase 5 — Per-file audit**: every tracked file audited + improved, recorded below.
 
+## Local compile-only validation (NEVER runs tests)
+
+- C++ (`-Werror`, compiles header + ALL modules + pure-logic tests):
+  `cmake --build build-mingw -j`  (build-mingw configured: MinGW g++, WARNINGS_AS_ERRORS=ON)
+- Java fixtures (compile, no run): `javac -d /tmp/fixcheck example/vmhook/*.java example/vmhook/fixtures/*.java`
+- DO NOT run `etc/run_local_mingw.sh` (it launches the JVM + injects + RUNS tests = violates rule).
+- DO NOT run `ctest`. GHA is the only test oracle.
+
+## Phase 1 (Rework D) prep — legacy inline `test_*()` → module parity map
+
+Call-site mapping (example.cpp:3226-3282 → modules) shows 1:1 coverage — every legacy
+inline test has a module equivalent (claim "all migrated" looks accurate):
+make_unique→make_unique · method_hook→hook_basic · force_return→return_set_primitives ·
+cancel→return_value_cancel · list/linked/set/map/hash/tree→collection_* · poly→
+poly_inherited_oop+interface_polymorphism · arg_mutation→return_set_arg · edge_primitives→
+field_primitives_get · string_edge→field_string+read_java_string · array_edge→field_arrays_* ·
+enum→enum_singleton · interface→interface_polymorphism · nested→nested_classes · throwing→
+method_throwing_call_site · overloaded→method_overload(+_java_dispatch) · return_types→
+method_return_types · for_each_*→for_each_* · read_java_string→read_java_string · global_ref→
+global_ref · method_enumeration→method_enumeration · on_exception→on_exception · scoped_hook→
+scoped_hook_raii · caller_info→return_caller · field_watcher→watch_static_field ·
+class_load_watcher→on_class_loaded.
+**Phase 1 GATE before deletion:** diff each legacy body vs its module to confirm the module
+asserts ≥ what the legacy test did (don't lose coverage). Then delete the legacy section +
+legacy top-level fixtures, shrinking example.cpp to a thin modular-only driver.
+
+## High-priority queued findings (act in serial passes)
+
+- **[CI] Add Java 26 to the matrix** — `ci.yml:18 env.JAVA_VERSIONS` is hardcoded
+  `["8","11","17","21","24","25"]`. **Eclipse Temurin 26 went GA 2026-04-13** (verified
+  via adoptium.net), so "every Java version up to latest" now requires **26**. Add "26"
+  (and keep an eye on the cadence: 27 ≈ Sept 2026). `actions/setup-java@temurin` resolves
+  GA versions. Serial edit + watch CI (a bad version id fails all JVM jobs). Also reword the
+  env comment to note the 6-month cadence so "latest" is maintained going forward.
+- **[build] Example DLL is `NO_WERROR`** (CMakeLists:205) by design — module style-warnings
+  don't fail CI; only hard errors + the strict first-party `tests/test_*.cpp` (-Werror) do.
+  So new-module integration only needs to *compile* clean (errors), not be warning-free.
+
 ## Progress log
 
-- **2026-06-06** — Phase 0. Baseline e23d1fc fully green (45 CI jobs). Built feature
+- **2026-06-06** — Phase 0 done. Baseline e23d1fc fully green (45 CI jobs). Built feature
   catalog (117 features), orchestration model, this spine. 37 specialist agent-defs
   pre-exist + spawnable; 60 JVM modules, 76 fixtures, 28 pure-logic tests in tree.
-  Next: Phase 1 (harness refactor) groundwork + Phase 2 wave 1.
+  Confirmed: existing modules are EXEMPLARY (field_primitives_get ~150 checks), so program
+  pivots to (a) cover the ~50 uncovered features, esp. G9 HotSpot-internals cross-JDK
+  linchpins, (b) refactor, (c) per-file audit. Fixture mechanism: auto-discovered by
+  Main.loadFixtures + auto-globbed by CMake → new modules/fixtures self-wire (no driver edit).
+- **2026-06-06** — Phase 2 Wave 1 LAUNCHED (workflow wf_0f3f75ae-7a5, 5 parallel agents):
+  field_primitives_set, method_call_wide_args, field_null_safety, find_methods_by_signature,
+  make_java_array. Each authors fixture + module + agent-def. Awaiting completion → integrate
+  → compile → push → watch CI.
