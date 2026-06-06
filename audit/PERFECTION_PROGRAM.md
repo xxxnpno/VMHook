@@ -378,6 +378,12 @@ New agent-reported library bugs (task #5):
 - **[low] object_base** has no operator==/hash → wrappers awkward as keys; identity only via
   base-qualified get_instance() raw-oop compare.
 
+## MILESTONE: suite GREEN again @ fb0df4a (Waves 1+2 + for_each_loaded_class fix)
+
+CI fb0df4a: ALL GREEN across the full matrix (Java 8-25 × all OS/compilers). Wave-3 quarantined.
+The for_each_loaded_class JDK8 fix works (windows·java8 green). Clean baseline. Then added
+**Java 26** to the matrix (ci.yml:18) — confirms whether vmhook works on the latest GA JDK.
+
 ## Wave 2 def-only result + agent-reported library bugs (roster 42 → 64; task #5)
 
 22 specialist agent-defs authored for already-tested features (collection_*, method_*,

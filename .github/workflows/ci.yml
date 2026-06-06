@@ -11,11 +11,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# All supported Java versions.  Update when a new release ships from Adoptium.
-# Java 8 is the oldest HotSpot vmhook still supports; the latest entry tracks
-# the newest GA build that Temurin publishes.
+# All supported Java versions.  Update when a new release ships from Adoptium
+# (6-month GA cadence: 26 ~Mar 2026, 27 ~Sep 2026, ...).  Java 8 is the oldest
+# HotSpot vmhook still supports; the latest entry tracks the newest GA build
+# that Temurin publishes (26 became GA on 2026-04-13).
 env:
-  JAVA_VERSIONS: '["8","11","17","21","24","25"]'
+  JAVA_VERSIONS: '["8","11","17","21","24","25","26"]'
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
