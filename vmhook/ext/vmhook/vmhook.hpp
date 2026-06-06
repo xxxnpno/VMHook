@@ -2237,6 +2237,44 @@ namespace vmhook
                 @brief Returns a pointer to the internal method flags of this method.
                 @details
                 These flags encode HotSpot-internal method properties such as _dont_inline.
+
+                The width and even the existence of Method::_flags in gHotSpotVMStructs
+                varies across HotSpot versions, and this accessor returns a
+                std::uint16_t* — so it is only correct to dereference when the live
+                field really is a 2-byte (u2) word.  Verified HotSpot reality:
+
+                  JDK 8 (incl. 8u442):  flags live in a `u1` bitfield group
+                                        (_dont_inline : 1, ...); there is NO member
+                                        literally named `_flags`, and
+                                        gHotSpotVMStructs exports NO Method::_flags
+                                        entry.  iterate_struct_entries(...) -> nullptr,
+                                        so this returns nullptr (set_dont_inline is a
+                                        safe no-op).
+                  JDK 11 .. 20:         `mutable u2 _flags`, with _dont_inline == 1<<2,
+                                        exported as `nonstatic_field(Method,_flags,u2)`.
+                                        This is the ONLY band where the pointer is
+                                        live, and the u2 width + bit-2 position are
+                                        exactly right.
+                  JDK 21+ (incl.        `_flags` became a `MethodFlags` object (u4
+                  24/25/26):            _status), _dont_inline moved to bit 12, and
+                                        the compilability bits relocated there too.
+                                        gHotSpotVMStructs exports NO Method::_flags
+                                        entry, so this again returns nullptr (no-op).
+
+                Net: on every shipping JDK the entry is either absent (8, 21+) or
+                present and exactly `u2` (11-20), so a fixed u2 read/write can never
+                reach a u1/u4 field and cannot clobber an adjacent Method field.
+
+                The type_string guard below makes that invariant explicit and
+                defensive: if some custom / future HotSpot ever DID export
+                Method::_flags at a non-u2 width, we refuse the (now mismatched)
+                u2 access and return nullptr — turning a would-be wrong-width write
+                into the same safe no-op we already exhibit on JDK 8 / 21+, rather
+                than scribbling 2 bytes over a u1 field or under-writing a u4 field.
+                We only reject on a POSITIVE width mismatch: an absent/empty
+                type_string is treated as "trust the entry" so behaviour on real
+                JDK 11-20 (where type_string == "u2") is byte-for-byte unchanged.
+                Detection mirrors the existing _java_mirror OopHandle dispatch.
             */
             auto get_flags() const
                 -> std::uint16_t*
@@ -2244,6 +2282,18 @@ namespace vmhook
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_flags") };
 
                 if (!entry)
+                {
+                    return nullptr;
+                }
+
+                // Reject a positively-identified non-u2 export (would never happen
+                // on JDK 8-26, where _flags is either unexported or exactly u2).
+                // A null/empty type_string keeps the legacy "trust the offset" path.
+                static const bool width_mismatch{
+                    entry->type_string
+                    && entry->type_string[0] != '\0'
+                    && std::strcmp(entry->type_string, "u2") != 0 };
+                if (width_mismatch)
                 {
                     return nullptr;
                 }
