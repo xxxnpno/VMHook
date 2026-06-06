@@ -458,6 +458,13 @@ full, and `make_java_object` (11188; null at 11237-11243) has NO GC-assisted slo
 null when an alloc needs a GC. make_java_array/make_java_string propagate the null. Blocks Java 26
 + flakes make_java_array (even small lengths).
 
+**FIX APPLIED @(this commit)** — patch applied cleanly + full -Werror build of all 127 targets
+exit 0. Pushed WITHOUT java26 first to validate NO-REGRESSION on green configs (make_java_string/
+make_java_array/return_set_arg on Java 8-25; the additive design means the TLAB fast path is
+unchanged so green configs should be byte-identical). If green → re-add java26 (criterion 3) +
+un-gate make_java_array best-effort checks. If a green config regresses (the make_java_string
+restructure) → revert. Original draft notes below.
+
 **DRAFTED FIX (saved: `audit/patches/make_java_object_jni_fallback.patch`; also in worktree branch
 `worktree-agent-a6422a8637c1961c0`):** STRICTLY-ADDITIVE GC-aware JNI fallback that runs ONLY when
 the TLAB path already returned null. Two new helpers — `detail::jni_new_primitive_array` (JNIEnv::

@@ -9877,6 +9877,225 @@ namespace vmhook
         }
 
         /*
+            @brief GC-aware primitive-array allocation via JNIEnv::New<Type>Array.
+            @details
+            A purely additive companion to vmhook::make_java_array's TLAB fast path:
+            the TLAB primitive (java_thread::allocate_tlab) can ONLY bump-allocate from
+            a thread's existing TLAB and returns nullptr the moment the buffer is
+            exhausted and the allocation would require a GC / heap slow-path
+            (vmhook.hpp:3877-3880).  This helper instead routes the allocation through
+            the JNI New<Type>Array entry, which IS the VM's GC-aware allocation slow
+            path: it allocates a fully-formed, correctly-typed, zeroed array (header,
+            klass, _length all stamped by the JVM), running a GC first if necessary.
+
+            The descriptor is the standard JVM primitive-array form ("[Z" "[B" "[S"
+            "[C" "[I" "[J" "[F" "[D"); reference arrays ("[L...;", "[[...") are NOT
+            handled here (they need NewObjectArray + an element jclass) and yield
+            nullptr so the caller can fall back / gate them as before.
+
+            The returned value is a RAW decoded heap oop (identical in form to what the
+            TLAB path returns): the JNI local reference is decoded with
+            jni_decode_object() and then released, so — exactly like the TLAB fast path
+            — the oop is unrooted on return and the caller must wire it into a GC root
+            (a field / interpreter slot) immediately, before any subsequent safepoint.
+            This matches the established contract of jni_make_unique() and the set_arg
+            String path, which both decode-then-DeleteLocalRef and rely on immediate
+            rooting.
+
+            Complexity: O(length) (the JVM zero-fills).  Exception safety: noexcept —
+            returns nullptr on any failure, leaving no pending JNI exception.
+
+            @param descriptor  JVM primitive-array descriptor ("[B", "[C", ...).
+            @param length      Element count; must be >= 0.
+            @return  Raw decoded array oop, or nullptr if unsupported / JNI unavailable.
+        */
+        inline auto jni_new_primitive_array(const std::string_view descriptor, const std::int32_t length) noexcept
+            -> void*
+        {
+            if (length < 0 || descriptor.size() != 2u || descriptor.front() != '[')
+            {
+                return nullptr;
+            }
+
+            // Map the element tag to its JNI New<Type>Array table slot.  The slots
+            // are spec-frozen and contiguous in the canonical element order
+            // (Boolean=175 .. Double=182) and are cross-checked in this file against
+            // the JNI slots already in use (FindClass=6, NewStringUTF=167, etc.).
+            std::size_t slot{ 0u };
+            switch (descriptor[1])
+            {
+                case 'Z': slot = 175u; break; // NewBooleanArray
+                case 'B': slot = 176u; break; // NewByteArray
+                case 'C': slot = 177u; break; // NewCharArray
+                case 'S': slot = 178u; break; // NewShortArray
+                case 'I': slot = 179u; break; // NewIntArray
+                case 'J': slot = 180u; break; // NewLongArray
+                case 'F': slot = 181u; break; // NewFloatArray
+                case 'D': slot = 182u; break; // NewDoubleArray
+                default:  return nullptr;     // reference / unknown element type
+            }
+
+            if (!vmhook::hotspot::ensure_current_java_thread() || !vmhook::hotspot::current_jni_env)
+            {
+                return nullptr;
+            }
+
+            // All New<Type>Array slots share the (JNIEnv*, jsize) -> jarray ABI.
+            using new_type_array_t = void* (*)(void*, std::int32_t);
+            void** const table{ *reinterpret_cast<void***>(vmhook::hotspot::current_jni_env) };
+            if (!table)
+            {
+                return nullptr;
+            }
+            new_type_array_t const new_type_array{ reinterpret_cast<new_type_array_t>(table[slot]) };
+            if (!new_type_array)
+            {
+                return nullptr;
+            }
+
+            void* const array_handle{ new_type_array(vmhook::hotspot::current_jni_env, length) };
+            // An OutOfMemoryError (or any pending exception) must be cleared so it
+            // cannot poison the caller's subsequent JNI/interpreter work.
+            vmhook::detail::jni_exception_clear();
+            if (!array_handle)
+            {
+                return nullptr;
+            }
+
+            void* const array_oop{ vmhook::detail::jni_decode_object(array_handle) };
+            vmhook::detail::jni_delete_local_ref(array_handle);
+            return array_oop;
+        }
+
+        /*
+            @brief GC-aware java.lang.String allocation via JNIEnv::NewString (UTF-16).
+            @details
+            A purely additive companion to vmhook::make_java_string's TLAB-based encode
+            path.  Where that path allocates the String instance and its backing
+            byte[]/char[] from the TLAB fast path (and so returns null when a GC is
+            needed), this builds the entire String — instance AND backing array,
+            internally rooted by the JVM for the whole operation — in one GC-aware JNI
+            call.  It takes the UTF-16 code units directly (NewString, slot 163, is
+            content-exact for every code point including astral surrogate pairs, unlike
+            the modified-UTF-8 NewStringUTF), so it is byte-for-byte faithful to the
+            same `units` the encode path computed.
+
+            Returns a RAW decoded String oop (same form as make_java_string); the local
+            reference is released, so the caller must root it immediately (the standard
+            contract here).  Because the WHOLE String is constructed inside JNI with no
+            intermediate unrooted oop exposed to the caller, this fallback is safe to
+            invoke even when an interleaved GC would otherwise relocate a half-built
+            object.
+
+            Complexity: O(N).  Exception safety: noexcept — nullptr on failure, no
+            pending JNI exception left behind.
+
+            @param units  UTF-16 code units (already decoded from the source text).
+            @return  Raw decoded java.lang.String oop, or nullptr on failure.
+        */
+        inline auto jni_new_string_utf16(const std::vector<std::uint16_t>& units) noexcept
+            -> void*
+        {
+            if (!vmhook::hotspot::ensure_current_java_thread() || !vmhook::hotspot::current_jni_env)
+            {
+                return nullptr;
+            }
+
+            using new_string_t = void* (*)(void*, const std::uint16_t*, std::int32_t);
+            new_string_t const new_string{ vmhook::detail::jni_function<163, new_string_t>(vmhook::hotspot::current_jni_env) };
+            if (!new_string)
+            {
+                return nullptr;
+            }
+
+            // NewString(env, nullptr, 0) is the well-defined way to make the empty
+            // String; pass a stable pointer either way.
+            const std::uint16_t* const data{ units.empty() ? nullptr : units.data() };
+            void* const string_handle{ new_string(vmhook::hotspot::current_jni_env, data, static_cast<std::int32_t>(units.size())) };
+            vmhook::detail::jni_exception_clear();
+            if (!string_handle)
+            {
+                return nullptr;
+            }
+
+            void* const string_oop{ vmhook::detail::jni_decode_object(string_handle) };
+            vmhook::detail::jni_delete_local_ref(string_handle);
+            return string_oop;
+        }
+
+        /*
+            @brief Decodes a UTF-8 byte string into a vector of UTF-16 code units.
+            @details
+            Extracted verbatim from make_java_string's original inline decoder so the
+            TLAB encode path and the GC-aware JNI NewString fallback share ONE source
+            of truth for the byte->char-unit conversion (they must agree exactly).
+            Malformed sequences yield U+FFFD; astral code points (>= U+10000) become a
+            surrogate pair.  The result is capped at 4096 code units to match the
+            ceiling read_java_string enforces.
+
+            Complexity: O(N).  Exception safety: noexcept-equivalent (only std::vector
+            growth, which the caller treats as fatal-on-throw via the noexcept callers).
+
+            @param value  UTF-8 input text.
+            @return  UTF-16 code units (LE in-memory), length <= 4096.
+        */
+        inline auto utf8_to_utf16(const std::string_view value)
+            -> std::vector<std::uint16_t>
+        {
+            std::vector<std::uint16_t> units;
+            units.reserve(value.size());
+            for (std::size_t i{ 0 }; i < value.size(); )
+            {
+                const std::uint8_t b0{ static_cast<std::uint8_t>(value[i]) };
+                std::uint32_t cp{ 0xFFFDu }; // U+FFFD replacement for malformed input
+                std::size_t adv{ 1 };
+                if (b0 < 0x80u)
+                {
+                    cp = b0;
+                }
+                else if ((b0 & 0xE0u) == 0xC0u && (i + 1) < value.size())
+                {
+                    cp = ((b0 & 0x1Fu) << 6)
+                       |  (static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu);
+                    adv = 2;
+                }
+                else if ((b0 & 0xF0u) == 0xE0u && (i + 2) < value.size())
+                {
+                    cp = ((b0 & 0x0Fu) << 12)
+                       | ((static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu) << 6)
+                       |  (static_cast<std::uint8_t>(value[i + 2]) & 0x3Fu);
+                    adv = 3;
+                }
+                else if ((b0 & 0xF8u) == 0xF0u && (i + 3) < value.size())
+                {
+                    cp = ((b0 & 0x07u) << 18)
+                       | ((static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu) << 12)
+                       | ((static_cast<std::uint8_t>(value[i + 2]) & 0x3Fu) << 6)
+                       |  (static_cast<std::uint8_t>(value[i + 3]) & 0x3Fu);
+                    adv = 4;
+                }
+
+                if (cp >= 0x10000u)
+                {
+                    cp -= 0x10000u;
+                    units.push_back(static_cast<std::uint16_t>(0xD800u + (cp >> 10)));
+                    units.push_back(static_cast<std::uint16_t>(0xDC00u + (cp & 0x3FFu)));
+                }
+                else
+                {
+                    units.push_back(static_cast<std::uint16_t>(cp));
+                }
+                i += adv;
+            }
+
+            if (units.size() > 4096u)
+            {
+                units.resize(4096u);
+            }
+            return units;
+        }
+
+        /*
             @brief Reads a Java String's content as a std::string via JNI.
             @details
             Calls JNIEnv::GetStringUTFChars (slot 169) to obtain a UTF-8 C string,
@@ -11287,15 +11506,33 @@ namespace vmhook
 
         The caller is responsible for filling in the element data after this call.
 
+        Allocation strategy (in order):
+          1. TLAB fast path: make_java_object() (unchanged) — used on every call and
+             on every config where it currently succeeds.
+          2. ADDITIVE GC-aware fallback (only when step 1 returns null AND
+             allow_jni_fallback is true AND the descriptor is a PRIMITIVE array):
+             jni_new_primitive_array() routes the allocation through JNIEnv::
+             New<Type>Array, the VM's GC-aware slow path.  This recovers the case
+             where the TLAB is exhausted and the allocation needs a GC — the
+             documented make_java_object GC-slow-path gap — without touching the fast
+             path.  Reference arrays are not covered by the fallback (they stay best-
+             effort / null, exactly as before).
+
         Complexity: O(1) on the fast TLAB path; O(N) on the fallback.
         Exception safety: noexcept — returns nullptr on any failure.
 
-        @param class_name    Internal JVM array type descriptor (e.g. "[B", "[C", "[Ljava/lang/Object;").
-        @param length        Number of elements; must be >= 0.
-        @param element_size  Size in bytes of each array element.
+        @param class_name         Internal JVM array type descriptor (e.g. "[B", "[C", "[Ljava/lang/Object;").
+        @param length             Number of elements; must be >= 0.
+        @param element_size       Size in bytes of each array element.
+        @param allow_jni_fallback When true (default), allows the GC-aware JNI
+                                  New<Type>Array fallback if the TLAB path fails.
+                                  Callers that hold an unrooted intermediate oop
+                                  across this call (e.g. make_java_string mid-encode)
+                                  pass false so a fallback GC cannot relocate it; they
+                                  supply their own rooted fallback instead.
         @return  Pointer to the raw array OOP with header and length initialised, or nullptr on failure.
     */
-    inline auto make_java_array(const std::string_view class_name, const std::int32_t length, const std::size_t element_size) noexcept
+    inline auto make_java_array(const std::string_view class_name, const std::int32_t length, const std::size_t element_size, const bool allow_jni_fallback = true) noexcept
         -> void*
     {
         if (length < 0)
@@ -11333,6 +11570,23 @@ namespace vmhook
         void* const array_oop{ vmhook::make_java_object(array_klass, array_header_size + static_cast<std::size_t>(length) * element_size) };
         if (!array_oop)
         {
+            // ADDITIVE GC-aware fallback (fast path above is untouched): the TLAB
+            // primitive returned null, which happens when the buffer is exhausted
+            // and the allocation needs a GC.  For PRIMITIVE arrays, retry through
+            // the JVM's GC-aware JNI New<Type>Array slow path, which allocates a
+            // fully-formed array (header/klass/_length stamped by the JVM, GC run
+            // first if needed).  This only runs on the already-failing path, so it
+            // cannot regress any config where the TLAB path currently succeeds.
+            if (allow_jni_fallback)
+            {
+                if (void* const jni_array_oop{ vmhook::detail::jni_new_primitive_array(class_name, length) })
+                {
+                    // The JVM already wrote the _length slot; the oop is in the same
+                    // raw decoded form the TLAB path returns.  Hand it straight back.
+                    return jni_array_oop;
+                }
+            }
+
             VMHOOK_LOG("{} vmhook::make_java_array('{}'): make_java_object failed for {} elements "
                        "({} bytes total).",
                        vmhook::error_tag, class_name, length,
@@ -11373,15 +11627,6 @@ namespace vmhook
             return nullptr;
         }
 
-        void* const string_oop{ vmhook::make_java_object(string_klass, string_klass->get_instance_size()) };
-        if (!string_oop)
-        {
-            VMHOOK_LOG("{} vmhook::make_java_string(): make_java_object for java.lang.String failed "
-                       "(instance_size={} bytes).",
-                       vmhook::error_tag, string_klass->get_instance_size());
-            return nullptr;
-        }
-
         const bool compact_string{ string_klass->find_field("coder").has_value() };
 
         // Decode the UTF-8 input into UTF-16 code units (astral code points
@@ -11389,57 +11634,9 @@ namespace vmhook
         // UTF-8 BYTES straight into a LATIN1 byte[] / char[], which conflated
         // byte count with char count and corrupted every non-ASCII string —
         // e.g. "é" (0xC3 0xA9) turned into the two chars U+00C3 U+00A9.
-        std::vector<std::uint16_t> units;
-        units.reserve(value.size());
-        for (std::size_t i{ 0 }; i < value.size(); )
-        {
-            const std::uint8_t b0{ static_cast<std::uint8_t>(value[i]) };
-            std::uint32_t cp{ 0xFFFDu }; // U+FFFD replacement for malformed input
-            std::size_t adv{ 1 };
-            if (b0 < 0x80u)
-            {
-                cp = b0;
-            }
-            else if ((b0 & 0xE0u) == 0xC0u && (i + 1) < value.size())
-            {
-                cp = ((b0 & 0x1Fu) << 6)
-                   |  (static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu);
-                adv = 2;
-            }
-            else if ((b0 & 0xF0u) == 0xE0u && (i + 2) < value.size())
-            {
-                cp = ((b0 & 0x0Fu) << 12)
-                   | ((static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu) << 6)
-                   |  (static_cast<std::uint8_t>(value[i + 2]) & 0x3Fu);
-                adv = 3;
-            }
-            else if ((b0 & 0xF8u) == 0xF0u && (i + 3) < value.size())
-            {
-                cp = ((b0 & 0x07u) << 18)
-                   | ((static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu) << 12)
-                   | ((static_cast<std::uint8_t>(value[i + 2]) & 0x3Fu) << 6)
-                   |  (static_cast<std::uint8_t>(value[i + 3]) & 0x3Fu);
-                adv = 4;
-            }
-
-            if (cp >= 0x10000u)
-            {
-                cp -= 0x10000u;
-                units.push_back(static_cast<std::uint16_t>(0xD800u + (cp >> 10)));
-                units.push_back(static_cast<std::uint16_t>(0xDC00u + (cp & 0x3FFu)));
-            }
-            else
-            {
-                units.push_back(static_cast<std::uint16_t>(cp));
-            }
-            i += adv;
-        }
-
-        // Bound the char count to the same 4096 ceiling read_java_string enforces.
-        if (units.size() > 4096u)
-        {
-            units.resize(4096u);
-        }
+        // Shared with the GC-aware JNI NewString fallback below so both encode
+        // the identical code units.
+        const std::vector<std::uint16_t> units{ vmhook::detail::utf8_to_utf16(value) };
         const std::int32_t char_count{ static_cast<std::int32_t>(units.size()) };
 
         // A compact (JDK 9+) String may use the LATIN1 coder only when every
@@ -11450,80 +11647,127 @@ namespace vmhook
             if (unit > 0xFFu) { all_latin1 = false; break; }
         }
 
-        if (compact_string && all_latin1)
+        // FAST PATH (unchanged): build the String + backing array from the TLAB.
+        // This lambda is the original encode body verbatim; the ONLY differences
+        // are (a) it returns the oop / nullptr instead of returning from the
+        // function, and (b) its internal make_java_array calls pass
+        // allow_jni_fallback=false.  That last point is critical: the String
+        // instance (string_oop) is an UNROOTED raw oop while the backing array is
+        // allocated, so letting the array allocation take a GC-triggering JNI
+        // slow path here could relocate string_oop and corrupt the write.  When
+        // the TLAB array allocation fails we instead fall through to the
+        // whole-String JNI NewString fallback (no unrooted intermediate), below.
+        const auto build_via_tlab{ [&]() -> void*
         {
-            void* const value_array{ vmhook::make_java_array("[B", char_count, sizeof(std::uint8_t)) };
-            if (!value_array)
+            void* const string_oop{ vmhook::make_java_object(string_klass, string_klass->get_instance_size()) };
+            if (!string_oop)
             {
-                VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the byte[] backing "
-                           "array (compact LATIN1 path, chars={}).",
-                           vmhook::error_tag, char_count);
+                VMHOOK_LOG("{} vmhook::make_java_string(): make_java_object for java.lang.String failed "
+                           "(instance_size={} bytes).",
+                           vmhook::error_tag, string_klass->get_instance_size());
                 return nullptr;
             }
 
-            auto* const bytes{ reinterpret_cast<std::uint8_t*>(value_array) + 16u };
-            for (std::int32_t index{ 0 }; index < char_count; ++index)
+            if (compact_string && all_latin1)
             {
-                bytes[index] = static_cast<std::uint8_t>(units[static_cast<std::size_t>(index)]);
+                void* const value_array{ vmhook::make_java_array("[B", char_count, sizeof(std::uint8_t), false) };
+                if (!value_array)
+                {
+                    VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the byte[] backing "
+                               "array (compact LATIN1 path, chars={}).",
+                               vmhook::error_tag, char_count);
+                    return nullptr;
+                }
+
+                auto* const bytes{ reinterpret_cast<std::uint8_t*>(value_array) + 16u };
+                for (std::int32_t index{ 0 }; index < char_count; ++index)
+                {
+                    bytes[index] = static_cast<std::uint8_t>(units[static_cast<std::size_t>(index)]);
+                }
+                vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
+                vmhook::set_field<std::uint8_t>(string_oop, string_klass, "coder", 0u);
             }
-            vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
-            vmhook::set_field<std::uint8_t>(string_oop, string_klass, "coder", 0u);
-        }
-        else if (compact_string)
+            else if (compact_string)
+            {
+                // UTF16 coder: byte[] holding 2 bytes per code unit, native-endian
+                // (HotSpot StringUTF16 stores chars in platform byte order; on the
+                // x64 CI that is little-endian, matching the units' in-memory bytes).
+                void* const value_array{ vmhook::make_java_array("[B", char_count * 2, sizeof(std::uint8_t), false) };
+                if (!value_array)
+                {
+                    VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the byte[] backing "
+                               "array (compact UTF16 path, chars={}).",
+                               vmhook::error_tag, char_count);
+                    return nullptr;
+                }
+
+                std::memcpy(reinterpret_cast<std::uint8_t*>(value_array) + 16u,
+                            units.data(), static_cast<std::size_t>(char_count) * 2u);
+                vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
+                vmhook::set_field<std::uint8_t>(string_oop, string_klass, "coder", 1u);
+            }
+            else
+            {
+                void* const value_array{ vmhook::make_java_array("[C", char_count, sizeof(std::uint16_t), false) };
+                if (!value_array)
+                {
+                    VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the char[] backing "
+                               "array (classic string path, chars={}).",
+                               vmhook::error_tag, char_count);
+                    return nullptr;
+                }
+
+                auto* const chars{ reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(value_array) + 16u) };
+                for (std::int32_t index{ 0 }; index < char_count; ++index)
+                {
+                    chars[index] = units[static_cast<std::size_t>(index)];
+                }
+
+                vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
+
+                if (string_klass->find_field("offset").has_value())
+                {
+                    vmhook::set_field<std::int32_t>(string_oop, string_klass, "offset", 0);
+                }
+
+                if (string_klass->find_field("count").has_value())
+                {
+                    vmhook::set_field<std::int32_t>(string_oop, string_klass, "count", char_count);
+                }
+            }
+
+            if (string_klass->find_field("hash").has_value())
+            {
+                vmhook::set_field<std::int32_t>(string_oop, string_klass, "hash", 0);
+            }
+
+            return string_oop;
+        } };
+
+        if (void* const tlab_string_oop{ build_via_tlab() })
         {
-            // UTF16 coder: byte[] holding 2 bytes per code unit, native-endian
-            // (HotSpot StringUTF16 stores chars in platform byte order; on the
-            // x64 CI that is little-endian, matching the units' in-memory bytes).
-            void* const value_array{ vmhook::make_java_array("[B", char_count * 2, sizeof(std::uint8_t)) };
-            if (!value_array)
-            {
-                VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the byte[] backing "
-                           "array (compact UTF16 path, chars={}).",
-                           vmhook::error_tag, char_count);
-                return nullptr;
-            }
-
-            std::memcpy(reinterpret_cast<std::uint8_t*>(value_array) + 16u,
-                        units.data(), static_cast<std::size_t>(char_count) * 2u);
-            vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
-            vmhook::set_field<std::uint8_t>(string_oop, string_klass, "coder", 1u);
+            return tlab_string_oop;
         }
-        else
+
+        // ADDITIVE GC-aware fallback (the fast path above is unchanged and ran
+        // first): the TLAB path returned null because the String instance or its
+        // backing array could not be allocated without a GC.  Rebuild the entire
+        // String — instance AND backing array, rooted internally by the JVM for
+        // the whole operation — via the GC-aware JNIEnv::NewString slow path,
+        // using the SAME code units we just computed (content-exact for every
+        // code point, including astral surrogate pairs).  No unrooted
+        // intermediate oop is exposed, so this is GC-safe; it only runs on the
+        // already-failing path, so it cannot regress any config where the TLAB
+        // path currently succeeds.
+        if (void* const jni_string_oop{ vmhook::detail::jni_new_string_utf16(units) })
         {
-            void* const value_array{ vmhook::make_java_array("[C", char_count, sizeof(std::uint16_t)) };
-            if (!value_array)
-            {
-                VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the char[] backing "
-                           "array (classic string path, chars={}).",
-                           vmhook::error_tag, char_count);
-                return nullptr;
-            }
-
-            auto* const chars{ reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(value_array) + 16u) };
-            for (std::int32_t index{ 0 }; index < char_count; ++index)
-            {
-                chars[index] = units[static_cast<std::size_t>(index)];
-            }
-
-            vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
-
-            if (string_klass->find_field("offset").has_value())
-            {
-                vmhook::set_field<std::int32_t>(string_oop, string_klass, "offset", 0);
-            }
-
-            if (string_klass->find_field("count").has_value())
-            {
-                vmhook::set_field<std::int32_t>(string_oop, string_klass, "count", char_count);
-            }
+            VMHOOK_LOG("{} vmhook::make_java_string(): TLAB encode path failed; recovered via the "
+                       "GC-aware JNIEnv::NewString fallback ({} code units).",
+                       vmhook::info_tag, char_count);
+            return jni_string_oop;
         }
 
-        if (string_klass->find_field("hash").has_value())
-        {
-            vmhook::set_field<std::int32_t>(string_oop, string_klass, "hash", 0);
-        }
-
-        return string_oop;
+        return nullptr;
     }
 
     // --- Array element access -------------------------------------------------
