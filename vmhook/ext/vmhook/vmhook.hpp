@@ -1818,17 +1818,6 @@ namespace vmhook
         }
 
         /*
-            @brief Reads a 32-bit pointer field from a JVM structure and zero-extends it.
-        */
-        template<typename structure_type>
-        inline static auto read_pointer(const void* const base, const std::uint64_t offset) noexcept
-            -> structure_type*
-        {
-            const std::uint32_t raw{ *reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::uint8_t*>(base) + offset) };
-            return reinterpret_cast<structure_type*>(static_cast<std::uintptr_t>(raw));
-        }
-
-        /*
             @brief Safely reads a pointer value from a memory address without faulting.
             @details
             Uses os::safe_read which maps to ReadProcessMemory on Windows and a
@@ -16527,18 +16516,6 @@ namespace vmhook
             }
         }
 
-        /*
-            @brief Legacy alias retained for source compatibility.
-            @details
-            ensure_dr_handler_installed used to be the public entry point.
-            New code should call dr_arm_one() so the unregister path
-            stays balanced.  Kept here so external consumers that might
-            have built on the old name don't break at upgrade time.
-        */
-        inline auto ensure_dr_handler_installed() -> void
-        {
-            dr_arm_one();
-        }
     } // namespace detail
 #endif // VMHOOK_HAS_HW_DATA_BREAKPOINTS
 

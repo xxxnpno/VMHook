@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "vmhook",
-  "version-semver": "0.4.0",
+  "version-semver": "0.5.3",
   "description": "Single-header, header-only C++23 library for inspecting, wrapping, calling, and hooking a running HotSpot JVM from native code.",
   "homepage": "https://github.com/xxxnpno/vmhook",
   "documentation": "https://github.com/xxxnpno/vmhook/blob/master/README.md",
