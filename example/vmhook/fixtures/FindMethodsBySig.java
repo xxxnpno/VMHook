@@ -1,0 +1,288 @@
+package vmhook.fixtures;
+
+import vmhook.Harness;
+
+/**
+ * Fixture for the find_methods_by_signature feature (area: methods).
+ *
+ * The ONE thing under test:
+ *
+ *     vmhook::find_methods_by_signature<W>(descriptor)
+ *         -> std::vector<std::string>   // names of EVERY declared method on W's
+ *                                       // klass whose exact JVM descriptor == descriptor
+ *
+ * find_methods_by_signature is the obfuscated-build selector: the method NAME
+ * rotates between builds, the JVM DESCRIPTOR is stable, so callers look a method
+ * up by descriptor and get back ALL matching names (so a non-unique descriptor is
+ * detectable instead of silently taking the first).  It is a thin filter over
+ * get_class_methods<W>(), which walks InstanceKlass::_methods DIRECTLY (no JNI).
+ * That array holds every method this class DECLARES -- including the synthetic
+ * constructor {@code <init>} and the static initializer {@code <clinit>} -- but
+ * NOT methods inherited from java.lang.Object.  The match is EXACT string
+ * equality on the descriptor (no normalization, no validation).
+ *
+ * This fixture is shaped so the resulting (name -> descriptor) map is known
+ * EXACTLY and exercises every discrimination axis the matcher must respect:
+ *
+ *   ARG-TYPE / WIDTH:
+ *     f(int)        (I)I        | f(long)      (J)J
+ *     sFn(short)    (S)S        | bFn(byte)    (B)B
+ *     cFn(char)     (C)C        | zFn(boolean) (Z)Z
+ *     ffn(float)    (F)F        | dfn(double)  (D)D
+ *   ARITY:
+ *     f()           ()V         | g(int,int)   (II)I   | g()          ()J
+ *   RETURN-TYPE discrimination (same arg list, different return):
+ *     f(int)        (I)I        VS  fL(int)     (I)J
+ *     f()           ()V         VS  retI()      ()I     VS  g()          ()J
+ *   REFERENCE vs primitive return, and String vs Object:
+ *     f(String)     (Ljava/lang/String;)Ljava/lang/String;
+ *     makeObj()     ()Ljava/lang/Object;
+ *   ARRAYS (1-D primitive, 2-D primitive, 1-D reference):
+ *     arr(int[])      ([I)[I
+ *     arr2(int[][])   ([[I)[[I
+ *     arrStr(String[])([Ljava/lang/String;)[Ljava/lang/String;
+ *   MULTI-SLOT (long/double occupy two stack slots):
+ *     mix(int,long,double)  (IJD)D
+ *   STATIC methods are found exactly like instance methods (the descriptor walk
+ *   ignores JVM_ACC_STATIC):
+ *     sf(int)       (I)I        -> SHARES (I)I with instance f(int)
+ *     sf(String)    (Ljava/lang/String;)Ljava/lang/String; -> SHARES with f(String)
+ *     sUnique(long,long)  (JJ)J -> a genuinely-unique static descriptor
+ *
+ * So, by design and verified against `javap -s`:
+ *   (I)I                                       -> { f , sf }    (instance + static)
+ *   (J)J                                       -> { f }
+ *   (Ljava/lang/String;)Ljava/lang/String;     -> { f , sf }    (instance + static)
+ *   ()V                                        -> contains { f , uniqueVoid , <init> }
+ *   (II)I                                      -> { g }
+ *   ([I)[I                                     -> { arr }
+ *   (I)J                                       -> { fL }         (return-type proof)
+ *   (D)D / (F)F / (S)S / (B)B / (C)C / (Z)Z    -> each { its one method }
+ *   ([[I)[[I / ([L..String;)[L..String;        -> { arr2 } / { arrStr }
+ *   (IJD)D                                     -> { mix }
+ *   (JJ)J                                      -> { sUnique }
+ *   ()I                                        -> { retI }
+ *   ()J                                        -> { g }
+ *   ()Ljava/lang/Object;                       -> { makeObj }
+ *
+ * NOTE on (I)I: the task brief sketched "(I)I -> {f}", but it ALSO asked for a
+ * static int sf(int) AND for the String descriptor to be { f , sf }.  A static
+ * int sf(int) IS (I)I, so (I)I genuinely contains BOTH f and sf.  Asserting the
+ * TRUE set { f , sf } is the stronger test: it simultaneously proves static
+ * methods are enumerated, that ALL matches are returned (not just the first),
+ * and -- via the (I)J -> {fL} check -- that return type still discriminates.
+ *
+ * The probe's run() additionally dispatches several of these methods through
+ * REAL bytecode (invokevirtual / invokestatic), so the native side can re-run
+ * find_methods_by_signature AFTER live dispatch + JIT and prove the _methods
+ * enumeration is stable (calling/compiling a method does not perturb it).
+ *
+ * Java 8 source compatibility only: no var / records / switch-expressions /
+ * text-blocks / sealed / List.of; only java.* (none past Java 8) + vmhook.Harness.
+ * Every method body returns a constant / trivial value -- behaviour is irrelevant;
+ * only the declared (name, descriptor) shape matters.
+ */
+public final class FindMethodsBySig
+{
+    /** Native sets this true to request the probe action; cleared after. */
+    public static volatile boolean go;
+
+    /** The probe action sets this true when it has run; native polls it. */
+    public static volatile boolean done;
+
+    // ---- Witnesses written by the probe through real bytecode -------------
+    public static volatile int     wFInt;     // result of f(7)
+    public static volatile long    wFLong;    // result of f(11L)
+    public static volatile int     wGII;      // result of g(3,4)
+    public static volatile int     wArrLen;   // arr(new int[]{...}).length
+    public static volatile int     wSfInt;    // sf(9)  (static dispatch)
+    public static volatile long    wSUnique;  // sUnique(2L,3L) (static dispatch)
+
+    // =======================================================================
+    //  Instance methods.  Declaration order is intentionally scrambled vs
+    //  HotSpot's name-symbol sort order; the enumeration must not depend on it.
+    //  Bodies return constants -- only the descriptor matters.
+    // =======================================================================
+
+    /** (I)I -- SHARES its descriptor with the static sf(int). */
+    public int f(final int x)
+    {
+        return x + 1;
+    }
+
+    /** (J)J -- unique. */
+    public long f(final long x)
+    {
+        return x + 1L;
+    }
+
+    /** (Ljava/lang/String;)Ljava/lang/String; -- SHARES with static sf(String). */
+    public String f(final String x)
+    {
+        return (x == null) ? "" : x;
+    }
+
+    /** ()V -- SHARES ()V with uniqueVoid, <init> and <clinit>. */
+    public void f()
+    {
+        // no-op
+    }
+
+    /** (II)I -- the two-int-arg discriminator (arity vs (I)I). */
+    public int g(final int a, final int b)
+    {
+        return a + b;
+    }
+
+    /** ()J -- no-arg long return (return-type discrimination vs ()V and ()I). */
+    public long g()
+    {
+        return 42L;
+    }
+
+    /** ()V -- a deliberately-unique NAME on the shared ()V descriptor. */
+    public void uniqueVoid()
+    {
+        // no-op
+    }
+
+    /** ([I)[I -- 1-D primitive array in and out. */
+    public int[] arr(final int[] a)
+    {
+        return (a == null) ? new int[0] : a;
+    }
+
+    /** (I)J -- same arg list as f(int) but a DIFFERENT return type. */
+    public long fL(final int x)
+    {
+        return (long) x;
+    }
+
+    /** ()I -- no-arg int return (return-type discrimination vs ()V and ()J). */
+    public int retI()
+    {
+        return 5;
+    }
+
+    /** (S)S -- short width. */
+    public short sFn(final short x)
+    {
+        return x;
+    }
+
+    /** (B)B -- byte width. */
+    public byte bFn(final byte x)
+    {
+        return x;
+    }
+
+    /** (C)C -- char width. */
+    public char cFn(final char x)
+    {
+        return x;
+    }
+
+    /** (Z)Z -- boolean. */
+    public boolean zFn(final boolean x)
+    {
+        return x;
+    }
+
+    /** (F)F -- float. */
+    public float ffn(final float x)
+    {
+        return x;
+    }
+
+    /** (D)D -- double. */
+    public double dfn(final double x)
+    {
+        return x;
+    }
+
+    /** (IJD)D -- int + long + double spans the two-slot boundary. */
+    public double mix(final int a, final long b, final double c)
+    {
+        return a + b + c;
+    }
+
+    /** ()Ljava/lang/Object; -- reference return distinct from String. */
+    public Object makeObj()
+    {
+        return new Object();
+    }
+
+    /** ([[I)[[I -- 2-D primitive array. */
+    public int[][] arr2(final int[][] a)
+    {
+        return (a == null) ? new int[0][] : a;
+    }
+
+    /** ([Ljava/lang/String;)[Ljava/lang/String; -- 1-D reference array. */
+    public String[] arrStr(final String[] a)
+    {
+        return (a == null) ? new String[0] : a;
+    }
+
+    // =======================================================================
+    //  Static methods.  The descriptor walk ignores JVM_ACC_STATIC, so these
+    //  appear in the SAME result set as the instance methods of equal descriptor.
+    // =======================================================================
+
+    /** (I)I -- shares (I)I with instance f(int). */
+    public static int sf(final int x)
+    {
+        return x * 2;
+    }
+
+    /** (Ljava/lang/String;)Ljava/lang/String; -- shares with instance f(String). */
+    public static String sf(final String x)
+    {
+        return (x == null) ? "" : x;
+    }
+
+    /** (JJ)J -- a genuinely-unique static descriptor (two longs, four slots). */
+    public static long sUnique(final long a, final long b)
+    {
+        return a + b;
+    }
+
+    // ---- Probe dispatch ---------------------------------------------------
+
+    /**
+     * Drives REAL bytecode through a representative spread of the methods so the
+     * native side can re-enumerate AFTER live dispatch/JIT and prove stability.
+     * Uses both invokevirtual (on a fresh instance) and invokestatic.
+     */
+    private static void driveDispatch()
+    {
+        final FindMethodsBySig obj = new FindMethodsBySig();
+        wFInt   = obj.f(7);                       // invokevirtual (I)I
+        wFLong  = obj.f(11L);                     // invokevirtual (J)J
+        wGII    = obj.g(3, 4);                    // invokevirtual (II)I
+        wArrLen = obj.arr(new int[] { 1, 2, 3 }).length; // invokevirtual ([I)[I
+        obj.f();                                  // invokevirtual ()V
+        obj.uniqueVoid();                         // invokevirtual ()V
+        wSfInt   = FindMethodsBySig.sf(9);        // invokestatic   (I)I
+        wSUnique = FindMethodsBySig.sUnique(2L, 3L); // invokestatic (JJ)J
+    }
+
+    static
+    {
+        Harness.register(new Harness.Probe()
+        {
+            @Override
+            public boolean pending()
+            {
+                return FindMethodsBySig.go && !FindMethodsBySig.done;
+            }
+
+            @Override
+            public void run()
+            {
+                driveDispatch();
+                FindMethodsBySig.done = true;
+            }
+        });
+    }
+}
