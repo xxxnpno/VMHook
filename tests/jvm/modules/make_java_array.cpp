@@ -489,22 +489,19 @@ VMHOOK_JVM_MODULE(make_java_array)
             const std::int32_t len{ k_lengths[k] };
             const std::string suffix{ std::string{ tag[di] } + "_len" + std::to_string(len) };
             const bool nn{ r.nonnull[k].load() };
-            // HARD only for a PRIMITIVE array at a SMALL length: those never need
-            // a GC to allocate and don't depend on the JDK8 ref-array fallback, so
-            // they are universal.  A reference array (JNI FindClass fallback) OR a
-            // LARGE (>=256) allocation is best-effort: make_java_object returns
-            // null when an allocation needs a GC (a real lib bug, config/GC-timing
-            // variant — logged in the spine), which surfaces flakily on GC-active
-            // JDKs (e.g. java11 G1).  When the alloc DID land we still assert its
-            // correctness HARD; when it returned null we record [INFO] so GC /
-            // fallback variance never reds CI.  Small-primitive coverage + element
-            // round-trips + the make_java_string [B/[C deps are the hard floor.
-            const bool best_effort{ spec.is_reference || len >= 256 };
+            // PRIMITIVE arrays are HARD at EVERY length now: make_java_object's
+            // GC-aware JNI New<Type>Array fallback (the landed make_java_object fix)
+            // covers the previously-flaky large/GC-needed allocations, so [Z..[D at
+            // len 0/1/3/256 must all succeed on every JDK (incl. java26).  Only
+            // REFERENCE arrays ([L...) stay best-effort: the fix deliberately does
+            // NOT add a NewObjectArray fallback, so on a GC-active config they can
+            // still return null — recorded [INFO], asserted HARD when they DID land.
+            const bool best_effort{ spec.is_reference };
             if (best_effort && !nn)
             {
-                ctx.record("[INFO] native_" + suffix + ": SKIPPED — make_java_array returned null"
-                           " (large alloc needing a GC, or JDK8 ref-array fallback) on this JVM;"
-                           " real make_java_object slow-path-alloc gap logged in the spine.");
+                ctx.record("[INFO] native_" + suffix + ": SKIPPED — reference-array make_java_array"
+                           " returned null on this JVM (no NewObjectArray fallback yet); native"
+                           " primitive coverage + element round-trips remain the hard floor.");
                 continue;
             }
             ctx.check("native_nonnull_" + suffix, nn);

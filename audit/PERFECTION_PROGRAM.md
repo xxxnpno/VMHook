@@ -29,8 +29,12 @@
    legacy pre-roll, and/or harden those modules to self-establish their preconditions; (c)
    re-apply incrementally + CI-validate the modular-only harness on the crashing configs first.
    The Rework-D diff is recoverable (commit 240b57a + worktree branch worktree-agent-aac751078).
-3. **Every feature works Java 8 → latest** — Java 8-25 green; Java 26 blocked by make_java_object
-   (fix DRAFTED + patch saved, apply carefully → re-add 26). [CLOSING via the staged patch]
+3. **Every feature works Java 8 → latest** — ✅ **DONE**: Java 8,11,17,21,24,25,**26** all GREEN
+   across the matrix. The make_java_object GC-aware JNI fallback (additive; validated no-regression
+   on 8-25, then unblocked windows·msvc·java26 which had failed) let Java 26 (Temurin GA 2026-04-13)
+   into the matrix on all 6 configs. make_java_array PRIMITIVE native checks UN-GATED back to HARD
+   at every length (the fallback covers them); only reference-array allocs stay best-effort (no
+   NewObjectArray fallback yet — a remaining low-pri lib item).
 4. **Full repo refactor + remove unused + improve structure; completely refactor the JVMs; every
    file audited + improved** — per-file AUDIT WAVE IN FLIGHT (wf_05ca5f2d, 14 read-only clusters
    covering every tracked file → findings: dead/unused, structure, bugs, improvements, doc).
