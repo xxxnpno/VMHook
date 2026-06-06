@@ -325,7 +325,40 @@ state, exposing a latent fragility on the slowest config) — dispatched to the
 for_each_loaded_class-specialist (agent a280d34f0) to fix robustly; will batch its fix with the
 Wave 3 push for one green run. find_class_context_loader agent-def still TODO.
 
-## Wave 3 module-gap result (6 new modules, ~535 checks; validated, pending push)
+## ⚠️ Wave 3 QUARANTINED (.wip) — JVM crash + matrix-wide cascade (rework before re-add)
+
+CI 3300494 (after the libc++ fix let them finally RUN their JVM tests) exposed that Wave-3
+modules CRASH the JVM on Windows (no TOTAL line — "JVM likely crashed") and cascade-fail across
+the whole matrix even on linux (registered_static_field_marker_resolves, E5_override_null_seed_
+then_restore, + later modules dog_*/global_ref_*/instance_allow_through_*). ROOT CAUSE: the
+state-mutating modules corrupt SHARED in-process suite state for every module after them —
+**register_class** rebinds/mutates the global type_to_class_map + factory map; **hook_reinstall_
+after_shutdown** calls the GLOBAL `shutdown_hooks()` mid-suite (the milestone's known latch
+hazard — tears down EVERY other module's hooks/state); **find_class_context_loader** (its agent
+errored) fails its own java8 host-classloader checks. They each PASS in isolation (compiled,
+javac-clean) but BREAK the full suite — the exact "isolation-green can fail in full-suite
+(ordering/state)" lesson, in its severe form.
+
+**ACTION TAKEN:** all 6 modules + 6 fixtures renamed `.wip` (excluded from `tests/jvm/modules/
+*.cpp` + `example/vmhook/fixtures/*.java` globs; verified DLL relinks without them, "ninja: no
+work to do" after deleting their objects). Suite restored to Waves 1+2 + the for_each_loaded_class
+fix. Files preserved in place for rework.
+
+**REWORK PLAN (re-add suite-safe, incrementally, each its own CI cycle):**
+1. wrapper_pattern, collection_iteration_safety — likely safe (read-mostly); re-enable first, verify.
+2. hook_chaining — scoped_hook only; verify it cleans up + doesn't crash; re-enable.
+3. find_class_context_loader — finish (agent errored) + java8-gate host-classloader checks; re-enable.
+4. register_class — must use ISOLATED throwaway wrapper types + NOT leave the global registry
+   mutated (snapshot/restore, or only-additive registrations to fresh class names). Re-enable.
+5. hook_reinstall_after_shutdown — must NOT call global shutdown_hooks() mid-suite (it nukes other
+   modules). Either run it LAST + fully restore, or test reinstall via per-handle stop()/re-hook
+   without the global teardown. Likely the crasher. Re-enable last, alone.
+**NEW SUITE-SAFETY RULE for all future test-authoring prompts:** a module may NOT mutate global
+process state other modules rely on (type registry, global shutdown_hooks, persistent hooks) —
+use isolated types, scoped_hook RAII, and snapshot/restore; never call global shutdown_hooks()
+mid-suite. Crash-safety is a hard requirement (a crash voids the whole run's TOTAL).
+
+## Wave 3 module-gap result (6 new modules, ~535 checks; QUARANTINED — see above)
 
 6 exhaustive new modules+fixtures authored (wrapper_pattern 104, register_class 66,
 find_class_context_loader 69, hook_chaining 137, hook_reinstall_after_shutdown 110,
