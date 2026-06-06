@@ -77,6 +77,7 @@
 #include "../harness.hpp"
 
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <memory>
 #include <string>

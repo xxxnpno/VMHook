@@ -84,6 +84,10 @@
 #include "../harness.hpp"
 
 #include <atomic>
+#include <mutex>
+#include <memory>
+#include <map>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <string>
