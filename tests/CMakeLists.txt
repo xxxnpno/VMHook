@@ -90,6 +90,7 @@ vmhook_add_test(iterate_entries_safety         SOURCES test_iterate_entries_safe
 vmhook_add_test(os_release_and_protect_edges   SOURCES test_os_release_and_protect_edges.cpp)
 vmhook_add_test(array_element_helpers          SOURCES test_array_element_helpers.cpp)
 vmhook_add_test(return_value                    SOURCES test_return_value.cpp)
+vmhook_add_test(object_factory                  SOURCES test_object_factory.cpp)
 vmhook_add_test(version_macros                  SOURCES test_version_macros.cpp)
 target_compile_definitions("vmhook_test_version_macros" PRIVATE
     VMHOOK_CMAKE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
