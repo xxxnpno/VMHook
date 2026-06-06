@@ -2281,7 +2281,12 @@ namespace vmhook
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_flags") };
 
-                if (!entry)
+                // Guard `this` before computing `this + offset`: a freed/invalid
+                // Method* (verify_hooks "Method freed" path, post-class-unload)
+                // would otherwise yield a wild address that set_dont_inline()
+                // then WRITES to.  Mirrors every other method accessor's
+                // is_valid_pointer(this) guard (e.g. get_name at ~1964).
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
                 {
                     return nullptr;
                 }
