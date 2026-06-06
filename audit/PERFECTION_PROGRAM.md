@@ -14,11 +14,21 @@
    surfaced **216 library bugs** (32 high) now catalogued in **audit/LIBRARY_BUGS.md** — the
    "improve every feature" roadmap. NEXT: serial lib-fix pass (high first) + test-gap waves +
    Wave-3 rework until every feature has exhaustive every-input coverage. [IN PROGRESS]
-   **Rework D DONE (criterion-4 "completely refactor the JVMs"):** example.cpp 3383→278 lines
-   (−92%), Main.java 342→82 (−76%), 10 legacy top-level Java fixtures + 13 legacy wrapper classes
-   + 37 legacy test_*() deleted; thin modular-only driver (run_all(ctx) + main_class stop-JVM +
-   DllMain kept). No module hard-depends on a deleted class (verified). Compile+javac clean;
-   CI-validating all JVM modules on the modular-only harness.
+   **Rework D ATTEMPTED @240b57a then REVERTED @(next):** the thin modular-only driver
+   (example.cpp 3383→278, Main.java 342→82, legacy fixtures/wrappers/test_*() deleted) compiled +
+   javac'd clean and NO module hard-deps a deleted class — but CI CRASHED on 6 configs
+   (windows·mingw·java17/21/24/25 after nested_classes; windows·msvc·java21 after
+   dont_inline_dont_compile; linux·gcc·java24). ROOT CAUSE: the modular harness was NEVER run
+   STANDALONE — it always ran AFTER the ~40 legacy tests, which warmed the JVM (class-loading,
+   JIT/deopt, GCs, and PACING between probes). Removing them exposed cold-JVM/timing crashes in
+   JIT/class-loading-sensitive modules (full-suite-state hazard, same class as Wave 3). Reverted
+   to keep master green. **REWORK PLAN (before re-applying):** make the modular harness robust
+   STANDALONE — (a) diagnose the nested_classes/dont_inline_dont_compile cold crashes (likely a
+   class not yet loaded / JIT-state assumption the legacy tests used to establish); (b) add a
+   warm-up phase to the thin driver (force-load + a settle delay + maybe a GC) replicating the
+   legacy pre-roll, and/or harden those modules to self-establish their preconditions; (c)
+   re-apply incrementally + CI-validate the modular-only harness on the crashing configs first.
+   The Rework-D diff is recoverable (commit 240b57a + worktree branch worktree-agent-aac751078).
 3. **Every feature works Java 8 → latest** — Java 8-25 green; Java 26 blocked by make_java_object
    (fix DRAFTED + patch saved, apply carefully → re-add 26). [CLOSING via the staged patch]
 4. **Full repo refactor + remove unused + improve structure; completely refactor the JVMs; every
