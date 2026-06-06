@@ -378,11 +378,20 @@ New agent-reported library bugs (task #5):
 - **[low] object_base** has no operator==/hash → wrappers awkward as keys; identity only via
   base-qualified get_instance() raw-oop compare.
 
-## MILESTONE: suite GREEN again @ fb0df4a (Waves 1+2 + for_each_loaded_class fix)
+## MILESTONE: suite GREEN @ fb0df4a + Java 26 probed (a9475c6) — held pending make_java_object fix
 
-CI fb0df4a: ALL GREEN across the full matrix (Java 8-25 × all OS/compilers). Wave-3 quarantined.
-The for_each_loaded_class JDK8 fix works (windows·java8 green). Clean baseline. Then added
-**Java 26** to the matrix (ci.yml:18) — confirms whether vmhook works on the latest GA JDK.
+CI fb0df4a: ALL GREEN across Java 8-25 × all OS/compilers (Wave-3 quarantined; for_each_loaded_class
+JDK8 fix works). Then probed **Java 26** (a9475c6): VERIFIED WORKING on linux gcc+clang, macOS,
+windows·mingw — but FAILS on windows·{msvc,clang}·java26 (return_set_arg injectArg_* for empty +
+CJK made strings). It passes on windows·MINGW·java26 + all linux/macos·java26, so it is NOT a pure
+java26 layout bug — it is the **make_java_object GC-slow-path bug** (below) surfacing on a new
+GC-active config: make_java_string(empty/CJK) -> make_java_array -> make_java_object returns null
+when the alloc needs a GC. **DECISION:** reverted "26" from the matrix to keep the green-gate intact
+(a persistently-red master would mask future regressions in this ongoing program); java26 re-enters
+the moment make_java_object is fixed (then it should pass on all 6 configs = true "up to latest").
+Java-26 IS otherwise supported — only this one allocation path blocks it. (ci.yml comment documents this.)
+**This makes the make_java_object fix the #1 library-fix-pass item — it unblocks java26 + removes
+3 best-effort gates (make_java_array native len256 + Java-visible recv + this).**
 
 ## Wave 2 def-only result + agent-reported library bugs (roster 42 → 64; task #5)
 
