@@ -410,6 +410,37 @@ Full bug detail lives in each `.claude/agents/<f>-specialist.md` "Flaws I found"
   total element caps can silently truncate; walkers don't cross-check emitted count vs `size`.
 - (make_java_array Java-visible store is GC-fragile late in a heavy sweep — see below; gated.)
 
+## make_java_object GC-slow-path — FIX DRAFTED (patch saved; apply carefully next, task #5)
+
+**Root cause (agent-confirmed):** `make_java_object` only allocates via the TLAB bump-pointer
+fast path; `java_thread::allocate_tlab` (vmhook.hpp:3877-3880) returns null when the TLAB is too
+full, and `make_java_object` (11188; null at 11237-11243) has NO GC-assisted slow path → returns
+null when an alloc needs a GC. make_java_array/make_java_string propagate the null. Blocks Java 26
++ flakes make_java_array (even small lengths).
+
+**DRAFTED FIX (saved: `audit/patches/make_java_object_jni_fallback.patch`; also in worktree branch
+`worktree-agent-a6422a8637c1961c0`):** STRICTLY-ADDITIVE GC-aware JNI fallback that runs ONLY when
+the TLAB path already returned null. Two new helpers — `detail::jni_new_primitive_array` (JNIEnv::
+New<Type>Array, slots 175-182, the VM's GC-aware slow path) + `detail::jni_new_string_utf16`
+(JNIEnv::NewString slot 163, builds the whole rooted String). make_java_array gains
+`allow_jni_fallback=true` (fallback only inside `if(!array_oop)`); make_java_string's TLAB body →
+`build_via_tlab()` lambda (runs first), JNI NewString only on null. `make_java_object` itself is
+UNTOUCHED. Compile-validated JDK8+26 -Werror (70/70 TUs + ODR). Uses JNI (already proven in-tree:
+jni_make_unique etc.), not raw VM symbols. Confidence MEDIUM (unverified at runtime on the failing
+windows·msvc/clang·java26 — if current_jni_env is unusable there it's a no-op/clean-null, not a
+regression/crash).
+
+**APPLY-CAREFULLY PLAN (next, fresh context — diff is 360+/116−, touches load-bearing
+make_java_string):** (1) REVIEW the patch — verify make_java_string's TLAB path was moved VERBATIM
+into build_via_tlab (no fast-path behavior change) since that's the one regression risk; (2)
+`git apply audit/patches/make_java_object_jni_fallback.patch`; full -Werror build all targets;
+(3) push WITHOUT java26 first → CI must stay green on java 8-25 (the additive property guarantees no
+regression IF the move is verbatim — confirm); (4) THEN re-add java26 → validate windows·msvc/clang·
+java26 (return_set_arg injectArg_* + make_java_string) go green + make_java_array native_*_D/len256
+recover (un-gate them); (5) if java26 still fails → current_jni_env-in-detour is the deeper issue
+(no-op, investigate). DO NOT apply depleted — the dictionary-fix failure showed library fixes need
+careful review + CI iteration.
+
 ## make_java_array — make_java_object GC-slow-path bug (HIGH-value finding, task #5)
 
 **[medium/high] `make_java_object`/`make_java_array` returns NULL when an allocation needs a
