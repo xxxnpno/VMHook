@@ -2900,7 +2900,7 @@ namespace vmhook
                            [group        if field_flags & 0x10]
                 All integers encoded with UNSIGNED5 (see decode_u5).
             */
-            auto find_field_in_stream(const std::string_view name, void** constant_pool_base, const std::int32_t cp_length) const noexcept
+            auto find_field_in_stream(const std::string_view name, void** constant_pool_base) const noexcept
                 -> std::optional<vmhook::hotspot::field_entry_t>
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const fis_entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream") };
@@ -2972,27 +2972,14 @@ namespace vmhook
                     }
 
                     // Resolve the field name from the constant pool and compare.
-                    // Bound name_index against ConstantPool::_length (when the
-                    // JDK exports it) and verify the specific entry slot is
-                    // mapped BEFORE reading constant_pool_base[name_index] - a
-                    // corrupt / over-decoded UNSIGNED5 index would otherwise read
-                    // past the entry array (access violation) instead of being a
-                    // recoverable skip.  Mirrors const_method::get_name (the
-                    // is_readable_pointer / cp_length pattern at ~2051-2058).
-                    if (name_index
-                        && (cp_length < 0 || static_cast<std::int64_t>(name_index) < cp_length)
-                        && vmhook::hotspot::is_readable_pointer(&constant_pool_base[name_index])
-                        && vmhook::hotspot::is_valid_pointer(constant_pool_base[name_index]))
+                    if (name_index && vmhook::hotspot::is_valid_pointer(constant_pool_base[name_index]))
                     {
                         const vmhook::hotspot::symbol* const name_symbol{ reinterpret_cast<const vmhook::hotspot::symbol*>(constant_pool_base[name_index]) };
                         if (vmhook::hotspot::is_valid_pointer(name_symbol) && name_symbol->to_string() == name)
                         {
                             const bool is_static{ (access_flags & 0x0008u) != 0u };
                             std::string signature;
-                            if (sig_index
-                                && (cp_length < 0 || static_cast<std::int64_t>(sig_index) < cp_length)
-                                && vmhook::hotspot::is_readable_pointer(&constant_pool_base[sig_index])
-                                && vmhook::hotspot::is_valid_pointer(constant_pool_base[sig_index]))
+                            if (sig_index && vmhook::hotspot::is_valid_pointer(constant_pool_base[sig_index]))
                             {
                                 const vmhook::hotspot::symbol* const signature_symbol{ reinterpret_cast<const vmhook::hotspot::symbol*>(constant_pool_base[sig_index]) };
                                 if (vmhook::hotspot::is_valid_pointer(signature_symbol))
@@ -3051,18 +3038,10 @@ namespace vmhook
                     return std::nullopt;
                 }
 
-                // Bound for constant-pool entry indices read on either field
-                // path below.  Resolved once here (the only place the
-                // ConstantPool* is in scope); -1 means the JDK does not export
-                // _length, in which case the bound check is skipped and the
-                // per-slot is_readable_pointer guard is the sole protection -
-                // exactly mirroring the method path (get_name/get_signature).
-                const std::int32_t cp_length{ constant_pool_ptr->get_length() };
-
                 // -- JDK 21+ path: FieldInfoStream ----------------------------
                 if (fis_entry)
                 {
-                    return vmhook::hotspot::klass::find_field_in_stream(name, constant_pool_base, cp_length);
+                    return vmhook::hotspot::klass::find_field_in_stream(name, constant_pool_base);
                 }
 
                 // -- JDK 8 through JDK 17 path: Array<u2> with 6-slot FieldInfo records --
@@ -3112,19 +3091,6 @@ namespace vmhook
                         continue;  // slot 1: name_index == 0 means VM-injected field, skip
                     }
 
-                    // Bound name_index against ConstantPool::_length (when the
-                    // JDK exports it) and verify the entry slot is mapped BEFORE
-                    // reading constant_pool_base[name_index] - a corrupt u2 index
-                    // would otherwise read past the entry array (access
-                    // violation) instead of skipping this slot.  Mirrors
-                    // const_method::get_name (cp_length / is_readable_pointer
-                    // pattern at ~2051-2058).
-                    if ((cp_length >= 0 && static_cast<std::int64_t>(name_index) >= cp_length)
-                        || !vmhook::hotspot::is_readable_pointer(&constant_pool_base[name_index]))
-                    {
-                        continue;
-                    }
-
                     const vmhook::hotspot::symbol* const name_symbol{ reinterpret_cast<const vmhook::hotspot::symbol*>(constant_pool_base[name_index]) };
                     if (!vmhook::hotspot::is_valid_pointer(name_symbol) || name_symbol->to_string() != name)
                     {
@@ -3145,22 +3111,8 @@ namespace vmhook
 
                     const bool is_static{ (access_flags & 0x0008u) != 0u };
 
-                    // Bound sig_index and verify the slot is mapped BEFORE
-                    // reading constant_pool_base[sig_index]; on a corrupt index
-                    // fall back to an empty signature (exactly as today's
-                    // is_valid_pointer(signature_symbol) failure path does)
-                    // rather than faulting on an out-of-array read.  Mirrors
-                    // const_method::get_signature (~2104-2117).
-                    std::string signature;
-                    if ((cp_length < 0 || static_cast<std::int64_t>(sig_index) < cp_length)
-                        && vmhook::hotspot::is_readable_pointer(&constant_pool_base[sig_index]))
-                    {
-                        const vmhook::hotspot::symbol* const signature_symbol{ reinterpret_cast<const vmhook::hotspot::symbol*>(constant_pool_base[sig_index]) };
-                        if (vmhook::hotspot::is_valid_pointer(signature_symbol))
-                        {
-                            signature = signature_symbol->to_string();
-                        }
-                    }
+                    const vmhook::hotspot::symbol* const signature_symbol{ reinterpret_cast<const vmhook::hotspot::symbol*>(constant_pool_base[sig_index]) };
+                    const std::string signature{ vmhook::hotspot::is_valid_pointer(signature_symbol) ? signature_symbol->to_string() : std::string{} };
 
                     return vmhook::hotspot::field_entry_t{ offset, is_static, signature };
                 }
