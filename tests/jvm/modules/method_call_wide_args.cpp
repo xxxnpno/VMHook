@@ -571,6 +571,61 @@ namespace
         const wide& s = *self;
 
         // ============================================================
+        //  WRONG ARITY / WRONG TYPE — must NOT crash.  Run these FIRST: they
+        //  reuse real methods (addL / scaleD / mixA) and would otherwise stamp
+        //  garbage into the witness fields that the legitimate calls below leave
+        //  in their asserted state.  By running first, the later legit calls
+        //  overwrite any garbage, so the "LAST call" witness invariants hold.
+        //  We resolve the name (which succeeds) but DELIBERATELY do not assert a
+        //  specific value — the real guarantee is the process SURVIVES.  Calling
+        //  a wide method with too few args / mismatched widths exercises the
+        //  arg-packing + overload-walk under abuse (zero-init params[] makes the
+        //  missing words read as 0; the abuse methods are primitive-only so there
+        //  is no reference-slot store barrier that could AV).
+        // ============================================================
+        {
+            // addL with ZERO args (too few).  call() with no args; survive.
+            probe_result r{};
+            auto px{ s.get_method("addL") };
+            r.resolved = px.has_value();
+            if (px.has_value())
+            {
+                const vmhook::method_proxy::value_t v = px->call();
+                r.dispatched = !v.is_void();
+                r.ival       = static_cast<std::int64_t>(v);
+            }
+            put("wrong_addL_noargs", r);
+        }
+        {
+            // scaleD with a single double (missing the trailing int).  Survive.
+            probe_result r{};
+            auto px{ s.get_method("scaleD") };
+            r.resolved = px.has_value();
+            if (px.has_value())
+            {
+                const vmhook::method_proxy::value_t v = px->call(2.0);
+                r.dispatched = !v.is_void();
+                const double g = v;
+                r.dbits = d2bits(g);
+            }
+            put("wrong_scaleD_one_arg", r);
+        }
+        {
+            // mixA called with (long,long,long) instead of (int,long,int):
+            // wrong widths for the flanking params.  Survive; pin survival only.
+            probe_result r{};
+            auto px{ s.get_method("mixA") };
+            r.resolved = px.has_value();
+            if (px.has_value())
+            {
+                const vmhook::method_proxy::value_t v = px->call(1LL, 2LL, 3LL);
+                r.dispatched = !v.is_void();
+                r.ival = static_cast<std::int64_t>(v);
+            }
+            put("wrong_mixA_all_long", r);
+        }
+
+        // ============================================================
         //  Single-long ECHO across the full boundary set (idL).  Proves the
         //  whole 64-bit value round-trips with no truncation, leading slot.
         // ============================================================
@@ -684,57 +739,6 @@ namespace
         scap_mixA ("s_mixA", -7, static_cast<std::int64_t>(0xFFFFFFFF00000000ULL), 99);
         scap_scaleD("s_scaleD", 3.141592653589793, 1000000);
         scap_mixD ("s_mixD", 100LL, 200.0, 300LL, 400.0);
-
-        // ============================================================
-        //  WRONG ARITY / WRONG TYPE — must NOT crash.  We resolve the name
-        //  (which succeeds) but DELIBERATELY do not assert any specific value;
-        //  the real guarantee is the process survives.  We pin "did the proxy
-        //  resolve" so the body can confirm we exercised the path.  Calling a
-        //  wide method with too few args / mismatched widths exercises the
-        //  arg-packing + overload-walk under abuse.
-        // ============================================================
-        {
-            // addL with ZERO args (too few).  call() with no args; survive.
-            probe_result r{};
-            auto px{ s.get_method("addL") };
-            r.resolved = px.has_value();
-            if (px.has_value())
-            {
-                const vmhook::method_proxy::value_t v = px->call();
-                r.dispatched = !v.is_void();
-                r.ival       = static_cast<std::int64_t>(v);
-            }
-            put("wrong_addL_noargs", r);
-        }
-        {
-            // scaleD with a single double (missing the trailing int).  Survive.
-            probe_result r{};
-            auto px{ s.get_method("scaleD") };
-            r.resolved = px.has_value();
-            if (px.has_value())
-            {
-                const vmhook::method_proxy::value_t v = px->call(2.0);
-                r.dispatched = !v.is_void();
-                const double g = v;
-                r.dbits = d2bits(g);
-            }
-            put("wrong_scaleD_one_arg", r);
-        }
-        {
-            // mixA called with (long,long,long) instead of (int,long,int):
-            // wrong widths for the flanking params.  Survive; pin survival only.
-            probe_result r{};
-            auto px{ s.get_method("mixA") };
-            r.resolved = px.has_value();
-            if (px.has_value())
-            {
-                const vmhook::method_proxy::value_t v = px->call(1LL, 2LL, 3LL);
-                r.dispatched = !v.is_void();
-                r.ival = static_cast<std::int64_t>(v);
-            }
-            put("wrong_mixA_all_long", r);
-        }
-        (void)cap_wrong; // (helper retained for symmetry; resolution proven above)
     }
 }
 

@@ -289,6 +289,20 @@ class_load_watcher→on_class_loaded.
 asserts ≥ what the legacy test did (don't lose coverage). Then delete the legacy section +
 legacy top-level fixtures, shrinking example.cpp to a thin modular-only driver.
 
+## Wave 1 agent-reported library bugs (pinned by tests; fix in serial header pass — task #5)
+
+- **[medium] `make_java_array` leaks a PENDING JNI exception on the miss path**
+  (`jni_find_class`, vmhook.hpp:9297-9314 via 11314-11322). Surfaces under `-Xcheck:jni`
+  / fastdebug. Fix: `ExceptionClear` after a failed FindClass fallback.
+- **[medium] `field_proxy::set()` has a SIZE guard but NO TYPE guard** (vmhook.hpp:12167-12180):
+  a wrong-type value of the right width slips through.
+- **[low] `method_proxy::call()` silently drops args past 8** (vmhook.hpp:13277) — no diagnostic.
+- **[low] `call()` `case 'F'` decodes through a signed int32_t** (vmhook.hpp:13378).
+- **[low] `find_methods_by_signature` does no descriptor validation** (vmhook.hpp:7088) — a
+  malformed/typo'd descriptor is an indistinguishable silent empty; doc says inherited names
+  but only declared are returned (doc/behaviour drift).
+- **[low] `make_java_array` hardcodes x64 compressed-oops arrayOop layout** (header +12/+16).
+
 ## High-priority queued findings (act in serial passes)
 
 - **[CI] Add Java 26 to the matrix** — `ci.yml:18 env.JAVA_VERSIONS` is hardcoded
@@ -312,5 +326,29 @@ legacy top-level fixtures, shrinking example.cpp to a thin modular-only driver.
   Main.loadFixtures + auto-globbed by CMake → new modules/fixtures self-wire (no driver edit).
 - **2026-06-06** — Phase 2 Wave 1 LAUNCHED (workflow wf_0f3f75ae-7a5, 5 parallel agents):
   field_primitives_set, method_call_wide_args, field_null_safety, find_methods_by_signature,
-  make_java_array. Each authors fixture + module + agent-def. Awaiting completion → integrate
-  → compile → push → watch CI.
+  make_java_array. Each authors fixture + module + agent-def.
+- **2026-06-06** — Wave 1 INTEGRATED + PUSHED (commit 18ed5b5). ~520 ctx.check assertions
+  across 5 modules. Validated: C++ compile clean (build-mingw exit 0), javac fixtures clean,
+  3/5 modules deep-reviewed (excellent), 2/5 quality-scanned (high density, no vacuous checks).
+  CI running (watch bv3bq44q2). Roster now 41 agent-defs (method_call_wide_args def pending
+  workflow finalize → follow-up commit).
+  **CI CONSTRAINT LEARNED:** ci.yml has `concurrency: cancel-in-progress: true` — every push
+  cancels the in-flight run. So BATCH commits and push once per CI cycle; never push while a
+  run you care about is live. (Wave-1 agent-def follow-up + Java-26 edit are batched to land
+  after this run reports.)
+  NEXT once green: (1) commit method_call_wide_args agent-def, (2) add Java 26 to matrix,
+  (3) Wave 2 = G9 HotSpot-internals modules. If red: serial-fix per the loop.
+- **2026-06-06** — Wave 1 CI RESULT: build FAILED on all compilers — `method_call_wide_args.cpp`
+  had a dangling `(void)cap_wrong;` referencing a helper the agent removed in a post-commit
+  edit. ROOT CAUSE: I committed 18ed5b5 while the authoring workflow was STILL finalizing files
+  (the agent kept editing method_call_wide_args.cpp after I read+committed it), AND my local
+  `cmake --build` had passed on a STALE object (CONFIGURE_DEPENDS/mtime). TWO LESSONS BANKED:
+  (1) **wait for the workflow completion signal before committing its output**; (2) **force a
+  fresh recompile** (delete the obj / clean) to validate — a plain build can pass on stale objects.
+  Working tree already had the agent's corrected module; re-validated with a FORCED recompile
+  (saw method_call_wide_args.cpp.obj rebuild, exit 0). Re-pushing build fix + the 2 trailing
+  agent-defs (method_call_wide_args, make_java_array). The other 4 modules compiled fine on CI.
+  Also CONFIRMED: pre-existing JVM flakes are real + SEPARATE — a doc-only commit (76f29d5)
+  failed ONLY on jvm·linux·gcc·java11 + jvm·windows·clang·java25 (the milestone's GC/thread-
+  timing flake class), not the build. Wave 1's re-run will be judged by: build jobs green +
+  no [FAIL] from the 5 NEW modules; java11/java25 flakes are the separate deflake workstream.
