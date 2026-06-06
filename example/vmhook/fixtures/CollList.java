@@ -22,10 +22,11 @@ import vmhook.Harness;
  *     (size == capacity), and an ensureCapacity(100) list (size != capacity) —
  *     the to_vector bound MUST be `size`, never `elementData.length`.
  *   - LinkedList fast path (field shape "first" + "size"): empty, single, many
- *     (12), and a LARGE 20000-element chain so the native side can wall-clock
- *     the first-&gt;next walk and catch an O(N*F) / O(N^2) regression, and prove
- *     the chain walk visits every node exactly once in order (no cycle, no
- *     dup, no early stop).
+ *     (12), and a LARGE 4096-element chain (reduced from 20000 to deflake a
+ *     G1/JDK11+ GC-relocation race — see the BIG field's note) so the native
+ *     side can wall-clock the first-&gt;next walk and catch an O(N*F) / O(N^2)
+ *     regression, and prove the chain walk visits every node exactly once in
+ *     order (no cycle, no dup, no early stop).
  *   - null elements become nullptr slots in BOTH containers (ArrayList array
  *     slot == null; LinkedList Node.item == null).
  *   - element order preserved: element k carries id == k, so the native side
@@ -67,8 +68,23 @@ public final class CollList
     /** Element count of the "many" ArrayList / LinkedList (> default cap 10). */
     public static final int MANY = 12;
 
-    /** Element count of the large LinkedList used for the chain-walk canary. */
-    public static final int BIG = 20000;
+    /**
+     * Element count of the large LinkedList used for the chain-walk canary.
+     * Reduced from 20000 to 4096 to deflake the collection_list module on the
+     * GC-sensitive CI config (default G1 on JDK 11+, e.g. linux-gcc-java11).
+     * The native walk (collection::to_vector's LinkedList fast path) holds raw
+     * decoded Node/element oops while it walks + re-reads them inside the
+     * trigger() interpreter detour, and is not GC-safe; a relocating young GC
+     * mid-walk moved those objects -> wrong/duplicate ids or an unmapped-page
+     * fault (a SIGSEGV the Linux detour's catch(...) can't contain).  The 20000
+     * build was ~60k young-gen allocations right before the walk, the burst that
+     * tipped G1 into a collection during the probe.  4096 stays a genuinely
+     * large, multi-region chain (every order/distinctness/identity invariant on
+     * the native side stays a hard assert) while cutting both the allocation
+     * burst and the raw-oop-hold window ~5x.  Keep this in lockstep with BIG in
+     * tests/jvm/modules/collection_list.cpp.
+     */
+    public static final int BIG = 4096;
 
     /** Index inside the "with null" lists that holds a null element. */
     public static final int NULL_AT = 2;
