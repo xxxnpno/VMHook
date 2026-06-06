@@ -12800,7 +12800,6 @@ namespace vmhook
             : object{ owning_object }
             , method{ method_ptr }
             , signature_text{ std::move(sig) }
-            , static_field{ false }
             , signature_pinned{ pinned }
         {
         }
@@ -13500,7 +13499,10 @@ namespace vmhook
             std::intptr_t params[8]{};
             std::size_t   param_idx{ 0 };
 
-            if (this->object && !this->static_field)
+            // Instance methods receive 'this' as locals[0]; static methods are
+            // constructed with a null owning object, so guarding on `object`
+            // alone correctly omits the receiver slot for static calls.
+            if (this->object)
             {
                 params[param_idx++] = reinterpret_cast<std::intptr_t>(this->object);
             }
@@ -13674,13 +13676,12 @@ namespace vmhook
             @brief Returns true if this method is a static Java method.
             @details
             Static methods do not receive a 'this' pointer as the first argument.
-            The constructor's `static_field` member is always false (it is not
-            wired to any caller), so report the JVM truth directly: read
-            JVM_ACC_STATIC (0x0008) from the live Method's _access_flags.  The
-            static bit lives in the low byte and is stable across every
-            supported JDK, so reading the flags word as u4 and masking 0x0008
-            is width-independent.  Falls back to the stored member if the
-            access-flags slot can't be resolved (no VMStructs / no JVM).
+            Report the JVM truth directly: read JVM_ACC_STATIC (0x0008) from the
+            live Method's _access_flags.  The static bit lives in the low byte
+            and is stable across every supported JDK, so reading the flags word
+            as u4 and masking 0x0008 is width-independent.  Returns false if the
+            access-flags slot can't be resolved (no VMStructs / no JVM) — the
+            proxy carries no other static signal.
 
             Complexity: O(1) after the first VMStruct lookup (cached).
             Exception safety: noexcept.
@@ -13695,7 +13696,7 @@ namespace vmhook
                     return (*flags & 0x0008u) != 0u;
                 }
             }
-            return this->static_field;
+            return false;
         }
 
         /*
@@ -14104,7 +14105,6 @@ namespace vmhook
         void* object;
         vmhook::hotspot::method* method;
         std::string signature_text;
-        bool        static_field;
         // True when this proxy was created via get_method(name, SIGNATURE) /
         // static_method(name, SIGNATURE): the caller pinned an EXACT overload, so
         // resolve_compatible_method() must NOT re-pick a different overload from
