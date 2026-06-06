@@ -10234,62 +10234,95 @@ namespace vmhook
         }
 
         /*
-            @brief Converts a single C++ argument to a jni_value and appends it to values.
+            @brief Shared core that converts one C++ argument into a single jni_value.
             @details
-            Handles the full range of argument types by compile-time dispatch:
-              - std::string / string_view / const char* -> jni_new_string_utf + .l slot
-              - unique_ptr<T extends object_base>       -> stores raw OOP in object_handles; .l slot
-              - object_base derived by value            -> stores raw OOP in object_handles; .l slot
+            The single source of truth for the C++ -> jvalue per-type dispatch used by
+            BOTH the heap path (append_jni_arg / make_jni_args, which boxes results into
+            std::vectors) and the stack path (write_jni_arg_to_slot, used by
+            method_proxy::call_jni).  Both callers were previously byte-identical
+            if-constexpr chains that drifted (the null const char* branch disagreed);
+            this collapses them to one copy so they can never diverge again.
+
+            Compile-time dispatch over std::decay_t<arg_type>:
+              - std::string / string_view              -> jni_new_string_utf + .l slot
+              - const char* / char*                    -> null arg -> Java null (.l = nullptr,
+                                                          no release); non-null -> jni_new_string_utf
+                                                          (a non-null empty "" still becomes a real
+                                                          empty Java String) + .l slot
+              - unique_ptr<T extends object_base>       -> writes raw OOP handle into `storage`; .l = &storage
+              - object_base derived by value            -> writes raw OOP handle into `storage`; .l = &storage
               - bool                                    -> .z slot
               - integral (<=4 bytes)                    -> .i slot
               - integral (8 bytes)                      -> .j slot
               - float                                   -> .f slot
               - double                                  -> .d slot
-            Object handles are stored in the caller-provided object_handles vector to keep
-            the OOP alive for the duration of the JNI call.
+            Any other type is a hard COMPILE error (static_assert), never a silent
+            mis-encode.
+
+            Storage / lifetime contract for object references: this function does NOT
+            decide where the synthetic JNI handle lives.  It writes the raw OOP into the
+            caller-provided `storage` cell and points `out.l` at `&storage`, so the
+            handle outlives the call exactly as long as `storage` does.  Each caller
+            passes a `storage` location with the right lifetime:
+              - write_jni_arg_to_slot passes a per-arg stack cell (handle_storage[i]),
+                used directly.
+              - append_jni_arg passes a throwaway local, then (for object args only)
+                RE-HOMES the handle into its object_handles vector and re-points out.l
+                at &object_handles.back() — because the heap path's jvalue array must
+                outlive the local.  See append_jni_arg for that re-point + why it never
+                dangles.
+            `out.l` for object args is therefore only valid while the caller's chosen
+            backing cell is alive; callers must not let it dangle.
+
+            @param out            Output jvalue slot (fully written; union cleared first).
+            @param storage        Caller-owned cell that receives the raw OOP handle for
+                                  object-reference args; out.l is pointed at it.  Untouched
+                                  for non-object args.
+            @param needs_release  Set to true ONLY when out.l is a real JNI local ref from
+                                  NewStringUTF that the caller must DeleteLocalRef.  False
+                                  for primitives, synthetic object handles, and null/failed
+                                  strings (jni_value is a union, so reading out.l back to
+                                  classify a slot is unsound — a primitive's bits alias .l;
+                                  hence this dedicated tag).
+            @param arg            The C++ argument to convert (perfect-forwarded).
 
             Complexity: O(1) for primitives; O(N) for strings.
-            Exception safety: noexcept — failures silently append a zero-initialised value.
-
-            @param values          Output jni_value array being built.
-            @param object_handles  Storage for OOP pointers wrapped as fake JNI handles.
-            @param arg             The C++ argument to convert.
+            Exception safety: noexcept.
         */
         template<typename arg_type>
-        inline auto append_jni_arg(std::vector<vmhook::detail::jni_value>& values, std::vector<void*>& object_handles, std::vector<char>& needs_release, arg_type&& arg) noexcept
-            -> void
+        inline auto convert_jni_arg(vmhook::detail::jni_value& out,
+                                    void*& storage,
+                                    bool& needs_release,
+                                    arg_type&& arg) noexcept -> void
         {
             using clean_t = std::decay_t<arg_type>;
-            vmhook::detail::jni_value value{};
             // Deterministic full-width clear.  jni_value is a union; value-init
             // ({}) only guarantees the FIRST member (bool z, 1 byte) + padding
             // are zeroed — the upper 7 bytes are left unspecified and differ by
             // compiler (MinGW zeroes them, Clang does not).  Writing the widest
             // member zeroes the whole 8-byte cell, so a narrow primitive (bool /
             // int / float) never leaves stale high bits in the slot.
-            value.j = 0;
-            // Tag tracked in lockstep with `values`: 1 ONLY for jstrings from
-            // NewStringUTF (real local refs that must be DeleteLocalRef'd).
-            // Reading value.l back at cleanup time is unsound because jni_value
-            // is a union — a primitive arg aliases .l and would be deleted as a
-            // garbage pointer.  std::vector<char> (not <bool>) so &back() is a
-            // real addressable byte if ever needed.
-            char release_tag{ 0 };
+            out.j = 0;
+            needs_release = false;
 
             if constexpr (std::is_same_v<clean_t, std::string>)
             {
-                value.l = vmhook::detail::jni_new_string_utf(arg);
-                release_tag = (value.l != nullptr) ? 1 : 0;
+                out.l = vmhook::detail::jni_new_string_utf(arg);
+                needs_release = (out.l != nullptr);
             }
             else if constexpr (std::is_same_v<clean_t, std::string_view>)
             {
-                value.l = vmhook::detail::jni_new_string_utf(arg);
-                release_tag = (value.l != nullptr) ? 1 : 0;
+                out.l = vmhook::detail::jni_new_string_utf(arg);
+                needs_release = (out.l != nullptr);
             }
             else if constexpr (std::is_same_v<clean_t, const char*> || std::is_same_v<clean_t, char*>)
             {
-                value.l = vmhook::detail::jni_new_string_utf(arg ? std::string_view{ arg } : std::string_view{});
-                release_tag = (value.l != nullptr) ? 1 : 0;
+                // nullptr <-> Java null (the library-wide convention); a non-null
+                // arg — including the empty "" — becomes a real Java String via
+                // jni_new_string_utf.  ONLY the null-pointer case yields Java null.
+                out.l = arg ? vmhook::detail::jni_new_string_utf(std::string_view{ arg })
+                            : nullptr;
+                needs_release = (out.l != nullptr);
             }
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
@@ -10299,49 +10332,125 @@ namespace vmhook
                 // std::true_type::value_type=bool typedef won over the template
                 // parameter and made wrapper_type=bool, dropping the arg).
                 static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
-                              "vmhook::detail::append_jni_arg: unique_ptr<T> arg's T does not "
+                              "vmhook::detail::convert_jni_arg: unique_ptr<T> arg's T does not "
                               "derive from vmhook::object_base.  Either the wrapper type is wrong "
                               "or is_unique_ptr<>::value_type_t is mis-resolving (this caught the "
                               "value_type-shadowing trait bug).");
-                object_handles.push_back(arg ? arg->get_instance() : nullptr);
-                value.l = object_handles.empty() ? nullptr : &object_handles.back();
+                storage = arg ? arg->get_instance() : nullptr;
+                out.l = &storage;
             }
             else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
             {
-                object_handles.push_back(arg.get_instance());
-                value.l = &object_handles.back();
+                storage = arg.get_instance();
+                out.l = &storage;
             }
             else if constexpr (std::is_same_v<clean_t, bool>)
             {
-                value.z = arg;
+                out.z = arg;
             }
             else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) <= sizeof(std::int32_t))
             {
-                value.i = static_cast<std::int32_t>(arg);
+                out.i = static_cast<std::int32_t>(arg);
             }
             else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == sizeof(std::int64_t))
             {
-                value.j = static_cast<std::int64_t>(arg);
+                out.j = static_cast<std::int64_t>(arg);
             }
             else if constexpr (std::is_same_v<clean_t, float>)
             {
-                value.f = arg;
+                out.f = arg;
             }
             else if constexpr (std::is_same_v<clean_t, double>)
             {
-                value.d = arg;
+                out.d = arg;
             }
             else
             {
                 static_assert(vmhook::detail::dependent_false_v<clean_t>,
-                              "vmhook::detail::append_jni_arg: unsupported argument type.  "
+                              "vmhook::detail::convert_jni_arg: unsupported argument type.  "
                               "Add a branch above or convert the arg to one of: string, c-string, "
                               "unique_ptr<vmhook::object>, object_base-derived, bool, integral, "
                               "float, double.");
             }
+        }
 
+        /*
+            @brief Converts a single C++ argument to a jni_value and appends it to values.
+            @details
+            The heap (vector) path.  Delegates the per-type conversion to the shared
+            detail::convert_jni_arg core, then boxes the results onto the caller's
+            std::vectors:
+              - std::string / string_view              -> jni_new_string_utf + .l slot
+              - const char* / char*                    -> null -> Java null; non-null (incl "")
+                                                          -> jni_new_string_utf + .l slot
+              - unique_ptr<T extends object_base>       -> stores raw OOP in object_handles; .l slot
+              - object_base derived by value            -> stores raw OOP in object_handles; .l slot
+              - bool                                    -> .z slot
+              - integral (<=4 bytes)                    -> .i slot
+              - integral (8 bytes)                      -> .j slot
+              - float                                   -> .f slot
+              - double                                  -> .d slot
+            Object handles are re-homed from the core's scratch cell into the
+            caller-provided object_handles vector to keep the OOP alive for the
+            duration of the JNI call (make_jni_args pre-reserves it so &back() is
+            stable — value.l never dangles).
+
+            Complexity: O(1) for primitives; O(N) for strings.
+            Exception safety: noexcept — failures silently append a zero-initialised value.
+
+            @param values          Output jni_value array being built.
+            @param object_handles  Storage for OOP pointers wrapped as fake JNI handles.
+            @param needs_release   Per-arg release tags (lockstep with values); 1 ONLY for
+                                   jstrings from NewStringUTF that must be DeleteLocalRef'd.
+            @param arg             The C++ argument to convert.
+        */
+        template<typename arg_type>
+        inline auto append_jni_arg(std::vector<vmhook::detail::jni_value>& values, std::vector<void*>& object_handles, std::vector<char>& needs_release, arg_type&& arg) noexcept
+            -> void
+        {
+            using clean_t = std::decay_t<arg_type>;
+
+            // Convert via the single shared core.  For object-reference args the
+            // core writes the raw OOP handle into `local_storage` and points
+            // value.l at &local_storage — a stack cell that dies when this
+            // function returns.  The heap path's jvalue array must OUTLIVE that,
+            // so below we RE-HOME the handle into the object_handles vector and
+            // re-point value.l at the vector element (see the re-home block).
+            vmhook::detail::jni_value value{};
+            void* local_storage{ nullptr };
+            bool  needs_release_flag{ false };
+            vmhook::detail::convert_jni_arg(value, local_storage, needs_release_flag,
+                                            std::forward<arg_type>(arg));
+
+            // For object-reference args, re-home the handle the core stashed in
+            // `local_storage` into the caller's vector and re-point value.l at it.
+            // object_handles is pre-reserved by make_jni_args to sizeof...(args),
+            // so push_back never reallocates and &back() stays stable for the
+            // whole call — value.l therefore never dangles.  This restores the
+            // exact original behaviour: the value pushed (the OOP handle, or
+            // nullptr for a null unique_ptr) and value.l == &object_handles.back().
+            if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
+            {
+                object_handles.push_back(local_storage);
+                // Defensive empty()-guard preserved verbatim from the original
+                // (we just pushed, so empty() is always false here, but keep the
+                // belt-and-braces null in case the push were ever elided).
+                value.l = object_handles.empty() ? nullptr : &object_handles.back();
+            }
+            else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
+            {
+                object_handles.push_back(local_storage);
+                value.l = &object_handles.back();
+            }
+
+            // Tag tracked in lockstep with `values`: 1 ONLY for jstrings from
+            // NewStringUTF (real local refs that must be DeleteLocalRef'd).
+            // Reading value.l back at cleanup time is unsound because jni_value
+            // is a union — a primitive arg aliases .l and would be deleted as a
+            // garbage pointer.  std::vector<char> (not <bool>) so &back() is a
+            // real addressable byte if ever needed.
             values.push_back(value);
-            needs_release.push_back(release_tag);
+            needs_release.push_back(needs_release_flag ? char{ 1 } : char{ 0 });
         }
 
         /*
@@ -10373,9 +10482,9 @@ namespace vmhook
         /*
             @brief Fills a single jni_value slot from one C++ argument.
             @details
-            Mirrors append_jni_arg's per-type conversion logic but
-            writes into a fixed slot instead of pushing onto a
-            std::vector.  Used by method_proxy::call_jni to pack args
+            Thin wrapper over the shared detail::convert_jni_arg core (same per-type
+            conversion as append_jni_arg) that writes into a fixed slot instead of
+            pushing onto a std::vector.  Used by method_proxy::call_jni to pack args
             on the stack — no heap allocation in the call hot path.
 
             @param value    Output slot for the jvalue.
@@ -10400,73 +10509,14 @@ namespace vmhook
                                            bool& needs_release,
                                            arg_type&& arg) noexcept -> void
         {
-            using clean_t = std::decay_t<arg_type>;
-            // Deterministic full-width clear of the union cell — value-init of a
-            // union ({}) only zeroes the first member (bool z) + padding on some
-            // compilers, leaving the upper 7 bytes unspecified.  Writing the
-            // widest member zeroes all 8 bytes so a narrow primitive leaves no
-            // stale high bits behind.
-            value.j = 0;
-            needs_release = false;
-
-            if constexpr (std::is_same_v<clean_t, std::string>
-                       || std::is_same_v<clean_t, std::string_view>)
-            {
-                value.l = vmhook::detail::jni_new_string_utf(arg);
-                needs_release = (value.l != nullptr);
-            }
-            else if constexpr (std::is_same_v<clean_t, const char*>
-                            || std::is_same_v<clean_t, char*>)
-            {
-                value.l = arg ? vmhook::detail::jni_new_string_utf(std::string_view{ arg })
-                              : nullptr;
-                needs_release = (value.l != nullptr);
-            }
-            else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
-            {
-                using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
-                static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
-                              "vmhook::detail::write_jni_arg_to_slot: unique_ptr<T> arg's T does "
-                              "not derive from vmhook::object_base.  Either the wrapper type is "
-                              "wrong or is_unique_ptr<>::value_type_t is mis-resolving (this "
-                              "caught the value_type-shadowing trait bug that silently dropped "
-                              "every IChatComponent arg).");
-                storage = arg ? arg->get_instance() : nullptr;
-                value.l = &storage;
-            }
-            else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
-            {
-                storage = arg.get_instance();
-                value.l = &storage;
-            }
-            else if constexpr (std::is_same_v<clean_t, bool>)
-            {
-                value.z = arg;
-            }
-            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) <= sizeof(std::int32_t))
-            {
-                value.i = static_cast<std::int32_t>(arg);
-            }
-            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == sizeof(std::int64_t))
-            {
-                value.j = static_cast<std::int64_t>(arg);
-            }
-            else if constexpr (std::is_same_v<clean_t, float>)
-            {
-                value.f = arg;
-            }
-            else if constexpr (std::is_same_v<clean_t, double>)
-            {
-                value.d = arg;
-            }
-            else
-            {
-                static_assert(vmhook::detail::dependent_false_v<clean_t>,
-                              "vmhook::detail::write_jni_arg_to_slot: unsupported argument type.  "
-                              "Add a branch above or convert the arg to one of: string, c-string, "
-                              "unique_ptr<vmhook::object>, object_base-derived, bool, integral, "
-                              "float, double.");
-            }
+            // Stack path: hand the core our fixed per-arg `storage` cell directly.
+            // For object args the core writes the OOP handle into `storage` and
+            // points value.l at &storage — which is exactly what this slot path
+            // wants (the cell lives in the caller's call_jni stack frame for the
+            // whole call), so no re-homing is needed.  needs_release is forwarded
+            // straight through.
+            vmhook::detail::convert_jni_arg(value, storage, needs_release,
+                                            std::forward<arg_type>(arg));
         }
 
         /*
