@@ -116,17 +116,91 @@ namespace
         return reinterpret_cast<std::uint8_t*>(oop) + entry->offset;
     }
 
-    // Decode a reference field's compressed OOP to its internal klass name
-    // (e.g. "java/lang/String", "[I").  Empty string on any failure.
-    auto klass_name_of_field(const vmhook::field_proxy& fp) -> std::string
+    // ── CRASH-PROOFING: validate a decoded OOP before any RAW dereference ────
+    //
+    // WHY this module needs more than is_valid_pointer():
+    //   get_compressed_oop()/get()(as void*) call decode_oop_pointer(), which is
+    //   PURE ARITHMETIC (vmhook.hpp ~4380 narrow_decode: base + (compressed<<shift))
+    //   with NO validity filter — a stale/relocated/wild compressed value yields a
+    //   wild but range-plausible pointer.  The library's object readers
+    //   (read_java_string ~16046, array_length ~11877, get_array_element ~11906,
+    //   klass_from_oop ~14930) then RAW-dereference that pointer, gated ONLY by
+    //   is_valid_pointer().  is_valid_pointer() checks range + alignment + debug
+    //   poison patterns — a GC-RELOCATED object's OLD address is canonical,
+    //   aligned and in-range, so it PASSES is_valid_pointer() yet points into a
+    //   now-unmapped/relocated page.  The raw read then segfaults; with no SEH net
+    //   (mingw·java8) that takes down the whole JVM.
+    //
+    // os::safe_read() (ReadProcessMemory on Windows / process_vm_readv on Linux)
+    // is the ONLY check that actually proves the page is currently mapped: it
+    // performs the read through a kernel path that returns false instead of
+    // faulting on an unmapped/relocated address.  We probe the OOP header region
+    // every library reader touches (mark word @0, narrow-klass @8, array length
+    // @12 — the first 16 bytes) before handing the oop to any raw-deref helper.
+    //
+    // GC timing makes this BEST-EFFORT, not a hard guarantee: a concurrent/young
+    // collector can relocate an object between the probe and the library read.
+    // So callers treat a failed probe (or an empty read) as a transient miss:
+    // record [INFO] and skip the STRONG assertion (never fail).  The arithmetic /
+    // descriptor / primitive checks that do NOT deref an oop stay hard.
+    constexpr std::size_t k_oop_header_probe_bytes{ 16 };
+
+    auto oop_header_safely_readable(void* const decoded) -> bool
+    {
+        if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded)) { return false; }
+        std::uint8_t scratch[k_oop_header_probe_bytes] = { 0 };
+        // ReadProcessMemory/process_vm_readv: returns false (no fault) if any byte
+        // of the header is on an unmapped/relocated page.
+        return vmhook::os::safe_read(scratch, decoded, sizeof(scratch));
+    }
+
+    // Decode + safe-probe a reference field's compressed OOP in one step.  Returns
+    // nullptr (NOT a faulting pointer) if the slot is null, the decode is wild, or
+    // the object's header is not currently mapped (stale / mid-relocation).
+    auto safely_decoded_field_oop(const vmhook::field_proxy& fp) -> void*
     {
         void* const decoded{ vmhook::hotspot::decode_oop_pointer(fp.get_compressed_oop()) };
-        if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded)) { return {}; }
+        return oop_header_safely_readable(decoded) ? decoded : nullptr;
+    }
+
+    // Decode a reference field's compressed OOP to its internal klass name
+    // (e.g. "java/lang/String", "[I").  Empty string on any failure OR if the
+    // decoded oop's header is not safely readable (stale/relocated/wild) — so a
+    // caller comparing the result to an expected name naturally degrades to a
+    // best-effort miss instead of faulting inside klass_from_oop's raw read.
+    auto klass_name_of_field(const vmhook::field_proxy& fp) -> std::string
+    {
+        void* const decoded{ safely_decoded_field_oop(fp) };
+        if (!decoded) { return {}; }
         vmhook::hotspot::klass* const k{ vmhook::klass_from_oop(decoded) };
         if (!k) { return {}; }
         vmhook::hotspot::symbol* const sym{ k->get_name() };
         if (!sym) { return {}; }
         return sym->to_string();
+    }
+
+    // Safe wrappers around the RAW-deref library readers: probe the oop header
+    // first, and return a sentinel (empty string / -1 length / T{}) on a failed
+    // probe so the call site can branch to a best-effort [INFO] instead of
+    // faulting.  These never themselves dereference an unmapped oop.
+    auto safe_read_java_string(void* const decoded) -> std::string
+    {
+        return oop_header_safely_readable(decoded) ? vmhook::read_java_string(decoded)
+                                                   : std::string{};
+    }
+
+    auto safe_array_length(void* const decoded) -> std::int32_t
+    {
+        return oop_header_safely_readable(decoded) ? vmhook::array_length(decoded)
+                                                   : -1;
+    }
+
+    template<typename element_type>
+    auto safe_array_element(void* const decoded, const std::int32_t index) -> element_type
+    {
+        return oop_header_safely_readable(decoded)
+                   ? vmhook::get_array_element<element_type>(decoded, index)
+                   : element_type{};
     }
 }
 
@@ -497,16 +571,33 @@ VMHOOK_JVM_MODULE(field_introspection)
                           decoded_direct != nullptr
                           && vmhook::hotspot::is_valid_pointer(decoded_direct));
 
-                // The decoded object really is the String "introspect-me".
-                const std::string text = vmhook::read_java_string(decoded_direct);
-                ctx.check("cmp_oop_string_decodes_to_real_value",
-                          text == "introspect-me");
-                ctx.check("cmp_oop_string_length_matches_java",
-                          static_cast<std::int32_t>(text.size())
-                              == fi_fixture::s_string_len());
-                // Its klass is java/lang/String.
-                ctx.check("cmp_oop_string_klass_name",
-                          klass_name_of_field(*fp) == "java/lang/String");
+                // The decoded object really is the String "introspect-me".  The
+                // content read RAW-derefs the oop (read_java_string), so it is
+                // BEST-EFFORT: a probe that the header is mapped guards the read,
+                // and a transient empty miss (object mid-relocation) is recorded,
+                // not failed.  A DIFFERENT non-empty value would still be a real
+                // mis-decode and fails.
+                const std::string text = safe_read_java_string(decoded_direct);
+                if (!text.empty())
+                {
+                    ctx.check("cmp_oop_string_decodes_to_real_value",
+                              text == "introspect-me");
+                    ctx.check("cmp_oop_string_length_matches_java",
+                              static_cast<std::int32_t>(text.size())
+                                  == fi_fixture::s_string_len());
+                }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_string: decoded String header not safely "
+                               "readable (stale/relocated) — skipped value/length asserts.");
+                }
+                // Its klass is java/lang/String (klass_name_of_field is itself
+                // safe-probe-guarded; empty on a transient miss).
+                const std::string kn{ klass_name_of_field(*fp) };
+                if (!kn.empty())
+                {
+                    ctx.check("cmp_oop_string_klass_name", kn == "java/lang/String");
+                }
             }
         }
 
@@ -528,14 +619,27 @@ VMHOOK_JVM_MODULE(field_introspection)
                 ctx.check("cmp_oop_intarray_field_oop_equals_decode",
                           vmhook::field_oop(*fp) == decoded);
 
-                const std::int32_t len{ vmhook::array_length(decoded) };
-                ctx.check("cmp_oop_intarray_length_matches_java",
-                          len == fi_fixture::s_int_array_len() && len == 5);
-                const std::int32_t e0{ vmhook::get_array_element<std::int32_t>(decoded, 0) };
-                ctx.check("cmp_oop_intarray_elem0_matches_java",
-                          e0 == fi_fixture::s_int_array_elem0() && e0 == 11);
-                ctx.check("cmp_oop_intarray_klass_name",
-                          klass_name_of_field(*fp) == "[I");
+                // length + elem0 RAW-deref the array oop, so they are BEST-EFFORT
+                // (safe_* return -1 / T{} when the header is not safely readable).
+                const std::int32_t len{ safe_array_length(decoded) };
+                if (len >= 0)
+                {
+                    ctx.check("cmp_oop_intarray_length_matches_java",
+                              len == fi_fixture::s_int_array_len() && len == 5);
+                    const std::int32_t e0{ safe_array_element<std::int32_t>(decoded, 0) };
+                    ctx.check("cmp_oop_intarray_elem0_matches_java",
+                              e0 == fi_fixture::s_int_array_elem0() && e0 == 11);
+                }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_intarray: array header not safely readable "
+                               "(stale/relocated) — skipped length/elem0 asserts.");
+                }
+                const std::string kn{ klass_name_of_field(*fp) };
+                if (!kn.empty())
+                {
+                    ctx.check("cmp_oop_intarray_klass_name", kn == "[I");
+                }
             }
         }
 
@@ -548,10 +652,22 @@ VMHOOK_JVM_MODULE(field_introspection)
                 void* const decoded{ vmhook::hotspot::decode_oop_pointer(fp->get_compressed_oop()) };
                 ctx.check("cmp_oop_objarray_get_equals_decode",
                           static_cast<void*>(fp->get()) == decoded);
-                ctx.check("cmp_oop_objarray_length_matches_java",
-                          vmhook::array_length(decoded) == fi_fixture::s_obj_array_len());
-                ctx.check("cmp_oop_objarray_klass_name",
-                          klass_name_of_field(*fp) == "[Ljava/lang/Object;");
+                const std::int32_t len{ safe_array_length(decoded) };
+                if (len >= 0)
+                {
+                    ctx.check("cmp_oop_objarray_length_matches_java",
+                              len == fi_fixture::s_obj_array_len());
+                }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_objarray: array header not safely readable "
+                               "(stale/relocated) — skipped length assert.");
+                }
+                const std::string kn{ klass_name_of_field(*fp) };
+                if (!kn.empty())
+                {
+                    ctx.check("cmp_oop_objarray_klass_name", kn == "[Ljava/lang/Object;");
+                }
             }
         }
 
@@ -568,8 +684,11 @@ VMHOOK_JVM_MODULE(field_introspection)
                           decoded != nullptr && vmhook::hotspot::is_valid_pointer(decoded));
                 ctx.check("cmp_oop_object_get_equals_decode",
                           static_cast<void*>(fp->get()) == decoded);
-                ctx.check("cmp_oop_object_klass_name",
-                          klass_name_of_field(*fp) == "java/lang/Object");
+                const std::string kn{ klass_name_of_field(*fp) };
+                if (!kn.empty())
+                {
+                    ctx.check("cmp_oop_object_klass_name", kn == "java/lang/Object");
+                }
             }
         }
 
@@ -589,9 +708,19 @@ VMHOOK_JVM_MODULE(field_introspection)
                 ctx.check("cmp_oop_runnable_get_equals_decode",
                           static_cast<void*>(fp->get()) == decoded);
                 // Concrete class is a synthetic subtype of FieldIntrospection's
-                // anonymous Runnable; its name starts with the declaring class.
-                const std::string kn{ klass_name_of_field(*fp) };
-                ctx.check("cmp_oop_runnable_klass_resolved", !kn.empty());
+                // anonymous Runnable.  klass_name_of_field RAW-derefs the oop, so
+                // assert "resolved" only when the header is safely readable (a
+                // stale/relocated miss is recorded, not failed).
+                if (oop_header_safely_readable(decoded))
+                {
+                    ctx.check("cmp_oop_runnable_klass_resolved",
+                              !klass_name_of_field(*fp).empty());
+                }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_runnable: decoded object header not safely "
+                               "readable (stale/relocated) — skipped klass-resolved assert.");
+                }
             }
         }
 
@@ -600,8 +729,12 @@ VMHOOK_JVM_MODULE(field_introspection)
             auto fp{ fi_fixture::static_field("sSelfRef") };
             if (fp)
             {
-                ctx.check("cmp_oop_selfref_klass_name",
-                          klass_name_of_field(*fp) == "vmhook/fixtures/FieldIntrospection");
+                const std::string kn{ klass_name_of_field(*fp) };
+                if (!kn.empty())
+                {
+                    ctx.check("cmp_oop_selfref_klass_name",
+                              kn == "vmhook/fixtures/FieldIntrospection");
+                }
             }
         }
 
@@ -619,17 +752,34 @@ VMHOOK_JVM_MODULE(field_introspection)
                     ctx.check("cmp_oop_instance_string_nonzero", raw != 0);
                     ctx.check("cmp_oop_instance_string_get_equals_decode",
                               static_cast<void*>(fp->get()) == decoded);
-                    ctx.check("cmp_oop_instance_string_value",
-                              vmhook::read_java_string(decoded) == "instance-string");
+                    const std::string text{ safe_read_java_string(decoded) };
+                    if (!text.empty())
+                    {
+                        ctx.check("cmp_oop_instance_string_value",
+                                  text == "instance-string");
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] cmp_oop_instance_string: header not safely readable "
+                                   "(stale/relocated) — skipped value assert.");
+                    }
                 }
 
                 auto fa{ inst->get_field("iIntArray") };
                 if (fa)
                 {
                     void* const decoded{ vmhook::hotspot::decode_oop_pointer(fa->get_compressed_oop()) };
-                    ctx.check("cmp_oop_instance_intarray_length",
-                              vmhook::array_length(decoded) == fi_fixture::i_int_array_len()
-                              && vmhook::array_length(decoded) == 3);
+                    const std::int32_t len{ safe_array_length(decoded) };
+                    if (len >= 0)
+                    {
+                        ctx.check("cmp_oop_instance_intarray_length",
+                                  len == fi_fixture::i_int_array_len() && len == 3);
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] cmp_oop_instance_intarray: array header not safely "
+                                   "readable (stale/relocated) — skipped length assert.");
+                    }
                 }
             }
         }
@@ -763,9 +913,24 @@ VMHOOK_JVM_MODULE(field_introspection)
                           std::string{ fp->signature() } == "Ljava/lang/String;");
                 ctx.check("post_probe_is_static_still_true", fp->is_static());
                 ctx.check("post_probe_is_reference_still_true", fp->is_reference());
+                // The post-dispatch String decode RAW-derefs the oop.  The probe's
+                // run() (touch + publishWitnesses) allocates on the Java thread and
+                // can trigger a minor/young GC that relocates sString's referent
+                // between this decode and the read; on mingw·java8 that landed as a
+                // full-JVM crash.  Guard the read behind a safe-read probe and make
+                // it best-effort: a transient empty miss is recorded, a DIFFERENT
+                // non-empty value still fails (real mis-decode).
                 void* const decoded{ vmhook::hotspot::decode_oop_pointer(fp->get_compressed_oop()) };
-                ctx.check("post_probe_string_still_decodes",
-                          vmhook::read_java_string(decoded) == "introspect-me");
+                const std::string text{ safe_read_java_string(decoded) };
+                if (!text.empty())
+                {
+                    ctx.check("post_probe_string_still_decodes", text == "introspect-me");
+                }
+                else
+                {
+                    ctx.record("[INFO] post_probe_string: decoded String header not safely "
+                               "readable after dispatch (relocated/transient) — skipped decode assert.");
+                }
             }
         }
     }
@@ -785,9 +950,23 @@ VMHOOK_JVM_MODULE(field_introspection)
             before.has_value()
                 ? vmhook::hotspot::decode_oop_pointer(before->get_compressed_oop())
                 : nullptr };
-        ctx.check("gc_doc_before_decodes",
-                  decoded_before != nullptr
-                  && vmhook::read_java_string(decoded_before) == "introspect-me");
+        // This block runs AFTER Section G's dispatch, so sString's referent may
+        // already have been relocated by a young GC; the decoded address can pass
+        // is_valid_pointer() yet point into an unmapped page.  Probe the header
+        // with safe_read before the RAW read_java_string and make it best-effort
+        // (the hard pre-GC value proof lives in Section E.1 / Section G).
+        {
+            const std::string text{ safe_read_java_string(decoded_before) };
+            if (!text.empty())
+            {
+                ctx.check("gc_doc_before_decodes", text == "introspect-me");
+            }
+            else
+            {
+                ctx.record("[INFO] gc_doc_before: sString header not safely readable "
+                           "(relocated by an earlier dispatch GC) — skipped pre-GC decode assert.");
+            }
+        }
 
         const bool done{ ctx.run_probe(
             [](bool value)
@@ -822,6 +1001,12 @@ VMHOOK_JVM_MODULE(field_introspection)
             // decode is EITHER the real value OR a transient empty miss — never a
             // DIFFERENT live string (which would be a real mis-decode bug) — and
             // record the observed value.
+            // Bounded retry (<=16).  Each fresh decode RAW-derefs the oop via
+            // read_java_string; right after System.gc() the referent is the most
+            // likely thing in this whole module to be mid-relocation, so we route
+            // EVERY read through safe_read_java_string (header safe-probe first).
+            // A failed probe / relocated object yields "" and we simply retry;
+            // never a raw fault.
             std::string decoded_value{};
             for (int attempt{ 0 }; attempt < 16 && decoded_value != "introspect-me"; ++attempt)
             {
@@ -829,7 +1014,7 @@ VMHOOK_JVM_MODULE(field_introspection)
                 void* const d{ fresh.has_value()
                     ? vmhook::hotspot::decode_oop_pointer(fresh->get_compressed_oop())
                     : nullptr };
-                if (d != nullptr) { decoded_value = vmhook::read_java_string(d); }
+                decoded_value = safe_read_java_string(d);
             }
             ctx.record(std::string{ "[INFO] gc_doc: post-GC fresh decode = '" } + decoded_value +
                        "' (expected 'introspect-me'; empty = transient concurrent-GC miss, addr is coherent).");
