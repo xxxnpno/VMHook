@@ -289,7 +289,11 @@ namespace
                 return true;
             }
             // Let any in-flight compile / safepoint settle before re-reading.
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 25 });
+            // 40 ms (was 25): java26's tiered JIT queues several recompiles during
+            // the drift window, and they drain over a longer interval after
+            // NO_COMPILE is re-armed; a longer settle lets each queued nmethod land
+            // and be re-nulled before the next read.
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 40 });
             if (method_code(m) == nullptr)
             {
                 return true;
@@ -435,7 +439,7 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
             // this read — same hazard as scenario 3's repair_pre_code_null, more
             // frequent on java24-26.  Assert "vmhook drives _code null" with a
             // bounded verify_hooks() settle; still fails on a stale-_code regression.
-            ctx.check("jit_install_left_code_null", code_settles_null(m, 4));
+            ctx.check("jit_install_left_code_null", code_settles_null(m, 12));
         }
 
         const bool done{ drive(ctx, 2) };
@@ -488,7 +492,7 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
         // state no matter what HotSpot did during the loop.
         if (m != nullptr)
         {
-            ctx.check("jit_code_null_after_verify_pass", code_settles_null(m, 4));
+            ctx.check("jit_code_null_after_verify_pass", code_settles_null(m, 12));
             ctx.check("jit_no_compile_held_after_verify_pass", no_compile_set(m));
         }
         // Hook still fires after all that JIT pressure + verify — BEST-EFFORT.
@@ -591,7 +595,7 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
             // Assert the robust invariant "vmhook can drive _code to null" via a
             // bounded verify_hooks() settle, not a raw single-instant snapshot.
             // Still fails if verify_hooks() can't deopt (leaves a stale _code).
-            ctx.check("repair_pre_code_null", code_settles_null(m, 4));
+            ctx.check("repair_pre_code_null", code_settles_null(m, 12));
 
             // --- Induce the drift: clear the inhibitors. ---
             const bool drifted{ force_jit_drift(m) };
@@ -638,7 +642,7 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
             // NO_COMPILE re-armed, _code re-nulled.  These are deterministic
             // consequences of verify_hooks()'s repair and stay HARD.
             ctx.check("repair_no_compile_re_armed_after_verify", no_compile_set(m));
-            ctx.check("repair_code_re_nulled_after_verify", code_settles_null(m, 4));
+            ctx.check("repair_code_re_nulled_after_verify", code_settles_null(m, 12));
 
             // --- Re-check: the hook fires again on a fresh dispatch. ---
             //
@@ -747,7 +751,7 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
                        + " within ~" + std::to_string(budget.count()) + "ms.");
             ctx.check("watchdog_re_armed_no_compile_without_manual_verify", re_armed);
             ctx.check("watchdog_no_compile_set_after_watchdog", no_compile_set(m));
-            ctx.check("watchdog_code_null_after_watchdog", code_settles_null(m, 4));
+            ctx.check("watchdog_code_null_after_watchdog", code_settles_null(m, 12));
 
             // Hook fires again on a fresh dispatch post watchdog repair — gated
             // best-effort exactly like scenario 3.  Only HARD-assert the re-fire
