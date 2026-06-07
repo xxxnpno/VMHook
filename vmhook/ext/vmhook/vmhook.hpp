@@ -13868,9 +13868,32 @@ namespace vmhook
             //  Return type
             const std::string_view sig{ selected_signature };
             const std::size_t rparen{ sig.rfind(')') };
+            // Guard the return-descriptor read on two fronts.  selected_signature is
+            // a resolved Method descriptor on the happy path (always "(...)<ret>"),
+            // but it falls back to this->signature_text -- a caller-supplied override
+            // -- when no Method resolved, so it may be malformed:
+            //   * bounds: a signature ending in ')' (e.g. "()" or "(I)") makes
+            //     rparen == size()-1, so sig[rparen + 1] would read sig[size()] --
+            //     out of bounds for a string_view (operator[] requires pos < size();
+            //     the std::string's NUL-at-size() guarantee does NOT carry through a
+            //     string_view).  Treat "ends in ')'" as void.
+            //   * validity: an unrecognised return char must not fall through
+            //     sig_char_to_basic_type()'s T_OBJECT default, which would make the
+            //     call stub decode an arbitrary return register as an oop pointer.
+            //     Restrict to the real JVM return descriptors; anything else degrades
+            //     to T_VOID (a safe no-op return), consistent with the npos fallback.
             const char ret_char{
-                rparen != std::string_view::npos ? sig[rparen + 1] : 'V' };
-            const int result_type{ vmhook::detail::sig_char_to_basic_type(ret_char) };
+                (rparen != std::string_view::npos && rparen + 1 < sig.size())
+                    ? sig[rparen + 1]
+                    : 'V' };
+            const bool valid_ret_char{
+                ret_char == 'Z' || ret_char == 'B' || ret_char == 'C'
+                || ret_char == 'S' || ret_char == 'I' || ret_char == 'J'
+                || ret_char == 'F' || ret_char == 'D' || ret_char == 'L'
+                || ret_char == '[' || ret_char == 'V' };
+            const int result_type{
+                valid_ret_char ? vmhook::detail::sig_char_to_basic_type(ret_char)
+                               : 14 /* T_VOID: malformed/unknown return -> safe no-op */ };
 
             //  Parameter slot array
             // The call_stub passes parameters[] to the interpreter as locals[].
