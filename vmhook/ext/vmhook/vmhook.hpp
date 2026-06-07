@@ -12189,7 +12189,12 @@ namespace vmhook
         }
 
         element_type result{};
-        std::memcpy(&result, reinterpret_cast<const std::uint8_t*>(array_oop) + 16 + index * static_cast<std::int32_t>(sizeof(element_type)), sizeof(element_type));
+        // Offset computed in ptrdiff_t: `index` is a bounds-checked int32, but
+        // `index * (int)sizeof` is a 32-bit multiply that would wrap at 2^31 if a
+        // corrupted/relocated _length admitted a large in-bounds-claimed index
+        // (e.g. index 0x10000000 at stride 8 -> INT_MIN), sign-extending to a wild
+        // byte offset.  Widening the multiply keeps the address arithmetic honest.
+        std::memcpy(&result, reinterpret_cast<const std::uint8_t*>(array_oop) + 16 + static_cast<std::ptrdiff_t>(index) * static_cast<std::ptrdiff_t>(sizeof(element_type)), sizeof(element_type));
         return result;
     }
 
@@ -12214,7 +12219,9 @@ namespace vmhook
         {
             return;
         }
-        std::memcpy(reinterpret_cast<std::uint8_t*>(array_oop) + 16 + index * static_cast<std::int32_t>(sizeof(element_type)), &value, sizeof(element_type));
+        // Offset in ptrdiff_t (see get_array_element): avoids a 32-bit index*stride
+        // multiply wrapping to a wild byte offset under a corrupted _length.
+        std::memcpy(reinterpret_cast<std::uint8_t*>(array_oop) + 16 + static_cast<std::ptrdiff_t>(index) * static_cast<std::ptrdiff_t>(sizeof(element_type)), &value, sizeof(element_type));
     }
 
     // --- Field proxy ----------------------------------------------------------
@@ -12758,11 +12765,29 @@ namespace vmhook
                 // Special case: passing a 1-byte C++ `char` to a Java `char` field
                 // (descriptor "C", 2 bytes wide).  We widen via uint16 so the
                 // field's full 2 bytes are written rather than only the low byte.
-                if (this->signature_text == "C" && sizeof(clean_value_type) == sizeof(char))
+                //
+                // Guarded with `if constexpr`: the body's
+                // `static_cast<unsigned char>(value)` is only well-formed for
+                // arithmetic / enum value types.  As a plain runtime `if` it was
+                // still INSTANTIATED for every trivially-copyable value_type that
+                // reaches this branch, so `set(void*)`, `set(std::array<char,N>)`,
+                // or `set(some_struct)` on ANY field failed to COMPILE (a hard
+                // error, not even SFINAE-detectable) even though signature_text was
+                // not "C".  `if constexpr` drops the widening for non-arithmetic /
+                // non-enum types, which then fall through to the size guard below
+                // and are written (or rejected) by width like any other blob.
+                // (is_arithmetic || is_enum, not is_convertible: it must still cover
+                // every realistic 1-byte target of a "C" field, including std::byte,
+                // which is static_cast-able but NOT implicitly convertible.)
+                if constexpr (std::is_arithmetic_v<clean_value_type>
+                              || std::is_enum_v<clean_value_type>)
                 {
-                    const std::uint16_t wide_value{ static_cast<std::uint16_t>(static_cast<unsigned char>(value)) };
-                    std::memcpy(this->field_pointer, &wide_value, sizeof(wide_value));
-                    return;
+                    if (this->signature_text == "C" && sizeof(clean_value_type) == sizeof(char))
+                    {
+                        const std::uint16_t wide_value{ static_cast<std::uint16_t>(static_cast<unsigned char>(value)) };
+                        std::memcpy(this->field_pointer, &wide_value, sizeof(wide_value));
+                        return;
+                    }
                 }
 
                 // Size mismatch guard.  Previously the write was an unconditional
