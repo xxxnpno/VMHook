@@ -39,12 +39,41 @@ namespace vmhook_test
 
     using module_fn = void (*)(context&);
 
-    // Register a module (called from the VMHOOK_JVM_MODULE static initializer).
-    auto register_module(const char* name, module_fn fn) -> void;
+    // Run-ordering priority for a module.  run_all() executes modules in
+    // ASCENDING priority (lower runs first); modules with equal priority keep
+    // their registration order.  The default is `normal`, so an ordinary module
+    // never has to think about this.  A module that must run BEFORE every
+    // ordinary module (e.g. the process-global JIT/class-load/GC warm-up) uses
+    // `first`.
+    //
+    // WHY an explicit key instead of a filename trick: run_all() iterates the
+    // registry in REGISTRATION order, and registration happens in C++ static-
+    // initializer order across translation units — which the standard leaves
+    // UNSPECIFIED and which real toolchains disagree on.  GNU ld (MinGW + Linux
+    // gcc) runs a TU's static initializers in REVERSE link-line order, so a
+    // CMake file(GLOB) that sorts "aaa_warmup.cpp" to the front of the link line
+    // makes it initialize (and thus register, and thus run) LAST, not first —
+    // the exact opposite of what an "aaa_"-prefix is meant to buy.  Sorting the
+    // registry by an explicit priority in run_all() makes run-order independent
+    // of link order and of the compiler, so "runs first" is guaranteed on every
+    // toolchain in CI (MSVC, clang-cl, MinGW, gcc, clang).
+    enum class priority : int
+    {
+        first  = -100,   // warm-up / setup: runs before every normal module
+        normal = 0,      // default for ordinary feature modules
+        last   = 100,    // teardown / wind-down: runs after every normal module
+    };
 
-    // Run every registered module in registration order.  Each module's
-    // failures are isolated (a throwing module is caught and logged, the rest
-    // still run).  Returns the number of modules executed.
+    // Register a module (called from the VMHOOK_JVM_MODULE static initializer).
+    // `prio` controls run order (see `priority`); ordinary modules use the
+    // defaulted `normal` so existing callers are unaffected.
+    auto register_module(const char* name, module_fn fn,
+                         priority prio = priority::normal) -> void;
+
+    // Run every registered module, ordered by ascending priority (modules of
+    // equal priority keep their registration order — a STABLE sort).  Each
+    // module's failures are isolated (a throwing module is caught and logged,
+    // the rest still run).  Returns the number of modules executed.
     auto run_all(context& ctx) -> std::size_t;
 }
 
@@ -65,6 +94,26 @@ namespace vmhook_test
             modname##_registrar() noexcept                                    \
             {                                                                 \
                 vmhook_test::register_module(#modname, &modname##_body);      \
+            }                                                                 \
+        } modname##_registrar_instance;                                       \
+    }                                                                         \
+    static void modname##_body(vmhook_test::context& ctx)
+
+// Like VMHOOK_JVM_MODULE but pins the module's run order via a
+// vmhook_test::priority value (first / normal / last).  run_all() sorts by it,
+// so this is the RELIABLE way to make a module run before (or after) the
+// ordinary feature modules on every toolchain — see the `priority` enum for why
+// a filename trick is not.  Used by the standalone warm-up module.
+#define VMHOOK_JVM_MODULE_PRIORITY(modname, prio)                             \
+    static void modname##_body(vmhook_test::context& ctx);                    \
+    namespace                                                                 \
+    {                                                                         \
+        struct modname##_registrar                                            \
+        {                                                                     \
+            modname##_registrar() noexcept                                    \
+            {                                                                 \
+                vmhook_test::register_module(#modname, &modname##_body,       \
+                                             (prio));                         \
             }                                                                 \
         } modname##_registrar_instance;                                       \
     }                                                                         \

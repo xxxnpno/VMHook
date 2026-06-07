@@ -5,6 +5,7 @@
 // example DLL alongside example.cpp without ODR or include-order surprises.
 #include "harness.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <vector>
 
@@ -22,6 +23,7 @@ namespace vmhook_test
         {
             const char* name;
             module_fn   fn;
+            priority    prio;
         };
 
         // Run one module, CONTAINING a hard crash (access violation chasing a
@@ -68,16 +70,30 @@ namespace vmhook_test
         }
     }
 
-    auto register_module(const char* const name, const module_fn fn) -> void
+    auto register_module(const char* const name, const module_fn fn,
+                         const priority prio) -> void
     {
         if (name && fn)
         {
-            registry().push_back(entry{ name, fn });
+            registry().push_back(entry{ name, fn, prio });
         }
     }
 
     auto run_all(context& ctx) -> std::size_t
     {
+        // Order by ascending priority so a `priority::first` module (the warm-up)
+        // runs before every ordinary module and a `priority::last` module runs
+        // after them, REGARDLESS of static-initializer / link order (which the
+        // C++ standard leaves unspecified and which MinGW/GNU ld in fact
+        // REVERSES — see harness.hpp).  std::stable_sort preserves registration
+        // order among equal-priority modules, so the default `normal` modules
+        // keep running in exactly the order they do today.
+        std::stable_sort(registry().begin(), registry().end(),
+                         [](const entry& lhs, const entry& rhs) noexcept
+                         {
+                             return static_cast<int>(lhs.prio) < static_cast<int>(rhs.prio);
+                         });
+
         std::size_t ran{ 0 };
         for (const entry& module_entry : registry())
         {
