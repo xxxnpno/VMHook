@@ -9431,6 +9431,43 @@ namespace vmhook
         }
 
         /*
+            @brief Reports whether a JNI exception is currently pending on this thread.
+            @details
+            Calls JNIEnv::ExceptionCheck (slot 228) only — it does NOT clear.  Use this
+            to decide whether it is safe to make a further (non-exception-handling) JNI
+            call: per the JNI specification, after a JNI call raises a pending exception
+            the native code may call only the exception-handling functions
+            (ExceptionOccurred/ExceptionCheck/ExceptionDescribe/ExceptionClear) and the
+            reference-management functions (DeleteLocalRef/DeleteGlobalRef/etc.); invoking
+            any other JNI function while an exception is pending is undefined behaviour and
+            can fault inside the JVM on some builds (notably a cold JDK 17+ where the
+            missing-class path raises heavier linkage errors than JDK 8).
+
+            Fail-safe contract: if the JNIEnv or the ExceptionCheck slot cannot be
+            resolved, this returns true ("assume an exception may be pending") so callers
+            conservatively skip the follow-up call rather than risk the UB.
+
+            Complexity: O(1).
+            Exception safety: noexcept — JNI vtable dispatch only.
+
+            @return true if an exception is pending OR cannot be ruled out; false only
+                    when ExceptionCheck positively reports no pending exception.
+        */
+        inline auto jni_exception_pending() noexcept
+            -> bool
+        {
+            using exception_check_t = bool (*)(void*);
+            exception_check_t const exception_check{ vmhook::detail::jni_function<228, exception_check_t>(vmhook::hotspot::current_jni_env) };
+            if (!exception_check)
+            {
+                // Can't query — be conservative and treat as pending so the
+                // caller does not make another JNI call into UB.
+                return true;
+            }
+            return exception_check(vmhook::hotspot::current_jni_env);
+        }
+
+        /*
             @brief Calls JNIEnv::GetObjectClass to retrieve the jclass of a JNI object handle.
             @details
             Uses JNI table slot 31 (GetObjectClass).  Returns a jclass local reference.
@@ -9498,9 +9535,19 @@ namespace vmhook
         inline auto jni_get_static_method_id(void* const klass, const std::string& name, const std::string& signature) noexcept
             -> void*
         {
+            // Mirror jni_get_method_id: clear any pending exception BEFORE the
+            // lookup so this slot call is never made while an exception is pending
+            // (JNI-spec UB), and again AFTER if the lookup itself fails (a missing
+            // static method raises NoSuchMethodError).  No-op on the success path.
+            vmhook::detail::jni_exception_clear();
             using get_static_method_id_t = void* (*)(void*, void*, const char*, const char*);
             get_static_method_id_t const get_static_method_id{ vmhook::detail::jni_function<113, get_static_method_id_t>(vmhook::hotspot::current_jni_env) };
-            return get_static_method_id ? get_static_method_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr;
+            void* const method_id{ get_static_method_id ? get_static_method_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr };
+            if (!method_id)
+            {
+                vmhook::detail::jni_exception_clear();
+            }
+            return method_id;
         }
 
         /*
@@ -9520,9 +9567,18 @@ namespace vmhook
         inline auto jni_get_static_field_id(void* const klass, const std::string& name, const std::string& signature) noexcept
             -> void*
         {
+            // Mirror jni_get_method_id: clear before the lookup so the slot call is
+            // never issued under a pending exception, and after if it fails (a
+            // missing static field raises NoSuchFieldError).  No-op on success.
+            vmhook::detail::jni_exception_clear();
             using get_static_field_id_t = void* (*)(void*, void*, const char*, const char*);
             get_static_field_id_t const get_static_field_id{ vmhook::detail::jni_function<144, get_static_field_id_t>(vmhook::hotspot::current_jni_env) };
-            return get_static_field_id ? get_static_field_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr;
+            void* const field_id{ get_static_field_id ? get_static_field_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr };
+            if (!field_id)
+            {
+                vmhook::detail::jni_exception_clear();
+            }
+            return field_id;
         }
 
         /*
@@ -9607,6 +9663,17 @@ namespace vmhook
         inline auto jni_klass_from_class_mirror(void* const class_handle) noexcept
             -> vmhook::hotspot::klass*
         {
+            // Defensive: never decode a mirror while a JNI exception is pending.
+            // jni_decode_object() raw-dereferences the handle's slot; if the caller
+            // reached here off a throwing JNI call (a stale/garbage handle left by a
+            // failed call on a cold JDK 17+), proceeding would read an invalid slot.
+            // The valid callers (loadClass success, FindClass success) have no
+            // pending exception, so this is a no-op for them.
+            if (vmhook::detail::jni_exception_pending())
+            {
+                return nullptr;
+            }
+
             void* const class_oop{ vmhook::detail::jni_decode_object(class_handle) };
             if (!class_oop || !vmhook::hotspot::is_valid_pointer(class_oop))
             {
@@ -9631,6 +9698,28 @@ namespace vmhook
             {
                 return nullptr;
             }
+
+            // ensure_current_java_thread() may have just attached this (injected)
+            // OS thread to the JVM.  Every JNI helper below dereferences
+            // current_jni_env through jni_function<>; that template null-checks the
+            // env, but we additionally validate it here so the whole fallback bails
+            // cleanly (returns nullptr — the not-found contract) if the JNIEnv could
+            // not be established, instead of threading a null env through a dozen
+            // call sites.
+            if (!vmhook::hotspot::current_jni_env
+                || !vmhook::hotspot::is_valid_pointer(vmhook::hotspot::current_jni_env))
+            {
+                return nullptr;
+            }
+
+            // Clear any exception that was already pending when we were entered.
+            // A freshly-attached injected thread, or a detour thread that just ran
+            // host Java code which left an exception in flight, can arrive here with
+            // a pending exception.  The very first JNI call below (FindClass) would
+            // then execute with that exception pending — undefined behaviour per the
+            // JNI spec and a known cold-JDK-17+ fault on no-SEH toolchains.  Start
+            // from a known-clean exception state.
+            vmhook::detail::jni_exception_clear();
 
             // Small RAII helper: every JNI local ref we acquire during the
             // class-loader walk lands in this vector; on return the dtor
@@ -9697,9 +9786,37 @@ namespace vmhook
                 vmhook::detail::jni_value args[1]{};
                 args[0].l = name_string;
 
+                // Invoke ClassLoader.loadClass(name).  For a class that does not
+                // resolve this THROWS — ClassNotFoundException on every JDK, plus
+                // NoClassDefFoundError / linkage errors on a cold JDK 17+ where the
+                // module layer is touched for the first time.  CallObjectMethodA
+                // returns null on any throw.
                 void* const class_mirror{ bag.track(vmhook::detail::jni_call_object_method(class_loader, load_class_id, args)) };
-                vmhook::hotspot::klass* const klass{ vmhook::detail::jni_klass_from_class_mirror(class_mirror) };
+
+                // CRITICAL (JNI-spec safety): clear the pending exception NOW, before
+                // any other action.  Per the JNI spec, once a call leaves an exception
+                // pending the only legal follow-up calls are the exception-handling and
+                // reference functions — making any other JNI call (or letting one run
+                // implicitly) while the exception is pending is undefined behaviour and
+                // faults inside the JVM on cold JDK 17+ under toolchains whose runtime
+                // cannot contain a structured AV (MinGW / clang-cl, which lack SEH).
+                // Snapshot whether loadClass threw, then dismiss it immediately.
+                const bool load_threw{ vmhook::detail::jni_exception_pending() };
                 vmhook::detail::jni_exception_clear();
+
+                // Only decode the returned mirror on the SUCCESS path — i.e. when
+                // loadClass did NOT throw and actually returned a Class handle.  On the
+                // not-found path class_mirror is null (and an exception was pending), so
+                // there is nothing to decode and we return nullptr cleanly.  This keeps
+                // the success path byte-for-byte equivalent to before: a real class still
+                // yields a non-null mirror with no pending exception and is decoded to
+                // its Klass* exactly as it always was.
+                if (load_threw || !class_mirror)
+                {
+                    return nullptr;
+                }
+
+                vmhook::hotspot::klass* const klass{ vmhook::detail::jni_klass_from_class_mirror(class_mirror) };
                 return klass;
             };
 
