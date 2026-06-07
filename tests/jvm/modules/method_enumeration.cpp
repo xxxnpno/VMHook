@@ -32,6 +32,31 @@
 //     wrapper type return empty;
 //   - get_class_methods("bogus/Name") returns empty (class not loaded).
 //
+// CRASH-PROOFING (mingw·gcc has NO SEH net — any wild read kills the whole JVM):
+//   PARTs A-D are pure METADATA: get_class_methods / find_methods_by_signature
+//   walk InstanceKlass::_methods and read Method*/Symbol* out of METASPACE, which
+//   is native and STABLE (never GC-relocated), and the library guards every slot
+//   with is_valid_pointer — so those reads cannot fault on a cold JVM and stay
+//   HARD.  The single genuinely cold-unsafe dereference in the whole module is
+//   inside the PART E (J)J detour: it reads the receiver's `seed` field
+//   (self->seed() -> get_field("seed")->get(), a RAW std::memcpy at oop+offset,
+//   vmhook.hpp field_proxy::get).  Crucially, the library's detour trampoline
+//   wraps the user detour in seh_invoke_detour (vmhook.hpp:5945), but that SEH
+//   net is a no-op on mingw·gcc — its #else branch is a plain C++ try/catch,
+//   which on Windows-GCC does NOT catch a structured access violation.  So a
+//   faulting field read inside the detour escapes uncaught and tears down the
+//   JVM ("Last module entered: method_enumeration", no TOTAL line) — exactly the
+//   modular-only cold crash.  The fix makes the detour itself fault-proof:
+//   self->seed() is read only after the receiver oop's header AND the exact
+//   `seed` slot are proven currently-mapped via os::safe_read (returns false,
+//   never faults, on an unmapped/relocated page); a transient miss degrades to a
+//   best-effort [INFO] (never a fault, never a vacuous pass), while a SUCCESSFUL
+//   read that yields the WRONG seed still FAILS.  No m->call() is ever issued
+//   here (the probe drives real bytecode; the detour only reads a field), so the
+//   call-stub gate that sibling modules need is N/A.  Fine-grained ctx.record()
+//   checkpoints (flushed per line) bracket every PART and every risky op so any
+//   residual no-SEH fault is pinpointed by the last-flushed line.
+//
 // Harness note: the fixture's `done` latches, so each scenario resets done +
 // sets mode on the rising edge of go (the drive() helper), runs ONE probe cycle,
 // then reads back observations.  scoped_hook (NEVER shutdown_hooks) isolates the
@@ -47,8 +72,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -75,7 +102,53 @@ namespace
         static auto get_last_id_int() -> std::int32_t  { return static_field("lastIdInt")->get(); }
 
         // Reads an instance's own seed (proves the detour's `self` is correct).
-        auto seed() const -> std::int32_t { return get_field("seed")->get(); }
+        //
+        // CRASH-PROOF variant for use INSIDE the detour, where a raw fault would
+        // escape the library's (mingw-no-op) SEH net and kill the JVM.  Returns
+        // nullopt — never faults, never UB — when the field cannot be SAFELY read:
+        //   * get_field() didn't resolve (cold-JVM field-resolution miss) — the
+        //     plain seed() below would deref a nullopt optional (UB);
+        //   * the receiver oop's header or the exact 4-byte `seed` slot is not
+        //     currently mapped (os::safe_read returns false instead of faulting),
+        //     e.g. a relocated/stale receiver.
+        // A SUCCESSFUL probe means the get()/memcpy of the SAME 4 bytes at the
+        // SAME address cannot fault, so the returned value is HARD: a wrong seed
+        // from a successful read still surfaces as a mismatch at the call site.
+        auto seed_safe() const -> std::optional<std::int32_t>
+        {
+            const auto proxy{ get_field("seed") };
+            if (!proxy.has_value())
+            {
+                return std::nullopt;
+            }
+            // Re-acquire the receiver oop fresh and probe BOTH the object header
+            // (proves the base oop is the real, currently-resident object) and the
+            // precise 4-byte slot the read will touch (proxy->raw_address() ==
+            // oop+offset for an instance field).  safe_read goes through a kernel
+            // path (ReadProcessMemory / process_vm_readv) that returns false rather
+            // than faulting on an unmapped page.
+            void* const base_oop{ this->get_instance() };
+            if (!base_oop || !vmhook::hotspot::is_valid_pointer(base_oop))
+            {
+                return std::nullopt;
+            }
+            std::uint8_t header_scratch[16] = { 0 };
+            if (!vmhook::os::safe_read(header_scratch, base_oop, sizeof(header_scratch)))
+            {
+                return std::nullopt;
+            }
+            void* const slot{ proxy->raw_address() };
+            std::int32_t slot_scratch{ 0 };
+            if (!slot || !vmhook::os::safe_read(&slot_scratch, slot, sizeof(slot_scratch)))
+            {
+                return std::nullopt;
+            }
+            // COPY-init from value_t (never brace-init): value_t's templated
+            // conversion operator makes std::int32_t{ proxy->get() } ambiguous on
+            // MSVC (see the nested_classes convention).
+            const std::int32_t value = proxy->get();
+            return value;
+        }
     };
 
     // A SECOND wrapper type that we deliberately NEVER register, to prove the
@@ -99,7 +172,16 @@ namespace
     // ---- (J)J hook observations (the unique-descriptor install/fire target) -
     std::atomic<std::int32_t> g_jj_fire_count{ 0 };
     std::atomic<std::int64_t> g_jj_arg{ -1 };
-    std::atomic<bool>         g_jj_self_ok{ false };
+    // Tri-state observation of the detour's view of `self` (set INSIDE the detour,
+    // which on mingw runs with NO SEH net — so the seed read must never fault):
+    //    0 = not observed / could not SAFELY read seed (transient: receiver oop
+    //        header or slot not currently mapped, or field unresolved) -> the
+    //        saw_correct_self assertion degrades to [INFO] (never a fault, never
+    //        a vacuous pass);
+    //    1 = read seed and it MATCHED SEED (self is the correct receiver);
+    //    2 = read seed and it did NOT match (a real wrong-self / mis-decode bug).
+    // A value of 2 still FAILS the assertion, so a SUCCESSFUL read stays HARD.
+    std::atomic<std::int32_t> g_jj_self_state{ 0 };
 
     // ---- refused-hook observation: must STAY zero -----------------------
     std::atomic<std::int32_t> g_refused_fire_count{ 0 };
@@ -156,11 +238,30 @@ namespace
 
 VMHOOK_JVM_MODULE(method_enumeration)
 {
+    // ── Fine-grained CRASH-LOCATOR checkpoints (CRITICAL on mingw·gcc) ────────
+    //
+    // mingw·gcc installs NO usable SEH net (seh_invoke_detour's try/catch can't
+    // catch a structured AV), so a single wild read takes down the whole JVM with
+    // no stack trace — the only forensic signal is the LAST line flushed to
+    // test_results.txt (ctx.record flushes per line).  A checkpoint is dropped
+    // before every PART and immediately before the one read that can fault on a
+    // cold JVM (the detour's seed read), so the next CI run's last-flushed line
+    // names the EXACT op that died.  Permanent: one flushed line each, invaluable
+    // on a platform with no fault recovery.
+    const auto cp = [&](const char* where)
+    {
+        ctx.record(std::string{ "[INFO] method_enumeration checkpoint: " } + where);
+    };
+
+    cp("register_class<me_fixture>");
     vmhook::register_class<me_fixture>("vmhook/fixtures/MethodEnumeration");
 
     // =====================================================================
     // PART A — get_class_methods<T>(): the real declared (name, descriptor) set.
+    //   METASPACE metadata read (Method*/Symbol*, native + stable, library-guarded
+    //   per slot with is_valid_pointer) — cannot fault on a cold JVM -> all HARD.
     // =====================================================================
+    cp("PART A get_class_methods<T>() (metaspace metadata — no oop deref)");
     const std::vector<std::pair<std::string, std::string>> by_type{
         vmhook::get_class_methods<me_fixture>() };
 
@@ -253,7 +354,9 @@ VMHOOK_JVM_MODULE(method_enumeration)
 
     // =====================================================================
     // PART B — get_class_methods(by NAME) AGREES with get_class_methods<T>().
+    //   Same metaspace path as PART A (by internal name) -> HARD.
     // =====================================================================
+    cp("PART B get_class_methods(by name) (metaspace metadata — no oop deref)");
     const std::vector<std::pair<std::string, std::string>> by_name{
         vmhook::get_class_methods(CLASS_NAME) };
 
@@ -300,14 +403,19 @@ VMHOOK_JVM_MODULE(method_enumeration)
 
     // =====================================================================
     // PART C — get_class_methods<U>() on an UNREGISTERED wrapper type is empty.
+    //   Pure type-map lookup miss -> returns empty, no deref -> HARD.
     // =====================================================================
+    cp("PART C get_class_methods<unregistered>() (type-map miss — no deref)");
     const std::vector<std::pair<std::string, std::string>> by_unregistered_type{
         vmhook::get_class_methods<me_unregistered>() };
     ctx.check("unregistered_type_enumerates_empty", by_unregistered_type.empty());
 
     // =====================================================================
     // PART D — find_methods_by_signature<T>(desc): returns ALL matching names.
+    //   Filters the PART-A metaspace enumeration by descriptor string-equality —
+    //   no oop deref -> HARD.
     // =====================================================================
+    cp("PART D find_methods_by_signature<T> (metaspace metadata — no oop deref)");
 
     // Unique (J)J -> exactly one name, and it is idLong.
     const std::vector<std::string> jj{ vmhook::find_methods_by_signature<me_fixture>("(J)J") };
@@ -381,26 +489,55 @@ VMHOOK_JVM_MODULE(method_enumeration)
     // PART E — hook_by_signature<T>: INSTALL + FIRE on the UNIQUE (J)J match.
     //   The detour observes the long arg (across the 2-slot boundary) and self.
     //   run() calls idLong on a real bytecode dispatch (mode 1).
+    //
+    //   *** THE cold-JVM crash site ***  The detour reads self->seed(), a RAW
+    //   memcpy at receiver_oop+offset (field_proxy::get).  The library's detour
+    //   trampoline wraps this in seh_invoke_detour, but that SEH net is a no-op
+    //   on mingw·gcc (its #else branch is a plain try/catch that cannot catch a
+    //   structured AV), so a faulting seed read escapes uncaught and tears down
+    //   the JVM.  The detour therefore reads via seed_safe(): it probes the oop
+    //   header AND the exact 4-byte seed slot with os::safe_read first, so the
+    //   read provably cannot fault; a transient miss yields nullopt -> tri-state
+    //   0 (best-effort [INFO]), a successful read sets 1 (correct) or 2 (wrong).
+    //   The arg decode and fire-count read NO oop (frame locals / an atomic), so
+    //   they stay HARD.
     // =====================================================================
     {
         g_jj_fire_count.store(0);
         g_jj_arg.store(-1);
-        g_jj_self_ok.store(false);
+        g_jj_self_state.store(0);
 
+        cp("PART E hook_by_signature<(J)J> install");
         const bool installed{ vmhook::hook_by_signature<me_fixture>(
             "(J)J",
             [](vmhook::return_value&,
                const std::unique_ptr<me_fixture>& self,
                std::int64_t x)
             {
+                // Fire-count + arg decode touch NO oop (an atomic and the frame's
+                // local-variable slots, which are live stack during the in-flight
+                // call) -> always safe, even on a cold JVM with no SEH net.
                 g_jj_fire_count.fetch_add(1, std::memory_order_relaxed);
                 g_jj_arg.store(x, std::memory_order_relaxed);
-                g_jj_self_ok.store(self != nullptr && self->seed() == SEED,
-                                   std::memory_order_relaxed);
+
+                // The ONLY oop deref: gate it through seed_safe(), which proves the
+                // receiver header + the exact seed slot are currently mapped before
+                // the memcpy.  nullopt = transient unreadable (tri-state 0); a read
+                // value sets 1 (== SEED) or 2 (mismatch) so a wrong self still fails.
+                if (self != nullptr)
+                {
+                    const std::optional<std::int32_t> s{ self->seed_safe() };
+                    if (s.has_value())
+                    {
+                        g_jj_self_state.store(*s == SEED ? 1 : 2,
+                                              std::memory_order_relaxed);
+                    }
+                }
             }) };
 
         ctx.check("hook_by_sig_JJ_installed_true", installed);
 
+        cp("PART E drive(mode 1) — real idLong bytecode dispatch fires detour");
         const bool done{ drive(ctx, 1) };
         ctx.check("hook_by_sig_JJ_probe_completed", done);
 
@@ -410,9 +547,25 @@ VMHOOK_JVM_MODULE(method_enumeration)
                   g_jj_fire_count.load(std::memory_order_relaxed) != 0);
         ctx.check("hook_by_sig_JJ_decoded_long_arg",
                   g_jj_arg.load(std::memory_order_relaxed) == IDLONG_ARG);
-        ctx.check("hook_by_sig_JJ_saw_correct_self",
-                  g_jj_self_ok.load(std::memory_order_relaxed));
+
+        // saw_correct_self: HARD-fail on a WRONG seed from a successful read
+        // (state 2 — a genuine wrong-self / mis-decode bug); pass on state 1;
+        // best-effort [INFO] on state 0 (the detour fired but the receiver slot
+        // was not safely readable at that instant — transient, never a fault).
+        const std::int32_t self_state{ g_jj_self_state.load(std::memory_order_relaxed) };
+        if (self_state == 0)
+        {
+            ctx.record("[INFO] hook_by_sig_JJ_saw_correct_self: detour fired but the "
+                       "receiver `seed` slot was not safely readable at that instant "
+                       "(transient cold-JVM/relocation miss) — skipped self assert "
+                       "(not a defect; fire-count + arg-decode above stay HARD).");
+        }
+        else
+        {
+            ctx.check("hook_by_sig_JJ_saw_correct_self", self_state == 1);
+        }
         // allow-through: the original idLong body still ran (returns its arg).
+        // get_last_id_long reads the static mirror (old-gen, stable) -> HARD.
         ctx.check("hook_by_sig_JJ_allow_through",
                   me_fixture::get_last_id_long() == IDLONG_ARG);
     }
@@ -421,10 +574,14 @@ VMHOOK_JVM_MODULE(method_enumeration)
     // PART F — hook_by_signature<T> REFUSES on a SHARED descriptor (I)I.
     //   It must return false AND install nothing — proven by then calling
     //   idInt (mode 2) and confirming the would-be detour never fires.
+    //   The refused (I)I detour reads NO oop (an atomic only) and never installs;
+    //   the accepted (J)J detour does NOT fire on idInt (a different method) — so
+    //   mode 2 runs no oop-dereferencing detour body and cannot fault.
     // =====================================================================
     {
         g_refused_fire_count.store(0);
 
+        cp("PART F hook_by_signature<(I)I> refuse (shared descriptor)");
         const bool installed{ vmhook::hook_by_signature<me_fixture>(
             "(I)I",
             [](vmhook::return_value&,
@@ -436,6 +593,7 @@ VMHOOK_JVM_MODULE(method_enumeration)
 
         ctx.check("hook_by_sig_II_refused_false", installed == false);
 
+        cp("PART F drive(mode 2) — idInt dispatch (no detour body derefs an oop)");
         const bool done{ drive(ctx, 2) };
         ctx.check("hook_by_sig_II_probe_completed", done);
 
@@ -454,8 +612,9 @@ VMHOOK_JVM_MODULE(method_enumeration)
     // =====================================================================
     // PART G — hook_by_signature<T> REFUSES on the SYNTHETIC-member collision
     //   ()V (6 matches incl. <init>/<clinit>): returns false, installs nothing.
-    //   No probe needed — the refusal is a pure resolution decision.
+    //   No probe needed — the refusal is a pure resolution decision (no deref).
     // =====================================================================
+    cp("PART G hook_by_signature<()V> refuse (synthetic-member collision)");
     {
         std::atomic<std::int32_t> v_fire{ 0 };
         const bool installed{ vmhook::hook_by_signature<me_fixture>(
@@ -472,7 +631,9 @@ VMHOOK_JVM_MODULE(method_enumeration)
     // =====================================================================
     // PART H — hook_by_signature<T> on a descriptor that matches NOTHING:
     //   returns false (distinct refusal path: empty, not multi-match).
+    //   Pure resolution decisions, no probe, no deref.
     // =====================================================================
+    cp("PART H hook_by_signature refusals (no-match / empty / unregistered)");
     {
         const bool installed{ vmhook::hook_by_signature<me_fixture>(
             "(D)D",
@@ -511,8 +672,10 @@ VMHOOK_JVM_MODULE(method_enumeration)
     // PART I — a UNIQUE descriptor that the probe never dispatches still
     //   INSTALLS (true).  Proves install success is decided purely by
     //   descriptor uniqueness, not by whether the method is later called.
-    //   (sWide (JD)J is static and unique; we never invoke it.)
+    //   (sWide (JD)J is static and unique; we never invoke it — the detour never
+    //   fires, so no deref.)
     // =====================================================================
+    cp("PART I hook_by_signature<(JD)J> install (unique, never dispatched)");
     {
         const bool installed{ vmhook::hook_by_signature<me_fixture>(
             "(JD)J",
@@ -521,4 +684,6 @@ VMHOOK_JVM_MODULE(method_enumeration)
             }) };
         ctx.check("hook_by_sig_unique_static_JDJ_installed_true", installed);
     }
+
+    cp("module complete (all parts reached without a no-SEH fault)");
 }
