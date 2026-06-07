@@ -16309,7 +16309,39 @@ namespace vmhook
             return {};
         }
 
-        const std::uint32_t arr_compressed{ vmhook::get_field<std::uint32_t>(string_oop, string_klass, "value") };
+        // Resolve the `value` field offset on java.lang.String, then read the
+        // compressed backing-array OOP through os::safe_read rather than
+        // vmhook::get_field<>().  get_field()'s internal std::memcpy from
+        // (string_oop + offset) is guarded only by is_valid_pointer(), a
+        // range/alignment/poison HEURISTIC — it does NOT prove the page is
+        // mapped.  After a GC relocation the String's old address still passes
+        // is_valid_pointer but points at an unmapped page; the raw memcpy would
+        // then fault, and on MinGW/clang-cl (no SEH) that AV terminates the JVM
+        // instead of degrading to "".  safe_read (ReadProcessMemory on Windows /
+        // process_vm_readv on Linux) never faults and returns false on an
+        // unreadable span — mirroring symbol::to_string().  `value` is declared
+        // on java.lang.String itself, so the per-klass find_field offset equals
+        // the one get_field()/find_field() would resolve.
+        const auto value_field{ string_klass->find_field("value") };
+        if (!value_field)
+        {
+            VMHOOK_LOG("{} read_java_string(): java.lang.String has no 'value' field - "
+                       "VMStructs field walk failed.",
+                       vmhook::error_tag);
+            return {};
+        }
+
+        std::uint32_t arr_compressed{ 0 };
+        if (!vmhook::os::safe_read(&arr_compressed,
+                                   reinterpret_cast<const std::uint8_t*>(string_oop) + value_field->offset,
+                                   sizeof(arr_compressed)))
+        {
+            // The String OOP's `value` slot is not currently mapped (e.g. the
+            // String was GC-relocated out from under its old address).  Degrade
+            // to "" exactly like every other failure path here.
+            return {};
+        }
+
         if (!arr_compressed)
         {
             // Backing-array compressed pointer is 0 - this is the legitimate
@@ -16328,8 +16360,17 @@ namespace vmhook
             return {};
         }
 
+        // Read the arrayOop length (+12) through safe_read for the same reason:
+        // the backing array can itself be relocated/unmapped, and
+        // is_valid_pointer(arr_oop) only passed the heuristic, not a
+        // mapped-memory check.
         const auto* const arr{ reinterpret_cast<const std::uint8_t*>(arr_oop) };
-        const std::int32_t length{ *reinterpret_cast<const std::int32_t*>(arr + 12) };
+        std::int32_t length{ 0 };
+        if (!vmhook::os::safe_read(&length, arr + 12, sizeof(length)))
+        {
+            return {};
+        }
+
         if (length <= 0 || length > 4096)
         {
             VMHOOK_LOG("{} read_java_string(): array length {} out of range (must be 1..4096) - "
@@ -16338,8 +16379,50 @@ namespace vmhook
             return {};
         }
 
-        const std::uint8_t* const data{ arr + 16 };
         const bool has_coder{ string_klass->find_field("coder").has_value() };
+
+        // Resolve the coder (JDK 9+) BEFORE touching the body so we know how many
+        // body bytes the layout occupies, then copy exactly that span into a
+        // fixed local buffer through safe_read.  The decode below reads from this
+        // mapped-into-process copy (`data`) instead of dereferencing the heap
+        // array directly — so a relocated/unmapped body can never fault the
+        // decode loops, and a normally-mapped String yields byte-identical bytes.
+        //
+        // Worst-case span is the JDK 8 char[] layout: `length` is the char count
+        // and each char is 2 bytes, so 4096 * 2 = 8192 bytes.  For the JDK 9+
+        // byte[] layouts `length` is already the byte count (<= 4096).
+        std::uint8_t coder{ 0 };
+        if (has_coder)
+        {
+            const auto coder_field{ string_klass->find_field("coder") };
+            if (!coder_field
+                || !vmhook::os::safe_read(&coder,
+                                          reinterpret_cast<const std::uint8_t*>(string_oop) + coder_field->offset,
+                                          sizeof(coder)))
+            {
+                return {};
+            }
+        }
+
+        // Number of body bytes this String occupies for its layout: the JDK 8
+        // char[] (no coder) stores 2 bytes per char (`length` chars), while both
+        // JDK 9+ byte[] layouts (LATIN1 and UTF16) make `length` the byte count
+        // directly.  length <= 4096, so length * 2 <= 8192 — no int32 overflow
+        // and a perfect fit for body_buffer.
+        const std::int32_t body_bytes{ has_coder ? length : length * 2 };
+
+        // alignas(uint16_t): the UTF-16 decode below reinterpret_casts `data` to
+        // const uint16_t* and reads 2-byte units; the heap arrayOop body was
+        // naturally aligned, so keep the local copy 2-aligned too.
+        alignas(std::uint16_t) std::uint8_t body_buffer[8192];
+        if (!vmhook::os::safe_read(body_buffer, arr + 16, static_cast<std::size_t>(body_bytes)))
+        {
+            // The backing array body is not fully mapped (relocated String) —
+            // degrade to "" rather than faulting the decode below.
+            return {};
+        }
+
+        const std::uint8_t* const data{ body_buffer };
 
         // Append a Unicode code point to `out` as standard UTF-8 (1-4 bytes).
         // Replaces the previous lossy "non-ASCII -> '?'" substitution that
@@ -16402,7 +16485,7 @@ namespace vmhook
         }
         else
         {
-            const std::uint8_t coder{ vmhook::get_field<std::uint8_t>(string_oop, string_klass, "coder") };
+            // `coder` was already read (safe_read) above to size the body copy.
             if (coder == 0)
             {
                 // JDK 9+ LATIN1: one byte per char, each a code point in 0..255.
