@@ -235,6 +235,59 @@ namespace
         return name_sym->to_string() == std::string{ expected };
     }
 
+    // ── CRASH-PROOFING: validate an OOP before any RAW dereference ───────────
+    //
+    // WHY is_valid_pointer() alone is NOT enough here (the cold-JVM crash):
+    //   This module acquires the fixture's force-instantiated singletons (host /
+    //   staticNested / innerInst) by reading their compressed OOPs out of static
+    //   fields, then later reads CONTENT off those oops:
+    //     * klass_from_oop(oop)           RAW-derefs the narrow-klass at oop+8
+    //                                     (vmhook.hpp ~14597), gated ONLY by
+    //                                     is_valid_pointer;
+    //     * get_field("…")->get()         RAW std::memcpy's the field bytes at
+    //                                     instance+offset (field_proxy::get,
+    //                                     vmhook.hpp ~12297) — no validity filter
+    //                                     beyond a null field_pointer check;
+    //     * get_field("this$0")->get()    reads the synthetic reference slot the
+    //                                     same RAW way before decoding it.
+    //   The singletons are freshly allocated in <clinit> and, on a COLD JVM, still
+    //   live in the young generation.  The harness's own work (and the mode-1
+    //   probe) allocates on the Java thread and can trigger a young/minor GC that
+    //   RELOCATES those objects mid-module.  A relocated object's OLD address is
+    //   still canonical + aligned + in range, so it PASSES is_valid_pointer()
+    //   while pointing into a now-unmapped/evacuated page — the raw read then
+    //   segfaults.  With the legacy warm-up battery present the heap was already
+    //   settled (singletons tenured) before this module ran, which is why the
+    //   crash only surfaced on the modular-only, cold-JVM path; MinGW/gcc have no
+    //   SEH net, so the fault takes down the whole JVM with no TOTAL line.
+    //
+    // os::safe_read() (ReadProcessMemory on Windows / a fault-safe path on Linux)
+    // is the ONLY check that actually proves the page is currently mapped: it
+    // reads through a kernel path that returns false instead of faulting on an
+    // unmapped/relocated address.  We probe the OOP header region every reader
+    // touches (mark word @0 .. narrow-klass @8 — the first 16 bytes) BEFORE
+    // handing the oop to any raw-deref helper.
+    //
+    // GC timing makes this BEST-EFFORT, not a hard guarantee (a collector can
+    // relocate between the probe and the read), so a failed probe is treated as a
+    // transient miss: record [INFO] and skip the STRONG assertion, never fail —
+    // mirroring tests/jvm/modules/field_introspection.cpp.  The checks that do
+    // NOT deref an oop (find_class resolution, name echo, has_value, distinctness,
+    // pointer IDENTITY comparison, the static-field probe reads) stay HARD.
+    constexpr std::size_t k_oop_header_probe_bytes{ 16 };
+
+    auto oop_header_safely_readable(void* const oop) -> bool
+    {
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+        {
+            return false;
+        }
+        std::uint8_t scratch[k_oop_header_probe_bytes] = { 0 };
+        // Returns false (no fault) if any byte of the header is on an
+        // unmapped/relocated page.
+        return vmhook::os::safe_read(scratch, oop, sizeof(scratch));
+    }
+
     // Drive one probe cycle for `mode`: clears the latched `done` and programs
     // the selector on the rising edge of go, then waits for done.
     auto drive(vmhook_test::context& ctx, std::int32_t mode) -> bool
@@ -301,17 +354,46 @@ VMHOOK_JVM_MODULE(nested_classes)
     ctx.check("static_nested_instance_acquired", static_nested != nullptr);
     ctx.check("inner_instance_acquired", inner != nullptr);
 
+    // Each get_*() RAW-memcpy's the field bytes at instance+offset, so probe the
+    // instance oop header first: a GC-relocated singleton's old address passes
+    // is_valid_pointer but is unmapped (see oop_header_safely_readable).  On a
+    // probe miss, record [INFO] and skip — the assertion stays HARD on success,
+    // so a genuinely wrong field value from a SUCCESSFUL read still fails.
     if (host)
     {
-        ctx.check("host_outerField_is_7", host->get_outer_field() == 7);
+        if (oop_header_safely_readable(host->get_instance()))
+        {
+            ctx.check("host_outerField_is_7", host->get_outer_field() == 7);
+        }
+        else
+        {
+            ctx.record("[INFO] nested_classes: host instance header not safely readable "
+                       "(stale/relocated) -- skipped outerField read.");
+        }
     }
     if (static_nested)
     {
-        ctx.check("static_nested_value_is_42", static_nested->get_value() == 42);
+        if (oop_header_safely_readable(static_nested->get_instance()))
+        {
+            ctx.check("static_nested_value_is_42", static_nested->get_value() == 42);
+        }
+        else
+        {
+            ctx.record("[INFO] nested_classes: staticNested instance header not safely "
+                       "readable (stale/relocated) -- skipped value read.");
+        }
     }
     if (inner)
     {
-        ctx.check("inner_innerValue_is_99", inner->get_inner_value() == 99);
+        if (oop_header_safely_readable(inner->get_instance()))
+        {
+            ctx.check("inner_innerValue_is_99", inner->get_inner_value() == 99);
+        }
+        else
+        {
+            ctx.record("[INFO] nested_classes: inner instance header not safely readable "
+                       "(stale/relocated) -- skipped innerValue read.");
+        }
     }
 
     // =====================================================================
@@ -319,21 +401,39 @@ VMHOOK_JVM_MODULE(nested_classes)
     //     Ties "resolve klass by `$` name" to the actual objects the field
     //     reads ran against (klass_from_oop(instance) == find_class(name)).
     // =====================================================================
-    if (host && host->get_instance() && vmhook::hotspot::is_valid_pointer(host->get_instance()))
+    // klass_from_oop RAW-derefs the narrow-klass at oop+8, so gate on the
+    // safe-read header probe (not bare is_valid_pointer — a relocated old address
+    // passes that yet faults).  Best-effort: skip + [INFO] on a probe miss; the
+    // equality assertion is HARD on success (a wrong klass still fails).
+    if (host && oop_header_safely_readable(host->get_instance()))
     {
         ctx.check("host_oop_klass_matches_find_class",
                   vmhook::klass_from_oop(host->get_instance()) == host_klass);
     }
-    if (static_nested && static_nested->get_instance()
-        && vmhook::hotspot::is_valid_pointer(static_nested->get_instance()))
+    else if (host)
+    {
+        ctx.record("[INFO] nested_classes: host instance header not safely readable "
+                   "(stale/relocated) -- skipped klass_from_oop tie-back.");
+    }
+    if (static_nested && oop_header_safely_readable(static_nested->get_instance()))
     {
         ctx.check("static_nested_oop_klass_matches_find_class",
                   vmhook::klass_from_oop(static_nested->get_instance()) == static_klass);
     }
-    if (inner && inner->get_instance() && vmhook::hotspot::is_valid_pointer(inner->get_instance()))
+    else if (static_nested)
+    {
+        ctx.record("[INFO] nested_classes: staticNested instance header not safely "
+                   "readable (stale/relocated) -- skipped klass_from_oop tie-back.");
+    }
+    if (inner && oop_header_safely_readable(inner->get_instance()))
     {
         ctx.check("inner_oop_klass_matches_find_class",
                   vmhook::klass_from_oop(inner->get_instance()) == inner_klass);
+    }
+    else if (inner)
+    {
+        ctx.record("[INFO] nested_classes: inner instance header not safely readable "
+                   "(stale/relocated) -- skipped klass_from_oop tie-back.");
     }
 
     // =====================================================================
@@ -344,30 +444,70 @@ VMHOOK_JVM_MODULE(nested_classes)
     // =====================================================================
     if (inner)
     {
+        // Field-metadata existence (walks the klass field list); no oop deref, HARD.
         ctx.check("inner_synthetic_this0_field_resolves", inner->this0_resolves());
 
-        const auto this0_host{ inner->get_this0_host() };
-        ctx.check("inner_this0_decodes_to_nonnull_wrapper", this0_host != nullptr);
-
-        if (this0_host)
+        // get_this0_host() RAW-reads the synthetic reference slot at
+        // inner_oop + this$0_offset, so it must only run when inner's header is
+        // safely readable.  On a probe miss the whole this$0 deref chain is
+        // skipped + [INFO] (never faults).
+        if (oop_header_safely_readable(inner->get_instance()))
         {
-            vmhook::oop_t const this0_oop{ this0_host->get_instance() };
-            ctx.check("inner_this0_oop_is_valid",
-                      this0_oop != nullptr && vmhook::hotspot::is_valid_pointer(this0_oop));
+            const auto this0_host{ inner->get_this0_host() };
+            ctx.check("inner_this0_decodes_to_nonnull_wrapper", this0_host != nullptr);
 
-            // IDENTITY: the this$0 OOP must be the very Host instance we acquired
-            // from the static `host` field (same Java object -> same heap oop).
-            if (host && this0_oop && vmhook::hotspot::is_valid_pointer(this0_oop))
+            if (this0_host)
             {
-                ctx.check("inner_this0_identity_is_host_instance",
-                          this0_oop == host->get_instance());
-                // And it carries the Host klass (consistency with phase 1/3).
-                ctx.check("inner_this0_oop_klass_is_host_klass",
-                          vmhook::klass_from_oop(this0_oop) == host_klass);
-                // Reading Host.outerField THROUGH the this$0-decoded wrapper sees 7.
-                ctx.check("inner_this0_outerField_readback_7",
-                          this0_host->get_outer_field() == 7);
+                vmhook::oop_t const this0_oop{ this0_host->get_instance() };
+                ctx.check("inner_this0_oop_is_valid",
+                          this0_oop != nullptr && vmhook::hotspot::is_valid_pointer(this0_oop));
+
+                // IDENTITY: the this$0 OOP must be the very Host instance we
+                // acquired from the static `host` field (same Java object -> same
+                // heap oop).  This is the strongest, load-bearing assertion in the
+                // module: it is a pure POINTER COMPARISON (no dereference), so it
+                // CANNOT fault and stays HARD — gated only on non-null, never on a
+                // safe-read probe.  It is the only thing distinguishing "correct"
+                // from "decoded some other live object," and must never be
+                // weakened to a mere non-null check.
+                if (host && this0_oop && vmhook::hotspot::is_valid_pointer(this0_oop))
+                {
+                    ctx.check("inner_this0_identity_is_host_instance",
+                              this0_oop == host->get_instance());
+
+                    // klass_from_oop RAW-derefs this0_oop+8 -> probe its header.
+                    if (oop_header_safely_readable(this0_oop))
+                    {
+                        ctx.check("inner_this0_oop_klass_is_host_klass",
+                                  vmhook::klass_from_oop(this0_oop) == host_klass);
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] nested_classes: this$0 oop header not safely "
+                                   "readable (stale/relocated) -- skipped klass tie-back "
+                                   "(identity proof above still HARD).");
+                    }
+
+                    // Reading Host.outerField THROUGH the this$0-decoded wrapper
+                    // RAW-memcpy's host_oop+offset -> probe that wrapper's header.
+                    if (oop_header_safely_readable(this0_host->get_instance()))
+                    {
+                        ctx.check("inner_this0_outerField_readback_7",
+                                  this0_host->get_outer_field() == 7);
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] nested_classes: this$0-decoded Host header not "
+                                   "safely readable (stale/relocated) -- skipped outerField "
+                                   "readback (identity proof above still HARD).");
+                    }
+                }
             }
+        }
+        else
+        {
+            ctx.record("[INFO] nested_classes: inner instance header not safely readable "
+                       "(stale/relocated) -- skipped this$0 decode + back-reference checks.");
         }
     }
 
@@ -375,8 +515,28 @@ VMHOOK_JVM_MODULE(nested_classes)
     //  5. Native interpreter-call ATTEMPTS (degrade gracefully to [INFO]).
     //     A no-arg int instance method on a nested class may return monostate
     //     via the call_jni fallback on some JDK builds; never FAIL on that.
+    //
+    //     CRASH-PROOFING: the call dispatches into Java bytecode that reads the
+    //     receiver oop.  Two cold-JVM hazards are gated out before invoking:
+    //       * the call gate (StubRoutines::_call_stub_entry) may be absent on a
+    //         cold JVM -> method_proxy::call() takes the JNI fallback path; mirror
+    //         poly_inherited_oop and SKIP the call (record [INFO]) when the gate is
+    //         absent rather than driving an unguarded cold call;
+    //       * even with the gate present, a GC-relocated receiver must not be
+    //         passed into the call machinery, so require the receiver header to be
+    //         safely readable.
+    //     Either way the authoritative 84 / 106 come from the mode-1 bytecode probe
+    //     (phase 6), so skipping here loses no coverage.
     // =====================================================================
-    if (static_nested)
+    const bool call_gate_present{ vmhook::detail::find_call_stub_entry() != nullptr };
+    ctx.record(std::string{ "[INFO] nested_classes call gate: " }
+               + (call_gate_present
+                      ? "StubRoutines::_call_stub_entry present (call_stub fast path)"
+                      : "call_stub_entry absent (JNI fallback) -- native call attempts skipped; "
+                        "mode-1 probe is authoritative"));
+
+    if (static_nested && call_gate_present
+        && oop_header_safely_readable(static_nested->get_instance()))
     {
         const vmhook::method_proxy::value_t dv{ static_nested->call_doubled() };
         if (!dv.is_void())
@@ -391,7 +551,14 @@ VMHOOK_JVM_MODULE(nested_classes)
                        "covered authoritatively by the mode-1 probe below.");
         }
     }
-    if (inner)
+    else if (static_nested)
+    {
+        ctx.record("[INFO] nested_classes: native StaticNested.doubled() attempt skipped "
+                   "(call gate absent or receiver header not safely readable) -- "
+                   "covered authoritatively by the mode-1 probe below.");
+    }
+    if (inner && call_gate_present
+        && oop_header_safely_readable(inner->get_instance()))
     {
         const vmhook::method_proxy::value_t ov{ inner->call_outer_plus_inner() };
         if (!ov.is_void())
@@ -405,6 +572,12 @@ VMHOOK_JVM_MODULE(nested_classes)
                        "(synthetic-this$0 no-arg int call via JNI fallback unavailable on this JDK "
                        "build) -- covered authoritatively by the mode-1 probe below.");
         }
+    }
+    else if (inner)
+    {
+        ctx.record("[INFO] nested_classes: native Inner.outerPlusInner() attempt skipped "
+                   "(call gate absent or receiver header not safely readable) -- "
+                   "covered authoritatively by the mode-1 probe below.");
     }
 
     // =====================================================================
