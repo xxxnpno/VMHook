@@ -357,6 +357,16 @@ VMHOOK_JVM_MODULE(method_enumeration)
     //   Same metaspace path as PART A (by internal name) -> HARD.
     // =====================================================================
     cp("PART B get_class_methods(by name) (metaspace metadata — no oop deref)");
+    // SUB-CHECKPOINTS (one per by-name call): on a no-SEH toolchain
+    // (mingw/clang-cl) a structured AV is uncatchable, so the only forensic
+    // signal is the LAST flushed line.  PART B makes THREE distinct find_class
+    // calls and the first cold one differs sharply from PART A: PART A resolved
+    // the VALID class (graph-walk HIT, returns early, then cached), but B.2/B.3
+    // are full graph-walk MISSES (walk EVERY loaded klass's name symbol) that
+    // then fall through to the JNI ClassLoader.loadClass fallback — paths PART A
+    // never touched.  These three markers split "somewhere in PART B" into the
+    // exact faulting call on the next CI run.
+    cp("PART B.1 by-name VALID get_class_methods(CLASS_NAME) (cache HIT — graph-walk warmed by PART A)");
     const std::vector<std::pair<std::string, std::string>> by_name{
         vmhook::get_class_methods(CLASS_NAME) };
 
@@ -392,11 +402,22 @@ VMHOOK_JVM_MODULE(method_enumeration)
     ctx.check("by_name_descriptor_II_shared_3", count_descriptor(by_name, "(I)I") == 3);
 
     // Negative: a class that is NOT loaded enumerates to empty.
+    // This is a FULL graph-walk MISS (touches every loaded klass's name symbol)
+    // followed by the JNI ClassLoader.loadClass("vmhook.fixtures.NoSuchClassZZZ")
+    // fallback — the FIRST cold exercise of both on mingw/clang (this module runs
+    // before find_class_fallback in MinGW/GNU-ld registration order), so it is the
+    // prime cold-fault suspect; checkpoint it on its own line.
+    cp("PART B.2 by-name BOGUS get_class_methods('vmhook/fixtures/NoSuchClassZZZ') (full graph-walk MISS + JNI loadClass fallback)");
     const std::vector<std::pair<std::string, std::string>> by_bogus_name{
         vmhook::get_class_methods("vmhook/fixtures/NoSuchClassZZZ") };
     ctx.check("by_bogus_name_empty", by_bogus_name.empty());
 
-    // Negative: an empty class name enumerates to empty (no crash).
+    // Negative: an empty class name enumerates to empty (no crash).  An empty
+    // internal class name can never name a loaded class; find_class short-circuits
+    // it to nullptr (empty-name guard) so this no longer walks the graph or calls
+    // the JNI loadClass fallback with "".  Checkpointed separately so a residual
+    // no-SEH fault here is unambiguous.
+    cp("PART B.3 by-name EMPTY get_class_methods(\"\") (find_class empty-name guard — no walk, no JNI)");
     const std::vector<std::pair<std::string, std::string>> by_empty_name{
         vmhook::get_class_methods("") };
     ctx.check("by_empty_name_empty", by_empty_name.empty());

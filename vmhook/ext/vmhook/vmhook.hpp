@@ -1887,15 +1887,47 @@ namespace vmhook
                         return std::string{};
                     }
 
-                    const std::uint16_t length{ *reinterpret_cast<const std::uint16_t*>(reinterpret_cast<const std::uint8_t*>(this) + length_entry->offset) };
-                    const char* const body{ reinterpret_cast<const char*>(reinterpret_cast<const std::uint8_t*>(this) + body_entry->offset) };
-
-                    if (!vmhook::hotspot::is_valid_pointer(body) || length == 0 || length > 0x1000)
+                    // Read _length through a kernel-validated probe rather than a
+                    // raw deref: safe_read_pointer(this) above only proved the
+                    // first pointer-sized chunk at `this` is mapped, and _length
+                    // (though small) need not lie within it on every JDK layout.
+                    std::uint16_t length{ 0 };
+                    if (!vmhook::os::safe_read(&length,
+                                               reinterpret_cast<const std::uint8_t*>(this) + length_entry->offset,
+                                               sizeof(length)))
                     {
                         return std::string{};
                     }
 
-                    return std::string{ body, length };
+                    if (length == 0 || length > 0x1000)
+                    {
+                        return std::string{};
+                    }
+
+                    const std::uint8_t* const body{ reinterpret_cast<const std::uint8_t*>(this) + body_entry->offset };
+
+                    // Copy the body through os::safe_read (ReadProcessMemory on
+                    // Windows / process_vm_readv etc. elsewhere) instead of a raw
+                    // std::string{body, length}.  is_valid_pointer(body) is only a
+                    // range/alignment/poison heuristic — it does NOT prove every
+                    // one of `length` body bytes is currently mapped.  A Symbol
+                    // straddling a transiently-unmapped page boundary (cold-JVM
+                    // metaspace expansion / relocation, e.g. while a full
+                    // ClassLoaderDataGraph MISS walk reads every loaded klass's
+                    // name) would fault the raw copy, and on MinGW/clang the
+                    // surrounding try/catch CANNOT catch that structured AV — it
+                    // would kill the JVM.  safe_read returns false (never faults)
+                    // on an unreadable span, degrading to "" exactly like every
+                    // other failure path here.  For a normal mapped Symbol the
+                    // bytes are identical to the old copy (still no modified-UTF-8
+                    // decode — ASCII identifiers/descriptors are byte-for-byte).
+                    char buffer[0x1000];
+                    if (!vmhook::os::safe_read(buffer, body, length))
+                    {
+                        return std::string{};
+                    }
+
+                    return std::string{ buffer, length };
                 }
                 catch (const std::exception& exception)
                 {
@@ -6365,6 +6397,23 @@ namespace vmhook
     static auto find_class(const std::string_view class_name)
         -> vmhook::hotspot::klass*
     {
+        // Empty-name fast-reject.  An empty internal class name can never name a
+        // loaded class, so there is nothing to resolve.  Short-circuiting here is
+        // not merely an optimisation: without it an empty name falls through the
+        // full ClassLoaderDataGraph walk and then into
+        // jni_find_class_with_context_loader, which invokes
+        // ClassLoader.loadClass("") via JNI on the calling (possibly freshly-
+        // attached) thread.  On a cold JDK 17+ JVM that empty-binary-name path is
+        // far less travelled than an ordinary ClassNotFoundException miss, and a
+        // fault inside it escapes the library's MinGW/clang try/catch (which can
+        // only contain C++ throws, not a structured AV) and tears the JVM down.
+        // Rejecting "" up front is behaviour-preserving — the previous code also
+        // returned nullptr for an empty name, just by the long way around.
+        if (class_name.empty())
+        {
+            return nullptr;
+        }
+
         {
             std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
             const auto cache_entry{ vmhook::klass_lookup_cache.find(std::string{ class_name }) };
