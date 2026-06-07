@@ -823,31 +823,28 @@ int main()
     }
 
     // ======================================================================
-    // SECTION 12 — guard's trivially-copyable type-set boundary.  [INFO].
+    // SECTION 12 — guard's trivially-copyable type-set boundary.
     //
-    // SUBTLE LIBRARY NOTE (see the agent report's library-bug section): the "C"
-    // 1-byte widening shortcut (vmhook.hpp:12761) is a *runtime* `if` (NOT
-    // `if constexpr`), so its body — `static_cast<unsigned char>(value)` at
-    // :12763 — is INSTANTIATED for every trivially-copyable value_type that
-    // reaches the trivial arm, regardless of the field signature.  Any type not
-    // static_cast-convertible to unsigned char (std::array<char,N>, void*, a
-    // small struct) is therefore a HARD COMPILE ERROR at the call site, even
-    // when the field is "I"/"J"/... and the "C" branch would never execute at
-    // runtime.  So audit flaw #3's premise ("std::array<char,4> falls through
-    // and is accepted as a blob") is WRONG: it does not fall through — it does
-    // not compile.  This is a COMPILE-TIME property and cannot be probed with a
-    // `requires`-expression (which only checks call-expression well-formedness,
-    // not template-body instantiation — verified: the probe reports the call as
-    // valid, yet instantiating it errors).  It is therefore documented here and
-    // in the report rather than asserted at runtime; the cases below were
-    // intentionally NOT written as `proxy.set(std::array<...>{})` because that
-    // would break the build.
+    // RESOLVED LIBRARY NOTE: the "C" 1-byte widening shortcut (vmhook.hpp ~12761)
+    // was originally a *runtime* `if` whose body — `static_cast<unsigned char>(value)`
+    // — was INSTANTIATED for every trivially-copyable value_type reaching the trivial
+    // arm, regardless of the field signature.  Any type not static_cast-convertible
+    // to unsigned char (std::array<char,N>, void*, a small struct) was therefore a
+    // HARD COMPILE ERROR at the call site even when the field was "I"/"J"/... and the
+    // "C" branch would never execute — and, insidiously, this was NOT
+    // `requires`-detectable (a `requires`-expression checks only call-expression
+    // well-formedness, not template-body instantiation, so the probe reported the
+    // call valid yet instantiating it errored).
     //
-    // What we CAN assert: the positive direction — every 1-byte integral type
-    // IS set()-callable (it is convertible to unsigned char), confirming the
-    // shortcut's accepted input set.  `requires` is reliable for the POSITIVE
-    // case (no body instantiation needed to confirm it compiles, since these do
-    // compile).
+    // FIXED by guarding the shortcut with `if constexpr (is_arithmetic_v ||
+    // is_enum_v)`, so the widening is only instantiated for value types whose cast is
+    // well-formed; every OTHER trivially-copyable type now falls through to the size
+    // guard and is written (width match) or rejected (width mismatch) like any blob.
+    // This section now ASSERTS the fixed behaviour at RUNTIME — these calls would not
+    // have compiled before the fix.
+    //
+    // First the positive `requires` direction — every 1-byte integral type, and now
+    // also void* / std::array / a trivial struct, IS set()-callable:
     {
         constexpr bool char_callable{
             requires(const vmhook::field_proxy& p) { p.set(char{ 'A' }); } };
@@ -876,6 +873,45 @@ int main()
         constexpr bool string_callable{
             requires(const vmhook::field_proxy& p) { p.set(std::string{ "x" }); } };
         check("string_IS_set_callable", string_callable);
+
+        // void* / std::array / a trivial struct are NOW set()-callable (post-fix).
+        constexpr bool voidptr_callable{
+            requires(const vmhook::field_proxy& p) { p.set(static_cast<void*>(nullptr)); } };
+        check("voidptr_IS_set_callable_after_fix", voidptr_callable);
+
+        constexpr bool array_callable{
+            requires(const vmhook::field_proxy& p) { p.set(std::array<char, 4>{}); } };
+        check("array_IS_set_callable_after_fix", array_callable);
+
+        struct trivial4 { std::uint8_t a, b, c, d; };
+        static_assert(std::is_trivially_copyable_v<trivial4>,
+                      "trivial4 must be trivially copyable to reach the trivial arm.");
+        constexpr bool struct_callable{
+            requires(const vmhook::field_proxy& p) { p.set(trivial4{}); } };
+        check("struct_IS_set_callable_after_fix", struct_callable);
+
+        // ...and at RUNTIME they route through the SIZE GUARD (not the "C" path):
+        // width match -> accepted (raw bytes land verbatim); mismatch -> rejected
+        // (slot + sentinels intact).  This is the direct proof of the fix — before
+        // it, none of the calls below would compile.
+        void* const ptr_val{
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1122334455667788ULL)) };
+        check("voidptr_into_J_accepted_8eq8", accepted_into("J", ptr_val));
+        check("voidptr_into_I_rejected_8ne4", rejected_into("I", ptr_val));
+
+        const std::array<unsigned char, 4> arr4{ { 0x0D, 0xF0, 0xAD, 0x0B } };
+        check("array4_into_I_accepted_4eq4", accepted_into("I", arr4));
+        check("array4_into_J_rejected_4ne8", rejected_into("J", arr4));
+
+        const std::array<unsigned char, 2> arr2{ { 0xEF, 0xBE } };
+        check("array2_into_S_accepted_2eq2", accepted_into("S", arr2));
+
+        const trivial4 s4{ 0x11, 0x22, 0x33, 0x44 };
+        check("struct4_into_I_accepted_4eq4", accepted_into("I", s4));
+        // A 4-byte NON-arithmetic struct into "C" (2-byte) must NOT widen (the
+        // if constexpr excludes non-arithmetic/non-enum types) -> size guard sees
+        // 4 != 2 -> rejected.  Proves the guard's predicate, not just compilability.
+        check("struct4_into_C_rejected_no_widen", rejected_into("C", s4));
     }
 
     // ======================================================================
