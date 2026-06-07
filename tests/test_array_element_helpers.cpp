@@ -494,6 +494,619 @@ static auto test_array_length_sign() -> void
     }
 }
 
+// ===========================================================================
+// EXHAUSTIVE EXPANSION (12+).  The three helpers reduce to one piece of
+// arithmetic — element address = base + 16 + index * sizeof(T) — gated by a
+// half-open [0, length) bounds check and vmhook::hotspot::is_valid_pointer on
+// the *header* pointer.  There is no BasicType size table or base-offset helper
+// inside this feature: the per-element stride IS sizeof(T) (the C++ element
+// type) and the base IS the constant +16.  So "element size for every JVM
+// BasicType" maps here to "every element width T", and the sweeps below pin the
+// exact byte offset the helper touches against an independent oracle.
+//
+// The oracle (offset_of) recomputes the address the SAME way the header does,
+// then reads/writes the raw backing bytes at that offset and cross-checks
+// against get/set_array_element.  Mirroring the header arithmetic exactly means
+// a divergence (e.g. a base or stride change) fails loudly.
+// ===========================================================================
+
+// Independent oracle for the element byte offset within the buffer.  Mirrors
+// vmhook.hpp: data starts at +16, stride is sizeof(T).  Uses size_t here so the
+// oracle itself never overflows (the header uses an int32 multiply — see the
+// documented overflow note in test_index_scale_overflow / the bug report).
+template<typename T>
+static auto offset_of(std::int32_t index) -> std::size_t
+{
+    return std::size_t{ 16u } + static_cast<std::size_t>(index) * sizeof(T);
+}
+
+// Read sizeof(T) raw bytes straight out of the backing buffer at the oracle
+// offset (bypassing the helper) so we can prove the helper landed exactly there.
+template<typename T>
+static auto raw_peek(const std::vector<std::uint8_t>& buffer, std::int32_t index) -> T
+{
+    T value{};
+    std::memcpy(&value, buffer.data() + offset_of<T>(index), sizeof(T));
+    return value;
+}
+
+// ---------------------------------------------------------------------------
+// 12. Per-width STRIDE / element-size proof.
+//
+// For every supported element width, build a fresh N-element array seeded with
+// a per-index distinct pattern, then for EACH index assert:
+//   * get_array_element<T>(oop, i) == raw bytes the oracle reads at +16+i*sizeof(T)
+//   * after set_array_element<T>(oop, i, v), the oracle reads back v at that
+//     same offset and the helper agrees.
+// This is the exhaustive "element stride == sizeof(T), base == +16" check across
+// all widths (the JVM BasicType size table, expressed as C++ widths):
+//   boolean/byte = 1, char/short = 2, int/float = 4, long/double = 8,
+//   compressed-oop = 4, uncompressed-oop = 8.
+// ---------------------------------------------------------------------------
+template<typename T>
+static auto exercise_stride(const char* label_prefix, std::int32_t count) -> void
+{
+    auto tag{ [&](const char* suffix)
+    {
+        static thread_local char storage[112];
+        std::snprintf(storage, sizeof(storage), "%s_%s", label_prefix, suffix);
+        return storage;
+    } };
+
+    // Seed each element with a distinct, width-filling pattern derived from its
+    // index so that a stride error (reading/writing a neighbour) is visible.
+    std::vector<T> seed(static_cast<std::size_t>(count));
+    for (std::int32_t i{ 0 }; i < count; ++i)
+    {
+        // Spread the index across all bytes of T so neighbours never alias.
+        const std::uint64_t pattern{ (static_cast<std::uint64_t>(i) * 0x0101010101010101ull)
+                                     ^ (static_cast<std::uint64_t>(i) << 3) ^ 0x55u };
+        T element{};
+        std::memcpy(&element, &pattern, sizeof(T));
+        seed[static_cast<std::size_t>(i)] = element;
+    }
+
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    check(tag("length_matches_count"), vmhook::array_length(oop) == count);
+
+    bool all_get_match{ true };
+    for (std::int32_t i{ 0 }; i < count; ++i)
+    {
+        const T via_helper{ vmhook::get_array_element<T>(oop, i) };
+        const T via_oracle{ raw_peek<T>(buffer, i) };
+        if (!bits_equal(via_helper, via_oracle)) { all_get_match = false; break; }
+    }
+    check(tag("get_lands_at_base16_plus_index_stride"), all_get_match);
+
+    // Overwrite every slot with a second distinct pattern and confirm both the
+    // helper and the raw oracle see the new value at exactly the oracle offset,
+    // and that no other slot moved (full re-read after the full rewrite).
+    std::vector<T> rewritten(static_cast<std::size_t>(count));
+    for (std::int32_t i{ 0 }; i < count; ++i)
+    {
+        const std::uint64_t pattern{ (static_cast<std::uint64_t>(count - i) * 0x8080808080808080ull)
+                                     ^ 0xA5A5u ^ (static_cast<std::uint64_t>(i) << 1) };
+        T element{};
+        std::memcpy(&element, &pattern, sizeof(T));
+        rewritten[static_cast<std::size_t>(i)] = element;
+        vmhook::set_array_element<T>(oop, i, element);
+    }
+
+    bool all_set_match{ true };
+    for (std::int32_t i{ 0 }; i < count; ++i)
+    {
+        const T expected{ rewritten[static_cast<std::size_t>(i)] };
+        if (!bits_equal(vmhook::get_array_element<T>(oop, i), expected)) { all_set_match = false; break; }
+        if (!bits_equal(raw_peek<T>(buffer, i), expected))               { all_set_match = false; break; }
+    }
+    check(tag("set_lands_at_base16_plus_index_stride"), all_set_match);
+
+    // The 16-byte header must be byte-identical to its seeded state after the
+    // full rewrite (length at +12 preserved; mark/klass zero).
+    {
+        bool header_ok{ vmhook::array_length(oop) == count };
+        for (std::size_t i{ 0 }; i < 12u && header_ok; ++i)
+        {
+            if (buffer[i] != 0) { header_ok = false; }
+        }
+        check(tag("header_intact_after_full_rewrite"), header_ok);
+    }
+}
+
+static auto test_element_size_strides() -> void
+{
+    // 1-byte widths: boolean / byte.
+    exercise_stride<std::uint8_t>("stride_u8",  37);
+    exercise_stride<std::int8_t>("stride_i8",   37);
+    // 2-byte widths: char / short.
+    exercise_stride<std::int16_t>("stride_i16", 29);
+    exercise_stride<std::uint16_t>("stride_u16",29);
+    exercise_stride<char16_t>("stride_c16",     29);
+    // 4-byte widths: int / float / compressed-oop.
+    exercise_stride<std::int32_t>("stride_i32", 23);
+    exercise_stride<std::uint32_t>("stride_u32",23);
+    exercise_stride<float>("stride_f32",        23);
+    // 8-byte widths: long / double / uncompressed-oop.
+    exercise_stride<std::int64_t>("stride_i64", 19);
+    exercise_stride<std::uint64_t>("stride_u64",19);
+    exercise_stride<double>("stride_f64",       19);
+}
+
+// ---------------------------------------------------------------------------
+// 13. Dense address sweep across every element scale.
+//
+// For scales 1/2/4/8, sweep EVERY index in a sizeable array and assert the
+// address the helper uses equals base + 16 + index*scale.  We prove the address
+// indirectly but exactly: write a unique value through the helper at index i,
+// then read the raw bytes at the independently-computed oracle offset and
+// require equality (and vice-versa).  A dense sweep (not just 0/1/mid/last)
+// catches any non-linear stride bug.
+// ---------------------------------------------------------------------------
+template<typename T>
+static auto sweep_scale(const char* label, std::int32_t count) -> void
+{
+    std::vector<T> seed(static_cast<std::size_t>(count), T{});
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    bool ok{ true };
+    for (std::int32_t i{ 0 }; i < count && ok; ++i)
+    {
+        // Unique per-index value across the full width of T.
+        const std::uint64_t bits{ 0xC0FFEE0000000000ull ^ (static_cast<std::uint64_t>(i) * 2654435761ull) };
+        T value{};
+        std::memcpy(&value, &bits, sizeof(T));
+
+        // set via helper -> raw oracle must see it at +16+i*scale.
+        vmhook::set_array_element<T>(oop, i, value);
+        if (!bits_equal(raw_peek<T>(buffer, i), value)) { ok = false; break; }
+
+        // get via helper must read the same bytes back.
+        if (!bits_equal(vmhook::get_array_element<T>(oop, i), value)) { ok = false; break; }
+
+        // And the helper must NOT have touched the next slot's first byte
+        // (stride exactness): that byte should still be zero for i < count-1.
+        if (i + 1 < count)
+        {
+            if (buffer[offset_of<T>(i + 1)] != 0) { ok = false; break; }
+        }
+    }
+    check(label, ok);
+}
+
+static auto test_address_computation_sweep() -> void
+{
+    sweep_scale<std::uint8_t>("sweep_scale1_dense", 100);
+    sweep_scale<std::uint16_t>("sweep_scale2_dense", 100);
+    sweep_scale<std::uint32_t>("sweep_scale4_dense", 100);
+    sweep_scale<std::uint64_t>("sweep_scale8_dense", 100);
+
+    // Explicit index 0 / 1 / mid / last per scale, asserting the exact oracle
+    // offset value (16, 16+scale, ...), so the offsets are pinned numerically
+    // and not only relatively.
+    {
+        const std::vector<std::uint32_t> seed(50u, 0u);
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        vmhook::set_array_element<std::uint32_t>(oop, 0,  0x11111111u);
+        vmhook::set_array_element<std::uint32_t>(oop, 1,  0x22222222u);
+        vmhook::set_array_element<std::uint32_t>(oop, 25, 0x33333333u);
+        vmhook::set_array_element<std::uint32_t>(oop, 49, 0x44444444u);
+        // Oracle offsets: 16, 20, 16+25*4=116, 16+49*4=212.
+        check("explicit_offset_index0_is_16",
+              raw_peek<std::uint32_t>(buffer, 0) == 0x11111111u && offset_of<std::uint32_t>(0) == 16u);
+        check("explicit_offset_index1_is_20",
+              raw_peek<std::uint32_t>(buffer, 1) == 0x22222222u && offset_of<std::uint32_t>(1) == 20u);
+        check("explicit_offset_index25_is_116",
+              raw_peek<std::uint32_t>(buffer, 25) == 0x33333333u && offset_of<std::uint32_t>(25) == 116u);
+        check("explicit_offset_index49_is_212",
+              raw_peek<std::uint32_t>(buffer, 49) == 0x44444444u && offset_of<std::uint32_t>(49) == 212u);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 14. The COMPLETE boundary set, read AND write, across widths and lengths.
+//
+// For a given length L the half-open contract is: valid iff 0 <= index < L.
+// Enumerate the full boundary neighbourhood:
+//   -1, INT_MIN, 0, L-1 (last valid), L (first invalid), L+1, INT_MAX.
+// On a length-L array: 0 and L-1 succeed (when L>=1); the rest are rejected.
+// Empty array (L==0): 0 itself is the first invalid index.
+// ---------------------------------------------------------------------------
+template<typename T>
+static auto check_boundary(const char* label_prefix, std::int32_t length, T probe) -> void
+{
+    auto tag{ [&](const char* suffix)
+    {
+        static thread_local char storage[112];
+        std::snprintf(storage, sizeof(storage), "%s_len%d_%s", label_prefix, length, suffix);
+        return storage;
+    } };
+
+    std::vector<T> seed(static_cast<std::size_t>(length), T{});
+    // Seed a recognisable value so a successful read returns something specific.
+    for (std::int32_t i{ 0 }; i < length; ++i)
+    {
+        T v{};
+        const std::uint64_t bits{ 0xABCDEF12u + static_cast<std::uint64_t>(i) };
+        std::memcpy(&v, &bits, sizeof(T));
+        seed[static_cast<std::size_t>(i)] = v;
+    }
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    constexpr std::int32_t int_min{ -2147483647 - 1 };
+    constexpr std::int32_t int_max{ 2147483647 };
+
+    // Invalid indices: must read default and be no-op on write, regardless of L.
+    const std::int32_t invalid[]{ opaque_index(-1), opaque_index(int_min),
+                                  opaque_index(length), opaque_index(length + 1),
+                                  opaque_index(int_max) };
+    bool all_invalid_default{ true };
+    for (const std::int32_t idx : invalid)
+    {
+        if (!bits_equal(vmhook::get_array_element<T>(oop, idx), T{})) { all_invalid_default = false; break; }
+    }
+    check(tag("invalid_reads_default"), all_invalid_default);
+
+    {
+        const std::vector<std::uint8_t> before{ buffer };
+        for (const std::int32_t idx : invalid)
+        {
+            vmhook::set_array_element<T>(oop, idx, probe);
+        }
+        check(tag("invalid_writes_noop"), buffer == before);
+    }
+
+    // Valid indices: 0 and L-1 (only meaningful when L >= 1).
+    if (length >= 1)
+    {
+        check(tag("index0_valid_read"),
+              bits_equal(vmhook::get_array_element<T>(oop, 0), seed[0]));
+        check(tag("last_valid_read"),
+              bits_equal(vmhook::get_array_element<T>(oop, length - 1),
+                         seed[static_cast<std::size_t>(length - 1)]));
+
+        vmhook::set_array_element<T>(oop, 0, probe);
+        check(tag("index0_valid_write"),
+              bits_equal(vmhook::get_array_element<T>(oop, 0), probe));
+        vmhook::set_array_element<T>(oop, length - 1, probe);
+        check(tag("last_valid_write"),
+              bits_equal(vmhook::get_array_element<T>(oop, length - 1), probe));
+    }
+    else
+    {
+        // Empty array: index 0 is itself the first invalid index.
+        check(tag("empty_index0_read_default"),
+              bits_equal(vmhook::get_array_element<T>(oop, opaque_index(0)), T{}));
+        const std::vector<std::uint8_t> before{ buffer };
+        vmhook::set_array_element<T>(oop, opaque_index(0), probe);
+        check(tag("empty_index0_write_noop"), buffer == before);
+    }
+}
+
+static auto test_full_boundary_set() -> void
+{
+    // Lengths 0,1,2,3,8 across a 1/4/8-byte width.
+    check_boundary<std::uint8_t>("bnd_u8", 0, std::uint8_t{ 0x7E });
+    check_boundary<std::uint8_t>("bnd_u8", 1, std::uint8_t{ 0x7E });
+    check_boundary<std::uint8_t>("bnd_u8", 2, std::uint8_t{ 0x7E });
+    check_boundary<std::int32_t>("bnd_i32", 1, std::int32_t{ 0x5EED5EED });
+    check_boundary<std::int32_t>("bnd_i32", 3, std::int32_t{ 0x5EED5EED });
+    check_boundary<std::int64_t>("bnd_i64", 1, std::int64_t{ 0x0123456789ABCDEFll });
+    check_boundary<std::int64_t>("bnd_i64", 8, std::int64_t{ 0x0123456789ABCDEFll });
+    check_boundary<double>("bnd_f64", 2, 3.141592653589793);
+}
+
+// ---------------------------------------------------------------------------
+// 15. OOP element widths: compressed (4-byte) and uncompressed (8-byte).
+//
+// Reference arrays decode through get_array_element<std::uint32_t> (compressed
+// OOP, 4-byte stride) across the codebase, and would be 8-byte (uintptr_t /
+// void*) under -XX:-UseCompressedOops.  The raw helpers are width-agnostic; pin
+// both element sizes round-trip exactly so the documented compressed/uncompressed
+// oop element size is covered as an input to the stride arithmetic.
+// ---------------------------------------------------------------------------
+static auto test_oop_element_widths() -> void
+{
+    // Compressed OOP element = uint32 (4-byte stride).
+    {
+        const std::vector<std::uint32_t> seed{ 0x00000001u, 0x0000ABCDu, 0xFFFFFFF8u, 0x80000000u };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        check("oop_narrow_length_4", vmhook::array_length(oop) == 4);
+        bool ok{ true };
+        for (std::int32_t i{ 0 }; i < 4; ++i)
+        {
+            if (vmhook::get_array_element<std::uint32_t>(oop, i)
+                != seed[static_cast<std::size_t>(i)]) { ok = false; }
+        }
+        check("oop_narrow_roundtrip_4byte_stride", ok);
+        // Stride proof: each slot is exactly 4 bytes apart.
+        check("oop_narrow_stride_is_4",
+              offset_of<std::uint32_t>(0) == 16u && offset_of<std::uint32_t>(1) == 20u
+              && offset_of<std::uint32_t>(3) == 28u);
+    }
+
+    // Uncompressed OOP element = uintptr_t / void* (8-byte stride on x64).
+    {
+        const std::vector<std::uintptr_t> seed{ 0x1ull, 0x00007FFF12345678ull, 0xDEADBEEFCAFEull };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        check("oop_wide_length_3", vmhook::array_length(oop) == 3);
+        bool ok{ true };
+        for (std::int32_t i{ 0 }; i < 3; ++i)
+        {
+            if (vmhook::get_array_element<std::uintptr_t>(oop, i)
+                != seed[static_cast<std::size_t>(i)]) { ok = false; }
+        }
+        check("oop_wide_roundtrip_8byte_stride", ok);
+        check("oop_wide_stride_is_8",
+              offset_of<std::uintptr_t>(0) == 16u && offset_of<std::uintptr_t>(1) == 24u
+              && offset_of<std::uintptr_t>(2) == 32u);
+
+        // void* element type also compiles (trivially copyable) and round-trips.
+        std::vector<void*> seedp{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x2ull)),
+                                  reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x00007FFFAABBCCDEull)) };
+        std::vector<std::uint8_t> bufp{ build_fake_array(seedp) };
+        void* const oopp{ bufp.data() };
+        check("oop_voidptr_roundtrip",
+              vmhook::get_array_element<void*>(oopp, 0) == seedp[0]
+              && vmhook::get_array_element<void*>(oopp, 1) == seedp[1]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 16. index * sizeof(T) offset-overflow behaviour (documents library FLAW #1).
+//
+// vmhook.hpp computes the byte offset as
+//     16 + index * static_cast<std::int32_t>(sizeof(element_type))
+// i.e. a 32-bit (int) multiply.  For a *legitimate* array the offset can never
+// overflow, because every index that passes the bounds check satisfies
+// index < length and length is bounded by the real backing allocation — so the
+// helper's behaviour on every reachable input is deterministic and correct.
+//
+// We pin that here without reading wild memory: on a buffer whose real,
+// allocation-backed length is small, every in-bounds index lands at a byte
+// offset that fits comfortably in int32 (16 + (length-1)*sizeof(T) << INT_MAX),
+// so there is no overflow on any index the bounds check admits.  The DANGER
+// case (a fabricated huge _length that admits a large index whose
+// index*sizeof(T) wraps int32) requires a corrupted length AND would dereference
+// unmapped memory; it is documented in the bug report and intentionally NOT
+// executed here (it is a genuine library hazard, not test-observable safely).
+// ---------------------------------------------------------------------------
+static auto test_index_scale_overflow() -> void
+{
+    // The int32 multiply wraps when index * sizeof(T) >= 2^31.  For sizeof==8
+    // that threshold index is 0x10000000 (268435456); for sizeof==1 it is
+    // 0x80000000 which is already < 0 as int32 and rejected by the negative
+    // guard.  Document the threshold arithmetic as a compile-time-style check so
+    // a reader sees exactly where the wrap is, without performing it.
+    constexpr std::int64_t wrap_threshold_stride8{ static_cast<std::int64_t>(1) << 31 };
+    check("overflow_threshold_stride8_is_2pow31",
+          wrap_threshold_stride8 == 2147483648ll
+          && (0x10000000ll * 8ll) == wrap_threshold_stride8);
+
+    // Reachability proof: with a real (small) backing length, the maximum
+    // in-bounds byte offset is tiny and cannot overflow int32.  We assert the
+    // helper reads the genuine last element (no wrap) for an 8-byte stride.
+    const std::vector<std::int64_t> seed{ 0x1111111111111111ll, 0x2222222222222222ll,
+                                          0x3333333333333333ll, 0x4444444444444444ll };
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+    const std::int32_t last{ vmhook::array_length(oop) - 1 };
+    const std::int64_t max_offset{ 16ll + static_cast<std::int64_t>(last) * 8ll };
+    check("reachable_max_offset_fits_int32", max_offset < 2147483647ll);
+    check("reachable_last_index_no_wrap",
+          vmhook::get_array_element<std::int64_t>(oop, last) == 0x4444444444444444ll);
+
+    // A fabricated negative-via-wrap index is still caught by the FRONT guard:
+    // 0x10000000 with the bounds check fails because length (4) <= index, so the
+    // multiply is never reached.  This shows the bounds check shields the wrap on
+    // any array whose length is honest (the supported precondition).
+    check("large_index_rejected_before_multiply",
+          vmhook::get_array_element<std::int64_t>(oop, opaque_index(0x10000000)) == 0);
+    const std::vector<std::uint8_t> before{ buffer };
+    vmhook::set_array_element<std::int64_t>(oop, opaque_index(0x10000000), 0x9999999999999999ll);
+    check("large_index_write_rejected_before_multiply", buffer == before);
+}
+
+// ---------------------------------------------------------------------------
+// 17. is_valid_pointer guard matrix on the array oop (header pointer).
+//
+// The helpers gate on vmhook::hotspot::is_valid_pointer(array_oop).  Exhaustively
+// feed each rejection class as the oop and require length 0 / default read /
+// no-op write:
+//   * floor (0xFFFF) and at/below it,
+//   * the canonical ceiling (>= 0x00007FFFFFFFFFFF),
+//   * an odd (unaligned) address,
+//   * each of the 9 debug/sentinel low-32 patterns.
+// A valid heap pointer (our buffer) is the positive control.
+// ---------------------------------------------------------------------------
+static auto test_pointer_guard_matrix() -> void
+{
+    auto rejected{ [](std::uintptr_t addr) -> bool
+    {
+        void* const p{ reinterpret_cast<void*>(addr) };
+        const bool len0{ vmhook::array_length(p) == 0 };
+        const bool read_default{ vmhook::get_array_element<std::int32_t>(p, 0) == 0 };
+        // A write must be a no-op; we cannot observe a no-op on an arbitrary
+        // address directly, but it must not crash — reaching the next line is
+        // the observable evidence the guard short-circuited before dereference.
+        vmhook::set_array_element<std::int32_t>(p, 0, 0x1234);
+        return len0 && read_default;
+    } };
+
+    // Range floor: 0xFFFF and below are rejected (addr <= floor).  We do NOT
+    // probe just-above-floor (e.g. 0x10000): that address PASSES is_valid_pointer
+    // (even, > floor, not a sentinel) and the helper would dereference unmapped
+    // memory — a real fault, not a guard-observable rejection.  The guard
+    // validates address range/shape only, never OS page state (see flaw #3).
+    check("guard_floor_exact_rejected", rejected(0xFFFFull));
+    check("guard_below_floor_rejected", rejected(0x1000ull));
+
+    // Range ceiling: at/above 0x00007FFFFFFFFFFF rejected (addr >= ceiling).
+    check("guard_ceiling_exact_rejected", rejected(0x00007FFFFFFFFFFFull));
+    check("guard_above_ceiling_rejected", rejected(0x0000800000000000ull));
+
+    // Odd / unaligned addresses rejected by the (addr & 1) check.
+    check("guard_odd_address_rejected", rejected(0x0000000000400001ull));
+
+    // Each of the nine debug/sentinel low-32 patterns must be rejected when it
+    // forms the low 32 bits of the oop address.  We place the sentinel in the
+    // low 32 bits and a small in-range high word, WITHOUT altering the low bits.
+    // is_valid_pointer rejects via either the odd-address check (for the odd
+    // sentinels: 0xDEADBEEF, 0xCDCDCDCD, 0xABABABAB, 0xFDFDFDFD) or the sentinel
+    // switch (for the even ones).  Both are rejections, which is all the helper
+    // contract requires — so we assert rejection, not the specific reason.
+    const std::uint32_t sentinels[]{
+        0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+        0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu };
+    bool all_sentinels_rejected{ true };
+    for (const std::uint32_t s : sentinels)
+    {
+        // High word 0x00000001 keeps the address inside (floor, ceiling) and the
+        // low 32 bits exactly equal to the sentinel.
+        const std::uintptr_t hi_addr{ (std::uintptr_t{ 1ull } << 32) | s };
+        if (!rejected(hi_addr)) { all_sentinels_rejected = false; }
+        // Canonical low-only form (high word zero): the low-32 switch matches
+        // regardless of the high bits, and the even sentinels are caught by it;
+        // the odd ones are caught by the odd-address check.  Either way rejected.
+        if (!rejected(static_cast<std::uintptr_t>(s))) { all_sentinels_rejected = false; }
+    }
+    check("guard_all_nine_sentinels_rejected", all_sentinels_rejected);
+
+    // Positive control: a real heap buffer passes the guard and reads back.
+    {
+        const std::vector<std::int32_t> seed{ 0x0ABCDEF0 };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        check("guard_valid_heap_pointer_accepted",
+              vmhook::array_length(buffer.data()) == 1
+              && vmhook::get_array_element<std::int32_t>(buffer.data(), 0) == 0x0ABCDEF0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 18. Mixed-width aliasing over the same buffer (endianness / no-padding pin).
+//
+// Writing two int32s at logical indices 0 and 1 lays down 8 contiguous bytes at
+// +16..+23; reading a single int64 at index 0 over the same bytes must compose
+// them little-endian (low int32 in the low half).  This proves there is no
+// hidden per-element padding beyond sizeof and pins the byte order the codebase
+// assumes (x64 LE).
+// ---------------------------------------------------------------------------
+static auto test_mixed_width_aliasing() -> void
+{
+    // Buffer big enough for two int64 slots (16 data bytes).
+    std::vector<std::uint8_t> buffer(16u + 2u * sizeof(std::int64_t), std::uint8_t{ 0 });
+    const std::int32_t len{ 4 }; // 4 int32 slots == 2 int64 slots
+    std::memcpy(buffer.data() + 12, &len, sizeof(len));
+    void* const oop{ buffer.data() };
+
+    // Write low and high halves as int32.
+    vmhook::set_array_element<std::int32_t>(oop, 0, static_cast<std::int32_t>(0x89ABCDEF));
+    vmhook::set_array_element<std::int32_t>(oop, 1, static_cast<std::int32_t>(0x01234567));
+
+    // Read back as a single int64 at index 0 (8-byte stride from +16).
+    const std::int64_t composed{ vmhook::get_array_element<std::int64_t>(oop, 0) };
+    check("alias_two_i32_compose_le_i64",
+          composed == static_cast<std::int64_t>(0x0123456789ABCDEFll));
+
+    // And the reverse: write an int64, read the two int32 halves.
+    vmhook::set_array_element<std::int64_t>(oop, 1, static_cast<std::int64_t>(0x1122334455667788ll));
+    check("alias_i64_low_half_is_i32_index2",
+          vmhook::get_array_element<std::uint32_t>(oop, 2) == 0x55667788u);
+    check("alias_i64_high_half_is_i32_index3",
+          vmhook::get_array_element<std::uint32_t>(oop, 3) == 0x11223344u);
+}
+
+// ---------------------------------------------------------------------------
+// 19. Dense round-trip at non-trivial indices on a large 8-byte array.
+//
+// Round-tripping only indices 0..3 (as the original tests do) cannot reveal a
+// stride error whose magnitude is a multiple that only diverges at larger
+// indices.  Use a 64-element int64 array and round-trip at 0,1,17,31,32,63,
+// each verified against the oracle offset, so a 32-bit-vs-64-bit stride
+// discrepancy would surface as a wrong neighbour.
+// ---------------------------------------------------------------------------
+static auto test_dense_nontrivial_indices() -> void
+{
+    constexpr std::int32_t n{ 64 };
+    std::vector<std::int64_t> seed(static_cast<std::size_t>(n));
+    for (std::int32_t i{ 0 }; i < n; ++i)
+    {
+        seed[static_cast<std::size_t>(i)] = 0x1000000000000000ll + i;
+    }
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    check("dense64_length_is_64", vmhook::array_length(oop) == n);
+
+    const std::int32_t probes[]{ 0, 1, 17, 31, 32, 63 };
+    bool ok{ true };
+    for (const std::int32_t i : probes)
+    {
+        const std::int64_t want{ 0x1000000000000000ll + i };
+        if (vmhook::get_array_element<std::int64_t>(oop, i) != want) { ok = false; break; }
+        if (raw_peek<std::int64_t>(buffer, i) != want)               { ok = false; break; }
+
+        const std::int64_t newv{ 0x2000000000000000ll + i };
+        vmhook::set_array_element<std::int64_t>(oop, i, newv);
+        if (vmhook::get_array_element<std::int64_t>(oop, i) != newv) { ok = false; break; }
+        if (raw_peek<std::int64_t>(buffer, i) != newv)               { ok = false; break; }
+    }
+    check("dense64_nontrivial_index_roundtrip", ok);
+
+    // Neighbours of a touched index must be unchanged: rewrite index 32 and
+    // confirm 31 and 33 keep their values.
+    vmhook::set_array_element<std::int64_t>(oop, 31, 0x3100000000000031ll);
+    vmhook::set_array_element<std::int64_t>(oop, 33, 0x3300000000000033ll);
+    vmhook::set_array_element<std::int64_t>(oop, 32, 0x3200000000000032ll);
+    check("dense64_neighbours_preserved",
+          vmhook::get_array_element<std::int64_t>(oop, 31) == 0x3100000000000031ll
+          && vmhook::get_array_element<std::int64_t>(oop, 32) == 0x3200000000000032ll
+          && vmhook::get_array_element<std::int64_t>(oop, 33) == 0x3300000000000033ll);
+}
+
+// ---------------------------------------------------------------------------
+// 20. array_length reads EXACTLY +12 — not +0 (mark) or +8 (klass).
+//
+// Poison the mark word (+0..+7) and the narrow-klass slot (+8..+11) with values
+// that, if mis-read as the length, would give a wrong answer; confirm the length
+// still equals the int32 actually written at +12 for several distinct lengths.
+// Also confirm element writes never alter +0..+15 for an interior index.
+// ---------------------------------------------------------------------------
+static auto test_length_reads_only_offset12() -> void
+{
+    for (const std::int32_t len : { 1, 2, 7, 100 })
+    {
+        std::vector<std::uint8_t> buffer(16u + static_cast<std::size_t>(len) * sizeof(std::int32_t),
+                                         std::uint8_t{ 0 });
+        // Poison mark (+0..+7) and narrow klass (+8..+11) with 0xEE.
+        std::memset(buffer.data(), 0xEE, 12u);
+        std::memcpy(buffer.data() + 12, &len, sizeof(len));
+        char name[64];
+        std::snprintf(name, sizeof(name), "length_only_off12_len%d", len);
+        check(name, vmhook::array_length(buffer.data()) == len);
+    }
+
+    // Element write to an interior index leaves the entire 16-byte header
+    // (mark+klass+length) byte-identical.
+    {
+        const std::vector<std::int32_t> seed{ 10, 20, 30, 40, 50 };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        // Snapshot the header (note _length lives in here too, at +12).
+        std::uint8_t header_before[16];
+        std::memcpy(header_before, buffer.data(), 16u);
+        vmhook::set_array_element<std::int32_t>(buffer.data(), 2, 0x6B6B6B6B);
+        const bool header_same{ std::memcmp(header_before, buffer.data(), 16u) == 0 };
+        check("interior_write_leaves_full_header", header_same
+              && vmhook::get_array_element<std::int32_t>(buffer.data(), 2) == 0x6B6B6B6B);
+    }
+}
+
 int main()
 {
     test_all_widths();
@@ -507,6 +1120,15 @@ int main()
     test_zero_length_element_access();
     test_extreme_index_sentinels();
     test_array_length_sign();
+    test_element_size_strides();
+    test_address_computation_sweep();
+    test_full_boundary_set();
+    test_oop_element_widths();
+    test_index_scale_overflow();
+    test_pointer_guard_matrix();
+    test_mixed_width_aliasing();
+    test_dense_nontrivial_indices();
+    test_length_reads_only_offset12();
 
     if (failures == 0)
     {
