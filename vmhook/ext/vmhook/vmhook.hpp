@@ -11108,6 +11108,11 @@ namespace vmhook
         return all_resolved;
     }
 
+    // Forward declaration: make_unique<>()'s TLAB-fallback path below delegates
+    // its raw allocation + oopDesc header stamping to this shared primitive,
+    // whose definition appears later in this header (after the field helpers).
+    inline auto make_java_object(vmhook::hotspot::klass* klass, std::size_t requested_size) noexcept -> void*;
+
     /*
         @brief Constructs a new Java object and returns a C++ wrapper.
         @tparam T The C++ wrapper class (must derive from vmhook::object).
@@ -11175,79 +11180,27 @@ namespace vmhook
         }
 
         const std::size_t raw_size{ klass->get_instance_size() };
-        const std::size_t object_size{ (raw_size + 7u) & ~static_cast<std::size_t>(7u) };
-        if (object_size == 0)
+        if (raw_size == 0)
         {
             VMHOOK_LOG("{} vmhook::make_unique<{}>(): failed to read HotSpot instance size.", vmhook::error_tag, typeid(wrapper_type).name());
             return nullptr;
         }
 
-        vmhook::hotspot::java_thread* const thread{ vmhook::hotspot::find_allocation_thread() };
-        void* object_pointer{};
-        if (thread && vmhook::hotspot::is_valid_pointer(thread))
-        {
-            object_pointer = thread->allocate_tlab(object_size);
-        }
-
+        // Allocate + zero + stamp the oopDesc header via the shared allocation
+        // primitive.  make_java_object() rounds raw_size up to 8-byte alignment,
+        // performs the same find_allocation_thread()->allocate_tlab fast path,
+        // the same 256-thread walk + allocate_from_threads_list() fallbacks, the
+        // same std::memset, and the same mark-word / (compressed) klass-pointer
+        // header stamping this path used to hand-roll inline.  Delegating keeps
+        // make_unique on the one allocation path the library maintains (so any
+        // future hardening of make_java_object — e.g. a GC-aware slow path — is
+        // inherited here for free) instead of a near-identical copy.  Failure
+        // contract is unchanged: a null return becomes a null unique_ptr.
+        void* const object_pointer{ vmhook::make_java_object(klass, raw_size) };
         if (!object_pointer)
         {
-            std::int32_t visited_threads{ 0 };
-            for (vmhook::hotspot::java_thread* candidate{ vmhook::hotspot::find_any_java_thread() };
-                candidate && vmhook::hotspot::is_valid_pointer(candidate) && visited_threads < 256;
-                candidate = candidate->get_next(), ++visited_threads)
-            {
-                object_pointer = candidate->allocate_tlab(object_size);
-                if (object_pointer)
-                {
-                    vmhook::hotspot::last_java_thread.store(candidate, std::memory_order_relaxed);
-                    break;
-                }
-            }
-        }
-
-        if (!object_pointer)
-        {
-            object_pointer = vmhook::hotspot::allocate_from_threads_list(object_size);
-        }
-
-        if (!object_pointer)
-        {
-            VMHOOK_LOG("{} vmhook::make_unique<{}>(): current JavaThread TLAB has no room for {} bytes.", vmhook::warning_tag, typeid(wrapper_type).name(), object_size);
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): make_java_object() failed to allocate {} bytes.", vmhook::warning_tag, typeid(wrapper_type).name(), raw_size);
             return nullptr;
-        }
-
-        std::memset(object_pointer, 0, object_size);
-
-        static const vmhook::hotspot::vm_struct_entry_t* const mark_entry{ []()
-            -> const vmhook::hotspot::vm_struct_entry_t*
-            {
-                {
-                    auto* entry{ vmhook::hotspot::iterate_struct_entries("oopDesc", "_mark") };
-                    if (entry)
-                    {
-                        return entry;
-                    }
-                }
-                return vmhook::hotspot::iterate_struct_entries("oopDesc", "_markWord");
-            }()
-        };
-        static const vmhook::hotspot::vm_struct_entry_t* const compressed_klass_entry{ vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._compressed_klass") };
-        static const vmhook::hotspot::vm_struct_entry_t* const klass_entry{ vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._klass") };
-
-        const std::size_t mark_offset{ mark_entry ? static_cast<std::size_t>(mark_entry->offset) : 0u };
-        *reinterpret_cast<std::uintptr_t*>(reinterpret_cast<std::uint8_t*>(object_pointer) + mark_offset) = klass->get_prototype_header();
-
-        if (compressed_klass_entry)
-        {
-            *reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(object_pointer) + compressed_klass_entry->offset) = vmhook::hotspot::encode_klass_pointer(klass);
-        }
-        else if (klass_entry)
-        {
-            *reinterpret_cast<vmhook::hotspot::klass**>(reinterpret_cast<std::uint8_t*>(object_pointer) + klass_entry->offset) = klass;
-        }
-        else
-        {
-            *reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(object_pointer) + 8u) = vmhook::hotspot::encode_klass_pointer(klass);
         }
 
         auto result{ std::make_unique<wrapper_type>(object_pointer) };
