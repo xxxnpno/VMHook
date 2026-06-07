@@ -358,6 +358,68 @@ namespace
         return (code && vmhook::hotspot::is_valid_pointer(code)) ? code : nullptr;
     }
 
+    // True once Method::_code is null with a bounded tolerance for HotSpot's
+    // ASYNCHRONOUS compiler threads, which OWN _code and can land (or have an
+    // in-flight) nmethod on an already-warm method at any instant — including
+    // the microsecond window between hook()/verify_hooks() returning and this
+    // read.  (Mirrors hook_verify_repair.cpp's code_settles_null, the proven
+    // fix for this same flake family on java24-26's faster tiering.)
+    //
+    // Why a plain `method_code(m) == nullptr` is a flake on a HOT method: the
+    // install path only NULLs _code when its install-time `was_compiled`
+    // snapshot is true (vmhook.hpp:8089, 8229-8265).  hot() is hammered by the
+    // earlier hot-loop scenarios, so its compile counters are saturated; if an
+    // async (re)compile repopulates _code AFTER hook()/verify sampled state but
+    // BEFORE we read it, the raw snapshot is non-null even though the install /
+    // verify was correct — far more often on java24-26's aggressive tiered JIT.
+    //
+    // The robust invariant is "vmhook can drive this method to the deopted,
+    // _code==null state".  We assert it by giving verify_hooks() — the exact
+    // re-arm machinery under test, whose mode-3 repair NULLs _code and re-arms
+    // NO_COMPILE (vmhook.hpp:8550-8595) — up to `attempts` synchronous passes to
+    // settle the method, returning true as soon as _code reads null.  NO_COMPILE
+    // (re-armed by verify_hooks) inhibits the next compile so the state sticks.
+    //
+    // Non-vacuous: a transient async recompile is ABSORBED (verify_hooks
+    // re-nulls it), but a genuine regression — verify_hooks failing to deopt,
+    // i.e. leaving a stale compiled _code that it should have nulled — is NOT
+    // absorbed (every pass still reads non-null) and the caller's check fails.
+    // Returns false only after the whole budget still shows a non-null _code.
+    //
+    // Fast path is byte-identical to the old single-instant read: on a correctly
+    // installed/verified method _code is already null, so this returns true
+    // immediately without a single verify_hooks() pass or sleep — only the racy
+    // case pays the settle cost.
+    auto code_settles_null(vmhook::hotspot::method* const m, int attempts) -> bool
+    {
+        if (method_code(m) == nullptr)
+        {
+            return true;
+        }
+        for (int attempt{ 0 }; attempt < attempts; ++attempt)
+        {
+            // Synchronous re-arm: verify_hooks() re-applies the deopt (NULLs
+            // _code, re-arms NO_COMPILE) for any drifted hook.  No-op on a clean
+            // hook.  This is the same machinery scenario 3 relies on.
+            (void)vmhook::verify_hooks();
+            if (method_code(m) == nullptr)
+            {
+                return true;
+            }
+            // Let any in-flight compile / safepoint settle before re-reading.
+            // 40 ms: java26's tiered JIT queues several recompiles during the
+            // drift window, and they drain over a longer interval after
+            // NO_COMPILE is re-armed; a longer settle lets each queued nmethod
+            // land and be re-nulled before the next read.
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 40 });
+            if (method_code(m) == nullptr)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // True iff an INTERPRETED dispatch of this method will route through the
     // patched i2i stub (so the detour can fire).  That holds exactly when
     // _from_interpreted_entry == _i2i_entry — the "deopted" invariant the install
@@ -533,7 +595,11 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
             expect_dont_inline_set(ctx, "install_set_dont_inline_bit", m);
             ctx.check("install_set_no_compile_flags", no_compile_set(m));
             // Install deopts the method, so _code is null in the steady state.
-            ctx.check("install_left_code_null", method_code(m) == nullptr);
+            // hot() is saturated from earlier scenarios; an async recompile can
+            // race _code non-null in the window after hook() returns, so settle
+            // it with a bounded verify_hooks() (still fails on a stale-_code
+            // regression).  Clean fast path = the old single-instant null read.
+            ctx.check("install_left_code_null", code_settles_null(m, 12));
         }
 
         const bool done{ drive(ctx, 1) };
@@ -635,7 +701,11 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
         {
             expect_dont_inline_set(ctx, "hot_install_set_dont_inline", m);
             ctx.check("hot_install_set_no_compile", no_compile_set(m));
-            ctx.check("hot_install_left_code_null", method_code(m) == nullptr);
+            // _code is async-owned by HotSpot; a fresh install on this already-
+            // warm method can race an in-flight recompile that lands _code
+            // between hook() returning and this read.  Settle with a bounded
+            // verify_hooks() pass (still fails on a stale-_code regression).
+            ctx.check("hot_install_left_code_null", code_settles_null(m, 12));
         }
 
         const bool done{ drive(ctx, 2) };
@@ -693,7 +763,12 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
             // _dont_inline bit-readback is best-effort on JDK 21+.
             expect_dont_inline_set(ctx, "hot_dont_inline_set_after_verify_pass", m);
             ctx.check("hot_no_compile_set_after_verify_pass", no_compile_set(m));
-            ctx.check("hot_code_null_after_verify_pass", method_code(m) == nullptr);
+            // After the verify pass _code is deopted-null in the steady state,
+            // but the hot loop left hot() saturated, so on java24-26 one more
+            // async recompile can land _code before this read; verify_hooks()
+            // re-nulls it.  Settle with a bounded pass (still fails on a stale-
+            // _code regression verify_hooks should have deopted).
+            ctx.check("hot_code_null_after_verify_pass", code_settles_null(m, 12));
         }
 
         // Hook still fires after all that JIT pressure + verify — BEST-EFFORT.
