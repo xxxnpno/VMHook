@@ -2709,7 +2709,18 @@ namespace vmhook
                     return 0;
                 }
 
-                return *reinterpret_cast<std::int32_t*>(array);
+                // Sanity-clamp the Array<Method*>::_length.  A HotSpot class has
+                // at most 65535 methods (the class file's method_count is u2), so
+                // a negative or absurdly large value means the _methods pointer
+                // was valid-but-wrong (mis-resolved offset / torn read).  Returning
+                // 0 there stops every caller's reserve()/loop from over-allocating
+                // or walking off the end on a corrupt count.
+                const std::int32_t count{ *reinterpret_cast<std::int32_t*>(array) };
+                if (count < 0 || count > 65535)
+                {
+                    return 0;
+                }
+                return count;
             }
 
             /*
