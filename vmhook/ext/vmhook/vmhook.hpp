@@ -9401,6 +9401,74 @@ namespace vmhook
         }
 
         /*
+            @brief Calls JNIEnv::PushLocalFrame (table slot 19) to open a bounded local-ref frame.
+            @details
+            Opens a new JNI local-reference frame guaranteeing at least `capacity` free
+            local-reference slots.  Every local reference created after this call (whether
+            by our own JNI helpers OR internally by the JVM — e.g. the ClassNotFoundException
+            object and its captured stack-trace elements that HotSpot materialises when
+            ClassLoader.loadClass fails) is allocated in this frame and is released en masse
+            by the matching jni_pop_local_frame().
+
+            Why this matters on a freshly-attached thread: a thread brought into the VM via
+            AttachCurrentThreadAsDaemon has NO native-method frame on its stack, so the JNI
+            spec's only guarantee is a small initial local-ref capacity (16) with no implicit
+            frame teardown.  A multi-step sequence that also forces the JVM to build exception
+            objects (the absent-class loadClass path on a cold JDK 17+) can press against that
+            capacity; pre-establishing a frame with ample headroom makes the whole sequence's
+            local-ref behaviour well-defined and bounded on every JDK.
+
+            Returns 0 on success, a negative value on failure (out of memory), mirroring the
+            JNI contract.  If the slot or env cannot be resolved this returns a negative value
+            so callers treat the frame as NOT pushed (and therefore must not pop).
+
+            Complexity: O(1).  Exception safety: noexcept — JNI vtable dispatch only.
+
+            @param capacity  Minimum number of local references the frame must accommodate.
+            @return  0 on success; negative on failure or if the slot/env is unavailable.
+        */
+        inline auto jni_push_local_frame(const int capacity) noexcept
+            -> int
+        {
+            using push_local_frame_t = int (*)(void*, int);
+            push_local_frame_t const push_local_frame{ vmhook::detail::jni_function<19, push_local_frame_t>(vmhook::hotspot::current_jni_env) };
+            if (!push_local_frame)
+            {
+                return -1;
+            }
+            return push_local_frame(vmhook::hotspot::current_jni_env, capacity);
+        }
+
+        /*
+            @brief Calls JNIEnv::PopLocalFrame (table slot 20) to close a local-ref frame.
+            @details
+            Frees every local reference created since the matching jni_push_local_frame(),
+            in one operation.  `result` is a local reference that should survive into the
+            enclosing frame (or nullptr to keep none); PopLocalFrame returns a fresh local
+            reference to the same object in the popped-to frame.  This function passes
+            nullptr because all of vmhook's class-loader lookups convert their result to a
+            raw HotSpot Klass* (Metaspace, not a heap oop / local ref) before the pop, so no
+            local reference needs to be carried across the frame boundary.
+
+            Must be paired exactly-once with a successful jni_push_local_frame() on every
+            return path.  No-op (and harmless) if the slot/env cannot be resolved.
+
+            Complexity: O(refs in the frame).  Exception safety: noexcept — vtable dispatch.
+        */
+        inline auto jni_pop_local_frame() noexcept
+            -> void
+        {
+            using pop_local_frame_t = void* (*)(void*, void*);
+            pop_local_frame_t const pop_local_frame{ vmhook::detail::jni_function<20, pop_local_frame_t>(vmhook::hotspot::current_jni_env) };
+            if (pop_local_frame)
+            {
+                // Discard the returned (re-homed) local ref: we carry nothing across the
+                // frame boundary — every result is already a raw Klass*.
+                static_cast<void>(pop_local_frame(vmhook::hotspot::current_jni_env, nullptr));
+            }
+        }
+
+        /*
             @brief Calls JNIEnv::FindClass to locate a class by its internal name.
             @details
             Uses JNI table slot 6 (FindClass) with current_jni_env.  The name must use
@@ -9748,6 +9816,51 @@ namespace vmhook
             // from a known-clean exception state.
             vmhook::detail::jni_exception_clear();
 
+            // Open a bounded JNI local-reference frame around the ENTIRE class-loader
+            // walk.  This is the primary robustness fix for the cold-start /
+            // freshly-attached / JDK 17+ / absent-name failure:
+            //
+            //   * A thread attached via AttachCurrentThreadAsDaemon has NO native-method
+            //     frame, so the JNI spec only guarantees a small (16-slot) local-ref
+            //     capacity with no implicit teardown.  This sequence creates ~10 live
+            //     local refs (thread/loader/string/mirror handles across three loaders)
+            //     AND, on the absent-name path, forces the JVM to materialise a
+            //     ClassNotFoundException plus its captured stack trace — objects HotSpot
+            //     allocates as local refs in the CURRENT frame while loadClass unwinds.
+            //     On a cold JDK 17+ (heavier module-layer / linkage machinery than
+            //     JDK 8) those internal refs press against a not-yet-grown table; on a
+            //     toolchain without SEH (MinGW / clang-on-Windows) a fault in that
+            //     near-overflow state is not contained and terminates the process.
+            //
+            //   * PushLocalFrame(capacity) pre-establishes ample headroom BEFORE any of
+            //     that happens and makes the frame's local-ref behaviour well-defined and
+            //     bounded on every JDK; the matching PopLocalFrame (run by the RAII guard
+            //     below, on EVERY return path) frees the whole frame in one operation.
+            //
+            // Behaviour-preserving: on a warm JVM / JDK 8 / MSVC the table never
+            // overflowed, so a frame with headroom changes nothing observable; the
+            // success path still resolves and decodes the identical Klass*.  If the push
+            // itself fails (out of memory, or the slot/env is unavailable) we record that
+            // no frame was opened, pop nothing, and the per-handle local_ref_bag below
+            // remains the sole cleanup mechanism — exactly the pre-fix behaviour.
+            struct local_frame_guard
+            {
+                bool pushed;
+                explicit local_frame_guard(const int capacity) noexcept
+                    : pushed{ vmhook::detail::jni_push_local_frame(capacity) == 0 }
+                {
+                }
+                ~local_frame_guard() noexcept
+                {
+                    if (this->pushed)
+                    {
+                        vmhook::detail::jni_pop_local_frame();
+                    }
+                }
+                local_frame_guard(const local_frame_guard&) = delete;
+                auto operator=(const local_frame_guard&) -> local_frame_guard& = delete;
+            } frame_guard{ 32 };
+
             // Small RAII helper: every JNI local ref we acquire during the
             // class-loader walk lands in this vector; on return the dtor
             // DeleteLocalRef's each one.  Previously this function leaked
@@ -9759,6 +9872,13 @@ namespace vmhook
             // brand-new class still ate one ref per intermediate handle -
             // detour threads that look up many classes (Minecraft + Forge
             // + Lunar mods) eventually trip the local-ref table.
+            //
+            // When the local_frame_guard above pushed a frame, these per-handle
+            // DeleteLocalRef calls are redundant (the frame pop would free them anyway)
+            // but harmless and well-defined: DeleteLocalRef'ing a ref in the current
+            // frame simply frees it early.  This bag is declared AFTER frame_guard so it
+            // destructs FIRST — individual releases happen before the frame pop — and it
+            // remains the complete cleanup path if the frame push failed.
             struct local_ref_bag
             {
                 std::vector<void*> handles;
@@ -9786,6 +9906,15 @@ namespace vmhook
                 {
                     return nullptr;
                 }
+
+                // Defensive (completes the cold-path exception discipline): the first
+                // JNI call below is jni_find_class, which does NOT clear a pending
+                // exception on entry.  Each caller currently reaches here clean, but a
+                // failed loader attempt earlier in the walk must never leave a stale
+                // exception that this FindClass would then execute under (JNI-spec UB,
+                // a cold-JDK-17+ fault on no-SEH toolchains).  No-op on the success path
+                // — a resolvable class arrives with no exception pending.
+                vmhook::detail::jni_exception_clear();
 
                 void* const class_loader_class{ bag.track(vmhook::detail::jni_find_class("java/lang/ClassLoader")) };
                 if (!class_loader_class)
