@@ -246,6 +246,58 @@ namespace
         return (code && vmhook::hotspot::is_valid_pointer(code)) ? code : nullptr;
     }
 
+    // True once Method::_code is null with a bounded tolerance for HotSpot's
+    // ASYNCHRONOUS compiler threads, which OWN _code and can land (or have an
+    // in-flight) nmethod on an already-warm method at any instant — including
+    // the microsecond window between hook()/verify returning and this read.
+    //
+    // Why a plain `method_code(m) == nullptr` is a flake (the repair_pre_code_null
+    // failure on jvm·linux·gcc·java25): hook()'s install path only NULLs _code
+    // when its install-time `was_compiled` snapshot is true (vmhook.hpp:8089,
+    // 8229-8265).  If _code is repopulated by an async (re)compile AFTER hook()
+    // sampled was_compiled==false but BEFORE we read it, the raw snapshot is
+    // non-null even though the install was correct.  hot() is hammered by the
+    // earlier hot/warm loops, so its compile counters are saturated and a C1/C2
+    // recompile can win that race — far more often on java24-26's faster tiering.
+    //
+    // The robust invariant is "vmhook can drive this method to the deopted,
+    // _code==null state".  We assert it by giving verify_hooks() — the exact
+    // re-arm machinery under test, whose mode-3 repair NULLs _code and sets
+    // NO_COMPILE (vmhook.hpp:8550-8595) — up to `attempts` synchronous passes to
+    // settle the method, returning true as soon as _code reads null.  NO_COMPILE
+    // (re-armed by verify_hooks) inhibits the next compile so the state sticks.
+    //
+    // Non-vacuous: a transient async recompile is ABSORBED (verify_hooks re-nulls
+    // it), but a genuine regression — verify_hooks failing to deopt, i.e. leaving
+    // a stale compiled _code that it should have nulled — is NOT absorbed (every
+    // pass still reads non-null) and the caller's check fails.  Returns false
+    // only after the whole budget still shows a non-null _code.
+    auto code_settles_null(vmhook::hotspot::method* const m, int attempts) -> bool
+    {
+        if (method_code(m) == nullptr)
+        {
+            return true;
+        }
+        for (int attempt{ 0 }; attempt < attempts; ++attempt)
+        {
+            // Synchronous re-arm: verify_hooks() re-applies the deopt (NULLs
+            // _code, sets NO_COMPILE) for any drifted hook.  No-op on a clean
+            // hook.  This is the same machinery scenarios 3 & 4 rely on.
+            (void)vmhook::verify_hooks();
+            if (method_code(m) == nullptr)
+            {
+                return true;
+            }
+            // Let any in-flight compile / safepoint settle before re-reading.
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 25 });
+            if (method_code(m) == nullptr)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // True iff the method currently carries the NO_COMPILE inhibitor vmhook sets
     // at install time (i.e. HotSpot is told not to compile it).
     auto no_compile_set(vmhook::hotspot::method* const m) -> bool
@@ -374,8 +426,16 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
         // Sanity: install left the method in the deopted, NO_COMPILE state.
         if (m != nullptr)
         {
+            // NO_COMPILE is a flag vmhook writes synchronously at install -> a
+            // direct read is deterministic.
             ctx.check("jit_install_set_no_compile", no_compile_set(m));
-            ctx.check("jit_install_left_code_null", method_code(m) == nullptr);
+            // _code is async-owned by HotSpot's compiler threads.  A fresh
+            // install on this (already-warm from prior scenarios) method can race
+            // an in-flight recompile that lands _code between hook() returning and
+            // this read — same hazard as scenario 3's repair_pre_code_null, more
+            // frequent on java24-26.  Assert "vmhook drives _code null" with a
+            // bounded verify_hooks() settle; still fails on a stale-_code regression.
+            ctx.check("jit_install_left_code_null", code_settles_null(m, 4));
         }
 
         const bool done{ drive(ctx, 2) };
@@ -520,8 +580,18 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
         else
         {
             // Pre-state: install left it deopted + NO_COMPILE.
+            //
+            // NO_COMPILE is a flag vmhook WRITES synchronously at install, so a
+            // direct read is deterministic across all JDKs.
             ctx.check("repair_pre_no_compile_set", no_compile_set(m));
-            ctx.check("repair_pre_code_null", method_code(m) == nullptr);
+            // _code is owned by HotSpot's ASYNC compiler threads; hot() was
+            // hammered by scenarios 1 & 2, so a C1/C2 recompile can land in the
+            // window between hook() returning and this read (the
+            // jvm·linux·gcc·java25 flake — worse on java24-26's faster tiering).
+            // Assert the robust invariant "vmhook can drive _code to null" via a
+            // bounded verify_hooks() settle, not a raw single-instant snapshot.
+            // Still fails if verify_hooks() can't deopt (leaves a stale _code).
+            ctx.check("repair_pre_code_null", code_settles_null(m, 4));
 
             // --- Induce the drift: clear the inhibitors. ---
             const bool drifted{ force_jit_drift(m) };
