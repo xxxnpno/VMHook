@@ -260,5 +260,204 @@ int main()
         check("make_jni_args_string_l_null_no_jvm", values[6].l == nullptr);
     }
 
+    // =====================================================================
+    // EXPANDED COVERAGE (additive — every expected value derived from the
+    // convert_jni_arg core in vmhook.hpp:
+    //   out.j = 0 (full-width clear); needs_release = false; then by type:
+    //   bool->.z, integral&&sizeof<=4 -> .i (static_cast<int32>),
+    //   integral&&sizeof==8 -> .j, float->.f, double->.d, string/c-string ->
+    //   .l via NewStringUTF (null w/o JVM), object/unique_ptr -> .l=&storage.)
+    // All targets are little-endian (CI matrix), matching this file's existing
+    // union-aliasing assertions.
+    // =====================================================================
+
+    // ---- More integral types route through the .i (int32) branch ------------
+    // sizeof<=4 integrals all land in .i via static_cast<int32_t>: the cast
+    // SIGN-extends signed sources and ZERO-extends unsigned sources.
+    {
+        vmhook::detail::jni_value v{};
+        void* storage{ nullptr };
+
+        // plain int -> .i verbatim.
+        pack_one(int{ -123456 }, v, storage);
+        check("plain_int_writes_i_member", v.i == -123456);
+
+        // unsigned int (uint32) -> .i is a bit-reinterpret (0xFFFFFFFF -> -1).
+        pack_one(std::uint32_t{ 0xFFFFFFFFu }, v, storage);
+        check("uint32_max_writes_i_member_as_minus_one", v.i == -1);
+        check("uint32_max_not_tagged_for_release",
+              pack_one(std::uint32_t{ 0xFFFFFFFFu }, v, storage) == false);
+
+        // plain char -> .i (sizeof 1, integral).  Value 'A' == 65.
+        pack_one(char{ 'A' }, v, storage);
+        check("plain_char_writes_i_member_65", v.i == 65);
+
+        // char16_t (Java char width) -> .i (sizeof 2, integral), zero-extended.
+        pack_one(char16_t{ 0x4E2D }, v, storage);
+        check("char16_writes_i_member_zero_extended", v.i == 0x4E2D);
+
+        // uint8_t max -> .i == 255 (zero-extended), int8_t min -> .i == -128.
+        pack_one(std::uint8_t{ 0xFF }, v, storage);
+        check("uint8_max_writes_i_member_255", v.i == 255);
+        pack_one(std::int8_t{ -128 }, v, storage);
+        check("int8_min_writes_i_member_minus_128", v.i == -128);
+
+        // int16 boundary values -> .i sign-extended.
+        pack_one(std::int16_t{ -32768 }, v, storage);
+        check("int16_min_writes_i_member_minus_32768", v.i == -32768);
+        pack_one(std::int16_t{ 32767 }, v, storage);
+        check("int16_max_writes_i_member_32767", v.i == 32767);
+
+        // uint16 max -> .i == 65535 (zero-extended; the unsigned-16 source is
+        // widened to int32, NOT sign-extended).
+        pack_one(std::uint16_t{ 0xFFFF }, v, storage);
+        check("uint16_max_writes_i_member_65535", v.i == 65535);
+    }
+
+    // ---- The out.j=0 full-width clear: a narrow write leaves high bits zero --
+    // convert_jni_arg writes out.j=0 BEFORE the member store, so a 4-byte .i
+    // write over the zeroed cell leaves the upper 4 bytes zero.  Reading the
+    // whole 8-byte cell back as .j therefore yields the ZERO-EXTENDED low word,
+    // even for a negative .i — the high bits are not sign-filled (the int32
+    // store only touches 4 bytes).  (Little-endian: low word == the .i value's
+    // bit pattern, high word == 0.)
+    {
+        vmhook::detail::jni_value v{};
+        void* storage{ nullptr };
+
+        pack_one(std::int32_t{ -1 }, v, storage);
+        check("int32_minus_one_leaves_high_word_zero",
+              v.j == static_cast<std::int64_t>(0x00000000FFFFFFFFLL));  // 4294967295
+        check("int32_minus_one_l_is_zero_extended_pointer",
+              v.l == reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xFFFFFFFFull)));
+
+        pack_one(std::int32_t{ 1 }, v, storage);
+        check("int32_one_high_word_zero", v.j == 1);
+
+        // bool false over a pre-dirtied cell clears the whole width (already
+        // asserted via .l==nullptr elsewhere; pin via .j here for completeness).
+        v.j = static_cast<std::int64_t>(0xFFFFFFFFFFFFFFFFULL);
+        {
+            bool needs_release{ true };
+            vmhook::detail::write_jni_arg_to_slot(v, storage, needs_release, false);
+        }
+        check("bool_false_clears_full_width_j_is_zero", v.j == 0);
+    }
+
+    // ---- float / double occupy the documented members with a clean high word -
+    // float writes .f (low 4 bytes) over the zeroed cell, so reading .j back is
+    // the float's IEEE-754 bit pattern in the low word with a zero high word.
+    // 1.0f == 0x3F800000; 2.0f == 0x40000000.  This pins both the member choice
+    // AND the full-width clear for the 4-byte float path.
+    {
+        vmhook::detail::jni_value v{};
+        void* storage{ nullptr };
+
+        pack_one(float{ 1.0f }, v, storage);
+        check("float_one_in_f_member", v.f == 1.0f);
+        check("float_one_low_word_is_ieee_bits_high_zero",
+              v.j == static_cast<std::int64_t>(0x000000003F800000LL));
+
+        pack_one(float{ 2.0f }, v, storage);
+        check("float_two_low_word_is_ieee_bits_high_zero",
+              v.j == static_cast<std::int64_t>(0x0000000040000000LL));
+
+        // double writes the full 8-byte .d member; 1.0 == 0x3FF0000000000000.
+        pack_one(double{ 1.0 }, v, storage);
+        check("double_one_in_d_member", v.d == 1.0);
+        check("double_one_full_width_ieee_bits",
+              v.j == static_cast<std::int64_t>(0x3FF0000000000000LL));
+    }
+
+    // ---- int64 boundary values land in .j at full width ---------------------
+    {
+        vmhook::detail::jni_value v{};
+        void* storage{ nullptr };
+
+        pack_one(std::int64_t{ -9223372036854775807LL - 1 }, v, storage);
+        check("int64_min_in_j_member",
+              v.j == (std::int64_t{ -9223372036854775807LL } - 1));
+        pack_one(std::int64_t{ 9223372036854775807LL }, v, storage);
+        check("int64_max_in_j_member", v.j == 9223372036854775807LL);
+        check("int64_max_not_tagged_for_release",
+              pack_one(std::int64_t{ 9223372036854775807LL }, v, storage) == false);
+
+        // uint64 max -> .j == -1 (bit-reinterpret); .l aliases the all-ones ptr.
+        pack_one(std::uint64_t{ 0xFFFFFFFFFFFFFFFFULL }, v, storage);
+        check("uint64_max_in_j_member_is_minus_one", v.j == -1);
+        check("uint64_max_l_is_all_ones_pointer",
+              v.l == reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xFFFFFFFFFFFFFFFFULL)));
+    }
+
+    // ---- object-arg branch: storage indirection for several pointer values --
+    // For an object_base-derived arg the core writes storage = get_instance()
+    // and points value.l at &storage (the synthetic-handle indirection), and
+    // leaves needs_release false.  Verify across distinct instance pointers,
+    // including a null instance (storage becomes null, .l still points at the
+    // storage cell — NOT null).
+    {
+        vmhook::detail::jni_value v{};
+        void* storage{ nullptr };
+
+        for (std::uintptr_t raw : { std::uintptr_t{ 0x1000u },
+                                    std::uintptr_t{ 0xDEADBEEFu },
+                                    std::uintptr_t{ 0x7FFFFFFFFFFFFFFFull } })
+        {
+            fake_object obj{ reinterpret_cast<void*>(raw) };
+            const bool rel{ pack_one(obj, v, storage) };
+            check("object_arg_not_tagged_for_release", rel == false);
+            check("object_arg_l_points_at_storage_cell", v.l == static_cast<void*>(&storage));
+            check("object_arg_storage_holds_instance", storage == obj.get_instance());
+            check("object_arg_storage_matches_raw",
+                  storage == reinterpret_cast<void*>(raw));
+        }
+
+        // Null-instance object: storage becomes null, but value.l still points
+        // at &storage (a non-null cell), and needs_release stays false.
+        fake_object null_obj{ nullptr };
+        const bool rel{ pack_one(null_obj, v, storage) };
+        check("null_object_arg_not_tagged_for_release", rel == false);
+        check("null_object_arg_storage_is_null", storage == nullptr);
+        check("null_object_arg_l_still_points_at_storage",
+              v.l == static_cast<void*>(&storage));
+    }
+
+    // ---- vector path parity for the EXTRA types -----------------------------
+    // make_jni_args over uint32 / char16 / uint8 / int8 / uint16 / uint64 plus
+    // a c-string: every primitive tag must be 0 and the union members must land
+    // exactly as the single-slot path placed them.  The c-string is non-null
+    // but NewStringUTF returns null w/o JVM, so its tag is 0 and .l is null.
+    {
+        std::vector<void*> object_handles{};
+        std::vector<char>  needs_release{};
+        const char* cstr{ "still_no_jvm" };
+        std::vector<vmhook::detail::jni_value> values{
+            vmhook::detail::make_jni_args(
+                object_handles, needs_release,
+                std::uint32_t{ 0xFFFFFFFFu },
+                char16_t{ 0x4E2D },
+                std::uint8_t{ 0xFF },
+                std::int8_t{ -128 },
+                std::uint16_t{ 0xFFFF },
+                std::uint64_t{ 0xFFFFFFFFFFFFFFFFULL },
+                cstr)
+        };
+
+        check("extra_vector_value_count", values.size() == 7);
+        check("extra_vector_tag_count", needs_release.size() == 7);
+
+        bool all_zero{ true };
+        for (const char tag : needs_release) { if (tag != 0) { all_zero = false; } }
+        check("extra_vector_no_slot_tagged_for_release", all_zero);
+
+        check("extra_vector_uint32_in_i_member", values[0].i == -1);
+        check("extra_vector_char16_in_i_member", values[1].i == 0x4E2D);
+        check("extra_vector_uint8_in_i_member", values[2].i == 255);
+        check("extra_vector_int8_in_i_member", values[3].i == -128);
+        check("extra_vector_uint16_in_i_member", values[4].i == 65535);
+        check("extra_vector_uint64_in_j_member", values[5].j == -1);
+        check("extra_vector_cstring_l_null_no_jvm", values[6].l == nullptr);
+    }
+
     return failures == 0 ? 0 : 1;
 }

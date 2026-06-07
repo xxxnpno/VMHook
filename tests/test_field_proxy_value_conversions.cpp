@@ -373,5 +373,265 @@ int main()
               && storage[6] == 0xAB && storage[7] == 0xAB);
     }
 
+    // =====================================================================
+    // EXPANDED COVERAGE (additive — every expected value derived from the
+    // field_proxy::get() dispatch, cast_for_variant<>, get_compressed_oop()
+    // FLAW-C guard, and value_t::is_reference()/as_string() in vmhook.hpp).
+    // No JVM: only the compressed value 0 is safe for the void*/string decode
+    // paths; numeric static_casts of a NON-zero uint32 alternative are pure and
+    // JVM-free, so those are exercised here too.
+    // =====================================================================
+
+    // ---------------------------------------------------------------------
+    // 12. get() dispatch matches the signature EXACTLY.  Any descriptor that
+    //     is NOT one of the eight primitive single-chars falls through to the
+    //     reference/array branch and reads 4 bytes as the uint32 alternative —
+    //     INCLUDING an empty signature, an unknown single char, and a 2-char
+    //     "primitive-looking" string.  (With a non-null pointer; the null-proxy
+    //     path is the separate int32 fallback already covered above.)
+    // ---------------------------------------------------------------------
+    {
+        // Unknown single char "X": get() -> uint32 alternative (not a primitive
+        // match), value == the 4 little-endian bytes.
+        auto v = read_back<std::uint32_t>("X", std::uint32_t{ 0x0000002Au });
+        check("unknown_sig_X_selects_uint32_alternative", v.data.index() == idx::k_u32);
+        check("unknown_sig_X_value_is_42", std::get<std::uint32_t>(v.data) == 42u);
+    }
+    {
+        // Empty signature with a NON-null pointer also routes to uint32.
+        auto v = read_back<std::uint32_t>("", std::uint32_t{ 0xDEADBEEFu });
+        check("empty_sig_nonnull_selects_uint32_alternative", v.data.index() == idx::k_u32);
+        check("empty_sig_nonnull_value_round_trips",
+              std::get<std::uint32_t>(v.data) == 0xDEADBEEFu);
+    }
+    {
+        // A 2-char "II" is != "I", so it is NOT the int branch -> uint32.
+        auto v = read_back<std::uint32_t>("II", std::uint32_t{ 0x12345678u });
+        check("two_char_II_selects_uint32_alternative", v.data.index() == idx::k_u32);
+        check("two_char_II_value_round_trips",
+              std::get<std::uint32_t>(v.data) == 0x12345678u);
+    }
+    {
+        // Lowercase "i" is not the uppercase "I" primitive -> uint32 fallback.
+        auto v = read_back<std::uint32_t>("i", std::uint32_t{ 7u });
+        check("lowercase_i_selects_uint32_alternative", v.data.index() == idx::k_u32);
+        check("lowercase_i_value_is_7", std::get<std::uint32_t>(v.data) == 7u);
+    }
+
+    // ---------------------------------------------------------------------
+    // 13. Numeric static_cast conversions of a NON-zero uint32 alternative.
+    //     cast_for_variant routes a non-string/vector/unique_ptr/void* target
+    //     through static_cast<target>(uint32).  These are pure arithmetic and
+    //     need no JVM (unlike the void*/string decode of a non-zero OOP).
+    // ---------------------------------------------------------------------
+    {
+        auto v = read_back<std::uint32_t>("Ljava/lang/String;", std::uint32_t{ 42u });
+        check("uint32_alt_casts_to_int_42", static_cast<int>(v) == 42);
+        check("uint32_alt_casts_to_int64_42", static_cast<std::int64_t>(v) == 42);
+        check("uint32_alt_casts_to_uint32_42", static_cast<std::uint32_t>(v) == 42u);
+        check("uint32_alt_value_is_reference_true", v.is_reference() == true);
+    }
+    {
+        // uint32 0xFFFFFFFF -> int is a bit-reinterpret (-1); -> int64 zero-
+        // extends to 4294967295 (uint32 widened through the value, NOT sign
+        // extended, because the stored alternative is unsigned).
+        auto v = read_back<std::uint32_t>("[I", std::uint32_t{ 0xFFFFFFFFu });
+        check("uint32_max_alt_casts_to_int_minus_one", static_cast<int>(v) == -1);
+        check("uint32_max_alt_casts_to_int64_4294967295",
+              static_cast<std::int64_t>(v) == static_cast<std::int64_t>(4294967295LL));
+        check("uint32_max_alt_casts_to_uint32_all_ones",
+              static_cast<std::uint32_t>(v) == 0xFFFFFFFFu);
+    }
+
+    // ---------------------------------------------------------------------
+    // 14. int8 ("B") cross-casts: -1 fans out to every numeric target with the
+    //     documented sign/zero extension via static_cast from int8_t.
+    // ---------------------------------------------------------------------
+    {
+        auto v = read_back<std::int8_t>("B", std::int8_t{ -1 });
+        check("B_minus_one_to_int16_is_minus_one", static_cast<std::int16_t>(v) == -1);
+        check("B_minus_one_to_int32_is_minus_one", static_cast<std::int32_t>(v) == -1);
+        check("B_minus_one_to_int64_is_minus_one", static_cast<std::int64_t>(v) == -1);
+        check("B_minus_one_to_uint8_is_0xFF",
+              static_cast<std::uint8_t>(v) == std::uint8_t{ 0xFF });
+        check("B_minus_one_to_uint16_is_0xFFFF",
+              static_cast<std::uint16_t>(v) == std::uint16_t{ 0xFFFF });
+        check("B_minus_one_to_float_is_minus_one", static_cast<float>(v) == -1.0f);
+        check("B_minus_one_to_double_is_minus_one", static_cast<double>(v) == -1.0);
+    }
+
+    // ---------------------------------------------------------------------
+    // 15. char ("C", uint16) cross-casts: 0xFFFF wraps to -1 as int16, widens
+    //     to 65535 as int/int64, narrows to 0xFF as uint8, and converts exactly
+    //     to float/double.
+    // ---------------------------------------------------------------------
+    {
+        auto v = read_back<std::uint16_t>("C", std::uint16_t{ 0xFFFF });
+        check("C_0xFFFF_to_int16_is_minus_one", static_cast<std::int16_t>(v) == -1);
+        check("C_0xFFFF_to_int_is_65535", static_cast<int>(v) == 65535);
+        check("C_0xFFFF_to_int64_is_65535", static_cast<std::int64_t>(v) == 65535);
+        check("C_0xFFFF_to_uint8_is_0xFF",
+              static_cast<std::uint8_t>(v) == std::uint8_t{ 0xFF });
+        check("C_0xFFFF_to_float_is_65535", static_cast<float>(v) == 65535.0f);
+        check("C_0xFFFF_to_double_is_65535", static_cast<double>(v) == 65535.0);
+    }
+
+    // ---------------------------------------------------------------------
+    // 16. Floating-point -> integral truncation (toward zero) and float->int64.
+    //     static_cast<int>(3.9f) == 3; static_cast<int>(-3.9f) == -3.
+    // ---------------------------------------------------------------------
+    {
+        auto v = read_back<float>("F", 3.9f);
+        check("F_3p9_truncates_to_int_3", static_cast<int>(v) == 3);
+        check("F_3p9_truncates_to_int64_3", static_cast<std::int64_t>(v) == 3);
+    }
+    {
+        auto v = read_back<float>("F", -3.9f);
+        check("F_minus_3p9_truncates_to_int_minus_3", static_cast<int>(v) == -3);
+    }
+    {
+        auto v = read_back<double>("D", 2.999);
+        check("D_2p999_truncates_to_int_2", static_cast<int>(v) == 2);
+        check("D_2p999_truncates_to_int64_2", static_cast<std::int64_t>(v) == 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // 17. bool ("Z") cross-casts: true -> 1 across numeric targets, false -> 0.
+    // ---------------------------------------------------------------------
+    {
+        auto t = read_back<std::uint8_t>("Z", std::uint8_t{ 0x01 });
+        check("Z_true_to_int_1", static_cast<int>(t) == 1);
+        check("Z_true_to_int64_1", static_cast<std::int64_t>(t) == 1);
+        check("Z_true_to_uint32_1", static_cast<std::uint32_t>(t) == 1u);
+        check("Z_true_to_float_1", static_cast<float>(t) == 1.0f);
+        check("Z_true_to_double_1", static_cast<double>(t) == 1.0);
+
+        auto f = read_back<std::uint8_t>("Z", std::uint8_t{ 0x00 });
+        check("Z_false_to_int_0", static_cast<int>(f) == 0);
+        check("Z_false_to_double_0", static_cast<double>(f) == 0.0);
+    }
+
+    // ---------------------------------------------------------------------
+    // 18. int32 / int64 widening & narrowing boundaries through the operator.
+    // ---------------------------------------------------------------------
+    {
+        // INT32_MAX widened to int64 (no sign issue, positive).
+        auto v = read_back<std::int32_t>("I", std::int32_t{ 2147483647 });
+        check("I_int32_max_widens_to_int64", static_cast<std::int64_t>(v) == 2147483647LL);
+    }
+    {
+        // int64 value that is exactly representable as double (2^53) round-trips
+        // through static_cast<double> with no precision loss.
+        const std::int64_t exact{ 9007199254740992LL };  // 2^53
+        auto v = read_back<std::int64_t>("J", exact);
+        check("J_2pow53_casts_to_double_exactly",
+              static_cast<double>(v) == 9007199254740992.0);
+    }
+    {
+        // A small int64 -> int32 narrowing keeps the low value.
+        auto v = read_back<std::int64_t>("J", std::int64_t{ 1000 });
+        check("J_small_value_narrows_to_int32_1000", static_cast<std::int32_t>(v) == 1000);
+    }
+
+    // ---------------------------------------------------------------------
+    // 19. value_t::is_reference(): true ONLY for the uint32 alternative, false
+    //     for every primitive alternative and for the null-proxy int32 fallback.
+    //     (This is the value_t-level holds_alternative<uint32> test, distinct
+    //     from the proxy-level signature-first-char is_reference() below.)
+    // ---------------------------------------------------------------------
+    {
+        check("value_is_reference_false_for_int", read_back<std::int32_t>("I", 1).is_reference() == false);
+        check("value_is_reference_false_for_bool", read_back<std::uint8_t>("Z", std::uint8_t{ 1 }).is_reference() == false);
+        check("value_is_reference_false_for_double", read_back<double>("D", 1.0).is_reference() == false);
+        check("value_is_reference_false_for_char", read_back<std::uint16_t>("C", std::uint16_t{ 65 }).is_reference() == false);
+
+        // Reference field -> uint32 alternative -> value_t::is_reference() true.
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0x00 });
+        vmhook::field_proxy ref{ storage.data(), "Ljava/lang/String;", false };
+        check("value_is_reference_true_for_ref_field", ref.get().is_reference() == true);
+
+        // Null proxy -> int32 alternative -> value_t::is_reference() false.
+        vmhook::field_proxy null_ref{ nullptr, "Ljava/lang/String;", false };
+        check("value_is_reference_false_for_null_proxy", null_ref.get().is_reference() == false);
+    }
+
+    // ---------------------------------------------------------------------
+    // 20. value_t::as_string(): "" for every primitive alternative and for a
+    //     uint32 alternative whose OOP is 0 (decode_oop_pointer(0)==nullptr ->
+    //     read_java_string(nullptr)==""), with no JVM.  Never decodes a non-zero
+    //     OOP here (that needs a live heap).
+    // ---------------------------------------------------------------------
+    {
+        check("as_string_empty_for_int", read_back<std::int32_t>("I", 12345).as_string().empty());
+        check("as_string_empty_for_double", read_back<double>("D", 3.14).as_string().empty());
+        check("as_string_empty_for_bool", read_back<std::uint8_t>("Z", std::uint8_t{ 1 }).as_string().empty());
+
+        // Reference field with a ZERO compressed OOP -> "" (null decode).
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0x00 });
+        vmhook::field_proxy ref{ storage.data(), "Ljava/lang/String;", false };
+        check("as_string_empty_for_zero_oop_ref", ref.get().as_string().empty());
+
+        // Null proxy -> int32 alternative -> "".
+        vmhook::field_proxy null_ref{ nullptr, "Ljava/lang/String;", false };
+        check("as_string_empty_for_null_proxy", null_ref.get().as_string().empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // 21. get_compressed_oop() FLAW-C guard: returns 0 on a PRIMITIVE field
+    //     even with a non-null pointer and non-zero bytes (because the proxy's
+    //     is_reference() is false for a primitive descriptor), and ALSO 0 for an
+    //     unknown single-char signature like "X" (first char not 'L'/'[').  Only
+    //     genuine reference/array descriptors expose the raw 4 bytes.
+    // ---------------------------------------------------------------------
+    {
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0xAB });
+        const std::uint32_t sentinel{ 0xCAFEBABEu };
+        std::memcpy(storage.data(), &sentinel, sizeof(sentinel));
+
+        // Primitive "I": is_reference() false -> guard fires -> 0.
+        vmhook::field_proxy prim_i{ storage.data(), "I", false };
+        check("get_compressed_oop_primitive_int_is_guarded_zero",
+              prim_i.get_compressed_oop() == 0u);
+        check("get_compressed_oop_primitive_int_is_reference_false",
+              prim_i.is_reference() == false);
+
+        // Primitive "J": same guard.
+        vmhook::field_proxy prim_j{ storage.data(), "J", false };
+        check("get_compressed_oop_primitive_long_is_guarded_zero",
+              prim_j.get_compressed_oop() == 0u);
+
+        // Unknown "X": proxy is_reference() false (first char not L/[) -> 0,
+        // even though get() would put the bytes in the uint32 alternative.
+        vmhook::field_proxy unknown_x{ storage.data(), "X", false };
+        check("get_compressed_oop_unknown_X_is_guarded_zero",
+              unknown_x.get_compressed_oop() == 0u);
+        check("get_compressed_oop_unknown_X_proxy_is_reference_false",
+              unknown_x.is_reference() == false);
+
+        // Genuine reference "[I": guard passes -> raw 4 bytes exposed.
+        vmhook::field_proxy arr{ storage.data(), "[I", false };
+        check("get_compressed_oop_array_field_exposes_bytes",
+              arr.get_compressed_oop() == sentinel);
+    }
+
+    // ---------------------------------------------------------------------
+    // 22. Proxy-level is_reference() vs value_t-level is_reference() DIVERGE on
+    //     an unknown single-char signature: get() routes "X" into the uint32
+    //     alternative (value_t::is_reference() == true), while the proxy checks
+    //     the first descriptor char and returns false.  Pin this contrast.
+    // ---------------------------------------------------------------------
+    {
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0x11 });
+        vmhook::field_proxy unknown_x{ storage.data(), "X", false };
+        check("proxy_is_reference_false_for_unknown_X",
+              unknown_x.is_reference() == false);
+        check("value_is_reference_true_for_unknown_X_get",
+              unknown_x.get().is_reference() == true);
+    }
+
     return failures == 0 ? 0 : 1;
 }

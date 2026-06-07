@@ -329,6 +329,171 @@ static auto test_last_index_access() -> void
     check("last_set_at_length_is_noop", buffer == before);
 }
 
+// ---------------------------------------------------------------------------
+// 7. EXPANDED: additional element widths/types not in test_all_widths.
+//
+// The helpers are templated on any trivially-copyable element_type, gating only
+// on sizeof(T) for the stride.  Cover bool (1B), uint32_t (4B), and char16_t
+// (the real Java `char` representation, 2B) end-to-end, mirroring the generic
+// round-trip + bounds expectations derived from get/set_array_element:
+//   in-bounds [0,length) -> memcpy at +16+index*sizeof(T); OOB -> default/no-op.
+// ---------------------------------------------------------------------------
+static auto test_extra_widths() -> void
+{
+    // bool: only canonical 0/1 are seeded (reading a non-canonical byte into
+    // bool would be UB to observe, per the field_proxy notes); 1-byte stride.
+    {
+        const std::vector<std::uint8_t> seed{ 1u, 0u, 1u };  // backing bytes
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        check("bool_array_length_is_3", vmhook::array_length(oop) == 3);
+        check("bool_get_index_0_true",  vmhook::get_array_element<bool>(oop, 0) == true);
+        check("bool_get_index_1_false", vmhook::get_array_element<bool>(oop, 1) == false);
+        check("bool_get_index_2_true",  vmhook::get_array_element<bool>(oop, 2) == true);
+        vmhook::set_array_element<bool>(oop, 1, true);
+        check("bool_set_then_get_roundtrip", vmhook::get_array_element<bool>(oop, 1) == true);
+        check("bool_oob_get_is_false",
+              vmhook::get_array_element<bool>(oop, opaque_index(3)) == false);
+    }
+
+    // uint32_t round-trip + bounds across the full unsigned range endpoints.
+    exercise_width<std::uint32_t>("uint32",
+        std::uint32_t{ 0u }, std::uint32_t{ 0x9ABCDEF0u }, std::uint32_t{ 0xFFFFFFFFu });
+
+    // char16_t — the genuine UTF-16 code-unit type for Java char[].
+    exercise_width<char16_t>("char16",
+        char16_t{ 0x0000 }, char16_t{ 0x4E2D }, char16_t{ 0xFFFF });
+}
+
+// ---------------------------------------------------------------------------
+// 8. EXPANDED: a NEGATIVE _length field makes every access safe-default.
+//
+// array_length returns the raw int32 at +12 with no clamping, so a negative
+// length is returned verbatim.  get/set then compare `index >= length`; for a
+// negative length EVERY non-negative index satisfies index >= length and is
+// rejected, so reads return T{} and writes are no-ops.  This pins that a
+// corrupted/negative length cannot be used to read or write any element.
+// ---------------------------------------------------------------------------
+static auto test_negative_length_field() -> void
+{
+    // Build a 3-element buffer, then overwrite _length with -5.
+    const std::vector<std::int32_t> seed{ 111, 222, 333 };
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+    const std::int32_t neg{ -5 };
+    std::memcpy(buffer.data() + 12, &neg, sizeof(neg));
+
+    check("negative_length_returned_verbatim", vmhook::array_length(oop) == -5);
+
+    // Index 0 (and any non-negative index) is rejected: 0 >= -5 is true.
+    check("negative_length_get_index_0_is_default",
+          vmhook::get_array_element<std::int32_t>(oop, 0) == 0);
+    check("negative_length_get_index_2_is_default",
+          vmhook::get_array_element<std::int32_t>(oop, opaque_index(2)) == 0);
+
+    // Writes are no-ops: capture the payload, attempt writes, confirm unchanged.
+    const std::vector<std::uint8_t> before{ buffer };
+    vmhook::set_array_element<std::int32_t>(oop, 0, 0x44444444);
+    vmhook::set_array_element<std::int32_t>(oop, opaque_index(1), 0x55555555);
+    check("negative_length_writes_are_noops", buffer == before);
+}
+
+// ---------------------------------------------------------------------------
+// 9. EXPANDED: zero-length array through get/set (not just array_length).
+//
+// With _length == 0 the only candidate index is 0, and 0 >= 0 (== length) is
+// the first rejected index, so the half-open [0,0) range is empty: every read
+// is default and every write a no-op.  (test_array_length_edges covers the
+// array_length==0 readback; this exercises the element helpers on it.)
+// ---------------------------------------------------------------------------
+static auto test_zero_length_element_access() -> void
+{
+    // Header-only buffer plus a little slack so a (rejected) write target would
+    // at least be inside the vector if the guard ever regressed.
+    std::vector<std::uint8_t> buffer(16u + 4u * sizeof(std::int32_t), std::uint8_t{ 0 });
+    // _length already 0 (zero-filled); be explicit.
+    const std::int32_t zero{ 0 };
+    std::memcpy(buffer.data() + 12, &zero, sizeof(zero));
+    void* const oop{ buffer.data() };
+
+    check("zero_length_array_length_is_0", vmhook::array_length(oop) == 0);
+    check("zero_length_get_index_0_is_default",
+          vmhook::get_array_element<std::int32_t>(oop, opaque_index(0)) == 0);
+    check("zero_length_get_negative_is_default",
+          vmhook::get_array_element<std::int32_t>(oop, opaque_index(-1)) == 0);
+
+    const std::vector<std::uint8_t> before{ buffer };
+    vmhook::set_array_element<std::int32_t>(oop, opaque_index(0), 0x66666666);
+    check("zero_length_set_index_0_is_noop", buffer == before);
+}
+
+// ---------------------------------------------------------------------------
+// 10. EXPANDED: extreme index sentinels are rejected for every access.
+//
+// INT32_MIN (negative -> first guard) and INT32_MAX (>= any real length ->
+// second guard) must both be rejected for read and write, for several widths,
+// without computing the would-be byte offset (the guards run BEFORE the
+// index*sizeof multiply).
+// ---------------------------------------------------------------------------
+static auto test_extreme_index_sentinels() -> void
+{
+    const std::vector<std::int64_t> seed{ 1, 2, 3, 4, 5 };
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    check("extreme_length_is_5", vmhook::array_length(oop) == 5);
+
+    check("intmin_index_get_is_default_i64",
+          vmhook::get_array_element<std::int64_t>(oop, opaque_index(-2147483647 - 1)) == 0);
+    check("intmax_index_get_is_default_i64",
+          vmhook::get_array_element<std::int64_t>(oop, opaque_index(2147483647)) == 0);
+    check("intmin_index_get_is_default_i8",
+          vmhook::get_array_element<std::int8_t>(oop, opaque_index(-2147483647 - 1)) == 0);
+    check("intmax_index_get_is_default_i8",
+          vmhook::get_array_element<std::int8_t>(oop, opaque_index(2147483647)) == 0);
+
+    const std::vector<std::uint8_t> before{ buffer };
+    vmhook::set_array_element<std::int64_t>(oop, opaque_index(-2147483647 - 1), 0x77ll);
+    vmhook::set_array_element<std::int64_t>(oop, opaque_index(2147483647), 0x88ll);
+    check("extreme_index_writes_are_noops", buffer == before);
+}
+
+// ---------------------------------------------------------------------------
+// 11. EXPANDED: array_length returns the stored int32 SIGN-correctly.
+//
+// The field is read as a signed int32: 0xFFFFFFFF -> -1, 0x80000000 -> INT32_MIN,
+// 0x7FFFFFFF -> INT32_MAX.  Pin the exact signed reinterpretation (no unsigned
+// read), and that a -1 length makes get return default.  (We never index into a
+// fabricated huge positive length — that would read past our real buffer.)
+// ---------------------------------------------------------------------------
+static auto test_array_length_sign() -> void
+{
+    auto length_from_bytes{ [](std::uint32_t raw) -> std::int32_t
+    {
+        std::vector<std::uint8_t> buf(16u, std::uint8_t{ 0 });
+        std::memcpy(buf.data() + 12, &raw, sizeof(raw));
+        return vmhook::array_length(buf.data());
+    } };
+
+    check("array_length_0xFFFFFFFF_is_minus_one",
+          length_from_bytes(0xFFFFFFFFu) == -1);
+    check("array_length_0x80000000_is_int32_min",
+          length_from_bytes(0x80000000u) == (std::int32_t{ -2147483647 } - 1));
+    check("array_length_0x7FFFFFFF_is_int32_max",
+          length_from_bytes(0x7FFFFFFFu) == 2147483647);
+    check("array_length_0x00000001_is_one",
+          length_from_bytes(0x00000001u) == 1);
+
+    // A -1 length rejects index 0 (0 >= -1) -> default read.
+    {
+        std::vector<std::uint8_t> buf(16u + sizeof(std::int32_t), std::uint8_t{ 0 });
+        const std::uint32_t raw{ 0xFFFFFFFFu };
+        std::memcpy(buf.data() + 12, &raw, sizeof(raw));
+        check("minus_one_length_get_is_default",
+              vmhook::get_array_element<std::int32_t>(buf.data(), opaque_index(0)) == 0);
+    }
+}
+
 int main()
 {
     test_all_widths();
@@ -337,6 +502,11 @@ int main()
     test_element_null_guards();
     test_single_element_boundaries();
     test_last_index_access();
+    test_extra_widths();
+    test_negative_length_field();
+    test_zero_length_element_access();
+    test_extreme_index_sentinels();
+    test_array_length_sign();
 
     if (failures == 0)
     {

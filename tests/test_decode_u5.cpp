@@ -268,5 +268,213 @@ int main()
         check("sequence_then_end_pos_value", pos == 3);
     }
 
+    // =====================================================================
+    // EXPANDED COVERAGE (additive — every expected value derived from the
+    // decode_u5 loop body in vmhook.hpp:
+    //   sum += (byte-1) << (6*pos); low byte (<192) terminates; byte 0 at ANY
+    //   position is the End marker (returns ~0u and rewinds one byte); the loop
+    //   reads at most 5 bytes).  decode_at0 pads the buffer with trailing zeros,
+    //   which act as harmless End markers for the at-most-5-byte window.)
+    // =====================================================================
+
+    // ---- The 191/192 low-vs-continuation boundary, both directions ----------
+    // 191 is the LARGEST low byte (191 < 192): a lone 191 is a complete 1-byte
+    // value (190) consuming one byte.  192 is the SMALLEST continuation byte
+    // (NOT < 192): a lone 192 followed by the trailing-zero padding makes the
+    // decoder read the 0 at position 1 and treat it as the End marker -> ~0u,
+    // with stream_pos rewound to 1 (the 192 was consumed, the 0 was given back).
+    // This pins that 192 alone is an INCOMPLETE sequence, not the value 191.
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 192 }, pos) };
+        check("lone_192_then_padding_is_end_marker", v == ~0u);
+        check("lone_192_consumes_one_then_rewinds_to_one", pos == 1);
+    }
+    // 190 and 191 are adjacent low bytes -> values 189 and 190, each one byte.
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 190 }, pos) };
+        check("one_byte_189_value", v == 189u);
+        check("one_byte_189_consumes_one", pos == 1);
+    }
+
+    // ---- Interior 1-byte values across the whole 0..190 range ----------------
+    // value == byte - 1 for every low byte; sample several interior points to
+    // cover the full single-byte span between the already-tested endpoints.
+    check("one_byte_2",   decode_value({ 3 })   == 2u);
+    check("one_byte_31",  decode_value({ 32 })  == 31u);
+    check("one_byte_63",  decode_value({ 64 })  == 63u);   // 64^1 boundary - 1
+    check("one_byte_100", decode_value({ 101 }) == 100u);
+    check("one_byte_128", decode_value({ 129 }) == 128u);
+    check("one_byte_189", decode_value({ 190 }) == 189u);
+
+    // ---- 2-byte: every "high digit" boundary value --------------------------
+    // value = 191 + (b1 - 1) * 64 for a leading 192 (the minimum continuation,
+    // contributing 191 at position 0).  Walk b1 = 1,2,3,...; each step adds 64.
+    check("two_byte_b1_3_is_319",  decode_value({ 192, 3 })  == 191u + 2u * 64u);  // 319
+    check("two_byte_b1_10_is_767", decode_value({ 192, 10 }) == 191u + 9u * 64u);  // 767
+    // Leading 193 contributes 192 at position 0: value = 192 + (b1-1)*64.
+    check("two_byte_lead_193_b1_1_is_192", decode_value({ 193, 1 }) == 192u);
+    check("two_byte_lead_193_b1_2_is_256", decode_value({ 193, 2 }) == 256u);
+    // The smallest 2-byte value (191) requires a continuation FIRST byte; the
+    // SAME numeric value 191 also has a 1-byte-impossible form — pin that the
+    // canonical 2-byte encoding {192,1} round-trips to 191 and the 1-byte
+    // maximum {191} is the different value 190 (no aliasing across lengths).
+    check("two_byte_min_191_distinct_from_one_byte_max_190",
+          decode_value({ 192, 1 }) == 191u && decode_value({ 191 }) == 190u);
+
+    // ---- 3-byte maximum (both leading digits maxed, final low byte 191) -----
+    //   {255, 255, 191} = 254 + 254*64 + 190*4096
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 255, 255, 191 }, pos) };
+        check("three_byte_max_value", v == (254u + 254u * 64u + 190u * 64u * 64u));  // 794750
+        check("three_byte_max_literal", v == 794750u);
+        check("three_byte_max_consumes_three", pos == 3);
+    }
+
+    // ---- 4-byte maximum -----------------------------------------------------
+    //   {255, 255, 255, 191} = 254 + 254*64 + 254*4096 + 190*262144
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 255, 255, 255, 191 }, pos) };
+        const std::uint32_t expected{
+            254u + 254u * 64u + 254u * 64u * 64u + 190u * 64u * 64u * 64u };
+        check("four_byte_max_value", v == expected);
+        check("four_byte_max_literal", v == 50864254u);
+        check("four_byte_max_consumes_four", pos == 4);
+    }
+
+    // ---- 5-byte maximum with a terminating low byte -------------------------
+    //   {255, 255, 255, 255, 191}
+    //   = 254 + 254*64 + 254*64^2 + 254*64^3 + 190*64^4
+    // Still within uint32 range (3,255,312,510 < 2^32).  Consumes exactly 5.
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 255, 255, 255, 255, 191 }, pos) };
+        const std::uint32_t expected{
+            254u
+            + 254u * 64u
+            + 254u * 64u * 64u
+            + 254u * 64u * 64u * 64u
+            + 190u * 64u * 64u * 64u * 64u };
+        check("five_byte_max_low_terminated_value", v == expected);
+        check("five_byte_max_low_terminated_literal", v == 3255312510u);
+        check("five_byte_max_low_terminated_consumes_five", pos == 5);
+    }
+
+    // ---- 5-byte all-0xFF: every byte a continuation, no terminating low ------
+    // All five bytes are 255 (>= 192), so the loop runs to position 5 and
+    // returns the accumulated sum WITHOUT reading a sixth byte.  The true sum
+    // 254*(1+64+4096+262144+16777216) overflows uint32 and wraps; we build the
+    // expected value with the SAME uint32_t shift arithmetic the decoder uses,
+    // so the assertion pins the decoder's actual (wrapping) result rather than
+    // an idealised big-integer value.
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 255, 255, 255, 255, 255 }, pos) };
+        const std::uint32_t expected{
+            (static_cast<std::uint32_t>(254u) << 0)
+            + (static_cast<std::uint32_t>(254u) << 6)
+            + (static_cast<std::uint32_t>(254u) << 12)
+            + (static_cast<std::uint32_t>(254u) << 18)
+            + (static_cast<std::uint32_t>(254u) << 24) };
+        check("five_byte_all_0xFF_matches_uint32_shift_sum", v == expected);
+        check("five_byte_all_0xFF_consumes_five", pos == 5);
+    }
+
+    // ---- End marker at EVERY interior position (0 byte after continuations) --
+    // A 0 byte at ANY position (not just position 0) is the End marker: the
+    // decoder rewinds the single peeked 0 and returns ~0u, leaving stream_pos
+    // at the index of that 0.  So N leading continuation bytes (192) followed
+    // by a 0 yields ~0u with stream_pos == N.  Covers N = 1, 2, 3, 4.
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 192, 0 }, pos) };
+        check("end_marker_after_1_continuation_value", v == ~0u);
+        check("end_marker_after_1_continuation_pos", pos == 1);
+    }
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 192, 192, 0 }, pos) };
+        check("end_marker_after_2_continuations_value", v == ~0u);
+        check("end_marker_after_2_continuations_pos", pos == 2);
+    }
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 192, 192, 192, 0 }, pos) };
+        check("end_marker_after_3_continuations_value", v == ~0u);
+        check("end_marker_after_3_continuations_pos", pos == 3);
+    }
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 192, 192, 192, 192, 0 }, pos) };
+        check("end_marker_after_4_continuations_value", v == ~0u);
+        check("end_marker_after_4_continuations_pos", pos == 4);
+    }
+
+    // ---- Truncated input: continuation bytes that run into trailing zeros ----
+    // decode_at0 pads with zeros, so a buffer that is "all continuation" but
+    // shorter than 5 real bytes hits a padding 0 and returns the End marker.
+    // This documents that an UNTERMINATED short sequence is reported as End,
+    // not as a partial value (the partial-value path only triggers at the
+    // 5-byte cap, tested above).  {193, 200} (no low terminator) -> pos 2 reads
+    // the padding 0 -> ~0u, pos == 2.
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 193, 200 }, pos) };
+        check("truncated_two_continuations_hits_padding_end", v == ~0u);
+        check("truncated_two_continuations_pos_at_padding", pos == 2);
+    }
+
+    // ---- Low byte immediately after a maxed continuation digit --------------
+    // {255, 1}: position 0 byte 255 (continuation, contributes 254), position 1
+    // byte 1 is the SMALLEST low byte and contributes (1-1)<<6 = 0, terminating.
+    // So {255,1} decodes to exactly 254 in two bytes — the minimum 2-byte value
+    // reachable with a maxed first digit.
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 255, 1 }, pos) };
+        check("maxed_first_digit_then_min_low_is_254", v == 254u);
+        check("maxed_first_digit_then_min_low_consumes_two", pos == 2);
+    }
+
+    // ---- Position-2 digit weight, isolated ----------------------------------
+    // Each position's contribution is (byte-1)<<(6*pos).  To REACH position 2
+    // the bytes at positions 0 and 1 must both be continuation bytes (>= 192);
+    // a low byte there would terminate early.  With two leading 192s (each
+    // contributing 191) and a terminating low byte 2 at position 2:
+    //   {192, 192, 2} = 191 + 191*64 + (2-1)*64^2 = 191 + 12224 + 4096 = 16511.
+    // This pins the position-2 weight (4096) of a byte whose value is 2.
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 192, 192, 2 }, pos) };
+        check("position_2_weight_is_4096",
+              v == (191u + 191u * 64u + 1u * 64u * 64u));  // 16511
+        check("position_2_weight_literal", v == 16511u);
+        check("position_2_weight_consumes_three", pos == 3);
+    }
+
+    // ---- Sequential decode mixing 1-, 2- and 3-byte values + End -------------
+    // Thread stream_pos across four reads from one buffer to confirm the
+    // back-to-back usage pattern with varied lengths lands on the right cursor.
+    //   [65, 193,62, 192,192,1, 0, ...]
+    //     -> 64 (1B), 4096 (2B), 12415 (3B), then End (parks at the 0)
+    {
+        std::vector<std::uint8_t> stream{ 65, 193, 62, 192, 192, 1, 0, 0, 0, 0 };
+        int pos{ 0 };
+        const std::uint32_t v0{ vmhook::hotspot::klass::decode_u5(stream.data(), pos) };
+        const std::uint32_t v1{ vmhook::hotspot::klass::decode_u5(stream.data(), pos) };
+        const std::uint32_t v2{ vmhook::hotspot::klass::decode_u5(stream.data(), pos) };
+        const int pos_before_end{ pos };
+        const std::uint32_t end{ vmhook::hotspot::klass::decode_u5(stream.data(), pos) };
+        check("mixed_seq_v0_is_64",     v0 == 64u);
+        check("mixed_seq_v1_is_4096",   v1 == 4096u);
+        check("mixed_seq_v2_is_12415",  v2 == 12415u);
+        check("mixed_seq_total_pos_6",  pos_before_end == 6);
+        check("mixed_seq_end_marker",   end == ~0u);
+        check("mixed_seq_end_parks",    pos == 6);
+    }
+
     return failures == 0 ? 0 : 1;
 }
