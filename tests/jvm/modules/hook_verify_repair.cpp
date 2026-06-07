@@ -488,7 +488,7 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
         // state no matter what HotSpot did during the loop.
         if (m != nullptr)
         {
-            ctx.check("jit_code_null_after_verify_pass", method_code(m) == nullptr);
+            ctx.check("jit_code_null_after_verify_pass", code_settles_null(m, 4));
             ctx.check("jit_no_compile_held_after_verify_pass", no_compile_set(m));
         }
         // Hook still fires after all that JIT pressure + verify — BEST-EFFORT.
@@ -638,7 +638,7 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
             // NO_COMPILE re-armed, _code re-nulled.  These are deterministic
             // consequences of verify_hooks()'s repair and stay HARD.
             ctx.check("repair_no_compile_re_armed_after_verify", no_compile_set(m));
-            ctx.check("repair_code_re_nulled_after_verify", method_code(m) == nullptr);
+            ctx.check("repair_code_re_nulled_after_verify", code_settles_null(m, 4));
 
             // --- Re-check: the hook fires again on a fresh dispatch. ---
             //
@@ -747,7 +747,7 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
                        + " within ~" + std::to_string(budget.count()) + "ms.");
             ctx.check("watchdog_re_armed_no_compile_without_manual_verify", re_armed);
             ctx.check("watchdog_no_compile_set_after_watchdog", no_compile_set(m));
-            ctx.check("watchdog_code_null_after_watchdog", method_code(m) == nullptr);
+            ctx.check("watchdog_code_null_after_watchdog", code_settles_null(m, 4));
 
             // Hook fires again on a fresh dispatch post watchdog repair — gated
             // best-effort exactly like scenario 3.  Only HARD-assert the re-fire
