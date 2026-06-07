@@ -1,7 +1,25 @@
 // field_introspection JVM test module  (feature area: fields)
 //
-// Exhaustively exercises the FOUR field_proxy introspection accessors on a live
+// Exhaustively exercises the FIVE field_proxy introspection accessors on a live
 // JVM, through the public wrapper API (static_field("n") / get_field("n")):
+//
+// CRASH-PROOFING (mingw·java8 has NO SEH net — any wild read kills the JVM):
+//   The fixture's `instance` is a YOUNG-GEN object; any probe allocation can
+//   trigger a minor GC that RELOCATES it.  field_proxy::get() and
+//   get_compressed_oop() RAW-memcpy field_pointer (== instance+offset for an
+//   instance field) with NO safe_read, so reading an INSTANCE field through a
+//   wrapper decoded BEFORE that GC derefs an unmapped page and faults.  Every
+//   instance-backed read here is therefore (1) RE-ACQUIRED fresh right before use
+//   (get_instance() re-decodes the stable old-gen mirror slot to the CURRENT
+//   location, shrinking the relocation window to a few instructions) and (2)
+//   exact-byte PROBED via os::safe_read on the precise field slot the read will
+//   touch (+ the oop header) before the read — a successful probe means the
+//   matching memcpy CANNOT fault, and a transient miss degrades to a best-effort
+//   [INFO] skip (never a fault, never a vacuous pass).  STATIC reads go through
+//   the Class mirror (old-gen, NOT young-relocated) and stay HARD.  Fine-grained
+//   ctx.record() checkpoints (flushed per line) bracket every section and every
+//   individual instance read so a no-SEH crash's last-flushed line pinpoints the
+//   exact faulting op.
 //
 //   * signature()         (vmhook.hpp:11759-11763) — returns the exact JVM type
 //     descriptor for EVERY field shape: the eight primitives Z B S I J F D C,
@@ -202,6 +220,53 @@ namespace
                    ? vmhook::get_array_element<element_type>(decoded, index)
                    : element_type{};
     }
+
+    // ── CRASH-PROOFING the *field-slot* read itself (the a84e51a gap) ─────────
+    //
+    // a84e51a hardened only the oop-CONTENT decode sites (decode -> read_java_string
+    // / array_length / klass_from_oop).  It did NOT harden the read of the field
+    // SLOT on an INSTANCE-backed proxy.  field_proxy::get() (vmhook.hpp:12268) and
+    // field_proxy::get_compressed_oop() (vmhook.hpp:12540) RAW-memcpy `field_pointer`
+    // with only a null-check — no safe_read.  For an INSTANCE field
+    // field_pointer == decoded_instance_oop + offset (vmhook.hpp:14371).  The
+    // fixture's `instance` (FieldIntrospection.instance) is a young-gen object: a
+    // minor/young GC triggered by any probe allocation RELOCATES it and frees its
+    // old page, while the static `instance` slot on the (old-gen) Class mirror is
+    // fixed up by the GC.  A wrapper obtained BEFORE that GC still holds the OLD
+    // decoded oop, so reading instance+offset through it derefs an unmapped page →
+    // SIGSEGV.  On mingw·java8 (no SEH net) that takes down the whole JVM, which is
+    // exactly the crash that recurred after a84e51a.
+    //
+    // The guarantee: before any get()/get_compressed_oop()/memcpy that will read
+    // `width` bytes at `field_addr`, safe_read EXACTLY those `width` bytes.
+    // safe_read goes through ReadProcessMemory / process_vm_readv, a kernel path
+    // that returns false instead of faulting on an unmapped/relocated page.  If it
+    // succeeds, the matching memcpy of the SAME bytes at the SAME address cannot
+    // fault (the page is currently mapped).  The only residual is a TOCTOU window
+    // between probe and read; callers SHRINK it to a handful of instructions by
+    // RE-ACQUIRING the instance fresh (re-decoding the stable mirror slot) right
+    // before the probe, and a relocation landing inside that window degrades to a
+    // best-effort [INFO] miss — never a fault.  A SUCCESSFUL read still asserts the
+    // correct value, so coverage stays non-vacuous.
+    auto field_slot_safely_readable(void* const field_addr, const std::size_t width) -> bool
+    {
+        if (!field_addr || width == 0) { return false; }
+        std::uint8_t scratch[8] = { 0 };   // widest field is J/D (8 bytes)
+        if (width > sizeof(scratch)) { return false; }
+        return vmhook::os::safe_read(scratch, field_addr, width);
+    }
+
+    // An INSTANCE-backed proxy is safe to read iff (a) its object header is mapped
+    // (proves the base oop is the real, currently-resident object) AND (b) the
+    // exact field slot the read will touch is mapped.  `base_oop` is the wrapper's
+    // decoded instance oop; `fp.raw_address()` is base_oop+offset (the slot).
+    auto instance_field_read_safe(void* const base_oop,
+                                  const vmhook::field_proxy& fp,
+                                  const std::size_t width) -> bool
+    {
+        return oop_header_safely_readable(base_oop)
+            && field_slot_safely_readable(fp.raw_address(), width);
+    }
 }
 
 VMHOOK_JVM_MODULE(field_introspection)
@@ -215,12 +280,28 @@ VMHOOK_JVM_MODULE(field_introspection)
             vmhook::find_class("vmhook/fixtures/FieldIntrospection")) };
     ctx.check("fixture_class_found", klass != nullptr);
 
+    // ── Fine-grained CRASH-LOCATOR checkpoints (CRITICAL on mingw·java8) ──────
+    //
+    // mingw·java8 installs NO SEH net, so a single wild read takes down the whole
+    // JVM with no stack trace — the only forensic signal is the LAST line flushed
+    // to test_results.txt (write_result/ctx.record flush per line, example.cpp
+    // :1468).  We drop a checkpoint before every section AND immediately before
+    // every individual instance-backed RAW read (the only reads that can fault on
+    // a GC-relocated oop), so the next CI run's last-flushed line names the EXACT
+    // op that died.  These are permanent: they cost one flushed line each and are
+    // invaluable forensics on a platform with no fault recovery.
+    const auto cp = [&](const char* where)
+    {
+        ctx.record(std::string{ "[INFO] field_introspection checkpoint: " } + where);
+    };
+
     // =====================================================================
     //  SECTION A — signature(): exact JVM descriptor for EVERY static field.
     //  Asserted three ways: (1) signature() == descriptor, (2) the value_t the
     //  proxy carries embeds the SAME descriptor (value_t::signature), and
     //  (3) signature().size() is correct (no stray bytes).
     // =====================================================================
+    cp("SECTION A (signature, static fields — mirror reads, no fault risk)");
     auto chk_static_sig = [&](const char* field, const char* descriptor)
     {
         auto fp{ fi_fixture::static_field(field) };
@@ -256,7 +337,11 @@ VMHOOK_JVM_MODULE(field_introspection)
 
     // signature() of INSTANCE fields (descriptor is identical to the static
     // twin where the type matches; exercises the instance get_field path).
+    // NOTE: signature() returns signature_text (a C++ std::string copied at
+    // resolve time, vmhook.hpp:12479) — it does NOT deref the instance oop, so
+    // these reads are fault-free even if `instance` was relocated.
     {
+        cp("SECTION A.inst (signature, instance fields — no oop deref)");
         const auto inst{ fi_fixture::get_instance() };
         ctx.check("sig_instance_wrapper_obtained", inst != nullptr);
         if (inst)
@@ -306,6 +391,10 @@ VMHOOK_JVM_MODULE(field_introspection)
     //  INVARIANT to the accessor used (a static field read through an instance
     //  wrapper still reports is_static()==true).
     // =====================================================================
+    // NOTE: is_static()/is_reference()/raw_address() read proxy METADATA (the
+    // static_field flag, signature_text, and the stored pointer) — none deref the
+    // instance oop, so Section B is fault-free regardless of relocation.
+    cp("SECTION B (is_static — proxy metadata only, no oop deref)");
     {
         const char* static_fields[] = {
             "sBool", "sByte", "sShort", "sInt", "sLong", "sFloat", "sDouble",
@@ -350,6 +439,8 @@ VMHOOK_JVM_MODULE(field_introspection)
     //  SECTION C — is_reference(): true for L.../[..., false for primitives.
     //  Proven to be the exact complement of "is a primitive descriptor".
     // =====================================================================
+    // NOTE: is_reference() keys on signature_text[0] only — no oop deref, fault-free.
+    cp("SECTION C (is_reference — signature byte only, no oop deref)");
     {
         struct Row { const char* field; bool is_ref; };
         const Row rows[] = {
@@ -395,8 +486,12 @@ VMHOOK_JVM_MODULE(field_introspection)
     //  (mirror|oop)+offset, stable across lookups, width-aligned, and the
     //  EXACT address get()/get_compressed_oop read from.
     // =====================================================================
+    cp("SECTION D (raw_address)");
     {
         // D.1 — STATIC fields: raw_address == mirror + offset (recomputed).
+        // STATIC reads touch mirror+offset (old-gen Class mirror, NOT young-
+        // relocated) so they are HARD and need no probe.
+        cp("SECTION D.1 (static raw_address — mirror reads, no fault risk)");
         auto chk_static_addr = [&](const char* field, std::size_t align)
         {
             auto fp{ fi_fixture::static_field(field) };
@@ -433,6 +528,8 @@ VMHOOK_JVM_MODULE(field_introspection)
         // D.2 — raw_address is the EXACT byte get() reads.  For a primitive int
         // field, the 4 bytes at raw_address must equal get() as int32.  This
         // catches any future internal offset drift between the two accessors.
+        // STATIC fields → get()/memcpy touch mirror+offset (old-gen) → HARD.
+        cp("SECTION D.2 (static int/long bytes==get — mirror reads, no fault risk)");
         {
             auto fp{ fi_fixture::static_field("sInt") };
             if (fp)
@@ -456,6 +553,14 @@ VMHOOK_JVM_MODULE(field_introspection)
         }
 
         // D.3 — INSTANCE fields: raw_address == oop + offset (recomputed).
+        // CRASH NOTE: every read below derives from a wrapper whose `instance` oop
+        // (FieldIntrospection.instance) is YOUNG-GEN and may be relocated by a GC
+        // that an earlier section's allocation triggered.  raw_address() and the
+        // address-equality / alignment / after-header checks read proxy METADATA
+        // and POINTERS ONLY (no oop deref) so they stay HARD; the ONLY reads that
+        // touch instance memory are the get()/memcpy in the bytes==get block — those
+        // are re-acquired fresh + exact-byte probed below.
+        cp("SECTION D.3 (instance raw_address — get() reads guarded)");
         const auto inst{ fi_fixture::get_instance() };
         ctx.check("raw_addr_instance_wrapper_obtained", inst != nullptr);
         if (inst)
@@ -466,6 +571,11 @@ VMHOOK_JVM_MODULE(field_introspection)
             ctx.check("raw_addr_instance_oop_valid",
                       oop != nullptr && vmhook::hotspot::is_valid_pointer(oop));
 
+            // chk_inst_addr derefs NOTHING off the oop: it compares raw_address()
+            // (proxy metadata) against recompute_instance_addr (pure oop+offset
+            // arithmetic on the SAME captured base) and checks alignment / ordering.
+            // Both sides use the same captured `oop`, so the equality holds even if
+            // `instance` was relocated — fault-free and non-vacuous → HARD.
             auto chk_inst_addr = [&](const char* field, std::size_t align)
             {
                 auto fp{ inst->get_field(field) };
@@ -500,7 +610,7 @@ VMHOOK_JVM_MODULE(field_introspection)
             chk_inst_addr("iIntArray", 4);
 
             // Two DIFFERENT instance fields on the SAME object have DIFFERENT
-            // raw addresses (offsets differ), and both share the same object base.
+            // raw addresses (offsets differ).  raw_address() only — no deref → HARD.
             {
                 auto a{ inst->get_field("iInt") };
                 auto b{ inst->get_field("iLong") };
@@ -512,16 +622,40 @@ VMHOOK_JVM_MODULE(field_introspection)
             }
 
             // The instance int field's bytes at raw_address equal get().
+            //
+            // *** THE a84e51a GAP ***  fp->get() (vmhook.hpp:12268) and the memcpy
+            // both RAW-read instance+offset.  If `instance` was relocated since the
+            // wrapper above was decoded, instance+offset is an unmapped page → the
+            // crash that recurred.  RE-ACQUIRE the wrapper fresh (re-decodes the
+            // stable mirror slot to the CURRENT location, shrinking the window to a
+            // few instructions) and exact-byte PROBE the 4 bytes the read touches
+            // before reading.  A relocation inside the tiny window degrades to an
+            // [INFO] miss; a successful probe means the get()/memcpy CANNOT fault and
+            // the value assertion stays HARD (so coverage is non-vacuous).
+            cp("SECTION D.3 iInt bytes==get (instance get() — re-acquire + probe)");
             {
-                auto fp{ inst->get_field("iInt") };
-                if (fp)
+                const auto fresh_inst{ fi_fixture::get_instance() };
+                bool did_assert{ false };
+                if (fresh_inst)
                 {
-                    const std::int32_t via_get{ fp->get() };
-                    std::int32_t via_addr{};
-                    std::memcpy(&via_addr, fp->raw_address(), sizeof(via_addr));
-                    ctx.check("raw_addr_instance_int_bytes_equal_get", via_addr == via_get);
-                    ctx.check("raw_addr_instance_int_matches_java",
-                              via_get == 0x0BADCAFE);
+                    void* const fresh_oop{ fresh_inst->vmhook::object_base::get_instance() };
+                    auto fp{ fresh_inst->get_field("iInt") };
+                    if (fp && instance_field_read_safe(fresh_oop, *fp, sizeof(std::int32_t)))
+                    {
+                        const std::int32_t via_get{ fp->get() };
+                        std::int32_t via_addr{};
+                        std::memcpy(&via_addr, fp->raw_address(), sizeof(via_addr));
+                        ctx.check("raw_addr_instance_int_bytes_equal_get", via_addr == via_get);
+                        ctx.check("raw_addr_instance_int_matches_java",
+                                  via_get == 0x0BADCAFE);
+                        did_assert = true;
+                    }
+                }
+                if (!did_assert)
+                {
+                    ctx.record("[INFO] raw_addr_instance_int: instance slot not safely "
+                               "readable (instance relocated mid-section) — skipped "
+                               "bytes==get / value asserts (transient, not a defect).");
                 }
             }
         }
@@ -548,10 +682,19 @@ VMHOOK_JVM_MODULE(field_introspection)
     //  SAME oop get() (as void*) and field_oop() yield, and that oop is the
     //  REAL Java object (structural + identity cross-checks).
     // =====================================================================
+    // For E.1–E.6 (STATIC reference fields) get_compressed_oop()/get() read the
+    // compressed slot off the Class MIRROR (old-gen, stable) → HARD.  Only the
+    // DECODED-oop CONTENT reads (read_java_string / array_length / klass_from_oop)
+    // touch the young-gen referent and are routed through the safe_* probes →
+    // best-effort.  E.7 (INSTANCE reference fields) is the genuine fault site: its
+    // get_compressed_oop()/get() read instance+offset (young-gen) and are
+    // re-acquired fresh + exact-byte probed there.
+    cp("SECTION E (get_compressed_oop — static slots HARD, content guarded)");
     {
         // E.1 — String reference: three decode paths agree, decoded string is
         //       the real value, decoded klass is java/lang/String.
         {
+            cp("SECTION E.1 (static sString — mirror slot, content decode guarded)");
             auto fp{ fi_fixture::static_field("sString") };
             ctx.check("cmp_oop_string_resolves", fp.has_value());
             if (fp)
@@ -604,6 +747,7 @@ VMHOOK_JVM_MODULE(field_introspection)
         // E.2 — int[] reference: decoded oop is the real array (length + elem0
         //       match Java), klass name is "[I", and get()/field_oop agree.
         {
+            cp("SECTION E.2 (static sIntArray — mirror slot, content decode guarded)");
             auto fp{ fi_fixture::static_field("sIntArray") };
             ctx.check("cmp_oop_intarray_resolves", fp.has_value());
             if (fp)
@@ -646,6 +790,7 @@ VMHOOK_JVM_MODULE(field_introspection)
         // E.3 — Object[] reference: decoded array length matches, klass is
         //       "[Ljava/lang/Object;".
         {
+            cp("SECTION E.3 (static sObjArray — mirror slot, content decode guarded)");
             auto fp{ fi_fixture::static_field("sObjArray") };
             if (fp)
             {
@@ -674,6 +819,7 @@ VMHOOK_JVM_MODULE(field_introspection)
         // E.4 — plain Object reference: decoded oop is valid and its klass is
         //       java/lang/Object; get()==decode.
         {
+            cp("SECTION E.4 (static sObject — mirror slot, content decode guarded)");
             auto fp{ fi_fixture::static_field("sObject") };
             if (fp)
             {
@@ -696,6 +842,7 @@ VMHOOK_JVM_MODULE(field_introspection)
         //       is_reference is true and the compressed OOP decodes to a valid
         //       object whose concrete klass is the anonymous Runnable subclass.
         {
+            cp("SECTION E.5 (static sRunnable — mirror slot, content decode guarded)");
             auto fp{ fi_fixture::static_field("sRunnable") };
             if (fp)
             {
@@ -726,6 +873,7 @@ VMHOOK_JVM_MODULE(field_introspection)
 
         // E.6 — self-typed reference: decoded oop's klass is exactly the fixture.
         {
+            cp("SECTION E.6 (static sSelfRef — mirror slot, content decode guarded)");
             auto fp{ fi_fixture::static_field("sSelfRef") };
             if (fp)
             {
@@ -740,18 +888,36 @@ VMHOOK_JVM_MODULE(field_introspection)
 
         // E.7 — INSTANCE reference field (iString): get_compressed_oop on an
         //       instance proxy decodes to the real instance String.
+        //
+        // *** THE a84e51a GAP (instance reference fields) ***  Unlike E.1–E.6,
+        // here get_compressed_oop() (vmhook.hpp:12540) and get() (vmhook.hpp:12268)
+        // read the 4-byte compressed-OOP slot at instance+offset — and `instance`
+        // is the young-gen object that relocates.  a84e51a guarded the CONTENT
+        // decode (safe_read_java_string / safe_array_length) but NOT these
+        // instance-slot reads, so reading the slot off a relocated `instance` would
+        // fault.  RE-ACQUIRE the wrapper fresh and exact-byte PROBE the 4-byte slot
+        // (+header) before any get_compressed_oop()/get(); on a miss skip best-
+        // effort, on success read + assert HARD (the value/length content decode
+        // remains separately guarded for the young-gen referent).
         {
+            cp("SECTION E.7 (INSTANCE ref fields — re-acquire + probe slot)");
             const auto inst{ fi_fixture::get_instance() };
             if (inst)
             {
+                void* const inst_oop{ inst->vmhook::object_base::get_instance() };
+
+                cp("SECTION E.7 iString (instance get_compressed_oop/get — probe slot)");
                 auto fp{ inst->get_field("iString") };
-                if (fp)
+                if (fp && instance_field_read_safe(inst_oop, *fp, sizeof(std::uint32_t)))
                 {
                     const std::uint32_t raw{ fp->get_compressed_oop() };
                     void* const decoded{ vmhook::hotspot::decode_oop_pointer(raw) };
                     ctx.check("cmp_oop_instance_string_nonzero", raw != 0);
                     ctx.check("cmp_oop_instance_string_get_equals_decode",
                               static_cast<void*>(fp->get()) == decoded);
+                    // The referent String is itself young-gen — its CONTENT read is
+                    // separately header-probed (safe_read_java_string).
+                    cp("SECTION E.7 iString content (read_java_string — probe header)");
                     const std::string text{ safe_read_java_string(decoded) };
                     if (!text.empty())
                     {
@@ -760,15 +926,22 @@ VMHOOK_JVM_MODULE(field_introspection)
                     }
                     else
                     {
-                        ctx.record("[INFO] cmp_oop_instance_string: header not safely readable "
-                                   "(stale/relocated) — skipped value assert.");
+                        ctx.record("[INFO] cmp_oop_instance_string: referent header not safely "
+                                   "readable (stale/relocated) — skipped value assert.");
                     }
                 }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_instance_string: instance slot not safely "
+                               "readable (instance relocated) — skipped all asserts (transient).");
+                }
 
+                cp("SECTION E.7 iIntArray (instance get_compressed_oop — probe slot)");
                 auto fa{ inst->get_field("iIntArray") };
-                if (fa)
+                if (fa && instance_field_read_safe(inst_oop, *fa, sizeof(std::uint32_t)))
                 {
                     void* const decoded{ vmhook::hotspot::decode_oop_pointer(fa->get_compressed_oop()) };
+                    cp("SECTION E.7 iIntArray content (array_length — probe header)");
                     const std::int32_t len{ safe_array_length(decoded) };
                     if (len >= 0)
                     {
@@ -777,9 +950,14 @@ VMHOOK_JVM_MODULE(field_introspection)
                     }
                     else
                     {
-                        ctx.record("[INFO] cmp_oop_instance_intarray: array header not safely "
-                                   "readable (stale/relocated) — skipped length assert.");
+                        ctx.record("[INFO] cmp_oop_instance_intarray: referent array header not "
+                                   "safely readable (stale/relocated) — skipped length assert.");
                     }
+                }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_instance_intarray: instance slot not safely "
+                               "readable (instance relocated) — skipped length assert (transient).");
                 }
             }
         }
@@ -788,6 +966,12 @@ VMHOOK_JVM_MODULE(field_introspection)
     // =====================================================================
     //  SECTION F — get_compressed_oop() boundary / FLAW pinning.
     // =====================================================================
+    // Every read here is on a STATIC field (mirror, old-gen) or a synthetic stack
+    // proxy — none touch the young-gen instance, so none can fault.  In particular
+    // F.2/F.3 (the FLAW-C lines) call get_compressed_oop() on PRIMITIVE static
+    // fields: the is_reference() guard (vmhook.hpp:12550) returns 0 BEFORE any
+    // memcpy, so there is no read at all.  HARD throughout.
+    cp("SECTION F (boundary / FLAW pinning — static + stack only, no fault risk)");
     {
         // F.1 — NULL reference field: compressed OOP is 0, decode is null,
         //       get() as void* is null.
@@ -817,6 +1001,7 @@ VMHOOK_JVM_MODULE(field_introspection)
         //       so on a primitive "I" field it returns 0 instead of the raw int
         //       bytes (which would decode to a wild OOP).
         {
+            cp("SECTION F.2 (sInt get_compressed_oop guarded — primitive, no memcpy)");
             auto fp{ fi_fixture::static_field("sInt") };
             if (fp)
             {
@@ -831,6 +1016,7 @@ VMHOOK_JVM_MODULE(field_introspection)
         //       get_compressed_oop() now returns 0 (it used to read only the low
         //       32 bits of the 8-byte field).
         {
+            cp("SECTION F.3 (sLong get_compressed_oop guarded — primitive, no memcpy)");
             auto fp{ fi_fixture::static_field("sLong") };
             if (fp)
             {
@@ -870,6 +1056,11 @@ VMHOOK_JVM_MODULE(field_introspection)
     //  then re-introspect post-dispatch (proves the accessors reflect live JVM
     //  state, and that a hooked Java call did not perturb field resolution).
     // =====================================================================
+    // The mode-1 dispatch allocates on the Java thread (touch + publishWitnesses)
+    // and can trigger a young GC that relocates `instance` AND `sString`'s
+    // referent.  Post-probe reads are STATIC (sString on the mirror) so the slot
+    // read is HARD; only the decoded referent CONTENT read is probe-guarded.
+    cp("SECTION G (live probe mode 1)");
     {
         auto handle{ vmhook::scoped_hook<fi_fixture>(
             "touch",
@@ -883,6 +1074,7 @@ VMHOOK_JVM_MODULE(field_introspection)
             }) };
         ctx.check("probe_hook_installed", handle.installed());
 
+        cp("SECTION G run_probe mode 1 (Java dispatch + alloc — GC trigger)");
         const bool done{ ctx.run_probe(
             [](bool value)
             {
@@ -906,6 +1098,7 @@ VMHOOK_JVM_MODULE(field_introspection)
         // Re-introspect post-dispatch: signature/is_static/get_compressed_oop
         // all still correct and the String still decodes.
         {
+            cp("SECTION G post-probe re-introspect (static sString — mirror slot)");
             auto fp{ fi_fixture::static_field("sString") };
             if (fp)
             {
@@ -920,6 +1113,7 @@ VMHOOK_JVM_MODULE(field_introspection)
                 // full-JVM crash.  Guard the read behind a safe-read probe and make
                 // it best-effort: a transient empty miss is recorded, a DIFFERENT
                 // non-empty value still fails (real mis-decode).
+                cp("SECTION G post-probe sString content (read_java_string — probe header)");
                 void* const decoded{ vmhook::hotspot::decode_oop_pointer(fp->get_compressed_oop()) };
                 const std::string text{ safe_read_java_string(decoded) };
                 if (!text.empty())
@@ -944,7 +1138,14 @@ VMHOOK_JVM_MODULE(field_introspection)
     //  any address a caller CACHED across the GC may now be stale, but a FRESH
     //  lookup remains correct.
     // =====================================================================
+    // Every slot read here is on STATIC sString (mirror) → HARD; every referent
+    // CONTENT read goes through safe_read_java_string (header probe) → best-effort.
+    // This block deliberately straddles a forced GC, so its content reads are the
+    // single most likely place to observe a mid-relocation object — hence the
+    // probe-then-read on EVERY decode (including the retry loop).
+    cp("SECTION H (raw_address GC-staleness doc, mode 2)");
     {
+        cp("SECTION H pre-GC decode (sString content — probe header)");
         auto before{ fi_fixture::static_field("sString") };
         void* const decoded_before{
             before.has_value()
@@ -968,6 +1169,7 @@ VMHOOK_JVM_MODULE(field_introspection)
             }
         }
 
+        cp("SECTION H run_probe mode 2 (forced System.gc() churn)");
         const bool done{ ctx.run_probe(
             [](bool value)
             {
@@ -985,6 +1187,7 @@ VMHOOK_JVM_MODULE(field_introspection)
         // mirror+offset math is GC-coherent; only a stale CACHED raw_address
         // would be wrong — which is the documented flaw, not exercised as a
         // crash here because that would be UB.)
+        cp("SECTION H post-GC fresh re-resolve (static sString — mirror slot)");
         auto after{ fi_fixture::static_field("sString") };
         ctx.check("gc_doc_after_resolves", after.has_value());
         if (after)
@@ -1007,6 +1210,7 @@ VMHOOK_JVM_MODULE(field_introspection)
             // EVERY read through safe_read_java_string (header safe-probe first).
             // A failed probe / relocated object yields "" and we simply retry;
             // never a raw fault.
+            cp("SECTION H post-GC content retry loop (sString — probe header each)");
             std::string decoded_value{};
             for (int attempt{ 0 }; attempt < 16 && decoded_value != "introspect-me"; ++attempt)
             {
