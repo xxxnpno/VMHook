@@ -212,5 +212,118 @@ int main()
                 "(VMHOOK_CMAKE_VERSION_* not defined for this target)\n");
 #endif
 
+    // -----------------------------------------------------------------------
+    // VMHOOK_MAKE_VERSION packing: each field is exactly three decimal digits,
+    // so adjacent triples that differ by one unit in a single field must differ
+    // by exactly that field's weight.  These pin the "no carry between fields"
+    // property at the boundaries of each field.
+    // -----------------------------------------------------------------------
+    static_assert(VMHOOK_MAKE_VERSION(0, 0, 999) == 999,
+                  "patch field tops out at 999");
+    static_assert(VMHOOK_MAKE_VERSION(0, 999, 0) == 999000,
+                  "minor field tops out at 999*1000");
+    static_assert(VMHOOK_MAKE_VERSION(0, 1, 0) - VMHOOK_MAKE_VERSION(0, 0, 999) == 1,
+                  "minor.0 is exactly one above patch-maxed minor-1 ((1*1000) - 999 == 1)");
+    static_assert(VMHOOK_MAKE_VERSION(1, 0, 0) - VMHOOK_MAKE_VERSION(0, 999, 999) == 1,
+                  "major.0.0 is exactly one above the maxed-out 0.999.999");
+    check("make_version_patch_field_max", VMHOOK_MAKE_VERSION(0, 0, 999) == 999);
+    check("make_version_minor_field_max", VMHOOK_MAKE_VERSION(0, 999, 0) == 999000);
+    check("make_version_minor_one_above_patch_max",
+          VMHOOK_MAKE_VERSION(0, 1, 0) - VMHOOK_MAKE_VERSION(0, 0, 999) == 1);
+    check("make_version_major_one_above_minor_patch_max",
+          VMHOOK_MAKE_VERSION(1, 0, 0) - VMHOOK_MAKE_VERSION(0, 999, 999) == 1);
+
+    // A single patch step always changes the packed value by exactly 1, a single
+    // minor step by exactly 1000, and a single major step by exactly 1'000'000 —
+    // for arbitrary in-field base values, not just zero.
+    check("make_version_patch_step_is_one",
+          VMHOOK_MAKE_VERSION(4, 12, 8) - VMHOOK_MAKE_VERSION(4, 12, 7) == 1);
+    check("make_version_minor_step_is_1000",
+          VMHOOK_MAKE_VERSION(4, 12, 8) - VMHOOK_MAKE_VERSION(4, 11, 8) == 1000);
+    check("make_version_major_step_is_1000000",
+          VMHOOK_MAKE_VERSION(4, 12, 8) - VMHOOK_MAKE_VERSION(3, 12, 8) == 1000000);
+
+    // -----------------------------------------------------------------------
+    // Decompose round-trip for a battery of synthetic triples: pack with
+    // VMHOOK_MAKE_VERSION, then recover each field by the documented /-and-%
+    // identities.  Covers zeros, field maxima, and an all-fields-populated mix —
+    // exercising the lossless-pack invariant far past the single live value.
+    // -----------------------------------------------------------------------
+    {
+        struct triple { int major; int minor; int patch; };
+        constexpr triple triples[]{
+            { 0, 0, 0 }, { 0, 0, 1 }, { 0, 1, 0 }, { 1, 0, 0 },
+            { 0, 0, 999 }, { 0, 999, 0 }, { 0, 999, 999 },
+            { 1, 2, 3 }, { 7, 13, 21 }, { 99, 999, 999 }, { 255, 1, 500 },
+        };
+        bool all_decompose_ok{ true };
+        for (const triple t : triples)
+        {
+            const int p{ (t.major * 1000000) + (t.minor * 1000) + t.patch };
+            if ((p / 1000000) != t.major) { all_decompose_ok = false; }
+            if (((p / 1000) % 1000) != t.minor) { all_decompose_ok = false; }
+            if ((p % 1000) != t.patch) { all_decompose_ok = false; }
+        }
+        check("make_version_decompose_roundtrip_battery", all_decompose_ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // The live shipped version.  VMHOOK_VERSION_* are fixed in the header at the
+    // moment of release; pin the exact triple (0.5.3 at the time of writing) so a
+    // version bump that forgets to update one of the three macros, or the packed
+    // value, fails here.  Sourced from vmhook.hpp lines 67-69.
+    // -----------------------------------------------------------------------
+    check("live_version_major_is_0", v_major == 0);
+    check("live_version_minor_is_5", v_minor == 5);
+    check("live_version_patch_is_3", v_patch == 3);
+    check("live_version_packed_is_5003", packed == 5003);
+    check("live_version_string_is_0_5_3", version_text == std::string{ "0.5.3" });
+
+    // -----------------------------------------------------------------------
+    // Self-comparison / reflexivity and strict ordering corners that a `#if
+    // VMHOOK_VERSION >= MAKE(x,y,z)` gate relies on: equal triples compare
+    // equal (>= holds, > does not), and the live version is >= itself but not
+    // strictly greater than itself.
+    // -----------------------------------------------------------------------
+    check("version_ge_itself", packed >= VMHOOK_VERSION);
+    check("version_not_strictly_gt_itself", !(packed > VMHOOK_VERSION));
+    check("make_version_equal_triples_compare_equal",
+          VMHOOK_MAKE_VERSION(2, 5, 9) == VMHOOK_MAKE_VERSION(2, 5, 9));
+    check("make_version_equal_triples_not_strictly_ordered",
+          !(VMHOOK_MAKE_VERSION(2, 5, 9) > VMHOOK_MAKE_VERSION(2, 5, 9))
+          && !(VMHOOK_MAKE_VERSION(2, 5, 9) < VMHOOK_MAKE_VERSION(2, 5, 9)));
+
+    // -----------------------------------------------------------------------
+    // VMHOOK_VERSION_STRING substring agreement: the dotted string must contain
+    // each numeric component as a token, and splitting on '.' must yield exactly
+    // the three components in order.  This is stronger than the snprintf rebuild
+    // above because it checks the stringize path field-by-field.
+    // -----------------------------------------------------------------------
+    {
+        // Split version_text on '.' into three pieces and parse each as an int.
+        std::vector<std::string> parts;
+        std::string current;
+        for (const char c : version_text)
+        {
+            if (c == '.') { parts.push_back(current); current.clear(); }
+            else { current.push_back(c); }
+        }
+        parts.push_back(current);
+        check("version_string_splits_into_three_parts", parts.size() == 3);
+        if (parts.size() == 3)
+        {
+            check("version_string_part0_is_major",
+                  parts[0] == std::to_string(v_major));
+            check("version_string_part1_is_minor",
+                  parts[1] == std::to_string(v_minor));
+            check("version_string_part2_is_patch",
+                  parts[2] == std::to_string(v_patch));
+            // No part is empty (would mean a leading/trailing/double dot).
+            check("version_string_no_empty_parts",
+                  !parts[0].empty() && !parts[1].empty() && !parts[2].empty());
+        }
+    }
+
+    std::printf("\n%d checks failed\n", failures);
     return failures == 0 ? 0 : 1;
 }

@@ -99,6 +99,26 @@ static auto test_type_tags_are_distinct() -> void
     check("map_ne_hash_map",        !std::is_same_v<vmhook::map, vmhook::hash_map>);
     check("collection_ne_hash_map", !std::is_same_v<vmhook::collection, vmhook::hash_map>);
     check("list_ne_map",            !std::is_same_v<vmhook::list, vmhook::map>);
+
+    // Exhaustive remaining distinctness pairs across the six tags so a typedef
+    // alias collapsing ANY two of them flips exactly one of these to true.
+    check("set_ne_map",             !std::is_same_v<vmhook::set, vmhook::map>);
+    check("set_ne_hash_map",        !std::is_same_v<vmhook::set, vmhook::hash_map>);
+    check("set_ne_linked_list2",    !std::is_same_v<vmhook::set, vmhook::linked_list>);
+    check("linked_list_ne_map",     !std::is_same_v<vmhook::linked_list, vmhook::map>);
+    check("linked_list_ne_hash_map",!std::is_same_v<vmhook::linked_list, vmhook::hash_map>);
+    check("list_ne_hash_map",       !std::is_same_v<vmhook::list, vmhook::hash_map>);
+    check("collection_ne_linked_list",
+          !std::is_same_v<vmhook::collection, vmhook::linked_list>);
+
+    // The shared mixin base is itself a distinct type from every concrete tag
+    // and from object_base (it sits strictly between them in the hierarchy).
+    check("oop_reflective_base_ne_object_base",
+          !std::is_same_v<vmhook::oop_reflective_base, vmhook::object_base>);
+    check("oop_reflective_base_ne_collection",
+          !std::is_same_v<vmhook::oop_reflective_base, vmhook::collection>);
+    check("oop_reflective_base_ne_map",
+          !std::is_same_v<vmhook::oop_reflective_base, vmhook::map>);
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +139,71 @@ static auto test_inheritance_lattice() -> void
     // collection and map are unrelated branches of the hierarchy.
     check("collection_not_base_of_map",  (!std::is_base_of_v<vmhook::collection, vmhook::map>));
     check("map_not_base_of_collection",  (!std::is_base_of_v<vmhook::map, vmhook::collection>));
+
+    // --- The shared mixin: oop_reflective_base sits above BOTH branches. ---
+    // collection and map both derive from oop_reflective_base, which derives
+    // from object_base.  This shared ancestry is exactly what the task warns
+    // must NOT make the two branches relatives of each other.
+    check("collection_is_oop_reflective_base",
+          (std::is_base_of_v<vmhook::oop_reflective_base, vmhook::collection>));
+    check("map_is_oop_reflective_base",
+          (std::is_base_of_v<vmhook::oop_reflective_base, vmhook::map>));
+    check("oop_reflective_base_is_object_base",
+          (std::is_base_of_v<vmhook::object_base, vmhook::oop_reflective_base>));
+
+    // Every concrete tag transitively derives from the mixin and from object_base.
+    check("list_is_oop_reflective_base",
+          (std::is_base_of_v<vmhook::oop_reflective_base, vmhook::list>));
+    check("set_is_oop_reflective_base",
+          (std::is_base_of_v<vmhook::oop_reflective_base, vmhook::set>));
+    check("linked_list_is_oop_reflective_base",
+          (std::is_base_of_v<vmhook::oop_reflective_base, vmhook::linked_list>));
+    check("hash_map_is_oop_reflective_base",
+          (std::is_base_of_v<vmhook::oop_reflective_base, vmhook::hash_map>));
+    check("collection_is_object_base",
+          (std::is_base_of_v<vmhook::object_base, vmhook::collection>));
+    check("map_is_object_base",
+          (std::is_base_of_v<vmhook::object_base, vmhook::map>));
+    check("hash_map_is_object_base",
+          (std::is_base_of_v<vmhook::object_base, vmhook::hash_map>));
+    check("linked_list_is_object_base",
+          (std::is_base_of_v<vmhook::object_base, vmhook::linked_list>));
+
+    // --- The CROSS-branch non-relationships (the core regression guard). ---
+    // Despite sharing oop_reflective_base + object_base, NOTHING on the
+    // collection side is a base/derived of anything on the map side.
+    check("map_not_base_of_list",      (!std::is_base_of_v<vmhook::map, vmhook::list>));
+    check("list_not_base_of_map",      (!std::is_base_of_v<vmhook::list, vmhook::map>));
+    check("map_not_base_of_set",       (!std::is_base_of_v<vmhook::map, vmhook::set>));
+    check("set_not_base_of_map",       (!std::is_base_of_v<vmhook::set, vmhook::map>));
+    check("hash_map_not_base_of_collection",
+          (!std::is_base_of_v<vmhook::hash_map, vmhook::collection>));
+    check("collection_not_base_of_hash_map",
+          (!std::is_base_of_v<vmhook::collection, vmhook::hash_map>));
+    check("hash_map_not_base_of_list",
+          (!std::is_base_of_v<vmhook::hash_map, vmhook::list>));
+    check("linked_list_not_base_of_map",
+          (!std::is_base_of_v<vmhook::linked_list, vmhook::map>));
+    check("map_not_base_of_linked_list",
+          (!std::is_base_of_v<vmhook::map, vmhook::linked_list>));
+    check("hash_map_not_base_of_set",
+          (!std::is_base_of_v<vmhook::hash_map, vmhook::set>));
+
+    // --- Direction / reflexivity sanity on the lattice. ---
+    // is_base_of is reflexive in C++ (a class is its own base), but a derived
+    // class is NEVER a base of its parent.
+    check("collection_not_base_of_self_derived_list",
+          (!std::is_base_of_v<vmhook::list, vmhook::collection>));   // list is NOT a base of collection
+    check("list_not_base_of_linked_list_reversed",
+          (std::is_base_of_v<vmhook::list, vmhook::linked_list>)     // forward holds
+          && (!std::is_base_of_v<vmhook::linked_list, vmhook::list>)); // reverse does not
+    check("map_not_base_of_hash_map_reversed",
+          (std::is_base_of_v<vmhook::map, vmhook::hash_map>)
+          && (!std::is_base_of_v<vmhook::hash_map, vmhook::map>));
+    // The mixin is not a base of object_base (it derives FROM it, not the
+    // other way around).
+    check("oop_reflective_base_not_base_of_object_base",
+          (!std::is_base_of_v<vmhook::oop_reflective_base, vmhook::object_base>));
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +261,13 @@ static auto test_size_and_is_empty_null_safe() -> void
 
     check("collection_is_empty_true", c.is_empty());
     check("map_is_empty_true",        m.is_empty());
+    // is_empty() is null-safe on EVERY tag (size()==0 -> empty), not just the
+    // two the original suite checked.
+    check("list_is_empty_true",        l.is_empty());
+    check("set_is_empty_true",         s.is_empty());
+    check("linked_list_is_empty_true", ll.is_empty());
+    check("hash_map_is_empty_true",    hm.is_empty());
+    check("hash_map_size_zero2",       hm.size() == 0);
 }
 
 // ---------------------------------------------------------------------------

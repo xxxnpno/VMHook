@@ -325,6 +325,216 @@ int main()
     static_assert(!vmhook::detail::dependent_false_v<int>,
                   "dependent_false_v must be false");
 
+    // -------------------------------------------------------------------------
+    // is_java_double_slot_v — uint64_t is ALSO a two-slot type (vmhook.hpp:7514),
+    // alongside int64_t and double.  The existing checks cover int64/double/int/
+    // float/void*; pin uint64_t and the cv-ref stripping the trait performs.
+    // -------------------------------------------------------------------------
+    check("is_java_double_slot_v_uint64_is_two",
+          vmhook::detail::is_java_double_slot_v<std::uint64_t>);
+    check("is_java_double_slot_v_strips_const_ref_on_long",
+          vmhook::detail::is_java_double_slot_v<const std::int64_t&>);
+    check("is_java_double_slot_v_strips_ref_on_double",
+          vmhook::detail::is_java_double_slot_v<double&>);
+    check("is_java_double_slot_v_strips_const_on_uint64",
+          vmhook::detail::is_java_double_slot_v<const std::uint64_t>);
+    // Narrow / unsigned-narrow / pointer / bool are all single-slot.
+    check("is_java_double_slot_v_uint32_is_one",
+          !vmhook::detail::is_java_double_slot_v<std::uint32_t>);
+    check("is_java_double_slot_v_int16_is_one",
+          !vmhook::detail::is_java_double_slot_v<std::int16_t>);
+    check("is_java_double_slot_v_bool_is_one",
+          !vmhook::detail::is_java_double_slot_v<bool>);
+    check("is_java_double_slot_v_int8_is_one",
+          !vmhook::detail::is_java_double_slot_v<std::int8_t>);
+
+    // -------------------------------------------------------------------------
+    // java_slot_offsets — more tuple shapes.  Every expected array is computed by
+    // hand from the rule "each long/double/uint64 advances the cursor by 2, every
+    // other type by 1" (vmhook.hpp:7542-7553).
+    // -------------------------------------------------------------------------
+    // Single double / single long / single uint64: one entry, always slot 0.
+    check("java_slot_offsets_single_double",
+          (vmhook::detail::java_slot_offsets<std::tuple<double>>::value
+           == std::array<std::int32_t, 1>{ 0 }));
+    check("java_slot_offsets_single_long",
+          (vmhook::detail::java_slot_offsets<std::tuple<std::int64_t>>::value
+           == std::array<std::int32_t, 1>{ 0 }));
+    check("java_slot_offsets_single_uint64",
+          (vmhook::detail::java_slot_offsets<std::tuple<std::uint64_t>>::value
+           == std::array<std::int32_t, 1>{ 0 }));
+    // Two consecutive longs: 0, then 2 (first long spans 0-1).
+    check("java_slot_offsets_two_longs",
+          (vmhook::detail::java_slot_offsets<std::tuple<std::int64_t, std::int64_t>>::value
+           == std::array<std::int32_t, 2>{ 0, 2 }));
+    // long, long, int -> 0, 2, 4.
+    check("java_slot_offsets_long_long_int",
+          (vmhook::detail::java_slot_offsets<std::tuple<std::int64_t, std::int64_t, std::int32_t>>::value
+           == std::array<std::int32_t, 3>{ 0, 2, 4 }));
+    // double, double -> 0, 2.
+    check("java_slot_offsets_double_double",
+          (vmhook::detail::java_slot_offsets<std::tuple<double, double>>::value
+           == std::array<std::int32_t, 2>{ 0, 2 }));
+    // int, double, int, long, int -> 0, 1, 3, 4, 6.
+    check("java_slot_offsets_int_double_int_long_int",
+          (vmhook::detail::java_slot_offsets<
+               std::tuple<std::int32_t, double, std::int32_t, std::int64_t, std::int32_t>>::value
+           == std::array<std::int32_t, 5>{ 0, 1, 3, 4, 6 }));
+    // uint64 counts as a double slot too: (uint64, int) -> 0, 2.
+    check("java_slot_offsets_uint64_int_widens",
+          (vmhook::detail::java_slot_offsets<std::tuple<std::uint64_t, std::int32_t>>::value
+           == std::array<std::int32_t, 2>{ 0, 2 }));
+    // A long at the very END still only consumes its own two slots; nothing
+    // follows it, so the table is just the leading offsets.
+    check("java_slot_offsets_int_int_long",
+          (vmhook::detail::java_slot_offsets<std::tuple<std::int32_t, std::int32_t, std::int64_t>>::value
+           == std::array<std::int32_t, 3>{ 0, 1, 2 }));
+    // Pointer + float + bool are all single-slot: identity offsets.
+    check("java_slot_offsets_ptr_float_bool_identity",
+          (vmhook::detail::java_slot_offsets<std::tuple<void*, float, bool>>::value
+           == std::array<std::int32_t, 3>{ 0, 1, 2 }));
+    // The computed array size always equals the tuple arity (one entry per arg,
+    // regardless of how many slots each arg spans).
+    check("java_slot_offsets_size_equals_arity",
+          vmhook::detail::java_slot_offsets<
+              std::tuple<std::int64_t, double, std::int32_t>>::value.size() == 3);
+
+    // -------------------------------------------------------------------------
+    // is_vector_v / value_type_t — more element types and qualifier stripping.
+    // -------------------------------------------------------------------------
+    check("is_vector_v_true_for_vector_bool",
+          vmhook::detail::is_vector_v<std::vector<bool>>);
+    check("is_vector_v_true_for_vector_of_vector",
+          vmhook::detail::is_vector_v<std::vector<std::vector<int>>>);
+    check("is_vector_v_strips_volatile_ref",
+          vmhook::detail::is_vector_v<volatile std::vector<int>&>);
+    check("is_vector_v_false_for_shared_ptr",
+          !vmhook::detail::is_vector_v<std::shared_ptr<std::vector<int>>>);
+    check("is_vector_v_false_for_tuple",
+          !vmhook::detail::is_vector_v<std::tuple<int, int>>);
+    check("is_vector_value_type_t_pointer",
+          std::is_same_v<vector_value_t<std::vector<int*>>, int*>);
+    check("is_vector_value_type_t_nested_vector",
+          std::is_same_v<vector_value_t<std::vector<std::vector<double>>>, std::vector<double>>);
+    check("is_vector_value_type_t_wrapper_unique_ptr",
+          std::is_same_v<vector_value_t<std::vector<std::unique_ptr<sample_wrapper>>>,
+                         std::unique_ptr<sample_wrapper>>);
+
+    // -------------------------------------------------------------------------
+    // is_unique_ptr_v / value_type_t — more pointee types and qualifier stripping.
+    // -------------------------------------------------------------------------
+    check("is_unique_ptr_v_true_for_unique_ptr_vector",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<std::vector<int>>>);
+    check("is_unique_ptr_v_strips_rvalue_ref",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<int>&&>);
+    check("is_unique_ptr_v_strips_volatile_const_ref",
+          vmhook::detail::is_unique_ptr_v<const volatile std::unique_ptr<int>&>);
+    check("is_unique_ptr_v_false_for_object_base_value",
+          !vmhook::detail::is_unique_ptr_v<vmhook::object_base*>);
+    check("is_unique_ptr_value_type_t_double",
+          std::is_same_v<unique_value_t<std::unique_ptr<double>>, double>);
+    check("is_unique_ptr_value_type_t_vector",
+          std::is_same_v<unique_value_t<std::unique_ptr<std::vector<int>>>, std::vector<int>>);
+    check("is_unique_ptr_value_type_t_void_ptr_pointee",
+          std::is_same_v<unique_value_t<std::unique_ptr<void*>>, void*>);
+
+    // -------------------------------------------------------------------------
+    // is_unique_object_ptr — bool_constant base, more wrapper / non-wrapper cases.
+    // -------------------------------------------------------------------------
+    check("is_unique_object_ptr_false_for_unique_ptr_vector",
+          !vmhook::detail::is_unique_object_ptr<std::unique_ptr<std::vector<int>>>::value);
+    check("is_unique_object_ptr_false_for_unique_ptr_double",
+          !vmhook::detail::is_unique_object_ptr<std::unique_ptr<double>>::value);
+    check("is_unique_object_ptr_false_for_shared_ptr_wrapper",
+          !vmhook::detail::is_unique_object_ptr<std::shared_ptr<sample_wrapper>>::value);
+    check("is_unique_object_ptr_false_for_object_base_value",
+          !vmhook::detail::is_unique_object_ptr<vmhook::object_base>::value);
+    // The predicate is exactly is_base_of<object_base, pointee>: object_base
+    // itself qualifies (is_base_of is reflexive).
+    check("is_unique_object_ptr_true_for_unique_ptr_object_base_self",
+          vmhook::detail::is_unique_object_ptr<std::unique_ptr<vmhook::object_base>>::value);
+
+    // -------------------------------------------------------------------------
+    // dependent_false_v — false for more arities and qualifier mixes.
+    // -------------------------------------------------------------------------
+    check("dependent_false_v_zero_args_is_false",
+          !vmhook::detail::dependent_false_v<>);
+    check("dependent_false_v_pointer_is_false",
+          !vmhook::detail::dependent_false_v<int*>);
+    check("dependent_false_v_unique_ptr_is_false",
+          !vmhook::detail::dependent_false_v<std::unique_ptr<sample_wrapper>>);
+    check("dependent_false_v_five_args_is_false",
+          !vmhook::detail::dependent_false_v<int, long, double, std::string, void*>);
+
+    // -------------------------------------------------------------------------
+    // function_traits + tuple_tail — more callable shapes and arg lists.
+    // -------------------------------------------------------------------------
+    // A long-arg-list lambda: (return_value&, self, long, double, int, long).
+    {
+        auto detour = [](vmhook::return_value&,
+                         std::unique_ptr<sample_wrapper>,
+                         std::int64_t, double, std::int32_t, std::int64_t) {};
+        using method = method_args_of<decltype(detour)>;
+        check("tuple_tail_six_arg_lambda_arity_5",
+              std::tuple_size_v<method> == 5);
+        check("tuple_tail_six_arg_lambda_order_preserved",
+              std::is_same_v<method,
+                  std::tuple<std::unique_ptr<sample_wrapper>, std::int64_t, double,
+                             std::int32_t, std::int64_t>>);
+    }
+    // The method-arg tuple feeds java_slot_offsets directly; verify the chain end
+    // to end for an instance method (self, long, int, double): the trailing
+    // double must land past the long's two slots.
+    {
+        auto detour = [](vmhook::return_value&,
+                         std::unique_ptr<sample_wrapper>,
+                         std::int64_t, std::int32_t, double) {};
+        using method = method_args_of<decltype(detour)>;
+        // method tuple = (unique_ptr<self>, long, int, double).
+        // slots: self@0(+1), long@1(+2), int@3(+1), double@4(+2) -> [0,1,3,4].
+        check("function_traits_to_slot_offsets_self_long_int_double",
+              (vmhook::detail::java_slot_offsets<method>::value
+               == std::array<std::int32_t, 4>{ 0, 1, 3, 4 }));
+    }
+    // std::function with an object (non-unique_ptr) arg list.
+    {
+        using fn_t = std::function<void(vmhook::return_value&, std::int32_t, double)>;
+        check("function_traits_std_function_int_double",
+              std::is_same_v<method_args_of<fn_t>, std::tuple<std::int32_t, double>>);
+    }
+    // A const-operator() functor (non-mutable lambda is already const; pin an
+    // explicit struct with a const call operator to exercise that specialisation).
+    {
+        struct const_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t) const {}
+        };
+        check("function_traits_const_functor_decomposes",
+              std::is_same_v<method_args_of<const_functor>, std::tuple<std::int32_t>>);
+    }
+    // tuple_tail directly on a hand-built tuple drops exactly the first element.
+    check("tuple_tail_drops_first_element_only",
+          std::is_same_v<
+              typename vmhook::detail::tuple_tail<
+                  std::tuple<vmhook::return_value&, int, double, void*>>::type_t,
+              std::tuple<int, double, void*>>);
+    // tuple_tail of a single-element tuple yields the empty tuple.
+    check("tuple_tail_single_element_yields_empty",
+          std::is_same_v<
+              typename vmhook::detail::tuple_tail<std::tuple<vmhook::return_value&>>::type_t,
+              std::tuple<>>);
+
+    // -------------------------------------------------------------------------
+    // Compile-time enforcement of the new uint64 slot fact and a fresh slot
+    // table, so a regression breaks the build before it reaches runtime.
+    // -------------------------------------------------------------------------
+    static_assert(vmhook::detail::is_java_double_slot_v<std::uint64_t>,
+                  "uint64_t must occupy two Java slots, like int64_t");
+    static_assert(vmhook::detail::java_slot_offsets<
+                      std::tuple<std::int64_t, std::int64_t, std::int32_t>>::value
+                      == std::array<std::int32_t, 3>{ 0, 2, 4 },
+                  "two leading longs must push the trailing int to slot 4");
+
     std::printf("vmhook traits-extra: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

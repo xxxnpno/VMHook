@@ -281,6 +281,132 @@ static auto test_iterate_consistent_with_getters() -> void
           !types_null || iterate_type_entries("Method") == nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// 8. Determinism: repeating the SAME lookup many times always returns nullptr
+//    (no internal state mutates between calls), and is consistent for both
+//    helpers across a mix of real, bogus, and empty symbol names.
+// ---------------------------------------------------------------------------
+static auto test_lookup_determinism_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    bool struct_stable{ true };
+    bool type_stable{ true };
+    for (int i{ 0 }; i < 256; ++i)
+    {
+        if (iterate_struct_entries("Method", "_constMethod") != nullptr) { struct_stable = false; }
+        if (iterate_struct_entries("", "") != nullptr) { struct_stable = false; }
+        if (iterate_struct_entries(nullptr, "_x") != nullptr) { struct_stable = false; }
+        if (iterate_type_entries("Klass") != nullptr) { type_stable = false; }
+        if (iterate_type_entries("") != nullptr) { type_stable = false; }
+        if (iterate_type_entries(nullptr) != nullptr) { type_stable = false; }
+    }
+    check("iterate_struct_entries_repeated_lookup_stable", struct_stable);
+    check("iterate_type_entries_repeated_lookup_stable", type_stable);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Pathological string contents: the loop guard never executes its body with
+//    a null array head, so the CONTENT of a (non-null) symbol string is never
+//    dereferenced beyond strcmp — and even very long / control-char / embedded-
+//    special strings must return nullptr without faulting.  Embedded NUL is NOT
+//    testable through a const char* (it would truncate at the NUL), so we cover
+//    long strings and unusual-but-NUL-free byte content instead.
+// ---------------------------------------------------------------------------
+static auto test_pathological_symbol_strings_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    // A very long type/field name (8 KiB) — must still short-circuit on the null
+    // array and return nullptr (no buffer walk, no overflow).
+    const std::string long_name(8u * 1024u, 'Z');
+    check("struct_very_long_type_name",
+          iterate_struct_entries(long_name.c_str(), "_length") == nullptr);
+    check("struct_very_long_field_name",
+          iterate_struct_entries("Symbol", long_name.c_str()) == nullptr);
+    check("struct_both_very_long",
+          iterate_struct_entries(long_name.c_str(), long_name.c_str()) == nullptr);
+    check("type_very_long_name",
+          iterate_type_entries(long_name.c_str()) == nullptr);
+
+    // Names containing characters that never appear in real HotSpot symbols
+    // (spaces, punctuation, high bytes) — ordinary non-null strings, returned
+    // nullptr by failing to match, never by crashing.
+    const char* const weird_names[]{
+        "Method ",                       // trailing space
+        " Method",                       // leading space
+        "Met\thod",                      // embedded tab
+        "_metadata._klass\n",            // embedded newline
+        "!@#$%^&*()",                    // pure punctuation
+        "Klass/InnerClass$1",            // dollar + slash
+        "\x7F\x7E\x7D",                  // high-ish ASCII bytes
+    };
+    bool all_weird_null{ true };
+    for (const char* const n : weird_names)
+    {
+        if (iterate_struct_entries(n, "_x") != nullptr) { all_weird_null = false; }
+        if (iterate_struct_entries("X", n) != nullptr) { all_weird_null = false; }
+        if (iterate_type_entries(n) != nullptr) { all_weird_null = false; }
+    }
+    check("iterate_helpers_tolerate_weird_symbol_bytes", all_weird_null);
+
+    // A single-character name (shortest possible non-empty string).
+    check("struct_single_char_names",
+          iterate_struct_entries("X", "y") == nullptr);
+    check("type_single_char_name",
+          iterate_type_entries("X") == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Extended real-symbol matrix.  A broader cross-section of the type/field
+//     pairs the library resolves at runtime (the codec base/shift fields, the
+//     Klass/Method/oop layout offsets, thread + CLD walking) — every one must
+//     short-circuit to nullptr with no JVM.  Complements section 3.
+// ---------------------------------------------------------------------------
+static auto test_extended_real_symbol_matrix_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    struct pair { const char* type; const char* field; const char* tag; };
+    static const pair pairs[]{
+        { "CompressedOops",  "_narrow_oop._base",  "ext_compressedoops_narrow_base" },
+        { "CompressedOops",  "_narrow_oop._shift", "ext_compressedoops_narrow_shift" },
+        { "CompressedKlassPointers", "_narrow_klass._base", "ext_compressedklass_base" },
+        { "Klass",           "_name",              "ext_klass_name" },
+        { "Klass",           "_super",             "ext_klass_super" },
+        { "Klass",           "_subklass",          "ext_klass_subklass" },
+        { "InstanceKlass",   "_methods",           "ext_instanceklass_methods" },
+        { "ConstMethod",     "_name_index",        "ext_constmethod_name_index" },
+        { "ConstMethod",     "_signature_index",   "ext_constmethod_signature_index" },
+        { "Symbol",          "_length",            "ext_symbol_length" },
+        { "oopDesc",         "_mark",              "ext_oopdesc_mark" },
+        { "JavaThread",      "_anchor",            "ext_javathread_anchor" },
+        { "ClassLoaderDataGraph", "_head",         "ext_cldgraph_head" },
+    };
+    for (const auto& p : pairs)
+    {
+        check(p.tag, iterate_struct_entries(p.type, p.field) == nullptr);
+    }
+
+    struct named { const char* type; const char* tag; };
+    static const named names[]{
+        { "ConstMethod",          "ext_type_constmethod" },
+        { "Symbol",               "ext_type_symbol" },
+        { "JavaThread",           "ext_type_javathread" },
+        { "ClassLoaderData",      "ext_type_cld" },
+        { "ClassLoaderDataGraph", "ext_type_cldgraph" },
+        { "CompressedOops",       "ext_type_compressedoops" },
+        { "intptr_t",             "ext_type_intptr_t" },
+    };
+    for (const auto& n : names)
+    {
+        check(n.tag, iterate_type_entries(n.type) == nullptr);
+    }
+}
+
 int main()
 {
     test_getters_cache_no_jvm();
@@ -290,6 +416,9 @@ int main()
     test_null_arg_guards();
     test_argument_ordering_and_empty_strings();
     test_iterate_consistent_with_getters();
+    test_lookup_determinism_no_jvm();
+    test_pathological_symbol_strings_no_jvm();
+    test_extended_real_symbol_matrix_no_jvm();
 
     return failures == 0 ? 0 : 1;
 }

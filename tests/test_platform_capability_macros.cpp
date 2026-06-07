@@ -19,6 +19,9 @@
 #include <string>
 #include <vector>
 
+#include <iterator>
+#include <type_traits>
+
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
 {
@@ -195,6 +198,36 @@ int main()
               ? (VMHOOK_HAS_HW_DATA_BREAKPOINTS == 0)
               : true);
 
+    // -- Additional cross-macro implications (runtime mirror). --------------
+    // POSIX is the exact complement of Windows within the supported set, so
+    // each implies the negation of the other.
+    check("posix_implies_not_windows",
+          !VMHOOK_OS_POSIX || (VMHOOK_OS_WINDOWS == 0));
+    check("windows_implies_not_posix",
+          !VMHOOK_OS_WINDOWS || (VMHOOK_OS_POSIX == 0));
+    // The five base-OS flags XOR to 1 (an even number of 1s would mean either
+    // zero or two selected — both are bugs the "exactly one" sum also catches,
+    // but XOR pins the parity independently).
+    check("os_flags_xor_to_one",
+          (VMHOOK_OS_WINDOWS ^ VMHOOK_OS_LINUX ^ VMHOOK_OS_MACOS
+           ^ VMHOOK_OS_IOS ^ VMHOOK_OS_ANDROID) == 1);
+    // iOS is an Apple target, so iOS implies APPLE implies POSIX; and iOS is the
+    // one POSIX/Apple platform where runtime hooking is forced off.
+    check("ios_implies_apple_and_posix",
+          !VMHOOK_OS_IOS || (VMHOOK_OS_APPLE == 1 && VMHOOK_OS_POSIX == 1));
+    check("ios_forces_runtime_hooking_off",
+          !VMHOOK_OS_IOS || (VMHOOK_RUNTIME_HOOKING_AVAILABLE == 0));
+    // arm64 forces BOTH higher capabilities off (no runtime hooking, no HW
+    // breakpoints) since both require x86_64.
+    check("arm64_forces_both_capabilities_off",
+          !VMHOOK_ARCH_ARM64
+              || (VMHOOK_RUNTIME_HOOKING_AVAILABLE == 0
+                  && VMHOOK_HAS_HW_DATA_BREAKPOINTS == 0));
+    // HW data breakpoints are the strongest capability: having them implies
+    // runtime hooking is also available (monotone capability ladder).
+    check("hw_breakpoints_is_subset_of_runtime_hooking",
+          !VMHOOK_HAS_HW_DATA_BREAKPOINTS || VMHOOK_RUNTIME_HOOKING_AVAILABLE);
+
     // -- Portable os:: address-range constants (defined on every platform) --
     // These are the documented user-space bounds the hook/scan code relies on;
     // they are plain constexpr values, no JVM needed.
@@ -223,6 +256,53 @@ int main()
               && static_cast<std::uint32_t>(vmhook::os::memory_protection::read_write) == 2
               && static_cast<std::uint32_t>(vmhook::os::memory_protection::execute_read) == 3
               && static_cast<std::uint32_t>(vmhook::os::memory_protection::execute_rw) == 4);
+
+    // memory_protection underlying type is std::uint32_t (vmhook.hpp:447); a
+    // change of width would silently alter ABI of any struct holding it.
+    check("memory_protection_underlying_is_uint32",
+          std::is_same_v<std::underlying_type_t<vmhook::os::memory_protection>,
+                         std::uint32_t>);
+
+    // The five ordinals are CONTIGUOUS [0..4] and STRICTLY INCREASING in the
+    // documented declaration order, with no gaps — the OS-protection lookup
+    // tables index by these values, so a reorder or gap would mis-map.
+    {
+        using mp = vmhook::os::memory_protection;
+        const std::uint32_t ord[]{
+            static_cast<std::uint32_t>(mp::no_access),
+            static_cast<std::uint32_t>(mp::read),
+            static_cast<std::uint32_t>(mp::read_write),
+            static_cast<std::uint32_t>(mp::execute_read),
+            static_cast<std::uint32_t>(mp::execute_rw),
+        };
+        bool strictly_increasing_contiguous{ true };
+        for (std::size_t i{ 0 }; i < std::size(ord); ++i)
+        {
+            if (ord[i] != static_cast<std::uint32_t>(i)) { strictly_increasing_contiguous = false; }
+        }
+        check("memory_protection_ordinals_contiguous_0_to_4",
+              strictly_increasing_contiguous);
+        // All five are pairwise distinct (a duplicate would collapse two
+        // protection semantics onto one value).
+        bool all_distinct{ true };
+        for (std::size_t i{ 0 }; i < std::size(ord); ++i)
+        {
+            for (std::size_t j{ i + 1 }; j < std::size(ord); ++j)
+            {
+                if (ord[i] == ord[j]) { all_distinct = false; }
+            }
+        }
+        check("memory_protection_ordinals_all_distinct", all_distinct);
+        // The max ordinal is exactly 4 (execute_rw); anchors "exactly five".
+        check("memory_protection_max_ordinal_is_4",
+              static_cast<std::uint32_t>(mp::execute_rw) == 4);
+        // execute_read and execute_rw are the only two with the "execute" bit
+        // of meaning — they are the two highest ordinals and strictly above the
+        // non-executable trio.
+        check("memory_protection_execute_variants_are_highest",
+              static_cast<std::uint32_t>(mp::execute_read) > static_cast<std::uint32_t>(mp::read_write)
+              && static_cast<std::uint32_t>(mp::execute_rw) > static_cast<std::uint32_t>(mp::execute_read));
+    }
 
     // region_info default-constructs to an all-empty/unset region (the scan
     // allocator depends on these defaults).
@@ -299,6 +379,85 @@ int main()
             if ((v & (std::uint64_t{ 1 } << (slot * 2 + 1))) != 0) { no_global_enable = false; }
         }
         check("build_dr7_never_sets_global_enable", no_global_enable);
+
+        // -- The remaining enum ordinals (vmhook.hpp:1004-1019). --------------
+        // data_breakpoint_kind underlying type is uint8_t; only write(0b01) and
+        // read_write(0b11) exist — both have bit 0 set (the "enabled R/W" low
+        // bit), and execute (0b00) is deliberately absent (DR can't trap exec
+        // via the data-watch path).
+        check("dr_kind_underlying_is_uint8",
+              std::is_same_v<std::underlying_type_t<data_breakpoint_kind>, std::uint8_t>);
+        check("dr_kind_write_and_read_write_distinct",
+              static_cast<std::uint8_t>(data_breakpoint_kind::write)
+                  != static_cast<std::uint8_t>(data_breakpoint_kind::read_write));
+        check("dr_kind_values_have_low_bit_set",
+              (static_cast<std::uint8_t>(data_breakpoint_kind::write) & 0b01u) != 0
+              && (static_cast<std::uint8_t>(data_breakpoint_kind::read_write) & 0b01u) != 0);
+
+        // data_breakpoint_length: the Intel-SDM LEN encoding is NOT in numeric
+        // byte order — one_byte=0b00, two_bytes=0b01, eight_bytes=0b10,
+        // four_bytes=0b11.  Pin the two the existing suite omits (two_bytes,
+        // four_bytes) and that all four are distinct 2-bit codes.
+        check("dr_length_two_bytes_is_0b01",
+              static_cast<std::uint8_t>(data_breakpoint_length::two_bytes) == 0b01);
+        check("dr_length_four_bytes_is_0b11",
+              static_cast<std::uint8_t>(data_breakpoint_length::four_bytes) == 0b11);
+        check("dr_length_underlying_is_uint8",
+              std::is_same_v<std::underlying_type_t<data_breakpoint_length>, std::uint8_t>);
+        {
+            const std::uint8_t lens[]{
+                static_cast<std::uint8_t>(data_breakpoint_length::one_byte),
+                static_cast<std::uint8_t>(data_breakpoint_length::two_bytes),
+                static_cast<std::uint8_t>(data_breakpoint_length::eight_bytes),
+                static_cast<std::uint8_t>(data_breakpoint_length::four_bytes),
+            };
+            bool all_two_bit_and_distinct{ true };
+            for (std::size_t i{ 0 }; i < std::size(lens); ++i)
+            {
+                if ((lens[i] & ~0b11u) != 0) { all_two_bit_and_distinct = false; }
+                for (std::size_t j{ i + 1 }; j < std::size(lens); ++j)
+                {
+                    if (lens[i] == lens[j]) { all_two_bit_and_distinct = false; }
+                }
+            }
+            check("dr_length_all_codes_two_bit_and_distinct", all_two_bit_and_distinct);
+        }
+
+        // -- build_dr7 exhaustive field placement across all 4 slots. ---------
+        // For every slot the R/W field sits at bit (16 + 4*slot) and the LEN
+        // field at bit (18 + 4*slot); verify the raw enum codes land exactly
+        // there for a read_write/two_bytes watch, and that the only L-enable bit
+        // set is the slot's own (bit 2*slot).
+        {
+            bool fields_placed_ok{ true };
+            for (int slot{ 0 }; slot < 4; ++slot)
+            {
+                const std::uint64_t v{ vmhook::os::detail_dr::build_dr7(
+                    slot, data_breakpoint_kind::read_write,
+                    data_breakpoint_length::two_bytes) };
+                const std::uint64_t rw_field{ (v >> (16 + 4 * slot)) & 0b11u };
+                const std::uint64_t len_field{ (v >> (18 + 4 * slot)) & 0b11u };
+                if (rw_field != 0b11u) { fields_placed_ok = false; }    // read_write
+                if (len_field != 0b01u) { fields_placed_ok = false; }   // two_bytes
+                // Exactly one L-enable bit (the slot's own) among bits 0,2,4,6.
+                const std::uint64_t l_enable_bits{ v & 0b01010101u };
+                if (l_enable_bits != (std::uint64_t{ 1 } << (slot * 2))) { fields_placed_ok = false; }
+            }
+            check("build_dr7_rw_len_fields_placed_per_slot", fields_placed_ok);
+        }
+
+        // Two distinct slots produce distinct DR7 words (different L-enable
+        // bit), and the same (slot, kind, length) is deterministic.
+        check("build_dr7_distinct_slots_distinct_words",
+              vmhook::os::detail_dr::build_dr7(0, data_breakpoint_kind::write,
+                                               data_breakpoint_length::one_byte)
+                  != vmhook::os::detail_dr::build_dr7(1, data_breakpoint_kind::write,
+                                                      data_breakpoint_length::one_byte));
+        check("build_dr7_is_deterministic",
+              vmhook::os::detail_dr::build_dr7(2, data_breakpoint_kind::read_write,
+                                               data_breakpoint_length::four_bytes)
+                  == vmhook::os::detail_dr::build_dr7(2, data_breakpoint_kind::read_write,
+                                                      data_breakpoint_length::four_bytes));
     }
 #else
     // Symbol vmhook::os::detail_dr::build_dr7 / data_breakpoint_* are not
