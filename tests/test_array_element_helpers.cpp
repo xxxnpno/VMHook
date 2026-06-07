@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1107,6 +1108,87 @@ static auto test_length_reads_only_offset12() -> void
     }
 }
 
+// ---------------------------------------------------------------------------
+// 21. clamp_safe_container_count — the defensive count clamp shared by every
+//     reader that derives an element count from a live oop (array_length() or a
+//     Java size / size() field).  Pure arithmetic, no oop needed: it maps a raw
+//     (possibly negative or absurdly large) int32 to [0, k_max_safe_container_elems]
+//     and is used for BOTH the pre-reservation and the read-loop bound so a
+//     corrupted count degrades to a bounded, non-terminating partial read while
+//     an honest count (raw <= cap) passes through byte-identically.
+//
+// We assert the boundary behaviour both at runtime AND in a constexpr context
+// (the helper is constexpr, so a wrong constant-folded result is a compile error).
+// ---------------------------------------------------------------------------
+static auto test_clamp_safe_container_count() -> void
+{
+    constexpr std::int32_t cap{ static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) };
+
+    // The cap must be the documented 16,777,216 (1<<24): large enough to never
+    // truncate a realistic introspected container, small enough that
+    // cap * sizeof(largest reserved element) cannot plausibly bad_alloc.
+    check("clamp_cap_is_1_shl_24", vmhook::k_max_safe_container_elems == (1ull << 24));
+    check("clamp_cap_value_16777216", vmhook::k_max_safe_container_elems == 16777216ull);
+
+    // The cap fits int32 with room to spare (the helper returns int32; its own
+    // static_assert guarantees this, but assert it here too for documentation).
+    check("clamp_cap_fits_int32",
+          vmhook::k_max_safe_container_elems
+              <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()));
+
+    // cap * the widest element this header ever reserves (a std::pair of two
+    // unique_ptrs == 16 bytes on x64) stays well under any allocator's hard
+    // ceiling, so the post-clamp reserve cannot throw length_error.
+    check("clamp_cap_times_16_no_overflow",
+          vmhook::k_max_safe_container_elems
+              < (std::numeric_limits<std::size_t>::max() / 16u));
+
+    // Negatives (a torn / sign-flipped _length read) collapse to 0.
+    check("clamp_intmin_is_0",
+          vmhook::clamp_safe_container_count(std::numeric_limits<std::int32_t>::min()) == 0);
+    check("clamp_neg_one_is_0", vmhook::clamp_safe_container_count(-1) == 0);
+    check("clamp_neg_large_is_0", vmhook::clamp_safe_container_count(-123456789) == 0);
+
+    // Zero stays zero (empty container -> empty vector, no reserve, no loop).
+    check("clamp_zero_is_0", vmhook::clamp_safe_container_count(0) == 0);
+
+    // In-range values pass through UNCHANGED — the honest-container guarantee.
+    check("clamp_one_is_1", vmhook::clamp_safe_container_count(1) == 1);
+    check("clamp_small_passthrough", vmhook::clamp_safe_container_count(5000) == 5000);
+    check("clamp_below_cap_passthrough", vmhook::clamp_safe_container_count(cap - 1) == cap - 1);
+
+    // At and above the cap, the result saturates to exactly the cap.
+    check("clamp_at_cap_is_cap", vmhook::clamp_safe_container_count(cap) == cap);
+    check("clamp_above_cap_is_cap", vmhook::clamp_safe_container_count(cap + 1) == cap);
+    check("clamp_intmax_is_cap",
+          vmhook::clamp_safe_container_count(std::numeric_limits<std::int32_t>::max()) == cap);
+
+    // The result is ALWAYS a valid, non-negative reservation/loop bound.
+    bool all_in_range{ true };
+    for (const std::int32_t raw : { std::numeric_limits<std::int32_t>::min(), -7, -1, 0,
+                                    1, 63, 5000, cap - 1, cap, cap + 1,
+                                    std::numeric_limits<std::int32_t>::max() })
+    {
+        const std::int32_t got{ vmhook::clamp_safe_container_count(raw) };
+        if (got < 0 || got > cap) { all_in_range = false; break; }
+    }
+    check("clamp_result_always_in_0_cap", all_in_range);
+
+    // constexpr usability: the helper folds at compile time, so these are
+    // compile-time-checked clamps (a regression would fail to build).
+    static_assert(vmhook::clamp_safe_container_count(-1) == 0,
+                  "clamp(-1) must be 0 in constexpr context");
+    static_assert(vmhook::clamp_safe_container_count(0) == 0,
+                  "clamp(0) must be 0 in constexpr context");
+    static_assert(vmhook::clamp_safe_container_count(42) == 42,
+                  "clamp(42) must pass through in constexpr context");
+    static_assert(vmhook::clamp_safe_container_count(
+                      std::numeric_limits<std::int32_t>::max())
+                      == static_cast<std::int32_t>(vmhook::k_max_safe_container_elems),
+                  "clamp(INT_MAX) must saturate to the cap in constexpr context");
+    check("clamp_constexpr_static_asserts_compiled", true);
+}
+
 int main()
 {
     test_all_widths();
@@ -1129,6 +1211,7 @@ int main()
     test_mixed_width_aliasing();
     test_dense_nontrivial_indices();
     test_length_reads_only_offset12();
+    test_clamp_safe_container_count();
 
     if (failures == 0)
     {

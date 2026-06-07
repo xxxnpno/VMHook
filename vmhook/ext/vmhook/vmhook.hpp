@@ -12142,6 +12142,71 @@ namespace vmhook
     // --- Array element access -------------------------------------------------
 
     /*
+        @brief Defensive upper bound on any element count derived from a live oop.
+        @details
+        array_length() and the Java `size`/`size()` fields it sits beside read a
+        raw int32 straight out of heap memory.  For a stale / GC-relocated /
+        partially-corrupted oop that slot can hold an arbitrary large positive
+        value.  Several readers below feed that value UNVALIDATED into both
+        `result.reserve(count)` and a `count`-iteration element loop:
+
+          * a `reserve()` of `count * sizeof(element)` can throw std::length_error
+            or std::bad_alloc — and several readers are `noexcept`, so the throw
+            would cross the noexcept boundary and call std::terminate, taking the
+            whole host JVM down (a HARD rule violation), and
+          * even when reserve succeeds the loop can spin billions of times,
+            reading far past the real allocation (a hang / massive over-read).
+
+        Clamping every oop-derived count to `min(count, k_max_safe_container_elems)`
+        (and treating <0 as 0) before BOTH the reserve and the loop fixes both:
+        the reserve can never throw (16M * the largest element this header
+        reserves — a unique_ptr / pair / char — stays a few hundred MB at most,
+        which standard allocators satisfy or fail gracefully WITHOUT length_error)
+        and the loop is bounded.  16,777,216 is far above any realistic
+        introspected container, so an honest container of N <= cap elements reads
+        EXACTLY as before — only a degenerate/corrupted count is ever truncated.
+
+        NOTE: this cap is deliberately NOT applied inside array_length() itself,
+        because array_length() is also the bounds oracle for get/set_array_element
+        (a valid array genuinely longer than the cap must still report its true
+        length so high-but-valid indices are not wrongly rejected).  The clamp
+        lives at each count-driven reserve/iteration site instead.
+    */
+    inline constexpr std::size_t k_max_safe_container_elems{ 1ull << 24 };
+
+    /*
+        @brief Clamps a raw, possibly-corrupt oop-derived element count to a safe
+               iteration/reservation bound.
+        @param raw  A length/size read straight from heap memory (may be negative
+                    or absurdly large under a stale/corrupted oop).
+        @return  raw clamped to [0, k_max_safe_container_elems].
+        @details
+        Negative counts (e.g. a torn read of the _length slot) collapse to 0;
+        counts above the cap are truncated to the cap.  The result is the count
+        used for BOTH the pre-reservation (`reserve(static_cast<std::size_t>(...))`,
+        unchanged in form) AND the read-loop bound (`for (int32_t i; i < safe; ++i)`)
+        at every reader fed by such a count, so a single honest call site
+        (raw <= cap) reads byte-identically while a corrupt one degrades to a
+        bounded, non-terminating partial read.  The return type is std::int32_t so
+        existing int32 loop counters and the existing reserve cast are reused
+        verbatim; the cap (1<<24) fits int32 with room to spare, so the clamp
+        itself can never overflow.
+    */
+    inline constexpr auto clamp_safe_container_count(const std::int32_t raw) noexcept
+        -> std::int32_t
+    {
+        if (raw <= 0)
+        {
+            return 0;
+        }
+        static_assert(vmhook::k_max_safe_container_elems
+                          <= static_cast<std::size_t>((std::numeric_limits<std::int32_t>::max)()),
+                      "k_max_safe_container_elems must fit in std::int32_t so the clamp cannot overflow.");
+        constexpr std::int32_t cap{ static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) };
+        return (raw < cap) ? raw : cap;
+    }
+
+    /*
         @brief Reads the length of a Java primitive array.
         @param array_oop Decoded pointer to the Java array object (not compressed).
         @return Element count, or 0 if the pointer is invalid.
@@ -12381,8 +12446,15 @@ namespace vmhook
                     return result;
                 }
 
-                result.reserve(static_cast<std::size_t>(length));
-                for (std::int32_t index{ 0 }; index < length; ++index)
+                // length is read straight from the array header (+12) and is
+                // UNVALIDATED: a stale/corrupted array_oop can report an absurd
+                // count.  This function is noexcept, so an uncapped reserve that
+                // threw length_error/bad_alloc would std::terminate the host JVM.
+                // Clamp to a generous safe bound for BOTH the reserve and the
+                // loop; an honest array (length <= cap) is unaffected.
+                const std::int32_t safe_length{ vmhook::clamp_safe_container_count(length) };
+                result.reserve(static_cast<std::size_t>(safe_length));
+                for (std::int32_t index{ 0 }; index < safe_length; ++index)
                 {
                     append_array_value(result, array_oop, index, signature);
                 }
@@ -15506,8 +15578,15 @@ namespace vmhook
                 void* const array_oop{ vmhook::decode_array_oop(compressed_array) };
                 if (array_oop && vmhook::hotspot::is_valid_pointer(array_oop))
                 {
-                    result.reserve(static_cast<std::size_t>(n));
-                    for (std::int32_t index{ 0 }; index < n; ++index)
+                    // n is the Java `size` field read from heap memory; a
+                    // stale/corrupted list oop can report an absurd value, so
+                    // clamp it for BOTH the reserve and the loop (the per-element
+                    // get_array_element read is already bounds-clamped, but the
+                    // loop COUNT and the reserve are not).  Honest lists (n <= cap)
+                    // are unaffected.
+                    const std::int32_t safe_n{ vmhook::clamp_safe_container_count(n) };
+                    result.reserve(static_cast<std::size_t>(safe_n));
+                    for (std::int32_t index{ 0 }; index < safe_n; ++index)
                     {
                         const std::uint32_t compressed_element{ vmhook::get_array_element<std::uint32_t>(array_oop, index) };
                         void* const element_oop{ vmhook::hotspot::decode_oop_pointer(compressed_element) };
@@ -15575,8 +15654,13 @@ namespace vmhook
                 return result;
             }
 
-            result.reserve(static_cast<std::size_t>(n));
-            for (std::int32_t index{ 0 }; index < n; ++index)
+            // n is the collection's live size(); clamp it so a corrupt/absurd
+            // size cannot make this reserve over-allocate or the loop call the
+            // Java get(int) gate billions of times.  Honest lists (n <= cap) read
+            // exactly as before.
+            const std::int32_t safe_n{ vmhook::clamp_safe_container_count(n) };
+            result.reserve(static_cast<std::size_t>(safe_n));
+            for (std::int32_t index{ 0 }; index < safe_n; ++index)
             {
                 const auto element_value{ get_method_opt->call<std::uint32_t>(index) };
                 void* const element_oop{ vmhook::hotspot::decode_oop_pointer(element_value) };
@@ -15819,9 +15903,14 @@ namespace vmhook
                 reinterpret_cast<const std::uint8_t*>(list_oop) + first_entry->offset) };
         void* node_oop{ vmhook::hotspot::decode_oop_pointer(first_compressed) };
 
-        out.reserve(static_cast<std::size_t>(size));
+        // `size` is the caller's Java `size` field — clamp it so a corrupt/absurd
+        // value cannot make the reserve over-allocate (the chain guards below
+        // already stop the walk at the real end of the list, so honest lists are
+        // unaffected: a real list of <= cap nodes reserves and walks identically).
+        const std::int32_t safe_size{ vmhook::clamp_safe_container_count(size) };
+        out.reserve(static_cast<std::size_t>(safe_size));
         for (std::int32_t i{ 0 };
-             i < size && node_oop && vmhook::hotspot::is_valid_pointer(node_oop);
+             i < safe_size && node_oop && vmhook::hotspot::is_valid_pointer(node_oop);
              ++i)
         {
             vmhook::hotspot::klass* const node_klass{ vmhook::klass_from_oop(node_oop) };
@@ -15890,7 +15979,12 @@ namespace vmhook
             return;
         }
 
-        const std::int32_t bucket_count{ vmhook::array_length(table_oop) };
+        // bucket_count is array_length(table_oop), read from the table's header
+        // (+12).  A stale/corrupted table oop can report an absurd capacity, so
+        // clamp the OUTER bucket loop (the inner per-bucket chain is already
+        // guarded below).  A real HashMap table (power-of-two capacity <= cap)
+        // walks identically.
+        const std::int32_t bucket_count{ vmhook::clamp_safe_container_count(vmhook::array_length(table_oop)) };
         for (std::int32_t bucket{ 0 }; bucket < bucket_count; ++bucket)
         {
             const std::uint32_t head_compressed{
@@ -15976,7 +16070,11 @@ namespace vmhook
             return;
         }
 
-        const std::int32_t bucket_count{ vmhook::array_length(table_oop) };
+        // bucket_count is array_length(table_oop); clamp the OUTER bucket loop so
+        // a corrupt table capacity cannot spin it billions of times (the inner
+        // per-bucket chain is already guarded below).  A real HashMap table walks
+        // identically.
+        const std::int32_t bucket_count{ vmhook::clamp_safe_container_count(vmhook::array_length(table_oop)) };
         for (std::int32_t bucket{ 0 }; bucket < bucket_count; ++bucket)
         {
             const std::uint32_t head_compressed{
@@ -16278,7 +16376,11 @@ namespace vmhook
             && (this->signature[1] == 'L' || this->signature[1] == '['))
         {
             std::vector<std::unique_ptr<element_type>> result;
-            const std::int32_t n{ vmhook::array_length(collection_oop) };
+            // n is array_length() of the backing Object[] header; clamp it for
+            // BOTH the reserve and the loop so a stale/corrupted array oop cannot
+            // over-allocate or over-read (the per-element get_array_element is
+            // already bounds-clamped).  An honest array (n <= cap) is unaffected.
+            const std::int32_t n{ vmhook::clamp_safe_container_count(vmhook::array_length(collection_oop)) };
             if (n > 0)
             {
                 result.reserve(static_cast<std::size_t>(n));
