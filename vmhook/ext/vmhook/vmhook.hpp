@@ -2712,7 +2712,13 @@ namespace vmhook
                     return nullptr;
                 }
 
-                vmhook::hotspot::klass* const next{ *reinterpret_cast<vmhook::hotspot::klass**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::klass*>(this)) + entry->offset) };
+                // safe_read_pointer (kernel-validated), not a raw deref: is_valid_pointer(this)
+                // doesn't prove the _next_link field at this+offset is mapped.  A full
+                // class-graph traversal (a not-found-name lookup walking the whole _klasses
+                // chain) on a freshly-started JVM can reach a link whose field lies on an
+                // unmapped page; safe_read_pointer returns null there instead of reading
+                // unmapped memory.  Matches klass::get_name's safe read of _name.
+                vmhook::hotspot::klass* const next{ reinterpret_cast<vmhook::hotspot::klass*>(const_cast<void*>(vmhook::hotspot::safe_read_pointer(reinterpret_cast<const std::uint8_t*>(this) + entry->offset))) };
 
                 return vmhook::hotspot::is_valid_pointer(next) ? next : nullptr;
             }
@@ -3241,7 +3247,15 @@ namespace vmhook
                     }
 
                     // _klasses is a Klass* (full 8-byte native pointer), not a compressed OOP.
-                    vmhook::hotspot::klass* const result{ *reinterpret_cast<vmhook::hotspot::klass**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::class_loader_data*>(this)) + entry->offset) };
+                    // Read it through safe_read_pointer (kernel-validated) rather than a
+                    // raw deref: is_valid_pointer(this) only proves `this` is in range/
+                    // aligned, not that the _klasses field at this+offset is mapped.  On a
+                    // freshly-started JVM the metadata graph can be sparsely mapped, so a
+                    // full-traversal lookup (a not-found name walking every node) can reach
+                    // a node whose field lies on an unmapped page; safe_read_pointer returns
+                    // null there instead of reading unmapped memory.  Matches get_next /
+                    // get_dictionary, which already read their pointer fields this way.
+                    vmhook::hotspot::klass* const result{ reinterpret_cast<vmhook::hotspot::klass*>(const_cast<void*>(vmhook::hotspot::safe_read_pointer(reinterpret_cast<const std::uint8_t*>(this) + entry->offset))) };
 
                     return vmhook::hotspot::is_valid_pointer(result) ? result : nullptr;
                 }
@@ -3398,7 +3412,17 @@ namespace vmhook
                 -> std::int32_t
             {
                 // _table_size is the first field of BasicHashtable at offset 0.
-                return *reinterpret_cast<const std::int32_t*>(this);
+                // Read it through the kernel-validated path: on a freshly-started JVM a
+                // CLD's _dictionary can be in range/aligned (passing is_valid_pointer)
+                // yet have its header on a not-yet-mapped page, and a full class-graph
+                // traversal (a not-found-name lookup checking every CLD's dictionary)
+                // would otherwise read unmapped memory.  0 makes find_klass skip it.
+                std::int32_t table_size{ 0 };
+                if (!vmhook::os::safe_read(&table_size, this, sizeof(table_size)))
+                {
+                    return 0;
+                }
+                return table_size;
             }
 
             /*
@@ -3412,7 +3436,10 @@ namespace vmhook
                 -> const std::uint8_t*
             {
                 // +8 bytes = sizeof(int32_t _table_size) + 4 bytes alignment padding.
-                return *reinterpret_cast<const std::uint8_t* const*>(reinterpret_cast<const std::uint8_t*>(this) + 8);
+                // safe_read_pointer (kernel-validated), not a raw deref — see
+                // get_table_size: the dict header may be on an unmapped page on a cold
+                // JVM during a full-graph not-found traversal.  null makes find_klass skip.
+                return reinterpret_cast<const std::uint8_t*>(const_cast<void*>(vmhook::hotspot::safe_read_pointer(reinterpret_cast<const std::uint8_t*>(this) + 8)));
             }
 
             /*
