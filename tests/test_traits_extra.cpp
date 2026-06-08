@@ -78,6 +78,85 @@ namespace
     template<typename T>
     struct has_vector_value_t<T, std::void_t<typename vmhook::detail::is_vector<T>::value_type_t>>
         : std::true_type {};
+
+    // SFINAE probe: does function_traits<F>::args_tuple_t resolve to a member
+    // type for F?  function_traits' primary template (vmhook.hpp:7482-7483) is
+    // declared but left UNDEFINED, so for any callable shape the five
+    // specialisations do not match, args_tuple_t is absent and this is false.
+    // Used to pin exactly which callable shapes the trait accepts vs rejects.
+    //
+    // IMPORTANT detectability boundary: this probe is only well-formed for
+    // shapes whose `operator()` either (a) yields a plain, non-overloaded,
+    // non-template member-pointer the functor spec at 7498 forwards to, or
+    // (b) has NO single addressable `operator()` (generic / overloaded /
+    // templated call operator), in which case the 7498 spec's void_t
+    // substitution fails and F cleanly falls through to the undefined primary
+    // -> args_tuple_t absent -> detector reports false.  A functor whose
+    // operator() is present-and-addressable but carries a qualifier the
+    // member-pointer specs do NOT cover (noexcept / & / && / volatile / C
+    // varargs) is a HARD COMPILE ERROR, NOT a detectable absence: 7498 IS
+    // selected, its base function_traits<member-ptr> is the undefined primary,
+    // and reading args_tuple_t off it is a non-SFINAE error.  Such shapes are
+    // therefore documented below as build-breaking and are deliberately NOT
+    // fed to this detector (doing so would fail to compile the whole TU).
+    template<typename F, typename = void>
+    struct has_args_tuple : std::false_type {};
+    template<typename F>
+    struct has_args_tuple<F, std::void_t<typename vmhook::detail::function_traits<F>::args_tuple_t>>
+        : std::true_type {};
+
+    // SFINAE probe: does tuple_tail<T>::type_t exist?  tuple_tail's primary
+    // (vmhook.hpp:7524-7525) is undefined; only the <first, rest...> spec
+    // (7527-7531) defines type_t.  An EMPTY std::tuple<> therefore has NO
+    // type_t today (library flaw #1) and this reports false for it; the moment
+    // an empty-tuple specialisation is added the assertion below flips and
+    // catches it.  Non-empty tuples report true.
+    template<typename T, typename = void>
+    struct has_tuple_tail : std::false_type {};
+    template<typename T>
+    struct has_tuple_tail<T, std::void_t<typename vmhook::detail::tuple_tail<T>::type_t>>
+        : std::true_type {};
+
+    // A representative second wrapper type, used to prove element-type identity
+    // is by-type (not by-position) through the decomposition chain.
+    struct other_wrapper : public vmhook::object<other_wrapper>
+    {
+        using vmhook::object<other_wrapper>::object;
+    };
+
+    // Free function whose operator-less plain pointer the trait DOES accept;
+    // a wide-arg shape so java_slot_offsets has J/D widening to chew on.
+    void free_detour_wide(vmhook::return_value&,
+                          std::unique_ptr<sample_wrapper>,
+                          std::int64_t,
+                          std::int32_t,
+                          double) {}
+
+    // A non-capturing, non-mutable lambda is a const-operator() functor; an
+    // explicit struct lets us name the const / non-const specialisations
+    // directly (no closure type involved).
+    struct const_call_functor
+    {
+        void operator()(vmhook::return_value&, std::int32_t, std::int64_t) const {}
+    };
+    struct nonconst_call_functor
+    {
+        void operator()(vmhook::return_value&, std::int32_t, std::int64_t) {}
+    };
+
+    // Shapes the trait CLEANLY rejects (args_tuple_t absent, detector-safe):
+    //  - overloaded operator()  -> &F::operator() ambiguous, 7498 dropped
+    //  - templated operator()   -> &F::operator() ill-formed, 7498 dropped
+    struct overloaded_call_functor
+    {
+        void operator()(vmhook::return_value&, std::int32_t) const {}
+        void operator()(vmhook::return_value&, double) const {}
+    };
+    struct templated_call_functor
+    {
+        template<typename T>
+        void operator()(vmhook::return_value&, T) const {}
+    };
 }
 
 int main()
@@ -534,6 +613,392 @@ int main()
                       std::tuple<std::int64_t, std::int64_t, std::int32_t>>::value
                       == std::array<std::int32_t, 3>{ 0, 2, 4 },
                   "two leading longs must push the trailing int to slot 4");
+
+    // =========================================================================
+    // WAVE: exhaustive callable-shape coverage for function_traits.
+    //
+    // hook<T>() deduces the Java parameter list by instantiating
+    //   function_traits<remove_cvref_t<Detour>>::args_tuple_t   (vmhook.hpp:8211-8212)
+    // then tuple_tail to drop the leading vmhook::return_value&.  The five
+    // function_traits specialisations (vmhook.hpp:7485-7513) are the ENTIRE set
+    // of callable shapes the typed hook path accepts.  This block walks every
+    // shape — accepted, cleanly-rejected, and (documented) build-breaking — so
+    // the contract is pinned for all three CI STLs.  Pure type algebra: no JVM,
+    // no interpreter frame, every fact is constexpr / static_assert-checkable.
+    //
+    // NOTE on the trait's surface: function_traits exposes ONLY args_tuple_t.
+    // There is deliberately NO return_type_t / result_type member (verified
+    // against the header), so these tests assert the argument decomposition
+    // only — the return type a detour declares is never read by this chain
+    // (the detour's return is delivered separately via vmhook::return_value).
+    // =========================================================================
+
+    // --- Accepted shapes: args_tuple_t present -------------------------------
+    check("has_args_tuple_free_function_pointer",
+          has_args_tuple<decltype(&free_detour)>::value);
+    check("has_args_tuple_std_function",
+          has_args_tuple<std::function<void(vmhook::return_value&, std::int32_t)>>::value);
+    check("has_args_tuple_const_call_functor",
+          has_args_tuple<const_call_functor>::value);
+    check("has_args_tuple_nonconst_call_functor",
+          has_args_tuple<nonconst_call_functor>::value);
+    {
+        auto plain_lambda = [](vmhook::return_value&, std::int32_t) {};
+        auto mutable_lambda = [x = 0](vmhook::return_value&, std::int32_t) mutable { ++x; };
+        check("has_args_tuple_plain_lambda",
+              has_args_tuple<decltype(plain_lambda)>::value);
+        check("has_args_tuple_mutable_lambda",
+              has_args_tuple<decltype(mutable_lambda)>::value);
+    }
+
+    // --- Cleanly-rejected shapes: args_tuple_t ABSENT (detector-safe) --------
+    // A free-function POINTER is accepted, but a bare free-function TYPE
+    // (R(args...), no pointer) matches none of the five specialisations.
+    check("has_args_tuple_absent_for_free_function_type",
+          !has_args_tuple<void(vmhook::return_value&, std::int32_t)>::value);
+    // A NOEXCEPT free-function pointer has a distinct type with no matching
+    // specialisation (there is no R(*)(args...) noexcept spec) -> absent.
+    // This is the detectable face of library flaw #4 (noexcept gap).
+    check("has_args_tuple_absent_for_noexcept_free_function_pointer",
+          !has_args_tuple<void(*)(vmhook::return_value&, std::int32_t) noexcept>::value);
+    // Overloaded / templated / generic operator() leave &F::operator()
+    // ambiguous or ill-formed, so the functor spec (7498) is dropped and F
+    // falls through to the undefined primary -> args_tuple_t absent.  This is
+    // the "single concrete operator() required" contract (library flaw #3).
+    check("has_args_tuple_absent_for_overloaded_operator",
+          !has_args_tuple<overloaded_call_functor>::value);
+    check("has_args_tuple_absent_for_templated_operator",
+          !has_args_tuple<templated_call_functor>::value);
+    {
+        auto generic_lambda = [](vmhook::return_value&, auto) {};
+        check("has_args_tuple_absent_for_generic_lambda",
+              !has_args_tuple<decltype(generic_lambda)>::value);
+    }
+    // A plain non-callable type obviously has no args_tuple_t.
+    check("has_args_tuple_absent_for_int",
+          !has_args_tuple<int>::value);
+    check("has_args_tuple_absent_for_unique_ptr",
+          !has_args_tuple<std::unique_ptr<sample_wrapper>>::value);
+
+    // --- args_tuple_t arity / element types across shapes --------------------
+    // Zero Java args beyond the leading return_value& on every accepted shape.
+    {
+        auto rv_only = [](vmhook::return_value&) {};
+        check("full_arity_1_for_return_value_only_lambda",
+              std::tuple_size_v<all_args_of<decltype(rv_only)>> == 1);
+        check("full_first_arg_is_return_value_ref_rv_only",
+              std::is_same_v<std::tuple_element_t<0, all_args_of<decltype(rv_only)>>,
+                             vmhook::return_value&>);
+    }
+    // const_call_functor: (return_value&, int, long) -> full arity 3.
+    check("const_call_functor_full_arity_3",
+          std::tuple_size_v<all_args_of<const_call_functor>> == 3);
+    check("const_call_functor_method_args_int_long",
+          std::is_same_v<method_args_of<const_call_functor>,
+                         std::tuple<std::int32_t, std::int64_t>>);
+    // non-const operator() decomposes identically to the const one.
+    check("nonconst_call_functor_matches_const",
+          std::is_same_v<method_args_of<nonconst_call_functor>,
+                         method_args_of<const_call_functor>>);
+    // A pointer-to-free-function with five params strips to four method args.
+    check("free_detour_wide_method_arity_4",
+          std::tuple_size_v<method_args_of<decltype(&free_detour_wide)>> == 4);
+    check("free_detour_wide_method_args_exact",
+          std::is_same_v<method_args_of<decltype(&free_detour_wide)>,
+                         std::tuple<std::unique_ptr<sample_wrapper>, std::int64_t,
+                                    std::int32_t, double>>);
+
+    // --- All accepted shapes converge on ONE method tuple --------------------
+    // The four spellings of the SAME logical detour (lambda, std::function,
+    // free-fn pointer, explicit functor) must yield byte-identical method
+    // tuples — this is the property hook<T>() relies on to be call-syntax
+    // agnostic.  Signature: (return_value&, self, int, long).
+    {
+        using expected = std::tuple<std::unique_ptr<sample_wrapper>, std::int32_t, std::int64_t>;
+        auto lam = [](vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                      std::int32_t, std::int64_t) {};
+        using fn_t = std::function<void(vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                                        std::int32_t, std::int64_t)>;
+        struct functor
+        {
+            void operator()(vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                            std::int32_t, std::int64_t) const {}
+        };
+        check("convergence_lambda_method_tuple",
+              std::is_same_v<method_args_of<decltype(lam)>, expected>);
+        check("convergence_std_function_method_tuple",
+              std::is_same_v<method_args_of<fn_t>, expected>);
+        check("convergence_functor_method_tuple",
+              std::is_same_v<method_args_of<functor>, expected>);
+        check("convergence_all_four_shapes_identical",
+              std::is_same_v<method_args_of<decltype(lam)>, method_args_of<fn_t>>
+              && std::is_same_v<method_args_of<fn_t>, method_args_of<functor>>);
+    }
+
+    // --- cv / ref parameter spelling (library flaw #2 contract) --------------
+    // function_traits preserves each argument's cv/ref qualifiers VERBATIM in
+    // args_tuple_t: a by-value param and a const-ref param are DIFFERENT tuple
+    // element types and therefore different method tuples.  Downstream this is
+    // papered over because is_java_double_slot_v (remove_cvref internally) and
+    // extract_frame_arg (returns remove_cvref_t) both normalise — so the two
+    // spellings still read the same slots and yield the same C++ value type.
+    // These checks pin BOTH halves of that contract.
+    {
+        auto by_val = [](vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                         std::int32_t, std::string) {};
+        auto by_ref = [](vmhook::return_value&, const std::unique_ptr<sample_wrapper>&,
+                         const std::int32_t&, const std::string&) {};
+        using mv = method_args_of<decltype(by_val)>;
+        using mr = method_args_of<decltype(by_ref)>;
+        // (a) the trait preserves spelling: the element types differ exactly.
+        check("cvref_by_value_element0_is_plain_unique_ptr",
+              std::is_same_v<std::tuple_element_t<0, mv>, std::unique_ptr<sample_wrapper>>);
+        check("cvref_by_ref_element0_is_const_ref_unique_ptr",
+              std::is_same_v<std::tuple_element_t<0, mr>, const std::unique_ptr<sample_wrapper>&>);
+        check("cvref_by_ref_element1_is_const_ref_int",
+              std::is_same_v<std::tuple_element_t<1, mr>, const std::int32_t&>);
+        check("cvref_by_ref_element2_is_const_ref_string",
+              std::is_same_v<std::tuple_element_t<2, mr>, const std::string&>);
+        check("cvref_value_and_ref_method_tuples_differ",
+              !std::is_same_v<mv, mr>);
+        // (b) is_java_double_slot_v collapses cv/ref, so the slot offset table
+        //     is IDENTICAL for both spellings (here all single-slot -> identity).
+        check("cvref_slot_offsets_identical_for_both_spellings",
+              vmhook::detail::java_slot_offsets<mv>::value
+              == vmhook::detail::java_slot_offsets<mr>::value);
+        // (c) extract_frame_arg's return type strips cv/ref to the bare value
+        //     type, so const-ref and by-value params decode to the same C++ type.
+        //     (Type-level only: extract_frame_arg is never invoked here.)
+        check("extract_frame_arg_collapses_const_ref_int_to_int",
+              std::is_same_v<
+                  decltype(vmhook::detail::extract_frame_arg<const std::int32_t&>(nullptr, 0)),
+                  std::int32_t>);
+        check("extract_frame_arg_collapses_const_ref_string_to_string",
+              std::is_same_v<
+                  decltype(vmhook::detail::extract_frame_arg<const std::string&>(nullptr, 0)),
+                  std::string>);
+        check("extract_frame_arg_collapses_const_ref_unique_ptr",
+              std::is_same_v<
+                  decltype(vmhook::detail::extract_frame_arg<const std::unique_ptr<sample_wrapper>&>(nullptr, 0)),
+                  std::unique_ptr<sample_wrapper>>);
+        check("extract_frame_arg_collapses_by_value_int_to_int",
+              std::is_same_v<
+                  decltype(vmhook::detail::extract_frame_arg<std::int32_t>(nullptr, 0)),
+                  std::int32_t>);
+    }
+    // cv/ref on a long/double param must NOT defeat the 2-slot widening:
+    // (self, const long&, int) still widens the trailing int to slot 3.
+    {
+        auto by_ref_long = [](vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                              const std::int64_t&, std::int32_t) {};
+        using m = method_args_of<decltype(by_ref_long)>;
+        check("cvref_const_ref_long_still_widens_two_slots",
+              (vmhook::detail::java_slot_offsets<m>::value
+               == std::array<std::int32_t, 3>{ 0, 1, 3 }));
+    }
+
+    // --- empty tuple_tail detectability (library flaw #1) --------------------
+    // tuple_tail<std::tuple<>> has NO type_t today (only the <first, rest...>
+    // spec exists).  Assert the member is ABSENT for the empty tuple but
+    // PRESENT for non-empty tuples.  When the empty-tuple specialisation is
+    // added this flips and the test below must be updated — pinning the fix.
+    check("tuple_tail_type_t_absent_for_empty_tuple_today",
+          !has_tuple_tail<std::tuple<>>::value);
+    check("tuple_tail_type_t_present_for_single_element",
+          has_tuple_tail<std::tuple<vmhook::return_value&>>::value);
+    check("tuple_tail_type_t_present_for_multi_element",
+          has_tuple_tail<std::tuple<vmhook::return_value&, int, double>>::value);
+    // The minimal SUPPORTED detour, (return_value&), decomposes through
+    // tuple_tail<tuple<return_value&>> -> empty tuple WITHOUT touching the
+    // undefined empty-tuple primary (the strip happens on a one-element tuple).
+    check("minimal_detour_tail_is_empty_and_well_formed",
+          has_tuple_tail<all_args_of<decltype([](vmhook::return_value&) {})>>::value
+          && std::tuple_size_v<method_args_of<decltype([](vmhook::return_value&) {})>> == 0);
+    // java_slot_offsets, by contrast, DOES define the empty-tuple case, so the
+    // empty method tuple flows all the way to a zero-length offset table.
+    check("empty_method_tuple_yields_empty_offset_table",
+          vmhook::detail::java_slot_offsets<
+              method_args_of<decltype([](vmhook::return_value&) {})>>::value.size() == 0);
+
+    // --- self-less (static-method) shape -------------------------------------
+    // A static Java method has no implicit `this`, so a detour for it omits the
+    // leading unique_ptr<self>: (return_value&, int, long, int).  The method
+    // tuple is exactly (int, long, int) with NO wrapper element, and widens the
+    // trailing int to slot 3 — proving the decomposition adds no implicit self.
+    {
+        auto static_detour = [](vmhook::return_value&, std::int32_t,
+                                std::int64_t, std::int32_t) {};
+        using m = method_args_of<decltype(static_detour)>;
+        check("static_shape_method_tuple_has_no_self_element",
+              std::is_same_v<m, std::tuple<std::int32_t, std::int64_t, std::int32_t>>);
+        check("static_shape_first_element_is_not_a_unique_ptr",
+              !vmhook::detail::is_unique_ptr_v<std::tuple_element_t<0, m>>);
+        check("static_shape_offsets_widen_trailing_int",
+              (vmhook::detail::java_slot_offsets<m>::value
+               == std::array<std::int32_t, 3>{ 0, 1, 3 }));
+    }
+
+    // --- many-arg fold past the small cases ----------------------------------
+    // Eight method args mixing every single-slot primitive: identity offsets,
+    // confirming java_slot_offsets::compute()'s fold accumulates correctly well
+    // past the 3-4 element cases asserted elsewhere.
+    {
+        auto wide = [](vmhook::return_value&, bool, std::int8_t, std::int16_t,
+                       char16_t, std::int32_t, float, void*, char) {};
+        using m = method_args_of<decltype(wide)>;
+        check("many_arg_single_slot_full_method_arity_8",
+              std::tuple_size_v<m> == 8);
+        check("many_arg_single_slot_identity_offsets",
+              (vmhook::detail::java_slot_offsets<m>::value
+               == std::array<std::int32_t, 8>{ 0, 1, 2, 3, 4, 5, 6, 7 }));
+    }
+    // Nine method args interleaving int and J/D types: the fold must thread the
+    // running +2 widening across the whole list.
+    {
+        using m = std::tuple<std::int32_t, std::int64_t, std::int32_t, double,
+                             std::int32_t, std::int64_t, std::int32_t, double, std::int32_t>;
+        check("nine_arg_jd_interleave_offsets",
+              (vmhook::detail::java_slot_offsets<m>::value
+               == std::array<std::int32_t, 9>{ 0, 1, 3, 4, 6, 7, 9, 10, 12 }));
+    }
+
+    // --- all-widths offset matrix --------------------------------------------
+    // Every single-slot primitive interleaved with both J/D types in one tuple:
+    // bool@0(+1), long@1(+2), char16@3(+1), double@4(+2), i8@6(+1), int@7.
+    check("all_widths_matrix_offsets",
+          (vmhook::detail::java_slot_offsets<
+               std::tuple<bool, std::int64_t, char16_t, double, std::int8_t, std::int32_t>>::value
+           == std::array<std::int32_t, 6>{ 0, 1, 3, 4, 6, 7 }));
+    // A tuple that BEGINS with a J/D: (long, int) -> 0, 2.
+    check("offsets_leading_jd_long_int",
+          (vmhook::detail::java_slot_offsets<std::tuple<std::int64_t, std::int32_t>>::value
+           == std::array<std::int32_t, 2>{ 0, 2 }));
+    // A tuple that ENDS with a J/D: (int, long) -> 0, 1 (the trailing long's
+    // second slot is consumed but never indexed, since nothing follows).
+    check("offsets_trailing_jd_int_long",
+          (vmhook::detail::java_slot_offsets<std::tuple<std::int32_t, std::int64_t>>::value
+           == std::array<std::int32_t, 2>{ 0, 1 }));
+    // A tuple that is ALL J/D: (long, double, uint64) -> 0, 2, 4.
+    check("offsets_all_jd_triple",
+          (vmhook::detail::java_slot_offsets<
+               std::tuple<std::int64_t, double, std::uint64_t>>::value
+           == std::array<std::int32_t, 3>{ 0, 2, 4 }));
+    // float is a SINGLE slot even though it sits beside doubles:
+    // (float, double, float) -> 0, 1, 3.
+    check("offsets_float_double_float_widens_only_double",
+          (vmhook::detail::java_slot_offsets<std::tuple<float, double, float>>::value
+           == std::array<std::int32_t, 3>{ 0, 1, 3 }));
+
+    // --- tuple_element_t round-trip (the exact hook<T> instantiation) --------
+    // hook<T>() reads each Java arg with
+    //   extract_frame_arg<std::tuple_element_t<k, method_arg_tuple_t>>(...)
+    // (vmhook.hpp:8316).  Assert that tuple_element_t<k, method_tuple> equals
+    // the declared k-th Java parameter type for every k, for a representative
+    // instance detour: (return_value&, self, int, long, double, string).
+    {
+        auto detour = [](vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                         std::int32_t, std::int64_t, double, std::string) {};
+        using m = method_args_of<decltype(detour)>;
+        check("tuple_element_roundtrip_arity_5",
+              std::tuple_size_v<m> == 5);
+        check("tuple_element_roundtrip_k0_self",
+              std::is_same_v<std::tuple_element_t<0, m>, std::unique_ptr<sample_wrapper>>);
+        check("tuple_element_roundtrip_k1_int",
+              std::is_same_v<std::tuple_element_t<1, m>, std::int32_t>);
+        check("tuple_element_roundtrip_k2_long",
+              std::is_same_v<std::tuple_element_t<2, m>, std::int64_t>);
+        check("tuple_element_roundtrip_k3_double",
+              std::is_same_v<std::tuple_element_t<3, m>, double>);
+        check("tuple_element_roundtrip_k4_string",
+              std::is_same_v<std::tuple_element_t<4, m>, std::string>);
+        // And the slot the k-th element is read from, end to end:
+        // self@0, int@1, long@2(+2), double@4(+2), string@6.
+        check("tuple_element_roundtrip_offsets",
+              (vmhook::detail::java_slot_offsets<m>::value
+               == std::array<std::int32_t, 5>{ 0, 1, 2, 4, 6 }));
+    }
+
+    // --- element-type identity is by TYPE, not position ----------------------
+    // Two different wrapper types in one detour must each survive as their own
+    // distinct unique_ptr element — proving tuple_tail/element extraction keys
+    // on the declared type, never collapsing wrappers together.
+    {
+        auto detour = [](vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                         std::unique_ptr<other_wrapper>) {};
+        using m = method_args_of<decltype(detour)>;
+        check("distinct_wrapper_elements_preserved",
+              std::is_same_v<m, std::tuple<std::unique_ptr<sample_wrapper>,
+                                           std::unique_ptr<other_wrapper>>>);
+        check("distinct_wrapper_elements_are_not_equal",
+              !std::is_same_v<std::tuple_element_t<0, m>, std::tuple_element_t<1, m>>);
+    }
+
+    // --- remove_cvref_t on the callable itself (hook<T> uses it) -------------
+    // hook<T>() applies remove_cvref_t to decltype(user_detour) before feeding
+    // function_traits (vmhook.hpp:8211).  A const / ref-qualified lambda value
+    // category therefore decomposes identically to the bare closure type.
+    {
+        auto lam = [](vmhook::return_value&, std::int32_t, std::int64_t) {};
+        using bare = std::remove_cvref_t<decltype(lam)>;
+        check("remove_cvref_callable_const_lvalue_matches_bare",
+              std::is_same_v<
+                  method_args_of<const decltype(lam)&>,
+                  method_args_of<bare>>);
+        check("remove_cvref_callable_rvalue_matches_bare",
+              std::is_same_v<
+                  method_args_of<decltype(lam)&&>,
+                  method_args_of<bare>>);
+    }
+
+    // --- tuple_tail direct edge cases ----------------------------------------
+    // Stripping a long single-element-after-first tuple keeps the remainder
+    // intact and ordered.
+    check("tuple_tail_keeps_long_remainder_ordered",
+          std::is_same_v<
+              typename vmhook::detail::tuple_tail<
+                  std::tuple<vmhook::return_value&, std::int64_t, double,
+                             std::int32_t, void*, std::string>>::type_t,
+              std::tuple<std::int64_t, double, std::int32_t, void*, std::string>>);
+    // tuple_tail does NOT inspect the first element's type — it drops whatever
+    // is first.  Here the first element is a plain int (not return_value&), and
+    // it is still the one removed.  This documents that the "must be
+    // return_value& first" property is a hook<T> authoring contract, NOT
+    // something tuple_tail enforces (library flaw #5).
+    check("tuple_tail_drops_first_regardless_of_type",
+          std::is_same_v<
+              typename vmhook::detail::tuple_tail<
+                  std::tuple<int, double, void*>>::type_t,
+              std::tuple<double, void*>>);
+
+    // --- compile-time enforcement (build breaks before runtime on regress) ---
+    static_assert(has_args_tuple<decltype(&free_detour)>::value,
+                  "function_traits must accept a free-function pointer detour");
+    static_assert(!has_args_tuple<void(vmhook::return_value&, std::int32_t)>::value,
+                  "function_traits must NOT match a bare function TYPE (only the pointer)");
+    static_assert(!has_args_tuple<overloaded_call_functor>::value,
+                  "function_traits requires a single non-overloaded operator() "
+                  "(overloaded call operator must decompose to absent args_tuple_t)");
+    static_assert(!has_args_tuple<templated_call_functor>::value,
+                  "function_traits requires a non-template operator() "
+                  "(templated/generic call operator must decompose to absent args_tuple_t)");
+    static_assert(!has_tuple_tail<std::tuple<>>::value,
+                  "tuple_tail<std::tuple<>> has no type_t today (flaw #1); update this "
+                  "assertion to the positive form when the empty-tuple spec is added");
+    static_assert(
+        std::is_same_v<
+            method_args_of<const_call_functor>,
+            std::tuple<std::int32_t, std::int64_t>>,
+        "const operator() functor must strip return_value& and keep (int, long)");
+    static_assert(
+        vmhook::detail::java_slot_offsets<
+            std::tuple<bool, std::int64_t, char16_t, double, std::int8_t, std::int32_t>>::value
+            == std::array<std::int32_t, 6>{ 0, 1, 3, 4, 6, 7 },
+        "all-widths matrix: each long/double advances the cursor by 2, others by 1");
+    static_assert(
+        std::is_same_v<
+            decltype(vmhook::detail::extract_frame_arg<const std::int32_t&>(nullptr, 0)),
+            std::int32_t>,
+        "extract_frame_arg must strip cv/ref from its result type");
 
     std::printf("vmhook traits-extra: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
