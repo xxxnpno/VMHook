@@ -1591,6 +1591,64 @@ namespace vmhook
         template<typename type>
         inline constexpr bool is_unique_ptr_v{ is_unique_ptr<std::remove_cvref_t<type>>::value };
 
+        /*
+            @brief Constrains the value_t conversion operators to their *legitimate*
+                   target set, excising the spurious productions that make a class
+                   target with competing constructors ambiguous on MSVC.
+            @details
+            field_proxy::value_t and method_proxy::value_t both expose an
+            UNCONSTRAINED `template<typename T> operator T()`.  Such an operator is
+            convertible to *every* type its body can default-construct on the fall-
+            through arm — including `const char*`, `char*`, a raw wrapper pointer
+            `W*`, and `std::nullptr_t`.  Those extra productions collide with the
+            legitimate ones during overload resolution of a class target's
+            constructors:
+
+              std::string s = static_cast<std::string>(v);   // value_t->string
+                                                              // vs value_t->const char*
+                                                              // vs value_t->nullptr_t
+              auto p = static_cast<std::unique_ptr<W>>(v);    // value_t->unique_ptr<W>
+                                                              // vs value_t->W* (explicit ctor)
+                                                              // vs value_t->nullptr_t
+
+            MSVC under /permissive- rejects both as ambiguous (C2440); libstdc++
+            happens to accept them.  Gating the operator on this trait removes the
+            spurious targets from the overload set so BOTH casts resolve to the one
+            intended conversion, without altering any conversion that still
+            compiles (a numeric / void* / string / unique_ptr / vector target is
+            unaffected).
+
+            A target is legitimate iff it is NOT `std::nullptr_t` and NOT a pointer
+            to a non-void type.  `void*` (the compressed-OOP decode target) is the
+            single permitted pointer; `const char*`, `char*`, `W*`, etc. are
+            excluded.  Arithmetic types, std::string, std::unique_ptr<W>, and
+            std::vector<T> are all class/scalar non-pointer targets and pass through.
+
+            cv-ref qualifiers are stripped first so `const std::string&` /
+            `std::unique_ptr<W>&&` targets are classified by their underlying type.
+        */
+        template<typename type>
+        inline constexpr bool value_t_convertible_target_v{
+            []() constexpr noexcept -> bool
+            {
+                using clean = std::remove_cvref_t<type>;
+                if constexpr (std::is_same_v<clean, std::nullptr_t>)
+                {
+                    return false;
+                }
+                else if constexpr (std::is_pointer_v<clean>)
+                {
+                    // Only void* (any cv) is a legitimate pointer target; every
+                    // other pointer (char*, const char*, W*, ...) is excised.
+                    return std::is_void_v<std::remove_pointer_t<clean>>;
+                }
+                else
+                {
+                    return true;
+                }
+            }()
+        };
+
     }
 
     // --- HotSpot internals ----------------------------------------------------
@@ -12570,12 +12628,26 @@ namespace vmhook
                   int  i  = proxy->get();
                   auto s  = static_cast<std::string>(proxy->get());
 
+                The `requires` clause (vmhook::detail::value_t_convertible_target_v)
+                excises the spurious productions — `const char*`, `char*`, a raw
+                wrapper pointer `W*`, and `std::nullptr_t` — that an UNCONSTRAINED
+                conversion template would also offer.  Those collide with the
+                constructors of class targets (std::string from const char* or
+                nullptr, std::unique_ptr<W> from W* or nullptr), making
+                `static_cast<std::string>` and `static_cast<std::unique_ptr<W>>`
+                ambiguous on MSVC /permissive-.  With the constraint the only
+                producible pointer is `void*`, so both casts resolve to their single
+                intended conversion on every compiler; no legitimate conversion
+                (arithmetic / void* / string / unique_ptr / vector) is removed, so
+                runtime behaviour is unchanged.
+
                 Complexity: O(1) for scalars; O(N) for strings/arrays.
                 Exception safety: noexcept.
 
                 @tparam target_type  The type the value is being converted to.
             */
             template<typename target_type>
+                requires vmhook::detail::value_t_convertible_target_v<target_type>
             operator target_type() const noexcept
             {
                 return std::visit([this](auto value) noexcept
@@ -12588,16 +12660,18 @@ namespace vmhook
             /*
                 @brief The field value as a std::string, unambiguously.
                 @details
-                Parity with method_proxy::value_t::as_string().  Prefer this over
-                `std::string s{ proxy->get() }` or a static_cast: the templated
-                conversion operator can ALSO yield `const char*` (which std::string
-                constructs from), so the brace-init / cast forms are ambiguous on
-                MSVC — and on the compilers that do resolve them, can silently pick
-                the const char* path and build a std::string from a null pointer for
-                a non-string field.  as_string() names the extraction directly: a
-                reference/String field (compressed OOP, the uint32 alternative) is
-                decoded through read_java_string(); every numeric / boolean
-                alternative — including a null proxy's int32 zero — yields "".
+                Parity with method_proxy::value_t::as_string(), and the explicit-
+                intent alias for the std::string conversion.  Since the conversion
+                operator is now constrained (see value_t_convertible_target_v),
+                `static_cast<std::string>(proxy->get())` is unambiguous on MSVC too;
+                as_string() remains the preferred spelling because it names the
+                extraction directly (and avoids relying on overload resolution at
+                the call site).  A reference/String field (compressed OOP, the
+                uint32 alternative) is decoded through read_java_string(); every
+                numeric / boolean alternative — including a null proxy's int32 zero
+                — yields "".  Note brace-init `std::string s{ proxy->get() }` can
+                still pick a surprising constructor (it considers all viable
+                user-defined conversions); prefer as_string() or static_cast.
             */
             auto as_string() const noexcept -> std::string
             {
@@ -13140,8 +13214,19 @@ namespace vmhook
                     would silently produce a truncated 4-byte address - on
                     every JVM with a non-zero narrow_oop_base, that's not
                     even a heap address and dereferences immediately.
+
+                The `requires` clause (vmhook::detail::value_t_convertible_target_v)
+                excises the spurious productions an UNCONSTRAINED conversion template
+                would also offer — `const char*`, `char*`, the raw wrapper pointer
+                `W*`, and `std::nullptr_t` — which otherwise compete with the
+                constructors of class targets and make `static_cast<std::string>` /
+                `static_cast<std::unique_ptr<W>>` ambiguous on MSVC /permissive-.
+                With the constraint `void*` is the only producible pointer, so both
+                casts resolve unambiguously on every compiler while every legitimate
+                conversion (arithmetic / void* / string / unique_ptr) is preserved.
             */
             template<typename target_type>
+                requires vmhook::detail::value_t_convertible_target_v<target_type>
             operator target_type() const noexcept
             {
                 return std::visit([](const auto& v) noexcept
@@ -13236,13 +13321,15 @@ namespace vmhook
             /*
                 @brief The result as a std::string, unambiguously.
                 @details
-                Prefer this over `std::string s = call()` / `static_cast<std::string>`:
-                the templated conversion operator can also yield `const char*`
-                (which std::string constructs from), so the implicit/cast forms are
-                ambiguous on MSVC.  as_string() names the extraction directly:
-                returns the eagerly-decoded String alternative as-is, decodes a
-                compressed-OOP alternative through read_java_string, and returns ""
-                for any other (numeric / monostate) alternative.
+                The explicit-intent alias for the std::string conversion.  Since the
+                conversion operator is now constrained (see
+                value_t_convertible_target_v), `static_cast<std::string>(call())` is
+                unambiguous on MSVC too; as_string() remains preferred because it
+                names the extraction directly.  Returns the eagerly-decoded String
+                alternative as-is, decodes a compressed-OOP alternative through
+                read_java_string, and returns "" for any other (numeric / monostate)
+                alternative.  Note plain `std::string s = call()` (copy-init) still
+                relies on overload resolution; prefer as_string() or static_cast.
             */
             auto as_string() const noexcept -> std::string
             {

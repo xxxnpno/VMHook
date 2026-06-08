@@ -72,13 +72,17 @@ int main()
           static_cast<void*>(value_t{ std::monostate{} }) == nullptr);
     {
         // monostate -> std::string falls into the default arm (empty string).
-        // Use static_cast (not brace-init): with a *templated* conversion
-        // operator, `std::string s{ value_t }` runs overload resolution over
-        // every conversion the operator could produce (const char*, string_view,
-        // ...) and picks a surprising one — a known C++ gotcha unrelated to the
-        // operator's logic.  static_cast<std::string> names the target exactly.
+        // The conversion operator is now constrained (BUG 1 fix), so
+        // static_cast<std::string>(value_t) is unambiguous; as_string() is the
+        // ergonomic public spelling for the same extraction and is used here.
+        // (Brace-init `std::string s{ value_t }` is still avoided: copy-list-init
+        // considers every viable user-defined conversion and can pick a
+        // surprising one — a C++ gotcha independent of the operator's logic.)
         const auto s = value_t{ std::monostate{} }.as_string();
         check("monostate_to_string_is_empty", s.empty());
+        // The constrained static_cast also yields the empty string here.
+        check("monostate_static_cast_string_is_empty",
+              static_cast<std::string>(value_t{ std::monostate{} }).empty());
     }
 
     // -------------------------------------------------------------------------
@@ -179,6 +183,38 @@ int main()
     static_assert(std::is_convertible_v<value_t, std::string>,    "value_t -> string");
     static_assert(std::is_convertible_v<value_t, std::uint16_t>,  "value_t -> uint16");
     check("value_t_compile_time_conversions_present", true);
+
+    // -------------------------------------------------------------------------
+    // BUG 1 (FIXED) — the constrained conversion operator.  Compile-time proof
+    // that the NATURAL cast forms are now well-formed (they were ambiguous on
+    // MSVC /permissive- before the value_t_convertible_target_v constraint), and
+    // that the spurious productions which caused the ambiguity are now EXCLUDED
+    // from the operator's target set.  These are detected with a requires-expr so
+    // a regression (operator un-constrained again => ambiguous => not well-formed,
+    // or constraint too tight => legitimate cast removed) fails the build.
+    // -------------------------------------------------------------------------
+    // The two cast forms that were the whole point of the fix are now well-formed:
+    static_assert(requires(const value_t& v) { static_cast<std::string>(v); },
+                  "BUG 1: static_cast<std::string>(value_t) must be well-formed");
+    static_assert(requires(const value_t& v) { static_cast<std::unique_ptr<W>>(v); },
+                  "BUG 1: static_cast<std::unique_ptr<W>>(value_t) must be well-formed");
+    // Legitimate targets remain convertible (constraint not over-tight):
+    static_assert(std::is_convertible_v<value_t, std::unique_ptr<W>>,
+                  "value_t -> unique_ptr<W> must remain convertible");
+    static_assert(std::is_convertible_v<value_t, void*>,
+                  "value_t -> void* must remain convertible (the one allowed pointer)");
+    // The spurious targets are now EXCLUDED — value_t is NOT convertible to a
+    // char pointer, a wrapper pointer, or std::nullptr_t (these are exactly the
+    // productions that made the class-target casts ambiguous).
+    static_assert(!std::is_convertible_v<value_t, const char*>,
+                  "BUG 1: value_t must NOT be convertible to const char* (ambiguity source)");
+    static_assert(!std::is_convertible_v<value_t, char*>,
+                  "BUG 1: value_t must NOT be convertible to char*");
+    static_assert(!std::is_convertible_v<value_t, W*>,
+                  "BUG 1: value_t must NOT be convertible to W* (unique_ptr ambiguity source)");
+    static_assert(!std::is_convertible_v<value_t, std::nullptr_t>,
+                  "BUG 1: value_t must NOT be convertible to std::nullptr_t");
+    check("value_t_bug1_constraint_present", true);
 
     // -------------------------------------------------------------------------
     // method_proxy built with a NULL Method* (no JVM): accessor round-trips.
@@ -495,21 +531,32 @@ int main()
     // as_string() must AGREE with the conversion operator's std::string arm on
     // the std::string alternative (both return the stored bytes verbatim).
     //
-    // IMPORTANT (confirmed bug, see report): `static_cast<std::string>(v)` does
-    // NOT compile — it is AMBIGUOUS on MSVC (and brittle elsewhere) because the
-    // templated operator can yield std::string, const char*, AND std::nullptr_t,
-    // all of which std::string has a constructor for.  We therefore invoke the
-    // std::string conversion operator EXPLICITLY via v.operator std::string(),
-    // which names a single specialization and dodges the constructor overload
-    // set.  as_string() is the ergonomic public escape hatch for the same trap.
+    // BUG 1 (FIXED): the conversion operator was an UNCONSTRAINED template, so it
+    // was also convertible to const char* / char* / std::nullptr_t — every one a
+    // std::string constructor argument — which made `static_cast<std::string>(v)`
+    // AMBIGUOUS on MSVC /permissive- (C2440).  The operator is now constrained
+    // (vmhook::detail::value_t_convertible_target_v) to exclude those spurious
+    // pointer/nullptr targets, leaving void* as the only producible pointer, so
+    // the cast resolves to the single value_t->std::string conversion on every
+    // compiler.  We exercise BOTH the natural static_cast AND the explicit
+    // operator spelling and require they agree.  as_string() remains the
+    // ergonomic public escape hatch for the same extraction.
     // -------------------------------------------------------------------------
     {
         const value_t v{ std::string{ "agree" } };
+        // Natural cast form — must compile now (was BUG 1: ambiguous on MSVC).
+        check("static_cast_string_equals_as_string",
+              static_cast<std::string>(v) == v.as_string());
         check("as_string_matches_operator_string",
               v.as_string() == v.operator std::string());
+        check("static_cast_string_equals_operator_string",
+              static_cast<std::string>(v) == v.operator std::string());
         // The unambiguous extraction via as_string() compiles and yields the value.
         const std::string s{ v.as_string() };
         check("as_string_unambiguous_assignment", s == "agree");
+        // Copy-initialisation from the constrained operator is now unambiguous too.
+        const std::string from_cast = static_cast<std::string>(v);
+        check("static_cast_string_value", from_cast == "agree");
     }
     // Embedded NUL survives the std::string alternative round-trip (length-based,
     // not NUL-terminated) — a property the const char* path would have lost.
@@ -529,30 +576,37 @@ int main()
     //   * monostate / string stored      -> also null (else branch).
     // None of these construct a W (no JVM), so they are crash-free.
     //
-    // Same ambiguity caveat as the std::string arm: `static_cast<unique_ptr<W>>`
-    // is ambiguous on MSVC (the operator yields unique_ptr<W>, W*, AND nullptr_t,
-    // all unique_ptr constructors), so we invoke the operator EXPLICITLY.
-    // is_convertible (a single implicit conversion sequence) is unambiguous and
-    // pins that the arm exists.
+    // BUG 1 (FIXED): `static_cast<std::unique_ptr<W>>(v)` used to be AMBIGUOUS on
+    // MSVC because the UNCONSTRAINED operator also yielded W* (which unique_ptr's
+    // explicit pointer ctor accepts) and std::nullptr_t.  The operator is now
+    // constrained to exclude all non-void pointers + nullptr_t, so the only
+    // producible unique_ptr<W>-constructible type is unique_ptr<W> itself and the
+    // direct-init cast resolves unambiguously.  We now use the NATURAL static_cast
+    // spelling (with one explicit operator call kept to prove the two agree).
+    // is_convertible (a single implicit conversion sequence) pins the arm exists.
     // -------------------------------------------------------------------------
     static_assert(std::is_convertible_v<value_t, std::unique_ptr<W>>,
                   "value_t -> unique_ptr<wrapper> arm must exist");
     check("unique_ptr_from_uint32_zero_is_null",
-          value_t{ std::uint32_t{ 0 } }.operator std::unique_ptr<W>() == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 0 } }) == nullptr);
     check("unique_ptr_from_uint32_nonzero_is_null_no_jvm",
-          value_t{ std::uint32_t{ 42 } }.operator std::unique_ptr<W>() == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 42 } }) == nullptr);
     check("unique_ptr_from_uint32_sentinel_is_null_no_jvm",
-          value_t{ std::uint32_t{ 0xDEADBEEF } }.operator std::unique_ptr<W>() == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 0xDEADBEEF } }) == nullptr);
     check("unique_ptr_from_int32_alternative_is_null",
-          value_t{ std::int32_t{ 1 } }.operator std::unique_ptr<W>() == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::int32_t{ 1 } }) == nullptr);
     check("unique_ptr_from_int64_alternative_is_null",
-          value_t{ std::int64_t{ 1 } }.operator std::unique_ptr<W>() == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::int64_t{ 1 } }) == nullptr);
     check("unique_ptr_from_monostate_is_null",
-          value_t{ std::monostate{} }.operator std::unique_ptr<W>() == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::monostate{} }) == nullptr);
     check("unique_ptr_from_string_alternative_is_null",
-          value_t{ std::string{ "x" } }.operator std::unique_ptr<W>() == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::string{ "x" } }) == nullptr);
     check("unique_ptr_from_float_alternative_is_null",
-          value_t{ 1.0f }.operator std::unique_ptr<W>() == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ 1.0f }) == nullptr);
+    // The natural cast and the explicit operator spelling agree (both null here).
+    check("unique_ptr_static_cast_matches_operator",
+          static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 42 } })
+              == value_t{ std::uint32_t{ 42 } }.operator std::unique_ptr<W>());
 
     // -------------------------------------------------------------------------
     // uint16_t (the Java char alternative) is NOT the uint32_t reference
@@ -567,11 +621,11 @@ int main()
     //   * char -> unique_ptr  : non-uint32 -> null.
     // -------------------------------------------------------------------------
     check("uint16_char_to_string_is_empty_not_decoded",
-          value_t{ std::uint16_t{ 0x0041 } }.operator std::string().empty());
+          static_cast<std::string>(value_t{ std::uint16_t{ 0x0041 } }).empty());
     check("uint16_char_to_voidptr_is_null_not_decoded",
           static_cast<void*>(value_t{ std::uint16_t{ 0x0041 } }) == nullptr);
     check("uint16_char_to_unique_ptr_is_null",
-          value_t{ std::uint16_t{ 0x0041 } }.operator std::unique_ptr<W>() == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{ std::uint16_t{ 0x0041 } }) == nullptr);
     // And as_string() on a char alternative is "" (only string / uint32 decode).
     check("uint16_char_as_string_is_empty",
           value_t{ std::uint16_t{ 0x0041 } }.as_string().empty());
@@ -815,12 +869,12 @@ int main()
               == vmhook::hotspot::decode_oop_pointer(0x0010'0000u));
     // uint32_t -> std::string also routes through decode + read_java_string and
     // yields "" with no JVM (this is the operator's std::string arm, distinct
-    // from as_string()).  Invoked via the explicit operator call (static_cast is
-    // ambiguous, see above).
-    check("uint32_to_string_via_operator_empty_no_jvm",
-          value_t{ std::uint32_t{ 12345 } }.operator std::string().empty());
-    check("uint32_zero_to_string_via_operator_empty",
-          value_t{ std::uint32_t{ 0 } }.operator std::string().empty());
+    // from as_string()).  The natural static_cast spelling is unambiguous now
+    // (BUG 1 fixed), so we use it directly.
+    check("uint32_to_string_via_cast_empty_no_jvm",
+          static_cast<std::string>(value_t{ std::uint32_t{ 12345 } }).empty());
+    check("uint32_zero_to_string_via_cast_empty",
+          static_cast<std::string>(value_t{ std::uint32_t{ 0 } }).empty());
 
     // -------------------------------------------------------------------------
     // A default-constructed value_t holds monostate and converts determinist(-
@@ -834,7 +888,9 @@ int main()
     check("default_value_t_to_voidptr_null", static_cast<void*>(value_t{}) == nullptr);
     check("default_value_t_as_string_empty", value_t{}.as_string().empty());
     check("default_value_t_to_unique_ptr_null",
-          value_t{}.operator std::unique_ptr<W>() == nullptr);
+          static_cast<std::unique_ptr<W>>(value_t{}) == nullptr);
+    check("default_value_t_to_string_empty",
+          static_cast<std::string>(value_t{}).empty());
 
     // -------------------------------------------------------------------------
     // Compile-time conversion-operator surface: pin the remaining targets the
