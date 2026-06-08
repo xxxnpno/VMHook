@@ -642,6 +642,23 @@ namespace vmhook
             {
                 return false;
             }
+            // Reject any request whose [base, base+size) span would wrap the
+            // address space.  On POSIX the page-rounding below computes
+            // end = base + size and then aligned_size = end - base + ps - 1; if
+            // base + size overflows uintptr_t the length math produces a bogus
+            // value and mprotect is handed a garbage range.  A real protect()
+            // call (always a small, controlled size) never trips this; only a
+            // degenerate size such as SIZE_MAX does, and that becomes a clean
+            // false instead of undefined behaviour.  Windows' VirtualProtect
+            // validates the range kernel-side, but we reject here too so the
+            // contract is identical on every platform.
+            {
+                const std::uintptr_t base_addr{ reinterpret_cast<std::uintptr_t>(address) };
+                if (size > (static_cast<std::uintptr_t>(~std::uintptr_t{ 0 }) - base_addr))
+                {
+                    return false;
+                }
+            }
 #if VMHOOK_OS_WINDOWS
             DWORD prev{};
             const BOOL ok{ ::VirtualProtect(address, size, to_native_protect(prot), &prev) };

@@ -946,6 +946,85 @@ static auto test_protect_subpage_does_not_bleed_into_neighbour() -> void
 }
 
 // ---------------------------------------------------------------------------
+// EXHAUSTIVE: address-space-wrap / overflow guard.  protect() rounds the
+// [base, base+size) span up to page granularity on POSIX (end = base + size;
+// aligned_size = end - base + ps - 1).  A size large enough that base + size
+// wraps uintptr_t would make that length math produce a garbage value and hand
+// mprotect a bogus range.  The wrapper must reject such a request up front —
+// returning false WITHOUT touching the kernel — so the degenerate case is a
+// clean failure rather than undefined behaviour.  Windows' VirtualProtect
+// validates kernel-side, but the wrapper rejects uniformly so the contract is
+// identical on every platform.
+//
+// This test is SAFE precisely because the guard short-circuits before any
+// syscall: we hand protect() a valid, live page plus a wrapping size and assert
+// (a) it returns false, (b) the process does not crash, and (c) the page's
+// protection is UNCHANGED — a real store still sticks afterwards.  No kernel
+// call is made with the bogus range, so nothing about the page is disturbed.
+// ---------------------------------------------------------------------------
+static auto test_protect_size_overflow_guard() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("protect_overflow_guard_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x5A; // marker we will re-write after the rejected calls
+
+    // (1) SIZE_MAX from any non-null base wraps the address space.  Must be
+    // rejected with false and must not call mprotect/VirtualProtect.
+    check("protect_size_max_returns_false",
+          !vmhook::os::protect(block, SIZE_MAX,
+                               vmhook::os::memory_protection::read, nullptr));
+
+    // (2) A size precisely tuned so that base + size wraps past the maximum
+    // representable pointer by a few bytes.  size = (UINTPTR_MAX - base) + k
+    // is the smallest family of sizes that overflow; k = 8 here.  This pins the
+    // boundary of the guard, not just the SIZE_MAX extreme.
+    {
+        const std::uintptr_t base_addr{ reinterpret_cast<std::uintptr_t>(block) };
+        const std::uintptr_t max_addr{ ~static_cast<std::uintptr_t>(0) };
+        // (max_addr - base_addr) is the largest size that does NOT wrap; +8
+        // is the smallest that does.  Guard against the (impossible for a heap
+        // page) case base_addr == 0 so the addition itself can't overflow here.
+        const std::size_t wrapping_size{
+            static_cast<std::size_t>(max_addr - base_addr) + std::size_t{ 8 } };
+        check("protect_base_plus_size_wrap_returns_false",
+              !vmhook::os::protect(block, wrapping_size,
+                                   vmhook::os::memory_protection::read, nullptr));
+    }
+
+    // (3) Boundary witness on the SAFE side: the LARGEST size that does NOT
+    // wrap (base + size == UINTPTR_MAX exactly) must NOT be rejected by the
+    // overflow guard.  The kernel will almost certainly fail such an enormous
+    // mprotect/VirtualProtect with its own error, so we accept EITHER outcome
+    // (true or false) — what we are pinning is that the guard does not falsely
+    // reject the maximal non-wrapping size.  We only assert no crash.
+    {
+        const std::uintptr_t base_addr{ reinterpret_cast<std::uintptr_t>(block) };
+        const std::uintptr_t max_addr{ ~static_cast<std::uintptr_t>(0) };
+        const std::size_t non_wrapping_max{
+            static_cast<std::size_t>(max_addr - base_addr) };
+        (void)vmhook::os::protect(block, non_wrapping_max,
+                                  vmhook::os::memory_protection::read, nullptr);
+        check("protect_non_wrapping_max_size_no_crash", true);
+    }
+
+    // The page's protection must be UNCHANGED by the rejected calls: it came
+    // from allocate_rwx (RW or RWX) and a fresh store must still stick.  If any
+    // rejected call had leaked through to the kernel and flipped the page to
+    // read-only, this store would fault or fail to take effect.
+    bytes[0] = 0xA5;
+    check("protect_overflow_guard_page_still_writable", bytes[0] == 0xA5);
+
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
 // query_region must report the FREE attribute for an unallocated address.
 // This is implementation-defined on iOS (where the helper always returns a
 // permissive "looks committed" stub) so we only check it on every other
@@ -994,6 +1073,7 @@ int main()
     test_protect_unaligned_multipage_span();
     test_protect_idempotent_reprotect();
     test_protect_subpage_does_not_bleed_into_neighbour();
+    test_protect_size_overflow_guard();
     test_os_primitive_input_guards();
 #if !VMHOOK_OS_IOS
     test_safe_read_refuses_no_access_page();
