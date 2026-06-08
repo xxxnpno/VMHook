@@ -348,7 +348,15 @@ namespace
         {
             // static_field path (resolve_klass -> type_to_class_map -> find_class).
             ctx.check("registered_static_field_go_resolves", rc::resolves("go"));
-            ctx.check("registered_static_field_marker_resolves", rc::resolves("marker"));
+            // `marker` is an INSTANCE field (public int marker), so static_field()
+            // must NOT resolve it -- static_field only finds STATIC fields, and the
+            // instance accessor get_field("marker") (used by the detour below) is the
+            // correct path.  This pins that the registered-wrapper static accessor
+            // correctly REJECTS an instance field (the static field classToken IS
+            // resolved + value-checked just below).  (CI confirmed static_field
+            // ("marker") returns no value; the prior assertion expected the opposite
+            // and failed deterministically on every JDK.)
+            ctx.check("registered_static_field_rejects_instance_marker", !rc::resolves("marker"));
             ctx.check("registered_static_field_classToken_value",
                       rc::get_class_token() == CLASS_TOKEN);
 
