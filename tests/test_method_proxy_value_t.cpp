@@ -22,7 +22,12 @@
 #include <vmhook/vmhook.hpp>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
+#include <cmath>
+#include <limits>
+#include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 static int failures{ 0 };
@@ -33,6 +38,18 @@ static auto check(const char* name, bool ok) -> void
 }
 
 using value_t = vmhook::method_proxy::value_t;
+
+// Minimal vmhook wrapper type for exercising the value_t -> std::unique_ptr<T>
+// conversion arm.  The arm static_asserts that T derives from
+// vmhook::object_base and constructs `new T{ decoded_void_ptr }`; object_base's
+// constructor takes oop_type_t (== void*), which W inherits.  W adds no state,
+// so constructing/destructing it is trivial — but with NO JVM the arm never
+// actually news a W (decode_oop_pointer returns nullptr, so the !decoded guard
+// fires first and the arm returns a null unique_ptr).
+struct W : vmhook::object_base
+{
+    using vmhook::object_base::object_base;
+};
 
 int main()
 {
@@ -415,6 +432,499 @@ int main()
         // the documented behaviour: it does NOT validate the arg list.)
         vmhook::method_proxy p{ nullptr, nullptr, std::string{ ")Lx;" } };
         check("is_reference_true_when_only_close_paren_then_L", p.is_reference() == true);
+    }
+
+    // =========================================================================
+    // EXPANSION (no-JVM, platform-invariant): exhaustive value_t conversion
+    // matrix + introspection over EVERY variant alternative, plus the
+    // unique_ptr arm and get_compressed_oop.  Every OOP-touching arm short-
+    // circuits to null/"" with no VMStructs (decode_oop_pointer returns nullptr
+    // for any input, read_java_string returns "" for a null oop), so all of
+    // this is deterministic and crash-free on both MinGW and MSVC.
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // is_void() / is_string() over ALL eleven alternatives.  is_void() is true
+    // ONLY for monostate; is_string() ONLY for the std::string alternative.
+    // The uint32_t (reference) alternative is NEITHER — it pins that the
+    // introspection is keyed on the variant slot, not on "could this decode to
+    // a String" (the static-descriptor-vs-runtime-type gap).
+    // -------------------------------------------------------------------------
+    check("is_void_bool_false",   value_t{ true }.is_void() == false);
+    check("is_void_int8_false",   value_t{ std::int8_t{ 1 } }.is_void() == false);
+    check("is_void_int16_false",  value_t{ std::int16_t{ 1 } }.is_void() == false);
+    check("is_void_int64_false",  value_t{ std::int64_t{ 1 } }.is_void() == false);
+    check("is_void_float_false",  value_t{ 1.0f }.is_void() == false);
+    check("is_void_double_false", value_t{ 1.0 }.is_void() == false);
+    check("is_void_uint16_false", value_t{ std::uint16_t{ 1 } }.is_void() == false);
+    check("is_string_bool_false",   value_t{ true }.is_string() == false);
+    check("is_string_int8_false",   value_t{ std::int8_t{ 1 } }.is_string() == false);
+    check("is_string_int16_false",  value_t{ std::int16_t{ 1 } }.is_string() == false);
+    check("is_string_int64_false",  value_t{ std::int64_t{ 1 } }.is_string() == false);
+    check("is_string_float_false",  value_t{ 1.0f }.is_string() == false);
+    check("is_string_double_false", value_t{ 1.0 }.is_string() == false);
+    check("is_string_uint16_false", value_t{ std::uint16_t{ 1 } }.is_string() == false);
+    // The reference (uint32_t) alternative is neither void nor string.
+    check("uint32_alternative_is_neither_void_nor_string",
+          !value_t{ std::uint32_t{ 7 } }.is_void()
+              && !value_t{ std::uint32_t{ 7 } }.is_string());
+    // An empty std::string is still the string alternative (content-independent).
+    check("empty_string_alternative_is_string",
+          value_t{ std::string{ "" } }.is_string() == true);
+    check("empty_string_alternative_is_not_void",
+          value_t{ std::string{ "" } }.is_void() == false);
+
+    // -------------------------------------------------------------------------
+    // as_string() over the uint32_t (reference / compressed-OOP) alternative.
+    // With no JVM:  uint32_t{0} -> decode short-circuits to nullptr -> "".
+    //               uint32_t{nonzero} -> decode returns nullptr (no VMStructs)
+    //                                  -> read_java_string(nullptr) -> "".
+    // Proves crash-freedom AND the no-VMStruct contract for the OOP arm of
+    // as_string() (previously only monostate / std::string were covered).
+    // -------------------------------------------------------------------------
+    check("as_string_uint32_zero_empty",
+          value_t{ std::uint32_t{ 0 } }.as_string().empty());
+    check("as_string_uint32_nonzero_empty_no_jvm",
+          value_t{ std::uint32_t{ 0xDEADBEEF } }.as_string().empty());
+    check("as_string_uint32_one_empty_no_jvm",
+          value_t{ std::uint32_t{ 1 } }.as_string().empty());
+    check("as_string_uint32_max_empty_no_jvm",
+          value_t{ std::uint32_t{ 0xFFFF'FFFF } }.as_string().empty());
+
+    // -------------------------------------------------------------------------
+    // as_string() must AGREE with the conversion operator's std::string arm on
+    // the std::string alternative (both return the stored bytes verbatim).
+    //
+    // IMPORTANT (confirmed bug, see report): `static_cast<std::string>(v)` does
+    // NOT compile — it is AMBIGUOUS on MSVC (and brittle elsewhere) because the
+    // templated operator can yield std::string, const char*, AND std::nullptr_t,
+    // all of which std::string has a constructor for.  We therefore invoke the
+    // std::string conversion operator EXPLICITLY via v.operator std::string(),
+    // which names a single specialization and dodges the constructor overload
+    // set.  as_string() is the ergonomic public escape hatch for the same trap.
+    // -------------------------------------------------------------------------
+    {
+        const value_t v{ std::string{ "agree" } };
+        check("as_string_matches_operator_string",
+              v.as_string() == v.operator std::string());
+        // The unambiguous extraction via as_string() compiles and yields the value.
+        const std::string s{ v.as_string() };
+        check("as_string_unambiguous_assignment", s == "agree");
+    }
+    // Embedded NUL survives the std::string alternative round-trip (length-based,
+    // not NUL-terminated) — a property the const char* path would have lost.
+    {
+        const std::string with_nul{ std::string("a\0b", 3) };
+        const value_t v{ with_nul };
+        check("string_alternative_preserves_embedded_nul",
+              v.as_string().size() == 3 && v.as_string() == with_nul);
+    }
+
+    // -------------------------------------------------------------------------
+    // value_t -> std::unique_ptr<W> (the compressed-OOP reference arm).
+    //   * uint32_t{0}      -> decode short-circuits -> null unique_ptr.
+    //   * uint32_t{nonzero}-> decode returns nullptr (no VMStructs) -> the
+    //                         !decoded guard fires -> null unique_ptr.
+    //   * a NON-uint32 stored alternative -> the `else` branch -> null.
+    //   * monostate / string stored      -> also null (else branch).
+    // None of these construct a W (no JVM), so they are crash-free.
+    //
+    // Same ambiguity caveat as the std::string arm: `static_cast<unique_ptr<W>>`
+    // is ambiguous on MSVC (the operator yields unique_ptr<W>, W*, AND nullptr_t,
+    // all unique_ptr constructors), so we invoke the operator EXPLICITLY.
+    // is_convertible (a single implicit conversion sequence) is unambiguous and
+    // pins that the arm exists.
+    // -------------------------------------------------------------------------
+    static_assert(std::is_convertible_v<value_t, std::unique_ptr<W>>,
+                  "value_t -> unique_ptr<wrapper> arm must exist");
+    check("unique_ptr_from_uint32_zero_is_null",
+          value_t{ std::uint32_t{ 0 } }.operator std::unique_ptr<W>() == nullptr);
+    check("unique_ptr_from_uint32_nonzero_is_null_no_jvm",
+          value_t{ std::uint32_t{ 42 } }.operator std::unique_ptr<W>() == nullptr);
+    check("unique_ptr_from_uint32_sentinel_is_null_no_jvm",
+          value_t{ std::uint32_t{ 0xDEADBEEF } }.operator std::unique_ptr<W>() == nullptr);
+    check("unique_ptr_from_int32_alternative_is_null",
+          value_t{ std::int32_t{ 1 } }.operator std::unique_ptr<W>() == nullptr);
+    check("unique_ptr_from_int64_alternative_is_null",
+          value_t{ std::int64_t{ 1 } }.operator std::unique_ptr<W>() == nullptr);
+    check("unique_ptr_from_monostate_is_null",
+          value_t{ std::monostate{} }.operator std::unique_ptr<W>() == nullptr);
+    check("unique_ptr_from_string_alternative_is_null",
+          value_t{ std::string{ "x" } }.operator std::unique_ptr<W>() == nullptr);
+    check("unique_ptr_from_float_alternative_is_null",
+          value_t{ 1.0f }.operator std::unique_ptr<W>() == nullptr);
+
+    // -------------------------------------------------------------------------
+    // uint16_t (the Java char alternative) is NOT the uint32_t reference
+    // alternative, so it routes through the GENERIC arms — not the OOP special
+    // cases.  Proves the reference handling is keyed on uint32_t ONLY, not on
+    // "any unsigned type".
+    //   * char -> std::string : the operator's std::string arm sees a non-
+    //     uint32 / non-string stored type and returns target_type{} (empty),
+    //     NOT a decoded String.
+    //   * char -> void*       : the void* arm only fires for uint32_t, so a
+    //     char falls through to target_type{} == nullptr (it is NOT decoded).
+    //   * char -> unique_ptr  : non-uint32 -> null.
+    // -------------------------------------------------------------------------
+    check("uint16_char_to_string_is_empty_not_decoded",
+          value_t{ std::uint16_t{ 0x0041 } }.operator std::string().empty());
+    check("uint16_char_to_voidptr_is_null_not_decoded",
+          static_cast<void*>(value_t{ std::uint16_t{ 0x0041 } }) == nullptr);
+    check("uint16_char_to_unique_ptr_is_null",
+          value_t{ std::uint16_t{ 0x0041 } }.operator std::unique_ptr<W>() == nullptr);
+    // And as_string() on a char alternative is "" (only string / uint32 decode).
+    check("uint16_char_as_string_is_empty",
+          value_t{ std::uint16_t{ 0x0041 } }.as_string().empty());
+
+    // -------------------------------------------------------------------------
+    // Numeric -> void* : ONLY the uint32_t alternative decodes; every other
+    // numeric alternative cannot static_cast to void*, so it falls through to
+    // target_type{} == nullptr (pins flaw: a J/I/etc. return cast to void* is
+    // silently null, not the bits).
+    // -------------------------------------------------------------------------
+    check("bool_to_voidptr_is_null",   static_cast<void*>(value_t{ true }) == nullptr);
+    check("int8_to_voidptr_is_null",   static_cast<void*>(value_t{ std::int8_t{ 5 } }) == nullptr);
+    check("int16_to_voidptr_is_null",  static_cast<void*>(value_t{ std::int16_t{ 5 } }) == nullptr);
+    check("int32_to_voidptr_is_null",  static_cast<void*>(value_t{ std::int32_t{ 5 } }) == nullptr);
+    check("int64_to_voidptr_is_null",  static_cast<void*>(value_t{ std::int64_t{ 5 } }) == nullptr);
+    check("uint16_to_voidptr_is_null", static_cast<void*>(value_t{ std::uint16_t{ 5 } }) == nullptr);
+    check("float_to_voidptr_is_null",  static_cast<void*>(value_t{ 5.0f }) == nullptr);
+    check("double_to_voidptr_is_null", static_cast<void*>(value_t{ 5.0 }) == nullptr);
+
+    // -------------------------------------------------------------------------
+    // Numeric -> bool : the generic static_cast arm => result is (value != 0).
+    // Covers every alternative (the existing tests only did int32 and bool).
+    // The uint32_t (reference) alternative ALSO goes through the generic arm for
+    // a bool target (bool is not void*/string/unique_ptr), so a non-null
+    // compressed OOP reads as true — pins that "Object present?" is a non-zero
+    // check on the COMPRESSED oop.
+    // -------------------------------------------------------------------------
+    check("int8_nonzero_to_bool_true",   static_cast<bool>(value_t{ std::int8_t{ -1 } }) == true);
+    check("int8_zero_to_bool_false",     static_cast<bool>(value_t{ std::int8_t{ 0 } }) == false);
+    check("int16_nonzero_to_bool_true",  static_cast<bool>(value_t{ std::int16_t{ 1 } }) == true);
+    check("int16_zero_to_bool_false",    static_cast<bool>(value_t{ std::int16_t{ 0 } }) == false);
+    check("int64_nonzero_to_bool_true",  static_cast<bool>(value_t{ std::int64_t{ 0x1'0000'0000LL } }) == true);
+    check("int64_zero_to_bool_false",    static_cast<bool>(value_t{ std::int64_t{ 0 } }) == false);
+    check("uint16_nonzero_to_bool_true", static_cast<bool>(value_t{ std::uint16_t{ 0x8000 } }) == true);
+    check("uint16_zero_to_bool_false",   static_cast<bool>(value_t{ std::uint16_t{ 0 } }) == false);
+    check("float_nonzero_to_bool_true",  static_cast<bool>(value_t{ 0.5f }) == true);
+    check("float_zero_to_bool_false",    static_cast<bool>(value_t{ 0.0f }) == false);
+    check("double_nonzero_to_bool_true", static_cast<bool>(value_t{ -0.5 }) == true);
+    check("double_zero_to_bool_false",   static_cast<bool>(value_t{ 0.0 }) == false);
+    check("uint32_nonzero_to_bool_true", static_cast<bool>(value_t{ std::uint32_t{ 1 } }) == true);
+    check("uint32_zero_to_bool_false",   static_cast<bool>(value_t{ std::uint32_t{ 0 } }) == false);
+
+    // -------------------------------------------------------------------------
+    // bool alternative -> every arithmetic target: true == 1, false == 0.
+    // -------------------------------------------------------------------------
+    check("bool_true_to_int8_is_one",    static_cast<std::int8_t>(value_t{ true }) == std::int8_t{ 1 });
+    check("bool_true_to_int16_is_one",   static_cast<std::int16_t>(value_t{ true }) == std::int16_t{ 1 });
+    check("bool_true_to_int64_is_one",   static_cast<std::int64_t>(value_t{ true }) == 1LL);
+    check("bool_true_to_uint16_is_one",  static_cast<std::uint16_t>(value_t{ true }) == std::uint16_t{ 1 });
+    check("bool_true_to_uint32_is_one",  static_cast<std::uint32_t>(value_t{ true }) == 1u);
+    check("bool_true_to_float_is_one",   static_cast<float>(value_t{ true }) == 1.0f);
+    check("bool_true_to_double_is_one",  static_cast<double>(value_t{ true }) == 1.0);
+    check("bool_false_to_int_is_zero",   static_cast<std::int32_t>(value_t{ false }) == 0);
+    check("bool_false_to_double_is_zero",static_cast<double>(value_t{ false }) == 0.0);
+
+    // -------------------------------------------------------------------------
+    // int8_t alternative -> full arithmetic cast matrix (sign-extends because
+    // the SOURCE is signed; pins flaw that signedness is load-bearing on the
+    // exact alternative the producer chose).
+    // -------------------------------------------------------------------------
+    check("int8_neg_to_int16_sign_extends",
+          static_cast<std::int16_t>(value_t{ std::int8_t{ -2 } }) == std::int16_t{ -2 });
+    check("int8_neg_to_int64_sign_extends",
+          static_cast<std::int64_t>(value_t{ std::int8_t{ -2 } }) == -2LL);
+    check("int8_neg_to_uint16_wraps",
+          static_cast<std::uint16_t>(value_t{ std::int8_t{ -1 } }) == std::uint16_t{ 0xFFFF });
+    check("int8_neg_to_uint32_wraps",
+          static_cast<std::uint32_t>(value_t{ std::int8_t{ -1 } }) == 0xFFFF'FFFFu);
+    check("int8_to_float_exact",
+          static_cast<float>(value_t{ std::int8_t{ -3 } }) == -3.0f);
+    check("int8_to_double_exact",
+          static_cast<double>(value_t{ std::int8_t{ -3 } }) == -3.0);
+
+    // -------------------------------------------------------------------------
+    // int16_t alternative -> matrix.
+    // -------------------------------------------------------------------------
+    check("int16_neg_to_int32_sign_extends",
+          static_cast<std::int32_t>(value_t{ std::int16_t{ -300 } }) == -300);
+    check("int16_neg_to_int64_sign_extends",
+          static_cast<std::int64_t>(value_t{ std::int16_t{ -300 } }) == -300LL);
+    check("int16_to_int8_truncates_low_byte",
+          static_cast<std::int8_t>(value_t{ std::int16_t{ 0x1234 } }) == std::int8_t{ 0x34 });
+    check("int16_to_float_exact",
+          static_cast<float>(value_t{ std::int16_t{ -1234 } }) == -1234.0f);
+    check("int16_to_double_exact",
+          static_cast<double>(value_t{ std::int16_t{ 32767 } }) == 32767.0);
+
+    // -------------------------------------------------------------------------
+    // int32_t alternative -> matrix (narrowing + widening, both signs).
+    // -------------------------------------------------------------------------
+    check("int32_neg_to_int64_sign_extends",
+          static_cast<std::int64_t>(value_t{ std::int32_t{ -123456 } }) == -123456LL);
+    check("int32_to_int16_truncates",
+          static_cast<std::int16_t>(value_t{ std::int32_t{ 0x0001'ABCD } }) == std::int16_t{ static_cast<std::int16_t>(0xABCD) });
+    check("int32_to_uint32_reinterprets_negative",
+          static_cast<std::uint32_t>(value_t{ std::int32_t{ -1 } }) == 0xFFFF'FFFFu);
+    check("int32_to_float_loses_low_precision",
+          static_cast<float>(value_t{ std::int32_t{ 16777217 } }) == 16777216.0f); // 2^24+1 not representable
+    check("int32_to_double_exact_large",
+          static_cast<double>(value_t{ std::int32_t{ 2147483647 } }) == 2147483647.0);
+
+    // -------------------------------------------------------------------------
+    // int64_t alternative -> matrix, including the documented int64 -> int32
+    // truncation-to-zero when only the high half is set.
+    // -------------------------------------------------------------------------
+    check("int64_high_only_truncates_to_int32_zero",
+          static_cast<std::int32_t>(value_t{ std::int64_t{ 0x1'0000'0000LL } }) == 0);
+    check("int64_to_int16_keeps_low_16",
+          static_cast<std::int16_t>(value_t{ std::int64_t{ 0x7777'8888'9999'1234LL } }) == std::int16_t{ 0x1234 });
+    check("int64_to_uint32_keeps_low_32",
+          static_cast<std::uint32_t>(value_t{ std::int64_t{ 0x1234'5678'9ABC'DEF0LL } }) == 0x9ABC'DEF0u);
+    check("int64_neg_to_int32_sign_aware_low_bits",
+          static_cast<std::int32_t>(value_t{ std::int64_t{ -1LL } }) == -1);
+    check("int64_to_double_within_2pow53_exact",
+          static_cast<double>(value_t{ std::int64_t{ 9007199254740992LL } }) == 9007199254740992.0); // 2^53
+
+    // -------------------------------------------------------------------------
+    // uint16_t (char) alternative -> matrix.  Zero-extends to wider integers
+    // (unsigned source), and a 0xFFFF char reinterpreted as int16 is -1.
+    // -------------------------------------------------------------------------
+    check("uint16_max_to_int32_zero_extends",
+          static_cast<std::int32_t>(value_t{ std::uint16_t{ 0xFFFF } }) == 65535);
+    check("uint16_max_to_int64_zero_extends",
+          static_cast<std::int64_t>(value_t{ std::uint16_t{ 0xFFFF } }) == 65535LL);
+    check("uint16_max_to_int16_reinterprets_as_minus_one",
+          static_cast<std::int16_t>(value_t{ std::uint16_t{ 0xFFFF } }) == std::int16_t{ -1 });
+    check("uint16_to_int8_truncates_low_byte",
+          static_cast<std::int8_t>(value_t{ std::uint16_t{ 0x12FF } }) == std::int8_t{ -1 }); // 0xFF -> -1
+    check("uint16_to_uint32_zero_extends",
+          static_cast<std::uint32_t>(value_t{ std::uint16_t{ 0xABCD } }) == 0xABCDu);
+    check("uint16_to_float_exact",
+          static_cast<float>(value_t{ std::uint16_t{ 0xFFFF } }) == 65535.0f);
+    check("uint16_to_double_exact",
+          static_cast<double>(value_t{ std::uint16_t{ 0xFFFF } }) == 65535.0);
+
+    // -------------------------------------------------------------------------
+    // float alternative -> matrix.  Truncation toward zero for integer targets;
+    // exact widen to double.
+    // -------------------------------------------------------------------------
+    check("float_to_int32_truncates",
+          static_cast<std::int32_t>(value_t{ 7.9f }) == 7);
+    check("float_neg_to_int32_truncates_toward_zero",
+          static_cast<std::int32_t>(value_t{ -7.9f }) == -7);
+    check("float_to_int64_truncates",
+          static_cast<std::int64_t>(value_t{ 100.6f }) == 100LL);
+    check("float_to_int16_truncates",
+          static_cast<std::int16_t>(value_t{ 200.9f }) == std::int16_t{ 200 });
+    check("float_half_widens_to_double_exact",
+          static_cast<double>(value_t{ 0.5f }) == 0.5);
+    check("float_quarter_widens_to_double_exact",
+          static_cast<double>(value_t{ 0.25f }) == 0.25);
+
+    // -------------------------------------------------------------------------
+    // double alternative -> matrix.  Truncation toward zero; narrowing to float
+    // keeps an exactly-representable value.
+    // -------------------------------------------------------------------------
+    check("double_to_int32_truncates",
+          static_cast<std::int32_t>(value_t{ 9.99 }) == 9);
+    check("double_neg_to_int64_truncates_toward_zero",
+          static_cast<std::int64_t>(value_t{ -9.99 }) == -9LL);
+    check("double_to_int16_truncates",
+          static_cast<std::int16_t>(value_t{ 1234.99 }) == std::int16_t{ 1234 });
+    check("double_half_narrows_to_float_exact",
+          static_cast<float>(value_t{ 0.5 }) == 0.5f);
+    check("double_small_power_of_two_narrows_exact",
+          static_cast<float>(value_t{ 1024.0 }) == 1024.0f);
+
+    // -------------------------------------------------------------------------
+    // Floating-point special values survive the float<->double static_cast
+    // path.  We assert PROPERTIES (isnan / isinf / sign), never bit patterns or
+    // formatted spellings, so MinGW (libstdc++) and MSVC (STL) agree.  inf and
+    // nan are EXACT under float->double and double->float (no UB, unlike a
+    // finite overflow), so these are well-defined on both compilers.
+    // -------------------------------------------------------------------------
+    {
+        const double d_from_inf_f{ static_cast<double>(value_t{ std::numeric_limits<float>::infinity() }) };
+        check("float_pos_inf_widens_to_double_inf",
+              std::isinf(d_from_inf_f) && d_from_inf_f > 0.0);
+        const double d_from_neg_inf_f{ static_cast<double>(value_t{ -std::numeric_limits<float>::infinity() }) };
+        check("float_neg_inf_widens_to_double_neg_inf",
+              std::isinf(d_from_neg_inf_f) && d_from_neg_inf_f < 0.0);
+        const double d_from_nan_f{ static_cast<double>(value_t{ std::numeric_limits<float>::quiet_NaN() }) };
+        check("float_nan_widens_to_double_nan", std::isnan(d_from_nan_f));
+
+        const float f_from_inf_d{ static_cast<float>(value_t{ std::numeric_limits<double>::infinity() }) };
+        check("double_pos_inf_narrows_to_float_inf",
+              std::isinf(f_from_inf_d) && f_from_inf_d > 0.0f);
+        const float f_from_nan_d{ static_cast<float>(value_t{ std::numeric_limits<double>::quiet_NaN() }) };
+        check("double_nan_narrows_to_float_nan", std::isnan(f_from_nan_d));
+    }
+    // FLT_MAX survives float->float and float->double exactly (in-range, no UB).
+    check("float_max_round_trips",
+          static_cast<float>(value_t{ std::numeric_limits<float>::max() })
+              == std::numeric_limits<float>::max());
+    check("float_max_widens_to_double_exact",
+          static_cast<double>(value_t{ std::numeric_limits<float>::max() })
+              == static_cast<double>(std::numeric_limits<float>::max()));
+    // Smallest positive normal float round-trips (no flush-to-zero in the cast).
+    check("float_min_normal_round_trips",
+          static_cast<float>(value_t{ std::numeric_limits<float>::min() })
+              == std::numeric_limits<float>::min());
+    // DBL_MAX round-trips through the double->double identity cast.
+    check("double_max_round_trips",
+          static_cast<double>(value_t{ std::numeric_limits<double>::max() })
+              == std::numeric_limits<double>::max());
+
+    // -------------------------------------------------------------------------
+    // Per-alternative round-trip to SELF at boundary values that the existing
+    // suite did not pin (extends the int8/int16/uint16 self round-trips).
+    // -------------------------------------------------------------------------
+    check("int8_zero_self_round_trip",
+          static_cast<std::int8_t>(value_t{ std::int8_t{ 0 } }) == std::int8_t{ 0 });
+    check("int16_max_self_round_trip",
+          static_cast<std::int16_t>(value_t{ std::int16_t{ 32767 } }) == std::int16_t{ 32767 });
+    check("int32_minus_one_self_round_trip",
+          static_cast<std::int32_t>(value_t{ std::int32_t{ -1 } }) == -1);
+    check("int64_minus_one_self_round_trip",
+          static_cast<std::int64_t>(value_t{ std::int64_t{ -1LL } }) == -1LL);
+    check("uint16_mid_self_round_trip",
+          static_cast<std::uint16_t>(value_t{ std::uint16_t{ 0x8000 } }) == std::uint16_t{ 0x8000 });
+    check("uint32_zero_self_round_trip",
+          static_cast<std::uint32_t>(value_t{ std::uint32_t{ 0 } }) == 0u);
+    check("uint32_max_self_round_trip",
+          static_cast<std::uint32_t>(value_t{ std::uint32_t{ 0xFFFF'FFFF } }) == 0xFFFF'FFFFu);
+
+    // -------------------------------------------------------------------------
+    // uint32_t (reference) alternative -> void* across a fuller value set, all
+    // matching decode_oop_pointer EXACTLY (which is the no-truncation contract).
+    // With no VMStructs every one of these is nullptr, but we compare against
+    // the helper rather than hardcoding nullptr so the assertion still holds if
+    // a future build links a JVM into the test harness.
+    // -------------------------------------------------------------------------
+    check("uint32_two_to_voidptr_matches_decode",
+          static_cast<void*>(value_t{ std::uint32_t{ 2 } })
+              == vmhook::hotspot::decode_oop_pointer(2u));
+    check("uint32_sentinel_cafebabe_to_voidptr_matches_decode",
+          static_cast<void*>(value_t{ std::uint32_t{ 0xCAFEBABE } })
+              == vmhook::hotspot::decode_oop_pointer(0xCAFEBABEu));
+    check("uint32_aligned_to_voidptr_matches_decode",
+          static_cast<void*>(value_t{ std::uint32_t{ 0x0010'0000 } })
+              == vmhook::hotspot::decode_oop_pointer(0x0010'0000u));
+    // uint32_t -> std::string also routes through decode + read_java_string and
+    // yields "" with no JVM (this is the operator's std::string arm, distinct
+    // from as_string()).  Invoked via the explicit operator call (static_cast is
+    // ambiguous, see above).
+    check("uint32_to_string_via_operator_empty_no_jvm",
+          value_t{ std::uint32_t{ 12345 } }.operator std::string().empty());
+    check("uint32_zero_to_string_via_operator_empty",
+          value_t{ std::uint32_t{ 0 } }.operator std::string().empty());
+
+    // -------------------------------------------------------------------------
+    // A default-constructed value_t holds monostate and converts determinist(-
+    // ally) to the zero/false/null/"" of every target — the documented
+    // "no value" contract.
+    // -------------------------------------------------------------------------
+    check("default_value_t_is_void",        value_t{}.is_void() == true);
+    check("default_value_t_to_int_zero",     static_cast<std::int32_t>(value_t{}) == 0);
+    check("default_value_t_to_bool_false",   static_cast<bool>(value_t{}) == false);
+    check("default_value_t_to_double_zero",  static_cast<double>(value_t{}) == 0.0);
+    check("default_value_t_to_voidptr_null", static_cast<void*>(value_t{}) == nullptr);
+    check("default_value_t_as_string_empty", value_t{}.as_string().empty());
+    check("default_value_t_to_unique_ptr_null",
+          value_t{}.operator std::unique_ptr<W>() == nullptr);
+
+    // -------------------------------------------------------------------------
+    // Compile-time conversion-operator surface: pin the remaining targets the
+    // operator must satisfy (char, unsigned variants, void*, unique_ptr).  A
+    // future reshuffle of the variant or the operator arms is caught at build.
+    // -------------------------------------------------------------------------
+    static_assert(std::is_convertible_v<value_t, char>,            "value_t -> char");
+    static_assert(std::is_convertible_v<value_t, unsigned char>,   "value_t -> unsigned char");
+    static_assert(std::is_convertible_v<value_t, short>,           "value_t -> short");
+    static_assert(std::is_convertible_v<value_t, unsigned short>,  "value_t -> unsigned short");
+    static_assert(std::is_convertible_v<value_t, long long>,       "value_t -> long long");
+    static_assert(std::is_convertible_v<value_t, std::uint64_t>,   "value_t -> uint64");
+    static_assert(std::is_nothrow_move_constructible_v<value_t>,   "value_t move ctor noexcept");
+    // as_string / is_void / is_string are noexcept (the call()/JVM seam relies
+    // on it — a throwing introspector would std::terminate the host JVM).
+    static_assert(noexcept(std::declval<const value_t&>().as_string()), "as_string noexcept");
+    static_assert(noexcept(std::declval<const value_t&>().is_void()),   "is_void noexcept");
+    static_assert(noexcept(std::declval<const value_t&>().is_string()), "is_string noexcept");
+    check("value_t_extended_compile_time_surface_present", true);
+
+    // -------------------------------------------------------------------------
+    // method_proxy::get_compressed_oop(): null object -> 0 (no JVM, no crash).
+    // With a real stack uint32_t fed as the "object" pointer it reads the first
+    // 4 bytes via memcpy (no decode, no JVM) — proving the raw 4-byte read.
+    // -------------------------------------------------------------------------
+    {
+        vmhook::method_proxy null_obj{ nullptr, nullptr, std::string{ "()I" } };
+        check("get_compressed_oop_null_object_is_zero", null_obj.get_compressed_oop() == 0u);
+    }
+    {
+        // A stack value standing in for an object header's first 4 bytes.
+        std::uint32_t fake_header{ 0x1234'ABCDu };
+        vmhook::method_proxy proxy{ &fake_header, nullptr, std::string{ "()Ljava/lang/Object;" } };
+        check("get_compressed_oop_reads_first_four_bytes",
+              proxy.get_compressed_oop() == 0x1234'ABCDu);
+    }
+    {
+        // Zero-valued header reads back as 0 even with a non-null object.
+        std::uint32_t zero_header{ 0u };
+        vmhook::method_proxy proxy{ &zero_header, nullptr, std::string{ "()Ljava/lang/Object;" } };
+        check("get_compressed_oop_zero_header_is_zero", proxy.get_compressed_oop() == 0u);
+    }
+
+    // -------------------------------------------------------------------------
+    // method_proxy::is_static(): with a null Method* the live-flags read can't
+    // happen, so it returns false REGARDLESS of whether the object pointer is
+    // null (static) or non-null (instance).  Pins the documented fallback.
+    // -------------------------------------------------------------------------
+    {
+        std::uint32_t dummy{ 0 };
+        vmhook::method_proxy with_obj{ &dummy, nullptr, std::string{ "()V" } };
+        check("is_static_false_when_object_non_null_and_method_null",
+              with_obj.is_static() == false);
+        // raw_method stays null; name stays empty; signature still round-trips.
+        check("with_obj_raw_method_null", with_obj.raw_method() == nullptr);
+        check("with_obj_name_empty",      with_obj.name().empty());
+        check("with_obj_signature_round_trips",
+              with_obj.signature() == std::string_view{ "()V" });
+    }
+
+    // -------------------------------------------------------------------------
+    // method_proxy::is_reference(): a few more descriptor shapes the suite
+    // hadn't covered (char/byte/short/float returns -> primitives -> false;
+    // nested generic-erased object signature -> true).
+    // -------------------------------------------------------------------------
+    {
+        vmhook::method_proxy p{ nullptr, nullptr, std::string{ "()C" } };
+        check("is_reference_false_for_char_return", p.is_reference() == false);
+    }
+    {
+        vmhook::method_proxy p{ nullptr, nullptr, std::string{ "()B" } };
+        check("is_reference_false_for_byte_return", p.is_reference() == false);
+    }
+    {
+        vmhook::method_proxy p{ nullptr, nullptr, std::string{ "()S" } };
+        check("is_reference_false_for_short_return", p.is_reference() == false);
+    }
+    {
+        vmhook::method_proxy p{ nullptr, nullptr, std::string{ "()F" } };
+        check("is_reference_false_for_float_return", p.is_reference() == false);
+    }
+    {
+        // 3D array of objects -> first char after ')' is '[' -> true.
+        vmhook::method_proxy p{ nullptr, nullptr, std::string{ "()[[[Ljava/lang/String;" } };
+        check("is_reference_true_for_3d_object_array_return", p.is_reference() == true);
+    }
+    {
+        // Object array of a primitive inner type still starts with '[' -> true.
+        vmhook::method_proxy p{ nullptr, nullptr, std::string{ "(JD)[Z" } };
+        check("is_reference_true_for_boolean_array_return", p.is_reference() == true);
     }
 
     return failures == 0 ? 0 : 1;
