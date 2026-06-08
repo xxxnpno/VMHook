@@ -11,7 +11,41 @@
 //   * allocation_granularity() must be a multiple of page_size() — required
 //     by every trampoline allocator that walks the address space at
 //     granularity-sized strides.
-
+//
+// EXHAUSTIVE EXPANSION
+// --------------------
+// This file drives os::protect (and its interaction with allocate_rwx /
+// query_region / safe_read / release) from every input/edge that is *safely*
+// testable in-process:
+//   * protect a freshly-allocated page to each portable protection
+//     (read, read_write, execute_read, execute_rw, no_access) and confirm the
+//     page contents survive each transition;
+//   * round-trip protect -> query_region -> protect-back (the natural
+//     trampoline-installer pattern);
+//   * page-boundary rounding of base+size: 1 byte -> 1 page, exact one page,
+//     one page minus one, exactly N pages, N pages plus one byte (spill into
+//     the next page), and an unaligned interior base spanning many pages;
+//   * idempotent re-protect (same protection twice) and protect of an
+//     already-correctly-protected region;
+//   * the old_prot output contract — PLATFORM-ASYMMETRIC: Windows writes the
+//     genuine previous native flags, POSIX always writes 0.  We assert the
+//     contract WITHOUT ever feeding a POSIX old_prot back into protect() (that
+//     would request no_access and brick the page);
+//   * a behavioural probe of each protection via safe_read where it is
+//     fault-safe to do so (skipped on iOS — no fault-safe read API — and when
+//     a sandbox refuses PROT_NONE).
+//
+// SAFETY: every test only ever protects memory it allocated itself, always
+// restores a writable mapping before release(), never executes written bytes,
+// and never reads a no_access page except through the fault-safe safe_read()
+// path (which is itself gated off on iOS and skipped if PROT_NONE is refused).
+//
+// PORTABILITY: protection-flag VALUES and the page size differ by OS, so every
+// assertion here is an INVARIANT (round-trip survival, alignment, success /
+// failure contract, asymmetry of old_prot) rather than an OS-specific constant.
+// The only OS-gated literal is the Windows-vs-POSIX old_prot contract, behind
+// VMHOOK_OS_WINDOWS.  No <charconv>/float, no std::expected/syncstream — the
+// file builds under the MinGW libstdc++, MSVC STL, and libc++ CI toolchains.
 #include <vmhook/vmhook.hpp>
 
 #include <cstdio>
@@ -27,6 +61,39 @@ static auto check(const char* name, bool ok) -> void
     {
         ++failures;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers.  Keeping the W^X fallback and the no_access behavioural probe
+// in one place lets every test below restore a writable mapping the same way
+// and keeps the per-test bodies focused on the edge they target.
+// ---------------------------------------------------------------------------
+
+// Restore a writable mapping for teardown.  execute_rw is the natural state a
+// page came back from allocate_rwx with; Apple arm64 / current iOS enforce W^X
+// and refuse PROT_WRITE|PROT_EXEC without the JIT entitlement, so fall back to
+// plain read_write (which is what allocate_rwx itself falls back to there).
+static auto make_writable(void* base, std::size_t size) -> bool
+{
+    bool ok{ vmhook::os::protect(base, size,
+                                 vmhook::os::memory_protection::execute_rw, nullptr) };
+    if (!ok)
+    {
+        ok = vmhook::os::protect(base, size,
+                                 vmhook::os::memory_protection::read_write, nullptr);
+    }
+    return ok;
+}
+
+// Probe whether the first byte at `p` is readable, WITHOUT faulting.  safe_read
+// uses ReadProcessMemory / process_vm_readv / mach_vm_read_overwrite, all of
+// which kernel-validate the source and return false instead of crashing.  Not
+// usable on iOS (safe_read there is a raw memcpy that would fault on a
+// no_access page), so callers gate the no_access cases behind !VMHOOK_OS_IOS.
+static auto byte_is_readable(const void* p) -> bool
+{
+    std::uint8_t sink{ 0 };
+    return vmhook::os::safe_read(&sink, p, 1u);
 }
 
 static auto test_granularity_relationship() -> void
@@ -96,14 +163,7 @@ static auto test_protect_non_aligned_address() -> void
     // platforms (Apple arm64 without JIT entitlement) only permit RW after
     // a writable->execute_rw transition; in that case we still want the
     // page to be writable for the cleanup memset below.
-    bool restored{ vmhook::os::protect(bytes, page,
-                                       vmhook::os::memory_protection::execute_rw, nullptr) };
-    if (!restored)
-    {
-        restored = vmhook::os::protect(bytes, page,
-                                       vmhook::os::memory_protection::read_write, nullptr);
-    }
-    check("protect_back_to_rw", restored);
+    check("protect_back_to_rw", make_writable(bytes, page));
 
     vmhook::os::release(block, page * 2);
 }
@@ -138,14 +198,7 @@ static auto test_protect_crossing_page_boundary() -> void
           bytes[page] == 0xCC && bytes[page * 2 - 1] == 0xDD);
 
     // Restore writable.
-    bool restored{ vmhook::os::protect(bytes, page * 2,
-                                       vmhook::os::memory_protection::execute_rw, nullptr) };
-    if (!restored)
-    {
-        restored = vmhook::os::protect(bytes, page * 2,
-                                       vmhook::os::memory_protection::read_write, nullptr);
-    }
-    check("protect_back_to_rw_crossing", restored);
+    check("protect_back_to_rw_crossing", make_writable(bytes, page * 2));
 
     vmhook::os::release(block, page * 2);
 }
@@ -312,18 +365,584 @@ static auto test_protect_all_enum_values() -> void
 
     // Tear down: ensure writable before unmap so any platform-level integrity
     // check at release time doesn't trip on a read-only mapping.
-    bool restored{ vmhook::os::protect(block, page,
-                                       vmhook::os::memory_protection::execute_rw, nullptr) };
-    if (!restored)
-    {
-        restored = vmhook::os::protect(block, page,
-                                       vmhook::os::memory_protection::read_write, nullptr);
-    }
-    check("protect_back_to_rw_after_enum_walk", restored);
+    check("protect_back_to_rw_after_enum_walk", make_writable(block, page));
     bytes[0] = 0x5A;
     check("protect_byte_still_writable_after_walk", bytes[0] == 0x5A);
 
     vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// EXHAUSTIVE: every portable protection in BOTH directions, each verified by a
+// behavioural probe (safe_read), not just the bool return.  The enum-walk above
+// only checks the return; here we confirm the page actually ends up readable /
+// unreadable as requested, distinguishing read_write (R+W, no X) from
+// execute_rw (R+W+X) and execute_read (R+X) from read (R).  We never trigger a
+// write/exec fault directly (no SEH / signal harness in this TU); writability
+// is verified by an actual store only for the writable protections.
+//
+// no_access and the X-bearing protections are gated:
+//   * no_access read-back requires the fault-safe safe_read path -> !iOS, and
+//     is skipped when a sandbox refuses PROT_NONE.
+//   * execute_rw may be refused under W^X; we treat refusal as "skip", never
+//     as failure.
+// ---------------------------------------------------------------------------
+static auto test_protect_each_protection_behavioural() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("protect_behavioural_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x10;
+
+    // read: page becomes R-only.  safe_read must succeed (readable); we do NOT
+    // attempt a store (that would fault).  The byte content is unchanged.
+    {
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::read, nullptr) };
+        check("protect_read_succeeds", ok);
+#if !VMHOOK_OS_IOS
+        if (ok)
+        {
+            check("protect_read_page_is_readable", byte_is_readable(block));
+        }
+#endif
+        check("protect_read_preserves_byte", bytes[0] == 0x10);
+    }
+
+    // read_write: page becomes R+W (no X).  A real store must stick.
+    {
+        const bool ok{ make_writable(block, page) }; // execute_rw or read_write
+        check("protect_read_write_succeeds", ok);
+        if (ok)
+        {
+            bytes[0] = 0x20;
+            check("protect_read_write_store_sticks", bytes[0] == 0x20);
+#if !VMHOOK_OS_IOS
+            check("protect_read_write_page_is_readable", byte_is_readable(block));
+#endif
+        }
+    }
+
+    // execute_read: page becomes R+X.  Readable; we never execute the bytes.
+    {
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::execute_read, nullptr) };
+        check("protect_execute_read_succeeds", ok);
+#if !VMHOOK_OS_IOS
+        if (ok)
+        {
+            check("protect_execute_read_page_is_readable", byte_is_readable(block));
+        }
+#endif
+        check("protect_execute_read_preserves_byte", bytes[0] == 0x20);
+    }
+
+    // execute_rw: page becomes R+W+X.  May be refused under W^X; treat refusal
+    // as a skip.  When it succeeds a real store must stick and it is readable.
+    {
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::execute_rw, nullptr) };
+        if (ok)
+        {
+            bytes[0] = 0x30;
+            check("protect_execute_rw_store_sticks", bytes[0] == 0x30);
+#if !VMHOOK_OS_IOS
+            check("protect_execute_rw_page_is_readable", byte_is_readable(block));
+#endif
+        }
+        else
+        {
+            std::printf("[INFO] protect_execute_rw skipped: refused (W^X / no JIT entitlement)\n");
+        }
+    }
+
+    // no_access: page becomes unreadable.  Gated off iOS (no fault-safe read)
+    // and skipped where PROT_NONE is refused.
+#if !VMHOOK_OS_IOS
+    {
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::no_access, nullptr) };
+        if (ok)
+        {
+            check("protect_no_access_page_is_not_readable", !byte_is_readable(block));
+        }
+        else
+        {
+            std::printf("[INFO] protect_no_access skipped: refused (sandbox forbids PROT_NONE)\n");
+        }
+    }
+#endif
+
+    // Always restore writable before release.
+    check("protect_behavioural_restore_writable", make_writable(block, page));
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// EXHAUSTIVE: the natural trampoline-installer pattern — protect a page, query
+// it back, protect it back — works as a round trip and query_region reflects
+// the requested state.  query_region's `executable`/`readable` flags are
+// platform-derived (Windows reads PAGE_*, Linux parses /proc perms, macOS reads
+// mach protection), so we assert the cross-platform-true direction only:
+//   * after protect(read)         -> region is readable;
+//   * after protect(execute_read) -> region is readable AND executable;
+//   * after protect(read_write)   -> region is readable.
+// We deliberately do NOT assert "execute bit clear after read" because some
+// kernels keep an executable mapping's backing flags coarser than the portable
+// enum; the positive direction is the contract callers rely on.
+// ---------------------------------------------------------------------------
+static auto test_protect_query_roundtrip() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("protect_query_roundtrip_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x99;
+
+    // read -> readable.
+    {
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::read, nullptr) };
+        check("protect_query_read_succeeds", ok);
+        const auto info{ vmhook::os::query_region(block) };
+        check("protect_query_read_region_committed", info.committed);
+        check("protect_query_read_region_readable", info.readable);
+    }
+
+    // execute_read -> readable + executable.  Skip the executable assertion if
+    // the transition was refused (W^X edge); on the platforms that grant R+X
+    // query_region reports the X bit.
+    {
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::execute_read, nullptr) };
+        check("protect_query_execrx_succeeds", ok);
+        if (ok)
+        {
+            const auto info{ vmhook::os::query_region(block) };
+            check("protect_query_execrx_region_readable", info.readable);
+            check("protect_query_execrx_region_executable", info.executable);
+        }
+    }
+
+    // read_write -> readable, and an actual store must stick (proves the W bit).
+    {
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::read_write, nullptr) };
+        check("protect_query_rw_succeeds", ok);
+        if (ok)
+        {
+            const auto info{ vmhook::os::query_region(block) };
+            check("protect_query_rw_region_readable", info.readable);
+            bytes[0] = 0xCD;
+            check("protect_query_rw_store_sticks", bytes[0] == 0xCD);
+        }
+    }
+
+    check("protect_query_roundtrip_restore_writable", make_writable(block, page));
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// EXHAUSTIVE: the old_prot output contract.  The signature exposes an optional
+// old_prot out-parameter, but its meaning is PLATFORM-ASYMMETRIC:
+//   * Windows: VirtualProtect reports the genuine previous protection, so
+//     old_prot receives a non-zero PAGE_* bitmask after a successful flip.
+//   * POSIX:   mprotect has no cheap way to read the prior flags, so the
+//     wrapper writes 0 unconditionally.
+// A caller that does "save old, work, restore old" would, on POSIX, restore
+// with 0 == no_access and brick the page.  We pin BOTH halves of the contract
+// here so a future "real previous flags on Linux" change is a deliberate,
+// tested decision rather than a silent break — and crucially we NEVER feed the
+// POSIX old_prot back into protect().
+// ---------------------------------------------------------------------------
+static auto test_protect_old_prot_contract() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("protect_old_prot_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x01;
+
+    constexpr std::uint32_t sentinel{ 0xDEADBEEFu };
+
+    // First flip: RWX (from allocate_rwx) -> read.  old_prot must be WRITTEN on
+    // success (it must not keep the sentinel) on every platform.
+    {
+        std::uint32_t op{ sentinel };
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::read, &op) };
+        check("protect_old_prot_first_flip_succeeds", ok);
+        if (ok)
+        {
+            check("protect_old_prot_written_on_success", op != sentinel);
+#if VMHOOK_OS_WINDOWS
+            // Windows reports the genuine prior protection; the page was RWX
+            // (PAGE_EXECUTE_READWRITE) before this flip, so old_prot is a
+            // non-zero PAGE_* bitmask.  We do not pin the exact value (it is a
+            // native constant), only that it is meaningfully populated.
+            check("protect_old_prot_windows_nonzero", op != 0u);
+#else
+            // POSIX contract: old_prot is always exactly 0 after success.  This
+            // is the documented asymmetry; if it ever becomes the real previous
+            // flags this assertion will fire and force a conscious update.
+            check("protect_old_prot_posix_is_zero", op == 0u);
+#endif
+        }
+    }
+
+    // Second flip: read -> read_write.  Same contract; on Windows old_prot now
+    // reflects PAGE_READONLY (still non-zero), on POSIX still 0.
+    {
+        std::uint32_t op{ sentinel };
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::read_write, &op) };
+        check("protect_old_prot_second_flip_succeeds", ok);
+        if (ok)
+        {
+            check("protect_old_prot_second_written_on_success", op != sentinel);
+#if VMHOOK_OS_WINDOWS
+            check("protect_old_prot_second_windows_nonzero", op != 0u);
+#else
+            check("protect_old_prot_second_posix_is_zero", op == 0u);
+#endif
+        }
+    }
+
+    // A successful protect with a NULL old_prot must also succeed and not crash
+    // (the `if (old_prot)` guard on the success path must be exercised with
+    // old_prot == nullptr, not only on the failure path).
+    check("protect_success_null_old_prot_ok",
+          vmhook::os::protect(block, page,
+                              vmhook::os::memory_protection::read, nullptr));
+
+    check("protect_old_prot_restore_writable", make_writable(block, page));
+    bytes[0] = 0x02;
+    check("protect_old_prot_byte_writable_after", bytes[0] == 0x02);
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// EXHAUSTIVE: size/rounding boundary pairs against the POSIX page-rounding math
+// (base &= ~(ps-1); size = (end-base+ps-1) & ~(ps-1)) and Windows' native
+// rounding.  Allocate THREE pages so even the "+1 byte spill" case stays inside
+// our own allocation, write distinct markers across all three pages, and run
+// each size through protect(read) -> restore, asserting no marker is corrupted.
+//   size == 1            -> rounds up to exactly one page
+//   size == page - 1     -> rounds up to exactly one page
+//   size == page         -> exactly one page, no rounding
+//   size == page + 1     -> spills into page 1 -> two pages
+//   size == 2*page       -> exactly two pages
+//   size == 2*page + 1   -> spills into page 2 -> three pages
+// Each is launched from an aligned base (block) so the covered span is
+// predictable; the unaligned-base spans are covered by the crossing test above
+// and the many-page unaligned case below.
+// ---------------------------------------------------------------------------
+static auto test_protect_size_rounding_boundaries() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * 3) };
+    if (!block)
+    {
+        check("protect_size_rounding_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+
+    const std::size_t sizes[]{
+        std::size_t{ 1 },
+        page - 1,
+        page,
+        page + 1,
+        page * 2,
+        page * 2 + 1,
+    };
+
+    bool all_ok{ true };
+    bool all_preserved{ true };
+    for (const std::size_t sz : sizes)
+    {
+        // Re-stamp distinct markers across all three pages before each pass.
+        bytes[0]              = 0xA0;
+        bytes[page]           = 0xB0;
+        bytes[page * 2]       = 0xC0;
+        bytes[page * 3 - 1]   = 0xD0;
+
+        if (!vmhook::os::protect(block, sz,
+                                 vmhook::os::memory_protection::read, nullptr))
+        {
+            all_ok = false;
+        }
+
+        // Whatever sub-span got rounded read-only, the contents must be intact.
+        if (!(bytes[0] == 0xA0 && bytes[page] == 0xB0
+              && bytes[page * 2] == 0xC0 && bytes[page * 3 - 1] == 0xD0))
+        {
+            all_preserved = false;
+        }
+
+        // Restore the whole allocation writable for the next iteration.
+        if (!make_writable(block, page * 3))
+        {
+            all_ok = false;
+        }
+    }
+
+    check("protect_size_rounding_all_sizes_succeed", all_ok);
+    check("protect_size_rounding_preserves_all_markers", all_preserved);
+
+    // Leave it writable + release.
+    check("protect_size_rounding_restore_writable", make_writable(block, page * 3));
+    vmhook::os::release(block, page * 3);
+}
+
+// ---------------------------------------------------------------------------
+// EXHAUSTIVE: exact one-page span (no rounding) and exact multi-page spans.
+// Distinguished from the boundary sweep above by asserting per-span behaviour
+// individually with descriptive names, and by exercising an exact 3-page span
+// in a single call.
+// ---------------------------------------------------------------------------
+static auto test_protect_exact_page_multiples() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * 3) };
+    if (!block)
+    {
+        check("protect_exact_multiples_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0]            = 0x1A;
+    bytes[page]         = 0x2B;
+    bytes[page * 2]     = 0x3C;
+
+    // Exactly one page.
+    check("protect_exact_one_page_succeeds",
+          vmhook::os::protect(block, page,
+                              vmhook::os::memory_protection::read, nullptr));
+    check("protect_exact_one_page_preserves",
+          bytes[0] == 0x1A && bytes[page] == 0x2B && bytes[page * 2] == 0x3C);
+    check("protect_exact_one_page_restore", make_writable(block, page * 3));
+
+    // Exactly two pages.
+    check("protect_exact_two_pages_succeeds",
+          vmhook::os::protect(block, page * 2,
+                              vmhook::os::memory_protection::read, nullptr));
+    check("protect_exact_two_pages_preserves",
+          bytes[0] == 0x1A && bytes[page] == 0x2B && bytes[page * 2] == 0x3C);
+    check("protect_exact_two_pages_restore", make_writable(block, page * 3));
+
+    // Exactly three pages (the whole allocation) in one call.
+    check("protect_exact_three_pages_succeeds",
+          vmhook::os::protect(block, page * 3,
+                              vmhook::os::memory_protection::read, nullptr));
+    check("protect_exact_three_pages_preserves",
+          bytes[0] == 0x1A && bytes[page] == 0x2B && bytes[page * 2] == 0x3C);
+    check("protect_exact_three_pages_restore", make_writable(block, page * 3));
+
+    vmhook::os::release(block, page * 3);
+}
+
+// ---------------------------------------------------------------------------
+// EXHAUSTIVE: an unaligned interior base whose [base, base+len) spans several
+// pages.  The wrapper must align base DOWN and round the length UP to cover the
+// whole request — exactly the formula reproduced in test_os_layer.cpp, here
+// exercised against a live mprotect/VirtualProtect.  Four pages allocated; we
+// protect from 3 bytes into page 0 across a length that reaches into page 2.
+// ---------------------------------------------------------------------------
+static auto test_protect_unaligned_multipage_span() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * 4) };
+    if (!block)
+    {
+        check("protect_unaligned_multipage_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0]              = 0x5A;
+    bytes[page]           = 0x6B;
+    bytes[page * 2]       = 0x7C;
+    bytes[page * 3]       = 0x8D;
+    bytes[page * 4 - 1]   = 0x9E;
+
+    // Base 3 bytes into page 0; length spans into page 2 (covers pages 0..2).
+    const std::size_t len{ page * 2 + 8 };
+    const bool flipped{ vmhook::os::protect(bytes + 3, len,
+                                            vmhook::os::memory_protection::read,
+                                            nullptr) };
+    check("protect_unaligned_multipage_succeeds", flipped);
+    check("protect_unaligned_multipage_preserves_all",
+          bytes[0] == 0x5A && bytes[page] == 0x6B && bytes[page * 2] == 0x7C
+          && bytes[page * 3] == 0x8D && bytes[page * 4 - 1] == 0x9E);
+
+    check("protect_unaligned_multipage_restore", make_writable(block, page * 4));
+    vmhook::os::release(block, page * 4);
+}
+
+// ---------------------------------------------------------------------------
+// EXHAUSTIVE: idempotent re-protect and protect-of-already-correct.
+//   * Applying the SAME protection twice in a row must both succeed and leave
+//     the page in that protection (no state corruption on a no-op transition).
+//   * Applying read_write to a page that is already read_write (allocate_rwx
+//     came back RW or RWX) must succeed and remain writable.
+// ---------------------------------------------------------------------------
+static auto test_protect_idempotent_reprotect() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("protect_idempotent_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x44;
+
+    // read twice.
+    check("protect_read_first_succeeds",
+          vmhook::os::protect(block, page,
+                              vmhook::os::memory_protection::read, nullptr));
+    check("protect_read_second_succeeds",
+          vmhook::os::protect(block, page,
+                              vmhook::os::memory_protection::read, nullptr));
+#if !VMHOOK_OS_IOS
+    check("protect_read_twice_still_readable", byte_is_readable(block));
+#endif
+    check("protect_read_twice_preserves_byte", bytes[0] == 0x44);
+
+    // read_write twice; a store must stick after the second.
+    check("protect_rw_first_succeeds", make_writable(block, page));
+    check("protect_rw_second_succeeds",
+          vmhook::os::protect(block, page,
+                              vmhook::os::memory_protection::read_write, nullptr));
+    bytes[0] = 0x55;
+    check("protect_rw_twice_store_sticks", bytes[0] == 0x55);
+
+    // protect-of-already-correct: read_write a third time changes nothing.
+    check("protect_already_rw_succeeds",
+          vmhook::os::protect(block, page,
+                              vmhook::os::memory_protection::read_write, nullptr));
+    check("protect_already_rw_store_still_sticks", (bytes[0] = 0x66) == 0x66);
+
+    check("protect_idempotent_restore_writable", make_writable(block, page));
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// EXHAUSTIVE: out-of-range enum value.  Both to_native_protect overloads end
+// with a `return PAGE_NOACCESS;` / `return PROT_NONE;` fallback, so a garbage
+// enum cast degrades to the most-restrictive mapping and protect() still
+// returns true.  Pin that fallback: the call succeeds AND the page becomes
+// inaccessible (safe_read refuses).  This locks the current behaviour so a
+// refactor cannot silently turn the fallback into, say, RWX.
+//
+// Gated like the other no_access probes: the read-back needs the fault-safe
+// path (off on iOS) and PROT_NONE may be refused in a sandbox.  Where the
+// platform refuses the most-restrictive mapping the protect() call may itself
+// fail; we treat that as a skip rather than a failure, because the contract we
+// own is "garbage enum does not silently become a PERMISSIVE mapping".
+// ---------------------------------------------------------------------------
+#if !VMHOOK_OS_IOS
+static auto test_protect_out_of_range_enum_is_restrictive() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("protect_oor_enum_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x7F;
+
+    const auto garbage{ static_cast<vmhook::os::memory_protection>(0xFFu) };
+    const bool ok{ vmhook::os::protect(block, page, garbage, nullptr) };
+    if (ok)
+    {
+        // Fallback mapped to no_access -> the page must NOT be readable.  This
+        // is the load-bearing assertion: a garbage enum must never widen access.
+        check("protect_oor_enum_maps_to_no_access", !byte_is_readable(block));
+    }
+    else
+    {
+        // A sandbox refused the most-restrictive mapping (PROT_NONE).  That is
+        // acceptable; what matters is it did not silently succeed as permissive.
+        std::printf("[INFO] protect_oor_enum skipped: most-restrictive mapping refused\n");
+    }
+
+    // Restore writable regardless (the page may currently be no_access).
+    check("protect_oor_enum_restore_writable", make_writable(block, page));
+    vmhook::os::release(block, page);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// EXHAUSTIVE: alignment witness.  Sub-page protect MUST page-round and so MUST
+// NOT bleed into a neighbouring page.  Allocate two pages, write a distinct
+// marker into page 1, protect a single byte in page 0 read-only, and confirm
+// page 1 is STILL WRITABLE (a fresh store sticks).  This is the assertion the
+// existing unaligned tests omit — they prove non-corruption of the *other*
+// page's existing bytes but not its continued writability.
+//
+// On POSIX the rounding covers page 0 only (base rounds down into page 0, the
+// 1-byte length rounds up to one page), so page 1 stays whatever it was (RW).
+// On Windows VirtualProtect rounds to the page enclosing the single byte, with
+// the same outcome.  Either way page 1 must remain writable.
+// ---------------------------------------------------------------------------
+static auto test_protect_subpage_does_not_bleed_into_neighbour() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * 2) };
+    if (!block)
+    {
+        check("protect_neighbour_witness_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0]    = 0x01; // page 0 marker
+    bytes[page] = 0x02; // page 1 marker (the neighbour we must keep writable)
+
+    // Make a single byte in page 0 read-only.  Must round to page 0 only.
+    const bool flipped{ vmhook::os::protect(bytes, 1,
+                                            vmhook::os::memory_protection::read,
+                                            nullptr) };
+    check("protect_neighbour_witness_flip_succeeds", flipped);
+
+    // Page 0's existing byte is intact (protection change never rewrites data).
+    check("protect_neighbour_witness_page0_byte_intact", bytes[0] == 0x01);
+
+    // The neighbour page must still be WRITABLE — a brand-new store must stick.
+    // If sub-page protect had bled into page 1 this store would fault (and the
+    // process would die) or, at minimum, not take effect.  We reach it only
+    // because page 1 was never touched by the page-0 rounding.
+    bytes[page] = 0xF2;
+    check("protect_neighbour_witness_page1_still_writable", bytes[page] == 0xF2);
+
+    // Restore page 0 writable and release the whole allocation.
+    check("protect_neighbour_witness_restore", make_writable(block, page * 2));
+    vmhook::os::release(block, page * 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -367,9 +986,18 @@ int main()
     test_protect_non_aligned_address();
     test_protect_crossing_page_boundary();
     test_protect_all_enum_values();
+    test_protect_each_protection_behavioural();
+    test_protect_query_roundtrip();
+    test_protect_old_prot_contract();
+    test_protect_size_rounding_boundaries();
+    test_protect_exact_page_multiples();
+    test_protect_unaligned_multipage_span();
+    test_protect_idempotent_reprotect();
+    test_protect_subpage_does_not_bleed_into_neighbour();
     test_os_primitive_input_guards();
 #if !VMHOOK_OS_IOS
     test_safe_read_refuses_no_access_page();
+    test_protect_out_of_range_enum_is_restrictive();
     test_query_region_reports_free_for_unallocated();
 #endif
 

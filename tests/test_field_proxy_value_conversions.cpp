@@ -18,10 +18,14 @@
 //   * cast_for_variant<void*, T> returns nullptr unless the stored alternative is uint32_t.
 
 #include <vmhook/vmhook.hpp>
+#include <array>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -31,6 +35,22 @@ static auto check(const char* name, bool ok) -> void
     std::printf("%s %s\n", ok ? "[PASS]" : "[FAIL]", name);
     if (!ok) { ++failures; }
 }
+
+// Minimal vmhook wrapper type for exercising the value_t -> std::unique_ptr<W>
+// conversion arm AND the value_t_convertible_target_v constraint exclusions
+// (W* must NOT be a producible target).  cast_for_variant's unique_ptr arm
+// does `new W{ decoded_void_ptr }`; object_base's constructor takes oop_type_t
+// (== void*), which W inherits.  W adds no state.  With NO JVM the arm never
+// actually news a W for any case we drive here: every unique_ptr case below
+// either hits the FLAW-B signature guard (non-'L' signature -> nullptr before
+// any decode) or the non-uint32 alternative guard (-> nullptr), so no live oop
+// is ever dereferenced.  Mirrors test_method_proxy_value_t.cpp's W.
+struct W : vmhook::object_base
+{
+    using vmhook::object_base::object_base;
+};
+
+using value_t = vmhook::field_proxy::value_t;
 
 // Variant alternative order in field_proxy::value_t::data (must mirror vmhook.hpp):
 //   0 bool, 1 int8_t, 2 int16_t, 3 int32_t, 4 int64_t, 5 float, 6 double,
@@ -631,6 +651,590 @@ int main()
               unknown_x.is_reference() == false);
         check("value_is_reference_true_for_unknown_X_get",
               unknown_x.get().is_reference() == true);
+    }
+
+    // =====================================================================
+    // STATIC_CAST / CONSTRAINT EXPANSION.  The conversion operator is now
+    // gated on vmhook::detail::value_t_convertible_target_v (vmhook.hpp
+    // ~1630-1650), so `static_cast<std::string>(v)` and
+    // `static_cast<std::unique_ptr<W>>(v)` COMPILE unambiguously on MSVC
+    // /permissive- (they previously hard-errored C2440).  These sections
+    // (a) prove the constraint shape at compile time, (b) drive the now-
+    // legal static_cast forms at runtime, and (c) cross-check static_cast
+    // against the implicit conversion so the two spellings always agree.
+    // All remain no-JVM: only zero compressed OOPs and pure-arithmetic
+    // alternatives are exercised; the FLAW-B unique_ptr guard and the
+    // non-uint32 guards mean no live oop is ever decoded.
+    // =====================================================================
+
+    // ---------------------------------------------------------------------
+    // 23. COMPILE-TIME constraint proof for field_proxy::value_t.  Mirrors
+    //     the method_proxy::value_t BUG-1 block: the two class-target casts
+    //     that the constraint exists to disambiguate must be well-formed,
+    //     every legitimate target stays convertible, and the four spurious
+    //     productions (const char*, char*, W*, std::nullptr_t) that caused
+    //     the MSVC ambiguity must be EXCLUDED.  A regression in either
+    //     direction (operator un-constrained again -> ambiguous -> casts
+    //     ill-formed; or constraint over-tight -> a real target removed)
+    //     fails the build, not just the run.
+    // ---------------------------------------------------------------------
+    {
+        // The two cast forms that are the entire point of the constraint fix
+        // are now well-formed (were ambiguous C2440 on MSVC /permissive-):
+        static_assert(requires(const value_t& v) { static_cast<std::string>(v); },
+                      "static_cast<std::string>(field value_t) must be well-formed");
+        static_assert(requires(const value_t& v) { static_cast<std::unique_ptr<W>>(v); },
+                      "static_cast<std::unique_ptr<W>>(field value_t) must be well-formed");
+
+        // Legitimate targets remain convertible (constraint not over-tight):
+        static_assert(std::is_convertible_v<value_t, bool>,
+                      "value_t -> bool must remain convertible");
+        static_assert(std::is_convertible_v<value_t, std::int8_t>,
+                      "value_t -> int8_t must remain convertible");
+        static_assert(std::is_convertible_v<value_t, std::int16_t>,
+                      "value_t -> int16_t must remain convertible");
+        static_assert(std::is_convertible_v<value_t, std::int32_t>,
+                      "value_t -> int32_t must remain convertible");
+        static_assert(std::is_convertible_v<value_t, std::int64_t>,
+                      "value_t -> int64_t must remain convertible");
+        static_assert(std::is_convertible_v<value_t, std::uint16_t>,
+                      "value_t -> uint16_t must remain convertible");
+        static_assert(std::is_convertible_v<value_t, std::uint32_t>,
+                      "value_t -> uint32_t must remain convertible");
+        static_assert(std::is_convertible_v<value_t, float>,
+                      "value_t -> float must remain convertible");
+        static_assert(std::is_convertible_v<value_t, double>,
+                      "value_t -> double must remain convertible");
+        static_assert(std::is_convertible_v<value_t, std::string>,
+                      "value_t -> std::string must remain convertible");
+        // NB: std::vector<T> is NOT asserted via std::is_convertible_v here.
+        // is_convertible tests a copy-init/return context whose candidate set
+        // (operator->vector<T> vs operator->size_type matching vector's
+        // (size_type) ctor) is ambiguous on some STLs (MSVC /permissive-).
+        // The constraint's acceptance of std::vector<T> as a legitimate target
+        // is asserted at the trait level instead (value_t_convertible_target_v
+        // below), which is STL-independent; the runtime copy-init reject path
+        // is exercised in section 26.
+        static_assert(std::is_convertible_v<value_t, std::unique_ptr<W>>,
+                      "value_t -> unique_ptr<W> must remain convertible");
+        static_assert(std::is_convertible_v<value_t, void*>,
+                      "value_t -> void* must remain convertible (the one allowed pointer)");
+        // Any cv-qualified void* is a legitimate pointer target (the trait
+        // strips the pointee's cv and checks is_void_v); cast_for_variant only
+        // decodes through the exact `void*` arm, so `const void*` rides the
+        // generic static_cast arm (decode result implicitly converts).
+        static_assert(std::is_convertible_v<value_t, const void*>,
+                      "value_t -> const void* must remain convertible (cv void* allowed)");
+
+        // The spurious targets are EXCLUDED — these are exactly the
+        // productions that an UNCONSTRAINED operator would also offer and
+        // that collided with std::string / unique_ptr constructors:
+        static_assert(!std::is_convertible_v<value_t, const char*>,
+                      "value_t must NOT be convertible to const char* (ambiguity source)");
+        static_assert(!std::is_convertible_v<value_t, char*>,
+                      "value_t must NOT be convertible to char*");
+        static_assert(!std::is_convertible_v<value_t, W*>,
+                      "value_t must NOT be convertible to W* (unique_ptr ambiguity source)");
+        static_assert(!std::is_convertible_v<value_t, int*>,
+                      "value_t must NOT be convertible to int*");
+        static_assert(!std::is_convertible_v<value_t, std::nullptr_t>,
+                      "value_t must NOT be convertible to std::nullptr_t");
+
+        // The trait itself, exercised directly on representative targets.
+        static_assert(vmhook::detail::value_t_convertible_target_v<int>);
+        static_assert(vmhook::detail::value_t_convertible_target_v<std::string>);
+        static_assert(vmhook::detail::value_t_convertible_target_v<void*>);
+        static_assert(vmhook::detail::value_t_convertible_target_v<const void* volatile>);
+        static_assert(vmhook::detail::value_t_convertible_target_v<std::unique_ptr<W>>);
+        static_assert(vmhook::detail::value_t_convertible_target_v<std::vector<int>>);
+        static_assert(!vmhook::detail::value_t_convertible_target_v<const char*>);
+        static_assert(!vmhook::detail::value_t_convertible_target_v<char*>);
+        static_assert(!vmhook::detail::value_t_convertible_target_v<W*>);
+        static_assert(!vmhook::detail::value_t_convertible_target_v<std::nullptr_t>);
+        // cv-ref qualifiers are stripped before classification.
+        static_assert(vmhook::detail::value_t_convertible_target_v<const std::string&>);
+        static_assert(vmhook::detail::value_t_convertible_target_v<std::unique_ptr<W>&&>);
+        static_assert(!vmhook::detail::value_t_convertible_target_v<const char* const&>);
+
+        // operator-as-noexcept: the conversion operator is declared noexcept.
+        static_assert(noexcept(static_cast<int>(std::declval<value_t>())),
+                      "value_t conversion operator must be noexcept");
+
+        check("value_t_constraint_compile_proof_present", true);
+    }
+
+    // ---------------------------------------------------------------------
+    // 24. static_cast<std::string>(value_t) RUNTIME path (the fixed form).
+    //     For a numeric / null alternative cast_for_variant's std::string arm
+    //     returns "" (the source is not uint32_t); for a uint32 alternative
+    //     it decodes via read_java_string(decode_oop_pointer(v)), and a ZERO
+    //     OOP decodes to nullptr -> "".  static_cast and as_string() must
+    //     agree on every case (both name the same extraction).
+    // ---------------------------------------------------------------------
+    {
+        auto vi = read_back<std::int32_t>("I", 999);
+        check("static_cast_string_empty_for_int", static_cast<std::string>(vi).empty());
+        check("static_cast_string_matches_as_string_int",
+              static_cast<std::string>(vi) == vi.as_string());
+
+        auto vj = read_back<std::int64_t>("J", std::int64_t{ 123456789 });
+        check("static_cast_string_empty_for_long", static_cast<std::string>(vj).empty());
+
+        auto vd = read_back<double>("D", 2.5);
+        check("static_cast_string_empty_for_double", static_cast<std::string>(vd).empty());
+
+        auto vz = read_back<std::uint8_t>("Z", std::uint8_t{ 1 });
+        check("static_cast_string_empty_for_bool", static_cast<std::string>(vz).empty());
+
+        auto vc = read_back<std::uint16_t>("C", std::uint16_t{ 0x41 });
+        check("static_cast_string_empty_for_char", static_cast<std::string>(vc).empty());
+
+        // Reference field with a ZERO compressed OOP -> "" via null decode.
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0x00 });
+        vmhook::field_proxy ref{ storage.data(), "Ljava/lang/String;", false };
+        auto vr = ref.get();
+        check("static_cast_string_empty_for_zero_oop_ref", static_cast<std::string>(vr).empty());
+        check("static_cast_string_matches_as_string_zero_oop",
+              static_cast<std::string>(vr) == vr.as_string());
+
+        // Null proxy -> int32 alternative -> "".
+        vmhook::field_proxy null_ref{ nullptr, "Ljava/lang/String;", false };
+        check("static_cast_string_empty_for_null_proxy",
+              static_cast<std::string>(null_ref.get()).empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // 25. static_cast<std::unique_ptr<W>>(value_t) RUNTIME path (the fixed
+    //     form) — the FLAW-B reject arms, all JVM-free because they return
+    //     nullptr BEFORE any decode_oop_pointer / is_valid_pointer call:
+    //       * uint32 alternative + array signature "[L..."  -> nullptr
+    //       * uint32 alternative + primitive-looking sig "I" -> nullptr
+    //       * uint32 alternative + EMPTY signature           -> nullptr
+    //       * uint32 alternative + unknown sig "X"           -> nullptr
+    //       * non-uint32 alternative (null-proxy int32)      -> nullptr
+    //     (A valid 'L...;' field with a LIVE oop is JVM-only and out of
+    //     scope here.)
+    // ---------------------------------------------------------------------
+    {
+        // uint32 alternative reached via the reference/array fall-through of
+        // get(), but the signature's first char is not 'L' -> guard fires.
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0x00 });
+
+        vmhook::field_proxy arr{ storage.data(), "[Ljava/lang/Object;", false };
+        auto va = arr.get();
+        check("unique_ptr_null_for_array_signature",
+              static_cast<std::unique_ptr<W>>(va) == nullptr);
+        check("unique_ptr_array_alt_is_uint32", va.data.index() == idx::k_u32);
+
+        vmhook::field_proxy arr_prim{ storage.data(), "[I", false };
+        check("unique_ptr_null_for_primitive_array_signature",
+              static_cast<std::unique_ptr<W>>(arr_prim.get()) == nullptr);
+
+        // Unknown single char "X": get() -> uint32 alt, sig.front() != 'L'.
+        vmhook::field_proxy unknown_x{ storage.data(), "X", false };
+        auto vx = unknown_x.get();
+        check("unique_ptr_null_for_unknown_signature",
+              static_cast<std::unique_ptr<W>>(vx) == nullptr);
+        check("unique_ptr_unknown_alt_is_uint32", vx.data.index() == idx::k_u32);
+
+        // Empty signature + non-null pointer: get() -> uint32 alt, sig empty.
+        vmhook::field_proxy empty_sig{ storage.data(), "", false };
+        check("unique_ptr_null_for_empty_signature",
+              static_cast<std::unique_ptr<W>>(empty_sig.get()) == nullptr);
+
+        // Non-uint32 alternative (null proxy -> int32) -> nullptr arm.
+        vmhook::field_proxy null_ref{ nullptr, "Ljava/lang/String;", false };
+        auto vn = null_ref.get();
+        check("unique_ptr_null_for_non_uint32_alternative",
+              static_cast<std::unique_ptr<W>>(vn) == nullptr);
+        check("unique_ptr_null_proxy_alt_is_int32", vn.data.index() == idx::k_i32);
+
+        // A primitive value_t (int alt) -> unique_ptr is the non-uint32 arm.
+        check("unique_ptr_null_for_int_alternative",
+              static_cast<std::unique_ptr<W>>(read_back<std::int32_t>("I", 7)) == nullptr);
+
+        // The implicit conversion agrees with the static_cast spelling.
+        std::unique_ptr<W> implicit_form = read_back<std::int32_t>("I", 7);
+        check("unique_ptr_implicit_matches_static_cast_null", implicit_form == nullptr);
+    }
+
+    // ---------------------------------------------------------------------
+    // 26. value_t -> std::vector<T> reject path (via COPY-INITIALISATION, the
+    //     documented spelling): a numeric or null alternative is not uint32_t,
+    //     so cast_for_variant's vector arm returns an empty vector (the
+    //     populated array path needs a live JVM and is out of scope).  Also a
+    //     uint32 alternative whose array OOP is ZERO yields an empty vector
+    //     (decode_array_oop(0) == nullptr).
+    //
+    //     NB: `std::vector<T>` is driven through copy-init (`std::vector<T> x =
+    //     v;`) and NOT `static_cast<std::vector<T>>(v)`.  Unlike std::string /
+    //     std::unique_ptr (both fixed by value_t_convertible_target_v), a
+    //     std::vector<T> static_cast is STILL ambiguous on MSVC /permissive-:
+    //     value_t -> vector<T> (the operator's vector arm) competes with
+    //     value_t -> size_type (an arithmetic arm) against vector's
+    //     (size_type) constructor.  The constraint cannot excise that without
+    //     dropping arithmetic conversions, so to_vector<T>() / copy-init is the
+    //     portable spelling.  See the bug note in the agent report.
+    // ---------------------------------------------------------------------
+    {
+        std::vector<int> from_int = read_back<std::int32_t>("I", 5);
+        check("vector_int_empty_for_int_alt", from_int.empty());
+        std::vector<int> from_double = read_back<double>("D", 1.0);
+        check("vector_int_empty_for_double_alt", from_double.empty());
+        std::vector<int> from_bool = read_back<std::uint8_t>("Z", std::uint8_t{ 1 });
+        check("vector_int_empty_for_bool_alt", from_bool.empty());
+
+        // Null proxy -> int32 alt -> empty vector.
+        vmhook::field_proxy null_arr{ nullptr, "[I", false };
+        std::vector<int> from_null = null_arr.get();
+        check("vector_int_empty_for_null_proxy", from_null.empty());
+
+        // Array field with ZERO compressed OOP -> empty (decode_array_oop(0)).
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0x00 });
+        vmhook::field_proxy arr{ storage.data(), "[I", false };
+        std::vector<int> from_zero_oop = arr.get();
+        check("vector_int_empty_for_zero_array_oop", from_zero_oop.empty());
+
+        // std::vector<bool> and std::vector<std::string> reject arms likewise.
+        std::vector<bool> bool_vec = read_back<std::int32_t>("I", 5);
+        check("vector_bool_empty_for_int_alt", bool_vec.empty());
+        std::vector<std::string> str_vec = read_back<std::int32_t>("I", 5);
+        check("vector_string_empty_for_int_alt", str_vec.empty());
+
+        // The constraint nonetheless keeps value_t -> std::vector<T> a valid
+        // (copy-init) conversion target — proven at compile time in section 23.
+        check("vector_int_copy_init_present", true);
+    }
+
+    // ---------------------------------------------------------------------
+    // 27. Every primitive alternative -> every compatible numeric target,
+    //     driven through BOTH the implicit conversion AND static_cast, with
+    //     the two spellings REQUIRED to agree.  cast_for_variant routes both
+    //     through the same static_cast<target>(value) arm, so a divergence
+    //     would mean the operator and an explicit cast disagree.
+    // ---------------------------------------------------------------------
+    {
+        // Helper-free explicit dual-path assertions per source alternative.
+        // int32 source.
+        {
+            auto v = read_back<std::int32_t>("I", std::int32_t{ -12345 });
+            const int implicit_i = v;            const int cast_i = static_cast<int>(v);
+            const std::int64_t implicit_l = v;   const std::int64_t cast_l = static_cast<std::int64_t>(v);
+            const double implicit_d = v;         const double cast_d = static_cast<double>(v);
+            check("i32_implicit_eq_static_cast_int", implicit_i == cast_i && cast_i == -12345);
+            check("i32_implicit_eq_static_cast_int64", implicit_l == cast_l && cast_l == -12345);
+            check("i32_implicit_eq_static_cast_double", implicit_d == cast_d && cast_d == -12345.0);
+        }
+        // int64 source.
+        {
+            auto v = read_back<std::int64_t>("J", std::int64_t{ 5000000000LL });
+            const std::int64_t implicit_l = v;   const std::int64_t cast_l = static_cast<std::int64_t>(v);
+            const double implicit_d = v;         const double cast_d = static_cast<double>(v);
+            check("i64_implicit_eq_static_cast_int64", implicit_l == cast_l && cast_l == 5000000000LL);
+            check("i64_implicit_eq_static_cast_double", implicit_d == cast_d && cast_d == 5000000000.0);
+        }
+        // int8 source.
+        {
+            auto v = read_back<std::int8_t>("B", std::int8_t{ -42 });
+            check("i8_implicit_eq_static_cast_int",
+                  static_cast<int>(v) == static_cast<int>(static_cast<std::int8_t>(-42))
+                  && (int{ v } == static_cast<int>(v)));
+        }
+        // int16 source.
+        {
+            auto v = read_back<std::int16_t>("S", std::int16_t{ -3000 });
+            check("i16_implicit_eq_static_cast_int",
+                  int{ v } == static_cast<int>(v) && static_cast<int>(v) == -3000);
+        }
+        // uint16 (char) source.
+        {
+            auto v = read_back<std::uint16_t>("C", std::uint16_t{ 50000 });
+            const int implicit_i = v;
+            check("u16_implicit_eq_static_cast_int",
+                  implicit_i == static_cast<int>(v) && static_cast<int>(v) == 50000);
+        }
+        // float source.
+        {
+            auto v = read_back<float>("F", 12.0f);
+            const double implicit_d = v;
+            check("f32_implicit_eq_static_cast_double",
+                  implicit_d == static_cast<double>(v) && static_cast<double>(v) == 12.0);
+            check("f32_implicit_eq_static_cast_int",
+                  int{ v } == static_cast<int>(v) && static_cast<int>(v) == 12);
+        }
+        // double source.
+        {
+            auto v = read_back<double>("D", 99.0);
+            const float implicit_f = v;
+            check("f64_implicit_eq_static_cast_float",
+                  implicit_f == static_cast<float>(v) && static_cast<float>(v) == 99.0f);
+            check("f64_implicit_eq_static_cast_int64",
+                  std::int64_t{ v } == static_cast<std::int64_t>(v)
+                  && static_cast<std::int64_t>(v) == 99);
+        }
+        // bool source.
+        {
+            auto v = read_back<std::uint8_t>("Z", std::uint8_t{ 1 });
+            const int implicit_i = v;
+            check("bool_implicit_eq_static_cast_int",
+                  implicit_i == static_cast<int>(v) && static_cast<int>(v) == 1);
+        }
+        // uint32 (reference) source — pure arithmetic, no decode.
+        {
+            auto v = read_back<std::uint32_t>("Ljava/lang/Object;", std::uint32_t{ 305419896u });
+            const std::int64_t implicit_l = v;
+            check("u32_implicit_eq_static_cast_int64",
+                  implicit_l == static_cast<std::int64_t>(v)
+                  && static_cast<std::int64_t>(v) == 305419896LL);
+            const std::uint32_t implicit_u = v;
+            check("u32_implicit_eq_static_cast_uint32",
+                  implicit_u == static_cast<std::uint32_t>(v)
+                  && static_cast<std::uint32_t>(v) == 305419896u);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 28. void* is the ONLY legitimate pointer target.  static_cast<void*>
+    //     and the implicit conversion both route a uint32 alternative through
+    //     decode_oop_pointer (zero OOP -> nullptr, JVM-free) and yield
+    //     nullptr for every non-uint32 alternative.  The two spellings agree.
+    // ---------------------------------------------------------------------
+    {
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0x00 });
+        vmhook::field_proxy ref{ storage.data(), "Ljava/lang/String;", false };
+        auto vr = ref.get();
+        void* implicit_p = vr;
+        check("void_ptr_implicit_eq_static_cast_zero_oop",
+              implicit_p == static_cast<void*>(vr) && static_cast<void*>(vr) == nullptr);
+
+        // Non-uint32 alternatives -> nullptr through the void* "else" arm.
+        check("void_ptr_null_for_int_alt",
+              static_cast<void*>(read_back<std::int32_t>("I", 1)) == nullptr);
+        check("void_ptr_null_for_double_alt",
+              static_cast<void*>(read_back<double>("D", 1.0)) == nullptr);
+        check("void_ptr_null_for_bool_alt",
+              static_cast<void*>(read_back<std::uint8_t>("Z", std::uint8_t{ 1 })) == nullptr);
+        check("void_ptr_null_for_char_alt",
+              static_cast<void*>(read_back<std::uint16_t>("C", std::uint16_t{ 65 })) == nullptr);
+    }
+
+    // ---------------------------------------------------------------------
+    // 29. Additional narrowing / sign edges through static_cast not already
+    //     pinned: uint16 boundaries, int64 just-past-2^53, and int64 ->
+    //     float rounding direction.  Pure arithmetic.
+    // ---------------------------------------------------------------------
+    {
+        auto v0 = read_back<std::uint16_t>("C", std::uint16_t{ 0 });
+        check("C_zero_casts_to_int_0", static_cast<int>(v0) == 0);
+        check("C_zero_casts_to_uint32_0", static_cast<std::uint32_t>(v0) == 0u);
+
+        auto vmax = read_back<std::uint16_t>("C", std::uint16_t{ 0xFFFF });
+        check("C_max_casts_to_uint32_65535", static_cast<std::uint32_t>(vmax) == 65535u);
+        check("C_max_no_sign_extension_in_int64",
+              static_cast<std::int64_t>(vmax) == 65535);
+
+        // int16 max/min through static_cast widen with sign.
+        auto smax = read_back<std::int16_t>("S", std::int16_t{ 32767 });
+        check("S_max_widens_to_int_32767", static_cast<int>(smax) == 32767);
+        auto smin = read_back<std::int16_t>("S", std::int16_t{ -32768 });
+        check("S_min_widens_to_int_minus_32768", static_cast<int>(smin) == -32768);
+
+        // int64 value one past exact double integer range (2^53 + 1) cast to
+        // double: cannot be represented, rounds to 2^53.  Pin the documented
+        // static_cast rounding (round-to-nearest-even on every IEEE target).
+        const std::int64_t past_exact{ 9007199254740993LL };  // 2^53 + 1
+        auto vp = read_back<std::int64_t>("J", past_exact);
+        check("J_2pow53_plus_1_rounds_to_2pow53_as_double",
+              static_cast<double>(vp) == 9007199254740992.0);
+
+        // uint32 0x80000000 -> int is the minimum int (bit reinterpret), ->
+        // int64 zero-extends.  Pure arithmetic, no decode.
+        auto vh = read_back<std::uint32_t>("[I", std::uint32_t{ 0x80000000u });
+        check("u32_high_bit_casts_to_int_min",
+              static_cast<int>(vh) == (-2147483647 - 1));
+        check("u32_high_bit_casts_to_int64_2147483648",
+              static_cast<std::int64_t>(vh) == 2147483648LL);
+    }
+
+    // ---------------------------------------------------------------------
+    // 30. float / double special values survive the variant bit-exactly.
+    //     get() does a raw memcpy and cast_for_variant<float>/<double> is an
+    //     identity static_cast, so +0.0/-0.0 stay distinct, +-inf round-trip,
+    //     NaN stays NaN, and a subnormal keeps every bit.  NaN != NaN, so we
+    //     compare BITS via memcmp (libc++-safe: no <charconv>, no float
+    //     from_chars/to_chars).
+    // ---------------------------------------------------------------------
+    {
+        // +0.0 vs -0.0: distinct bit patterns must both survive.
+        const double pos_zero{ 0.0 };
+        const double neg_zero{ -0.0 };
+        const double got_pos{ static_cast<double>(read_back<double>("D", pos_zero)) };
+        const double got_neg{ static_cast<double>(read_back<double>("D", neg_zero)) };
+        std::uint64_t bits_pos{}, bits_neg{};
+        std::memcpy(&bits_pos, &got_pos, sizeof(bits_pos));
+        std::memcpy(&bits_neg, &got_neg, sizeof(bits_neg));
+        std::uint64_t ref_pos{}, ref_neg{};
+        std::memcpy(&ref_pos, &pos_zero, sizeof(ref_pos));
+        std::memcpy(&ref_neg, &neg_zero, sizeof(ref_neg));
+        check("D_pos_zero_bits_preserved", bits_pos == ref_pos);
+        check("D_neg_zero_bits_preserved", bits_neg == ref_neg);
+        check("D_pos_and_neg_zero_have_distinct_bits", bits_pos != bits_neg);
+        check("D_pos_zero_equals_neg_zero_numerically", got_pos == got_neg); // 0.0 == -0.0
+
+        // +inf / -inf via bit construction (no <limits> dependence for the
+        // pattern itself; we build the IEEE-754 double bit patterns directly).
+        std::uint64_t inf_bits{ 0x7FF0000000000000ULL };
+        double pos_inf{};
+        std::memcpy(&pos_inf, &inf_bits, sizeof(pos_inf));
+        auto vi = read_back<double>("D", pos_inf);
+        double got_inf{ static_cast<double>(vi) };
+        std::uint64_t got_inf_bits{};
+        std::memcpy(&got_inf_bits, &got_inf, sizeof(got_inf_bits));
+        check("D_pos_inf_bits_preserved", got_inf_bits == inf_bits);
+
+        std::uint64_t ninf_bits{ 0xFFF0000000000000ULL };
+        double neg_inf{};
+        std::memcpy(&neg_inf, &ninf_bits, sizeof(neg_inf));
+        double got_ninf{ static_cast<double>(read_back<double>("D", neg_inf)) };
+        std::uint64_t got_ninf_bits{};
+        std::memcpy(&got_ninf_bits, &got_ninf, sizeof(got_ninf_bits));
+        check("D_neg_inf_bits_preserved", got_ninf_bits == ninf_bits);
+
+        // Quiet NaN: bits must survive exactly (NaN != NaN so compare bits).
+        std::uint64_t nan_bits{ 0x7FF8000000000000ULL };
+        double the_nan{};
+        std::memcpy(&the_nan, &nan_bits, sizeof(the_nan));
+        double got_nan{ static_cast<double>(read_back<double>("D", the_nan)) };
+        std::uint64_t got_nan_bits{};
+        std::memcpy(&got_nan_bits, &got_nan, sizeof(got_nan_bits));
+        check("D_quiet_nan_bits_preserved", got_nan_bits == nan_bits);
+
+        // Smallest positive subnormal double (bit pattern 0x1): every bit kept.
+        std::uint64_t subnormal_bits{ 0x0000000000000001ULL };
+        double subnormal{};
+        std::memcpy(&subnormal, &subnormal_bits, sizeof(subnormal));
+        double got_sub{ static_cast<double>(read_back<double>("D", subnormal)) };
+        std::uint64_t got_sub_bits{};
+        std::memcpy(&got_sub_bits, &got_sub, sizeof(got_sub_bits));
+        check("D_subnormal_bits_preserved", got_sub_bits == subnormal_bits);
+
+        // float special values: +inf and NaN via 32-bit patterns.
+        std::uint32_t f_inf_bits{ 0x7F800000u };
+        float f_inf{};
+        std::memcpy(&f_inf, &f_inf_bits, sizeof(f_inf));
+        float got_finf{ static_cast<float>(read_back<float>("F", f_inf)) };
+        std::uint32_t got_finf_bits{};
+        std::memcpy(&got_finf_bits, &got_finf, sizeof(got_finf_bits));
+        check("F_pos_inf_bits_preserved", got_finf_bits == f_inf_bits);
+
+        std::uint32_t f_nan_bits{ 0x7FC00000u };
+        float f_nan{};
+        std::memcpy(&f_nan, &f_nan_bits, sizeof(f_nan));
+        float got_fnan{ static_cast<float>(read_back<float>("F", f_nan)) };
+        std::uint32_t got_fnan_bits{};
+        std::memcpy(&got_fnan_bits, &got_fnan, sizeof(got_fnan_bits));
+        check("F_quiet_nan_bits_preserved", got_fnan_bits == f_nan_bits);
+
+        std::uint32_t f_negzero_bits{ 0x80000000u };
+        float f_negzero{};
+        std::memcpy(&f_negzero, &f_negzero_bits, sizeof(f_negzero));
+        float got_fnz{ static_cast<float>(read_back<float>("F", f_negzero)) };
+        std::uint32_t got_fnz_bits{};
+        std::memcpy(&got_fnz_bits, &got_fnz, sizeof(got_fnz_bits));
+        check("F_neg_zero_bits_preserved", got_fnz_bits == f_negzero_bits);
+    }
+
+    // ---------------------------------------------------------------------
+    // 31. char ("C") full BMP range: U+0000, U+007F (ASCII edge), U+0080
+    //     (Latin-1 supplement start), U+07FF, U+FFFF (max code unit) all
+    //     round-trip through the uint16 alternative with NO sign extension
+    //     (the source is unsigned), via both std::get and static_cast<int>.
+    // ---------------------------------------------------------------------
+    {
+        const std::uint16_t code_units[]{ 0x0000, 0x007F, 0x0080, 0x07FF, 0x4E2D, 0xFFFF };
+        bool all_ok{ true };
+        for (const std::uint16_t cu : code_units)
+        {
+            auto v = read_back<std::uint16_t>("C", cu);
+            if (v.data.index() != idx::k_u16) { all_ok = false; }
+            if (std::get<std::uint16_t>(v.data) != cu) { all_ok = false; }
+            // No sign extension: int value equals the unsigned code unit.
+            if (static_cast<int>(v) != static_cast<int>(cu)) { all_ok = false; }
+            if (static_cast<char16_t>(v) != static_cast<char16_t>(cu)) { all_ok = false; }
+        }
+        check("C_full_bmp_range_round_trips_no_sign_extension", all_ok);
+    }
+
+    // ---------------------------------------------------------------------
+    // 32. bool ("Z") non-canonical backing byte (documented get() gap): a
+    //     0x02 byte is not a valid bool object representation, so OBSERVING
+    //     its value would be UB.  We assert only that get() (a) does not
+    //     crash and (b) still selects the bool alternative (index check, no
+    //     value read).  This pins the dispatch without depending on the
+    //     trap representation — libc++-safe (no bool trap read).
+    // ---------------------------------------------------------------------
+    {
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0xAB });
+        storage[0] = std::uint8_t{ 0x02 };  // non-canonical bool byte
+        vmhook::field_proxy proxy{ storage.data(), "Z", false };
+        auto v = proxy.get();
+        check("Z_non_canonical_byte_selects_bool_alternative", v.data.index() == idx::k_bool);
+    }
+
+    // ---------------------------------------------------------------------
+    // 33. Direct value_t aggregate construction (no proxy / no get()): the
+    //     conversion operator and static_cast work identically on a value_t
+    //     built straight from an alternative, including monostate-free
+    //     defaults.  This isolates the operator from the get() dispatch and
+    //     mirrors test_method_proxy_value_t's direct-construction style.
+    //     value_t{ alt } leaves signature default "" — fine for numeric
+    //     casts (signature is only consulted by the unique_ptr/vector/string
+    //     arms, which a numeric alt never enters).
+    // ---------------------------------------------------------------------
+    {
+        // Numeric alternatives constructed directly.
+        check("direct_int32_static_cast", static_cast<int>(value_t{ std::int32_t{ 77 } }) == 77);
+        check("direct_int32_implicit", []{ int i = value_t{ std::int32_t{ 77 } }; return i; }() == 77);
+        check("direct_int64_static_cast",
+              static_cast<std::int64_t>(value_t{ std::int64_t{ -9000000000LL } }) == -9000000000LL);
+        check("direct_double_static_cast",
+              static_cast<double>(value_t{ double{ 1.25 } }) == 1.25);
+        check("direct_float_static_cast",
+              static_cast<float>(value_t{ float{ -2.5f } }) == -2.5f);
+        check("direct_bool_true_static_cast", static_cast<bool>(value_t{ true }) == true);
+        check("direct_bool_false_static_cast", static_cast<bool>(value_t{ false }) == false);
+        check("direct_uint16_static_cast",
+              static_cast<std::uint16_t>(value_t{ std::uint16_t{ 0xBEEF } }) == std::uint16_t{ 0xBEEF });
+        check("direct_int8_static_cast",
+              static_cast<std::int8_t>(value_t{ std::int8_t{ -7 } }) == std::int8_t{ -7 });
+        check("direct_int16_static_cast",
+              static_cast<std::int16_t>(value_t{ std::int16_t{ 4242 } }) == std::int16_t{ 4242 });
+
+        // uint32 alternative built directly, with a default ("") signature:
+        // numeric casts are pure; string/void* arms behave as zero-OOP.
+        value_t ref_default{ std::uint32_t{ 0u } };
+        check("direct_uint32_is_reference_true", ref_default.is_reference() == true);
+        check("direct_uint32_zero_as_string_empty", ref_default.as_string().empty());
+        check("direct_uint32_zero_to_void_ptr_null", static_cast<void*>(ref_default) == nullptr);
+        check("direct_uint32_value_static_cast",
+              static_cast<std::uint32_t>(value_t{ std::uint32_t{ 123u } }) == 123u);
+
+        // unique_ptr<W> on a directly-built uint32 alt with EMPTY signature ->
+        // FLAW-B guard (signature.empty()) -> nullptr, no decode.
+        check("direct_uint32_empty_sig_unique_ptr_null",
+              static_cast<std::unique_ptr<W>>(value_t{ std::uint32_t{ 0u } }) == nullptr);
+
+        // Explicit signature on a directly-built value_t flows into the
+        // unique_ptr signature guard: "[I" (array) -> nullptr.
+        value_t arr_alt{ std::uint32_t{ 0u }, std::string{ "[I" } };
+        check("direct_value_t_carries_signature", arr_alt.signature == "[I");
+        check("direct_uint32_array_sig_unique_ptr_null",
+              static_cast<std::unique_ptr<W>>(arr_alt) == nullptr);
     }
 
     return failures == 0 ? 0 : 1;
