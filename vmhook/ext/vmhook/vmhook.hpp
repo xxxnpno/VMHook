@@ -7530,6 +7530,24 @@ namespace vmhook
             using type_t = std::tuple<remaining_types...>;
         };
 
+        // Empty-tuple base case.  A detour that observes a zero-argument Java
+        // method takes only (vmhook::return_value&): function_traits yields
+        // args_tuple_t = std::tuple<return_value&>, and the first tuple_tail
+        // strips it down to std::tuple<>.  Without this specialisation the
+        // (incidental) second tuple_tail on that empty tuple — and any future
+        // caller that strips an already-empty tuple — would instantiate the
+        // undefined primary template above and emit an opaque
+        // "incomplete type / no member type_t" diagnostic.  Defining type_t as
+        // the empty tuple keeps a no-arg detour compiling cleanly through
+        // hook<T>() and mirrors the empty-tuple case java_slot_offsets already
+        // provides (see below).  Purely additive: no non-empty tuple ever
+        // matched this specialisation.
+        template<>
+        struct tuple_tail<std::tuple<>>
+        {
+            using type_t = std::tuple<>;
+        };
+
         /*
             @brief Extracts a single Java method argument from the interpreter frame as value_type.
             @details
@@ -8210,6 +8228,25 @@ namespace vmhook
         {
             using traits_t = vmhook::detail::function_traits<std::remove_cvref_t<decltype(user_detour)>>;
             using all_args_tuple_t = typename traits_t::args_tuple_t;
+
+            // Authoring-contract guard: every vmhook detour must take
+            // vmhook::return_value& as its FIRST parameter.  tuple_tail below
+            // unconditionally drops element 0 to recover the Java-visible
+            // argument list, so a detour that omits the leading return_value&
+            // (e.g. (const std::unique_ptr<W>&, int)) would silently treat the
+            // wrapper slot as the return-value slot and shift every Java arg by
+            // one — reading garbage at runtime with NO compile error.  These
+            // static_asserts turn that latent mistake into a readable build
+            // error.  The arity check guards the element-0 access so a detour
+            // taking literally zero parameters reports the same clear message
+            // instead of an opaque std::tuple_element out-of-range error.
+            static_assert(std::tuple_size_v<all_args_tuple_t> >= 1,
+                          "vmhook detour must take vmhook::return_value& as its first "
+                          "parameter (signature must begin with (vmhook::return_value&, ...)).");
+            static_assert(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<0, all_args_tuple_t>>,
+                                         vmhook::return_value>,
+                          "vmhook detour's first parameter must be vmhook::return_value&.");
+
             using method_arg_tuple_t = typename vmhook::detail::tuple_tail<all_args_tuple_t>::type_t;
 
             const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };

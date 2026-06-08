@@ -106,11 +106,11 @@ namespace
         : std::true_type {};
 
     // SFINAE probe: does tuple_tail<T>::type_t exist?  tuple_tail's primary
-    // (vmhook.hpp:7524-7525) is undefined; only the <first, rest...> spec
-    // (7527-7531) defines type_t.  An EMPTY std::tuple<> therefore has NO
-    // type_t today (library flaw #1) and this reports false for it; the moment
-    // an empty-tuple specialisation is added the assertion below flips and
-    // catches it.  Non-empty tuples report true.
+    // (vmhook.hpp:7524-7525) is undefined; type_t is defined by the
+    // <first, rest...> spec (7527-7531) AND, since the flaw #1 fix, by the
+    // empty-tuple base specialisation (7545-7549).  So this now reports true
+    // for BOTH the empty std::tuple<> and any non-empty tuple; only types that
+    // are not std::tuple specialisations at all leave type_t absent.
     template<typename T, typename = void>
     struct has_tuple_tail : std::false_type {};
     template<typename T>
@@ -797,13 +797,22 @@ int main()
                == std::array<std::int32_t, 3>{ 0, 1, 3 }));
     }
 
-    // --- empty tuple_tail detectability (library flaw #1) --------------------
-    // tuple_tail<std::tuple<>> has NO type_t today (only the <first, rest...>
-    // spec exists).  Assert the member is ABSENT for the empty tuple but
-    // PRESENT for non-empty tuples.  When the empty-tuple specialisation is
-    // added this flips and the test below must be updated — pinning the fix.
-    check("tuple_tail_type_t_absent_for_empty_tuple_today",
-          !has_tuple_tail<std::tuple<>>::value);
+    // --- empty tuple_tail: zero-arg detour support (library flaw #1 FIXED) ----
+    // tuple_tail<std::tuple<>> now has the empty-tuple base specialisation
+    // (vmhook.hpp:7545-7549), so type_t IS present for the empty tuple and
+    // resolves to std::tuple<> — exactly mirroring java_slot_offsets' own
+    // empty-tuple case.  This is what lets a zero-argument-method observer
+    // detour, [](vmhook::return_value&){}, decompose cleanly through hook<T>()
+    // (the chain strips the lone return_value& to tuple<>, and any further
+    // strip of that empty tuple no longer hits the undefined primary).  These
+    // checks were previously the ABSENT pins for the flaw; they are flipped to
+    // the PRESENT/identity form now that the fix is in.
+    check("tuple_tail_type_t_present_for_empty_tuple",
+          has_tuple_tail<std::tuple<>>::value);
+    check("tuple_tail_empty_tuple_yields_empty_tuple",
+          std::is_same_v<
+              typename vmhook::detail::tuple_tail<std::tuple<>>::type_t,
+              std::tuple<>>);
     check("tuple_tail_type_t_present_for_single_element",
           has_tuple_tail<std::tuple<vmhook::return_value&>>::value);
     check("tuple_tail_type_t_present_for_multi_element",
@@ -981,9 +990,19 @@ int main()
     static_assert(!has_args_tuple<templated_call_functor>::value,
                   "function_traits requires a non-template operator() "
                   "(templated/generic call operator must decompose to absent args_tuple_t)");
-    static_assert(!has_tuple_tail<std::tuple<>>::value,
-                  "tuple_tail<std::tuple<>> has no type_t today (flaw #1); update this "
-                  "assertion to the positive form when the empty-tuple spec is added");
+    static_assert(has_tuple_tail<std::tuple<>>::value,
+                  "tuple_tail<std::tuple<>> must expose type_t (flaw #1 fix: empty-tuple "
+                  "base specialisation lets a zero-arg detour decompose cleanly)");
+    static_assert(std::is_same_v<typename vmhook::detail::tuple_tail<std::tuple<>>::type_t,
+                                 std::tuple<>>,
+                  "tuple_tail<std::tuple<>>::type_t must be std::tuple<>");
+    // A (vmhook::return_value&)-only detour — the shape used to observe a
+    // zero-argument Java method — must deduce an EMPTY Java-arg tuple through
+    // the exact function_traits -> tuple_tail chain hook<T>() instantiates.
+    static_assert(std::is_same_v<method_args_of<decltype([](vmhook::return_value&) {})>,
+                                 std::tuple<>>,
+                  "return_value&-only detour must decompose to an empty method-arg tuple "
+                  "(zero-arg-method observe-only path, flaw #1 fix)");
     static_assert(
         std::is_same_v<
             method_args_of<const_call_functor>,
