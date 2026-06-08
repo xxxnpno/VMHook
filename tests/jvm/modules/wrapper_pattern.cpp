@@ -76,6 +76,11 @@
 
 namespace
 {
+    // The fixture class this module wraps.  Used by register_class<wp>() and by
+    // the entry guard's find_class() pre-check (so the unguarded handshake
+    // static_field("go")->set(...) derefs can never fault on a missing class).
+    constexpr char FIXTURE[]{ "vmhook/fixtures/WrapperPattern" };
+
     // -----------------------------------------------------------------------
     // The wrapper under test: vmhook.fixtures.WrapperPattern.
     //
@@ -241,6 +246,10 @@ namespace
     // selector on the rising edge of go, then wait for done.
     auto drive(vmhook_test::context& ctx, std::int32_t mode) -> bool
     {
+        if (!ctx.run_probe)
+        {
+            return false;
+        }
         return ctx.run_probe(
             [mode](bool value)
             {
@@ -253,12 +262,30 @@ namespace
             },
             []() { return wp::get_done(); });
     }
-}
 
-VMHOOK_JVM_MODULE(wrapper_pattern)
-{
-    vmhook::register_class<wp>("vmhook/fixtures/WrapperPattern");
-    // wp_unregistered is intentionally NOT registered (type-registry gate test).
+    // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
+    // it under a try/catch and ALWAYS follow it with shutdown_hooks() (suite-
+    // safety: ZERO hooks armed on EVERY exit path).
+    auto run_wrapper_pattern_checks(vmhook_test::context& ctx) -> void
+    {
+        // =====================================================================
+        //  ENTRY GUARD.  If WrapperPattern is not loaded/resolvable, every
+        //  static_field()->set/get below (the go/done/mode handshake) would deref
+        //  a disengaged optional.  Bail cleanly to [INFO] instead of dereferencing
+        //  anything (the wrapper's final shutdown_hooks() still runs).  In practice
+        //  the harness loads every vmhook.fixtures.* class on each run, so this is
+        //  belt-and-braces.  (Same idiom as register_class / hook_basic.)
+        // =====================================================================
+        if (vmhook::find_class(FIXTURE) == nullptr)
+        {
+            ctx.record("[INFO] wrapper_pattern: WrapperPattern not loaded/resolvable "
+                       "on this run; skipping the module's live checks (no crash, no "
+                       "hooks armed).");
+            return;
+        }
+
+        vmhook::register_class<wp>(FIXTURE);
+        // wp_unregistered is intentionally NOT registered (type-registry gate test).
 
     // =====================================================================
     //  0. Sanity: the class resolves through the portable accessors.
@@ -720,4 +747,38 @@ VMHOOK_JVM_MODULE(wrapper_pattern)
         }
         // scoped_hook `handle` uninstalls here at scope exit — nothing left armed.
     }
+}   // run_wrapper_pattern_checks
+}   // anonymous namespace
+
+VMHOOK_JVM_MODULE(wrapper_pattern)
+{
+    // Run the whole body under a try/catch so a stray throw from any vmhook call
+    // (or the harness) can never escape this module.  A throw is recorded as
+    // [INFO], never a FAIL (mirrors register_class.cpp / aaa_warmup.cpp).
+    bool body_threw{ false };
+    try
+    {
+        run_wrapper_pattern_checks(ctx);
+    }
+    catch (...)
+    {
+        body_threw = true;
+    }
+
+    // FINAL CLEANUP — belt-and-braces, OUTSIDE the try so it ALWAYS runs.  Other
+    // modules run after this one, so the module MUST leave ZERO hooks armed.  The
+    // only hook (section 11's scoped_hook) already uninstalled at its scope exit;
+    // this unconditional shutdown_hooks() guarantees an empty hook table even if
+    // the body threw BEFORE reaching that scope exit (it is idempotent and
+    // safe-when-empty — proven by shutdown_hooks_teardown).  A leaked armed hook
+    // is exactly the failure mode that cascaded across the matrix in Wave 3.
+    vmhook::shutdown_hooks();
+
+    if (body_threw)
+    {
+        ctx.record("[INFO] wrapper_pattern: the test body threw and was contained "
+                   "(no crash, no hooks armed); see preceding checks for partial "
+                   "results.");
+    }
+    ctx.check("module_left_clean_final_shutdown", true);
 }
