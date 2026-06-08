@@ -4,8 +4,8 @@ import vmhook.Harness;
 
 /**
  * Fixture for the register_class feature: vmhook::register_class&lt;T&gt;(name) and the
- * type-&gt;class map / wrapper-factory machinery (vmhook.hpp:1440 type_to_class_map,
- * 1462 g_type_factory_map, 6915-6952 register_class&lt;T&gt;).
+ * type-&gt;class map / wrapper-factory machinery (vmhook.hpp type_to_class_map,
+ * g_type_factory_map, register_class&lt;T&gt;).
  *
  * register_class is almost entirely native-side: it associates a C++ wrapper type
  * with an internal JVM class name, verifies the class is loaded (find_class), and
@@ -26,12 +26,17 @@ import vmhook.Harness;
  * The single Java interaction anchors a LIVE instance: the native module installs
  * a scoped_hook on {@link #anchor(int)} whose detour receives the receiver as a
  * std::unique_ptr&lt;wrapper&gt; -- the ONLY code path that goes through the registered
- * FACTORY (vmhook.hpp:7488-7508 extract_frame_arg builds the wrapper via
- * g_type_factory_map[class]).  Reading the anchored instance's own field back
- * inside the detour proves a made/decoded object decodes to the REGISTERED wrapper
- * type (correct klass, correct field offsets).
+ * FACTORY (extract_frame_arg builds the wrapper via g_type_factory_map[class]).
+ * Reading the anchored instance's own field back inside the detour proves a
+ * made/decoded object decodes to the REGISTERED wrapper type (correct klass,
+ * correct field offsets).
  *
- * JAVA 8 SOURCE (compiles under javac 8 AND 25): no var/records/switch-expr/
+ * The go/done/anchorCalls handshake mirrors HookBasic exactly: the native side
+ * raises `go`, the Harness loop runs this fixture's Probe (real bytecode dispatch
+ * on the held INSTANCE), then sets `done`.  No System.gc() / no allocation churn,
+ * so this fixture adds no GC-timing crash surface to the suite.
+ *
+ * JAVA 8 SOURCE (compiles under javac 8 AND 25+): no var/records/switch-expr/
  * text-blocks/sealed/List.of/Stream.toList/post-8 API.
  */
 public final class RegisterClassFix
