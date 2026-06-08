@@ -5794,10 +5794,39 @@ namespace vmhook
                 std::memcpy(this->allocated + HOOK_SIZE, assembly, sizeof(assembly));
 
                 std::uint32_t old_protect{};
-                vmhook::os::protect(this->allocated, total_size,
-                                    vmhook::os::memory_protection::execute_read, &old_protect);
-                vmhook::os::protect(target, JMP_SIZE,
-                                    vmhook::os::memory_protection::execute_rw, &old_protect);
+                // Load-bearing: the trampoline must be executable before the
+                // target JMP can branch into it.  If the kernel refuses the
+                // protection change (hardened W^X, OOM, or the protect()
+                // address-wrap guard), do NOT proceed - a target redirected to
+                // a non-executable page crashes the JVM on first hit.  Release
+                // the just-allocated stub and leave the hook in its error state
+                // (error stays true) so the caller sees a clean failure.  The
+                // target is still pristine here (patched only below), so there
+                // is nothing else to undo.
+                if (!vmhook::os::protect(this->allocated, total_size,
+                                         vmhook::os::memory_protection::execute_read, &old_protect))
+                {
+                    VMHOOK_LOG("{} midi2i_hook::midi2i_hook failed to make trampoline executable.",
+                               vmhook::error_tag);
+                    vmhook::os::release(this->allocated, this->allocated_size);
+                    this->allocated = nullptr;
+                    return;
+                }
+                // Load-bearing: the injection point must be writable before we
+                // stamp the 5-byte JMP over it.  If the protection change is
+                // refused we must not write to a read-only page (it would either
+                // fault or, worse, partially succeed); abort cleanly.  The stub
+                // is built but the target is untouched, so release the stub and
+                // leave error == true.
+                if (!vmhook::os::protect(target, JMP_SIZE,
+                                         vmhook::os::memory_protection::execute_rw, &old_protect))
+                {
+                    VMHOOK_LOG("{} midi2i_hook::midi2i_hook failed to make target writable.",
+                               vmhook::error_tag);
+                    vmhook::os::release(this->allocated, this->allocated_size);
+                    this->allocated = nullptr;
+                    return;
+                }
 
                 target[0] = JMP_OPCODE;
                 const std::int32_t jmp_delta{ static_cast<std::int32_t>(this->allocated - (target + JMP_SIZE)) };
@@ -5805,7 +5834,12 @@ namespace vmhook
 
                 // Restore the target page's original protection.  We don't have a portable
                 // way to spell the original native flags, so we apply execute_read which
-                // matches the JVM's normal state for generated code.
+                // matches the JVM's normal state for generated code.  The return value is
+                // intentionally not load-bearing: the JMP is already written and the page
+                // is currently execute_rw (executable), so the hook is live and functional
+                // even if this re-tightening to execute_read fails.  Leaving the page RW
+                // is a hardening concern, not a correctness one, and is never a reason to
+                // tear down a successfully-installed hook.
                 vmhook::os::protect(target, JMP_SIZE,
                                     vmhook::os::memory_protection::execute_read, &old_protect);
                 vmhook::os::flush_instruction_cache(target, JMP_SIZE);
@@ -5828,6 +5862,12 @@ namespace vmhook
                 static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
                 std::uint32_t old_protect{};
+                // The make-writable protect() here is already load-bearing and
+                // guarded: the && short-circuits the restore-memcpy below if it
+                // fails, so we never write the original bytes over a read-only
+                // page.  The inner execute_read protect() is a best-effort
+                // re-tighten whose failure is not load-bearing (bytes already
+                // restored; leaving the page RW does not corrupt anything).
                 if (this->target[0] == JMP_OPCODE
                     && vmhook::os::protect(this->target, 5,
                                            vmhook::os::memory_protection::execute_rw, &old_protect))
