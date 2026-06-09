@@ -1,6 +1,8 @@
 package vmhook.fixtures;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
 
@@ -31,6 +33,31 @@ import vmhook.Harness;
  *     slot == null; LinkedList Node.item == null).
  *   - element order preserved: element k carries id == k, so the native side
  *     asserts vec[k].id == k for every k — the strongest order+identity signal.
+ *
+ * EXHAUSTIVE shape coverage (added so every List flavour and small size the
+ * native to_vector cascade can hit is exercised on a live JVM):
+ *   - size 2 in BOTH containers (arrTwo / linkTwo): the smallest "more than one"
+ *     case, distinct from single.
+ *   - duplicate-VALUE list (arrDup): several elements share the same id/tag but
+ *     are DISTINCT heap objects — proves the walk neither collapses equal-valued
+ *     elements nor re-emits one (decoded OOPs stay all-distinct) and that the
+ *     value readback is per-element, not deduplicated.
+ *   - Object[] reference array (elemArray, an Elem[]): a '[L...;' field, which
+ *     value_t::to_vector walks DIRECTLY as a raw Java array (the array branch),
+ *     NOT through the collection cascade — the sibling entry point to the List
+ *     object path.
+ *   - nested List-of-Lists (nested, an ArrayList<List<Elem>>): the outer takes
+ *     the ArrayList fast path and each element is itself a List the native side
+ *     re-walks with collection::to_vector — proves an element OOP produced by
+ *     to_vector is a real, fully-walkable container.
+ *   - the GENERIC size()+get(int) fallback List flavours that have NO
+ *     elementData/first/map/m field shape and so cannot take any fast path:
+ *       * Arrays.asList(...)            -> java.util.Arrays$ArrayList (field "a")
+ *       * Collections.emptyList()       -> Collections$EmptyList (size()==0)
+ *       * Collections.singletonList(x)  -> Collections$SingletonList (field "element")
+ *       * Collections.unmodifiableList()-> Collections$UnmodifiableRandomAccessList
+ *     Each is reached by the cascade's last resort (collection::to_vector's
+ *     get(int) loop), exercising the Java-call-gate decode path end to end.
  *
  * Each Elem also carries a String `tag` ("e<id>") so the native side can do the
  * element-field readback the scope asks for, through a wrapper built by
@@ -92,6 +119,34 @@ public final class CollList
     /** Total element count of the "with null" lists (one slot is null). */
     public static final int NULL_LIST_LEN = 4;
 
+    /** Element count of the size-2 lists (smallest "more than one"). */
+    public static final int TWO = 2;
+
+    /** Element count of the duplicate-value ArrayList. */
+    public static final int DUP_LEN = 6;
+
+    /**
+     * The single id/tag shared by EVERY element of the duplicate-value list.
+     * Each element is still a distinct heap object (a fresh new Elem(DUP_VAL)),
+     * so the native side sees DUP_LEN equal values but DUP_LEN distinct OOPs.
+     */
+    public static final int DUP_VAL = 9;
+
+    /** Element count of the Elem[] object-array field (the '[L' array branch). */
+    public static final int OBJ_ARR_LEN = 5;
+
+    /** Outer length of the nested List-of-Lists. */
+    public static final int NESTED_OUTER = 3;
+
+    /** Inner length of EACH list inside the nested List-of-Lists. */
+    public static final int NESTED_INNER = 4;
+
+    /** Element count of the Arrays.asList(...) view (generic fallback). */
+    public static final int ASLIST_LEN = 3;
+
+    /** The id/tag of the Collections.singletonList(...) element. */
+    public static final int SINGLETON_ID = 0;
+
     // ── ArrayList fields (each takes the "elementData"+"size" fast path) ────
     /** Empty ArrayList — size 0, to_vector must be empty (no element read). */
     public final ArrayList<Elem> arrEmpty = new ArrayList<Elem>();
@@ -111,6 +166,17 @@ public final class CollList
     /** ArrayList whose element at index NULL_AT is null (nullptr-slot proof). */
     public final ArrayList<Elem> arrWithNull = new ArrayList<Elem>();
 
+    /** Size-2 ArrayList (smallest "more than one"). */
+    public final ArrayList<Elem> arrTwo = new ArrayList<Elem>();
+
+    /**
+     * ArrayList of DUP_LEN elements that all share id/tag == DUP_VAL but are
+     * distinct heap objects.  Proves equal-valued elements are neither collapsed
+     * nor re-emitted: the native side reads DUP_LEN equal ids yet DUP_LEN
+     * distinct element OOPs.
+     */
+    public final ArrayList<Elem> arrDup = new ArrayList<Elem>();
+
     // ── LinkedList fields (each takes the "first"+"size" Node-chain path) ───
     /** Empty LinkedList — size 0, to_vector must be empty. */
     public final LinkedList<Elem> linkEmpty = new LinkedList<Elem>();
@@ -124,6 +190,9 @@ public final class CollList
     /** LinkedList whose node at index NULL_AT has item == null. */
     public final LinkedList<Elem> linkWithNull = new LinkedList<Elem>();
 
+    /** Size-2 LinkedList (smallest "more than one"). */
+    public final LinkedList<Elem> linkTwo = new LinkedList<Elem>();
+
     /**
      * Large LinkedList (BIG elements).  The native side wall-clocks the
      * first->next walk over this to catch a quadratic (per-node find_field)
@@ -132,6 +201,39 @@ public final class CollList
      * fast-path selection is field-shape based, not Java-static-type based.
      */
     public final List<Elem> linkBig = new LinkedList<Elem>();
+
+    // ── Object-array field ('[L...;') — the value_t::to_vector ARRAY branch ──
+    /**
+     * A raw Elem[] (NOT a List).  Its field signature is "[Lvmhook/fixtures/
+     * CollList$Elem;", so field_proxy::value_t::to_vector walks it DIRECTLY as a
+     * Java array (the array branch), never routing it through the collection
+     * cascade — the sibling of the List-object path the rest of this fixture
+     * exercises.  Populated in populate() with ids 0..OBJ_ARR_LEN-1.
+     */
+    public final Elem[] elemArray = new Elem[OBJ_ARR_LEN];
+
+    // ── Nested List-of-Lists — outer fast path, inner re-walk ───────────────
+    /**
+     * An ArrayList whose elements are themselves Lists.  The outer takes the
+     * ArrayList fast path; the native side then re-walks each element (an inner
+     * List OOP produced by to_vector) with collection::to_vector to prove a
+     * decoded element is a real, fully-walkable container.  Inner list j holds
+     * ids 0..NESTED_INNER-1.
+     */
+    public final ArrayList<List<Elem>> nested = new ArrayList<List<Elem>>();
+
+    // ── Generic size()+get(int) fallback flavours (NO fast-path field shape) ─
+    /** Arrays.asList(...) view — java.util.Arrays$ArrayList (backing field "a"). */
+    public List<Elem> asListView;
+
+    /** Collections.emptyList() — Collections$EmptyList, size()==0. */
+    public List<Elem> emptyImmutable;
+
+    /** Collections.singletonList(x) — Collections$SingletonList (field "element"). */
+    public List<Elem> singletonView;
+
+    /** Collections.unmodifiableList(arrMany) — wraps the 12-element ArrayList. */
+    public List<Elem> unmodifiableView;
 
     /** A throwaway so the trigger() detour has a guaranteed fresh TLAB/dispatch. */
     public static volatile int triggerNonce;
@@ -186,6 +288,54 @@ public final class CollList
         {
             linkBig.add(new Elem(i));
         }
+
+        // size-2 lists.
+        for (int i = 0; i < TWO; ++i)
+        {
+            arrTwo.add(new Elem(i));
+            linkTwo.add(new Elem(i));
+        }
+
+        // duplicate-VALUE ArrayList: DUP_LEN distinct Elem objects, every one
+        // carrying the SAME id/tag (DUP_VAL).  Equal values, distinct identities.
+        for (int i = 0; i < DUP_LEN; ++i)
+        {
+            arrDup.add(new Elem(DUP_VAL));
+        }
+
+        // Elem[] object array (the '[L' array branch): ids 0..OBJ_ARR_LEN-1.
+        for (int i = 0; i < OBJ_ARR_LEN; ++i)
+        {
+            elemArray[i] = new Elem(i);
+        }
+
+        // nested List-of-Lists: NESTED_OUTER inner lists, each with ids
+        // 0..NESTED_INNER-1.  Alternate inner concrete types so the inner re-walk
+        // is proven against both fast paths (ArrayList and LinkedList).
+        for (int j = 0; j < NESTED_OUTER; ++j)
+        {
+            final List<Elem> inner = (j % 2 == 0)
+                ? new ArrayList<Elem>()
+                : new LinkedList<Elem>();
+            for (int i = 0; i < NESTED_INNER; ++i)
+            {
+                inner.add(new Elem(i));
+            }
+            nested.add(inner);
+        }
+
+        // Generic size()+get(int) fallback flavours.  None of these has an
+        // elementData/first/map/m field shape, so collection::to_vector falls
+        // through to the get(int) loop.
+        final Elem[] asListElems = new Elem[ASLIST_LEN];
+        for (int i = 0; i < ASLIST_LEN; ++i)
+        {
+            asListElems[i] = new Elem(i);
+        }
+        asListView = Arrays.asList(asListElems);                 // Arrays$ArrayList
+        emptyImmutable = Collections.<Elem>emptyList();          // EmptyList
+        singletonView = Collections.singletonList(new Elem(SINGLETON_ID));
+        unmodifiableView = Collections.unmodifiableList(arrMany);// wraps arrMany
 
         populated = true;
     }

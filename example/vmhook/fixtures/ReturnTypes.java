@@ -65,6 +65,40 @@ public final class ReturnTypes
     // matching modified-UTF-8 bytes.  Logical text: "cafe<acute> <nihongo>".
     public static final String UNICODE = "caf\u00e9 \u65e5\u672c\u8a9e";  // cafe-acute + nihongo
 
+    // -- Long ASCII String return (well under read_java_string's 4096 cap, so the
+    //    decode is exact -- proves a multi-segment String round-trips byte-for-byte,
+    //    not just the short headline).  300 chars: '0'..'9' repeated. --------------
+    public static final String LONG_STRING = buildLongString();
+
+    private static String buildLongString()
+    {
+        final StringBuilder sb = new StringBuilder(300);
+        for (int i = 0; i < 300; i++)
+        {
+            sb.append((char) ('0' + (i % 10)));
+        }
+        return sb.toString();
+    }
+
+    // -- A String with an INTERIOR NUL (U+0000) between two ASCII halves.  The two
+    //    decode paths legitimately DIFFER on this input: read_java_string (call_stub
+    //    / compressed-OOP path) emits standard UTF-8 (a single 0x00 byte), whereas
+    //    the call_jni String path goes through GetStringUTFChars, which yields Java's
+    //    MODIFIED UTF-8 (U+0000 -> 0xC0 0x80).  The native module CHARACTERIZES the
+    //    decoded bytes for whichever path this JDK takes rather than over-asserting. -
+    public static final String INTERIOR_NUL = "ab\u0000cd";
+
+    // -- A STABLE non-null Object the native side decodes + cross-checks by OOP
+    //    identity.  returnsObject() hands back THIS instance (not a fresh Object each
+    //    call), so the decoded wrapper's heap pointer must equal this object's OOP. --
+    public static final Object OBJECT_SINGLETON = new Object();
+
+    /** identityHashCode of OBJECT_SINGLETON, published for the native cross-check. */
+    public static volatile int objectIdentity;
+
+    /** identityHashCode of SINGLETON (the receiver), for the self-as-Object check. */
+    public static volatile int selfIdentity;
+
     // -- the method the native module hooks to obtain a live thread --------------
 
     /** Hookable instance method.  The native detour on this method performs every
@@ -73,6 +107,16 @@ public final class ReturnTypes
     {
         triggerCount++;
         return delta + 1;
+    }
+
+    // ========================================================================
+    //  void (V) -- the no-result return
+    // ========================================================================
+    /** A void-returning method: side effect only.  call() must decode to a
+     *  monostate value_t (is_void() true) on BOTH dispatch paths. */
+    public void returnsVoid()
+    {
+        triggerCount += 0;   // a real (no-op) side effect so the body is non-trivial
     }
 
     // ========================================================================
@@ -137,6 +181,36 @@ public final class ReturnTypes
     public String returnsString()        { return "hello-from-jvm"; }   // mirrors Example
     public String returnsStringEmpty()   { return ""; }                 // empty != null boundary
     public String returnsStringUnicode() { return UNICODE; }            // multibyte modified-UTF-8
+    public String returnsStringLong()    { return LONG_STRING; }        // 300 ASCII chars, exact decode
+    public String returnsStringInteriorNul() { return INTERIOR_NUL; }   // embedded U+0000
+
+    // ========================================================================
+    //  primitive arrays ([Z [B [C [S [I [J [F [D) and Object[]
+    //  The reference return decodes to a compressed-OOP value_t alternative; the
+    //  native side recovers the array OOP (decode_oop_pointer) and reads length +
+    //  elements via vmhook::array_length / get_array_element<T>.
+    // ========================================================================
+    public boolean[] returnsBoolArray()  { return new boolean[] { true, false, true }; }
+    public byte[]    returnsByteArray()   { return new byte[] { (byte) -128, 0, (byte) 127 }; }
+    public char[]    returnsCharArray()   { return new char[] { 'A', '?', (char) 0xFFFF }; }
+    public short[]   returnsShortArray()  { return new short[] { (short) -32768, 0, (short) 32767 }; }
+    public int[]     returnsIntArray()    { return new int[] { Integer.MIN_VALUE, 0, 0x12345678, Integer.MAX_VALUE }; }
+    public long[]    returnsLongArray()   { return new long[] { Long.MIN_VALUE, 0x123456789ABCDEF0L, Long.MAX_VALUE }; }
+    public float[]   returnsFloatArray()  { return new float[] { 1.0f, 3.1415926f }; }
+    public double[]  returnsDoubleArray() { return new double[] { 1.0, 2.718281828459045 }; }
+    /** Object[] -- the reference-element array branch. */
+    public Object[]  returnsObjectArray() { return new Object[] { OBJECT_SINGLETON, null }; }
+    /** Empty int[] -- the zero-length array boundary (length 0, valid OOP). */
+    public int[]     returnsEmptyIntArray() { return new int[0]; }
+
+    // ========================================================================
+    //  boxed wrapper types (java.lang.Integer / Long / Double)
+    //  Each decodes to a reference value_t; the native side wraps it and reads the
+    //  boxed value back through a method call (intValue()/longValue()/doubleValue()).
+    // ========================================================================
+    public Integer returnsBoxedInteger() { return Integer.valueOf(0x12345678); }
+    public Long    returnsBoxedLong()    { return Long.valueOf(0x123456789ABCDEF0L); }
+    public Double  returnsBoxedDouble()  { return Double.valueOf(2.718281828459045); }
 
     // ========================================================================
     //  Object / null-returning method
@@ -145,9 +219,14 @@ public final class ReturnTypes
      *  null/empty-wrapper boundary the native side characterizes. */
     public Object returnsNull() { return null; }
 
-    /** Returns a non-null Object (a fresh java.lang.Object) -- the native side
-     *  characterizes whether the reference decode yields a non-empty wrapper. */
-    public Object returnsObject() { return new Object(); }
+    /** Returns the STABLE non-null Object singleton (NOT a fresh Object) so the
+     *  native side can cross-check the decoded wrapper's OOP against this object's
+     *  published identity. */
+    public Object returnsObject() { return OBJECT_SINGLETON; }
+
+    /** Returns {@code this} through an Object-typed signature: the decoded wrapper's
+     *  instance must equal the receiver OOP (identity via the reference path). */
+    public Object returnsSelfAsObject() { return this; }
 
     static
     {
@@ -162,6 +241,11 @@ public final class ReturnTypes
             @Override
             public void run()
             {
+                // Publish OOP identities the native side cross-checks against the
+                // decoded reference returns (returnsObject / returnsSelfAsObject).
+                ReturnTypes.objectIdentity = System.identityHashCode(OBJECT_SINGLETON);
+                ReturnTypes.selfIdentity   = System.identityHashCode(SINGLETON);
+
                 // Real bytecode dispatch -> the native hook on trigger() fires,
                 // and the detour exercises every return-typed method on this very
                 // SINGLETON instance.
