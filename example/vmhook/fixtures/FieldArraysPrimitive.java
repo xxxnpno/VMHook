@@ -17,10 +17,11 @@ import vmhook.Harness;
  *   - an empty array (length 0),
  *   - a single-element array,
  *   - a large array (256 elements) populated by a deterministic formula,
- *   - a boundary array holding the type's MIN / MAX / special values.
- * Both the STATIC and the INSTANCE variants of every canonical array exist so
- * the native side covers the static-mirror read path and the instance-offset
- * read path independently.
+ *   - a boundary array holding the type's MIN / MAX / special values,
+ *   - a null array reference (the field holds null, not an array).
+ * Both the STATIC and the INSTANCE variants of every shape exist so the native
+ * side covers the static-mirror read path and the instance-offset read path
+ * independently (canonical / empty / single / boundary, plus a null reference).
  *
  * Shape mirrors the canonical Pilot fixture: a public-static-volatile go/done
  * handshake the native side drives through run_probe, a self-reference
@@ -30,9 +31,10 @@ import vmhook.Harness;
  * raises 'done'; the native reads happen out-of-probe through direct field
  * access, which is the real-world usage pattern for field_proxy array reads.
  *
- * Pure-ASCII source on purpose (no box-drawing comment glyphs, char literals
- * written as \\uXXXX escapes) so it compiles under javac 8..25 with any
- * -encoding.  Java 8 syntax only: no var, no records, no switch-expressions.
+ * Pure-ASCII source on purpose (no box-drawing comment glyphs; high char code
+ * units written as (char) integer casts, NOT \\uXXXX literals) so it compiles
+ * under javac 8..25 with any -encoding and survives source-normalisation.
+ * Java 8 syntax only: no var, no records, no switch-expressions.
  */
 public final class FieldArraysPrimitive
 {
@@ -82,6 +84,16 @@ public final class FieldArraysPrimitive
     public static float[]   emptyFloatArray  = new float[0];
     public static double[]  emptyDoubleArray = new double[0];
 
+    // --- Empty arrays (length 0), INSTANCE variant ---------------------------
+    public boolean[] instEmptyBoolArray   = new boolean[0];
+    public byte[]    instEmptyByteArray   = new byte[0];
+    public short[]   instEmptyShortArray  = new short[0];
+    public char[]    instEmptyCharArray   = new char[0];
+    public int[]     instEmptyIntArray    = new int[0];
+    public long[]    instEmptyLongArray   = new long[0];
+    public float[]   instEmptyFloatArray  = new float[0];
+    public double[]  instEmptyDoubleArray = new double[0];
+
     // --- Single-element arrays for every type --------------------------------
     public static boolean[] singleBoolArray   = { true };
     public static byte[]    singleByteArray   = { (byte) 42 };
@@ -91,6 +103,16 @@ public final class FieldArraysPrimitive
     public static long[]    singleLongArray   = { 1234567890123L };
     public static float[]   singleFloatArray  = { 3.14159f };
     public static double[]  singleDoubleArray = { 2.718281828 };
+
+    // --- Single-element arrays, INSTANCE variant -----------------------------
+    public boolean[] instSingleBoolArray   = { false };
+    public byte[]    instSingleByteArray   = { (byte) -7 };
+    public short[]   instSingleShortArray  = { (short) -321 };
+    public char[]    instSingleCharArray   = { 'q' };
+    public int[]     instSingleIntArray    = { -7654321 };
+    public long[]    instSingleLongArray   = { -9876543210987L };
+    public float[]   instSingleFloatArray  = { -1.5f };
+    public double[]  instSingleDoubleArray = { -0.0078125 };
 
     // --- Large arrays (256 elements) by a deterministic formula --------------
     // Filled in the static / instance initialisers below so the C++ side can
@@ -118,16 +140,36 @@ public final class FieldArraysPrimitive
     public static double[]  boundaryDoubleArray =
         { -Double.MAX_VALUE, 0.0, Double.MAX_VALUE };
 
+    // --- Boundary-value arrays, INSTANCE variant -----------------------------
+    public boolean[] instBoundaryBoolArray   = { true, false, false };
+    public byte[]    instBoundaryByteArray   = { Byte.MIN_VALUE, (byte) -1, Byte.MAX_VALUE };
+    public short[]   instBoundaryShortArray  = { Short.MIN_VALUE, (short) -1, Short.MAX_VALUE };
+    public char[]    instBoundaryCharArray   = { Character.MIN_VALUE, (char) 0x01, Character.MAX_VALUE };
+    public int[]     instBoundaryIntArray    = { Integer.MIN_VALUE, -1, Integer.MAX_VALUE };
+    public long[]    instBoundaryLongArray   = { Long.MIN_VALUE, -1L, Long.MAX_VALUE };
+    public float[]   instBoundaryFloatArray  =
+        { -Float.MAX_VALUE, Float.MIN_VALUE, Float.MAX_VALUE };
+    public double[]  instBoundaryDoubleArray =
+        { -Double.MAX_VALUE, Double.MIN_VALUE, Double.MAX_VALUE };
+
     // Extra float/double special-value arrays (NaN / +Inf / -Inf / subnormal).
     public static float[]   specialFloatArray  =
         { Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY, Float.MIN_VALUE };
     public static double[]  specialDoubleArray =
         { Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, Double.MIN_VALUE };
 
+    // Null array REFERENCES (the field holds null, not an empty array).  Reading
+    // these must decode_array_oop(0) -> nullptr -> empty vector, never a crash.
+    // One static + one instance, two distinct element types, prove the
+    // null-reference short-circuit on both read paths and that it is element-
+    // type independent.
+    public static int[]  nullIntArray = null;
+    public long[]        instNullLongArray = null;
+
     // A long[] whose elements hold values that do NOT fit in 32 bits, so a
-    // (buggy) narrow read into vector<int32_t> would be detectable as the low
-    // 32 bits.  Used by the width-mismatch documentation check on the native
-    // side.  High word differs from low word for every element.
+    // (buggy) narrow read into vector<int32_t> would be detectable as a 4-byte
+    // stride over the 8-byte data.  Used by the width-mismatch documentation
+    // check on the native side.  High word differs from low word per element.
     public static long[]    wideLongArray =
         { 0x1122334455667788L, 0x7FFFFFFF00000001L, -1L };
 

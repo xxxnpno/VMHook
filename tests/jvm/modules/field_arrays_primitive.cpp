@@ -9,28 +9,48 @@
 //
 // which lands in field_proxy::value_t::operator target_type()
 //   -> std::visit -> cast_for_variant<vector<T>> -> read_array_value<vector<T>>
-//   -> append_array_value(...) per element (vmhook.hpp ~11291-11383, 11154-11193).
+//   -> append_array_value(...) per element  (vmhook.hpp: array_length ~12372,
+//   get_array_element ~12393, append_array_value ~12516-12567,
+//   read_array_value ~12584-12615).
 //
 // NOTE on the public API: the canonical primitive-array read is the *implicit
 // conversion operator*, NOT value_t::to_vector<T>().  to_vector<T>() is the
 // OBJECT-array path (returns std::vector<std::unique_ptr<T>> via
-// collection::to_vector) — calling it with an arithmetic T would compile to a
+// collection::to_vector) -- calling it with an arithmetic T would compile to a
 // vector<unique_ptr<int>> and log "not a collection" at runtime.  Every read
 // below therefore assigns get() into a typed std::vector<T> local so the
 // primitive operator fires.  This module documents that naming overlap as a
 // known sharp edge of the feature.
 //
-// Exhaustiveness: every primitive element type, both static and instance
-// fields, and the empty / single / large(256) / boundary / special-value
-// shapes — size AND every element verified.  Plus two documentation checks for
-// real flaws found in the read path (silent width-mismatch narrowing; lossy
-// char[] -> vector<char> truncation) exercised in a crash-safe direction.
+// Exhaustiveness: every primitive element type, BOTH static and instance fields,
+// at the empty / single / many / large(256) / boundary / special shapes -- size
+// AND every element verified.  The instance-offset read path is exercised at the
+// canonical / empty / single / boundary shapes independently of the static
+// mirror.  A null array REFERENCE is read on both paths (must yield an empty
+// vector, never a crash).  Each canonical array is ALSO walked at the raw
+// array_length + get_array_element<T> layer at index 0 / mid / last, proving the
+// length oracle and per-element offset arithmetic directly (and never reading
+// out of bounds -- array_length is the only bounds source used).  Two
+// documentation checks pin real flaws in the read path (silent element-width
+// mismatch; lossy char[] -> vector<char> truncation), each exercised in a
+// crash-safe direction so a future fix deliberately flips the check.
+//
+// SUITE-SAFETY (mirrors field_primitives_get.cpp / register_class.cpp):
+//   * the whole body runs under a try/catch -- a stray throw is recorded as
+//     [INFO], never a FAIL, and never escapes this module;
+//   * an unconditional vmhook::shutdown_hooks() runs OUTSIDE the try, so the
+//     module always returns to the driver with an empty hook table (this module
+//     installs NO hooks -- it only drives the fixture's pre-registered probe --
+//     so that is belt-and-braces, but the playbook mandates it regardless);
+//   * an entry guard bails to [INFO] if the fixture class is not resolvable, so
+//     no static_field()/get_field() below ever derefs a disengaged optional;
+//   * raw-pointer derefs (the decoded array oop / element addresses) are gated on
+//     is_valid_pointer and bounded by array_length -- never an out-of-bounds read.
 
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
 
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -42,9 +62,16 @@
 
 namespace
 {
+    // The fixture this module reads.  Used by the entry guard and registration.
+    constexpr char FIXTURE[]{ "vmhook/fixtures/FieldArraysPrimitive" };
+
     // Wrapper for vmhook.fixtures.FieldArraysPrimitive.  Each accessor returns
     // the field read into a concrete std::vector<T> so the primitive-array
-    // implicit-conversion operator (operator std::vector<T>()) fires.
+    // implicit-conversion operator (operator std::vector<T>()) fires.  The
+    // accessors are deliberately the clean one-liner idiom documented in the
+    // header (`return get_field("x")->get();`) with NO defensive has_value()
+    // guard -- the fields are known to exist (the entry guard proves the class is
+    // loaded), and all suite-safety lives at the module/call-site level below.
     class field_arrays_primitive_fixture
         : public vmhook::object<field_arrays_primitive_fixture>
     {
@@ -86,7 +113,7 @@ namespace
         auto i_float()  -> std::vector<float>         { return get_field("instFloatArray")->get(); }
         auto i_double() -> std::vector<double>        { return get_field("instDoubleArray")->get(); }
 
-        // --- EMPTY reads -------------------------------------------------------
+        // --- STATIC empty reads ------------------------------------------------
         static auto e_bool()   -> std::vector<bool>          { return static_field("emptyBoolArray")->get(); }
         static auto e_byte()   -> std::vector<std::byte>     { return static_field("emptyByteArray")->get(); }
         static auto e_short()  -> std::vector<std::int16_t>  { return static_field("emptyShortArray")->get(); }
@@ -96,7 +123,17 @@ namespace
         static auto e_float()  -> std::vector<float>         { return static_field("emptyFloatArray")->get(); }
         static auto e_double() -> std::vector<double>        { return static_field("emptyDoubleArray")->get(); }
 
-        // --- SINGLE-element reads ---------------------------------------------
+        // --- INSTANCE empty reads ----------------------------------------------
+        auto ie_bool()   -> std::vector<bool>          { return get_field("instEmptyBoolArray")->get(); }
+        auto ie_byte()   -> std::vector<std::byte>     { return get_field("instEmptyByteArray")->get(); }
+        auto ie_short()  -> std::vector<std::int16_t>  { return get_field("instEmptyShortArray")->get(); }
+        auto ie_char()   -> std::vector<char>          { return get_field("instEmptyCharArray")->get(); }
+        auto ie_int()    -> std::vector<std::int32_t>  { return get_field("instEmptyIntArray")->get(); }
+        auto ie_long()   -> std::vector<std::int64_t>  { return get_field("instEmptyLongArray")->get(); }
+        auto ie_float()  -> std::vector<float>         { return get_field("instEmptyFloatArray")->get(); }
+        auto ie_double() -> std::vector<double>        { return get_field("instEmptyDoubleArray")->get(); }
+
+        // --- STATIC single-element reads ---------------------------------------
         static auto one_bool()   -> std::vector<bool>          { return static_field("singleBoolArray")->get(); }
         static auto one_byte()   -> std::vector<std::int8_t>   { return static_field("singleByteArray")->get(); }
         static auto one_short()  -> std::vector<std::int16_t>  { return static_field("singleShortArray")->get(); }
@@ -106,7 +143,17 @@ namespace
         static auto one_float()  -> std::vector<float>         { return static_field("singleFloatArray")->get(); }
         static auto one_double() -> std::vector<double>        { return static_field("singleDoubleArray")->get(); }
 
-        // --- LARGE (256-element) reads ----------------------------------------
+        // --- INSTANCE single-element reads -------------------------------------
+        auto i_one_bool()   -> std::vector<bool>          { return get_field("instSingleBoolArray")->get(); }
+        auto i_one_byte()   -> std::vector<std::int8_t>   { return get_field("instSingleByteArray")->get(); }
+        auto i_one_short()  -> std::vector<std::int16_t>  { return get_field("instSingleShortArray")->get(); }
+        auto i_one_char()   -> std::vector<char>          { return get_field("instSingleCharArray")->get(); }
+        auto i_one_int()    -> std::vector<std::int32_t>  { return get_field("instSingleIntArray")->get(); }
+        auto i_one_long()   -> std::vector<std::int64_t>  { return get_field("instSingleLongArray")->get(); }
+        auto i_one_float()  -> std::vector<float>         { return get_field("instSingleFloatArray")->get(); }
+        auto i_one_double() -> std::vector<double>        { return get_field("instSingleDoubleArray")->get(); }
+
+        // --- LARGE (256-element) reads -----------------------------------------
         static auto big_bool()   -> std::vector<bool>          { return static_field("largeBoolArray")->get(); }
         static auto big_byte()   -> std::vector<std::int8_t>   { return static_field("largeByteArray")->get(); }
         static auto big_short()  -> std::vector<std::int16_t>  { return static_field("largeShortArray")->get(); }
@@ -116,7 +163,7 @@ namespace
         static auto big_float()  -> std::vector<float>         { return static_field("largeFloatArray")->get(); }
         static auto big_double() -> std::vector<double>        { return static_field("largeDoubleArray")->get(); }
 
-        // --- BOUNDARY-value reads ---------------------------------------------
+        // --- STATIC boundary-value reads ---------------------------------------
         static auto b_bool()   -> std::vector<bool>          { return static_field("boundaryBoolArray")->get(); }
         static auto b_byte()   -> std::vector<std::int8_t>   { return static_field("boundaryByteArray")->get(); }
         static auto b_short()  -> std::vector<std::int16_t>  { return static_field("boundaryShortArray")->get(); }
@@ -126,8 +173,22 @@ namespace
         static auto b_float()  -> std::vector<float>         { return static_field("boundaryFloatArray")->get(); }
         static auto b_double() -> std::vector<double>        { return static_field("boundaryDoubleArray")->get(); }
 
+        // --- INSTANCE boundary-value reads -------------------------------------
+        auto i_b_bool()   -> std::vector<bool>          { return get_field("instBoundaryBoolArray")->get(); }
+        auto i_b_byte()   -> std::vector<std::int8_t>   { return get_field("instBoundaryByteArray")->get(); }
+        auto i_b_short()  -> std::vector<std::int16_t>  { return get_field("instBoundaryShortArray")->get(); }
+        auto i_b_char()   -> std::vector<char>          { return get_field("instBoundaryCharArray")->get(); }
+        auto i_b_int()    -> std::vector<std::int32_t>  { return get_field("instBoundaryIntArray")->get(); }
+        auto i_b_long()   -> std::vector<std::int64_t>  { return get_field("instBoundaryLongArray")->get(); }
+        auto i_b_float()  -> std::vector<float>         { return get_field("instBoundaryFloatArray")->get(); }
+        auto i_b_double() -> std::vector<double>        { return get_field("instBoundaryDoubleArray")->get(); }
+
         static auto sp_float()  -> std::vector<float>        { return static_field("specialFloatArray")->get(); }
         static auto sp_double() -> std::vector<double>       { return static_field("specialDoubleArray")->get(); }
+
+        // --- NULL array references (field holds null, not an array) -------------
+        static auto null_int() -> std::vector<std::int32_t>  { return static_field("nullIntArray")->get(); }
+        auto i_null_long()     -> std::vector<std::int64_t>  { return get_field("instNullLongArray")->get(); }
 
         // char[] read of the high-code-unit array (documents narrowing).
         static auto uni_char_as_char() -> std::vector<char> { return static_field("unicodeCharArray")->get(); }
@@ -140,7 +201,7 @@ namespace
         static auto wide_long_as_int64() -> std::vector<std::int64_t> { return static_field("wideLongArray")->get(); }
     };
 
-    // ---- small helpers -------------------------------------------------------
+    // ---- small comparison helpers --------------------------------------------
 
     template <typename element_type>
     auto vectors_equal(const std::vector<element_type>& a,
@@ -197,14 +258,70 @@ namespace
         }
         return true;
     }
+
+    // ---- raw-layer array probe ------------------------------------------------
+    //
+    // Resolves a STATIC array field to its decoded array oop, reads array_length
+    // as the bounds oracle, and reads the element at index 0 / mid / last through
+    // get_array_element<element_type> (the same per-element offset arithmetic the
+    // implicit operator drives).  Bounds come ONLY from array_length, and every
+    // raw deref is is_valid_pointer-gated, so this never reads out of bounds.
+    // Returns false (and writes nothing) if the field / oop is unusable.
+    template <typename element_type>
+    auto raw_endpoints_static(const char* field_name,
+                              std::int32_t& out_length,
+                              element_type& out_first,
+                              element_type& out_mid,
+                              element_type& out_last) -> bool
+    {
+        const auto proxy{ field_arrays_primitive_fixture::static_field(field_name) };
+        if (!proxy.has_value())
+        {
+            return false;
+        }
+        void* const array_oop{ vmhook::field_oop(*proxy) };
+        if (!array_oop || !vmhook::hotspot::is_valid_pointer(array_oop))
+        {
+            return false;
+        }
+        const std::int32_t length{ vmhook::array_length(array_oop) };
+        out_length = length;
+        if (length <= 0)
+        {
+            return true;   // length read succeeded; no elements to sample.
+        }
+        const std::int32_t last{ length - 1 };
+        const std::int32_t mid{ length / 2 };
+        out_first = vmhook::get_array_element<element_type>(array_oop, 0);
+        out_mid   = vmhook::get_array_element<element_type>(array_oop, mid);
+        out_last  = vmhook::get_array_element<element_type>(array_oop, last);
+        return true;
+    }
 }
 
-VMHOOK_JVM_MODULE(field_arrays_primitive)
+// The entire test body, factored out so the VMHOOK_JVM_MODULE wrapper can run it
+// under a try/catch and ALWAYS follow it with shutdown_hooks() (suite-safety).
+// Anonymous-namespace members are visible here at file scope in this TU.
+static void run_field_arrays_primitive_checks(vmhook_test::context& ctx)
 {
-    vmhook::register_class<field_arrays_primitive_fixture>(
-        "vmhook/fixtures/FieldArraysPrimitive");
+    vmhook::register_class<field_arrays_primitive_fixture>(FIXTURE);
 
     using wrapper = field_arrays_primitive_fixture;
+
+    // =========================================================================
+    //  ENTRY GUARD.  If the fixture is not loaded/resolvable on this run, every
+    //  static_field()->get() below would deref a disengaged optional.  Bail
+    //  cleanly to [INFO] (the wrapper's final shutdown_hooks() still runs).  In
+    //  practice the harness loads the fixture on every run, so this is
+    //  belt-and-braces.
+    // =========================================================================
+    if (vmhook::find_class(FIXTURE) == nullptr)
+    {
+        ctx.record("[INFO] field_arrays_primitive: FieldArraysPrimitive not "
+                   "loaded/resolvable on this run; skipping the module's live "
+                   "checks (no crash, no hooks armed).");
+        return;
+    }
 
     // -------------------------------------------------------------------------
     // 0) Drive one real Java bytecode dispatch so the fixture is proven live
@@ -223,7 +340,7 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
     }
 
     // =========================================================================
-    // 1) STATIC canonical 3-element arrays — size + every element.
+    // 1) STATIC canonical 3-element arrays -- size + every element.
     // =========================================================================
     {
         const std::vector<bool> bool_v{ wrapper::s_bool() };
@@ -237,7 +354,7 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
                   vectors_equal(byte_v, std::vector<std::byte>{
                       std::byte{ 1 }, std::byte{ 2 }, std::byte{ 3 } }));
 
-        // Same [B field read into std::vector<int8_t> — alternate element type.
+        // Same [B field read into std::vector<int8_t> -- alternate element type.
         const std::vector<std::int8_t> byte_i8{ wrapper::s_byte_i8() };
         ctx.check("static_byte_i8_values",
                   vectors_equal(byte_i8, std::vector<std::int8_t>{ 1, 2, 3 }));
@@ -275,14 +392,16 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
     }
 
     // =========================================================================
-    // 2) INSTANCE canonical 3-element arrays — exercises the instance-offset
-    //    read path (vs the static-mirror path above).
+    // 2) INSTANCE arrays -- exercises the instance-offset read path (vs the
+    //    static-mirror path above) at the canonical / empty / single / boundary
+    //    shapes, plus a null instance array reference.
     // =========================================================================
     {
         const std::unique_ptr<wrapper> self{ wrapper::get_instance() };
         ctx.check("instance_wrapper_nonnull", self != nullptr);
         if (self)
         {
+            // ---- 2a) canonical 3-element instance arrays --------------------
             const std::vector<bool> bool_v{ self->i_bool() };
             ctx.check("instance_bool_size3", bool_v.size() == 3);
             ctx.check("instance_bool_values",
@@ -318,12 +437,86 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
             const std::vector<double> double_v{ self->i_double() };
             ctx.check("instance_double_values",
                       all_bits_equal(double_v, std::vector<double>{ 4.25, 5.25, 6.25 }));
+
+            // ---- 2b) EMPTY instance arrays (length 0 on the instance path) --
+            ctx.check("instance_empty_bool",   self->ie_bool().empty());
+            ctx.check("instance_empty_byte",   self->ie_byte().empty());
+            ctx.check("instance_empty_short",  self->ie_short().empty());
+            ctx.check("instance_empty_char",   self->ie_char().empty());
+            ctx.check("instance_empty_int",    self->ie_int().empty());
+            ctx.check("instance_empty_long",   self->ie_long().empty());
+            ctx.check("instance_empty_float",  self->ie_float().empty());
+            ctx.check("instance_empty_double", self->ie_double().empty());
+
+            // ---- 2c) SINGLE-element instance arrays -------------------------
+            const std::vector<bool> i1_bool{ self->i_one_bool() };
+            ctx.check("instance_single_bool", i1_bool.size() == 1 && i1_bool[0] == false);
+            const std::vector<std::int8_t> i1_byte{ self->i_one_byte() };
+            ctx.check("instance_single_byte",
+                      i1_byte.size() == 1 && i1_byte[0] == static_cast<std::int8_t>(-7));
+            const std::vector<std::int16_t> i1_short{ self->i_one_short() };
+            ctx.check("instance_single_short",
+                      i1_short.size() == 1 && i1_short[0] == static_cast<std::int16_t>(-321));
+            const std::vector<char> i1_char{ self->i_one_char() };
+            ctx.check("instance_single_char", i1_char.size() == 1 && i1_char[0] == 'q');
+            const std::vector<std::int32_t> i1_int{ self->i_one_int() };
+            ctx.check("instance_single_int", i1_int.size() == 1 && i1_int[0] == -7654321);
+            const std::vector<std::int64_t> i1_long{ self->i_one_long() };
+            ctx.check("instance_single_long",
+                      i1_long.size() == 1 && i1_long[0] == -9876543210987LL);
+            const std::vector<float> i1_float{ self->i_one_float() };
+            ctx.check("instance_single_float",
+                      i1_float.size() == 1 && bits_equal(i1_float[0], -1.5f));
+            const std::vector<double> i1_double{ self->i_one_double() };
+            ctx.check("instance_single_double",
+                      i1_double.size() == 1 && bits_equal(i1_double[0], -0.0078125));
+
+            // ---- 2d) BOUNDARY instance arrays ------------------------------
+            ctx.check("instance_boundary_bool",
+                      vectors_equal(self->i_b_bool(), std::vector<bool>{ true, false, false }));
+            ctx.check("instance_boundary_byte",
+                      vectors_equal(self->i_b_byte(), std::vector<std::int8_t>{
+                          std::numeric_limits<std::int8_t>::min(),
+                          static_cast<std::int8_t>(-1),
+                          std::numeric_limits<std::int8_t>::max() }));
+            ctx.check("instance_boundary_short",
+                      vectors_equal(self->i_b_short(), std::vector<std::int16_t>{
+                          std::numeric_limits<std::int16_t>::min(),
+                          static_cast<std::int16_t>(-1),
+                          std::numeric_limits<std::int16_t>::max() }));
+            // char is unsigned 16-bit; into vector<char> the low byte is kept.
+            // Fixture holds { 0x0000, 0x0001, 0xFFFF } -> low bytes { 0x00, 0x01, 0xFF }.
+            ctx.check("instance_boundary_char",
+                      vectors_equal(self->i_b_char(), std::vector<char>{
+                          static_cast<char>(0x00), static_cast<char>(0x01),
+                          static_cast<char>(0xFF) }));
+            ctx.check("instance_boundary_int",
+                      vectors_equal(self->i_b_int(), std::vector<std::int32_t>{
+                          std::numeric_limits<std::int32_t>::min(), -1,
+                          std::numeric_limits<std::int32_t>::max() }));
+            ctx.check("instance_boundary_long",
+                      vectors_equal(self->i_b_long(), std::vector<std::int64_t>{
+                          std::numeric_limits<std::int64_t>::min(), -1,
+                          std::numeric_limits<std::int64_t>::max() }));
+            ctx.check("instance_boundary_float",
+                      all_bits_equal(self->i_b_float(), std::vector<float>{
+                          -std::numeric_limits<float>::max(),
+                          std::numeric_limits<float>::denorm_min(),
+                          std::numeric_limits<float>::max() }));
+            ctx.check("instance_boundary_double",
+                      all_bits_equal(self->i_b_double(), std::vector<double>{
+                          -std::numeric_limits<double>::max(),
+                          std::numeric_limits<double>::denorm_min(),
+                          std::numeric_limits<double>::max() }));
+
+            // ---- 2e) NULL instance array reference -> empty, no crash ------
+            ctx.check("instance_null_long_array_ref_is_empty", self->i_null_long().empty());
         }
     }
 
     // =========================================================================
-    // 3) EMPTY arrays (length 0) — read_array_value's `length <= 0` early-out.
-    //    Every type must yield an empty vector and must NOT crash.
+    // 3) EMPTY static arrays (length 0) -- read_array_value's `length <= 0`
+    //    early-out.  Every type must yield an empty vector and must NOT crash.
     // =========================================================================
     {
         ctx.check("empty_bool",   wrapper::e_bool().empty());
@@ -337,7 +530,7 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
     }
 
     // =========================================================================
-    // 4) SINGLE-element arrays — the length==1 boundary of the read loop.
+    // 4) SINGLE-element static arrays -- the length==1 boundary of the read loop.
     // =========================================================================
     {
         const std::vector<bool> bool_v{ wrapper::one_bool() };
@@ -367,7 +560,7 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
     }
 
     // =========================================================================
-    // 5) LARGE (256-element) arrays — size + EVERY element recomputed from the
+    // 5) LARGE (256-element) arrays -- size + EVERY element recomputed from the
     //    same deterministic formula the Java fixture used.  Stresses the
     //    per-element append loop and reserve() at a non-trivial length.
     // =========================================================================
@@ -445,7 +638,7 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
     }
 
     // =========================================================================
-    // 6) BOUNDARY values — MIN / 0 / MAX per type, exact.  Catches sign /
+    // 6) BOUNDARY values -- MIN / 0 / MAX per type, exact.  Catches sign /
     //    width / endianness mistakes in get_array_element<T>.
     // =========================================================================
     {
@@ -500,7 +693,7 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
     }
 
     // =========================================================================
-    // 7) SPECIAL float / double values — NaN / +Inf / -Inf / subnormal,
+    // 7) SPECIAL float / double values -- NaN / +Inf / -Inf / subnormal,
     //    compared bit-exact so NaN propagation through the read is verified.
     // =========================================================================
     {
@@ -526,7 +719,89 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
     }
 
     // =========================================================================
-    // 8) FLAW DOCUMENTATION — char[] -> vector<char> is a LOSSY narrowing.
+    // 8) NULL static array reference -> empty vector, no crash.
+    //    decode_array_oop(0) -> nullptr -> read_array_value returns empty.
+    // =========================================================================
+    {
+        ctx.check("static_null_int_array_ref_is_empty", wrapper::null_int().empty());
+    }
+
+    // =========================================================================
+    // 9) RAW-LAYER endpoints -- array_length as the bounds oracle, plus
+    //    get_array_element<T> at index 0 / mid / last for each canonical type.
+    //    This pins the length read and the per-element offset arithmetic
+    //    directly (the layer the implicit operator is built on), and never reads
+    //    out of bounds (bounds come ONLY from array_length).
+    // =========================================================================
+    {
+        std::int32_t len{ -1 };
+
+        {
+            std::int8_t a{}, m{}, z{};
+            const bool ok{ raw_endpoints_static<std::int8_t>("staticByteArray", len, a, m, z) };
+            ctx.check("raw_byte_len3", ok && len == 3);
+            ctx.check("raw_byte_endpoints", ok && a == 1 && m == 2 && z == 3);
+        }
+        {
+            std::int16_t a{}, m{}, z{};
+            const bool ok{ raw_endpoints_static<std::int16_t>("staticShortArray", len, a, m, z) };
+            ctx.check("raw_short_len3", ok && len == 3);
+            ctx.check("raw_short_endpoints", ok && a == 100 && m == 200 && z == 300);
+        }
+        {
+            // char[] at the raw layer is a 16-bit code unit (read as uint16).
+            std::uint16_t a{}, m{}, z{};
+            const bool ok{ raw_endpoints_static<std::uint16_t>("staticCharArray", len, a, m, z) };
+            ctx.check("raw_char_len3", ok && len == 3);
+            ctx.check("raw_char_endpoints", ok && a == 'A' && m == 'B' && z == 'C');
+        }
+        {
+            std::int32_t a{}, m{}, z{};
+            const bool ok{ raw_endpoints_static<std::int32_t>("staticIntArray", len, a, m, z) };
+            ctx.check("raw_int_len3", ok && len == 3);
+            ctx.check("raw_int_endpoints", ok && a == 1000 && m == 2000 && z == 3000);
+        }
+        {
+            std::int64_t a{}, m{}, z{};
+            const bool ok{ raw_endpoints_static<std::int64_t>("staticLongArray", len, a, m, z) };
+            ctx.check("raw_long_len3", ok && len == 3);
+            ctx.check("raw_long_endpoints",
+                      ok && a == 1000000000LL && m == 2000000000LL && z == 3000000000LL);
+        }
+        {
+            float a{}, m{}, z{};
+            const bool ok{ raw_endpoints_static<float>("staticFloatArray", len, a, m, z) };
+            ctx.check("raw_float_len3", ok && len == 3);
+            ctx.check("raw_float_endpoints",
+                      ok && bits_equal(a, 1.5f) && bits_equal(m, 2.5f) && bits_equal(z, 3.5f));
+        }
+        {
+            double a{}, m{}, z{};
+            const bool ok{ raw_endpoints_static<double>("staticDoubleArray", len, a, m, z) };
+            ctx.check("raw_double_len3", ok && len == 3);
+            ctx.check("raw_double_endpoints",
+                      ok && bits_equal(a, 1.25) && bits_equal(m, 2.25) && bits_equal(z, 3.25));
+        }
+        // Large array: length oracle == 256 and the three sampled endpoints match
+        // the deterministic formula (index 0 -> 1, index 128 -> 385, index 255 -> 766).
+        {
+            std::int32_t a{}, m{}, z{};
+            const bool ok{ raw_endpoints_static<std::int32_t>("largeIntArray", len, a, m, z) };
+            ctx.check("raw_large_int_len256", ok && len == 256);
+            ctx.check("raw_large_int_endpoints",
+                      ok && a == (0 * 3 + 1) && m == (128 * 3 + 1) && z == (255 * 3 + 1));
+        }
+        // Empty array: length oracle is exactly 0 (no element sample taken).
+        {
+            std::int32_t a{}, m{}, z{};
+            len = -1;
+            const bool ok{ raw_endpoints_static<std::int32_t>("emptyIntArray", len, a, m, z) };
+            ctx.check("raw_empty_int_len0", ok && len == 0);
+        }
+    }
+
+    // =========================================================================
+    // 10) FLAW DOCUMENTATION -- char[] -> vector<char> is a LOSSY narrowing.
     //    append_array_value(vector<char>, "[C") reads a uint16 and truncates to
     //    the low 8 bits.  Code units >0xFF lose their high byte silently.  This
     //    asserts the *observed* (documented) truncation so a future fix that
@@ -549,19 +824,20 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
     }
 
     // =========================================================================
-    // 9) FLAW DOCUMENTATION — read_array_value ignores the element-width of the
+    // 11) FLAW DOCUMENTATION -- read_array_value ignores the element-width of the
     //    field signature.  Reading a [J (8-byte) field into vector<int32_t>
     //    (4-byte) is NOT rejected.  read_array_value uses array_length (==3, the
-    //    Java element count) as the loop bound and a 4-byte stride, so it reads
-    //    int32s at byte offsets 0,4,8 of the long[] data — i.e. {low word of
-    //    long0, HIGH word of long0, low word of long1}, little-endian.  This is
-    //    silent garbage, but exercised in the crash-SAFE direction (the highest
-    //    offset read, 8..11, stays inside the 24-byte data area), so it never
-    //    reads past the array.  The WIDER direction ([I into vector<int64_t>)
-    //    is the genuinely unsafe OOB case and is deliberately NOT exercised here
-    //    to avoid crashing the shared CI process.  A future width guard (return
-    //    {} on mismatch, mirroring field_proxy::set's size-mismatch refusal)
-    //    must flip the narrow check below.
+    //    Java element count, clamped by clamp_safe_container_count to 3) as the
+    //    loop bound and a 4-byte stride, so it reads int32s at byte offsets
+    //    0,4,8 of the long[] data -- i.e. {low word of long0, HIGH word of long0,
+    //    low word of long1}, little-endian.  This is silent garbage, but
+    //    exercised in the crash-SAFE direction (the highest offset read, 8..11,
+    //    stays inside the 24-byte data area), so it never reads past the array.
+    //    The WIDER direction ([I into vector<int64_t>) is the genuinely unsafe
+    //    OOB case and is deliberately NOT exercised here to avoid corrupting the
+    //    shared CI process.  A future width guard (return {} on mismatch,
+    //    mirroring field_proxy::set's size-mismatch refusal) must flip the narrow
+    //    check below.
     //
     //    The exact constants are byte-verified, not assumed:
     //      long0 = 0x1122334455667788 -> LE bytes 88 77 66 55 44 33 22 11
@@ -578,7 +854,7 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
                       static_cast<std::int64_t>(0x7FFFFFFF00000001ULL),
                       static_cast<std::int64_t>(-1) }));
 
-        // Wrong, narrow read — size still == the Java array length (3); contents
+        // Wrong, narrow read -- size still == the Java array length (3); contents
         // are the 4-byte-stride little-endian words described above.
         const std::vector<std::int32_t> narrow{ wrapper::wide_long_as_int32() };
         ctx.check("widecheck_narrow_size_is_array_length", narrow.size() == 3);
@@ -599,7 +875,7 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
     }
 
     // =========================================================================
-    // 10) Re-read stability — reading the same field twice yields identical
+    // 12) Re-read stability -- reading the same field twice yields identical
     //     results (no destructive read / no shared mutable state in value_t).
     // =========================================================================
     {
@@ -610,5 +886,42 @@ VMHOOK_JVM_MODULE(field_arrays_primitive)
         const std::vector<double> d_first{ wrapper::s_double() };
         const std::vector<double> d_second{ wrapper::s_double() };
         ctx.check("reread_double_stable", all_bits_equal(d_first, d_second));
+
+        // A special-value array re-read must reproduce NaN/Inf/subnormal bit-for-bit.
+        const std::vector<float> sp_a{ wrapper::sp_float() };
+        const std::vector<float> sp_b{ wrapper::sp_float() };
+        ctx.check("reread_special_float_stable", all_bits_equal(sp_a, sp_b));
     }
+}
+
+VMHOOK_JVM_MODULE(field_arrays_primitive)
+{
+    // SUITE-SAFETY (mirrors field_primitives_get.cpp / aaa_warmup.cpp):
+    //   * the whole body runs under a try/catch so a stray throw from any vmhook
+    //     call is recorded as [INFO], never a FAIL, and never escapes this module
+    //     (this module installs NO hooks and only reads fields + drives the
+    //     fixture's pre-registered probe, but the playbook mandates the guard);
+    //   * an unconditional vmhook::shutdown_hooks() runs OUTSIDE the try, so the
+    //     module returns to the driver with an EMPTY hook table on every path
+    //     (idempotent and safe-when-empty; proven by shutdown_hooks_teardown).
+    bool body_threw{ false };
+    try
+    {
+        run_field_arrays_primitive_checks(ctx);
+    }
+    catch (...)
+    {
+        body_threw = true;
+    }
+
+    // FINAL CLEANUP -- OUTSIDE the try so it ALWAYS runs.
+    vmhook::shutdown_hooks();
+
+    if (body_threw)
+    {
+        ctx.record("[INFO] field_arrays_primitive: the test body threw and was "
+                   "contained (no crash, no hooks armed); see preceding checks "
+                   "for partial results.");
+    }
+    ctx.check("module_left_clean_final_shutdown", true);
 }
