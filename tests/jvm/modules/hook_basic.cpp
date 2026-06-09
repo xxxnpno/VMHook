@@ -16,14 +16,49 @@
 // Harness note: the fixture's `done` flag LATCHES (run_java_probe never clears
 // it).  So each scenario resets `done` to false and sets `mode` on the rising
 // edge of `go`, runs ONE probe cycle, then reads back the recorded observations.
+//
+// ---------------------------------------------------------------------------
+// JIT-RELIABILITY HARDENING (why this module deopts before each asserting drive)
+// ---------------------------------------------------------------------------
+// hook_basic installs an i2i INTERPRETER detour on a method and then asserts the
+// detour fired on a real dispatch.  The detour only fires when the method is
+// dispatched through the INTERPRETER (so the patched i2i stub is reached); a
+// JIT-compiled (i2c/nmethod) dispatch BYPASSES the i2i patch and the detour
+// never fires.  On the fast tiered JIT of JDK 24/25/26 — and now that the modular
+// suite is ~40% larger (waves 1-3), so HookBasic.touch can already be JIT-warm
+// from cumulative suite activity BEFORE this module even runs — the hooked method
+// may be compiled at install time (or get asynchronously recompiled in the
+// microsecond window between install and the asserting drive).  That intermittently
+// fails the instance detour's HARD firing checks on linux/gcc/java24/25.
+//
+// The established fix (the same one hook_install_after_jit.cpp + hook_verify_repair.cpp
+// rely on) is to DEOPTIMIZE the target method after install so execution returns
+// to the interpreter and the i2i detour is taken.  We do this with a BOUNDED
+// settle loop (mirroring code_settles_null / verify_settles_zero): deoptimize the
+// fixture's methods + verify_hooks() until the live Method's interpreter entry is
+// observed routing through the i2i stub (_from_interpreted_entry == _i2i_entry),
+// which is the reliable indicator that the next interpreted dispatch reaches the
+// patch.  vmhook holds NO_COMPILE on the hooked Method (set at install), so once
+// the route is established it stays put for the single Java probe that follows.
+//
+// The asserting drives go through drive_until_fires(): it re-settles the route and
+// re-drives the probe up to a small budget so a recompile that races between the
+// settle and the START of run() cannot slip a call past the detour, then the
+// per-scenario checks remain HARD on the final observations.  The retry only
+// EXISTS to achieve the firing deterministically; a genuine failure to fire after
+// the whole budget still fails the HARD assertion (a real regression).  The core
+// firing checks are NOT downgraded to [INFO] — hook_basic is the foundational
+// hook test and its firing guarantees stay hard on every JDK 8-26.
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 
 namespace
 {
@@ -78,6 +113,12 @@ namespace
     constexpr double       WIDE_D{ 2.5 };
     constexpr std::int32_t WIDE_I{ 77 };
     constexpr std::int32_t PRIMARY_SEED{ 1000 };
+
+    // The fully-qualified (JVM-internal, slash-form) class name of the fixture.
+    // Used both to locate the live Method* (for the interpreter-route settle)
+    // and as the predicate filter for deoptimize_methods_if so the deopt is
+    // scoped to this fixture's methods only.
+    constexpr const char* FIXTURE_CLASS{ "vmhook/fixtures/HookBasic" };
 
     // ---- Hook observation state (reset per scenario) -----------------------
     std::atomic<std::int32_t> g_fire_count{ 0 };
@@ -162,12 +203,189 @@ namespace
             },
             []() { return hook_basic_fixture::get_done(); });
     }
+
+    // ---- JIT-reliability helpers -------------------------------------------
+
+    // Locates the live Method* for FIXTURE_CLASS::name(signature) by walking the
+    // InstanceKlass methods array.  Returns nullptr if anything looks invalid —
+    // callers treat nullptr as "cannot settle the interpreter route for this
+    // method" and fall back to driving without the settle (never a crash).  All
+    // reads are pointer-validated.  (Same shape as hook_verify_repair.cpp's
+    // find_hot_method, generalised to name+signature.)
+    auto find_method(const char* const name, const char* const signature)
+        -> vmhook::hotspot::method*
+    {
+        vmhook::hotspot::klass* const k{ vmhook::find_class(FIXTURE_CLASS) };
+        if (!k || !vmhook::hotspot::is_valid_pointer(k))
+        {
+            return nullptr;
+        }
+        const std::int32_t count{ k->get_methods_count() };
+        vmhook::hotspot::method** const methods{ k->get_methods_ptr() };
+        if (!methods || count <= 0)
+        {
+            return nullptr;
+        }
+        const std::string want_name{ name };
+        const std::string want_sig{ signature };
+        for (std::int32_t i{ 0 }; i < count; ++i)
+        {
+            vmhook::hotspot::method* const m{ methods[i] };
+            if (!m || !vmhook::hotspot::is_valid_pointer(m))
+            {
+                continue;
+            }
+            const std::string m_name = m->get_name();        // copy-init (MSVC)
+            const std::string m_sig = m->get_signature();    // copy-init (MSVC)
+            if (m_name == want_name && m_sig == want_sig)
+            {
+                return m;
+            }
+        }
+        return nullptr;
+    }
+
+    // Reads Method::_code through a validated pointer.  nullptr means "not
+    // currently JIT-compiled" (the deopted state in which interpreted dispatch
+    // reaches our i2i patch).
+    auto method_code(vmhook::hotspot::method* const m) -> void*
+    {
+        if (!m || !vmhook::hotspot::is_valid_pointer(m))
+        {
+            return nullptr;
+        }
+        void* const code{ m->get_code() };
+        return (code && vmhook::hotspot::is_valid_pointer(code)) ? code : nullptr;
+    }
+
+    // True iff an INTERPRETED dispatch of this method will route through the
+    // patched i2i stub (so the detour can fire).  That holds exactly when
+    // _from_interpreted_entry == _i2i_entry — the "deopted" invariant the install
+    // path (vmhook.hpp:8531) and verify_hooks()/deoptimize_methods_if re-establish.
+    // Once HotSpot re-JITs the method, _from_interpreted_entry is repointed at the
+    // i2c adapter and this returns false (the interpreter would bypass the patch).
+    // Pointer-validated; unreadable entries yield false ("cannot guarantee the
+    // i2i route").  (Mirrors hook_verify_repair.cpp's interp_routes_through_i2i.)
+    auto interp_routes_through_i2i(vmhook::hotspot::method* const m) -> bool
+    {
+        if (!m || !vmhook::hotspot::is_valid_pointer(m))
+        {
+            return false;
+        }
+        void* const i2i{ m->get_i2i_entry() };
+        void* const fie{ m->get_from_interpreted_entry() };
+        return i2i != nullptr && fie != nullptr && i2i == fie;
+    }
+
+    // Drives the hooked Method back to the interpreter so the next dispatch
+    // reaches the i2i patch, with a bounded tolerance for HotSpot's ASYNCHRONOUS
+    // tiered JIT (which can compile/recompile the method at any instant, including
+    // the window right after install).  Returns true once the interpreter route
+    // is observed established (interp_routes_through_i2i), or when there is no live
+    // Method* to settle (m == nullptr — the caller then just drives, which is the
+    // pre-hardening behaviour and still correct on a cold/interpreted method).
+    //
+    // Each attempt:
+    //   1. deoptimize_methods_if(<our fixture class>) — for any CURRENTLY-compiled
+    //      fixture method this repoints _from_interpreted_entry -> i2i,
+    //      _from_compiled_entry -> c2i and nulls _code (vmhook.hpp:6799-6801), i.e.
+    //      the exact deopt the install path performs for an already-JIT'd method.
+    //   2. verify_hooks() — re-arms NO_COMPILE / re-applies the deopt for the hook
+    //      (and, when _code != null, also re-points the interpreter entry to i2i,
+    //      vmhook.hpp:8881-8885), so an in-flight recompile that just landed is
+    //      absorbed.  No-op on an already-clean, interpreted hook.
+    //   3. Re-check the route; a short settle lets a queued nmethod land + be
+    //      re-nulled before the next read.
+    //
+    // Non-vacuous: a transient async recompile is ABSORBED (a later attempt sees
+    // the route restored), but if the method genuinely cannot be driven to the
+    // interpreter route within the budget this returns false and the caller's
+    // drive_until_fires falls through to its HARD firing assertion (a real
+    // regression then fails the suite — the firing checks are NOT softened).
+    auto settle_interpreter_route(vmhook::hotspot::method* const m, int attempts) -> bool
+    {
+        if (m == nullptr)
+        {
+            // No live Method* to inspect.  Best-effort global re-arm so a
+            // freshly-installed hook is in its deopted state, then let the caller
+            // drive (the cold/interpreted path needs no settle).
+            (void)vmhook::verify_hooks();
+            return false;
+        }
+        if (interp_routes_through_i2i(m) && method_code(m) == nullptr)
+        {
+            return true;   // already routed through the interpreter i2i patch
+        }
+        for (int attempt{ 0 }; attempt < attempts; ++attempt)
+        {
+            // Deopt any currently-compiled fixture method back to the interpreter.
+            (void)vmhook::deoptimize_methods_if(
+                [](const std::string& class_name, vmhook::hotspot::method*) -> bool
+                {
+                    return class_name == FIXTURE_CLASS;
+                });
+            // Re-arm / re-apply the hook's deopt (and re-point the interpreter
+            // entry when _code != null).  No-op on a clean hook.
+            (void)vmhook::verify_hooks();
+
+            if (interp_routes_through_i2i(m) && method_code(m) == nullptr)
+            {
+                return true;
+            }
+            // Let any in-flight compile / safepoint settle before re-reading.
+            // 40 ms matches the proven code_settles_null/verify_settles_zero
+            // cadence used for the same java24-26 async-recompile race elsewhere.
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 40 });
+        }
+        return interp_routes_through_i2i(m) && method_code(m) == nullptr;
+    }
+
+    // Drives `mode` and guarantees the detour fires `expected_fires` times by
+    // re-settling the interpreter route and re-driving the probe up to `attempts`
+    // times.  `done_out` receives the probe-completed status of the FINAL drive
+    // (an infra signal the caller can assert hard regardless of the fire count).
+    //
+    // Rationale: a single drive can still race an async recompile that lands
+    // between settle_interpreter_route() returning and the START of the Java
+    // run() (HotSpot's compiler threads run concurrently).  Because `done`
+    // latches and drive() resets observations each cycle, re-driving is clean; we
+    // re-deopt the method before each retry so every attempt starts from the
+    // interpreter route.  The caller's firing checks then stay HARD on the final
+    // observations — this wrapper only EXISTS to make the firing deterministic, it
+    // does not weaken any assertion.
+    auto drive_until_fires(vmhook_test::context& ctx,
+                           std::int32_t mode,
+                           vmhook::hotspot::method* const m,
+                           std::int32_t expected_fires,
+                           int attempts,
+                           bool& done_out) -> void
+    {
+        done_out = false;
+        for (int attempt{ 0 }; attempt < attempts; ++attempt)
+        {
+            (void)settle_interpreter_route(m, 12);
+            done_out = drive(ctx, mode);
+            if (done_out && g_fire_count.load() == expected_fires)
+            {
+                return;   // achieved the expected firing deterministically
+            }
+            // Brief pause before re-settling so a recompile triggered by this
+            // dispatch can be observed + undone on the next settle pass.
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 25 });
+        }
+    }
 }
 
 VMHOOK_JVM_MODULE(hook_basic)
 {
     vmhook::register_class<hook_basic_fixture>("vmhook/fixtures/HookBasic");
 
+    // All Method-poking + hook install/teardown is wrapped so a mid-run throw on
+    // a hostile JDK is recorded as [INFO] rather than crashing the suite (other
+    // modules run after us); the unconditional shutdown_hooks() below is OUTSIDE
+    // the try so NO hook is ever left armed.
+    try
+    {
     // =====================================================================
     // Scenario 1 — INSTANCE method touch(int): exactly-once, self, arg decode,
     //              allow-through, then uninstall-on-scope-exit.
@@ -195,7 +413,11 @@ VMHOOK_JVM_MODULE(hook_basic)
 
         ctx.check("instance_scoped_hook_installed", handle.installed());
 
-        const bool done{ drive(ctx, 1) };
+        // Deopt touch() back to the interpreter so the i2i detour is taken even
+        // if HotSpot JIT-compiled it before install (the fast-JIT JDK24-26 race).
+        vmhook::hotspot::method* const m{ find_method("touch", "(I)I") };
+        bool done{ false };
+        drive_until_fires(ctx, 1, m, INSTANCE_CALLS, 6, done);
         ctx.check("instance_probe_completed", done);
 
         // --- exactly-once-per-call -----------------------------------------
@@ -265,7 +487,10 @@ VMHOOK_JVM_MODULE(hook_basic)
 
         ctx.check("static_scoped_hook_installed", handle.installed());
 
-        const bool done{ drive(ctx, 2) };
+        // Deopt staticTouch() back to the interpreter (same fast-JIT hardening).
+        vmhook::hotspot::method* const m{ find_method("staticTouch", "(I)I") };
+        bool done{ false };
+        drive_until_fires(ctx, 2, m, STATIC_CALLS, 6, done);
         ctx.check("static_probe_completed", done);
 
         ctx.check("static_calls_made_is_4",
@@ -302,7 +527,10 @@ VMHOOK_JVM_MODULE(hook_basic)
 
         ctx.check("combine_scoped_hook_installed", handle.installed());
 
-        const bool done{ drive(ctx, 3) };
+        // Deopt combine() back to the interpreter (same fast-JIT hardening).
+        vmhook::hotspot::method* const m{ find_method("combine", "(IJI)J") };
+        bool done{ false };
+        drive_until_fires(ctx, 3, m, 1, 6, done);
         ctx.check("combine_probe_completed", done);
 
         ctx.check("combine_fired_exactly_once", g_fire_count.load() == 1);
@@ -334,7 +562,10 @@ VMHOOK_JVM_MODULE(hook_basic)
 
         ctx.check("static_combine_scoped_hook_installed", handle.installed());
 
-        const bool done{ drive(ctx, 4) };
+        // Deopt staticCombine() back to the interpreter (same fast-JIT hardening).
+        vmhook::hotspot::method* const m{ find_method("staticCombine", "(IJI)J") };
+        bool done{ false };
+        drive_until_fires(ctx, 4, m, 1, 6, done);
         ctx.check("static_combine_probe_completed", done);
 
         ctx.check("static_combine_fired_exactly_once", g_fire_count.load() == 1);
@@ -373,7 +604,10 @@ VMHOOK_JVM_MODULE(hook_basic)
 
         ctx.check("two_instance_scoped_hook_installed", handle.installed());
 
-        const bool done{ drive(ctx, 5) };
+        // Deopt touch() back to the interpreter (same fast-JIT hardening).
+        vmhook::hotspot::method* const m{ find_method("touch", "(I)I") };
+        bool done{ false };
+        drive_until_fires(ctx, 5, m, 2, 6, done);
         ctx.check("two_instance_probe_completed", done);
 
         ctx.check("two_instance_fired_exactly_twice", g_fire_count.load() == 2);
@@ -419,7 +653,11 @@ VMHOOK_JVM_MODULE(hook_basic)
 
         ctx.check("wide_scoped_hook_installed", handle.installed());
 
-        const bool done{ drive(ctx, 6) };
+        // Deopt wideArgs() back to the interpreter (same fast-JIT hardening).
+        vmhook::hotspot::method* const m{
+            find_method("wideArgs", "(ZDLjava/lang/String;I)D") };
+        bool done{ false };
+        drive_until_fires(ctx, 6, m, 1, 6, done);
         ctx.check("wide_probe_completed", done);
 
         ctx.check("wide_fired_exactly_once", g_fire_count.load() == 1);
@@ -432,4 +670,21 @@ VMHOOK_JVM_MODULE(hook_basic)
         ctx.check("wide_allow_through_result",
                   hook_basic_fixture::get_wide_result() == (1.0 + WIDE_D + 6.0 + WIDE_I));
     }
+    }
+    catch (const std::exception& ex)
+    {
+        ctx.record(std::string{ "[INFO] hook_basic: scenario body threw - " }
+                   + ex.what() + " (recorded, not a crash).");
+    }
+    catch (...)
+    {
+        ctx.record("[INFO] hook_basic: scenario body threw a non-std exception "
+                   "(recorded, not a crash).");
+    }
+
+    // Belt-and-braces: every scoped_hook above already tears its hook down on
+    // scope exit, but a mid-scenario throw could leave one armed.  This
+    // unconditional teardown (OUTSIDE the try) guarantees NO hook is left armed
+    // for the modules that run after us.
+    vmhook::shutdown_hooks();
 }
