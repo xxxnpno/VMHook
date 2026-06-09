@@ -34,8 +34,9 @@ import vmhook.Harness;
  *
  * JAVA 8 SOURCE: no var / records / switch-expressions / text-blocks / lambdas
  * in fields; only an anonymous Harness.Probe.  Compiles identically under javac
- * 8 and javac 25+ (the CI invokes javac with no -encoding flag; this file is
- * pure ASCII).
+ * 8 and javac 25+ (verified with javac --release 8 and --release 21; the CI
+ * compiles fixtures with `javac -encoding UTF-8`, and this file is pure ASCII so
+ * the encoding is irrelevant either way).
  */
 public final class HookReinstall
 {
