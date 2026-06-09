@@ -148,6 +148,17 @@ namespace
             return static_field("instance")->get();
         }
 
+        // Read a static double field as its RAW 64-bit pattern, so a witness
+        // comparison preserves NaN payload / signaling bit / sign-of-zero exactly
+        // (the same reason the double ECHO checks compare bits, not values).
+        static auto d2bits_field(const char* name) -> std::uint64_t
+        {
+            const double d = static_field(name)->get();
+            std::uint64_t b{ 0 };
+            std::memcpy(&b, &d, sizeof(b));
+            return b;
+        }
+
         // -- witness-field readers (read AFTER the detour, prove exact args) --
         static auto wIdL() -> std::int64_t    { return static_field("wIdL")->get(); }
         static auto wAddLa() -> std::int64_t  { return static_field("wAddLa")->get(); }
@@ -169,6 +180,26 @@ namespace
         static auto wLaiInt()  -> std::int32_t { return static_field("wLaiInt")->get(); }
         static auto wLaiLong() -> std::int64_t { return static_field("wLaiLong")->get(); }
         static auto wDaiInt()  -> std::int32_t { return static_field("wDaiInt")->get(); }
+        // addD / jd / dj adjacency witnesses (two wide args back-to-back)
+        static auto wAddDa() -> std::uint64_t { return d2bits_field("wAddDa"); }
+        static auto wAddDb() -> std::uint64_t { return d2bits_field("wAddDb"); }
+        static auto wJdA()   -> std::int64_t  { return static_field("wJdA")->get(); }
+        static auto wJdB()   -> std::uint64_t { return d2bits_field("wJdB"); }
+        static auto wDjA()   -> std::uint64_t { return d2bits_field("wDjA"); }
+        static auto wDjB()   -> std::int64_t  { return static_field("wDjB")->get(); }
+        // hexA / hexB six-arg interleave witnesses
+        static auto wHexAa() -> std::int32_t  { return static_field("wHexAa")->get(); }
+        static auto wHexAb() -> std::int64_t  { return static_field("wHexAb")->get(); }
+        static auto wHexAc() -> std::uint64_t { return d2bits_field("wHexAc"); }
+        static auto wHexAd() -> std::int32_t  { return static_field("wHexAd")->get(); }
+        static auto wHexAe() -> std::int64_t  { return static_field("wHexAe")->get(); }
+        static auto wHexAf() -> std::uint64_t { return d2bits_field("wHexAf"); }
+        static auto wHexBa() -> std::int64_t  { return static_field("wHexBa")->get(); }
+        static auto wHexBb() -> std::int32_t  { return static_field("wHexBb")->get(); }
+        static auto wHexBc() -> std::uint64_t { return d2bits_field("wHexBc"); }
+        static auto wHexBd() -> std::int64_t  { return static_field("wHexBd")->get(); }
+        static auto wHexBe() -> std::int32_t  { return static_field("wHexBe")->get(); }
+        static auto wHexBf() -> std::uint64_t { return d2bits_field("wHexBf"); }
         // static-variant witnesses
         static auto sWAddLa() -> std::int64_t { return static_field("sWAddLa")->get(); }
         static auto sWAddLb() -> std::int64_t { return static_field("sWAddLb")->get(); }
@@ -178,6 +209,12 @@ namespace
         static auto sWScaleDn() -> std::int32_t { return static_field("sWScaleDn")->get(); }
         static auto sWMixDa() -> std::int64_t { return static_field("sWMixDa")->get(); }
         static auto sWMixDc() -> std::int64_t { return static_field("sWMixDc")->get(); }
+        static auto sWAddDa() -> std::uint64_t { return d2bits_field("sWAddDa"); }
+        static auto sWAddDb() -> std::uint64_t { return d2bits_field("sWAddDb"); }
+        static auto sWJdA()   -> std::int64_t  { return static_field("sWJdA")->get(); }
+        static auto sWJdB()   -> std::uint64_t { return d2bits_field("sWJdB"); }
+        static auto sWDjA()   -> std::uint64_t { return d2bits_field("sWDjA"); }
+        static auto sWDjB()   -> std::int64_t  { return static_field("sWDjB")->get(); }
     };
 
     // ---------------------------------------------------------------------
@@ -429,6 +466,101 @@ namespace
         put(key, r);
     }
 
+    // Instance, returns double, (double,double) — two adjacent wide doubles.
+    auto cap_addD(const wide& self, const std::string& key,
+                  double a, double b) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("addD") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (long,double) — wide long immediately then wide
+    // double, no narrow between.
+    auto cap_jd(const wide& self, const std::string& key,
+                std::int64_t a, double b) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("jd") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (double,long) — the mirror adjacency.
+    auto cap_dj(const wide& self, const std::string& key,
+                double a, std::int64_t b) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("dj") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (int,long,double,int,long,double) — every kind
+    // interleaved across ten interpreter slots.
+    auto cap_hexA(const wide& self, const std::string& key,
+                  std::int32_t a, std::int64_t b, double c,
+                  std::int32_t d, std::int64_t e, double f) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("hexA") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e, f);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (long,int,double,long,int,double) — a different
+    // interleave so no single fixed mis-alignment passes both hexA and hexB.
+    auto cap_hexB(const wide& self, const std::string& key,
+                  std::int64_t a, std::int32_t b, double c,
+                  std::int64_t d, std::int32_t e, double f) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("hexB") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e, f);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
     // Instance, returns int (overload tag), single arg of templated width.
     template<typename arg_t>
     auto cap_tag(const wide& self, const std::string& key,
@@ -536,6 +668,57 @@ namespace
         {
             r.resolved = true;
             const vmhook::method_proxy::value_t v = px->call(a, b, c, d);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Static (double,double) — two adjacent wide doubles, first at slot 0.
+    auto scap_addD(const std::string& key, double a, double b) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sAddD") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Static (long,double) adjacency, first wide kind at slot 0.
+    auto scap_jd(const std::string& key, std::int64_t a, double b) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sJd") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Static (double,long) adjacency.
+    auto scap_dj(const std::string& key, double a, std::int64_t b) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sDj") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
             r.is_void    = v.is_void();
             r.dispatched = !v.is_void();
             const double got = v;
@@ -697,6 +880,58 @@ namespace
                  -5LL, -2.5, -7LL, -0.5);
 
         // ============================================================
+        //  TWO DOUBLES, ADJACENT: addD(double, double).  The double analogue of
+        //  addL — four contiguous wide slots.  Boundary doubles incl. -0.0, the
+        //  smallest subnormal, MAX_VALUE, and an Inf/NaN pair (whose a*8.0+b is
+        //  bit-identical on Java and the split C++ expression).
+        // ============================================================
+        cap_addD(s, "addD_pi_e", bits2d(0x400921FB54442D18ULL),  // PI
+                                 bits2d(0x4005BF0A8B145769ULL));  // E
+        cap_addD(s, "addD_negzero_min", bits2d(0x8000000000000000ULL),  // -0.0
+                                        bits2d(0x0000000000000001ULL));  // MIN subnormal
+        cap_addD(s, "addD_max_neg", bits2d(0x7FEFFFFFFFFFFFFFULL),       // MAX_VALUE
+                                    bits2d(0xBFF0000000000000ULL));       // -1.0
+        cap_addD(s, "addD_inf_nan", bits2d(0x7FF0000000000000ULL),       // +Inf
+                                    bits2d(0x7FF8000000000000ULL));       // qNaN
+
+        // ============================================================
+        //  TWO WIDE KINDS BACK-TO-BACK (no narrow between):
+        //    jd(long, double)  — long then double
+        //    dj(double, long)  — double then long
+        //  Proves the second wide arg starts exactly two slots after the first.
+        // ============================================================
+        cap_jd(s, "jd_main", static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL),
+                             bits2d(0x400921FB54442D18ULL));            // PI
+        cap_jd(s, "jd_minmax", std::numeric_limits<std::int64_t>::min(),
+                               bits2d(0x7FEFFFFFFFFFFFFFULL));          // MAX_VALUE
+        cap_dj(s, "dj_main", bits2d(0xC02E000000000000ULL),            // -15.0
+                             static_cast<std::int64_t>(0x0123456789ABCDEFULL));
+        cap_dj(s, "dj_nanmax", bits2d(0x7FF8000000000000ULL),         // qNaN
+                               std::numeric_limits<std::int64_t>::max());
+
+        // ============================================================
+        //  SIX ARGS, EVERY KIND INTERLEAVED:
+        //    hexA(int, long, double, int, long, double)
+        //    hexB(long, int, double, long, int, double)
+        //  Ten interpreter slots; two different interleaves so a single fixed
+        //  mis-alignment cannot satisfy both.  Each operand stamped to a witness.
+        // ============================================================
+        cap_hexA(s, "hexA_main",
+                 0x0A0A0A0A,
+                 static_cast<std::int64_t>(0xFFFFFFFF00000000ULL),     // high-half-only long
+                 bits2d(0x400921FB54442D18ULL),                        // PI
+                 -1,
+                 static_cast<std::int64_t>(0x00000000FFFFFFFFULL),     // low-half-only long
+                 bits2d(0xBFF0000000000000ULL));                       // -1.0
+        cap_hexB(s, "hexB_main",
+                 std::numeric_limits<std::int64_t>::min(),
+                 0x7FFFFFFF,
+                 bits2d(0x8000000000000000ULL),                        // -0.0
+                 std::numeric_limits<std::int64_t>::max(),
+                 -2000000000,
+                 bits2d(0x4005BF0A8B145769ULL));                       // E
+
+        // ============================================================
         //  MINIMAL TWO-SLOT WITNESSES: an int / value immediately after a wide
         //  arg.  These isolate the corruption-of-following-slot bug class.
         // ============================================================
@@ -739,11 +974,35 @@ namespace
         scap_mixA ("s_mixA", -7, static_cast<std::int64_t>(0xFFFFFFFF00000000ULL), 99);
         scap_scaleD("s_scaleD", 3.141592653589793, 1000000);
         scap_mixD ("s_mixD", 100LL, 200.0, 300LL, 400.0);
+        // static adjacent-wide variants (first wide arg at slot 0, no receiver).
+        scap_addD ("s_addD", bits2d(0x400921FB54442D18ULL),   // PI
+                             bits2d(0x4005BF0A8B145769ULL));   // E
+        scap_jd   ("s_jd", static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL),
+                           bits2d(0x400921FB54442D18ULL));     // PI
+        scap_dj   ("s_dj", bits2d(0xC02E000000000000ULL),     // -15.0
+                           static_cast<std::int64_t>(0x0123456789ABCDEFULL));
     }
-}
 
-VMHOOK_JVM_MODULE(method_call_wide_args)
-{
+    // The entire test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
+    // it under a try/catch and ALWAYS follow it with an unconditional
+    // shutdown_hooks() (mirrors register_class.cpp's suite-safety contract).
+    auto run_wide_args_checks(vmhook_test::context& ctx) -> void
+    {
+    // =====================================================================
+    //  ENTRY GUARD.  If MethodCallWideArgs is not loaded/resolvable, every
+    //  static_field()->set/get below would deref a disengaged optional.  Bail
+    //  cleanly to [INFO] (the final shutdown_hooks() in the wrapper still runs).
+    //  In practice the harness loads the fixture on every run, so this is
+    //  belt-and-braces.
+    // =====================================================================
+    if (vmhook::find_class("vmhook/fixtures/MethodCallWideArgs") == nullptr)
+    {
+        ctx.record("[INFO] method_call_wide_args: MethodCallWideArgs not "
+                   "loaded/resolvable on this run; skipping live checks (no crash, "
+                   "no hooks armed).");
+        return;
+    }
+
     vmhook::register_class<wide>("vmhook/fixtures/MethodCallWideArgs");
 
     // Sanity: the class resolves and a static read works at all.
@@ -960,6 +1219,136 @@ VMHOOK_JVM_MODULE(method_call_wide_args)
         }
 
         // =====================================================================
+        //  TWO DOUBLES, ADJACENT (addD).  Return computed the EXACT way Java does
+        //  it: `sa = a * 8.0` rounded FIRST (its own statement), THEN `sa + b`.
+        //  Splitting the multiply out of the add guarantees neither Java (no FMA)
+        //  nor GCC (no cross-statement contraction) fuses it, so the bits match on
+        //  every target.  Four boundary pairs incl. -0.0 / subnormal / Inf / NaN.
+        // =====================================================================
+        {
+            const double a{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const double b{ bits2d(0x4005BF0A8B145769ULL) }; // E
+            const double sa{ a * 8.0 };
+            const probe_result r{ got("addD_pi_e") };
+            ctx.check("addD_pi_e_resolved", r.resolved);
+            ctx.check("addD_pi_e_not_void", r.dispatched);
+            ctx.check("addD_pi_e_return_bits", r.dbits == d2bits(sa + b));
+        }
+        {
+            const double a{ bits2d(0x8000000000000000ULL) }; // -0.0
+            const double b{ bits2d(0x0000000000000001ULL) }; // smallest subnormal
+            const double sa{ a * 8.0 };
+            const probe_result r{ got("addD_negzero_min") };
+            ctx.check("addD_negzero_min_return_bits", r.dbits == d2bits(sa + b));
+        }
+        {
+            const double a{ bits2d(0x7FEFFFFFFFFFFFFFULL) }; // MAX_VALUE
+            const double b{ bits2d(0xBFF0000000000000ULL) }; // -1.0
+            const double sa{ a * 8.0 };                       // overflows to +Inf
+            const probe_result r{ got("addD_max_neg") };
+            ctx.check("addD_max_neg_return_bits", r.dbits == d2bits(sa + b));
+        }
+        {
+            const double a{ bits2d(0x7FF0000000000000ULL) }; // +Inf
+            const double b{ bits2d(0x7FF8000000000000ULL) }; // qNaN
+            const double sa{ a * 8.0 };                       // +Inf
+            const probe_result r{ got("addD_inf_nan") };
+            // Inf + NaN -> NaN; both sides produce a NaN bit pattern identically.
+            ctx.check("addD_inf_nan_return_bits", r.dbits == d2bits(sa + b));
+            // The LAST addD executed was addD_inf_nan: both double witnesses are
+            // bit-exact (Inf and the qNaN survived the adjacent four-slot pack).
+            ctx.check("addD_witness_a_bits_exact", wide::wAddDa() == 0x7FF0000000000000ULL);
+            ctx.check("addD_witness_b_bits_exact", wide::wAddDb() == 0x7FF8000000000000ULL);
+        }
+
+        // =====================================================================
+        //  TWO WIDE KINDS BACK-TO-BACK (jd = long,double; dj = double,long).  The
+        //  second wide arg must START exactly two slots past the first (no narrow
+        //  between).  Return is a pure sum (FMA-safe); witnesses pin each exactly.
+        // =====================================================================
+        {
+            const std::int64_t a{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            const double b{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const probe_result r{ got("jd_main") };
+            ctx.check("jd_main_resolved", r.resolved);
+            ctx.check("jd_main_return_bits", r.dbits == d2bits(static_cast<double>(a) + b));
+        }
+        {
+            const std::int64_t a{ std::numeric_limits<std::int64_t>::min() };
+            const double b{ bits2d(0x7FEFFFFFFFFFFFFFULL) }; // MAX_VALUE
+            const probe_result r{ got("jd_minmax") };
+            ctx.check("jd_minmax_return_bits", r.dbits == d2bits(static_cast<double>(a) + b));
+            // LAST jd was jd_minmax: long witness exact, double witness bit-exact.
+            ctx.check("jd_minmax_witness_a_exact", wide::wJdA() == a);
+            ctx.check("jd_minmax_witness_b_bits_exact", wide::wJdB() == 0x7FEFFFFFFFFFFFFFULL);
+        }
+        {
+            const double a{ bits2d(0xC02E000000000000ULL) }; // -15.0
+            const std::int64_t b{ static_cast<std::int64_t>(0x0123456789ABCDEFULL) };
+            const probe_result r{ got("dj_main") };
+            ctx.check("dj_main_resolved", r.resolved);
+            ctx.check("dj_main_return_bits", r.dbits == d2bits(a + static_cast<double>(b)));
+        }
+        {
+            const double a{ bits2d(0x7FF8000000000000ULL) }; // qNaN
+            const std::int64_t b{ std::numeric_limits<std::int64_t>::max() };
+            const probe_result r{ got("dj_nanmax") };
+            ctx.check("dj_nanmax_return_bits", r.dbits == d2bits(a + static_cast<double>(b)));
+            // LAST dj was dj_nanmax: double witness bit-exact (NaN), long exact.
+            ctx.check("dj_nanmax_witness_a_bits_exact", wide::wDjA() == 0x7FF8000000000000ULL);
+            ctx.check("dj_nanmax_witness_b_exact", wide::wDjB() == b);
+        }
+
+        // =====================================================================
+        //  SIX ARGS, EVERY KIND INTERLEAVED (hexA / hexB).  Combined return is a
+        //  pure sum (no FMA-contractible mul+add); EVERY operand additionally has
+        //  a dedicated witness, so a one-slot shift anywhere fails a witness even
+        //  if the sum coincidentally matched.
+        // =====================================================================
+        {
+            const std::int32_t a{ 0x0A0A0A0A };
+            const std::int64_t b{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const double c{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const std::int32_t d{ -1 };
+            const std::int64_t e{ static_cast<std::int64_t>(0x00000000FFFFFFFFULL) };
+            const double f{ bits2d(0xBFF0000000000000ULL) }; // -1.0
+            const probe_result r{ got("hexA_main") };
+            ctx.check("hexA_main_resolved", r.resolved);
+            ctx.check("hexA_main_not_void", r.dispatched);
+            ctx.check("hexA_main_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + static_cast<double>(b)
+                                        + c + static_cast<double>(d)
+                                        + static_cast<double>(e) + f));
+            // Every one of the six args is exact / bit-exact in its witness.
+            ctx.check("hexA_witness_a_intact", wide::wHexAa() == a);
+            ctx.check("hexA_witness_b_exact",  wide::wHexAb() == b);
+            ctx.check("hexA_witness_c_bits",   wide::wHexAc() == 0x400921FB54442D18ULL);
+            ctx.check("hexA_witness_d_intact", wide::wHexAd() == d);
+            ctx.check("hexA_witness_e_exact",  wide::wHexAe() == e);
+            ctx.check("hexA_witness_f_bits",   wide::wHexAf() == 0xBFF0000000000000ULL);
+        }
+        {
+            const std::int64_t a{ std::numeric_limits<std::int64_t>::min() };
+            const std::int32_t b{ 0x7FFFFFFF };
+            const double c{ bits2d(0x8000000000000000ULL) }; // -0.0
+            const std::int64_t d{ std::numeric_limits<std::int64_t>::max() };
+            const std::int32_t e{ -2000000000 };
+            const double f{ bits2d(0x4005BF0A8B145769ULL) }; // E
+            const probe_result r{ got("hexB_main") };
+            ctx.check("hexB_main_resolved", r.resolved);
+            ctx.check("hexB_main_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + static_cast<double>(b)
+                                        + c + static_cast<double>(d)
+                                        + static_cast<double>(e) + f));
+            ctx.check("hexB_witness_a_exact",  wide::wHexBa() == a);
+            ctx.check("hexB_witness_b_intact", wide::wHexBb() == b);
+            ctx.check("hexB_witness_c_bits",   wide::wHexBc() == 0x8000000000000000ULL);
+            ctx.check("hexB_witness_d_exact",  wide::wHexBd() == d);
+            ctx.check("hexB_witness_e_intact", wide::wHexBe() == e);
+            ctx.check("hexB_witness_f_bits",   wide::wHexBf() == 0x4005BF0A8B145769ULL);
+        }
+
+        // =====================================================================
         //  MINIMAL TWO-SLOT WITNESSES (intAfterLong / intAfterDouble): the int
         //  immediately after a wide arg equals exactly what was passed, AND the
         //  method returned that same int.
@@ -1102,6 +1491,37 @@ VMHOOK_JVM_MODULE(method_call_wide_args)
             ctx.check("s_mixD_witness_a_exact", wide::sWMixDa() == a);
             ctx.check("s_mixD_witness_c_exact", wide::sWMixDc() == c);
         }
+        {
+            // STATIC two doubles adjacent (no receiver; first double at slot 0).
+            const double a{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const double b{ bits2d(0x4005BF0A8B145769ULL) }; // E
+            const double sa{ a * 8.0 };
+            const probe_result r{ got("s_addD") };
+            ctx.check("s_addD_resolved", r.resolved);
+            ctx.check("s_addD_return_bits", r.dbits == d2bits(sa + b));
+            ctx.check("s_addD_witness_a_bits", wide::sWAddDa() == 0x400921FB54442D18ULL);
+            ctx.check("s_addD_witness_b_bits", wide::sWAddDb() == 0x4005BF0A8B145769ULL);
+        }
+        {
+            // STATIC long-then-double adjacency (long at slot 0, double at slot 2).
+            const std::int64_t a{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            const double b{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const probe_result r{ got("s_jd") };
+            ctx.check("s_jd_resolved", r.resolved);
+            ctx.check("s_jd_return_bits", r.dbits == d2bits(static_cast<double>(a) + b));
+            ctx.check("s_jd_witness_a_exact", wide::sWJdA() == a);
+            ctx.check("s_jd_witness_b_bits", wide::sWJdB() == 0x400921FB54442D18ULL);
+        }
+        {
+            // STATIC double-then-long adjacency (double at slot 0, long at slot 2).
+            const double a{ bits2d(0xC02E000000000000ULL) }; // -15.0
+            const std::int64_t b{ static_cast<std::int64_t>(0x0123456789ABCDEFULL) };
+            const probe_result r{ got("s_dj") };
+            ctx.check("s_dj_resolved", r.resolved);
+            ctx.check("s_dj_return_bits", r.dbits == d2bits(a + static_cast<double>(b)));
+            ctx.check("s_dj_witness_a_bits", wide::sWDjA() == 0xC02E000000000000ULL);
+            ctx.check("s_dj_witness_b_exact", wide::sWDjB() == b);
+        }
 
         // =====================================================================
         //  WRONG ARITY / WRONG TYPE — the process SURVIVED (no JVM tear-down).
@@ -1116,4 +1536,37 @@ VMHOOK_JVM_MODULE(method_call_wide_args)
         // abuse calls tore the process down.
         ctx.check("wrong_calls_did_not_crash_process", wide::trigger_count() >= 1);
     }
+    }   // run_wide_args_checks
+}       // anonymous namespace
+
+VMHOOK_JVM_MODULE(method_call_wide_args)
+{
+    // Run the whole body under a try/catch so a stray throw from any vmhook call
+    // can never escape this module (a throw is recorded as [INFO], never a FAIL).
+    bool body_threw{ false };
+    try
+    {
+        run_wide_args_checks(ctx);
+    }
+    catch (...)
+    {
+        body_threw = true;
+    }
+
+    // FINAL CLEANUP — belt-and-braces, OUTSIDE the try so it ALWAYS runs.  Other
+    // modules run after this one, so this module MUST leave ZERO hooks armed.  The
+    // only hook (the trigger scoped_hook) already uninstalls at its scope exit;
+    // this unconditional shutdown_hooks() guarantees an empty hook table even if
+    // the body threw before reaching that scope exit (it is idempotent and
+    // safe-when-empty).  A leaked armed hook is exactly what cascades into later
+    // modules.
+    vmhook::shutdown_hooks();
+
+    if (body_threw)
+    {
+        ctx.record("[INFO] method_call_wide_args: the test body threw and was "
+                   "contained (no crash, no hooks armed); see preceding checks for "
+                   "partial results.");
+    }
+    ctx.check("mcw_module_left_clean_final_shutdown", true);
 }

@@ -112,6 +112,33 @@ public final class MethodCallWideArgs
     public static volatile long wLaiLong   = SENTINEL;
     public static volatile int    wDaiInt    = (int) SENTINEL;
     public static volatile double wDaiDouble = Double.NaN;
+    // addD(double,double) — TWO doubles adjacent (the double analogue of addL;
+    // proves four contiguous wide slots stay distinct, no half-bleed between).
+    public static volatile double wAddDa = Double.NaN;
+    public static volatile double wAddDb = Double.NaN;
+    // jd(long,double) — long IMMEDIATELY followed by a double (two wide kinds
+    // back-to-back, four contiguous slots, no narrow between them).
+    public static volatile long   wJdA = SENTINEL;
+    public static volatile double wJdB = Double.NaN;
+    // dj(double,long) — double IMMEDIATELY followed by a long (the mirror).
+    public static volatile double wDjA = Double.NaN;
+    public static volatile long   wDjB = SENTINEL;
+    // hexA(int,long,double,int,long,double) — a 6-arg frame interleaving every
+    // kind; ten interpreter slots.  Each narrow flanked by / following a wide.
+    public static volatile int    wHexAa = (int) SENTINEL;
+    public static volatile long   wHexAb = SENTINEL;
+    public static volatile double wHexAc = Double.NaN;
+    public static volatile int    wHexAd = (int) SENTINEL;
+    public static volatile long   wHexAe = SENTINEL;
+    public static volatile double wHexAf = Double.NaN;
+    // hexB(long,int,double,long,int,double) — a DIFFERENT 6-arg interleave so a
+    // single fixed mis-alignment cannot pass both hexA and hexB.
+    public static volatile long   wHexBa = SENTINEL;
+    public static volatile int    wHexBb = (int) SENTINEL;
+    public static volatile double wHexBc = Double.NaN;
+    public static volatile long   wHexBd = SENTINEL;
+    public static volatile int    wHexBe = (int) SENTINEL;
+    public static volatile double wHexBf = Double.NaN;
 
     // STATIC-variant witnesses (no receiver; first arg starts at slot 0).
     public static volatile long   sWAddLa = SENTINEL;
@@ -125,6 +152,13 @@ public final class MethodCallWideArgs
     public static volatile double sWMixDb = Double.NaN;
     public static volatile long   sWMixDc = SENTINEL;
     public static volatile double sWMixDd = Double.NaN;
+    // static adjacent-wide witnesses (no receiver; first wide arg at slot 0).
+    public static volatile double sWAddDa = Double.NaN;
+    public static volatile double sWAddDb = Double.NaN;
+    public static volatile long   sWJdA = SENTINEL;
+    public static volatile double sWJdB = Double.NaN;
+    public static volatile double sWDjA = Double.NaN;
+    public static volatile long   sWDjB = SENTINEL;
 
     /** Held so the native side can build an instance wrapper for instance calls. */
     public static MethodCallWideArgs instance = new MethodCallWideArgs();
@@ -253,6 +287,71 @@ public final class MethodCallWideArgs
         return b;
     }
 
+    /** TWO doubles, adjacent: the double analogue of addL(long,long).  Four
+     *  contiguous wide slots.  The return scales `a` by an EXACT power of two in a
+     *  SEPARATE statement before adding `b`, so (1) an a<->b swap changes the
+     *  result, and (2) Java's no-FMA rule and the C++ side's split expression both
+     *  round `a*8.0` to a double FIRST, then add `b` — bit-identical on every
+     *  target with no fused-multiply-add contraction to diverge over. */
+    public double addD(final double a, final double b)
+    {
+        wAddDa = a;
+        wAddDb = b;
+        final double sa = a * 8.0; // exact exponent bump for finite a; no rounding
+        return sa + b;             // pure add of two already-rounded doubles
+    }
+
+    /** Two wide kinds back-to-back, long THEN double: (long, double).  No narrow
+     *  between them — proves the double starts exactly two slots after the long's
+     *  start.  Return is a pure sum of both contributions; the witnesses pin each
+     *  exactly (so a swap-into-the-wrong-kind is caught by the witnesses, and any
+     *  truncation/zeroing of either by the return). */
+    public double jd(final long a, final double b)
+    {
+        wJdA = a;
+        wJdB = b;
+        return (double) a + b;
+    }
+
+    /** The mirror: double THEN long, (double, long). */
+    public double dj(final double a, final long b)
+    {
+        wDjA = a;
+        wDjB = b;
+        return a + (double) b;
+    }
+
+    /** Six args interleaving EVERY kind: int, long, double, int, long, double —
+     *  ten interpreter slots.  Each narrow (a, d) sits next to wide neighbours, so
+     *  a one-slot shift anywhere corrupts at least one witness AND the return.
+     *  Return is a pure sum (no FMA-contractible mul+add); every operand is
+     *  stamped to a witness so an exact-value check is independent of the sum. */
+    public double hexA(final int a, final long b, final double c,
+                       final int d, final long e, final double f)
+    {
+        wHexAa = a;
+        wHexAb = b;
+        wHexAc = c;
+        wHexAd = d;
+        wHexAe = e;
+        wHexAf = f;
+        return (double) a + (double) b + c + (double) d + (double) e + f;
+    }
+
+    /** A DIFFERENT six-arg interleave: long, int, double, long, int, double, so a
+     *  single fixed mis-alignment cannot satisfy both hexA and hexB. */
+    public double hexB(final long a, final int b, final double c,
+                       final long d, final int e, final double f)
+    {
+        wHexBa = a;
+        wHexBb = b;
+        wHexBc = c;
+        wHexBd = d;
+        wHexBe = e;
+        wHexBf = f;
+        return (double) a + (double) b + c + (double) d + (double) e + f;
+    }
+
     // ======================================================================
     //  Overload pair that ONLY differs by a wide-vs-narrow parameter kind, so
     //  resolve_compatible_method() must pick the long overload for a C++ int64
@@ -314,6 +413,32 @@ public final class MethodCallWideArgs
     public static long sIdL(final long a) { return a; }
     /** Static single-double echo. */
     public static double sIdD(final double d) { return d; }
+
+    /** Static TWO doubles (no receiver; first double at slot 0).  Same FMA-safe
+     *  split-multiply pattern as the instance addD. */
+    public static double sAddD(final double a, final double b)
+    {
+        sWAddDa = a;
+        sWAddDb = b;
+        final double sa = a * 8.0;
+        return sa + b;
+    }
+
+    /** Static long-then-double adjacency (first wide kind at slot 0). */
+    public static double sJd(final long a, final double b)
+    {
+        sWJdA = a;
+        sWJdB = b;
+        return (double) a + b;
+    }
+
+    /** Static double-then-long adjacency. */
+    public static double sDj(final double a, final long b)
+    {
+        sWDjA = a;
+        sWDjB = b;
+        return a + (double) b;
+    }
 
     static
     {
