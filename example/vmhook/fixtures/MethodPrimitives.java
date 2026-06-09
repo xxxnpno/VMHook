@@ -44,6 +44,21 @@ public final class MethodPrimitives
      *  side can prove arguments are passed through alongside the return. */
     public static volatile int lastEchoArg;
 
+    /** Witness fields recording the argument each narrow-primitive echo method
+     *  last received.  Stored at the DECLARED width so a native side-effect check
+     *  proves the argument arrived at a real Java body unmangled (not just that
+     *  the return value happened to match).  The mix* fields capture each slot of
+     *  the heterogeneous (int,byte,char,short) frame so a per-slot read confirms
+     *  every narrow arg landed in its own descriptor-typed slot. */
+    public static volatile boolean lastBoolArg;
+    public static volatile byte    lastByteArg;
+    public static volatile short   lastShortArg;
+    public static volatile char    lastCharArg;
+    public static volatile int     mixIArg;
+    public static volatile byte    mixBArg;
+    public static volatile char    mixCArg;
+    public static volatile short   mixSArg;
+
     // ----- the method the native module hooks to obtain a live thread -----
 
     /** Hookable instance method.  The native detour on this method calls every
@@ -60,6 +75,11 @@ public final class MethodPrimitives
     public boolean retBoolFalse()        { return false; }
     public static boolean sRetBoolTrue() { return true; }
     public static boolean sRetBoolFalse(){ return false; }
+    /** (Z)Z echo + (Z)Z logical NOT — proves a boolean ARGUMENT round-trips
+     *  through the .z jvalue slot (0/1) and reaches a real body (witness). */
+    public boolean echoBool(final boolean v)        { lastBoolArg = v; return v; }
+    public static boolean sEchoBool(final boolean v){ lastBoolArg = v; return v; }
+    public boolean notBool(final boolean v)         { return !v; }
 
     // ----------------------------------------------------------------------
     //  byte (B)   — signed 8-bit, range -128..127
@@ -72,6 +92,15 @@ public final class MethodPrimitives
     public static byte sRetByteNegOne() { return (byte) -1; }
     public static byte sRetByteMax()    { return Byte.MAX_VALUE; }
     public static byte sRetByteMin()    { return Byte.MIN_VALUE; }
+    /** (B)B echo — proves a byte ARGUMENT round-trips through the .i jvalue
+     *  slot with its sign intact (-1 stays -1, not 255). */
+    public byte echoByte(final byte v)        { lastByteArg = v; return v; }
+    public static byte sEchoByte(final byte v){ lastByteArg = v; return v; }
+    /** (B)I — the callee widens the byte arg to int.  Proves the byte reached
+     *  the body SIGN-extended (arg -1 -> int -1), isolating the sign path from
+     *  the return-decode path tested by the (B)B echo above. */
+    public int byteToInt(final byte v)        { return (int) v; }
+    public static int sByteToInt(final byte v){ return (int) v; }
 
     // ----------------------------------------------------------------------
     //  short (S)  — signed 16-bit, range -32768..32767
@@ -83,6 +112,12 @@ public final class MethodPrimitives
     public static short sRetShortNegOne() { return (short) -1; }
     public static short sRetShortMax()    { return Short.MAX_VALUE; }
     public static short sRetShortMin()    { return Short.MIN_VALUE; }
+    /** (S)S echo — proves a short ARGUMENT round-trips with sign intact. */
+    public short echoShort(final short v)        { lastShortArg = v; return v; }
+    public static short sEchoShort(final short v){ lastShortArg = v; return v; }
+    /** (S)I — callee widens the short arg; proves it arrived SIGN-extended. */
+    public int shortToInt(final short v)        { return (int) v; }
+    public static int sShortToInt(final short v){ return (int) v; }
 
     // ----------------------------------------------------------------------
     //  char (C)   — UNSIGNED 16-bit, range 0..65535
@@ -92,6 +127,14 @@ public final class MethodPrimitives
     public char retCharMax()         { return (char) 0xFFFF; }   // 65535
     public static char sRetCharA()      { return 'A'; }
     public static char sRetCharMax()    { return (char) 0xFFFF; }
+    /** (C)C echo — proves a char ARGUMENT round-trips across the full unsigned
+     *  16-bit range (0xFFFF stays 0xFFFF). */
+    public char echoChar(final char v)        { lastCharArg = v; return v; }
+    public static char sEchoChar(final char v){ lastCharArg = v; return v; }
+    /** (C)I — callee widens the char arg; proves it arrived ZERO-extended
+     *  (arg 0xFFFF -> int 65535, never -1). */
+    public int charToInt(final char v)        { return (int) v; }
+    public static int sCharToInt(final char v){ return (int) v; }
 
     // ----------------------------------------------------------------------
     //  int (I)    — signed 32-bit
@@ -107,6 +150,35 @@ public final class MethodPrimitives
     /** (I)I echo — proves argument passthrough together with the return. */
     public int echoInt(final int v)  { lastEchoArg = v; return v; }
     public static int sEchoInt(final int v) { lastEchoArg = v; return v; }
+    /** (II)I addition — exercises TWO int args AND int two's-complement overflow
+     *  wrap (Integer.MAX_VALUE + 1 == Integer.MIN_VALUE). */
+    public int addInt(final int a, final int b)        { return a + b; }
+    public static int sAddInt(final int a, final int b){ return a + b; }
+    /** (III)I — three int args; proves narrow args pack in declaration order
+     *  (an a/c swap or a dropped middle arg changes the asymmetric result). */
+    public int sumThreeInts(final int a, final int b, final int c)        { return (a * 100) + (b * 10) + c; }
+    public static int sSumThreeInts(final int a, final int b, final int c){ return (a * 100) + (b * 10) + c; }
+    /** (IBCS)I — heterogeneous narrow args in ONE frame.  Each arg is captured
+     *  to its own witness field so the native side can confirm every narrow
+     *  primitive landed in its own descriptor-typed slot (int, byte, char,
+     *  short) rather than colliding.  The returned combination is asymmetric so
+     *  any slot swap is also caught by the return value alone. */
+    public int mixIBCS(final int i, final byte b, final char c, final short s)
+    {
+        mixIArg = i;
+        mixBArg = b;
+        mixCArg = c;
+        mixSArg = s;
+        return (i * 1000003) + (b * 7) + (c * 13) + s;
+    }
+    public static int sMixIBCS(final int i, final byte b, final char c, final short s)
+    {
+        mixIArg = i;
+        mixBArg = b;
+        mixCArg = c;
+        mixSArg = s;
+        return (i * 1000003) + (b * 7) + (c * 13) + s;
+    }
 
     // ----------------------------------------------------------------------
     //  long (J)   — signed 64-bit (occupies TWO interpreter local slots)

@@ -51,6 +51,16 @@ namespace
         static auto get_void_instance_hits() -> std::int32_t { return static_field("voidInstanceHits")->get(); }
         static auto get_void_static_hits() -> std::int32_t   { return static_field("voidStaticHits")->get(); }
         static auto get_last_echo_arg() -> std::int32_t      { return static_field("lastEchoArg")->get(); }
+        // Narrow-primitive ARG witness fields (read AFTER the detour to prove the
+        // argument arrived at a real Java body, not just that the return matched).
+        static auto get_last_bool_arg() -> bool          { return static_field("lastBoolArg")->get(); }
+        static auto get_last_byte_arg() -> std::int8_t   { return static_field("lastByteArg")->get(); }
+        static auto get_last_short_arg() -> std::int16_t { return static_field("lastShortArg")->get(); }
+        static auto get_last_char_arg() -> std::uint16_t { return static_field("lastCharArg")->get(); }
+        static auto get_mix_i_arg() -> std::int32_t      { return static_field("mixIArg")->get(); }
+        static auto get_mix_b_arg() -> std::int8_t       { return static_field("mixBArg")->get(); }
+        static auto get_mix_c_arg() -> std::uint16_t     { return static_field("mixCArg")->get(); }
+        static auto get_mix_s_arg() -> std::int16_t      { return static_field("mixSArg")->get(); }
 
         // -- instance primitive returners (call into the live receiver) --
         auto call_bool(const char* n) -> bool        { return get_method(n)->call(); }
@@ -62,6 +72,27 @@ namespace
         auto call_float(const char* n) -> float      { return get_method(n)->call(); }
         auto call_double(const char* n) -> double    { return get_method(n)->call(); }
         auto call_int_arg(const char* n, std::int32_t a) -> std::int32_t { return get_method(n)->call(a); }
+
+        // -- narrow-primitive ARGUMENT echoes (instance) --
+        // Each passes the EXACT-width C++ type so detail::convert_jni_arg packs it
+        // into the matching jvalue slot (.z for bool, .i for byte/short/char/int)
+        // and the overload walk selects the matching descriptor.  The two-arg
+        // get_method(name, sig) form PINS the exact descriptor (exercises the
+        // signature_pinned path) so there is zero overload ambiguity.
+        auto echo_bool(bool a) -> bool                  { return get_method("echoBool", "(Z)Z")->call(a); }
+        auto not_bool(bool a) -> bool                   { return get_method("notBool", "(Z)Z")->call(a); }
+        auto echo_byte(std::int8_t a) -> std::int8_t    { return get_method("echoByte", "(B)B")->call(a); }
+        auto byte_to_int(std::int8_t a) -> std::int32_t { return get_method("byteToInt", "(B)I")->call(a); }
+        auto echo_short(std::int16_t a) -> std::int16_t { return get_method("echoShort", "(S)S")->call(a); }
+        auto short_to_int(std::int16_t a) -> std::int32_t { return get_method("shortToInt", "(S)I")->call(a); }
+        auto echo_char(std::uint16_t a) -> std::uint16_t  { return get_method("echoChar", "(C)C")->call(a); }
+        auto char_to_int(std::uint16_t a) -> std::int32_t { return get_method("charToInt", "(C)I")->call(a); }
+        auto add_int(std::int32_t a, std::int32_t b) -> std::int32_t { return get_method("addInt", "(II)I")->call(a, b); }
+        auto sum_three_ints(std::int32_t a, std::int32_t b, std::int32_t c) -> std::int32_t { return get_method("sumThreeInts", "(III)I")->call(a, b, c); }
+        auto mix_ibcs(std::int32_t i, std::int8_t b, std::uint16_t c, std::int16_t s) -> std::int32_t
+        {
+            return get_method("mixIBCS", "(IBCS)I")->call(i, b, c, s);
+        }
 
         // value_t introspection probes (instance)
         auto is_void(const char* n) -> bool   { return get_method(n)->call().is_void(); }
@@ -78,6 +109,21 @@ namespace
         static auto scall_double(const char* n) -> double    { return static_method(n)->call(); }
         static auto scall_int_arg(const char* n, std::int32_t a) -> std::int32_t { return static_method(n)->call(a); }
         static auto svoid(const char* n) -> bool { return static_method(n)->call().is_void(); }
+
+        // -- narrow-primitive ARGUMENT echoes (static; CallStatic<T>MethodA) --
+        static auto secho_bool(bool a) -> bool                  { return static_method("sEchoBool", "(Z)Z")->call(a); }
+        static auto secho_byte(std::int8_t a) -> std::int8_t    { return static_method("sEchoByte", "(B)B")->call(a); }
+        static auto sbyte_to_int(std::int8_t a) -> std::int32_t { return static_method("sByteToInt", "(B)I")->call(a); }
+        static auto secho_short(std::int16_t a) -> std::int16_t { return static_method("sEchoShort", "(S)S")->call(a); }
+        static auto sshort_to_int(std::int16_t a) -> std::int32_t { return static_method("sShortToInt", "(S)I")->call(a); }
+        static auto secho_char(std::uint16_t a) -> std::uint16_t  { return static_method("sEchoChar", "(C)C")->call(a); }
+        static auto schar_to_int(std::uint16_t a) -> std::int32_t { return static_method("sCharToInt", "(C)I")->call(a); }
+        static auto sadd_int(std::int32_t a, std::int32_t b) -> std::int32_t { return static_method("sAddInt", "(II)I")->call(a, b); }
+        static auto ssum_three_ints(std::int32_t a, std::int32_t b, std::int32_t c) -> std::int32_t { return static_method("sSumThreeInts", "(III)I")->call(a, b, c); }
+        static auto smix_ibcs(std::int32_t i, std::int8_t b, std::uint16_t c, std::int16_t s) -> std::int32_t
+        {
+            return static_method("sMixIBCS", "(IBCS)I")->call(i, b, c, s);
+        }
     };
 
     // ---- raw-bit capture helpers so NaN / Inf / -0.0 survive the atomic ----
@@ -104,6 +150,29 @@ namespace
         double d{ 0.0 };
         std::memcpy(&d, &b, sizeof(d));
         return d;
+    }
+
+    // Java `int` arithmetic is two's-complement wraparound, bit-identical to
+    // unsigned 32-bit arithmetic.  Compute the EXPECTED sum through unsigned so
+    // the C++ side matches the Java callee on overflow boundaries (INT_MAX+1)
+    // AND avoids signed-overflow UB / the -Woverflow warning under -Werror.
+    inline auto jaddi(std::int32_t a, std::int32_t b) noexcept -> std::int32_t
+    {
+        return static_cast<std::int32_t>(
+            static_cast<std::uint32_t>(a) + static_cast<std::uint32_t>(b));
+    }
+    inline auto jmuli(std::int32_t a, std::int32_t b) noexcept -> std::int32_t
+    {
+        return static_cast<std::int32_t>(
+            static_cast<std::uint32_t>(a) * static_cast<std::uint32_t>(b));
+    }
+    // The (IBCS)I fixture computes (i*1000003) + (b*7) + (c*13) + s with Java int
+    // wraparound.  Mirror it bit-for-bit through the unsigned helpers (b/s are the
+    // already sign-extended ints, c the already zero-extended int).
+    inline auto mix_expect(std::int32_t i, std::int32_t b, std::int32_t c, std::int32_t s) noexcept
+        -> std::int32_t
+    {
+        return jaddi(jaddi(jaddi(jmuli(i, 1000003), jmuli(b, 7)), jmuli(c, 13)), s);
     }
 
     // Sentinel that no Java boundary value collides with, so "did the detour
@@ -163,6 +232,48 @@ namespace
     std::atomic<std::int64_t> g_int_42_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_int_echo_inst{ k_uncaptured };
     std::atomic<std::int64_t> g_int_echo_stat{ k_uncaptured };
+
+    // ---- narrow-primitive ARGUMENT round-trips (echo / widen / arithmetic) ----
+    // boolean arg (Z): echo true/false + logical NOT, instance + static.
+    std::atomic<int> g_arg_bool_echo_true_inst{ -1 };
+    std::atomic<int> g_arg_bool_echo_false_inst{ -1 };
+    std::atomic<int> g_arg_bool_not_true_inst{ -1 };
+    std::atomic<int> g_arg_bool_not_false_inst{ -1 };
+    std::atomic<int> g_arg_bool_echo_true_stat{ -1 };
+    std::atomic<int> g_arg_bool_echo_false_stat{ -1 };
+    // byte arg (B): echo boundaries + widen-to-int (sign-extension proof).
+    std::atomic<std::int64_t> g_arg_byte_echo_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_byte_echo_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_byte_echo_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_byte_widen_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_byte_widen_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_byte_echo_min_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_byte_widen_negone_stat{ k_uncaptured };
+    // short arg (S).
+    std::atomic<std::int64_t> g_arg_short_echo_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_short_echo_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_short_widen_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_short_echo_max_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_short_widen_negone_stat{ k_uncaptured };
+    // char arg (C): echo full unsigned range + widen-to-int (zero-extension proof).
+    std::atomic<std::int64_t> g_arg_char_echo_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_char_echo_a{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_char_echo_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_char_widen_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_char_echo_max_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_char_widen_max_stat{ k_uncaptured };
+    // int arg arithmetic (II)I: ordinary sum + two's-complement overflow wrap.
+    std::atomic<std::int64_t> g_arg_int_add{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_int_overflow_wrap{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_int_underflow_wrap{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_int_add_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_int_overflow_wrap_stat{ k_uncaptured };
+    // three int args (III)I: ordering proof.
+    std::atomic<std::int64_t> g_arg_sum3_inst{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_sum3_stat{ k_uncaptured };
+    // heterogeneous narrow args (IBCS)I: per-slot packing proof.
+    std::atomic<std::int64_t> g_arg_mix_inst{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_mix_stat{ k_uncaptured };
 
     // long
     std::atomic<std::int64_t> g_long_zero{ k_uncaptured };
@@ -280,6 +391,62 @@ namespace
         g_int_echo_inst.store(s.call_int_arg("echoInt", 1234567));
         g_int_echo_stat.store(method_primitives::scall_int_arg("sEchoInt", -7654321));
 
+        // ---- narrow-primitive ARGUMENT round-trips ----
+        // boolean arg (Z): the .z slot is spec'd 0/1; echo + NOT prove both.
+        g_arg_bool_echo_true_inst.store(s.echo_bool(true) ? 1 : 0);
+        g_arg_bool_echo_false_inst.store(s.echo_bool(false) ? 1 : 0);
+        g_arg_bool_not_true_inst.store(s.not_bool(true) ? 1 : 0);   // -> false
+        g_arg_bool_not_false_inst.store(s.not_bool(false) ? 1 : 0); // -> true
+        g_arg_bool_echo_true_stat.store(method_primitives::secho_bool(true) ? 1 : 0);
+        g_arg_bool_echo_false_stat.store(method_primitives::secho_bool(false) ? 1 : 0);
+
+        // byte arg (B): echo at boundaries + widen-to-int proves SIGN-extension.
+        g_arg_byte_echo_min.store(s.echo_byte(std::numeric_limits<std::int8_t>::min()));   // -128
+        g_arg_byte_echo_max.store(s.echo_byte(std::numeric_limits<std::int8_t>::max()));   //  127
+        g_arg_byte_echo_negone.store(s.echo_byte(static_cast<std::int8_t>(-1)));
+        g_arg_byte_widen_negone.store(s.byte_to_int(static_cast<std::int8_t>(-1)));        // -> -1
+        g_arg_byte_widen_min.store(s.byte_to_int(std::numeric_limits<std::int8_t>::min()));// -> -128
+        g_arg_byte_echo_min_stat.store(method_primitives::secho_byte(std::numeric_limits<std::int8_t>::min()));
+        g_arg_byte_widen_negone_stat.store(method_primitives::sbyte_to_int(static_cast<std::int8_t>(-1)));
+
+        // short arg (S).
+        g_arg_short_echo_min.store(s.echo_short(std::numeric_limits<std::int16_t>::min())); // -32768
+        g_arg_short_echo_max.store(s.echo_short(std::numeric_limits<std::int16_t>::max())); //  32767
+        g_arg_short_widen_negone.store(s.short_to_int(static_cast<std::int16_t>(-1)));      // -> -1
+        g_arg_short_echo_max_stat.store(method_primitives::secho_short(std::numeric_limits<std::int16_t>::max()));
+        g_arg_short_widen_negone_stat.store(method_primitives::sshort_to_int(static_cast<std::int16_t>(-1)));
+
+        // char arg (C): echo full unsigned range + widen-to-int proves ZERO-ext.
+        g_arg_char_echo_zero.store(s.echo_char(static_cast<std::uint16_t>(0)));
+        g_arg_char_echo_a.store(s.echo_char(static_cast<std::uint16_t>('A')));               // 65
+        g_arg_char_echo_max.store(s.echo_char(static_cast<std::uint16_t>(0xFFFF)));           // 65535
+        g_arg_char_widen_max.store(s.char_to_int(static_cast<std::uint16_t>(0xFFFF)));        // -> 65535
+        g_arg_char_echo_max_stat.store(method_primitives::secho_char(static_cast<std::uint16_t>(0xFFFF)));
+        g_arg_char_widen_max_stat.store(method_primitives::schar_to_int(static_cast<std::uint16_t>(0xFFFF)));
+
+        // int args (II)I: ordinary add, then two's-complement overflow + underflow.
+        g_arg_int_add.store(s.add_int(2000000000, 100000000));                                // ordinary (fits)
+        g_arg_int_overflow_wrap.store(s.add_int(std::numeric_limits<std::int32_t>::max(), 1)); // -> INT_MIN
+        g_arg_int_underflow_wrap.store(s.add_int(std::numeric_limits<std::int32_t>::min(), -1));// -> INT_MAX
+        g_arg_int_add_stat.store(method_primitives::sadd_int(1000000000, 1000000000));
+        g_arg_int_overflow_wrap_stat.store(method_primitives::sadd_int(std::numeric_limits<std::int32_t>::max(), 1));
+
+        // three int args (III)I: declaration-order proof (asymmetric weights).
+        g_arg_sum3_inst.store(s.sum_three_ints(1, 2, 3));                 // -> 123
+        g_arg_sum3_stat.store(method_primitives::ssum_three_ints(7, 0, 9)); // -> 709
+
+        // heterogeneous narrow args (IBCS)I: per-slot packing.  byte/short sign-
+        // extend in Java arithmetic; char zero-extends.  Use boundary operands so
+        // a wrong-width or swapped slot changes the result.
+        g_arg_mix_inst.store(s.mix_ibcs(1000000,
+                                        static_cast<std::int8_t>(-1),        // byte -> -1 (signed)
+                                        static_cast<std::uint16_t>(0xFFFF),  // char -> 65535 (unsigned)
+                                        static_cast<std::int16_t>(-2)));     // short -> -2 (signed)
+        g_arg_mix_stat.store(method_primitives::smix_ibcs(-5,
+                                        std::numeric_limits<std::int8_t>::max(),   // 127
+                                        static_cast<std::uint16_t>('Z'),           // 90
+                                        std::numeric_limits<std::int16_t>::min())); // -32768
+
         // ---- long ----
         g_long_zero.store(s.call_long("retLongZero"));
         g_long_negone.store(s.call_long("retLongNegOne"));
@@ -347,17 +514,38 @@ namespace
     }
 }
 
-VMHOOK_JVM_MODULE(method_call_primitives)
+namespace
 {
-    vmhook::register_class<method_primitives>("vmhook/fixtures/MethodPrimitives");
-
-    // Record which dispatch path the live JDK will use, for diagnostics.
-    const bool call_stub_present{ vmhook::detail::find_call_stub_entry() != nullptr };
-    ctx.record(std::string{ "[INFO] method_call_primitives dispatch path: " }
-               + (call_stub_present ? "call_stub fast path (StubRoutines::_call_stub_entry present)"
-                                    : "JNI fallback (call stub absent)"));
-
+    // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
+    // it under a try/catch and ALWAYS follow it with shutdown_hooks() (suite-safe
+    // playbook — mirrors register_class.cpp).  A throw is recorded as [INFO],
+    // never a FAIL; the only hook is the scoped_hook below, which RAII-uninstalls
+    // at inner-block scope exit AND is backstopped by the wrapper's unconditional
+    // final shutdown_hooks().
+    auto run_method_call_primitives_checks(vmhook_test::context& ctx) -> void
     {
+        // ENTRY GUARD: if the fixture is not loaded/resolvable, every
+        // static_field()->set/get and the hook install below would deref a
+        // disengaged optional.  Bail cleanly to [INFO] (the wrapper's final
+        // shutdown_hooks() still runs).  In practice the harness loads
+        // MethodPrimitives on every run, so this is belt-and-braces.
+        if (vmhook::find_class("vmhook/fixtures/MethodPrimitives") == nullptr)
+        {
+            ctx.record("[INFO] method_call_primitives: MethodPrimitives not "
+                       "loaded/resolvable on this run; skipping live checks "
+                       "(no crash, no hooks armed).");
+            return;
+        }
+
+        vmhook::register_class<method_primitives>("vmhook/fixtures/MethodPrimitives");
+
+        // Record which dispatch path the live JDK will use, for diagnostics.
+        const bool call_stub_present{ vmhook::detail::find_call_stub_entry() != nullptr };
+        ctx.record(std::string{ "[INFO] method_call_primitives dispatch path: " }
+                   + (call_stub_present ? "call_stub fast path (StubRoutines::_call_stub_entry present)"
+                                        : "JNI fallback (call stub absent)"));
+
+        {
         auto handle{ vmhook::scoped_hook<method_primitives>(
             "trigger",
             [](vmhook::return_value&,
@@ -439,6 +627,84 @@ VMHOOK_JVM_MODULE(method_call_primitives)
         // The (I)I echo also writes lastEchoArg in Java; the last echo executed
         // in run_all_calls was the static one with -7654321.
         ctx.check("mcp_echo_side_effect_arg", method_primitives::get_last_echo_arg() == -7654321);
+
+        // =====================================================================
+        //  NARROW-PRIMITIVE ARGUMENTS (Z B S C I) — boundary echo, widen (sign /
+        //  zero extension), int overflow wrap, multi-arg ordering, mixed packing.
+        //  (long / double ARGUMENTS — the two-slot wide args — are owned by the
+        //  method_call_wide_args module; this module owns the NARROW arg slots.)
+        // =====================================================================
+        // boolean arg (Z): echo true/false + logical NOT, instance + static.
+        ctx.check("mcp_arg_bool_echo_true_instance",  g_arg_bool_echo_true_inst.load()  == 1);
+        ctx.check("mcp_arg_bool_echo_false_instance", g_arg_bool_echo_false_inst.load() == 0);
+        ctx.check("mcp_arg_bool_not_true_is_false",   g_arg_bool_not_true_inst.load()   == 0);
+        ctx.check("mcp_arg_bool_not_false_is_true",   g_arg_bool_not_false_inst.load()  == 1);
+        ctx.check("mcp_arg_bool_echo_true_static",    g_arg_bool_echo_true_stat.load()  == 1);
+        ctx.check("mcp_arg_bool_echo_false_static",   g_arg_bool_echo_false_stat.load() == 0);
+        // The LAST boolean echo executed was the static sEchoBool(false): witness.
+        ctx.check("mcp_arg_bool_side_effect_false", method_primitives::get_last_bool_arg() == false);
+
+        // byte arg (B): echo boundaries (sign preserved) + widen-to-int.
+        ctx.check("mcp_arg_byte_echo_min_neg128", g_arg_byte_echo_min.load() == -128);
+        ctx.check("mcp_arg_byte_echo_max_127",    g_arg_byte_echo_max.load() == 127);
+        ctx.check("mcp_arg_byte_echo_negone",     g_arg_byte_echo_negone.load() == -1);
+        ctx.check("mcp_arg_byte_widen_negone_sign_extends", g_arg_byte_widen_negone.load() == -1);
+        ctx.check("mcp_arg_byte_widen_min_sign_extends",    g_arg_byte_widen_min.load() == -128);
+        ctx.check("mcp_arg_byte_echo_min_static", g_arg_byte_echo_min_stat.load() == -128);
+        ctx.check("mcp_arg_byte_widen_negone_static", g_arg_byte_widen_negone_stat.load() == -1);
+        // LAST byte echo executed was static sEchoByte(-128): witness at byte width.
+        ctx.check("mcp_arg_byte_side_effect_min", method_primitives::get_last_byte_arg() == -128);
+
+        // short arg (S).
+        ctx.check("mcp_arg_short_echo_min_neg32768", g_arg_short_echo_min.load() == -32768);
+        ctx.check("mcp_arg_short_echo_max_32767",    g_arg_short_echo_max.load() == 32767);
+        ctx.check("mcp_arg_short_widen_negone_sign_extends", g_arg_short_widen_negone.load() == -1);
+        ctx.check("mcp_arg_short_echo_max_static",   g_arg_short_echo_max_stat.load() == 32767);
+        ctx.check("mcp_arg_short_widen_negone_static", g_arg_short_widen_negone_stat.load() == -1);
+        // LAST short echo executed was static sEchoShort(32767): witness.
+        ctx.check("mcp_arg_short_side_effect_max", method_primitives::get_last_short_arg() == 32767);
+
+        // char arg (C): echo full unsigned range + widen-to-int (zero-extension).
+        ctx.check("mcp_arg_char_echo_zero",  g_arg_char_echo_zero.load() == 0);
+        ctx.check("mcp_arg_char_echo_A_65",  g_arg_char_echo_a.load() == 65);
+        ctx.check("mcp_arg_char_echo_max_65535", g_arg_char_echo_max.load() == 65535);
+        ctx.check("mcp_arg_char_widen_max_zero_extends_65535", g_arg_char_widen_max.load() == 65535);
+        ctx.check("mcp_arg_char_echo_max_static_65535", g_arg_char_echo_max_stat.load() == 65535);
+        ctx.check("mcp_arg_char_widen_max_static_zero_extends", g_arg_char_widen_max_stat.load() == 65535);
+        // LAST char echo executed was static sEchoChar(0xFFFF): witness (unsigned).
+        ctx.check("mcp_arg_char_side_effect_max", method_primitives::get_last_char_arg() == 65535);
+
+        // int args (II)I: ordinary add + two's-complement overflow / underflow wrap.
+        ctx.check("mcp_arg_int_add_ordinary", g_arg_int_add.load() == jaddi(2000000000, 100000000));
+        ctx.check("mcp_arg_int_overflow_wraps_to_min",
+                  g_arg_int_overflow_wrap.load() == std::numeric_limits<std::int32_t>::min());
+        ctx.check("mcp_arg_int_underflow_wraps_to_max",
+                  g_arg_int_underflow_wrap.load() == std::numeric_limits<std::int32_t>::max());
+        ctx.check("mcp_arg_int_add_static", g_arg_int_add_stat.load() == jaddi(1000000000, 1000000000));
+        ctx.check("mcp_arg_int_overflow_wraps_static",
+                  g_arg_int_overflow_wrap_stat.load() == std::numeric_limits<std::int32_t>::min());
+
+        // three int args (III)I: declaration-order proof.
+        ctx.check("mcp_arg_sum_three_ints_instance", g_arg_sum3_inst.load() == 123);
+        ctx.check("mcp_arg_sum_three_ints_static",   g_arg_sum3_stat.load() == 709);
+
+        // heterogeneous narrow args (IBCS)I: per-slot packing.  Mirror Java's
+        // promotion: byte/short sign-extend, char zero-extends, all to int.
+        {
+            const std::int32_t expect{ mix_expect(1000000, -1, 0xFFFF, -2) };
+            ctx.check("mcp_arg_mix_ibcs_instance", g_arg_mix_inst.load() == expect);
+        }
+        {
+            const std::int32_t expect{ mix_expect(-5, 127, static_cast<std::int32_t>('Z'), -32768) };
+            ctx.check("mcp_arg_mix_ibcs_static", g_arg_mix_stat.load() == expect);
+            // The LAST mix call executed was the static one: every witness slot
+            // holds that call's exact arg, proving each narrow primitive landed in
+            // its own descriptor-typed slot (no cross-slot corruption).
+            ctx.check("mcp_arg_mix_witness_int_slot",   method_primitives::get_mix_i_arg() == -5);
+            ctx.check("mcp_arg_mix_witness_byte_slot",  method_primitives::get_mix_b_arg() == 127);
+            ctx.check("mcp_arg_mix_witness_char_slot",  method_primitives::get_mix_c_arg() == 90);
+            ctx.check("mcp_arg_mix_witness_short_slot", method_primitives::get_mix_s_arg() == -32768);
+        }
 
         // =====================================================================
         //  long (J) — full signed 64-bit range (two local slots per long)
@@ -528,5 +794,38 @@ VMHOOK_JVM_MODULE(method_call_primitives)
         // A numeric (int) return must NOT be reported as void or string.
         ctx.check("mcp_int_return_is_not_void", g_int_is_void.load() == 0);
         ctx.check("mcp_int_return_is_not_string", g_int_is_string.load() == 0);
+        }
     }
+}
+
+VMHOOK_JVM_MODULE(method_call_primitives)
+{
+    // Run the whole body under a try/catch so a stray throw from any vmhook call
+    // can never escape this module (a throw is recorded as [INFO], never a FAIL —
+    // mirrors register_class.cpp's suite-safety contract).
+    bool body_threw{ false };
+    try
+    {
+        run_method_call_primitives_checks(ctx);
+    }
+    catch (...)
+    {
+        body_threw = true;
+    }
+
+    // FINAL CLEANUP — OUTSIDE the try so it ALWAYS runs.  Later modules run after
+    // this one, so the module MUST leave ZERO hooks armed.  The only hook (the
+    // inner scoped_hook) already uninstalls at its scope exit; this unconditional
+    // shutdown_hooks() guarantees an empty hook table even if the body threw
+    // before reaching that scope exit (idempotent + safe-when-empty).  A leaked
+    // armed hook is exactly what cascaded into later modules in earlier waves.
+    vmhook::shutdown_hooks();
+
+    if (body_threw)
+    {
+        ctx.record("[INFO] method_call_primitives: the test body threw and was "
+                   "contained (no crash, no hooks armed); see preceding checks for "
+                   "partial results.");
+    }
+    ctx.check("mcp_module_left_clean_final_shutdown", true);
 }

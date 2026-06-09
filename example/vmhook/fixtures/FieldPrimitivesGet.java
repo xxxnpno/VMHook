@@ -97,8 +97,14 @@ public final class FieldPrimitivesGet
     //  char  ("C")  -- variant alternative: uint16_t (index 7), UTF-16 unit.
     //  All values written as integer/\\uXXXX escapes (encoding-independent).
     // =====================================================================
+    public static char sCharNull    = 0x0000; // '\0' (NUL, char MIN)
     public static char sCharSpace   = 0x0020; // ' '
     public static char sCharA       = 0x0041; // 'A'
+    public static char sCharZeroDig = 0x0030; // '0' (mid ASCII)
+    public static char sChar0x7F    = 0x007F; // DEL, last single-byte ASCII
+    public static char sChar0x80    = 0x0080; // first value with high bit set
+    public static char sChar0xFF    = 0x00FF; // last value that fits in 8 bits
+    public static char sChar0x0100  = 0x0100; // first value needing the high byte
     public static char sCharMax     = 0xFFFF; // Character.MAX_VALUE
     public static char sCharHighBit = 0x00E9; // 'e-acute' (>0x7F: char-narrowing witness)
     public static char sCharBmp     = 0x4E2D; // CJK char (>0xFF: high-byte-drop witness)
@@ -125,6 +131,12 @@ public final class FieldPrimitivesGet
     public static float sFloatNaNPay  = Float.intBitsToFloat(0x7FA55555); // qNaN with payload
     public static float sFloatPi      = 3.14159265358979F;                // ordinary value
     public static float sFloatDenorm  = Float.intBitsToFloat(0x00000001); // 1.4e-45 (== MIN_VALUE)
+    // Exact-representable fractions: asserted BIT-EXACT (no epsilon needed).
+    public static float sFloatHalf    = 0.5F;                             // 0x3F000000
+    public static float sFloatQuarter = 0.25F;                            // 0x3E800000
+    public static float sFloatNegHalf = -0.5F;                            // 0xBF000000
+    public static float sFloatThreeQ  = 0.75F;                            // 0x3F400000
+    public static float sFloatTwo     = 2.0F;                             // 0x40000000
 
     // =====================================================================
     //  double  ("D")  -- variant alternative: double (index 6)
@@ -143,6 +155,12 @@ public final class FieldPrimitivesGet
     public static double sDoubleNaNPay  = Double.longBitsToDouble(0x7FFAAAAAAAAAAAAAL);  // qNaN with payload
     public static double sDoublePi      = 3.141592653589793;                             // ordinary value
     public static double sDoubleDenorm  = Double.longBitsToDouble(0x0000000000000001L);  // == MIN_VALUE
+    // Exact-representable fractions: asserted BIT-EXACT (no epsilon needed).
+    public static double sDoubleHalf    = 0.5;                                            // 0x3FE0000000000000
+    public static double sDoubleQuarter = 0.25;                                           // 0x3FD0000000000000
+    public static double sDoubleNegHalf = -0.5;                                           // 0xBFE0000000000000
+    public static double sDoubleThreeQ  = 0.75;                                           // 0x3FE8000000000000
+    public static double sDoubleTwo     = 2.0;                                            // 0x4000000000000000
 
     // =====================================================================
     //  INSTANCE fields -- representative subset of each primitive so the
@@ -157,6 +175,29 @@ public final class FieldPrimitivesGet
     public char    iChar   = 0x20AC;                            // euro sign
     public float   iFloat  = Float.intBitsToFloat(0xC0490FDB);  // -pi bit pattern
     public double  iDouble = Double.longBitsToDouble(0x400921FB54442D18L); // pi
+
+    // Instance BOUNDARY fields: the instance-dispatch path of get() exercised at
+    // the extremes of every primitive (not just one representative value), so a
+    // static/instance offset-basis mix-up at a boundary is caught too.
+    public boolean iBoolFalse  = false;
+    public byte    iByteMin    = Byte.MIN_VALUE;                //  -128
+    public byte    iByteMax    = Byte.MAX_VALUE;                //   127
+    public byte    iByteZero   = 0;
+    public short   iShortMin   = Short.MIN_VALUE;              // -32768
+    public short   iShortMax   = Short.MAX_VALUE;              //  32767
+    public int     iIntMin     = Integer.MIN_VALUE;
+    public int     iIntMax     = Integer.MAX_VALUE;
+    public int     iIntNegOne  = -1;
+    public long    iLongMin    = Long.MIN_VALUE;
+    public long    iLongMax    = Long.MAX_VALUE;
+    public char    iCharNull   = 0x0000;                       // '\0'
+    public char    iCharMax    = 0xFFFF;
+    public float   iFloatPosInf = Float.POSITIVE_INFINITY;     // 0x7F800000
+    public float   iFloatNaN    = Float.NaN;                   // 0x7FC00000
+    public float   iFloatNegZero = Float.intBitsToFloat(0x80000000); // -0.0
+    public double  iDoubleMax   = Double.MAX_VALUE;            // 0x7FEFFFFFFFFFFFFF
+    public double  iDoubleNegInf = Double.NEGATIVE_INFINITY;   // 0xFFF0000000000000
+    public double  iDoubleNegZero = Double.longBitsToDouble(0x8000000000000000L); // -0.0
 
     // =====================================================================
     //  RUNTIME fields -- written fresh by the probe on a real bytecode

@@ -63,6 +63,9 @@ namespace
         static auto get_runtime_seed_done() -> bool { return get_done(); }
     };
 
+    // The fixture this module reads.  Used by the entry guard and registration.
+    constexpr char FIXTURE[]{ "vmhook/fixtures/FieldPrimitivesGet" };
+
     // Variant-alternative indices (must match field_proxy::value_t::data order).
     constexpr std::size_t kIdxBool   = 0;
     constexpr std::size_t kIdxI8     = 1;
@@ -90,9 +93,29 @@ namespace
     }
 }
 
-VMHOOK_JVM_MODULE(field_primitives_get)
+// The entire test body, factored out so the VMHOOK_JVM_MODULE wrapper can run it
+// under a try/catch and ALWAYS follow it with shutdown_hooks() (suite-safety: a
+// throw must never escape, and zero hooks must be armed on exit — see the wrapper
+// at the bottom).  Anonymous-namespace members (fpg, kIdx*, float_bits) are
+// visible here at file scope in this TU.
+static void run_field_primitives_get_checks(vmhook_test::context& ctx)
 {
-    vmhook::register_class<fpg>("vmhook/fixtures/FieldPrimitivesGet");
+    vmhook::register_class<fpg>(FIXTURE);
+
+    // =====================================================================
+    //  ENTRY GUARD.  If FieldPrimitivesGet is not loaded/resolvable on this
+    //  run, every static_field()->get() below would deref a disengaged
+    //  optional.  Bail cleanly to [INFO] instead (the wrapper's final
+    //  shutdown_hooks() still runs).  In practice the harness loads the
+    //  fixture on every run, so this is belt-and-braces.
+    // =====================================================================
+    if (vmhook::find_class(FIXTURE) == nullptr)
+    {
+        ctx.record("[INFO] field_primitives_get: FieldPrimitivesGet not "
+                   "loaded/resolvable on this run; skipping the module's live "
+                   "checks (no crash, no hooks armed).");
+        return;
+    }
 
     // ---------------------------------------------------------------------
     // Sanity: the class resolves and a static read works at all.
@@ -252,8 +275,14 @@ VMHOOK_JVM_MODULE(field_primitives_get)
                   widened == static_cast<int>(expected));
         ctx.check(std::string{ "C_signature_" } + field, v.signature == "C");
     };
+    chk_char("sCharNull",   0x0000); // '\0' — char MIN, NUL terminator
     chk_char("sCharSpace",  0x0020);
     chk_char("sCharA",      0x0041);
+    chk_char("sCharZeroDig", 0x0030); // '0'
+    chk_char("sChar0x7F",   0x007F); // last single-byte ASCII (DEL)
+    chk_char("sChar0x80",   0x0080); // first high-bit value
+    chk_char("sChar0xFF",   0x00FF); // last 8-bit value
+    chk_char("sChar0x0100", 0x0100); // first value needing the high byte
     chk_char("sCharMax",    0xFFFF);
     chk_char("sCharHighBit", 0x00E9); // 'é'
     chk_char("sCharBmp",    0x4E2D);  // '中'
@@ -314,6 +343,12 @@ VMHOOK_JVM_MODULE(field_primitives_get)
     chk_float("sFloatSNaN",    0x7F800001); // signaling NaN bit pattern
     chk_float("sFloatNaNPay",  0x7FA55555); // qNaN with payload
     chk_float("sFloatDenorm",  0x00000001);
+    // Exact-representable fractions (bit patterns are exact, no epsilon needed).
+    chk_float("sFloatHalf",    0x3F000000); // 0.5
+    chk_float("sFloatQuarter", 0x3E800000); // 0.25
+    chk_float("sFloatNegHalf", 0xBF000000); // -0.5
+    chk_float("sFloatThreeQ",  0x3F400000); // 0.75
+    chk_float("sFloatTwo",     0x40000000); // 2.0
     // Ordinary value: assert the actual float compares equal (not just bits).
     {
         auto fp{ fpg::static_field("sFloatPi") };
@@ -334,6 +369,27 @@ VMHOOK_JVM_MODULE(field_primitives_get)
         if (fpinf) { const float g{ fpinf->get() }; ctx.check("F_posinf_is_inf_pos", std::isinf(g) && g > 0.0F); }
         if (fninf) { const float g{ fninf->get() }; ctx.check("F_neginf_is_inf_neg", std::isinf(g) && g < 0.0F); }
         if (fnz)   { const float g{ fnz->get() };   ctx.check("F_negzero_signbit",   std::signbit(g) && g == 0.0F); }
+    }
+    // Exact-value equality on exactly-representable fractions (== is safe here:
+    // 0.5/0.25/0.75/2.0 have no rounding).  Proves the CONVERTED float value, not
+    // only its bit pattern, is faithful.
+    {
+        auto fh{ fpg::static_field("sFloatHalf") };
+        auto fq{ fpg::static_field("sFloatQuarter") };
+        auto ftq{ fpg::static_field("sFloatThreeQ") };
+        auto fnh{ fpg::static_field("sFloatNegHalf") };
+        if (fh)  { const float g{ fh->get() };  ctx.check("F_half_value_exact",    g == 0.5F); }
+        if (fq)  { const float g{ fq->get() };  ctx.check("F_quarter_value_exact", g == 0.25F); }
+        if (ftq) { const float g{ ftq->get() }; ctx.check("F_threeQ_value_exact",  g == 0.75F); }
+        if (fnh) { const float g{ fnh->get() }; ctx.check("F_neghalf_value_exact", g == -0.5F && std::signbit(g)); }
+        // 0.5 + 0.25 == 0.75 reconstructed purely from get()-read operands.
+        if (fh && fq && ftq)
+        {
+            const float a{ fh->get() };
+            const float b{ fq->get() };
+            const float c{ ftq->get() };
+            ctx.check("F_half_plus_quarter_is_threeQ", (a + b) == c);
+        }
     }
 
     // double ("D") -> double, index 6.  value + BIT-EXACT pattern.
@@ -361,6 +417,12 @@ VMHOOK_JVM_MODULE(field_primitives_get)
     chk_double("sDoubleSNaN",    0x7FF0000000000001ULL); // signaling NaN
     chk_double("sDoubleNaNPay",  0x7FFAAAAAAAAAAAAAULL); // qNaN with payload
     chk_double("sDoubleDenorm",  0x0000000000000001ULL);
+    // Exact-representable fractions (bit patterns are exact, no epsilon needed).
+    chk_double("sDoubleHalf",    0x3FE0000000000000ULL); // 0.5
+    chk_double("sDoubleQuarter", 0x3FD0000000000000ULL); // 0.25
+    chk_double("sDoubleNegHalf", 0xBFE0000000000000ULL); // -0.5
+    chk_double("sDoubleThreeQ",  0x3FE8000000000000ULL); // 0.75
+    chk_double("sDoubleTwo",     0x4000000000000000ULL); // 2.0
     {
         auto fp{ fpg::static_field("sDoublePi") };
         if (fp)
@@ -378,6 +440,24 @@ VMHOOK_JVM_MODULE(field_primitives_get)
         if (dpinf) { const double g{ dpinf->get() }; ctx.check("D_posinf_is_inf_pos", std::isinf(g) && g > 0.0); }
         if (dninf) { const double g{ dninf->get() }; ctx.check("D_neginf_is_inf_neg", std::isinf(g) && g < 0.0); }
         if (dnz)   { const double g{ dnz->get() };   ctx.check("D_negzero_signbit",   std::signbit(g) && g == 0.0); }
+    }
+    // Exact-value equality on exactly-representable double fractions.
+    {
+        auto dh{ fpg::static_field("sDoubleHalf") };
+        auto dq{ fpg::static_field("sDoubleQuarter") };
+        auto dtq{ fpg::static_field("sDoubleThreeQ") };
+        auto dnh{ fpg::static_field("sDoubleNegHalf") };
+        if (dh)  { const double g{ dh->get() };  ctx.check("D_half_value_exact",    g == 0.5); }
+        if (dq)  { const double g{ dq->get() };  ctx.check("D_quarter_value_exact", g == 0.25); }
+        if (dtq) { const double g{ dtq->get() }; ctx.check("D_threeQ_value_exact",  g == 0.75); }
+        if (dnh) { const double g{ dnh->get() }; ctx.check("D_neghalf_value_exact", g == -0.5 && std::signbit(g)); }
+        if (dh && dq && dtq)
+        {
+            const double a{ dh->get() };
+            const double b{ dq->get() };
+            const double c{ dtq->get() };
+            ctx.check("D_half_plus_quarter_is_threeQ", (a + b) == c);
+        }
     }
 
     // =====================================================================
@@ -487,6 +567,112 @@ VMHOOK_JVM_MODULE(field_primitives_get)
                     ctx.check("inst_D_bits_exact", double_bits(d) == 0x400921FB54442D18ULL);
                 }
             }
+
+            // ── Instance BOUNDARY reads ──────────────────────────────────
+            // The same get() decoding at the EXTREMES of each primitive on the
+            // instance-dispatch path (offset basis = decoded oop + offset), each
+            // asserting value AND variant alternative.  Small per-type lambdas
+            // keep these uniform; the instance handle `inst` is captured.
+            auto inst_bool = [&](const char* field, bool expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "inst_Z_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "inst_Z_variant_" } + field, v.data.index() == kIdxBool);
+                const bool b{ v };
+                ctx.check(std::string{ "inst_Z_value_" } + field, b == expected);
+            };
+            auto inst_byte = [&](const char* field, std::int8_t expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "inst_B_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "inst_B_variant_" } + field, v.data.index() == kIdxI8);
+                const std::int8_t b{ v };
+                ctx.check(std::string{ "inst_B_value_" } + field, b == expected);
+            };
+            auto inst_short = [&](const char* field, std::int16_t expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "inst_S_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "inst_S_variant_" } + field, v.data.index() == kIdxI16);
+                const std::int16_t s{ v };
+                ctx.check(std::string{ "inst_S_value_" } + field, s == expected);
+            };
+            auto inst_int = [&](const char* field, std::int32_t expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "inst_I_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "inst_I_variant_" } + field, v.data.index() == kIdxI32);
+                const std::int32_t i{ v };
+                ctx.check(std::string{ "inst_I_value_" } + field, i == expected);
+            };
+            auto inst_long = [&](const char* field, std::int64_t expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "inst_J_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "inst_J_variant_" } + field, v.data.index() == kIdxI64);
+                const std::int64_t l{ v };
+                ctx.check(std::string{ "inst_J_value_" } + field, l == expected);
+            };
+            auto inst_char = [&](const char* field, std::uint16_t expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "inst_C_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "inst_C_variant_" } + field, v.data.index() == kIdxU16);
+                const std::uint16_t c{ v };
+                ctx.check(std::string{ "inst_C_value_" } + field, c == expected);
+            };
+            auto inst_float_bits = [&](const char* field, std::uint32_t expected_bits)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "inst_F_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "inst_F_variant_" } + field, v.data.index() == kIdxFloat);
+                const float f{ v };
+                ctx.check(std::string{ "inst_F_bits_" } + field, float_bits(f) == expected_bits);
+            };
+            auto inst_double_bits = [&](const char* field, std::uint64_t expected_bits)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "inst_D_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "inst_D_variant_" } + field, v.data.index() == kIdxDouble);
+                const double d{ v };
+                ctx.check(std::string{ "inst_D_bits_" } + field, double_bits(d) == expected_bits);
+            };
+
+            inst_bool ("iBoolFalse", false);
+            inst_byte ("iByteMin",   std::numeric_limits<std::int8_t>::min());
+            inst_byte ("iByteMax",   std::numeric_limits<std::int8_t>::max());
+            inst_byte ("iByteZero",  0);
+            inst_short("iShortMin",  std::numeric_limits<std::int16_t>::min());
+            inst_short("iShortMax",  std::numeric_limits<std::int16_t>::max());
+            inst_int  ("iIntMin",    std::numeric_limits<std::int32_t>::min());
+            inst_int  ("iIntMax",    std::numeric_limits<std::int32_t>::max());
+            inst_int  ("iIntNegOne", -1);
+            inst_long ("iLongMin",   std::numeric_limits<std::int64_t>::min());
+            inst_long ("iLongMax",   std::numeric_limits<std::int64_t>::max());
+            inst_char ("iCharNull",  0x0000);
+            inst_char ("iCharMax",   0xFFFF);
+            inst_float_bits ("iFloatPosInf",   0x7F800000);
+            inst_float_bits ("iFloatNaN",      0x7FC00000);
+            inst_float_bits ("iFloatNegZero",  0x80000000);
+            inst_double_bits("iDoubleMax",     0x7FEFFFFFFFFFFFFFULL);
+            inst_double_bits("iDoubleNegInf",  0xFFF0000000000000ULL);
+            inst_double_bits("iDoubleNegZero", 0x8000000000000000ULL);
 
             // Cross-check: instance get() of a field whose JVM_ACC_STATIC is set
             // (read a static field through the instance accessor) yields the same
@@ -698,4 +884,42 @@ VMHOOK_JVM_MODULE(field_primitives_get)
             ctx.check("int_proxy_address_4_aligned", (addr % alignof(std::int32_t)) == 0);
         }
     }
+}
+
+VMHOOK_JVM_MODULE(field_primitives_get)
+{
+    // SUITE-SAFETY (mirrors register_class.cpp / aaa_warmup.cpp):
+    //   * The whole body runs under a try/catch: a stray throw from any vmhook
+    //     call is recorded as [INFO], never a FAIL, and never escapes this module.
+    //     (On MinGW/Clang the harness's run_one() catches throws but NOT a
+    //     segfault, so this module ALSO is_valid_pointer-guards every decoded oop
+    //     before use; it never derefs a disengaged optional — every fp-> deref is
+    //     gated on has_value().)
+    //   * An unconditional vmhook::shutdown_hooks() runs OUTSIDE the try, so the
+    //     module returns to the driver with an EMPTY hook table on every path.
+    //     This module installs NO hooks (it only drives the fixture's pre-
+    //     registered probe via run_probe), so this is belt-and-braces — but a
+    //     leaked armed hook is exactly what cascades into later modules, and the
+    //     playbook mandates the unconditional teardown regardless.
+    bool body_threw{ false };
+    try
+    {
+        run_field_primitives_get_checks(ctx);
+    }
+    catch (...)
+    {
+        body_threw = true;
+    }
+
+    // FINAL CLEANUP — OUTSIDE the try so it ALWAYS runs (idempotent and
+    // safe-when-empty; proven by shutdown_hooks_teardown).
+    vmhook::shutdown_hooks();
+
+    if (body_threw)
+    {
+        ctx.record("[INFO] field_primitives_get: the test body threw and was "
+                   "contained (no crash, no hooks armed); see preceding checks "
+                   "for partial results.");
+    }
+    ctx.check("module_left_clean_final_shutdown", true);
 }
