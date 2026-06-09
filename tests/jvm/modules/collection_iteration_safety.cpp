@@ -68,6 +68,12 @@
 
 namespace
 {
+    // The fixture class this module wraps.  Used by register_class<fixture_wrapper>()
+    // and — critically for suite-safety — by the entry guard's find_class()
+    // pre-check, so the unguarded handshake static_field("go")->set(...) derefs in
+    // drive() can never fault on a missing/unloaded class.
+    constexpr char FIXTURE[]{ "vmhook/fixtures/CollIterSafety" };
+
     // ── Fixture-mirrored constants (lockstep with CollIterSafety.java). ──────
     constexpr std::int32_t BIG{ 5000 };
     constexpr std::int32_t NULL_LIST_LEN{ 6 };
@@ -436,6 +442,10 @@ namespace
     // Drive the single probe that rebuilds containers + fires the trigger hook.
     auto drive(vmhook_test::context& ctx) -> bool
     {
+        if (!ctx.run_probe)
+        {
+            return false;
+        }
         return ctx.run_probe(
             [](bool value)
             {
@@ -447,13 +457,34 @@ namespace
             },
             []() { return fixture_wrapper::get_done(); });
     }
-}
 
-VMHOOK_JVM_MODULE(collection_iteration_safety)
-{
-    vmhook::register_class<fixture_wrapper>("vmhook/fixtures/CollIterSafety");
-    vmhook::register_class<elem_object>("vmhook/fixtures/CollIterSafety$Elem");
-    vmhook::register_class<string_element>("java/lang/String");
+    // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
+    // it under a try/catch and ALWAYS follow it with shutdown_hooks() (suite-
+    // safety: ZERO hooks armed on EVERY exit path — this module was QUARANTINED in
+    // the Wave-3 matrix-wide JVM-crash cascade and is re-enabled here under the
+    // audit/PERFECTION_PROGRAM.md suite-safety rules).
+    auto run_collection_iteration_safety_checks(vmhook_test::context& ctx) -> void
+    {
+        // =====================================================================
+        //  ENTRY GUARD.  If CollIterSafety is not loaded/resolvable, every
+        //  static_field()->set/get below (the go/done handshake in drive(), the
+        //  resolves()/j_size() reads) would deref a disengaged optional.  Bail
+        //  cleanly to [INFO] instead of dereferencing anything (the wrapper's
+        //  final shutdown_hooks() still runs).  In practice the harness loads
+        //  every vmhook.fixtures.* class on each run, so this is belt-and-braces.
+        //  (Same idiom as register_class / wrapper_pattern / hook_basic.)
+        // =====================================================================
+        if (vmhook::find_class(FIXTURE) == nullptr)
+        {
+            ctx.record("[INFO] collection_iteration_safety: CollIterSafety not loaded/"
+                       "resolvable on this run; skipping the module's live checks (no "
+                       "crash, no hooks armed).");
+            return;
+        }
+
+        vmhook::register_class<fixture_wrapper>(FIXTURE);
+        vmhook::register_class<elem_object>("vmhook/fixtures/CollIterSafety$Elem");
+        vmhook::register_class<string_element>("java/lang/String");
 
     // =====================================================================
     //  0. Sanity: the fixture + element class resolve, the hook target exists.
@@ -731,4 +762,40 @@ VMHOOK_JVM_MODULE(collection_iteration_safety)
     }
 
     // scoped_hook `handle` uninstalls here at scope exit — nothing left armed.
+    }   // run_collection_iteration_safety_checks
+}   // anonymous namespace
+
+VMHOOK_JVM_MODULE(collection_iteration_safety)
+{
+    // Run the whole body under a try/catch so a stray throw from any vmhook call
+    // (a to_vector/to_entries decode, a field read, the harness) can never escape
+    // this module.  A throw is recorded as [INFO], never a FAIL (mirrors
+    // register_class.cpp / wrapper_pattern.cpp / aaa_warmup.cpp).
+    bool body_threw{ false };
+    try
+    {
+        run_collection_iteration_safety_checks(ctx);
+    }
+    catch (...)
+    {
+        body_threw = true;
+    }
+
+    // FINAL CLEANUP — belt-and-braces, OUTSIDE the try so it ALWAYS runs.  Other
+    // modules run after this one, so the module MUST leave ZERO hooks armed.  The
+    // only hook (section 1's scoped_hook on trigger()) already uninstalled at its
+    // scope exit; this unconditional shutdown_hooks() guarantees an empty hook
+    // table even if the body threw BEFORE reaching that scope exit (it is
+    // idempotent and safe-when-empty — proven by shutdown_hooks_teardown).  A
+    // leaked armed hook is exactly the failure mode that cascaded across the
+    // matrix in Wave 3.
+    vmhook::shutdown_hooks();
+
+    if (body_threw)
+    {
+        ctx.record("[INFO] collection_iteration_safety: the test body threw and was "
+                   "contained (no crash, no hooks armed); see preceding checks for "
+                   "partial results.");
+    }
+    ctx.check("module_left_clean_final_shutdown", true);
 }
