@@ -2,9 +2,11 @@ package vmhook.fixtures;
 
 import vmhook.Harness;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.SortedMap;
 import java.util.TreeMap;
 
 /**
@@ -14,14 +16,25 @@ import java.util.TreeMap;
  * and the two underlying walkers, on a live JVM, across every container shape and
  * boundary the audit flagged:
  *
- *   - HashMap&lt;String,Box&gt;          empty / small / MANY (forces resize +
- *                                    a treeified bin) / one-null-key /
+ *   - HashMap&lt;String,Box&gt;          empty / one / two / small / MANY (forces
+ *                                    resize + a treeified bin) / one-null-key /
  *                                    one-null-value / empty-string key+value.
  *   - LinkedHashMap&lt;String,Box&gt;    small + MANY (the HashMap "table" fast path
  *                                    is taken, so iteration is BUCKET order, NOT
  *                                    insertion order — pinned as a known quirk).
- *   - TreeMap&lt;String,Box&gt;          empty / small / MANY (red-black in-order
- *                                    walk; in-order == sorted key order).
+ *   - TreeMap&lt;String,Box&gt;          empty / one / two / small / MANY (red-black
+ *                                    in-order walk; in-order == sorted key order),
+ *                                    plus a DESCENDING-inserted tree (proves the
+ *                                    in-order walk re-sorts) and a null-VALUE tree
+ *                                    (TreeMap permits null values, never null keys).
+ *   - Collections.* views            emptyMap() / singletonMap() /
+ *                                    unmodifiableMap(HashMap) /
+ *                                    unmodifiableSortedMap(TreeMap): NONE expose a
+ *                                    "table"/"root" field on their own klass, so
+ *                                    to_entries returns EMPTY for every one of them
+ *                                    (a faithful, characterized contract — the
+ *                                    unmodifiable wrappers do NOT see through to the
+ *                                    map they wrap).
  *   - a Map field left NULL          and a field that does not exist at all
  *                                    (to_entries must return empty, never throw).
  *
@@ -79,6 +92,12 @@ public final class CollMap
     /** Empty HashMap (size 0). */
     public static HashMap<String, Box> hashEmpty = new HashMap<String, Box>();
 
+    /** Single-entry HashMap (size 1, a normal non-empty key — the minimal populated bucket walk). */
+    public static HashMap<String, Box> hashOne = new HashMap<String, Box>();
+
+    /** Two-entry HashMap (size 2 — the smallest map that can place entries in two buckets). */
+    public static HashMap<String, Box> hashTwo = new HashMap<String, Box>();
+
     /** Small HashMap: exactly SMALL_N deterministic entries. */
     public static HashMap<String, Box> hashSmall = new HashMap<String, Box>();
 
@@ -115,11 +134,50 @@ public final class CollMap
     /** Empty TreeMap. */
     public static TreeMap<String, Box> treeEmpty = new TreeMap<String, Box>();
 
+    /** Single-entry TreeMap (size 1 — the minimal red-black root with no children). */
+    public static TreeMap<String, Box> treeOne = new TreeMap<String, Box>();
+
+    /** Two-entry TreeMap (size 2 — a root + one child; in-order yields the sorted pair). */
+    public static TreeMap<String, Box> treeTwo = new TreeMap<String, Box>();
+
     /** Small TreeMap: SMALL_N entries; in-order walk == sorted key order. */
     public static TreeMap<String, Box> treeSmall = new TreeMap<String, Box>();
 
     /** Large TreeMap: MANY_N entries; deep red-black tree. */
     public static TreeMap<String, Box> treeMany = new TreeMap<String, Box>();
+
+    /**
+     * TreeMap whose keys are inserted in STRICT DESCENDING order ("k(N-1)" first,
+     * "k0" last).  A correct red-black in-order walk must STILL emit them in
+     * ascending order, so this proves the native walk re-sorts and is not merely
+     * echoing insertion order.  Holds SMALL_N entries.
+     */
+    public static TreeMap<String, Box> treeReverseInsert = new TreeMap<String, Box>();
+
+    /**
+     * TreeMap with a null VALUE under a non-null key.  TreeMap permits null
+     * values (it forbids only null keys), so this exercises the tree walk
+     * surfacing a nullptr value while keeping the key — the TreeMap analogue of
+     * hashNullValue.  Holds 2 entries, one of which has a null value.
+     */
+    public static TreeMap<String, Box> treeNullValue = new TreeMap<String, Box>();
+
+    // ---- Collections.* views: NONE expose a "table"/"root" field of their own,
+    //      so to_entries returns EMPTY for each (characterized contract). --------
+
+    /** Collections.emptyMap() — an EmptyMap singleton with no backing table/root. */
+    public static Map<String, Box> emptyMapColl = Collections.emptyMap();
+
+    /** Collections.singletonMap(k,v) — a SingletonMap (fields k,v, not table/root). */
+    public static Map<String, Box> singletonMapColl =
+        Collections.singletonMap("only", new Box(42, "only-value"));
+
+    /** Collections.unmodifiableMap(hashSmall) — an UnmodifiableMap wrapping (field m). */
+    public static Map<String, Box> unmodifiableHash = Collections.unmodifiableMap(hashSmall);
+
+    /** Collections.unmodifiableSortedMap(treeSmall) — an UnmodifiableSortedMap wrapper. */
+    public static SortedMap<String, Box> unmodifiableTree =
+        Collections.unmodifiableSortedMap(treeSmall);
 
     /** A declared Map field that is deliberately left NULL. */
     public static Map<String, Box> nullMap = null;
@@ -149,6 +207,8 @@ public final class CollMap
     public static volatile long hashSmallIdSum;
     public static volatile long hashSmallIdXor;
 
+    public static volatile long treeReverseIdSum;
+
     public static volatile long hashManyKeyCharSum;
     public static volatile long hashManyIdSum;
     public static volatile long hashManyIdXor;
@@ -158,6 +218,8 @@ public final class CollMap
 
     /** Java's own view of each map's size(), for a native cross-check. */
     public static volatile int hashEmptySize;
+    public static volatile int hashOneSize;
+    public static volatile int hashTwoSize;
     public static volatile int hashSmallSize;
     public static volatile int hashManySize;
     public static volatile int hashNullKeySize;
@@ -167,12 +229,28 @@ public final class CollMap
     public static volatile int linkedSmallSize;
     public static volatile int linkedManySize;
     public static volatile int treeEmptySize;
+    public static volatile int treeOneSize;
+    public static volatile int treeTwoSize;
     public static volatile int treeSmallSize;
     public static volatile int treeManySize;
+    public static volatile int treeReverseInsertSize;
+    public static volatile int treeNullValueSize;
+
+    /**
+     * size() of each Collections.* view (Java's own count).  These are non-zero
+     * for the singleton / unmodifiable views even though to_entries reads EMPTY,
+     * which is exactly the gap the module characterizes.
+     */
+    public static volatile int emptyMapCollSize;
+    public static volatile int singletonMapCollSize;
+    public static volatile int unmodifiableHashSize;
+    public static volatile int unmodifiableTreeSize;
 
     /** TreeMap's first/last keys (sorted), so native can pin the in-order walk. */
     public static volatile String treeSmallFirstKey;
     public static volatile String treeSmallLastKey;
+    public static volatile String treeReverseFirstKey;
+    public static volatile String treeReverseLastKey;
 
     /** Whether the treeified HashMap actually treeified at least one bin. */
     public static volatile boolean treeifiedHasTreeBin;
@@ -201,6 +279,16 @@ public final class CollMap
     private static void buildAll()
     {
         hashEmpty = new HashMap<String, Box>();
+
+        // Minimal populated HashMaps: the size-1 and size-2 general cases (the
+        // empty-string and null-bearing maps are special boundaries; these are
+        // ordinary tiny maps so a plain single/double bucket walk is exercised).
+        hashOne = new HashMap<String, Box>();
+        hashOne.put("k0", new Box(0, "v0"));
+
+        hashTwo = new HashMap<String, Box>();
+        hashTwo.put("k0", new Box(0, "v0"));
+        hashTwo.put("k1", new Box(1, "v1"));
 
         hashSmall = new HashMap<String, Box>();
         long hsKey = 0, hsId = 0, hsXor = 0;
@@ -277,6 +365,13 @@ public final class CollMap
 
         treeEmpty = new TreeMap<String, Box>();
 
+        treeOne = new TreeMap<String, Box>();
+        treeOne.put("k0", new Box(0, "v0"));
+
+        treeTwo = new TreeMap<String, Box>();
+        treeTwo.put("k0", new Box(0, "v0"));
+        treeTwo.put("k1", new Box(1, "v1"));
+
         treeSmall = new TreeMap<String, Box>();
         long tsId = 0;
         for (int i = 0; i < SMALL_N; ++i)
@@ -297,9 +392,39 @@ public final class CollMap
         }
         treeManyIdSum = tmId;
 
+        // Insert keys in STRICT DESCENDING order so a correct in-order walk has
+        // to re-sort them (insertion order != sorted order).  Same content as
+        // treeSmall, so the native side can reuse the ascending-order assertion.
+        treeReverseInsert = new TreeMap<String, Box>();
+        long trId = 0;
+        for (int i = SMALL_N - 1; i >= 0; --i)
+        {
+            treeReverseInsert.put("k" + i, new Box(i, "v" + i));
+            trId += i;
+        }
+        treeReverseIdSum = trId;
+        treeReverseFirstKey = treeReverseInsert.firstKey();
+        treeReverseLastKey = treeReverseInsert.lastKey();
+
+        // TreeMap permits null VALUES (never null keys): one entry maps a real
+        // key to null, the sibling maps to a real Box.
+        treeNullValue = new TreeMap<String, Box>();
+        treeNullValue.put("present", null);
+        treeNullValue.put("alsohere", new Box(9, "v9"));
+
+        // Collections.* views.  unmodifiable* must wrap the maps AFTER they are
+        // populated above so their size() witnesses are non-zero; to_entries on
+        // each still reads EMPTY (no "table"/"root" on the wrapper's own klass).
+        emptyMapColl = Collections.emptyMap();
+        singletonMapColl = Collections.singletonMap("only", new Box(42, "only-value"));
+        unmodifiableHash = Collections.unmodifiableMap(hashSmall);
+        unmodifiableTree = Collections.unmodifiableSortedMap(treeSmall);
+
         nullMap = null;
 
         hashEmptySize = hashEmpty.size();
+        hashOneSize = hashOne.size();
+        hashTwoSize = hashTwo.size();
         hashSmallSize = hashSmall.size();
         hashManySize = hashMany.size();
         hashNullKeySize = hashNullKey.size();
@@ -309,8 +434,17 @@ public final class CollMap
         linkedSmallSize = linkedSmall.size();
         linkedManySize = linkedMany.size();
         treeEmptySize = treeEmpty.size();
+        treeOneSize = treeOne.size();
+        treeTwoSize = treeTwo.size();
         treeSmallSize = treeSmall.size();
         treeManySize = treeMany.size();
+        treeReverseInsertSize = treeReverseInsert.size();
+        treeNullValueSize = treeNullValue.size();
+
+        emptyMapCollSize = emptyMapColl.size();
+        singletonMapCollSize = singletonMapColl.size();
+        unmodifiableHashSize = unmodifiableHash.size();
+        unmodifiableTreeSize = unmodifiableTree.size();
     }
 
     /**
