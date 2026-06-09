@@ -374,17 +374,28 @@ VMHOOK_JVM_MODULE(global_ref)
                         g_survive_read_val.store(survived, std::memory_order_relaxed);
                     }
 
-                    // Release the pin on the live JNIEnv (real DeleteGlobalRef),
-                    // then prove reset() is idempotent.  These are HANDLE-level
-                    // operations — they never deref the (possibly relocated) oop —
-                    // so they stay hard invariants below.  Mark the pin released so
-                    // the module body's shutdown guard knows the JVM-side global ref
-                    // is already gone and need not be touched at static destruction.
-                    g_pinned.reset();
-                    g_reset_clears_oop.store(g_pinned.oop() == nullptr, std::memory_order_relaxed);
-                    g_pinned.reset();
-                    g_double_reset_safe.store(!static_cast<bool>(g_pinned), std::memory_order_relaxed);
-                    g_pin_released_live.store(true, std::memory_order_relaxed);
+                    // Release the pin on the live JNIEnv (real DeleteGlobalRef), then
+                    // prove reset() is idempotent — but ONLY when the post-GC oop was
+                    // SAFELY attainable (non-relocating collector).  The earlier
+                    // assumption that these are "pure handle-level ops, always safe"
+                    // was WRONG on a relocating GC: on msvc·java24/25 calling reset()
+                    // here on a moved/relocated pin FAULTED (SEH-caught in the probe,
+                    // leaving g_pin_released_live false) and corrupted JNI state enough
+                    // to crash the NEXT module (hook_basic) — an "incomplete suite" at
+                    // ~3488 PASS.  So on a relocating GC we DO NOT touch reset() in the
+                    // detour; we leave g_pinned HELD and let the file-scope destructor
+                    // release it safely at static destruction (after the JVM quiesces).
+                    // The reset/double-reset CONTRACT is covered HARD on every JDK by
+                    // the empty-pin reset checks + the no-JVM global_ref test, and the
+                    // module-body checks are gated on the same g_survive_attainable.
+                    if (attainable)
+                    {
+                        g_pinned.reset();
+                        g_reset_clears_oop.store(g_pinned.oop() == nullptr, std::memory_order_relaxed);
+                        g_pinned.reset();
+                        g_double_reset_safe.store(!static_cast<bool>(g_pinned), std::memory_order_relaxed);
+                        g_pin_released_live.store(true, std::memory_order_relaxed);
+                    }
                     return;
                 }
             }) };
