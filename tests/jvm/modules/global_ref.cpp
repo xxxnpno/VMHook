@@ -374,28 +374,17 @@ VMHOOK_JVM_MODULE(global_ref)
                         g_survive_read_val.store(survived, std::memory_order_relaxed);
                     }
 
-                    // Release the pin on the live JNIEnv (real DeleteGlobalRef), then
-                    // prove reset() is idempotent — but ONLY when the post-GC oop was
-                    // SAFELY attainable (non-relocating collector).  The earlier
-                    // assumption that these are "pure handle-level ops, always safe"
-                    // was WRONG on a relocating GC: on msvc·java24/25 calling reset()
-                    // here on a moved/relocated pin FAULTED (SEH-caught in the probe,
-                    // leaving g_pin_released_live false) and corrupted JNI state enough
-                    // to crash the NEXT module (hook_basic) — an "incomplete suite" at
-                    // ~3488 PASS.  So on a relocating GC we DO NOT touch reset() in the
-                    // detour; we leave g_pinned HELD and let the file-scope destructor
-                    // release it safely at static destruction (after the JVM quiesces).
-                    // The reset/double-reset CONTRACT is covered HARD on every JDK by
-                    // the empty-pin reset checks + the no-JVM global_ref test, and the
-                    // module-body checks are gated on the same g_survive_attainable.
-                    if (attainable)
-                    {
-                        g_pinned.reset();
-                        g_reset_clears_oop.store(g_pinned.oop() == nullptr, std::memory_order_relaxed);
-                        g_pinned.reset();
-                        g_double_reset_safe.store(!static_cast<bool>(g_pinned), std::memory_order_relaxed);
-                        g_pin_released_live.store(true, std::memory_order_relaxed);
-                    }
+                    // Release the pin on the live JNIEnv (real DeleteGlobalRef),
+                    // then prove reset() is idempotent.  These are HANDLE-level
+                    // operations — they never deref the (possibly relocated) oop —
+                    // so they stay hard invariants below.  Mark the pin released so
+                    // the module body's shutdown guard knows the JVM-side global ref
+                    // is already gone and need not be touched at static destruction.
+                    g_pinned.reset();
+                    g_reset_clears_oop.store(g_pinned.oop() == nullptr, std::memory_order_relaxed);
+                    g_pinned.reset();
+                    g_double_reset_safe.store(!static_cast<bool>(g_pinned), std::memory_order_relaxed);
+                    g_pin_released_live.store(true, std::memory_order_relaxed);
                     return;
                 }
             }) };
@@ -529,28 +518,8 @@ VMHOOK_JVM_MODULE(global_ref)
                 []() { return global_ref_fixture::get_done(); }) };
 
             ctx.check("global_ref_phase2_probe_completed", done2);
-            // Whether the forced System.gc() actually registered a collection round is
-            // collector/config-dependent: an explicit GC can be deferred or a no-op
-            // (e.g. -XX:+DisableExplicitGC, or the collector ignoring the hint), and
-            // the whole post-GC detour flow (survive-resolve + reset) only runs when a
-            // round registered.  This was a HARD assert and flaked across several
-            // configs once added modules shifted suite timing.  Make it best-effort:
-            // hard-PASS when a round registered, [INFO] otherwise (the post-GC
-            // reset/double-reset below are gated on the same gc_ran so they don't read
-            // their default-false atomics when the detour's post-GC stage didn't run).
-            const bool gc_ran{ global_ref_fixture::get_gc_rounds() >= 1 };
-            if (gc_ran)
-            {
-                ctx.check("global_ref_gc_actually_ran", true);
-            }
-            else
-            {
-                ctx.record("[INFO] global_ref: forced System.gc() registered no GC round "
-                           "this run (explicit GC deferred / no-op on this collector+config) "
-                           "— survive-GC + post-GC reset checks recorded best-effort, not "
-                           "asserted; handle-level reset is still covered by the empty-pin "
-                           "reset checks here + the no-JVM global_ref test.");
-            }
+            ctx.check("global_ref_gc_actually_ran",
+                      global_ref_fixture::get_gc_rounds() >= 1);
 
             // ── Survive-GC checks — GATED on safe attainability ─────────────────
             // The HARD contract a global ref guarantees across EVERY collector is
@@ -586,29 +555,8 @@ VMHOOK_JVM_MODULE(global_ref)
             // because exercising them requires entering the faulting phase-2 detour;
             // the phase-1 reset/double-reset semantics are already covered above by
             // the empty-pin reset checks, which are hard on JDK 8.)
-            // Gated on g_survive_attainable (NOT just gc_ran): these read g_pinned's
-            // state AFTER a post-GC reset(), and CI shows that on a RELOCATING collector
-            // (G1 on linux-gcc + msvc) g_pinned.oop() can return non-null after reset()
-            // — i.e. the post-relocating-GC reset/oop() behaviour is unreliable, the
-            // same condition the survive-GC checks gate on.  (The module comment at the
-            // store site assumed these were purely handle-level and always safe; the CI
-            // matrix disproved that on relocating GCs — a potential library question:
-            // global_ref::reset()/oop() interaction with a relocated OopStorage slot,
-            // flagged for follow-up, NOT a test bug.)  The reset/double-reset CONTRACT
-            // is independently covered HARD on every JDK by the empty-pin reset checks
-            // above + the no-JVM global_ref test (77 checks incl. reset), so gating the
-            // post-GC variant to [INFO] on relocating collectors loses no real coverage.
-            if (g_survive_attainable.load(std::memory_order_relaxed))
-            {
-                ctx.check("global_ref_reset_clears_oop", g_reset_clears_oop.load(std::memory_order_relaxed));
-                ctx.check("global_ref_double_reset_safe", g_double_reset_safe.load(std::memory_order_relaxed));
-            }
-            else
-            {
-                ctx.record("[INFO] global_ref: post-GC reset/double-reset not asserted "
-                           "(post-GC oop not safely attainable on this relocating collector; "
-                           "handle-level reset is covered by the empty-pin checks + no-JVM test).");
-            }
+            ctx.check("global_ref_reset_clears_oop", g_reset_clears_oop.load(std::memory_order_relaxed));
+            ctx.check("global_ref_double_reset_safe", g_double_reset_safe.load(std::memory_order_relaxed));
         }
         else
         {

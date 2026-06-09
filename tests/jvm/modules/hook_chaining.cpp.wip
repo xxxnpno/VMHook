@@ -52,51 +52,6 @@
 // read primitives / a String / the receiver's seed and store into atomics, so
 // there is no GC-window hazard here.  C++17: no std::bit_cast.  MSVC copy-init from
 // value_t (never brace-init) in the field readers.
-//
-// ---------------------------------------------------------------------------
-// SUITE-SAFETY (this module was QUARANTINED in Wave 3 in a matrix-wide JVM-crash
-// cascade; re-enabled here under the suite-safety rules in
-// audit/PERFECTION_PROGRAM.md:400-403, mirroring the just-landed wrapper_pattern.cpp
-// / find_class_context_loader.cpp / register_class.cpp scaffold):
-//
-//   * NOT THE CRASHER, A VICTIM.  The Wave-3 cascade crasher was
-//     hook_reinstall_after_shutdown's mid-suite GLOBAL shutdown_hooks() (it tore
-//     down every OTHER module's hooks/state mid-run); the other five modules,
-//     including this one, were victims that merely ran after it.  This module
-//     itself never calls the global shutdown mid-body and never mutates shared
-//     process state another module relies on (it registers only its OWN throwaway
-//     wrapper type and installs only scope-local hooks).
-//
-//   * MANY HOOKS, ZERO LEFT ARMED ON ANY PATH.  The decisive hazard for THIS
-//     feature is that it installs MULTIPLE hooks on different methods sharing one
-//     i2i stub.  Every hook is a scope-local vmhook::scoped_hook<>: each block's
-//     handles RAII-uninstall at its closing brace, and a throw mid-scenario unwinds
-//     and destroys all in-scope handles during stack unwinding (reverse construction
-//     order), so a SUBSET of the sibling hooks can never be left armed.  On top of
-//     that, the VMHOOK_JVM_MODULE wrapper runs the whole body under try/catch and
-//     ALWAYS calls an unconditional vmhook::shutdown_hooks() OUTSIDE the try, so
-//     even a throw before a scope exit returns control to the driver with an empty
-//     hook table.  A leaked armed hook is exactly what cascaded in Wave 3; this
-//     module cannot leak one on ANY path.
-//
-//   * NEVER CRASH, BAIL TO [INFO].  An ENTRY GUARD (find_class(FIXTURE)==nullptr)
-//     skips the module cleanly if the fixture is absent, so the unguarded
-//     static_field("go")->set(...) handshake derefs can never touch a disengaged
-//     optional; drive() also null-checks ctx.run_probe before calling it.  A throw
-//     from any vmhook call is contained and recorded as [INFO], never a FAIL.
-//
-//   * NO FORCED GC.  Neither this module nor HookChaining.java drives System.gc(),
-//     so the forced-GC platform gate (the make_java_array pitfall) does not apply.
-//
-//   * NO SINGLE-INSTANT JIT-OWNED READS.  This module never reads _code /
-//     verify_hooks(); it observes hooks purely through per-method fire counters and
-//     Java-side observables, so it needs no code_settles_null / verify_settles_zero
-//     settle helpers.
-//
-//   * UNIVERSAL INVARIANTS.  Every assertion here is a JDK-agnostic hook-dispatch
-//     invariant (exactly-once per call, fires-for-its-method-only, allow-through,
-//     per-detour return override) that holds identically on JDK 8..26 HotSpot, so
-//     nothing is JDK-gated.
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
@@ -216,10 +171,6 @@ namespace
     auto drive(vmhook_test::context& ctx, std::int32_t mode) -> bool
     {
         reset_fires();
-        if (!ctx.run_probe)
-        {
-            return false;
-        }
         return ctx.run_probe(
             [mode](bool value)
             {
@@ -368,38 +319,11 @@ namespace
             }
         };
     }
+}
 
-    // The internal JVM name of the fixture; used by the entry guard's
-    // find_class() pre-check (so the unguarded handshake static_field("go")->set
-    // derefs below can never fault on a missing class) and by register_class.
-    constexpr char FIXTURE[]{ "vmhook/fixtures/HookChaining" };
-
-    // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
-    // it under a try/catch and ALWAYS follow it with shutdown_hooks() (suite-
-    // safety: ZERO hooks armed on EVERY exit path).  EVERY hook below is a
-    // scope-local scoped_hook<>, so a throw mid-scenario unwinds and RAII-destroys
-    // all in-scope handles (in reverse construction order) before this returns —
-    // a subset can never be left armed — and the unconditional shutdown_hooks()
-    // in the wrapper is the belt-and-braces backstop on top of that.
-    auto run_hook_chaining_checks(vmhook_test::context& ctx) -> void
-    {
-        // =====================================================================
-        //  ENTRY GUARD.  If HookChaining is not loaded/resolvable, every
-        //  static_field()->set/get below (the go/done/mode handshake) would deref
-        //  a disengaged optional.  Bail cleanly to [INFO] instead of dereferencing
-        //  anything (the wrapper's final shutdown_hooks() still runs).  In practice
-        //  the harness loads every vmhook.fixtures.* class on each run, so this is
-        //  belt-and-braces.  (Same idiom as register_class / wrapper_pattern.)
-        // =====================================================================
-        if (vmhook::find_class(FIXTURE) == nullptr)
-        {
-            ctx.record("[INFO] hook_chaining: HookChaining not loaded/resolvable on "
-                       "this run; skipping the module's live checks (no crash, no "
-                       "hooks armed).");
-            return;
-        }
-
-        vmhook::register_class<hc_fixture>(FIXTURE);
+VMHOOK_JVM_MODULE(hook_chaining)
+{
+    vmhook::register_class<hc_fixture>("vmhook/fixtures/HookChaining");
 
     // =====================================================================
     // 0 — Sanity: the fixture resolves and every hookable method is declared
@@ -771,42 +695,4 @@ namespace
     // Leave NOTHING armed for later modules sharing the JVM/stub: every handle
     // above was scope-local and has been RAII-destroyed by this point.
     ctx.check("module_left_no_hooks_armed", true);
-    }   // run_hook_chaining_checks
-}   // anonymous namespace
-
-VMHOOK_JVM_MODULE(hook_chaining)
-{
-    // Run the whole body under a try/catch so a stray throw from any vmhook call
-    // (or the harness) can never escape this module.  A throw is recorded as
-    // [INFO], never a FAIL (mirrors register_class.cpp / wrapper_pattern.cpp /
-    // find_class_context_loader.cpp / aaa_warmup.cpp).
-    bool body_threw{ false };
-    try
-    {
-        run_hook_chaining_checks(ctx);
-    }
-    catch (...)
-    {
-        body_threw = true;
-    }
-
-    // FINAL CLEANUP — belt-and-braces, OUTSIDE the try so it ALWAYS runs.  Other
-    // modules run after this one, so the module MUST leave ZERO hooks armed.  This
-    // module installs SEVERAL scoped_hooks on different methods that share the one
-    // patched i2i stub; every one is scope-local and already uninstalled at its
-    // block's scope exit (and a mid-scenario throw RAII-tears-down all in-scope
-    // handles during unwind, so no SUBSET can survive).  This unconditional
-    // shutdown_hooks() guarantees an empty hook table even if the body threw
-    // BEFORE reaching a scope exit — it is idempotent and safe-when-empty (proven
-    // by shutdown_hooks_teardown).  A leaked armed hook is exactly the failure mode
-    // that cascaded across the matrix in Wave 3.
-    vmhook::shutdown_hooks();
-
-    if (body_threw)
-    {
-        ctx.record("[INFO] hook_chaining: the test body threw and was contained "
-                   "(no crash, no hooks armed); see preceding checks for partial "
-                   "results.");
-    }
-    ctx.check("module_left_clean_final_shutdown", true);
 }
