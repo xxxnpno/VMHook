@@ -13542,20 +13542,7 @@ namespace vmhook
                 this->cached_ret_char = ret_char;
             }
 
-            // A call is static if the proxy carries no receiver (the
-            // static_method()/null-receiver case) OR the resolved Method is
-            // actually ACC_STATIC.  The second clause is what makes
-            // `instance->get_method("staticX")->call(...)` work: get_method on
-            // an INSTANCE wrapper hands the static Method* through with the
-            // instance still bound as this->object, so keying static-ness on
-            // `object == nullptr` alone mis-classified it as an instance call and
-            // dispatched the static method nonvirtually with the live receiver
-            // pinned as its first declared argument (wrong result + corrupted
-            // JNI call/exception state).  is_static() reads JVM_ACC_STATIC from
-            // the live Method's _access_flags (noexcept, false if unresolved), so
-            // for an instance method this stays false and the instance path is
-            // byte-identical, and for a null-receiver static this stays true.
-            const bool is_static_call{ this->object == nullptr || this->is_static() };
+            const bool is_static_call{ this->object == nullptr };
 
             // Resolve jclass + jmethodID.  Both are cached on the
             // method_proxy so subsequent calls skip the GetMethodID /
@@ -14193,18 +14180,10 @@ namespace vmhook
             std::intptr_t params[8]{};
             std::size_t   param_idx{ 0 };
 
-            // Instance methods receive 'this' as locals[0]; static methods take
-            // no receiver slot.  Omit the receiver when the proxy has no object
-            // OR the resolved Method is ACC_STATIC.  The is_static() clause
-            // mirrors the call_jni fix: a static Method resolved through an
-            // INSTANCE wrapper (instance->get_method("staticX")) keeps the
-            // receiver bound in this->object, and prepending it here as locals[0]
-            // would shift every real argument down one slot and feed the
-            // interpreter the instance as the static method's first parameter.
-            // is_static() is noexcept (false if _access_flags is unresolvable),
-            // so an instance method still takes the receiver slot byte-identically
-            // and a null-receiver static still omits it.
-            if (this->object && !this->is_static())
+            // Instance methods receive 'this' as locals[0]; static methods are
+            // constructed with a null owning object, so guarding on `object`
+            // alone correctly omits the receiver slot for static calls.
+            if (this->object)
             {
                 params[param_idx++] = reinterpret_cast<std::intptr_t>(this->object);
             }
