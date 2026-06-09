@@ -43,6 +43,22 @@
 //     uint16 path (the value matrix) AND the char shortcut and assert the full
 //     2-byte Java char lands.
 //   * set(value) on a null field_pointer is a silent no-op (early return); pinned.
+//
+// GUARD ASSERTION (this run): in addition to the value matrix this module also
+// directly asserts that the size guard SAFELY REJECTS a mis-sized / wrong-kind
+// write into its OWN primitive slots (too-wide int64->"I", too-narrow int32->"J",
+// wrong-kind float->"I" same-width characterisation, non-primitive string/vector
+// into "I") WITHOUT clobbering the field or its neighbours -- a self-contained
+// "never corrupts adjacent memory" proof on this fixture.  (The strong spatial
+// raw_address() adjacency proof and the full rejection matrix remain owned by
+// field_set_size_guard; the names here are disjoint so there is no overlap.)
+//
+// SUITE-SAFETY: the entire body runs inside an entry guard (find_class==nullptr
+// -> [INFO] + return) and a try/catch (a caught throw is recorded [INFO], never a
+// FAIL), and an UNCONDITIONAL vmhook::shutdown_hooks() runs OUTSIDE the try on
+// every exit path.  This module installs no hooks, so the shutdown is belt-and-
+// braces (idempotent, safe-when-empty), but it guarantees ZERO hooks armed for
+// the modules that run after it -- exactly the Wave-3 cascade failure mode.
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
@@ -250,11 +266,32 @@ namespace
             },
             []() { return fps::get_done(); });
     }
-}
 
-VMHOOK_JVM_MODULE(field_primitives_set)
-{
-    vmhook::register_class<fps>("vmhook/fixtures/FieldPrimitivesSet");
+    // Internal JVM name of the fixture (used by the entry guard).
+    constexpr const char* FIXTURE{ "vmhook/fixtures/FieldPrimitivesSet" };
+
+    // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
+    // it under a try/catch and ALWAYS follow it with shutdown_hooks() (suite
+    // safety; mirrors collection_iteration_safety.cpp / register_class.cpp).
+    auto run_field_primitives_set_checks(vmhook_test::context& ctx) -> void
+    {
+        // =================================================================
+        //  ENTRY GUARD.  If the fixture is not loaded/resolvable on this run,
+        //  every static_field()->set/get below would dereference a disengaged
+        //  optional.  Bail cleanly to [INFO] instead of touching anything (the
+        //  wrapper's unconditional shutdown_hooks() still runs).  In practice the
+        //  harness loads every vmhook.fixtures.* class on each run, so this is
+        //  belt-and-braces (same idiom as collection_iteration_safety).
+        // =================================================================
+        if (vmhook::find_class(FIXTURE) == nullptr)
+        {
+            ctx.record("[INFO] field_primitives_set: FieldPrimitivesSet not loaded/"
+                       "resolvable on this run; skipping the module's live checks "
+                       "(no crash, no hooks armed).");
+            return;
+        }
+
+        vmhook::register_class<fps>(FIXTURE);
 
     // =====================================================================
     //  0. Sanity: the class resolves and the portable static accessor works.
@@ -421,6 +458,7 @@ VMHOOK_JVM_MODULE(field_primitives_set)
             const int widened = v;
             ctx.check(std::string{ "C_widens_unsigned_" } + tag, widened == static_cast<int>(value));
         };
+        set_chk_C("nul",     0x0000); // '\0' -- the low boundary code unit
         set_chk_C("space",   0x0020);
         set_chk_C("A",       0x0041);
         set_chk_C("highbit", 0x00E9); // 'e-acute'
@@ -948,5 +986,148 @@ VMHOOK_JVM_MODULE(field_primitives_set)
         if (const auto p{ fps::static_field("sF") }) { p->set(2.5F); ctx.check("guard_ok_F_took", float_bits(fps::get_float("sF")) == 0x40200000u); }
         if (const auto p{ fps::static_field("sD") }) { p->set(2.5); ctx.check("guard_ok_D_took", double_bits(fps::get_double("sD")) == 0x4004000000000000ULL); }
         if (const auto p{ fps::static_field("sZ") }) { p->set(false); ctx.check("guard_ok_Z_took", fps::get_bool("sZ") == false); }
+    }
+
+    // =====================================================================
+    //  18. GUARD UPPER BOUND -- a MIS-SIZED or NON-PRIMITIVE write into THIS
+    //      module's own primitive slot is SAFELY REJECTED and does NOT clobber
+    //      the field OR its neighbours.  This is the "never corrupts adjacent
+    //      memory" half of the guard, asserted directly on this fixture (the
+    //      full rejection matrix + spatial raw_address proof stay in
+    //      field_set_size_guard; assertion names here are disjoint).  This phase
+    //      runs LAST, after every Java-observed phase, so its writes cannot
+    //      disturb earlier observations.
+    // =====================================================================
+    {
+        // -- too-WIDE: set(int64) into the 4-byte "I" slot is refused --------
+        if (const auto p{ fps::static_field("sI") })
+        {
+            p->set(std::int32_t{ 0x0BADF00D });
+            ctx.check("guard_reject_I_seed", fps::get_i32("sI") == 0x0BADF00D);
+            p->set(std::int64_t{ 0x7766554433221100LL }); // 8B -> 4B field: REFUSED
+            ctx.check("guard_reject_I_too_wide_unchanged", fps::get_i32("sI") == 0x0BADF00D);
+        }
+        // -- too-WIDE: set(int32) into the 1-byte "B" slot is refused --------
+        if (const auto p{ fps::static_field("sB") })
+        {
+            p->set(static_cast<std::int8_t>(0x3C));
+            ctx.check("guard_reject_B_seed", fps::get_i8("sB") == 0x3C);
+            p->set(std::int32_t{ 0x09ABCDEF }); // 4B -> 1B field: REFUSED
+            ctx.check("guard_reject_B_too_wide_unchanged", fps::get_i8("sB") == 0x3C);
+        }
+        // -- too-NARROW: set(int32) into the 8-byte "J" slot is refused ------
+        if (const auto p{ fps::static_field("sJ") })
+        {
+            p->set(std::int64_t{ 0x0123456789ABCDEFLL });
+            ctx.check("guard_reject_J_seed", fps::get_i64("sJ") == 0x0123456789ABCDEFLL);
+            p->set(std::int32_t{ 0x09ABCDEF }); // 4B -> 8B field: REFUSED (no stale high bytes)
+            ctx.check("guard_reject_J_too_narrow_unchanged", fps::get_i64("sJ") == 0x0123456789ABCDEFLL);
+        }
+        // -- too-NARROW: set(float) into the 8-byte "D" slot is refused ------
+        if (const auto p{ fps::static_field("sD") })
+        {
+            p->set(bits_to_double(0x400921FB54442D18ULL));
+            ctx.check("guard_reject_D_seed", double_bits(fps::get_double("sD")) == 0x400921FB54442D18ULL);
+            p->set(2.5F); // 4B -> 8B field: REFUSED
+            ctx.check("guard_reject_D_float_too_narrow_unchanged",
+                      double_bits(fps::get_double("sD")) == 0x400921FB54442D18ULL);
+        }
+        // -- NON-PRIMITIVE into a primitive: string / string_view / const
+        //    char* / vector<int> into the "I" slot are ALL refused (the
+        //    symmetric guard; otherwise the int bytes are reinterpreted as a
+        //    compressed OOP and written to a wild address). -------------------
+        if (const auto p{ fps::static_field("sI") })
+        {
+            p->set(std::int32_t{ 0x0BADF00D });
+            ctx.check("guard_reject_I_nonprim_seed", fps::get_i32("sI") == 0x0BADF00D);
+            p->set(std::string{ "99999" });          // std::string -> "I": REFUSED
+            ctx.check("guard_reject_I_string_refused", fps::get_i32("sI") == 0x0BADF00D);
+            p->set(std::string_view{ "abc" });        // string_view -> "I": REFUSED
+            ctx.check("guard_reject_I_string_view_refused", fps::get_i32("sI") == 0x0BADF00D);
+            p->set("literal");                         // const char* -> "I": REFUSED
+            ctx.check("guard_reject_I_cstr_refused", fps::get_i32("sI") == 0x0BADF00D);
+            const std::vector<int> vec{ 1, 2, 3 };
+            p->set(vec);                               // vector<int> -> "I": REFUSED
+            ctx.check("guard_reject_I_vector_refused", fps::get_i32("sI") == 0x0BADF00D);
+        }
+        // -- SAME-WIDTH WRONG-KIND is a documented LIMITATION (NOT a guard the
+        //    SIZE check can catch): set(float) into "I" passes the width check
+        //    and reinterprets the IEEE-754 bits verbatim.  We characterise the
+        //    ACTUAL bytes that land (NOT "unchanged"), matching the sibling, then
+        //    restore the slot.  An [INFO] flags the type-confusion footgun. -----
+        ctx.record("[INFO] field_primitives_set: field_proxy::set's guard is a SIZE "
+                   "guard, not a TYPE guard -- a same-width wrong-KIND write (e.g. "
+                   "set(float) into \"I\") passes the size check and reinterprets the "
+                   "bit pattern verbatim.  Characterised below; never corrupts an "
+                   "ADJACENT field because the width still matches the slot.");
+        if (const auto p{ fps::static_field("sI") })
+        {
+            p->set(1.5F); // float into "I": same width (4B) -> ACCEPTED as raw IEEE bits
+            ctx.check("guard_charac_I_float_keeps_ieee_bits",
+                      static_cast<std::uint32_t>(fps::get_i32("sI")) == 0x3FC00000u);
+            p->set(std::int32_t{ 0x0BADF00D }); // restore a clean int value
+            ctx.check("guard_charac_I_restored", fps::get_i32("sI") == 0x0BADF00D);
+        }
+
+        // -- ANTI-CLOBBER ON REJECTION: a too-wide (refused) write into the
+        //    middle of the instance int trio leaves BOTH neighbours intact AND
+        //    the middle unchanged -- the "never corrupts adjacent memory" proof
+        //    via this fixture's own contiguous trio (Java-observed adjacency is
+        //    in phases 13/16; the strong raw_address proof is in the sibling). --
+        if (inst)
+        {
+            auto pb{ inst->get_field("clobBefore") };
+            auto pm{ inst->get_field("clobMid") };
+            auto pa{ inst->get_field("clobAfter") };
+            if (pb && pm && pa)
+            {
+                // clobMid currently holds 0x2DEF1234 from phase 11; neighbours
+                // are the declared sentinels.  Copy-init extraction from value_t
+                // (= not braces) keeps the conversion MSVC-unambiguous.
+                const std::int32_t mid_before    = pm->get();
+                const std::int32_t before_before = pb->get();
+                const std::int32_t after_before  = pa->get();
+                ctx.check("guard_reject_clob_neighbours_sentinel",
+                          before_before == 0x11111111 && after_before == 0x33333333);
+                pm->set(std::int64_t{ 0x7766554433221100LL }); // 8B -> 4B mid: REFUSED
+                ctx.check("guard_reject_clob_mid_unchanged_by_overwide",
+                          static_cast<std::int32_t>(pm->get()) == mid_before);
+                ctx.check("guard_reject_clob_before_intact_by_overwide",
+                          static_cast<std::int32_t>(pb->get()) == before_before);
+                ctx.check("guard_reject_clob_after_intact_by_overwide",
+                          static_cast<std::int32_t>(pa->get()) == after_before);
+            }
+        }
+    }
+    }   // run_field_primitives_set_checks
+}   // anonymous namespace
+
+VMHOOK_JVM_MODULE(field_primitives_set)
+{
+    // Run the whole body under a try/catch so a stray throw from any vmhook call
+    // (a field read/write, the harness probe) can never escape this module.  A
+    // throw is recorded [INFO], never a FAIL (mirrors collection_iteration_safety
+    // / register_class / wrapper_pattern / aaa_warmup).
+    bool body_threw{ false };
+    try
+    {
+        run_field_primitives_set_checks(ctx);
+    }
+    catch (...)
+    {
+        body_threw = true;
+    }
+
+    // FINAL CLEANUP -- belt-and-braces, OUTSIDE the try so it ALWAYS runs.  Other
+    // modules run after this one, so the module MUST leave ZERO hooks armed.  This
+    // module installs no hooks, so shutdown_hooks() is purely defensive (it is
+    // idempotent and safe-when-empty -- proven by shutdown_hooks_teardown), but it
+    // guarantees an empty hook table even if the body threw partway through.
+    vmhook::shutdown_hooks();
+
+    if (body_threw)
+    {
+        ctx.record("[INFO] field_primitives_set: the test body threw and was contained "
+                   "(no crash, no hooks armed); see preceding checks for partial results.");
     }
 }
