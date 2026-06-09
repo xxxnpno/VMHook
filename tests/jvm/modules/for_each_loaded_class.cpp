@@ -262,7 +262,7 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
     ctx.check("app_loader_reached", app_classes_seen >= 1);
 
     // BEST-EFFORT gate for the OWN-fixture ENUMERATION checks, mirroring
-    // gate_string_presence.  On JDK 9+ (per-CLD Dictionary walk lists every app
+    // gate_bootstrap_presence.  On JDK 9+ (per-CLD Dictionary walk lists every app
     // class) these stay HARD.  On JDK8 the SystemDictionary-only walk may drop the
     // fixture entry, so when it is genuinely absent we record [INFO] instead of
     // failing — the two HARD floors above already prove the class is loaded AND
@@ -384,7 +384,7 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
 
     ctx.check("pass2_count_over_100", e2.count > 100);
     ctx.check("pass2_has_java_lang_Object", e2.names.contains("java/lang/Object"));
-    gate_string_presence("pass2_has_java_lang_String", e2.names.contains("java/lang/String"));
+    gate_bootstrap_presence("pass2_has_java_lang_String", e2.names.contains("java/lang/String"));
     // Pass-2 app-loader floor (HARD on every JDK): the independent second walk also
     // reached the application loader.  Robust to the JDK8 per-entry lottery.
     ctx.check("pass2_app_loader_reached", count_app_classes(e2.names) >= 1);
