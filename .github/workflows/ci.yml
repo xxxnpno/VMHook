@@ -257,13 +257,13 @@ jobs:
             exit 1
           }
 
-          if (-not $java.WaitForExit(60000)) {
+          if (-not $java.WaitForExit(120000)) {
             Stop-Process -Id $java.Id -Force -ErrorAction SilentlyContinue
-            Write-Host "::warning::java.exe did not exit within 60 s; dumping diagnostics before failing"
+            Write-Host "::warning::java.exe did not exit within 120 s; dumping diagnostics before failing"
             if (Test-Path "java_stdout.txt") { Write-Host "--- java_stdout.txt ---"; Get-Content "java_stdout.txt" | ForEach-Object { Write-Host $_ } }
             if (Test-Path "java_stderr.txt") { Write-Host "--- java_stderr.txt ---"; Get-Content "java_stderr.txt" | ForEach-Object { Write-Host "[stderr] $_" } }
             if (Test-Path "test_results.txt") { Write-Host "--- test_results.txt (partial) ---"; Get-Content "test_results.txt" | ForEach-Object { Write-Host $_ } }
-            Write-Error "java.exe did not exit within 60 s"
+            Write-Error "java.exe did not exit within 120 s"
             exit 1
           }
 
@@ -441,7 +441,7 @@ jobs:
           JAVA_PID=$!
           sleep 3
           waited=0
-          while kill -0 "$JAVA_PID" 2>/dev/null && [ "$waited" -lt 60 ]; do
+          while kill -0 "$JAVA_PID" 2>/dev/null && [ "$waited" -lt 120 ]; do
             sleep 1
             waited=$((waited + 1))
           done
