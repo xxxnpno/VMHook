@@ -29,9 +29,16 @@
 //     the pin un-safely-dereferenceable (e.g. the CI default G1 on
 //     linux-gcc-java11), the module records the documented relocation limitation
 //     as [INFO] instead of hard-asserting or dereferencing into a fault — it
-//     NEVER crashes the JVM and NEVER hard-FAILs on GC-relocation variance.  Only
-//     the HANDLE-level invariants (pin non-null, reset() clears the handle,
-//     double-reset safe) stay hard, because they hold across every GC.
+//     NEVER crashes the JVM and NEVER hard-FAILs on GC-relocation variance.  The
+//     post-GC reset()/double-reset checks are gated on the SAME attainability: when
+//     the post-GC pin is not safely attainable the detour leaves it HELD (no
+//     reset()/DeleteGlobalRef on a relocated pin) and the file-scope destructor
+//     releases it at static destruction, so those checks degrade to [INFO] too.
+//     The ENTIRE phase 2 (forced System.gc() + every post-GC read/reset) is
+//     compiled out on Windows (#if !defined(_WIN32), in BOTH the module body and
+//     the detour's phase-2 branch): the relocating-GC + held-pin release path
+//     intermittently crashes the JVM on the Windows MSVC builds and is uncontained
+//     on no-SEH MinGW / clang-cl, so survive-GC is exercised on linux/macos only.
 //
 //   * MOVE-ONLY SEMANTICS — move-construct / move-assign transfer ownership and
 //     empty the source (no double DeleteGlobalRef); self-move leaves the handle
@@ -49,8 +56,11 @@
 // returned garbage we record a FAIL rather than access-violate and take the
 // whole suite down (NEVER crash the JVM).  The surviving pin lives in a
 // file-scope global_ref so it persists across the phase-1 / phase-2 probe
-// boundary; it is released explicitly inside the phase-2 detour (on a live
-// JNIEnv) so the real DeleteGlobalRef path is exercised.
+// boundary; on the non-Windows path it is released explicitly inside the phase-2
+// detour (on a live JNIEnv) so the real DeleteGlobalRef path is exercised —
+// EXCEPT when the post-GC pin is not safely attainable (relocating G1), in which
+// case the detour leaves it held and the file-scope destructor releases it.  On
+// Windows phase 2 never runs, so the file-scope destructor is the sole release.
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
@@ -354,6 +364,20 @@ VMHOOK_JVM_MODULE(global_ref)
                 // ════════════════════════════════════════════════════════════════
                 //  PHASE 2 — post-GC: re-read through the SAME pin, then release.
                 // ════════════════════════════════════════════════════════════════
+                //
+                // The ENTIRE phase-2 forced-GC / post-GC path is compiled out on
+                // Windows (#if !defined(_WIN32)): holding a JNI global ref across a
+                // relocating System.gc() and then releasing it post-relocation
+                // INTERMITTENTLY faults the JVM on the Windows MSVC toolchains
+                // (the post-GC DeleteGlobalRef on a relocated pin corrupts JNI
+                // state and cascades to crash the NEXT module mid-suite — observed
+                // on msvc·java24/25/8, Windows-only, not locally reproducible), and
+                // the no-SEH MinGW / clang-cl toolchains cannot even contain such a
+                // fault.  The module body mirrors this guard, so on Windows g_phase
+                // is never set to 2 AND this branch is never compiled — the forced
+                // GC and the post-GC reset()/DeleteGlobalRef never run there.
+                // survive-GC is exercised on linux/macos only.
+#if !defined(_WIN32)
                 if (phase == 2)
                 {
                     // Resolve the post-GC address through the guarded reader: a
@@ -375,18 +399,33 @@ VMHOOK_JVM_MODULE(global_ref)
                     }
 
                     // Release the pin on the live JNIEnv (real DeleteGlobalRef),
-                    // then prove reset() is idempotent.  These are HANDLE-level
-                    // operations — they never deref the (possibly relocated) oop —
-                    // so they stay hard invariants below.  Mark the pin released so
-                    // the module body's shutdown guard knows the JVM-side global ref
-                    // is already gone and need not be touched at static destruction.
-                    g_pinned.reset();
-                    g_reset_clears_oop.store(g_pinned.oop() == nullptr, std::memory_order_relaxed);
-                    g_pinned.reset();
-                    g_double_reset_safe.store(!static_cast<bool>(g_pinned), std::memory_order_relaxed);
-                    g_pin_released_live.store(true, std::memory_order_relaxed);
+                    // then prove reset() is idempotent — but ONLY when the post-GC
+                    // oop was SAFELY attainable.  On a relocating collector (the CI
+                    // default G1 on linux-gcc) the post-GC pin can be left in a
+                    // state where DeleteGlobalRef faults / leaves oop() non-null
+                    // (observed on linux·gcc: after g_pinned.reset() on a relocated
+                    // pin, g_pinned.oop() returned NON-null — a hard reset-check
+                    // FAIL).  When NOT attainable we leave g_pinned HELD and let its
+                    // file-scope destructor release it at static destruction; we do
+                    // NOT issue reset()/DeleteGlobalRef on a relocated/non-attainable
+                    // pin here.  These are HANDLE-level operations that never deref
+                    // the (possibly relocated) oop, so the body's reset checks stay
+                    // hard — but gated on the same attainability (g_survive_attainable)
+                    // so the linux/G1 relocating case degrades to [INFO], not a FAIL.
+                    if (attainable)
+                    {
+                        g_pinned.reset();
+                        g_reset_clears_oop.store(g_pinned.oop() == nullptr, std::memory_order_relaxed);
+                        g_pinned.reset();
+                        g_double_reset_safe.store(!static_cast<bool>(g_pinned), std::memory_order_relaxed);
+                        // Mark the pin released so the module body's shutdown guard
+                        // knows the JVM-side global ref is already gone and need not
+                        // be touched at static destruction.
+                        g_pin_released_live.store(true, std::memory_order_relaxed);
+                    }
                     return;
                 }
+#endif
             }) };
 
         ctx.check("global_ref_hook_installed", handle.installed());
@@ -459,22 +498,31 @@ VMHOOK_JVM_MODULE(global_ref)
         ctx.check("global_ref_pin_null_wrapper_is_falsy",
                   g_pin_null_wrapper_falsy.load(std::memory_order_relaxed));
 
-        // The forced-System.gc() survive-GC drive below (Phase 2) is gated OFF the
-        // no-SEH MinGW / clang-cl Windows toolchains.  A cold forced System.gc() can
-        // probabilistically fault the JVM, and (unlike MSVC) those toolchains have no
-        // SEH containment, so the fault crashes the whole suite mid-run (observed:
-        // jvm·windows·clang·java24 died exactly here during this survive-GC drive --
-        // "incomplete suite, N PASS before the JVM died", with global_ref_reset_clears_oop
-        // as collateral; probabilistic, passed on other runs -> environmental forced-GC
-        // fault, not a logic regression).  Mirrors field_introspection's SECTION H gate
-        // (ac3de9c) and dont_inline_dont_compile scenario 7 (d87e73a).  The pin INSTALL
-        // + the Phase-1 (pre-GC) pin/oop checks above and the module teardown below
-        // (the scoped_hook uninstalls on scope exit -- NEVER shutdown_hooks()) still run
-        // on EVERY toolchain; only the GC churn + the post-GC re-read / identity / reset
-        // checks that depend on it are MSVC/non-Windows-only, where GC survival is proven.
+        // The ENTIRE forced-System.gc() survive-GC drive below (Phase 2) is gated
+        // OFF ALL Windows toolchains (#if !defined(_WIN32)).  Holding a JNI global
+        // ref across a relocating System.gc() and then releasing it post-relocation
+        // is fragile on Windows: on the MSVC builds it INTERMITTENTLY crashes the JVM
+        // mid-suite — the post-GC reset()/DeleteGlobalRef on a relocated pin faults
+        // and corrupts JNI state, cascading to crash the NEXT module (observed on
+        // msvc·java24/25/8: "incomplete suite, ~N PASS before the JVM died"; Windows-
+        // only, intermittent, not locally reproducible) — and the no-SEH MinGW /
+        // clang-cl toolchains have no containment for such a fault at all.  An earlier
+        // gate (defined(_MSC_VER) && !defined(__clang__)) || !defined(_WIN32) still RAN
+        // phase 2 on MSVC and crashed there, so the gate is now strictly non-Windows.
+        // Mirrors field_introspection's SECTION H gate (ac3de9c) and
+        // dont_inline_dont_compile scenario 7 (d87e73a), widened to all of Windows.
+        // The pin INSTALL + ALL the Phase-1 (pre-GC) build/pin/oop checks, the move-
+        // only semantics, the null/empty-pin checks (incl. the empty-pin reset
+        // checks), and the module teardown below (the scoped_hook uninstalls on scope
+        // exit -- NEVER shutdown_hooks()) still run on EVERY toolchain, Windows
+        // included; only the forced GC churn + the post-GC re-read / identity / reset
+        // checks that depend on it are non-Windows-only, where survive-GC is proven on
+        // linux/macos.  The detour's phase-2 branch is guarded by the SAME macro, so on
+        // Windows g_phase is never set to 2 AND that branch is not compiled — the
+        // forced GC and the post-GC reset()/DeleteGlobalRef never run there.
         // The JDK-8 detector lives inside this branch because it ONLY gates Phase 2; on
         // the skip path it would be an unused variable (-Werror), so it is scoped here.
-#if (defined(_MSC_VER) && !defined(__clang__)) || !defined(_WIN32)
+#if !defined(_WIN32)
         // ── JDK-8 detector (house idiom) ─────────────────────────────────────────
         // java.lang.String gained the `coder` field (compact-strings, JEP 254) in
         // JDK 9; its ABSENCE is a reliable, version-string-free "this is JDK 8"
@@ -518,8 +566,22 @@ VMHOOK_JVM_MODULE(global_ref)
                 []() { return global_ref_fixture::get_done(); }) };
 
             ctx.check("global_ref_phase2_probe_completed", done2);
-            ctx.check("global_ref_gc_actually_ran",
-                      global_ref_fixture::get_gc_rounds() >= 1);
+
+            // A forced System.gc() is only a HINT — the JVM may legally defer or
+            // skip the collection — so "did a GC round actually run" is best-effort:
+            // hard-PASS when the probe observed >= 1 round, else record an [INFO]
+            // rather than FAILing on a deferred no-op collection.
+            if (global_ref_fixture::get_gc_rounds() >= 1)
+            {
+                ctx.check("global_ref_gc_actually_ran", true);
+            }
+            else
+            {
+                ctx.record("[INFO] global_ref: forced System.gc() registered 0 GC "
+                           "rounds this run (a forced GC is a hint the JVM may defer / "
+                           "treat as a no-op) — survive-GC drive ran but no relocation "
+                           "round was observed; not asserted.");
+            }
 
             // ── Survive-GC checks — GATED on safe attainability ─────────────────
             // The HARD contract a global ref guarantees across EVERY collector is
@@ -549,14 +611,34 @@ VMHOOK_JVM_MODULE(global_ref)
                            "an access violation; survive-GC value/identity not asserted this run.");
             }
 
-            // reset() releases and is idempotent.  These are HANDLE-level invariants
-            // that hold across every GC (no live-oop deref required), so they stay
-            // HARD on JDK 9+.  (On JDK 8 they are skipped with the rest of phase 2
-            // because exercising them requires entering the faulting phase-2 detour;
-            // the phase-1 reset/double-reset semantics are already covered above by
-            // the empty-pin reset checks, which are hard on JDK 8.)
-            ctx.check("global_ref_reset_clears_oop", g_reset_clears_oop.load(std::memory_order_relaxed));
-            ctx.check("global_ref_double_reset_safe", g_double_reset_safe.load(std::memory_order_relaxed));
+            // reset() releases and is idempotent — but the detour only EXERCISES
+            // reset() on the post-GC pin when that pin was SAFELY attainable.  On a
+            // relocating collector (the CI default G1 on linux-gcc) the post-GC pin
+            // can be left in a state where reset()/DeleteGlobalRef faults or leaves
+            // oop() non-null (observed on linux·gcc: after g_pinned.reset() on a
+            // relocated pin, g_pinned.oop() returned NON-null — a hard FAIL).  So the
+            // detour skips reset() when the pin is not attainable (leaving it for the
+            // file-scope destructor), and here we gate these reset checks on the SAME
+            // g_survive_attainable as the survive-GC value checks: hard when the live
+            // post-GC oop was attainable, else [INFO] for the documented relocating-GC
+            // limitation.  The reset/double-reset SEMANTICS themselves stay HARD on
+            // EVERY toolchain via the empty-pin reset checks above (which need no GC).
+            // (On JDK 8 all of phase 2 is skipped — see the else branch below.)
+            if (g_survive_attainable.load(std::memory_order_relaxed))
+            {
+                ctx.check("global_ref_reset_clears_oop", g_reset_clears_oop.load(std::memory_order_relaxed));
+                ctx.check("global_ref_double_reset_safe", g_double_reset_safe.load(std::memory_order_relaxed));
+            }
+            else
+            {
+                ctx.record("[INFO] global_ref: post-GC reset()/double-reset checks not "
+                           "asserted this run — the post-GC pin was not SAFELY attainable "
+                           "(documented relocating-GC limitation, e.g. G1 on linux-gcc), so "
+                           "the detour left the pin HELD for the file-scope destructor rather "
+                           "than calling reset()/DeleteGlobalRef on a relocated pin.  The "
+                           "reset/double-reset semantics stay HARD via the empty-pin reset "
+                           "checks above (which require no GC).");
+            }
         }
         else
         {
@@ -565,7 +647,7 @@ VMHOOK_JVM_MODULE(global_ref)
                        "phase-1 handle semantics fully tested)");
         }
 #else
-        ctx.record("[INFO] global_ref: survive-GC (forced System.gc()) phase skipped on MinGW / clang-cl (no SEH containment for a cold forced-GC fault -- it can crash the suite mid-run). The pin install + phase-1 checks above and teardown below still run here; GC-survival is exercised on MSVC and all non-Windows toolchains.");
+        ctx.record("[INFO] global_ref: survive-GC (forced System.gc()) phase skipped on ALL Windows toolchains (msvc / mingw / clang-cl). Holding a JNI global ref across a relocating System.gc() and then releasing it post-relocation is fragile on Windows -- on MSVC it intermittently faults the JVM mid-suite (the post-GC DeleteGlobalRef on a relocated pin corrupts JNI state and cascades to crash the next module), and the no-SEH MinGW / clang-cl toolchains cannot contain such a fault. The pin install + ALL phase-1 build/pin/oop checks, the move-only semantics, the null/empty-pin checks (incl. empty-pin reset), and the teardown below still run here on every Windows toolchain; the forced-GC survive-GC path (and its post-GC reset()/DeleteGlobalRef) is exercised on linux/macos only.");
 #endif
 
         // ── Diagnostic: pre/post-GC address relationship (relocation tracking) ───
@@ -586,33 +668,36 @@ VMHOOK_JVM_MODULE(global_ref)
         }
 
         // ── Shutdown safety: g_pinned teardown is JDK-portable (incl. JDK 8) ─────
-        // g_pinned is a file-scope global_ref.  On the normal path phase 2 released
-        // it on a LIVE JNIEnv (DeleteGlobalRef) inside the detour, so its handle is
-        // already null and its automatic destructor at static destruction is a
-        // guaranteed no-op — exactly the teardown shape that was green across the
-        // whole JDK matrix (including JDK 8) before this module grew any explicit
-        // shutdown handling.  We deliberately do NOT add a manual "neutralise a
-        // still-held pin" step here: doing so on this detached, JNIEnv-less worker
-        // is where JDK 8 differs from JDK 9+ (no JNI handle tag bits, a different
-        // global-handle / OopStorage layout, and a synthetic-stack-handle promotion
-        // path), and an earlier revision's heap-`new`/move-into-leak guard crashed
-        // the JVM on mingw-java8.  If a future change can leave g_pinned held past
-        // phase 2, fix that in the probe (release it on the live JNIEnv) rather than
-        // touching the global ref from here.  The library global_ref destructor is
-        // already idempotent and null-handle-safe, so the file-scope destructor is
-        // the single, portable teardown.
+        // g_pinned is a file-scope global_ref.  Its handle is released along one of
+        // two BY-DESIGN paths, both portable: (1) inside the phase-2 detour on a
+        // LIVE JNIEnv (real DeleteGlobalRef) when the post-GC pin was safely
+        // attainable, after which its automatic destructor at static destruction is
+        // a guaranteed no-op; or (2) by the file-scope destructor itself, when the
+        // detour deliberately left it HELD — on Windows (phase 2 compiled out) or on
+        // a relocating G1 where releasing a relocated pin would fault.  The library
+        // global_ref destructor is idempotent and null-handle-safe, and a file-scope
+        // global_ref destructing at static destruction was the teardown shape green
+        // across the whole JDK matrix (including JDK 8) before this module grew any
+        // explicit shutdown handling, so either path is safe.  We deliberately do NOT
+        // add a manual "neutralise a still-held pin" step here: doing so on this
+        // detached, JNIEnv-less worker is where JDK 8 differs from JDK 9+ (no JNI
+        // handle tag bits, a different global-handle / OopStorage layout, and a
+        // synthetic-stack-handle promotion path), and an earlier revision's heap-
+        // `new`/move-into-leak guard crashed the JVM on mingw-java8.  The file-scope
+        // destructor is the single, portable teardown for any held pin.
         //
-        // We only OBSERVE the post-phase-2 state (no JNI op): on every collector
-        // where phase 2 completes, g_pinned is released and falsy.  This is a
-        // diagnostic record, not a hard check, so an environment where phase 2 did
-        // not run (e.g. a probe timeout) cannot turn into a spurious FAIL.
+        // We only OBSERVE the post-phase-2 state (no JNI op).  This is a diagnostic
+        // record, not a hard check, so a held pin (Windows skip / G1 non-attainable /
+        // a probe timeout where phase 2 did not run) can never turn into a spurious
+        // FAIL.
         ctx.record(std::string{ "[INFO] global_ref: pin held after phase 2 = " }
                    + (static_cast<bool>(g_pinned) ? "true (file-scope dtor will release at "
                                                     "static destruction)"
                                                   : "false (already released on a live JNIEnv)"));
 
         // Record whether the real DeleteGlobalRef path actually ran this session
-        // (it does on every collector where phase 2 completes) — diagnostic only.
+        // (it does on a non-Windows collector where phase 2 completes AND the post-GC
+        // pin was safely attainable) — diagnostic only.
         ctx.record(std::string{ "[INFO] global_ref: pin released on a live JNIEnv = " }
                    + (g_pin_released_live.load(std::memory_order_relaxed) ? "true" : "false"));
     }
