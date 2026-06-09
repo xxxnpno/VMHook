@@ -221,6 +221,35 @@ namespace
     // Non-corruption: a value-returning call AFTER all the loops.
     std::atomic<std::int64_t> g_post_loop_echo{ k_uncaptured };
 
+    // ── STATIC-METHOD-VIA-INSTANCE-PROXY regression (the CI-failure bug) ──
+    // A static method resolved through an INSTANCE wrapper's get_method("..")
+    // yields a proxy whose this->object is the live receiver but whose Method*
+    // is ACC_STATIC.  Before the fix, call()/call_jni keyed static-ness solely
+    // on `object == nullptr`, so it mis-classified these as INSTANCE calls:
+    //   * call_jni -> GetObjectClass + GetMethodID (which does NOT resolve
+    //     static methods) -> null id -> monostate (wrong result), and on JVMs
+    //     where it did resolve, the live receiver was bound as the static
+    //     method's FIRST declared arg -> corrupted result + poisoned JNI
+    //     exception state (which let a sibling module's uncaught exception
+    //     escape and kill the JVM).
+    //   * call (call_stub) -> prepends the receiver as locals[0], shifting
+    //     every real argument down one slot -> wrong arithmetic.
+    // The fix treats the call as static when object==nullptr OR is_static().
+    // These sentinels are recognizable and INDEPENDENT of the receiver, so a
+    // correct value can only come from a true static dispatch.
+    std::atomic<std::int64_t> g_svia_ret_int{ k_uncaptured };      // sRetInt() == INT_MIN
+    std::atomic<std::int64_t> g_svia_echo_int{ k_uncaptured };     // sEchoInt(v) == v
+    std::atomic<std::int64_t> g_svia_sum_ild{ k_uncaptured };      // sSumILD(i,j,d)
+    std::atomic<std::int64_t> g_svia_echo_sig{ k_uncaptured };     // via (name,sig) overload
+    std::atomic<int>          g_svia_is_static{ -1 };              // proxy.is_static() == true
+    std::atomic<int>          g_svia_has_receiver{ -1 };           // proxy receiver OOP != 0
+    // Proof the receiver survives a static-via-instance dispatch unharmed: an
+    // ordinary INSTANCE call performed immediately AFTER must still be correct.
+    std::atomic<std::int64_t> g_svia_followup_inst_echo{ k_uncaptured };
+    // Sentinels for the static-via-instance regression.
+    constexpr std::int64_t k_svia_echo  = static_cast<std::int64_t>(0x6E5D4C3BLL); // 1851877947
+    constexpr std::int32_t k_svia_follow = 0x2BCD16E0;
+
     // Sentinels (mirror the fixture's boundary values).
     constexpr std::int64_t k_int_ret    = 0x0BADF00DLL;            // 195948557
     constexpr std::int64_t k_long_ret   = static_cast<std::int64_t>(0x0123456789ABCDEFLL);
@@ -517,6 +546,68 @@ namespace
                 g_post_loop_echo.store(r);
             }
         }
+
+        // ═════════ STATIC METHOD resolved through the INSTANCE wrapper ═════════
+        // get_method("sX") on the instance `s` returns a proxy bound to the live
+        // receiver (this->object != null) whose Method* is ACC_STATIC.  These
+        // calls reproduce the CI-failure bug exactly; the asserted results below
+        // would be wrong (or monostate, and the JVM possibly torn down) before
+        // the call()/call_jni static-detection fix.
+        {
+            // No-arg static via instance proxy: sRetInt() == Integer.MIN_VALUE.
+            // Under the bug this took the instance path (GetMethodID can't see a
+            // static -> monostate -> 0), so a correct -2147483648 proves static
+            // dispatch fired off the Method's declaring class, not the receiver.
+            auto p_ret{ s.get_method("sRetInt") };
+            if (p_ret.has_value())
+            {
+                g_svia_is_static.store(p_ret->is_static() ? 1 : 0);
+                // The proxy MUST still carry the receiver OOP (that's the whole
+                // point — it came from an instance wrapper); the fix must make it
+                // dispatch static *despite* a non-null receiver.
+                g_svia_has_receiver.store(p_ret->get_compressed_oop() != 0u ? 1 : 0);
+                g_svia_ret_int.store(static_cast<std::int32_t>(p_ret->call()));
+            }
+
+            // Single-arg static via instance proxy: sEchoInt(v) == v.  This is the
+            // sharpest discriminator for the "receiver bound as first arg" mis-
+            // dispatch: if the live instance were pinned into slot 0 / arg 0, the
+            // echoed value would be the receiver's bits, never our sentinel.
+            auto p_echo{ s.get_method("sEchoInt") };
+            if (p_echo.has_value())
+            {
+                g_svia_echo_int.store(static_cast<std::int32_t>(p_echo->call(
+                    static_cast<std::int32_t>(k_svia_echo))));
+            }
+
+            // Multi-arg (I,J,D) static via instance proxy: a receiver shift would
+            // corrupt every two-slot argument, so the exact arithmetic sum is a
+            // strong proof the argument block was laid out with NO receiver.
+            auto p_sum{ s.get_method("sSumILD") };
+            if (p_sum.has_value())
+            {
+                g_svia_sum_ild.store(static_cast<std::int64_t>(
+                    p_sum->call(k_sum_i, k_sum_j, k_sum_d)));
+            }
+
+            // The (name, signature) instance overload must behave identically.
+            auto p_sig{ s.get_method("sEchoInt", "(I)I") };
+            if (p_sig.has_value())
+            {
+                g_svia_echo_sig.store(static_cast<std::int32_t>(p_sig->call(
+                    static_cast<std::int32_t>(k_svia_echo))));
+            }
+
+            // Non-corruption: an ordinary INSTANCE call AFTER the static-via-
+            // instance dispatches must still deliver its argument intact (proves
+            // the receiver/JNI state was not poisoned by the static calls).
+            auto p_follow{ s.get_method("echoInt") };
+            if (p_follow.has_value())
+            {
+                g_svia_followup_inst_echo.store(
+                    static_cast<std::int32_t>(p_follow->call(k_svia_follow)));
+            }
+        }
     }
 }
 
@@ -727,5 +818,39 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
         // ═════════════════════ NON-CORRUPTION after the loops ═════════════════
         // A value-returning call after hundreds of JNI dispatches still works.
         ctx.check("mcj_post_loop_echo_value", g_post_loop_echo.load() == k_post_echo);
+
+        // ═════════ STATIC METHOD via INSTANCE PROXY (CI-failure regression) ════
+        // The bug: call()/call_jni decided static-vs-instance from
+        // `this->object == nullptr` alone, so a static Method resolved through an
+        // instance wrapper's get_method("..") (non-null receiver) was dispatched
+        // as an instance call — wrong result AND corrupted JNI exception state.
+        // The fix dispatches static whenever object==nullptr OR is_static().
+        // These assertions FAIL on the pre-fix header (monostate/0 on the JNI
+        // path, receiver-shifted arithmetic on the call_stub path) and PASS now,
+        // on BOTH dispatch paths.
+
+        // The proxy is genuinely a static method that nevertheless carries the
+        // receiver (so the fix has to override a non-null `object`).
+        ctx.check("mcj_svia_proxy_is_static", g_svia_is_static.load() == 1);
+        ctx.check("mcj_svia_proxy_has_receiver", g_svia_has_receiver.load() == 1);
+
+        // No-arg static via instance proxy returns the real static value.
+        ctx.check("mcj_svia_no_arg_static_returns_int_min",
+                  g_svia_ret_int.load() == -2147483648LL);
+        // Single-arg static via instance proxy echoes the sentinel — proves the
+        // receiver was NOT bound as the static method's first argument.
+        ctx.check("mcj_svia_single_arg_static_echo_passthrough",
+                  g_svia_echo_int.load() == k_svia_echo);
+        // Multi-arg (I,J,D) static via instance proxy: exact sum proves the arg
+        // block had no phantom receiver slot.
+        ctx.check("mcj_svia_multi_arg_static_return_correct",
+                  g_svia_sum_ild.load() == expected_sum);
+        // The (name, signature) instance overload behaves identically.
+        ctx.check("mcj_svia_sig_overload_static_echo_passthrough",
+                  g_svia_echo_sig.load() == k_svia_echo);
+        // And an ordinary INSTANCE call performed right after the static-via-
+        // instance dispatches still works — the receiver / JNI state survived.
+        ctx.check("mcj_svia_followup_instance_call_intact",
+                  g_svia_followup_inst_echo.load() == k_svia_follow);
     }
 }
