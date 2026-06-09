@@ -78,39 +78,21 @@ namespace
     public:
         explicit box_integer(vmhook::oop_t instance) noexcept
             : vmhook::object<box_integer>{ instance } {}
-        auto int_value() -> std::int32_t
-        {
-            const auto m{ get_method("intValue") };
-            if (!m.has_value()) { return 0; }
-            const std::int32_t v = m->call();
-            return v;
-        }
+        auto int_value() -> std::int32_t { return get_method("intValue")->call(); }
     };
     class box_long : public vmhook::object<box_long>
     {
     public:
         explicit box_long(vmhook::oop_t instance) noexcept
             : vmhook::object<box_long>{ instance } {}
-        auto long_value() -> std::int64_t
-        {
-            const auto m{ get_method("longValue") };
-            if (!m.has_value()) { return 0; }
-            const std::int64_t v = m->call();
-            return v;
-        }
+        auto long_value() -> std::int64_t { return get_method("longValue")->call(); }
     };
     class box_double : public vmhook::object<box_double>
     {
     public:
         explicit box_double(vmhook::oop_t instance) noexcept
             : vmhook::object<box_double>{ instance } {}
-        auto double_value() -> double
-        {
-            const auto m{ get_method("doubleValue") };
-            if (!m.has_value()) { return 0.0; }
-            const double v = m->call();
-            return v;
-        }
+        auto double_value() -> double { return get_method("doubleValue")->call(); }
     };
 
     // Wrapper for vmhook.fixtures.ReturnTypes.  The handshake accessors are STATIC
@@ -131,120 +113,35 @@ namespace
         static auto get_done() -> bool            { return static_field("done")->get(); }
 
         // ---- published OOP identities (for the reference cross-checks) ----
-        static auto object_identity() -> std::int32_t
-        {
-            const auto fp{ static_field("objectIdentity") };
-            if (!fp.has_value()) { return 0; }
-            const std::int32_t v = fp->get();
-            return v;
-        }
+        static auto object_identity() -> std::int32_t { return static_field("objectIdentity")->get(); }
 
         // ---- primitive return decoders (copy-init the value_t into the type) ----
-        auto call_bool(const char* name) -> bool
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return false; }
-            const bool v = m->call();
-            return v;
-        }
-        auto call_i8(const char* name) -> std::int8_t
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return 0; }
-            const std::int8_t v = m->call();
-            return v;
-        }
+        auto call_bool(const char* name) -> bool { return get_method(name)->call(); }
+        auto call_i8(const char* name) -> std::int8_t { return get_method(name)->call(); }
         // B/S read into a WIDER int to prove sign-extension of the narrow return.
-        auto call_i8_as_int(const char* name) -> std::int32_t
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return 0; }
-            const std::int32_t v = m->call();
-            return v;
-        }
-        auto call_i16(const char* name) -> std::int16_t
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return 0; }
-            const std::int16_t v = m->call();
-            return v;
-        }
-        auto call_i16_as_int(const char* name) -> std::int32_t
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return 0; }
-            const std::int32_t v = m->call();
-            return v;
-        }
+        auto call_i8_as_int(const char* name) -> std::int32_t { return get_method(name)->call(); }
+        auto call_i16(const char* name) -> std::int16_t { return get_method(name)->call(); }
+        auto call_i16_as_int(const char* name) -> std::int32_t { return get_method(name)->call(); }
         // C read into an int proves ZERO-extension (unsigned char).
         auto call_char_as_int(const char* name) -> std::int32_t
         {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return -1; }
-            const std::uint16_t raw = m->call();
+            const std::uint16_t raw = get_method(name)->call();
             return static_cast<std::int32_t>(raw);
         }
-        auto call_i32(const char* name) -> std::int32_t
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return 0; }
-            const std::int32_t v = m->call();
-            return v;
-        }
-        auto call_i64(const char* name) -> std::int64_t
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return 0; }
-            const std::int64_t v = m->call();
-            return v;
-        }
-        auto call_float(const char* name) -> float
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return 0.0f; }
-            const float v = m->call();
-            return v;
-        }
-        auto call_double(const char* name) -> double
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return 0.0; }
-            const double v = m->call();
-            return v;
-        }
+        auto call_i32(const char* name) -> std::int32_t { return get_method(name)->call(); }
+        auto call_i64(const char* name) -> std::int64_t { return get_method(name)->call(); }
+        auto call_float(const char* name) -> float { return get_method(name)->call(); }
+        auto call_double(const char* name) -> double { return get_method(name)->call(); }
 
         // ---- String return decode: as_string() (NOT a cast / brace-init) ----
-        auto call_string(const char* name) -> std::string
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return std::string{ "<<no-method>>" }; }
-            return m->call().as_string();
-        }
+        auto call_string(const char* name) -> std::string { return get_method(name)->call().as_string(); }
 
         // ---- introspection: is_void() / is_string() on the returned value_t ----
-        auto call_is_void(const char* name) -> bool
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return false; }
-            const auto result{ m->call() };
-            return result.is_void();
-        }
-        auto call_is_string(const char* name) -> bool
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return false; }
-            const auto result{ m->call() };
-            return result.is_string();
-        }
+        auto call_is_void(const char* name) -> bool { return get_method(name)->call().is_void(); }
+        auto call_is_string(const char* name) -> bool { return get_method(name)->call().is_string(); }
 
         // ---- void return: must decode to monostate (is_void() true) ----
-        auto call_void_is_void(const char* name) -> bool
-        {
-            const auto m{ get_method(name) };
-            if (!m.has_value()) { return false; }
-            const auto result{ m->call() };   // decodes V -> monostate
-            return result.is_void();
-        }
+        auto call_void_is_void(const char* name) -> bool { return get_method(name)->call().is_void(); }
 
         // ---- reference return -> raw decoded array/object OOP (void* path).
         //      value_t -> void* runs decode_oop_pointer, recovering the full 64-bit
