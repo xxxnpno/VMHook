@@ -93,16 +93,7 @@ namespace
         }
 
         // ---- acquire the published SINGLETON instance wrapper ----
-        static auto singleton() -> std::unique_ptr<llp>
-        {
-            const auto proxy{ static_field("SINGLETON") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<llp> ptr = proxy->get();   // copy-init from value_t
-            return ptr;
-        }
+        static auto singleton() -> std::unique_ptr<llp> { return static_field("SINGLETON")->get(); }
 
         // ---- path (1): the documented value_t::to_vector user path ----
         auto words_via_value_to_vector() const -> std::vector<std::unique_ptr<str_elem>>

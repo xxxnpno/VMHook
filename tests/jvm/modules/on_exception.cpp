@@ -111,21 +111,9 @@ namespace
             return static_field(name).has_value();
         }
 
-        // Java-observable witnesses (copy-init out of value_t — never brace-init).
-        static auto throws_observed() -> std::int32_t
-        {
-            const auto p{ static_field("throwsObserved") };
-            if (!p.has_value()) { return -1; }
-            const std::int32_t v = p->get();
-            return v;
-        }
-        static auto last_throw_kind() -> std::int32_t
-        {
-            const auto p{ static_field("lastThrowKind") };
-            if (!p.has_value()) { return -1; }
-            const std::int32_t v = p->get();
-            return v;
-        }
+        // Java-observable witnesses.
+        static auto throws_observed() -> std::int32_t  { return static_field("throwsObserved")->get(); }
+        static auto last_throw_kind() -> std::int32_t { return static_field("lastThrowKind")->get(); }
     };
 
     // Drive one probe cycle for `mode`: clear the latched `done` and program the

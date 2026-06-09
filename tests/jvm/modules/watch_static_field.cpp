@@ -77,16 +77,7 @@ namespace
         static auto resolves(const char* name) -> bool { return static_field(name).has_value(); }
 
         // ---- read a watched counter's current value (Java's own view) ----
-        static auto counter(const char* name) -> std::int32_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = proxy->get();   // copy-init (MSVC-unambiguous)
-            return v;
-        }
+        static auto counter(const char* name) -> std::int32_t { return static_field(name)->get(); }
 
         static auto get_writes_made() -> std::int32_t
         {

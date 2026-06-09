@@ -62,31 +62,11 @@ namespace
         // handshake (static fields on the fixture, not on B) — resolved via the
         // fixture wrapper below, so nothing here.
 
-        // B's OWN field (super walk depth 0).  Guards has_value() so a name typo
-        // or resolution failure is a recordable sentinel, never an optional UB.
-        // COPY-init the value_t (=) to stay MSVC-unambiguous.
-        auto b_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("bInt") };
-            if (!fp.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = fp->get();
-            return v;
-        }
+        // B's OWN field (super walk depth 0).
+        auto b_int() const -> std::int32_t { return get_field("bInt")->get(); }
 
         // INHERITED protected field declared on A (super walk depth 1 from B).
-        auto protected_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("protectedInt") };
-            if (!fp.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = fp->get();
-            return v;
-        }
+        auto protected_int() const -> std::int32_t { return get_field("protectedInt")->get(); }
 
         // INHERITED protected method declared on A — found via the super walk on
         // B's klass.  call() result COPY-init'd.  Caller gates on the call gate.
@@ -112,16 +92,7 @@ namespace
             : vmhook::object<pi_a>{ instance }
         {
         }
-        auto protected_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("protectedInt") };
-            if (!fp.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = fp->get();
-            return v;
-        }
+        auto protected_int() const -> std::int32_t { return get_field("protectedInt")->get(); }
     };
 
     // ---- Wrapper registered to the FIXTURE class, owning the go/done

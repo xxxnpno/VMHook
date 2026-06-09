@@ -78,16 +78,7 @@ namespace
         }
 
         // ---- enum-body instance field ----
-        auto get_rgb() const -> std::int32_t
-        {
-            const auto proxy{ get_field("rgb") };
-            if (!proxy.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = proxy->get();
-            return v;
-        }
+        auto get_rgb() const -> std::int32_t { return get_field("rgb")->get(); }
 
         auto rgb_resolves() const -> bool { return get_field("rgb").has_value(); }
 
@@ -120,17 +111,7 @@ namespace
 
         // ---- decode one of the enum's own synthetic constant statics ----
         // RED/GREEN/BLUE are `public static final Color NAME` on the Color klass.
-        static auto acquire_constant(const char* name) -> std::unique_ptr<enum_color>
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            // Copy-init value_t -> unique_ptr<enum_color> (never brace-init).
-            std::unique_ptr<enum_color> ptr = proxy->get();
-            return ptr;
-        }
+        static auto acquire_constant(const char* name) -> std::unique_ptr<enum_color> { return static_field(name)->get(); }
 
         static auto constant_resolves(const char* name) -> bool
         {
@@ -166,56 +147,20 @@ namespace
         static auto set_mode(std::int32_t m) -> void { static_field("mode")->set(m); }
 
         // ---- acquire the published holder SINGLETON ----
-        static auto acquire_singleton() -> std::unique_ptr<enum_holder>
-        {
-            const auto proxy{ static_field("SINGLETON") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<enum_holder> ptr = proxy->get();
-            return ptr;
-        }
+        static auto acquire_singleton() -> std::unique_ptr<enum_holder> { return static_field("SINGLETON")->get(); }
 
         // ---- INSTANCE enum-reference field -> enum_color singleton ----
-        auto get_favorite_color() const -> std::unique_ptr<enum_color>
-        {
-            const auto proxy{ get_field("favoriteColor") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<enum_color> ptr = proxy->get();
-            return ptr;
-        }
+        auto get_favorite_color() const -> std::unique_ptr<enum_color> { return get_field("favoriteColor")->get(); }
 
         auto favorite_color_resolves() const -> bool { return get_field("favoriteColor").has_value(); }
 
         // ---- STATIC enum-reference field -> enum_color singleton ----
-        static auto get_static_color() -> std::unique_ptr<enum_color>
-        {
-            const auto proxy{ static_field("staticColor") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<enum_color> ptr = proxy->get();
-            return ptr;
-        }
+        static auto get_static_color() -> std::unique_ptr<enum_color> { return static_field("staticColor")->get(); }
 
         static auto static_color_resolves() -> bool { return static_field("staticColor").has_value(); }
 
         // ---- Java-side witnesses published by the probe action ----
-        static auto seen_int(const char* name) -> std::int32_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = proxy->get();
-            return v;
-        }
+        static auto seen_int(const char* name) -> std::int32_t { return static_field(name)->get(); }
     };
 
     // Drive one probe cycle for `mode`: clears the latched `done` and programs

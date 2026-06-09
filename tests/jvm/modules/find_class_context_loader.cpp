@@ -144,13 +144,7 @@ namespace
         {
             return static_field("sentinel").has_value();
         }
-        static auto sentinel() -> std::int32_t
-        {
-            const auto proxy{ static_field("sentinel") };
-            if (!proxy.has_value()) { return 0; }
-            const std::int32_t v = proxy->get();
-            return v;
-        }
+        static auto sentinel() -> std::int32_t { return static_field("sentinel")->get(); }
         static auto sentinel_via_getter() -> std::int32_t
         {
             const auto m{ static_method("getSentinel") };
@@ -158,20 +152,8 @@ namespace
             const std::int32_t v = m->call();
             return v;
         }
-        static auto observed_sentinel() -> std::int32_t
-        {
-            const auto proxy{ static_field("observedSentinel") };
-            if (!proxy.has_value()) { return 0; }
-            const std::int32_t v = proxy->get();
-            return v;
-        }
-        static auto witness_captured() -> bool
-        {
-            const auto proxy{ static_field("witnessCaptured") };
-            if (!proxy.has_value()) { return false; }
-            const bool v = proxy->get();
-            return v;
-        }
+        static auto observed_sentinel() -> std::int32_t { return static_field("observedSentinel")->get(); }
+        static auto witness_captured() -> bool { return static_field("witnessCaptured")->get(); }
     };
 
     // ── Guarded helpers (never deref a bad pointer). ──

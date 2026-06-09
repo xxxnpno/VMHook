@@ -115,28 +115,10 @@ namespace
         // Returns the published `instance` singleton as a wrapper.  Declaring a
         // static get_instance() hides the inherited instance accessor; the
         // module proves you must base-qualify to reach the raw-OOP accessor.
-        static auto get_instance() -> std::unique_ptr<wp>
-        {
-            const auto proxy{ static_field("instance") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<wp> ptr = proxy->get();   // copy-init (MSVC-safe)
-            return ptr;
-        }
+        static auto get_instance() -> std::unique_ptr<wp> { return static_field("instance")->get(); }
 
         // ---- acquire any published singleton by static field name -----------
-        static auto acquire(const char* field) -> std::unique_ptr<wp>
-        {
-            const auto proxy{ static_field(field) };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<wp> ptr = proxy->get();
-            return ptr;
-        }
+        static auto acquire(const char* field) -> std::unique_ptr<wp> { return static_field(field)->get(); }
 
         // ---- the raw wrapped OOP, via EXPLICIT base qualification -----------
         // The whole point: object_base::get_instance(), NOT the static shadow.
@@ -146,26 +128,9 @@ namespace
         }
 
         // ---- instance field reads (live-oop dispatch) ----------------------
-        auto get_iId() const -> std::int32_t
-        {
-            const auto p{ get_field("iId") };
-            if (!p.has_value()) { return -1; }
-            const std::int32_t v = p->get();
-            return v;
-        }
-        auto get_iValue() const -> std::int64_t
-        {
-            const auto p{ get_field("iValue") };
-            if (!p.has_value()) { return -1; }
-            const std::int64_t v = p->get();
-            return v;
-        }
-        auto get_iLabel() const -> std::string
-        {
-            const auto p{ get_field("iLabel") };
-            if (!p.has_value()) { return std::string{ "<<no-field>>" }; }
-            return p->get().as_string();
-        }
+        auto get_iId() const -> std::int32_t    { return get_field("iId")->get(); }
+        auto get_iValue() const -> std::int64_t { return get_field("iValue")->get(); }
+        auto get_iLabel() const -> std::string  { return get_field("iLabel")->get().as_string(); }
 
         // ---- instance method call (best-effort; needs a live JavaThread) ----
         auto call_get_id() const -> std::int64_t

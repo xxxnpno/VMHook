@@ -81,20 +81,8 @@ namespace
         static auto resolves(const char* name) -> bool { return static_field(name).has_value(); }
 
         // ---- primitive witness reads (VMStructs; safe off the Java thread) ----
-        static auto get_bool(const char* name) -> bool
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return false; }
-            const bool v = proxy->get();
-            return v;
-        }
-        static auto get_int(const char* name) -> std::int32_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return -999; }
-            const std::int32_t v = proxy->get();
-            return v;
-        }
+        static auto get_bool(const char* name) -> bool { return static_field(name)->get(); }
+        static auto get_int(const char* name) -> std::int32_t { return static_field(name)->get(); }
     };
 
     // A minimal wrapper bound to java.lang.String whose ONLY job is to carry a

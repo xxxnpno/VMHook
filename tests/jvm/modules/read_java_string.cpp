@@ -121,26 +121,8 @@ namespace
         }
 
         // ---- read a published Java cross-check int witness ----
-        static auto seen_int(const char* name) -> std::int32_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return -424242;
-            }
-            const std::int32_t v = proxy->get();
-            return v;
-        }
-        static auto seen_bool(const char* name) -> bool
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return false;
-            }
-            const bool v = proxy->get();
-            return v;
-        }
+        static auto seen_int(const char* name) -> std::int32_t { return static_field(name)->get(); }
+        static auto seen_bool(const char* name) -> bool { return static_field(name)->get(); }
     };
 
     // Fixed, JDK-independent expected UTF-8 byte sequences for each subject.

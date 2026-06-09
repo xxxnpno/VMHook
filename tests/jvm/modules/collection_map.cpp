@@ -80,24 +80,9 @@ namespace
         {
         }
 
-        auto id() const -> std::int32_t
-        {
-            const auto proxy{ get_field("id") };
-            return proxy.has_value() ? static_cast<std::int32_t>(proxy->get()) : -987654;
-        }
+        auto id() const -> std::int32_t { return static_cast<std::int32_t>(get_field("id")->get()); }
 
-        auto name() const -> std::string
-        {
-            const auto proxy{ get_field("name") };
-            if (!proxy.has_value())
-            {
-                return std::string{ "<<no-name-field>>" };
-            }
-            // Copy-init (not brace-init): value_t has a templated conversion
-            // operator, so std::string s{ proxy->get() } is ambiguous on MSVC.
-            const std::string s = proxy->get();
-            return s;
-        }
+        auto name() const -> std::string { return get_field("name")->get(); }
     };
 
     // ── Fixture wrapper: vmhook.fixtures.CollMap. ───────────────────────────

@@ -115,79 +115,19 @@ namespace
             return true;
         }
 
-        // ── typed static GETs (copy-init extraction) ──────────────────────
-        static auto get_bool(const char* name) -> bool
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return false; }
-            const bool v = proxy->get();
-            return v;
-        }
-        static auto get_i8(const char* name) -> std::int8_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return 0; }
-            const std::int8_t v = proxy->get();
-            return v;
-        }
-        static auto get_i16(const char* name) -> std::int16_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return 0; }
-            const std::int16_t v = proxy->get();
-            return v;
-        }
-        static auto get_i32(const char* name) -> std::int32_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return -1; }
-            const std::int32_t v = proxy->get();
-            return v;
-        }
-        static auto get_i64(const char* name) -> std::int64_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return -1; }
-            const std::int64_t v = proxy->get();
-            return v;
-        }
-        static auto get_u16(const char* name) -> std::uint16_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return 0; }
-            const std::uint16_t v = proxy->get();
-            return v;
-        }
-        static auto get_float(const char* name) -> float
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return 0.0F; }
-            const float v = proxy->get();
-            return v;
-        }
-        static auto get_double(const char* name) -> double
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return 0.0; }
-            const double v = proxy->get();
-            return v;
-        }
-        static auto get_string(const char* name) -> std::string
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return std::string{ "<<no-field>>" }; }
-            const std::string v = proxy->get();
-            return v;
-        }
+        // ── typed static GETs ──────────────────────────────────────────────
+        static auto get_bool(const char* name) -> bool          { return static_field(name)->get(); }
+        static auto get_i8(const char* name) -> std::int8_t      { return static_field(name)->get(); }
+        static auto get_i16(const char* name) -> std::int16_t    { return static_field(name)->get(); }
+        static auto get_i32(const char* name) -> std::int32_t    { return static_field(name)->get(); }
+        static auto get_i64(const char* name) -> std::int64_t    { return static_field(name)->get(); }
+        static auto get_u16(const char* name) -> std::uint16_t   { return static_field(name)->get(); }
+        static auto get_float(const char* name) -> float         { return static_field(name)->get(); }
+        static auto get_double(const char* name) -> double       { return static_field(name)->get(); }
+        static auto get_string(const char* name) -> std::string  { return static_field(name)->get(); }
 
         // ── acquire a published instance wrapper (instance / refA / refB / refSlot) ─
-        static auto acquire(const char* name) -> std::unique_ptr<fsg>
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value()) { return nullptr; }
-            std::unique_ptr<fsg> ptr = proxy->get();
-            return ptr;
-        }
+        static auto acquire(const char* name) -> std::unique_ptr<fsg> { return static_field(name)->get(); }
 
         // ── set an object-reference static field to a wrapper (or null) ───
         static auto set_ref(const char* name, const std::unique_ptr<fsg>& target) -> bool

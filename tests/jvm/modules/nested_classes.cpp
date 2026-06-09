@@ -81,25 +81,13 @@ namespace
         template<typename wrapper_type>
         static auto acquire(const char* name) -> std::unique_ptr<wrapper_type>
         {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<wrapper_type> ptr = proxy->get();
-            return ptr;
+            return static_field(name)->get();
         }
 
         // ---- published int (identity hashes, composite results) ------------
         static auto get_int(const char* name) -> std::int32_t
         {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = proxy->get();
-            return v;
+            return static_field(name)->get();
         }
     };
 
@@ -112,16 +100,7 @@ namespace
         {
         }
 
-        auto get_outer_field() const -> std::int32_t
-        {
-            const auto p{ get_field("outerField") };
-            if (!p.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = p->get();
-            return v;
-        }
+        auto get_outer_field() const -> std::int32_t { return get_field("outerField")->get(); }
     };
 
     // The STATIC nested class: `int value` + `int doubled()`.
@@ -133,16 +112,7 @@ namespace
         {
         }
 
-        auto get_value() const -> std::int32_t
-        {
-            const auto p{ get_field("value") };
-            if (!p.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = p->get();
-            return v;
-        }
+        auto get_value() const -> std::int32_t { return get_field("value")->get(); }
 
         // Calls the no-arg int instance method via the interpreter call gate.
         // Returns the value_t so the caller can distinguish "returned 84" from
@@ -170,29 +140,11 @@ namespace
         {
         }
 
-        auto get_inner_value() const -> std::int32_t
-        {
-            const auto p{ get_field("innerValue") };
-            if (!p.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = p->get();
-            return v;
-        }
+        auto get_inner_value() const -> std::int32_t { return get_field("innerValue")->get(); }
 
         // The synthetic outer back-reference: read the compressed OOP in the
         // `this$0` slot and decode it into a usable Host wrapper.
-        auto get_this0_host() const -> std::unique_ptr<host_w>
-        {
-            const auto p{ get_field("this$0") };
-            if (!p.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<host_w> ptr = p->get();
-            return ptr;
-        }
+        auto get_this0_host() const -> std::unique_ptr<host_w> { return get_field("this$0")->get(); }
 
         // Whether the synthetic field resolves at all (descriptor 'L...;').
         auto this0_resolves() const -> bool

@@ -80,16 +80,7 @@ namespace
         {
             return static_field("sentinel").has_value();
         }
-        static auto sentinel() -> std::int32_t
-        {
-            const auto proxy{ static_field("sentinel") };
-            if (!proxy.has_value())
-            {
-                return 0;
-            }
-            const std::int32_t v = proxy->get();
-            return v;
-        }
+        static auto sentinel() -> std::int32_t { return static_field("sentinel")->get(); }
         // Pull the sentinel back through the Java getter (static_method path).
         static auto sentinel_via_getter() -> std::int32_t
         {

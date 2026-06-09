@@ -58,63 +58,19 @@ namespace
         static auto get_done() -> bool       { return static_field("done")->get(); }
         static auto set_mode(std::int32_t m) -> void { static_field("mode")->set(m); }
 
-        // The held child instance, wrapped so we can read it.  Guard the
-        // optional: a missing/instance-mismatched field would otherwise UB on
-        // operator->.  The value_t -> unique_ptr conversion validates the OOP.
-        static auto get_instance() -> std::unique_ptr<fi_child>
-        {
-            const auto fp{ static_field("instance") };
-            if (!fp.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<fi_child> ptr = fp->get();
-            return ptr;
-        }
+        // The held child instance, wrapped so we can read it.  The value_t ->
+        // unique_ptr conversion validates the decoded OOP.
+        static auto get_instance() -> std::unique_ptr<fi_child> { return static_field("instance")->get(); }
 
         // Read the child's own / inherited fields THROUGH the child klass.
-        // Every accessor guards has_value() so a name typo / resolution failure
-        // is a recordable wrong value (sentinel), never a fatal optional deref.
-        auto own_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("childOwnInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
-        auto mid_own_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("midOwnInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
-        auto protected_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("protectedInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
-        auto public_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("publicInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
-        auto package_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("packageInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
-        auto private_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("privateInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
-        auto base_long() const -> std::int64_t
-        {
-            const auto fp{ get_field("baseLong") };
-            return fp.has_value() ? static_cast<std::int64_t>(fp->get()) : -1;
-        }
-        auto shadowed_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("shadowedInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
+        auto own_int() const -> std::int32_t       { return static_cast<std::int32_t>(get_field("childOwnInt")->get()); }
+        auto mid_own_int() const -> std::int32_t   { return static_cast<std::int32_t>(get_field("midOwnInt")->get()); }
+        auto protected_int() const -> std::int32_t { return static_cast<std::int32_t>(get_field("protectedInt")->get()); }
+        auto public_int() const -> std::int32_t    { return static_cast<std::int32_t>(get_field("publicInt")->get()); }
+        auto package_int() const -> std::int32_t   { return static_cast<std::int32_t>(get_field("packageInt")->get()); }
+        auto private_int() const -> std::int32_t   { return static_cast<std::int32_t>(get_field("privateInt")->get()); }
+        auto base_long() const -> std::int64_t     { return static_cast<std::int64_t>(get_field("baseLong")->get()); }
+        auto shadowed_int() const -> std::int32_t  { return static_cast<std::int32_t>(get_field("shadowedInt")->get()); }
     };
 
     // ---- Wrapper registered to the MID class.  Super walk starts at Mid. ---
@@ -125,21 +81,9 @@ namespace
             : vmhook::object<fi_mid>{ instance }
         {
         }
-        auto mid_own_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("midOwnInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
-        auto protected_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("protectedInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
-        auto shadowed_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("shadowedInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
+        auto mid_own_int() const -> std::int32_t   { return static_cast<std::int32_t>(get_field("midOwnInt")->get()); }
+        auto protected_int() const -> std::int32_t { return static_cast<std::int32_t>(get_field("protectedInt")->get()); }
+        auto shadowed_int() const -> std::int32_t  { return static_cast<std::int32_t>(get_field("shadowedInt")->get()); }
     };
 
     // ---- Wrapper registered to the BASE class.  Super walk starts at Base. -
@@ -156,41 +100,16 @@ namespace
         //
         // IMPORTANT: `baseInstance` is declared on the CHILD class
         // (FieldInherited), not on FieldInheritedBase — so it must be resolved
-        // through the CHILD wrapper.  Resolving it through *this* (base) wrapper
-        // would start the super walk at FieldInheritedBase and walk UP toward
-        // Object, never finding a child-declared static -> static_field() returns
-        // nullopt, and the old `static_field("baseInstance")->get()` then invoked
-        // operator-> on an EMPTY optional (undefined behaviour -> the Windows AV
-        // that truncated this whole suite).  We resolve on fi_child (the field's
-        // declaring class), guard the optional, and wrap the resulting OOP as an
-        // fi_base (the held object IS a FieldInheritedBase instance).  The
-        // value_t -> unique_ptr<fi_base> conversion validates the decoded OOP and
-        // yields nullptr for a null/garbage reference, so no bad wrapper escapes.
-        static auto get_base_instance() -> std::unique_ptr<fi_base>
-        {
-            const auto fp{ fi_child::static_field("baseInstance") };
-            if (!fp.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<fi_base> ptr = fp->get();
-            return ptr;
-        }
-        auto protected_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("protectedInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
-        auto public_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("publicInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
-        auto shadowed_int() const -> std::int32_t
-        {
-            const auto fp{ get_field("shadowedInt") };
-            return fp.has_value() ? static_cast<std::int32_t>(fp->get()) : -1;
-        }
+        // through the CHILD wrapper (fi_child), the field's declaring class.
+        // Resolving it through *this* (base) wrapper would start the super walk at
+        // FieldInheritedBase and walk UP toward Object, never finding a
+        // child-declared static.  We wrap the resulting OOP as an fi_base (the
+        // held object IS a FieldInheritedBase instance); the value_t ->
+        // unique_ptr<fi_base> conversion validates the decoded OOP.
+        static auto get_base_instance() -> std::unique_ptr<fi_base> { return fi_child::static_field("baseInstance")->get(); }
+        auto protected_int() const -> std::int32_t { return static_cast<std::int32_t>(get_field("protectedInt")->get()); }
+        auto public_int() const -> std::int32_t    { return static_cast<std::int32_t>(get_field("publicInt")->get()); }
+        auto shadowed_int() const -> std::int32_t  { return static_cast<std::int32_t>(get_field("shadowedInt")->get()); }
     };
 
     // ---- Constants mirrored from FieldInherited*.java ----------------------

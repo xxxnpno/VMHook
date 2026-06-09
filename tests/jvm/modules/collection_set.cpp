@@ -96,24 +96,9 @@ namespace
         {
         }
 
-        auto id() const -> std::int32_t
-        {
-            const auto f{ get_field("id") };
-            return f ? static_cast<std::int32_t>(f->get()) : -987654;
-        }
+        auto id() const -> std::int32_t { return static_cast<std::int32_t>(get_field("id")->get()); }
 
-        // Copy-init (never brace-init) a std::string from a value_t — value_t's
-        // templated conversion operator makes brace-init ambiguous on MSVC.
-        auto tag() const -> std::string
-        {
-            const auto f{ get_field("tag") };
-            if (!f)
-            {
-                return std::string{};
-            }
-            std::string s = f->get();
-            return s;
-        }
+        auto tag() const -> std::string { return get_field("tag")->get(); }
     };
 
     // ── STRING element wrapper: java.lang.String. ───────────────────────────

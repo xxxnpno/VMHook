@@ -166,16 +166,7 @@ namespace
         static auto set_mode(std::int32_t m) -> void { static_field("mode")->set(m); }
 
         // ---- the published singleton holder ----
-        static auto singleton() -> std::unique_ptr<ifp_holder>
-        {
-            const auto proxy{ static_field("SINGLETON") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<ifp_holder> ptr = proxy->get();  // copy-init from value_t
-            return ptr;
-        }
+        static auto singleton() -> std::unique_ptr<ifp_holder> { return static_field("SINGLETON")->get(); }
 
         // ---- the `pet` field signature (proves it is the interface type) ----
         auto pet_signature() const -> std::string
@@ -190,40 +181,13 @@ namespace
         }
 
         // ---- read `pet` AS the concrete Dog type ----
-        auto pet_as_dog() const -> std::unique_ptr<ifp_dog>
-        {
-            const auto proxy{ get_field("pet") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<ifp_dog> ptr = proxy->get();  // copy-init
-            return ptr;
-        }
+        auto pet_as_dog() const -> std::unique_ptr<ifp_dog> { return get_field("pet")->get(); }
 
         // ---- read `pet` AS the DECLARED interface type ----
-        auto pet_as_animal() const -> std::unique_ptr<ifp_animal>
-        {
-            const auto proxy{ get_field("pet") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<ifp_animal> ptr = proxy->get();  // copy-init
-            return ptr;
-        }
+        auto pet_as_animal() const -> std::unique_ptr<ifp_animal> { return get_field("pet")->get(); }
 
         // ---- read the petAsDog field (concrete-typed slot to the SAME object) ----
-        auto pet_alias_as_dog() const -> std::unique_ptr<ifp_dog>
-        {
-            const auto proxy{ get_field("petAsDog") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            std::unique_ptr<ifp_dog> ptr = proxy->get();  // copy-init
-            return ptr;
-        }
+        auto pet_alias_as_dog() const -> std::unique_ptr<ifp_dog> { return get_field("petAsDog")->get(); }
 
         // ---- Java-side witnesses ----
         static auto get_pet_is_dog_seen() -> bool        { return static_field("petIsDogSeen")->get(); }

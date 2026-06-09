@@ -111,15 +111,7 @@ namespace
         // ── acquire the published SINGLETON instance ───────────────────────
         // SINGLETON is set at class-init (before the probe), so this works any
         // time after register_class — no probe required to reach instance fields.
-        static auto singleton() -> std::unique_ptr<holder_object>
-        {
-            const auto proxy{ static_field("SINGLETON") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            return proxy->get();   // value_t -> unique_ptr<holder_object>
-        }
+        static auto singleton() -> std::unique_ptr<holder_object> { return static_field("SINGLETON")->get(); }
 
         // ── instance object-reference field reads (THE FEATURE) ────────────
         auto ref()          -> std::unique_ptr<ref_object> { return get_field("ref")->get(); }
@@ -162,15 +154,7 @@ namespace
         }
 
         // value_t::operator void* of a named ref field (the other decode entry).
-        auto ref_value_as_voidp(const char* name) -> void*
-        {
-            const auto proxy{ get_field(name) };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            return static_cast<void*>(proxy->get());
-        }
+        auto ref_value_as_voidp(const char* name) -> void* { return static_cast<void*>(get_field(name)->get()); }
 
         // is_reference() of a named field (introspection).
         auto field_is_reference(const char* name) -> bool
@@ -202,15 +186,7 @@ namespace
             }
             return proxy->get_compressed_oop();
         }
-        auto primitive_value(const char* name) -> std::int32_t
-        {
-            const auto proxy{ get_field(name) };
-            if (!proxy.has_value())
-            {
-                return 0;
-            }
-            return proxy->get();
-        }
+        auto primitive_value(const char* name) -> std::int32_t { return get_field(name)->get(); }
         auto primitive_is_reference(const char* name) -> bool
         {
             const auto proxy{ get_field(name) };

@@ -133,30 +133,12 @@ namespace
         static auto get_done() -> bool            { return static_field("done")->get(); }
 
         static auto resolves(const char* name) -> bool { return static_field(name).has_value(); }
-        static auto get_class_token() -> std::int32_t
-        {
-            const auto fp{ static_field("classToken") };
-            if (!fp.has_value()) { return -1; }
-            const std::int32_t v = fp->get();
-            return v;
-        }
-        static auto get_anchor_calls() -> std::int32_t
-        {
-            const auto fp{ static_field("anchorCalls") };
-            if (!fp.has_value()) { return -1; }
-            const std::int32_t v = fp->get();
-            return v;
-        }
+        static auto get_class_token() -> std::int32_t  { return static_field("classToken")->get(); }
+        static auto get_anchor_calls() -> std::int32_t { return static_field("anchorCalls")->get(); }
 
         // Instance-side read of `marker` (used INSIDE the detour through the
         // factory-built wrapper).  Inherited get_field; safe on a valid oop.
-        auto marker() const -> std::int32_t
-        {
-            const auto fp{ get_field("marker") };
-            if (!fp.has_value()) { return -1; }
-            const std::int32_t v = fp->get();
-            return v;
-        }
+        auto marker() const -> std::int32_t { return get_field("marker")->get(); }
     };
 
     // ---- A wrapper type that is registered to a DIFFERENT real class --------

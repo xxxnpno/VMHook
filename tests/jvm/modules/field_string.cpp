@@ -44,15 +44,7 @@ namespace
         // ---- read a static String field through field_proxy::get() (the
         //      value_t -> std::string conversion routes through read_java_string).
         //      Returns "" if the field can't be resolved.
-        static auto read_static(const char* name) -> std::string
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return std::string{ "<<no-field:" } + name + ">>";
-            }
-            return proxy->get();
-        }
+        static auto read_static(const char* name) -> std::string { return static_field(name)->get(); }
 
         // ---- read the SAME field's backing String OOP and decode it DIRECTLY
         //      via read_java_string (bypassing field_proxy), to prove the two
@@ -92,15 +84,7 @@ namespace
             return true;
         }
 
-        static auto read_static_int(const char* name) -> std::int32_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return -1;
-            }
-            return proxy->get();
-        }
+        static auto read_static_int(const char* name) -> std::int32_t { return static_field(name)->get(); }
 
         // ---- Java-published observation fields ----
         static auto j_ascii_len()   -> std::int32_t { return static_field("jAsciiLen")->get(); }
@@ -126,15 +110,7 @@ namespace
         static auto interned_intact()      -> bool        { return static_field("internedStillIntact")->get(); }
 
         // ---- obtain the live instance the fixture published in `self`. ----
-        static auto acquire_self() -> std::unique_ptr<field_string_fixture>
-        {
-            const auto proxy{ static_field("self") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            return proxy->get();   // value_t -> unique_ptr<field_string_fixture>
-        }
+        static auto acquire_self() -> std::unique_ptr<field_string_fixture> { return static_field("self")->get(); }
     };
 
     std::atomic<int>          g_hook_calls{ 0 };

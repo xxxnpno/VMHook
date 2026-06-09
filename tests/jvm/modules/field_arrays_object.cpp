@@ -105,15 +105,7 @@ namespace
         static auto get_observed() -> std::int32_t { return static_field("observed")->get(); }
 
         // ---- self (for instance-field reads) ---------------------------------
-        static auto acquire_self() -> std::unique_ptr<field_arrays_object_fixture>
-        {
-            const auto proxy{ static_field("self") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            return proxy->get();   // value_t -> unique_ptr<field_arrays_object_fixture>
-        }
+        static auto acquire_self() -> std::unique_ptr<field_arrays_object_fixture> { return static_field("self")->get(); }
 
         // ---- STATIC String[] reads (operator vector<string>()) ---------------
         static auto s_strings()        -> std::vector<std::string> { return static_field("staticStrings")->get(); }

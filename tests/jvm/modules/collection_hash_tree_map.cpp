@@ -94,53 +94,18 @@ namespace
         }
 
         // ---- Java's own published witnesses ----
-        static auto java_hash_size() -> std::int32_t
-        {
-            const auto p{ static_field("hashMapSize") };
-            if (!p.has_value()) { return -1; }
-            const std::int32_t v = p->get();           // copy-init
-            return v;
-        }
-        static auto java_tree_size() -> std::int32_t
-        {
-            const auto p{ static_field("treeMapSize") };
-            if (!p.has_value()) { return -1; }
-            const std::int32_t v = p->get();
-            return v;
-        }
-        static auto java_tree_first_key() -> std::string
-        {
-            const auto p{ static_field("treeFirstKey") };
-            if (!p.has_value()) { return std::string{ "<<no-field>>" }; }
-            return p->get().as_string();               // String field -> as_string()
-        }
-        static auto java_tree_last_key() -> std::string
-        {
-            const auto p{ static_field("treeLastKey") };
-            if (!p.has_value()) { return std::string{ "<<no-field>>" }; }
-            return p->get().as_string();
-        }
+        static auto java_hash_size() -> std::int32_t { return static_field("hashMapSize")->get(); }
+        static auto java_tree_size() -> std::int32_t { return static_field("treeMapSize")->get(); }
+        static auto java_tree_first_key() -> std::string { return static_field("treeFirstKey")->get().as_string(); }
+        static auto java_tree_last_key() -> std::string { return static_field("treeLastKey")->get().as_string(); }
 
         // ---- the HashMap via the EXPLICIT vmhook::hash_map wrapper ----
         // value_t -> unique_ptr<hash_map> is the typed intent-declaring path the
-        // legacy test_hash_map_probe used (get<unique_ptr<hash_map>>()).  Copy-
-        // init from value_t (NEVER brace-init) to stay MSVC-unambiguous.
-        static auto acquire_hash_map() -> std::unique_ptr<vmhook::hash_map>
-        {
-            const auto p{ static_field("hashMap") };
-            if (!p.has_value()) { return nullptr; }
-            std::unique_ptr<vmhook::hash_map> hm = p->get();
-            return hm;
-        }
+        // legacy test_hash_map_probe used (get<unique_ptr<hash_map>>()).
+        static auto acquire_hash_map() -> std::unique_ptr<vmhook::hash_map> { return static_field("hashMap")->get(); }
 
         // ---- the TreeMap via the generic vmhook::map wrapper ----
-        static auto acquire_tree_map() -> std::unique_ptr<vmhook::map>
-        {
-            const auto p{ static_field("treeMap") };
-            if (!p.has_value()) { return nullptr; }
-            std::unique_ptr<vmhook::map> tm = p->get();
-            return tm;
-        }
+        static auto acquire_tree_map() -> std::unique_ptr<vmhook::map> { return static_field("treeMap")->get(); }
 
         // ---- the HashMap via the IMPLICIT value_t::to_entries path ----
         // The cross-check that the field-proxy convenience path agrees with the

@@ -94,18 +94,7 @@ namespace
         }
 
         // ---- read a static String field through the portable accessor ----
-        static auto get_string(const char* name) -> std::string
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return std::string{ "<<no-field>>" };
-            }
-            // Copy-init: value_t has a templated conversion operator, so
-            // std::string s{ proxy->get() } is ambiguous on MSVC.
-            const std::string s = proxy->get();
-            return s;
-        }
+        static auto get_string(const char* name) -> std::string { return static_field(name)->get(); }
 
         // ---- set a static String field with an ASCII value ----
         static auto set_string(const char* name, std::string_view value) -> bool
@@ -120,51 +109,14 @@ namespace
         }
 
         // ---- raw int read (for the size/type guard targets) ----
-        static auto get_int(const char* name) -> std::int32_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return -1;
-            }
-            const std::int32_t v = proxy->get();
-            return v;
-        }
+        static auto get_int(const char* name) -> std::int32_t { return static_field(name)->get(); }
 
-        static auto get_long(const char* name) -> std::int64_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return -1;
-            }
-            const std::int64_t v = proxy->get();
-            return v;
-        }
+        static auto get_long(const char* name) -> std::int64_t { return static_field(name)->get(); }
 
-        static auto get_char(const char* name) -> std::uint16_t
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return 0;
-            }
-            const std::uint16_t v = proxy->get();
-            return v;
-        }
+        static auto get_char(const char* name) -> std::uint16_t { return static_field(name)->get(); }
 
         // ---- acquire a published instance wrapper (objA / objB / objRef) ----
-        static auto acquire(const char* name) -> std::unique_ptr<fs>
-        {
-            const auto proxy{ static_field(name) };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            // Copy-init from value_t -> unique_ptr<fs> (never brace-init).
-            std::unique_ptr<fs> ptr = proxy->get();
-            return ptr;
-        }
+        static auto acquire(const char* name) -> std::unique_ptr<fs> { return static_field(name)->get(); }
 
         // ---- set an object-reference static field to a wrapper (or null) ----
         static auto set_ref(const char* name, const std::unique_ptr<fs>& target) -> bool

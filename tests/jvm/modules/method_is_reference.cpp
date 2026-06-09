@@ -92,17 +92,7 @@ namespace
 
         // ---- acquire the published SINGLETON instance (reference-field decode;
         //      no live thread needed — mirrors field_static::acquire) ----------
-        static auto acquire_singleton() -> std::unique_ptr<isref>
-        {
-            const auto proxy{ static_field("SINGLETON") };
-            if (!proxy.has_value())
-            {
-                return nullptr;
-            }
-            // Copy-init from value_t -> unique_ptr<isref> (never brace-init).
-            std::unique_ptr<isref> ptr = proxy->get();
-            return ptr;
-        }
+        static auto acquire_singleton() -> std::unique_ptr<isref> { return static_field("SINGLETON")->get(); }
     };
 
     // Independent oracle: parse the JVM descriptor's RETURN type by hand and

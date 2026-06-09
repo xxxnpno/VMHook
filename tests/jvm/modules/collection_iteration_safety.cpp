@@ -96,11 +96,7 @@ namespace
         {
         }
 
-        auto id() const -> std::int32_t
-        {
-            const auto f{ get_field("id") };
-            return f ? static_cast<std::int32_t>(f->get()) : -987654;
-        }
+        auto id() const -> std::int32_t { return static_cast<std::int32_t>(get_field("id")->get()); }
     };
 
     // ── STRING element wrapper: java.lang.String (colliding-key Set). ────────
@@ -134,16 +130,8 @@ namespace
 
         // Java-published size oracle (read via VMStructs; no Java thread needed,
         // but we read it inside the detour anyway for a coherent snapshot).
-        static auto j_size(const char* name) -> std::int32_t
-        {
-            const auto f{ static_field(name) };
-            return f ? static_cast<std::int32_t>(f->get()) : -1;
-        }
-        static auto j_bool(const char* name) -> bool
-        {
-            const auto f{ static_field(name) };
-            return f ? static_cast<bool>(f->get()) : false;
-        }
+        static auto j_size(const char* name) -> std::int32_t { return static_cast<std::int32_t>(static_field(name)->get()); }
+        static auto j_bool(const char* name) -> bool { return static_cast<bool>(static_field(name)->get()); }
         static auto get_observed() -> std::int32_t { return static_field("observed")->get(); }
     };
 
