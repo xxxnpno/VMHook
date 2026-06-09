@@ -11,39 +11,47 @@ import vmhook.Harness;
  *
  * i.e. field_proxy::get() on a field whose JVM descriptor starts with 'L'
  * yields a compressed OOP that value_t::cast_for_variant decodes into a
- * std::unique_ptr&lt;wrapper&gt; (vmhook.hpp ~11433-11449).  Unlike the method-return
- * twin (method_proxy::call, which truncates/free's a JNI handle on JDK 21+),
- * the FIELD path reads a real compressed OOP straight from the object slot, so
- * the "non-null ref -&gt; usable wrapper" contract holds on EVERY JDK.  That makes
- * this fixture the canonical, JDK-independent proof of the decode pipeline.
+ * std::unique_ptr&lt;wrapper&gt;.  Unlike the method-return twin (method_proxy::call,
+ * which truncates/free's a JNI handle on JDK 21+), the FIELD path reads a real
+ * compressed OOP straight from the object slot, so the "non-null ref -&gt; usable
+ * wrapper" contract holds on EVERY JDK.  That makes this fixture the canonical,
+ * JDK-independent proof of the decode pipeline.
  *
- * The native module asserts, on a live JVM:
+ * The native module asserts, on a live JVM, the WHOLE object-reference input
+ * space.  Every reference shape a field can hold is represented here:
  *
  *   - NON-NULL instance ref field   -&gt; usable wrapper (read its int / String /
  *     nested-ref fields, AND call a method through it),
  *   - NON-NULL static ref field     -&gt; usable wrapper (the mirror+offset path),
- *   - NULL ref field                -&gt; null unique_ptr (the most important
+ *   - NULL ref field (instance+static) -&gt; null unique_ptr (the most important
  *     invariant: a null slot must never fabricate a wrapper),
- *   - FINAL object field            -&gt; decodes identically to a non-final one
- *     (final-ness is compile-time only; the slot is an ordinary oop),
- *   - VOLATILE object field         -&gt; decodes correctly (no fences needed for a
- *     plain read of the slot),
- *   - SELF ref (a field that holds `this`) -&gt; decoded instance == the receiver,
- *   - IDENTITY: the decoded OOP, re-encoded, round-trips; and the field read and
- *     a direct decode_oop of the same slot agree (compressed-oop decode
- *     correctness),
- *   - SHARED ref: two different fields that hold the SAME Java object decode to
+ *   - FINAL object field            -&gt; decodes identically to a non-final one,
+ *   - VOLATILE object field         -&gt; decodes correctly (plain slot read),
+ *   - SELF ref (a field holding `this`) -&gt; decoded instance == the receiver,
+ *   - OTHER-INSTANCE ref            -&gt; a field holding a DIFFERENT instance of
+ *     this same class decodes to a distinct, independently-usable wrapper,
+ *   - STRING ref                    -&gt; a java.lang.String-typed field decodes
+ *     (its slot holds a real String OOP; read back as std::string),
+ *   - BOXED ref                     -&gt; a java.lang.Integer-typed field decodes
+ *     to a usable wrapper (intValue() dispatched through it),
+ *   - INTERFACE-typed field         -&gt; declared an interface, holds a concrete
+ *     impl; the decoded oop's RUNTIME klass is the impl and a method dispatches,
+ *   - OBJECT-typed field            -&gt; declared java.lang.Object, holds various
+ *     runtime types (a Ref, a String); the decoded oop's runtime klass is the
+ *     concrete type and (for the Ref case) it reads back as a usable Ref,
+ *   - IDENTITY: the decoded OOP, re-encoded, round-trips; the field read and a
+ *     direct decode_oop of the same slot agree; and two DIFFERENTLY-DECLARED
+ *     fields holding the SAME object (ref / objAsRef) decode to the SAME oop,
+ *   - SHARED ref: two reference-typed fields that hold the SAME object decode to
  *     the SAME heap address,
- *   - WRONG-WRAPPER-TYPE read: reading a Holder-typed field through a wrapper
- *     registered for an UNRELATED Java class (Decoy) is NOT rejected by the
- *     library (a documented flaw: no klass-match check) — the fixture lays out
- *     Decoy so its field offsets differ from Holder's, so the wrong-typed read
- *     returns a DIFFERENT value than the correct-typed read, proving the silent
+ *   - WRONG-WRAPPER-TYPE read (flaw A): reading a Ref-typed field through a
+ *     wrapper registered for an UNRELATED class (Decoy) is NOT rejected — the
+ *     fixture lays Decoy out so its offsets differ, proving the silent
  *     mis-decode,
- *   - ARRAY-vs-object: a field whose descriptor is '[' (Ref[]) decoded as a
- *     unique_ptr&lt;wrapper&gt; is ALSO not rejected (no signature-shape check) — the
- *     wrapper ends up pointing at the array oop; the fixture publishes the array
- *     identity so native can show the wrapper wrapped the array, not an element.
+ *   - ARRAY-vs-object (flaw B, now fixed): a '[' (Ref[]) field decoded as a
+ *     single unique_ptr is rejected; the array is walked element-wise instead,
+ *   - PRIMITIVE get_compressed_oop (flaw C, now fixed): get_compressed_oop() on
+ *     an 'I' field is guarded and returns 0.
  *
  * Every object the native side inspects carries deterministic field values AND
  * its System.identityHashCode, so the C++ checks are exact (never "non-null and
@@ -64,9 +72,39 @@ public final class FieldObjectRef
      * object-reference read is side-effect free and happens from native code;
      * the probe exists solely to fire the interpreter hook on tick() and to
      * (re)publish identities on the Java thread.
-     *   0 = publish identities + call tick() once (drives the native hook).
+     *   0 = wire self/nested/other + publish identities + call tick() once
+     *       (drives the native interpreter hook).
      */
     public static volatile int mode;
+
+    // ── A tiny interface + impl for the interface-typed-field angle ─────────
+    /**
+     * Declared (static) type of the `tag` field.  Its runtime value is a
+     * TagImpl, so the native side proves the decoded oop's RUNTIME klass is the
+     * concrete impl (never the interface) and that a method dispatches through a
+     * concrete wrapper.
+     */
+    public interface Tag
+    {
+        int tagValue();
+    }
+
+    /** Concrete implementation behind the interface-typed `tag` field. */
+    public static final class TagImpl implements Tag
+    {
+        public int slot;
+
+        public TagImpl(final int slot)
+        {
+            this.slot = slot;
+        }
+
+        @Override
+        public int tagValue()
+        {
+            return this.slot;
+        }
+    }
 
     // ── The reference type the wrappers walk ───────────────────────────────
     /**
@@ -132,6 +170,10 @@ public final class FieldObjectRef
     public static final int    ARRAY_ELEM0_VAL  = 700;
     public static final int    ARRAY_ELEM1_VAL  = 800;
     public static final int    ARRAY_LEN        = 2;
+    public static final int    OTHER_REF_VAL    = 0x6363;   // the `other` instance's ref.val
+    public static final String STR_REF_VALUE    = "string-ref-field";
+    public static final int    BOXED_INT_VALUE  = 0x07E5;   // 2021
+    public static final int    TAG_SLOT_VALUE   = 0x0539;   // 1337
 
     // ── Instance reference fields (read through an INSTANCE field_proxy) ────
 
@@ -150,8 +192,32 @@ public final class FieldObjectRef
     /** VOLATILE object reference: a plain slot read must still decode correctly. */
     public volatile Ref volatileRef = makeRef(VOLATILE_REF_VAL, "volatile-ref");
 
-    /** A field that holds `this` (self-reference identity angle). */
+    /** A field that holds `this` (self-reference identity angle); wired in run(). */
     public FieldObjectRef self;
+
+    /**
+     * A field holding a DIFFERENT instance of THIS class (other-instance angle);
+     * wired in run().  Its own `ref.val` is OTHER_REF_VAL so the native side can
+     * tell it apart from the SINGLETON's ref.  Left null at construction so a
+     * field initialiser `new FieldObjectRef()` cannot recurse (the ctor never
+     * touches `other`).
+     */
+    public FieldObjectRef other;
+
+    /** A java.lang.String-typed object reference (the String-ref angle). */
+    public String strRef = STR_REF_VALUE;
+
+    /** A boxed java.lang.Integer-typed object reference (the boxed-type angle). */
+    public Integer boxedInt = Integer.valueOf(BOXED_INT_VALUE);
+
+    /** An INTERFACE-typed field holding a concrete impl (the interface angle). */
+    public Tag tag = new TagImpl(TAG_SLOT_VALUE);
+
+    /** A field declared java.lang.Object holding a Ref at runtime (Object angle). */
+    public Object objAsRef = this.ref;
+
+    /** A field declared java.lang.Object holding a String at runtime. */
+    public Object objAsString = STR_REF_VALUE;
 
     /** An object-ARRAY field ('[' descriptor) — the signature-shape angle. */
     public Ref[] refArray =
@@ -185,15 +251,33 @@ public final class FieldObjectRef
     public static volatile int finalRefIdentity;
     public static volatile int volatileRefIdentity;
     public static volatile int selfIdentity;
+    public static volatile int otherIdentity;
     public static volatile int staticRefIdentity;
     public static volatile int nestedRefIdentity;
     public static volatile int refArrayIdentity;
     public static volatile int refArrayElem0Identity;
+    public static volatile int strRefIdentity;
+    public static volatile int boxedIntIdentity;
+    public static volatile int tagIdentity;
+    public static volatile int objAsRefIdentity;
+    public static volatile int objAsStringIdentity;
 
     /** Helper so the field initialisers and run() build Refs identically. */
     private static Ref makeRef(final int val, final String label)
     {
         return new Ref(val, label);
+    }
+
+    /**
+     * Builds the "other" instance and gives its `ref` a distinguishing value so
+     * the native side can confirm it is a genuinely different object.  Safe: the
+     * default ctor never wires `other`, so this does not recurse.
+     */
+    private static FieldObjectRef makeOther()
+    {
+        final FieldObjectRef o = new FieldObjectRef();
+        o.ref = makeRef(OTHER_REF_VAL, "other-ref");
+        return o;
     }
 
     // ── Hook site ──────────────────────────────────────────────────────────
@@ -223,12 +307,17 @@ public final class FieldObjectRef
             {
                 final FieldObjectRef s = SINGLETON;
 
-                // Wire the nested + self references on the published instance.
+                // Wire the nested + self + other references on the published
+                // instance.
                 if (s.ref.next == null)
                 {
                     s.ref.next = makeRef(NESTED_REF_VAL, NESTED_REF_LABEL);
                 }
                 s.self = s;
+                if (s.other == null)
+                {
+                    s.other = makeOther();
+                }
 
                 // Publish identities the native side cross-checks against the
                 // OOPs it decodes from each field slot.
@@ -237,10 +326,16 @@ public final class FieldObjectRef
                 FieldObjectRef.finalRefIdentity       = System.identityHashCode(s.finalRef);
                 FieldObjectRef.volatileRefIdentity    = System.identityHashCode(s.volatileRef);
                 FieldObjectRef.selfIdentity           = System.identityHashCode(s.self);
+                FieldObjectRef.otherIdentity          = System.identityHashCode(s.other);
                 FieldObjectRef.staticRefIdentity      = System.identityHashCode(FieldObjectRef.staticRef);
                 FieldObjectRef.nestedRefIdentity      = System.identityHashCode(s.ref.next);
                 FieldObjectRef.refArrayIdentity       = System.identityHashCode(s.refArray);
                 FieldObjectRef.refArrayElem0Identity  = System.identityHashCode(s.refArray[0]);
+                FieldObjectRef.strRefIdentity         = System.identityHashCode(s.strRef);
+                FieldObjectRef.boxedIntIdentity       = System.identityHashCode(s.boxedInt);
+                FieldObjectRef.tagIdentity            = System.identityHashCode(s.tag);
+                FieldObjectRef.objAsRefIdentity       = System.identityHashCode(s.objAsRef);
+                FieldObjectRef.objAsStringIdentity    = System.identityHashCode(s.objAsString);
 
                 // Real bytecode dispatch -> native interpreter hook fires.
                 s.tick(7);
