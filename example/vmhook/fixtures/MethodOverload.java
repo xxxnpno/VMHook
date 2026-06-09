@@ -38,6 +38,10 @@ import vmhook.Harness;
  *   - two-arg type-order overloads: pick(int,long) vs pick(long,int) vs
  *     pick(int,String) — proves the matcher checks EACH parameter slot, not just
  *     the first, and respects order,
+ *   - ARRAY-vs-scalar overloads: pick(int[]) / pick(long[]) ("[I" / "[J") sit
+ *     alongside pick(int) / pick(long) so the native side proves the resolver's
+ *     array-token parser walks past a '[' descriptor when matching a scalar arg
+ *     and reaches the array body for an explicit "([I)I" / "([J)I" call,
  *   - per-overload boundary values (INT_MIN/MAX, LONG_MIN/MAX, the float-vs-
  *     double-vs-int-vs-long ambiguity of the literal 3) recorded via lastArg*,
  *   - STATIC overloads mirrored as spick(...) so the native side can exercise
@@ -83,6 +87,11 @@ public final class MethodOverload
     public static final int RET_INT_LONG    = 1023;  // pick(int,long)
     public static final int RET_LONG_INT    = 1024;  // pick(long,int)
     public static final int RET_INT_STRING  = 1025;  // pick(int,String)
+    // Array overloads: descriptor "[I" / "[J" — a leading '[' the matcher must
+    // parse via next_argument_descriptor's array branch and treat as DISTINCT
+    // from the scalar "I" / "J" overloads (array-vs-scalar disambiguation).
+    public static final int RET_INT_ARRAY   = 1031;  // pick(int[])
+    public static final int RET_LONG_ARRAY  = 1032;  // pick(long[])
 
     // Static twins reuse the SAME sentinels + a +100 bias so the native side
     // can tell an instance hit from a static hit even if a JDK quirk routed one
@@ -102,6 +111,10 @@ public final class MethodOverload
     public static volatile String  lastStringArg;
     public static volatile int     lastArg2A;
     public static volatile long    lastArg2B;
+    // Array echoes: the length and first element of the last array arg, so the
+    // native side can prove the right array landed in the right (array) slot.
+    public static volatile int     lastArrayLen;
+    public static volatile long    lastArrayHead;
 
     // ── The hook site ──────────────────────────────────────────────────────
     /**
@@ -136,13 +149,30 @@ public final class MethodOverload
     public int pick(final long a, final int b)              { lastArg2A = b; lastArg2B = a; return RET_LONG_INT; }
     public int pick(final int a, final String b)            { lastArg2A = a; lastStringArg = b; return RET_INT_STRING; }
 
+    // Array overloads — a leading '[' in the descriptor ("[I" / "[J").  These
+    // exist so the resolver's array-token parsing is exercised: scanning the
+    // "pick" overloads to resolve a SCALAR int/long must walk PAST these array
+    // descriptors (not mis-match them), and an explicit "([I)I" / "([J)I" call
+    // must reach exactly these bodies.  echoed via lastArrayLen / lastArrayHead.
+    public int pick(final int[] a)  { lastArrayLen = (a == null ? -1 : a.length); lastArrayHead = (a == null || a.length == 0 ? 0L : a[0]);          return RET_INT_ARRAY;  }
+    public int pick(final long[] a) { lastArrayLen = (a == null ? -1 : a.length); lastArrayHead = (a == null || a.length == 0 ? 0L : a[0]);          return RET_LONG_ARRAY; }
+
     // ── Static overloads: ALL named "spick" ────────────────────────────────
+    // Mirrors the instance "pick" set across the FULL primitive descriptor set
+    // (I J D F Z B S C) so the native side can assert that static name-only
+    // overload resolution (resolve_compatible_method deriving the declaring
+    // klass from the Method's ConstantPool _pool_holder when object==nullptr)
+    // re-picks the arg-MATCHING overload — the exact regression that fix #7
+    // restored.  Declaration order is scrambled relative to descriptor order.
     public static int spick(final int a)     { lastIntArg = a;    return RET_INT + SBIAS; }
     public static int spick(final String a)  { lastStringArg = a; return RET_STRING + SBIAS; }
     public static int spick(final double a)  { lastDoubleArg = a; return RET_DOUBLE + SBIAS; }
     public static int spick(final long a)    { lastLongArg = a;   return RET_LONG + SBIAS; }
     public static int spick(final float a)   { lastFloatArg = a;  return RET_FLOAT + SBIAS; }
     public static int spick(final boolean a) { lastBoolArg = a;   return RET_BOOLEAN + SBIAS; }
+    public static int spick(final byte a)    { lastByteArg = a;   return RET_BYTE + SBIAS; }
+    public static int spick(final short a)   { lastShortArg = a;  return RET_SHORT + SBIAS; }
+    public static int spick(final char a)    { lastCharArg = a;   return RET_CHAR + SBIAS; }
     public static int spick(final int a, final int b) { lastArg2A = a; lastArg2B = b; return RET_INT_INT + SBIAS; }
 
     // ── A method with exactly ONE signature, for the no-overload baseline ──

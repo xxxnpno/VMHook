@@ -116,6 +116,58 @@ public final class FieldStatic
     // snapshot(), so the shorter write would corrupt that comparison literal.
     public static String  setStrShort = freshAscii("world");  // native writes "hi" -> "hirld"
 
+    // String SET edge targets (private backings, never interned literals):
+    //   - setStrEmpty: native writes "" -> writable_length<=0 -> NO-OP, keeps "keep".
+    //   - setStrTrunc: native writes "toolongvalue" (len 12) into a len-5 backing
+    //     -> in-place write truncates to the first 5 -> "toolo" (length still 5).
+    public static String  setStrEmpty = freshAscii("keep");   // native writes "" -> stays "keep"
+    public static String  setStrTrunc = freshAscii("ABCDE");  // native writes long -> "toolo"
+
+    // =====================================================================
+    //  EXHAUSTIVE SET-EDGE targets, each with a matching getX() getter so the
+    //  native side can (a) re-read the slot in C++ and (b) pull the value back
+    //  through Java bytecode via static_method("getX")->call().  These fill the
+    //  0/1/-1 + boundary matrix the primary/secondary batteries don't cover.
+    // =====================================================================
+    public static int     setIZero   = 7;     // native writes 0
+    public static int     setIOne    = 7;     // native writes 1
+    public static int     setINegOne = 7;     // native writes -1
+    public static int     setIMax    = 0;     // native writes Integer.MAX_VALUE
+    public static long    setJZero   = 7L;    // native writes 0
+    public static long    setJOne    = 7L;    // native writes 1
+    public static long    setJNegOne = 7L;    // native writes -1
+    public static byte    setBZero   = 9;     // native writes 0
+    public static byte    setBMax    = 0;     // native writes Byte.MAX_VALUE (127)
+    public static short   setSZero   = 9;     // native writes 0
+    public static short   setSMax    = 0;     // native writes Short.MAX_VALUE
+    public static char    setCNul    = 0x0041;// native writes 0x0000 ('\0')
+    public static char    setCA      = 0x0000;// native writes 0x0041 ('A')
+    public static float   setFPosInf = 0.0f;  // native writes +Infinity
+    public static float   setFMin    = 0.0f;  // native writes Float.MIN_VALUE
+    public static float   setFMax    = 0.0f;  // native writes Float.MAX_VALUE
+    public static float   setFNegZero= 1.0f;  // native writes -0.0
+    public static double  setDPosInf = 0.0;   // native writes +Infinity
+    public static double  setDMin    = 0.0;   // native writes Double.MIN_VALUE
+    public static double  setDMax    = 0.0;   // native writes Double.MAX_VALUE
+    public static double  setDNegZero= 1.0;   // native writes -0.0
+
+    // =====================================================================
+    //  static final CONSTANTS (compile-time inlined via the ConstantValue
+    //  attribute).  Characterizes what vmhook's static_field() actually reads:
+    //  vmhook reads the LIVE java.lang.Class mirror slot (which the class
+    //  initializer sets to the constant), NOT the inlined literal -- so a GET
+    //  returns the real stored value, and a SET overwrites the mirror slot
+    //  even though Java *references* to the constant keep using the inlined
+    //  literal (a getter that `return CONST_I;` returns the OLD value, while
+    //  static_field("CONST_I")->get() returns the NEW one).  getConstIField()
+    //  re-reads via getstatic so we can show the mirror slot really changed.
+    // =====================================================================
+    public static final int     CONST_I = 0x0A0B0C0D;
+    public static final long    CONST_J = 0x0102030405060708L;
+    public static final boolean CONST_Z = true;
+    public static final char    CONST_C = 'Q';                 // 0x0051
+    public static final String  CONST_STR = "konst";
+
     // =====================================================================
     //  PRIMITIVE-vs-PRIMITIVE TYPE/SIZE GUARD targets (audit:
     //  field_proxy_set_size_guard.md).  The native side attempts MISTYPED
@@ -163,6 +215,49 @@ public final class FieldStatic
     public static float   gFOne   = Float.intBitsToFloat(0x3F800000); // +1.0
     public static double  gDOne   = Double.longBitsToDouble(0x3FF0000000000000L); // +1.0
     public static String  gStr    = "field_static";
+
+    // ---- EXHAUSTIVE integral boundary GET battery: 0 / 1 / -1 for every
+    //      signed integral width, so the static GET decode is proven at the
+    //      "ordinary small" boundaries (the prior battery only had MIN/MAX). ----
+    public static int     gIZero   = 0;
+    public static int     gIOne    = 1;
+    public static int     gINegOne = -1;
+    public static long    gJZero   = 0L;
+    public static long    gJOne    = 1L;
+    public static long    gJNegOne = -1L;
+    public static byte    gBZero   = 0;
+    public static byte    gBOne    = 1;
+    public static byte    gBNegOne = -1;
+    public static short   gSZero   = 0;
+    public static short   gSOne    = 1;
+    public static short   gSNegOne = -1;
+
+    // ---- char GET boundaries: '\0' / 'A' / 0xFFFF (the unsigned 16-bit edges). ----
+    public static char    gCNul    = 0x0000;
+    public static char    gCA      = 0x0041; // 'A'
+
+    // ---- EXHAUSTIVE float boundary GET battery (compared by exact bit pattern
+    //      so the check is -Werror clean -- never an == on a float value). ----
+    public static float   gFZero    = 0.0f;                              // 0x00000000
+    public static float   gFNegZero = Float.intBitsToFloat(0x80000000); // -0.0
+    public static float   gFMin     = Float.MIN_VALUE;                  // 0x00000001 (smallest subnormal)
+    public static float   gFMax     = Float.MAX_VALUE;                  // 0x7F7FFFFF
+    public static float   gFPosInf  = Float.POSITIVE_INFINITY;          // 0x7F800000
+    public static float   gFNegInf  = Float.NEGATIVE_INFINITY;          // 0xFF800000
+    public static float   gFNan     = Float.NaN;                        // 0x7FC00000 (canonical)
+
+    // ---- EXHAUSTIVE double boundary GET battery (exact bit pattern compares). ----
+    public static double  gDZero    = 0.0;                                          // 0x0000000000000000
+    public static double  gDNegZero = Double.longBitsToDouble(0x8000000000000000L); // -0.0
+    public static double  gDMin     = Double.MIN_VALUE;                             // 0x...0001
+    public static double  gDMax     = Double.MAX_VALUE;                             // 0x7FEFFFFFFFFFFFFF
+    public static double  gDPosInf  = Double.POSITIVE_INFINITY;                     // 0x7FF0000000000000
+    public static double  gDNegInf  = Double.NEGATIVE_INFINITY;                     // 0xFFF0000000000000
+    public static double  gDNan     = Double.NaN;                                   // 0x7FF8000000000000
+
+    // ---- a null static String field: GET must resolve, report the String
+    //      signature, decode the compressed-0 OOP, and read back "". ----
+    public static String  gNullStr = null;
 
     /** An instance (non-static) int field, to drive the "needs an object" path. */
     public int instanceOnlyInt = 4242;
@@ -253,6 +348,67 @@ public final class FieldStatic
     public static int     getObjRefTag() { return objRef == null ? -1 : objRef.tag; }
     public static boolean objRefIsB() { return objRef == objB; }
     public static boolean objRefIsNull() { return objRef == null; }
+
+    // ---- getters for the EXHAUSTIVE SET-EDGE targets (genuine getstatic). ----
+    public static int     getIZero() { return setIZero; }
+    public static int     getIOne() { return setIOne; }
+    public static int     getINegOne() { return setINegOne; }
+    public static int     getIMax() { return setIMax; }
+    public static long    getJZero() { return setJZero; }
+    public static long    getJOne() { return setJOne; }
+    public static long    getJNegOne() { return setJNegOne; }
+    public static byte    getBZero() { return setBZero; }
+    public static byte    getBMax() { return setBMax; }
+    public static short   getSZero() { return setSZero; }
+    public static short   getSMax() { return setSMax; }
+    public static char    getCNul() { return setCNul; }
+    public static char    getCA() { return setCA; }
+    public static int     getFPosInfBits() { return Float.floatToRawIntBits(setFPosInf); }
+    public static int     getFMinBits() { return Float.floatToRawIntBits(setFMin); }
+    public static int     getFMaxBits() { return Float.floatToRawIntBits(setFMax); }
+    public static int     getFNegZeroBits() { return Float.floatToRawIntBits(setFNegZero); }
+    public static long    getDPosInfBits() { return Double.doubleToRawLongBits(setDPosInf); }
+    public static long    getDMinBits() { return Double.doubleToRawLongBits(setDMin); }
+    public static long    getDMaxBits() { return Double.doubleToRawLongBits(setDMax); }
+    public static long    getDNegZeroBits() { return Double.doubleToRawLongBits(setDNegZero); }
+
+    // ---- static-final CONSTANT readers.  Two flavours, deliberately:
+    //   * getConstIInlined() does `return CONST_I;` -- javac CONSTANT-FOLDS this
+    //     to an ldc of the original literal, so it NEVER reflects a mirror write.
+    //   * getConstIReflect() reads the LIVE mirror slot via reflection (no
+    //     constant folding), so it DOES reflect a vmhook write to the slot.
+    //  The pair lets the native module prove that static_field()->set() lands on
+    //  the mirror slot (reflective read changes) while Java's inlined references
+    //  do not see it (inlined read unchanged) -- the documented constant caveat. ----
+    public static int     getConstIInlined() { return CONST_I; }
+    public static long    getConstJInlined() { return CONST_J; }
+    public static int     getConstCInlined() { return CONST_C; }
+    public static int     getConstIReflect()
+    {
+        try { return FieldStatic.class.getField("CONST_I").getInt(null); }
+        catch (Exception e) { return -1; }
+    }
+    public static long    getConstJReflect()
+    {
+        try { return FieldStatic.class.getField("CONST_J").getLong(null); }
+        catch (Exception e) { return -1L; }
+    }
+    public static int     getConstCReflect()
+    {
+        try { return FieldStatic.class.getField("CONST_C").getChar(null); }
+        catch (Exception e) { return -1; }
+    }
+    public static String  getConstStrReflect()
+    {
+        try
+        {
+            Object v = FieldStatic.class.getField("CONST_STR").get(null);
+            return (v == null) ? "<null>" : (String) v;
+        }
+        catch (Exception e) { return "<err>"; }
+    }
+    public static String  getStrEmpty() { return setStrEmpty; }
+    public static String  getStrTrunc() { return setStrTrunc; }
 
     /**
      * Builds a String from the chars of {@code text} via new String(char[]),

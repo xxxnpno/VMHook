@@ -28,38 +28,49 @@
 // returns a different sentinel, so it is caught as a value mismatch — not as a
 // crash, and not as "some int came back".
 //
-// =====================  THE FLAWS THIS MODULE PINS DOWN  =====================
+// ===============  THE FLAWS THIS MODULE PINS DOWN (regression targets)  ======
 //
-//  [high] Static-overload resolution is DEAD on the call_jni path (and on the
-//  call_stub path).  resolve_compatible_method() at vmhook.hpp:13312 does:
-//      klass* resolved{ this->object ? klass_from_object_header(object) : nullptr };
-//      if (!resolved) return this->method;          // <-- static bails here
-//  Every static method_proxy is built with object==nullptr (object_base::
-//  get_method(type_index,name) at 13763 passes nullptr).  So for STATIC
-//  overloads the hierarchy is NEVER walked: static_method("spick")->call(3.14)
-//  cannot re-pick (D)I; it dispatches whatever get_method latched onto first by
-//  name.  On JDK 21 (call stub absent) this module runs the call_jni path, so
-//  the bug is LIVE here.  The module records every static-overload outcome as
-//  [INFO] and emits ONE soft signal documenting the bug, but NEVER fails CI for
-//  it (the test has no power to fix the library).  It DOES hard-assert the
-//  explicit-signature static path static_method("spick","(D)I") which bypasses
-//  resolution — proving the methods exist and the fixture is sound.
+//  [high — FIXED, now hard-asserted] Static-overload resolution used to be DEAD.
+//  resolve_compatible_method() derived its klass only from the receiver's object
+//  header; every static method_proxy is built with object==nullptr, so the
+//  hierarchy was never walked and static_method("spick")->call(3.14) could not
+//  re-pick (D)I — it dispatched whatever get_method() latched onto first by name.
+//  When that first-by-name overload took a reference (spick(String)) and we passed
+//  a primitive, the primitive bits were blasted into a reference slot and the
+//  callee's reference-store barrier AV'd the whole JVM (crashed windows-clang-java8
+//  on the FIRST call, spick(int 1)).  FIX #7 (vmhook.hpp resolve_compatible_method,
+//  ~14716-14755): for a static proxy the declaring klass is now derived from the
+//  Method's ConstantPool _pool_holder, so the hierarchy walk runs and selects the
+//  arg-MATCHING overload.  This module is the regression guard: it HARD-ASSERTS
+//  that static_method("spick")->call(<typed>) resolves to the right overload across
+//  the full primitive descriptor set (I J D F Z B S C), by arity, and for String —
+//  exactly mirroring the instance assertions — and cross-checks the name-only
+//  result against the explicit-signature static result.
 //
 //  [medium] First-match-wins with no ambiguity detection.  For an UNREGISTERED
-//  wrapper type the L...; branch of argument_matches_descriptor (13131/13144)
-//  matches ANY reference descriptor, so pick(String) and pick(Object) both
-//  match and the loop returns whichever _methods index is lower — silently.  We
-//  exercise this with a deliberately-unregistered wrapper and record the
-//  (nondeterministic) outcome as [INFO].  The REGISTERED-wrapper path resolves
-//  deterministically (a wrapper registered as java/lang/Object matches only
-//  Ljava/lang/Object;), which we hard-assert.
+//  wrapper type the L...; branch of argument_matches_descriptor matches ANY
+//  reference descriptor, so pick(String) and pick(Object) both match and the loop
+//  returns whichever _methods index is lower — silently.  We exercise this with a
+//  deliberately-unregistered wrapper and record the (nondeterministic) outcome as
+//  [INFO].  The REGISTERED-wrapper path resolves deterministically (a wrapper
+//  registered as java/lang/Object matches only Ljava/lang/Object;), which we
+//  hard-assert.
 //
 //  [low] LLP64 trap (documentation, not a library bug): C++ `long` is 32-bit on
 //  Windows, so `3L` maps to descriptor I, not J.  Every long check here uses
 //  std::int64_t / an LL literal so it actually exercises the (J)I overload.
 //
-// All calls happen inside a single scoped_hook detour on tick(); the fixture
-// publishes a SINGLETON so `self` is deterministic.  Never shutdown_hooks().
+//  Array-vs-scalar: pick(int[]) / pick(long[]) ("[I"/"[J") sit beside the scalar
+//  pick(int)/pick(long).  We prove (a) scalar resolution is unperturbed by the
+//  array overloads (next_argument_descriptor walks past the leading '['), and
+//  (b) an explicit "([I)I"/"([J)I" call reaches the array body.
+//
+// All calls happen inside a single scoped_hook detour on tick() (uninstalled at
+// scope exit); the fixture publishes a SINGLETON so `self` is deterministic.  The
+// module body runs under try/catch (a throw -> [INFO], never a FAIL) and ends with
+// an unconditional, idempotent, safe-when-empty shutdown_hooks() OUTSIDE the try
+// so ZERO hooks stay armed for later modules (suite-safety; mirrors
+// collection_list.cpp / register_class.cpp).
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
@@ -92,6 +103,7 @@ namespace
         // argument echoes (prove the right value reached the right slot)
         static auto last_int()    -> std::int32_t { return static_field("lastIntArg")->get(); }
         static auto last_long()   -> std::int64_t { return static_field("lastLongArg")->get(); }
+        static auto last_double() -> double       { return static_field("lastDoubleArg")->get(); }
         static auto last_bool()   -> bool         { return static_field("lastBoolArg")->get(); }
         static auto last_byte()   -> std::int8_t  { return static_field("lastByteArg")->get(); }
         static auto last_short()  -> std::int16_t { return static_field("lastShortArg")->get(); }
@@ -99,6 +111,8 @@ namespace
         static auto last_string() -> std::string  { return static_field("lastStringArg")->get(); }
         static auto last_arg2a()  -> std::int32_t { return static_field("lastArg2A")->get(); }
         static auto last_arg2b()  -> std::int64_t { return static_field("lastArg2B")->get(); }
+        static auto last_array_len()  -> std::int32_t { return static_field("lastArrayLen")->get(); }
+        static auto last_array_head() -> std::int64_t { return static_field("lastArrayHead")->get(); }
 
         // ── name-only instance resolution helpers (the FEATURE) ────────────
         // Each returns the resolved overload's int sentinel.
@@ -160,6 +174,23 @@ namespace
         }
     };
 
+    // A bare carrier for a Java ARRAY oop.  call()'s argument packer sends any
+    // object_base-derived arg as a raw oop (its get_instance()), so wrapping an
+    // int[]/long[] oop here lets us drive pick(int[]) / pick(long[]) through the
+    // explicit-signature path ("([I)I" / "([J)I").  It is deliberately NOT
+    // register_class<>'d: array resolution here is exercised via the pinned
+    // signature, never via argument_matches_descriptor (which maps a wrapper to a
+    // scalar 'L...;', not to a '[' array descriptor — so a wrapper arg can never
+    // name-resolve to an array overload, by design).
+    class array_carrier : public vmhook::object<array_carrier>
+    {
+    public:
+        explicit array_carrier(vmhook::oop_t instance) noexcept
+            : vmhook::object<array_carrier>{ instance }
+        {
+        }
+    };
+
     // ── Fixture-mirrored sentinels (kept in lockstep with MethodOverload.java) ─
     constexpr std::int32_t RET_NOARG       = 1000;
     constexpr std::int32_t RET_INT         = 1001;
@@ -177,14 +208,11 @@ namespace
     constexpr std::int32_t RET_INT_LONG    = 1023;
     constexpr std::int32_t RET_LONG_INT    = 1024;
     constexpr std::int32_t RET_INT_STRING  = 1025;
+    constexpr std::int32_t RET_INT_ARRAY   = 1031;  // pick(int[])  -> ([I)I
+    constexpr std::int32_t RET_LONG_ARRAY  = 1032;  // pick(long[]) -> ([J)I
     constexpr std::int32_t SBIAS           = 100;
 
     constexpr std::int64_t k_unset = static_cast<std::int64_t>(0xDEADBEEFCAFEF00Dull);
-
-    // Distinct from k_unset: marks a static name-only call that was DELIBERATELY
-    // skipped because the dispatch path is the call_jni fallback, on which a
-    // static-overload call AVs the JVM (see the SAFETY note in run_all()).
-    constexpr std::int64_t k_skipped_unsafe = static_cast<std::int64_t>(0x5EED5A1F5A1FD00Dull);
 
     // ── Observations captured inside the tick() detour ─────────────────────
     std::atomic<int>  g_detour_calls{ 0 };
@@ -256,17 +284,42 @@ namespace
     std::atomic<std::int64_t> g_only_int_match{ k_unset };
     std::atomic<std::int64_t> g_only_int_mismatch{ k_unset };
 
-    // ── STATIC overload resolution (KNOWN-broken path; recorded as [INFO]) ─
+    // ── STATIC name-only overload resolution (fix #7 RESTORED this — hard-asserted) ─
     std::atomic<std::int64_t> g_s_int{ k_unset };
     std::atomic<std::int64_t> g_s_long{ k_unset };
     std::atomic<std::int64_t> g_s_double{ k_unset };
     std::atomic<std::int64_t> g_s_float{ k_unset };
     std::atomic<std::int64_t> g_s_bool{ k_unset };
+    std::atomic<std::int64_t> g_s_byte{ k_unset };
+    std::atomic<std::int64_t> g_s_short{ k_unset };
+    std::atomic<std::int64_t> g_s_char{ k_unset };
     std::atomic<std::int64_t> g_s_string{ k_unset };
+    std::atomic<std::int64_t> g_s_arity2{ k_unset };   // spick(int,int) by name
+    // static argument echoes (right value -> right static slot)
+    std::atomic<std::int64_t> g_s_echo_int{ k_unset };
+    std::atomic<std::int64_t> g_s_echo_double_is_pi{ -1 };
+    std::atomic<bool>         g_s_echo_string_ok{ false };
     // explicit-signature static path (bypasses resolution — MUST work)
     std::atomic<std::int64_t> g_s_sig_int{ k_unset };
     std::atomic<std::int64_t> g_s_sig_double{ k_unset };
     std::atomic<std::int64_t> g_s_sig_string{ k_unset };
+
+    // ── ARRAY-vs-scalar resolution ─────────────────────────────────────────
+    // Scalar resolution must be UNPERTURBED by the presence of array overloads
+    // (the resolver's array-token parser must walk past "[I"/"[J" when matching
+    // a scalar arg); and an explicit "([I)I"/"([J)I" call must reach the array
+    // body.  g_r_int_scalar_amid_arrays mirrors g_r_int but proves the scalar
+    // pick still lands on (I)I even though array overloads share the name "pick".
+    std::atomic<std::int64_t> g_arr_int_sig{ k_unset };       // pick_sig("([I)I", int[])
+    std::atomic<std::int64_t> g_arr_long_sig{ k_unset };      // pick_sig("([J)I", long[])
+    std::atomic<std::int64_t> g_arr_int_len{ k_unset };       // echoed int[] length
+    std::atomic<std::int64_t> g_arr_int_head{ k_unset };      // echoed int[][0]
+    std::atomic<std::int64_t> g_arr_long_len{ k_unset };
+    std::atomic<std::int64_t> g_arr_long_head{ k_unset };
+    std::atomic<int>          g_arr_int_attempted{ 0 };       // 1 once the int[] alloc succeeded
+    std::atomic<int>          g_arr_long_attempted{ 0 };
+    std::atomic<std::int64_t> g_r_int_scalar_amid_arrays{ k_unset };  // scalar int still -> (I)I
+    std::atomic<std::int64_t> g_r_long_scalar_amid_arrays{ k_unset }; // scalar long still -> (J)I
 
     // ── ambiguous unregistered-wrapper resolution (nondeterministic; [INFO]) ─
     std::atomic<std::int64_t> g_amb_unregistered{ k_unset };
@@ -353,59 +406,82 @@ namespace
         // whatever int comes back (documents the fallback, never asserts a value).
         g_only_int_mismatch.store(s.only_int_mismatch_double(99.0));
 
-        // ===== STATIC name-only overload resolution (KNOWN-broken + UNSAFE) =
+        // ===== STATIC name-only overload resolution (the [high] flaw, now FIXED) =
         //
-        // SAFETY (do NOT remove the guard): static-overload resolution is DEAD on
-        // BOTH dispatch paths.  resolve_compatible_method() returns this->method
-        // unconditionally for a static proxy because object==nullptr
-        // (vmhook.hpp:13652-13656 — the hierarchy walk is skipped).  So a static
-        // name-only call dispatches whatever overload get_method() latched onto
-        // FIRST by name, NOT the one matching the C++ arg type.  HotSpot orders
-        // InstanceKlass._methods by the name Symbol's identity, so "which spick
-        // is first" is effectively arbitrary across JDK/compiler builds.
+        // HISTORY: static-overload resolution USED to be dead — resolve_compatible_
+        // method() returned this->method unconditionally for a static proxy because
+        // object==nullptr (the hierarchy walk was skipped), so a static name-only
+        // call dispatched whatever overload get_method() latched onto FIRST by name,
+        // not the one matching the C++ arg type.  When that first-by-name overload
+        // had a REFERENCE parameter (spick(String)) and we passed a primitive, the
+        // primitive bits were blasted into a reference slot and the callee's
+        // reference-store barrier AV'd the whole JVM (crashed windows-clang-java8 on
+        // the FIRST call, spick(int 1)).
         //
-        // When that first-by-name overload has a REFERENCE parameter (here the
-        // only candidate is spick(String) -> (Ljava/lang/String;)I) and we pass a
-        // primitive, the primitive bits are blasted into a reference slot:
-        //   * call_jni fallback: write_jni_arg_to_slot puts the raw int bits in
-        //     jvalue.l (vmhook.hpp:10160) and CallStaticIntMethodA hands the JVM a
-        //     bogus oop (e.g. 0x1);
-        //   * call_stub fast path: pack() memcpy's the int bits into params[i]
-        //     (vmhook.hpp:13187) which the interpreter reads as an oop.
-        // Either way the callee's `lastStringArg = a` store runs the GC
-        // reference-store barrier on that bogus oop and the JVM takes an access
-        // violation that tears the whole process down.  This is exactly what
-        // crashed windows-clang-java8 (call_jni path, methods array ordered the
-        // String overload first) on the very FIRST static call, spick(int 1).
-        //
-        // A crash truncates the ENTIRE test artifact (no TOTAL line) — strictly
-        // worse than a FAIL — and the broken behaviour is already only recorded
-        // as [INFO], never asserted.  So we DO NOT perform the static name-only
-        // calls at all; we mark every outcome as deliberately-skipped-unsafe and
-        // characterize the bug below.  The explicit-signature static path that
-        // follows (arg type matches the slot, no reference-slot blasting) is safe
-        // on every path and remains the hard assertion that the static methods
-        // exist + dispatch on this JDK.
-        // FIXED (vmhook.hpp): resolve_compatible_method() now derives a STATIC
-        // method's declaring klass from the Method's ConstantPool _pool_holder and
-        // walks the hierarchy, so these name-only static calls resolve to the
-        // arg-MATCHING overload (not the first-by-_methods-order one); and both
-        // call paths now REFUSE to dispatch on a total type-mismatch (fail-safe —
-        // a refused call returns monostate, never the wrong-slot JVM AV).  So the
-        // calls are safe to make and must resolve correctly to RET_<type> + SBIAS
-        // (asserted in the else branch below).  k_skipped_unsafe is retained only
-        // as the sentinel the (now-unreached) skip branch keys on.
+        // FIXED (vmhook.hpp resolve_compatible_method, commit "Fix #7"): for a
+        // STATIC proxy (object==nullptr) the declaring klass is now derived from the
+        // Method's ConstantPool _pool_holder, so the hierarchy walk runs and picks
+        // the arg-MATCHING overload (vmhook.hpp:14716-14755).  So these name-only
+        // static calls are SAFE and must resolve correctly to RET_<type> + SBIAS —
+        // hard-asserted below, exactly mirroring the instance assertions.  This is
+        // the regression target for the flaw the fix restored.
+        // Each echo is captured IMMEDIATELY after its call — the spick(...) bodies
+        // share the same lastXArg static fields, so a later call would overwrite an
+        // echo read at the end of the block.
         g_s_int.store(overload_fixture::static_method("spick")->call(static_cast<std::int32_t>(1)));
-        g_s_long.store(overload_fixture::static_method("spick")->call(static_cast<std::int64_t>(2)));
+        g_s_echo_int.store(overload_fixture::last_int());                       // 1
+        g_s_long.store(overload_fixture::static_method("spick")->call(static_cast<std::int64_t>(2)));   // int64 -> J
         g_s_double.store(overload_fixture::static_method("spick")->call(3.14));
+        g_s_echo_double_is_pi.store(overload_fixture::last_double() == 3.14 ? 1 : 0);
         g_s_float.store(overload_fixture::static_method("spick")->call(2.5f));
         g_s_bool.store(overload_fixture::static_method("spick")->call(true));
+        g_s_byte.store(overload_fixture::static_method("spick")->call(static_cast<std::int8_t>(-7)));
+        g_s_short.store(overload_fixture::static_method("spick")->call(static_cast<std::int16_t>(-200)));
+        g_s_char.store(overload_fixture::static_method("spick")->call(static_cast<std::uint16_t>(0x1234)));
         g_s_string.store(overload_fixture::static_method("spick")->call(std::string{ "s" }));
+        g_s_echo_string_ok.store(overload_fixture::last_string() == std::string{ "s" });
+        // STATIC arity disambiguation: spick(int,int) by name, distinct from the
+        // single-arg spick(int).
+        g_s_arity2.store(overload_fixture::static_method("spick")->call(
+            static_cast<std::int32_t>(30), static_cast<std::int32_t>(40)));
 
         // explicit-signature static path: bypasses resolution -> MUST be exact.
         g_s_sig_int.store(overload_fixture::static_method("spick", "(I)I")->call(static_cast<std::int32_t>(1)));
         g_s_sig_double.store(overload_fixture::static_method("spick", "(D)I")->call(3.14));
         g_s_sig_string.store(overload_fixture::static_method("spick", "(Ljava/lang/String;)I")->call(std::string{ "s" }));
+
+        // ===== ARRAY-vs-scalar resolution ==================================
+        // (1) The mere PRESENCE of pick(int[]) / pick(long[]) in the methods array
+        //     must NOT perturb scalar resolution: resolving a C++ int / int64 by
+        //     name walks every "pick" descriptor, and next_argument_descriptor must
+        //     skip the leading '[' of "[I"/"[J" so the scalar arg still lands on
+        //     (I)I / (J)I — never on the array overload.
+        g_r_int_scalar_amid_arrays.store(s.pick(static_cast<std::int32_t>(77)));
+        g_r_long_scalar_amid_arrays.store(s.pick(static_cast<std::int64_t>(88)));
+        // (2) An explicit "([I)I" / "([J)I" call must reach the ARRAY body.  Build a
+        //     real Java int[3]/long[2], wrap the oop, dispatch via the pinned
+        //     signature.  Fully guarded: if allocation fails, the call is skipped and
+        //     only [INFO] is recorded — never a fault, never a false FAIL.
+        {
+            void* const int_arr{ vmhook::make_java_array("[I", 3, sizeof(std::int32_t)) };
+            if (int_arr && vmhook::hotspot::is_valid_pointer(int_arr))
+            {
+                g_arr_int_attempted.store(1);
+                g_arr_int_sig.store(s.pick_sig("([I)I", std::make_unique<array_carrier>(int_arr)));
+                g_arr_int_len.store(overload_fixture::last_array_len());
+                g_arr_int_head.store(overload_fixture::last_array_head());
+            }
+        }
+        {
+            void* const long_arr{ vmhook::make_java_array("[J", 2, sizeof(std::int64_t)) };
+            if (long_arr && vmhook::hotspot::is_valid_pointer(long_arr))
+            {
+                g_arr_long_attempted.store(1);
+                g_arr_long_sig.store(s.pick_sig("([J)I", std::make_unique<array_carrier>(long_arr)));
+                g_arr_long_len.store(overload_fixture::last_array_len());
+                g_arr_long_head.store(overload_fixture::last_array_head());
+            }
+        }
 
         // ===== ambiguous unregistered-wrapper resolution (nondeterministic) =
         // unregistered_wrapper matches ANY L...;, so pick(String) and
@@ -415,25 +491,41 @@ namespace
             g_amb_unregistered.store(s.get_method("pick")->call(std::move(amb)));
         }
     }
-}
 
-VMHOOK_JVM_MODULE(method_overload)
-{
-    vmhook::register_class<overload_fixture>("vmhook/fixtures/MethodOverload");
-    // Register the Object wrapper so a wrapper arg resolves deterministically to
-    // pick(Object).  (unregistered_wrapper is intentionally NOT registered.)
-    vmhook::register_class<java_object>("java/lang/Object");
+    // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
+    // it under a try/catch and ALWAYS follow it with shutdown_hooks() (suite-
+    // safety: ZERO hooks armed on EVERY exit path, mirrors collection_list.cpp /
+    // register_class.cpp).
+    auto run_method_overload_checks(vmhook_test::context& ctx) -> void
+    {
+        // ─── ENTRY GUARD ────────────────────────────────────────────────────
+        // If MethodOverload is not loaded/resolvable, the static_field("go")/
+        // ("done") handshake and every get_method() below would operate on an
+        // unresolved klass.  Bail cleanly to [INFO] (the wrapper's final
+        // shutdown_hooks() still runs).  loadFixtures() loads every
+        // vmhook.fixtures.* class each run, so this is belt-and-braces.
+        if (vmhook::find_class("vmhook/fixtures/MethodOverload") == nullptr)
+        {
+            ctx.record("[INFO] method_overload: MethodOverload not loaded/resolvable on this "
+                       "run; skipping the module's live checks (no crash, no hooks armed).");
+            return;
+        }
 
-    const bool call_stub_present{ vmhook::detail::find_call_stub_entry() != nullptr };
-    // Publish the path to the detour BEFORE the probe runs so run_all() can label
-    // its [INFO] correctly.  NOTE: the static name-only calls are skipped on BOTH
-    // paths (the static resolver is dead regardless of call_stub vs call_jni, and
-    // a mis-resolved reference-slot dispatch can AV on either), so this flag is
-    // diagnostic only — it does not gate the skip.
-    g_call_jni_fallback_active.store(!call_stub_present, std::memory_order_relaxed);
-    ctx.record(std::string{ "[INFO] method_overload dispatch path: " }
-               + (call_stub_present ? "call_stub fast path (StubRoutines::_call_stub_entry present)"
-                                    : "call_jni fallback (call stub absent — static-overload bug is LIVE)"));
+        vmhook::register_class<overload_fixture>("vmhook/fixtures/MethodOverload");
+        // Register the Object wrapper so a wrapper arg resolves deterministically to
+        // pick(Object).  (unregistered_wrapper and array_carrier are intentionally
+        // NOT registered — see their class comments.)
+        vmhook::register_class<java_object>("java/lang/Object");
+
+        const bool call_stub_present{ vmhook::detail::find_call_stub_entry() != nullptr };
+        // Publish the dispatch path to the detour BEFORE the probe runs so run_all()
+        // can label its [INFO] correctly.  Diagnostic only: BOTH paths now resolve
+        // statics correctly (fix #7), so this flag never gates a skip — it just
+        // documents which gate (call_stub fast path vs call_jni fallback) ran.
+        g_call_jni_fallback_active.store(!call_stub_present, std::memory_order_relaxed);
+        ctx.record(std::string{ "[INFO] method_overload dispatch path: " }
+                   + (call_stub_present ? "call_stub fast path (StubRoutines::_call_stub_entry present)"
+                                        : "call_jni fallback (call stub absent — JDK 21+)"));
 
     {
         auto handle{ vmhook::scoped_hook<overload_fixture>(
@@ -569,75 +661,91 @@ VMHOOK_JVM_MODULE(method_overload)
         ctx.check("mo_static_sig_string_exact", g_s_sig_string.load() == RET_STRING + SBIAS);
 
         // =====================================================================
-        //  STATIC NAME-ONLY overload resolution — KNOWN-BROKEN *and* UNSAFE.
-        //  resolve_compatible_method bails when object==nullptr (vmhook.hpp:13652)
-        //  so a static name-only call dispatches the first-by-name overload; when
-        //  that overload has a reference parameter and we pass a primitive, the
-        //  JVM dereferences a bogus oop and AVs (crashed windows-clang-java8).  We
-        //  DELIBERATELY SKIP these calls (run_all stores k_skipped_unsafe) — a
-        //  crash truncates the whole artifact, which is far worse than a FAIL, and
-        //  the outcome was only ever recorded as [INFO] anyway.  Record the skip;
-        //  emit ONE soft signal; NEVER fail CI here.
+        //  STATIC NAME-ONLY overload resolution — the [high] flaw, now FIXED and
+        //  hard-asserted as a regression target.  static_method("spick")->call(<typed>)
+        //  must re-pick the arg-MATCHING overload across the FULL primitive
+        //  descriptor set (I J D F Z B S C), by ARITY, and for String — exactly as
+        //  the instance path does.  Before fix #7 this resolver bailed for
+        //  object==nullptr and dispatched the first-by-name overload (and AV'd the
+        //  JVM when a primitive hit a reference slot); the fix derives the declaring
+        //  klass from the Method's ConstantPool _pool_holder (vmhook.hpp:14716-14755)
+        //  so the hierarchy walk runs.  Each distinct sentinel proves WHICH spick ran.
         // =====================================================================
-        const std::int64_t s_int{ g_s_int.load() };
-        const std::int64_t s_long{ g_s_long.load() };
-        const std::int64_t s_double{ g_s_double.load() };
-        const std::int64_t s_float{ g_s_float.load() };
-        const std::int64_t s_bool{ g_s_bool.load() };
-        const std::int64_t s_string{ g_s_string.load() };
-        const bool static_name_only_skipped{ s_int == k_skipped_unsafe };
-        const bool call_jni_path{ g_call_jni_fallback_active.load() };
-        if (static_name_only_skipped)
+        ctx.record(std::string{ "[INFO] STATIC dispatch path: " }
+                   + (g_call_jni_fallback_active.load() ? "call_jni fallback" : "call_stub fast path"));
+        ctx.check("mo_static_int_resolves_int",        g_s_int.load()    == RET_INT + SBIAS);
+        ctx.check("mo_static_long_resolves_long",      g_s_long.load()   == RET_LONG + SBIAS);
+        ctx.check("mo_static_double_resolves_double",  g_s_double.load() == RET_DOUBLE + SBIAS);
+        ctx.check("mo_static_float_resolves_float",    g_s_float.load()  == RET_FLOAT + SBIAS);
+        ctx.check("mo_static_bool_resolves_boolean",   g_s_bool.load()   == RET_BOOLEAN + SBIAS);
+        ctx.check("mo_static_byte_resolves_byte",      g_s_byte.load()   == RET_BYTE + SBIAS);
+        ctx.check("mo_static_short_resolves_short",    g_s_short.load()  == RET_SHORT + SBIAS);
+        ctx.check("mo_static_char_resolves_char",      g_s_char.load()   == RET_CHAR + SBIAS);
+        ctx.check("mo_static_string_resolves_string",  g_s_string.load() == RET_STRING + SBIAS);
+        // STATIC arity disambiguation: spick(int,int) is told from spick(int).
+        ctx.check("mo_static_arity2_resolves_int_int", g_s_arity2.load() == RET_INT_INT + SBIAS);
+        ctx.check("mo_static_arity1_vs_arity2_distinct",
+                  g_s_int.load() != g_s_arity2.load());
+        // The four ambiguous-by-value-but-distinct-by-type statics land on four
+        // DIFFERENT overloads — the static mirror of the instance crown-jewel check.
+        ctx.check("mo_static_int_long_double_float_all_distinct",
+                  g_s_int.load() != g_s_long.load()
+                  && g_s_long.load() != g_s_double.load()
+                  && g_s_double.load() != g_s_float.load()
+                  && g_s_int.load() != g_s_float.load());
+        // STATIC arg-value fidelity: right value reached the right static slot.
+        ctx.check("mo_static_int_arg_value_echoed",    g_s_echo_int.load() == 1);
+        ctx.check("mo_static_double_arg_value_echoed", g_s_echo_double_is_pi.load() == 1);
+        ctx.check("mo_static_string_arg_value_echoed", g_s_echo_string_ok.load());
+        // The static name-only path and the static explicit-signature path must
+        // agree on the same overload (cross-check of the two static resolutions).
+        ctx.check("mo_static_nameonly_agrees_with_sig_int",
+                  g_s_int.load() == g_s_sig_int.load());
+        ctx.check("mo_static_nameonly_agrees_with_sig_double",
+                  g_s_double.load() == g_s_sig_double.load());
+        ctx.check("mo_static_nameonly_agrees_with_sig_string",
+                  g_s_string.load() == g_s_sig_string.load());
+
+        // =====================================================================
+        //  ARRAY-vs-scalar resolution.
+        // =====================================================================
+        // (1) Scalar resolution is UNPERTURBED by the array overloads' presence:
+        //     a C++ int / int64 still resolves to (I)I / (J)I even though the
+        //     methods array now also holds "([I)I" / "([J)I" (the resolver's
+        //     array-token parser walked past the leading '[').
+        ctx.check("mo_scalar_int_unperturbed_by_array_overload",
+                  g_r_int_scalar_amid_arrays.load() == RET_INT);
+        ctx.check("mo_scalar_long_unperturbed_by_array_overload",
+                  g_r_long_scalar_amid_arrays.load() == RET_LONG);
+        // (2) Explicit "([I)I" / "([J)I" calls reach the ARRAY bodies (distinct
+        //     from each other and from every scalar overload).  Guarded on the
+        //     array allocation having succeeded; if it did not, record [INFO].
+        if (g_arr_int_attempted.load() == 1)
         {
-            ctx.record(std::string{ "[INFO] STATIC name-only resolution: SKIPPED (not executed) — calling a "
-                       "static overloaded method by name is UNSAFE on this build (dispatch path: " }
-                       + (call_jni_path ? "call_jni fallback" : "call_stub fast path")
-                       + ").  resolve_compatible_method() bails for object==nullptr (vmhook.hpp:13652), so "
-                         "spick(<primitive>) dispatches the first-by-name overload; if that overload takes a "
-                         "reference (e.g. spick(String)=(Ljava/lang/String;)I) the primitive bits become a bogus "
-                         "oop and the callee's reference-store barrier AVs the JVM.  This crashed "
-                         "windows-clang-java8 on the FIRST call, spick(int 1).  The explicit-signature static "
-                         "path below is the hard proof that the static methods exist + dispatch on this JDK.");
-            ctx.record("[INFO] static_overload_resolution_works = unknown (calls skipped to avoid the JVM-AV "
-                       "described above; the underlying flaw is real — see the vmhook bug report)");
-            // Pipeline-alive proof when the name-only calls are skipped: the
-            // explicit-signature static calls (asserted above as
-            // mo_static_sig_*_exact) prove the static dispatch pipeline is live.
-            ctx.check("mo_static_pipeline_alive",
-                      g_s_sig_int.load() == RET_INT + SBIAS);
+            ctx.check("mo_int_array_sig_resolves_int_array",  g_arr_int_sig.load()  == RET_INT_ARRAY);
+            ctx.check("mo_int_array_arg_landed", g_arr_int_len.load() == 3);
+            ctx.check("mo_int_array_distinct_from_scalar_int",
+                      g_arr_int_sig.load() != g_r_int.load());
         }
         else
         {
-            ctx.record("[INFO] STATIC name-only resolution (expected int/long/double/float/bool/string sentinels "
-                       + std::to_string(RET_INT + SBIAS) + "/" + std::to_string(RET_LONG + SBIAS) + "/"
-                       + std::to_string(RET_DOUBLE + SBIAS) + "/" + std::to_string(RET_FLOAT + SBIAS) + "/"
-                       + std::to_string(RET_BOOLEAN + SBIAS) + "/" + std::to_string(RET_STRING + SBIAS) + "):");
-            ctx.record("[INFO]   spick(int)="    + std::to_string(s_int)
-                       + " spick(long)="          + std::to_string(s_long)
-                       + " spick(double)="        + std::to_string(s_double)
-                       + " spick(float)="         + std::to_string(s_float)
-                       + " spick(bool)="          + std::to_string(s_bool)
-                       + " spick(String)="        + std::to_string(s_string));
-            const bool static_resolution_correct{
-                s_int == RET_INT + SBIAS
-                && s_long == RET_LONG + SBIAS
-                && s_double == RET_DOUBLE + SBIAS
-                && s_float == RET_FLOAT + SBIAS
-                && s_bool == RET_BOOLEAN + SBIAS
-                && s_string == RET_STRING + SBIAS };
-            ctx.record(std::string{ "[INFO] static_overload_resolution_works = " }
-                       + (static_resolution_correct
-                              ? "true (this JDK/path resolved statics correctly)"
-                              : "false (KNOWN flaw: resolve_compatible_method bails for object==nullptr, "
-                                "vmhook.hpp:13652 — static_method(name)->call(typed) cannot re-pick the overload)"));
-            // A weaker invariant that DOES hold even with the bug: at least one
-            // static call returned a valid static sentinel (the fixture + dispatch
-            // are wired), proving the [INFO] above reflects resolution, not a dead
-            // pipeline.
-            ctx.check("mo_static_pipeline_alive",
-                      s_int >= RET_NOARG + SBIAS && s_int <= RET_INT_STRING + SBIAS
-                      ? true
-                      : (s_int >= RET_NOARG && s_int <= RET_INT_STRING));
+            ctx.record("[INFO] int[] allocation unavailable in this detour — "
+                       "explicit ([I)I array dispatch skipped (no fault, no FAIL)");
+        }
+        if (g_arr_long_attempted.load() == 1)
+        {
+            ctx.check("mo_long_array_sig_resolves_long_array", g_arr_long_sig.load() == RET_LONG_ARRAY);
+            ctx.check("mo_long_array_arg_landed", g_arr_long_len.load() == 2);
+        }
+        else
+        {
+            ctx.record("[INFO] long[] allocation unavailable in this detour — "
+                       "explicit ([J)I array dispatch skipped (no fault, no FAIL)");
+        }
+        if (g_arr_int_attempted.load() == 1 && g_arr_long_attempted.load() == 1)
+        {
+            ctx.check("mo_int_array_vs_long_array_distinct",
+                      g_arr_int_sig.load() != g_arr_long_sig.load());
         }
 
         // =====================================================================
@@ -652,5 +760,39 @@ VMHOOK_JVM_MODULE(method_overload)
                    + "); first-match-wins with no ambiguity diagnostic is a KNOWN flaw");
         ctx.record(std::string{ "[INFO] unregistered_wrapper_matched_a_reference_overload = " }
                    + ((amb == RET_STRING || amb == RET_OBJECT) ? "true" : "false"));
+    }
+    }
+}
+
+VMHOOK_JVM_MODULE(method_overload)
+{
+    // Run the whole body under a try/catch so a stray throw from any vmhook call
+    // (a get_method() / call() resolution, a field read, an array allocation, the
+    // harness) can never escape this module.  A throw is recorded as [INFO], never
+    // a FAIL (mirrors collection_list.cpp / register_class.cpp).
+    bool body_threw{ false };
+    try
+    {
+        run_method_overload_checks(ctx);
+    }
+    catch (...)
+    {
+        body_threw = true;
+    }
+
+    // FINAL CLEANUP — belt-and-braces, OUTSIDE the try so it ALWAYS runs.  Other
+    // modules run after this one, so the module MUST leave ZERO hooks armed.  The
+    // only hook (the scoped_hook on tick()) already uninstalled at its scope exit;
+    // this unconditional shutdown_hooks() guarantees an empty hook table even if
+    // the body threw BEFORE reaching that scope exit (it is idempotent and
+    // safe-when-empty — proven by shutdown_hooks_teardown).  A leaked armed hook is
+    // exactly the failure mode that cascaded across the matrix in Wave 3.
+    vmhook::shutdown_hooks();
+
+    if (body_threw)
+    {
+        ctx.record("[INFO] method_overload: the test body threw and was contained "
+                   "(no crash, no hooks armed); see preceding checks for partial "
+                   "results.");
     }
 }
