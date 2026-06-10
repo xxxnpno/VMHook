@@ -1237,5 +1237,105 @@ int main()
               static_cast<std::unique_ptr<W>>(arr_alt) == nullptr);
     }
 
+    // ---------------------------------------------------------------------
+    // 34. GC-safety / os::safe_read fallback: field_proxy::get() reads the
+    //     field bytes through vmhook::os::safe_read (ReadProcessMemory on
+    //     Windows / process_vm_readv + signal-guarded fallback on POSIX), so a
+    //     field_pointer aimed at an UNMAPPED address must NOT fault — get()
+    //     recovers with the same zero/empty result the null-pointer guard
+    //     returns.  This is the no-JVM stand-in for the relocating-GC race
+    //     where a static field's class mirror moves between resolve and read,
+    //     leaving the cached field_pointer pointing at a stale/unmapped page.
+    //     Before the fix get() raw-memcpy'd that pointer and crashed.
+    //
+    //     0xDEAD0000 is reliably unmapped in this process on every supported
+    //     platform; safe_read returns false there (never faults).  We first
+    //     confirm safe_read itself rejects the address, then drive get() for
+    //     every signature and assert the recovered value collapses to zero.
+    // ---------------------------------------------------------------------
+    {
+        void* const unmapped{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xDEAD0000ULL)) };
+
+        // Precondition: the address really is unreadable (so the cases below
+        // exercise the recovery arm, not an accidentally-mapped page).
+        std::uint64_t scratch{ 0 };
+        const bool readable{ vmhook::os::safe_read(&scratch, unmapped, sizeof(scratch)) };
+        check("safe_read_rejects_unmapped_address", readable == false);
+
+        // Each primitive signature: get() must return without faulting and the
+        // value must read back as zero (failed safe_read leaves the zero-init).
+        {
+            vmhook::field_proxy p{ unmapped, "Z", false };
+            check("unmapped_Z_recovers_false", static_cast<bool>(p.get()) == false);
+        }
+        {
+            vmhook::field_proxy p{ unmapped, "B", false };
+            auto v = p.get();
+            check("unmapped_B_selects_int8_alternative", v.data.index() == idx::k_i8);
+            check("unmapped_B_recovers_zero", static_cast<std::int8_t>(v) == 0);
+        }
+        {
+            vmhook::field_proxy p{ unmapped, "S", false };
+            check("unmapped_S_recovers_zero", static_cast<std::int16_t>(p.get()) == 0);
+        }
+        {
+            vmhook::field_proxy p{ unmapped, "I", false };
+            auto v = p.get();
+            check("unmapped_I_selects_int32_alternative", v.data.index() == idx::k_i32);
+            check("unmapped_I_recovers_zero", static_cast<std::int32_t>(v) == 0);
+        }
+        {
+            vmhook::field_proxy p{ unmapped, "J", false };
+            check("unmapped_J_recovers_zero", static_cast<std::int64_t>(p.get()) == 0);
+        }
+        {
+            vmhook::field_proxy p{ unmapped, "F", false };
+            check("unmapped_F_recovers_zero", static_cast<float>(p.get()) == 0.0f);
+        }
+        {
+            vmhook::field_proxy p{ unmapped, "D", false };
+            check("unmapped_D_recovers_zero", static_cast<double>(p.get()) == 0.0);
+        }
+        {
+            vmhook::field_proxy p{ unmapped, "C", false };
+            auto v = p.get();
+            check("unmapped_C_selects_uint16_alternative", v.data.index() == idx::k_u16);
+            check("unmapped_C_recovers_zero", static_cast<std::uint16_t>(v) == 0u);
+        }
+        {
+            // Reference field over an unmapped slot: get() recovers a zero
+            // compressed OOP (the uint32 alternative), which routes to a null
+            // void* and an empty string — no fault, no wild decode.
+            vmhook::field_proxy p{ unmapped, "Ljava/lang/String;", false };
+            auto v = p.get();
+            check("unmapped_ref_selects_uint32_alternative", v.data.index() == idx::k_u32);
+            check("unmapped_ref_recovers_zero_oop", std::get<std::uint32_t>(v.data) == 0u);
+            check("unmapped_ref_routes_to_null_void_ptr", static_cast<void*>(v) == nullptr);
+            check("unmapped_ref_as_string_empty", v.as_string().empty());
+        }
+        {
+            vmhook::field_proxy p{ unmapped, "[I", false };
+            check("unmapped_array_recovers_zero_oop",
+                  std::get<std::uint32_t>(p.get().data) == 0u);
+        }
+
+        // get_compressed_oop() over the same unmapped reference slot must also
+        // route through safe_read and recover 0 rather than faulting.
+        {
+            vmhook::field_proxy p{ unmapped, "Ljava/lang/String;", false };
+            check("unmapped_get_compressed_oop_recovers_zero",
+                  p.get_compressed_oop() == 0u);
+        }
+
+        // A static-flagged proxy with NO mirror_klass (legacy 3-arg ctor) takes
+        // the same recovery path: get() never re-resolves (mirror_klass is
+        // null) and safe_read protects the stale field_pointer.
+        {
+            vmhook::field_proxy p{ unmapped, "I", true };
+            check("unmapped_static_legacy_recovers_zero",
+                  static_cast<std::int32_t>(p.get()) == 0);
+        }
+    }
+
     return failures == 0 ? 0 : 1;
 }

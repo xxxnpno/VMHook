@@ -12865,6 +12865,29 @@ namespace vmhook
         }
 
         /*
+            @param field_pointer Direct pointer to the field's bytes (mirror + offset),
+                                 computed at construction for compatibility with the
+                                 existing SET path and raw_address() consumers.
+            @param signature     JVM type descriptor.
+            @param is_static     true (this overload is for static fields).
+            @param mirror_klass  GC-STABLE declaring klass whose _java_mirror OopHandle
+                                 survives relocation; used by get() to re-resolve the
+                                 *current* mirror address at read time so a relocating
+                                 GC (G1) moving the mirror between resolve and read can
+                                 never leave us dereferencing a stale/unmapped address.
+            @param field_offset  Offset of the field within the mirror oop.
+        */
+        field_proxy(void* field_pointer, std::string sig, const bool is_static_flag,
+                    vmhook::hotspot::klass* mirror_klass, const std::size_t field_offset) noexcept
+            : field_pointer{ field_pointer }
+            , signature_text{ std::move(sig) }
+            , static_field{ is_static_flag }
+            , mirror_klass{ mirror_klass }
+            , field_offset{ field_offset }
+        {
+        }
+
+        /*
             @brief Reads the field and returns a typed copy.
             @details
             Dispatches on the JVM type descriptor to determine how many bytes to
@@ -12877,63 +12900,91 @@ namespace vmhook
         auto get() const noexcept
             -> value_t
         {
-            if (!this->field_pointer)
+            // GC-safety: re-resolve the field address for STATIC fields at read
+            // time.  field_pointer was computed as mirror_oop + offset back when
+            // static_field() ran; a relocating GC (G1) can move that mirror oop
+            // before we read it, so the cached address may be stale or unmapped.
+            // mirror_klass is a GC-STABLE root whose _java_mirror OopHandle always
+            // yields the *current* mirror address (see get_java_mirror()).  When
+            // mirror_klass is null (every instance field, and statics built via
+            // the legacy 3-arg ctor) read_pointer == field_pointer, so the
+            // instance / fast path is byte-identical to before.
+            void* read_pointer{ this->field_pointer };
+            if (this->mirror_klass)
+            {
+                void* const live_mirror{ this->mirror_klass->get_java_mirror() };
+                if (live_mirror && vmhook::hotspot::is_valid_pointer(live_mirror))
+                {
+                    read_pointer = reinterpret_cast<std::uint8_t*>(live_mirror) + this->field_offset;
+                }
+            }
+
+            if (!read_pointer)
             {
                 return value_t{ std::int32_t{}, this->signature_text };
             }
 
+            // Every field-byte read goes through os::safe_read (ReadProcessMemory
+            // on Windows / process_vm_readv + signal-guarded fallback on POSIX) so
+            // a transiently-stale or unmapped address — e.g. a mirror caught mid
+            // relocation — returns the zero-initialized default instead of
+            // faulting (FLAW: stale-mirror crash).  On a valid mapped page this is
+            // a kernel-validated copy of the SAME bytes the previous memcpy read,
+            // so a successful read returns the identical value as before.  The
+            // local is zero-initialized first, so a failed read yields the same
+            // empty/zero result the null-pointer guard above returns.
             if (this->signature_text == "Z")
             {
                 bool value{};
-                std::memcpy(&value, this->field_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "B")
             {
                 std::int8_t value{};
-                std::memcpy(&value, this->field_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "S")
             {
                 std::int16_t value{};
-                std::memcpy(&value, this->field_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "I")
             {
                 std::int32_t value{};
-                std::memcpy(&value, this->field_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "J")
             {
                 std::int64_t value{};
-                std::memcpy(&value, this->field_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "F")
             {
                 float value{};
-                std::memcpy(&value, this->field_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "D")
             {
                 double value{};
-                std::memcpy(&value, this->field_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "C")
             {
                 std::uint16_t value{};
-                std::memcpy(&value, this->field_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
 
             // Reference or array type - store compressed OOP
             std::uint32_t value{};
-            std::memcpy(&value, this->field_pointer, sizeof(value));
+            vmhook::os::safe_read(&value, read_pointer, sizeof(value));
             return value_t{ value, this->signature_text };
         }
 
@@ -13174,12 +13225,33 @@ namespace vmhook
             // so a misused proxy yields null, not garbage.  Valid callers only ask
             // for the compressed OOP of reference/array fields, so this is a no-op
             // for them.
-            if (!this->field_pointer || !this->is_reference())
+            if (!this->is_reference())
+            {
+                return 0;
+            }
+
+            // GC-safety, mirrored from get(): re-resolve a STATIC field's address
+            // through the GC-stable mirror_klass at read time so a relocated class
+            // mirror never leaves us reading a stale slot; then read the bytes via
+            // os::safe_read so a transiently-unmapped page recovers 0 instead of
+            // faulting.  On a valid mapped slot this returns the same 4 bytes the
+            // previous memcpy did (instance / fast path unchanged).
+            void* read_pointer{ this->field_pointer };
+            if (this->mirror_klass)
+            {
+                void* const live_mirror{ this->mirror_klass->get_java_mirror() };
+                if (live_mirror && vmhook::hotspot::is_valid_pointer(live_mirror))
+                {
+                    read_pointer = reinterpret_cast<std::uint8_t*>(live_mirror) + this->field_offset;
+                }
+            }
+
+            if (!read_pointer)
             {
                 return 0;
             }
             std::uint32_t value{};
-            std::memcpy(&value, this->field_pointer, sizeof(value));
+            vmhook::os::safe_read(&value, read_pointer, sizeof(value));
             return value;
         }
 
@@ -13187,6 +13259,23 @@ namespace vmhook
         void* field_pointer;
         std::string signature_text;
         bool        static_field;
+
+        // --- GC-stable re-resolution metadata (STATIC fields only) -----------
+        // For a static field, field_pointer == mirror_oop + field_offset, but the
+        // mirror is a relocatable young/heap oop.  A relocating GC (G1) can move
+        // it between the moment static_field() computed field_pointer and the
+        // moment get() dereferences it, leaving field_pointer pointing at a stale
+        // (possibly unmapped) old address -> wrong bytes or a fault.  To stay
+        // correct, remember the GC-STABLE root for the mirror — the declaring
+        // klass, whose _java_mirror OopHandle survives relocation — plus the
+        // field's offset, so get() can re-resolve the *current* mirror address at
+        // read time (see get_java_mirror()).
+        //
+        // For instance fields (and statics constructed via the legacy 3-arg ctor)
+        // these stay null/zero and get() uses the pre-computed field_pointer
+        // exactly as before — no behavioural change on that path.
+        vmhook::hotspot::klass* mirror_klass{ nullptr };
+        std::size_t             field_offset{ 0 };
     };
 
     // --- detail helpers that depend on hotspot types -------------------------
@@ -15052,7 +15141,9 @@ namespace vmhook
                     return std::nullopt;
                 }
                 void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
-                return vmhook::field_proxy{ field_pointer, entry->signature, true };
+                // Pass the GC-stable mirror_klass + offset so field_proxy::get()
+                // re-resolves the live mirror at read time (relocating-GC safe).
+                return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset };
             }
 
             if (!this->instance)
@@ -15119,7 +15210,9 @@ namespace vmhook
             }
 
             void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
-            return vmhook::field_proxy{ field_pointer, entry->signature, true };
+            // Pass the GC-stable mirror_klass + offset so field_proxy::get()
+            // re-resolves the live mirror at read time (relocating-GC safe).
+            return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset };
         }
 
         /*
@@ -15649,7 +15742,9 @@ namespace vmhook
                     return std::nullopt;
                 }
                 void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
-                return vmhook::field_proxy{ field_pointer, entry->signature, true };
+                // Pass the GC-stable mirror_klass + offset so field_proxy::get()
+                // re-resolves the live mirror at read time (relocating-GC safe).
+                return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset };
             }
             if (!this->instance)
             {
