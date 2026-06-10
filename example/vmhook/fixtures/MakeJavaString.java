@@ -7,17 +7,24 @@ import vmhook.Harness;
  * heap allocation / string construction).  This is the FIRST live-JVM coverage
  * of the make_java_string API: allocating a brand-new java.lang.String OOP from
  * C++ (no JNI NewStringUTF), across the LATIN1 / UTF16 / classic-char[] coder
- * paths, and proving the result is usable BOTH natively (read_java_string
- * round-trip) AND from executing Java bytecode (set_arg injection + a String
- * field the native side overwrites with a made oop).
+ * paths, and proving the result is usable THREE independent ways:
+ *   1. natively (read_java_string round-trip — the hard correctness gate);
+ *   2. from executing Java bytecode via the LOW-LEVEL injection surface
+ *      (return_value::set_arg into an interpreter local + field_proxy::set into a
+ *      static String field, both read back with real Java bytecode);
+ *   3. from executing Java bytecode via the PUBLIC method-call surface
+ *      ({@code method_proxy::call} with a {@code std::string} argument, which
+ *      constructs the String internally through make_java_string and hands it to
+ *      a Java {@link #echoCheck(int, String)} that compares it to the expected
+ *      literal with genuine String.equals / length / codePointCount).
  *
  * <p>The native module ({@code tests/jvm/modules/make_java_string.cpp}) installs
  * two interpreter hooks on this fixture and does ALL of its make_java_string /
- * read_java_string / set_arg / field-write work from INSIDE those detours, where
- * HotSpot's current_java_thread is established (the precondition for heap
- * allocation via make_java_object, which make_java_string calls).  The detours
- * run on a real bytecode dispatch, which is the only thing that fires an
- * interpreter hook.</p>
+ * read_java_string / set_arg / field-write / call work from INSIDE those detours,
+ * where HotSpot's current_java_thread is established (the precondition for heap
+ * allocation via make_java_object, which make_java_string calls, AND for the
+ * call stub / JNI call path).  The detours run on a real bytecode dispatch, which
+ * is the only thing that fires an interpreter hook.</p>
  *
  * <h3>Four canonical test strings (index 0..3)</h3>
  * <ul>
@@ -30,35 +37,41 @@ import vmhook.Harness;
  * Every non-ASCII constant is written with {@code \\uXXXX} escapes so the source
  * is pure ASCII and javac decodes it identically on every CI host regardless of
  * the build machine's file encoding.  The C++ module hard-codes the matching
- * UTF-8 byte expectations for the native round-trip.
+ * UTF-8 byte expectations for the native round-trip, AND drives a much wider set
+ * of native-only round-trips (interior NUL, astral surrogate pairs, lone
+ * surrogate, the U+00FF LATIN1 ceiling, 1000+-char strings, the 4096-char cap
+ * and its truncation boundary) that need no Java field — read_java_string reads
+ * the freshly-made backing array directly.
  *
- * <h3>Two interpreter-hook targets</h3>
+ * <h3>mode selector</h3>
+ * The native side sets {@link #mode} (and clears {@link #done}) on the rising
+ * edge of {@link #go}, then drives one probe cycle:
  * <ul>
- *   <li>{@link #roundtrip()} — a no-arg trigger.  Inside its native detour the
- *       module performs every make_java_string + read_java_string native
- *       round-trip AND writes a freshly-made String oop into each of the four
- *       {@code madeN} static String fields below (via field_proxy::set on the
- *       fixture's String field, i.e. the object-reference write path).  After
- *       the dispatch returns, {@link #captureMade()} snapshots — with genuine
- *       Java bytecode — what the JVM actually sees in each {@code madeN}
- *       (.equals against the expected literal, and .length()).</li>
- *   <li>{@link #injectArg(String)} — takes a String arg.  The probe sets
- *       {@link #injectWhich} to an index 0..3 and calls injectArg with a
- *       recognisable placeholder; the native detour makes the matching String
- *       and overwrites slot 1 via return_value::set_arg, so the body observes
- *       (and records) the INJECTED made string, not the placeholder.</li>
+ *   <li>0 = MAIN cycle.  Fire {@link #roundtrip()} once (native detour does every
+ *       native round-trip, writes a made oop into each {@code madeN} field, and
+ *       calls {@link #echoCheck} on the live receiver for each index), snapshot
+ *       the {@code madeN} fields with {@link #captureMade()}, then drive one
+ *       {@link #injectArg(String)} dispatch per index.</li>
+ *   <li>2 = SURVIVE-GC cycle.  Force {@code System.gc()} several times with young
+ *       churn (a relocating collector may move / reclaim the freshly-made backing
+ *       arrays that the unbarriered {@code madeN} static-field writes installed),
+ *       then re-snapshot the {@code madeN} fields with {@link #captureMadeGc()}.
+ *       This is the live-JVM probe for the suspected GC store-barrier hazard: a
+ *       String whose backing array is young and was stored into an older field by
+ *       a raw write with no card mark.</li>
  * </ul>
  *
  * <h3>KNOWN ISSUE — characterised, not asserted green</h3>
- * There is a suspected vmhook bug where a make_java_string / write_java_string
- * String matches on a native byte-view (read_java_string is byte-exact) yet
- * Java {@code expected.equals(made)} can return FALSE due to a coder / length /
- * array-klass metadata inconsistency (char[] vs byte[] per JDK).  This fixture
- * therefore RECORDS the actual Java-side .equals()/.length() outcomes into
- * primitive witness fields ({@code madeEqN}, {@code madeLenN}, {@code argEqN}, …)
- * that the native side reads back and asserts the ACTUAL observed value, keeping
- * CI green while still surfacing the behaviour.  The native round-trip
- * (read_java_string) is the hard correctness gate on the C++ side.
+ * There is a suspected vmhook hazard where a make_java_string String matches on a
+ * native byte-view (read_java_string is byte-exact) yet Java
+ * {@code expected.equals(made)} can disagree due to a coder / length / array-klass
+ * metadata inconsistency or a missing GC store barrier on the reference write.
+ * This fixture therefore RECORDS the actual Java-side .equals()/.length() outcomes
+ * into primitive witness fields ({@code madeEqN}, {@code madeLenN}, {@code argEqN},
+ * {@code echoEqN}, {@code madeEqGcN}, …) that the native side reads back and
+ * asserts as the ACTUAL observed value, keeping CI green while still surfacing the
+ * behaviour.  The native round-trip (read_java_string) is the hard correctness
+ * gate on the C++ side; a pure invariant (equals ⇒ correct length) stays HARD.
  *
  * <p>Java 8 syntax only (anonymous Harness.Probe, no var / lambda-in-field /
  * switch-expression / records).</p>
@@ -68,6 +81,15 @@ public final class MakeJavaString
     // ── go / done handshake driven by the native module via run_probe ───────
     public static volatile boolean go;
     public static volatile boolean done;
+
+    /**
+     * Cycle selector (native sets it on the rising edge of go, then clears
+     * done).  0 = MAIN (roundtrip + echo + injectArg); 2 = SURVIVE-GC re-capture.
+     */
+    public static volatile int mode;
+
+    /** How many times the SURVIVE-GC cycle has driven System.gc(). */
+    public static volatile int gcRounds;
 
     /**
      * Selects which canonical string the native injectArg() detour should make
@@ -129,15 +151,36 @@ public final class MakeJavaString
     public static boolean madeEq2;   public static int madeLen2;   public static boolean madeNull2;
     public static boolean madeEq3;   public static int madeLen3;   public static boolean madeNull3;
 
+    // ── Witnesses for the SAME made* fields re-read AFTER a forced GC
+    //    (snapshotted by captureMadeGc() in the mode-2 cycle).  A divergence
+    //    from the pre-GC snapshot is the fingerprint of the missing store
+    //    barrier: a young backing array reclaimed/relocated out from under an
+    //    unbarriered static-field reference write. ──
+    public static boolean madeEqGc0;   public static int madeLenGc0;   public static boolean madeNullGc0;
+    public static boolean madeEqGc1;   public static int madeLenGc1;   public static boolean madeNullGc1;
+    public static boolean madeEqGc2;   public static int madeLenGc2;   public static boolean madeNullGc2;
+    public static boolean madeEqGc3;   public static int madeLenGc3;   public static boolean madeNullGc3;
+
     // ── Witnesses for the set_arg INJECTION (written by injectArg's body) ───
-    // argSeenN is the .equals(expected[N]) result the BODY observed for the
+    // argEqN is the .equals(expected[N]) result the BODY observed for the
     // injected arg; argLenN is its .length(); argNullN true if the body saw
-    // null; argWasPlaceholderN true if the body still saw the placeholder
+    // null; argPlaceholderN true if the body still saw the placeholder
     // (i.e. set_arg did not take effect).
     public static boolean argEq0;   public static int argLen0;   public static boolean argNull0;   public static boolean argPlaceholder0;
     public static boolean argEq1;   public static int argLen1;   public static boolean argNull1;   public static boolean argPlaceholder1;
     public static boolean argEq2;   public static int argLen2;   public static boolean argNull2;   public static boolean argPlaceholder2;
     public static boolean argEq3;   public static int argLen3;   public static boolean argNull3;   public static boolean argPlaceholder3;
+
+    // ── Witnesses for the PUBLIC method-call surface (echoCheck), driven by
+    //    the native detour via method_proxy::call(index, std::string).  call()
+    //    builds the String through make_java_string internally, so these prove
+    //    the SAME constructor product is usable as a real call argument.
+    //    echoCalledN flips true the instant the body runs (so the native side
+    //    can tell "call dispatched" from "call never reached the body"). ──
+    public static boolean echoCalled0;   public static boolean echoEq0;   public static int echoLen0;   public static boolean echoNull0;   public static int echoCp0;
+    public static boolean echoCalled1;   public static boolean echoEq1;   public static int echoLen1;   public static boolean echoNull1;   public static int echoCp1;
+    public static boolean echoCalled2;   public static boolean echoEq2;   public static int echoLen2;   public static boolean echoNull2;   public static int echoCp2;
+    public static boolean echoCalled3;   public static boolean echoEq3;   public static int echoLen3;   public static boolean echoNull3;   public static int echoCp3;
 
     // =====================================================================
     //  Hooked methods.
@@ -146,9 +189,10 @@ public final class MakeJavaString
     /**
      * No-arg trigger.  The native module hooks this; calling it on a real
      * bytecode dispatch fires the interpreter hook, and the native detour does
-     * every make_java_string / read_java_string native round-trip AND writes a
-     * made oop into each madeN field.  Returns nothing; just bumps a counter so
-     * the native side can confirm the hook fired.
+     * every make_java_string / read_java_string native round-trip, writes a
+     * made oop into each madeN field, AND calls {@link #echoCheck} on the live
+     * receiver for each index (the public method-call surface).  Returns
+     * nothing; just bumps a counter so the native side can confirm the hook fired.
      */
     public void roundtrip()
     {
@@ -182,6 +226,35 @@ public final class MakeJavaString
     }
 
     /**
+     * Genuine-bytecode echo of a String the native side built with
+     * make_java_string and passed through {@code method_proxy::call}.  Compares
+     * {@code value} against {@link #expected(int)} for {@code which} and stores
+     * the .equals / .length() / null / codePointCount it observes into the
+     * per-index echo witnesses.  codePointCount is recorded so the native side
+     * can confirm astral / surrogate handling on a string built by the call path
+     * (none of the four canonical strings are astral, but the field is here for
+     * completeness and future expansion).  Returns the observed length so the
+     * call also has a non-void primitive return (-1 for null / unknown index).
+     */
+    public int echoCheck(final int which, final String value)
+    {
+        final boolean isNull = (value == null);
+        final int len = isNull ? -1 : value.length();
+        final int cp = isNull ? -1 : value.codePointCount(0, value.length());
+        final String exp = expected(which);
+        final boolean eq = (exp != null) && exp.equals(value);
+        switch (which)
+        {
+            case 0: echoCalled0 = true; echoEq0 = eq; echoLen0 = len; echoNull0 = isNull; echoCp0 = cp; break;
+            case 1: echoCalled1 = true; echoEq1 = eq; echoLen1 = len; echoNull1 = isNull; echoCp1 = cp; break;
+            case 2: echoCalled2 = true; echoEq2 = eq; echoLen2 = len; echoNull2 = isNull; echoCp2 = cp; break;
+            case 3: echoCalled3 = true; echoEq3 = eq; echoLen3 = len; echoNull3 = isNull; echoCp3 = cp; break;
+            default: break;
+        }
+        return len;
+    }
+
+    /**
      * Snapshots — with genuine getfield / String.equals / String.length
      * bytecode — what the JVM observes in each madeN field after the native
      * roundtrip detour wrote a make_java_string oop there.  Captures the
@@ -194,6 +267,22 @@ public final class MakeJavaString
         madeNull1 = (made1 == null); madeLen1 = madeNull1 ? -1 : made1.length(); madeEq1 = EXP1.equals(made1);
         madeNull2 = (made2 == null); madeLen2 = madeNull2 ? -1 : made2.length(); madeEq2 = EXP2.equals(made2);
         madeNull3 = (made3 == null); madeLen3 = madeNull3 ? -1 : made3.length(); madeEq3 = EXP3.equals(made3);
+    }
+
+    /**
+     * Re-snapshots the SAME madeN fields AFTER the forced-GC churn (mode 2).
+     * If a made String survived only by an unbarriered reference write, a
+     * relocating/reclaiming collector can leave these disagreeing with the
+     * pre-GC {@link #captureMade()} snapshot — the fingerprint the native side
+     * characterises.  Reads are wrapped so a corrupt String that throws on
+     * .equals/.length cannot wedge the probe loop.
+     */
+    private static void captureMadeGc()
+    {
+        madeNullGc0 = (made0 == null); try { madeLenGc0 = madeNullGc0 ? -1 : made0.length(); madeEqGc0 = EXP0.equals(made0); } catch (final Throwable t) { madeLenGc0 = -2; madeEqGc0 = false; }
+        madeNullGc1 = (made1 == null); try { madeLenGc1 = madeNullGc1 ? -1 : made1.length(); madeEqGc1 = EXP1.equals(made1); } catch (final Throwable t) { madeLenGc1 = -2; madeEqGc1 = false; }
+        madeNullGc2 = (made2 == null); try { madeLenGc2 = madeNullGc2 ? -1 : made2.length(); madeEqGc2 = EXP2.equals(made2); } catch (final Throwable t) { madeLenGc2 = -2; madeEqGc2 = false; }
+        madeNullGc3 = (made3 == null); try { madeLenGc3 = madeNullGc3 ? -1 : made3.length(); madeEqGc3 = EXP3.equals(made3); } catch (final Throwable t) { madeLenGc3 = -2; madeEqGc3 = false; }
     }
 
     static
@@ -209,11 +298,34 @@ public final class MakeJavaString
             @Override
             public void run()
             {
+                if (MakeJavaString.mode == 2)
+                {
+                    // SURVIVE-GC cycle: force a handful of collections with young
+                    // churn so a relocating/reclaiming collector has every chance
+                    // to move or free the freshly-made backing arrays that the
+                    // native side stored into the madeN static fields (mode 0)
+                    // through an unbarriered reference write.  Then re-snapshot.
+                    for (int round = 0; round < 4; round++)
+                    {
+                        final byte[] churn = new byte[1 << 16];
+                        if (churn.length == 0)
+                        {
+                            throw new IllegalStateException("unreachable");
+                        }
+                        System.gc();
+                        MakeJavaString.gcRounds++;
+                    }
+                    captureMadeGc();
+                    MakeJavaString.done = true;
+                    return;
+                }
+
+                // MAIN cycle (mode 0).
                 final MakeJavaString self = new MakeJavaString();
 
                 // (1) Fire the roundtrip hook once: a real bytecode dispatch so
-                //     the native detour does every native round-trip and writes
-                //     the madeN fields.
+                //     the native detour does every native round-trip, writes the
+                //     madeN fields, and drives echoCheck on the live receiver.
                 self.roundtrip();
 
                 // (2) Snapshot what Java sees in the madeN fields (pure Java).
