@@ -137,6 +137,44 @@ public final class FieldArraysObject
     /** Instance mixed Item[]: { Item(51), null }. */
     public volatile Item[] instMixedItems = { new Item(51), null };
 
+    // ---- RAW Object[] fields (declared type Object[], so the JVM signature is
+    //      "[Ljava/lang/Object;" rather than "[L...Item;") ------------------
+    // These prove the wrapper layer reads a generic Object[] field — whose
+    // ERASED element type is java.lang.Object — by re-wrapping each non-null
+    // slot as the concrete element type the caller asks for.  The runtime
+    // elements are still Items, so the decoded wrappers read their tags.
+
+    /** Canonical Object[] holding Items: declared type Object[]. */
+    public static volatile Object[] objectItems =
+        { new Item(60), new Item(70), new Item(80) };
+
+    /** Mixed Object[] holding Items + a null: { Item(61), null, Item(63) }. */
+    public static volatile Object[] objectMixed =
+        { new Item(61), null, new Item(63) };
+
+    /** A null Object[] reference (the array itself is null). */
+    public static volatile Object[] nullObjectArray = null;
+
+    // ---- 2D arrays (signature begins "[[", so the native to_vector<T>()
+    //      signature branch must walk the OUTER array; each element is an
+    //      INNER array OOP, re-wrapped as the requested element type) ---------
+    // The native side does not descend into the inner rows here (that needs a
+    // vector-of-vectors API the library does not expose); instead it proves the
+    // OUTER dimension is read with the right COUNT and per-row null-ness, and
+    // that an inner-null ROW decodes to a real nullptr slot.  This exercises the
+    // signature[1] == '[' arm of the array walk.
+
+    /** Canonical 2D Item[][]: 3 non-null rows of varying width. */
+    public static volatile Item[][] grid2d =
+        { { new Item(1) }, { new Item(2), new Item(3) }, { new Item(4) } };
+
+    /** 2D Item[][] with a NULL middle row: { row, null, row }. */
+    public static volatile Item[][] grid2dMixed =
+        { { new Item(11) }, null, { new Item(12), new Item(13) } };
+
+    /** Empty 2D Item[][] (outer length 0). */
+    public static volatile Item[][] grid2dEmpty = new Item[0][];
+
     // ---- Published values for native cross-checks -------------------------
     // Each Item carries a UNIQUE tag, so the native side proves it decoded the
     // right object by reading tag through the wrapper (field AND getTag method).
@@ -152,6 +190,10 @@ public final class FieldArraysObject
     public static volatile int mixedStringsLen;
     public static volatile int staticItemsLen;
     public static volatile int mixedItemsLen;
+    public static volatile int objectItemsLen;
+    public static volatile int objectMixedLen;
+    public static volatile int grid2dLen;
+    public static volatile int grid2dMixedLen;
 
     /** Hookable instance method — the native module hooks this to prove the
         fixture is live and to obtain a `self` that can read instance fields. */
@@ -166,6 +208,10 @@ public final class FieldArraysObject
         mixedStringsLen  = mixedStrings.length;
         staticItemsLen   = staticItems.length;
         mixedItemsLen    = mixedItems.length;
+        objectItemsLen   = objectItems.length;
+        objectMixedLen   = objectMixed.length;
+        grid2dLen        = grid2d.length;
+        grid2dMixedLen   = grid2dMixed.length;
     }
 
     static
