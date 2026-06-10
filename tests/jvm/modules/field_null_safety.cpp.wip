@@ -89,10 +89,8 @@ namespace
         }
 
         // ── handshake ──────────────────────────────────────────────────────
-        static auto set_go(bool value) -> void   { static_field("go")->set(value); }
-        static auto set_done(bool value) -> void { static_field("done")->set(value); }
-        static auto get_done() -> bool           { return static_field("done")->get(); }
-        static auto set_mode(std::int32_t m) -> void { static_field("mode")->set(m); }
+        static auto set_go(bool value) -> void { static_field("go")->set(value); }
+        static auto get_done() -> bool          { return static_field("done")->get(); }
 
         // ── resolve helper (true iff the accessor yields a proxy) ──────────
         static auto resolves(const char* name) -> bool
@@ -185,57 +183,11 @@ namespace
     // Constant the probe writes into okInt via putstatic.
     constexpr std::int32_t kRuntimeOkInt{ 0x0BEEF99 };  // 200044441 (== RUNTIME_OK_INT)
     constexpr std::int32_t kCanaryInt{ 0x600DC0DE };
-
-    // Fixture `mode` selector values (lockstep with FieldNullSafety.java).
-    constexpr std::int32_t kModeMutateOkInt{ 1 };  // putstatic okInt (live-state proof)
-    constexpr std::int32_t kModeGcSettle{ 2 };     // tenure this class's mirror
 }
 
 VMHOOK_JVM_MODULE(field_null_safety)
 {
     vmhook::register_class<fns>("vmhook/fixtures/FieldNullSafety");
-
-    // =====================================================================
-    //  PRELUDE — TENURE THIS CLASS'S java.lang.Class MIRROR before any static
-    //  VALUE read.  WHY (CI-only, windows·msvc 14.51): the library's static
-    //  read path resolves `mirror + offset` and then does a RAW (GC-unsafe)
-    //  read of that address.  The mirror is a young, relocatable heap oop the
-    //  first time this module touches it; a young GC firing between resolve and
-    //  read leaves the captured address pointing at the pre-relocation copy —
-    //  stale bytes (a WRONG value -> a clean [FAIL]) or, if the old page is
-    //  unmapped, a FAULT (-> the JVM dies, "no TOTAL").  This is the same
-    //  accepted raw-oop GC-safety gap deflaked in collection_list; it was
-    //  invisible on the old runner but the msvc-14.51 codegen/timing widened
-    //  the window enough to corrupt the FIRST handful of reads (~3/4 runs) on
-    //  java 24/25/26, while windows·clang and every linux/macos JDK stayed
-    //  green.  Driving the fixture's gcSettle() (garbage + System.gc() x2)
-    //  promotes the mirror to old-gen, where G1 will not relocate it, so every
-    //  value read below is stable and can stay a HARD ctx.check.
-    //
-    //  This is best-effort warm-up, NOT an assertion: it is recorded as [INFO]
-    //  and can never FAIL the suite.  If it does not complete (e.g. the probe
-    //  pump is busy), the value checks below would surface a genuine problem on
-    //  their own — we never weaken them.
-    // =====================================================================
-    {
-        const bool tenured{ ctx.run_probe(
-            [](bool value)
-            {
-                if (value)
-                {
-                    fns::set_done(false);
-                    fns::set_mode(kModeGcSettle);
-                }
-                fns::set_go(value);
-            },
-            []() { return fns::get_done(); }) };
-        ctx.record(std::string{ "[INFO] field_null_safety: pre-read mirror tenure "
-                                "(gcSettle: garbage + System.gc() x2) completed=" }
-                   + (tenured ? "yes" : "no")
-                   + " — promotes this class's java.lang.Class mirror to old-gen so the "
-                     "library's GC-unsafe raw static reads cannot race a relocating young "
-                     "GC (windows·msvc-14.51 first-touch fix).");
-    }
 
     // =====================================================================
     //  0. BASELINE — the happy path works at all (the guards must NOT have
@@ -713,21 +665,8 @@ VMHOOK_JVM_MODULE(field_null_safety)
     //      the null/garbage handling left the field surface in a degraded state.
     // =====================================================================
     {
-        // Rising-edge handshake: select mode 1 (mutateOkInt's putstatic) and
-        // clear the latched `done` BEFORE raising go.  Resetting mode is
-        // required because the PRELUDE above ran mode 2 (gcSettle) and left
-        // done==true; without this the probe would re-run gcSettle (or observe
-        // a stale done) instead of performing the putstatic this phase proves.
         const bool done{ ctx.run_probe(
-            [](bool value)
-            {
-                if (value)
-                {
-                    fns::set_done(false);
-                    fns::set_mode(kModeMutateOkInt);
-                }
-                fns::set_go(value);
-            },
+            [](bool value) { fns::set_go(value); },
             []() { return fns::get_done(); }) };
         ctx.check("runtime_probe_completed", done);
 
