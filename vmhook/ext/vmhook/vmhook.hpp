@@ -241,11 +241,21 @@
 // __ANDROID__.
 //
 // The deducing-this path is therefore enabled only on MSVC and non-NDK
-// Clang — that is where vmhook::object<T>::get_field can be invoked from
+// Clang < 20 — that is where vmhook::object<T>::get_field can be invoked from
 // both instance and static methods uniformly.
+//
+// Clang 20 changed overload resolution: a static-context `get_field("x")` now
+// binds the string literal to the deducing-this overload's explicit-object
+// parameter ("too few non-object arguments") instead of selecting the static
+// `std::string_view` overload, so the uniform static-context call no longer
+// compiles there.  (The VS18 / MSVC 14.51 runner image forces clang >= 20 via
+// STL1000.)  On clang >= 20 we therefore fall back to the gcc-style path:
+// instance-context get_field/get_method via the inherited using-declarations,
+// and static-context access via the always-available static_field/static_method.
 #if defined(__cpp_explicit_this_parameter) && __cpp_explicit_this_parameter >= 202110L \
     && (defined(__clang__) || defined(_MSC_VER)) \
-    && !defined(__ANDROID__)
+    && !defined(__ANDROID__) \
+    && !(defined(__clang__) && __clang_major__ >= 20)
     #define VMHOOK_HAS_DEDUCING_THIS 1
 #else
     #define VMHOOK_HAS_DEDUCING_THIS 0
