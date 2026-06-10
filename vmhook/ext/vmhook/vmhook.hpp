@@ -16208,6 +16208,47 @@ namespace vmhook
     // without depending on each other's identity.
 
     /*
+        @brief Reads a 4-byte narrow-oop field at `holder_oop + offset`.
+        @details
+        A Java reference field / array slot is a raw 32-bit narrow oop sitting
+        in foreign (JVM) heap memory at which no C++ `std::uint32_t` object's
+        lifetime ever began.  Reading it as `*reinterpret_cast<const
+        std::uint32_t*>(bytes)` is therefore a strict-aliasing violation (UB):
+        the access type does not match any object at that address.  Most
+        compilers tolerate it, but a type-based-alias-analysis pass is free to
+        treat such a load as not aliasing prior stores and hoist / reorder /
+        cache it — which is exactly the failure mode observed in the data-
+        dependent LinkedList Node `first -> next` pointer-chase on the
+        MSVC 14.51 toolset (cl 19.51): the list walk decoded WRONG element oops
+        at runtime while compiling clean.
+
+        `std::memcpy` is the standard, blessed way to type-pun trivially-
+        copyable bytes: it has no aliasing precondition, so the optimizer must
+        treat it as a genuine memory read of the live bytes.  On every supported
+        little-endian x64 target the 4 copied bytes are bit-for-bit the value
+        the `reinterpret_cast` load produced, so behaviour is byte-identical on
+        gcc / clang / older MSVC — only the UB (and the miscompile window it
+        opened) is removed.
+
+        The caller must have already validated `holder_oop` with
+        is_valid_pointer (every walk below does), so the page is mapped; this is
+        the same contract the previous `reinterpret_cast` deref relied on, and
+        the same memcpy idiom the collection_list test module's hand-walk uses.
+
+        Complexity: O(1). Exception safety: noexcept.
+    */
+    inline auto read_compressed_oop_at(const void* const holder_oop,
+                                       const std::size_t offset) noexcept
+        -> std::uint32_t
+    {
+        std::uint32_t compressed{};
+        std::memcpy(&compressed,
+                    reinterpret_cast<const std::uint8_t*>(holder_oop) + offset,
+                    sizeof(compressed));
+        return compressed;
+    }
+
+    /*
         @brief Walks a LinkedList's first->next Node chain and appends items.
         @details
         Reads the Node klass once per node (HotSpot guarantees every node
@@ -16233,9 +16274,11 @@ namespace vmhook
         {
             return;
         }
+        // memcpy (not *reinterpret_cast<uint32_t*>) — strict-aliasing-safe read
+        // of the narrow oop; see read_compressed_oop_at.  is_valid_pointer above
+        // already proved list_oop's page is mapped.
         const std::uint32_t first_compressed{
-            *reinterpret_cast<const std::uint32_t*>(
-                reinterpret_cast<const std::uint8_t*>(list_oop) + first_entry->offset) };
+            vmhook::read_compressed_oop_at(list_oop, first_entry->offset) };
         void* node_oop{ vmhook::hotspot::decode_oop_pointer(first_compressed) };
 
         // `size` is the caller's Java `size` field — clamp it so a corrupt/absurd
@@ -16259,9 +16302,10 @@ namespace vmhook
             {
                 break;
             }
+            // memcpy read (strict-aliasing-safe; node_oop validated by the loop
+            // guard above) — see read_compressed_oop_at.
             const std::uint32_t item_compressed{
-                *reinterpret_cast<const std::uint32_t*>(
-                    reinterpret_cast<const std::uint8_t*>(node_oop) + item_entry->offset) };
+                vmhook::read_compressed_oop_at(node_oop, item_entry->offset) };
             void* const item_oop{ vmhook::hotspot::decode_oop_pointer(item_compressed) };
             if (item_oop && vmhook::hotspot::is_valid_pointer(item_oop))
             {
@@ -16272,9 +16316,12 @@ namespace vmhook
                 out.push_back(nullptr);
             }
 
+            // memcpy read of the `next` link (strict-aliasing-safe).  This is
+            // THE read the data-dependent pointer-chase miscompiled on MSVC
+            // 14.51 when it was a reinterpret_cast deref — see
+            // read_compressed_oop_at.
             const std::uint32_t next_compressed{
-                *reinterpret_cast<const std::uint32_t*>(
-                    reinterpret_cast<const std::uint8_t*>(node_oop) + next_entry->offset) };
+                vmhook::read_compressed_oop_at(node_oop, next_entry->offset) };
             node_oop = vmhook::hotspot::decode_oop_pointer(next_compressed);
         }
     }

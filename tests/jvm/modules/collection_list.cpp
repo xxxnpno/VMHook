@@ -1,28 +1,36 @@
 // collection_list JVM test module  (feature area: collections)
 //
 // Exhaustively exercises decoding of real java.util.ArrayList /
-// java.util.LinkedList / Elem[] BACKING STORES on a live JVM, through a direct
-// MEMORY-WALK the module performs itself — NOT through the library's templated
-// field_proxy::value_t::to_vector<T>().
+// java.util.LinkedList / Elem[] BACKING STORES on a live JVM via a direct
+// MEMORY-WALK the module performs itself, AND — since the underlying library
+// bug is fixed — re-validates the library's own templated
+// vmhook::collection::to_vector<T>() against that hand-walk (see the
+// "to_vector<T>() decode" section near the end).
 //
-// ROOT CAUSE this rewrite works around (a separate LIBRARY task):
-//   vmhook::collection::to_vector<T>() (vmhook.hpp ~15795) mis-decodes List
-//   element OOPs at RUNTIME on the new MSVC-14.51 windows runner.  The TU
-//   compiles clean (no warning, no error) but the decoded ArrayList/LinkedList
-//   elements come out WRONG — a codegen/UB divergence in the templated
-//   to_vector body on cl.exe 14.51.36231, /std:c++latest.  collection_set.cpp
-//   is CI-green on that exact runner because it (a) obtains its collection OOPs
-//   from plain static fields rather than a capture-detour, and (b) the Set fast
-//   paths it happens to hit survive the codegen difference.  The List fast paths
-//   do not.  So this module mirrors collection_set's robustness recipe AND goes
-//   one step further: it decodes the asserted list CONTENT with its OWN
-//   hand-walk built from the library's LOW-LEVEL primitives — find_field /
-//   klass_from_oop / decode_oop_pointer / decode_array_oop / array_length /
-//   get_array_element / is_valid_pointer — each of which collection_set.cpp
-//   exercises CI-green on MSVC-14.51.  The hand-walk reproduces the EXACT
-//   layouts to_vector uses internally (ArrayList: "elementData" + "size";
-//   LinkedList: "first" + node "item"/"next" chain; Object[]: the raw reference
-//   array), so it decodes correctly on MSVC-14.51 by construction.
+// HISTORY — the LIBRARY bug this module first worked around, now FIXED:
+//   vmhook::collection::to_vector<T>() / linked_list_walk_items (vmhook.hpp)
+//   used to mis-decode List element OOPs at RUNTIME on the MSVC-14.51 windows
+//   runner.  The TU compiled clean (no warning, no error) but the decoded
+//   ArrayList/LinkedList elements came out WRONG — a strict-aliasing miscompile
+//   (UB) in the LinkedList chain walk's `*reinterpret_cast<const uint32_t*>`
+//   narrow-oop reads on cl.exe 14.51 (cl 19.51), /std:c++latest, where a TBAA
+//   pass could hoist/reorder the data-dependent `first->next` loads.
+//   collection_set.cpp stayed CI-green because the Set fast paths' read shape
+//   did not trip the same miscompile.  The library fix routes every narrow-oop
+//   read in the List path through a memcpy helper (read_compressed_oop_at),
+//   which carries no aliasing precondition — byte-identical on gcc/clang/older
+//   MSVC, miscompile-proof on 14.51.
+//
+//   This module keeps BOTH decoders: (1) its OWN hand-walk built from the
+//   library's LOW-LEVEL primitives — find_field / klass_from_oop /
+//   decode_oop_pointer / decode_array_oop / array_length / get_array_element /
+//   is_valid_pointer — reproducing the EXACT layouts to_vector uses internally
+//   (ArrayList: "elementData" + "size"; LinkedList: "first" + node "item"/"next"
+//   chain; Object[]: the raw reference array); and (2) the library's real
+//   to_vector<T>() on the same live lists.  The hand-walk is an independent
+//   oracle, so asserting to_vector == hand-walk turns any future re-decode
+//   regression on the 14.51 runner into a HARD CI failure instead of a silent
+//   wrong answer.
 //
 // HOW THE OOPS ARE OBTAINED (no capture-detour):
 //   Every list is an instance field of the static singleton CollList.SINGLETON.
@@ -519,6 +527,27 @@ namespace
 
     bool g_singleton_oop_ok{ false };
 
+    // ── LIBRARY to_vector<T>() observations (the path this module's hand-walk
+    //    works AROUND) ────────────────────────────────────────────────────────
+    // These decode the SAME live ArrayList / LinkedList fields through the
+    // library's own vmhook::collection::to_vector<elem_object>() — i.e. the
+    // ArrayList "elementData"+"size" fast path and the LinkedList
+    // first->node-item/next chain walk (linked_list_walk_items).  That is the
+    // exact code that mis-decoded List elements at RUNTIME on the MSVC-14.51
+    // runner (a strict-aliasing miscompile in the chain walk's reinterpret_cast
+    // oop reads, since fixed by routing them through a memcpy read).  Asserting
+    // the decoded ids/tags here turns that runtime mis-decode into a HARD CI
+    // failure on the very runner that exhibited it, instead of being silently
+    // worked around.  The ArrayList / LinkedList fast paths issue NO Java call
+    // (pure guarded heap reads), so running to_vector from the worker-thread
+    // body is as safe as the hand-walk beside it.
+    list_obs g_tv_arr_empty;     // to_vector(arrEmpty)   -> empty
+    list_obs g_tv_arr_many;      // to_vector(arrMany)    -> ArrayList fast path
+    list_obs g_tv_arr_null;      // to_vector(arrWithNull)-> null-slot handling
+    list_obs g_tv_link_empty;    // to_vector(linkEmpty)  -> empty
+    list_obs g_tv_link_many;     // to_vector(linkMany)   -> LinkedList chain walk
+    list_obs g_tv_link_null;     // to_vector(linkWithNull)-> null Node.item slot
+
     // Reduce a decoded vector into a list_obs: size, null pattern, ascending id
     // order (id == index for non-null slots), tag correctness, and OOP
     // distinctness (a cycle/duplicate walk would collapse this).
@@ -865,6 +894,33 @@ namespace
         observe(g_singleton,   walk_list_by_shape(list_oop_of("singletonView"), 0),    true);
         observe(g_unmod,       walk_list_by_shape(list_oop_of("unmodifiableView"), 0), true);
 
+        // ── LIBRARY to_vector<T>() decode of the SAME live lists ────────────
+        // Drives vmhook::collection::to_vector<elem_object>() directly on each
+        // list OOP — the real ArrayList / LinkedList fast paths.  This is the
+        // regression guard for the MSVC-14.51 chain-walk mis-decode: if the
+        // library ever again returns wrong element OOPs on this runner, these
+        // observations diverge from the (independently-correct) hand-walk ones
+        // and the checks below FAIL.  Each list OOP is gated by is_valid_pointer
+        // inside to_vector, so a null/absent field yields an empty vector, never
+        // a crash.
+        const auto to_vector_of{ [](void* const list_oop)
+            -> std::vector<std::unique_ptr<elem_object>>
+        {
+            if (!list_oop || !vmhook::hotspot::is_valid_pointer(list_oop))
+            {
+                return {};
+            }
+            return vmhook::collection{ static_cast<vmhook::oop_t>(list_oop) }
+                .to_vector<elem_object>();
+        } };
+
+        observe(g_tv_arr_empty,  to_vector_of(list_oop_of("arrEmpty")),     true);
+        observe(g_tv_arr_many,   to_vector_of(list_oop_of("arrMany")),      true);
+        observe(g_tv_arr_null,   to_vector_of(list_oop_of("arrWithNull")),  true);
+        observe(g_tv_link_empty, to_vector_of(list_oop_of("linkEmpty")),    true);
+        observe(g_tv_link_many,  to_vector_of(list_oop_of("linkMany")),     true);
+        observe(g_tv_link_null,  to_vector_of(list_oop_of("linkWithNull")), true);
+
         // ════════════════════════════════════════════════════════════════════
         //  ArrayList backing store
         // ════════════════════════════════════════════════════════════════════
@@ -982,6 +1038,55 @@ namespace
                   g_unmod.first_id == g_arr_many.first_id);
         ctx.check("unmodifiable_matches_backing_arraylist_last_id",
                   g_unmod.last_id == g_arr_many.last_id);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  LIBRARY to_vector<T>() decode — the regression guard for the
+        //  MSVC-14.51 List-branch mis-decode.  These assert that the library's
+        //  OWN ArrayList / LinkedList fast paths decode each live list to the
+        //  SAME correct ids/tags the hand-walk proved — element-for-element.  A
+        //  reintroduced strict-aliasing miscompile (or any decode regression) in
+        //  collection::to_vector / linked_list_walk_items makes these FAIL on
+        //  the exact runner that first exhibited the bug.
+        // ════════════════════════════════════════════════════════════════════
+        // ArrayList fast path: empty / dense-12 / null-slot, fully checked.
+        check_empty(ctx, "to_vector_arraylist_empty", g_tv_arr_empty);
+        check_dense(ctx, "to_vector_arraylist_many", g_tv_arr_many, MANY);
+        check_with_null(ctx, "to_vector_arraylist_with_null", g_tv_arr_null);
+
+        // LinkedList chain walk: empty / dense-12 / null Node.item slot.
+        check_empty(ctx, "to_vector_linkedlist_empty", g_tv_link_empty);
+        check_dense(ctx, "to_vector_linkedlist_many", g_tv_link_many, MANY);
+        check_with_null(ctx, "to_vector_linkedlist_with_null", g_tv_link_null);
+
+        // to_vector MUST agree with the independent hand-walk on the same lists
+        // (the hand-walk decodes the identical layout WITHOUT going through the
+        // templated to_vector body — so equality is a true cross-implementation
+        // oracle, not a tautology).
+        ctx.check("to_vector_arraylist_matches_hand_walk_size",
+                  g_tv_arr_many.size == g_arr_many.size);
+        ctx.check("to_vector_arraylist_matches_hand_walk_first_id",
+                  g_tv_arr_many.first_id == g_arr_many.first_id);
+        ctx.check("to_vector_arraylist_matches_hand_walk_last_id",
+                  g_tv_arr_many.last_id == g_arr_many.last_id);
+        ctx.check("to_vector_linkedlist_matches_hand_walk_size",
+                  g_tv_link_many.size == g_link_many.size);
+        ctx.check("to_vector_linkedlist_matches_hand_walk_first_id",
+                  g_tv_link_many.first_id == g_link_many.first_id);
+        ctx.check("to_vector_linkedlist_matches_hand_walk_last_id",
+                  g_tv_link_many.last_id == g_link_many.last_id);
+
+        // And the two library fast paths must agree with EACH OTHER on the
+        // many-element lists (same size / first / last / order) — the
+        // cross-path parity the module already proves for the hand-walk, now
+        // restated for to_vector so a one-sided fast-path regression is caught.
+        ctx.check("to_vector_array_and_link_many_same_size",
+                  g_tv_arr_many.size == g_tv_link_many.size);
+        ctx.check("to_vector_array_and_link_many_same_first_id",
+                  g_tv_arr_many.first_id == g_tv_link_many.first_id);
+        ctx.check("to_vector_array_and_link_many_same_last_id",
+                  g_tv_arr_many.last_id == g_tv_link_many.last_id);
+        ctx.check("to_vector_array_and_link_many_both_ordered",
+                  g_tv_arr_many.order_ok && g_tv_link_many.order_ok);
     }   // run_collection_list_checks
 }   // anonymous namespace
 
