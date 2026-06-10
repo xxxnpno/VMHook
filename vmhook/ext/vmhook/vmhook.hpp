@@ -6276,12 +6276,31 @@ namespace vmhook
         /*
             @brief Enables or disables the _dont_inline flag on a HotSpot Method object.
             @details
-            The _dont_inline flag is stored in Method._flags at bit position 2.
-            When set, it prevents the JIT from inlining this method at any call site.
+            On JDK 11..20 the _dont_inline flag is bit 2 of the exported
+            `mutable u2 Method::_flags`, and this toggles it.  On JDK 8 (no
+            `_flags` member exported) and JDK 21+ (where `_flags` became a u4
+            `MethodFlags` and is NOT exported via gHotSpotVMStructs, with
+            _dont_inline relocated to bit 12) get_flags() returns nullptr and this
+            is a safe no-op — see get_flags() for the full per-version analysis.
+            When set on the supported band, it prevents the JIT from inlining this
+            method at any call site.
+
+            Guarded against a null / invalid Method*: the verify-repair and
+            shutdown call sites can legitimately hand a Method* that became null or
+            aliases freed metaspace after a class unload / RedefineClasses.  Calling
+            get_flags() on such a pointer would form `this + offset` from a wild
+            base; the is_valid_pointer() check here (mirroring get_flags()'s own
+            this-guard) turns that into the same safe no-op rather than a wild
+            read-modify-write.
         */
         static auto set_dont_inline(const vmhook::hotspot::method* const method_pointer, const bool enabled) noexcept
             -> void
         {
+            if (!method_pointer || !vmhook::hotspot::is_valid_pointer(method_pointer))
+            {
+                return;
+            }
+
             std::uint16_t* const flags{ method_pointer->get_flags() };
             if (!flags)
             {
@@ -13552,7 +13571,28 @@ namespace vmhook
                 this->cached_ret_char = ret_char;
             }
 
-            const bool is_static_call{ this->object == nullptr };
+            // A call is static if the proxy carries no receiver (the
+            // static_method()/null-receiver case) OR the resolved Method is
+            // actually ACC_STATIC.  The second clause makes
+            // `instance->get_method("staticX")->call(...)` work: get_method on an
+            // INSTANCE wrapper hands a static Method* through with the instance
+            // still bound as this->object, so keying static-ness on
+            // `object == nullptr` alone mis-classifies it as an instance call and
+            // dispatches the static method with the live receiver pinned as its
+            // first declared argument (wrong result + poisoned JNI exception
+            // state).  is_static() reads JVM_ACC_STATIC (0x0008) from the live
+            // Method's _access_flags; that bit lives in the low byte and is
+            // width-independent across every supported JDK (8..26), so reading the
+            // flags word as u4 and masking 0x0008 is correct even on JDK 24+ where
+            // AccessFlags itself shrank to u2 (JVM_ACC_STATIC stayed in
+            // _access_flags).  For a genuine instance method this stays false (the
+            // instance path is byte-identical) and for a null-receiver static it
+            // stays true — only the previously-broken static-via-instance case
+            // changes, and it now routes through the unchanged static path.
+            // (Reliability of this disjunct is pinned on every JDK by the green
+            // method_static_portability module's is_static()==false-for-instance /
+            // ==true-for-static checks.)
+            const bool is_static_call{ this->object == nullptr || this->is_static() };
 
             // Resolve jclass + jmethodID.  Both are cached on the
             // method_proxy so subsequent calls skip the GetMethodID /
@@ -14190,10 +14230,19 @@ namespace vmhook
             std::intptr_t params[8]{};
             std::size_t   param_idx{ 0 };
 
-            // Instance methods receive 'this' as locals[0]; static methods are
-            // constructed with a null owning object, so guarding on `object`
-            // alone correctly omits the receiver slot for static calls.
-            if (this->object)
+            // Instance methods receive 'this' as locals[0]; static methods take
+            // no receiver slot.  Omit the receiver when the proxy has no object
+            // OR the resolved Method is ACC_STATIC.  The is_static() clause
+            // mirrors the call_jni decision: a static Method resolved through an
+            // INSTANCE wrapper (instance->get_method("staticX")) keeps the
+            // receiver bound in this->object, and prepending it here as locals[0]
+            // would shift every real argument down one slot and feed the
+            // interpreter the instance as the static method's first parameter.
+            // is_static() is noexcept (false if _access_flags is unresolvable) and
+            // reads the width-independent JVM_ACC_STATIC bit, so an instance method
+            // still takes the receiver slot byte-identically and a null-receiver
+            // static still omits it; only the static-via-instance case changes.
+            if (this->object && !this->is_static())
             {
                 params[param_idx++] = reinterpret_cast<std::intptr_t>(this->object);
             }
