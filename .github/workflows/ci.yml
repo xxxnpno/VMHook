@@ -93,9 +93,12 @@ jobs:
         if: matrix.os == 'windows-latest' && matrix.cc == 'clang'
         uses: KyleMayes/install-llvm-action@v2
         with:
-          # MSVC's STL requires Clang 19+ (yvals_core.h enforces STL1000).
-          # Bumping to 19 also gives us full C++23 deducing-this support.
-          version: "19.1"
+          # MSVC's STL hard-enforces a minimum Clang via yvals_core.h (STL1000).
+          # The VS18 / MSVC 14.51 runner image (2026-06) raised that bar to
+          # "Clang 20 or newer", so clang 19.1 now fails every TU. Pin Clang 20
+          # (latest 20.1.x patch) — satisfies the new floor, keeps full C++23
+          # deducing-this, and avoids any new-diagnostic churn from clang 21+.
+          version: "20.1.8"
 
       - name: Export Clang env (Windows)
         if: matrix.os == 'windows-latest' && matrix.cc == 'clang'
