@@ -74,41 +74,6 @@
 //   decoded nothing on this JVM, HARD when it decoded anything) so an exotic
 //   compressed-oops profile cannot flake the suite; the ArrayList/LinkedList
 //   fast-path content checks stay HARD (CI runs default compressed-oops heaps).
-//
-// ---------------------------------------------------------------------------
-// JIT-RELIABILITY HARDENING (why this module deopts trigger() before driving)
-// ---------------------------------------------------------------------------
-// The whole battery is reached through an i2i INTERPRETER detour on
-// CollList.trigger(int): the detour fires (and does ALL the to_vector reads on
-// `self`) only when trigger() is dispatched through the INTERPRETER, so the
-// patched i2i stub is reached.  A JIT-compiled (i2c/nmethod) dispatch BYPASSES
-// the i2i patch and the detour never fires -> g_detour_calls stays 0, g_self_ok
-// stays false, every list stays unobserved, and EVERY arraylist_*/linkedlist_*/
-// object_array_*/nested/generic_fallback check FAILs deterministically (plus the
-// probe-completed/detour-fired/saw-self infra checks).
-//
-// This is exactly the failure that quarantined the module on the new MSVC 14.51
-// windows runner (+ windows·clang·java25): the suite grew ~40% (waves 1-3) and
-// the new runner JITs aggressively, so trigger() can already be JIT-warm at
-// install time (or get asynchronously recompiled in the microsecond window
-// between install and the asserting drive) -> the capture never happens.  It is
-// the SAME class of flake hook_basic.cpp just fixed for its hooked methods.
-//
-// The proven fix (mirrored verbatim from hook_basic.cpp, which is green) is to
-// DEOPTIMIZE trigger() after install so execution returns to the interpreter and
-// the i2i detour is taken.  We do it with a BOUNDED settle loop
-// (settle_interpreter_route): fixture-scoped deoptimize_methods_if(CollList) +
-// verify_hooks() until the live Method's interpreter entry is observed routing
-// through the i2i stub (_from_interpreted_entry == _i2i_entry, _code == null) on
-// a 40 ms cadence.  vmhook holds NO_COMPILE on the hooked Method (set at
-// install), so once the route is established it stays put for the single Java
-// probe.  drive_capture_until_fires() re-settles + re-drives the probe up to a
-// small budget so a recompile racing between the settle and the START of run()
-// cannot slip the call past the detour.  EVERY arraylist_*/linkedlist_*/
-// object_array_* content check stays HARD on the final observation — the
-// settle/retry only EXISTS to make the capture deterministic; a genuine failure
-// to capture after the whole budget still FAILs the HARD asserts (a real
-// regression).
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
@@ -118,7 +83,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -182,13 +146,8 @@ namespace
         }
 
         // ── handshake ──────────────────────────────────────────────────────
-        // set_done(false) clears the LATCHED done flag on the rising edge so the
-        // fixture's pending() (go && !done) re-arms and run() re-fires — required
-        // by drive_capture_until_fires's bounded retry (the fixture never clears
-        // done itself, so a stale latch would block every re-drive).
-        static auto set_go(bool value) -> void   { static_field("go")->set(value); }
-        static auto set_done(bool value) -> void { static_field("done")->set(value); }
-        static auto get_done() -> bool           { return static_field("done")->get(); }
+        static auto set_go(bool value) -> void { static_field("go")->set(value); }
+        static auto get_done() -> bool          { return static_field("done")->get(); }
 
         // to_vector a named List/Collection field off this live instance.
         template<typename element_type>
@@ -526,192 +485,7 @@ namespace
 
 namespace
 {
-    // The fully-qualified (JVM-internal, slash-form) class name of the fixture.
-    // Used to locate the live trigger() Method* (for the interpreter-route
-    // settle), as the entry-guard lookup key, AND as the predicate filter for
-    // deoptimize_methods_if so the deopt is scoped to THIS fixture's methods only
-    // (so settling trigger() never disturbs another module's hot methods).
     constexpr char FIXTURE[]{ "vmhook/fixtures/CollList" };
-
-    // ── JIT-reliability helpers (mirrored from hook_basic.cpp) ───────────────
-    // The capture detour fires only on an INTERPRETED dispatch of trigger(); a
-    // JIT-compiled dispatch bypasses the i2i patch.  These drive trigger() back
-    // to the interpreter route before the asserting probe so the capture is
-    // deterministic on the fast-JIT runners (MSVC 14.51 / clang·java25) that
-    // quarantined this module.  See the JIT-RELIABILITY HARDENING banner at top.
-
-    // Locates the live Method* for FIXTURE::name(signature) by walking the
-    // InstanceKlass methods array.  Returns nullptr if anything looks invalid —
-    // callers treat nullptr as "cannot settle the interpreter route" and fall
-    // back to driving without the settle (never a crash).  All reads are
-    // pointer-validated.  (Same shape as hook_basic.cpp's find_method.)
-    auto find_method(const char* const name, const char* const signature)
-        -> vmhook::hotspot::method*
-    {
-        vmhook::hotspot::klass* const k{ vmhook::find_class(FIXTURE) };
-        if (!k || !vmhook::hotspot::is_valid_pointer(k))
-        {
-            return nullptr;
-        }
-        const std::int32_t count{ k->get_methods_count() };
-        vmhook::hotspot::method** const methods{ k->get_methods_ptr() };
-        if (!methods || count <= 0)
-        {
-            return nullptr;
-        }
-        const std::string want_name{ name };
-        const std::string want_sig{ signature };
-        for (std::int32_t i{ 0 }; i < count; ++i)
-        {
-            vmhook::hotspot::method* const m{ methods[i] };
-            if (!m || !vmhook::hotspot::is_valid_pointer(m))
-            {
-                continue;
-            }
-            const std::string m_name = m->get_name();        // copy-init (MSVC)
-            const std::string m_sig = m->get_signature();    // copy-init (MSVC)
-            if (m_name == want_name && m_sig == want_sig)
-            {
-                return m;
-            }
-        }
-        return nullptr;
-    }
-
-    // Reads Method::_code through a validated pointer.  nullptr means "not
-    // currently JIT-compiled" (the deopted state in which interpreted dispatch
-    // reaches our i2i patch).
-    auto method_code(vmhook::hotspot::method* const m) -> void*
-    {
-        if (!m || !vmhook::hotspot::is_valid_pointer(m))
-        {
-            return nullptr;
-        }
-        void* const code{ m->get_code() };
-        return (code && vmhook::hotspot::is_valid_pointer(code)) ? code : nullptr;
-    }
-
-    // True iff an INTERPRETED dispatch of this method will route through the
-    // patched i2i stub (so the detour can fire).  That holds exactly when
-    // _from_interpreted_entry == _i2i_entry — the "deopted" invariant the install
-    // path and verify_hooks()/deoptimize_methods_if re-establish.  Once HotSpot
-    // re-JITs the method, _from_interpreted_entry is repointed at the i2c adapter
-    // and this returns false.  Pointer-validated; unreadable entries yield false.
-    // (Mirrors hook_basic.cpp's interp_routes_through_i2i.)
-    auto interp_routes_through_i2i(vmhook::hotspot::method* const m) -> bool
-    {
-        if (!m || !vmhook::hotspot::is_valid_pointer(m))
-        {
-            return false;
-        }
-        void* const i2i{ m->get_i2i_entry() };
-        void* const fie{ m->get_from_interpreted_entry() };
-        return i2i != nullptr && fie != nullptr && i2i == fie;
-    }
-
-    // Drives the hooked trigger() back to the interpreter so the next dispatch
-    // reaches the i2i patch, with a bounded tolerance for HotSpot's ASYNCHRONOUS
-    // tiered JIT (which can compile/recompile at any instant, including the window
-    // right after install).  Returns true once the interpreter route is observed
-    // established, or when there is no live Method* to settle (m == nullptr — the
-    // caller then just drives, the pre-hardening behaviour, still correct on a
-    // cold/interpreted method).
-    //
-    // Each attempt: (1) deoptimize_methods_if(<our fixture class>) — for any
-    // CURRENTLY-compiled fixture method this repoints _from_interpreted_entry ->
-    // i2i, _from_compiled_entry -> c2i and nulls _code, i.e. the exact deopt the
-    // install path performs for an already-JIT'd method; (2) verify_hooks() —
-    // re-arms NO_COMPILE / re-applies the hook's deopt (and re-points the
-    // interpreter entry when _code != null), absorbing an in-flight recompile that
-    // just landed; (3) re-check the route, with a short settle so a queued nmethod
-    // lands + is re-nulled before the next read.
-    //
-    // Non-vacuous: a transient async recompile is ABSORBED (a later attempt sees
-    // the route restored), but if trigger() genuinely cannot be driven to the
-    // interpreter route within the budget this returns false and the caller's
-    // drive_capture_until_fires falls through to its HARD checks (a real
-    // regression then fails the suite — the content checks are NOT softened).
-    auto settle_interpreter_route(vmhook::hotspot::method* const m, int attempts) -> bool
-    {
-        if (m == nullptr)
-        {
-            // No live Method* to inspect.  Best-effort global re-arm so a
-            // freshly-installed hook is in its deopted state, then let the caller
-            // drive (the cold/interpreted path needs no settle).
-            (void)vmhook::verify_hooks();
-            return false;
-        }
-        if (interp_routes_through_i2i(m) && method_code(m) == nullptr)
-        {
-            return true;   // already routed through the interpreter i2i patch
-        }
-        for (int attempt{ 0 }; attempt < attempts; ++attempt)
-        {
-            // Deopt any currently-compiled fixture method back to the interpreter.
-            (void)vmhook::deoptimize_methods_if(
-                [](const std::string& class_name, vmhook::hotspot::method*) -> bool
-                {
-                    return class_name == FIXTURE;
-                });
-            // Re-arm / re-apply the hook's deopt (and re-point the interpreter
-            // entry when _code != null).  No-op on a clean hook.
-            (void)vmhook::verify_hooks();
-
-            if (interp_routes_through_i2i(m) && method_code(m) == nullptr)
-            {
-                return true;
-            }
-            // Let any in-flight compile / safepoint settle before re-reading.
-            // 40 ms matches the proven hook_basic.cpp cadence for the same
-            // fast-JIT async-recompile race.
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 40 });
-        }
-        return interp_routes_through_i2i(m) && method_code(m) == nullptr;
-    }
-
-    // Drives the go/done capture probe and guarantees the trigger() detour fires
-    // (the capture happens) by re-settling the interpreter route and re-driving
-    // up to `attempts` times.  `done_out` receives the probe-completed status of
-    // the FINAL drive (an infra signal the caller asserts hard regardless).  The
-    // detour latches CollList.done only after it runs, so a fire is observable
-    // BOTH via `done` and via g_detour_calls; we retry until g_detour_calls > 0
-    // (the capture actually executed) so the heavy to_vector battery has run.
-    //
-    // Because CollList.done LATCHES across the suite (the fixture never clears it)
-    // we must FORCE the rising edge: clear done before raising go each attempt, so
-    // pending() (go && !done) re-arms and the fixture's run() re-executes.  This
-    // wrapper only EXISTS to make the capture deterministic; the caller's content
-    // checks stay HARD on the final observation.
-    auto drive_capture_until_fires(vmhook_test::context& ctx,
-                                   vmhook::hotspot::method* const m,
-                                   int attempts,
-                                   bool& done_out) -> void
-    {
-        done_out = false;
-        for (int attempt{ 0 }; attempt < attempts; ++attempt)
-        {
-            (void)settle_interpreter_route(m, 12);
-            done_out = ctx.run_probe(
-                [](bool value)
-                {
-                    if (value)
-                    {
-                        // Rising edge: clear the latched `done` BEFORE raising go
-                        // so pending() (go && !done) re-arms and run() re-fires.
-                        coll_list_fixture::set_done(false);
-                    }
-                    coll_list_fixture::set_go(value);
-                },
-                []() { return coll_list_fixture::get_done(); });
-            if (done_out && g_detour_calls.load(std::memory_order_relaxed) >= 1)
-            {
-                return;   // capture executed deterministically
-            }
-            // Brief pause before re-settling so a recompile triggered by this
-            // dispatch can be observed + undone on the next settle pass.
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 25 });
-        }
-    }
 
     // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
     // it under a try/catch and ALWAYS follow it with shutdown_hooks() (suite-
@@ -879,17 +653,9 @@ namespace
 
         ctx.check("collection_list_hook_installed", handle.installed());
 
-        // Deopt trigger() back to the interpreter so the i2i capture detour is
-        // taken even if HotSpot JIT-compiled it before install (the fast-JIT
-        // MSVC-14.51 / clang·java25 race that quarantined this module), then drive
-        // the go/done probe, re-settling + re-driving until the capture executes.
-        // trigger(int)->int has JVM signature "(I)I".  find_method returns nullptr
-        // if the live Method* can't be located (then we just drive — still correct
-        // on a cold/interpreted method); the content checks below stay HARD on the
-        // final observation regardless.
-        vmhook::hotspot::method* const trigger_m{ find_method("trigger", "(I)I") };
-        bool done{ false };
-        drive_capture_until_fires(ctx, trigger_m, 6, done);
+        const bool done{ ctx.run_probe(
+            [](bool value) { coll_list_fixture::set_go(value); },
+            []() { return coll_list_fixture::get_done(); }) };
 
         ctx.check("collection_list_probe_completed", done);
         ctx.check("collection_list_detour_fired",
