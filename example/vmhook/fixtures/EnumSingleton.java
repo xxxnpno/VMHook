@@ -87,6 +87,68 @@ public final class EnumSingleton
         }
     }
 
+    /**
+     * A trivial interface the second enum implements, so the native side can
+     * prove it reads a method DECLARED ON AN INTERFACE through an enum singleton
+     * (label()), exactly like any other instance method.
+     */
+    public interface Labeled
+    {
+        String label();
+    }
+
+    /**
+     * A second enum whose constants each have their OWN class body (a
+     * constant-specific subclass) implementing an ABSTRACT method, and which
+     * implements an interface.  javac emits the constants as anonymous
+     * subclasses EnumSingleton$Op$1 / EnumSingleton$Op$2, while the constant
+     * STATIC fields (PLUS / TIMES) and values()/valueOf still live on the
+     * abstract base EnumSingleton$Op.  This exercises:
+     *   - an enum with a field (symbol) AND an abstract method body
+     *     (apply(int,int)) specialised per constant, and
+     *   - an enum implementing an interface (label()).
+     * The Java probe computes apply()/label() with real bytecode and publishes
+     * witnesses so the native side has a thread-gate-independent proof even when
+     * a native method_proxy::call() has no live JavaThread.
+     */
+    public enum Op implements Labeled
+    {
+        PLUS("+")
+        {
+            @Override
+            public int apply(final int a, final int b)
+            {
+                return a + b;
+            }
+        },
+        TIMES("*")
+        {
+            @Override
+            public int apply(final int a, final int b)
+            {
+                return a * b;
+            }
+        };
+
+        /** Instance field on the enum body (native reads this). */
+        public final String symbol;
+
+        Op(final String symbol)
+        {
+            this.symbol = symbol;
+        }
+
+        /** Constant-specific behaviour (each constant overrides this). */
+        public abstract int apply(int a, int b);
+
+        /** Interface method, shared by all constants. */
+        @Override
+        public String label()
+        {
+            return "op:" + this.symbol;
+        }
+    }
+
     // ---- Deterministic constants the native side mirrors -------------------
     public static final int RED_RGB   = 0xFF0000;
     public static final int GREEN_RGB = 0x00FF00;
@@ -118,6 +180,29 @@ public final class EnumSingleton
     public static volatile int blueIdentity;
     public static volatile int favoriteIdentity;          // == greenIdentity
     public static volatile int staticIdentity;            // == blueIdentity
+
+    // ---- Color values()/valueOf witnesses (computed via real bytecode) -----
+    public static volatile int     colorValuesLen;        // Color.values().length == 3
+    public static volatile boolean valueOfGreenIsGreen;   // Color.valueOf("GREEN") == GREEN
+    public static volatile int     valueOfBlueIdentity;   // id of Color.valueOf("BLUE")
+
+    // ---- Per-constant name()/ordinal() witnesses (so name/ordinal reads are
+    //      cross-checked against the JVM's own values) ----
+    public static volatile int redOrdinal;                // == 0
+    public static volatile int greenOrdinal;              // == 1
+    public static volatile int blueOrdinal;               // == 2
+
+    // ---- Second-enum (Op) witnesses + identities ---------------------------
+    public static volatile int     opValuesLen;           // Op.values().length == 2
+    public static volatile int     plusApplySeen;         // PLUS.apply(6,2) == 8
+    public static volatile int     timesApplySeen;        // TIMES.apply(6,2) == 12
+    public static volatile String  plusLabelSeen;         // PLUS.label() == "op:+"
+    public static volatile String  timesLabelSeen;        // TIMES.label() == "op:*"
+    public static volatile boolean valueOfPlusIsPlus;     // Op.valueOf("PLUS") == PLUS
+    public static volatile int     plusOrdinal;           // == 0
+    public static volatile int     timesOrdinal;          // == 1
+    public static volatile int     plusIdentity;          // id of Op.PLUS
+    public static volatile int     timesIdentity;         // id of Op.TIMES
 
     /**
      * The single instance the native module wraps for the INSTANCE-field read.
@@ -164,6 +249,27 @@ public final class EnumSingleton
                 EnumSingleton.blueIdentity     = System.identityHashCode(Color.BLUE);
                 EnumSingleton.favoriteIdentity = System.identityHashCode(SINGLETON.favoriteColor);
                 EnumSingleton.staticIdentity   = System.identityHashCode(EnumSingleton.staticColor);
+
+                // Color values()/valueOf + ordinals, via real bytecode dispatch.
+                EnumSingleton.colorValuesLen      = Color.values().length;
+                EnumSingleton.valueOfGreenIsGreen = Color.valueOf("GREEN") == Color.GREEN;
+                EnumSingleton.valueOfBlueIdentity = System.identityHashCode(Color.valueOf("BLUE"));
+                EnumSingleton.redOrdinal          = Color.RED.ordinal();
+                EnumSingleton.greenOrdinal        = Color.GREEN.ordinal();
+                EnumSingleton.blueOrdinal         = Color.BLUE.ordinal();
+
+                // Second enum (Op): constant-specific abstract bodies + interface
+                // method + values()/valueOf + ordinals + identities.
+                EnumSingleton.opValuesLen      = Op.values().length;
+                EnumSingleton.plusApplySeen    = Op.PLUS.apply(6, 2);
+                EnumSingleton.timesApplySeen   = Op.TIMES.apply(6, 2);
+                EnumSingleton.plusLabelSeen    = Op.PLUS.label();
+                EnumSingleton.timesLabelSeen   = Op.TIMES.label();
+                EnumSingleton.valueOfPlusIsPlus = Op.valueOf("PLUS") == Op.PLUS;
+                EnumSingleton.plusOrdinal      = Op.PLUS.ordinal();
+                EnumSingleton.timesOrdinal     = Op.TIMES.ordinal();
+                EnumSingleton.plusIdentity     = System.identityHashCode(Op.PLUS);
+                EnumSingleton.timesIdentity    = System.identityHashCode(Op.TIMES);
 
                 // Real bytecode dispatch (parity with the other fixtures).
                 SINGLETON.tick(7);
