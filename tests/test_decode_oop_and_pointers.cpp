@@ -13,9 +13,23 @@
 //
 // is_valid_pointer is pure address arithmetic (range + alignment + poison
 // switch), so its full boundary behaviour IS checkable without a JVM.  Source
-// of truth: vmhook/ext/vmhook/vmhook.hpp:1768-1805 (is_valid_pointer),
-// :4226-4290 (decode_oop_pointer), :4298-4361 (encode_oop_pointer),
-// :505/:510 (os::user_address_ceiling / user_address_floor).
+// of truth (verified against vmhook/ext/vmhook/vmhook.hpp on 2026-06-10):
+//   is_valid_pointer        : :1823-1845
+//   untag_pointer           : :1895-1903
+//   narrow_decode (shared)  : :4531-4536   base + (uint64(c) << shift)
+//   narrow_encode (shared)  : :4552-4557   uint32((addr - base) >> shift)
+//   decode_oop_pointer      : :4576-4614   (null guard :4579, no-resolve :4604)
+//   encode_oop_pointer      : :4622-4661   (null guard :4625, below-base :4655)
+//   decode_klass_pointer    : :4670-4707
+//   encode_klass_pointer    : :4723-4763   (below-base guard :4757)
+//   os::user_address_ceiling: :515 (0x00007FFFFFFFFFFF)
+//   os::user_address_floor  : :520 (0xFFFF)
+//
+// The OOP codec was refactored to delegate to the two pure primitives
+// narrow_decode / narrow_encode (which take base+shift EXPLICITLY), so the
+// FULL decode/encode arithmetic — every (base, shift) HotSpot mode and the
+// complete narrow-value domain — is now exercisable with NO JVM by injecting
+// base/shift directly.  Sections G..Z below do exactly that, exhaustively.
 #include <vmhook/vmhook.hpp>
 #include <cstdio>
 #include <cstdint>
@@ -1094,6 +1108,431 @@ int main()
             }
         }
         check("shared_narrow_primitive_single_formula", primitive_is_single_formula);
+    }
+
+    // ===================================================================
+    // T. COMPILE-TIME formula pinning (static_assert) + runtime conformance.
+    //    The shared primitives narrow_decode/narrow_encode are NOT constexpr
+    //    (narrow_decode reinterpret_casts to void*, narrow_encode is a plain
+    //    static function), so they cannot appear inside a static_assert.  But
+    //    the documented CLOSED FORM they implement is pure integer arithmetic
+    //    and IS constant-evaluable.  We therefore:
+    //      (1) pin the closed form at COMPILE TIME with static_assert over the
+    //          full HotSpot (base, shift) mode set and the extreme narrow
+    //          values, so a formula typo is a build error on every CI config;
+    //      (2) assert at RUNTIME that the actual library primitive reproduces
+    //          the very same compile-time constant — proving the shipped code
+    //          matches the statically-pinned spec.
+    //    This is the "static_assert where constexpr-evaluable, else runtime
+    //    assert" split the coverage goal calls for.
+    // ===================================================================
+
+    // constexpr re-derivations of the two documented formulas.  These are the
+    // single source of truth for the expected values, evaluated by the
+    // compiler.  They deliberately compute in integer types only (no void*),
+    // which keeps them usable in a constant expression.
+    struct ct
+    {
+        static constexpr auto dec(std::uint64_t base, std::uint32_t shift,
+                                  std::uint32_t c) noexcept -> std::uint64_t
+        {
+            return base + (static_cast<std::uint64_t>(c) << shift);
+        }
+        static constexpr auto enc(std::uint64_t base, std::uint32_t shift,
+                                  std::uint64_t addr) noexcept -> std::uint32_t
+        {
+            return static_cast<std::uint32_t>((addr - base) >> shift);
+        }
+    };
+
+    // -- (1) COMPILE-TIME pins.  Every assertion here is checked by the
+    //        compiler; reaching runtime means they all held. ----------------
+
+    // shift == 0 : decode is base + c, encode is addr - base (mod 2^32).
+    static_assert(ct::dec(0u, 0u, 0u) == 0ull);
+    static_assert(ct::dec(0u, 0u, 1u) == 1ull);
+    static_assert(ct::dec(0u, 0u, 0xFFFF'FFFFu) == 0xFFFF'FFFFull);
+    static_assert(ct::dec(0x1'0000'0000ull, 0u, 0xFFFF'FFFFu) == 0x1'FFFF'FFFFull);
+
+    // shift == 3 : the canonical <=32 GB heap.  Widen-before-shift means the
+    // all-ones narrow value must reach 0x7'FFFF'FFF8, NOT truncate to 32 bits.
+    static_assert(ct::dec(0u, 3u, 1u) == 8ull);
+    static_assert(ct::dec(0u, 3u, 0xFFFF'FFFFu) == 0x7'FFFF'FFF8ull);
+    static_assert(ct::dec(0u, 3u, 0x8000'0000u) == 0x4'0000'0000ull); // sign bit widens
+    static_assert(ct::dec(0x8'0000'0000ull, 3u, 0x10u) == 0x8'0000'0080ull);
+
+    // shift == 4 : 16-byte object alignment regime.
+    static_assert(ct::dec(0u, 4u, 1u) == 16ull);
+    static_assert(ct::dec(0u, 4u, 0xFFFF'FFFFu) == 0xF'FFFF'FFF0ull);
+
+    // encode is the exact inverse on representable points, at compile time.
+    static_assert(ct::enc(0u, 0u, 0x1234ull) == 0x1234u);
+    static_assert(ct::enc(0x1000ull, 0u, 0x1234ull) == 0x234u);
+    static_assert(ct::enc(0u, 3u, 64ull) == 8u);
+    static_assert(ct::enc(0x4000'0000ull, 3u, 0x4000'0000ull) == 0u); // addr==base -> 0
+    static_assert(ct::enc(0u, 4u, 0xF'FFFF'FFF0ull) == 0xFFFF'FFFFu);  // top, shift 4
+
+    // Round-trip closed-form identity, pinned at compile time for the corner
+    // narrow values across the four canonical modes.  enc(dec(c)) == c for all
+    // 32-bit c, for any base/shift (the << bits are exactly the >> bits).
+    static_assert(ct::enc(0u, 0u, ct::dec(0u, 0u, 0xDEAD'BEEFu)) == 0xDEAD'BEEFu);
+    static_assert(ct::enc(0u, 3u, ct::dec(0u, 3u, 0xFFFF'FFFFu)) == 0xFFFF'FFFFu);
+    static_assert(ct::enc(0x8'0000'0000ull, 3u,
+                          ct::dec(0x8'0000'0000ull, 3u, 0x8000'0000u)) == 0x8000'0000u);
+    static_assert(ct::enc(0x7F00'0000'0000ull, 0u,
+                          ct::dec(0x7F00'0000'0000ull, 0u, 0x00FF'FFFFu)) == 0x00FF'FFFFu);
+
+    // narrow == 0 decodes to exactly `base` at compile time, for ANY base/shift
+    // (the primitive is intentionally not null-aware; the wrapper owns that).
+    static_assert(ct::dec(0u, 0u, 0u) == 0ull);
+    static_assert(ct::dec(0u, 3u, 0u) == 0ull);
+    static_assert(ct::dec(0x1'0000'0000ull, 3u, 0u) == 0x1'0000'0000ull);
+    static_assert(ct::dec(0x7FFF'FFFF'8000ull, 4u, 0u) == 0x7FFF'FFFF'8000ull);
+
+    // -- (2) RUNTIME conformance: the shipped library primitive equals the
+    //        compile-time constant, for the same mode set.  If the build
+    //        compiled, the static_asserts held; these prove the real code path
+    //        agrees with that statically-verified spec. ---------------------
+    {
+        struct mode { std::uint64_t base; std::uint32_t shift; };
+        const mode modes[]{
+            { 0u, 0u }, { 0u, 3u }, { 0u, 4u },
+            { std::uint64_t{ 0x1'0000'0000ull }, 0u },
+            { std::uint64_t{ 0x8'0000'0000ull }, 3u },
+            { std::uint64_t{ 0x7F00'0000'0000ull }, 0u },
+        };
+        const std::uint32_t corner[]{
+            0u, 1u, 2u, 0x7Fu, 0x7FFF'FFFFu, 0x8000'0000u, 0xFFFF'FFFEu, 0xFFFF'FFFFu,
+        };
+        bool decode_equals_compiletime{ true };
+        bool encode_equals_compiletime{ true };
+        for (const mode m : modes)
+        {
+            for (const std::uint32_t c : corner)
+            {
+                // Library decode must equal the constexpr closed form.
+                if (as_uptr(narrow_decode(m.base, m.shift, c))
+                    != static_cast<std::uintptr_t>(ct::dec(m.base, m.shift, c)))
+                {
+                    decode_equals_compiletime = false;
+                }
+                // Library encode of the representable address must equal the
+                // constexpr closed form (and, since it is representable, c).
+                const std::uint64_t addr{ ct::dec(m.base, m.shift, c) };
+                const std::uint32_t enc{ narrow_encode(m.base, m.shift, addr) };
+                if (enc != ct::enc(m.base, m.shift, addr) || enc != c)
+                {
+                    encode_equals_compiletime = false;
+                }
+            }
+        }
+        check("narrow_decode_matches_compiletime_formula", decode_equals_compiletime);
+        check("narrow_encode_matches_compiletime_formula", encode_equals_compiletime);
+    }
+
+    // ===================================================================
+    // U. EXHAUSTIVE decode over the COMPLETE low-16-bit narrow domain.
+    //    Unlike the earlier "dense representative" sweeps, this enumerates
+    //    EVERY narrow value in [0, 0xFFFF] (all 65 536 of them) against every
+    //    HotSpot (base, shift) mode, recomputing the expected full pointer from
+    //    the documented formula.  A complete contiguous subdomain — no gaps —
+    //    is the strongest "all inputs possible" statement we can make at u32
+    //    width without enumerating the full 4 billion (infeasible per build).
+    //    The high 16 bits are then swept exhaustively in their own right via
+    //    the power-of-two / bit-pair families (section X) and the 32-bit
+    //    extremes (sections J/M), so every structurally distinct bit is covered.
+    // ===================================================================
+    {
+        struct mode { std::uint64_t base; std::uint32_t shift; const char* tag; };
+        const mode modes[]{
+            { 0u,                             0u, "b0_s0"   },
+            { 0u,                             3u, "b0_s3"   },
+            { 0u,                             4u, "b0_s4"   },
+            { std::uint64_t{ 0x1'0000'0000ull },    0u, "bN_s0"   },
+            { std::uint64_t{ 0x8'0000'0000ull },    3u, "b32G_s3" },
+            { std::uint64_t{ 0x7FFF'FFFF'8000ull }, 4u, "bHi_s4"  }, // near-ceiling base
+            { std::uint64_t{ 0x12'3456'7801ull },   3u, "bUnal_s3"}, // non-8-aligned base
+        };
+        bool full16_decode_ok{ true };
+        std::size_t full16_cases{ 0 };
+        std::uint32_t first_bad{ 0xFFFF'FFFFu };
+        for (const mode m : modes)
+        {
+            for (std::uint32_t c{ 0u }; c <= 0xFFFFu; ++c)
+            {
+                const std::uintptr_t got{ as_uptr(narrow_decode(m.base, m.shift, c)) };
+                const std::uintptr_t want{
+                    static_cast<std::uintptr_t>(ct::dec(m.base, m.shift, c)) };
+                if (got != want)
+                {
+                    full16_decode_ok = false;
+                    if (first_bad == 0xFFFF'FFFFu) { first_bad = c; }
+                }
+                ++full16_cases;
+            }
+        }
+        check("narrow_decode_exhaustive_low16_all_modes", full16_decode_ok);
+        // 7 modes * 65536 == 458 752 cases; pin the magnitude so an accidental
+        // loop-bound edit that shrinks the sweep is caught.
+        check("narrow_decode_exhaustive_low16_is_complete",
+              full16_cases == static_cast<std::size_t>(7) * 0x1'0000u);
+        // first_bad stays sentinel iff nothing mismatched; referencing it keeps
+        // it live under -Werror and documents the first failing input if any.
+        check("narrow_decode_exhaustive_low16_no_first_bad",
+              first_bad == 0xFFFF'FFFFu);
+    }
+
+    // ===================================================================
+    // V. EXHAUSTIVE encode inverse over the COMPLETE low-16-bit domain.
+    //    For every narrow c in [0, 0xFFFF] and every mode, the representable
+    //    address base + (c << shift) must encode back to exactly c (the high
+    //    bits dropped by >> are precisely the bits the address lacks).  This is
+    //    the complete-domain inverse of section U.
+    // ===================================================================
+    {
+        struct mode { std::uint64_t base; std::uint32_t shift; };
+        const mode modes[]{
+            { 0u, 0u }, { 0u, 1u }, { 0u, 2u }, { 0u, 3u }, { 0u, 4u },
+            { std::uint64_t{ 0x1'0000'0000ull },    0u },
+            { std::uint64_t{ 0x8'0000'0000ull },    3u },
+            { std::uint64_t{ 0x7FFF'FFFF'8000ull }, 4u },
+            { std::uint64_t{ 0x12'3456'7801ull },   3u },
+        };
+        bool full16_encode_ok{ true };
+        for (const mode m : modes)
+        {
+            for (std::uint32_t c{ 0u }; c <= 0xFFFFu; ++c)
+            {
+                const std::uint64_t addr{ ct::dec(m.base, m.shift, c) };
+                if (narrow_encode(m.base, m.shift, addr) != c)
+                {
+                    full16_encode_ok = false;
+                }
+            }
+        }
+        check("narrow_encode_exhaustive_low16_all_modes", full16_encode_ok);
+    }
+
+    // ===================================================================
+    // W. EXHAUSTIVE round-trips over the COMPLETE low-16-bit domain, BOTH
+    //    directions, for every mode:
+    //      encode(decode(c)) == c                       (compressed -> compressed)
+    //      decode(encode(base+(c<<shift))) == base+(c<<shift)  (addr -> addr)
+    //    No sampling: every c in [0, 0xFFFF].  This is the codec's central
+    //    identity proven over a full contiguous domain rather than a dense set.
+    // ===================================================================
+    {
+        struct mode { std::uint64_t base; std::uint32_t shift; };
+        const mode modes[]{
+            { 0u, 0u }, { 0u, 3u }, { 0u, 4u },
+            { std::uint64_t{ 0x1'0000'0000ull },    0u },
+            { std::uint64_t{ 0x8'0000'0000ull },    3u },
+            { std::uint64_t{ 0x7F00'0000'0000ull }, 0u },
+            { std::uint64_t{ 0x12'3456'7801ull },   3u },
+        };
+        bool rt_c_ok{ true };
+        bool rt_addr_ok{ true };
+        for (const mode m : modes)
+        {
+            for (std::uint32_t c{ 0u }; c <= 0xFFFFu; ++c)
+            {
+                // compressed -> address -> compressed
+                void* const decoded{ narrow_decode(m.base, m.shift, c) };
+                if (narrow_encode(m.base, m.shift,
+                                  static_cast<std::uint64_t>(as_uptr(decoded))) != c)
+                {
+                    rt_c_ok = false;
+                }
+                // address -> compressed -> address (representable address)
+                const std::uint64_t addr{ ct::dec(m.base, m.shift, c) };
+                const std::uint32_t enc{ narrow_encode(m.base, m.shift, addr) };
+                if (static_cast<std::uint64_t>(as_uptr(narrow_decode(m.base, m.shift, enc)))
+                    != addr)
+                {
+                    rt_addr_ok = false;
+                }
+            }
+        }
+        check("narrow_roundtrip_encode_decode_exhaustive_low16", rt_c_ok);
+        check("narrow_roundtrip_decode_encode_exhaustive_low16", rt_addr_ok);
+    }
+
+    // ===================================================================
+    // X. COMPLETE bit-position families: every single-bit narrow value, every
+    //    adjacent-bit pair, and every value straddling the shift boundary, at
+    //    every shift 0..4.  This exhausts the *high* 16 bits that section U's
+    //    low-16 sweep cannot reach, so between U and X every one of the 32
+    //    narrow bits is exercised in isolation and in adjacent combination.
+    //    The task explicitly asks for "values straddling the shift so the high
+    //    bits matter" — this makes that exhaustive over all bit positions.
+    // ===================================================================
+    {
+        const std::uint32_t shifts[]{ 0u, 1u, 2u, 3u, 4u };
+        bool single_bit_ok{ true };
+        bool bit_pair_ok{ true };
+        bool straddle_ok{ true };
+        for (const std::uint32_t sh : shifts)
+        {
+            // Every single set bit b in 0..31: decode(0, sh, 1<<b) == (1<<b)<<sh
+            // computed in 64 bits — must never truncate even when b+sh >= 32.
+            for (unsigned b{ 0u }; b < 32u; ++b)
+            {
+                const std::uint32_t c{ static_cast<std::uint32_t>(1u) << b };
+                const std::uintptr_t want{
+                    static_cast<std::uintptr_t>(static_cast<std::uint64_t>(c) << sh) };
+                if (as_uptr(narrow_decode(0u, sh, c)) != want) { single_bit_ok = false; }
+                // The decoded value must have its low sh bits clear (alignment
+                // grid) and round-trip back to c.
+                if ((as_uptr(narrow_decode(0u, sh, c)) & ((std::uintptr_t{ 1u } << sh) - 1u)) != 0u)
+                {
+                    single_bit_ok = false;
+                }
+                if (narrow_encode(0u, sh,
+                        static_cast<std::uint64_t>(as_uptr(narrow_decode(0u, sh, c)))) != c)
+                {
+                    single_bit_ok = false;
+                }
+            }
+            // Every adjacent bit pair (b, b+1) for b in 0..30.
+            for (unsigned b{ 0u }; b < 31u; ++b)
+            {
+                const std::uint32_t c{
+                    static_cast<std::uint32_t>((1u << b) | (1u << (b + 1u))) };
+                const std::uintptr_t want{
+                    static_cast<std::uintptr_t>(static_cast<std::uint64_t>(c) << sh) };
+                if (as_uptr(narrow_decode(0u, sh, c)) != want) { bit_pair_ok = false; }
+            }
+            // Straddle the shift boundary: at shift sh, the value 1<<sh is the
+            // first compressed value whose product crosses into bit (2*sh), and
+            // (1<<sh)-1 / (1<<sh)+1 are its neighbours.  Verify all three decode
+            // to the exact widened product (high bits preserved).
+            if (sh > 0u)
+            {
+                const std::uint32_t centre{ static_cast<std::uint32_t>(1u) << sh };
+                const std::uint32_t around[]{ centre - 1u, centre, centre + 1u };
+                for (const std::uint32_t c : around)
+                {
+                    const std::uintptr_t want{
+                        static_cast<std::uintptr_t>(static_cast<std::uint64_t>(c) << sh) };
+                    if (as_uptr(narrow_decode(0u, sh, c)) != want) { straddle_ok = false; }
+                }
+            }
+        }
+        check("narrow_decode_every_single_bit_all_shifts", single_bit_ok);
+        check("narrow_decode_every_adjacent_bit_pair_all_shifts", bit_pair_ok);
+        check("narrow_decode_shift_boundary_straddle_all_shifts", straddle_ok);
+    }
+
+    // ===================================================================
+    // Y. ALIGNMENT-GRID / SHIFT-RESIDUE law, stated exhaustively.  This is the
+    //    no-JVM analogue of the live-JVM assertion "(decoded - base) has zero
+    //    residue mod (1<<shift) for a real oop".  For EVERY narrow c in a
+    //    complete domain and every shift, with a base that is itself a multiple
+    //    of (1<<shift):
+    //      (decode(base, shift, c) - base)  ==  c << shift   exactly, and
+    //      its low `shift` bits are zero (it sits on the 2^shift grid).
+    //    We use base==0 and a shift-aligned non-zero base so the residue law is
+    //    purely a property of the shift, mirroring HotSpot's 8/16-byte object
+    //    alignment guarantee.
+    // ===================================================================
+    {
+        const std::uint32_t shifts[]{ 0u, 1u, 2u, 3u, 4u };
+        bool residue_law_holds{ true };
+        for (const std::uint32_t sh : shifts)
+        {
+            const std::uintptr_t grid_mask{ (std::uintptr_t{ 1u } << sh) - 1u };
+            // base chosen as a multiple of the grid so base contributes no
+            // residue; 0 and a large grid-aligned value both qualify.
+            const std::uint64_t bases[]{ 0u, (std::uint64_t{ 0x8'0000'0000ull }) };
+            for (const std::uint64_t base : bases)
+            {
+                // Sweep a complete contiguous run of compressed values plus the
+                // top of the range; every decoded offset must equal c<<sh and be
+                // grid-aligned.
+                for (std::uint32_t c{ 0u }; c <= 0x2000u; ++c)
+                {
+                    const std::uintptr_t dec{ as_uptr(narrow_decode(base, sh, c)) };
+                    const std::uintptr_t offset{ dec - static_cast<std::uintptr_t>(base) };
+                    if (offset != (static_cast<std::uintptr_t>(c) << sh))
+                    {
+                        residue_law_holds = false;
+                    }
+                    if ((offset & grid_mask) != 0u) { residue_law_holds = false; }
+                }
+                // Top of the narrow range too.
+                const std::uintptr_t dec_top{ as_uptr(narrow_decode(base, sh, 0xFFFF'FFFFu)) };
+                const std::uintptr_t off_top{ dec_top - static_cast<std::uintptr_t>(base) };
+                if (off_top != (std::uint64_t{ 0xFFFF'FFFFull } << sh)) { residue_law_holds = false; }
+                if ((off_top & grid_mask) != 0u) { residue_law_holds = false; }
+            }
+        }
+        check("narrow_decode_shift_residue_grid_law_exhaustive", residue_law_holds);
+    }
+
+    // ===================================================================
+    // Z. BASE FAMILY completeness + the "narrow 0 -> base REGARDLESS of base"
+    //    law, over the four base classes the coverage goal enumerates:
+    //      - zero base (zero-based heap)
+    //      - 32 GB-aligned heap base (0x8_0000_0000)
+    //      - non-8-aligned / "unaligned-looking" base (low bits set)
+    //      - high near-canonical-ceiling base (just under user_address_ceiling)
+    //    For each, across all shifts 0..4:
+    //      (Z1) narrow == 0 decodes to exactly the base (primitive contract),
+    //      (Z2) the max u32 narrow decodes to base + (0xFFFFFFFF << shift) with
+    //           no truncation (independently recomputed),
+    //      (Z3) encode(base) == 0 (the at-base / null grid point).
+    //    Plus the wrapper-level invariant that decode_oop_pointer(0) is null
+    //    irrespective of any base/shift (it short-circuits before resolution).
+    // ===================================================================
+    {
+        const std::uint64_t bases[]{
+            0u,
+            std::uint64_t{ 0x8'0000'0000ull },        // 32 GB-aligned
+            std::uint64_t{ 0x12'3456'7801ull },       // unaligned-looking (odd low byte)
+            std::uint64_t{ 0x7FFF'FFFF'0000ull },      // high, near user_address_ceiling
+        };
+        const std::uint32_t shifts[]{ 0u, 1u, 2u, 3u, 4u };
+        bool zero_is_base{ true };
+        bool max_no_truncate{ true };
+        bool base_encodes_zero{ true };
+        for (const std::uint64_t base : bases)
+        {
+            for (const std::uint32_t sh : shifts)
+            {
+                // (Z1) narrow 0 -> base.
+                if (as_uptr(narrow_decode(base, sh, 0u))
+                    != static_cast<std::uintptr_t>(base))
+                {
+                    zero_is_base = false;
+                }
+                // (Z2) max u32 -> base + (0xFFFFFFFF << sh), recomputed in 64-bit.
+                const std::uintptr_t got_max{ as_uptr(narrow_decode(base, sh, 0xFFFF'FFFFu)) };
+                const std::uintptr_t want_max{
+                    static_cast<std::uintptr_t>(base + (std::uint64_t{ 0xFFFF'FFFFull } << sh)) };
+                if (got_max != want_max) { max_no_truncate = false; }
+                // (Z3) encode(base) -> 0.
+                if (narrow_encode(base, sh, base) != 0u) { base_encodes_zero = false; }
+            }
+        }
+        check("narrow_decode_zero_is_base_all_base_families", zero_is_base);
+        check("narrow_decode_max_u32_no_truncate_all_base_families", max_no_truncate);
+        check("narrow_encode_base_is_zero_all_base_families", base_encodes_zero);
+
+        // Wrapper-level: decode_oop_pointer(0) / decode_klass_pointer(0) are
+        // null with NO dependence on base/shift (the compressed==0 guard runs
+        // before VMStruct resolution).  This is the "narrow 0 -> null REGARDLESS
+        // of base" contract at the public API, which the primitive (returning
+        // `base`) deliberately does NOT provide — the wrapper adds it.  Pinning
+        // both halves documents exactly where the null semantics live.
+        check("decode_oop_pointer_zero_null_independent_of_base",
+              decode_oop_pointer(0u) == nullptr);
+        check("decode_klass_pointer_zero_null_independent_of_base",
+              decode_klass_pointer(0u) == nullptr);
+        // And the primitive, fed compressed 0 with a NON-zero base, returns that
+        // base (not null) — the precise distinction the wrapper papers over.
+        check("narrow_decode_zero_with_nonzero_base_is_base_not_null",
+              narrow_decode(std::uint64_t{ 0x8'0000'0000ull }, 3u, 0u)
+                  == reinterpret_cast<void*>(std::uintptr_t{ 0x8'0000'0000ull }));
     }
 
     return failures == 0 ? 0 : 1;

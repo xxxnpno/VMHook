@@ -86,6 +86,7 @@ vmhook_add_test(method_flags_width             SOURCES test_method_flags_width.c
 vmhook_add_test(jni_arg_packing                SOURCES test_jni_arg_packing.cpp)
 vmhook_add_test(signature_parsing              SOURCES test_signature_parsing.cpp)
 vmhook_add_test(decode_oop_and_pointers        SOURCES test_decode_oop_and_pointers.cpp)
+vmhook_add_test(compressed_klass_decode        SOURCES test_compressed_klass_decode.cpp)
 vmhook_add_test(decode_u5                       SOURCES test_decode_u5.cpp)
 vmhook_add_test(iterate_entries_safety         SOURCES test_iterate_entries_safety.cpp)
 vmhook_add_test(os_release_and_protect_edges   SOURCES test_os_release_and_protect_edges.cpp)

@@ -24,6 +24,7 @@
 // in example.cpp.
 
 #include <vmhook/vmhook.hpp>
+#include <array>
 #include <cstdio>
 #include <cstdint>
 #include <string>
@@ -124,6 +125,215 @@ namespace u5_oracle
         return encode(value).size();
     }
 }  // namespace u5_oracle
+
+// ---------------------------------------------------------------------------
+// COMPILE-TIME spec mirror (namespace u5_ct).  vmhook's real decode_u5 is
+// `inline static` but NOT constexpr, so it cannot be evaluated inside a
+// static_assert.  To still get genuine compile-time coverage of the UNSIGNED5
+// *contract* (the base-64 excess-1 math, the 5-byte cap, the low/high split,
+// the End(0) rewind), we transcribe the SAME algorithm here as constexpr
+// functions over a fixed-size buffer (std::array is constexpr in C++17; the
+// oracle above uses std::vector, which is not).  The static_assert wall below
+// pins the exact byte<->value mapping for every length-transition boundary and
+// every landmark value at COMPILE time.  The identical landmarks are then
+// re-checked against the REAL runtime decode_u5 in section (M), so the
+// compile-time math and the shipped symbol are cross-validated, not merely
+// asserted against each other.
+// ---------------------------------------------------------------------------
+namespace u5_ct
+{
+    constexpr std::uint32_t kExcess{ 1u };
+    constexpr std::uint32_t kLow{ 191u };
+    constexpr std::uint32_t kBase{ 64u };
+    constexpr int           kShift{ 6 };
+    constexpr int           kMaxLen{ 5 };
+    constexpr std::uint32_t kContinuation{ kExcess + kLow };  // 192
+
+    // A fixed 5-byte buffer plus the count of bytes actually written; this is
+    // the constexpr-friendly stand-in for the oracle's std::vector encoding.
+    struct Encoded
+    {
+        std::array<std::uint8_t, 5> bytes{};
+        std::size_t                 len{ 0 };
+    };
+
+    // Canonical encoder (constexpr): minimal byte sequence HotSpot's writer
+    // emits for `value`.  Never emits a 0 byte.  Mirrors u5_oracle::encode.
+    constexpr auto encode(std::uint32_t value) -> Encoded
+    {
+        Encoded e{};
+        if (value < kLow)
+        {
+            e.bytes[e.len++] = static_cast<std::uint8_t>(kExcess + value);
+            return e;
+        }
+        std::uint32_t sum{ value };
+        for (int i{ 0 }; ; ++i)
+        {
+            if (sum < kLow || i == kMaxLen - 1)
+            {
+                e.bytes[e.len++] = static_cast<std::uint8_t>(kExcess + sum);
+                return e;
+            }
+            sum -= kLow;
+            e.bytes[e.len++] = static_cast<std::uint8_t>(kExcess + kLow + (sum % kBase));
+            sum >>= kShift;
+        }
+    }
+
+    // Decoder (constexpr) modelling vmhook::decode_u5 EXACTLY, including the
+    // End(0) rewind semantics: a 0 byte at any position returns ~0u and leaves
+    // the cursor unchanged.  `data` must hold at least 5 readable bytes.
+    constexpr auto decode(const std::uint8_t* data, int& pos) -> std::uint32_t
+    {
+        std::uint32_t sum{ 0 };
+        for (int i{ 0 }; i < kMaxLen; ++i)
+        {
+            const std::uint8_t b{ data[pos++] };
+            if (b == 0u)
+            {
+                --pos;
+                return ~0u;
+            }
+            sum += static_cast<std::uint32_t>(b - 1u) << (kShift * i);
+            if (b < kContinuation)
+            {
+                return sum;
+            }
+        }
+        return sum;
+    }
+
+    // decode(encode(value)) over the fixed buffer; reports value + bytes used.
+    struct Decoded { std::uint32_t value; int pos; };
+    constexpr auto roundtrip(std::uint32_t value) -> Decoded
+    {
+        const Encoded e{ encode(value) };
+        std::array<std::uint8_t, 8> buf{};   // 5 payload + 3 zero padding
+        for (std::size_t i{ 0 }; i < e.len; ++i) { buf[i] = e.bytes[i]; }
+        int pos{ 0 };
+        const std::uint32_t v{ decode(buf.data(), pos) };
+        return { v, pos };
+    }
+
+    // Decode a single low byte (constexpr) — the 1-byte-domain helper.
+    constexpr auto decode_one(std::uint8_t b) -> Decoded
+    {
+        const std::array<std::uint8_t, 8> buf{ b, 0, 0, 0, 0, 0, 0, 0 };
+        int pos{ 0 };
+        const std::uint32_t v{ decode(buf.data(), pos) };
+        return { v, pos };
+    }
+}  // namespace u5_ct
+
+// ===========================================================================
+// COMPILE-TIME ASSERTION WALL — every check here is evaluated by the compiler.
+// If any fails the translation unit does not build (a far stronger guarantee
+// than a runtime check).  These pin the codec contract; the runtime section
+// (M) mirrors the same landmarks against the shipped decode_u5.
+// ===========================================================================
+
+// --- 1-byte domain: decode({b}) == b-1, consumes 1, for the endpoints and a
+//     spread of interior points (full 1..191 sweep is done at runtime in (C)).
+static_assert(u5_ct::decode_one(1).value == 0u   && u5_ct::decode_one(1).pos == 1, "1->0");
+static_assert(u5_ct::decode_one(2).value == 1u   && u5_ct::decode_one(2).pos == 1, "2->1");
+static_assert(u5_ct::decode_one(128).value == 127u, "128->127 (0x7F)");
+static_assert(u5_ct::decode_one(129).value == 128u, "129->128 (0x80)");
+static_assert(u5_ct::decode_one(191).value == 190u && u5_ct::decode_one(191).pos == 1, "191->190 (1-byte max)");
+
+// --- End(0) marker: returns ~0u and does NOT advance the cursor (rewind).
+static_assert(u5_ct::decode_one(0).value == ~0u && u5_ct::decode_one(0).pos == 0, "End(0) rewinds");
+
+// --- Exact length-transition boundaries (the load-bearing base-64 carries).
+//     max-at-len-N and min-at-len-(N+1) for every N in 1..5.
+static_assert(u5_ct::encode(190u).len == 1 && u5_ct::encode(191u).len == 2, "len1->len2 @ 190/191");
+static_assert(u5_ct::encode(12414u).len == 2 && u5_ct::encode(12415u).len == 3, "len2->len3 @ 12414/12415");
+static_assert(u5_ct::encode(794750u).len == 3 && u5_ct::encode(794751u).len == 4, "len3->len4 @ 794750/794751");
+static_assert(u5_ct::encode(50864254u).len == 4 && u5_ct::encode(50864255u).len == 5, "len4->len5 @ 50864254/50864255");
+
+// --- Every boundary value round-trips through the constexpr codec with the
+//     canonical byte length.
+static_assert(u5_ct::roundtrip(190u).value == 190u        && u5_ct::roundtrip(190u).pos == 1, "rt 190");
+static_assert(u5_ct::roundtrip(191u).value == 191u        && u5_ct::roundtrip(191u).pos == 2, "rt 191");
+static_assert(u5_ct::roundtrip(12414u).value == 12414u    && u5_ct::roundtrip(12414u).pos == 2, "rt 12414");
+static_assert(u5_ct::roundtrip(12415u).value == 12415u    && u5_ct::roundtrip(12415u).pos == 3, "rt 12415");
+static_assert(u5_ct::roundtrip(794750u).value == 794750u  && u5_ct::roundtrip(794750u).pos == 3, "rt 794750");
+static_assert(u5_ct::roundtrip(794751u).value == 794751u  && u5_ct::roundtrip(794751u).pos == 4, "rt 794751");
+static_assert(u5_ct::roundtrip(50864254u).value == 50864254u && u5_ct::roundtrip(50864254u).pos == 4, "rt 50864254");
+static_assert(u5_ct::roundtrip(50864255u).value == 50864255u && u5_ct::roundtrip(50864255u).pos == 5, "rt 50864255");
+
+// --- Canonical encodings pinned BYTE-FOR-BYTE against the spec (these literals
+//     are independently derived from value = sum (b_i-1)*64^i, not from the
+//     encoder, so they cross-check the constexpr encoder itself).
+static_assert(u5_ct::encode(0u).bytes[0] == 1u, "enc(0)={1}");
+static_assert(u5_ct::encode(191u).bytes[0] == 192u && u5_ct::encode(191u).bytes[1] == 1u, "enc(191)={192,1}");
+static_assert(u5_ct::encode(4096u).bytes[0] == 193u && u5_ct::encode(4096u).bytes[1] == 62u, "enc(4096)={193,62}");
+static_assert(u5_ct::encode(65535u).bytes[0] == 192u && u5_ct::encode(65535u).bytes[1] == 254u
+           && u5_ct::encode(65535u).bytes[2] == 13u && u5_ct::encode(65535u).len == 3, "enc(0xFFFF)={192,254,13}");
+static_assert(u5_ct::encode(16777215u).bytes[0] == 192u && u5_ct::encode(16777215u).bytes[1] == 254u
+           && u5_ct::encode(16777215u).bytes[2] == 253u && u5_ct::encode(16777215u).bytes[3] == 61u
+           && u5_ct::encode(16777215u).len == 4, "enc(0xFFFFFF)={192,254,253,61}");
+static_assert(u5_ct::encode(0xFFFFFFFFu).bytes[0] == 192u && u5_ct::encode(0xFFFFFFFFu).bytes[1] == 254u
+           && u5_ct::encode(0xFFFFFFFFu).bytes[2] == 253u && u5_ct::encode(0xFFFFFFFFu).bytes[3] == 253u
+           && u5_ct::encode(0xFFFFFFFFu).bytes[4] == 253u && u5_ct::encode(0xFFFFFFFFu).len == 5,
+           "enc(UINT32_MAX)={192,254,253,253,253}");
+
+// --- Landmark values round-trip losslessly through the constexpr codec, all
+//     five byte-lengths represented.  (The runtime mirror in (M) re-verifies
+//     these against the shipped decode_u5.)
+static_assert(u5_ct::roundtrip(127u).value == 127u, "rt 0x7F");
+static_assert(u5_ct::roundtrip(128u).value == 128u, "rt 0x80");
+static_assert(u5_ct::roundtrip(255u).value == 255u, "rt 0xFF");
+static_assert(u5_ct::roundtrip(65535u).value == 65535u && u5_ct::roundtrip(65535u).pos == 3, "rt 0xFFFF");
+static_assert(u5_ct::roundtrip(65536u).value == 65536u, "rt 0x10000");
+static_assert(u5_ct::roundtrip(16777215u).value == 16777215u && u5_ct::roundtrip(16777215u).pos == 4, "rt 0xFFFFFF");
+static_assert(u5_ct::roundtrip(16777216u).value == 16777216u, "rt 0x1000000");
+static_assert(u5_ct::roundtrip(2147483647u).value == 2147483647u && u5_ct::roundtrip(2147483647u).pos == 5, "rt 2^31-1");
+static_assert(u5_ct::roundtrip(2147483648u).value == 2147483648u, "rt 2^31");
+static_assert(u5_ct::roundtrip(2147483649u).value == 2147483649u, "rt 2^31+1");
+static_assert(u5_ct::roundtrip(0xFFFFFFFFu).value == 0xFFFFFFFFu && u5_ct::roundtrip(0xFFFFFFFFu).pos == 5, "rt UINT32_MAX");
+
+// --- Power-of-two ±1 ladder, EVERY exponent 0..31, all three of (2^k-1, 2^k,
+//     2^k+1) round-tripping at compile time.  A single recursive constexpr fold
+//     collapses the whole ladder into one assertion: any off-by-one carry bug
+//     at any bit position breaks the build.
+namespace u5_ct
+{
+    constexpr bool pow2_neighbourhood_roundtrips(int k)
+    {
+        if (k > 31) { return true; }
+        const std::uint32_t p{ static_cast<std::uint32_t>(1u) << k };
+        const std::uint32_t lo{ p == 0u ? 0u : p - 1u };
+        const std::uint32_t hi{ p + 1u };  // wraps harmlessly at k==31 (-> 2^31+1)
+        const bool here{
+               roundtrip(lo).value == lo
+            && roundtrip(p).value  == p
+            && roundtrip(hi).value == hi };
+        return here && pow2_neighbourhood_roundtrips(k + 1);
+    }
+}  // namespace u5_ct
+static_assert(u5_ct::pow2_neighbourhood_roundtrips(0),
+              "every power-of-two +/-1 (2^0..2^31) round-trips through UNSIGNED5");
+
+// --- Dense compile-time fold over a contiguous low block: decode(encode(x))==x
+//     for all x in [0..4500].  This crosses the len1->len2 and len2->len3
+//     transitions hundreds of times entirely at compile time.  (Kept modest so
+//     constexpr step limits are never an issue on any compiler in the matrix.)
+namespace u5_ct
+{
+    constexpr bool dense_roundtrips(std::uint32_t x, std::uint32_t end)
+    {
+        for (; x <= end; ++x)
+        {
+            const Decoded d{ roundtrip(x) };
+            if (d.value != x) { return false; }
+            if (static_cast<std::size_t>(d.pos) != encode(x).len) { return false; }
+        }
+        return true;
+    }
+}  // namespace u5_ct
+static_assert(u5_ct::dense_roundtrips(0u, 4500u),
+              "decode(encode(x))==x with canonical length for all x in [0,4500]");
 
 // Run vmhook's decode_u5 on the canonical encoding of `value` and report both
 // the decoded result and the bytes consumed.  Pads with trailing zeros so the
@@ -1098,6 +1308,162 @@ int main()
         check("empty_stream_header_consumes_two_bytes", pos_after_header == 2);
         check("empty_stream_then_end_marker", end == ~0u);
         check("empty_stream_end_parks_at_two", pos == 2);
+    }
+
+    // #####################################################################
+    // ##  EXHAUSTIVE WAVE 3 — TARGETED LANDMARK VALUES against the REAL   ##
+    // ##  decode_u5.  The strided uint32 sweep (E) walks ~84k coprime     ##
+    // ##  points but lands on NONE of the classic landmark constants      ##
+    // ##  (verified: 0x7F, 0x80, 0xFFFF, 0xFFFFFF, every power-of-two +-1,##
+    // ##  2^31, 2^31+-1 are all missed by stride 51217).  The low dense    ##
+    // ##  block (D) covers only x <= 49999.  This wave pins each landmark  ##
+    // ##  EXPLICITLY: the shipped decode_u5 must reproduce the exact       ##
+    // ##  spec value, the canonical byte length, and agree with the        ##
+    // ##  independent oracle decoder, for every one.                       ##
+    // #####################################################################
+
+    // =====================================================================
+    // (M) LANDMARK TABLE — 0x7F/0x80, 0xFF, 0xFFFF, 0xFFFFFF, the byte-width
+    //     round constants, 2^31 +/- 1, and UINT32_MAX.  Each `expect_len` is
+    //     the hand-derived canonical UNSIGNED5 length (see the boundary map in
+    //     section (B)).  decode_u5 is fed the canonical encoding and must
+    //     return (value, expect_len); the oracle decoder must agree byte-for-
+    //     byte on the cursor too.
+    // =====================================================================
+    {
+        struct Landmark { const char* name; std::uint32_t value; std::size_t expect_len; };
+        const Landmark landmarks[]{
+            { "0x7F_127",            127u,         1 },  // last value below the 0x80 transition
+            { "0x80_128",            128u,         1 },  // 0x80 itself (still 1 byte: 128 < 191)
+            { "0xFF_255",            255u,         2 },  // first 0xFF; spills to 2 bytes
+            { "0x100_256",           256u,         2 },
+            { "0x1FF_511",           511u,         2 },
+            { "0x200_512",           512u,         2 },
+            { "0xFFF_4095",          4095u,        2 },  // last 2-byte value before 0x1000 region
+            { "0x1000_4096",         4096u,        2 },
+            { "0xFFFF_65535",        65535u,       3 },  // 16-bit all-ones
+            { "0x10000_65536",       65536u,       3 },
+            { "0xFFFFF_1048575",     1048575u,     4 },
+            { "0x100000_1048576",    1048576u,     4 },
+            { "0xFFFFFF_16777215",   16777215u,    4 },  // 24-bit all-ones
+            { "0x1000000_16777216",  16777216u,    4 },  // 2^24; still 4 bytes (5-byte region starts at 50864255)
+            { "0x7FFFFFFF_2147483647", 2147483647u, 5 }, // 2^31 - 1
+            { "0x80000000_2147483648", 2147483648u, 5 }, // 2^31 (bit 31 set)
+            { "0x80000001_2147483649", 2147483649u, 5 }, // 2^31 + 1
+            { "0xFFFFFFFF_max",      0xFFFFFFFFu,  5 },  // UINT32_MAX
+        };
+        bool value_ok{ true };
+        bool length_ok{ true };
+        bool oracle_ok{ true };
+        const char* first_bad{ nullptr };
+        for (const Landmark& lm : landmarks)
+        {
+            // real decode_u5 on the canonical encoding
+            int vpos{ 0 };
+            const std::uint32_t vdec{ roundtrip_decode(lm.value, vpos) };
+            // independent oracle decode on the same padded buffer
+            std::vector<std::uint8_t> padded{ u5_oracle::encode(lm.value) };
+            padded.resize(padded.size() + 8, 0u);
+            int opos{ 0 };
+            const std::uint32_t odec{ u5_oracle::decode(padded.data(), opos) };
+
+            if (vdec != lm.value)                                { value_ok = false;  if (!first_bad) first_bad = lm.name; }
+            if (static_cast<std::size_t>(vpos) != lm.expect_len) { length_ok = false; if (!first_bad) first_bad = lm.name; }
+            if (vdec != odec || vpos != opos)                    { oracle_ok = false; if (!first_bad) first_bad = lm.name; }
+        }
+        if (first_bad) { std::printf("       (first failing landmark = %s)\n", first_bad); }
+        check("landmarks_decode_to_exact_value", value_ok);
+        check("landmarks_consume_canonical_length", length_ok);
+        check("landmarks_vmhook_matches_oracle_decoder", oracle_ok);
+    }
+
+    // =====================================================================
+    // (N) HARDCODED-BYTE LANDMARK PINS — decode the canonical byte sequences
+    //     for 0xFFFF and 0xFFFFFF written out as LITERAL bytes (independently
+    //     derived from value = sum (b_i-1)*64^i), so these two checks do not
+    //     depend on the in-test encoder at all.  If both the encoder and the
+    //     decoder shared a bug, these byte-literal pins would still catch it.
+    //       0xFFFF   = 65535    -> {192,254,13}     : 191 + 253*64 + 12*4096
+    //       0xFFFFFF = 16777215 -> {192,254,253,61} : 191 + 253*64 + 252*4096 + 60*262144
+    // =====================================================================
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 192, 254, 13 }, pos) };
+        check("hardcoded_0xFFFF_bytes_decode_to_65535",
+              v == 65535u && v == (191u + 253u * 64u + 12u * 64u * 64u));
+        check("hardcoded_0xFFFF_consumes_three", pos == 3);
+    }
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 192, 254, 253, 61 }, pos) };
+        check("hardcoded_0xFFFFFF_bytes_decode_to_16777215",
+              v == 16777215u
+           && v == (191u + 253u * 64u + 252u * 64u * 64u + 60u * 64u * 64u * 64u));
+        check("hardcoded_0xFFFFFF_consumes_four", pos == 4);
+    }
+    // 2^31 (bit 31 set) decoded from its literal canonical bytes {193,254,253,253,125}.
+    //   = 192 + 253*64 + 252*4096 + 252*262144 + 124*16777216 = 2147483648
+    {
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 193, 254, 253, 253, 125 }, pos) };
+        check("hardcoded_2pow31_bytes_decode_to_2147483648",
+              v == 2147483648u && (v & 0x80000000u) != 0u);
+        check("hardcoded_2pow31_consumes_five", pos == 5);
+    }
+
+    // =====================================================================
+    // (O) POWER-OF-TWO +/-1 LADDER against the REAL decode_u5 — for every
+    //     exponent k in 0..31, decode_u5 on the canonical encodings of
+    //     (2^k - 1), 2^k, and (2^k + 1) must round-trip exactly and consume
+    //     the canonical length.  The compile-time wall already proved the
+    //     spec math; this proves the SHIPPED symbol agrees across all 32 bit
+    //     positions (96 values), where any per-bit carry mishandling would
+    //     surface.
+    // =====================================================================
+    {
+        bool value_ok{ true };
+        bool length_ok{ true };
+        int  first_bad_k{ -1 };
+        for (int k{ 0 }; k <= 31; ++k)
+        {
+            const std::uint32_t p{ static_cast<std::uint32_t>(1u) << k };
+            const std::uint32_t probes[]{ (p == 0u ? 0u : p - 1u), p, p + 1u };
+            for (const std::uint32_t x : probes)
+            {
+                int vpos{ 0 };
+                const std::uint32_t vdec{ roundtrip_decode(x, vpos) };
+                if (vdec != x)                                                  { value_ok = false;  if (first_bad_k < 0) first_bad_k = k; }
+                if (static_cast<std::size_t>(vpos) != u5_oracle::encoded_length(x)) { length_ok = false; if (first_bad_k < 0) first_bad_k = k; }
+            }
+        }
+        if (first_bad_k >= 0) { std::printf("       (first failing power-of-two exponent k = %d)\n", first_bad_k); }
+        check("pow2_pm1_ladder_real_decode_roundtrips", value_ok);
+        check("pow2_pm1_ladder_real_decode_canonical_length", length_ok);
+    }
+
+    // =====================================================================
+    // (P) HIGH-RANGE DENSE BLOCK around UINT32_MAX — the strided sweep is
+    //     sparse near the very top; pin a contiguous run of the largest 4096
+    //     uint32 values [2^32-4096 .. 2^32-1] so the top of the encoding
+    //     space (where the 5th byte carries its maximum digit) has zero gaps.
+    // =====================================================================
+    {
+        bool ok{ true };
+        std::uint32_t first_bad{ 0 };
+        bool have_bad{ false };
+        for (std::uint32_t x{ 0xFFFFF000u }; ; ++x)
+        {
+            int vpos{ 0 };
+            const std::uint32_t vdec{ roundtrip_decode(x, vpos) };
+            if (vdec != x || static_cast<std::size_t>(vpos) != 5u)
+            {
+                ok = false;
+                if (!have_bad) { first_bad = x; have_bad = true; }
+            }
+            if (x == 0xFFFFFFFFu) { break; }  // inclusive of UINT32_MAX, then stop (no wrap)
+        }
+        if (have_bad) { std::printf("       (first failing top-range value = %u)\n", first_bad); }
+        check("top_4096_uint32_values_roundtrip_in_five_bytes", ok);
     }
 
     return failures == 0 ? 0 : 1;

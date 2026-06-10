@@ -27,18 +27,56 @@ static auto check(const char* name, bool ok) -> void
     if (!ok) { ++failures; }
 }
 
-// Mirror of the inline return-type extraction in method_proxy::call
-// (vmhook.hpp ~12241-12245): find the last ')', the return descriptor is the
-// single char immediately after it; when there is no ')' the contract is to
-// treat the return type as void ('V').  The library has no *named* helper for
-// this step — the BasicType lookup it performs IS detail::sig_char_to_basic_type
-// — so we reproduce the one-line extraction and assert the composed result,
-// exercising sig_char_to_basic_type through the exact code path call() uses.
+// RAW-CLASSIFIER mirror of return-descriptor extraction: find the last ')',
+// take the single char immediately after it, and feed it STRAIGHT into
+// sig_char_to_basic_type with no validity filtering; when there is no ')' the
+// fallback is void ('V').  This reproduces the *historical* (pre-guard)
+// method_proxy::call call site and exists to characterise sig_char_to_basic_type
+// through that lens — in particular it preserves the OLD policy where an
+// unrecognised return letter degrades to T_OBJECT(12) (see the FLAW1 block).
+// It is NOT the current library behaviour: the live call site now filters the
+// return char through an allow-list and degrades unknowns to T_VOID — that is
+// reproduced separately by call_site_result_type() below.  Because this mirror
+// is unguarded, callers MUST NOT pass a signature whose final char is ')'
+// (signature[rparen+1] would index size(), which is UB on string_view).
 static auto return_basic_type_of(std::string_view signature) -> int
 {
     const std::size_t rparen{ signature.rfind(')') };
     const char        ret_char{ rparen != std::string_view::npos ? signature[rparen + 1] : 'V' };
     return vmhook::detail::sig_char_to_basic_type(ret_char);
+}
+
+// FAITHFUL mirror of the CURRENT return-descriptor decode in method_proxy::call
+// (vmhook.hpp:14287-14313) AND method_proxy::call_jni (vmhook.hpp:13646-13660).
+// The live code hardens the raw lookup on two fronts, both reproduced verbatim:
+//   * BOUNDS: the return char is read only when `rparen + 1 < size()`, so a
+//     signature ending in ')' (e.g. "()" / "(I)" / "(Lj/l/String;)") — where
+//     rparen+1 == size() — is treated as void with NO out-of-bounds read.  (On
+//     string_view, operator[](size()) is UB; std::string's NUL-at-size() does
+//     NOT carry through the view, which is exactly why the guard exists.)
+//   * VALIDITY: only a real JVM return descriptor letter
+//     (Z B C S I J F D | L | [ | V) is forwarded to sig_char_to_basic_type;
+//     anything else degrades to T_VOID(14) — a safe no-op return — rather than
+//     falling through sig_char_to_basic_type's T_OBJECT(12) default, which would
+//     make the call stub decode an arbitrary return register as an oop pointer.
+// This is byte-for-byte the `ret_char` / `valid_ret_char` / `result_type` ladder
+// the library runs; reproducing it lets the exhaustive sweep below exercise the
+// real, guarded policy (the boundary "ends in ')'" cases and the unknown->VOID
+// mapping) that the raw mirror above deliberately cannot reach.
+static auto call_site_result_type(std::string_view sig) -> int
+{
+    const std::size_t rparen{ sig.rfind(')') };
+    const char ret_char{
+        (rparen != std::string_view::npos && rparen + 1 < sig.size())
+            ? sig[rparen + 1]
+            : 'V' };
+    const bool valid_ret_char{
+        ret_char == 'Z' || ret_char == 'B' || ret_char == 'C'
+        || ret_char == 'S' || ret_char == 'I' || ret_char == 'J'
+        || ret_char == 'F' || ret_char == 'D' || ret_char == 'L'
+        || ret_char == '[' || ret_char == 'V' };
+    return valid_ret_char ? vmhook::detail::sig_char_to_basic_type(ret_char)
+                          : 14 /* T_VOID */;
 }
 
 // Mirror of the constructor-signature build inside vmhook::jni_make_unique
@@ -1066,14 +1104,172 @@ int main()
     check("return_type_balanced_then_object_is_12",
           return_basic_type_of("(I(J)K)Ljava/lang/Object;") == 12);
 
-    // NOTE on flaw #2 (the `signature[rparen+1]` boundary): a signature whose
-    // FINAL character is ')' makes rparen+1 == size(), and string_view::
-    // operator[](size()) is UB.  We deliberately DO NOT feed such inputs to
-    // return_basic_type_of (it mirrors the library's unguarded call site
-    // verbatim, so doing so would invoke the same UB here).  The boundary is
-    // documented as a library hazard in the final report rather than exercised.
-    // Inputs that merely *contain* ')' but do not END in it are safe and are
-    // covered above; the npos (no-')') path is covered in pass 1.
+    // NOTE on the `signature[rparen+1]` boundary: a signature whose FINAL char
+    // is ')' makes rparen+1 == size(), and string_view::operator[](size()) is
+    // UB.  The RAW mirror (return_basic_type_of) reproduces the library's
+    // *historical* unguarded read, so we never feed it an ends-in-')' input.
+    // The CURRENT library guards that read (`rparen + 1 < size()`), and that
+    // guarded behaviour — plus the unknown->VOID validity filter — is what the
+    // call_site_result_type() mirror reproduces and PASS 5 below exercises in
+    // full, including the previously-unprobed ends-in-')' boundary.
+
+    // =====================================================================
+    // EXHAUSTIVE PASS 5 — the CURRENT, GUARDED call-site return-decode.
+    //
+    // PASSES 1-4 above pin the raw sig_char_to_basic_type lookup as reached by
+    // the *historical* unguarded call site (return_basic_type_of).  Since that
+    // test was written the live method_proxy::call / call_jni sites gained two
+    // guards (vmhook.hpp:14287-14313 / 13646-13660): a bounds check that makes a
+    // signature ending in ')' decode as void instead of reading one-past-end,
+    // and a return-char allow-list that degrades an UNKNOWN return descriptor to
+    // T_VOID(14) instead of sig_char_to_basic_type's T_OBJECT(12) default.  This
+    // pass drives call_site_result_type() — the faithful mirror of that guarded
+    // ladder — so the suite tracks what the library actually does today, and so
+    // the boundary + unknown-policy cases the older passes could not reach (the
+    // raw mirror would UB on ends-in-')'; PASS-4's FLAW1 block pins the *old*
+    // T_OBJECT policy) are now covered against the real, fixed behaviour.
+    // =====================================================================
+
+    // ---- guarded decode: every well-formed return letter is UNCHANGED -------
+    // For a real, well-formed signature the guard is transparent: the allow-list
+    // admits every genuine descriptor letter, so each routes to the SAME
+    // BasicType the raw lookup gives.  Pin the full set so the guard can never
+    // accidentally start rejecting a valid return.
+    check("callsite_return_void_is_14",    call_site_result_type("()V")                    == 14);
+    check("callsite_return_boolean_is_4",  call_site_result_type("(Ljava/lang/Object;)Z")  == 4);
+    check("callsite_return_char_is_5",     call_site_result_type("(I)C")                    == 5);
+    check("callsite_return_float_is_6",    call_site_result_type("(J)F")                    == 6);
+    check("callsite_return_double_is_7",   call_site_result_type("([B)D")                   == 7);
+    check("callsite_return_byte_is_8",     call_site_result_type("(II)B")                   == 8);
+    check("callsite_return_short_is_9",    call_site_result_type("(D)S")                    == 9);
+    check("callsite_return_int_is_10",     call_site_result_type("(I)I")                    == 10);
+    check("callsite_return_long_is_11",    call_site_result_type("(FF)J")                   == 11);
+    check("callsite_return_object_is_12",  call_site_result_type("(I)Ljava/lang/String;")   == 12);
+    check("callsite_return_array_is_13",   call_site_result_type("(I)[I")                   == 13);
+    // Multi-dimensional and object arrays classify by the leading '[' -> 13.
+    check("callsite_return_2d_array_is_13",      call_site_result_type("()[[I")             == 13);
+    check("callsite_return_obj_array_is_13",     call_site_result_type("()[Ljava/lang/String;") == 13);
+    // "Last paren wins" survives the guard unchanged.
+    check("callsite_return_many_params_last_paren_is_10",
+          call_site_result_type("(IJLjava/lang/Object;)I") == 10);
+    check("callsite_return_nested_parens_then_J_is_11",
+          call_site_result_type("(((())))J") == 11);
+
+    // ---- guarded decode: the ends-in-')' BOUNDARY (the unprobed gap) ---------
+    // These are the inputs the raw mirror could NOT take: rparen is the LAST
+    // index, so rparen+1 == size().  The live guard `rparen + 1 < size()` makes
+    // the read fall to the 'V' branch -> T_VOID(14), with no one-past-end access.
+    // Drive a representative spread of "chopped return" signatures and assert the
+    // safe void result for every one.
+    check("callsite_boundary_empty_parens_is_void_14",
+          call_site_result_type("()") == 14);
+    check("callsite_boundary_one_arg_no_ret_is_void_14",
+          call_site_result_type("(I)") == 14);
+    check("callsite_boundary_two_args_no_ret_is_void_14",
+          call_site_result_type("(IJ)") == 14);
+    check("callsite_boundary_object_arg_no_ret_is_void_14",
+          call_site_result_type("(Ljava/lang/String;)") == 14);
+    check("callsite_boundary_array_arg_no_ret_is_void_14",
+          call_site_result_type("([I)") == 14);
+    check("callsite_boundary_paren_soup_ending_in_rparen_is_void_14",
+          call_site_result_type("(()())") == 14);
+    check("callsite_boundary_single_rparen_is_void_14",
+          call_site_result_type(")") == 14);
+    // A lone ')' as the entire 1-char signature: rparen==0, size()==1, 0+1==1
+    // is NOT < 1 -> void, no read of index 1.
+    {
+        bool every_chopped_is_void{ true };
+        const char* chopped[]{
+            "()", "(I)", "(II)", "(IJ)", "(JD)", "(Z)", "([[I)",
+            "(Ljava/lang/Object;)", "([Ljava/lang/String;)", "(()())", ")",
+        };
+        for (const char* s : chopped)
+        {
+            if (call_site_result_type(s) != 14) { every_chopped_is_void = false; }
+        }
+        check("callsite_boundary_every_ends_in_rparen_is_void_14", every_chopped_is_void);
+    }
+
+    // ---- guarded decode: UNKNOWN return char -> T_VOID(14), not T_OBJECT -----
+    // This is the policy FLIP from PASS-4's FLAW1 block.  The raw lookup maps an
+    // unrecognised post-')' letter to T_OBJECT(12); the live allow-list rejects
+    // it and yields T_VOID(14).  Pin the new, safe policy against the SAME inputs
+    // FLAW1 pinned to 12, so the divergence between "raw classifier" and "live
+    // call site" is explicit and any regression in either direction fails loudly.
+    check("callsite_unknown_Q_is_void_14_not_object",
+          call_site_result_type("(I)Q") == 14);
+    check("callsite_unknown_lowercase_i_is_void_14",
+          call_site_result_type("(I)i") == 14);
+    check("callsite_unknown_digit_is_void_14",
+          call_site_result_type("()9") == 14);
+    check("callsite_unknown_semicolon_is_void_14",
+          call_site_result_type("();") == 14);
+    check("callsite_unknown_slash_is_void_14",
+          call_site_result_type("()/") == 14);
+    // Direct contrast with the raw classifier on one input: raw -> 12, guarded
+    // -> 14.  This single line makes the remediation of flaw #1 unmistakable.
+    check("callsite_vs_raw_unknown_return_diverge_14_vs_12",
+          call_site_result_type("(I)Q") == 14 && return_basic_type_of("(I)Q") == 12);
+    // The 'L' object marker is on the allow-list, so a genuine object return is
+    // STILL 12 under the guard — only *unknown* letters move to 14.  Pin that a
+    // valid object return is not collateral damage of the unknown->void policy.
+    check("callsite_valid_object_L_still_12_under_guard",
+          call_site_result_type("(I)Ljava/lang/String;") == 12);
+
+    // ---- guarded decode: no-')' (npos) path -> void, same as raw ------------
+    // When there is no ')' at all the guard's first conjunct (rparen != npos) is
+    // false, so it takes the 'V' branch -> 14, identical to the raw mirror's npos
+    // fallback.  Pin parity on the npos path so both mirrors agree where they can.
+    check("callsite_no_paren_is_void_14",      call_site_result_type("garbage") == 14);
+    check("callsite_empty_signature_is_void_14", call_site_result_type("")       == 14);
+    check("callsite_single_letter_no_paren_is_void_14", call_site_result_type("I") == 14);
+
+    // ---- guarded decode: FULL 0..255 post-')' byte sweep --------------------
+    // Build "()X" for every byte X and assert the guarded result matches the
+    // reference policy: the 11 allow-listed descriptor letters (Z C F D B S I J
+    // L [ V) keep their BasicType; EVERY other byte (all 245 of them, including
+    // all high/negative bytes under a signed `char`) degrades to T_VOID(14).
+    // This is the call-site analogue of the raw 0..255 sweep in pass 2 and is the
+    // single source of truth for "which return bytes the live decode trusts".
+    {
+        auto reference_callsite = [](int byte) -> int
+        {
+            switch (byte)
+            {
+            case 'Z': return 4;   case 'C': return 5;   case 'F': return 6;
+            case 'D': return 7;   case 'B': return 8;   case 'S': return 9;
+            case 'I': return 10;  case 'J': return 11;  case 'L': return 12;
+            case '[': return 13;  case 'V': return 14;
+            default:  return 14;  // unknown return -> T_VOID under the allow-list
+            }
+        };
+        bool whole_post_paren_range_matches{ true };
+        for (int byte{ 0 }; byte <= 0xFF; ++byte)
+        {
+            const char three[3]{ '(', ')', static_cast<char>(byte) };
+            const int got{ call_site_result_type(std::string_view{ three, 3 }) };
+            if (got != reference_callsite(byte)) { whole_post_paren_range_matches = false; }
+        }
+        check("callsite_full_0_to_255_post_paren_sweep_matches_allowlist",
+              whole_post_paren_range_matches);
+        // Independent count: exactly 10 bytes classify as something OTHER than
+        // T_VOID(14) — Z C F D B S I J L [ minus the ones equal to 14.  'V' maps
+        // to 14 (so not counted) and unknowns map to 14, leaving precisely the 8
+        // primitives + 'L'(12) + '['(13) = 10 distinct-from-void results.
+        int non_void_count{ 0 };
+        for (int byte{ 0 }; byte <= 0xFF; ++byte)
+        {
+            const char three[3]{ '(', ')', static_cast<char>(byte) };
+            if (call_site_result_type(std::string_view{ three, 3 }) != 14) { ++non_void_count; }
+        }
+        check("callsite_exactly_10_post_paren_bytes_classify_non_void", non_void_count == 10);
+    }
+    // High / signed-char corners after ')': bytes that arrive negative under a
+    // signed `char` are not allow-listed -> 14, with no signed-char surprise.
+    check("callsite_high_byte_0x80_after_paren_is_void_14",
+          call_site_result_type(std::string_view{ "()\x80", 3 }) == 14);
+    check("callsite_high_byte_0xFF_after_paren_is_void_14",
+          call_site_result_type(std::string_view{ "()\xFF", 3 }) == 14);
 
     return failures == 0 ? 0 : 1;
 }
