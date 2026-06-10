@@ -30,6 +30,22 @@ import vmhook.Harness;
  * side can confirm the valid read path reflects live, post-dispatch JVM state
  * even after all the degenerate calls — i.e. the guards never wedged the field.
  *
+ * GC-SETTLE / MIRROR-TENURE (mode 2): the native module's static-field VALUE
+ * reads resolve `java.lang.Class mirror + offset` and then do a RAW read of that
+ * address (the library's field_proxy::get() memcpy is not GC-safe — the same
+ * accepted raw-oop gap deflaked in collection_list).  This class's mirror is a
+ * young, relocatable heap oop the FIRST time field_null_safety touches it; a
+ * young GC firing between resolve and read leaves the captured address pointing
+ * at the pre-relocation copy (stale bytes => a wrong value; an unmapped old page
+ * => a fault).  This was invisible on the old CI runner but the windows·msvc
+ * 14.51 runner's codegen/timing widened the window enough to corrupt the first
+ * few reads (and, ~1/4 of runs, fault the JVM) — while windows·clang and every
+ * linux/macos JDK-24/25/26 config stayed green.  Mode 2 allocates a little
+ * garbage and calls System.gc() twice so this class's mirror is PROMOTED to the
+ * old generation (where G1 will not relocate it) BEFORE the native side reads
+ * any static value.  After that the raw reads are stable and every native check
+ * can stay a HARD assertion.  Mirrors Warmup.java's runGcSettle().
+ *
  * ENCODING NOTE: the one non-ASCII char value uses a \\uXXXX escape (resolved by
  * the Java lexer regardless of source-file encoding), so this fixture compiles
  * identically under javac on Windows (Cp1252) and Linux/macOS (UTF-8); CI
@@ -40,6 +56,20 @@ public final class FieldNullSafety
     // -- go / done handshake driven by the native module via run_probe ------
     public static volatile boolean go;
     public static volatile boolean done;
+
+    /**
+     * Action selector; the native side sets it BEFORE raising `go` so one probe
+     * cycle drives exactly the work it wants.
+     *   1 = mutateOkInt(): genuine putstatic on okInt (the live-state proof).
+     *   2 = gcSettle(): allocate garbage + System.gc() x2 so THIS class's
+     *       java.lang.Class mirror tenures to old-gen before native value reads
+     *       (see the GC-SETTLE / MIRROR-TENURE note in the class doc above).
+     * Defaults to 1 so an unset/legacy driver keeps the original behaviour.
+     */
+    public static volatile int mode = 1;
+
+    /** Allocation iterations for the GC-settle action (mirrors Warmup.java). */
+    public static final int GC_GARBAGE_ALLOCS = 32;
 
     // =====================================================================
     //  KNOWN-GOOD static fields — one of every primitive width plus a String
@@ -108,6 +138,27 @@ public final class FieldNullSafety
         return probeRuns;
     }
 
+    /**
+     * Allocates a little real garbage and calls System.gc() twice so a
+     * collection actually happens (even under -XX:+DisableExplicitGC the garbage
+     * forces one), promoting this class's live java.lang.Class mirror to the old
+     * generation.  Once tenured, G1 will not relocate the mirror during the
+     * young GCs that fire while the native module runs, so the native side's raw
+     * `mirror + offset` static reads are stable.  See the class-doc note and
+     * Warmup.runGcSettle().  Bounded and cheap so it completes well inside the
+     * native probe's poll window.
+     */
+    public static void gcSettle()
+    {
+        for (int n = 0; n < GC_GARBAGE_ALLOCS; ++n)
+        {
+            final byte[] junk = new byte[64 * 1024];
+            junk[0] = (byte) n;
+        }
+        System.gc();
+        System.gc();
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -121,10 +172,22 @@ public final class FieldNullSafety
             @Override
             public void run()
             {
-                // Real bytecode dispatch: invokestatic mutateOkInt() which
-                // executes a putstatic on okInt that the native side then reads
-                // back through the valid field_proxy::get() path.
-                FieldNullSafety.mutateOkInt();
+                switch (FieldNullSafety.mode)
+                {
+                    case 2:
+                        // Tenure this class's mirror BEFORE the native value
+                        // reads so the (GC-unsafe) raw reads cannot race a young
+                        // GC relocating the mirror oop.
+                        FieldNullSafety.gcSettle();
+                        break;
+                    case 1:
+                    default:
+                        // Real bytecode dispatch: invokestatic mutateOkInt()
+                        // executes a putstatic on okInt that the native side
+                        // then reads back through the valid field_proxy::get().
+                        FieldNullSafety.mutateOkInt();
+                        break;
+                }
                 FieldNullSafety.done = true;
             }
         });
