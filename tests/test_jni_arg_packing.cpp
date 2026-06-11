@@ -101,6 +101,60 @@ struct registered_wrapper : vmhook::object_base
     explicit registered_wrapper(void* p = nullptr) noexcept : vmhook::object_base{ p } {}
 };
 
+// ---------------------------------------------------------------------------
+// Compile-time ACCEPTANCE predicate (test-local mirror of convert_jni_arg /
+// jni_signature_for_arg's if-constexpr ladder).  The library packers do NOT
+// SFINAE-reject unsupported args — they fire a hard static_assert in the `else`
+// branch (vmhook.hpp convert_jni_arg:10938 / jni_signature_for_arg:10794), so a
+// detector that *instantiates* the packer on a bad type would hard-error rather
+// than fail gracefully.  Instead we replicate the library's exact dispatch
+// predicate here as a constexpr bool, then assert (Section O) that it ACCEPTS
+// every documented arg type and REJECTS everything else.  This is the
+// compile-time "type -> jvalue-field / signature mapping" + "non-JNI-convertible
+// arg is rejected" contract the harness brief calls for, expressed as a single
+// boolean so a drift in the supported set surfaces as a failing static_assert.
+//
+// MUST stay in lockstep with convert_jni_arg.  Acceptance set (post std::decay):
+//   string family (std::string / std::string_view / const char* / char*)
+//   | unique_ptr<T : object_base> | T : object_base | bool
+//   | integral && (sizeof<=4 || sizeof==8) | float | double.
+template<typename arg_t>
+inline constexpr bool jni_arg_accepted_v = [] {
+    using clean_t = std::decay_t<arg_t>;
+    if constexpr (std::is_same_v<clean_t, std::string>
+                  || std::is_same_v<clean_t, std::string_view>
+                  || std::is_same_v<clean_t, const char*>
+                  || std::is_same_v<clean_t, char*>)
+        return true;
+    else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
+        // unique_ptr is accepted by convert_jni_arg's dispatch arm; whether its
+        // T derives from object_base is enforced by an *inner* static_assert,
+        // so at the dispatch level the unique_ptr branch is "accepted".
+        return true;
+    else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
+        return true;
+    else if constexpr (std::is_same_v<clean_t, bool>)
+        return true;
+    else if constexpr (std::is_integral_v<clean_t>
+                       && (sizeof(clean_t) <= sizeof(std::int32_t)
+                           || sizeof(clean_t) == sizeof(std::int64_t)))
+        return true;
+    else if constexpr (std::is_same_v<clean_t, float> || std::is_same_v<clean_t, double>)
+        return true;
+    else
+        return false;
+}();
+
+// A plain aggregate that is NOT object_base-derived: an unsupported arg type.
+struct not_an_object
+{
+    int a;
+    double b;
+};
+
+// A scoped enum (NOT integral per std::is_integral) -> unsupported.
+enum class some_scoped_enum : int { x, y };
+
 int main()
 {
     // --- Precondition: confirm we really are running without a JVM ----------
@@ -1524,6 +1578,234 @@ int main()
         // No object args -> object_handles did not grow.
         check("N_object_handles_not_grown_no_objects",
               object_handles.size() == handles_before);
+    }
+
+    // =====================================================================
+    // SECTION O — COMPILE-TIME contract: type -> jvalue-member / signature
+    // mapping and the non-JNI-convertible rejection.  Everything here is a
+    // static_assert (zero runtime cost) split into two halves:
+    //   (O1) STRUCTURAL: the jni_value union's member TYPES are exactly the
+    //        widths the packer's union-member dispatch depends on.  If the
+    //        union ever changed (e.g. `i` widened to int64), the packer's
+    //        `out.i = static_cast<int32_t>(arg)` narrow store + the LE
+    //        narrow-read aliasing the whole file relies on would silently
+    //        break; this pins the layout at compile time.
+    //   (O2) ACCEPTANCE: the test-local predicate jni_arg_accepted_v (a faithful
+    //        mirror of convert_jni_arg's if-constexpr ladder) ACCEPTS every
+    //        documented arg type and REJECTS everything else — the "compile-time
+    //        rejection contract via a detector" the brief asks for.  Because the
+    //        library uses a hard static_assert (not SFINAE) for the reject path,
+    //        the predicate is the only way to assert rejection without forcing a
+    //        deliberate build break.
+    // =====================================================================
+    {
+        // ---- (O1) union member-type / width invariants --------------------
+        // bool/int8/uint16/int16/int32/int64/float/double/void* members map to
+        // the exact C++ types the packer stores into.  decltype on a union
+        // member is well-defined and needs no live object.
+        static_assert(sizeof(vmhook::detail::jni_value) == sizeof(void*),
+                      "jni_value must stay pointer-sized (the whole union-aliasing model).");
+        static_assert(std::is_same_v<decltype(vmhook::detail::jni_value::z), bool>,
+                      "jni_value::z must be bool (jboolean slot).");
+        static_assert(std::is_same_v<decltype(vmhook::detail::jni_value::b), std::int8_t>,
+                      "jni_value::b must be int8 (jbyte slot).");
+        static_assert(std::is_same_v<decltype(vmhook::detail::jni_value::c), std::uint16_t>,
+                      "jni_value::c must be uint16 (jchar slot).");
+        static_assert(std::is_same_v<decltype(vmhook::detail::jni_value::s), std::int16_t>,
+                      "jni_value::s must be int16 (jshort slot).");
+        static_assert(std::is_same_v<decltype(vmhook::detail::jni_value::i), std::int32_t>,
+                      "jni_value::i must be int32 (jint slot) — the <=4B integral target.");
+        static_assert(std::is_same_v<decltype(vmhook::detail::jni_value::j), std::int64_t>,
+                      "jni_value::j must be int64 (jlong slot) — the 8B integral target.");
+        static_assert(std::is_same_v<decltype(vmhook::detail::jni_value::f), float>,
+                      "jni_value::f must be float (jfloat slot).");
+        static_assert(std::is_same_v<decltype(vmhook::detail::jni_value::d), double>,
+                      "jni_value::d must be double (jdouble slot).");
+        static_assert(std::is_same_v<decltype(vmhook::detail::jni_value::l), void*>,
+                      "jni_value::l must be void* (jobject slot).");
+
+        // ---- (O2a) ACCEPTANCE: every documented arg type is accepted -------
+        // Primitives (and their cv/ref-qualified spellings, which decay).
+        static_assert(jni_arg_accepted_v<bool>, "bool must be an accepted arg.");
+        static_assert(jni_arg_accepted_v<std::int8_t>, "int8 accepted.");
+        static_assert(jni_arg_accepted_v<std::uint8_t>, "uint8 accepted.");
+        static_assert(jni_arg_accepted_v<std::int16_t>, "int16 accepted.");
+        static_assert(jni_arg_accepted_v<std::uint16_t>, "uint16 accepted.");
+        static_assert(jni_arg_accepted_v<std::int32_t>, "int32 accepted.");
+        static_assert(jni_arg_accepted_v<std::uint32_t>, "uint32 accepted.");
+        static_assert(jni_arg_accepted_v<std::int64_t>, "int64 accepted.");
+        static_assert(jni_arg_accepted_v<std::uint64_t>, "uint64 accepted.");
+        static_assert(jni_arg_accepted_v<float>, "float accepted.");
+        static_assert(jni_arg_accepted_v<double>, "double accepted.");
+        // char-family (Section C runtime-packs these; here pin acceptance).
+        static_assert(jni_arg_accepted_v<char>, "plain char accepted (integral, sizeof 1).");
+        static_assert(jni_arg_accepted_v<signed char>, "signed char accepted.");
+        static_assert(jni_arg_accepted_v<unsigned char>, "unsigned char accepted.");
+        static_assert(jni_arg_accepted_v<char16_t>, "char16_t accepted.");
+        static_assert(jni_arg_accepted_v<char32_t>, "char32_t accepted.");
+        static_assert(jni_arg_accepted_v<wchar_t>, "wchar_t accepted.");
+        // 8-byte non-intN spellings (Section D) — accepted via the size arm.
+        static_assert(jni_arg_accepted_v<long long>, "long long accepted (8B integral).");
+        static_assert(jni_arg_accepted_v<unsigned long long>, "unsigned long long accepted.");
+        static_assert(jni_arg_accepted_v<std::size_t>, "size_t accepted (integral, 4 or 8B).");
+        static_assert(jni_arg_accepted_v<std::ptrdiff_t>, "ptrdiff_t accepted.");
+        static_assert(jni_arg_accepted_v<std::intmax_t>, "intmax_t accepted.");
+        static_assert(jni_arg_accepted_v<std::uintmax_t>, "uintmax_t accepted.");
+        // String family + cv/ref spellings (decay to one of the four).
+        static_assert(jni_arg_accepted_v<std::string>, "std::string accepted.");
+        static_assert(jni_arg_accepted_v<std::string_view>, "string_view accepted.");
+        static_assert(jni_arg_accepted_v<const char*>, "const char* accepted.");
+        static_assert(jni_arg_accepted_v<char*>, "char* accepted.");
+        static_assert(jni_arg_accepted_v<const std::string&>, "const std::string& decays -> accepted.");
+        static_assert(jni_arg_accepted_v<std::int32_t&>, "int32& decays -> accepted.");
+        static_assert(jni_arg_accepted_v<const double&&>, "const double&& decays -> accepted.");
+        // Object / unique_ptr (by value, ref, and smart-pointer forms).
+        static_assert(jni_arg_accepted_v<fake_object>, "object_base-derived accepted.");
+        static_assert(jni_arg_accepted_v<const fake_object&>, "const object& decays -> accepted.");
+        static_assert(jni_arg_accepted_v<std::unique_ptr<fake_object>>, "unique_ptr<object> accepted.");
+        static_assert(jni_arg_accepted_v<registered_wrapper>, "registered wrapper accepted.");
+
+        // ---- (O2b) REJECTION: non-JNI-convertible args are NOT accepted ----
+        // These are exactly the types convert_jni_arg's `else` static_assert
+        // would reject at the call site.  void*, raw object pointers, aggregates
+        // that are not object_base-derived, containers, scoped enums, long
+        // double, function pointers, std::nullptr_t — none of them.
+        static_assert(!jni_arg_accepted_v<void*>, "raw void* must be rejected (not a string/object).");
+        static_assert(!jni_arg_accepted_v<int*>, "raw int* must be rejected.");
+        static_assert(!jni_arg_accepted_v<fake_object*>, "raw object POINTER must be rejected (pass by value or unique_ptr).");
+        static_assert(!jni_arg_accepted_v<not_an_object>, "a non-object aggregate must be rejected.");
+        static_assert(!jni_arg_accepted_v<std::vector<int>>, "std::vector<int> must be rejected.");
+        static_assert(!jni_arg_accepted_v<some_scoped_enum>, "scoped enum (not integral) must be rejected.");
+        static_assert(!jni_arg_accepted_v<long double>, "long double (neither float nor double) must be rejected.");
+        static_assert(!jni_arg_accepted_v<std::nullptr_t>, "std::nullptr_t must be rejected.");
+        static_assert(!jni_arg_accepted_v<void (*)()>, "function pointer must be rejected.");
+        static_assert(!jni_arg_accepted_v<std::string*>, "std::string* (pointer to string) must be rejected — only the value/view/c-string forms convert.");
+        // NOTE the asymmetry, deliberately pinned: a unique_ptr<NON-object> (e.g.
+        // unique_ptr<int>) is matched by convert_jni_arg's unique_ptr DISPATCH arm
+        // (so the detector reports it "accepted" at the dispatch level), but the
+        // arm immediately fires an INNER static_assert demanding T : object_base.
+        // The detector models only the outer dispatch ladder, not the inner gate,
+        // so it must report `true` here; the actual library would HARD-ERROR at
+        // compile time if such an arg were ever passed.  Asserting `accepted`
+        // documents exactly where the rejection happens (inner arm, not the
+        // else-branch) — flipping this to `!accepted` would itself be a lie.
+        static_assert(jni_arg_accepted_v<std::unique_ptr<int>>,
+                      "unique_ptr<int> reaches the unique_ptr dispatch arm (accepted at the "
+                      "dispatch level); its T:object_base requirement is enforced by an INNER "
+                      "static_assert in convert_jni_arg, not by the outer ladder this detector "
+                      "mirrors.  See the note above.");
+
+        // A purely-compile-time check has no runtime assertion; emit one PASS so
+        // the section is visible in the [PASS]/[FAIL] log and counted.
+        check("O_compile_time_contract_holds", true);
+    }
+
+    // =====================================================================
+    // SECTION P — extra 8-byte integral spellings + pure-object packs.
+    //   (P1) intmax_t / uintmax_t pack to .j (Section D covered long / size_t /
+    //        ptrdiff_t but not the *max_t spellings the brief's flaw #2 lists).
+    //   (P2) make_jni_args over an ALL-object pack (no primitives): every slot
+    //        re-homes into object_handles and each .l points at its own cell —
+    //        a denser stress of the realloc-stability guard than the interleaved
+    //        Section K (consecutive push_backs, no primitive slots in between).
+    // =====================================================================
+    {
+        vmhook::detail::jni_value v{};
+        void* storage{ nullptr };
+
+        // (P1) intmax_t / uintmax_t — both 8 bytes on every CI target -> .j.
+        {
+            const std::intmax_t s{ static_cast<std::intmax_t>(0x0123456789ABCDEFLL) };
+            pack_one(s, v, storage);
+            check("P_intmax_in_j", v.j == static_cast<std::int64_t>(s));
+            check("P_intmax_not_tagged", pack_one(s, v, storage) == false);
+
+            const std::uintmax_t u{ 0xFFFFFFFFFFFFFFFFULL };
+            pack_one(u, v, storage);
+            check("P_uintmax_in_j_is_minus_one", v.j == -1);
+        }
+
+        // (P2) all-object make_jni_args: four objects, no primitives.
+        {
+            std::vector<void*> object_handles{};
+            std::vector<char>  needs_release{};
+
+            fake_object a{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x0A0A0000)) };
+            fake_object b{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x0B0B0000)) };
+            fake_object c{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x0C0C0000)) };
+            fake_object d{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x0D0D0000)) };
+
+            std::vector<vmhook::detail::jni_value> values{
+                vmhook::detail::make_jni_args(object_handles, needs_release, a, b, c, d) };
+
+            check("P_all_object_value_count", values.size() == 4);
+            check("P_all_object_handle_count", object_handles.size() == 4);
+
+            // Each .l points at its OWN distinct handle cell, in order, and the
+            // pre-reserve kept the earliest cell's address stable to the end.
+            check("P_all_object_l0_is_handle0", values[0].l == static_cast<void*>(&object_handles[0]));
+            check("P_all_object_l1_is_handle1", values[1].l == static_cast<void*>(&object_handles[1]));
+            check("P_all_object_l2_is_handle2", values[2].l == static_cast<void*>(&object_handles[2]));
+            check("P_all_object_l3_is_handle3", values[3].l == static_cast<void*>(&object_handles[3]));
+
+            // Cells hold the four instances, in order, and deref round-trips.
+            check("P_all_object_h0", object_handles[0] == a.get_instance());
+            check("P_all_object_h1", object_handles[1] == b.get_instance());
+            check("P_all_object_h2", object_handles[2] == c.get_instance());
+            check("P_all_object_h3", object_handles[3] == d.get_instance());
+            check("P_all_object_deref3_is_d",
+                  *static_cast<void**>(values[3].l) == d.get_instance());
+
+            // Distinctness: no two object slots share a handle cell (a re-home
+            // bug that pointed every .l at the same back() would fail here).
+            check("P_all_object_distinct_cells",
+                  values[0].l != values[1].l && values[1].l != values[2].l
+                  && values[2].l != values[3].l && values[0].l != values[3].l);
+
+            bool all_zero{ true };
+            for (const char tag : needs_release) { if (tag != 0) { all_zero = false; } }
+            check("P_all_object_no_release_tags", all_zero);
+        }
+    }
+
+    // =====================================================================
+    // SECTION Q — runtime tie-back: the accepted-type predicate (Section O)
+    // is consistent with what actually packs.  For a representative arg of
+    // each accepted *category* confirm convert_jni_arg writes a member (the
+    // cell is touched) AND leaves needs_release false (no JVM, no real local
+    // ref).  This bridges the compile-time acceptance contract to observed
+    // packer behaviour without re-asserting the per-bit tables of B/C/D.
+    // =====================================================================
+    {
+        vmhook::detail::jni_value v{};
+        void* storage{ nullptr };
+
+        // bool / integral<=4 / integral==8 / float / double categories: each
+        // writes a non-poison member and never tags for release.  We poison
+        // via the core helper (pack_one_core) so "a member was written" is
+        // observable as "the poison is gone".
+        check("Q_bool_category_packs", pack_one_core(true, v, storage) == false && v.z == true);
+        check("Q_i4_category_packs",  pack_one_core(std::int16_t{ 9 }, v, storage) == false && v.i == 9);
+        check("Q_i8_category_packs",  pack_one_core(std::int64_t{ 9 }, v, storage) == false && v.j == 9);
+        check("Q_float_category_packs",  pack_one_core(float{ 9.0f }, v, storage) == false && bits_eq(v.f, 9.0f));
+        check("Q_double_category_packs", pack_one_core(double{ 9.0 }, v, storage) == false && bits_eq(v.d, 9.0));
+
+        // object category: .l re-homed to &storage, tag false, storage = inst.
+        fake_object obj{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x7007'7007)) };
+        check("Q_object_category_packs",
+              pack_one_core(obj, v, storage) == false
+              && v.l == static_cast<void*>(&storage)
+              && storage == obj.get_instance());
+
+        // string category (no JVM): .l null, tag false (the deterministic
+        // no-env outcome — a real local ref + tag true is JVM-integration).
+        check("Q_string_category_packs_null_no_jvm",
+              pack_one_core(std::string{ "q" }, v, storage) == false && v.l == nullptr);
+
+        // null c-string category: Java null, tag false.
+        const char* nul{ nullptr };
+        check("Q_null_cstring_category_packs",
+              pack_one_core(nul, v, storage) == false && v.l == nullptr);
     }
 
     return failures == 0 ? 0 : 1;

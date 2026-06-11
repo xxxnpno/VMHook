@@ -129,3 +129,4 @@ vmhook_add_test(logging_logfile_unwritable      SOURCES test_logging_logfile_unw
 target_compile_definitions("vmhook_test_logging_logfile_unwritable" PRIVATE
     "VMHOOK_LOG_FILE=\"${_vmhook_bad_log_file}\""
     "VMHOOK_TEST_LOG_PATH=\"${_vmhook_bad_log_file}\"")
+vmhook_add_test(const_method_bounds            SOURCES test_const_method_bounds.cpp)

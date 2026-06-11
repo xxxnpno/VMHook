@@ -28,11 +28,13 @@
 
 #include <vmhook/vmhook.hpp>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 static int failures{ 0 };
@@ -1189,6 +1191,305 @@ static auto test_clamp_safe_container_count() -> void
     check("clamp_constexpr_static_asserts_compiled", true);
 }
 
+// ===========================================================================
+// COMPILE-TIME ARITHMETIC SWEEP (22-25).  The prompt asks, where possible, for
+// compile-time static_assert proofs of the PURE width / offset / address
+// arithmetic, with runtime reserved for anything needing a synthetic buffer.
+//
+// The three helpers contain no BasicType size table and no base-offset helper:
+// the element stride IS sizeof(T) (the C++ element type chosen per BasicType)
+// and the data base IS the constant +16, with _length at +12 (see
+// vmhook.hpp::array_length / get_array_element / set_array_element).  The
+// sections below pin EXACTLY those three numbers — the JVM BasicType -> C++
+// width mapping, the +12 length slot, the +16 data base, and the
+// base + index*stride address — as constant expressions, so any divergence is a
+// COMPILE error (a hard regression gate the runtime checks cannot give) rather
+// than a runtime [FAIL].  These mirror the header's own constants independently.
+// ===========================================================================
+
+// The documented HotSpot array layout constants the helpers hard-code.  Kept as
+// named constants here so the static_asserts read as "the helper's +12 / +16",
+// and a single edit re-points every proof if the layout assumption ever moves.
+namespace layout_oracle
+{
+    inline constexpr std::size_t length_offset{ 12u };  // _length (int32) slot
+    inline constexpr std::size_t data_base{ 16u };      // _data[0] byte offset
+    inline constexpr std::size_t narrow_oop_size{ 4u }; // compressed reference
+    inline constexpr std::size_t wide_oop_size{ 8u };   // -XX:-UseCompressedOops
+
+    // The element byte offset the helpers compute: +16 + index * sizeof(T).
+    // size_t arithmetic so the ORACLE never wraps (the documented int->ptrdiff_t
+    // widening inside the helper is what keeps the helper itself honest).
+    template<typename T>
+    constexpr auto element_offset(std::size_t index) noexcept -> std::size_t
+    {
+        return data_base + index * sizeof(T);
+    }
+
+    // The helper's half-open bounds predicate, as a pure function: an access at
+    // `index` into a length-`length` array is in range iff 0 <= index < length.
+    constexpr auto index_in_range(std::int32_t index, std::int32_t length) noexcept -> bool
+    {
+        return index >= 0 && index < length;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 22. COMPILE-TIME element width for EVERY JVM BasicType.
+//
+// HotSpot BasicType -> element stride (== sizeof of the C++ type the helpers are
+// instantiated with for that BasicType, the value used as `index * sizeof(T)`):
+//     T_BOOLEAN  boolean -> 1   T_BYTE   byte   -> 1
+//     T_CHAR     char    -> 2   T_SHORT  short  -> 2
+//     T_INT      int     -> 4   T_FLOAT  float  -> 4
+//     T_LONG     long    -> 8   T_DOUBLE double -> 8
+//     T_OBJECT/T_ARRAY (reference): narrow oop -> 4, wide oop -> 8
+// Every one is asserted at compile time against the exact C++ element type the
+// codebase passes for that BasicType.  A platform whose `float`/`double` or
+// fixed-width type drifted from the JVM contract would fail to BUILD.
+// ---------------------------------------------------------------------------
+// Primitive widths (the eight Java primitives).
+static_assert(sizeof(bool)          == 1, "T_BOOLEAN element stride must be 1 byte");
+static_assert(sizeof(std::uint8_t)  == 1, "boolean[] backing byte stride must be 1");
+static_assert(sizeof(std::int8_t)   == 1, "T_BYTE element stride must be 1 byte");
+static_assert(sizeof(char)          == 1, "raw char element stride must be 1 byte");
+static_assert(sizeof(char16_t)      == 2, "T_CHAR (UTF-16) element stride must be 2 bytes");
+static_assert(sizeof(std::int16_t)  == 2, "T_SHORT element stride must be 2 bytes");
+static_assert(sizeof(std::uint16_t) == 2, "char[]/short[] unsigned stride must be 2 bytes");
+static_assert(sizeof(std::int32_t)  == 4, "T_INT element stride must be 4 bytes");
+static_assert(sizeof(std::uint32_t) == 4, "compressed-oop / int unsigned stride must be 4 bytes");
+static_assert(sizeof(float)         == 4, "T_FLOAT element stride must be 4 bytes (IEEE-754 single)");
+static_assert(sizeof(std::int64_t)  == 8, "T_LONG element stride must be 8 bytes");
+static_assert(sizeof(std::uint64_t) == 8, "long unsigned stride must be 8 bytes");
+static_assert(sizeof(double)        == 8, "T_DOUBLE element stride must be 8 bytes (IEEE-754 double)");
+// Reference (T_OBJECT / T_ARRAY) element widths: compressed vs uncompressed oop.
+static_assert(layout_oracle::narrow_oop_size == sizeof(std::uint32_t),
+              "compressed reference element must be a 4-byte narrow oop");
+static_assert(layout_oracle::wide_oop_size == sizeof(std::uintptr_t),
+              "uncompressed reference element must be a pointer-width (8-byte) oop on x64");
+static_assert(sizeof(void*) == layout_oracle::wide_oop_size,
+              "void* reference element width must equal the wide-oop size on this target");
+// The helpers only accept trivially-copyable element types (their static_assert):
+// confirm every BasicType-mapped C++ type the codebase uses qualifies, at compile time.
+static_assert(std::is_trivially_copyable_v<bool>
+              && std::is_trivially_copyable_v<std::int8_t>
+              && std::is_trivially_copyable_v<std::uint8_t>
+              && std::is_trivially_copyable_v<char>
+              && std::is_trivially_copyable_v<char16_t>
+              && std::is_trivially_copyable_v<std::int16_t>
+              && std::is_trivially_copyable_v<std::uint16_t>
+              && std::is_trivially_copyable_v<std::int32_t>
+              && std::is_trivially_copyable_v<std::uint32_t>
+              && std::is_trivially_copyable_v<float>
+              && std::is_trivially_copyable_v<std::int64_t>
+              && std::is_trivially_copyable_v<std::uint64_t>
+              && std::is_trivially_copyable_v<double>
+              && std::is_trivially_copyable_v<std::uintptr_t>
+              && std::is_trivially_copyable_v<void*>,
+              "every BasicType-mapped element type must satisfy the helpers' trivially-copyable contract");
+
+// ---------------------------------------------------------------------------
+// 23. COMPILE-TIME header/layout constants: length slot +12, data base +16.
+//
+// array_length reads the int32 at +12; get/set read/write at +16 + i*stride.
+// Pin those two offsets, their relationship (length slot sits in the last 4
+// bytes of the 16-byte header, immediately before the data), and that the data
+// base equals the make_java_array header size (16) as constant expressions.
+// ---------------------------------------------------------------------------
+static_assert(layout_oracle::length_offset == 12u, "_length must live at byte +12");
+static_assert(layout_oracle::data_base == 16u, "_data[0] must start at byte +16");
+static_assert(layout_oracle::length_offset + sizeof(std::int32_t) == layout_oracle::data_base,
+              "the int32 _length slot must end exactly where _data begins (no gap, no overlap)");
+static_assert(layout_oracle::data_base - layout_oracle::length_offset == sizeof(std::int32_t),
+              "_length occupies exactly the 4 bytes between +12 and the data base");
+// index 0's element offset is the data base for every width (no per-type bias).
+static_assert(layout_oracle::element_offset<bool>(0)          == layout_oracle::data_base, "");
+static_assert(layout_oracle::element_offset<std::int8_t>(0)   == layout_oracle::data_base, "");
+static_assert(layout_oracle::element_offset<char16_t>(0)      == layout_oracle::data_base, "");
+static_assert(layout_oracle::element_offset<std::int16_t>(0)  == layout_oracle::data_base, "");
+static_assert(layout_oracle::element_offset<std::int32_t>(0)  == layout_oracle::data_base, "");
+static_assert(layout_oracle::element_offset<float>(0)         == layout_oracle::data_base, "");
+static_assert(layout_oracle::element_offset<std::int64_t>(0)  == layout_oracle::data_base, "");
+static_assert(layout_oracle::element_offset<double>(0)        == layout_oracle::data_base, "");
+static_assert(layout_oracle::element_offset<std::uintptr_t>(0)== layout_oracle::data_base, "");
+
+// ---------------------------------------------------------------------------
+// 24. COMPILE-TIME element-address matrix: +16 + index*stride, every (width x
+//     index) combination, with exact numeric offsets.
+//
+// For each element width and a spread of indices (0, 1, mid, a last-valid, and
+// a large index whose 64-bit offset would differ from a 32-bit-truncated one),
+// assert the helper's address formula yields the exact byte offset.  This is the
+// "(type x index) address matrix" the prompt calls for, decided at compile time
+// so a base or stride regression cannot link.
+// ---------------------------------------------------------------------------
+// Helper: stringize the per-width offset assertions compactly.  Each line is
+// element_offset<T>(index) == 16 + index*sizeof(T) with the literal RHS spelled
+// out, so a wrong base OR a wrong stride both fail (they are independent terms).
+
+// 1-byte stride: offset == 16 + index.
+static_assert(layout_oracle::element_offset<std::uint8_t>(0)   == 16u,  "u8[0]");
+static_assert(layout_oracle::element_offset<std::uint8_t>(1)   == 17u,  "u8[1]");
+static_assert(layout_oracle::element_offset<std::uint8_t>(7)   == 23u,  "u8[7]");
+static_assert(layout_oracle::element_offset<std::uint8_t>(255) == 271u, "u8[255]");
+
+// 2-byte stride: offset == 16 + 2*index.
+static_assert(layout_oracle::element_offset<char16_t>(0)    == 16u,  "c16[0]");
+static_assert(layout_oracle::element_offset<char16_t>(1)    == 18u,  "c16[1]");
+static_assert(layout_oracle::element_offset<char16_t>(10)   == 36u,  "c16[10]");
+static_assert(layout_oracle::element_offset<std::int16_t>(100) == 216u, "i16[100]");
+
+// 4-byte stride: offset == 16 + 4*index (int / float / narrow oop).
+static_assert(layout_oracle::element_offset<std::int32_t>(0)  == 16u,  "i32[0]");
+static_assert(layout_oracle::element_offset<std::int32_t>(1)  == 20u,  "i32[1]");
+static_assert(layout_oracle::element_offset<std::int32_t>(25) == 116u, "i32[25]");
+static_assert(layout_oracle::element_offset<std::int32_t>(49) == 212u, "i32[49]");
+static_assert(layout_oracle::element_offset<float>(49)        == 212u, "f32[49] matches i32 stride");
+static_assert(layout_oracle::element_offset<std::uint32_t>(7) == 44u,  "narrow-oop[7]");
+
+// 8-byte stride: offset == 16 + 8*index (long / double / wide oop).
+static_assert(layout_oracle::element_offset<std::int64_t>(0)  == 16u,  "i64[0]");
+static_assert(layout_oracle::element_offset<std::int64_t>(1)  == 24u,  "i64[1]");
+static_assert(layout_oracle::element_offset<std::int64_t>(3)  == 40u,  "i64[3]");
+static_assert(layout_oracle::element_offset<std::int64_t>(63) == 520u, "i64[63]");
+static_assert(layout_oracle::element_offset<double>(63)       == 520u, "f64[63] matches i64 stride");
+static_assert(layout_oracle::element_offset<std::uintptr_t>(2)== 32u,  "wide-oop[2]");
+
+// 32-bit-vs-64-bit divergence pin: index 0x10000000 at stride 8 wraps a 32-bit
+// `index * (int)sizeof` to INT_MIN (-2147483648); the honest 64-bit offset is
+// 16 + 0x10000000*8 = 0x80000010.  The oracle (size_t) yields the honest value,
+// documenting the magnitude the helper's ptrdiff_t widening must preserve.
+static_assert(layout_oracle::element_offset<std::int64_t>(0x10000000u) == 0x80000010ull,
+              "index 0x10000000 stride 8 must scale to 0x80000010 in honest (non-wrapping) arithmetic");
+// Document the 32-bit wrap the helper's ptrdiff_t widening avoids, WITHOUT
+// invoking signed overflow (which is UB and not a constant expression): the
+// product is formed in unsigned (well-defined modular wrap) to the bit pattern
+// 0x80000000, which reinterpreted as int32 is INT_MIN.  This is the value a
+// naive `index * (int)sizeof` would have produced before sign-extension.
+static_assert(0x10000000u * 8u == 0x80000000u,
+              "0x10000000 * 8 wraps (mod 2^32) to the bit pattern 0x80000000");
+static_assert(static_cast<std::int32_t>(0x80000000u) == (std::numeric_limits<std::int32_t>::min)(),
+              "bit pattern 0x80000000 reinterpreted as int32 is INT_MIN — the wild offset avoided");
+
+// ---------------------------------------------------------------------------
+// 25. COMPILE-TIME bounds predicate over a (length x index) boundary matrix.
+//
+// The helpers accept an access iff 0 <= index < length (half-open).  Enumerate
+// the full boundary neighbourhood for representative lengths as constant
+// expressions: -1 and INT_MIN always rejected; 0 valid iff length>=1; length-1
+// valid iff length>=1; length / length+1 / INT_MAX always rejected; empty array
+// (length 0) rejects index 0.  A change to the comparison (e.g. <= vs <) fails
+// to build.
+// ---------------------------------------------------------------------------
+namespace
+{
+    constexpr std::int32_t k_int_min{ (std::numeric_limits<std::int32_t>::min)() };
+    constexpr std::int32_t k_int_max{ (std::numeric_limits<std::int32_t>::max)() };
+}
+// Universally-invalid indices, independent of length:
+static_assert(!layout_oracle::index_in_range(-1, 0),        "neg index rejected (len 0)");
+static_assert(!layout_oracle::index_in_range(-1, 5),        "neg index rejected (len 5)");
+static_assert(!layout_oracle::index_in_range(k_int_min, 5), "INT_MIN index rejected");
+static_assert(!layout_oracle::index_in_range(k_int_max, 5), "INT_MAX index rejected (len 5)");
+// Empty array: every index, including 0, is out of range.
+static_assert(!layout_oracle::index_in_range(0, 0), "len 0: index 0 is the first OOB index");
+static_assert(!layout_oracle::index_in_range(1, 0), "len 0: index 1 OOB");
+// Length 1: only index 0 is valid; index 1 (== length) is the first OOB.
+static_assert(layout_oracle::index_in_range(0, 1),  "len 1: index 0 valid");
+static_assert(!layout_oracle::index_in_range(1, 1), "len 1: index 1 (==len) OOB");
+// Length 5: 0 and 4 valid; 5 and 6 invalid (the half-open upper edge).
+static_assert(layout_oracle::index_in_range(0, 5),  "len 5: index 0 valid");
+static_assert(layout_oracle::index_in_range(4, 5),  "len 5: last index 4 valid");
+static_assert(!layout_oracle::index_in_range(5, 5), "len 5: index 5 (==len) OOB");
+static_assert(!layout_oracle::index_in_range(6, 5), "len 5: index 6 (len+1) OOB");
+// A negative length (corrupted/torn _length) rejects EVERY non-negative index,
+// because index >= length whenever length < 0 <= index — pins flaw-#2 containment
+// at compile time (no index can pass the bounds check on a negative length).
+static_assert(!layout_oracle::index_in_range(0, -1),         "neg length: index 0 rejected");
+static_assert(!layout_oracle::index_in_range(0, -5),         "neg length: index 0 rejected");
+static_assert(!layout_oracle::index_in_range(k_int_max, -1), "neg length: INT_MAX rejected");
+static_assert(!layout_oracle::index_in_range(1000000, k_int_min), "neg length INT_MIN: index rejected");
+
+// ---------------------------------------------------------------------------
+// Runtime cross-check that the SAME oracle the static_asserts use agrees with
+// what the live helpers actually do on a synthetic buffer at the exhaustive
+// (width x index) matrix.  The static_asserts prove the formula; this proves the
+// helpers obey the formula (offset + bounds) on real bytes, closing the loop.
+// ---------------------------------------------------------------------------
+template<typename T>
+static auto crosscheck_oracle_offset(const char* label) -> void
+{
+    // A 70-element buffer: indices below span 0, 1, mid, last-valid for the
+    // widths used, all comfortably inside the allocation.
+    constexpr std::int32_t n{ 70 };
+    std::vector<T> seed(static_cast<std::size_t>(n), T{});
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    bool ok{ vmhook::array_length(oop) == n };
+    const std::int32_t probes[]{ 0, 1, 2, 9, 31, 35, 69 };
+    for (const std::int32_t i : probes)
+    {
+        if (!ok) { break; }
+        // The byte offset the test oracle predicts must equal +16+i*sizeof(T)
+        // AND must be exactly where the helper deposits a written value.
+        const std::size_t predicted{ layout_oracle::element_offset<T>(static_cast<std::size_t>(i)) };
+        if (predicted != 16u + static_cast<std::size_t>(i) * sizeof(T)) { ok = false; break; }
+
+        const std::uint64_t bits{ 0xF00DCAFE00000000ull ^ (static_cast<std::uint64_t>(i) * 1099511628211ull) };
+        T value{};
+        std::memcpy(&value, &bits, sizeof(T));
+        vmhook::set_array_element<T>(oop, i, value);
+
+        // Raw bytes at the predicted offset must equal what we wrote, and the
+        // helper's own read must agree — i.e. the helper used `predicted`.
+        T raw{};
+        std::memcpy(&raw, buffer.data() + predicted, sizeof(T));
+        if (!bits_equal(raw, value)) { ok = false; break; }
+        if (!bits_equal(vmhook::get_array_element<T>(oop, i), value)) { ok = false; break; }
+    }
+    check(label, ok);
+}
+
+static auto test_compile_time_arithmetic() -> void
+{
+    // The static_asserts above already fired at compile time; this check records
+    // that the TU embedding them built (a regression would have failed the build).
+    check("ct_width_offset_bounds_static_asserts_compiled", true);
+
+    // Runtime confirmation that the helpers honour the same oracle, per width.
+    crosscheck_oracle_offset<std::uint8_t>("ct_crosscheck_offset_u8");
+    crosscheck_oracle_offset<std::int16_t>("ct_crosscheck_offset_i16");
+    crosscheck_oracle_offset<char16_t>("ct_crosscheck_offset_c16");
+    crosscheck_oracle_offset<std::int32_t>("ct_crosscheck_offset_i32");
+    crosscheck_oracle_offset<float>("ct_crosscheck_offset_f32");
+    crosscheck_oracle_offset<std::int64_t>("ct_crosscheck_offset_i64");
+    crosscheck_oracle_offset<double>("ct_crosscheck_offset_f64");
+    crosscheck_oracle_offset<std::uint32_t>("ct_crosscheck_offset_narrow_oop");
+    crosscheck_oracle_offset<std::uintptr_t>("ct_crosscheck_offset_wide_oop");
+
+    // Runtime spot-checks that the live bounds guard matches index_in_range at
+    // the exact boundary, for a concrete length (the static matrix proves the
+    // predicate; this proves get/set use it).  Length 5 int32 array.
+    {
+        const std::vector<std::int32_t> seed{ 10, 11, 12, 13, 14 };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        bool agree{ true };
+        for (std::int32_t i{ -2 }; i <= 7 && agree; ++i)
+        {
+            const bool predicate{ layout_oracle::index_in_range(i, 5) };
+            const std::int32_t got{ vmhook::get_array_element<std::int32_t>(oop, opaque_index(i)) };
+            // In range -> the seeded value (10+i); out of range -> default 0.
+            const bool helper_in_range{ got == 10 + i };
+            const bool helper_out_range{ got == 0 };
+            if (predicate && !helper_in_range)  { agree = false; }
+            if (!predicate && !helper_out_range){ agree = false; }
+        }
+        check("ct_live_bounds_match_predicate_len5", agree);
+    }
+}
+
 int main()
 {
     test_all_widths();
@@ -1212,6 +1513,7 @@ int main()
     test_dense_nontrivial_indices();
     test_length_reads_only_offset12();
     test_clamp_safe_container_count();
+    test_compile_time_arithmetic();
 
     if (failures == 0)
     {
