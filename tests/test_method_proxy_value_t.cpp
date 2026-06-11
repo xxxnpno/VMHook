@@ -28,6 +28,8 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 static int failures{ 0 };
@@ -982,6 +984,281 @@ int main()
         vmhook::method_proxy p{ nullptr, nullptr, std::string{ "(JD)[Z" } };
         check("is_reference_true_for_boolean_array_return", p.is_reference() == true);
     }
+
+    // =========================================================================
+    // EXPANSION 2 (no-JVM, platform-invariant): the value-semantics surface of
+    // value_t itself — the ACTIVE-ALTERNATIVE tag for every slot, copy/move
+    // construction, copy/move assignment, and reassignment BETWEEN alternatives.
+    // The earlier blocks only ever assert the *converted-out* value of a freshly
+    // brace-initialised temporary; none of them pin which variant slot is live,
+    // nor that value_t survives being copied / moved / reassigned (the holder is
+    // handed around by call()/call_jni() return, stored, and re-bound by callers).
+    // value_t is an aggregate over a single std::variant, so it inherits the
+    // variant's regular-type semantics; these checks lock that contract in.
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // Active-alternative tag: data.index() must equal the documented slot for
+    // EACH of the eleven alternatives (vmhook.hpp:13401-13413).  Order:
+    //   0 monostate, 1 bool, 2 int8, 3 int16, 4 int32, 5 int64, 6 float,
+    //   7 double, 8 uint16, 9 uint32 (compressed OOP), 10 std::string.
+    // A future reshuffle of the variant flips these and is caught here AND by
+    // the conversion-behaviour checks above (which depend on the slot order).
+    // -------------------------------------------------------------------------
+    check("index_monostate_is_0", value_t{ std::monostate{} }.data.index() == 0u);
+    check("index_bool_is_1",      value_t{ true }.data.index() == 1u);
+    check("index_int8_is_2",      value_t{ std::int8_t{ 1 } }.data.index() == 2u);
+    check("index_int16_is_3",     value_t{ std::int16_t{ 1 } }.data.index() == 3u);
+    check("index_int32_is_4",     value_t{ std::int32_t{ 1 } }.data.index() == 4u);
+    check("index_int64_is_5",     value_t{ std::int64_t{ 1 } }.data.index() == 5u);
+    check("index_float_is_6",     value_t{ 1.0f }.data.index() == 6u);
+    check("index_double_is_7",    value_t{ 1.0 }.data.index() == 7u);
+    check("index_uint16_is_8",    value_t{ std::uint16_t{ 1 } }.data.index() == 8u);
+    check("index_uint32_is_9",    value_t{ std::uint32_t{ 1 } }.data.index() == 9u);
+    check("index_string_is_10",   value_t{ std::string{ "x" } }.data.index() == 10u);
+    // The default-constructed holder is the monostate (void/failure) slot.
+    check("index_default_is_monostate_0", value_t{}.data.index() == 0u);
+    // holds_alternative agrees with the index for a representative non-trivial
+    // alternative pair (the introspection helpers are thin wrappers over these).
+    check("holds_string_alternative_for_string",
+          std::holds_alternative<std::string>(value_t{ std::string{ "h" } }.data));
+    check("holds_uint32_alternative_for_uint32",
+          std::holds_alternative<std::uint32_t>(value_t{ std::uint32_t{ 7 } }.data));
+
+    // -------------------------------------------------------------------------
+    // Copy construction: a copied value_t keeps the SAME active alternative and
+    // converts out to the SAME value as the original, and the original is left
+    // intact (copy, not move).  The std::string alternative (the only heap-
+    // owning payload) is the interesting one — the copy must own an independent
+    // buffer that still compares equal.
+    // -------------------------------------------------------------------------
+    {
+        const value_t original{ std::int32_t{ -424242 } };
+        const value_t copy{ original };                       // copy-construct
+        check("copy_ctor_preserves_index",
+              copy.data.index() == original.data.index());
+        check("copy_ctor_preserves_value",
+              static_cast<std::int32_t>(copy) == -424242
+                  && static_cast<std::int32_t>(original) == -424242);
+    }
+    {
+        const value_t original{ std::string{ "payload-string" } };
+        const value_t copy{ original };
+        check("copy_ctor_string_is_independent_equal",
+              copy.as_string() == "payload-string"
+                  && original.as_string() == "payload-string");
+        check("copy_ctor_string_keeps_string_slot",
+              copy.is_string() && original.is_string());
+    }
+    {
+        // Copying the monostate / uint32 / double alternatives preserves slot.
+        const value_t mono{ std::monostate{} };
+        const value_t mono_copy{ mono };
+        check("copy_ctor_monostate_stays_void",
+              mono_copy.is_void() && mono.is_void());
+        const value_t ref{ std::uint32_t{ 0xCAFEBABE } };
+        const value_t ref_copy{ ref };
+        check("copy_ctor_uint32_round_trips",
+              static_cast<std::uint32_t>(ref_copy) == 0xCAFEBABEu);
+        const value_t dbl{ -2.5 };
+        const value_t dbl_copy{ dbl };
+        check("copy_ctor_double_round_trips",
+              static_cast<double>(dbl_copy) == -2.5);
+    }
+
+    // -------------------------------------------------------------------------
+    // Move construction: the moved-INTO value_t must carry the original value
+    // and active alternative.  Per [variant.assign]/[string], the moved-FROM
+    // object is left in a valid-but-UNSPECIFIED state, so we assert ONLY the
+    // destination — never the source's content — to stay deterministic across
+    // libstdc++ (MinGW) and the MSVC STL.
+    // -------------------------------------------------------------------------
+    {
+        value_t source{ std::string{ "moved-out-string" } };
+        const value_t moved{ std::move(source) };             // move-construct
+        check("move_ctor_string_destination_has_value",
+              moved.as_string() == "moved-out-string");
+        check("move_ctor_string_destination_is_string_slot", moved.is_string());
+    }
+    {
+        value_t source{ std::int64_t{ 0x7FFF'FFFF'0000'0001LL } };
+        const value_t moved{ std::move(source) };
+        check("move_ctor_int64_destination_value",
+              static_cast<std::int64_t>(moved) == 0x7FFF'FFFF'0000'0001LL);
+        check("move_ctor_int64_destination_slot", moved.data.index() == 5u);
+    }
+
+    // -------------------------------------------------------------------------
+    // Copy assignment: assigning over a live value_t replaces BOTH the value and
+    // the active alternative — including switching from one alternative to a
+    // DIFFERENT one (string <- int, int <- string), the realistic case where a
+    // stored result holder is overwritten by the next call()'s return.
+    // -------------------------------------------------------------------------
+    {
+        value_t target{ std::int32_t{ 7 } };
+        const value_t src{ std::string{ "assigned" } };
+        target = src;                                         // copy-assign, slot changes
+        check("copy_assign_switches_int_to_string_slot", target.is_string());
+        check("copy_assign_switches_int_to_string_value",
+              target.as_string() == "assigned");
+        check("copy_assign_leaves_source_intact", src.as_string() == "assigned");
+    }
+    {
+        value_t target{ std::string{ "old" } };
+        const value_t src{ std::int64_t{ 9999999999LL } };
+        target = src;                                        // string slot -> int64 slot
+        check("copy_assign_switches_string_to_int64_slot",
+              target.data.index() == 5u && !target.is_string());
+        check("copy_assign_switches_string_to_int64_value",
+              static_cast<std::int64_t>(target) == 9999999999LL);
+    }
+    {
+        // Self-assignment is a no-op (must not corrupt the held value).
+        value_t target{ std::uint32_t{ 0x1234'5678 } };
+        const value_t& alias{ target };
+        target = alias;                                      // self copy-assign
+        check("self_copy_assign_is_noop",
+              static_cast<std::uint32_t>(target) == 0x1234'5678u
+                  && target.data.index() == 9u);
+    }
+
+    // -------------------------------------------------------------------------
+    // Move assignment: same slot-switching contract; assert only the destination.
+    // -------------------------------------------------------------------------
+    {
+        value_t target{ std::monostate{} };
+        value_t src{ std::string{ "move-assigned" } };
+        target = std::move(src);                             // monostate -> string
+        check("move_assign_monostate_to_string_slot", target.is_string());
+        check("move_assign_monostate_to_string_value",
+              target.as_string() == "move-assigned");
+    }
+    {
+        value_t target{ std::string{ "discarded" } };
+        value_t src{ 3.5 };
+        target = std::move(src);                             // string -> double
+        check("move_assign_string_to_double_slot", target.data.index() == 7u);
+        check("move_assign_string_to_double_value",
+              static_cast<double>(target) == 3.5);
+    }
+
+    // -------------------------------------------------------------------------
+    // Reassignment of the underlying variant directly (data = ... / emplace):
+    // value_t is an aggregate with a public `data` member, so callers / the
+    // library can re-point the active alternative in place.  Each reassignment
+    // must flip the introspection helpers and the converted-out value together.
+    // -------------------------------------------------------------------------
+    {
+        value_t v{ std::monostate{} };
+        check("reassign_starts_void", v.is_void());
+        v.data = std::int32_t{ 55 };                         // monostate -> int32
+        check("reassign_to_int32_not_void",
+              !v.is_void() && v.data.index() == 4u);
+        check("reassign_to_int32_value", static_cast<std::int32_t>(v) == 55);
+        v.data = std::string{ "now-a-string" };              // int32 -> string
+        check("reassign_to_string_is_string",
+              v.is_string() && v.as_string() == "now-a-string");
+        v.data = std::uint32_t{ 0xABCD'0123 };               // string -> uint32
+        check("reassign_to_uint32_slot",
+              v.data.index() == 9u && !v.is_string() && !v.is_void());
+        check("reassign_to_uint32_value",
+              static_cast<std::uint32_t>(v) == 0xABCD'0123u);
+        v.data.emplace<std::monostate>();                    // back to void via emplace
+        check("reassign_emplace_back_to_void", v.is_void());
+    }
+
+    // -------------------------------------------------------------------------
+    // std::swap on two value_t exchanges their active alternatives and values
+    // (variant is Swappable; pins that value_t inherits it).  Assert both sides.
+    // -------------------------------------------------------------------------
+    {
+        value_t a{ std::int32_t{ 111 } };
+        value_t b{ std::string{ "bee" } };
+        std::swap(a, b);
+        check("swap_moves_string_into_a", a.is_string() && a.as_string() == "bee");
+        check("swap_moves_int_into_b",
+              b.data.index() == 4u && static_cast<std::int32_t>(b) == 111);
+    }
+
+    // -------------------------------------------------------------------------
+    // The conversion operator's std::string GENERIC-ELSE arm (vmhook.hpp:
+    // 13491-13494): a NON-string, NON-uint32 stored alternative cast straight to
+    // std::string yields "" (target_type{}).  The as_string() block above pins
+    // the same alternatives through as_string(); here we pin the OPERATOR path
+    // (static_cast<std::string>) for the numeric alternatives the operator-arm
+    // coverage had not yet exercised (only monostate/string/uint16/uint32 were).
+    // BUG 1 (FIXED): these casts are unambiguous now the operator is constrained.
+    // -------------------------------------------------------------------------
+    check("static_cast_string_from_bool_empty",
+          static_cast<std::string>(value_t{ true }).empty());
+    check("static_cast_string_from_int8_empty",
+          static_cast<std::string>(value_t{ std::int8_t{ -1 } }).empty());
+    check("static_cast_string_from_int16_empty",
+          static_cast<std::string>(value_t{ std::int16_t{ 1234 } }).empty());
+    check("static_cast_string_from_int32_empty",
+          static_cast<std::string>(value_t{ std::int32_t{ 1234 } }).empty());
+    check("static_cast_string_from_int64_empty",
+          static_cast<std::string>(value_t{ std::int64_t{ 1234 } }).empty());
+    check("static_cast_string_from_float_empty",
+          static_cast<std::string>(value_t{ 1.5f }).empty());
+    check("static_cast_string_from_double_empty",
+          static_cast<std::string>(value_t{ 2.5 }).empty());
+    // And the operator path agrees with as_string() on these numeric alternatives
+    // (both produce "").
+    check("operator_string_agrees_with_as_string_on_int32",
+          static_cast<std::string>(value_t{ std::int32_t{ 9 } })
+              == value_t{ std::int32_t{ 9 } }.as_string());
+
+    // -------------------------------------------------------------------------
+    // Signed-zero / representative boundaries the earlier blocks skipped.
+    //   * -0.0 survives the double->double identity cast WITH its sign bit (the
+    //     value compares == +0.0, so we assert std::signbit, not ==).
+    //   * -0.0f likewise through float->float, and float -0.0 widens to a
+    //     negative-zero double.
+    //   * +0.0 has a clear (unset) sign bit for contrast.
+    // -------------------------------------------------------------------------
+    check("double_negative_zero_preserves_sign_bit",
+          std::signbit(static_cast<double>(value_t{ -0.0 })));
+    check("double_positive_zero_has_no_sign_bit",
+          !std::signbit(static_cast<double>(value_t{ 0.0 })));
+    check("float_negative_zero_preserves_sign_bit",
+          std::signbit(static_cast<float>(value_t{ -0.0f })));
+    check("float_negative_zero_widens_to_negative_zero_double",
+          std::signbit(static_cast<double>(value_t{ -0.0f })));
+    // -0.0 still reads as boolean false (negative zero == zero).
+    check("double_negative_zero_to_bool_false",
+          static_cast<bool>(value_t{ -0.0 }) == false);
+
+    // -------------------------------------------------------------------------
+    // A couple more per-alternative self-round-trips at the zero / representative
+    // values not yet pinned, closing the SELF cast matrix.
+    // -------------------------------------------------------------------------
+    check("int32_zero_self_round_trip",
+          static_cast<std::int32_t>(value_t{ std::int32_t{ 0 } }) == 0);
+    check("int64_zero_self_round_trip",
+          static_cast<std::int64_t>(value_t{ std::int64_t{ 0 } }) == 0LL);
+    check("bool_false_self_round_trip",
+          static_cast<bool>(value_t{ false }) == false);
+    check("uint16_zero_self_round_trip_2",
+          static_cast<std::uint16_t>(value_t{ std::uint16_t{ 0 } }) == 0u);
+    check("double_zero_self_round_trip",
+          static_cast<double>(value_t{ 0.0 }) == 0.0);
+    check("float_zero_self_round_trip_2",
+          static_cast<float>(value_t{ 0.0f }) == 0.0f);
+
+    // -------------------------------------------------------------------------
+    // Compile-time: value_t is a regular-ish value type (the holder contract the
+    // copy/move/swap checks above exercise at runtime).  Move ops are noexcept
+    // already pinned (line ~906); add copy-constructible / copy-assignable /
+    // move-assignable / swappable so a future change to the variant payload set
+    // that breaks regularity is caught at build time.
+    // -------------------------------------------------------------------------
+    static_assert(std::is_copy_constructible_v<value_t>,    "value_t copy-constructible");
+    static_assert(std::is_copy_assignable_v<value_t>,       "value_t copy-assignable");
+    static_assert(std::is_move_assignable_v<value_t>,       "value_t move-assignable");
+    static_assert(std::is_swappable_v<value_t>,             "value_t swappable");
+    static_assert(std::is_default_constructible_v<value_t>, "value_t default-constructible");
+    check("value_t_value_semantics_compile_time_present", true);
 
     return failures == 0 ? 0 : 1;
 }

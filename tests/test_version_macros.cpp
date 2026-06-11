@@ -31,6 +31,170 @@ static auto check(const char* name, bool ok) -> void
     if (!ok) { ++failures; }
 }
 
+// ===========================================================================
+// EXHAUSTIVE COMPILE-TIME COMPARISON SWEEP (file scope).
+//
+// Everything in this block is a `static_assert`, so it is evaluated by the
+// compiler on *every* CI configuration (every OS, every compiler, every JDK
+// job's build step) and can never be flaky -- a regression in the packing
+// arithmetic or in the `>=` gating relation is a hard compile error, not a
+// runtime failure that a particular runner might skip.
+//
+// The goal is maximum input coverage on the version-comparison logic that
+// consumers rely on via `#if VMHOOK_VERSION >= VMHOOK_MAKE_VERSION(x,y,z)`.
+// We pin, for a dense matrix of triples spanning zero / single-digit /
+// multi-digit / large values and every component-carry boundary:
+//   (1) the packed value equals its open-coded major*1e6 + minor*1e3 + patch;
+//   (2) the `>=` / `>` / `<` / `==` relations are correct for equal, one-below,
+//       one-above, and carry-boundary neighbours;
+//   (3) packing is order-isomorphic to lexicographic (major,minor,patch)
+//       comparison -- the property that makes version gating sound.
+// ===========================================================================
+
+// Compile-time mirror of the documented decimal pack.  Used only to cross-check
+// VMHOOK_MAKE_VERSION against an independent expression so a silent change to
+// the macro's field weights cannot pass unnoticed.  Uses `long long` (>=64-bit
+// on every data model) so the cross-check is correct even on LLP64 targets
+// (Windows/MinGW/MSVC) where `long` is only 32-bit -- on those a `long`-based
+// mirror would itself overflow at the very ceiling we want to document.
+constexpr long long vm_expected_pack(long long major, long long minor, long long patch)
+{
+    return (major * 1000000LL) + (minor * 1000LL) + patch;
+}
+
+// --- (1) Composite equals its parts, across a dense value matrix. ----------
+// Zero, single-digit, the documented live triple, double-digit components,
+// every field maximum (999), and large in-range majors.
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 0)       == vm_expected_pack(0, 0, 0));
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 1)       == vm_expected_pack(0, 0, 1));
+static_assert(VMHOOK_MAKE_VERSION(0, 1, 0)       == vm_expected_pack(0, 1, 0));
+static_assert(VMHOOK_MAKE_VERSION(1, 0, 0)       == vm_expected_pack(1, 0, 0));
+static_assert(VMHOOK_MAKE_VERSION(0, 5, 3)       == vm_expected_pack(0, 5, 3));
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3)       == vm_expected_pack(1, 2, 3));
+static_assert(VMHOOK_MAKE_VERSION(1, 9, 9)       == vm_expected_pack(1, 9, 9));
+static_assert(VMHOOK_MAKE_VERSION(1, 10, 0)      == vm_expected_pack(1, 10, 0));
+static_assert(VMHOOK_MAKE_VERSION(1, 23, 45)     == vm_expected_pack(1, 23, 45));
+static_assert(VMHOOK_MAKE_VERSION(12, 34, 56)    == vm_expected_pack(12, 34, 56));
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 999)     == vm_expected_pack(0, 0, 999));
+static_assert(VMHOOK_MAKE_VERSION(0, 999, 0)     == vm_expected_pack(0, 999, 0));
+static_assert(VMHOOK_MAKE_VERSION(0, 999, 999)   == vm_expected_pack(0, 999, 999));
+static_assert(VMHOOK_MAKE_VERSION(999, 999, 999) == vm_expected_pack(999, 999, 999));
+static_assert(VMHOOK_MAKE_VERSION(1000, 0, 0)    == vm_expected_pack(1000, 0, 0));
+static_assert(VMHOOK_MAKE_VERSION(2147, 0, 0)    == vm_expected_pack(2147, 0, 0));
+
+// --- (2) `>=` gating: equal / one-below / one-above on every field. --------
+// Reflexivity: a version is always >= and <= itself, never strictly either way.
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) >= VMHOOK_MAKE_VERSION(1, 2, 3));
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) <= VMHOOK_MAKE_VERSION(1, 2, 3));
+static_assert(!(VMHOOK_MAKE_VERSION(1, 2, 3) > VMHOOK_MAKE_VERSION(1, 2, 3)));
+static_assert(!(VMHOOK_MAKE_VERSION(1, 2, 3) < VMHOOK_MAKE_VERSION(1, 2, 3)));
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) == VMHOOK_MAKE_VERSION(1, 2, 3));
+
+// One patch below / equal / above the same anchor.
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) >  VMHOOK_MAKE_VERSION(1, 2, 2));
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) >= VMHOOK_MAKE_VERSION(1, 2, 2));
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) <  VMHOOK_MAKE_VERSION(1, 2, 4));
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) <= VMHOOK_MAKE_VERSION(1, 2, 4));
+static_assert(!(VMHOOK_MAKE_VERSION(1, 2, 3) >= VMHOOK_MAKE_VERSION(1, 2, 4)));
+
+// One minor below / equal / above the same anchor (patch held constant).
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) >  VMHOOK_MAKE_VERSION(1, 1, 3));
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) <  VMHOOK_MAKE_VERSION(1, 3, 3));
+static_assert(!(VMHOOK_MAKE_VERSION(1, 2, 3) >= VMHOOK_MAKE_VERSION(1, 3, 3)));
+
+// One major below / equal / above the same anchor (minor.patch held constant).
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) >  VMHOOK_MAKE_VERSION(0, 2, 3));
+static_assert(VMHOOK_MAKE_VERSION(1, 2, 3) <  VMHOOK_MAKE_VERSION(2, 2, 3));
+static_assert(!(VMHOOK_MAKE_VERSION(1, 2, 3) >= VMHOOK_MAKE_VERSION(2, 2, 3)));
+
+// --- (2b) Component-carry boundaries (single->multi digit, NOT field wrap). -
+// 1.9.9 vs 1.10.0 is the canonical SemVer carry the audit calls out: the minor
+// rolls from one digit to two while still far below the 1000-wide field, and
+// 1.10.0 MUST compare strictly greater than 1.9.9 (a naive lexical/string
+// compare would get this backwards -- "1.10.0" < "1.9.9" as text).
+static_assert(VMHOOK_MAKE_VERSION(1, 10, 0) >  VMHOOK_MAKE_VERSION(1, 9, 9));
+static_assert(VMHOOK_MAKE_VERSION(1, 10, 0) >= VMHOOK_MAKE_VERSION(1, 9, 9));
+static_assert(!(VMHOOK_MAKE_VERSION(1, 9, 9) >= VMHOOK_MAKE_VERSION(1, 10, 0)));
+static_assert(VMHOOK_MAKE_VERSION(1, 10, 0) - VMHOOK_MAKE_VERSION(1, 9, 9) == 991);
+// Patch single->double digit carry (1.0.9 -> 1.0.10) and triple (…99 -> …100).
+static_assert(VMHOOK_MAKE_VERSION(1, 0, 10)  > VMHOOK_MAKE_VERSION(1, 0, 9));
+static_assert(VMHOOK_MAKE_VERSION(1, 0, 100) > VMHOOK_MAKE_VERSION(1, 0, 99));
+static_assert(VMHOOK_MAKE_VERSION(2, 100, 0) > VMHOOK_MAKE_VERSION(2, 99, 999));
+// Field-overflow boundary (the *lossy* edge): at exactly 1000 a component
+// carries into the next field, so these pin where the encoding stops being
+// injective.  Documents flaw #2's failure mode as an executable spec.
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 1000) == VMHOOK_MAKE_VERSION(0, 1, 0));
+static_assert(VMHOOK_MAKE_VERSION(0, 1000, 0) == VMHOOK_MAKE_VERSION(1, 0, 0));
+
+// --- (2c) Zero floor and large-value ceiling of the gating relation. -------
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 0) == 0);
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 0) <  VMHOOK_MAKE_VERSION(0, 0, 1));
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 0) <= VMHOOK_MAKE_VERSION(0, 0, 0));
+// Largest major that still fits a signed 32-bit int when packed: 2147*1e6 =
+// 2'147'000'000 < INT_MAX (2'147'483'647).  Pins the documented ~2147 cap so a
+// future widen to `long` is a deliberate, test-visible change (flaw #1).
+static_assert(VMHOOK_MAKE_VERSION(2147, 0, 0) == 2147000000L);
+static_assert(VMHOOK_MAKE_VERSION(2147, 0, 0) > VMHOOK_MAKE_VERSION(2146, 999, 999));
+// Below INT_MAX the macro packs and orders correctly even at the very top of
+// the int range; this is the highest triple whose pack stays < INT_MAX.
+static_assert(VMHOOK_MAKE_VERSION(2147, 483, 647) == 2147483647L);   // == INT_MAX
+static_assert(VMHOOK_MAKE_VERSION(2147, 483, 647) > VMHOOK_MAKE_VERSION(2147, 483, 646));
+// Ceiling proof WITHOUT invoking the macro (its bare `int` literals would make
+// 2'147'999'999 overflow -> UB -> hard compile error, which is precisely the
+// cap we are documenting).  Computed in `long long`, MAKE(2147,999,999) would
+// be 2'147'999'999, i.e. strictly above INT_MAX -- the first major.minor.patch
+// the current `int`-arithmetic macro cannot represent.
+static_assert(vm_expected_pack(2147, 999, 999) == 2147999999LL);
+static_assert(vm_expected_pack(2147, 999, 999) > 2147483647LL /* INT_MAX */);
+
+// --- (3) Pack is order-isomorphic to lexicographic (major,minor,patch). ----
+// For a strictly ascending ladder of triples, the packed integers must be
+// strictly ascending too: this is the single property that makes EVERY `>=`
+// gate correct.  Adjacent pairs cover patch steps, minor steps, major steps,
+// single->double->triple digit carries, and field-max -> next-field rollovers.
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 0)   < VMHOOK_MAKE_VERSION(0, 0, 1));
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 1)   < VMHOOK_MAKE_VERSION(0, 0, 9));
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 9)   < VMHOOK_MAKE_VERSION(0, 0, 10));
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 10)  < VMHOOK_MAKE_VERSION(0, 0, 99));
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 99)  < VMHOOK_MAKE_VERSION(0, 0, 100));
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 100) < VMHOOK_MAKE_VERSION(0, 0, 999));
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 999) < VMHOOK_MAKE_VERSION(0, 1, 0));
+static_assert(VMHOOK_MAKE_VERSION(0, 1, 0)   < VMHOOK_MAKE_VERSION(0, 9, 999));
+static_assert(VMHOOK_MAKE_VERSION(0, 9, 999) < VMHOOK_MAKE_VERSION(0, 10, 0));
+static_assert(VMHOOK_MAKE_VERSION(0, 10, 0)  < VMHOOK_MAKE_VERSION(0, 99, 999));
+static_assert(VMHOOK_MAKE_VERSION(0, 99, 999)< VMHOOK_MAKE_VERSION(0, 100, 0));
+static_assert(VMHOOK_MAKE_VERSION(0, 100, 0) < VMHOOK_MAKE_VERSION(0, 999, 999));
+static_assert(VMHOOK_MAKE_VERSION(0, 999, 999) < VMHOOK_MAKE_VERSION(1, 0, 0));
+static_assert(VMHOOK_MAKE_VERSION(1, 0, 0)   < VMHOOK_MAKE_VERSION(1, 9, 9));
+static_assert(VMHOOK_MAKE_VERSION(1, 9, 9)   < VMHOOK_MAKE_VERSION(1, 10, 0));
+static_assert(VMHOOK_MAKE_VERSION(1, 10, 0)  < VMHOOK_MAKE_VERSION(2, 0, 0));
+static_assert(VMHOOK_MAKE_VERSION(2, 0, 0)   < VMHOOK_MAKE_VERSION(10, 0, 0));
+static_assert(VMHOOK_MAKE_VERSION(10, 0, 0)  < VMHOOK_MAKE_VERSION(100, 0, 0));
+static_assert(VMHOOK_MAKE_VERSION(100, 0, 0) < VMHOOK_MAKE_VERSION(999, 999, 999));
+
+// --- (3b) The packed value is usable in the *preprocessor*, not just in C++
+// constant expressions.  static_assert runs in the compiler; consumers gate in
+// the preprocessor with `#if`, a distinct evaluation context.  Prove the live
+// packed value and VMHOOK_MAKE_VERSION both survive `#if` arithmetic.
+#if VMHOOK_VERSION >= VMHOOK_MAKE_VERSION(0, 3, 0)
+    // expected: project is past 0.3.0
+#else
+#   error "VMHOOK_VERSION unexpectedly below 0.3.0 in #if context"
+#endif
+#if VMHOOK_VERSION < VMHOOK_MAKE_VERSION(1, 0, 0)
+    // expected: still in the 0.x series
+#else
+#   error "VMHOOK_VERSION unexpectedly >= 1.0.0 in #if context"
+#endif
+#if VMHOOK_MAKE_VERSION(1, 10, 0) > VMHOOK_MAKE_VERSION(1, 9, 9)
+    // expected: carry boundary holds in the preprocessor too
+#else
+#   error "1.10.0 must exceed 1.9.9 in #if context"
+#endif
+#if (2 * VMHOOK_MAKE_VERSION(0, 0, 1)) != 2
+#   error "VMHOOK_MAKE_VERSION outer parens fail under * in #if context"
+#endif
+
 int main()
 {
     // -----------------------------------------------------------------------
@@ -322,6 +486,111 @@ int main()
             check("version_string_no_empty_parts",
                   !parts[0].empty() && !parts[1].empty() && !parts[2].empty());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Data-driven dense ordering sweep.  Build a STRICTLY ASCENDING ladder of
+    // (major,minor,patch) triples that crosses every interesting boundary --
+    // patch carries (9->10, 99->100), the lossy field-wrap (999->next field),
+    // minor single->double->triple digit, and major rollovers -- then assert
+    // the FULL pairwise comparison matrix: for i<j the packed value at i must be
+    // strictly < the one at j, and the `>=` gate must agree with index order in
+    // both directions.  This exercises the comparison logic over O(n^2) pairs,
+    // far more than the hand-written checks above, while staying pure-runtime
+    // (and deterministic, so never flaky).  Mirrors the compile-time ladder so a
+    // divergence between constexpr and runtime evaluation would also surface.
+    // -----------------------------------------------------------------------
+    {
+        struct triple { int major; int minor; int patch; };
+        // Kept ascending by construction; pack() must preserve this order.
+        constexpr triple ladder[]{
+            { 0, 0, 0 },   { 0, 0, 1 },   { 0, 0, 9 },   { 0, 0, 10 },
+            { 0, 0, 99 },  { 0, 0, 100 }, { 0, 0, 999 },
+            { 0, 1, 0 },   { 0, 1, 1 },   { 0, 9, 999 }, { 0, 10, 0 },
+            { 0, 99, 999 },{ 0, 100, 0 }, { 0, 999, 999 },
+            { 1, 0, 0 },   { 1, 9, 9 },   { 1, 10, 0 },  { 1, 99, 999 },
+            { 2, 0, 0 },   { 10, 0, 0 },  { 100, 0, 0 }, { 999, 999, 999 },
+        };
+        constexpr auto pack = [](triple t) {
+            return (static_cast<long>(t.major) * 1000000L)
+                 + (static_cast<long>(t.minor) * 1000L)
+                 + static_cast<long>(t.patch);
+        };
+        const std::size_t n{ sizeof(ladder) / sizeof(ladder[0]) };
+        bool strictly_ascending{ true };
+        bool ge_relation_consistent{ true };
+        long pairs_checked{ 0 };
+        for (std::size_t i{ 0 }; i < n; ++i)
+        {
+            for (std::size_t j{ 0 }; j < n; ++j)
+            {
+                const long a{ pack(ladder[i]) };
+                const long b{ pack(ladder[j]) };
+                ++pairs_checked;
+                if (i < j)
+                {
+                    if (!(a < b))  { strictly_ascending = false; }
+                    if (!(b >= a)) { ge_relation_consistent = false; }
+                    if (a >= b)    { ge_relation_consistent = false; }
+                }
+                else if (i == j)
+                {
+                    if (!(a == b)) { strictly_ascending = false; }
+                    if (!(a >= b)) { ge_relation_consistent = false; }
+                    if (a > b)     { ge_relation_consistent = false; }
+                }
+                else // i > j
+                {
+                    if (!(a > b))  { strictly_ascending = false; }
+                    if (!(a >= b)) { ge_relation_consistent = false; }
+                }
+            }
+        }
+        check("ordering_ladder_strictly_ascending", strictly_ascending);
+        check("ordering_ladder_ge_relation_consistent", ge_relation_consistent);
+        check("ordering_ladder_full_matrix_covered",
+              pairs_checked == static_cast<long>(n) * static_cast<long>(n));
+    }
+
+    // -----------------------------------------------------------------------
+    // Dense "equal / one-below / one-above" matrix anchored on the LIVE shipped
+    // version (currently 0.5.3).  These are the exact comparisons a consumer's
+    // `#if VMHOOK_VERSION >= MAKE(...)` gate performs, so we walk one step in
+    // each direction on every field and confirm the gate's verdict.  Because
+    // they reference VMHOOK_VERSION_* they auto-retarget on a version bump.
+    // -----------------------------------------------------------------------
+    {
+        const int M{ v_major };
+        const int m{ v_minor };
+        const int p{ v_patch };
+
+        // Equal: gate at exactly the current version must pass (>=) but not (>).
+        check("gate_equal_passes_ge", packed >= VMHOOK_MAKE_VERSION(M, m, p));
+        check("gate_equal_fails_gt", !(packed > VMHOOK_MAKE_VERSION(M, m, p)));
+
+        // One patch above the live version: gate must FAIL (we are below it).
+        check("gate_one_patch_above_fails",
+              !(packed >= VMHOOK_MAKE_VERSION(M, m, p + 1)));
+        // One patch below (when patch>0): gate must PASS and be strictly above.
+        check("gate_one_patch_below_passes",
+              (p == 0) || (packed > VMHOOK_MAKE_VERSION(M, m, p - 1)));
+
+        // One minor above: fails.  One minor below (when minor>0): passes.
+        check("gate_one_minor_above_fails",
+              !(packed >= VMHOOK_MAKE_VERSION(M, m + 1, p)));
+        check("gate_one_minor_below_passes",
+              (m == 0) || (packed > VMHOOK_MAKE_VERSION(M, m - 1, p)));
+
+        // One major above: fails.  One major below (when major>0): passes.
+        check("gate_one_major_above_fails",
+              !(packed >= VMHOOK_MAKE_VERSION(M + 1, m, p)));
+        check("gate_one_major_below_passes",
+              (M == 0) || (packed > VMHOOK_MAKE_VERSION(M - 1, m, p)));
+
+        // Zero floor: every released version is >= 0.0.0; and the live version
+        // sits at or above 0.0.1 (we have definitely shipped something).
+        check("gate_above_zero_floor", packed >= VMHOOK_MAKE_VERSION(0, 0, 0));
+        check("gate_strictly_above_zero", packed > VMHOOK_MAKE_VERSION(0, 0, 0));
     }
 
     std::printf("\n%d checks failed\n", failures);

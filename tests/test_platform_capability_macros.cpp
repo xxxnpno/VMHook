@@ -120,6 +120,182 @@ static_assert(!VMHOOK_HAS_HW_DATA_BREAKPOINTS || VMHOOK_ARCH_X86_64,
 static_assert(!VMHOOK_HAS_HW_DATA_BREAKPOINTS || VMHOOK_RUNTIME_HOOKING_AVAILABLE,
               "HW data breakpoints imply runtime hooking is available");
 
+// ---------------------------------------------------------------------------
+// Gate-input snapshots.  `defined()` and `__has_include()` are preprocessor-only
+// operators — they cannot appear in a C++ `static_assert` or runtime expression.
+// So we evaluate every raw gate input *here*, in #if directives, and capture it
+// as a plain 0/1 macro (VMHT_*) that IS usable in both static_assert and the
+// runtime check() mirror.  These reproduce, independently of vmhook.hpp, the
+// inputs the library's own gates consume; comparing the library macro against a
+// VMHT_-derived expression catches any drift in the library's #if ladder.
+// ---------------------------------------------------------------------------
+#if defined(_MSC_VER)
+    #define VMHT_HAS_MSC_VER 1
+#else
+    #define VMHT_HAS_MSC_VER 0
+#endif
+#if defined(__clang__)
+    #define VMHT_HAS_CLANG 1
+#else
+    #define VMHT_HAS_CLANG 0
+#endif
+#if defined(__GNUC__)
+    #define VMHT_HAS_GNUC 1
+#else
+    #define VMHT_HAS_GNUC 0
+#endif
+#if defined(__clang__) && __clang_major__ >= 20
+    #define VMHT_CLANG_GE_20 1
+#else
+    #define VMHT_CLANG_GE_20 0
+#endif
+#if defined(__ANDROID__)
+    #define VMHT_IS_ANDROID 1
+#else
+    #define VMHT_IS_ANDROID 0
+#endif
+#if defined(__cpp_explicit_this_parameter) && __cpp_explicit_this_parameter >= 202110L
+    #define VMHT_HAS_EXPLICIT_THIS 1
+#else
+    #define VMHT_HAS_EXPLICIT_THIS 0
+#endif
+#if __has_include(<format>)
+    #define VMHT_HAS_FORMAT_HEADER 1
+#else
+    #define VMHT_HAS_FORMAT_HEADER 0
+#endif
+#if __has_include(<print>) && defined(__cpp_lib_print) && __cpp_lib_print >= 202207L
+    #define VMHT_HAS_PRINT_AND_FEATURE 1
+#else
+    #define VMHT_HAS_PRINT_AND_FEATURE 0
+#endif
+
+// ===========================================================================
+// Compiler-family macros (vmhook.hpp:198-214).  These select #pragma /
+// intrinsic paths elsewhere; nothing previously asserted they are well-formed.
+// They are NOT a strict partition: an "unknown" compiler (e.g. ICC without the
+// GNU/MSVC personality) legally yields all three 0, so we assert an *at-most-one*
+// invariant rather than exactly-one.
+// ===========================================================================
+#if !defined(VMHOOK_COMPILER_MSVC) || !defined(VMHOOK_COMPILER_CLANG)             \
+ || !defined(VMHOOK_COMPILER_GCC)
+#error "all three VMHOOK_COMPILER_* macros must be defined"
+#endif
+static_assert((VMHOOK_COMPILER_MSVC == 0 || VMHOOK_COMPILER_MSVC == 1)
+                  && (VMHOOK_COMPILER_CLANG == 0 || VMHOOK_COMPILER_CLANG == 1)
+                  && (VMHOOK_COMPILER_GCC == 0 || VMHOOK_COMPILER_GCC == 1),
+              "each VMHOOK_COMPILER_* macro must be 0 or 1");
+// MSVC and GCC are each gated `&& !defined(__clang__)`, so neither can coexist
+// with CLANG, and the two "real" families (cl.exe vs g++) are mutually
+// exclusive.  At most one of the three may be set.
+static_assert(VMHOOK_COMPILER_MSVC + VMHOOK_COMPILER_CLANG + VMHOOK_COMPILER_GCC <= 1,
+              "at most one compiler family may be selected");
+static_assert(!(VMHOOK_COMPILER_MSVC && VMHOOK_COMPILER_GCC),
+              "MSVC and GCC are mutually exclusive");
+static_assert(!(VMHOOK_COMPILER_CLANG && VMHOOK_COMPILER_MSVC),
+              "the !__clang__ guard means CLANG and MSVC never both fire (clang-cl => CLANG only)");
+static_assert(!(VMHOOK_COMPILER_CLANG && VMHOOK_COMPILER_GCC),
+              "the !__clang__ guard means CLANG and GCC never both fire");
+// Pin the resolved family to the gate inputs that produce it, so a refactor of
+// the #if ladder that flips a family is caught at compile time on *this* target.
+static_assert(VMHOOK_COMPILER_MSVC == (VMHT_HAS_MSC_VER && !VMHT_HAS_CLANG),
+              "VMHOOK_COMPILER_MSVC == (_MSC_VER && !__clang__)");
+static_assert(VMHOOK_COMPILER_CLANG == VMHT_HAS_CLANG,
+              "VMHOOK_COMPILER_CLANG == defined(__clang__)");
+static_assert(VMHOOK_COMPILER_GCC == (VMHT_HAS_GNUC && !VMHT_HAS_CLANG),
+              "VMHOOK_COMPILER_GCC == (__GNUC__ && !__clang__)");
+// clang-cl edge: clang defines _MSC_VER, but VMHOOK_COMPILER_MSVC is guarded
+// `!__clang__`, so under clang-cl we must see MSVC==0 and CLANG==1.  Express it
+// as the implication "clang implies not-MSVC" (vacuously true off clang).
+static_assert(!VMHOOK_COMPILER_CLANG || VMHOOK_COMPILER_MSVC == 0,
+              "clang (incl. clang-cl) never reports as MSVC");
+
+// ===========================================================================
+// VMHOOK_HAS_DEDUCING_THIS (vmhook.hpp:255-262).  Documented gate:
+//   __cpp_explicit_this_parameter >= 202110L
+//   && (clang || msvc) && !android && !(clang >= 20)
+// Gates whether object<T>::get_field can be invoked uniformly from instance
+// AND static contexts.  Previously had zero coverage.
+// ===========================================================================
+#if !defined(VMHOOK_HAS_DEDUCING_THIS)
+#error "VMHOOK_HAS_DEDUCING_THIS must be defined"
+#endif
+static_assert(VMHOOK_HAS_DEDUCING_THIS == 0 || VMHOOK_HAS_DEDUCING_THIS == 1,
+              "VMHOOK_HAS_DEDUCING_THIS must be 0 or 1");
+// Reproduce the exact documented predicate from the captured gate inputs; a
+// drift in the gate (added/removed term, changed version threshold, dropped
+// Android/clang-20 exclusion) fails the build.
+static_assert(
+    VMHOOK_HAS_DEDUCING_THIS
+        == (VMHT_HAS_EXPLICIT_THIS
+            && (VMHT_HAS_CLANG || VMHT_HAS_MSC_VER)
+            && !VMHT_IS_ANDROID
+            && !VMHT_CLANG_GE_20),
+    "VMHOOK_HAS_DEDUCING_THIS must equal its documented gate");
+// Implication chain: enabling deducing-this requires the C++23 feature flag,
+// a clang-or-MSVC front end, a non-Android target, and (for clang) major < 20.
+static_assert(!VMHOOK_HAS_DEDUCING_THIS || VMHT_HAS_EXPLICIT_THIS,
+              "deducing-this implies __cpp_explicit_this_parameter >= 202110L");
+static_assert(!VMHOOK_HAS_DEDUCING_THIS || (VMHT_HAS_CLANG || VMHT_HAS_MSC_VER),
+              "deducing-this implies a clang or MSVC front end (the GCC static-call path is excluded)");
+static_assert(!VMHOOK_HAS_DEDUCING_THIS || !VMHT_IS_ANDROID,
+              "deducing-this implies a non-Android target (NDK clang behaves like GCC here)");
+static_assert(!VMHOOK_HAS_DEDUCING_THIS || !VMHT_CLANG_GE_20,
+              "deducing-this implies clang major < 20 (clang 20 changed static-context overload resolution)");
+// Pure GCC can never enable deducing-this (no clang/MSVC personality).
+static_assert(!(VMHOOK_COMPILER_GCC && VMHOOK_HAS_DEDUCING_THIS),
+              "pure GCC must not enable VMHOOK_HAS_DEDUCING_THIS");
+// Android can never enable it regardless of front end.
+static_assert(!(VMHOOK_OS_ANDROID && VMHOOK_HAS_DEDUCING_THIS),
+              "Android must not enable VMHOOK_HAS_DEDUCING_THIS");
+
+// ===========================================================================
+// std-library feature gates (vmhook.hpp:217-230): VMHOOK_HAS_STD_FORMAT /
+// VMHOOK_HAS_STD_PRINT.  These pick the logging backend; previously untested.
+// ===========================================================================
+#if !defined(VMHOOK_HAS_STD_FORMAT) || !defined(VMHOOK_HAS_STD_PRINT)
+#error "VMHOOK_HAS_STD_FORMAT and VMHOOK_HAS_STD_PRINT must be defined"
+#endif
+static_assert(VMHOOK_HAS_STD_FORMAT == 0 || VMHOOK_HAS_STD_FORMAT == 1,
+              "VMHOOK_HAS_STD_FORMAT must be 0 or 1");
+static_assert(VMHOOK_HAS_STD_PRINT == 0 || VMHOOK_HAS_STD_PRINT == 1,
+              "VMHOOK_HAS_STD_PRINT must be 0 or 1");
+// VMHOOK_HAS_STD_FORMAT is exactly __has_include(<format>) (vmhook.hpp:217).
+static_assert(VMHOOK_HAS_STD_FORMAT == VMHT_HAS_FORMAT_HEADER,
+              "VMHOOK_HAS_STD_FORMAT == __has_include(<format>)");
+// VMHOOK_HAS_STD_PRINT is __has_include(<print>) AND __cpp_lib_print>=202207L
+// (vmhook.hpp:225).  Reproduce both terms.
+static_assert(VMHOOK_HAS_STD_PRINT == VMHT_HAS_PRINT_AND_FEATURE,
+              "VMHOOK_HAS_STD_PRINT == (__has_include(<print>) && __cpp_lib_print>=202207L)");
+// std::print is strictly newer than std::format: a toolchain shipping <print>
+// (post-format era) necessarily also ships <format>.  So PRINT implies FORMAT.
+static_assert(!VMHOOK_HAS_STD_PRINT || VMHOOK_HAS_STD_FORMAT,
+              "std::print availability implies std::format availability");
+
+// ===========================================================================
+// Aggregate-macro NORMALISATION (latent flaw): VMHOOK_OS_POSIX / VMHOOK_OS_APPLE
+// are bitwise-OR *expressions* of the base flags, not 0/1 literals.  Today the
+// OR collapses to 0/1 because each base flag is 0/1, but they are consumed as
+// booleans (`!VMHOOK_OS_IOS`, `Windows | POSIX == 1`).  Force them to be exactly
+// 0 or 1 in arithmetic contexts so a future arm that sets two sub-flags (which
+// would make the OR != 1) is caught here rather than silently mis-behaving in a
+// `POSIX * N` or `POSIX + Windows` expression.
+// ===========================================================================
+static_assert(VMHOOK_OS_POSIX == 0 || VMHOOK_OS_POSIX == 1,
+              "VMHOOK_OS_POSIX must normalise to exactly 0 or 1");
+static_assert(VMHOOK_OS_APPLE == 0 || VMHOOK_OS_APPLE == 1,
+              "VMHOOK_OS_APPLE must normalise to exactly 0 or 1");
+// Stronger arithmetic-context probes: if the aggregate were ever != {0,1} these
+// identities would break even though the bare `== union` check still passed.
+static_assert((VMHOOK_OS_POSIX | 1) == 1 && (VMHOOK_OS_POSIX & 1) == VMHOOK_OS_POSIX,
+              "VMHOOK_OS_POSIX behaves as a 1-bit boolean under | and &");
+static_assert((VMHOOK_OS_APPLE | 1) == 1 && (VMHOOK_OS_APPLE & 1) == VMHOOK_OS_APPLE,
+              "VMHOOK_OS_APPLE behaves as a 1-bit boolean under | and &");
+static_assert(VMHOOK_OS_POSIX * 7 == (VMHOOK_OS_POSIX ? 7 : 0),
+              "VMHOOK_OS_POSIX multiplies as a normalised 0/1 scalar");
+static_assert(VMHOOK_OS_APPLE * 7 == (VMHOOK_OS_APPLE ? 7 : 0),
+              "VMHOOK_OS_APPLE multiplies as a normalised 0/1 scalar");
+
 int main()
 {
     // -- OS macro consistency (runtime mirror of the static_asserts) --------
@@ -228,6 +404,79 @@ int main()
     check("hw_breakpoints_is_subset_of_runtime_hooking",
           !VMHOOK_HAS_HW_DATA_BREAKPOINTS || VMHOOK_RUNTIME_HOOKING_AVAILABLE);
 
+    // -- Compiler-family macros (runtime mirror of the static_asserts) ------
+    check("compiler_macros_are_zero_or_one",
+          (VMHOOK_COMPILER_MSVC | 1) == 1 && (VMHOOK_COMPILER_CLANG | 1) == 1
+              && (VMHOOK_COMPILER_GCC | 1) == 1
+              && VMHOOK_COMPILER_MSVC >= 0 && VMHOOK_COMPILER_MSVC <= 1
+              && VMHOOK_COMPILER_CLANG >= 0 && VMHOOK_COMPILER_CLANG <= 1
+              && VMHOOK_COMPILER_GCC >= 0 && VMHOOK_COMPILER_GCC <= 1);
+    check("at_most_one_compiler_family",
+          VMHOOK_COMPILER_MSVC + VMHOOK_COMPILER_CLANG + VMHOOK_COMPILER_GCC <= 1);
+    check("compiler_msvc_and_gcc_mutually_exclusive",
+          !(VMHOOK_COMPILER_MSVC && VMHOOK_COMPILER_GCC));
+    check("compiler_clang_excludes_msvc",
+          !(VMHOOK_COMPILER_CLANG && VMHOOK_COMPILER_MSVC));
+    check("compiler_clang_excludes_gcc",
+          !(VMHOOK_COMPILER_CLANG && VMHOOK_COMPILER_GCC));
+    // clang-cl reports CLANG, never MSVC, even though it defines _MSC_VER.
+    check("clang_never_reports_as_msvc",
+          !VMHOOK_COMPILER_CLANG || VMHOOK_COMPILER_MSVC == 0);
+    // Resolved value pinned to gate inputs (mirrors the compile-time pins via
+    // the VMHT_* gate-input snapshots, since defined()/__has_include can't be
+    // used in a runtime expression).
+    check("compiler_msvc_matches_gate",
+          VMHOOK_COMPILER_MSVC == (VMHT_HAS_MSC_VER && !VMHT_HAS_CLANG));
+    check("compiler_clang_matches_gate",
+          VMHOOK_COMPILER_CLANG == VMHT_HAS_CLANG);
+    check("compiler_gcc_matches_gate",
+          VMHOOK_COMPILER_GCC == (VMHT_HAS_GNUC && !VMHT_HAS_CLANG));
+
+    // -- VMHOOK_HAS_DEDUCING_THIS (runtime mirror) -------------------------
+    check("deducing_this_flag_is_zero_or_one",
+          VMHOOK_HAS_DEDUCING_THIS >= 0 && VMHOOK_HAS_DEDUCING_THIS <= 1);
+    check("deducing_this_equals_documented_gate",
+          VMHOOK_HAS_DEDUCING_THIS
+              == (VMHT_HAS_EXPLICIT_THIS
+                  && (VMHT_HAS_CLANG || VMHT_HAS_MSC_VER)
+                  && !VMHT_IS_ANDROID
+                  && !VMHT_CLANG_GE_20));
+    check("deducing_this_implies_clang_or_msvc",
+          !VMHOOK_HAS_DEDUCING_THIS || (VMHT_HAS_CLANG || VMHT_HAS_MSC_VER));
+    check("deducing_this_implies_not_android",
+          !VMHOOK_HAS_DEDUCING_THIS || !VMHT_IS_ANDROID);
+    check("deducing_this_off_under_pure_gcc",
+          !(VMHOOK_COMPILER_GCC && VMHOOK_HAS_DEDUCING_THIS));
+    check("deducing_this_off_on_android",
+          !(VMHOOK_OS_ANDROID && VMHOOK_HAS_DEDUCING_THIS));
+
+    // -- std-library feature gates (runtime mirror) ------------------------
+    check("std_format_flag_is_zero_or_one",
+          VMHOOK_HAS_STD_FORMAT >= 0 && VMHOOK_HAS_STD_FORMAT <= 1);
+    check("std_print_flag_is_zero_or_one",
+          VMHOOK_HAS_STD_PRINT >= 0 && VMHOOK_HAS_STD_PRINT <= 1);
+    check("std_format_equals_has_include",
+          VMHOOK_HAS_STD_FORMAT == VMHT_HAS_FORMAT_HEADER);
+    check("std_print_equals_has_include_and_feature_test",
+          VMHOOK_HAS_STD_PRINT == VMHT_HAS_PRINT_AND_FEATURE);
+    check("std_print_implies_std_format",
+          !VMHOOK_HAS_STD_PRINT || VMHOOK_HAS_STD_FORMAT);
+
+    // -- Aggregate-macro normalisation (runtime mirror) --------------------
+    // Force POSIX/APPLE to behave as 0/1 scalars (not just "equal to the union
+    // on today's config").  A future arm setting two sub-flags would break the
+    // multiply/OR identities here even if the bare union check still passed.
+    check("os_posix_normalises_to_zero_or_one",
+          VMHOOK_OS_POSIX == 0 || VMHOOK_OS_POSIX == 1);
+    check("os_apple_normalises_to_zero_or_one",
+          VMHOOK_OS_APPLE == 0 || VMHOOK_OS_APPLE == 1);
+    check("os_posix_is_one_bit_boolean",
+          (VMHOOK_OS_POSIX | 1) == 1 && (VMHOOK_OS_POSIX & 1) == VMHOOK_OS_POSIX
+              && (VMHOOK_OS_POSIX * 7) == (VMHOOK_OS_POSIX ? 7 : 0));
+    check("os_apple_is_one_bit_boolean",
+          (VMHOOK_OS_APPLE | 1) == 1 && (VMHOOK_OS_APPLE & 1) == VMHOOK_OS_APPLE
+              && (VMHOOK_OS_APPLE * 7) == (VMHOOK_OS_APPLE ? 7 : 0));
+
     // -- Portable os:: address-range constants (defined on every platform) --
     // These are the documented user-space bounds the hook/scan code relies on;
     // they are plain constexpr values, no JVM needed.
@@ -238,6 +487,52 @@ int main()
     check("user_address_floor_is_64k",
           vmhook::os::user_address_floor == std::uintptr_t{ 0xFFFFull });
 
+    // -- user_address_ceiling's SECOND role: the OOP tag-strip mask ---------
+    // The same constant is reused as the mask that strips high GC tag/colour
+    // bits from a HotSpot oop (vmhook.hpp untag_pointer / the OOP-untag site).
+    // It must (a) be a clean low-47-bit mask 0x0000'7FFF'FFFF'FFFF, (b) clear
+    // every bit at/above 47 for synthetic tagged pointers, and (c) be a no-op
+    // on an already-canonical low-half address.  Pure arithmetic, no JVM; this
+    // pins the constant to its masking role (relevant under ZGC/JDK21+ coloured
+    // pointers that pack tag bits above bit 47).
+    {
+        const std::uintptr_t mask{ vmhook::os::user_address_ceiling };
+        // The mask is exactly bits 0..46 set, bits 47..63 clear.
+        check("untag_mask_is_low_47_bits",
+              mask == ((std::uintptr_t{ 1 } << 47) - 1));
+        check("untag_mask_high_bits_clear",
+              (mask & ~((std::uintptr_t{ 1 } << 47) - 1)) == 0);
+        // A canonical low-half address survives masking unchanged.
+        const std::uintptr_t canonical{ 0x0000'1234'5678'9AB0ull };
+        check("untag_mask_noop_on_canonical_address",
+              (canonical & mask) == canonical);
+        // Synthetic tagged pointers: a real address OR'd with assorted high
+        // tag/colour bits.  Masking must recover exactly the low-47 address.
+        const std::uintptr_t base{ 0x0000'0000'DEAD'BEE0ull };  // < 2^47
+        const std::uintptr_t tag_bits[]{
+            std::uintptr_t{ 1 } << 47,                 // first bit above the window
+            std::uintptr_t{ 1 } << 60,                 // a high colour bit
+            std::uintptr_t{ 0xFFFFull } << 48,         // canonical sign-extension bits
+            std::uintptr_t{ 0xABCDull } << 48,         // arbitrary high tag nibble
+            ~((std::uintptr_t{ 1 } << 47) - 1),        // ALL bits 47..63 set
+        };
+        bool all_recovered{ true };
+        for (const std::uintptr_t tb : tag_bits)
+        {
+            const std::uintptr_t tagged{ base | tb };
+            if ((tagged & mask) != base) { all_recovered = false; }
+        }
+        check("untag_mask_strips_synthetic_tag_bits", all_recovered);
+        // The library's untag_pointer helper (vmhook::hotspot) must agree with a
+        // manual mask for a tagged pointer — it is a pure function that masks
+        // with os::user_address_ceiling; no JVM, no live oop.
+        const std::uintptr_t tagged_ptr{ base | (std::uintptr_t{ 0xDEADull } << 48) };
+        check("untag_pointer_helper_matches_manual_mask",
+              reinterpret_cast<std::uintptr_t>(
+                  vmhook::hotspot::untag_pointer(reinterpret_cast<const void*>(tagged_ptr)))
+                  == base);
+    }
+
     // -- Portable os:: page geometry (pure syscalls, no JVM) ----------------
     const std::size_t ps{ vmhook::os::page_size() };
     check("page_size_is_nonzero", ps != 0);
@@ -247,6 +542,17 @@ int main()
     check("allocation_granularity_is_nonzero", gran != 0);
     check("allocation_granularity_multiple_of_page_size",
           ps != 0 && (gran % ps) == 0);
+    // Granularity is never finer than a page (the scan allocator clamps to it).
+    check("allocation_granularity_at_least_page_size", gran >= ps);
+    // Platform-specific cross-relation (vmhook.hpp:508): on POSIX the two are
+    // identical (allocation_granularity() just forwards to page_size()); on
+    // Windows the granularity comes from dwAllocationGranularity, which is a
+    // strict multiple of (and typically 64 KiB, larger than) the page size.
+#if VMHOOK_OS_POSIX
+    check("posix_allocation_granularity_equals_page_size", gran == ps);
+#else
+    check("windows_allocation_granularity_is_page_multiple", (gran % ps) == 0);
+#endif
 
     // memory_protection is a portable enum present on all platforms; confirm
     // the documented stable ordinal values the OS-protection mapping relies on.
@@ -311,6 +617,12 @@ int main()
         check("region_info_default_is_empty_unset",
               ri.base == nullptr && ri.size == 0 && !ri.committed && !ri.free
                   && !ri.readable && !ri.executable && !ri.guarded);
+        // The scan allocator relies on region_info being a plain aggregate it
+        // can default-construct and brace-init; pin those structural traits.
+        check("region_info_is_default_constructible",
+              std::is_default_constructible_v<vmhook::os::region_info>);
+        check("region_info_is_aggregate",
+              std::is_aggregate_v<vmhook::os::region_info>);
     }
 
     // -- DR7 builder: only exists when the capability is compiled in --------
@@ -458,6 +770,145 @@ int main()
                                                data_breakpoint_length::four_bytes)
                   == vmhook::os::detail_dr::build_dr7(2, data_breakpoint_kind::read_write,
                                                       data_breakpoint_length::four_bytes));
+
+        // -- EXHAUSTIVE build_dr7 matrix: all 4 slots x 2 kinds x 4 lengths ----
+        // Every one of the 32 combinations must equal the closed-form Intel-SDM
+        // encoding (1<<2s) | (kind<<(16+4s)) | (len<<(18+4s)).  This is the full
+        // input space of the helper (slot is contractually 0..3); previously
+        // only ~6 of the 32 cells were spot-checked.
+        {
+            const data_breakpoint_kind kinds[]{
+                data_breakpoint_kind::write,
+                data_breakpoint_kind::read_write,
+            };
+            const data_breakpoint_length lens[]{
+                data_breakpoint_length::one_byte,
+                data_breakpoint_length::two_bytes,
+                data_breakpoint_length::four_bytes,
+                data_breakpoint_length::eight_bytes,
+            };
+            bool all_match_closed_form{ true };
+            int  cells_checked{ 0 };
+            for (int slot{ 0 }; slot < 4; ++slot)
+            {
+                for (const data_breakpoint_kind k : kinds)
+                {
+                    for (const data_breakpoint_length l : lens)
+                    {
+                        const std::uint64_t got{ vmhook::os::detail_dr::build_dr7(slot, k, l) };
+                        const std::uint64_t want{
+                            (std::uint64_t{ 1 } << (slot * 2))
+                            | (static_cast<std::uint64_t>(k) << (16 + slot * 4))
+                            | (static_cast<std::uint64_t>(l) << (18 + slot * 4)) };
+                        if (got != want) { all_match_closed_form = false; }
+                        ++cells_checked;
+                    }
+                }
+            }
+            check("build_dr7_full_matrix_matches_closed_form", all_match_closed_form);
+            check("build_dr7_full_matrix_covered_all_32_cells", cells_checked == 32);
+        }
+
+        // -- DR7 bit-field NON-OVERLAP within a slot, and across slots ---------
+        // For each slot the three sub-fields occupy disjoint bit positions:
+        //   L-enable: bit 2*slot          (1 bit)
+        //   R/W:      bits 16+4*slot .. 17+4*slot   (2 bits)
+        //   LEN:      bits 18+4*slot .. 19+4*slot   (2 bits)
+        // Build the per-slot field masks and assert (a) the three masks are
+        // pairwise disjoint for the same slot, (b) the L-enable bits of distinct
+        // slots are disjoint, and (c) slot N's R/W+LEN region never overlaps slot
+        // M's (N != M).  This proves the 4*slot stride is correct for ALL slots,
+        // not merely the 0/3 endpoints the earlier checks pinned.
+        {
+            auto enable_mask = [](int s) {
+                return std::uint64_t{ 1 } << (s * 2);
+            };
+            auto rw_mask = [](int s) {
+                return std::uint64_t{ 0b11 } << (16 + s * 4);
+            };
+            auto len_mask = [](int s) {
+                return std::uint64_t{ 0b11 } << (18 + s * 4);
+            };
+
+            bool within_slot_disjoint{ true };
+            for (int s{ 0 }; s < 4; ++s)
+            {
+                const std::uint64_t e{ enable_mask(s) };
+                const std::uint64_t r{ rw_mask(s) };
+                const std::uint64_t l{ len_mask(s) };
+                if ((e & r) != 0) { within_slot_disjoint = false; }
+                if ((e & l) != 0) { within_slot_disjoint = false; }
+                if ((r & l) != 0) { within_slot_disjoint = false; }
+            }
+            check("build_dr7_fields_disjoint_within_slot", within_slot_disjoint);
+
+            bool across_slot_disjoint{ true };
+            for (int n{ 0 }; n < 4; ++n)
+            {
+                for (int m{ 0 }; m < 4; ++m)
+                {
+                    if (n == m) { continue; }
+                    // L-enable bits never collide.
+                    if ((enable_mask(n) & enable_mask(m)) != 0) { across_slot_disjoint = false; }
+                    // The full per-slot control region (enable|rw|len) of two
+                    // different slots is disjoint.
+                    const std::uint64_t region_n{ enable_mask(n) | rw_mask(n) | len_mask(n) };
+                    const std::uint64_t region_m{ enable_mask(m) | rw_mask(m) | len_mask(m) };
+                    if ((region_n & region_m) != 0) { across_slot_disjoint = false; }
+                }
+            }
+            check("build_dr7_fields_disjoint_across_slots", across_slot_disjoint);
+
+            // Cross-check the masks against actual build_dr7 output: for a
+            // read_write/four_bytes watch the only bits set in the whole word
+            // must lie inside this slot's (enable|rw|len) region.
+            bool output_within_region{ true };
+            for (int s{ 0 }; s < 4; ++s)
+            {
+                const std::uint64_t v{ vmhook::os::detail_dr::build_dr7(
+                    s, data_breakpoint_kind::read_write,
+                    data_breakpoint_length::four_bytes) };
+                const std::uint64_t region{ enable_mask(s) | rw_mask(s) | len_mask(s) };
+                if ((v & ~region) != 0) { output_within_region = false; }
+            }
+            check("build_dr7_output_bits_confined_to_slot_region", output_within_region);
+        }
+
+        // -- No two distinct slots' DR7 words collide in their enable bits -----
+        // Stronger than the pairwise (0,1) check above: across the full 4x2x4
+        // configuration set, any two words for *different* slots differ, because
+        // the L-enable bit (bit 2*slot) is unique per slot.
+        {
+            bool all_distinct_slots{ true };
+            for (int s1{ 0 }; s1 < 4; ++s1)
+            {
+                for (int s2{ 0 }; s2 < 4; ++s2)
+                {
+                    if (s1 == s2) { continue; }
+                    const std::uint64_t a{ vmhook::os::detail_dr::build_dr7(
+                        s1, data_breakpoint_kind::read_write,
+                        data_breakpoint_length::eight_bytes) };
+                    const std::uint64_t b{ vmhook::os::detail_dr::build_dr7(
+                        s2, data_breakpoint_kind::read_write,
+                        data_breakpoint_length::eight_bytes) };
+                    // The two words differ in their L-enable bit (2*s1 vs 2*s2).
+                    if ((a & (std::uint64_t{ 1 } << (s1 * 2))) == 0) { all_distinct_slots = false; }
+                    if (a == b) { all_distinct_slots = false; }
+                }
+            }
+            check("build_dr7_distinct_slots_never_collide", all_distinct_slots);
+        }
+
+        // -- Contract note for the unchecked `slot` parameter (flaw: build_dr7
+        // does not validate slot in [0,3]).  We deliberately do NOT call
+        // build_dr7(4) or build_dr7(-1): slot==4 silently writes reserved high
+        // DR7 bits (1<<8 lands in slot-0 LEN, R/W/LEN shift by >=32) and
+        // enables nothing, while slot<0 is a negative shift (UB).  The only
+        // caller (watch_static_field) rejects slot<0 before calling and passes
+        // find_free_slot()'s 0..3 result, so the hazard is a latent API-contract
+        // issue, not a live bug.  Document the safe domain as an explicit pin.
+        check("build_dr7_safe_slot_domain_is_0_to_3",
+              true /* slots 0..3 exercised exhaustively above; 4 and -1 are out of contract */);
     }
 #else
     // Symbol vmhook::os::detail_dr::build_dr7 / data_breakpoint_* are not

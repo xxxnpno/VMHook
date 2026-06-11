@@ -1022,6 +1022,369 @@ static auto test_value_t_call_forms() -> void
           std::holds_alternative<std::uint32_t>(v.data));
 }
 
+// ---------------------------------------------------------------------------
+// 7e. EXHAUSTIVE byte sweep of the value_t::to_vector OBJECT-ARRAY gate.
+//
+// This is the element TYPE-TAG mapping of THIS feature: given a field
+// signature, value_t::to_vector classifies it into one of two "tags" —
+//   * OBJECT-ARRAY  (walk the backing Object[] directly, Fix #1 ec1c8a8), or
+//   * FALL-THROUGH  (route the OOP through collection::to_vector).
+// The classifier (header, value_t::to_vector) is EXACTLY:
+//     sig.size() >= 2 && sig.front() == '[' && (sig[1] == 'L' || sig[1] == '[')
+// i.e. the element descriptor immediately after a single leading '[' must be
+// 'L' (object element) or '[' (nested-array element); EVERY other element
+// descriptor — all eight primitives Z/B/C/S/I/J/F/D and ANY unrecognised byte
+// — is the FALL-THROUGH tag (no gap, no UB, a documented total default).
+//
+// With no JVM the runtime RESULT is empty on both tags (decode_oop_pointer of
+// the backing OOP is always nullptr, so the array-walk body is never reached),
+// so this sweep pins the SPEC of the gate exhaustively over the full input byte
+// space — the no-gaps / default-tag / switch-completeness guarantee STEP 2
+// asks for — while the never-throw/empty BEHAVIOUR is pinned by the curated
+// to_vector calls at the end.  The predicate below is a verbatim copy of the
+// header gate; freezing it here makes any future loosening (accepting "[I") or
+// tightening (rejecting "[[I") a loud, reviewable test diff.
+// ---------------------------------------------------------------------------
+namespace
+{
+    // Verbatim mirror of the header's value_t::to_vector object-array gate.
+    constexpr auto value_t_takes_array_branch(std::string_view sig) noexcept -> bool
+    {
+        return sig.size() >= 2u && sig.front() == '[' && (sig[1] == 'L' || sig[1] == '[');
+    }
+}
+
+static auto test_value_t_array_gate_byte_sweep() -> void
+{
+    // --- (a) SECOND byte sweep, first byte fixed '[': "[<byte>" over 0..255. ---
+    // The array branch is taken IFF the element descriptor is 'L' or '['.
+    {
+        bool all_correct{ true };
+        int  yes_count{ 0 };
+        for (int b{ 0 }; b < 256; ++b)
+        {
+            char buf[2]{ '[', static_cast<char>(b) };
+            const std::string_view sig{ buf, 2 };
+            const bool taken{ value_t_takes_array_branch(sig) };
+            const bool expected{ (b == 'L') || (b == '[') };
+            if (taken != expected) { all_correct = false; }
+            if (taken) { ++yes_count; }
+        }
+        check("gate_second_byte_full_sweep_matches_LorBracket", all_correct);
+        // EXACTLY two of the 256 element descriptors take the array branch.
+        check("gate_second_byte_exactly_two_take_branch", yes_count == 2);
+    }
+
+    // --- (b) FIRST byte sweep, second byte fixed 'L': "<byte>L" over 0..255. ---
+    // The array branch requires the leading byte to be EXACTLY '['.
+    {
+        bool all_correct{ true };
+        int  yes_count{ 0 };
+        for (int b{ 0 }; b < 256; ++b)
+        {
+            char buf[2]{ static_cast<char>(b), 'L' };
+            const std::string_view sig{ buf, 2 };
+            const bool taken{ value_t_takes_array_branch(sig) };
+            const bool expected{ (b == '[') };
+            if (taken != expected) { all_correct = false; }
+            if (taken) { ++yes_count; }
+        }
+        check("gate_first_byte_full_sweep_matches_bracket", all_correct);
+        check("gate_first_byte_exactly_one_takes_branch", yes_count == 1);
+    }
+
+    // --- (c) Every SINGLE-char signature (0..255) fails the size>=2 guard. ---
+    // A length-1 signature can never be an array descriptor, even "[".
+    {
+        bool none_taken{ true };
+        for (int b{ 0 }; b < 256; ++b)
+        {
+            const char one{ static_cast<char>(b) };
+            const std::string_view sig{ &one, 1 };
+            if (value_t_takes_array_branch(sig)) { none_taken = false; }
+        }
+        check("gate_no_single_char_signature_takes_branch", none_taken);
+    }
+
+    // --- (d) The empty signature fails the size>=2 guard. ---
+    check("gate_empty_signature_no_branch", !value_t_takes_array_branch(std::string_view{}));
+    check("gate_empty_cstr_signature_no_branch", !value_t_takes_array_branch(""));
+
+    // --- (e) Element-descriptor classification tied to the shared BasicType
+    //         table: every PRIMITIVE element ("[Z".."[D") is FALL-THROUGH and
+    //         classifies as a primitive BasicType (4..11); 'L'/'[' are the only
+    //         array-branch descriptors and classify as T_OBJECT(12)/T_ARRAY(13).
+    //         Pins that the gate is STRICTER than sig_char_to_basic_type's
+    //         T_OBJECT(12) fallback — it checks the literal 'L'/'[' bytes, not
+    //         "classified as object".  Each is also a primitive ARRAY whose
+    //         in-heap width is 0 (jvm_primitive_byte_width over the 2-char desc).
+    {
+        struct prim_elem { char code; int basic; };
+        const prim_elem prims[]{
+            { 'Z', 4 }, { 'C', 5 }, { 'F', 6 }, { 'D', 7 },
+            { 'B', 8 }, { 'S', 9 }, { 'I', 10 }, { 'J', 11 },
+        };
+        bool all_prim_fall_through{ true };
+        bool all_prim_basic_ok{ true };
+        for (const auto& p : prims)
+        {
+            char buf[2]{ '[', p.code };
+            const std::string_view sig{ buf, 2 };
+            if (value_t_takes_array_branch(sig)) { all_prim_fall_through = false; }
+            if (vmhook::detail::sig_char_to_basic_type(p.code) != p.basic) { all_prim_basic_ok = false; }
+        }
+        check("gate_all_primitive_element_descriptors_fall_through", all_prim_fall_through);
+        check("gate_primitive_element_basic_types_match_table", all_prim_basic_ok);
+
+        // 'L' (object) and '[' (array) are the array-branch element descriptors.
+        check("gate_object_element_L_takes_branch", value_t_takes_array_branch("[L"));
+        check("gate_array_element_bracket_takes_branch", value_t_takes_array_branch("[["));
+        check("basic_type_L_is_T_OBJECT_12", vmhook::detail::sig_char_to_basic_type('L') == 12);
+        check("basic_type_bracket_is_T_ARRAY_13", vmhook::detail::sig_char_to_basic_type('[') == 13);
+        // A String[] is NOT distinguished from any other Object[] by the gate:
+        // it reads s[1]=='L' only — the class name is irrelevant.
+        check("gate_string_array_same_as_object_array",
+              value_t_takes_array_branch("[Ljava/lang/String;")
+              && value_t_takes_array_branch("[Ljava/lang/Object;"));
+    }
+
+    // --- (f) BEHAVIOUR: across a representative signature matrix (object-array,
+    //         nested-array, every primitive-array, reference, scalar, degenerate)
+    //         BOTH to_vector and to_entries return empty and never fault, for a
+    //         zero OOP AND a non-zero-but-invalid OOP (which gets past the
+    //         compressed==0 early-out so the signature branch is reached).
+    {
+        const char* const sigs[]{
+            "[Ljava/lang/Object;", "[Ljava/lang/String;", "[Ljava/util/List;",
+            "[[I", "[[Ljava/lang/String;", "[[[Ljava/lang/Object;",
+            "[Z", "[B", "[S", "[I", "[J", "[F", "[D", "[C",
+            "Ljava/util/List;", "Ljava/util/Map;", "Ljava/util/Set;", "Ljava/lang/Object;",
+            "I", "Z", "J", "D", "", "[", "L",
+        };
+        const std::uint32_t oops[]{ 0u, 0x7u };
+        bool all_empty{ true };
+        for (const char* s : sigs)
+        {
+            for (const std::uint32_t o : oops)
+            {
+                const value_t v{ std::uint32_t{ o }, std::string{ s } };
+                if (!v.to_vector<elem_w>().empty()) { all_empty = false; }
+                if (!v.to_entries<key_w, val_w>().empty()) { all_empty = false; }
+            }
+        }
+        check("gate_behaviour_matrix_all_empty_no_fault", all_empty);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7f. value_t variant alternative completeness (the "covers every enumerator"
+//     exhaustiveness guard for the reference/primitive slot the mapping reads).
+//
+// to_vector / to_entries read the stored OOP via static_cast<uint32_t>(*this),
+// which std::visits EVERY variant alternative.  These compile-time assertions
+// pin the variant's exact shape — count, order, and per-index type — so a new
+// alternative added (or one reordered) without updating the to_vector cast path
+// is caught at compile time rather than silently mis-decoding a field.
+// ---------------------------------------------------------------------------
+static auto test_value_t_variant_completeness() -> void
+{
+    using variant_t = decltype(value_t::data);
+
+    // EXACTLY nine alternatives — the JVM primitive set plus the compressed-OOP
+    // reference slot.  A 10th alternative must come with a conscious test update.
+    static_assert(std::variant_size_v<variant_t> == 9,
+                  "value_t variant must have exactly 9 alternatives "
+                  "(bool,i8,i16,i32,i64,float,double,u16,u32).");
+
+    // Per-index type pin (the documented order at vmhook.hpp value_t struct).
+    static_assert(std::is_same_v<std::variant_alternative_t<0, variant_t>, bool>);
+    static_assert(std::is_same_v<std::variant_alternative_t<1, variant_t>, std::int8_t>);
+    static_assert(std::is_same_v<std::variant_alternative_t<2, variant_t>, std::int16_t>);
+    static_assert(std::is_same_v<std::variant_alternative_t<3, variant_t>, std::int32_t>);
+    static_assert(std::is_same_v<std::variant_alternative_t<4, variant_t>, std::int64_t>);
+    static_assert(std::is_same_v<std::variant_alternative_t<5, variant_t>, float>);
+    static_assert(std::is_same_v<std::variant_alternative_t<6, variant_t>, double>);
+    static_assert(std::is_same_v<std::variant_alternative_t<7, variant_t>, std::uint16_t>);
+    static_assert(std::is_same_v<std::variant_alternative_t<8, variant_t>, std::uint32_t>,
+                  "alternative 8 is the compressed-OOP reference slot to_vector/to_entries read.");
+
+    // The conversion the entry points rely on (value_t -> uint32) exists and is
+    // noexcept (a throwing field conversion in a detour would escape into the JVM).
+    static_assert(std::is_convertible_v<value_t, std::uint32_t>,
+                  "value_t must convert to the compressed-OOP uint32 slot.");
+    check("value_t_to_uint32_noexcept", noexcept(static_cast<std::uint32_t>(std::declval<value_t>())));
+
+    // RUNTIME: is_reference() partitions the alternatives — EXACTLY the uint32
+    // alternative is a reference; all eight others are not.  Built one value_t
+    // per alternative; count must be exactly one true.
+    const value_t one_per_alt[]{
+        value_t{ false },
+        value_t{ std::int8_t{ 1 } },
+        value_t{ std::int16_t{ 1 } },
+        value_t{ std::int32_t{ 1 } },
+        value_t{ std::int64_t{ 1 } },
+        value_t{ float{ 1.0F } },
+        value_t{ double{ 1.0 } },
+        value_t{ std::uint16_t{ 1 } },
+        value_t{ std::uint32_t{ 1 } },
+    };
+    int reference_count{ 0 };
+    bool all_empty{ true };
+    for (const auto& v : one_per_alt)
+    {
+        if (v.is_reference()) { ++reference_count; }
+        // Whichever alternative is stored, both entry points are empty w/o JVM.
+        if (!v.to_vector<elem_w>().empty()) { all_empty = false; }
+        if (!v.to_entries<key_w, val_w>().empty()) { all_empty = false; }
+    }
+    check("value_t_exactly_one_alternative_is_reference", reference_count == 1);
+    check("value_t_every_alternative_to_vector_entries_empty", all_empty);
+}
+
+// ---------------------------------------------------------------------------
+// 7g. Compressed-OOP value sweep: EVERY representative point of the 32-bit
+//     compressed-OOP space (held in the uint32 reference slot) decodes to
+//     nullptr w/o a JVM, so to_vector / to_entries are empty for all of them —
+//     across an object-array signature (reaches the gate) and a reference
+//     signature (delegates to collection::to_vector / map::to_entries).
+//
+// This pins that is_valid_pointer / decode_oop_pointer reject the WHOLE
+// compressed range without a JVM (the determinism the file header relies on):
+// no compressed value — not 1, not a plausible mid-heap offset, not 0xFFFFFFFF
+// — is ever mistaken for a live element/entry, so no walk is ever entered.
+//
+// NOTE: this sweep deliberately exercises ONLY the value_t entry points, which
+// route the stored uint32 through decode_oop_pointer() (always nullptr w/o a
+// JVM) — never the DIRECT collection{oop}/map{oop} constructors.  Those treat
+// their argument as an already-DECODED 64-bit instance pointer and dereference
+// its object header, so a large 4 GB-ish value (e.g. 0xFFFFFFFF zero-extended)
+// can pass is_valid_pointer and then fault on an unmapped read.  Direct-wrapper
+// rejection is covered separately with clearly-out-of-range LOW pointers
+// (0x4 / 0x6) in test_to_vector_empty_no_jvm / test_to_entries_empty_no_jvm.
+// ---------------------------------------------------------------------------
+static auto test_value_t_compressed_oop_value_sweep() -> void
+{
+    const std::uint32_t oops[]{
+        0x00000000u, 0x00000001u, 0x00000002u, 0x00000003u, 0x00000004u,
+        0x00000007u, 0x00000008u, 0x000000FFu, 0x0000FFFFu, 0x00010000u,
+        0x00080000u, 0x00800000u, 0x01000000u, 0x10000000u,
+        0x7FFFFFFFu, 0x80000000u, 0xC0000000u, 0xFFFFFFFEu, 0xFFFFFFFFu,
+    };
+    const char* const sigs[]{ "[Ljava/lang/Object;", "Ljava/util/List;", "Ljava/util/Map;" };
+
+    bool all_vec_empty{ true };
+    bool all_ent_empty{ true };
+    for (const std::uint32_t o : oops)
+    {
+        for (const char* s : sigs)
+        {
+            const value_t v{ std::uint32_t{ o }, std::string{ s } };
+            if (!v.to_vector<elem_w>().empty()) { all_vec_empty = false; }
+            if (!v.to_entries<key_w, val_w>().empty()) { all_ent_empty = false; }
+        }
+    }
+    check("compressed_oop_value_sweep_to_vector_all_empty", all_vec_empty);
+    check("compressed_oop_value_sweep_to_entries_all_empty", all_ent_empty);
+}
+
+// ---------------------------------------------------------------------------
+// 7h. Cross product: EVERY variant alternative × a spread of signatures.
+//
+// test_value_t_all_alternatives_empty fixes the signature empty; the array
+// matrix fixes the alternative to uint32.  This closes the gap between them:
+// a non-uint32 alternative carrying an OBJECT-ARRAY signature still reaches the
+// gate via static_cast<uint32_t>(*this) (which narrows e.g. bool true -> 1) and
+// must come back empty — the alternative and the signature are independent
+// inputs to the same never-throw contract.
+// ---------------------------------------------------------------------------
+static auto test_value_t_alternative_signature_cross() -> void
+{
+    const value_t alts[]{
+        value_t{ true },                       // -> compressed OOP 1
+        value_t{ std::int8_t{ -1 } },          // -> 0xFFFFFFFF widened
+        value_t{ std::int32_t{ 1 << 20 } },
+        value_t{ std::int64_t{ 0x1'0000'0001LL } }, // narrows to 1
+        value_t{ double{ 3.9 } },              // static_cast -> 3
+        value_t{ std::uint16_t{ 0xFFFF } },
+        value_t{ std::uint32_t{ 0x00800000u } },
+    };
+    const char* const sigs[]{
+        "[Ljava/lang/Object;",  // object-array  -> reaches the gate
+        "[[Ljava/lang/String;", // nested-array  -> reaches the gate
+        "[I",                   // primitive-array -> fall-through
+        "Ljava/util/List;",     // reference     -> collection::to_vector
+        "Ljava/util/Map;",      // reference     -> map::to_entries
+        "I",                    // scalar
+        "",                     // empty signature
+    };
+
+    bool all_empty{ true };
+    for (const auto& base : alts)
+    {
+        for (const char* s : sigs)
+        {
+            // Re-stamp the alternative with this signature (aggregate copy of the
+            // variant + an explicit signature).
+            value_t v{ base.data, std::string{ s } };
+            if (!v.to_vector<elem_w>().empty()) { all_empty = false; }
+            if (!v.to_entries<key_w, val_w>().empty()) { all_empty = false; }
+        }
+    }
+    check("alternative_signature_cross_all_empty", all_empty);
+}
+
+// ---------------------------------------------------------------------------
+// 8d. Total, disjoint partition of the six container tags across the two
+//     branches (the exhaustiveness guard for the tag lattice itself).
+//
+// Every concrete container tag is on EXACTLY ONE side of the hierarchy:
+// collection-side (collection/list/set/linked_list) XOR map-side (map/hash_map).
+// is_base_of pairs are checked elsewhere; this pins the PARTITION is total and
+// disjoint — no tag is on both sides, none is on neither — so a future tag that
+// accidentally bridged the branches (deriving from both) would flip a side
+// count and fail here.
+// ---------------------------------------------------------------------------
+template<typename tag>
+static constexpr bool is_collection_side_v =
+    std::is_base_of_v<vmhook::collection, tag> && !std::is_base_of_v<vmhook::map, tag>;
+template<typename tag>
+static constexpr bool is_map_side_v =
+    std::is_base_of_v<vmhook::map, tag> && !std::is_base_of_v<vmhook::collection, tag>;
+
+static auto test_tag_lattice_total_partition() -> void
+{
+    // Each tag is on exactly one side (collection XOR map), never both/neither.
+    static_assert(is_collection_side_v<vmhook::collection>  && !is_map_side_v<vmhook::collection>);
+    static_assert(is_collection_side_v<vmhook::list>        && !is_map_side_v<vmhook::list>);
+    static_assert(is_collection_side_v<vmhook::set>         && !is_map_side_v<vmhook::set>);
+    static_assert(is_collection_side_v<vmhook::linked_list> && !is_map_side_v<vmhook::linked_list>);
+    static_assert(is_map_side_v<vmhook::map>                && !is_collection_side_v<vmhook::map>);
+    static_assert(is_map_side_v<vmhook::hash_map>           && !is_collection_side_v<vmhook::hash_map>);
+
+    // Count form: exactly 4 collection-side, exactly 2 map-side, summing to all 6.
+    constexpr int collection_side{
+        static_cast<int>(is_collection_side_v<vmhook::collection>)
+        + static_cast<int>(is_collection_side_v<vmhook::list>)
+        + static_cast<int>(is_collection_side_v<vmhook::set>)
+        + static_cast<int>(is_collection_side_v<vmhook::linked_list>)
+        + static_cast<int>(is_collection_side_v<vmhook::map>)
+        + static_cast<int>(is_collection_side_v<vmhook::hash_map>) };
+    constexpr int map_side{
+        static_cast<int>(is_map_side_v<vmhook::collection>)
+        + static_cast<int>(is_map_side_v<vmhook::list>)
+        + static_cast<int>(is_map_side_v<vmhook::set>)
+        + static_cast<int>(is_map_side_v<vmhook::linked_list>)
+        + static_cast<int>(is_map_side_v<vmhook::map>)
+        + static_cast<int>(is_map_side_v<vmhook::hash_map>) };
+    static_assert(collection_side == 4, "exactly 4 collection-side container tags.");
+    static_assert(map_side == 2, "exactly 2 map-side container tags.");
+    static_assert(collection_side + map_side == 6, "the partition covers all six tags exactly once.");
+
+    check("tag_lattice_partition_collection_side_is_4", collection_side == 4);
+    check("tag_lattice_partition_map_side_is_2", map_side == 2);
+    check("tag_lattice_partition_total_is_6", (collection_side + map_side) == 6);
+}
+
 int main()
 {
     // Registering the element wrappers mirrors real usage; harmless with no JVM.
@@ -1042,10 +1405,15 @@ int main()
     test_default_value_t_empty();
     test_value_t_all_alternatives_empty();
     test_value_t_array_signature_matrix();
+    test_value_t_array_gate_byte_sweep();
+    test_value_t_variant_completeness();
+    test_value_t_compressed_oop_value_sweep();
+    test_value_t_alternative_signature_cross();
     test_value_t_signature_robustness();
     test_value_t_via_field_proxy_empty();
     test_field_proxy_all_signatures_empty();
     test_value_t_call_forms();
+    test_tag_lattice_total_partition();
 
     return failures == 0 ? 0 : 1;
 }

@@ -108,3 +108,24 @@ vmhook_add_test(method_enumeration             SOURCES test_method_enumeration.c
 vmhook_add_test(classloader_reanchor           SOURCES test_classloader_reanchor.cpp)
 vmhook_add_test(jni_forwarders                  SOURCES test_jni_forwarders.cpp)
 vmhook_add_test(find_class_contracts           SOURCES test_find_class_contracts.cpp)
+vmhook_add_test(traits_function_traits         SOURCES test_traits_function_traits.cpp)
+vmhook_add_test(make_unique                     SOURCES test_make_unique.cpp)
+vmhook_add_test(os_page_size_granularity       SOURCES test_os_page_size_granularity.cpp)
+# logging_format only reaches the std::cout sink (VMHOOK_LOG_FILE undefined).
+# The opt-in FILE sink (detail::emit_log_line's `#ifdef VMHOOK_LOG_FILE` arm)
+# is selected at compile time, so it gets two dedicated TUs built with
+# -DVMHOOK_LOG_FILE set to a per-build path.  VMHOOK_TEST_LOG_PATH carries the
+# SAME path as a plain string the test reads back / checks for.  Forward slashes
+# work in C++ file opens on every platform incl. Windows; the writable file
+# lives directly in CMAKE_BINARY_DIR (which always exists), the unwritable one
+# inside a directory that is intentionally never created.
+set(_vmhook_log_file "${CMAKE_BINARY_DIR}/vmhook_test_filelog.log")
+set(_vmhook_bad_log_file "${CMAKE_BINARY_DIR}/vmhook_no_such_dir/vmhook_test_filelog.log")
+vmhook_add_test(logging_logfile                 SOURCES test_logging_logfile.cpp)
+target_compile_definitions("vmhook_test_logging_logfile" PRIVATE
+    "VMHOOK_LOG_FILE=\"${_vmhook_log_file}\""
+    "VMHOOK_TEST_LOG_PATH=\"${_vmhook_log_file}\"")
+vmhook_add_test(logging_logfile_unwritable      SOURCES test_logging_logfile_unwritable.cpp)
+target_compile_definitions("vmhook_test_logging_logfile_unwritable" PRIVATE
+    "VMHOOK_LOG_FILE=\"${_vmhook_bad_log_file}\""
+    "VMHOOK_TEST_LOG_PATH=\"${_vmhook_bad_log_file}\"")
