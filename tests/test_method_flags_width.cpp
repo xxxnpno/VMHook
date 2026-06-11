@@ -33,10 +33,12 @@
 #include <vmhook/vmhook.hpp>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <type_traits>
 
 static int failures{ 0 };
@@ -91,6 +93,30 @@ namespace flags_layout
     // (JDK 11..20) band.  1u << 2 fits inside u1/u2/u4 alike — only the ACCESS
     // WIDTH must vary per band, never the mask's representability.
     constexpr std::uint32_t dont_inline_mask_supported = (1u << 2);
+
+    // ── JDK 21+ MethodFlags::_status bit positions (verified against OpenJDK
+    //    methodFlags.hpp on jdk21u and master) ────────────────────────────────
+    //    These are the bits the JDK 24 relocation (JDK-8339113) moved OUT of the
+    //    u4 AccessFlags and INTO MethodFlags::_status — the not_compilable /
+    //    queued group lives here on JDK 21+ (already true at 21; AccessFlags
+    //    shrank to u2 at 24).  _dont_inline shares this word at bit 12.
+    namespace methodflags_status_bit
+    {
+        constexpr int queued_for_compilation = 7;   // was JVM_ACC_QUEUED
+        constexpr int is_not_c2_compilable   = 8;   // was JVM_ACC_NOT_C2_COMPILABLE
+        constexpr int is_not_c1_compilable   = 9;   // was JVM_ACC_NOT_C1_COMPILABLE
+        constexpr int is_not_c2_osr          = 10;  // was JVM_ACC_NOT_C2_OSR_COMPILABLE
+        constexpr int force_inline           = 11;
+        constexpr int dont_inline            = 12;
+    }
+
+    // The u4 _status offset is provably (_intrinsic_id_offset - 4) on JDK 21+
+    // because the u4 _status is the field immediately before the u2 _intrinsic_id
+    // in the C++ Method layout.
+    constexpr std::uint64_t status_offset_from_intrinsic(std::uint64_t intrinsic_id_offset)
+    {
+        return intrinsic_id_offset - 4;
+    }
 }
 
 // Compile-time pinning of the layout contract (a future width-aware accessor
@@ -107,6 +133,22 @@ static_assert(flags_layout::jdk24_26.access_flags_width == 2
               "AccessFlags shrank u4 -> u2 in JDK 24 (JDK-8339113)");
 static_assert((flags_layout::dont_inline_mask_supported & 0xFFFFu) == flags_layout::dont_inline_mask_supported,
               "the _dont_inline mask fits in the low 16 bits (u2-safe)");
+
+// JDK 24 (JDK-8339113) relocated the C1/C2/OSR-compiled + queued bits OUT of the
+// (now u2) AccessFlags and INTO MethodFlags::_status bits 7..10; _dont_inline
+// shares the same u4 _status at bit 12.  Pin those positions and prove they all
+// live ABOVE the 16-bit boundary that a u2 read of _flags (JDK 11..20) could see,
+// i.e. they are only reachable through the JDK 21+ u4 path.
+static_assert(flags_layout::methodflags_status_bit::queued_for_compilation == 7
+              && flags_layout::methodflags_status_bit::is_not_c2_compilable == 8
+              && flags_layout::methodflags_status_bit::is_not_c1_compilable == 9
+              && flags_layout::methodflags_status_bit::is_not_c2_osr == 10,
+              "JDK 24 moved not_compilable/queued into MethodFlags::_status bits 7..10");
+static_assert(flags_layout::methodflags_status_bit::dont_inline == 12
+              && flags_layout::methodflags_status_bit::force_inline == 11,
+              "MethodFlags _dont_inline=bit12 / _force_inline=bit11 (JDK 21+)");
+static_assert(flags_layout::status_offset_from_intrinsic(44) == 40,
+              "u4 _status sits 4 bytes before u2 _intrinsic_id");
 
 // ─────────────────────────────────────────────────────────────────────────
 //  1. set_dont_inline(nullptr, ...) is a crash-free no-op.
@@ -248,6 +290,435 @@ static auto test_layout_contract_runtime() -> void
           (dont_inline_mask_supported & 0xFFFFu) == dont_inline_mask_supported);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  6. EXHAUSTIVE per-JDK sweep of the pure offset/width/bit DERIVATION.
+//
+//  derive_method_flags_layout() is the width/offset/bit-correct heart of the
+//  FACET-A fix, factored out as a pure function so it can be driven WITHOUT a
+//  JVM.  For every supported JDK band we synthesise the exact VMStructs evidence
+//  that HotSpot exports on that version (verified against OpenJDK method.hpp /
+//  methodFlags.hpp / vmStructs.cpp on jdk8u, jdk11u, jdk17u/18, jdk21u, master)
+//  and assert the derived (offset, width, bit, confident) matches that JDK's
+//  REAL Method::_flags layout.  These are the asserts that pin the JDK 21+
+//  derivation (offset = _intrinsic_id - 4, width 4, bit 12) and prove the
+//  confident-guard refuses JDK 8 and every degenerate input.
+// ─────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+    using vmhook::hotspot::derive_method_flags_layout;
+    using vmhook::hotspot::method_flags_evidence;
+    using vmhook::hotspot::method_flags_layout;
+
+    // Evidence as HotSpot exports it on each band.  Offsets are realistic 64-bit
+    // Method offsets; the DERIVATION only depends on the relative arithmetic
+    // (_intrinsic_id - 4) and the type strings, not the absolute value, and the
+    // sweep below also varies the absolute offset to prove that.
+    constexpr method_flags_evidence evidence_jdk8{
+        /*flags_present*/ false, /*flags_type*/ nullptr, /*flags_offset*/ 0,
+        /*intrinsic_id_present*/ true, /*intrinsic_id_type*/ "u1", /*intrinsic_id_offset*/ 42 };
+
+    constexpr method_flags_evidence evidence_jdk11_20{
+        /*flags_present*/ true, /*flags_type*/ "u2", /*flags_offset*/ 44,
+        /*intrinsic_id_present*/ true, /*intrinsic_id_type*/ "u2", /*intrinsic_id_offset*/ 42 };
+
+    constexpr method_flags_evidence evidence_jdk21_23{
+        /*flags_present*/ false, /*flags_type*/ nullptr, /*flags_offset*/ 0,
+        /*intrinsic_id_present*/ true, /*intrinsic_id_type*/ "u2", /*intrinsic_id_offset*/ 44 };
+
+    // JDK 24..26: _flags layout is identical to 21..23 (the JDK 24 change was to
+    // _access_flags width + relocating the not_compilable bits, NOT to _flags).
+    constexpr method_flags_evidence evidence_jdk24_26{
+        /*flags_present*/ false, /*flags_type*/ nullptr, /*flags_offset*/ 0,
+        /*intrinsic_id_present*/ true, /*intrinsic_id_type*/ "u2", /*intrinsic_id_offset*/ 44 };
+}
+
+// Pin the derivation at COMPILE TIME for every band (derive_method_flags_layout
+// is constexpr) — a regression in the offset/width/bit logic fails the build.
+static_assert(!derive_method_flags_layout(evidence_jdk8).confident,
+              "JDK 8 (u1 _intrinsic_id, no _flags) must NOT be confidently placed");
+static_assert(derive_method_flags_layout(evidence_jdk11_20).confident
+              && derive_method_flags_layout(evidence_jdk11_20).width_bytes == 2
+              && derive_method_flags_layout(evidence_jdk11_20).dont_inline_bit == 2
+              && derive_method_flags_layout(evidence_jdk11_20).offset == 44,
+              "JDK 11..20: exported u2 _flags @offset, bit 2");
+static_assert(derive_method_flags_layout(evidence_jdk21_23).confident
+              && derive_method_flags_layout(evidence_jdk21_23).width_bytes == 4
+              && derive_method_flags_layout(evidence_jdk21_23).dont_inline_bit == 12
+              && derive_method_flags_layout(evidence_jdk21_23).offset == 40,
+              "JDK 21..23: derived u4 _status @ (_intrinsic_id-4)=40, bit 12");
+static_assert(derive_method_flags_layout(evidence_jdk24_26).confident
+              && derive_method_flags_layout(evidence_jdk24_26).width_bytes == 4
+              && derive_method_flags_layout(evidence_jdk24_26).dont_inline_bit == 12
+              && derive_method_flags_layout(evidence_jdk24_26).offset == 40,
+              "JDK 24..26: derived u4 _status @ (_intrinsic_id-4)=40, bit 12");
+
+static auto test_derivation_per_jdk() -> void
+{
+    // --- JDK 8: u1 _intrinsic_id, no exported _flags -> REFUSE (safe no-op) ---
+    {
+        const method_flags_layout layout{ derive_method_flags_layout(evidence_jdk8) };
+        check("derive_jdk8_refuses_no_confident_slot", !layout.confident);
+        check("derive_jdk8_width_and_bit_zeroed",
+              layout.width_bytes == 0 && layout.dont_inline_bit == 0 && layout.offset == 0);
+    }
+
+    // --- JDK 11..20: Path A, exported u2 _flags, bit 2, offset verbatim -------
+    {
+        const method_flags_layout layout{ derive_method_flags_layout(evidence_jdk11_20) };
+        check("derive_jdk11_20_confident", layout.confident);
+        check("derive_jdk11_20_width_u2", layout.width_bytes == 2);
+        check("derive_jdk11_20_bit2", layout.dont_inline_bit == flags_layout::jdk11_20.dont_inline_bit);
+        check("derive_jdk11_20_offset_is_exported_flags_offset",
+              layout.offset == evidence_jdk11_20.flags_offset);
+    }
+
+    // --- JDK 21..23: Path B, derived u4 _status @ intrinsic-4, bit 12 ---------
+    {
+        const method_flags_layout layout{ derive_method_flags_layout(evidence_jdk21_23) };
+        check("derive_jdk21_23_confident", layout.confident);
+        check("derive_jdk21_23_width_u4", layout.width_bytes == 4);
+        check("derive_jdk21_23_bit12", layout.dont_inline_bit == flags_layout::jdk21_23.dont_inline_bit);
+        check("derive_jdk21_23_offset_is_intrinsic_minus_4",
+              layout.offset == flags_layout::status_offset_from_intrinsic(evidence_jdk21_23.intrinsic_id_offset)
+              && layout.offset == evidence_jdk21_23.intrinsic_id_offset - 4);
+    }
+
+    // --- JDK 24..26: identical _flags placement to 21..23 (u4 _status, bit12) -
+    // The JDK 24 change (AccessFlags u4->u2, not_compilable bits -> _status 7..10)
+    // does NOT move _flags, so the derivation is byte-for-byte the same.
+    {
+        const method_flags_layout layout{ derive_method_flags_layout(evidence_jdk24_26) };
+        check("derive_jdk24_26_confident", layout.confident);
+        check("derive_jdk24_26_width_u4", layout.width_bytes == 4);
+        check("derive_jdk24_26_bit12", layout.dont_inline_bit == flags_layout::jdk24_26.dont_inline_bit);
+        check("derive_jdk24_26_offset_is_intrinsic_minus_4",
+              layout.offset == evidence_jdk24_26.intrinsic_id_offset - 4);
+        const method_flags_layout layout21{ derive_method_flags_layout(evidence_jdk21_23) };
+        check("derive_jdk24_26_flags_layout_matches_jdk21",
+              layout.width_bytes == layout21.width_bytes
+              && layout.dont_inline_bit == layout21.dont_inline_bit);
+    }
+
+    // --- Absolute-offset independence: Path B derivation is purely relative. ---
+    // Sweep a range of realistic _intrinsic_id offsets; the derived _status
+    // offset must always be exactly intrinsic-4, width 4, bit 12.
+    {
+        bool all_relative_ok{ true };
+        for (std::uint64_t intrinsic_off : { std::uint64_t{ 40 }, std::uint64_t{ 44 },
+                                             std::uint64_t{ 48 }, std::uint64_t{ 56 },
+                                             std::uint64_t{ 100 } })
+        {
+            method_flags_evidence ev{};
+            ev.intrinsic_id_present = true;
+            ev.intrinsic_id_type   = "u2";
+            ev.intrinsic_id_offset = intrinsic_off;
+            const method_flags_layout layout{ derive_method_flags_layout(ev) };
+            all_relative_ok = all_relative_ok
+                && layout.confident
+                && layout.offset == intrinsic_off - 4
+                && layout.width_bytes == 4
+                && layout.dont_inline_bit == 12;
+        }
+        check("derive_pathB_offset_is_always_intrinsic_minus_4", all_relative_ok);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  7. CONFIDENT-OFFSET GUARD: derive_method_flags_layout REFUSES every unsafe
+//     or unknown input (no write may ever be issued from a guess).
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_confident_guard_refusals() -> void
+{
+    // (a) Wholly empty evidence (no JVM / nothing exported) -> not confident.
+    check("guard_empty_evidence_refuses",
+          !derive_method_flags_layout(method_flags_evidence{}).confident);
+
+    // (b) _flags present but type unknown/empty/non-u2 AND no usable
+    //     _intrinsic_id -> refuse (never blind-trust an offset of unknown width).
+    {
+        method_flags_evidence ev{};
+        ev.flags_present = true;
+        ev.flags_type   = "u1";       // e.g. a hypothetical u1 export
+        ev.flags_offset = 44;
+        check("guard_flags_u1_only_refuses", !derive_method_flags_layout(ev).confident);
+
+        ev.flags_type = "";           // empty type string
+        check("guard_flags_empty_type_refuses", !derive_method_flags_layout(ev).confident);
+
+        ev.flags_type = nullptr;      // null type string
+        check("guard_flags_null_type_refuses", !derive_method_flags_layout(ev).confident);
+
+        ev.flags_type = "MethodFlags"; // u4 object, NOT the legacy u2
+        check("guard_flags_methodflags_type_alone_refuses",
+              !derive_method_flags_layout(ev).confident);
+    }
+
+    // (c) JDK-8-shaped: _intrinsic_id present but u1 -> Path B must refuse (this
+    //     is the single check that keeps a u4 bit-12 write off a JDK 8 Method).
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type   = "u1";
+        ev.intrinsic_id_offset = 42;
+        check("guard_intrinsic_u1_refuses_pathB", !derive_method_flags_layout(ev).confident);
+    }
+
+    // (d) _intrinsic_id u2 but offset < 4 -> underflow guard refuses.
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type   = "u2";
+        ev.intrinsic_id_offset = 0;
+        check("guard_intrinsic_offset0_refuses", !derive_method_flags_layout(ev).confident);
+        ev.intrinsic_id_offset = 3;
+        check("guard_intrinsic_offset3_refuses", !derive_method_flags_layout(ev).confident);
+    }
+
+    // (e) _intrinsic_id u2 but offset not 4-byte aligned -> layout-mismatch
+    //     guard refuses (the u4 _status must be 4-aligned; if _intrinsic_id at
+    //     _status+4 is not 4-aligned the layout is not the verified one).
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type   = "u2";
+        ev.intrinsic_id_offset = 46;  // 46 % 4 == 2
+        check("guard_intrinsic_misaligned_refuses", !derive_method_flags_layout(ev).confident);
+        ev.intrinsic_id_offset = 45;  // odd
+        check("guard_intrinsic_odd_offset_refuses", !derive_method_flags_layout(ev).confident);
+    }
+
+    // (f) _intrinsic_id present but type null/empty -> refuse.
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type   = nullptr;
+        ev.intrinsic_id_offset = 44;
+        check("guard_intrinsic_null_type_refuses", !derive_method_flags_layout(ev).confident);
+        ev.intrinsic_id_type = "";
+        check("guard_intrinsic_empty_type_refuses", !derive_method_flags_layout(ev).confident);
+    }
+
+    // (g) Path A WINS over Path B when both are usable (JDK 11..20 has BOTH an
+    //     exported u2 _flags AND a u2 _intrinsic_id) — must pick the exported u2
+    //     _flags (bit 2), never the derived path (bit 12).
+    {
+        method_flags_evidence ev{};
+        ev.flags_present        = true;
+        ev.flags_type           = "u2";
+        ev.flags_offset         = 44;
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type    = "u2";
+        ev.intrinsic_id_offset  = 48;
+        const method_flags_layout layout{ derive_method_flags_layout(ev) };
+        check("guard_pathA_precedence_over_pathB",
+              layout.confident && layout.width_bytes == 2
+              && layout.dont_inline_bit == 2 && layout.offset == 44);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  8. WIDTH MATRIX / ATOMIC TOGGLE on a FAKE Method buffer, exercising the
+//     SAME width/bit logic set_dont_inline applies — but driven through
+//     derive_method_flags_layout (which needs no JVM) + a hand-rolled toggle
+//     mirroring set_dont_inline's width dispatch.  This proves the toggle only
+//     touches sizeof(field) bytes at the derived offset and never the neighbour
+//     (the adjacent-byte anti-clobber proof the live-JVM module also wants).
+//
+//  NOTE: this does NOT call set_dont_inline (its real get/resolve path reads the
+//  absent gHotSpotVMStructs and no-ops with no JVM); it validates the arithmetic
+//  + write-width contract that set_dont_inline is built on, per-band.
+// ─────────────────────────────────────────────────────────────────────────
+namespace
+{
+    // Apply the exact width/bit dispatch set_dont_inline uses, to a raw buffer.
+    auto toggle_like_set_dont_inline(std::uint8_t* const base,
+                                     const method_flags_layout& layout,
+                                     const bool enabled) -> void
+    {
+        if (!layout.confident)
+        {
+            return;
+        }
+        void* const address{ base + layout.offset };
+        if (layout.width_bytes == 2 && layout.dont_inline_bit < 16)
+        {
+            const std::uint16_t mask{ static_cast<std::uint16_t>(1u << layout.dont_inline_bit) };
+            std::atomic_ref<std::uint16_t> word{ *static_cast<std::uint16_t*>(address) };
+            if (enabled) { word.fetch_or(mask, std::memory_order_acq_rel); }
+            else         { word.fetch_and(static_cast<std::uint16_t>(~mask), std::memory_order_acq_rel); }
+        }
+        else if (layout.width_bytes == 4 && layout.dont_inline_bit < 32)
+        {
+            const std::uint32_t mask{ 1u << layout.dont_inline_bit };
+            std::atomic_ref<std::uint32_t> word{ *static_cast<std::uint32_t*>(address) };
+            if (enabled) { word.fetch_or(mask, std::memory_order_acq_rel); }
+            else         { word.fetch_and(~mask, std::memory_order_acq_rel); }
+        }
+    }
+
+    // Read the toggled word back at the derived width.
+    auto read_word(const std::uint8_t* const base, const method_flags_layout& layout) -> std::uint32_t
+    {
+        const void* const address{ base + layout.offset };
+        if (layout.width_bytes == 2)
+        {
+            std::uint16_t v{};
+            std::memcpy(&v, address, sizeof(v));
+            return v;
+        }
+        std::uint32_t v{};
+        std::memcpy(&v, address, sizeof(v));
+        return v;
+    }
+}
+
+static auto test_width_matrix_anti_clobber() -> void
+{
+    struct case_t { const char* tag; method_flags_evidence ev; };
+    const case_t cases[]{
+        { "jdk11_20_u2", evidence_jdk11_20 },
+        { "jdk21_23_u4", evidence_jdk21_23 },
+        { "jdk24_26_u4", evidence_jdk24_26 },
+    };
+
+    for (const case_t& c : cases)
+    {
+        const method_flags_layout layout{ derive_method_flags_layout(c.ev) };
+        // All three are confident; if not, the derivation regressed.
+        if (!layout.confident)
+        {
+            check((std::string{ "width_matrix_" } + c.tag + "_confident").c_str(), false);
+            continue;
+        }
+
+        // Lay a fake Method: fill with a sentinel, snapshot, toggle the bit on
+        // then off, and prove (a) the bit toggled INSIDE the slot and (b) every
+        // byte OUTSIDE [offset, offset+width) is byte-for-byte unchanged.
+        alignas(16) std::array<std::uint8_t, 128> buffer{};
+        buffer.fill(0xA5);
+        // Make the slot start cleared so the on/off transition is observable.
+        std::memset(buffer.data() + layout.offset, 0x00, static_cast<std::size_t>(layout.width_bytes));
+        const std::array<std::uint8_t, 128> snapshot_after_clear{ buffer };
+
+        // (1) set the bit.
+        toggle_like_set_dont_inline(buffer.data(), layout, /*enabled*/ true);
+        const std::uint32_t after_set{ read_word(buffer.data(), layout) };
+        check((std::string{ "width_matrix_" } + c.tag + "_bit_set_inside_slot").c_str(),
+              (after_set & (1u << layout.dont_inline_bit)) != 0u);
+
+        // (1b) ONLY the dont_inline bit moved within the slot.
+        check((std::string{ "width_matrix_" } + c.tag + "_only_target_bit_set").c_str(),
+              after_set == (1u << layout.dont_inline_bit));
+
+        // (1c) Anti-clobber: bytes OUTSIDE the slot are unchanged after the SET.
+        bool outside_intact_set{ true };
+        for (std::size_t i{ 0 }; i < buffer.size(); ++i)
+        {
+            const bool inside{ i >= layout.offset
+                               && i < layout.offset + static_cast<std::size_t>(layout.width_bytes) };
+            if (!inside && buffer[i] != snapshot_after_clear[i]) { outside_intact_set = false; break; }
+        }
+        check((std::string{ "width_matrix_" } + c.tag + "_set_no_adjacent_clobber").c_str(),
+              outside_intact_set);
+
+        // (2) clear the bit.
+        toggle_like_set_dont_inline(buffer.data(), layout, /*enabled*/ false);
+        const std::uint32_t after_clear{ read_word(buffer.data(), layout) };
+        check((std::string{ "width_matrix_" } + c.tag + "_bit_cleared_inside_slot").c_str(),
+              (after_clear & (1u << layout.dont_inline_bit)) == 0u && after_clear == 0u);
+
+        // (2b) Anti-clobber: bytes OUTSIDE the slot still match the original.
+        bool outside_intact_clear{ true };
+        for (std::size_t i{ 0 }; i < buffer.size(); ++i)
+        {
+            const bool inside{ i >= layout.offset
+                               && i < layout.offset + static_cast<std::size_t>(layout.width_bytes) };
+            if (!inside && buffer[i] != snapshot_after_clear[i]) { outside_intact_clear = false; break; }
+        }
+        check((std::string{ "width_matrix_" } + c.tag + "_clear_no_adjacent_clobber").c_str(),
+              outside_intact_clear);
+    }
+
+    // Idempotency: setting twice leaves the slot identical to setting once, and
+    // no sibling bit moves.  Use the u4 (JDK 21+) case (the path the fix adds).
+    {
+        const method_flags_layout layout{ derive_method_flags_layout(evidence_jdk21_23) };
+        alignas(16) std::array<std::uint8_t, 128> buffer{};
+        buffer.fill(0x00);
+        // Seed a few unrelated sibling bits in the slot that must survive.
+        const std::uint32_t siblings{ (1u << 7) | (1u << 9) | (1u << 20) };  // queued, not_c1, a high bit
+        std::memcpy(buffer.data() + layout.offset, &siblings, sizeof(siblings));
+
+        toggle_like_set_dont_inline(buffer.data(), layout, true);
+        const std::uint32_t once{ read_word(buffer.data(), layout) };
+        toggle_like_set_dont_inline(buffer.data(), layout, true);
+        const std::uint32_t twice{ read_word(buffer.data(), layout) };
+
+        check("width_matrix_u4_set_idempotent", once == twice);
+        check("width_matrix_u4_set_preserves_siblings",
+              (twice & siblings) == siblings && (twice & (1u << 12)) != 0u);
+
+        // Clearing dont_inline must preserve those siblings too.
+        toggle_like_set_dont_inline(buffer.data(), layout, false);
+        const std::uint32_t cleared{ read_word(buffer.data(), layout) };
+        check("width_matrix_u4_clear_preserves_siblings",
+              cleared == siblings && (cleared & (1u << 12)) == 0u);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  9. ATOMICITY: concurrent toggles of _dont_inline must not lose an unrelated
+//     in-word bit a "JIT thread" is OR-ing in.  Mirrors set_dont_inline's
+//     atomic fetch_or/fetch_and at the JDK 21+ u4 width on a fake _status word.
+//     (After the fetch_or/fetch_and fix this is race-safe; a plain |=/&= would
+//     intermittently drop the sibling bit.)
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_atomic_toggle_preserves_sibling() -> void
+{
+    const method_flags_layout layout{ derive_method_flags_layout(evidence_jdk21_23) };
+    alignas(16) std::array<std::uint8_t, 64> buffer{};
+    buffer.fill(0x00);
+
+    constexpr int iterations{ 20000 };
+    constexpr std::uint32_t sibling_bit{ 1u << 7 };   // e.g. queued_for_compilation
+
+    std::atomic<bool> go{ false };
+
+    // Writer A: hammer dont_inline (bit 12) set/clear via the atomic toggle.
+    std::thread toggler{ [&]
+    {
+        while (!go.load(std::memory_order_acquire)) { }
+        for (int i{ 0 }; i < iterations; ++i)
+        {
+            toggle_like_set_dont_inline(buffer.data(), layout, (i & 1) != 0);
+        }
+    } };
+
+    // Writer B: a stand-in "JIT thread" atomically OR-ing the sibling bit in.
+    std::thread jit{ [&]
+    {
+        std::atomic_ref<std::uint32_t> word{
+            *reinterpret_cast<std::uint32_t*>(buffer.data() + layout.offset) };
+        while (!go.load(std::memory_order_acquire)) { }
+        for (int i{ 0 }; i < iterations; ++i)
+        {
+            word.fetch_or(sibling_bit, std::memory_order_acq_rel);
+        }
+    } };
+
+    go.store(true, std::memory_order_release);
+    toggler.join();
+    jit.join();
+
+    const std::uint32_t final_word{ read_word(buffer.data(), layout) };
+    // The sibling bit, once set by the last JIT iteration, must NOT have been
+    // clobbered by a non-atomic dont_inline RMW.  With atomic fetch_or/fetch_and
+    // this is guaranteed; the assertion would flake under a plain |=/&=.
+    check("atomic_toggle_does_not_clobber_sibling_bit",
+          (final_word & sibling_bit) == sibling_bit);
+}
+
 int main()
 {
     test_set_dont_inline_null();
@@ -255,6 +726,10 @@ int main()
     test_flag_accessors_no_jvm_null();
     test_method_proxy_is_static_no_jvm();
     test_layout_contract_runtime();
+    test_derivation_per_jdk();
+    test_confident_guard_refusals();
+    test_width_matrix_anti_clobber();
+    test_atomic_toggle_preserves_sibling();
 
     std::printf("\n%s: %d failure(s)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;

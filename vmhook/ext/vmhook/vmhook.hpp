@@ -2355,18 +2355,27 @@ namespace vmhook
                 @details
                 These flags encode HotSpot-internal method properties such as _dont_inline.
 
-                The width and even the existence of Method::_flags in gHotSpotVMStructs
-                varies across HotSpot versions, and this accessor returns a
-                std::uint16_t* — so it is only correct to dereference when the live
-                field really is a 2-byte (u2) word.  Verified HotSpot reality:
+                SCOPE: this accessor is the U2-WIDTH READ view of Method::_flags only.
+                It returns a live std::uint16_t* exclusively on the JDK 11..20 band
+                where the field really IS an exported 2-byte `u2 _flags` (the band
+                whose _dont_inline sits at bit 2), and nullptr everywhere else.  The
+                WRITE side — and the cross-JDK width/offset/bit correctness — lives in
+                set_dont_inline() / resolve_method_flags_slot(), which on JDK 21+
+                reaches the relocated MethodFlags u4 `_status` (bit 12) via a derived
+                offset.  This accessor is deliberately NOT widened to follow it: its
+                one consumer beyond set_dont_inline is the dont_inline_dont_compile
+                test module, which reads it as a u16 and checks bit 2; widening it
+                would make that readback test interpret a u4 _status as if bit 2 were
+                _dont_inline (it is _is_old on JDK 21+).  Keeping get_flags() u2-only
+                preserves that contract and the module's documented [INFO] downgrade on
+                JDK 21+.  Verified HotSpot reality:
 
                   JDK 8 (incl. 8u442):  flags live in a `u1` bitfield group
                                         (_dont_inline : 1, ...); there is NO member
                                         literally named `_flags`, and
                                         gHotSpotVMStructs exports NO Method::_flags
                                         entry.  iterate_struct_entries(...) -> nullptr,
-                                        so this returns nullptr (set_dont_inline is a
-                                        safe no-op).
+                                        so this returns nullptr.
                   JDK 11 .. 20:         `mutable u2 _flags`, with _dont_inline == 1<<2,
                                         exported as `nonstatic_field(Method,_flags,u2)`.
                                         This is the ONLY band where the pointer is
@@ -2376,22 +2385,22 @@ namespace vmhook
                   24/25/26):            _status), _dont_inline moved to bit 12, and
                                         the compilability bits relocated there too.
                                         gHotSpotVMStructs exports NO Method::_flags
-                                        entry, so this again returns nullptr (no-op).
+                                        entry, so this returns nullptr here; the WRITE
+                                        path reaches the field via the derived offset
+                                        in resolve_method_flags_slot() instead.
 
                 Net: on every shipping JDK the entry is either absent (8, 21+) or
-                present and exactly `u2` (11-20), so a fixed u2 read/write can never
+                present and exactly `u2` (11-20), so this fixed u2 read can never
                 reach a u1/u4 field and cannot clobber an adjacent Method field.
 
                 The type_string guard below makes that invariant explicit and
                 defensive: if some custom / future HotSpot ever DID export
                 Method::_flags at a non-u2 width, we refuse the (now mismatched)
-                u2 access and return nullptr — turning a would-be wrong-width write
-                into the same safe no-op we already exhibit on JDK 8 / 21+, rather
-                than scribbling 2 bytes over a u1 field or under-writing a u4 field.
-                We only reject on a POSITIVE width mismatch: an absent/empty
-                type_string is treated as "trust the entry" so behaviour on real
-                JDK 11-20 (where type_string == "u2") is byte-for-byte unchanged.
-                Detection mirrors the existing _java_mirror OopHandle dispatch.
+                u2 access and return nullptr.  We only reject on a POSITIVE width
+                mismatch: an absent/empty type_string is treated as "trust the entry"
+                so behaviour on real JDK 11-20 (where type_string == "u2") is
+                byte-for-byte unchanged.  Detection mirrors the existing _java_mirror
+                OopHandle dispatch.
             */
             auto get_flags() const
                 -> std::uint16_t*
@@ -6259,6 +6268,212 @@ namespace vmhook
         }
 
         /*
+            @brief Resolved location of HotSpot's _dont_inline flag inside a live Method.
+            @details
+            Describes WHERE the _dont_inline bit lives for the running JDK and how
+            WIDE the surrounding word is, so set_dont_inline() can do a width-correct
+            read-modify-write instead of a fixed u2 access.
+
+            - address          : &Method::_flags (JDK 11..20) or &MethodFlags::_status
+                                 (JDK 21+), or nullptr when the slot cannot be located.
+            - width_bytes      : 2 (u2 _flags, JDK 11..20) or 4 (u4 _status, JDK 21+);
+                                 0 when unresolved.
+            - dont_inline_bit  : 2 (JDK 11..20) or 12 (JDK 21+, MethodFlags).
+            - confident        : true ONLY when (address,width_bytes,dont_inline_bit)
+                                 were derived from VMStructs evidence that uniquely
+                                 identifies the running layout.  set_dont_inline()
+                                 refuses to write unless this is true — a wrong write
+                                 corrupts a live Method, so an unconfident result is a
+                                 safe no-op (the deopt/settle path still inhibits JIT
+                                 inlining of the hooked method).
+        */
+        struct method_flags_slot
+        {
+            void* address{ nullptr };
+            int   width_bytes{ 0 };
+            int   dont_inline_bit{ 0 };
+            bool  confident{ false };
+        };
+
+        /*
+            @brief Pure VMStructs evidence about Method::_flags and Method::_intrinsic_id.
+            @details
+            The raw facts resolve_method_flags_slot() reads out of gHotSpotVMStructs,
+            packaged so the (offset,width,bit) DECISION can be computed by a pure
+            function with no JVM and unit-tested exhaustively per JDK.  A field that is
+            not exported has its `*_present` flag false; `*_type` is the VMStruct
+            type_string ("u1"/"u2"/...) or nullptr; `*_offset` is the byte offset.
+        */
+        struct method_flags_evidence
+        {
+            bool          flags_present{ false };
+            const char*   flags_type{ nullptr };
+            std::uint64_t flags_offset{ 0 };
+            bool          intrinsic_id_present{ false };
+            const char*   intrinsic_id_type{ nullptr };
+            std::uint64_t intrinsic_id_offset{ 0 };
+        };
+
+        /*
+            @brief Result of the pure layout decision: where/how wide _dont_inline is.
+            @details
+            `offset` is the byte offset of the flags word from the Method base;
+            valid only when `confident`.  Same width/bit semantics as method_flags_slot.
+        */
+        struct method_flags_layout
+        {
+            std::uint64_t offset{ 0 };
+            int           width_bytes{ 0 };
+            int           dont_inline_bit{ 0 };
+            bool          confident{ false };
+        };
+
+        /*
+            @brief Decides the (offset,width,bit) of _dont_inline from VMStructs evidence.
+            @details
+            The width/offset/bit-correct heart of the Method-flags fix, factored out as
+            a PURE function (no JVM, no live Method) so every supported JDK's layout can
+            be swept in a standalone unit test.  Verified against OpenJDK sources
+            (method.hpp / methodFlags.hpp / vmStructs.cpp on jdk8u, jdk11u, jdk17u/18,
+            jdk21u and master):
+
+              JDK 8        : flags are a `u1` bitfield group declared AFTER `u1
+                             _intrinsic_id`; there is NO `_flags` member and none is
+                             exported.  `_intrinsic_id` IS exported but as `u1`.
+                             -> NEITHER path fires -> not confident -> caller no-ops
+                             (the same safe no-op JDK 8 has always exhibited).
+
+              JDK 11 .. 20 : `mutable u2 _flags`, _dont_inline == bit 2, exported as
+                             nonstatic_field(Method,_flags,u2).  Path A: use the
+                             exported offset directly, width 2, bit 2.  BYTE-IDENTICAL
+                             to the legacy behaviour.
+
+              JDK 21+      : `_flags` became a `MethodFlags` object wrapping `u4
+              (incl.         _status`; _dont_inline RELOCATED to bit 12 and the
+              24/25/26)      compilability bits moved into _status too.  `_flags` is
+                             NOT exported, but `_intrinsic_id` IS (as `u2`) and is
+                             declared in C++ IMMEDIATELY AFTER `_flags`.  The u4 _status
+                             occupies exactly the 4 bytes ending where the u2
+                             _intrinsic_id begins, so its offset is provably
+                             `_intrinsic_id_offset - 4`.  Path B derives that, width 4,
+                             bit 12.
+
+            Path B is gated so it can fire ONLY on the JDK 21+ MethodFlags layout and
+            never on JDK 8 (whose `_intrinsic_id` is `u1`, not `u2`) or any layout where
+            the arithmetic is unsafe:
+              * `_flags` must be absent / not the legacy u2 (else Path A owns it);
+              * `_intrinsic_id` must be present with type EXACTLY "u2" (this single
+                check excludes JDK 8's u1 `_intrinsic_id`);
+              * its offset must be >= 4 (no underflow) and 4-byte aligned (the u4
+                _status is 4-aligned, so `_intrinsic_id` at _status+4 must be too — if
+                it is not, the layout is not the one we verified and we refuse).
+            Any failure -> confident = false.
+        */
+        inline constexpr auto derive_method_flags_layout(const vmhook::hotspot::method_flags_evidence& evidence) noexcept
+            -> vmhook::hotspot::method_flags_layout
+        {
+            const auto type_is = [](const char* const type, const char* const literal) constexpr noexcept -> bool
+            {
+                if (!type)
+                {
+                    return false;
+                }
+                // constexpr-safe strcmp for short type_string literals.
+                for (std::size_t index{ 0 }; ; ++index)
+                {
+                    if (type[index] != literal[index])
+                    {
+                        return false;
+                    }
+                    if (type[index] == '\0')
+                    {
+                        return true;
+                    }
+                }
+            };
+
+            // ---- Path A: exported `mutable u2 Method::_flags` (JDK 11..20) --------
+            if (evidence.flags_present && type_is(evidence.flags_type, "u2"))
+            {
+                return vmhook::hotspot::method_flags_layout{
+                    evidence.flags_offset,
+                    /*width_bytes*/ 2,
+                    /*dont_inline_bit*/ 2,
+                    /*confident*/ true };
+            }
+
+            // ---- Path B: derived MethodFlags::_status (JDK 21+) -------------------
+            if (evidence.intrinsic_id_present
+                && type_is(evidence.intrinsic_id_type, "u2")
+                && evidence.intrinsic_id_offset >= 4
+                && (evidence.intrinsic_id_offset % 4) == 0)
+            {
+                return vmhook::hotspot::method_flags_layout{
+                    evidence.intrinsic_id_offset - 4,
+                    /*width_bytes*/ 4,
+                    /*dont_inline_bit*/ 12,
+                    /*confident*/ true };
+            }
+
+            // JDK 8 (u1 bitfield, nothing exported) or any unrecognised layout.
+            return {};
+        }
+
+        /*
+            @brief Locates the _dont_inline bit of a live Method across all JDKs.
+            @details
+            Gathers the VMStructs evidence for the running JVM, runs the pure
+            derive_method_flags_layout() decision (see there for the full per-version
+            analysis), and turns a confident offset into an address inside `this`.
+            Returns a non-confident slot (caller no-ops) for a null/invalid Method* or
+            any layout the pure decision cannot confidently place — a wrong write
+            corrupts a live Method, so refusing is strictly safer than guessing.
+        */
+        static auto resolve_method_flags_slot(const vmhook::hotspot::method* const method_pointer) noexcept
+            -> vmhook::hotspot::method_flags_slot
+        {
+            if (!method_pointer || !vmhook::hotspot::is_valid_pointer(method_pointer))
+            {
+                return {};
+            }
+
+            // Resolved once; the entry pointers are stable for the process lifetime.
+            static const vmhook::hotspot::vm_struct_entry_t* const flags_entry{
+                vmhook::hotspot::iterate_struct_entries("Method", "_flags") };
+            static const vmhook::hotspot::vm_struct_entry_t* const intrinsic_id_entry{
+                vmhook::hotspot::iterate_struct_entries("Method", "_intrinsic_id") };
+
+            vmhook::hotspot::method_flags_evidence evidence{};
+            if (flags_entry)
+            {
+                evidence.flags_present = true;
+                evidence.flags_type   = flags_entry->type_string;
+                evidence.flags_offset = flags_entry->offset;
+            }
+            if (intrinsic_id_entry)
+            {
+                evidence.intrinsic_id_present = true;
+                evidence.intrinsic_id_type   = intrinsic_id_entry->type_string;
+                evidence.intrinsic_id_offset = intrinsic_id_entry->offset;
+            }
+
+            const vmhook::hotspot::method_flags_layout layout{
+                vmhook::hotspot::derive_method_flags_layout(evidence) };
+            if (!layout.confident)
+            {
+                return {};
+            }
+
+            auto* const base{ reinterpret_cast<std::uint8_t*>(
+                const_cast<vmhook::hotspot::method*>(method_pointer)) };
+            return vmhook::hotspot::method_flags_slot{
+                base + layout.offset,
+                layout.width_bytes,
+                layout.dont_inline_bit,
+                /*confident*/ true };
+        }
+
+        /*
             @brief Bitmask of HotSpot access flags used to disable JIT compilation on hooked methods.
             @details
             OR'd into Method._access_flags to prevent C1, C2, and OSR compilation.
@@ -6266,6 +6481,22 @@ namespace vmhook
             - JVM_ACC_NOT_C1_COMPILABLE   (0x04000000)
             - JVM_ACC_NOT_C2_OSR_COMPILABLE (0x08000000)
             - JVM_ACC_QUEUED              (0x01000000)
+
+            Width / version note (the access-flags companion of set_dont_inline's
+            width fix): these four bits live in the high byte (bits 24..27) of the
+            historical u4 AccessFlags, and OR'ing them is correct on JDK 8..23 where
+            Method::_access_flags is a 4-byte `jint`.  On JDK 24+ (JDK-8339113)
+            AccessFlags shrank to `u2` AND these compile-control bits were removed
+            from AccessFlags and relocated into MethodFlags::_status (bits 7..10).
+            The u4 OR through get_access_flags() then lands its high byte in the
+            2 bytes of alignment padding that sit between the u2 _access_flags and the
+            4-byte-aligned _flags that follows it (verified field order:
+            _vtable_index, _access_flags(u2), _flags(u4)), so it corrupts NOTHING but
+            is also a no-op for JIT inhibition on JDK 24+.  This is intentionally left
+            as-is: the deopt/settle path the hook modules rely on keeps a hooked
+            method interpreted regardless, and routing NO_COMPILE into MethodFlags on
+            JDK 24+ would require mutating the install/teardown call sites (outside the
+            flag-accessor surface).  No behavioural change on JDK 8..23.
         */
         inline constexpr std::int32_t NO_COMPILE =
             0x02000000 |
@@ -6276,22 +6507,40 @@ namespace vmhook
         /*
             @brief Enables or disables the _dont_inline flag on a HotSpot Method object.
             @details
-            On JDK 11..20 the _dont_inline flag is bit 2 of the exported
-            `mutable u2 Method::_flags`, and this toggles it.  On JDK 8 (no
-            `_flags` member exported) and JDK 21+ (where `_flags` became a u4
-            `MethodFlags` and is NOT exported via gHotSpotVMStructs, with
-            _dont_inline relocated to bit 12) get_flags() returns nullptr and this
-            is a safe no-op — see get_flags() for the full per-version analysis.
-            When set on the supported band, it prevents the JIT from inlining this
-            method at any call site.
+            Sets/clears HotSpot's _dont_inline flag so the JIT will not inline the
+            hooked method at any call site.  The flag's WIDTH, OFFSET and BIT all
+            depend on the running JDK; resolve_method_flags_slot() derives the right
+            (address,width,bit) and this performs a WIDTH-CORRECT, ATOMIC
+            read-modify-write at exactly that location:
 
-            Guarded against a null / invalid Method*: the verify-repair and
-            shutdown call sites can legitimately hand a Method* that became null or
-            aliases freed metaspace after a class unload / RedefineClasses.  Calling
-            get_flags() on such a pointer would form `this + offset` from a wild
-            base; the is_valid_pointer() check here (mirroring get_flags()'s own
-            this-guard) turns that into the same safe no-op rather than a wild
-            read-modify-write.
+              JDK 11..20 : exported `mutable u2 _flags`, bit 2 -> 2-byte access.
+                           BYTE-IDENTICAL to the previous implementation.
+              JDK 21+    : `MethodFlags` u4 `_status`, bit 12, offset derived as
+                           `_intrinsic_id_offset - 4` -> 4-byte access.  This is the
+                           band the previous fixed-u2 code could NOT reach (it
+                           no-oped); it now works.
+              JDK 8      : no exported `_flags`, `_intrinsic_id` is u1 -> the resolver
+                           is NOT confident -> safe no-op (unchanged).
+
+            SAFETY: a wrong write corrupts a live Method and crashes, so the write is
+            gated on slot.confident AND on the target word being naturally aligned for
+            its width (the resolver already guarantees this, the check is
+            belt-and-braces).  When either fails this is a no-op — strictly safer than
+            guessing, and the deopt/settle path still inhibits inlining of the hook.
+
+            ATOMICITY: HotSpot mutates the same word from C2 / JVMCI / JFR compile
+            threads (Method::set_force_inline / set_hidden / the compilability bits,
+            all defended with Atomic::cmpxchg).  A plain |= / &= can lose a
+            concurrently-set bit; std::atomic_ref fetch_or / fetch_and (C++20, the
+            standard this header already targets) makes our flip race-safe.  On x86
+            the lock prefix is system-wide regardless of how HotSpot declares the
+            field, so this composes correctly with HotSpot's own CAS.
+
+            Guarded against a null / invalid Method*: the verify-repair and shutdown
+            call sites can legitimately hand a Method* that became null or aliases
+            freed metaspace after a class unload / RedefineClasses; that is rejected
+            up front (and again inside the resolver) so we never form `this + offset`
+            from a wild base.
         */
         static auto set_dont_inline(const vmhook::hotspot::method* const method_pointer, const bool enabled) noexcept
             -> void
@@ -6301,20 +6550,55 @@ namespace vmhook
                 return;
             }
 
-            std::uint16_t* const flags{ method_pointer->get_flags() };
-            if (!flags)
+            const vmhook::hotspot::method_flags_slot slot{
+                vmhook::hotspot::resolve_method_flags_slot(method_pointer) };
+            if (!slot.confident || !slot.address || slot.dont_inline_bit < 0)
             {
                 return;
             }
 
-            if (enabled)
+            const std::uintptr_t address_value{ reinterpret_cast<std::uintptr_t>(slot.address) };
+
+            // Width-correct, atomic toggle.  The mask (1u << bit) is representable in
+            // every width we use (bit 2 for u2, bit 12 for u4), so only the ACCESS
+            // WIDTH varies — never the mask.  Alignment is asserted per width to keep
+            // std::atomic_ref's preconditions satisfied; an unaligned target (which
+            // the resolver should never produce) degrades to a safe no-op.
+            if (slot.width_bytes == 2 && slot.dont_inline_bit < 16)
             {
-                *flags |= (1 << 2);
+                if ((address_value % alignof(std::uint16_t)) != 0)
+                {
+                    return;
+                }
+                const std::uint16_t mask{ static_cast<std::uint16_t>(1u << slot.dont_inline_bit) };
+                std::atomic_ref<std::uint16_t> word{ *static_cast<std::uint16_t*>(slot.address) };
+                if (enabled)
+                {
+                    word.fetch_or(mask, std::memory_order_acq_rel);
+                }
+                else
+                {
+                    word.fetch_and(static_cast<std::uint16_t>(~mask), std::memory_order_acq_rel);
+                }
             }
-            else
+            else if (slot.width_bytes == 4 && slot.dont_inline_bit < 32)
             {
-                *flags &= static_cast<std::uint16_t>(~(1 << 2));
+                if ((address_value % alignof(std::uint32_t)) != 0)
+                {
+                    return;
+                }
+                const std::uint32_t mask{ 1u << slot.dont_inline_bit };
+                std::atomic_ref<std::uint32_t> word{ *static_cast<std::uint32_t*>(slot.address) };
+                if (enabled)
+                {
+                    word.fetch_or(mask, std::memory_order_acq_rel);
+                }
+                else
+                {
+                    word.fetch_and(~mask, std::memory_order_acq_rel);
+                }
             }
+            // Any other width -> unrecognised; no-op (never reached for confident slots).
         }
 
         /*
