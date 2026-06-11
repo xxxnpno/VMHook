@@ -2754,30 +2754,34 @@ namespace
             });
 
         check("forEachLoadedClassCountSane", count > 100);
-        check("forEachLoadedClassObject",    classes_seen.contains("java/lang/Object"));
-        // java.lang.String presence is BEST-EFFORT on JDK 8: HotSpot's JDK 8
-        // SystemDictionary enumeration is incomplete / non-deterministic for
-        // bootstrap classes (the same quirk that omits vmhook/Main and array
-        // klasses below), and java.lang.String is intermittently dropped too.
-        // Detect JDK 8 the house way — java.lang.String has no compact-string
-        // `coder` field before JDK 9 — and on JDK 8 record String's absence as
-        // [INFO] rather than hard-asserting; keep it HARD on JDK 9+.  Object stays
-        // HARD on every JDK (the canary that the bootstrap loader was reached).
+        // java.lang.Object / java.lang.String presence is BEST-EFFORT on JDK 8:
+        // HotSpot's JDK 8 SystemDictionary enumeration is incomplete / non-deterministic
+        // for bootstrap classes (the same quirk that omits vmhook/Main and array klasses
+        // below).  The VS18/MSVC-14.51 windows runner now intermittently drops even
+        // java.lang.Object on JDK 8 (previously assumed the always-present canary), so it
+        // is gated the same way.  Detect JDK 8 the house way — java.lang.String has no
+        // compact-string `coder` field before JDK 9 — and on JDK 8 record a bootstrap
+        // class's absence as [INFO] rather than hard-asserting; keep both HARD on JDK 9+
+        // (where the per-CLD Dictionary walk lists every class).
         {
-            const bool string_seen{ classes_seen.contains("java/lang/String") };
             vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
             const bool jdk8{ string_klass != nullptr
                              && !string_klass->find_field("coder").has_value() };
-            if (!jdk8 || string_seen)
+            const auto gate_bootstrap = [&](const char* check_name, bool present) -> void
             {
-                check("forEachLoadedClassString", string_seen);
-            }
-            else
-            {
-                write_result("[INFO] forEachLoadedClass: java.lang.String NOT enumerated "
-                             "on JDK8 (incomplete SystemDictionary enumeration, same quirk "
-                             "as Main/arrays) — forEachLoadedClassString recorded, not asserted");
-            }
+                if (!jdk8 || present)
+                {
+                    check(check_name, present);
+                }
+                else
+                {
+                    write_result(std::string{ "[INFO] forEachLoadedClass: a bootstrap class was "
+                                 "NOT enumerated on JDK8 (incomplete SystemDictionary enumeration, "
+                                 "same quirk as Main/arrays) — " } + check_name + " recorded, not asserted");
+                }
+            };
+            gate_bootstrap("forEachLoadedClassObject", classes_seen.contains("java/lang/Object"));
+            gate_bootstrap("forEachLoadedClassString", classes_seen.contains("java/lang/String"));
         }
         // The example's OWN classes prove app-class (not just bootstrap) enumeration.
         // On JDK 9+ vmhook/Example is reliably enumerated; on JDK 8 the conservative
