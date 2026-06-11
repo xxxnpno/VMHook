@@ -21,9 +21,19 @@
 //     NewObjectA path never calls it), so it is how we satisfy the "a
 //     registered construct() runs" requirement.
 //
-// All make_unique calls happen inside a scoped_hook detour on trigger(), so a
+// Most make_unique calls happen inside a scoped_hook detour on trigger(), so a
 // JavaThread is guaranteed live — the same shape the canonical example.cpp
 // make_unique test uses.
+//
+//   * OUTSIDE-A-HOOK path — make_unique is ALSO exercised at module entry,
+//     BEFORE any hook is armed (no detour, so vmhook::hotspot::current_java_thread
+//     is NOT trampoline-set).  In that state make_unique must DISCOVER a live
+//     JavaThread from VM metadata instead of riding the hook trampoline's
+//     captured thread.  This is a DISTINCT code path from the in-detour calls and
+//     mirrors the legacy example.cpp test_make_unique_before_hooks /
+//     make_unique_outside_hook tail of test_make_unique_status.  We HARD-assert
+//     allocation succeeds, a constructor arg landed (field read-back), and a
+//     SECOND call yields a DISTINCT live instance.
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
@@ -134,6 +144,16 @@ namespace
     // ── Distinct-identity check (two no-arg objects differ) ────────────────────
     std::atomic<bool> g_distinct_identity{ false };
 
+    // ── OUTSIDE-A-HOOK path observations (filled in the module body, no detour) ─
+    // make_unique called with NO hook active, so current_java_thread is NOT
+    // trampoline-set and the implementation must discover a live JavaThread from
+    // VM metadata.  Filled before the scoped_hook block below.
+    std::atomic<bool> g_outside_made{ false };          // first alloc succeeded
+    std::atomic<std::int32_t> g_outside_int{ -1 };      // (I)V arg read back
+    std::atomic<std::int32_t> g_outside_tag{ -1 };      // dispatched ctorTag
+    std::atomic<bool> g_outside_made2{ false };         // second alloc succeeded
+    std::atomic<bool> g_outside_distinct{ false };      // two allocs are distinct
+
     // Bit-compare helper for the double field (exact round-trip).
     auto double_to_bits(double d) -> std::int64_t
     {
@@ -146,9 +166,66 @@ namespace
 
 VMHOOK_JVM_MODULE(make_unique)
 {
-    vmhook::register_class<make_unique_fixture>("vmhook/fixtures/MakeUnique");
+    static constexpr const char* FIXTURE{ "vmhook/fixtures/MakeUnique" };
+
+    vmhook::register_class<make_unique_fixture>(FIXTURE);
+
+    // ── ENTRY GUARD ────────────────────────────────────────────────────────────
+    // If the fixture is not loaded/resolvable on this run, every make_unique /
+    // static_field below would operate on an unresolvable class.  Bail cleanly to
+    // [INFO] instead (no crash, no hooks armed).  The harness loads every
+    // vmhook.fixtures.* class on each run, so this is belt-and-braces (same idiom
+    // as field_primitives_set / collection_iteration_safety).
+    if (vmhook::find_class(FIXTURE) == nullptr)
+    {
+        ctx.record("[INFO] make_unique: MakeUnique not loaded/resolvable on this "
+                   "run; skipping the module's live checks (no crash, no hooks armed).");
+        return;
+    }
+
+    // ── OUTSIDE-A-HOOK make_unique (VM-metadata JavaThread discovery) ──────────
+    // Runs in the MODULE BODY before ANY hook is armed: no detour is active, so
+    // vmhook::hotspot::current_java_thread is NOT trampoline-set and make_unique
+    // must discover a live JavaThread from VM metadata.  This is the DISTINCT
+    // code path the legacy example.cpp test_make_unique_before_hooks /
+    // make_unique_outside_hook tail covered, which the in-detour calls below do
+    // NOT exercise.  Contained in a try/catch so a stray throw can never escape
+    // the module (recorded [INFO], never a FAIL); the hard checks are asserted
+    // after the scoped_hook block alongside the in-detour ones.  Done BEFORE the
+    // set_instance_count(0) reset below so it cannot perturb the in-detour
+    // instanceCount baseline.
+    try
+    {
+        // (I)V — single int, so we can read the constructor arg back and prove it
+        // landed (not just that allocation returned non-null).
+        if (auto o1{ vmhook::make_unique<make_unique_fixture>(static_cast<std::int32_t>(4242)) })
+        {
+            g_outside_made.store(true, std::memory_order_relaxed);
+            g_outside_int.store(o1->get_int_field(), std::memory_order_relaxed);
+            g_outside_tag.store(o1->get_ctor_tag(), std::memory_order_relaxed);
+
+            // A SECOND outside-a-hook allocation must yield a DISTINCT live
+            // instance (different heap identity) — proves discovery is repeatable
+            // and each call produces a fresh object, exactly like the legacy
+            // outside-hook counter/identity assertions.
+            if (auto o2{ vmhook::make_unique<make_unique_fixture>(static_cast<std::int32_t>(7)) })
+            {
+                g_outside_made2.store(true, std::memory_order_relaxed);
+                g_outside_distinct.store(
+                    o1->get_instance() != o2->get_instance(),
+                    std::memory_order_relaxed);
+            }
+        }
+    }
+    catch (...)
+    {
+        ctx.record("[INFO] make_unique: outside-a-hook make_unique threw and was "
+                   "contained (no crash); see the outside_* checks for partial results.");
+    }
 
     // Reset the Java-side observers so counts are deterministic for this run.
+    // (Clears the outside-a-hook increments above too, so the in-detour
+    // instanceCount math below starts from a clean baseline.)
     make_unique_fixture::set_instance_count(0);
 
     {
@@ -317,6 +394,22 @@ VMHOOK_JVM_MODULE(make_unique)
                   g_hook_calls.load(std::memory_order_relaxed) >= 1);
         ctx.check("make_unique_hook_saw_self",
                   g_hook_saw_self.load(std::memory_order_relaxed));
+
+        // ── OUTSIDE-A-HOOK angles (VM-metadata JavaThread discovery, no detour) ─
+        // make_unique was called in the module body before any hook was armed, so
+        // a live JavaThread had to be discovered from VM metadata (not the hook
+        // trampoline).  Allocation succeeded, the (I)V arg landed via field
+        // read-back, and a second call produced a DISTINCT live instance.
+        ctx.check("outside_hook_allocated",
+                  g_outside_made.load(std::memory_order_relaxed));
+        ctx.check("outside_hook_int_field_set_to_4242",
+                  g_outside_int.load(std::memory_order_relaxed) == 4242);
+        ctx.check("outside_hook_dispatched_I_ctor",
+                  g_outside_tag.load(std::memory_order_relaxed) == 2);
+        ctx.check("outside_hook_second_allocated",
+                  g_outside_made2.load(std::memory_order_relaxed));
+        ctx.check("outside_hook_distinct_identity",
+                  g_outside_distinct.load(std::memory_order_relaxed));
 
         // ── No-arg constructor angles ──────────────────────────────────────────
         ctx.check("noarg_allocated", g_noarg_ok.load(std::memory_order_relaxed));
