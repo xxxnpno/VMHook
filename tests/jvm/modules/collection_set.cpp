@@ -67,14 +67,14 @@
 //     * Collections.unmodifiableSet(..) (size 2, field "c")
 //     * Collections.synchronizedSet(..) (size 2, field "c")
 //
-//   Collections.newSetFromMap(new HashMap<>())  [REAL vmhook BUG, characterized]:
-//     * Its backing-map field is literally named "m" (collides with TreeSet), so
-//       collection::to_vector routes it to tree_map_walk_keys; find_field(map,
-//       "root") misses on a HashMap; an EMPTY vector is returned for a NON-empty
-//       Set.  This route is a PURE MEMORY WALK (no Java call), so it is safe to
-//       decode from the body.  The module CHARACTERIZES the actual (buggy) empty
-//       result and records an [INFO] flaw note.  It never crashes and never edits
-//       vmhook.hpp.
+//   Collections.newSetFromMap(new HashMap<>())  [was a vmhook bug, now FIXED]:
+//     * Its backing-map field is literally named "m" (collides with TreeSet), but
+//       the backing map is a HashMap (no "root", has "table").  collection::
+//       to_vector now inspects the actual backing-map klass and routes a HashMap-
+//       backed Set to hash_map_walk_keys, decoding ALL elements.  This route is a
+//       PURE MEMORY WALK (no Java call), so it is safe to decode from the body.
+//       The module HARD-asserts the full-element result (count == size, full id
+//       fingerprint) and records an [INFO] note that the bug is fixed.
 //
 //   size cross-check:  for every populated set the decoded element count is
 //   cross-checked against Java's own size(), published by the fixture into a
@@ -904,14 +904,14 @@ namespace
         }
 
         // =====================================================================
-        // Collections.newSetFromMap(new HashMap<>())  — REAL vmhook BUG,
-        // characterized.  SetFromMap's backing-map field is literally named "m"
-        // (same probe as TreeSet), so collection::to_vector routes it to
-        // tree_map_walk_keys, which does find_field(mapKlass,"root") on a HashMap
-        // (no "root") and returns an EMPTY vector for a NON-empty Set.  This route
-        // is a PURE MEMORY WALK (no Java call), so decoding it from the body is
-        // safe.  We pin the ACTUAL (buggy) behaviour and record the flaw; the call
-        // must NOT crash.
+        // Collections.newSetFromMap(new HashMap<>())  — FIXED (was robustness
+        // backlog #3 / to_vector_treeset_redblack.md [medium]).  SetFromMap's
+        // backing-map field is literally named "m" (same probe as TreeSet), but
+        // the backing map is a HashMap (a "table" field, NO "root").  to_vector's
+        // "m"-route now inspects the ACTUAL backing-map klass: it finds no "root"
+        // but does find "table", so it routes to hash_map_walk_keys and decodes
+        // ALL N elements.  This route is a PURE MEMORY WALK (no Java call), so
+        // decoding it from the body is safe.  Elements carry ids 200..203.
         // =====================================================================
         {
             const std::int32_t java_size{ coll_set_fixture::j_size("setFromHashMapSize") };
@@ -920,21 +920,33 @@ namespace
             const auto v{ coll_set_fixture::elems_of("setFromHashMap") };
             const elem_stats st{ fingerprint(v) };
 
-            // The bug manifests as a SHORT decode: vmhook returns fewer elements
-            // than the Set actually holds (in practice 0, HashMap has no "root").
-            const bool short_decode{ st.count < java_size };
-            ctx.record(std::string{ "[INFO] vmhook BUG (to_vector_treeset_redblack.md "
-                                    "[medium]): Collections.newSetFromMap(HashMap) has "
-                                    "field 'm' so to_vector takes the TreeSet path; "
-                                    "HashMap has no 'root' field, so the decode returns " }
-                       + std::to_string(st.count) + " of " + std::to_string(java_size)
-                       + " elements (expected behaviour: route to the generic iterator "
-                         "path and return all " + std::to_string(java_size) + ").");
+            ctx.record("[INFO] FIXED (to_vector_treeset_redblack.md [medium]): "
+                       "Collections.newSetFromMap(HashMap) has backing field 'm'; "
+                       "to_vector now inspects the backing-map klass (no 'root', has "
+                       "'table') and routes to the HashMap key walk, decoding all "
+                       "elements instead of returning empty.");
 
-            // Characterize, do not fix: assert the ACTUAL behaviour (short/empty).
-            ctx.check("setfrommap_decode_is_short_BUG", short_decode);
+            // HARD assert the CORRECT full-element result (the fix): every element
+            // is decoded, exactly once, cross-checked against Java's size() and the
+            // closed-form id fingerprint (ids 200..203).
+            ctx.check("setfrommap_decode_count_is_4", st.count == SETFROMMAP_N);
+            ctx.check("setfrommap_decode_count_matches_java", st.count == java_size);
+            ctx.check("setfrommap_decode_no_null", st.null_count == 0);
             ctx.check("setfrommap_decode_did_not_crash", true);
-            ctx.check("setfrommap_decode_count_is_zero_today", st.count == 0);
+            ctx.check("setfrommap_all_elements_distinct", st.distinct_oops);
+            ctx.check("setfrommap_tags_round_trip", st.tags_consistent);
+            // Closed form over ids 200..203: sum == 806, xor == 0.
+            ctx.check("setfrommap_id_sum_closed_form", st.id_sum == 806);
+            ctx.check("setfrommap_id_xor_closed_form", st.id_xor == 0);
+
+            // Membership: every id 200..203 present exactly once (set semantics).
+            const auto ids{ id_set(v) };
+            bool all_present{ ids.size() == static_cast<std::size_t>(SETFROMMAP_N) };
+            for (std::int32_t i{ 0 }; i < SETFROMMAP_N; ++i)
+            {
+                if (ids.find(200 + i) == ids.end()) { all_present = false; }
+            }
+            ctx.check("setfrommap_every_id_present_no_dupes", all_present);
         }
 
         // =====================================================================

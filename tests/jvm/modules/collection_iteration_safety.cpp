@@ -44,12 +44,12 @@
 // not depend on a populated decode).  JDK generation is recorded for context via
 // the house idiom (java.lang.String has the compact-string "coder" field on 9+).
 //
-// KNOWN LIB BUG pinned here (NOT fixed — header is off-limits): to_vector routes
-// by FIRST-matching field name, and Collections.newSetFromMap(HashMap)'s backing
-// field is named "m" (the TreeSet probe), so it takes tree_map_walk_keys; a
-// HashMap has no "root", so the decode is SHORT (0 in practice) for a non-empty
-// Set.  The module asserts the ACTUAL short decode and records the flaw; it does
-// NOT assert the broken path as correct, and the call must not crash.
+// Previously-pinned lib bug, now FIXED: Collections.newSetFromMap(HashMap)'s
+// backing field is named "m" (the TreeSet probe), but the map is a HashMap (no
+// "root").  to_vector now inspects the actual backing-map klass — "root" => tree
+// walk, else "table" => hash walk — so the HashMap-backed Set decodes ALL its
+// elements.  The module HARD-asserts the full decode (section 7); the call must
+// not crash.
 //
 // C++17 (no std::bit_cast); MSVC copy-init (never brace-init) from value_t.
 #include <vmhook/vmhook.hpp>
@@ -167,7 +167,7 @@ namespace
     walk_obs g_oo_treeset;          // keys
     walk_obs g_oo_treemap;          // entries
 
-    walk_obs g_setfrommap;          // KNOWN BUG: short decode
+    walk_obs g_setfrommap;          // FIXED: full HashMap-backed decode
 
     // ── get_array_element bounds outcomes (HARD, universal). ─────────────────
     // In-bounds reads (must equal the sentinel value).
@@ -354,7 +354,7 @@ namespace
         observe_vec(g_oo_treeset, vec_of<elem_object>(*self, "outOfOrderTreeSet"));
         observe_entries(g_oo_treemap, entries_of<elem_object, elem_object>(*self, "outOfOrderTreeMap"));
 
-        // ── KNOWN BUG: newSetFromMap(HashMap) mis-routes to the TreeSet path. ─
+        // ── FIXED: newSetFromMap(HashMap) routes to the HashMap key walk. ─────
         observe_vec(g_setfrommap, vec_of<elem_object>(*self, "setFromHashMap"));
 
         // ── get_array_element bounds clamp (HARD, universal). ────────────────
@@ -693,28 +693,32 @@ namespace
     }
 
     // =====================================================================
-    //  7. KNOWN LIB BUG (PIN, do NOT fix): Collections.newSetFromMap(HashMap)
-    //     mis-routes to the TreeSet path (backing field "m"), HashMap has no
-    //     "root", so the decode is SHORT (0 in practice) for a non-empty Set.
-    //     Assert the ACTUAL short decode; never assert the broken path correct.
-    //     The call must NOT crash (g_setfrommap.seen proves it returned).
+    //  7. FIXED (was a known lib bug): Collections.newSetFromMap(HashMap) used
+    //     to mis-route to the TreeSet path on backing field "m"; the HashMap has
+    //     no "root", so the decode returned empty for a non-empty Set.
+    //     collection::to_vector now inspects the ACTUAL backing-map klass — no
+    //     "root" but a "table" — and routes to the HashMap key walk, decoding
+    //     ALL elements.  HARD assert the full decode; the call must NOT crash
+    //     (g_setfrommap.seen proves it returned).  Elements carry ids 300..304.
     // =====================================================================
     {
         const std::int32_t java_size{ fixture_wrapper::j_size("setFromHashMapSize") };
         ctx.check("setfrommap_java_size_is_5", java_size == SETFROMMAP_N);
         ctx.check("setfrommap_walk_returned_no_crash", g_setfrommap.seen.load());
         const std::int32_t decoded{ g_setfrommap.count.load() };
-        // BUG: the decode is short (fewer than the Set actually holds).
-        ctx.check("setfrommap_decode_is_short_BUG", decoded < java_size);
-        ctx.record(std::string{ "[INFO] LIB BUG (to_vector first-match field routing): "
-                                "Collections.newSetFromMap(HashMap) has backing field 'm', "
-                                "so collection::to_vector takes the TreeSet path; HashMap has "
-                                "no 'root' field, so the decode returns " }
-                   + std::to_string(decoded) + " of " + std::to_string(java_size)
-                   + " elements. Correct behaviour would route to the generic iterator path.");
-        // In practice the short decode is exactly 0 (no 'root' -> walker returns
-        // immediately).  Pin that, but tolerate a future partial fix (< java_size).
-        ctx.check("setfrommap_decode_count_is_zero_today", decoded == 0);
+        ctx.record("[INFO] FIXED (to_vector backing-klass-aware 'm' routing): "
+                   "Collections.newSetFromMap(HashMap) has backing field 'm'; "
+                   "collection::to_vector now checks the backing-map klass (no 'root', "
+                   "has 'table') and routes to the HashMap key walk, decoding all "
+                   "elements instead of returning empty.");
+        // HARD: the decode is now COMPLETE — every element, once, no nulls.
+        ctx.check("setfrommap_decode_count_is_5", decoded == SETFROMMAP_N);
+        ctx.check("setfrommap_decode_matches_java", decoded == java_size);
+        ctx.check("setfrommap_decode_all_non_null",
+                  g_setfrommap.non_null.load() == SETFROMMAP_N);
+        ctx.check("setfrommap_decode_no_null_slots",
+                  g_setfrommap.null_count.load() == 0);
+        ctx.check("setfrommap_decode_distinct_oops", g_setfrommap.distinct_ok.load());
     }
 
     // =====================================================================

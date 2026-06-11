@@ -16571,15 +16571,46 @@ namespace vmhook
                 return result;
             }
 
-            //  TreeSet fast path — elements live as keys in the backing
-            //  NavigableMap (TreeMap) held in field "m".
+            //  "m"-backed Set fast path — elements live as keys in a backing
+            //  map held in field "m".  Two distinct JDK shapes share this field
+            //  name, so we must NOT assume TreeMap from the name alone:
+            //    * TreeSet                          -> m is a TreeMap (red-black,
+            //                                          has a "root" field).
+            //    * Collections.newSetFromMap(map)   -> Collections$SetFromMap.m
+            //                                          is whatever Map was passed,
+            //                                          commonly a HashMap (has a
+            //                                          "table" field, NO "root").
+            //  Routing on the field name alone sent a HashMap-backed SetFromMap
+            //  into the tree walk, which finds no "root" and silently returns 0
+            //  of N elements.  Instead inspect the ACTUAL backing map's klass and
+            //  pick the walker that matches its real layout: "root" => tree walk,
+            //  else "table" => hash walk.  A real TreeSet still resolves "root"
+            //  first, so its behaviour is unchanged.
             if (const auto tree_field{ get_field_by_oop_klass("m") })
             {
                 const std::uint32_t tree_compressed{ static_cast<std::uint32_t>(tree_field->get()) };
-                void* const tree_oop{ vmhook::hotspot::decode_oop_pointer(tree_compressed) };
-                if (tree_oop && vmhook::hotspot::is_valid_pointer(tree_oop))
+                void* const map_oop{ vmhook::hotspot::decode_oop_pointer(tree_compressed) };
+                if (map_oop && vmhook::hotspot::is_valid_pointer(map_oop))
                 {
-                    vmhook::tree_map_walk_keys<element_type>(tree_oop, result);
+                    vmhook::hotspot::klass* const backing_klass{ vmhook::klass_from_oop(map_oop) };
+                    if (backing_klass && vmhook::find_field(backing_klass, "root"))
+                    {
+                        // TreeMap-shaped backing -> in-order red-black walk.
+                        vmhook::tree_map_walk_keys<element_type>(map_oop, result);
+                    }
+                    else if (backing_klass && vmhook::find_field(backing_klass, "table"))
+                    {
+                        // HashMap-shaped backing (e.g. newSetFromMap(new HashMap))
+                        // -> bucket/Node.next key walk.
+                        vmhook::hash_map_walk_keys<element_type>(map_oop, result);
+                    }
+                    else
+                    {
+                        // Unknown backing shape: fall back to the tree walk, which
+                        // null-guards a missing "root" and returns empty — keeping
+                        // the prior behaviour for any non-Tree/non-Hash backing.
+                        vmhook::tree_map_walk_keys<element_type>(map_oop, result);
+                    }
                 }
                 return result;
             }

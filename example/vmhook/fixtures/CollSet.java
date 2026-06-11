@@ -38,11 +38,10 @@ import java.util.TreeSet;
  *
  *   - Collections.newSetFromMap(new HashMap&lt;&gt;())   the JDK Set wrapper whose
  *       backing-map field is ALSO literally named "m" (collides with TreeSet).
- *       vmhook routes it to the TreeSet fast path, find_field(mapKlass,"root")
- *       misses on a HashMap, and an EMPTY vector is returned for a NON-empty Set.
- *       The native module CHARACTERIZES this real [medium] vmhook bug (asserts
- *       the actual empty/partial result + records an [INFO] flaw note); it never
- *       crashes and never edits vmhook.
+ *       vmhook's "m"-route now inspects the actual backing-map klass: a HashMap
+ *       has no "root" but does have "table", so it routes to the HashMap key walk
+ *       and decodes ALL elements (previously a [medium] bug that returned empty).
+ *       The native module HARD-asserts the full-element result; it never crashes.
  *
  *   - a Set field left NULL                  to_vector must return empty, never throw.
  *
@@ -273,9 +272,10 @@ public final class CollSet
     /**
      * Set backed by a HashMap via Collections.newSetFromMap(...).  Its private
      * backing-map field is named "m" (same as TreeSet's), but the map is a
-     * HashMap (no "root" field), so vmhook's TreeSet fast path returns empty for
-     * this NON-empty Set.  Holds SETFROMMAP_N elements.  The native module
-     * characterizes the resulting empty/partial decode as a known vmhook bug.
+     * HashMap (no "root", has "table").  vmhook's "m"-route now inspects the
+     * backing-map klass and routes this to the HashMap key walk, decoding all
+     * SETFROMMAP_N elements (previously returned empty — a known [medium] bug,
+     * now fixed).  The native module HARD-asserts the full-element decode.
      */
     public static Set<Elem> setFromHashMap =
         Collections.newSetFromMap(new HashMap<Elem, Boolean>());

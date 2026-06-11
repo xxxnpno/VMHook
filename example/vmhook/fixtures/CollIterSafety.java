@@ -166,7 +166,7 @@ public final class CollIterSafety
     public static Map<Elem, Elem> outOfOrderTreeMap = new TreeMap<Elem, Elem>();
     public static Set<Elem>       outOfOrderTreeSet = new TreeSet<Elem>();
 
-    // ── KNOWN mis-route: Collections.newSetFromMap(HashMap) ─────────────────
+    // ── FIXED route: Collections.newSetFromMap(HashMap) -> HashMap key walk ──
     public static Set<Elem> setFromHashMap =
         Collections.newSetFromMap(new HashMap<Elem, Boolean>());
     public static final int SETFROMMAP_N = 5;
