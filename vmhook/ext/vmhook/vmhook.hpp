@@ -1555,8 +1555,11 @@ namespace vmhook
         @brief Factory function type that creates a std::unique_ptr<T> from a raw OOP.
         @details
         Populated by vmhook::register_class() alongside type_to_class_map.
-        Used by field_proxy::get_as<T>() and frame::get_arguments() to construct
-        C++ wrapper objects from decoded Java object references.
+        Used by frame::get_arguments() (via detail::extract_frame_arg) to construct
+        C++ wrapper objects from decoded Java object references.  Note: field_proxy
+        does NOT route through this map — a wrapper-typed field read
+        (static_cast<std::unique_ptr<T>>(proxy->get()), via value_t's implicit
+        operator) inlines `new T{ decoded_oop }` directly in cast_for_variant.
         Keys   - internal JVM class names (e.g. "java/lang/String").
         Values - lambda functions: +[](void* oop) { return std::make_unique<T>(oop); }
     */
@@ -3136,7 +3139,19 @@ namespace vmhook
                 Algorithm (from src/hotspot/share/utilities/unsigned5.hpp):
                   sum = sum of (b_i - 1) * 64^i   for i = 0, 1, 2, ...
                   Stop after the first byte b_i where b_i < 192 (a "low byte").
-                  Byte 0 is never emitted; it marks the stream End and returns ~0u.
+                  Byte 0 is never emitted by the encoder; it marks the stream End,
+                  in which case decode_u5 returns ~0u and REWINDS (leaves stream_pos
+                  unchanged) so the byte is not consumed.
+
+                Caveat: ~0u (0xFFFFFFFF) is NOT a private End-only sentinel.  A
+                genuine 5-byte sequence {192,254,253,253,253} decodes to exactly
+                0xFFFFFFFF (UINT32_MAX) and advances stream_pos by 5.  So the End
+                marker and a real UINT32_MAX value share the same RETURN value; they
+                are disambiguated only by the cursor delta (End rewinds, a real value
+                advances).  Callers that test `== ~0u` to detect End rely on the
+                FieldInfoStream never legitimately carrying 0xFFFFFFFF as a header
+                count / index (indices are small) — true for this format, but the
+                value itself is reachable, not impossible.
             */
             inline static auto decode_u5(const std::uint8_t* data, int& stream_pos) noexcept
                 -> std::uint32_t
@@ -3148,7 +3163,11 @@ namespace vmhook
                     if (current_byte == 0)
                     {
                         --stream_pos;
-                        return ~0u;  // End marker - never a valid value
+                        // End marker: rewind so byte 0 is not consumed and return
+                        // ~0u.  NB ~0u is also what a genuine 5-byte UINT32_MAX
+                        // ({192,254,253,253,253}) decodes to — End is distinguished
+                        // by the rewound cursor, not by the return value alone.
+                        return ~0u;
                     }
                     sum += static_cast<std::uint32_t>(current_byte - 1) << (6 * byte_position);
                     if (current_byte < 192)
@@ -7569,8 +7588,10 @@ namespace vmhook
 
         vmhook::type_to_class_map.insert_or_assign(std::type_index{ typeid(wrapper_type) }, std::string{ class_name });
 
-        // Store a factory function so field_proxy::get_as<T>() and frame::get_arguments()
-        // can construct C++ wrapper objects from decoded Java object references.
+        // Store a factory function so frame::get_arguments() (through
+        // detail::extract_frame_arg) can construct C++ wrapper objects from decoded
+        // Java object references.  (field_proxy reads its own wrappers inline in
+        // cast_for_variant and does not consult this map.)
         // The factory returns a raw pointer; consumers immediately wrap it in
         // a unique_ptr at the call site.  See type_factory_function_t for why.
         vmhook::g_type_factory_map.emplace(std::string{ class_name }, +[](void* instance)
@@ -11031,7 +11052,12 @@ namespace vmhook
                 return {};
             }
 
-            using get_string_utf_chars_t = const char* (*)(void*, void*, bool*);
+            // The 3rd arg is JNI's jboolean* (jboolean == unsigned char, 1 byte);
+            // model it as std::uint8_t* — matching the sister GetStringUTFChars call
+            // site (slot 169) below — rather than bool*.  The JVM writes a jboolean
+            // (uint8) through this lvalue, so typing it bool* would write a jboolean
+            // through a bool* (not aliasing-compatible under the C++ object model).
+            using get_string_utf_chars_t = const char* (*)(void*, void*, std::uint8_t*);
             using release_string_utf_chars_t = void (*)(void*, void*, const char*);
             get_string_utf_chars_t const get_string_utf_chars{ vmhook::detail::jni_function<169, get_string_utf_chars_t>(vmhook::hotspot::current_jni_env) };
             release_string_utf_chars_t const release_string_utf_chars{ vmhook::detail::jni_function<170, release_string_utf_chars_t>(vmhook::hotspot::current_jni_env) };
@@ -11040,7 +11066,7 @@ namespace vmhook
                 return {};
             }
 
-            bool is_copy{};
+            std::uint8_t is_copy{};
             const char* const chars{ get_string_utf_chars(vmhook::hotspot::current_jni_env, string_handle, &is_copy) };
             if (!chars)
             {
