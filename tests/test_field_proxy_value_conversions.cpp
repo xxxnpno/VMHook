@@ -1337,5 +1337,102 @@ int main()
         }
     }
 
+    // ---------------------------------------------------------------------
+    // 35. os::safe_read_fast — the cheap-path fault-safe read that
+    //     field_proxy::get()/get_compressed_oop() now use on the hot path
+    //     (PERF #21).  It must be a DROP-IN for os::safe_read: identical
+    //     all-or-nothing bool contract, identical bytes on success, and it
+    //     must NEVER fault on a bad pointer.
+    //
+    //     SAFE BY CONSTRUCTION across every toolchain: safe_read_fast only
+    //     takes a cheap guarded path where that guard is proven (SEH __try
+    //     on real MSVC cl.exe); on EVERY other config — clang-cl /
+    //     clang-on-windows, MinGW, Linux, Android, macOS, iOS — it is just a
+    //     call to os::safe_read.  So this fault-injection section can never
+    //     reach an unguarded faulting read on ANY platform: the worst case is
+    //     it exercises os::safe_read, which is itself fault-safe.  These cases
+    //     run with no JVM — they drive the read primitive directly over
+    //     buffers we own plus the same 0xDEAD0000 unmapped sentinel section 34
+    //     uses.
+    // ---------------------------------------------------------------------
+    {
+        // Input-guard parity with safe_read: null dst / null src / zero size
+        // all return false on BOTH primitives (no fault, no copy).
+        {
+            std::uint64_t scratch{ 0 };
+            std::uint64_t src{ 0x1122334455667788ULL };
+            check("fast_null_dst_false",
+                  vmhook::os::safe_read_fast(nullptr, &src, sizeof(src)) == false);
+            check("fast_null_src_false",
+                  vmhook::os::safe_read_fast(&scratch, nullptr, sizeof(scratch)) == false);
+            check("fast_zero_size_false",
+                  vmhook::os::safe_read_fast(&scratch, &src, 0) == false);
+        }
+
+        // Cheap-path SUCCESS on a valid buffer: every width field_proxy reads
+        // (1,2,4,8 bytes) copies the exact bytes and returns true, and the
+        // result is byte-identical to os::safe_read over the same source.
+        {
+            alignas(std::uint64_t) const std::uint8_t source[8]{
+                0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67 };
+            const std::size_t widths[]{ 1, 2, 4, 8 };
+            for (const std::size_t w : widths)
+            {
+                std::uint8_t via_fast[8]{};
+                std::uint8_t via_slow[8]{};
+                const bool ok_fast{ vmhook::os::safe_read_fast(via_fast, source, w) };
+                const bool ok_slow{ vmhook::os::safe_read(via_slow, source, w) };
+                check("fast_valid_returns_true", ok_fast == true);
+                check("fast_matches_safe_read_bool", ok_fast == ok_slow);
+                check("fast_copies_exact_bytes", std::memcmp(via_fast, source, w) == 0);
+                check("fast_matches_safe_read_bytes",
+                      std::memcmp(via_fast, via_slow, w) == 0);
+            }
+        }
+
+        // Cheap-path FAULT recovery: an unmapped source must NOT fault — on
+        // MSVC the SEH guard traps the AV and falls back to safe_read; on every
+        // other config the call IS safe_read.  Either way it reports false
+        // (same as safe_read).  This is the load-bearing fault-safety case: if
+        // any config reached an unguarded read here, it would crash the process.
+        {
+            void* const unmapped{ reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(0xDEAD0000ULL)) };
+            const std::size_t widths[]{ 1, 2, 4, 8 };
+            for (const std::size_t w : widths)
+            {
+                std::uint64_t dst{ 0 };
+                const bool ok_fast{ vmhook::os::safe_read_fast(&dst, unmapped, w) };
+                const bool ok_slow{ vmhook::os::safe_read(&dst, unmapped, w) };
+                check("fast_unmapped_returns_false", ok_fast == false);
+                check("fast_unmapped_matches_safe_read", ok_fast == ok_slow);
+            }
+        }
+
+        // Stress the fault path: many consecutive faulting reads followed by a
+        // valid read must all behave (no wedged SEH filter, no fault).  Closest
+        // no-JVM proxy that the guarded path stays healthy across repeated trips.
+        {
+            void* const unmapped{ reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(0xDEAD0000ULL)) };
+            bool all_false{ true };
+            for (int i = 0; i < 256; ++i)
+            {
+                std::uint32_t dst{ 0xFFFFFFFFu };
+                if (vmhook::os::safe_read_fast(&dst, unmapped, sizeof(dst)))
+                {
+                    all_false = false;
+                }
+            }
+            check("fast_repeated_faults_all_false", all_false);
+
+            const std::uint32_t source{ 0xCAFED00Du };
+            std::uint32_t dst{ 0 };
+            check("fast_valid_after_faults_true",
+                  vmhook::os::safe_read_fast(&dst, &source, sizeof(dst)) == true);
+            check("fast_valid_after_faults_bytes", dst == 0xCAFED00Du);
+        }
+    }
+
     return failures == 0 ? 0 : 1;
 }
