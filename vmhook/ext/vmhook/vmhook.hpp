@@ -15823,14 +15823,16 @@ namespace vmhook
                 {
                     vmhook::hotspot::method* const current_method{ methods_array[method_index] };
                     if (current_method && vmhook::hotspot::is_valid_pointer(current_method)
-                        && current_method->get_name() == method_name)
+                        && current_method->get_name() == method_name
+                        && static_method_only(current_method))
                     {
                         return vmhook::method_proxy{ nullptr, current_method, current_method->get_signature() };
                     }
                 }
             }
 
-            VMHOOK_LOG("{} object::get_method('{}') (static): method not found in class hierarchy.",
+            VMHOOK_LOG("{} object::get_method('{}') (static): no STATIC method with this name "
+                       "found in class hierarchy.",
                        vmhook::error_tag, method_name);
             return std::nullopt;
         }
@@ -15881,7 +15883,8 @@ namespace vmhook
                     }
 
                     const std::string current_signature{ current_method->get_signature() };
-                    if (current_method->get_name() == method_name && current_signature == method_signature)
+                    if (current_method->get_name() == method_name && current_signature == method_signature
+                        && static_method_only(current_method))
                     {
                         return vmhook::method_proxy{ nullptr, current_method, current_signature,
                                                      /*signature_pinned=*/true };
@@ -15889,7 +15892,7 @@ namespace vmhook
                 }
             }
 
-            VMHOOK_LOG("{} object::get_method('{}{}') (static): no method with this exact "
+            VMHOOK_LOG("{} object::get_method('{}{}') (static): no STATIC method with this exact "
                        "name+signature found in class hierarchy.",
                        vmhook::error_tag, method_name, method_signature);
             return std::nullopt;
@@ -15947,6 +15950,49 @@ namespace vmhook
             }
 
             return found_klass;
+        }
+
+        /*
+            @brief Static-kind gate for the static_method() / static get_method() resolution path.
+            @details
+            static_method(name) must resolve ONLY a STATIC Java method.  Without
+            this filter the name (+ optional descriptor) scan over the klass
+            _methods array returned the FIRST name match regardless of kind, so
+            static_method("instanceMethod") handed back a usable proxy aimed at an
+            INSTANCE Method with object == nullptr.  call() then dispatches that
+            instance method through the STATIC slot with no receiver pushed (slot 0
+            becomes the first declared arg instead of 'this'), yielding a wrong
+            result or a JVM-tearing access violation as the callee reads garbage as
+            its receiver.  The symmetric receiver-push decision in method_proxy
+            already keys static-ness on this same bit (see the is_static() disjunct
+            at the call site); this is the matching gate at resolution time.
+
+            Reads JVM_ACC_STATIC (0x0008) the same way is_static() does — through
+            method::get_access_flags() then masking 0x0008u.  That bit lives in the
+            low byte of Method::_access_flags and is stable across every supported
+            JDK (8..26), so reading the flags word as u4 and masking 0x0008 is
+            width-independent even on JDKs where AccessFlags itself shrank.  Fails
+            CLOSED: if the access-flags slot can't be resolved (no VMStructs entry)
+            the candidate is treated as NOT static and skipped, so a method whose
+            kind cannot be confirmed is never mis-dispatched through the static
+            path.  Does NOT touch the Method-flags WIDTH machinery
+            (derive_method_flags_layout / set_dont_inline) — only the stable
+            low-byte ACC_STATIC bit.
+
+            Complexity: O(1) after the first VMStruct lookup (cached).
+            Exception safety: noexcept.
+
+            @param candidate  The HotSpot Method under consideration (must be non-null).
+            @return  true iff JVM_ACC_STATIC is set on the candidate.
+        */
+        static auto static_method_only(vmhook::hotspot::method* const candidate) noexcept
+            -> bool
+        {
+            if (const std::uint32_t* const flags{ candidate->get_access_flags() })
+            {
+                return (*flags & 0x0008u) != 0u;
+            }
+            return false;
         }
     };
 

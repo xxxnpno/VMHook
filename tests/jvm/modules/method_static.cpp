@@ -1,17 +1,20 @@
 // method_static — exhaustive JVM tests for the STATIC-method call surface:
 //   static_method("name")->call(args)   on vmhook::object<T>.
 //
-// Feature lives in vmhook/ext/vmhook/vmhook.hpp:
-//   * object<T>::static_method(name)            : 14026-14030
-//   * object<T>::static_method(name, signature) : 14035-14039
-//   * object_base::get_method(type_index,name)        (static path) : 13735-13771
-//   * object_base::get_method(type_index,name,sig)    (static path) : 13788-13830
-//   * method_proxy::is_static()  (reads JVM_ACC_STATIC)             : 12977-12988
-//   * method_proxy::get_compressed_oop() (receiver OOP, 0 if null)  : 13022-13032
-//   * method_proxy::call()      (interpreter fast path + decode)    : 12726-12938
+// Feature lives in vmhook/ext/vmhook/vmhook.hpp (line numbers verified against
+// the current file; the static get_method path now has a JVM_ACC_STATIC filter
+// via object_base::static_method_only()):
+//   * object<T>::static_method(name)            : 16092-16097
+//   * object<T>::static_method(name, signature) : 16101-16106
+//   * object_base::get_method(type_index,name)        (static path) : 15800-15837
+//   * object_base::get_method(type_index,name,sig)    (static path) : 15853-15897
+//   * object_base::static_method_only() (the ACC_STATIC gate)       : ~15956-15971
+//   * method_proxy::is_static()  (reads JVM_ACC_STATIC)             : 14976-14987
+//   * method_proxy::get_compressed_oop() (receiver OOP, 0 if null)  : 15021
+//   * method_proxy::call()      (interpreter fast path + decode)    : 14687
 //   * method_proxy::call_jni()  (JNI fallback; static dispatch slots
-//                                116/119/122/125/128/131/134/137/140/143) : 12141-12695
-//   * value_t::as_string() / is_string() / is_void()                : 12066-12110
+//                                116/119/122/125/128/131/134/137/140/143) : 14057
+//   * value_t::is_void() / is_string() / as_string()                : 13978/13986/14004
 //
 // WHAT THIS MODULE PROVES (the method_static contract), each as ctx.check():
 //   1. static_method("m")->call() returns the EXACT Java value for every
@@ -30,10 +33,10 @@
 //      for every instance method (the recently-fixed accessor that reads
 //      JVM_ACC_STATIC from the live Method's _access_flags, NOT the dead
 //      constructor member).
-//   6. AUDIT FLAW (still open): the static get_method path has no JVM_ACC_STATIC
-//      filter, so static_method("instanceMethod") wrongly returns a non-empty
-//      optional.  The fixed is_static() accessor is what lets us DETECT it
-//      (is_static()==false on the wrongly-accepted proxy).  Recorded as INFO.
+//   6. Robustness #6 (FIXED): the static get_method path now applies a
+//      JVM_ACC_STATIC filter (static_method_only()), so
+//      static_method("instanceMethod").has_value() == false while a real static
+//      method still resolves.  HARD-asserted both ways, plus a positive control.
 //
 // Everything runs inside ONE detour on trigger(int) — the only context where
 // current_java_thread is set so method_proxy::call() may dispatch.
@@ -189,11 +192,16 @@ namespace
     std::atomic<int>  g_isstatic_itouch{ -1 };
     std::atomic<int>  g_isstatic_trigger{ -1 }; // the hooked instance method -> false
 
-    // -- Bug #2 flaw probe: static_method() wrongly accepts instance methods --
-    std::atomic<int>  g_flaw_iget_has_value{ -1 };       // static_method("iGetSeed").has_value()
-    std::atomic<int>  g_flaw_iget_is_static{ -1 };       // ...is_static() on it -> false (detect)
-    std::atomic<int>  g_flaw_iecho_has_value{ -1 };
+    // -- Robustness #6 (FIXED): static_method() must REJECT instance methods.
+    // The static get_method path now applies a JVM_ACC_STATIC filter, so
+    // static_method("instanceMethod").has_value() == false.  These probe the
+    // rejection (has_value -> 0) plus a real-static positive control so the
+    // assertion can't pass merely because resolution is broken for everything.
+    std::atomic<int>  g_flaw_iget_has_value{ -1 };       // static_method("iGetSeed").has_value() -> 0
+    std::atomic<int>  g_flaw_iget_is_static{ -1 };       // ...is_static() on it -> 0 (never static)
+    std::atomic<int>  g_flaw_iecho_has_value{ -1 };      // static_method("iEcho").has_value()    -> 0
     std::atomic<int>  g_flaw_iecho_is_static{ -1 };
+    std::atomic<int>  g_static_real_has_value{ -1 };     // static_method("sIntFortyTwo").has_value() -> 1
 
     // -- signature-overload accessor: static_method(name, sig) --
     std::atomic<std::int64_t> g_sig_echo_ret{ k_uncaptured };  // static_method("sEchoInt","(I)I")
@@ -336,10 +344,13 @@ namespace
             g_isstatic_trigger.store(self->get_method("trigger")->is_static() ? 1 : 0);
         }
 
-        // ===================== Bug #2: static_method accepts an instance =======
-        // The static get_method path has NO JVM_ACC_STATIC filter, so these
-        // return non-empty optionals for INSTANCE methods (the flaw).  The fixed
-        // is_static() accessor reports them as non-static (the detection).
+        // ============ Robustness #6 (FIXED): static_method REJECTS instance =====
+        // The static get_method path now applies a JVM_ACC_STATIC filter, so
+        // static_method("iGetSeed") / static_method("iEcho") — both INSTANCE
+        // methods on this class — resolve to an EMPTY optional.  is_static() on
+        // an empty optional is never reached, so it stays 0.  The positive
+        // control proves a real static method STILL resolves through the same
+        // path (so the rejection isn't just "resolution is broken for all").
         {
             auto flaw_iget = method_static::static_method("iGetSeed");
             g_flaw_iget_has_value.store(flaw_iget.has_value() ? 1 : 0);
@@ -348,6 +359,9 @@ namespace
             auto flaw_iecho = method_static::static_method("iEcho");
             g_flaw_iecho_has_value.store(flaw_iecho.has_value() ? 1 : 0);
             g_flaw_iecho_is_static.store((flaw_iecho && flaw_iecho->is_static()) ? 1 : 0);
+
+            auto real_static = method_static::static_method("sIntFortyTwo");
+            g_static_real_has_value.store(real_static.has_value() ? 1 : 0);
         }
 
         // ===================== static_method(name, signature) ==================
@@ -587,23 +601,29 @@ VMHOOK_JVM_MODULE(method_static)
         ctx.check("ms_sig_overload_echo_returns_arg", g_sig_echo_ret.load() == 24681357);
 
         // ==================================================================
-        //  6) AUDIT FLAW (still open): static_method() wrongly accepts an
-        //     instance method.  The fixed is_static() DETECTS it.  Recorded as
-        //     INFO; the detection assertion is hard (is_static()==false).
+        //  6) Robustness #6 (FIXED): static_method() REJECTS instance methods.
+        //     The static get_method path applies a JVM_ACC_STATIC filter, so
+        //     static_method("iGetSeed") / ("iEcho") resolve to an EMPTY
+        //     optional (both are instance methods on this class).  HARD
+        //     assertions, plus a positive control proving a real static method
+        //     still resolves through the same path.
         // ==================================================================
-        ctx.record(std::string{ "[INFO] FLAW vmhook.hpp:13735-13830 — static get_method has no "
-                                "JVM_ACC_STATIC filter; static_method(\"iGetSeed\").has_value() = " }
-                   + (g_flaw_iget_has_value.load() == 1 ? "true (WRONGLY ACCEPTED an instance method)"
-                                                        : "false (correctly rejected)"));
-        ctx.record(std::string{ "[INFO] FLAW static_method(\"iEcho\").has_value() = " }
-                   + (g_flaw_iecho_has_value.load() == 1 ? "true (WRONGLY ACCEPTED)"
-                                                         : "false (correctly rejected)"));
-        // Whichever way the flaw resolves, the fixed accessor must never report
-        // an instance method as static: if the proxy was (wrongly) created, its
-        // is_static() reads the real JVM_ACC_STATIC bit and returns false.
-        ctx.check("ms_flaw_wrongly_accepted_instance_is_not_static_iget",
+        ctx.check("ms_static_method_rejects_instance_iget",
+                  g_flaw_iget_has_value.load() == 0);
+        ctx.check("ms_static_method_rejects_instance_iecho",
+                  g_flaw_iecho_has_value.load() == 0);
+        // Positive control: a genuine static method DOES resolve, so the
+        // rejection above is the JVM_ACC_STATIC filter at work, not a blanket
+        // resolution failure.
+        ctx.check("ms_static_method_resolves_real_static",
+                  g_static_real_has_value.load() == 1);
+        // Belt-and-braces: a rejected (empty) proxy is never reported static.
+        // is_static() on an empty optional is unreachable, so this stays 0 — it
+        // would also catch a regression where an instance Method leaked through
+        // as a non-static proxy.
+        ctx.check("ms_static_method_rejected_instance_not_static_iget",
                   g_flaw_iget_is_static.load() == 0);
-        ctx.check("ms_flaw_wrongly_accepted_instance_is_not_static_iecho",
+        ctx.check("ms_static_method_rejected_instance_not_static_iecho",
                   g_flaw_iecho_is_static.load() == 0);
     }
 }
