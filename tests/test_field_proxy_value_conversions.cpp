@@ -1434,5 +1434,104 @@ int main()
         }
     }
 
+    // ---------------------------------------------------------------------
+    // 36. RAW-ECHO SAFETY (robustness #1).  The 3-arg ctor is a documented
+    //     escape hatch that stores ANY caller pointer with no validation
+    //     (raw_address() echoes it verbatim).  get()/get_compressed_oop() now
+    //     gate the DEREF behind vmhook::hotspot::is_valid_pointer, so a proxy
+    //     built over a genuinely-BOGUS address returns the SAME zero/empty default
+    //     the null guard yields, WITHOUT dereferencing the wild pointer.  This is
+    //     the load-bearing safety case: before the gate, get() handed the address
+    //     straight to the read, which on a config whose fault guard is weakest
+    //     (clang-cl SEH does not trap AVs; iOS safe_read raw-memcpys) is an access
+    //     violation.  No JVM: pure pointer-classification + the null-guard default;
+    //     no live oop is decoded.
+    //
+    //     The gate accepts an address when is_valid_pointer(addr) OR
+    //     is_valid_pointer(addr & ~1) holds — the second arm keeps a LEGITIMATE
+    //     1-byte (byte/boolean) field at an ODD offset readable (is_valid_pointer
+    //     demands 2-byte alignment, which such a field does not satisfy), while a
+    //     truly-wild pointer fails BOTH.  Outcome-wise every case below collapses
+    //     to the documented default: out-of-range / kernel addresses are rejected
+    //     by the gate; an address that PASSES the gate but is unmapped (e.g. the
+    //     poison pattern, whose even neighbour is in-range) is caught one layer
+    //     down by safe_read_fast — both yield the zero/empty default, no crash.
+    // ---------------------------------------------------------------------
+    {
+        // A spread of addresses that all drive get() to the safe default:
+        //   0x1 / 0x3      -> below user_address_floor (0xFFFF): rejected by the
+        //                     gate (both the address AND its even base are out of
+        //                     range), so get() never reads them.
+        //   0xDEADBEEF     -> a poison pattern; is_valid_pointer(addr) is false but
+        //                     is_valid_pointer(addr & ~1)==0xDEADBEEE is in range,
+        //                     so the gate lets it through and safe_read_fast (the
+        //                     backstop) recovers 0 from the unmapped page.  This
+        //                     mirrors section 34's 0xDEAD0000 safe-read recovery.
+        //   0xFFFF...FFFF  -> kernel-space, above user_address_ceiling: rejected by
+        //                     the gate.
+        struct BogusAddr { const char* tag; std::uintptr_t value; };
+        const BogusAddr bogus_addrs[]{
+            { "one",          std::uintptr_t{ 0x1 } },
+            { "three",        std::uintptr_t{ 0x3 } },
+            { "poison",       std::uintptr_t{ 0xDEADBEEFull } },
+            { "kernel_space", ~std::uintptr_t{ 0 } },
+        };
+
+        // Sanity: every address above fails is_valid_pointer itself (the building
+        // block of the gate), so the get() cases below exercise the safe path and
+        // not an accidentally-valid pointer.
+        for (const BogusAddr& b : bogus_addrs)
+        {
+            check((std::string{ "bogus_addr_fails_is_valid_pointer_" } + b.tag).c_str(),
+                  vmhook::hotspot::is_valid_pointer(
+                      reinterpret_cast<void*>(b.value)) == false);
+        }
+
+        // get() over each bogus address returns the documented default for the
+        // signature: the int32 alternative, value 0, signature preserved — the
+        // identical result the null-pointer guard produces.  No AV, no crash.
+        for (const BogusAddr& b : bogus_addrs)
+        {
+            void* const addr{ reinterpret_cast<void*>(b.value) };
+
+            vmhook::field_proxy pi{ addr, "I", false };
+            auto vi = pi.get();
+            check((std::string{ "bogus_get_int_is_int32_alt_" } + b.tag).c_str(),
+                  vi.data.index() == idx::k_i32);
+            check((std::string{ "bogus_get_int_is_zero_" } + b.tag).c_str(),
+                  static_cast<std::int32_t>(vi) == 0);
+            check((std::string{ "bogus_get_int_signature_preserved_" } + b.tag).c_str(),
+                  vi.signature == "I");
+
+            // Wider primitive: still the zero default, never an 8-byte wild read.
+            vmhook::field_proxy pj{ addr, "J", true };
+            check((std::string{ "bogus_get_long_is_zero_" } + b.tag).c_str(),
+                  static_cast<std::int64_t>(pj.get()) == 0);
+
+            // Reference field: get() yields the int32 zero default (NOT a uint32
+            // OOP read), so it routes to a null void* and an empty string with no
+            // wild decode; get_compressed_oop() likewise recovers 0.
+            vmhook::field_proxy pr{ addr, "Ljava/lang/String;", true };
+            auto vr = pr.get();
+            check((std::string{ "bogus_get_ref_routes_to_null_void_ptr_" } + b.tag).c_str(),
+                  static_cast<void*>(vr) == nullptr);
+            check((std::string{ "bogus_get_ref_as_string_empty_" } + b.tag).c_str(),
+                  vr.as_string().empty());
+            check((std::string{ "bogus_get_compressed_oop_is_zero_" } + b.tag).c_str(),
+                  pr.get_compressed_oop() == 0u);
+        }
+
+        // raw_address() is UNCHANGED by the fix: it still echoes the bogus
+        // pointer verbatim (the gate is on the DEREF in get(), not on the ctor
+        // or the accessor).  This pins that the escape hatch remains an escape
+        // hatch — only the *read* is now safe-by-default.
+        {
+            void* const addr{ reinterpret_cast<void*>(std::uintptr_t{ 0x1 }) };
+            vmhook::field_proxy p{ addr, "Ljava/lang/String;", true };
+            check("bogus_raw_address_still_echoes_pointer",
+                  p.raw_address() == addr);
+        }
+    }
+
     return failures == 0 ? 0 : 1;
 }

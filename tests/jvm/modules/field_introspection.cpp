@@ -661,8 +661,12 @@ VMHOOK_JVM_MODULE(field_introspection)
         }
 
         // D.4 — raw_address echoes whatever the proxy was constructed with,
-        //       with NO validation (documents the "bogus pointer passes through"
-        //       contract the audit flagged).  Includes the null-base case.
+        //       with NO validation (it is a pure accessor of the stored pointer).
+        //       The 3-arg ctor remains a documented ESCAPE HATCH — but the READ
+        //       through that pointer is now SAFE-BY-DEFAULT: robustness #1 added an
+        //       is_valid_pointer gate on the deref in get()/get_compressed_oop(),
+        //       so a proxy over a bogus pointer (0x1) returns the zero/empty default
+        //       instead of dereferencing the wild address (was: unguarded UB/AV).
         {
             vmhook::field_proxy null_proxy{ nullptr, "I", false };
             ctx.check("raw_addr_null_base_is_null", null_proxy.raw_address() == nullptr);
@@ -670,10 +674,33 @@ VMHOOK_JVM_MODULE(field_introspection)
             vmhook::field_proxy buf_proxy{ storage + 8, "I", false };
             ctx.check("raw_addr_echoes_constructor_pointer",
                       buf_proxy.raw_address() == storage + 8);
+
+            // raw_address() (accessor, no deref) STILL echoes the bogus pointer
+            // verbatim — the escape hatch is preserved.
             void* const bogus{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1)) };
             vmhook::field_proxy bogus_proxy{ bogus, "Ljava/lang/String;", true };
             ctx.check("raw_addr_no_validation_passes_bogus",
                       bogus_proxy.raw_address() == bogus);
+
+            // HARD: the READ through that bogus pointer is now gated.  0x1 fails
+            // is_valid_pointer (below the user-address floor), so get() returns the
+            // documented default (int32 alternative, value 0, signature preserved)
+            // and get_compressed_oop() returns 0 — NO access violation, NO crash.
+            // (Previously this dereferenced 0x1; the [INFO] that documented "bogus
+            // pointer passes through" the read is now this HARD safety assertion.)
+            const auto bogus_value{ bogus_proxy.get() };
+            ctx.check("bogus_get_signature_preserved", bogus_value.signature == "Ljava/lang/String;");
+            ctx.check("bogus_get_routes_to_null_void_ptr",
+                      static_cast<void*>(bogus_value) == nullptr);
+            ctx.check("bogus_get_as_string_empty", bogus_value.as_string().empty());
+            ctx.check("bogus_get_compressed_oop_is_zero",
+                      bogus_proxy.get_compressed_oop() == 0u);
+
+            // A primitive-typed bogus proxy is likewise safe: zero default, no read
+            // of the wild address.
+            vmhook::field_proxy bogus_int{ bogus, "I", false };
+            ctx.check("bogus_get_int_is_zero",
+                      static_cast<std::int32_t>(bogus_int.get()) == 0);
         }
     }
 

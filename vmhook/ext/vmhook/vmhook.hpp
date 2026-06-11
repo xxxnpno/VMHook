@@ -13376,6 +13376,41 @@ namespace vmhook
                 return value_t{ std::int32_t{}, this->signature_text };
             }
 
+            // RAW-ECHO SAFETY (robustness #1): the 3-arg ctor is a documented
+            // escape hatch — it stores whatever raw pointer the caller hands it
+            // with NO validation (raw_address() echoes it verbatim).  The normal
+            // resolved-field paths reach here with read_pointer == a validated
+            // oop/mirror + offset (the static path was re-resolved + range-checked
+            // through is_valid_pointer(live_mirror) just above; the instance path
+            // came from a decoded, validated oop), so they ALWAYS pass this gate
+            // and their reads stay byte-identical.  A field_proxy built directly
+            // over a bogus pointer (e.g. 0x1, a freed/poison block, a kernel-space
+            // address) would otherwise feed that address straight into the read
+            // below; on a config whose fault guard is weakest (clang-cl SEH does
+            // not trap AVs; iOS safe_read is a raw memcpy) that is unguarded UB/AV.
+            // Gate the deref through is_valid_pointer (pure range + alignment +
+            // poison-pattern check, NOT config-specific) and return the SAME
+            // zero/empty default the null guard above produces.
+            //
+            // Sub-word alignment caveat: a LEGITIMATE 1-byte field (byte "B" /
+            // boolean "Z") can sit at an ODD mirror/oop offset, which is a valid
+            // interior read but fails is_valid_pointer's 2-byte-alignment sub-check
+            // (FieldIntrospection asserts byte/bool addresses with align==1 for
+            // exactly this reason).  Rejecting it would WRONGLY default a real read.
+            // So accept the address when EITHER it passes is_valid_pointer directly,
+            // OR — for an odd address — its 2-byte-aligned base passes (proving the
+            // read lands in a valid, non-poison, in-range region and only the low
+            // bit, i.e. sub-word field packing, made the direct check fail).  A
+            // genuinely wild pointer (0x1, kernel-space, a poison cell) fails BOTH
+            // and is rejected; safe_read_fast below remains the backstop for any
+            // address that passes here but is transiently unmapped.
+            if (!vmhook::hotspot::is_valid_pointer(read_pointer)
+                && !vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(
+                       reinterpret_cast<std::uintptr_t>(read_pointer) & ~std::uintptr_t{ 1 })))
+            {
+                return value_t{ std::int32_t{}, this->signature_text };
+            }
+
             // Every field-byte read goes through os::safe_read_fast so a
             // transiently-stale or unmapped address — e.g. a mirror caught mid
             // relocation — returns the zero-initialized default instead of
@@ -13705,6 +13740,22 @@ namespace vmhook
             }
 
             if (!read_pointer)
+            {
+                return 0;
+            }
+            // RAW-ECHO SAFETY (robustness #1), mirrored from get(): the resolved
+            // static/instance paths reach here with a validated mirror/oop + offset
+            // and always pass; only a field_proxy built from a caller-supplied raw
+            // pointer (the 3-arg escape-hatch ctor) can present a bogus address.
+            // Gate the deref through is_valid_pointer (pure range/alignment/poison)
+            // and return 0 (the documented null/empty default) instead of reading a
+            // wild address.  As in get(), accept an odd-but-otherwise-valid base so
+            // the byte-aligned-interior case is never wrongly defaulted (a compressed
+            // OOP slot is in practice at least 2-byte aligned, so this only ever
+            // loosens a theoretical edge); a genuinely wild pointer fails both checks.
+            if (!vmhook::hotspot::is_valid_pointer(read_pointer)
+                && !vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(
+                       reinterpret_cast<std::uintptr_t>(read_pointer) & ~std::uintptr_t{ 1 })))
             {
                 return 0;
             }
