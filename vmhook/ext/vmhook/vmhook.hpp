@@ -13015,6 +13015,64 @@ namespace vmhook
                     return result;
                 }
 
+                // ELEMENT-WIDTH GUARD (mirrors field_proxy::set's size-mismatch
+                // refusal at the read side).  The per-element read strides the
+                // array data by sizeof(the REQUESTED C++ element) via
+                // get_array_element<T>, but the array's ACTUAL element width is
+                // fixed by its JVM descriptor ([Z/[B = 1, [S/[C = 2, [I/[F = 4,
+                // [J/[D = 8).  A width mismatch is memory-unsafe in BOTH directions:
+                //   - requested WIDER than actual (e.g. [I -> vector<int64_t>):
+                //     strides length*8 bytes across a length*4-byte array, reading
+                //     PAST the data area = OUT-OF-BOUNDS.  get_array_element's
+                //     bounds check is index-only (index < length) and cannot catch
+                //     a too-large per-element stride.
+                //   - requested NARROWER than actual (e.g. [J -> vector<int32_t>):
+                //     walks the wider data with a short stride, yielding interleaved
+                //     low/high words = silently WRONG values.
+                // Refuse the read (return the empty result) on any mismatch, exactly
+                // as field_proxy::set refuses a width-mismatched write, instead of
+                // mis-decoding or reading past the array.  Matching-width reads
+                // ([I -> vector<int32_t>, [J -> vector<int64_t>, ...) are unaffected
+                // and take the byte-identical fast path below.
+                //
+                // Carve-outs: the std::vector<bool> / <char> / <string> overloads
+                // DELIBERATELY decode at a width that differs from sizeof(element)
+                // (bool <- uint8 of [Z, char <- uint16 of [C, string <- compressed
+                // OOP of an object array) and are validated by their own overloads,
+                // so the numeric width comparison must not gate them.  The helper
+                // also returns 0 for object / unknown element descriptors, which
+                // skips the guard for those.
+                if constexpr (vmhook::detail::is_vector_v<target_type>)
+                {
+                    using element_type =
+                        typename vmhook::detail::is_vector<std::remove_cvref_t<target_type>>::value_type_t;
+                    if constexpr (!std::is_same_v<element_type, bool>
+                               && !std::is_same_v<element_type, char>
+                               && !std::is_same_v<element_type, std::string>)
+                    {
+                        if (signature.size() >= 2 && signature.front() == '[')
+                        {
+                            const std::size_t field_element_width{
+                                vmhook::detail::jvm_primitive_byte_width(signature.substr(1)) };
+                            if (field_element_width != 0
+                                && sizeof(element_type) != field_element_width)
+                            {
+                                VMHOOK_LOG("{} field_proxy::value_t::read_array_value: element-width "
+                                           "mismatch (requested C++ element = {}B, JVM array element "
+                                           "= {}B, sig='{}') - refusing the read to avoid {} the "
+                                           "array data.  Read the field into a std::vector whose "
+                                           "element matches the array's primitive width.",
+                                           vmhook::error_tag, sizeof(element_type),
+                                           field_element_width, signature,
+                                           sizeof(element_type) > field_element_width
+                                               ? "reading PAST"
+                                               : "mis-striding");
+                                return result;
+                            }
+                        }
+                    }
+                }
+
                 const std::int32_t length{ vmhook::array_length(array_oop) };
                 if (length <= 0)
                 {

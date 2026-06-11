@@ -30,9 +30,13 @@
 // vector, never a crash).  Each canonical array is ALSO walked at the raw
 // array_length + get_array_element<T> layer at index 0 / mid / last, proving the
 // length oracle and per-element offset arithmetic directly (and never reading
-// out of bounds -- array_length is the only bounds source used).  Two
-// documentation checks pin real flaws in the read path (silent element-width
-// mismatch; lossy char[] -> vector<char> truncation), each exercised in a
+// out of bounds -- array_length is the only bounds source used).  The
+// element-width GUARD is hard-asserted in BOTH unsafe directions -- a narrower
+// [J -> vector<int32_t> (silent garbage, pre-guard) and the wider [I ->
+// vector<int64_t> (out-of-bounds, pre-guard) both now REFUSE the read and yield
+// an empty vector, with matching-width controls proving the guard never
+// over-fires.  One remaining documentation check pins a real flaw still open in
+// the read path (lossy char[] -> vector<char> truncation), exercised in a
 // crash-safe direction so a future fix deliberately flips the check.
 //
 // SUITE-SAFETY (mirrors field_primitives_get.cpp / register_class.cpp):
@@ -193,12 +197,27 @@ namespace
         // char[] read of the high-code-unit array (documents narrowing).
         static auto uni_char_as_char() -> std::vector<char> { return static_field("unicodeCharArray")->get(); }
 
-        // [J read into the WRONG (narrower) element type, on purpose, in a
-        // crash-safe direction (4-byte stride over an 8-byte array never reads
-        // past the data area).  Documents the missing width guard.
+        // ELEMENT-WIDTH GUARD checks (vmhook.hpp read_array_value).
+        //
+        // NARROWER direction: a [J (8-byte) field read into vector<int32_t>
+        // (4-byte requested).  Pre-guard this walked the long[] data with a
+        // 4-byte stride and returned interleaved low/high words; the guard now
+        // REFUSES it and returns an empty vector.  Exercised in the crash-safe
+        // direction (even unguarded it stayed in bounds), with a matching-width
+        // vector<int64_t> control proving the guard does NOT over-fire.
         static auto wide_long_as_int32() -> std::vector<std::int32_t> { return static_field("wideLongArray")->get(); }
-        // Correct full-width read of the same field, for the contrast check.
         static auto wide_long_as_int64() -> std::vector<std::int64_t> { return static_field("wideLongArray")->get(); }
+
+        // WIDER direction: a [I (4-byte) field read into vector<int64_t>
+        // (8-byte requested) -- the genuinely UNSAFE case.  Pre-guard this
+        // would stride length*8 bytes across a length*4-byte array, reading
+        // PAST the data area (out-of-bounds).  The guard REFUSES it (empty
+        // vector) BEFORE any element is read, so the OOB read never happens and
+        // this is safe to drive in the shared CI process.  staticIntArray is the
+        // canonical {1000,2000,3000} [I field re-read at the wrong width; the
+        // matching-width vector<int32_t> read of the same field (wrapper::s_int,
+        // asserted in section 1) is the control.
+        static auto int_as_int64_oob() -> std::vector<std::int64_t> { return static_field("staticIntArray")->get(); }
     };
 
     // ---- small comparison helpers --------------------------------------------
@@ -824,54 +843,53 @@ static void run_field_arrays_primitive_checks(vmhook_test::context& ctx)
     }
 
     // =========================================================================
-    // 11) FLAW DOCUMENTATION -- read_array_value ignores the element-width of the
-    //    field signature.  Reading a [J (8-byte) field into vector<int32_t>
-    //    (4-byte) is NOT rejected.  read_array_value uses array_length (==3, the
-    //    Java element count, clamped by clamp_safe_container_count to 3) as the
-    //    loop bound and a 4-byte stride, so it reads int32s at byte offsets
-    //    0,4,8 of the long[] data -- i.e. {low word of long0, HIGH word of long0,
-    //    low word of long1}, little-endian.  This is silent garbage, but
-    //    exercised in the crash-SAFE direction (the highest offset read, 8..11,
-    //    stays inside the 24-byte data area), so it never reads past the array.
-    //    The WIDER direction ([I into vector<int64_t>) is the genuinely unsafe
-    //    OOB case and is deliberately NOT exercised here to avoid corrupting the
-    //    shared CI process.  A future width guard (return {} on mismatch,
-    //    mirroring field_proxy::set's size-mismatch refusal) must flip the narrow
-    //    check below.
+    // 11) ELEMENT-WIDTH GUARD -- read_array_value REFUSES a read whose requested
+    //    C++ element width disagrees with the field's JVM array element width,
+    //    returning an empty vector (the documented safe failure) instead of
+    //    mis-decoding (narrower) or reading past the array (wider).  This mirrors
+    //    field_proxy::set's size-mismatch refusal on the read side, and closes
+    //    BOTH unsafe directions:
     //
-    //    The exact constants are byte-verified, not assumed:
-    //      long0 = 0x1122334455667788 -> LE bytes 88 77 66 55 44 33 22 11
-    //        int32 @0 = 0x55667788, int32 @4 = 0x11223344
-    //      long1 = 0x7FFFFFFF00000001 -> LE bytes 01 00 00 00 FF FF FF 7F
-    //        int32 @8 = 0x00000001
+    //      * NARROWER ([J 8B -> vector<int32_t> 4B): pre-guard this walked the
+    //        long[] data with a 4-byte stride and yielded interleaved low/high
+    //        words (silent garbage); now refused -> empty.
+    //      * WIDER ([I 4B -> vector<int64_t> 8B): pre-guard this strided
+    //        length*8 bytes across a length*4-byte array, reading PAST the data
+    //        area (OUT-OF-BOUNDS); now refused -> empty, with NO element read,
+    //        so it is safe to drive in the shared CI process.
+    //
+    //    Matching-width reads of the SAME fields MUST still work byte-identically
+    //    (the controls below): [J -> vector<int64_t> and [I -> vector<int32_t>.
+    //    The guard is a pure width comparison, so it fires identically on every
+    //    platform/JDK and validates locally.
     // =========================================================================
     {
-        // Correct, full-width read first (control).
+        // -- NARROWER direction: [J read into vector<int32_t> is REFUSED. -------
+        const std::vector<std::int32_t> narrow{ wrapper::wide_long_as_int32() };
+        ctx.check("widthguard_narrow_long_to_int32_refused_empty", narrow.empty());
+
+        // Control: the SAME [J field read at the matching width (vector<int64_t>)
+        // still returns the exact long values, byte-for-byte.  (long2 == -1.)
         const std::vector<std::int64_t> correct{ wrapper::wide_long_as_int64() };
-        ctx.check("widecheck_correct_int64",
+        ctx.check("widthguard_match_long_to_int64_ok",
                   vectors_equal(correct, std::vector<std::int64_t>{
                       static_cast<std::int64_t>(0x1122334455667788ULL),
                       static_cast<std::int64_t>(0x7FFFFFFF00000001ULL),
                       static_cast<std::int64_t>(-1) }));
 
-        // Wrong, narrow read -- size still == the Java array length (3); contents
-        // are the 4-byte-stride little-endian words described above.
-        const std::vector<std::int32_t> narrow{ wrapper::wide_long_as_int32() };
-        ctx.check("widecheck_narrow_size_is_array_length", narrow.size() == 3);
-        const bool stride_words_ok{
-            narrow.size() == 3
-            && narrow[0] == static_cast<std::int32_t>(0x55667788)   // long0 low
-            && narrow[1] == static_cast<std::int32_t>(0x11223344)   // long0 high
-            && narrow[2] == static_cast<std::int32_t>(0x00000001) };// long1 low
-        ctx.check("widecheck_narrow_reads_stride_words_unguarded", stride_words_ok);
-        ctx.record("[INFO] field_arrays_primitive: read_array_value performs NO "
-                   "element-width validation against the field signature.  Reading a "
-                   "[J field into vector<int32_t> is silently accepted: it walks the "
-                   "8-byte long[] data with a 4-byte stride (array_length elements), "
-                   "yielding interleaved low/high words instead of an empty vector.  "
-                   "The same mismatch in the WIDER direction ([I into vector<int64_t>) "
-                   "would read past the array data and is unsafe.  A width guard "
-                   "mirroring field_proxy::set's size-mismatch refusal is the fix.");
+        // -- WIDER direction: [I read into vector<int64_t> is REFUSED. ---------
+        // This is the genuinely UNSAFE case (an 8-byte stride over 4-byte data
+        // reads past the array end).  The guard rejects it BEFORE any element is
+        // read, so no OOB access occurs -- the empty result proves the refusal.
+        const std::vector<std::int64_t> wide_oob{ wrapper::int_as_int64_oob() };
+        ctx.check("widthguard_wider_int_to_int64_refused_empty", wide_oob.empty());
+
+        // Control: the SAME [I field read at the matching width (vector<int32_t>)
+        // still returns {1000,2000,3000} -- proving the guard does NOT over-fire
+        // on a correct-width read (this is the byte-identical fast path).
+        const std::vector<std::int32_t> match{ wrapper::s_int() };
+        ctx.check("widthguard_match_int_to_int32_ok",
+                  vectors_equal(match, std::vector<std::int32_t>{ 1000, 2000, 3000 }));
     }
 
     // =========================================================================

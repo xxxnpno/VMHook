@@ -40,7 +40,10 @@
 //   * actual primitive write landing in a real Java field,
 //   * set_str_field / set_prim_array / set_bool_array / set_str_array success
 //     paths (they decode a compressed OOP and mutate a real Java backing array),
-//   * the value_t -> std::vector<T> read path and its width/length guards,
+//   * the value_t -> std::vector<T> read path's END-TO-END behaviour on a live
+//     array (empty-vector refusal, no OOB) -- though its read-side element-width
+//     guard PREDICATE (pure width logic, shared jvm_primitive_byte_width oracle)
+//     is pinned here in SECTION 18,
 //   * unique_ptr<wrapper> success path (encodes a real OOP),
 //   * the anti-clobber adjacency proof and Java-visibility (getfield) read-back.
 // Here we only assert that the guards reject mistyped writes and leave the
@@ -1144,6 +1147,90 @@ int main()
     {
         // string into a static primitive field: non-primitive guard fires.
         check("static_field_string_refuses_I", rejected_into("I", std::string{ "x" }));
+    }
+
+    // ======================================================================
+    // SECTION 18 — READ-SIDE element-width guard predicate (pure logic).
+    //
+    // field_proxy::value_t::read_array_value applies the SYMMETRIC counterpart
+    // of the write-side size guard above: before reading a primitive array into
+    // a std::vector<T>, it refuses the read when sizeof(the requested C++
+    // element) disagrees with the array's actual JVM element width.  That width
+    // is derived by stripping the leading '[' from the field descriptor and
+    // consulting the SAME jvm_primitive_byte_width oracle Section 1 exhausts
+    // (i.e. jvm_primitive_byte_width(signature.substr(1)) for an "[X" array).
+    //
+    // The decision is pure logic and JVM-independent: this section pins the
+    // element-descriptor extraction and the accept(==) / refuse(!=) predicate
+    // for every primitive array form, so a regression in the read guard's width
+    // arithmetic is caught here with no oop / running JVM.  (The end-to-end read
+    // refusal on a live array — empty vector, no OOB — is the JVM sibling
+    // module field_arrays_primitive.cpp's job.)
+    // ----------------------------------------------------------------------
+    {
+        // Models the exact predicate read_array_value evaluates for an "[X"
+        // descriptor: refuse iff the array is a known primitive ([X with a
+        // primitive X) AND the requested element width differs from X's width.
+        // Matching widths (and non-primitive / non-array descriptors) accept.
+        auto read_guard_refuses{ [](std::string_view sig, std::size_t requested_width) -> bool
+        {
+            if (sig.size() < 2 || sig.front() != '[') { return false; }
+            const std::size_t element_width{ jvm_primitive_byte_width(sig.substr(1)) };
+            return element_width != 0 && requested_width != element_width;
+        } };
+
+        // Element-descriptor extraction yields each primitive's width.
+        check("read_elem_width_Z_is_1", jvm_primitive_byte_width(std::string_view{ "[Z" }.substr(1)) == 1);
+        check("read_elem_width_B_is_1", jvm_primitive_byte_width(std::string_view{ "[B" }.substr(1)) == 1);
+        check("read_elem_width_S_is_2", jvm_primitive_byte_width(std::string_view{ "[S" }.substr(1)) == 2);
+        check("read_elem_width_C_is_2", jvm_primitive_byte_width(std::string_view{ "[C" }.substr(1)) == 2);
+        check("read_elem_width_I_is_4", jvm_primitive_byte_width(std::string_view{ "[I" }.substr(1)) == 4);
+        check("read_elem_width_F_is_4", jvm_primitive_byte_width(std::string_view{ "[F" }.substr(1)) == 4);
+        check("read_elem_width_J_is_8", jvm_primitive_byte_width(std::string_view{ "[J" }.substr(1)) == 8);
+        check("read_elem_width_D_is_8", jvm_primitive_byte_width(std::string_view{ "[D" }.substr(1)) == 8);
+
+        // Matching-width reads are ACCEPTED (guard does not fire) -- the
+        // byte-identical fast path.  One representative per width.
+        check("read_match_int32_into_arrI_accepts",  !read_guard_refuses("[I", sizeof(std::int32_t)));   // 4 == 4
+        check("read_match_int64_into_arrJ_accepts",  !read_guard_refuses("[J", sizeof(std::int64_t)));   // 8 == 8
+        check("read_match_int16_into_arrS_accepts",  !read_guard_refuses("[S", sizeof(std::int16_t)));   // 2 == 2
+        check("read_match_int8_into_arrB_accepts",   !read_guard_refuses("[B", sizeof(std::int8_t)));    // 1 == 1
+        check("read_match_float_into_arrF_accepts",  !read_guard_refuses("[F", sizeof(float)));          // 4 == 4
+        check("read_match_double_into_arrD_accepts", !read_guard_refuses("[D", sizeof(double)));         // 8 == 8
+
+        // The two headline UNSAFE mismatches the JVM module now hard-asserts:
+        //   NARROWER: [J (8B) read as int32 (4B) -> silent garbage, REFUSED.
+        //   WIDER:    [I (4B) read as int64 (8B) -> out-of-bounds, REFUSED.
+        check("read_narrow_int32_from_arrJ_refused", read_guard_refuses("[J", sizeof(std::int32_t)));    // 4 != 8
+        check("read_wider_int64_from_arrI_refused",  read_guard_refuses("[I", sizeof(std::int64_t)));    // 8 != 4
+
+        // FULL off-diagonal sweep: requested width {1,2,4,8} x array element
+        // width {1,2,4,8}.  Diagonal accepts, every off-diagonal refuses.  Array
+        // descriptors per width: 1="[B", 2="[S", 4="[I", 8="[J".
+        const char* const desc[]{ "[B", "[S", "[I", "[J" };
+        const std::size_t width[]{ 1u, 2u, 4u, 8u };
+        bool sweep_ok{ true };
+        for (std::size_t f{ 0 }; f < 4 && sweep_ok; ++f)
+        {
+            for (std::size_t v{ 0 }; v < 4; ++v)
+            {
+                const bool refused{ read_guard_refuses(desc[f], width[v]) };
+                const bool expect_refused{ width[v] != width[f] };
+                if (refused != expect_refused) { sweep_ok = false; break; }
+            }
+        }
+        check("read_guard_full_width_matrix", sweep_ok);
+
+        // Non-array / non-primitive-element descriptors NEVER trigger the read
+        // guard (it only gates genuine "[<primitive>" arrays): an object array,
+        // a multi-dim array, a bare primitive, a reference, and the empty string
+        // all return "do not refuse" regardless of the requested width.
+        check("read_guard_skips_object_array",   !read_guard_refuses("[Ljava/lang/String;", 8));
+        check("read_guard_skips_multidim_array", !read_guard_refuses("[[I", 8));
+        check("read_guard_skips_bare_primitive", !read_guard_refuses("I", 8));
+        check("read_guard_skips_reference",      !read_guard_refuses("Ljava/lang/Object;", 8));
+        check("read_guard_skips_empty",          !read_guard_refuses("", 8));
+        check("read_guard_skips_lone_bracket",   !read_guard_refuses("[", 8));
     }
 
     return failures == 0 ? 0 : 1;
