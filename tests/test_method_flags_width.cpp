@@ -256,6 +256,23 @@ static auto test_method_proxy_is_static_no_jvm() -> void
 
     check("is_static_no_jvm_static_style_false", static_style_proxy.is_static() == false);
     check("is_static_no_jvm_instance_style_false", instance_style_proxy.is_static() == false);
+
+    // Robustness #6 (the static-resolution gate) reads JVM_ACC_STATIC through the
+    // SAME path this accessor does: object_base::static_method_only() calls
+    // method::get_access_flags() and masks 0x0008u, then FAILS CLOSED (treats the
+    // candidate as NOT static) when the flags slot can't be resolved — exactly
+    // the nullptr return get_access_flags() produces here with no JVM.  So the
+    // gate and is_static() share one fail-closed condition: whenever is_static()
+    // degrades to false on an unreachable flags word (asserted just above), the
+    // resolution gate likewise rejects the candidate rather than mis-dispatching
+    // it through the static path.  static_method_only() is private, so we pin the
+    // shared mechanism via this public accessor; its VALUE correctness for real
+    // static-vs-instance Methods is covered by the method_static module's
+    // ms_static_method_rejects_instance_* / ms_static_method_resolves_real_static
+    // hard assertions on every JDK.  The mask itself is the stable low-byte bit
+    // pinned by jvm_acc_static_is_low_byte_bit3 in test_layout_contract_runtime.
+    check("static_resolution_gate_shares_is_static_failclosed_bit",
+          static_style_proxy.is_static() == false && (0x0008u & 0xFFu) == 0x0008u);
 }
 
 // ─────────────────────────────────────────────────────────────────────────

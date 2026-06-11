@@ -698,17 +698,15 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
         ctx.check("miss_base_long_is_nullopt",        !get("miss_base_long").resolved);
         ctx.check("miss_smap_long_is_nullopt",        !get("miss_smap_long").resolved);
         ctx.check("miss_smap_empty_is_nullopt",       !get("miss_smap_empty").resolved);
-        // The static overload must NOT find an instance method just by name+sig:
-        // process(I)I is an INSTANCE method, so the static-by-type_index lookup
-        // resolves the klass and walks methods; it WILL find process(I)I by
-        // name+signature (the static overload does not filter on JVM_ACC_STATIC).
-        // This documents the real behaviour: it RESOLVES (returns a proxy with a
-        // null owning object).  Calling it as static would be wrong, but the
-        // LOOKUP itself is signature-exact and succeeds.
-        ctx.check("static_lookup_of_instance_name_resolves",
-                  get("miss_static_name_is_instance").resolved);
-        ctx.check("static_lookup_of_instance_name_sig_exact",
-                  get("miss_static_name_is_instance").sig_text == SIG_PROC_I);
+        // The static overload must NOT find an instance method just by name+sig.
+        // process(I)I is an INSTANCE method; the static-by-type_index lookup now
+        // filters on JVM_ACC_STATIC (fix: static get_method ACC_STATIC guard), so
+        // it correctly REJECTS process(I)I by name+signature.  Resolving an
+        // instance method via the static path was always wrong (it yielded a proxy
+        // with a null owning object that misbehaves if called static); the lookup
+        // now refuses it outright rather than handing back that footgun proxy.
+        ctx.check("static_lookup_of_instance_name_rejected",
+                  !get("miss_static_name_is_instance").resolved);
 
         // ===================================================================
         //  SAFE NO-OP: the wrong-signature guarded call never dispatched, so it
