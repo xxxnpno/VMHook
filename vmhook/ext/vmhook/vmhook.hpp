@@ -979,99 +979,6 @@ namespace vmhook
 #endif
         }
 
-#if VMHOOK_OS_WINDOWS && defined(_MSC_VER)
-        /*
-            @brief MSVC-only SEH-guarded raw copy used by safe_read_fast.
-            @details
-            Kept in its own tiny function whose only locals are PODs so the
-            compiler never needs C++ object unwinding inside the __try block
-            (MSVC C2712).  EXCEPTION_EXECUTE_HANDLER catches the access
-            violation a bad `src` raises and turns it into a clean `false`;
-            on the no-fault path this is a plain memcpy with zero syscall and
-            only the table-based SEH prologue cost (effectively free).
-        */
-        inline auto seh_guarded_copy(void* dst, const void* src, std::size_t size) noexcept -> bool
-        {
-            __try
-            {
-                std::memcpy(dst, src, size);
-                return true;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                return false;
-            }
-        }
-#endif
-
-        /*
-            @brief Fault-safe read that favours the cheapest no-fault path.
-            @details
-            Same all-or-nothing contract and return value as safe_read (true iff
-            all `size` bytes were copied; never faults on a bad/unmapped `src`),
-            but optimised for the common case where `src` is mapped and readable
-            — the GC-safe field_proxy hot path re-resolves a LIVE class mirror
-            before reading, so a fault there is essentially impossible and paying
-            a kernel round-trip (ReadProcessMemory / process_vm_readv) per read
-            is pure overhead.
-
-            Cheap path per platform:
-              * Windows (MSVC): SEH-guarded memcpy — table-based, no syscall.
-              * Linux / Android: a PRE-INSTALLED (install-once) SIGSEGV/SIGBUS
-                handler + a per-read sigsetjmp around a direct memcpy — no
-                process_vm_readv syscall on the no-fault path.
-            On a fault (or when the cheap path is unavailable: MinGW Windows,
-            macOS, iOS, unknown) it delegates to safe_read, which uses the
-            kernel-validated primitive that returns false without faulting.  The
-            bytes returned on success are byte-identical to safe_read's, so this
-            is a drop-in replacement with no behavioural change on the value.
-        */
-        inline auto safe_read_fast(void* dst, const void* src, std::size_t size) noexcept -> bool
-        {
-            if (!dst || !src || size == 0)
-            {
-                return false;
-            }
-#if VMHOOK_OS_WINDOWS && defined(_MSC_VER)
-            if (seh_guarded_copy(dst, src, size))
-            {
-                return true;
-            }
-            // SEH caught a fault: fall back to the kernel-validated read so the
-            // result (false on a genuinely bad pointer) is authoritative and dst
-            // is left exactly as safe_read would leave it.
-            return safe_read(dst, src, size);
-#elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
-            // Cheap path: signal-guarded direct memcpy, skipping the
-            // process_vm_readv syscall.  install_once() arms the handler the
-            // first time through (cost paid once per process, not per read).
-            if (detail_signal::install_once())
-            {
-                detail_signal::probe_state state{};
-                state.active = true;
-                detail_signal::active_state = &state;
-                bool copied{ false };
-                if (::sigsetjmp(state.env, 1) == 0)
-                {
-                    std::memcpy(dst, src, size);
-                    copied = true;
-                }
-                detail_signal::active_state = nullptr;
-                if (copied && !state.fault)
-                {
-                    return true;
-                }
-            }
-            // Handler unavailable or the probe faulted: defer to safe_read,
-            // whose process_vm_readv path is kernel-validated and never faults.
-            return safe_read(dst, src, size);
-#else
-            // macOS / iOS / unknown: no cheaper portable fault-safe primitive
-            // than what safe_read already uses (mach_vm_read_overwrite, etc.).
-            return safe_read(dst, src, size);
-#endif
-        }
-
         /*
             @brief Hints the CPU/OS that an instruction range has been written.
         */
@@ -13301,70 +13208,67 @@ namespace vmhook
                 return value_t{ std::int32_t{}, this->signature_text };
             }
 
-            // Every field-byte read goes through os::safe_read_fast so a
-            // transiently-stale or unmapped address — e.g. a mirror caught mid
+            // Every field-byte read goes through os::safe_read (ReadProcessMemory
+            // on Windows / process_vm_readv + signal-guarded fallback on POSIX) so
+            // a transiently-stale or unmapped address — e.g. a mirror caught mid
             // relocation — returns the zero-initialized default instead of
-            // faulting (FLAW: stale-mirror crash).  safe_read_fast favours a
-            // cheap no-syscall fault-safe read on the common no-fault path
-            // (SEH-guarded memcpy on MSVC / a pre-installed-handler sigsetjmp
-            // memcpy on Linux) and only falls back to the kernel-validated
-            // os::safe_read (ReadProcessMemory / process_vm_readv) when a fault
-            // actually trips — so the GC-safe re-resolved read is near-free when
-            // the page is mapped, yet still copies the SAME bytes the previous
-            // memcpy read.  The local is zero-initialized first, so a failed read
-            // yields the same empty/zero result the null-pointer guard returns.
+            // faulting (FLAW: stale-mirror crash).  On a valid mapped page this is
+            // a kernel-validated copy of the SAME bytes the previous memcpy read,
+            // so a successful read returns the identical value as before.  The
+            // local is zero-initialized first, so a failed read yields the same
+            // empty/zero result the null-pointer guard above returns.
             if (this->signature_text == "Z")
             {
                 bool value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "B")
             {
                 std::int8_t value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "S")
             {
                 std::int16_t value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "I")
             {
                 std::int32_t value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "J")
             {
                 std::int64_t value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "F")
             {
                 float value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "D")
             {
                 double value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "C")
             {
                 std::uint16_t value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                vmhook::os::safe_read(&value, read_pointer, sizeof(value));
                 return value_t{ value, this->signature_text };
             }
 
             // Reference or array type - store compressed OOP
             std::uint32_t value{};
-            vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+            vmhook::os::safe_read(&value, read_pointer, sizeof(value));
             return value_t{ value, this->signature_text };
         }
 
@@ -13613,11 +13517,9 @@ namespace vmhook
             // GC-safety, mirrored from get(): re-resolve a STATIC field's address
             // through the GC-stable mirror_klass at read time so a relocated class
             // mirror never leaves us reading a stale slot; then read the bytes via
-            // os::safe_read_fast so a transiently-unmapped page recovers 0 instead
-            // of faulting, while the common mapped-slot case avoids a syscall
-            // (cheap fault-safe path, kernel fallback only on a real fault).  On a
-            // valid mapped slot this returns the same 4 bytes the previous memcpy
-            // did (instance / fast path unchanged).
+            // os::safe_read so a transiently-unmapped page recovers 0 instead of
+            // faulting.  On a valid mapped slot this returns the same 4 bytes the
+            // previous memcpy did (instance / fast path unchanged).
             void* read_pointer{ this->field_pointer };
             if (this->mirror_klass)
             {
@@ -13633,7 +13535,7 @@ namespace vmhook
                 return 0;
             }
             std::uint32_t value{};
-            vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+            vmhook::os::safe_read(&value, read_pointer, sizeof(value));
             return value;
         }
 
