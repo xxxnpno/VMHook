@@ -474,9 +474,11 @@ int main()
         check("make_java_string_astral_unicode_does_not_throw", !threw);
     }
     {
-        // Over the documented 4096-char cap: the cap logic lives AFTER the
-        // find_class guard, so with no JVM a long input is still a clean
-        // nullptr (and, importantly, no oversized allocation is attempted).
+        // A long (10000-char) input: make_java_string no longer truncates it
+        // (robustness #9 — over-cap inputs route through the GC-aware NewString
+        // fallback in full).  Either way the find_class guard fires FIRST with no
+        // JVM, so a long input is still a clean nullptr here (and, importantly, the
+        // decode/allocation never even runs because find_class returns null first).
         const std::string long_input(10000, 'x');
         void* result{ nullptr };
         bool  threw{ false };

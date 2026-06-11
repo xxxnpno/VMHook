@@ -598,7 +598,10 @@ VMHOOK_JVM_MODULE(return_set_arg)
             ctx.check("set_arg_string2_long_body_len_5000", set_arg_fixture::get_string_len_seen2() == 5000);
             ctx.record("[INFO] set_arg long-string: body observed length " +
                        std::to_string(set_arg_fixture::get_string_len_seen2()) +
-                       " (correct=5000; 4096 would indicate make_java_string truncation parity gap).");
+                       " (correct=5000; built via the JNI NewStringUTF fast path, which has no "
+                       "length cap. make_java_string is only the fallback here and, since "
+                       "robustness #9, it too builds over-cap inputs in full - so neither path "
+                       "truncates to 4096).");
         }
 
         // non-ASCII UTF-8 -> body sees 6 Java chars, exact content preserved

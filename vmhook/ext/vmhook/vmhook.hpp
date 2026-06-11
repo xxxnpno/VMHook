@@ -10966,14 +10966,25 @@ namespace vmhook
             TLAB encode path and the GC-aware JNI NewString fallback share ONE source
             of truth for the byte->char-unit conversion (they must agree exactly).
             Malformed sequences yield U+FFFD; astral code points (>= U+10000) become a
-            surrogate pair.  The result is capped at 4096 code units to match the
-            ceiling read_java_string enforces.
+            surrogate pair.
+
+            This decodes the FULL input — it does NOT truncate.  A previous version
+            capped the result at 4096 code units, which made make_java_string SILENTLY
+            produce a SHORTER String for any input over the cap (a 5000-char input
+            yielded a 4096-char String that did NOT equal the original, with no error
+            — robustness bug #9).  The length decision now lives entirely in the
+            caller: make_java_string builds inputs up to the TLAB/read_java_string
+            ceiling on the fast TLAB path, and routes longer inputs through the
+            GC-aware JNIEnv::NewString fallback (which the JVM constructs faithfully
+            at any length).  Keeping the decode lossless is what lets that fallback
+            return the full, correct String.
 
             Complexity: O(N).  Exception safety: noexcept-equivalent (only std::vector
             growth, which the caller treats as fatal-on-throw via the noexcept callers).
 
             @param value  UTF-8 input text.
-            @return  UTF-16 code units (LE in-memory), length <= 4096.
+            @return  UTF-16 code units (LE in-memory), one per BMP char and two per
+                     astral code point — the complete decode, never truncated.
         */
         inline auto utf8_to_utf16(const std::string_view value)
             -> std::vector<std::uint16_t>
@@ -11024,10 +11035,11 @@ namespace vmhook
                 i += adv;
             }
 
-            if (units.size() > 4096u)
-            {
-                units.resize(4096u);
-            }
+            // No truncation here: return the complete decode.  make_java_string
+            // picks the build path off units.size() (TLAB fast path for inputs
+            // within the read_java_string ceiling, GC-aware JNIEnv::NewString for
+            // longer ones), so capping here would silently shorten the String the
+            // caller asked for.
             return units;
         }
 
@@ -12551,12 +12563,23 @@ namespace vmhook
           - Compact:  allocates a byte[] ("[B"), copies UTF-8 bytes directly, sets coder=0 (LATIN1).
           - Classic:  allocates a char[] ("[C"), widens each byte to uint16.
         Sets the "value" field of the String to the encoded OOP of the backing array.
-        Capped at 4096 characters to avoid oversized allocations.
+
+        LENGTH HANDLING (no silent truncation): inputs whose decoded UTF-16 length is
+        within the TLAB / read_java_string ceiling (k_tlab_string_max_units, 4096)
+        take the fast hand-built TLAB path above.  LONGER inputs are NOT truncated —
+        they are built in full by the GC-aware JNIEnv::NewString fallback, which the
+        JVM constructs faithfully at any length, so the returned String EQUALS the
+        complete input.  (Previously the decode was capped at 4096, so a 5000-char
+        input silently produced a 4096-char String that did not equal the original;
+        robustness bug #9.)  Note that read_java_string still reads back at most 4096
+        chars via its fixed body buffer, so the native readback of an over-cap String
+        is a separate, documented limit — the Java-visible String itself is complete.
 
         Complexity: O(N) where N = length of value.
         Exception safety: noexcept — returns nullptr on any allocation failure.
 
-        @param value  UTF-8 text to encode as a Java String (capped at 4096 chars).
+        @param value  UTF-8 text to encode as a Java String (any length; over-cap
+                      inputs route through the GC-aware JNI NewString fallback).
         @return  Raw java.lang.String OOP, or nullptr on failure.
     */
     inline auto make_java_string(const std::string_view value) noexcept
@@ -12582,6 +12605,15 @@ namespace vmhook
         // the identical code units.
         const std::vector<std::uint16_t> units{ vmhook::detail::utf8_to_utf16(value) };
         const std::int32_t char_count{ static_cast<std::int32_t>(units.size()) };
+
+        // Largest decoded length the hand-built TLAB fast path constructs.  This
+        // mirrors the ceiling read_java_string can read back (its fixed 8192-byte
+        // body buffer == 4096 chars * 2), so the TLAB product stays round-trippable
+        // by read_java_string.  Inputs LONGER than this are NOT truncated: they fall
+        // through to the GC-aware JNIEnv::NewString fallback below, which builds the
+        // full String inside the JVM at any length (so the result equals the whole
+        // input).  This is the fix for the silent >4096 truncation (robustness #9).
+        constexpr std::int32_t k_tlab_string_max_units{ 4096 };
 
         // A compact (JDK 9+) String may use the LATIN1 coder only when every
         // code unit fits in one byte; otherwise it must use the UTF16 coder.
@@ -12688,26 +12720,47 @@ namespace vmhook
             return string_oop;
         } };
 
-        if (void* const tlab_string_oop{ build_via_tlab() })
+        // The hand-built TLAB path is only attempted for inputs within the
+        // round-trippable ceiling.  For longer inputs we deliberately SKIP it (its
+        // hand-stamped backing array is validated only up to the cap, and
+        // read_java_string would not read it back past 4096) and go straight to the
+        // GC-aware JNIEnv::NewString fallback below, which builds the full String in
+        // the JVM.  The ONLY difference for an over-cap input is which path makes it
+        // — it is built completely either way, never truncated.
+        if (char_count <= k_tlab_string_max_units)
         {
-            return tlab_string_oop;
+            if (void* const tlab_string_oop{ build_via_tlab() })
+            {
+                return tlab_string_oop;
+            }
         }
 
-        // ADDITIVE GC-aware fallback (the fast path above is unchanged and ran
-        // first): the TLAB path returned null because the String instance or its
-        // backing array could not be allocated without a GC.  Rebuild the entire
-        // String — instance AND backing array, rooted internally by the JVM for
-        // the whole operation — via the GC-aware JNIEnv::NewString slow path,
-        // using the SAME code units we just computed (content-exact for every
-        // code point, including astral surrogate pairs).  No unrooted
-        // intermediate oop is exposed, so this is GC-safe; it only runs on the
-        // already-failing path, so it cannot regress any config where the TLAB
-        // path currently succeeds.
+        // GC-aware fallback.  Reached on two paths, both ADDITIVE to the unchanged
+        // fast path above:
+        //   (1) the TLAB path was attempted (char_count <= cap) but returned null
+        //       because the String instance or its backing array could not be
+        //       allocated without a GC; or
+        //   (2) char_count > cap, so we intentionally bypassed the TLAB path to
+        //       build the over-cap String in full here rather than truncating it.
+        // Either way, rebuild the entire String — instance AND backing array, rooted
+        // internally by the JVM for the whole operation — via the GC-aware
+        // JNIEnv::NewString slow path, using the SAME code units we just computed
+        // (content-exact for every code point, including astral surrogate pairs, at
+        // any length).  No unrooted intermediate oop is exposed, so this is GC-safe;
+        // and for case (1) it only runs on the already-failing path, so it cannot
+        // regress any config where the TLAB path currently succeeds.
         if (void* const jni_string_oop{ vmhook::detail::jni_new_string_utf16(units) })
         {
-            VMHOOK_LOG("{} vmhook::make_java_string(): TLAB encode path failed; recovered via the "
-                       "GC-aware JNIEnv::NewString fallback ({} code units).",
-                       vmhook::info_tag, char_count);
+            // Bind the reason to a named lvalue (not a ternary prvalue) before
+            // logging: std::make_format_args takes its arguments by lvalue
+            // reference, so an inline temporary would not bind on the stricter
+            // standard libraries.
+            const char* const fallback_reason{ char_count > k_tlab_string_max_units
+                                                   ? "input exceeds the TLAB fast-path cap"
+                                                   : "TLAB encode path failed" };
+            VMHOOK_LOG("{} vmhook::make_java_string(): built java.lang.String via the "
+                       "GC-aware JNIEnv::NewString fallback ({} code units; {}).",
+                       vmhook::info_tag, char_count, fallback_reason);
             return jni_string_oop;
         }
 

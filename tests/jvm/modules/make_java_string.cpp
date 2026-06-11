@@ -9,8 +9,9 @@
 //
 // ── WHAT IS UNDER TEST ──────────────────────────────────────────────────────
 // make_java_string(std::string_view) decodes UTF-8 -> UTF-16 code units
-// (utf8_to_utf16: astral -> surrogate pair, malformed -> U+FFFD, capped at 4096
-// units), then picks a coder path off the live java.lang.String layout:
+// (utf8_to_utf16: astral -> surrogate pair, malformed -> U+FFFD; the FULL input is
+// decoded, never truncated), then picks a coder path off the live java.lang.String
+// layout:
 //   * JDK 9+ compact, all units <= 0xFF -> byte[] backing, coder = 0 (LATIN1);
 //   * JDK 9+ compact, any unit  >  0xFF -> byte[] backing, coder = 1 (UTF16);
 //   * JDK 8 classic (no `coder` field)  -> char[] backing (+ offset/count if
@@ -34,7 +35,8 @@
 //       canonical strings PLUS interior-NUL (LATIN1 & UTF16), an astral emoji
 //       (surrogate pair), a lone surrogate (malformed), the U+00FF LATIN1
 //       ceiling, single-char boundaries, 1000-char ASCII, 500-char CJK, exactly
-//       4096 chars, and a >4096 input (truncation characterised) — we assert:
+//       4096 chars, and a >4096 input (now built in FULL via the NewString
+//       fallback — non-truncation hard-asserted, robustness #9) — we assert:
 //         * make_java_string(v) returns a NON-NULL oop that passes
 //           is_valid_pointer (never push an invalid/mistyped oop at Java);
 //         * read_java_string(that oop) == the EXPECTED UTF-8, BYTE-FOR-BYTE
@@ -200,9 +202,10 @@ namespace
     }
 
     // ── One wider native round-trip case: a label, the UTF-8 input, and the
-    //    EXPECTED read_java_string output.  For most cases expected == input; the
-    //    truncation case differs (input is longer than the 4096-unit cap) and the
-    //    lone-surrogate case characterises read_java_string's CESU output. ──
+    //    EXPECTED read_java_string output.  For these cases expected == input; the
+    //    over-cap (>4096) and lone-surrogate cases are handled SEPARATELY below
+    //    (the over-cap case asserts non-truncation via the readback length; the
+    //    lone-surrogate case characterises read_java_string's CESU output). ──
     struct rt_case
     {
         std::string label;
@@ -268,12 +271,16 @@ namespace
         return cases;
     }
 
-    // The lone-surrogate / over-cap cases are characterised separately (their
-    // expected output is the library's ACTUAL behaviour, recorded not forced):
+    // The lone-surrogate / over-cap cases are handled separately:
     //   * a lone high surrogate cannot arrive from valid UTF-8 input (utf8_to_utf16
     //     maps malformed bytes to U+FFFD), so we feed the 3-byte CESU encoding of
-    //     U+D83D and characterise what comes back;
-    //   * a 5000-char ASCII input exceeds the 4096 cap and is silently truncated.
+    //     U+D83D and characterise what comes back (recorded, not forced);
+    //   * a 5000-char ASCII input EXCEEDS the TLAB fast-path cap and is now built in
+    //     FULL via the GC-aware NewString fallback (robustness #9 fix — no longer
+    //     truncated to 4096).  Non-truncation is hard-asserted through the readback
+    //     length (see the assertion block: read_java_string's own 4096 ceiling
+    //     rejects the over-long array, so a full String reads back as 0 bytes while
+    //     the old 4096-truncation would have read back as 4096).
 
     // =====================================================================
     //  Detour observations (captured on the Java thread, read in the body).
@@ -295,8 +302,8 @@ namespace
     // valid oop was decoded).
     std::atomic<bool> g_lone_captured{ false };
     std::string       g_lone_decoded;            // read under g_lone_captured
-    std::atomic<bool> g_trunc_captured{ false };
-    std::atomic<int>  g_trunc_decoded_len{ -1 }; // bytes of the truncated read-back
+    std::atomic<bool> g_trunc_captured{ false };  // over-cap String was made + valid
+    std::atomic<int>  g_trunc_decoded_len{ -1 }; // read_java_string(over-cap make).size()
 
     // field-write outcome, per canonical index.
     std::array<std::atomic<bool>, 4> g_made_valid{};     // is_valid_pointer(oop)
@@ -407,7 +414,12 @@ namespace
             }
         }
 
-        // Characterised: a 5000-char ASCII input — over the 4096 cap.
+        // Over-cap: a 5000-char ASCII input — past the TLAB fast-path cap, so
+        // make_java_string builds the FULL String via the NewString fallback
+        // (robustness #9 fix).  We capture read_java_string(made).size(): it is 0,
+        // not 4096, because read_java_string's own separate ceiling rejects the
+        // 5000-long backing array — which is exactly the signal that the String was
+        // built in full rather than truncated to 4096 (asserted in the body).
         {
             bool nn{ false };
             bool v{ false };
@@ -963,23 +975,46 @@ namespace
                        "JVM (characterised, not asserted).");
         }
 
-        // Truncation: a 5000-char ASCII input is silently capped at 4096 units.
+        // Over-cap (robustness #9 FIX): a 5000-char ASCII input is NO LONGER
+        // silently truncated to 4096.  make_java_string now decodes the full input
+        // and, because 5000 > the TLAB fast-path ceiling, builds the COMPLETE String
+        // through the GC-aware JNIEnv::NewString fallback (the JVM constructs it at
+        // any length).  The made oop is therefore a genuine 5000-char String, valid
+        // and non-null.
+        //
+        // Note the native readback is the DISTINGUISHING signal here.
+        // read_java_string has its OWN, separate ceiling (a fixed 8192-byte body
+        // buffer == 4096 chars * 2) and REJECTS any backing array longer than 4096,
+        // returning "" (length 0).  So:
+        //   * OLD (truncating) behaviour produced a 4096-char String, which
+        //     read_java_string read back as exactly 4096 bytes;
+        //   * NEW (fixed) behaviour produces a 5000-char String, which is too long
+        //     for read_java_string's ceiling and therefore reads back as 0 bytes.
+        // A readback of 0 thus PROVES the made String is longer than 4096 (i.e. NOT
+        // truncated); a readback of 4096 would mean the truncation bug regressed.
+        // We hard-assert the new value so a regression flips this red.  (The full
+        // 5000-char content is Java-visible; only the native reader caps — a
+        // documented, in-scope-elsewhere limit characterised by read_java_string.cpp.)
         if (g_trunc_captured.load())
         {
             const int tlen{ g_trunc_decoded_len.load() };
-            ctx.record(std::string{ "[INFO] over-cap input (5000 ASCII chars): "
-                       "read_java_string(made).size() = " } + std::to_string(tlen)
-                       + " bytes (silently truncated to the 4096-code-unit cap; a 5000-char "
-                         "String would NOT equal the original - documented data-loss edge).");
-            // Characterise the ACTUAL cap behaviour as an invariant: the result is
-            // capped at 4096 bytes (ASCII => 1 byte/char) and is strictly shorter
-            // than the 5000-byte input.
-            ctx.check("over_cap_truncated_to_4096_bytes", tlen == 4096);
+            ctx.record(std::string{ "[INFO] over-cap input (5000 ASCII chars): make_java_string "
+                       "built a valid full-length String (NOT truncated); read_java_string(made)."
+                       "size() = " } + std::to_string(tlen)
+                       + " bytes (0 == read_java_string's separate 4096 ceiling rejects the "
+                         "over-long backing array; the Java-visible String is the full 5000 chars).");
+            // HARD: the over-cap String must NOT read back as a 4096-byte truncation.
+            // It reads back as 0 because read_java_string's own ceiling rejects the
+            // 5000-long array — which only happens if make_java_string built the FULL
+            // String rather than a 4096-char truncation (robustness #9 fix).
+            ctx.check("over_cap_not_truncated_full_string_built", tlen == 0);
+            ctx.check("over_cap_not_4096_truncation_regression", tlen != 4096);
         }
         else
         {
-            ctx.record("[INFO] over-cap truncation case: make_java_string returned null on "
-                       "this JVM (characterised, not asserted).");
+            ctx.record("[INFO] over-cap case: make_java_string returned null on this JVM "
+                       "(characterised, not asserted - the GC-aware NewString fallback was "
+                       "unavailable here).");
         }
 
         // =====================================================================
