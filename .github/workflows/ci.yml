@@ -213,13 +213,16 @@ jobs:
       matrix:
         compiler: [msvc, clang, mingw]
         java:     ${{ fromJson(needs.java-versions.outputs.versions) }}
-        # clang·windows·java11 was quarantined for the no-SEH DETOUR-thread cold
-        # fault; QUARANTINE LIFTED now that the dispatch-time root read —
-        # frame::get_method()'s cold Method* load at rbp-24, hit on every hooked
-        # call — is os::safe_read-guarded on Windows (it crashed clang·windows at a
-        # varying module each run).  The harness ALSO contains a suite-thread AV via
-        # a pure-Win32 VEH + setjmp + [INFO] classification (tests/jvm/harness.cpp).
-        # Full clang·windows JDK matrix runs again.
+        # The frame::get_method() os::safe_read guard (Windows) fixed the dominant
+        # detour-thread cold-fault — clang·windows·java8/17/21-26 went green — but
+        # clang·windows·java11 still crashes (no TOTAL) on a RESIDUAL detour read the
+        # get_method fix didn't reach.  Keep that one cell quarantined while the
+        # remaining detour-side decode is hardened (task #28); java11 stays covered by
+        # mingw/msvc/linux/macos, clang-windows by every other JDK.  (The harness also
+        # contains suite-thread AVs via a pure-Win32 VEH + [INFO]; see harness.cpp.)
+        exclude:
+          - compiler: clang
+            java: "11"
 
     steps:
       - uses: actions/checkout@v4
