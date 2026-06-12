@@ -228,6 +228,23 @@ if(VMHOOK_BUILD_EXAMPLE)
     # Self-contained on MinGW: java.exe's LoadLibraryW must resolve this DLL with
     # no external libstdc++-6 / libgcc_s_seh-1 / libwinpthread-1 on its search path.
     vmhook_static_runtime(vmhook_example)
+    # no-SEH ACCESS-VIOLATION containment for Clang-on-Windows.  A cold OOP/Klass
+    # deref that slips past is_valid_pointer can fault; the modular harness wraps
+    # each module so one bad module can't take the JVM down, but that only works if
+    # the fault is catchable: MSVC uses __try/__except, MinGW relies on os::safe_read
+    # hardening, and Clang-on-Windows had NEITHER — its __try doesn't trap AVs and a
+    # plain catch(...) can't see a hardware fault without asynchronous-exception
+    # codegen.  -fasync-exceptions (Clang's /EHa equivalent) makes the fault unwind
+    # as a catchable exception so the harness's per-module catch(...) contains it,
+    # running RAII / unhooking on the way out, instead of crashing the whole suite
+    # mid-run.  Flag-guarded so an older Clang without it simply builds unchanged.
+    if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag("-fasync-exceptions" VMHOOK_HAS_FASYNC_EXCEPTIONS)
+        if(VMHOOK_HAS_FASYNC_EXCEPTIONS)
+            target_compile_options(vmhook_example PRIVATE -fasync-exceptions)
+        endif()
+    endif()
     set_target_properties(vmhook_example PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
