@@ -3,8 +3,13 @@ package vmhook.fixtures;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
+import java.util.Stack;
+import java.util.Vector;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import vmhook.Harness;
 
@@ -65,6 +70,41 @@ import vmhook.Harness;
  *       * Collections.singletonList(x)   -&gt; Collections$SingletonList (field "element")
  *       * Collections.unmodifiableList() -&gt; Collections$UnmodifiableList (field "list"
  *                                          -&gt; backing ArrayList, re-walked by hand)
+ *       * Collections.synchronizedList() -&gt; Collections$SynchronizedList (field "c"
+ *                                          -&gt; backing ArrayList, re-walked by hand)
+ *
+ *   - the other RandomAccess / legacy List families, each reached by its own
+ *     stable backing-field shape:
+ *       * java.util.Vector / java.util.Stack -&gt; "elementData" Object[] bounded by
+ *         "elementCount" (NOT "size"!): empty / many (default cap 10 grows to 20,
+ *         so size != elementData.length) / ensureCapacity(100) (size != capacity)
+ *         / with-null / size-2.  The Vector bound MUST be elementCount, never
+ *         elementData.length — the SAME size-vs-capacity property the ArrayList
+ *         oversized case proves, on a container whose grow policy DOUBLES capacity.
+ *       * java.util.concurrent.CopyOnWriteArrayList -&gt; "array" Object[] whose
+ *         length IS the size (no separate size field): empty / many / with-null
+ *         (COW permits null) / size-2.
+ *       * boxed element type: ArrayList&lt;Integer&gt; / Vector&lt;Integer&gt; whose elements
+ *         are java.lang.Integer; the native side reads Integer.value per slot
+ *         (order == value), proving the backing walk is element-type-agnostic.
+ *       * nested List-of-Map: an outer ArrayList whose elements are HashMaps; the
+ *         outer walk recovers each inner Map OOP and proves it is a real, distinct
+ *         heap object (Map CONTENT decode is collection_map's job, not this one).
+ *
+ *   - List families the backing-field walk deliberately CHARACTERIZES rather than
+ *     decodes (it pins the Java-published size() as an oracle and records [INFO],
+ *     never FAILs — exactly the CollSet.java handling for non-fast-path Sets):
+ *       * List.of(...) (JDK 9+ immutable, built reflectively so the fixture still
+ *         compiles at -source 8).  List.of() / List.of(4 elems) are ListN ("elements"
+ *         Object[]) and ARE hand-walked; List.of(1) / List.of(1,2) are List12 whose
+ *         absent second slot "e1" holds a shared non-null EMPTY SENTINEL object (not
+ *         null), so a raw e0/e1 read cannot tell size-1 from size-2 without size()
+ *         — those two are characterized, not decoded.  `listOfAvailable` is false on
+ *         Java 8.
+ *       * subList(from, to) views (ArrayList- and LinkedList-backed): the backing
+ *         field shape moved across JDKs (8: "parent"/"parentOffset"; 9+:
+ *         "root"/"parent"/"offset") with no element array of its own, so the walk
+ *         characterizes them via the published size() instead of a fragile raw walk.
  *
  * Each Elem also carries a String `tag` ("e<id>") so the native side can do the
  * reference-field readback the scope asks for, through a wrapper it built from a
@@ -149,6 +189,27 @@ public final class CollList
 
     /** The id/tag of the Collections.singletonList(...) element. */
     public static final int SINGLETON_ID = 0;
+
+    /** Element count of the Vector / Stack / COW "many" lists (> default cap 10). */
+    public static final int VEC_MANY = 12;
+
+    /** Element count of the boxed-Integer lists. */
+    public static final int INT_LEN = 6;
+
+    /** Outer length of the nested List-of-Map. */
+    public static final int MAP_OUTER = 3;
+
+    /** Entry count of EACH map inside the nested List-of-Map. */
+    public static final int MAP_INNER = 2;
+
+    /** Element count of the List.of(...) ListN cases that ARE hand-walked. */
+    public static final int LISTOF_N = 4;
+
+    /** sublist window [SUB_FROM, SUB_TO) taken from the MANY lists. */
+    public static final int SUB_FROM = 3;
+    public static final int SUB_TO = 9;
+    /** Resulting size of the subList window (SUB_TO - SUB_FROM). */
+    public static final int SUB_LEN = SUB_TO - SUB_FROM;
 
     // ── ArrayList fields (each takes the "elementData"+"size" backing store) ─
     /** Empty ArrayList — size 0, the walk must be empty (no element read). */
@@ -236,6 +297,96 @@ public final class CollList
 
     /** Collections.unmodifiableList(arrMany) — wraps the 12-element ArrayList. */
     public List<Elem> unmodifiableView;
+
+    /** Collections.synchronizedList(arrMany) — backing field "c" -&gt; arrMany. */
+    public List<Elem> synchronizedView;
+
+    // ── Vector / Stack ("elementData" + "elementCount") ─────────────────────
+    /** Empty Vector — size 0, the elementData walk must be empty. */
+    public final Vector<Elem> vecEmpty = new Vector<Elem>();
+
+    /**
+     * Many-element Vector (VEC_MANY=12).  A default Vector starts at capacity 10
+     * and DOUBLES on grow, so after 12 adds elementData.length == 20 != size 12.
+     * The walk MUST bound by elementCount (12), never elementData.length (20) —
+     * the headline size-vs-capacity property, here on Vector's doubling policy.
+     */
+    public final Vector<Elem> vecMany = new Vector<Elem>();
+
+    /** Vector pre-sized to capacity 100 holding only VEC_MANY elems (size != cap). */
+    public final Vector<Elem> vecOversized = new Vector<Elem>(100);
+
+    /** Vector whose element at index NULL_AT is null (nullptr-slot proof). */
+    public final Vector<Elem> vecWithNull = new Vector<Elem>();
+
+    /** Size-2 Vector (smallest "more than one"). */
+    public final Vector<Elem> vecTwo = new Vector<Elem>();
+
+    /** Stack (extends Vector) with VEC_MANY pushed elements. */
+    public final Stack<Elem> stackMany = new Stack<Elem>();
+
+    // ── CopyOnWriteArrayList ("array" Object[], length == size) ──────────────
+    /** Empty COW list — backing "array" has length 0, the walk must be empty. */
+    public final CopyOnWriteArrayList<Elem> cowEmpty = new CopyOnWriteArrayList<Elem>();
+
+    /** Many-element COW list (VEC_MANY); "array".length == size (no slack). */
+    public final CopyOnWriteArrayList<Elem> cowMany = new CopyOnWriteArrayList<Elem>();
+
+    /** COW list whose element at index NULL_AT is null (COW permits null). */
+    public final CopyOnWriteArrayList<Elem> cowWithNull = new CopyOnWriteArrayList<Elem>();
+
+    /** Size-2 COW list. */
+    public final CopyOnWriteArrayList<Elem> cowTwo = new CopyOnWriteArrayList<Elem>();
+
+    // ── Boxed-Integer element lists (element decode is type-agnostic) ────────
+    /** ArrayList&lt;Integer&gt; with values 0..INT_LEN-1; native reads Integer.value. */
+    public final ArrayList<Integer> intArrList = new ArrayList<Integer>();
+
+    /** Vector&lt;Integer&gt; with values 0..INT_LEN-1 (elementData walk, boxed elems). */
+    public final Vector<Integer> intVecList = new Vector<Integer>();
+
+    // ── Nested List-of-Map (outer ArrayList walk -> inner Map OOPs) ──────────
+    /**
+     * Outer ArrayList whose elements are HashMaps.  The outer takes the ArrayList
+     * backing walk; each decoded element OOP is a Map the native side proves is a
+     * real, distinct heap object (Map content decode belongs to collection_map).
+     */
+    public final ArrayList<Map<String, Elem>> nestedMaps = new ArrayList<Map<String, Elem>>();
+
+    // ── subList views (CHARACTERIZED via size(), not decoded) ────────────────
+    /** ArrayList.subList(SUB_FROM, SUB_TO) over arrMany — ArrayList$SubList. */
+    public List<Elem> arrSubList;
+
+    /** LinkedList.subList(SUB_FROM, SUB_TO) over linkMany — AbstractList$SubList. */
+    public List<Elem> linkSubList;
+
+    // ── List.of(...) immutable (JDK 9+, built reflectively; CHARACTERIZED) ───
+    /** List.of() — ImmutableCollections$ListN, "elements" Object[] of length 0. */
+    public List<Elem> listOf0;
+
+    /** List.of(x) — ImmutableCollections$List12 (e0 real, e1 = EMPTY sentinel). */
+    public List<Elem> listOf1;
+
+    /** List.of(x,y) — ImmutableCollections$List12 (e0, e1 both real). */
+    public List<Elem> listOf2;
+
+    /** List.of(...4...) — ImmutableCollections$ListN, "elements" Object[] len 4. */
+    public List<Elem> listOfN;
+
+    /** True when List.of(...) resolved (JDK 9+); false on Java 8. */
+    public volatile boolean listOfAvailable;
+
+    // ── Published Java size() witnesses (plain int fields the native side reads
+    //    WITHOUT a Java call) for the characterized / cross-checked families ──
+    public volatile int arrSubListSize;
+    public volatile int linkSubListSize;
+    public volatile int listOf0Size;
+    public volatile int listOf1Size;
+    public volatile int listOf2Size;
+    public volatile int listOfNSize;
+    public volatile int synchronizedViewSize;
+    public volatile int vecManySize;
+    public volatile int cowManySize;
 
     private static volatile boolean populated;
 
@@ -336,8 +487,125 @@ public final class CollList
         emptyImmutable = Collections.<Elem>emptyList();          // EmptyList
         singletonView = Collections.singletonList(new Elem(SINGLETON_ID));
         unmodifiableView = Collections.unmodifiableList(arrMany);// wraps arrMany
+        synchronizedView = Collections.synchronizedList(arrMany);// backing "c"
+
+        // Vector / Stack: "elementData" + "elementCount".  vecMany grows 10->20 so
+        // size(12) != elementData.length(20); vecOversized is pre-sized to cap 100.
+        for (int i = 0; i < VEC_MANY; ++i)
+        {
+            vecMany.add(new Elem(i));
+            vecOversized.add(new Elem(i));
+            stackMany.push(new Elem(i));
+        }
+        for (int i = 0; i < NULL_LIST_LEN; ++i)
+        {
+            vecWithNull.add(i == NULL_AT ? null : new Elem(i));
+        }
+        for (int i = 0; i < TWO; ++i)
+        {
+            vecTwo.add(new Elem(i));
+        }
+
+        // CopyOnWriteArrayList: backing "array" whose length IS the size.  COW
+        // permits a null element (unlike List.of), so cowWithNull has a null slot.
+        for (int i = 0; i < VEC_MANY; ++i)
+        {
+            cowMany.add(new Elem(i));
+        }
+        for (int i = 0; i < NULL_LIST_LEN; ++i)
+        {
+            cowWithNull.add(i == NULL_AT ? null : new Elem(i));
+        }
+        for (int i = 0; i < TWO; ++i)
+        {
+            cowTwo.add(new Elem(i));
+        }
+
+        // Boxed-Integer element lists: ids == values 0..INT_LEN-1.
+        for (int i = 0; i < INT_LEN; ++i)
+        {
+            intArrList.add(Integer.valueOf(i));
+            intVecList.add(Integer.valueOf(i));
+        }
+
+        // Nested List-of-Map: MAP_OUTER HashMaps, each with MAP_INNER entries.
+        for (int j = 0; j < MAP_OUTER; ++j)
+        {
+            final Map<String, Elem> inner = new HashMap<String, Elem>();
+            for (int i = 0; i < MAP_INNER; ++i)
+            {
+                inner.put("k" + i, new Elem(i));
+            }
+            nestedMaps.add(inner);
+        }
+
+        // subList views over the MANY lists; characterized via published size().
+        arrSubList = arrMany.subList(SUB_FROM, SUB_TO);
+        linkSubList = linkMany.subList(SUB_FROM, SUB_TO);
+
+        // List.of(...) (JDK 9+) reflectively so this compiles at -source 8.
+        buildListOf();
+
+        // Published Java size() witnesses (read by the native side as plain int
+        // fields — no Java call from the worker body).
+        arrSubListSize = arrSubList.size();
+        linkSubListSize = linkSubList.size();
+        synchronizedViewSize = synchronizedView.size();
+        vecManySize = vecMany.size();
+        cowManySize = cowMany.size();
 
         populated = true;
+    }
+
+    /**
+     * Builds listOf0..listOfN via reflection on List.of(...) so this fixture still
+     * compiles at -source 8 (where List.of does not exist).  On Java 8 the methods
+     * are absent -> listOfAvailable stays false and the fields stay null (the
+     * native module skips its List.of coverage).  On Java 9+ the immutable lists
+     * are built and their size() published.  ListN ("elements" Object[]) IS
+     * hand-walked natively; List12 (e0/e1 with an EMPTY sentinel) is characterized.
+     * List.of rejects null, so every element here is non-null with id == index.
+     */
+    @SuppressWarnings("unchecked")
+    private void buildListOf()
+    {
+        try
+        {
+            final java.lang.reflect.Method of0 = List.class.getMethod("of");
+            final java.lang.reflect.Method of1 = List.class.getMethod("of", Object.class);
+            final java.lang.reflect.Method of2 =
+                List.class.getMethod("of", Object.class, Object.class);
+            final java.lang.reflect.Method ofN = List.class.getMethod("of", Object[].class);
+
+            listOf0 = (List<Elem>) of0.invoke(null);
+            listOf1 = (List<Elem>) of1.invoke(null, new Elem(0));
+            listOf2 = (List<Elem>) of2.invoke(null, new Elem(0), new Elem(1));
+            final Elem[] nElems = new Elem[LISTOF_N];
+            for (int i = 0; i < LISTOF_N; ++i)
+            {
+                nElems[i] = new Elem(i);
+            }
+            listOfN = (List<Elem>) ofN.invoke(null, (Object) nElems);
+
+            listOf0Size = listOf0.size();
+            listOf1Size = listOf1.size();
+            listOf2Size = listOf2.size();
+            listOfNSize = listOfN.size();
+            listOfAvailable = true;
+        }
+        catch (final NoSuchMethodException e)
+        {
+            // Java 8: List.of does not exist.  Leave fields null, flag unavailable.
+            listOf0 = null;
+            listOf1 = null;
+            listOf2 = null;
+            listOfN = null;
+            listOfAvailable = false;
+        }
+        catch (final Throwable t)
+        {
+            listOfAvailable = false;
+        }
     }
 
     /** The single instance the native module wraps (reached via SINGLETON). */

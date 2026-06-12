@@ -66,15 +66,51 @@
 //   nested List-of-Lists: outer ArrayList walk yields inner List OOPs; each is
 //     re-walked by a shape-detecting hand-walk (ArrayList OR LinkedList).
 //
+//   Vector / Stack backing store ("elementData" + "elementCount", NOT "size")
+//     * empty / many (default cap 10 DOUBLES to 20, so size 12 != length 20 —
+//       the bound MUST be elementCount) / ensureCapacity-style oversized (cap 100)
+//       / null element -> nullptr slot / size 2 / Stack (extends Vector).
+//
+//   CopyOnWriteArrayList backing store ("array" Object[]; length IS the size)
+//     * empty / many / null element (COW permits null) / size 2.
+//
+//   Boxed-Integer element lists (ArrayList<Integer> / Vector<Integer>): the
+//     backing walk is element-TYPE-agnostic — each slot decodes to a real
+//     java.lang.Integer read through integer_object (value == index).
+//
+//   Object[] ('[L...;') raw reference array (elemArray): array_length + per-slot
+//     get_array_element<uint32> -> decode_oop_pointer.
+//
+//   nested List-of-Lists: outer ArrayList walk yields inner List OOPs; each is
+//     re-walked by a shape-detecting hand-walk (ArrayList OR LinkedList).
+//   nested List-of-Maps: outer ArrayList walk yields inner Map OOPs; each proven
+//     a real, distinct heap object (Map content decode is collection_map's job).
+//
 //   JDK Collections wrappers, decoded by a direct backing-FIELD walk (NO Java
 //   get(int) call — forbidden from the worker body): Arrays.asList (field "a",
 //   an Object[]); Collections.emptyList (no element field, size 0);
 //   Collections.singletonList (field "element"); Collections.unmodifiableList
-//   (field "list" -> backing ArrayList, re-walked).
+//   (field "list" -> backing ArrayList); Collections.synchronizedList (field "c"
+//   -> backing ArrayList) — both re-walked.
+//
+//   List.of(...) immutable (JDK 9+, built reflectively so the fixture compiles at
+//   -source 8): ListN (field "elements" Object[]) for List.of()/List.of(4) IS
+//   hand-walked; List12 (e0/e1 with a shared non-null EMPTY sentinel for size 1)
+//   is CHARACTERIZED via its published size() witness — a raw e0/e1 read cannot
+//   tell size-1 from size-2.  On Java 8 the whole List.of block is [INFO]-skipped.
+//
+//   CHARACTERIZED (size()-witness + [INFO], not element-decoded): subList(from,to)
+//   views (ArrayList- and LinkedList-backed) whose SubList backing shape moved
+//   across JDKs (parent/parentOffset -> root/parent/offset) and carries no element
+//   array — the module pins their published size() (== SUB_LEN) instead of a
+//   fragile raw walk.  This is exactly the CollSet.java handling for non-fast-path
+//   Set wrappers: a Java size() oracle the native side reads as a plain int field.
 //
 //   Cross-path parity: ArrayList-many vs LinkedList-many agree on size / first /
-//   last and both ordered (the walk picks the backing shape from the runtime
-//   klass, not the Java static type — note linkBig is declared as List).
+//   last and both ordered; AND ArrayList / Vector / Stack / COW (four backing
+//   shapes, same 12-element content) agree on size / first / last and all ordered
+//   — the walk picks the backing shape from the runtime klass, not the Java static
+//   type (note linkBig is declared as List).
 //
 // SUITE-SAFETY (mirrors collection_set.cpp / register_class.cpp): the whole body
 // runs under a try/catch (a throw is recorded [INFO], never a FAIL); an entry
@@ -135,6 +171,26 @@ namespace
         }
     };
 
+    // Wrapper for java.lang.Integer — the BOXED element type.  Reads the single
+    // primitive field "value" (an int, stable JDK 6..26).  Proves the backing
+    // walk is element-TYPE-agnostic: it hands back a decoded element OOP that is a
+    // real java.lang.Integer the native side reads through, exactly as it does for
+    // the fixture's own Elem type.
+    class integer_object : public vmhook::object<integer_object>
+    {
+    public:
+        explicit integer_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<integer_object>{ instance }
+        {
+        }
+
+        auto value() const -> std::int32_t
+        {
+            const auto f{ get_field("value") };
+            return f ? static_cast<std::int32_t>(f->get()) : -1;
+        }
+    };
+
     // ── Fixture-mirrored constants (kept in lockstep with CollList.java) ─────
     constexpr std::int32_t MANY{ 12 };
     constexpr std::int32_t BIG{ 4096 };
@@ -148,6 +204,13 @@ namespace
     constexpr std::int32_t NESTED_INNER{ 4 };
     constexpr std::int32_t ASLIST_LEN{ 3 };
     constexpr std::int32_t SINGLETON_ID{ 0 };
+
+    // New shapes (mirror CollList.java).
+    constexpr std::int32_t VEC_MANY{ 12 };
+    constexpr std::int32_t INT_LEN{ 6 };
+    constexpr std::int32_t MAP_OUTER{ 3 };
+    constexpr std::int32_t LISTOF_N{ 4 };
+    constexpr std::int32_t SUB_LEN{ 6 };   // SUB_TO(9) - SUB_FROM(3)
 
     // Generous wall-clock ceiling for the BIG-node LinkedList walk.  A linear
     // walk is sub-millisecond; even a heavily-loaded CI box stays well under
@@ -339,6 +402,140 @@ namespace
         return result;
     }
 
+    // Generic Object[] walk into a vector of `T` wrappers (one per slot, nullptr
+    // for a null slot), bounded by `bound`.  `bound < 0` means "use the array's
+    // real length"; a non-negative `bound` is the LOGICAL element count (e.g. a
+    // Vector's elementCount) and is the loop limit instead of the backing length.
+    // Per-slot get_array_element bounds-checks every index against the real array
+    // length, so a (pathological) bound > length yields nullptr tail slots rather
+    // than an OOB read — the same size-vs-capacity safety walk_arraylist relies on.
+    template<typename T>
+    auto walk_object_array_as(void* const array_oop, const std::int32_t bound)
+        -> std::vector<std::unique_ptr<T>>
+    {
+        std::vector<std::unique_ptr<T>> result;
+        if (!array_oop || !vmhook::hotspot::is_valid_pointer(array_oop))
+        {
+            return result;
+        }
+        const std::int32_t length{ vmhook::array_length(array_oop) };
+        const std::int32_t n{ clamp_count(bound < 0 ? length : bound) };
+        result.reserve(static_cast<std::size_t>(n));
+        for (std::int32_t index{ 0 }; index < n; ++index)
+        {
+            const std::uint32_t compressed{
+                vmhook::get_array_element<std::uint32_t>(array_oop, index) };
+            void* const element_oop{ vmhook::hotspot::decode_oop_pointer(compressed) };
+            if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
+            {
+                result.push_back(std::make_unique<T>(
+                    static_cast<vmhook::oop_t>(element_oop)));
+            }
+            else
+            {
+                result.push_back(nullptr);
+            }
+        }
+        return result;
+    }
+
+    // Walk a java.util.Vector / java.util.Stack (Stack extends Vector) by its
+    // "elementData" Object[] backing array, bounded by "elementCount" — NOT
+    // elementData.length and NOT "size" (Vector has no "size" field; its count
+    // field is "elementCount").  A default Vector grows by DOUBLING (cap 10 -> 20),
+    // so the elementCount bound is the size-vs-capacity property on a second
+    // container family: emit exactly elementCount elements, no phantom-null tail.
+    auto walk_vector(void* const list_oop)
+        -> std::vector<std::unique_ptr<elem_object>>
+    {
+        std::vector<std::unique_ptr<elem_object>> result;
+        if (!list_oop || !vmhook::hotspot::is_valid_pointer(list_oop))
+        {
+            return result;
+        }
+        const auto count_entry{ field_entry_of(list_oop, "elementCount") };
+        const auto data_entry{ field_entry_of(list_oop, "elementData") };
+        if (!count_entry || !data_entry)
+        {
+            return result;
+        }
+        const std::int32_t n{ read_int_field(list_oop, "elementCount", 0) };
+        if (n <= 0)
+        {
+            return result;
+        }
+        std::uint32_t compressed_array{};
+        if (!read_compressed_at(list_oop, data_entry->offset, compressed_array))
+        {
+            return result;
+        }
+        void* const array_oop{ vmhook::decode_array_oop(compressed_array) };
+        return walk_object_array_as<elem_object>(array_oop, clamp_count(n));
+    }
+
+    // Walk a java.util.concurrent.CopyOnWriteArrayList by its "array" Object[]
+    // backing.  COW has NO separate size field — the backing array's LENGTH is the
+    // element count — so the walk bound is the array length itself (bound = -1).
+    // COW permits a null element, surfaced as a nullptr slot.
+    auto walk_cow(void* const list_oop)
+        -> std::vector<std::unique_ptr<elem_object>>
+    {
+        std::vector<std::unique_ptr<elem_object>> result;
+        if (!list_oop || !vmhook::hotspot::is_valid_pointer(list_oop))
+        {
+            return result;
+        }
+        void* const array_oop{ read_ref_field_oop(list_oop, "array") };
+        if (!array_oop)
+        {
+            return result;
+        }
+        return walk_object_array_as<elem_object>(array_oop, -1);
+    }
+
+    // Walk an ArrayList- or Vector-shaped list ("elementData" Object[] bounded by
+    // "size" OR "elementCount") into a vector of `T` wrappers.  Used for the
+    // boxed-Integer lists (T = integer_object): proves the same backing-array walk
+    // is element-TYPE-agnostic.  The bound is the logical count field, never
+    // elementData.length, so a grown backing array contributes no phantom tail.
+    template<typename T>
+    auto walk_indexed_backing_as(void* const list_oop)
+        -> std::vector<std::unique_ptr<T>>
+    {
+        std::vector<std::unique_ptr<T>> result;
+        if (!list_oop || !vmhook::hotspot::is_valid_pointer(list_oop))
+        {
+            return result;
+        }
+        if (!field_entry_of(list_oop, "elementData").has_value())
+        {
+            return result;
+        }
+        // ArrayList uses "size"; Vector uses "elementCount".  Read whichever the
+        // klass exposes as the logical element count.
+        std::int32_t n{ 0 };
+        if (field_entry_of(list_oop, "size").has_value())
+        {
+            n = read_int_field(list_oop, "size", 0);
+        }
+        else if (field_entry_of(list_oop, "elementCount").has_value())
+        {
+            n = read_int_field(list_oop, "elementCount", 0);
+        }
+        if (n <= 0)
+        {
+            return result;
+        }
+        const auto data_entry{ field_entry_of(list_oop, "elementData") };
+        std::uint32_t compressed_array{};
+        if (!data_entry || !read_compressed_at(list_oop, data_entry->offset, compressed_array))
+        {
+            return result;
+        }
+        void* const array_oop{ vmhook::decode_array_oop(compressed_array) };
+        return walk_object_array_as<T>(array_oop, clamp_count(n));
+    }
+
     // Walk a java.util.LinkedList (decoded list OOP) by its first->next Node
     // chain, bounded by `n` (the list's "size").  Mirrors linked_list_walk_items:
     // resolve "first" off the list klass, then for each Node read "item" (the
@@ -407,12 +604,18 @@ namespace
     // the nested inner lists (mixed ArrayList/LinkedList) and the JDK Collections
     // wrappers.  Probed in order of specificity:
     //   1. ArrayList  ("elementData" + "size")          -> walk_arraylist
-    //   2. LinkedList ("first" + "size")                 -> walk_linkedlist(size)
-    //   3. Arrays$ArrayList ("a" Object[])               -> walk_object_array
-    //   4. SingletonList ("element")                     -> one-element vector
-    //   5. UnmodifiableList ("list" backing) / Collection ("c")
-    //                                                    -> recurse on the backing
-    //   6. EmptyList / anything else                     -> empty
+    //   2. Vector/Stack ("elementData" + "elementCount")-> walk_vector
+    //   3. LinkedList ("first" + "size")                 -> walk_linkedlist(size)
+    //   4. CopyOnWriteArrayList ("array", no "size")     -> walk_cow (len == size)
+    //   5. Arrays$ArrayList ("a" Object[])               -> walk_object_array
+    //   6. ImmutableCollections$ListN ("elements")       -> walk_object_array
+    //   7. SingletonList ("element")                     -> one-element vector
+    //   8. UnmodifiableList ("list") / Collection ("c")  -> recurse on the backing
+    //   9. EmptyList / anything else                     -> empty
+    // NOTE: ImmutableCollections$List12 ("e0"/"e1") is intentionally NOT here: its
+    // unused "e1" slot holds a shared non-null EMPTY sentinel for a size-1 list, so
+    // a raw e0/e1 read cannot tell size-1 from size-2 without size().  The module
+    // CHARACTERIZES List12 via the published size() witness instead of decoding it.
     auto walk_list_by_shape(void* const list_oop, const int depth)
         -> std::vector<std::unique_ptr<elem_object>>
     {
@@ -429,13 +632,26 @@ namespace
         {
             return walk_arraylist(list_oop);
         }
-        // 2. LinkedList.
+        // 2. Vector / Stack: "elementData" + "elementCount" (NO "size" field).
+        if (field_entry_of(list_oop, "elementCount").has_value()
+            && field_entry_of(list_oop, "elementData").has_value())
+        {
+            return walk_vector(list_oop);
+        }
+        // 3. LinkedList.
         if (has_size && field_entry_of(list_oop, "first").has_value())
         {
             const std::int32_t n{ read_int_field(list_oop, "size", 0) };
             return walk_linkedlist(list_oop, n);
         }
-        // 3. Arrays$ArrayList: backing Object[] in field "a".
+        // 4. CopyOnWriteArrayList: backing "array" Object[] whose length is the
+        //    size (no separate size field).  Guard on the absence of "size" so a
+        //    future List that happened to expose both does not misroute here.
+        if (!has_size && field_entry_of(list_oop, "array").has_value())
+        {
+            return walk_cow(list_oop);
+        }
+        // 5. Arrays$ArrayList: backing Object[] in field "a".
         if (field_entry_of(list_oop, "a").has_value())
         {
             void* const array_oop{ read_ref_field_oop(list_oop, "a") };
@@ -445,7 +661,18 @@ namespace
             }
             return result;
         }
-        // 4. SingletonList: single element in field "element".
+        // 6. ImmutableCollections$ListN (List.of with 0 or 3+ elems): backing
+        //    "elements" Object[] holds exactly the real elements (no sentinel).
+        if (field_entry_of(list_oop, "elements").has_value())
+        {
+            void* const array_oop{ read_ref_field_oop(list_oop, "elements") };
+            if (array_oop)
+            {
+                return walk_object_array(array_oop);
+            }
+            return result;
+        }
+        // 7. SingletonList: single element in field "element".
         if (field_entry_of(list_oop, "element").has_value())
         {
             void* const element_oop{ read_ref_field_oop(list_oop, "element") };
@@ -460,8 +687,10 @@ namespace
             }
             return result;
         }
-        // 5. UnmodifiableList ("list") / UnmodifiableCollection ("c"): recurse on
-        //    the wrapped backing list.
+        // 8. UnmodifiableList ("list") / Unmodifiable/Synchronized Collection ("c"):
+        //    recurse on the wrapped backing list.  Collections.synchronizedList's
+        //    backing field is also "c" (its mutex is a separate field), so this one
+        //    branch covers both unmodifiable and synchronized wrappers.
         if (field_entry_of(list_oop, "list").has_value())
         {
             void* const backing{ read_ref_field_oop(list_oop, "list") };
@@ -472,7 +701,7 @@ namespace
             void* const backing{ read_ref_field_oop(list_oop, "c") };
             return walk_list_by_shape(backing, depth + 1);
         }
-        // 6. EmptyList / no recognised element field -> empty.
+        // 9. EmptyList / no recognised element field -> empty.
         return result;
     }
 
@@ -547,6 +776,41 @@ namespace
     list_obs g_tv_link_empty;    // to_vector(linkEmpty)  -> empty
     list_obs g_tv_link_many;     // to_vector(linkMany)   -> LinkedList chain walk
     list_obs g_tv_link_null;     // to_vector(linkWithNull)-> null Node.item slot
+
+    // ── New List-family observations (Vector/Stack/COW/synchronized/ListN) ───
+    list_obs g_vec_empty;
+    list_obs g_vec_many;
+    list_obs g_vec_oversized;    // size != elementData.length (cap 100)
+    list_obs g_vec_null;
+    list_obs g_vec_two;
+    list_obs g_stack_many;       // Stack extends Vector
+    list_obs g_cow_empty;
+    list_obs g_cow_many;
+    list_obs g_cow_null;         // COW permits null
+    list_obs g_cow_two;
+    list_obs g_sync;             // Collections.synchronizedList -> "c" recurse
+    list_obs g_listof0;          // List.of() ListN (hand-walked)
+    list_obs g_listofN;          // List.of(4 elems) ListN (hand-walked)
+
+    // Boxed-Integer lists: observed by VALUE, not id/tag (java.lang.Integer).
+    list_obs g_int_arr;          // ArrayList<Integer>
+    list_obs g_int_vec;          // Vector<Integer>
+    bool g_int_arr_values_ok{ false };
+    bool g_int_vec_values_ok{ false };
+
+    // Nested List-of-Map: outer ArrayList walk -> inner Map OOP identity only.
+    std::int32_t g_nested_map_outer_n{ -1 };
+    bool         g_nested_map_distinct{ true };
+    std::int32_t g_nested_map_nonnull{ -1 };
+
+    // Characterized-via-size() families (NOT element-decoded by the hand-walk):
+    // the module reads each list's published Java size() witness (a plain int
+    // field — no Java call) and asserts it matches the expected constant.
+    bool         g_listof_available{ false };
+    std::int32_t g_listof1_size_witness{ -1 };
+    std::int32_t g_listof2_size_witness{ -1 };
+    std::int32_t g_arr_sublist_size_witness{ -1 };
+    std::int32_t g_link_sublist_size_witness{ -1 };
 
     // Reduce a decoded vector into a list_obs: size, null pattern, ascending id
     // order (id == index for non-null slots), tag correctness, and OOP
@@ -646,6 +910,39 @@ namespace
         o.non_null = non_null;
         o.null_count = null_count;
         o.distinct_ok = distinct_ok;
+    }
+
+    // Reduce a decoded vector of java.lang.Integer wrappers: size / null pattern /
+    // OOP distinctness (into `o`), and set `values_ok` iff every slot is non-null
+    // with value() == its index (the boxed analogue of the Elem id==index order
+    // proof).  Boxed Integers in [-128,127] are interned (cached), so two equal
+    // small Integers ARE the same OOP — to keep the distinctness check meaningful
+    // the fixture uses values 0..INT_LEN-1 which are DISTINCT, hence distinct OOPs.
+    auto observe_integers(list_obs& o,
+                          const std::vector<std::unique_ptr<integer_object>>& v,
+                          bool& values_ok) -> void
+    {
+        o.seen = true;
+        o.size = static_cast<std::int32_t>(v.size());
+        std::int32_t non_null{ 0 };
+        std::int32_t null_count{ 0 };
+        bool distinct_ok{ true };
+        bool vals_ok{ !v.empty() };
+        std::unordered_set<const void*> seen_oops;
+        seen_oops.reserve(v.size() * 2 + 1);
+        for (std::size_t k{ 0 }; k < v.size(); ++k)
+        {
+            const integer_object* const e{ v[k].get() };
+            if (e == nullptr) { ++null_count; vals_ok = false; continue; }
+            ++non_null;
+            if (e->value() != static_cast<std::int32_t>(k)) { vals_ok = false; }
+            const void* const oop{ static_cast<const void*>(e->get_instance()) };
+            if (!seen_oops.insert(oop).second) { distinct_ok = false; }
+        }
+        o.non_null = non_null;
+        o.null_count = null_count;
+        o.distinct_ok = distinct_ok;
+        values_ok = vals_ok;
     }
 
     // True iff a decoded inner Elem vector is a perfect dense list of `expected`:
@@ -749,6 +1046,8 @@ namespace
 
         vmhook::register_class<coll_list_fixture>(FIXTURE);
         vmhook::register_class<elem_object>("vmhook/fixtures/CollList$Elem");
+        // java.lang.Integer is always loaded; needed for the boxed-element lists.
+        vmhook::register_class<integer_object>("java/lang/Integer");
 
         // Drive a build probe so populate() runs on the Java thread; then read
         // the now-populated backing stores off the worker thread.  (No detour:
@@ -893,6 +1192,68 @@ namespace
         observe(g_empty_immut, walk_list_by_shape(list_oop_of("emptyImmutable"), 0),   true);
         observe(g_singleton,   walk_list_by_shape(list_oop_of("singletonView"), 0),    true);
         observe(g_unmod,       walk_list_by_shape(list_oop_of("unmodifiableView"), 0), true);
+        observe(g_sync,        walk_list_by_shape(list_oop_of("synchronizedView"), 0), true);
+
+        // ── Vector / Stack ("elementData" + "elementCount") ─────────────────
+        observe(g_vec_empty,     walk_vector(list_oop_of("vecEmpty")),     true);
+        observe(g_vec_many,      walk_vector(list_oop_of("vecMany")),      true);
+        observe(g_vec_oversized, walk_vector(list_oop_of("vecOversized")), true);
+        observe(g_vec_null,      walk_vector(list_oop_of("vecWithNull")),  true);
+        observe(g_vec_two,       walk_vector(list_oop_of("vecTwo")),       true);
+        observe(g_stack_many,    walk_vector(list_oop_of("stackMany")),    true);
+
+        // ── CopyOnWriteArrayList ("array" Object[], length == size) ─────────
+        observe(g_cow_empty, walk_cow(list_oop_of("cowEmpty")), true);
+        observe(g_cow_many,  walk_cow(list_oop_of("cowMany")),  true);
+        observe(g_cow_null,  walk_cow(list_oop_of("cowWithNull")), true);
+        observe(g_cow_two,   walk_cow(list_oop_of("cowTwo")),   true);
+
+        // ── Boxed-Integer element lists (element decode is type-agnostic) ───
+        observe_integers(g_int_arr,
+                         walk_indexed_backing_as<integer_object>(list_oop_of("intArrList")),
+                         g_int_arr_values_ok);
+        observe_integers(g_int_vec,
+                         walk_indexed_backing_as<integer_object>(list_oop_of("intVecList")),
+                         g_int_vec_values_ok);
+
+        // ── Nested List-of-Map: outer ArrayList -> inner Map OOP identity ───
+        {
+            std::vector<std::unique_ptr<elem_object>> outer_maps{
+                walk_arraylist(list_oop_of("nestedMaps")) };
+            g_nested_map_outer_n = static_cast<std::int32_t>(outer_maps.size());
+            std::int32_t nonnull{ 0 };
+            bool distinct{ true };
+            std::unordered_set<const void*> seen;
+            for (const auto& up : outer_maps)
+            {
+                const elem_object* const m{ up.get() };
+                if (m == nullptr) { continue; }
+                void* const map_oop{ m->get_instance() };
+                if (!map_oop || !vmhook::hotspot::is_valid_pointer(map_oop)) { continue; }
+                ++nonnull;
+                if (!seen.insert(static_cast<const void*>(map_oop)).second) { distinct = false; }
+            }
+            g_nested_map_nonnull = nonnull;
+            g_nested_map_distinct = distinct;
+        }
+
+        // ── List.of(...) (JDK 9+).  ListN ("elements") is hand-walked; List12
+        //    ("e0"/"e1" with an EMPTY sentinel) is characterized via size().  The
+        //    fixture publishes listOfAvailable + per-list size() witnesses.
+        g_listof_available =
+            (read_int_field(singleton, "listOfAvailable", 0) != 0);
+        if (g_listof_available)
+        {
+            observe(g_listof0, walk_list_by_shape(list_oop_of("listOf0"), 0), true);
+            observe(g_listofN, walk_list_by_shape(list_oop_of("listOfN"), 0), true);
+            g_listof1_size_witness = read_int_field(singleton, "listOf1Size", -1);
+            g_listof2_size_witness = read_int_field(singleton, "listOf2Size", -1);
+        }
+
+        // ── subList views: CHARACTERIZED via the published Java size() witness
+        //    (the backing field shape moved across JDKs; no stable raw walk).
+        g_arr_sublist_size_witness  = read_int_field(singleton, "arrSubListSize", -1);
+        g_link_sublist_size_witness = read_int_field(singleton, "linkSubListSize", -1);
 
         // ── LIBRARY to_vector<T>() decode of the SAME live lists ────────────
         // Drives vmhook::collection::to_vector<elem_object>() directly on each
@@ -1012,6 +1373,119 @@ namespace
         // Collections.unmodifiableList(arrMany) -> "list" backing ArrayList walk.
         check_dense(ctx, "collections_unmodifiablelist", g_unmod, MANY);
 
+        // Collections.synchronizedList(arrMany) -> "c" backing ArrayList walk.
+        check_dense(ctx, "collections_synchronizedlist", g_sync, MANY);
+        ctx.check("collections_synchronizedlist_size_witness_matches",
+                  read_int_field(singleton, "synchronizedViewSize", -1) == MANY);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Vector / Stack ("elementData" + "elementCount").  The headline angle:
+        //  the bound is elementCount, NOT elementData.length — a default Vector
+        //  grows by DOUBLING (cap 10 -> 20) so vecMany has size 12 in a length-20
+        //  backing array; the walk must emit exactly 12 with no phantom-null tail.
+        // ════════════════════════════════════════════════════════════════════
+        check_empty(ctx, "vector_empty", g_vec_empty);
+        check_dense(ctx, "vector_many", g_vec_many, VEC_MANY);
+        ctx.check("vector_many_size_witness_matches",
+                  read_int_field(singleton, "vecManySize", -1) == VEC_MANY);
+        ctx.check("vector_many_no_phantom_null_tail", g_vec_many.null_count == 0);
+
+        check_dense(ctx, "vector_oversized", g_vec_oversized, VEC_MANY);
+        ctx.check("vector_oversized_no_phantom_null_tail",
+                  g_vec_oversized.null_count == 0);
+        ctx.check("vector_oversized_size_not_capacity",
+                  g_vec_oversized.size == VEC_MANY);
+
+        check_with_null(ctx, "vector_with_null", g_vec_null);
+        check_dense(ctx, "vector_two", g_vec_two, TWO);
+
+        // Stack extends Vector: same elementData/elementCount backing walk.
+        check_dense(ctx, "stack_many", g_stack_many, VEC_MANY);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  CopyOnWriteArrayList ("array" Object[]; length IS the size).
+        // ════════════════════════════════════════════════════════════════════
+        check_empty(ctx, "cow_empty", g_cow_empty);
+        check_dense(ctx, "cow_many", g_cow_many, VEC_MANY);
+        ctx.check("cow_many_size_witness_matches",
+                  read_int_field(singleton, "cowManySize", -1) == VEC_MANY);
+        check_with_null(ctx, "cow_with_null", g_cow_null);
+        check_dense(ctx, "cow_two", g_cow_two, TWO);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Boxed-Integer element lists: the backing walk is element-TYPE-agnostic.
+        //  Each slot is a java.lang.Integer the native side reads through; value
+        //  == index proves order, and the values 0..INT_LEN-1 are distinct so the
+        //  decoded OOPs are distinct too (small Integers are interned per value).
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("integer_arraylist_seen", g_int_arr.seen);
+        ctx.check("integer_arraylist_size_matches", g_int_arr.size == INT_LEN);
+        ctx.check("integer_arraylist_all_non_null", g_int_arr.non_null == INT_LEN);
+        ctx.check("integer_arraylist_values_equal_index", g_int_arr_values_ok);
+        ctx.check("integer_arraylist_oops_distinct", g_int_arr.distinct_ok);
+
+        ctx.check("integer_vector_seen", g_int_vec.seen);
+        ctx.check("integer_vector_size_matches", g_int_vec.size == INT_LEN);
+        ctx.check("integer_vector_all_non_null", g_int_vec.non_null == INT_LEN);
+        ctx.check("integer_vector_values_equal_index", g_int_vec_values_ok);
+        ctx.check("integer_vector_oops_distinct", g_int_vec.distinct_ok);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Nested List-of-Map: outer ArrayList walk recovers inner Map OOPs; each
+        //  is a real, DISTINCT heap object (Map content decode is collection_map).
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("nested_maps_outer_count_matches", g_nested_map_outer_n == MAP_OUTER);
+        ctx.check("nested_maps_all_non_null", g_nested_map_nonnull == MAP_OUTER);
+        ctx.check("nested_maps_distinct", g_nested_map_distinct);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  List.of(...) (JDK 9+).  ListN backing "elements" Object[] IS decoded
+        //  (List.of() empty, List.of(4) dense); List12 (e0/e1 EMPTY sentinel) is
+        //  CHARACTERIZED via the published Java size() witness, never element-
+        //  decoded.  On Java 8 the whole block is recorded [INFO] and skipped.
+        // ════════════════════════════════════════════════════════════════════
+        if (g_listof_available)
+        {
+            check_empty(ctx, "list_of_empty_listN", g_listof0);
+            check_dense(ctx, "list_of_n_listN", g_listofN, LISTOF_N);
+            // List12 characterization: the published size() is the oracle.
+            ctx.check("list_of_1_size_witness_is_1", g_listof1_size_witness == 1);
+            ctx.check("list_of_2_size_witness_is_2", g_listof2_size_witness == 2);
+            ctx.record("[INFO] collection_list: List.of(1)/List.of(1,2) are "
+                       "ImmutableCollections$List12; their unused 'e1' slot holds a "
+                       "shared non-null EMPTY sentinel for size 1, so the backing-field "
+                       "walk CHARACTERIZES them via the published size() witness rather "
+                       "than decoding e0/e1 (which would mis-emit 2 elements for size 1). "
+                       "List.of()/List.of(4) are ListN and ARE hand-walked.");
+        }
+        else
+        {
+            ctx.record("[INFO] collection_list: List.of(...) unavailable on this JDK "
+                       "(Java 8); skipping the immutable-List.of coverage. The fixture "
+                       "builds those fields reflectively, so they are simply absent here.");
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        //  subList views: CHARACTERIZED via the published Java size() witness.
+        //  The ArrayList$SubList / AbstractList$SubList backing field shape moved
+        //  across JDKs (8: parent/parentOffset; 9+: root/parent/offset) and the
+        //  view carries no element array of its own, so the module pins its
+        //  size() oracle (== SUB_LEN) and records [INFO] instead of a fragile raw
+        //  walk.  (The library's to_vector CAN decode a subList — via its generic
+        //  size()+get(int) fallback — but that issues Java calls, forbidden from
+        //  this no-detour worker body; that is the characterization reason.)
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("arraylist_sublist_size_witness_is_sub_len",
+                  g_arr_sublist_size_witness == SUB_LEN);
+        ctx.check("linkedlist_sublist_size_witness_is_sub_len",
+                  g_link_sublist_size_witness == SUB_LEN);
+        ctx.record("[INFO] collection_list: ArrayList/LinkedList subList(from,to) views "
+                   "are characterized via their published size() witness (== "
+                   + std::to_string(SUB_LEN) + "); their SubList backing shape "
+                   "(parent/offset, renamed root/offset in JDK 9+) carries no element "
+                   "array of its own, so the no-Java-call worker body does not raw-walk "
+                   "them. to_vector decodes them through its get(int) fallback.");
+
         // ════════════════════════════════════════════════════════════════════
         //  Cross-path parity.
         // ════════════════════════════════════════════════════════════════════
@@ -1028,6 +1502,26 @@ namespace
                   g_arr_two.size == g_link_two.size);
         ctx.check("array_and_link_two_both_ordered",
                   g_arr_two.order_ok && g_link_two.order_ok);
+
+        // Four backing shapes (ArrayList / Vector / Stack / COW) hold the SAME
+        // 12-element id==index content, so all four fast paths must agree on
+        // size / first / last and all be ordered — proving the hand-walk selects
+        // each backing shape from the runtime klass and decodes them equivalently.
+        ctx.check("arraylist_vector_cow_same_many_size",
+                  g_arr_many.size == VEC_MANY
+                  && g_vec_many.size == VEC_MANY
+                  && g_stack_many.size == VEC_MANY
+                  && g_cow_many.size == VEC_MANY);
+        ctx.check("arraylist_vector_cow_same_many_first_id",
+                  g_arr_many.first_id == g_vec_many.first_id
+                  && g_vec_many.first_id == g_stack_many.first_id
+                  && g_stack_many.first_id == g_cow_many.first_id);
+        ctx.check("arraylist_vector_cow_same_many_last_id",
+                  g_arr_many.last_id == g_vec_many.last_id
+                  && g_vec_many.last_id == g_stack_many.last_id
+                  && g_stack_many.last_id == g_cow_many.last_id);
+        ctx.check("arraylist_vector_cow_all_ordered",
+                  g_vec_many.order_ok && g_stack_many.order_ok && g_cow_many.order_ok);
 
         // unmodifiableView wraps arrMany: it must agree element-for-element with
         // the ArrayList walk over the same backing list (size, first, last) — a
