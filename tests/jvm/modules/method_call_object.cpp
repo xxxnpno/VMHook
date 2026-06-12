@@ -19,32 +19,19 @@
 //   * String reference return  -> childLabel() lands in the std::string
 //                                alternative, NOT the uint32 OOP alternative.
 //
-// IMPORTANT path sensitivity (history + current state this module documents):
+// IMPORTANT path sensitivity (a real, still-live flaw this module documents):
 // method_proxy::call() uses HotSpot's _call_stub_entry when present (JDK 8-20),
 // where a non-String reference return is stored as a REAL compressed OOP
-// (encode_oop_pointer) and round-trips correctly through the unique_ptr decode.
-// On JDK 21+ that VMStruct is absent, so call() falls back to call_jni(), whose
-// 'L'/'[' branch was historically the weak point:
-//   (1) it once stored only the LOW 32 BITS of a JNI indirect local-ref handle
-//       as if it were a compressed OOP — FIXED: it now decodes the handle to the
-//       real heap OOP (jni_decode_object) and re-encodes a real compressed OOP
-//       (encode_oop_pointer), so the unique_ptr decode recovers the object;
-//   (2) it then DeleteLocalRef'd the handle BEFORE re-encoding, dropping the only
-//       GC root and leaving the returned OOP stale if a relocating GC ran in the
-//       window before the caller wrapped it — FIXED: the branch now promotes the
-//       live local to a JNI global ref (pin) spanning the decode→encode, reads the
-//       object's CURRENT address from the pinned slot, and only then releases the
-//       pin, so there is no unrooted window inside call_jni.
-// The bare compressed OOP a reference-returning call() hands back is still
-// tick-scoped on BOTH paths (per vmhook.hpp's global-ref contract): code that
-// needs the object across a LATER GC must pin it (vmhook::pin / global_ref).
-// The null-return contract holds on both paths (null handle -> 0 -> nullptr).
-// This module hard-asserts everything that holds on BOTH paths and hard-asserts
-// the full usable-wrapper contract on the call_stub path; the call_jni
-// usable-wrapper results are still surfaced as [INFO] (the harness cannot force a
-// GC between the decode and the in-detour use, so cross-GC durability is not
-// asserted here — see method_call_jni_fallback for the hard call_jni identity
-// asserts that DO run on the modern JDKs).
+// (encode_oop_pointer, vmhook.hpp ~12935) and round-trips correctly through the
+// unique_ptr decode.  On JDK 21+ that VMStruct is absent, so call() falls back
+// to call_jni(), whose 'L'/'[' branch (vmhook.hpp ~12683-12686) stores only the
+// LOW 32 BITS of a JNI indirect local-ref handle AND DeleteLocalRef's it before
+// returning — so the unique_ptr decode gets a truncated, already-freed handle
+// and produces null/garbage.  The null-return contract still holds on both
+// paths (null handle -> 0 -> nullptr).  This module hard-asserts everything that
+// holds on BOTH paths, hard-asserts the full usable-wrapper contract on the
+// call_stub path, and records the call_jni truncation as [INFO] (a known flaw)
+// rather than a CI [FAIL].
 
 #include <vmhook/vmhook.hpp>
 
@@ -450,17 +437,13 @@ VMHOOK_JVM_MODULE(method_call_object)
         }
         else
         {
-            // JDK 21+ call_jni path: the non-null reference returns are now
-            // decoded to the real heap OOP through a JNI global-ref pin spanning
-            // the decode→encode (the historical truncation and unrooted-handle
-            // flaws are both fixed in the call_jni 'L'/'[' branch), so these
-            // results are EXPECTED to be correct and match the call_stub path.
-            // They are still surfaced as [INFO] rather than hard [check]s here:
-            // this module's hard call_jni identity asserts live in
-            // method_call_jni_fallback, and the harness cannot force a GC between
-            // the in-detour decode and use to exercise cross-GC durability.  The
-            // contract that this module DOES hard-assert on every path
-            // (null-returns, String routing, field-path parity) is checked above.
+            // JDK 21+ call_jni path: the non-null reference returns come back as
+            // truncated, freed JNI handles.  Record what actually happened so a
+            // human can see the flaw, but do NOT fail CI for a bug this test
+            // module has no power to fix (it is documented in the audit and the
+            // call_jni 'L'/'[' branch).  The contract that DOES hold on this
+            // path (null-returns, String routing, field-path parity) is hard-
+            // asserted above.
             ctx.record("[INFO] makechild_non_null_wrapper (call_jni) = "
                        + std::string{ g_make_nonnull.load(std::memory_order_relaxed) ? "true" : "false" });
             ctx.record("[INFO] makechild_field_read_through_wrapper (call_jni) tag = "
@@ -479,16 +462,14 @@ VMHOOK_JVM_MODULE(method_call_object)
             ctx.record("[INFO] childarray_reference_decoded_non_null (call_jni) = "
                        + std::string{ g_array_decoded_nonnull.load(std::memory_order_relaxed) ? "true" : "false" });
 
-            // Signal whether the non-null call_jni object return decoded to a
-            // usable wrapper on this JDK — surfaced as an [INFO] (record), never a
-            // [FAIL].  Post-fix this is expected true; a false here would point at
-            // a regression in the call_jni 'L'/'[' decode/pin path.
+            // Soft signal that SOMETHING about the non-null path is broken on
+            // this JDK — surfaced as an [INFO] (record), never a [FAIL].
             const bool any_usable{
                 g_make_nonnull.load(std::memory_order_relaxed)
                 && g_make_tag.load(std::memory_order_relaxed) == k_child_tag };
             ctx.record(std::string{ "[INFO] call_jni non-null object return usable = " }
-                       + (any_usable ? "true (decoded + pinned heap OOP)"
-                                     : "false (UNEXPECTED — check call_jni decode/pin path)"));
+                       + (any_usable ? "true (handle happened to survive)"
+                                     : "false (truncated/freed handle — KNOWN call_jni flaw)"));
         }
     }
 }

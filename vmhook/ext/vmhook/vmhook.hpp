@@ -14807,63 +14807,10 @@ namespace vmhook
                     // wrapper whose first field read took an access violation
                     // (this crashed the JVM on the call_jni path, i.e. every
                     // object-returning call on JDK 21+ where the call stub is
-                    // gone).  A null Java return becomes monostate so
+                    // gone).  A null Java return now becomes monostate so
                     // value_t::is_void() is true and unique_ptr<wrapper> is null.
-                    //
-                    // GC-ROOTING: CallObjectMethodA returns a JNI *local* ref,
-                    // which is a GC root only while it is alive.  The earlier code
-                    // decoded the raw oop and then IMMEDIATELY DeleteLocalRef'd it,
-                    // dropping the only root before re-encoding — so a relocating
-                    // GC in that window (or any window before the caller wraps the
-                    // result) left the stored compressed OOP pointing at a stale /
-                    // collected address.  We instead promote the live local to a
-                    // JNI *global* ref (which the JVM keeps updated across
-                    // relocation, exactly like vmhook::jni::global_ref) BEFORE
-                    // releasing the local, so the object is continuously rooted
-                    // across the decode→encode with NO unrooted instant, then read
-                    // the object's CURRENT address out of the pinned global handle
-                    // and encode THAT.  (global_ref the class is defined far below
-                    // in this single header, so we drive the same detail:: JNI
-                    // primitives it wraps — jni_new_global_ref / jni_delete_global_ref
-                    // plus the JDK-9+ tag-bit-masked slot read — directly here.)
-                    //
-                    // The bare compressed OOP we return is still tick-scoped per
-                    // this header's contract (a caller that needs it to survive a
-                    // LATER GC must pin it itself, e.g. via vmhook::pin /
-                    // vmhook::jni::global_ref) — but it is now derived from a
-                    // properly-rooted, relocation-stable address instead of from a
-                    // handle that had already been freed.
-                    void* const decoded_oop{ vmhook::detail::jni_decode_object(result_handle) };
-                    if (!decoded_oop)
-                    {
-                        // Null Java return (or invalid handle): nothing to root.
-                        vmhook::detail::jni_delete_local_ref(result_handle);
-                        return value_t{ std::monostate{} };
-                    }
-                    // Promote the STILL-LIVE local to a global ref (object is
-                    // double-rooted at this instant), THEN drop the local.  The
-                    // global pin keeps the oop alive and relocation-tracked until
-                    // we capture its address below.
-                    void* const global_handle{ vmhook::detail::jni_new_global_ref(result_handle) };
+                    void* const result_oop{ vmhook::detail::jni_decode_object(result_handle) };
                     vmhook::detail::jni_delete_local_ref(result_handle);
-                    // CURRENT (post-any-relocation) heap address.  HotSpot tags JNI
-                    // handles in the low 3 bits on JDK 9+ (the OopStorage slot is
-                    // 8-byte aligned), so mask before dereferencing — identical to
-                    // vmhook::jni::global_ref::oop().  If the global ref could not
-                    // be created (no JVM / slot unavailable) fall back to the
-                    // freshly-decoded oop, which is no worse than the pre-fix path.
-                    void* result_oop{ decoded_oop };
-                    if (global_handle)
-                    {
-                        const std::uintptr_t global_slot{
-                            reinterpret_cast<std::uintptr_t>(global_handle) & ~std::uintptr_t{ 0b111 } };
-                        void* const live_oop{ *reinterpret_cast<void**>(global_slot) };
-                        if (vmhook::hotspot::is_valid_pointer(live_oop))
-                        {
-                            result_oop = live_oop;
-                        }
-                        vmhook::detail::jni_delete_global_ref(global_handle);
-                    }
                     if (!result_oop)
                     {
                         return value_t{ std::monostate{} };

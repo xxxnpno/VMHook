@@ -780,16 +780,10 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
         ctx.check("mcj_static_null_object_returns_null_unique_ptr", g_static_null_is_null.load());
 
         // ═════════════════════ Object returns: identity ═══════════════════════
-        // The call_jni 'L'/'[' arm decodes the JNI handle to the real heap OOP
-        // (jni_decode_object) and re-encodes it (encode_oop_pointer), promoting
-        // the live local ref to a JNI global-ref PIN that spans the decode→encode
-        // so the OOP is never unrooted in that window (a relocating GC there would
-        // otherwise have left it stale).  A non-null reference return therefore
-        // round-trips into a usable wrapper on BOTH paths.  retSelf() must yield
-        // the RECEIVER's OOP.  (This is an in-detour, same-tick check: no GC is
-        // forced between the decode and the compare, so it exercises the decode/
-        // re-encode correctness; the pin's value is preventing a GC-window stale
-        // read, which this harness cannot deterministically trigger.)
+        // The current call_jni 'L'/'[' arm decodes the JNI handle to the real
+        // heap OOP (jni_decode_object) and re-encodes it (encode_oop_pointer),
+        // so a non-null reference return round-trips into a usable wrapper on
+        // BOTH paths.  retSelf() must therefore yield the RECEIVER's OOP.
         ctx.check("mcj_retself_non_null_wrapper", g_self_nonnull.load());
         ctx.check("mcj_retself_instance_equals_receiver",
                   g_self_instance.load() != 0
