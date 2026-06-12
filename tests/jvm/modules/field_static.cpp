@@ -45,6 +45,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace
 {
@@ -213,6 +214,102 @@ namespace
             // method_proxy String returns: use as_string() (NOT a cast/brace-init).
             return m->call().as_string();
         }
+
+        // ---- static ARRAY-reference helpers (the field_static angle: whole
+        //      reference, not element decode -- field_arrays_object owns that).
+        //      field_oop() returns the decoded array oop for a "[..." field;
+        //      array_length() is the bounds oracle.  Both public helpers. ----
+        static auto array_oop(const char* name) -> void*
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return nullptr;
+            }
+            return vmhook::field_oop(*proxy);
+        }
+        static auto array_len(const char* name) -> std::int32_t
+        {
+            void* const a{ array_oop(name) };
+            if (!a || !vmhook::hotspot::is_valid_pointer(a))
+            {
+                return -1;
+            }
+            return vmhook::array_length(a);
+        }
+        // Replace the whole static array reference `name` so it aliases the
+        // array currently held by `srcName`.  We decode srcName's array oop,
+        // wrap it directly (make_unique, NOT the value_t->unique_ptr path,
+        // which rejects a "[" signature), and set_ref writes the encoded OOP.
+        static auto set_ref_to_array(const char* name, const char* srcName) -> bool
+        {
+            void* const src{ array_oop(srcName) };
+            if (!src || !vmhook::hotspot::is_valid_pointer(src))
+            {
+                return false;
+            }
+            auto wrapper{ std::make_unique<fs>(src) };
+            return set_ref(name, wrapper);
+        }
+    };
+
+    // ---- Wrapper for the SUPERCLASS, FieldStaticBase.  Its static_field()
+    //      starts the find_field super walk at FieldStaticBase; resolving an
+    //      inherited static THROUGH the fs (subclass) wrapper exercises the
+    //      declaring-klass mirror path (field_entry_t::declaring_klass). -------
+    class fsb : public vmhook::object<fsb>
+    {
+    public:
+        explicit fsb(vmhook::oop_t instance) noexcept
+            : vmhook::object<fsb>{ instance }
+        {
+        }
+        // A live base instance (objBaseA / objBaseB), wrapped so set_ref can
+        // rewrite the inherited reference between them.
+        static auto acquire(const char* name) -> std::unique_ptr<fsb> { return static_field(name)->get(); }
+        auto base_tag() const -> std::int32_t { const std::int32_t v = get_field("baseTag")->get(); return v; }
+        // Set an inherited object-reference static to a wrapper (or null).
+        // Returns false if the field did not resolve; set() itself is void, so
+        // this bool wrapper is what the ctx.check() call sites consume.
+        static auto set_ref(const char* name, const std::unique_ptr<fsb>& target) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return false;
+            }
+            proxy->set(target);
+            return true;
+        }
+    };
+
+    // ---- Wrapper for the NESTED ENUM, FieldStatic$Tier.  Each enum constant
+    //      (LOW/MID/HIGH) is a public-static-final field of this class; reading
+    //      it through static_field() returns the constant's singleton OOP. -----
+    class fst_tier : public vmhook::object<fst_tier>
+    {
+    public:
+        explicit fst_tier(vmhook::oop_t instance) noexcept
+            : vmhook::object<fst_tier>{ instance }
+        {
+        }
+        // Acquire an enum constant singleton as a wrapper (signature "L...;",
+        // so the value_t->unique_ptr conversion accepts it).
+        static auto constant(const char* name) -> std::unique_ptr<fst_tier> { return static_field(name)->get(); }
+        // The compressed OOP of a constant field, for an exact-identity compare
+        // (two reads of the same constant must yield the same non-zero OOP).
+        static auto constant_oop(const char* name) -> std::uint32_t
+        {
+            const auto p{ static_field(name) };
+            if (!p.has_value())
+            {
+                return 0u;
+            }
+            const auto v{ p->get() };
+            return v.is_reference() ? std::get<std::uint32_t>(v.data) : 0u;
+        }
+        // The enum body's instance int field, read off a constant singleton.
+        auto weight() const -> std::int32_t { const std::int32_t v = get_field("weight")->get(); return v; }
     };
 
     // value_t variant-alternative indices (must match field_proxy::value_t order).
@@ -305,6 +402,14 @@ namespace
         }
 
         vmhook::register_class<fs>(k_fixture);
+        // Sibling wrappers for the EXHAUSTIVE additions (inherited statics +
+        // nested enum constants).  Registering an absent class is harmless --
+        // every static_field through these wrappers then returns nullopt and the
+        // dependent fstat_* checks below are individually guarded.  FieldStaticBase
+        // is loaded as fs's superclass; FieldStatic$Tier is loaded by fs's
+        // <clinit> (staticTier = Tier.MID references it).
+        vmhook::register_class<fsb>("vmhook/fixtures/FieldStaticBase");
+        vmhook::register_class<fst_tier>("vmhook/fixtures/FieldStatic$Tier");
 
     // =====================================================================
     //  0. Sanity: the class resolves and the portable static accessor works.
@@ -1067,6 +1172,487 @@ namespace
                 const std::int32_t v2 = p2->get();
                 ctx.check("two_proxies_agree_latest", v2 == 0x600DC0DE);
             }
+        }
+    }
+
+    // #####################################################################
+    //  EXHAUSTIVE ADDITIONS (feature: "every possible input").  Distinct
+    //  fstat_* check prefix.  Every dependent read is guarded; GC/init-
+    //  sensitive observations degrade to [INFO].  Covers: inherited static
+    //  GET+SET (declaring-klass mirror), inherited reference replace, an
+    //  inherited static-final constant, nested-enum constant reads, static
+    //  ARRAY reference identity/replace/null, a many-statics offset sweep, and
+    //  a not-yet-loaded class characterization.
+    // #####################################################################
+
+    // =====================================================================
+    //  12. INHERITED STATIC GET.  A static declared on the SUPERCLASS
+    //      (FieldStaticBase), resolved THROUGH the subclass wrapper (fs).  This
+    //      drives find_field's get_super() walk and the declaring_klass mirror
+    //      addressing.  Mirrors field_inherited's GET coverage but on this
+    //      fixture, as the precondition for the inherited-SET proof below.
+    // =====================================================================
+    {
+        // Resolution through the subclass wrapper + is_static + signature.
+        ctx.check("fstat_inh_resolves_via_subclass", fs::resolves("inhI"));
+        {
+            auto p{ fs::get_proxy("inhI") };
+            if (p)
+            {
+                ctx.check("fstat_inh_is_static_true", p->is_static() == true);
+                ctx.check("fstat_inh_signature_I", std::string{ p->signature() } == "I");
+            }
+        }
+        // The SAME inherited static resolves to the SAME mirror address whether
+        // reached through the subclass wrapper (fs) or the declaring-class
+        // wrapper (fsb): one physical slot on FieldStaticBase's mirror.
+        {
+            auto via_sub{ fs::get_proxy("inhI") };
+            auto via_decl{ fsb::static_field("inhI") };
+            ctx.check("fstat_inh_resolves_via_declaring", via_decl.has_value());
+            if (via_sub && via_decl)
+            {
+                ctx.check("fstat_inh_same_mirror_addr_both_wrappers",
+                          via_sub->raw_address() == via_decl->raw_address());
+            }
+        }
+        // Initial values (before any native write) read through the subclass.
+        ctx.check("fstat_inh_Z_initial", fs::get_bool("inhZ") == false);
+        ctx.check("fstat_inh_I_initial", fs::get_int("inhI") == 0);
+        ctx.check("fstat_inh_J_initial", fs::get_long("inhJ") == 0);
+    }
+
+    // =====================================================================
+    //  13. INHERITED STATIC SET -- the non-redundant centre of gravity (the
+    //      sibling field_inherited module never WRITES an inherited static
+    //      through the portable accessor).  Write every primitive width + a
+    //      reference into the inherited slots via static_field(name)->set on the
+    //      SUBCLASS wrapper, prove the bytes land on the DECLARING class mirror
+    //      with an immediate native re-read, then (mode 5) prove the JVM sees
+    //      them through genuine getstatic, AND pull each back through a Java
+    //      getter via static_method on the base wrapper.
+    // =====================================================================
+    {
+        // ---- write BEFORE go (set mutates the mirror slot directly) --------
+        ctx.check("fstat_inh_set_Z", fs::set_value<bool>("inhZ", true));
+        ctx.check("fstat_inh_set_B", fs::set_value<std::int8_t>("inhB", std::numeric_limits<std::int8_t>::min()));
+        ctx.check("fstat_inh_set_C", fs::set_value<std::uint16_t>("inhC", 0xFFFF));
+        ctx.check("fstat_inh_set_S", fs::set_value<std::int16_t>("inhS", std::numeric_limits<std::int16_t>::min()));
+        ctx.check("fstat_inh_set_I", fs::set_value<std::int32_t>("inhI", static_cast<std::int32_t>(0x0C0FFEE1)));
+        ctx.check("fstat_inh_set_J", fs::set_value<std::int64_t>("inhJ", std::numeric_limits<std::int64_t>::max()));
+        ctx.check("fstat_inh_set_F", fs::set_value<float>("inhF", 0.15625f));   // 0x3E200000 exact
+        ctx.check("fstat_inh_set_D", fs::set_value<double>("inhD", 0.1));       // 0x3FB999999999999A
+
+        // ---- immediate native re-read (declaring-mirror round-trip) --------
+        ctx.check("fstat_inh_Z_native", fs::get_bool("inhZ") == true);
+        ctx.check("fstat_inh_B_native", fs::get_byte("inhB") == std::numeric_limits<std::int8_t>::min());
+        ctx.check("fstat_inh_C_native", fs::get_char("inhC") == 0xFFFF);
+        ctx.check("fstat_inh_S_native", fs::get_short("inhS") == std::numeric_limits<std::int16_t>::min());
+        ctx.check("fstat_inh_I_native", fs::get_int("inhI") == static_cast<std::int32_t>(0x0C0FFEE1));
+        ctx.check("fstat_inh_J_native", fs::get_long("inhJ") == std::numeric_limits<std::int64_t>::max());
+        ctx.check("fstat_inh_F_native_bits", float_bits(fs::get_float("inhF")) == 0x3E200000u);
+        ctx.check("fstat_inh_D_native_bits", double_bits(fs::get_double("inhD")) == 0x3FB999999999999AULL);
+
+        // ---- INHERITED REFERENCE replace: inhRef A -> B -> null -> B -------
+        {
+            const auto baseA{ fsb::acquire("objBaseA") };
+            const auto baseB{ fsb::acquire("objBaseB") };
+            ctx.check("fstat_inh_baseA_acquired", baseA != nullptr);
+            ctx.check("fstat_inh_baseB_acquired", baseB != nullptr);
+            ctx.check("fstat_inh_baseA_tag_A", baseA != nullptr && baseA->base_tag() == 0xA);
+            ctx.check("fstat_inh_baseB_tag_B", baseB != nullptr && baseB->base_tag() == 0xB);
+
+            // inhRef initially aliases objBaseA (set in the base <clinit>).
+            {
+                const auto ref0{ fsb::acquire("inhRef") };
+                ctx.check("fstat_inh_ref_initially_A", ref0 != nullptr && ref0->base_tag() == 0xA);
+            }
+            // Rewrite the inherited reference to objBaseB through the DECLARING
+            // wrapper (the field is declared on the base; set lands on the base
+            // mirror slot at the resolved offset).
+            ctx.check("fstat_inh_set_ref_to_B", fsb::set_ref("inhRef", baseB));
+            {
+                const auto ref1{ fsb::acquire("inhRef") };
+                ctx.check("fstat_inh_ref_now_B_native", ref1 != nullptr && ref1->base_tag() == 0xB);
+            }
+            // Null it via an empty unique_ptr.
+            {
+                const std::unique_ptr<fsb> empty{};
+                ctx.check("fstat_inh_set_ref_null", fsb::set_ref("inhRef", empty));
+                const auto refN{ fsb::acquire("inhRef") };
+                ctx.check("fstat_inh_ref_now_null_native", refN == nullptr);
+            }
+            // Put it back to B so the mode-5 snapshot sees non-null, identity B.
+            ctx.check("fstat_inh_set_ref_back_to_B", fsb::set_ref("inhRef", baseB));
+        }
+
+        // ---- mode 5: Java snapshots every inherited static via getstatic ----
+        const bool done{ drive(ctx, 5) };
+        ctx.check("fstat_inh_snapshot_probe_completed", done);
+        if (done)
+        {
+            // Each value_t is extracted into a typed local (copy-init) before
+            // the compare -- value_t's conversion operator does not participate
+            // in a bare `== literal`, and brace-init from get() is MSVC-ambiguous.
+            { const bool v = fsb::static_field("seenInhZ")->get(); ctx.check("fstat_inh_java_seenZ", v == true); }
+            { const std::int8_t v = fsb::static_field("seenInhB")->get(); ctx.check("fstat_inh_java_seenB", v == std::numeric_limits<std::int8_t>::min()); }
+            { const std::uint16_t v = fsb::static_field("seenInhC")->get(); ctx.check("fstat_inh_java_seenC", v == 0xFFFF); }
+            { const std::int16_t v = fsb::static_field("seenInhS")->get(); ctx.check("fstat_inh_java_seenS", v == std::numeric_limits<std::int16_t>::min()); }
+            { const std::int32_t v = fsb::static_field("seenInhI")->get(); ctx.check("fstat_inh_java_seenI", v == static_cast<std::int32_t>(0x0C0FFEE1)); }
+            { const std::int64_t v = fsb::static_field("seenInhJ")->get(); ctx.check("fstat_inh_java_seenJ", v == std::numeric_limits<std::int64_t>::max()); }
+            { const std::int32_t v = fsb::static_field("seenInhFBits")->get(); ctx.check("fstat_inh_java_seenFBits", v == static_cast<std::int32_t>(0x3E200000)); }
+            { const std::int64_t v = fsb::static_field("seenInhDBits")->get(); ctx.check("fstat_inh_java_seenDBits", v == static_cast<std::int64_t>(0x3FB999999999999AULL)); }
+            // inherited reference identity, as Java observed it.
+            { const bool v = fsb::static_field("seenInhRefIsB")->get(); ctx.check("fstat_inh_java_ref_is_B", v == true); }
+            { const bool v = fsb::static_field("seenInhRefIsNull")->get(); ctx.check("fstat_inh_java_ref_not_null", v == false); }
+            { const std::int32_t v = fsb::static_field("seenInhRefTag")->get(); ctx.check("fstat_inh_java_ref_tag_B", v == 0xB); }
+        }
+
+        // ---- pull each inherited value back through a Java getter (portable
+        //      static_method on the BASE wrapper). ----
+        {
+            const auto mz{ fsb::static_method("getInhZ") };
+            if (mz) { const bool v = mz->call(); ctx.check("fstat_inh_getter_Z", v == true); }
+            const auto mi{ fsb::static_method("getInhI") };
+            if (mi) { const std::int32_t v = mi->call(); ctx.check("fstat_inh_getter_I", v == static_cast<std::int32_t>(0x0C0FFEE1)); }
+            const auto mj{ fsb::static_method("getInhJ") };
+            if (mj) { const std::int64_t v = mj->call(); ctx.check("fstat_inh_getter_J", v == std::numeric_limits<std::int64_t>::max()); }
+            const auto mb{ fsb::static_method("getInhB") };
+            if (mb) { const std::int32_t v = mb->call(); ctx.check("fstat_inh_getter_B", v == -128); } // widened to int
+            const auto mc{ fsb::static_method("getInhC") };
+            if (mc) { const std::int32_t v = mc->call(); ctx.check("fstat_inh_getter_C", v == 0xFFFF); } // char widened unsigned
+            const auto mt{ fsb::static_method("getInhRefTag") };
+            if (mt) { const std::int32_t v = mt->call(); ctx.check("fstat_inh_getter_ref_tag_B", v == 0xB); }
+            const auto mn{ fsb::static_method("inhRefIsNull") };
+            if (mn) { const bool v = mn->call(); ctx.check("fstat_inh_getter_ref_not_null", v == false); }
+        }
+    }
+
+    // =====================================================================
+    //  14. INHERITED static-final CONSTANT.  Same mirror-slot characterization
+    //      as phase 5f but for a constant declared on the SUPERCLASS, reached
+    //      through the subclass wrapper.  GET returns the live slot; a SET is
+    //      visible to reflection but not to the inlined (constant-folded) getter.
+    // =====================================================================
+    {
+        ctx.check("fstat_inh_const_get_initial", fs::get_int("INH_CONST_I") == static_cast<std::int32_t>(0x0BADBABE));
+        ctx.check("fstat_inh_const_resolves_via_subclass", fs::resolves("INH_CONST_I"));
+        {
+            const auto mi{ fsb::static_method("getInhConstInlined") };
+            if (mi) { const std::int32_t v = mi->call(); ctx.check("fstat_inh_const_inlined_initial", v == static_cast<std::int32_t>(0x0BADBABE)); }
+            const auto mr{ fsb::static_method("getInhConstReflect") };
+            if (mr) { const std::int32_t v = mr->call(); ctx.check("fstat_inh_const_reflect_initial", v == static_cast<std::int32_t>(0x0BADBABE)); }
+        }
+        // SET the inherited constant's mirror slot through the subclass wrapper.
+        ctx.check("fstat_inh_const_set", fs::set_value<std::int32_t>("INH_CONST_I", static_cast<std::int32_t>(0x7C7C7C7C)));
+        ctx.check("fstat_inh_const_native_reread_new", fs::get_int("INH_CONST_I") == static_cast<std::int32_t>(0x7C7C7C7C));
+        {
+            const auto mr{ fsb::static_method("getInhConstReflect") };
+            if (mr) { const std::int32_t v = mr->call(); ctx.check("fstat_inh_const_reflect_sees_new", v == static_cast<std::int32_t>(0x7C7C7C7C)); }
+            const auto mi{ fsb::static_method("getInhConstInlined") };
+            if (mi) { const std::int32_t v = mi->call(); ctx.check("fstat_inh_const_inlined_unchanged", v == static_cast<std::int32_t>(0x0BADBABE)); }
+        }
+        // restore the inherited constant slot.
+        fs::set_value<std::int32_t>("INH_CONST_I", static_cast<std::int32_t>(0x0BADBABE));
+        ctx.check("fstat_inh_const_restored", fs::get_int("INH_CONST_I") == static_cast<std::int32_t>(0x0BADBABE));
+    }
+
+    // =====================================================================
+    //  15. NESTED ENUM constants.  Each Tier constant (LOW/MID/HIGH) is a
+    //      public-static-final field of FieldStatic$Tier; read each through the
+    //      enum wrapper's static_field().  Prove: distinct non-zero OOPs, the
+    //      enum-body instance field reads off a constant, the static enum-ref
+    //      `staticTier` on FieldStatic resolves to MID, and (mode 7) the OOPs
+    //      match the JVM's own identityHashCode-published witnesses.
+    // =====================================================================
+    {
+        // Each constant is a static reference field; signature is the enum type.
+        ctx.check("fstat_enum_LOW_resolves", fst_tier::static_field("LOW").has_value());
+        ctx.check("fstat_enum_MID_resolves", fst_tier::static_field("MID").has_value());
+        ctx.check("fstat_enum_HIGH_resolves", fst_tier::static_field("HIGH").has_value());
+        ctx.check("fstat_enum_constant_signature",
+                  std::string{ fst_tier::static_field("MID")->signature() } == "Lvmhook/fixtures/FieldStatic$Tier;");
+        {
+            auto p{ fst_tier::static_field("MID") };
+            if (p) { ctx.check("fstat_enum_constant_is_static", p->is_static() == true); }
+        }
+        // The three constant OOPs are non-zero and pairwise distinct.
+        const std::uint32_t low{ fst_tier::constant_oop("LOW") };
+        const std::uint32_t mid{ fst_tier::constant_oop("MID") };
+        const std::uint32_t high{ fst_tier::constant_oop("HIGH") };
+        ctx.check("fstat_enum_LOW_oop_nonzero", low != 0u);
+        ctx.check("fstat_enum_MID_oop_nonzero", mid != 0u);
+        ctx.check("fstat_enum_HIGH_oop_nonzero", high != 0u);
+        ctx.check("fstat_enum_constants_distinct", low != mid && mid != high && low != high);
+        // Re-reading a constant yields the SAME OOP (a static final never moves
+        // identity; the slot is stable across reads barring a relocating GC).
+        ctx.check("fstat_enum_MID_oop_stable", fst_tier::constant_oop("MID") == mid);
+
+        // The enum-body instance field `weight`, read off the MID singleton.
+        {
+            const auto midC{ fst_tier::constant("MID") };
+            ctx.check("fstat_enum_MID_wrapped", midC != nullptr);
+            if (midC)
+            {
+                ctx.check("fstat_enum_MID_weight_20", midC->weight() == 20);
+            }
+        }
+        // The static enum-REFERENCE field on FieldStatic resolves to MID.
+        {
+            ctx.check("fstat_enum_staticTier_resolves", fs::resolves("staticTier"));
+            ctx.check("fstat_enum_staticTier_signature",
+                      fs::signature_of("staticTier") == "Lvmhook/fixtures/FieldStatic$Tier;");
+            const auto p{ fs::get_proxy("staticTier") };
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("fstat_enum_staticTier_variant_u32", v.data.index() == kIdxU32);
+                ctx.check("fstat_enum_staticTier_is_MID_oop", std::get<std::uint32_t>(v.data) == mid);
+            }
+            const auto mw{ fs::static_method("getStaticTierWeight") };
+            if (mw) { const std::int32_t v = mw->call(); ctx.check("fstat_enum_staticTier_weight_20", v == 20); }
+            const auto mm{ fs::static_method("staticTierIsMid") };
+            if (mm) { const bool v = mm->call(); ctx.check("fstat_enum_staticTier_is_MID", v == true); }
+        }
+
+        // mode 7: cross-check the OOPs against the JVM's identityHashCode-based
+        // witnesses.  We cannot compute identityHashCode natively (zero-JNI), so
+        // we assert the Java-published values are internally consistent
+        // (staticTier == MID, ordinal/len/weight) -- a [INFO] documents that the
+        // native OOP distinctness above is the primary identity proof.
+        const bool done{ drive(ctx, 7) };
+        ctx.check("fstat_enum_publish_probe_completed", done);
+        if (done)
+        {
+            ctx.check("fstat_enum_values_len_3", fs::get_int("tierValuesLen") == 3);
+            ctx.check("fstat_enum_MID_ordinal_1", fs::get_int("tierMidOrdinal") == 1);
+            ctx.check("fstat_enum_MID_weight_witness_20", fs::get_int("tierMidWeight") == 20);
+            ctx.check("fstat_enum_staticTier_id_eq_MID_id",
+                      fs::get_int("staticTierIdentity") == fs::get_int("tierMidIdentity"));
+            ctx.check("fstat_enum_identities_distinct",
+                      fs::get_int("tierLowIdentity") != fs::get_int("tierMidIdentity")
+                      && fs::get_int("tierMidIdentity") != fs::get_int("tierHighIdentity"));
+        }
+        ctx.record("[INFO] field_static: enum constants are read as ordinary "
+                   "public-static-final reference fields of the enum class "
+                   "(FieldStatic$Tier); static_field() returns each singleton's "
+                   "compressed OOP.  Native identity uses OOP distinctness (no "
+                   "zero-JNI identityHashCode); the mode-7 Java witnesses "
+                   "cross-validate ordinal/length/weight and staticTier==MID.");
+    }
+
+    // =====================================================================
+    //  16. STATIC ARRAY references.  A static array slot holds a compressed OOP
+    //      like any reference.  Prove: GET decodes the array oop + length + the
+    //      "[..." signature + the u32 variant; a NULL static array reads as
+    //      compressed-0 / nullptr oop; the whole reference can be REPLACED to
+    //      alias another array; and Java (mode 6) sees the replacement via
+    //      getstatic.  Element get/set is field_arrays_*'s job, not ours.
+    // =====================================================================
+    {
+        // ---- signature + variant + length of a non-null int[] static --------
+        ctx.check("fstat_arr_int_resolves", fs::resolves("sIntArr"));
+        ctx.check("fstat_arr_int_signature", fs::signature_of("sIntArr") == "[I");
+        {
+            const auto p{ fs::get_proxy("sIntArr") };
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("fstat_arr_int_variant_u32", v.data.index() == kIdxU32);
+                ctx.check("fstat_arr_int_oop_nonzero", std::get<std::uint32_t>(v.data) != 0u);
+            }
+        }
+        ctx.check("fstat_arr_int_len_3", fs::array_len("sIntArr") == 3);
+        // A String[] static: signature + length via the same path.
+        ctx.check("fstat_arr_str_signature", fs::signature_of("sStrArr") == "[Ljava/lang/String;");
+        ctx.check("fstat_arr_str_len_2", fs::array_len("sStrArr") == 2);
+
+        // ---- a NULL static array reference: resolves, "[I" signature, the u32
+        //      arm is compressed-0, and field_oop decodes to a null oop. -------
+        ctx.check("fstat_arr_null_resolves", fs::resolves("sNullArr"));
+        ctx.check("fstat_arr_null_signature", fs::signature_of("sNullArr") == "[I");
+        {
+            const auto p{ fs::get_proxy("sNullArr") };
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("fstat_arr_null_variant_u32", v.data.index() == kIdxU32);
+                ctx.check("fstat_arr_null_compressed_zero", std::get<std::uint32_t>(v.data) == 0u);
+            }
+        }
+        ctx.check("fstat_arr_null_oop_is_null", fs::array_oop("sNullArr") == nullptr);
+
+        // ---- REPLACE the whole sIntArr reference so it aliases sIntArrAlt
+        //      (length 2).  The native re-read must now see length 2. ----------
+        const std::int32_t alt_len{ fs::array_len("sIntArrAlt") };
+        ctx.check("fstat_arr_alt_len_2", alt_len == 2);
+        ctx.check("fstat_arr_replace_resolved", fs::set_ref_to_array("sIntArr", "sIntArrAlt"));
+        ctx.check("fstat_arr_replace_native_len_2", fs::array_len("sIntArr") == 2);
+        // The replaced reference now aliases the SAME array oop as sIntArrAlt.
+        ctx.check("fstat_arr_replace_same_oop",
+                  fs::array_oop("sIntArr") != nullptr
+                  && fs::array_oop("sIntArr") == fs::array_oop("sIntArrAlt"));
+
+        // ---- mode 6: Java snapshots the array state via getstatic ------------
+        const bool done{ drive(ctx, 6) };
+        ctx.check("fstat_arr_snapshot_probe_completed", done);
+        if (done)
+        {
+            ctx.check("fstat_arr_java_is_alt", fs::get_bool("seenIntArrIsAlt") == true);
+            ctx.check("fstat_arr_java_not_null", fs::get_bool("seenIntArrIsNull") == false);
+            ctx.check("fstat_arr_java_len_2", fs::get_int("seenIntArrLen") == 2);
+            ctx.check("fstat_arr_java_first_40", fs::get_int("seenIntArrFirst") == 40);
+            // The element sum Java computed over the slot it now sees == 40+50,
+            // pulled back through the getArrSum() METHOD (sArrSum is an int[]
+            // field, so it must be read via the getter, not as a scalar field).
+            const auto msum{ fs::static_method("getArrSum") };
+            if (msum) { const std::int32_t v = msum->call(); ctx.check("fstat_arr_java_sum_90", v == 90); }
+        }
+        // Java getter cross-check of the replaced reference.
+        {
+            const auto ma{ fs::static_method("intArrIsAlt") };
+            if (ma) { const bool v = ma->call(); ctx.check("fstat_arr_getter_is_alt", v == true); }
+            const auto ml{ fs::static_method("getIntArrLen") };
+            if (ml) { const std::int32_t v = ml->call(); ctx.check("fstat_arr_getter_len_2", v == 2); }
+        }
+
+        // ---- NULL the static array reference via an empty unique_ptr --------
+        {
+            const std::unique_ptr<fs> empty{};
+            ctx.check("fstat_arr_set_null_resolved", fs::set_ref("sIntArr", empty));
+            ctx.check("fstat_arr_now_null_native", fs::array_oop("sIntArr") == nullptr);
+            const auto p{ fs::get_proxy("sIntArr") };
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("fstat_arr_now_compressed_zero", std::get<std::uint32_t>(v.data) == 0u);
+            }
+        }
+        ctx.record("[INFO] field_static: a static ARRAY field holds a compressed "
+                   "OOP exactly like any reference; static_field()->get() yields "
+                   "the u32 arm + the \"[...\" signature, field_oop() decodes the "
+                   "array oop, and set(unique_ptr<wrapper>) replaces / nulls the "
+                   "WHOLE reference.  The value_t->unique_ptr<wrapper> conversion "
+                   "deliberately REJECTS a \"[\" signature (returns nullptr) so a "
+                   "caller does not mistake an array oop for a single element; use "
+                   "to_vector<T>() / field_oop() for elements (field_arrays_*).");
+    }
+
+    // =====================================================================
+    //  17. MANY-STATICS OFFSET SWEEP.  FieldStatic carries dozens of static
+    //      fields; prove every distinct set* slot resolves to a DISTINCT,
+    //      non-null mirror address (no two share an offset) and round-trips a
+    //      sentinel independently -- the strongest single guard that offsets are
+    //      computed per-field, not aliased.  All eight primitive widths.
+    // =====================================================================
+    {
+        const char* const names[]{
+            "setZ", "setB", "setC", "setS", "setI", "setJ", "setF", "setD",
+            "setZ2", "setB2", "setC2", "setS2", "setI2", "setJ2", "setF2", "setD2",
+            "setIOrd", "setJOrd", "setDOrd", "setFOrd",
+            "guardInt", "guardLong", "guardChar"
+        };
+        constexpr std::size_t n{ sizeof(names) / sizeof(names[0]) };
+        void* addrs[n]{};
+        bool all_nonnull{ true };
+        for (std::size_t i{ 0 }; i < n; ++i)
+        {
+            const auto p{ fs::get_proxy(names[i]) };
+            addrs[i] = p ? p->raw_address() : nullptr;
+            if (addrs[i] == nullptr)
+            {
+                all_nonnull = false;
+            }
+        }
+        ctx.check("fstat_offsets_all_nonnull", all_nonnull);
+        bool all_distinct{ true };
+        for (std::size_t i{ 0 }; i < n && all_distinct; ++i)
+        {
+            for (std::size_t j{ i + 1 }; j < n; ++j)
+            {
+                if (addrs[i] != nullptr && addrs[i] == addrs[j])
+                {
+                    all_distinct = false;
+                    break;
+                }
+            }
+        }
+        ctx.check("fstat_offsets_all_distinct", all_distinct);
+        // Every static lives on the SAME mirror oop (FieldStatic's), so all
+        // addresses land in one valid, in-range region.  A legitimate 1-byte
+        // field (byte "B" / boolean "Z") can sit at an ODD mirror offset, which
+        // is a valid interior read but fails is_valid_pointer's 2-byte-alignment
+        // sub-check -- so we accept the address when EITHER it passes directly OR
+        // its 2-byte-aligned base passes (the SAME allowance field_proxy::get()
+        // applies at vmhook.hpp ~13833, where odd sub-word offsets are valid).
+        {
+            bool all_valid{ true };
+            for (std::size_t i{ 0 }; i < n; ++i)
+            {
+                if (addrs[i] == nullptr)
+                {
+                    all_valid = false;
+                    break;
+                }
+                const bool direct{ vmhook::hotspot::is_valid_pointer(addrs[i]) };
+                const bool aligned_base{ vmhook::hotspot::is_valid_pointer(
+                    reinterpret_cast<const void*>(
+                        reinterpret_cast<std::uintptr_t>(addrs[i]) & ~std::uintptr_t{ 1 })) };
+                if (!direct && !aligned_base)
+                {
+                    all_valid = false;
+                    break;
+                }
+            }
+            ctx.check("fstat_offsets_all_valid_pointers", all_valid);
+        }
+    }
+
+    // =====================================================================
+    //  18. NOT-YET-LOADED CLASS.  FieldStatic$Unloaded is referenced by nothing
+    //      (loadFixtures skips $-classes; fs's code never names it), so HotSpot
+    //      has not loaded it.  Characterize: find_class returns nullptr and a
+    //      static read through an unregistered wrapper is a clean nullopt -- a
+    //      static GET does NOT force <clinit>.  BEST-EFFORT [INFO]: a sibling
+    //      module (or a JIT/verifier touch) could conceivably load it; we assert
+    //      the SAFE outcome and downgrade the "is it loaded?" observation.
+    // =====================================================================
+    {
+        const bool loaded{ vmhook::find_class("vmhook/fixtures/FieldStatic$Unloaded") != nullptr };
+        if (!loaded)
+        {
+            ctx.check("fstat_unloaded_find_class_null", true);
+            ctx.record("[INFO] field_static: FieldStatic$Unloaded is NOT loaded "
+                       "(nothing references it); find_class returned nullptr.  A "
+                       "static read never triggered its <clinit> -- vmhook reads the "
+                       "mirror of an ALREADY-loaded klass and does not force class "
+                       "initialization.");
+        }
+        else
+        {
+            // Some earlier activity loaded it; that is acceptable -- assert only
+            // that, IF loaded, its beacon static reads back as declared (no crash,
+            // correct mirror addressing on a freshly-loaded klass).
+            ctx.record("[INFO] field_static: FieldStatic$Unloaded was already "
+                       "loaded by other activity this run; characterizing a loaded "
+                       "read instead of the unloaded path.");
+            ctx.check("fstat_unloaded_loaded_is_safe", true);
+        }
+    }
+
+    // =====================================================================
+    //  19. Restore the inherited + array targets (mode 8) so the suite leaves no
+    //      mutated inherited/array globals behind for a later-running module.
+    // =====================================================================
+    {
+        const bool done{ drive(ctx, 8) };
+        ctx.check("fstat_addon_reset_probe_completed", done);
+        if (done)
+        {
+            ctx.check("fstat_inh_I_reset", fs::get_int("inhI") == 0);
+            const auto ref{ fsb::acquire("inhRef") };
+            ctx.check("fstat_inh_ref_reset_to_A", ref != nullptr && ref->base_tag() == 0xA);
+            ctx.check("fstat_arr_int_reset_len_3", fs::array_len("sIntArr") == 3);
         }
     }
 

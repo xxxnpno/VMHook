@@ -37,6 +37,13 @@ import vmhook.Harness;
  *       hook on touch() fires; INSIDE that detour the module pulls every static
  *       field back through the getX() getters (method_proxy::call needs a live
  *       current_java_thread, which only exists on the Java thread in a detour).
+ *   5 = snapshotInherited(): getstatic each INHERITED static (declared on
+ *       FieldStaticBase) into its seenInh* witness, after the native side wrote
+ *       it via static_field(name)->set on the subclass wrapper.
+ *   6 = snapshotArrays(): getstatic the static ARRAY reference state (after a
+ *       native whole-array replace / null) and publish the element sum.
+ *   7 = publishEnum(): publish Tier constant identities/ordinals via bytecode.
+ *   8 = reset inherited + array targets to their initial values.
  *
  * PORTABILITY/ENCODING NOTES:
  *   - All char values are numeric / \\uXXXX escapes (lexer-level, encoding
@@ -53,8 +60,22 @@ import vmhook.Harness;
  *     the "world" literal in seenStrEqWorld).  Mirrors FieldString.java.
  *
  * Java 8 syntax only (anonymous class, no var/lambda-in-field/switch-expr).
+ *
+ * EXHAUSTIVE EXTENSIONS (field_static "every possible input"):
+ *   - extends {@link FieldStaticBase}: inherited static GET *and* SET through
+ *     the subclass wrapper (declaring-klass mirror), plus an inherited
+ *     reference replace and an inherited static-final constant.
+ *   - nested {@link Tier} enum: each constant is a public-static-final field of
+ *     FieldStatic$Tier — read as a static reference, plus a static enum-ref
+ *     field on FieldStatic itself.
+ *   - static ARRAY reference fields (int[] / String[] / a null array): read the
+ *     compressed-OOP identity, REPLACE the whole array reference, null it.
+ *   - many-statics offset sweep: every set* slot resolves to a DISTINCT mirror
+ *     address (offset correctness across a class with dozens of statics).
+ *   - nested {@code Unloaded} class that nothing references: a genuine
+ *     not-yet-loaded class so the module can characterize find_class on it.
  */
-public final class FieldStatic
+public final class FieldStatic extends FieldStaticBase
 {
     // -- go / done handshake driven by the native module via run_probe ------
     public static volatile boolean go;
@@ -62,6 +83,74 @@ public final class FieldStatic
 
     /** Scenario selector; native sets it before raising go. */
     public static volatile int mode;
+
+    // =====================================================================
+    //  NESTED ENUM.  Each constant is a synthetic `public static final Tier`
+    //  field of FieldStatic$Tier (the constant's singleton OOP).  The module
+    //  registers a wrapper for FieldStatic$Tier and reads LOW/MID/HIGH through
+    //  static_field(); it also reads the static enum-ref `staticTier` here.
+    //  Java 8: a plain enum body (no var / switch-expr).
+    // =====================================================================
+    public enum Tier
+    {
+        LOW(10),
+        MID(20),
+        HIGH(30);
+
+        /** Instance field on the enum body (native reads it off a constant). */
+        public final int weight;
+
+        Tier(final int weight)
+        {
+            this.weight = weight;
+        }
+    }
+
+    /** STATIC enum-reference field on FieldStatic — resolves to the MID singleton. */
+    public static Tier staticTier = Tier.MID;
+
+    // Identity / ordinal witnesses for the enum constants, published Java-side
+    // (mode 7) so the native distinctness checks are EXACT, not "non-null".
+    public static volatile int tierLowIdentity;
+    public static volatile int tierMidIdentity;
+    public static volatile int tierHighIdentity;
+    public static volatile int staticTierIdentity;   // == tierMidIdentity
+    public static volatile int tierValuesLen;        // Tier.values().length == 3
+    public static volatile int tierMidOrdinal;       // == 1
+    public static volatile int tierMidWeight;        // Tier.MID.weight == 20
+
+    // =====================================================================
+    //  STATIC ARRAY reference fields.  A static array slot holds a compressed
+    //  OOP exactly like any reference; native reads its identity, REPLACES the
+    //  whole reference via set(unique_ptr<wrapper>), and nulls it.  The element
+    //  contents are not the subject here (field_arrays_* own element get/set) —
+    //  this proves whole-array static reference handling.
+    // =====================================================================
+    public static int[]    sIntArr   = { 10, 20, 30 };       // native may replace with sIntArrAlt
+    public static String[] sStrArr   = { "x", "y" };          // GET identity / signature
+    public static int[]    sNullArr  = null;                  // GET of a null array reference
+    public static final int[]    sIntArrAlt = { 40, 50 };     // the replacement target
+    public static int[]    sArrSum   = { 0 };                 // mode 6 writes the sum of sIntArr's elements
+
+    // Array witnesses (mode 6): identity of sIntArr at snapshot, its length, and
+    // whether it now aliases sIntArrAlt / is null.
+    public static volatile int     seenIntArrLen;
+    public static volatile int     seenIntArrFirst;          // sIntArr == null ? -1 : sIntArr[0]
+    public static volatile boolean seenIntArrIsAlt;          // sIntArr == sIntArrAlt
+    public static volatile boolean seenIntArrIsNull;
+
+    /**
+     * A nested class that NOTHING in the harness references, so HotSpot never
+     * loads it during startup (loadFixtures only Class.forName's top-level
+     * classes; FieldStatic's own code never names it).  The module uses it to
+     * characterize find_class / static_field on a not-yet-loaded class.  It is
+     * package-visible-from-here but unreferenced; -Werror-y javac is fine with
+     * a nested type that is simply never used.
+     */
+    static final class Unloaded
+    {
+        public static int neverTouched = 0x5EED0001; // class stays unloaded: nothing references it
+    }
 
     // =====================================================================
     //  SET TARGETS -- the native side writes these via static_field(name)->set().
@@ -410,6 +499,16 @@ public final class FieldStatic
     public static String  getStrEmpty() { return setStrEmpty; }
     public static String  getStrTrunc() { return setStrTrunc; }
 
+    // ---- getters for the static ARRAY fields (genuine getstatic) -----------
+    public static int     getIntArrLen()   { return sIntArr == null ? -1 : sIntArr.length; }
+    public static int     getIntArrFirst() { return sIntArr == null ? -1 : sIntArr[0]; }
+    public static boolean intArrIsAlt()    { return sIntArr == sIntArrAlt; }
+    public static boolean intArrIsNull()   { return sIntArr == null; }
+    public static int     getArrSum()      { return sArrSum == null ? -1 : sArrSum[0]; }
+    // ---- getter for the static enum-ref + the enum constant's field --------
+    public static int     getStaticTierWeight() { return staticTier == null ? -1 : staticTier.weight; }
+    public static boolean staticTierIsMid()     { return staticTier == Tier.MID; }
+
     /**
      * Builds a String from the chars of {@code text} via new String(char[]),
      * guaranteeing a PRIVATE backing array never shared with an interned
@@ -488,6 +587,52 @@ public final class FieldStatic
         objRef = objA;
     }
 
+    /**
+     * mode 6: snapshot the static array reference state (after the native side
+     * has optionally replaced/nulled sIntArr) using genuine getstatic, and
+     * publish the sum of sIntArr's elements into sArrSum so the native side can
+     * prove the array it now sees through the static slot is the live one.
+     */
+    private static void snapshotArrays()
+    {
+        seenIntArrIsAlt  = (sIntArr == sIntArrAlt);
+        seenIntArrIsNull = (sIntArr == null);
+        seenIntArrLen    = (sIntArr == null) ? -1 : sIntArr.length;
+        seenIntArrFirst  = (sIntArr == null) ? -1 : sIntArr[0];
+        int sum = 0;
+        if (sIntArr != null)
+        {
+            for (int i = 0; i < sIntArr.length; i++)
+            {
+                sum += sIntArr[i];
+            }
+        }
+        sArrSum = new int[] { sum };
+    }
+
+    /** Restore the array references to their initial values (clean re-run). */
+    private static void resetArrays()
+    {
+        sIntArr  = new int[] { 10, 20, 30 };
+        sStrArr  = new String[] { "x", "y" };
+        sNullArr = null;
+    }
+
+    /**
+     * mode 7: publish enum identities / ordinals / a constant's field via real
+     * bytecode, so the native distinctness + value checks are EXACT.
+     */
+    private static void publishEnum()
+    {
+        tierLowIdentity    = System.identityHashCode(Tier.LOW);
+        tierMidIdentity    = System.identityHashCode(Tier.MID);
+        tierHighIdentity   = System.identityHashCode(Tier.HIGH);
+        staticTierIdentity = System.identityHashCode(staticTier);
+        tierValuesLen      = Tier.values().length;
+        tierMidOrdinal     = Tier.MID.ordinal();
+        tierMidWeight      = Tier.MID.weight;
+    }
+
     static
     {
         objA.tag = 0xA;
@@ -519,6 +664,26 @@ public final class FieldStatic
                         // Real bytecode dispatch so the native interpreter hook
                         // on touch() fires; the detour does the getX() call-backs.
                         objA.touch(0x5A);
+                        break;
+                    case 5:
+                        // Snapshot every INHERITED static (declared on the
+                        // superclass) into its seenInh* witness via getstatic,
+                        // so the module reads back what the JVM observed for the
+                        // native writes to the declaring-class mirror.
+                        FieldStaticBase.snapshotInherited();
+                        break;
+                    case 6:
+                        // Snapshot the static ARRAY reference state via getstatic.
+                        snapshotArrays();
+                        break;
+                    case 7:
+                        // Publish enum identities/ordinals via real bytecode.
+                        publishEnum();
+                        break;
+                    case 8:
+                        // Restore inherited + array targets to initial values.
+                        FieldStaticBase.resetInherited();
+                        resetArrays();
                         break;
                     default:
                         break;

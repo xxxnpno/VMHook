@@ -50,31 +50,44 @@
 //     * REVERSE comparator (Collections.reverseOrder()) — the in-order walk must
 //       honour the comparator and come out DESCENDING by id, NOT natural order.
 //     * TreeSet<String> (sorted lexicographic order, exact).
+//     * TreeSet<Integer> (BOXED element; ascending numeric order, exact).
+//
+//   Boxed-Integer element decode (java.lang.Integer.value read as a primitive):
+//     * HashSet<Integer> (INT_N=40 values; value fingerprint + membership).
+//     * TreeSet<Integer> (sorted ascending, exact).
+//
+//   "m"-backed JDK Set wrappers that DO reach a fast path (the klass-shape
+//   router, vmhook.hpp ~17369, picks tree-vs-hash by the backing-map's real
+//   layout, NOT the field name) — all PURE memory walks, decoded from the body:
+//     * Collections.newSetFromMap(new HashMap<>())   "m" → HashMap (table) →
+//       hash walk; was a [medium] bug that returned empty, now FIXED — full decode.
+//     * Collections.newSetFromMap(new TreeMap<>())   "m" → TreeMap (root) → TREE
+//       walk → SORTED decode (proves the router picks the tree walk by klass).
+//     * Collections.newSetFromMap(new LinkedHashMap<>())  "m" → LinkedHashMap
+//       (table, no root) → hash walk → content decode (bucket order).
+//     * ConcurrentHashMap.newKeySet()                "map" resolved off the
+//       KeySetView SUPERCLASS (CollectionView) via find_field's superclass walk;
+//       backing CHM 'table' Nodes carry key/next → full decode (empty + populated).
 //
 //   JDK Collections wrappers (the cascade's generic-fallback frontier).  These
 //   have NO fast-path field shape (EmptySet: no fields; SingletonSet: "element";
-//   Unmodifiable/Synchronized: "c"), so collection::to_vector would reach the
-//   generic get(int) fallback, which a Set cannot satisfy — and that fallback
-//   issues a Java size() call.  Calling a Java method from the worker-thread body
-//   is forbidden by the suite (only safe inside a detour), so this module does
-//   NOT decode these from the body; instead it pins each one's Java-published
-//   size() (a pure static-field read) and records an [INFO] documenting the
-//   List-only-fallback limitation (the SAME root cause as the setFromHashMap
-//   [medium] bug).  The empty-decode correctness of the fallback itself is proven
-//   by collection_list.cpp inside a detour.
+//   Unmodifiable/Synchronized: "c"; EnumSet: a primitive `long elements` bitmask;
+//   Set.of → Set12 "e0/e1" / SetN "elements[]"+"size"), so collection::to_vector
+//   would reach the generic get(int) fallback, which a Set cannot satisfy — and
+//   that fallback issues a Java size() call.  Calling a Java method from the
+//   worker-thread body is forbidden by the suite (only safe inside a detour), so
+//   this module does NOT decode these from the body; instead it pins each one's
+//   Java-published size() (a pure static-field read) and records an [INFO]
+//   documenting the List-only-fallback limitation (the SAME root cause as the
+//   setFromHashMap [medium] bug).  The empty-decode correctness of the fallback
+//   itself is proven by collection_list.cpp inside a detour.
 //     * Collections.emptySet()          (size 0)
 //     * Collections.singleton(Elem)     (size 1)
 //     * Collections.unmodifiableSet(..) (size 2, field "c")
 //     * Collections.synchronizedSet(..) (size 2, field "c")
-//
-//   Collections.newSetFromMap(new HashMap<>())  [was a vmhook bug, now FIXED]:
-//     * Its backing-map field is literally named "m" (collides with TreeSet), but
-//       the backing map is a HashMap (no "root", has "table").  collection::
-//       to_vector now inspects the actual backing-map klass and routes a HashMap-
-//       backed Set to hash_map_walk_keys, decoding ALL elements.  This route is a
-//       PURE MEMORY WALK (no Java call), so it is safe to decode from the body.
-//       The module HARD-asserts the full-element result (count == size, full id
-//       fingerprint) and records an [INFO] note that the bug is fixed.
+//     * EnumSet.of(3) / EnumSet.noneOf(0)  (primitive long bitmask, no oop field)
+//     * Set.of(0/1/2/3)  (JDK 9+, built reflectively so the fixture compiles at
+//       -source 8; GATED on setOfAvailable; per-run SALT-randomized order)
 //
 //   size cross-check:  for every populated set the decoded element count is
 //   cross-checked against Java's own size(), published by the fixture into a
@@ -157,6 +170,24 @@ namespace
         }
     };
 
+    // ── BOXED-Integer element wrapper: java.lang.Integer. ───────────────────
+    // For HashSet<Integer> / TreeSet<Integer>, each element OOP is a boxed
+    // Integer; value() reads its primitive `value` int field directly (a pure
+    // heap read, no Java call) — the boxed-element decode angle.
+    class integer_box : public vmhook::object<integer_box>
+    {
+    public:
+        explicit integer_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<integer_box>{ instance }
+        {
+        }
+
+        auto value() const -> std::int32_t
+        {
+            return static_cast<std::int32_t>(get_field("value")->get());
+        }
+    };
+
     // ── Fixture wrapper: vmhook.fixtures.CollSet. ───────────────────────────
     class coll_set_fixture : public vmhook::object<coll_set_fixture>
     {
@@ -198,6 +229,19 @@ namespace
             return proxy->get().to_vector<string_element>();
         }
 
+        // Same, decoded to a boxed-Integer vector (HashSet<Integer> /
+        // TreeSet<Integer>).
+        static auto ints_of(const char* field)
+            -> std::vector<std::unique_ptr<integer_box>>
+        {
+            const auto proxy{ static_field(field) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            return proxy->get().to_vector<integer_box>();
+        }
+
         // Java-published cross-check values (pure heap-field reads — no Java call).
         static auto j_size(const char* f) -> std::int32_t { return static_field(f)->get(); }
         static auto j_long(const char* f) -> std::int64_t { return static_field(f)->get(); }
@@ -215,6 +259,8 @@ namespace
     constexpr std::int32_t TREE_MANY_N{ 200 };
     constexpr std::int32_t NULL_SET_NONNULL{ 3 };
     constexpr std::int32_t SETFROMMAP_N{ 4 };
+    constexpr std::int32_t CHM_N{ 50 };
+    constexpr std::int32_t INT_N{ 40 };
 
     // ── Hook observation (pilot-style proof). ───────────────────────────────
     std::atomic<int>          g_hook_calls{ 0 };
@@ -326,6 +372,56 @@ namespace
         return st;
     }
 
+    // Order-independent fingerprint over a decoded boxed-Integer set.
+    struct int_stats
+    {
+        std::int32_t count{ 0 };
+        std::int32_t null_count{ 0 };
+        std::int64_t val_sum{ 0 };
+        std::int64_t val_xor{ 0 };
+        bool         distinct_oops{ true };
+    };
+
+    auto fingerprint_ints(const std::vector<std::unique_ptr<integer_box>>& v)
+        -> int_stats
+    {
+        int_stats st;
+        st.count = static_cast<std::int32_t>(v.size());
+        std::unordered_set<const void*> seen;
+        seen.reserve(v.size() * 2 + 1);
+        for (const auto& up : v)
+        {
+            const integer_box* const e{ up.get() };
+            if (e == nullptr)
+            {
+                ++st.null_count;
+                continue;
+            }
+            const std::int32_t val{ e->value() };
+            st.val_sum += val;
+            st.val_xor ^= val;
+            const void* const oop{ static_cast<const void*>(e->get_instance()) };
+            if (!seen.insert(oop).second)
+            {
+                st.distinct_oops = false;
+            }
+        }
+        return st;
+    }
+
+    // Decoded boxed-Integer values IN WALK ORDER (a placeholder for a null slot).
+    auto int_values_in_order(const std::vector<std::unique_ptr<integer_box>>& v)
+        -> std::vector<std::int32_t>
+    {
+        std::vector<std::int32_t> order;
+        order.reserve(v.size());
+        for (const auto& up : v)
+        {
+            order.push_back(up ? up->value() : -1);
+        }
+        return order;
+    }
+
     // Collect decoded Elem ids IN WALK ORDER (a -1 placeholder for a null slot).
     // Used for the TreeSet ordered-walk assertions.
     auto ids_in_order(const std::vector<std::unique_ptr<elem_object>>& v)
@@ -388,6 +484,7 @@ namespace
         vmhook::register_class<coll_set_fixture>(FIXTURE);
         vmhook::register_class<elem_object>("vmhook/fixtures/CollSet$Elem");
         vmhook::register_class<string_element>("java/lang/String");
+        vmhook::register_class<integer_box>("java/lang/Integer");
 
         // The fixture's static initializer already built every set (buildAll()).
         // Drive one mode-0 probe first so the build also runs on the Java thread
@@ -881,6 +978,187 @@ namespace
         }
 
         // =====================================================================
+        // Collections.newSetFromMap(new TreeMap<>())  — the "m" backing-field
+        // name collides with TreeSet AND setFromHashMap, but the backing map is a
+        // TreeMap (HAS "root").  to_vector's "m"-route inspects the backing-map
+        // klass, finds "root", and routes to tree_map_walk_keys — so this decodes
+        // IN SORTED ORDER, proving the klass-shape router picks the TREE walk (not
+        // the hash walk) for a TreeMap-backed SetFromMap.  Ids 400..402, inserted
+        // out of order; the in-order walk must come out ascending [400,401,402].
+        // PURE memory walk (no Java call) → safe to decode from the body.
+        // =====================================================================
+        {
+            const std::int32_t java_size{ coll_set_fixture::j_size("setFromTreeMapSize") };
+            ctx.check("setfromtreemap_java_size_is_3", java_size == SMALL_N);
+
+            const auto v{ coll_set_fixture::elems_of("setFromTreeMap") };
+            const elem_stats st{ fingerprint(v) };
+            ctx.check("setfromtreemap_count_is_3", st.count == SMALL_N);
+            ctx.check("setfromtreemap_count_matches_java", st.count == java_size);
+            ctx.check("setfromtreemap_no_null", st.null_count == 0);
+            ctx.check("setfromtreemap_distinct", st.distinct_oops);
+            ctx.check("setfromtreemap_tags_round_trip", st.tags_consistent);
+
+            // TreeMap-backed → in-order walk → ascending by id: [400,401,402].
+            const std::vector<std::int32_t> order{ ids_in_order(v) };
+            bool ascending{ order.size() == static_cast<std::size_t>(SMALL_N) };
+            for (std::size_t k{ 0 }; ascending && k < order.size(); ++k)
+            {
+                if (order[k] != 400 + static_cast<std::int32_t>(k)) { ascending = false; }
+            }
+            ctx.check("setfromtreemap_in_sorted_order", ascending);
+            ctx.check("setfromtreemap_is_sorted",
+                      std::is_sorted(order.begin(), order.end()));
+            ctx.record("[INFO] newSetFromMap(TreeMap): backing field 'm' resolves to "
+                       "a TreeMap (has 'root'); to_vector's klass-shape router takes "
+                       "the in-order red-black walk → SORTED decode (vs the HashMap-"
+                       "backed setFromHashMap which takes the bucket walk).");
+        }
+
+        // =====================================================================
+        // Collections.newSetFromMap(new LinkedHashMap<>())  — backing field "m"
+        // again, but the backing map is a LinkedHashMap (NO "root", HAS "table"
+        // inherited from HashMap).  The "m"-route finds "table" and routes to
+        // hash_map_walk_keys → content decodes (bucket order; the LinkedHashMap
+        // insertion overlay is ignored, the SAME documented [low] as a plain
+        // LinkedHashSet).  Verified order-independently.  Ids 500..502.
+        // =====================================================================
+        {
+            const std::int32_t java_size{ coll_set_fixture::j_size("setFromLinkedMapSize") };
+            ctx.check("setfromlinkedmap_java_size_is_3", java_size == SMALL_N);
+
+            const auto v{ coll_set_fixture::elems_of("setFromLinkedMap") };
+            const elem_stats st{ fingerprint(v) };
+            ctx.check("setfromlinkedmap_count_is_3", st.count == SMALL_N);
+            ctx.check("setfromlinkedmap_count_matches_java", st.count == java_size);
+            ctx.check("setfromlinkedmap_no_null", st.null_count == 0);
+            ctx.check("setfromlinkedmap_id_sum_matches_java",
+                      st.id_sum == coll_set_fixture::j_long("setFromLinkedMapIdSum"));
+            ctx.check("setfromlinkedmap_distinct", st.distinct_oops);
+            ctx.check("setfromlinkedmap_tags_round_trip", st.tags_consistent);
+
+            const auto ids{ id_set(v) };
+            bool all_present{ ids.size() == static_cast<std::size_t>(SMALL_N) };
+            for (std::int32_t i{ 0 }; i < SMALL_N; ++i)
+            {
+                if (ids.find(500 + i) == ids.end()) { all_present = false; }
+            }
+            ctx.check("setfromlinkedmap_every_id_present", all_present);
+            ctx.record("[INFO] newSetFromMap(LinkedHashMap): backing field 'm' is a "
+                       "LinkedHashMap (no 'root', has 'table'); klass-shape router "
+                       "takes the HASH bucket walk → content correct in bucket order "
+                       "(insertion overlay ignored, documented [low]).");
+        }
+
+        // =====================================================================
+        // ConcurrentHashMap.newKeySet()  — a KeySetView whose backing field "map"
+        // lives on its SUPERCLASS (CollectionView), so the "map" fast path's
+        // find_field must resolve an INHERITED field (same superclass-walk the
+        // treeified-bin TreeNode case depends on).  The backing CHM has a "table"
+        // of Nodes carrying "key"/"next", so hash_map_walk_keys decodes every
+        // element.  CHM_N=50 distinct ids → all buckets are plain Node heads (no
+        // TreeBin / ForwardingNode), so the key/next walk surfaces all 50.  Full
+        // fingerprint + distinctness + membership.  Ids 600..649.
+        // =====================================================================
+        {
+            const std::int32_t java_size{ coll_set_fixture::j_size("chmKeySetSize") };
+            ctx.check("chm_keyset_java_size_is_50", java_size == CHM_N);
+
+            const auto v{ coll_set_fixture::elems_of("chmKeySet") };
+            const elem_stats st{ fingerprint(v) };
+            ctx.check("chm_keyset_count_is_50", st.count == CHM_N);
+            ctx.check("chm_keyset_count_matches_java", st.count == java_size);
+            ctx.check("chm_keyset_no_null", st.null_count == 0);
+            ctx.check("chm_keyset_id_sum_matches_java",
+                      st.id_sum == coll_set_fixture::j_long("chmKeySetIdSum"));
+            ctx.check("chm_keyset_id_xor_matches_java",
+                      st.id_xor == coll_set_fixture::j_long("chmKeySetIdXor"));
+            ctx.check("chm_keyset_all_distinct", st.distinct_oops);
+            ctx.check("chm_keyset_tags_round_trip", st.tags_consistent);
+
+            const auto ids{ id_set(v) };
+            bool all_present{ ids.size() == static_cast<std::size_t>(CHM_N) };
+            for (std::int32_t i{ 0 }; i < CHM_N; ++i)
+            {
+                if (ids.find(600 + i) == ids.end()) { all_present = false; }
+            }
+            ctx.check("chm_keyset_every_id_present_no_dupes", all_present);
+            ctx.record("[INFO] ConcurrentHashMap.newKeySet(): 'map' resolved off the "
+                       "KeySetView SUPERCLASS (CollectionView) via find_field's "
+                       "superclass walk; backing CHM 'table' Nodes carry key/next, so "
+                       "the HashSet key walk decodes all elements.");
+        }
+
+        // ConcurrentHashMap.newKeySet() — EMPTY.  No elements added; the backing
+        // CHM table may be null or all-null → 0 elements, no read, no throw.
+        {
+            const auto v{ coll_set_fixture::elems_of("chmKeySetEmpty") };
+            ctx.check("chm_keyset_empty_size_zero", v.empty());
+            ctx.check("chm_keyset_empty_java_size_zero",
+                      coll_set_fixture::j_size("chmKeySetEmptySize") == 0);
+        }
+
+        // =====================================================================
+        // HashSet<Integer>  — BOXED-Integer element decode.  Each decoded element
+        // OOP is a java.lang.Integer; integer_box reads its primitive `value`
+        // field.  Order-independent value fingerprint (sum/xor vs Java + closed
+        // form), distinctness, full membership 0..INT_N-1.  (Integer.hashCode() ==
+        // value, so distinct values cannot share a bucket-forcing hashCode; the
+        // collision-into-tree-bin coverage is the String "Aa"/"BB" family.)
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::ints_of("hashIntegers") };
+            const int_stats st{ fingerprint_ints(v) };
+            ctx.check("hash_ints_count_is_n", st.count == INT_N);
+            ctx.check("hash_ints_count_matches_java",
+                      st.count == coll_set_fixture::j_size("hashIntegersSize"));
+            ctx.check("hash_ints_no_null", st.null_count == 0);
+            ctx.check("hash_ints_val_sum_matches_java",
+                      st.val_sum == coll_set_fixture::j_long("hashIntegersValSum"));
+            ctx.check("hash_ints_val_xor_matches_java",
+                      st.val_xor == coll_set_fixture::j_long("hashIntegersValXor"));
+            ctx.check("hash_ints_val_sum_closed_form",
+                      st.val_sum == (static_cast<std::int64_t>(INT_N) * (INT_N - 1)) / 2);
+            ctx.check("hash_ints_all_distinct", st.distinct_oops);
+
+            std::unordered_set<std::int32_t> vals;
+            for (const auto& up : v) { if (up) { vals.insert(up->value()); } }
+            bool all_present{ vals.size() == static_cast<std::size_t>(INT_N) };
+            for (std::int32_t i{ 0 }; i < INT_N; ++i)
+            {
+                if (vals.find(i) == vals.end()) { all_present = false; }
+            }
+            ctx.check("hash_ints_every_value_present", all_present);
+        }
+
+        // =====================================================================
+        // TreeSet<Integer>  — BOXED-Integer through the in-order red-black walk;
+        // inserted DESCENDING, must decode ASCENDING [0..INT_N-1] exactly.
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::ints_of("treeIntegers") };
+            const int_stats st{ fingerprint_ints(v) };
+            ctx.check("tree_ints_count_is_n", st.count == INT_N);
+            ctx.check("tree_ints_count_matches_java",
+                      st.count == coll_set_fixture::j_size("treeIntegersSize"));
+            ctx.check("tree_ints_no_null", st.null_count == 0);
+            ctx.check("tree_ints_all_distinct", st.distinct_oops);
+
+            const std::vector<std::int32_t> order{ int_values_in_order(v) };
+            ctx.check("tree_ints_is_sorted",
+                      std::is_sorted(order.begin(), order.end()));
+            bool exact{ order.size() == static_cast<std::size_t>(INT_N) };
+            for (std::size_t k{ 0 }; exact && k < order.size(); ++k)
+            {
+                if (order[k] != static_cast<std::int32_t>(k)) { exact = false; }
+            }
+            ctx.check("tree_ints_exact_ascending_sequence", exact);
+            ctx.check("tree_ints_first_is_0", !order.empty() && order.front() == 0);
+            ctx.check("tree_ints_last_is_max",
+                      !order.empty() && order.back() == INT_N - 1);
+        }
+
+        // =====================================================================
         // JDK Collections Set wrappers — characterized via Java-published size()
         // ONLY (no body-context decode, which would issue a forbidden Java size()
         // call through to_vector's List-only fallback).  See characterize_wrapped_set.
@@ -901,6 +1179,67 @@ namespace
                                      "c", TWO);
             characterize_wrapped_set(ctx, "syncset", "synchronizedSetSize",
                                      "c", TWO);
+        }
+
+        // =====================================================================
+        // EnumSet — characterized.  RegularEnumSet's only element storage is a
+        // PRIMITIVE `long elements` bitmask (plus elementType/universe); it has no
+        // map/m/elementData/first, so collection::to_vector reaches the generic
+        // get(int) fallback (a Set has no get(int)) — not decodable without a Java
+        // call.  We do NOT decode it from the body; we pin Java's size() and record
+        // the layout reason.  Two shapes: a populated EnumSet.of(3) and an empty
+        // EnumSet.noneOf(0).  (Notably its `elements` field is a long, NOT an oop
+        // array, so even a name-only match could never be walked as elementData.)
+        // =====================================================================
+        {
+            const std::int32_t some_size{ coll_set_fixture::j_size("enumSetSomeSize") };
+            const std::int32_t empty_size{ coll_set_fixture::j_size("enumSetEmptySize") };
+            ctx.check("enumset_some_java_size_is_3", some_size == SMALL_N);
+            ctx.check("enumset_empty_java_size_is_0", empty_size == 0);
+            ctx.record("[INFO] EnumSet (RegularEnumSet): element storage is a "
+                       "primitive 'long elements' bitmask + 'universe' Enum[]; no "
+                       "map/m/elementData/first fast-path field, so collection::"
+                       "to_vector would reach the List-only get(int) fallback (not "
+                       "satisfiable by a Set).  Characterized via size(): some=="
+                       + std::to_string(some_size) + ", empty=="
+                       + std::to_string(empty_size) + ".  Not decoded from the body.");
+        }
+
+        // =====================================================================
+        // Set.of(...) (JDK 9+ immutable) — characterized, GATED on availability.
+        // The fixture builds setOf0..3 reflectively (so it still compiles at
+        // -source 8); on Java 8 setOfAvailable is false and we skip with an [INFO].
+        // The concrete classes (ImmutableCollections$Set12 fields e0/e1;
+        // $SetN fields elements[]/size — note 'elements', NOT 'elementData', so the
+        // ArrayList fast path does NOT misfire) have no fast-path field shape, AND
+        // their iteration order is per-run randomized by an internal SALT, so they
+        // are neither decodable through the List-only fallback nor order-stable.
+        // Characterized via the Java-published size() of each arity.
+        // =====================================================================
+        {
+            const bool available{ coll_set_fixture::j_bool("setOfAvailable") };
+            if (!available)
+            {
+                ctx.record("[INFO] Set.of(...) unavailable on this JDK (Java 8); "
+                           "skipping the immutable-Set.of characterization.");
+            }
+            else
+            {
+                ctx.check("setof0_java_size_is_0",
+                          coll_set_fixture::j_size("setOf0Size") == 0);
+                ctx.check("setof1_java_size_is_1",
+                          coll_set_fixture::j_size("setOf1Size") == 1);
+                ctx.check("setof2_java_size_is_2",
+                          coll_set_fixture::j_size("setOf2Size") == 2);
+                ctx.check("setof3_java_size_is_3",
+                          coll_set_fixture::j_size("setOf3Size") == SMALL_N);
+                ctx.record("[INFO] Set.of(...) (JDK 9+): ImmutableCollections$Set12 "
+                           "(e0/e1) and $SetN (elements[]/size) — no fast-path field "
+                           "(SetN's 'elements' is NOT 'elementData'), and per-run "
+                           "SALT-randomized order; not decoded from the body, "
+                           "characterized via size() (0/1/2/3).  Same List-only-"
+                           "fallback limitation as singleton/unmodifiable/sync.");
+            }
         }
 
         // =====================================================================

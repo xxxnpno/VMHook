@@ -357,6 +357,33 @@ namespace
             record_value("charAtOf:wxyz2",
                          proxy->call(std::string{ "wxyz" }, static_cast<std::int32_t>(2)));
         }
+        // ---- ARG-ENCODER WITNESS via Java's own String.length() -------------
+        // lengthOf(arg) returns "len=" + the arg's *Java* char (UTF-16 unit) count,
+        // measured ON THE JAVA SIDE — a decoder-independent proof of what the String
+        // ARG encoder actually built (it does NOT pass back through the return
+        // decoder's modified-UTF-8 quirk; the result "len=N" is pure ASCII and
+        // byte-identical on call_stub and call_jni).  These pin the fix: the astral
+        // arg must arrive as ONE supplementary scalar = 2 UTF-16 units (len=2, was 1
+        // when NewStringUTF mangled it to U+00F0), and the interior-NUL arg must
+        // arrive with its U+0000 intact = 3 units (len=3, was 1 when NewStringUTF
+        // truncated the C string at the NUL).
+        if (auto proxy{ self->get_method("lengthOf") })
+        {
+            record_value("lengthOf:emoji", proxy->call(std::string{ "\xF0\x9F\x98\x80" }));
+        }
+        if (auto proxy{ self->get_method("lengthOf") })
+        {
+            record_value("lengthOf:nul", proxy->call(std::string("a\0b", 3)));
+        }
+        // Direct ECHO identity of the astral arg on the INSTANCE path: with the fix
+        // the Java String IS U+1F600, so the round-trip value is the decoder's exact
+        // re-encoding of that scalar (standard 4-byte on call_stub, CESU-8 6-byte on
+        // call_jni) — asserted hard below, no longer an [INFO] characterization.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:twoAstralArg",
+                         proxy->call(std::string{ "\xF0\x9F\x98\x80\xF0\x9F\x9A\x80" }));
+        }
 
         // ---- STATIC argument round-trips — the regression site -------------
         // staticEcho / staticConcat are STATIC; drive them through static_method
@@ -607,11 +634,12 @@ namespace
             ctx.check("echo_long_len_300", echo_long.byte_len == 300);
             ctx.check("echo_long_all_Z",   echo_long.value == std::string(300, 'Z'));
 
-            // Latin-1 round-trip.  On the call_jni path (CI) NewStringUTF decodes
-            // the modified-UTF-8 arg to caf+U+00E9 and GetStringUTFChars encodes
-            // it back, so the bytes round-trip exactly.  Recorded as [INFO] on the
-            // call_stub path (make_java_string's arg encode is not exercised in
-            // CI; we do not hard-assert an unverified path).
+            // Latin-1 round-trip.  The arg encoder (jni_new_string_utf16_local ->
+            // utf8_to_utf16) decodes the 2-byte C3 A9 to U+00E9, so the Java String is
+            // caf+U+00E9; on the call_jni return GetStringUTFChars re-encodes U+00E9 as
+            // C3 A9 (modified UTF-8 of a U+0080..U+07FF scalar == standard UTF-8), so
+            // the bytes round-trip exactly.  Hard-asserted on the live CI (call_jni)
+            // path; recorded as [INFO] on the unreachable call_stub path.
             const observation echo_unicode{ get("echo:unicode") };
             ctx.record(std::string{ "[INFO] echo:unicode = [" } + to_hex(echo_unicode.value) + "]");
             if (!stub_path)
@@ -719,10 +747,14 @@ namespace
             }
 
             // ============ ECHO round-trips of every shape (String arg) =======
-            // The argument travels make_java_string (utf8_to_utf16 -> hand-built
-            // array for <=4096 units, else GC-aware JNIEnv::NewString), and the
-            // return travels the live decoder.  These prove the ARGUMENT encode for
-            // CJK, an astral scalar, an interior NUL, max-BMP, and a >65536 arg.
+            // The String ARGUMENT is encoded by detail::convert_jni_arg via
+            // jni_new_string_utf16_local: utf8_to_utf16 (the same lossless decoder
+            // make_java_string uses) -> JNIEnv::NewString (length-counted UTF-16).
+            // That path preserves interior NULs (counted length, no C-string cut) and
+            // astral scalars (proper surrogate pairs) — fixing the prior NewStringUTF
+            // truncation/mangle.  The return then travels the live decoder.  These
+            // prove the ARGUMENT encode for CJK, an astral scalar, an interior NUL,
+            // max-BMP, and a >65536 arg.
 
             // CJK arg -> identical 9 bytes back (BMP, path-independent).
             const observation echo_cjk{ get("echo:cjk") };
@@ -734,57 +766,78 @@ namespace
             const observation echo_max_bmp{ get("echo:maxBmp") };
             ctx.check("echo_maxBmp_round_trip", echo_max_bmp.value == "\xEF\xBF\xBF");
 
-            // Astral emoji arg.  KEY ASYMMETRY between the two String-arg encoders:
-            //   * call_jni (CI path) packs a std::string arg via NewStringUTF, which
-            //     interprets the bytes as MODIFIED UTF-8 read as a C string.  A
-            //     STANDARD 4-byte sequence (F0 9F 98 80) is NOT valid modified UTF-8
-            //     (which has no 4-byte form), so HotSpot's lenient NewStringUTF does
-            //     NOT reconstruct U+1F600 — it decodes the lead byte to a single
-            //     char (observed: U+00F0 -> the 2 bytes C3 B0 on the return).  This
-            //     is characterised, not hard-asserted, because it is NewStringUTF's
-            //     malformed-input behaviour, not vmhook's decode (which this module
-            //     owns and which is byte-exact for every WELL-FORMED case above).
-            //   * call_stub packs via make_java_string -> utf8_to_utf16, which DOES
-            //     decode the 4-byte sequence to a surrogate pair, so the return is
-            //     the 4-byte standard form again.
-            // To pass a SUPPLEMENTARY scalar through the call_jni String-arg path
-            // intact, the caller must hand modified UTF-8 (a CESU surrogate pair);
-            // that is out of scope here (the return-decode is the subject).
+            // Astral emoji arg — FIXED standard-UTF-8 round-trip (was a characterized
+            // NewStringUTF mangle).  The String-arg encoder now routes std::string
+            // through utf8_to_utf16 + NewString (length-counted UTF-16), so a STANDARD
+            // 4-byte sequence (F0 9F 98 80) is decoded to the surrogate pair D83D DE00
+            // and the Java String IS the true U+1F600 on BOTH dispatchers.  The arg is
+            // therefore intact (proven decoder-independently by lengthOf:emoji == 2
+            // below); what differs between the two paths is only the RETURN decoder:
+            //   * call_stub return = read_java_string => STANDARD UTF-8, the original
+            //     4 bytes F0 9F 98 80.
+            //   * call_jni  return = GetStringUTFChars => MODIFIED UTF-8 (CESU-8), the
+            //     surrogate pair re-encoded as two 3-byte units ED A0 BD ED B8 80.
+            // Both are now HARD round-trip assertions (identical to the corresponding
+            // `emoji` RETURN case), not [INFO] characterizations.
             const observation echo_emoji{ get("echo:emoji") };
-            ctx.record(std::string{ "[INFO] echo:emoji (std-4byte arg via String-arg encoder) = [" }
-                       + to_hex(echo_emoji.value)
-                       + "]  (call_jni NewStringUTF mangles a non-modified-UTF-8 astral arg; "
-                         "call_stub utf8_to_utf16 round-trips it)");
+            ctx.record(std::string{ "[INFO] echo:emoji (std-4byte astral arg, FIXED round-trip) = [" }
+                       + to_hex(echo_emoji.value) + "]");
             if (stub_path)
             {
                 ctx.check("echo_emoji_call_stub_4byte",
                           echo_emoji.value == "\xF0\x9F\x98\x80");
+                ctx.check("echo_emoji_call_stub_len4", echo_emoji.byte_len == 4);
             }
             else
             {
-                // Deterministic NewStringUTF malformed-lead decode -> U+00F0 (C3 B0).
-                ctx.check("echo_emoji_call_jni_newstringutf_mangles",
-                          echo_emoji.value == "\xC3\xB0");
+                // FIXED: the astral arg survives as U+1F600; the call_jni return
+                // decoder (modified UTF-8) hands it back as the 6-byte CESU pair.
+                ctx.check("echo_emoji_call_jni_cesu8",
+                          echo_emoji.value == "\xED\xA0\xBD\xED\xB8\x80");
+                ctx.check("echo_emoji_call_jni_len6", echo_emoji.byte_len == 6);
             }
 
-            // Interior-NUL arg "a\0b" (RAW NUL in the std::string).  ANOTHER
-            // String-arg-encoder asymmetry:
-            //   * call_jni packs via NewStringUTF(arg.c_str()) — a C string — so it
-            //     TRUNCATES at the first interior NUL: the Java String is just "a",
-            //     and the return is "a".  This is a real (if documented) limitation
-            //     of passing NUL-bearing bytes through the JNI String-arg path; the
-            //     RETURN decoder handles interior NULs perfectly (see the
-            //     interiorNul / nulOnly / leadingNul / trailingNul cases — those are
-            //     method RETURNS, decoded by call()/read_java_string, not args).
-            //   * call_stub packs via make_java_string -> utf8_to_utf16, which is
-            //     length-counted (raw 0x00 -> U+0000, no C-string cut), so the Java
-            //     String is 'a' U+0000 'b' and the return re-encodes U+0000 to C0 80
-            //     -> "a\xC0\x80b".
+            // Decoder-INDEPENDENT proof the astral ARG arrived intact: Java's own
+            // String.length() of the emoji arg is 2 UTF-16 units (one supplementary
+            // scalar).  This was 1 with the old NewStringUTF mangle (U+00F0).  The
+            // "len=2" payload is pure ASCII -> identical on both dispatchers.
+            const observation len_emoji{ get("lengthOf:emoji") };
+            ctx.check("lengthOf_emoji_arg_intact_2_units", len_emoji.value == "len=2");
+
+            // Two astral scalars as a single arg: Java length 4 (two surrogate pairs);
+            // round-trips to the 8-byte standard form (call_stub) or the 12-byte CESU
+            // form (call_jni) — same bytes as the `twoAstral` RETURN case.
+            const observation echo_two_astral{ get("echo:twoAstralArg") };
+            if (stub_path)
+            {
+                ctx.check("echo_twoAstralArg_call_stub",
+                          echo_two_astral.value == "\xF0\x9F\x98\x80\xF0\x9F\x9A\x80");
+                ctx.check("echo_twoAstralArg_call_stub_len8", echo_two_astral.byte_len == 8);
+            }
+            else
+            {
+                // U+1F600 (D83D DE00) -> ED A0 BD ED B8 80; U+1F680 (D83D DE80) ->
+                // ED A0 BD ED BA 80.  Same 12 bytes as the `twoAstral` RETURN case.
+                ctx.check("echo_twoAstralArg_call_jni_cesu8",
+                          echo_two_astral.value
+                              == "\xED\xA0\xBD\xED\xB8\x80\xED\xA0\xBD\xED\xBA\x80");
+                ctx.check("echo_twoAstralArg_call_jni_len12", echo_two_astral.byte_len == 12);
+            }
+
+            // Interior-NUL arg "a\0b" (RAW NUL in the std::string) — FIXED: the
+            // interior NUL is now PRESERVED (was truncated by NewStringUTF's C-string
+            // read).  The String-arg encoder routes std::string through utf8_to_utf16
+            // + NewString, which is length-counted: the raw 0x00 becomes U+0000 (not a
+            // terminator), so the Java String is 'a' U+0000 'b' (3 chars) on BOTH
+            // dispatchers (proven decoder-independently by lengthOf:nul == 3 below).
+            // Only the RETURN decoder differs:
+            //   * call_stub return = read_java_string => STANDARD UTF-8, raw 61 00 62.
+            //   * call_jni  return = GetStringUTFChars => MODIFIED UTF-8, U+0000 as
+            //     C0 80 -> 61 C0 80 62 (4 bytes).  Same bytes as the interiorNul
+            //     RETURN case; both are now HARD round-trip assertions.
             const observation echo_nul{ get("echo:nul") };
-            ctx.record(std::string{ "[INFO] echo:nul (\"a\\0b\" arg via String-arg encoder) = [" }
-                       + to_hex(echo_nul.value)
-                       + "]  (call_jni NewStringUTF truncates the arg at the interior NUL -> \"a\"; "
-                         "call_stub utf8_to_utf16 keeps it)");
+            ctx.record(std::string{ "[INFO] echo:nul (\"a\\0b\" arg, FIXED round-trip) = [" }
+                       + to_hex(echo_nul.value) + "]");
             if (stub_path)
             {
                 ctx.check("echo_nul_call_stub_bytes", echo_nul.value == std::string("a\0b", 3));
@@ -792,16 +845,24 @@ namespace
             }
             else
             {
-                // C-string truncation at the interior NUL: arg "a\0b" -> Java "a".
-                ctx.check("echo_nul_call_jni_truncates_at_nul", echo_nul.value == "a");
-                ctx.check("echo_nul_call_jni_len1",             echo_nul.byte_len == 1);
+                // FIXED: interior NUL preserved; call_jni return encodes U+0000 -> C0 80.
+                ctx.check("echo_nul_call_jni_bytes",
+                          echo_nul.value == std::string("\x61\xC0\x80\x62", 4));
+                ctx.check("echo_nul_call_jni_len4", echo_nul.byte_len == 4);
             }
 
-            // >65536-code-unit arg: make_java_string routes any input above the
-            // 4096-unit TLAB ceiling to the GC-aware JNIEnv::NewString fallback,
-            // which builds the FULL String (no truncation — the e547746 fix).  The
-            // call_jni return then yields all 70000 bytes; the call_stub return
-            // caps the READ at 4096 -> "".  This is the over-cap ARGUMENT proof.
+            // Decoder-INDEPENDENT proof the interior NUL ARG survived: Java's own
+            // String.length() of "a\0b" is 3 (NUL kept as U+0000).  This was 1 with
+            // the old NewStringUTF C-string truncation.  "len=3" is pure ASCII ->
+            // identical on both dispatchers.
+            const observation len_nul{ get("lengthOf:nul") };
+            ctx.check("lengthOf_nul_arg_interior_nul_kept", len_nul.value == "len=3");
+
+            // >65536-code-unit arg: convert_jni_arg -> jni_new_string_utf16_local
+            // calls JNIEnv::NewString with the full length-counted UTF-16 (70000 BMP
+            // units), so the JVM builds the FULL String at any length (no cap on the
+            // ARG side).  The call_jni return then yields all 70000 bytes; the
+            // call_stub return caps the READ at 4096 -> "".  Over-cap ARGUMENT proof.
             const observation echo_big{ get("echo:big70000") };
             if (stub_path)
             {
@@ -1100,6 +1161,12 @@ namespace
             ctx.check("no_truncation_maxBmp_nonempty",        !max_bmp.value.empty());
             ctx.check("no_truncation_loneSurrogate_nonempty", !lone_hi.value.empty());
             ctx.check("no_truncation_unicodeWs_nonempty",     !uws.value.empty());
+            // ARG-ENCODER guard (the fix): the astral and interior-NUL ARGS must come
+            // back with MORE than one byte on every path — the old NewStringUTF encoder
+            // collapsed the emoji to a single U+00F0 (2 bytes C3 B0) and truncated
+            // "a\0b" to a one-byte "a".  A length-counted UTF-16 arg never does either.
+            ctx.check("no_argtrunc_echoEmoji_multibyte", echo_emoji.byte_len >= 4);
+            ctx.check("no_argtrunc_echoNul_past_nul",    echo_nul.byte_len >= 3);
             // The >65536 return is non-empty only on call_jni (call_stub caps the
             // READ to 4096 -> ""); guard it on the path that returns it.
             if (!stub_path)

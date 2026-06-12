@@ -92,6 +92,9 @@ public final class MethodPrimitives
     public static byte sRetByteNegOne() { return (byte) -1; }
     public static byte sRetByteMax()    { return Byte.MAX_VALUE; }
     public static byte sRetByteMin()    { return Byte.MIN_VALUE; }
+    /** (byte)0x55 — a value with mixed-but-positive bits, so the decode landing
+     *  in the wrong width (e.g. reading a stale neighbouring byte) changes it. */
+    public byte retBytePattern()     { return (byte) 0x55; }            // 85
     /** (B)B echo — proves a byte ARGUMENT round-trips through the .i jvalue
      *  slot with its sign intact (-1 stays -1, not 255). */
     public byte echoByte(final byte v)        { lastByteArg = v; return v; }
@@ -109,15 +112,30 @@ public final class MethodPrimitives
     public short retShortNegOne()    { return (short) -1; }
     public short retShortMax()       { return Short.MAX_VALUE; }  // 32767
     public short retShortMin()       { return Short.MIN_VALUE; }  // -32768
+    /** (short)255 — bit 7 set, bit 15 CLEAR: stays POSITIVE 255.  Discriminates a
+     *  correct 16-bit decode from one that narrows to int8 (which would read
+     *  -1) — a value the byte-range boundaries above cannot expose. */
+    public short retShort255()       { return (short) 0x00FF; }   // 255 (positive)
+    /** (short)0xFF00 == -256: bit 15 set, low byte zero.  A decode that took only
+     *  the low 8 bits would read 0; correct sign-extension reads -256. */
+    public short retShortHighByte()  { return (short) 0xFF00; }   // -256
     public static short sRetShortNegOne() { return (short) -1; }
     public static short sRetShortMax()    { return Short.MAX_VALUE; }
     public static short sRetShortMin()    { return Short.MIN_VALUE; }
+    public static short sRetShort255()    { return (short) 0x00FF; }
     /** (S)S echo — proves a short ARGUMENT round-trips with sign intact. */
     public short echoShort(final short v)        { lastShortArg = v; return v; }
     public static short sEchoShort(final short v){ lastShortArg = v; return v; }
     /** (S)I — callee widens the short arg; proves it arrived SIGN-extended. */
     public int shortToInt(final short v)        { return (int) v; }
     public static int sShortToInt(final short v){ return (int) v; }
+    /** (S)I used with arg 255 (0x00FF: bit 7 set, bit 15 clear) so the short arg
+     *  is proven to arrive as POSITIVE 255 across the .i slot, discriminating a
+     *  true 16-bit short pack from an int8 narrowing that would deliver -1.
+     *  Deliberately does NOT write lastShortArg so it cannot disturb the
+     *  "last short arg" witness the echoShort methods establish. */
+    public int shortPosToInt(final short v)        { return (int) v; }
+    public static int sShortPosToInt(final short v){ return (int) v; }
 
     // ----------------------------------------------------------------------
     //  char (C)   — UNSIGNED 16-bit, range 0..65535
@@ -125,8 +143,17 @@ public final class MethodPrimitives
     public char retCharZero()        { return (char) 0; }
     public char retCharA()           { return 'A'; }             // 65
     public char retCharMax()         { return (char) 0xFFFF; }   // 65535
+    /** (char)0x00FF == 255: bit 7 set, bit 15 clear — discriminates the 16-bit
+     *  ZERO-extend decode from an int8 narrowing (which would read -1). */
+    public char retChar255()         { return (char) 0x00FF; }   // 255
+    /** (char)0x8000 == 32768: ONLY bit 15 set.  The cleanest witness that a char
+     *  return is ZERO-extended, not sign-extended — retCharMax (0xFFFF, all bits
+     *  set) cannot distinguish "zero-extend" from several other failure modes,
+     *  but 0x8000 read as a signed 16-bit value would be -32768. */
+    public char retCharHighBit()     { return (char) 0x8000; }   // 32768
     public static char sRetCharA()      { return 'A'; }
     public static char sRetCharMax()    { return (char) 0xFFFF; }
+    public static char sRetCharHighBit(){ return (char) 0x8000; }
     /** (C)C echo — proves a char ARGUMENT round-trips across the full unsigned
      *  16-bit range (0xFFFF stays 0xFFFF). */
     public char echoChar(final char v)        { lastCharArg = v; return v; }
@@ -135,6 +162,13 @@ public final class MethodPrimitives
      *  (arg 0xFFFF -> int 65535, never -1). */
     public int charToInt(final char v)        { return (int) v; }
     public static int sCharToInt(final char v){ return (int) v; }
+    /** (C)I used with arg 0x8000 so a CLEAN bit-15 char arg (only the high bit
+     *  set) is proven to arrive zero-extended (32768), not sign-extended (-32768).
+     *  echoChar/charToInt with 0xFFFF cannot isolate bit 15 because every bit is
+     *  set.  Deliberately does NOT write lastCharArg so it cannot disturb the
+     *  "last char arg" witness the echoChar methods establish. */
+    public int charHighBitToInt(final char v)        { return (int) v; }
+    public static int sCharHighBitToInt(final char v){ return (int) v; }
 
     // ----------------------------------------------------------------------
     //  int (I)    — signed 32-bit
@@ -147,9 +181,21 @@ public final class MethodPrimitives
     public static int sRetIntMax()      { return Integer.MAX_VALUE; }
     public static int sRetIntMin()      { return Integer.MIN_VALUE; }
     public static int sRetIntFortyTwo() { return 42; }
+    /** 0x12345678 — four DISTINCT non-zero bytes, so a byte-order error in the
+     *  4-byte return decode reorders them into a different value.  The other int
+     *  returns (0/-1/MAX/MIN/42) are all byte-symmetric or near-zero and cannot
+     *  expose such a swap. */
+    public int retIntPattern()       { return 0x12345678; }      // 305419896
+    public static int sRetIntPattern() { return 0x12345678; }
     /** (I)I echo — proves argument passthrough together with the return. */
     public int echoInt(final int v)  { lastEchoArg = v; return v; }
     public static int sEchoInt(final int v) { lastEchoArg = v; return v; }
+    /** (I)I echo dedicated to the distinct-byte pattern 0x12345678 — does NOT
+     *  write lastEchoArg, so it cannot disturb the "last echo arg" witness the
+     *  ordinary echoInt establishes.  A byte-order error on the int ARG path
+     *  (C++ -> .i slot -> body) would echo back a reordered value. */
+    public int echoIntPattern(final int v)        { return v; }
+    public static int sEchoIntPattern(final int v){ return v; }
     /** (II)I addition — exercises TWO int args AND int two's-complement overflow
      *  wrap (Integer.MAX_VALUE + 1 == Integer.MIN_VALUE). */
     public int addInt(final int a, final int b)        { return a + b; }
@@ -188,9 +234,19 @@ public final class MethodPrimitives
     public long retLongMax()         { return Long.MAX_VALUE; }  // 9223372036854775807
     public long retLongMin()         { return Long.MIN_VALUE; }  // -9223372036854775808
     public long retLongBig()         { return 0x0123456789ABCDEFL; }
+    /** High 32 bits set, low 32 bits zero.  A return decode that drops the high
+     *  word (a 32-bit truncation) reads 0 instead of this large negative value. */
+    public long retLongHighHalf()    { return 0xFFFFFFFF00000000L; } // -4294967296
+    /** Low 32 bits set, high 32 bits zero == 4294967295 (POSITIVE).  A decode that
+     *  sign-extends a 32-bit read of the low word would read -1; the correct
+     *  64-bit decode keeps it positive.  Complements retLongHighHalf so a high/low
+     *  word swap in the return path is caught from both directions. */
+    public long retLongLowHalf()     { return 0x00000000FFFFFFFFL; } // 4294967295
     public static long sRetLongMax()    { return Long.MAX_VALUE; }
     public static long sRetLongMin()    { return Long.MIN_VALUE; }
     public static long sRetLongBig()    { return 0x0123456789ABCDEFL; }
+    public static long sRetLongHighHalf() { return 0xFFFFFFFF00000000L; }
+    public static long sRetLongLowHalf()  { return 0x00000000FFFFFFFFL; }
 
     // ----------------------------------------------------------------------
     //  float (F)
@@ -205,10 +261,20 @@ public final class MethodPrimitives
     public float retFloatNaN()       { return Float.NaN; }
     public float retFloatPosInf()    { return Float.POSITIVE_INFINITY; }
     public float retFloatNegInf()    { return Float.NEGATIVE_INFINITY; }
+    /** A finite negative with a non-trivial mantissa, to exercise an ordinary
+     *  (non-special) negative value through the 4-byte float return decode. */
+    public float retFloatNegFiften(){ return -15.5f; }
+    /** intBitsToFloat(0x12345678): a finite float whose 4-byte IEEE-754 pattern
+     *  has FOUR distinct non-zero bytes.  Every other float return here is
+     *  byte-sparse (0.5f == 0x3F000000 has three zero bytes; MAX/-0.0/Inf are
+     *  similarly sparse), so a byte-order error in the 4-byte decode would slip
+     *  past them — this value reorders into a different float if the words swap. */
+    public float retFloatBusyBits(){ return Float.intBitsToFloat(0x12345678); }
     public static float sRetFloatHalf()   { return 0.5f; }
     public static float sRetFloatNaN()    { return Float.NaN; }
     public static float sRetFloatPosInf() { return Float.POSITIVE_INFINITY; }
     public static float sRetFloatNegZero(){ return -0.0f; }
+    public static float sRetFloatBusyBits(){ return Float.intBitsToFloat(0x12345678); }
 
     // ----------------------------------------------------------------------
     //  double (D)
@@ -223,10 +289,19 @@ public final class MethodPrimitives
     public double retDoubleNaN()     { return Double.NaN; }
     public double retDoublePosInf()  { return Double.POSITIVE_INFINITY; }
     public double retDoubleNegInf()  { return Double.NEGATIVE_INFINITY; }
+    /** An ordinary finite negative (mirrors retFloatNegFiften for the 8-byte path). */
+    public double retDoubleNegFifteen(){ return -15.0; }
+    /** longBitsToDouble(0x123456789ABCDEF0): a finite double whose 8-byte IEEE-754
+     *  pattern has its HIGH and LOW 32-bit words BOTH busy and distinct, so a
+     *  high/low word swap in the 8-byte return decode produces a different double.
+     *  Math.PI already has busy words, but this one's halves are deliberately
+     *  asymmetric (no shared nibble run) for a sharper word-swap witness. */
+    public double retDoubleBusyBits(){ return Double.longBitsToDouble(0x123456789ABCDEF0L); }
     public static double sRetDoublePi()     { return Math.PI; }
     public static double sRetDoubleNaN()    { return Double.NaN; }
     public static double sRetDoubleNegInf() { return Double.NEGATIVE_INFINITY; }
     public static double sRetDoubleNegZero(){ return -0.0; }
+    public static double sRetDoubleBusyBits(){ return Double.longBitsToDouble(0x123456789ABCDEF0L); }
 
     // ----------------------------------------------------------------------
     //  void (V)

@@ -8684,6 +8684,23 @@ namespace vmhook
             -> void*;
 
         /*
+            @brief Creates a new Java String from STANDARD UTF-8 via JNIEnv::NewString
+                   (length-counted UTF-16); returns a jstring local reference.
+            @details
+            The content-exact companion to jni_new_string_utf used by return_value::set_arg
+            and detail::convert_jni_arg.  Forward-declared here (ahead of set_arg, which
+            qualifies the call as vmhook::detail::jni_new_string_utf16_local so the name
+            must be visible at template-definition time); defined after the JNI helper
+            section below, next to jni_new_string_utf16 / utf8_to_utf16.  Preserves
+            interior NULs (counted length) and astral scalars (surrogate pairs), unlike
+            NewStringUTF's modified-UTF-8 C-string handling.
+
+            Complexity: O(N).  Exception safety: noexcept — nullptr if JNIEnv unavailable.
+        */
+        inline auto jni_new_string_utf16_local(std::string_view value) noexcept
+            -> void*;
+
+        /*
             @brief Releases a JNI local reference via JNIEnv::DeleteLocalRef.
             @details
             Callers that produce a local ref via jni_new_string_utf / jni_find_class /
@@ -9023,15 +9040,21 @@ namespace vmhook
         }
         else if constexpr (std::is_same_v<clean_value_type, std::string> || std::is_same_v<clean_value_type, std::string_view>)
         {
-            // jni_new_string_utf returns a JNI local reference.  The OOP we
-            // extract goes into the interpreter local-variable slot (a GC
+            // jni_new_string_utf16_local returns a JNI local reference.  The OOP
+            // we extract goes into the interpreter local-variable slot (a GC
             // root), so the String stays reachable after we release the
             // handle.  Skipping DeleteLocalRef would leak one local per call
             // on long-lived attached threads - HotSpot's default ref table
             // capacity is 16 and there's no implicit per-detour-frame
             // teardown, so the leak surfaces as JNI "local reference table
             // overflow" warnings after enough hot-path string injections.
-            void* const string_handle{ vmhook::detail::jni_new_string_utf(value) };
+            //
+            // Length-counted UTF-16 (NewString), NOT NewStringUTF: a std::string
+            // is standard UTF-8 — NewStringUTF would truncate at an interior NUL
+            // and mangle astral scalars (it decodes modified UTF-8).  make_java_string
+            // is the GC-aware fallback and already encodes via the same UTF-16 path,
+            // so both routes agree byte-for-byte.
+            void* const string_handle{ vmhook::detail::jni_new_string_utf16_local(value) };
             void* const string_oop{ string_handle
                 ? vmhook::detail::jni_decode_object(string_handle)
                 : vmhook::make_java_string(value) };
@@ -9050,8 +9073,11 @@ namespace vmhook
         }
         else if constexpr (std::is_same_v<clean_value_type, const char*> || std::is_same_v<clean_value_type, char*>)
         {
+            // const char* is a C string (no interior NULs), but can still hold
+            // standard-UTF-8 astral bytes, so use the length-counted UTF-16 encoder
+            // (NewString) rather than NewStringUTF to avoid modified-UTF-8 mangling.
             const std::string_view text{ value ? std::string_view{ value } : std::string_view{} };
-            void* const string_handle{ vmhook::detail::jni_new_string_utf(text) };
+            void* const string_handle{ vmhook::detail::jni_new_string_utf16_local(text) };
             void* const string_oop{ string_handle
                 ? vmhook::detail::jni_decode_object(string_handle)
                 : vmhook::make_java_string(text) };
@@ -11583,6 +11609,64 @@ namespace vmhook
         }
 
         /*
+            @brief Encodes a UTF-8 std::string as a Java String via JNIEnv::NewString
+                   (UTF-16, length-counted) and returns the jstring LOCAL REFERENCE.
+            @details
+            The content-exact, length-counted companion to jni_new_string_utf
+            (NewStringUTF, slot 167).  NewStringUTF has two failure modes for any
+            argument that is genuine *standard* UTF-8 rather than the JVM's bespoke
+            "modified UTF-8" C-string:
+              (a) INTERIOR-NUL TRUNCATION — it reads a NUL-terminated C string, so
+                  "a\\0b" silently becomes the Java String "a" (robustness bug, found
+                  by the method_call_string expansion driving the call_jni arg path).
+              (b) ASTRAL / NON-ASCII MANGLING — NewStringUTF decodes *modified* UTF-8,
+                  in which an astral scalar is a six-byte surrogate-pair encoding, NOT
+                  the four-byte standard-UTF-8 form.  Feeding it standard UTF-8 (e.g.
+                  U+1F600 == F0 9F 98 80) makes the JVM mis-read the lead byte as a
+                  Latin-1 scalar (U+00F0 ...), so the Java side receives garbage.
+            Routing through utf8_to_utf16 + NewString (slot 163, the same length-counted
+            UTF-16 entry make_java_string's over-cap fallback and jni_new_string_utf16
+            use) fixes BOTH: a counted length carries interior NULs verbatim, and the
+            shared decoder emits proper surrogate pairs for astral scalars.  Pure-ASCII
+            input is byte-identical either way (each byte maps 1:1 to a BMP code unit).
+
+            Unlike jni_new_string_utf16 (which decodes to a raw OOP and DeleteLocalRefs
+            the handle for the make_java_string allocation path), this returns the RAW
+            jstring local reference UNTOUCHED — a drop-in for jni_new_string_utf in the
+            convert_jni_arg encoder, where value.l must hold a JNI local ref that the
+            jvalue dispatch passes to Call<Type>MethodA and the per-arg cleanup later
+            DeleteLocalRefs.  Lifetime/contract are identical to jni_new_string_utf.
+
+            Complexity: O(N).  Exception safety: noexcept — nullptr if the JNIEnv /
+            NewString slot is unavailable (utf8_to_utf16's only throw path is vector
+            growth, which the noexcept callers already treat as fatal).
+
+            @param value  Standard-UTF-8 text to encode as a Java String.
+            @return  jstring local reference, or nullptr on failure.
+        */
+        inline auto jni_new_string_utf16_local(const std::string_view value) noexcept
+            -> void*
+        {
+            using new_string_t = void* (*)(void*, const std::uint16_t*, std::int32_t);
+            new_string_t const new_string{ vmhook::detail::jni_function<163, new_string_t>(vmhook::hotspot::current_jni_env) };
+            if (!new_string)
+            {
+                return nullptr;
+            }
+
+            // Lossless, length-counted UTF-16 (proper surrogate pairs for astral
+            // scalars) — the SAME decode make_java_string's over-cap NewString
+            // fallback uses, so the two encode paths agree byte-for-byte.
+            const std::vector<std::uint16_t> units{ vmhook::detail::utf8_to_utf16(value) };
+
+            // NewString(env, nullptr, 0) is the well-defined empty-String form; pass
+            // a stable pointer either way.  A counted length means an interior NUL is
+            // a normal U+0000 code unit, NOT a terminator — no C-string truncation.
+            const std::uint16_t* const data{ units.empty() ? nullptr : units.data() };
+            return new_string(vmhook::hotspot::current_jni_env, data, static_cast<std::int32_t>(units.size()));
+        }
+
+        /*
             @brief Reads a Java String's content as a std::string via JNI.
             @details
             Calls JNIEnv::GetStringUTFChars (slot 169) to obtain a UTF-8 C string,
@@ -11821,20 +11905,31 @@ namespace vmhook
 
             if constexpr (std::is_same_v<clean_t, std::string>)
             {
-                out.l = vmhook::detail::jni_new_string_utf(arg);
+                // Length-counted UTF-16 (NewString), NOT NewStringUTF: a std::string
+                // is standard UTF-8 and may carry interior NULs.  NewStringUTF would
+                // truncate at the first NUL ("a\\0b" -> "a") and mis-decode astral
+                // scalars (it expects modified UTF-8); the counted UTF-16 path
+                // preserves both.  See jni_new_string_utf16_local.
+                out.l = vmhook::detail::jni_new_string_utf16_local(arg);
                 needs_release = (out.l != nullptr);
             }
             else if constexpr (std::is_same_v<clean_t, std::string_view>)
             {
-                out.l = vmhook::detail::jni_new_string_utf(arg);
+                // Same standard-UTF-8 round-trip as std::string (interior NULs +
+                // astral scalars preserved) via the length-counted UTF-16 path.
+                out.l = vmhook::detail::jni_new_string_utf16_local(arg);
                 needs_release = (out.l != nullptr);
             }
             else if constexpr (std::is_same_v<clean_t, const char*> || std::is_same_v<clean_t, char*>)
             {
                 // nullptr <-> Java null (the library-wide convention); a non-null
-                // arg — including the empty "" — becomes a real Java String via
-                // jni_new_string_utf.  ONLY the null-pointer case yields Java null.
-                out.l = arg ? vmhook::detail::jni_new_string_utf(std::string_view{ arg })
+                // arg — including the empty "" — becomes a real Java String.  ONLY
+                // the null-pointer case yields Java null.  A const char* is inherently
+                // a C string (no interior NULs to preserve), but it can still hold
+                // standard-UTF-8 astral bytes, so route it through the same
+                // length-counted UTF-16 encoder to avoid NewStringUTF's modified-UTF-8
+                // mangling.
+                out.l = arg ? vmhook::detail::jni_new_string_utf16_local(std::string_view{ arg })
                             : nullptr;
                 needs_release = (out.l != nullptr);
             }

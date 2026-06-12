@@ -3,11 +3,15 @@ package vmhook.fixtures;
 import vmhook.Harness;
 
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Fixture for the collection_set feature (area: collections).
@@ -325,6 +329,109 @@ public final class CollSet
     /** A declared Set field deliberately left NULL (to_vector must stay empty). */
     public static Set<Elem> nullSet = null;
 
+    // ---- MORE decodable Set shapes (all reach a vmhook FAST PATH) -----------
+    //
+    // The cases below all land on one of the two memory-walk fast paths
+    // (hash_map_walk_keys via "map", or the "m"-route that inspects the backing
+    // map klass), so the native module DECODES them from the worker body (a pure
+    // heap walk, no Java call) and HARD-asserts the full element set.
+
+    /** Element count of the ConcurrentHashMap key-set / boxed-Integer sets. */
+    public static final int CHM_N = 50;
+    public static final int INT_N = 40;
+
+    /**
+     * Collections.newSetFromMap(new TreeMap&lt;&gt;()): the SAME "m" backing-field
+     * name as TreeSet AND setFromHashMap, but the backing map is a TreeMap (HAS a
+     * "root" field).  vmhook's "m"-route inspects the backing-map klass, finds
+     * "root", and routes to tree_map_walk_keys — so this decodes IN SORTED ORDER,
+     * exactly like a TreeSet, proving the klass-shape routing picks the tree walk
+     * (not the hash walk) for a TreeMap-backed SetFromMap.  Ids 400..400+SMALL_N-1.
+     */
+    public static Set<Elem> setFromTreeMap =
+        Collections.newSetFromMap(new TreeMap<Elem, Boolean>());
+
+    /**
+     * Collections.newSetFromMap(new LinkedHashMap&lt;&gt;()): backing field "m" again,
+     * backing map is a LinkedHashMap (NO "root", HAS "table" inherited from
+     * HashMap).  The "m"-route finds "table" and routes to hash_map_walk_keys —
+     * content decodes (bucket order; the LinkedHashMap insertion overlay is
+     * ignored, same documented [low] as LinkedHashSet).  Ids 500..500+SMALL_N-1.
+     */
+    public static Set<Elem> setFromLinkedMap =
+        Collections.newSetFromMap(new LinkedHashMap<Elem, Boolean>());
+
+    /**
+     * ConcurrentHashMap.newKeySet(): a KeySetView whose backing field "map" lives
+     * on its superclass CollectionView (so vmhook's superclass-walking find_field
+     * must resolve "map" off a SUPERCLASS — the same inherited-field resolve the
+     * treeified-bin TreeNode case relies on).  The backing ConcurrentHashMap has a
+     * "table" Node[] whose nodes carry "key"/"next", so the "map" fast path's
+     * hash_map_walk_keys decodes every element.  Ids 600..600+CHM_N-1.
+     */
+    public static Set<Elem> chmKeySet = ConcurrentHashMap.<Elem>newKeySet();
+
+    /** Empty ConcurrentHashMap key-set — table may be null/all-null → 0, no throw. */
+    public static Set<Elem> chmKeySetEmpty = ConcurrentHashMap.<Elem>newKeySet();
+
+    /**
+     * HashSet&lt;Integer&gt; — BOXED-Integer element decode.  Each element OOP is a
+     * java.lang.Integer; the native side reads Integer.value (a pure int field
+     * read) through the key walk.  Integer.hashCode()==value, so distinct values
+     * are distinct hashCodes — collision-into-tree-bin coverage is the String
+     * "Aa"/"BB" family (hashIntegers cannot force hash collisions with distinct
+     * Integers).  Values 0..INT_N-1.
+     */
+    public static HashSet<Integer> hashIntegers = new HashSet<Integer>();
+
+    /**
+     * TreeSet&lt;Integer&gt; — BOXED-Integer element through the in-order red-black
+     * walk; decodes in ascending numeric order.  Values 0..INT_N-1.
+     */
+    public static TreeSet<Integer> treeIntegers = new TreeSet<Integer>();
+
+    // ---- NON-decodable Set families (characterized via size() + [INFO]) -----
+    //
+    // These have NO fast-path field shape, so collection::to_vector would reach
+    // the generic List-only get(int) fallback, which a Set cannot satisfy and
+    // which issues a Java size() call (forbidden from the worker body).  The
+    // native module does NOT decode them; it pins their Java-published size() and
+    // records the layout reason — same handling as emptySet/singleton/unmod/sync.
+
+    /**
+     * EnumSet.of(...) → RegularEnumSet, whose only element storage is a primitive
+     * "long elements" bitmask (plus "elementType"/"universe").  No map/m/
+     * elementData/first → generic fallback → not decodable.  Characterized.
+     */
+    public static Set<Thread.State> enumSetSome =
+        EnumSet.of(Thread.State.NEW, Thread.State.RUNNABLE, Thread.State.TERMINATED);
+
+    /** EnumSet.noneOf(...) → empty RegularEnumSet (size 0); characterized. */
+    public static Set<Thread.State> enumSetEmpty =
+        EnumSet.noneOf(Thread.State.class);
+
+    /**
+     * Set.of(...) (JDK 9+ immutable).  Built REFLECTIVELY so this fixture still
+     * compiles at -source 8 (Set.of does not exist there).  The concrete classes
+     * are java.util.ImmutableCollections$Set12 (fields e0/e1; sizes 1-2) and $SetN
+     * (fields elements[]/size; sizes 0 and 3+) — none of the fast-path names
+     * (note: SetN's field is "elements", NOT "elementData", so the ArrayList path
+     * does not misfire), so they are NOT decodable through the List-only fallback,
+     * AND their iteration order is per-run randomized by an internal SALT.
+     * Characterized via size() only.  `setOfAvailable` is false on Java 8.
+     */
+    public static Set<Integer> setOf0;
+    public static Set<Integer> setOf1;
+    public static Set<Integer> setOf2;
+    public static Set<Integer> setOf3;
+
+    /** True when Set.of(...) was resolvable (JDK 9+); false on Java 8. */
+    public static volatile boolean setOfAvailable;
+    public static volatile int setOf0Size;
+    public static volatile int setOf1Size;
+    public static volatile int setOf2Size;
+    public static volatile int setOf3Size;
+
     // ---- Published cross-check values (order-independent) -------------------
     //
     // The native walker visits HashSet/LinkedHashSet elements in BUCKET order,
@@ -372,10 +479,25 @@ public final class CollSet
     public static volatile int treeReverseSize;
     public static volatile int treeStringsSize;
     public static volatile int setFromHashMapSize;
+    public static volatile int setFromTreeMapSize;
+    public static volatile int setFromLinkedMapSize;
+    public static volatile int chmKeySetSize;
+    public static volatile int chmKeySetEmptySize;
+    public static volatile int hashIntegersSize;
+    public static volatile int treeIntegersSize;
     public static volatile int emptySetSize;
     public static volatile int singletonSetSize;
     public static volatile int unmodifiableSetSize;
     public static volatile int synchronizedSetSize;
+    public static volatile int enumSetSomeSize;
+    public static volatile int enumSetEmptySize;
+
+    /** Order-independent aggregates for the new decodable shapes. */
+    public static volatile long setFromLinkedMapIdSum;
+    public static volatile long chmKeySetIdSum;
+    public static volatile long chmKeySetIdXor;
+    public static volatile long hashIntegersValSum;
+    public static volatile long hashIntegersValXor;
 
     /** Whether the treeified HashSet actually treeified at least one bin. */
     public static volatile boolean treeifiedHasTreeBin;
@@ -581,6 +703,69 @@ public final class CollSet
             setFromHashMap.add(new Elem(200 + i));
         }
 
+        // newSetFromMap(TreeMap): "m"-route must inspect the backing klass, find
+        // "root", and take the TREE walk → sorted decode.  Insert out of order so
+        // the in-order walk has to re-sort; ids 400..400+SMALL_N-1.
+        setFromTreeMap = Collections.newSetFromMap(new TreeMap<Elem, Boolean>());
+        for (int i = SMALL_N - 1; i >= 0; --i)
+        {
+            setFromTreeMap.add(new Elem(400 + i));
+        }
+
+        // newSetFromMap(LinkedHashMap): "m"-route finds "table" (no "root") → HASH
+        // walk → content decode (bucket order).  Ids 500..500+SMALL_N-1.
+        setFromLinkedMap = Collections.newSetFromMap(new LinkedHashMap<Elem, Boolean>());
+        long sflId = 0;
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            setFromLinkedMap.add(new Elem(500 + i));
+            sflId += (500 + i);
+        }
+        setFromLinkedMapIdSum = sflId;
+
+        // ConcurrentHashMap.newKeySet(): "map" lives on the KeySetView SUPERCLASS
+        // (CollectionView), so find_field must walk supers; the backing CHM has a
+        // "table" of Nodes (key/next) → hash walk decodes all.  Ids 600..600+CHM_N-1.
+        chmKeySet = ConcurrentHashMap.<Elem>newKeySet();
+        long chId = 0, chXor = 0;
+        for (int i = 0; i < CHM_N; ++i)
+        {
+            chmKeySet.add(new Elem(600 + i));
+            chId += (600 + i);
+            chXor ^= (600 + i);
+        }
+        chmKeySetIdSum = chId;
+        chmKeySetIdXor = chXor;
+
+        chmKeySetEmpty = ConcurrentHashMap.<Elem>newKeySet();
+
+        // HashSet<Integer> / TreeSet<Integer>: boxed-Integer element decode.
+        hashIntegers = new HashSet<Integer>();
+        long hiSum = 0, hiXor = 0;
+        for (int i = 0; i < INT_N; ++i)
+        {
+            hashIntegers.add(Integer.valueOf(i));
+            hiSum += i;
+            hiXor ^= i;
+        }
+        hashIntegersValSum = hiSum;
+        hashIntegersValXor = hiXor;
+
+        treeIntegers = new TreeSet<Integer>();
+        for (int i = INT_N - 1; i >= 0; --i)   // insert descending; walk re-sorts
+        {
+            treeIntegers.add(Integer.valueOf(i));
+        }
+
+        // EnumSet (characterized only): RegularEnumSet stores a primitive long
+        // bitmask, no fast-path field shape.
+        enumSetSome = EnumSet.of(Thread.State.NEW, Thread.State.RUNNABLE, Thread.State.TERMINATED);
+        enumSetEmpty = EnumSet.noneOf(Thread.State.class);
+
+        // Set.of(...) (JDK 9+), built reflectively so this fixture compiles at
+        // -source 8.  Characterized only (no fast-path field; randomized order).
+        buildSetOf();
+
         // JDK Collections Set wrappers (re-created so they wrap the freshly built
         // hashTwo).  emptySet decodes correctly (size 0); singleton/unmodifiable/
         // synchronized have no fast-path field shape and decode EMPTY through the
@@ -613,10 +798,64 @@ public final class CollSet
         treeReverseSize = treeReverse.size();
         treeStringsSize = treeStrings.size();
         setFromHashMapSize = setFromHashMap.size();
+        setFromTreeMapSize = setFromTreeMap.size();
+        setFromLinkedMapSize = setFromLinkedMap.size();
+        chmKeySetSize = chmKeySet.size();
+        chmKeySetEmptySize = chmKeySetEmpty.size();
+        hashIntegersSize = hashIntegers.size();
+        treeIntegersSize = treeIntegers.size();
         emptySetSize = emptySet.size();
         singletonSetSize = singletonSet.size();
         unmodifiableSetSize = unmodifiableSet.size();
         synchronizedSetSize = synchronizedSet.size();
+        enumSetSomeSize = enumSetSome.size();
+        enumSetEmptySize = enumSetEmpty.size();
+    }
+
+    /**
+     * Builds setOf0..setOf3 via reflection on Set.of(...) so this fixture still
+     * compiles at -source 8 (where Set.of does not exist).  On Java 8 the methods
+     * are absent → setOfAvailable stays false and the fields stay null (the native
+     * module skips its Set.of characterization in that case).  On Java 9+ the
+     * immutable sets are built and their size() published.  These sets are NEVER
+     * decoded natively (no fast-path field shape; per-run randomized order), only
+     * characterized via size().
+     */
+    @SuppressWarnings("unchecked")
+    private static void buildSetOf()
+    {
+        try
+        {
+            final java.lang.reflect.Method of0 = Set.class.getMethod("of");
+            final java.lang.reflect.Method of1 = Set.class.getMethod("of", Object.class);
+            final java.lang.reflect.Method of2 = Set.class.getMethod("of", Object.class, Object.class);
+            final java.lang.reflect.Method ofN = Set.class.getMethod("of", Object[].class);
+
+            setOf0 = (Set<Integer>) of0.invoke(null);
+            setOf1 = (Set<Integer>) of1.invoke(null, Integer.valueOf(10));
+            setOf2 = (Set<Integer>) of2.invoke(null, Integer.valueOf(10), Integer.valueOf(20));
+            setOf3 = (Set<Integer>) ofN.invoke(null,
+                (Object) new Integer[] { Integer.valueOf(10), Integer.valueOf(20), Integer.valueOf(30) });
+
+            setOf0Size = setOf0.size();
+            setOf1Size = setOf1.size();
+            setOf2Size = setOf2.size();
+            setOf3Size = setOf3.size();
+            setOfAvailable = true;
+        }
+        catch (final NoSuchMethodException e)
+        {
+            // Java 8: Set.of does not exist.  Leave fields null, flag unavailable.
+            setOf0 = null;
+            setOf1 = null;
+            setOf2 = null;
+            setOf3 = null;
+            setOfAvailable = false;
+        }
+        catch (final Throwable t)
+        {
+            setOfAvailable = false;
+        }
     }
 
     /**
