@@ -67,10 +67,13 @@ import vmhook.Harness;
  *       yields the SAME decoded OOP (the field decode is type-agnostic);</li>
  *   <li>the interface DEFAULT method {@code defaultGreet()} INHERITED (Dog/Cat)
  *       vs OVERRIDDEN (Snake): the override lands on Snake's own klass and IS
- *       reachable through the Snake wrapper's superclass walk, while the inherited
- *       form lives only on the interface and characterises vmhook's
- *       superclass-only walk (it walks the superclass chain, not the interface
- *       chain), so the module records [INFO] rather than failing.</li>
+ *       reachable through the Snake wrapper's superclass walk; the INHERITED form
+ *       lives only on the {@code Animal} interface, and vmhook's
+ *       {@code object::get_method} now reaches it through the concrete wrapper by
+ *       falling back to the IMPLEMENTED-INTERFACE chain after the superclass walk
+ *       (HotSpot's own {@code InstanceKlass::_transitive_interfaces}), so the
+ *       module HARD-asserts the inherited default both resolves and calls to the
+ *       same body the JVM dispatches.</li>
  * </ul>
  *
  * <p>The Java-side probe runs the SAME polymorphism observations across every
@@ -115,10 +118,11 @@ public final class InterfacePoly
          * Interface DEFAULT method (Java 8+). INHERITED unchanged by Dog and Cat,
          * OVERRIDDEN by Snake. The inherited form is reachable only by walking the
          * interface chain; vmhook's object::get_method walks the SUPERCLASS chain
-         * but not the interface chain, so the native module treats reaching the
-         * INHERITED form through a concrete wrapper as a best-effort [INFO], never
-         * a failure. The OVERRIDDEN form lives on Snake's own klass, so it IS
-         * reachable through the Snake wrapper's superclass walk.
+         * first and then falls back to the IMPLEMENTED-INTERFACE chain
+         * (InstanceKlass::_transitive_interfaces), so the inherited default IS now
+         * reachable through a concrete wrapper (Dog/Cat) and the native module
+         * HARD-asserts it. The OVERRIDDEN form lives on Snake's own klass, so it is
+         * reached by the superclass walk before the interface fallback even runs.
          */
         default String defaultGreet()
         {
@@ -357,6 +361,14 @@ public final class InterfacePoly
     /** Snake's OVERRIDDEN defaultGreet() result, published for cross-check. */
     public static volatile String snakeGreetSeen = "";
 
+    /**
+     * Dog's INHERITED defaultGreet() result (the interface DEFAULT method Dog does
+     * NOT override), published so native can cross-check that walking the interface
+     * chain through the concrete Dog wrapper reaches the SAME default body the JVM
+     * dispatches.  Embeds Dog's speak() ("...woof") via the default's body.
+     */
+    public static volatile String dogGreetSeen = "";
+
     /** Robot's speak() result (multi-iface, Animal side), published for cross-check. */
     public static volatile String robotSpeakSeen = "";
 
@@ -415,6 +427,7 @@ public final class InterfacePoly
                 InterfacePoly.catSpeakSeen   = s.pet2.speak();
                 InterfacePoly.snakeSpeakSeen = s.pet3.speak();
                 InterfacePoly.snakeGreetSeen = s.pet3.defaultGreet();   // OVERRIDDEN default
+                InterfacePoly.dogGreetSeen   = ((Dog) s.pet).defaultGreet(); // INHERITED default (Dog)
 
                 // Multi-interface impl: dispatch through BOTH declared interfaces.
                 InterfacePoly.robotSpeakSeen = s.robotPet.speak();      // Animal side
