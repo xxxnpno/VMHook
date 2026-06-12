@@ -38,7 +38,9 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -71,6 +73,16 @@ namespace
         auto private_int() const -> std::int32_t   { return static_cast<std::int32_t>(get_field("privateInt")->get()); }
         auto base_long() const -> std::int64_t     { return static_cast<std::int64_t>(get_field("baseLong")->get()); }
         auto shadowed_int() const -> std::int32_t  { return static_cast<std::int32_t>(get_field("shadowedInt")->get()); }
+
+        // Inherited (depth-2) fields of every remaining primitive type + an array,
+        // read THROUGH the child klass (the super walk supplies the offset).
+        auto base_bool() const -> bool             { return get_field("baseBool")->get(); }
+        auto base_byte() const -> std::int8_t      { return static_cast<std::int8_t>(get_field("baseByte")->get()); }
+        auto base_char() const -> std::uint16_t    { return static_cast<std::uint16_t>(get_field("baseChar")->get()); }
+        auto base_short() const -> std::int16_t    { return static_cast<std::int16_t>(get_field("baseShort")->get()); }
+        auto base_float() const -> float           { return get_field("baseFloat")->get(); }
+        auto base_double() const -> double         { return get_field("baseDouble")->get(); }
+        auto base_int_array() const -> std::vector<std::int32_t> { return get_field("baseIntArray")->get(); }
     };
 
     // ---- Wrapper registered to the MID class.  Super walk starts at Mid. ---
@@ -112,6 +124,21 @@ namespace
         auto shadowed_int() const -> std::int32_t  { return static_cast<std::int32_t>(get_field("shadowedInt")->get()); }
     };
 
+    // ---- Wrapper registered to the INTERFACE klass.  Used ONLY for the static
+    //      accessor on the interface constant — an interface is never
+    //      instantiated, so this wrapper holds no live instance; static_field /
+    //      the static get_field(type_index,...) overload need no OOP.  Registering
+    //      it lets us resolve the interface's OWN klass (its declaring class) and
+    //      read IFACE_CONST off the interface mirror through the public API. -----
+    class fi_iface : public vmhook::object<fi_iface>
+    {
+    public:
+        explicit fi_iface(vmhook::oop_t instance) noexcept
+            : vmhook::object<fi_iface>{ instance }
+        {
+        }
+    };
+
     // ---- Constants mirrored from FieldInherited*.java ----------------------
     constexpr std::int32_t OWN_INT_INIT        { 0x0C1D0001 };
     constexpr std::int32_t OWN_INT_RUNTIME     { 0x0C1DBEEF };
@@ -143,6 +170,32 @@ namespace
     constexpr std::int32_t STAT_MID_INIT     { 400 };
     constexpr std::int32_t STAT_MID_RUNTIME  { 0x7373 };
 
+    // Base.java — one inherited slot of EVERY remaining JVM primitive type, plus
+    // an inherited array.  Mirrored verbatim from FieldInheritedBase.java so the
+    // depth-2 super walk is proven for Z B C S F D and the array-OOP decode.
+    constexpr bool          BASE_BOOL_INIT   { true };
+    constexpr std::int8_t   BASE_BYTE_INIT   { static_cast<std::int8_t>(0x5A) };   // 90
+    constexpr std::uint16_t BASE_CHAR_INIT   { static_cast<std::uint16_t>('Q') };  // 0x0051
+    constexpr std::int16_t  BASE_SHORT_INIT  { static_cast<std::int16_t>(0x1234) };// 4660
+    constexpr float         BASE_FLOAT_INIT  { 2.5f };
+    constexpr double        BASE_DOUBLE_INIT { 1.5 };
+    // mode 1 runtime writes for the inherited non-int slots.
+    constexpr bool          BASE_BOOL_RUNTIME   { false };
+    constexpr float         BASE_FLOAT_RUNTIME  { 6.25f };
+    constexpr double        BASE_DOUBLE_RUNTIME { 9.75 };
+
+    // FieldInheritedIface.java — the interface constant (implicitly public static
+    // final).  find_field's _super-only walk does NOT reach it from an
+    // implementor; it resolves only through the interface's own klass.
+    constexpr std::int32_t IFACE_CONST_VALUE { 0x1FACE123 };
+
+    // Internal (JVM '/') names used for the direct klass::find_field-vs-super-walk
+    // contrast and the interface-constant characterization.
+    constexpr char K_CHILD[]{ "vmhook/fixtures/FieldInherited" };
+    constexpr char K_MID[]  { "vmhook/fixtures/FieldInheritedMid" };
+    constexpr char K_BASE[] { "vmhook/fixtures/FieldInheritedBase" };
+    constexpr char K_IFACE[]{ "vmhook/fixtures/FieldInheritedIface" };
+
     // Drive exactly one probe cycle for `mode`: reset the latched done flag and
     // program the scenario selector on the rising edge, then run the probe.
     auto drive(vmhook_test::context& ctx, std::int32_t mode) -> bool
@@ -166,6 +219,7 @@ VMHOOK_JVM_MODULE(field_inherited)
     vmhook::register_class<fi_child>("vmhook/fixtures/FieldInherited");
     vmhook::register_class<fi_mid>("vmhook/fixtures/FieldInheritedMid");
     vmhook::register_class<fi_base>("vmhook/fixtures/FieldInheritedBase");
+    vmhook::register_class<fi_iface>("vmhook/fixtures/FieldInheritedIface");
 
     // =====================================================================
     //  Registration / resolution sanity for all three hierarchy levels.
@@ -177,6 +231,158 @@ VMHOOK_JVM_MODULE(field_inherited)
         // wrapper — this is the super walk working at all (depth 2).
         ctx.check("child_resolves_grandparent_field_via_super_walk",
                   fi_child::static_field("sPublic").has_value());
+    }
+
+    // =====================================================================
+    //  DECLARED-ONLY  vs  SUPER-WALK  — the load-bearing distinction.
+    //
+    //  klass::find_field(name) searches ONLY the fields declared directly on
+    //  that one klass (vmhook.hpp:3462, doc "Searches only fields declared
+    //  directly on this class").  vmhook::find_field(klass,name) is the wrapper
+    //  that walks Klass::get_super() so INHERITED fields resolve (the loop at
+    //  vmhook.hpp:12993).  This block pins the contract at every chain position:
+    //  the per-klass call MUST NOT see an inherited field; the super-walk MUST.
+    //  We reach both directly through vmhook::find_class (a public free fn that
+    //  returns the klass*), independent of any wrapper, so the two layers are
+    //  compared head-to-head.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const k_child{ vmhook::find_class(K_CHILD) };
+        vmhook::hotspot::klass* const k_mid  { vmhook::find_class(K_MID) };
+        vmhook::hotspot::klass* const k_base { vmhook::find_class(K_BASE) };
+
+        ctx.check("declared_vs_walk_klasses_resolved",
+                  k_child != nullptr && k_mid != nullptr && k_base != nullptr);
+
+        if (k_child && k_mid && k_base)
+        {
+            // -- get_super() actually links the chain child -> mid -> base ----
+            ctx.check("super_link_child_to_mid", k_child->get_super() == k_mid);
+            ctx.check("super_link_mid_to_base",  k_mid->get_super()   == k_base);
+            // ...and Base's super is some non-null klass that is NOT in our
+            // hierarchy (java.lang.Object, possibly via no intermediate) — at
+            // minimum it is neither child nor mid nor base.
+            {
+                vmhook::hotspot::klass* const base_super{ k_base->get_super() };
+                ctx.check("super_link_base_has_super", base_super != nullptr);
+                ctx.check("super_link_base_super_not_in_hierarchy",
+                          base_super != k_child && base_super != k_mid && base_super != k_base);
+            }
+
+            // -- OWN field (childOwnInt): declared on the child --------------
+            //    declared-only on child  -> FOUND;  super-walk on child -> FOUND.
+            ctx.check("declared_only_finds_own_on_child",
+                      k_child->find_field("childOwnInt").has_value());
+            ctx.check("super_walk_finds_own_on_child",
+                      vmhook::find_field(k_child, "childOwnInt").has_value());
+
+            // -- PARENT field (midOwnInt): declared on Mid ------------------
+            //    declared-only on CHILD  -> NOT found (it is inherited, depth 1);
+            //    declared-only on MID    -> found (it is Mid's own);
+            //    super-walk   on CHILD   -> found (the walk descends one link).
+            ctx.check("declared_only_misses_inherited_parent_field",
+                      k_child->find_field("midOwnInt").has_value() == false);
+            ctx.check("declared_only_finds_parent_field_on_its_own_klass",
+                      k_mid->find_field("midOwnInt").has_value());
+            ctx.check("super_walk_finds_inherited_parent_field",
+                      vmhook::find_field(k_child, "midOwnInt").has_value());
+
+            // -- GRANDPARENT field (protectedInt): declared on Base ----------
+            //    declared-only on CHILD -> NOT found (inherited, depth 2);
+            //    declared-only on MID   -> NOT found (still inherited for Mid);
+            //    declared-only on BASE  -> found (Base's own);
+            //    super-walk   on CHILD  -> found (walk descends two links).
+            ctx.check("declared_only_misses_inherited_grandparent_from_child",
+                      k_child->find_field("protectedInt").has_value() == false);
+            ctx.check("declared_only_misses_inherited_grandparent_from_mid",
+                      k_mid->find_field("protectedInt").has_value() == false);
+            ctx.check("declared_only_finds_grandparent_field_on_base",
+                      k_base->find_field("protectedInt").has_value());
+            ctx.check("super_walk_finds_inherited_grandparent_field",
+                      vmhook::find_field(k_child, "protectedInt").has_value());
+
+            // -- The super-walk records WHICH klass declared the field -------
+            //    (field_entry_t::declaring_klass, vmhook.hpp:13005).  For an
+            //    inherited grandparent field that must be Base, not the child.
+            {
+                const auto e_prot{ vmhook::find_field(k_child, "protectedInt") };
+                ctx.check("super_walk_records_declaring_klass_grandparent",
+                          e_prot.has_value() && e_prot->declaring_klass == k_base);
+                const auto e_own{ vmhook::find_field(k_child, "childOwnInt") };
+                ctx.check("super_walk_records_declaring_klass_own",
+                          e_own.has_value() && e_own->declaring_klass == k_child);
+                const auto e_mid{ vmhook::find_field(k_child, "midOwnInt") };
+                ctx.check("super_walk_records_declaring_klass_parent",
+                          e_mid.has_value() && e_mid->declaring_klass == k_mid);
+            }
+
+            // -- An ABSENT name: declared-only AND super-walk both empty, at
+            //    every chain position, and NEVER crash. --------------------
+            ctx.check("declared_only_absent_is_empty",
+                      k_child->find_field("noSuchFieldAnywhere").has_value() == false);
+            ctx.check("super_walk_absent_is_empty",
+                      vmhook::find_field(k_child, "noSuchFieldAnywhere").has_value() == false);
+        }
+    }
+
+    // =====================================================================
+    //  INTERFACE CONSTANT (interface static final) inherited by an implementor.
+    //
+    //  FieldInheritedBase implements FieldInheritedIface, which declares the
+    //  constant IFACE_CONST.  vmhook::find_field's walk follows ONLY _super
+    //  (Klass::get_super), NEVER _transitive_interfaces — so the constant is
+    //  INVISIBLE through any implementor wrapper, but resolves through the
+    //  interface's OWN klass (depth 0, where it is declared).  This characterizes
+    //  the deliberate field/method asymmetry: METHOD lookup falls back to the
+    //  implemented-interface chain (see InterfacePoly), FIELD lookup does not.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const k_iface{ vmhook::find_class(K_IFACE) };
+        vmhook::hotspot::klass* const k_child{ vmhook::find_class(K_CHILD) };
+        vmhook::hotspot::klass* const k_base { vmhook::find_class(K_BASE) };
+
+        ctx.check("iface_klass_resolved", k_iface != nullptr);
+
+        if (k_iface)
+        {
+            // Through the interface's OWN klass: the constant is declared here.
+            // It is a static (interface fields are implicitly static final).
+            ctx.check("iface_const_declared_only_on_iface",
+                      k_iface->find_field("IFACE_CONST").has_value());
+            const auto e_iface{ vmhook::find_field(k_iface, "IFACE_CONST") };
+            ctx.check("iface_const_super_walk_on_iface", e_iface.has_value());
+            if (e_iface)
+            {
+                ctx.check("iface_const_is_static", e_iface->is_static == true);
+            }
+            // Read its value through the interface mirror via the registered
+            // interface wrapper's static accessor (resolve at the declaring klass).
+            {
+                const auto fp{ fi_iface::static_field("IFACE_CONST") };
+                ctx.check("iface_const_value_via_iface_wrapper",
+                          fp.has_value()
+                              && static_cast<std::int32_t>(fp->get()) == IFACE_CONST_VALUE);
+            }
+        }
+
+        // Through the IMPLEMENTOR klasses: the _super-only walk never reaches the
+        // interface, so the constant is NOT found from child or base.
+        if (k_child)
+        {
+            ctx.check("iface_const_NOT_visible_from_child_super_walk",
+                      vmhook::find_field(k_child, "IFACE_CONST").has_value() == false);
+        }
+        if (k_base)
+        {
+            ctx.check("iface_const_NOT_visible_from_base_super_walk",
+                      vmhook::find_field(k_base, "IFACE_CONST").has_value() == false);
+            // ...and the per-klass declared-only call on the implementor agrees.
+            ctx.check("iface_const_NOT_declared_on_base",
+                      k_base->find_field("IFACE_CONST").has_value() == false);
+        }
+        // ...and through the registered child wrapper's static accessor likewise.
+        ctx.check("iface_const_NOT_visible_via_child_wrapper",
+                  fi_child::static_field("IFACE_CONST").has_value() == false);
     }
 
     // =====================================================================
@@ -246,6 +452,91 @@ VMHOOK_JVM_MODULE(field_inherited)
                     ctx.check("inherited_string_value", s == "base-str");
                     ctx.check("inherited_string_signature",
                               std::string{ sp->signature() } == "Ljava/lang/String;");
+                }
+            }
+        }
+
+        // =================================================================
+        //  Inherited fields of EVERY remaining JVM type — depth-2 super walk +
+        //  field_proxy::get() proven for Z B C S F D and an inherited ARRAY.
+        //  Each resolves (the walk supplies the offset), carries the right
+        //  signature, and reads its mirrored init value.  Together with the
+        //  I / J / Ljava/lang/String; cases above this is the full type matrix.
+        // =================================================================
+        {
+            // boolean "Z"
+            {
+                auto fp{ child->get_field("baseBool") };
+                ctx.check("inherited_bool_resolves", fp.has_value());
+                if (fp)
+                {
+                    ctx.check("inherited_bool_signature", std::string{ fp->signature() } == "Z");
+                    ctx.check("inherited_bool_value", child->base_bool() == BASE_BOOL_INIT);
+                }
+            }
+            // byte "B"
+            {
+                auto fp{ child->get_field("baseByte") };
+                ctx.check("inherited_byte_resolves", fp.has_value());
+                if (fp)
+                {
+                    ctx.check("inherited_byte_signature", std::string{ fp->signature() } == "B");
+                    ctx.check("inherited_byte_value", child->base_byte() == BASE_BYTE_INIT);
+                }
+            }
+            // char "C"
+            {
+                auto fp{ child->get_field("baseChar") };
+                ctx.check("inherited_char_resolves", fp.has_value());
+                if (fp)
+                {
+                    ctx.check("inherited_char_signature", std::string{ fp->signature() } == "C");
+                    ctx.check("inherited_char_value", child->base_char() == BASE_CHAR_INIT);
+                }
+            }
+            // short "S"
+            {
+                auto fp{ child->get_field("baseShort") };
+                ctx.check("inherited_short_resolves", fp.has_value());
+                if (fp)
+                {
+                    ctx.check("inherited_short_signature", std::string{ fp->signature() } == "S");
+                    ctx.check("inherited_short_value", child->base_short() == BASE_SHORT_INIT);
+                }
+            }
+            // float "F"  (exact in IEEE-754 — equality is safe)
+            {
+                auto fp{ child->get_field("baseFloat") };
+                ctx.check("inherited_float_resolves", fp.has_value());
+                if (fp)
+                {
+                    ctx.check("inherited_float_signature", std::string{ fp->signature() } == "F");
+                    ctx.check("inherited_float_value", child->base_float() == BASE_FLOAT_INIT);
+                }
+            }
+            // double "D"  (exact in IEEE-754 — equality is safe)
+            {
+                auto fp{ child->get_field("baseDouble") };
+                ctx.check("inherited_double_resolves", fp.has_value());
+                if (fp)
+                {
+                    ctx.check("inherited_double_signature", std::string{ fp->signature() } == "D");
+                    ctx.check("inherited_double_value", child->base_double() == BASE_DOUBLE_INIT);
+                }
+            }
+            // int[] "[I" — inherited ARRAY reference (exercises the array-OOP
+            // decode through the depth-2 walk, not just a scalar slot).
+            {
+                auto fp{ child->get_field("baseIntArray") };
+                ctx.check("inherited_array_resolves", fp.has_value());
+                if (fp)
+                {
+                    ctx.check("inherited_array_signature", std::string{ fp->signature() } == "[I");
+                    ctx.check("inherited_array_is_reference", fp->is_reference() == true);
+                    const std::vector<std::int32_t> v{ child->base_int_array() };
+                    ctx.check("inherited_array_size", v.size() == 3);
+                    ctx.check("inherited_array_values",
+                              v.size() == 3 && v[0] == 11 && v[1] == 22 && v[2] == 33);
                 }
             }
         }
@@ -464,6 +755,78 @@ VMHOOK_JVM_MODULE(field_inherited)
     }
 
     // =====================================================================
+    //  WRITE an inherited field THROUGH THE SUBCLASS WRAPPER via the library's
+    //  own field_proxy::set() (NOT bytecode).  The super walk resolves the
+    //  inherited offset for the write exactly as for the read, at depth 1 (Mid)
+    //  and depth 2 (Base) and for an inherited reference (String).  Each slot is
+    //  written, read back, asserted, then RESTORED to its init so the later
+    //  bytecode-driven mode blocks see the canonical pre-mutation state.
+    // =====================================================================
+    if (child)
+    {
+        // depth-1 inherited int (Mid.midOwnInt)
+        {
+            auto fp{ child->get_field("midOwnInt") };
+            ctx.check("set_inherited_depth1_resolves", fp.has_value());
+            if (fp)
+            {
+                fp->set(std::int32_t{ 0x1515 });
+                auto rb{ child->get_field("midOwnInt") };
+                ctx.check("set_inherited_depth1_readback",
+                          rb.has_value() && static_cast<std::int32_t>(rb->get()) == 0x1515);
+                fp->set(MID_INT_INIT);  // restore
+                auto rs{ child->get_field("midOwnInt") };
+                ctx.check("set_inherited_depth1_restored",
+                          rs.has_value() && static_cast<std::int32_t>(rs->get()) == MID_INT_INIT);
+            }
+        }
+        // depth-2 inherited int (Base.publicInt)
+        {
+            auto fp{ child->get_field("publicInt") };
+            ctx.check("set_inherited_depth2_resolves", fp.has_value());
+            if (fp)
+            {
+                fp->set(std::int32_t{ 0x2626 });
+                auto rb{ child->get_field("publicInt") };
+                ctx.check("set_inherited_depth2_readback",
+                          rb.has_value() && static_cast<std::int32_t>(rb->get()) == 0x2626);
+                fp->set(PUB_INT_INIT);  // restore
+                auto rs{ child->get_field("publicInt") };
+                ctx.check("set_inherited_depth2_restored",
+                          rs.has_value() && static_cast<std::int32_t>(rs->get()) == PUB_INT_INIT);
+            }
+        }
+        // depth-2 inherited REFERENCE (Base.baseStr) — the walk must resolve the
+        // inherited String slot for WRITING just as it does for reading.  We
+        // assert the RESOLUTION hard (the proxy is obtained at the walk-resolved
+        // offset and the slot is a writable reference).  The post-set VALUE
+        // read-back depends on make_java_string()/set_str_field() — an ORTHOGONAL
+        // path (owned by field_string / field_primitives_set) with a documented
+        // mirror-allocation fragility — so the round-trip VALUE is recorded
+        // best-effort [INFO], never a FAIL of THIS (inheritance) module.  The slot
+        // is restored to its init regardless; nothing downstream reads baseStr.
+        {
+            auto fp{ child->get_field("baseStr") };
+            ctx.check("set_inherited_string_resolves", fp.has_value());
+            if (fp)
+            {
+                ctx.check("set_inherited_string_is_reference", fp->is_reference() == true);
+                fp->set(std::string{ "rewritten" });
+                auto rb{ child->get_field("baseStr") };
+                const std::string rbv{ rb ? std::string{ rb->get() } : std::string{} };
+                ctx.record(std::string{ "[INFO] set_inherited_string_readback (best-effort; "
+                                        "make_java_string path): got '" } + rbv
+                           + "' (expected 'rewritten')");
+                fp->set(std::string{ "base-str" });  // restore (best-effort)
+                auto rs{ child->get_field("baseStr") };
+                const std::string rsv{ rs ? std::string{ rs->get() } : std::string{} };
+                ctx.record(std::string{ "[INFO] set_inherited_string_restored (best-effort): now '" }
+                           + rsv + "' (expected 'base-str')");
+            }
+        }
+    }
+
+    // =====================================================================
     //  LIVE mutation — mode 1: putfield the child's own + inherited instance
     //  slots through real bytecode, then read each back.  Proves find_field
     //  resolves the live post-dispatch slot at every walk depth.
@@ -483,6 +846,14 @@ VMHOOK_JVM_MODULE(field_inherited)
                           live->protected_int() == PROT_INT_RUNTIME);
                 ctx.check("mode1_inherited_public_live_depth2",
                           live->public_int() == PUB_INT_RUNTIME);
+                // Inherited NON-int slots written by the same putfield dispatch:
+                // the depth-2 walk resolves the live Z / F / D slot too.
+                ctx.check("mode1_inherited_bool_live_depth2",
+                          live->base_bool() == BASE_BOOL_RUNTIME);
+                ctx.check("mode1_inherited_float_live_depth2",
+                          live->base_float() == BASE_FLOAT_RUNTIME);
+                ctx.check("mode1_inherited_double_live_depth2",
+                          live->base_double() == BASE_DOUBLE_RUNTIME);
             }
         }
     }

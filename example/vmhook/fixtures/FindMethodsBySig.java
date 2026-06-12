@@ -43,11 +43,24 @@ import vmhook.Harness;
  *     arrStr(String[])([Ljava/lang/String;)[Ljava/lang/String;
  *   MULTI-SLOT (long/double occupy two stack slots):
  *     mix(int,long,double)  (IJD)D
+ *     wideVoid(long,double) (JD)V    -> two wide args, VOID return
+ *   MANY-ARG (all four slot-width classes + a reference + an array, two ways):
+ *     many(int,long,double,String,int[],boolean) (IJDLjava/lang/String;[IZ)V  (void)
+ *     manyR(int,int,int,int,int,int)             (IIIIII)I                    (int)
+ *   REFERENCE arg -> REFERENCE return of a DIFFERENT type (String in, Object out):
+ *     boxStr(String)  (Ljava/lang/String;)Ljava/lang/Object;
+ *   NO-ARG REFERENCE return that collides (by descriptor) with an INHERITED
+ *   java.lang.Object method, proving find returns the DECLARED one only:
+ *     name()          ()Ljava/lang/String;   -> { name }, NOT inherited toString()
+ *   THREE-WAY shared descriptor -- proves find returns ALL N matches at N=3, and
+ *   that two instance + one static method co-enumerate on one descriptor:
+ *     tri1(double) / tri2(double) (instance) + tri3(double) (static)  (D)I
  *   STATIC methods are found exactly like instance methods (the descriptor walk
  *   ignores JVM_ACC_STATIC):
  *     sf(int)       (I)I        -> SHARES (I)I with instance f(int)
  *     sf(String)    (Ljava/lang/String;)Ljava/lang/String; -> SHARES with f(String)
  *     sUnique(long,long)  (JJ)J -> a genuinely-unique static descriptor
+ *     tri3(double)  (D)I        -> SHARES (D)I with instance tri1/tri2
  *
  * So, by design and verified against `javap -s`:
  *   (I)I                                       -> { f , sf }    (instance + static)
@@ -60,10 +73,16 @@ import vmhook.Harness;
  *   (D)D / (F)F / (S)S / (B)B / (C)C / (Z)Z    -> each { its one method }
  *   ([[I)[[I / ([L..String;)[L..String;        -> { arr2 } / { arrStr }
  *   (IJD)D                                     -> { mix }
+ *   (JD)V                                      -> { wideVoid }
+ *   (IJDLjava/lang/String;[IZ)V                -> { many }
+ *   (IIIIII)I                                  -> { manyR }
  *   (JJ)J                                      -> { sUnique }
  *   ()I                                        -> { retI }
  *   ()J                                        -> { g }
  *   ()Ljava/lang/Object;                       -> { makeObj }
+ *   (Ljava/lang/String;)Ljava/lang/Object;     -> { boxStr }
+ *   ()Ljava/lang/String;                       -> { name }   (NOT inherited toString)
+ *   (D)I                                       -> { tri1 , tri2 , tri3 }  (3-way set)
  *
  * NOTE on (I)I: the task brief sketched "(I)I -> {f}", but it ALSO asked for a
  * static int sf(int) AND for the String descriptor to be { f , sf }.  A static
@@ -224,6 +243,63 @@ public final class FindMethodsBySig
         return (a == null) ? new String[0] : a;
     }
 
+    /** (JD)V -- two WIDE args (long+double, four slots) with a VOID return. */
+    public void wideVoid(final long a, final double b)
+    {
+        // no-op
+    }
+
+    /**
+     * (IJDLjava/lang/String;[IZ)V -- a MANY-arg, VOID-return method spanning every
+     * slot-width class: 1-slot int, 2-slot long, 2-slot double, a reference, a
+     * reference array, and a 1-slot boolean.
+     */
+    public void many(final int a, final long b, final double c,
+                     final String d, final int[] e, final boolean f)
+    {
+        // no-op
+    }
+
+    /** (IIIIII)I -- a MANY-arg method, all single-slot ints, with an INT return. */
+    public int manyR(final int a, final int b, final int c,
+                     final int d, final int e, final int f)
+    {
+        return a + b + c + d + e + f;
+    }
+
+    /**
+     * (Ljava/lang/String;)Ljava/lang/Object; -- a REFERENCE arg returning a
+     * DIFFERENT reference type (String in, Object out), distinct from the
+     * String->String set { f, sf }.
+     */
+    public Object boxStr(final String s)
+    {
+        return (s == null) ? new Object() : s;
+    }
+
+    /**
+     * ()Ljava/lang/String; -- a no-arg String return.  java.lang.Object does NOT
+     * declare a no-arg String method, but Object#toString() carries this exact
+     * descriptor; because find walks DECLARED methods only, ()Ljava/lang/String;
+     * resolves to { name } and never to the inherited toString.
+     */
+    public String name()
+    {
+        return "FindMethodsBySig";
+    }
+
+    /** (D)I -- member of the THREE-WAY (D)I set { tri1, tri2, tri3 }. */
+    public int tri1(final double x)
+    {
+        return (int) x;
+    }
+
+    /** (D)I -- member of the THREE-WAY (D)I set { tri1, tri2, tri3 }. */
+    public int tri2(final double x)
+    {
+        return (int) x + 1;
+    }
+
     // =======================================================================
     //  Static methods.  The descriptor walk ignores JVM_ACC_STATIC, so these
     //  appear in the SAME result set as the instance methods of equal descriptor.
@@ -245,6 +321,16 @@ public final class FindMethodsBySig
     public static long sUnique(final long a, final long b)
     {
         return a + b;
+    }
+
+    /**
+     * (D)I -- the STATIC member of the three-way (D)I set { tri1, tri2, tri3 },
+     * proving find returns ALL matches at multiplicity 3 and that static and
+     * instance methods co-enumerate on one descriptor.
+     */
+    public static int tri3(final double x)
+    {
+        return (int) x + 2;
     }
 
     // ---- Probe dispatch ---------------------------------------------------

@@ -62,6 +62,13 @@ public final class FieldInherited extends FieldInheritedMid
     public static final int  STATIC_SHADOW_CHILD   = 777;       // child sShadow
     public static final int  STATIC_SHADOW_RUNTIME = 3030;      // mode 3 child write
 
+    // mode 1 also writes these inherited non-int slots, so the live read-back
+    // proves the super walk resolves the live offset for Z / F / D too (not only
+    // I).  Init values for these live on FieldInheritedBase; the runtimes differ.
+    public static final boolean BASE_BOOL_RUNTIME   = false;    // init is true
+    public static final float   BASE_FLOAT_RUNTIME  = 6.25f;    // init is 2.5f
+    public static final double  BASE_DOUBLE_RUNTIME = 9.75d;    // init is 1.5d
+
     // ---- The child's OWN instance field (super walk stops at depth 0) -------
     protected int childOwnInt = OWN_INT_INIT;
 
@@ -96,6 +103,10 @@ public final class FieldInherited extends FieldInheritedMid
         this.midOwnInt    = FieldInheritedMid.MID_INT_RUNTIME;  // inherited depth 1
         this.protectedInt = FieldInheritedBase.PROT_INT_RUNTIME;// inherited depth 2
         this.publicInt    = FieldInheritedBase.PUB_INT_RUNTIME; // inherited depth 2
+        // Inherited NON-int slots (depth 2), so the live read-back covers Z/F/D.
+        this.baseBool     = BASE_BOOL_RUNTIME;
+        this.baseFloat    = BASE_FLOAT_RUNTIME;
+        this.baseDouble   = BASE_DOUBLE_RUNTIME;
     }
 
     /**

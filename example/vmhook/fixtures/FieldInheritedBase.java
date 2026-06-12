@@ -19,7 +19,7 @@ package vmhook.fixtures;
  * Package-private top-level class (its public-named file matches the type); it
  * carries no Harness.Probe, so Main.loadFixtures() merely loads it.  Java 8.
  */
-class FieldInheritedBase
+class FieldInheritedBase implements FieldInheritedIface
 {
     // ---- Init + runtime constants the child's mutators write ---------------
     static final int PROT_INT_INIT    = 1337;        // canonical inherited value
@@ -47,6 +47,19 @@ class FieldInheritedBase
     protected long   baseLong     = 0x00BA5E_0000BA5EL;
     public    String baseStr      = "base-str";
 
+    // ---- One inherited field of EVERY remaining JVM primitive type, plus an
+    //      array reference, so the depth-2 super walk + field_proxy::get() are
+    //      proven for Z B C S F D and the array-OOP decode path -- not only the
+    //      I / J / Ljava/lang/String; signatures the rest of the fixture covers.
+    //      Init values are mirrored verbatim on the native side.
+    public    boolean baseBool   = true;                 // "Z"
+    public    byte    baseByte   = (byte) 0x5A;          // "B"  (= 90)
+    public    char    baseChar   = 'Q';                  // "C"  (= 0x0051 = 81)
+    public    short   baseShort  = (short) 0x1234;       // "S"  (= 4660)
+    public    float   baseFloat  = 2.5f;                 // "F"  (exact in IEEE-754)
+    public    double  baseDouble = 1.5d;                 // "D"  (exact in IEEE-754)
+    public    int[]   baseIntArray = { 11, 22, 33 };     // "[I" (inherited array ref)
+
     // ---- STATIC fields at every access level -------------------------------
     protected static int sProtected = STAT_PROT_INIT;
     public    static int sPublic    = STAT_PUB_INIT;
@@ -57,10 +70,15 @@ class FieldInheritedBase
     public  String shadowedStr = "base";    // base copy of the shadowed String
     public  static int sShadow  = 555;      // FieldInherited.STATIC_SHADOW_BASE
 
-    // Touch private members so javac does not warn them unused under -Werror-y
-    // builds and so they are guaranteed present in the layout.
+    // Touch private members + the every-type slots so javac does not warn them
+    // unused under -Werror-y builds and so they are guaranteed present in the
+    // layout.  Also reads the interface constant so its declaration is exercised.
     int sumPrivates()
     {
-        return this.privateInt + FieldInheritedBase.sPrivate;
+        int acc = this.privateInt + FieldInheritedBase.sPrivate + IFACE_CONST;
+        acc += (this.baseBool ? 1 : 0) + this.baseByte + this.baseChar + this.baseShort;
+        acc += (int) this.baseFloat + (int) this.baseDouble;
+        acc += this.baseIntArray.length;
+        return acc;
     }
 }
