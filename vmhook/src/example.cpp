@@ -3342,6 +3342,14 @@ static auto run_test_suite() -> void
                     [&](bool value) { set_go(value); },
                     [&]() { return get_done(); });
             };
+            // Post-contained-crash cleanup for the harness's no-SEH Windows AV
+            // container (MinGW / clang-on-Windows): after it longjmps out of a
+            // faulting module — skipping that module's C++ destructors — any
+            // scoped_hook it left armed must be torn down before the next module
+            // runs, or the leftover detour corrupts it.  shutdown_hooks() is
+            // REVERSIBLE (it clears the shutdown/started latches at the end), so
+            // the next module's hook<T>() installs a fully-live hook again.
+            ctx.reset = [] { vmhook::shutdown_hooks(); };
             const std::size_t modules_ran{ vmhook_test::run_all(ctx) };
             write_result("[INFO] ran " + std::to_string(modules_ran) + " modular JVM test module(s).");
             // Closes the verification gap: a green CI must mean the modular

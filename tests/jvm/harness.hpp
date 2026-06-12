@@ -35,6 +35,18 @@ namespace vmhook_test
         // happens on the Java thread inside the fixture's registered action.
         std::function<bool(std::function<void(bool)> set_go,
                            std::function<bool()>     get_done)> run_probe;
+
+        // Tear down ALL installed hooks and clear vmhook's global hook state.
+        // Implemented by the driver (example.cpp) as vmhook::shutdown_hooks(),
+        // which is REVERSIBLE — a subsequent module's hook<T>() is fully live
+        // again.  run_all() calls this after a CONTAINED module crash on the
+        // no-SEH Windows path: that recovery longjmps out of the faulting
+        // module, skipping its C++ destructors, so any scoped_hook it armed
+        // would otherwise stay installed and corrupt the NEXT module.  Resetting
+        // here restores a clean slate.  Optional — run_all() no-ops if unset
+        // (e.g. the MSVC __try path doesn't need it; __except unwinds the C++
+        // frames normally on return, but calling reset() there is harmless).
+        std::function<void()> reset;
     };
 
     using module_fn = void (*)(context&);
