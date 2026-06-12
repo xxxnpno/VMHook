@@ -55,7 +55,25 @@
 //     detour where current_java_thread is live (the only legal context);
 //   * immediately after the throwing call() we ALWAYS run
 //     vmhook::detail::jni_exception_clear() (idempotent) so no pending exception
-//     can poison subsequent JNI on this thread or leak into the next module;
+//     can poison subsequent JNI on this thread, leak into the next module, OR
+//     unwind out of trigger()'s interpreter frame into vmhook.Main and kill the
+//     suite (the uncaught-exception escape this module previously flaked on).
+//     jni_exception_clear() silently NO-OPS when vmhook::hotspot::current_jni_env
+//     is null, and a detour runs on a JVM thread common_detour merely ADOPTED
+//     (never attached -> env can be null) — so on the CALL-STUB path, where
+//     boom(-1) dispatches with only current_java_thread and leaves the exception
+//     pending, the clear could no-op and the throw escaped.  Defences (all inside
+//     the detour, before the interpreter resumes trigger()):
+//       (1) vmhook::hotspot::ensure_current_java_thread() right before the clear
+//           to GUARANTEE current_jni_env is populated (cheap no-op on the common
+//           path) so the JNI clear can actually fire;
+//       (2) the JNI jni_exception_clear() with a bounded verify-and-retry;
+//       (3) a DIRECT null of JavaThread::_pending_exception via VMStructs
+//           (raw_clear_pending_exception) — the load-bearing dismissal for the
+//           cold/env-null case the JNI clear cannot reach, and a safe no-op where
+//           the field is absent from VMStructs;
+//       (4) a final re-ensure + JNI clear + direct clear at the detour's end,
+//           so absolutely nothing pending can reach vmhook.Main;
 //   * value_t is read by COPY-INIT (never brace-init from call()/value_t — that
 //     is ambiguous on MSVC because the templated conversion operator can also
 //     produce const char*);
@@ -71,6 +89,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace
@@ -130,6 +149,67 @@ namespace
     std::atomic<std::int64_t> g_health_field_value{ k_uncaptured };
     std::atomic<bool>         g_static_health_read_ok{ false };  // static field read succeeded
     std::atomic<std::int64_t> g_static_health_value{ k_uncaptured };
+
+    // HotSpot-level pending-exception clear: null JavaThread::_pending_exception
+    // directly when VMStructs exposes the field.  This is the LOAD-BEARING clear
+    // for the dangerous cases the JNI-level clear cannot cover:
+    //
+    //   * COLD / env-null thread.  vmhook::detail::jni_exception_clear() reads
+    //     ExceptionCheck/ExceptionClear via current_jni_env and SILENTLY NO-OPS
+    //     when that thread_local is null.  call() tries to populate it (via
+    //     ensure_current_java_thread -> attach), but attach is allowed to FAIL
+    //     while call() still dispatches on the CALL-STUB path (which needs only
+    //     current_java_thread).  boom(-1) then throws, the exception is parked in
+    //     JavaThread::_pending_exception, and with a null env the JNI clear cannot
+    //     dismiss it — so it would unwind out of trigger()'s interpreter frame
+    //     into vmhook.Main and kill the suite before TOTAL.  This direct write
+    //     needs no JNIEnv, so it clears regardless.
+    //   * Surfacing via a non-JNI state transition.  The resuming interpreter
+    //     checks _pending_exception directly; nulling the field is what actually
+    //     guarantees nothing is left to dispatch.
+    //
+    // Safe no-op when _pending_exception is not in this JDK's VMStructs (e.g. the
+    // JNI-FALLBACK-path JDKs, where vmhook already surfaced+cleared the throw via
+    // ExceptionDescribe).  Every access is is_valid_pointer-gated (matching the
+    // module's "every pointer deref is gated" posture and how the whole library
+    // reads VMStruct fields); std::memcpy avoids strict-aliasing UB; the field is
+    // pointer-width on every supported HotSpot.  Clearing an oop root needs no GC
+    // store barrier — this is exactly what JNI ExceptionClear does internally.
+    auto pending_exception_offset() noexcept -> std::uint64_t
+    {
+        static const std::uint64_t off{ []() -> std::uint64_t {
+            const vmhook::hotspot::vm_struct_entry_t* e{
+                vmhook::hotspot::iterate_struct_entries("Thread", "_pending_exception") };
+            if (!e)
+            {
+                e = vmhook::hotspot::iterate_struct_entries("JavaThread", "_pending_exception");
+            }
+            return e ? e->offset : static_cast<std::uint64_t>(-1);
+        }() };
+        return off;
+    }
+
+    auto raw_clear_pending_exception() noexcept -> bool
+    {
+        void* const thr{ vmhook::hotspot::current_java_thread };
+        if (!thr || !vmhook::hotspot::is_valid_pointer(thr))
+        {
+            return false;
+        }
+        const std::uint64_t off{ pending_exception_offset() };
+        if (off == static_cast<std::uint64_t>(-1))
+        {
+            return false;   // field not exported on this JDK — JNI clear is the path
+        }
+        void* const slot{ reinterpret_cast<std::uint8_t*>(thr) + off };
+        if (!vmhook::hotspot::is_valid_pointer(slot))
+        {
+            return false;
+        }
+        void* const null_oop{ nullptr };
+        std::memcpy(slot, &null_oop, sizeof(void*));
+        return true;
+    }
 
     // Read the current thread's JNI ExceptionCheck (slot 228) WITHOUT clearing.
     // Fully guarded; returns 1 (pending), 0 (none), or -1 (could not determine).
@@ -226,21 +306,66 @@ namespace
             }
         }
 
+        // -----------------------------------------------------------------
+        //  GUARANTEE A NON-NULL JNIEnv BEFORE WE CLEAR.  This is the escape
+        //  fix: jni_exception_clear() reads ExceptionCheck/ExceptionClear via
+        //  vmhook::hotspot::current_jni_env and SILENTLY NO-OPS when that
+        //  thread_local is null (vmhook.hpp jni_exception_clear, ~10255:
+        //  the `exception_check && exception_clear && exception_check(env)`
+        //  guard short-circuits on a null env).  current_jni_env is populated
+        //  only by attach_current_native_thread(); a detour runs on a JVM
+        //  thread that common_detour ADOPTED (it sets current_java_thread from
+        //  the trampoline's r15 but never attaches, vmhook.hpp ~6431), so the
+        //  env can be null here.  On the CALL-STUB fast path boom(-1) is then
+        //  dispatched (call() only needs current_java_thread, not the env),
+        //  throws, and leaves the exception PENDING on the thread — but the
+        //  defensive clear below would no-op, so the exception would unwind out
+        //  of trigger()'s interpreter frame all the way to vmhook.Main and kill
+        //  the suite with an uncaught IllegalStateException before TOTAL.
+        //  ensure_current_java_thread() attaches the thread when the env is
+        //  missing (vmhook.hpp ~4538 populates current_jni_env via GetEnv), so
+        //  the clear can actually fire.  On the common path the env is already
+        //  set (call() attached pre-throw) and this is a cheap no-op that skips
+        //  re-attaching.  It is noexcept and makes no JNIEnv calls itself, so it
+        //  is safe to invoke with an exception pending.
+        static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
+
         // Snapshot whether a pending exception remained on the thread BEFORE we
-        // clear it (characterizes the call-stub vs JNI-fallback paths).
+        // clear it (characterizes the call-stub vs JNI-fallback paths).  Now
+        // that the env is guaranteed populated, this reads a DEFINITE 1/0 on
+        // the call-stub/JNI-fallback paths instead of -1 (unknown env).
         g_pending_pre_clear.store(jni_exception_pending());
 
         // -----------------------------------------------------------------
         //  DEFENSIVE CLEAR — always, idempotent.  On the call-stub fast path
         //  vmhook does NOT auto-clear, so without this the thrown exception
-        //  would poison the safeAdd()/field reads below and leak into the next
-        //  module.  On the JNI-fallback path vmhook already cleared it; this is
-        //  then a no-op.
+        //  would poison the safeAdd()/field reads below, leak into the next
+        //  module, AND (the escape fixed above) propagate out to vmhook.Main.
+        //  On the JNI-fallback path vmhook already cleared it; this is then a
+        //  no-op.  With the env guaranteed non-null above, this clear can no
+        //  longer silently no-op while an exception is pending.
         // -----------------------------------------------------------------
         vmhook::detail::jni_exception_clear();
+        // HotSpot-level clear too: the load-bearing dismissal for the cold/env-null
+        // call-stub case where the JNI clear above no-ops (see
+        // raw_clear_pending_exception).  No-op where _pending_exception is not in
+        // VMStructs (JNI-fallback JDKs).
+        static_cast<void>(raw_clear_pending_exception());
         g_clear_invoked.store(true);
 
-        const int post{ jni_exception_pending() };
+        // Verify the clear took; if a transient left something pending, clear
+        // again (bounded) so the thread is DEFINITELY clean before we resume —
+        // belt-and-braces against any single-shot clear that did not dismiss
+        // the pending exception.  Each ExceptionClear is idempotent and a leaf
+        // JNI op, so the loop cannot itself raise.  Both clears run so the thread
+        // is left with nothing the resuming interpreter could unwind into Main.
+        int post{ jni_exception_pending() };
+        for (int retry{ 0 }; post == 1 && retry < 4; ++retry)
+        {
+            vmhook::detail::jni_exception_clear();
+            static_cast<void>(raw_clear_pending_exception());
+            post = jni_exception_pending();
+        }
         g_pending_post_clear.store(post);
         g_clean_after_clear.store(post == 0);
 
@@ -293,8 +418,14 @@ namespace
             }
         }
 
-        // Final defensive clear so absolutely nothing pending escapes the detour.
+        // Final defensive clear so absolutely nothing pending escapes the
+        // detour into vmhook.Main.  Re-ensure the env first (cheap no-op when
+        // already attached) so the JNI clear can never silently no-op on a null
+        // current_jni_env, then null _pending_exception directly as the last
+        // HotSpot-level guarantee before the interpreter resumes trigger().
+        static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
         vmhook::detail::jni_exception_clear();
+        static_cast<void>(raw_clear_pending_exception());
     }
 
     // Drive one probe cycle: clear `done`, raise `go`, wait for the fixture's
@@ -446,11 +577,29 @@ VMHOOK_JVM_MODULE(method_throwing_call_site)
                              "state IMMEDIATELY AFTER call() (pre-defensive-clear) "
                              "ExceptionCheck=" };
             exc += (pre == 1 ? "1 (pending -> CALL-STUB path: vmhook did NOT "
-                               "auto-clear; our jni_exception_clear() handled it)"
+                               "auto-clear; our env-guaranteed jni_exception_clear() "
+                               "plus a direct _pending_exception clear dismissed it "
+                               "so it cannot unwind into vmhook.Main)"
                   : pre == 0 ? "0 (already clear -> JNI-FALLBACK path: vmhook's "
                                "check_callee_exception()/ExceptionDescribe cleared it)"
                   : "-1 (could not determine: no JNIEnv / slot)");
             ctx.record(exc);
+
+            // IMPORTANT for log readers: on the JNI-FALLBACK path vmhook surfaces
+            // the thrown exception by calling JNIEnv::ExceptionDescribe, which
+            // prints a single-frame  `Exception in thread "main" '
+            // java.lang.IllegalStateException: boom:-1  at ...boom(...)`  line to
+            // the JVM's stderr AND clears it.  That stderr line is the library's
+            // INTENDED exception-surfacing (it is one of the two contract-accepted
+            // observation channels), NOT an uncaught exception escaping to and
+            // killing vmhook.Main: the suite continues and reaches its TOTAL line.
+            // (The genuinely dangerous variant is the CALL-STUB path, where vmhook
+            // does not auto-clear and the pending exception would unwind into Main
+            // before TOTAL — that is what the clears above neutralise.)
+            ctx.record("[INFO] method_throwing_call_site: a `Exception in thread "
+                       "\"main\" ... boom:-1` line on JVM stderr (JNI-FALLBACK path) "
+                       "is vmhook's ExceptionDescribe surfacing the throw, not an "
+                       "escape; the suite still completes to TOTAL.");
 
             // The benign RECOVERY call after the throw decoded normally — record
             // its variant so the "JVM healthy after" proof is fully visible

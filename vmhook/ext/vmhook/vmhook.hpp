@@ -979,6 +979,61 @@ namespace vmhook
 #endif
         }
 
+        /*
+            @brief Writes `size` bytes from `src` into `dst` without faulting on a
+                   bad/unmapped/read-only destination.  The write counterpart of
+                   safe_read.
+            @details
+            A detour that mutates interpreter state (return_value::set_arg writing
+            an argument slot) is the one place we write THROUGH a pointer derived
+            from a cold/relocated interpreter frame.  A raw `*dst = …` to such a
+            pointer faults on the no-SEH toolchains (MinGW, clang-on-windows) the
+            same way a raw read does — except a stray WRITE also corrupts whatever
+            it lands on, so it is strictly more dangerous than a stray read.  This
+            routes the store through the kernel, which validates the destination and
+            returns false (never faults, never partially writes a slot) when it is
+            not a committed writable page.
+
+            Per-platform fault-safe path (all-or-nothing: true iff every byte landed):
+              * Windows: WriteProcessMemory on the current process — the kernel
+                performs the store and reports failure on an unmapped / read-only
+                page instead of raising an AV.  Mirrors safe_read's ReadProcessMemory.
+              * Linux / Android: process_vm_writev (zero-copy, kernel-validated).
+              * macOS: mach_vm_write.
+              * iOS / unknown: no user-callable fault-safe write primitive without
+                entitlements; refuse rather than risk a corrupting raw store the
+                caller cannot recover from.  (set_arg's caller treats false as
+                "leave the argument untouched", which is the safe outcome.)
+        */
+        inline auto safe_write(void* dst, const void* src, std::size_t size) noexcept -> bool
+        {
+            if (!dst || !src || size == 0)
+            {
+                return false;
+            }
+#if VMHOOK_OS_WINDOWS
+            SIZE_T transferred{ 0 };
+            const BOOL ok{ ::WriteProcessMemory(::GetCurrentProcess(), dst, src,
+                                                size, &transferred) };
+            return ok && transferred == size;
+#elif VMHOOK_OS_MACOS
+            const kern_return_t rc{ ::mach_vm_write(
+                ::mach_task_self(),
+                reinterpret_cast<mach_vm_address_t>(dst),
+                reinterpret_cast<vm_offset_t>(const_cast<void*>(src)),
+                static_cast<mach_msg_type_number_t>(size)) };
+            return rc == KERN_SUCCESS;
+#elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
+            iovec local{ const_cast<void*>(src), size };
+            iovec remote{ dst, size };
+            const ssize_t n{ ::process_vm_writev(::getpid(), &local, 1, &remote, 1, 0) };
+            return n == static_cast<ssize_t>(size);
+#else
+            (void)dst; (void)src; (void)size;
+            return false;
+#endif
+        }
+
 #if defined(_MSC_VER) && !defined(__clang__)
         /*
             @brief MSVC-cl-only SEH-guarded raw copy used by safe_read_fast.
@@ -5449,7 +5504,27 @@ namespace vmhook
                       RBP = 0x243f888    [rbp-56] = 3
                       R14 = 0x243f8a0    rbp + 3*8 = 0x243f8a0
                 */
-                const void* const frame_slot_value{ *reinterpret_cast<void* const*>(reinterpret_cast<const std::uint8_t*>(this) + locals_offset) };
+                // `this` is the interpreter rbp.  On a cold / relocated / about-to-be
+                // GC-walked frame it can be in-range+aligned (passing is_valid_pointer)
+                // yet point at a page that is not actually mapped at this instant; a
+                // raw `*(this + locals_offset)` then FAULTS, and on the no-SEH
+                // toolchains (MinGW, clang-on-windows) that fault is uncontained and
+                // kills the JVM.  Gate on is_valid_pointer first, then read the frame
+                // slot through os::safe_read (kernel-validated, never faults).  On a
+                // bad frame this returns null and every caller (get_argument,
+                // extract_frame_arg, set_arg, get_arguments) already treats a null
+                // locals pointer as "give up safely".
+                if (!vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return nullptr;
+                }
+                const void* frame_slot_value{ nullptr };
+                if (!vmhook::os::safe_read(&frame_slot_value,
+                                           reinterpret_cast<const std::uint8_t*>(this) + locals_offset,
+                                           sizeof(frame_slot_value)))
+                {
+                    return nullptr;
+                }
 
                 // JDK 8-20: direct pointer stored in the frame slot.
                 if (vmhook::hotspot::is_valid_pointer(frame_slot_value))
@@ -6830,7 +6905,125 @@ namespace vmhook
                 return nullptr;
             }
 
-            return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(adapter) + entry->offset);
+            // CRASH-SAFE: `adapter` is recovered from Method::_adapter (JDK 8
+            // export) or a heuristic offset scan (JDK 9+) and can be a cold /
+            // GC-relocated AdapterHandlerEntry whose page passes is_valid_pointer
+            // yet faults on a raw `*ptr` load.  MinGW / clang-on-windows have no
+            // SEH to contain that AV, so it would kill the JVM mid-suite.  Route
+            // the field read through safe_read_pointer (kernel-validated
+            // ReadProcessMemory): an unreadable slot returns nullptr and the
+            // deopt caller simply skips the method instead of faulting.
+            return const_cast<void*>(vmhook::hotspot::safe_read_pointer(
+                reinterpret_cast<const std::uint8_t*>(adapter) + entry->offset));
+        }
+
+        /*
+            @brief Fault-safe read of the Array<Method*> backing InstanceKlass::_methods.
+            @details
+            Reproduces get_methods_count() + get_methods_ptr() (the `_methods`
+            Array<Method*> read: array pointer @ _methods offset, then `_length`
+            @0, data @ +8) but EVERY hop goes through os::safe_read /
+            safe_read_pointer instead of a raw `*ptr` — so it can only ever
+            fail-safe (returns false), never fault.
+
+            Why this exists separately from the raw accessors: the public deopt
+            sweep (deoptimize_methods_if) walks EVERY loaded klass returned by
+            for_each_loaded_class, including array klasses and klasses that are
+            cold / mid-GC-relocation / reached through a renamed-or-wrong
+            VMStruct offset.  Such a klass pointer can pass is_valid_pointer's
+            range+alignment heuristic yet FAULT on the raw `_methods` load.  The
+            MSVC harness __try/__except contains that EXCEPTION_ACCESS_VIOLATION,
+            but MinGW / clang-on-windows have NO SEH and the whole JVM goes down
+            mid-suite (the crash this hardening fixes).  The existing raw
+            accessors are deliberately left untouched so their byte-for-byte
+            behaviour on the warm install path is unchanged; only the cold sweep
+            routes through here.
+
+            @param k             InstanceKlass* to read _methods from.
+            @param methods_data  Out: pointer to the first Method* (array base + 8),
+                                 nullptr on any failure.
+            @param method_count  Out: clamped [1,65535] method count, 0 on failure.
+            @return true iff BOTH the array pointer and a sane length were readable.
+        */
+        static auto safe_klass_methods(vmhook::hotspot::klass* const k,
+                                       vmhook::hotspot::method**&    methods_data,
+                                       std::int32_t&                 method_count) noexcept
+            -> bool
+        {
+            methods_data = nullptr;
+            method_count = 0;
+
+            static const vmhook::hotspot::vm_struct_entry_t* const methods_entry{
+                vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_methods") };
+            if (!methods_entry || !k || !vmhook::hotspot::is_valid_pointer(k))
+            {
+                return false;
+            }
+
+            // InstanceKlass::_methods -> Array<Method*>* — fault-safe pointer read.
+            // A non-InstanceKlass (array/objArray klass) or a cold klass yields an
+            // unreadable / bogus slot here and we bail without ever raw-deref'ing.
+            const void* const array{ vmhook::hotspot::safe_read_pointer(
+                reinterpret_cast<const std::uint8_t*>(k) + methods_entry->offset) };
+            if (!vmhook::hotspot::is_valid_pointer(array))
+            {
+                return false;
+            }
+
+            // Array<Method*>::_length @0 — fault-safe, then sanity-clamp exactly
+            // like get_methods_count() (u2 class-file method_count ceiling; a
+            // negative / absurd value means a valid-but-wrong / torn read).
+            std::int32_t count{ 0 };
+            if (!vmhook::os::safe_read(&count, array, sizeof(count)))
+            {
+                return false;
+            }
+            if (count <= 0 || count > 65535)
+            {
+                return false;
+            }
+
+            methods_data = reinterpret_cast<vmhook::hotspot::method**>(
+                reinterpret_cast<std::uint8_t*>(const_cast<void*>(array)) + 8);
+            method_count = count;
+            return true;
+        }
+
+        /*
+            @brief Fault-safe read of a single pointer-typed Method field by VMStruct name.
+            @details
+            Resolves "Method::<field_name>" via gHotSpotVMStructs (cached by the
+            caller's static) and reads the void* at that offset through
+            safe_read_pointer — never a raw `*ptr`.  Used by the deopt sweep to
+            read Method::_code / _i2i_entry / _adapter off a possibly-cold Method*
+            without faulting: an unreadable field returns nullptr and the caller
+            skips the method.  Returns false (and leaves out=nullptr) when the
+            field is unresolved, the Method* is invalid, or the slot is unreadable.
+
+            @param m       Method* to read from (re-validated here).
+            @param entry   Resolved VMStruct entry for the field (may be nullptr).
+            @param out     Out: the read pointer value, nullptr on any failure.
+            @return true iff the field offset was known AND the slot read succeeded.
+        */
+        static auto safe_method_pointer_field(vmhook::hotspot::method* const           m,
+                                              const vmhook::hotspot::vm_struct_entry_t* const entry,
+                                              void*&                                    out) noexcept
+            -> bool
+        {
+            out = nullptr;
+            if (!entry || !m || !vmhook::hotspot::is_valid_pointer(m))
+            {
+                return false;
+            }
+            void* value{ nullptr };
+            if (!vmhook::os::safe_read(&value,
+                                       reinterpret_cast<const std::uint8_t*>(m) + entry->offset,
+                                       sizeof(value)))
+            {
+                return false;
+            }
+            out = value;
+            return true;
         }
 
         /*
@@ -7266,43 +7459,108 @@ namespace vmhook
     {
         std::size_t deoptimized{ 0 };
         std::size_t skipped_no_c2i{ 0 };
+
+        // CRASH-SAFE BY CONSTRUCTION (the headline of this sweep's hardening):
+        // for_each_loaded_class hands us EVERY loaded klass — array klasses, and
+        // klasses that are cold / mid-GC-relocation / reached through a
+        // renamed-or-wrong VMStruct offset.  The Method* entries those klasses
+        // point at are likewise a COLD region (a method JITed once, then its
+        // nmethod swept, leaves a Method whose fields were not touched for a
+        // long time).  A raw `*ptr` / `ptr->field` of any such klass / Method /
+        // adapter pointer can PASS is_valid_pointer's range+alignment heuristic
+        // yet FAULT (EXCEPTION_ACCESS_VIOLATION) on the actual load.  The MSVC
+        // harness __try/__except contains that AV, but MinGW / clang-on-windows
+        // have NO SEH and the whole JVM goes down mid-suite.  So below EVERY
+        // klass / Method / array-element / adapter read goes through
+        // os::safe_read / safe_read_pointer (kernel-validated; returns
+        // null/false on an unreadable span instead of faulting), and every loop
+        // is bounded.  On ANY unreadable entry we SKIP it and continue — never
+        // fault.  The writes (set_*) are reached only after _code, _i2i_entry,
+        // and c2i were all safely read off the SAME Method*, which proves that
+        // Method's page is mapped before we write a single byte into it.
+
+        // Method field offsets resolved once (cached); read fault-safe below.
+        static const vmhook::hotspot::vm_struct_entry_t* const code_entry{
+            vmhook::hotspot::iterate_struct_entries("Method", "_code") };
+        static const vmhook::hotspot::vm_struct_entry_t* const i2i_entry_meta{
+            vmhook::hotspot::iterate_struct_entries("Method", "_i2i_entry") };
+        // Method::_adapter is exported via VMStructs only on JDK 8; on JDK 9+ it
+        // is absent and we fall back to the (in-object, memcpy-bounded) heuristic
+        // in get_adapter() — but only AFTER the fault-safe _code read has proven
+        // this Method's page is mapped, so the heuristic scan stays on the
+        // committed Method allocation and cannot fault either.
+        static const vmhook::hotspot::vm_struct_entry_t* const adapter_entry_meta{
+            vmhook::hotspot::iterate_struct_entries("Method", "_adapter") };
+
         vmhook::for_each_loaded_class(
             [&](const std::string& class_name, vmhook::hotspot::klass* const k)
             {
-                if (!k)
+                if (!k || !vmhook::hotspot::is_valid_pointer(k))
                 {
                     return;
                 }
-                const std::int32_t method_count{ k->get_methods_count() };
-                vmhook::hotspot::method** const methods{ k->get_methods_ptr() };
-                if (!methods || method_count <= 0)
+
+                // Fault-safe read of the Array<Method*> (pointer + clamped
+                // length).  A non-InstanceKlass (array klass) or a cold klass
+                // returns false here and we skip it WITHOUT any raw deref.
+                vmhook::hotspot::method** methods{ nullptr };
+                std::int32_t              method_count{ 0 };
+                if (!vmhook::hotspot::safe_klass_methods(k, methods, method_count))
                 {
                     return;
                 }
+
                 for (std::int32_t i{ 0 }; i < method_count; ++i)
                 {
-                    vmhook::hotspot::method* const m{ methods[i] };
+                    // Each Method* element lives in the (separately allocated,
+                    // possibly cold) array data — read it fault-safe, never
+                    // methods[i] raw.
+                    vmhook::hotspot::method* const m{ reinterpret_cast<vmhook::hotspot::method*>(
+                        const_cast<void*>(vmhook::hotspot::safe_read_pointer(&methods[i]))) };
                     if (!m || !vmhook::hotspot::is_valid_pointer(m))
                     {
                         continue;
                     }
-                    void* const code{ m->get_code() };
-                    if (!code || !vmhook::hotspot::is_valid_pointer(code))
+
+                    // _code: fault-safe.  This is both the "is it JIT-compiled?"
+                    // test AND the readability proof for m's page — every later
+                    // access to m below is safe because this succeeded.
+                    void* code{ nullptr };
+                    if (!vmhook::hotspot::safe_method_pointer_field(m, code_entry, code)
+                        || !code
+                        || !vmhook::hotspot::is_valid_pointer(code))
                     {
-                        continue;  // Not JIT-compiled — nothing to do.
+                        continue;  // Unreadable, unresolved, or not JIT-compiled.
                     }
                     if (!predicate(class_name, m))
                     {
                         continue;
                     }
 
-                    void* const i2i{ m->get_i2i_entry() };
-                    void* const adapter{ m->get_adapter() };
+                    // _i2i_entry: fault-safe.
+                    void* i2i{ nullptr };
+                    if (!vmhook::hotspot::safe_method_pointer_field(m, i2i_entry_meta, i2i)
+                        || !i2i)
+                    {
+                        ++skipped_no_c2i;
+                        continue;
+                    }
+
+                    // _adapter: prefer the fault-safe exported-offset read (JDK 8);
+                    // on JDK 9+ (no export) fall back to the heuristic get_adapter(),
+                    // safe now that _code proved m mapped.
+                    void* adapter{ nullptr };
+                    if (adapter_entry_meta)
+                    {
+                        (void)vmhook::hotspot::safe_method_pointer_field(m, adapter_entry_meta, adapter);
+                    }
+                    else
+                    {
+                        adapter = m->get_adapter();
+                    }
                     void* const c2i{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
 
-                    if (!i2i
-                        || !c2i
-                        || !vmhook::hotspot::is_valid_pointer(c2i))
+                    if (!c2i || !vmhook::hotspot::is_valid_pointer(c2i))
                     {
                         ++skipped_no_c2i;
                         continue;
@@ -7314,6 +7572,9 @@ namespace vmhook
                     //   3. Clear _code last so the entry-point writes are
                     //      visible before HotSpot's safepoint check sees
                     //      _code == nullptr.
+                    // Reached only after every read off m above succeeded, so m's
+                    // page is mapped; the setters additionally no-op when their
+                    // VMStruct offset is unresolved.
                     m->set_from_interpreted_entry(i2i);
                     m->set_from_compiled_entry(c2i);
                     m->set_code(nullptr);
@@ -7574,27 +7835,81 @@ namespace vmhook
             return 0;
         }
 
-        void* const collected_heap{ *reinterpret_cast<void**>(heap_static_entry->address) };
+        // CRASH-SAFETY (no-SEH toolchains): every structure-derived pointer read
+        // below goes through safe_read / safe_read_pointer (ReadProcessMemory /
+        // process_vm_readv), NOT a raw `*ptr`.  is_valid_pointer is only a
+        // range+alignment+poison heuristic; a cold/misresolved offset can produce
+        // an address that PASSES it yet points at an unmapped page, and a raw read
+        // there raises EXCEPTION_ACCESS_VIOLATION.  On MSVC-cl the harness __try
+        // contains that, but MinGW / clang-on-windows have no SEH and the process
+        // dies before the suite reports — so this scan must never fault by
+        // construction.  A failed kernel-validated read returns null/false and we
+        // bail cleanly (0 instances) rather than crash.
+        const void* const collected_heap{
+            vmhook::hotspot::safe_read_pointer(heap_static_entry->address) };
         if (!vmhook::hotspot::is_valid_pointer(collected_heap))
         {
             return 0;
         }
 
         auto* const memregion_addr{
-            reinterpret_cast<std::uint8_t*>(collected_heap) + reserved_offset->offset };
-        void* const heap_start{
-            *reinterpret_cast<void**>(memregion_addr + memregion_start_offset->offset) };
-        const std::size_t heap_word_count{
-            *reinterpret_cast<std::size_t*>(memregion_addr + memregion_word_size_offset->offset) };
-        const std::size_t heap_byte_size{ heap_word_count * sizeof(void*) };
+            reinterpret_cast<const std::uint8_t*>(collected_heap) + reserved_offset->offset };
 
-        if (!vmhook::hotspot::is_valid_pointer(heap_start) || heap_byte_size == 0)
+        // MemRegion::_start — fault-safe pointer read (a raw deref here is exactly
+        // the documented cold-fault site: collected_heap passes is_valid_pointer
+        // but the reserved-region offset may land on an unmapped/garbage word).
+        const void* const heap_start{
+            vmhook::hotspot::safe_read_pointer(memregion_addr + memregion_start_offset->offset) };
+
+        // MemRegion::_word_size — fault-safe scalar read.
+        std::size_t heap_word_count{ 0 };
+        if (!vmhook::os::safe_read(&heap_word_count,
+                                   memregion_addr + memregion_word_size_offset->offset,
+                                   sizeof(heap_word_count)))
         {
             return 0;
         }
 
-        auto* const scan_begin{ static_cast<std::uint8_t*>(heap_start) };
-        auto* const scan_end{ scan_begin + heap_byte_size };
+        if (!vmhook::hotspot::is_valid_pointer(heap_start) || heap_word_count == 0)
+        {
+            return 0;
+        }
+
+        // BOUND THE WALK (garbage size must not run off the region).  A
+        // mis-resolved _word_size can converge to anything; clamp it so the
+        // computed byte span (a) cannot overflow std::size_t in the *8 below and
+        // (b) cannot exceed the user-space address window.  Every chunk is still
+        // safe_read-gated, so an over-large-but-clamped span only costs (skipped)
+        // iterations — it can never fault — but the clamp keeps a pathological
+        // value from turning the scan into a multi-billion-iteration spin.  64 GiB
+        // generously exceeds any test heap while staying far inside size_t and the
+        // 47-bit user window.
+        constexpr std::size_t max_scan_bytes{ std::size_t{ 64 } << 30 };  // 64 GiB
+        constexpr std::size_t max_scan_words{ max_scan_bytes / sizeof(void*) };
+        if (heap_word_count > max_scan_words)
+        {
+            heap_word_count = max_scan_words;
+        }
+        const std::size_t heap_byte_size{ heap_word_count * sizeof(void*) };
+
+        auto* const scan_begin{
+            static_cast<const std::uint8_t*>(heap_start) };
+
+        // Compute scan_end without ever forming a pointer past the user-space
+        // ceiling (pointer overflow is UB and a wrapped end could make `p <
+        // scan_end` mis-behave).  Clamp the span to the room actually left below
+        // the ceiling, then the loop is naturally bounded by scan_end.
+        const std::uintptr_t begin_addr{ reinterpret_cast<std::uintptr_t>(scan_begin) };
+        const std::size_t room_to_ceiling{
+            (begin_addr < vmhook::os::user_address_ceiling)
+                ? static_cast<std::size_t>(vmhook::os::user_address_ceiling - begin_addr)
+                : std::size_t{ 0 } };
+        const std::size_t bounded_byte_size{ std::min<std::size_t>(heap_byte_size, room_to_ceiling) };
+        if (bounded_byte_size == 0)
+        {
+            return 0;
+        }
+        auto* const scan_end{ scan_begin + bounded_byte_size };
 
         // Chunked safe-read scan: copy 4 KiB at a time so each
         // candidate read stays in our process address space (no
@@ -7632,14 +7947,21 @@ namespace vmhook
 
                 // Hand the visitor a wrapper pointing at the real
                 // heap address (not the buffer copy).
+                //
+                // NOTE: we never raw-deref `p + off` here.  The wrapper stores it
+                // as its oop_t and the only reads off it happen later, inside the
+                // visitor, through object<T>::get_field -> field_proxy::get, which
+                // is itself is_valid_pointer-gated and safe_read_fast-guarded.  So
+                // a matched-but-stale/garbage header (the conservative scan admits
+                // those) can never fault a field read on any toolchain.
                 try
                 {
-                    // T's constructor accepts vmhook::oop_t, which is
-                    // an alias for void* defined further down in the
-                    // header — use void* directly so we don't need
-                    // the typedef in scope yet.
+                    // T's constructor accepts vmhook::oop_t (an alias for void*).
+                    // `p` is a const scan cursor; the oop the wrapper carries is
+                    // the live, mutable Java object address, so const_cast is the
+                    // intended bridge (the scan itself writes nothing through it).
                     auto wrapper{ std::unique_ptr<T>{
-                        new T{ static_cast<void*>(p + off) } } };
+                        new T{ const_cast<void*>(static_cast<const void*>(p + off)) } } };
                     visit(std::move(wrapper));
                 }
                 catch (const std::exception& ex)
@@ -8622,6 +8944,52 @@ namespace vmhook
 
         using clean_value_type = std::remove_cvref_t<value_type>;
 
+        // Fault-safe slot writer.  Every store this function makes goes through
+        // here so the dangerous part — writing THROUGH a pointer derived from a
+        // cold/relocated interpreter frame — is guarded exactly once.
+        //
+        // Why this is needed even though the index was already range-checked:
+        // `index <= max_jvm_locals` only bounds the *logical* slot number.  The
+        // actual address &locals[-slot] still depends on `locals`, which came
+        // from get_locals() walking the live frame.  On a frame that is cold or
+        // being GC-relocated the computed slot address can sit on a page that is
+        // not mapped/writable at this instant; a raw `locals[-slot] = …` then
+        // faults, and on the no-SEH toolchains (MinGW, clang-on-windows) that
+        // fault is uncontained and takes the whole JVM down mid-suite.  A bad
+        // WRITE is worse than a bad read — it corrupts whatever it lands on — so
+        // a writer must be even more careful than a reader.
+        //
+        // Guard order: (1) is_readable_pointer pre-filters the computed address
+        // (committed, mapped, not a guard page, in user range, aligned) — a cheap
+        // VirtualQuery/maps check that rejects the obviously-bad cases without a
+        // syscall per byte; (2) os::safe_write performs the store through the
+        // kernel (WriteProcessMemory / process_vm_writev), which is authoritative
+        // about writability and NEVER faults — it returns false (writing nothing)
+        // on a read-only or unmapped destination.  On any miss the slot is left
+        // exactly as it was and set_arg reports false, i.e. the argument is not
+        // mutated.  Stacks are RW, so on a healthy frame both checks pass and the
+        // value lands; only a genuinely bad frame is turned into a safe no-op.
+        auto write_slot = [&](const std::int32_t slot, void* const raw)
+            -> bool
+        {
+            void** const slot_addr{ locals - slot };
+            if (!vmhook::hotspot::is_readable_pointer(slot_addr))
+            {
+                VMHOOK_LOG("{} return_value::set_arg(index={}): computed slot address {} "
+                           "is not committed/writable - refusing to write (no-op).",
+                           vmhook::error_tag, index, static_cast<const void*>(slot_addr));
+                return false;
+            }
+            if (!vmhook::os::safe_write(slot_addr, &raw, sizeof(raw)))
+            {
+                VMHOOK_LOG("{} return_value::set_arg(index={}): fault-safe write to slot "
+                           "address {} failed - refusing to write (no-op).",
+                           vmhook::error_tag, index, static_cast<const void*>(slot_addr));
+                return false;
+            }
+            return true;
+        };
+
         auto store_oop = [&](void* const oop)
             -> bool
         {
@@ -8638,8 +9006,7 @@ namespace vmhook
             // wrote a narrow/compressed pointer into a wide slot, corrupting the
             // local.  Always store the wide pointer; storing nullptr wide is the
             // correct representation of a null local too.
-            locals[-index] = oop;
-            return true;
+            return write_slot(index, oop);
         };
 
         if constexpr (vmhook::detail::is_unique_object_ptr<clean_value_type>::value)
@@ -8709,15 +9076,17 @@ namespace vmhook
             // and [index+1]; the interpreter reads the 64-bit value from the lower
             // slot locals[-(index+1)] (LOCALS_LONG / LOCALS_DOUBLE), so a long/double
             // arg injection must land there.  One-word primitives go to locals[-index].
+            // write_slot validates the computed address and stores via the
+            // fault-safe path, so a cold/relocated frame becomes a safe no-op
+            // (returns false) rather than a corrupting raw write.
             if constexpr (sizeof(clean_value_type) > sizeof(std::int32_t))
             {
-                locals[-(index + 1)] = raw;
+                return write_slot(index + 1, raw);
             }
             else
             {
-                locals[-index] = raw;
+                return write_slot(index, raw);
             }
-            return true;
         }
         else
         {
