@@ -11,7 +11,7 @@ import vmhook.Harness;
  *
  * i.e. method_proxy::call() that returns a Java reference type ('L' / '[') and
  * whose value_t implicitly converts to a std::unique_ptr&lt;wrapper&gt;.  The native
- * module asserts the full contract:
+ * module asserts the full contract on EVERY object-return SHAPE:
  *
  *   - a NON-NULL object return yields a USABLE wrapper: the native side reads a
  *     field through it (Child.tag / Child.label) AND calls a method through it
@@ -20,20 +20,35 @@ import vmhook.Harness;
  *   - a NULL object return yields a NULL unique_ptr (monostate -&gt; nullptr), on
  *     the SAME method that can also return non-null (maybeChild(false)) and on a
  *     method that is unconditionally null (nullChild()),
+ *   - a FRESHLY-ALLOCATED object each call yields DISTINCT identities across
+ *     calls (makeChild() new's a Child every time -&gt; two calls, two OOPs),
  *   - method-vs-field PARITY: the SAME Child reachable via the `child` field
  *     (field_proxy -&gt; unique_ptr) and via getChild() (method_proxy -&gt; unique_ptr)
  *     decode to the SAME heap object — identityHashCode is published so the
  *     native side can cross-check the field read against the method return,
  *   - SELF identity: self() returns `this`, so the returned wrapper's instance
  *     must equal the receiver's instance,
+ *   - POLYMORPHIC return: makeAnimal() is declared to return the base type
+ *     Animal but actually returns a Dog subclass — the decoded wrapper must see
+ *     the RUNTIME klass (Dog), and a virtual method (speak()) dispatches to the
+ *     override; getAnimalSound() returns the Dog's String so the native side can
+ *     confirm the override fired,
+ *   - BOXED return: boxedInt() returns Integer.valueOf(N) typed as Object — a
+ *     bootstrap-class reference; the wrapper is usable and intValue() dispatches
+ *     through it,
  *   - STATIC object returns: staticMakeChild() / staticNullChild() drive the
  *     static-call path of method_proxy::call() returning an object,
- *   - ARRAY reference return: childArray() returns Child[] ('[' descriptor),
- *     the other reference-return branch of the value_t,
+ *   - ARRAY reference returns: childArray() returns Child[] ('[L' descriptor),
+ *     intArray() returns int[] ('[I' descriptor), objectArray() returns Object[]
+ *     ('[Ljava/lang/Object;') — the array-reference branches of the value_t; the
+ *     native side decodes the array oop and walks its length + elements,
+ *   - CHAINED call: getChild() returns a Child, and Child.makeSibling() returns
+ *     ANOTHER Child — so the unique_ptr&lt;wrapper&gt; from the first call is itself
+ *     used as the receiver of a second object-returning call,
  *   - a String-returning method (childLabel()) — the eager-decode reference
- *     return that lands in the std::string variant alternative, NOT the
- *     uint32 OOP alternative; included so the module proves the value_t routes
- *     String vs Object to different alternatives.
+ *     return that lands in the std::string variant alternative, NOT the uint32
+ *     OOP alternative; included so the module proves the value_t routes String
+ *     vs Object to different alternatives.
  *
  * Every object the native side inspects is published with a deterministic field
  * value AND its System.identityHashCode so the C++ checks are exact, never
@@ -62,9 +77,10 @@ public final class MethodObject
     // ── The child object the wrappers walk ─────────────────────────────────
     /**
      * Small standalone reference type the native side wraps.  Has a primitive
-     * field (tag), a String field (label), and a method (getTag) so the native
-     * side can prove a method-returned wrapper is fully usable (field read +
-     * method call through it).
+     * field (tag), a String field (label), and methods (getTag, makeSibling) so
+     * the native side can prove a method-returned wrapper is fully usable (field
+     * read + method call through it) AND chain a second object-returning call
+     * off the returned wrapper.
      */
     public static final class Child
     {
@@ -86,6 +102,38 @@ public final class MethodObject
         {
             return this.label;
         }
+
+        /**
+         * Returns ANOTHER freshly-allocated Child — the chained-call target.
+         * The native side calls this THROUGH a method-returned Child wrapper,
+         * so a unique_ptr&lt;Child&gt; from one call() is the receiver of the next.
+         */
+        public Child makeSibling()
+        {
+            return new Child(SIBLING_TAG, SIBLING_LABEL);
+        }
+    }
+
+    // ── Polymorphic return hierarchy ────────────────────────────────────────
+    /** Base type a method is DECLARED to return. */
+    public static class Animal
+    {
+        public String speak()
+        {
+            return "generic";
+        }
+    }
+
+    /** Concrete subclass actually returned — proves the wrapper sees runtime type. */
+    public static final class Dog extends Animal
+    {
+        public int breedId = DOG_BREED_ID;
+
+        @Override
+        public String speak()
+        {
+            return DOG_SOUND;
+        }
     }
 
     // ── Deterministic constants the native side mirrors ────────────────────
@@ -104,13 +152,31 @@ public final class MethodObject
     /** label of the static Child. */
     public static final String STATIC_LABEL = "static-child";
 
+    /** tag/label of the chained Child returned by Child.makeSibling(). */
+    public static final int SIBLING_TAG = 0x51B;          // 1307
+    public static final String SIBLING_LABEL = "sibling-of-child";
+
+    /** breedId of the polymorphic Dog, and the sound its speak() override returns. */
+    public static final int DOG_BREED_ID = 0x0D06;        // 3334
+    public static final String DOG_SOUND = "woof";
+
+    /** value boxed by boxedInt(). */
+    public static final int BOXED_INT_VALUE = 0x07E5;     // 2021
+
     /** tags of the three Child elements in childArray(), in order. */
     public static final int ARRAY_TAG_0 = 100;
     public static final int ARRAY_TAG_1 = 200;
     public static final int ARRAY_TAG_2 = 300;
 
-    /** Length of childArray(). */
+    /** Length of childArray() / objectArray(). */
     public static final int ARRAY_LEN = 3;
+
+    /** Elements of intArray(), in order, and its length. */
+    public static final int INT_ARRAY_0 = 11;
+    public static final int INT_ARRAY_1 = 22;
+    public static final int INT_ARRAY_2 = 33;
+    public static final int INT_ARRAY_3 = 44;
+    public static final int INT_ARRAY_LEN = 4;
 
     /** Return value of childLabel() — a String, the eager-decode reference. */
     public static final String LABEL_STRING = "label-via-method";
@@ -133,8 +199,14 @@ public final class MethodObject
     /** identityHashCode of the Child staticMakeChild() returns. */
     public static volatile int staticChildIdentity;
 
+    /** identityHashCode of the Animal (a Dog) makeAnimal() returns. */
+    public static volatile int animalIdentity;
+
     /** The singleton static Child, so its identity is stable across calls. */
     private static final Child STATIC_CHILD = new Child(STATIC_TAG, STATIC_LABEL);
+
+    /** The singleton Dog makeAnimal() returns, so its identity is stable. */
+    private static final Dog ANIMAL = new Dog();
 
     /** The fixed Child[] childArray() returns, so element identities are stable. */
     private final Child[] childArray =
@@ -142,6 +214,17 @@ public final class MethodObject
         new Child(ARRAY_TAG_0, "a0"),
         new Child(ARRAY_TAG_1, "a1"),
         new Child(ARRAY_TAG_2, "a2"),
+    };
+
+    /** The fixed int[] intArray() returns. */
+    private final int[] intArray = { INT_ARRAY_0, INT_ARRAY_1, INT_ARRAY_2, INT_ARRAY_3 };
+
+    /** The fixed Object[] objectArray() returns (holds the same kind of Children). */
+    private final Object[] objectArray = new Object[]
+    {
+        new Child(ARRAY_TAG_0, "o0"),
+        new Child(ARRAY_TAG_1, "o1"),
+        new Child(ARRAY_TAG_2, "o2"),
     };
 
     // ── Object-returning probe targets ─────────────────────────────────────
@@ -153,7 +236,9 @@ public final class MethodObject
         return nonce + 1;
     }
 
-    /** Returns a freshly-allocated non-null Child with a known tag/label. */
+    /** Returns a freshly-allocated non-null Child with a known tag/label.
+     *  Each call new's a DISTINCT object so the native side can assert two
+     *  calls yield two different identities. */
     public Child makeChild()
     {
         return new Child(CHILD_TAG, CHILD_LABEL);
@@ -195,10 +280,45 @@ public final class MethodObject
         return null;
     }
 
-    /** Array reference return ('[' descriptor) — the other reference branch. */
+    /**
+     * Polymorphic return: declared Animal, actually a Dog.  The native wrapper
+     * registered for Dog must decode the RUNTIME type and dispatch speak() to
+     * the Dog override.  Returns the stable ANIMAL singleton (identity published).
+     */
+    public Animal makeAnimal()
+    {
+        return ANIMAL;
+    }
+
+    /** The polymorphic Dog's overridden speak() result, for cross-checking the
+     *  virtual dispatch the native side performs through its decoded wrapper. */
+    public String getAnimalSound()
+    {
+        return ANIMAL.speak();
+    }
+
+    /** Boxed-type Object return: Integer.valueOf(N) typed as Object. */
+    public Object boxedInt()
+    {
+        return Integer.valueOf(BOXED_INT_VALUE);
+    }
+
+    /** Array reference return ('[L' descriptor) — Child[]. */
     public Child[] childArray()
     {
         return this.childArray;
+    }
+
+    /** Primitive array reference return ('[I' descriptor) — int[]. */
+    public int[] intArray()
+    {
+        return this.intArray;
+    }
+
+    /** Object array reference return ('[Ljava/lang/Object;' descriptor). */
+    public Object[] objectArray()
+    {
+        return this.objectArray;
     }
 
     /** String reference return — lands in the std::string variant alternative. */
@@ -228,6 +348,7 @@ public final class MethodObject
                 MethodObject.selfIdentity = System.identityHashCode(self);
                 MethodObject.childIdentity = System.identityHashCode(self.child);
                 MethodObject.staticChildIdentity = System.identityHashCode(STATIC_CHILD);
+                MethodObject.animalIdentity = System.identityHashCode(ANIMAL);
 
                 // Calling tick() through normal bytecode dispatch is what makes
                 // the native interpreter hook fire; the detour then performs the

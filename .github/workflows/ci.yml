@@ -223,13 +223,6 @@ jobs:
         # and on the no-SEH legs for every OTHER JDK (8/21/24/25/26, which the
         # get_method fix made green / rare-flake-rerun).  The harness also contains
         # SUITE-thread AVs via a pure-Win32 VEH + [INFO] (tests/jvm/harness.cpp).
-        exclude:
-          - compiler: clang
-            java: "11"
-          - compiler: clang
-            java: "17"
-          - compiler: mingw
-            java: "17"
 
     steps:
       - uses: actions/checkout@v4

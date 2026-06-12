@@ -5718,7 +5718,22 @@ namespace vmhook
                         }
                         const std::string class_name{ descriptor.substr(pos + 1, semi - pos - 1) };
 
+                        // get_locals() validated the locals BASE pointer, but
+                        // locals[-slot_index] is a separate deref at a different
+                        // address that can sit on a cold/uncommitted page on a
+                        // relocated frame; on Windows read it through os::safe_read
+                        // so it yields a zeroed (null-oop) slot instead of faulting
+                        // the JVM uncontained on the no-SEH legs.  POSIX keeps the
+                        // raw read (never faulted there; see extract_frame_arg).
+#if defined(_WIN32)
+                        void* raw_value{ nullptr };
+                        if (!vmhook::os::safe_read(&raw_value, &locals[-slot_index], sizeof(raw_value)))
+                        {
+                            raw_value = nullptr;
+                        }
+#else
                         void* raw_value{ locals[-slot_index] };
+#endif
                         void* decoded{ nullptr };
                         if (raw_value)
                         {
@@ -5817,7 +5832,27 @@ namespace vmhook
                 }
 
                 // locals[-index]: arguments are stored in descending slot order.
-                void* raw_value{ locals[-index] };
+                // get_locals() validated the locals BASE pointer, but the slot at
+                // locals[-index] is a separate deref at a different address that
+                // can be on a cold/uncommitted page on a relocated frame.  Read it
+                // through os::safe_read on Windows (zeroed slot on a bad page,
+                // never faults the no-SEH legs); POSIX keeps the raw read.  Same
+                // discipline as detail::extract_frame_arg.
+                const auto read_slot = [locals](const std::int32_t slot_index) noexcept -> void*
+                {
+#if defined(_WIN32)
+                    void* slot_value{ nullptr };
+                    if (!vmhook::os::safe_read(&slot_value, &locals[-slot_index], sizeof(slot_value)))
+                    {
+                        return nullptr;
+                    }
+                    return slot_value;
+#else
+                    return locals[-slot_index];
+#endif
+                };
+
+                void* raw_value{ read_slot(index) };
 
                 if constexpr (std::is_pointer_v<argument_type>)
                 {
@@ -5852,7 +5887,7 @@ namespace vmhook
                     void* slot_value{ raw_value };
                     if constexpr (sizeof(argument_type) > sizeof(std::int32_t))
                     {
-                        slot_value = locals[-(index + 1)];
+                        slot_value = read_slot(index + 1);
                     }
                     argument_type result{};
                     std::memcpy(&result, &slot_value, sizeof(argument_type));
@@ -8638,7 +8673,49 @@ namespace vmhook
                 return base_t{};
             }
 
-            void* const raw_value{ locals[-index] };
+            // Read the argument slot.  frame->get_locals() validated and
+            // os::safe_read-returned the locals BASE pointer, but locals[-index]
+            // is a SEPARATE dereference at a DIFFERENT address (locals - index*8):
+            // on a cold / relocated / about-to-be-GC-walked interpreter frame the
+            // base slot can be mapped while the argument slot lands on a page that
+            // is not actually committed at this instant.  This is the same class
+            // of cold deref as frame::get_method()'s Method* slot — and it is the
+            // genuinely-cold dispatch-time read that runs for EVERY hooked method
+            // whose detour takes a typed argument: extract_frame_arg() is invoked
+            // by the hook() wrapper_detour BEFORE the user lambda body, from inside
+            // seh_invoke_detour, on the Java/detour thread.  A raw load here then
+            // FAULTS, and on the no-SEH toolchains (MinGW / clang-on-windows) that
+            // hardware AV is uncontained — seh_invoke_detour's catch(...) on those
+            // legs only catches C++ exceptions, not a hardware fault — so it kills
+            // the JVM.  Read it through os::safe_read (kernel-validated, never
+            // faults); on a bad frame this yields a zeroed slot, which the decode
+            // below treats as a null oop / zero primitive, i.e. the detour sees a
+            // default-constructed arg rather than crashing the process.
+            //
+            // Windows-only, exactly like frame::get_method(): on POSIX the raw
+            // read never faulted on this path (a stray AV is contained by the
+            // JVM's own signal handling) and gating the read regressed the
+            // return_value::stack_trace multi-frame walk (process_vm_readv changed
+            // the result on linux·gcc·java21+); keep the direct read there.  For a
+            // normal mapped frame the bytes are byte-identical to the old raw load,
+            // so the warm path is unchanged on both platforms.
+            const auto read_slot = [locals](const std::int32_t slot_index) noexcept -> void*
+            {
+#if defined(_WIN32)
+                void* slot_value{ nullptr };
+                if (!vmhook::os::safe_read(&slot_value,
+                                           &locals[-slot_index],
+                                           sizeof(slot_value)))
+                {
+                    return nullptr;
+                }
+                return slot_value;
+#else
+                return locals[-slot_index];
+#endif
+            };
+
+            void* const raw_value{ read_slot(index) };
 
             // Decode a compressed OOP (32-bit narrow value) to a full 64-bit pointer.
             auto decode_oop = [](void* raw_value)
@@ -8691,10 +8768,13 @@ namespace vmhook
                 // [index] and [index+1]; HotSpot stores the 64-bit value at the
                 // lower slot locals[-(index+1)] (LOCALS_LONG / LOCALS_DOUBLE).
                 // One-word primitives (≤4 bytes) live at locals[-index] (raw_value).
+                // Read the high slot through the same fault-safe path as raw_value
+                // (Windows-gated os::safe_read) — it is a distinct address from the
+                // already-read slot and can land on its own cold page.
                 void* slot_value{ raw_value };
                 if constexpr (sizeof(base_t) > sizeof(std::int32_t))
                 {
-                    slot_value = locals[-(index + 1)];
+                    slot_value = read_slot(index + 1);
                 }
                 base_t result{};
                 std::memcpy(&result, &slot_value, sizeof(base_t));
@@ -8810,12 +8890,29 @@ namespace vmhook
         // Saved-rbp chains only work when the caller is *also* an
         // interpreted frame; if the caller is compiled or native, the
         // chain breaks and pointer checks below will reject the read.
+        //
+        // The two cross-frame derefs below ([caller_rbp_slot+0] for the saved
+        // rbp, [caller_rbp-24] for the caller's Method*) reach a frame OTHER than
+        // the intercepted one; on a cold / partially-unwound stack that target
+        // page can be in-range+aligned yet not committed, so a raw load would
+        // fault and — on the no-SEH toolchains (MinGW / clang-on-windows) — tear
+        // the JVM down uncontained.  Read them through safe_read_pointer
+        // (kernel-validated, returns null on a bad page) on Windows, exactly like
+        // frame::get_method().  POSIX keeps the raw read: it never faulted there
+        // (a stray AV is contained by the JVM's signal handling) and gating these
+        // reads regressed the sibling stack_trace walk under process_vm_readv on
+        // linux·gcc·java21+.  On a mapped frame the value is byte-identical.
         void* const caller_rbp_slot{ this->stack_frame };
         if (!vmhook::hotspot::is_valid_pointer(caller_rbp_slot))
         {
             return empty;
         }
+#if defined(_WIN32)
+        void* const caller_rbp{
+            const_cast<void*>(vmhook::hotspot::safe_read_pointer(caller_rbp_slot)) };
+#else
         void* const caller_rbp{ *reinterpret_cast<void* const*>(caller_rbp_slot) };
+#endif
         if (!vmhook::hotspot::is_valid_pointer(caller_rbp))
         {
             return empty;
@@ -8830,8 +8927,13 @@ namespace vmhook
         {
             return empty;
         }
+#if defined(_WIN32)
+        auto* const caller_method{ reinterpret_cast<vmhook::hotspot::method*>(
+            const_cast<void*>(vmhook::hotspot::safe_read_pointer(caller_method_slot))) };
+#else
         auto* const caller_method{
             *reinterpret_cast<vmhook::hotspot::method* const*>(caller_method_slot) };
+#endif
         if (!caller_method || !vmhook::hotspot::is_valid_pointer(caller_method))
         {
             return empty;
@@ -8854,6 +8956,10 @@ namespace vmhook
         // Best-effort class-name lookup.  Method -> ConstMethod ->
         // ConstantPool holds a back-pointer to the owning Klass via
         // _pool_holder; we read it through the cached VMStruct offset.
+        // The _pool_holder slot ([cp + offset]) is a distinct address from the
+        // already-validated `cp`, so on Windows read it through safe_read_pointer
+        // (matching the sibling stack_trace walk's discipline); POSIX keeps the
+        // raw read for the same stack_trace-regression reason as above.
         if (const auto* const const_method{ caller_method->get_const_method() })
         {
             if (auto* const cp{ const_method->get_constants() })
@@ -8862,8 +8968,15 @@ namespace vmhook
                     vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
                 if (pool_holder_entry)
                 {
+                    const void* const pool_holder_slot{
+                        reinterpret_cast<const std::uint8_t*>(cp) + pool_holder_entry->offset };
+#if defined(_WIN32)
+                    auto* const klass{ reinterpret_cast<vmhook::hotspot::klass*>(
+                        const_cast<void*>(vmhook::hotspot::safe_read_pointer(pool_holder_slot))) };
+#else
                     auto* const klass{ *reinterpret_cast<vmhook::hotspot::klass* const*>(
-                        reinterpret_cast<const std::uint8_t*>(cp) + pool_holder_entry->offset) };
+                        pool_holder_slot) };
+#endif
                     if (klass && vmhook::hotspot::is_valid_pointer(klass))
                     {
                         if (auto* const name_symbol{ klass->get_name() })
@@ -8895,7 +9008,15 @@ namespace vmhook
         // rbp from [current_rbp+0], then their Method* from
         // [caller_rbp - 24].  Every dereference is gated by
         // is_valid_pointer so a non-interpreter frame produces an early
-        // return rather than a crash.
+        // return rather than a crash.  On Windows the two cross-frame reads
+        // additionally go through safe_read_pointer (kernel-validated) so a
+        // saved-rbp that passes the range/monotonicity gates yet points at an
+        // uncommitted page yields null and breaks the walk instead of faulting
+        // the JVM uncontained on the no-SEH (MinGW / clang-windows) legs.  POSIX
+        // keeps the raw read: routing this multi-frame walk through
+        // process_vm_readv changed its result (stk_* regressed on
+        // linux·gcc·java21+), and a stray AV here is contained by the JVM's own
+        // signal handling.  Byte-identical on a mapped frame.
         void* current_rbp_slot{ this->stack_frame };
         frames.reserve(8);
 
@@ -8908,7 +9029,12 @@ namespace vmhook
             {
                 break;
             }
+#if defined(_WIN32)
+            void* const caller_rbp{
+                const_cast<void*>(vmhook::hotspot::safe_read_pointer(current_rbp_slot)) };
+#else
             void* const caller_rbp{ *reinterpret_cast<void* const*>(current_rbp_slot) };
+#endif
             if (!vmhook::hotspot::is_valid_pointer(caller_rbp))
             {
                 break;
@@ -8940,8 +9066,13 @@ namespace vmhook
             {
                 break;
             }
+#if defined(_WIN32)
+            auto* const caller_method{ reinterpret_cast<vmhook::hotspot::method*>(
+                const_cast<void*>(vmhook::hotspot::safe_read_pointer(caller_method_slot))) };
+#else
             auto* const caller_method{
                 *reinterpret_cast<vmhook::hotspot::method* const*>(caller_method_slot) };
+#endif
             if (!caller_method || !vmhook::hotspot::is_valid_pointer(caller_method))
             {
                 break;
@@ -8987,8 +9118,17 @@ namespace vmhook
                     reinterpret_cast<const std::uint8_t*>(constants) + pool_holder_entry->offset };
                 if (vmhook::hotspot::is_valid_pointer(slot))
                 {
+                    // [constants + offset] is a distinct address from the
+                    // already-validated `constants`; read it through
+                    // safe_read_pointer on Windows so an uncommitted page yields
+                    // null (no class name) instead of faulting, raw on POSIX.
+#if defined(_WIN32)
+                    auto* const klass{ reinterpret_cast<vmhook::hotspot::klass*>(
+                        const_cast<void*>(vmhook::hotspot::safe_read_pointer(slot))) };
+#else
                     auto* const klass{
                         *reinterpret_cast<vmhook::hotspot::klass* const*>(slot) };
+#endif
                     if (klass && vmhook::hotspot::is_valid_pointer(klass))
                     {
                         if (auto* const name_symbol{ klass->get_name() };
