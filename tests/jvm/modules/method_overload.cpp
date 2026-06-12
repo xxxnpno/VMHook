@@ -145,6 +145,15 @@ namespace
         // single-signature method (no ambiguity) + a deliberate non-matching arg.
         auto only_int(std::int32_t a) -> std::int32_t { return get_method("onlyInt")->call(a); }
         auto only_int_mismatch_double(double a) -> std::int32_t { return get_method("onlyInt")->call(a); }
+        // single-signature method called with the WRONG ARITY: onlyInt has only
+        // (I)I.  call() with zero args finds no (())I overload, falls back to
+        // this->method ((I)I), and dispatches it reading a zero-initialised slot.
+        // Primitive-only -> memory-safe; we record the int, never assert a value.
+        auto only_int_noargs() -> std::int32_t { return get_method("onlyInt")->call(); }
+        // (The REFERENCE-type no-match probe — onlyRef(Integer) called with a
+        // java/lang/Double-registered wrapper — is issued inline in run_all(),
+        // where the java_double wrapper type is complete, mirroring how the
+        // registered pick(Object)/pick(Integer) wrapper calls are issued there.)
         // get_instance() is inherited public from object_base (vmhook.hpp:13491).
     };
 
@@ -158,6 +167,38 @@ namespace
     public:
         explicit java_object(vmhook::oop_t instance) noexcept
             : vmhook::object<java_object>{ instance }
+        {
+        }
+    };
+
+    // A wrapper registered as java/lang/Integer so that a wrapper ARG resolves
+    // DETERMINISTICALLY to pick(Integer) ((Ljava/lang/Integer;)I) — a SECOND
+    // reference overload distinct from both pick(String) (Ljava/lang/String;) and
+    // pick(Object) (Ljava/lang/Object;).  argument_matches_descriptor's L...; branch
+    // compares the FULL class name inside 'L...;', so this matches ONLY
+    // Ljava/lang/Integer;, proving the resolver tells three reference overloads apart
+    // by their declared class, not merely "is a reference".  The oop we carry is the
+    // fixture singleton (any valid oop): pick(Integer)'s body never dereferences it.
+    class java_integer : public vmhook::object<java_integer>
+    {
+    public:
+        explicit java_integer(vmhook::oop_t instance) noexcept
+            : vmhook::object<java_integer>{ instance }
+        {
+        }
+    };
+
+    // A wrapper registered as java/lang/Double.  Used ONLY for the reference-typed
+    // NO-MATCH probe: its descriptor Ljava/lang/Double; matches no overload of
+    // onlyRef (whose sole signature is (Ljava/lang/Integer;)I), so the resolver
+    // finds nothing and falls back to onlyRef's single Method — a graceful,
+    // well-defined reference no-match.  onlyRef's body ignores the arg, so handing
+    // it a MethodOverload oop in an Integer-typed slot is memory-safe (no deref).
+    class java_double : public vmhook::object<java_double>
+    {
+    public:
+        explicit java_double(vmhook::oop_t instance) noexcept
+            : vmhook::object<java_double>{ instance }
         {
         }
     };
@@ -203,13 +244,17 @@ namespace
     constexpr std::int32_t RET_CHAR        = 1008;
     constexpr std::int32_t RET_STRING      = 1009;
     constexpr std::int32_t RET_OBJECT      = 1010;
+    constexpr std::int32_t RET_INTEGER     = 1011;  // pick(Integer)    -> (Ljava/lang/Integer;)I
     constexpr std::int32_t RET_INT_INT     = 1021;
     constexpr std::int32_t RET_INT_INT_INT = 1022;
     constexpr std::int32_t RET_INT_LONG    = 1023;
     constexpr std::int32_t RET_LONG_INT    = 1024;
     constexpr std::int32_t RET_INT_STRING  = 1025;
+    constexpr std::int32_t RET_STRING_INT  = 1026;  // pick(String,int) -> (Ljava/lang/String;I)I
+    constexpr std::int32_t RET_LONG_DOUBLE = 1027;  // pick(long,double)-> (JD)I  (two wide slots)
     constexpr std::int32_t RET_INT_ARRAY   = 1031;  // pick(int[])  -> ([I)I
     constexpr std::int32_t RET_LONG_ARRAY  = 1032;  // pick(long[]) -> ([J)I
+    constexpr std::int32_t RET_ONLY_REF    = 8500;  // onlyRef(Integer) sole-overload fallback sentinel
     constexpr std::int32_t SBIAS           = 100;
 
     constexpr std::int64_t k_unset = static_cast<std::int64_t>(0xDEADBEEFCAFEF00Dull);
@@ -238,6 +283,7 @@ namespace
     std::atomic<std::int64_t> g_r_char{ k_unset };
     std::atomic<std::int64_t> g_r_string{ k_unset };
     std::atomic<std::int64_t> g_r_object_registered{ k_unset };
+    std::atomic<std::int64_t> g_r_integer_registered{ k_unset };  // pick(Integer) via java/lang/Integer wrapper
 
     // boundary-value re-resolutions (same overload, extreme inputs)
     std::atomic<std::int64_t> g_r_int_min{ k_unset };
@@ -272,6 +318,14 @@ namespace
     std::atomic<std::int64_t> g_int_long_b{ k_unset };
     std::atomic<std::int64_t> g_long_int_a{ k_unset };
     std::atomic<std::int64_t> g_long_int_b{ k_unset };
+    // reference-first two-arg order: pick(String,int) — distinct from pick(int,String)
+    std::atomic<std::int64_t> g_r_string_int{ k_unset };
+    std::atomic<std::int64_t> g_string_int_a{ k_unset };       // echoed int (slot1)
+    std::atomic<bool>         g_string_int_str_ok{ false };    // echoed String (slot0)
+    // two consecutive wide params: pick(long,double) — distinct from (int,long)/(long,int)
+    std::atomic<std::int64_t> g_r_long_double{ k_unset };
+    std::atomic<std::int64_t> g_long_double_a{ k_unset };      // echoed long (slot0, 2 slots)
+    std::atomic<std::int64_t> g_long_double_b_is_e{ -1 };      // echoed double (slot2) == 2.5 ?
 
     // explicit-signature fast-path resolution (bypasses hierarchy walk)
     std::atomic<std::int64_t> g_sig_int{ k_unset };
@@ -283,6 +337,10 @@ namespace
     // single-signature method + non-matching-arg fallback
     std::atomic<std::int64_t> g_only_int_match{ k_unset };
     std::atomic<std::int64_t> g_only_int_mismatch{ k_unset };
+    std::atomic<std::int64_t> g_only_int_noargs{ k_unset };       // wrong-ARITY no-match (primitive, safe)
+    std::atomic<int>          g_only_int_noargs_attempted{ 0 };
+    std::atomic<std::int64_t> g_only_ref_mismatch{ k_unset };     // reference no-match -> sole-overload fallback
+    std::atomic<int>          g_only_ref_mismatch_attempted{ 0 };
 
     // ── STATIC name-only overload resolution (fix #7 RESTORED this — hard-asserted) ─
     std::atomic<std::int64_t> g_s_int{ k_unset };
@@ -294,6 +352,8 @@ namespace
     std::atomic<std::int64_t> g_s_short{ k_unset };
     std::atomic<std::int64_t> g_s_char{ k_unset };
     std::atomic<std::int64_t> g_s_string{ k_unset };
+    std::atomic<std::int64_t> g_s_integer{ k_unset };  // spick(Integer) by name (java/lang/Integer wrapper)
+    std::atomic<std::int64_t> g_s_long_double{ k_unset };  // spick(long,double) by name (JD)I
     std::atomic<std::int64_t> g_s_arity2{ k_unset };   // spick(int,int) by name
     // static argument echoes (right value -> right static slot)
     std::atomic<std::int64_t> g_s_echo_int{ k_unset };
@@ -351,6 +411,15 @@ namespace
             g_r_object_registered.store(s.get_method("pick")->call(std::move(obj)));
         }
 
+        // registered wrapper (java/lang/Integer) -> Ljava/lang/Integer; (pick(Integer)).
+        // A THIRD reference disambiguation: must NOT collapse to pick(Object) or
+        // pick(String).  The carried oop is the fixture singleton; pick(Integer)'s
+        // body never dereferences it.
+        {
+            auto integer{ std::make_unique<java_integer>(s.get_instance()) };
+            g_r_integer_registered.store(s.get_method("pick")->call(std::move(integer)));
+        }
+
         // argument-value echoes: prove the value landed in the right slot.
         g_echo_int.store(overload_fixture::last_int());
         g_echo_long.store(overload_fixture::last_long());
@@ -388,6 +457,21 @@ namespace
         g_long_int_b.store(overload_fixture::last_arg2b());
         g_r_int_string.store(s.pick2(static_cast<std::int32_t>(5), std::string{ "two" }));
 
+        // pick(String,int) — the reference-FIRST mirror.  Proves slot0's reference
+        // descriptor is matched (not just primitives) and that order distinguishes
+        // it from pick(int,String).  Echo both slots: int -> lastArg2A, String ->
+        // lastStringArg.  Read the echoes IMMEDIATELY (later calls reuse the slots).
+        g_r_string_int.store(s.pick2(std::string{ "lead" }, static_cast<std::int32_t>(13)));
+        g_string_int_a.store(overload_fixture::last_arg2a());
+        g_string_int_str_ok.store(overload_fixture::last_string() == std::string{ "lead" });
+
+        // pick(long,double) — two CONSECUTIVE wide (two-slot) params "(JD)I".  The
+        // resolver must select this over pick(int,long)/(long,int).  Echo the long
+        // (-> lastArg2B) and the double (-> lastDoubleArg); read immediately.
+        g_r_long_double.store(s.pick2(static_cast<std::int64_t>(123456789012345LL), 2.5));
+        g_long_double_a.store(overload_fixture::last_arg2b());
+        g_long_double_b_is_e.store(overload_fixture::last_double() == 2.5 ? 1 : 0);
+
         // ===== explicit-signature fast path (no hierarchy walk) ============
         // get_method("pick","(I)I") -> signature_text already matches int args,
         // so resolve_compatible_method returns this->method immediately.  Must
@@ -405,6 +489,22 @@ namespace
         // a double arg against an int slot is itself undefined — we just record
         // whatever int comes back (documents the fallback, never asserts a value).
         g_only_int_mismatch.store(s.only_int_mismatch_double(99.0));
+        // Wrong-ARITY no-match: onlyInt() with ZERO args.  No (())I overload, so
+        // resolution falls back to (I)I; the interpreter reads a zero-initialised
+        // slot.  Primitive-only -> memory-safe.  Record the int; assert SURVIVAL
+        // only (the contract is "no crash on a no-match", not a specific value).
+        g_only_int_noargs.store(s.only_int_noargs());
+        g_only_int_noargs_attempted.store(1);
+        // Reference-typed no-match: onlyRef(Integer) called with a wrapper
+        // registered as java/lang/Double.  Ljava/lang/Double; matches no onlyRef
+        // overload, so resolution falls back to the SOLE onlyRef(Integer) and
+        // dispatches it -> RET_ONLY_REF (deterministic).  onlyRef ignores its arg,
+        // so passing a MethodOverload oop in the reference slot is memory-safe.
+        {
+            auto wrong{ std::make_unique<java_double>(s.get_instance()) };
+            g_only_ref_mismatch.store(s.get_method("onlyRef")->call(std::move(wrong)));
+            g_only_ref_mismatch_attempted.store(1);
+        }
 
         // ===== STATIC name-only overload resolution (the [high] flaw, now FIXED) =
         //
@@ -440,6 +540,18 @@ namespace
         g_s_char.store(overload_fixture::static_method("spick")->call(static_cast<std::uint16_t>(0x1234)));
         g_s_string.store(overload_fixture::static_method("spick")->call(std::string{ "s" }));
         g_s_echo_string_ok.store(overload_fixture::last_string() == std::string{ "s" });
+        // STATIC reference overload twin: spick(Integer) by name via a wrapper
+        // registered as java/lang/Integer.  The static resolver (deriving the klass
+        // from _pool_holder, fix #7) must re-pick (Ljava/lang/Integer;)I over
+        // spick(String).  Body ignores the arg -> the carried oop is harmless.
+        {
+            auto integer{ std::make_unique<java_integer>(s.get_instance()) };
+            g_s_integer.store(overload_fixture::static_method("spick")->call(std::move(integer)));
+        }
+        // STATIC two-wide-parameter twin: spick(long,double) "(JD)I" by name.
+        // Writes lastDoubleArg — placed AFTER the double echo was already captured.
+        g_s_long_double.store(overload_fixture::static_method("spick")->call(
+            static_cast<std::int64_t>(77LL), 9.5));
         // STATIC arity disambiguation: spick(int,int) by name, distinct from the
         // single-arg spick(int).
         g_s_arity2.store(overload_fixture::static_method("spick")->call(
@@ -516,6 +628,14 @@ namespace
         // pick(Object).  (unregistered_wrapper and array_carrier are intentionally
         // NOT registered — see their class comments.)
         vmhook::register_class<java_object>("java/lang/Object");
+        // Register the Integer wrapper -> pick(Integer)/spick(Integer) resolve
+        // deterministically to Ljava/lang/Integer; (a THIRD reference overload).
+        vmhook::register_class<java_integer>("java/lang/Integer");
+        // Register the Double wrapper -> drives the reference no-match probe
+        // (Ljava/lang/Double; matches no onlyRef overload).  These three wrapper
+        // C++ types are distinct to this TU, so registration is isolated from every
+        // other module (type_to_class_map is keyed by the C++ type_index).
+        vmhook::register_class<java_double>("java/lang/Double");
 
         const bool call_stub_present{ vmhook::detail::find_call_stub_entry() != nullptr };
         // Publish the dispatch path to the detour BEFORE the probe runs so run_all()
@@ -566,6 +686,17 @@ namespace
         ctx.check("mo_string_resolves_to_string_overload", g_r_string.load() == RET_STRING);
         ctx.check("mo_registered_wrapper_resolves_to_object_overload",
                   g_r_object_registered.load() == RET_OBJECT);
+        // Third reference type: a java/lang/Integer-registered wrapper resolves to
+        // pick(Integer), NOT pick(Object) and NOT pick(String).
+        ctx.check("mo_registered_integer_resolves_to_integer_overload",
+                  g_r_integer_registered.load() == RET_INTEGER);
+        // The three reference overloads are mutually distinct AND each was hit by
+        // its own registered wrapper / String — proving class-name discrimination
+        // inside 'L...;', not "any reference matches any reference overload".
+        ctx.check("mo_string_object_integer_three_refs_distinct",
+                  g_r_string.load() != g_r_object_registered.load()
+                  && g_r_object_registered.load() != g_r_integer_registered.load()
+                  && g_r_string.load() != g_r_integer_registered.load());
 
         // The four ambiguous-by-value-but-distinct-by-type literals: the crown
         // jewels.  3 (int), 42(long via int64), 3.14(double), 3.14f(float) MUST
@@ -628,6 +759,25 @@ namespace
         ctx.check("mo_int_long_arg_slots", g_int_long_a.load() == 7 && g_int_long_b.load() == 8);
         // pick(long,int): the fixture stores a=slot1 int(=11), b=slot0 long(=9).
         ctx.check("mo_long_int_arg_slots", g_long_int_a.load() == 11 && g_long_int_b.load() == 9);
+        // pick(String,int): reference-first ordering resolves distinctly from
+        // pick(int,String) (same type multiset {String,int}, different slot order).
+        ctx.check("mo_string_int_resolves_string_int", g_r_string_int.load() == RET_STRING_INT);
+        ctx.check("mo_string_int_vs_int_string_distinct",
+                  g_r_string_int.load() != g_r_int_string.load());
+        // slot0 String == "lead", slot1 int == 13 (right value -> right slot).
+        ctx.check("mo_string_int_arg_slots",
+                  g_string_int_str_ok.load() && g_string_int_a.load() == 13);
+        // pick(long,double): two CONSECUTIVE wide params resolve to (JD)I, distinct
+        // from the (int,long)/(long,int) one-wide overloads.  RESOLUTION assertion;
+        // wide-slot packing fidelity across long+double is method_call_wide_args'.
+        ctx.check("mo_long_double_resolves_long_double", g_r_long_double.load() == RET_LONG_DOUBLE);
+        ctx.check("mo_long_double_distinct_from_int_long_and_long_int",
+                  g_r_long_double.load() != g_r_int_long.load()
+                  && g_r_long_double.load() != g_r_long_int.load());
+        // both wide values survived into their distinct slots: long(slot0)=123456789012345,
+        // double(slot2)=2.5 (proves the two wide args did not overlap or truncate).
+        ctx.check("mo_long_double_arg_slots",
+                  g_long_double_a.load() == 123456789012345LL && g_long_double_b_is_e.load() == 1);
 
         // =====================================================================
         //  Explicit-signature fast path resolves identically to name-only.
@@ -650,6 +800,37 @@ namespace
         ctx.check("mo_only_int_matching_arg", g_only_int_match.load() == 7011);
         ctx.record("[INFO] onlyInt(double 99.0) [no (D)I overload -> fallback to (I)I] returned "
                    + std::to_string(g_only_int_mismatch.load()));
+
+        // =====================================================================
+        //  NO-MATCH graceful failure (the contract: never crash; fall back
+        //  predictably).  Three flavours: a type mismatch (onlyInt(double),
+        //  above), an ARITY mismatch (onlyInt() with zero args), and a
+        //  REFERENCE-type mismatch (onlyRef(Double-wrapper) — its descriptor
+        //  matches no onlyRef overload).  The process SURVIVING to here is itself
+        //  the primary proof for the first two; the reference case additionally
+        //  has a DETERMINISTIC fallback (a single onlyRef overload) so its value
+        //  is hard-asserted.  g_detour_calls/g_saw_self (checked above) confirm
+        //  the detour ran to completion, i.e. no call AV'd.
+        if (g_only_int_noargs_attempted.load() == 1)
+        {
+            ctx.record("[INFO] onlyInt() [wrong arity: 0 args vs (I)I -> fallback to (I)I, "
+                       "reads zero-initialised slot] returned "
+                       + std::to_string(g_only_int_noargs.load()) + " (no crash is the contract)");
+        }
+        if (g_only_ref_mismatch_attempted.load() == 1)
+        {
+            // Ljava/lang/Double; matches no onlyRef overload; the SOLE onlyRef(Integer)
+            // is the fallback this->method and dispatches -> RET_ONLY_REF.  A wrong
+            // value here (or a crash before here) would mean the reference no-match
+            // fallback is broken.
+            ctx.check("mo_reference_no_match_falls_back_to_sole_overload",
+                      g_only_ref_mismatch.load() == RET_ONLY_REF);
+        }
+        else
+        {
+            ctx.record("[INFO] reference no-match probe (onlyRef + java/lang/Double wrapper) "
+                       "did not run on this detour — skipped (no fault, no FAIL)");
+        }
 
         // =====================================================================
         //  STATIC explicit-signature path — bypasses resolution, MUST be exact.
@@ -682,6 +863,18 @@ namespace
         ctx.check("mo_static_short_resolves_short",    g_s_short.load()  == RET_SHORT + SBIAS);
         ctx.check("mo_static_char_resolves_char",      g_s_char.load()   == RET_CHAR + SBIAS);
         ctx.check("mo_static_string_resolves_string",  g_s_string.load() == RET_STRING + SBIAS);
+        // STATIC reference overload: a java/lang/Integer wrapper re-picks
+        // spick(Integer) over spick(String) on the historically-broken static path.
+        ctx.check("mo_static_integer_resolves_integer", g_s_integer.load() == RET_INTEGER + SBIAS);
+        ctx.check("mo_static_integer_distinct_from_string",
+                  g_s_integer.load() != g_s_string.load());
+        // STATIC two-wide-parameter overload: spick(long,double) (JD)I selected by
+        // a (int64_t,double) static call, distinct from every single-arg static.
+        ctx.check("mo_static_long_double_resolves_long_double",
+                  g_s_long_double.load() == RET_LONG_DOUBLE + SBIAS);
+        ctx.check("mo_static_long_double_distinct_from_long_and_double",
+                  g_s_long_double.load() != g_s_long.load()
+                  && g_s_long_double.load() != g_s_double.load());
         // STATIC arity disambiguation: spick(int,int) is told from spick(int).
         ctx.check("mo_static_arity2_resolves_int_int", g_s_arity2.load() == RET_INT_INT + SBIAS);
         ctx.check("mo_static_arity1_vs_arity2_distinct",
@@ -750,16 +943,19 @@ namespace
 
         // =====================================================================
         //  AMBIGUOUS unregistered-wrapper resolution — first-match-wins, no
-        //  diagnostic (the medium flaw).  Nondeterministic which of pick(String)
-        //  / pick(Object) wins; record only.
+        //  diagnostic (the medium flaw).  An UNREGISTERED wrapper's L...; branch
+        //  matches ANY reference descriptor, so pick(String) / pick(Object) /
+        //  pick(Integer) ALL match and the loop returns whichever _methods index
+        //  is lowest — nondeterministic across builds.  Record only.
         // =====================================================================
         const std::int64_t amb{ g_amb_unregistered.load() };
         ctx.record("[INFO] unregistered-wrapper arg resolved to sentinel "
                    + std::to_string(amb) + " (pick(String)=" + std::to_string(RET_STRING)
                    + " pick(Object)=" + std::to_string(RET_OBJECT)
+                   + " pick(Integer)=" + std::to_string(RET_INTEGER)
                    + "); first-match-wins with no ambiguity diagnostic is a KNOWN flaw");
         ctx.record(std::string{ "[INFO] unregistered_wrapper_matched_a_reference_overload = " }
-                   + ((amb == RET_STRING || amb == RET_OBJECT) ? "true" : "false"));
+                   + ((amb == RET_STRING || amb == RET_OBJECT || amb == RET_INTEGER) ? "true" : "false"));
     }
     }
 }

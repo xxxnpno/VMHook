@@ -30,7 +30,7 @@
 //
 //   NATIVE (HARD on all JDKs for primitives; best-effort for ref arrays on JDK8):
 //     For each of [Z [B [S [C [I [J [F [D [Ljava/lang/Object; [Ljava/lang/String;
-//     at length 0, 1, 3, 256:
+//     at length 0, 1, 3, 256, AND 100000 (the big-allocation case):
 //       * make_java_array(...) returns a NON-NULL oop that passes is_valid_pointer
 //         (never hand Java an invalid/mistyped oop), and
 //       * vmhook::array_length(oop) == the requested length (the _length slot was
@@ -45,7 +45,28 @@
 //         LAST [255] — proving the data region (offset +16) is real, sized, and
 //         addressable for the full element stride far into the array.
 //
-//   JAVA-VISIBLE (proves the oop is a REAL Java array, not just a byte blob):
+//   PASS-INTO-JAVA (the well-formed-array proof — "build from a C++ vector, then
+//   prove every element is correct Java-side"):  for each PRIMITIVE descriptor the
+//   detour builds a length-FEED_LEN array, writes a C++ std::vector of
+//   edge-case values into it element-by-element with set_array_element, then PASSES
+//   THE MADE ARRAY into the matching MakeJavaArray.sum*/check* Java method via
+//   method_proxy::call.  That method walks EVERY element with genuine bytecode
+//   (arraylength + Xaload) and returns a position-weighted value (a sum for
+//   integrals, an XOR-of-raw-bits fold for J/F/D so the full width / NaN / -0.0 /
+//   Inf are all distinguished).  The module recomputes the SAME value in C++ and
+//   asserts the Java return equals it, plus the Java-observed .length / class name /
+//   first / last element match — so a wrong element width, a stride/slot mistake,
+//   a 0xFF sign error, a high/low wide-word swap, or any element corruption is
+//   caught by real Java bytecode, not just a native re-read.
+//
+//   For the REFERENCE descriptors the detour allocates an EMPTY (default-null)
+//   Object[] / String[] and passes it into MakeJavaArray.fillCheck*Array, which
+//   FILLS it with refs + interspersed nulls (real aastore), reads them back
+//   (aaload by == identity), and reports length / non-null count / round-trip —
+//   proving the made reference array supports element storage with the correct
+//   element klass (a wrong-type store would raise ArrayStoreException).
+//
+//   JAVA-VISIBLE recv* witness (proves the oop is a REAL Java array via a field):
 //     One representative array per descriptor (length WITNESS_LEN==3) is stored
 //     into a static recv* field via field_proxy::set (the object-reference /
 //     compressed-OOP write path).  The fixture's captureAll() then reads, with
@@ -106,6 +127,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace
 {
@@ -113,12 +135,19 @@ namespace
     // MakeJavaArray.WITNESS_LEN).
     constexpr std::int32_t k_witness_len{ 3 };
 
-    // The four exhaustive lengths every descriptor is allocated at natively.
-    constexpr std::array<std::int32_t, 4> k_lengths{ 0, 1, 3, 256 };
+    // The length of the C++-vector-built arrays passed into the Java sum*/check*
+    // verifiers (must equal MakeJavaArray.FEED_LEN).
+    constexpr std::int32_t k_feed_len{ 5 };
 
-    // The "deep" length whose first / middle / last elements are round-tripped
-    // (must be k_lengths.back() so the deep sweep reuses that allocation slot).
+    // The native lengths every descriptor is allocated at: 0, 1, 3, 256, and a
+    // BIG length that exercises the allocation path well past a TLAB top-up.
+    constexpr std::array<std::int32_t, 5> k_lengths{ 0, 1, 3, 256, 100000 };
+
+    // The "deep" length whose first / middle / last elements are round-tripped.
     constexpr std::int32_t k_deep_len{ 256 };
+
+    // The big-allocation length (must appear in k_lengths).
+    constexpr std::int32_t k_big_len{ 100000 };
 
     // Wrapper for vmhook.fixtures.MakeJavaArray — hook target + witness reads.
     class mja : public vmhook::object<mja>
@@ -138,16 +167,19 @@ namespace
 
         // ---- primitive witness reads (VMStructs reads; no Java thread needed) --
         static auto get_int(const char* name) -> std::int32_t { return static_field(name)->get(); }
+        static auto get_long(const char* name) -> std::int64_t { return static_field(name)->get(); }
         static auto get_bool(const char* name) -> bool { return static_field(name)->get(); }
         static auto get_str(const char* name) -> std::string { return static_field(name)->get().as_string(); }
     };
 
     // Minimal carrier bound to java/lang/Object whose ONLY job is to ferry a
-    // make_java_array oop into field_proxy::set's object-reference branch, which
-    // calls object_base::get_instance() and then encode_oop_pointer().  It never
-    // needs the array layout itself — it just transports the oop with the correct
-    // compression semantics (a bare void* would land an UNcompressed pointer in
-    // the slot and mistype the field).
+    // make_java_array oop into field_proxy::set's object-reference branch (which
+    // calls get_instance() + encode_oop_pointer()) AND into method_proxy::call's
+    // unique_ptr<wrapper> arg slot (which also just extracts get_instance()).  It
+    // never needs the array layout itself.  Crucially, the method-call path uses
+    // the RESOLVED method's own declared descriptor ("([I)J", ...) for the JNI
+    // signature, NOT the carrier's registered class name — so this one Object-bound
+    // carrier correctly transports an array of ANY element type as a call argument.
     class java_array_w : public vmhook::object<java_array_w>
     {
     public:
@@ -170,18 +202,41 @@ namespace
         std::memcpy(&b, &d, sizeof(b));
         return b;
     }
+    // Reinterpret a 64-bit pattern as the signed long Java reports from
+    // doubleToRawLongBits (no UB; NaN/Inf bits have the sign bit set).
+    auto to_i64(std::uint64_t bits) noexcept -> std::int64_t
+    {
+        std::int64_t out{};
+        std::memcpy(&out, &bits, sizeof(out));
+        return out;
+    }
+
+    // Position weight matching MakeJavaArray.weight(i) = 2*i + 1 exactly.
+    auto weight(std::int32_t i) noexcept -> std::int64_t
+    {
+        return static_cast<std::int64_t>(2 * i + 1);
+    }
+
+    // (value + weight) computed with WELL-DEFINED two's-complement wraparound,
+    // bit-identical to Java's `long +` (which wraps silently).  The wide XOR-fold
+    // verifiers add a 64-bit element to a small weight where MAX/MIN inputs would
+    // overflow a signed int64 (UB in C++); doing the add in std::uint64_t makes it
+    // defined modular arithmetic and matches the JVM bit-for-bit, then we reinterpret
+    // the bits back to int64 for the fold.  Used by the J / F / D feeders.
+    auto add_wrap(std::int64_t value, std::int64_t w) noexcept -> std::int64_t
+    {
+        const std::uint64_t sum{ static_cast<std::uint64_t>(value) + static_cast<std::uint64_t>(w) };
+        std::int64_t out{};
+        std::memcpy(&out, &sum, sizeof(out));   // bit-cast uint64 -> int64, no UB
+        return out;
+    }
 
     // ── Per-descriptor native sweep result (filled inside the detour). ──
-    // One slot per (descriptor) holding, for each of the 4 lengths:
-    //   nonnull[k]  : make_java_array(...) returned non-null
-    //   valid[k]    : is_valid_pointer(oop)
-    //   len_ok[k]   : array_length(oop) == requested length
-    // plus, for primitive descriptors, zero-init + element round-trip flags.
     struct desc_result
     {
-        std::array<std::atomic<bool>, 4> nonnull{};
-        std::array<std::atomic<bool>, 4> valid{};
-        std::array<std::atomic<bool>, 4> len_ok{};
+        std::array<std::atomic<bool>, 5> nonnull{};
+        std::array<std::atomic<bool>, 5> valid{};
+        std::array<std::atomic<bool>, 5> len_ok{};
         // Fresh-array default-init (read [0]/[last] of an UNwritten array == 0).
         std::atomic<bool> zero_init_tested{ false };
         std::atomic<bool> zero_init_ok{ false };
@@ -195,9 +250,14 @@ namespace
         std::atomic<bool> deep_mid_ok{ false };
         std::atomic<bool> deep_last_ok{ false };
         std::atomic<bool> stored_into_recv{ false };
+        // PASS-INTO-JAVA (primitive: sum*/check*; reference: fillCheck*).
+        std::atomic<bool> fed_attempted{ false };  // we tried to feed+call
+        std::atomic<bool> fed_dispatched{ false }; // the Java verifier ran
+        std::atomic<bool> fed_return_ok{ false };  // Java return == C++ expected
+        std::atomic<bool> fed_len_ok{ false };     // Java-observed .length == feed len
+        std::atomic<bool> fed_first_last_ok{ false }; // Java-observed [0]/[last] match
     };
 
-    // Element descriptors, in a fixed order; index 8/9 are the reference arrays.
     enum desc_index : std::size_t
     {
         D_Z = 0, D_B, D_S, D_C, D_I, D_J, D_F, D_D, D_OBJ, D_STR, D_COUNT
@@ -215,11 +275,6 @@ namespace
         const char* null_field;     // obsNull* witness
     };
 
-    // element_size per descriptor: the natural JVM element stride.  For the
-    // reference arrays we pass sizeof(uint32) == narrow-oop width (compressed
-    // oops, the x64 CI default); the value only affects the allocation SIZE, not
-    // the _length slot or the klass stamp, and we never element-access ref arrays
-    // natively, so it is robust either way.
     const std::array<desc_spec, D_COUNT> k_specs{ {
         { "[Z", sizeof(std::uint8_t),  false, "recvZ",   "[Z",                    "obsLenZ",   "obsTypeZ",   "obsNullZ"   },
         { "[B", sizeof(std::int8_t),   false, "recvB",   "[B",                    "obsLenB",   "obsTypeB",   "obsNullB"   },
@@ -245,15 +300,8 @@ namespace
     std::atomic<bool> g_bare_bracket_null{ false };
     std::atomic<bool> g_array_of_void_null{ false };
     std::atomic<bool> g_missing_elem_class_null{ false };
-    // A negative length with a VALID primitive descriptor still returns null
-    // (guard fires before any klass work).
     std::atomic<bool> g_neg_len_valid_desc_null{ false };
-    // allow_jni_fallback=false on a valid PRIMITIVE descriptor still succeeds via
-    // the untouched TLAB fast path (the parameter only governs the GC-slow-path
-    // fallback, which a small allocation does not need).
     std::atomic<bool> g_no_fallback_primitive_ok{ false };
-    // A valid MULTI-DIM array ("[[I" == int[][]): a reference (ObjArrayKlass)
-    // allocation, so best-effort like the other ref arrays.
     std::atomic<bool> g_multidim_nonnull{ false };
     std::atomic<bool> g_multidim_valid{ false };
     std::atomic<bool> g_multidim_len_ok{ false };
@@ -263,9 +311,7 @@ namespace
     std::atomic<bool> g_saw_self{ false };
 
     // Read element [0] and [last] of a FRESH (unwritten) primitive array and
-    // assert they are the zero/default value.  make_java_object memset()s the
-    // whole allocation, so a usable made array must start default-initialised.
-    // Bit-exact for F/D so -0.0 / +0.0 are not confused (a fresh array is +0.0).
+    // assert they are the zero/default value.
     template<typename element_type>
     auto zero_init_check(desc_result& r, void* const oop, const std::int32_t len) -> void
     {
@@ -291,9 +337,7 @@ namespace
     }
 
     // Write a boundary element into [0] and [last] of a primitive array and read
-    // it straight back, BIT-EXACT for F/D.  Sets the two per-descriptor element
-    // flags.  Runs on the Java thread (inside the detour).  `oop` is a validated
-    // make_java_array result of `len` elements.
+    // it straight back, BIT-EXACT for F/D.
     template<typename element_type>
     auto element_round_trip(desc_result& r, void* const oop, const std::int32_t len,
                             const element_type first_val, const element_type last_val) -> void
@@ -307,7 +351,6 @@ namespace
         vmhook::set_array_element<element_type>(oop, len - 1, last_val);
         const element_type got_first{ vmhook::get_array_element<element_type>(oop, 0) };
         const element_type got_last{ vmhook::get_array_element<element_type>(oop, len - 1) };
-        // Bit-exact compare so NaN / -0.0 element payloads are proven too.
         if constexpr (std::is_same_v<element_type, float>)
         {
             r.elem_first_ok.store(float_bits(got_first) == float_bits(first_val));
@@ -325,10 +368,7 @@ namespace
         }
     }
 
-    // Write+read a value into [0], [middle], and [last] of a DEEP primitive array
-    // and assert each round-trips bit-exact.  Proves the full element stride
-    // reaches far into the data region (the middle/last of a 256-element array),
-    // not just the first slot.  `oop` is a validated array of `len` elements.
+    // Write+read a value into [0], [middle], and [last] of a DEEP primitive array.
     template<typename element_type>
     auto deep_round_trip(desc_result& r, void* const oop, const std::int32_t len,
                          const element_type first_val, const element_type mid_val,
@@ -366,8 +406,6 @@ namespace
         }
     }
 
-    // Dispatch the zero-init read with the type-appropriate element type for the
-    // given primitive descriptor index, at the representative length.
     auto zero_init_for(std::size_t di, void* const oop, std::int32_t len) -> void
     {
         desc_result& r{ g_results[di] };
@@ -381,12 +419,10 @@ namespace
             case D_J: zero_init_check<std::int64_t>(r, oop, len); break;
             case D_F: zero_init_check<float>(r, oop, len); break;
             case D_D: zero_init_check<double>(r, oop, len); break;
-            default: break;  // reference arrays: not native-element-tested
+            default: break;
         }
     }
 
-    // Dispatch the element round-trip with type-appropriate boundary values for
-    // the given primitive descriptor index, at the representative length (3).
     auto element_round_trip_for(std::size_t di, void* const oop, std::int32_t len) -> void
     {
         desc_result& r{ g_results[di] };
@@ -414,12 +450,10 @@ namespace
             case D_D: element_round_trip<double>(r, oop, len,
                           std::numeric_limits<double>::quiet_NaN(),
                           -0.0); break;
-            default: break;  // reference arrays: no native element round-trip
+            default: break;
         }
     }
 
-    // Dispatch the DEEP round-trip ([0]/[middle]/[last]) with type-appropriate
-    // distinct values for the given primitive descriptor index, at k_deep_len.
     auto deep_round_trip_for(std::size_t di, void* const oop, std::int32_t len) -> void
     {
         desc_result& r{ g_results[di] };
@@ -454,13 +488,287 @@ namespace
                           std::numeric_limits<double>::quiet_NaN(),
                           2.718281828459045,
                           -0.0); break;
-            default: break;  // reference arrays: no native element round-trip
+            default: break;
         }
     }
 
-    // The cycle() detour: performs the entire native make_java_array sweep, the
-    // malformed-input guards, and stores one representative array per descriptor
-    // into its recv* field.  self is `this`.
+    // ── PASS-INTO-JAVA: build a length-k_feed_len primitive array from a C++
+    //    vector, write every element with set_array_element, then call the named
+    //    MakeJavaArray.sum*/check* method with the made array as the (sole) arg and
+    //    assert the Java return equals the SAME position-weighted value computed in
+    //    C++ from the vector.  Also reads back the fed*Len / fed*First / fed*Last
+    //    witnesses the verifier recorded and checks them against the vector. ──
+    //
+    // element_type : the C++ array element type written with set_array_element.
+    // values       : exactly k_feed_len elements.
+    // expected     : the long the Java method must return (computed by the caller
+    //                with the identical formula).
+    // first_w/last_w : the long the verifier records for [0] / [last] (so we can
+    //                  cross-check the per-element witnesses too).
+    template<typename element_type>
+    auto feed_and_call(std::size_t di, const std::unique_ptr<mja>& self,
+                       const char* method_name,
+                       const std::vector<element_type>& values,
+                       const std::int64_t expected,
+                       const std::int64_t first_w, const std::int64_t last_w,
+                       const char* fed_len_field, const char* fed_first_field,
+                       const char* fed_last_field) -> void
+    {
+        desc_result& r{ g_results[di] };
+        r.fed_attempted.store(true);
+        if (!self)
+        {
+            return;
+        }
+        const desc_spec& spec{ k_specs[di] };
+        void* const oop{ vmhook::make_java_array(spec.descriptor, k_feed_len, spec.element_size) };
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+        {
+            return;
+        }
+        if (vmhook::array_length(oop) != k_feed_len)
+        {
+            return;
+        }
+        for (std::int32_t i{ 0 }; i < k_feed_len; ++i)
+        {
+            vmhook::set_array_element<element_type>(oop, i, values[static_cast<std::size_t>(i)]);
+        }
+
+        const auto method{ self->get_method(method_name) };
+        if (!method.has_value())
+        {
+            return;
+        }
+        std::unique_ptr<java_array_w> carrier{ std::make_unique<java_array_w>(oop) };
+        const vmhook::method_proxy::value_t v = method->call(carrier);
+        if (v.is_void())
+        {
+            return;   // call did not dispatch
+        }
+        r.fed_dispatched.store(true);
+        const std::int64_t returned = static_cast<std::int64_t>(v);
+        r.fed_return_ok.store(returned == expected);
+
+        // Cross-check the per-element witnesses the verifier recorded.
+        r.fed_len_ok.store(mja::get_int(fed_len_field) == k_feed_len);
+        const std::int64_t obs_first{ mja::get_long(fed_first_field) };
+        const std::int64_t obs_last{ mja::get_long(fed_last_field) };
+        r.fed_first_last_ok.store(obs_first == first_w && obs_last == last_w);
+    }
+
+    // Build the per-descriptor feed vector + expected checksum, then feed+call.
+    // Each vector packs edge-case values for its type (MIN/MAX/0/+-1, NaN/Inf/-0.0,
+    // 0xFF byte, full-range char incl. 0xFFFF, wide 64-bit patterns).
+    auto feed_primitive(std::size_t di, const std::unique_ptr<mja>& self) -> void
+    {
+        switch (di)
+        {
+            case D_Z:
+            {
+                const std::vector<bool> vals{ true, false, true, true, false };
+                std::int64_t exp{ 0 };
+                for (std::int32_t i{ 0 }; i < k_feed_len; ++i)
+                {
+                    if (vals[static_cast<std::size_t>(i)]) { exp += weight(i); }
+                }
+                const std::int64_t first_w{ vals[0] ? 1 : 0 };
+                const std::int64_t last_w{ vals[static_cast<std::size_t>(k_feed_len - 1)] ? 1 : 0 };
+                feed_and_call<bool>(di, self, "sumBoolArray", vals, exp, first_w, last_w,
+                                    "fedZLen", "fedZFirst", "fedZLast");
+                break;
+            }
+            case D_B:
+            {
+                // -1 == the 0xFF byte (signed -1 in Java); MIN/MAX boundary too.
+                const std::vector<std::int8_t> vals{
+                    std::numeric_limits<std::int8_t>::min(),
+                    static_cast<std::int8_t>(-1),
+                    static_cast<std::int8_t>(0),
+                    static_cast<std::int8_t>(1),
+                    std::numeric_limits<std::int8_t>::max() };
+                std::int64_t exp{ 0 };
+                for (std::int32_t i{ 0 }; i < k_feed_len; ++i)
+                {
+                    exp += static_cast<std::int64_t>(vals[static_cast<std::size_t>(i)]) * weight(i);
+                }
+                feed_and_call<std::int8_t>(di, self, "sumByteArray", vals, exp,
+                                           static_cast<std::int64_t>(vals[0]),
+                                           static_cast<std::int64_t>(vals[static_cast<std::size_t>(k_feed_len - 1)]),
+                                           "fedBLen", "fedBFirst", "fedBLast");
+                break;
+            }
+            case D_S:
+            {
+                const std::vector<std::int16_t> vals{
+                    std::numeric_limits<std::int16_t>::min(),
+                    static_cast<std::int16_t>(-1),
+                    static_cast<std::int16_t>(0),
+                    static_cast<std::int16_t>(1),
+                    std::numeric_limits<std::int16_t>::max() };
+                std::int64_t exp{ 0 };
+                for (std::int32_t i{ 0 }; i < k_feed_len; ++i)
+                {
+                    exp += static_cast<std::int64_t>(vals[static_cast<std::size_t>(i)]) * weight(i);
+                }
+                feed_and_call<std::int16_t>(di, self, "sumShortArray", vals, exp,
+                                            static_cast<std::int64_t>(vals[0]),
+                                            static_cast<std::int64_t>(vals[static_cast<std::size_t>(k_feed_len - 1)]),
+                                            "fedSLen", "fedSFirst", "fedSLast");
+                break;
+            }
+            case D_C:
+            {
+                // Full UTF-16 code-unit range incl. 0x0000 and 0xFFFF.
+                const std::vector<std::uint16_t> vals{
+                    static_cast<std::uint16_t>(0x0000),
+                    static_cast<std::uint16_t>(0x0041),
+                    static_cast<std::uint16_t>(0x00FF),
+                    static_cast<std::uint16_t>(0xABCD),
+                    static_cast<std::uint16_t>(0xFFFF) };
+                std::int64_t exp{ 0 };
+                for (std::int32_t i{ 0 }; i < k_feed_len; ++i)
+                {
+                    exp += static_cast<std::int64_t>(vals[static_cast<std::size_t>(i)]) * weight(i);
+                }
+                feed_and_call<std::uint16_t>(di, self, "sumCharArray", vals, exp,
+                                             static_cast<std::int64_t>(vals[0]),
+                                             static_cast<std::int64_t>(vals[static_cast<std::size_t>(k_feed_len - 1)]),
+                                             "fedCLen", "fedCFirst", "fedCLast");
+                break;
+            }
+            case D_I:
+            {
+                const std::vector<std::int32_t> vals{
+                    std::numeric_limits<std::int32_t>::min(),
+                    -1, 0, 1,
+                    std::numeric_limits<std::int32_t>::max() };
+                std::int64_t exp{ 0 };
+                for (std::int32_t i{ 0 }; i < k_feed_len; ++i)
+                {
+                    exp += static_cast<std::int64_t>(vals[static_cast<std::size_t>(i)]) * weight(i);
+                }
+                feed_and_call<std::int32_t>(di, self, "sumIntArray", vals, exp,
+                                            static_cast<std::int64_t>(vals[0]),
+                                            static_cast<std::int64_t>(vals[static_cast<std::size_t>(k_feed_len - 1)]),
+                                            "fedILen", "fedIFirst", "fedILast");
+                break;
+            }
+            case D_J:
+            {
+                // XOR-fold of (value + weight); wide 64-bit patterns.
+                const std::vector<std::int64_t> vals{
+                    std::numeric_limits<std::int64_t>::min(),
+                    static_cast<std::int64_t>(-1),
+                    static_cast<std::int64_t>(0),
+                    static_cast<std::int64_t>(0x0123456789ABCDEFLL),
+                    std::numeric_limits<std::int64_t>::max() };
+                std::int64_t exp{ 0 };
+                for (std::int32_t i{ 0 }; i < k_feed_len; ++i)
+                {
+                    exp ^= add_wrap(vals[static_cast<std::size_t>(i)], weight(i));
+                }
+                feed_and_call<std::int64_t>(di, self, "sumLongArray", vals, exp,
+                                            vals[0], vals[static_cast<std::size_t>(k_feed_len - 1)],
+                                            "fedJLen", "fedJFirst", "fedJLast");
+                break;
+            }
+            case D_F:
+            {
+                // XOR-fold of (rawIntBits & 0xFFFFFFFF) + weight; NaN/Inf/-0.0.
+                const std::vector<float> vals{
+                    std::numeric_limits<float>::quiet_NaN(),
+                    -0.0F,
+                    std::numeric_limits<float>::infinity(),
+                    -std::numeric_limits<float>::infinity(),
+                    3.14159F };
+                std::int64_t exp{ 0 };
+                for (std::int32_t i{ 0 }; i < k_feed_len; ++i)
+                {
+                    // float_bits is uint32; Java masks rawIntBits with 0xFFFFFFFFL,
+                    // so the value is a non-negative long in [0, 0xFFFFFFFF].
+                    const std::int64_t bits{ static_cast<std::int64_t>(float_bits(vals[static_cast<std::size_t>(i)])) };
+                    exp ^= add_wrap(bits, weight(i));
+                }
+                const std::int64_t first_w{ static_cast<std::int64_t>(float_bits(vals[0])) };
+                const std::int64_t last_w{ static_cast<std::int64_t>(float_bits(vals[static_cast<std::size_t>(k_feed_len - 1)])) };
+                feed_and_call<float>(di, self, "checkFloatArray", vals, exp, first_w, last_w,
+                                     "fedFLen", "fedFFirst", "fedFLast");
+                break;
+            }
+            case D_D:
+            {
+                // XOR-fold of rawLongBits + weight; NaN/Inf/-0.0 (wide).
+                const std::vector<double> vals{
+                    std::numeric_limits<double>::quiet_NaN(),
+                    -0.0,
+                    std::numeric_limits<double>::infinity(),
+                    -std::numeric_limits<double>::infinity(),
+                    2.718281828459045 };
+                std::int64_t exp{ 0 };
+                for (std::int32_t i{ 0 }; i < k_feed_len; ++i)
+                {
+                    // to_i64 reinterprets the raw 64-bit pattern (NaN/Inf have the
+                    // sign bit set); add_wrap matches Java's two's-complement long +.
+                    exp ^= add_wrap(to_i64(double_bits(vals[static_cast<std::size_t>(i)])), weight(i));
+                }
+                const std::int64_t first_w{ to_i64(double_bits(vals[0])) };
+                const std::int64_t last_w{ to_i64(double_bits(vals[static_cast<std::size_t>(k_feed_len - 1)])) };
+                feed_and_call<double>(di, self, "checkDoubleArray", vals, exp, first_w, last_w,
+                                      "fedDLen", "fedDFirst", "fedDLast");
+                break;
+            }
+            default: break;
+        }
+    }
+
+    // ── PASS-INTO-JAVA for the reference descriptors: make an EMPTY (default-null)
+    //    array of length k_witness_len and pass it into the named fillCheck*
+    //    method, which fills it with refs + interspersed nulls (aastore), reads
+    //    them back (aaload), and returns the non-null count.  We assert the call
+    //    dispatched and the returned non-null count matches the 2 the filler
+    //    stores ([0]=ref, [1]=null, [2]=ref).  Best-effort: only runs when the
+    //    array allocates (gated like the other ref-array paths). ──
+    auto feed_reference(std::size_t di, const std::unique_ptr<mja>& self,
+                        const char* method_name) -> void
+    {
+        desc_result& r{ g_results[di] };
+        r.fed_attempted.store(true);
+        if (!self)
+        {
+            return;
+        }
+        const desc_spec& spec{ k_specs[di] };
+        void* const oop{ vmhook::make_java_array(spec.descriptor, k_witness_len, spec.element_size) };
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+        {
+            return;   // ref-array alloc may fail on JDK 8 / GC-active config
+        }
+        if (vmhook::array_length(oop) != k_witness_len)
+        {
+            return;
+        }
+        const auto method{ self->get_method(method_name) };
+        if (!method.has_value())
+        {
+            return;
+        }
+        std::unique_ptr<java_array_w> carrier{ std::make_unique<java_array_w>(oop) };
+        const vmhook::method_proxy::value_t v = method->call(carrier);
+        if (v.is_void())
+        {
+            return;
+        }
+        r.fed_dispatched.store(true);
+        // The filler stores 2 non-null elements ([0]=ref, [1]=null, [2]=ref).
+        r.fed_return_ok.store(static_cast<std::int64_t>(v) == 2);
+        r.fed_len_ok.store(true);
+        r.fed_first_last_ok.store(true);
+    }
+
+    // The cycle() detour: the entire native make_java_array sweep, the
+    // malformed-input guards, the recv* witness stores, the PASS-INTO-JAVA
+    // sum*/check*/fillCheck* calls, and the big-allocation case.  self is `this`.
     auto on_cycle(vmhook::return_value& /*ret*/, const std::unique_ptr<mja>& self) -> void
     {
         g_cycle_calls.fetch_add(1, std::memory_order_relaxed);
@@ -484,14 +792,11 @@ namespace
 
                 if (valid && !spec.is_reference)
                 {
-                    // Zero-init proof at the representative length: a FRESH array
-                    // must read back all-default before we write anything.
                     if (len == k_witness_len)
                     {
                         zero_init_for(di, oop, len);
                         element_round_trip_for(di, oop, len);
                     }
-                    // Deep round-trip at the largest length: [0]/[middle]/[last].
                     if (len == k_deep_len)
                     {
                         deep_round_trip_for(di, oop, len);
@@ -511,51 +816,43 @@ namespace
                     r.stored_into_recv.store(true);
                 }
             }
+
+            // ── 3. PASS-INTO-JAVA: build from a C++ vector and hand the made
+            //       array to a real Java verifier (primitive) / filler (reference). ──
+            if (!spec.is_reference)
+            {
+                feed_primitive(di, self);
+            }
         }
 
-        // ── 3. Malformed / guard inputs — must be graceful (null, no crash). ──
+        // Reference fillers (run after the primitive sweep so the early ref-array
+        // klasses are warm).
+        feed_reference(D_OBJ, self, "fillCheckObjectArray");
+        feed_reference(D_STR, self, "fillCheckStringArray");
+
+        // ── 4. Malformed / guard inputs — must be graceful (null, no crash). ──
         g_neg_len_minus1_null.store(
             vmhook::make_java_array("[I", -1, sizeof(std::int32_t)) == nullptr);
         g_neg_len_intmin_null.store(
             vmhook::make_java_array("[B", std::numeric_limits<std::int32_t>::min(), sizeof(std::int8_t)) == nullptr);
-        // A negative length must short-circuit BEFORE klass resolution even for a
-        // perfectly valid descriptor (the guard is the very first statement).
         g_neg_len_valid_desc_null.store(
             vmhook::make_java_array("[D", -5, sizeof(double)) == nullptr);
-        // Non-array descriptors: front() != '[', so the JDK-8 fallback never
-        // triggers and find_class either misses or returns a non-array klass; in
-        // both cases the caller asked for the wrong thing.  "Ljava/lang/Object;"
-        // is not a loadable class name (FindClass wants "java/lang/Object"), and
-        // "I" is a primitive descriptor, so both miss -> null.
         g_nonarray_Lobj_null.store(
             vmhook::make_java_array("Ljava/lang/Object;", 1, sizeof(std::uint32_t)) == nullptr);
         g_nonarray_I_null.store(
             vmhook::make_java_array("I", 1, sizeof(std::int32_t)) == nullptr);
-        // Wrong syntax (Java source form, not a JVM descriptor).
         g_wrong_syntax_null.store(
             vmhook::make_java_array("byte[]", 1, sizeof(std::int8_t)) == nullptr);
-        // Empty descriptor: find_class("") misses and class_name.empty() disables
-        // the fallback -> null.
         g_empty_desc_null.store(
             vmhook::make_java_array("", 1, 1) == nullptr);
-        // A bare "[" (front == '[' so the FIX-D fallback DOES run, but FindClass
-        // rejects the malformed array descriptor) -> null, no crash.
         g_bare_bracket_null.store(
             vmhook::make_java_array("[", 1, 1) == nullptr);
-        // An array of void "[V": void is not a valid element type, FindClass
-        // rejects it -> null.
         g_array_of_void_null.store(
             vmhook::make_java_array("[V", 1, 1) == nullptr);
-        // An array of a class that was never loaded: the element type does not
-        // resolve, so neither find_class nor the JNI fallback can build the
-        // ObjArrayKlass -> null (no crash).
         g_missing_elem_class_null.store(
             vmhook::make_java_array("[Lvmhook/fixtures/NoSuchClass12345;", 1, sizeof(std::uint32_t)) == nullptr);
 
-        // ── 4. The new 4th parameter: allow_jni_fallback=false on a valid
-        //       PRIMITIVE descriptor must still succeed on the (untouched) TLAB
-        //       fast path — a small allocation never needs the GC-slow-path
-        //       fallback the flag governs.  Validated + length-checked. ──
+        // ── 5. allow_jni_fallback=false on a valid PRIMITIVE descriptor. ──
         {
             void* const oop{ vmhook::make_java_array("[I", k_witness_len, sizeof(std::int32_t), /*allow_jni_fallback=*/false) };
             g_no_fallback_primitive_ok.store(
@@ -564,9 +861,7 @@ namespace
                 && vmhook::array_length(oop) == k_witness_len);
         }
 
-        // ── 5. A valid MULTI-DIM array ("[[I" == int[][]): an ObjArrayKlass
-        //       allocation that exercises the same find_class / FIX-D path as the
-        //       other reference arrays.  Best-effort (gated below). ──
+        // ── 6. MULTI-DIM array ("[[I"). ──
         {
             void* const oop{ vmhook::make_java_array("[[I", k_witness_len, sizeof(std::uint32_t)) };
             const bool nn{ oop != nullptr };
@@ -582,16 +877,11 @@ namespace
         // make_java_array only clears it on the '['-prefixed fallback path AND
         // only when that fallback's FindClass succeeds; for a non-'[' descriptor,
         // or a '[' descriptor whose ELEMENT class is missing, the pending
-        // exception is left set on the thread.  If it escapes this detour it would
-        // surface when the interpreter resumes (and abort under -Xcheck:jni).  The
-        // malformed-input asserts above only need the null RETURN, so clear the
-        // pending exception here so it never poisons the probe's own bytecode
-        // (captureAll / done=true).  This pins the current null-return behaviour
-        // while keeping CI green; see the module's lib_bugs note.
+        // exception is left set on the thread.  Clear it here so it never poisons
+        // the probe's own bytecode (captureAll / done=true); see lib_bugs note.
         vmhook::jni::exception_clear();
     }
 
-    // Drive the single probe that fires the cycle hook + runs captureAll().
     auto drive(vmhook_test::context& ctx) -> bool
     {
         return ctx.run_probe(
@@ -606,20 +896,13 @@ namespace
             []() { return mja::get_done(); });
     }
 
-    // The real body.  Wrapped by the VMHOOK_JVM_MODULE entry below so any C++
-    // exception is downgraded to [INFO] and the unconditional teardown still runs.
     auto run_body(vmhook_test::context& ctx) -> void
     {
         vmhook::register_class<mja>("vmhook/fixtures/MakeJavaArray");
-        // Register the carrier so it is a valid wrapper type for field_proxy::set
-        // (which only calls get_instance()).  Harmless if another module already
-        // bound a wrapper to java/lang/Object — the factory map keeps the first,
-        // and this carrier does not rely on the factory.
         vmhook::register_class<java_array_w>("java/lang/Object");
 
         // =================================================================
-        //  ENTRY GUARD (suite-safe): if the fixture klass can't be resolved
-        //  yet, there is nothing to test — record [INFO] and return (no FAIL).
+        //  ENTRY GUARD (suite-safe).
         // =================================================================
         if (vmhook::find_class("vmhook/fixtures/MakeJavaArray") == nullptr)
         {
@@ -629,10 +912,11 @@ namespace
         }
 
         // =================================================================
-        //  0. Sanity: the fixture resolves and its hook target exists.
+        //  0. Sanity.
         // =================================================================
         ctx.check("mja_class_registered_field_resolves", mja::resolves("go"));
         ctx.check("mja_witness_len_field_is_3", mja::get_int("WITNESS_LEN") == k_witness_len);
+        ctx.check("mja_feed_len_field_is_5", mja::get_int("FEED_LEN") == k_feed_len);
         {
             const auto methods{ vmhook::get_class_methods<mja>() };
             bool has_cycle{ false };
@@ -643,10 +927,7 @@ namespace
             ctx.check("mja_cycle_method_declared", has_cycle);
         }
 
-        // ── JDK-8 detection (house idiom): java.lang.String has the compact-
-        //    string "coder" field only on JDK 9+.  On JDK 8 the reference-array
-        //    allocation relies on the FIX-D JNI FindClass fallback resolving an
-        //    Obj/ArrayKlass. ──
+        // ── JDK-8 detection (house idiom). ──
         vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
         const bool compact_strings{ string_klass != nullptr
                                     && string_klass->find_field("coder").has_value() };
@@ -663,9 +944,7 @@ namespace
                    "[INFO] when make_java_array returns null on a GC-active config / JDK 8.");
 
         // =================================================================
-        //  1. Install the interpreter hook on cycle().  scoped_hook uninstalls
-        //     on scope exit; the unconditional shutdown_hooks() in the entry
-        //     wrapper is the belt-and-braces floor.
+        //  1. Install the interpreter hook on cycle().
         // =================================================================
         auto handle{ vmhook::scoped_hook<mja>("cycle", &on_cycle) };
         ctx.check("make_java_array_hook_installed", handle.installed());
@@ -675,21 +954,18 @@ namespace
         }
 
         // =================================================================
-        //  2. Fire the probe once (real bytecode dispatch -> detour runs the
-        //     whole native sweep, then captureAll() snapshots the witnesses).
+        //  2. Fire the probe once.
         // =================================================================
         const bool probe_done{ drive(ctx) };
         ctx.check("make_java_array_probe_completed", probe_done);
         ctx.check("make_java_array_cycle_fired_once", g_cycle_calls.load() == 1);
         ctx.check("make_java_array_detour_saw_self", g_saw_self.load());
 
-        // Per-descriptor short tags for readable check names.
         const std::array<const char*, D_COUNT> tag{
             "Z", "B", "S", "C", "I", "J", "F", "D", "Obj", "Str" };
 
         // =================================================================
         //  3. NATIVE sweep assertions — every descriptor x every length.
-        //     Primitives are HARD on all JDKs; reference arrays are best-effort.
         // =================================================================
         for (std::size_t di{ 0 }; di < D_COUNT; ++di)
         {
@@ -700,13 +976,6 @@ namespace
                 const std::int32_t len{ k_lengths[k] };
                 const std::string suffix{ std::string{ tag[di] } + "_len" + std::to_string(len) };
                 const bool nn{ r.nonnull[k].load() };
-                // PRIMITIVE arrays are HARD at EVERY length: make_java_object's
-                // GC-aware JNI New<Type>Array fallback covers the previously-flaky
-                // large/GC-needed allocations, so [Z..[D at len 0/1/3/256 must all
-                // succeed on every JDK (incl. java26).  Only REFERENCE arrays
-                // ([L...) stay best-effort: the fix deliberately does NOT add a
-                // NewObjectArray fallback, so on a GC-active config they can still
-                // return null — recorded [INFO], asserted HARD when they DID land.
                 const bool best_effort{ spec.is_reference };
                 if (best_effort && !nn)
                 {
@@ -720,17 +989,13 @@ namespace
                 ctx.check("native_length_matches_" + suffix, r.len_ok[k].load());
             }
 
-            // Primitive-only native element invariants.
             if (!spec.is_reference)
             {
-                // Fresh-array default-init (read before any write == zero).
                 ctx.check(std::string{ "native_zero_init_tested_" } + tag[di], r.zero_init_tested.load());
                 ctx.check(std::string{ "native_fresh_array_zero_initialised_" } + tag[di], r.zero_init_ok.load());
-                // Boundary round-trip at the representative length (3).
                 ctx.check(std::string{ "native_element_tested_" } + tag[di], r.elem_tested.load());
                 ctx.check(std::string{ "native_element_first_round_trips_" } + tag[di], r.elem_first_ok.load());
                 ctx.check(std::string{ "native_element_last_round_trips_" } + tag[di], r.elem_last_ok.load());
-                // Deep round-trip at len 256: [0]/[middle]/[last].
                 ctx.check(std::string{ "native_deep_tested_" } + tag[di], r.deep_tested.load());
                 ctx.check(std::string{ "native_deep_first_round_trips_" } + tag[di], r.deep_first_ok.load());
                 ctx.check(std::string{ "native_deep_middle_round_trips_" } + tag[di], r.deep_mid_ok.load());
@@ -738,21 +1003,83 @@ namespace
             }
         }
 
-        // [B and [C are the load-bearing primitives make_java_string depends on:
-        // make the dependency explicit with a dedicated, unmistakable invariant at
-        // every length.  (Hard on ALL JDKs — never gated.)
+        // [B and [C are the load-bearing primitives make_java_string depends on.
         {
             const bool b_all{ g_results[D_B].len_ok[0].load() && g_results[D_B].len_ok[1].load()
-                             && g_results[D_B].len_ok[2].load() && g_results[D_B].len_ok[3].load() };
+                             && g_results[D_B].len_ok[2].load() && g_results[D_B].len_ok[3].load()
+                             && g_results[D_B].len_ok[4].load() };
             const bool c_all{ g_results[D_C].len_ok[0].load() && g_results[D_C].len_ok[1].load()
-                             && g_results[D_C].len_ok[2].load() && g_results[D_C].len_ok[3].load() };
+                             && g_results[D_C].len_ok[2].load() && g_results[D_C].len_ok[3].load()
+                             && g_results[D_C].len_ok[4].load() };
             ctx.check("byte_array_all_lengths_ok_make_java_string_dependency", b_all);
             ctx.check("char_array_all_lengths_ok_make_java_string_dependency", c_all);
         }
 
+        // Big-allocation (100k) primitive invariant: every primitive descriptor
+        // must allocate and report the right length at the large size.  HARD on
+        // all JDKs (k_lengths[4] is the big length; index reused below).
+        {
+            constexpr std::size_t big_k{ 4 };
+            static_assert(k_lengths[big_k] == k_big_len, "big length index drift");
+            bool all_big_primitives_ok{ true };
+            for (std::size_t di{ 0 }; di < D_COUNT; ++di)
+            {
+                if (k_specs[di].is_reference) { continue; }
+                if (!g_results[di].len_ok[big_k].load()) { all_big_primitives_ok = false; break; }
+            }
+            ctx.check("native_big_100k_primitive_arrays_all_allocate_and_length_ok",
+                      all_big_primitives_ok);
+        }
+
         // =================================================================
-        //  4. GUARDS — negative length, non-array / malformed descriptors all
-        //     return null gracefully (no crash).  HARD on every JDK.
+        //  4. PASS-INTO-JAVA — built from a C++ vector, every element verified by
+        //     a real Java method (sum*/check* for primitives).  HARD on all JDKs:
+        //     these use the primitive allocation path (always succeeds) + the
+        //     method-call surface, so a wrong element width / stride / value is a
+        //     genuine failure.
+        // =================================================================
+        for (std::size_t di{ 0 }; di < D_COUNT; ++di)
+        {
+            const desc_spec& spec{ k_specs[di] };
+            if (spec.is_reference) { continue; }
+            desc_result& r{ g_results[di] };
+            ctx.check(std::string{ "java_feed_attempted_" } + tag[di], r.fed_attempted.load());
+            ctx.check(std::string{ "java_feed_dispatched_" } + tag[di], r.fed_dispatched.load());
+            ctx.check(std::string{ "java_feed_return_matches_cpp_checksum_" } + tag[di], r.fed_return_ok.load());
+            ctx.check(std::string{ "java_feed_observed_length_5_" } + tag[di], r.fed_len_ok.load());
+            ctx.check(std::string{ "java_feed_observed_first_last_match_" } + tag[di], r.fed_first_last_ok.load());
+        }
+
+        // Reference fillers: best-effort (gated on the made array existing).  When
+        // dispatched, the non-null count MUST be the 2 the filler stores.
+        for (std::size_t di : { static_cast<std::size_t>(D_OBJ), static_cast<std::size_t>(D_STR) })
+        {
+            desc_result& r{ g_results[di] };
+            if (r.fed_dispatched.load())
+            {
+                ctx.check(std::string{ "java_ref_fill_nonnull_count_is_2_" } + tag[di], r.fed_return_ok.load());
+                // Cross-read the fillCheck* witnesses too (length 3, roundtrip,
+                // exactly 2 non-null after the fill).
+                const char* len_field{ di == D_OBJ ? "refObjLen" : "refStrLen" };
+                const char* nn_field{ di == D_OBJ ? "refObjNonNull" : "refStrNonNull" };
+                const char* rt_field{ di == D_OBJ ? "refObjRoundtrip" : "refStrRoundtrip" };
+                ctx.check(std::string{ "java_ref_fill_length_is_3_" } + tag[di],
+                          mja::get_int(len_field) == k_witness_len);
+                ctx.check(std::string{ "java_ref_fill_two_non_null_" } + tag[di],
+                          mja::get_int(nn_field) == 2);
+                ctx.check(std::string{ "java_ref_fill_element_roundtrip_" } + tag[di],
+                          mja::get_bool(rt_field));
+            }
+            else
+            {
+                ctx.record(std::string{ "[INFO] java_ref_fill_" } + tag[di]
+                           + ": SKIPPED — reference-array make_java_array returned null on this"
+                             " JVM (no NewObjectArray fallback / JDK 8). Primitive feed is the floor.");
+            }
+        }
+
+        // =================================================================
+        //  5. GUARDS.
         // =================================================================
         ctx.check("guard_negative_length_minus1_returns_null", g_neg_len_minus1_null.load());
         ctx.check("guard_negative_length_intmin_returns_null", g_neg_len_intmin_null.load());
@@ -766,15 +1093,12 @@ namespace
         ctx.check("guard_missing_element_class_returns_null", g_missing_elem_class_null.load());
 
         // =================================================================
-        //  5. The new allow_jni_fallback parameter: =false on a small valid
-        //     PRIMITIVE descriptor still succeeds on the untouched TLAB path.
-        //     HARD on every JDK (the fast path does not depend on the flag).
+        //  6. allow_jni_fallback parameter.
         // =================================================================
         ctx.check("allow_jni_fallback_false_primitive_still_allocates", g_no_fallback_primitive_ok.load());
 
         // =================================================================
-        //  6. MULTI-DIM array ("[[I"): a valid reference (ObjArrayKlass)
-        //     allocation.  Best-effort, same gating as the other ref arrays.
+        //  7. MULTI-DIM array ("[[I").
         // =================================================================
         if (g_multidim_nonnull.load())
         {
@@ -789,27 +1113,10 @@ namespace
         }
 
         // =================================================================
-        //  7. JAVA-VISIBLE witnesses — the made array is a REAL Java array.  For
-        //     each descriptor: it was stored into recv*, the slot is non-null,
-        //     its .length == 3, and getClass().getName() is exactly the JVM's
-        //     dotted binary array-class name.
+        //  8. JAVA-VISIBLE recv* witnesses — the made array is a REAL Java array.
         // =================================================================
         if (probe_done)
         {
-            // The Java-visible recv layer is a BONUS proof on top of the native
-            // invariants above (allocation / valid oop / length slot / zero-init /
-            // element round-trips / the make_java_string [B+[C deps — all HARD).
-            // Unlike the immediately-validated native checks, it holds a made oop
-            // in a static recv* field across the whole allocation sweep AND the
-            // probe boundary, so it is exposed to GC: a heavy unrooted-allocation
-            // sweep can invalidate a LATE witness before it roots (observed on
-            // windows·java11 for the last descriptors — a GC-timing/platform
-            // limitation, NOT a feature defect; the native layer proves the
-            // feature on every JDK).  So gate each per-descriptor check on whether
-            // the store actually landed (`stored`): when it did, the array MUST be
-            // a correct, non-null, length-3 array of the exact type (HARD, every
-            // JDK); when it did not, record [INFO].  A hard MAJORITY floor keeps
-            // this from being vacuous.
             std::size_t stored_correct{ 0 };
             for (std::size_t di{ 0 }; di < D_COUNT; ++di)
             {
@@ -835,8 +1142,6 @@ namespace
                     continue;
                 }
 
-                // Stored => it MUST be exactly the array we made: non-null, length
-                // 3, exact binary type name.  HARD on every JDK that stored it.
                 const bool not_null{ obs_null == false };
                 const bool len_ok{ obs_len == k_witness_len };
                 const bool type_ok{ obs_type == spec.expected_name };
@@ -846,16 +1151,12 @@ namespace
                 if (not_null && len_ok && type_ok) { ++stored_correct; }
             }
 
-            // CROSS-CUTTING HARD invariant (all JDKs): any recv slot the JVM sees
-            // as non-null MUST be a length-3 array whose name starts with '[' —
-            // catches a "stored a non-array / wrong-length blob" corruption
-            // regardless of which JDK / how many descriptors landed.
             {
                 bool every_nonnull_recv_is_array_len3{ true };
                 for (std::size_t di{ 0 }; di < D_COUNT; ++di)
                 {
                     const desc_spec& spec{ k_specs[di] };
-                    if (!mja::get_bool(spec.null_field))   // slot is non-null Java-side
+                    if (!mja::get_bool(spec.null_field))
                     {
                         const std::int32_t obs_len{ mja::get_int(spec.len_field) };
                         const std::string  obs_type{ mja::get_str(spec.type_field) };
@@ -870,30 +1171,17 @@ namespace
                           every_nonnull_recv_is_array_len3);
             }
 
-            // HARD floor: the Java-visible path genuinely works for the MAJORITY
-            // of descriptors (the early ones root before GC pressure builds), so a
-            // real regression is still caught while the GC-timing tail on stressed
-            // configs is tolerated.  Worst observed in CI = 7/10 (windows·java11).
             ctx.check("java_recv_majority_stored_correct", stored_correct >= 5);
             ctx.record(std::string{ "[INFO] make_java_array Java-visible: " }
                        + std::to_string(static_cast<int>(stored_correct)) + "/"
                        + std::to_string(static_cast<int>(D_COUNT))
                        + " descriptors stored a correct array (>=5 required hard).");
         }
-
-        // scoped_hook `handle` uninstalls here at scope exit; the unconditional
-        // shutdown_hooks() in the entry wrapper is the belt-and-braces floor.
     }
 }
 
 VMHOOK_JVM_MODULE(make_java_array)
 {
-    // SUITE-SAFETY: run the whole body under a try/catch so a thrown C++
-    // exception is downgraded to an [INFO] line (never a suite FAIL), and run an
-    // UNCONDITIONAL shutdown_hooks() OUTSIDE the try as the last statement so no
-    // hook is left armed for later modules even on an early return (the
-    // scoped_hook inside run_body also disarms on scope exit — this is the
-    // belt-and-braces floor).
     try
     {
         run_body(ctx);

@@ -30,14 +30,18 @@ import vmhook.Harness;
  * Coverage layers:
  *   - single-arg primitive overloads: int / long / double / float / boolean /
  *     byte / short / char  (the full primitive descriptor set I J D F Z B S C),
- *   - reference overloads: String (Ljava/lang/String;) vs Object (the wildcard
- *     L...; branch) so the native side proves String resolves distinctly from
- *     a generic Object overload,
+ *   - reference overloads: String (Ljava/lang/String;) vs Object (Ljava/lang/
+ *     Object;) vs Integer (Ljava/lang/Integer;) — THREE distinct reference types
+ *     so the native side proves the matcher discriminates on the FULL class name
+ *     inside 'L...;', not merely "is a reference"; a wrapper registered as each
+ *     class resolves to exactly its overload,
  *   - ARITY overloads: pick() / pick(int) / pick(int,int) / pick(int,int,int)
  *     all share the name "pick" and are told apart purely by argument count,
  *   - two-arg type-order overloads: pick(int,long) vs pick(long,int) vs
- *     pick(int,String) — proves the matcher checks EACH parameter slot, not just
- *     the first, and respects order,
+ *     pick(int,String) vs pick(String,int) vs pick(long,double) — proves the
+ *     matcher checks EACH parameter slot (primitive AND reference), respects
+ *     ORDER (int,String vs String,int share a type multiset but differ by slot),
+ *     and walks two CONSECUTIVE wide (two-slot) params (long,double -> "(JD)I"),
  *   - ARRAY-vs-scalar overloads: pick(int[]) / pick(long[]) ("[I" / "[J") sit
  *     alongside pick(int) / pick(long) so the native side proves the resolver's
  *     array-token parser walks past a '[' descriptor when matching a scalar arg
@@ -47,9 +51,12 @@ import vmhook.Harness;
  *   - STATIC overloads mirrored as spick(...) so the native side can exercise
  *     the static-call resolution path (a KNOWN-broken path on JDKs where the
  *     call stub is absent — see the native module + agent notes),
- *   - a no-match probe: callNoOverload is a name that exists with exactly one
- *     signature the native side will deliberately call with a non-matching arg
- *     type, to observe the fallback-to-first behaviour.
+ *   - no-match probes (graceful failure, never a crash): onlyInt(I)I called with
+ *     a double (type mismatch) and with zero args (arity mismatch) — both
+ *     primitive, so the fallback dispatch is memory-safe; and onlyRef(Integer)
+ *     called with a wrapper registered as java/lang/Double (reference-type
+ *     mismatch) — its descriptor matches no onlyRef overload, so resolution falls
+ *     back to the SOLE onlyRef(Integer) and returns deterministically (8500).
  *
  * Java 8 syntax only (no var / records / switch-expressions / text-blocks).
  */
@@ -82,11 +89,31 @@ public final class MethodOverload
     public static final int RET_CHAR        = 1008;  // pick(char)
     public static final int RET_STRING      = 1009;  // pick(String)
     public static final int RET_OBJECT      = 1010;  // pick(Object)
+    public static final int RET_INTEGER     = 1011;  // pick(Integer)  — a SECOND
+    //   reference overload distinct from Object: descriptor Ljava/lang/Integer;.
+    //   A wrapper REGISTERED as java/lang/Integer must resolve here, NOT to
+    //   pick(Object) (Ljava/lang/Object;) nor pick(String) (Ljava/lang/String;),
+    //   proving the matcher compares the FULL class name inside 'L...;', not just
+    //   "is a reference".  Body must NOT dereference `a` (the native side may pass
+    //   an oop of a different runtime type to drive resolution only).
     public static final int RET_INT_INT     = 1021;  // pick(int,int)
     public static final int RET_INT_INT_INT = 1022;  // pick(int,int,int)
     public static final int RET_INT_LONG    = 1023;  // pick(int,long)
     public static final int RET_LONG_INT    = 1024;  // pick(long,int)
     public static final int RET_INT_STRING  = 1025;  // pick(int,String)
+    public static final int RET_STRING_INT  = 1026;  // pick(String,int)  — the
+    //   reference-FIRST mirror of pick(int,String): proves the matcher checks the
+    //   FIRST parameter slot's descriptor too (a reference) and respects ORDER, so
+    //   pick(String,int) and pick(int,String) are told apart by slot, not by the
+    //   multiset of their parameter types.
+    public static final int RET_LONG_DOUBLE = 1027;  // pick(long,double)  — TWO
+    //   consecutive wide (two-interpreter-slot) parameters, "(JD)I".  Here the
+    //   concern is RESOLUTION ONLY: a (int64_t,double) call must select THIS
+    //   overload, distinct from pick(int,long) "(IJ)I" / pick(long,int) "(JI)I".
+    //   (Exhaustive wide-slot PACKING fidelity — truncation / slot-shift across
+    //   long+double adjacency — is owned by the method_call_wide_args module's
+    //   jd/dj/addD/mixD methods; this overload exists so the RESOLVER's two-wide
+    //   parameter walk is exercised in the overload-disambiguation module.)
     // Array overloads: descriptor "[I" / "[J" — a leading '[' the matcher must
     // parse via next_argument_descriptor's array branch and treat as DISTINCT
     // from the scalar "I" / "J" overloads (array-vs-scalar disambiguation).
@@ -141,6 +168,11 @@ public final class MethodOverload
     public int pick(final short a)      { lastShortArg = a;  return RET_SHORT; }
     public int pick(final char a)       { lastCharArg = a;   return RET_CHAR; }
     public int pick(final Object a)     { return RET_OBJECT; }
+    // SECOND reference overload (distinct class inside 'L...;').  Body ignores `a`
+    // on purpose: the native side resolves THIS overload by registering a wrapper
+    // type as java/lang/Integer and may hand it an oop of another runtime type —
+    // dereferencing it would be unsound, and resolution does not require it.
+    public int pick(final Integer a)    { return RET_INTEGER; }
 
     public int pick()                                       { return RET_NOARG; }
     public int pick(final int a, final int b)               { lastArg2A = a; lastArg2B = b; return RET_INT_INT; }
@@ -148,6 +180,16 @@ public final class MethodOverload
     public int pick(final int a, final long b)              { lastArg2A = a; lastArg2B = b; return RET_INT_LONG; }
     public int pick(final long a, final int b)              { lastArg2A = b; lastArg2B = a; return RET_LONG_INT; }
     public int pick(final int a, final String b)            { lastArg2A = a; lastStringArg = b; return RET_INT_STRING; }
+    // Reference-FIRST two-arg overload: slot0 = String (a reference), slot1 = int.
+    // Echo b into lastArg2A and the String into lastStringArg so the native side
+    // can prove both the right reference and the right int landed in the right
+    // slots (and that the order, not just the type multiset, was honoured).
+    public int pick(final String a, final int b)            { lastArg2A = b; lastStringArg = a; return RET_STRING_INT; }
+    // Two consecutive WIDE params (long then double) — "(JD)I".  Echo a into
+    // lastArg2B (long) and b into lastDoubleArg so the native side proves the
+    // resolver selected this overload AND both wide values survived into their
+    // (distinct, non-overlapping) slots.
+    public int pick(final long a, final double b)           { lastArg2B = a; lastDoubleArg = b; return RET_LONG_DOUBLE; }
 
     // Array overloads — a leading '[' in the descriptor ("[I" / "[J").  These
     // exist so the resolver's array-token parsing is exercised: scanning the
@@ -174,12 +216,32 @@ public final class MethodOverload
     public static int spick(final short a)   { lastShortArg = a;  return RET_SHORT + SBIAS; }
     public static int spick(final char a)    { lastCharArg = a;   return RET_CHAR + SBIAS; }
     public static int spick(final int a, final int b) { lastArg2A = a; lastArg2B = b; return RET_INT_INT + SBIAS; }
+    // STATIC reference overload twin (the historically-buggy path): a wrapper
+    // registered as java/lang/Integer must re-pick THIS over spick(String).  Body
+    // ignores `a` (same reason as pick(Integer)).
+    public static int spick(final Integer a) { return RET_INTEGER + SBIAS; }
+    // STATIC two-wide-parameter twin "(JD)I": (int64_t,double) must select this,
+    // distinct from any single-wide or narrow static overload.  RESOLUTION focus;
+    // wide-slot packing fidelity is owned by method_call_wide_args.
+    public static int spick(final long a, final double b) { lastArg2B = a; lastDoubleArg = b; return RET_LONG_DOUBLE + SBIAS; }
 
     // ── A method with exactly ONE signature, for the no-overload baseline ──
     // Single signature => no ambiguity => resolves on every path.  The native
     // side calls it both with the matching type and with a non-matching type to
     // observe the "fall back to this->method" behaviour.
     public int onlyInt(final int a) { lastIntArg = a; return 7000 + a; }
+
+    // A method with exactly ONE *reference* signature, for the reference-typed
+    // no-match baseline.  The native side calls it with a wrapper REGISTERED as a
+    // DIFFERENT class (java/lang/Double), whose descriptor Ljava/lang/Double;
+    // matches no overload of onlyRef (its only signature is Ljava/lang/Integer;).
+    // resolve_compatible_method finds no arg-matching overload and falls back to
+    // this->method — the SOLE onlyRef(Integer) — which then dispatches.  The
+    // return is therefore deterministic (8500), proving the reference no-match
+    // fallback is graceful (no crash) AND well-defined for a single-overload name.
+    // Body IGNORES `a`: the native side passes an oop of another runtime type, so
+    // dereferencing it would be unsound and is unnecessary for this check.
+    public int onlyRef(final Integer a) { return 8500; }
 
     static
     {
