@@ -251,8 +251,16 @@ jobs:
           Start-Sleep -Seconds 5
 
           $inject = Start-Process -FilePath "build\bin\injector.exe" `
-                                  -PassThru -Wait -WindowStyle Hidden
+                                  -ArgumentList "$($java.Id)" `
+                                  -PassThru -Wait -WindowStyle Hidden `
+                                  -RedirectStandardOutput "injector_stdout.txt" `
+                                  -RedirectStandardError  "injector_stderr.txt"
           Write-Host "injector.exe exit=$($inject.ExitCode)"
+          # The injector logs [INFO]/[OK]/[ERROR] to stdout; surface it so an
+          # injection failure (e.g. a DLL-load error inside the remote thread)
+          # names its own cause instead of an opaque "exit=1".
+          if (Test-Path "injector_stdout.txt") { Write-Host "--- injector stdout ---"; Get-Content "injector_stdout.txt" | ForEach-Object { Write-Host $_ } }
+          if (Test-Path "injector_stderr.txt") { $ie = @(Get-Content "injector_stderr.txt"); if ($ie.Count) { Write-Host "--- injector stderr ---"; $ie | ForEach-Object { Write-Host "[ierr] $_" } } }
 
           if ($inject.ExitCode -ne 0) {
             Stop-Process -Id $java.Id -Force -ErrorAction SilentlyContinue

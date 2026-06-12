@@ -156,6 +156,28 @@ function(vmhook_apply_warnings target)
     endif()
 endfunction()
 
+# ── Self-contained MinGW binaries ───────────────────────────────────────────
+# Statically link the GCC / libstdc++ / winpthread runtime into MinGW-built
+# Windows binaries so they carry NO external libstdc++-6.dll / libgcc_s_seh-1.dll
+# / libwinpthread-1.dll dependency.
+#
+# Why this matters for the injected DLL: the CI JVM jobs download the build
+# artefact and inject vmhook.dll into java.exe via CreateRemoteThread+LoadLibraryW.
+# LoadLibraryW resolves vmhook.dll's imports against the JVM PROCESS's DLL search
+# path (java.exe's directory + System32 + PATH) — NOT vmhook.dll's own directory —
+# and the JVM job never installs MSYS2/MinGW, so the GCC runtime DLLs are not on
+# that path.  A dynamically-linked MinGW vmhook.dll therefore fails to load and the
+# injector reports "exit=1 / Injection failed".  This is environment-dependent: it
+# passed only while the runner image happened to carry the MinGW runtime on PATH,
+# and broke the instant the image updated (win25-vs2026/20260608).  Static linking
+# removes the dependency entirely, so injection works on any runner image.
+function(vmhook_static_runtime target)
+    if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_link_options(${target} PRIVATE
+            -static-libgcc -static-libstdc++ -static)
+    endif()
+endfunction()
+
 # ── Example DLL / shared library that drives the JVM tests ──────────────────
 if(VMHOOK_BUILD_EXAMPLE)
     set(_vmhook_example_sources vmhook/src/example.cpp)
@@ -203,6 +225,9 @@ if(VMHOOK_BUILD_EXAMPLE)
         target_compile_definitions(vmhook_example PRIVATE VMHOOK_BENCH_USE_JNI=1)
     endif()
     vmhook_apply_warnings(vmhook_example NO_WERROR)
+    # Self-contained on MinGW: java.exe's LoadLibraryW must resolve this DLL with
+    # no external libstdc++-6 / libgcc_s_seh-1 / libwinpthread-1 on its search path.
+    vmhook_static_runtime(vmhook_example)
     set_target_properties(vmhook_example PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
@@ -214,6 +239,8 @@ if(VMHOOK_BUILD_INJECTOR AND VMHOOK_PLATFORM_WINDOWS)
     set_target_properties(vmhook_injector PROPERTIES OUTPUT_NAME "injector")
     target_link_libraries(vmhook_injector PRIVATE kernel32)
     vmhook_apply_warnings(vmhook_injector)
+    # Self-contained on MinGW: the JVM runner has no MinGW runtime on PATH.
+    vmhook_static_runtime(vmhook_injector)
     set_target_properties(vmhook_injector PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
