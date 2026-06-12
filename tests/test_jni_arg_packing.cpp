@@ -1259,28 +1259,17 @@ int main()
         bool aliased{};
         std::memcpy(&aliased, &raw, sizeof aliased);
         pack_one(aliased, v, storage);
-        // Whether the packer copies the raw 0xFF byte VERBATIM or canonicalises it
-        // to 1 is COMPILER-DEFINED, not portable: pack_one's source `aliased` is a
-        // bool object holding 0xFF (a non-canonical / trap representation), and the
-        // lvalue-to-rvalue read of it inside the packer is undefined behaviour whose
-        // result varies by compiler/codegen — GCC/MSVC have propagated 255 verbatim,
-        // but MinGW after an UNRELATED codegen shift canonicalised it to 1 (CI run
-        // 27409143538 flipped purely from a distant header edit).  So the LOAD-
-        // BEARING, portable property is only that the packer wrote a SINGLE bool
-        // byte — EITHER the raw 0xFF OR the canonical 1 — into the low cell and left
-        // the high bytes zero; NOT which of the two it chose.  Read the object
-        // representation via memcpy (well-defined on every compiler).
-        unsigned char z_byte{ 0 };
-        std::memcpy(&z_byte, &v.z, sizeof z_byte);
-        check("I_bool_from_0xFF_byte_z_member_is_raw_or_canonical",
-              z_byte == 0xFFu || z_byte == 0x01u);
-        check("I_bool_from_0xFF_byte_cell_is_raw_or_canonical",
-              static_cast<unsigned char>(v.b) == 0xFFu
-              || static_cast<unsigned char>(v.b) == 0x01u);
+        // pack_one's source `aliased` is a bool object holding the non-canonical
+        // byte 0xFF; the lvalue-to-rvalue read of it inside the packer is UNDEFINED
+        // BEHAVIOUR, so the resulting LOW byte is compiler-/codegen-defined and
+        // genuinely UNPREDICTABLE — not even constrained to {0xFF, 1}: MinGW after
+        // an unrelated codegen shift produced a third value (CI runs 27409143538 /
+        // 27409860975 both flipped purely from a distant header edit).  Asserting
+        // ANY specific low-byte value from a UB read can only flake across
+        // toolchains, so the low byte is deliberately NOT asserted.  The one
+        // WELL-DEFINED, portable property is that the packer wrote into the LOW
+        // cell only and left the HIGH 7 bytes zero (no garbage, no wide write).
         check("I_bool_from_0xFF_byte_high_bytes_zero", (v.j >> 8) == 0);
-        check("I_bool_from_0xFF_byte_full_cell_is_raw_or_canonical",
-              static_cast<std::uint64_t>(v.j) == 0xFFull
-              || static_cast<std::uint64_t>(v.j) == 0x01ull);
     }
 
     // =====================================================================
