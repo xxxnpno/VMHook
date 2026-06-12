@@ -5463,7 +5463,56 @@ namespace vmhook
                 -> vmhook::hotspot::method*
             {
                 // -24 bytes = -3 * sizeof(void*): the Method* slot in the interpreter frame.
-                return *reinterpret_cast<vmhook::hotspot::method**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::frame*>(this)) - 24);
+                //
+                // `this` is the interpreter rbp handed straight to common_detour by
+                // the trampoline.  On a cold / relocated / about-to-be-GC-walked
+                // interpreter frame (the JDK 21+ injection point is reached while
+                // the thread may still be mid-transition; a stale frame can also
+                // survive a GC for an instant) rbp can be in-range+aligned (passing
+                // is_valid_pointer) yet point at a page that is not actually mapped
+                // at this instant.  A raw `*(this - 24)` then FAULTS, and on the
+                // no-SEH toolchains (MinGW, clang-on-windows) that hardware AV is
+                // uncontained — vmhook's surrounding try/catch only catches C++
+                // exceptions, and a thread-scoped VEH cannot safely swallow it
+                // because HotSpot uses access violations for its own implicit
+                // null-checks and safepoint polls — so it kills the JVM.  This is
+                // the one genuinely-cold dispatch-time read on common_detour's hot
+                // path (the sibling get_locals() below was already hardened the
+                // same way by the a9c5 fix); extend the identical discipline here.
+                //
+                // Gate on is_valid_pointer first, then read the Method* slot
+                // through os::safe_read (kernel-validated: ReadProcessMemory on
+                // Windows / process_vm_readv on Linux — never faults).  On a bad
+                // frame this returns nullptr, which both callers already treat as
+                // "give up safely": get_arguments() bails on a null method, and
+                // common_detour simply finds no g_hooked_methods entry matching a
+                // null current_method and falls through to the original method
+                // body.  For a normal mapped frame the value is byte-identical to
+                // the old raw load, so the warm path is unchanged.
+                //
+                // Perf: this read happens once per hooked-method invocation.  On
+                // MSVC-cl the safe_read_fast SEH path would be a table-based
+                // memcpy with no syscall on the no-fault case; we deliberately use
+                // the plain os::safe_read (single kernel round-trip) here so the
+                // crash-safety guarantee is uniform across the MinGW / clang-windows
+                // CI legs that are exactly where the uncontained fault was observed
+                // — a kernel-validated read is the only construction that does not
+                // fault on those no-SEH toolchains.  One ReadProcessMemory per
+                // intercepted call is negligible beside the user detour it gates,
+                // and the value-comparison scan over g_hooked_methods that follows
+                // stays a raw, lock-free loop over our own (always-mapped) heap.
+                if (!vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return nullptr;
+                }
+                vmhook::hotspot::method* method_pointer{ nullptr };
+                if (!vmhook::os::safe_read(&method_pointer,
+                                           reinterpret_cast<const std::uint8_t*>(this) - 24,
+                                           sizeof(method_pointer)))
+                {
+                    return nullptr;
+                }
+                return method_pointer;
             }
 
             /*
@@ -6498,6 +6547,18 @@ namespace vmhook
                     throw vmhook::exception{ "JavaThread pointer is null or invalid." };
                 }
 
+                // frame::get_method() is the only genuinely-cold dispatch-time
+                // deref (the interpreter frame's Method* slot at rbp-24).  It is
+                // is_valid_pointer-gated and read through os::safe_read inside
+                // get_method(), so a cold / unmapped / torn frame yields nullptr
+                // here instead of faulting the JVM on the no-SEH toolchains; the
+                // value-comparison scan below then matches no g_hooked_methods
+                // entry (install never stores a null method) and we fall through
+                // to the original method body.  thread came from r15 (the live
+                // current JavaThread, always mapped) and is validated above, so
+                // it needs no safe_read; the scan itself only compares pointer
+                // VALUES against our own always-mapped vector, never dereferencing
+                // a cold pointer — keeping the hot loop raw and lock-free.
                 const method* const current_method{ frame_pointer->get_method() };
                 struct current_thread_guard
                 {
