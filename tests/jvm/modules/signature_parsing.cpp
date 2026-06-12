@@ -181,11 +181,20 @@ namespace
         std::size_t i{ 0 };
         while (i < args.size())
         {
-            // Skip array-dimension markers; the element type follows.
+            // Skip array-dimension markers; the element type follows.  An ARRAY
+            // is a reference: it occupies exactly ONE local-variable slot no
+            // matter what its element type is (JVMS §2.6.1 -- a reference value
+            // is one slot).  So once we have seen any '[', the token is a single
+            // 1-slot reference and the element type that follows is consumed but
+            // contributes NO further slots -- in particular an array OF long /
+            // double ([J / [D) is 1 slot, NOT 2.  (Only a bare top-level J / D,
+            // with no preceding '[', is the two-slot category.)
+            const std::size_t bracket_start{ i };
             while (i < args.size() && args[i] == '[')
             {
                 ++i;
             }
+            const bool is_array{ i != bracket_start };
             if (i >= args.size())
             {
                 return false;   // trailing '[' with no element type -> malformed
@@ -207,13 +216,15 @@ namespace
             {
                 ++i;
                 ++count;
-                slots += 1;
+                slots += 1;         // narrow primitive, or array-of-narrow: 1 slot
             }
             else if (c == 'J' || c == 'D')
             {
                 ++i;
                 ++count;
-                slots += 2;         // long / double occupy two slots
+                // A bare long/double is two slots; an array of them ([J / [D) is
+                // a single reference slot.
+                slots += is_array ? 1 : 2;
             }
             else
             {
@@ -824,6 +835,380 @@ namespace
                     ctx.check("clsmap_ctor_wrapper_int_is_Lname_I_V",
                               s == "(Lvmhook/fixtures/FindMethodsBySig;I)V");
                 }
+            }
+        }
+
+        // =====================================================================
+        //  8. EXHAUSTIVE DESCRIPTOR-SHAPE SWEEP (the "every possible input" core).
+        //     Every primitive, object and array descriptor SHAPE the JVMS § 4.3
+        //     grammar admits, driven through the SAME two parsing surfaces the
+        //     library uses: the return-descriptor extraction (call-site policy,
+        //     mirrored by call_site_return_basic_type) and the arg-list walk
+        //     (count_arg_slots, the grammar twin of the library's private
+        //     next_argument_descriptor).  Each row pins the exact BasicType /
+        //     slot / arg-count, so any table or grammar drift names the case.
+        // =====================================================================
+        {
+            // -- 8a. Every PRIMITIVE descriptor as a RETURN, via the call site. --
+            //    (The 8 value primitives + V; their BasicType is the table value.)
+            struct ret_row { const char* sig; int basic; };
+            const ret_row prim_rets[]{
+                { "()Z", 4 }, { "()C", 5 }, { "()F", 6 }, { "()D", 7 },
+                { "()B", 8 }, { "()S", 9 }, { "()I", 10 }, { "()J", 11 },
+                { "()V", 14 },
+            };
+            bool prim_ret_ok{ true };
+            for (const ret_row& r : prim_rets)
+            {
+                if (call_site_return_basic_type(r.sig) != r.basic) { prim_ret_ok = false; }
+            }
+            ctx.check("sigparse_every_primitive_return_basic_type", prim_ret_ok);
+
+            // -- 8b. Every PRIMITIVE descriptor as a single ARG: arg-count 1,
+            //    slot 1 except J/D which are 2, width matches the table, and the
+            //    arg char's BasicType is the primitive band [4,11]. --
+            struct arg_row { const char* code; int slots; std::size_t width; int basic; };
+            const arg_row prim_args[]{
+                { "Z", 1, 1, 4 }, { "C", 1, 2, 5 }, { "F", 1, 4, 6 }, { "D", 2, 8, 7 },
+                { "B", 1, 1, 8 }, { "S", 1, 2, 9 }, { "I", 1, 4, 10 }, { "J", 2, 8, 11 },
+            };
+            bool prim_arg_ok{ true };
+            for (const arg_row& a : prim_args)
+            {
+                const std::string one_arg{ std::string{ "(" } + a.code + ")V" };
+                std::string_view ap{};
+                int s{ 0 };
+                int n{ 0 };
+                const bool parsed{ args_portion(one_arg, ap) && count_arg_slots(ap, s, n) };
+                if (!parsed || n != 1 || s != a.slots) { prim_arg_ok = false; }
+                const char buf[1]{ a.code[0] };
+                if (vmhook::detail::jvm_primitive_byte_width(std::string_view{ buf, 1 }) != a.width)
+                {
+                    prim_arg_ok = false;
+                }
+                if (vmhook::detail::sig_char_to_basic_type(a.code[0]) != a.basic) { prim_arg_ok = false; }
+            }
+            ctx.check("sigparse_every_primitive_arg_slots_width_basic", prim_arg_ok);
+
+            // -- 8c. OBJECT descriptor shapes (JVMS internal form: '/'-separated,
+            //    '$' inner classes, digits in names, single-char package).  As a
+            //    RETURN each is T_OBJECT(12); as a single ARG each is exactly one
+            //    slot, and the whole arg portion has primitive-width 0 (it is a
+            //    reference, never a primitive). --
+            const char* const object_names[]{
+                "Ljava/lang/String;",                 // canonical
+                "Ljava/lang/Object;",                 // the fallback target
+                "La/B;",                              // single-char package + class
+                "LFoo;",                              // default (no) package
+                "Lcom/example/Outer$Inner;",          // '$' inner class
+                "Lcom/example/Outer$Inner$Deep;",     // nested inner
+                "Lp1/p2/p3/p4/p5/p6/Deeply;",         // deeply qualified
+                "Lcom/example/Cls2Name3;",            // digits inside identifiers
+                "Lx/_y/$z;",                          // '_' and '$' as identifier chars
+                "Lcom/example/a1/b2/c3/D4$E5;",       // digits + inner combined
+            };
+            bool obj_ret_ok{ true };
+            bool obj_arg_ok{ true };
+            for (const char* const name : object_names)
+            {
+                // return: "()L...;"
+                const std::string ret_sig{ std::string{ "()" } + name };
+                if (call_site_return_basic_type(ret_sig) != 12) { obj_ret_ok = false; }
+                // arg: "(L...;)V" -> 1 slot, 1 arg, arg portion width 0
+                const std::string arg_sig{ std::string{ "(" } + name + ")V" };
+                std::string_view ap{};
+                int s{ 0 };
+                int n{ 0 };
+                const bool parsed{ args_portion(arg_sig, ap) && count_arg_slots(ap, s, n) };
+                if (!parsed || s != 1 || n != 1) { obj_arg_ok = false; }
+                if (vmhook::detail::jvm_primitive_byte_width(ap) != 0) { obj_arg_ok = false; }
+            }
+            ctx.check("sigparse_object_shapes_return_is_object_12", obj_ret_ok);
+            ctx.check("sigparse_object_shapes_arg_is_one_slot_width0", obj_arg_ok);
+
+            // -- 8d. ARRAY descriptor shapes: 1-D..N-D, primitive and reference
+            //    element.  As a RETURN every array is T_ARRAY(13) regardless of
+            //    element type or dimension (the call site keys on the leading
+            //    '[').  As a single ARG every array is exactly ONE slot (arrays
+            //    are references), and the arg portion has primitive-width 0. --
+            const char* const array_descs[]{
+                "[I", "[J", "[D", "[Z", "[B", "[C", "[S", "[F",   // 1-D, each primitive
+                "[[I", "[[[D", "[[[[J",                            // 2-D / 3-D / 4-D primitive
+                "[Ljava/lang/Object;", "[Ljava/lang/String;",      // 1-D reference
+                "[[Ljava/lang/String;",                            // 2-D reference
+                "[[[[[[[[Ljava/lang/Object;",                      // 8-D reference (deep)
+                "[[[[[[[[[[[[[[[[I",                               // 16-D primitive (deep)
+            };
+            bool arr_ret_ok{ true };
+            bool arr_arg_ok{ true };
+            for (const char* const desc : array_descs)
+            {
+                const std::string ret_sig{ std::string{ "()" } + desc };
+                if (call_site_return_basic_type(ret_sig) != 13) { arr_ret_ok = false; }
+                const std::string arg_sig{ std::string{ "(" } + desc + ")V" };
+                std::string_view ap{};
+                int s{ 0 };
+                int n{ 0 };
+                const bool parsed{ args_portion(arg_sig, ap) && count_arg_slots(ap, s, n) };
+                if (!parsed || s != 1 || n != 1) { arr_arg_ok = false; }
+                if (vmhook::detail::jvm_primitive_byte_width(ap) != 0) { arr_arg_ok = false; }
+            }
+            ctx.check("sigparse_array_shapes_return_is_array_13", arr_ret_ok);
+            ctx.check("sigparse_array_shapes_arg_is_one_slot_width0", arr_arg_ok);
+
+            // -- 8e. METHOD descriptors: empty / single / multi / MANY params,
+            //    mixing every width so the slot count exercises the J/D two-slot
+            //    rule against narrow + reference args.  out_slots / out_count are
+            //    pinned exactly. --
+            struct method_row { const char* sig; int ret; int slots; int count; };
+            const method_row method_rows[]{
+                { "()V", 14, 0, 0 },                                        // empty params
+                { "(I)I", 10, 1, 1 },                                       // 1 narrow
+                { "(J)J", 11, 2, 1 },                                       // 1 wide (2 slots)
+                { "(JD)V", 14, 4, 2 },                                      // two wides -> 4 slots
+                { "(IJD)D", 7, 5, 3 },                                      // narrow+wide+wide
+                { "(Ljava/lang/String;[IJ)Ljava/lang/Object;", 12, 4, 3 },  // ref(1)+arr(1)+J(2)
+                { "(ZBCSIFJD)V", 14, 10, 8 },                               // all 8 prims: 6*1+2*2
+                { "(IIIIIIIIII)I", 10, 10, 10 },                            // ten narrows
+                { "(JJJJJ)J", 11, 10, 5 },                                  // five wides -> 10 slots
+                { "([[[ILjava/lang/String;D)V", 14, 4, 3 },                 // 3-D arr(1)+ref(1)+D(2)
+                { "([Ljava/lang/String;[[Ljava/lang/Object;)V", 14, 2, 2 }, // two ref arrays
+            };
+            bool method_ok{ true };
+            for (const method_row& mr : method_rows)
+            {
+                std::string_view ap{};
+                int s{ 0 };
+                int n{ 0 };
+                const bool parsed{ args_portion(mr.sig, ap) && count_arg_slots(ap, s, n) };
+                if (!parsed || s != mr.slots || n != mr.count) { method_ok = false; }
+                if (call_site_return_basic_type(mr.sig) != mr.ret) { method_ok = false; }
+            }
+            ctx.check("sigparse_method_descriptor_slot_and_return_matrix", method_ok);
+
+            // -- 8f. A genuinely-large parameter list: 64 long args -> 64 args /
+            //    128 slots, void return.  Proves the arg walk has no fixed cap and
+            //    the slot accumulator is correct at scale (the call site itself
+            //    only fills 8 slots, but the GRAMMAR walk is unbounded). --
+            {
+                std::string big{ "(" };
+                for (int i{ 0 }; i < 64; ++i) { big += 'J'; }
+                big += ")V";
+                std::string_view ap{};
+                int s{ 0 };
+                int n{ 0 };
+                const bool parsed{ args_portion(big, ap) && count_arg_slots(ap, s, n) };
+                ctx.check("sigparse_64_long_args_is_64_count_128_slots",
+                          parsed && n == 64 && s == 128);
+                ctx.check("sigparse_64_long_args_return_void_14",
+                          call_site_return_basic_type(big) == 14);
+            }
+        }
+
+        // =====================================================================
+        //  9. ADVERSARIAL / MALFORMED MATRIX (the parser must NOT crash or read
+        //     OOB -- best-effort, graceful).  Two surfaces:
+        //       (a) the return-descriptor extraction (call_site_return_basic_type,
+        //           a faithful copy of the library call site): every degenerate
+        //           input degrades to T_VOID(14), NEVER an OOB read.  This is the
+        //           characterization of the library's bounds+validity guard.
+        //       (b) the arg-list walk (args_portion + count_arg_slots, the grammar
+        //           twin of the library's next_argument_descriptor): malformed arg
+        //           lists return false (no crash, no OOB), never a bogus count.
+        //     Each input is constructed in a std::string and passed as a
+        //     string_view, so operator[]/substr OOB would be UB the sanitizer / a
+        //     crash would catch -- the assertions below also pin the SANE result.
+        // =====================================================================
+        {
+            // -- 9a. Return-parse on degenerate signatures -> always void(14),
+            //    never a crash, never the raw T_OBJECT fallback. --
+            const char* const malformed_rets[]{
+                "",                              // empty
+                "(",                             // '(' with no ')'
+                ")",                             // ')' at end -> rparen+1 == size -> void
+                "()",                            // ends in ')' (rparen+1 == size)
+                "(I)",                           // ends in ')' after an arg
+                "(Ljava/lang/String;)",          // ends in ')' after a ref arg
+                "(II)",                          // ends in ')' after two args
+                "garbage",                       // no paren at all
+                "V",                             // a lone primitive char, no paren
+                "Ljava/lang/String;",            // a lone object desc, no paren
+                "(I)Q",                          // unknown return char -> degrade to void
+                "(I)i",                          // lowercase 'i' is not 'I' -> void
+                "(I)1",                          // digit return char -> void
+                "(I) ",                          // space return char -> void
+                "()VV",                          // trailing junk after a valid return
+                "(()))V",                        // pathological nested parens; last ')' wins
+                "(((",                           // only '(' -> no ')' -> void
+                "))))",                          // only ')' -> last is at size-1 -> void
+            };
+            bool all_malformed_rets_void{ true };
+            for (const char* const s : malformed_rets)
+            {
+                // Construct via std::string then view, so an OOB [rparen+1] read
+                // on the view is genuine UB (caught by ASan / a crash) rather than
+                // the std::string NUL-at-size() masking it.
+                const std::string owned{ s };
+                if (call_site_return_basic_type(std::string_view{ owned }) != 14)
+                {
+                    all_malformed_rets_void = false;
+                }
+            }
+            ctx.check("sigparse_all_malformed_returns_degrade_to_void_14",
+                      all_malformed_rets_void);
+
+            // A couple of degenerate-but-VALID returns that must NOT be swept to
+            // void: ")I" (a ')' with no '(' still yields the byte after it) and
+            // "()I)" (last ')' is final -> void, but "()I" prefix is irrelevant).
+            ctx.check("sigparse_rparen_no_lparen_still_reads_return_I_10",
+                      call_site_return_basic_type(std::string_view{ std::string{ ")I" } }) == 10);
+            ctx.check("sigparse_trailing_rparen_after_valid_ret_is_void_14",
+                      call_site_return_basic_type(std::string_view{ std::string{ "()I)" } }) == 14);
+            // An object name with an EMBEDDED '(' or ')' : rfind(')') keys on the
+            // LAST ')', so a ')' inside the (malformed) name still parses without
+            // OOB; the char after the last ')' is what is honoured.
+            ctx.check("sigparse_embedded_paren_in_objname_no_oob",
+                      call_site_return_basic_type(
+                          std::string_view{ std::string{ "(LweirdName;)V" } }) == 14
+                      && call_site_return_basic_type(
+                          std::string_view{ std::string{ "()Lweird(Name);" } }) == 14);
+
+            // -- 9b. Arg-walk on malformed arg lists -> args_portion+count_arg_slots
+            //    return false (graceful), never a crash, never a bogus count.  The
+            //    arg portion is the substring between '(' and the last ')'. --
+            struct bad_args { const char* sig; bool portion_ok; bool walk_ok; };
+            const bad_args bad_arg_rows[]{
+                // No parens at all: args_portion fails outright.
+                { "garbage", false, false },
+                { "",        false, false },
+                // Unterminated 'L' inside the params: portion is found, walk fails.
+                { "(Ljava/lang/String)V", true, false },   // missing ';'
+                { "(L)V",                true, false },     // bare 'L', no name, no ';'
+                { "(Ljava/lang/String;L)V", true, false },  // 2nd 'L' unterminated
+                // Lone '[' with no element type before ')': walk fails.
+                { "([)V",     true, false },
+                { "([[)V",    true, false },
+                { "(I[)V",    true, false },                // good arg then trailing '['
+                // Garbage / illegal arg descriptor chars: walk fails.
+                { "(Q)V",     true, false },
+                { "(IqI)V",   true, false },                // lowercase q mid-list
+                { "(1)V",     true, false },                // digit as arg char
+                { "( )V",     true, false },                // space as arg char
+                { "(;)V",     true, false },                // stray ';'
+                // ')' before '(' : args_portion sees rp < lp -> false.
+                { ")(",       false, false },
+                // Well-formed empty / valid lists: BOTH succeed (control rows).
+                { "()V",      true, true },
+                { "(I)V",     true, true },
+                { "(IJD)D",   true, true },
+                { "([[Ljava/lang/Object;)V", true, true },
+            };
+            bool all_bad_args_graceful{ true };
+            for (const bad_args& b : bad_arg_rows)
+            {
+                const std::string owned{ b.sig };
+                std::string_view ap{};
+                const bool got_portion{ args_portion(std::string_view{ owned }, ap) };
+                if (got_portion != b.portion_ok) { all_bad_args_graceful = false; }
+                if (got_portion)
+                {
+                    int s{ -1 };
+                    int n{ -1 };
+                    const bool got_walk{ count_arg_slots(ap, s, n) };
+                    if (got_walk != b.walk_ok) { all_bad_args_graceful = false; }
+                    // On a failed walk the out-params must be untouched-or-sane
+                    // (count_arg_slots only writes them on success), and on a
+                    // successful walk a count is never negative.
+                    if (got_walk && (s < 0 || n < 0)) { all_bad_args_graceful = false; }
+                }
+            }
+            ctx.check("sigparse_all_malformed_arg_lists_graceful", all_bad_args_graceful);
+
+            // -- 9c. TRUNCATION sweep: every proper prefix of a fully-formed,
+            //    multi-shape descriptor is fed to BOTH surfaces.  Not one prefix
+            //    may crash; the return-parse always yields a value in {4..14} (it
+            //    can never read OOB), and the arg-walk either parses or cleanly
+            //    fails.  This is the "truncated mid-descriptor" requirement applied
+            //    exhaustively to a representative descriptor. --
+            {
+                const std::string full{ "(Ljava/lang/String;[IJD)[Ljava/lang/Object;" };
+                bool every_prefix_safe{ true };
+                for (std::size_t len{ 0 }; len <= full.size(); ++len)
+                {
+                    const std::string_view prefix{ std::string_view{ full }.substr(0, len) };
+                    // (a) return-parse: must return a valid BasicType band value.
+                    const int bt{ call_site_return_basic_type(prefix) };
+                    if (bt < 4 || bt > 14) { every_prefix_safe = false; }
+                    // (b) arg-walk: must not crash.  args_portion may or may not
+                    //     find a ()-shape in a prefix; if it does, the walk must
+                    //     return a bool without UB.  We only require "no crash"
+                    //     here, so the result is consumed but not asserted.
+                    std::string_view ap{};
+                    if (args_portion(prefix, ap))
+                    {
+                        int s{ 0 };
+                        int n{ 0 };
+                        const bool walked{ count_arg_slots(ap, s, n) };
+                        (void)walked;
+                    }
+                }
+                ctx.check("sigparse_every_truncation_prefix_safe", every_prefix_safe);
+            }
+
+            // -- 9d. Single-byte and high-byte adversarial views through BOTH pure
+            //    helpers (belt-and-braces over the 0..255 sweeps above): leading /
+            //    trailing whitespace, NUL-containing views, and a lone high byte
+            //    all yield width 0; the high byte's BasicType is the T_OBJECT
+            //    fallback (12).  These pin the exact inputs the task calls out. --
+            ctx.check("sigparse_bytewidth_whitespace_and_highbyte_are_0",
+                         vmhook::detail::jvm_primitive_byte_width(" I") == 0
+                      && vmhook::detail::jvm_primitive_byte_width("I ") == 0
+                      && vmhook::detail::jvm_primitive_byte_width("\t") == 0
+                      && vmhook::detail::jvm_primitive_byte_width(std::string_view{ "I\0", 2 }) == 0
+                      && vmhook::detail::jvm_primitive_byte_width(std::string_view{ "\0I", 2 }) == 0
+                      && vmhook::detail::jvm_primitive_byte_width("\xFF") == 0);
+            ctx.check("sigparse_sigchar_highbyte_is_object_fallback_12",
+                         vmhook::detail::sig_char_to_basic_type(static_cast<char>(0x80)) == 12
+                      && vmhook::detail::sig_char_to_basic_type(static_cast<char>(0xC0)) == 12
+                      && vmhook::detail::sig_char_to_basic_type(static_cast<char>(0xFF)) == 12
+                      && vmhook::detail::sig_char_to_basic_type('\t') == 12
+                      && vmhook::detail::sig_char_to_basic_type(' ') == 12);
+        }
+
+        // =====================================================================
+        //  10. LIVE-KLASS adversarial backstop.  The fixture's descriptors are
+        //      all well-formed, but we additionally feed the live klass through
+        //      the TRUNCATION sweep of section 9c, per descriptor, to prove the
+        //      parsers survive arbitrary prefixes of REAL JVM-emitted descriptors
+        //      (not just the synthetic one in 9c).  Pure string work over already-
+        //      enumerated descriptors; no oop, no re-enumeration, no hooks.
+        // =====================================================================
+        if (class_loaded)
+        {
+            const pair_list methods{ vmhook::get_class_methods<sigp>() };
+            if (!methods.empty())
+            {
+                bool live_prefixes_safe{ true };
+                for (const std::pair<std::string, std::string>& m : methods)
+                {
+                    const std::string& d{ m.second };
+                    for (std::size_t len{ 0 }; len <= d.size(); ++len)
+                    {
+                        const std::string_view prefix{ std::string_view{ d }.substr(0, len) };
+                        const int bt{ call_site_return_basic_type(prefix) };
+                        if (bt < 4 || bt > 14) { live_prefixes_safe = false; }
+                        std::string_view ap{};
+                        if (args_portion(prefix, ap))
+                        {
+                            int s{ 0 };
+                            int n{ 0 };
+                            const bool walked{ count_arg_slots(ap, s, n) };
+                            (void)walked;
+                        }
+                    }
+                }
+                ctx.check("sigparse_live_descriptor_truncation_prefixes_safe",
+                          live_prefixes_safe);
             }
         }
     }

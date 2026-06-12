@@ -15,10 +15,33 @@
 //                            resizes) / one-null-key / one-null-value /
 //                            empty-string-key+value / a TREEIFIED bin (>8 keys
 //                            colliding into one bucket -> the head is a TreeNode).
+//   Hashtable<String,Box>    small — a SECOND positively-decoding family: its
+//                            Entry[] "table" exposes key/value/next exactly like
+//                            HashMap.Node, so it decodes FULLY (content cross-
+//                            checked against hashSmall's fingerprint).
+//   HashMap collision chain  hashColl6 — 6 colliding-hashCode keys in ONE bucket
+//                            BELOW the treeify threshold => a plain Node.next chain
+//                            (not a TreeNode); the walk follows `next` and returns
+//                            all 6 (the case between one-per-bucket and treeified).
+//   HashMap<Integer,Integer> hashIntKey — BOXED-primitive keys 0,16,32,48 colliding
+//                            into one bucket; decodes each java.lang.Integer key AND
+//                            value via Integer.value (non-String key/value path).
+//   HashMap nested values    hashNestedMap / hashNestedList — values are themselves
+//                            a Map / a List; the outer walk decodes each value OOP,
+//                            then the module re-wraps it as vmhook::map / ::collection
+//                            and decodes the INNER container (nested round-trip).
 //   LinkedHashMap<String,Box> small + MANY — proves the SAME "table" fast path is
 //                            taken; iteration is BUCKET order, NOT insertion order
 //                            (a faithful quirk: we verify CONTENT order-independently
 //                            and deliberately do NOT assert insertion order).
+//   ConcurrentHashMap        small + MANY — HAS a "table" but its Node field is
+//                            "val" not "value", so the hash walk bails => EMPTY
+//                            (characterized; size witnesses prove non-empty).
+//   WeakHashMap/IdentityHashMap/EnumMap/Map.of(N,1) — every remaining JDK Map
+//                            family, each CHARACTERIZED EMPTY for a documented
+//                            layout reason (no "key" field / flat Object[] table /
+//                            no table+root / interleaved-k-v table / k0+v0), with
+//                            the Java size() witness pinning each as non-empty.
 //   TreeMap<String,Box>      empty / ONE / TWO / small(3) / MANY(1000) — the
 //                            red-black in-order walk yields SORTED key order
 //                            (asserted strictly); plus a DESCENDING-inserted tree
@@ -107,6 +130,36 @@ namespace
         auto name() const -> std::string { return get_field("name")->get(); }
     };
 
+    // ── BOXED-PRIMITIVE wrapper: java.lang.Integer. ─────────────────────────
+    // For HashMap<Integer,Integer> the key AND value OOPs are java.lang.Integer
+    // boxes; we decode the primitive via the "value" field.  get_instance() is
+    // also used to fingerprint object identity where needed.
+    class integer_box : public vmhook::object<integer_box>
+    {
+    public:
+        explicit integer_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<integer_box>{ instance }
+        {
+        }
+
+        auto value() const -> std::int32_t { return static_cast<std::int32_t>(get_field("value")->get()); }
+    };
+
+    // ── NESTED-CONTAINER value wrapper. ─────────────────────────────────────
+    // The value OOP is itself a Map or a List; this wrapper only needs to hand
+    // its raw OOP back so the module can re-wrap it as a vmhook::map /
+    // vmhook::collection and decode the inner container.  (vmhook::object<>
+    // already exposes get_instance(); this named subclass documents intent and
+    // lets to_entries<string_key, nested_value> build it.)
+    class nested_value : public vmhook::object<nested_value>
+    {
+    public:
+        explicit nested_value(vmhook::oop_t instance) noexcept
+            : vmhook::object<nested_value>{ instance }
+        {
+        }
+    };
+
     // ── Fixture wrapper: vmhook.fixtures.CollMap. ───────────────────────────
     class coll_map_fixture : public vmhook::object<coll_map_fixture>
     {
@@ -139,6 +192,19 @@ namespace
             return proxy->get().to_entries<string_key, box_value>();
         }
 
+        // Generic K/V variant for the boxed-Integer and nested-container maps.
+        template<typename key_type, typename value_type>
+        static auto entries_of_as(const char* field)
+            -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<value_type>>>
+        {
+            const auto proxy{ static_field(field) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            return proxy->get().to_entries<key_type, value_type>();
+        }
+
         // Java-published cross-check values.
         static auto j_size(const char* f) -> std::int32_t { return static_field(f)->get(); }
         static auto j_long(const char* f) -> std::int64_t { return static_field(f)->get(); }
@@ -151,6 +217,9 @@ namespace
     constexpr std::int32_t MANY_N{ 1000 };
     constexpr std::int32_t NULL_KEY_N{ 3 };
     constexpr std::int32_t TREEIFY_N{ 12 };
+    constexpr std::int32_t COLL6_N{ 6 };
+    constexpr std::int32_t INTKEY_N{ 4 };
+    constexpr std::int32_t NESTED_N{ 2 };
 
     // ── Hook observation (pilot-style proof). ───────────────────────────────
     std::atomic<int>          g_hook_calls{ 0 };
@@ -266,6 +335,9 @@ namespace
         vmhook::register_class<coll_map_fixture>(FIXTURE);
         vmhook::register_class<box_value>("vmhook/fixtures/CollMap$Box");
         vmhook::register_class<string_key>("java/lang/String");
+        vmhook::register_class<integer_box>("java/lang/Integer");
+        // nested_value carries an arbitrary container OOP; it has no fixed klass
+        // of its own, so it is intentionally NOT registered.
 
         // JDK generation (house idiom): java.lang.String has the compact-string
         // "coder" field only on JDK 9+.  Recorded for context; the order-
@@ -553,6 +625,199 @@ namespace
         }
 
         // =====================================================================
+        // Hashtable — SMALL (3).  A DISTINCT positively-decoding container family:
+        // its Entry[] "table" exposes the same key/value/next fields as
+        // HashMap.Node, so the HashMap "table" fast path decodes it FULLY.  Same
+        // content recipe as hashSmall, so fingerprints cross-check 1:1.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of("hashtableSmall") };
+            const entry_stats st{ fingerprint(e) };
+            ctx.check("cmap_hashtable_small_count_is_3", st.count == SMALL_N);
+            check_size_oracle("cmap_hashtable_small", st.count, "hashtableSmallSize");
+            ctx.check("cmap_hashtable_small_no_null_keys", st.null_keys == 0);
+            ctx.check("cmap_hashtable_small_no_null_values", st.null_values == 0);
+            ctx.check("cmap_hashtable_small_key_char_sum_matches_java",
+                      st.key_char_sum == coll_map_fixture::j_long("hashtableSmallKeyCharSum"));
+            ctx.check("cmap_hashtable_small_id_sum_matches_java",
+                      st.id_sum == coll_map_fixture::j_long("hashtableSmallIdSum"));
+            ctx.check("cmap_hashtable_small_id_xor_matches_java",
+                      st.id_xor == coll_map_fixture::j_long("hashtableSmallIdXor"));
+            // Same content as hashSmall -> the cross-map fingerprints agree.
+            ctx.check("cmap_hashtable_small_key_char_sum_matches_hash_small",
+                      st.key_char_sum == coll_map_fixture::j_long("hashSmallKeyCharSum"));
+            bool pairs_ok{ true };
+            bool saw_k0{ false }, saw_k1{ false }, saw_k2{ false };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { pairs_ok = false; continue; }
+                const std::string key{ kv.first->text() };
+                if (key != ("k" + std::to_string(kv.second->id()))) { pairs_ok = false; }
+                if (kv.second->name() != ("v" + std::to_string(kv.second->id()))) { pairs_ok = false; }
+                if (key == "k0") { saw_k0 = true; }
+                if (key == "k1") { saw_k1 = true; }
+                if (key == "k2") { saw_k2 = true; }
+            }
+            ctx.check("cmap_hashtable_small_pairs_consistent", pairs_ok);
+            ctx.check("cmap_hashtable_small_all_keys_present", saw_k0 && saw_k1 && saw_k2);
+        }
+
+        // =====================================================================
+        // HashMap — SUB-TREEIFY COLLISION CHAIN (6 colliding keys in ONE bucket,
+        // below the treeify threshold of 8).  The bucket head is a plain Node and
+        // the bucket is a linked Node.next chain (NOT a TreeNode); the walk must
+        // follow `next` and return every colliding entry.  This is the case
+        // BETWEEN one-per-bucket and a treeified bin.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of("hashColl6") };
+            const entry_stats st{ fingerprint(e) };
+            ctx.check("cmap_coll6_count_is_6", st.count == COLL6_N);
+            check_size_oracle("cmap_coll6", st.count, "hashColl6Size");
+            ctx.check("cmap_coll6_no_null_keys", st.null_keys == 0);
+            ctx.check("cmap_coll6_no_null_values", st.null_values == 0);
+            ctx.check("cmap_coll6_key_char_sum_matches_java",
+                      st.key_char_sum == coll_map_fixture::j_long("hashColl6KeyCharSum"));
+            ctx.check("cmap_coll6_id_sum_matches_java",
+                      st.id_sum == coll_map_fixture::j_long("hashColl6IdSum"));
+            ctx.check("cmap_coll6_id_xor_matches_java",
+                      st.id_xor == coll_map_fixture::j_long("hashColl6IdXor"));
+            // Values are Box(2000+i,"c"+i); the chain walk surfaces every id.
+            std::int64_t expect_id_sum{ 0 };
+            for (std::int32_t i{ 0 }; i < COLL6_N; ++i) { expect_id_sum += (2000 + i); }
+            ctx.check("cmap_coll6_id_sum_closed_form", st.id_sum == expect_id_sum);
+            // Java confirms (when reflection is open) the bucket stayed a PLAIN
+            // chain — recorded as [INFO]; the count proof above is the hard part.
+            const bool treeified{ coll_map_fixture::j_bool("hashColl6Treeified") };
+            ctx.record(std::string{ "[INFO] cmap_coll6: bucket treeified (Java, best-effort) = " }
+                       + (treeified ? "yes (unexpected)" : "no (plain Node chain)"));
+        }
+
+        // =====================================================================
+        // HashMap<Integer,Integer> — BOXED-PRIMITIVE keys+values that COLLIDE.
+        // Keys 0,16,32,48 land in one bucket; the walk decodes each boxed
+        // java.lang.Integer key AND value via Integer.value, proving non-String
+        // key/value decode on a collision chain.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<integer_box, integer_box>("hashIntKey") };
+            ctx.check("cmap_intkey_count_is_4", static_cast<std::int32_t>(e.size()) == INTKEY_N);
+            check_size_oracle("cmap_intkey", static_cast<std::int32_t>(e.size()), "hashIntKeySize");
+
+            std::int64_t key_sum{ 0 }, val_sum{ 0 }, key_xor{ 0 };
+            std::int32_t null_kv{ 0 };
+            bool pairs_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
+                const std::int32_t k{ kv.first->value() };
+                const std::int32_t v{ kv.second->value() };
+                key_sum += k;
+                val_sum += v;
+                key_xor ^= k;
+                // Recipe: key i*16 -> value 100 + i, i.e. value == 100 + key/16.
+                if (v != (100 + k / 16)) { pairs_ok = false; }
+            }
+            ctx.check("cmap_intkey_no_null_kv", null_kv == 0);
+            ctx.check("cmap_intkey_pairs_consistent", pairs_ok);
+            ctx.check("cmap_intkey_key_sum_matches_java",
+                      key_sum == coll_map_fixture::j_long("hashIntKeyKeySum"));
+            ctx.check("cmap_intkey_val_sum_matches_java",
+                      val_sum == coll_map_fixture::j_long("hashIntKeyValSum"));
+            ctx.check("cmap_intkey_key_xor_matches_java",
+                      key_xor == coll_map_fixture::j_long("hashIntKeyKeyXor"));
+            // Closed form: keys 0+16+32+48 == 96; values 100+101+102+103 == 406.
+            ctx.check("cmap_intkey_key_sum_closed_form", key_sum == (0 + 16 + 32 + 48));
+            ctx.check("cmap_intkey_val_sum_closed_form", val_sum == (100 + 101 + 102 + 103));
+            const bool one_bucket{ coll_map_fixture::j_bool("hashIntKeyOneBucket") };
+            ctx.record(std::string{ "[INFO] cmap_intkey: all keys in ONE bucket (Java, best-effort) = " }
+                       + (one_bucket ? "yes" : "no/unknown"));
+        }
+
+        // =====================================================================
+        // HashMap with NESTED-MAP values.  The outer walk decodes each value OOP;
+        // we then re-wrap that OOP as a vmhook::map and decode the INNER entries,
+        // proving nested-Map values round-trip through a second to_entries.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<string_key, nested_value>("hashNestedMap") };
+            ctx.check("cmap_nested_map_outer_count",
+                      static_cast<std::int32_t>(e.size()) == NESTED_N);
+            check_size_oracle("cmap_nested_map", static_cast<std::int32_t>(e.size()), "hashNestedMapSize");
+
+            std::int32_t inner_total{ 0 };
+            std::int64_t inner_id_sum{ 0 };
+            bool outer_keys_ok{ true };
+            bool all_inner_pairs_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { outer_keys_ok = false; continue; }
+                const std::string okey{ kv.first->text() };
+                if (okey.size() < 1 || okey.front() != 'n') { outer_keys_ok = false; }
+                // Re-wrap the nested value OOP as a Map and decode its entries.
+                const auto inner{ vmhook::map{ kv.second->get_instance() }
+                                      .to_entries<string_key, box_value>() };
+                inner_total += static_cast<std::int32_t>(inner.size());
+                for (const auto& ikv : inner)
+                {
+                    if (!ikv.first || !ikv.second) { all_inner_pairs_ok = false; continue; }
+                    inner_id_sum += ikv.second->id();
+                    // inner key "ik"+j, inner value name "iv"+id.
+                    if (ikv.second->name() != ("iv" + std::to_string(ikv.second->id())))
+                    {
+                        all_inner_pairs_ok = false;
+                    }
+                }
+            }
+            ctx.check("cmap_nested_map_outer_keys_ok", outer_keys_ok);
+            ctx.check("cmap_nested_map_inner_total_is_4", inner_total == (NESTED_N * NESTED_N));
+            ctx.check("cmap_nested_map_inner_pairs_consistent", all_inner_pairs_ok);
+            // ids are i*10+j over i,j in [0,NESTED_N): {0,1,10,11} -> sum 22.
+            std::int64_t expect_inner_id_sum{ 0 };
+            for (std::int32_t i{ 0 }; i < NESTED_N; ++i)
+            {
+                for (std::int32_t j{ 0 }; j < NESTED_N; ++j) { expect_inner_id_sum += (i * 10 + j); }
+            }
+            ctx.check("cmap_nested_map_inner_id_sum_ok", inner_id_sum == expect_inner_id_sum);
+        }
+
+        // =====================================================================
+        // HashMap with NESTED-LIST values.  Same idea as nested-map, but each
+        // value OOP is decoded as a vmhook::collection (ArrayList) -> to_vector.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<string_key, nested_value>("hashNestedList") };
+            ctx.check("cmap_nested_list_outer_count",
+                      static_cast<std::int32_t>(e.size()) == NESTED_N);
+            check_size_oracle("cmap_nested_list", static_cast<std::int32_t>(e.size()), "hashNestedListSize");
+
+            std::int32_t inner_total{ 0 };
+            std::int64_t inner_id_sum{ 0 };
+            bool all_inner_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.second) { all_inner_ok = false; continue; }
+                const auto inner{ vmhook::collection{ kv.second->get_instance() }
+                                      .to_vector<box_value>() };
+                inner_total += static_cast<std::int32_t>(inner.size());
+                for (const auto& el : inner)
+                {
+                    if (!el) { all_inner_ok = false; continue; }
+                    inner_id_sum += el->id();
+                    if (el->name() != ("lv" + std::to_string(el->id()))) { all_inner_ok = false; }
+                }
+            }
+            ctx.check("cmap_nested_list_inner_total_is_4", inner_total == (NESTED_N * NESTED_N));
+            ctx.check("cmap_nested_list_inner_consistent", all_inner_ok);
+            std::int64_t expect_inner_id_sum{ 0 };
+            for (std::int32_t i{ 0 }; i < NESTED_N; ++i)
+            {
+                for (std::int32_t j{ 0 }; j < NESTED_N; ++j) { expect_inner_id_sum += (i * 10 + j); }
+            }
+            ctx.check("cmap_nested_list_inner_id_sum_ok", inner_id_sum == expect_inner_id_sum);
+        }
+
+        // =====================================================================
         // LinkedHashMap — SMALL + MANY.  Reuses HashMap.table, so the SAME fast
         // path is taken.  Verify CONTENT via the order-independent fingerprint.
         // (Audit note: vmhook walks BUCKET order, not LinkedHashMap insertion
@@ -806,6 +1071,108 @@ namespace
                        "real map in field 'm' and are NOT seen through). Java size() is "
                        "non-zero for the singleton/unmodifiable views; vmhook only walks "
                        "HashMap/LinkedHashMap/TreeMap layouts. Characterized, not a crash.");
+        }
+
+        // =====================================================================
+        // ConcurrentHashMap — CHARACTERIZED EMPTY.  CHM HAS a "table" field, so
+        // the HashMap fast path is SELECTED, but its Node names the value field
+        // "val" (not "value"); the walker's find_field(node,"value") misses and
+        // the bucket bails, so to_entries reads EMPTY for BOTH small and MANY.
+        // Java size() is non-zero, proving these are genuinely populated maps.
+        // (If a future walker learns the "val" alias, these flip to populated —
+        // a deliberate tripwire pinned here with the size witnesses.)
+        // =====================================================================
+        {
+            const auto e_small{ coll_map_fixture::entries_of("chmSmall") };
+            ctx.check("cmap_chm_small_decodes_empty", e_small.empty());
+            ctx.check("cmap_chm_small_java_size_is_3",
+                      coll_map_fixture::j_size("chmSmallSize") == SMALL_N);
+
+            const auto e_many{ coll_map_fixture::entries_of("chmMany") };
+            ctx.check("cmap_chm_many_decodes_empty", e_many.empty());
+            ctx.check("cmap_chm_many_java_size_is_1000",
+                      coll_map_fixture::j_size("chmManySize") == MANY_N);
+            ctx.record("[INFO] cmap_chm: ConcurrentHashMap has a \"table\" but its Node "
+                       "uses field \"val\" not \"value\"; the hash walk finds no \"value\" "
+                       "field and returns EMPTY. Characterized contract (size witness "
+                       "proves the map is non-empty Java-side), not a crash.");
+        }
+
+        // =====================================================================
+        // WeakHashMap / IdentityHashMap — CHARACTERIZED EMPTY (both HAVE "table").
+        //   WeakHashMap.Entry holds the key as the WeakReference REFERENT (no
+        //     "key" field) -> find_field(node,"key") misses -> EMPTY.
+        //   IdentityHashMap.table is a FLAT Object[] of alternating key,value
+        //     (no Node objects) -> a bucket element is a bare String/Box, not a
+        //     Node -> find_field(element,"key") misses -> EMPTY.
+        // Both keys are strongly held (weakSmall via keyHolder) so nothing is
+        // GC-cleared mid-read; the size witnesses prove they are non-empty.
+        // =====================================================================
+        {
+            const auto e_weak{ coll_map_fixture::entries_of("weakSmall") };
+            ctx.check("cmap_weak_small_decodes_empty", e_weak.empty());
+            ctx.check("cmap_weak_small_java_size_is_3",
+                      coll_map_fixture::j_size("weakSmallSize") == SMALL_N);
+
+            const auto e_identity{ coll_map_fixture::entries_of("identitySmall") };
+            ctx.check("cmap_identity_small_decodes_empty", e_identity.empty());
+            ctx.check("cmap_identity_small_java_size_is_3",
+                      coll_map_fixture::j_size("identitySmallSize") == SMALL_N);
+            ctx.record("[INFO] cmap_weak/identity: WeakHashMap.Entry has no \"key\" field "
+                       "(key is the WeakReference referent) and IdentityHashMap.table is a "
+                       "flat alternating-k/v Object[] (no Node), so both decode EMPTY "
+                       "despite owning a \"table\". Characterized, size witnesses non-zero.");
+        }
+
+        // =====================================================================
+        // EnumMap — CHARACTERIZED EMPTY.  EnumMap stores values in a parallel
+        // "vals" Object[] keyed by ordinal and exposes NEITHER "table" NOR
+        // "root", so the dispatcher finds no fast path -> EMPTY.
+        // =====================================================================
+        {
+            const auto e_enum{ coll_map_fixture::entries_of("enumSmall") };
+            ctx.check("cmap_enum_small_decodes_empty", e_enum.empty());
+            ctx.check("cmap_enum_small_java_size_is_3",
+                      coll_map_fixture::j_size("enumSmallSize") == SMALL_N);
+            ctx.record("[INFO] cmap_enum: EnumMap exposes neither \"table\" nor \"root\" "
+                       "(values live in a parallel \"vals\" Object[] by ordinal), so "
+                       "to_entries reads EMPTY. Characterized, size witness == 3.");
+        }
+
+        // =====================================================================
+        // Map.of(...) immutable maps (JDK 9+) — CHARACTERIZED EMPTY.
+        //   MapN (3 entries): "table" is an Object[] of INTERLEAVED key,value
+        //     (not a Node[]), so the hash fast path is selected but every slot is
+        //     a bare String/Box, never a Node -> EMPTY.
+        //   Map1 (1 entry): fields k0/v0, no "table"/"root" -> EMPTY.
+        // Built reflectively in the fixture so JDK 8 compiles; on a pre-9 JVM the
+        // field is null (size witness -1) and to_entries is empty too — still the
+        // characterized contract.  We gate the size assertion on JDK 9+.
+        // =====================================================================
+        {
+            const std::int32_t mapN_size{ coll_map_fixture::j_size("mapOfNSize") };
+            const std::int32_t map1_size{ coll_map_fixture::j_size("mapOf1Size") };
+            const bool have_map_of{ mapN_size >= 0 };   // -1 => Map.of unavailable (JDK 8)
+
+            const auto e_mapN{ coll_map_fixture::entries_of("mapOfN") };
+            ctx.check("cmap_mapof_n_decodes_empty", e_mapN.empty());
+            const auto e_map1{ coll_map_fixture::entries_of("mapOf1") };
+            ctx.check("cmap_mapof_1_decodes_empty", e_map1.empty());
+
+            if (have_map_of)
+            {
+                ctx.check("cmap_mapof_n_java_size_is_3", mapN_size == SMALL_N);
+                ctx.check("cmap_mapof_1_java_size_is_1", map1_size == 1);
+                ctx.record("[INFO] cmap_mapof: Map.of MapN \"table\" is an interleaved "
+                           "k/v Object[] (not a Node[]) and Map1 uses k0/v0; neither "
+                           "exposes a walkable Node, so both decode EMPTY. Size "
+                           "witnesses (3 / 1) confirm they are non-empty Java-side.");
+            }
+            else
+            {
+                ctx.record("[INFO] cmap_mapof: Map.of unavailable on this JDK (pre-9); "
+                           "fields are null and decode empty (still the contract).");
+            }
         }
 
         // =====================================================================

@@ -3,11 +3,17 @@ package vmhook.fixtures;
 import vmhook.Harness;
 
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.Hashtable;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Fixture for the collection_map feature (area: collections).
@@ -185,12 +191,113 @@ public final class CollMap
     /** A plain (non-Map) reference field — to_entries on it must stay empty. */
     public static String notAMap = "not a map";
 
+    // ---- POSITIVELY-DECODING extra container families ----------------------
+    //      These expose a Node layout the native walkers DO decode.
+
+    /**
+     * java.util.Hashtable: its "table" is an Entry[] whose Entry exposes the
+     * SAME key/value/next fields as HashMap.Node, so the HashMap "table" fast
+     * path decodes it FULLY (a distinct, positively-decoding container family —
+     * not just HashMap/LinkedHashMap).  SMALL_N deterministic entries.
+     */
+    public static Hashtable<String, Box> hashtableSmall = new Hashtable<String, Box>();
+
+    /**
+     * HashMap with COLL6_N colliding-hashCode keys ("Aa"/"BB" family) that all
+     * land in ONE bucket but stay BELOW the treeify threshold (8), so the bucket
+     * head is a plain Node and the bucket is a linked Node.next chain — NOT a
+     * TreeNode.  Proves the next-chain walk on an ordinary (un-treeified) chain,
+     * the case between "one entry per bucket" and "treeified bin".
+     */
+    public static HashMap<String, Box> hashColl6 = new HashMap<String, Box>();
+
+    /**
+     * HashMap&lt;Integer,Integer&gt; whose BOXED keys 0,16,32,48 all collide into
+     * bucket 0 of the default 16-slot table (Integer.hashCode()==value, spread
+     * leaves the low 4 bits 0).  Proves a boxed-primitive key AND value decode
+     * (java.lang.Integer.value) plus a collision chain with non-String keys.
+     */
+    public static HashMap<Integer, Integer> hashIntKey = new HashMap<Integer, Integer>();
+
+    /**
+     * HashMap whose VALUES are themselves Maps (a nested HashMap&lt;String,Box&gt;
+     * per entry).  The outer walk decodes each value OOP; the native side then
+     * re-wraps that value OOP as a vmhook::map and decodes the INNER entries,
+     * proving nested-Map values round-trip.  NESTED_N outer entries.
+     */
+    public static HashMap<String, Map<String, Box>> hashNestedMap =
+        new HashMap<String, Map<String, Box>>();
+
+    /**
+     * HashMap whose VALUES are Lists (a nested java.util.List per entry).  The
+     * outer walk decodes each value OOP; the native side re-wraps it as a
+     * vmhook::collection and decodes the inner elements, proving nested-List
+     * values round-trip.  NESTED_N outer entries, each list holding NESTED_N ids.
+     */
+    public static HashMap<String, List<Box>> hashNestedList =
+        new HashMap<String, List<Box>>();
+
+    // ---- CHARACTERIZED-EMPTY extra Map shapes ------------------------------
+    //      Each is a real, non-empty Java Map, but its heap layout exposes no
+    //      Node the walkers can follow, so to_entries reads EMPTY.  The Java
+    //      size() witness (published below) proves the map is non-empty Java-side,
+    //      so these are faithful CHARACTERIZED pins, not vacuous.
+
+    /**
+     * ConcurrentHashMap: HAS a "table" field (so the HashMap fast path is
+     * selected), but its Node names the value field "val", NOT "value", so the
+     * walker's find_field(node,"value") misses and the bucket bails — to_entries
+     * reads EMPTY.  Small + MANY both characterized.
+     */
+    public static ConcurrentHashMap<String, Box> chmSmall = new ConcurrentHashMap<String, Box>();
+    public static ConcurrentHashMap<String, Box> chmMany  = new ConcurrentHashMap<String, Box>();
+
+    /**
+     * WeakHashMap: HAS a "table" field, but its Entry holds the KEY as the
+     * WeakReference referent (no "key" instance field), so find_field(node,"key")
+     * misses and the bucket bails — to_entries reads EMPTY.  Keys are held by a
+     * strong reference (keyHolder) so they cannot be GC-cleared mid-test.
+     */
+    public static WeakHashMap<String, Box> weakSmall = new WeakHashMap<String, Box>();
+
+    /**
+     * IdentityHashMap: its "table" is a FLAT Object[] of alternating key,value
+     * (no Node objects), so a bucket element is a bare String/Box, not a Node —
+     * find_field(element,"key") misses and to_entries reads EMPTY.
+     */
+    public static IdentityHashMap<String, Box> identitySmall = new IdentityHashMap<String, Box>();
+
+    /**
+     * EnumMap: stores its values in a parallel "vals" Object[] keyed by ordinal,
+     * exposing NEITHER a "table" NOR a "root" field, so the dispatcher finds no
+     * fast path and to_entries reads EMPTY.
+     */
+    public static EnumMap<Day, Box> enumSmall = new EnumMap<Day, Box>(Day.class);
+
+    /** A small enum used as the EnumMap key type. */
+    public enum Day { MON, TUE, WED }
+
+    /**
+     * Map.of(...) immutable maps (JDK 9+).  Built REFLECTIVELY so this fixture
+     * still COMPILES on JDK 8 (where Map.of is absent — the fields then stay
+     * null and decode empty too, which is still the characterized contract).
+     *   mapOfN : 3-entry MapN — "table" is an Object[] of interleaved k/v (not a
+     *            Node[]), so the hash fast path is selected but every slot is a
+     *            bare String/Box → EMPTY.
+     *   mapOf1 : 1-entry Map1 — fields k0/v0, no "table"/"root" → EMPTY.
+     */
+    public static Map<String, Box> mapOfN;
+    public static Map<String, Box> mapOf1;
+
     // ---- Scenario sizes (mirrored on the native side) ----------------------
 
     public static final int SMALL_N = 3;
     public static final int MANY_N = 1000;
     public static final int NULL_KEY_N = 3;     // includes the one null-key entry
     public static final int TREEIFY_N = 12;     // > 8 => bucket treeifies
+    public static final int COLL6_N = 6;        // colliding but < 8 => plain Node chain
+    public static final int INTKEY_N = 4;       // boxed Integer keys 0,16,32,48 (one bucket)
+    public static final int NESTED_N = 2;       // outer entries / inner list size
 
     // ---- Published checksums so native can verify content without ordering --
     //
@@ -216,6 +323,20 @@ public final class CollMap
     public static volatile long treeSmallIdSum;
     public static volatile long treeManyIdSum;
 
+    // Positively-decoding extra families.
+    public static volatile long hashtableSmallKeyCharSum;
+    public static volatile long hashtableSmallIdSum;
+    public static volatile long hashtableSmallIdXor;
+
+    public static volatile long hashColl6KeyCharSum;
+    public static volatile long hashColl6IdSum;
+    public static volatile long hashColl6IdXor;
+
+    /** hashIntKey: sum/xor of the boxed Integer KEYS and the boxed Integer VALUES. */
+    public static volatile long hashIntKeyKeySum;
+    public static volatile long hashIntKeyValSum;
+    public static volatile long hashIntKeyKeyXor;
+
     /** Java's own view of each map's size(), for a native cross-check. */
     public static volatile int hashEmptySize;
     public static volatile int hashOneSize;
@@ -235,6 +356,29 @@ public final class CollMap
     public static volatile int treeManySize;
     public static volatile int treeReverseInsertSize;
     public static volatile int treeNullValueSize;
+
+    // Extra-family size witnesses.
+    public static volatile int hashtableSmallSize;
+    public static volatile int hashColl6Size;
+    public static volatile int hashIntKeySize;
+    public static volatile int hashNestedMapSize;
+    public static volatile int hashNestedListSize;
+    public static volatile int chmSmallSize;
+    public static volatile int chmManySize;
+    public static volatile int weakSmallSize;
+    public static volatile int identitySmallSize;
+    public static volatile int enumSmallSize;
+    public static volatile int mapOfNSize;
+    public static volatile int mapOf1Size;
+
+    /**
+     * Reflective probes confirming the engineered HashMap bucket shapes, so the
+     * native side can pin its [INFO] against Java ground truth:
+     *   hashColl6Treeified : did the 6-key colliding bucket treeify? (expect NO)
+     *   hashIntKeyOneBucket: did the 4 Integer keys land in ONE bucket? (expect YES)
+     */
+    public static volatile boolean hashColl6Treeified;
+    public static volatile boolean hashIntKeyOneBucket;
 
     /**
      * size() of each Collections.* view (Java's own count).  These are non-zero
@@ -412,6 +556,129 @@ public final class CollMap
         treeNullValue.put("present", null);
         treeNullValue.put("alsohere", new Box(9, "v9"));
 
+        // ---- Positively-decoding extra families ----------------------------
+
+        // Hashtable: same key/value/next Entry shape as HashMap.Node, so it
+        // decodes fully through the "table" fast path.  Same content recipe as
+        // hashSmall so the native side reuses k/v consistency assertions.
+        hashtableSmall = new Hashtable<String, Box>();
+        long htKey = 0, htId = 0, htXor = 0;
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            final String k = "k" + i;
+            hashtableSmall.put(k, new Box(i, "v" + i));
+            htKey += codeUnitSum(k);
+            htId += i;
+            htXor ^= i;
+        }
+        hashtableSmallKeyCharSum = htKey;
+        hashtableSmallIdSum = htId;
+        hashtableSmallIdXor = htXor;
+
+        // HashMap with a SUB-treeify colliding chain (COLL6_N < 8 keys in one
+        // bucket): a plain Node.next chain, no TreeNode.  Uses the same "Aa"/"BB"
+        // equal-hashCode family as the treeified map but with fewer keys.  Values
+        // Box(2000+i,"c"+i) so its fingerprints are distinct from the others.
+        hashColl6 = new HashMap<String, Box>();
+        final String[] coll6 = collidingKeys(COLL6_N);
+        long c6Key = 0, c6Id = 0, c6Xor = 0;
+        for (int i = 0; i < coll6.length; ++i)
+        {
+            hashColl6.put(coll6[i], new Box(2000 + i, "c" + i));
+            c6Key += codeUnitSum(coll6[i]);
+            c6Id += (2000 + i);
+            c6Xor ^= (2000 + i);
+        }
+        hashColl6KeyCharSum = c6Key;
+        hashColl6IdSum = c6Id;
+        hashColl6IdXor = c6Xor;
+        hashColl6Treeified = hasTreeNodeBin(hashColl6);   // expect false
+
+        // HashMap<Integer,Integer>: boxed-primitive keys 0,16,32,48 all collide
+        // into bucket 0 of the 16-slot default table.  Proves boxed key+value
+        // decode and a non-String collision chain.
+        hashIntKey = new HashMap<Integer, Integer>();
+        long ikKeySum = 0, ikValSum = 0, ikKeyXor = 0;
+        for (int i = 0; i < INTKEY_N; ++i)
+        {
+            final int key = i * 16;          // 0,16,32,48 -> bucket 0
+            final int val = 100 + i;
+            hashIntKey.put(Integer.valueOf(key), Integer.valueOf(val));
+            ikKeySum += key;
+            ikValSum += val;
+            ikKeyXor ^= key;
+        }
+        hashIntKeyKeySum = ikKeySum;
+        hashIntKeyValSum = ikValSum;
+        hashIntKeyKeyXor = ikKeyXor;
+        hashIntKeyOneBucket = allInOneBucket(hashIntKey);  // expect true
+
+        // HashMap whose values are nested Maps, and another whose values are
+        // nested Lists.  Each outer key "n"+i maps to an inner container that
+        // itself holds NESTED_N Box entries/elements with ids derived from i.
+        hashNestedMap = new HashMap<String, Map<String, Box>>();
+        for (int i = 0; i < NESTED_N; ++i)
+        {
+            final HashMap<String, Box> inner = new HashMap<String, Box>();
+            for (int j = 0; j < NESTED_N; ++j)
+            {
+                inner.put("ik" + j, new Box(i * 10 + j, "iv" + (i * 10 + j)));
+            }
+            hashNestedMap.put("n" + i, inner);
+        }
+
+        hashNestedList = new HashMap<String, List<Box>>();
+        for (int i = 0; i < NESTED_N; ++i)
+        {
+            final java.util.ArrayList<Box> inner = new java.util.ArrayList<Box>();
+            for (int j = 0; j < NESTED_N; ++j)
+            {
+                inner.add(new Box(i * 10 + j, "lv" + (i * 10 + j)));
+            }
+            hashNestedList.put("n" + i, inner);
+        }
+
+        // ---- Characterized-empty extra shapes ------------------------------
+
+        chmSmall = new ConcurrentHashMap<String, Box>();
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            chmSmall.put("k" + i, new Box(i, "v" + i));
+        }
+        chmMany = new ConcurrentHashMap<String, Box>();
+        for (int i = 0; i < MANY_N; ++i)
+        {
+            chmMany.put("k" + i, new Box(i, "v" + i));
+        }
+
+        // WeakHashMap: hold the keys strongly so they cannot be cleared while the
+        // native side reads the table.
+        keyHolder = new String[SMALL_N];
+        weakSmall = new WeakHashMap<String, Box>();
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            // new String(...) so each key is a distinct, strongly-held instance.
+            final String k = new String("wk" + i);
+            keyHolder[i] = k;
+            weakSmall.put(k, new Box(i, "v" + i));
+        }
+
+        identitySmall = new IdentityHashMap<String, Box>();
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            identitySmall.put("k" + i, new Box(i, "v" + i));
+        }
+
+        enumSmall = new EnumMap<Day, Box>(Day.class);
+        enumSmall.put(Day.MON, new Box(0, "v0"));
+        enumSmall.put(Day.TUE, new Box(1, "v1"));
+        enumSmall.put(Day.WED, new Box(2, "v2"));
+
+        // Map.of(...) reflectively (so JDK 8 still compiles this source).  On a
+        // JDK without Map.of these stay null and the native side reads empty too.
+        mapOfN = buildMapOfN();
+        mapOf1 = buildMapOf1();
+
         // Collections.* views.  unmodifiable* must wrap the maps AFTER they are
         // populated above so their size() witnesses are non-zero; to_entries on
         // each still reads EMPTY (no "table"/"root" on the wrapper's own klass).
@@ -445,6 +712,109 @@ public final class CollMap
         singletonMapCollSize = singletonMapColl.size();
         unmodifiableHashSize = unmodifiableHash.size();
         unmodifiableTreeSize = unmodifiableTree.size();
+
+        hashtableSmallSize = hashtableSmall.size();
+        hashColl6Size = hashColl6.size();
+        hashIntKeySize = hashIntKey.size();
+        hashNestedMapSize = hashNestedMap.size();
+        hashNestedListSize = hashNestedList.size();
+        chmSmallSize = chmSmall.size();
+        chmManySize = chmMany.size();
+        weakSmallSize = weakSmall.size();
+        identitySmallSize = identitySmall.size();
+        enumSmallSize = enumSmall.size();
+        mapOfNSize = (mapOfN == null) ? -1 : mapOfN.size();
+        mapOf1Size = (mapOf1 == null) ? -1 : mapOf1.size();
+    }
+
+    /** Strong holder keeping WeakHashMap keys reachable for the duration. */
+    private static String[] keyHolder;
+
+    /**
+     * Reflectively builds Map.of("k0",Box(0,"v0"),...) with SMALL_N entries so
+     * this source compiles on JDK 8 (no Map.of).  Returns null if Map.of is
+     * unavailable (pre-9) or reflection is blocked.
+     */
+    private static Map<String, Box> buildMapOfN()
+    {
+        try
+        {
+            final Object[] kv = new Object[SMALL_N * 2];
+            for (int i = 0; i < SMALL_N; ++i)
+            {
+                kv[i * 2]     = "k" + i;
+                kv[i * 2 + 1] = new Box(i, "v" + i);
+            }
+            final java.lang.reflect.Method ofEntries =
+                Map.class.getMethod("ofEntries", java.util.Map.Entry[].class);
+            @SuppressWarnings("unchecked")
+            final java.util.Map.Entry<String, Box>[] entries =
+                (java.util.Map.Entry<String, Box>[]) new java.util.Map.Entry[SMALL_N];
+            for (int i = 0; i < SMALL_N; ++i)
+            {
+                entries[i] = new java.util.AbstractMap.SimpleImmutableEntry<String, Box>(
+                    (String) kv[i * 2], (Box) kv[i * 2 + 1]);
+            }
+            @SuppressWarnings("unchecked")
+            final Map<String, Box> result =
+                (Map<String, Box>) ofEntries.invoke(null, (Object) entries);
+            return result;
+        }
+        catch (final Throwable t)
+        {
+            return null;
+        }
+    }
+
+    /** Reflectively builds Map.of("only",Box(...)) — the 1-entry Map1 shape. */
+    private static Map<String, Box> buildMapOf1()
+    {
+        try
+        {
+            final java.lang.reflect.Method of =
+                Map.class.getMethod("of", Object.class, Object.class);
+            @SuppressWarnings("unchecked")
+            final Map<String, Box> result =
+                (Map<String, Box>) of.invoke(null, "only", new Box(42, "only-value"));
+            return result;
+        }
+        catch (final Throwable t)
+        {
+            return null;
+        }
+    }
+
+    /**
+     * Reflectively reports whether ALL entries of a HashMap live in a single
+     * bucket (used to confirm the Integer-key collision construction).  Returns
+     * false if reflection is blocked.
+     */
+    private static boolean allInOneBucket(final HashMap<?, ?> map)
+    {
+        try
+        {
+            final java.lang.reflect.Field tableField = HashMap.class.getDeclaredField("table");
+            tableField.setAccessible(true);
+            final Object table = tableField.get(map);
+            if (table == null)
+            {
+                return map.isEmpty();
+            }
+            final int len = java.lang.reflect.Array.getLength(table);
+            int nonEmptyBuckets = 0;
+            for (int i = 0; i < len; ++i)
+            {
+                if (java.lang.reflect.Array.get(table, i) != null)
+                {
+                    ++nonEmptyBuckets;
+                }
+            }
+            return nonEmptyBuckets == 1;
+        }
+        catch (final Throwable t)
+        {
+            return false;
+        }
     }
 
     /**
