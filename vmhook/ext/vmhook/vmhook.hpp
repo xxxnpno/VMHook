@@ -2975,6 +2975,108 @@ namespace vmhook
             }
 
             /*
+                @brief Returns the implemented-interface klasses of this InstanceKlass.
+                @details
+                Reads InstanceKlass._transitive_interfaces (the COMPLETE set: this
+                class's directly-declared interfaces, every super-interface of those,
+                and the interfaces of every superclass) as an Array<Klass*>, mirroring
+                the get_methods_ptr() layout (`[int32 _length @0][pad @4][Klass* _data @8]`).
+                The transitive set is exactly what interface-DEFAULT-method resolution
+                needs: an inherited default declared on any (super-)interface lives in
+                here even when it is several interface-inheritance hops away.
+
+                CRASH-SAFE / COLD-PATH HARDENING (this is the headline of this helper):
+                EVERY pointer/length read here goes through vmhook::os::safe_read /
+                safe_read_pointer (ReadProcessMemory on Windows, process_vm_readv /
+                signal-guarded read elsewhere) — NEVER a raw `*ptr`.  The interface
+                arrays are a genuinely COLD region: on the first lookup the
+                `_transitive_interfaces` Array and the Klass* entries it points at may
+                never have been touched, may be mid-relocation, or (on a renamed/wrong
+                VMStruct offset) point at unmapped memory.  Such an address can PASS
+                is_valid_pointer's range+alignment heuristic yet FAULT on the actual
+                load — an EXCEPTION_ACCESS_VIOLATION that the MSVC harness __try/__except
+                contains but MinGW / clang-on-windows (no SEH) do NOT, killing the whole
+                JVM mid-suite.  Routing the reads through safe_read returns false on an
+                unreadable span instead of faulting, so this can only ever fail-safe.
+
+                FAIL-SAFE / JDK-portability:  Gated entirely on the live
+                gHotSpotVMStructs export.  If "InstanceKlass::_transitive_interfaces"
+                is not exported on the running JDK, we transparently fall back to
+                "_local_interfaces" (directly-declared interfaces only); if NEITHER is
+                exported, *count is set to 0 and nullptr is returned, so every caller
+                simply finds nothing and preserves the pre-existing superclass-only
+                behaviour.  No offset is ever hardcoded, so a JDK that renames or drops
+                these fields degrades to "interface methods not walked" rather than
+                misreading memory.
+
+                @param count  Out-parameter receiving the number of interface klasses
+                              (clamped to [0, 65535]; 0 on any failure).
+                @return Pointer to the first Klass* in the array, or nullptr if neither
+                        interface array is resolvable / the array is empty / any read
+                        was unreadable.  The returned base pointer is NOT itself
+                        dereferenced here; callers MUST read each Klass* entry through
+                        os::safe_read as well (see find_interface_default_method).
+                @note This klass* must be an InstanceKlass* (i.e. a regular Java class).
+            */
+            auto get_interfaces_ptr(std::int32_t& count) const noexcept
+                -> vmhook::hotspot::klass**
+            {
+                count = 0;
+
+                if (!vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return nullptr;
+                }
+
+                // Prefer the transitive set (inherited / super-interface defaults
+                // included); fall back to the locally-declared set if the running
+                // JDK does not export the transitive one.  Resolved once and cached.
+                static const vmhook::hotspot::vm_struct_entry_t* const transitive_entry{
+                    vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_transitive_interfaces") };
+                static const vmhook::hotspot::vm_struct_entry_t* const local_entry{
+                    vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_local_interfaces") };
+
+                const vmhook::hotspot::vm_struct_entry_t* const entry{
+                    transitive_entry ? transitive_entry : local_entry };
+                if (!entry)
+                {
+                    // Neither interface array is exported on this JDK — fail safe.
+                    return nullptr;
+                }
+
+                // Read the Array<Klass*>* via a kernel-validated probe, NOT a raw
+                // deref: `this + offset` may straddle an unmapped page on a cold /
+                // relocated / mis-resolved klass.  safe_read_pointer returns nullptr
+                // there instead of faulting (the MinGW no-SEH crash this helper fixes).
+                const void* const array{ vmhook::hotspot::safe_read_pointer(
+                    reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
+                if (!vmhook::hotspot::is_valid_pointer(array))
+                {
+                    return nullptr;
+                }
+
+                // Read the Array<Klass*>::_length the same fault-safe way.  Sanity-
+                // clamp it exactly like get_methods_count(): a class can declare at
+                // most 65535 direct interfaces (interfaces_count is u2); the transitive
+                // closure can in principle exceed that, but clamping is still safe (we
+                // just stop early) and protects against a wild count from a wrong
+                // offset / torn read.
+                std::int32_t length{ 0 };
+                if (!vmhook::os::safe_read(&length, array, sizeof(length)))
+                {
+                    return nullptr;
+                }
+                if (length <= 0 || length > 65535)
+                {
+                    return nullptr;
+                }
+
+                count = length;
+                return reinterpret_cast<vmhook::hotspot::klass**>(
+                    reinterpret_cast<std::uint8_t*>(const_cast<void*>(array)) + 8);
+            }
+
+            /*
                 @brief Returns the java.lang.Class mirror object associated with this klass.
                 @details
                 Reads Klass::_java_mirror, which is an OopHandle (introduced as such in JDK 17).
@@ -13149,6 +13251,195 @@ namespace vmhook
             }
 
             /*
+                @brief Decides whether a decoded object reference may be wrapped as wrapper_type.
+                @details
+                FLAW A fix.  The unique_ptr<wrapper_type> branch of cast_for_variant
+                decodes a field's compressed OOP and wraps it in wrapper_type WITHOUT
+                checking that the live object's runtime klass is actually a
+                wrapper_type.  Reading a slot of one class through a wrapper registered
+                for an UNRELATED class therefore wrapped the real OOP with the wrong
+                klass, so a subsequent field/method access resolved at a MISMATCHED
+                offset — a silent type confusion (gated by is_valid_pointer, so it does
+                not AV on a normal layout, but the bytes it reads are wrong).
+
+                This helper answers "may we accept this wrap?" and is deliberately
+                FAIL-OPEN: it returns true (accept, preserving the legacy behaviour)
+                unless it can PROVE a confident cross-klass mismatch.  Specifically it
+                ACCEPTS when:
+                  - wrapper_type is not registered via register_class<T>() (no name to
+                    compare against), or
+                  - the wrapper's registered class is not resolvable in the JVM, or
+                  - the wrapper's registered class is a Java INTERFACE (its
+                    Klass::_access_flags has JVM_ACC_INTERFACE set) — a concrete oop
+                    that implements the interface is NOT on the interface's superclass
+                    chain, so the chain walk below would WRONGLY reject it; an
+                    interface-registered wrapper therefore fails open, or
+                  - the live OOP's runtime klass cannot be read, or
+                  - the runtime klass IS-A the wrapper's klass — i.e. the wrapper klass
+                    appears anywhere on the OOP's superclass chain (so reading a
+                    subclass instance through a base-class wrapper, or a concrete
+                    instance through its own wrapper, is always allowed).
+                Both a pointer-identity AND a name match are honoured during the walk
+                so a class loaded by a different loader (same name, distinct klass*)
+                still passes.  Only when the registered name/klass is known, is NOT an
+                interface, AND is absent from the entire superclass chain does it
+                return false (reject).
+
+                Complexity: O(D) in the superclass-chain depth (bounded at 64).
+                Exception safety: noexcept; every dereference is is_valid_pointer-gated
+                and the narrow-klass slot is read with std::memcpy (no strict-aliasing
+                UB — a reinterpret_cast<std::uint32_t*> read here miscompiled on
+                MSVC-14.51, the same class of bug the to_vector linked-list walk fixed).
+
+                @tparam wrapper_type  The C++ wrapper the caller wants to construct.
+                @param decoded_oop    The decoded (full 64-bit) heap pointer just read.
+                @return  true to accept the wrap (including all uncertain cases),
+                         false only on a proven cross-klass mismatch.
+            */
+            template<typename wrapper_type>
+            static auto klass_match_ok(void* const decoded_oop) noexcept
+                -> bool
+            {
+                // (1) Wrapper type registered?  If not, we have no expected name to
+                // compare against — fail open (accept), matching the pre-fix path and
+                // the same "unregistered => no constraint" rule used by
+                // argument_matches_descriptor().
+                const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
+                if (type_map_entry == vmhook::type_to_class_map.end())
+                {
+                    return true;
+                }
+                const std::string& expected_name{ type_map_entry->second };
+
+                // (2) Resolve the wrapper's registered klass.  If the class is not
+                // resolvable in this JVM we cannot judge a mismatch — fail open.
+                vmhook::hotspot::klass* const expected_klass{ vmhook::find_class(expected_name) };
+                if (!expected_klass || !vmhook::hotspot::is_valid_pointer(expected_klass))
+                {
+                    return true;
+                }
+
+                // (2a) If the wrapper's registered class is a Java INTERFACE, the
+                // superclass walk below can NEVER find it on a concrete oop's chain
+                // (an implemented interface is not a superclass), so it would wrongly
+                // reject every interface-typed read.  Fail OPEN for interface (and,
+                // in the degraded no-_access_flags fallback, any non-instantiable)
+                // wrappers.  See klass_is_interface_like for the primary
+                // (JVM_ACC_INTERFACE) and fallback (_layout_helper) signals — both
+                // fail open on uncertainty.
+                if (klass_is_interface_like(expected_klass))
+                {
+                    return true;
+                }
+
+                // (3) Read the live OOP's runtime klass from the narrow-klass slot at
+                // header offset 8 (UseCompressedClassPointers layout).  If it cannot be
+                // determined — fail open.  std::memcpy (NOT a reinterpret_cast read) so
+                // there is no strict-aliasing UB on the 4-byte narrow-klass load.
+                if (!decoded_oop || !vmhook::hotspot::is_valid_pointer(decoded_oop))
+                {
+                    return true;
+                }
+                std::uint32_t narrow_klass{ 0u };
+                std::memcpy(&narrow_klass,
+                            reinterpret_cast<const std::uint8_t*>(decoded_oop) + 8,
+                            sizeof(narrow_klass));
+                void* const decoded_klass_raw{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
+                if (!decoded_klass_raw || !vmhook::hotspot::is_valid_pointer(decoded_klass_raw))
+                {
+                    return true;
+                }
+                vmhook::hotspot::klass* const runtime_klass{
+                    reinterpret_cast<vmhook::hotspot::klass*>(decoded_klass_raw) };
+
+                // (4) Walk the runtime klass's SUPERCLASS chain; accept if the wrapper
+                // klass appears anywhere on it (IS-A), by pointer identity OR by name
+                // (the latter rescues a same-named class from a different loader).
+                // The walk is depth-bounded so a corrupt _super link can never spin.
+                vmhook::hotspot::klass* current{ runtime_klass };
+                for (int depth{ 0 }; depth < 64 && current != nullptr && vmhook::hotspot::is_valid_pointer(current); ++depth)
+                {
+                    if (current == expected_klass)
+                    {
+                        return true;
+                    }
+                    if (const vmhook::hotspot::symbol* const name_sym{ current->get_name() };
+                        name_sym && vmhook::hotspot::is_valid_pointer(name_sym)
+                        && name_sym->to_string() == expected_name)
+                    {
+                        return true;
+                    }
+                    current = current->get_super();
+                }
+
+                // (5) Registered name/klass is known, is not an interface, and is
+                // absent from the whole superclass chain: a confident cross-klass
+                // mismatch — reject.
+                return false;
+            }
+
+            /*
+                @brief True if the wrapper klass is interface-like and the super-walk must be skipped.
+                @details
+                Fail-open gate for klass_match_ok.  A wrapper registered for a Java
+                INTERFACE must never be put through the superclass walk: an oop that
+                implements the interface does NOT have the interface on its _super
+                chain, so the walk would WRONGLY reject every interface-typed read.
+                This returns true exactly when klass_match_ok should fail open for k.
+
+                PRIMARY signal — Klass::_access_flags & JVM_ACC_INTERFACE (0x0200):
+                _access_flags is a HotSpot AccessFlags whose low 16 bits mirror the
+                class-file access flags; the interface bit is 9 (0x0200).  It is read
+                with std::memcpy (no strict-aliasing UB).  AccessFlags is u4 on JDK 8..
+                ~24 and narrowed to u2 on the very latest builds, but the interface bit
+                lives in the low halfword either way, so a little-endian 4-byte memcpy
+                captures it on every width; the surplus bytes are masked off.
+
+                FALLBACK signal — Klass::_layout_helper (read via get_instance_size()):
+                used ONLY when the _access_flags VMStruct entry is unavailable (a JDK
+                that renamed/removed it).  An interface (like any non-instantiable
+                klass) has a non-positive _layout_helper, so get_instance_size()==0;
+                a concrete instantiable class has a positive size.  Treating
+                size==0 as "interface-like" preserves interface reads on such a JDK.
+                This is a deliberate, monotone widening of fail-open (it also accepts
+                an abstract-base wrapper without the IS-A walk) that fires ONLY in the
+                degraded no-_access_flags mode — every concrete wrapper (e.g. the
+                Decoy reject case) keeps a positive size and still takes the walk.
+
+                Returns false (NOT interface-like => run the superclass walk) on any
+                uncertainty: null/!is_valid_pointer klass, or both signals negative.
+
+                @param k  A live, is_valid_pointer-checked klass*.
+                @return true to fail open (skip the super-walk) for an interface-like k.
+            */
+            static auto klass_is_interface_like(vmhook::hotspot::klass* const k) noexcept
+                -> bool
+            {
+                if (!k || !vmhook::hotspot::is_valid_pointer(k))
+                {
+                    return false;
+                }
+
+                // PRIMARY: read the class-file access flags and test JVM_ACC_INTERFACE.
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{
+                    vmhook::hotspot::iterate_struct_entries("Klass", "_access_flags") };
+                if (entry)
+                {
+                    std::uint32_t access_flags{ 0u };
+                    std::memcpy(&access_flags,
+                                reinterpret_cast<const std::uint8_t*>(k) + entry->offset,
+                                sizeof(access_flags));
+                    constexpr std::uint32_t JVM_ACC_INTERFACE{ 0x0200u };
+                    return (access_flags & JVM_ACC_INTERFACE) != 0u;
+                }
+
+                // FALLBACK (only when _access_flags is unavailable): a non-positive
+                // layout helper => non-instantiable (interface / abstract / array),
+                // so fail open.  get_instance_size() returns 0 for that case.
+                return k->get_instance_size() == 0u;
+            }
+
+            /*
                 @brief Converts a variant alternative source_type to target_type with semantic dispatch.
                 @details
                 Called by operator target_type() via std::visit.  Applies the correct
@@ -13215,6 +13506,20 @@ namespace vmhook
                         using wrapper_type = typename clean_target_type::element_type;
                         void* const decoded{ vmhook::hotspot::decode_oop_pointer(value) };
                         if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
+                        {
+                            return nullptr;
+                        }
+                        // FLAW A fix: refuse a CONFIDENT wrapper-klass mismatch.  If the
+                        // live object's runtime klass is provably not a wrapper_type
+                        // (the wrapper's registered class is a non-interface that is
+                        // absent from the OOP's entire superclass chain), wrapping it
+                        // here would resolve every later field/method at a mismatched
+                        // offset — a silent type confusion.  klass_match_ok() is
+                        // fail-open: it only returns false for a proven cross-klass
+                        // mismatch, so unregistered wrappers, unresolvable klasses,
+                        // INTERFACE-registered wrappers, and IS-A (subclass-through-
+                        // base) reads all still go through unchanged.
+                        if (!klass_match_ok<wrapper_type>(decoded))
                         {
                             return nullptr;
                         }
@@ -15824,7 +16129,20 @@ namespace vmhook
                 }
             }
 
-            VMHOOK_LOG("{} object::get_method('{}'): method not found in class hierarchy.",
+            // Superclass-chain miss: fall back to the IMPLEMENTED-INTERFACE chain so
+            // an inherited interface DEFAULT method (declared on an interface, not on
+            // this class or a superclass) is reachable through the concrete wrapper.
+            // Crash-safe by construction (every VMStruct read is os::safe_read-guarded;
+            // see find_interface_default_method) and fail-safe to the legacy "not
+            // found" result on any JDK that does not export the interface VMStructs.
+            if (vmhook::hotspot::method* const default_method{
+                    find_interface_default_method(resolved_klass, method_name, std::string_view{}) })
+            {
+                return vmhook::method_proxy{ this->instance, default_method, default_method->get_signature() };
+            }
+
+            VMHOOK_LOG("{} object::get_method('{}'): method not found in class hierarchy "
+                       "(superclass chain) or implemented-interface default methods.",
                        vmhook::error_tag, method_name);
             return std::nullopt;
         }
@@ -15882,8 +16200,20 @@ namespace vmhook
                 }
             }
 
+            // Superclass-chain miss: fall back to the IMPLEMENTED-INTERFACE chain for
+            // an inherited interface DEFAULT method matching this exact name+signature.
+            // Crash-safe (os::safe_read-guarded throughout) and fail-safe on JDKs
+            // without the interface VMStructs (legacy "not found").
+            if (vmhook::hotspot::method* const default_method{
+                    find_interface_default_method(resolved_klass, method_name, method_signature) })
+            {
+                return vmhook::method_proxy{ this->instance, default_method, default_method->get_signature(),
+                                             /*signature_pinned=*/true };
+            }
+
             VMHOOK_LOG("{} object::get_method('{}{}'): no method with this exact name+signature "
-                       "found in class hierarchy.",
+                       "found in class hierarchy (superclass chain) or implemented-interface "
+                       "default methods.",
                        vmhook::error_tag, method_name, method_signature);
             return std::nullopt;
         }
@@ -15935,6 +16265,14 @@ namespace vmhook
                 }
             }
 
+            // NOTE: no interface-default fallback here (unlike the two INSTANCE
+            // overloads).  Interface DEFAULT methods are by definition NON-static
+            // instance methods, so they can never satisfy this STATIC lookup; and a
+            // `static` interface method (Java 8+) is not inherited by an implementor,
+            // so walking a concrete class's interface chain for one would be wrong.
+            // When the wrapper type IS the interface itself, the static interface
+            // method lives on that interface's own _methods array and the superclass
+            // walk above (which starts AT the interface klass) already finds it.
             VMHOOK_LOG("{} object::get_method('{}') (static): no STATIC method with this name "
                        "found in class hierarchy.",
                        vmhook::error_tag, method_name);
@@ -15996,6 +16334,10 @@ namespace vmhook
                 }
             }
 
+            // NOTE: no interface-default fallback here — see the name-only static
+            // overload above.  Default methods are non-static instance methods and
+            // static interface methods are not inherited, so neither belongs on this
+            // STATIC resolution path.
             VMHOOK_LOG("{} object::get_method('{}{}') (static): no STATIC method with this exact "
                        "name+signature found in class hierarchy.",
                        vmhook::error_tag, method_name, method_signature);
@@ -16097,6 +16439,376 @@ namespace vmhook
                 return (*flags & 0x0008u) != 0u;
             }
             return false;
+        }
+
+        /*
+            @brief Fault-safe accessor for the Array<Klass*>* + length pair behind an
+                   interface klass's _methods field, WITHOUT any raw VMStruct deref.
+            @details
+            klass::get_methods_ptr() / get_methods_count() each RAW-deref the
+            `_methods` Array pointer (`*reinterpret_cast<void**>(klass + offset)`) and
+            its `_length` (`*reinterpret_cast<int32_t*>(array)`), gated only by
+            is_valid_pointer.  That is fine on the WARM superclass chain (the
+            concrete class + its supers are already touched), but the interface
+            klasses reached through _transitive_interfaces are a COLD region: a
+            cold / GC-relocated / wrong-offset `_methods` pointer can pass
+            is_valid_pointer yet FAULT on the raw load, and MinGW / clang-on-windows
+            have no SEH to contain it (the crash this whole change fixes).  This
+            helper reproduces the SAME Array<Method*> layout read entirely through
+            os::safe_read / safe_read_pointer, so it can only fail-safe (returns
+            false, never faults).  The superclass walk deliberately keeps using the
+            raw accessors so its byte-for-byte behaviour is unchanged.
+
+            @param iface         Interface InstanceKlass* to read _methods from.
+            @param methods_data  Out: pointer to the first Method* (array base + 8).
+            @param method_count  Out: clamped [1,65535] method count.
+            @return true iff both the array pointer and a sane length were readable.
+        */
+        static auto safe_interface_methods(vmhook::hotspot::klass* const iface,
+                                           vmhook::hotspot::method**&    methods_data,
+                                           std::int32_t&                 method_count) noexcept
+            -> bool
+        {
+            methods_data = nullptr;
+            method_count = 0;
+
+            static const vmhook::hotspot::vm_struct_entry_t* const methods_entry{
+                vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_methods") };
+            if (!methods_entry || !iface || !vmhook::hotspot::is_valid_pointer(iface))
+            {
+                return false;
+            }
+
+            // Array<Method*>* _methods — fault-safe pointer read (no raw deref).
+            const void* const array{ vmhook::hotspot::safe_read_pointer(
+                reinterpret_cast<const std::uint8_t*>(iface) + methods_entry->offset) };
+            if (!vmhook::hotspot::is_valid_pointer(array))
+            {
+                return false;
+            }
+
+            // Array<Method*>::_length @0 — fault-safe, then sanity-clamp like
+            // get_methods_count() (u2 method_count ceiling, reject torn/wrong reads).
+            std::int32_t count{ 0 };
+            if (!vmhook::os::safe_read(&count, array, sizeof(count)))
+            {
+                return false;
+            }
+            if (count <= 0 || count > 65535)
+            {
+                return false;
+            }
+
+            methods_data = reinterpret_cast<vmhook::hotspot::method**>(
+                reinterpret_cast<std::uint8_t*>(const_cast<void*>(array)) + 8);
+            method_count = count;
+            return true;
+        }
+
+        /*
+            @brief Fault-safe name/signature read for a Method on a COLD interface,
+                   WITHOUT any raw VMStruct deref of the Method->ConstMethod->
+                   ConstantPool->Symbol chain.
+            @details
+            method::get_name()/get_signature() and the const_method accessors they
+            call RAW-deref `_constMethod`, `_name_index`/`_signature_index`,
+            `_constants`, and `base[index]`.  On the cold interface-method path any
+            of those pointers can pass is_valid_pointer yet fault on load (the
+            MinGW/clang-no-SEH crash).  This helper walks the SAME chain but every
+            pointer/index hop goes through os::safe_read / safe_read_pointer; only
+            the FINAL symbol->to_string() is reused, because symbol::to_string() is
+            itself already fully os::safe_read-guarded (it never raw-derefs).  Any
+            unreadable hop returns false and the caller skips the method (treated as
+            not-a-match), so a torn read can never fault or mis-match.
+
+            @param current_method  Candidate Method* (already is_valid_pointer-checked).
+            @param name_out        Out: method name (empty + false on any failure).
+            @param signature_out   Out: method JVM descriptor (empty + false on failure).
+            @return true iff BOTH the name and signature symbols were safely read.
+        */
+        static auto safe_method_name_signature(vmhook::hotspot::method* const current_method,
+                                               std::string&                  name_out,
+                                               std::string&                  signature_out) noexcept
+            -> bool
+        {
+            name_out.clear();
+            signature_out.clear();
+
+            static const vmhook::hotspot::vm_struct_entry_t* const constmethod_entry{
+                vmhook::hotspot::iterate_struct_entries("Method", "_constMethod") };
+            static const vmhook::hotspot::vm_struct_entry_t* const name_index_entry{
+                vmhook::hotspot::iterate_struct_entries("ConstMethod", "_name_index") };
+            static const vmhook::hotspot::vm_struct_entry_t* const sig_index_entry{
+                vmhook::hotspot::iterate_struct_entries("ConstMethod", "_signature_index") };
+            static const vmhook::hotspot::vm_struct_entry_t* const constants_entry{
+                vmhook::hotspot::iterate_struct_entries("ConstMethod", "_constants") };
+            static const vmhook::hotspot::vm_type_entry_t* const cp_type_entry{
+                vmhook::hotspot::iterate_type_entries("ConstantPool") };
+            // ConstantPool::_length is OPTIONAL: when present we bound the index, when
+            // absent we still proceed (the per-slot safe_read_pointer guards the read).
+            static const vmhook::hotspot::vm_struct_entry_t* const cp_length_entry{
+                vmhook::hotspot::iterate_struct_entries("ConstantPool", "_length") };
+
+            if (!constmethod_entry || !name_index_entry || !sig_index_entry
+                || !constants_entry || !cp_type_entry)
+            {
+                return false;
+            }
+            if (!current_method || !vmhook::hotspot::is_valid_pointer(current_method))
+            {
+                return false;
+            }
+
+            // Method::_constMethod — fault-safe pointer read.
+            const void* const const_method{ vmhook::hotspot::safe_read_pointer(
+                reinterpret_cast<const std::uint8_t*>(current_method) + constmethod_entry->offset) };
+            if (!vmhook::hotspot::is_valid_pointer(const_method))
+            {
+                return false;
+            }
+
+            // ConstMethod::_constants — fault-safe pointer read.
+            const void* const constants{ vmhook::hotspot::safe_read_pointer(
+                reinterpret_cast<const std::uint8_t*>(const_method) + constants_entry->offset) };
+            if (!vmhook::hotspot::is_valid_pointer(constants))
+            {
+                return false;
+            }
+
+            // ConstantPool entry array base = constants + sizeof(ConstantPool header).
+            void** const cp_base{ reinterpret_cast<void**>(
+                reinterpret_cast<std::uint8_t*>(const_cast<void*>(constants)) + cp_type_entry->size) };
+            if (!vmhook::hotspot::is_valid_pointer(cp_base))
+            {
+                return false;
+            }
+
+            // Optional bound: ConstantPool::_length (fault-safe).  -1 => unbounded.
+            std::int32_t cp_length{ -1 };
+            if (cp_length_entry)
+            {
+                std::int32_t probe{ 0 };
+                if (vmhook::os::safe_read(&probe,
+                                          reinterpret_cast<const std::uint8_t*>(constants) + cp_length_entry->offset,
+                                          sizeof(probe)))
+                {
+                    cp_length = probe;
+                }
+            }
+
+            // Resolve ONE constant-pool symbol slot by u2 index, fault-safe end to end.
+            const auto resolve_symbol{
+                [&](const vmhook::hotspot::vm_struct_entry_t* const index_entry) noexcept
+                    -> vmhook::hotspot::symbol*
+                {
+                    std::uint16_t index{ 0 };
+                    if (!vmhook::os::safe_read(&index,
+                                               reinterpret_cast<const std::uint8_t*>(const_method) + index_entry->offset,
+                                               sizeof(index)))
+                    {
+                        return nullptr;
+                    }
+                    if (cp_length >= 0 && index >= cp_length)
+                    {
+                        return nullptr;
+                    }
+                    // base[index] — fault-safe pointer read of the specific slot.
+                    const void* const sym{ vmhook::hotspot::safe_read_pointer(&cp_base[index]) };
+                    if (!vmhook::hotspot::is_valid_pointer(sym))
+                    {
+                        return nullptr;
+                    }
+                    return reinterpret_cast<vmhook::hotspot::symbol*>(const_cast<void*>(sym));
+                } };
+
+            const vmhook::hotspot::symbol* const name_symbol{ resolve_symbol(name_index_entry) };
+            const vmhook::hotspot::symbol* const sig_symbol{ resolve_symbol(sig_index_entry) };
+            if (!name_symbol || !sig_symbol)
+            {
+                return false;
+            }
+
+            // symbol::to_string() is itself fully os::safe_read-guarded (length via
+            // safe_read, body via safe_read into a bounded buffer) — no raw deref.
+            name_out = name_symbol->to_string();
+            signature_out = sig_symbol->to_string();
+            return !name_out.empty() && !signature_out.empty();
+        }
+
+        /*
+            @brief Fault-safe DEFAULT-method kind gate (NOT static AND NOT abstract),
+                   WITHOUT raw-derefing Method::_access_flags.
+            @details
+            A genuine interface DEFAULT method has a body and is an instance method:
+            neither ACC_STATIC (0x0008) nor ACC_ABSTRACT (0x0400).  We must EXCLUDE
+              * abstract interface declarations (e.g. `String speak();`) — no body to
+                call; the concrete override is already returned by the superclass walk,
+                so an abstract interface method must not shadow it, and
+              * static / (JDK 8) private interface helpers — a static interface method
+                is not inherited by implementors.
+            method::get_access_flags() returns a pointer that the caller raw-derefs
+            (`*flags`); on the cold interface path that raw read can fault.  Here we
+            safe_read the u4 _access_flags into a local instead.  Fails CLOSED: if the
+            flags word is unreadable / the VMStruct is absent, returns false (the
+            method is NOT treated as a callable default), so we never hand back an
+            abstract or static interface method as if it were one.
+
+            @param current_method  Candidate Method* (already is_valid_pointer-checked).
+            @return true iff the method is a real default (neither static nor abstract).
+        */
+        static auto safe_method_is_default(vmhook::hotspot::method* const current_method) noexcept
+            -> bool
+        {
+            static const vmhook::hotspot::vm_struct_entry_t* const flags_entry{
+                vmhook::hotspot::iterate_struct_entries("Method", "_access_flags") };
+            if (!flags_entry || !current_method || !vmhook::hotspot::is_valid_pointer(current_method))
+            {
+                return false;
+            }
+
+            std::uint32_t flags{ 0 };
+            if (!vmhook::os::safe_read(&flags,
+                                       reinterpret_cast<const std::uint8_t*>(current_method) + flags_entry->offset,
+                                       sizeof(flags)))
+            {
+                return false;
+            }
+
+            constexpr std::uint32_t acc_static{ 0x0008u };
+            constexpr std::uint32_t acc_abstract{ 0x0400u };
+            return (flags & (acc_static | acc_abstract)) == 0u;
+        }
+
+        /*
+            @brief Searches a klass's implemented interfaces for a matching DEFAULT method.
+            @details
+            The superclass-chain walk that every get_method() overload runs first
+            follows Klass::_super only (concrete class -> ... -> java.lang.Object) and
+            therefore CANNOT see a method declared on an implemented interface rather
+            than on the class or one of its superclasses.  An interface DEFAULT method
+            (Java 8+) lives exactly there: on the interface, never copied onto the
+            implementor's own InstanceKlass._methods array.  This helper closes that
+            gap — it is the SECOND-CHANCE lookup the overloads fall back to ONLY after
+            the superclass walk has failed, so it can never change which method an
+            already-resolvable name/name+sig binds to (the superclass/own-method result
+            still wins, byte-for-byte unchanged).
+
+            It walks InstanceKlass._transitive_interfaces (the complete, flattened set
+            of every interface this class implements directly or transitively — see
+            klass::get_interfaces_ptr) and, for each interface klass, scans that
+            interface's own _methods array for a method whose name (and, when
+            method_signature is non-empty, whose JVM descriptor) matches AND which is a
+            genuine default (NOT abstract, NOT static).
+
+            CRASH-SAFE BY CONSTRUCTION:  there is ZERO raw deref of a VMStructs-derived
+            pointer in this walk.  The interface array (length + each Klass* entry),
+            each interface's _methods array (length + each Method* entry), and each
+            Method's name/signature symbols and _access_flags are ALL read through
+            os::safe_read / safe_read_pointer via get_interfaces_ptr,
+            safe_interface_methods, safe_method_name_signature and
+            safe_method_is_default.  Every loop is bounded (<=65535).  On the cold /
+            relocated / wrong-offset path a bad pointer makes the relevant safe_read
+            return false and we SKIP that interface/method and continue — it can never
+            fault, which is why this is safe on MinGW / clang-on-windows (no SEH).
+
+            DETERMINISM / AMBIGUITY:  a class may implement several interfaces that each
+            supply a same-named default (Java rejects that at compile time without an
+            explicit override, but vmhook resolves against whatever the running JVM
+            actually loaded).  We return the FIRST match in _transitive_interfaces order
+            and stop — a single, stable, documented choice.  Callers needing a specific
+            one should pass an exact name+signature.
+
+            FAIL-SAFE:  get_interfaces_ptr() returns nullptr/0 whenever the interface
+            VMStructs entries are not exported on the running JDK (or on any unreadable
+            read), so on such a JDK this helper simply finds nothing and the caller's
+            behaviour is byte-for-byte the legacy superclass-only result.
+
+            @param start_klass        The (already-resolved) klass to search the
+                                      interfaces of.  Must be an InstanceKlass*.
+            @param method_name        Exact Java method name to match.
+            @param method_signature   Exact JVM descriptor to match, or empty for a
+                                      name-only match (first matching default wins).
+            @return  The matching default Method*, or nullptr if none is found / the
+                     interface arrays are not resolvable on this JDK.
+        */
+        static auto find_interface_default_method(vmhook::hotspot::klass* const start_klass,
+                                                  const std::string_view method_name,
+                                                  const std::string_view method_signature) noexcept
+            -> vmhook::hotspot::method*
+        {
+            if (!start_klass || !vmhook::hotspot::is_valid_pointer(start_klass))
+            {
+                return nullptr;
+            }
+
+            std::int32_t interface_count{ 0 };
+            vmhook::hotspot::klass** const interfaces{ start_klass->get_interfaces_ptr(interface_count) };
+            if (!interfaces || interface_count <= 0)
+            {
+                // No interface array on this JDK (fail-safe) or the class implements
+                // none: nothing to add beyond the superclass walk.
+                return nullptr;
+            }
+
+            for (std::int32_t i{ 0 }; i < interface_count; ++i)
+            {
+                // Each Klass* entry is in the COLD interface array — read it fault-safe
+                // (NO raw `interfaces[i]`).  An unreadable slot is skipped.
+                const void* const iface_raw{ vmhook::hotspot::safe_read_pointer(&interfaces[i]) };
+                if (!vmhook::hotspot::is_valid_pointer(iface_raw))
+                {
+                    continue;
+                }
+                vmhook::hotspot::klass* const iface{
+                    reinterpret_cast<vmhook::hotspot::klass*>(const_cast<void*>(iface_raw)) };
+
+                vmhook::hotspot::method** methods_array{ nullptr };
+                std::int32_t              method_count{ 0 };
+                if (!safe_interface_methods(iface, methods_array, method_count))
+                {
+                    continue;
+                }
+
+                for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
+                {
+                    // Each Method* entry is in the COLD methods array — fault-safe read.
+                    const void* const method_raw{ vmhook::hotspot::safe_read_pointer(&methods_array[method_index]) };
+                    if (!vmhook::hotspot::is_valid_pointer(method_raw))
+                    {
+                        continue;
+                    }
+                    vmhook::hotspot::method* const current_method{
+                        reinterpret_cast<vmhook::hotspot::method*>(const_cast<void*>(method_raw)) };
+
+                    std::string current_name;
+                    std::string current_signature;
+                    if (!safe_method_name_signature(current_method, current_name, current_signature))
+                    {
+                        continue;
+                    }
+                    if (current_name != method_name)
+                    {
+                        continue;
+                    }
+                    if (!method_signature.empty() && current_signature != method_signature)
+                    {
+                        continue;
+                    }
+
+                    // DEFAULT-method gate (fault-safe, fails CLOSED): skip abstract
+                    // interface declarations (no body; the concrete override is found
+                    // by the superclass walk) and static/private interface helpers.
+                    if (!safe_method_is_default(current_method))
+                    {
+                        continue;
+                    }
+
+                    // First matching DEFAULT method in transitive-interface order.
+                    return current_method;
+                }
+            }
+
+            return nullptr;
         }
     };
 

@@ -131,6 +131,24 @@ namespace
         return ua == ub;
     }
 
+    // Reinterpret a raw 32/64-bit pattern AS a float/double.  Used to forge an
+    // exact IEEE-754 bit pattern (e.g. a NaN with a SPECIFIC mantissa payload, a
+    // chosen subnormal) without relying on a literal that a compiler might fold.
+    // The value forced into the slot and the value the JVM caller must observe
+    // are then compared bit-for-bit by same_bits().
+    auto bits_to_float(std::uint32_t bits) -> float
+    {
+        float out{};
+        std::memcpy(&out, &bits, sizeof(out));
+        return out;
+    }
+    auto bits_to_double(std::uint64_t bits) -> double
+    {
+        double out{};
+        std::memcpy(&out, &bits, sizeof(out));
+        return out;
+    }
+
     // Arm all 16 hooks for one value vector, run ONE probe, leave the observed
     // fields populated for the caller to assert on.  Returns whether the probe
     // completed.  All handles are local, so they disarm when this function
@@ -268,6 +286,32 @@ VMHOOK_JVM_MODULE(return_set_primitives)
 
     float  f_neg_zero{ -0.0f };
     double d_neg_zero{ -0.0 };
+
+    // Largest/smallest finite magnitudes and the smallest positive SUBNORMAL.
+    // max()      = largest finite (sign clear).
+    // lowest()   = most-negative finite (== -max(); sign bit set).
+    // min()      = smallest POSITIVE NORMAL (exponent field == 1, mantissa 0).
+    // denorm_min = smallest POSITIVE SUBNORMAL (exponent field 0, mantissa == 1)
+    //              — a flush-to-zero FPU path would corrupt it, so a bit-exact
+    //              round-trip proves the slot/movq-xmm0 epilogue copies, never
+    //              arithmetises, the value.
+    constexpr float  f_max{ std::numeric_limits<float>::max() };
+    constexpr double d_max{ std::numeric_limits<double>::max() };
+    constexpr float  f_lowest{ std::numeric_limits<float>::lowest() };
+    constexpr double d_lowest{ std::numeric_limits<double>::lowest() };
+    constexpr float  f_min_normal{ std::numeric_limits<float>::min() };
+    constexpr double d_min_normal{ std::numeric_limits<double>::min() };
+    const     float  f_subnormal{ std::numeric_limits<float>::denorm_min() };
+    const     double d_subnormal{ std::numeric_limits<double>::denorm_min() };
+
+    // NaNs carrying a SPECIFIC, non-canonical mantissa payload (distinct from
+    // the library/std quiet-NaN used in the "qnan" round).  The exponent field
+    // is all-ones and a hand-chosen payload sits in the mantissa; same_bits()
+    // then demands the EXACT payload survive the movq xmm0 epilogue, proving the
+    // slot is not "normalised" to a canonical NaN.  Bit 22 (float) / 51 (double)
+    // is set so the value is a quiet NaN regardless of platform sNaN handling.
+    const     float  f_nan_payload{ bits_to_float(0x7FAB1234u) };
+    const     double d_nan_payload{ bits_to_double(0x7FF8ABCDEF012345ULL) };
 
     // ROUND 1 — canonical "obviously not the original" values, all distinct
     // from every orig* return.  The bedrock that the force-return path works
@@ -448,7 +492,169 @@ VMHOOK_JVM_MODULE(return_set_primitives)
         /*d */ 13.0,
         /*c */ static_cast<std::uint16_t>(0xD83D) }); // high surrogate
 
-    // ROUND 14 — re-run the canonical vector a SECOND time at the very end to
+    // ROUND 14 — signed-integral MIN+1: the off-by-one neighbour just ABOVE the
+    // minimum.  A sign-extension predicate that is wrong only at exactly MIN
+    // would still pass signed_min by luck; -127 / INT16_MIN+1 / INT32_MIN+1 /
+    // INT64_MIN+1 are negative non-extreme values that MUST keep their sign
+    // through static_cast<int64_t> (byte/short/int) and the memcpy path (long).
+    run_and_check(ctx, "boundary_plus_one", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(std::numeric_limits<std::int8_t>::min() + 1),    // -127
+        /*s */ static_cast<std::int16_t>(std::numeric_limits<std::int16_t>::min() + 1),  // -32767
+        /*i */ std::numeric_limits<std::int32_t>::min() + 1,                             // INT_MIN+1
+        /*l */ std::numeric_limits<std::int64_t>::min() + 1,                             // LONG_MIN+1
+        /*f */ 14.5f,
+        /*d */ 14.25,
+        /*c */ static_cast<std::uint16_t>(0x0002) });
+
+    // ROUND 15 — signed-integral MAX-1: the off-by-one neighbour just BELOW the
+    // maximum (positive, non-extreme).  char 0xFFFE is jchar-max minus one and
+    // must keep the upper 48 bits CLEAR (no accidental sign extension next to
+    // the top of the unsigned range).
+    run_and_check(ctx, "boundary_minus_one", forced_values{
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(std::numeric_limits<std::int8_t>::max() - 1),    // 126
+        /*s */ static_cast<std::int16_t>(std::numeric_limits<std::int16_t>::max() - 1),  // 32766
+        /*i */ std::numeric_limits<std::int32_t>::max() - 1,                             // INT_MAX-1
+        /*l */ std::numeric_limits<std::int64_t>::max() - 1,                             // LONG_MAX-1
+        /*f */ 15.5f,
+        /*d */ 15.25,
+        /*c */ static_cast<std::uint16_t>(0xFFFE) });
+
+    // ROUND 16 — LONG low-dword saturated, high-dword zero (0x00000000FFFFFFFF).
+    // This is the 32->64 boundary the OTHER way from long_high_dword: a 64-bit
+    // long whose low 32 bits are all ones must NOT be sign-extended (long takes
+    // the memcpy path, sizeof==8), so the high dword stays 0 — i.e. the Java
+    // caller sees +4294967295L, never -1L.  byte/short/int carry their own
+    // low-bits-set sentinels; char 0x0100 is the first 2-byte UTF-8 boundary.
+    run_and_check(ctx, "long_low_dword_max", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(16),
+        /*s */ static_cast<std::int16_t>(16),
+        /*i */ 16,
+        /*l */ static_cast<std::int64_t>(0x00000000FFFFFFFFLL), // 4294967295
+        /*f */ 16.5f,
+        /*d */ 16.25,
+        /*c */ static_cast<std::uint16_t>(0x0100) });
+
+    // ROUND 17 — LONG exact 32->64 carry point (0x0000000100000000 == 2^32):
+    // bit 32 set, every lower bit clear.  Proves the single bit that straddles
+    // the two 32-bit halves is delivered, so a truncating "low dword only" path
+    // would surface 0 here and fail loudly.  char 0x0200 keeps the char slot
+    // distinct.
+    run_and_check(ctx, "long_carry_2pow32", forced_values{
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(17),
+        /*s */ static_cast<std::int16_t>(17),
+        /*i */ 17,
+        /*l */ static_cast<std::int64_t>(0x0000000100000000LL), // 2^32
+        /*f */ 17.5f,
+        /*d */ 17.25,
+        /*c */ static_cast<std::uint16_t>(0x0200) });
+
+    // ROUND 18 — float/double TYPE MAX (largest finite magnitude), bit-exact.
+    //   float  0x7F7FFFFF, double 0x7FEFFFFFFFFFFFFF.  Distinct from +Inf: the
+    // exponent is all-ones-minus-one with a full mantissa, so a mishandled
+    // overflow-to-Inf would change the bits and same_bits() would catch it.
+    run_and_check(ctx, "float_double_type_max", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(18),
+        /*s */ static_cast<std::int16_t>(18),
+        /*i */ 18,
+        /*l */ static_cast<std::int64_t>(18),
+        /*f */ f_max,
+        /*d */ d_max,
+        /*c */ static_cast<std::uint16_t>(0x4D41) }); // 'MA'
+
+    // ROUND 19 — float/double smallest POSITIVE NORMAL (min()), bit-exact.
+    //   float  0x00800000, double 0x0010000000000000.  Exponent field == 1,
+    // mantissa 0 — the very edge above the subnormal range.
+    run_and_check(ctx, "float_double_min_normal", forced_values{
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(19),
+        /*s */ static_cast<std::int16_t>(19),
+        /*i */ 19,
+        /*l */ static_cast<std::int64_t>(19),
+        /*f */ f_min_normal,
+        /*d */ d_min_normal,
+        /*c */ static_cast<std::uint16_t>(0x4D49) }); // 'MI'
+
+    // ROUND 20 — float/double LOWEST finite (== -max(); sign bit set),
+    // bit-exact.  The most-negative representable finite value, distinct from
+    // type_max only by the sign bit, proving the sign rides through the slot for
+    // the maximum-magnitude operand.
+    run_and_check(ctx, "float_double_lowest", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(20),
+        /*s */ static_cast<std::int16_t>(20),
+        /*i */ 20,
+        /*l */ static_cast<std::int64_t>(20),
+        /*f */ f_lowest,
+        /*d */ d_lowest,
+        /*c */ static_cast<std::uint16_t>(0x4C4F) }); // 'LO'
+
+    // ROUND 21 — float/double smallest POSITIVE SUBNORMAL (denorm_min()),
+    // bit-exact.  float 0x00000001, double 0x0000000000000001: exponent field 0,
+    // mantissa == 1.  An FPU path with flush-to-zero / denormals-are-zero would
+    // turn this into +0.0; same_bits() proves the slot is copied verbatim and
+    // never passed through an arithmetic unit.
+    run_and_check(ctx, "float_double_subnormal", forced_values{
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(21),
+        /*s */ static_cast<std::int16_t>(21),
+        /*i */ 21,
+        /*l */ static_cast<std::int64_t>(21),
+        /*f */ f_subnormal,
+        /*d */ d_subnormal,
+        /*c */ static_cast<std::uint16_t>(0x5355) }); // 'SU'
+
+    // ROUND 22 — NaN with a SPECIFIC mantissa payload (not the canonical quiet
+    // NaN of the qnan round).  float 0x7FAB1234, double 0x7FF8ABCDEF012345 must
+    // arrive with their payload intact: same_bits() fails if the value were
+    // canonicalised to 0x7FC00000 / 0x7FF8000000000000.  This is the strongest
+    // guard that the slot delivers ARBITRARY bit patterns, not just "a NaN".
+    run_and_check(ctx, "float_double_nan_payload", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(22),
+        /*s */ static_cast<std::int16_t>(22),
+        /*i */ 22,
+        /*l */ static_cast<std::int64_t>(22),
+        /*f */ f_nan_payload,
+        /*d */ d_nan_payload,
+        /*c */ static_cast<std::uint16_t>(0x4E50) }); // 'NP'
+
+    // ROUND 23 — positive sign-bit-neighbour integrals: MAX-with-low-bit-clear
+    //   byte 0x7E, short 0x7FFE, int 0x7FFFFFFE, long 0x7FFFFFFFFFFFFFFE.  The
+    // largest-even positive in each width, sitting just below the sign flip,
+    // confirming the top positive region is delivered without tipping into the
+    // negative (extension) branch.  char 0x7FFE is the BMP value just below the
+    // surrogate-adjacent range.
+    run_and_check(ctx, "int_sign_neighbors", forced_values{
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(0x7E),
+        /*s */ static_cast<std::int16_t>(0x7FFE),
+        /*i */ 0x7FFFFFFE,
+        /*l */ static_cast<std::int64_t>(0x7FFFFFFFFFFFFFFELL),
+        /*f */ 23.5f,
+        /*d */ 23.25,
+        /*c */ static_cast<std::uint16_t>(0x7FFE) });
+
+    // ROUND 24 — char LOW surrogate (0xDC00), the twin of the high surrogate
+    // (0xD83D) covered earlier, plus the 2-byte/3-byte UTF-8 BMP boundaries on
+    // the integral slots (short 0x07FF, int 0x0800).  A lone low surrogate is a
+    // valid 16-bit jchar code unit; forcing it proves the char path applies no
+    // surrogate validation and no sign extension across the full unsigned range.
+    run_and_check(ctx, "char_low_surrogate", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(24),
+        /*s */ static_cast<std::int16_t>(0x07FF), // last 2-byte UTF-8 codepoint
+        /*i */ 0x0800,                            // first 3-byte UTF-8 codepoint
+        /*l */ static_cast<std::int64_t>(24),
+        /*f */ 24.5f,
+        /*d */ 24.25,
+        /*c */ static_cast<std::uint16_t>(0xDC00) }); // lone low surrogate
+
+    // ROUND 25 — re-run the canonical vector a SECOND time at the very end to
     // prove the force-return path is stable across repeated arm/disarm cycles
     // (each round installs fresh scoped_hooks; this guards against state left
     // behind by a previous round's teardown).
@@ -462,8 +668,8 @@ VMHOOK_JVM_MODULE(return_set_primitives)
         /*d */ 2.5,
         /*c */ static_cast<std::uint16_t>(0x263A) });
 
-    // ---- Lifecycle sanity: 14 rounds ran, so roundCount must be 14. -------
-    ctx.check("ran_14_rounds", rsp_fixture::round_count() == 14);
+    // ---- Lifecycle sanity: 25 rounds ran, so roundCount must be 25. -------
+    ctx.check("ran_25_rounds", rsp_fixture::round_count() == 25);
 
     // ---- Control angle: with NO hooks installed, the original values flow
     // through unchanged (proves the force-return is what changed the result,
@@ -498,7 +704,24 @@ VMHOOK_JVM_MODULE(return_set_primitives)
     }
 
     ctx.record("[INFO] return_set_primitives: forced bool/byte/short/int/long/float/double/char "
-               "on instance+static dispatch across 14 value rounds (canonical, min/zero, signed "
+               "on instance+static dispatch across 25 value rounds (canonical, min/zero, signed "
                "min/max, minus-one, high-bit, -0.0, +Inf, -Inf, qNaN, precision, long-high-dword, "
-               "surrogate char, repeat) plus a no-hook baseline.");
+               "surrogate char, MIN+1, MAX-1, long-low-dword-max, long-2^32-carry, float/double "
+               "type-max, min-normal, lowest, subnormal, custom-NaN-payload, int-sign-neighbors, "
+               "low-surrogate char, canonical-repeat) plus a no-hook baseline.");
+
+    // [INFO] Boolean force-return is intentionally bounded to {true,false}: the
+    // return_value::set(value) API takes its argument BY TYPE, so a boolean slot
+    // can only be driven through a C++ `bool`, whose object representation is
+    // {0,1}.  A "raw non-canonical byte" (e.g. 0x02) cannot be expressed through
+    // this typed path WITHOUT constructing a `bool` with an invalid value, which
+    // is undefined behaviour in C++ — so it is deliberately NOT exercised here.
+    // The byte-width force-return is covered exhaustively by the origByte rounds
+    // (0, 1, -1, 0x80, MIN/MAX, +/-1 neighbours) instead; the {true,false} edges
+    // of the boolean path are both asserted (canonical=true, min_zero=false,
+    // high_bit=false) on instance AND static dispatch.
+    ctx.record("[INFO] return_set_primitives: bool force-return is type-bounded to {true,false} by "
+               "set(value); a raw non-canonical boolean byte is not expressible without UB, so the "
+               "raw-byte boolean case is documented rather than tested (byte-width raw patterns are "
+               "covered by the origByte rounds).");
 }

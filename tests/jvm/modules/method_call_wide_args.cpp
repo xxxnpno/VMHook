@@ -93,8 +93,24 @@ namespace
     constexpr std::int32_t FD_TAG_FLOAT   = 333;
     constexpr std::int32_t FD_TAG_DOUBLE  = 444;
 
-    // The exhaustive long boundary set.  The last two are the halves a 32-bit
-    // truncation bug would confuse (high-only vs low-only).
+    // Two ASCII String arguments for the object-reference interleave methods
+    // (mixS / objLong / longObj / sMixS).  They have DISTINCT lengths (7 vs 13)
+    // so an a<->c swap changes the length-weighted return; the exact lengths feed
+    // the deterministic return formula the native side recomputes.  Pure ASCII so
+    // a.length() == byte count == the std::string size on both sides.
+    const std::string kStrA{ "wide-aa" };          // length 7
+    const std::string kStrC{ "ref-cc-trailer" };   // length 14
+    constexpr std::int64_t kStrLenA = 7;
+    constexpr std::int64_t kStrLenC = 14;
+
+    // The exhaustive long boundary set.  Beyond the canonical halves (high-only
+    // vs low-only — what a 32-bit truncation confuses) this also walks the
+    // 32->64-bit SIGN/CARRY boundary and powers of two straddling bit 31/32/63,
+    // because the single most common wide-arg defect is treating a long as a
+    // sign-extended 32-bit int: such a bug maps 0x0000000080000000 (a POSITIVE
+    // long whose low word reads as a negative int) onto 0xFFFFFFFF80000000, and
+    // collapses 0x0000000100000000 (1<<32) to 0.  Each entry round-trips through
+    // idL bit-exact, so any of those confusions fails its echo check.
     constexpr std::int64_t kLongVals[] = {
         0LL,
         1LL,
@@ -105,6 +121,20 @@ namespace
         static_cast<std::int64_t>(0xFFFFFFFF00000000ULL),       // high half only
         static_cast<std::int64_t>(0x00000000FFFFFFFFULL),       // low half only (== 4294967295)
         static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL),       // both halves nonzero
+        // --- 32->64-bit sign / carry boundary (the sign-extension-bug witnesses) ---
+        static_cast<std::int64_t>(0x000000007FFFFFFFULL),       // INT_MAX as a long (positive)
+        static_cast<std::int64_t>(0x0000000080000000ULL),       // INT_MAX+1: low word "looks" negative-int, long is +2^31
+        static_cast<std::int64_t>(0xFFFFFFFF80000000ULL),       // INT_MIN sign-extended to 64 (-2^31)
+        static_cast<std::int64_t>(0x0000000100000000ULL),       // 1<<32: a naive low-32 pack reads 0
+        static_cast<std::int64_t>(0x00000000FFFFFFFEULL),       // (1<<32)-2: high word zero, low word large
+        // --- powers of two and their neighbours straddling bit 31 / 62 / 63 ---
+        static_cast<std::int64_t>(0x0000000080000001ULL),       // (1<<31)+1
+        static_cast<std::int64_t>(0x000000007FFFFFFEULL),       // (1<<31)-2
+        static_cast<std::int64_t>(0x4000000000000000ULL),       // 1<<62
+        static_cast<std::int64_t>(0x4000000000000001ULL),       // (1<<62)+1
+        static_cast<std::int64_t>(0x7FFFFFFFFFFFFFFEULL),       // LONG_MAX-1
+        static_cast<std::int64_t>(0x8000000000000001ULL),       // LONG_MIN+1
+        static_cast<std::int64_t>(0x7EDCBA9812345678ULL),       // distinct nonzero high+low words (no symmetry)
     };
     constexpr std::size_t kLongCount{ sizeof(kLongVals) / sizeof(kLongVals[0]) };
 
@@ -125,6 +155,16 @@ namespace
         0x0000000000000001ULL, // smallest subnormal (Double.MIN_VALUE)
         0x0010000000000000ULL, // Double.MIN_NORMAL
         0x7FEFFFFFFFFFFFFFULL, // Double.MAX_VALUE
+        // --- the negative-sign mirrors (an 'abs only' or sign-dropping bug fails here) ---
+        0xFFF0000000000001ULL, // -signaling NaN (sign bit + signaling payload)
+        0x8000000000000001ULL, // -smallest subnormal (sign bit on the denormal)
+        0x8010000000000000ULL, // -Double.MIN_NORMAL
+        0xFFEFFFFFFFFFFFFFULL, // -Double.MAX_VALUE
+        // --- distinct nonzero HIGH and LOW 32-bit words (a word-swap/endian bug
+        //     on the wide echo path lands here; most of the set above has a zero
+        //     low word, so this is the dedicated split-word witness). ---
+        0x123456789ABCDEF0ULL, // arbitrary finite-ish pattern, both words set
+        0x401ABCDEF1234567ULL, // a normal magnitude (~6.7) with a busy low word
     };
     constexpr std::size_t kDoubleCount{ sizeof(kDoubleBits) / sizeof(kDoubleBits[0]) };
 
@@ -200,6 +240,33 @@ namespace
         static auto wHexBd() -> std::int64_t  { return static_field("wHexBd")->get(); }
         static auto wHexBe() -> std::int32_t  { return static_field("wHexBe")->get(); }
         static auto wHexBf() -> std::uint64_t { return d2bits_field("wHexBf"); }
+        // mixF / fld float+wide witnesses.  A float witness is read as its RAW
+        // 32-bit pattern so the comparison is bit-exact (mirrors the double-bits
+        // approach), reconstructed from the float static field.
+        static auto f2bits_field(const char* name) -> std::uint32_t
+        {
+            const float f = static_field(name)->get();
+            std::uint32_t b{ 0 };
+            std::memcpy(&b, &f, sizeof(b));
+            return b;
+        }
+        static auto wMixFa() -> std::uint32_t { return f2bits_field("wMixFa"); }
+        static auto wMixFb() -> std::int64_t  { return static_field("wMixFb")->get(); }
+        static auto wMixFc() -> std::uint32_t { return f2bits_field("wMixFc"); }
+        static auto wFldA()  -> std::uint32_t { return f2bits_field("wFldA"); }
+        static auto wFldB()  -> std::int64_t  { return static_field("wFldB")->get(); }
+        static auto wFldC()  -> std::uint64_t { return d2bits_field("wFldC"); }
+        // mixS / objLong / longObj object-reference adjacency witnesses.  The
+        // String witnesses are read back as std::string (their content is the
+        // proof the reference neither swapped nor shifted); the long witnesses
+        // prove the wide arg stayed intact beside the reference slots.
+        static auto wMixSa() -> std::string  { return static_field("wMixSa")->get().as_string(); }
+        static auto wMixSb() -> std::int64_t { return static_field("wMixSb")->get(); }
+        static auto wMixSc() -> std::string  { return static_field("wMixSc")->get().as_string(); }
+        static auto wOlObj()  -> std::string  { return static_field("wOlObj")->get().as_string(); }
+        static auto wOlLong() -> std::int64_t { return static_field("wOlLong")->get(); }
+        static auto wLoLong() -> std::int64_t { return static_field("wLoLong")->get(); }
+        static auto wLoObj()  -> std::string  { return static_field("wLoObj")->get().as_string(); }
         // static-variant witnesses
         static auto sWAddLa() -> std::int64_t { return static_field("sWAddLa")->get(); }
         static auto sWAddLb() -> std::int64_t { return static_field("sWAddLb")->get(); }
@@ -215,6 +282,13 @@ namespace
         static auto sWJdB()   -> std::uint64_t { return d2bits_field("sWJdB"); }
         static auto sWDjA()   -> std::uint64_t { return d2bits_field("sWDjA"); }
         static auto sWDjB()   -> std::int64_t  { return static_field("sWDjB")->get(); }
+        // static float/object-interleave witnesses
+        static auto sWFldA()  -> std::uint32_t { return f2bits_field("sWFldA"); }
+        static auto sWFldB()  -> std::int64_t  { return static_field("sWFldB")->get(); }
+        static auto sWFldC()  -> std::uint64_t { return d2bits_field("sWFldC"); }
+        static auto sWMixSa() -> std::string  { return static_field("sWMixSa")->get().as_string(); }
+        static auto sWMixSb() -> std::int64_t { return static_field("sWMixSb")->get(); }
+        static auto sWMixSc() -> std::string  { return static_field("sWMixSc")->get().as_string(); }
     };
 
     // ---------------------------------------------------------------------
@@ -233,7 +307,17 @@ namespace
         bool         is_void{ false };
         std::int64_t ival{ 0 };          // long/int result
         std::uint64_t dbits{ 0 };        // double result raw bits
+        std::uint32_t fbits{ 0 };        // float result raw bits (mixF)
     };
+
+    // float -> raw 32-bit pattern (the single-precision analogue of d2bits), so a
+    // float return / witness compares bit-exact.
+    inline auto f2bits(float f) noexcept -> std::uint32_t
+    {
+        std::uint32_t b{ 0 };
+        std::memcpy(&b, &f, sizeof(b));
+        return b;
+    }
 
     std::mutex                          g_mutex;
     std::map<std::string, probe_result> g_res;
@@ -561,6 +645,94 @@ namespace
         put(key, r);
     }
 
+    // Instance, returns float, (float,long,float) — wide long flanked by floats.
+    auto cap_mixF(const wide& self, const std::string& key,
+                  float a, std::int64_t b, float c) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("mixF") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const float got = v;
+            r.fbits      = f2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (float,long,double) — narrow float then two wide.
+    auto cap_fld(const wide& self, const std::string& key,
+                 float a, std::int64_t b, double c) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("fld") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns long, (String,long,String) — wide long between two object
+    // references.  The Strings are passed as std::string (-> java.lang.String).
+    auto cap_mixS(const wide& self, const std::string& key,
+                  const std::string& a, std::int64_t b, const std::string& c) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("mixS") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns long, (String,long) — reference then wide long.
+    auto cap_objLong(const wide& self, const std::string& key,
+                     const std::string& o, std::int64_t v_) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("objLong") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(o, v_);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns long, (long,String) — wide long then reference.
+    auto cap_longObj(const wide& self, const std::string& key,
+                     std::int64_t v_, const std::string& o) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("longObj") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(v_, o);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
     // Instance, returns int (overload tag), single arg of templated width.
     template<typename arg_t>
     auto cap_tag(const wide& self, const std::string& key,
@@ -727,6 +899,41 @@ namespace
         put(key, r);
     }
 
+    // Static (float,long,double) interleave, first arg (float) at slot 0.
+    auto scap_fld(const std::string& key, float a, std::int64_t b, double c) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sFld") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Static (String,long,String) — wide long between two references, first
+    // reference at slot 0 (no receiver shift).
+    auto scap_mixS(const std::string& key,
+                   const std::string& a, std::int64_t b, const std::string& c) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sMixS") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
     // ---- EXPLICIT-SIGNATURE capture (pin a wide overload by descriptor) -------
     auto cap_sig_long1(const wide& self, const std::string& key,
                        const char* name, const char* sig, std::int64_t a) -> void
@@ -828,6 +1035,16 @@ namespace
                   static_cast<std::int64_t>(0xFFFFFFFF00000000ULL),
                   static_cast<std::int64_t>(0x00000000FFFFFFFFULL));
         cap_long2(s, "addL_one_negone", "addL", 1LL, -1LL);
+        // 32->64-bit CARRY pair: 0x7FFFFFFF + 1 must carry into bit 31 producing
+        // 0x80000000 as a POSITIVE long, not wrap a 32-bit int to INT_MIN.  And a
+        // pair whose low words are both "negative as int" but whose longs are
+        // positive (>2^31) — a sign-extend-from-32 bug would make both negative.
+        cap_long2(s, "addL_carry31", "addL",
+                  static_cast<std::int64_t>(0x000000007FFFFFFFULL),
+                  1LL);
+        cap_long2(s, "addL_pos2to31", "addL",
+                  static_cast<std::int64_t>(0x0000000080000000ULL),
+                  static_cast<std::int64_t>(0x0000000080000000ULL));
         cap_long2(s, "addL_pat_pat", "addL",
                   static_cast<std::int64_t>(0x0123456789ABCDEFULL),
                   static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
@@ -847,6 +1064,14 @@ namespace
         //  nonzero (the worst case for a high-bits-leak corrupting the next int).
         // ============================================================
         cap_mixA(s, "mixA_main", 0x11111111, static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL), 0x22222222);
+        // Middle long whose LOW word is 0x80000000 ("negative as int") but whose
+        // value is +2^31: a sign-extend-from-32 bug flips its sign and the return
+        // changes; the flanking ints (here both INT_MIN/INT_MAX extremes) must be
+        // untouched.  NOT the last mixA, so its witnesses are not asserted.
+        cap_mixA(s, "mixA_lowneg",
+                 std::numeric_limits<std::int32_t>::min(),
+                 static_cast<std::int64_t>(0x0000000080000000ULL),
+                 std::numeric_limits<std::int32_t>::max());
         // and with the high-half-only long (a naive low-32-bit pack would make
         // the long look like 0 and the trailing int could absorb the high bits).
         cap_mixA(s, "mixA_highhalf", -7, static_cast<std::int64_t>(0xFFFFFFFF00000000ULL), 99);
@@ -932,6 +1157,44 @@ namespace
                  bits2d(0x4005BF0A8B145769ULL));                       // E
 
         // ============================================================
+        //  WIDE LONG FLANKED BY FLOATS: mixF(float, long, float).  A float is one
+        //  slot but carries the 'F' descriptor (distinct from mixA's 'I'); the
+        //  flanking floats must survive the two-slot long.  Both floats are exact
+        //  integral values so the return and witnesses compare bit-exact.  The
+        //  middle long has both halves set (worst case for a high-bits leak).
+        // ============================================================
+        cap_mixF(s, "mixF_main", 3.0f,
+                 static_cast<std::int64_t>(0x00000000DEADBEEFULL), 5.0f);
+
+        // ============================================================
+        //  NARROW FLOAT THEN TWO WIDE: fld(float, long, double).  Five slots; the
+        //  float must not widen into the long, and the double must start exactly
+        //  two slots past the long.  Both halves of the long are set.
+        // ============================================================
+        cap_fld(s, "fld_main", 2.5f,
+                static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL),
+                bits2d(0x400921FB54442D18ULL));                        // PI
+
+        // ============================================================
+        //  WIDE LONG FLANKED BY OBJECT REFERENCES: mixS(String, long, String).
+        //  Each reference is one slot; the long between them (high-half-only, the
+        //  worst case) must stay intact and the two distinct-length references
+        //  must not swap.  Passed as std::string -> java.lang.String.
+        // ============================================================
+        cap_mixS(s, "mixS_main", kStrA,
+                 static_cast<std::int64_t>(0xFFFFFFFF00000000ULL), kStrC);
+
+        // ============================================================
+        //  REFERENCE THEN WIDE LONG, and WIDE LONG THEN REFERENCE.  The wide arg
+        //  must start one slot after a leading reference (objLong), and a trailing
+        //  reference must start two slots after a leading long (longObj).
+        // ============================================================
+        cap_objLong(s, "objLong_main", kStrA,
+                    static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
+        cap_longObj(s, "longObj_main",
+                    std::numeric_limits<std::int64_t>::min(), kStrC);
+
+        // ============================================================
         //  MINIMAL TWO-SLOT WITNESSES: an int / value immediately after a wide
         //  arg.  These isolate the corruption-of-following-slot bug class.
         // ============================================================
@@ -981,6 +1244,11 @@ namespace
                            bits2d(0x400921FB54442D18ULL));     // PI
         scap_dj   ("s_dj", bits2d(0xC02E000000000000ULL),     // -15.0
                            static_cast<std::int64_t>(0x0123456789ABCDEFULL));
+        // static float/object-interleave variants (first arg at slot 0).
+        scap_fld  ("s_fld", 2.5f, static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL),
+                            bits2d(0x400921FB54442D18ULL));    // PI
+        scap_mixS ("s_mixS", kStrA,
+                   static_cast<std::int64_t>(0xFFFFFFFF00000000ULL), kStrC);
     }
 
     // The entire test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
@@ -1083,6 +1351,24 @@ namespace
             ctx.check("addL_one_negone_return", r.ival == jadd(jmul(1LL, 1000003LL), -1LL));
         }
         {
+            // 32->64 carry: 0x7FFFFFFF * 1000003 + 1.  A 32-bit-truncating packer
+            // that wrapped the first operand at INT_MAX would compute a different
+            // product (and sign), so the full-width formula here is the witness.
+            const std::int64_t a{ static_cast<std::int64_t>(0x000000007FFFFFFFULL) };
+            const probe_result r{ got("addL_carry31") };
+            ctx.check("addL_carry31_resolved", r.resolved);
+            ctx.check("addL_carry31_return", r.ival == jadd(jmul(a, 1000003LL), 1LL));
+        }
+        {
+            // Both operands are +2^31 (low word 0x80000000, "negative as int").  A
+            // sign-extend-from-32 bug would treat each as -2^31 and flip the
+            // product's sign — the unsigned-wrap formula pins the correct value.
+            const std::int64_t a{ static_cast<std::int64_t>(0x0000000080000000ULL) };
+            const probe_result r{ got("addL_pos2to31") };
+            ctx.check("addL_pos2to31_resolved", r.resolved);
+            ctx.check("addL_pos2to31_return", r.ival == jadd(jmul(a, 1000003LL), a));
+        }
+        {
             const std::int64_t a{ static_cast<std::int64_t>(0x0123456789ABCDEFULL) };
             const std::int64_t b{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
             const probe_result r{ got("addL_pat_pat") };
@@ -1115,6 +1401,19 @@ namespace
             const probe_result r{ got("mixA_main") };
             ctx.check("mixA_main_resolved", r.resolved);
             ctx.check("mixA_main_return",
+                      r.ival == jadd(jadd(jmul(a, 7LL), jmul(b, 1000003LL)), jmul(c, 13LL)));
+        }
+        {
+            // Middle long = +2^31 (low word 0x80000000); flanking ints are INT_MIN
+            // and INT_MAX.  A sign-extend-from-32 bug on the middle long flips its
+            // sign and the return changes — the flanking extremes also catch a
+            // shift that would alias the long's low/high word into a neighbour.
+            const std::int32_t a{ std::numeric_limits<std::int32_t>::min() };
+            const std::int64_t b{ static_cast<std::int64_t>(0x0000000080000000ULL) };
+            const std::int32_t c{ std::numeric_limits<std::int32_t>::max() };
+            const probe_result r{ got("mixA_lowneg") };
+            ctx.check("mixA_lowneg_resolved", r.resolved);
+            ctx.check("mixA_lowneg_return",
                       r.ival == jadd(jadd(jmul(a, 7LL), jmul(b, 1000003LL)), jmul(c, 13LL)));
         }
         {
@@ -1349,6 +1648,92 @@ namespace
         }
 
         // =====================================================================
+        //  WIDE LONG FLANKED BY FLOATS (mixF).  The return is recomputed in the
+        //  EXACT float-precision order Java uses — a*256.0f and c*4.0f each rounded
+        //  to float in their own step, the long widened to float once, then summed
+        //  left-to-right — so the bits match with no FMA/double-rounding drift.
+        //  Both floats are small exact integers, so their witnesses are bit-exact.
+        // =====================================================================
+        {
+            const float        a{ 3.0f };
+            const std::int64_t b{ static_cast<std::int64_t>(0x00000000DEADBEEFULL) };
+            const float        c{ 5.0f };
+            const float sa{ a * 256.0f };
+            const float sc{ c * 4.0f };
+            const float lo{ static_cast<float>(b) };
+            const float expect{ sa + lo + sc };
+            const probe_result r{ got("mixF_main") };
+            ctx.check("mixF_main_resolved", r.resolved);
+            ctx.check("mixF_main_not_void", r.dispatched);
+            ctx.check("mixF_main_return_bits", r.fbits == f2bits(expect));
+            // The flanking floats survived the two-slot long (bit-exact witnesses).
+            ctx.check("mixF_witness_a_bits", wide::wMixFa() == f2bits(a));
+            ctx.check("mixF_witness_b_exact", wide::wMixFb() == b);
+            ctx.check("mixF_witness_c_bits_after_wide", wide::wMixFc() == f2bits(c));
+        }
+
+        // =====================================================================
+        //  NARROW FLOAT THEN TWO WIDE (fld = float,long,double).  Pure sum, so
+        //  bit-exact across the widen-to-double of the float and the long.
+        // =====================================================================
+        {
+            const float        a{ 2.5f };
+            const std::int64_t b{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            const double       c{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const probe_result r{ got("fld_main") };
+            ctx.check("fld_main_resolved", r.resolved);
+            ctx.check("fld_main_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + static_cast<double>(b) + c));
+            ctx.check("fld_witness_a_bits", wide::wFldA() == f2bits(a));
+            ctx.check("fld_witness_b_exact", wide::wFldB() == b);
+            ctx.check("fld_witness_c_bits", wide::wFldC() == 0x400921FB54442D18ULL);
+        }
+
+        // =====================================================================
+        //  WIDE LONG FLANKED BY OBJECT REFERENCES (mixS = String,long,String).
+        //  The long between two 'L' slots is intact, and the two distinct-length
+        //  references did not swap.  Return is recomputed from the long + the
+        //  known String lengths; witnesses pin the long exactly and the Strings'
+        //  content (so a swap is caught independently of the return).
+        // =====================================================================
+        {
+            const std::int64_t b{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const std::int64_t expect{ jadd(jadd(b, jmul(kStrLenA, 1000003LL)),
+                                            jmul(kStrLenC, 97LL)) };
+            const probe_result r{ got("mixS_main") };
+            ctx.check("mixS_main_resolved", r.resolved);
+            ctx.check("mixS_main_not_void", r.dispatched);
+            ctx.check("mixS_main_return", r.ival == expect);
+            // The long survived between the two reference slots.
+            ctx.check("mixS_witness_long_exact", wide::wMixSb() == b);
+            // The references did not swap (distinct content each in its own slot).
+            ctx.check("mixS_witness_a_content", wide::wMixSa() == kStrA);
+            ctx.check("mixS_witness_c_content_after_wide", wide::wMixSc() == kStrC);
+        }
+
+        // =====================================================================
+        //  REFERENCE THEN WIDE LONG (objLong) and WIDE LONG THEN REFERENCE
+        //  (longObj).  The wide value must start one slot after a leading
+        //  reference, and a trailing reference two slots after a leading long.
+        // =====================================================================
+        {
+            const std::int64_t v{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            const probe_result r{ got("objLong_main") };
+            ctx.check("objLong_main_resolved", r.resolved);
+            ctx.check("objLong_main_return_long_exact", r.ival == v);
+            ctx.check("objLong_witness_obj_content", wide::wOlObj() == kStrA);
+            ctx.check("objLong_witness_long_exact_after_ref", wide::wOlLong() == v);
+        }
+        {
+            const std::int64_t v{ std::numeric_limits<std::int64_t>::min() };
+            const probe_result r{ got("longObj_main") };
+            ctx.check("longObj_main_resolved", r.resolved);
+            ctx.check("longObj_main_return_long_exact", r.ival == v);
+            ctx.check("longObj_witness_long_exact", wide::wLoLong() == v);
+            ctx.check("longObj_witness_obj_content_after_wide", wide::wLoObj() == kStrC);
+        }
+
+        // =====================================================================
         //  MINIMAL TWO-SLOT WITNESSES (intAfterLong / intAfterDouble): the int
         //  immediately after a wide arg equals exactly what was passed, AND the
         //  method returned that same int.
@@ -1521,6 +1906,32 @@ namespace
             ctx.check("s_dj_return_bits", r.dbits == d2bits(a + static_cast<double>(b)));
             ctx.check("s_dj_witness_a_bits", wide::sWDjA() == 0xC02E000000000000ULL);
             ctx.check("s_dj_witness_b_exact", wide::sWDjB() == b);
+        }
+        {
+            // STATIC float,long,double interleave (float at slot 0, no receiver).
+            const float        a{ 2.5f };
+            const std::int64_t b{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            const double       c{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const probe_result r{ got("s_fld") };
+            ctx.check("s_fld_resolved", r.resolved);
+            ctx.check("s_fld_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + static_cast<double>(b) + c));
+            ctx.check("s_fld_witness_a_bits", wide::sWFldA() == f2bits(a));
+            ctx.check("s_fld_witness_b_exact", wide::sWFldB() == b);
+            ctx.check("s_fld_witness_c_bits", wide::sWFldC() == 0x400921FB54442D18ULL);
+        }
+        {
+            // STATIC String,long,String — wide long between two references at the
+            // no-receiver frame (first reference at slot 0, long at slot 1).
+            const std::int64_t b{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const std::int64_t expect{ jadd(jadd(b, jmul(kStrLenA, 1000003LL)),
+                                            jmul(kStrLenC, 97LL)) };
+            const probe_result r{ got("s_mixS") };
+            ctx.check("s_mixS_resolved", r.resolved);
+            ctx.check("s_mixS_return", r.ival == expect);
+            ctx.check("s_mixS_witness_long_exact", wide::sWMixSb() == b);
+            ctx.check("s_mixS_witness_a_content", wide::sWMixSa() == kStrA);
+            ctx.check("s_mixS_witness_c_content_after_wide", wide::sWMixSc() == kStrC);
         }
 
         // =====================================================================

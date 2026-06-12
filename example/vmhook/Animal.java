@@ -12,8 +12,10 @@ public interface Animal
     String speak();
 
     // Default method, available on every implementation without an
-    // override.  Tests interface-method lookup through the superclass
-    // walk in vmhook::object::get_method.
+    // override.  Tests interface-default-method lookup through the
+    // implemented-interface fallback in vmhook::object::get_method (which
+    // runs after the superclass walk misses, since a default lives on the
+    // interface, not on the concrete class or its superclasses).
     default String greet()
     {
         return "Hello, " + this.speak();

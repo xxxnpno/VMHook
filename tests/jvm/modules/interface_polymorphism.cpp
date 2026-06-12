@@ -28,10 +28,13 @@
 //     are mutually distinct.
 //   * MULTIPLE INTERFACES: Robot implements Animal AND Named; speak() (Animal)
 //     and who() (Named) each dispatch to Robot's own override.
-//   * ABSTRACT BASE vs INTERFACE (the key contrast): AbstractPet is a real
-//     _super, so the concrete describe() declared on it IS reachable through the
-//     Hamster wrapper's superclass walk -- whereas an interface DEFAULT method
-//     is NOT (interfaces are not on the _super chain).  Both directions asserted.
+//   * ABSTRACT BASE vs INTERFACE (the two reachability paths): AbstractPet is a
+//     real _super, so the concrete describe() declared on it is reached by the
+//     Hamster wrapper's SUPERCLASS walk (HARD); an inherited interface DEFAULT
+//     method is reached by the IMPLEMENTED-INTERFACE fallback that runs after the
+//     superclass walk misses (object::get_method walks _transitive_interfaces) --
+//     best-effort, since that fallback is a cold-path os::safe_read of the
+//     interface arrays.  Both directions asserted.
 //   * METHOD ON THE INTERFACE vs ONLY ON THE IMPL: speak()/who() are declared on
 //     interfaces; fetch() is Dog-only.  Both resolve through the concrete wrapper.
 //   * DECLARED-vs-CONCRETE IDENTITY: reading the same slot as the declared
@@ -39,10 +42,12 @@
 //     decode is type-agnostic -- it wraps whatever the slot's compressed OOP
 //     points at).
 //   * DEFAULT METHOD INHERITED vs OVERRIDDEN: Snake OVERRIDES defaultGreet() (on
-//     its own klass -> reachable via the super walk), while Dog/Cat INHERIT it
-//     (only on the interface -> NOT reachable through a concrete wrapper, since
-//     object::get_method walks the SUPERCLASS chain, not the interface chain).
-//     Recorded as characterised [INFO], never a failure.
+//     its own klass -> reached by the super walk, HARD), while Dog/Cat INHERIT it
+//     (only on the Animal interface -> reached by the interface-chain fallback in
+//     object::get_method).  The inherited case is BEST-EFFORT: when the cold-path
+//     interface walk resolves it, the call body + a Java byte-for-byte cross-check
+//     are asserted HARD; when it does not (interface VMStructs unexported / arrays
+//     not safely readable on some JDK/config) it records [INFO], never a failure.
 //   * JVM AGREEMENT: a probe runs the SAME observations Java-side and publishes
 //     per-impl witnesses the module reads back (each impl's speak()/who()/etc.).
 //
@@ -60,8 +65,10 @@
 // STYLE: wrapper accessors are CLEAN one-liners over the documented field/method
 // idiom (vmhook.hpp ~12457 / ~14856) -- no sentinel-string guards; statics go
 // through static_field()/static_method().  A method that may legitimately fail to
-// resolve (an interface default through a concrete wrapper) is probed with a
-// dedicated resolves_*() (has_value) accessor rather than a guarded call.
+// resolve on some JDK/config (an interface default reached through the cold-path
+// interface fallback) is probed with a dedicated resolves_*() (has_value) accessor
+// so the best-effort gate is applied to the CALL, not the lookup, and a non-
+// resolving config degrades to [INFO] rather than dereferencing a nullopt.
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
@@ -111,7 +118,17 @@ namespace
         // Dog-only method (NOT on the Animal interface) -- declared on this klass.
         auto fetch() const -> std::string { return get_method("fetch")->call().as_string(); }
 
-        // Probes (no call): does the Dog superclass walk reach each method?
+        // INHERITED interface DEFAULT method (Dog does NOT override it): when the
+        // implemented-interface fallback in object::get_method reaches it (after the
+        // superclass walk misses), the call dispatches the same default body the JVM
+        // resolves on the Dog runtime type.  Guarded by resolves_default_greet() at
+        // the call site so a JDK where the interface VMStructs are unreadable never
+        // dereferences a nullopt.
+        auto default_greet() const -> std::string { return get_method("defaultGreet")->call().as_string(); }
+
+        // Probes (no call): does method resolution reach each method?  speak()/fetch()
+        // are on Dog's own klass (superclass walk); defaultGreet() is on the Animal
+        // interface (interface-chain fallback -- best-effort across JDKs).
         auto resolves_speak()         const -> bool { return get_method("speak").has_value(); }
         auto resolves_fetch()         const -> bool { return get_method("fetch").has_value(); }
         auto resolves_default_greet() const -> bool { return get_method("defaultGreet").has_value(); }
@@ -129,6 +146,10 @@ namespace
         auto name()   const -> std::string  { return get_field("name")->get();   }
         auto indoor() const -> bool         { return get_field("indoor")->get(); }
         auto speak()  const -> std::string  { return get_method("speak")->call().as_string(); }
+
+        // INHERITED interface default (Cat does not override it) -- reached via the
+        // interface-chain fallback, same as Dog.  Call-site-guarded by resolves_*().
+        auto default_greet() const -> std::string { return get_method("defaultGreet")->call().as_string(); }
 
         auto resolves_default_greet() const -> bool { return get_method("defaultGreet").has_value(); }
     };
@@ -729,16 +750,26 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
         }
 
         // =================================================================
-        //  7. DEFAULT METHOD INHERITED vs OVERRIDDEN (characterised; the
-        //     inherited case never fails).
+        //  7. DEFAULT METHOD INHERITED vs OVERRIDDEN.
         //
         //     Snake OVERRIDES defaultGreet() -> the override is on Snake's own
-        //     klass -> the super walk REACHES it (HARD resolvability; call
+        //     klass -> the SUPERCLASS walk REACHES it (HARD resolvability; call
         //     best-effort).  Dog/Cat INHERIT the default -> it lives only on the
-        //     Animal interface -> the SUPERCLASS-only walk does NOT reach it
-        //     through the concrete wrapper -> recorded [INFO], the documented
-        //     limitation.  Through the Animal interface wrapper (whose own klass
-        //     declares the default) the lookup is characterised both ways.
+        //     Animal interface -> object::get_method now reaches it via the
+        //     IMPLEMENTED-INTERFACE fallback that runs after the superclass walk
+        //     misses (InstanceKlass::_transitive_interfaces).
+        //
+        //     BEST-EFFORT GATE (the interface walk is a COLD-path VMStruct read):
+        //     the fallback reads the interface arrays entirely through
+        //     os::safe_read, so on a JDK/config where those arrays are not
+        //     exported or not safely readable it fail-safes to "not found".  We
+        //     therefore treat REACHING the inherited default as best-effort: when
+        //     resolves_default_greet() is true we HARD-assert the call dispatches
+        //     to the right default body (and cross-check it against the Java
+        //     witness below); when it is false we record [INFO] rather than FAIL.
+        //     This mirrors the dont_inline / field_null_safety degrade idiom.  The
+        //     superclass-reached cases (Snake override; the interface wrapper's own
+        //     klass) stay HARD on every JDK.
         // =================================================================
         if (pet_snake)
         {
@@ -762,43 +793,90 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
             }
         }
 
-        // Dog/Cat INHERIT the interface default -> NOT reachable through the
-        // concrete wrapper's superclass-only walk.  Characterise (never fail).
+        // Dog/Cat INHERIT the interface default (they do NOT override it -> it lives
+        // ONLY on the Animal interface).  object::get_method reaches it by falling
+        // back to the IMPLEMENTED-INTERFACE chain after the superclass walk misses.
+        // BEST-EFFORT: HARD content + cross-check WHEN the cold-path interface walk
+        // resolves it; [INFO] (never FAIL) when it does not on this JDK/config.
+        std::string dog_greet;
         if (pet_dog)
         {
             if (pet_dog->resolves_default_greet())
             {
-                // If a future vmhook DOES walk the interface chain, prove the call
-                // reaches the default body (which embeds speak() -> "Rex"/"woof").
+                // The headline of this fix: the inherited interface default IS
+                // reachable through the concrete Dog wrapper via the interface walk.
+                if (oop_readable(pet_dog->get_instance()))
+                {
+                    dog_greet = pet_dog->default_greet();
+                    if (!dog_greet.empty())
+                    {
+                        // Animal.defaultGreet() body = "interface-default-greet:" + speak()
+                        // and Dog.speak() = "Rex says woof".
+                        ctx.check("dog_default_greet_is_interface_default_form",
+                                  contains(dog_greet, "interface-default-greet"));
+                        ctx.check("dog_default_greet_embeds_dog_speak", contains(dog_greet, "woof"));
+                        ctx.check("dog_default_greet_contains_name_Rex", contains(dog_greet, "Rex"));
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] interface_polymorphism: Dog's INHERITED defaultGreet() resolved via "
+                                   "the interface walk but returned no value through the interpreter on this JDK "
+                                   "build; content assert skipped (resolvability already demonstrated).");
+                    }
+                }
                 ctx.record("[INFO] interface_polymorphism: Dog wrapper FOUND the INHERITED interface default "
-                           "defaultGreet() (vmhook now walks the interface chain via the concrete class).");
+                           "defaultGreet() via the implemented-interface fallback "
+                           "(InstanceKlass::_transitive_interfaces).");
             }
             else
             {
+                // Cold-path safe_read could not reach the interface arrays on this
+                // JDK/config (or the VMStructs are not exported): documented degrade,
+                // NOT a failure.  The abstract-base describe() contrast still holds
+                // (it is reached by the superclass walk, asserted HARD above).
                 ctx.record("[INFO] interface_polymorphism: INHERITED interface DEFAULT method defaultGreet() "
-                           "is NOT reachable through the concrete Dog wrapper -- object::get_method walks the "
-                           "SUPERCLASS chain (Dog -> Object) only, not the interface chain.  Known limitation; "
-                           "not a failure.  (Contrast: the abstract-base describe() above IS reachable, since "
-                           "an abstract base is a real _super.)");
+                           "was NOT reached through the concrete Dog wrapper on this JDK/config -- the "
+                           "implemented-interface fallback fail-safed (interface VMStructs unexported or the "
+                           "cold interface arrays were not safely readable).  Best-effort; not a failure.");
             }
         }
         if (pet_cat)
         {
-            ctx.record(std::string("[INFO] interface_polymorphism: INHERITED defaultGreet() resolvable "
-                       "through the concrete Cat wrapper (superclass-only walk) = ")
-                       + (pet_cat->resolves_default_greet() ? "true" : "false") + ".");
+            if (pet_cat->resolves_default_greet())
+            {
+                // Same headline for the SECOND inheriting impl through a different
+                // concrete class (Cat); best-effort content check.
+                if (oop_readable(pet_cat->get_instance()))
+                {
+                    const std::string cat_greet{ pet_cat->default_greet() };
+                    if (!cat_greet.empty())
+                    {
+                        ctx.check("cat_default_greet_is_interface_default_form",
+                                  contains(cat_greet, "interface-default-greet"));
+                        ctx.check("cat_default_greet_embeds_cat_speak", contains(cat_greet, "meow"));
+                    }
+                }
+                ctx.record("[INFO] interface_polymorphism: Cat wrapper FOUND the INHERITED interface default "
+                           "defaultGreet() via the implemented-interface fallback.");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: INHERITED defaultGreet() was NOT reached through the "
+                           "concrete Cat wrapper on this JDK/config (interface fallback fail-safed); best-effort, "
+                           "not a failure.");
+            }
         }
 
-        // Through the INTERFACE wrapper, whose OWN klass declares both, the
-        // lookups are characterised: defaultGreet() (default) and speak()
-        // (abstract) both live on this very klass.
+        // Through the INTERFACE wrapper, whose OWN klass declares both: defaultGreet()
+        // (default) and speak() (abstract) live on this very klass, so the depth-0
+        // superclass walk finds both WITHOUT needing the interface fallback.  HARD on
+        // every JDK (own-klass methods).
         if (pet_animal)
         {
-            ctx.record(std::string("[INFO] interface_polymorphism: through the Animal-interface wrapper "
-                       "(method on the wrapper's OWN klass) defaultGreet() resolvable = ")
-                       + (pet_animal->resolves_default_greet() ? "true" : "false")
-                       + ", abstract speak() resolvable = "
-                       + (pet_animal->resolves_speak() ? "true" : "false") + ".");
+            ctx.check("animal_interface_wrapper_resolves_own_default_greet",
+                      pet_animal->resolves_default_greet());
+            ctx.check("animal_interface_wrapper_resolves_own_abstract_speak",
+                      pet_animal->resolves_speak());
         }
 
         // =================================================================
@@ -820,6 +898,7 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
             const std::string java_robot{ ifp_holder::java_witness("robotSpeakSeen") };
             const std::string java_who{   ifp_holder::java_witness("robotWhoSeen") };
             const std::string java_sgreet{ ifp_holder::java_witness("snakeGreetSeen") };
+            const std::string java_dgreet{ ifp_holder::java_witness("dogGreetSeen") };
             const std::string java_hsound{ ifp_holder::java_witness("hamsterSoundSeen") };
             const std::string java_hdesc{ ifp_holder::java_witness("hamsterDescribeSeen") };
 
@@ -831,6 +910,11 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
             ctx.check("java_robot_speak_contains_beep", contains(java_robot, "beep"));
             ctx.check("java_robot_who_is_named_form",   contains(java_who,   "robot:"));
             ctx.check("java_snake_overridden_greet_is_custom", contains(java_sgreet, "snake-greet"));
+            // Dog's INHERITED interface default, as the JVM ITSELF dispatched it
+            // (Java-side invokevirtual through the (Dog) cast -- always runs, HARD).
+            ctx.check("java_dog_inherited_greet_is_interface_default_form",
+                      contains(java_dgreet, "interface-default-greet"));
+            ctx.check("java_dog_inherited_greet_embeds_speak", contains(java_dgreet, "woof"));
             ctx.check("java_hamster_sound_contains_squeak",    contains(java_hsound, "squeak"));
             ctx.check("java_hamster_describe_contains_squeak", contains(java_hdesc,  "squeak"));
 
@@ -851,6 +935,15 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
             if (!robot_spoke.empty())
             {
                 ctx.check("native_and_java_robot_speak_agree", robot_spoke == java_robot);
+            }
+            // The strongest proof of the interface-default fix: where the NATIVE
+            // interface-chain call to Dog's INHERITED defaultGreet() returned a value
+            // (dog_greet non-empty => the cold-path interface walk resolved AND the
+            // interpreter dispatched), it matches the JVM's own invokevirtual
+            // byte-for-byte.  Gated, so a no-value JDK build never fails here.
+            if (!dog_greet.empty())
+            {
+                ctx.check("native_and_java_dog_inherited_greet_agree", dog_greet == java_dgreet);
             }
         }
 

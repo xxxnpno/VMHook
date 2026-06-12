@@ -42,11 +42,14 @@
 //   * INTROSPECTION: get_field() is INSTANCE-only for instance names; is_reference
 //     / signature() report the exact JVM descriptors the fixture declares.
 //
-// FLAWS this module pins on the live JVM, surfaced as [INFO] (a CI [FAIL] would
-// punish a bug this test has no power to fix):
-//   (A) NO wrapper-klass match check: a Ref-typed slot read through a Decoy
-//       wrapper (unrelated class) is NOT rejected; the decoy's field offsets read
-//       garbage relative to Ref.  STILL LIVE.
+// FLAWS this module pins on the live JVM.  (A), (B) and (C) are now FIXED in the
+// header and asserted HARD as the fixed behaviour:
+//   (A) wrapper-klass match check in cast_for_variant: a Ref-typed slot read
+//       through a Decoy wrapper (unrelated, non-interface class absent from Ref's
+//       super chain) is now REJECTED (nullptr), so the decoy can never read at a
+//       mismatched offset.  FIXED — asserted; the fail-open guard still ACCEPTS
+//       same-klass, subclass-through-base (IS-A), and interface-registered reads
+//       (all re-asserted so an over-tightening regression is caught here).
 //   (B) signature-shape guard in cast_for_variant: a '[' (Ref[]) field decoded as
 //       a single unique_ptr is now REJECTED (nullptr).  FIXED in this header —
 //       asserted as the fixed behaviour; walk the array element-wise instead.
@@ -120,6 +123,26 @@ namespace
         auto tag_value() -> std::int32_t { return get_method("tagValue")->call(); }
     };
 
+    // Wrapper registered for the INTERFACE vmhook.fixtures.FieldObjectRef$Tag
+    // (NOT the concrete impl).  The `tag` field holds a TagImpl at runtime; the
+    // klass-match fix must FAIL OPEN for an interface-registered wrapper (a
+    // concrete impl is not on the interface's superclass chain), so reading the
+    // `tag` slot through THIS wrapper stays non-null after the fix.  tagValue()
+    // dispatches the interface method virtually through it.
+    class tag_iface_object : public vmhook::object<tag_iface_object>
+    {
+    public:
+        explicit tag_iface_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<tag_iface_object>{ instance }
+        {
+        }
+
+        auto tag_value() -> std::int32_t { return get_method("tagValue")->call(); }
+        // Boolean-resolver (allowed outside accessors): does tagValue() resolve
+        // through this interface-registered wrapper on this JDK?
+        auto tag_value_resolves() -> bool { return get_method("tagValue").has_value(); }
+    };
+
     // Wrapper for java.lang.Integer — the boxed-type angle.  int_value()
     // dispatches Integer.intValue() through a field-decoded wrapper.
     class integer_object : public vmhook::object<integer_object>
@@ -133,10 +156,30 @@ namespace
         auto int_value() -> std::int32_t { return get_method("intValue")->call(); }
     };
 
+    // Wrapper registered for java.lang.Number — a SUPERCLASS of java.lang.Integer.
+    // Reading the `boxedInt` (runtime Integer) slot through this BASE wrapper
+    // exercises the IS-A path of the klass-match fix: Integer's superclass chain
+    // contains Number, so the read is ACCEPTED (subclass-through-base).
+    // longValue() is declared abstract on Number and overridden by Integer, so it
+    // dispatches virtually through the base-typed wrapper.
+    class number_object : public vmhook::object<number_object>
+    {
+    public:
+        explicit number_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<number_object>{ instance }
+        {
+        }
+
+        auto long_value() -> std::int64_t { return get_method("longValue")->call(); }
+        // Boolean-resolver: does longValue() resolve through this base-registered
+        // (Number) wrapper on this JDK?
+        auto long_value_resolves() -> bool { return get_method("longValue").has_value(); }
+    };
+
     // Wrapper for vmhook.fixtures.FieldObjectRef$Decoy — an UNRELATED Java class
     // whose field layout differs from Ref.  Used for the wrong-wrapper-type
-    // angle: reading a Ref-typed slot through this wrapper is silently accepted
-    // by the library (flaw A).
+    // angle: reading a Ref-typed slot through this wrapper is now REJECTED
+    // (nullptr) by the klass-match guard (flaw A FIXED).
     class decoy_object : public vmhook::object<decoy_object>
     {
     public:
@@ -179,7 +222,15 @@ namespace
         auto self_ref()     -> std::unique_ptr<holder_object> { return get_field("self")->get(); }
         auto other()        -> std::unique_ptr<holder_object> { return get_field("other")->get(); }
         auto tag()          -> std::unique_ptr<tag_impl_object> { return get_field("tag")->get(); }
+        // The SAME `tag` slot decoded through a wrapper registered for the Tag
+        // INTERFACE — must remain non-null after the klass-match fix (fail-open
+        // on interface wrappers).
+        auto tag_via_iface() -> std::unique_ptr<tag_iface_object> { return get_field("tag")->get(); }
         auto boxed_int()    -> std::unique_ptr<integer_object> { return get_field("boxedInt")->get(); }
+        // The SAME `boxedInt` (runtime Integer) slot decoded through a wrapper
+        // registered for the SUPERCLASS java.lang.Number — must remain non-null
+        // after the klass-match fix (IS-A: Number is on Integer's super chain).
+        auto boxed_as_number() -> std::unique_ptr<number_object> { return get_field("boxedInt")->get(); }
         // OBJECT-typed field holding a Ref at runtime, decoded as a ref_object:
         // the decode is type-agnostic (it wraps whatever the slot points at).
         auto obj_as_ref()   -> std::unique_ptr<ref_object> { return get_field("objAsRef")->get(); }
@@ -188,7 +239,8 @@ namespace
         auto str_ref() -> std::string { return get_field("strRef")->get(); }
 
         // wrong-wrapper-type read: the SAME Ref-typed `ref` slot, decoded as a
-        // Decoy.  The library does not reject this (flaw A).
+        // Decoy.  The library now REJECTS this confident cross-klass read and
+        // returns a null unique_ptr (flaw A FIXED).
         auto ref_as_decoy() -> std::unique_ptr<decoy_object> { return get_field("ref")->get(); }
 
         // array-vs-object: the `refArray` field is '[' (Ref[]); decoding it as a
@@ -318,9 +370,13 @@ namespace
         vmhook::register_class<holder_object>(FIXTURE);
         vmhook::register_class<ref_object>("vmhook/fixtures/FieldObjectRef$Ref");
         vmhook::register_class<tag_impl_object>("vmhook/fixtures/FieldObjectRef$TagImpl");
+        vmhook::register_class<tag_iface_object>("vmhook/fixtures/FieldObjectRef$Tag");
         vmhook::register_class<decoy_object>("vmhook/fixtures/FieldObjectRef$Decoy");
         // Boxed-type wrapper: java.lang.Integer is a bootstrap class, always loaded.
         vmhook::register_class<integer_object>("java/lang/Integer");
+        // Base-class wrapper for the subclass-through-base IS-A angle (Number is a
+        // superclass of Integer); bootstrap class, always loaded.
+        vmhook::register_class<number_object>("java/lang/Number");
 
         // =====================================================================
         // PART 1 — object-reference field reads (side-effect free, pre-probe).
@@ -581,40 +637,94 @@ namespace
                        + std::to_string(holder->ref_compressed("self")));
 
             // ==================================================================
-            // FLAW A — wrong-wrapper-type read is NOT rejected (no klass check).
-            // Read the Ref-typed `ref` slot through a Decoy wrapper.  The library
-            // constructs a decoy_object over the Ref oop; decoy.poison() then
-            // reads at refOop + Decoy's poison-offset, which differs from the
-            // correct Ref read.  Surfaced as [INFO] (a documented flaw), but we
-            // HARD-assert the robust fact: a non-null slot yields a non-null
-            // wrapper either way (the bug is "wrong type accepted", not "crash").
+            // FLAW A (FIXED) — a CONFIDENT wrong-wrapper-type read is now REFUSED.
+            // Reading the Ref-typed `ref` slot through a Decoy wrapper (registered
+            // for the UNRELATED, non-interface class Decoy, which is absent from
+            // Ref's superclass chain) is a confident cross-klass mismatch, so
+            // cast_for_variant's klass_match_ok<> guard returns nullptr instead of
+            // wrapping the Ref oop with the wrong klass.  This is the JDK-
+            // independent decode path (a real compressed OOP straight from the
+            // slot), so the refusal is asserted HARD on every JDK.
+            //
+            // The guard is FAIL-OPEN: it rejects ONLY a proven cross-klass
+            // mismatch.  The three reads that must STILL succeed are re-asserted
+            // immediately below so a future over-tightening (rejecting a legitimate
+            // read) is caught here, not silently:
+            //   * SAME-KLASS:            Ref slot through ref_object (its own klass),
+            //   * SUBCLASS-THROUGH-BASE: Integer slot through a Number wrapper
+            //                            (Number is on Integer's super chain, IS-A),
+            //   * INTERFACE-WRAPPER:     TagImpl slot through a Tag-interface wrapper
+            //                            (an impl is not on the interface's super
+            //                            chain, so the guard fails open for it).
             // ==================================================================
             {
+                // (FIX) confident cross-klass read is refused -> null unique_ptr.
                 const auto wrong{ holder->ref_as_decoy() };
-                ctx.check("wrong_wrapper_type_still_non_null_documented_flaw",
-                          wrong != nullptr);
-                // CRASH-PROOFING: the cross-klass read (Decoy.poison on a Ref oop)
-                // reads at refOop + Decoy's poison-offset.  The Ref oop is a real
-                // heap object so the small-offset read stays mapped, but we still
-                // gate it on is_valid_pointer so an edge layout can never turn the
-                // documented mis-decode into an AV that truncates the suite.
-                if (wrong
-                    && wrong->get_instance() != nullptr
-                    && vmhook::hotspot::is_valid_pointer(wrong->get_instance()))
+                ctx.check("flawA_fixed_cross_klass_read_refused_returns_null",
+                          wrong == nullptr);
+                ctx.record("[INFO] FLAW A FIXED (klass-match guard in cast_for_variant): "
+                           "reading a Ref-typed slot through an unrelated Decoy wrapper is "
+                           "now rejected (nullptr), so a Decoy.poison read at the wrong "
+                           "offset can never happen. The guard is fail-open: only a proven "
+                           "cross-klass mismatch is refused.");
+
+                // (PRESERVED 1) same-klass read still yields a usable wrapper.
+                const auto same{ holder->ref() };
+                ctx.check("flawA_fixed_same_klass_read_still_usable",
+                          same != nullptr && same->val() == REF_VAL);
+
+                // (PRESERVED 2) subclass-through-base: an Integer oop read through a
+                // wrapper registered for its SUPERCLASS Number is accepted (IS-A)
+                // and the virtual longValue() dispatches through the base wrapper.
+                const auto as_number{ holder->boxed_as_number() };
+                ctx.check("flawA_fixed_subclass_through_base_read_accepted",
+                          as_number != nullptr);
+                if (as_number
+                    && as_number->get_instance() != nullptr
+                    && vmhook::hotspot::is_valid_pointer(as_number->get_instance()))
                 {
-                    const std::int32_t poison{ wrong->poison() };
-                    const auto correct{ holder->ref() };
-                    const std::int32_t correct_val{ correct ? correct->val() : 0 };
-                    ctx.record("[INFO] FLAW A (no klass-match check): Ref slot read "
-                               "through Decoy wrapper was ACCEPTED. Decoy.poison="
-                               + std::to_string(poison)
-                               + " vs correct Ref.val=" + std::to_string(correct_val)
-                               + " (differ => silent mis-decode).");
-                    // The decoy's instance pointer is nonetheless the same Ref oop
-                    // — proving the wrapper wrapped the Ref with the wrong klass.
-                    ctx.check("wrong_wrapper_wraps_same_oop_as_correct",
-                              correct != nullptr
-                              && wrong->get_instance() == correct->get_instance());
+                    // Virtual dispatch through a BASE-typed wrapper is a method-
+                    // resolution concern (not the read the fix governs), so it is
+                    // guarded: only assert the result when longValue() resolves
+                    // through Number on this JDK; otherwise record (never throw).
+                    if (as_number->long_value_resolves())
+                    {
+                        ctx.check("flawA_fixed_subclass_through_base_dispatch",
+                                  as_number->long_value()
+                                  == static_cast<std::int64_t>(BOXED_INT_VALUE));
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] longValue() did not resolve through the Number "
+                                   "base wrapper on this JDK; the IS-A READ was still "
+                                   "accepted (the fix's concern). Dispatch not asserted.");
+                    }
+                }
+
+                // (PRESERVED 3) interface-registered wrapper: the TagImpl oop read
+                // through a wrapper registered for the Tag INTERFACE is accepted
+                // (fail-open on interface) and the interface method dispatches.
+                const auto as_iface{ holder->tag_via_iface() };
+                ctx.check("flawA_fixed_interface_wrapper_read_accepted",
+                          as_iface != nullptr);
+                if (as_iface
+                    && as_iface->get_instance() != nullptr
+                    && vmhook::hotspot::is_valid_pointer(as_iface->get_instance()))
+                {
+                    // As above: the interface-method dispatch is guarded so a
+                    // resolution miss is recorded, not thrown — the READ being
+                    // accepted (fail-open on interface) is the fix's contract.
+                    if (as_iface->tag_value_resolves())
+                    {
+                        ctx.check("flawA_fixed_interface_wrapper_dispatch",
+                                  as_iface->tag_value() == TAG_SLOT_VALUE);
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] tagValue() did not resolve through the Tag "
+                                   "interface wrapper on this JDK; the interface READ was "
+                                   "still accepted (the fix's concern). Dispatch not asserted.");
+                    }
                 }
             }
 

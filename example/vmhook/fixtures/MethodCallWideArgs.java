@@ -139,6 +139,33 @@ public final class MethodCallWideArgs
     public static volatile long   wHexBd = SENTINEL;
     public static volatile int    wHexBe = (int) SENTINEL;
     public static volatile double wHexBf = Double.NaN;
+    // mixF(float,long,float) — wide long in the MIDDLE flanked by FLOATS.  A
+    // float occupies ONE slot (like int) but has its own 'F' descriptor; this is
+    // distinct from mixA(int,long,int) because a packer that mishandles 'F'
+    // adjacency to a wide slot (rather than 'I') would corrupt a flanking float.
+    public static volatile float wMixFa = (float) SENTINEL;
+    public static volatile long  wMixFb = SENTINEL;
+    public static volatile float wMixFc = (float) SENTINEL;
+    // fld(float,long,double) — float, long, double: a narrow 'F' immediately
+    // BEFORE two back-to-back wide kinds (J then D), five interpreter slots.
+    public static volatile float  wFldA = (float) SENTINEL;
+    public static volatile long   wFldB = SENTINEL;
+    public static volatile double wFldC = Double.NaN;
+    // mixS(String,long,String) — wide long in the MIDDLE flanked by OBJECT
+    // references (each one slot).  Proves a wide arg neither truncates nor
+    // shifts when its neighbours are 'L' reference slots, AND that the two
+    // references do not swap (distinct lengths make a swap change the return).
+    public static volatile String wMixSa = null;
+    public static volatile long   wMixSb = SENTINEL;
+    public static volatile String wMixSc = null;
+    // objLong(String,long) — reference THEN wide long (wide arg starts at the
+    // slot right after a one-slot reference).
+    public static volatile String wOlObj  = null;
+    public static volatile long   wOlLong = SENTINEL;
+    // longObj(long,String) — wide long THEN reference (the reference slot must
+    // start exactly two slots after the long's start, not one).
+    public static volatile long   wLoLong = SENTINEL;
+    public static volatile String wLoObj  = null;
 
     // STATIC-variant witnesses (no receiver; first arg starts at slot 0).
     public static volatile long   sWAddLa = SENTINEL;
@@ -159,6 +186,13 @@ public final class MethodCallWideArgs
     public static volatile double sWJdB = Double.NaN;
     public static volatile double sWDjA = Double.NaN;
     public static volatile long   sWDjB = SENTINEL;
+    // static float/object-interleave witnesses (no receiver; first arg slot 0).
+    public static volatile float  sWFldA = (float) SENTINEL;
+    public static volatile long   sWFldB = SENTINEL;
+    public static volatile double sWFldC = Double.NaN;
+    public static volatile String sWMixSa = null;
+    public static volatile long   sWMixSb = SENTINEL;
+    public static volatile String sWMixSc = null;
 
     /** Held so the native side can build an instance wrapper for instance calls. */
     public static MethodCallWideArgs instance = new MethodCallWideArgs();
@@ -352,6 +386,70 @@ public final class MethodCallWideArgs
         return (double) a + (double) b + c + (double) d + (double) e + f;
     }
 
+    /** Wide long in the MIDDLE flanked by FLOATS: float, long, float.  Floats
+     *  occupy one slot each (like int) but carry the 'F' descriptor; a packer
+     *  that mis-expands the wide long against an 'F' neighbour would corrupt a
+     *  flanking float.  Both floats are EXACT-representable so the return and the
+     *  witnesses compare bit-exact.  The multipliers are exact small powers of two
+     *  so a*256.0f and c*4.0f introduce no rounding, and each product is summed in
+     *  its own already-rounded step (no FMA contraction). */
+    public float mixF(final float a, final long b, final float c)
+    {
+        wMixFa = a;
+        wMixFb = b;
+        wMixFc = c;
+        final float sa = a * 256.0f;     // exact for the small integral floats used
+        final float sc = c * 4.0f;       // exact
+        final float lo = (float) b;      // long contribution, rounded once
+        return sa + lo + sc;
+    }
+
+    /** Narrow FLOAT immediately before two back-to-back wide kinds: float, long,
+     *  double — five interpreter slots (1 + 2 + 2).  The float must not be
+     *  widened into the long's slots, and the double must start exactly two slots
+     *  past the long.  Each operand is stamped; the return is a pure sum. */
+    public double fld(final float a, final long b, final double c)
+    {
+        wFldA = a;
+        wFldB = b;
+        wFldC = c;
+        return (double) a + (double) b + c;
+    }
+
+    /** Wide long in the MIDDLE flanked by OBJECT references: String, long, String.
+     *  Each reference is one slot.  Returns the full long plus a length-weighted
+     *  mix of the two Strings (distinct multipliers so an a<->c swap of unequal
+     *  lengths changes the result); each arg is stamped to a witness so the long
+     *  is provably intact and the references provably did not swap.  Null-guarded
+     *  so a wrong-arity abuse call (missing String -> null slot) cannot NPE. */
+    public long mixS(final String a, final long b, final String c)
+    {
+        wMixSa = a;
+        wMixSb = b;
+        wMixSc = c;
+        final long la = (a == null) ? 0L : (long) a.length();
+        final long lc = (c == null) ? 0L : (long) c.length();
+        return b + la * 1000003L + lc * 97L;
+    }
+
+    /** Object reference THEN wide long: String, long.  The long starts at the slot
+     *  immediately after the one-slot reference (slot 1 for instance). */
+    public long objLong(final String o, final long v)
+    {
+        wOlObj  = o;
+        wOlLong = v;
+        return v;
+    }
+
+    /** Wide long THEN object reference: long, String.  The reference slot must
+     *  start exactly TWO slots after the long's start, not one. */
+    public long longObj(final long v, final String o)
+    {
+        wLoLong = v;
+        wLoObj  = o;
+        return v;
+    }
+
     // ======================================================================
     //  Overload pair that ONLY differs by a wide-vs-narrow parameter kind, so
     //  resolve_compatible_method() must pick the long overload for a C++ int64
@@ -438,6 +536,28 @@ public final class MethodCallWideArgs
         sWDjA = a;
         sWDjB = b;
         return a + (double) b;
+    }
+
+    /** Static float,long,double interleave (no receiver; float at slot 0). */
+    public static double sFld(final float a, final long b, final double c)
+    {
+        sWFldA = a;
+        sWFldB = b;
+        sWFldC = c;
+        return (double) a + (double) b + c;
+    }
+
+    /** Static String,long,String — wide long between two references, no receiver
+     *  (first reference at slot 0).  Same length-weighted return as the instance
+     *  mixS, null-guarded for abuse safety. */
+    public static long sMixS(final String a, final long b, final String c)
+    {
+        sWMixSa = a;
+        sWMixSb = b;
+        sWMixSc = c;
+        final long la = (a == null) ? 0L : (long) a.length();
+        final long lc = (c == null) ? 0L : (long) c.length();
+        return b + la * 1000003L + lc * 97L;
     }
 
     static
