@@ -692,6 +692,377 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
     }
 
     // =====================================================================
+    //  EXHAUSTIVE INSTANCE reads (fpg_*).  The mandate: "every possible
+    //  instance primitive-field read."  The block above reads a representative
+    //  subset on the instance-dispatch path; this block reads EVERY boundary of
+    //  EVERY primitive through inst->get_field("name")->get() — full parity with
+    //  the static sweep — plus final-field reads, multi-offset offset-correctness,
+    //  mixed-width offset skipping, and the char-narrowing witness on the instance
+    //  path.  Each read asserts BOTH the decoded value AND the variant alternative
+    //  index (proves the right signature branch ran), exactly as the static side.
+    //
+    //  A fresh instance handle is obtained here so this block is self-contained
+    //  (independent of the lambdas scoped inside the representative block above).
+    //  Distinct fpg_inst_* check names keep it from colliding with the existing
+    //  inst_* names.
+    // =====================================================================
+    {
+        const auto inst{ fpg::get_instance() };
+        ctx.check("fpg_inst_handle_obtained", inst != nullptr);
+        if (inst)
+        {
+            // Per-type helpers: assert (value + variant alternative) uniformly.
+            auto z = [&](const char* field, bool expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "fpg_inst_Z_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "fpg_inst_Z_variant_" } + field, v.data.index() == kIdxBool);
+                const bool b{ v };
+                ctx.check(std::string{ "fpg_inst_Z_value_" } + field, b == expected);
+                const int as_int{ v };
+                ctx.check(std::string{ "fpg_inst_Z_canonical_" } + field,
+                          as_int == (expected ? 1 : 0));
+            };
+            auto b = [&](const char* field, std::int8_t expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "fpg_inst_B_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "fpg_inst_B_variant_" } + field, v.data.index() == kIdxI8);
+                const std::int8_t got{ v };
+                ctx.check(std::string{ "fpg_inst_B_value_" } + field, got == expected);
+                const int widened{ v };
+                ctx.check(std::string{ "fpg_inst_B_sign_extends_" } + field,
+                          widened == static_cast<int>(expected));
+            };
+            auto s = [&](const char* field, std::int16_t expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "fpg_inst_S_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "fpg_inst_S_variant_" } + field, v.data.index() == kIdxI16);
+                const std::int16_t got{ v };
+                ctx.check(std::string{ "fpg_inst_S_value_" } + field, got == expected);
+                const int widened{ v };
+                ctx.check(std::string{ "fpg_inst_S_sign_extends_" } + field,
+                          widened == static_cast<int>(expected));
+            };
+            auto i = [&](const char* field, std::int32_t expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "fpg_inst_I_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "fpg_inst_I_variant_" } + field, v.data.index() == kIdxI32);
+                const std::int32_t got{ v };
+                ctx.check(std::string{ "fpg_inst_I_value_" } + field, got == expected);
+                const std::int64_t widened{ v };
+                ctx.check(std::string{ "fpg_inst_I_sign_extends_" } + field,
+                          widened == static_cast<std::int64_t>(expected));
+            };
+            auto j = [&](const char* field, std::int64_t expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "fpg_inst_J_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "fpg_inst_J_variant_" } + field, v.data.index() == kIdxI64);
+                const std::int64_t got{ v };
+                ctx.check(std::string{ "fpg_inst_J_value_" } + field, got == expected);
+            };
+            auto c = [&](const char* field, std::uint16_t expected)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "fpg_inst_C_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "fpg_inst_C_variant_" } + field, v.data.index() == kIdxU16);
+                const std::uint16_t got{ v };
+                ctx.check(std::string{ "fpg_inst_C_value_" } + field, got == expected);
+                const int widened{ v };
+                ctx.check(std::string{ "fpg_inst_C_widens_unsigned_" } + field,
+                          widened == static_cast<int>(expected));
+            };
+            auto f = [&](const char* field, std::uint32_t expected_bits)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "fpg_inst_F_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "fpg_inst_F_variant_" } + field, v.data.index() == kIdxFloat);
+                const float got{ v };
+                ctx.check(std::string{ "fpg_inst_F_bits_" } + field, float_bits(got) == expected_bits);
+            };
+            auto d = [&](const char* field, std::uint64_t expected_bits)
+            {
+                auto fp{ inst->get_field(field) };
+                ctx.check(std::string{ "fpg_inst_D_resolves_" } + field, fp.has_value());
+                if (!fp) { return; }
+                const auto v{ fp->get() };
+                ctx.check(std::string{ "fpg_inst_D_variant_" } + field, v.data.index() == kIdxDouble);
+                const double got{ v };
+                ctx.check(std::string{ "fpg_inst_D_bits_" } + field, double_bits(got) == expected_bits);
+            };
+
+            // boolean — both states.
+            z("iBool",      true);
+            z("iBoolFalse", false);
+
+            // byte — every boundary (sign-extension witnesses included).
+            b("iByteZero",   0);
+            b("iByteOne",    1);
+            b("iByteNegOne", -1);
+            b("iByteMin",    std::numeric_limits<std::int8_t>::min()); // -128
+            b("iByteMax",    std::numeric_limits<std::int8_t>::max()); //  127
+            b("iByte0x7F",   127);
+            b("iByte0x80",   -128);
+            b("iByte0xFF",   -1);
+            b("iByte0xAB",   static_cast<std::int8_t>(0xAB));          //  -85
+            // Unsigned widening of instance byte 0xFF -> uint32 0xFFFFFFFF.
+            {
+                auto fp{ inst->get_field("iByte0xFF") };
+                if (fp)
+                {
+                    const std::uint32_t u{ fp->get() };
+                    ctx.check("fpg_inst_B_0xFF_widens_unsigned", u == 0xFFFFFFFFu);
+                }
+            }
+
+            // short — every boundary.
+            s("iShortZero",   0);
+            s("iShortNegOne", -1);
+            s("iShortMin",    std::numeric_limits<std::int16_t>::min()); // -32768
+            s("iShortMax",    std::numeric_limits<std::int16_t>::max()); //  32767
+            s("iShort0x8000", static_cast<std::int16_t>(0x8000));        // -32768
+            s("iShort0x7FFF", 0x7FFF);                                   //  32767
+            s("iShortBeef",   static_cast<std::int16_t>(0xBEEF));        //  -16657
+
+            // int — every boundary.
+            i("iIntZero",       0);
+            i("iIntOne",        1);
+            i("iIntNegOne",     -1);
+            i("iIntMin",        std::numeric_limits<std::int32_t>::min());
+            i("iIntMax",        std::numeric_limits<std::int32_t>::max());
+            i("iIntDeadBeef",   static_cast<std::int32_t>(0xDEADBEEF));
+            i("iInt0x7FFFFFFF", 0x7FFFFFFF);
+            i("iInt0x80000000", static_cast<std::int32_t>(0x80000000));
+
+            // long — every boundary.
+            j("iLongZero",               0);
+            j("iLongOne",                1);
+            j("iLongNegOne",             -1);
+            j("iLongMin",                std::numeric_limits<std::int64_t>::min());
+            j("iLongMax",                std::numeric_limits<std::int64_t>::max());
+            j("iLongDeadBeef",           static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
+            j("iLong0x7FFFFFFFFFFFFFFF", 0x7FFFFFFFFFFFFFFFLL);
+            j("iLong0x8000000000000000", static_cast<std::int64_t>(0x8000000000000000ULL));
+            j("iLongHighBits",           static_cast<std::int64_t>(0x00000000FFFFFFFFULL));
+
+            // char — full BMP + surrogate sweep.
+            c("iCharNull",    0x0000);
+            c("iCharSpace",   0x0020);
+            c("iCharA",       0x0041);
+            c("iCharZeroDig", 0x0030);
+            c("iChar0x7F",    0x007F);
+            c("iChar0x80",    0x0080);
+            c("iChar0xFF",    0x00FF);
+            c("iChar0x0100",  0x0100);
+            c("iCharMax",     0xFFFF);
+            c("iCharHighBit", 0x00E9);
+            c("iCharBmp",     0x4E2D);
+            c("iCharHiSurr",  0xD83D);
+            c("iCharLoSurr",  0xDE00);
+            c("iCharMinSurr", 0xD800);
+            c("iCharMaxSurr", 0xDFFF);
+
+            // char narrowing witness on the INSTANCE path: uint16/char16 lossless,
+            // C++ char truncates to the low byte (audit: silent narrowing).
+            {
+                auto fp{ inst->get_field("iCharBmp") };
+                if (fp)
+                {
+                    const auto v{ fp->get() };
+                    const std::uint16_t full{ v };
+                    const char narrowed{ v };
+                    ctx.check("fpg_inst_C_bmp_uint16_lossless", full == 0x4E2D);
+                    ctx.check("fpg_inst_C_bmp_char_truncates",
+                              static_cast<unsigned char>(narrowed) == 0x2D);
+                }
+            }
+
+            // float — full IEEE-754 special set + exact fractions (bit-exact).
+            f("iFloatPosZero", 0x00000000);
+            f("iFloatNegZero", 0x80000000);
+            f("iFloatOne",     0x3F800000);
+            f("iFloatNegOne",  0xBF800000);
+            f("iFloatMin",     0x00000001);
+            f("iFloatMax",     0x7F7FFFFF);
+            f("iFloatMinNorm", 0x00800000);
+            f("iFloatPosInf",  0x7F800000);
+            f("iFloatNegInf",  0xFF800000);
+            f("iFloatNaN",     0x7FC00000);
+            f("iFloatSNaN",    0x7F800001);
+            f("iFloatNaNPay",  0x7FA55555);
+            f("iFloatDenorm",  0x00000001);
+            f("iFloatHalf",    0x3F000000);
+            f("iFloatQuarter", 0x3E800000);
+            f("iFloatNegHalf", 0xBF000000);
+            f("iFloatThreeQ",  0x3F400000);
+            f("iFloatTwo",     0x40000000);
+            // Semantic predicates round-tripped through the instance get().
+            {
+                auto fnan{ inst->get_field("iFloatNaN") };
+                auto fpinf{ inst->get_field("iFloatPosInf") };
+                auto fninf{ inst->get_field("iFloatNegInf") };
+                auto fnz{ inst->get_field("iFloatNegZero") };
+                if (fnan)  { const float g{ fnan->get() };  ctx.check("fpg_inst_F_NaN_is_nan",      std::isnan(g)); }
+                if (fpinf) { const float g{ fpinf->get() }; ctx.check("fpg_inst_F_posinf_pred",     std::isinf(g) && g > 0.0F); }
+                if (fninf) { const float g{ fninf->get() }; ctx.check("fpg_inst_F_neginf_pred",     std::isinf(g) && g < 0.0F); }
+                if (fnz)   { const float g{ fnz->get() };   ctx.check("fpg_inst_F_negzero_signbit", std::signbit(g) && g == 0.0F); }
+            }
+
+            // double — full IEEE-754 special set + exact fractions (bit-exact).
+            d("iDoublePosZero", 0x0000000000000000ULL);
+            d("iDoubleNegZero", 0x8000000000000000ULL);
+            d("iDoubleOne",     0x3FF0000000000000ULL);
+            d("iDoubleNegOne",  0xBFF0000000000000ULL);
+            d("iDoubleMin",     0x0000000000000001ULL);
+            d("iDoubleMax",     0x7FEFFFFFFFFFFFFFULL);
+            d("iDoubleMinNorm", 0x0010000000000000ULL);
+            d("iDoublePosInf",  0x7FF0000000000000ULL);
+            d("iDoubleNegInf",  0xFFF0000000000000ULL);
+            d("iDoubleNaN",     0x7FF8000000000000ULL);
+            d("iDoubleSNaN",    0x7FF0000000000001ULL);
+            d("iDoubleNaNPay",  0x7FFAAAAAAAAAAAAAULL);
+            d("iDoubleDenorm",  0x0000000000000001ULL);
+            d("iDoubleHalf",    0x3FE0000000000000ULL);
+            d("iDoubleQuarter", 0x3FD0000000000000ULL);
+            d("iDoubleNegHalf", 0xBFE0000000000000ULL);
+            d("iDoubleThreeQ",  0x3FE8000000000000ULL);
+            d("iDoubleTwo",     0x4000000000000000ULL);
+            {
+                auto dnan{ inst->get_field("iDoubleNaN") };
+                auto dpinf{ inst->get_field("iDoublePosInf") };
+                auto dninf{ inst->get_field("iDoubleNegInf") };
+                auto dnz{ inst->get_field("iDoubleNegZero") };
+                if (dnan)  { const double g{ dnan->get() };  ctx.check("fpg_inst_D_NaN_is_nan",      std::isnan(g)); }
+                if (dpinf) { const double g{ dpinf->get() }; ctx.check("fpg_inst_D_posinf_pred",     std::isinf(g) && g > 0.0); }
+                if (dninf) { const double g{ dninf->get() }; ctx.check("fpg_inst_D_neginf_pred",     std::isinf(g) && g < 0.0); }
+                if (dnz)   { const double g{ dnz->get() };   ctx.check("fpg_inst_D_negzero_signbit", std::signbit(g) && g == 0.0); }
+            }
+
+            // ── FINAL instance primitive fields — same get() path ────────────
+            // `final` is purely a language-level write restriction; storage is a
+            // normal instance slot, so get() must read them byte-identically.
+            {
+                auto fp{ inst->get_field("fBool") };
+                if (fp) { const auto v{ fp->get() }; ctx.check("fpg_inst_final_Z_variant", v.data.index() == kIdxBool); const bool g{ v }; ctx.check("fpg_inst_final_Z_value", g == true); }
+            }
+            {
+                auto fp{ inst->get_field("fByte") };
+                if (fp) { const auto v{ fp->get() }; ctx.check("fpg_inst_final_B_variant", v.data.index() == kIdxI8); const std::int8_t g{ v }; ctx.check("fpg_inst_final_B_value", g == static_cast<std::int8_t>(0x80)); }
+            }
+            {
+                auto fp{ inst->get_field("fShort") };
+                if (fp) { const auto v{ fp->get() }; ctx.check("fpg_inst_final_S_variant", v.data.index() == kIdxI16); const std::int16_t g{ v }; ctx.check("fpg_inst_final_S_value", g == 0x7FFF); }
+            }
+            {
+                auto fp{ inst->get_field("fInt") };
+                if (fp) { const auto v{ fp->get() }; ctx.check("fpg_inst_final_I_variant", v.data.index() == kIdxI32); const std::int32_t g{ v }; ctx.check("fpg_inst_final_I_value", g == 0x7FFFFFFF); }
+            }
+            {
+                auto fp{ inst->get_field("fLong") };
+                if (fp) { const auto v{ fp->get() }; ctx.check("fpg_inst_final_J_variant", v.data.index() == kIdxI64); const std::int64_t g{ v }; ctx.check("fpg_inst_final_J_value", g == std::numeric_limits<std::int64_t>::min()); }
+            }
+            {
+                auto fp{ inst->get_field("fChar") };
+                if (fp) { const auto v{ fp->get() }; ctx.check("fpg_inst_final_C_variant", v.data.index() == kIdxU16); const std::uint16_t g{ v }; ctx.check("fpg_inst_final_C_value", g == 0xFFFF); }
+            }
+            {
+                auto fp{ inst->get_field("fFloat") };
+                if (fp) { const auto v{ fp->get() }; ctx.check("fpg_inst_final_F_variant", v.data.index() == kIdxFloat); const float g{ v }; ctx.check("fpg_inst_final_F_bits", float_bits(g) == 0x7F800000); }
+            }
+            {
+                auto fp{ inst->get_field("fDouble") };
+                if (fp) { const auto v{ fp->get() }; ctx.check("fpg_inst_final_D_variant", v.data.index() == kIdxDouble); const double g{ v }; ctx.check("fpg_inst_final_D_bits", double_bits(g) == 0x7FF8000000000000ULL); }
+            }
+
+            // ── MULTI-OFFSET offset-correctness ──────────────────────────────
+            // Six back-to-back int fields, each with a distinct value: reading all
+            // six and getting the six DISTINCT correct values proves get() honours
+            // each field's own offset (an off-by-one would read a neighbour).
+            {
+                const char* names[]{ "off0", "off1", "off2", "off3", "off4", "off5" };
+                const std::int32_t expect[]{ 0x10000001, 0x20000002, 0x30000003,
+                                             0x40000004, 0x50000005, 0x60000006 };
+                std::int32_t seen[6]{};
+                bool all_ok{ true };
+                for (std::size_t k{ 0 }; k < 6; ++k)
+                {
+                    auto fp{ inst->get_field(names[k]) };
+                    ctx.check(std::string{ "fpg_inst_offset_resolves_" } + names[k], fp.has_value());
+                    if (!fp) { all_ok = false; continue; }
+                    seen[k] = fp->get();
+                    ctx.check(std::string{ "fpg_inst_offset_value_" } + names[k], seen[k] == expect[k]);
+                }
+                // Every value distinct — confirms no two reads aliased the same slot.
+                bool distinct{ all_ok };
+                for (std::size_t a{ 0 }; a < 6 && distinct; ++a)
+                {
+                    for (std::size_t bb{ a + 1 }; bb < 6; ++bb)
+                    {
+                        if (seen[a] == seen[bb]) { distinct = false; break; }
+                    }
+                }
+                ctx.check("fpg_inst_offset_all_distinct", distinct);
+            }
+            // Mixed-width offset skipping: two ints straddling a 1-byte field; both
+            // ints must read correctly despite the (padded) byte slot between them.
+            {
+                auto a{ inst->get_field("mixBeforeInt") };
+                auto m{ inst->get_field("mixByte") };
+                auto z2{ inst->get_field("mixAfterInt") };
+                if (a)  { const std::int32_t g{ a->get() };  ctx.check("fpg_inst_mix_before_int", g == 0x0AAAAAA0); }
+                if (m)  { const std::int8_t  g{ m->get() };  ctx.check("fpg_inst_mix_byte",       g == static_cast<std::int8_t>(0x5A)); }
+                if (z2) { const std::int32_t g{ z2->get() }; ctx.check("fpg_inst_mix_after_int",  g == 0x0BBBBBB0); }
+            }
+        }
+    }
+
+    // =====================================================================
+    //  MUTATE-BETWEEN-READS (instance) — read the pre-seeded sentinel BEFORE the
+    //  probe, drive the probe (Java putfield overwrites it), then re-read AFTER.
+    //  before != after AND after == the written value proves get() reads LIVE
+    //  storage on every call (it does not cache the first read).  GC/timing
+    //  sensitive only insofar as the probe must complete; degrades to [INFO].
+    //  The "before" reads happen HERE so they precede the runtime probe below.
+    // =====================================================================
+    bool mutate_pre_captured{ false };
+    std::int32_t mut_int_before{ 0 };
+    std::int64_t mut_long_before{ 0 };
+    {
+        const auto inst{ fpg::get_instance() };
+        if (inst)
+        {
+            auto fi{ inst->get_field("mutInt") };
+            auto fl{ inst->get_field("mutLong") };
+            if (fi && fl)
+            {
+                mut_int_before  = fi->get();
+                mut_long_before = fl->get();
+                mutate_pre_captured = true;
+                // Sanity: the pre-probe read sees the class-initializer sentinels.
+                ctx.check("fpg_mutate_pre_int_is_sentinel",  mut_int_before  == 0x11111111);
+                ctx.check("fpg_mutate_pre_long_is_sentinel", mut_long_before == 0x2222222222222222LL);
+            }
+        }
+    }
+
+    // =====================================================================
     //  NULL-field_pointer fallback (vmhook.hpp:11551-11554): get() returns
     //  value_t{int32_t{}, sig} for EVERY signature.  We construct field_proxy
     //  directly with a null pointer and confirm the (buggy-by-design) contract:
@@ -839,6 +1210,38 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
                         const double d{ fp->get() };
                         // Math.PI bit pattern.
                         ctx.check("runtime_inst_D_is_pi_bits", double_bits(d) == 0x400921FB54442D18ULL);
+                    }
+                }
+
+                // ── MUTATE-BETWEEN-READS: AFTER side ─────────────────────────
+                // writeRuntime() (just executed by the probe) overwrote mutInt /
+                // mutLong with values DIFFERENT from the sentinels we read before
+                // the probe.  Re-read them now: the new value proves get() reads
+                // live storage every call; before != after proves it does not
+                // cache.  Guarded on mutate_pre_captured so we only compare when
+                // the pre-probe read actually happened.
+                {
+                    auto fi{ inst->get_field("mutInt") };
+                    if (fi)
+                    {
+                        const std::int32_t after{ fi->get() };
+                        ctx.check("fpg_mutate_after_int_is_new", after == 0x33333333);
+                        if (mutate_pre_captured)
+                        {
+                            ctx.check("fpg_mutate_int_changed", after != mut_int_before);
+                        }
+                    }
+                }
+                {
+                    auto fl{ inst->get_field("mutLong") };
+                    if (fl)
+                    {
+                        const std::int64_t after{ fl->get() };
+                        ctx.check("fpg_mutate_after_long_is_new", after == 0x4444444444444444LL);
+                        if (mutate_pre_captured)
+                        {
+                            ctx.check("fpg_mutate_long_changed", after != mut_long_before);
+                        }
                     }
                 }
             }

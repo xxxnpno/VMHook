@@ -200,6 +200,142 @@ public final class FieldPrimitivesGet
     public double  iDoubleNegZero = Double.longBitsToDouble(0x8000000000000000L); // -0.0
 
     // =====================================================================
+    //  EXHAUSTIVE INSTANCE fields -- FULL boundary parity with the static set
+    //  for EVERY primitive, so the instance-dispatch path of get() (offset basis
+    //  = decoded oop + offset) is exercised at EVERY value the static path is, not
+    //  just a representative subset.  Names mirror the static sXxx fields with an
+    //  iXxx prefix.  All char/float/double values are encoding-independent numeric
+    //  or raw-bit forms (see the ENCODING NOTE above).
+    // =====================================================================
+
+    // byte ("B") -- remaining boundaries (Min/Max/Zero already declared above).
+    public byte iByteOne    = 1;
+    public byte iByteNegOne = -1;
+    public byte iByte0x7F   = (byte) 0x7F;   //  127
+    public byte iByte0x80   = (byte) 0x80;   // -128
+    public byte iByte0xFF   = (byte) 0xFF;   //   -1 (sign-extension witness)
+    public byte iByte0xAB   = (byte) 0xAB;   //  -85
+
+    // short ("S") -- remaining boundaries (Min/Max already declared above).
+    public short iShortZero   = 0;
+    public short iShortNegOne = -1;
+    public short iShort0x8000 = (short) 0x8000; // -32768
+    public short iShort0x7FFF = (short) 0x7FFF; //  32767
+    public short iShortBeef   = (short) 0xBEEF; //  -16657
+
+    // int ("I") -- remaining boundaries (Min/Max/NegOne already declared above).
+    public int iIntZero       = 0;
+    public int iIntOne         = 1;
+    public int iIntDeadBeef    = 0xDEADBEEF;     // -559038737
+    public int iInt0x7FFFFFFF  = 0x7FFFFFFF;     //  2147483647
+    public int iInt0x80000000  = 0x80000000;     // -2147483648
+
+    // long ("J") -- remaining boundaries (Min/Max already declared above).
+    public long iLongZero               = 0L;
+    public long iLongOne                = 1L;
+    public long iLongNegOne             = -1L;
+    public long iLongDeadBeef           = 0xDEADBEEFCAFEBABEL;
+    public long iLong0x7FFFFFFFFFFFFFFF = 0x7FFFFFFFFFFFFFFFL;
+    public long iLong0x8000000000000000 = 0x8000000000000000L;
+    public long iLongHighBits           = 0x00000000FFFFFFFFL; // 4294967295
+
+    // char ("C") -- full BMP + surrogate sweep (Null/Max already declared above).
+    public char iCharSpace   = 0x0020; // ' '
+    public char iCharA       = 0x0041; // 'A'
+    public char iCharZeroDig = 0x0030; // '0'
+    public char iChar0x7F    = 0x007F; // DEL, last single-byte ASCII
+    public char iChar0x80    = 0x0080; // first value with high bit set
+    public char iChar0xFF    = 0x00FF; // last value that fits in 8 bits
+    public char iChar0x0100  = 0x0100; // first value needing the high byte
+    public char iCharHighBit = 0x00E9; // 'e-acute' (>0x7F: char-narrowing witness)
+    public char iCharBmp     = 0x4E2D; // CJK char (>0xFF: high-byte-drop witness)
+    public char iCharHiSurr  = 0xD83D; // high surrogate of U+1F600
+    public char iCharLoSurr  = 0xDE00; // low surrogate of U+1F600
+    public char iCharMinSurr = 0xD800; // first high surrogate
+    public char iCharMaxSurr = 0xDFFF; // last low surrogate
+
+    // float ("F") -- full IEEE-754 special set + exact fractions
+    // (PosInf/NaN/NegZero already declared above).  Raw bits so the native side
+    // asserts bit-exact patterns through the instance path.
+    public float iFloatPosZero = Float.intBitsToFloat(0x00000000); // +0.0
+    public float iFloatOne     = Float.intBitsToFloat(0x3F800000); // +1.0
+    public float iFloatNegOne  = Float.intBitsToFloat(0xBF800000); // -1.0
+    public float iFloatMin     = Float.MIN_VALUE;                  // 0x00000001 denormal
+    public float iFloatMax     = Float.MAX_VALUE;                  // 0x7F7FFFFF
+    public float iFloatMinNorm = Float.MIN_NORMAL;                 // 0x00800000
+    public float iFloatNegInf  = Float.NEGATIVE_INFINITY;          // 0xFF800000
+    public float iFloatSNaN    = Float.intBitsToFloat(0x7F800001); // signaling NaN
+    public float iFloatNaNPay  = Float.intBitsToFloat(0x7FA55555); // qNaN with payload
+    public float iFloatDenorm  = Float.intBitsToFloat(0x00000001); // == MIN_VALUE
+    public float iFloatHalf    = 0.5F;                             // 0x3F000000
+    public float iFloatQuarter = 0.25F;                            // 0x3E800000
+    public float iFloatNegHalf = -0.5F;                            // 0xBF000000
+    public float iFloatThreeQ  = 0.75F;                            // 0x3F400000
+    public float iFloatTwo     = 2.0F;                             // 0x40000000
+
+    // double ("D") -- full IEEE-754 special set + exact fractions
+    // (Max/NegInf/NegZero already declared above).
+    public double iDoublePosZero = Double.longBitsToDouble(0x0000000000000000L); // +0.0
+    public double iDoubleOne     = Double.longBitsToDouble(0x3FF0000000000000L); // +1.0
+    public double iDoubleNegOne  = Double.longBitsToDouble(0xBFF0000000000000L); // -1.0
+    public double iDoubleMin     = Double.MIN_VALUE;                             // 0x0...01 denormal
+    public double iDoubleMinNorm = Double.MIN_NORMAL;                            // 0x0010000000000000
+    public double iDoublePosInf  = Double.POSITIVE_INFINITY;                     // 0x7FF0000000000000
+    public double iDoubleNaN     = Double.NaN;                                   // 0x7FF8000000000000
+    public double iDoubleSNaN    = Double.longBitsToDouble(0x7FF0000000000001L); // signaling NaN
+    public double iDoubleNaNPay  = Double.longBitsToDouble(0x7FFAAAAAAAAAAAAAL); // qNaN with payload
+    public double iDoubleDenorm  = Double.longBitsToDouble(0x0000000000000001L); // == MIN_VALUE
+    public double iDoubleHalf    = 0.5;                                          // 0x3FE0000000000000
+    public double iDoubleQuarter = 0.25;                                         // 0x3FD0000000000000
+    public double iDoubleNegHalf = -0.5;                                         // 0xBFE0000000000000
+    public double iDoubleThreeQ  = 0.75;                                         // 0x3FE8000000000000
+    public double iDoubleTwo     = 2.0;                                          // 0x4000000000000000
+
+    // =====================================================================
+    //  FINAL instance primitive fields -- read through the SAME get() path.
+    //  `final` changes nothing about the storage layout (still a regular
+    //  instance slot at oop + offset), so get() must read them identically; this
+    //  pins that the read path does not special-case (or choke on) final fields.
+    // =====================================================================
+    public final boolean fBool   = true;
+    public final byte    fByte   = (byte) 0x80;                       // -128
+    public final short   fShort  = (short) 0x7FFF;                    //  32767
+    public final int     fInt    = 0x7FFFFFFF;                        //  INT32_MAX
+    public final long    fLong   = Long.MIN_VALUE;
+    public final char    fChar   = 0xFFFF;                            //  CHAR MAX
+    public final float   fFloat  = Float.intBitsToFloat(0x7F800000);  // +Inf
+    public final double  fDouble = Double.longBitsToDouble(0x7FF8000000000000L); // canonical NaN
+
+    // =====================================================================
+    //  MULTI-OFFSET cluster -- six int fields declared back-to-back with
+    //  DISTINCT values.  Reading all six and getting six distinct correct values
+    //  proves get() applies each field's OWN offset (oop + entry->offset); an
+    //  off-by-one offset bug would read a neighbour and surface as a wrong value.
+    // =====================================================================
+    public int off0 = 0x1000_0001;
+    public int off1 = 0x2000_0002;
+    public int off2 = 0x3000_0003;
+    public int off3 = 0x4000_0004;
+    public int off4 = 0x5000_0005;
+    public int off5 = 0x6000_0006;
+
+    // Mixed-width neighbours: a byte wedged between two ints, so the int reads
+    // must skip the (possibly-padded) 1-byte slot and still land correctly --
+    // another offset-correctness witness across heterogeneous widths.
+    public int  mixBeforeInt = 0x0AAAAAA0;
+    public byte mixByte      = (byte) 0x5A;   //  90
+    public int  mixAfterInt  = 0x0BBBBBB0;
+
+    // =====================================================================
+    //  MUTATE-BETWEEN-READS witness -- pre-seeded to a known NON-default value,
+    //  then OVERWRITTEN by writeRuntime() (putfield) to a DIFFERENT value.  The
+    //  native side reads it BEFORE and AFTER the probe; before != after proves
+    //  get() reads LIVE storage on every call (no caching of the first read).
+    // =====================================================================
+    public int  mutInt  = 0x11111111;   // pre-probe sentinel
+    public long mutLong  = 0x2222222222222222L;
+
+    // =====================================================================
     //  RUNTIME fields -- written fresh by the probe on a real bytecode
     //  dispatch (putstatic / putfield).  The native side reads them AFTER
     //  the probe completes, proving get() reflects live JVM state.
@@ -246,6 +382,12 @@ public final class FieldPrimitivesGet
         instance.rIInt    = 0x7FFFFFFF;   // INT32_MAX
         instance.rILong   = Long.MIN_VALUE;
         instance.rIDouble = Math.PI;
+
+        // Mutate-between-reads witnesses: overwrite the pre-seeded sentinels with
+        // DIFFERENT values so the native side's post-probe re-read differs from its
+        // pre-probe read (proves get() is not caching the first value).
+        instance.mutInt  = 0x33333333; // was 0x11111111
+        instance.mutLong = 0x4444444444444444L; // was 0x2222...
 
         return this.seed + salt;
     }
