@@ -5501,6 +5501,12 @@ namespace vmhook
                 // intercepted call is negligible beside the user detour it gates,
                 // and the value-comparison scan over g_hooked_methods that follows
                 // stays a raw, lock-free loop over our own (always-mapped) heap.
+#if defined(_WIN32)
+                // Windows-only: the uncontained no-SEH access violation is a Windows
+                // phenomenon (MinGW / clang-on-Windows have no __try AV trap).  Gate
+                // on is_valid_pointer, then read the Method* slot through os::safe_read
+                // so a torn / unmapped / GC-relocated frame yields nullptr instead of
+                // faulting.  This is what fixed the clang-windows detour cold-fault.
                 if (!vmhook::hotspot::is_valid_pointer(this))
                 {
                     return nullptr;
@@ -5513,6 +5519,18 @@ namespace vmhook
                     return nullptr;
                 }
                 return method_pointer;
+#else
+                // POSIX (Linux/macOS): the raw read never faulted on the detour path,
+                // and guarding it regressed return_value::stack_trace — which reaches
+                // this accessor for EVERY caller frame in its multi-frame walk: the
+                // is_valid_pointer range check can reject a legitimate deep stack rbp,
+                // and routing the read through process_vm_readv changed the walk's
+                // result (stk_* failed on linux·gcc·java21+).  A stray AV here is
+                // contained by the JVM's own POSIX signal handling, not by this
+                // accessor, so keep the direct read.
+                return *reinterpret_cast<vmhook::hotspot::method* const*>(
+                    reinterpret_cast<const std::uint8_t*>(this) - 24);
+#endif
             }
 
             /*

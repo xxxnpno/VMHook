@@ -213,20 +213,13 @@ jobs:
       matrix:
         compiler: [msvc, clang, mingw]
         java:     ${{ fromJson(needs.java-versions.outputs.versions) }}
-        # The modular harness contains a SUITE-THREAD no-SEH access violation
-        # compiler-independently via a pure-Win32 Vectored-Exception-Handler +
-        # setjmp container (tests/jvm/harness.cpp; a contained suite-thread cold
-        # fault is recorded there as a visible [INFO], so it no longer reds the
-        # matrix).  But a cold fault on a DETOUR / Java thread — a hooked
-        # method-call path — is out of that container's thread scope and still
-        # takes the JVM down with no TOTAL line, and clang·windows·java11 hits one
-        # SYSTEMATICALLY (every run, at a varying module).  Keep that one cell
-        # quarantined until the detour-side decode is hardened (os::safe_read on the
-        # call/return path) or contained.  java11 stays covered by
-        # mingw/msvc/linux/macos; clang-windows stays covered by every other JDK.
-        exclude:
-          - compiler: clang
-            java: "11"
+        # clang·windows·java11 was quarantined for the no-SEH DETOUR-thread cold
+        # fault; QUARANTINE LIFTED now that the dispatch-time root read —
+        # frame::get_method()'s cold Method* load at rbp-24, hit on every hooked
+        # call — is os::safe_read-guarded on Windows (it crashed clang·windows at a
+        # varying module each run).  The harness ALSO contains a suite-thread AV via
+        # a pure-Win32 VEH + setjmp + [INFO] classification (tests/jvm/harness.cpp).
+        # Full clang·windows JDK matrix runs again.
 
     steps:
       - uses: actions/checkout@v4
