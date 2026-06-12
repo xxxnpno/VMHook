@@ -22,20 +22,28 @@ import vmhook.Harness;
  *          vmhook's own read path).
  *
  * GET fields are deliberately constructed to span every decode path of
- * read_java_string on a modern (JDK 9+) compact-string VM:
+ * read_java_string on a modern (JDK 9+) compact-string VM.  read_java_string
+ * UTF-8-ENCODES every code point (it no longer substitutes '?' for non-ASCII):
  *   - pure ASCII             -> LATIN1 (coder 0), byte-verbatim
- *   - Latin-1 (cp <= 0xFF)   -> LATIN1 (coder 0), raw high bytes preserved
- *   - supplementary / CJK    -> UTF-16 (coder 1), the lossy '?'-substitution path
+ *   - Latin-1 (cp <= 0xFF)   -> LATIN1 (coder 0), each cp UTF-8-encoded
+ *                               (0xE9 -> C3 A9, 0x80 -> C2 80, 0xFF -> C3 BF)
+ *   - supplementary / CJK    -> UTF-16 (coder 1), decoded to multi-byte UTF-8;
+ *                               astral code points combine the surrogate pair
+ *                               into one 4-byte sequence
  *   - empty / null           -> the length<=0 and null-oop guard paths
- *   - >4096 chars            -> the length>4096 rejection path
+ *   - >4096 chars            -> the length>4096 rejection path (returns "")
  *
  * Every SET-target String is allocated with {@code new String(...)} (or built
  * char-by-char) so it owns a PRIVATE, non-interned backing array — mutating it
  * in place cannot corrupt a shared string-pool literal elsewhere in the JVM.
  *
+ * The class extends {@link FieldStringBase} so the module can also read a String
+ * field declared on a SUPERCLASS (inherited get, via vmhook::find_field's super
+ * walk).  It is therefore NOT final.
+ *
  * Target Java 8 syntax: no var / records / switch-expressions.
  */
-public final class FieldString
+public class FieldString extends FieldStringBase
 {
     // ----- go/done handshake the native run_probe drives -------------------
     public static volatile boolean go;
@@ -46,9 +54,10 @@ public final class FieldString
     public static String getAscii      = "hello world";
     // Single char, ASCII.
     public static String getOneChar    = "Z";
-    // All code points <= 0xFF (Latin-1) -> still LATIN1 coder 0, raw bytes >=0x80.
+    // All code points <= 0xFF (Latin-1) -> still LATIN1 coder 0; each cp is
+    // UTF-8-encoded by read_java_string (0xE9 -> C3 A9, 0xFF -> C3 BF).
     public static String getLatin1      = makeLatin1();      // "héllo èéÿ"
-    // Contains code points > 0xFF -> forced to UTF-16 coder 1 -> '?'-substitution.
+    // Contains code points > 0xFF -> forced to UTF-16 coder 1 -> multi-byte UTF-8.
     public static String getCjk         = "日本語";          // 日本語
     // Mixed ASCII + a >0xFF char -> whole string promoted to UTF-16 coder 1.
     public static String getMixed       = "A日BéC";             // A 日 B é C
@@ -64,12 +73,43 @@ public final class FieldString
     public static String getLen4097     = repeat('y', 4097);
     // 5000 ASCII chars -> well past the cap -> rejected (returns "").
     public static String getLen5000     = repeat('z', 5000);
-    // 2048 CJK chars -> UTF-16 byte length 4096 -> passes cap, all '?'.
+    // 2048 CJK chars -> UTF-16 byte length 4096 -> passes cap -> 2048*3 UTF-8 bytes.
     public static String getCjk2048     = repeat('日', 2048);
     // 2049 CJK chars -> UTF-16 byte length 4098 -> rejected (returns "").
     public static String getCjk2049     = repeat('日', 2049);
     // Embedded NUL: ASCII bytes with a 0x00 in the middle (LATIN1, length 5).
     public static String getEmbeddedNul = makeEmbeddedNul();             // a\0b\0c
+
+    // ----- exhaustive GET extras (the "every possible read" battery) -------
+    // Astral emoji (U+1F600) flanked by ASCII: stored UTF-16 (coder 1) as a
+    // surrogate PAIR; read_java_string must COMBINE the pair into one 4-byte
+    // UTF-8 sequence and not swallow the trailing 'Y'.  Built from code points
+    // (no raw-emoji source literal needed) -> 'X' + U+1F600 + 'Y'.
+    public static String getEmoji       = makeEmoji();                   // X U+1F600 Y
+    // The same astral code point ALONE -> exactly one 4-byte UTF-8 sequence.
+    public static String getAstral      = new String(Character.toChars(0x1F600));
+    // Max BMP code point U+FFFF -> UTF-16 (coder 1), 3-byte UTF-8 EF BF BF.
+    public static String getMaxBmp      = new String(new char[]{ (char) 0xFFFF });
+    // U+0080 -> the smallest non-ASCII; STILL LATIN1 (coder 0) but the UTF-8
+    // output is the TWO bytes C2 80 (the 1->2 byte encoder boundary on the
+    // LATIN1 path).
+    public static String getLo80        = new String(new char[]{ (char) 0x0080 });
+    // U+0800 -> UTF-16 (coder 1), the FIRST 3-byte UTF-8 code point (E0 A0 80),
+    // i.e. the append_utf8 2->3 byte boundary reached via the UTF-16 path.
+    public static String getU0800       = new String(new char[]{ (char) 0x0800 });
+    // EVERY byte value 0x00..0xFF in one LATIN1 (coder 0) String.  Decodes to
+    // 384 UTF-8 bytes: 128 ASCII (1 byte each, incl. a leading interior NUL) +
+    // 128 high (2 bytes each, C2 80 .. C3 BF).  The most thorough LATIN1 proof.
+    public static String getAll256      = makeAll256();
+    // A static FINAL String whose initializer is a COMPILE-TIME CONSTANT.  javac
+    // constant-folds every *bytecode read* of it into the using class's constant
+    // pool, but the field SLOT still exists with real backing storage holding the
+    // value (verified on JDK 21) — so reading it via the field_proxy/raw decode
+    // returns the actual String, not "".  Characterizes folded-constant storage.
+    public static final String getFinalConst = "FINAL_CONSTANT";
+    // A field the PROBE reassigns to a new String between two native reads, to
+    // prove a fresh field_proxy read sees the NEW backing (GC-sensitive -> [INFO]).
+    public static String getReassign    = freshAscii("before");          // -> "after2"
 
     // Java-published facts about the GET targets (native cross-checks these).
     public static volatile int     jAsciiLen;
@@ -80,6 +120,20 @@ public final class FieldString
     public static volatile boolean jNullIsNull;
     public static volatile int     jLen4096Len;
     public static volatile int     jLen4097Len;
+    // ...for the exhaustive GET extras.
+    public static volatile int     jEmojiCpCount;       // codePointCount == 3 (X,emoji,Y)
+    public static volatile int     jEmojiCp1;            // codePointAt(1) == 0x1F600
+    public static volatile int     jAstralCp0;          // codePointAt(0) == 0x1F600
+    public static volatile int     jMaxBmpCp0;          // == 0xFFFF
+    public static volatile int     jLo80Cp0;            // == 0x0080
+    public static volatile int     jU0800Cp0;           // == 0x0800
+    public static volatile int     jAll256Len;          // == 256
+    public static volatile int     jAll256Cp255;        // == 0x00FF
+    public static volatile String  jFinalConstValue;    // the folded-constant field, read in Java
+    public static volatile String  jInheritedStrValue;  // inherited instance String, read in Java
+    public static volatile String  jStaticInheritedValue; // inherited static String, read in Java
+    public static volatile String  jInstGetOnlyValue;   // clean instance String, read in Java
+    public static volatile String  jReassignAfterValue; // getReassign AFTER the probe reassigns it
 
     // ================= SET targets (static) ================================
     // CRITICAL: every SET target is built with new String(char[]) so it owns a
@@ -111,6 +165,13 @@ public final class FieldString
     public String  instAscii = freshAscii("QQQQQ");                      // len 5, write "java!"
     public static volatile String  instAsciiValue;
     public static volatile boolean instAsciiMatches;    // equals("java!")
+
+    // ================= GET target (instance, NEVER written) ================
+    // A clean instance String the module READS (does not mutate), proving the
+    // String getter decodes an INSTANCE field's compressed OOP through an
+    // instance field_proxy.  A plain literal here is fine: nothing writes it, so
+    // the shared-backing landmine that applies to SET targets does not apply.
+    public String  instGetOnly = "instance-get";
 
     // A live instance the native side wraps (to reach the instance field).
     public static volatile FieldString self;
@@ -149,6 +210,34 @@ public final class FieldString
     {
         // Five Latin-1 'AA' so coder is 0 and backing length is 5 bytes.
         final char[] c = { 'A', 'A', 'A', 'A', 'A' };
+        return new String(c);
+    }
+
+    /**
+     * Builds "X" + U+1F600 + "Y" from code points (no raw-emoji source literal),
+     * so the astral scalar is carried as a UTF-16 surrogate pair flanked by ASCII.
+     */
+    private static String makeEmoji()
+    {
+        final StringBuilder b = new StringBuilder();
+        b.append('X');
+        b.appendCodePoint(0x1F600);
+        b.append('Y');
+        return b.toString();
+    }
+
+    /**
+     * Builds a String of every char value 0x0000..0x00FF (256 chars).  All code
+     * points are <= 0xFF so the String stores as LATIN1 (coder 0); read_java_string
+     * UTF-8-encodes it to 384 bytes.
+     */
+    private static String makeAll256()
+    {
+        final char[] c = new char[256];
+        for (int i = 0; i < 256; i++)
+        {
+            c[i] = (char) i;
+        }
         return new String(c);
     }
 
@@ -199,6 +288,28 @@ public final class FieldString
                 jNullIsNull = (getNull == null);
                 jLen4096Len = getLen4096.length();
                 jLen4097Len = getLen4097.length();
+
+                // --- Java-observed facts about the exhaustive GET extras ----
+                jEmojiCpCount = getEmoji.codePointCount(0, getEmoji.length());
+                jEmojiCp1     = getEmoji.codePointAt(1);     // the astral cp (after 'X')
+                jAstralCp0    = getAstral.codePointAt(0);
+                jMaxBmpCp0    = getMaxBmp.codePointAt(0);
+                jLo80Cp0      = getLo80.codePointAt(0);
+                jU0800Cp0     = getU0800.codePointAt(0);
+                jAll256Len    = getAll256.length();
+                jAll256Cp255  = getAll256.codePointAt(255);
+                jFinalConstValue      = getFinalConst;
+                jInheritedStrValue    = self.inheritedStr;       // inherited instance String
+                jStaticInheritedValue = FieldStringBase.sInheritedStr;
+                jInstGetOnlyValue     = self.instGetOnly;        // clean instance String
+
+                // --- reassign getReassign to a NEW backing String.  The module
+                //     read it as "before" BEFORE the probe; a fresh field_proxy
+                //     read AFTER the probe must see this new value.  Built via
+                //     freshAscii so it owns a private backing (no shared-literal
+                //     surprises) and is a different object than the original.
+                getReassign = freshAscii("after2");
+                jReassignAfterValue = getReassign;          // Java's view of the new value
 
                 // --- read the post-write SET targets THROUGH JAVA -----------
                 setAsciiEqValue   = setAsciiEq;

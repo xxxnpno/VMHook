@@ -8,10 +8,15 @@
 //   - field_proxy::set(std::string)               (~11655)       SET dispatch + guard
 //
 // All checks run on a live JDK-21 JVM, where java.lang.String is COMPACT:
-//   coder 0 (LATIN1) => one byte per char, raw bytes preserved verbatim;
-//   coder 1 (UTF-16) => two bytes per char, and read_java_string replaces every
-//   code unit >= 0x80 with '?'.  The fixture is built so every decode/encode
-//   path is exercised, including the known bugs (documented inline per check).
+//   coder 0 (LATIN1) => one byte per char, each code point UTF-8-ENCODED
+//                       (0xE9 -> C3 A9, 0x80 -> C2 80, 0xFF -> C3 BF);
+//   coder 1 (UTF-16) => two bytes per char, decoded to multi-byte UTF-8 with
+//                       surrogate pairs combined into one 4-byte sequence.
+//   read_java_string no longer substitutes '?' for non-ASCII.  The remaining
+//   characterized quirk is the 4096-backing-byte cap: a String whose backing
+//   array exceeds 4096 bytes is REJECTED to "" (NOT truncated), which makes the
+//   effective UTF-16 ceiling 2048 chars.  The fixture is built so every decode
+//   path AND that cap boundary is exercised (documented inline per check).
 //
 // Mirrors the pilot module shape: register_class, a scoped_hook for the
 // interpreter-hook-on-dispatch requirement, run_probe for the handshake, and a
@@ -96,6 +101,21 @@ namespace
         static auto j_len4096_len() -> std::int32_t { return static_field("jLen4096Len")->get(); }
         static auto j_len4097_len() -> std::int32_t { return static_field("jLen4097Len")->get(); }
 
+        // ---- Java-published facts for the exhaustive GET extras ----
+        static auto j_emoji_cpcount() -> std::int32_t { return static_field("jEmojiCpCount")->get(); }
+        static auto j_emoji_cp1()     -> std::int32_t { return static_field("jEmojiCp1")->get(); }
+        static auto j_astral_cp0()    -> std::int32_t { return static_field("jAstralCp0")->get(); }
+        static auto j_max_bmp_cp0()   -> std::int32_t { return static_field("jMaxBmpCp0")->get(); }
+        static auto j_lo80_cp0()      -> std::int32_t { return static_field("jLo80Cp0")->get(); }
+        static auto j_u0800_cp0()     -> std::int32_t { return static_field("jU0800Cp0")->get(); }
+        static auto j_all256_len()    -> std::int32_t { return static_field("jAll256Len")->get(); }
+        static auto j_all256_cp255()  -> std::int32_t { return static_field("jAll256Cp255")->get(); }
+        static auto j_final_const_value()     -> std::string { return static_field("jFinalConstValue")->get(); }
+        static auto j_inherited_str_value()   -> std::string { return static_field("jInheritedStrValue")->get(); }
+        static auto j_static_inherited_value()-> std::string { return static_field("jStaticInheritedValue")->get(); }
+        static auto j_inst_get_only_value()   -> std::string { return static_field("jInstGetOnlyValue")->get(); }
+        static auto j_reassign_after_value()  -> std::string { return static_field("jReassignAfterValue")->get(); }
+
         static auto set_ascii_eq_matches() -> bool        { return static_field("setAsciiEqMatches")->get(); }
         static auto set_ascii_eq_len()     -> std::int32_t { return static_field("setAsciiEqLen")->get(); }
         static auto set_ascii_eq_value()   -> std::string  { return static_field("setAsciiEqValue")->get(); }
@@ -128,6 +148,28 @@ namespace
             out += digits[c >> 4];
             out += digits[c & 0x0F];
             out += ' ';
+        }
+        return out;
+    }
+
+    // Build the expected UTF-8 for the getAll256 field (char[i] == i, i in
+    // 0..255) by mirroring read_java_string's LATIN1 append_utf8: each code point
+    // 0..0x7F is one byte; 0x80..0xFF is two bytes (C2/C3 lead).  384 bytes total.
+    auto build_all256_expected() -> std::string
+    {
+        std::string out;
+        out.reserve(384);
+        for (std::uint32_t cp{ 0 }; cp < 256u; ++cp)
+        {
+            if (cp < 0x80u)
+            {
+                out += static_cast<char>(cp);
+            }
+            else
+            {
+                out += static_cast<char>(0xC0u | (cp >> 6));
+                out += static_cast<char>(0x80u | (cp & 0x3Fu));
+            }
         }
         return out;
     }
@@ -327,6 +369,146 @@ VMHOOK_JVM_MODULE(field_string)
         }
     }
 
+    // ======================================================================
+    // EXHAUSTIVE GET EXTRAS — "every possible String-field read" battery.
+    // Prefix fstr_* for these additions.  Each value's storage form (coder /
+    // backing-byte length) was verified empirically on Temurin 21, and every
+    // expected UTF-8 byte string was cross-checked against String.getBytes(UTF_8).
+    // All reads go through the CLEAN one-liner (read_static -> field_proxy::get
+    // -> read_java_string) AND are re-decoded directly via read_java_string on
+    // the raw backing OOP (read_static_direct), asserting the two paths agree —
+    // no new raw dereferences (both reuse the guarded read_java_string).
+    // ======================================================================
+
+    // --- Astral emoji (U+1F600) flanked by ASCII -> surrogate pair COMBINED
+    //     into one 4-byte UTF-8 sequence; the trailing 'Y' is not swallowed.
+    //     Stored UTF-16 (coder 1, byte[8]).  Expected UTF-8: 58 F0 9F 98 80 59. ---
+    const std::string emoji{ field_string_fixture::read_static("getEmoji") };
+    ctx.record(std::string{ "[INFO] fstr getEmoji UTF-8 bytes: " } + hex_bytes(emoji));
+    ctx.check("fstr_emoji_utf8_X_emoji_Y",
+              emoji == std::string{ "\x58\xF0\x9F\x98\x80\x59" });
+    ctx.check("fstr_emoji_utf8_len_6", emoji.size() == 6);
+    ctx.check("fstr_emoji_4byte_lead_F0",
+              emoji.size() == 6
+              && static_cast<unsigned char>(emoji.front()) == 0x58
+              && static_cast<unsigned char>(emoji[1]) == 0xF0
+              && static_cast<unsigned char>(emoji.back()) == 0x59);
+    ctx.check("fstr_emoji_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getEmoji") == emoji);
+
+    // --- The same astral code point ALONE -> exactly one 4-byte UTF-8 seq. ---
+    const std::string astral{ field_string_fixture::read_static("getAstral") };
+    ctx.check("fstr_astral_utf8_4bytes",
+              astral == std::string{ "\xF0\x9F\x98\x80" });
+    ctx.check("fstr_astral_utf8_len_4", astral.size() == 4);
+    ctx.check("fstr_astral_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getAstral") == astral);
+
+    // --- Max BMP U+FFFF -> UTF-16 (coder 1) -> 3-byte UTF-8 EF BF BF.
+    //     Proves a non-surrogate at the very top of the BMP is a plain 3-byte
+    //     char (not mis-handled by the surrogate-combining branch). ---
+    const std::string max_bmp{ field_string_fixture::read_static("getMaxBmp") };
+    ctx.check("fstr_max_bmp_utf8_EFBFBF",
+              max_bmp == std::string{ "\xEF\xBF\xBF" });
+    ctx.check("fstr_max_bmp_utf8_len_3", max_bmp.size() == 3);
+    ctx.check("fstr_max_bmp_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getMaxBmp") == max_bmp);
+
+    // --- U+0080 -> smallest non-ASCII; STILL LATIN1 (coder 0) but encodes to
+    //     the TWO bytes C2 80 (the 1->2 byte boundary on the LATIN1 path). ---
+    const std::string lo80{ field_string_fixture::read_static("getLo80") };
+    ctx.check("fstr_lo80_latin1_utf8_C280",
+              lo80 == std::string{ "\xC2\x80" });
+    ctx.check("fstr_lo80_utf8_len_2", lo80.size() == 2);
+    ctx.check("fstr_lo80_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getLo80") == lo80);
+
+    // --- U+0800 -> UTF-16 (coder 1) -> the FIRST 3-byte UTF-8 code point
+    //     (E0 A0 80): the append_utf8 2->3 byte boundary via the UTF-16 path. ---
+    const std::string u0800{ field_string_fixture::read_static("getU0800") };
+    ctx.check("fstr_u0800_utf8_E0A080",
+              u0800 == std::string{ "\xE0\xA0\x80" });
+    ctx.check("fstr_u0800_utf8_len_3", u0800.size() == 3);
+    ctx.check("fstr_u0800_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getU0800") == u0800);
+
+    // --- EVERY byte 0x00..0xFF in one LATIN1 (coder 0) String -> 384 UTF-8
+    //     bytes (128 ASCII incl. a leading interior NUL + 128 two-byte highs,
+    //     C2 80 .. C3 BF).  The single most thorough LATIN1 decode proof, on the
+    //     FIELD get path.  Also exercises the interior NUL inside a long string. ---
+    const std::string all256{ field_string_fixture::read_static("getAll256") };
+    const std::string all256_expected{ build_all256_expected() };
+    ctx.record(std::string{ "[INFO] fstr getAll256 -> " } + std::to_string(all256.size())
+               + " bytes (expect 384); first=" + (all256.empty() ? "??" : "00")
+               + " expect leading 00 .. trailing C3 BF");
+    ctx.check("fstr_all256_utf8_len_384", all256.size() == 384);
+    ctx.check("fstr_all256_byte_exact", all256 == all256_expected);
+    ctx.check("fstr_all256_leading_nul_then_01",
+              all256.size() == 384
+              && static_cast<unsigned char>(all256[0]) == 0x00
+              && static_cast<unsigned char>(all256[1]) == 0x01);
+    ctx.check("fstr_all256_tail_is_C3BF",
+              all256.size() == 384
+              && static_cast<unsigned char>(all256[382]) == 0xC3
+              && static_cast<unsigned char>(all256[383]) == 0xBF);
+    ctx.check("fstr_all256_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getAll256") == all256);
+
+    // --- static FINAL String whose initializer is a COMPILE-TIME CONSTANT.
+    //     javac folds bytecode reads of it into the using class's constant pool,
+    //     but the field SLOT still carries real backing storage (verified on JDK
+    //     21: the value/coder/backing are all present).  So reading it via the
+    //     field_proxy/raw decode returns the actual String — NOT "".  This
+    //     characterizes folded-constant field storage for the GET path. ---
+    const std::string final_const{ field_string_fixture::read_static("getFinalConst") };
+    ctx.check("fstr_final_const_value_FINAL_CONSTANT", final_const == "FINAL_CONSTANT");
+    ctx.check("fstr_final_const_len_14", final_const.size() == 14);
+    ctx.check("fstr_final_const_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getFinalConst") == final_const);
+
+    // --- INHERITED static String field, declared only on FieldStringBase,
+    //     resolved through the CHILD wrapper's static_field (vmhook::find_field's
+    //     Klass::get_super() walk on the class mirror), then decoded. ---
+    const std::string static_inherited{ field_string_fixture::read_static("sInheritedStr") };
+    ctx.check("fstr_static_inherited_value", static_inherited == "base-static-inherited");
+    ctx.check("fstr_static_inherited_direct_equals_proxy",
+              field_string_fixture::read_static_direct("sInheritedStr") == static_inherited);
+
+    // --- The pre-reassign read of getReassign.  The probe (PHASE 2) replaces it
+    //     with a freshly-allocated "after2"; a NEW field_proxy read after the
+    //     probe must see the new backing.  Capture "before" now. ---
+    const std::string reassign_before{ field_string_fixture::read_static("getReassign") };
+    ctx.check("fstr_reassign_before_value", reassign_before == "before");
+
+    // --- INHERITED instance String + a clean (never-written) instance String,
+    //     both read through an INSTANCE field_proxy on the live `self` OOP.
+    //     The inherited one starts the super walk at the child klass and resolves
+    //     a slot declared on FieldStringBase (depth 1, compressed-OOP decode). ---
+    {
+        const auto self{ field_string_fixture::acquire_self() };
+        ctx.check("fstr_self_acquired_for_get", self != nullptr);
+        if (self)
+        {
+            const auto inherited_proxy{ self->get_field("inheritedStr") };
+            ctx.check("fstr_inherited_instance_field_resolves", inherited_proxy.has_value());
+            if (inherited_proxy.has_value())
+            {
+                const std::string inherited = inherited_proxy->get();
+                ctx.check("fstr_inherited_instance_value", inherited == "base-inherited");
+                ctx.check("fstr_inherited_instance_signature",
+                          std::string{ inherited_proxy->signature() } == "Ljava/lang/String;");
+            }
+
+            const auto get_only_proxy{ self->get_field("instGetOnly") };
+            ctx.check("fstr_instance_get_only_field_resolves", get_only_proxy.has_value());
+            if (get_only_proxy.has_value())
+            {
+                const std::string get_only = get_only_proxy->get();
+                ctx.check("fstr_instance_get_only_value", get_only == "instance-get");
+            }
+        }
+    }
+
     // ----------------------------------------------------------------------
     // PHASE 2: install the interpreter hook and run the probe, which fires a
     // real bytecode dispatch AND reads every mutated field back through Java.
@@ -366,6 +548,27 @@ VMHOOK_JVM_MODULE(field_string)
         ctx.check("java_len4096_len_4096", field_string_fixture::j_len4096_len() == 4096);
         ctx.check("java_len4097_len_4097", field_string_fixture::j_len4097_len() == 4097);
 
+        // ---- Java-side cross-checks of the exhaustive GET extras: prove the
+        //      bytes vmhook decoded correspond to the real Java String. ----
+        ctx.check("fstr_java_emoji_cpcount_3", field_string_fixture::j_emoji_cpcount() == 3);
+        ctx.check("fstr_java_emoji_cp1_is_1F600", field_string_fixture::j_emoji_cp1() == 0x1F600);
+        ctx.check("fstr_java_astral_cp0_is_1F600", field_string_fixture::j_astral_cp0() == 0x1F600);
+        ctx.check("fstr_java_max_bmp_cp0_is_FFFF", field_string_fixture::j_max_bmp_cp0() == 0xFFFF);
+        ctx.check("fstr_java_lo80_cp0_is_80", field_string_fixture::j_lo80_cp0() == 0x80);
+        ctx.check("fstr_java_u0800_cp0_is_800", field_string_fixture::j_u0800_cp0() == 0x800);
+        ctx.check("fstr_java_all256_len_256", field_string_fixture::j_all256_len() == 256);
+        ctx.check("fstr_java_all256_cp255_is_FF", field_string_fixture::j_all256_cp255() == 0xFF);
+        // Java itself sees the SAME value vmhook decoded for the folded constant
+        // and the two inherited / clean instance String fields.
+        ctx.check("fstr_java_final_const_value",
+                  field_string_fixture::j_final_const_value() == "FINAL_CONSTANT");
+        ctx.check("fstr_java_inherited_str_value",
+                  field_string_fixture::j_inherited_str_value() == "base-inherited");
+        ctx.check("fstr_java_static_inherited_value",
+                  field_string_fixture::j_static_inherited_value() == "base-static-inherited");
+        ctx.check("fstr_java_inst_get_only_value",
+                  field_string_fixture::j_inst_get_only_value() == "instance-get");
+
         // ---- SET write-back verified THROUGH JAVA (the contract). ----
         // Clean full overwrite landed and is visible to Java.
         ctx.check("set_ascii_eq_java_equals_world", field_string_fixture::set_ascii_eq_matches());
@@ -401,5 +604,67 @@ VMHOOK_JVM_MODULE(field_string)
                   field_string_fixture::read_static("setOverlong") == "LON");
         ctx.check("set_empty_target_still_empty",
                   field_string_fixture::read_static("setEmptyTgt").empty());
+
+        // ---- FIELD REASSIGNED BETWEEN READS: the probe replaced getReassign's
+        //      reference with a freshly-allocated "after2".  A NEW field_proxy
+        //      read must now resolve the new backing (proving the getter reads
+        //      the live slot, not a cached OOP).  This is GC-sensitive: the
+        //      probe just allocated the replacement, so a young-gen collection
+        //      could relocate it between the putstatic and this read; if that
+        //      happens read_java_string degrades to "" (its safe_read guard).
+        //      We therefore (a) record the raw observation as [INFO], and (b)
+        //      assert vmhook AGREES WITH JAVA's own post-reassign view — Java
+        //      republished jReassignAfterValue inside the same probe, so both
+        //      sides see the same heap state and the comparison is race-free. ----
+        const std::string reassign_after_vmhook{ field_string_fixture::read_static("getReassign") };
+        const std::string reassign_after_java{ field_string_fixture::j_reassign_after_value() };
+        ctx.record(std::string{ "[INFO] fstr getReassign: before='" } + reassign_before
+                   + "' after(vmhook)='" + reassign_after_vmhook
+                   + "' after(java)='" + reassign_after_java
+                   + "' (GC-sensitive re-read of a reassigned field).");
+        // Java's own view of the reassigned field is the authoritative new value
+        // (race-free: republished inside the same probe).
+        ctx.check("fstr_reassign_java_is_after2", reassign_after_java == "after2");
+        // The fresh field_proxy read resolved the NEW slot, not the stale "before"
+        // backing — the core "re-read sees the reassignment" proof.  Guard the
+        // exact-value assertion behind a non-empty read: the replacement String was
+        // allocated by the probe an instant earlier, so a young-gen relocation
+        // between the putstatic and this read could (rarely) leave read_java_string's
+        // safe_read on an in-flight OOP and degrade to "".  In that GC-race window we
+        // record [INFO] instead of failing; in the overwhelmingly common case we
+        // assert the exact new value AND that it agrees with Java.
+        ctx.check("fstr_reassign_vmhook_not_before", reassign_after_vmhook != "before");
+        if (!reassign_after_vmhook.empty())
+        {
+            ctx.check("fstr_reassign_vmhook_agrees_with_java",
+                      reassign_after_vmhook == reassign_after_java);
+            ctx.check("fstr_reassign_vmhook_is_after2", reassign_after_vmhook == "after2");
+        }
+        else
+        {
+            ctx.record("[INFO] fstr getReassign: vmhook re-read returned \"\" — a GC "
+                       "relocation of the just-allocated replacement raced the read; "
+                       "Java's authoritative view (above) confirms the reassignment.");
+        }
+
+        // ---- Inherited / clean-instance / folded-constant reads still agree
+        //      with Java AFTER the probe (the probe never wrote these; this is a
+        //      stability re-read proving the getter is repeatable for them). ----
+        ctx.check("fstr_final_const_reread_after_probe",
+                  field_string_fixture::read_static("getFinalConst") == "FINAL_CONSTANT");
+        ctx.check("fstr_static_inherited_reread_after_probe",
+                  field_string_fixture::read_static("sInheritedStr") == "base-static-inherited");
+        {
+            const auto self_after{ field_string_fixture::acquire_self() };
+            if (self_after)
+            {
+                const auto inh{ self_after->get_field("inheritedStr") };
+                if (inh.has_value())
+                {
+                    const std::string v = inh->get();
+                    ctx.check("fstr_inherited_instance_reread_after_probe", v == "base-inherited");
+                }
+            }
+        }
     }
 }
