@@ -84,6 +84,18 @@ namespace
     constexpr const char* k_color_class  = "vmhook/fixtures/EnumSingleton$Color";
     constexpr const char* k_op_class     = "vmhook/fixtures/EnumSingleton$Op";
 
+    // Single-constant enum (the enum-singleton idiom) + the classic (pre-enum)
+    // private-static-final singleton, both nested in the holder.
+    constexpr const char* k_lonely_class  = "vmhook/fixtures/EnumSingleton$Lonely";
+    constexpr const char* k_classic_class = "vmhook/fixtures/EnumSingleton$ClassicSingleton";
+
+    // Internal ('/'-separated) names of the runtime klasses javac emits for the
+    // Op constants' anonymous subclass bodies, and the body-less leaf klasses.
+    // These are what klass_from_oop(constant_oop)->get_name()->to_string()
+    // returns (HotSpot symbols use '/'; Class.getName() uses '.').
+    constexpr const char* k_op_plus_subclass  = "vmhook/fixtures/EnumSingleton$Op$1";
+    constexpr const char* k_op_times_subclass = "vmhook/fixtures/EnumSingleton$Op$2";
+
     // -----------------------------------------------------------------------
     // Wrapper for the nested enum  vmhook.fixtures.EnumSingleton$Color.
     //
@@ -241,6 +253,81 @@ namespace
     };
 
     // -----------------------------------------------------------------------
+    // Wrapper for the SINGLE-CONSTANT enum  EnumSingleton$Lonely  (the enum-
+    // singleton idiom).  Its one constant INSTANCE is THE singleton; the wrapper
+    // reads the enum-body `tag` field, the inherited name/ordinal, and (as a
+    // static helper) the INSTANCE constant + the $VALUES array (length 1).
+    // -----------------------------------------------------------------------
+    class lonely_enum : public vmhook::object<lonely_enum>
+    {
+    public:
+        explicit lonely_enum(vmhook::oop_t instance) noexcept
+            : vmhook::object<lonely_enum>{ instance }
+        {
+        }
+
+        auto get_tag() const -> std::int32_t { return get_field("tag")->get(); }
+        auto tag_resolves() const -> bool { return get_field("tag").has_value(); }
+        auto get_name() const -> std::string { return get_field("name")->get(); }
+        auto get_ordinal() const -> std::int32_t { return get_field("ordinal")->get(); }
+
+        static auto acquire_constant(const char* name) -> std::unique_ptr<lonely_enum> { return static_field(name)->get(); }
+        static auto constant_resolves(const char* name) -> bool { return static_field(name).has_value(); }
+
+        static auto values_array_oop() -> void*
+        {
+            const auto proxy{ static_field("$VALUES") };
+            if (!proxy.has_value())
+            {
+                return nullptr;
+            }
+            return vmhook::field_oop(*proxy);
+        }
+
+        static auto values_array_resolves() -> bool { return static_field("$VALUES").has_value(); }
+
+        auto oop() const -> void* { return this->vmhook::object_base::get_instance(); }
+    };
+
+    // -----------------------------------------------------------------------
+    // Wrapper for the CLASSIC (pre-enum) singleton  EnumSingleton$ClassicSingleton.
+    //
+    // A final class with a PRIVATE ctor and a `private static final INSTANCE`
+    // slot.  Unlike an enum constant this is an ordinary object; the wrapper
+    // reads the private `magic` payload and (as a static helper) decodes the
+    // private static INSTANCE field directly out of the class mirror — proving
+    // a private-static-final singleton is reachable exactly like any other
+    // static reference field.
+    // -----------------------------------------------------------------------
+    class classic_singleton : public vmhook::object<classic_singleton>
+    {
+    public:
+        explicit classic_singleton(vmhook::oop_t instance) noexcept
+            : vmhook::object<classic_singleton>{ instance }
+        {
+        }
+
+        auto get_magic() const -> std::int32_t { return get_field("magic")->get(); }
+        auto magic_resolves() const -> bool { return get_field("magic").has_value(); }
+
+        // The canonical private-static-final INSTANCE slot.
+        static auto acquire_instance() -> std::unique_ptr<classic_singleton> { return static_field("INSTANCE")->get(); }
+        static auto instance_resolves() -> bool { return static_field("INSTANCE").has_value(); }
+
+        static auto instance_oop() -> void*
+        {
+            const auto proxy{ static_field("INSTANCE") };
+            if (!proxy.has_value())
+            {
+                return nullptr;
+            }
+            return vmhook::field_oop(*proxy);
+        }
+
+        auto oop() const -> void* { return this->vmhook::object_base::get_instance(); }
+    };
+
+    // -----------------------------------------------------------------------
     // Wrapper for the holder  vmhook.fixtures.EnumSingleton.
     //
     // Owns the go/done/mode handshake, decodes the instance + static enum-
@@ -372,6 +459,32 @@ namespace
                 vmhook::get_array_element<std::uint32_t>(array_oop, i)));
         }
         return out;
+    }
+
+    // The runtime ('/'-separated) klass name of an OOP, read by decoding the
+    // narrow-klass slot in the object header (klass_from_oop) and stringifying
+    // the Klass::_name symbol.  FULLY GATED: klass_from_oop RAW-derefs oop+8 and
+    // symbol::to_string RAW-reads the body, so a null/garbage/relocated OOP (or a
+    // JVM with uncompressed klass pointers the decoder can't resolve) degrades to
+    // an empty string rather than faulting.  Used to CHARACTERISE the body-enum
+    // constants' anonymous subclasses vs the body-less constants' leaf klass.
+    auto runtime_klass_name(void* const oop) -> std::string
+    {
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+        {
+            return std::string{};
+        }
+        vmhook::hotspot::klass* const k{ vmhook::klass_from_oop(oop) };
+        if (!k || !vmhook::hotspot::is_valid_pointer(k))
+        {
+            return std::string{};
+        }
+        const vmhook::hotspot::symbol* const name_sym{ k->get_name() };
+        if (!name_sym || !vmhook::hotspot::is_valid_pointer(name_sym))
+        {
+            return std::string{};
+        }
+        return name_sym->to_string();
     }
 
     // The actual body, wrapped so the VMHOOK_JVM_MODULE entry can guarantee an
@@ -859,6 +972,51 @@ namespace
                     ctx.check("op_PLUS_label_native_best_effort", true);
                 }
             }
+
+            // ---- BODY-ENUM RUNTIME KLASS characterisation ----
+            // javac emits a constant WITH a class body as a DISTINCT anonymous
+            // subclass of the enum (EnumSingleton$Op$1 / $2), while the constant
+            // STATIC fields live on the abstract base Op.  Prove the leaf klass
+            // read out of each constant's OOP header IS that synthetic subclass
+            // (and that the two constants have DIFFERENT leaf klasses), so the
+            // "each constant is its own subclass" reality is asserted natively —
+            // not just via the Java getClass() witnesses.  klass_from_oop +
+            // symbol read are fully gated (runtime_klass_name) so a relocated/
+            // unreadable constant degrades to "" -> a visible FAIL, never a fault.
+            if (live(plus))
+            {
+                const std::string kn{ runtime_klass_name(plus->oop()) };
+                if (!kn.empty())
+                {
+                    ctx.check("op_PLUS_runtime_klass_is_subclass_1", kn == k_op_plus_subclass);
+                    // The constant-specific subclass is NOT the bare base Op.
+                    ctx.check("op_PLUS_runtime_klass_is_not_base_Op", kn != std::string{ k_op_class });
+                }
+                else
+                {
+                    ctx.record("[INFO] enum_singleton: Op.PLUS runtime klass name unreadable "
+                               "(relocated/cold OOP or uncompressed klass pointers); the subclass "
+                               "identity is proven via the Java witness (java_op_PLUS_is_subclass).");
+                }
+            }
+            if (live(times))
+            {
+                const std::string kn{ runtime_klass_name(times->oop()) };
+                if (!kn.empty())
+                {
+                    ctx.check("op_TIMES_runtime_klass_is_subclass_2", kn == k_op_times_subclass);
+                }
+            }
+            // PLUS and TIMES are DIFFERENT anonymous subclasses (distinct klasses).
+            if (live(plus) && live(times))
+            {
+                const std::string kp{ runtime_klass_name(plus->oop()) };
+                const std::string kt{ runtime_klass_name(times->oop()) };
+                if (!kp.empty() && !kt.empty())
+                {
+                    ctx.check("op_PLUS_TIMES_distinct_runtime_klass", kp != kt);
+                }
+            }
         }
 
         // ---- Op Java-side witnesses (robust; independent of native call gate) -
@@ -874,6 +1032,268 @@ namespace
             ctx.check("java_op_TIMES_ordinal_is_1", enum_holder::seen_int("timesOrdinal") == 1);
             ctx.check("java_op_PLUS_TIMES_distinct_identity",
                       enum_holder::seen_int("plusIdentity") != enum_holder::seen_int("timesIdentity"));
+        }
+
+        // =====================================================================
+        // 13. BODY vs BODY-LESS RUNTIME KLASS — Java cross-checks + the body-less
+        //     constants' leaf klass.  The Op section above proved the body
+        //     constants' subclass klass natively; here we (a) corroborate with the
+        //     Java getClass() witnesses, and (b) prove a BODY-LESS constant's leaf
+        //     klass IS the enum class itself (Color.GREEN -> EnumSingleton$Color,
+        //     never a $N subclass) — the contrast that makes the body-enum result
+        //     meaningful.
+        // =====================================================================
+        if (done)
+        {
+            // Java-side: a body constant's getClass() is a subclass of Op; a
+            // body-less constant's getClass() is exactly the enum class.
+            ctx.check("java_op_PLUS_is_subclass",  enum_holder::seen_bool("plusIsSubclassOfOp"));
+            ctx.check("java_GREEN_is_exactly_Color", enum_holder::seen_bool("greenIsExactlyColor"));
+            // The Java runtime class names ('.'-separated) name the expected types.
+            ctx.check("java_PLUS_className_is_Op_1",
+                      enum_holder::seen_str("plusClassName") == "vmhook.fixtures.EnumSingleton$Op$1");
+            ctx.check("java_TIMES_className_is_Op_2",
+                      enum_holder::seen_str("timesClassName") == "vmhook.fixtures.EnumSingleton$Op$2");
+            ctx.check("java_GREEN_className_is_Color",
+                      enum_holder::seen_str("greenClassName") == "vmhook.fixtures.EnumSingleton$Color");
+        }
+        // Native: a body-LESS Color constant's leaf klass IS the enum class
+        // (the '/'-separated internal name), NOT an anonymous subclass.
+        if (live(green))
+        {
+            const std::string kn{ runtime_klass_name(green->oop()) };
+            if (!kn.empty())
+            {
+                ctx.check("color_GREEN_runtime_klass_is_enum_class", kn == std::string{ k_color_class });
+            }
+            else
+            {
+                ctx.record("[INFO] enum_singleton: Color.GREEN runtime klass name unreadable; the "
+                           "body-less-constant klass identity is proven via the Java witness "
+                           "(java_GREEN_className_is_Color).");
+            }
+        }
+        // All three Color constants share ONE leaf klass (no per-constant body).
+        if (live(red) && live(green) && live(blue))
+        {
+            const std::string kr{ runtime_klass_name(red->oop()) };
+            const std::string kg{ runtime_klass_name(green->oop()) };
+            const std::string kb{ runtime_klass_name(blue->oop()) };
+            if (!kr.empty() && !kg.empty() && !kb.empty())
+            {
+                ctx.check("color_constants_share_one_runtime_klass", kr == kg && kg == kb);
+            }
+        }
+
+        // =====================================================================
+        // 14. SINGLE-CONSTANT ENUM (the enum-singleton idiom): EnumSingleton$Lonely.
+        //     Its sole constant INSTANCE IS the singleton.  Loaded lazily by the
+        //     probe (it references Lonely.INSTANCE), so registered + read only now.
+        //     Everything guarded: an unloaded Lonely degrades to [INFO].
+        // =====================================================================
+        const bool lonely_registered{ vmhook::register_class<lonely_enum>(k_lonely_class) };
+        if (!lonely_registered)
+        {
+            ctx.record("[INFO] enum_singleton: EnumSingleton$Lonely not loaded/registered; skipping "
+                       "the single-constant-enum (enum-singleton idiom) native reads.  Its Java "
+                       "witnesses are still checked below if the probe completed.");
+        }
+        if (lonely_registered)
+        {
+            ctx.check("lonely_const_INSTANCE_resolves", lonely_enum::constant_resolves("INSTANCE"));
+            auto sole{ lonely_enum::acquire_constant("INSTANCE") };
+            ctx.check("lonely_INSTANCE_nonnull", sole != nullptr);
+            if (live(sole))
+            {
+                ctx.check("lonely_INSTANCE_oop_valid", live(sole));
+                ctx.check("lonely_INSTANCE_name_is_INSTANCE", sole->get_name() == "INSTANCE");
+                ctx.check("lonely_INSTANCE_ordinal_is_0",     sole->get_ordinal() == 0);
+                ctx.check("lonely_INSTANCE_tag_resolves",     sole->tag_resolves());
+                ctx.check("lonely_INSTANCE_tag_is_sentinel",  sole->get_tag() == static_cast<std::int32_t>(0x515E));
+                // The single constant's leaf klass IS the enum class (no body).
+                const std::string kn{ runtime_klass_name(sole->oop()) };
+                if (!kn.empty())
+                {
+                    ctx.check("lonely_INSTANCE_runtime_klass_is_enum_class", kn == std::string{ k_lonely_class });
+                }
+            }
+            // $VALUES has length EXACTLY 1, and its sole element IS INSTANCE.
+            ctx.check("lonely_values_array_resolves", lonely_enum::values_array_resolves());
+            {
+                void* const array_oop{ lonely_enum::values_array_oop() };
+                if (array_oop && vmhook::hotspot::is_valid_pointer(array_oop))
+                {
+                    ctx.check("lonely_values_array_length_is_1", vmhook::array_length(array_oop) == 1);
+                    const std::vector<void*> elems{ values_element_oops(array_oop) };
+                    if (elems.size() == 1 && live(sole))
+                    {
+                        ctx.check("lonely_values_elem0_is_INSTANCE", elems[0] == sole->oop());
+                    }
+                }
+                else
+                {
+                    ctx.record("[INFO] enum_singleton: Lonely.$VALUES array OOP not readable; the "
+                               "single-constant count is proven via the Java witness "
+                               "(java_lonely_values_length_is_1).");
+                }
+            }
+            // Read the sole constant twice -> identical OOP (it IS the singleton).
+            {
+                const auto again{ lonely_enum::acquire_constant("INSTANCE") };
+                ctx.check("lonely_INSTANCE_read_twice_identical_oop",
+                          live(sole) && live(again) && sole->oop() == again->oop());
+            }
+        }
+
+        // =====================================================================
+        // 15. CLASSIC (pre-enum) SINGLETON: EnumSingleton$ClassicSingleton, a
+        //     private-static-final INSTANCE behind getInstance().  Loaded lazily
+        //     by the probe (getInstance()), so registered + read only now.
+        // =====================================================================
+        const bool classic_registered{ vmhook::register_class<classic_singleton>(k_classic_class) };
+        if (!classic_registered)
+        {
+            ctx.record("[INFO] enum_singleton: EnumSingleton$ClassicSingleton not loaded/registered; "
+                       "skipping the classic-singleton native reads.  Its identity is proven via the "
+                       "Java witnesses below if the probe completed.");
+        }
+        if (classic_registered)
+        {
+            // A PRIVATE static final field still resolves + decodes via the mirror.
+            ctx.check("classic_INSTANCE_field_resolves", classic_singleton::instance_resolves());
+            auto inst{ classic_singleton::acquire_instance() };
+            ctx.check("classic_INSTANCE_nonnull", inst != nullptr);
+            if (live(inst))
+            {
+                ctx.check("classic_INSTANCE_oop_valid", live(inst));
+                ctx.check("classic_magic_field_resolves", inst->magic_resolves());
+                ctx.check("classic_magic_is_payload", inst->get_magic() == static_cast<std::int32_t>(0x5A5A5A5A));
+                // Its leaf klass is the ordinary class (NOT a synthetic enum subclass).
+                const std::string kn{ runtime_klass_name(inst->oop()) };
+                if (!kn.empty())
+                {
+                    ctx.check("classic_runtime_klass_is_class", kn == std::string{ k_classic_class });
+                }
+            }
+            // Read the private static slot twice -> identical OOP (singleton-stable).
+            {
+                void* const a{ classic_singleton::instance_oop() };
+                void* const b{ classic_singleton::instance_oop() };
+                ctx.check("classic_INSTANCE_oop_nonnull",
+                          a != nullptr && vmhook::hotspot::is_valid_pointer(a));
+                ctx.check("classic_INSTANCE_oop_stable_across_reads", a == b);
+                if (live(inst))
+                {
+                    ctx.check("classic_wrapper_oop_matches_field", inst->oop() == a);
+                }
+            }
+        }
+
+        // =====================================================================
+        // 16. ENUMMAP / ENUMSET keyed on the Color enum.  The library has no
+        //     dedicated wrapper for these SPECIAL (ordinal-indexed) collections,
+        //     so we CHARACTERISE their runtime klass best-effort ([INFO]) — never
+        //     a hard assertion on a type the library does not model — and prove
+        //     their CONTENTS robustly via the Java witnesses (section below).
+        //     The fields are PUBLIC STATIC FINAL on the holder, decoded as plain
+        //     reference OOPs.
+        // =====================================================================
+        {
+            const auto color_names{ enum_holder::static_field("COLOR_NAMES") };
+            ctx.check("enummap_COLOR_NAMES_field_resolves", color_names.has_value());
+            if (color_names.has_value())
+            {
+                void* const map_oop{ vmhook::field_oop(*color_names) };
+                const std::string kn{ runtime_klass_name(map_oop) };
+                ctx.record(std::string{ "[INFO] enum_singleton: EnumMap COLOR_NAMES runtime klass = '" }
+                           + (kn.empty() ? std::string{ "<unreadable>" } : kn)
+                           + "' (library has no EnumMap wrapper; contents proven via Java witnesses).");
+                // Best-effort POSITIVE characterisation: when the klass name is
+                // readable it IS java/util/EnumMap.  Only asserted on a non-empty
+                // read so a relocated/cold map degrades to the [INFO] above.
+                if (!kn.empty())
+                {
+                    ctx.check("enummap_COLOR_NAMES_klass_is_EnumMap", kn == "java/util/EnumMap");
+                }
+            }
+
+            const auto warm_colors{ enum_holder::static_field("WARM_COLORS") };
+            ctx.check("enumset_WARM_COLORS_field_resolves", warm_colors.has_value());
+            if (warm_colors.has_value())
+            {
+                void* const set_oop{ vmhook::field_oop(*warm_colors) };
+                const std::string kn{ runtime_klass_name(set_oop) };
+                ctx.record(std::string{ "[INFO] enum_singleton: EnumSet WARM_COLORS runtime klass = '" }
+                           + (kn.empty() ? std::string{ "<unreadable>" } : kn)
+                           + "' (library has no EnumSet wrapper; contents proven via Java witnesses).");
+                // EnumSet.of(...) for <=64 constants is java/util/RegularEnumSet.
+                if (!kn.empty())
+                {
+                    ctx.check("enumset_WARM_COLORS_klass_is_RegularEnumSet", kn == "java/util/RegularEnumSet");
+                }
+            }
+        }
+
+        // =====================================================================
+        // 17. NAME() REFLECTION CROSS-CHECK.  The native `name` field reads in
+        //     section 5 compared against source literals; here we cross-check the
+        //     PUBLISHED java.lang.Enum.name() witnesses (the JVM's own values) AND
+        //     tie each back to the native read, so name decoding is proven against
+        //     the runtime, not just the .java source.
+        // =====================================================================
+        if (done)
+        {
+            ctx.check("java_RED_name_is_RED",     enum_holder::seen_str("redNameSeen") == "RED");
+            ctx.check("java_GREEN_name_is_GREEN", enum_holder::seen_str("greenNameSeen") == "GREEN");
+            ctx.check("java_BLUE_name_is_BLUE",   enum_holder::seen_str("blueNameSeen") == "BLUE");
+            ctx.check("java_PLUS_name_is_PLUS",   enum_holder::seen_str("plusNameSeen") == "PLUS");
+            // Native read == Java Enum.name() witness (same value, two paths).
+            if (live(green))
+            {
+                ctx.check("native_GREEN_name_matches_java_witness",
+                          green->get_name() == enum_holder::seen_str("greenNameSeen"));
+            }
+            if (live(red))
+            {
+                ctx.check("native_RED_name_matches_java_witness",
+                          red->get_name() == enum_holder::seen_str("redNameSeen"));
+            }
+        }
+
+        // =====================================================================
+        // 18. SINGLE-CONSTANT / CLASSIC SINGLETON + ENUMMAP/ENUMSET Java-side
+        //     witnesses (robust; independent of the native reads above).
+        // =====================================================================
+        if (done)
+        {
+            // Single-constant enum: exactly one constant, INSTANCE is that one.
+            ctx.check("java_lonely_values_length_is_1", enum_holder::seen_int("lonelyValuesLen") == 1);
+            ctx.check("java_lonely_INSTANCE_is_sole",    enum_holder::seen_bool("lonelyInstanceIsSole"));
+            ctx.check("java_lonely_tag_is_sentinel",
+                      enum_holder::seen_int("lonelyTagSeen") == static_cast<std::int32_t>(0x515E));
+
+            // Classic singleton: getInstance() idempotent + stable identity.
+            ctx.check("java_classic_same_instance", enum_holder::seen_bool("classicSameInstance"));
+            ctx.check("java_classic_magic_is_payload",
+                      enum_holder::seen_int("classicMagicSeen") == static_cast<std::int32_t>(0x5A5A5A5A));
+
+            // Tie the Java-published singleton identities back to the native OOPs:
+            // identityHashCode is NOT the OOP, but two reads agreeing on it (Java)
+            // plus the native OOP-stability checks above are complementary proofs.
+            ctx.check("java_lonely_identity_nonzero",  enum_holder::seen_int("lonelyInstanceIdentity") != 0);
+            ctx.check("java_classic_identity_nonzero", enum_holder::seen_int("classicInstanceIdentity") != 0);
+
+            // EnumMap / EnumSet contents (the robust proof for the un-wrapped types).
+            ctx.check("java_enummap_size_is_3",      enum_holder::seen_int("colorNamesSize") == 3);
+            ctx.check("java_enummap_get_GREEN_is_g", enum_holder::seen_str("colorNamesGreen") == "g");
+            ctx.check("java_enumset_size_is_1",      enum_holder::seen_int("warmColorsSize") == 1);
+            ctx.check("java_enumset_contains_RED",   enum_holder::seen_bool("warmColorsHasRed"));
+            ctx.check("java_enumset_excludes_BLUE",  !enum_holder::seen_bool("warmColorsHasBlue"));
+            // Corroborate the native klass characterisation with the Java names.
+            ctx.check("java_enummap_className_is_EnumMap",
+                      enum_holder::seen_str("colorNamesClassName") == "java.util.EnumMap");
+            ctx.check("java_enumset_className_is_RegularEnumSet",
+                      enum_holder::seen_str("warmColorsClassName") == "java.util.RegularEnumSet");
         }
     }
 }

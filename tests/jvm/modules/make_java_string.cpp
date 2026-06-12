@@ -201,6 +201,96 @@ namespace
         return out;
     }
 
+    // Append one Unicode scalar to `out` as standard UTF-8 (1-4 bytes).  Mirrors
+    // read_java_string's append_utf8 / the encode the library round-trips against,
+    // so a string assembled here from code points feeds make_java_string the bytes
+    // it expects and reads back byte-identically.  Surrogate code points
+    // (U+D800..U+DFFF) are skipped by the callers (they cannot appear in valid
+    // UTF-8), so this only ever emits well-formed sequences.
+    auto append_utf8(std::string& out, std::uint32_t cp) -> void
+    {
+        if (cp < 0x80u)
+        {
+            out += static_cast<char>(cp);
+        }
+        else if (cp < 0x800u)
+        {
+            out += static_cast<char>(0xC0u | (cp >> 6));
+            out += static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+        else if (cp < 0x10000u)
+        {
+            out += static_cast<char>(0xE0u | (cp >> 12));
+            out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+            out += static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+        else
+        {
+            out += static_cast<char>(0xF0u | (cp >> 18));
+            out += static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu));
+            out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+            out += static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+    }
+
+    // UTF-8 for the inclusive code-point range [lo, hi], skipping the UTF-16
+    // surrogate block U+D800..U+DFFF (not encodable as scalars).  Used to build
+    // the "every byte / full BMP" exhaustive inputs.
+    auto utf8_range(std::uint32_t lo, std::uint32_t hi) -> std::string
+    {
+        std::string out;
+        for (std::uint32_t cp{ lo }; cp <= hi; ++cp)
+        {
+            if (cp >= 0xD800u && cp <= 0xDFFFu) { continue; }
+            append_utf8(out, cp);
+        }
+        return out;
+    }
+
+    // The position-weighted 32-bit content signature MakeJavaString.checkContent
+    // computes in Java (sig = sig*131 + charAt(i), wrapping in a 32-bit int), but
+    // computed natively from the UTF-16 code units the library decodes the input
+    // into — the SAME decoder make_java_string uses (vmhook::detail::utf8_to_utf16),
+    // so the value is exactly what the made String's chars must fold to.  Done in
+    // uint32 and reinterpreted to int32 to match Java's wrapping `int` arithmetic.
+    auto java_string_signature(const std::string& utf8) -> std::int32_t
+    {
+        const std::vector<std::uint16_t> units{ vmhook::detail::utf8_to_utf16(utf8) };
+        std::uint32_t sig{ 0 };
+        for (const std::uint16_t unit : units)
+        {
+            sig = (sig * 131u) + unit;
+        }
+        return static_cast<std::int32_t>(sig);
+    }
+
+    // Java String.length() (UTF-16 code-unit count) of a UTF-8 input, via the
+    // library's own decoder so it matches make_java_string's char_count exactly.
+    auto java_string_length(const std::string& utf8) -> std::int32_t
+    {
+        return static_cast<std::int32_t>(vmhook::detail::utf8_to_utf16(utf8).size());
+    }
+
+    // Java String.codePointCount(0, length): one per BMP unit, one per surrogate
+    // PAIR.  Computed from the decoded units so it agrees with what Java sees on
+    // the made String.
+    auto java_string_codepoints(const std::string& utf8) -> std::int32_t
+    {
+        const std::vector<std::uint16_t> units{ vmhook::detail::utf8_to_utf16(utf8) };
+        std::int32_t cps{ 0 };
+        for (std::size_t i{ 0 }; i < units.size(); ++i)
+        {
+            if (units[i] >= 0xD800u && units[i] <= 0xDBFFu
+                && (i + 1) < units.size()
+                && units[i + 1] >= 0xDC00u && units[i + 1] <= 0xDFFFu)
+            {
+                ++i;  // consumed a surrogate pair -> one code point
+            }
+            ++cps;
+        }
+        return cps;
+    }
+
     // ── One wider native round-trip case: a label, the UTF-8 input, and the
     //    EXPECTED read_java_string output.  For these cases expected == input; the
     //    over-cap (>4096) and lone-surrogate cases are handled SEPARATELY below
@@ -268,6 +358,84 @@ namespace
         // intact (read_java_string allows array length up to 4096 inclusive).
         cases.push_back({ "cap_exactly_4096", repeat_bytes("x", 4096), repeat_bytes("x", 4096) });
 
+        // ── EXHAUSTIVE additions (mjs_*): drive every code-point class the
+        //    encoder distinguishes, plus the TLAB-cap neighbours.  expected==input
+        //    for all of these (well-formed UTF-8 in, byte-exact UTF-8 back). ──
+
+        // Control characters U+0001..U+001F (LATIN1; 31 units).  U+0000 is the
+        // interior-NUL case above; here we sweep the rest of the C0 controls to
+        // prove tab/newline/escape/etc. are ordinary code units, not delimiters.
+        cases.push_back({ "control_chars_01_1F", utf8_range(0x01u, 0x1Fu), utf8_range(0x01u, 0x1Fu) });
+
+        // EVERY BYTE 0x00..0xFF as code points U+0000..U+00FF (256 units, LATIN1:
+        // all <= 0xFF).  This is the literal "every byte" battery — the LATIN1
+        // backing must hold each of the 256 values verbatim, including the leading
+        // NUL, and read_java_string must give all 256 back.  The 2-byte UTF-8 forms
+        // of 0x80..0xFF exercise the multibyte decode for the whole high half.
+        {
+            std::string all256;
+            for (std::uint32_t cp{ 0x00u }; cp <= 0xFFu; ++cp) { append_utf8(all256, cp); }
+            cases.push_back({ "every_byte_0x00_0xFF_latin1", all256, all256 });
+        }
+
+        // BMP boundary scalars that bracket every encode decision: the LATIN1->UTF16
+        // promotion edge (U+00FF/U+0100), the 2->3 byte UTF-8 edge (U+07FF/U+0800),
+        // the low/high surrogate-block borders (U+D7FF just below, U+E000 just
+        // above — the block itself is unencodable), and the BMP ceiling
+        // (U+FFFD/U+FFFF).  Any off-by-one in the coder choice or surrogate
+        // handling shows here.
+        {
+            const std::uint32_t pts[]{ 0x00FFu, 0x0100u, 0x07FFu, 0x0800u,
+                                       0xD7FFu, 0xE000u, 0xFFFDu, 0xFFFFu };
+            std::string s;
+            for (const std::uint32_t cp : pts) { append_utf8(s, cp); }
+            cases.push_back({ "bmp_boundaries", s, s });
+        }
+
+        // DENSE BMP SWEEP: every 64th code point across the whole BMP
+        // (U+0000..U+FFFF), skipping the surrogate block.  ~1023 units spanning
+        // 1-, 2- and 3-byte UTF-8 forms and forcing the UTF16 coder — a broad
+        // content fuzz of the byte[]-UTF16 path, round-tripped byte-exact.
+        {
+            std::string sweep;
+            for (std::uint32_t cp{ 0x0000u }; cp <= 0xFFFFu; cp += 64u)
+            {
+                if (cp >= 0xD800u && cp <= 0xDFFFu) { continue; }
+                append_utf8(sweep, cp);
+            }
+            cases.push_back({ "bmp_dense_sweep_step64", sweep, sweep });
+        }
+
+        // TWO consecutive astral emoji -> FOUR surrogate units (length 4, two code
+        // points): proves successive surrogate pairs each advance correctly and the
+        // second pair is not swallowed.
+        cases.push_back({ "astral_two_emoji",
+                          std::string{ "\xF0\x9F\x98\x80\xF0\x9F\x98\x81" },
+                          std::string{ "\xF0\x9F\x98\x80\xF0\x9F\x98\x81" } });
+
+        // The MAXIMUM Unicode scalar U+10FFFF -> surrogate pair DBFF/DFFF (the top
+        // of the astral range): the encode/decode surrogate maths at its ceiling.
+        {
+            std::string s;
+            append_utf8(s, 0x10FFFFu);  // F4 8F BF BF
+            cases.push_back({ "astral_max_U10FFFF", s, s });
+        }
+
+        // A MIXED string spanning every encode path in one input: ASCII + a Latin-1
+        // high char + a 3-byte BMP char + an astral pair.  The single astral/BMP
+        // char promotes the whole thing to the UTF16 coder, so the ASCII and
+        // Latin-1 units ride the 2-byte backing too.
+        cases.push_back({ "mixed_all_classes",
+                          std::string{ "A\xC3\xA9\xE6\x97\xA5\xF0\x9F\x98\x80Z" },
+                          std::string{ "A\xC3\xA9\xE6\x97\xA5\xF0\x9F\x98\x80Z" } });
+
+        // TLAB-cap NEIGHBOURS: 4095 (one below the cap -> fast TLAB path) and 4097
+        // (one above -> over-cap NewString fallback).  Both must read back intact
+        // (4097 still <= read_java_string's own 4096-char readback?  No: 4097 > 4096,
+        // so read_java_string rejects it -> handled in the over-cap section, NOT
+        // here).  Only 4095 round-trips natively; 4097 is asserted via Java length.
+        cases.push_back({ "cap_minus_one_4095", repeat_bytes("x", 4095), repeat_bytes("x", 4095) });
+
         return cases;
     }
 
@@ -319,6 +487,71 @@ namespace
     std::array<std::atomic<bool>, 4> g_echo_call_returned{};// call() returned (no throw / void tag ok)
     std::array<std::atomic<int>,  4> g_echo_call_retlen{};  // echoCheck's int return (observed length)
 
+    // Second over-cap case: a >65536-char ASCII input (well past the 4096 TLAB
+    // cap AND past 16-bit lengths) built in full via the NewString fallback.  Like
+    // the 5000 case its native readback is 0 (read_java_string's 4096 ceiling
+    // rejects the long array); the FULL length is proven only Java-side (content
+    // check below).
+    std::atomic<bool> g_huge_captured{ false };  // >65536 String made + valid
+    std::atomic<int>  g_huge_decoded_len{ -1 };  // read_java_string(huge make).size()
+
+    // ── Java-visible GENERIC content check (checkContent) state, per kind slot.
+    //    The detour makes each content-check input, passes the made oop (wrapped)
+    //    to MakeJavaString.checkContent(kind, String) via method_proxy::call, and
+    //    records whether the made oop was valid + whether call() returned + the int
+    //    length the call returned.  The body then reads the Java witness fields
+    //    (ccLenK / ccCpK / ccSigK / ccNullK / ccCalledK) and asserts them against
+    //    the natively-computed expected length / code points / signature. ──
+    constexpr std::size_t k_num_cc{ 8 };
+    std::array<std::atomic<bool>, k_num_cc> g_cc_made_valid{};   // made oop was valid
+    std::array<std::atomic<bool>, k_num_cc> g_cc_call_returned{};// call() dispatched + returned
+    std::array<std::atomic<int>,  k_num_cc> g_cc_call_retlen{};  // checkContent int return
+
+    // Each content-check slot's input is built once (some are large) and shared by
+    // the detour (which makes + injects it) and the body (which computes the
+    // expected length/codepoints/signature to assert against).  Built lazily.
+    struct cc_case
+    {
+        std::string label;
+        std::string input;
+    };
+    auto build_cc_cases() -> std::vector<cc_case>
+    {
+        std::vector<cc_case> cc;
+        // 0..2: the three NON-empty canonical strings (ASCII / Latin-1 / CJK) — a
+        // cross-check that the public call() surface sees the canonical content
+        // char-for-char (complements the echoCheck .equals path with a signature).
+        cc.push_back({ "canon_hello", k_canon[0] });
+        cc.push_back({ "canon_cafe",  k_canon[1] });
+        cc.push_back({ "canon_cjk",   k_canon[2] });
+        // 3: every byte 0x00..0xFF (256 LATIN1 units) — Java must see all 256.
+        {
+            std::string all256;
+            for (std::uint32_t cp{ 0x00u }; cp <= 0xFFu; ++cp) { append_utf8(all256, cp); }
+            cc.push_back({ "every_byte_latin1", all256 });
+        }
+        // 4: a single astral emoji — Java MUST report length 2, codePointCount 1.
+        cc.push_back({ "astral_emoji", std::string{ "\xF0\x9F\x98\x80" } });
+        // 5: dense BMP sweep (step 64) — broad UTF16-coder content, Java-verified.
+        {
+            std::string sweep;
+            for (std::uint32_t cp{ 0x0000u }; cp <= 0xFFFFu; cp += 64u)
+            {
+                if (cp >= 0xD800u && cp <= 0xDFFFu) { continue; }
+                append_utf8(sweep, cp);
+            }
+            cc.push_back({ "bmp_sweep", sweep });
+        }
+        // 6: OVER-CAP 4097 ASCII — one past the TLAB cap; NewString fallback builds
+        //    it full.  read_java_string can't read 4097 back (its 4096 ceiling), so
+        //    Java is the ONLY proof the made String is genuinely 4097 chars.
+        cc.push_back({ "over_cap_4097", repeat_bytes("x", 4097) });
+        // 7: OVER-CAP >65536 ASCII — far past the cap and past 16-bit lengths;
+        //    full length provable only Java-side.
+        cc.push_back({ "over_cap_100000", repeat_bytes("x", 100000) });
+        return cc;
+    }
+
     // Build a make_java_string oop and validate it.  Returns nullptr (leaving
     // *valid=false) on any failure so callers never wrap/inject/store an invalid
     // oop.  Runs on the Java thread (inside a detour).
@@ -358,6 +591,8 @@ namespace
         g_lone_decoded.clear();
         g_trunc_captured.store(false);
         g_trunc_decoded_len.store(-1);
+        g_huge_captured.store(false);
+        g_huge_decoded_len.store(-1);
 
         for (std::size_t i{ 0 }; i < 4; ++i)
         {
@@ -369,6 +604,13 @@ namespace
             g_echo_made_valid[i].store(false);
             g_echo_call_returned[i].store(false);
             g_echo_call_retlen[i].store(0);
+        }
+
+        for (std::size_t i{ 0 }; i < k_num_cc; ++i)
+        {
+            g_cc_made_valid[i].store(false);
+            g_cc_call_returned[i].store(false);
+            g_cc_call_retlen[i].store(0);
         }
     }
 
@@ -429,6 +671,53 @@ namespace
                 const std::string decoded = vmhook::read_java_string(oop);
                 g_trunc_decoded_len.store(static_cast<int>(decoded.size()));
                 g_trunc_captured.store(true);
+            }
+        }
+
+        // Over-cap, BIGGER: a >65536-char ASCII input (100000).  Same fallback
+        // path as the 5000 case but well past 16-bit lengths — guards against any
+        // 16-bit length truncation in the NewString fallback or the readback.  The
+        // native readback is again 0 (read ceiling); the full 100000-char length is
+        // proven only Java-side (content check, slot 7).
+        {
+            bool nn{ false };
+            bool v{ false };
+            void* const oop{ make_validated(repeat_bytes("x", 100000), nn, v) };
+            if (oop)
+            {
+                const std::string decoded = vmhook::read_java_string(oop);
+                g_huge_decoded_len.store(static_cast<int>(decoded.size()));
+                g_huge_captured.store(true);
+            }
+        }
+
+        // ── (D) JAVA-VISIBLE GENERIC CONTENT CHECK via public call(). ──
+        // For each content-check input, build it with make_java_string, wrap the
+        // made oop, and hand it to checkContent(kind, String) via method_proxy::call
+        // (the SAME wrapper/get_instance() vehicle as the echoes).  The Java body
+        // folds the String char-by-char into a signature + records length/codepoints;
+        // the module body asserts those against the natively-computed expectations.
+        // This is the char-by-char "well-formed JVM String" proof for the WIDE
+        // battery — including the over-cap strings whose length read_java_string
+        // cannot confirm.
+        if (self)
+        {
+            const std::vector<cc_case> cc{ build_cc_cases() };
+            const auto method{ self->get_method("checkContent") };
+            const std::size_t ncc{ cc.size() < k_num_cc ? cc.size() : k_num_cc };
+            for (std::size_t i{ 0 }; i < ncc; ++i)
+            {
+                bool nn{ false };
+                bool v{ false };
+                void* const oop{ make_validated(cc[i].input, nn, v) };
+                g_cc_made_valid[i].store(v);
+                if (oop && method.has_value())
+                {
+                    std::unique_ptr<java_string_w> carrier{ std::make_unique<java_string_w>(oop) };
+                    const std::int32_t observed = method->call(static_cast<std::int32_t>(i), carrier);
+                    g_cc_call_returned[i].store(true);
+                    g_cc_call_retlen[i].store(static_cast<int>(observed));
+                }
             }
         }
 
@@ -809,6 +1098,7 @@ namespace
             ctx.check("mjs_roundtrip_method_declared", has_method("roundtrip"));
             ctx.check("mjs_injectArg_method_declared", has_method("injectArg"));
             ctx.check("mjs_echoCheck_method_declared", has_method("echoCheck"));
+            ctx.check("mjs_checkContent_method_declared", has_method("checkContent"));
         }
         ctx.check("string_klass_found", vmhook::find_class("java/lang/String") != nullptr);
 
@@ -954,6 +1244,47 @@ namespace
                 gate("cap_exactly_4096_survives_intact", g_rt_valid[i].load(),
                      g_rt_decoded_len[i].load() == 4096 && g_rt_byte_exact[i].load());
             }
+            // ── EXHAUSTIVE-addition named property gates (mjs_*). ──
+            else if (cases[i].label == "control_chars_01_1F")
+            {
+                // 31 control chars U+0001..U+001F -> 31 LATIN1 bytes, byte-exact.
+                gate("mjs_control_chars_preserved_len31", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 31 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "every_byte_0x00_0xFF_latin1")
+            {
+                // 256 code points U+0000..U+00FF.  The 0x00..0x7F half is 1 UTF-8
+                // byte each (128), the 0x80..0xFF half is 2 bytes each (256), so the
+                // round-tripped UTF-8 is 128 + 256 = 384 bytes — and byte-exact.
+                gate("mjs_every_byte_0x00_0xFF_roundtrips", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 384 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "astral_two_emoji")
+            {
+                // Two astral emoji -> 8 UTF-8 bytes (4 each), byte-exact.
+                gate("mjs_astral_two_emoji_roundtrips_8byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 8 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "astral_max_U10FFFF")
+            {
+                // U+10FFFF -> 4 UTF-8 bytes (F4 8F BF BF), byte-exact.
+                gate("mjs_astral_max_U10FFFF_roundtrips_4byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 4 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "cap_minus_one_4095")
+            {
+                gate("mjs_cap_minus_one_4095_survives_intact", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 4095 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "bmp_boundaries")
+            {
+                // 8 scalars: U+00FF (2B), U+0100 (2B), U+07FF (2B), U+0800 (3B),
+                // U+D7FF (3B), U+E000 (3B), U+FFFD (3B), U+FFFF (3B) = 2*3 + 6*3?
+                // recompute: 00FF,0100,07FF -> 2 bytes each = 6; the other five
+                // (0800,D7FF,E000,FFFD,FFFF) -> 3 bytes each = 15; total 21 bytes.
+                gate("mjs_bmp_boundaries_roundtrips_21byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 21 && g_rt_byte_exact[i].load());
+            }
         }
 
         // Lone surrogate: characterise the ACTUAL read-back (never forced).  The
@@ -1015,6 +1346,31 @@ namespace
             ctx.record("[INFO] over-cap case: make_java_string returned null on this JVM "
                        "(characterised, not asserted - the GC-aware NewString fallback was "
                        "unavailable here).");
+        }
+
+        // Over-cap, >65536 (100000 ASCII): same fix, well past 16-bit lengths.  The
+        // native readback is 0 for the SAME reason (read ceiling).  This guards
+        // specifically against a 16-bit length truncation anywhere on the fallback
+        // or readback path: a 16-bit-wrapped length (100000 & 0xFFFF == 34464) would
+        // be <= 4096?  No (34464 > 4096) so it would still read back 0 — but a wrap
+        // to e.g. 100000 & 0x0FFF would not.  The Java content check (slot 7) is the
+        // real full-length proof; here we assert the native readback is not the old
+        // 4096 truncation and not a short wrapped value that slipped under the ceiling.
+        if (g_huge_captured.load())
+        {
+            const int hlen{ g_huge_decoded_len.load() };
+            ctx.record(std::string{ "[INFO] over-cap input (100000 ASCII chars, >65536): "
+                       "make_java_string built a valid full-length String; read_java_string(made)."
+                       "size() = " } + std::to_string(hlen)
+                       + " bytes (0 == read ceiling rejects the over-long array; full length "
+                         "proven Java-side in the content check, slot 7).");
+            ctx.check("mjs_over_cap_65536_not_truncated", hlen == 0);
+            ctx.check("mjs_over_cap_65536_not_4096_regression", hlen != 4096);
+        }
+        else
+        {
+            ctx.record("[INFO] over-cap >65536 case: make_java_string returned null on this JVM "
+                       "(characterised, not asserted - NewString fallback unavailable here).");
         }
 
         // =====================================================================
@@ -1120,6 +1476,97 @@ namespace
                        + " wasNull=" + (java_null ? "true" : "false")
                        + " call_return=" + std::to_string(ret_len)
                        + " (expected length " + std::to_string(k_canon_len[i]) + ")");
+        }
+
+        // =====================================================================
+        //  6.5 JAVA-VISIBLE GENERIC CONTENT CHECK — the char-by-char proof that a
+        //      make_java_string product is a WELL-FORMED JVM String for the WIDE
+        //      battery (every-byte LATIN1, dense BMP sweep, astral, and the over-cap
+        //      NewString-fallback strings).  The detour passed each made oop to
+        //      checkContent(kind, String) via call(); the Java body walked it
+        //      char-by-char into a position-weighted signature and recorded
+        //      length/codePointCount.  We assert those Java-observed values against
+        //      the natively-computed expectations (same UTF-16 decoder), so a wrong
+        //      coder, a dropped/transposed char, a surrogate mishandle, or an
+        //      over-cap length truncation all flip a HARD check.
+        //
+        //      length/signature are gated on the made oop being valid AND the call
+        //      reaching the body (ccCalledK) — a JDK-8 char[] null or a call-path
+        //      miss records [INFO] rather than reds CI, exactly like the other
+        //      Java-visible sections.  The length/codepoint/signature equalities are
+        //      HARD where the call ran (the made String the JVM SEES must be exactly
+        //      the content we asked for — this is the strongest usable-String gate).
+        // =====================================================================
+        {
+            const std::vector<cc_case> cc{ build_cc_cases() };
+            const std::array<const char*, 8> ccf_called{
+                "ccCalled0","ccCalled1","ccCalled2","ccCalled3","ccCalled4","ccCalled5","ccCalled6","ccCalled7" };
+            const std::array<const char*, 8> ccf_len{
+                "ccLen0","ccLen1","ccLen2","ccLen3","ccLen4","ccLen5","ccLen6","ccLen7" };
+            const std::array<const char*, 8> ccf_cp{
+                "ccCp0","ccCp1","ccCp2","ccCp3","ccCp4","ccCp5","ccCp6","ccCp7" };
+            const std::array<const char*, 8> ccf_null{
+                "ccNull0","ccNull1","ccNull2","ccNull3","ccNull4","ccNull5","ccNull6","ccNull7" };
+            const std::array<const char*, 8> ccf_sig{
+                "ccSig0","ccSig1","ccSig2","ccSig3","ccSig4","ccSig5","ccSig6","ccSig7" };
+
+            const std::size_t ncc{ cc.size() < k_num_cc ? cc.size() : k_num_cc };
+            for (std::size_t i{ 0 }; i < ncc; ++i)
+            {
+                const bool made_valid{ g_cc_made_valid[i].load() };
+                const bool ran{ g_cc_call_returned[i].load() && mjs::get_bool(ccf_called[i]) };
+
+                // Natively-computed expectations from the SAME decoder the library
+                // uses, so they describe exactly what the made String's chars must be.
+                const std::int32_t exp_len{ java_string_length(cc[i].input) };
+                const std::int32_t exp_cp{ java_string_codepoints(cc[i].input) };
+                const std::int32_t exp_sig{ java_string_signature(cc[i].input) };
+
+                const bool java_null{ mjs::get_bool(ccf_null[i]) };
+                const std::int32_t java_len{ mjs::get_int(ccf_len[i]) };
+                const std::int32_t java_cp{ mjs::get_int(ccf_cp[i]) };
+                const std::int32_t java_sig{ mjs::get_int(ccf_sig[i]) };
+                const std::int32_t ret_len{ g_cc_call_retlen[i].load() };
+
+                // The call reached the body with a valid made oop.
+                gate(std::string{ "mjs_content_check_dispatched_" } + cc[i].label, made_valid, ran);
+
+                // Where it ran: the made String the JVM sees is non-null, the EXACT
+                // length, code-point count, and content signature we asked for, and
+                // the call's int return matches.  All HARD when ran (the proof).
+                if (ran)
+                {
+                    ctx.check(std::string{ "mjs_content_check_not_null_" } + cc[i].label, !java_null);
+                    ctx.check(std::string{ "mjs_content_check_length_" } + cc[i].label, java_len == exp_len);
+                    ctx.check(std::string{ "mjs_content_check_codepoints_" } + cc[i].label, java_cp == exp_cp);
+                    ctx.check(std::string{ "mjs_content_check_signature_" } + cc[i].label, java_sig == exp_sig);
+                    ctx.check(std::string{ "mjs_content_check_return_len_" } + cc[i].label, ret_len == exp_len);
+                }
+
+                ctx.record(std::string{ "[INFO] content-check (" } + cc[i].label
+                           + "): ran=" + (ran ? "true" : "false")
+                           + " java_len=" + std::to_string(java_len) + " (exp " + std::to_string(exp_len) + ")"
+                           + " java_cp=" + std::to_string(java_cp) + " (exp " + std::to_string(exp_cp) + ")"
+                           + " java_sig=" + std::to_string(java_sig) + " (exp " + std::to_string(exp_sig) + ")"
+                           + " null=" + (java_null ? "true" : "false"));
+            }
+
+            // Spell out the headline over-cap proofs by name so a regression is
+            // unmistakable: the 4097 and 100000 strings the JVM sees are genuinely
+            // their FULL length (this is the Java-side counterpart to the native
+            // readback-is-0 over-cap assertions, and the only place the full
+            // over-cap length is positively confirmed).
+            //   slot 6 == over_cap_4097, slot 7 == over_cap_100000 (see build_cc_cases).
+            if (ncc > 6 && g_cc_call_returned[6].load() && mjs::get_bool(ccf_called[6]))
+            {
+                ctx.check("mjs_over_cap_4097_full_length_java",
+                          mjs::get_int(ccf_len[6]) == 4097 && mjs::get_bool(ccf_null[6]) == false);
+            }
+            if (ncc > 7 && g_cc_call_returned[7].load() && mjs::get_bool(ccf_called[7]))
+            {
+                ctx.check("mjs_over_cap_100000_full_length_java",
+                          mjs::get_int(ccf_len[7]) == 100000 && mjs::get_bool(ccf_null[7]) == false);
+            }
         }
 
         // =====================================================================

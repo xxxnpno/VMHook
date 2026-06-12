@@ -182,6 +182,37 @@ public final class MakeJavaString
     public static boolean echoCalled2;   public static boolean echoEq2;   public static int echoLen2;   public static boolean echoNull2;   public static int echoCp2;
     public static boolean echoCalled3;   public static boolean echoEq3;   public static int echoLen3;   public static boolean echoNull3;   public static int echoCp3;
 
+    // ── Witnesses for the GENERIC content check (checkContent), driven by the
+    //    native detour to prove — char-by-char, with genuine Java bytecode — that
+    //    a make_java_string product Java actually sees matches the exact UTF-16
+    //    the encoder intended, for inputs WAY beyond the four canonical strings:
+    //    every byte 0x00..0xFF, the control range, a dense BMP sweep, multiple
+    //    astral code points, and the OVER-CAP (>4096 and >65536) NewString-fallback
+    //    strings whose full length is NOT natively read-back-able (read_java_string
+    //    caps at 4096) and so can ONLY be proven full-length from the Java side.
+    //
+    //    There are NUM_CC slots (kind 0..NUM_CC-1).  Per slot the body records:
+    //      ccCalledK  — true the instant the body ran (call dispatched to the body);
+    //      ccLenK     — value.length()  (UTF-16 code-unit count Java sees);
+    //      ccCpK      — value.codePointCount(0, length)  (astral folds to 1 cp/pair);
+    //      ccNullK    — true if the body saw null;
+    //      ccSigK     — a position-weighted content signature over value.charAt(i):
+    //                   sig = ((sig * 131) + charAt(i)) over all i, in a 32-bit int.
+    //                   The native side computes the SAME fold over the UTF-16 units
+    //                   it asked make_java_string to encode and asserts equality, so
+    //                   a single int proves byte-for-byte content agreement (a
+    //                   transposition, a dropped char, or a wrong coder all change it)
+    //                   without thousands of witness fields.
+    public static final int NUM_CC = 8;
+    public static boolean ccCalled0; public static int ccLen0; public static int ccCp0; public static boolean ccNull0; public static int ccSig0;
+    public static boolean ccCalled1; public static int ccLen1; public static int ccCp1; public static boolean ccNull1; public static int ccSig1;
+    public static boolean ccCalled2; public static int ccLen2; public static int ccCp2; public static boolean ccNull2; public static int ccSig2;
+    public static boolean ccCalled3; public static int ccLen3; public static int ccCp3; public static boolean ccNull3; public static int ccSig3;
+    public static boolean ccCalled4; public static int ccLen4; public static int ccCp4; public static boolean ccNull4; public static int ccSig4;
+    public static boolean ccCalled5; public static int ccLen5; public static int ccCp5; public static boolean ccNull5; public static int ccSig5;
+    public static boolean ccCalled6; public static int ccLen6; public static int ccCp6; public static boolean ccNull6; public static int ccSig6;
+    public static boolean ccCalled7; public static int ccLen7; public static int ccCp7; public static boolean ccNull7; public static int ccSig7;
+
     // =====================================================================
     //  Hooked methods.
     // =====================================================================
@@ -249,6 +280,50 @@ public final class MakeJavaString
             case 1: echoCalled1 = true; echoEq1 = eq; echoLen1 = len; echoNull1 = isNull; echoCp1 = cp; break;
             case 2: echoCalled2 = true; echoEq2 = eq; echoLen2 = len; echoNull2 = isNull; echoCp2 = cp; break;
             case 3: echoCalled3 = true; echoEq3 = eq; echoLen3 = len; echoNull3 = isNull; echoCp3 = cp; break;
+            default: break;
+        }
+        return len;
+    }
+
+    /**
+     * GENERIC content witness for a make_java_string product the native side
+     * built (often a string with no canonical constant — every-byte LATIN1, a
+     * dense BMP sweep, multiple astral code points, or an OVER-CAP string built
+     * through the NewString fallback).  Runs entirely in Java bytecode: walks
+     * {@code value} char-by-char and records into the per-{@code kind} witnesses
+     * its {@link String#length()}, {@link String#codePointCount(int,int)}, a
+     * null flag, and a position-weighted 32-bit content signature
+     * {@code sig = sig*131 + value.charAt(i)} over every UTF-16 code unit.  The
+     * native side computes the identical fold over the UTF-16 units it handed
+     * make_java_string and asserts both the length and the signature match, which
+     * proves — byte for byte — that the String the JVM sees is the exact content
+     * the encoder intended, even when the string is far too long for
+     * read_java_string's 4096 native readback ceiling.  Returns the observed
+     * length (-1 for null) so the call also exercises a primitive return.
+     */
+    public int checkContent(final int kind, final String value)
+    {
+        final boolean isNull = (value == null);
+        final int len = isNull ? -1 : value.length();
+        final int cp = isNull ? -1 : value.codePointCount(0, len);
+        int sig = 0;
+        if (!isNull)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                sig = (sig * 131) + value.charAt(i);
+            }
+        }
+        switch (kind)
+        {
+            case 0: ccCalled0 = true; ccLen0 = len; ccCp0 = cp; ccNull0 = isNull; ccSig0 = sig; break;
+            case 1: ccCalled1 = true; ccLen1 = len; ccCp1 = cp; ccNull1 = isNull; ccSig1 = sig; break;
+            case 2: ccCalled2 = true; ccLen2 = len; ccCp2 = cp; ccNull2 = isNull; ccSig2 = sig; break;
+            case 3: ccCalled3 = true; ccLen3 = len; ccCp3 = cp; ccNull3 = isNull; ccSig3 = sig; break;
+            case 4: ccCalled4 = true; ccLen4 = len; ccCp4 = cp; ccNull4 = isNull; ccSig4 = sig; break;
+            case 5: ccCalled5 = true; ccLen5 = len; ccCp5 = cp; ccNull5 = isNull; ccSig5 = sig; break;
+            case 6: ccCalled6 = true; ccLen6 = len; ccCp6 = cp; ccNull6 = isNull; ccSig6 = sig; break;
+            case 7: ccCalled7 = true; ccLen7 = len; ccCp7 = cp; ccNull7 = isNull; ccSig7 = sig; break;
             default: break;
         }
         return len;
