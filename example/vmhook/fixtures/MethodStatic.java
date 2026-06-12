@@ -7,27 +7,40 @@ import vmhook.Harness;
  *
  * Exercises {@code static_method("name")->call(args)} for STATIC Java methods
  * that return every JVM primitive (Z B S C I J F D), {@code java.lang.String},
- * and an object reference, and proves on a real JVM (genuine bytecode dispatch
- * via the Harness go/done handshake) that:
+ * an object reference, and array references, and proves on a real JVM (genuine
+ * bytecode dispatch via the Harness go/done handshake) that:
  *
  *   - the returned value_t decodes to the EXACT Java return value for each
  *     primitive width and boundary (min/max/-1/NaN/Inf/-0.0/65535 ...),
  *   - the String return decodes to the exact UTF-8 text (eager std::string
  *     alternative on both call paths),
- *   - the object return routes through the uint32/oop alternative (its full
- *     usability is JDK/call-path dependent and recorded as INFO, mirroring
+ *   - the object / array return routes through the uint32/oop alternative (its
+ *     full usability is JDK/call-path dependent and recorded as INFO, mirroring
  *     method_call_object),
  *   - NO RECEIVER is passed to a static method: the first declared argument
  *     occupies slot 0 (a {@code this} would have pushed it to slot 1), the
  *     proxy's receiver OOP is null, and a static method observably cannot and
  *     does not see any instance state,
+ *   - EVERY primitive (Z B S C I J F D incl. the two-slot wide long/double),
+ *     String, and object ARGUMENT round-trips: the static method echoes / records
+ *     exactly the value it received, proving the C++ arg-packer maps each type to
+ *     the right descriptor slot with no receiver shift,
+ *   - OVERLOADED static methods (same name, distinct signatures) resolve to the
+ *     RIGHT overload both by C++ argument TYPE and by an explicit
+ *     static_method(name, signature) pin (distinct return sentinels per overload),
+ *   - a static method that MUTATES a static field has its side effect observable,
  *   - {@code method_proxy::is_static()} returns TRUE for every static method and
- *     FALSE for every instance method (the recently-fixed accessor that reads
- *     JVM_ACC_STATIC straight from the live Method's _access_flags),
- *   - the audit's still-open flaw is exercised: {@code static_method("inst")}
- *     wrongly returns a proxy for an INSTANCE method (no JVM_ACC_STATIC filter
- *     on the static get_method path); the fixed is_static() accessor is what
- *     lets the native side DETECT that the wrongly-accepted proxy is non-static.
+ *     FALSE for every instance method (the accessor that reads JVM_ACC_STATIC
+ *     straight from the live Method's _access_flags),
+ *   - static_method() REJECTS an instance method of the same surface (the
+ *     JVM_ACC_STATIC gate on the static get_method path), and an instance wrapper's
+ *     get_method() of a STATIC method still dispatches statically (no receiver),
+ *   - a STATIC method on an INTERFACE (Java 8+), on an ABSTRACT class, on an ENUM,
+ *     and an INHERITED static (declared in a super, named through the sub — statics
+ *     are NOT polymorphic, so the sub sees the super's declaration) all resolve and
+ *     dispatch,
+ *   - first touch of a class through a static call triggers its {@code <clinit>}
+ *     (lazy class initialization) — characterized.
  *
  * Java 8 syntax only (no var / records / switch-expression / text blocks).
  * Only java.* + vmhook.Harness are referenced.
@@ -64,6 +77,24 @@ public final class MethodStatic
 
     /** Counts how many times the static recorder ran (allow-through proof). */
     public static volatile int   staticRecorderHits;
+
+    // ---- full-width single-argument echo recorders -----------------------
+    // One static field per primitive + String + object, written by the matching
+    // sEcho*/sRecord* method below so the native side can prove EACH argument
+    // type landed intact at parameter slot 0 with no receiver shift.
+    public static volatile boolean recordedBoolArg;
+    public static volatile byte    recordedByteArg;
+    public static volatile short   recordedShortArg;
+    public static volatile char    recordedCharArg;
+    public static volatile long    recordedEchoLong;   // sEchoLong only (distinct from recordedLongArg)
+    public static volatile float   recordedFloatArg;
+    public static volatile double  recordedDoubleArg;
+    public static volatile String  recordedStringArg;
+    /** identityHashCode of the last object argument sArgIdentity received. */
+    public static volatile int     recordedObjectIdentity;
+
+    /** A mutable static field a static method flips; the side effect is asserted. */
+    public static volatile int     mutableState;
 
     /**
      * An INSTANCE field with a poison value.  A correctly-dispatched STATIC
@@ -155,7 +186,41 @@ public final class MethodStatic
     public static final int STATIC_CHILD_SEED = 9090;
 
     // ======================================================================
-    //  STATIC argument-passing methods — these PROVE no receiver is passed.
+    //  STATIC ARRAY returners — the '[I' / '[Ljava/lang/String;' /
+    //  '[Ljava/lang/Object;' reference-return branches of value_t.
+    // ======================================================================
+
+    /** Length + element sentinels for the int[] returner (native mirrors them). */
+    public static final int  ARR_INT_LEN  = 4;
+    public static final int  ARR_INT_0    = 10;
+    public static final int  ARR_INT_1    = 20;
+    public static final int  ARR_INT_2    = 30;
+    public static final int  ARR_INT_3    = 40;
+
+    /** Static int[] return ('[I'). */
+    public static int[] sIntArray()
+    {
+        return new int[] { ARR_INT_0, ARR_INT_1, ARR_INT_2, ARR_INT_3 };
+    }
+
+    /** Static String[] return ('[Ljava/lang/String;'). */
+    public static String[] sStringArray()
+    {
+        return new String[] { "a0", "a1", "a2" };
+    }
+
+    /** Static Object[] return ('[Ljava/lang/Object;') holding tagged children. */
+    public static Object[] sObjectArray()
+    {
+        return new Object[] { sMakeChild(), sMakeChild() };
+    }
+
+    /** Static array return that is null (must yield a null unique_ptr). */
+    public static int[] sNullArray() { return null; }
+
+    // ======================================================================
+    //  STATIC argument-passing methods — these PROVE no receiver is passed
+    //  AND that EVERY argument type round-trips through the C++ arg-packer.
     // ======================================================================
 
     /**
@@ -165,6 +230,18 @@ public final class MethodStatic
      * dispatch returns exactly {@code v}.
      */
     public static int sEchoInt(final int v) { return v; }
+
+    // One echo returner per remaining primitive type + String.  Each RETURNS its
+    // argument so the native side proves the value survived the C++->JVM packing
+    // for that descriptor (Z B S C J F D, Ljava/lang/String;).
+    public static boolean sEchoBool(final boolean v)   { recordedBoolArg = v;   return v; }
+    public static byte    sEchoByte(final byte v)      { recordedByteArg = v;   return v; }
+    public static short   sEchoShort(final short v)    { recordedShortArg = v;  return v; }
+    public static char    sEchoChar(final char v)      { recordedCharArg = v;   return v; }
+    public static long    sEchoLong(final long v)      { recordedEchoLong = v;  return v; }
+    public static float   sEchoFloat(final float v)    { recordedFloatArg = v;  return v; }
+    public static double  sEchoDouble(final double v)  { recordedDoubleArg = v; return v; }
+    public static String  sEchoString(final String v)  { recordedStringArg = v; return v; }
 
     /**
      * Records its single int argument into a static field, so the native side
@@ -200,20 +277,58 @@ public final class MethodStatic
     }
 
     /**
-     * Returns the identity hash of the single argument it receives.  Used so
-     * the native side can confirm the object argument (not a receiver) reached
-     * the static method as parameter zero.
+     * Returns the identity hash of the single OBJECT argument it receives, and
+     * also stamps it into recordedObjectIdentity.  Used so the native side can
+     * confirm the object argument (not a receiver) reached the static method as
+     * parameter zero — a returned 0 means the arg was null.
      */
     public static int sArgIdentity(final MethodStatic arg)
     {
-        return (arg == null) ? 0 : System.identityHashCode(arg);
+        final int id = (arg == null) ? 0 : System.identityHashCode(arg);
+        recordedObjectIdentity = id;
+        return id;
+    }
+
+    /** Returns the length of an int[] argument (-1 for null) — array arg echo. */
+    public static int sArrayLen(final int[] arg)
+    {
+        return (arg == null) ? -1 : arg.length;
+    }
+
+    /** Sets mutableState to v and returns the PRIOR value — observable mutation. */
+    public static int sMutateState(final int v)
+    {
+        final int prior = mutableState;
+        mutableState = v;
+        ++staticRecorderHits;
+        return prior;
     }
 
     // ======================================================================
+    //  OVERLOADED static methods — all named "sPoly", told apart by signature.
+    //  Each returns a DISTINCT sentinel so the native side proves WHICH overload
+    //  resolved, both by C++ argument type and by an explicit signature pin.
+    //  Declaration order is scrambled relative to descriptor sort order so the
+    //  resolver cannot depend on source order.
+    // ======================================================================
+
+    public static final int POLY_INT    = 7001;  // sPoly(int)    -> (I)I
+    public static final int POLY_LONG   = 7002;  // sPoly(long)   -> (J)I
+    public static final int POLY_DOUBLE = 7003;  // sPoly(double) -> (D)I
+    public static final int POLY_STRING = 7004;  // sPoly(String) -> (Ljava/lang/String;)I
+    public static final int POLY_INT2   = 7005;  // sPoly(int,int)-> (II)I
+
+    public static int sPoly(final int a)               { return POLY_INT; }
+    public static int sPoly(final String a)            { return POLY_STRING; }
+    public static int sPoly(final long a)              { return POLY_LONG; }
+    public static int sPoly(final double a)            { return POLY_DOUBLE; }
+    public static int sPoly(final int a, final int b)  { return POLY_INT2; }
+
+    // ======================================================================
     //  INSTANCE methods — used to prove is_static() == FALSE for non-static,
-    //  and to exercise the audit's "static_method wrongly accepts an instance
-    //  method" flaw (Bug #2).  Names are deliberately distinct from the static
-    //  ones so the native side can target each precisely.
+    //  and that static_method() REJECTS an instance method.  Names are
+    //  deliberately distinct from the static ones so the native side can target
+    //  each precisely.
     // ======================================================================
 
     /** Instance int returner (is_static() must be false). */
@@ -227,6 +342,103 @@ public final class MethodStatic
 
     /** Instance void method (is_static() must be false). */
     public void iTouch() { this.instancePoison = 0; }
+
+    // ======================================================================
+    //  INHERITED-STATIC: a base class declares a static method; this class
+    //  does NOT redeclare it.  Statics are NOT polymorphic — naming it through
+    //  the SUB resolves the SUPER's single declaration (the superclass-chain
+    //  walk in the static get_method path).  StaticSub extends StaticBase so the
+    //  native side can register a wrapper for the SUB and still reach the
+    //  inherited static.
+    // ======================================================================
+
+    public static class StaticBase
+    {
+        public static final int BASE_STATIC_VALUE = 0x5151;  // 20817
+
+        /** Declared ONLY here; reachable through StaticSub via inheritance. */
+        public static int baseStaticValue() { return BASE_STATIC_VALUE; }
+
+        /** An instance method, so a StaticSub wrapper has a non-static to check. */
+        public int baseInstanceSeed() { return 1717; }
+    }
+
+    /** Subclass that adds NO static of its own — inherits baseStaticValue(). */
+    public static class StaticSub extends StaticBase
+    {
+        public static final int SUB_STATIC_VALUE = 0x6262;   // 25186
+
+        /** A static declared on the SUB itself (distinct from the inherited one). */
+        public static int subStaticValue() { return SUB_STATIC_VALUE; }
+    }
+
+    // ======================================================================
+    //  ABSTRACT class with a STATIC method (statics are independent of the
+    //  abstract-ness; the static dispatches without any instance).
+    // ======================================================================
+
+    public abstract static class AbstractWithStatic
+    {
+        public static final int ABSTRACT_STATIC_VALUE = 0x7373;  // 29555
+
+        public static int abstractStaticValue() { return ABSTRACT_STATIC_VALUE; }
+
+        /** The abstract instance method — never called by the native side. */
+        public abstract int mustImplement();
+    }
+
+    // ======================================================================
+    //  INTERFACE with a STATIC method (Java 8+).  A static interface method
+    //  lives on the interface's own _methods array; the native side registers a
+    //  wrapper for the INTERFACE itself and resolves it directly (it is NOT
+    //  inherited by implementors, by JLS, so resolving it through the interface
+    //  klass is the only correct path).
+    // ======================================================================
+
+    public interface StaticIface
+    {
+        int IFACE_STATIC_VALUE = 0x8484;  // 33924  (interface fields are implicitly static final)
+
+        static int ifaceStaticValue() { return IFACE_STATIC_VALUE; }
+    }
+
+    // ======================================================================
+    //  ENUM with a STATIC method (in addition to the implicit values()/valueOf).
+    // ======================================================================
+
+    public enum StaticEnum
+    {
+        ALPHA, BETA, GAMMA;
+
+        public static final int ENUM_STATIC_VALUE = 0x9595;  // 38293
+
+        public static int enumStaticValue() { return ENUM_STATIC_VALUE; }
+    }
+
+    // ======================================================================
+    //  <clinit> characterization: a class whose static initializer flips a
+    //  sentinel.  The probe LOADS it without initializing (Class.forName with
+    //  initialize=false) so the native wrapper can resolve the klass, but its
+    //  <clinit> stays pending until the FIRST static call touches a static
+    //  member — at which point clinitValue() returns the post-<clinit> sentinel.
+    // ======================================================================
+
+    public static final class ClinitProbe
+    {
+        /** Set to true only by the static initializer below. */
+        public static volatile boolean initialized;
+
+        /** The value <clinit> stamps; clinitValue() returns it. */
+        public static final int CLINIT_VALUE = 0xC11C;  // 49436
+
+        static
+        {
+            initialized = true;
+        }
+
+        /** First call triggers <clinit>; returns the post-init sentinel. */
+        public static int clinitValue() { return CLINIT_VALUE; }
+    }
 
     static
     {
@@ -253,6 +465,36 @@ public final class MethodStatic
                 recordedFirstOfThree = 0;
                 recordedSecondOfThree = 0L;
                 recordedThirdOfThree = 0;
+                mutableState = 0;
+
+                // Make sure the auxiliary klasses the native side wraps are
+                // LOADED (so register_class<>'s ClassLoaderDataGraph walk finds
+                // them) before the detour resolves them.  Referencing a static
+                // field both loads AND initializes these — that is intentional
+                // for the inherited / abstract / interface / enum cases (their
+                // static methods are about RESOLUTION + DISPATCH, not <clinit>
+                // timing).
+                int warm = 0;
+                warm += StaticSub.SUB_STATIC_VALUE;
+                warm += StaticBase.BASE_STATIC_VALUE;
+                warm += AbstractWithStatic.ABSTRACT_STATIC_VALUE;
+                warm += StaticIface.IFACE_STATIC_VALUE;
+                warm += StaticEnum.ENUM_STATIC_VALUE;
+                if (warm == Integer.MIN_VALUE) { throw new IllegalStateException("unreachable"); }
+
+                // The <clinit> probe is handled differently: LOAD it without
+                // INITIALIZING (initialize=false) so its <clinit> stays pending
+                // for the native side's first static call to trigger.  The class
+                // must be loaded so register_class<> can resolve the klass.
+                try
+                {
+                    Class.forName("vmhook.fixtures.MethodStatic$ClinitProbe",
+                                  false, MethodStatic.class.getClassLoader());
+                }
+                catch (final ClassNotFoundException ex)
+                {
+                    System.err.println("ClinitProbe load failed: " + ex);
+                }
 
                 final MethodStatic instance = new MethodStatic();
                 instance.trigger(7);

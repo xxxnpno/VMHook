@@ -1,45 +1,52 @@
 // method_static — exhaustive JVM tests for the STATIC-method call surface:
 //   static_method("name")->call(args)   on vmhook::object<T>.
 //
-// Feature lives in vmhook/ext/vmhook/vmhook.hpp (line numbers verified against
-// the current file; the static get_method path now has a JVM_ACC_STATIC filter
-// via object_base::static_method_only()):
-//   * object<T>::static_method(name)            : 16092-16097
-//   * object<T>::static_method(name, signature) : 16101-16106
-//   * object_base::get_method(type_index,name)        (static path) : 15800-15837
-//   * object_base::get_method(type_index,name,sig)    (static path) : 15853-15897
-//   * object_base::static_method_only() (the ACC_STATIC gate)       : ~15956-15971
-//   * method_proxy::is_static()  (reads JVM_ACC_STATIC)             : 14976-14987
-//   * method_proxy::get_compressed_oop() (receiver OOP, 0 if null)  : 15021
-//   * method_proxy::call()      (interpreter fast path + decode)    : 14687
-//   * method_proxy::call_jni()  (JNI fallback; static dispatch slots
-//                                116/119/122/125/128/131/134/137/140/143) : 14057
-//   * value_t::is_void() / is_string() / as_string()                : 13978/13986/14004
+// Feature lives in vmhook/ext/vmhook/vmhook.hpp.  Authoritative anchors (read &
+// verified against the current file; do NOT trust older line citations):
+//   * object<T>::static_method(name)             -> object_base::get_method(type_index,name)
+//   * object<T>::static_method(name, signature)  -> object_base::get_method(type_index,name,sig)
+//   * object_base::get_method(type_index,name)        (static path, super-chain walk,
+//        first STATIC name match, builds method_proxy{nullptr,...})
+//   * object_base::get_method(type_index,name,sig)    (static path, name+sig, STATIC only)
+//   * object_base::static_method_only()  (the JVM_ACC_STATIC 0x0008 gate; fails CLOSED)
+//   * method_proxy::is_static()          (reads JVM_ACC_STATIC from the live Method)
+//   * method_proxy::get_compressed_oop() (receiver OOP; 0 when object==nullptr)
+//   * method_proxy::call()      (interpreter call-stub fast path + return decode)
+//   * method_proxy::call_jni()  (JNI fallback; is_static_call = object==nullptr || is_static();
+//        static JNI dispatch slots 116/119/122/125/128/131/134/137/140/143)
+//   * value_t::is_void() / is_string() / as_string()
+//   * vmhook::array_length / get_array_element (array-return element walks)
 //
-// WHAT THIS MODULE PROVES (the method_static contract), each as ctx.check():
-//   1. static_method("m")->call() returns the EXACT Java value for every
-//      primitive return type (Z B S C I J F D) at boundary values, plus void.
-//   2. static String returns decode to exact UTF-8 (as_string()); empty and
-//      null are distinguished and never crash.
-//   3. static object returns route through the oop/uint32 value_t alternative;
-//      a null object return is ALWAYS a null unique_ptr (hard assert), while the
-//      full usable-wrapper contract is call-path dependent (recorded as INFO on
-//      the JDK-21 call_jni path, mirroring method_call_object).
-//   4. NO RECEIVER is passed to a static method: the first declared argument
-//      lands at parameter slot 0 (a `this` would shift it), the proxy's receiver
-//      OOP is null (get_compressed_oop()==0), and static recorders observe the
-//      exact args at the right slots across the J/D two-slot boundary.
-//   5. method_proxy::is_static() == TRUE for every static method and == FALSE
-//      for every instance method (the recently-fixed accessor that reads
-//      JVM_ACC_STATIC from the live Method's _access_flags, NOT the dead
-//      constructor member).
-//   6. Robustness #6 (FIXED): the static get_method path now applies a
-//      JVM_ACC_STATIC filter (static_method_only()), so
-//      static_method("instanceMethod").has_value() == false while a real static
-//      method still resolves.  HARD-asserted both ways, plus a positive control.
+// WHAT THIS MODULE PROVES (the method_static contract).  Two families of check:
+//   ms_*    — the original surface (primitive/String/object returns, no-receiver,
+//             is_static(), the ACC_STATIC instance-rejection gate, name+sig pin).
+//   mstat_* — the EXHAUSTIVE expansion added on top:
+//      A. every NON-int primitive ARGUMENT (Z B S C J F D) + String + Object echoes
+//         back exactly (the C++ arg-packer maps each descriptor slot, no shift),
+//      B. ARRAY returns ([I / [Ljava/lang/String; / [Ljava/lang/Object; / null) and
+//         an array ARGUMENT length echo,
+//      C. OVERLOADED static methods resolved by C++ arg TYPE and by explicit
+//         static_method(name, signature) — distinct sentinel per overload,
+//      D. a static method that MUTATES a static field (observable side effect),
+//      E. an instance wrapper's get_method() of a STATIC method dispatches
+//         statically (is_static()==true, no receiver) — the "vice-versa" of the
+//         instance-rejection gate,
+//      F. STATIC method on an INTERFACE (Java 8+), on an ABSTRACT class, on an
+//         ENUM, and an INHERITED static (declared in a super, named through the
+//         sub — statics are not polymorphic),
+//      G. first touch of a class via a static call triggers its <clinit>
+//         (characterized).
+//
+// Object/array USABILITY is call-path dependent (call_stub fast path vs JDK-21
+// call_jni): every such assertion gates on `call_stub_present` and is recorded as
+// INFO on the JNI path, exactly mirroring method_call_object / enum_singleton.
+// Path-INDEPENDENT invariants (right value/overload, type routing, is_static,
+// null->null uptr, no crash) are HARD-asserted on every path.
 //
 // Everything runs inside ONE detour on trigger(int) — the only context where
-// current_java_thread is set so method_proxy::call() may dispatch.
+// current_java_thread is set so method_proxy::call() may dispatch.  The module
+// body ends with an unconditional shutdown_hooks() OUTSIDE the try-equivalent so
+// ZERO hooks stay armed for later modules (suite-safety).
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
@@ -75,8 +82,84 @@ namespace
         static auto get_recorded_second() -> std::int64_t      { return static_field("recordedSecondOfThree")->get(); }
         static auto get_recorded_third() -> std::int32_t       { return static_field("recordedThirdOfThree")->get(); }
 
+        // full-width single-arg echo recorders (read back to prove the arg landed)
+        static auto get_recorded_bool() -> bool                { return static_field("recordedBoolArg")->get(); }
+        static auto get_recorded_byte() -> std::int8_t         { return static_field("recordedByteArg")->get(); }
+        static auto get_recorded_short() -> std::int16_t       { return static_field("recordedShortArg")->get(); }
+        static auto get_recorded_char() -> std::uint16_t       { return static_field("recordedCharArg")->get(); }
+        static auto get_recorded_echo_long() -> std::int64_t   { return static_field("recordedEchoLong")->get(); }
+        static auto get_recorded_float() -> float              { return static_field("recordedFloatArg")->get(); }
+        static auto get_recorded_double() -> double            { return static_field("recordedDoubleArg")->get(); }
+        static auto get_recorded_string() -> std::string       { return static_field("recordedStringArg")->get(); }
+        static auto get_mutable_state() -> std::int32_t        { return static_field("mutableState")->get(); }
+
         // Reads this instance's own seed (proves a returned wrapper is usable).
         auto seed() const -> std::int32_t { return get_field("seed")->get(); }
+    };
+
+    // Bare carrier for an arbitrary Java oop / array oop.  call()'s arg-packer
+    // sends any object_base-derived arg as a raw oop (get_instance()), so wrapping
+    // an oop here lets us pass an Object / array argument into a static method.
+    class oop_carrier : public vmhook::object<oop_carrier>
+    {
+    public:
+        explicit oop_carrier(vmhook::oop_t instance) noexcept
+            : vmhook::object<oop_carrier>{ instance }
+        {
+        }
+    };
+
+    // Wrapper for the inherited-static subclass  MethodStatic$StaticSub.
+    class static_sub : public vmhook::object<static_sub>
+    {
+    public:
+        explicit static_sub(vmhook::oop_t instance) noexcept
+            : vmhook::object<static_sub>{ instance }
+        {
+        }
+    };
+
+    // Wrapper for the abstract class with a static  MethodStatic$AbstractWithStatic.
+    class abstract_with_static : public vmhook::object<abstract_with_static>
+    {
+    public:
+        explicit abstract_with_static(vmhook::oop_t instance) noexcept
+            : vmhook::object<abstract_with_static>{ instance }
+        {
+        }
+    };
+
+    // Wrapper for the interface with a static  MethodStatic$StaticIface (Java 8+).
+    class static_iface : public vmhook::object<static_iface>
+    {
+    public:
+        explicit static_iface(vmhook::oop_t instance) noexcept
+            : vmhook::object<static_iface>{ instance }
+        {
+        }
+    };
+
+    // Wrapper for the enum with a static  MethodStatic$StaticEnum.
+    class static_enum : public vmhook::object<static_enum>
+    {
+    public:
+        explicit static_enum(vmhook::oop_t instance) noexcept
+            : vmhook::object<static_enum>{ instance }
+        {
+        }
+    };
+
+    // Wrapper for the <clinit> probe  MethodStatic$ClinitProbe.
+    class clinit_probe : public vmhook::object<clinit_probe>
+    {
+    public:
+        explicit clinit_probe(vmhook::oop_t instance) noexcept
+            : vmhook::object<clinit_probe>{ instance }
+        {
+        }
+        // Reads the <clinit>-set sentinel via a RAW static-field read, which does
+        // NOT run <clinit> (so it can observe the pre-init state).
+        static auto get_initialized() -> bool { return static_field("initialized")->get(); }
     };
 
     // ---- raw-bit capture so NaN / Inf / -0.0 survive the atomic round-trip --
@@ -108,6 +191,28 @@ namespace
     // Sentinel no Java boundary value collides with.
     constexpr std::int64_t k_uncaptured = static_cast<std::int64_t>(0xDEADBEEFCAFEF00Dull);
     constexpr std::int32_t k_static_child_seed = 9090;
+
+    // -- overloaded-static sentinels (mirror MethodStatic.POLY_*) --
+    constexpr std::int32_t k_poly_int    = 7001;
+    constexpr std::int32_t k_poly_long   = 7002;
+    constexpr std::int32_t k_poly_double = 7003;
+    constexpr std::int32_t k_poly_string = 7004;
+    constexpr std::int32_t k_poly_int2   = 7005;
+
+    // -- inherited/abstract/interface/enum/clinit sentinels (mirror the fixture) --
+    constexpr std::int32_t k_base_static     = 0x5151;  // 20817
+    constexpr std::int32_t k_sub_static      = 0x6262;  // 25186
+    constexpr std::int32_t k_abstract_static = 0x7373;  // 29555
+    constexpr std::int32_t k_iface_static    = 0x8484;  // 33924
+    constexpr std::int32_t k_enum_static     = 0x9595;  // 38293
+    constexpr std::int32_t k_clinit_value    = 0xC11C;  // 49436
+
+    // -- array-return sentinels (mirror the fixture) --
+    constexpr std::int32_t k_arr_int_len = 4;
+    constexpr std::int32_t k_arr_int_0   = 10;
+    constexpr std::int32_t k_arr_int_3   = 40;
+    constexpr std::int32_t k_arr_str_len = 3;
+    constexpr std::int32_t k_arr_obj_len = 2;
 
     // ------------------------------------------------------------------
     //  Captured observations.  The detour writes; the module body reads.
@@ -192,11 +297,7 @@ namespace
     std::atomic<int>  g_isstatic_itouch{ -1 };
     std::atomic<int>  g_isstatic_trigger{ -1 }; // the hooked instance method -> false
 
-    // -- Robustness #6 (FIXED): static_method() must REJECT instance methods.
-    // The static get_method path now applies a JVM_ACC_STATIC filter, so
-    // static_method("instanceMethod").has_value() == false.  These probe the
-    // rejection (has_value -> 0) plus a real-static positive control so the
-    // assertion can't pass merely because resolution is broken for everything.
+    // -- static_method() must REJECT instance methods (JVM_ACC_STATIC gate). --
     std::atomic<int>  g_flaw_iget_has_value{ -1 };       // static_method("iGetSeed").has_value() -> 0
     std::atomic<int>  g_flaw_iget_is_static{ -1 };       // ...is_static() on it -> 0 (never static)
     std::atomic<int>  g_flaw_iecho_has_value{ -1 };      // static_method("iEcho").has_value()    -> 0
@@ -206,6 +307,92 @@ namespace
     // -- signature-overload accessor: static_method(name, sig) --
     std::atomic<std::int64_t> g_sig_echo_ret{ k_uncaptured };  // static_method("sEchoInt","(I)I")
     std::atomic<int>  g_sig_isstatic{ -1 };
+
+    // ===================== mstat_* EXHAUSTIVE EXPANSION =====================
+
+    // (A) every non-int primitive + String + object ARGUMENT echo round-trip.
+    std::atomic<int>          g_arg_bool_ret{ -1 };        // sEchoBool(true)  -> 1
+    std::atomic<int>          g_arg_bool_field{ -1 };
+    std::atomic<std::int64_t> g_arg_byte_ret{ k_uncaptured };   // sEchoByte(-7)
+    std::atomic<std::int64_t> g_arg_byte_field{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_short_ret{ k_uncaptured };  // sEchoShort(-12345)
+    std::atomic<std::int64_t> g_arg_short_field{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_char_ret{ k_uncaptured };   // sEchoChar(0xBEEF)
+    std::atomic<std::int64_t> g_arg_char_field{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_long_ret{ k_uncaptured };   // sEchoLong(big)
+    std::atomic<std::int64_t> g_arg_long_field{ k_uncaptured };
+    std::atomic<std::uint32_t> g_arg_float_ret{ 0 };            // sEchoFloat(-0.0f) raw bits
+    std::atomic<std::uint32_t> g_arg_float_field{ 0 };
+    std::atomic<std::uint64_t> g_arg_double_ret{ 0 };          // sEchoDouble(pi) raw bits
+    std::atomic<std::uint64_t> g_arg_double_field{ 0 };
+    std::atomic<bool>         g_arg_string_captured{ false };
+    std::string               g_arg_string_ret;               // sEchoString("round-trip")
+    std::string               g_arg_string_field;
+    std::atomic<int>          g_arg_object_identity_nonzero{ -1 }; // sArgIdentity(self) != 0
+    std::atomic<int>          g_arg_object_field_matches{ -1 };    // field == returned id
+    std::atomic<int>          g_arg_object_null_zero{ -1 };        // sArgIdentity(null) == 0
+
+    // (B) array returns + array argument.
+    std::atomic<int> g_arr_int_resolves{ -1 };
+    std::atomic<int> g_arr_int_not_string{ -1 };   // path-independent: [I is not a String
+    std::atomic<int> g_arr_int_not_void{ -1 };     // non-null array: is_void()==false (path-dep)
+    std::atomic<int> g_arr_int_len_ok{ -1 };       // array_length == 4 (path-dep)
+    std::atomic<int> g_arr_int_elems_ok{ -1 };     // elem[0]==10 && elem[3]==40 (path-dep)
+    std::atomic<int> g_arr_str_resolves{ -1 };
+    std::atomic<int> g_arr_str_len_ok{ -1 };       // length 3 (path-dep)
+    std::atomic<int> g_arr_obj_resolves{ -1 };
+    std::atomic<int> g_arr_obj_len_ok{ -1 };       // length 2 (path-dep)
+    std::atomic<bool> g_arr_null_is_null_uptr{ false }; // sNullArray -> null uptr (hard)
+    std::atomic<int>  g_arr_arg_attempted{ 0 };         // 1 once the fresh int[] alloc succeeded
+    std::atomic<std::int64_t> g_arr_arg_len_ret{ k_uncaptured }; // sArrayLen(int[]) -> 4 (path-indep)
+
+    // (C) overloaded static resolution.
+    std::atomic<int> g_poly_by_int{ -1 };       // sPoly(int)    -> POLY_INT
+    std::atomic<int> g_poly_by_long{ -1 };      // sPoly(int64)  -> POLY_LONG
+    std::atomic<int> g_poly_by_double{ -1 };    // sPoly(double) -> POLY_DOUBLE
+    std::atomic<int> g_poly_by_string{ -1 };    // sPoly(string) -> POLY_STRING
+    std::atomic<int> g_poly_by_int2{ -1 };      // sPoly(int,int)-> POLY_INT2
+    std::atomic<int> g_poly_sig_int{ -1 };      // static_method("sPoly","(I)I")    -> POLY_INT
+    std::atomic<int> g_poly_sig_long{ -1 };     // static_method("sPoly","(J)I")    -> POLY_LONG
+    std::atomic<int> g_poly_sig_string{ -1 };   // static_method("sPoly","(Ljava/lang/String;)I") -> POLY_STRING
+
+    // (D) static-field mutation side effect.
+    std::atomic<int> g_mutate_prior{ -1 };      // sMutateState(0x1357) returns prior (0 after reset)
+    std::atomic<int> g_mutate_observed{ -1 };   // mutableState field now == 0x1357
+
+    // (E) instance wrapper's get_method() of a STATIC method dispatches statically.
+    // NOTE: a proxy built by instance->get_method("staticX") KEEPS the instance as
+    // its stored receiver (this->object), so get_compressed_oop() is the instance's
+    // (NON-zero) oop — the "no receiver" decision is made at CALL time via
+    // is_static() (object==nullptr || is_static()), NOT by a nulled receiver oop.
+    // So we characterize the oop as non-zero and rely on is_static()/return for the
+    // real contract.  (Contrast static_method("staticX"), whose receiver IS null.)
+    std::atomic<int> g_inst_static_resolves{ -1 };   // self->get_method("sIntFortyTwo").has_value()
+    std::atomic<int> g_inst_static_is_static{ -1 };  // ...is_static() == true
+    std::atomic<int> g_inst_static_oop_nonzero{ -1 }; // ...get_compressed_oop()!=0 (carries the wrapper oop)
+    std::atomic<std::int64_t> g_inst_static_ret{ k_uncaptured }; // ...call() == 42
+
+    // (F) static on interface / abstract / enum / inherited.
+    std::atomic<int> g_iface_resolves{ -1 };
+    std::atomic<int> g_iface_is_static{ -1 };
+    std::atomic<std::int64_t> g_iface_ret{ k_uncaptured };       // ifaceStaticValue() -> 0x8484
+    std::atomic<int> g_abstract_resolves{ -1 };
+    std::atomic<int> g_abstract_is_static{ -1 };
+    std::atomic<std::int64_t> g_abstract_ret{ k_uncaptured };    // abstractStaticValue() -> 0x7373
+    std::atomic<int> g_enum_resolves{ -1 };
+    std::atomic<int> g_enum_is_static{ -1 };
+    std::atomic<std::int64_t> g_enum_ret{ k_uncaptured };        // enumStaticValue() -> 0x9595
+    std::atomic<int> g_sub_own_resolves{ -1 };                   // subStaticValue() on the sub
+    std::atomic<std::int64_t> g_sub_own_ret{ k_uncaptured };     // -> 0x6262
+    std::atomic<int> g_inherited_resolves{ -1 };                 // baseStaticValue() VIA the sub wrapper
+    std::atomic<int> g_inherited_is_static{ -1 };
+    std::atomic<std::int64_t> g_inherited_ret{ k_uncaptured };   // -> 0x5151 (super's declaration)
+
+    // (G) <clinit> characterization.
+    std::atomic<int> g_clinit_pre_initialized{ -1 };  // initialized field BEFORE the static call
+    std::atomic<int> g_clinit_resolves{ -1 };
+    std::atomic<std::int64_t> g_clinit_ret{ k_uncaptured };  // clinitValue() -> 0xC11C (proves <clinit> ran)
+    std::atomic<int> g_clinit_post_initialized{ -1 }; // initialized field AFTER the static call -> 1
 
     auto run_all_calls(const std::unique_ptr<method_static>& self) -> void
     {
@@ -344,13 +531,7 @@ namespace
             g_isstatic_trigger.store(self->get_method("trigger")->is_static() ? 1 : 0);
         }
 
-        // ============ Robustness #6 (FIXED): static_method REJECTS instance =====
-        // The static get_method path now applies a JVM_ACC_STATIC filter, so
-        // static_method("iGetSeed") / static_method("iEcho") — both INSTANCE
-        // methods on this class — resolve to an EMPTY optional.  is_static() on
-        // an empty optional is never reached, so it stays 0.  The positive
-        // control proves a real static method STILL resolves through the same
-        // path (so the rejection isn't just "resolution is broken for all").
+        // ============ static_method REJECTS instance methods (ACC_STATIC gate) ==
         {
             auto flaw_iget = method_static::static_method("iGetSeed");
             g_flaw_iget_has_value.store(flaw_iget.has_value() ? 1 : 0);
@@ -374,6 +555,248 @@ namespace
             }
         }
 
+        // ================================================================
+        //  (A) EVERY non-int primitive + String + object ARGUMENT echo
+        // ================================================================
+        g_arg_bool_ret.store(method_static::static_method("sEchoBool")->call(true) ? 1 : 0);
+        g_arg_bool_field.store(method_static::get_recorded_bool() ? 1 : 0);
+
+        g_arg_byte_ret.store(static_cast<std::int8_t>(
+            method_static::static_method("sEchoByte")->call(std::int8_t{ -7 })));
+        g_arg_byte_field.store(method_static::get_recorded_byte());
+
+        g_arg_short_ret.store(static_cast<std::int16_t>(
+            method_static::static_method("sEchoShort")->call(std::int16_t{ -12345 })));
+        g_arg_short_field.store(method_static::get_recorded_short());
+
+        g_arg_char_ret.store(static_cast<std::uint16_t>(
+            method_static::static_method("sEchoChar")->call(std::uint16_t{ 0xBEEF })));
+        g_arg_char_field.store(method_static::get_recorded_char());
+
+        g_arg_long_ret.store(static_cast<std::int64_t>(
+            method_static::static_method("sEchoLong")->call(std::int64_t{ 0x7766554433221100LL })));
+        g_arg_long_field.store(method_static::get_recorded_echo_long());
+
+        g_arg_float_ret.store(f2bits(static_cast<float>(
+            method_static::static_method("sEchoFloat")->call(-0.0f))));
+        g_arg_float_field.store(f2bits(method_static::get_recorded_float()));
+
+        g_arg_double_ret.store(d2bits(static_cast<double>(
+            method_static::static_method("sEchoDouble")->call(3.141592653589793))));
+        g_arg_double_field.store(d2bits(method_static::get_recorded_double()));
+
+        {
+            const auto v = method_static::static_method("sEchoString")->call(std::string{ "round-trip" });
+            g_arg_string_ret = v.as_string();
+            g_arg_string_field = method_static::get_recorded_string();
+            g_arg_string_captured.store(true);
+        }
+
+        // Object argument: pass `self` as an oop_carrier and confirm the static
+        // method saw a non-null object at slot 0 (its identity hash is non-zero
+        // and matches what it stamped).  Then pass null -> identity 0.
+        if (self)
+        {
+            auto carrier{ std::make_unique<oop_carrier>(self->get_instance()) };
+            const std::int32_t id = method_static::static_method("sArgIdentity")->call(std::move(carrier));
+            g_arg_object_identity_nonzero.store(id != 0 ? 1 : 0);
+            const std::int32_t recorded_id{ method_static::static_field("recordedObjectIdentity")->get() };
+            g_arg_object_field_matches.store(recorded_id == id ? 1 : 0);
+        }
+        {
+            std::unique_ptr<oop_carrier> none{};   // null oop -> Java null arg
+            const std::int32_t id0 = method_static::static_method("sArgIdentity")->call(std::move(none));
+            g_arg_object_null_zero.store(id0 == 0 ? 1 : 0);
+        }
+
+        // ================================================================
+        //  (B) ARRAY returns + array argument
+        // ================================================================
+        {
+            auto m_int_arr = method_static::static_method("sIntArray");
+            g_arr_int_resolves.store(m_int_arr.has_value() ? 1 : 0);
+            if (m_int_arr)
+            {
+                const auto v = m_int_arr->call();
+                g_arr_int_not_string.store(v.is_string() ? 0 : 1);
+                g_arr_int_not_void.store(v.is_void() ? 0 : 1);
+                void* const arr = v;
+                if (arr != nullptr && vmhook::hotspot::is_valid_pointer(arr))
+                {
+                    g_arr_int_len_ok.store(vmhook::array_length(arr) == k_arr_int_len ? 1 : 0);
+                    const std::int32_t e0 = vmhook::get_array_element<std::int32_t>(arr, 0);
+                    const std::int32_t e3 = vmhook::get_array_element<std::int32_t>(arr, 3);
+                    g_arr_int_elems_ok.store((e0 == k_arr_int_0 && e3 == k_arr_int_3) ? 1 : 0);
+                }
+            }
+
+            // array ARGUMENT echo (path-INDEPENDENT): allocate a FRESH int[4]
+            // through the library's make_java_array (the canonical native-array
+            // path, mirrors method_overload), wrap the oop, and pass it to
+            // sArrayLen(int[]).  An object/array ARGUMENT is sent as a raw oop and
+            // consumed correctly on BOTH the call_stub and call_jni paths (only
+            // object RETURNS are call-path dependent), so this is hard-asserted —
+            // guarded only on allocation success (never faults, never false-fails).
+            {
+                void* const fresh_int_arr{
+                    vmhook::make_java_array("[I", k_arr_int_len, sizeof(std::int32_t)) };
+                if (fresh_int_arr && vmhook::hotspot::is_valid_pointer(fresh_int_arr))
+                {
+                    g_arr_arg_attempted.store(1);
+                    auto arr_carrier{ std::make_unique<oop_carrier>(fresh_int_arr) };
+                    g_arr_arg_len_ret.store(static_cast<std::int32_t>(
+                        method_static::static_method("sArrayLen")->call(std::move(arr_carrier))));
+                }
+            }
+
+            auto m_str_arr = method_static::static_method("sStringArray");
+            g_arr_str_resolves.store(m_str_arr.has_value() ? 1 : 0);
+            if (m_str_arr)
+            {
+                void* const arr = m_str_arr->call();
+                if (arr != nullptr && vmhook::hotspot::is_valid_pointer(arr))
+                {
+                    g_arr_str_len_ok.store(vmhook::array_length(arr) == k_arr_str_len ? 1 : 0);
+                }
+            }
+
+            auto m_obj_arr = method_static::static_method("sObjectArray");
+            g_arr_obj_resolves.store(m_obj_arr.has_value() ? 1 : 0);
+            if (m_obj_arr)
+            {
+                void* const arr = m_obj_arr->call();
+                if (arr != nullptr && vmhook::hotspot::is_valid_pointer(arr))
+                {
+                    g_arr_obj_len_ok.store(vmhook::array_length(arr) == k_arr_obj_len ? 1 : 0);
+                }
+            }
+
+            // Null array return MUST be a null unique_ptr (path-independent).
+            std::unique_ptr<oop_carrier> null_arr = method_static::static_method("sNullArray")->call();
+            g_arr_null_is_null_uptr.store(null_arr == nullptr, std::memory_order_relaxed);
+        }
+
+        // ================================================================
+        //  (C) OVERLOADED static resolution — by arg TYPE and by signature
+        // ================================================================
+        g_poly_by_int.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly")->call(std::int32_t{ 1 })));
+        g_poly_by_long.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly")->call(std::int64_t{ 2 })));
+        g_poly_by_double.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly")->call(3.5)));
+        g_poly_by_string.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly")->call(std::string{ "x" })));
+        g_poly_by_int2.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly")->call(std::int32_t{ 4 }, std::int32_t{ 5 })));
+
+        g_poly_sig_int.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly", "(I)I")->call(std::int32_t{ 9 })));
+        g_poly_sig_long.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly", "(J)I")->call(std::int64_t{ 9 })));
+        g_poly_sig_string.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly", "(Ljava/lang/String;)I")->call(std::string{ "y" })));
+
+        // ================================================================
+        //  (D) static-field MUTATION side effect
+        // ================================================================
+        // mutableState was reset to 0 by run(); sMutateState returns the prior
+        // value (0) and sets it to 0x1357 — then we read the field back.
+        g_mutate_prior.store(static_cast<std::int32_t>(
+            method_static::static_method("sMutateState")->call(std::int32_t{ 0x1357 })));
+        g_mutate_observed.store(method_static::get_mutable_state() == 0x1357 ? 1 : 0);
+
+        // ================================================================
+        //  (E) instance wrapper's get_method() of a STATIC method dispatches
+        //      statically (the "vice-versa" of the instance-rejection gate)
+        // ================================================================
+        if (self)
+        {
+            auto p = self->get_method("sIntFortyTwo");   // STATIC method via INSTANCE wrapper
+            g_inst_static_resolves.store(p.has_value() ? 1 : 0);
+            if (p)
+            {
+                g_inst_static_is_static.store(p->is_static() ? 1 : 0);
+                // The proxy carries the instance oop (receiver), so this is NON-zero;
+                // the static dispatch still passes NO receiver because is_static()
+                // is true (decided at call time).  See the global's note.
+                g_inst_static_oop_nonzero.store(p->get_compressed_oop() != 0u ? 1 : 0);
+                g_inst_static_ret.store(static_cast<std::int32_t>(p->call()));
+            }
+        }
+
+        // ================================================================
+        //  (F) STATIC on interface / abstract / enum / inherited
+        // ================================================================
+        {
+            auto p = static_iface::static_method("ifaceStaticValue");
+            g_iface_resolves.store(p.has_value() ? 1 : 0);
+            if (p)
+            {
+                g_iface_is_static.store(p->is_static() ? 1 : 0);
+                g_iface_ret.store(static_cast<std::int32_t>(p->call()));
+            }
+        }
+        {
+            auto p = abstract_with_static::static_method("abstractStaticValue");
+            g_abstract_resolves.store(p.has_value() ? 1 : 0);
+            if (p)
+            {
+                g_abstract_is_static.store(p->is_static() ? 1 : 0);
+                g_abstract_ret.store(static_cast<std::int32_t>(p->call()));
+            }
+        }
+        {
+            auto p = static_enum::static_method("enumStaticValue");
+            g_enum_resolves.store(p.has_value() ? 1 : 0);
+            if (p)
+            {
+                g_enum_is_static.store(p->is_static() ? 1 : 0);
+                g_enum_ret.store(static_cast<std::int32_t>(p->call()));
+            }
+        }
+        {
+            // The sub declares subStaticValue() itself...
+            auto p_own = static_sub::static_method("subStaticValue");
+            g_sub_own_resolves.store(p_own.has_value() ? 1 : 0);
+            if (p_own)
+            {
+                g_sub_own_ret.store(static_cast<std::int32_t>(p_own->call()));
+            }
+            // ...and INHERITS baseStaticValue() from StaticBase (statics are not
+            // polymorphic: naming it through the sub resolves the super's single
+            // declaration, found by the static get_method super-chain walk).
+            auto p_inh = static_sub::static_method("baseStaticValue");
+            g_inherited_resolves.store(p_inh.has_value() ? 1 : 0);
+            if (p_inh)
+            {
+                g_inherited_is_static.store(p_inh->is_static() ? 1 : 0);
+                g_inherited_ret.store(static_cast<std::int32_t>(p_inh->call()));
+            }
+        }
+
+        // ================================================================
+        //  (G) <clinit> characterization — first static touch initializes
+        // ================================================================
+        {
+            // BEFORE any static call on ClinitProbe: a raw static-field read does
+            // NOT trigger <clinit>, so on most JDKs this observes the pre-init
+            // (false) state.  Recorded, not hard-asserted (load-vs-init timing is
+            // JDK-sensitive and a raw field read can race a concurrent init).
+            g_clinit_pre_initialized.store(clinit_probe::get_initialized() ? 1 : 0);
+
+            auto p = clinit_probe::static_method("clinitValue");
+            g_clinit_resolves.store(p.has_value() ? 1 : 0);
+            if (p)
+            {
+                // Calling the static method TRIGGERS <clinit> and returns the
+                // post-init sentinel — the observable "first touch initialized
+                // the class" contract.
+                g_clinit_ret.store(static_cast<std::int32_t>(p->call()));
+            }
+            g_clinit_post_initialized.store(clinit_probe::get_initialized() ? 1 : 0);
+        }
+
         (void)self;
         g_all_calls_ran.store(true);
     }
@@ -382,13 +805,20 @@ namespace
 VMHOOK_JVM_MODULE(method_static)
 {
     vmhook::register_class<method_static>("vmhook/fixtures/MethodStatic");
+    vmhook::register_class<static_sub>("vmhook/fixtures/MethodStatic$StaticSub");
+    vmhook::register_class<abstract_with_static>("vmhook/fixtures/MethodStatic$AbstractWithStatic");
+    vmhook::register_class<static_iface>("vmhook/fixtures/MethodStatic$StaticIface");
+    vmhook::register_class<static_enum>("vmhook/fixtures/MethodStatic$StaticEnum");
+    vmhook::register_class<clinit_probe>("vmhook/fixtures/MethodStatic$ClinitProbe");
+    // oop_carrier is a bare oop holder; it is NEVER register_class<>'d — its
+    // instances are only ever passed AS ARGUMENTS (raw oop), never resolved.
 
-    // Record which dispatch path the live JDK uses (object-return usability is
-    // path-dependent; primitives + String are path-independent).
+    // Record which dispatch path the live JDK uses (object/array-return usability
+    // is path-dependent; primitives + String are path-independent).
     const bool call_stub_present{ vmhook::detail::find_call_stub_entry() != nullptr };
     ctx.record(std::string{ "[INFO] method_static dispatch path: " }
-               + (call_stub_present ? "call_stub fast path (object returns are real compressed OOPs)"
-                                    : "JNI fallback (object returns TRUNCATED/freed — KNOWN call_jni flaw)"));
+               + (call_stub_present ? "call_stub fast path (object/array returns are real compressed OOPs)"
+                                    : "JNI fallback (object/array returns TRUNCATED/freed — KNOWN call_jni flaw)"));
 
     {
         auto handle{ vmhook::scoped_hook<method_static>(
@@ -468,7 +898,7 @@ VMHOOK_JVM_MODULE(method_static)
         ctx.check("ms_double_max", bits2d(g_double_max.load()) == std::numeric_limits<double>::max());
 
         // void: is_void()==true AND the body's side effect ran.  The static
-        // recorder hit counter aggregates sVoidBump + sRecordInt-family bumps;
+        // recorder hit counter aggregates sVoidBump + sRecord*-family bumps;
         // we assert it is > 0 (every recorder that ran bumped it).
         ctx.check("ms_void_static_is_void", g_void_is_void.load() == 1);
         ctx.check("ms_static_void_side_effect_ran",
@@ -505,17 +935,9 @@ VMHOOK_JVM_MODULE(method_static)
         // ==================================================================
         //  3) OBJECT static returns — null is hard, non-null is path-dep
         // ==================================================================
-        // Hard invariant (every path): a null object return is a null uptr.
-        // This is the single most important object-return guarantee — a null
-        // Java return must never fabricate a wrapper.
         ctx.check("ms_object_null_returns_null_unique_ptr",
                   g_obj_null_is_null_uptr.load(std::memory_order_relaxed));
-        // Path-independent value_t routing: a non-String object is never
-        // is_string().
         ctx.check("ms_object_return_not_string", g_obj_child_is_string.load() == 0);
-        // is_void() on a null OBJECT return is PATH-DEPENDENT: call_stub yields
-        // monostate (is_void()==true); call_jni yields uint32{0} (is_void()==false,
-        // but the unique_ptr decode still correctly produces null above).
         if (call_stub_present)
         {
             ctx.check("ms_object_null_is_void", g_obj_null_is_void.load() == 1);
@@ -529,7 +951,6 @@ VMHOOK_JVM_MODULE(method_static)
 
         if (call_stub_present)
         {
-            // Full usable-wrapper contract holds only when the call stub is live.
             ctx.check("ms_object_make_child_non_null",
                       g_obj_child_nonnull.load(std::memory_order_relaxed));
             ctx.check("ms_object_make_child_seed_through_wrapper",
@@ -538,9 +959,6 @@ VMHOOK_JVM_MODULE(method_static)
         }
         else
         {
-            // JDK-21 call_jni: object handle is truncated/freed.  Record what
-            // happened; do NOT fail CI for a documented flaw this module cannot
-            // fix (mirrors method_call_object's policy).
             ctx.record(std::string{ "[INFO] ms_object_make_child_non_null (call_jni) = " }
                        + (g_obj_child_nonnull.load(std::memory_order_relaxed) ? "true" : "false"));
             ctx.record(std::string{ "[INFO] ms_object_make_child_seed (call_jni) = " }
@@ -553,9 +971,7 @@ VMHOOK_JVM_MODULE(method_static)
         // ==================================================================
         //  4) NO RECEIVER PASSED to a static method
         // ==================================================================
-        // sEchoInt(v) returns v: arg landed at slot 0, no phantom receiver.
         ctx.check("ms_no_receiver_echo_returns_arg", g_echo_ret.load() == 13572468);
-        // The recorded fields confirm each arg arrived intact at the right slot.
         ctx.check("ms_no_receiver_recorded_long_return",
                   g_record_long_ret.load() == static_cast<std::int64_t>(0x0011223344556677LL));
         ctx.check("ms_no_receiver_recorded_long_field",
@@ -563,22 +979,18 @@ VMHOOK_JVM_MODULE(method_static)
         ctx.check("ms_no_receiver_three_return",
                   g_record_three_ret.load()
                       == static_cast<std::int64_t>(5) + 0x1122334455667788LL + (-13));
-        // First int at slot 0, long across 1-2, trailing int at slot 3 — all
-        // correct ONLY if no receiver shifted them.
         ctx.check("ms_no_receiver_three_first_int_slot0",
                   method_static::get_recorded_first() == 5);
         ctx.check("ms_no_receiver_three_long_slot1",
                   method_static::get_recorded_second() == 0x1122334455667788LL);
         ctx.check("ms_no_receiver_three_trailing_int_after_long",
                   method_static::get_recorded_third() == -13);
-        // The proxy reports a NULL receiver OOP for static methods.
         ctx.check("ms_no_receiver_oop_zero_echo", g_recv_oop_zero_echo.load() == 1);
         ctx.check("ms_no_receiver_oop_zero_int", g_recv_oop_zero_int.load() == 1);
         ctx.check("ms_no_receiver_oop_zero_void", g_recv_oop_zero_void.load() == 1);
 
         // ==================================================================
         //  5) is_static() ACCESSOR — true for static, false for instance
-        //     (the recently-fixed accessor: reads JVM_ACC_STATIC live)
         // ==================================================================
         ctx.check("ms_is_static_true_int_returner", g_isstatic_sint.load() == 1);
         ctx.check("ms_is_static_true_long_returner", g_isstatic_slong.load() == 1);
@@ -601,29 +1013,166 @@ VMHOOK_JVM_MODULE(method_static)
         ctx.check("ms_sig_overload_echo_returns_arg", g_sig_echo_ret.load() == 24681357);
 
         // ==================================================================
-        //  6) Robustness #6 (FIXED): static_method() REJECTS instance methods.
-        //     The static get_method path applies a JVM_ACC_STATIC filter, so
-        //     static_method("iGetSeed") / ("iEcho") resolve to an EMPTY
-        //     optional (both are instance methods on this class).  HARD
-        //     assertions, plus a positive control proving a real static method
-        //     still resolves through the same path.
+        //  6) static_method() REJECTS instance methods (JVM_ACC_STATIC gate)
         // ==================================================================
         ctx.check("ms_static_method_rejects_instance_iget",
                   g_flaw_iget_has_value.load() == 0);
         ctx.check("ms_static_method_rejects_instance_iecho",
                   g_flaw_iecho_has_value.load() == 0);
-        // Positive control: a genuine static method DOES resolve, so the
-        // rejection above is the JVM_ACC_STATIC filter at work, not a blanket
-        // resolution failure.
         ctx.check("ms_static_method_resolves_real_static",
                   g_static_real_has_value.load() == 1);
-        // Belt-and-braces: a rejected (empty) proxy is never reported static.
-        // is_static() on an empty optional is unreachable, so this stays 0 — it
-        // would also catch a regression where an instance Method leaked through
-        // as a non-static proxy.
         ctx.check("ms_static_method_rejected_instance_not_static_iget",
                   g_flaw_iget_is_static.load() == 0);
         ctx.check("ms_static_method_rejected_instance_not_static_iecho",
                   g_flaw_iecho_is_static.load() == 0);
+
+        // ##################################################################
+        //  mstat_* — EXHAUSTIVE EXPANSION
+        // ##################################################################
+
+        // ---- (A) every non-int primitive + String + object ARGUMENT echo ----
+        ctx.check("mstat_arg_bool_echo_return", g_arg_bool_ret.load() == 1);
+        ctx.check("mstat_arg_bool_echo_field", g_arg_bool_field.load() == 1);
+        ctx.check("mstat_arg_byte_echo_return", g_arg_byte_ret.load() == -7);
+        ctx.check("mstat_arg_byte_echo_field", g_arg_byte_field.load() == -7);
+        ctx.check("mstat_arg_short_echo_return", g_arg_short_ret.load() == -12345);
+        ctx.check("mstat_arg_short_echo_field", g_arg_short_field.load() == -12345);
+        // 0xBEEF as a Java char is 48879 (zero-extended, unsigned 16-bit).
+        ctx.check("mstat_arg_char_echo_return", g_arg_char_ret.load() == 0xBEEF);
+        ctx.check("mstat_arg_char_echo_field", g_arg_char_field.load() == 0xBEEF);
+        ctx.check("mstat_arg_long_echo_return",
+                  g_arg_long_ret.load() == static_cast<std::int64_t>(0x7766554433221100LL));
+        ctx.check("mstat_arg_long_echo_field",
+                  g_arg_long_field.load() == static_cast<std::int64_t>(0x7766554433221100LL));
+        // -0.0f survives bit-exact through the arg packer (signbit preserved).
+        ctx.check("mstat_arg_float_echo_return_bits", g_arg_float_ret.load() == f2bits(-0.0f));
+        ctx.check("mstat_arg_float_echo_field_bits", g_arg_float_field.load() == f2bits(-0.0f));
+        ctx.check("mstat_arg_double_echo_return_bits", g_arg_double_ret.load() == d2bits(3.141592653589793));
+        ctx.check("mstat_arg_double_echo_field_bits", g_arg_double_field.load() == d2bits(3.141592653589793));
+        ctx.check("mstat_arg_string_captured", g_arg_string_captured.load());
+        ctx.check("mstat_arg_string_echo_return", g_arg_string_ret == "round-trip");
+        ctx.check("mstat_arg_string_echo_field", g_arg_string_field == "round-trip");
+        // Object argument: a non-null oop reached slot 0 (its identity is non-zero
+        // and matches what the static method stamped), and a null oop -> 0.
+        ctx.check("mstat_arg_object_identity_nonzero", g_arg_object_identity_nonzero.load() == 1);
+        ctx.check("mstat_arg_object_field_matches_return", g_arg_object_field_matches.load() == 1);
+        ctx.check("mstat_arg_object_null_identity_zero", g_arg_object_null_zero.load() == 1);
+
+        // ---- (B) array returns + array argument ----
+        ctx.check("mstat_array_int_resolves", g_arr_int_resolves.load() == 1);
+        ctx.check("mstat_array_int_return_not_string", g_arr_int_not_string.load() == 1);
+        ctx.check("mstat_array_str_resolves", g_arr_str_resolves.load() == 1);
+        ctx.check("mstat_array_obj_resolves", g_arr_obj_resolves.load() == 1);
+        // Null array return -> null unique_ptr (path-INDEPENDENT, hard assert).
+        ctx.check("mstat_array_null_returns_null_unique_ptr",
+                  g_arr_null_is_null_uptr.load(std::memory_order_relaxed));
+        // Array-RETURN element/length walks depend on a usable returned oop, which
+        // is call-path dependent (call_jni truncates the handle): gate on
+        // call_stub_present, record on call_jni — mirrors the object-return policy.
+        if (call_stub_present)
+        {
+            ctx.check("mstat_array_int_non_null_not_void", g_arr_int_not_void.load() == 1);
+            ctx.check("mstat_array_int_length_4", g_arr_int_len_ok.load() == 1);
+            ctx.check("mstat_array_int_elements_10_40", g_arr_int_elems_ok.load() == 1);
+            ctx.check("mstat_array_str_length_3", g_arr_str_len_ok.load() == 1);
+            ctx.check("mstat_array_obj_length_2", g_arr_obj_len_ok.load() == 1);
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] mstat_array_int (call_jni) not_void=" }
+                       + std::to_string(g_arr_int_not_void.load())
+                       + " len_ok=" + std::to_string(g_arr_int_len_ok.load())
+                       + " elems_ok=" + std::to_string(g_arr_int_elems_ok.load())
+                       + " (call_jni truncates the returned array handle)");
+            ctx.record(std::string{ "[INFO] mstat_array_str_length_ok (call_jni) = " }
+                       + std::to_string(g_arr_str_len_ok.load()));
+            ctx.record(std::string{ "[INFO] mstat_array_obj_length_ok (call_jni) = " }
+                       + std::to_string(g_arr_obj_len_ok.load()));
+        }
+        // Array ARGUMENT pass-through is path-INDEPENDENT (a raw oop arg is
+        // consumed correctly on both paths): hard-assert the echoed length when the
+        // fresh allocation succeeded.
+        if (g_arr_arg_attempted.load() == 1)
+        {
+            ctx.check("mstat_array_arg_length_echo_4", g_arr_arg_len_ret.load() == k_arr_int_len);
+        }
+        else
+        {
+            ctx.record("[INFO] mstat_array_arg_length_echo: int[] allocation unavailable "
+                       "on this run (TLAB/GC) — array-argument echo skipped (no crash).");
+        }
+
+        // ---- (C) overloaded static resolution — by arg type and by signature --
+        ctx.check("mstat_overload_by_int", g_poly_by_int.load() == k_poly_int);
+        ctx.check("mstat_overload_by_long", g_poly_by_long.load() == k_poly_long);
+        ctx.check("mstat_overload_by_double", g_poly_by_double.load() == k_poly_double);
+        ctx.check("mstat_overload_by_string", g_poly_by_string.load() == k_poly_string);
+        ctx.check("mstat_overload_by_int_int", g_poly_by_int2.load() == k_poly_int2);
+        ctx.check("mstat_overload_sig_int", g_poly_sig_int.load() == k_poly_int);
+        ctx.check("mstat_overload_sig_long", g_poly_sig_long.load() == k_poly_long);
+        ctx.check("mstat_overload_sig_string", g_poly_sig_string.load() == k_poly_string);
+
+        // ---- (D) static-field mutation side effect ----
+        ctx.check("mstat_mutate_returns_prior_zero", g_mutate_prior.load() == 0);
+        ctx.check("mstat_mutate_side_effect_observed", g_mutate_observed.load() == 1);
+
+        // ---- (E) STATIC method via INSTANCE wrapper dispatches statically ----
+        ctx.check("mstat_instance_wrapper_static_resolves", g_inst_static_resolves.load() == 1);
+        // The headline contracts: is_static() is true (so the call passes NO
+        // receiver), and the static method returns its constant.  The proxy's
+        // stored receiver oop is the wrapper's (non-zero) — see the global note;
+        // the static-ness is keyed on is_static(), not a nulled oop.
+        ctx.check("mstat_instance_wrapper_static_is_static", g_inst_static_is_static.load() == 1);
+        ctx.check("mstat_instance_wrapper_static_carries_wrapper_oop", g_inst_static_oop_nonzero.load() == 1);
+        ctx.check("mstat_instance_wrapper_static_returns_42", g_inst_static_ret.load() == 42);
+
+        // ---- (F) STATIC on interface / abstract / enum / inherited ----
+        ctx.check("mstat_iface_static_resolves", g_iface_resolves.load() == 1);
+        ctx.check("mstat_iface_static_is_static", g_iface_is_static.load() == 1);
+        ctx.check("mstat_iface_static_returns_value", g_iface_ret.load() == k_iface_static);
+
+        ctx.check("mstat_abstract_static_resolves", g_abstract_resolves.load() == 1);
+        ctx.check("mstat_abstract_static_is_static", g_abstract_is_static.load() == 1);
+        ctx.check("mstat_abstract_static_returns_value", g_abstract_ret.load() == k_abstract_static);
+
+        ctx.check("mstat_enum_static_resolves", g_enum_resolves.load() == 1);
+        ctx.check("mstat_enum_static_is_static", g_enum_is_static.load() == 1);
+        ctx.check("mstat_enum_static_returns_value", g_enum_ret.load() == k_enum_static);
+
+        ctx.check("mstat_sub_own_static_resolves", g_sub_own_resolves.load() == 1);
+        ctx.check("mstat_sub_own_static_returns_value", g_sub_own_ret.load() == k_sub_static);
+        // Inherited static: declared on StaticBase, named through the StaticSub
+        // wrapper.  Statics are NOT polymorphic — the super's declaration is what
+        // resolves (super-chain walk on the static get_method path).
+        ctx.check("mstat_inherited_static_resolves", g_inherited_resolves.load() == 1);
+        ctx.check("mstat_inherited_static_is_static", g_inherited_is_static.load() == 1);
+        ctx.check("mstat_inherited_static_returns_super_value", g_inherited_ret.load() == k_base_static);
+
+        // ---- (G) <clinit> characterization ----
+        ctx.check("mstat_clinit_static_resolves", g_clinit_resolves.load() == 1);
+        // The static call returns the post-<clinit> sentinel: first touch through
+        // a static call initialized the class (the observable contract; HARD).
+        ctx.check("mstat_clinit_call_returns_post_init_value",
+                  g_clinit_ret.load() == k_clinit_value);
+        // After the static call the class is definitely initialized.
+        ctx.check("mstat_clinit_initialized_after_call", g_clinit_post_initialized.load() == 1);
+        // The pre-call initialized state is JDK/timing-sensitive (a raw static
+        // field read does not itself force <clinit>, but load-vs-init ordering and
+        // any concurrent init can vary) — recorded, never asserted.
+        ctx.record(std::string{ "[INFO] mstat_clinit initialized BEFORE first static call = " }
+                   + std::to_string(g_clinit_pre_initialized.load())
+                   + " (0 expected on a JDK where the class was loaded-but-not-initialized; "
+                     "first static call then forces <clinit>)");
+    }
+
+    // Suite-safety: tear down any hook this module armed so ZERO stay installed
+    // for later modules.  Idempotent + safe when nothing is armed; mirrors
+    // method_overload / collection_list.  The scoped_hook above already uninstalls
+    // on scope exit on the normal path — this is the belt-and-braces guarantee
+    // for the no-SEH Windows recovery path (a contained crash longjmps past C++
+    // destructors).
+    if (ctx.reset)
+    {
+        ctx.reset();
     }
 }
