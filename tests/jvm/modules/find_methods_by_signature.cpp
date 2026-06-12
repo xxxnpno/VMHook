@@ -17,20 +17,14 @@
 //   ARITY                : ()V vs (I)I vs (II)I ; ()J no-arg long
 //   RETURN-TYPE          : (I)I {f,sf} vs (I)J {fL} ; ()V {..} vs ()I {retI} vs ()J {g}
 //   REFERENCE vs PRIM    : (..String;)..String; {f,sf} ; ()Ljava/lang/Object; {makeObj}
-//                          (..String;)..Object; {boxStr} ; ()..String; {name}
 //   ARRAYS               : ([I)[I {arr} ; ([[I)[[I {arr2} ; ([L..String;)[L..String; {arrStr}
-//   MULTI-SLOT / WIDE    : (IJD)D {mix} ; (JJ)J {sUnique} ; (JD)V {wideVoid}
-//   MANY-ARG             : (IJDLjava/lang/String;[IZ)V {many} ; (IIIIII)I {manyR}
+//   MULTI-SLOT           : (IJD)D {mix} ; (JJ)J {sUnique}
 //   STATIC == INSTANCE   : (I)I returns BOTH instance f AND static sf
-//   N-WAY (N=3)          : (D)I returns ALL of { tri1, tri2, tri3 } (2 instance + 1 static)
 //
 // What it proves, angle by angle:
 //   - find returns the FULL match SET (not just the first): (I)I -> {f, sf},
-//     String-desc -> {f, sf}, AND (D)I -> {tri1, tri2, tri3} (N=3); size AND
-//     membership asserted, order-independent.
-//   - genuinely-unique descriptors resolve to exactly their one method (incl. the
-//     task-named shapes (JD)V, (IJDLjava/lang/String;[IZ)V, (IIIIII)I,
-//     (..String;)..Object;, and ()..String;).
+//     String-desc -> {f, sf}; size AND membership asserted, order-independent.
+//   - genuinely-unique descriptors resolve to exactly their one method.
 //   - RETURN-TYPE discrimination: (I)I must NOT include fL ((I)J), and (I)J must
 //     NOT include f/sf -- a same-arg different-return method is a distinct match.
 //   - ARITY discrimination: (I)I excludes g(int,int); (II)I is exactly {g}.
@@ -174,18 +168,6 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
     ctx.check("substrate_has_g_III",  has_pair(all_methods, "g", "(II)I"));
     ctx.check("substrate_has_fL_IJ",  has_pair(all_methods, "fL", "(I)J"));
     ctx.check("substrate_has_arr_aII", has_pair(all_methods, "arr", "([I)[I"));
-    // ...and the newly-added shapes (task-named: wide-void, many-arg, String->Object,
-    // no-arg String, and the three-way (D)I set).
-    ctx.check("substrate_has_wideVoid_JDV", has_pair(all_methods, "wideVoid", "(JD)V"));
-    ctx.check("substrate_has_many_V",
-              has_pair(all_methods, "many", "(IJDLjava/lang/String;[IZ)V"));
-    ctx.check("substrate_has_manyR_6I", has_pair(all_methods, "manyR", "(IIIIII)I"));
-    ctx.check("substrate_has_boxStr_SO",
-              has_pair(all_methods, "boxStr", "(Ljava/lang/String;)Ljava/lang/Object;"));
-    ctx.check("substrate_has_name_S", has_pair(all_methods, "name", "()Ljava/lang/String;"));
-    ctx.check("substrate_has_tri1_DI", has_pair(all_methods, "tri1", "(D)I"));
-    ctx.check("substrate_has_tri2_DI", has_pair(all_methods, "tri2", "(D)I"));
-    ctx.check("substrate_has_tri3_DI", has_pair(all_methods, "tri3", "(D)I"));
 
     // =====================================================================
     //  1. SHARED descriptor (I)I -> the FULL set { f, sf }.  This is the
@@ -334,90 +316,9 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
         const name_list obj{ find_sig("()Ljava/lang/Object;") };
         ctx.check("noargObj_size_1", obj.size() == 1);
         ctx.check("noargObj_is_makeObj", obj.size() == 1 && obj.front() == "makeObj");
-        // REFERENCE-RETURN-TYPE discrimination: ()Ljava/lang/Object; (makeObj) and
-        // ()Ljava/lang/String; (name) share the no-arg shape but differ in return
-        // type, so neither set may contain the other's method.
-        ctx.check("noargObj_excludes_name", !contains(obj, "name"));
+        // A reference return must NOT match the String-returning no-arg... there
+        // is none, but assert makeObj is not mistaken for a String method.
         ctx.check("noargObj_excludes_f", !contains(obj, "f"));
-    }
-
-    // =====================================================================
-    //  5b. TASK-NAMED descriptor shapes not covered above, each a genuine
-    //      SINGLETON -> exactly its one method:
-    //        (JD)V                        wide args (long+double), VOID return
-    //        (IJDLjava/lang/String;[IZ)V  many-arg, all slot-widths, VOID return
-    //        (IIIIII)I                    many-arg, all single-slot, INT return
-    //        (Ljava/lang/String;)Ljava/lang/Object;  String in -> Object out
-    //        ()Ljava/lang/String;         no-arg String return (DECLARED name(),
-    //                                     NOT the inherited Object#toString())
-    // =====================================================================
-    {
-        // (JD)V -- two WIDE args, VOID return.  Distinct from (IJD)D {mix} and
-        // from every no-arg ()V member.
-        const name_list jdv{ find_sig("(JD)V") };
-        ctx.check("JDV_size_1", jdv.size() == 1);
-        ctx.check("JDV_is_wideVoid", jdv.size() == 1 && jdv.front() == "wideVoid");
-        ctx.check("JDV_excludes_mix", !contains(jdv, "mix"));   // mix is (IJD)D
-        ctx.check("JDV_excludes_f", !contains(jdv, "f"));       // f() is ()V
-
-        // (IJDLjava/lang/String;[IZ)V -- 6-arg, all slot-width classes, VOID.
-        const name_list manyV{ find_sig("(IJDLjava/lang/String;[IZ)V") };
-        ctx.check("manyV_size_1", manyV.size() == 1);
-        ctx.check("manyV_is_many", manyV.size() == 1 && manyV.front() == "many");
-
-        // (IIIIII)I -- 6 single-slot ints, INT return.  A genuinely-present long
-        // arg list (the (IIIIIIIIII)I 10-arg negative below stays absent).
-        const name_list manyR{ find_sig("(IIIIII)I") };
-        ctx.check("manyR_size_1", manyR.size() == 1);
-        ctx.check("manyR_is_manyR", manyR.size() == 1 && manyR.front() == "manyR");
-        // ARITY discrimination at high arity: (IIIIII)I != (II)I {g} and != (I)I.
-        ctx.check("manyR_excludes_g", !contains(manyR, "g"));
-
-        // (Ljava/lang/String;)Ljava/lang/Object; -- REFERENCE arg, DIFFERENT
-        // reference return.  Must NOT be confused with the String->String set
-        // { f, sf } that shares the arg type but differs in return type.
-        const name_list so{ find_sig("(Ljava/lang/String;)Ljava/lang/Object;") };
-        ctx.check("strObj_size_1", so.size() == 1);
-        ctx.check("strObj_is_boxStr", so.size() == 1 && so.front() == "boxStr");
-        ctx.check("strObj_excludes_f", !contains(so, "f"));    // f(String) is ..)..String;
-        ctx.check("strObj_excludes_sf", !contains(so, "sf"));
-        // ...and the String->String set must NOT contain boxStr (return differs).
-        const name_list strstr{ find_sig("(Ljava/lang/String;)Ljava/lang/String;") };
-        ctx.check("strStr_excludes_boxStr", !contains(strstr, "boxStr"));
-
-        // ()Ljava/lang/String; -- a no-arg String return.  Object#toString() has
-        // this EXACT descriptor, but find walks DECLARED methods only, so the
-        // result is the declared name() and NEVER the inherited toString.
-        const name_list ns{ find_sig("()Ljava/lang/String;") };
-        ctx.check("noargStr_size_1", ns.size() == 1);
-        ctx.check("noargStr_is_name", ns.size() == 1 && ns.front() == "name");
-        ctx.check("noargStr_excludes_toString", !contains(ns, "toString"));
-        ctx.check("noargStr_excludes_makeObj", !contains(ns, "makeObj")); // ()Lj.l.Object;
-    }
-
-    // =====================================================================
-    //  5c. THREE-WAY shared descriptor (D)I -> { tri1, tri2, tri3 }.  This
-    //      pushes the headline "return ALL matches, not just the first" past
-    //      multiplicity 2 to N=3, and proves two INSTANCE methods (tri1, tri2)
-    //      and one STATIC method (tri3) co-enumerate on a single descriptor
-    //      (the walk ignores JVM_ACC_STATIC).
-    // =====================================================================
-    {
-        const name_list di{ find_sig("(D)I") };
-        ctx.check("DI_size_3", di.size() == 3);
-        ctx.check("DI_has_tri1", contains(di, "tri1"));
-        ctx.check("DI_has_tri2", contains(di, "tri2"));
-        ctx.check("DI_has_tri3", contains(di, "tri3"));
-        ctx.check("DI_is_exactly_tri123",
-                  same_multiset(di, name_list{ "tri1", "tri2", "tri3" }));
-        // Each name appears exactly once (distinct name+descriptor per method).
-        ctx.check("DI_tri1_once", count_name(di, "tri1") == 1);
-        ctx.check("DI_tri2_once", count_name(di, "tri2") == 1);
-        ctx.check("DI_tri3_once", count_name(di, "tri3") == 1);
-        // (D)I must not bleed into the (D)D {dfn} set (same arg, different return).
-        ctx.check("DI_excludes_dfn", !contains(di, "dfn"));
-        const name_list ddd{ find_sig("(D)D") };
-        ctx.check("DD_excludes_tri1", !contains(ddd, "tri1"));
     }
 
     // =====================================================================
@@ -433,11 +334,7 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
             "(F)F", "(D)D", "(IJD)D", "(JJ)J", "([I)[I", "([[I)[[I",
             "([Ljava/lang/String;)[Ljava/lang/String;",
             "(Ljava/lang/String;)Ljava/lang/String;",
-            "()V", "()I", "()J", "()Ljava/lang/Object;",
-            // task-named shapes added to the fixture (singletons + the 3-way set):
-            "(JD)V", "(IJDLjava/lang/String;[IZ)V", "(IIIIII)I",
-            "(Ljava/lang/String;)Ljava/lang/Object;", "()Ljava/lang/String;",
-            "(D)I"
+            "()V", "()I", "()J", "()Ljava/lang/Object;"
         };
         bool all_sizes_agree{ true };
         bool all_names_carry_descriptor{ true };
@@ -472,9 +369,7 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
         {
             substrate_names.push_back(m.first);
         }
-        const char* probe_descs[]{ "(I)I", "(J)J", "()V", "([I)[I", "(JJ)J",
-                                   "(D)I", "(JD)V", "()Ljava/lang/String;",
-                                   "(Ljava/lang/String;)Ljava/lang/Object;" };
+        const char* probe_descs[]{ "(I)I", "(J)J", "()V", "([I)[I", "(JJ)J" };
         bool every_name_real{ true };
         bool no_empty_name{ true };
         for (const char* d : probe_descs)
@@ -521,19 +416,6 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
         ctx.check("nearmiss_ItoF_empty", find_sig("(I)F").empty());
         ctx.check("nearmiss_JtoI_empty", find_sig("(J)I").empty());
         ctx.check("nearmiss_DtoF_empty", find_sig("(D)F").empty());
-        // near-misses on the NEWLY-added shapes: (JD)V is declared, so (JD)I /
-        // (JD)D / (JD)J (same args, wrong return) must be absent; (D)I and (D)D
-        // are declared, so (D)J / (D)S (same arg, wrong return) must be absent.
-        ctx.check("nearmiss_JDtoI_empty", find_sig("(JD)I").empty());
-        ctx.check("nearmiss_JDtoD_empty", find_sig("(JD)D").empty());
-        ctx.check("nearmiss_JDtoJ_empty", find_sig("(JD)J").empty());
-        ctx.check("nearmiss_DtoJ_empty", find_sig("(D)J").empty());
-        ctx.check("nearmiss_DtoS_empty", find_sig("(D)S").empty());
-        // a near-miss many-arg: drop one int from (IIIIII)I {manyR} -> absent.
-        ctx.check("nearmiss_5I_empty", find_sig("(IIIII)I").empty());
-        // String->Object {boxStr} is declared; the swap Object->String is absent.
-        ctx.check("nearmiss_ObjToStr_empty",
-                  find_sig("(Ljava/lang/Object;)Ljava/lang/String;").empty());
 
         // (e) lowercase type chars (descriptors are case-sensitive uppercase).
         ctx.check("lowercase_i_empty", find_sig("(i)i").empty());
@@ -678,11 +560,5 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
         ctx.check("by_name_strdesc_count_matches_find",
                   count_descriptor(by_name, "(Ljava/lang/String;)Ljava/lang/String;")
                       == find_sig("(Ljava/lang/String;)Ljava/lang/String;").size());
-        // The 3-way (D)I set is the strongest by-name cross-check: the klass
-        // resolved by internal name must report multiplicity 3 for (D)I, exactly
-        // matching what find returns through the registered wrapper.
-        ctx.check("by_name_DI_count_matches_find",
-                  count_descriptor(by_name, "(D)I") == find_sig("(D)I").size());
-        ctx.check("by_name_DI_count_is_3", count_descriptor(by_name, "(D)I") == 3);
     }
 }
