@@ -223,6 +223,77 @@ namespace
             return reinterpret_cast<std::uintptr_t>(wrapped->get_instance());
         }
 
+        // ---- void side-effect observability: snapshot a field, run a void call(),
+        //      report whether the field advanced (i.e. the void dispatch executed). --
+        static auto void_side_effect() -> std::int32_t { return static_field("voidSideEffect")->get(); }
+
+        // ---- variant-alternative index of a return's value_t.  This is the DIRECT
+        //      probe of descriptor-driven type routing: the index pins WHICH variant
+        //      alternative call() chose (int32 vs int64, float vs double, ...),
+        //      independent of the numeric value.  Order matches the value_t variant:
+        //      0 monostate,1 bool,2 i8,3 i16,4 i32,5 i64,6 float,7 double,8 u16,
+        //      9 u32(reference/OOP),10 std::string.  -1 if the method is unresolved. --
+        auto call_variant_index(const char* name) -> int
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return -1; }
+            return static_cast<int>(m->call().data.index());
+        }
+
+        // ---- SAME method, DIFFERENT decodes: read returnsInt's 0x12345678 through
+        //      narrower / wider / float target types.  The value_t conversion operator
+        //      static_casts the stored int32 to each target, so this characterizes how
+        //      one return decodes when the caller pins a different C++ type. ----
+        auto call_int_as_i8(const char* name) -> std::int8_t { return get_method(name)->call(); }
+        auto call_int_as_i16(const char* name) -> std::int16_t { return get_method(name)->call(); }
+        auto call_int_as_i64(const char* name) -> std::int64_t { return get_method(name)->call(); }
+        auto call_int_as_float_bits(const char* name) -> std::uint32_t
+        {
+            const float f = get_method(name)->call();   // static_cast<float>(int32)
+            std::uint32_t bits{};
+            std::memcpy(&bits, &f, sizeof(bits));
+            return bits;
+        }
+
+        // ---- MISMATCH: decode a PRIMITIVE-int return as a reference (void* /
+        //      unique_ptr<rt>).  The int return stores the int32 alternative, NOT the
+        //      uint32 OOP alternative, so the void*/unique_ptr conversion cannot
+        //      static_cast it and yields nullptr/empty -- GRACEFUL, never a crash. ----
+        auto call_mismatch_int_as_pointer_is_null(const char* name) -> bool
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return true; }
+            void* const raw = m->call();   // int32 alt -> no void* cast -> nullptr
+            return raw == nullptr;
+        }
+        auto call_mismatch_int_as_wrapper_is_null(const char* name) -> bool
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return true; }
+            std::unique_ptr<rt> wrapped = m->call();   // int32 alt -> empty unique_ptr
+            return wrapped == nullptr;
+        }
+        // ---- MISMATCH (other direction): decode a reference (Object) return as a
+        //      primitive int.  The reference stores the uint32 OOP alternative, which
+        //      static_casts to int32 -- a well-defined (if semantically meaningless)
+        //      truncation of the compressed OOP, never a crash.  Characterized. ----
+        auto call_mismatch_object_as_int(const char* name) -> std::int32_t
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return 0; }
+            return m->call();   // uint32 OOP alt -> static_cast<int32>
+        }
+
+        // ---- INTERFACE-typed return whose runtime value is a String.  The descriptor
+        //      is Ljava/lang/CharSequence; (NOT Ljava/lang/String;), so call() stores a
+        //      generic reference; as_string() recovers the text via read_java_string on
+        //      the decoded String OOP.  Proves the String special-case is descriptor-
+        //      keyed, while the text is still recoverable through the reference path. --
+        auto call_charsequence_as_string(const char* name) -> std::string
+        {
+            return get_method(name)->call().as_string();
+        }
+
         // Sentinels distinguishing "decode produced a null wrapper" from a real 0.
         static constexpr std::int64_t  k_box_unset{ static_cast<std::int64_t>(0x7BADF00DBADF00DULL) };
         static constexpr std::uint64_t k_box_unset_bits{ 0x7BADF00DBADF00DULL };
@@ -366,6 +437,42 @@ namespace
     std::atomic<std::uintptr_t> g_self_obj_instance{ 0 };
     std::atomic<std::uintptr_t> g_receiver_instance{ 0 };
 
+    // ── descriptor-driven type-routing + edge cases (new exhaustive coverage) ──
+    // void side effect observable: did the field advance across the void call()?
+    std::atomic<int>           g_void_side_effect_ran{ -1 };
+    // variant-alternative index per return type (pins int32-vs-int64, float-vs-double).
+    std::atomic<int>           g_vidx_bool{ -2 };
+    std::atomic<int>           g_vidx_byte{ -2 };
+    std::atomic<int>           g_vidx_short{ -2 };
+    std::atomic<int>           g_vidx_char{ -2 };
+    std::atomic<int>           g_vidx_int{ -2 };
+    std::atomic<int>           g_vidx_long{ -2 };
+    std::atomic<int>           g_vidx_float{ -2 };
+    std::atomic<int>           g_vidx_double{ -2 };
+    std::atomic<int>           g_vidx_void{ -2 };
+    std::atomic<int>           g_vidx_string{ -2 };
+    std::atomic<int>           g_vidx_object{ -2 };
+    // CharSequence (interface return holding a String): proves the String special-
+    // case is descriptor-keyed -- runtime is a String, but descriptor != "...String;"
+    // so it routes to the reference (uint32) alternative, NOT the std::string one.
+    std::atomic<int>           g_vidx_charseq{ -2 };
+    // same method, different decodes: returnsInt (0x12345678) read narrow/wide/float.
+    std::atomic<std::int64_t>  g_int_as_i8{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_int_as_i16{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_int_as_i64{ k_uncaptured64 };
+    std::atomic<std::uint32_t> g_int_as_float_bits{ k_uncaptured_fbits };
+    // mismatch (graceful): int-return read as reference; object-return read as int.
+    std::atomic<int>           g_mismatch_int_as_ptr_null{ -1 };
+    std::atomic<int>           g_mismatch_int_as_wrapper_null{ -1 };
+    std::atomic<int>           g_mismatch_object_as_int_captured{ -1 };
+    // interface return whose runtime value is a String, recovered via as_string().
+    std::atomic<bool>          g_charseq_captured{ false };
+    std::string                g_charseq_value{};
+    // own-class-typed return: decoded wrapper instance must equal the receiver OOP.
+    std::atomic<std::uintptr_t> g_own_type_instance{ 0 };
+    // nested-generic-erased-to-Object: a usable non-null reference decode.
+    std::atomic<int>           g_nested_generic_usable{ -1 };
+
     auto reset_observations() -> void
     {
         g_detour_calls.store(0);
@@ -414,6 +521,19 @@ namespace
         g_null_str_is_empty.store(-1);
         g_obj_wrapper_is_null.store(-1);  g_obj_pointer_unusable.store(-1);
         g_self_obj_instance.store(0);     g_receiver_instance.store(0);
+        g_void_side_effect_ran.store(-1);
+        g_vidx_bool.store(-2);  g_vidx_byte.store(-2);  g_vidx_short.store(-2);
+        g_vidx_char.store(-2);  g_vidx_int.store(-2);   g_vidx_long.store(-2);
+        g_vidx_float.store(-2); g_vidx_double.store(-2);g_vidx_void.store(-2);
+        g_vidx_string.store(-2);g_vidx_object.store(-2);
+        g_vidx_charseq.store(-2);
+        g_int_as_i8.store(k_uncaptured64);  g_int_as_i16.store(k_uncaptured64);
+        g_int_as_i64.store(k_uncaptured64); g_int_as_float_bits.store(k_uncaptured_fbits);
+        g_mismatch_int_as_ptr_null.store(-1); g_mismatch_int_as_wrapper_null.store(-1);
+        g_mismatch_object_as_int_captured.store(-1);
+        g_charseq_captured.store(false);
+        g_own_type_instance.store(0);
+        g_nested_generic_usable.store(-1);
     }
 
     // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run it
@@ -647,6 +767,68 @@ namespace
                 g_obj_pointer_unusable.store(self->call_object_pointer_unusable("returnsObject") ? 1 : 0);
                 g_self_obj_instance.store(self->call_self_object_instance("returnsSelfAsObject"),
                                           std::memory_order_relaxed);
+
+                // ===== descriptor-driven type-routing + edge cases (new) =========
+
+                // ----- void side effect OBSERVABLE: snapshot the field, run the
+                //       void-returning call(), confirm the field advanced (the call
+                //       executed the body, not merely decoded an absent result). -----
+                {
+                    const std::int32_t before{ rt::void_side_effect() };
+                    const bool decoded_void{ self->call_void_is_void("returnsVoidWithSideEffect") };
+                    const std::int32_t after{ rt::void_side_effect() };
+                    g_void_side_effect_ran.store((decoded_void && after == before + 1) ? 1 : 0);
+                }
+
+                // ----- variant-alternative index per return: the DIRECT proof that
+                //       the descriptor picks the right value_t alternative/width. -----
+                g_vidx_bool.store(self->call_variant_index("returnsBool"));
+                g_vidx_byte.store(self->call_variant_index("returnsByte"));
+                g_vidx_short.store(self->call_variant_index("returnsShort"));
+                g_vidx_char.store(self->call_variant_index("returnsChar"));
+                g_vidx_int.store(self->call_variant_index("returnsInt"));
+                g_vidx_long.store(self->call_variant_index("returnsLong"));
+                g_vidx_float.store(self->call_variant_index("returnsFloat"));
+                g_vidx_double.store(self->call_variant_index("returnsDouble"));
+                g_vidx_void.store(self->call_variant_index("returnsVoid"));
+                g_vidx_string.store(self->call_variant_index("returnsString"));
+                g_vidx_object.store(self->call_variant_index("returnsObject"));
+                g_vidx_charseq.store(self->call_variant_index("returnsCharSequence"));
+
+                // ----- SAME method (returnsInt = 0x12345678), DIFFERENT decodes -----
+                g_int_as_i8.store(static_cast<std::int64_t>(self->call_int_as_i8("returnsInt")));
+                g_int_as_i16.store(static_cast<std::int64_t>(self->call_int_as_i16("returnsInt")));
+                g_int_as_i64.store(self->call_int_as_i64("returnsInt"));
+                g_int_as_float_bits.store(self->call_int_as_float_bits("returnsInt"));
+
+                // ----- MISMATCH (graceful, characterized): wrong-type decode -----
+                g_mismatch_int_as_ptr_null.store(
+                    self->call_mismatch_int_as_pointer_is_null("returnsInt") ? 1 : 0);
+                g_mismatch_int_as_wrapper_null.store(
+                    self->call_mismatch_int_as_wrapper_is_null("returnsInt") ? 1 : 0);
+                // object-as-int never crashes; record that it produced a value.
+                {
+                    const std::int32_t truncated{ self->call_mismatch_object_as_int("returnsObject") };
+                    g_mismatch_object_as_int_captured.store(1);
+                    (void)truncated;   // value is OOP-derived; only the no-crash matters
+                }
+
+                // ----- INTERFACE-typed return (CharSequence) holding a String -----
+                {
+                    const std::string s{ self->call_charsequence_as_string("returnsCharSequence") };
+                    g_charseq_value = s;
+                    g_charseq_captured.store(true);
+                }
+
+                // ----- OWN class-typed return (Lvmhook/fixtures/ReturnTypes;) -----
+                g_own_type_instance.store(self->call_self_object_instance("returnsOwnType"),
+                                          std::memory_order_relaxed);
+
+                // ----- NESTED generic erased to a bare interface descriptor -----
+                {
+                    void* const ref{ self->call_reference_oop("returnsNestedGeneric") };
+                    g_nested_generic_usable.store(ref != nullptr ? 1 : 0);
+                }
             }) };
         ctx.check("rt_trigger_hook_installed", hook_installed);
 
@@ -730,6 +912,67 @@ namespace
 
         // ---- void (V): decodes to a monostate value_t ----
         ctx.check("mrt_void_decodes_to_monostate", g_void_is_void.load() == 1);
+        // A void call() actually EXECUTED the method body (observable side effect),
+        // not merely decoded an absent result -- hard-asserted on every path.
+        ctx.check("mrt_void_side_effect_observed", g_void_side_effect_ran.load() == 1);
+
+        // =====================================================================
+        //  3b. DESCRIPTOR-DRIVEN TYPE ROUTING (hard-asserted on every path).  The
+        //      variant-alternative index pins WHICH value_t alternative the return
+        //      descriptor selected -- e.g. an int return is the int32 alternative, NOT
+        //      int64; a float is the float alternative, NOT double -- independent of
+        //      the numeric value.  Indices follow the value_t variant declaration:
+        //      0 monostate,1 bool,2 i8,3 i16,4 i32,5 i64,6 float,7 double,8 u16,
+        //      9 u32(reference/OOP),10 std::string.
+        // =====================================================================
+        ctx.check("mrt_route_bool_is_bool_alt",     g_vidx_bool.load()   == 1);
+        ctx.check("mrt_route_byte_is_i8_alt",       g_vidx_byte.load()   == 2);
+        ctx.check("mrt_route_short_is_i16_alt",     g_vidx_short.load()  == 3);
+        ctx.check("mrt_route_char_is_u16_alt",      g_vidx_char.load()   == 8);
+        ctx.check("mrt_route_int_is_i32_not_i64",   g_vidx_int.load()    == 4);
+        ctx.check("mrt_route_long_is_i64_not_i32",  g_vidx_long.load()   == 5);
+        ctx.check("mrt_route_float_is_float_not_double",  g_vidx_float.load()  == 6);
+        ctx.check("mrt_route_double_is_double_not_float", g_vidx_double.load() == 7);
+        ctx.check("mrt_route_void_is_monostate_alt", g_vidx_void.load()  == 0);
+        ctx.check("mrt_route_string_is_string_alt",  g_vidx_string.load() == 10);
+        // A reference (Object) return is the compressed-OOP (uint32) alternative --
+        // path/oops-independent: even when the OOP later fails to decode, the
+        // alternative the descriptor selected is still the reference one, never a
+        // numeric or string alternative.
+        ctx.check("mrt_route_object_is_reference_alt", g_vidx_object.load() == 9);
+        // DESCRIPTOR EDGE: an interface-typed (CharSequence) return whose RUNTIME value
+        // is a String routes to the reference (uint32) alternative, NOT the std::string
+        // one -- the String special-case keys off the declared descriptor
+        // "Ljava/lang/String;", not the runtime class.  Path/oops-independent.
+        ctx.check("mrt_route_charseq_is_reference_not_string_alt", g_vidx_charseq.load() == 9);
+
+        // ---- SAME method, DIFFERENT return decodes (returnsInt == 0x12345678).  The
+        //      value_t conversion operator static_casts the stored int32 to whatever
+        //      C++ type the caller pins, so one return decodes coherently as a narrower
+        //      int (low bits), a wider int (sign-preserved), or a float (int->float).
+        ctx.check("mrt_same_int_as_i8_low_byte",  g_int_as_i8.load()  == static_cast<std::int64_t>(static_cast<std::int8_t>(0x78)));
+        ctx.check("mrt_same_int_as_i16_low_word", g_int_as_i16.load() == static_cast<std::int64_t>(static_cast<std::int16_t>(0x5678)));
+        ctx.check("mrt_same_int_as_i64_widened",  g_int_as_i64.load() == static_cast<std::int64_t>(0x12345678));
+        {
+            // static_cast<float>(0x12345678) == 305419896.0f -> IEEE bits 0x4D91A2B4.
+            const float expected{ static_cast<float>(0x12345678) };
+            std::uint32_t expected_bits{};
+            std::memcpy(&expected_bits, &expected, sizeof(expected_bits));
+            ctx.check("mrt_same_int_as_float_static_cast", g_int_as_float_bits.load() == expected_bits);
+        }
+
+        // ---- MISMATCH: decoding a return as the WRONG type is GRACEFUL (no crash).
+        //      An int return read as a reference (void* / unique_ptr) cannot be
+        //      static_cast and yields null/empty (the int32 alternative is not the OOP
+        //      alternative).  An Object return read as int truncates the compressed OOP
+        //      to 32 bits -- meaningless but never a fault.  Documented choices [INFO].
+        ctx.check("mrt_mismatch_int_as_pointer_is_null",  g_mismatch_int_as_ptr_null.load() == 1);
+        ctx.check("mrt_mismatch_int_as_wrapper_is_null",  g_mismatch_int_as_wrapper_null.load() == 1);
+        ctx.check("mrt_mismatch_object_as_int_no_crash",  g_mismatch_object_as_int_captured.load() == 1);
+        ctx.record("[INFO] method_return_types: wrong-type decode is graceful -- an int "
+                   "return read as void*/unique_ptr<W> yields null (int32 alt is not the "
+                   "OOP alt); an Object return read as int truncates the compressed OOP to "
+                   "32 bits without a fault.  Both are documented value_t conversion choices.");
 
         // =====================================================================
         //  4. STRING decode assertions (hard-asserted: the String path eagerly
@@ -888,9 +1131,41 @@ namespace
                       g_obj_wrapper_is_null.load() == 0);
             ctx.check("mrt_object_decodes_usable_pointer",
                       g_obj_pointer_unusable.load() == 0);
+
+            // ---- DESCRIPTOR EDGE CASES (ride the reference OOP round-trip) -------
+
+            // INTERFACE return (CharSequence) holding a String: although it routed to
+            // the reference alternative (asserted above), as_string() still recovers
+            // the text by running read_java_string on the decoded String OOP.
+            ctx.check("mrt_charseq_captured", g_charseq_captured.load());
+            if (g_charseq_captured.load())
+            {
+                ctx.check("mrt_charseq_text_via_reference_path",
+                          g_charseq_value == "iface-charseq");
+            }
+
+            // OWN class-typed return (Lvmhook/fixtures/ReturnTypes;): returns `this`,
+            // so the decoded wrapper's instance OOP must equal the receiver.
+            ctx.check("mrt_own_type_instance_equals_receiver",
+                      g_own_type_instance.load() != 0
+                      && g_own_type_instance.load() == g_receiver_instance.load());
+
+            // NESTED generic erased to a bare interface descriptor (List<Map<...>> ->
+            // "Ljava/util/List;"): decodes to a usable non-null reference.  The native
+            // side never tries to recover the erased <...> type arguments.
+            ctx.check("mrt_nested_generic_decodes_usable_reference",
+                      g_nested_generic_usable.load() == 1);
         }
         else
         {
+            ctx.record(std::string("[INFO] method_return_types: descriptor-edge reference "
+                       "decodes unusable on this JVM -- charseq_captured=")
+                       + (g_charseq_captured.load() ? "true" : "false")
+                       + " charseq='" + g_charseq_value + "'"
+                       + " own_type_instance=0x" + std::to_string(g_own_type_instance.load())
+                       + " nested_generic_usable=" + std::to_string(g_nested_generic_usable.load())
+                       + " (recorded not asserted).");
+
             ctx.record("[INFO] method_return_types: array element lengths (bool="
                        + std::to_string(g_arr_bool_len.load())
                        + " int=" + std::to_string(g_arr_int_len.load())

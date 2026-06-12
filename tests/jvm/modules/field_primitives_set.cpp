@@ -483,109 +483,391 @@ namespace
 
     // =====================================================================
     //  9. INSTANCE writes -- the get_field(...)->set(...) dispatch path for
-    //     every primitive.  Proves set() ignores the static/instance flag and
-    //     writes the correct slot via instance dispatch.  Each: set then native
-    //     re-read bit-exact + correct variant alternative.
+    //     EVERY primitive at EVERY boundary value.  This is the headline: the
+    //     SET mirror's exhaustive INSTANCE matrix (the static matrix lives in
+    //     phases 1-8).  For each field we acquire the instance proxy ONCE and
+    //     drive it through the full boundary set; each write is re-read NATIVELY
+    //     through the same instance proxy bit-exact + correct variant
+    //     alternative (proving the instance dispatch wrote the right number of
+    //     bytes into the right slot, ignoring the static/instance flag).  The
+    //     LAST write of each field lands the DOCUMENTED FINAL value that phases
+    //     13 / 15 / 16 (snapshot / compare / getters) then observe Java-side, so
+    //     this matrix expansion needs no downstream change.
+    //
+    //     Finals (last write): iZ=true iB=0xFE iS=0xCAFE iC=0x20AC iI=0x0BADF00D
+    //     iJ=0x0123456789ABCDEF iF=0xC0490FDB iD=pi.
     // =====================================================================
     if (inst)
     {
-        // boolean
+        // ---- boolean (iZ): false/true, last write true ----
+        if (auto p{ inst->get_field("iZ") }; p.has_value())
         {
-            auto p{ inst->get_field("iZ") };
-            ctx.check("inst_Z_resolves", p.has_value());
-            if (p)
+            ctx.check("fps_inst_Z_resolves", true);
+            auto set_chk = [&](const char* tag, bool value)
             {
-                p->set(true);
+                p->set(value);
                 const auto v{ p->get() };
-                ctx.check("inst_Z_variant_bool", v.data.index() == kIdxBool);
-                const bool b = v; ctx.check("inst_Z_reread_true", b == true);
-            }
+                ctx.check(std::string{ "fps_inst_Z_variant_" } + tag, v.data.index() == kIdxBool);
+                const bool got = v;
+                ctx.check(std::string{ "fps_inst_Z_reread_" } + tag, got == value);
+                const int as_int = v;
+                ctx.check(std::string{ "fps_inst_Z_canonical_" } + tag, as_int == (value ? 1 : 0));
+            };
+            set_chk("false", false);
+            set_chk("true",  true);   // final = true
         }
-        // byte -> 0xFE (-2)
+        else { ctx.check("fps_inst_Z_resolves", false); }
+
+        // ---- byte (iB): 0,1,-1,min,max + 0x7F/0x80/0xFF/0xAB, last write 0xFE ----
+        if (auto p{ inst->get_field("iB") }; p.has_value())
         {
-            auto p{ inst->get_field("iB") };
-            ctx.check("inst_B_resolves", p.has_value());
-            if (p)
+            ctx.check("fps_inst_B_resolves", true);
+            auto set_chk = [&](const char* tag, std::int8_t value)
             {
-                p->set(static_cast<std::int8_t>(0xFE));
+                p->set(value);
                 const auto v{ p->get() };
-                ctx.check("inst_B_variant_i8", v.data.index() == kIdxI8);
-                const std::int8_t b = v; ctx.check("inst_B_reread_FE", b == static_cast<std::int8_t>(0xFE));
-                const int w = v; ctx.check("inst_B_sign_extends_neg2", w == -2);
-            }
+                ctx.check(std::string{ "fps_inst_B_variant_" } + tag, v.data.index() == kIdxI8);
+                const std::int8_t got = v;
+                ctx.check(std::string{ "fps_inst_B_reread_" } + tag, got == value);
+                const int widened = v;
+                ctx.check(std::string{ "fps_inst_B_sign_extends_" } + tag, widened == static_cast<int>(value));
+            };
+            set_chk("zero",   0);
+            set_chk("one",    1);
+            set_chk("negone", -1);
+            set_chk("min",    std::numeric_limits<std::int8_t>::min()); // -128
+            set_chk("max",    std::numeric_limits<std::int8_t>::max()); //  127
+            set_chk("0x7F",   static_cast<std::int8_t>(0x7F));
+            set_chk("0x80",   static_cast<std::int8_t>(0x80));          // -128
+            set_chk("0xFF",   static_cast<std::int8_t>(0xFF));          //   -1
+            set_chk("0xAB",   static_cast<std::int8_t>(0xAB));          //  -85
+            set_chk("0xFE",   static_cast<std::int8_t>(0xFE));          // final = -2
         }
-        // short -> 0xCAFE
+        else { ctx.check("fps_inst_B_resolves", false); }
+
+        // ---- short (iS): 0,1,-1,min,max + 0x7FFF/0x8000/0xBEEF, last write 0xCAFE ----
+        if (auto p{ inst->get_field("iS") }; p.has_value())
         {
-            auto p{ inst->get_field("iS") };
-            ctx.check("inst_S_resolves", p.has_value());
-            if (p)
+            ctx.check("fps_inst_S_resolves", true);
+            auto set_chk = [&](const char* tag, std::int16_t value)
             {
-                p->set(static_cast<std::int16_t>(0xCAFE));
+                p->set(value);
                 const auto v{ p->get() };
-                ctx.check("inst_S_variant_i16", v.data.index() == kIdxI16);
-                const std::int16_t s = v; ctx.check("inst_S_reread_CAFE", s == static_cast<std::int16_t>(0xCAFE));
-            }
+                ctx.check(std::string{ "fps_inst_S_variant_" } + tag, v.data.index() == kIdxI16);
+                const std::int16_t got = v;
+                ctx.check(std::string{ "fps_inst_S_reread_" } + tag, got == value);
+                const int widened = v;
+                ctx.check(std::string{ "fps_inst_S_sign_extends_" } + tag, widened == static_cast<int>(value));
+            };
+            set_chk("zero",   0);
+            set_chk("one",    1);
+            set_chk("negone", -1);
+            set_chk("min",    std::numeric_limits<std::int16_t>::min()); // -32768
+            set_chk("max",    std::numeric_limits<std::int16_t>::max()); //  32767
+            set_chk("0x7FFF", static_cast<std::int16_t>(0x7FFF));
+            set_chk("0x8000", static_cast<std::int16_t>(0x8000));        // -32768
+            set_chk("0xBEEF", static_cast<std::int16_t>(0xBEEF));        // -16657
+            set_chk("0xCAFE", static_cast<std::int16_t>(0xCAFE));        // final
         }
-        // int -> 0x0BADF00D
+        else { ctx.check("fps_inst_S_resolves", false); }
+
+        // ---- char (iC): full UTF-16 boundary set, last write 0x20AC ----
+        if (auto p{ inst->get_field("iC") }; p.has_value())
         {
-            auto p{ inst->get_field("iI") };
-            ctx.check("inst_I_resolves", p.has_value());
-            if (p)
+            ctx.check("fps_inst_C_resolves", true);
+            auto set_chk = [&](const char* tag, std::uint16_t value)
             {
-                p->set(static_cast<std::int32_t>(0x0BADF00D));
+                p->set(value);
                 const auto v{ p->get() };
-                ctx.check("inst_I_variant_i32", v.data.index() == kIdxI32);
-                const std::int32_t i = v; ctx.check("inst_I_reread_0BADF00D", i == 0x0BADF00D);
-            }
+                ctx.check(std::string{ "fps_inst_C_variant_" } + tag, v.data.index() == kIdxU16);
+                const std::uint16_t got = v;
+                ctx.check(std::string{ "fps_inst_C_reread_" } + tag, got == value);
+                const int widened = v;
+                ctx.check(std::string{ "fps_inst_C_widens_unsigned_" } + tag, widened == static_cast<int>(value));
+            };
+            set_chk("nul",     0x0000);
+            set_chk("space",   0x0020);
+            set_chk("A",       0x0041);
+            set_chk("highbit", 0x00E9); // 'e-acute'
+            set_chk("bmp",     0x4E2D); // CJK
+            set_chk("minsurr", 0xD800);
+            set_chk("hisurr",  0xD83D);
+            set_chk("losurr",  0xDE00);
+            set_chk("maxsurr", 0xDFFF);
+            set_chk("max",     0xFFFF); // Character.MAX_VALUE
+            set_chk("euro",    0x20AC); // final
         }
-        // long -> 0x0123456789ABCDEF
+        else { ctx.check("fps_inst_C_resolves", false); }
+
+        // ---- int (iI): 0,1,-1,min,max + boundary patterns, last write 0x0BADF00D ----
+        if (auto p{ inst->get_field("iI") }; p.has_value())
         {
-            auto p{ inst->get_field("iJ") };
-            ctx.check("inst_J_resolves", p.has_value());
-            if (p)
+            ctx.check("fps_inst_I_resolves", true);
+            auto set_chk = [&](const char* tag, std::int32_t value)
             {
-                p->set(static_cast<std::int64_t>(0x0123456789ABCDEFLL));
+                p->set(value);
                 const auto v{ p->get() };
-                ctx.check("inst_J_variant_i64", v.data.index() == kIdxI64);
-                const std::int64_t l = v; ctx.check("inst_J_reread_full", l == 0x0123456789ABCDEFLL);
-            }
+                ctx.check(std::string{ "fps_inst_I_variant_" } + tag, v.data.index() == kIdxI32);
+                const std::int32_t got = v;
+                ctx.check(std::string{ "fps_inst_I_reread_" } + tag, got == value);
+                const std::int64_t widened = v;
+                ctx.check(std::string{ "fps_inst_I_sign_extends_long_" } + tag, widened == static_cast<std::int64_t>(value));
+            };
+            set_chk("zero",       0);
+            set_chk("one",        1);
+            set_chk("negone",     -1);
+            set_chk("min",        std::numeric_limits<std::int32_t>::min());
+            set_chk("max",        std::numeric_limits<std::int32_t>::max());
+            set_chk("0x7FFFFFFF", static_cast<std::int32_t>(0x7FFFFFFF));
+            set_chk("0x80000000", static_cast<std::int32_t>(0x80000000));
+            set_chk("deadbeef",   static_cast<std::int32_t>(0xDEADBEEF));
+            set_chk("0BADF00D",   static_cast<std::int32_t>(0x0BADF00D)); // final
         }
-        // char -> 0x20AC (euro)
+        else { ctx.check("fps_inst_I_resolves", false); }
+
+        // ---- long (iJ): 0,1,-1,min,max + 64-bit patterns, last write 0x0123456789ABCDEF ----
+        if (auto p{ inst->get_field("iJ") }; p.has_value())
         {
-            auto p{ inst->get_field("iC") };
-            ctx.check("inst_C_resolves", p.has_value());
-            if (p)
+            ctx.check("fps_inst_J_resolves", true);
+            auto set_chk = [&](const char* tag, std::int64_t value)
             {
-                p->set(static_cast<std::uint16_t>(0x20AC));
+                p->set(value);
                 const auto v{ p->get() };
-                ctx.check("inst_C_variant_u16", v.data.index() == kIdxU16);
-                const std::uint16_t c = v; ctx.check("inst_C_reread_20AC", c == 0x20AC);
-            }
+                ctx.check(std::string{ "fps_inst_J_variant_" } + tag, v.data.index() == kIdxI64);
+                const std::int64_t got = v;
+                ctx.check(std::string{ "fps_inst_J_reread_" } + tag, got == value);
+            };
+            set_chk("zero",   0);
+            set_chk("one",    1);
+            set_chk("negone", -1);
+            set_chk("min",    std::numeric_limits<std::int64_t>::min());
+            set_chk("max",    std::numeric_limits<std::int64_t>::max());
+            set_chk("0x7FFFFFFFFFFFFFFF", 0x7FFFFFFFFFFFFFFFLL);
+            set_chk("0x8000000000000000", static_cast<std::int64_t>(0x8000000000000000ULL));
+            set_chk("highbits",           static_cast<std::int64_t>(0x00000000FFFFFFFFULL));
+            set_chk("deadbeef",           static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
+            set_chk("full",   0x0123456789ABCDEFLL); // final
         }
-        // float -> bit pattern 0xC0490FDB (-pi)
+        else { ctx.check("fps_inst_J_resolves", false); }
+
+        // ---- float (iF): every IEEE special bit-exact, last write 0xC0490FDB ----
+        if (auto p{ inst->get_field("iF") }; p.has_value())
         {
-            auto p{ inst->get_field("iF") };
-            ctx.check("inst_F_resolves", p.has_value());
-            if (p)
+            ctx.check("fps_inst_F_resolves", true);
+            auto set_chk = [&](const char* tag, std::uint32_t bits)
             {
-                p->set(bits_to_float(0xC0490FDB));
+                p->set(bits_to_float(bits));
                 const auto v{ p->get() };
-                ctx.check("inst_F_variant_float", v.data.index() == kIdxFloat);
-                const float f = v; ctx.check("inst_F_bits_exact", float_bits(f) == 0xC0490FDB);
-            }
+                ctx.check(std::string{ "fps_inst_F_variant_" } + tag, v.data.index() == kIdxFloat);
+                const float got = v;
+                ctx.check(std::string{ "fps_inst_F_bits_exact_" } + tag, float_bits(got) == bits);
+            };
+            set_chk("poszero", 0x00000000);
+            set_chk("negzero", 0x80000000);
+            set_chk("one",     0x3F800000);
+            set_chk("negone",  0xBF800000);
+            set_chk("min",     0x00000001); // Float.MIN_VALUE (denormal)
+            set_chk("max",     0x7F7FFFFF);
+            set_chk("minnorm", 0x00800000); // Float.MIN_NORMAL
+            set_chk("posinf",  0x7F800000);
+            set_chk("neginf",  0xFF800000);
+            set_chk("nan",     0x7FC00000); // canonical qNaN
+            set_chk("snan",    0x7F800001); // signaling NaN
+            set_chk("nanpay",  0x7FA55555); // qNaN with payload
+            set_chk("negpi",   0xC0490FDB); // final = -pi
         }
-        // double -> pi bits 0x400921FB54442D18
+        else { ctx.check("fps_inst_F_resolves", false); }
+
+        // ---- double (iD): every IEEE special bit-exact, last write pi ----
+        if (auto p{ inst->get_field("iD") }; p.has_value())
         {
-            auto p{ inst->get_field("iD") };
-            ctx.check("inst_D_resolves", p.has_value());
-            if (p)
+            ctx.check("fps_inst_D_resolves", true);
+            auto set_chk = [&](const char* tag, std::uint64_t bits)
             {
-                p->set(bits_to_double(0x400921FB54442D18ULL));
+                p->set(bits_to_double(bits));
                 const auto v{ p->get() };
-                ctx.check("inst_D_variant_double", v.data.index() == kIdxDouble);
-                const double d = v; ctx.check("inst_D_bits_exact", double_bits(d) == 0x400921FB54442D18ULL);
-            }
+                ctx.check(std::string{ "fps_inst_D_variant_" } + tag, v.data.index() == kIdxDouble);
+                const double got = v;
+                ctx.check(std::string{ "fps_inst_D_bits_exact_" } + tag, double_bits(got) == bits);
+            };
+            set_chk("poszero", 0x0000000000000000ULL);
+            set_chk("negzero", 0x8000000000000000ULL);
+            set_chk("one",     0x3FF0000000000000ULL);
+            set_chk("negone",  0xBFF0000000000000ULL);
+            set_chk("min",     0x0000000000000001ULL); // Double.MIN_VALUE
+            set_chk("max",     0x7FEFFFFFFFFFFFFFULL);
+            set_chk("minnorm", 0x0010000000000000ULL); // Double.MIN_NORMAL
+            set_chk("posinf",  0x7FF0000000000000ULL);
+            set_chk("neginf",  0xFFF0000000000000ULL);
+            set_chk("nan",     0x7FF8000000000000ULL); // canonical qNaN
+            set_chk("snan",    0x7FF0000000000001ULL); // signaling NaN
+            set_chk("nanpay",  0x7FFAAAAAAAAAAAAAULL); // qNaN with payload
+            set_chk("pi",      0x400921FB54442D18ULL); // final
         }
+        else { ctx.check("fps_inst_D_resolves", false); }
+    }
+
+    // =====================================================================
+    //  9b. INSTANCE MULTI-FIELD DISTINCT-OFFSET WRITE.  Write all eight instance
+    //      primitives to DISTINCT values in a single pass, then re-read every one
+    //      -- proving each lands at its OWN offset and a write to one field never
+    //      disturbs another (no cross-field clobber across the whole object).
+    //      Performed AFTER the per-field matrix so it overwrites with a known set,
+    //      then RESTORES the documented finals so phases 13/15/16 are unaffected.
+    // =====================================================================
+    if (inst)
+    {
+        auto pZ{ inst->get_field("iZ") };
+        auto pB{ inst->get_field("iB") };
+        auto pS{ inst->get_field("iS") };
+        auto pC{ inst->get_field("iC") };
+        auto pI{ inst->get_field("iI") };
+        auto pJ{ inst->get_field("iJ") };
+        auto pF{ inst->get_field("iF") };
+        auto pD{ inst->get_field("iD") };
+        const bool all{ pZ && pB && pS && pC && pI && pJ && pF && pD };
+        ctx.check("fps_inst_multifield_all_resolve", all);
+        if (all)
+        {
+            // Write a distinct fingerprint into each of the eight slots.
+            pZ->set(false);
+            pB->set(static_cast<std::int8_t>(0x11));
+            pS->set(static_cast<std::int16_t>(0x2233));
+            pC->set(static_cast<std::uint16_t>(0x4455));
+            pI->set(static_cast<std::int32_t>(0x66778899));
+            pJ->set(static_cast<std::int64_t>(0xA0B0C0D0E0F00102ULL));
+            pF->set(bits_to_float(0x40000000)); // 2.0f
+            pD->set(bits_to_double(0x4010000000000000ULL)); // 4.0
+
+            // Every slot still holds its OWN fingerprint -- no cross-clobber.
+            ctx.check("fps_inst_multifield_Z", static_cast<bool>(pZ->get()) == false);
+            ctx.check("fps_inst_multifield_B", static_cast<std::int8_t>(pB->get()) == static_cast<std::int8_t>(0x11));
+            ctx.check("fps_inst_multifield_S", static_cast<std::int16_t>(pS->get()) == static_cast<std::int16_t>(0x2233));
+            ctx.check("fps_inst_multifield_C", static_cast<std::uint16_t>(pC->get()) == 0x4455);
+            ctx.check("fps_inst_multifield_I", static_cast<std::int32_t>(pI->get()) == static_cast<std::int32_t>(0x66778899));
+            ctx.check("fps_inst_multifield_J", static_cast<std::int64_t>(pJ->get()) == static_cast<std::int64_t>(0xA0B0C0D0E0F00102ULL));
+            ctx.check("fps_inst_multifield_F", float_bits(pF->get()) == 0x40000000u);
+            ctx.check("fps_inst_multifield_D", double_bits(pD->get()) == 0x4010000000000000ULL);
+
+            // RESTORE the documented finals for the Java-observed phases.
+            pZ->set(true);
+            pB->set(static_cast<std::int8_t>(0xFE));
+            pS->set(static_cast<std::int16_t>(0xCAFE));
+            pC->set(static_cast<std::uint16_t>(0x20AC));
+            pI->set(static_cast<std::int32_t>(0x0BADF00D));
+            pJ->set(static_cast<std::int64_t>(0x0123456789ABCDEFLL));
+            pF->set(bits_to_float(0xC0490FDB));
+            pD->set(bits_to_double(0x400921FB54442D18ULL));
+            ctx.check("fps_inst_multifield_restored_Z", static_cast<bool>(pZ->get()) == true);
+            ctx.check("fps_inst_multifield_restored_I", static_cast<std::int32_t>(pI->get()) == 0x0BADF00D);
+            ctx.check("fps_inst_multifield_restored_D", double_bits(pD->get()) == 0x400921FB54442D18ULL);
+        }
+    }
+
+    // =====================================================================
+    //  9c. INSTANCE SEQUENTIAL WRITES at distinct offsets (write A, write B,
+    //      both observed).  Writing seqB must NOT undo the earlier seqA write,
+    //      and writing seqA must not disturb seqB -- proven natively here and
+    //      Java-side in phases 13/16.  Final: seqA=0x0A0A0A0A seqB=0x0B0B0B0B.
+    // =====================================================================
+    if (inst)
+    {
+        auto pa{ inst->get_field("seqA") };
+        auto pb{ inst->get_field("seqB") };
+        ctx.check("fps_inst_seq_resolve", pa.has_value() && pb.has_value());
+        if (pa && pb)
+        {
+            // Baseline sentinels distinct from every value we write.
+            ctx.check("fps_inst_seqA_init", static_cast<std::int32_t>(pa->get()) == 0x5A5A0001);
+            ctx.check("fps_inst_seqB_init", static_cast<std::int32_t>(pb->get()) == 0x5A5A0002);
+            // Write A first.
+            pa->set(std::int32_t{ 0x0A0A0A0A });
+            ctx.check("fps_inst_seqA_written", static_cast<std::int32_t>(pa->get()) == 0x0A0A0A0A);
+            ctx.check("fps_inst_seqB_untouched_by_A", static_cast<std::int32_t>(pb->get()) == 0x5A5A0002);
+            // Then write B; A must remain.
+            pb->set(std::int32_t{ 0x0B0B0B0B });
+            ctx.check("fps_inst_seqB_written", static_cast<std::int32_t>(pb->get()) == 0x0B0B0B0B);
+            ctx.check("fps_inst_seqA_survived_B", static_cast<std::int32_t>(pa->get()) == 0x0A0A0A0A);
+            // Both observed simultaneously.
+            ctx.check("fps_inst_seq_both_observed",
+                      static_cast<std::int32_t>(pa->get()) == 0x0A0A0A0A
+                      && static_cast<std::int32_t>(pb->get()) == 0x0B0B0B0B);
+        }
+    }
+
+    // =====================================================================
+    //  9d. FINAL-FIELD WRITE CHARACTERISATION.  `final` is a Java verifier
+    //      constraint, NOT a storage attribute: the slot is a plain offset.  A
+    //      direct field_proxy::set() (raw memory) therefore BYPASSES the final
+    //      guarantee that putfield bytecode would refuse.  We characterise the
+    //      ACTUAL behaviour: the native write LANDS (the field changes away from
+    //      its sentinel) and is re-read bit-exact through the same proxy.  This
+    //      is a documented characterisation (NOT a bug), flagged [INFO]; the
+    //      Java-observed half (snapshot/getter) is also [INFO] because a JIT may
+    //      treat a final field as stable and cache a folded load.
+    //      Finals: finZ=true finB=0x7E finS=0x7EEF finC=0x20AC finI=0x0BADF00D
+    //      finJ=0x0123456789ABCDEF finF=2.5f finD=pi.
+    // =====================================================================
+    if (inst)
+    {
+        ctx.record("[INFO] field_primitives_set: final-field write is a CHARACTERISATION "
+                   "-- field_proxy::set writes raw memory and bypasses ACC_FINAL (which only "
+                   "constrains putfield bytecode + the verifier).  The native write lands; "
+                   "this is by design for a zero-JNI memory layer, not a guard bypass bug.");
+        // Every final field is driven through the IDENTICAL explicit-block idiom:
+        // write the documented final via the instance proxy, then native re-read
+        // bit-exact through that same proxy (the hard proof the raw write landed).
+        if (auto p{ inst->get_field("finZ") }; p.has_value())
+        {
+            p->set(true);
+            ctx.check("fps_final_finZ_native_write_lands", static_cast<bool>(p->get()) == true);
+        }
+        else { ctx.check("fps_final_finZ_resolves", false); }
+        if (auto p{ inst->get_field("finB") }; p.has_value())
+        {
+            p->set(static_cast<std::int8_t>(0x7E));
+            const std::int8_t b = p->get();
+            ctx.check("fps_final_finB_native_write_lands", b == static_cast<std::int8_t>(0x7E));
+        }
+        else { ctx.check("fps_final_finB_resolves", false); }
+        if (auto p{ inst->get_field("finS") }; p.has_value())
+        {
+            p->set(static_cast<std::int16_t>(0x7EEF));
+            const std::int16_t s = p->get();
+            ctx.check("fps_final_finS_native_write_lands", s == static_cast<std::int16_t>(0x7EEF));
+        }
+        else { ctx.check("fps_final_finS_resolves", false); }
+        if (auto p{ inst->get_field("finC") }; p.has_value())
+        {
+            p->set(static_cast<std::uint16_t>(0x20AC));
+            const std::uint16_t c = p->get();
+            ctx.check("fps_final_finC_native_write_lands", c == 0x20AC);
+        }
+        else { ctx.check("fps_final_finC_resolves", false); }
+        if (auto p{ inst->get_field("finI") }; p.has_value())
+        {
+            p->set(std::int32_t{ 0x0BADF00D });
+            ctx.check("fps_final_finI_native_write_lands", static_cast<std::int32_t>(p->get()) == 0x0BADF00D);
+        }
+        else { ctx.check("fps_final_finI_resolves", false); }
+        if (auto p{ inst->get_field("finJ") }; p.has_value())
+        {
+            p->set(std::int64_t{ 0x0123456789ABCDEFLL });
+            ctx.check("fps_final_finJ_native_write_lands", static_cast<std::int64_t>(p->get()) == 0x0123456789ABCDEFLL);
+        }
+        else { ctx.check("fps_final_finJ_resolves", false); }
+        if (auto p{ inst->get_field("finF") }; p.has_value())
+        {
+            p->set(2.5F);
+            ctx.check("fps_final_finF_native_write_lands", float_bits(p->get()) == 0x40200000u);
+        }
+        else { ctx.check("fps_final_finF_resolves", false); }
+        if (auto p{ inst->get_field("finD") }; p.has_value())
+        {
+            p->set(bits_to_double(0x400921FB54442D18ULL));
+            ctx.check("fps_final_finD_native_write_lands", double_bits(p->get()) == 0x400921FB54442D18ULL);
+        }
+        else { ctx.check("fps_final_finD_resolves", false); }
     }
 
     // =====================================================================
@@ -736,6 +1018,40 @@ namespace
             ctx.check("java_seen_clobJ_before_intact", fps::get_i64("seenClobBeforeJ") == 0x1111111111111111LL);
             ctx.check("java_seen_clobJ_mid_written",   fps::get_i64("seenClobMidJ") == 0x2DEF123456789ABCLL);
             ctx.check("java_seen_clobJ_after_intact",  fps::get_i64("seenClobAfterJ") == 0x3333333333333333LL);
+
+            // ---- sequential-write fields (distinct offsets), as observed by Java.
+            //      Both writes survived and landed at their own slots. ----
+            ctx.check("java_seen_seqA", fps::get_i32("seenSeqA") == 0x0A0A0A0A);
+            ctx.check("java_seen_seqB", fps::get_i32("seenSeqB") == 0x0B0B0B0B);
+
+            // ---- FINAL-field writes, as observed by Java (genuine getfield in the
+            //      snapshot).  This is the Java-visible half of the final-write
+            //      CHARACTERISATION: on the interpreter the snapshot re-reads the
+            //      raw slot, so the native write IS visible.  Guarded so that on a
+            //      hypothetical JIT-stable-folded read a mismatch degrades to [INFO]
+            //      (never a FAIL) -- the native-side write-lands checks in phase 9d
+            //      remain the hard proof. ----
+            {
+                auto fin_seen = [&](const char* tag, bool observed)
+                {
+                    if (observed) { ctx.check(tag, true); }
+                    else
+                    {
+                        ctx.record(std::string{ "[INFO] field_primitives_set: " } + tag
+                                   + " -- Java snapshot did not observe the native final-field "
+                                     "write (likely a JIT-stable folded load on this run); the "
+                                     "native re-read in phase 9d already proved the write landed.");
+                    }
+                };
+                fin_seen("java_seen_finZ_true", fps::get_bool("seenFinZ") == true);
+                fin_seen("java_seen_finB_7E",   fps::get_i8("seenFinB") == static_cast<std::int8_t>(0x7E));
+                fin_seen("java_seen_finS_7EEF", fps::get_i16("seenFinS") == static_cast<std::int16_t>(0x7EEF));
+                fin_seen("java_seen_finC_20AC", fps::get_u16("seenFinC") == 0x20AC);
+                fin_seen("java_seen_finI_0BADF00D", fps::get_i32("seenFinI") == 0x0BADF00D);
+                fin_seen("java_seen_finJ_full", fps::get_i64("seenFinJ") == 0x0123456789ABCDEFLL);
+                fin_seen("java_seen_finF_bits", static_cast<std::uint32_t>(fps::get_i32("seenFinFBits")) == 0x40200000u);
+                fin_seen("java_seen_finD_pi_bits", static_cast<std::uint64_t>(fps::get_i64("seenFinDBits")) == 0x400921FB54442D18ULL);
+            }
         }
     }
 
@@ -884,6 +1200,35 @@ namespace
         ctx.check("java_getter_clobJ_before_intact", fps::call_i64("getClobBeforeJ") == 0x1111111111111111LL);
         ctx.check("java_getter_clobJ_mid_written",   fps::call_i64("getClobMidJ") == 0x2DEF123456789ABCLL);
         ctx.check("java_getter_clobJ_after_intact",  fps::call_i64("getClobAfterJ") == 0x3333333333333333LL);
+
+        // sequential-write fields visible to Java getters (both writes survived).
+        ctx.check("java_getter_seqA", fps::call_i32("getSeqA") == 0x0A0A0A0A);
+        ctx.check("java_getter_seqB", fps::call_i32("getSeqB") == 0x0B0B0B0B);
+
+        // FINAL-field writes visible to Java getters (the second Java-observed
+        // channel of the final-write characterisation).  Guarded to degrade to
+        // [INFO] on a JIT-stable folded load (phase 9d is the hard native proof).
+        {
+            auto fin_getter = [&](const char* tag, bool observed)
+            {
+                if (observed) { ctx.check(tag, true); }
+                else
+                {
+                    ctx.record(std::string{ "[INFO] field_primitives_set: " } + tag
+                               + " -- Java getter did not return the native final-field write "
+                                 "(likely JIT-stable folded); native re-read in phase 9d is the "
+                                 "hard proof the write landed.");
+                }
+            };
+            fin_getter("java_getter_finZ_true", fps::call_bool("getFinZ") == true);
+            fin_getter("java_getter_finB_7E",   fps::call_i8("getFinB") == static_cast<std::int8_t>(0x7E));
+            fin_getter("java_getter_finS_7EEF", fps::call_i16("getFinS") == static_cast<std::int16_t>(0x7EEF));
+            fin_getter("java_getter_finC_20AC", fps::call_i32("getFinC") == 0x20AC); // char widened unsigned
+            fin_getter("java_getter_finI_0BADF00D", fps::call_i32("getFinI") == 0x0BADF00D);
+            fin_getter("java_getter_finJ_full", fps::call_i64("getFinJ") == 0x0123456789ABCDEFLL);
+            fin_getter("java_getter_finF_bits", static_cast<std::uint32_t>(fps::call_i32("getFinFBits")) == 0x40200000u);
+            fin_getter("java_getter_finD_pi_bits", static_cast<std::uint64_t>(fps::call_i64("getFinDBits")) == 0x400921FB54442D18ULL);
+        }
     }
 
     // =====================================================================

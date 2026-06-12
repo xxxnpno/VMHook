@@ -108,6 +108,48 @@ public final class FieldPrimitivesSet
     public long clobAfterJ   = 0x3333333333333333L;
 
     // =====================================================================
+    //  FINAL instance fields, one per primitive.  `final` is purely a Java
+    //  language / verifier constraint (ACC_FINAL); it changes NOTHING about
+    //  the in-heap storage layout -- the slot is a plain offset like any other.
+    //  The native side writes these through field_proxy::set() (raw memory) to
+    //  CHARACTERISE that direct memory access bypasses the final guarantee the
+    //  JVM enforces on putfield bytecode.  Each is pre-set to a sentinel so a
+    //  successful native write is detectable.  These are deliberately NOT
+    //  blank-final + constructor-assigned (which the JIT may constant-fold);
+    //  giving them a non-constant initializer via the helper keeps every read
+    //  a genuine getfield so the snapshot/getter observes the native write.
+    // =====================================================================
+    public final boolean finZ = idBool(SENT_Z);
+    public final byte    finB = idByte(SENT_B);
+    public final short   finS = idShort(SENT_S);
+    public final char    finC = idChar(SENT_C);
+    public final int     finI = idInt(SENT_I);
+    public final long    finJ = idLong(SENT_J);
+    public final float   finF = idFloat(Float.intBitsToFloat(SENT_F_BITS));
+    public final double  finD = idDouble(Double.longBitsToDouble(SENT_D_BITS));
+
+    // Identity helpers: a non-constant initializer for the final fields above,
+    // so javac cannot inline the constant and every Java read is a real getfield
+    // (the native write must be visible to executing bytecode, not folded away).
+    private static boolean idBool(boolean v)  { return v; }
+    private static byte    idByte(byte v)     { return v; }
+    private static short   idShort(short v)   { return v; }
+    private static char    idChar(char v)     { return v; }
+    private static int     idInt(int v)       { return v; }
+    private static long    idLong(long v)     { return v; }
+    private static float   idFloat(float v)   { return v; }
+    private static double  idDouble(double v) { return v; }
+
+    // =====================================================================
+    //  SEQUENTIAL-WRITE instance fields at DISTINCT offsets.  The native side
+    //  writes seqA then seqB; both must be independently observable (a write to
+    //  one never disturbs the other), proving distinct-offset writes do not
+    //  cross-clobber and that the second write does not undo the first.
+    // =====================================================================
+    public int seqA = 0x5A5A0001;
+    public int seqB = 0x5A5A0002;
+
+    // =====================================================================
     //  WITNESS fields -- the snapshot the probe (mode 1) writes via genuine
     //  getstatic/getfield + putstatic.  F/D captured as RAW bits.
     // =====================================================================
@@ -135,6 +177,20 @@ public final class FieldPrimitivesSet
     public static long seenClobBeforeJ;
     public static long seenClobMidJ;
     public static long seenClobAfterJ;
+
+    // Witnesses for the FINAL-field write characterisation (mode 1 snapshot).
+    public static boolean seenFinZ;
+    public static byte    seenFinB;
+    public static short   seenFinS;
+    public static char    seenFinC;
+    public static int     seenFinI;
+    public static long    seenFinJ;
+    public static int     seenFinFBits;
+    public static long    seenFinDBits;
+
+    // Witnesses for the SEQUENTIAL-write instance fields (mode 1 snapshot).
+    public static int seenSeqA;
+    public static int seenSeqB;
 
     // =====================================================================
     //  EXACT-EQUALITY witness array.  The native side, before driving the
@@ -221,6 +277,22 @@ public final class FieldPrimitivesSet
     public static long getClobMidJ()    { return instance.clobMidJ; }
     public static long getClobAfterJ()  { return instance.clobAfterJ; }
 
+    // FINAL-field getters: each is a genuine getfield through the held instance,
+    // so the value returned is exactly what executing bytecode reads AFTER the
+    // native raw-memory write (the final-write characterisation).  F/D as raw bits.
+    public static boolean getFinZ()     { return instance.finZ; }
+    public static byte    getFinB()     { return instance.finB; }
+    public static short   getFinS()     { return instance.finS; }
+    public static int     getFinC()     { return instance.finC; }            // char -> unsigned int
+    public static int     getFinI()     { return instance.finI; }
+    public static long    getFinJ()     { return instance.finJ; }
+    public static int     getFinFBits() { return Float.floatToRawIntBits(instance.finF); }
+    public static long    getFinDBits() { return Double.doubleToRawLongBits(instance.finD); }
+
+    // SEQUENTIAL-write getters (distinct-offset instance fields).
+    public static int getSeqA() { return instance.seqA; }
+    public static int getSeqB() { return instance.seqB; }
+
     // Float/double value-class predicates evaluated by JAVA bytecode (so the
     // native side can assert isNaN / isInfinite / signbit survived a real
     // getstatic, independent of any raw-bits canonicalisation concern).
@@ -269,6 +341,20 @@ public final class FieldPrimitivesSet
         seenClobBeforeJ = instance.clobBeforeJ;
         seenClobMidJ    = instance.clobMidJ;
         seenClobAfterJ  = instance.clobAfterJ;
+
+        // final-field characterisation witnesses (genuine getfield on finalfields)
+        seenFinZ     = instance.finZ;
+        seenFinB     = instance.finB;
+        seenFinS     = instance.finS;
+        seenFinC     = instance.finC;
+        seenFinI     = instance.finI;
+        seenFinJ     = instance.finJ;
+        seenFinFBits = Float.floatToRawIntBits(instance.finF);
+        seenFinDBits = Double.doubleToRawLongBits(instance.finD);
+
+        // sequential-write witnesses
+        seenSeqA = instance.seqA;
+        seenSeqB = instance.seqB;
     }
 
     /**

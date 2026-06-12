@@ -2,6 +2,11 @@ package vmhook.fixtures;
 
 import vmhook.Harness;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 /**
  * Fixture for the {@code method_return_types} feature: exercises
  * {@code vmhook::method_proxy::call()} / {@code static_method(...)->call()}
@@ -99,6 +104,11 @@ public final class ReturnTypes
     /** identityHashCode of SINGLETON (the receiver), for the self-as-Object check. */
     public static volatile int selfIdentity;
 
+    /** Bumped by {@link #returnsVoidWithSideEffect()} so the native side can prove a
+     *  VOID-returning call() actually EXECUTED the method (the side effect is
+     *  observable), not merely decoded its absent result to a monostate. */
+    public static volatile int voidSideEffect;
+
     // -- the method the native module hooks to obtain a live thread --------------
 
     /** Hookable instance method.  The native detour on this method performs every
@@ -117,6 +127,15 @@ public final class ReturnTypes
     public void returnsVoid()
     {
         triggerCount += 0;   // a real (no-op) side effect so the body is non-trivial
+    }
+
+    /** A void-returning method with an OBSERVABLE side effect: it increments
+     *  {@link #voidSideEffect}.  The native side snapshots that field, invokes this
+     *  through call() (which decodes to monostate), then re-reads the field -- proving
+     *  the void dispatch RAN the method body, not just produced an empty value_t. */
+    public void returnsVoidWithSideEffect()
+    {
+        voidSideEffect++;
     }
 
     // ========================================================================
@@ -227,6 +246,46 @@ public final class ReturnTypes
     /** Returns {@code this} through an Object-typed signature: the decoded wrapper's
      *  instance must equal the receiver OOP (identity via the reference path). */
     public Object returnsSelfAsObject() { return this; }
+
+    // ========================================================================
+    //  DESCRIPTOR EDGE CASES -- the RUNTIME object is identical across several of
+    //  these, but the DECLARED return type in the method descriptor is what drives
+    //  call()'s decode.  These prove the dispatch keys off the descriptor, not the
+    //  runtime class:
+    //    * an INTERFACE-typed return whose runtime value is a String decodes through
+    //      the generic-reference branch (descriptor "Ljava/lang/CharSequence;" != the
+    //      special-cased "Ljava/lang/String;"), NOT the eager-std::string branch.
+    //    * the method's OWN class type as the return ("Lvmhook/fixtures/ReturnTypes;").
+    //    * a deeply-nested generic ERASED to a bare interface descriptor
+    //      ("Ljava/util/List;") -- the generic parameters vanish at the bytecode
+    //      level, so the descriptor the native side sees carries no <...>.
+    // ========================================================================
+
+    /** Interface-typed return ({@code CharSequence}) whose runtime value is a
+     *  {@code String}.  The descriptor is {@code Ljava/lang/CharSequence;}, so call()
+     *  does NOT take the {@code Ljava/lang/String;} eager-decode branch -- it stores a
+     *  generic compressed-OOP reference the native side decodes via read_java_string
+     *  on the recovered String OOP.  Proves descriptor-driven (not runtime-class)
+     *  String special-casing. */
+    public CharSequence returnsCharSequence() { return "iface-charseq"; }
+
+    /** The fixture's OWN class type as the declared return
+     *  ({@code Lvmhook/fixtures/ReturnTypes;}); returns {@code this} so the decoded
+     *  wrapper's instance OOP equals the receiver. */
+    public ReturnTypes returnsOwnType() { return this; }
+
+    /** A deeply-nested generic return: {@code List<Map<String,int[]>>}.  At the
+     *  bytecode level the descriptor is the bare erased {@code Ljava/util/List;}, so
+     *  call() decodes a generic reference (a non-null usable OOP) -- the native side
+     *  cannot and does not try to recover the erased type arguments. */
+    public List<Map<String, int[]>> returnsNestedGeneric()
+    {
+        final List<Map<String, int[]>> outer = new ArrayList<Map<String, int[]>>();
+        final Map<String, int[]> inner = new HashMap<String, int[]>();
+        inner.put("k", new int[] { 1, 2, 3 });
+        outer.add(inner);
+        return outer;
+    }
 
     static
     {
