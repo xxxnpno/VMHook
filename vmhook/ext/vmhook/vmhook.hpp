@@ -8776,10 +8776,19 @@ namespace vmhook
     // makes it visible to GCC's first-phase name lookup inside the template.
     namespace detail::auto_repair { static auto ensure_started() noexcept -> void; }
 
+    // The trailing `bool* already_hooked` out-parameter (defaulted to
+    // nullptr) lets scoped_hook<T>() distinguish a fresh install from the
+    // "method was already hooked" short-circuit *under the same
+    // g_hooked_methods_mutex critical section* that performs the install,
+    // so the duplicate-install contract is decided race-free.  Every other
+    // caller passes nothing and observes the unchanged bool return ("true
+    // if installed or already active").  See scoped_hook<T>() and the
+    // short-circuit inside the definition for the honest-handle contract.
     template<class wrapper_type>
     static auto hook(const std::string_view method_name,
                      const std::string_view method_signature,
-                     auto&& user_detour) -> bool;
+                     auto&& user_detour,
+                     bool* already_hooked = nullptr) -> bool;
 
     template<class wrapper_type>
     static auto hook(const std::string_view method_name, auto&& user_detour)
@@ -8799,8 +8808,17 @@ namespace vmhook
     template<class wrapper_type>
     static auto hook(const std::string_view method_name,
                      const std::string_view method_signature,
-                     auto&& user_detour) -> bool
+                     auto&& user_detour,
+                     bool* already_hooked) -> bool
     {
+        // Default the optional out-parameter to "not a duplicate" up front so
+        // every early-return / throw path leaves it well-defined for callers
+        // that passed a non-null pointer (scoped_hook<T>()).
+        if (already_hooked)
+        {
+            *already_hooked = false;
+        }
+
         try
         {
             using traits_t = vmhook::detail::function_traits<std::remove_cvref_t<decltype(user_detour)>>;
@@ -8877,6 +8895,22 @@ namespace vmhook
             {
                 if (hooked_method_entry.method == found_method)
                 {
+                    // This Method* is already hooked.  hook<T>() keeps its
+                    // documented "true if installed OR already active" return
+                    // so name-based callers (on_class_loaded, on_exception,
+                    // hook_by_signature) stay non-fatal.  But we DECLINE to
+                    // register a second detour/owner: only the first hook
+                    // fires (common_detour is first-match-and-return), so
+                    // silently sharing the single entry would mislead a second
+                    // scoped_hook into believing its distinct detour is live.
+                    // Signal the duplicate so scoped_hook<T>() hands back a
+                    // not-installed handle instead.  Decided here, under
+                    // g_hooked_methods_mutex, so the fresh-vs-duplicate verdict
+                    // cannot race a concurrent install of the same method.
+                    if (already_hooked)
+                    {
+                        *already_hooked = true;
+                    }
                     return true;
                 }
             }
@@ -9789,17 +9823,51 @@ namespace vmhook
         @return  A hook_handle whose installed() is true on success and
                  false on failure.  Failure modes (class not found,
                  method not found, etc.) match vmhook::hook<T>.
+
+                 Duplicate installs are reported honestly: if the target
+                 Method* is ALREADY hooked, this returns a not-installed
+                 handle (installed() == false) rather than a live-looking
+                 handle that secretly shares the first hook's single entry.
+                 Only one detour per method fires (the first one installed),
+                 so a second scoped_hook does NOT install a distinct detour;
+                 the pre-existing hook keeps owning the method and is the one
+                 that uninstalls.  The duplicate handle's destruction is a
+                 safe no-op (it never disarms the original).  Full
+                 multi-detour-per-method chaining is intentionally out of
+                 scope here.
     */
     template<class wrapper_type>
     inline auto scoped_hook(const std::string_view method_name,
                             const std::string_view method_signature,
                             auto&&                 user_detour) -> hook_handle
     {
+        bool already_hooked{ false };
         if (!vmhook::hook<wrapper_type>(method_name, method_signature,
-                                         std::forward<decltype(user_detour)>(user_detour)))
+                                         std::forward<decltype(user_detour)>(user_detour),
+                                         &already_hooked))
         {
             VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): underlying vmhook::hook() failed - returning empty handle.",
                        vmhook::error_tag, typeid(wrapper_type).name(),
+                       method_name, method_signature);
+            return hook_handle{};
+        }
+
+        // Honest duplicate-install contract: this Method* was ALREADY hooked
+        // before this call, so vmhook::hook<T>() declined to register our
+        // (distinct) detour as a second owner of the one shared entry — only
+        // the first hook fires.  Returning a live-looking handle here would
+        // be the misleading-contract bug: the caller would believe its detour
+        // is installed, and dropping EITHER handle would disarm the single
+        // shared hook (a double-disarm).  Instead return a not-installed
+        // handle (installed() == false).  Its destructor's stop() is a
+        // guaranteed no-op (method == nullptr), so it never touches the first
+        // hook's entry — no double-free, no premature disarm of the original.
+        if (already_hooked)
+        {
+            VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): method already hooked - this duplicate install "
+                       "registers no second detour; returning a not-installed handle (installed()==false). "
+                       "The pre-existing hook stays live and owns the method.",
+                       vmhook::warning_tag, typeid(wrapper_type).name(),
                        method_name, method_signature);
             return hook_handle{};
         }

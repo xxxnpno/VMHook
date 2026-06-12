@@ -21,8 +21,10 @@
 //     enumeration, since the bound overload is not portably the source-first one;
 //   * a descriptor matching NO overload fails install (false), while a different
 //     valid descriptor on the same name still installs (true);
-//   * duplicate install on name+signature: second returns true, FIRST detour
-//     stays active, second silently dropped (current behaviour, locked);
+//   * duplicate install on name+signature: the FIRST scoped_hook owns the entry
+//     and fires; the SECOND scoped_hook on the same Method* is reported HONESTLY
+//     as not-installed (installed()==false) and registers no second detour
+//     (robustness #7 honest duplicate-install contract);
 //   * scoped_hook teardown is per-overload: dropping the (I)I handle stops the
 //     int detour but a still-live (J)J handle keeps firing;
 //   * force-return on the selected overload replaces ONLY that overload's return.
@@ -694,15 +696,20 @@ VMHOOK_JVM_MODULE(hook_signature)
     }
 
     // =====================================================================
-    // Block 9 — DUPLICATE install on the SAME name+signature.  Current behaviour
-    //   (vmhook.hpp:7908-7914): the second install sees the method already in
-    //   g_hooked_methods and returns true WITHOUT replacing the detour, so the
-    //   FIRST detour stays active and the second is silently dropped.  We drive
-    //   both installs through scoped_hook (NEVER shutdown_hooks): the second
-    //   scoped_hook still returns an installed() handle because the underlying
-    //   hook<T>() returned true, even though its detour was dropped.  Both
-    //   handles target the same Method*, so dropping them at scope exit removes
-    //   the single g_hooked_methods entry cleanly.  Lock the documented contract.
+    // Block 9 — DUPLICATE install on the SAME name+signature -> HONEST contract
+    //   (robustness #7 fix): the second install sees the method already in
+    //   g_hooked_methods.  hook<T>() still returns true (so name-based callers
+    //   stay non-fatal), but it signals the duplicate to scoped_hook<T>(), which
+    //   returns a NOT-installed handle.  So the FIRST detour stays active and is
+    //   the sole owner; the SECOND handle reports installed()==false and its
+    //   detour is never registered.  We drive both installs through scoped_hook
+    //   (NEVER shutdown_hooks): only h_first owns the single g_hooked_methods
+    //   entry, so only h_first removes it at scope exit — h_second's destruction
+    //   is a no-op (it never owned the entry, so no double-free / no disarm of
+    //   the first hook).  Lock the honest contract.
+    //   (Formerly: h_second used to report installed()==true via the duplicate
+    //   short-circuit even though its detour was discarded, and the two handles
+    //   shared one entry.)
     // =====================================================================
     {
         auto h_first{ vmhook::scoped_hook<hook_sig_fixture>(
@@ -718,21 +725,19 @@ VMHOOK_JVM_MODULE(hook_signature)
                 g_dup_second.fetch_add(1, std::memory_order_relaxed);
             }) };
 
-        // The first install really took; the second reports installed() too
-        // (its hook<T>() returned true via the duplicate short-circuit) even
-        // though its detour was discarded.
+        // The first install really took; the second is HONESTLY reported as
+        // not-installed (its detour was declined, not silently shared).
         ctx.check("dup_first_handle_installed", h_first.installed());
-        ctx.check("dup_second_handle_reports_installed_via_short_circuit",
-                  h_second.installed());
+        ctx.check("dup_second_handle_not_installed", !h_second.installed());
 
         const bool done{ drive(ctx, 2) };   // process(int) once
         ctx.check("dup_probe_completed", done);
 
         ctx.check("dup_first_detour_still_fires", g_dup_first.load() == 1);
-        ctx.check("dup_second_detour_was_silently_dropped", g_dup_second.load() == 0);
+        ctx.check("dup_second_detour_never_registered", g_dup_second.load() == 0);
         ctx.check("dup_total_fires_is_one_not_two",
                   (g_dup_first.load() + g_dup_second.load()) == 1);
-    }   // both handles drop -> single g_hooked_methods entry removed.
+    }   // h_first removes the single entry; h_second's destruction is a no-op.
 
     // =====================================================================
     // Block 10 — EXACTLY-ONCE-PER-CALL on the selected overload across MANY

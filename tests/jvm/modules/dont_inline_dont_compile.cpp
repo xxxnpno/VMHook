@@ -623,9 +623,12 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
     }
 
     // =====================================================================
-    // Scenario 2 — IDEMPOTENT install.  A second hook<T>() on the SAME method
-    //   is a no-op that returns true (vmhook.hpp:8038-8044) and must NOT flip
-    //   the _dont_inline bit twice or clobber the access-flags word.  Snapshot
+    // Scenario 2 — IDEMPOTENT install.  A second LOW-LEVEL hook<T>() on the SAME
+    //   method is a no-op that returns true (the duplicate-membership
+    //   short-circuit) and must NOT flip the _dont_inline bit twice or clobber
+    //   the access-flags word.  (This is the raw hook<T>() path, whose true-on-
+    //   duplicate return is unchanged by the scoped_hook honest-handle fix.)
+    //   Snapshot
     //   Method::_flags after the first install and after a redundant second
     //   attempt; they must be byte-identical, with the bit set exactly once.
     // =====================================================================
@@ -909,20 +912,19 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
     }
 
     // =====================================================================
-    // Scenario 6 — SHARED-Method* teardown semantics (CHARACTERISATION of a real
-    //   vmhook trait — see the closing REPORT).  vmhook keys hooks by Method*
-    //   with NO refcount: a duplicate hook<T>() on an already-hooked Method
-    //   short-circuits (returns true WITHOUT a second g_hooked_methods entry,
-    //   vmhook.hpp:8038-8044), yet scoped_hook still hands back a hook_handle
-    //   bound to that SAME Method* (vmhook.hpp:8978).  So dropping that scoped
-    //   handle runs hook_handle::stop() on the SHARED entry: it clears
-    //   _dont_inline + NO_COMPILE and ERASES the single entry
-    //   (vmhook.hpp:8828-8841) — taking the still-wanted persistent hook down
-    //   with it.  This is a genuine "no per-handle refcount on a shared Method*"
-    //   behaviour; we DOCUMENT it (the durable multi-DISTINCT-Method* selective
-    //   teardown is already covered by shutdown_hooks_teardown.cpp scenario 3),
-    //   asserting what the code ACTUALLY does so the module stays green and the
-    //   trait is on record rather than silently mis-asserted.
+    // Scenario 6 — DUPLICATE scoped_hook on an ALREADY-hooked Method* does NOT
+    //   disarm the wanted hook (HONEST duplicate-install contract, robustness
+    //   #7 fix).  A persistent low-level hook<T>() keeps the Method hooked.  We
+    //   then take a scoped_hook on the SAME Method*: hook<T>() sees the method
+    //   already in g_hooked_methods and DECLINES to register a second owner, so
+    //   scoped_hook returns a NOT-installed handle (installed()==false).  When
+    //   that handle expires, its hook_handle::stop() short-circuits on the null
+    //   method — it does NOT erase the shared entry — so the persistent hook's
+    //   inhibitors stay set and the persistent hook KEEPS FIRING.  This is the
+    //   exact hazard the fix removes: previously the duplicate handle aliased the
+    //   single entry and dropping it tore the still-wanted hook down with it.
+    //   (The durable multi-DISTINCT-Method* selective teardown is covered by
+    //   shutdown_hooks_teardown.cpp scenario 3.)
     // =====================================================================
     {
         vmhook::hotspot::method* const m{ find_hot_method() };
@@ -936,7 +938,6 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
             ctx.check("shared_no_compile_set_with_persistent_hook", no_compile_set(m));
         }
 
-        bool dup_short_circuit_returns_true{ false };
         {
             auto handle{ vmhook::scoped_hook<dip_fixture>(
                 HOT_NAME,
@@ -944,63 +945,64 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
                    const std::unique_ptr<dip_fixture>&,
                    std::int32_t)
                 {
-                    // Same Method already hooked: the scoped install short-circuits
-                    // on duplicate-membership.  Body intentionally minimal.
+                    // Same Method already hooked: the duplicate install is
+                    // DECLINED.  Body intentionally minimal (never registered).
                 }) };
-            // The duplicate install still yields a usable handle bound to the
-            // shared Method* (installed() reflects the short-circuit's true).
-            dup_short_circuit_returns_true = handle.installed();
-            ctx.check("shared_duplicate_scoped_handle_is_installed",
-                      dup_short_circuit_returns_true);
+            // HONEST contract: the duplicate scoped_hook on an already-hooked
+            // Method* is reported as NOT installed (it registered no second
+            // owner of the shared entry).
+            ctx.check("shared_duplicate_scoped_handle_not_installed",
+                      !handle.installed());
         }
-        // The scoped handle just exited -> hook_handle::stop() ran on the SHARED
-        // entry.  Because there is no refcount, the persistent hook's entry is
-        // now gone and the inhibitors are cleared.  Assert the ACTUAL behaviour.
+        // The scoped handle just exited.  Because it was never installed, its
+        // stop() was a no-op: the persistent hook's entry is UNTOUCHED, so its
+        // inhibitors are still set.  Assert the persistent hook survives intact.
         if (m != nullptr)
         {
             const bool di_after{ dont_inline_set(m) };
             const bool nc_after{ no_compile_set(m) };
             ctx.record(std::string{ "[INFO] dont_inline_dont_compile scenario 6: "
-                       "after a scoped_hook on an ALREADY-hooked Method* expired, "
-                       "_dont_inline=" } + (di_after ? "still set" : "CLEARED")
+                       "after a DUPLICATE scoped_hook on an already-hooked Method* "
+                       "expired, _dont_inline=" } + (di_after ? "still set" : "CLEARED")
                        + ", NO_COMPILE=" + (nc_after ? "still set" : "CLEARED")
-                       + " (vmhook keys hooks by Method* with no refcount: the shared "
-                         "entry was erased by the handle's stop()).");
-            // _dont_inline bit-readback best-effort on JDK 21+; NO_COMPILE clear
-            // and the persistent-hook-silenced behaviour below stay HARD and are
-            // the durable proof the shared entry was actually torn down.
+                       + " (honest duplicate-install contract: the duplicate handle "
+                         "never owned the entry, so its no-op stop() left the "
+                         "persistent hook intact).");
+            // _dont_inline bit-readback best-effort on JDK 21+; NO_COMPILE-still-set
+            // and the persistent-hook-still-fires behaviour below stay HARD and are
+            // the durable proof the persistent hook was NOT disarmed.
             if (dont_inline_observable())
             {
-                ctx.check("shared_dont_inline_cleared_by_shared_handle_stop", !di_after);
+                ctx.check("shared_dont_inline_still_set_after_duplicate_handle_stop", di_after);
             }
             else
             {
                 ctx.record("[INFO] dont_inline_dont_compile: "
-                           "'shared_dont_inline_cleared_by_shared_handle_stop' "
+                           "'shared_dont_inline_still_set_after_duplicate_handle_stop' "
                            "best-effort - JDK21+ Method::_flags width: _dont_inline bit "
-                           "not observable via get_flags(); shared-entry teardown proven "
-                           "by shared_persistent_hook_silenced_by_shared_handle_stop.");
+                           "not observable via get_flags(); persistent-hook survival proven "
+                           "by shared_persistent_hook_still_fires_after_duplicate_handle_stop.");
             }
-            ctx.check("shared_no_compile_cleared_by_shared_handle_stop", !nc_after);
+            ctx.check("shared_no_compile_still_set_after_duplicate_handle_stop", nc_after);
         }
 
-        // Consequence of the shared-entry erase: the persistent hook no longer
-        // fires (its entry was removed too).  Characterise + assert the real
-        // outcome so the trait is locked in.
+        // Consequence of the honest decline: the persistent hook is UNAFFECTED
+        // by the duplicate handle's expiry and keeps firing.  Mode 1 = one hot()
+        // dispatch -> exactly one fire.
         const bool done{ drive(ctx, 1) };
         ctx.check("shared_post_probe_completed", done);
-        const std::int32_t fired_after_shared_stop{ g_fire_count.load() };
+        const std::int32_t fired_after_duplicate_stop{ g_fire_count.load() };
         ctx.record("[INFO] dont_inline_dont_compile scenario 6: persistent hook fired "
-                   + std::to_string(fired_after_shared_stop)
-                   + " time(s) after the shared scoped handle expired "
-                     "(0 == the shared entry was torn down with the handle).");
-        ctx.check("shared_persistent_hook_silenced_by_shared_handle_stop",
-                  fired_after_shared_stop == 0);
-        // The original body still runs byte-exact regardless.
-        ctx.check("shared_byte_exact_original_after_shared_stop",
+                   + std::to_string(fired_after_duplicate_stop)
+                   + " time(s) after the DUPLICATE scoped handle expired "
+                     "(1 == the persistent hook survived the duplicate's no-op stop()).");
+        ctx.check("shared_persistent_hook_still_fires_after_duplicate_handle_stop",
+                  fired_after_duplicate_stop == 1);
+        // Allow-through: the original body still runs byte-exact.
+        ctx.check("shared_byte_exact_original_after_duplicate_stop",
                   dip_fixture::get_last_hot_result() == HOT_ORIGINAL);
 
-        // Belt-and-braces bulk teardown (state is already clean here).
+        // Now tear down the persistent hook for real (bulk reset).
         vmhook::shutdown_hooks();
         if (m != nullptr)
         {
