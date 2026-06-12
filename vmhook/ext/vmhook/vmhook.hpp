@@ -2975,84 +2975,6 @@ namespace vmhook
             }
 
             /*
-                @brief Returns the implemented-interface klasses of this InstanceKlass.
-                @details
-                Reads InstanceKlass._transitive_interfaces (the COMPLETE set: this
-                class's directly-declared interfaces, every super-interface of those,
-                and the interfaces of every superclass) as an Array<Klass*>, mirroring
-                the get_methods_ptr() layout (`[int32 _length @0][pad @4][Klass* _data @8]`).
-                The transitive set is exactly what interface-DEFAULT-method resolution
-                needs: an inherited default declared on any (super-)interface lives in
-                here even when it is several interface-inheritance hops away.
-
-                FAIL-SAFE / JDK-portability:  This is gated entirely on the live
-                gHotSpotVMStructs export.  If "InstanceKlass::_transitive_interfaces"
-                is not exported on the running JDK, we transparently fall back to
-                "_local_interfaces" (directly-declared interfaces only); if NEITHER is
-                exported, *count is set to 0 and nullptr is returned, so every caller
-                simply finds nothing and preserves the pre-existing superclass-only
-                behaviour.  No offset is ever hardcoded, so a JDK that renames or drops
-                these fields degrades to "interface methods not walked" rather than
-                misreading memory.  (Both fields have been exported by HotSpot since
-                JDK 8; _transitive_interfaces is the long-standing name.)
-
-                @param count  Out-parameter receiving the number of interface klasses
-                              (clamped to [0, 65535]; 0 on any failure).
-                @return Pointer to the first Klass* in the array, or nullptr if neither
-                        interface array is resolvable / the array is empty.
-                @note This klass* must be an InstanceKlass* (i.e. a regular Java class).
-            */
-            auto get_interfaces_ptr(std::int32_t& count) const noexcept
-                -> vmhook::hotspot::klass**
-            {
-                count = 0;
-
-                if (!vmhook::hotspot::is_valid_pointer(this))
-                {
-                    return nullptr;
-                }
-
-                // Prefer the transitive set (inherited / super-interface defaults
-                // included); fall back to the locally-declared set if the running
-                // JDK does not export the transitive one.  Resolved once and cached.
-                static const vmhook::hotspot::vm_struct_entry_t* const transitive_entry{
-                    vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_transitive_interfaces") };
-                static const vmhook::hotspot::vm_struct_entry_t* const local_entry{
-                    vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_local_interfaces") };
-
-                const vmhook::hotspot::vm_struct_entry_t* const entry{
-                    transitive_entry ? transitive_entry : local_entry };
-                if (!entry)
-                {
-                    // Neither interface array is exported on this JDK — fail safe.
-                    return nullptr;
-                }
-
-                void* const array{ *reinterpret_cast<void**>(
-                    reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::klass*>(this)) + entry->offset) };
-                if (!vmhook::hotspot::is_valid_pointer(array))
-                {
-                    return nullptr;
-                }
-
-                // Sanity-clamp the Array<Klass*>::_length the same way
-                // get_methods_count() does: a torn / mis-resolved read must not
-                // drive a caller off the end of the array.  A class can declare at
-                // most 65535 direct interfaces (interfaces_count is u2); the
-                // transitive closure can exceed that in pathological synthetic
-                // hierarchies, but clamping there is still safe (we just stop early)
-                // and protects against a wild count from a wrong offset.
-                const std::int32_t length{ *reinterpret_cast<std::int32_t*>(array) };
-                if (length <= 0 || length > 65535)
-                {
-                    return nullptr;
-                }
-
-                count = length;
-                return reinterpret_cast<vmhook::hotspot::klass**>(reinterpret_cast<std::uint8_t*>(array) + 8);
-            }
-
-            /*
                 @brief Returns the java.lang.Class mirror object associated with this klass.
                 @details
                 Reads Klass::_java_mirror, which is an OopHandle (introduced as such in JDK 17).
@@ -8752,19 +8674,10 @@ namespace vmhook
     // makes it visible to GCC's first-phase name lookup inside the template.
     namespace detail::auto_repair { static auto ensure_started() noexcept -> void; }
 
-    // The trailing `bool* already_hooked` out-parameter (defaulted to
-    // nullptr) lets scoped_hook<T>() distinguish a fresh install from the
-    // "method was already hooked" short-circuit *under the same
-    // g_hooked_methods_mutex critical section* that performs the install,
-    // so the duplicate-install contract is decided race-free.  Every other
-    // caller passes nothing and observes the unchanged bool return ("true
-    // if installed or already active").  See scoped_hook<T>() and the
-    // short-circuit inside the definition for the honest-handle contract.
     template<class wrapper_type>
     static auto hook(const std::string_view method_name,
                      const std::string_view method_signature,
-                     auto&& user_detour,
-                     bool* already_hooked = nullptr) -> bool;
+                     auto&& user_detour) -> bool;
 
     template<class wrapper_type>
     static auto hook(const std::string_view method_name, auto&& user_detour)
@@ -8784,17 +8697,8 @@ namespace vmhook
     template<class wrapper_type>
     static auto hook(const std::string_view method_name,
                      const std::string_view method_signature,
-                     auto&& user_detour,
-                     bool* already_hooked) -> bool
+                     auto&& user_detour) -> bool
     {
-        // Default the optional out-parameter to "not a duplicate" up front so
-        // every early-return / throw path leaves it well-defined for callers
-        // that passed a non-null pointer (scoped_hook<T>()).
-        if (already_hooked)
-        {
-            *already_hooked = false;
-        }
-
         try
         {
             using traits_t = vmhook::detail::function_traits<std::remove_cvref_t<decltype(user_detour)>>;
@@ -8871,22 +8775,6 @@ namespace vmhook
             {
                 if (hooked_method_entry.method == found_method)
                 {
-                    // This Method* is already hooked.  hook<T>() keeps its
-                    // documented "true if installed OR already active" return
-                    // so name-based callers (on_class_loaded, on_exception,
-                    // hook_by_signature) stay non-fatal.  But we DECLINE to
-                    // register a second detour/owner: only the first hook
-                    // fires (common_detour is first-match-and-return), so
-                    // silently sharing the single entry would mislead a second
-                    // scoped_hook into believing its distinct detour is live.
-                    // Signal the duplicate so scoped_hook<T>() hands back a
-                    // not-installed handle instead.  Decided here, under
-                    // g_hooked_methods_mutex, so the fresh-vs-duplicate verdict
-                    // cannot race a concurrent install of the same method.
-                    if (already_hooked)
-                    {
-                        *already_hooked = true;
-                    }
                     return true;
                 }
             }
@@ -9799,51 +9687,17 @@ namespace vmhook
         @return  A hook_handle whose installed() is true on success and
                  false on failure.  Failure modes (class not found,
                  method not found, etc.) match vmhook::hook<T>.
-
-                 Duplicate installs are reported honestly: if the target
-                 Method* is ALREADY hooked, this returns a not-installed
-                 handle (installed() == false) rather than a live-looking
-                 handle that secretly shares the first hook's single entry.
-                 Only one detour per method fires (the first one installed),
-                 so a second scoped_hook does NOT install a distinct detour;
-                 the pre-existing hook keeps owning the method and is the one
-                 that uninstalls.  The duplicate handle's destruction is a
-                 safe no-op (it never disarms the original).  Full
-                 multi-detour-per-method chaining is intentionally out of
-                 scope here.
     */
     template<class wrapper_type>
     inline auto scoped_hook(const std::string_view method_name,
                             const std::string_view method_signature,
                             auto&&                 user_detour) -> hook_handle
     {
-        bool already_hooked{ false };
         if (!vmhook::hook<wrapper_type>(method_name, method_signature,
-                                         std::forward<decltype(user_detour)>(user_detour),
-                                         &already_hooked))
+                                         std::forward<decltype(user_detour)>(user_detour)))
         {
             VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): underlying vmhook::hook() failed - returning empty handle.",
                        vmhook::error_tag, typeid(wrapper_type).name(),
-                       method_name, method_signature);
-            return hook_handle{};
-        }
-
-        // Honest duplicate-install contract: this Method* was ALREADY hooked
-        // before this call, so vmhook::hook<T>() declined to register our
-        // (distinct) detour as a second owner of the one shared entry — only
-        // the first hook fires.  Returning a live-looking handle here would
-        // be the misleading-contract bug: the caller would believe its detour
-        // is installed, and dropping EITHER handle would disarm the single
-        // shared hook (a double-disarm).  Instead return a not-installed
-        // handle (installed() == false).  Its destructor's stop() is a
-        // guaranteed no-op (method == nullptr), so it never touches the first
-        // hook's entry — no double-free, no premature disarm of the original.
-        if (already_hooked)
-        {
-            VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): method already hooked - this duplicate install "
-                       "registers no second detour; returning a not-installed handle (installed()==false). "
-                       "The pre-existing hook stays live and owns the method.",
-                       vmhook::warning_tag, typeid(wrapper_type).name(),
                        method_name, method_signature);
             return hook_handle{};
         }
@@ -16023,19 +15877,7 @@ namespace vmhook
                 }
             }
 
-            // Superclass-chain miss: fall back to the IMPLEMENTED-INTERFACE chain so
-            // an inherited interface DEFAULT method (declared on an interface, not on
-            // this class or a superclass) is reachable through the concrete wrapper.
-            // Fails safe to the legacy "not found" result on any JDK that does not
-            // export the interface VMStructs (see find_interface_default_method).
-            if (vmhook::hotspot::method* const default_method{
-                    find_interface_default_method(resolved_klass, method_name, std::string_view{}) })
-            {
-                return vmhook::method_proxy{ this->instance, default_method, default_method->get_signature() };
-            }
-
-            VMHOOK_LOG("{} object::get_method('{}'): method not found in class hierarchy "
-                       "(superclass chain) or implemented-interface default methods.",
+            VMHOOK_LOG("{} object::get_method('{}'): method not found in class hierarchy.",
                        vmhook::error_tag, method_name);
             return std::nullopt;
         }
@@ -16093,19 +15935,8 @@ namespace vmhook
                 }
             }
 
-            // Superclass-chain miss: fall back to the IMPLEMENTED-INTERFACE chain for
-            // an inherited interface DEFAULT method matching this exact name+signature.
-            // Fail-safe on JDKs without the interface VMStructs (legacy "not found").
-            if (vmhook::hotspot::method* const default_method{
-                    find_interface_default_method(resolved_klass, method_name, method_signature) })
-            {
-                return vmhook::method_proxy{ this->instance, default_method, default_method->get_signature(),
-                                             /*signature_pinned=*/true };
-            }
-
             VMHOOK_LOG("{} object::get_method('{}{}'): no method with this exact name+signature "
-                       "found in class hierarchy (superclass chain) or implemented-interface "
-                       "default methods.",
+                       "found in class hierarchy.",
                        vmhook::error_tag, method_name, method_signature);
             return std::nullopt;
         }
@@ -16157,14 +15988,6 @@ namespace vmhook
                 }
             }
 
-            // NOTE: no interface-default fallback here (unlike the two INSTANCE
-            // overloads).  Interface DEFAULT methods are by definition NON-static
-            // instance methods, so they can never satisfy this STATIC lookup; and a
-            // `static` interface method (Java 8+) is not inherited by an implementor,
-            // so walking a concrete class's interface chain for one would be wrong.
-            // When the wrapper type IS the interface itself, the static interface
-            // method lives on that interface's own _methods array and the superclass
-            // walk above (which starts AT the interface klass) already finds it.
             VMHOOK_LOG("{} object::get_method('{}') (static): no STATIC method with this name "
                        "found in class hierarchy.",
                        vmhook::error_tag, method_name);
@@ -16226,10 +16049,6 @@ namespace vmhook
                 }
             }
 
-            // NOTE: no interface-default fallback here — see the name-only static
-            // overload above.  Default methods are non-static instance methods and
-            // static interface methods are not inherited, so neither belongs on this
-            // STATIC resolution path.
             VMHOOK_LOG("{} object::get_method('{}{}') (static): no STATIC method with this exact "
                        "name+signature found in class hierarchy.",
                        vmhook::error_tag, method_name, method_signature);
@@ -16331,140 +16150,6 @@ namespace vmhook
                 return (*flags & 0x0008u) != 0u;
             }
             return false;
-        }
-
-        /*
-            @brief Searches a klass's implemented interfaces for a matching DEFAULT method.
-            @details
-            The superclass-chain walk that every get_method() overload runs first
-            follows Klass::_super only (concrete class -> ... -> java.lang.Object) and
-            therefore CANNOT see a method that is declared on an implemented interface
-            rather than on the class or one of its superclasses.  An interface DEFAULT
-            method (Java 8+) lives exactly there: on the interface, never copied onto
-            the implementor's own InstanceKlass._methods array.  This helper closes
-            that gap — it is the SECOND-CHANCE lookup the overloads fall back to ONLY
-            after the superclass walk has failed, so it can never change which method
-            an already-resolvable name/name+sig binds to (the superclass/own-method
-            result still wins, unchanged).
-
-            It walks InstanceKlass._transitive_interfaces (the complete, flattened set
-            of every interface this class implements directly or transitively — see
-            klass::get_interfaces_ptr) and, for each interface klass, scans that
-            interface's own _methods array for a method whose name (and, when
-            method_signature is non-empty, whose JVM descriptor) matches.
-
-            ONLY genuine DEFAULT methods qualify: the candidate must be neither
-            ACC_STATIC (0x0008) nor ACC_ABSTRACT (0x0400).  This deliberately excludes
-              * abstract interface methods (e.g. `String speak();`) — there is no body
-                to dispatch to on the interface; the concrete override on the class is
-                what the superclass walk already returns, so an abstract interface
-                method must NOT shadow it or be returned standalone, and
-              * `static` interface methods (Java 8+) and JDK 8 `private` interface
-                helpers — a `static` interface method is not inherited by implementors,
-                and dispatching one as if it were an instance default would be wrong.
-            What remains is precisely the set of callable default methods, which is the
-            documented scope of this feature.
-
-            DETERMINISM / AMBIGUITY:  a class may implement several interfaces that each
-            supply a same-named default (Java would reject that at compile time without
-            an explicit override, but vmhook resolves against whatever the running JVM
-            actually loaded).  We return the FIRST match in
-            _transitive_interfaces array order and stop — a single, stable, documented
-            choice.  Callers needing a specific one should pass an exact name+signature.
-
-            FAIL-SAFE:  get_interfaces_ptr() returns nullptr/0 whenever the interface
-            VMStructs entries are not exported on the running JDK (or on any torn /
-            invalid read), so on such a JDK this helper simply finds nothing and the
-            caller's behaviour is byte-for-byte the legacy superclass-only result.
-            Every interface-klass and Method* pointer is is_valid_pointer-gated before
-            use, matching the safety contract of the superclass walk.
-
-            @param start_klass        The (already-resolved) klass to search the
-                                      interfaces of.  Must be an InstanceKlass*.
-            @param method_name        Exact Java method name to match.
-            @param method_signature   Exact JVM descriptor to match, or empty for a
-                                      name-only match (first matching default wins).
-            @return  The matching default Method*, or nullptr if none is found / the
-                     interface arrays are not resolvable on this JDK.
-        */
-        static auto find_interface_default_method(vmhook::hotspot::klass* const start_klass,
-                                                  const std::string_view method_name,
-                                                  const std::string_view method_signature) noexcept
-            -> vmhook::hotspot::method*
-        {
-            if (!start_klass || !vmhook::hotspot::is_valid_pointer(start_klass))
-            {
-                return nullptr;
-            }
-
-            std::int32_t interface_count{ 0 };
-            vmhook::hotspot::klass** const interfaces{ start_klass->get_interfaces_ptr(interface_count) };
-            if (!interfaces || interface_count <= 0)
-            {
-                // No interface array on this JDK (fail-safe) or the class implements
-                // none: nothing to add beyond the superclass walk.
-                return nullptr;
-            }
-
-            for (std::int32_t i{ 0 }; i < interface_count; ++i)
-            {
-                vmhook::hotspot::klass* const iface{ interfaces[i] };
-                if (!iface || !vmhook::hotspot::is_valid_pointer(iface))
-                {
-                    continue;
-                }
-
-                const std::int32_t method_count{ iface->get_methods_count() };
-                vmhook::hotspot::method** const methods_array{ iface->get_methods_ptr() };
-                if (!methods_array || method_count <= 0)
-                {
-                    continue;
-                }
-
-                for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
-                {
-                    vmhook::hotspot::method* const current_method{ methods_array[method_index] };
-                    if (!current_method || !vmhook::hotspot::is_valid_pointer(current_method))
-                    {
-                        continue;
-                    }
-                    if (current_method->get_name() != method_name)
-                    {
-                        continue;
-                    }
-                    if (!method_signature.empty() && current_method->get_signature() != method_signature)
-                    {
-                        continue;
-                    }
-
-                    // DEFAULT-method gate: a real default has a body and is an
-                    // instance method, i.e. NEITHER abstract NOR static.  Skip
-                    // abstract interface declarations (no body to call; the concrete
-                    // override is found by the superclass walk that already ran) and
-                    // static/private interface helpers (not inherited by implementors).
-                    if (const std::uint32_t* const flags{ current_method->get_access_flags() })
-                    {
-                        constexpr std::uint32_t acc_static{ 0x0008u };
-                        constexpr std::uint32_t acc_abstract{ 0x0400u };
-                        if ((*flags & (acc_static | acc_abstract)) != 0u)
-                        {
-                            continue;
-                        }
-                    }
-                    else
-                    {
-                        // Cannot confirm the method kind (no access-flags VMStruct):
-                        // fail CLOSED — do not risk returning an abstract/static
-                        // interface method as if it were a callable default.
-                        continue;
-                    }
-
-                    // First matching DEFAULT method in transitive-interface order.
-                    return current_method;
-                }
-            }
-
-            return nullptr;
         }
     };
 
