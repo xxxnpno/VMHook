@@ -91,6 +91,15 @@ namespace
         static auto set_go(bool value) -> void          { static_field("go")->set(value); }
         static auto get_done() -> bool                   { return static_field("done")->get(); }
         static auto get_trigger_count() -> std::int32_t  { return static_field("triggerCount")->get(); }
+
+        // ---- Java-published cross-check witnesses (read AFTER run_probe) ----
+        static auto has_coder_field() -> bool            { return static_field("jHasCoderField")->get(); }
+        static auto coder_regular() -> std::int32_t      { return static_field("jCoderRegular")->get(); }
+        static auto coder_cafe() -> std::int32_t         { return static_field("jCoderCafe")->get(); }
+        static auto coder_cjk() -> std::int32_t          { return static_field("jCoderCjk")->get(); }
+        static auto coder_emoji() -> std::int32_t        { return static_field("jCoderEmoji")->get(); }
+        static auto coder_max_bmp() -> std::int32_t      { return static_field("jCoderMaxBmp")->get(); }
+        static auto big_len() -> std::int32_t            { return static_field("jBigLen")->get(); }
     };
 
     // ---- One captured call() result ----------------------------------------
@@ -205,6 +214,22 @@ namespace
         capture(*self, "bmpBoundary");
         capture(*self, "asciiBoundary");
 
+        // More BMP — control chars, the max BMP code point, the replacement
+        // char, Unicode whitespace.  All BMP, so path-independent.
+        capture(*self, "controlChars");
+        capture(*self, "maxBmp");
+        capture(*self, "replacementChar");
+        capture(*self, "unicodeWhitespace");
+
+        // Lone / reversed surrogates: a Java String is a raw UTF-16 unit
+        // sequence, so an unpaired or out-of-order surrogate is a legal String.
+        // BOTH decoders emit the 3-byte CESU encoding of each surrogate code unit
+        // (they do NOT '?'-substitute like String.getBytes(UTF_8) does), so these
+        // are ALSO path-independent.
+        capture(*self, "loneHighSurrogate");
+        capture(*self, "loneLowSurrogate");
+        capture(*self, "reversedSurrogates");
+
         // Supplementary plane + NUL family — path-divergent.
         capture(*self, "emoji");
         capture(*self, "astralMid");
@@ -213,6 +238,22 @@ namespace
         capture(*self, "nulOnly");
         capture(*self, "leadingNul");
         capture(*self, "trailingNul");
+
+        // Very large returns — ABOVE 4096 and ABOVE 65536 code units.  On the
+        // call_jni path GetStringUTFChars returns the whole String (no cap); on the
+        // call_stub path read_java_string rejects any length > 4096 -> "".
+        if (auto proxy{ self->get_method("bigString") })
+        {
+            record_value("bigString:5000",  proxy->call(static_cast<std::int32_t>(5000)));
+        }
+        if (auto proxy{ self->get_method("bigString") })
+        {
+            record_value("bigString:70000", proxy->call(static_cast<std::int32_t>(70000)));
+        }
+        if (auto proxy{ self->get_method("bigString") })
+        {
+            record_value("bigString:131072", proxy->call(static_cast<std::int32_t>(131072)));
+        }
 
         // Static dispatch (FindClass / pool_holder branch, not GetObjectClass),
         // ALL via static_method(...).
@@ -224,6 +265,17 @@ namespace
         capture_static("staticEmoji");
         capture_static("staticInteriorNul");
         capture_static("staticDynamic");
+        capture_static("staticMaxBmp");
+        capture_static("staticLoneSurrogate");
+
+        // Static very-large return (>65536) via static_method + explicit
+        // signature (the static dispatch path, null-receiver proxy).
+        if (auto proxy{ method_string_fixture::static_method(
+                "staticBigString", "(I)Ljava/lang/String;") })
+        {
+            record_value("static:staticBigString:70000",
+                         proxy->call(static_cast<std::int32_t>(70000)));
+        }
 
         // Argument round-trips (String arg -> String return), INSTANCE.
         if (auto proxy{ self->get_method("echo") })
@@ -247,6 +299,45 @@ namespace
         if (auto proxy{ self->get_method("echo") })
         {
             record_value("echo:long", proxy->call(std::string(300, 'Z')));
+        }
+        // echo of a CJK arg: make_java_string's utf8_to_utf16 decodes the 3-byte
+        // sequences to BMP units; the return re-encodes them identically (BMP
+        // modified-UTF-8 == standard UTF-8), so this round-trips byte-for-byte on
+        // call_jni.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:cjk",
+                         proxy->call(std::string{ "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E" }));
+        }
+        // echo of a STANDARD 4-byte emoji arg: utf8_to_utf16 decodes it to a
+        // surrogate PAIR (U+1F600); on the call_jni return GetStringUTFChars
+        // re-encodes that pair as a 6-byte CESU sequence — so a 4-byte input comes
+        // back as 6 bytes (the standard-UTF-8 -> modified-UTF-8 asymmetry, the
+        // subtlety most encoders get wrong).  Cross-checked against writeUTF.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:emoji", proxy->call(std::string{ "\xF0\x9F\x98\x80" }));
+        }
+        // echo of an interior-NUL arg "a\0b" (RAW NUL in the std::string):
+        // utf8_to_utf16 reads it length-counted (raw 0x00 -> U+0000, never a
+        // C-string cut) into the 3-char Java String 'a' U+0000 'b'; on the
+        // call_jni return U+0000 re-encodes to C0 80, giving "a\xC0\x80b" (4 bytes).
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:nul", proxy->call(std::string("a\0b", 3)));
+        }
+        // echo of the max BMP code point U+FFFF (as a 3-byte UTF-8 arg).
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:maxBmp", proxy->call(std::string{ "\xEF\xBF\xBF" }));
+        }
+        // echo of a >65536-code-unit arg: make_java_string routes any input above
+        // the 4096-unit TLAB ceiling to the GC-aware JNIEnv::NewString fallback,
+        // which builds the FULL String (no truncation); the call_jni return then
+        // hands all 70000 bytes back.  Proves the over-cap ARGUMENT path end to end.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:big70000", proxy->call(std::string(70000, 'Q')));
         }
 
         // concat(a, b): two String args -> one String return (INSTANCE).
@@ -585,6 +676,181 @@ namespace
                           r5000.value == std::string(5000, 'A'));
             }
 
+            // ============ VERY LARGE returns: >4096 and >65536 ===============
+            // bigString(n) has NO 8192 clamp (unlike repeatA), so it returns a
+            // String far above the read_java_string backing-array cap AND above
+            // 65536 code units.  call_jni's GetStringUTFChars has no cap and returns
+            // the whole String; call_stub's read_java_string rejects any length >
+            // 4096 -> "".  Assert the path-correct contract for each.
+            const observation big5000{ get("bigString:5000") };
+            const observation big70000{ get("bigString:70000") };
+            const observation big131072{ get("bigString:131072") };
+            const observation s_big70000{ get("static:staticBigString:70000") };
+            ctx.check("bigString5000_captured",   big5000.captured);
+            ctx.check("bigString70000_captured",  big70000.captured);
+            if (stub_path)
+            {
+                // read_java_string caps at 4096 -> every over-cap return is "".
+                ctx.check("bigString5000_call_stub_empty",   big5000.value.empty());
+                ctx.check("bigString70000_call_stub_empty",  big70000.value.empty());
+                ctx.check("bigString131072_call_stub_empty", big131072.value.empty());
+                ctx.check("staticBigString70000_call_stub_empty", s_big70000.value.empty());
+            }
+            else
+            {
+                // GetStringUTFChars returns the FULL String at any length.
+                ctx.check("bigString5000_call_jni_len_5000",   big5000.byte_len == 5000);
+                ctx.check("bigString5000_call_jni_all_A",
+                          big5000.value == std::string(5000, 'A'));
+                // >65536 — the headline large case.
+                ctx.check("bigString70000_call_jni_len_70000", big70000.byte_len == 70000);
+                ctx.check("bigString70000_call_jni_all_A",
+                          big70000.value == std::string(70000, 'A'));
+                // >131072 (2x 65536), to be thorough about "very long".
+                ctx.check("bigString131072_call_jni_len_131072",
+                          big131072.byte_len == 131072);
+                ctx.check("bigString131072_call_jni_all_A",
+                          big131072.value == std::string(131072, 'A'));
+                // Same >65536 case via the STATIC dispatch path.
+                ctx.check("staticBigString70000_call_jni_len_70000",
+                          s_big70000.byte_len == 70000);
+                ctx.check("staticBigString70000_call_jni_all_A",
+                          s_big70000.value == std::string(70000, 'A'));
+            }
+
+            // ============ ECHO round-trips of every shape (String arg) =======
+            // The argument travels make_java_string (utf8_to_utf16 -> hand-built
+            // array for <=4096 units, else GC-aware JNIEnv::NewString), and the
+            // return travels the live decoder.  These prove the ARGUMENT encode for
+            // CJK, an astral scalar, an interior NUL, max-BMP, and a >65536 arg.
+
+            // CJK arg -> identical 9 bytes back (BMP, path-independent).
+            const observation echo_cjk{ get("echo:cjk") };
+            ctx.check("echo_cjk_round_trip",
+                      echo_cjk.value == "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E");
+            ctx.check("echo_cjk_len_9", echo_cjk.byte_len == 9);
+
+            // max-BMP arg U+FFFF -> 3-byte EF BF BF back (path-independent).
+            const observation echo_max_bmp{ get("echo:maxBmp") };
+            ctx.check("echo_maxBmp_round_trip", echo_max_bmp.value == "\xEF\xBF\xBF");
+
+            // Astral emoji arg.  KEY ASYMMETRY between the two String-arg encoders:
+            //   * call_jni (CI path) packs a std::string arg via NewStringUTF, which
+            //     interprets the bytes as MODIFIED UTF-8 read as a C string.  A
+            //     STANDARD 4-byte sequence (F0 9F 98 80) is NOT valid modified UTF-8
+            //     (which has no 4-byte form), so HotSpot's lenient NewStringUTF does
+            //     NOT reconstruct U+1F600 — it decodes the lead byte to a single
+            //     char (observed: U+00F0 -> the 2 bytes C3 B0 on the return).  This
+            //     is characterised, not hard-asserted, because it is NewStringUTF's
+            //     malformed-input behaviour, not vmhook's decode (which this module
+            //     owns and which is byte-exact for every WELL-FORMED case above).
+            //   * call_stub packs via make_java_string -> utf8_to_utf16, which DOES
+            //     decode the 4-byte sequence to a surrogate pair, so the return is
+            //     the 4-byte standard form again.
+            // To pass a SUPPLEMENTARY scalar through the call_jni String-arg path
+            // intact, the caller must hand modified UTF-8 (a CESU surrogate pair);
+            // that is out of scope here (the return-decode is the subject).
+            const observation echo_emoji{ get("echo:emoji") };
+            ctx.record(std::string{ "[INFO] echo:emoji (std-4byte arg via String-arg encoder) = [" }
+                       + to_hex(echo_emoji.value)
+                       + "]  (call_jni NewStringUTF mangles a non-modified-UTF-8 astral arg; "
+                         "call_stub utf8_to_utf16 round-trips it)");
+            if (stub_path)
+            {
+                ctx.check("echo_emoji_call_stub_4byte",
+                          echo_emoji.value == "\xF0\x9F\x98\x80");
+            }
+            else
+            {
+                // Deterministic NewStringUTF malformed-lead decode -> U+00F0 (C3 B0).
+                ctx.check("echo_emoji_call_jni_newstringutf_mangles",
+                          echo_emoji.value == "\xC3\xB0");
+            }
+
+            // Interior-NUL arg "a\0b" (RAW NUL in the std::string).  ANOTHER
+            // String-arg-encoder asymmetry:
+            //   * call_jni packs via NewStringUTF(arg.c_str()) — a C string — so it
+            //     TRUNCATES at the first interior NUL: the Java String is just "a",
+            //     and the return is "a".  This is a real (if documented) limitation
+            //     of passing NUL-bearing bytes through the JNI String-arg path; the
+            //     RETURN decoder handles interior NULs perfectly (see the
+            //     interiorNul / nulOnly / leadingNul / trailingNul cases — those are
+            //     method RETURNS, decoded by call()/read_java_string, not args).
+            //   * call_stub packs via make_java_string -> utf8_to_utf16, which is
+            //     length-counted (raw 0x00 -> U+0000, no C-string cut), so the Java
+            //     String is 'a' U+0000 'b' and the return re-encodes U+0000 to C0 80
+            //     -> "a\xC0\x80b".
+            const observation echo_nul{ get("echo:nul") };
+            ctx.record(std::string{ "[INFO] echo:nul (\"a\\0b\" arg via String-arg encoder) = [" }
+                       + to_hex(echo_nul.value)
+                       + "]  (call_jni NewStringUTF truncates the arg at the interior NUL -> \"a\"; "
+                         "call_stub utf8_to_utf16 keeps it)");
+            if (stub_path)
+            {
+                ctx.check("echo_nul_call_stub_bytes", echo_nul.value == std::string("a\0b", 3));
+                ctx.check("echo_nul_call_stub_len3",  echo_nul.byte_len == 3);
+            }
+            else
+            {
+                // C-string truncation at the interior NUL: arg "a\0b" -> Java "a".
+                ctx.check("echo_nul_call_jni_truncates_at_nul", echo_nul.value == "a");
+                ctx.check("echo_nul_call_jni_len1",             echo_nul.byte_len == 1);
+            }
+
+            // >65536-code-unit arg: make_java_string routes any input above the
+            // 4096-unit TLAB ceiling to the GC-aware JNIEnv::NewString fallback,
+            // which builds the FULL String (no truncation — the e547746 fix).  The
+            // call_jni return then yields all 70000 bytes; the call_stub return
+            // caps the READ at 4096 -> "".  This is the over-cap ARGUMENT proof.
+            const observation echo_big{ get("echo:big70000") };
+            if (stub_path)
+            {
+                // The arg built the full 70000-char String (make_java_string did
+                // not truncate); read_java_string just refuses to read it back.
+                ctx.check("echo_big70000_call_stub_read_capped_empty", echo_big.value.empty());
+            }
+            else
+            {
+                ctx.check("echo_big70000_call_jni_len_70000", echo_big.byte_len == 70000);
+                ctx.check("echo_big70000_call_jni_all_Q",
+                          echo_big.value == std::string(70000, 'Q'));
+            }
+
+            // ============ CODER WITNESS (Latin-1 coder 0 vs UTF-16 coder 1) ==
+            // The native decode that the call_jni path uses is coder-AGNOSTIC
+            // (GetStringUTFChars normalises both layouts), and the byte-exact
+            // assertions above already prove the call_stub read_java_string decoder
+            // handles BOTH the LATIN1 (coder 0) and UTF16 (coder 1) branches.  Here
+            // we additionally LABEL, from Java's own view, which physical coder each
+            // returned String used, so test_results.txt documents that the ASCII /
+            // Latin-1 returns are coder 0 and the >0xFF returns are coder 1.  On
+            // JDK 8 there is no coder field (char[] layout) -> witnesses are -1 and
+            // we assert nothing (the decodes above already covered the char[] path).
+            const bool has_coder{ method_string_fixture::has_coder_field() };
+            const std::int32_t c_regular{ method_string_fixture::coder_regular() };
+            const std::int32_t c_cafe{ method_string_fixture::coder_cafe() };
+            const std::int32_t c_cjk{ method_string_fixture::coder_cjk() };
+            const std::int32_t c_emoji{ method_string_fixture::coder_emoji() };
+            const std::int32_t c_max_bmp{ method_string_fixture::coder_max_bmp() };
+            ctx.record(std::string{ "[INFO] String coder field present (JDK9+)=" }
+                       + (has_coder ? "true" : "false")
+                       + " coder{regular=" + std::to_string(c_regular)
+                       + " cafe=" + std::to_string(c_cafe)
+                       + " cjk=" + std::to_string(c_cjk)
+                       + " emoji=" + std::to_string(c_emoji)
+                       + " maxBmp=" + std::to_string(c_max_bmp) + "}");
+            // Only assert a coder we could actually read (>= 0).  Latin-1-
+            // representable content -> coder 0; any char > 0xFF -> coder 1.
+            if (c_regular >= 0) { ctx.check("coder_regular_is_LATIN1", c_regular == 0); }
+            if (c_cafe    >= 0) { ctx.check("coder_cafe_is_LATIN1",    c_cafe == 0); }
+            if (c_cjk     >= 0) { ctx.check("coder_cjk_is_UTF16",      c_cjk == 1); }
+            if (c_emoji   >= 0) { ctx.check("coder_emoji_is_UTF16",    c_emoji == 1); }
+            if (c_max_bmp >= 0) { ctx.check("coder_maxBmp_is_UTF16",   c_max_bmp == 1); }
+            // Java's own length for the big string confirms the fixture built the
+            // full >65536 String (independent of which decoder read it back).
+            ctx.check("java_bigString_len_70000",
+                      method_string_fixture::big_len() == 70000);
+
             // ============ LEAK / STABILITY loop ==============================
 
             ctx.check("leak_loop_ran",
@@ -651,6 +917,73 @@ namespace
             const observation s_cjk{ get("static:staticCjk") };
             ctx.check("staticCjk_value_utf8",
                       s_cjk.value == "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E");
+
+            // ---- Control chars U+0001..U+001F + U+007F (all ASCII range) -----
+            // Every byte is < 0x80, so both decoders emit them 1:1, in order.
+            const observation control{ get("controlChars") };
+            ctx.check("controlChars_captured", control.captured);
+            ctx.check("controlChars_len_32",   control.byte_len == 32);
+            {
+                std::string expect;
+                expect.reserve(32);
+                for (int c{ 0x01 }; c <= 0x1F; ++c)
+                {
+                    expect += static_cast<char>(c);
+                }
+                expect += static_cast<char>(0x7F);
+                ctx.check("controlChars_value_exact", control.value == expect);
+            }
+
+            // ---- The max BMP code point U+FFFF -> 3-byte EF BF BF ------------
+            // The highest 3-byte UTF-8 sequence; identical on both paths.
+            const observation max_bmp{ get("maxBmp") };
+            ctx.check("maxBmp_captured",    max_bmp.captured);
+            ctx.check("maxBmp_value_utf8",  max_bmp.value == "\xEF\xBF\xBF");
+            ctx.check("maxBmp_len_3",       max_bmp.byte_len == 3);
+            ctx.check("maxBmp_is_string",   max_bmp.is_string);
+
+            // ---- The replacement char U+FFFD -> 3-byte EF BF BD -------------
+            const observation repl{ get("replacementChar") };
+            ctx.check("replacementChar_value_utf8", repl.value == "\xEF\xBF\xBD");
+            ctx.check("replacementChar_len_3",      repl.byte_len == 3);
+
+            // ---- Unicode whitespace U+00A0 / U+2028 / U+2029 ---------------
+            // C2 A0 (2-byte) + E2 80 A8 (3-byte) + E2 80 A9 (3-byte) = 8 bytes.
+            const observation uws{ get("unicodeWhitespace") };
+            ctx.check("unicodeWhitespace_value_utf8",
+                      uws.value == "\xC2\xA0\xE2\x80\xA8\xE2\x80\xA9");
+            ctx.check("unicodeWhitespace_len_8", uws.byte_len == 8);
+
+            // ---- Lone / reversed surrogates --------------------------------
+            // A Java String is a raw UTF-16 code-unit array, so an unpaired or
+            // out-of-order surrogate is a legal String.  BOTH vmhook decoders emit
+            // the 3-byte CESU encoding of each surrogate code unit (the call_jni
+            // GetStringUTFChars path and the call_stub read_java_string path agree
+            // — neither '?'-substitutes the way String.getBytes(UTF_8) does), so
+            // these are PATH-INDEPENDENT.  Cross-checked: writeUTF and
+            // read_java_string both yield ED A0 BD for U+D83D.
+            const observation lone_hi{ get("loneHighSurrogate") };
+            ctx.check("loneHighSurrogate_captured", lone_hi.captured);
+            ctx.check("loneHighSurrogate_cesu",     lone_hi.value == "\xED\xA0\xBD");
+            ctx.check("loneHighSurrogate_len_3",    lone_hi.byte_len == 3);
+            ctx.record(std::string{ "[INFO] loneHighSurrogate = [" } + to_hex(lone_hi.value)
+                       + "] (vmhook emits 3-byte CESU; Java getBytes(UTF_8) would give 3F '?')");
+
+            const observation lone_lo{ get("loneLowSurrogate") };
+            ctx.check("loneLowSurrogate_cesu",  lone_lo.value == "\xED\xB8\x80");
+            ctx.check("loneLowSurrogate_len_3", lone_lo.byte_len == 3);
+
+            // low THEN high — must NOT combine; two independent 3-byte CESU seqs.
+            const observation rev_surr{ get("reversedSurrogates") };
+            ctx.check("reversedSurrogates_no_combine",
+                      rev_surr.value == "\xED\xB8\x80\xED\xA0\xBD");
+            ctx.check("reversedSurrogates_len_6", rev_surr.byte_len == 6);
+
+            // static max-BMP / lone-surrogate through the static dispatch path.
+            const observation s_max_bmp{ get("static:staticMaxBmp") };
+            ctx.check("staticMaxBmp_value_utf8", s_max_bmp.value == "\xEF\xBF\xBF");
+            const observation s_lone{ get("static:staticLoneSurrogate") };
+            ctx.check("staticLoneSurrogate_cesu", s_lone.value == "\xED\xA0\xBD");
 
             // ============ SUPPLEMENTARY PLANE: path-DIVERGENT ================
             // call_jni (modified UTF-8): a supplementary scalar is a CESU-8
@@ -762,6 +1095,18 @@ namespace
             // The interior-NUL result must contain MORE than just the leading 'a'
             // (proves the NUL did not terminate the decode early on either path).
             ctx.check("no_truncation_interiorNul_past_nul", inul.byte_len >= 3);
+            // The newly-added shapes are non-empty on BOTH paths (all BMP / CESU).
+            ctx.check("no_truncation_controlChars_nonempty",  !control.value.empty());
+            ctx.check("no_truncation_maxBmp_nonempty",        !max_bmp.value.empty());
+            ctx.check("no_truncation_loneSurrogate_nonempty", !lone_hi.value.empty());
+            ctx.check("no_truncation_unicodeWs_nonempty",     !uws.value.empty());
+            // The >65536 return is non-empty only on call_jni (call_stub caps the
+            // READ to 4096 -> ""); guard it on the path that returns it.
+            if (!stub_path)
+            {
+                ctx.check("no_truncation_bigString70000_nonempty", !big70000.value.empty());
+                ctx.check("no_truncation_echoBig70000_nonempty",   !echo_big.value.empty());
+            }
         }
     }
 }

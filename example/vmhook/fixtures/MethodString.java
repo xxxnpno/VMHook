@@ -42,6 +42,21 @@ public final class MethodString
     /** Bumped every time {@link #trigger()} actually runs (hook liveness). */
     public static volatile int triggerCount;
 
+    // ---- Java-published cross-check witnesses (populated in the probe AFTER
+    //      trigger() runs, on the Java thread) -------------------------------
+    // The native module reads these after run_probe to (a) label which physical
+    // backing-array coder each returned String used -- LATIN1 (0) vs UTF16 (1) on
+    // JDK 9+, or -1 on JDK 8 where there is no `coder` field -- so the test
+    // documents that the ASCII/Latin-1 returns are coder 0 and the >0xFF returns
+    // are coder 1, and (b) confirm Java's own length for the very-large string.
+    public static volatile boolean jHasCoderField;  // true on JDK 9+, false on 8
+    public static volatile int     jCoderRegular;    // ASCII "hello world" -> 0 / -1
+    public static volatile int     jCoderCafe;       // Latin-1 (U+00E9)    -> 0 / -1
+    public static volatile int     jCoderCjk;        // CJK (>0xFF)         -> 1 / -1
+    public static volatile int     jCoderEmoji;      // astral (UTF-16)     -> 1 / -1
+    public static volatile int     jCoderMaxBmp;     // U+FFFF (>0xFF)      -> 1 / -1
+    public static volatile int     jBigLen;          // bigString(70000).length() == 70000
+
     // ---- Canonical unicode constants (ASCII-safe escaped source) -----------
     // Written purely with backslash-u escapes so javac decodes them identically
     // on every CI host (Windows cmd / Linux / macOS) no matter the file
@@ -106,6 +121,40 @@ public final class MethodString
      * then U+1F680 (rocket, D83D DE80) -- two surrogate pairs, four code units.
      */
     public static final String TWO_ASTRAL = "\ud83d\ude00\ud83d\ude80";
+
+    /** The highest BMP code point U+FFFF -> 3-byte EF BF BF on BOTH decode paths. */
+    public static final String MAX_BMP = "\uffff";
+
+    /** The Unicode replacement character U+FFFD -> 3-byte EF BF BD on both paths. */
+    public static final String REPLACEMENT = "\ufffd";
+
+    /**
+     * A LONE high surrogate U+D83D with no trailing low surrogate.  A Java String
+     * is just a UTF-16 code-unit sequence, so this is a legal (if ill-formed)
+     * String.  BOTH vmhook decoders emit the 3-byte CESU encoding of the surrogate
+     * code unit (ED A0 BD) -- they do NOT substitute '?' the way
+     * String.getBytes(UTF_8) does.  (Cross-checked: writeUTF and read_java_string
+     * both yield ED A0 BD.)
+     */
+    public static final String LONE_HIGH_SURROGATE = "\ud83d";
+
+    /** A LONE low surrogate U+DE00 -> 3-byte CESU ED B8 80 on both paths. */
+    public static final String LONE_LOW_SURROGATE = "\ude00";
+
+    /**
+     * A REVERSED surrogate pair: low U+DE00 THEN high U+D83D.  Must NOT be combined
+     * into an astral scalar (order is wrong), so each is decoded independently to
+     * its own 3-byte CESU sequence: ED B8 80 ED A0 BD (6 bytes) on both paths.
+     */
+    public static final String REVERSED_SURROGATES = "\ude00\ud83d";
+
+    /**
+     * Non-breaking space U+00A0 (2-byte) + line separator U+2028 (3-byte) +
+     * paragraph separator U+2029 (3-byte): the Unicode-whitespace characters that
+     * routinely break JSON/JS string handling.  BMP, so path-independent
+     * (C2 A0 E2 80 A8 E2 80 A9, 8 bytes).
+     */
+    public static final String UNICODE_WS = "\u00a0\u2028\u2029";
 
     // ---- A field whose String value an accessor method returns ------------
     private String instanceField = "instance-field-value";
@@ -237,6 +286,86 @@ public final class MethodString
     public String twoAstral()
     {
         return TWO_ASTRAL;
+    }
+
+    /** The highest BMP code point U+FFFF (3-byte EF BF BF). */
+    public String maxBmp()
+    {
+        return MAX_BMP;
+    }
+
+    /** The Unicode replacement char U+FFFD (3-byte EF BF BD). */
+    public String replacementChar()
+    {
+        return REPLACEMENT;
+    }
+
+    /** A lone high surrogate U+D83D (3-byte CESU ED A0 BD on both paths). */
+    public String loneHighSurrogate()
+    {
+        return LONE_HIGH_SURROGATE;
+    }
+
+    /** A lone low surrogate U+DE00 (3-byte CESU ED B8 80 on both paths). */
+    public String loneLowSurrogate()
+    {
+        return LONE_LOW_SURROGATE;
+    }
+
+    /** Reversed surrogate pair (low then high) -- must NOT combine. */
+    public String reversedSurrogates()
+    {
+        return REVERSED_SURROGATES;
+    }
+
+    /** U+00A0 / U+2028 / U+2029 -- Unicode whitespace (8 bytes UTF-8). */
+    public String unicodeWhitespace()
+    {
+        return UNICODE_WS;
+    }
+
+    /**
+     * Every C0 control character U+0001..U+001F followed by U+007F (DEL): 32 chars,
+     * all in the ASCII byte range so every byte survives 1:1 on both decode paths.
+     * (U+0000 is covered separately by the NUL-family methods.)
+     */
+    public String controlChars()
+    {
+        StringBuilder sb = new StringBuilder(32);
+        for (int c = 0x01; c <= 0x1F; c++)
+        {
+            sb.append((char) c);
+        }
+        sb.append((char) 0x7F);
+        return sb.toString();
+    }
+
+    /**
+     * A String of exactly {@code n} 'A' characters with NO upper clamp (other than
+     * a generous 1,048,576 safety ceiling), so the native side can request a
+     * String FAR above the 4096-char {@code read_java_string} backing-array cap and
+     * above 65,536 code units.  On the call_jni path GetStringUTFChars returns the
+     * whole thing (no cap); on the call_stub path read_java_string rejects any
+     * length &gt; 4096 and returns "".  Lets the native side prove the >65536 case
+     * on whichever decoder is live.
+     */
+    public String bigString(int n)
+    {
+        int count = n;
+        if (count < 0)
+        {
+            count = 0;
+        }
+        if (count > 1048576)
+        {
+            count = 1048576;
+        }
+        StringBuilder sb = new StringBuilder(count);
+        for (int i = 0; i < count; i++)
+        {
+            sb.append('A');
+        }
+        return sb.toString();
     }
 
     /** Interior-NUL string ('a' U+0000 'b'). */
@@ -416,6 +545,63 @@ public final class MethodString
         return sb.toString();
     }
 
+    /**
+     * Static counterpart of {@link #bigString(int)}: {@code n} 'A's (clamped to
+     * 0..1,048,576) returned through the STATIC call path, so the &gt;65536 case is
+     * proven for static dispatch too.
+     */
+    public static String staticBigString(int n)
+    {
+        int count = n;
+        if (count < 0)
+        {
+            count = 0;
+        }
+        if (count > 1048576)
+        {
+            count = 1048576;
+        }
+        StringBuilder sb = new StringBuilder(count);
+        for (int i = 0; i < count; i++)
+        {
+            sb.append('A');
+        }
+        return sb.toString();
+    }
+
+    /** Static U+FFFF (max BMP) through the static call path. */
+    public static String staticMaxBmp()
+    {
+        return MAX_BMP;
+    }
+
+    /** Static lone high surrogate U+D83D through the static call path. */
+    public static String staticLoneSurrogate()
+    {
+        return LONE_HIGH_SURROGATE;
+    }
+
+    /**
+     * Reflective {@code String.coder} probe used only to label which physical
+     * backing-array coder each returned String used.  Returns -1 when the field is
+     * absent (JDK 8, where String.value is a char[] with no coder) or reflection is
+     * denied -- the native side only asserts the coder when it is &gt;= 0, so this is
+     * a diagnostic, never a hard dependency.
+     */
+    private static int coderOf(final String s)
+    {
+        try
+        {
+            final java.lang.reflect.Field cf = String.class.getDeclaredField("coder");
+            cf.setAccessible(true);
+            return cf.getByte(s);
+        }
+        catch (final Throwable t)
+        {
+            return -1;
+        }
+    }
+
     // =======================================================================
     //  Hook trigger -- the native module hooks this no-arg instance method.
     //  Calling it on a real bytecode dispatch fires the interpreter hook, and
@@ -444,6 +630,29 @@ public final class MethodString
                 // and the detour exercises every String method on this very
                 // instance (and the static methods via static_method()).
                 instance.trigger();
+
+                // Publish the cross-check witnesses AFTER the detour has captured
+                // every observation (the native side reads these once run_probe
+                // returns).  coderOf() is -1 on JDK 8 (no coder field), so the
+                // native side only asserts a coder it could actually read.
+                boolean hasCoder;
+                try
+                {
+                    String.class.getDeclaredField("coder");
+                    hasCoder = true;
+                }
+                catch (final Throwable t)
+                {
+                    hasCoder = false;
+                }
+                MethodString.jHasCoderField = hasCoder;
+                MethodString.jCoderRegular = coderOf(instance.regular());
+                MethodString.jCoderCafe    = coderOf(CAFE);
+                MethodString.jCoderCjk      = coderOf(CJK);
+                MethodString.jCoderEmoji    = coderOf(EMOJI);
+                MethodString.jCoderMaxBmp   = coderOf(MAX_BMP);
+                MethodString.jBigLen        = instance.bigString(70000).length();
+
                 MethodString.done = true;
             }
         });
