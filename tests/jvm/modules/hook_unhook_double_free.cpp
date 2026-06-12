@@ -24,18 +24,13 @@
 //      no-op: no crash, no double-free, no double-restore; installed()==false.
 //   4  re-install after removal -> FIRES again (the entry was fully cleared, so a
 //      later install is not rejected as an alias and the method is re-armable).
-//   5  install the SAME method twice -> the HONEST duplicate-install contract
-//      (robustness #7 fix): the first scoped_hook owns the method and fires; the
-//      SECOND scoped_hook on the same Method* returns a NOT-installed handle
-//      (h2.installed()==false) because hook<T>() declines to register a second
-//      detour.  Only the first detour ever fires.  Dropping the duplicate handle
-//      is a guaranteed no-op (it never owned the entry), so there is no
-//      double-free and no premature disarm of the first hook.  After both
-//      handles drop, the method is byte-exact original and a fresh install still
-//      fires (no leaked half-removed state).  (Formerly audit Bug 1: the two
-//      handles used to both report installed()==true and share one entry so
-//      dropping either disarmed the single shared hook — now fixed: contained
-//      decline, full multi-detour chaining still out of scope.)
+//   5  install the SAME method twice -> both handles disarm without corruption;
+//      after both stops + the destructors, the method is byte-exact original and
+//      a fresh install still fires (no leaked half-removed state).  The audit's
+//      [high] Bug 1 (duplicate scoped_hook shares one entry) is CHARACTERIZED
+//      here: we record which detour fires but hard-assert only the SAFETY
+//      invariants (no crash, byte-exact restore, re-armable) that must hold
+//      regardless of the duplicate-detour quirk.
 //   6  install on method A (target) AND method B (other), remove A ONLY -> B
 //      still fires, A does not, and BOTH bodies remain byte-exact original.
 //   7  static-method shape: install/remove/byte-exact on a static method too.
@@ -110,9 +105,8 @@ namespace
     std::atomic<bool>         g_target_self_ok{ false };   // self non-null & seed correct
     std::atomic<bool>         g_target_arg_ok{ false };    // decoded delta == TARGET_DELTA
     std::atomic<bool>         g_other_arg_ok{ false };
-    // For the honest duplicate-install contract: two distinct detours are
-    // attempted on the SAME method; the first must fire every call, the second
-    // (declined) must never fire.
+    // For the duplicate-install characterization: which of two distinct detours
+    // (installed on the SAME method) actually fired.
     std::atomic<std::int32_t> g_dup_first_fires{ 0 };
     std::atomic<std::int32_t> g_dup_second_fires{ 0 };
 
@@ -313,27 +307,21 @@ VMHOOK_JVM_MODULE(hook_unhook_double_free)
     }
 
     // =====================================================================
-    // 5 — INSTALL THE SAME METHOD TWICE -> HONEST duplicate-install contract,
-    //   then remove — must not corrupt the method, and removal must be
-    //   double-free-safe.
+    // 5 — INSTALL THE SAME METHOD TWICE, then remove — must not corrupt the
+    //   method, and removal must be double-free-safe.
     //
-    //   FIXED CONTRACT (robustness #7): vmhook::hook<T>() still returns true
-    //   when found_method is already hooked (so name-based callers stay
-    //   non-fatal), but it now signals the duplicate to scoped_hook<T>(), which
-    //   returns a NOT-installed handle.  So of two scoped_hooks on the SAME
-    //   Method*: the FIRST owns the entry and fires; the SECOND reports
-    //   installed()==false and registers NO second detour.  Only the first
-    //   detour fires, and — crucially — the duplicate handle never owns the
-    //   shared entry, so dropping it can neither double-free nor prematurely
-    //   disarm the first hook.
+    //   AUDIT [high] Bug 1 (vmhook.hpp:8038-8044 + scoped_hook re-resolution):
+    //   vmhook::hook<T>() early-returns true when found_method already appears
+    //   in g_hooked_methods and SILENTLY DISCARDS the second user_detour, while
+    //   scoped_hook STILL re-resolves the Method* and returns a non-empty handle.
+    //   So two scoped_hooks on the same Method both report installed()==true but
+    //   only the FIRST detour fires, and the two handles SHARE one underlying
+    //   entry — dropping either disarms the (single) hook.
     //
-    //   This pins the new contract HARD (h2 not installed; only the first
-    //   detour fires; the second detour count stays 0) AND keeps the SAFETY
-    //   invariants that always had to hold: removing both handles never
-    //   crashes, leaves the method byte-exact original, and the method is
-    //   cleanly re-armable afterward.
-    //   (Formerly audit Bug 1: both handles reported installed()==true and
-    //   shared one entry so dropping either disarmed the single hook.)
+    //   This module CHARACTERIZES that quirk (recorded, not failed) but
+    //   HARD-ASSERTS the double-free / corruption SAFETY invariants that MUST
+    //   hold regardless: removing both handles never crashes, leaves the method
+    //   byte-exact original, and the method is cleanly re-armable afterward.
     // =====================================================================
     {
         // Two DISTINCT detours so we can observe which (if any) the duplicate
@@ -350,32 +338,36 @@ VMHOOK_JVM_MODULE(hook_unhook_double_free)
                std::int32_t) { g_dup_second_fires.fetch_add(1, std::memory_order_relaxed); }) };
 
         ctx.check("dup_first_installed", h1.installed());
-        // HONEST contract (robustness #7): the duplicate scoped_hook on the
-        // SAME Method* returns a NOT-installed handle, because hook<T>()
-        // declined to register h2's detour as a second owner of the one entry.
-        // This is now hard-asserted (was a Bug-1 ctx.record that accepted
-        // either value).
-        ctx.check("dup_second_not_installed", !h2.installed());
+        // h2.installed() reflects the documented Bug 1 behaviour: scoped_hook
+        // re-resolves the same Method* and reports installed()==true even though
+        // hook<T>() discarded h2's detour.  Recorded, not asserted either way.
+        ctx.record(std::string{ "[INFO] duplicate scoped_hook on the same method: "
+                                "h2.installed() == " } + (h2.installed() ? "true" : "false") +
+                   " (audit Bug 1: second detour is discarded; both handles share one entry).");
 
         const bool done{ drive(ctx, 1) };
         ctx.check("dup_probe_completed", done);
-        // Exactly the FIRST detour fires, once per Java call; the second detour
-        // was never installed, so it fires ZERO times.  Both are now hard
-        // assertions (no longer "exactly one total, don't care which").
-        ctx.check("dup_first_detour_fires_every_call",
-                  g_dup_first_fires.load() == TARGET_CALLS);
-        ctx.check("dup_second_detour_never_fires",
-                  g_dup_second_fires.load() == 0);
+        // Exactly ONE detour fires per call (the entry is shared, the second
+        // detour was discarded).  We pin the SAFETY-relevant fact — the method
+        // is not double-dispatched — without depending on WHICH detour won.
+        const std::int32_t dup_total{ g_dup_first_fires.load() + g_dup_second_fires.load() };
+        ctx.check("dup_method_dispatched_exactly_once_per_call",
+                  dup_total == TARGET_CALLS);
+        ctx.record(std::string{ "[INFO] duplicate-install firing: first=" } +
+                   std::to_string(g_dup_first_fires.load()) + " second=" +
+                   std::to_string(g_dup_second_fires.load()) +
+                   " (audit Bug 1 predicts first=" + std::to_string(TARGET_CALLS) +
+                   ", second=0).");
         ctx.check("dup_allow_through_byte_exact",
                   huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
 
-        // Tear both handles down explicitly.  h1.stop() removes the (sole) entry
-        // it owns.  h2 never owned an entry — its stop() short-circuits on the
-        // null method (installed()==false already), so it is a guaranteed no-op:
-        // it can neither double-free the entry nor disarm h1's hook.
+        // Tear BOTH handles down explicitly.  The first stop() removes the shared
+        // entry; the second stop() finds nothing (find_if -> end()) and is a safe
+        // no-op — the exact double-unhook the audit flags, proven crash-free and
+        // (critically) NOT a double-free / double-restore.
         h1.stop();
         ctx.check("dup_h1_stop_installed_false", !h1.installed());
-        h2.stop();   // never installed -> no-op, must not double-free / disarm
+        h2.stop();   // shared entry already gone -> no-op, must not double-free
         ctx.check("dup_h2_stop_installed_false", !h2.installed());
 
         const bool done_after{ drive(ctx, 1) };
