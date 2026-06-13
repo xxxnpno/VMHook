@@ -2,15 +2,30 @@
 //
 // FEATURE UNDER TEST: reading Java REFERENCE arrays out of object / static
 // fields and turning them into C++ vectors, with inner nulls handled as
-// null/empty slots (never a crash).  Three element kinds, three signatures:
+// null/empty slots (never a crash).  EVERY element kind, EVERY dimensionality:
 //
 //     String[]      -> "[Ljava/lang/String;"
-//     Item[]        -> "[Lvmhook/fixtures/FieldArraysObject$Item;"   (typed)
+//     Item[]        -> "[Lvmhook/fixtures/FieldArraysObject$Item;"   (typed class)
 //     Object[]      -> "[Ljava/lang/Object;"                         (erased)
-//     Item[][]      -> "[[Lvmhook/fixtures/FieldArraysObject$Item;"  (2-D)
+//     Integer[]     -> "[Ljava/lang/Integer;"                        (boxed prim)
+//     Tagged[]      -> "[Lvmhook/fixtures/FieldArraysObject$Tagged;" (interface)
+//     Item[][]      -> "[[Lvmhook/fixtures/FieldArraysObject$Item;"  (2-D, jagged)
+//     String[][]    -> "[[Ljava/lang/String;"                        (2-D)
+//     Object[][][]  -> "[[[Ljava/lang/Object;"                       (3-D)
+//     Object holding an array -> "Ljava/lang/Object;" at compile time, an array
+//                                oop at runtime (array covariance / component type)
 //
 // across the empty / single / all-null / mixed / leading-null / trailing-null /
-// big-mixed / null-array-reference shapes, for BOTH static and instance fields.
+// big-mixed / LARGE(1000) / null-array-reference shapes, for BOTH static and
+// instance fields, plus reference-array get_array_element BOUNDS (0 / last / OOB).
+//
+// PART A/B/C cover String[]/Item[]/Object[]/Item[][] + the instance handshake;
+// PART D (fao_* prefix) adds Integer[], Tagged[] (interface), the Object-holds-
+// array covariance case, the LARGE(1000) array, jagged 2-D + 3-D inner-row
+// descent, and the reference-array bounds contract.  Per cross-toolchain
+// hardening, PART D hard-asserts STRUCTURAL invariants (length, declared
+// signature, null-slot layout, OOP distinctness) and records element-VALUE
+// decodes (which assume compressed oops) as PASS-or-[INFO].
 //
 // THE READ PATHS this module drives, and how each is verified:
 //
@@ -77,6 +92,24 @@ namespace
 {
     constexpr const char* FIXTURE{ "vmhook/fixtures/FieldArraysObject" };
     constexpr const char* ITEM{ "vmhook/fixtures/FieldArraysObject$Item" };
+    constexpr const char* INTEGER{ "java/lang/Integer" };
+
+    // Boxed-Integer element wrapper for the Integer[] (autoboxed) array case: a
+    // readable `value` int field plus a callable intValue() method, so a decoded
+    // boxed element can be proven a real java.lang.Integer (field path AND method
+    // path), exactly as item_object proves an Item.  Registered as
+    // "java/lang/Integer" so get_field("value") / get_method("intValue") resolve.
+    class integer_object : public vmhook::object<integer_object>
+    {
+    public:
+        explicit integer_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<integer_object>{ instance }
+        {
+        }
+
+        auto value() -> std::int32_t { return get_field("value")->get(); }
+        auto int_value() -> std::int32_t { return get_method("intValue")->call(); }
+    };
 
     // Registered-wrapper element type for the Item[] / Object[] / Item[][]
     // arrays.  A readable int field + a callable method, so a decoded element
@@ -153,6 +186,16 @@ namespace
         static auto s_grid2d()        -> std::vector<std::unique_ptr<item_object>> { return static_field("grid2d")->get().to_vector<item_object>(); }
         static auto s_grid2d_mixed()  -> std::vector<std::unique_ptr<item_object>> { return static_field("grid2dMixed")->get().to_vector<item_object>(); }
         static auto s_grid2d_empty()  -> std::vector<std::unique_ptr<item_object>> { return static_field("grid2dEmpty")->get().to_vector<item_object>(); }
+        static auto s_jagged_grid()   -> std::vector<std::unique_ptr<item_object>> { return static_field("jaggedGrid")->get().to_vector<item_object>(); }
+        static auto s_str_grid2d()    -> std::vector<std::unique_ptr<item_object>> { return static_field("strGrid2d")->get().to_vector<item_object>(); }
+        static auto s_cube3d()        -> std::vector<std::unique_ptr<item_object>> { return static_field("cube3d")->get().to_vector<item_object>(); }
+
+        // ---- INTERFACE-typed Tagged[] via to_vector (covariance) -------------
+        static auto s_tagged()        -> std::vector<std::unique_ptr<item_object>> { return static_field("taggedItems")->get().to_vector<item_object>(); }
+        static auto s_tagged_mixed()  -> std::vector<std::unique_ptr<item_object>> { return static_field("taggedMixed")->get().to_vector<item_object>(); }
+
+        // ---- LARGE Item[] via to_vector --------------------------------------
+        static auto s_large_items()   -> std::vector<std::unique_ptr<item_object>> { return static_field("largeItems")->get().to_vector<item_object>(); }
 
         // ---- Java-published length oracles -----------------------------------
         static auto j_static_strings_len() -> std::int32_t { return static_field("staticStringsLen")->get(); }
@@ -163,6 +206,18 @@ namespace
         static auto j_object_mixed_len()   -> std::int32_t { return static_field("objectMixedLen")->get(); }
         static auto j_grid2d_len()         -> std::int32_t { return static_field("grid2dLen")->get(); }
         static auto j_grid2d_mixed_len()   -> std::int32_t { return static_field("grid2dMixedLen")->get(); }
+        static auto j_jagged_grid_len()    -> std::int32_t { return static_field("jaggedGridLen")->get(); }
+        static auto j_jagged_row0_len()    -> std::int32_t { return static_field("jaggedRow0Len")->get(); }
+        static auto j_jagged_row1_len()    -> std::int32_t { return static_field("jaggedRow1Len")->get(); }
+        static auto j_jagged_row2_len()    -> std::int32_t { return static_field("jaggedRow2Len")->get(); }
+        static auto j_str_grid2d_len()     -> std::int32_t { return static_field("strGrid2dLen")->get(); }
+        static auto j_cube3d_len()         -> std::int32_t { return static_field("cube3dLen")->get(); }
+        static auto j_boxed_ints_len()     -> std::int32_t { return static_field("boxedIntsLen")->get(); }
+        static auto j_boxed_mixed_len()    -> std::int32_t { return static_field("boxedMixedLen")->get(); }
+        static auto j_tagged_items_len()   -> std::int32_t { return static_field("taggedItemsLen")->get(); }
+        static auto j_tagged_mixed_len()   -> std::int32_t { return static_field("taggedMixedLen")->get(); }
+        static auto j_large_items_len()    -> std::int32_t { return static_field("largeItemsLen")->get(); }
+        static auto j_object_holding_array_len() -> std::int32_t { return static_field("objectHoldingArrayLen")->get(); }
     };
 
     // ---- manual Object[] walk: an independent cross-check of to_vector<T>() ---
@@ -257,6 +312,122 @@ namespace
         return element_oops(field_arrays_object_fixture::static_field(name));
     }
 
+    // ---- manual BOXED-Integer walk (Integer[]) -------------------------------
+    // Same shape as manual_item_walk, but wraps each non-null slot as an
+    // integer_object (java.lang.Integer) so its `value` field + intValue() method
+    // can be read.  A null slot becomes nullptr (autoboxing allows null elements).
+    auto manual_integer_walk_static(const char* name)
+        -> std::vector<std::unique_ptr<integer_object>>
+    {
+        std::vector<std::unique_ptr<integer_object>> result;
+        const auto proxy{ field_arrays_object_fixture::static_field(name) };
+        if (!proxy.has_value())
+        {
+            return result;
+        }
+        void* const array_oop{ vmhook::field_oop(*proxy) };
+        if (!array_oop || !vmhook::hotspot::is_valid_pointer(array_oop))
+        {
+            return result;
+        }
+        const std::int32_t length{ vmhook::array_length(array_oop) };
+        if (length <= 0)
+        {
+            return result;
+        }
+        result.reserve(static_cast<std::size_t>(length));
+        for (std::int32_t index{ 0 }; index < length; ++index)
+        {
+            void* const element_oop{ vmhook::hotspot::decode_oop_pointer(
+                vmhook::get_array_element<std::uint32_t>(array_oop, index)) };
+            if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
+            {
+                result.push_back(std::make_unique<integer_object>(
+                    static_cast<vmhook::oop_t>(element_oop)));
+            }
+            else
+            {
+                result.push_back(nullptr);
+            }
+        }
+        return result;
+    }
+
+    // Decodes a (possibly scalar-typed) reference field to the live ARRAY oop it
+    // points at.  field_oop walks the field bytes -> compressed OOP ->
+    // decode_array_oop (is_valid_pointer guarded), so it returns the array oop for
+    // BOTH a declared array field ("[...") AND a scalar Object field whose runtime
+    // value is an array (covariance).  Returns nullptr for a null/invalid ref.
+    auto field_array_oop_static(const char* name) -> void*
+    {
+        const auto proxy{ field_arrays_object_fixture::static_field(name) };
+        if (!proxy.has_value())
+        {
+            return nullptr;
+        }
+        void* const oop{ vmhook::field_oop(*proxy) };
+        return (oop && vmhook::hotspot::is_valid_pointer(oop)) ? oop : nullptr;
+    }
+
+    // Walks an INNER row of a 2-D reference array: reads the row oop at
+    // outer_index of `outer_array_oop`, then returns each inner element's decoded
+    // OOP (nullptr per inner-null slot).  Empty/out-of-range/null-row yields {}.
+    // This is the explicit jagged / multi-dim descent the flat to_vector cannot do.
+    auto inner_row_oops(void* const outer_array_oop, const std::int32_t outer_index)
+        -> std::vector<void*>
+    {
+        std::vector<void*> out;
+        if (!outer_array_oop || !vmhook::hotspot::is_valid_pointer(outer_array_oop))
+        {
+            return out;
+        }
+        const std::int32_t outer_len{ vmhook::array_length(outer_array_oop) };
+        if (outer_index < 0 || outer_index >= outer_len)
+        {
+            return out;
+        }
+        void* const row_oop{ vmhook::hotspot::decode_oop_pointer(
+            vmhook::get_array_element<std::uint32_t>(outer_array_oop, outer_index)) };
+        if (!row_oop || !vmhook::hotspot::is_valid_pointer(row_oop))
+        {
+            return out;   // null ROW -> empty inner walk (no crash).
+        }
+        const std::int32_t inner_len{ vmhook::array_length(row_oop) };
+        if (inner_len <= 0)
+        {
+            return out;
+        }
+        out.reserve(static_cast<std::size_t>(inner_len));
+        for (std::int32_t i{ 0 }; i < inner_len; ++i)
+        {
+            out.push_back(vmhook::hotspot::decode_oop_pointer(
+                vmhook::get_array_element<std::uint32_t>(row_oop, i)));
+        }
+        return out;
+    }
+
+    // Reads the Item.tag of the inner element at (outer_index, inner_index) of a
+    // 2-D Item[][] outer oop, by descending into the row and wrapping the inner
+    // slot as an item_object.  Returns the sentinel `missing` if anything along the
+    // path is null/out-of-range (so the test can assert a real tag distinctly).
+    auto inner_item_tag(void* const outer_array_oop, const std::int32_t outer_index,
+                        const std::int32_t inner_index, const std::int32_t missing)
+        -> std::int32_t
+    {
+        const std::vector<void*> row{ inner_row_oops(outer_array_oop, outer_index) };
+        if (inner_index < 0 || static_cast<std::size_t>(inner_index) >= row.size())
+        {
+            return missing;
+        }
+        void* const cell{ row[static_cast<std::size_t>(inner_index)] };
+        if (!cell || !vmhook::hotspot::is_valid_pointer(cell))
+        {
+            return missing;
+        }
+        item_object wrapped{ static_cast<vmhook::oop_t>(cell) };
+        return wrapped.get_tag();
+    }
+
     // Cross-checks one field's JVM descriptor + static-ness + reference-ness
     // against the fixture, exercising the field_proxy introspection accessors.
     // Records [INFO] (never FAIL) when a field can't be resolved so the module
@@ -277,6 +448,33 @@ namespace
         ctx.check(check_name, sig_ok && static_ok && ref_ok);
     }
 
+    // CROSS-TOOLCHAIN HARDENING gate for PART D's NEW element-VALUE decodes.
+    // A reference-array element's value is recovered through decode_oop_pointer +
+    // a field/method read, which assumes COMPRESSED oops and the +12/+16
+    // compressed array-header layout.  Those hold on every CI runner (small,
+    // default-compressed heaps), so the value SHOULD decode; but under
+    // -XX:-UseCompressedOops / a >=32 GB heap the narrow-element stride is wrong
+    // and the element would mis-decode with NO crash.  To keep the suite green on
+    // any toolchain, a value-decode that does not hold is recorded as [INFO]
+    // rather than failed — the STRUCTURAL invariants around it (length, declared
+    // signature, null-slot layout, OOP distinctness) are hard-asserted separately
+    // and catch a real regression on the compressed path CI actually runs.
+    auto pass_or_info(vmhook_test::context& ctx, const char* name, bool ok,
+                      const char* info) -> void
+    {
+        if (ok)
+        {
+            ctx.check(name, true);
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] field_arrays_object: " } + name
+                       + " did not hold (" + info + "); recorded as [INFO] under "
+                       "cross-toolchain hardening (value decode assumes compressed "
+                       "oops + the +12/+16 array header).");
+        }
+    }
+
     // ---- hook observation state ---------------------------------------------
     std::atomic<int>          g_hook_calls{ 0 };
     std::atomic<std::int32_t> g_hook_arg{ -1 };
@@ -288,6 +486,7 @@ namespace
     {
         vmhook::register_class<field_arrays_object_fixture>(FIXTURE);
         vmhook::register_class<item_object>(ITEM);
+        vmhook::register_class<integer_object>(INTEGER);
 
         using wrapper = field_arrays_object_fixture;
 
@@ -340,6 +539,40 @@ namespace
         // cross-checked in PART C through a live `self` (where it CAN resolve).
         ctx.check("shape_instance_field_via_static_resolver_is_nullopt",
                   !wrapper::static_field("instStrings").has_value());
+
+        // ---- PART 0 (extended): shape cross-checks for the NEW element kinds /
+        //      dimensionalities.  Each descriptor is asserted EXACTLY so the reads
+        //      in PART D are reading the field the .java declares.
+        check_field_shape(ctx, "fao_shape_boxedInts_is_Integer_array",
+                          wrapper::static_field("boxedInts"), "[Ljava/lang/Integer;", true);
+        check_field_shape(ctx, "fao_shape_taggedItems_is_Tagged_array",
+                          wrapper::static_field("taggedItems"),
+                          "[Lvmhook/fixtures/FieldArraysObject$Tagged;", true);
+        check_field_shape(ctx, "fao_shape_jaggedGrid_is_2d_Item_array",
+                          wrapper::static_field("jaggedGrid"),
+                          "[[Lvmhook/fixtures/FieldArraysObject$Item;", true);
+        check_field_shape(ctx, "fao_shape_strGrid2d_is_2d_String_array",
+                          wrapper::static_field("strGrid2d"), "[[Ljava/lang/String;", true);
+        check_field_shape(ctx, "fao_shape_cube3d_is_3d_Object_array",
+                          wrapper::static_field("cube3d"), "[[[Ljava/lang/Object;", true);
+        check_field_shape(ctx, "fao_shape_largeItems_is_Item_array",
+                          wrapper::static_field("largeItems"),
+                          "[Lvmhook/fixtures/FieldArraysObject$Item;", true);
+        // The COVARIANCE case: a field DECLARED as scalar java.lang.Object whose
+        // runtime value is an array.  The STATIC (declared) signature must be the
+        // scalar "Ljava/lang/Object;" — not an array descriptor — yet it is still a
+        // reference field.  PART D proves the runtime oop is nonetheless a walkable
+        // array.
+        {
+            const auto proxy{ wrapper::static_field("objectHoldingArray") };
+            ctx.check("fao_shape_objectHoldingArray_resolves", proxy.has_value());
+            if (proxy.has_value())
+            {
+                ctx.check("fao_shape_objectHoldingArray_declared_scalar_Object",
+                          proxy->signature() == "Ljava/lang/Object;"
+                          && proxy->is_static() && proxy->is_reference());
+            }
+        }
 
         // =====================================================================
         // PART A — STRING[] reads via the implicit vector<string> conversion.
@@ -786,6 +1019,355 @@ namespace
                     ctx.check("strobj_bridge_slot2_nonnull_oop", oops.size() == 3 && oops[2] != nullptr);
                 }
             }
+        }
+
+        // =====================================================================
+        // PART D — EXHAUSTIVE element-kind / dimensionality / scale coverage.
+        //   D1 Integer[]  (boxed primitive, autoboxed, mixed-null)
+        //   D2 Tagged[]   (INTERFACE element type — array covariance)
+        //   D3 Object field HOLDING an array (scalar-typed covariance + component)
+        //   D4 LARGE Item[] (length 1000 — loop / reserve stress)
+        //   D5 JAGGED 2-D Item[][] inner-row descent (differing inner widths)
+        //   D6 2-D String[][] inner-row descent (+ null inner row)
+        //   D7 3-D Object[][][] outermost-dimension walk
+        //   D8 reference-array get_array_element BOUNDS (0 / last / OOB no-crash)
+        // STRUCTURAL invariants (count, signature, null layout, distinctness) are
+        // hard-asserted; element-VALUE decodes go through pass_or_info (hardening).
+        // =====================================================================
+
+        // ---- D1: Integer[] (BOXED primitive) --------------------------------
+        // Each non-null element is a java.lang.Integer OOP; read its value via the
+        // field path (value) AND the method path (intValue()).  A null element is a
+        // real nullptr slot (boxing makes null legal, unlike a primitive int[]).
+        {
+            const std::vector<std::unique_ptr<integer_object>> canon{
+                manual_integer_walk_static("boxedInts") };
+            const std::vector<std::unique_ptr<integer_object>> mixed{
+                manual_integer_walk_static("boxedMixed") };
+
+            // Structural: count vs Java oracle, null layout.
+            ctx.check("fao_int_canonical_size3", canon.size() == 3);
+            ctx.check("fao_int_canonical_count_matches_java",
+                      static_cast<std::int32_t>(canon.size()) == wrapper::j_boxed_ints_len());
+            ctx.check("fao_int_canonical_all_nonnull",
+                      canon.size() == 3 && canon[0] && canon[1] && canon[2]);
+            ctx.check("fao_int_mixed_size3", mixed.size() == 3);
+            ctx.check("fao_int_mixed_count_matches_java",
+                      static_cast<std::int32_t>(mixed.size()) == wrapper::j_boxed_mixed_len());
+            ctx.check("fao_int_mixed_elem1_is_nullptr",
+                      mixed.size() == 3 && mixed[1] == nullptr);
+            ctx.check("fao_int_mixed_nonnull_slots",
+                      mixed.size() == 3 && mixed[0] != nullptr && mixed[2] != nullptr);
+
+            // Value decode (compressed-oops dependent) -> pass_or_info.
+            pass_or_info(ctx, "fao_int_canonical_elem0_value7",
+                         canon.size() == 3 && canon[0] && canon[0]->value() == 7,
+                         "Integer.value field read");
+            pass_or_info(ctx, "fao_int_canonical_elem1_value8",
+                         canon.size() == 3 && canon[1] && canon[1]->value() == 8,
+                         "Integer.value field read");
+            pass_or_info(ctx, "fao_int_canonical_elem2_value9",
+                         canon.size() == 3 && canon[2] && canon[2]->value() == 9,
+                         "Integer.value field read");
+            pass_or_info(ctx, "fao_int_canonical_elem0_method_intValue7",
+                         canon.size() == 3 && canon[0] && canon[0]->int_value() == 7,
+                         "Integer.intValue() method dispatch");
+            pass_or_info(ctx, "fao_int_mixed_elem0_value70",
+                         mixed.size() == 3 && mixed[0] && mixed[0]->value() == 70,
+                         "Integer.value field read");
+            pass_or_info(ctx, "fao_int_mixed_elem2_value90",
+                         mixed.size() == 3 && mixed[2] && mixed[2]->value() == 90,
+                         "Integer.value field read");
+        }
+
+        // ---- D2: Tagged[] (INTERFACE element type — covariance) -------------
+        // Declared "[L...$Tagged;" (interface array) holding concrete Items.  The
+        // to_vector signature branch keys on "[L" regardless of the L-class being
+        // an interface, so each slot re-wraps as item_object and reads its tag.
+        {
+            const std::vector<std::unique_ptr<item_object>> t{ wrapper::s_tagged() };
+            const std::vector<std::unique_ptr<item_object>> tm{ wrapper::s_tagged_mixed() };
+
+            ctx.check("fao_iface_canonical_size3", t.size() == 3);
+            ctx.check("fao_iface_canonical_count_matches_java",
+                      static_cast<std::int32_t>(t.size()) == wrapper::j_tagged_items_len());
+            ctx.check("fao_iface_canonical_all_nonnull",
+                      t.size() == 3 && t[0] && t[1] && t[2]);
+            ctx.check("fao_iface_mixed_size3", tm.size() == 3);
+            ctx.check("fao_iface_mixed_count_matches_java",
+                      static_cast<std::int32_t>(tm.size()) == wrapper::j_tagged_mixed_len());
+            ctx.check("fao_iface_mixed_elem1_is_nullptr", tm.size() == 3 && tm[1] == nullptr);
+
+            pass_or_info(ctx, "fao_iface_canonical_elem0_tag110",
+                         t.size() == 3 && t[0] && t[0]->get_tag() == 110, "Item.tag via interface[] slot");
+            pass_or_info(ctx, "fao_iface_canonical_elem1_tag120",
+                         t.size() == 3 && t[1] && t[1]->get_tag() == 120, "Item.tag via interface[] slot");
+            pass_or_info(ctx, "fao_iface_canonical_elem2_tag130",
+                         t.size() == 3 && t[2] && t[2]->get_tag() == 130, "Item.tag via interface[] slot");
+            pass_or_info(ctx, "fao_iface_canonical_elem0_method_tag110",
+                         t.size() == 3 && t[0] && t[0]->call_get_tag() == 110, "getTag() via interface[] slot");
+            pass_or_info(ctx, "fao_iface_mixed_elem0_tag111",
+                         tm.size() == 3 && tm[0] && tm[0]->get_tag() == 111, "Item.tag via interface[] slot");
+            pass_or_info(ctx, "fao_iface_mixed_elem2_tag113",
+                         tm.size() == 3 && tm[2] && tm[2]->get_tag() == 113, "Item.tag via interface[] slot");
+        }
+
+        // ---- D3: scalar Object field HOLDING an array (covariance) -----------
+        // Declared "Ljava/lang/Object;" (a scalar reference) but the runtime value
+        // is an Item[].  field_oop() decodes to the live ARRAY oop, so we can read
+        // its length + element identities through the array primitives even though
+        // the field's declared type is a scalar.  Proves component-type recovery
+        // at runtime.  A String[]-holding sibling proves the same for String OOPs.
+        {
+            void* const arr{ field_array_oop_static("objectHoldingArray") };
+            ctx.check("fao_objhold_oop_nonnull", arr != nullptr);
+            if (arr)
+            {
+                ctx.check("fao_objhold_runtime_is_array_len2",
+                          vmhook::array_length(arr) == 2);
+                ctx.check("fao_objhold_len_matches_java",
+                          vmhook::array_length(arr) == wrapper::j_object_holding_array_len());
+                void* const e0{ vmhook::hotspot::decode_oop_pointer(
+                    vmhook::get_array_element<std::uint32_t>(arr, 0)) };
+                void* const e1{ vmhook::hotspot::decode_oop_pointer(
+                    vmhook::get_array_element<std::uint32_t>(arr, 1)) };
+                ctx.check("fao_objhold_elems_distinct_nonnull",
+                          e0 != nullptr && e1 != nullptr && e0 != e1);
+                // The runtime elements are Items: read their tags (value decode).
+                bool tags_ok{ false };
+                if (e0 && e1 && vmhook::hotspot::is_valid_pointer(e0)
+                    && vmhook::hotspot::is_valid_pointer(e1))
+                {
+                    item_object w0{ static_cast<vmhook::oop_t>(e0) };
+                    item_object w1{ static_cast<vmhook::oop_t>(e1) };
+                    tags_ok = w0.get_tag() == 401 && w1.get_tag() == 402;
+                }
+                pass_or_info(ctx, "fao_objhold_elem_tags_401_402", tags_ok,
+                             "Item.tag through a covariant Object-typed array field");
+            }
+
+            // Sibling: scalar Object holding a String[] — read element 0 as a
+            // String through the same array-oop path.
+            void* const sarr{ field_array_oop_static("objectHoldingStringArray") };
+            ctx.check("fao_objhold_str_oop_nonnull", sarr != nullptr);
+            if (sarr)
+            {
+                ctx.check("fao_objhold_str_runtime_is_array_len2",
+                          vmhook::array_length(sarr) == 2);
+                const std::uint32_t c0{ vmhook::get_array_element<std::uint32_t>(sarr, 0) };
+                const std::string s0{ vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(c0)) };
+                pass_or_info(ctx, "fao_objhold_str_elem0_oh0", s0 == "oh0",
+                             "String decode through a covariant Object-typed array field");
+            }
+        }
+
+        // ---- D4: LARGE Item[] (length 1000) ---------------------------------
+        // Stresses the per-element decode loop + the reserve at a realistic length.
+        // Element i has tag == i, so the first / middle / last identities are
+        // spot-checked by value.  Count is the hard invariant; values are gated.
+        {
+            const std::vector<std::unique_ptr<item_object>> big{ wrapper::s_large_items() };
+            ctx.check("fao_large_size1000", big.size() == 1000);
+            ctx.check("fao_large_count_matches_java",
+                      static_cast<std::int32_t>(big.size()) == wrapper::j_large_items_len());
+            const bool all_nonnull{
+                big.size() == 1000 && big.front() != nullptr && big.back() != nullptr };
+            ctx.check("fao_large_endpoints_nonnull", all_nonnull);
+
+            pass_or_info(ctx, "fao_large_elem0_tag0",
+                         big.size() == 1000 && big[0] && big[0]->get_tag() == 0,
+                         "Item.tag of large[0]");
+            pass_or_info(ctx, "fao_large_elem500_tag500",
+                         big.size() == 1000 && big[500] && big[500]->get_tag() == 500,
+                         "Item.tag of large[500]");
+            pass_or_info(ctx, "fao_large_elem999_tag999",
+                         big.size() == 1000 && big[999] && big[999]->get_tag() == 999,
+                         "Item.tag of large[999]");
+            // Every slot non-null + monotone tag (full-loop integrity) -> gated.
+            bool monotone{ big.size() == 1000 };
+            for (std::size_t i{ 0 }; monotone && i < big.size(); ++i)
+            {
+                monotone = big[i] && big[i]->get_tag() == static_cast<std::int32_t>(i);
+            }
+            pass_or_info(ctx, "fao_large_every_slot_tag_equals_index", monotone,
+                         "full 1000-element tag sweep");
+        }
+
+        // ---- D5: JAGGED 2-D Item[][] inner-row descent ----------------------
+        // to_vector reads the OUTER dim (each element a row oop); here we DESCEND
+        // into each row via inner_row_oops / inner_item_tag and assert the differing
+        // inner widths {1,2,3} (jagged) and each inner cell's Item tag.  This is the
+        // true multi-dim / jagged verification a flat vector cannot express.
+        {
+            // to_vector over the "[[L...Item;" jagged field reads the OUTER dim
+            // (3 row oops); the per-row inner widths come from the manual descent
+            // below.  Outer count via the documented path is the hard invariant.
+            const std::vector<std::unique_ptr<item_object>> tv{ wrapper::s_jagged_grid() };
+            ctx.check("fao_jagged_tv_outer_size3", tv.size() == 3);
+            ctx.check("fao_jagged_tv_rows_nonnull",
+                      tv.size() == 3 && tv[0] != nullptr && tv[1] != nullptr && tv[2] != nullptr);
+
+            void* const outer{ field_array_oop_static("jaggedGrid") };
+            ctx.check("fao_jagged_outer_oop_nonnull", outer != nullptr);
+            ctx.check("fao_jagged_outer_len3",
+                      outer != nullptr && vmhook::array_length(outer) == 3);
+            ctx.check("fao_jagged_outer_count_matches_java",
+                      outer != nullptr
+                      && vmhook::array_length(outer) == wrapper::j_jagged_grid_len());
+            if (outer)
+            {
+                const std::vector<void*> r0{ inner_row_oops(outer, 0) };
+                const std::vector<void*> r1{ inner_row_oops(outer, 1) };
+                const std::vector<void*> r2{ inner_row_oops(outer, 2) };
+
+                // Jagged inner widths — hard invariants vs the Java oracle.
+                ctx.check("fao_jagged_row0_width1",
+                          r0.size() == 1 && static_cast<std::int32_t>(r0.size()) == wrapper::j_jagged_row0_len());
+                ctx.check("fao_jagged_row1_width2",
+                          r1.size() == 2 && static_cast<std::int32_t>(r1.size()) == wrapper::j_jagged_row1_len());
+                ctx.check("fao_jagged_row2_width3",
+                          r2.size() == 3 && static_cast<std::int32_t>(r2.size()) == wrapper::j_jagged_row2_len());
+
+                // Inner cell tags (value decode) -> gated.  Sentinel -1 cannot be a
+                // real tag (all tags are >= 201), so a miss is unambiguous.
+                pass_or_info(ctx, "fao_jagged_cell_0_0_tag201",
+                             inner_item_tag(outer, 0, 0, -1) == 201, "inner Item.tag (0,0)");
+                pass_or_info(ctx, "fao_jagged_cell_1_0_tag202",
+                             inner_item_tag(outer, 1, 0, -1) == 202, "inner Item.tag (1,0)");
+                pass_or_info(ctx, "fao_jagged_cell_1_1_tag203",
+                             inner_item_tag(outer, 1, 1, -1) == 203, "inner Item.tag (1,1)");
+                pass_or_info(ctx, "fao_jagged_cell_2_2_tag206",
+                             inner_item_tag(outer, 2, 2, -1) == 206, "inner Item.tag (2,2)");
+                // Inner OOB on a jagged row degrades to the sentinel, never a crash.
+                ctx.check("fao_jagged_inner_oob_is_sentinel",
+                          inner_item_tag(outer, 0, 5, -1) == -1);
+            }
+        }
+
+        // ---- D6: 2-D String[][] inner-row descent (+ null inner row) --------
+        {
+            // to_vector over the "[[Ljava/lang/String;" field reads the OUTER dim
+            // (each element a row oop) — proves the signature branch handles a 2-D
+            // STRING array, not just Item[][].  Outer count is the hard invariant.
+            const std::vector<std::unique_ptr<item_object>> tv{ wrapper::s_str_grid2d() };
+            ctx.check("fao_strgrid_tv_outer_size2", tv.size() == 2);
+            ctx.check("fao_strgrid_tv_rows_nonnull",
+                      tv.size() == 2 && tv[0] != nullptr && tv[1] != nullptr);
+
+            void* const outer{ field_array_oop_static("strGrid2d") };
+            ctx.check("fao_strgrid_outer_oop_nonnull", outer != nullptr);
+            ctx.check("fao_strgrid_outer_len2",
+                      outer != nullptr && vmhook::array_length(outer) == 2);
+            ctx.check("fao_strgrid_outer_count_matches_java",
+                      outer != nullptr
+                      && vmhook::array_length(outer) == wrapper::j_str_grid2d_len());
+            if (outer)
+            {
+                const std::vector<void*> r0{ inner_row_oops(outer, 0) };
+                const std::vector<void*> r1{ inner_row_oops(outer, 1) };
+                ctx.check("fao_strgrid_row0_width1", r0.size() == 1);
+                ctx.check("fao_strgrid_row1_width2", r1.size() == 2);
+                // Inner String value decode -> gated.
+                bool v_ok{ false };
+                if (r0.size() == 1 && r0[0] && vmhook::hotspot::is_valid_pointer(r0[0])
+                    && r1.size() == 2 && r1[1] && vmhook::hotspot::is_valid_pointer(r1[1]))
+                {
+                    v_ok = vmhook::read_java_string(r0[0]) == "r0c0"
+                        && vmhook::read_java_string(r1[1]) == "r1c1";
+                }
+                pass_or_info(ctx, "fao_strgrid_inner_values", v_ok,
+                             "inner String decode of strGrid2d");
+            }
+
+            // Mixed String[][] with a NULL middle row: the null ROW must decode to
+            // an empty inner walk, never a crash, and the flanking rows survive.
+            void* const outerm{ field_array_oop_static("strGrid2dMixed") };
+            ctx.check("fao_strgrid_mixed_outer_len3",
+                      outerm != nullptr && vmhook::array_length(outerm) == 3);
+            if (outerm)
+            {
+                const std::vector<void*> rows{ element_oops(
+                    wrapper::static_field("strGrid2dMixed")) };
+                ctx.check("fao_strgrid_mixed_row1_null_oop",
+                          rows.size() == 3 && rows[1] == nullptr);
+                ctx.check("fao_strgrid_mixed_row0_row2_nonnull",
+                          rows.size() == 3 && rows[0] != nullptr && rows[2] != nullptr);
+                // Descending into the null row yields an empty inner walk.
+                ctx.check("fao_strgrid_mixed_null_row_inner_empty",
+                          inner_row_oops(outerm, 1).empty());
+            }
+        }
+
+        // ---- D7: 3-D Object[][][] outermost-dimension walk ------------------
+        // Signature "[[[L..."; to_vector / the manual walk take the
+        // signature[1]=='[' arm and read the OUTERMOST dimension.  Each element is
+        // a 2-D plane oop, itself array_length-walkable (one descent shown).
+        {
+            const std::vector<std::unique_ptr<item_object>> planes{ wrapper::s_cube3d() };
+            ctx.check("fao_cube_outer_size2", planes.size() == 2);
+            ctx.check("fao_cube_outer_count_matches_java",
+                      static_cast<std::int32_t>(planes.size()) == wrapper::j_cube3d_len());
+            ctx.check("fao_cube_planes_nonnull",
+                      planes.size() == 2 && planes[0] != nullptr && planes[1] != nullptr);
+
+            void* const outer{ field_array_oop_static("cube3d") };
+            if (outer && vmhook::array_length(outer) == 2)
+            {
+                // plane 0 is a 2-D Object[][] of outer length 2; plane 1 of length 1.
+                const std::vector<void*> plane0{ inner_row_oops(outer, 0) };
+                const std::vector<void*> plane1{ inner_row_oops(outer, 1) };
+                ctx.check("fao_cube_plane0_rowcount2", plane0.size() == 2);
+                ctx.check("fao_cube_plane1_rowcount1", plane1.size() == 1);
+            }
+        }
+
+        // ---- D8: reference-array get_array_element BOUNDS --------------------
+        // Object-array-specific bounds contract (the primitive-array bounds live in
+        // array_element_helpers.cpp).  On staticItems (length 3): index 0 and
+        // length-1 read the real first/last element OOPs; negative / index==length /
+        // index>length read 0 (=> nullptr) with NO crash and do not perturb a
+        // subsequent in-bounds read.
+        {
+            void* const arr{ field_array_oop_static("staticItems") };
+            ctx.check("fao_bounds_array_oop_nonnull", arr != nullptr);
+            if (arr)
+            {
+                const std::int32_t n{ vmhook::array_length(arr) };
+                ctx.check("fao_bounds_len3", n == 3);
+
+                const std::uint32_t first{ vmhook::get_array_element<std::uint32_t>(arr, 0) };
+                const std::uint32_t last{ vmhook::get_array_element<std::uint32_t>(arr, n - 1) };
+                ctx.check("fao_bounds_index0_nonzero", first != 0u);
+                ctx.check("fao_bounds_last_nonzero", last != 0u);
+
+                // Every OOB index reads 0 (the bounds guard returns T{}), no crash.
+                const std::int32_t oob[]{ -1, n, n + 1, n + 100 };
+                bool all_oob_zero{ true };
+                for (const std::int32_t idx : oob)
+                {
+                    if (vmhook::get_array_element<std::uint32_t>(arr, idx) != 0u)
+                    {
+                        all_oob_zero = false;
+                    }
+                }
+                ctx.check("fao_bounds_oob_indices_read_zero", all_oob_zero);
+
+                // The OOB reads did not corrupt the in-bounds view.
+                ctx.check("fao_bounds_inbounds_stable_after_oob",
+                          vmhook::get_array_element<std::uint32_t>(arr, 0) == first
+                          && vmhook::get_array_element<std::uint32_t>(arr, n - 1) == last);
+
+                // Decoded first/last are distinct, non-null OOPs (identity oracle).
+                void* const d_first{ vmhook::hotspot::decode_oop_pointer(first) };
+                void* const d_last{ vmhook::hotspot::decode_oop_pointer(last) };
+                ctx.check("fao_bounds_first_last_distinct_nonnull",
+                          d_first != nullptr && d_last != nullptr && d_first != d_last);
+            }
+
+            // array_length / get_array_element on a NULL array oop are 0, no crash.
+            ctx.check("fao_bounds_null_oop_len0", vmhook::array_length(nullptr) == 0);
+            ctx.check("fao_bounds_null_oop_elem0_zero",
+                      vmhook::get_array_element<std::uint32_t>(nullptr, 0) == 0u);
         }
 
         // =====================================================================

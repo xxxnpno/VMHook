@@ -36,29 +36,56 @@
 //     handed — i.e. the pointer and the name describe the same live Klass;
 //   - NO name is empty and EVERY name is well-formed (no leading '/', no NUL, no
 //     embedded whitespace) — symbol decode never silently produced "" or garbage;
-//   - the walk TERMINATES (the visitor stops being called; control returns) and
+//   - NO klass handed to the visitor is null or torn: both walk paths call the
+//     visitor only after is_valid_pointer passed (vmhook.hpp:3875/4047), so
+//     null_klass == 0 and invalid_klass == 0 is a UNIVERSAL HARD contract;
+//   - names arrive in INTERNAL '/'-separated form, never the Java dotted form (no
+//     enumerated name contains a '.'; the fixture's dotted twin is absent);
+//   - an INTROSPECTING visitor (one that re-derefs EVERY valid klass and re-reads
+//     its _name) is as safe as the minimal name/count visitor — both walk the full
+//     graph, return control, and never crash the JVM;
+//   - the walk TERMINATES (control returns within a generous wall-clock bound) and
 //     the count is bounded well below the internal 1M-per-CLD / 64K-CLD safety
 //     caps, so we are observing a real finite graph, not a runaway loop;
 //   - the snapshot is STABLE: a second independent enumeration agrees on every
 //     robust invariant (count still > 100, the known classes still present, the
 //     two counts within a small drift band) — enumeration is repeatable and
-//     side-effect-free.
+//     side-effect-free;
+//   - SNAPSHOT FRESHNESS: a class loaded AFTER a first snapshot (the '$'-nested
+//     ForEachLoadedClass$LateAnchor, Class.forName'd by the probe) appears in a
+//     SECOND snapshot — the documented snapshot-at-call-time property.
 //
-// Treated as BEST-EFFORT (recorded [INFO], never a hard FAIL — see the legacy
-// test's note): the launcher-entry class vmhook/Main is NOT surfaced by HotSpot's
-// JDK 8 SystemDictionary walk, and the nested / array anchors
+// Two LIBRARY-CONTRACT angles worth calling out:
+//   - NO EARLY-TERMINATE API.  for_each_loaded_class's visitor is
+//     void(const std::string&, klass*) (vmhook.hpp:7505) — its return value is
+//     IGNORED, so there is no "return false to stop" hook to honour.  The only
+//     visitor-driven control flow the library promises is its OWN try/catch
+//     (vmhook.hpp:7507): a std::exception thrown from the visitor is CONTAINED,
+//     iteration stops at that visit, and control returns normally (no JVM crash).
+//     Part E proves that containment and that a later enumeration still works.
+//   - DUPLICATES are CHARACTERIZED, not asserted.  On JDK 8 the same Klass can be
+//     listed by both the per-CLD Dictionary and the SystemDictionary fallback, so
+//     a repeated klass* is legitimate — "no duplicate pointer" is NOT portable.
+//
+// Treated as BEST-EFFORT on JDK 8 only (recorded [INFO]; HARD on JDK 9+ via
+// gate_jdk9_hard, since the JDK 9+ _klasses walk lists every Klass — verified
+// locally): the launcher class vmhook/Main and the nested / array anchors
 // (ForEachLoadedClass$Inner, [I, [Ljava/lang/String;) live in Klass families the
-// JDK-8 dictionary path may not list — their presence is informational only.
+// JDK-8 dictionary-only walk omits.
 //
-// Harness note: class enumeration is a pure HotSpot-internal read driven straight
-// from the native worker thread — no go/done probe and no hook are required (the
-// fixture registers a trivial no-op probe only to be a well-formed Harness
-// participant).  The module installs NO hooks, so there is nothing to scope or
-// shut down; it reads vmhook.hpp's public surface and never mutates JVM state.
+// Harness note: the STATIC enumeration is a pure HotSpot-internal read driven
+// straight from the native worker thread — no hook is required.  The fixture's
+// go/done probe IS used (Part F): the native side raises `go` so the fixture's
+// tick-thread probe Class.forName's the late class, giving the freshness test a
+// class that is provably loaded only AFTER the first snapshot.  The module
+// installs NO hooks, so there is nothing to scope or shut down; it reads
+// vmhook.hpp's public surface and never mutates JVM state beyond triggering that
+// one on-demand class load.
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <set>
 #include <string>
@@ -70,19 +97,53 @@ namespace
     // MUST appear in the enumeration (the app-class proof).
     constexpr char OWN_FIXTURE[]{ "vmhook/fixtures/ForEachLoadedClass" };
 
+    // A nested class the fixture DELIBERATELY does NOT load at startup (it is
+    // '$'-nested so Main.loadFixtures skips it, AND the fixture's static
+    // initializer never references it).  The freshness probe Class.forName's it
+    // on demand, so it is the snapshot-freshness target: ABSENT from a first
+    // snapshot, PRESENT in a second taken after the probe loaded it.
+    constexpr char LATE_FIXTURE[]{ "vmhook/fixtures/ForEachLoadedClass$LateAnchor" };
+
     // The result of one full enumeration pass.
     struct enumeration
     {
-        std::set<std::string>      names{};               // every internal name seen
+        std::set<std::string>            names{};         // every internal name seen
+        std::set<vmhook::hotspot::klass*> ptrs{};         // every distinct klass* seen
         std::size_t                count{ 0 };            // raw visit count (with dups)
+        std::size_t                null_klass{ 0 };       // visits handed a nullptr klass
+        std::size_t                invalid_klass{ 0 };    // visits whose non-null klass failed the gate
+        std::size_t                dup_ptr{ 0 };          // visits repeating an already-seen klass*
         bool                       all_klass_valid{ true };// every klass* passed the gate
         bool                       any_empty_name{ false };// any visit yielded ""
         bool                       any_bad_name{ false };  // any malformed name
+        bool                       introspect_safe{ true };// re-deref of every klass stayed safe
         // For the OWN fixture: the klass* the visitor handed us, plus whether its
         // get_name() round-trips back to OWN_FIXTURE (usability proof).
         bool                       own_seen{ false };
         bool                       own_klass_valid{ false };
         bool                       own_name_roundtrips{ false };
+    };
+
+    // Wrapper for vmhook.fixtures.ForEachLoadedClass.  Deriving from
+    // vmhook::object<> gives the wrapper its vtable (required by register_class<T>)
+    // and the static_field(...) accessors used for the freshness go/done handshake
+    // and the late-load read-back.  No instance methods are needed — enumeration
+    // is a pure native read; this wrapper only drives the probe.
+    class felc_fixture : public vmhook::object<felc_fixture>
+    {
+    public:
+        explicit felc_fixture(vmhook::oop_t instance) noexcept
+            : vmhook::object<felc_fixture>{ instance }
+        {
+        }
+
+        // go/done handshake (static fields live on the class mirror).
+        static auto set_go(bool value) -> void   { static_field("go")->set(value); }
+        static auto set_done(bool value) -> void { static_field("done")->set(value); }
+        static auto get_done() -> bool           { return static_field("done")->get(); }
+
+        // Freshness read-back the probe writes on the tick thread.
+        static auto get_late_loaded() -> bool    { return static_field("lateLoaded")->get(); }
     };
 
     // A name is well-formed when it is non-empty, carries no leading '/', and has
@@ -127,12 +188,51 @@ namespace
                     result.any_bad_name = true;
                 }
 
-                // The visitor may legitimately be handed nullptr for an exotic
-                // entry, but a NON-null pointer must be a valid, dereferenceable
-                // Klass — never a sentinel / freed / torn value.
-                if (k != nullptr && !vmhook::hotspot::is_valid_pointer(k))
+                // The library NEVER hands the visitor a null klass: both walk
+                // paths (the JDK 21+ _klasses list and the JDK 8-17 dictionary)
+                // call the visitor only AFTER is_valid_pointer(candidate) passed
+                // (vmhook.hpp:3875/4047).  Count any nullptr / invalid pointer so
+                // the caller can assert the contract (null_klass + invalid_klass
+                // must both be 0).  A non-null pointer that fails the gate would
+                // be a torn / sentinel / freed value the caller must never see.
+                if (k == nullptr)
                 {
+                    ++result.null_klass;
                     result.all_klass_valid = false;
+                    return;   // nothing else to introspect.
+                }
+                if (!vmhook::hotspot::is_valid_pointer(k))
+                {
+                    ++result.invalid_klass;
+                    result.all_klass_valid = false;
+                    return;
+                }
+
+                // DUPLICATE-POINTER characterization (best-effort, recorded by the
+                // caller as [INFO], never asserted): on JDK 8 the same Klass can be
+                // listed by both the per-CLD Dictionary and the SystemDictionary
+                // _dictionary / _shared_dictionary fallback, so the same klass* can
+                // legitimately repeat — NOT a portable "no duplicate" invariant.
+                if (!result.ptrs.insert(k).second)
+                {
+                    ++result.dup_ptr;
+                }
+
+                // INTROSPECTING visitor (vs the minimal name/count visitor): for
+                // EVERY valid klass re-deref the supplied pointer (guarded) and
+                // read its _name symbol back.  This is the "callback that
+                // introspects each klass" angle — it must stay crash-safe across
+                // the whole snapshot (not just the fixture), and the re-read name
+                // must itself be empty-or-well-formed.  A symbol that is non-null
+                // but decodes to a control-byte string would flip introspect_safe.
+                const vmhook::hotspot::symbol* const sym{ k->get_name() };
+                if (vmhook::hotspot::is_valid_pointer(sym))
+                {
+                    const std::string round{ sym->to_string() };
+                    if (!round.empty() && !name_is_wellformed(round))
+                    {
+                        result.introspect_safe = false;
+                    }
                 }
 
                 // For our OWN fixture class, prove the supplied klass* is usable:
@@ -141,15 +241,10 @@ namespace
                 if (name == OWN_FIXTURE)
                 {
                     result.own_seen = true;
-                    result.own_klass_valid =
-                        (k != nullptr) && vmhook::hotspot::is_valid_pointer(k);
-                    if (result.own_klass_valid)
+                    result.own_klass_valid = true;   // proven valid above.
+                    if (vmhook::hotspot::is_valid_pointer(sym))
                     {
-                        const vmhook::hotspot::symbol* const sym{ k->get_name() };
-                        if (vmhook::hotspot::is_valid_pointer(sym))
-                        {
-                            result.own_name_roundtrips = (sym->to_string() == OWN_FIXTURE);
-                        }
+                        result.own_name_roundtrips = (sym->to_string() == OWN_FIXTURE);
                     }
                 }
             });
@@ -160,6 +255,12 @@ namespace
 
 VMHOOK_JVM_MODULE(for_each_loaded_class)
 {
+    // Register the fixture wrapper so the snapshot-freshness section (Part F) can
+    // drive its go/done handshake via the static-field accessors.  Enumeration
+    // itself needs no registration — it is a pure native graph read — so PASSES
+    // 1/2 below do not depend on this, but the freshness probe does.
+    vmhook::register_class<felc_fixture>(OWN_FIXTURE);
+
     // =====================================================================
     // PASS 1 — a single full enumeration; every invariant folded in one walk.
     // =====================================================================
@@ -205,6 +306,26 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
                    "on JDK8 (incomplete / non-deterministic SystemDictionary enumeration, "
                    "same quirk as java.lang.String/Main/arrays) — presence check '"
                    + name + "' recorded, not asserted");
+    };
+
+    // BEST-EFFORT gate for klass FAMILIES the JDK 8 dictionary path does not list
+    // but the JDK 9+ per-CLD _klasses walk DOES — array klasses ([I,
+    // [Ljava/lang/String;), the nested $Inner app class, and the launcher class.
+    // On JDK 9+ the _klasses linked list enumerates EVERY Klass (verified: a local
+    // JDK enumerates [I, $Inner, vmhook/Main), so presence is HARD there; on JDK 8
+    // the SystemDictionary-only walk omits these families, so record [INFO].  This
+    // is the same JDK-split discipline as gate_bootstrap_presence, applied to the
+    // array/nested/launcher targets the legacy test recorded as info-only.
+    const auto gate_jdk9_hard =
+        [&ctx, jdk8](const std::string& name, bool present, const char* jdk8_reason) -> void
+    {
+        if (!jdk8 || present)
+        {
+            ctx.check(name, present);
+            return;
+        }
+        ctx.record(std::string{ "[INFO] " } + name + " not enumerated on JDK8 ("
+                   + jdk8_reason + ") — recorded, not asserted; HARD on JDK 9+");
     };
 
     // ── HARD app-loader anchor that survives the JDK8 enumeration quirk ──
@@ -323,6 +444,40 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
     // ---- The enumerated klass pointer is valid AND usable. --------------
     // Every non-null klass* the visitor produced passed the is_valid_pointer gate.
     ctx.check("every_klass_pointer_valid", e1.all_klass_valid);
+    // NO klass delivered to the visitor is null — a UNIVERSAL HARD contract on
+    // every JDK: both walk paths call the visitor only after is_valid_pointer
+    // passed (vmhook.hpp:3875/4047), so the visitor never sees nullptr or an
+    // in-range-but-torn pointer.  These two are the executable form of "no null
+    // klass delivered to the callback".
+    ctx.record(std::string{ "[INFO] for_each_loaded_class: pass-1 null-klass visits=" }
+               + std::to_string(e1.null_klass) + " invalid-klass visits="
+               + std::to_string(e1.invalid_klass));
+    ctx.check("no_null_klass_delivered", e1.null_klass == 0);
+    ctx.check("no_invalid_klass_delivered", e1.invalid_klass == 0);
+
+    // ---- INTROSPECTING visitor stays crash-safe over the WHOLE snapshot. -
+    // enumerate_once already re-derefs EVERY valid klass (a second, heavier
+    // visitor than the minimal name/count one) and reads its _name back.  That it
+    // returned at all proves the introspecting callback never crashed the JVM, and
+    // introspect_safe proves no re-read name was a control-byte string.  This is
+    // the "minimal-work vs introspect-each-klass — both safe" angle.
+    ctx.check("introspecting_visitor_safe", e1.introspect_safe);
+
+    // ---- DUPLICATE klass pointer: CHARACTERIZED, never asserted. ---------
+    // On JDK 8 the same Klass can be listed by both the per-CLD Dictionary and the
+    // SystemDictionary _dictionary / _shared_dictionary fallback, so a repeated
+    // klass* is legitimate — "no duplicate pointer" is NOT a portable invariant.
+    // On JDK 9+ the _klasses walk lists each Klass once per CLD link (locally:
+    // distinct-name count == raw count, i.e. zero dups).  Record the delta either
+    // way; the HARD floor is only that distinct pointers track distinct names
+    // closely enough that the snapshot is not one giant duplicate.
+    ctx.record(std::string{ "[INFO] for_each_loaded_class: pass-1 saw " }
+               + std::to_string(e1.ptrs.size()) + " distinct klass pointer(s), "
+               + std::to_string(e1.dup_ptr) + " duplicate-pointer visit(s) (JDK 8 "
+                 "dictionary+SystemDictionary overlap can legitimately repeat a Klass)");
+    // The distinct-pointer set is itself non-trivial (the snapshot is real, not a
+    // handful of pointers revisited thousands of times).
+    ctx.check("distinct_klass_pointers_over_100", e1.ptrs.size() > 100);
     // For the OWN fixture specifically: the supplied pointer is valid and its own
     // _name symbol round-trips to the same internal name — pointer and name agree.
     // These only have meaning when the fixture was actually enumerated, so they
@@ -359,27 +514,70 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
     }
     ctx.check("all_distinct_names_wellformed", all_names_wellformed);
 
-    // ---- Best-effort, informational only (NEVER hard-fail). -------------
-    // The launcher-entry class is omitted by HotSpot's JDK 8 SystemDictionary
-    // walk, so record its presence rather than asserting it.
+    // ---- INTERNAL '/'-separated form, never the Java dotted form. --------
+    // The visitor receives JVM-internal names ("java/lang/Object"), so the dotted
+    // form must NEVER appear.  The OWN fixture is a known-present app class on
+    // JDK 9+ (gated on JDK 8): assert its slash form was seen and its dotted twin
+    // was not.  A snapshot-wide guard — no enumerated name contains '.' — also
+    // holds: internal names use '/' and '$', so a '.' would mean a decode that
+    // failed to convert.  (Array descriptors use '[', 'L', ';' — none contain '.'.)
+    bool any_dotted_name{ false };
+    for (const std::string& n : e1.names)
+    {
+        if (n.find('.') != std::string::npos)
+        {
+            any_dotted_name = true;
+            break;
+        }
+    }
+    ctx.check("no_dotted_form_name", !any_dotted_name);
+    ctx.check("own_fixture_dotted_form_absent",
+              !e1.names.contains("vmhook.fixtures.ForEachLoadedClass"));
+
+    // ---- More UNIVERSAL bootstrap classes: primitive boxes + a core array. -
+    // The wrapper boxes load before any user code on every HotSpot (autoboxing,
+    // the JLS-mandated cache classes).  Integer is already checked above; Long /
+    // Boolean / Double broaden the "a primitive box is enumerated" angle.  Gated
+    // best-effort on JDK 8 (same SystemDictionary incompleteness), HARD on JDK 9+.
+    gate_bootstrap_presence("has_java_lang_Long",    e1.names.contains("java/lang/Long"));
+    gate_bootstrap_presence("has_java_lang_Boolean", e1.names.contains("java/lang/Boolean"));
+    gate_bootstrap_presence("has_java_lang_Double",  e1.names.contains("java/lang/Double"));
+
+    // ---- Nested + launcher InstanceKlass (HARD on JDK 9+). --------------
+    // $Inner (a nested app class) and vmhook/Main (the launcher entry) are
+    // ordinary InstanceKlasses — the SAME Klass family as the OWN fixture that is
+    // already hard-asserted on JDK 9+ — so the JDK 9+ _klasses walk lists them with
+    // the same reliability (verified locally; gate_jdk9_hard records [INFO] on the
+    // JDK 8 dictionary-only walk that omits them).  This upgrades the legacy
+    // info-only nested / launcher angles into real assertions on the modern matrix.
+    const bool inner_present{ e1.names.contains("vmhook/fixtures/ForEachLoadedClass$Inner") };
+    gate_jdk9_hard("has_nested_inner_class", inner_present, "dictionary-path omits nested klasses");
     const bool main_present{ e1.names.contains("vmhook/Main") };
-    ctx.record(std::string{ "[INFO] for_each_loaded_class: vmhook/Main " }
-               + (main_present ? "enumerated"
-                               : "NOT enumerated (JDK 8 launcher quirk)"));
+    gate_jdk9_hard("has_launcher_main_class", main_present,
+                   "SystemDictionary walk omits the launcher main class");
+
+    // ---- Array klasses: CHARACTERIZED ([INFO], never asserted). ----------
+    // The fixture force-loads the [I primitive-array and [Ljava/lang/String;
+    // object-array klasses.  ArrayKlass is a DISTINCT Klass family from
+    // InstanceKlass: whether array klasses are linked into a CLD's _klasses list is
+    // a JDK-IMPLEMENTATION DETAIL that this module can only confirm on the JDK it
+    // runs against locally (JDK 26 lists both).  Rather than risk a false FAIL on a
+    // JDK 9..21 build the author cannot test, array-klass presence is recorded as
+    // [INFO] across the whole matrix — the well-formed-name guard above already
+    // proves that IF an array name is enumerated, "[I" / "[L..;" decode correctly.
+    const bool prim_array_present{ e1.names.contains("[I") };
+    const bool obj_array_present{ e1.names.contains("[Ljava/lang/String;") };
+    ctx.record(std::string{ "[INFO] for_each_loaded_class: [I primitive-array klass " }
+               + (prim_array_present ? "enumerated" : "NOT enumerated (array-klass family / JDK detail)"));
+    ctx.record(std::string{ "[INFO] for_each_loaded_class: [Ljava/lang/String; object-array klass " }
+               + (obj_array_present ? "enumerated" : "NOT enumerated (array-klass family / JDK detail)"));
+
     // vmhook/Example IS reliably present on every JDK (the legacy test asserted
     // it); record it as a cross-check alongside Main without making the suite
     // depend on the example class being loaded under the modular harness.
     ctx.record(std::string{ "[INFO] for_each_loaded_class: vmhook/Example " }
                + (e1.names.contains("vmhook/Example") ? "enumerated"
                                                        : "NOT enumerated"));
-    // Nested + array anchors the fixture force-loads live in Klass families the
-    // JDK 8 dictionary path may not list — informational, never a FAIL.
-    ctx.record(std::string{ "[INFO] for_each_loaded_class: nested $Inner " }
-               + (e1.names.contains("vmhook/fixtures/ForEachLoadedClass$Inner")
-                      ? "enumerated" : "NOT enumerated (dictionary-path quirk)"));
-    ctx.record(std::string{ "[INFO] for_each_loaded_class: [I array klass " }
-               + (e1.names.contains("[I") ? "enumerated"
-                                          : "NOT enumerated (array-klass quirk)"));
 
     // =====================================================================
     // PASS 2 — snapshot stability: an independent enumeration agrees on every
@@ -405,6 +603,12 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
     const bool own_enumerated_2{ e2.names.contains(OWN_FIXTURE) };
     gate_own_fixture("pass2_has_own_fixture_class", own_enumerated_2, own_enumerated_2);
     ctx.check("pass2_every_klass_pointer_valid", e2.all_klass_valid);
+    // Pass-2 re-proves the UNIVERSAL no-null / no-torn-pointer contract and that
+    // the introspecting (re-deref-every-klass) visitor stayed crash-safe on an
+    // independent walk.
+    ctx.check("pass2_no_null_klass_delivered", e2.null_klass == 0);
+    ctx.check("pass2_no_invalid_klass_delivered", e2.invalid_klass == 0);
+    ctx.check("pass2_introspecting_visitor_safe", e2.introspect_safe);
     // Empty names tolerated (see pass-1 rationale) — record, never hard-fail.
     ctx.record(std::string{ "[INFO] for_each_loaded_class: pass-2 empty-name visit " }
                + (e2.any_empty_name ? "present (VM-internal/anonymous klass — tolerated)"
@@ -443,5 +647,170 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
                    + (own_enumerated ? "seen" : "missed") + ", pass2="
                    + (own_enumerated_2 ? "seen" : "missed")
                    + ") — JDK8 SystemDictionary enumeration is non-deterministic");
+    }
+
+    // =====================================================================
+    // PART D — TERMINATION + EMPTY (minimal) visitor.  The "large count / full
+    // bootstrap set" angle: a visitor that does the least possible work (just a
+    // count) must still walk the WHOLE graph, return control, and finish within a
+    // generous wall-clock bound — no overrun, no hang, no crash.  This is the
+    // executable "the walk terminates" proof, complementing count_under_safety_cap.
+    // =====================================================================
+    {
+        std::size_t empty_count{ 0 };
+        const auto t0{ std::chrono::steady_clock::now() };
+        vmhook::for_each_loaded_class(
+            [&](const std::string&, vmhook::hotspot::klass*) { ++empty_count; });
+        const auto t1{ std::chrono::steady_clock::now() };
+        const double empty_ms{ std::chrono::duration<double, std::milli>{ t1 - t0 }.count() };
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: minimal-visitor walk counted " }
+                   + std::to_string(empty_count) + " klass(es) in "
+                   + std::to_string(empty_ms) + " ms");
+        // The minimal walk sees the same large bootstrap+app set (>100) ...
+        ctx.check("minimal_visitor_count_over_100", empty_count > 100);
+        // ... stays under the internal safety caps (a real finite graph) ...
+        ctx.check("minimal_visitor_under_safety_cap", empty_count < 1'000'000);
+        // ... and TERMINATES well within a generous bound even on a slow CI box.
+        ctx.check("minimal_visitor_terminates_bounded", empty_ms < 30000.0);
+    }
+
+    // =====================================================================
+    // PART E — THROWING visitor is CONTAINED (no early-terminate API, but a throw
+    // must not crash the JVM).  for_each_loaded_class has NO bool-returning
+    // early-stop hook — the visitor's return value is ignored (vmhook.hpp:7505,
+    // signature void(const std::string&, klass*)).  The only visitor-driven
+    // control flow the library promises is its OWN try/catch boundary
+    // (vmhook.hpp:7507-7515): a std::exception thrown from the visitor is caught,
+    // iteration stops at the throwing visit, and control returns NORMALLY — the
+    // JVM is not torn down.  We prove that contract here AND that the walk is
+    // stateless: an enumeration AFTER the throwing one still works.
+    //
+    // NOTE: the throw is caught INSIDE for_each_loaded_class, so it never reaches
+    // the harness's per-module container — this is suite-safe by construction.
+    // =====================================================================
+    {
+        std::size_t before_throw{ 0 };
+        bool         walk_returned{ false };
+        try
+        {
+            vmhook::for_each_loaded_class(
+                [&](const std::string&, vmhook::hotspot::klass*)
+                {
+                    ++before_throw;
+                    if (before_throw >= 5)
+                    {
+                        // Thrown from the visitor; the library's own catch must
+                        // swallow it and return control to us.
+                        throw vmhook::exception{ "for_each_loaded_class throwing-visitor probe" };
+                    }
+                });
+            walk_returned = true;   // reached iff the library caught the throw.
+        }
+        catch (...)
+        {
+            // Must NOT happen: the library's try/catch should have contained it.
+            walk_returned = false;
+        }
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: throwing visitor saw " }
+                   + std::to_string(before_throw)
+                   + " visit(s) before throw; library "
+                   + (walk_returned ? "contained the throw (control returned)"
+                                    : "let the throw ESCAPE"));
+        // The throw was contained by for_each_loaded_class's own catch: control
+        // returned to us without the exception escaping (and without crashing).
+        ctx.check("throwing_visitor_contained", walk_returned);
+        // It stopped AT the throwing visit (we threw on the 5th), so the count is
+        // exactly the throttle value — iteration halted, did not run to the end.
+        ctx.check("throwing_visitor_stopped_at_throw", before_throw == 5);
+
+        // The walk is stateless: a fresh enumeration AFTER the throwing one still
+        // produces a healthy snapshot (the contained throw left nothing corrupt).
+        const enumeration after{ enumerate_once() };
+        ctx.check("enumeration_healthy_after_contained_throw", after.count > 100);
+        ctx.check("enumeration_valid_after_contained_throw", after.all_klass_valid);
+    }
+
+    // =====================================================================
+    // PART F — SNAPSHOT FRESHNESS: a class loaded AFTER a first snapshot appears
+    // in a SECOND snapshot.  for_each_loaded_class is documented as a SNAPSHOT
+    // (vmhook.hpp:7474 "classes loaded after ... are not visited; ... loaded
+    // before a later call IS").  LATE_FIXTURE is a '$'-nested class the fixture
+    // deliberately leaves UNLOADED at startup; the probe Class.forName's it on the
+    // tick thread.  We snapshot BEFORE (it must be absent) and AFTER (it must
+    // appear).  CRUCIAL: we use ONLY the pure enumeration to test pre-load
+    // absence — NOT vmhook::find_class, whose JNI fallback would itself LOAD the
+    // class and destroy the premise.  find_class is used only AFTER the probe, as
+    // a portable "it is genuinely loaded now" oracle (its JNI fallback resolves an
+    // already-loaded app class on every JDK, including JDK 8).
+    // =====================================================================
+    {
+        // Snapshot 1 (pre-load).  The late class must be absent here; record
+        // [INFO] rather than hard-asserting (defensive — only this fixture ever
+        // references it, but a hard "absent" assertion would be brittle).
+        const enumeration pre{ enumerate_once() };
+        const bool late_in_pre{ pre.names.contains(LATE_FIXTURE) };
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: late class " }
+                   + LATE_FIXTURE + " in pre-load snapshot: "
+                   + (late_in_pre ? "PRESENT (unexpected — already loaded)"
+                                  : "absent (expected)"));
+
+        // Drive the probe: ask the fixture's tick thread to Class.forName the late
+        // class.  On the rising edge of `go` it clears `done`, loads the class,
+        // and sets `done` (see ForEachLoadedClass.java).
+        const bool probe_done{ ctx.run_probe(
+            [](bool value)
+            {
+                if (value)
+                {
+                    felc_fixture::set_done(false);
+                }
+                felc_fixture::set_go(value);
+            },
+            []() { return felc_fixture::get_done(); }) };
+        ctx.check("freshness_probe_completed", probe_done);
+        // The fixture confirms (independent of the enumeration) that the load ran.
+        const bool late_loaded_java{ felc_fixture::get_late_loaded() };
+        ctx.check("freshness_java_loaded_late_class", late_loaded_java);
+
+        // UNIVERSAL HARD oracle: the late class is now genuinely loaded, so
+        // find_class resolves it on EVERY JDK (graph walk on JDK 9+, JNI fallback
+        // on JDK 8).  Called only AFTER the probe, so it cannot have caused the
+        // load itself.
+        const bool late_resolvable{ vmhook::find_class(LATE_FIXTURE) != nullptr };
+        ctx.check("freshness_late_class_resolvable_after_load", late_resolvable);
+
+        // Snapshot 2 (post-load).
+        const enumeration post{ enumerate_once() };
+        const bool late_in_post{ post.names.contains(LATE_FIXTURE) };
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: late class " }
+                   + LATE_FIXTURE + " in post-load snapshot: "
+                   + (late_in_post ? "PRESENT (freshness confirmed)" : "absent"));
+
+        // UNIVERSAL HARD (drift-tolerant): classes only ACCRETE — loading a class
+        // never removes others, so the post-load snapshot should be >= the pre-load
+        // one.  On JDK 9+ the _klasses walk is deterministic and this is exact; on
+        // JDK 8 the SystemDictionary walk is non-deterministic and back-to-back
+        // snapshots drift by a handful either way (the same reason
+        // pass_to_pass_name_count_stable uses a tolerance band), so we allow the
+        // post count to dip by at most that same band rather than asserting strict
+        // monotonicity.  A genuine mass removal (dozens of classes) still FAILS.
+        ctx.check("freshness_count_did_not_shrink",
+                  post.names.size() + 64 >= pre.names.size());
+
+        // The headline freshness invariant: the newly-loaded class now appears in
+        // the snapshot.  HARD on JDK 9+ (the _klasses walk lists every app class);
+        // best-effort on JDK 8 (the SystemDictionary-only walk may drop the entry —
+        // the resolvable + monotonic floors above still hold there).
+        gate_jdk9_hard("freshness_late_class_in_second_snapshot", late_in_post,
+                       "SystemDictionary walk may drop the freshly-loaded entry");
+
+        // FRESHNESS DELTA (best-effort, [INFO]): the class transitioned from
+        // absent->present across the probe.  This is the cleanest statement of the
+        // snapshot property when both endpoints behaved (JDK 9+); on JDK 8 either
+        // endpoint may be perturbed by the enumeration lottery, so record it.
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: freshness delta — late class " }
+                   + (!late_in_pre && late_in_post
+                          ? "appeared between snapshot 1 and 2 (snapshot freshness confirmed)"
+                          : "did not show a clean absent->present transition this run"));
     }
 }

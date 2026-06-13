@@ -51,6 +51,33 @@
 //   * JVM AGREEMENT: a probe runs the SAME observations Java-side and publishes
 //     per-impl witnesses the module reads back (each impl's speak()/who()/etc.).
 //
+// EXHAUSTIVE itable / interface-dispatch shapes (scenarios 9-14, every
+// best-effort item PASS-or-[INFO], every Java witness HARD):
+//   * SUPER-INTERFACE (interface EXTENDS interface): Wolf : LoudAnimal : Animal.
+//     shout() (sub-iface default) and defaultGreet() (grandparent default) are
+//     reached through the Wolf wrapper ONLY via the transitive-interface walk.
+//   * DIAMOND: Diamond : DiamondLeft, DiamondRight (both : DiamondTop).  The
+//     single apex default tag() is reached through two arms -> one body.
+//   * SAME-SIGNATURE default across TWO interfaces + REQUIRED override:
+//     Concierge : Greeter, Welcomer (each declares hello()).  The override is on
+//     the impl's own klass, so the SUPER walk binds it before the interface
+//     tie-break ever runs -- proving own/override precedence.
+//   * INTERFACE INHERITED FROM A SUPERCLASS: GuardDog extends Watcher (which
+//     implements Animal) and declares NO interface itself; Animal is in its set
+//     only TRANSITIVELY through the superclass, so reaching defaultGreet() proves
+//     the walk reads _transitive_interfaces (not just _local_interfaces).
+//   * VTABLE vs ITABLE on the SAME object: the GuardDog oop read as a base-CLASS
+//     ref (Watcher -> virtual/vtable) and as an INTERFACE ref (Animal ->
+//     itable/invokeinterface) decode the SAME oop and dispatch the SAME speak().
+//   * STATIC interface method (Java 8+): Toolish.brand() is callable on the
+//     interface's own klass (HARD) but is NOT inherited by the Gadget implementor
+//     (the default fallback excludes ACC_STATIC) -- characterised.  (A PRIVATE
+//     interface method is deliberately omitted: JDK9+ only, would break javac 8.)
+//   * GENERIC interface + COVARIANT impl -> BRIDGE method (erasure): StringBox :
+//     Box<String> declares String get(); javac emits a synthetic Object get()
+//     bridge, so the runtime _methods array carries BOTH descriptors (enumerated
+//     HARD), and dispatch reaches the real String body either way.
+//
 // SAFETY (suite-safe end to end): the entire body runs inside one try/catch that
 // degrades ANY exception to [INFO] (never a FAIL), with an UNCONDITIONAL
 // vmhook::shutdown_hooks() in a trailing block OUTSIDE the try; an entry guard
@@ -93,6 +120,20 @@ namespace
     constexpr const char* k_robot_class     = "vmhook/fixtures/InterfacePoly$Robot";
     constexpr const char* k_abstract_class  = "vmhook/fixtures/InterfacePoly$AbstractPet";
     constexpr const char* k_hamster_class   = "vmhook/fixtures/InterfacePoly$Hamster";
+    // ---- types added for the EXHAUSTIVE itable/interface-shape coverage ----
+    constexpr const char* k_loudanimal_class = "vmhook/fixtures/InterfacePoly$LoudAnimal"; // iface extends iface
+    constexpr const char* k_wolf_class       = "vmhook/fixtures/InterfacePoly$Wolf";        // impl of super-iface
+    constexpr const char* k_diamondtop_class = "vmhook/fixtures/InterfacePoly$DiamondTop";  // diamond apex
+    constexpr const char* k_diamond_class    = "vmhook/fixtures/InterfacePoly$Diamond";     // diamond impl
+    constexpr const char* k_greeter_class    = "vmhook/fixtures/InterfacePoly$Greeter";     // same-sig iface A
+    constexpr const char* k_welcomer_class   = "vmhook/fixtures/InterfacePoly$Welcomer";    // same-sig iface B
+    constexpr const char* k_concierge_class  = "vmhook/fixtures/InterfacePoly$Concierge";   // same-sig override
+    constexpr const char* k_watcher_class    = "vmhook/fixtures/InterfacePoly$Watcher";     // non-final base impl
+    constexpr const char* k_guarddog_class   = "vmhook/fixtures/InterfacePoly$GuardDog";    // iface via superclass
+    constexpr const char* k_toolish_class    = "vmhook/fixtures/InterfacePoly$Toolish";     // static iface method
+    constexpr const char* k_gadget_class     = "vmhook/fixtures/InterfacePoly$Gadget";      // impl of Toolish
+    constexpr const char* k_box_class        = "vmhook/fixtures/InterfacePoly$Box";         // generic iface
+    constexpr const char* k_stringbox_class  = "vmhook/fixtures/InterfacePoly$StringBox";   // covariant impl (bridge)
 
     // ── Wrapper for CONCRETE implementation #1 (InterfacePoly$Dog) ──────────
     // Registered as the concrete class, so its resolve_klass() (typeid-based)
@@ -212,6 +253,190 @@ namespace
         auto resolves_describe() const -> bool { return get_method("describe").has_value(); }
     };
 
+    // ── Wrapper for the SUPER-interface implementor (InterfacePoly$Wolf) ────
+    // Wolf implements LoudAnimal (which EXTENDS Animal).  Only speak() is on
+    // Wolf's own klass; shout() (LoudAnimal default) and defaultGreet() (Animal
+    // default) live on (super-)interfaces, reachable through Wolf ONLY via the
+    // transitive-interface fallback.  All three resolves_*() probe that path.
+    class ifp_wolf : public vmhook::object<ifp_wolf>
+    {
+    public:
+        explicit ifp_wolf(vmhook::oop_t instance) noexcept
+            : vmhook::object<ifp_wolf>{ instance }
+        {
+        }
+
+        auto name()          const -> std::string { return get_field("name")->get(); }
+        auto speak()         const -> std::string { return get_method("speak")->call().as_string(); }
+        auto shout()         const -> std::string { return get_method("shout")->call().as_string(); }
+        auto default_greet() const -> std::string { return get_method("defaultGreet")->call().as_string(); }
+
+        auto resolves_speak()         const -> bool { return get_method("speak").has_value(); }
+        auto resolves_shout()         const -> bool { return get_method("shout").has_value(); }
+        auto resolves_default_greet() const -> bool { return get_method("defaultGreet").has_value(); }
+    };
+
+    // ── Wrapper for the DIAMOND implementor (InterfacePoly$Diamond) ─────────
+    // Diamond implements DiamondLeft AND DiamondRight (both extend DiamondTop).
+    // mark() is its own (super walk, depth 0); tag() is the SINGLE default at the
+    // apex DiamondTop, reachable via the transitive fallback through two arms.
+    class ifp_diamond : public vmhook::object<ifp_diamond>
+    {
+    public:
+        explicit ifp_diamond(vmhook::oop_t instance) noexcept
+            : vmhook::object<ifp_diamond>{ instance }
+        {
+        }
+
+        auto label() const -> std::string { return get_field("label")->get(); }
+        auto mark()  const -> std::string { return get_method("mark")->call().as_string(); }
+        auto tag()   const -> std::string { return get_method("tag")->call().as_string(); }
+
+        auto resolves_mark() const -> bool { return get_method("mark").has_value(); }
+        auto resolves_tag()  const -> bool { return get_method("tag").has_value(); }
+    };
+
+    // ── Wrapper for the SAME-SIGNATURE-conflict impl (InterfacePoly$Concierge)
+    // Implements Greeter AND Welcomer, each declaring a same-signature default
+    // hello(); the required override is on Concierge's own klass, so the SUPER
+    // walk binds it (depth 0) before the interface tie-break ever runs.
+    class ifp_concierge : public vmhook::object<ifp_concierge>
+    {
+    public:
+        explicit ifp_concierge(vmhook::oop_t instance) noexcept
+            : vmhook::object<ifp_concierge>{ instance }
+        {
+        }
+
+        auto desk()  const -> std::string { return get_field("desk")->get(); }
+        auto hello() const -> std::string { return get_method("hello")->call().as_string(); }
+
+        auto resolves_hello() const -> bool { return get_method("hello").has_value(); }
+    };
+
+    // ── Wrapper for the GuardDog (InterfacePoly$GuardDog) ───────────────────
+    // GuardDog extends Watcher (which implements Animal) and declares NO
+    // interface of its own, so Animal is reached only TRANSITIVELY through the
+    // superclass.  speak() is inherited from Watcher (super walk); defaultGreet()
+    // is on Animal, reachable only if the transitive-interface fallback surfaces a
+    // SUPERCLASS-supplied interface.  This is the itable-via-superclass case.
+    class ifp_guarddog : public vmhook::object<ifp_guarddog>
+    {
+    public:
+        explicit ifp_guarddog(vmhook::oop_t instance) noexcept
+            : vmhook::object<ifp_guarddog>{ instance }
+        {
+        }
+
+        auto on_duty()       const -> bool        { return get_field("onDuty")->get(); }
+        auto name()          const -> std::string { return get_field("name")->get(); } // inherited from Watcher
+        auto speak()         const -> std::string { return get_method("speak")->call().as_string(); }
+        auto default_greet() const -> std::string { return get_method("defaultGreet")->call().as_string(); }
+
+        auto resolves_speak()         const -> bool { return get_method("speak").has_value(); }
+        auto resolves_default_greet() const -> bool { return get_method("defaultGreet").has_value(); }
+    };
+
+    // ── Wrapper for the non-final base class (InterfacePoly$Watcher) ────────
+    // The CLASS-reference (vtable) view of the GuardDog object: registered to the
+    // base klass Watcher, so speak() resolves on Watcher's own klass (depth 0).
+    // Reading the GuardDog oop through THIS wrapper is the vtable side of the
+    // vtable-vs-itable contrast.
+    class ifp_watcher : public vmhook::object<ifp_watcher>
+    {
+    public:
+        explicit ifp_watcher(vmhook::oop_t instance) noexcept
+            : vmhook::object<ifp_watcher>{ instance }
+        {
+        }
+
+        auto name()  const -> std::string { return get_field("name")->get(); }
+        auto speak() const -> std::string { return get_method("speak")->call().as_string(); }
+
+        auto resolves_speak() const -> bool { return get_method("speak").has_value(); }
+    };
+
+    // ── Wrapper for the static-interface-method impl (InterfacePoly$Gadget) ─
+    // Gadget implements Toolish; use() is overridden on Gadget (super walk).  The
+    // STATIC interface method brand() is NOT inherited by the implementor, so the
+    // fallback must NOT surface it through this wrapper (resolves_brand() expected
+    // false -> [INFO]); brand() is still callable on the Toolish klass itself.
+    class ifp_gadget : public vmhook::object<ifp_gadget>
+    {
+    public:
+        explicit ifp_gadget(vmhook::oop_t instance) noexcept
+            : vmhook::object<ifp_gadget>{ instance }
+        {
+        }
+
+        auto model() const -> std::string { return get_field("model")->get(); }
+        auto use()   const -> std::string { return get_method("use")->call().as_string(); }
+
+        auto resolves_use()   const -> bool { return get_method("use").has_value(); }
+        auto resolves_brand() const -> bool { return get_method("brand").has_value(); }
+    };
+
+    // ── Wrapper for the covariant/bridge impl (InterfacePoly$StringBox) ─────
+    // StringBox implements Box<String> with a covariant String get(); javac emits
+    // a synthetic bridge Object get() on this klass, so the runtime klass exposes
+    // BOTH get descriptors.  The explicit-signature accessor pins the REAL body;
+    // the name-only accessor takes whichever the _methods order latches first
+    // (both dispatch to the real String body through the JVM).
+    class ifp_string_box : public vmhook::object<ifp_string_box>
+    {
+    public:
+        explicit ifp_string_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<ifp_string_box>{ instance }
+        {
+        }
+
+        auto value() const -> std::string { return get_field("value")->get(); }
+        auto get_via_name() const -> std::string { return get_method("get")->call().as_string(); }
+        auto get_via_string_sig() const -> std::string
+        {
+            return get_method("get", "()Ljava/lang/String;")->call().as_string();
+        }
+
+        auto resolves_get_name()       const -> bool { return get_method("get").has_value(); }
+        auto resolves_get_string_sig() const -> bool { return get_method("get", "()Ljava/lang/String;").has_value(); }
+        auto resolves_get_object_sig() const -> bool { return get_method("get", "()Ljava/lang/Object;").has_value(); }
+    };
+
+    // ── Wrapper for the generic interface type itself (InterfacePoly$Box) ───
+    // Reading the box slot AS the declared generic interface: its own klass
+    // declares the erased Object get(); proves the declared-interface read decodes
+    // the SAME oop as the concrete StringBox read.
+    class ifp_box : public vmhook::object<ifp_box>
+    {
+    public:
+        explicit ifp_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<ifp_box>{ instance }
+        {
+        }
+
+        auto resolves_get_erased() const -> bool { return get_method("get", "()Ljava/lang/Object;").has_value(); }
+    };
+
+    // ── Wrapper for the static-method interface itself (InterfacePoly$Toolish)
+    // Registered to the Toolish INTERFACE klass, so static_method("brand") finds
+    // the STATIC interface method on the interface's own _methods array (depth 0,
+    // HARD).  Contrast: through the Gadget IMPLEMENTOR wrapper the same static is
+    // NOT inherited (scenario 13).
+    class ifp_toolish : public vmhook::object<ifp_toolish>
+    {
+    public:
+        explicit ifp_toolish(vmhook::oop_t instance) noexcept
+            : vmhook::object<ifp_toolish>{ instance }
+        {
+        }
+
+        // Resolvability of the static interface method on the interface's own
+        // klass (depth-0 static walk): true on every JDK that loads Toolish.
+        static auto resolves_static_brand() -> bool { return static_method("brand").has_value(); }
+        // The static call itself (best-effort: interpreter may be no-value).
+        static auto static_brand() -> std::string { return static_method("brand")->call().as_string(); }
+    };
+
     // ── Wrapper for the DECLARED interface type (InterfacePoly$Animal) ──────
     // Registered as the interface, so its resolve_klass() lands on the interface
     // klass.  A speak() lookup here finds the ABSTRACT interface method; a
@@ -307,6 +532,18 @@ namespace
         // ---- read the petAsDog field (concrete-typed slot to the SAME object) ----
         auto pet_alias_as_dog() const -> std::unique_ptr<ifp_dog> { return get_field("petAsDog")->get(); }
 
+        // ---- EXHAUSTIVE shapes: read each new declared slot AS its concrete impl
+        auto loud_as_wolf()      const -> std::unique_ptr<ifp_wolf>      { return get_field("loud")->get(); }
+        auto diamond_as_impl()   const -> std::unique_ptr<ifp_diamond>   { return get_field("diamond")->get(); }
+        auto concierge_impl()    const -> std::unique_ptr<ifp_concierge> { return get_field("concierge")->get(); }
+        auto guard_as_guarddog() const -> std::unique_ptr<ifp_guarddog>  { return get_field("guard")->get(); }
+        auto guard_as_watcher()  const -> std::unique_ptr<ifp_watcher>   { return get_field("guardAsWatcher")->get(); }
+        auto gadget_impl()       const -> std::unique_ptr<ifp_gadget>    { return get_field("gadget")->get(); }
+        auto box_as_string_box() const -> std::unique_ptr<ifp_string_box>{ return get_field("box")->get(); }
+        // ---- read `box`/`guard` AS their DECLARED interface types -------------
+        auto box_as_iface()      const -> std::unique_ptr<ifp_box>       { return get_field("box")->get(); }
+        auto guard_as_animal()   const -> std::unique_ptr<ifp_animal>    { return get_field("guard")->get(); }
+
         // ---- Java-side witnesses (set by the probe through real bytecode) ----
         static auto pet_is_dog_seen()         -> bool        { return static_field("petIsDogSeen")->get(); }
         static auto all_impls_distinct_seen() -> bool        { return static_field("allImplsDistinctSeen")->get(); }
@@ -371,6 +608,32 @@ namespace
         return s.find(needle) != std::string::npos;
     }
 
+    // Shared runtime-klass battery for the EXHAUSTIVE scenarios (factored so each
+    // new shape gets the SAME proof + the SAME cold-relocation degrade).  Reads
+    // the concrete klass straight from the oop header: the runtime type is the
+    // implementor even though the declared field type is the interface/base.  The
+    // read is RAW; on a cold-JVM relocation runtime_klass_name() returns "" and we
+    // record [INFO] and skip (never FAIL), exactly like the original table loop.
+    // `leaf` is the expected internal-name suffix (e.g. "Wolf"); `full` the full
+    // slash-separated internal name; `label` only labels the [INFO] lines.
+    auto ipm_check_runtime_klass(vmhook_test::context& ctx, vmhook::oop_t oop,
+                                 const char* leaf, const char* full, const char* label) -> void
+    {
+        const std::string rn{ runtime_klass_name(oop) };
+        if (rn.empty())
+        {
+            ctx.record(std::string("[INFO] interface_polymorphism: ") + label
+                       + " runtime klass not readable (null/stale/relocated oop); "
+                         "skipped runtime-type assertion.");
+            return;
+        }
+        ctx.check(std::string("ipm_") + label + "_runtime_klass_ends_with_" + leaf, ends_with(rn, leaf));
+        ctx.check(std::string("ipm_") + label + "_runtime_klass_is_full_internal_name",
+                  rn == std::string{ full });
+        ctx.record(std::string("[INFO] interface_polymorphism: ") + label
+                   + " runtime klass = '" + rn + "' (declared field type is the interface/base).");
+    }
+
     // Drive one probe cycle for `mode`: clear the latched `done`, program the
     // selector on the rising edge of go, then wait for done.
     auto drive(vmhook_test::context& ctx, std::int32_t mode) -> bool
@@ -400,6 +663,16 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
     vmhook::register_class<ifp_robot>(k_robot_class);
     vmhook::register_class<ifp_abstract>(k_abstract_class);
     vmhook::register_class<ifp_hamster>(k_hamster_class);
+    // Wrappers for the exhaustive itable/interface-shape coverage.
+    vmhook::register_class<ifp_wolf>(k_wolf_class);
+    vmhook::register_class<ifp_diamond>(k_diamond_class);
+    vmhook::register_class<ifp_concierge>(k_concierge_class);
+    vmhook::register_class<ifp_guarddog>(k_guarddog_class);
+    vmhook::register_class<ifp_watcher>(k_watcher_class);
+    vmhook::register_class<ifp_gadget>(k_gadget_class);
+    vmhook::register_class<ifp_toolish>(k_toolish_class);
+    vmhook::register_class<ifp_string_box>(k_stringbox_class);
+    vmhook::register_class<ifp_box>(k_box_class);
 
     // Suite-safe: every observation is inside this try; any exception degrades to
     // an [INFO] line (never a FAIL), and the UNCONDITIONAL shutdown_hooks() in the
@@ -434,6 +707,20 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
         ctx.check("robot_klass_resolves",              vmhook::find_class(k_robot_class)     != nullptr);
         ctx.check("abstract_base_klass_resolves",      vmhook::find_class(k_abstract_class)  != nullptr);
         ctx.check("hamster_klass_resolves",            vmhook::find_class(k_hamster_class)   != nullptr);
+        // The EXHAUSTIVE-shape nested klasses (all loaded transitively via the holder).
+        ctx.check("ipm_loudanimal_super_iface_klass_resolves", vmhook::find_class(k_loudanimal_class) != nullptr);
+        ctx.check("ipm_wolf_klass_resolves",           vmhook::find_class(k_wolf_class)       != nullptr);
+        ctx.check("ipm_diamondtop_apex_klass_resolves", vmhook::find_class(k_diamondtop_class) != nullptr);
+        ctx.check("ipm_diamond_klass_resolves",        vmhook::find_class(k_diamond_class)    != nullptr);
+        ctx.check("ipm_greeter_klass_resolves",        vmhook::find_class(k_greeter_class)    != nullptr);
+        ctx.check("ipm_welcomer_klass_resolves",       vmhook::find_class(k_welcomer_class)   != nullptr);
+        ctx.check("ipm_concierge_klass_resolves",      vmhook::find_class(k_concierge_class)  != nullptr);
+        ctx.check("ipm_watcher_base_klass_resolves",   vmhook::find_class(k_watcher_class)    != nullptr);
+        ctx.check("ipm_guarddog_klass_resolves",       vmhook::find_class(k_guarddog_class)   != nullptr);
+        ctx.check("ipm_toolish_klass_resolves",        vmhook::find_class(k_toolish_class)    != nullptr);
+        ctx.check("ipm_gadget_klass_resolves",         vmhook::find_class(k_gadget_class)     != nullptr);
+        ctx.check("ipm_box_generic_iface_klass_resolves", vmhook::find_class(k_box_class)     != nullptr);
+        ctx.check("ipm_stringbox_klass_resolves",      vmhook::find_class(k_stringbox_class)  != nullptr);
 
         const auto holder{ ifp_holder::singleton() };
         ctx.check("ifp_singleton_nonnull", holder != nullptr);
@@ -465,6 +752,26 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
         // signature; the object behind it is the very same Dog as `pet`).
         ctx.check("petAsDog_field_descriptor_is_concrete_dog",
                   holder->field_signature("petAsDog") == dog_desc);
+
+        // DECLARED-type proof for the EXHAUSTIVE slots: each names its declared
+        // (interface / super-interface / base-class / generic-interface) type,
+        // never the runtime impl -- the contrast the runtime-klass battery below
+        // overturns.  loud=LoudAnimal, diamond=DiamondLeft, concierge=Greeter,
+        // guard=Animal, guardAsWatcher=Watcher, gadget=Toolish, box=Box.
+        const std::string loud_desc{      std::string{ "L" } + k_loudanimal_class + ";" };
+        const std::string diamondL_desc{  std::string{ "L" } + "vmhook/fixtures/InterfacePoly$DiamondLeft" + ";" };
+        const std::string greeter_desc{   std::string{ "L" } + k_greeter_class    + ";" };
+        const std::string watcher_desc{   std::string{ "L" } + k_watcher_class    + ";" };
+        const std::string toolish_desc{   std::string{ "L" } + k_toolish_class    + ";" };
+        const std::string box_desc{       std::string{ "L" } + k_box_class        + ";" };
+        ctx.check("ipm_loud_field_descriptor_is_super_interface",   holder->field_signature("loud")      == loud_desc);
+        ctx.check("ipm_diamond_field_descriptor_is_diamond_arm",    holder->field_signature("diamond")   == diamondL_desc);
+        ctx.check("ipm_concierge_field_descriptor_is_greeter_iface", holder->field_signature("concierge") == greeter_desc);
+        ctx.check("ipm_guard_field_descriptor_is_animal_interface", holder->field_signature("guard")      == animal_desc);
+        ctx.check("ipm_guardAsWatcher_field_descriptor_is_base_class",
+                  holder->field_signature("guardAsWatcher") == watcher_desc);
+        ctx.check("ipm_gadget_field_descriptor_is_toolish_iface",   holder->field_signature("gadget")    == toolish_desc);
+        ctx.check("ipm_box_field_descriptor_is_generic_iface",      holder->field_signature("box")       == box_desc);
 
         // =================================================================
         //  1. RUNTIME-TYPE RESOLUTION (one slot per impl): reading an
@@ -879,6 +1186,366 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
                       pet_animal->resolves_speak());
         }
 
+        // Native results from the EXHAUSTIVE scenarios, captured for the Java
+        // byte-for-byte cross-check in scenario 8 (each gated so a no-value JDK
+        // build never compares an empty native string).
+        std::string wolf_shout, wolf_greet, diamond_tag, concierge_hello;
+        std::string guard_speak_class, guard_speak_iface, guard_greet;
+        std::string gadget_use, box_get, toolish_brand;
+
+        // =================================================================
+        //  9. SUPER-INTERFACE (interface EXTENDS interface): InterfacePoly$Wolf
+        //     implements LoudAnimal, which extends Animal.  Runtime klass is Wolf;
+        //     speak() (own override) resolves via the super walk (HARD); shout()
+        //     (LoudAnimal default) and defaultGreet() (grandparent Animal default)
+        //     live on (super-)interfaces, reachable ONLY via the transitive
+        //     fallback -> BEST-EFFORT (PASS-or-[INFO]).
+        // =================================================================
+        const auto wolf{ holder->loud_as_wolf() };
+        ipm_check_runtime_klass(ctx, wolf ? wolf->get_instance() : nullptr,
+                                "Wolf", k_wolf_class, "wolf");
+        if (wolf)
+        {
+            // speak() is on Wolf's own klass -> superclass walk, HARD on every JDK.
+            ctx.check("ipm_wolf_own_speak_resolves", wolf->resolves_speak());
+
+            // shout() is a default on the SUB-interface LoudAnimal: transitive
+            // fallback only -> best-effort.
+            if (wolf->resolves_shout())
+            {
+                if (oop_readable(wolf->get_instance()))
+                {
+                    wolf_shout = wolf->shout();
+                    if (!wolf_shout.empty())
+                    {
+                        ctx.check("ipm_wolf_shout_is_loud_form", contains(wolf_shout, "LOUD:"));
+                        ctx.check("ipm_wolf_shout_embeds_speak", contains(wolf_shout, "howl"));
+                    }
+                }
+                ctx.record("[INFO] interface_polymorphism: Wolf wrapper FOUND the super-interface default "
+                           "shout() (declared on LoudAnimal) via the transitive-interface fallback.");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: super-interface default shout() was NOT reached "
+                           "through the Wolf wrapper on this JDK/config (transitive fallback fail-safed); "
+                           "best-effort, not a failure.");
+            }
+
+            // defaultGreet() is a default on the GRANDPARENT Animal: transitive
+            // fallback across two interface hops -> best-effort.
+            if (wolf->resolves_default_greet())
+            {
+                if (oop_readable(wolf->get_instance()))
+                {
+                    wolf_greet = wolf->default_greet();
+                    if (!wolf_greet.empty())
+                    {
+                        ctx.check("ipm_wolf_grandparent_default_greet_form",
+                                  contains(wolf_greet, "interface-default-greet"));
+                        ctx.check("ipm_wolf_grandparent_default_greet_embeds_speak",
+                                  contains(wolf_greet, "howl"));
+                    }
+                }
+                ctx.record("[INFO] interface_polymorphism: Wolf wrapper FOUND the GRANDPARENT-interface default "
+                           "defaultGreet() (declared on Animal, two interface hops up) via the transitive walk.");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: grandparent-interface default defaultGreet() was NOT "
+                           "reached through the Wolf wrapper on this JDK/config; best-effort, not a failure.");
+            }
+        }
+
+        // =================================================================
+        // 10. DIAMOND of interfaces sharing ONE default: InterfacePoly$Diamond
+        //     implements DiamondLeft AND DiamondRight (both extend DiamondTop).
+        //     mark() is its own (super walk, HARD); tag() is the SINGLE default at
+        //     the apex DiamondTop, reachable through two arms -> transitive
+        //     fallback, BEST-EFFORT.  The diamond must resolve to the one body.
+        // =================================================================
+        const auto diamond{ holder->diamond_as_impl() };
+        ipm_check_runtime_klass(ctx, diamond ? diamond->get_instance() : nullptr,
+                                "Diamond", k_diamond_class, "diamond");
+        if (diamond)
+        {
+            ctx.check("ipm_diamond_own_mark_resolves", diamond->resolves_mark());
+            if (diamond->resolves_tag())
+            {
+                if (oop_readable(diamond->get_instance()))
+                {
+                    diamond_tag = diamond->tag();
+                    if (!diamond_tag.empty())
+                    {
+                        ctx.check("ipm_diamond_tag_is_apex_default", contains(diamond_tag, "diamond-top-tag"));
+                    }
+                }
+                ctx.record("[INFO] interface_polymorphism: Diamond wrapper FOUND the single apex default tag() "
+                           "(declared on DiamondTop, reached via two diamond arms) -> transitive walk de-duped.");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: diamond apex default tag() was NOT reached through the "
+                           "Diamond wrapper on this JDK/config; best-effort, not a failure.");
+            }
+        }
+
+        // =================================================================
+        // 11. SAME-SIGNATURE default across TWO interfaces + REQUIRED override:
+        //     InterfacePoly$Concierge implements Greeter AND Welcomer (each with a
+        //     same-signature hello() default).  The override is on Concierge's own
+        //     klass, so the SUPERCLASS walk binds it FIRST -- the interface
+        //     tie-break never runs.  Resolvability HARD (own method); the call body
+        //     proves the override (not either interface default) won.
+        // =================================================================
+        const auto concierge{ holder->concierge_impl() };
+        ipm_check_runtime_klass(ctx, concierge ? concierge->get_instance() : nullptr,
+                                "Concierge", k_concierge_class, "concierge");
+        if (concierge)
+        {
+            // The override is on the impl's own klass -> super walk, HARD.
+            ctx.check("ipm_concierge_override_hello_resolves", concierge->resolves_hello());
+            if (oop_readable(concierge->get_instance()))
+            {
+                concierge_hello = concierge->hello();
+                if (!concierge_hello.empty())
+                {
+                    // The override won -- NOT "greeter-hello" / "welcomer-hello".
+                    ctx.check("ipm_concierge_hello_is_override", contains(concierge_hello, "concierge-hello"));
+                    ctx.check("ipm_concierge_hello_not_greeter", !contains(concierge_hello, "greeter-hello"));
+                    ctx.check("ipm_concierge_hello_not_welcomer", !contains(concierge_hello, "welcomer-hello"));
+                }
+            }
+        }
+
+        // =================================================================
+        // 12. INTERFACE INHERITED FROM A SUPERCLASS + vtable-vs-itable.
+        //     InterfacePoly$GuardDog extends Watcher (which implements Animal) and
+        //     declares NO interface of its own -- Animal is in GuardDog's set ONLY
+        //     transitively-through-the-superclass.  speak() is inherited from
+        //     Watcher (super walk, HARD); defaultGreet() (Animal default) is
+        //     reachable only if the transitive walk surfaces a SUPERCLASS-supplied
+        //     interface -> BEST-EFFORT.  The SAME oop is then read as a base-CLASS
+        //     ref (Watcher -> vtable) and an INTERFACE ref (Animal -> itable); both
+        //     decode the SAME oop and dispatch the SAME speak() body.
+        // =================================================================
+        const auto guard_dog{ holder->guard_as_guarddog() };
+        const auto guard_watcher{ holder->guard_as_watcher() };
+        const auto guard_animal{ holder->guard_as_animal() };
+        ipm_check_runtime_klass(ctx, guard_dog ? guard_dog->get_instance() : nullptr,
+                                "GuardDog", k_guarddog_class, "guarddog");
+        if (guard_dog)
+        {
+            // speak() comes from the superclass Watcher -> super walk, HARD.
+            ctx.check("ipm_guarddog_inherited_speak_resolves", guard_dog->resolves_speak());
+
+            // defaultGreet() (Animal default) reachable only if the transitive set
+            // includes the SUPERCLASS's interface -> best-effort.
+            if (guard_dog->resolves_default_greet())
+            {
+                if (oop_readable(guard_dog->get_instance()))
+                {
+                    guard_greet = guard_dog->default_greet();
+                    if (!guard_greet.empty())
+                    {
+                        ctx.check("ipm_guarddog_superclass_iface_default_form",
+                                  contains(guard_greet, "interface-default-greet"));
+                    }
+                }
+                ctx.record("[INFO] interface_polymorphism: GuardDog wrapper FOUND defaultGreet() -- the Animal "
+                           "interface was surfaced TRANSITIVELY through the superclass (GuardDog declares no "
+                           "interface itself).");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: GuardDog's superclass-supplied interface default "
+                           "defaultGreet() was NOT reached on this JDK/config (transitive fallback used "
+                           "_local_interfaces or fail-safed); best-effort, not a failure.");
+            }
+        }
+
+        // vtable-vs-itable: SAME object via base-CLASS ref and INTERFACE ref.
+        if (guard_dog && guard_watcher)
+        {
+            // Pure pointer compare -> HARD: the base-class-typed read decodes the
+            // SAME oop as the concrete read.
+            ctx.check("ipm_guard_class_ref_same_oop",
+                      guard_watcher->get_instance() == guard_dog->get_instance());
+            // speak() resolves through the base CLASS wrapper too (vtable side).
+            ctx.check("ipm_guard_class_ref_speak_resolves", guard_watcher->resolves_speak());
+        }
+        if (guard_dog && guard_animal)
+        {
+            // The INTERFACE-typed read decodes the SAME oop (itable side); HARD.
+            ctx.check("ipm_guard_iface_ref_same_oop",
+                      guard_animal->get_instance() == guard_dog->get_instance());
+            const std::string via_iface{ runtime_klass_name(guard_animal->get_instance()) };
+            if (!via_iface.empty())
+            {
+                ctx.check("ipm_guard_iface_ref_runtime_klass_is_guarddog",
+                          ends_with(via_iface, "GuardDog"));
+            }
+        }
+        // Both dispatch paths return the SAME speak() body (best-effort calls).
+        if (guard_watcher && oop_readable(guard_watcher->get_instance()))
+        {
+            guard_speak_class = guard_watcher->speak();   // vtable
+        }
+        if (guard_animal && guard_dog && oop_readable(guard_dog->get_instance()))
+        {
+            guard_speak_iface = guard_dog->speak();        // itable (concrete wrapper, runtime klass)
+        }
+        if (!guard_speak_class.empty() && !guard_speak_iface.empty())
+        {
+            // vtable result == itable result for the SAME object -> HARD when both
+            // calls returned a value.
+            ctx.check("ipm_guard_vtable_equals_itable_dispatch",
+                      guard_speak_class == guard_speak_iface);
+            ctx.check("ipm_guard_speak_contains_name", contains(guard_speak_class, "Bruno"));
+        }
+        else
+        {
+            ctx.record("[INFO] interface_polymorphism: GuardDog speak() did not return via the interpreter on "
+                       "both the class-ref and interface-ref paths on this JDK build; the same-oop pointer "
+                       "proofs above already establish the vtable-vs-itable identity.");
+        }
+
+        // =================================================================
+        // 13. STATIC INTERFACE METHOD (Java 8+) is NOT inherited by implementors.
+        //     InterfacePoly$Gadget implements Toolish; use() is overridden (super
+        //     walk, HARD).  Toolish.brand() is STATIC -> the interface-default
+        //     fallback must NOT surface it through the Gadget wrapper
+        //     (resolves_brand() expected false; characterised as [INFO], never a
+        //     FAIL -- if a future vmhook DOES surface a static, that is recorded
+        //     too).  brand() stays callable on the Toolish klass itself.
+        // =================================================================
+        const auto gadget{ holder->gadget_impl() };
+        ipm_check_runtime_klass(ctx, gadget ? gadget->get_instance() : nullptr,
+                                "Gadget", k_gadget_class, "gadget");
+        if (gadget)
+        {
+            ctx.check("ipm_gadget_override_use_resolves", gadget->resolves_use());
+            if (oop_readable(gadget->get_instance()))
+            {
+                gadget_use = gadget->use();
+                if (!gadget_use.empty())
+                {
+                    ctx.check("ipm_gadget_use_body", contains(gadget_use, "in use"));
+                }
+            }
+            // The static interface method must NOT be inherited by the implementor.
+            if (!gadget->resolves_brand())
+            {
+                ctx.record("[INFO] interface_polymorphism: STATIC interface method brand() is correctly NOT "
+                           "surfaced through the Gadget implementor wrapper (static interface methods are not "
+                           "inherited; the default fallback excludes ACC_STATIC).");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: a vmhook build surfaced the STATIC interface method "
+                           "brand() through the implementor wrapper -- recorded for visibility (the fallback's "
+                           "ACC_STATIC exclusion is expected to keep it hidden).");
+            }
+        }
+        // The static interface method IS resolvable directly on the Toolish klass
+        // (depth-0 static walk on the interface's own _methods) -> HARD on every JDK
+        // that loaded Toolish.  The CALL is best-effort (interpreter may be
+        // no-value); when it returns, assert its body and capture for cross-check.
+        if (vmhook::find_class(k_toolish_class) != nullptr)
+        {
+            ctx.check("ipm_toolish_static_brand_resolves_on_interface_klass",
+                      ifp_toolish::resolves_static_brand());
+            toolish_brand = ifp_toolish::static_brand();
+            if (!toolish_brand.empty())
+            {
+                ctx.check("ipm_toolish_static_brand_body", contains(toolish_brand, "toolish-brand"));
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: Toolish.brand() static call returned no value via the "
+                           "interpreter on this JDK build; resolvability proven HARD above.");
+            }
+        }
+
+        // =================================================================
+        // 14. GENERIC INTERFACE + COVARIANT IMPL -> javac BRIDGE method (erasure).
+        //     InterfacePoly$StringBox implements Box<String> with String get();
+        //     javac emits a synthetic bridge Object get() on this klass, so the
+        //     runtime _methods array carries BOTH descriptors.  Enumerating the
+        //     klass methods (a runtime-klass read, universal) proves both exist;
+        //     the explicit-signature lookup pins the REAL String body; the call
+        //     dispatches to the real body either way.
+        // =================================================================
+        const auto box{ holder->box_as_string_box() };
+        ipm_check_runtime_klass(ctx, box ? box->get_instance() : nullptr,
+                                "StringBox", k_stringbox_class, "stringbox");
+        if (box)
+        {
+            // Enumerate the runtime klass's own _methods: BOTH get descriptors.
+            const auto methods{ vmhook::get_class_methods<ifp_string_box>() };
+            if (!methods.empty())
+            {
+                int get_string{ 0 };
+                int get_object{ 0 };
+                for (const auto& [m_name, m_sig] : methods)
+                {
+                    if (m_name != "get")
+                    {
+                        continue;
+                    }
+                    if (m_sig == "()Ljava/lang/String;") { ++get_string; }
+                    if (m_sig == "()Ljava/lang/Object;") { ++get_object; }
+                }
+                // The real covariant method is universal; HARD.
+                ctx.check("ipm_stringbox_has_real_string_get", get_string >= 1);
+                // The synthetic bridge Object get() is what javac emits for an
+                // erased-interface covariant override; HARD (the _methods array is a
+                // warm runtime-klass read, and erasure is a language constant on 8+).
+                ctx.check("ipm_stringbox_has_bridge_object_get", get_object >= 1);
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: StringBox method enumeration was empty (klass not "
+                           "resolvable for the wrapper on this run); skipped bridge-method assertions.");
+            }
+
+            // Explicit-signature lookups resolve each overload distinctly; HARD.
+            ctx.check("ipm_stringbox_explicit_string_get_resolves", box->resolves_get_string_sig());
+            ctx.check("ipm_stringbox_explicit_object_get_resolves", box->resolves_get_object_sig());
+            ctx.check("ipm_stringbox_name_only_get_resolves",       box->resolves_get_name());
+
+            if (oop_readable(box->get_instance()))
+            {
+                // The explicit String-sig call reaches the real body.
+                const std::string real_get{ box->get_via_string_sig() };
+                if (!real_get.empty())
+                {
+                    ctx.check("ipm_stringbox_real_get_body", contains(real_get, "boxed:"));
+                    ctx.check("ipm_stringbox_real_get_value", contains(real_get, "cargo"));
+                }
+                // The name-only call (whichever overload latched) STILL returns the
+                // real String body, because the bridge delegates to it.  Capture for
+                // the Java cross-check.
+                box_get = box->get_via_name();
+                if (!box_get.empty())
+                {
+                    ctx.check("ipm_stringbox_name_only_get_reaches_real_body", contains(box_get, "boxed:"));
+                }
+            }
+        }
+        // Reading the box slot AS the declared GENERIC interface decodes the SAME
+        // oop, and its own klass declares the erased Object get().
+        {
+            const auto box_iface{ holder->box_as_iface() };
+            if (box && box_iface)
+            {
+                ctx.check("ipm_box_iface_ref_same_oop",
+                          box_iface->get_instance() == box->get_instance());
+                // The interface's own klass declares the erased get() -> HARD.
+                ctx.check("ipm_box_iface_declares_erased_get", box_iface->resolves_get_erased());
+            }
+        }
+
         // =================================================================
         //  8. JVM AGREEMENT: the probe runs the SAME observations Java-side and
         //     publishes per-impl witnesses.  Confirms the JVM itself sees each
@@ -944,6 +1611,86 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
             if (!dog_greet.empty())
             {
                 ctx.check("native_and_java_dog_inherited_greet_agree", dog_greet == java_dgreet);
+            }
+
+            // ---- EXHAUSTIVE-shape witnesses (Java's own invoke* -> HARD) ------
+            const std::string j_wolf_shout{  ifp_holder::java_witness("wolfShoutSeen") };
+            const std::string j_wolf_speak{  ifp_holder::java_witness("wolfSpeakSeen") };
+            const std::string j_wolf_greet{  ifp_holder::java_witness("wolfGreetSeen") };
+            const std::string j_diamond{     ifp_holder::java_witness("diamondTagSeen") };
+            const std::string j_concierge{   ifp_holder::java_witness("conciergeHelloSeen") };
+            const std::string j_guard_class{ ifp_holder::java_witness("guardSpeakViaClassSeen") };
+            const std::string j_guard_iface{ ifp_holder::java_witness("guardSpeakViaInterfaceSeen") };
+            const std::string j_guard_greet{ ifp_holder::java_witness("guardGreetSeen") };
+            const std::string j_gadget{      ifp_holder::java_witness("gadgetUseSeen") };
+            const std::string j_brand{       ifp_holder::java_witness("toolishBrandSeen") };
+            const std::string j_box{         ifp_holder::java_witness("boxGetSeen") };
+
+            // Super-interface: shout() (sub-iface default), speak() (override),
+            // defaultGreet() (grandparent default) -- all via the LoudAnimal ref.
+            ctx.check("java_wolf_shout_is_loud_form",      contains(j_wolf_shout, "LOUD:"));
+            ctx.check("java_wolf_shout_embeds_speak",      contains(j_wolf_shout, "howl"));
+            ctx.check("java_wolf_speak_is_override",       contains(j_wolf_speak, "howl"));
+            ctx.check("java_wolf_grandparent_greet_form",  contains(j_wolf_greet, "interface-default-greet"));
+            // Diamond: single apex default reached via two arms.
+            ctx.check("java_diamond_tag_is_apex_default",  contains(j_diamond, "diamond-top-tag"));
+            // Same-signature override won (not either interface default).
+            ctx.check("java_concierge_hello_is_override",  contains(j_concierge, "concierge-hello"));
+            ctx.check("java_concierge_hello_not_greeter",  !contains(j_concierge, "greeter-hello"));
+            ctx.check("java_concierge_hello_not_welcomer", !contains(j_concierge, "welcomer-hello"));
+            // vtable (class ref) and itable (interface ref) reach the SAME body on
+            // the SAME GuardDog object -> Java sees them byte-for-byte equal.
+            ctx.check("java_guard_class_ref_speaks",       contains(j_guard_class, "woof"));
+            ctx.check("java_guard_iface_ref_speaks",       contains(j_guard_iface, "woof"));
+            ctx.check("java_guard_vtable_equals_itable",   j_guard_class == j_guard_iface);
+            ctx.check("java_guard_superclass_iface_greet", contains(j_guard_greet, "interface-default-greet"));
+            // Static interface method invoked directly (NOT through an instance).
+            ctx.check("java_gadget_use_body",              contains(j_gadget, "in use"));
+            ctx.check("java_toolish_static_brand_body",    contains(j_brand, "toolish-brand"));
+            // Generic/bridge: dispatch through Box<String> reaches the real body.
+            ctx.check("java_box_get_reaches_real_body",    contains(j_box, "boxed:"));
+
+            // Cross-check: where the NATIVE call also returned a value, native and
+            // Java agree byte-for-byte (gated, so a no-value JDK build never fails).
+            if (!wolf_shout.empty())
+            {
+                ctx.check("native_and_java_wolf_shout_agree", wolf_shout == j_wolf_shout);
+            }
+            if (!wolf_greet.empty())
+            {
+                ctx.check("native_and_java_wolf_greet_agree", wolf_greet == j_wolf_greet);
+            }
+            if (!diamond_tag.empty())
+            {
+                ctx.check("native_and_java_diamond_tag_agree", diamond_tag == j_diamond);
+            }
+            if (!concierge_hello.empty())
+            {
+                ctx.check("native_and_java_concierge_hello_agree", concierge_hello == j_concierge);
+            }
+            if (!guard_speak_class.empty())
+            {
+                ctx.check("native_and_java_guard_class_speak_agree", guard_speak_class == j_guard_class);
+            }
+            if (!guard_speak_iface.empty())
+            {
+                ctx.check("native_and_java_guard_iface_speak_agree", guard_speak_iface == j_guard_iface);
+            }
+            if (!guard_greet.empty())
+            {
+                ctx.check("native_and_java_guard_greet_agree", guard_greet == j_guard_greet);
+            }
+            if (!gadget_use.empty())
+            {
+                ctx.check("native_and_java_gadget_use_agree", gadget_use == j_gadget);
+            }
+            if (!toolish_brand.empty())
+            {
+                ctx.check("native_and_java_toolish_brand_agree", toolish_brand == j_brand);
+            }
+            if (!box_get.empty())
+            {
+                ctx.check("native_and_java_box_get_agree", box_get == j_box);
             }
         }
 

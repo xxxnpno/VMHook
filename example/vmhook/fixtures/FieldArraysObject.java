@@ -5,24 +5,37 @@ import vmhook.Harness;
 /**
  * Fixture for the field_arrays_object feature (area: fields).
  *
- * Exercises READING Java reference arrays out of object / static fields:
+ * Exercises READING Java reference arrays out of object / static fields, across
+ * every element kind, every dimensionality, and every null/empty/large shape:
  *
  *   - String[]                       (signature "[Ljava/lang/String;")
- *   - Object[] of a registered wrapper type Item
- *                                    (signature "[Lvmhook/fixtures/FieldArraysObject$Item;")
+ *   - Item[]   (registered wrapper)  (signature "[Lvmhook/fixtures/FieldArraysObject$Item;")
+ *   - Object[] (erased element)      (signature "[Ljava/lang/Object;")
+ *   - Integer[] (boxed primitive)    (signature "[Ljava/lang/Integer;")
+ *   - Tagged[] (interface element)   (signature "[Lvmhook/fixtures/FieldArraysObject$Tagged;")
+ *   - Item[][] / String[][]          (2-D, signatures "[[L...")
+ *   - Object[][][]                   (3-D, signature "[[[Ljava/lang/Object;")
+ *   - a field typed plain Object that HOLDS an Item[] (array covariance: the
+ *     declared field type is "Ljava/lang/Object;" but the runtime oop is an array)
  *
- * through the two C++ read paths the native module drives:
+ * through the C++ read paths the native module drives:
  *
  *   (a) the field_proxy implicit-conversion operator into std::vector<std::string>
  *       for String[] (lands in read_array_value -> append_array_value(vector<string>)),
- *   (b) field_proxy::value_t::to_vector<Item>() for the Object[] wrapper path
- *       (the documented entry point, which currently mis-routes through
- *       collection::to_vector — see the native module's [INFO] flaw notes),
+ *   (b) field_proxy::value_t::to_vector<Item>() for the Object[] / Item[] wrapper
+ *       path.  This WORKS today: to_vector<T>() branches on the field signature and,
+ *       for a "[L.../"[[..." array field, walks the raw array directly (each
+ *       non-null slot -> make_unique<Item>, each null slot -> nullptr).  Only plain
+ *       "L...;" collection fields fall through to collection::to_vector.  (An
+ *       earlier revision mis-routed every Object[] through collection::to_vector and
+ *       silently returned an EMPTY vector; the signature branch fixed that.)
  *   (c) a manual decode_array_oop + per-element get_array_element walk that proves
- *       the Object[] DATA is reachable and that inner nulls are distinguishable,
- *       independent of (b).
+ *       the array DATA is reachable, that inner nulls are distinguishable as real
+ *       nullptr slots, and (for the multi-dim cases) that an inner ROW oop is itself
+ *       a walkable array — exercising jagged inner lengths and 2-D/3-D descent.
  *
- * Coverage shapes, for BOTH String[] and Item[]:
+ * Coverage shapes, for BOTH String[] and Item[] (and, where it adds signal, the
+ * other element kinds):
  *   - canonical multi-element (all non-null),
  *   - EMPTY array (length 0),
  *   - SINGLE element,
@@ -30,9 +43,11 @@ import vmhook.Harness;
  *   - MIXED null / non-null (interleaved),
  *   - leading-null and trailing-null edge layouts,
  *   - a genuinely null field (the array reference itself is null),
+ *   - a LARGE array (length 1000) to stress the per-element loop and the reserve,
+ *   - jagged 2-D rows of differing inner width,
  *   - instance (non-static) variants of the canonical + mixed cases.
  *
- * Every element's value (String contents, or Item.tag + identityHashCode) and
+ * Every element's value (String contents, Item.tag, or Integer.value) and
  * null-ness is published so the native side can verify element COUNT and each
  * element's value / null-ness exactly.  Java 8 syntax only.
  */
@@ -48,12 +63,24 @@ public final class FieldArraysObject
     public static volatile int observed;
 
     /**
-     * Registered-wrapper element type for the Object[] arrays.  Mirrors the
-     * MethodObject$Child shape: a readable int field plus a callable method, so
-     * the native side can prove a decoded element is a real, usable object (read
-     * tag through the wrapper AND call getTag() through it).
+     * Interface element type, so a field can be declared {@code Tagged[]}
+     * (signature "[Lvmhook/fixtures/FieldArraysObject$Tagged;") while its runtime
+     * elements are concrete {@link Item}s — the array-of-interface / covariance
+     * case.  {@link Item} implements it, so the SAME native item_object wrapper
+     * decodes a {@code Tagged[]} slot and reads its tag.
      */
-    public static final class Item
+    public interface Tagged
+    {
+        int getTag();
+    }
+
+    /**
+     * Registered-wrapper element type for the Object[] / Item[] / Tagged[] arrays.
+     * Mirrors the MethodObject$Child shape: a readable int field plus a callable
+     * method, so the native side can prove a decoded element is a real, usable
+     * object (read tag through the wrapper AND call getTag() through it).
+     */
+    public static final class Item implements Tagged
     {
         public int tag;
 
@@ -62,6 +89,7 @@ public final class FieldArraysObject
             this.tag = tag;
         }
 
+        @Override
         public int getTag()
         {
             return this.tag;
@@ -175,6 +203,102 @@ public final class FieldArraysObject
     /** Empty 2D Item[][] (outer length 0). */
     public static volatile Item[][] grid2dEmpty = new Item[0][];
 
+    // ---- JAGGED 2D Item[][] for explicit inner-row descent ----------------
+    // The native side walks the OUTER array, then walks each non-null ROW oop as
+    // an array in its own right (array_length + get_array_element per inner slot),
+    // asserting the differing inner widths {1, 2, 3} and the inner Item tags.
+
+    /** Jagged Item[][]: rows of width 1 / 2 / 3 with unique tags per cell. */
+    public static volatile Item[][] jaggedGrid =
+        {
+            { new Item(201) },
+            { new Item(202), new Item(203) },
+            { new Item(204), new Item(205), new Item(206) },
+        };
+
+    // ---- 2D String[][] -----------------------------------------------------
+    // Same OUTER-walk + inner-row descent, but the inner element is a String OOP,
+    // bridging the String[] read with the multi-dim object-array walk.  Includes a
+    // jagged inner-width layout and a NULL middle row.
+
+    /** Jagged String[][]: row widths 1 / 2, inner Strings. */
+    public static volatile String[][] strGrid2d =
+        { { "r0c0" }, { "r1c0", "r1c1" } };
+
+    /** String[][] with a NULL middle row: { row, null, row }. */
+    public static volatile String[][] strGrid2dMixed =
+        { { "a" }, null, { "b", "c" } };
+
+    // ---- 3D Object[][][] ---------------------------------------------------
+    // Signature begins "[[[", so to_vector<T>() / the manual walk take the
+    // signature[1]=='[' arm and read the OUTERMOST dimension; each element is a
+    // 2-D Object[][] oop.  Proves the array walk is dimensionality-agnostic.
+
+    /** Canonical 3D Object[][][]: 2 outer planes. */
+    public static volatile Object[][][] cube3d =
+        {
+            { { new Item(301), new Item(302) }, { new Item(303) } },
+            { { new Item(304) } },
+        };
+
+    // ---- Integer[] (BOXED primitive) ---------------------------------------
+    // Declared java.lang.Integer[], so each non-null element is a boxed Integer
+    // OOP whose `value` int field + intValue() the native side reads through a
+    // java/lang/Integer wrapper.  Includes an interleaved null (boxing makes a
+    // null element legal, unlike a primitive int[]).
+
+    /** Canonical Integer[] (autoboxed), all non-null: { 7, 8, 9 }. */
+    public static volatile Integer[] boxedInts = { 7, 8, 9 };
+
+    /** Mixed Integer[] with a null: { 70, null, 90 }. */
+    public static volatile Integer[] boxedMixed = { 70, null, 90 };
+
+    // ---- Tagged[] (INTERFACE element type) ---------------------------------
+    // Declared Tagged[] (an interface array) holding concrete Items: array
+    // covariance.  The native item_object wrapper decodes each slot and reads its
+    // tag, proving an interface-typed array reads identically to a class-typed one.
+
+    /** Canonical Tagged[] holding Items: { Item(110), Item(120), Item(130) }. */
+    public static volatile Tagged[] taggedItems =
+        { new Item(110), new Item(120), new Item(130) };
+
+    /** Mixed Tagged[]: { Item(111), null, Item(113) }. */
+    public static volatile Tagged[] taggedMixed =
+        { new Item(111), null, new Item(113) };
+
+    // ---- Field typed plain Object that HOLDS an array (covariance) ----------
+    // The DECLARED field type is java.lang.Object (signature "Ljava/lang/Object;"),
+    // but the assigned value is an Item[] — so field_oop() decodes to a live ARRAY
+    // oop whose component type is Item.  The native side proves it can read the
+    // backing array (length + element tags) even though the static field type is a
+    // scalar reference, and that the component type is recoverable at runtime.
+
+    /** A scalar Object field whose runtime value is an Item[]{Item(401),Item(402)}. */
+    public static volatile Object objectHoldingArray =
+        new Item[]{ new Item(401), new Item(402) };
+
+    /** A scalar Object field whose runtime value is a String[]{"oh0","oh1"}. */
+    public static volatile Object objectHoldingStringArray =
+        new String[]{ "oh0", "oh1" };
+
+    // ---- LARGE Item[] (length 1000) ----------------------------------------
+    // Stresses the per-element decode loop and the result-vector reserve at a
+    // realistic length.  Element i carries tag == i, so the native side can
+    // spot-check the first / a middle / the last element's identity by value.
+
+    /** Large Item[] of length 1000; element i has tag == i. */
+    public static volatile Item[] largeItems = buildLargeItems(1000);
+
+    private static Item[] buildLargeItems(final int n)
+    {
+        final Item[] out = new Item[n];
+        for (int i = 0; i < n; i++)
+        {
+            out[i] = new Item(i);
+        }
+        return out;
+    }
+
     // ---- Published values for native cross-checks -------------------------
     // Each Item carries a UNIQUE tag, so the native side proves it decoded the
     // right object by reading tag through the wrapper (field AND getTag method).
@@ -194,6 +318,18 @@ public final class FieldArraysObject
     public static volatile int objectMixedLen;
     public static volatile int grid2dLen;
     public static volatile int grid2dMixedLen;
+    public static volatile int jaggedGridLen;
+    public static volatile int jaggedRow0Len;
+    public static volatile int jaggedRow1Len;
+    public static volatile int jaggedRow2Len;
+    public static volatile int strGrid2dLen;
+    public static volatile int cube3dLen;
+    public static volatile int boxedIntsLen;
+    public static volatile int boxedMixedLen;
+    public static volatile int taggedItemsLen;
+    public static volatile int taggedMixedLen;
+    public static volatile int largeItemsLen;
+    public static volatile int objectHoldingArrayLen;
 
     /** Hookable instance method — the native module hooks this to prove the
         fixture is live and to obtain a `self` that can read instance fields. */
@@ -212,6 +348,18 @@ public final class FieldArraysObject
         objectMixedLen   = objectMixed.length;
         grid2dLen        = grid2d.length;
         grid2dMixedLen   = grid2dMixed.length;
+        jaggedGridLen    = jaggedGrid.length;
+        jaggedRow0Len    = jaggedGrid[0].length;
+        jaggedRow1Len    = jaggedGrid[1].length;
+        jaggedRow2Len    = jaggedGrid[2].length;
+        strGrid2dLen     = strGrid2d.length;
+        cube3dLen        = cube3d.length;
+        boxedIntsLen     = boxedInts.length;
+        boxedMixedLen    = boxedMixed.length;
+        taggedItemsLen   = taggedItems.length;
+        taggedMixedLen   = taggedMixed.length;
+        largeItemsLen    = largeItems.length;
+        objectHoldingArrayLen = ((Object[]) objectHoldingArray).length;
     }
 
     static
