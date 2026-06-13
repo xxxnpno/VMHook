@@ -1196,15 +1196,17 @@ VMHOOK_JVM_MODULE(field_introspection)
             }
         }
 
-        // The forced-System.gc() GC-staleness characterization below is gated OFF
-        // on MinGW / clang-cl: those Windows toolchains have no SEH net, and a cold
-        // aggressive full-GC churn here can destabilize the test JVM (consistently
-        // observed crashing jvm·windows·mingw·java8 at this exact point, while every
-        // native read in this block is already safe_read/mirror-guarded — i.e. the
-        // forced collection itself, not a vmhook read, is the trigger). The
-        // no-relocation accessors are fully covered by Sections A-G; this
-        // characterization runs in full on MSVC + Linux + macOS.
-#if (defined(_MSC_VER) && !defined(__clang__)) || !defined(_WIN32)
+        // The forced-System.gc() GC-staleness characterization below is gated to
+        // POSIX (Linux/macOS) ONLY.  On ALL Windows toolchains the aggressive full-GC
+        // churn destabilizes the test JVM with an OFF-suite-thread fault during the
+        // collection / code-cache sweep that neither the harness __try nor the (now
+        // fully fault-proofed) auto-repair watchdog can contain — observed crashing
+        // mingw·java8 AND msvc·JDK11+ at this exact point, while EVERY native read in
+        // this block is already safe_read/mirror-guarded (the forced collection itself,
+        // not a vmhook read, is the trigger; deep msvc·JDK11+ GC-internal interaction
+        // tracked as a follow-up).  The no-relocation accessors are fully covered by
+        // Sections A-G on every cell; this characterization runs on Linux + macOS.
+#if !defined(_WIN32)
         cp("SECTION H run_probe mode 2 (forced System.gc() churn)");
         const bool done{ ctx.run_probe(
             [](bool value)
