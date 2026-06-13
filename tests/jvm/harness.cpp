@@ -306,17 +306,6 @@ namespace vmhook_test
                     ctx.check(std::string{ "module_" } + module_entry.name + "_completed_cleanly", false);
                 }
 #endif
-                // The contained crash recovered via longjmp (VEH) / __except (MSVC),
-                // which abandoned the faulting module's C++ destructors — so any
-                // hook it armed (e.g. a scoped_hook) is still installed and would
-                // corrupt the NEXT module.  Tear all hooks down before the next
-                // module runs.  reset() is vmhook::shutdown_hooks(), which is
-                // REVERSIBLE, so the next module can hook again.  Only present when
-                // the driver wires a reset callback.
-                if (ctx.reset)
-                {
-                    ctx.reset();
-                }
             }
             // Paired with the "=== module: X ===" line above: with per-line
             // flushing in the driver, if a module crashes the JVM on a toolchain
@@ -328,6 +317,23 @@ namespace vmhook_test
             if (ctx.record)
             {
                 ctx.record(std::string{ "[INFO] --- module " } + module_entry.name + " done ---");
+            }
+            // INTER-MODULE RESET (cross-platform suite-safety): every module must hand
+            // the next one a PRISTINE hook system.  scoped_hook/hook_handle::stop()
+            // tears down a hook's patch but does NOT stop the auto-repair watchdog or
+            // clear its stored Method* — only shutdown_hooks() does.  A watchdog left
+            // running by ANY earlier module keeps polling verify_hooks() over stored
+            // Method*; once a LATER module's forced System.gc()/class-unload relocates
+            // or frees that Method, the watchdog raw-derefs it ON ITS OWN DETACHED
+            // THREAD — outside the per-module SEH/__try AND the detour guard — so the
+            // fault is uncontained and crashes the JVM (NO-TOTAL) on msvc + linux-gcc,
+            // not just the no-SEH legs.  Reset unconditionally AFTER EVERY module (not
+            // only after a contained crash) so no watchdog / stored Method* / armed
+            // hook ever survives across the module boundary.  reset() == reversible
+            // vmhook::shutdown_hooks(); the next module hooks again from a clean slate.
+            if (ctx.reset)
+            {
+                ctx.reset();
             }
             ++ran;
         }
