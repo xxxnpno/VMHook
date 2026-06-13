@@ -93,6 +93,15 @@ namespace
 
         static auto last_echo_arg() -> std::int32_t { return static_field("lastEchoArg")->get(); }
 
+        static auto record_string_called()   -> bool        { return static_field("recordStringCalled")->get(); }
+        static auto record_string_char_len() -> std::int32_t { return static_field("recordStringCharLen")->get(); }
+        static auto record_string_cp_count() -> std::int32_t { return static_field("recordStringCpCount")->get(); }
+        static auto record_string_first_cp() -> std::int32_t { return static_field("recordStringFirstCp")->get(); }
+        static auto record_string_last_cp()  -> std::int32_t { return static_field("recordStringLastCp")->get(); }
+        static auto record_string_hash()     -> std::int32_t { return static_field("recordStringHash")->get(); }
+
+        static auto ctor_calls() -> std::int32_t { return static_field("ctorCalls")->get(); }
+
         // -- instance primitive returners (convert at the exact target type) --
         auto call_bool(const char* n) -> bool          { return get_method(n)->call(); }
         auto call_byte(const char* n) -> std::int8_t   { return get_method(n)->call(); }
@@ -255,6 +264,53 @@ namespace
     // Sentinels for the static-via-instance regression.
     constexpr std::int64_t k_svia_echo   = static_cast<std::int64_t>(0x6E5D4C3BLL); // 1851877947
     constexpr std::int64_t k_svia_follow = static_cast<std::int64_t>(0x2BCD16E0ABCDEF01LL);
+
+    // ── ARRAY-RETURN value-correctness (int[] / long[] / String[]) ──────────
+    // Decoded array oop -> read length + elements via the crash-safe library
+    // readers (vmhook::array_length / vmhook::get_array_element), so the '['
+    // dispatch arm is proven to land on the REAL array, not merely "non-null".
+    std::atomic<std::int64_t> g_int_arr_len{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_arr_e0{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_arr_e1{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_arr_e2{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_arr_len{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_arr_e0{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_arr_e3{ k_uncaptured };
+    std::atomic<bool>         g_str_arr_nonnull{ false };
+    std::atomic<std::int64_t> g_str_arr_len{ k_uncaptured };
+
+    // ── String-ARG NUL / astral round-trip into the JVM (the #27 fix) ───────
+    // Pure-int observations the fixture body publishes, immune to string decode.
+    std::atomic<int> g_nul_arg_captured{ -1 };
+    std::atomic<int> g_nul_arg_char_len{ -1 };
+    std::atomic<int> g_nul_arg_cp_count{ -1 };
+    std::atomic<int> g_nul_arg_hash{ 0 };
+    std::atomic<int> g_astral_arg_captured{ -1 };
+    std::atomic<int> g_astral_arg_char_len{ -1 };
+    std::atomic<int> g_astral_arg_cp_count{ -1 };
+    std::atomic<int> g_astral_arg_first_cp{ 0 };
+    std::atomic<int> g_astral_arg_last_cp{ 0 };
+
+    // ── NONVIRTUAL <init> via CallNonvirtualVoidMethodA (slot 93) ───────────
+    std::atomic<int> g_ctor_proxy_found{ -1 };
+    std::atomic<int> g_ctor_calls_before{ -1 };
+    std::atomic<int> g_ctor_calls_after{ -1 };
+    std::atomic<int> g_ctor_call_is_void{ -1 };
+    std::atomic<int> g_ctor_no_pending_exc{ -1 };
+
+    // ── EXCEPTION discipline (callee throws -> observed + cleared, no escape) ─
+    // For each throwing call we record whether a JNI exception was pending
+    // IMMEDIATELY AFTER call() returned.  On the JNI fallback path call_jni's
+    // check_callee_exception ran ExceptionDescribe (which clears), so the library
+    // leaves NO pending exception — pending==0 is the discipline proof.  After
+    // recording, run_all unconditionally clears (idempotent) so neither path can
+    // poison what follows.  A clean follow-up call then proves recovery.
+    std::atomic<int>          g_exc_void_pending_after{ -1 };
+    std::atomic<int>          g_exc_int_pending_after{ -1 };
+    std::atomic<int>          g_exc_static_pending_after{ -1 };
+    std::atomic<int>          g_exc_recovery_ok{ -1 };       // echoInt after throws == sentinel
+    std::atomic<int>          g_exc_seen_at_least_one{ -1 }; // a throw WAS observed pending pre-clear
+    constexpr std::int32_t    k_exc_recovery = 0x33EC0DE5;   // recovery echo sentinel
 
     // Sentinels (mirror the fixture's boundary values).
     constexpr std::int64_t k_int_ret    = 0x0BADF00DLL;            // 195948557
@@ -438,6 +494,9 @@ namespace
         }
         // Array reference return ('[' descriptor): decode to a non-null oop via
         // the value_t void* conversion (decode_oop_pointer), without walking it.
+        // Then read its length + every element value-correctly via the crash-safe
+        // library array readers (no new raw deref) to prove the '[' arm landed on
+        // the REAL int[] { 11, 22, 33 }.
         {
             auto p{ s.get_method("retIntArray") };
             if (p.has_value())
@@ -445,6 +504,82 @@ namespace
                 const auto v{ p->call() };
                 void* const arr{ static_cast<void*>(v) };
                 g_array_nonnull.store(arr != nullptr);
+                if (arr != nullptr)
+                {
+                    g_int_arr_len.store(vmhook::array_length(arr));
+                    g_int_arr_e0.store(vmhook::get_array_element<std::int32_t>(arr, 0));
+                    g_int_arr_e1.store(vmhook::get_array_element<std::int32_t>(arr, 1));
+                    g_int_arr_e2.store(vmhook::get_array_element<std::int32_t>(arr, 2));
+                }
+            }
+        }
+        // long[] return — 8-byte stride; value-correct read of the boundary
+        // elements proves get_array_element<int64_t> stride math + the '[' arm.
+        {
+            auto p{ s.get_method("retLongArray") };
+            if (p.has_value())
+            {
+                const auto v{ p->call() };
+                void* const arr{ static_cast<void*>(v) };
+                if (arr != nullptr)
+                {
+                    g_long_arr_len.store(vmhook::array_length(arr));
+                    g_long_arr_e0.store(vmhook::get_array_element<std::int64_t>(arr, 0));
+                    g_long_arr_e3.store(vmhook::get_array_element<std::int64_t>(arr, 3));
+                }
+            }
+        }
+        // String[] return ('[Ljava/lang/String;') — object-element descriptor on
+        // the '[' arm.  Assert non-null decode + exact length (object elements
+        // are not walked; the header length read proves the decode landed right).
+        {
+            auto p{ s.get_method("retStringArray") };
+            if (p.has_value())
+            {
+                const auto v{ p->call() };
+                void* const arr{ static_cast<void*>(v) };
+                g_str_arr_nonnull.store(arr != nullptr);
+                if (arr != nullptr)
+                {
+                    g_str_arr_len.store(vmhook::array_length(arr));
+                }
+            }
+        }
+
+        // ═════════ String-ARG NUL / astral round-trip INTO the JVM (#27) ════════
+        // The arg path uses length-counted UTF-16 (NewString), so an interior NUL
+        // and an astral scalar must arrive in the JVM verbatim — proven by the
+        // fixture's pure-int measurements, which no string DECODE can distort.
+        // (The String-RETURN decode via GetStringUTFChars cannot itself round-trip
+        // these, so a plain echo+compare would be a false negative for the arg
+        // path; these int observations are the correct, decode-independent proof.)
+        {
+            auto p{ s.get_method("recordString") };
+            if (p.has_value())
+            {
+                // "a\0b\0c" — three interior NULs; char len 5, code-point count 5.
+                const std::string nul_payload{ std::string("a\0b\0c", 5) };
+                p->call(nul_payload);
+                g_nul_arg_captured.store(method_call_jni::record_string_called() ? 1 : 0);
+                g_nul_arg_char_len.store(method_call_jni::record_string_char_len());
+                g_nul_arg_cp_count.store(method_call_jni::record_string_cp_count());
+                g_nul_arg_hash.store(method_call_jni::record_string_hash());
+            }
+        }
+        {
+            auto p{ s.get_method("recordString") };
+            if (p.has_value())
+            {
+                // U+1F600 GRINNING FACE, standard UTF-8 F0 9F 98 80 — one astral
+                // scalar = TWO UTF-16 units (surrogate pair).  Sandwiched between
+                // ASCII so a truncation/mangle is unmistakable.
+                const std::string astral_payload{ "X\xF0\x9F\x98\x80Y" };
+                p->call(astral_payload);
+                g_astral_arg_captured.store(method_call_jni::record_string_called() ? 1 : 0);
+                g_astral_arg_char_len.store(method_call_jni::record_string_char_len());
+                g_astral_arg_cp_count.store(method_call_jni::record_string_cp_count());
+                g_astral_arg_first_cp.store(method_call_jni::record_string_first_cp());
+                g_astral_arg_last_cp.store(method_call_jni::record_string_last_cp());
             }
         }
 
@@ -617,6 +752,99 @@ namespace
                     static_cast<std::int64_t>(p_follow->call(k_svia_follow)));
             }
         }
+
+        // ═════════ NONVIRTUAL dispatch: re-invoke <init> via slot 93 ═══════════
+        // The only CallNonvirtualVoidMethodA (invokespecial) path in the whole
+        // library is call_jni's 'V' arm for a void <init>/<clinit> on an INSTANCE
+        // proxy.  We resolve the no-arg constructor on the live receiver and
+        // call() it: that re-runs MethodCallJni() (which only bumps ctorCalls) via
+        // the nonvirtual slot, so the counter advancing by exactly one — with no
+        // pending exception and a void result — proves the nonvirtual constructor
+        // dispatch fired correctly and left the thread clean.
+        {
+            auto p_ctor{ s.get_method("<init>", "()V") };
+            g_ctor_proxy_found.store(p_ctor.has_value() ? 1 : 0);
+            if (p_ctor.has_value())
+            {
+                g_ctor_calls_before.store(method_call_jni::ctor_calls());
+                const auto v{ p_ctor->call() };
+                g_ctor_call_is_void.store(v.is_void() ? 1 : 0);
+                g_ctor_calls_after.store(method_call_jni::ctor_calls());
+                g_ctor_no_pending_exc.store(
+                    vmhook::detail::jni_exception_pending() ? 0 : 1);
+                // Defensive: never let a stray pending exception (e.g. on the
+                // legacy call_stub path) leak past this point.
+                vmhook::detail::jni_exception_clear();
+            }
+        }
+
+        // ═════════ EXCEPTION DISCIPLINE: callee throws -> observed + cleared ════
+        // A Java method that throws must NOT let the pending JNI exception escape
+        // to poison the thread (which previously let a sibling module's exception
+        // crash the JVM).  On the JNI fallback path call_jni's
+        // check_callee_exception runs ExceptionDescribe (which clears), so AFTER
+        // call() returns there is NO pending exception — pending==0 is the proof
+        // of discipline.  We record that for instance-void, instance-int (value
+        // path) and static-void throwers, then UNCONDITIONALLY clear (idempotent;
+        // also protects the legacy call_stub path, which does not auto-clear) so a
+        // clean follow-up call can prove the thread recovered.  Run LAST so even a
+        // legacy-path lingering exception (cleared here) cannot affect any earlier
+        // assertion.
+        {
+            int seen_pending{ 0 };
+
+            auto p_tv{ s.get_method("throwVoid") };
+            if (p_tv.has_value())
+            {
+                p_tv->call();
+                // Capture the discipline observation, then clear for safety.
+                const bool pend{ vmhook::detail::jni_exception_pending() };
+                g_exc_void_pending_after.store(pend ? 1 : 0);
+                if (pend) { ++seen_pending; }
+                vmhook::detail::jni_exception_clear();
+            }
+
+            auto p_ti{ s.get_method("throwReturningInt") };
+            if (p_ti.has_value())
+            {
+                const auto v{ p_ti->call() };
+                (void)v; // JNI returns 0 on a pending exception; value is moot.
+                const bool pend{ vmhook::detail::jni_exception_pending() };
+                g_exc_int_pending_after.store(pend ? 1 : 0);
+                if (pend) { ++seen_pending; }
+                vmhook::detail::jni_exception_clear();
+            }
+
+            auto p_ts{ method_call_jni::static_method("sThrowVoid") };
+            if (p_ts.has_value())
+            {
+                p_ts->call();
+                const bool pend{ vmhook::detail::jni_exception_pending() };
+                g_exc_static_pending_after.store(pend ? 1 : 0);
+                if (pend) { ++seen_pending; }
+                vmhook::detail::jni_exception_clear();
+            }
+
+            g_exc_seen_at_least_one.store(seen_pending > 0 ? 1 : 0);
+
+            // Hard recovery proof: a normal value-returning call after all the
+            // throws must still deliver its argument intact — the throwing calls
+            // did not corrupt the thread's JNI state.  We deliberately use
+            // echoLong (returns its long arg, NO lastEchoArg side effect) so this
+            // recovery call cannot clobber the field the sibling
+            // mcj_echo_int_side_effect assertion reads (same discipline as the
+            // static-via-instance follow-up above).  Belt-and-braces clear after.
+            auto p_rec{ s.get_method("echoLong") };
+            if (p_rec.has_value())
+            {
+                // copy-init via static_cast (NOT brace-init from value_t): the
+                // deducing-this/MSVC conversion is unambiguous this way.
+                const std::int64_t r =
+                    static_cast<std::int64_t>(p_rec->call(static_cast<std::int64_t>(k_exc_recovery)));
+                g_exc_recovery_ok.store(r == static_cast<std::int64_t>(k_exc_recovery) ? 1 : 0);
+            }
+            vmhook::detail::jni_exception_clear();
+        }
     }
 }
 
@@ -659,6 +887,18 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
                              "JNI fallback NOT exercised on this JDK; assertions still valid"
                            : "JNI fallback (call_jni: Call(Static)?<Type>MethodA) - "
                              "this module's target path"));
+
+        // HARD assertion that the JNI fallback is the path actually taken.  Every
+        // JDK the CI exercises does NOT export StubRoutines::_call_stub_entry via
+        // VMStructs (see the module header), so find_call_stub_entry() is absent
+        // and call() short-circuits into call_jni — exactly the path this module
+        // is here to exercise.  Asserting it HARD makes "we really ran call_jni,
+        // not the call-stub fast path" a first-class, non-skippable guarantee on
+        // CI rather than a passive INFO line.  (All the VALUE assertions below
+        // remain dual-path-correct, so a hypothetical future JDK that DOES export
+        // the entry would only flip THIS one check, never silently mis-test the
+        // converted value_t.)
+        ctx.check("mcj_jni_fallback_is_the_live_path", !stub);
 
         // ═════════════════════ INSTANCE primitive returns ═════════════════════
         ctx.check("mcj_bool_true_instance",  g_bool_true.load()  == 1);
@@ -797,6 +1037,111 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
         // Array reference return decoded to a non-null oop.
         ctx.check("mcj_array_reference_decoded_non_null", g_array_nonnull.load());
 
+        // ═════════════════════ Array returns: VALUE-correct ═══════════════════
+        // int[] { 11, 22, 33 } — length + every element via the crash-safe
+        // library readers prove the '[' arm decoded the REAL array.
+        ctx.check("mcj_int_array_length_3", g_int_arr_len.load() == 3);
+        ctx.check("mcj_int_array_elem0_11", g_int_arr_e0.load() == 11);
+        ctx.check("mcj_int_array_elem1_22", g_int_arr_e1.load() == 22);
+        ctx.check("mcj_int_array_elem2_33", g_int_arr_e2.load() == 33);
+        // long[] — 8-byte stride; boundary elements exact.
+        ctx.check("mcj_long_array_length_4", g_long_arr_len.load() == 4);
+        ctx.check("mcj_long_array_elem0_pattern",
+                  g_long_arr_e0.load() == static_cast<std::int64_t>(0x1111111111111111LL));
+        ctx.check("mcj_long_array_elem3_pattern",
+                  g_long_arr_e3.load() == static_cast<std::int64_t>(0x4444444444444444LL));
+        // String[] — object-element '[' arm: non-null decode + exact length.
+        ctx.check("mcj_string_array_decoded_non_null", g_str_arr_nonnull.load());
+        ctx.check("mcj_string_array_length_3", g_str_arr_len.load() == 3);
+
+        // ═════════════════ String-ARG NUL / astral into the JVM (#27) ══════════
+        // The length-counted UTF-16 arg path must deliver every code unit verbatim.
+        // "a\0b\0c": 5 UTF-16 units, 5 code points (interior NULs preserved — a
+        // NewStringUTF marshaller would truncate to "a", giving char_len 1).
+        ctx.check("mcj_nul_arg_body_ran", g_nul_arg_captured.load() == 1);
+        ctx.check("mcj_nul_arg_char_len_5", g_nul_arg_char_len.load() == 5);
+        ctx.check("mcj_nul_arg_cp_count_5", g_nul_arg_cp_count.load() == 5);
+        // String.hashCode() of "a\0b\0c" is content-defined; a truncated arg would
+        // hash differently.  Java: 31^4*'a' + 31^3*0 + 31^2*'b' + 31*0 + 'c'.
+        {
+            const std::string nul_payload{ std::string("a\0b\0c", 5) };
+            std::int32_t expect_hash{ 0 };
+            for (char ch : nul_payload)
+            {
+                expect_hash = expect_hash * 31 + static_cast<std::int32_t>(static_cast<unsigned char>(ch));
+            }
+            ctx.check("mcj_nul_arg_hashcode_content_exact",
+                      g_nul_arg_hash.load() == expect_hash);
+        }
+        // "X<U+1F600>Y": one astral scalar = 2 UTF-16 units, so char_len 4 but
+        // code-point count 3 (X, U+1F600, Y).  first cp 'X', last cp 'Y'; a
+        // mangled marshal would change the count or drop the surrogate pair.
+        ctx.check("mcj_astral_arg_body_ran", g_astral_arg_captured.load() == 1);
+        ctx.check("mcj_astral_arg_char_len_4", g_astral_arg_char_len.load() == 4);
+        ctx.check("mcj_astral_arg_cp_count_3", g_astral_arg_cp_count.load() == 3);
+        ctx.check("mcj_astral_arg_first_cp_X", g_astral_arg_first_cp.load() == static_cast<int>('X'));
+        ctx.check("mcj_astral_arg_last_cp_Y", g_astral_arg_last_cp.load() == static_cast<int>('Y'));
+
+        // ═════════════════════ NONVIRTUAL <init> via slot 93 ══════════════════
+        // The library's only CallNonvirtualVoidMethodA path: re-invoking the no-arg
+        // constructor on the live receiver bumps ctorCalls by exactly one, returns
+        // void, and leaves no pending exception.
+        ctx.check("mcj_nonvirtual_ctor_proxy_found", g_ctor_proxy_found.load() == 1);
+        ctx.check("mcj_nonvirtual_ctor_call_is_void", g_ctor_call_is_void.load() == 1);
+        ctx.check("mcj_nonvirtual_ctor_advanced_count_by_one",
+                  g_ctor_calls_before.load() >= 1
+                  && g_ctor_calls_after.load() == g_ctor_calls_before.load() + 1);
+        ctx.check("mcj_nonvirtual_ctor_no_pending_exception",
+                  g_ctor_no_pending_exc.load() == 1);
+
+        // ═════════════════════ EXCEPTION discipline ═══════════════════════════
+        // A callee that throws must leave NO pending exception after call() on the
+        // JNI fallback path (check_callee_exception -> ExceptionDescribe clears),
+        // and a follow-up call must still work.  The library cleared it: the
+        // suite continues, nothing escapes.  On the legacy call_stub path the
+        // call stub does not auto-clear, so the strict "pending==cleared" checks
+        // are gated to the fallback path; the recovery + no-escape guarantees
+        // (which we enforce with our own unconditional clears) hold on BOTH.
+        if (!stub)
+        {
+            // The library observed AND cleared each thrown exception: pending==0.
+            ctx.check("mcj_exc_instance_void_cleared_by_library",
+                      g_exc_void_pending_after.load() == 0);
+            ctx.check("mcj_exc_instance_int_cleared_by_library",
+                      g_exc_int_pending_after.load() == 0);
+            ctx.check("mcj_exc_static_void_cleared_by_library",
+                      g_exc_static_pending_after.load() == 0);
+        }
+        else
+        {
+            ctx.record("[INFO] method_call_jni_fallback: exception auto-clear "
+                       "discipline asserted only on the JNI fallback path; the "
+                       "call_stub path does not run check_callee_exception, so the "
+                       "module clears pending exceptions itself for suite safety.");
+        }
+        // Recovery + no-escape hold on every path (we cleared unconditionally):
+        // a normal value-returning call after the throws delivered its argument
+        // intact, so the throwing calls did not corrupt the thread's JNI state and
+        // nothing escaped to poison a sibling module.
+        ctx.check("mcj_exc_recovery_call_intact", g_exc_recovery_ok.load() == 1);
+        // Liveness: the throw mechanism genuinely fired (at least one call left a
+        // pending exception pre-clear), so the discipline checks are not vacuous.
+        // On the fallback path the library clears DURING call_jni, so this is read
+        // on the call_stub path; on the fallback path it may be 0 (already cleared)
+        // — guard so it can never be a false negative.
+        if (stub)
+        {
+            ctx.check("mcj_exc_throw_mechanism_fired_call_stub",
+                      g_exc_seen_at_least_one.load() == 1);
+        }
+        else
+        {
+            ctx.record("[INFO] method_call_jni_fallback: throw liveness is implicit "
+                       "on the fallback path (call_jni clears the pending exception "
+                       "before run_all can observe it); the recovery check proves "
+                       "the throwing dispatch ran and the thread stayed usable.");
+        }
+
         // ═════════════════════ TIGHT LOOP characterization ════════════════════
         // These are the JNI-fallback local-ref-leak guards the audit flagged.
 
@@ -865,5 +1210,15 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
         // (echoLong returns its argument; no lastEchoArg side effect.)
         ctx.check("mcj_svia_followup_instance_call_intact",
                   g_svia_followup_inst_echo.load() == k_svia_follow);
+    }
+
+    // UNCONDITIONAL teardown: the scoped_hook above is RAII, but on the no-SEH
+    // Windows path (mingw/clang) a faulting body longjmps PAST its destructor,
+    // leaving the hook armed for the NEXT module (poisons on_class_loaded's
+    // multi_cb/rearm).  Force a full hook reset so the table is empty regardless
+    // of how control left the block.
+    if (ctx.reset)
+    {
+        ctx.reset();
     }
 }

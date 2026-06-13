@@ -182,6 +182,60 @@ public final class FieldArraysPrimitive
     public static char[]    unicodeCharArray =
         { 'a', (char) 0x00FF, (char) 0x0100, (char) 0x20AC };
 
+    // A char[] holding the printable-range boundary code units the JLS calls
+    // out: ' ' (0x20, the first printable ASCII) and Character.MAX_VALUE
+    // (0xFFFF, the largest char), with an ordinary letter in between.  ' '
+    // and 'A' survive the vector<char> narrowing (both <= 0x7F); 0xFFFF
+    // truncates to 0xFF, documenting the same lossy narrowing at the char
+    // boundary.  The raw uint16 read recovers all three exactly.
+    public static char[]    spaceCharArray = { ' ', (char) 0xFFFF, 'A' };
+
+    // --- Large arrays (1024 elements) ----------------------------------------
+    // The task asks for a 1000+ element shape on top of the 256 case above;
+    // these stress reserve() + the per-element loop at a four-figure length.
+    // Same deterministic-formula approach so the C++ side recomputes each
+    // expected element by index without a second data copy.  Three element
+    // widths (4 / 8 / 8 bytes) cover the int / long / double append paths.
+    public static final int LARGE_K_LEN = 1024;
+    public static int[]    largeKIntArray    = new int[LARGE_K_LEN];
+    public static long[]   largeKLongArray   = new long[LARGE_K_LEN];
+    public static double[] largeKDoubleArray = new double[LARGE_K_LEN];
+
+    // --- Multi-dimensional primitive arrays ----------------------------------
+    // A multi-dim primitive array field holds a reference to an OUTER object
+    // array whose elements are themselves (compressed-OOP) references to inner
+    // primitive arrays.  The native side decodes the outer reference, walks
+    // each slot to the inner primitive array, and reads the inner elements --
+    // proving the read path composes across a dimension boundary.
+    //
+    // Rectangular 2-D int[][] (2 rows x 3 cols).
+    public static int[][]    staticIntGrid =
+        { { 10, 20, 30 }, { 40, 50, 60 } };
+    // Rectangular 2-D double[][] (2 rows x 2 cols), exact halves.
+    public static double[][] staticDoubleGrid =
+        { { 1.5, 2.5 }, { 3.5, 4.5 } };
+    // 3-D byte[][][]: two outer planes of differing shape (jagged in the
+    // middle/inner dimensions) so depth-length and element value are both
+    // exercised at three levels of nesting.
+    public static byte[][][] staticByteCube =
+        { { { (byte) 1, (byte) 2 }, { (byte) 3 } },
+          { { (byte) 4, (byte) 5, (byte) 6 } } };
+    // 2-D int[][] whose MIDDLE row is null -- the native walk must read the
+    // null inner slot as an empty row (no crash), then continue.
+    public static int[][]    staticIntGridNullRow =
+        { { 1, 2 }, null, { 3 } };
+
+    // --- Jagged primitive arrays (rows of differing length) ------------------
+    // int[][] with rows of length 1 / 2 / 3, plus a deliberately EMPTY row.
+    public static int[][]    staticJaggedIntArray =
+        { { 7 }, { 8, 9 }, { }, { 10, 11, 12 } };
+
+    // --- INSTANCE multi-dim / jagged variants --------------------------------
+    public int[][]    instIntGrid =
+        { { 70, 80 }, { 90, 100 }, { 110, 120 } };           // 3 x 2 rectangular
+    public short[][]  instJaggedShortArray =
+        { { (short) 1 }, { (short) -2, (short) 3 }, { (short) 4, (short) 5, (short) 6 } };
+
     static
     {
         for (int i = 0; i < LARGE_LEN; ++i)
@@ -194,6 +248,13 @@ public final class FieldArraysPrimitive
             largeLongArray[i]   = (long) i * 1000000007L + 5L;
             largeFloatArray[i]  = i + 0.5f;
             largeDoubleArray[i] = i + 0.25;
+        }
+
+        for (int i = 0; i < LARGE_K_LEN; ++i)
+        {
+            largeKIntArray[i]    = i * 5 - 2000;
+            largeKLongArray[i]   = (long) i * 1000000009L - 7L;
+            largeKDoubleArray[i] = i * 0.5 - 256.0;
         }
 
         Harness.register(new Harness.Probe()
@@ -224,6 +285,14 @@ public final class FieldArraysPrimitive
                 sum += instance.instLongArray[0];
                 sum += largeIntArray[LARGE_LEN - 1];
                 sum += singleIntArray[0];
+                // Touch the 1000+ and multi-dim shapes too so a class-init /
+                // classpath failure that nulls any of them surfaces as a probe
+                // checksum mismatch rather than a silent skip.
+                sum += largeKIntArray[LARGE_K_LEN - 1];
+                sum += staticIntGrid[1][2];
+                sum += staticByteCube[1][0][2];
+                sum += staticJaggedIntArray[3][2];
+                sum += instance.instIntGrid[2][1];
                 FieldArraysPrimitive.probeChecksum = sum;
                 FieldArraysPrimitive.done = true;
             }

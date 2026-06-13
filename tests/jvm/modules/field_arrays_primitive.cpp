@@ -23,21 +23,32 @@
 // known sharp edge of the feature.
 //
 // Exhaustiveness: every primitive element type, BOTH static and instance fields,
-// at the empty / single / many / large(256) / boundary / special shapes -- size
-// AND every element verified.  The instance-offset read path is exercised at the
-// canonical / empty / single / boundary shapes independently of the static
-// mirror.  A null array REFERENCE is read on both paths (must yield an empty
-// vector, never a crash).  Each canonical array is ALSO walked at the raw
+// at the empty / single / many / large(256) / large(1024) / boundary / special
+// shapes -- size AND every element verified.  The instance-offset read path is
+// exercised at the canonical / empty / single / boundary shapes independently of
+// the static mirror.  A null array REFERENCE is read on both paths (must yield an
+// empty vector, never a crash).  Each canonical array is ALSO walked at the raw
 // array_length + get_array_element<T> layer at index 0 / mid / last, proving the
 // length oracle and per-element offset arithmetic directly (and never reading
-// out of bounds -- array_length is the only bounds source used).  The
-// element-width GUARD is hard-asserted in BOTH unsafe directions -- a narrower
-// [J -> vector<int32_t> (silent garbage, pre-guard) and the wider [I ->
+// out of bounds -- array_length is the only bounds source used), and the raw
+// get_array_element bounds check is hammered directly at index < 0, == length,
+// > length, INT_MAX, and INT_MIN (each must return T{}, never crash).
+//
+// MULTI-DIMENSIONAL + JAGGED: int[][] / double[][] (rectangular), byte[][][]
+// (3-D), an int[][] with a null middle row, and jagged int[][]/short[][] (rows
+// of differing length incl. an empty row) are walked at the raw layer (outer
+// object-array -> inner primitive arrays) on BOTH the static and instance paths;
+// depth-length and every element value are checked, a null inner row reads as an
+// empty inner vector (no crash), and a uniform-stride assumption would fail.
+//
+// The element-width GUARD is hard-asserted in BOTH unsafe directions -- a
+// narrower [J -> vector<int32_t> (silent garbage, pre-guard) and the wider [I ->
 // vector<int64_t> (out-of-bounds, pre-guard) both now REFUSE the read and yield
 // an empty vector, with matching-width controls proving the guard never
 // over-fires.  One remaining documentation check pins a real flaw still open in
 // the read path (lossy char[] -> vector<char> truncation), exercised in a
-// crash-safe direction so a future fix deliberately flips the check.
+// crash-safe direction (incl. the ' '/0xFFFF char boundary) so a future fix
+// deliberately flips the check.
 //
 // SUITE-SAFETY (mirrors field_primitives_get.cpp / register_class.cpp):
 //   * the whole body runs under a try/catch -- a stray throw is recorded as
@@ -218,6 +229,32 @@ namespace
         // matching-width vector<int32_t> read of the same field (wrapper::s_int,
         // asserted in section 1) is the control.
         static auto int_as_int64_oob() -> std::vector<std::int64_t> { return static_field("staticIntArray")->get(); }
+
+        // --- LARGE (1024-element) reads ----------------------------------------
+        // The 1000+ shape the feature must survive on top of the 256 case.
+        static auto bigk_int()    -> std::vector<std::int32_t>  { return static_field("largeKIntArray")->get(); }
+        static auto bigk_long()   -> std::vector<std::int64_t>  { return static_field("largeKLongArray")->get(); }
+        static auto bigk_double() -> std::vector<double>        { return static_field("largeKDoubleArray")->get(); }
+
+        // char[] with ' ' (0x20) and Character.MAX_VALUE (0xFFFF) boundaries.
+        static auto space_char() -> std::vector<char> { return static_field("spaceCharArray")->get(); }
+
+        // --- MULTI-DIM / JAGGED field proxies (walked at the raw layer) --------
+        // A multi-dim primitive field holds the OUTER object-array reference; the
+        // native walk decodes it, then each inner primitive array, via the same
+        // array_length + get_array_element idiom the flat reads use.  These
+        // expose the field proxy so the raw walker below can reach field_oop().
+        static auto p_int_grid()           { return static_field("staticIntGrid"); }
+        static auto p_double_grid()        { return static_field("staticDoubleGrid"); }
+        static auto p_byte_cube()          { return static_field("staticByteCube"); }
+        static auto p_int_grid_null_row()  { return static_field("staticIntGridNullRow"); }
+        static auto p_jagged_int()         { return static_field("staticJaggedIntArray"); }
+        auto p_inst_int_grid()             { return get_field("instIntGrid"); }
+        auto p_inst_jagged_short()         { return get_field("instJaggedShortArray"); }
+
+        // Raw proxy for the canonical [I field, used by the out-of-range
+        // get_array_element checks (index < 0 / == length / > length).
+        static auto p_static_int()         { return static_field("staticIntArray"); }
     };
 
     // ---- small comparison helpers --------------------------------------------
@@ -315,6 +352,126 @@ namespace
         out_mid   = vmhook::get_array_element<element_type>(array_oop, mid);
         out_last  = vmhook::get_array_element<element_type>(array_oop, last);
         return true;
+    }
+
+    // ---- multi-dimensional / jagged raw walkers -------------------------------
+    //
+    // A multi-dim primitive field (int[][], double[][], byte[][][], ...) stores
+    // a reference to an OUTER object-array whose slots are compressed OOPs of the
+    // inner arrays.  These walkers decode the outer array once, then walk each
+    // slot to its inner primitive array and read the inner elements -- reusing
+    // the SAME array_length (bounds oracle) + get_array_element (per-element
+    // offset) primitives the flat reads use.  Every deref is is_valid_pointer-
+    // gated and every index stays inside array_length(), so nothing reads out of
+    // bounds; a null inner slot (a null row) decodes to an empty inner vector,
+    // never a crash.  This mirrors the documented manual walk in
+    // field_arrays_object.cpp (field_oop -> array_length -> get_array_element
+    // <uint32_t> -> decode_oop_pointer).
+
+    // Reads one inner primitive array (already decoded to its oop) into a vector.
+    template <typename element_type>
+    auto read_inner_prim_array(void* const inner_oop) -> std::vector<element_type>
+    {
+        std::vector<element_type> row;
+        if (!inner_oop || !vmhook::hotspot::is_valid_pointer(inner_oop))
+        {
+            return row;   // null inner array (null row) -> empty, no crash.
+        }
+        const std::int32_t inner_len{ vmhook::array_length(inner_oop) };
+        if (inner_len <= 0)
+        {
+            return row;
+        }
+        row.reserve(static_cast<std::size_t>(inner_len));
+        for (std::int32_t j{ 0 }; j < inner_len; ++j)
+        {
+            row.push_back(vmhook::get_array_element<element_type>(inner_oop, j));
+        }
+        return row;
+    }
+
+    // Walks a 2-D primitive field proxy into vector<vector<T>>.  `ok` reports
+    // whether the OUTER array decoded (a usable field); a genuinely null field
+    // reference yields ok==true with an empty result only when the outer oop is
+    // null -- callers that expect rows assert on the contents.
+    template <typename element_type>
+    auto walk_2d(const std::optional<vmhook::field_proxy>& proxy, bool& ok)
+        -> std::vector<std::vector<element_type>>
+    {
+        std::vector<std::vector<element_type>> grid;
+        ok = false;
+        if (!proxy.has_value())
+        {
+            return grid;
+        }
+        void* const outer_oop{ vmhook::field_oop(*proxy) };
+        if (!outer_oop || !vmhook::hotspot::is_valid_pointer(outer_oop))
+        {
+            return grid;   // null outer reference -> empty grid (no crash).
+        }
+        ok = true;
+        const std::int32_t rows{ vmhook::array_length(outer_oop) };
+        if (rows <= 0)
+        {
+            return grid;
+        }
+        grid.reserve(static_cast<std::size_t>(rows));
+        for (std::int32_t i{ 0 }; i < rows; ++i)
+        {
+            // Each outer slot is a compressed OOP of an inner primitive array.
+            void* const inner_oop{ vmhook::hotspot::decode_oop_pointer(
+                vmhook::get_array_element<std::uint32_t>(outer_oop, i)) };
+            grid.push_back(read_inner_prim_array<element_type>(inner_oop));
+        }
+        return grid;
+    }
+
+    // Walks a 3-D primitive field proxy (T[][][]) into vector<vector<vector<T>>>.
+    template <typename element_type>
+    auto walk_3d(const std::optional<vmhook::field_proxy>& proxy, bool& ok)
+        -> std::vector<std::vector<std::vector<element_type>>>
+    {
+        std::vector<std::vector<std::vector<element_type>>> cube;
+        ok = false;
+        if (!proxy.has_value())
+        {
+            return cube;
+        }
+        void* const outer_oop{ vmhook::field_oop(*proxy) };
+        if (!outer_oop || !vmhook::hotspot::is_valid_pointer(outer_oop))
+        {
+            return cube;
+        }
+        ok = true;
+        const std::int32_t planes{ vmhook::array_length(outer_oop) };
+        if (planes <= 0)
+        {
+            return cube;
+        }
+        cube.reserve(static_cast<std::size_t>(planes));
+        for (std::int32_t i{ 0 }; i < planes; ++i)
+        {
+            // Each outer slot is a compressed OOP of a 2-D (object-array) plane.
+            void* const plane_oop{ vmhook::hotspot::decode_oop_pointer(
+                vmhook::get_array_element<std::uint32_t>(outer_oop, i)) };
+            std::vector<std::vector<element_type>> plane;
+            if (plane_oop && vmhook::hotspot::is_valid_pointer(plane_oop))
+            {
+                const std::int32_t rows{ vmhook::array_length(plane_oop) };
+                if (rows > 0)
+                {
+                    plane.reserve(static_cast<std::size_t>(rows));
+                    for (std::int32_t r{ 0 }; r < rows; ++r)
+                    {
+                        void* const inner_oop{ vmhook::hotspot::decode_oop_pointer(
+                            vmhook::get_array_element<std::uint32_t>(plane_oop, r)) };
+                        plane.push_back(read_inner_prim_array<element_type>(inner_oop));
+                    }
+                }
+            }
+            cube.push_back(std::move(plane));
+        }
+        return cube;
     }
 }
 
@@ -890,6 +1047,224 @@ static void run_field_arrays_primitive_checks(vmhook_test::context& ctx)
         const std::vector<std::int32_t> match{ wrapper::s_int() };
         ctx.check("widthguard_match_int_to_int32_ok",
                   vectors_equal(match, std::vector<std::int32_t>{ 1000, 2000, 3000 }));
+    }
+
+    // =========================================================================
+    // 13) LARGE (1024-element) arrays -- the 1000+ shape, size + EVERY element
+    //     recomputed from the Java fixture's deterministic formula.  Stresses
+    //     reserve() + the per-element append loop at a four-figure length across
+    //     the 4-byte (int) and 8-byte (long / double) append paths.
+    // =========================================================================
+    {
+        constexpr std::int32_t k_len{ 1024 };
+
+        const std::vector<std::int32_t> int_v{ wrapper::bigk_int() };
+        bool int_ok{ int_v.size() == static_cast<std::size_t>(k_len) };
+        for (std::int32_t i{ 0 }; int_ok && i < k_len; ++i)
+        {
+            int_ok = int_v[static_cast<std::size_t>(i)] == (i * 5 - 2000);
+        }
+        ctx.check("largek_int_size1024", int_v.size() == static_cast<std::size_t>(k_len));
+        ctx.check("largek_int_all", int_ok);
+
+        const std::vector<std::int64_t> long_v{ wrapper::bigk_long() };
+        bool long_ok{ long_v.size() == static_cast<std::size_t>(k_len) };
+        for (std::int32_t i{ 0 }; long_ok && i < k_len; ++i)
+        {
+            long_ok = long_v[static_cast<std::size_t>(i)]
+                      == (static_cast<std::int64_t>(i) * 1000000009LL - 7LL);
+        }
+        ctx.check("largek_long_all", long_ok);
+
+        const std::vector<double> double_v{ wrapper::bigk_double() };
+        bool double_ok{ double_v.size() == static_cast<std::size_t>(k_len) };
+        for (std::int32_t i{ 0 }; double_ok && i < k_len; ++i)
+        {
+            double_ok = bits_equal(double_v[static_cast<std::size_t>(i)],
+                                   static_cast<double>(i) * 0.5 - 256.0);
+        }
+        ctx.check("largek_double_all", double_ok);
+    }
+
+    // =========================================================================
+    // 14) char[] with ' ' (0x20) and Character.MAX_VALUE (0xFFFF) boundaries.
+    //     Into vector<char>: ' ' and 'A' (both <= 0x7F) survive; 0xFFFF narrows
+    //     to 0xFF (the same lossy narrowing documented in section 10, here at the
+    //     printable/MAX char boundary).  The raw uint16 layer recovers all three.
+    // =========================================================================
+    {
+        const std::vector<char> sp{ wrapper::space_char() };
+        ctx.check("space_char_size3", sp.size() == 3);
+        ctx.check("space_char_values",
+                  vectors_equal(sp, std::vector<char>{
+                      ' ', static_cast<char>(0xFF), 'A' }));
+
+        // Raw layer: the same field read as uint16 keeps all three code units
+        // EXACTLY (0x20, 0xFFFF, 0x41) -- proving the loss is only in the
+        // vector<char> narrowing, not in the read itself.
+        std::int32_t len{ -1 };
+        std::uint16_t a{}, m{}, z{};
+        const bool ok{ raw_endpoints_static<std::uint16_t>("spaceCharArray", len, a, m, z) };
+        ctx.check("space_char_raw_len3", ok && len == 3);
+        ctx.check("space_char_raw_exact",
+                  ok && a == 0x0020 && m == 0xFFFF && z == 0x0041);
+    }
+
+    // =========================================================================
+    // 15) MULTI-DIMENSIONAL primitive arrays -- depth length + every element.
+    //     int[][] (rect), double[][] (rect), byte[][][] (3-D), plus a 2-D field
+    //     whose middle row is null (read as an empty row, no crash).  Walked at
+    //     the raw layer (outer object-array -> inner primitive arrays) using the
+    //     same array_length + get_array_element primitives as the flat reads;
+    //     never reads out of bounds.
+    // =========================================================================
+    {
+        // ---- int[][] rectangular 2 x 3 -----------------------------------
+        bool grid_ok{ false };
+        const std::vector<std::vector<std::int32_t>> grid{
+            walk_2d<std::int32_t>(wrapper::p_int_grid(), grid_ok) };
+        ctx.check("md_int_grid_outer2", grid_ok && grid.size() == 2);
+        ctx.check("md_int_grid_values",
+                  grid.size() == 2
+                  && vectors_equal(grid[0], std::vector<std::int32_t>{ 10, 20, 30 })
+                  && vectors_equal(grid[1], std::vector<std::int32_t>{ 40, 50, 60 }));
+
+        // ---- double[][] rectangular 2 x 2 (exact halves) -----------------
+        bool dgrid_ok{ false };
+        const std::vector<std::vector<double>> dgrid{
+            walk_2d<double>(wrapper::p_double_grid(), dgrid_ok) };
+        ctx.check("md_double_grid_outer2", dgrid_ok && dgrid.size() == 2);
+        ctx.check("md_double_grid_values",
+                  dgrid.size() == 2
+                  && all_bits_equal(dgrid[0], std::vector<double>{ 1.5, 2.5 })
+                  && all_bits_equal(dgrid[1], std::vector<double>{ 3.5, 4.5 }));
+
+        // ---- byte[][][] 3-D ----------------------------------------------
+        // { { {1,2}, {3} }, { {4,5,6} } }
+        bool cube_ok{ false };
+        const std::vector<std::vector<std::vector<std::int8_t>>> cube{
+            walk_3d<std::int8_t>(wrapper::p_byte_cube(), cube_ok) };
+        const bool cube_shape{
+            cube_ok && cube.size() == 2
+            && cube[0].size() == 2 && cube[1].size() == 1
+            && cube[0][0].size() == 2 && cube[0][1].size() == 1
+            && cube[1][0].size() == 3 };
+        ctx.check("md_byte_cube_shape", cube_shape);
+        ctx.check("md_byte_cube_values",
+                  cube_shape
+                  && vectors_equal(cube[0][0], std::vector<std::int8_t>{ 1, 2 })
+                  && vectors_equal(cube[0][1], std::vector<std::int8_t>{ 3 })
+                  && vectors_equal(cube[1][0], std::vector<std::int8_t>{ 4, 5, 6 }));
+
+        // ---- int[][] with a NULL middle row ------------------------------
+        // { {1,2}, null, {3} } -- the null row must read as an empty inner
+        // vector and the walk must still recover rows 0 and 2 (no crash).
+        bool nullrow_ok{ false };
+        const std::vector<std::vector<std::int32_t>> nullrow{
+            walk_2d<std::int32_t>(wrapper::p_int_grid_null_row(), nullrow_ok) };
+        ctx.check("md_int_grid_nullrow_outer3", nullrow_ok && nullrow.size() == 3);
+        ctx.check("md_int_grid_nullrow_values",
+                  nullrow.size() == 3
+                  && vectors_equal(nullrow[0], std::vector<std::int32_t>{ 1, 2 })
+                  && nullrow[1].empty()
+                  && vectors_equal(nullrow[2], std::vector<std::int32_t>{ 3 }));
+
+        // ---- INSTANCE int[][] 3 x 2 (instance-offset outer read) ---------
+        const std::unique_ptr<wrapper> self{ wrapper::get_instance() };
+        if (self)
+        {
+            bool ig_ok{ false };
+            const std::vector<std::vector<std::int32_t>> ig{
+                walk_2d<std::int32_t>(self->p_inst_int_grid(), ig_ok) };
+            ctx.check("md_instance_int_grid_outer3", ig_ok && ig.size() == 3);
+            ctx.check("md_instance_int_grid_values",
+                      ig.size() == 3
+                      && vectors_equal(ig[0], std::vector<std::int32_t>{ 70, 80 })
+                      && vectors_equal(ig[1], std::vector<std::int32_t>{ 90, 100 })
+                      && vectors_equal(ig[2], std::vector<std::int32_t>{ 110, 120 }));
+        }
+    }
+
+    // =========================================================================
+    // 16) JAGGED primitive arrays -- rows of differing length (and an EMPTY
+    //     row).  The outer length and EACH row's length+values are verified, so
+    //     a walk that assumed a uniform stride would fail.
+    // =========================================================================
+    {
+        // int[][] = { {7}, {8,9}, { }, {10,11,12} }
+        bool jag_ok{ false };
+        const std::vector<std::vector<std::int32_t>> jag{
+            walk_2d<std::int32_t>(wrapper::p_jagged_int(), jag_ok) };
+        ctx.check("jagged_int_outer4", jag_ok && jag.size() == 4);
+        ctx.check("jagged_int_row_lengths",
+                  jag.size() == 4
+                  && jag[0].size() == 1 && jag[1].size() == 2
+                  && jag[2].empty()      && jag[3].size() == 3);
+        ctx.check("jagged_int_values",
+                  jag.size() == 4
+                  && vectors_equal(jag[0], std::vector<std::int32_t>{ 7 })
+                  && vectors_equal(jag[1], std::vector<std::int32_t>{ 8, 9 })
+                  && jag[2].empty()
+                  && vectors_equal(jag[3], std::vector<std::int32_t>{ 10, 11, 12 }));
+
+        // short[][] jagged on the INSTANCE path = { {1}, {-2,3}, {4,5,6} }
+        const std::unique_ptr<wrapper> self{ wrapper::get_instance() };
+        if (self)
+        {
+            bool js_ok{ false };
+            const std::vector<std::vector<std::int16_t>> js{
+                walk_2d<std::int16_t>(self->p_inst_jagged_short(), js_ok) };
+            ctx.check("jagged_instance_short_outer3", js_ok && js.size() == 3);
+            ctx.check("jagged_instance_short_values",
+                      js.size() == 3
+                      && vectors_equal(js[0], std::vector<std::int16_t>{ 1 })
+                      && vectors_equal(js[1], std::vector<std::int16_t>{ -2, 3 })
+                      && vectors_equal(js[2], std::vector<std::int16_t>{ 4, 5, 6 }));
+        }
+    }
+
+    // =========================================================================
+    // 17) get_array_element BOUNDS -- index 0 / length-1 are valid; index < 0,
+    //     index == length, index > length, and a huge index must all return
+    //     T{} (the documented out-of-range result) WITHOUT crashing or reading
+    //     out of bounds.  Driven on the canonical [I {1000,2000,3000} field.
+    // =========================================================================
+    {
+        const auto proxy{ wrapper::p_static_int() };
+        ctx.check("oob_proxy_present", proxy.has_value());
+        if (proxy.has_value())
+        {
+            void* const array_oop{ vmhook::field_oop(*proxy) };
+            const bool oop_ok{ array_oop != nullptr
+                               && vmhook::hotspot::is_valid_pointer(array_oop) };
+            ctx.check("oob_array_oop_valid", oop_ok);
+            if (oop_ok)
+            {
+                const std::int32_t len{ vmhook::array_length(array_oop) };
+                ctx.check("oob_len3", len == 3);
+
+                // In-range endpoints read the real values.
+                ctx.check("oob_index0_ok",
+                          vmhook::get_array_element<std::int32_t>(array_oop, 0) == 1000);
+                ctx.check("oob_index_last_ok",
+                          vmhook::get_array_element<std::int32_t>(array_oop, len - 1) == 3000);
+
+                // Out-of-range indices return T{} (0) and do NOT crash / read OOB.
+                ctx.check("oob_index_negative_zero",
+                          vmhook::get_array_element<std::int32_t>(array_oop, -1) == 0);
+                ctx.check("oob_index_equals_len_zero",
+                          vmhook::get_array_element<std::int32_t>(array_oop, len) == 0);
+                ctx.check("oob_index_past_len_zero",
+                          vmhook::get_array_element<std::int32_t>(array_oop, len + 5) == 0);
+                ctx.check("oob_index_huge_zero",
+                          vmhook::get_array_element<std::int32_t>(
+                              array_oop, 0x7FFFFFFF) == 0);
+                // INT_MIN exercises the negative-index branch at the extreme.
+                ctx.check("oob_index_int_min_zero",
+                          vmhook::get_array_element<std::int32_t>(
+                              array_oop, std::numeric_limits<std::int32_t>::min()) == 0);
+            }
+        }
     }
 
     // =========================================================================

@@ -156,6 +156,108 @@ public final class ReturnSetArg
     public static volatile int boundsSeen = 0;
     public void boundsTarget(final int value) { boundsSeen = value; }
 
+    // ── int x4 (instance): index 0 / middle / last + un-mutated survival ──
+    // this=slot0, a=slot1, b=slot2, c=slot3, d=slot4.  The native side mutates
+    // ONLY the FIRST explicit arg (a, slot 1) and the LAST (d, slot 4) in a
+    // single detour, and leaves the two MIDDLE args (b slot2, c slot3) alone.
+    // The body records all four so the native side can assert a/d changed AND
+    // b/c are byte-for-byte the originals (no adjacent-slot clobber).
+    public static volatile int quadASeen = 0;
+    public static volatile int quadBSeen = 0;
+    public static volatile int quadCSeen = 0;
+    public static volatile int quadDSeen = 0;
+    public void quad(final int a, final int b, final int c, final int d)
+    {
+        quadASeen = a;
+        quadBSeen = b;
+        quadCSeen = c;
+        quadDSeen = d;
+    }
+
+    // ── double + int (instance): slot model with a DOUBLE in front ─────────
+    // The double twin of mixLongInt: this=slot0, a (double)=slot1 (reserves
+    // offsets 1..2; its 64-bit value lives at the lower slot locals[-2]),
+    // b (int)=slot3.  Mutating b needs its true slot (3), not slot 2 — the
+    // reserved second half of the double.  Recorded as raw bits so the native
+    // side can compare the double bit-exactly (no float-format ambiguity).
+    public static volatile long mixDblBitsSeen = 0L;
+    public static volatile int  mixDblIntSeen  = 0;
+    public void mixDoubleInt(final double a, final int b)
+    {
+        mixDblBitsSeen = Double.doubleToRawLongBits(a);
+        mixDblIntSeen  = b;
+    }
+
+    // ── read-back targets (STATIC so the arg sits at slot 0) ───────────────
+    // The native detour mutates the slot, then reads it BACK through the public
+    // frame read path (frame.get_arguments<...>()) BEFORE the body runs, to
+    // prove the write is observable in-detour.  The body also records the value
+    // so the post-mutation observation is cross-checked Java-side.  Static keeps
+    // the read-back slot index unambiguous (slot 0, no `this`).
+    public static volatile int    intReadbackSeen    = 0;
+    public static void takeStaticIntReadback(final int value) { intReadbackSeen = value; }
+
+    public static volatile long   longReadbackSeen   = 0L;
+    public static void takeStaticLongReadback(final long value) { longReadbackSeen = value; }
+
+    public static volatile String stringReadbackSeen = "<unset>";
+    public static volatile int    stringReadbackLen  = -1;
+    public static void takeStaticStringReadback(final String value)
+    {
+        stringReadbackSeen = value;
+        stringReadbackLen  = (value == null) ? -1 : value.length();
+    }
+
+    // ── String edge content: interior NUL, astral (surrogate pair), char* ──
+    // The native side injects a std::string with an embedded U+0000, an astral
+    // scalar (U+1F600, a surrogate pair in UTF-16), and a non-const char*.  The
+    // body records length plus a probe char / code point so the native side can
+    // assert the length-counted UTF-16 path carried them faithfully (NewStringUTF
+    // would truncate at the NUL and mangle the astral scalar).
+    public static volatile int stringNulLen   = -1;
+    public static volatile int stringNulCharAt1 = -1;   // the U+0000 code unit
+    public void takeStringNul(final String value)
+    {
+        stringNulLen     = (value == null) ? -1 : value.length();
+        stringNulCharAt1 = (value == null || value.length() < 2) ? -1 : value.charAt(1);
+    }
+
+    public static volatile int stringAstralLen = -1;
+    public static volatile int stringAstralCp  = -1;    // value.codePointAt(0)
+    public void takeStringAstral(final String value)
+    {
+        stringAstralLen = (value == null) ? -1 : value.length();
+        stringAstralCp  = (value == null || value.length() < 1) ? -1 : value.codePointAt(0);
+    }
+
+    public static volatile String stringCharStarSeen = "<unset>";
+    public static volatile int    stringCharStarLen  = -1;
+    public void takeStringCharStar(final String value)
+    {
+        stringCharStarSeen = value;
+        stringCharStarLen  = (value == null) ? -1 : value.length();
+    }
+
+    // ── int[] (instance): array-reference argument mutation ────────────────
+    // The native side builds a fresh Java int[] (make_java_array), fills it, and
+    // injects it into this method's array slot; a sibling injects a null array.
+    // The body records length + an element + null-ness so the native side can
+    // assert the made array round-tripped through the slot as a real Java array.
+    public static volatile boolean arrayWasNull  = true;
+    public static volatile int     arrayLenSeen  = -1;
+    public static volatile int     arrayElem0Seen = -1;
+    public static volatile int     arrayElem2Seen = -1;
+    public void takeArray(final int[] value)
+    {
+        arrayWasNull = (value == null);
+        arrayLenSeen = (value == null) ? -1 : value.length;
+        if (value != null && value.length > 0) { arrayElem0Seen = value[0]; }
+        if (value != null && value.length > 2) { arrayElem2Seen = value[2]; }
+    }
+
+    public static volatile boolean arrayNullWasNull = false;
+    public void takeArrayNull(final int[] value) { arrayNullWasNull = (value == null); }
+
     // Tiny no-arg dispatch the probe uses so even a fully-failed feature still
     // makes `done` flip (the native side can then tell "probe ran" apart from
     // "individual method observation").
@@ -198,9 +300,27 @@ public final class ReturnSetArg
                 self.takeString2("before");      // hook -> "cc" (const char*)
 
                 self.mixLongInt(100L, 7);        // hook -> a kept, b -> 99 (slot 3)
+                self.mixDoubleInt(2.5, 7);       // hook -> a kept, b -> 77 (slot 3)
                 self.twoInts(5, 6);              // hook -> a -> 50, b -> 60
+                self.quad(1, 2, 3, 4);           // hook -> a->10, d->40; b,c untouched
 
                 self.boundsTarget(7);            // hook attempts OOB set_arg; arg stays 7
+
+                // Read-back targets (static; arg at slot 0).  The hook mutates the
+                // slot, reads it back in-detour, then the body re-records it.
+                ReturnSetArg.takeStaticIntReadback(7);     // hook -> 4242, read back
+                ReturnSetArg.takeStaticLongReadback(1L);   // hook -> wide, read back
+                ReturnSetArg.takeStaticStringReadback("before"); // hook -> "after", read back
+
+                // String edge content (interior NUL / astral / non-const char*).
+                self.takeStringNul("before");    // hook -> "a b" (len 3)
+                self.takeStringAstral("before"); // hook -> U+1F600 (len 2)
+                self.takeStringCharStar("before"); // hook -> "ccc" via char*
+
+                // Array-reference mutation: a non-null original so the slot holds a
+                // wide oop; the hook injects a fresh int[] / a null.
+                self.takeArray(new int[] { -1 });   // hook -> fresh int[]{10,20,30}
+                self.takeArrayNull(new int[] { -1 }); // hook -> null array
 
                 ReturnSetArg.done = true;
             }

@@ -95,6 +95,82 @@ namespace
         auto protected_int() const -> std::int32_t { return get_field("protectedInt")->get(); }
     };
 
+    // ======================================================================
+    //  Wrappers for the EXHAUSTIVE expansion (deep hierarchy, shadow pair,
+    //  reference shapes, polymorphic actual type).  Distinct poh_* prefix.
+    //  Every accessor uses the documented one-liner idiom
+    //  (return get_field("x")->get();) with NO sentinel guards — all
+    //  suite-safety lives at the MODULE call sites, never in the accessors.
+    // ======================================================================
+
+    // -- Deep hierarchy L1<-L2<-L3<-L4.  Registered to the DEEPEST class L4, so
+    //    every get_field starts the super walk at L4 and an inherited name
+    //    resolves at depth 1 (L3) .. depth 3 (L1). -----------------------------
+    class poh_l4 : public vmhook::object<poh_l4>
+    {
+    public:
+        explicit poh_l4(vmhook::oop_t instance) noexcept
+            : vmhook::object<poh_l4>{ instance }
+        {
+        }
+
+        // int declared at EACH level, all read through the L4 view.
+        auto l1_int() const -> std::int32_t { return get_field("l1Int")->get(); }  // depth 3
+        auto l2_int() const -> std::int32_t { return get_field("l2Int")->get(); }  // depth 2
+        auto l3_int() const -> std::int32_t { return get_field("l3Int")->get(); }  // depth 1
+        auto l4_int() const -> std::int32_t { return get_field("l4Int")->get(); }  // depth 0 (own)
+
+        // Inherited String reference (declared on L1, read through L4) decoded to
+        // a std::string via the value_t string alternative.
+        auto l1_str() const -> std::string { return get_field("l1Str")->get(); }
+
+        // Inherited reference-shape fields exposed as a field_proxy so the call
+        // site can decode the compressed OOP (field_oop) and validate it before
+        // wrapping.  Returning the proxy (not a typed wrapper) keeps these free
+        // of forward-reference ordering on the other poh_* wrappers and lets the
+        // module assert the raw decode + identity exactly.
+        auto field(const char* name) const -> std::optional<vmhook::field_proxy> { return get_field(name); }
+    };
+
+    // -- A plain-L1 wrapper so the inherited L2-ref (which holds an L1) and the
+    //    polymorphic L1-declared field can be read back as a concrete object. --
+    class poh_l1 : public vmhook::object<poh_l1>
+    {
+    public:
+        explicit poh_l1(vmhook::oop_t instance) noexcept
+            : vmhook::object<poh_l1>{ instance }
+        {
+        }
+        auto l1_int() const -> std::int32_t { return get_field("l1Int")->get(); }
+        auto l1_str() const -> std::string  { return get_field("l1Str")->get(); }
+    };
+
+    // -- Shadow base wrapper: registered to the BASE Shadow, so a read of the
+    //    shadowed name resolves the BASE slot at depth 0. ----------------------
+    class poh_shadow : public vmhook::object<poh_shadow>
+    {
+    public:
+        explicit poh_shadow(vmhook::oop_t instance) noexcept
+            : vmhook::object<poh_shadow>{ instance }
+        {
+        }
+        auto shadowed_int() const -> std::int32_t { return get_field("shadowedInt")->get(); }
+        auto shadowed_ref() const -> std::string  { return get_field("shadowedRef")->get(); }
+    };
+
+    // -- Shadow sub wrapper: registered to ShadowSub, so a read of the shadowed
+    //    name resolves the CHILD slot (declared-scope wins at the start klass). -
+    class poh_shadow_sub : public vmhook::object<poh_shadow_sub>
+    {
+    public:
+        explicit poh_shadow_sub(vmhook::oop_t instance) noexcept
+            : vmhook::object<poh_shadow_sub>{ instance }
+        {
+        }
+        auto shadowed_int() const -> std::int32_t { return get_field("shadowedInt")->get(); }
+        auto shadowed_ref() const -> std::string  { return get_field("shadowedRef")->get(); }
+    };
+
     // ---- Wrapper registered to the FIXTURE class, owning the go/done
     //      handshake, the Java-side witnesses, and the held B instance. -------
     class pi_fixture : public vmhook::object<pi_fixture>
@@ -115,22 +191,39 @@ namespace
         static auto saw_inherited_field() -> bool  { return static_field("sawInheritedField")->get(); }
         static auto saw_inherited_method() -> bool { return static_field("sawInheritedMethod")->get(); }
 
-        // The held live B instance.  Resolve the static field on the FIXTURE
-        // klass (where bInstance is declared), guard the optional, and hand back
-        // the raw decoded OOP so the caller can validate it before wrapping as a
-        // B.  Returns nullptr on a missing field / null reference.
-        static auto get_b_oop() -> vmhook::oop_t
+        // -- Witnesses for the EXHAUSTIVE expansion (latched by the probe) --
+        static auto saw_deep_fields() -> bool   { return static_field("sawDeepFields")->get(); }
+        static auto saw_deep_refs() -> bool     { return static_field("sawDeepRefs")->get(); }
+        static auto saw_shadow_sub() -> bool    { return static_field("sawShadowSub")->get(); }
+        static auto saw_shadow_base() -> bool   { return static_field("sawShadowBase")->get(); }
+        static auto saw_poly_concrete() -> bool { return static_field("sawPolyConcrete")->get(); }
+
+        // -- Published identity hash codes (exact native-oop cross-checks) --
+        static auto l1_str_identity() -> std::int32_t   { return static_field("l1StrIdentity")->get(); }
+        static auto l1_arr_identity() -> std::int32_t   { return static_field("l1ArrIdentity")->get(); }
+        static auto l2_ref_identity() -> std::int32_t   { return static_field("l2RefIdentity")->get(); }
+        static auto self_ref_identity() -> std::int32_t { return static_field("selfRefIdentity")->get(); }
+        static auto poly_base_identity() -> std::int32_t { return static_field("polyBaseIdentity")->get(); }
+
+        // Decode the raw OOP held by a static REFERENCE field declared on the
+        // fixture, validating + decoding the compressed OOP through the
+        // unique_ptr<wrapper_type> conversion and handing back the raw instance
+        // pointer (or nullptr).  Generic over the wrapper type so each held
+        // instance (B / L4 / Shadow / polyBase) decodes through its own wrapper.
+        template<typename wrapper_type>
+        static auto static_ref_oop(const char* const name) -> vmhook::oop_t
         {
-            const auto fp{ static_field("bInstance") };
+            const auto fp{ static_field(name) };
             if (!fp.has_value())
             {
                 return nullptr;
             }
-            // unique_ptr<pi_b> conversion validates+decodes the compressed OOP;
-            // extract its raw instance pointer (or nullptr) by COPY.
-            std::unique_ptr<pi_b> held = fp->get();
+            std::unique_ptr<wrapper_type> held = fp->get();
             return held ? held->vmhook::object_base::get_instance() : nullptr;
         }
+
+        // The held live B instance (kept as a named helper for the legacy block).
+        static auto get_b_oop() -> vmhook::oop_t { return static_ref_oop<pi_b>("bInstance"); }
     };
 
     // ---- Constants mirrored from PolyInherited.java / legacy A.java + B.java -
@@ -138,6 +231,25 @@ namespace
     constexpr std::int32_t B_INT         { 42 };     // B.bInt init
     constexpr std::int32_t ADD_ARG       { 3 };      // protectedAdd argument
     constexpr std::int32_t ADD_RESULT    { 1340 };   // protectedAdd(3) == 1337 + 3
+
+    // ---- Constants for the deep 4-level hierarchy (mirror PolyInherited.java) -
+    constexpr std::int32_t L1_INT       { 0x0A1A0001 };   // declared on L1 (depth 3)
+    constexpr std::int32_t L2_INT       { 0x0B2B0002 };   // declared on L2 (depth 2)
+    constexpr std::int32_t L3_INT       { 0x0C3C0003 };   // declared on L3 (depth 1)
+    constexpr std::int32_t L4_INT       { 0x0D4D0004 };   // declared on L4 (depth 0 / own)
+    constexpr std::int32_t L2_REF_VAL   { 0x0E5E0005 };   // l2Ref's own l1Int
+    constexpr std::int32_t L1_ARR_ELEM0 { 0x51510001 };   // l1Arr[0]
+    constexpr std::int32_t L1_ARR_LEN   { 2 };
+    const     std::string  L1_STR_VALUE { "l1-inherited-string" };
+
+    // ---- Constants for the shadow (hidden-field) pair ----------------------
+    constexpr std::int32_t BASE_SHADOW_INT { 1000 };      // Shadow.shadowedInt
+    constexpr std::int32_t SUB_SHADOW_INT  { 2000 };      // ShadowSub.shadowedInt
+    const     std::string  BASE_SHADOW_STR { "base-shadow" };
+    const     std::string  SUB_SHADOW_STR  { "sub-shadow" };
+
+    // ---- Constant for the polymorphic field's concrete L4 ------------------
+    constexpr std::int32_t POLY_L4_INT  { 0x0F6F0006 };   // l4Poly's l4Int
 
     // ---- Internal (JVM, slash-separated) class names.  javac emits the nested
     //      static classes as PolyInherited$A / PolyInherited$B (confirmed via
@@ -147,6 +259,40 @@ namespace
     constexpr const char* FIXTURE_NAME { "vmhook/fixtures/PolyInherited" };
     constexpr const char* A_NAME       { "vmhook/fixtures/PolyInherited$A" };
     constexpr const char* B_NAME       { "vmhook/fixtures/PolyInherited$B" };
+    constexpr const char* L1_NAME      { "vmhook/fixtures/PolyInherited$L1" };
+    constexpr const char* L4_NAME      { "vmhook/fixtures/PolyInherited$L4" };
+    constexpr const char* SHADOW_NAME      { "vmhook/fixtures/PolyInherited$Shadow" };
+    constexpr const char* SHADOW_SUB_NAME  { "vmhook/fixtures/PolyInherited$ShadowSub" };
+
+    // ---- Internal name of the runtime klass behind an oop, or "" if it can't
+    //      be resolved.  Used to prove the polymorphic L1-declared field's
+    //      decoded oop carries the CONCRETE runtime type (L4, never L1).  Fully
+    //      is_valid_pointer-gated. ----------------------------------------------
+    auto runtime_klass_name(void* const oop) -> std::string
+    {
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+        {
+            return {};
+        }
+        vmhook::hotspot::klass* const k{ vmhook::klass_from_oop(oop) };
+        if (!k || !vmhook::hotspot::is_valid_pointer(k))
+        {
+            return {};
+        }
+        vmhook::hotspot::symbol* const sym{ k->get_name() };
+        if (!sym || !vmhook::hotspot::is_valid_pointer(sym))
+        {
+            return {};
+        }
+        return sym->to_string();
+    }
+
+    // ---- True if `haystack` ends with `suffix` (klass-name suffix checks). ---
+    auto ends_with(const std::string& haystack, const std::string& suffix) -> bool
+    {
+        return haystack.size() >= suffix.size()
+            && haystack.compare(haystack.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
 }
 
 VMHOOK_JVM_MODULE(poly_inherited_oop)
@@ -154,6 +300,10 @@ VMHOOK_JVM_MODULE(poly_inherited_oop)
     vmhook::register_class<pi_fixture>(FIXTURE_NAME);
     vmhook::register_class<pi_a>(A_NAME);
     vmhook::register_class<pi_b>(B_NAME);
+    vmhook::register_class<poh_l1>(L1_NAME);
+    vmhook::register_class<poh_l4>(L4_NAME);
+    vmhook::register_class<poh_shadow>(SHADOW_NAME);
+    vmhook::register_class<poh_shadow_sub>(SHADOW_SUB_NAME);
 
     // Record which dispatch path the live JDK uses for call(), for diagnostics.
     const bool call_gate_present{ vmhook::detail::find_call_stub_entry() != nullptr };

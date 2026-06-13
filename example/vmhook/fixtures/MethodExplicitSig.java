@@ -49,6 +49,7 @@ import vmhook.Harness;
  * Java 8 syntax only (no var / records / switch-expr / text-blocks).
  */
 public final class MethodExplicitSig extends MethodExplicitSigBase
+        implements MethodExplicitSigIface
 {
     /** Native sets this true to request the action; clears it after. */
     public static volatile boolean go;
@@ -104,6 +105,49 @@ public final class MethodExplicitSig extends MethodExplicitSigBase
     public static final int    BASE_I_ARG      = 100;   // base(I)I -> 107
     public static final int    BASE_II_A       = 50;
     public static final int    BASE_II_B       = 8;     // base(II)I -> 42
+
+    // -- descriptor-shape selector family (shapes/dup/iface) constants ----
+    public static final float  SHAPE_F_ARG     = 1.5f;  // shapes(F)F  -> 3.0
+    public static final double SHAPE_D_ARG     = 2.25;  // shapes(D)D  -> 5.5
+    public static final byte   SHAPE_B_ARG     = 7;     // shapes(B)B  -> 14
+    public static final short  SHAPE_S_ARG     = 11;    // shapes(S)S  -> 33
+    public static final char   SHAPE_C_ARG     = 'Q';   // shapes(C)C  -> 'Q'+1 = 'R'
+    public static final int    SHAPE_4A        = 1;
+    public static final int    SHAPE_4B        = 2;
+    public static final int    SHAPE_4C        = 3;
+    public static final int    SHAPE_4D        = 4;     // shapes(IIII)I -> sum 10
+    public static final int    DUP_INST_ARG    = 60;    // dupInstance(I)I -> 61
+    public static final int    DUP_STAT_ARG    = 70;    // dupStatic(I)I   -> 140
+    public static final int    IFACE_DEF_I_ARG = 19;    // ifaceDefault(I)I -> 22
+    public static final long   IFACE_DEF_J_ARG = 4L;    // ifaceDefault(J)J -> 34
+    public static final int    IFACE_ABS_ARG   = 80;    // ifaceAbstract(I)I -> 81
+    public static final int    INIT_I_ARG      = 33;    // <init>(I) records 33
+    public static final String INIT_S_ARG      = "ctor";// <init>(String) records "ctor"
+
+    // ===================== Constructor overloads (<init>) ==================
+    // Several <init> overloads with DISTINCT descriptors so the explicit-
+    // signature lookup can select one constructor proxy by its exact descriptor.
+    // The native module resolves these by signature (LOOKUP correctness +
+    // signature() text); it deliberately does NOT call() a constructor proxy on a
+    // live instance (re-running <init> on an already-constructed object is not a
+    // meaningful or safe dispatch — the selection-by-descriptor is the feature).
+
+    /** <init>()V — kept explicit because adding other ctors removes the implicit one. */
+    public MethodExplicitSig()
+    {
+    }
+
+    /** <init>(I)V */
+    public MethodExplicitSig(final int a)
+    {
+        MethodExplicitSigCounters.initIntSeen = a;
+    }
+
+    /** <init>(Ljava/lang/String;)V */
+    public MethodExplicitSig(final String s)
+    {
+        MethodExplicitSigCounters.initStrSeen = s;
+    }
 
     // ===================== Overload family: process =========================
 
@@ -182,6 +226,139 @@ public final class MethodExplicitSig extends MethodExplicitSigBase
     {
         smapStrHits++;
         return "M:" + s;
+    }
+
+    // ===================== Descriptor-shape selector family: shapes ========
+    // One overload per JVM descriptor SHAPE so the explicit signature exercises
+    // every primitive selector (F D B S C), arrays ([I [J [Ljava/lang/String;),
+    // and a many-arg (IIII).  Each returns a distinct value and records a
+    // distinct side effect on MethodExplicitSigCounters.
+
+    /** shapes(F)F */
+    public float shapes(final float a)
+    {
+        MethodExplicitSigCounters.shapeFloatSeen = a;
+        return a * 2.0f;
+    }
+
+    /** shapes(D)D */
+    public double shapes(final double a)
+    {
+        MethodExplicitSigCounters.shapeDoubleSeen = a;
+        return a + 3.25;
+    }
+
+    /** shapes(Z)Z */
+    public boolean shapes(final boolean a)
+    {
+        MethodExplicitSigCounters.shapeBoolSeen = a ? 1 : 0;
+        return !a;
+    }
+
+    /** shapes(B)B */
+    public byte shapes(final byte a)
+    {
+        MethodExplicitSigCounters.shapeByteSeen = a;
+        return (byte) (a * 2);
+    }
+
+    /** shapes(S)S */
+    public short shapes(final short a)
+    {
+        MethodExplicitSigCounters.shapeShortSeen = a;
+        return (short) (a * 3);
+    }
+
+    /** shapes(C)C */
+    public char shapes(final char a)
+    {
+        MethodExplicitSigCounters.shapeCharSeen = a;
+        return (char) (a + 1);
+    }
+
+    /** shapes([I)I — primitive int array; returns element sum. */
+    public int shapes(final int[] a)
+    {
+        int sum = 0;
+        if (a != null)
+        {
+            for (final int v : a)
+            {
+                sum += v;
+            }
+        }
+        MethodExplicitSigCounters.shapeIntArrSeen = sum;
+        return sum;
+    }
+
+    /** shapes([J)J — wide (long) array; returns element sum. */
+    public long shapes(final long[] a)
+    {
+        long sum = 0L;
+        if (a != null)
+        {
+            for (final long v : a)
+            {
+                sum += v;
+            }
+        }
+        MethodExplicitSigCounters.shapeLongArrSeen = sum;
+        return sum;
+    }
+
+    /** shapes([Ljava/lang/String;)I — object array; returns element count. */
+    public int shapes(final String[] a)
+    {
+        final int n = (a == null) ? 0 : a.length;
+        MethodExplicitSigCounters.shapeStrArrSeen = n;
+        return n;
+    }
+
+    /** shapes(IIII)I — many-arg; returns the sum. */
+    public int shapes(final int a, final int b, final int c, final int d)
+    {
+        final int sum = a + b + c + d;
+        MethodExplicitSigCounters.shapeFourArgSeen = sum;
+        return sum;
+    }
+
+    // ===================== ACC_STATIC orthogonality: dup* ==================
+    // A Java class CANNOT declare the same name+parameter-types as both static
+    // and instance (the receiver is implicit, so the descriptors would clash).
+    // So the orthogonality is characterized with a matched PAIR of DISTINCT
+    // names that share the IDENTICAL descriptor (I)I but differ in KIND:
+    //   dupStatic(I)I    — STATIC   only
+    //   dupInstance(I)I  — INSTANCE only
+    // The native module asserts:
+    //   * static_method("dupStatic","(I)I")   RESOLVES (correct: null owner)
+    //   * static_method("dupInstance","(I)I")  MISSES   (ACC_STATIC gate rejects)
+    //   * get_method("dupInstance","(I)I")    RESOLVES (correct: real receiver)
+    //   * get_method("dupStatic","(I)I")      RESOLVES (instance overload has NO
+    //       ACC_STATIC gate — it hands back the static Method with a phantom
+    //       receiver; this is FLAW 1, characterized not asserted-good).
+
+    /** dupStatic(I)I — STATIC. */
+    public static int dupStatic(final int a)
+    {
+        MethodExplicitSigCounters.dupStaticSeen = a;
+        return a * 2;
+    }
+
+    /** dupInstance(I)I — INSTANCE, same descriptor as dupStatic. */
+    public int dupInstance(final int a)
+    {
+        MethodExplicitSigCounters.dupInstanceSeen = a;
+        return a + 1;
+    }
+
+    // ===================== Interface abstract override =====================
+
+    /** ifaceAbstract(I)I — concrete override of the interface's ABSTRACT method. */
+    @Override
+    public int ifaceAbstract(final int a)
+    {
+        MethodExplicitSigCounters.ifaceAbstractSeen = a;
+        return a + 1;
     }
 
     // ===================== Hook target =====================================

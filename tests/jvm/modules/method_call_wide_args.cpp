@@ -289,6 +289,62 @@ namespace
         static auto sWMixSa() -> std::string  { return static_field("sWMixSa")->get().as_string(); }
         static auto sWMixSb() -> std::int64_t { return static_field("sWMixSb")->get(); }
         static auto sWMixSc() -> std::string  { return static_field("sWMixSc")->get().as_string(); }
+        // mixE(float,double,float) — double in the MIDDLE flanked by FLOATS.
+        static auto wMixEa() -> std::uint32_t { return f2bits_field("wMixEa"); }
+        static auto wMixEb() -> std::uint64_t { return d2bits_field("wMixEb"); }
+        static auto wMixEc() -> std::uint32_t { return f2bits_field("wMixEc"); }
+        // jidi(long,int,double,int) — the (JIDI) shape.
+        static auto wJidiA() -> std::int64_t  { return static_field("wJidiA")->get(); }
+        static auto wJidiB() -> std::int32_t  { return static_field("wJidiB")->get(); }
+        static auto wJidiC() -> std::uint64_t { return d2bits_field("wJidiC"); }
+        static auto wJidiD() -> std::int32_t  { return static_field("wJidiD")->get(); }
+        // idj(int,double,long) — the (ID J) shape.
+        static auto wIdjA() -> std::int32_t  { return static_field("wIdjA")->get(); }
+        static auto wIdjB() -> std::uint64_t { return d2bits_field("wIdjB"); }
+        static auto wIdjC() -> std::int64_t  { return static_field("wIdjC")->get(); }
+        // widePent(long,int,double,int,float) — the (JIDIF) five-arg tail.
+        static auto wPentA() -> std::int64_t  { return static_field("wPentA")->get(); }
+        static auto wPentB() -> std::int32_t  { return static_field("wPentB")->get(); }
+        static auto wPentC() -> std::uint64_t { return d2bits_field("wPentC"); }
+        static auto wPentD() -> std::int32_t  { return static_field("wPentD")->get(); }
+        static auto wPentE() -> std::uint32_t { return f2bits_field("wPentE"); }
+        // sixL(long x6) — deep-packing long witnesses.
+        static auto wSixLa() -> std::int64_t { return static_field("wSixLa")->get(); }
+        static auto wSixLb() -> std::int64_t { return static_field("wSixLb")->get(); }
+        static auto wSixLc() -> std::int64_t { return static_field("wSixLc")->get(); }
+        static auto wSixLd() -> std::int64_t { return static_field("wSixLd")->get(); }
+        static auto wSixLe() -> std::int64_t { return static_field("wSixLe")->get(); }
+        static auto wSixLf() -> std::int64_t { return static_field("wSixLf")->get(); }
+        // sixD(double x6) — deep-packing double witnesses (raw bits).
+        static auto wSixDa() -> std::uint64_t { return d2bits_field("wSixDa"); }
+        static auto wSixDb() -> std::uint64_t { return d2bits_field("wSixDb"); }
+        static auto wSixDc() -> std::uint64_t { return d2bits_field("wSixDc"); }
+        static auto wSixDd() -> std::uint64_t { return d2bits_field("wSixDd"); }
+        static auto wSixDe() -> std::uint64_t { return d2bits_field("wSixDe"); }
+        static auto wSixDf() -> std::uint64_t { return d2bits_field("wSixDf"); }
+        // mixSD(String,double,String) — wide double between two references.
+        static auto wMixSDa() -> std::string  { return static_field("wMixSDa")->get().as_string(); }
+        static auto wMixSDb() -> std::uint64_t { return d2bits_field("wMixSDb"); }
+        static auto wMixSDc() -> std::string  { return static_field("wMixSDc")->get().as_string(); }
+        // static deep-packing witnesses
+        static auto sWSixLa() -> std::int64_t { return static_field("sWSixLa")->get(); }
+        static auto sWSixLb() -> std::int64_t { return static_field("sWSixLb")->get(); }
+        static auto sWSixLc() -> std::int64_t { return static_field("sWSixLc")->get(); }
+        static auto sWSixLd() -> std::int64_t { return static_field("sWSixLd")->get(); }
+        static auto sWSixLe() -> std::int64_t { return static_field("sWSixLe")->get(); }
+        static auto sWSixLf() -> std::int64_t { return static_field("sWSixLf")->get(); }
+        static auto sWSixDa() -> std::uint64_t { return d2bits_field("sWSixDa"); }
+        static auto sWSixDb() -> std::uint64_t { return d2bits_field("sWSixDb"); }
+        static auto sWSixDc() -> std::uint64_t { return d2bits_field("sWSixDc"); }
+        static auto sWSixDd() -> std::uint64_t { return d2bits_field("sWSixDd"); }
+        static auto sWSixDe() -> std::uint64_t { return d2bits_field("sWSixDe"); }
+        static auto sWSixDf() -> std::uint64_t { return d2bits_field("sWSixDf"); }
+        // static (JIDIF) five-arg witnesses
+        static auto sWPentA() -> std::int64_t  { return static_field("sWPentA")->get(); }
+        static auto sWPentB() -> std::int32_t  { return static_field("sWPentB")->get(); }
+        static auto sWPentC() -> std::uint64_t { return d2bits_field("sWPentC"); }
+        static auto sWPentD() -> std::int32_t  { return static_field("sWPentD")->get(); }
+        static auto sWPentE() -> std::uint32_t { return f2bits_field("sWPentE"); }
     };
 
     // ---------------------------------------------------------------------
@@ -733,6 +789,137 @@ namespace
         put(key, r);
     }
 
+    // Instance, returns float, (float,double,float) — wide DOUBLE flanked by
+    // floats (the 'F'-neighbour analogue of mixC's int flanks).
+    auto cap_mixE(const wide& self, const std::string& key,
+                  float a, double b, float c) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("mixE") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const float got = v;
+            r.fbits      = f2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (long,int,double,int) — the (JIDI) shape.
+    auto cap_jidi(const wide& self, const std::string& key,
+                  std::int64_t a, std::int32_t b, double c, std::int32_t d) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("jidi") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (int,double,long) — the (ID J) shape.
+    auto cap_idj(const wide& self, const std::string& key,
+                 std::int32_t a, double b, std::int64_t c) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("idj") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (long,int,double,int,float) — the explicit
+    // five-arg "every shape" tail with a TRAILING float.
+    auto cap_widePent(const wide& self, const std::string& key,
+                      std::int64_t a, std::int32_t b, double c,
+                      std::int32_t d, float e) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("widePent") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns long, (long x6) — six adjacent longs, deep slot packing.
+    auto cap_sixL(const wide& self, const std::string& key,
+                  std::int64_t a, std::int64_t b, std::int64_t c,
+                  std::int64_t d, std::int64_t e, std::int64_t f) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("sixL") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e, f);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (double x6) — six adjacent doubles, deep packing.
+    auto cap_sixD(const wide& self, const std::string& key,
+                  double a, double b, double c,
+                  double d, double e, double f) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("sixD") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e, f);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (String,double,String) — wide DOUBLE between two
+    // object references (the double analogue of mixS).
+    auto cap_mixSD(const wide& self, const std::string& key,
+                   const std::string& a, double b, const std::string& c) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("mixSD") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
     // Instance, returns int (overload tag), single arg of templated width.
     template<typename arg_t>
     auto cap_tag(const wide& self, const std::string& key,
@@ -930,6 +1117,63 @@ namespace
             r.is_void    = v.is_void();
             r.dispatched = !v.is_void();
             r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Static (long x6) — six adjacent longs, deep packing, first long at slot 0.
+    auto scap_sixL(const std::string& key,
+                   std::int64_t a, std::int64_t b, std::int64_t c,
+                   std::int64_t d, std::int64_t e, std::int64_t f) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sSixL") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e, f);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Static (double x6) — six adjacent doubles, deep packing, first at slot 0.
+    auto scap_sixD(const std::string& key,
+                   double a, double b, double c,
+                   double d, double e, double f) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sSixD") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e, f);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Static (long,int,double,int,float) — the (JIDIF) five-arg "every shape"
+    // tail at the no-receiver frame (first arg at slot 0).
+    auto scap_widePent(const std::string& key,
+                       std::int64_t a, std::int32_t b, double c,
+                       std::int32_t d, float e) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sWidePent") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
         }
         put(key, r);
     }

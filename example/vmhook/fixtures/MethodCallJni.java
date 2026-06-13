@@ -113,6 +113,40 @@ public final class MethodCallJni
      *  performed after the stress loops still delivers its argument intact. */
     public static volatile int     lastEchoArg;
 
+    // ── recorded String-arg shape (NUL / astral arg proof) ──────────────────
+    //
+    // The String-RETURN decode (call_jni -> GetStringUTFChars, modified UTF-8 +
+    // NUL-terminated) CANNOT round-trip an interior NUL (truncates) or an astral
+    // scalar (6-byte surrogate form), so a pure "echoString then compare" cannot
+    // prove the ARG path (NewString / length-counted UTF-16, the #27 fix) carried
+    // them.  These INTEGER observations are immune to any string decoding: the
+    // body measures the Java String the JVM actually received and publishes plain
+    // ints, so the native side proves the exact code units reached the JVM.
+    public static volatile boolean recordStringCalled;
+    public static volatile int     recordStringCharLen;   // String.length()  (UTF-16 units)
+    public static volatile int     recordStringCpCount;   // codePointCount() (scalars)
+    public static volatile int     recordStringFirstCp;   // codePointAt(0)
+    public static volatile int     recordStringLastCp;    // last code point
+    public static volatile int     recordStringHash;      // String.hashCode() — content fingerprint
+
+    // ── constructor-invocation counter (CallNonvirtual / invokespecial proof) ─
+    //
+    // The ONLY path in method_proxy::call() that dispatches through JNI
+    // CallNonvirtualVoidMethodA (slot 93) is a void <init> / <clinit> resolved on
+    // an INSTANCE proxy (see call_jni's 'V' arm).  Re-invoking this no-arg
+    // constructor on the already-built SINGLETON via get_method("<init>","()V")
+    // ->call() exercises that nonvirtual slot; the constructor only bumps this
+    // static counter, so re-running it on a live receiver is a safe no-op whose
+    // single observable effect is the increment.
+    public static volatile int     ctorCalls;
+
+    /** No-arg constructor: side-effect is ONLY the static counter bump, so the
+     *  nonvirtual re-invocation test can re-run it on a live object harmlessly. */
+    public MethodCallJni()
+    {
+        ctorCalls++;
+    }
+
     // ── the method the native module hooks to obtain a live thread ──────────
 
     /** Hookable instance method.  The native detour on this method performs
@@ -203,16 +237,91 @@ public final class MethodCallJni
         return null;
     }
 
-    // Array reference return ('[' descriptor) — a non-null int[].
+    // Array reference return ('[' descriptor) — a non-null int[].  The exact
+    // contents { 11, 22, 33 } are asserted value-correct on the native side via
+    // vmhook::array_length + vmhook::get_array_element (the crash-safe library
+    // array readers), so the '[' arm's OOP decode is proven to land on the real
+    // array, not just "non-null".
     public int[] retIntArray()
     {
         return new int[] { 11, 22, 33 };
+    }
+
+    // Long[] return — a DIFFERENT element stride (8 bytes) from int[], so the
+    // value-correct read also exercises get_array_element<int64_t> stride math.
+    public long[] retLongArray()
+    {
+        return new long[] { 0x1111111111111111L, 0x2222222222222222L,
+                            0x3333333333333333L, 0x4444444444444444L };
+    }
+
+    // Object array return ('[Ljava/lang/String;') — exercises the '[' arm with a
+    // REFERENCE element descriptor.  The native side asserts a non-null decode and
+    // the exact length (object-element contents are not walked — that's the user's
+    // job — but the length read proves the array header decoded correctly).
+    public String[] retStringArray()
+    {
+        return new String[] { "alpha", "bravo", "charlie" };
     }
 
     // String return used by the tight leak loop: a fresh constant each call.
     public String loopString()
     {
         return "loop-stable-value";
+    }
+
+    // ── String-arg shape recorder (NUL / astral ARG proof) ──────────────────
+    // Publishes pure-int measurements of the received String so the native side
+    // proves the length-counted UTF-16 arg path delivered every code unit
+    // (interior NUL, astral surrogate pair) to the JVM, independent of any
+    // string-DECODE limitation on the return side.
+    public void recordString(final String s)
+    {
+        if (s == null)
+        {
+            recordStringCharLen = -1;
+            recordStringCpCount = -1;
+            recordStringFirstCp = 0;
+            recordStringLastCp  = 0;
+            recordStringHash    = 0;
+        }
+        else
+        {
+            recordStringCharLen = s.length();
+            recordStringCpCount = s.codePointCount(0, s.length());
+            recordStringFirstCp = s.isEmpty() ? 0 : s.codePointAt(0);
+            recordStringLastCp  = s.isEmpty() ? 0 : s.codePointBefore(s.length());
+            recordStringHash    = s.hashCode();
+        }
+        recordStringCalled = true;
+    }
+
+    // ── methods that THROW (exception-discipline proof) ─────────────────────
+    // The native side calls these, then asserts the library OBSERVED and CLEARED
+    // the pending JNI exception (call_jni's check_callee_exception -> Describe,
+    // which clears), so a subsequent call succeeds and nothing escapes to crash a
+    // sibling module.  Distinct messages let the trace identify each.
+    public void throwVoid()
+    {
+        throw new IllegalStateException("mcj-throw-void");
+    }
+
+    // Throwing method with a NON-void return: proves the value path also leaves a
+    // pending exception that the library clears (JNI returns 0 on a pending
+    // exception, so the returned value is meaningless — only the discipline
+    // matters here).
+    public int throwReturningInt()
+    {
+        if (triggerCount >= 0)            // always true; defeats unreachable-code
+        {
+            throw new ArithmeticException("mcj-throw-int");
+        }
+        return 0;
+    }
+
+    public static void sThrowVoid()
+    {
+        throw new IllegalStateException("mcj-throw-static");
     }
 
     // ════════════════════════════════════════════════════════════════════════

@@ -194,6 +194,81 @@ public final class MethodCallWideArgs
     public static volatile long   sWMixSb = SENTINEL;
     public static volatile String sWMixSc = null;
 
+    // mixE(float,double,float) — a DOUBLE in the MIDDLE flanked by FLOATS (the
+    // 'F' analogue of mixC's int flanks).  A packer that mis-expands a wide
+    // DOUBLE against an 'F' neighbour (vs the 'I' in mixC) corrupts a flank.
+    public static volatile float  wMixEa = (float) SENTINEL;
+    public static volatile double wMixEb = Double.NaN;
+    public static volatile float  wMixEc = (float) SENTINEL;
+    // jidi(long,int,double,int) — the exact (JIDI) shape: a long, then a narrow
+    // int squeezed between the long and a double, then a trailing int after the
+    // double.  Seven interpreter slots (2+1+2+1+1); two narrows each adjacent to
+    // a different wide kind, so a one-slot drift anywhere fails a witness.
+    public static volatile long   wJidiA = SENTINEL;
+    public static volatile int    wJidiB = (int) SENTINEL;
+    public static volatile double wJidiC = Double.NaN;
+    public static volatile int    wJidiD = (int) SENTINEL;
+    // idj(int,double,long) — the (ID J) shape: a narrow int, then a double, then
+    // a long.  The long must START exactly two slots after the double's start
+    // (slot 3 for instance: int@1, double@2-3, long@4-5).
+    public static volatile int    wIdjA = (int) SENTINEL;
+    public static volatile double wIdjB = Double.NaN;
+    public static volatile long   wIdjC = SENTINEL;
+    // widePent(long,int,double,int,float) — the explicit five-arg "every shape"
+    // tail: long, int, double, int, float (eight interpreter slots).  A TRAILING
+    // float after a wide-heavy frame is the witness that the float lands on the
+    // right single slot once two wides + two narrows precede it.
+    public static volatile long   wPentA = SENTINEL;
+    public static volatile int    wPentB = (int) SENTINEL;
+    public static volatile double wPentC = Double.NaN;
+    public static volatile int    wPentD = (int) SENTINEL;
+    public static volatile float  wPentE = (float) SENTINEL;
+    // sixL(long x6) — SIX adjacent longs: twelve contiguous interpreter slots,
+    // the deep-packing witness for the long kind (every slot pair must stay
+    // distinct, no half-bleed between any neighbour).  All six stamped.
+    public static volatile long wSixLa = SENTINEL;
+    public static volatile long wSixLb = SENTINEL;
+    public static volatile long wSixLc = SENTINEL;
+    public static volatile long wSixLd = SENTINEL;
+    public static volatile long wSixLe = SENTINEL;
+    public static volatile long wSixLf = SENTINEL;
+    // sixD(double x6) — SIX adjacent doubles: twelve contiguous slots, the
+    // deep-packing witness for the double kind.  Stamped as RAW bits-equivalent
+    // doubles (the native side reads each back bit-exact).
+    public static volatile double wSixDa = Double.NaN;
+    public static volatile double wSixDb = Double.NaN;
+    public static volatile double wSixDc = Double.NaN;
+    public static volatile double wSixDd = Double.NaN;
+    public static volatile double wSixDe = Double.NaN;
+    public static volatile double wSixDf = Double.NaN;
+    // mixSD(String,double,String) — a wide DOUBLE between two OBJECT references
+    // (the double analogue of mixS's long-between-references).  Proves a wide
+    // double neither truncates nor shifts beside 'L' slots and the two distinct-
+    // length references do not swap.
+    public static volatile String wMixSDa = null;
+    public static volatile double wMixSDb = Double.NaN;
+    public static volatile String wMixSDc = null;
+
+    // STATIC deep-packing witnesses (no receiver; first wide arg at slot 0).
+    public static volatile long sWSixLa = SENTINEL;
+    public static volatile long sWSixLb = SENTINEL;
+    public static volatile long sWSixLc = SENTINEL;
+    public static volatile long sWSixLd = SENTINEL;
+    public static volatile long sWSixLe = SENTINEL;
+    public static volatile long sWSixLf = SENTINEL;
+    public static volatile double sWSixDa = Double.NaN;
+    public static volatile double sWSixDb = Double.NaN;
+    public static volatile double sWSixDc = Double.NaN;
+    public static volatile double sWSixDd = Double.NaN;
+    public static volatile double sWSixDe = Double.NaN;
+    public static volatile double sWSixDf = Double.NaN;
+    // static (JIDIF) five-arg "every shape" witnesses (first arg at slot 0).
+    public static volatile long   sWPentA = SENTINEL;
+    public static volatile int    sWPentB = (int) SENTINEL;
+    public static volatile double sWPentC = Double.NaN;
+    public static volatile int    sWPentD = (int) SENTINEL;
+    public static volatile float  sWPentE = (float) SENTINEL;
+
     /** Held so the native side can build an instance wrapper for instance calls. */
     public static MethodCallWideArgs instance = new MethodCallWideArgs();
 
@@ -450,6 +525,122 @@ public final class MethodCallWideArgs
         return v;
     }
 
+    /** A DOUBLE in the MIDDLE flanked by FLOATS: float, double, float.  This is
+     *  the 'F'-neighbour analogue of mixC(int,double,int): a packer that mis-
+     *  expands the wide double against an 'F' slot (rather than 'I') would corrupt
+     *  a flanking float.  Both floats are exact small powers-of-two-scaled values
+     *  so the return and witnesses compare bit-exact; the products are computed in
+     *  their own already-rounded steps so no FMA contraction can diverge. */
+    public float mixE(final float a, final double b, final float c)
+    {
+        wMixEa = a;
+        wMixEb = b;
+        wMixEc = c;
+        final float sa = a * 256.0f;     // exact for the small integral floats used
+        final float sc = c * 4.0f;       // exact
+        final float bf = (float) b;      // double contribution, rounded once
+        return sa + bf + sc;
+    }
+
+    /** The exact (JIDI) shape: long, int, double, int.  Seven interpreter slots.
+     *  The first int sits between a long and a double; the second int follows the
+     *  double.  Each operand is stamped; the return is a pure left-to-right sum
+     *  (no FMA-contractible mul+add) recomputed identically on the native side. */
+    public double jidi(final long a, final int b, final double c, final int d)
+    {
+        wJidiA = a;
+        wJidiB = b;
+        wJidiC = c;
+        wJidiD = d;
+        return (double) a + (double) b + c + (double) d;
+    }
+
+    /** The (ID J) shape: int, double, long.  The long must start exactly two
+     *  slots after the double's start.  Pure sum; every operand stamped. */
+    public double idj(final int a, final double b, final long c)
+    {
+        wIdjA = a;
+        wIdjB = b;
+        wIdjC = c;
+        return (double) a + b + (double) c;
+    }
+
+    /** The explicit five-arg "every shape" tail: long, int, double, int, float —
+     *  eight interpreter slots (2+1+2+1+1).  A TRAILING float after a wide-heavy
+     *  frame proves the float lands on the correct single slot.  Pure left-to-
+     *  right sum; the float widens to double once.  Every operand stamped. */
+    public double widePent(final long a, final int b, final double c,
+                           final int d, final float e)
+    {
+        wPentA = a;
+        wPentB = b;
+        wPentC = c;
+        wPentD = d;
+        wPentE = e;
+        return (double) a + (double) b + c + (double) d + (double) e;
+    }
+
+    /** SIX adjacent longs: twelve contiguous interpreter slots, the deep-packing
+     *  witness for the long kind.  Distinct small prime-ish multipliers (each a
+     *  SEPARATE term) make any neighbour swap change the result; the full 64-bit
+     *  contribution of each operand makes any truncation change it.  Each operand
+     *  is also stamped to its own witness.  All arithmetic is Java two's-complement
+     *  wraparound, mirrored on the native side via unsigned-wrap helpers. */
+    public long sixL(final long a, final long b, final long c,
+                     final long d, final long e, final long f)
+    {
+        wSixLa = a;
+        wSixLb = b;
+        wSixLc = c;
+        wSixLd = d;
+        wSixLe = e;
+        wSixLf = f;
+        return a * 1000003L + b * 31L + c * 131L + d * 524287L + e * 8191L + f;
+    }
+
+    /** SIX adjacent doubles: twelve contiguous slots, the deep-packing witness for
+     *  the double kind.  Each operand is scaled by a DISTINCT exact power of two in
+     *  its own rounded step (so the multiply introduces no rounding), then summed
+     *  strictly left-to-right.  Java has no FMA for '+' and evaluates left-to-
+     *  right, and the native side recomputes the identical operation order, so the
+     *  bits match exactly.  Every operand stamped (read back bit-exact). */
+    public double sixD(final double a, final double b, final double c,
+                       final double d, final double e, final double f)
+    {
+        wSixDa = a;
+        wSixDb = b;
+        wSixDc = c;
+        wSixDd = d;
+        wSixDe = e;
+        wSixDf = f;
+        final double ta = a * 2.0;
+        final double tb = b * 4.0;
+        final double tc = c * 8.0;
+        final double td = d * 16.0;
+        final double te = e * 32.0;
+        final double tf = f * 64.0;
+        return ta + tb + tc + td + te + tf;
+    }
+
+    /** A wide DOUBLE between two OBJECT references: String, double, String — the
+     *  double analogue of mixS(String,long,String).  Returns the double plus a
+     *  length-weighted mix of the two Strings (distinct multipliers so an a<->c
+     *  swap of unequal lengths changes the result).  Each operand stamped so the
+     *  double is provably intact and the references provably did not swap.  Null-
+     *  guarded so a wrong-arity abuse call cannot NPE.  The String lengths are
+     *  added as doubles in their own rounded steps to stay FMA-safe. */
+    public double mixSD(final String a, final double b, final String c)
+    {
+        wMixSDa = a;
+        wMixSDb = b;
+        wMixSDc = c;
+        final double la = (a == null) ? 0.0 : (double) a.length();
+        final double lc = (c == null) ? 0.0 : (double) c.length();
+        final double wa = la * 1024.0;   // exact scale
+        final double wc = lc * 16.0;     // exact scale
+        return b + wa + wc;
+    }
+
     // ======================================================================
     //  Overload pair that ONLY differs by a wide-vs-narrow parameter kind, so
     //  resolve_compatible_method() must pick the long overload for a C++ int64
@@ -558,6 +749,53 @@ public final class MethodCallWideArgs
         final long la = (a == null) ? 0L : (long) a.length();
         final long lc = (c == null) ? 0L : (long) c.length();
         return b + la * 1000003L + lc * 97L;
+    }
+
+    /** Static SIX longs — twelve contiguous slots at the no-receiver frame (first
+     *  long at slot 0).  Same deep-packing formula as the instance sixL. */
+    public static long sSixL(final long a, final long b, final long c,
+                             final long d, final long e, final long f)
+    {
+        sWSixLa = a;
+        sWSixLb = b;
+        sWSixLc = c;
+        sWSixLd = d;
+        sWSixLe = e;
+        sWSixLf = f;
+        return a * 1000003L + b * 31L + c * 131L + d * 524287L + e * 8191L + f;
+    }
+
+    /** Static SIX doubles — twelve contiguous slots at the no-receiver frame.
+     *  Same FMA-safe split-scale-then-left-to-right-sum as the instance sixD. */
+    public static double sSixD(final double a, final double b, final double c,
+                               final double d, final double e, final double f)
+    {
+        sWSixDa = a;
+        sWSixDb = b;
+        sWSixDc = c;
+        sWSixDd = d;
+        sWSixDe = e;
+        sWSixDf = f;
+        final double ta = a * 2.0;
+        final double tb = b * 4.0;
+        final double tc = c * 8.0;
+        final double td = d * 16.0;
+        final double te = e * 32.0;
+        final double tf = f * 64.0;
+        return ta + tb + tc + td + te + tf;
+    }
+
+    /** Static (JIDIF) five-arg "every shape" tail (first arg at slot 0).  Same
+     *  pure left-to-right sum as the instance widePent. */
+    public static double sWidePent(final long a, final int b, final double c,
+                                   final int d, final float e)
+    {
+        sWPentA = a;
+        sWPentB = b;
+        sWPentC = c;
+        sWPentD = d;
+        sWPentE = e;
+        return (double) a + (double) b + c + (double) d + (double) e;
     }
 
     static
