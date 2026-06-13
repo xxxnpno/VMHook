@@ -351,6 +351,19 @@ namespace surface_lock
                   "vmhook::verify_hooks must take no arguments");
     static_assert(noexcept(vmhook::verify_hooks()),
                   "vmhook::verify_hooks must be noexcept");
+    // Background auto-repair watchdog run-time master switch.
+    static_assert(std::is_same_v<decltype(vmhook::set_auto_repair_enabled(true)), void>,
+                  "vmhook::set_auto_repair_enabled(bool) must return void");
+    static_assert(std::is_invocable_r_v<void, decltype(&vmhook::set_auto_repair_enabled), bool>,
+                  "vmhook::set_auto_repair_enabled must take a single bool");
+    static_assert(noexcept(vmhook::set_auto_repair_enabled(true)),
+                  "vmhook::set_auto_repair_enabled must be noexcept");
+    static_assert(std::is_same_v<decltype(vmhook::auto_repair_enabled()), bool>,
+                  "vmhook::auto_repair_enabled() must return bool");
+    static_assert(std::is_invocable_r_v<bool, decltype(&vmhook::auto_repair_enabled)>,
+                  "vmhook::auto_repair_enabled must take no arguments");
+    static_assert(noexcept(vmhook::auto_repair_enabled()),
+                  "vmhook::auto_repair_enabled must be noexcept");
 
     // -----------------------------------------------------------------------
     // GROUP E — enumeration & deoptimization
@@ -951,6 +964,38 @@ int main()
         }
         catch (...) { threw = true; }
         check("shutdown_hooks_no_hooks_does_not_throw", !threw);
+    }
+
+    // --- set_auto_repair_enabled / auto_repair_enabled round-trip --------
+    {
+        // Default state is ENABLED (production behaviour unchanged).
+        check("auto_repair_enabled_default_true", vmhook::auto_repair_enabled());
+
+        bool threw{ false };
+        try
+        {
+            // Disabling with no watchdog live + no hooks installed is a safe no-op
+            // (no thread to stop), and the getter must reflect it immediately.
+            vmhook::set_auto_repair_enabled(false);
+        }
+        catch (...) { threw = true; }
+        check("set_auto_repair_disable_does_not_throw", !threw);
+        check("auto_repair_enabled_false_after_disable", !vmhook::auto_repair_enabled());
+
+        threw = false;
+        try
+        {
+            // Re-enable just flips the gate (no spawn here, no JVM) and is
+            // idempotent across repeated calls.
+            vmhook::set_auto_repair_enabled(true);
+            vmhook::set_auto_repair_enabled(true);
+        }
+        catch (...) { threw = true; }
+        check("set_auto_repair_enable_does_not_throw", !threw);
+        check("auto_repair_enabled_true_after_enable", vmhook::auto_repair_enabled());
+
+        // Leave the library in its default ENABLED state for any later checks.
+        vmhook::set_auto_repair_enabled(true);
     }
 
     // --- for_each_loaded_class: no JVM -> visitor never invoked ----------

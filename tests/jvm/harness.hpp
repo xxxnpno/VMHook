@@ -47,6 +47,22 @@ namespace vmhook_test
         // (e.g. the MSVC __try path doesn't need it; __except unwinds the C++
         // frames normally on return, but calling reset() there is harmless).
         std::function<void()> reset;
+
+        // Enable/disable vmhook's background auto-repair watchdog.  Implemented
+        // by the driver (example.cpp) as vmhook::set_auto_repair_enabled(bool).
+        // run_all() calls set_auto_repair(false) ONCE at the very start so NO
+        // detached watchdog thread runs during the functional modules: the
+        // watchdog's asynchronous verify_hooks() (os::protect + i2i rewrite)
+        // racing a GC-time code-cache sweep/relocation is the uncontainable,
+        // off-suite-thread crash class the per-module __try cannot catch.  The
+        // functional modules don't need continuous auto-repair — ctx.reset()
+        // already clears hook state at each module boundary, and any module
+        // that specifically EXERCISES the watchdog re-enables it locally for the
+        // duration of its own (GC-quiet) test and disables it again at the end.
+        // harness.cpp deliberately does not include vmhook.hpp, so this crosses
+        // the boundary as a callback, exactly like reset.  Optional — run_all()
+        // no-ops if unset.
+        std::function<void(bool enabled)> set_auto_repair;
     };
 
     using module_fn = void (*)(context&);

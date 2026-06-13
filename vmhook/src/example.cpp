@@ -3350,6 +3350,13 @@ static auto run_test_suite() -> void
             // REVERSIBLE (it clears the shutdown/started latches at the end), so
             // the next module's hook<T>() installs a fully-live hook again.
             ctx.reset = [] { vmhook::shutdown_hooks(); };
+            // Run-time master switch for vmhook's background auto-repair
+            // watchdog.  run_all() flips this OFF before the module loop so the
+            // detached watchdog thread cannot race a GC-time code-cache sweep
+            // (the off-suite-thread crash the per-module __try can't contain);
+            // the hook_verify_repair / watchdog-exercising modules toggle it
+            // back on locally for their own GC-quiet test.
+            ctx.set_auto_repair = [](bool enabled) { vmhook::set_auto_repair_enabled(enabled); };
             const std::size_t modules_ran{ vmhook_test::run_all(ctx) };
             write_result("[INFO] ran " + std::to_string(modules_ran) + " modular JVM test module(s).");
             // Closes the verification gap: a green CI must mean the modular

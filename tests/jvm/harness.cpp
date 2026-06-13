@@ -253,6 +253,26 @@ namespace vmhook_test
 
     auto run_all(context& ctx) -> std::size_t
     {
+        // DISABLE the background auto-repair watchdog for the ENTIRE functional
+        // suite — the decisive cure for the persistent hook+GC crashes.  Even
+        // with every watchdog read fault-proofed (os::safe_read) and every write
+        // guarded (os::safe_write/os::protect), the watchdog REPAIRING — toggling
+        // page protection and rewriting an i2i stub — while the JVM is mid
+        // code-cache sweep/relocation during a GC can corrupt JVM state
+        // uncontainably.  That happens on the watchdog's OWN detached thread,
+        // OFF the suite thread, so the per-module SEH/__try container can never
+        // catch it (NO-TOTAL crashes on specific msvc JDK cells).  The
+        // functional modules don't need continuous auto-repair: ctx.reset()
+        // clears hook state at each module boundary, and any module that
+        // specifically exercises the watchdog re-enables it locally for its own
+        // GC-quiet test and disables it again before returning.  Done ONCE here,
+        // before the module loop, so no watchdog runs during the GC-heavy
+        // modules.  No-op if the driver didn't wire the callback.
+        if (ctx.set_auto_repair)
+        {
+            ctx.set_auto_repair(false);
+        }
+
         // Order by ascending priority so a `priority::first` module (the warm-up)
         // runs before every ordinary module and a `priority::last` module runs
         // after them, REGARDLESS of static-initializer / link order (which the

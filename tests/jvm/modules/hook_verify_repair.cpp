@@ -419,6 +419,18 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
 {
     vmhook::register_class<hvr_fixture>(FIXTURE_CLASS);
 
+    // The functional suite runs with vmhook's background auto-repair watchdog
+    // DISABLED (run_all() flips it off before the module loop) so no detached
+    // thread can race a GC-time code-cache sweep on the GC-heavy modules.  This
+    // module, however, is the ONE place that deliberately EXERCISES that
+    // watchdog (scenario 4 proves it autonomously re-arms a drifted hook), so it
+    // re-enables auto-repair for the duration of its own — GC-quiet — test and
+    // disables it again at the end (see the FINAL CLEANUP block).  Enabling here
+    // is what lets ensure_started() spawn the watchdog on this module's first
+    // hook<T>() install; scenarios 1-3 & 5 drive verify_hooks() SYNCHRONOUSLY and
+    // are indifferent to it, while scenario 4 needs the live background thread.
+    vmhook::set_auto_repair_enabled(true);
+
     // A clean baseline: nothing should be armed when we start.  verify_hooks()
     // on an empty hook set is a safe no-op that reports 0 repairs.
     {
@@ -1016,4 +1028,15 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
     vmhook::shutdown_hooks();
     ctx.check("module_left_clean_final_verify_zero", vmhook::verify_hooks() == 0);
     ctx.check("module_left_clean_final_shutdown", true);
+
+    // Restore the suite-wide invariant: the background watchdog is OFF for every
+    // OTHER module.  We re-enabled it at this module's start to test it in
+    // isolation; now turn it back off so no detached watchdog survives into the
+    // GC-heavy modules that run after us.  shutdown_hooks() above already stopped
+    // the live thread (it raises the shutdown flag and joins the watchdog), but
+    // it leaves the run-time ENABLE flag set — so this call is what actually
+    // re-establishes the off state run_all() set before the module loop.  Passing
+    // false also stops any watchdog still live as a belt-and-braces measure.
+    vmhook::set_auto_repair_enabled(false);
+    ctx.check("module_left_auto_repair_disabled", !vmhook::auto_repair_enabled());
 }

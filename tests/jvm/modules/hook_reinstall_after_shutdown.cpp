@@ -332,6 +332,19 @@ namespace
     {
         vmhook::register_class<hr_fixture>(FIXTURE_CLASS);
 
+        // The functional suite runs with vmhook's background auto-repair watchdog
+        // DISABLED (run_all() flips it off before the module loop) so no detached
+        // thread can race a GC-time code-cache sweep.  THIS module, however, is a
+        // white-box proof of the watchdog's spawn/teardown/respawn lifecycle:
+        // section 1 below HARD-asserts detail::auto_repair::g_started flips true on
+        // install, false on shutdown, and true again on reinstall — which only
+        // holds when ensure_started() is actually allowed to spawn the thread.
+        // Re-enable auto-repair for the duration of this (GC-quiet) module so the
+        // g_started lifecycle is genuine; the FINAL CLEANUP in the wrapper turns it
+        // back OFF (unconditionally, even if this body returns early or throws) so
+        // no watchdog survives into the modules that run after us.
+        vmhook::set_auto_repair_enabled(true);
+
         // =====================================================================
         //  ENTRY GUARD.  If HookReinstall is not loaded/resolvable, every
         //  static_field()->set/get below would deref a disengaged optional.  Bail
@@ -842,6 +855,15 @@ VMHOOK_JVM_MODULE_PRIORITY(hook_reinstall_after_shutdown, vmhook_test::priority:
     // A leaked armed hook is exactly what cascaded into later modules in Wave 3;
     // this module cannot leak one on ANY path.
     vmhook::shutdown_hooks();
+
+    // Restore the suite-wide invariant: background watchdog OFF for every other
+    // module.  We re-enabled it at the top of the body to make section 1's
+    // g_started lifecycle genuine; turn it back off here, OUTSIDE the try, so it
+    // runs on EVERY exit path (early return, throw, or normal completion).
+    // shutdown_hooks() above already stopped any live thread; this re-establishes
+    // the off state run_all() set before the module loop (and stops a stray
+    // watchdog belt-and-braces).
+    vmhook::set_auto_repair_enabled(false);
 
     if (body_threw)
     {

@@ -10562,8 +10562,11 @@ namespace vmhook
     // nmethod - "everything worked, then after an hour it stopped".
     //
     // Controls:
-    //   VMHOOK_DISABLE_AUTO_REPAIR        — define to opt out entirely.
+    //   VMHOOK_DISABLE_AUTO_REPAIR        — compile-time: define to opt out entirely.
     //   VMHOOK_AUTO_REPAIR_INTERVAL_MS    — repair-pass interval (default 1000ms).
+    //   vmhook::set_auto_repair_enabled() — run-time: enable/disable the watchdog.
+    //                                        Disabling while it is already running
+    //                                        stops the live thread (see below).
     //
     // Lifetime: the thread is detached after spawning so the std::thread
     // destructor never calls terminate() at program exit even if the
@@ -10578,6 +10581,15 @@ namespace vmhook
         inline std::atomic<bool>        g_watchdog_running{ false };
         inline std::mutex               g_cv_mutex{};
         inline std::condition_variable  g_cv{};
+
+        // Run-time master switch for the background watchdog.  Default TRUE so
+        // production behaviour is unchanged: the first successful hook<T>()
+        // spawns the watchdog as before.  Flipping this to FALSE makes
+        // ensure_started() a no-op (no thread is spawned on future installs);
+        // vmhook::set_auto_repair_enabled(false) additionally stops a watchdog
+        // that is already live.  Synchronous vmhook::verify_hooks() is wholly
+        // unaffected by this flag — only the detached self-healing thread is.
+        inline std::atomic<bool>        g_auto_repair_enabled{ true };
 
         static auto worker_loop() noexcept -> void
         {
@@ -10632,6 +10644,14 @@ namespace vmhook
         static auto ensure_started() noexcept -> void
         {
 #ifndef VMHOOK_DISABLE_AUTO_REPAIR
+            // Run-time opt-out.  Checked BEFORE the g_started CAS so the CAS
+            // token is not consumed while disabled — a later
+            // set_auto_repair_enabled(true) followed by a fresh install can
+            // then still spawn the watchdog (g_started is untouched here).
+            if (!g_auto_repair_enabled.load(std::memory_order_acquire))
+            {
+                return;
+            }
             bool expected{ false };
             if (!g_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
             {
@@ -10677,6 +10697,91 @@ namespace vmhook
             }
 #endif
         }
+    }
+
+    /*
+        @brief Reports whether the background auto-repair watchdog is currently
+               permitted to run.
+        @return true if the watchdog may be (or already is) spawned, false if it
+                has been disabled via set_auto_repair_enabled(false).
+        @details Reflects only the run-time master switch — it does NOT report
+                 whether a watchdog thread is live at this instant.  Compiling
+                 with VMHOOK_DISABLE_AUTO_REPAIR removes the watchdog entirely
+                 regardless of this flag.
+    */
+    inline auto auto_repair_enabled() noexcept -> bool
+    {
+        return vmhook::detail::auto_repair::g_auto_repair_enabled.load(std::memory_order_acquire);
+    }
+
+    /*
+        @brief Enables or disables the background auto-repair watchdog at run time.
+        @param enabled true (the default state) to allow the watchdog to be
+                       spawned by the next successful hook<T>(); false to suppress
+                       it AND stop a watchdog that is already running.
+        @details
+        The watchdog is a self-healing background thread (one detached thread per
+        process) that periodically calls verify_hooks() to repair JIT-state drift
+        before users notice their hooks have silently stopped firing.  It is on by
+        default — production behaviour is unchanged unless you call this.
+
+        Disable it when continuous, asynchronous re-arming is undesirable — e.g.
+        a host that performs aggressive code-cache sweeps / relocations during GC,
+        where having a second thread rewrite an i2i stub or toggle page protection
+        concurrently with a JVM safepoint is a hazard.  With the watchdog off you
+        can still drive recovery yourself by calling verify_hooks() synchronously
+        from your own loop on a cadence you control; that path is unaffected by
+        this flag.
+
+        When called with false while a watchdog is live, this raises the shutdown
+        flag, wakes the watchdog (notify_shutdown()), waits for it to actually exit
+        (wait_for_exit()), then clears the shutdown flag and the started latch so
+        the library is left fully usable: existing hooks keep firing, synchronous
+        verify_hooks() keeps working, and a later set_auto_repair_enabled(true)
+        followed by a fresh install can spawn the watchdog again.
+
+        Thread-safety: safe to call from the driver/main thread.  Like the rest of
+        the teardown machinery it must NOT be called while holding
+        g_hooked_methods_mutex (the watchdog may be mid-verify_hooks() under it).
+        No-op if compiled with VMHOOK_DISABLE_AUTO_REPAIR.
+    */
+    inline auto set_auto_repair_enabled(const bool enabled) noexcept -> void
+    {
+#ifndef VMHOOK_DISABLE_AUTO_REPAIR
+        vmhook::detail::auto_repair::g_auto_repair_enabled.store(enabled, std::memory_order_release);
+
+        if (enabled)
+        {
+            // Re-enable only flips the gate.  ensure_started() spawns the
+            // watchdog on the next successful hook<T>(); we deliberately do
+            // not spawn here so this is callable before any install.
+            return;
+        }
+
+        // Disabling: stop a watchdog that is already live.  Mirror the
+        // watchdog half of shutdown_hooks() so the live thread observes the
+        // shutdown flag, exits, and we then restore a clean, reusable state.
+        if (!vmhook::detail::auto_repair::g_watchdog_running.load(std::memory_order_acquire))
+        {
+            // No live thread; clearing g_started lets a future re-enable+install
+            // spawn a fresh one without leaking the started latch.
+            vmhook::detail::auto_repair::g_started.store(false, std::memory_order_release);
+            return;
+        }
+
+        vmhook::hotspot::g_shutdown_requested.store(true, std::memory_order_release);
+        vmhook::detail::auto_repair::notify_shutdown();
+        vmhook::detail::auto_repair::wait_for_exit();
+
+        // Restore the library to a fully usable state: hooks keep firing
+        // (common_detour no longer early-outs) and a later re-enable can
+        // spawn a new watchdog.  This is the same reversibility contract
+        // shutdown_hooks() establishes for the watchdog latches.
+        vmhook::detail::auto_repair::g_started.store(false, std::memory_order_release);
+        vmhook::hotspot::g_shutdown_requested.store(false, std::memory_order_release);
+#else
+        (void)enabled;
+#endif
     }
 
     // Forward declaration of the watcher-latch reset helper.  shutdown_hooks()
