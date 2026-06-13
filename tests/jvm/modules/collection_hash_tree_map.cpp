@@ -1,150 +1,78 @@
 // collection_hash_tree_map JVM test module  (feature area: collections)
 //
-// THE authority for vmhook's two HotSpot Map INTERNAL-STRUCTURE walkers,
-// decoded straight from a raw OOP with NO Java call-gate dispatch per entry:
+// THE Map-walker authority for the two HotSpot container layouts vmhook decodes
+// from a raw OOP without a single Java call-gate dispatch:
 //
-//   hash_map_walk_entries<K,V>  vmhook.hpp  — the HashMap "table" Node[] BUCKET
-//                                             walk: per bucket, follow the
-//                                             key/value/next chain.  A bucket
-//                                             head is a HashMap$Node (a LINKED
-//                                             bin) or, once it exceeds the
-//                                             treeify threshold (8 colliding
-//                                             keys), a HashMap$TreeNode (a
-//                                             red-black TREE bin).  TreeNode
-//                                             keeps the Node.next threading, so
-//                                             the SAME next-chain walk visits
-//                                             both shapes.
-//   tree_map_walk_entries<K,V>  vmhook.hpp  — the TreeMap "root" red-black
-//                                             IN-ORDER walk reading
-//                                             key/value/left/right per node.
+//   * java.util.HashMap   -> the "table" Node[] BUCKET walk, reached through the
+//                            EXPLICIT vmhook::hash_map wrapper (the typed
+//                            intent-declaring path:
+//                            `std::unique_ptr<vmhook::hash_map> = proxy->get()`),
+//                            and cross-checked through value_t::to_entries.
+//   * java.util.TreeMap   -> the "root" red-black IN-ORDER walk, reached through
+//                            the generic vmhook::map wrapper.  The fixture inserts
+//                            the keys OUT OF NATURAL ORDER (t2,t0,t1) so a correct
+//                            in-order traversal proving itself is non-trivial.
 //
-// COVERAGE (every internal-structure angle, all on real heap objects):
-//   HashMap sizes 0 / 1 / 8 / 9 / 16 / 17 / 64 / 1000 — straddling the default
-//     capacity (16, threshold 12) so the bucket walk is proven across the
-//     12->32 resize boundary and at mid scale.
-//   HashMap collision chain (7 colliding keys, below treeify) — one bucket, a
-//     plain Node.next chain; the walk follows next.
-//   HashMap TREE bin (>=12 colliding keys) — one bucket that TREEIFIES to a
-//     red-black TreeNode bin; the next-chain walk must still surface every entry
-//     (proves the linked-bin AND tree-bin cases both decode).
-//   HashMap resize boundary (exactly 13 entries) — one past threshold 12, the
-//     table has rehashed 16->32; every key survives.
-//   Key/value type matrix: String->String, Integer->Integer, String->Long
-//     (values > 2^32 so a truncating read is caught), enum->String, a null KEY,
-//     and a null VALUE (both legal in HashMap; surface as nullptr entries).
-//   TreeMap sizes 0 / 1 / 8 / 64 / 1000 — the iterative red-black in-order walk
-//     across a trivial root, small, and deep tree; strict ascending key order.
-//   TreeMap inserted DESCENDING / SCRAMBLED — the in-order walk re-sorts (it
-//     does not echo insertion order).
-//   TreeMap with a null VALUE, and an Integer-keyed tree (natural numeric order).
+// This is the live-JVM successor to the legacy Example.test_hash_map_probe /
+// Example.test_tree_map_probe pair (vmhook/src/example.cpp).  The maps are
+// HashMap<String,String> / TreeMap<String,String>, so BOTH the key and value
+// OOPs decode directly through vmhook::read_java_string and the module asserts
+// exact value CONTENT, not just identity.
 //
-// CROSS-TOOLCHAIN HARDENING (Java 8-26 x 5 toolchains; win-clang/mingw NO-SEH):
-//   * The size oracle (decoded count == Java size() AND <= Java size()) and
-//     every-entry-present (no miss / no duplicate, all OOPs distinct => no
-//     chain cycle / over-read) are UNIVERSAL HARD assertions on every shape.
-//   * Per-entry VALUE-CONTENT decode is PASS-or-[INFO]: a correct structural
-//     walk whose value bytes do not match is the documented compressed-oops-
-//     DISABLED regime (every field read assumes a 4-byte narrow oop), so it is
-//     recorded [INFO], never a FAIL, on the exotic-heap toolchains.  On the
-//     default-heap CI JVMs (compression on) it always PASSES.
-//   * The chain/tree walk can NEVER cycle or overrun: distinct-OOP + count<=size
-//     are HARD; a corrupt-heap cycle is bounded in the library (see the
-//     tree_map_walk left-spine cap fix shipped with this change).
-//
-// SUITE-SAFETY (mirrors collection_map.cpp / collection_set_exhaustive.cpp):
-//   the whole body runs under a try/catch (a throw is recorded [INFO], never a
-//   FAIL); an entry guard bails to [INFO] if the fixture class is not loaded so
-//   no unguarded static_field deref can fault; this is a reads-only feature with
-//   NO hooks, but an UNCONDITIONAL `if (ctx.reset) ctx.reset();` followed by
-//   vmhook::shutdown_hooks() runs OUTSIDE the try on EVERY exit path so the
-//   module leaves ZERO hooks armed regardless.  Every key/value OOP deref is
-//   gated by is_valid_pointer; all value_t extractions are COPY-INIT (never
-//   brace-init) to stay MSVC-unambiguous.  Distinct `htm_` check-name prefix.
+// What this module proves on a live JVM (Java 8/11/17/21/24/25 x MSVC/Clang/GCC):
+//   * hash_map::size() and map::size() == 3 for both maps (Java size() via the
+//     live OOP's klass), matching Java's own published size() witness.
+//   * hash_map::to_entries<K,V>() returns all 3 HashMap (key,value) pairs with
+//     correct values, ORDER-INDEPENDENT (HashMap iteration is bucket order):
+//     h0->hash-zero, h1->hash-one, h2->hash-two.
+//   * map::to_entries<K,V>() over the TreeMap returns the 3 entries in NATURAL
+//     SORTED key order t0 < t1 < t2 (proving the red-black in-order walk
+//     re-sorted the out-of-order insertion), each with the correct value.
+//   * value_t::to_entries (the implicit field-proxy path) and the explicit
+//     wrapper path agree for the HashMap.
+//   * the TreeMap first/last keys the native walk yields match Java's
+//     firstKey()/lastKey().
 //
 // CHARACTERIZED ([INFO], not a failure): vmhook routes BOTH containers through
 // the SAME vmhook::map::to_entries (HashMap "table" path, then TreeMap "root"
 // path); vmhook::hash_map adds NO distinct hash-specific traversal — it is a
-// typed intent tag whose to_entries IS map::to_entries.
+// pure intent tag whose to_entries IS map::to_entries.  The contents/ordering
+// assertions below hold regardless.
+//
+// SAFETY: there are no hooks in this feature (only reads), so there is nothing
+// to tear down.  Every key/value OOP is gated with is_valid_pointer before any
+// deref.  All value_t extractions are COPY-INIT (never brace-init) to stay
+// MSVC-unambiguous, and every static accessor goes through static_field /
+// static_method (the portable GCC path).
+//
+// Harness shape mirrors field_static: register_class, a `mode` selector with a
+// `done` reset on the rising edge of go, and a dense battery of ctx.check()s.
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace
 {
-    constexpr char FIXTURE[]{ "vmhook/fixtures/HashTreeMap" };
+    // Key/value wrapper for the Map entries.  Plain vmhook::object<> — the entry
+    // OOPs are java.lang.String, decoded via read_java_string(get_instance()).
+    using str_oop = vmhook::object<>;
 
-    // ── String key/value wrapper: java.lang.String. ─────────────────────────
-    class str_oop : public vmhook::object<str_oop>
-    {
-    public:
-        explicit str_oop(vmhook::oop_t instance) noexcept
-            : vmhook::object<str_oop>{ instance }
-        {
-        }
+    // The vector type both walk paths return.
+    using entries_t = std::vector<std::pair<std::unique_ptr<str_oop>, std::unique_ptr<str_oop>>>;
 
-        auto text() const -> std::string
-        {
-            return vmhook::read_java_string(get_instance());
-        }
-    };
-
-    // ── Boxed-primitive wrapper: java.lang.Integer. ─────────────────────────
-    class integer_box : public vmhook::object<integer_box>
-    {
-    public:
-        explicit integer_box(vmhook::oop_t instance) noexcept
-            : vmhook::object<integer_box>{ instance }
-        {
-        }
-
-        auto value() const -> std::int32_t
-        {
-            return static_cast<std::int32_t>(get_field("value")->get());
-        }
-    };
-
-    // ── Boxed-primitive wrapper: java.lang.Long (64-bit value). ─────────────
-    class long_box : public vmhook::object<long_box>
-    {
-    public:
-        explicit long_box(vmhook::oop_t instance) noexcept
-            : vmhook::object<long_box>{ instance }
-        {
-        }
-
-        auto value() const -> std::int64_t
-        {
-            return static_cast<std::int64_t>(get_field("value")->get());
-        }
-    };
-
-    // ── Enum-key wrapper: java.lang.Enum (name/ordinal on the superclass). ──
-    class enum_key : public vmhook::object<enum_key>
-    {
-    public:
-        explicit enum_key(vmhook::oop_t instance) noexcept
-            : vmhook::object<enum_key>{ instance }
-        {
-        }
-
-        auto name() const -> std::string { return get_field("name")->get(); }
-
-        auto ordinal() const -> std::int32_t
-        {
-            return static_cast<std::int32_t>(get_field("ordinal")->get());
-        }
-    };
-
-    // ── Fixture wrapper: vmhook.fixtures.HashTreeMap. ───────────────────────
+    // Wrapper for vmhook.fixtures.HashTreeMap.
+    //
+    // EVERY accessor here is a STATIC method reaching the field through
+    // static_field(...) / static_method(...): the portable path that also
+    // compiles on GCC (the deducing-this get_field overloads are non-viable from
+    // a static context there).
     class htm : public vmhook::object<htm>
     {
     public:
@@ -153,85 +81,64 @@ namespace
         {
         }
 
-        static auto set_go(bool value) -> void       { static_field("go")->set(value); }
-        static auto set_done(bool value) -> void      { static_field("done")->set(value); }
-        static auto get_done() -> bool                { return static_field("done")->get(); }
-        static auto set_mode(std::int32_t m) -> void  { static_field("mode")->set(m); }
+        // ---- handshake + scenario selector (all via static_field) ----
+        static auto set_go(bool value) -> void      { static_field("go")->set(value); }
+        static auto set_done(bool value) -> void     { static_field("done")->set(value); }
+        static auto get_done() -> bool               { return static_field("done")->get(); }
+        static auto set_mode(std::int32_t m) -> void { static_field("mode")->set(m); }
 
+        // ---- resolve helper ----
         static auto resolves(const char* name) -> bool
         {
             return static_field(name).has_value();
         }
 
-        // The HashMap via the EXPLICIT vmhook::hash_map wrapper (typed intent).
-        static auto acquire_hash_map(const char* field) -> std::unique_ptr<vmhook::hash_map>
-        {
-            const auto p{ static_field(field) };
-            if (!p.has_value())
-            {
-                return nullptr;
-            }
-            return p->get();
-        }
+        // ---- Java's own published witnesses ----
+        static auto java_hash_size() -> std::int32_t { return static_field("hashMapSize")->get(); }
+        static auto java_tree_size() -> std::int32_t { return static_field("treeMapSize")->get(); }
+        static auto java_tree_first_key() -> std::string { return static_field("treeFirstKey")->get().as_string(); }
+        static auto java_tree_last_key() -> std::string { return static_field("treeLastKey")->get().as_string(); }
 
-        // The generic vmhook::map wrapper (used for the TreeMaps).
-        static auto acquire_map(const char* field) -> std::unique_ptr<vmhook::map>
-        {
-            const auto p{ static_field(field) };
-            if (!p.has_value())
-            {
-                return nullptr;
-            }
-            return p->get();
-        }
+        // ---- the HashMap via the EXPLICIT vmhook::hash_map wrapper ----
+        // value_t -> unique_ptr<hash_map> is the typed intent-declaring path the
+        // legacy test_hash_map_probe used (get<unique_ptr<hash_map>>()).
+        static auto acquire_hash_map() -> std::unique_ptr<vmhook::hash_map> { return static_field("hashMap")->get(); }
 
-        // Decode a named static Map field to entries via the IMPLICIT field-proxy
-        // value_t::to_entries path.  Empty when the field is unresolved.
-        template<typename key_type, typename value_type>
-        static auto entries_of(const char* field)
-            -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<value_type>>>
-        {
-            const auto p{ static_field(field) };
-            if (!p.has_value())
-            {
-                return {};
-            }
-            return p->get().to_entries<key_type, value_type>();
-        }
+        // ---- the TreeMap via the generic vmhook::map wrapper ----
+        static auto acquire_tree_map() -> std::unique_ptr<vmhook::map> { return static_field("treeMap")->get(); }
 
-        static auto j_size(const char* f) -> std::int32_t { return static_field(f)->get(); }
-        static auto j_long(const char* f) -> std::int64_t { return static_field(f)->get(); }
-        static auto j_string(const char* f) -> std::string { return static_field(f)->get().as_string(); }
-        static auto j_bool(const char* f) -> bool { return static_field(f)->get(); }
-        static auto j_int(const char* f) -> std::int32_t { return static_field(f)->get(); }
+        // ---- the HashMap via the IMPLICIT value_t::to_entries path ----
+        // The cross-check that the field-proxy convenience path agrees with the
+        // explicit wrapper.  to_entries returns the unique_ptr-pair vector.
+        static auto hash_entries_via_value_t() -> entries_t
+        {
+            const auto p{ static_field("hashMap") };
+            if (!p.has_value()) { return entries_t{}; }
+            return p->get().to_entries<str_oop, str_oop>();
+        }
     };
 
-    // ── Fixture-mirrored constants (lockstep with HashTreeMap.java). ─────────
-    constexpr std::int32_t N1{ 1 };
-    constexpr std::int32_t N8{ 8 };
-    constexpr std::int32_t N9{ 9 };
-    constexpr std::int32_t N16{ 16 };
-    constexpr std::int32_t N17{ 17 };
-    constexpr std::int32_t N64{ 64 };
-    constexpr std::int32_t N1000{ 1000 };
-    constexpr std::int32_t COLL7{ 7 };
-    constexpr std::int32_t TREE_BIN{ 12 };
-    constexpr std::int32_t RESIZE13{ 13 };
-
-    auto code_unit_sum(const std::string& s) -> std::int64_t
+    // Decode an entry-side String wrapper to std::string, gating the deref with
+    // is_valid_pointer (SAFETY).  A null/invalid OOP yields the sentinel so a
+    // missing entry can never masquerade as a real value.
+    auto decode_entry(const std::unique_ptr<str_oop>& w) -> std::string
     {
-        std::int64_t sum{ 0 };
-        for (const unsigned char c : s) { sum += c; }
-        return sum;
+        if (!w)
+        {
+            return std::string{ "<<null>>" };
+        }
+        void* const oop{ w->get_instance() };
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+        {
+            return std::string{ "<<invalid>>" };
+        }
+        return vmhook::read_java_string(oop);
     }
 
-    // Drive one probe cycle for `mode`.
+    // Drive one probe cycle for `mode`: clears the latched `done` and programs
+    // the selector on the rising edge of go, then waits for done.
     auto drive(vmhook_test::context& ctx, std::int32_t mode) -> bool
     {
-        if (!ctx.run_probe)
-        {
-            return false;
-        }
         return ctx.run_probe(
             [mode](bool value)
             {
@@ -244,731 +151,194 @@ namespace
             },
             []() { return htm::get_done(); });
     }
-
-    // A value-content assertion that is PASS-or-[INFO]: a structurally-correct
-    // walk whose decoded VALUE bytes don't match is the documented compressed-
-    // oops-DISABLED decode regime, recorded [INFO] (never a FAIL) so the exotic-
-    // heap toolchains stay green.  On the default-heap CI JVMs it PASSES.
-    auto soft_value_check(vmhook_test::context& ctx, const std::string& name, bool ok) -> void
-    {
-        if (ok)
-        {
-            ctx.check(name, true);
-        }
-        else
-        {
-            ctx.record("[INFO] " + name + ": structural walk OK but value-content decode "
-                       "mismatched -- treated as the compressed-oops-disabled regime "
-                       "(narrow-oop field reads); not a structural failure.");
-        }
-    }
-
-    // A generic HashMap String->String shape: count==size AND <=size (HARD), all
-    // OOPs distinct (HARD: no cycle / no over-read), every key "k0".."k{n-1}"
-    // present exactly once (HARD), and the value content "v"+i (PASS-or-[INFO]).
-    auto check_str_hash(vmhook_test::context& ctx, const char* tag,
-                        const char* field, const char* size_field, std::int32_t n) -> void
-    {
-        const std::string t{ tag };
-        const auto e{ htm::entries_of<str_oop, str_oop>(field) };
-        const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-        const std::int32_t java_size{ htm::j_size(size_field) };
-
-        ctx.check(t + "_count_matches_java_size", decoded == java_size);
-        ctx.check(t + "_count_never_over_reads", decoded <= java_size);
-        ctx.check(t + "_count_is_expected", decoded == n);
-
-        std::unordered_set<const void*> oops;
-        std::unordered_set<std::string> keys;
-        oops.reserve(static_cast<std::size_t>(decoded) * 2 + 1);
-        keys.reserve(static_cast<std::size_t>(decoded) * 2 + 1);
-        std::int32_t null_keys{ 0 }, null_values{ 0 };
-        bool values_ok{ true };
-        for (const auto& kv : e)
-        {
-            if (!kv.first) { ++null_keys; continue; }
-            void* const koop{ kv.first->get_instance() };
-            if (koop && vmhook::hotspot::is_valid_pointer(koop)) { oops.insert(koop); }
-            const std::string key{ kv.first->text() };
-            keys.insert(key);
-            if (!kv.second) { ++null_values; continue; }
-            // Recipe: key "k"+i pairs with value "v"+i (same trailing digits).
-            if (key.size() < 1 || key.front() != 'k') { values_ok = false; continue; }
-            const std::string idx{ key.substr(1) };
-            if (kv.second->text() != ("v" + idx)) { values_ok = false; }
-        }
-        ctx.check(t + "_no_null_keys", null_keys == 0);
-        ctx.check(t + "_no_null_values", null_values == 0);
-        ctx.check(t + "_all_oops_distinct_no_cycle",
-                  oops.size() == static_cast<std::size_t>(decoded));
-        // Every k0..k{n-1} present exactly once (membership complete, no dup).
-        bool all_present{ keys.size() == static_cast<std::size_t>(n) };
-        for (std::int32_t i{ 0 }; i < n && all_present; ++i)
-        {
-            if (keys.find("k" + std::to_string(i)) == keys.end()) { all_present = false; }
-        }
-        ctx.check(t + "_every_key_present_no_dup", all_present);
-        soft_value_check(ctx, t + "_values_correct", values_ok);
-    }
-
-    // A generic TreeMap String->String shape: count oracle + distinct OOPs HARD,
-    // strict ascending key order HARD (the in-order walk's defining contract),
-    // value content PASS-or-[INFO], and first/last cross-checked vs Java.
-    auto check_str_tree(vmhook_test::context& ctx, const char* tag, const char* field,
-                        const char* size_field, std::int32_t n,
-                        const char* first_field, const char* last_field) -> void
-    {
-        const std::string t{ tag };
-        const auto e{ htm::entries_of<str_oop, str_oop>(field) };
-        const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-        const std::int32_t java_size{ htm::j_size(size_field) };
-
-        ctx.check(t + "_count_matches_java_size", decoded == java_size);
-        ctx.check(t + "_count_never_over_reads", decoded <= java_size);
-        ctx.check(t + "_count_is_expected", decoded == n);
-
-        std::unordered_set<const void*> oops;
-        std::vector<std::string> keys;
-        keys.reserve(e.size());
-        std::int32_t null_keys{ 0 }, null_values{ 0 };
-        bool values_ok{ true };
-        for (const auto& kv : e)
-        {
-            if (!kv.first) { ++null_keys; keys.emplace_back(); continue; }
-            void* const koop{ kv.first->get_instance() };
-            if (koop && vmhook::hotspot::is_valid_pointer(koop)) { oops.insert(koop); }
-            const std::string key{ kv.first->text() };
-            keys.push_back(key);
-            if (!kv.second) { ++null_values; continue; }
-            if (key.size() < 1 || key.front() != 'k') { values_ok = false; continue; }
-            if (kv.second->text() != ("v" + key.substr(1))) { values_ok = false; }
-        }
-        ctx.check(t + "_no_null_keys", null_keys == 0);
-        ctx.check(t + "_no_null_values", null_values == 0);
-        ctx.check(t + "_all_oops_distinct_no_cycle",
-                  oops.size() == static_cast<std::size_t>(decoded));
-        ctx.check(t + "_keys_strictly_ascending",
-                  std::is_sorted(keys.begin(), keys.end()));
-        if (!keys.empty())
-        {
-            ctx.check(t + "_first_matches_java", keys.front() == htm::j_string(first_field));
-            ctx.check(t + "_last_matches_java", keys.back() == htm::j_string(last_field));
-        }
-        soft_value_check(ctx, t + "_values_correct", values_ok);
-    }
-
-    auto run_checks(vmhook_test::context& ctx) -> void
-    {
-        // ─── ENTRY GUARD ────────────────────────────────────────────────────
-        if (vmhook::find_class(FIXTURE) == nullptr)
-        {
-            ctx.record("[INFO] collection_hash_tree_map: HashTreeMap not loaded/resolvable "
-                       "on this run; skipping the module's live checks (no crash, no hooks).");
-            return;
-        }
-
-        vmhook::register_class<htm>(FIXTURE);
-        vmhook::register_class<str_oop>("java/lang/String");
-        vmhook::register_class<integer_box>("java/lang/Integer");
-        vmhook::register_class<long_box>("java/lang/Long");
-        vmhook::register_class<enum_key>("java/lang/Enum");
-
-        // =====================================================================
-        //  0. Resolution / shape.
-        // =====================================================================
-        ctx.check("htm_class_registered_hashMap_resolves", htm::resolves("hashMap"));
-        ctx.check("htm_treeMap_field_resolves", htm::resolves("treeMap"));
-        {
-            const auto p{ htm::static_field("hashMap") };
-            if (p)
-            {
-                ctx.check("htm_hashMap_proxy_is_static_true", p->is_static() == true);
-                ctx.check("htm_hashMap_proxy_signature_is_ref",
-                          !std::string{ p->signature() }.empty()
-                              && std::string{ p->signature() }.front() == 'L');
-            }
-        }
-
-        // =====================================================================
-        //  1. [INFO] routing characterization — hash_map and map share to_entries.
-        // =====================================================================
-        ctx.record("[INFO] collection_hash_tree_map: vmhook routes BOTH HashMap and TreeMap "
-                   "through the same vmhook::map::to_entries (HashMap \"table\" bucket walk, "
-                   "then TreeMap \"root\" red-black walk); vmhook::hash_map adds no hash-"
-                   "specific traversal -- it is a typed intent tag whose to_entries IS "
-                   "map::to_entries.  size()==count and entry presence are asserted regardless.");
-
-        // =====================================================================
-        //  2. Build + Java witnesses (drive mode 0 for a fresh same-thread snapshot).
-        // =====================================================================
-        ctx.check("htm_build_probe_completed", drive(ctx, 0));
-        ctx.check("htm_java_hashMapSize_is_3", htm::j_size("hashMapSize") == 3);
-        ctx.check("htm_java_treeMapSize_is_3", htm::j_size("treeMapSize") == 3);
-        ctx.check("htm_java_treeFirstKey_is_t0", htm::j_string("treeFirstKey") == "t0");
-        ctx.check("htm_java_treeLastKey_is_t2", htm::j_string("treeLastKey") == "t2");
-
-        // =====================================================================
-        //  3. LEGACY HashMap via the EXPLICIT vmhook::hash_map wrapper — size()==3,
-        //     is_empty()==false, exactly 3 pairs, order-independent value check.
-        // =====================================================================
-        {
-            const auto hm{ htm::acquire_hash_map("hashMap") };
-            ctx.check("htm_legacy_hash_map_wrapper_acquired", hm != nullptr);
-            if (hm)
-            {
-                ctx.check("htm_legacy_hash_map_size_is_3", hm->size() == 3);
-                ctx.check("htm_legacy_hash_map_not_empty", hm->is_empty() == false);
-
-                const auto e{ hm->to_entries<str_oop, str_oop>() };
-                ctx.check("htm_legacy_hash_map_entries_size_is_3",
-                          static_cast<std::int32_t>(e.size()) == 3);
-
-                std::array<bool, 3> seen{ false, false, false };
-                bool values_ok{ true };
-                bool keys_ok{ true };
-                for (const auto& kv : e)
-                {
-                    const std::string key{ kv.first ? kv.first->text() : std::string{} };
-                    const std::string val{ kv.second ? kv.second->text() : std::string{} };
-                    if      (key == "h0") { seen[0] = true; if (val != "hash-zero") { values_ok = false; } }
-                    else if (key == "h1") { seen[1] = true; if (val != "hash-one")  { values_ok = false; } }
-                    else if (key == "h2") { seen[2] = true; if (val != "hash-two")  { values_ok = false; } }
-                    else                  { keys_ok = false; }
-                }
-                ctx.check("htm_legacy_hash_map_all_keys_present", seen[0] && seen[1] && seen[2]);
-                ctx.check("htm_legacy_hash_map_no_unexpected_keys", keys_ok);
-                soft_value_check(ctx, "htm_legacy_hash_map_all_values_correct", values_ok);
-            }
-        }
-
-        // =====================================================================
-        //  4. LEGACY HashMap via the IMPLICIT value_t::to_entries path — must
-        //     AGREE with the explicit wrapper (same keys, same values).
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<str_oop, str_oop>("hashMap") };
-            ctx.check("htm_legacy_value_t_entries_size_is_3",
-                      static_cast<std::int32_t>(e.size()) == 3);
-            std::array<bool, 3> seen{ false, false, false };
-            bool pairs_ok{ true };
-            for (const auto& kv : e)
-            {
-                const std::string key{ kv.first ? kv.first->text() : std::string{} };
-                const std::string val{ kv.second ? kv.second->text() : std::string{} };
-                if      (key == "h0") { seen[0] = true; if (val != "hash-zero") { pairs_ok = false; } }
-                else if (key == "h1") { seen[1] = true; if (val != "hash-one")  { pairs_ok = false; } }
-                else if (key == "h2") { seen[2] = true; if (val != "hash-two")  { pairs_ok = false; } }
-                else                  { pairs_ok = false; }
-            }
-            ctx.check("htm_legacy_value_t_all_keys_present", seen[0] && seen[1] && seen[2]);
-            soft_value_check(ctx, "htm_legacy_value_t_path_agrees", pairs_ok);
-        }
-
-        // =====================================================================
-        //  5. LEGACY TreeMap via vmhook::map — size()==3, NATURAL SORTED order
-        //     t0<t1<t2 pinned positionally (proves the in-order re-sort).
-        // =====================================================================
-        {
-            const auto tm{ htm::acquire_map("treeMap") };
-            ctx.check("htm_legacy_tree_map_wrapper_acquired", tm != nullptr);
-            if (tm)
-            {
-                ctx.check("htm_legacy_tree_map_size_is_3", tm->size() == 3);
-                ctx.check("htm_legacy_tree_map_not_empty", tm->is_empty() == false);
-
-                const auto e{ tm->to_entries<str_oop, str_oop>() };
-                ctx.check("htm_legacy_tree_map_entries_size_is_3",
-                          static_cast<std::int32_t>(e.size()) == 3);
-
-                static constexpr std::array<const char*, 3> ek{ "t0", "t1", "t2" };
-                static constexpr std::array<const char*, 3> ev{ "tree-zero", "tree-one", "tree-two" };
-                bool order_ok{ true }, values_ok{ true };
-                std::array<bool, 3> seen{ false, false, false };
-                std::vector<std::string> keys;
-                for (std::size_t i{ 0 }; i < e.size(); ++i)
-                {
-                    const std::string key{ e[i].first ? e[i].first->text() : std::string{} };
-                    const std::string val{ e[i].second ? e[i].second->text() : std::string{} };
-                    keys.push_back(key);
-                    if      (key == "t0") { seen[0] = true; }
-                    else if (key == "t1") { seen[1] = true; }
-                    else if (key == "t2") { seen[2] = true; }
-                    if (i < ek.size())
-                    {
-                        if (key != ek[i]) { order_ok = false; }
-                        if (val != ev[i]) { values_ok = false; }
-                    }
-                }
-                ctx.check("htm_legacy_tree_map_all_keys_present", seen[0] && seen[1] && seen[2]);
-                ctx.check("htm_legacy_tree_map_keys_strictly_ascending",
-                          std::is_sorted(keys.begin(), keys.end()));
-                ctx.check("htm_legacy_tree_map_in_order_t0_t1_t2", order_ok);
-                soft_value_check(ctx, "htm_legacy_tree_map_values_in_order", values_ok);
-                if (e.size() == 3)
-                {
-                    const std::string first{ e.front().first ? e.front().first->text() : std::string{} };
-                    const std::string last{ e.back().first ? e.back().first->text() : std::string{} };
-                    ctx.check("htm_legacy_tree_native_first_matches_java",
-                              first == htm::j_string("treeFirstKey"));
-                    ctx.check("htm_legacy_tree_native_last_matches_java",
-                              last == htm::j_string("treeLastKey"));
-                }
-            }
-        }
-
-        // =====================================================================
-        //  6. HashMap SIZE SWEEP 0/1/8/9/16/17/64/1000 — the bucket walk across
-        //     the empty table, a single bucket, the default-cap span, the 12->32
-        //     resize, and mid scale.  count oracle + every-entry-present HARD.
-        // =====================================================================
-        {
-            const auto e0{ htm::entries_of<str_oop, str_oop>("hashEmpty") };
-            ctx.check("htm_hash_empty_is_empty", e0.empty());
-            ctx.check("htm_hash_empty_java_size_zero", htm::j_size("hashEmptySize") == 0);
-        }
-        check_str_hash(ctx, "htm_hash_one",      "hashOne",      "hashOneSize",      N1);
-        check_str_hash(ctx, "htm_hash_eight",    "hashEight",    "hashEightSize",    N8);
-        check_str_hash(ctx, "htm_hash_nine",     "hashNine",     "hashNineSize",     N9);
-        check_str_hash(ctx, "htm_hash_sixteen",  "hashSixteen",  "hashSixteenSize",  N16);
-        check_str_hash(ctx, "htm_hash_seventeen","hashSeventeen","hashSeventeenSize",N17);
-        check_str_hash(ctx, "htm_hash_resize13", "hashResize13", "hashResize13Size", RESIZE13);
-        check_str_hash(ctx, "htm_hash_sixtyfour","hashSixtyFour","hashSixtyFourSize",N64);
-        check_str_hash(ctx, "htm_hash_thousand", "hashThousand", "hashThousandSize", N1000);
-
-        // Extra: 64 / 1000 key char-sum cross-check vs Java (PASS-or-[INFO]).
-        {
-            const auto e{ htm::entries_of<str_oop, str_oop>("hashSixtyFour") };
-            std::int64_t key_chars{ 0 };
-            for (const auto& kv : e) { if (kv.first) { key_chars += code_unit_sum(kv.first->text()); } }
-            soft_value_check(ctx, "htm_hash_sixtyfour_key_char_sum_matches_java",
-                             key_chars == htm::j_long("hashSixtyFourKeyCharSum"));
-        }
-        {
-            const auto e{ htm::entries_of<str_oop, str_oop>("hashThousand") };
-            std::int64_t key_chars{ 0 };
-            for (const auto& kv : e) { if (kv.first) { key_chars += code_unit_sum(kv.first->text()); } }
-            soft_value_check(ctx, "htm_hash_thousand_key_char_sum_matches_java",
-                             key_chars == htm::j_long("hashThousandKeyCharSum"));
-        }
-
-        // =====================================================================
-        //  7. HashMap COLLISION CHAIN (7 colliding keys, below treeify=8) — ONE
-        //     bucket, a plain Node.next chain.  The walk follows next; every
-        //     entry surfaces exactly once (HARD), the chain never cycles.
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<str_oop, str_oop>("hashColl7") };
-            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-            ctx.check("htm_coll7_count_matches_java_size", decoded == htm::j_size("hashColl7Size"));
-            ctx.check("htm_coll7_count_never_over_reads", decoded <= htm::j_size("hashColl7Size"));
-            ctx.check("htm_coll7_count_is_7", decoded == COLL7);
-
-            std::unordered_set<const void*> oops;
-            std::unordered_set<std::string> vals;
-            std::int32_t null_kv{ 0 };
-            for (const auto& kv : e)
-            {
-                if (!kv.first || !kv.second) { ++null_kv; continue; }
-                void* const koop{ kv.first->get_instance() };
-                if (koop && vmhook::hotspot::is_valid_pointer(koop)) { oops.insert(koop); }
-                vals.insert(kv.second->text());
-            }
-            ctx.check("htm_coll7_no_null_kv", null_kv == 0);
-            ctx.check("htm_coll7_all_oops_distinct_no_cycle",
-                      oops.size() == static_cast<std::size_t>(decoded));
-            // Values c0..c6, all present exactly once (PASS-or-[INFO]).
-            bool vals_ok{ vals.size() == static_cast<std::size_t>(COLL7) };
-            for (std::int32_t i{ 0 }; i < COLL7 && vals_ok; ++i)
-            {
-                if (vals.find("c" + std::to_string(i)) == vals.end()) { vals_ok = false; }
-            }
-            soft_value_check(ctx, "htm_coll7_all_values_present", vals_ok);
-            ctx.record(std::string{ "[INFO] htm_coll7: bucket treeified (Java best-effort) = " }
-                       + (htm::j_bool("hashColl7IsTree") ? "yes (unexpected)" : "no (plain Node chain)"));
-        }
-
-        // =====================================================================
-        //  8. HashMap TREE BIN (>=12 colliding keys => bucket TREEIFIES to a
-        //     red-black TreeNode bin).  TreeNode keeps Node.next, so the SAME
-        //     next-chain walk must surface every entry.  count + distinct HARD.
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<str_oop, str_oop>("hashTreeBin") };
-            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-            ctx.check("htm_treebin_count_matches_java_size", decoded == htm::j_size("hashTreeBinSize"));
-            ctx.check("htm_treebin_count_never_over_reads", decoded <= htm::j_size("hashTreeBinSize"));
-            ctx.check("htm_treebin_count_is_12", decoded == TREE_BIN);
-
-            std::unordered_set<const void*> oops;
-            std::unordered_set<std::string> vals;
-            std::int32_t null_kv{ 0 };
-            for (const auto& kv : e)
-            {
-                if (!kv.first || !kv.second) { ++null_kv; continue; }
-                void* const koop{ kv.first->get_instance() };
-                if (koop && vmhook::hotspot::is_valid_pointer(koop)) { oops.insert(koop); }
-                vals.insert(kv.second->text());
-            }
-            ctx.check("htm_treebin_no_null_kv", null_kv == 0);
-            ctx.check("htm_treebin_all_oops_distinct_no_cycle",
-                      oops.size() == static_cast<std::size_t>(decoded));
-            bool vals_ok{ vals.size() == static_cast<std::size_t>(TREE_BIN) };
-            for (std::int32_t i{ 0 }; i < TREE_BIN && vals_ok; ++i)
-            {
-                if (vals.find("t" + std::to_string(i)) == vals.end()) { vals_ok = false; }
-            }
-            soft_value_check(ctx, "htm_treebin_all_values_present", vals_ok);
-
-            const bool treeified{ htm::j_bool("hashTreeBinIsTree") };
-            ctx.record(std::string{ "[INFO] htm_treebin: bucket actually treeified to a TreeNode "
-                                    "bin (Java reflection, best-effort) = " }
-                       + (treeified ? "yes -- the TreeNode-via-next path was exercised"
-                                    : "no/unknown (reflection blocked); count proof still holds"));
-            if (treeified)
-            {
-                // If Java confirmed a TreeNode bin, the count proof above proves
-                // the next-chain walk returned every TreeNode entry.
-                ctx.check("htm_treebin_treenode_path_returned_all", decoded == TREE_BIN);
-            }
-        }
-
-        // =====================================================================
-        //  9. HashMap<Integer,Integer> — boxed-primitive KEY and VALUE.  Key i ->
-        //     value 100+i.  count oracle HARD; key/value sums PASS-or-[INFO].
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<integer_box, integer_box>("hashIntKey") };
-            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-            ctx.check("htm_intkey_count_matches_java_size", decoded == htm::j_size("hashIntKeySize"));
-            ctx.check("htm_intkey_count_never_over_reads", decoded <= htm::j_size("hashIntKeySize"));
-            ctx.check("htm_intkey_count_is_8", decoded == N8);
-
-            std::int64_t key_sum{ 0 }, val_sum{ 0 };
-            std::int32_t null_kv{ 0 };
-            bool pairs_ok{ true };
-            std::unordered_set<const void*> oops;
-            for (const auto& kv : e)
-            {
-                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
-                void* const koop{ kv.first->get_instance() };
-                if (koop && vmhook::hotspot::is_valid_pointer(koop)) { oops.insert(koop); }
-                const std::int32_t k{ kv.first->value() };
-                const std::int32_t v{ kv.second->value() };
-                key_sum += k;
-                val_sum += v;
-                if (v != (100 + k)) { pairs_ok = false; }
-            }
-            ctx.check("htm_intkey_no_null_kv", null_kv == 0);
-            ctx.check("htm_intkey_all_oops_distinct_no_cycle",
-                      oops.size() == static_cast<std::size_t>(decoded));
-            soft_value_check(ctx, "htm_intkey_pairs_consistent", pairs_ok);
-            soft_value_check(ctx, "htm_intkey_key_sum_matches_java",
-                             key_sum == htm::j_long("hashIntKeyKeySum"));
-            soft_value_check(ctx, "htm_intkey_val_sum_matches_java",
-                             val_sum == htm::j_long("hashIntKeyValSum"));
-        }
-
-        // =====================================================================
-        // 10. HashMap<String,Long> — 64-bit VALUE > 2^32 (a truncating read would
-        //     corrupt the sum).  count oracle HARD; value sum + high-word survival
-        //     PASS-or-[INFO].
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<str_oop, long_box>("hashLongVal") };
-            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-            ctx.check("htm_longval_count_matches_java_size", decoded == htm::j_size("hashLongValSize"));
-            ctx.check("htm_longval_count_never_over_reads", decoded <= htm::j_size("hashLongValSize"));
-            ctx.check("htm_longval_count_is_8", decoded == N8);
-
-            std::int64_t val_sum{ 0 };
-            std::int32_t null_kv{ 0 };
-            bool all_high{ true };
-            for (const auto& kv : e)
-            {
-                if (!kv.first || !kv.second) { ++null_kv; continue; }
-                const std::int64_t v{ kv.second->value() };
-                val_sum += v;
-                if (v <= 0x7FFF'FFFFLL) { all_high = false; }
-            }
-            ctx.check("htm_longval_no_null_kv", null_kv == 0);
-            soft_value_check(ctx, "htm_longval_high_word_survived", all_high);
-            soft_value_check(ctx, "htm_longval_val_sum_matches_java",
-                             val_sum == htm::j_long("hashLongValValSum"));
-        }
-
-        // =====================================================================
-        // 11. HashMap<Day,String> — ENUM KEYS in an ordinary HashMap (decodes
-        //     positively via java.lang.Enum.name/ordinal).  count HARD; content
-        //     PASS-or-[INFO].
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<enum_key, str_oop>("hashEnumKey") };
-            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-            ctx.check("htm_enumkey_count_matches_java_size", decoded == htm::j_size("hashEnumKeySize"));
-            ctx.check("htm_enumkey_count_never_over_reads", decoded <= htm::j_size("hashEnumKeySize"));
-            ctx.check("htm_enumkey_count_is_5", decoded == 5);
-
-            std::int64_t ord_sum{ 0 }, val_chars{ 0 };
-            std::int32_t null_kv{ 0 };
-            std::unordered_set<std::string> names;
-            bool pairs_ok{ true };
-            for (const auto& kv : e)
-            {
-                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
-                const std::int32_t ord{ kv.first->ordinal() };
-                const std::string nm{ kv.first->name() };
-                const std::string val{ kv.second->text() };
-                ord_sum += ord;
-                val_chars += code_unit_sum(val);
-                names.insert(nm);
-                // Recipe: enum d -> value "d"+ordinal.
-                if (val != ("d" + std::to_string(ord))) { pairs_ok = false; }
-            }
-            ctx.check("htm_enumkey_no_null_kv", null_kv == 0);
-            soft_value_check(ctx, "htm_enumkey_all_constants_present",
-                             names.count("MON") == 1 && names.count("FRI") == 1
-                                 && names.size() == 5);
-            soft_value_check(ctx, "htm_enumkey_pairs_consistent", pairs_ok);
-            soft_value_check(ctx, "htm_enumkey_ordinal_sum_matches_java",
-                             ord_sum == htm::j_long("hashEnumKeyOrdinalSum"));
-            soft_value_check(ctx, "htm_enumkey_val_char_sum_matches_java",
-                             val_chars == htm::j_long("hashEnumKeyValCharSum"));
-        }
-
-        // =====================================================================
-        // 12. HashMap null KEY (legal) — the walk surfaces a nullptr key whose
-        //     VALUE still decodes, plus the two real keys.  Sentinel != miss.
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<str_oop, str_oop>("hashNullKey") };
-            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-            ctx.check("htm_nullkey_count_matches_java_size", decoded == htm::j_size("hashNullKeySize"));
-            ctx.check("htm_nullkey_count_is_3", decoded == 3);
-
-            std::int32_t null_keys{ 0 };
-            bool null_key_value_ok{ false };
-            bool saw_a{ false }, saw_b{ false };
-            for (const auto& kv : e)
-            {
-                if (!kv.first)
-                {
-                    ++null_keys;
-                    null_key_value_ok = (kv.second != nullptr && kv.second->text() == "null-val");
-                    continue;
-                }
-                const std::string key{ kv.first->text() };
-                if (key == "a" && kv.second && kv.second->text() == "va") { saw_a = true; }
-                if (key == "b" && kv.second && kv.second->text() == "vb") { saw_b = true; }
-            }
-            ctx.check("htm_nullkey_exactly_one_null_key", null_keys == 1);
-            soft_value_check(ctx, "htm_nullkey_null_entry_value_decoded", null_key_value_ok);
-            soft_value_check(ctx, "htm_nullkey_real_keys_present", saw_a && saw_b);
-        }
-
-        // =====================================================================
-        // 13. HashMap null VALUE (legal) — nullptr value, key intact, sibling too.
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<str_oop, str_oop>("hashNullVal") };
-            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-            ctx.check("htm_nullval_count_matches_java_size", decoded == htm::j_size("hashNullValSize"));
-            ctx.check("htm_nullval_count_is_2", decoded == 2);
-
-            std::int32_t null_values{ 0 };
-            bool null_value_key_ok{ false };
-            bool sibling_ok{ false };
-            for (const auto& kv : e)
-            {
-                if (!kv.second)
-                {
-                    ++null_values;
-                    null_value_key_ok = (kv.first != nullptr && kv.first->text() == "present");
-                    continue;
-                }
-                if (kv.first && kv.first->text() == "alsohere" && kv.second->text() == "v9")
-                {
-                    sibling_ok = true;
-                }
-            }
-            ctx.check("htm_nullval_exactly_one_null_value", null_values == 1);
-            soft_value_check(ctx, "htm_nullval_null_entry_key_is_present", null_value_key_ok);
-            soft_value_check(ctx, "htm_nullval_sibling_decoded", sibling_ok);
-        }
-
-        // =====================================================================
-        // 14. TreeMap SIZE SWEEP 0/1/8/64/1000 — the iterative red-black in-order
-        //     walk across a null root, a single node, a small, and a deep tree.
-        //     count oracle + distinct OOPs + strict ascending order HARD.
-        // =====================================================================
-        {
-            const auto e0{ htm::entries_of<str_oop, str_oop>("treeEmpty") };
-            ctx.check("htm_tree_empty_is_empty", e0.empty());
-            ctx.check("htm_tree_empty_java_size_zero", htm::j_size("treeEmptySize") == 0);
-        }
-        check_str_tree(ctx, "htm_tree_one",       "treeOne",       "treeOneSize",       N1,
-                       "treeOneFirst", "treeOneFirst");  // n==1: first==last==k0
-        check_str_tree(ctx, "htm_tree_eight",     "treeEight",     "treeEightSize",     N8,
-                       "treeFirstKeyEight", "treeLastKeyEight");
-        check_str_tree(ctx, "htm_tree_sixtyfour", "treeSixtyFour", "treeSixtyFourSize", N64,
-                       "treeSixtyFourFirst", "treeSixtyFourLast");
-        check_str_tree(ctx, "htm_tree_thousand",  "treeThousand",  "treeThousandSize",  N1000,
-                       "treeThousandFirstKey", "treeThousandLastKey");
-
-        // =====================================================================
-        // 15. TreeMap inserted DESCENDING — the in-order walk MUST re-sort to
-        //     ascending (it does not echo insertion order).  Strict ascending HARD.
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<str_oop, str_oop>("treeDescending") };
-            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-            ctx.check("htm_tree_desc_count_matches_java_size", decoded == htm::j_size("treeDescendingSize"));
-            ctx.check("htm_tree_desc_count_is_8", decoded == N8);
-            std::vector<std::string> keys;
-            keys.reserve(e.size());
-            for (const auto& kv : e) { keys.push_back(kv.first ? kv.first->text() : std::string{}); }
-            ctx.check("htm_tree_desc_keys_strictly_ascending",
-                      std::is_sorted(keys.begin(), keys.end()));
-            ctx.check("htm_tree_desc_first_is_k0", !keys.empty() && keys.front() == "k0");
-            ctx.check("htm_tree_desc_last_is_k7", !keys.empty() && keys.back() == "k7");
-        }
-
-        // =====================================================================
-        // 16. TreeMap null VALUE (legal in TreeMap; null keys are not).  The walk
-        //     surfaces a nullptr value, keys remain sorted a<b<c.
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<str_oop, str_oop>("treeNullVal") };
-            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-            ctx.check("htm_tree_nullval_count_matches_java_size", decoded == htm::j_size("treeNullValSize"));
-            ctx.check("htm_tree_nullval_count_is_3", decoded == 3);
-            std::int32_t null_keys{ 0 }, null_values{ 0 };
-            std::vector<std::string> keys;
-            for (const auto& kv : e)
-            {
-                if (!kv.first) { ++null_keys; }
-                else { keys.push_back(kv.first->text()); }
-                if (!kv.second) { ++null_values; }
-            }
-            ctx.check("htm_tree_nullval_no_null_keys", null_keys == 0);
-            ctx.check("htm_tree_nullval_exactly_one_null_value", null_values == 1);
-            ctx.check("htm_tree_nullval_keys_strictly_ascending",
-                      std::is_sorted(keys.begin(), keys.end()));
-        }
-
-        // =====================================================================
-        // 17. TreeMap<Integer,Integer> — Integer keys, NATURAL NUMERIC order
-        //     (not lexicographic).  Inserted scrambled; walk yields 0..9.  count
-        //     + ascending HARD; value (key*10) PASS-or-[INFO].
-        // =====================================================================
-        {
-            const auto e{ htm::entries_of<integer_box, integer_box>("treeIntKey") };
-            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
-            ctx.check("htm_tree_intkey_count_matches_java_size", decoded == htm::j_size("treeIntKeySize"));
-            ctx.check("htm_tree_intkey_count_is_10", decoded == 10);
-
-            std::vector<std::int32_t> keys;
-            keys.reserve(e.size());
-            bool pairs_ok{ true };
-            std::int32_t null_kv{ 0 };
-            for (const auto& kv : e)
-            {
-                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; keys.push_back(-1); continue; }
-                const std::int32_t k{ kv.first->value() };
-                keys.push_back(k);
-                if (kv.second->value() != (k * 10)) { pairs_ok = false; }
-            }
-            ctx.check("htm_tree_intkey_no_null_kv", null_kv == 0);
-            ctx.check("htm_tree_intkey_keys_numeric_ascending",
-                      std::is_sorted(keys.begin(), keys.end()));
-            // Exact numeric sequence 0..9 (proves natural NUMERIC, not lexicographic).
-            bool exact{ keys.size() == 10 };
-            for (std::size_t i{ 0 }; exact && i < keys.size(); ++i)
-            {
-                if (keys[i] != static_cast<std::int32_t>(i)) { exact = false; }
-            }
-            ctx.check("htm_tree_intkey_exact_0_to_9", exact);
-            ctx.check("htm_tree_intkey_first_matches_java",
-                      !keys.empty() && keys.front() == htm::j_int("treeIntKeyFirst"));
-            ctx.check("htm_tree_intkey_last_matches_java",
-                      !keys.empty() && keys.back() == htm::j_int("treeIntKeyLast"));
-            soft_value_check(ctx, "htm_tree_intkey_values_are_key_times_10", pairs_ok);
-        }
-
-        // =====================================================================
-        // 18. ROBUSTNESS — a NULL Map field, a MISSING field name, and a non-Map
-        //     reference field all decode to EMPTY and NEVER throw / wild-walk.
-        // =====================================================================
-        {
-            // (a) Declared-but-null HashMap field -> the value_t null-oop guard fires.
-            const auto e_hnull{ htm::entries_of<str_oop, str_oop>("hashNull") };
-            ctx.check("htm_null_hash_field_returns_empty", e_hnull.empty());
-            const auto e_tnull{ htm::entries_of<str_oop, str_oop>("treeNull") };
-            ctx.check("htm_null_tree_field_returns_empty", e_tnull.empty());
-
-            // (b) Missing field name -> static_field nullopt -> empty.
-            ctx.check("htm_missing_field_is_nullopt", htm::resolves("noSuchMap") == false);
-            const auto e_missing{ htm::entries_of<str_oop, str_oop>("noSuchMap") };
-            ctx.check("htm_missing_field_returns_empty", e_missing.empty());
-
-            // (c) Non-Map reference (a String field): neither "table" nor "root"
-            //     resolves on java.lang.String -> empty (no throw, no wild walk).
-            const auto p{ htm::static_field("treeFirstKey") };
-            if (p)
-            {
-                const auto e_notmap{ p->get().to_entries<str_oop, str_oop>() };
-                ctx.check("htm_non_map_field_returns_empty", e_notmap.empty());
-            }
-
-            // Stable on re-read (the walk has no destructive heap side effects).
-            ctx.check("htm_null_hash_stable_on_reread",
-                      htm::entries_of<str_oop, str_oop>("hashNull").empty());
-            ctx.check("htm_missing_stable_on_reread",
-                      htm::entries_of<str_oop, str_oop>("noSuchMap").empty());
-        }
-
-        // =====================================================================
-        // 19. Re-read stability — decoding the same populated map twice yields the
-        //     same count + key fingerprint (no destructive side effects).
-        // =====================================================================
-        {
-            const auto a{ htm::entries_of<str_oop, str_oop>("hashSixtyFour") };
-            const auto b{ htm::entries_of<str_oop, str_oop>("hashSixtyFour") };
-            std::int64_t ca{ 0 }, cb{ 0 };
-            for (const auto& kv : a) { if (kv.first) { ca += code_unit_sum(kv.first->text()); } }
-            for (const auto& kv : b) { if (kv.first) { cb += code_unit_sum(kv.first->text()); } }
-            ctx.check("htm_reread_same_count", a.size() == b.size());
-            soft_value_check(ctx, "htm_reread_same_key_char_sum", ca == cb);
-        }
-    }   // run_checks
-}   // anonymous namespace
+}
 
 VMHOOK_JVM_MODULE(collection_hash_tree_map)
 {
-    bool body_threw{ false };
-    try
+    vmhook::register_class<htm>("vmhook/fixtures/HashTreeMap");
+
+    // =====================================================================
+    //  0. Sanity: the class resolves and the map fields are reachable as
+    //     static reference fields through the portable accessor.
+    // =====================================================================
+    ctx.check("htm_class_registered_field_resolves", htm::resolves("hashMap"));
+    ctx.check("htm_treeMap_field_resolves", htm::resolves("treeMap"));
+
     {
-        run_checks(ctx);
-    }
-    catch (...)
-    {
-        body_threw = true;
+        const auto p{ htm::static_field("hashMap") };
+        if (p)
+        {
+            // A HashMap<String,String> field is an object reference: signature
+            // "Ljava/util/HashMap;" and is_static()==true.
+            ctx.check("hashMap_proxy_is_static_true", p->is_static() == true);
+            ctx.check("hashMap_proxy_signature_is_ref",
+                      !std::string{ p->signature() }.empty()
+                          && std::string{ p->signature() }.front() == 'L');
+        }
     }
 
-    // FINAL CLEANUP — OUTSIDE the try so it ALWAYS runs, on EVERY exit path.
-    // This is a reads-only feature with NO hooks, but the contract is universal:
-    // reset the contained-crash recovery state (no-SEH Windows path) if present,
-    // then guarantee ZERO hooks armed via the idempotent, safe-when-empty
-    // shutdown_hooks().
-    if (ctx.reset)
-    {
-        ctx.reset();
-    }
-    vmhook::shutdown_hooks();
+    // Characterize the routing up-front: hash_map and the generic map share the
+    // SAME to_entries (HashMap "table" path then TreeMap "root" path); the
+    // hash_map wrapper is a pure intent tag, adding no distinct traversal.
+    ctx.record("[INFO] collection_hash_tree_map: vmhook routes BOTH HashMap and "
+               "TreeMap through the same vmhook::map::to_entries (HashMap \"table\" "
+               "bucket walk, then TreeMap \"root\" red-black walk); vmhook::hash_map "
+               "adds no hash-specific traversal -- it is a typed intent tag whose "
+               "to_entries IS map::to_entries. Key/value contents and TreeMap sorted "
+               "order are asserted regardless.");
 
-    if (body_threw)
+    // =====================================================================
+    //  1. Build both maps on the Java thread (mode 0), so the native reads
+    //     below see a fresh, deterministic population published this tick.
+    // =====================================================================
+    const bool built{ drive(ctx, 0) };
+    ctx.check("build_probe_completed", built);
+
+    // Java's own view of the sizes (published by the fixture's buildAll()).
+    ctx.check("java_hashMapSize_is_3", htm::java_hash_size() == 3);
+    ctx.check("java_treeMapSize_is_3", htm::java_tree_size() == 3);
+    // The TreeMap's sorted bounds, straight from Java's firstKey()/lastKey().
+    ctx.check("java_treeFirstKey_is_t0", htm::java_tree_first_key() == "t0");
+    ctx.check("java_treeLastKey_is_t2",  htm::java_tree_last_key() == "t2");
+
+    // =====================================================================
+    //  2. HASHMAP via the EXPLICIT vmhook::hash_map wrapper.
+    //     size()==3; to_entries yields all 3 (key,value) pairs with correct
+    //     values, ORDER-INDEPENDENT (HashMap iteration is bucket order).
+    // =====================================================================
     {
-        ctx.record("[INFO] collection_hash_tree_map: the test body threw and was contained "
-                   "(no crash, no hooks armed); see preceding checks for partial results.");
+        const auto hm{ htm::acquire_hash_map() };
+        ctx.check("hash_map_wrapper_acquired", hm != nullptr);
+
+        if (hm)
+        {
+            ctx.check("hash_map_size_is_3", hm->size() == 3);
+            ctx.check("hash_map_not_empty", hm->is_empty() == false);
+
+            const entries_t entries{ hm->to_entries<str_oop, str_oop>() };
+            ctx.check("hash_map_entries_size_is_3",
+                      static_cast<std::int32_t>(entries.size()) == 3);
+
+            // Order-independent presence+value check for h0/h1/h2.
+            std::array<bool, 3> seen{ false, false, false };
+            bool values_ok{ true };
+            bool keys_ok{ true };
+            for (const auto& kv : entries)
+            {
+                const std::string key{ decode_entry(kv.first) };
+                const std::string val{ decode_entry(kv.second) };
+                if      (key == "h0") { seen[0] = true; if (val != "hash-zero") { values_ok = false; } }
+                else if (key == "h1") { seen[1] = true; if (val != "hash-one")  { values_ok = false; } }
+                else if (key == "h2") { seen[2] = true; if (val != "hash-two")  { values_ok = false; } }
+                else                  { keys_ok = false; }
+            }
+            ctx.check("hash_map_all_keys_present", seen[0] && seen[1] && seen[2]);
+            ctx.check("hash_map_no_unexpected_keys", keys_ok);
+            ctx.check("hash_map_all_values_correct", values_ok);
+        }
     }
-    ctx.check("htm_module_left_clean_final_shutdown", true);
+
+    // =====================================================================
+    //  3. HASHMAP via the IMPLICIT value_t::to_entries path -- must AGREE with
+    //     the explicit wrapper (the field-proxy convenience path is correct).
+    // =====================================================================
+    {
+        const entries_t entries{ htm::hash_entries_via_value_t() };
+        ctx.check("hash_map_value_t_entries_size_is_3",
+                  static_cast<std::int32_t>(entries.size()) == 3);
+
+        std::array<bool, 3> seen{ false, false, false };
+        bool pairs_ok{ true };
+        for (const auto& kv : entries)
+        {
+            const std::string key{ decode_entry(kv.first) };
+            const std::string val{ decode_entry(kv.second) };
+            if      (key == "h0") { seen[0] = true; if (val != "hash-zero") { pairs_ok = false; } }
+            else if (key == "h1") { seen[1] = true; if (val != "hash-one")  { pairs_ok = false; } }
+            else if (key == "h2") { seen[2] = true; if (val != "hash-two")  { pairs_ok = false; } }
+            else                  { pairs_ok = false; }
+        }
+        ctx.check("hash_map_value_t_path_agrees",
+                  seen[0] && seen[1] && seen[2] && pairs_ok);
+    }
+
+    // =====================================================================
+    //  4. TREEMAP via the generic vmhook::map wrapper.
+    //     size()==3; to_entries MUST come out in NATURAL SORTED key order
+    //     t0 < t1 < t2 (the keys were inserted OUT OF ORDER t2,t0,t1, so this
+    //     proves the red-black IN-ORDER walk), each with the correct value.
+    // =====================================================================
+    {
+        const auto tm{ htm::acquire_tree_map() };
+        ctx.check("tree_map_wrapper_acquired", tm != nullptr);
+
+        if (tm)
+        {
+            ctx.check("tree_map_size_is_3", tm->size() == 3);
+            ctx.check("tree_map_not_empty", tm->is_empty() == false);
+
+            const entries_t entries{ tm->to_entries<str_oop, str_oop>() };
+            ctx.check("tree_map_entries_size_is_3",
+                      static_cast<std::int32_t>(entries.size()) == 3);
+
+            // Pin the FULL ordered sequence: the i-th entry must be exactly
+            // t{i} -> tree-{word(i)}.  This is the strongest in-order proof.
+            static constexpr std::array<const char*, 3> expect_key{ "t0", "t1", "t2" };
+            static constexpr std::array<const char*, 3> expect_val{ "tree-zero", "tree-one", "tree-two" };
+
+            bool order_ok{ true };
+            bool values_ok{ true };
+            std::array<bool, 3> seen{ false, false, false };
+            for (std::size_t i{ 0 }; i < entries.size(); ++i)
+            {
+                const std::string key{ decode_entry(entries[i].first) };
+                const std::string val{ decode_entry(entries[i].second) };
+                if      (key == "t0") { seen[0] = true; }
+                else if (key == "t1") { seen[1] = true; }
+                else if (key == "t2") { seen[2] = true; }
+                // Ordered position check: entry i must be t{i}.
+                if (i < expect_key.size())
+                {
+                    if (key != expect_key[i]) { order_ok = false; }
+                    if (val != expect_val[i]) { values_ok = false; }
+                }
+            }
+            ctx.check("tree_map_all_keys_present", seen[0] && seen[1] && seen[2]);
+            ctx.check("tree_map_in_order_sorted_t0_t1_t2", order_ok);
+            ctx.check("tree_map_all_values_correct_in_order", values_ok);
+
+            // Cross-check the native walk's bounds against Java's firstKey/lastKey.
+            if (entries.size() == 3)
+            {
+                const std::string first{ decode_entry(entries.front().first) };
+                const std::string last{ decode_entry(entries.back().first) };
+                ctx.check("tree_map_native_first_matches_java",
+                          first == htm::java_tree_first_key());
+                ctx.check("tree_map_native_last_matches_java",
+                          last == htm::java_tree_last_key());
+            }
+        }
+    }
+
+    // =====================================================================
+    //  5. EDGE: a null / non-existent Map field must walk to EMPTY, never crash.
+    //     (Guards the to_entries null-OOP and missing-field paths the audit
+    //     flagged; mirrors the legacy "map left null" coverage.)
+    // =====================================================================
+    {
+        // A field that does not exist -> static_field is nullopt; the wrapper
+        // helpers return nullptr and the walks stay empty.
+        ctx.check("nonexistent_map_field_is_nullopt",
+                  htm::static_field("noSuchMap").has_value() == false);
+
+        // value_t::to_entries on a non-Map String field ("treeFirstKey" holds a
+        // plain String, not a Map): the "table"/"root" probes both miss, so the
+        // result is an empty entries vector (never a throw / wild walk).
+        const auto p{ htm::static_field("treeFirstKey") };
+        if (p)
+        {
+            const entries_t entries{ p->get().to_entries<str_oop, str_oop>() };
+            ctx.check("non_map_field_to_entries_is_empty", entries.empty());
+        }
+    }
 }

@@ -11,12 +11,11 @@ import vmhook.Harness;
  * This is the legacy {@code test_throwing_method} scenario carried into the
  * modular harness, but HARDENED: where the legacy Example path merely let a
  * Java-side {@code runProbe} call the throwing method and catch the exception in
- * Java, this fixture instead exposes a FAMILY of throwing methods the NATIVE
- * side drives directly through method_proxy::call().  That is the dangerous
- * shape — a Java exception unwinding back into native code — so the contract
- * under test is "no detour access-violation, no suite truncation, thread NOT
- * left in ExceptionOccurred state, JVM healthy afterwards", proven once per
- * exception KIND.
+ * Java, this fixture instead exposes a throwing method the NATIVE side drives
+ * directly through method_proxy::call().  That is the dangerous shape — a Java
+ * exception unwinding back into native code — so the contract under test is
+ * "no detour access-violation, no suite truncation, thread NOT left in
+ * ExceptionOccurred state, JVM healthy afterwards".
  *
  * How the native module drives it (mirrors MethodCallJni / MethodPrimitives):
  *   - The native side hooks {@link #trigger(int)}.  Inside that detour
@@ -24,22 +23,19 @@ import vmhook.Harness;
  *     which method_proxy::call() may invoke the interpreter / JNI call gate.
  *   - The probe's run() calls trigger(1) on the shared SINGLETON through normal
  *     bytecode dispatch.  That fires the native interpreter hook; the detour
- *     then drives one throwing call() (selected by {@link #scenario}), a benign
- *     control method, and reads a field, recording observations into C++
- *     atomics.  The native side runs MANY probe cycles, one per scenario, so it
- *     can prove the thread recovered cleanly after EACH kind of throw.
+ *     then calls boom(-1) (which throws), a benign control method, and reads a
+ *     field, recording observations into C++ atomics.
  *
- * IMPORTANT — this fixture's probe action does NOT itself call any throwing
- * method.  Only the NATIVE detour calls them, so the exception path under test
- * is purely the native call() -> Java-throw -> native unwind one.  The probe
- * body only calls the benign trigger(); if a throw leaked an exception into the
- * detour and that corrupted the thread, the symptom shows up as a missing
- * {@code done} flag (native crash / truncation) or a failed post-throw health
- * check, never as an exception escaping this fixture.
+ * IMPORTANT — this fixture's probe action does NOT itself call boom().  Only the
+ * NATIVE detour calls boom(), so the exception path under test is purely the
+ * native call() -> Java-throw -> native unwind one.  The probe body only calls
+ * the benign trigger(); if boom() leaked an exception into the detour and that
+ * corrupted the thread, the symptom shows up as a missing {@code done} flag
+ * (native crash / truncation) or a failed post-throw health check, never as an
+ * exception escaping this fixture.
  *
  * Java 8 syntax only (no var / records / switch-expressions / lambdas):
- * the anonymous Harness.Probe below is the Java-8-only probe shape.  Compiles
- * unchanged under javac 8, 21, and 26 (default source level on each).
+ * the anonymous Harness.Probe below is the Java-8-only probe shape.
  */
 public final class ThrowingMethod
 {
@@ -49,70 +45,22 @@ public final class ThrowingMethod
     /** The probe action sets this true when it has run; native polls it. */
     public static volatile boolean done;
 
-    /**
-     * Which throwing method the native detour should drive this cycle.  The
-     * native side programs it on the rising edge of {@code go}; the detour reads
-     * it (via a field, NOT via this fixture) to pick the scenario.  Mirrors the
-     * OnException {@code mode} selector.  It is informational on the Java side —
-     * the probe body never branches on it — but lets the native module record
-     * exactly which call() it drove per cycle.
-     */
-    public static volatile int scenario;
-
     /** Bumped every time the hooked trigger() runs (handshake sanity). */
     public static volatile int triggerCount;
 
-    // ── per-throwing-method witnesses ───────────────────────────────────────
-    // Each throwing method records its entry + argument FIRST (BEFORE the throw)
-    // so the throw can never hide that the body genuinely ran and received the
-    // native side's marshalled argument.
-
-    /** boom(int): RuntimeException (IllegalStateException) — the headline path. */
+    /** Bumped every time boom() actually ENTERS its body, so the native side can
+     *  prove the throwing method was genuinely dispatched (not silently skipped
+     *  because the call gate was unavailable).  Incremented BEFORE the throw. */
     public static volatile int boomEntered;
+
+    /** The argument the LAST boom() invocation received, recorded BEFORE the
+     *  throw — lets the native side prove the argument was marshalled into the
+     *  throwing call correctly even though the call unwinds. */
     public static volatile int boomLastArg;
 
-    /** throwChecked(int): a CHECKED exception (java.io.IOException). */
-    public static volatile int checkedEntered;
-    public static volatile int checkedLastArg;
-
-    /** throwError(int): a java.lang.Error (subclass of Throwable, not Exception). */
-    public static volatile int errorEntered;
-    public static volatile int errorLastArg;
-
-    /** throwCustom(int): a project-defined exception (the nested BoomException). */
-    public static volatile int customEntered;
-    public static volatile int customLastArg;
-
-    /** throwNpe(int): a java.lang.NullPointerException raised by a real null deref. */
-    public static volatile int npeEntered;
-    public static volatile int npeLastArg;
-
-    /** throwAioobe(int): java.lang.ArrayIndexOutOfBoundsException from a real OOB read. */
-    public static volatile int aioobeEntered;
-    public static volatile int aioobeLastArg;
-
-    /** throwArithmetic(int): java.lang.ArithmeticException from integer divide-by-zero. */
-    public static volatile int arithEntered;
-    public static volatile int arithLastArg;
-
-    /** throwNested(int): throws via a NESTED Java call (deep()) so the exception
-     *  unwinds several Java frames before crossing back into native code. */
-    public static volatile int nestedEntered;     // outer frame entered
-    public static volatile int nestedDeepEntered; // innermost frame entered
-    public static volatile int nestedLastArg;
-
-    /** sBoom(int): a STATIC throwing method (CallStaticIntMethodA throw path). */
-    public static volatile int sBoomEntered;
-    public static volatile int sBoomLastArg;
-
-    /** throwAfterSuccess(int): records that a PRIOR successful call ran, then
-     *  throws — proves "throw after a successful call leaves state clean". */
-    public static volatile int afterSuccessEntered;
-    public static volatile int afterSuccessLastArg;
-
     /** Bumped every time the benign control method safeAdd() runs.  The native
-     *  side calls safeAdd AFTER a throw, so a growing value proves the JVM/thread
-     *  is still able to dispatch Java bytecode post-exception. */
+     *  side calls safeAdd AFTER boom() threw, so a non-zero value here proves
+     *  the JVM/thread is still able to dispatch Java bytecode post-exception. */
     public static volatile int safeAddCalls;
 
     /** A plain readable instance field.  The native side reads it AFTER the
@@ -121,13 +69,6 @@ public final class ThrowingMethod
 
     /** A static readable field, same purpose via the static accessor. */
     public static int staticHealthField = 0x5AFE5AFE;
-
-    // A non-null instance field used to make the NPE path a genuine null deref
-    // on a SEPARATE reference, while this one stays valid.
-    private final int[] presentArray = new int[] { 11, 22, 33 };
-
-    // Deliberately-null reference the NPE path dereferences.
-    private final int[] absentArray = null;
 
     // ── the method the native module hooks to obtain a live thread ──────────
 
@@ -144,19 +85,22 @@ public final class ThrowingMethod
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    //  The THROWING methods under test.  All keep a clean (I)I descriptor so the
-    //  native side resolves and calls each exactly like any other int(int)
-    //  method, regardless of whether the thrown type is checked or unchecked.
-    //  (A checked exception is wrapped so no `throws` clause is needed and the
-    //  descriptor stays (I)I; the WRAPPED throwable is still genuinely a checked
-    //  java.io.IOException, observable as such by the native side.)
+    //  The THROWING method under test.
+    //
+    //  Unconditionally throws for the negative input the native side passes
+    //  (boom(-1)); records its entry + argument FIRST so the throw cannot hide
+    //  the fact that the body genuinely ran.  An IllegalStateException is an
+    //  unchecked RuntimeException, so no `throws` clause is needed and the
+    //  descriptor stays a clean (I)I — the native side resolves and calls it
+    //  exactly like any other int(int) method.
     // ════════════════════════════════════════════════════════════════════════
 
     /**
-     * Throws IllegalStateException (an unchecked RuntimeException) for any
-     * negative argument (and for the boom(-1) the native side uses).  For a
-     * non-negative argument it returns the argument unchanged, so the method has
-     * a real non-throwing branch too.
+     * Throws IllegalStateException for any negative argument (and for the
+     * specific boom(-1) the native side uses).  For a non-negative argument it
+     * returns the argument unchanged, so the method has a real non-throwing
+     * branch too (the native side does not rely on it, but it keeps boom a
+     * normal, JIT-friendly method rather than a guaranteed-throw stub).
      */
     public int boom(final int x)
     {
@@ -169,100 +113,10 @@ public final class ThrowingMethod
         return x;
     }
 
-    /**
-     * Raises a CHECKED exception (java.io.IOException).  Wrapped in an unchecked
-     * RuntimeException so the descriptor stays (I)I, but the actual pending
-     * Throwable the native side observes is the checked IOException cause — i.e.
-     * a checked exception genuinely crosses the native boundary.  We throw the
-     * RuntimeException whose cause is the IOException; either way a Throwable is
-     * pending after the call.
-     */
-    public int throwChecked(final int x)
-    {
-        checkedLastArg = x;
-        checkedEntered++;
-        try
-        {
-            throw new java.io.IOException("checked-io:" + x);
-        }
-        catch (final java.io.IOException ioe)
-        {
-            throw new RuntimeException(ioe);
-        }
-    }
-
-    /**
-     * Throws a java.lang.Error (subclass of Throwable that is NOT an Exception).
-     * Errors are the most dangerous to let escape, so the native side must clear
-     * one just as cleanly as an ordinary exception.
-     */
-    public int throwError(final int x)
-    {
-        errorLastArg = x;
-        errorEntered++;
-        throw new IllegalAccessError("error:" + x);
-    }
-
-    /** Throws the project-defined nested BoomException (custom Throwable type). */
-    public int throwCustom(final int x)
-    {
-        customLastArg = x;
-        customEntered++;
-        throw new BoomException("custom:" + x);
-    }
-
-    /** Raises a genuine java.lang.NullPointerException by dereferencing a null
-     *  array reference (NOT an explicit throw), so it is the JVM's own NPE. */
-    public int throwNpe(final int x)
-    {
-        npeLastArg = x;
-        npeEntered++;
-        // absentArray is null; reading its length is a real null deref -> NPE.
-        return absentArray.length + x;
-    }
-
-    /** Raises a genuine java.lang.ArrayIndexOutOfBoundsException by reading past
-     *  the end of a real array (the JVM's own bounds-check throw). */
-    public int throwAioobe(final int x)
-    {
-        aioobeLastArg = x;
-        aioobeEntered++;
-        // presentArray has length 3; index 99 is out of bounds -> AIOOBE.
-        return presentArray[99] + x;
-    }
-
-    /** Raises a genuine java.lang.ArithmeticException via integer / by zero. */
-    public int throwArithmetic(final int x)
-    {
-        arithLastArg = x;
-        arithEntered++;
-        final int zero = arithEntered - arithEntered; // 0, opaque to the JIT
-        return x / zero;
-    }
-
-    /** Throws via a NESTED Java call: this frame calls deep(), which throws, so
-     *  the exception unwinds an extra Java frame before reaching native code. */
-    public int throwNested(final int x)
-    {
-        nestedLastArg = x;
-        nestedEntered++;
-        return deep(x); // unwinds deep()'s frame, then this one, into native
-    }
-
-    private int deep(final int x)
-    {
-        nestedDeepEntered++;
-        throw new IllegalStateException("nested-deep:" + x);
-    }
-
-    /**
-     * Static throwing variant (CallStaticIntMethodA throw path).  Records its
-     * own witnesses so the static dispatch's throw can be proven independently.
-     */
+    /** Static throwing variant, so the native side can also drive the
+     *  CallStaticIntMethodA throwing path if it chooses.  Same shape. */
     public static int sBoom(final int x)
     {
-        sBoomLastArg = x;
-        sBoomEntered++;
         if (x < 0)
         {
             throw new IllegalStateException("sBoom:" + x);
@@ -270,46 +124,18 @@ public final class ThrowingMethod
         return x;
     }
 
-    /**
-     * Performs a benign side effect (incrementing safeAddCalls) and THEN throws —
-     * so the native side can prove that a throw which happens AFTER the method
-     * already did real, successful work still leaves the thread clean (the work
-     * is committed; only the unwinding return value is lost).
-     */
-    public int throwAfterSuccess(final int x)
-    {
-        afterSuccessLastArg = x;
-        afterSuccessEntered++;
-        safeAddCalls++; // the "successful work" that commits before the throw
-        throw new IllegalStateException("after-success:" + x);
-    }
-
     // ── benign control method: the JVM-health witness after the throw ───────
 
     /**
-     * Benign control method the native side calls AFTER a throw.  A successful
-     * return with the expected value proves the throwing call left the thread in
-     * a clean, usable state (no pending exception poisoning the next dispatch).
-     * result = x + 1.
+     * Benign control method the native side calls AFTER boom() threw.  A
+     * successful return with the expected value proves the throwing call left
+     * the thread in a clean, usable state (no pending exception poisoning the
+     * next dispatch).  result = x + 1.
      */
     public int safeAdd(final int x)
     {
         safeAddCalls++;
         return x + 1;
-    }
-
-    // ── project-defined custom Throwable for the "custom exception" scenario ─
-    // A nested static class so it compiles with this fixture and is ignored by
-    // Main.loadFixtures() (which skips '$'-containing .class names).  Extends
-    // RuntimeException so the descriptor of throwCustom stays (I)I.
-    public static final class BoomException extends RuntimeException
-    {
-        private static final long serialVersionUID = 1L;
-
-        public BoomException(final String message)
-        {
-            super(message);
-        }
     }
 
     static
@@ -327,9 +153,8 @@ public final class ThrowingMethod
             {
                 // Drive trigger() through a normal bytecode dispatch -> fires the
                 // native interpreter hook; THAT detour performs the throwing
-                // method_proxy::call() (selected by `scenario`) and the
-                // post-throw health checks.  This probe body deliberately never
-                // touches any throwing method itself.
+                // method_proxy::call() and the post-throw health checks.  This
+                // probe body deliberately never touches boom() itself.
                 SINGLETON.trigger(1);
                 ThrowingMethod.done = true;
             }
