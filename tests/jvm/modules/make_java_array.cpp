@@ -1282,6 +1282,13 @@ namespace
                 bool every_nonnull_recv_is_array_len3{ true };
                 for (std::size_t di{ 0 }; di < D_COUNT; ++di)
                 {
+                    // Only STORED slots are meaningful here: an unstored slot (ref-array
+                    // best-effort returned null, or late-sweep unrooted-oop GC pressure
+                    // on e.g. windows/msvc) retains its non-null fixture placeholder,
+                    // which is not an array -> exclude it, exactly as the per-slot loop
+                    // above skips !stored. Without this, the aggregate wrongly fails on a
+                    // toolchain where a slot went unstored while every per-slot check passed.
+                    if (!g_results[di].stored_into_recv.load()) { continue; }
                     const desc_spec& spec{ k_specs[di] };
                     if (!mja::get_bool(spec.null_field))
                     {
