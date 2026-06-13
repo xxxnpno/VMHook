@@ -6735,19 +6735,35 @@ namespace vmhook
                 expected[0] = JMP_OPCODE;
                 std::memcpy(expected + 1, &expected_rel, sizeof(expected_rel));
 
-                if (std::memcmp(this->target, expected, JMP_SIZE) == 0)
+                // Read the current 5 stub bytes through os::safe_read.  verify_and_repair
+                // runs on the DETACHED auto-repair watchdog thread (outside any SEH/detour
+                // guard), and the shared HotSpot i2i stub page can be transiently UNMAPPED
+                // by a code-cache sweep (a GC/deopt on JDK 11+).  A raw read of this->target
+                // there faults UNCONTAINED and kills the JVM — the #28 crash at every
+                // forced-GC module (field_introspection SECTION H, wrapper_pattern mode-1).
+                // If the stub is unreadable, skip this tick (treat as intact; the next tick
+                // retries once it is mapped).  Cross-platform: the watchdog never walks a
+                // stack frame, so this safe_read cannot reintroduce the stk_ POSIX regression.
+                std::uint8_t current[JMP_SIZE]{};
+                if (!vmhook::os::safe_read(current, this->target, JMP_SIZE))
+                {
+                    return true;
+                }
+
+                if (std::memcmp(current, expected, JMP_SIZE) == 0)
                 {
                     return true;  // hook intact, nothing to do
                 }
 
                 // Patch is gone.  If a different JMP is there, follow it -
                 // someone else hooked the stub after us; chain to their
-                // trampoline so both hooks fire after we re-install.
+                // trampoline so both hooks fire after we re-install.  Use the
+                // safe_read'd `current` bytes, never a second raw deref of the stub.
                 void* new_chain{ this->current_chain_resume };
-                if (this->target[0] == JMP_OPCODE)
+                if (current[0] == JMP_OPCODE)
                 {
                     std::int32_t rel{};
-                    std::memcpy(&rel, this->target + 1, sizeof(rel));
+                    std::memcpy(&rel, current + 1, sizeof(rel));
                     std::uint8_t* const prior_trampoline{ this->target + JMP_SIZE + rel };
                     if (prior_trampoline != this->allocated  // not pointing at ourselves
                         && vmhook::hotspot::is_valid_pointer(prior_trampoline))
