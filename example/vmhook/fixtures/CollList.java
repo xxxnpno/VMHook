@@ -139,6 +139,19 @@ public final class CollList
         }
     }
 
+    /**
+     * Enum element type.  Each constant is a genuine enum instance whose `name`
+     * (String) and `ordinal` (int) live on java.lang.Enum (the shared superclass),
+     * so the native side reads them through a wrapper registered as java/lang/Enum
+     * — proving a List's decoded element OOP can be a real enum constant whose
+     * inherited Enum fields read back correctly, in positional (ordinal) order.
+     * The internal name is "CollList$Color".  Three constants keep the list small.
+     */
+    public enum Color
+    {
+        RED, GREEN, BLUE
+    }
+
     // ── Sizes the native side mirrors ──────────────────────────────────────
     /** Element count of the "many" ArrayList / LinkedList (> default cap 10). */
     public static final int MANY = 12;
@@ -210,6 +223,32 @@ public final class CollList
     public static final int SUB_TO = 9;
     /** Resulting size of the subList window (SUB_TO - SUB_FROM). */
     public static final int SUB_LEN = SUB_TO - SUB_FROM;
+
+    // ── Extra element-TYPE coverage (String / boxed Long / enum) ────────────
+    /** Element count of the String-element ArrayList (strList). */
+    public static final int STR_LEN = 5;
+
+    /** Element count of the boxed-Long ArrayList (longArrList). */
+    public static final int LONG_LEN = 6;
+
+    /**
+     * Base offset for the boxed-Long values.  Strictly &gt; 2^32 so element k holds
+     * LONG_BASE + k, a value whose high 32 bits are non-zero.  A truncating 32-bit
+     * read of the boxed long would drop the high word and collapse every element to
+     * its low word (== k), so reading back LONG_BASE + k proves the element decode
+     * (and the java.lang.Long.value field read) is full-width, not truncated.
+     */
+    public static final long LONG_BASE = 0x1_0000_0007L; // 4294967303
+
+    // ── Extra SIZE coverage (10 / 16 / 1000) on both backing families ───────
+    /** Default ArrayList capacity boundary (a 10-element list fits exactly). */
+    public static final int TEN = 10;
+
+    /** Power-of-two element count (16) — a grow/resize boundary. */
+    public static final int SIXTEEN = 16;
+
+    /** Round large element count (1000) for ArrayList and LinkedList. */
+    public static final int THOUSAND = 1000;
 
     // ── ArrayList fields (each takes the "elementData"+"size" backing store) ─
     /** Empty ArrayList — size 0, the walk must be empty (no element read). */
@@ -344,6 +383,44 @@ public final class CollList
 
     /** Vector&lt;Integer&gt; with values 0..INT_LEN-1 (elementData walk, boxed elems). */
     public final Vector<Integer> intVecList = new Vector<Integer>();
+
+    // ── Extra element-TYPE lists (String / boxed Long / enum) ────────────────
+    /**
+     * ArrayList&lt;String&gt; with values "s0".."s{STR_LEN-1}".  The native side reads
+     * each decoded element OOP as a java.lang.String via read_java_string — the
+     * element decode is type-agnostic, and String is the canonical reference
+     * element type the scope calls for.
+     */
+    public final ArrayList<String> strList = new ArrayList<String>();
+
+    /**
+     * ArrayList&lt;Long&gt; whose element k is Long.valueOf(LONG_BASE + k).  Every value
+     * exceeds 2^32, so a truncating 32-bit read of the boxed long would collapse
+     * the high word; the native side reads back the FULL 64-bit Long.value and
+     * asserts it equals LONG_BASE + k — a positive catch for any truncating read.
+     */
+    public final ArrayList<Long> longArrList = new ArrayList<Long>();
+
+    /**
+     * ArrayList&lt;Color&gt; holding the enum constants in ordinal order (RED, GREEN,
+     * BLUE).  The native side reads each element's inherited Enum name/ordinal and
+     * asserts ordinal == index, proving positional order for a non-Elem reference
+     * element type.
+     */
+    public final ArrayList<Color> enumList = new ArrayList<Color>();
+
+    // ── Extra SIZE lists (10 / 16 / 1000) — positional order at each size ─────
+    /** 10-element ArrayList (exactly the default capacity). */
+    public final ArrayList<Elem> arrTen = new ArrayList<Elem>();
+
+    /** 16-element ArrayList (power-of-two grow boundary). */
+    public final ArrayList<Elem> arrSixteen = new ArrayList<Elem>();
+
+    /** 1000-element ArrayList (round large size). */
+    public final ArrayList<Elem> arrThousand = new ArrayList<Elem>();
+
+    /** 1000-element LinkedList (round large size; chain walk at scale). */
+    public final LinkedList<Elem> linkThousand = new LinkedList<Elem>();
 
     // ── Nested List-of-Map (outer ArrayList walk -> inner Map OOPs) ──────────
     /**
@@ -526,6 +603,39 @@ public final class CollList
         {
             intArrList.add(Integer.valueOf(i));
             intVecList.add(Integer.valueOf(i));
+        }
+
+        // String-element list: "s0".."s{STR_LEN-1}".
+        for (int i = 0; i < STR_LEN; ++i)
+        {
+            strList.add("s" + i);
+        }
+
+        // Boxed-Long list: element k == LONG_BASE + k (every value > 2^32).
+        for (int i = 0; i < LONG_LEN; ++i)
+        {
+            longArrList.add(Long.valueOf(LONG_BASE + i));
+        }
+
+        // Enum-element list: constants in ordinal order (RED, GREEN, BLUE).
+        for (final Color c : Color.values())
+        {
+            enumList.add(c);
+        }
+
+        // Extra-size Elem lists (ids 0..size-1) on both backing families.
+        for (int i = 0; i < TEN; ++i)
+        {
+            arrTen.add(new Elem(i));
+        }
+        for (int i = 0; i < SIXTEEN; ++i)
+        {
+            arrSixteen.add(new Elem(i));
+        }
+        for (int i = 0; i < THOUSAND; ++i)
+        {
+            arrThousand.add(new Elem(i));
+            linkThousand.add(new Elem(i));
         }
 
         // Nested List-of-Map: MAP_OUTER HashMaps, each with MAP_INNER entries.

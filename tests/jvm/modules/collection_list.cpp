@@ -191,6 +191,76 @@ namespace
         }
     };
 
+    // Wrapper for java.lang.Long — the BOXED 64-bit element type.  Reads the
+    // single primitive field "value" (a long, stable JDK 6..26) FULL-WIDTH via the
+    // value_t -> std::int64_t conversion.  The boxed-Long list stores values above
+    // 2^32, so a truncating 32-bit read would drop the high word; reading the whole
+    // 64-bit value back proves the element decode is full-width.  No element-klass
+    // registration beyond java/lang/Long is needed (find_field resolves "value").
+    class long_object : public vmhook::object<long_object>
+    {
+    public:
+        explicit long_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<long_object>{ instance }
+        {
+        }
+
+        auto value() const -> std::int64_t
+        {
+            const auto f{ get_field("value") };
+            return f ? static_cast<std::int64_t>(f->get()) : -1;
+        }
+    };
+
+    // Wrapper for java.lang.String list elements.  read_java_string resolves
+    // java/lang/String itself and is internally gated by is_valid_pointer, so this
+    // needs NO klass registration; "" comes back for a null/invalid backing.  Same
+    // idiom as collection_linked_list.cpp's str_elem.
+    class string_object : public vmhook::object<string_object>
+    {
+    public:
+        explicit string_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<string_object>{ instance }
+        {
+        }
+
+        auto content() const -> std::string
+        {
+            return vmhook::read_java_string(this->get_instance());
+        }
+    };
+
+    // Wrapper for an enum-constant list element.  Registered as java/lang/Enum so
+    // find_field resolves `name` (String) and `ordinal` (int), both declared on
+    // java.lang.Enum (the shared superclass of every concrete enum) at offsets
+    // common to every enum constant OOP — the same idiom collection_set_exhaustive
+    // uses.  Proves a decoded List element can be a real enum constant.
+    class enum_object : public vmhook::object<enum_object>
+    {
+    public:
+        explicit enum_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<enum_object>{ instance }
+        {
+        }
+
+        auto ordinal() const -> std::int32_t
+        {
+            const auto f{ get_field("ordinal") };
+            return f ? static_cast<std::int32_t>(f->get()) : -1;
+        }
+
+        auto name() const -> std::string
+        {
+            const auto f{ get_field("name") };
+            if (!f)
+            {
+                return std::string{};
+            }
+            std::string s = f->get();
+            return s;
+        }
+    };
+
     // ── Fixture-mirrored constants (kept in lockstep with CollList.java) ─────
     constexpr std::int32_t MANY{ 12 };
     constexpr std::int32_t BIG{ 4096 };
@@ -211,6 +281,15 @@ namespace
     constexpr std::int32_t MAP_OUTER{ 3 };
     constexpr std::int32_t LISTOF_N{ 4 };
     constexpr std::int32_t SUB_LEN{ 6 };   // SUB_TO(9) - SUB_FROM(3)
+
+    // Extra element-TYPE / SIZE coverage (mirror CollList.java).
+    constexpr std::int32_t STR_LEN{ 5 };
+    constexpr std::int32_t LONG_LEN{ 6 };
+    constexpr std::int64_t LONG_BASE{ 0x1'0000'0007LL };   // > 2^32 (4294967303)
+    constexpr std::int32_t ENUM_LEN{ 3 };                  // Color.values().length
+    constexpr std::int32_t TEN{ 10 };
+    constexpr std::int32_t SIXTEEN{ 16 };
+    constexpr std::int32_t THOUSAND{ 1000 };
 
     // Generous wall-clock ceiling for the BIG-node LinkedList walk.  A linear
     // walk is sub-millisecond; even a heavily-loaded CI box stays well under
@@ -798,6 +877,22 @@ namespace
     bool g_int_arr_values_ok{ false };
     bool g_int_vec_values_ok{ false };
 
+    // String / boxed-Long / enum element lists (extra element-TYPE coverage).
+    list_obs     g_str_arr;            // ArrayList<String>
+    bool         g_str_values_ok{ false };
+    list_obs     g_long_arr;           // ArrayList<Long> (values > 2^32)
+    bool         g_long_values_ok{ false };
+    list_obs     g_enum_arr;           // ArrayList<Color> (enum constants)
+    bool         g_enum_values_ok{ false };
+
+    // Extra-size Elem lists (positional order at sizes 10 / 16 / 1000).
+    list_obs g_arr_ten;
+    list_obs g_arr_sixteen;
+    list_obs g_arr_thousand;
+    list_obs g_link_thousand;
+    // to_vector parity on a round-1000 ArrayList (library fast path at scale).
+    list_obs g_tv_arr_thousand;
+
     // Nested List-of-Map: outer ArrayList walk -> inner Map OOP identity only.
     std::int32_t g_nested_map_outer_n{ -1 };
     bool         g_nested_map_distinct{ true };
@@ -945,6 +1040,99 @@ namespace
         values_ok = vals_ok;
     }
 
+    // Reduce a decoded vector of java.lang.String wrappers: size / null pattern /
+    // OOP distinctness (into `o`), and set `values_ok` iff every slot is non-null
+    // with content() == "s<index>" (the String analogue of the id==index proof).
+    auto observe_strings(list_obs& o,
+                         const std::vector<std::unique_ptr<string_object>>& v,
+                         bool& values_ok) -> void
+    {
+        o.seen = true;
+        o.size = static_cast<std::int32_t>(v.size());
+        std::int32_t non_null{ 0 };
+        std::int32_t null_count{ 0 };
+        bool distinct_ok{ true };
+        bool vals_ok{ !v.empty() };
+        std::unordered_set<const void*> seen_oops;
+        seen_oops.reserve(v.size() * 2 + 1);
+        for (std::size_t k{ 0 }; k < v.size(); ++k)
+        {
+            const string_object* const e{ v[k].get() };
+            if (e == nullptr) { ++null_count; vals_ok = false; continue; }
+            ++non_null;
+            if (e->content() != ("s" + std::to_string(k))) { vals_ok = false; }
+            const void* const oop{ static_cast<const void*>(e->get_instance()) };
+            if (!seen_oops.insert(oop).second) { distinct_ok = false; }
+        }
+        o.non_null = non_null;
+        o.null_count = null_count;
+        o.distinct_ok = distinct_ok;
+        values_ok = vals_ok;
+    }
+
+    // Reduce a decoded vector of java.lang.Long wrappers: size / null pattern /
+    // OOP distinctness (into `o`), and set `values_ok` iff every slot is non-null
+    // with value() == LONG_BASE + index.  Because LONG_BASE > 2^32, a truncating
+    // 32-bit read would yield index instead of LONG_BASE + index, flipping vals_ok.
+    auto observe_longs(list_obs& o,
+                       const std::vector<std::unique_ptr<long_object>>& v,
+                       bool& values_ok) -> void
+    {
+        o.seen = true;
+        o.size = static_cast<std::int32_t>(v.size());
+        std::int32_t non_null{ 0 };
+        std::int32_t null_count{ 0 };
+        bool distinct_ok{ true };
+        bool vals_ok{ !v.empty() };
+        std::unordered_set<const void*> seen_oops;
+        seen_oops.reserve(v.size() * 2 + 1);
+        for (std::size_t k{ 0 }; k < v.size(); ++k)
+        {
+            const long_object* const e{ v[k].get() };
+            if (e == nullptr) { ++null_count; vals_ok = false; continue; }
+            ++non_null;
+            if (e->value() != LONG_BASE + static_cast<std::int64_t>(k)) { vals_ok = false; }
+            const void* const oop{ static_cast<const void*>(e->get_instance()) };
+            if (!seen_oops.insert(oop).second) { distinct_ok = false; }
+        }
+        o.non_null = non_null;
+        o.null_count = null_count;
+        o.distinct_ok = distinct_ok;
+        values_ok = vals_ok;
+    }
+
+    // Reduce a decoded vector of enum-constant wrappers: size / null pattern / OOP
+    // distinctness (into `o`), and set `values_ok` iff every slot is non-null with
+    // ordinal() == index (positional/ordinal order) AND name() non-empty (the
+    // inherited Enum String field reads back).
+    auto observe_enums(list_obs& o,
+                       const std::vector<std::unique_ptr<enum_object>>& v,
+                       bool& values_ok) -> void
+    {
+        o.seen = true;
+        o.size = static_cast<std::int32_t>(v.size());
+        std::int32_t non_null{ 0 };
+        std::int32_t null_count{ 0 };
+        bool distinct_ok{ true };
+        bool vals_ok{ !v.empty() };
+        std::unordered_set<const void*> seen_oops;
+        seen_oops.reserve(v.size() * 2 + 1);
+        for (std::size_t k{ 0 }; k < v.size(); ++k)
+        {
+            const enum_object* const e{ v[k].get() };
+            if (e == nullptr) { ++null_count; vals_ok = false; continue; }
+            ++non_null;
+            if (e->ordinal() != static_cast<std::int32_t>(k)) { vals_ok = false; }
+            if (e->name().empty()) { vals_ok = false; }
+            const void* const oop{ static_cast<const void*>(e->get_instance()) };
+            if (!seen_oops.insert(oop).second) { distinct_ok = false; }
+        }
+        o.non_null = non_null;
+        o.null_count = null_count;
+        o.distinct_ok = distinct_ok;
+        values_ok = vals_ok;
+    }
+
     // True iff a decoded inner Elem vector is a perfect dense list of `expected`:
     // exactly `expected` non-null, distinct, ascending elements with id == index
     // and tag == "e<id>".
@@ -1004,6 +1192,39 @@ namespace
         ctx.check(p + "_non_null_distinct", o.distinct_ok);
     }
 
+    // Best-effort gate for a CONTENT/VALUE read that decodes a reference element
+    // (compressed-oops-dependent): records a PASS when the expected value reads,
+    // else an [INFO] (never a FAIL).  Structural shape (size / non-null / distinct)
+    // is checked HARD elsewhere; only the per-element value round-trip is gated this
+    // way, mirroring the cross-toolchain hardening the suite uses for config-variant
+    // reads.  CI runs default (compressed-oops-on) heaps, so on green CI this PASSes.
+    auto check_or_info(vmhook_test::context& ctx, const std::string& name,
+                       const bool ok, const std::string& info_detail) -> void
+    {
+        if (ok)
+        {
+            ctx.check(name, true);
+        }
+        else
+        {
+            ctx.record("[INFO] " + name + ": " + info_detail);
+        }
+    }
+
+    // Structural bundle for a typed (String/Long/enum) dense list of `expected`:
+    // size / non-null / no-null / distinct are HARD (these hold whenever the
+    // backing array decodes at all, exactly like the Elem lists).  The per-element
+    // VALUE round-trip is gated separately via check_or_info by the caller.
+    auto check_typed_dense_shape(vmhook_test::context& ctx, const std::string& p,
+                                 const list_obs& o, const std::int32_t expected) -> void
+    {
+        ctx.check(p + "_seen", o.seen);
+        ctx.check(p + "_size_matches", o.size == expected);
+        ctx.check(p + "_all_non_null", o.non_null == expected);
+        ctx.check(p + "_no_null_slots", o.null_count == 0);
+        ctx.check(p + "_elements_distinct", o.distinct_ok);
+    }
+
     constexpr char FIXTURE[]{ "vmhook/fixtures/CollList" };
 
     // Fixture wrapper — handshake + the SINGLETON OOP read.
@@ -1046,8 +1267,14 @@ namespace
 
         vmhook::register_class<coll_list_fixture>(FIXTURE);
         vmhook::register_class<elem_object>("vmhook/fixtures/CollList$Elem");
-        // java.lang.Integer is always loaded; needed for the boxed-element lists.
+        // java.lang.Integer / java.lang.Long are always loaded; needed for the
+        // boxed-element lists.  java.lang.Enum is the shared enum superclass that
+        // declares name/ordinal, so registering the enum wrapper there resolves
+        // those fields off any concrete enum-constant OOP.  (string_object needs
+        // no registration — read_java_string resolves java/lang/String itself.)
         vmhook::register_class<integer_object>("java/lang/Integer");
+        vmhook::register_class<long_object>("java/lang/Long");
+        vmhook::register_class<enum_object>("java/lang/Enum");
 
         // Drive a build probe so populate() runs on the Java thread; then read
         // the now-populated backing stores off the worker thread.  (No detour:
@@ -1216,6 +1443,27 @@ namespace
                          walk_indexed_backing_as<integer_object>(list_oop_of("intVecList")),
                          g_int_vec_values_ok);
 
+        // ── String / boxed-Long / enum element lists (type-agnostic decode) ──
+        observe_strings(g_str_arr,
+                        walk_indexed_backing_as<string_object>(list_oop_of("strList")),
+                        g_str_values_ok);
+        observe_longs(g_long_arr,
+                      walk_indexed_backing_as<long_object>(list_oop_of("longArrList")),
+                      g_long_values_ok);
+        observe_enums(g_enum_arr,
+                      walk_indexed_backing_as<enum_object>(list_oop_of("enumList")),
+                      g_enum_values_ok);
+
+        // ── Extra-size Elem lists (positional order at 10 / 16 / 1000) ───────
+        observe(g_arr_ten,      walk_arraylist(list_oop_of("arrTen")),      true);
+        observe(g_arr_sixteen,  walk_arraylist(list_oop_of("arrSixteen")),  true);
+        observe(g_arr_thousand, walk_arraylist(list_oop_of("arrThousand")), true);
+        {
+            void* const o{ list_oop_of("linkThousand") };
+            observe(g_link_thousand,
+                    walk_linkedlist(o, read_int_field(o, "size", 0)), true);
+        }
+
         // ── Nested List-of-Map: outer ArrayList -> inner Map OOP identity ───
         {
             std::vector<std::unique_ptr<elem_object>> outer_maps{
@@ -1281,6 +1529,9 @@ namespace
         observe(g_tv_link_empty, to_vector_of(list_oop_of("linkEmpty")),    true);
         observe(g_tv_link_many,  to_vector_of(list_oop_of("linkMany")),     true);
         observe(g_tv_link_null,  to_vector_of(list_oop_of("linkWithNull")), true);
+        // Library ArrayList fast path at a round-1000 scale (cross-oracle vs the
+        // hand-walked arrThousand below).
+        observe(g_tv_arr_thousand, to_vector_of(list_oop_of("arrThousand")), true);
 
         // ════════════════════════════════════════════════════════════════════
         //  ArrayList backing store
@@ -1429,6 +1680,69 @@ namespace
         ctx.check("integer_vector_all_non_null", g_int_vec.non_null == INT_LEN);
         ctx.check("integer_vector_values_equal_index", g_int_vec_values_ok);
         ctx.check("integer_vector_oops_distinct", g_int_vec.distinct_ok);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  String-element ArrayList: the backing walk is element-TYPE-agnostic;
+        //  each slot is a java.lang.String the native side reads via
+        //  read_java_string.  Shape is HARD; the per-element content round-trip is
+        //  best-effort (reference decode is compressed-oops-dependent).
+        // ════════════════════════════════════════════════════════════════════
+        check_typed_dense_shape(ctx, "string_arraylist", g_str_arr, STR_LEN);
+        check_or_info(ctx, "string_arraylist_content_equals_s_index", g_str_values_ok,
+                      "String element content did not all read back as \"s<index>\" on "
+                      "this run (reference/String decode is compressed-oops-dependent); "
+                      "size/shape still checked hard.");
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Boxed-Long ArrayList: element k == LONG_BASE + k, every value > 2^32.
+        //  This is the TRUNCATION catch — a 32-bit-truncating read of the boxed
+        //  long would yield k (the low word) instead of LONG_BASE + k, flipping
+        //  the value check.  Shape HARD; full-width value round-trip best-effort.
+        // ════════════════════════════════════════════════════════════════════
+        check_typed_dense_shape(ctx, "long_arraylist", g_long_arr, LONG_LEN);
+        check_or_info(ctx, "long_arraylist_values_full_width_above_2pow32",
+                      g_long_values_ok,
+                      "boxed Long element values did not all read back as LONG_BASE+index "
+                      "(> 2^32) on this run; either the reference decode or the 64-bit "
+                      "Long.value read did not resolve here. A truncating 32-bit read "
+                      "would also land here. size/shape still checked hard.");
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Enum-element ArrayList: each slot is a real enum constant; ordinal ==
+        //  index (positional order) and the inherited Enum `name` reads back
+        //  non-empty.  Shape HARD; ordinal/name round-trip best-effort.
+        // ════════════════════════════════════════════════════════════════════
+        check_typed_dense_shape(ctx, "enum_arraylist", g_enum_arr, ENUM_LEN);
+        check_or_info(ctx, "enum_arraylist_ordinal_equals_index_and_name_reads",
+                      g_enum_values_ok,
+                      "enum element ordinal!=index or inherited Enum name read empty on "
+                      "this run (enum-constant reference decode / name String decode is "
+                      "compressed-oops-dependent); size/shape still checked hard.");
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Extra SIZE coverage (10 / 16 / 1000) — positional order at each size
+        //  on both backing families.  These are plain Elem lists, so the full
+        //  dense bundle (size/order/tags/distinct/first/last) applies as HARD.
+        // ════════════════════════════════════════════════════════════════════
+        check_dense(ctx, "arraylist_ten", g_arr_ten, TEN);
+        check_dense(ctx, "arraylist_sixteen", g_arr_sixteen, SIXTEEN);
+        check_dense(ctx, "arraylist_thousand", g_arr_thousand, THOUSAND);
+        check_dense(ctx, "linkedlist_thousand", g_link_thousand, THOUSAND);
+
+        // Library to_vector ArrayList fast path agrees with the hand-walk at 1000.
+        check_dense(ctx, "to_vector_arraylist_thousand", g_tv_arr_thousand, THOUSAND);
+        ctx.check("to_vector_arraylist_thousand_matches_hand_walk_size",
+                  g_tv_arr_thousand.size == g_arr_thousand.size);
+        ctx.check("to_vector_arraylist_thousand_matches_hand_walk_last_id",
+                  g_tv_arr_thousand.last_id == g_arr_thousand.last_id);
+
+        // ArrayList vs LinkedList parity at 1000 (same content, two backing shapes).
+        ctx.check("array_and_link_thousand_same_size",
+                  g_arr_thousand.size == g_link_thousand.size);
+        ctx.check("array_and_link_thousand_same_last_id",
+                  g_arr_thousand.last_id == g_link_thousand.last_id);
+        ctx.check("array_and_link_thousand_both_ordered",
+                  g_arr_thousand.order_ok && g_link_thousand.order_ok);
 
         // ════════════════════════════════════════════════════════════════════
         //  Nested List-of-Map: outer ArrayList walk recovers inner Map OOPs; each

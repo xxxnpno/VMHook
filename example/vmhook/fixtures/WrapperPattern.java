@@ -28,6 +28,25 @@ import vmhook.Harness;
  * plus an alias to the first instance (for the equality test), and a runtime-
  * mutated instance field driven by genuine invokevirtual / putfield.
  *
+ * EXHAUSTIVE-WRAPPER additions (so the native module can prove the object&lt;T&gt;
+ * contract over EVERY object shape, not just this class):
+ *   - a nested wrapped reference type {@link Node} reachable through an instance
+ *     field, and a {@code Node} that itself holds another {@code Node}
+ *     (wrapper-of-wrapper / nested get through a field-decoded wrapper),
+ *   - an INTERFACE-typed instance field ({@link Greeter}) holding a concrete
+ *     impl ({@link Hello}) — a wrapper registered for the concrete impl reads
+ *     it and dispatches the interface method,
+ *   - an ENUM-constant reference ({@link Suit}) reachable as a static field — a
+ *     wrapper registered for the enum reads an enum-body field and dispatches an
+ *     enum instance method,
+ *   - a primitive ARRAY field ({@code int[] numbers}) the module walks
+ *     element-wise (an array oop is wrappable as a generic object_base, but its
+ *     ELEMENTS are read through the array helpers),
+ *   - a {@code java.lang.Object}-typed field holding {@code this} so the module
+ *     can decode it through the generic polymorphic base and downcast,
+ *   - a {@code mode == 1} probe branch that drives {@code System.gc()} so the
+ *     native side can characterise a wrapper outliving a GC nudge.
+ *
  * String fields are built with new String(char[]) (private backing) so any
  * in-place vmhook string write could never corrupt an interned literal; this
  * fixture never writes them, but the convention is kept for safety parity with
@@ -43,7 +62,97 @@ public final class WrapperPattern
     public static volatile boolean go;
     public static volatile boolean done;
     // Scenario selector (native sets it + clears done on the rising edge of go).
+    //   0 = bump(2345) on `instance` (the runtime-mutation / hook target).
+    //   1 = drive System.gc() twice (the wrapper-outlives-a-GC-nudge angle) and
+    //       publish the post-GC witnesses below.
     public static volatile int mode;
+
+    // -- GC-probe witnesses (published by the mode==1 action, Java-side) ------
+    /** True once the gc() probe has run (so the native gate is exact). */
+    public static volatile boolean gcProbeRan;
+    /** instance.iId re-read Java-side AFTER System.gc() (still 0x0BADF00D). */
+    public static volatile int gcInstanceIdAfter;
+    /** node.nId re-read Java-side AFTER System.gc() (still NODE_ID). */
+    public static volatile int gcNodeIdAfter;
+
+    // =====================================================================
+    //  Nested wrapped reference type (emitted as WrapperPattern$Node).
+    //  The native module registers a wrapper for it and reads it through an
+    //  instance field of WrapperPattern; a Node that holds ANOTHER Node proves
+    //  wrapper-of-wrapper (nested get through a field-decoded wrapper).
+    // =====================================================================
+    public static final class Node
+    {
+        public int    nId;
+        public String nLabel;
+        public Node   nextNode;   // a Node-typed field ON a Node (recursive ref)
+
+        public Node(final int id, final String label)
+        {
+            this.nId      = id;
+            this.nLabel   = label;
+            this.nextNode = null;
+        }
+
+        /** Instance method dispatched through a field-decoded Node wrapper. */
+        public int nodeId()
+        {
+            return this.nId;
+        }
+    }
+
+    // =====================================================================
+    //  An interface + concrete impl (WrapperPattern$Greeter / $Hello).  The
+    //  `greeter` field is declared as the interface but holds a Hello at
+    //  runtime; the native side registers a wrapper for the concrete impl,
+    //  reads it through the interface-typed field, and dispatches greet().
+    // =====================================================================
+    public interface Greeter
+    {
+        String greet();
+    }
+
+    public static final class Hello implements Greeter
+    {
+        public String who;
+
+        public Hello(final String who)
+        {
+            this.who = who;
+        }
+
+        @Override
+        public String greet()
+        {
+            return "hello " + this.who;
+        }
+    }
+
+    // =====================================================================
+    //  An enum (WrapperPattern$Suit) with an instance field + an instance
+    //  method.  Each constant is a distinct singleton object; the native side
+    //  registers a wrapper for the enum klass, reads a constant through a
+    //  static field, reads the enum-body field, and dispatches rank().
+    // =====================================================================
+    public enum Suit
+    {
+        HEARTS(3),
+        SPADES(7);
+
+        /** Instance field declared on the enum body (native reads this). */
+        public final int rank;
+
+        Suit(final int rank)
+        {
+            this.rank = rank;
+        }
+
+        /** Instance method on the enum (native dispatches it through a wrapper). */
+        public int rank()
+        {
+            return this.rank;
+        }
+    }
 
     // =====================================================================
     //  STATIC fields — resolved through the class mirror (no live oop needed).
@@ -57,6 +166,20 @@ public final class WrapperPattern
     // A static reference to a sibling object (object-reference static field).
     public static WrapperPattern sRef = new WrapperPattern(0x100);
 
+    // A static ENUM-constant reference (the enum-singleton-through-a-wrapper
+    // angle): resolves to the HEARTS singleton.
+    public static Suit favoriteSuit = Suit.HEARTS;
+
+    // ---- Deterministic constants the native side mirrors (exhaustive part) --
+    public static final int    NODE_ID    = 0x0D0E;            // head Node.nId
+    public static final int    NODE2_ID   = 0x0D0F;            // chained Node.nId
+    public static final String HELLO_WHO  = "wrapper";          // Hello.who
+    public static final int    NUM0       = 11;
+    public static final int    NUM1       = 22;
+    public static final int    NUM2       = 33;
+    public static final int    NUMBERS_LEN = 3;
+    public static final int    HEARTS_RANK = 3;                 // Suit.HEARTS.rank
+
     // =====================================================================
     //  INSTANCE fields — resolved through a live oop.  Values DIFFER from the
     //  static ones so a static/instance mix-up is caught immediately.
@@ -65,6 +188,25 @@ public final class WrapperPattern
     public long   iValue = 1000L;                     // mutated by bump() at runtime
     public boolean iFlag = false;
     public String iLabel = freshAscii("wrapper-instance");
+
+    // =====================================================================
+    //  EXHAUSTIVE-WRAPPER reference / array fields (every object shape).
+    //  Eagerly initialised so the nested Node / Hello / Suit klasses are
+    //  loaded (and the OOPs exist) before the native module runs — Main's
+    //  loadFixtures() only forName's the TOP-LEVEL fixture, so a nested type
+    //  reached only through a never-touched field would otherwise stay unloaded.
+    // =====================================================================
+    /** A nested wrapped reference (a WrapperPattern$Node) on an instance. */
+    public Node node = makeChain();
+
+    /** An INTERFACE-typed field holding a concrete impl (Greeter -> Hello). */
+    public Greeter greeter = new Hello(HELLO_WHO);
+
+    /** A primitive int[] the native side walks element-wise through helpers. */
+    public int[] numbers = { NUM0, NUM1, NUM2 };
+
+    /** A java.lang.Object-typed field holding `this` (polymorphic-base angle). */
+    public Object selfAsObject = this;
 
     // =====================================================================
     //  Published singletons the native side wraps.
@@ -157,6 +299,15 @@ public final class WrapperPattern
         return new String(literal.toCharArray());
     }
 
+    // Builds a two-deep Node chain so the native side can prove wrapper-of-
+    // wrapper: head.nextNode is itself a Node-typed field on a Node.
+    private static Node makeChain()
+    {
+        final Node head = new Node(NODE_ID, freshAscii("node-head"));
+        head.nextNode   = new Node(NODE2_ID, freshAscii("node-tail"));
+        return head;
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -170,6 +321,23 @@ public final class WrapperPattern
             @Override
             public void run()
             {
+                if (WrapperPattern.mode == 1)
+                {
+                    // GC-nudge scenario: ask the JVM to collect (twice, to give a
+                    // moving collector a chance to relocate live objects), then
+                    // re-read the witness fields Java-side so the native module
+                    // can characterise a wrapper held across the GC.  This is a
+                    // best-effort hint; the native side never hard-asserts a moved
+                    // oop, only the re-resolved read.
+                    System.gc();
+                    System.gc();
+                    WrapperPattern.gcInstanceIdAfter = WrapperPattern.instance.iId;
+                    WrapperPattern.gcNodeIdAfter     = WrapperPattern.instance.node.nId;
+                    WrapperPattern.gcProbeRan        = true;
+                    WrapperPattern.done = true;
+                    return;
+                }
+
                 // Real bytecode dispatch so a native interpreter hook on bump()
                 // fires on the Java thread, and putfield mutates iValue.  mode 0
                 // bumps by a fixed delta; the native side knows the expected
