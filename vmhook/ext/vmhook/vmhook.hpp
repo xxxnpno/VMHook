@@ -13299,15 +13299,33 @@ namespace vmhook
         // array descriptors, and convert the returned jclass mirror to its Klass*.
         if (!array_klass && !class_name.empty() && class_name.front() == '[')
         {
-            if (void* const h{ vmhook::detail::jni_find_class(class_name) })
+            void* const h{ vmhook::detail::jni_find_class(class_name) };
+            if (h)
             {
                 array_klass = vmhook::detail::jni_klass_from_class_mirror(h);
                 vmhook::detail::jni_delete_local_ref(h);
-                vmhook::detail::jni_exception_clear();
             }
+            // CRITICAL: JNIEnv::FindClass leaves a pending exception
+            // (NoClassDefFoundError / ClassNotFoundException) on a MISS — and
+            // jni_find_class does NOT clear it.  The previous code only cleared
+            // inside `if (h)`, so a '[' descriptor whose ELEMENT class is missing
+            // (e.g. "[Lvmhook/fixtures/NoSuchClass;", where FindClass returns null)
+            // left that exception pending on the thread.  Under -Xcheck:jni
+            // (fastdebug HotSpot) the leaked exception aborts the next JNI call, and
+            // it can surface when the interpreter resumes after a detour.  Clear it
+            // unconditionally after the attempt — on the success path (h non-null)
+            // FindClass left nothing pending, so this is a no-op there.
+            vmhook::detail::jni_exception_clear();
         }
         if (!array_klass)
         {
+            // Belt-and-braces: clear any pending JNI exception from the resolution
+            // attempt above before returning, so a make_java_array miss never hands
+            // a leaked exception back to the caller (JNI-spec safety / -Xcheck:jni).
+            // find_class()'s context-loader path already clears on its own misses,
+            // so this is normally a no-op; it closes the residual window left by any
+            // resolution arm that did not.
+            vmhook::detail::jni_exception_clear();
             VMHOOK_LOG("{} vmhook::make_java_array('{}'): array klass not found - the array "
                        "descriptor is not loaded yet, or class_name uses the wrong syntax "
                        "(e.g. should be \"[B\" not \"byte[]\").",

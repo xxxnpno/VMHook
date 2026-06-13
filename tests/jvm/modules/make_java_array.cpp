@@ -30,7 +30,8 @@
 //
 //   NATIVE (HARD on all JDKs for primitives; best-effort for ref arrays on JDK8):
 //     For each of [Z [B [S [C [I [J [F [D [Ljava/lang/Object; [Ljava/lang/String;
-//     at length 0, 1, 3, 256, AND 100000 (the big-allocation case):
+//     at length 0, 1, 3, 16, 256, 1000, AND 100000 (the big-allocation case;
+//     16 and 1000 are the explicitly-requested "ordinary" sizes):
 //       * make_java_array(...) returns a NON-NULL oop that passes is_valid_pointer
 //         (never hand Java an invalid/mistyped oop), and
 //       * vmhook::array_length(oop) == the requested length (the _length slot was
@@ -44,6 +45,9 @@
 //       * DEEP ROUND-TRIP at len 256: write+read at [0], the MIDDLE [128], and the
 //         LAST [255] — proving the data region (offset +16) is real, sized, and
 //         addressable for the full element stride far into the array.
+//       * SECOND DEEP ROUND-TRIP at len 1000: the same [0]/[middle]/[last]
+//         write+read at a four-digit length, so the user-named 1000 size is
+//         element-verified, not just allocation-checked.
 //
 //   PASS-INTO-JAVA (the well-formed-array proof — "build from a C++ vector, then
 //   prove every element is correct Java-side"):  for each PRIMITIVE descriptor the
@@ -139,12 +143,25 @@ namespace
     // verifiers (must equal MakeJavaArray.FEED_LEN).
     constexpr std::int32_t k_feed_len{ 5 };
 
-    // The native lengths every descriptor is allocated at: 0, 1, 3, 256, and a
-    // BIG length that exercises the allocation path well past a TLAB top-up.
-    constexpr std::array<std::int32_t, 5> k_lengths{ 0, 1, 3, 256, 100000 };
+    // The native lengths every descriptor is allocated at.  Covers the empty
+    // array (0), the singleton (1), the small representative (3), the two
+    // explicitly-requested "ordinary" sizes 16 and 1000, a 256 mid size, and a
+    // BIG length (100000) that exercises the allocation path well past a TLAB
+    // top-up.  Kept STRICTLY ASCENDING; everything that needs a specific length
+    // keys off the VALUE (k_deep_len / k_mid_deep_len / k_big_len) or loops over
+    // the whole set, so the literal index of any entry never has to be tracked.
+    constexpr std::array<std::int32_t, 7> k_lengths{ 0, 1, 3, 16, 256, 1000, 100000 };
+
+    // The number of distinct lengths swept (sizes the per-length result arrays).
+    constexpr std::size_t k_length_count{ k_lengths.size() };
 
     // The "deep" length whose first / middle / last elements are round-tripped.
     constexpr std::int32_t k_deep_len{ 256 };
+
+    // A SECOND, larger round-trip length (one of the user-named sizes): elements
+    // at [0] / [middle] / [last] are written+read at length 1000 too, proving the
+    // data region stays addressable for the full stride at a four-digit length.
+    constexpr std::int32_t k_mid_deep_len{ 1000 };
 
     // The big-allocation length (must appear in k_lengths).
     constexpr std::int32_t k_big_len{ 100000 };
@@ -234,9 +251,9 @@ namespace
     // ── Per-descriptor native sweep result (filled inside the detour). ──
     struct desc_result
     {
-        std::array<std::atomic<bool>, 5> nonnull{};
-        std::array<std::atomic<bool>, 5> valid{};
-        std::array<std::atomic<bool>, 5> len_ok{};
+        std::array<std::atomic<bool>, k_length_count> nonnull{};
+        std::array<std::atomic<bool>, k_length_count> valid{};
+        std::array<std::atomic<bool>, k_length_count> len_ok{};
         // Fresh-array default-init (read [0]/[last] of an UNwritten array == 0).
         std::atomic<bool> zero_init_tested{ false };
         std::atomic<bool> zero_init_ok{ false };
@@ -249,6 +266,11 @@ namespace
         std::atomic<bool> deep_first_ok{ false };
         std::atomic<bool> deep_mid_ok{ false };
         std::atomic<bool> deep_last_ok{ false };
+        // Second deep round-trip at k_mid_deep_len (1000): [0], [middle], [last].
+        std::atomic<bool> mid_deep_tested{ false };
+        std::atomic<bool> mid_deep_first_ok{ false };
+        std::atomic<bool> mid_deep_mid_ok{ false };
+        std::atomic<bool> mid_deep_last_ok{ false };
         std::atomic<bool> stored_into_recv{ false };
         // PASS-INTO-JAVA (primitive: sum*/check*; reference: fillCheck*).
         std::atomic<bool> fed_attempted{ false };  // we tried to feed+call
@@ -256,6 +278,7 @@ namespace
         std::atomic<bool> fed_return_ok{ false };  // Java return == C++ expected
         std::atomic<bool> fed_len_ok{ false };     // Java-observed .length == feed len
         std::atomic<bool> fed_first_last_ok{ false }; // Java-observed [0]/[last] match
+        std::atomic<bool> fed_type_ok{ false };    // Java-observed getClass().getName() == descriptor
     };
 
     enum desc_index : std::size_t
@@ -305,6 +328,7 @@ namespace
     std::atomic<bool> g_multidim_nonnull{ false };
     std::atomic<bool> g_multidim_valid{ false };
     std::atomic<bool> g_multidim_len_ok{ false };
+    std::atomic<bool> g_multidim_stored{ false };   // [[I stored into recvMD for Java introspection
 
     // ── Detour bookkeeping. ──
     std::atomic<int>  g_cycle_calls{ 0 };
@@ -368,13 +392,26 @@ namespace
         }
     }
 
-    // Write+read a value into [0], [middle], and [last] of a DEEP primitive array.
+    // The four result atomics a deep round-trip writes into.  Bundling them by
+    // reference lets the SAME per-type value switch (deep_round_trip_for) target
+    // either the 256-length slots (r.deep_*) or the 1000-length slots
+    // (r.mid_deep_*) without duplicating the switch.
+    struct deep_slots
+    {
+        std::atomic<bool>& tested;
+        std::atomic<bool>& first_ok;
+        std::atomic<bool>& mid_ok;
+        std::atomic<bool>& last_ok;
+    };
+
+    // Write+read a value into [0], [middle], and [last] of a DEEP primitive array,
+    // recording the per-position outcome into the supplied slots.
     template<typename element_type>
-    auto deep_round_trip(desc_result& r, void* const oop, const std::int32_t len,
+    auto deep_round_trip(const deep_slots slots, void* const oop, const std::int32_t len,
                          const element_type first_val, const element_type mid_val,
                          const element_type last_val) -> void
     {
-        r.deep_tested.store(true);
+        slots.tested.store(true);
         if (len < 3)
         {
             return;
@@ -388,21 +425,21 @@ namespace
         const element_type gl{ vmhook::get_array_element<element_type>(oop, len - 1) };
         if constexpr (std::is_same_v<element_type, float>)
         {
-            r.deep_first_ok.store(float_bits(g0) == float_bits(first_val));
-            r.deep_mid_ok.store(float_bits(gm) == float_bits(mid_val));
-            r.deep_last_ok.store(float_bits(gl) == float_bits(last_val));
+            slots.first_ok.store(float_bits(g0) == float_bits(first_val));
+            slots.mid_ok.store(float_bits(gm) == float_bits(mid_val));
+            slots.last_ok.store(float_bits(gl) == float_bits(last_val));
         }
         else if constexpr (std::is_same_v<element_type, double>)
         {
-            r.deep_first_ok.store(double_bits(g0) == double_bits(first_val));
-            r.deep_mid_ok.store(double_bits(gm) == double_bits(mid_val));
-            r.deep_last_ok.store(double_bits(gl) == double_bits(last_val));
+            slots.first_ok.store(double_bits(g0) == double_bits(first_val));
+            slots.mid_ok.store(double_bits(gm) == double_bits(mid_val));
+            slots.last_ok.store(double_bits(gl) == double_bits(last_val));
         }
         else
         {
-            r.deep_first_ok.store(g0 == first_val);
-            r.deep_mid_ok.store(gm == mid_val);
-            r.deep_last_ok.store(gl == last_val);
+            slots.first_ok.store(g0 == first_val);
+            slots.mid_ok.store(gm == mid_val);
+            slots.last_ok.store(gl == last_val);
         }
     }
 
@@ -454,42 +491,58 @@ namespace
         }
     }
 
-    auto deep_round_trip_for(std::size_t di, void* const oop, std::int32_t len) -> void
+    // Drive a deep round-trip for descriptor `di` at length `len`, recording into
+    // the supplied result slots (so the same per-type value table serves both the
+    // 256-length and the 1000-length round-trips).
+    auto deep_round_trip_into(std::size_t di, const deep_slots slots, void* const oop, std::int32_t len) -> void
     {
-        desc_result& r{ g_results[di] };
         switch (di)
         {
-            case D_Z: deep_round_trip<bool>(r, oop, len, true, false, true); break;
-            case D_B: deep_round_trip<std::int8_t>(r, oop, len,
+            case D_Z: deep_round_trip<bool>(slots, oop, len, true, false, true); break;
+            case D_B: deep_round_trip<std::int8_t>(slots, oop, len,
                           std::numeric_limits<std::int8_t>::min(),
                           static_cast<std::int8_t>(42),
                           std::numeric_limits<std::int8_t>::max()); break;
-            case D_S: deep_round_trip<std::int16_t>(r, oop, len,
+            case D_S: deep_round_trip<std::int16_t>(slots, oop, len,
                           std::numeric_limits<std::int16_t>::min(),
                           static_cast<std::int16_t>(0x1234),
                           std::numeric_limits<std::int16_t>::max()); break;
-            case D_C: deep_round_trip<std::uint16_t>(r, oop, len,
+            case D_C: deep_round_trip<std::uint16_t>(slots, oop, len,
                           static_cast<std::uint16_t>(0x0000),
                           static_cast<std::uint16_t>(0xABCD),
                           static_cast<std::uint16_t>(0xFFFF)); break;
-            case D_I: deep_round_trip<std::int32_t>(r, oop, len,
+            case D_I: deep_round_trip<std::int32_t>(slots, oop, len,
                           std::numeric_limits<std::int32_t>::min(),
                           static_cast<std::int32_t>(0x0BADF00D),
                           std::numeric_limits<std::int32_t>::max()); break;
-            case D_J: deep_round_trip<std::int64_t>(r, oop, len,
+            case D_J: deep_round_trip<std::int64_t>(slots, oop, len,
                           std::numeric_limits<std::int64_t>::min(),
                           static_cast<std::int64_t>(0x0123456789ABCDEFLL),
                           std::numeric_limits<std::int64_t>::max()); break;
-            case D_F: deep_round_trip<float>(r, oop, len,
+            case D_F: deep_round_trip<float>(slots, oop, len,
                           std::numeric_limits<float>::quiet_NaN(),
                           3.14159F,
                           -0.0F); break;
-            case D_D: deep_round_trip<double>(r, oop, len,
+            case D_D: deep_round_trip<double>(slots, oop, len,
                           std::numeric_limits<double>::quiet_NaN(),
                           2.718281828459045,
                           -0.0); break;
             default: break;
         }
+    }
+
+    // Deep round-trip at k_deep_len (256) -> r.deep_* slots.
+    auto deep_round_trip_for(std::size_t di, void* const oop, std::int32_t len) -> void
+    {
+        desc_result& r{ g_results[di] };
+        deep_round_trip_into(di, deep_slots{ r.deep_tested, r.deep_first_ok, r.deep_mid_ok, r.deep_last_ok }, oop, len);
+    }
+
+    // Deep round-trip at k_mid_deep_len (1000) -> r.mid_deep_* slots.
+    auto mid_deep_round_trip_for(std::size_t di, void* const oop, std::int32_t len) -> void
+    {
+        desc_result& r{ g_results[di] };
+        deep_round_trip_into(di, deep_slots{ r.mid_deep_tested, r.mid_deep_first_ok, r.mid_deep_mid_ok, r.mid_deep_last_ok }, oop, len);
     }
 
     // ── PASS-INTO-JAVA: build a length-k_feed_len primitive array from a C++
@@ -505,6 +558,11 @@ namespace
     //                with the identical formula).
     // first_w/last_w : the long the verifier records for [0] / [last] (so we can
     //                  cross-check the per-element witnesses too).
+    // fed_type_field : the fed*Type witness the verifier set to
+    //                  arg.getClass().getName(); we assert it equals the descriptor
+    //                  (a primitive array's binary name IS its descriptor, e.g.
+    //                  "[Z"/"[I"/"[D"), so Java introspected the made array's klass
+    //                  /component type as exactly the type we asked for.
     template<typename element_type>
     auto feed_and_call(std::size_t di, const std::unique_ptr<mja>& self,
                        const char* method_name,
@@ -512,7 +570,7 @@ namespace
                        const std::int64_t expected,
                        const std::int64_t first_w, const std::int64_t last_w,
                        const char* fed_len_field, const char* fed_first_field,
-                       const char* fed_last_field) -> void
+                       const char* fed_last_field, const char* fed_type_field) -> void
     {
         desc_result& r{ g_results[di] };
         r.fed_attempted.store(true);
@@ -555,6 +613,10 @@ namespace
         const std::int64_t obs_first{ mja::get_long(fed_first_field) };
         const std::int64_t obs_last{ mja::get_long(fed_last_field) };
         r.fed_first_last_ok.store(obs_first == first_w && obs_last == last_w);
+
+        // INTROSPECTION: the Java verifier recorded arg.getClass().getName(); for a
+        // primitive array that binary name is the descriptor verbatim ("[Z".."[D").
+        r.fed_type_ok.store(mja::get_str(fed_type_field) == spec.descriptor);
     }
 
     // Build the per-descriptor feed vector + expected checksum, then feed+call.
@@ -575,7 +637,7 @@ namespace
                 const std::int64_t first_w{ vals[0] ? 1 : 0 };
                 const std::int64_t last_w{ vals[static_cast<std::size_t>(k_feed_len - 1)] ? 1 : 0 };
                 feed_and_call<bool>(di, self, "sumBoolArray", vals, exp, first_w, last_w,
-                                    "fedZLen", "fedZFirst", "fedZLast");
+                                    "fedZLen", "fedZFirst", "fedZLast", "fedZType");
                 break;
             }
             case D_B:
@@ -595,7 +657,7 @@ namespace
                 feed_and_call<std::int8_t>(di, self, "sumByteArray", vals, exp,
                                            static_cast<std::int64_t>(vals[0]),
                                            static_cast<std::int64_t>(vals[static_cast<std::size_t>(k_feed_len - 1)]),
-                                           "fedBLen", "fedBFirst", "fedBLast");
+                                           "fedBLen", "fedBFirst", "fedBLast", "fedBType");
                 break;
             }
             case D_S:
@@ -614,7 +676,7 @@ namespace
                 feed_and_call<std::int16_t>(di, self, "sumShortArray", vals, exp,
                                             static_cast<std::int64_t>(vals[0]),
                                             static_cast<std::int64_t>(vals[static_cast<std::size_t>(k_feed_len - 1)]),
-                                            "fedSLen", "fedSFirst", "fedSLast");
+                                            "fedSLen", "fedSFirst", "fedSLast", "fedSType");
                 break;
             }
             case D_C:
@@ -634,7 +696,7 @@ namespace
                 feed_and_call<std::uint16_t>(di, self, "sumCharArray", vals, exp,
                                              static_cast<std::int64_t>(vals[0]),
                                              static_cast<std::int64_t>(vals[static_cast<std::size_t>(k_feed_len - 1)]),
-                                             "fedCLen", "fedCFirst", "fedCLast");
+                                             "fedCLen", "fedCFirst", "fedCLast", "fedCType");
                 break;
             }
             case D_I:
@@ -651,7 +713,7 @@ namespace
                 feed_and_call<std::int32_t>(di, self, "sumIntArray", vals, exp,
                                             static_cast<std::int64_t>(vals[0]),
                                             static_cast<std::int64_t>(vals[static_cast<std::size_t>(k_feed_len - 1)]),
-                                            "fedILen", "fedIFirst", "fedILast");
+                                            "fedILen", "fedIFirst", "fedILast", "fedIType");
                 break;
             }
             case D_J:
@@ -670,7 +732,7 @@ namespace
                 }
                 feed_and_call<std::int64_t>(di, self, "sumLongArray", vals, exp,
                                             vals[0], vals[static_cast<std::size_t>(k_feed_len - 1)],
-                                            "fedJLen", "fedJFirst", "fedJLast");
+                                            "fedJLen", "fedJFirst", "fedJLast", "fedJType");
                 break;
             }
             case D_F:
@@ -693,7 +755,7 @@ namespace
                 const std::int64_t first_w{ static_cast<std::int64_t>(float_bits(vals[0])) };
                 const std::int64_t last_w{ static_cast<std::int64_t>(float_bits(vals[static_cast<std::size_t>(k_feed_len - 1)])) };
                 feed_and_call<float>(di, self, "checkFloatArray", vals, exp, first_w, last_w,
-                                     "fedFLen", "fedFFirst", "fedFLast");
+                                     "fedFLen", "fedFFirst", "fedFLast", "fedFType");
                 break;
             }
             case D_D:
@@ -715,7 +777,7 @@ namespace
                 const std::int64_t first_w{ to_i64(double_bits(vals[0])) };
                 const std::int64_t last_w{ to_i64(double_bits(vals[static_cast<std::size_t>(k_feed_len - 1)])) };
                 feed_and_call<double>(di, self, "checkDoubleArray", vals, exp, first_w, last_w,
-                                      "fedDLen", "fedDFirst", "fedDLast");
+                                      "fedDLen", "fedDFirst", "fedDLast", "fedDType");
                 break;
             }
             default: break;
@@ -801,6 +863,10 @@ namespace
                     {
                         deep_round_trip_for(di, oop, len);
                     }
+                    if (len == k_mid_deep_len)
+                    {
+                        mid_deep_round_trip_for(di, oop, len);
+                    }
                 }
             }
 
@@ -861,7 +927,9 @@ namespace
                 && vmhook::array_length(oop) == k_witness_len);
         }
 
-        // ── 6. MULTI-DIM array ("[[I"). ──
+        // ── 6. MULTI-DIM array ("[[I").  Allocate, length-check, AND store into
+        //       recvMD so captureAll() can introspect the JVM's view of its
+        //       (outer) component type Java-side. ──
         {
             void* const oop{ vmhook::make_java_array("[[I", k_witness_len, sizeof(std::uint32_t)) };
             const bool nn{ oop != nullptr };
@@ -869,16 +937,29 @@ namespace
             g_multidim_nonnull.store(nn);
             g_multidim_valid.store(valid);
             g_multidim_len_ok.store(valid && vmhook::array_length(oop) == k_witness_len);
+            if (valid)
+            {
+                const auto field{ mja::static_field("recvMD") };
+                if (field.has_value())
+                {
+                    std::unique_ptr<java_array_w> carrier{ std::make_unique<java_array_w>(oop) };
+                    field->set(carrier);
+                    g_multidim_stored.store(true);
+                }
+            }
         }
 
-        // DEFENSIVE (and a documented lib finding): make_java_array's internal
-        // find_class() goes through JNIEnv::FindClass, which leaves a PENDING JNI
-        // exception (NoClassDefFoundError / ClassNotFoundException) on a miss.
-        // make_java_array only clears it on the '['-prefixed fallback path AND
-        // only when that fallback's FindClass succeeds; for a non-'[' descriptor,
-        // or a '[' descriptor whose ELEMENT class is missing, the pending
-        // exception is left set on the thread.  Clear it here so it never poisons
-        // the probe's own bytecode (captureAll / done=true); see lib_bugs note.
+        // DEFENSIVE belt-and-braces.  The pending-JNI-exception leak on
+        // make_java_array's malformed-descriptor miss path (its fallback
+        // JNIEnv::FindClass set a NoClassDefFoundError that was only cleared when
+        // that FindClass SUCCEEDED — so "[Lvmhook/fixtures/NoSuchClass;" left one
+        // pending) is now FIXED IN THE LIBRARY: make_java_array clears the pending
+        // exception unconditionally after the resolution attempt and again before
+        // any null return (vmhook.hpp make_java_array, "CRITICAL"/"Belt-and-braces"
+        // notes).  This clear stays as a floor anyway — the detour issues many other
+        // JNI/interpreter calls (method_proxy::call, field_proxy::set), and a clean
+        // slate before captureAll()/done=true keeps the probe robust on a checked
+        // JVM regardless of any future regression.
         vmhook::jni::exception_clear();
     }
 
@@ -1000,26 +1081,45 @@ namespace
                 ctx.check(std::string{ "native_deep_first_round_trips_" } + tag[di], r.deep_first_ok.load());
                 ctx.check(std::string{ "native_deep_middle_round_trips_" } + tag[di], r.deep_mid_ok.load());
                 ctx.check(std::string{ "native_deep_last_round_trips_" } + tag[di], r.deep_last_ok.load());
+                // Second deep round-trip at the user-named length 1000.
+                ctx.check(std::string{ "native_len1000_round_trip_tested_" } + tag[di], r.mid_deep_tested.load());
+                ctx.check(std::string{ "native_len1000_first_round_trips_" } + tag[di], r.mid_deep_first_ok.load());
+                ctx.check(std::string{ "native_len1000_middle_round_trips_" } + tag[di], r.mid_deep_mid_ok.load());
+                ctx.check(std::string{ "native_len1000_last_round_trips_" } + tag[di], r.mid_deep_last_ok.load());
             }
         }
 
-        // [B and [C are the load-bearing primitives make_java_string depends on.
+        // [B and [C are the load-bearing primitives make_java_string depends on:
+        // every swept length (0, 1, 3, 16, 256, 1000, 100000) must allocate and
+        // report the right length.  Loop over the whole set so the invariant tracks
+        // k_lengths automatically.
         {
-            const bool b_all{ g_results[D_B].len_ok[0].load() && g_results[D_B].len_ok[1].load()
-                             && g_results[D_B].len_ok[2].load() && g_results[D_B].len_ok[3].load()
-                             && g_results[D_B].len_ok[4].load() };
-            const bool c_all{ g_results[D_C].len_ok[0].load() && g_results[D_C].len_ok[1].load()
-                             && g_results[D_C].len_ok[2].load() && g_results[D_C].len_ok[3].load()
-                             && g_results[D_C].len_ok[4].load() };
+            bool b_all{ true };
+            bool c_all{ true };
+            for (std::size_t k{ 0 }; k < k_length_count; ++k)
+            {
+                if (!g_results[D_B].len_ok[k].load()) { b_all = false; }
+                if (!g_results[D_C].len_ok[k].load()) { c_all = false; }
+            }
             ctx.check("byte_array_all_lengths_ok_make_java_string_dependency", b_all);
             ctx.check("char_array_all_lengths_ok_make_java_string_dependency", c_all);
         }
 
         // Big-allocation (100k) primitive invariant: every primitive descriptor
         // must allocate and report the right length at the large size.  HARD on
-        // all JDKs (k_lengths[4] is the big length; index reused below).
+        // all JDKs.  The big length's index in k_lengths is derived (not hardcoded)
+        // so reordering / extending k_lengths can't silently point this at the
+        // wrong slot.
         {
-            constexpr std::size_t big_k{ 4 };
+            constexpr std::size_t big_k{ []() constexpr -> std::size_t
+            {
+                for (std::size_t i{ 0 }; i < k_length_count; ++i)
+                {
+                    if (k_lengths[i] == k_big_len) { return i; }
+                }
+                return k_length_count;   // unreachable: k_big_len is in k_lengths
+            }() };
+            static_assert(big_k < k_length_count, "k_big_len must appear in k_lengths");
             static_assert(k_lengths[big_k] == k_big_len, "big length index drift");
             bool all_big_primitives_ok{ true };
             for (std::size_t di{ 0 }; di < D_COUNT; ++di)
@@ -1048,6 +1148,9 @@ namespace
             ctx.check(std::string{ "java_feed_return_matches_cpp_checksum_" } + tag[di], r.fed_return_ok.load());
             ctx.check(std::string{ "java_feed_observed_length_5_" } + tag[di], r.fed_len_ok.load());
             ctx.check(std::string{ "java_feed_observed_first_last_match_" } + tag[di], r.fed_first_last_ok.load());
+            // INTROSPECTION (component type): the fed array's Java getClass().getName()
+            // equals the descriptor we asked for ("[Z".."[D").
+            ctx.check(std::string{ "java_feed_observed_classname_matches_descriptor_" } + tag[di], r.fed_type_ok.load());
         }
 
         // Reference fillers: best-effort (gated on the made array existing).  When
@@ -1104,6 +1207,30 @@ namespace
         {
             ctx.check("multidim_int_array_valid_oop", g_multidim_valid.load());
             ctx.check("multidim_int_array_length_matches", g_multidim_len_ok.load());
+
+            // INTROSPECTION: when the [[I was stored into recvMD, captureAll() read
+            // its .length and getClass().getName() with real bytecode.  The JVM's
+            // binary name for a 2-D int array is "[[I", so this proves both the
+            // outer length (3) and the multidim component type are Java-correct.
+            if (probe_done && g_multidim_stored.load())
+            {
+                const std::int32_t obs_len{ mja::get_int("obsLenMD") };
+                const std::string  obs_type{ mja::get_str("obsTypeMD") };
+                const bool         obs_null{ mja::get_bool("obsNullMD") };
+                ctx.record(std::string{ "[INFO] multidim recvMD: obsNull=" }
+                           + (obs_null ? "true" : "false")
+                           + " obsLen=" + std::to_string(obs_len)
+                           + " obsType='" + obs_type + "' (expected '[[I')");
+                ctx.check("multidim_int_array_java_not_null", obs_null == false);
+                ctx.check("multidim_int_array_java_length_is_3", obs_len == k_witness_len);
+                ctx.check("multidim_int_array_java_classname_is_2D_int", obs_type == "[[I");
+            }
+            else
+            {
+                ctx.record("[INFO] multidim_int_array Java introspection: SKIPPED — the made "
+                           "[[I was not stored into recvMD on this JVM (late-sweep unrooted-oop "
+                           "GC pressure). Native length/valid coverage remains the floor.");
+            }
         }
         else
         {

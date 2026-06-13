@@ -96,6 +96,8 @@ public final class MakeJavaArray
     public static Object recvD   = "<<unwritten-D>>";
     public static Object recvObj = "<<unwritten-Obj>>";
     public static Object recvStr = "<<unwritten-Str>>";
+    /** Receiver for the multi-dimensional ("[[I") made array. */
+    public static Object recvMD  = "<<unwritten-MD>>";
 
     // =====================================================================
     //  Witnesses captured by captureAll() with genuine Java bytecode.
@@ -117,6 +119,7 @@ public final class MakeJavaArray
     public static int     obsLenD;   public static String obsTypeD   = "";  public static boolean obsNullD;
     public static int     obsLenObj; public static String obsTypeObj = "";  public static boolean obsNullObj;
     public static int     obsLenStr; public static String obsTypeStr = "";  public static boolean obsNullStr;
+    public static int     obsLenMD;  public static String obsTypeMD  = "";  public static boolean obsNullMD;
 
     // =====================================================================
     //  PASS-INTO-JAVA witnesses.  The native side builds a primitive array from a
@@ -209,6 +212,7 @@ public final class MakeJavaArray
         obsNullD   = (recvD   == null); obsLenD   = lengthOf(recvD);   obsTypeD   = typeOf(recvD);
         obsNullObj = (recvObj == null); obsLenObj = lengthOf(recvObj); obsTypeObj = typeOf(recvObj);
         obsNullStr = (recvStr == null); obsLenStr = lengthOf(recvStr); obsTypeStr = typeOf(recvStr);
+        obsNullMD  = (recvMD  == null); obsLenMD  = lengthOf(recvMD);  obsTypeMD  = typeOf(recvMD);
     }
 
     // =====================================================================
