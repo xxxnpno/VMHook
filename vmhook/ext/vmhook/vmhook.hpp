@@ -1644,6 +1644,18 @@ namespace vmhook
     class map;
     class hash_map;
 
+    // Upper bound, in CHARACTERS, on the String read_java_string will decode.
+    // The backing-array length is validated against this (in char units, the same
+    // ceiling for the JDK 8 char[], JDK 9+ LATIN1, and JDK 9+ UTF16 layouts)
+    // before any allocation or body read, so a corrupt array length can neither
+    // drive an unbounded allocation nor a read that walks past the array.  It is
+    // deliberately far above any realistic String (and far below INT32_MAX, so all
+    // the body-size arithmetic — up to 2 bytes per char — stays within int32):
+    // it exists to reject corruption, not to truncate legitimate text.  Raised
+    // from the old hard 4096-char cap that made longer Strings decode to "" (the
+    // doc even mis-claimed it "truncated") — robustness bug #29.
+    inline constexpr std::int32_t read_java_string_max_units{ 16 * 1024 * 1024 };
+
     inline auto read_java_string(void* string_oop)
         -> std::string;
 
@@ -8901,6 +8913,27 @@ namespace vmhook
             return empty;
         }
 
+        // Enforce the same stack-growth invariant stack_trace() does (kept in
+        // lockstep — the twins must share one safety discipline): callers live
+        // at HIGHER addresses on x86-64, so a valid interpreter saved-rbp is
+        // strictly above the current slot and a sane frame size apart.  A
+        // caller_rbp that is not above caller_rbp_slot — or absurdly far above
+        // it — means the immediate caller is NOT an interpreter frame (compiled
+        // / native trampoline, or the chain has strayed into garbage); bail with
+        // an empty result instead of dereferencing [caller_rbp - 24] at an
+        // arbitrary address.  is_valid_pointer alone accepts any mapped page
+        // (including a readable-but-wrong frame), so without this guard a
+        // compiled immediate caller could yield a confidently-wrong caller_info
+        // rather than the documented valid()==false.
+        {
+            const std::uintptr_t cur_addr{ reinterpret_cast<std::uintptr_t>(caller_rbp_slot) };
+            const std::uintptr_t cal_addr{ reinterpret_cast<std::uintptr_t>(caller_rbp) };
+            if (cal_addr <= cur_addr || (cal_addr - cur_addr) > (std::uintptr_t{ 1 } << 20))
+            {
+                return empty;
+            }
+        }
+
         // The Method* lives 3 words (24 bytes) below rbp in the
         // interpreter frame layout (see frame::get_method for the
         // matching read on the current frame).
@@ -8942,13 +8975,24 @@ namespace vmhook
                     vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
                 if (pool_holder_entry)
                 {
-                    auto* const klass{ *reinterpret_cast<vmhook::hotspot::klass* const*>(
-                        reinterpret_cast<const std::uint8_t*>(cp) + pool_holder_entry->offset) };
-                    if (klass && vmhook::hotspot::is_valid_pointer(klass))
+                    // Gate the _pool_holder slot address itself with
+                    // is_valid_pointer before dereferencing it — kept in lockstep
+                    // with stack_trace()'s class-name walk so the two share one
+                    // safety discipline (a stray cp would otherwise be read at
+                    // cp + offset without a gate).
+                    const auto* const slot{
+                        reinterpret_cast<const std::uint8_t*>(cp) + pool_holder_entry->offset };
+                    if (vmhook::hotspot::is_valid_pointer(slot))
                     {
-                        if (auto* const name_symbol{ klass->get_name() })
+                        auto* const klass{
+                            *reinterpret_cast<vmhook::hotspot::klass* const*>(slot) };
+                        if (klass && vmhook::hotspot::is_valid_pointer(klass))
                         {
-                            info.class_name = name_symbol->to_string();
+                            if (auto* const name_symbol{ klass->get_name() };
+                                name_symbol && vmhook::hotspot::is_valid_pointer(name_symbol))
+                            {
+                                info.class_name = name_symbol->to_string();
+                            }
                         }
                     }
                 }
@@ -14550,8 +14594,19 @@ namespace vmhook
             @details
             This is the only field setter exposed by field_proxy. It accepts JVM
             primitives, std::string for java.lang.String, and std::vector<T> for
-            Java arrays. String and array writes update the existing Java object
-            in place because this zero-JNI layer cannot resize Java heap objects.
+            Java arrays.
+
+            A std::string / string_view / const char* write to a java.lang.String
+            field REBINDS the field to a freshly-built java.lang.String (an
+            object-reference store, like a Java `field = value;`): it constructs a
+            new, correctly-encoded String of any length and stores a reference to
+            it, so the written value equals the input exactly (library bug #30).
+            It does NOT mutate the previous String's backing array, so a shared /
+            interned String referenced elsewhere is never corrupted.
+
+            Array writes still update the existing Java array object in place
+            (element-by-element, capped at the existing length) because this
+            zero-JNI layer does not resize Java arrays.
         */
         template<typename value_type>
         auto set(const value_type& value) const noexcept
@@ -14591,11 +14646,20 @@ namespace vmhook
 
             if constexpr (std::is_same_v<clean_value_type, std::string>)
             {
-                vmhook::set_str_field(*this, value);
+                // Build a real java.lang.String and rebind the field to it (an
+                // object-reference store), NOT an in-place overwrite of the
+                // existing backing array.  The old set_str_field path truncated
+                // longer inputs, left stale tail bytes for shorter ones, corrupted
+                // UTF-16-coder targets, and could mutate a shared interned literal;
+                // store_string() constructs an independent, correctly-encoded
+                // String of any length and is GC-safe (library bug #30).
+                this->store_string(std::string_view{ value });
             }
             else if constexpr (std::is_convertible_v<value_type, std::string_view> && !std::is_same_v<clean_value_type, std::string>)
             {
-                vmhook::set_str_field(*this, std::string_view{ value });
+                // string_view / const char* / std::string-like: same real-String
+                // construction + reference store as the std::string arm above.
+                this->store_string(std::string_view{ value });
             }
             else if constexpr (vmhook::detail::is_vector_v<clean_value_type>)
             {
@@ -14832,6 +14896,147 @@ namespace vmhook
         }
 
     private:
+        /*
+            @brief Stores a (raw, decoded) heap oop into this reference field as a
+                   compressed-OOP reference write.
+            @details
+            This is the SET counterpart of get_compressed_oop(): it resolves the
+            live address of the field slot and overwrites the 32-bit compressed OOP
+            it holds with the narrow encoding of `decoded_oop` (nullptr writes a
+            null reference).  It mirrors get_compressed_oop()'s GC-stable address
+            resolution exactly — for a STATIC field it re-resolves the *current*
+            java.lang.Class mirror through the GC-stable mirror_klass at write time
+            (a relocating G1 GC can move the mirror after static_field() cached
+            field_pointer, so writing the cached address could clobber a stale or
+            unmapped page), while an instance field (mirror_klass == null) writes
+            through field_pointer unchanged, byte-identical to the legacy path.
+
+            The store goes through os::safe_write so a transiently-unmapped or
+            read-only destination becomes a clean no-op (false) instead of a
+            faulting / partial write, matching set_arg's interpreter-slot write.
+
+            GC-SAFETY OF THE VALUE: the field slot is itself a GC root once the
+            reference lands in it, but the window between allocating `decoded_oop`
+            and this store is not — the CALLER must keep `decoded_oop` reachable
+            (e.g. via a live JNI local reference) across this call so an
+            interleaved GC cannot collect or relocate it out from under the write.
+            store_string() below satisfies that contract.
+
+            @param decoded_oop  Raw decoded heap oop to store (nullptr -> null ref).
+            @return  true if the compressed OOP was written; false on any failure
+                     (non-reference field, unresolvable mirror, unmapped slot).
+        */
+        auto store_object_oop(void* const decoded_oop) const noexcept
+            -> bool
+        {
+            // Only reference / array fields hold a compressed OOP; refuse a
+            // primitive slot so a misused proxy can never reinterpret/overwrite a
+            // primitive's bytes as a narrow reference (symmetric with
+            // get_compressed_oop()'s is_reference() guard).
+            if (!this->is_reference())
+            {
+                return false;
+            }
+
+            // GC-stable re-resolution, identical to get_compressed_oop(): a static
+            // field's slot lives at mirror_oop + field_offset, and the mirror is a
+            // relocatable heap oop, so re-fetch its CURRENT address through the
+            // GC-stable mirror_klass before writing.  Instance fields (and statics
+            // built via the legacy 3-arg ctor) keep field_pointer verbatim.
+            void* write_pointer{ this->field_pointer };
+            if (this->mirror_klass)
+            {
+                void* const live_mirror{ this->mirror_klass->get_java_mirror() };
+                if (live_mirror && vmhook::hotspot::is_valid_pointer(live_mirror))
+                {
+                    write_pointer = reinterpret_cast<std::uint8_t*>(live_mirror) + this->field_offset;
+                }
+            }
+
+            if (!write_pointer || !vmhook::hotspot::is_valid_pointer(write_pointer))
+            {
+                return false;
+            }
+
+            // narrow-encode the oop (encode_oop_pointer maps nullptr -> 0, the
+            // correct representation of a null reference) and store the 4-byte
+            // compressed OOP through the fault-safe path.
+            const std::uint32_t compressed{ vmhook::hotspot::encode_oop_pointer(decoded_oop) };
+            return vmhook::os::safe_write(write_pointer, &compressed, sizeof(compressed));
+        }
+
+        /*
+            @brief Builds a genuine java.lang.String from UTF-8 text and stores a
+                   reference to it into this String field (GC-safe).
+            @details
+            The CORRECT implementation of "assign a std::string to a String field":
+            it does NOT overwrite the existing String's backing array in place
+            (which truncated longer inputs, left stale tail bytes for shorter ones,
+            corrupted UTF-16-coder targets, and could even mutate a shared interned
+            literal).  Instead it constructs a brand-new, correctly-encoded
+            java.lang.String oop and rebinds the field to it as an object-reference
+            store — the same semantics as a Java `field = value;` putfield/putstatic.
+
+            The String is built via the SAME length-counted UTF-16 path the method-
+            argument String injection uses (jni_new_string_utf16_local -> NewString,
+            slot 163), so it is content-exact for every code point: interior NULs are
+            preserved (counted length, not a C string), astral scalars become proper
+            surrogate pairs, and the JVM picks the LATIN1/UTF16 coder itself.  That
+            JNI call also returns a LOCAL REFERENCE, which roots the new String for
+            the whole operation — so even if encoding/storing triggers a GC, the
+            String cannot be collected or relocated out from under store_object_oop().
+            If the JNI String path is unavailable we fall back to make_java_string()
+            (the GC-aware allocator), exactly mirroring return_value::set_arg.
+
+            On success the field references a full, independent String equal to
+            `value` at any length; the local reference is released afterwards (the
+            field slot is now the GC root keeping it alive).
+
+            @param value  UTF-8 text to encode and bind into the field.
+            @return  true if a new String was built and stored; false otherwise
+                     (the field is left untouched on failure).
+        */
+        auto store_string(const std::string_view value) const noexcept
+            -> bool
+        {
+            // Length-counted UTF-16 (NOT NewStringUTF): a std::string is standard
+            // UTF-8, so an interior NUL is a real U+0000 and astral bytes must
+            // decode to surrogate pairs — NewStringUTF would truncate / mangle
+            // both.  The returned handle is a JNI local ref that keeps the new
+            // String rooted across the store below (GC-safety of the value).
+            void* const string_handle{ vmhook::detail::jni_new_string_utf16_local(value) };
+            void* const string_oop{ string_handle
+                ? vmhook::detail::jni_decode_object(string_handle)
+                : vmhook::make_java_string(value) };
+            if (!string_oop)
+            {
+                vmhook::detail::jni_delete_local_ref(string_handle);
+                VMHOOK_LOG("{} field_proxy::set: failed to build a java.lang.String for a "
+                           "String-field write (sig='{}') at {:p} ({} field) - both the JNI "
+                           "NewString path and the make_java_string fallback returned null; "
+                           "the field is left unchanged.",
+                           vmhook::error_tag, this->signature_text, this->field_pointer,
+                           this->static_field ? "static" : "instance");
+                return false;
+            }
+
+            // Rebind the field to the new String (object-reference store).  The
+            // local ref above is still alive, so the String is a live GC root for
+            // the whole of store_object_oop(); only after it lands in the field
+            // (itself a GC root) do we release the local ref.
+            const bool stored{ this->store_object_oop(string_oop) };
+            if (!stored)
+            {
+                VMHOOK_LOG("{} field_proxy::set: built a java.lang.String but could not store "
+                           "the reference into the field (sig='{}') at {:p} ({} field) - the "
+                           "slot was unresolvable / unmapped; the field is left unchanged.",
+                           vmhook::error_tag, this->signature_text, this->field_pointer,
+                           this->static_field ? "static" : "instance");
+            }
+            vmhook::detail::jni_delete_local_ref(string_handle);
+            return stored;
+        }
+
         void* field_pointer;
         std::string signature_text;
         bool        static_field;
@@ -16003,6 +16208,55 @@ namespace vmhook
 
             //  Decode result
             thread->set_thread_state(previous_state);
+
+            // SURFACE + CLEAR a Java exception thrown by the callee.
+            //
+            // The raw call stub does NOT clear a pending exception the way the
+            // JNI call gate does: if the invoked Java method threw, the
+            // exception is parked on the JavaThread and remains PENDING after the
+            // stub returns.  The call_jni() path runs check_callee_exception()
+            // after every Call(Static)?<Type>MethodA (which ExceptionDescribe-s
+            // and clears it); the call-stub fast path historically had no such
+            // step, so a throwing call() returned to native with the exception
+            // STILL SET on the thread.  The very next JNI op on that thread (the
+            // next call()'s GetMethodID, a field read, anything) then ran in
+            // ExceptionOccurred state and misbehaved ("the method seemed to run
+            // but nothing happened"), and on -Xcheck:jni (fastdebug HotSpot) the
+            // leaked exception aborts the next JNI call; worse, it could unwind
+            // out of an interpreter frame and propagate as an uncaught exception.
+            //
+            // Mirror call_jni's check_callee_exception() here so BOTH dispatch
+            // paths leave the thread clean: ExceptionDescribe (slot 16) prints
+            // the backtrace AND clears the exception (the library's intended
+            // surfacing channel); fall back to ExceptionClear (slot 17) if
+            // Describe is unavailable.  ensure_current_java_thread() was already
+            // called before the stub (it populates current_jni_env via GetEnv),
+            // so the env is live here; the whole block is a guarded no-op when
+            // no exception is pending or the env/slots cannot be resolved.
+            if (void* const env{ vmhook::hotspot::current_jni_env })
+            {
+                using exception_check_t    = std::uint8_t (*)(void*);
+                using exception_describe_t = void (*)(void*);
+                using exception_clear_t    = void (*)(void*);
+                auto* const exc_check{ vmhook::detail::jni_function<228, exception_check_t>(env) };
+                if (exc_check && exc_check(env) != 0u)
+                {
+                    VMHOOK_LOG("{} method_proxy::call('{}{}'): Java exception thrown by callee "
+                               "(call-stub path); surfacing + clearing so the thread is left clean.",
+                               vmhook::error_tag, this->name(), selected_signature);
+                    if (auto* const exc_desc{ vmhook::detail::jni_function<16, exception_describe_t>(env) })
+                    {
+                        exc_desc(env);
+                    }
+                    if (exc_check(env) != 0u)
+                    {
+                        if (auto* const exc_clr{ vmhook::detail::jni_function<17, exception_clear_t>(env) })
+                        {
+                            exc_clr(env);
+                        }
+                    }
+                }
+            }
 
             switch (ret_char)
             {
@@ -18566,8 +18820,14 @@ namespace vmhook
           K key; V value; Entry left, right, parent; boolean color.
 
         Uses an iterative traversal with a small stack so deeply-balanced
-        trees do not blow the C++ stack.  The HashMap-equivalent depth cap
-        keeps a malformed tree from looping forever.
+        trees do not blow the C++ stack.  TWO independent caps keep a malformed
+        tree from running away: the OUTER `visited` cap bounds the total number
+        of popped (emitted) nodes, and the INNER left-spine descent carries its
+        OWN `descended` cap so a corrupt `left`-pointer CYCLE cannot push onto
+        the stack without bound (the outer cap is only re-checked AFTER a pop,
+        which a spinning inner loop never reaches — so the inner loop must guard
+        itself).  Both caps use k_max_safe_container_elems, matching the HashMap
+        walker's per-bucket guard.
     */
     template<typename key_type, typename value_type, typename out_t>
     inline auto tree_map_walk_entries(void* const map_oop, out_t& out) -> void
@@ -18600,10 +18860,19 @@ namespace vmhook
         void* node_oop{ root_oop };
         std::int32_t visited{ 0 };
 
+        // INNER left-spine cap: a corrupt `left`-pointer cycle would push onto
+        // `stack` forever (the outer `visited` cap is only re-checked after a
+        // pop, which a spinning inner descent never reaches).  Bound the descent
+        // by k_max_safe_container_elems, matching the HashMap walker's guard.
+        constexpr std::int32_t k_descend_cap{
+            static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) };
         while ((node_oop && vmhook::hotspot::is_valid_pointer(node_oop)) || !stack.empty())
         {
             // Walk the left spine first.
-            while (node_oop && vmhook::hotspot::is_valid_pointer(node_oop))
+            for (std::int32_t descended{ 0 };
+                 node_oop && vmhook::hotspot::is_valid_pointer(node_oop)
+                     && descended < k_descend_cap;
+                 ++descended)
             {
                 vmhook::hotspot::klass* const entry_klass{ vmhook::klass_from_oop(node_oop) };
                 if (!entry_klass)
@@ -18681,6 +18950,11 @@ namespace vmhook
     /*
         @brief In-order walk of a TreeMap, pushing each entry's key to `out`.
         Used by vmhook::set::to_vector for TreeSet.
+
+        Carries the same TWO independent run-away caps as tree_map_walk_entries:
+        the OUTER `visited` cap bounds emitted nodes, and the INNER left-spine
+        descent has its own `descended` cap so a corrupt `left`-pointer cycle
+        cannot push onto the stack without bound.
     */
     template<typename element_type, typename out_t>
     inline auto tree_map_walk_keys(void* const map_oop, out_t& out) -> void
@@ -18713,9 +18987,16 @@ namespace vmhook
         void* node_oop{ root_oop };
         std::int32_t visited{ 0 };
 
+        // INNER left-spine cap (see tree_map_walk_entries): a corrupt `left`
+        // cycle would otherwise push onto `stack` without bound.
+        constexpr std::int32_t k_descend_cap{
+            static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) };
         while ((node_oop && vmhook::hotspot::is_valid_pointer(node_oop)) || !stack.empty())
         {
-            while (node_oop && vmhook::hotspot::is_valid_pointer(node_oop))
+            for (std::int32_t descended{ 0 };
+                 node_oop && vmhook::hotspot::is_valid_pointer(node_oop)
+                     && descended < k_descend_cap;
+                 ++descended)
             {
                 vmhook::hotspot::klass* const entry_klass{ vmhook::klass_from_oop(node_oop) };
                 if (!entry_klass)
@@ -18879,8 +19160,38 @@ namespace vmhook
         @param string_oop  A decoded OOP pointing to a java.lang.String instance.
         @return A std::string containing the string contents, or empty on failure.
         @details
-        Handles both pre-Java-9 (char[] value) and Java-9+ (byte[] value + coder) layouts.
-        Truncates strings longer than 4096 characters as a sanity check.
+        Handles both pre-Java-9 (char[] value) and Java-9+ (byte[] value + coder)
+        layouts and reads the String IN FULL — there is no character-count cap that
+        silently drops the tail.
+
+        LENGTH HANDLING (the fix for robustness bug #29 — was "returns EMPTY past
+        4096 chars"): the backing-array length field (arrayOop +12) is read through
+        os::safe_read and then range-validated to 1..k_max_string_units CHARACTERS
+        (the cap is applied to the decoded char count, so it is the SAME ceiling for
+        the JDK 8 char[], JDK 9+ LATIN1, and JDK 9+ UTF16 layouts — not the old
+        asymmetric raw-array-length ceiling that capped UTF-16 at half the LATIN1
+        limit).  Exactly that many code units — never one byte more — are then copied
+        into a heap buffer sized to the validated body length, again through a single
+        all-or-nothing os::safe_read, and the decode loops read ONLY from that
+        in-process copy.  So:
+          * a String of any length up to the cap is read completely (no truncation,
+            no silent "" for a long-but-valid String);
+          * a CORRUPT length is bounded twice — the 1..k_max_string_units guard
+            rejects an absurd count outright, and even within the cap the body copy
+            is a length-validated safe_read that NEVER walks past the array (and
+            never faults the JVM on an unmapped span — it degrades to "");
+          * the read is LENGTH-DRIVEN, not a NUL-terminated walk, so interior NULs
+            are preserved and no unbounded raw scan exists.
+
+        FAULT SAFETY: every cross-page dereference (the `value`/`coder` field slots,
+        the arrayOop length at +12, and the body at +16) goes through os::safe_read
+        (ReadProcessMemory on Windows / process_vm_readv etc. elsewhere), which is
+        kernel-validated and returns false — never raises an access violation — on an
+        unmapped/relocated span.  This matters on the no-SEH toolchains (MinGW,
+        clang-cl) where a raw deref AV would terminate the JVM instead of degrading
+        to "".
+
+        Empty backing array (length 0) and a zero `value` OOP both yield "".
     */
     inline auto read_java_string(void* const string_oop)
         -> std::string
@@ -18963,11 +19274,24 @@ namespace vmhook
             return {};
         }
 
-        if (length <= 0 || length > 4096)
+        // Coarse sanity on the RAW array length (element count for char[] /
+        // byte count for byte[]) before we trust it for any arithmetic.  A
+        // length <= 0 is the empty string or a corrupt header; an absurdly large
+        // one is corruption.  The PRECISE, layout-aware ceiling is applied to the
+        // decoded CHARACTER count just below (k_max_string_units), so this coarse
+        // bound only has to reject a wildly negative/oversized raw value cheaply.
+        // The widest layout (JDK 9+ UTF16 byte[]) stores 2 bytes per char, so the
+        // raw length may legitimately be up to 2 * k_max_string_units.
+        //
+        // The fix for robustness bug #29: the old guard was `length > 4096`, which
+        // made any String longer than the cap decode to "" (the doc even claimed
+        // it "truncated").  We now read the String IN FULL up to a much larger,
+        // CHARACTER-based ceiling that is identical across all three layouts.
+        if (length <= 0 || length > 2 * read_java_string_max_units)
         {
-            VMHOOK_LOG("{} read_java_string(): array length {} out of range (must be 1..4096) - "
-                       "either an empty string or the array header is corrupt.",
-                       vmhook::warning_tag, length);
+            VMHOOK_LOG("{} read_java_string(): array length {} out of range (must be "
+                       "1..{}) - either an empty string or the array header is corrupt.",
+                       vmhook::warning_tag, length, 2 * read_java_string_max_units);
             return {};
         }
 
@@ -18975,14 +19299,11 @@ namespace vmhook
 
         // Resolve the coder (JDK 9+) BEFORE touching the body so we know how many
         // body bytes the layout occupies, then copy exactly that span into a
-        // fixed local buffer through safe_read.  The decode below reads from this
-        // mapped-into-process copy (`data`) instead of dereferencing the heap
-        // array directly — so a relocated/unmapped body can never fault the
-        // decode loops, and a normally-mapped String yields byte-identical bytes.
-        //
-        // Worst-case span is the JDK 8 char[] layout: `length` is the char count
-        // and each char is 2 bytes, so 4096 * 2 = 8192 bytes.  For the JDK 9+
-        // byte[] layouts `length` is already the byte count (<= 4096).
+        // heap buffer (sized to the validated body length) through safe_read.  The
+        // decode below reads from this mapped-into-process copy (`data`) instead
+        // of dereferencing the heap array directly — so a relocated/unmapped body
+        // can never fault the decode loops, and a normally-mapped String yields
+        // byte-identical bytes.
         std::uint8_t coder{ 0 };
         if (has_coder)
         {
@@ -18996,17 +19317,46 @@ namespace vmhook
             }
         }
 
+        // Decoded CHARACTER count for this layout:
+        //   * JDK 8 char[] (no coder):     `length` IS the char count.
+        //   * JDK 9+ LATIN1 (coder == 0):  one byte per char -> `length` chars.
+        //   * JDK 9+ UTF16  (coder != 0):  two bytes per char -> length / 2 chars
+        //                                  (a well-formed UTF16 byte[] is even).
+        const std::int32_t char_count{ (has_coder && coder != 0) ? length / 2 : length };
+
+        // The REAL ceiling, applied UNIFORMLY to the character count — so a
+        // LATIN1, a UTF16, and a JDK 8 char[] String of the same logical length
+        // all read back identically (this also fixes the old asymmetric ceiling
+        // that capped UTF-16 at HALF the LATIN1 limit, robustness bug #29 part 2).
+        // A char_count of 0 happens for a UTF16 byte[] of length 0/1 — treat the
+        // empty/degenerate case as "" just like length 0.
+        if (char_count <= 0 || char_count > read_java_string_max_units)
+        {
+            VMHOOK_LOG("{} read_java_string(): decoded character count {} out of range "
+                       "(must be 1..{}) - the backing array length is corrupt.",
+                       vmhook::warning_tag, char_count, read_java_string_max_units);
+            return {};
+        }
+
         // Number of body bytes this String occupies for its layout: the JDK 8
-        // char[] (no coder) stores 2 bytes per char (`length` chars), while both
-        // JDK 9+ byte[] layouts (LATIN1 and UTF16) make `length` the byte count
-        // directly.  length <= 4096, so length * 2 <= 8192 — no int32 overflow
-        // and a perfect fit for body_buffer.
+        // char[] (no coder) stores 2 bytes per char, while both JDK 9+ byte[]
+        // layouts (LATIN1 and UTF16) make `length` the byte count directly.
+        // char_count <= read_java_string_max_units and the widest case is
+        // 2 * char_count, both well within int32 (the cap is far below INT32_MAX).
         const std::int32_t body_bytes{ has_coder ? length : length * 2 };
 
-        // alignas(uint16_t): the UTF-16 decode below reinterpret_casts `data` to
-        // const uint16_t* and reads 2-byte units; the heap arrayOop body was
-        // naturally aligned, so keep the local copy 2-aligned too.
-        alignas(std::uint16_t) std::uint8_t body_buffer[8192];
+        // Copy EXACTLY body_bytes from the heap array body (+16) into a local heap
+        // buffer through a single all-or-nothing safe_read.  The buffer is sized
+        // to the validated body length — never larger — so the read can never walk
+        // past the array, and a corrupt length only ever drives a bounded
+        // allocation that is freed immediately if the read fails.  Replaces the
+        // old fixed 8192-byte stack buffer (the structural cause of the 4096-char
+        // cap).  std::vector<std::uint16_t> guarantees 2-byte alignment for the
+        // UTF-16 reinterpret_cast below, and (body_bytes + 1) / 2 rounds up so the
+        // last odd byte of a (malformed) odd-length body still has backing store.
+        std::vector<std::uint16_t> body_storage(
+            static_cast<std::size_t>((body_bytes + 1) / 2), std::uint16_t{ 0 });
+        auto* const body_buffer{ reinterpret_cast<std::uint8_t*>(body_storage.data()) };
         if (!vmhook::os::safe_read(body_buffer, arr + 16, static_cast<std::size_t>(body_bytes)))
         {
             // The backing array body is not fully mapped (relocated String) —
@@ -19068,33 +19418,30 @@ namespace vmhook
             }
         };
 
+        // char_count is the validated decoded length for whichever layout we are
+        // on (computed once, above).  Reserve at least that many output bytes —
+        // UTF-8 emits >= 1 byte per code unit — and decode EXACTLY char_count
+        // units from the in-process body copy (never past the validated length).
         std::string result;
+        result.reserve(static_cast<std::size_t>(char_count));
         if (!has_coder)
         {
-            // JDK 8: backing char[] is always UTF-16; `length` is the char count.
-            result.reserve(static_cast<std::size_t>(length));
-            utf16_to_utf8(result, reinterpret_cast<const std::uint16_t*>(data), length);
+            // JDK 8: backing char[] is always UTF-16; char_count == array length.
+            utf16_to_utf8(result, reinterpret_cast<const std::uint16_t*>(data), char_count);
+        }
+        else if (coder == 0)
+        {
+            // JDK 9+ LATIN1: one byte per char, each a code point in 0..255.
+            // UTF-8-encode each (so 0xE9 'é' -> C3 A9, not a raw invalid byte).
+            for (std::int32_t i{ 0 }; i < char_count; ++i)
+            {
+                append_utf8(result, data[i]);
+            }
         }
         else
         {
-            // `coder` was already read (safe_read) above to size the body copy.
-            if (coder == 0)
-            {
-                // JDK 9+ LATIN1: one byte per char, each a code point in 0..255.
-                // UTF-8-encode each (so 0xE9 'é' -> C3 A9, not a raw invalid byte).
-                result.reserve(static_cast<std::size_t>(length));
-                for (std::int32_t i{ 0 }; i < length; ++i)
-                {
-                    append_utf8(result, data[i]);
-                }
-            }
-            else
-            {
-                // JDK 9+ UTF16: `length` is the byte[] length == 2 * char count.
-                const std::int32_t char_count{ length / 2 };
-                result.reserve(static_cast<std::size_t>(char_count));
-                utf16_to_utf8(result, reinterpret_cast<const std::uint16_t*>(data), char_count);
-            }
+            // JDK 9+ UTF16: char_count == array byte length / 2.
+            utf16_to_utf8(result, reinterpret_cast<const std::uint16_t*>(data), char_count);
         }
         return result;
     }
