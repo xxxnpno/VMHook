@@ -2090,6 +2090,97 @@ namespace vmhook
         }
 
         /*
+            @brief Reads a pointer-sized word out of a possibly-cold interpreter
+                   frame / Method* / oop-metadata slot, Windows-gated exactly like
+                   frame::get_method().
+            @details
+            The detour / return_value-frame readers (return_value::caller(),
+            return_value::stack_trace()) walk the HotSpot saved-rbp chain and chase
+            Method* / ConstantPool pointers that came from a stale or GC-relocated
+            interpreter frame.  Such a slot address can pass the is_valid_pointer()
+            range/alignment HEURISTIC yet sit on a page that is not actually mapped
+            at this instant; a raw `*slot` then FAULTS, and on the no-SEH toolchains
+            (MinGW, clang-on-windows) seh_invoke_detour's catch(...) cannot trap a
+            hardware AV, so the JVM is torn down.
+
+            On Windows: route the read through os::safe_read (ReadProcessMemory —
+            kernel-validated, never faults), so a cold/unmapped slot yields nullptr
+            and the caller's existing is_valid_pointer gate / early-out treats it as
+            "stop the walk" instead of crashing.
+
+            On POSIX: KEEP the raw read.  The same Windows discipline applied to
+            frame::get_method() regressed return_value::stack_trace() on POSIX — the
+            is_valid_pointer range check rejects a legitimate deep-stack rbp and
+            routing the read through process_vm_readv changed the multi-frame walk's
+            result on linux*gcc*java21+.  A stray AV here is contained by the JVM's
+            own POSIX signal handling, not by this helper, so the direct read is
+            correct on POSIX.  For a normally-mapped frame the bytes are identical
+            to the old raw load on both platforms, so the warm path is unchanged.
+
+            The caller is expected to have already filtered `slot` through
+            is_valid_pointer(); this helper only adds the mapped-page guarantee on
+            Windows.
+        */
+        inline static auto cold_read_frame_pointer(const void* const slot) noexcept
+            -> void*
+        {
+#if defined(_WIN32)
+            void* value{ nullptr };
+            if (!vmhook::os::safe_read(&value, slot, sizeof(value)))
+            {
+                return nullptr;
+            }
+            return value;
+#else
+            return *reinterpret_cast<void* const*>(slot);
+#endif
+        }
+
+        /*
+            @brief Reads a pointer-sized word out of a possibly-cold Method* /
+                   ConstMethod* METADATA slot, fault-safe on ALL platforms.
+            @details
+            This is the cross-platform sibling of cold_read_frame_pointer(), used
+            exclusively by the watchdog / verify_hooks() Method-metadata accessors
+            (get_const_method, get_constants, get_code, the i2i/interpreted/compiled
+            entry getters, get_adapter, get_name, get_signature).
+
+            verify_hooks() runs on its OWN DETACHED watchdog thread, OUTSIDE the
+            detour __try and OUTSIDE the harness per-module guard.  When a hooked
+            method DEOPTs (e.g. set_arg on a JIT-compiled method triggers an
+            nmethod recompile/free), the stored Method*'s metadata slots can be
+            transiently cold/unmapped at the instant the watchdog polls them.  A
+            raw `*(this + offset)` then FAULTS uncontained — on Windows the no-SEH
+            toolchains (MinGW / clang-on-windows) cannot trap the hardware AV, and
+            on Linux/gcc the fault is on the watchdog thread where nothing
+            contains it either — and the JVM is torn down on every platform.
+
+            UNLIKE the frame-pointer reads (saved-rbp / locals / _pool_holder in
+            return_value::caller / stack_trace), routing these Method-metadata
+            reads through os::safe_read on POSIX does NOT regress the deep-frame
+            stack walk: the watchdog never walks a stack frame, so the documented
+            stk_ POSIX regression (commit 958877f) cannot apply here.  For a live
+            (mapped) Method these read byte-identical values to the old raw load,
+            so the warm path is unchanged on both platforms.  os::safe_read is
+            fault-safe on POSIX (process_vm_readv with a sigsetjmp/SIGSEGV memcpy
+            fallback), so the watchdog can never fault on Linux either.
+
+            The caller is expected to have already filtered `this` through
+            is_valid_pointer(); this helper adds the mapped-page guarantee
+            everywhere, returning nullptr on an unreadable slot.
+        */
+        inline static auto cold_read_metadata_pointer(const void* const slot) noexcept
+            -> void*
+        {
+            void* value{ nullptr };
+            if (!vmhook::os::safe_read(&value, slot, sizeof(value)))
+            {
+                return nullptr;
+            }
+            return value;
+        }
+
+        /*
             @brief Represents a HotSpot internal Symbol object.
             @details
             Symbols are interned strings used throughout the JVM to represent class names,
@@ -2263,8 +2354,23 @@ namespace vmhook
                     {
                         throw vmhook::exception{ "Failed to find ConstMethod._constants entry." };
                     }
-
-                    return *reinterpret_cast<constant_pool**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::const_method*>(this)) + entry->offset);
+                    // Guard `this` and read the load fault-safe on ALL platforms:
+                    // verify_hooks() (watchdog thread) reaches get_constants() via
+                    // get_name()/get_signature() off a stored Method*'s ConstMethod*
+                    // that a DEOPT/class-unload can leave non-null but on an unmapped
+                    // page.  cold_read_metadata_pointer (os::safe_read everywhere)
+                    // returns nullptr instead of faulting the JVM uncontained on the
+                    // no-SEH toolchains AND on the detached POSIX watchdog thread.
+                    // The watchdog never walks a stack frame, so this cross-platform
+                    // safe_read cannot cause the stk_ POSIX regression; for a live
+                    // ConstMethod the bytes are identical to the old raw load.
+                    if (!vmhook::hotspot::is_valid_pointer(this))
+                    {
+                        return nullptr;
+                    }
+                    return reinterpret_cast<vmhook::hotspot::constant_pool*>(
+                        vmhook::hotspot::cold_read_metadata_pointer(
+                            reinterpret_cast<const std::uint8_t*>(this) + entry->offset));
                 }
                 catch (const std::exception& exception)
                 {
@@ -2292,7 +2398,20 @@ namespace vmhook
                         return nullptr;
                     }
 
-                    const std::uint16_t index{ *reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::const_method*>(this)) + entry->offset) };
+                    // Cold read: _name_index off a ConstMethod* that the watchdog
+                    // (verify_hooks, Mode-2) or stack walk may have reached on an
+                    // unmapped page after a DEOPT/class-unload.  Read fault-safe on
+                    // ALL platforms (os::safe_read) so a bad page returns nullptr
+                    // instead of faulting the no-SEH legs OR the detached POSIX
+                    // watchdog thread; this is a metadata (not frame) read, so it
+                    // cannot trigger the stk_ POSIX regression.
+                    std::uint16_t index{ 0 };
+                    if (!vmhook::os::safe_read(&index,
+                                               reinterpret_cast<const std::uint8_t*>(this) + entry->offset,
+                                               sizeof(index)))
+                    {
+                        return nullptr;
+                    }
                     auto* const cp{ this->get_constants() };
                     if (!cp || !vmhook::hotspot::is_valid_pointer(cp))
                     {
@@ -2350,7 +2469,18 @@ namespace vmhook
                         return nullptr;
                     }
 
-                    const std::uint16_t index{ *reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::const_method*>(this)) + entry->offset) };
+                    // Cold read: _signature_index off a ConstMethod* that the
+                    // watchdog (verify_hooks / try_reinstall) or stack walk may
+                    // have reached on an unmapped page after a DEOPT/class-unload.
+                    // Read fault-safe on ALL platforms (os::safe_read), same as
+                    // get_name; a metadata read, so no stk_ POSIX regression.
+                    std::uint16_t index{ 0 };
+                    if (!vmhook::os::safe_read(&index,
+                                               reinterpret_cast<const std::uint8_t*>(this) + entry->offset,
+                                               sizeof(index)))
+                    {
+                        return nullptr;
+                    }
                     auto* const cp{ this->get_constants() };
                     if (!cp || !vmhook::hotspot::is_valid_pointer(cp))
                     {
@@ -2444,7 +2574,32 @@ namespace vmhook
                         throw vmhook::exception{ "Failed to find Method._i2i_entry entry." };
                     }
 
-                    return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);
+                    // verify_hooks() reads _i2i_entry off a STORED Method* on the
+                    // revive/JIT-drift repair path (Mode-3 deopt, try_reinstall) and
+                    // shutdown_hooks() reaches it through the same Method.  A Method
+                    // freed/relocated by a class-unload between install and the
+                    // watchdog tick can pass is_valid_pointer yet have this slot on an
+                    // unmapped page; a raw `*(this + offset)` then FAULTS uncontained
+                    // both on the no-SEH toolchains (MinGW / clang-on-windows) AND on
+                    // the detached POSIX watchdog thread, killing the JVM.  Gate on
+                    // is_valid_pointer, then read the entry fault-safe on ALL platforms
+                    // through os::safe_read (kernel-validated).  nullptr on an unreadable
+                    // slot is what every caller already handles (the deopt step is
+                    // skipped).  This is a Method-metadata read on the watchdog thread,
+                    // NOT a stack-frame walk, so the cross-platform safe_read cannot
+                    // cause the stk_ POSIX regression (commit 958877f).
+                    if (!vmhook::hotspot::is_valid_pointer(this))
+                    {
+                        return nullptr;
+                    }
+                    void* i2i_entry{ nullptr };
+                    if (!vmhook::os::safe_read(&i2i_entry,
+                                               reinterpret_cast<const std::uint8_t*>(this) + entry->offset,
+                                               sizeof(i2i_entry)))
+                    {
+                        return nullptr;
+                    }
+                    return i2i_entry;
                 }
                 catch (const std::exception& exception)
                 {
@@ -2468,7 +2623,25 @@ namespace vmhook
                         throw vmhook::exception{ "Failed to find Method._from_interpreted_entry entry." };
                     }
 
-                    return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);
+                    // Same cold-Method discipline as get_i2i_entry(): the install
+                    // path snapshots _from_interpreted_entry and the verify/revive
+                    // path can reach it on a stored Method that drifted/relocated.
+                    // Read fault-safe on ALL platforms through os::safe_read so an
+                    // unmapped slot returns nullptr instead of an uncontained AV on
+                    // the no-SEH legs OR the detached POSIX watchdog thread; a
+                    // metadata read, so no stk_ POSIX regression.
+                    if (!vmhook::hotspot::is_valid_pointer(this))
+                    {
+                        return nullptr;
+                    }
+                    void* from_interpreted{ nullptr };
+                    if (!vmhook::os::safe_read(&from_interpreted,
+                                               reinterpret_cast<const std::uint8_t*>(this) + entry->offset,
+                                               sizeof(from_interpreted)))
+                    {
+                        return nullptr;
+                    }
+                    return from_interpreted;
                 }
                 catch (const std::exception& exception)
                 {
@@ -2601,7 +2774,39 @@ namespace vmhook
                         throw vmhook::exception{ "Failed to find Method._constMethod entry." };
                     }
 
-                    return *reinterpret_cast<vmhook::hotspot::const_method**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);
+                    // `this` (a stored Method*) is the canonical cold/relocated read on
+                    // TWO paths: (1) the revive/verify path — verify_hooks()'s Mode-1
+                    // freed-Method detector (the FIRST field it touches per tick) and
+                    // shutdown_hooks()'s flag-restore loop call get_const_method() to
+                    // discover whether a class-unload / JVMTI RedefineClasses freed the
+                    // Method between install and the watchdog tick; (2) the detour stack
+                    // walk — return_value::caller / stack_trace hand us a Method* read
+                    // out of a possibly-stale interpreter frame.  In either case the
+                    // Method* can be in-range+aligned (passing is_valid_pointer) yet
+                    // point at a page that is no longer mapped — a raw `*(this + offset)`
+                    // then FAULTS, and on the no-SEH toolchains (MinGW, clang-on-windows)
+                    // that hardware AV is uncontained, AND on the DETACHED POSIX watchdog
+                    // thread nothing contains it either, killing the JVM (residual #28).
+                    // Guard `this` first, then read the _constMethod load fault-safe on
+                    // ALL platforms through os::safe_read (kernel-validated; never faults);
+                    // an unreadable slot yields nullptr, which every caller already treats
+                    // as "Method freed / stop the walk" (verify_hooks reinstalls,
+                    // shutdown_hooks skips, get_name/get_signature return "").
+                    //
+                    // This metadata read is SAFE to make cross-platform: the documented
+                    // stk_ POSIX regression (commit 958877f) was the FRAME-SLOT reads in
+                    // caller/stack_trace (saved-rbp, Method* slot, _pool_holder slot) —
+                    // those stay Windows-gated via cold_read_frame_pointer.  The
+                    // _constMethod field of a VALID live Method is always mapped, so for
+                    // a real frame safe_read reads the identical word; only a genuinely
+                    // freed Method (the case we must survive) reads back nullptr.
+                    if (!vmhook::hotspot::is_valid_pointer(this))
+                    {
+                        return nullptr;
+                    }
+                    return reinterpret_cast<vmhook::hotspot::const_method*>(
+                        vmhook::hotspot::cold_read_metadata_pointer(
+                            reinterpret_cast<const std::uint8_t*>(this) + entry->offset));
                 }
                 catch (const std::exception& exception)
                 {
@@ -2700,7 +2905,33 @@ namespace vmhook
                     return nullptr;
                 }
 
-                return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);
+                // verify_hooks()'s Mode-3 JIT-drift detector reads _code off a STORED
+                // Method* on every watchdog tick (the first field it touches after the
+                // freed/aliased checks).  After a shutdown_hooks() + re-install REVIVE —
+                // or right after a DEOPT triggered by set_arg recompiles/frees the
+                // nmethod — that Method can be relocated/freed by a concurrent
+                // class-unload and its _code slot land on an unmapped page; a raw
+                // `*(this + offset)` then FAULTS uncontained on MinGW / clang-on-windows
+                // (no SEH) AND on the detached POSIX watchdog thread, killing the JVM
+                // on every platform.  Read fault-safe on ALL platforms through
+                // os::safe_read (an unreadable slot reads as nullptr, i.e. "not
+                // compiled", so the repair step is harmlessly skipped).  verify_hooks
+                // only ever COMPARES the returned pointer (and is_valid_pointer-checks
+                // it) — it never dereferences the nmethod — so nullptr-on-cold is the
+                // correct, fully-handled outcome.  This is a Method-metadata read on the
+                // watchdog thread, not a stack-frame walk, so no stk_ POSIX regression.
+                if (!vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return nullptr;
+                }
+                void* code{ nullptr };
+                if (!vmhook::os::safe_read(&code,
+                                           reinterpret_cast<const std::uint8_t*>(this) + entry->offset,
+                                           sizeof(code)))
+                {
+                    return nullptr;
+                }
+                return code;
             }
 
             /*
@@ -2773,7 +3004,24 @@ namespace vmhook
                     return nullptr;
                 }
 
-                return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);
+                // _from_compiled_entry is read on the verify/revive deopt path off a
+                // stored Method* that may have relocated/freed since install; read it
+                // fault-safe on ALL platforms through os::safe_read so a cold slot
+                // returns nullptr instead of an uncontained AV on the no-SEH legs OR
+                // the detached POSIX watchdog thread.  A Method-metadata read, not a
+                // stack-frame walk, so no stk_ POSIX regression.
+                if (!vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return nullptr;
+                }
+                void* from_compiled{ nullptr };
+                if (!vmhook::os::safe_read(&from_compiled,
+                                           reinterpret_cast<const std::uint8_t*>(this) + entry->offset,
+                                           sizeof(from_compiled)))
+                {
+                    return nullptr;
+                }
+                return from_compiled;
             }
 
             /*
@@ -2823,14 +3071,35 @@ namespace vmhook
             auto get_adapter() const noexcept
                 -> void*
             {
+                // get_adapter() is read on the verify/revive deopt path (verify_hooks
+                // Mode-3 + try_reinstall) off a stored / freshly-re-resolved Method*.
+                // A Method relocated by a class-unload between install and the watchdog
+                // tick can pass is_valid_pointer yet have its _adapter slot on an
+                // unmapped page; a raw `*(this + offset)` then FAULTS uncontained on
+                // MinGW / clang-on-windows (no SEH) AND on the detached POSIX watchdog
+                // thread, killing the JVM on every platform.  Read fault-safe on ALL
+                // platforms: guard `this`, then route both the JDK 8 export branch and
+                // the JDK 9+ heuristic branch through os::safe_read so a cold slot
+                // returns nullptr (the caller then has no c2i adapter and skips the
+                // compiled-entry redirect).  A Method-metadata read, not a stack-frame
+                // walk, so no stk_ POSIX regression.
+                if (!vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return nullptr;
+                }
                 // Fast path: VMStructs export (JDK 8).
                 static const vmhook::hotspot::vm_struct_entry_t* const exported_entry{
                     vmhook::hotspot::iterate_struct_entries("Method", "_adapter") };
                 if (exported_entry)
                 {
-                    return *reinterpret_cast<void**>(
-                        reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this))
-                        + exported_entry->offset);
+                    void* adapter{ nullptr };
+                    if (!vmhook::os::safe_read(&adapter,
+                                               reinterpret_cast<const std::uint8_t*>(this) + exported_entry->offset,
+                                               sizeof(adapter)))
+                    {
+                        return nullptr;
+                    }
+                    return adapter;
                 }
 
                 // Slow path: JDK 9+ — heuristic detection, cached on success
@@ -2866,9 +3135,17 @@ namespace vmhook
                 {
                     return nullptr;
                 }
-                return *reinterpret_cast<void**>(
-                    reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this))
-                    + offset);
+                // Cold-Method safe read (see the is_valid_pointer(this) gate at the
+                // top of get_adapter()); the heuristic offset is read fault-safe on
+                // all platforms too.
+                void* adapter{ nullptr };
+                if (!vmhook::os::safe_read(&adapter,
+                                           reinterpret_cast<const std::uint8_t*>(this) + offset,
+                                           sizeof(adapter)))
+                {
+                    return nullptr;
+                }
+                return adapter;
             }
         };
 
@@ -8907,7 +9184,11 @@ namespace vmhook
         {
             return empty;
         }
-        void* const caller_rbp{ *reinterpret_cast<void* const*>(caller_rbp_slot) };
+        // Cold read: this->stack_frame is the intercepted interpreter rbp, which
+        // may be stale / GC-relocated.  Windows-gate the saved-rbp load through
+        // os::safe_read (raw on POSIX) so an unmapped frame returns nullptr
+        // instead of faulting the JVM uncontained on the no-SEH toolchains.
+        void* const caller_rbp{ vmhook::hotspot::cold_read_frame_pointer(caller_rbp_slot) };
         if (!vmhook::hotspot::is_valid_pointer(caller_rbp))
         {
             return empty;
@@ -8943,8 +9224,11 @@ namespace vmhook
         {
             return empty;
         }
+        // Cold read: the Method* slot of the caller frame, same Windows-gated
+        // discipline as the saved-rbp load above.
         auto* const caller_method{
-            *reinterpret_cast<vmhook::hotspot::method* const*>(caller_method_slot) };
+            reinterpret_cast<vmhook::hotspot::method*>(
+                vmhook::hotspot::cold_read_frame_pointer(caller_method_slot)) };
         if (!caller_method || !vmhook::hotspot::is_valid_pointer(caller_method))
         {
             return empty;
@@ -8984,8 +9268,12 @@ namespace vmhook
                         reinterpret_cast<const std::uint8_t*>(cp) + pool_holder_entry->offset };
                     if (vmhook::hotspot::is_valid_pointer(slot))
                     {
+                        // Cold read: _pool_holder Klass* off a ConstantPool reached
+                        // by chasing a possibly-stale Method* in the walk.
+                        // Windows-gate through os::safe_read (raw on POSIX).
                         auto* const klass{
-                            *reinterpret_cast<vmhook::hotspot::klass* const*>(slot) };
+                            reinterpret_cast<vmhook::hotspot::klass*>(
+                                vmhook::hotspot::cold_read_frame_pointer(slot)) };
                         if (klass && vmhook::hotspot::is_valid_pointer(klass))
                         {
                             if (auto* const name_symbol{ klass->get_name() };
@@ -9032,7 +9320,13 @@ namespace vmhook
             {
                 break;
             }
-            void* const caller_rbp{ *reinterpret_cast<void* const*>(current_rbp_slot) };
+            // Cold read: current_rbp_slot is an interpreter rbp from the
+            // saved-rbp chain, which may walk into a stale / GC-relocated /
+            // non-interpreter frame.  Windows-gate the load through
+            // os::safe_read (raw on POSIX — keeps the deep-stack walk result
+            // unchanged) so an unmapped frame stops the walk cleanly instead
+            // of faulting the JVM uncontained on the no-SEH toolchains.
+            void* const caller_rbp{ vmhook::hotspot::cold_read_frame_pointer(current_rbp_slot) };
             if (!vmhook::hotspot::is_valid_pointer(caller_rbp))
             {
                 break;
@@ -9064,8 +9358,11 @@ namespace vmhook
             {
                 break;
             }
+            // Cold read: the Method* slot of this caller frame, same
+            // Windows-gated discipline as the saved-rbp load above.
             auto* const caller_method{
-                *reinterpret_cast<vmhook::hotspot::method* const*>(caller_method_slot) };
+                reinterpret_cast<vmhook::hotspot::method*>(
+                    vmhook::hotspot::cold_read_frame_pointer(caller_method_slot)) };
             if (!caller_method || !vmhook::hotspot::is_valid_pointer(caller_method))
             {
                 break;
@@ -9111,8 +9408,12 @@ namespace vmhook
                     reinterpret_cast<const std::uint8_t*>(constants) + pool_holder_entry->offset };
                 if (vmhook::hotspot::is_valid_pointer(slot))
                 {
+                    // Cold read: _pool_holder Klass* off a ConstantPool reached
+                    // by chasing a possibly-stale Method* in the walk.
+                    // Windows-gate through os::safe_read (raw on POSIX).
                     auto* const klass{
-                        *reinterpret_cast<vmhook::hotspot::klass* const*>(slot) };
+                        reinterpret_cast<vmhook::hotspot::klass*>(
+                            vmhook::hotspot::cold_read_frame_pointer(slot)) };
                     if (klass && vmhook::hotspot::is_valid_pointer(klass))
                     {
                         if (auto* const name_symbol{ klass->get_name() };
@@ -9921,7 +10222,15 @@ namespace vmhook
             // ("orientCamera" vs the unhelpful raw pointer).
             for (vmhook::hotspot::hooked_method& hm : vmhook::hotspot::g_hooked_methods)
             {
-                if (!hm.method || hm.drift_logged)
+                // Reject a null / poison / wild stored Method* up front (matching
+                // shutdown_hooks()'s stronger guard) before forming `this + offset`
+                // in any accessor below.  is_valid_pointer is a pure range/alignment/
+                // poison check (it never touches memory), so a recycled-to-garbage
+                // slot is filtered without a deref; the accessors then additionally
+                // Windows-gate their reads through os::safe_read so even an in-range
+                // but unmapped (relocated/freed) Method yields nullptr instead of an
+                // uncontained no-SEH AV on the revive path.
+                if (!hm.method || !vmhook::hotspot::is_valid_pointer(hm.method) || hm.drift_logged)
                 {
                     continue;
                 }
@@ -17949,8 +18258,30 @@ namespace vmhook
         {
             return nullptr;
         }
+        // Cold read: the narrow-klass slot in the object header (oop + 8).  A
+        // detour can reach here with a stale / GC-relocated oop (e.g. a wrapper
+        // held across a System.gc(), or a collection/map element on a relocated
+        // page) that passes is_valid_pointer's range/alignment HEURISTIC yet
+        // sits on an unmapped page; a raw `*(oop + 8)` then FAULTS, and on the
+        // no-SEH toolchains (MinGW / clang-on-windows) that hardware AV is
+        // uncontained and tears the JVM down.  Windows-gate the header read
+        // through os::safe_read (ReadProcessMemory — never faults), yielding a
+        // zeroed narrow klass (-> nullptr below) on a bad page.  POSIX keeps the
+        // raw read: a stray AV there is contained by the JVM's own signal
+        // handling and gating reads regressed other oop walks (see
+        // frame::get_method); for a normally-mapped oop the bytes are identical.
+#if defined(_WIN32)
+        std::uint32_t narrow{ 0 };
+        if (!vmhook::os::safe_read(&narrow,
+                                   reinterpret_cast<const std::uint8_t*>(oop) + 8,
+                                   sizeof(narrow)))
+        {
+            return nullptr;
+        }
+#else
         const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
             reinterpret_cast<const std::uint8_t*>(oop) + 8) };
+#endif
         void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow) };
         if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
         {
