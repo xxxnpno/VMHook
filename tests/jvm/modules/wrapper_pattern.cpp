@@ -336,6 +336,30 @@ namespace
         return sym->to_string();
     }
 
+    // ── os::safe_read GATE for the post-GC wrapper reads (section 17) ──────────
+    //
+    // is_valid_pointer() proves an address is in-range + aligned, but NOT that
+    // its page is currently MAPPED — a moving collector can relocate an object so
+    // its old (bare-oop) address still passes is_valid_pointer yet points into an
+    // unmapped/relocated page (field_introspection documents this exact gap).
+    // The ONLY check that proves the page is resident is os::safe_read (kernel
+    // ReadProcessMemory / process_vm_readv: returns false instead of faulting on
+    // an unmapped page).  Section 17 holds a wrapper across a forced System.gc(),
+    // so before dereferencing ANY wrapper-held oop there we probe the oop header
+    // (mark word @0, narrow-klass @8, array length @12 — the first 16 bytes every
+    // reader touches).  A failed probe degrades the read to [INFO] (a relocated
+    // bare-oop wrapper is the documented limitation) instead of a deref fault, and
+    // closes the residual gap in object_base::get_field's instance branch (which
+    // does NOT validate this->instance — vmhook.hpp:14085-14092).
+    constexpr std::size_t k_oop_header_probe_bytes{ 16 };
+
+    auto oop_header_safely_readable(void* const oop) -> bool
+    {
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop)) { return false; }
+        std::uint8_t scratch[k_oop_header_probe_bytes] = { 0 };
+        return vmhook::os::safe_read(scratch, oop, sizeof(scratch));
+    }
+
     // ---- detour observations (filled on the Java thread inside bump()) ----
     std::atomic<int>          g_bump_calls{ 0 };
     std::atomic<bool>         g_self_nonnull{ false };
@@ -886,8 +910,35 @@ namespace
                 }
             }
         }
-        // scoped_hook `handle` uninstalls here at scope exit — nothing left armed.
+        // scoped_hook `handle` uninstalls here at scope exit.
     }
+
+    // FULL hook teardown BEFORE the forced-System.gc() section below (17).
+    //
+    // scoped_hook's destructor (hook_handle::stop) removes only THIS hook's
+    // entry from g_hooked_methods — it deliberately does NOT delete the shared
+    // midi2i trampoline (it stays in g_hooked_i2i_entries) and does NOT stop the
+    // detached auto-repair watchdog.  So after section 11 the watchdog is STILL
+    // RUNNING and STILL ticking verify_hooks() -> midi2i_hook::verify_and_repair(),
+    // which RAW-reads the HotSpot i2i stub bytes (std::memcmp on this->target,
+    // vmhook.hpp:6738) with NO os::safe_read gate — that read is crash-safe only
+    // while the stub page stays mapped.  Section 17 then drives System.gc() twice;
+    // a full GC + code-cache sweep can transiently relocate/unmap that stub page,
+    // and the watchdog (a DETACHED thread, OUTSIDE this module's per-module
+    // SEH/__try container and outside any detour guard) then faults uncontained
+    // reading it — killing the JVM with NO TOTAL line on EVERY toolchain, msvc
+    // included (the fault is off the suite thread, so __except never sees it).
+    // This is exactly the leftover-watchdog-across-a-forced-GC hazard the harness
+    // documents and neutralises BETWEEN modules via ctx.reset(); we neutralise it
+    // WITHIN the module, before our own forced GC.
+    //
+    // shutdown_hooks() is the ONLY call that BOTH stops/joins the watchdog (waits
+    // for g_watchdog_running to clear) AND clears g_hooked_i2i_entries (deletes
+    // the trampoline), so after it returns nothing polls verify_and_repair()
+    // across the GC.  It is reversible + idempotent + safe-when-empty (proven by
+    // shutdown_hooks_teardown), and section 11 is the module's only hook, so this
+    // is a clean no-cost teardown — sections 12-17 install no further hooks.
+    vmhook::shutdown_hooks();
 
     // =====================================================================
     //  12. WRAPPER OVER A NESTED REFERENCE TYPE + WRAPPER-OF-WRAPPER.
@@ -1191,32 +1242,47 @@ namespace
             // static-field decode re-reads the CURRENT oop of `instance` and lands on
             // the live (possibly relocated) object; under some CI configs the post-GC
             // re-resolve is transiently null -> characterize, never fail.  The value
-            // reads below stay guarded by `after && is_valid_pointer`.
+            // reads below are gated by oop_header_safely_readable (os::safe_read), NOT
+            // merely is_valid_pointer: right after a moving System.gc() a fresh decode
+            // can still land on an object mid-relocation whose header is on a
+            // transiently-unmapped page (in-range + aligned, so is_valid_pointer passes
+            // yet the deref would fault).  A failed probe degrades to [INFO].
             const auto after{ wp::acquire("instance") };
             if (after != nullptr)
                 ctx.check("lifetime_post_gc_fresh_wrapper_non_null", true);
             else
                 ctx.record("[INFO] lifetime_post_gc_fresh_wrapper_non_null: fresh re-resolve null post-GC (GC-variant)");
-            if (after && vmhook::hotspot::is_valid_pointer(after->vmhook::object_base::get_instance()))
+            if (after && oop_header_safely_readable(after->vmhook::object_base::get_instance()))
             {
                 ctx.check("lifetime_post_gc_fresh_wrapper_reads_iId",
                           after->get_iId() == 0x0BADF00D);
                 // The nested Node, re-resolved post-GC, is also correct.
                 const auto n{ after->node() };
-                if (n && vmhook::hotspot::is_valid_pointer(n->vmhook::object_base::get_instance()))
+                if (n && oop_header_safely_readable(n->vmhook::object_base::get_instance()))
                 {
                     ctx.check("lifetime_post_gc_fresh_nested_reads_nId",
                               n->get_nId() == NODE_ID);
                 }
             }
+            else if (after != nullptr)
+            {
+                ctx.record("[INFO] lifetime_post_gc_fresh_wrapper_reads_iId: fresh oop header not "
+                           "safely readable post-GC (mid-relocation/transiently-unmapped) — value "
+                           "read skipped to avoid a deref fault; re-resolution path is GC-variant.");
+            }
 
             // PASS-or-[INFO]: the ORIGINAL wrapper across the GC.  If the object
             // did not move (common: the CI default collector under these tiny
-            // heaps), the old oop is still valid and reads correctly -> PASS.  If
+            // heaps), the old oop is still mapped and reads correctly -> PASS.  If
             // a moving GC relocated it, the old oop is stale; we DO NOT fail —
-            // we record [INFO].  Fully guarded so a stale oop never faults.
+            // we record [INFO].  The gate is oop_header_safely_readable (os::safe_read
+            // through a kernel path), NOT is_valid_pointer: a relocated bare oop stays
+            // in-range + aligned (passes is_valid_pointer) yet its page is unmapped, so
+            // is_valid_pointer alone would let before->get_iId() deref-fault — exactly
+            // the NO-TOTAL hazard this section must never hit.  A failed probe means the
+            // object relocated; we record [INFO] and never touch the stale oop.
             if (before && before_oop
-                && vmhook::hotspot::is_valid_pointer(before_oop))
+                && oop_header_safely_readable(before_oop))
             {
                 const std::int32_t old_id{ before->get_iId() };
                 if (old_id == 0x0BADF00D)
@@ -1241,9 +1307,10 @@ namespace
             }
             else
             {
-                ctx.record("[INFO] wrapper_pattern: the original wrapper's oop did not pass "
-                           "is_valid_pointer after System.gc() (likely relocated/unmapped); "
-                           "not dereferenced. Fresh re-resolution path proves the contract.");
+                ctx.record("[INFO] wrapper_pattern: the original wrapper's oop header was not "
+                           "safely readable (os::safe_read) after System.gc() (likely "
+                           "relocated/unmapped); not dereferenced. Fresh re-resolution path "
+                           "proves the contract.");
                 ctx.check("lifetime_original_wrapper_still_reads_after_gc", true);
             }
         }

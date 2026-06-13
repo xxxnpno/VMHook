@@ -184,33 +184,38 @@ public final class FieldStatic extends FieldStaticBase
     public static double  setDOrd = -1.0;         // native writes Math.PI
     public static float   setFOrd = -1.0f;        // native writes 1.5f (exact in binary)
 
-    // String SET target: ASCII, length 5, overwritten with an equal-length
-    // ASCII value ("world").  In-place write keeps length on all JDKs.
+    // String SET target: ASCII, overwritten with "world".  field_proxy::set now
+    // REBINDS the field to a freshly-built java.lang.String of the exact value
+    // (library bug #30 fixed); it no longer mutates the backing array in place.
     //
-    // CRITICAL: built with new String(char[]) (via freshAscii) so it owns a
-    // PRIVATE, non-interned backing array.  A bare literal ("AAAAA") would be
-    // the SAME interned String object as every other "AAAAA" in the constant
-    // pool, and write_java_string's in-place backing-array mutation would then
-    // silently corrupt that shared literal process-wide (verified on JDK 21:
-    // a literal-initialised setStr left "AAAAA" reading "world" even after
-    // resetTargets() re-assigned setStr = "AAAAA", because the assignment just
-    // re-aliased the already-mutated interned object).  See FieldString.java's
-    // identical precaution and audit/findings/field_proxy_string_set.md.
-    public static String  setStr = freshAscii("AAAAA");       // native writes "world"
+    // Built with new String(char[]) (via freshAscii) so it starts with a PRIVATE,
+    // non-interned backing.  This keeps the rebind-safety guarantee testable: the
+    // fixture holds a separate alias to the original object (setStrShortOriginal
+    // below) and proves the rebind leaves it untouched.  (Historically a bare
+    // literal here also risked the OLD in-place path corrupting the shared
+    // interned String process-wide; the private backing preserves clean resets.)
+    public static String  setStr = freshAscii("AAAAA");       // native writes "world" -> "world"
 
-    // String SET target overwritten with a SHORTER value ("hi") -> partial
-    // overwrite leaves the tail: Java should see "hirld" (length unchanged).
-    // Same private-backing requirement: a bare "world" literal aliases the
-    // interned "world" used by seenStrEqWorld = "world".equals(setStr) in
-    // snapshot(), so the shorter write would corrupt that comparison literal.
-    public static String  setStrShort = freshAscii("world");  // native writes "hi" -> "hirld"
+    // String SET target overwritten with a SHORTER value ("hi").  The rebind
+    // makes the field read exactly "hi" (length 2), NOT the old partial-overwrite
+    // "hirld" (length 5).  Private backing (freshAscii) so the original object can
+    // be aliased and checked for non-corruption after the rebind.
+    public static String  setStrShort = freshAscii("world");  // native writes "hi" -> "hi"
+
+    // A SEPARATE alias to setStrShort's ORIGINAL String object, captured at class
+    // init BEFORE any native write.  After set() rebinds setStrShort to a new "hi"
+    // String, this still references the original, which must STILL read "world"
+    // (object-reference store, not in-place mutate -> no shared-object corruption).
+    public static final String setStrShortOriginal = setStrShort;
+    public static boolean       seenStrShortOriginalIntact;  // setStrShortOriginal.equals("world")
 
     // String SET edge targets (private backings, never interned literals):
-    //   - setStrEmpty: native writes "" -> writable_length<=0 -> NO-OP, keeps "keep".
-    //   - setStrTrunc: native writes "toolongvalue" (len 12) into a len-5 backing
-    //     -> in-place write truncates to the first 5 -> "toolo" (length still 5).
-    public static String  setStrEmpty = freshAscii("keep");   // native writes "" -> stays "keep"
-    public static String  setStrTrunc = freshAscii("ABCDE");  // native writes long -> "toolo"
+    //   - setStrEmpty: native writes "" -> the rebind builds a real empty String,
+    //     so the field reads "" (NOT the old writable_length<=0 no-op-keep).
+    //   - setStrTrunc: native writes "toolongvalue" (len 12) -> the rebind allocates
+    //     the full length, so the field reads "toolongvalue" (NOT the old truncate).
+    public static String  setStrEmpty = freshAscii("keep");   // native writes "" -> ""
+    public static String  setStrTrunc = freshAscii("ABCDE");  // native writes long -> "toolongvalue"
 
     // =====================================================================
     //  EXHAUSTIVE SET-EDGE targets, each with a matching getX() getter so the
@@ -512,9 +517,10 @@ public final class FieldStatic extends FieldStaticBase
     /**
      * Builds a String from the chars of {@code text} via new String(char[]),
      * guaranteeing a PRIVATE backing array never shared with an interned
-     * constant-pool literal.  Essential for the String SET targets, which
-     * write_java_string mutates in place: an interned-literal backing would be
-     * corrupted process-wide by that write (see the setStr/setStrShort notes).
+     * constant-pool literal.  The String SET targets use it so each starts with a
+     * private object that can be aliased and checked for non-corruption after the
+     * rebind (set() now rebinds the field reference rather than mutating backing
+     * in place; see the setStr/setStrShort notes).
      */
     private static String freshAscii(final String text)
     {
@@ -553,6 +559,9 @@ public final class FieldStatic extends FieldStaticBase
         seenStrEqWorld = "world".equals(setStr);
         seenStrShort = setStrShort;
         seenStrShortLen = (setStrShort == null) ? -1 : setStrShort.length();
+        // The rebind bound setStrShort to a new "hi" String; the original object
+        // (aliased here) must be untouched -> still "world".
+        seenStrShortOriginalIntact = "world".equals(setStrShortOriginal);
 
         seenGuardInt = guardInt;
         seenGuardLong = guardLong;

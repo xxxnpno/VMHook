@@ -71,20 +71,22 @@ import vmhook.Harness;
  *                                       index): 'X' then 3-byte CESU (58 ED A0 BD).
  *     - longCjk    300x U+65E5       -> a long (>300) UTF-16 string under the cap.
  *
- *   Length-cap boundary cases (read_java_string range-guards the backing-ARRAY
- *   length to 1..4096; the doc says "truncate", the code RETURNS EMPTY past the
- *   ceiling -- a documented behaviour these assert directly):
- *     - cap4096    4096x 'x'    -> LATIN1 byte[] length 4096 -> passes (inclusive).
- *     - cap4097    4097x 'x'    -> LATIN1 byte[] length 4097 -> REJECTED -> "".
- *     - cap70000   70000x 'x'   -> a length WAY over the cap (and over 65536):
+ *   Long-String read-in-full cases (robustness bug #29 FIXED: the old hard
+ *   4096-char cap that decoded any longer String to "" is GONE; read_java_string
+ *   now reads IN FULL up to read_java_string_max_units = 16M CHARACTERS, the
+ *   ceiling applied UNIFORMLY to the decoded CHARACTER count, so no layout has a
+ *   smaller effective limit):
+ *     - cap4096    4096x 'x'    -> LATIN1 byte[] length 4096 -> read in full.
+ *     - cap4097    4097x 'x'    -> ONE char past the OLD cap -> read in full (4097).
+ *     - cap70000   70000x 'x'   -> a length WAY over the OLD cap (and over 65536):
  *                                  proves the int32 length is read intact and the
- *                                  rejection stays clean (no overflow) -> "".
- *     - capUtf2048 2048x U+65E5 -> UTF16 byte[] length 4096 -> passes (decodes).
- *     - capUtf2049 2049x U+65E5 -> UTF16 byte[] length 4098 > 4096 -> REJECTED on
- *                                  JDK 9+ (the asymmetric UTF-16 char ceiling of
- *                                  2048); on JDK 8 the char[] length is 2049
- *                                  (<= 4096) so it DECODES -- the native module
- *                                  branches on the compact-string `coder` field.
+ *                                  full body is decoded (no overflow) -> 70000 bytes.
+ *     - capUtf2048 2048x U+65E5 -> UTF16 byte[] length 4096 -> read in full.
+ *     - capUtf2049 2049x U+65E5 -> UTF16 byte[] length 4098 (2049 chars) -> read in
+ *                                  full on JDK 9+ too (no more asymmetric UTF-16
+ *                                  ceiling); on JDK 8 the char[] length is 2049 and
+ *                                  it likewise reads in full -- 2049*3 UTF-8 bytes
+ *                                  on EVERY layout.
  *
  *   Guard paths:
  *     - empty    ""    -> backing array length 0 -> the length<=0 guard -> "".
@@ -208,21 +210,21 @@ public final class ReadJavaString
     // A long (>300) UTF-16 string, under the cap on both layouts.
     public static String longCjk  = repeatChar('\u65E5', 300);
 
-    // Length-cap boundary targets --------------------------------------------
-    // Exactly 4096 ASCII chars: LATIN1 byte[] length 4096 -> passes (inclusive).
+    // Long-String read-in-full targets (robustness bug #29 FIXED: no more 4096 cap;
+    // read_java_string reads IN FULL up to 16M chars, uniformly per char count) ---
+    // Exactly 4096 ASCII chars: LATIN1 byte[] length 4096 -> read in full.
     public static String cap4096    = repeatChar('x', 4096);
-    // 4097 ASCII chars: LATIN1 byte[] length 4097 > 4096 -> REJECTED -> "".
+    // 4097 ASCII chars: ONE char past the OLD 4096 cap -> read in full (4097 bytes).
     public static String cap4097    = repeatChar('x', 4097);
-    // 70000 ASCII chars: a length WAY past the 4096 cap and past 65536.  Proves the
-    // int32 length is read intact and the > 4096 rejection stays clean -> "".
+    // 70000 ASCII chars: a length WAY past the OLD cap and past 65536.  Proves the
+    // int32 length is read intact and the full 70000-byte body is decoded.
     public static String cap70000   = repeatChar('x', 70000);
-    // 2048 CJK chars: on JDK 9+ a UTF16 byte[] length 4096 -> passes (decodes to
-    // 2048*3 UTF-8 bytes).  On JDK 8 a char[] length 2048 -> also passes.
+    // 2048 CJK chars: on JDK 9+ a UTF16 byte[] length 4096; on JDK 8 a char[] length
+    // 2048.  Decodes to 2048*3 UTF-8 bytes on both layouts.
     public static String capUtf2048 = repeatChar('\u65E5', 2048);
-    // 2049 CJK chars: on JDK 9+ a UTF16 byte[] length 4098 > 4096 -> REJECTED ->
-    // "" (the asymmetric UTF-16 char ceiling of 2048).  On JDK 8 a char[] length
-    // 2049 <= 4096 -> DECODES (2049*3 UTF-8 bytes).  Native module branches on
-    // the presence of the compact-string `coder` field.
+    // 2049 CJK chars: UTF16 byte[] length 4098 (2049 chars) on JDK 9+, char[] length
+    // 2049 on JDK 8 -- BOTH read in full to 2049*3 UTF-8 bytes (the ceiling is now
+    // on the decoded char count, so there is no more asymmetric UTF-16 limit).
     public static String capUtf2049 = repeatChar('\u65E5', 2049);
 
     // Guard targets -----------------------------------------------------------

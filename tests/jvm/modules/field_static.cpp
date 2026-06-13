@@ -552,50 +552,48 @@ namespace
     }
 
     // =====================================================================
-    //  2. STRING static SET (ASCII, length-preserving on all JDKs).
+    //  2. STRING static SET (REBIND to a fresh String; library bug #30 FIXED).
     // =====================================================================
     // CONTRACT of the write path exercised here (field_proxy::set(std::string)
-    // -> vmhook::set_str_field -> vmhook::write_java_string, vmhook.hpp ~15667):
-    // write_java_string is an IN-PLACE, LENGTH-PRESERVING, MIN-LENGTH overwrite.
-    // It overwrites exactly min(value.size(), existing_backing_length) code units
-    // of the String's existing backing array and NEVER changes the String's
-    // logical length, never reallocates, and never replaces the String reference.
-    // Consequences proven by this phase:
-    //   * equal-length write ("AAAAA" <- "world") fully replaces the content;
-    //   * SHORTER write ("world" <- "hi") overwrites only the first 2 units and
-    //     LEAVES THE TAIL, so the field reads back "hi"+"rld" == "hirld" with
-    //     length still 5 (NOT "hi" with length 2) -- a real ergonomic limitation:
-    //     callers who need to truly shorten/grow/replace a String must build a
-    //     new String and rewrite the reference (the field still aliases the old
-    //     backing otherwise).  A longer-than-backing write would be truncated.
-    // The fixture's setStr/setStrShort are deliberately new String(char[])
-    // (private backing), never bare interned literals: an in-place write into an
-    // interned-literal backing corrupts that shared constant-pool String JVM-wide
-    // (see FieldStatic.java + audit/findings/field_proxy_string_set.md).
-    ctx.record("[INFO] field_static: write_java_string is in-place + "
-               "length-preserving + min-length overwrite -- a SHORTER write "
-               "leaves the tail (\"world\"<-\"hi\" reads back \"hirld\", len stays "
-               "5) and a longer write truncates; it never resizes or replaces the "
-               "String reference (vmhook.hpp ~15667). Targets must own a private "
-               "backing (new String(char[])) or the write corrupts the shared "
-               "interned literal process-wide.");
+    // -> field_proxy::store_string -> store_object_oop, vmhook.hpp ~15479):
+    // set(std::string) now REBINDS the field to a freshly-built, correctly-encoded
+    // java.lang.String of the EXACT input value+length (an object-reference store,
+    // like a Java `field = value;`).  It NO LONGER overwrites the existing backing
+    // array in place.  Consequences proven by this phase:
+    //   * equal-length write ("AAAAA" <- "world") -> field reads "world" (len 5);
+    //   * SHORTER write ("world" <- "hi") -> field reads exactly "hi" (len 2),
+    //     NOT the old partial-overwrite "hirld" (len 5) that left the stale tail;
+    //   * EMPTY write ("" ) -> field reads "" (a real empty String), NOT the old
+    //     writable_length<=0 NO-OP that kept the prior content;
+    //   * LONGER-than-backing write -> field reads the FULL value, NOT the old
+    //     truncate-to-backing-length result.
+    // The fixture's setStr/setStrShort are still new String(char[]) (private
+    // backing): a non-interned start lets the fixture hold a separate alias to the
+    // ORIGINAL object and prove the rebind does not mutate it (FieldStatic.java).
+    ctx.record("[INFO] field_static: field_proxy::set(std::string) REBINDS the "
+               "field to a fresh java.lang.String of the exact value+length "
+               "(store_string -> store_object_oop, vmhook.hpp ~15479; library bug "
+               "#30 fixed). A SHORTER write yields exactly \"hi\" (len 2, not the "
+               "old \"hirld\"/len-5), an EMPTY write yields \"\" (not the old "
+               "no-op-keep), and a LONGER write yields the FULL value (not the old "
+               "truncate). It never mutates the previously referenced String, so a "
+               "shared/interned object aliased elsewhere is never corrupted.");
 
-    ctx.check("set_str_resolved", fs::set_string("setStr", "world"));        // "AAAAA" <- "world" (len 5)
-    ctx.check("set_str_short_resolved", fs::set_string("setStrShort", "hi")); // "world" <- "hi" -> "hirld"
+    ctx.check("set_str_resolved", fs::set_string("setStr", "world"));        // "AAAAA" <- "world" -> "world"
+    ctx.check("set_str_short_resolved", fs::set_string("setStrShort", "hi")); // "world" <- "hi" -> "hi"
 
     // Immediate native re-read of the String set.
     ctx.check("set_str_native_reread_world", fs::get_string("setStr") == "world");
-    ctx.check("set_str_short_native_reread_hirld", fs::get_string("setStrShort") == "hirld");
+    ctx.check("set_str_short_native_reread_hi", fs::get_string("setStrShort") == "hi");
 
-    // ---- 2b. the two remaining write_java_string boundaries ----
-    //   * EMPTY write: writable_length = min(5, 0) = 0 -> the write is a NO-OP,
-    //     the backing is untouched, the field still reads "keep".
+    // ---- 2b. the two remaining SET boundaries, now via the rebind path ----
+    //   * EMPTY write: the rebind builds a real empty String -> the field reads "".
     ctx.check("set_str_empty_resolved", fs::set_string("setStrEmpty", ""));
-    ctx.check("set_str_empty_is_noop_keep", fs::get_string("setStrEmpty") == "keep");
-    //   * LONGER-than-backing write: "toolongvalue" (12) into a 5-unit backing
-    //     -> truncated to the first 5 code units -> "toolo" (length stays 5).
+    ctx.check("set_str_empty_now_empty", fs::get_string("setStrEmpty").empty());
+    //   * LONGER-than-backing write: the rebind allocates any length -> the field
+    //     reads the FULL "toolongvalue" (len 12), not the old truncate-to-5.
     ctx.check("set_str_trunc_resolved", fs::set_string("setStrTrunc", "toolongvalue"));
-    ctx.check("set_str_trunc_to_first_5", fs::get_string("setStrTrunc") == "toolo");
+    ctx.check("set_str_trunc_full_value", fs::get_string("setStrTrunc") == "toolongvalue");
 
     // =====================================================================
     //  3. SIZE / TYPE GUARD (audit: field_proxy_set_size_guard.md).
@@ -1050,8 +1048,13 @@ namespace
             ctx.record("[INFO] field_static: setStr == \"world\" both natively and via Java "
                        ".equals (write_java_string is correct; the prior mismatch was an interned-"
                        "literal corruption from a legacy in-place array write, now fixed).");
-            ctx.check("java_seenStrShort_hirld", fs::get_string("seenStrShort") == "hirld");
-            ctx.check("java_seenStrShort_len_5", fs::seen_i32("seenStrShortLen") == 5);
+            ctx.check("java_seenStrShort_hi", fs::get_string("seenStrShort") == "hi");
+            ctx.check("java_seenStrShort_len_2", fs::seen_i32("seenStrShortLen") == 2);
+            // REBIND-SAFETY: the original String object setStrShort pointed at is
+            // still "world" after the rebind (object-reference store, not in-place
+            // mutate -> a shared/aliased String is never corrupted).
+            ctx.check("java_seenStrShort_original_intact_world",
+                      fs::seen_bool("seenStrShortOriginalIntact") == true);
 
             // ---- guard targets unchanged, as seen by Java ----
             ctx.check("java_seenGuardInt_unchanged", fs::seen_i32("seenGuardInt") == 0x11223344);
@@ -1114,9 +1117,10 @@ namespace
         ctx.check("java_getter_DMin_bits",     fs::call_get_long("getDMinBits") == static_cast<std::int64_t>(0x0010000000000000ULL));
         ctx.check("java_getter_DMax_bits",     fs::call_get_long("getDMaxBits") == static_cast<std::int64_t>(0x7FEFFFFFFFFFFFFFULL));
         ctx.check("java_getter_DNegZero_bits", fs::call_get_long("getDNegZeroBits") == static_cast<std::int64_t>(0x8000000000000000ULL));
-        // the two String-write boundaries, as Java sees them.
-        ctx.check("java_getter_StrEmpty_keep", fs::call_get_string("getStrEmpty") == "keep");
-        ctx.check("java_getter_StrTrunc_toolo", fs::call_get_string("getStrTrunc") == "toolo");
+        // the two String-write boundaries, as Java sees them (rebind: empty write
+        // -> "", longer write -> the FULL value, not the old keep/truncate).
+        ctx.check("java_getter_StrEmpty_empty", fs::call_get_string("getStrEmpty").empty());
+        ctx.check("java_getter_StrTrunc_full", fs::call_get_string("getStrTrunc") == "toolongvalue");
     }
 
     // =====================================================================

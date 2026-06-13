@@ -36,7 +36,9 @@
 //       (surrogate pair), a lone surrogate (malformed), the U+00FF LATIN1
 //       ceiling, single-char boundaries, 1000-char ASCII, 500-char CJK, exactly
 //       4096 chars, and a >4096 input (now built in FULL via the NewString
-//       fallback — non-truncation hard-asserted, robustness #9) — we assert:
+//       fallback AND read back in FULL by the cap-raised reader — non-truncation
+//       hard-asserted via the exact full-length readback, robustness #9 + #29) —
+//       we assert:
 //         * make_java_string(v) returns a NON-NULL oop that passes
 //           is_valid_pointer (never push an invalid/mistyped oop at Java);
 //         * read_java_string(that oop) == the EXPECTED UTF-8, BYTE-FOR-BYTE
@@ -446,9 +448,10 @@ namespace
     //   * a 5000-char ASCII input EXCEEDS the TLAB fast-path cap and is now built in
     //     FULL via the GC-aware NewString fallback (robustness #9 fix — no longer
     //     truncated to 4096).  Non-truncation is hard-asserted through the readback
-    //     length (see the assertion block: read_java_string's own 4096 ceiling
-    //     rejects the over-long array, so a full String reads back as 0 bytes while
-    //     the old 4096-truncation would have read back as 4096).
+    //     length: the cap-raised read_java_string (ceiling 16M chars, robustness #29)
+    //     now decodes the over-4096 backing array IN FULL, so a full 5000-char String
+    //     reads back as exactly 5000 bytes — distinct from both the old 4096
+    //     truncation (would read 4096) and the old reader's 4096 ceiling (would read 0).
 
     // =====================================================================
     //  Detour observations (captured on the Java thread, read in the body).
@@ -489,9 +492,9 @@ namespace
 
     // Second over-cap case: a >65536-char ASCII input (well past the 4096 TLAB
     // cap AND past 16-bit lengths) built in full via the NewString fallback.  Like
-    // the 5000 case its native readback is 0 (read_java_string's 4096 ceiling
-    // rejects the long array); the FULL length is proven only Java-side (content
-    // check below).
+    // the 5000 case, the cap-raised read_java_string (16M-char ceiling) now decodes
+    // the long array IN FULL, so its native readback is the complete 100000 bytes;
+    // the Java-side content check (slot 7) is the independent full-length proof.
     std::atomic<bool> g_huge_captured{ false };  // >65536 String made + valid
     std::atomic<int>  g_huge_decoded_len{ -1 };  // read_java_string(huge make).size()
 
@@ -543,11 +546,13 @@ namespace
             cc.push_back({ "bmp_sweep", sweep });
         }
         // 6: OVER-CAP 4097 ASCII — one past the TLAB cap; NewString fallback builds
-        //    it full.  read_java_string can't read 4097 back (its 4096 ceiling), so
-        //    Java is the ONLY proof the made String is genuinely 4097 chars.
+        //    it full.  read_java_string now reads 4097 back in full (cap raised to
+        //    16M, robustness #29); the Java content check below independently confirms
+        //    the made String is genuinely 4097 chars via real bytecode.
         cc.push_back({ "over_cap_4097", repeat_bytes("x", 4097) });
         // 7: OVER-CAP >65536 ASCII — far past the cap and past 16-bit lengths;
-        //    full length provable only Java-side.
+        //    read_java_string decodes it in full too, and Java independently confirms
+        //    the full length.
         cc.push_back({ "over_cap_100000", repeat_bytes("x", 100000) });
         return cc;
     }
@@ -658,10 +663,10 @@ namespace
 
         // Over-cap: a 5000-char ASCII input — past the TLAB fast-path cap, so
         // make_java_string builds the FULL String via the NewString fallback
-        // (robustness #9 fix).  We capture read_java_string(made).size(): it is 0,
-        // not 4096, because read_java_string's own separate ceiling rejects the
-        // 5000-long backing array — which is exactly the signal that the String was
-        // built in full rather than truncated to 4096 (asserted in the body).
+        // (robustness #9 fix).  We capture read_java_string(made).size(): with the
+        // cap-raised reader (robustness #29, ceiling 16M chars) it is the FULL 5000,
+        // not 0 and not 4096 — the signal that the String was built AND read back in
+        // full rather than truncated to 4096 (asserted in the body).
         {
             bool nn{ false };
             bool v{ false };
@@ -677,8 +682,9 @@ namespace
         // Over-cap, BIGGER: a >65536-char ASCII input (100000).  Same fallback
         // path as the 5000 case but well past 16-bit lengths — guards against any
         // 16-bit length truncation in the NewString fallback or the readback.  The
-        // native readback is again 0 (read ceiling); the full 100000-char length is
-        // proven only Java-side (content check, slot 7).
+        // cap-raised reader decodes it in full, so the native readback is the
+        // complete 100000 bytes; the full length is corroborated Java-side too
+        // (content check, slot 7).
         {
             bool nn{ false };
             bool v{ false };
@@ -1306,39 +1312,47 @@ namespace
                        "JVM (characterised, not asserted).");
         }
 
-        // Over-cap (robustness #9 FIX): a 5000-char ASCII input is NO LONGER
-        // silently truncated to 4096.  make_java_string now decodes the full input
-        // and, because 5000 > the TLAB fast-path ceiling, builds the COMPLETE String
-        // through the GC-aware JNIEnv::NewString fallback (the JVM constructs it at
-        // any length).  The made oop is therefore a genuine 5000-char String, valid
-        // and non-null.
+        // Over-cap (robustness #9 + #29 FIX): a 5000-char ASCII input is NO LONGER
+        // silently truncated to 4096.  make_java_string decodes the FULL input and,
+        // because 5000 > the TLAB fast-path ceiling (k_tlab_string_max_units = 4096),
+        // builds the COMPLETE String through the GC-aware JNIEnv::NewString fallback
+        // (the JVM constructs it at any length).  The made oop is therefore a genuine
+        // 5000-char String, valid and non-null.
         //
-        // Note the native readback is the DISTINGUISHING signal here.
-        // read_java_string has its OWN, separate ceiling (a fixed 8192-byte body
-        // buffer == 4096 chars * 2) and REJECTS any backing array longer than 4096,
-        // returning "" (length 0).  So:
-        //   * OLD (truncating) behaviour produced a 4096-char String, which
-        //     read_java_string read back as exactly 4096 bytes;
-        //   * NEW (fixed) behaviour produces a 5000-char String, which is too long
-        //     for read_java_string's ceiling and therefore reads back as 0 bytes.
-        // A readback of 0 thus PROVES the made String is longer than 4096 (i.e. NOT
-        // truncated); a readback of 4096 would mean the truncation bug regressed.
-        // We hard-assert the new value so a regression flips this red.  (The full
-        // 5000-char content is Java-visible; only the native reader caps — a
-        // documented, in-scope-elsewhere limit characterised by read_java_string.cpp.)
+        // CURRENT, SELF-CONSISTENT readback behaviour (this is what the live library
+        // does now — verified against vmhook.hpp read_java_string + make_java_string):
+        // read_java_string NO LONGER has a 4096-char ceiling.  The old fixed
+        // 8192-byte (== 4096 chars * 2) body buffer is gone; read_java_string now
+        // sizes a heap buffer to the actual backing-array body and validates the
+        // decoded character count against read_java_string_max_units (16 * 1024 *
+        // 1024), reading the String IN FULL (robustness bug #29 fix — the old hard
+        // 4096 cap, which the doc even mis-called "truncation", was raised).  So:
+        //   * OLD (truncating make) behaviour produced a 4096-char String, which the
+        //     OLD reader read back as exactly 4096 bytes;
+        //   * the OLD reader's separate 4096 ceiling would have read a full 5000-char
+        //     String back as 0 bytes;
+        //   * CURRENT behaviour produces a FULL 5000-char String AND reads it back IN
+        //     FULL as exactly 5000 bytes (both the over-cap make AND the cap-raised
+        //     reader now agree end-to-end).
+        // We hard-assert the full 5000-byte readback: it proves the made String is
+        // the complete input (NOT a 4096 truncation, NOT a degenerate 0-byte reject),
+        // and it exercises the cap-raised reader on a real over-4096 backing array.
+        // A readback of 4096 would mean the make-time truncation bug regressed; a
+        // readback of 0 would mean the old reader 4096 ceiling regressed.
+        constexpr int k_mjs_overcap_chars{ 5000 };  // matches repeat_bytes("x", 5000) above
         if (g_trunc_captured.load())
         {
             const int tlen{ g_trunc_decoded_len.load() };
             ctx.record(std::string{ "[INFO] over-cap input (5000 ASCII chars): make_java_string "
                        "built a valid full-length String (NOT truncated); read_java_string(made)."
                        "size() = " } + std::to_string(tlen)
-                       + " bytes (0 == read_java_string's separate 4096 ceiling rejects the "
-                         "over-long backing array; the Java-visible String is the full 5000 chars).");
-            // HARD: the over-cap String must NOT read back as a 4096-byte truncation.
-            // It reads back as 0 because read_java_string's own ceiling rejects the
-            // 5000-long array — which only happens if make_java_string built the FULL
-            // String rather than a 4096-char truncation (robustness #9 fix).
-            ctx.check("over_cap_not_truncated_full_string_built", tlen == 0);
+                       + " bytes (expected 5000 == the cap-raised reader now decodes the over-4096 "
+                         "LATIN1 backing array IN FULL; the Java-visible String is the full 5000 chars).");
+            // HARD: the over-cap String must read back as the FULL 5000 bytes — proving
+            // BOTH that make_java_string built the complete String (no 4096 truncation)
+            // AND that read_java_string decodes an over-4096 array in full (cap raised
+            // from 4096 to 16M, robustness #29).  Distinct prefix retained.
+            ctx.check("over_cap_not_truncated_full_string_built", tlen == k_mjs_overcap_chars);
             ctx.check("over_cap_not_4096_truncation_regression", tlen != 4096);
         }
         else
@@ -1349,22 +1363,27 @@ namespace
         }
 
         // Over-cap, >65536 (100000 ASCII): same fix, well past 16-bit lengths.  The
-        // native readback is 0 for the SAME reason (read ceiling).  This guards
-        // specifically against a 16-bit length truncation anywhere on the fallback
-        // or readback path: a 16-bit-wrapped length (100000 & 0xFFFF == 34464) would
-        // be <= 4096?  No (34464 > 4096) so it would still read back 0 — but a wrap
-        // to e.g. 100000 & 0x0FFF would not.  The Java content check (slot 7) is the
-        // real full-length proof; here we assert the native readback is not the old
-        // 4096 truncation and not a short wrapped value that slipped under the ceiling.
+        // cap-raised reader (read_java_string_max_units = 16M chars) decodes this in
+        // FULL, so the native readback is the complete 100000 bytes — which directly
+        // guards against any 16-bit length truncation on the fallback or readback
+        // path: a 16-bit-wrapped length (100000 & 0xFFFF == 34464, or 100000 & 0x0FFF
+        // == 672) would yield a readback of 34464 / 672, NOT 100000.  Requiring the
+        // EXACT full 100000-byte readback therefore rejects every wrap, the old 4096
+        // truncation, and the old reader's 0-byte ceiling reject in a single assert.
+        // The Java content check (slot 7) is the independent full-length proof; this
+        // native assert now corroborates it end-to-end.
+        constexpr int k_mjs_huge_chars{ 100000 };  // matches repeat_bytes("x", 100000) above; > 65536
         if (g_huge_captured.load())
         {
             const int hlen{ g_huge_decoded_len.load() };
             ctx.record(std::string{ "[INFO] over-cap input (100000 ASCII chars, >65536): "
                        "make_java_string built a valid full-length String; read_java_string(made)."
                        "size() = " } + std::to_string(hlen)
-                       + " bytes (0 == read ceiling rejects the over-long array; full length "
-                         "proven Java-side in the content check, slot 7).");
-            ctx.check("mjs_over_cap_65536_not_truncated", hlen == 0);
+                       + " bytes (expected 100000 == the cap-raised reader decodes the >65536-byte "
+                         "backing array IN FULL; corroborates the Java-side content check, slot 7).");
+            // HARD: full 100000-byte readback proves no 4096 truncation, no 16-bit
+            // length wrap, and no 0-byte ceiling reject — all in one assert.
+            ctx.check("mjs_over_cap_65536_not_truncated", hlen == k_mjs_huge_chars);
             ctx.check("mjs_over_cap_65536_not_4096_regression", hlen != 4096);
         }
         else
@@ -1554,8 +1573,8 @@ namespace
             // Spell out the headline over-cap proofs by name so a regression is
             // unmistakable: the 4097 and 100000 strings the JVM sees are genuinely
             // their FULL length (this is the Java-side counterpart to the native
-            // readback-is-0 over-cap assertions, and the only place the full
-            // over-cap length is positively confirmed).
+            // full-length-readback over-cap assertions above — with the cap-raised
+            // reader both sides now positively confirm the full over-cap length).
             //   slot 6 == over_cap_4097, slot 7 == over_cap_100000 (see build_cc_cases).
             if (ncc > 6 && g_cc_call_returned[6].load() && mjs::get_bool(ccf_called[6]))
             {

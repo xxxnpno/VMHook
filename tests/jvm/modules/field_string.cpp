@@ -1,22 +1,35 @@
 // field_string JVM test module — exhaustive coverage of String field GET and
-// SET through vmhook's zero-JNI field_proxy / read_java_string / write_java_string.
+// SET through vmhook's zero-JNI field_proxy / read_java_string / store_string.
 //
 // Feature surface under test (vmhook/ext/vmhook/vmhook.hpp):
 //   - read_java_string()                          (line ~15138)  GET decode
 //   - field_proxy::value_t::cast_for_variant<std::string>  (~11411)  GET dispatch
-//   - write_java_string() / set_str_field()       (~15256/15320) SET in-place
-//   - field_proxy::set(std::string)               (~11655)       SET dispatch + guard
+//   - field_proxy::store_string()                 (~15479)       SET = REBIND
+//   - field_proxy::set(std::string)               (~15127)       SET dispatch + guard
+//
+// SET semantics (library bug #30 FIXED): field_proxy::set(std::string) now
+// REBINDS the String field to a freshly-built, correctly-encoded java.lang.String
+// of the EXACT input value+length (an object-reference store via store_string ->
+// store_object_oop), the same as a Java `field = value;`.  It NO LONGER overwrites
+// the existing backing array in place, so the old quirks are gone: a shorter write
+// becomes exactly the new value (not "old-tail"-padded), an overlong write is the
+// FULL value (not truncated to the backing length), a write over a 0-length backing
+// builds a real String, and a shared/interned String referenced elsewhere is never
+// corrupted.  These SET checks assert that new, correct behavior.
 //
 // All checks run on a live JDK-21 JVM, where java.lang.String is COMPACT:
 //   coder 0 (LATIN1) => one byte per char, each code point UTF-8-ENCODED
 //                       (0xE9 -> C3 A9, 0x80 -> C2 80, 0xFF -> C3 BF);
 //   coder 1 (UTF-16) => two bytes per char, decoded to multi-byte UTF-8 with
 //                       surrogate pairs combined into one 4-byte sequence.
-//   read_java_string no longer substitutes '?' for non-ASCII.  The remaining
-//   characterized quirk is the 4096-backing-byte cap: a String whose backing
-//   array exceeds 4096 bytes is REJECTED to "" (NOT truncated), which makes the
-//   effective UTF-16 ceiling 2048 chars.  The fixture is built so every decode
-//   path AND that cap boundary is exercised (documented inline per check).
+//   read_java_string no longer substitutes '?' for non-ASCII.  The old hard
+//   4096-backing-byte cap (which REJECTED any longer String to "") is GONE
+//   (robustness bug #29 fixed in the library): the helper now reads a String IN
+//   FULL up to a layout-uniform ceiling of read_java_string_max_units (16M
+//   CHARACTERS) — applied to the decoded CHARACTER count, so LATIN1, UTF16, and
+//   JDK 8 char[] all share the SAME char ceiling (no more asymmetric 2048-char
+//   UTF-16 limit).  The fixture is built so every decode path AND the long-String
+//   read-in-full behaviour is exercised (documented inline per check).
 //
 // Mirrors the pilot module shape: register_class, a scoped_hook for the
 // interpreter-hook-on-dispatch requirement, run_probe for the handshake, and a
@@ -121,6 +134,9 @@ namespace
         static auto set_ascii_eq_value()   -> std::string  { return static_field("setAsciiEqValue")->get(); }
         static auto set_shorter_value()    -> std::string  { return static_field("setShorterValue")->get(); }
         static auto set_shorter_len()      -> std::int32_t { return static_field("setShorterLen")->get(); }
+        static auto set_shorter_original_intact() -> bool  { return static_field("setShorterOriginalIntact")->get(); }
+        static auto set_empty_tgt_value()  -> std::string  { return static_field("setEmptyTgtValue")->get(); }
+        static auto set_empty_tgt_len()    -> std::int32_t { return static_field("setEmptyTgtLen")->get(); }
         static auto set_latin1_matches()   -> bool        { return static_field("setLatin1Matches")->get(); }
         static auto set_latin1_value()     -> std::string  { return static_field("setLatin1TgtValue")->get(); }
         static auto set_overlong_value()   -> std::string  { return static_field("setOverlongValue")->get(); }
@@ -181,22 +197,27 @@ VMHOOK_JVM_MODULE(field_string)
 
     // ----------------------------------------------------------------------
     // PHASE 1: perform every SET write BEFORE raising go.  field_proxy::set
-    // mutates the backing array directly in heap memory, so no Java bytecode
-    // is required for the writes; the probe (phase 2) then reads them back
-    // through Java to prove the mutation is visible to the JVM itself.
+    // builds a fresh java.lang.String and rebinds the field reference to it (an
+    // object-reference store, no Java bytecode required); the probe (phase 2)
+    // then reads each field back through Java to prove the new reference is
+    // visible to the JVM itself.
     // ----------------------------------------------------------------------
 
-    // Clean full overwrite: "AAAAA"(5) <- "world"(5).
+    // Clean full overwrite (rebind): "AAAAA"(5) <- "world"(5).
     ctx.check("set_ascii_eq_proxy_resolved",
               field_string_fixture::set_static("setAsciiEq", "world"));
 
     // Shorter write into a longer backing: "world"(5) <- "hi"(2).
-    // write_java_string writes only min(5,2)=2 bytes and leaves the tail,
-    // so Java should see "hirld" (partial-overwrite, no length change).
+    // field_proxy::set now REBINDS the field to a freshly-built java.lang.String
+    // (library bug #30 fixed) instead of overwriting the existing backing array
+    // in place, so the field becomes EXACTLY "hi" (length 2) — NOT the old
+    // partial-overwrite "hirld" (length 5) that left the stale tail.
     ctx.check("set_shorter_proxy_resolved",
               field_string_fixture::set_static("setShorter", "hi"));
 
-    // Write into a zero-length backing: must be a no-op (writable_length<=0).
+    // Write into a zero-length backing: the rebind builds a brand-new String, so
+    // a 0-length backing is irrelevant — the field becomes "ignored" (length 7).
+    // (Under the old in-place path this was a no-op, writable_length<=0.)
     ctx.check("set_empty_proxy_resolved",
               field_string_fixture::set_static("setEmptyTgt", "ignored"));
 
@@ -205,7 +226,8 @@ VMHOOK_JVM_MODULE(field_string)
               field_string_fixture::set_static("setLatin1Tgt", "abcde"));
 
     // Overlong write into a short backing: "abc"(3) <- "LONGER"(6).
-    // Truncates to 3 bytes ("LON"); length stays 3 (no Java-heap resize).
+    // The rebind allocates a String of ANY length, so the field becomes the FULL
+    // "LONGER" (length 6) — NOT the old truncation to the 3-byte backing ("LON").
     ctx.check("set_overlong_proxy_resolved",
               field_string_fixture::set_static("setOverlong", "LONGER"));
 
@@ -317,25 +339,33 @@ VMHOOK_JVM_MODULE(field_string)
               && embedded[0] == 'a' && embedded[1] == '\0'
               && embedded[2] == 'b' && embedded[3] == '\0' && embedded[4] == 'c');
 
-    // --- Length cap: exactly 4096 ASCII chars passes (inclusive). ---
+    // --- Long-String read-in-full (robustness bug #29 FIXED): the old hard
+    // 4096-byte cap that rejected longer Strings to "" is gone.  read_java_string
+    // now reads a String IN FULL up to read_java_string_max_units (16M CHARS), so
+    // these "boundary" subjects now decode to their COMPLETE content.  The 4096 /
+    // 4097 / 5000 numbers are no longer a cap — they are just lengths well under
+    // the new ceiling, asserted read-in-full. ---
     const std::string len4096{ field_string_fixture::read_static("getLen4096") };
-    ctx.check("get_len4096_passes_cap_full", len4096.size() == 4096);
+    ctx.check("get_len4096_read_in_full", len4096.size() == 4096);
     ctx.check("get_len4096_all_x",
               len4096.size() == 4096 && len4096.front() == 'x' && len4096.back() == 'x');
 
-    // --- 4097 ASCII chars: byte length 4097 > 4096 -> REJECTED -> "". ---
-    // (Bug: docstring says "truncates"; code rejects.  Asserts the real behavior.)
-    ctx.check("get_len4097_rejected_empty_BUG",
-              field_string_fixture::read_static("getLen4097").empty());
+    // --- 4097 ASCII chars ('y'): formerly REJECTED at the old 4096 cap, now read
+    // IN FULL (4097 bytes, every byte 'y').  This is the headline proof the fix
+    // landed: a String one char past the OLD cap is no longer truncated-to-empty. ---
+    const std::string len4097{ field_string_fixture::read_static("getLen4097") };
+    ctx.check("get_len4097_read_in_full", len4097.size() == 4097);
+    ctx.check("get_len4097_all_y",
+              len4097.size() == 4097 && len4097.front() == 'y' && len4097.back() == 'y');
 
-    // --- 5000 ASCII chars: well past cap -> "". ---
-    ctx.check("get_len5000_rejected_empty_BUG",
-              field_string_fixture::read_static("getLen5000").empty());
+    // --- 5000 ASCII chars ('z'): well past the OLD cap, now read IN FULL. ---
+    const std::string len5000{ field_string_fixture::read_static("getLen5000") };
+    ctx.check("get_len5000_read_in_full", len5000.size() == 5000);
+    ctx.check("get_len5000_all_z",
+              len5000.size() == 5000 && len5000.front() == 'z' && len5000.back() == 'z');
 
-    // --- 2048 CJK chars (日): UTF-16 byte[] length 4096 -> passes the cap, then
-    // decodes to correct UTF-8 — each 日 (U+65E5) is 3 bytes E6 97 A5, so the
-    // result is 2048 * 3 = 6144 bytes.  (The UTF-16 char cap is 2048, half of the
-    // 4096-byte array-length ceiling.) ---
+    // --- 2048 CJK chars (日): decodes to correct UTF-8 — each 日 (U+65E5) is
+    // 3 bytes E6 97 A5, so the result is 2048 * 3 = 6144 bytes. ---
     const std::string cjk2048{ field_string_fixture::read_static("getCjk2048") };
     ctx.check("get_cjk2048_utf8_len_6144", cjk2048.size() == 2048u * 3u);
     ctx.check("get_cjk2048_first_and_last_kanji",
@@ -347,27 +377,19 @@ VMHOOK_JVM_MODULE(field_string)
               && static_cast<unsigned char>(cjk2048[6142]) == 0x97
               && static_cast<unsigned char>(cjk2048[6143]) == 0xA5);
 
-    // --- 2049 CJK chars: read_java_string's 4096 cap is on the backing-ARRAY
-    // length.  On JDK 9+ compact strings the UTF-16 backing is a byte[] (2 bytes
-    // per char), so 2049 chars = 4098 bytes > 4096 -> rejected -> "".  On JDK 8
-    // the backing is a char[] (1 unit per char), so 2049 <= 4096 -> the read
-    // succeeds (2049 kanji -> 2049*3 = 6147 UTF-8 bytes).  Branch on whether the
-    // String class carries the JDK-9 `coder` field (i.e. uses compact strings). ---
-    {
-        vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
-        const bool compact_strings{ string_klass != nullptr
-                                    && string_klass->find_field("coder").has_value() };
-        const std::string cjk2049{ field_string_fixture::read_static("getCjk2049") };
-        if (compact_strings)
-        {
-            ctx.check("get_cjk2049_rejected_empty_utf16_cap_2048", cjk2049.empty());
-        }
-        else
-        {
-            // JDK 8 char[]: 2049 chars are within the 4096-char cap and decode fine.
-            ctx.check("get_cjk2049_classic_char_array_read_6147", cjk2049.size() == 2049u * 3u);
-        }
-    }
+    // --- 2049 CJK chars: with the fix, the ceiling is applied to the decoded
+    // CHARACTER count UNIFORMLY (16M chars), not to the raw backing-array byte
+    // length, so there is NO more asymmetric UTF-16 cap.  A 2049-char UTF-16 String
+    // (byte[] length 4098 on JDK 9+) now reads IN FULL on BOTH layouts: 2049 kanji
+    // -> 2049 * 3 = 6147 UTF-8 bytes, regardless of compact-string layout. ---
+    const std::string cjk2049{ field_string_fixture::read_static("getCjk2049") };
+    ctx.check("get_cjk2049_read_in_full_6147", cjk2049.size() == 2049u * 3u);
+    ctx.check("get_cjk2049_first_and_last_kanji",
+              cjk2049.size() == 2049u * 3u
+              && static_cast<unsigned char>(cjk2049[0]) == 0xE6
+              && static_cast<unsigned char>(cjk2049[1]) == 0x97
+              && static_cast<unsigned char>(cjk2049[2]) == 0xA5
+              && static_cast<unsigned char>(cjk2049[2049u * 3u - 1]) == 0xA5);
 
     // ======================================================================
     // EXHAUSTIVE GET EXTRAS — "every possible String-field read" battery.
@@ -575,17 +597,33 @@ VMHOOK_JVM_MODULE(field_string)
         ctx.check("set_ascii_eq_java_len_5", field_string_fixture::set_ascii_eq_len() == 5);
         ctx.check("set_ascii_eq_java_value_world", field_string_fixture::set_ascii_eq_value() == "world");
 
-        // Shorter write left the tail in place -> "hirld" (partial-overwrite quirk).
-        ctx.check("set_shorter_java_value_hirld", field_string_fixture::set_shorter_value() == "hirld");
-        ctx.check("set_shorter_java_len_stays_5", field_string_fixture::set_shorter_len() == 5);
+        // Shorter write REBINDS to a fresh String -> Java sees exactly "hi"
+        // (length 2), not the old partial-overwrite "hirld"/length-5 quirk.
+        ctx.check("set_shorter_java_value_hi", field_string_fixture::set_shorter_value() == "hi");
+        ctx.check("set_shorter_java_len_2", field_string_fixture::set_shorter_len() == 2);
+        // REBIND-SAFETY: a separate Java alias to setShorter's ORIGINAL String
+        // object still reads "world" after the native set().  The rebind is an
+        // object-reference store (it bound the field to a brand-new "hi" String),
+        // so the previously-referenced object was never mutated — proving a shared
+        // String aliased elsewhere is not corrupted (the old in-place overwrite
+        // WOULD have turned this original object's content into "hirld").
+        ctx.check("set_shorter_original_object_intact_world",
+                  field_string_fixture::set_shorter_original_intact());
+
+        // Empty-backing target: the rebind built a real "ignored" String, so Java
+        // sees the full value (length 7), not the old writable_length<=0 no-op "".
+        ctx.check("set_empty_java_value_ignored",
+                  field_string_fixture::set_empty_tgt_value() == "ignored");
+        ctx.check("set_empty_java_len_7", field_string_fixture::set_empty_tgt_len() == 7);
 
         // ASCII into LATIN1 coder-0 backing of equal length round-trips cleanly.
         ctx.check("set_latin1_java_equals_abcde", field_string_fixture::set_latin1_matches());
         ctx.check("set_latin1_java_value_abcde", field_string_fixture::set_latin1_value() == "abcde");
 
-        // Overlong write truncated to backing length; Java length stayed 3.
-        ctx.check("set_overlong_java_value_LON", field_string_fixture::set_overlong_value() == "LON");
-        ctx.check("set_overlong_java_len_stays_3", field_string_fixture::set_overlong_len() == 3);
+        // Overlong write REBINDS to a fresh String -> Java sees the FULL "LONGER"
+        // (length 6), not the old truncate-to-backing "LON"/length-3 quirk.
+        ctx.check("set_overlong_java_value_LONGER", field_string_fixture::set_overlong_value() == "LONGER");
+        ctx.check("set_overlong_java_len_6", field_string_fixture::set_overlong_len() == 6);
 
         // Instance field write-back visible to Java.
         ctx.check("instance_set_java_equals_java_bang", field_string_fixture::inst_ascii_matches());
@@ -598,12 +636,14 @@ VMHOOK_JVM_MODULE(field_string)
         //      and confirm it agrees with what Java reported. ----
         ctx.check("set_ascii_eq_vmhook_reread_world",
                   field_string_fixture::read_static("setAsciiEq") == "world");
-        ctx.check("set_shorter_vmhook_reread_hirld",
-                  field_string_fixture::read_static("setShorter") == "hirld");
-        ctx.check("set_overlong_vmhook_reread_LON",
-                  field_string_fixture::read_static("setOverlong") == "LON");
-        ctx.check("set_empty_target_still_empty",
-                  field_string_fixture::read_static("setEmptyTgt").empty());
+        ctx.check("set_shorter_vmhook_reread_hi",
+                  field_string_fixture::read_static("setShorter") == "hi");
+        ctx.check("set_overlong_vmhook_reread_LONGER",
+                  field_string_fixture::read_static("setOverlong") == "LONGER");
+        // The rebind built a real String over the formerly-empty backing, so the
+        // field now reads the written value (no longer the old no-op "").
+        ctx.check("set_empty_target_now_ignored",
+                  field_string_fixture::read_static("setEmptyTgt") == "ignored");
 
         // ---- FIELD REASSIGNED BETWEEN READS: the probe replaced getReassign's
         //      reference with a freshly-allocated "after2".  A NEW field_proxy

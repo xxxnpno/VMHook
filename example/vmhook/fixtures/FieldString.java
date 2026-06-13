@@ -4,19 +4,19 @@ import vmhook.Harness;
 
 /**
  * Exhaustive fixture for the {@code field_string} feature (String field get AND
- * set through vmhook's zero-JNI field_proxy / read_java_string / write_java_string).
+ * set through vmhook's zero-JNI field_proxy / read_java_string / store_string).
  *
  * The native module (tests/jvm/modules/field_string.cpp) drives this fixture in
  * two phases around a single go/done handshake:
  *
  *   1. BEFORE raising go, native performs every {@code field_proxy::set(...)}
- *      write it wants to test.  set() mutates the backing byte[]/char[] of an
- *      existing String directly in heap memory, so no Java bytecode needs to run
- *      for the write itself.
+ *      write it wants to test.  set() builds a fresh java.lang.String and rebinds
+ *      the field reference to it (an object-reference store, library bug #30 fixed),
+ *      so no Java bytecode needs to run for the write itself.
  *   2. When go is raised, this fixture's probe runs on the Java thread.  It:
  *        - calls a hooked instance method (touchString) so an interpreter hook
  *          fires on a real bytecode dispatch (mirrors the pilot contract), and
- *        - reads every just-mutated field *through Java* and publishes the
+ *        - reads every just-rebound field *through Java* and publishes the
  *          observations into the volatile result fields below, so the native
  *          side can prove the writes are visible to Java itself (not just to
  *          vmhook's own read path).
@@ -34,8 +34,10 @@ import vmhook.Harness;
  *   - >4096 chars            -> the length>4096 rejection path (returns "")
  *
  * Every SET-target String is allocated with {@code new String(...)} (or built
- * char-by-char) so it owns a PRIVATE, non-interned backing array — mutating it
- * in place cannot corrupt a shared string-pool literal elsewhere in the JVM.
+ * char-by-char) so it owns a PRIVATE, non-interned backing array.  set() now
+ * rebinds the field reference rather than mutating backing in place, so this can
+ * no longer corrupt a shared literal; the private backing additionally lets the
+ * fixture alias a SET target's original object and prove the rebind left it intact.
  *
  * The class extends {@link FieldStringBase} so the module can also read a String
  * field declared on a SUPERCLASS (inherited get, via vmhook::find_field's super
@@ -67,15 +69,19 @@ public class FieldString extends FieldStringBase
     public static String getNull        = null;
     // Interned literal (identity-shared); reading must not mutate it.
     public static String getInterned    = "INTERNED_LITERAL";
-    // Exactly 4096 ASCII chars -> LATIN1 byte length 4096 -> the inclusive cap.
+    // Long-String read-in-full targets (robustness bug #29 FIXED: the old hard
+    // 4096-byte cap is gone; read_java_string reads IN FULL up to 16M chars,
+    // uniformly per decoded char count). ---
+    // Exactly 4096 ASCII chars -> LATIN1 byte length 4096 -> read in full.
     public static String getLen4096     = repeat('x', 4096);
-    // 4097 ASCII chars -> LATIN1 byte length 4097 -> rejected (returns "").
+    // 4097 ASCII chars -> ONE char past the OLD cap -> read in full (4097 bytes).
     public static String getLen4097     = repeat('y', 4097);
-    // 5000 ASCII chars -> well past the cap -> rejected (returns "").
+    // 5000 ASCII chars -> well past the OLD cap -> read in full (5000 bytes).
     public static String getLen5000     = repeat('z', 5000);
-    // 2048 CJK chars -> UTF-16 byte length 4096 -> passes cap -> 2048*3 UTF-8 bytes.
+    // 2048 CJK chars -> UTF-16 byte length 4096 -> 2048*3 UTF-8 bytes.
     public static String getCjk2048     = repeat('日', 2048);
-    // 2049 CJK chars -> UTF-16 byte length 4098 -> rejected (returns "").
+    // 2049 CJK chars -> UTF-16 byte length 4098 (2049 chars) -> read in full on
+    // both layouts -> 2049*3 UTF-8 bytes (no more asymmetric UTF-16 cap).
     public static String getCjk2049     = repeat('日', 2049);
     // Embedded NUL: ASCII bytes with a 0x00 in the middle (LATIN1, length 5).
     public static String getEmbeddedNul = makeEmbeddedNul();             // a\0b\0c
@@ -136,28 +142,40 @@ public class FieldString extends FieldStringBase
     public static volatile String  jReassignAfterValue; // getReassign AFTER the probe reassigns it
 
     // ================= SET targets (static) ================================
-    // CRITICAL: every SET target is built with new String(char[]) so it owns a
-    // PRIVATE backing array.  (new String(String) shares the backing byte[] with
-    // the interned literal, so an in-place write_java_string would corrupt every
-    // copy of that literal across the whole JVM — verified empirically on JDK 21.)
-    // For an in-place write to land cleanly the replacement length must equal the
-    // existing backing length; these are sized to match their test inputs.
-    public static String setAsciiEq    = freshAscii("AAAAA");           // len 5, write "world"
-    public static String setShorter    = freshAscii("world");           // len 5, write "hi"
-    public static String setEmptyTgt   = freshAscii("");                // len 0, write -> no-op
-    public static String setLatin1Tgt  = newLatin1Blank();              // LATIN1 len 5, write "abcde"
-    public static String setOverlong   = freshAscii("abc");             // len 3, write "LONGER"
+    // field_proxy::set(std::string) REBINDS the field to a freshly-built String
+    // (library bug #30 fixed); it no longer overwrites the existing backing array
+    // in place, so the written value lands EXACTLY (any length) and the previously
+    // referenced String object is never mutated.  Targets are still built with
+    // new String(char[]) so each starts with a PRIVATE backing — this also lets us
+    // hold a SEPARATE reference to the original object (setShorterOriginal below)
+    // and prove the rebind did NOT corrupt it.  The lengths no longer need to
+    // match the test inputs (the rebind allocates the exact size it needs).
+    public static String setAsciiEq    = freshAscii("AAAAA");           // write "world" -> "world"
+    public static String setShorter    = freshAscii("world");           // write "hi"    -> "hi"
+    public static String setEmptyTgt   = freshAscii("");                // write "ignored"-> "ignored"
+    public static String setLatin1Tgt  = newLatin1Blank();              // write "abcde" -> "abcde"
+    public static String setOverlong   = freshAscii("abc");             // write "LONGER"-> "LONGER"
+
+    // A SEPARATE alias to setShorter's ORIGINAL String object, captured at class
+    // init BEFORE any native write.  After the native set() rebinds setShorter to
+    // a new "hi" String, this still points at the original object — which must STILL
+    // read "world" (the rebind is an object-reference store, NOT an in-place mutate;
+    // proving the old shared object is not corrupted).
+    public static final String setShorterOriginal = setShorter;
+    public static volatile boolean setShorterOriginalIntact;  // setShorterOriginal.equals("world")
 
     // Java-published facts AFTER the native writes (read through Java).
     public static volatile String  setAsciiEqValue;
     public static volatile int     setAsciiEqLen;
     public static volatile boolean setAsciiEqMatches;   // equals("world")
     public static volatile String  setShorterValue;
-    public static volatile int     setShorterLen;
+    public static volatile int     setShorterLen;       // == 2 ("hi") after the rebind
+    public static volatile String  setEmptyTgtValue;    // == "ignored" after the rebind
+    public static volatile int     setEmptyTgtLen;      // == 7
     public static volatile String  setLatin1TgtValue;
     public static volatile boolean setLatin1Matches;    // equals("abcde")
     public static volatile String  setOverlongValue;
-    public static volatile int     setOverlongLen;      // must stay 3 (no resize)
+    public static volatile int     setOverlongLen;      // == 6 ("LONGER") after the rebind
 
     // ================= SET target (instance) ===============================
     // Instance String field, mutated through an instance field_proxy.
@@ -244,7 +262,8 @@ public class FieldString extends FieldStringBase
     /**
      * Builds a String from the chars of {@code text} via new String(char[]),
      * guaranteeing a PRIVATE backing array (never shared with an interned
-     * literal).  Essential for SET targets that are mutated in place.
+     * literal).  Used for SET targets so each starts with a private object that
+     * can be aliased and checked for non-corruption after the field is rebound.
      */
     private static String freshAscii(final String text)
     {
@@ -316,14 +335,21 @@ public class FieldString extends FieldStringBase
                 setAsciiEqLen     = setAsciiEq.length();
                 setAsciiEqMatches = "world".equals(setAsciiEq);
 
-                setShorterValue = setShorter;
-                setShorterLen   = setShorter.length();
+                setShorterValue = setShorter;            // "hi" after the rebind
+                setShorterLen   = setShorter.length();    // 2
+
+                // The original String object setShorter pointed at is untouched by
+                // the rebind (object-reference store, not in-place mutate).
+                setShorterOriginalIntact = "world".equals(setShorterOriginal);
+
+                setEmptyTgtValue = setEmptyTgt;           // "ignored" after the rebind
+                setEmptyTgtLen   = setEmptyTgt.length();  // 7
 
                 setLatin1TgtValue = setLatin1Tgt;
                 setLatin1Matches  = "abcde".equals(setLatin1Tgt);
 
-                setOverlongValue = setOverlong;
-                setOverlongLen   = setOverlong.length();
+                setOverlongValue = setOverlong;           // "LONGER" after the rebind
+                setOverlongLen   = setOverlong.length();  // 6
 
                 instAsciiValue   = self.instAscii;
                 instAsciiMatches = "java!".equals(self.instAscii);

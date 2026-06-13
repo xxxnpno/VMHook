@@ -37,11 +37,15 @@
 //     LONE HIGH surrogate -> ED A0 BD, a LONE LOW surrogate -> ED B0 80, a
 //     REVERSED low-then-high pair -> two 3-byte CESU runs, and a high surrogate as
 //     the LAST array unit (the (i+1)<count guard false at a non-zero index).
-//   * The 1..4096 backing-ARRAY-length ceiling: exactly 4096 passes, 4097 is
-//     REJECTED to "" (the doc says "truncate"; the code returns empty -- asserted
-//     as the real behaviour), a 70000-char string (> 65536) is likewise rejected
-//     with no int32 overflow, and the ASYMMETRIC UTF-16 char ceiling (2048 chars
-//     pass, 2049 is rejected on JDK 9+ byte[] but decodes on JDK 8 char[]).
+//   * LONG-STRING READ-IN-FULL (robustness bug #29 FIXED): the old hard 4096-char
+//     cap that decoded any longer String to "" is GONE.  read_java_string now
+//     reads a String IN FULL up to read_java_string_max_units (16M CHARACTERS),
+//     the ceiling applied UNIFORMLY to the decoded CHARACTER count (so LATIN1,
+//     UTF16, and JDK 8 char[] share ONE char ceiling -- no more asymmetric
+//     2048-char UTF-16 cap).  We prove: 4096 chars, 4097 chars (one past the OLD
+//     cap), 70000 chars (> 65536, exercising the high half-words of the int32
+//     length read), and 2049 CJK chars (UTF16 byte[] length 4098 on JDK 9+) all
+//     decode to their COMPLETE content on EVERY layout -- not rejected to "".
 //   * The JDK-8 (char[]) and JDK-9+ (byte[]+coder) layouts decode to the
 //     IDENTICAL UTF-8 bytes -- every decode is compared to a FIXED expected byte
 //     sequence that does not depend on the running JDK, so a green row on each
@@ -555,34 +559,41 @@ namespace
         }
 
         // =================================================================
-        //  4. LENGTH-CAP BOUNDARIES on the backing-ARRAY length (1..4096).
-        //     The doc comment promises "truncate"; the code RETURNS EMPTY past
-        //     the ceiling -- these assert the REAL behaviour.  The ceiling is
-        //     applied to the raw array length, so it is ASYMMETRIC across coders:
-        //     LATIN1 allows 4096 chars, UTF16 (byte[] = 2*chars) only 2048.
+        //  4. LONG-STRING READ-IN-FULL (robustness bug #29 FIXED).
+        //     The old hard 4096-char cap that decoded any longer String to "" is
+        //     GONE.  read_java_string now reads a String IN FULL up to
+        //     read_java_string_max_units (16M CHARACTERS), the ceiling applied
+        //     UNIFORMLY to the decoded CHARACTER count -- so LATIN1, UTF16, and
+        //     JDK 8 char[] share ONE char ceiling (no more asymmetric 2048-char
+        //     UTF-16 cap).  These subjects -- formerly rejected past the cap -- now
+        //     decode to their COMPLETE content on EVERY layout.
         // =================================================================
         {
-            // Exactly 4096 ASCII chars: LATIN1 byte[] length 4096 -> passes.
+            // Exactly 4096 ASCII chars: LATIN1 byte[] length 4096 -> read in full.
             const std::string cap4096{ rjs::decode("cap4096") };
-            ctx.check("decode_cap4096_passes_inclusive", cap4096.size() == 4096);
+            ctx.check("decode_cap4096_read_in_full", cap4096.size() == 4096);
             ctx.check("decode_cap4096_all_x",
                       cap4096.size() == 4096 && cap4096.front() == 'x' && cap4096.back() == 'x');
 
-            // 4097 ASCII chars: byte[] length 4097 > 4096 -> REJECTED -> "".
-            // (Documented flaw: header says "truncate", implementation returns "".)
+            // 4097 ASCII chars: ONE char past the OLD 4096 cap.  Formerly rejected
+            // to "" -- now read IN FULL (4097 bytes).  The headline proof the fix
+            // landed: a String just over the old cap is no longer lost.
             const std::string cap4097{ rjs::decode("cap4097") };
-            ctx.check("decode_cap4097_rejected_empty_DOC_truncate_vs_real_empty", cap4097.empty());
+            ctx.check("decode_cap4097_read_in_full", cap4097.size() == 4097);
+            ctx.check("decode_cap4097_all_x",
+                      cap4097.size() == 4097 && cap4097.front() == 'x' && cap4097.back() == 'x');
 
-            // 70000 ASCII chars: a length WAY past the cap AND past 65536 (so it
-            // exercises the high half-words of the int32 length read).  Still a
-            // single > 4096 rejection -> "" with no overflow, no chunking (there is
-            // no chunking path: the helper hard-caps at 4096, it never reads back a
-            // String larger than that).  Distinguishes "too long" only by being "".
+            // 70000 ASCII chars: a length WAY past the OLD cap AND past 65536 (so it
+            // exercises the high half-words of the int32 length read).  Formerly
+            // rejected to "" -- now read IN FULL (70000 bytes) with no int32
+            // overflow.  Well under the new 16M-char ceiling.
             const std::string cap70000{ rjs::decode("cap70000") };
-            ctx.check("decode_cap70000_rejected_empty_over_65536", cap70000.empty());
+            ctx.check("decode_cap70000_read_in_full", cap70000.size() == 70000);
+            ctx.check("decode_cap70000_all_x",
+                      cap70000.size() == 70000 && cap70000.front() == 'x' && cap70000.back() == 'x');
 
-            // 2048 CJK chars: on JDK 9+ UTF16 byte[] length 4096 -> passes; on
-            // JDK 8 char[] length 2048 -> also passes.  Decodes to 2048*3 bytes.
+            // 2048 CJK chars: on JDK 9+ UTF16 byte[] length 4096; on JDK 8 char[]
+            // length 2048.  Decodes to 2048*3 bytes on both layouts.
             const std::string capUtf2048{ rjs::decode("capUtf2048") };
             ctx.check("decode_capUtf2048_len_6144", capUtf2048.size() == 2048u * 3u);
             ctx.check("decode_capUtf2048_first_and_last_kanji",
@@ -590,27 +601,25 @@ namespace
                       && static_cast<std::uint8_t>(capUtf2048[0]) == 0xE6u
                       && static_cast<std::uint8_t>(capUtf2048[6143]) == 0xA5u);
 
-            // 2049 CJK chars: the ASYMMETRIC ceiling.  On JDK 9+ the UTF16
-            // byte[] length is 4098 > 4096 -> REJECTED -> "" (a UTF-16 string is
-            // effectively capped at 2048 chars, HALF the LATIN1 cap).  On JDK 8
-            // the char[] length is 2049 <= 4096 -> DECODES (2049*3 bytes).
+            // 2049 CJK chars: with the ceiling now applied to the decoded CHARACTER
+            // count (not the raw byte length), there is NO more asymmetric UTF-16
+            // cap.  On JDK 9+ the UTF16 byte[] length is 4098 (2049 chars) and on
+            // JDK 8 the char[] length is 2049 -- BOTH read IN FULL to 2049*3 bytes,
+            // regardless of layout.  (Formerly rejected to "" on JDK 9+.)
             const std::string capUtf2049{ rjs::decode("capUtf2049") };
-            if (compact_strings)
-            {
-                ctx.check("decode_capUtf2049_rejected_empty_utf16_cap_2048_ASYMMETRY",
-                          capUtf2049.empty());
-            }
-            else
-            {
-                ctx.check("decode_capUtf2049_jdk8_char_array_decodes_6147",
-                          capUtf2049.size() == 2049u * 3u);
-            }
-            ctx.record(std::string{ "[INFO] length-cap: cap4096 -> " }
+            ctx.check("decode_capUtf2049_read_in_full_6147",
+                      capUtf2049.size() == 2049u * 3u);
+            ctx.check("decode_capUtf2049_first_and_last_kanji",
+                      capUtf2049.size() == 2049u * 3u
+                      && static_cast<std::uint8_t>(capUtf2049[0]) == 0xE6u
+                      && static_cast<std::uint8_t>(capUtf2049[2049u * 3u - 1]) == 0xA5u);
+            ctx.record(std::string{ "[INFO] read-in-full: cap4096 -> " }
                        + std::to_string(cap4096.size()) + " bytes, cap4097 -> "
-                       + std::to_string(cap4097.size()) + " bytes (0 == rejected); "
+                       + std::to_string(cap4097.size()) + " bytes, cap70000 -> "
+                       + std::to_string(cap70000.size()) + " bytes; "
                        + "capUtf2048 -> " + std::to_string(capUtf2048.size())
                        + ", capUtf2049 -> " + std::to_string(capUtf2049.size())
-                       + " (asymmetric UTF-16 ceiling: 2048 chars on JDK 9+).");
+                       + " bytes (ceiling now 16M chars, uniform across layouts).");
         }
 
         // =================================================================
@@ -656,14 +665,18 @@ namespace
             // so the worst case is a bounded best-effort result -- NEVER a crash.
             // We assert exactly that contract: the call returns (the next
             // statement executes => no crash) and the result is length-bounded by
-            // the helper's own 1..4096 array-length ceiling (so <= 8192 UTF-8
-            // bytes worst case).  Content is undefined, so it is NOT asserted.
+            // the helper's own decoded-character ceiling (read_java_string_max_units
+            // chars, each emitting at most 4 UTF-8 bytes), so <= max_units * 4 UTF-8
+            // bytes worst case.  (The old 8192-byte bound assumed the now-removed
+            // 4096-char cap; bug #29.)  Content is undefined, so it is NOT asserted.
+            constexpr std::size_t k_max_decoded_bytes{
+                static_cast<std::size_t>(vmhook::read_java_string_max_units) * 4u };
             void* const obj_oop{ rjs::valid_oop_of("obj") };
             if (obj_oop != nullptr)
             {
                 const std::string s{ vmhook::read_java_string(obj_oop) };
                 ctx.check("read_java_string_nonString_object_no_crash_bounded",
-                          s.size() <= 8192u);
+                          s.size() <= k_max_decoded_bytes);
                 ctx.record(std::string{ "[INFO] read_java_string(Object oop) -> " }
                            + std::to_string(s.size()) + " bytes (best-effort, no crash).");
             }
@@ -677,7 +690,7 @@ namespace
             {
                 const std::string s{ vmhook::read_java_string(arr_oop) };
                 ctx.check("read_java_string_nonString_intArray_no_crash_bounded",
-                          s.size() <= 8192u);
+                          s.size() <= k_max_decoded_bytes);
                 ctx.record(std::string{ "[INFO] read_java_string(int[] oop) -> " }
                            + std::to_string(s.size()) + " bytes (best-effort, no crash).");
             }
