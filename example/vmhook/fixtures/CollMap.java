@@ -219,6 +219,58 @@ public final class CollMap
      */
     public static HashMap<Integer, Integer> hashIntKey = new HashMap<Integer, Integer>();
 
+    // ---- Key/value TYPE-COVERAGE maps (every one decodes POSITIVELY) -------
+    //      The walkers are generic over the key/value wrapper, so any boxed
+    //      reference key/value decodes; these pin the remaining type pairs the
+    //      audit called out beyond String->Box and Integer->Integer.
+
+    /**
+     * HashMap&lt;String,String&gt; — both key AND value are java.lang.String, so
+     * the value side is decoded via read_java_string just like the key (not via
+     * a Box).  SMALL_N entries "sk"+i -&gt; "sv"+i.
+     */
+    public static HashMap<String, String> hashStrStr = new HashMap<String, String>();
+
+    /**
+     * HashMap&lt;Integer,String&gt; — boxed Integer KEY, String VALUE.  Proves a
+     * boxed-primitive key paired with a String value (a different value type
+     * from hashIntKey's boxed Integer value).  SMALL_N entries i -&gt; "iv"+i.
+     */
+    public static HashMap<Integer, String> hashIntStr = new HashMap<Integer, String>();
+
+    /**
+     * HashMap&lt;Long,Long&gt; — boxed Long KEY and boxed Long VALUE (64-bit
+     * primitive box).  Proves the java.lang.Long.value (a long, not an int)
+     * round-trips on BOTH sides.  Keys are large (&gt; Integer range) so a
+     * truncating read would be caught.  SMALL_N entries.
+     */
+    public static HashMap<Long, Long> hashLongLong = new HashMap<Long, Long>();
+
+    /**
+     * HashMap whose KEYS are enum constants (CollMap.Day) and values are Box.
+     * Unlike EnumMap (a parallel vals[] with no Node), an ORDINARY HashMap keyed
+     * by an enum stores real Node objects, so it decodes POSITIVELY: each key OOP
+     * is a Day constant whose java.lang.Enum.name field the native side reads.
+     * One entry per Day constant (3).
+     */
+    public static HashMap<Day, Box> hashEnumKey = new HashMap<Day, Box>();
+
+    /**
+     * HashMap at the DEFAULT-CAPACITY RESIZE BOUNDARY.  16 entries: with the
+     * default capacity 16 and load factor 0.75 the threshold is 12, so inserting
+     * the 13th entry already forced ONE resize to capacity 32.  Pins that the
+     * bucket walk visits every entry across a table that has been resized exactly
+     * at/after the boundary.  Keys "k"+i, values Box(i,"v"+i).
+     */
+    public static HashMap<String, Box> hashResize16 = new HashMap<String, Box>();
+
+    /**
+     * HashMap with 17 entries — one past the size-16 case, still in the capacity
+     * 32 table (next resize threshold is 24).  A companion to hashResize16 so the
+     * boundary is bracketed on both sides (16 and 17).  Keys "k"+i.
+     */
+    public static HashMap<String, Box> hashResize17 = new HashMap<String, Box>();
+
     /**
      * HashMap whose VALUES are themselves Maps (a nested HashMap&lt;String,Box&gt;
      * per entry).  The outer walk decodes each value OOP; the native side then
@@ -298,6 +350,8 @@ public final class CollMap
     public static final int COLL6_N = 6;        // colliding but < 8 => plain Node chain
     public static final int INTKEY_N = 4;       // boxed Integer keys 0,16,32,48 (one bucket)
     public static final int NESTED_N = 2;       // outer entries / inner list size
+    public static final int RESIZE16_N = 16;    // == default load threshold-after-one-resize boundary
+    public static final int RESIZE17_N = 17;    // one past the size-16 boundary
 
     // ---- Published checksums so native can verify content without ordering --
     //
@@ -337,6 +391,24 @@ public final class CollMap
     public static volatile long hashIntKeyValSum;
     public static volatile long hashIntKeyKeyXor;
 
+    // Type-coverage maps: order-independent content fingerprints.
+    /** hashStrStr: sum of UTF-16 code units across keys, and across values. */
+    public static volatile long hashStrStrKeyCharSum;
+    public static volatile long hashStrStrValCharSum;
+    /** hashIntStr: sum of boxed-Integer keys, and code-unit sum of String values. */
+    public static volatile long hashIntStrKeySum;
+    public static volatile long hashIntStrValCharSum;
+    /** hashLongLong: sum/xor of the boxed Long KEYS and the boxed Long VALUES. */
+    public static volatile long hashLongLongKeySum;
+    public static volatile long hashLongLongValSum;
+    public static volatile long hashLongLongKeyXor;
+    /** hashEnumKey: sum of value.id, and code-unit sum of the enum-constant names. */
+    public static volatile long hashEnumKeyIdSum;
+    public static volatile long hashEnumKeyNameCharSum;
+    /** hashResize16 / hashResize17: sum of value.id (closed-form cross-check). */
+    public static volatile long hashResize16IdSum;
+    public static volatile long hashResize17IdSum;
+
     /** Java's own view of each map's size(), for a native cross-check. */
     public static volatile int hashEmptySize;
     public static volatile int hashOneSize;
@@ -361,6 +433,12 @@ public final class CollMap
     public static volatile int hashtableSmallSize;
     public static volatile int hashColl6Size;
     public static volatile int hashIntKeySize;
+    public static volatile int hashStrStrSize;
+    public static volatile int hashIntStrSize;
+    public static volatile int hashLongLongSize;
+    public static volatile int hashEnumKeySize;
+    public static volatile int hashResize16Size;
+    public static volatile int hashResize17Size;
     public static volatile int hashNestedMapSize;
     public static volatile int hashNestedListSize;
     public static volatile int chmSmallSize;
@@ -613,6 +691,89 @@ public final class CollMap
         hashIntKeyKeyXor = ikKeyXor;
         hashIntKeyOneBucket = allInOneBucket(hashIntKey);  // expect true
 
+        // ---- Key/value TYPE-COVERAGE maps ----------------------------------
+
+        // String -> String: value is a java.lang.String, decoded via the same
+        // read_java_string path as the key.
+        hashStrStr = new HashMap<String, String>();
+        long ssKey = 0, ssVal = 0;
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            final String k = "sk" + i;
+            final String v = "sv" + i;
+            hashStrStr.put(k, v);
+            ssKey += codeUnitSum(k);
+            ssVal += codeUnitSum(v);
+        }
+        hashStrStrKeyCharSum = ssKey;
+        hashStrStrValCharSum = ssVal;
+
+        // Integer -> String: boxed Integer key, String value.
+        hashIntStr = new HashMap<Integer, String>();
+        long isKey = 0, isVal = 0;
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            final String v = "iv" + i;
+            hashIntStr.put(Integer.valueOf(i), v);
+            isKey += i;
+            isVal += codeUnitSum(v);
+        }
+        hashIntStrKeySum = isKey;
+        hashIntStrValCharSum = isVal;
+
+        // Long -> Long: 64-bit boxed key AND value.  Keys deliberately exceed
+        // the 32-bit range so a truncating read on the native side would be
+        // caught by the sum cross-check.
+        hashLongLong = new HashMap<Long, Long>();
+        long llKey = 0, llVal = 0, llKeyXor = 0;
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            final long k = 0x1_0000_0000L + i;   // > Integer.MAX_VALUE
+            final long v = 0x2_0000_0000L + i;
+            hashLongLong.put(Long.valueOf(k), Long.valueOf(v));
+            llKey += k;
+            llVal += v;
+            llKeyXor ^= k;
+        }
+        hashLongLongKeySum = llKey;
+        hashLongLongValSum = llVal;
+        hashLongLongKeyXor = llKeyXor;
+
+        // Enum-keyed ORDINARY HashMap (NOT EnumMap): stores real Node objects,
+        // so it decodes positively.  Each key OOP is a Day constant; native reads
+        // its java.lang.Enum.name.
+        hashEnumKey = new HashMap<Day, Box>();
+        long ekId = 0, ekName = 0;
+        final Day[] days = Day.values();
+        for (int i = 0; i < days.length; ++i)
+        {
+            hashEnumKey.put(days[i], new Box(i, "v" + i));
+            ekId += i;
+            ekName += codeUnitSum(days[i].name());
+        }
+        hashEnumKeyIdSum = ekId;
+        hashEnumKeyNameCharSum = ekName;
+
+        // Resize-boundary HashMaps: 16 (one resize past the default threshold of
+        // 12) and 17 (one more).  Keys "k"+i, values Box(i,"v"+i).
+        hashResize16 = new HashMap<String, Box>();
+        long r16Id = 0;
+        for (int i = 0; i < RESIZE16_N; ++i)
+        {
+            hashResize16.put("k" + i, new Box(i, "v" + i));
+            r16Id += i;
+        }
+        hashResize16IdSum = r16Id;
+
+        hashResize17 = new HashMap<String, Box>();
+        long r17Id = 0;
+        for (int i = 0; i < RESIZE17_N; ++i)
+        {
+            hashResize17.put("k" + i, new Box(i, "v" + i));
+            r17Id += i;
+        }
+        hashResize17IdSum = r17Id;
+
         // HashMap whose values are nested Maps, and another whose values are
         // nested Lists.  Each outer key "n"+i maps to an inner container that
         // itself holds NESTED_N Box entries/elements with ids derived from i.
@@ -716,6 +877,12 @@ public final class CollMap
         hashtableSmallSize = hashtableSmall.size();
         hashColl6Size = hashColl6.size();
         hashIntKeySize = hashIntKey.size();
+        hashStrStrSize = hashStrStr.size();
+        hashIntStrSize = hashIntStr.size();
+        hashLongLongSize = hashLongLong.size();
+        hashEnumKeySize = hashEnumKey.size();
+        hashResize16Size = hashResize16.size();
+        hashResize17Size = hashResize17.size();
         hashNestedMapSize = hashNestedMap.size();
         hashNestedListSize = hashNestedList.size();
         chmSmallSize = chmSmall.size();

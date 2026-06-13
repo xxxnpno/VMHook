@@ -97,6 +97,187 @@ static auto ctor_signature_of() -> std::string
     return signature;
 }
 
+// =====================================================================
+// WHOLE-DESCRIPTOR REFERENCE WALK (JVMS § 4.3.2 / § 4.3.3).
+//
+// vmhook does NOT ship a whole-signature parser: its descriptor surface is
+// exactly the three table helpers above plus the inline rfind(')')+1 return
+// extraction reproduced by return_basic_type_of / call_site_result_type.
+// There is no library function that counts arguments, counts JVM local-variable
+// slots (with the long/double = 2 rule), or peels an array's dimension from its
+// component — so those behaviours cannot be asserted against library code that
+// does not exist.  To still make this module "every JVM method/type descriptor
+// parse" exhaustive, the helpers below are a SELF-CONTAINED reference walk built
+// ONLY on the one library primitive that classifies a leading descriptor byte
+// (vmhook::detail::sig_char_to_basic_type).  They encode the canonical JVMS
+// grammar so the suite pins the full-parse semantics the task enumerates and so
+// any future library parser can be diffed against this reference.
+//
+// Slot-count note: the JVMS gives `long` (J) and `double` (D) TWO local-variable
+// slots and every other type ONE; that is a property of the DESCRIPTOR grammar.
+// It is deliberately distinct from how method_proxy::call happens to marshal
+// arguments (vmhook.hpp:15877 packs ONE intptr_t params[] entry per C++ value,
+// regardless of width) — these helpers report the JVMS slot count, not the
+// library's marshalling-slot usage.  Every index read here is bounds-checked
+// (`pos < size()`), so a malformed descriptor returns a clean failure and never
+// reads past the end.
+
+// Classification of a single (non-method) field descriptor.
+struct field_descriptor_parse
+{
+    bool        ok{ false };       // well-formed and fully consumed
+    int         basic_type{ -1 };  // sig_char_to_basic_type of the FIRST byte
+    int         array_dims{ 0 };   // count of leading '[' (0 for non-array)
+    int         component_basic{ -1 }; // basic type of the innermost component
+    std::size_t consumed{ 0 };     // bytes consumed (== whole length when ok)
+};
+
+// Walk ONE field descriptor starting at sig[pos].  Recognises:
+//   primitive  : Z B C S I J F D                      (one byte)
+//   object     : L <name with no ';'> ;               (consume through ';')
+//   array      : [+ <one element descriptor>          (any dimension)
+// On any malformation (truncated 'L', stray '[' at end, unknown leading byte,
+// empty) returns ok=false with consumed = bytes scanned before giving up.  Never
+// indexes past size().
+static auto parse_one_field_descriptor(std::string_view sig, std::size_t pos)
+    -> field_descriptor_parse
+{
+    field_descriptor_parse out{};
+    const std::size_t start{ pos };
+    int dims{ 0 };
+    while (pos < sig.size() && sig[pos] == '[')
+    {
+        ++dims;
+        ++pos;
+    }
+    if (pos >= sig.size())
+    {
+        // '[' with nothing following it -> malformed; report bytes scanned.
+        out.array_dims = dims;
+        out.consumed   = pos - start;
+        return out;
+    }
+    const char lead{ sig[pos] };
+    const int  lead_basic{ vmhook::detail::sig_char_to_basic_type(lead) };
+    if (lead == 'L')
+    {
+        // Object: scan to the terminating ';'.  Unterminated 'L' is malformed.
+        std::size_t scan{ pos + 1 };
+        while (scan < sig.size() && sig[scan] != ';')
+        {
+            ++scan;
+        }
+        if (scan >= sig.size())
+        {
+            // No ';' before end -> unterminated object descriptor.
+            out.array_dims = dims;
+            out.consumed   = sig.size() - start;
+            return out;
+        }
+        out.ok              = true;
+        out.basic_type      = dims > 0 ? 13 /* T_ARRAY */ : 12 /* T_OBJECT */;
+        out.array_dims      = dims;
+        out.component_basic = 12; // object component
+        out.consumed        = (scan + 1) - start; // include the ';'
+        return out;
+    }
+    // Primitive component?  Exactly the eight letters whose width != 0, i.e. the
+    // basic types in [4..11] EXCEPT 'L'(12)/'['(13)/'V'(14).  We reuse the width
+    // helper as the authoritative "is this a primitive letter" oracle so the
+    // reference walk stays coupled to the library tables.
+    {
+        const char one[1]{ lead };
+        const bool is_primitive{
+            vmhook::detail::jvm_primitive_byte_width(std::string_view{ one, 1 }) != 0 };
+        if (is_primitive)
+        {
+            out.ok              = true;
+            out.basic_type      = dims > 0 ? 13 /* T_ARRAY */ : lead_basic;
+            out.array_dims      = dims;
+            out.component_basic = lead_basic;
+            out.consumed        = (pos + 1) - start;
+            return out;
+        }
+    }
+    // Anything else (V, unknown byte, ']' etc.) is not a valid field descriptor
+    // leading byte.  Report failure with the bytes scanned so far.
+    out.array_dims = dims;
+    out.consumed   = (pos + 1) - start;
+    return out;
+}
+
+// Classification of a whole method descriptor "( params ) ret".
+struct method_descriptor_parse
+{
+    bool ok{ false };       // well-formed: balanced '(' ')' + valid params + ret
+    int  arg_count{ 0 };    // number of parameter descriptors
+    int  arg_slots{ 0 };    // JVM local slots: long/double = 2, else 1
+    int  return_basic{ -1 }; // basic type of the return descriptor
+    int  return_dims{ 0 };  // array dimension of the return (0 if not array)
+};
+
+// Walk a complete method descriptor.  Grammar: '(' field* ')' (field | 'V').
+// Counts parameters and JVM slots (J/D contribute 2), and classifies the return.
+// Any structural fault — missing '(', missing ')', a malformed parameter, a
+// missing/garbled return — yields ok=false.  Fully bounds-checked.
+static auto parse_method_descriptor(std::string_view sig) -> method_descriptor_parse
+{
+    method_descriptor_parse out{};
+    if (sig.empty() || sig[0] != '(')
+    {
+        return out;
+    }
+    std::size_t pos{ 1 };
+    int         args{ 0 };
+    int         slots{ 0 };
+    while (pos < sig.size() && sig[pos] != ')')
+    {
+        const field_descriptor_parse f{ parse_one_field_descriptor(sig, pos) };
+        if (!f.ok || f.consumed == 0)
+        {
+            return out; // malformed parameter -> whole descriptor invalid
+        }
+        ++args;
+        // long (J=11) and double (D=7) occupy two slots; everything else one.
+        slots += (f.basic_type == 11 || f.basic_type == 7) ? 2 : 1;
+        pos += f.consumed;
+    }
+    if (pos >= sig.size() || sig[pos] != ')')
+    {
+        return out; // no closing ')'
+    }
+    ++pos; // consume ')'
+    if (pos >= sig.size())
+    {
+        return out; // nothing after ')': missing return descriptor
+    }
+    if (sig[pos] == 'V')
+    {
+        // void return must be the final byte.
+        if (pos + 1 != sig.size())
+        {
+            return out;
+        }
+        out.ok           = true;
+        out.arg_count    = args;
+        out.arg_slots    = slots;
+        out.return_basic = 14; // T_VOID
+        out.return_dims  = 0;
+        return out;
+    }
+    const field_descriptor_parse r{ parse_one_field_descriptor(sig, pos) };
+    if (!r.ok || pos + r.consumed != sig.size())
+    {
+        return out; // trailing garbage after the return, or malformed return
+    }
+    out.ok           = true;
+    out.arg_count    = args;
+    out.arg_slots    = slots;
+    out.return_basic = r.basic_type;
+    out.return_dims  = r.array_dims;
+    return out;
+}
+
 // A minimal registered/registerable wrapper, following the exact pattern used by
 // tests/test_object_factory.cpp and tests/test_api_surface*.cpp: derive from
 // vmhook::object<T> with the required `explicit T(vmhook::oop_t)` constructor.
@@ -1270,6 +1451,360 @@ int main()
           call_site_result_type(std::string_view{ "()\x80", 3 }) == 14);
     check("callsite_high_byte_0xFF_after_paren_is_void_14",
           call_site_result_type(std::string_view{ "()\xFF", 3 }) == 14);
+
+    // =====================================================================
+    // EXHAUSTIVE PASS 6 — whole method/type descriptor WALK (JVMS § 4.3).
+    //
+    // PASSES 1-5 pin the library's per-byte helpers and the return-char
+    // extraction.  This pass covers the *whole-descriptor* parse axis the task
+    // enumerates — argument enumeration, arg COUNT vs JVM SLOT count (long/double
+    // = 2), array dimension + component, full return classification, and graceful
+    // handling of every malformation — via the self-contained reference walk
+    // (parse_one_field_descriptor / parse_method_descriptor) defined above, which
+    // is built only on vmhook::detail::sig_char_to_basic_type +
+    // jvm_primitive_byte_width.  No library whole-signature parser exists, so this
+    // canonical walk also serves as the diff target for any future one.
+    // =====================================================================
+
+    // ---- single field descriptor: every primitive char ----------------------
+    // Each primitive descriptor is a one-byte field that parses to its basic type
+    // with zero array dimension and consumes exactly one byte.
+    {
+        struct prim_field { const char* d; int basic; };
+        const prim_field prims[]{
+            { "Z", 4 }, { "C", 5 }, { "F", 6 }, { "D", 7 },
+            { "B", 8 }, { "S", 9 }, { "I", 10 }, { "J", 11 },
+        };
+        bool all_ok{ true };
+        for (const prim_field& p : prims)
+        {
+            const field_descriptor_parse f{ parse_one_field_descriptor(p.d, 0) };
+            if (!f.ok || f.basic_type != p.basic || f.array_dims != 0
+                || f.component_basic != p.basic || f.consumed != 1)
+            {
+                all_ok = false;
+            }
+        }
+        check("fielddesc_every_primitive_parses_one_byte_to_basic_type", all_ok);
+    }
+    // 'V' is NOT a valid field descriptor (only a method RETURN), so it fails to
+    // parse as a field even though sig_char_to_basic_type('V')==14.
+    check("fielddesc_void_is_not_a_valid_field",
+          !parse_one_field_descriptor("V", 0).ok);
+
+    // ---- single field descriptor: object Lpkg/Class; ------------------------
+    // Deep package, with digits / underscores, parses as T_OBJECT(12), dims 0,
+    // consuming the whole descriptor INCLUDING the terminating ';'.
+    {
+        const field_descriptor_parse f{
+            parse_one_field_descriptor("Lcom/example/My_Class9;", 0) };
+        check("fielddesc_object_deeppkg_digits_underscore_is_object_12",
+              f.ok && f.basic_type == 12 && f.array_dims == 0
+              && f.consumed == std::string_view{ "Lcom/example/My_Class9;" }.size());
+    }
+    // Nested ('$') inner-class name round-trips and terminates at the first ';'.
+    {
+        const field_descriptor_parse f{
+            parse_one_field_descriptor("La/b/Outer$Inner$Deep;", 0) };
+        check("fielddesc_object_nested_inner_class_is_object_12",
+              f.ok && f.basic_type == 12
+              && f.consumed == std::string_view{ "La/b/Outer$Inner$Deep;" }.size());
+    }
+    // Single-segment ("default package") object name.
+    check("fielddesc_object_single_segment_ok",
+          parse_one_field_descriptor("LX;", 0).ok);
+    // java/lang/String, the canonical reference type.
+    {
+        const field_descriptor_parse f{
+            parse_one_field_descriptor("Ljava/lang/String;", 0) };
+        check("fielddesc_object_string_is_object_12_full_consume",
+              f.ok && f.basic_type == 12
+              && f.consumed == std::string_view{ "Ljava/lang/String;" }.size());
+    }
+
+    // ---- single field descriptor: arrays [I [[I [Ljava/lang/String; [[[D -----
+    // The whole array descriptor classifies as T_ARRAY(13); array_dims counts the
+    // leading '[', component_basic is the element's basic type, and consumed spans
+    // the full descriptor (brackets + element, incl. any object ';').
+    {
+        struct arr_field { const char* d; int dims; int component; std::size_t len; };
+        const arr_field arrays[]{
+            { "[I",                    1, 10, 2  },                 // int[]
+            { "[[I",                   2, 10, 3  },                 // int[][]
+            { "[[[D",                  3, 7,  4  },                 // double[][][]
+            { "[J",                    1, 11, 2  },                 // long[]
+            { "[Z",                    1, 4,  2  },                 // boolean[]
+            { "[Ljava/lang/String;",   1, 12, 19 },                 // String[]
+            { "[[Ljava/lang/Object;",  2, 12, 20 },                 // Object[][]
+        };
+        bool all_ok{ true };
+        for (const arr_field& a : arrays)
+        {
+            const field_descriptor_parse f{ parse_one_field_descriptor(a.d, 0) };
+            if (!f.ok || f.basic_type != 13 || f.array_dims != a.dims
+                || f.component_basic != a.component || f.consumed != a.len)
+            {
+                all_ok = false;
+            }
+        }
+        check("fielddesc_arrays_dimension_and_component_parsed", all_ok);
+    }
+
+    // ---- method descriptor: ()V — zero args, void return --------------------
+    {
+        const method_descriptor_parse m{ parse_method_descriptor("()V") };
+        check("methoddesc_void_noargs_is_0args_0slots_voidret",
+              m.ok && m.arg_count == 0 && m.arg_slots == 0
+              && m.return_basic == 14 && m.return_dims == 0);
+    }
+    // ---- method descriptor: (I)I — one int arg, int return ------------------
+    {
+        const method_descriptor_parse m{ parse_method_descriptor("(I)I") };
+        check("methoddesc_int_to_int_is_1arg_1slot_intret",
+              m.ok && m.arg_count == 1 && m.arg_slots == 1
+              && m.return_basic == 10 && m.return_dims == 0);
+    }
+    // ---- method descriptor: (JD)V — two WIDE args -> 2 args, 4 slots --------
+    // The crux of the slot rule: long + double = two parameters but FOUR JVM
+    // local slots (2 each), with a void return.
+    {
+        const method_descriptor_parse m{ parse_method_descriptor("(JD)V") };
+        check("methoddesc_long_double_void_is_2args_4slots",
+              m.ok && m.arg_count == 2 && m.arg_slots == 4
+              && m.return_basic == 14);
+    }
+    // ---- method descriptor: (Ljava/lang/String;[IJ)Z — mixed ----------------
+    // String (1 slot) + int[] (1 slot, arrays are single-slot references) + long
+    // (2 slots) = 3 args, 4 slots; boolean return.
+    {
+        const method_descriptor_parse m{
+            parse_method_descriptor("(Ljava/lang/String;[IJ)Z") };
+        check("methoddesc_mixed_string_intarray_long_is_3args_4slots_boolret",
+              m.ok && m.arg_count == 3 && m.arg_slots == 4
+              && m.return_basic == 4 && m.return_dims == 0);
+    }
+    // ---- method descriptor: ([[Ljava/lang/Object;)[I — array arg + array ret -
+    // One parameter (Object[][], a single reference slot) and an int[] return
+    // classified T_ARRAY(13) with return_dims==1.
+    {
+        const method_descriptor_parse m{
+            parse_method_descriptor("([[Ljava/lang/Object;)[I") };
+        check("methoddesc_objarray_arg_intarray_ret_is_1arg_1slot_arrayret",
+              m.ok && m.arg_count == 1 && m.arg_slots == 1
+              && m.return_basic == 13 && m.return_dims == 1);
+    }
+    // ---- method descriptor: return-type shape sweep -------------------------
+    // Every return shape (void / each primitive / object / 1-D & multi-D array /
+    // object array) classified through the FULL parse (not just the post-')'
+    // byte), with the parameter list varied to prove the walk consumes params
+    // correctly before reaching the return.
+    {
+        struct ret_shape { const char* d; int basic; int dims; };
+        const ret_shape rets[]{
+            { "()V",                       14, 0 },  // void
+            { "(I)Z",                      4,  0 },  // boolean
+            { "(J)C",                      5,  0 },  // char
+            { "(D)F",                      6,  0 },  // float
+            { "(B)D",                      7,  0 },  // double
+            { "(S)B",                      8,  0 },  // byte
+            { "(C)S",                      9,  0 },  // short
+            { "(F)I",                      10, 0 },  // int
+            { "(Z)J",                      11, 0 },  // long
+            { "(I)Ljava/lang/String;",     12, 0 },  // object
+            { "(I)[I",                     13, 1 },  // int[]
+            { "(I)[[I",                    13, 2 },  // int[][]
+            { "(I)[[[D",                   13, 3 },  // double[][][]
+            { "(I)[Ljava/lang/String;",    13, 1 },  // String[]
+        };
+        bool all_ok{ true };
+        for (const ret_shape& r : rets)
+        {
+            const method_descriptor_parse m{ parse_method_descriptor(r.d) };
+            if (!m.ok || m.return_basic != r.basic || m.return_dims != r.dims)
+            {
+                all_ok = false;
+            }
+        }
+        check("methoddesc_return_shape_sweep_all_classified", all_ok);
+    }
+
+    // ---- arg COUNT vs arg SLOT count: the wide-type partition, exhaustively --
+    // For each single-parameter method, arg_count is always 1 but arg_slots is 2
+    // exactly when the parameter is long (J) or double (D), and 1 otherwise
+    // (including arrays-of-long / arrays-of-double, which are single-slot refs).
+    {
+        struct one_param { const char* d; int slots; };
+        const one_param cases[]{
+            { "(Z)V", 1 }, { "(B)V", 1 }, { "(C)V", 1 }, { "(S)V", 1 },
+            { "(I)V", 1 }, { "(F)V", 1 }, { "(J)V", 2 }, { "(D)V", 2 },
+            { "(Ljava/lang/String;)V", 1 },  // reference = 1 slot
+            { "([J)V", 1 },                  // long[] is a reference = 1 slot
+            { "([D)V", 1 },                  // double[] is a reference = 1 slot
+            { "([[I)V", 1 },                 // int[][] reference = 1 slot
+        };
+        bool all_ok{ true };
+        for (const one_param& c : cases)
+        {
+            const method_descriptor_parse m{ parse_method_descriptor(c.d) };
+            if (!m.ok || m.arg_count != 1 || m.arg_slots != c.slots) { all_ok = false; }
+        }
+        check("methoddesc_single_param_slot_is_2_iff_long_or_double", all_ok);
+    }
+    // A handful of multi-arg packs with mixed widths, asserting BOTH the argument
+    // count and the slot count independently so an off-by-one in either is caught.
+    {
+        struct pack_case { const char* d; int args; int slots; };
+        const pack_case packs[]{
+            { "(II)V",                              2, 2 },   // int,int
+            { "(JJ)V",                              2, 4 },   // long,long
+            { "(IJ)V",                              2, 3 },   // int,long
+            { "(JIDI)V",                            4, 6 },   // long,int,double,int
+            { "(DDDD)V",                            4, 8 },   // 4 doubles
+            { "(Ljava/lang/String;Ljava/lang/Object;)V", 2, 2 }, // 2 refs
+            { "([I[J[D)V",                          3, 3 },   // 3 arrays = 3 slots
+            { "(IJLjava/lang/Object;DF)V",          5, 7 },   // mixed
+        };
+        bool all_ok{ true };
+        for (const pack_case& p : packs)
+        {
+            const method_descriptor_parse m{ parse_method_descriptor(p.d) };
+            if (!m.ok || m.arg_count != p.args || m.arg_slots != p.slots)
+            {
+                all_ok = false;
+            }
+        }
+        check("methoddesc_mixed_packs_arg_and_slot_counts_correct", all_ok);
+    }
+
+    // ---- boundary: very long argument list ----------------------------------
+    // 64 int parameters -> 64 args, 64 slots; and 64 long parameters -> 64 args,
+    // 128 slots.  Proves the walk has no fixed-arity ceiling and the slot math
+    // accumulates correctly across a long list (unlike method_proxy's params[8]).
+    {
+        std::string many_ints{ "(" };
+        std::string many_longs{ "(" };
+        for (int i{ 0 }; i < 64; ++i)
+        {
+            many_ints  += "I";
+            many_longs += "J";
+        }
+        many_ints  += ")V";
+        many_longs += ")V";
+        const method_descriptor_parse mi{ parse_method_descriptor(many_ints) };
+        const method_descriptor_parse ml{ parse_method_descriptor(many_longs) };
+        check("methoddesc_64_int_params_is_64args_64slots",
+              mi.ok && mi.arg_count == 64 && mi.arg_slots == 64);
+        check("methoddesc_64_long_params_is_64args_128slots",
+              ml.ok && ml.arg_count == 64 && ml.arg_slots == 128);
+    }
+    // ---- boundary: a single deeply-nested array parameter -------------------
+    // 32 '[' before the element 'I': one argument (a reference, 1 slot) whose
+    // component is int and whose dimension is 32.
+    {
+        std::string deep{ "(" };
+        deep.append(32, '[');
+        deep += "I)V";
+        const method_descriptor_parse m{ parse_method_descriptor(deep) };
+        check("methoddesc_32d_array_param_is_1arg_1slot", m.ok && m.arg_count == 1 && m.arg_slots == 1);
+        // And the field-level walk of just that 32-D array reports dims==32.
+        std::string deep_field;
+        deep_field.append(32, '[');
+        deep_field += "I";
+        const field_descriptor_parse f{ parse_one_field_descriptor(deep_field, 0) };
+        check("fielddesc_32d_array_component_int_dims_32",
+              f.ok && f.basic_type == 13 && f.array_dims == 32 && f.component_basic == 10);
+    }
+
+    // ---- MALFORMED descriptors: graceful rejection, NO overrun --------------
+    // Each of these is structurally invalid; the walk must return ok=false and —
+    // critically — must not read past the end.  (Bounds safety is enforced by the
+    // `pos < size()` guards in the helpers; reaching here at all without a crash
+    // under -fsanitize / normal execution is itself the overrun check.)
+    {
+        const char* bad_methods[]{
+            "",                       // empty
+            "I",                      // no parens at all
+            "(",                      // just open paren, never closed
+            "()",                     // closed but no return descriptor
+            "(I",                     // unterminated param list (no ')')
+            "(II",                    // unterminated, two params
+            ")V",                     // missing open paren
+            "(I)",                    // params + ')' but no return
+            "(I)V extra",             // trailing garbage after a void return
+            "(I)IJ",                  // trailing byte after a primitive return
+            "(L)V",                   // 'L' with no class name and no ';'
+            "(Ljava/lang/String)V",   // object param missing terminating ';'
+            "(Q)V",                   // unknown primitive-ish letter as a param
+            "([)V",                   // '[' with no element before ')'
+            "(V)V",                   // 'V' is not a valid PARAMETER descriptor
+            "(I)Q",                   // unknown return letter (not in grammar)
+            "(I)[",                   // return '[' with no element
+            "(I)L",                   // return 'L' with no class / ';'
+            "garbage",                // pure junk, no structure
+            "(((",                    // only open parens
+            "()VV",                   // void must be the final byte
+        };
+        bool all_rejected{ true };
+        for (const char* d : bad_methods)
+        {
+            if (parse_method_descriptor(d).ok) { all_rejected = false; }
+        }
+        check("methoddesc_all_malformed_descriptors_rejected_no_overrun", all_rejected);
+    }
+    // Malformed FIELD descriptors likewise reject without overrun.
+    {
+        const char* bad_fields[]{
+            "",                       // empty
+            "L",                      // 'L' alone, unterminated
+            "Ljava/lang/String",      // object missing ';'
+            "[",                      // '[' alone, no element
+            "[[",                     // brackets with no element
+            "[L",                     // array of unterminated object
+            "[Lfoo",                  // array of object missing ';'
+            "V",                      // void is not a field descriptor
+            "Q",                      // unknown leading byte
+            ";",                      // stray terminator
+            ")",                      // stray close paren
+        };
+        bool all_rejected{ true };
+        for (const char* d : bad_fields)
+        {
+            if (parse_one_field_descriptor(d, 0).ok) { all_rejected = false; }
+        }
+        check("fielddesc_all_malformed_field_descriptors_rejected_no_overrun", all_rejected);
+    }
+    // Targeted unterminated-'L' boundary: "L" of length 1 must NOT read sig[1].
+    // The helper's `scan < sig.size()` guard makes this safe; assert it rejects.
+    check("fielddesc_lone_L_unterminated_rejected",
+          !parse_one_field_descriptor("L", 0).ok);
+    // A '[' as the entire 1-char field descriptor: dims becomes 1 then pos hits
+    // end -> rejected, no read of sig[1].
+    check("fielddesc_lone_bracket_rejected",
+          !parse_one_field_descriptor("[", 0).ok);
+    // Method "(" of length 1: pos=1 == size() immediately -> loop body never
+    // runs, the `pos >= size()` no-')' branch rejects, sig[1] never read.
+    check("methoddesc_lone_open_paren_rejected_no_read",
+          !parse_method_descriptor("(").ok);
+
+    // ---- well-formed round-trip: re-pin the exact briefing examples ---------
+    // The descriptors named in the task, asserted ok with their full (count,
+    // slots, return) tuple in one greppable block.
+    check("methoddesc_briefing_II_V",
+          [] { const auto m = parse_method_descriptor("(II)V");
+               return m.ok && m.arg_count == 2 && m.arg_slots == 2 && m.return_basic == 14; }());
+    check("methoddesc_briefing_String_to_I",
+          [] { const auto m = parse_method_descriptor("(Ljava/lang/String;)I");
+               return m.ok && m.arg_count == 1 && m.arg_slots == 1 && m.return_basic == 10; }());
+    check("methoddesc_briefing_JD_V_wide",
+          [] { const auto m = parse_method_descriptor("(JD)V");
+               return m.ok && m.arg_count == 2 && m.arg_slots == 4 && m.return_basic == 14; }());
+    check("methoddesc_briefing_mixed_String_intarray_long_Z",
+          [] { const auto m = parse_method_descriptor("(Ljava/lang/String;[IJ)Z");
+               return m.ok && m.arg_count == 3 && m.arg_slots == 4 && m.return_basic == 4; }());
+    check("methoddesc_briefing_objarray_to_intarray",
+          [] { const auto m = parse_method_descriptor("([[Ljava/lang/Object;)[I");
+               return m.ok && m.arg_count == 1 && m.arg_slots == 1
+                      && m.return_basic == 13 && m.return_dims == 1; }());
 
     return failures == 0 ? 0 : 1;
 }

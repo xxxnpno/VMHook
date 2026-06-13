@@ -26,6 +26,16 @@
 //   HashMap<Integer,Integer> hashIntKey — BOXED-primitive keys 0,16,32,48 colliding
 //                            into one bucket; decodes each java.lang.Integer key AND
 //                            value via Integer.value (non-String key/value path).
+//   KEY/VALUE TYPE COVERAGE  hashStrStr (String->String, value via read_java_string),
+//                            hashIntStr (Integer->String), hashLongLong (boxed
+//                            Long->Long, 64-bit values > 2^32 so a truncating read is
+//                            caught), hashEnumKey (enum keys in an ORDINARY HashMap —
+//                            decodes positively via java.lang.Enum.name, unlike the
+//                            characterized-empty EnumMap).  Every one decodes FULLY.
+//   HashMap resize boundary  hashResize16 / hashResize17 — 16 and 17 entries bracket
+//                            the default-capacity resize (threshold 12 => one resize to
+//                            cap 32); asserts EVERY key present exactly once (no miss /
+//                            no duplicate) across the rehash, plus closed-form id sums.
 //   HashMap nested values    hashNestedMap / hashNestedList — values are themselves
 //                            a Map / a List; the outer walk decodes each value OOP,
 //                            then the module re-wraps it as vmhook::map / ::collection
@@ -145,6 +155,57 @@ namespace
         auto value() const -> std::int32_t { return static_cast<std::int32_t>(get_field("value")->get()); }
     };
 
+    // ── BOXED-LONG wrapper: java.lang.Long. ─────────────────────────────────
+    // For HashMap<Long,Long> the key AND value OOPs are java.lang.Long boxes; we
+    // decode the 64-bit primitive via the "value" field (a long, not an int — a
+    // truncating read would corrupt the cross-check sums the fixture publishes).
+    class long_box : public vmhook::object<long_box>
+    {
+    public:
+        explicit long_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<long_box>{ instance }
+        {
+        }
+
+        auto value() const -> std::int64_t { return static_cast<std::int64_t>(get_field("value")->get()); }
+    };
+
+    // ── STRING VALUE wrapper: java.lang.String. ─────────────────────────────
+    // For HashMap<String,String> the VALUE OOP is itself a java.lang.String,
+    // decoded through the same read_java_string path as the key.  (A separate
+    // named type from string_key purely so to_entries<string_key,string_value>
+    // reads as key/value at the call site; both decode identically.)
+    class string_value : public vmhook::object<string_value>
+    {
+    public:
+        explicit string_value(vmhook::oop_t instance) noexcept
+            : vmhook::object<string_value>{ instance }
+        {
+        }
+
+        auto text() const -> std::string
+        {
+            return vmhook::read_java_string(get_instance());
+        }
+    };
+
+    // ── ENUM-KEY wrapper: vmhook.fixtures.CollMap$Day (a java.lang.Enum). ────
+    // For an ORDINARY HashMap keyed by an enum the key OOP is the enum constant;
+    // its identity is the inherited java.lang.Enum "name" field, which we read to
+    // fingerprint the key.  (EnumMap is characterized-empty elsewhere; this is a
+    // plain HashMap, so it stores real Node objects and decodes positively.)
+    class enum_key : public vmhook::object<enum_key>
+    {
+    public:
+        explicit enum_key(vmhook::oop_t instance) noexcept
+            : vmhook::object<enum_key>{ instance }
+        {
+        }
+
+        // java.lang.Enum.name — present on every enum constant since Java 5.
+        auto name() const -> std::string { return get_field("name")->get(); }
+    };
+
     // ── NESTED-CONTAINER value wrapper. ─────────────────────────────────────
     // The value OOP is itself a Map or a List; this wrapper only needs to hand
     // its raw OOP back so the module can re-wrap it as a vmhook::map /
@@ -220,6 +281,8 @@ namespace
     constexpr std::int32_t COLL6_N{ 6 };
     constexpr std::int32_t INTKEY_N{ 4 };
     constexpr std::int32_t NESTED_N{ 2 };
+    constexpr std::int32_t RESIZE16_N{ 16 };
+    constexpr std::int32_t RESIZE17_N{ 17 };
 
     // ── Hook observation (pilot-style proof). ───────────────────────────────
     std::atomic<int>          g_hook_calls{ 0 };
@@ -335,7 +398,10 @@ namespace
         vmhook::register_class<coll_map_fixture>(FIXTURE);
         vmhook::register_class<box_value>("vmhook/fixtures/CollMap$Box");
         vmhook::register_class<string_key>("java/lang/String");
+        vmhook::register_class<string_value>("java/lang/String");
         vmhook::register_class<integer_box>("java/lang/Integer");
+        vmhook::register_class<long_box>("java/lang/Long");
+        vmhook::register_class<enum_key>("vmhook/fixtures/CollMap$Day");
         // nested_value carries an arbitrary container OOP; it has no fixed klass
         // of its own, so it is intentionally NOT registered.
 
@@ -732,6 +798,204 @@ namespace
             const bool one_bucket{ coll_map_fixture::j_bool("hashIntKeyOneBucket") };
             ctx.record(std::string{ "[INFO] cmap_intkey: all keys in ONE bucket (Java, best-effort) = " }
                        + (one_bucket ? "yes" : "no/unknown"));
+        }
+
+        // =====================================================================
+        // HashMap<String,String> — BOTH key AND value are java.lang.String.  The
+        // value side is decoded through read_java_string exactly like the key
+        // (the walker is generic over the value wrapper), proving a non-Box,
+        // String VALUE round-trips.  Keys "sk"+i, values "sv"+i.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<string_key, string_value>("hashStrStr") };
+            ctx.check("cmap_strstr_count_is_3", static_cast<std::int32_t>(e.size()) == SMALL_N);
+            check_size_oracle("cmap_strstr", static_cast<std::int32_t>(e.size()), "hashStrStrSize");
+
+            std::int64_t key_char_sum{ 0 }, val_char_sum{ 0 };
+            std::int32_t null_kv{ 0 };
+            bool pairs_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
+                const std::string k{ kv.first->text() };
+                const std::string v{ kv.second->text() };
+                key_char_sum += code_unit_sum(k);
+                val_char_sum += code_unit_sum(v);
+                // Recipe: key "sk"+i pairs with value "sv"+i (same trailing digit).
+                if (k.size() < 3 || v.size() < 3 || k.substr(2) != v.substr(2)) { pairs_ok = false; }
+                if (k.rfind("sk", 0) != 0 || v.rfind("sv", 0) != 0) { pairs_ok = false; }
+            }
+            ctx.check("cmap_strstr_no_null_kv", null_kv == 0);
+            ctx.check("cmap_strstr_pairs_consistent", pairs_ok);
+            ctx.check("cmap_strstr_key_char_sum_matches_java",
+                      key_char_sum == coll_map_fixture::j_long("hashStrStrKeyCharSum"));
+            ctx.check("cmap_strstr_val_char_sum_matches_java",
+                      val_char_sum == coll_map_fixture::j_long("hashStrStrValCharSum"));
+        }
+
+        // =====================================================================
+        // HashMap<Integer,String> — boxed Integer KEY, String VALUE.  Proves a
+        // boxed-primitive key paired with a String value decodes (key via
+        // Integer.value, value via read_java_string).  Keys i, values "iv"+i.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<integer_box, string_value>("hashIntStr") };
+            ctx.check("cmap_intstr_count_is_3", static_cast<std::int32_t>(e.size()) == SMALL_N);
+            check_size_oracle("cmap_intstr", static_cast<std::int32_t>(e.size()), "hashIntStrSize");
+
+            std::int64_t key_sum{ 0 }, val_char_sum{ 0 };
+            std::int32_t null_kv{ 0 };
+            bool pairs_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
+                const std::int32_t k{ kv.first->value() };
+                const std::string v{ kv.second->text() };
+                key_sum += k;
+                val_char_sum += code_unit_sum(v);
+                // Recipe: key i -> value "iv"+i.
+                if (v != ("iv" + std::to_string(k))) { pairs_ok = false; }
+            }
+            ctx.check("cmap_intstr_no_null_kv", null_kv == 0);
+            ctx.check("cmap_intstr_pairs_consistent", pairs_ok);
+            ctx.check("cmap_intstr_key_sum_matches_java",
+                      key_sum == coll_map_fixture::j_long("hashIntStrKeySum"));
+            ctx.check("cmap_intstr_val_char_sum_matches_java",
+                      val_char_sum == coll_map_fixture::j_long("hashIntStrValCharSum"));
+            // Closed form: keys 0+1+2 == 3.
+            ctx.check("cmap_intstr_key_sum_closed_form", key_sum == (0 + 1 + 2));
+        }
+
+        // =====================================================================
+        // HashMap<Long,Long> — 64-bit boxed key AND value.  Keys/values exceed
+        // the 32-bit range (0x1_0000_0000 + i / 0x2_0000_0000 + i), so a
+        // truncating read on the native side would break the sum cross-check.
+        // Proves java.lang.Long.value (a long) round-trips on BOTH sides.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<long_box, long_box>("hashLongLong") };
+            ctx.check("cmap_longlong_count_is_3", static_cast<std::int32_t>(e.size()) == SMALL_N);
+            check_size_oracle("cmap_longlong", static_cast<std::int32_t>(e.size()), "hashLongLongSize");
+
+            std::int64_t key_sum{ 0 }, val_sum{ 0 }, key_xor{ 0 };
+            std::int32_t null_kv{ 0 };
+            bool pairs_ok{ true };
+            bool all_above_32bit{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
+                const std::int64_t k{ kv.first->value() };
+                const std::int64_t v{ kv.second->value() };
+                key_sum += k;
+                val_sum += v;
+                key_xor ^= k;
+                // Both halves must be above 0xFFFFFFFF (would be wrong if truncated).
+                if (k <= 0xFFFFFFFFLL || v <= 0xFFFFFFFFLL) { all_above_32bit = false; }
+                // Recipe: key 0x1_0000_0000+i, value 0x2_0000_0000+i -> v-k == 0x1_0000_0000.
+                if ((v - k) != 0x1'0000'0000LL) { pairs_ok = false; }
+            }
+            ctx.check("cmap_longlong_no_null_kv", null_kv == 0);
+            ctx.check("cmap_longlong_values_exceed_32_bits", all_above_32bit);
+            ctx.check("cmap_longlong_pairs_consistent", pairs_ok);
+            ctx.check("cmap_longlong_key_sum_matches_java",
+                      key_sum == coll_map_fixture::j_long("hashLongLongKeySum"));
+            ctx.check("cmap_longlong_val_sum_matches_java",
+                      val_sum == coll_map_fixture::j_long("hashLongLongValSum"));
+            ctx.check("cmap_longlong_key_xor_matches_java",
+                      key_xor == coll_map_fixture::j_long("hashLongLongKeyXor"));
+        }
+
+        // =====================================================================
+        // HashMap<Day,Box> — ENUM KEYS in an ORDINARY HashMap (not EnumMap).  The
+        // map stores real Node objects, so it decodes POSITIVELY: each key OOP is
+        // a Day constant whose inherited java.lang.Enum.name we read.  Proves a
+        // non-String, non-boxed-primitive (enum) key type round-trips.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<enum_key, box_value>("hashEnumKey") };
+            ctx.check("cmap_enumkey_count_is_3", static_cast<std::int32_t>(e.size()) == SMALL_N);
+            check_size_oracle("cmap_enumkey", static_cast<std::int32_t>(e.size()), "hashEnumKeySize");
+
+            std::int64_t id_sum{ 0 }, name_char_sum{ 0 };
+            std::int32_t null_kv{ 0 };
+            bool saw_mon{ false }, saw_tue{ false }, saw_wed{ false };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; continue; }
+                const std::string nm{ kv.first->name() };
+                id_sum += kv.second->id();
+                name_char_sum += code_unit_sum(nm);
+                if (nm == "MON") { saw_mon = true; }
+                if (nm == "TUE") { saw_tue = true; }
+                if (nm == "WED") { saw_wed = true; }
+            }
+            ctx.check("cmap_enumkey_no_null_kv", null_kv == 0);
+            ctx.check("cmap_enumkey_all_constants_present", saw_mon && saw_tue && saw_wed);
+            ctx.check("cmap_enumkey_id_sum_matches_java",
+                      id_sum == coll_map_fixture::j_long("hashEnumKeyIdSum"));
+            ctx.check("cmap_enumkey_name_char_sum_matches_java",
+                      name_char_sum == coll_map_fixture::j_long("hashEnumKeyNameCharSum"));
+        }
+
+        // =====================================================================
+        // HashMap — RESIZE BOUNDARY at 16 and 17 entries.  With default capacity
+        // 16 / load factor 0.75 the threshold is 12, so 13+ entries already forced
+        // a resize to capacity 32.  These pin that the bucket walk visits EVERY
+        // entry across a table that has been resized exactly at/after the
+        // boundary (no entry dropped or duplicated during/after rehash).
+        // =====================================================================
+        {
+            const auto e16{ coll_map_fixture::entries_of("hashResize16") };
+            const entry_stats s16{ fingerprint(e16) };
+            ctx.check("cmap_resize16_count_is_16", s16.count == RESIZE16_N);
+            check_size_oracle("cmap_resize16", s16.count, "hashResize16Size");
+            ctx.check("cmap_resize16_no_null_keys", s16.null_keys == 0);
+            ctx.check("cmap_resize16_no_null_values", s16.null_values == 0);
+            ctx.check("cmap_resize16_id_sum_matches_java",
+                      s16.id_sum == coll_map_fixture::j_long("hashResize16IdSum"));
+            // Closed form: sum 0..15 == 120.
+            ctx.check("cmap_resize16_id_sum_closed_form",
+                      s16.id_sum == (static_cast<std::int64_t>(RESIZE16_N) * (RESIZE16_N - 1)) / 2);
+            // Every key "k0".."k15" present exactly once (no miss, no duplicate).
+            std::vector<std::string> keys16{ keys_in_walk_order(e16) };
+            std::sort(keys16.begin(), keys16.end());
+            const bool unique16{ std::adjacent_find(keys16.begin(), keys16.end()) == keys16.end() };
+            ctx.check("cmap_resize16_keys_unique_no_dup", unique16);
+            bool all16_present{ keys16.size() == static_cast<std::size_t>(RESIZE16_N) };
+            for (std::int32_t i{ 0 }; i < RESIZE16_N && all16_present; ++i)
+            {
+                if (!std::binary_search(keys16.begin(), keys16.end(), "k" + std::to_string(i)))
+                {
+                    all16_present = false;
+                }
+            }
+            ctx.check("cmap_resize16_every_key_present", all16_present);
+        }
+        {
+            const auto e17{ coll_map_fixture::entries_of("hashResize17") };
+            const entry_stats s17{ fingerprint(e17) };
+            ctx.check("cmap_resize17_count_is_17", s17.count == RESIZE17_N);
+            check_size_oracle("cmap_resize17", s17.count, "hashResize17Size");
+            ctx.check("cmap_resize17_no_null_keys", s17.null_keys == 0);
+            ctx.check("cmap_resize17_no_null_values", s17.null_values == 0);
+            ctx.check("cmap_resize17_id_sum_matches_java",
+                      s17.id_sum == coll_map_fixture::j_long("hashResize17IdSum"));
+            // Closed form: sum 0..16 == 136.
+            ctx.check("cmap_resize17_id_sum_closed_form",
+                      s17.id_sum == (static_cast<std::int64_t>(RESIZE17_N) * (RESIZE17_N - 1)) / 2);
+            std::vector<std::string> keys17{ keys_in_walk_order(e17) };
+            std::sort(keys17.begin(), keys17.end());
+            const bool unique17{ std::adjacent_find(keys17.begin(), keys17.end()) == keys17.end() };
+            ctx.check("cmap_resize17_keys_unique_no_dup", unique17);
+            bool all17_present{ keys17.size() == static_cast<std::size_t>(RESIZE17_N) };
+            for (std::int32_t i{ 0 }; i < RESIZE17_N && all17_present; ++i)
+            {
+                if (!std::binary_search(keys17.begin(), keys17.end(), "k" + std::to_string(i)))
+                {
+                    all17_present = false;
+                }
+            }
+            ctx.check("cmap_resize17_every_key_present", all17_present);
         }
 
         // =====================================================================
