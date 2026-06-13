@@ -2678,6 +2678,95 @@ namespace vmhook
             }
 
             /*
+                @brief Fault-safe test of one or more Method::_access_flags bits.
+                @details
+                The detached auto-repair watchdog (verify_hooks Mode-3) needs to know
+                whether NO_COMPILE is still set on a STORED Method* to decide if the
+                JIT drifted.  The plain get_access_flags() returns a RAW pointer into
+                the Method, and the watchdog's `*flags & NO_COMPILE` then RAW-READS a
+                field on a Method that the JIT/GC/class-unload may have relocated or
+                freed since install.  Such a cold/unmapped page passes is_valid_pointer's
+                range/alignment heuristic yet FAULTS on the load — uncontained on the
+                detached watchdog thread (outside the detour __try and the harness guard),
+                and on the no-SEH legs (MinGW / clang-on-windows) it kills the JVM.
+
+                This routes the u4 read through os::safe_read (ReadProcessMemory /
+                process_vm_readv): a cold slot yields `found=false` and the caller treats
+                the drift check conservatively, NEVER faults.  A Method-metadata read,
+                not a stack-frame walk, so no stk_ POSIX regression.
+
+                @param mask   Bits to test (e.g. vmhook::hotspot::NO_COMPILE).
+                @param found  Out: true iff the flags word was readable.
+                @return true iff the read succeeded AND every requested bit was set.
+            */
+            auto safe_access_flags_test(const std::uint32_t mask, bool& found) const noexcept
+                -> bool
+            {
+                found = false;
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_access_flags") };
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return false;
+                }
+
+                std::uint32_t flags_value{ 0 };
+                if (!vmhook::os::safe_read(
+                        &flags_value,
+                        reinterpret_cast<const std::uint8_t*>(this) + entry->offset,
+                        sizeof(flags_value)))
+                {
+                    return false;
+                }
+                found = true;
+                return (flags_value & mask) == mask;
+            }
+
+            /*
+                @brief Fault-safe OR of bits into Method::_access_flags.
+                @details
+                Re-arm counterpart of safe_access_flags_test().  The watchdog's
+                `*flags |= NO_COMPILE` is a RAW READ-MODIFY-WRITE of _access_flags on a
+                STORED Method* that may be cold/relocated/freed — strictly more dangerous
+                than a stray read because it also corrupts whatever it lands on.  This
+                does the read AND the write through os::safe_read / os::safe_write, so a
+                cold page simply defers the re-arm to the next watchdog tick and never
+                faults.
+
+                Non-atomicity note: this is a non-atomic RMW, but the harness contract
+                guarantees install/verify/re-arm run on the driver thread BETWEEN probe
+                cycles (never concurrently with a Java dispatch of the hooked method),
+                and the watchdog is the only writer of NO_COMPILE on a Method we own, so
+                there is no torn-write hazard in practice.  Skipping the write on a cold
+                page is strictly safer than the previous raw store.
+
+                @param mask  Bits to set.
+                @return true iff the read-modify-write completed (false = deferred).
+            */
+            auto safe_access_flags_or(const std::uint32_t mask) const noexcept
+                -> bool
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_access_flags") };
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return false;
+                }
+
+                std::uint8_t* const slot{ reinterpret_cast<std::uint8_t*>(
+                    const_cast<vmhook::hotspot::method*>(this)) + entry->offset };
+                std::uint32_t flags_value{ 0 };
+                if (!vmhook::os::safe_read(&flags_value, slot, sizeof(flags_value)))
+                {
+                    return false;
+                }
+                if ((flags_value & mask) == mask)
+                {
+                    return true;  // already set; no write needed
+                }
+                flags_value |= mask;
+                return vmhook::os::safe_write(slot, &flags_value, sizeof(flags_value));
+            }
+
+            /*
                 @brief Returns a pointer to the internal method flags of this method.
                 @details
                 These flags encode HotSpot-internal method properties such as _dont_inline.
@@ -2952,12 +3041,26 @@ namespace vmhook
                 -> void
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_code") };
-                if (!entry)
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
                 {
                     return;
                 }
 
-                *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(this) + entry->offset) = code;
+                // CRASH-SAFE STORE: this setter runs on the detached auto-repair
+                // watchdog thread (verify_hooks Mode-3 + try_reinstall) off a STORED
+                // Method* that the JIT/GC/class-unload may have relocated or freed
+                // since install.  A raw `*ptr = code` to such a cold/unmapped page
+                // faults UNCONTAINED — outside the detour __try AND the harness
+                // per-module guard — and on the no-SEH legs (MinGW / clang-on-windows)
+                // it kills the whole JVM.  Route the pointer store through os::safe_write
+                // (kernel-validated WriteProcessMemory / process_vm_writev): a cold page
+                // returns false and the repair is simply deferred to the next watchdog
+                // tick, NEVER faults.  On the warm install/deopt path the page is mapped,
+                // so the write lands exactly as before — byte-for-byte unchanged.
+                (void)vmhook::os::safe_write(
+                    reinterpret_cast<std::uint8_t*>(this) + entry->offset,
+                    &code,
+                    sizeof(code));
             }
 
             /*
@@ -2969,12 +3072,22 @@ namespace vmhook
                 -> void
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_from_interpreted_entry") };
-                if (!entry)
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
                 {
                     return;
                 }
 
-                *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(this) + entry->offset) = entry_point;
+                // CRASH-SAFE STORE (watchdog re-arm path): same rationale as
+                // set_code() above — verify_hooks()/try_reinstall() redirect
+                // interpreted dispatch back through the i2i stub off a STORED Method*
+                // that may have relocated/freed since install.  Route the store
+                // through os::safe_write so a cold/unmapped Method page defers the
+                // re-arm to the next tick instead of faulting uncontained on the
+                // detached watchdog thread (no-SEH JVM-killer otherwise).
+                (void)vmhook::os::safe_write(
+                    reinterpret_cast<std::uint8_t*>(this) + entry->offset,
+                    &entry_point,
+                    sizeof(entry_point));
             }
 
             /*
@@ -3044,12 +3157,22 @@ namespace vmhook
                         return found_entry;
                     }()
                 };
-                if (!entry)
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
                 {
                     return;
                 }
 
-                *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(this) + entry->offset) = entry_point;
+                // CRASH-SAFE STORE (watchdog re-arm path): same rationale as
+                // set_code() above — verify_hooks()/try_reinstall() point compiled
+                // dispatch at the c2i adapter off a STORED Method* that may have
+                // relocated/freed since install.  Route the store through
+                // os::safe_write so a cold/unmapped Method page defers the re-arm to
+                // the next tick instead of faulting uncontained on the detached
+                // watchdog thread.
+                (void)vmhook::os::safe_write(
+                    reinterpret_cast<std::uint8_t*>(this) + entry->offset,
+                    &entry_point,
+                    sizeof(entry_point));
             }
 
             /*
@@ -7242,6 +7365,29 @@ namespace vmhook
 
             const std::uintptr_t address_value{ reinterpret_cast<std::uintptr_t>(slot.address) };
 
+            // CRASH-SAFE PROBE (watchdog re-arm path): set_dont_inline() runs on the
+            // detached auto-repair watchdog (verify_hooks Mode-3 + try_reinstall) off a
+            // STORED Method* that the JIT/GC/class-unload may have relocated or freed
+            // since install.  The atomic_ref RMW below is a RAW memory access on
+            // `slot.address` (== this + flags_offset); on a cold/relocated/freed Method
+            // page that passes is_valid_pointer's heuristic it FAULTS — uncontained on
+            // the watchdog thread, and on the no-SEH legs (MinGW / clang-on-windows) it
+            // kills the JVM.  Probe the exact width-sized word through os::safe_read
+            // first: if it is unreadable the Method is cold this tick, so no-op and let
+            // the next tick retry.  On a warm page the probe succeeds and the
+            // width-correct ATOMIC toggle proceeds exactly as before, preserving the
+            // torn-write safety contract versus the JIT compiler thread.
+            const int probe_width{ slot.width_bytes == 2 ? 2 : (slot.width_bytes == 4 ? 4 : 0) };
+            if (probe_width != 0)
+            {
+                std::uint32_t probe_value{ 0 };
+                if (!vmhook::os::safe_read(&probe_value, slot.address,
+                                           static_cast<std::size_t>(probe_width)))
+                {
+                    return;
+                }
+            }
+
             // Width-correct, atomic toggle.  The mask (1u << bit) is representable in
             // every width we use (bit 2 for u2, bit 12 for u4), so only the ACCESS
             // WIDTH varies — never the mask.  Alignment is asserted per width to keep
@@ -10114,9 +10260,17 @@ namespace vmhook
                         return false;
                     }
 
-                    const std::int32_t method_count{ new_klass->get_methods_count() };
-                    vmhook::hotspot::method** const methods_array{ new_klass->get_methods_ptr() };
-                    if (!methods_array || method_count <= 0)
+                    // Fault-safe klass-methods read.  try_reinstall runs on the
+                    // detached watchdog and new_klass (from find_class) can be
+                    // mid-GC-relocation or being class-unloaded; the raw
+                    // get_methods_count()/get_methods_ptr() each deref `*klass` and
+                    // `*array`, which faults uncontained on a cold page (no-SEH
+                    // JVM-killer).  safe_klass_methods() routes every hop through
+                    // os::safe_read / safe_read_pointer and fails safe (returns false).
+                    std::int32_t method_count{ 0 };
+                    vmhook::hotspot::method** methods_array{ nullptr };
+                    if (!vmhook::hotspot::safe_klass_methods(new_klass, methods_array, method_count)
+                        || !methods_array || method_count <= 0)
                     {
                         return false;
                     }
@@ -10124,7 +10278,10 @@ namespace vmhook
                     vmhook::hotspot::method* new_method{ nullptr };
                     for (std::int32_t i{ 0 }; i < method_count; ++i)
                     {
-                        vmhook::hotspot::method* const m{ methods_array[i] };
+                        // Read the Method* array slot fault-safe: methods_array[i] is a
+                        // RAW load off the (possibly cold) Array<Method*> data region.
+                        vmhook::hotspot::method* const m{ static_cast<vmhook::hotspot::method*>(
+                            const_cast<void*>(vmhook::hotspot::safe_read_pointer(methods_array + i))) };
                         if (m && vmhook::hotspot::is_valid_pointer(m)
                             && m->get_name() == hm_to_repair.expected_method_name
                             && (hm_to_repair.expected_signature.empty()
@@ -10144,12 +10301,13 @@ namespace vmhook
                     const vmhook::hotspot::method* const old_method{ hm_to_repair.method };
                     hm_to_repair.method = new_method;
 
-                    // Re-apply the JIT inhibitors so the new Method holds.
+                    // Re-apply the JIT inhibitors so the new Method holds.  new_method
+                    // was just resolved off a live klass (find_class) so its page is
+                    // warm, but route the NO_COMPILE OR through the fault-safe RMW
+                    // anyway — consistent with the rest of the watchdog path and a
+                    // no-op cost on a mapped page.
                     vmhook::hotspot::set_dont_inline(new_method, true);
-                    if (std::uint32_t* const flags{ new_method->get_access_flags() })
-                    {
-                        *flags |= vmhook::hotspot::NO_COMPILE;
-                    }
+                    (void)new_method->safe_access_flags_or(vmhook::hotspot::NO_COMPILE);
 
                     // If the new method is already JIT-compiled, deopt it
                     // the same way the install path does.  c2i recovery is
@@ -10298,8 +10456,22 @@ namespace vmhook
                 // visible first.  drift_logged is used as a debounce so
                 // we log once per drift event, not once per repair pass.
                 void* const code_now{ hm.method->get_code() };
-                std::uint32_t* const flags_now{ hm.method->get_access_flags() };
-                const bool no_compile_set{ flags_now && (*flags_now & vmhook::hotspot::NO_COMPILE) != 0 };
+
+                // Fault-safe NO_COMPILE probe: get_access_flags() returns a RAW
+                // pointer and a raw `*flags & NO_COMPILE` would deref a STORED Method*
+                // that the JIT/GC/class-unload may have relocated/freed since install —
+                // uncontained on this detached watchdog thread (no-SEH JVM-killer).
+                // safe_access_flags_test() routes the u4 read through os::safe_read.
+                // If the flags word is UNREADABLE (Method page cold/relocated this
+                // tick), flags_readable is false: we cannot reliably detect drift, so
+                // we conservatively skip the re-arm and defer to the next tick rather
+                // than write into a cold Method.
+                bool flags_readable{ false };
+                const bool no_compile_set{ hm.method->safe_access_flags_test(vmhook::hotspot::NO_COMPILE, flags_readable) };
+                if (!flags_readable)
+                {
+                    continue;
+                }
                 const bool jit_drifted{ code_now != nullptr || !no_compile_set };
 
                 if (jit_drifted)
@@ -10318,10 +10490,9 @@ namespace vmhook
                     }
 
                     vmhook::hotspot::set_dont_inline(hm.method, true);
-                    if (flags_now)
-                    {
-                        *flags_now |= vmhook::hotspot::NO_COMPILE;
-                    }
+                    // Fault-safe RMW of NO_COMPILE (was a raw `*flags |= …`).  A cold
+                    // Method page defers the re-arm to the next tick instead of faulting.
+                    (void)hm.method->safe_access_flags_or(vmhook::hotspot::NO_COMPILE);
 
                     if (code_now != nullptr && vmhook::hotspot::is_valid_pointer(code_now))
                     {
