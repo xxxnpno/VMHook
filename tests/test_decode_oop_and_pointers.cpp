@@ -13,15 +13,15 @@
 //
 // is_valid_pointer is pure address arithmetic (range + alignment + poison
 // switch), so its full boundary behaviour IS checkable without a JVM.  Source
-// of truth (verified against vmhook/ext/vmhook/vmhook.hpp on 2026-06-10):
-//   is_valid_pointer        : :1823-1845
-//   untag_pointer           : :1895-1903
-//   narrow_decode (shared)  : :4531-4536   base + (uint64(c) << shift)
-//   narrow_encode (shared)  : :4552-4557   uint32((addr - base) >> shift)
-//   decode_oop_pointer      : :4576-4614   (null guard :4579, no-resolve :4604)
-//   encode_oop_pointer      : :4622-4661   (null guard :4625, below-base :4655)
-//   decode_klass_pointer    : :4670-4707
-//   encode_klass_pointer    : :4723-4763   (below-base guard :4757)
+// of truth (verified against vmhook/ext/vmhook/vmhook.hpp on 2026-06-15):
+//   is_valid_pointer        : :2007-2045
+//   untag_pointer           : :2052-2057
+//   narrow_decode (shared)  : :5289-5294   base + (uint64(c) << shift)
+//   narrow_encode (shared)  : :5310-5315   uint32((addr - base) >> shift)
+//   decode_oop_pointer      : :5334-5372   (null guard :5337, no-resolve :5362)
+//   encode_oop_pointer      : :5380-5419   (null guard :5383, below-base :5413)
+//   decode_klass_pointer    : :5428-5466
+//   encode_klass_pointer    : :5481-5521   (below-base guard :5515)
 //   os::user_address_ceiling: :515 (0x00007FFFFFFFFFFF)
 //   os::user_address_floor  : :520 (0xFFFF)
 //
@@ -30,6 +30,13 @@
 // FULL decode/encode arithmetic — every (base, shift) HotSpot mode and the
 // complete narrow-value domain — is now exercisable with NO JVM by injecting
 // base/shift directly.  Sections G..Z below do exactly that, exhaustively.
+//
+// Sections AA..EE then attribute the coverage back to the compressed_oops_decode
+// feature PROPER: they exercise the PUBLIC OOP entry points decode_oop_pointer /
+// encode_oop_pointer over their whole no-JVM input domain (AA, BB, DD), pin the
+// OOP decode arithmetic per JDK-version (base, shift) regime (CC), characterise
+// the encoder's below-base / no-resolve null behaviour incl. flaw #1 (BB), and
+// pin the widen-before-shift overflow safety of the OOP decode formula (EE).
 #include <vmhook/vmhook.hpp>
 #include <cstdio>
 #include <cstdint>
@@ -51,7 +58,7 @@ int main()
 
     // ===================================================================
     // A. decode_oop_pointer / encode_oop_pointer — null-input contract.
-    //    These guards (vmhook.hpp:4229 and :4301) run BEFORE any
+    //    These guards (vmhook.hpp:5337 and :5383) run BEFORE any
     //    gHotSpotVMStructs lookup, so they are JVM-independent and fully
     //    deterministic in this no-JVM build.
     // ===================================================================
@@ -71,7 +78,7 @@ int main()
         check("decode_oop_pointer_zero_is_null_typed", decoded == nullptr);
     }
 
-    // encode_oop_pointer(nullptr) -> 0.  Inverse guard (vmhook.hpp:4301):
+    // encode_oop_pointer(nullptr) -> 0.  Inverse guard (vmhook.hpp:5383):
     // a null native pointer encodes back to the null compressed oop.
     check("encode_oop_pointer_null_is_zero",
           encode_oop_pointer(nullptr) == 0u);
@@ -87,7 +94,7 @@ int main()
 
     // No-JVM fall-through: a *non-zero* compressed oop cannot be decoded
     // because gHotSpotVMStructs is absent, so base_entry/shift_entry stay
-    // null and decode_oop_pointer returns nullptr (vmhook.hpp:4280-4283)
+    // null and decode_oop_pointer returns nullptr (vmhook.hpp:5362-5365)
     // WITHOUT crashing.  This documents the no-JVM behaviour; under a live
     // JVM this same input would decode to a real heap address instead.
     check("decode_oop_pointer_nonzero_no_jvm_is_null",
@@ -96,7 +103,7 @@ int main()
           decode_oop_pointer(0xFFFF'FFFFu) == nullptr);
 
     // No-JVM fall-through for the encoder: a non-null pointer with no
-    // resolvable VMStructs returns 0 (vmhook.hpp:4348-4351) and does not
+    // resolvable VMStructs returns 0 (vmhook.hpp:5405-5408) and does not
     // crash.  Use the address of a stack local as a plausible "decoded"
     // pointer.  Under a live JVM the result would be a real narrow oop.
     {
@@ -118,7 +125,7 @@ int main()
         check("encode_oop_pointer_returns_uint32", encode_returns_u32);
     }
 
-    // Both codec entry points are declared noexcept (vmhook.hpp:4226/:4298);
+    // Both codec entry points are declared noexcept (vmhook.hpp:5334/:5380);
     // pin that so a future change that can throw is caught at compile time.
     {
         int stack_anchor{ 0 };
@@ -134,7 +141,7 @@ int main()
     //    addr >= user_address_ceiling, rejects odd (bit-0 set) addresses,
     //    and rejects a fixed set of debug-poison low-32 patterns.
     //    All of this is pure arithmetic and fully checkable with no JVM.
-    //    (vmhook.hpp:1771-1804.)
+    //    (vmhook.hpp:2007-2045.)
     // ===================================================================
 
     constexpr std::uintptr_t floor{ vmhook::os::user_address_floor };    // 0xFFFF
@@ -230,7 +237,7 @@ int main()
 
     // ===================================================================
     // D. is_valid_pointer — debug-poison low-32 patterns.
-    //    The switch (vmhook.hpp:1789-1803) rejects any pointer whose low 32
+    //    The switch (vmhook.hpp:2025-2042) rejects any pointer whose low 32
     //    bits match a known uninitialised/freed fill, even though the
     //    address sits inside the canonical user range.  IMPORTANT: the
     //    alignment check (bit 0) runs BEFORE the poison switch, so for the
@@ -355,7 +362,7 @@ int main()
         }
     }
 
-    // is_valid_pointer is declared noexcept (vmhook.hpp:1768); pin it.
+    // is_valid_pointer is declared noexcept (vmhook.hpp:2007); pin it.
     check("is_valid_pointer_is_noexcept",
           noexcept(is_valid_pointer(nullptr)));
 
@@ -371,7 +378,7 @@ int main()
 
     // ===================================================================
     // G. narrow_decode / narrow_encode — the pure shift/add+subtract/shift
-    //    arithmetic primitives (vmhook.hpp:4446-4451, :4467-4472).  Unlike
+    //    arithmetic primitives (vmhook.hpp:5289-5294, :5310-5315).  Unlike
     //    decode_oop_pointer / encode_oop_pointer these take the base/shift
     //    EXPLICITLY (the caller normally resolves them from VMStructs), so
     //    their full arithmetic IS exercisable with no JVM by injecting
@@ -485,7 +492,7 @@ int main()
 
     // ===================================================================
     // H. untag_pointer — masks off high GC tag bits with user_address_ceiling
-    //    (vmhook.hpp:1813-1818).  Pure bit-AND, fully checkable with no JVM.
+    //    (vmhook.hpp:2052-2057).  Pure bit-AND, fully checkable with no JVM.
     //      untag_pointer(p) = p & 0x00007FFFFFFFFFFF
     // ===================================================================
     using vmhook::hotspot::untag_pointer;
@@ -570,7 +577,7 @@ int main()
         check("is_valid_pointer_even_accept_odd_reject_span", parity_rule_holds);
     }
 
-    // All nine documented poison low-32 patterns (vmhook.hpp:1791-1799) are
+    // All nine documented poison low-32 patterns (vmhook.hpp:2027-2042) are
     // rejected end-to-end under an in-range, even high prefix — whether the
     // rejection comes from the alignment rule (odd sentinels) or the poison
     // switch (even sentinels), the contract is that none of these low-32
@@ -604,7 +611,7 @@ int main()
     //    encoding mode, with the expected value recomputed independently
     //    from the documented formula
     //        narrow_decode(base, shift, c) = base + (uint64(c) << shift)
-    //    (vmhook.hpp:4446-4451).  This is the workhorse both decode_oop_pointer
+    //    (vmhook.hpp:5289-5294).  This is the workhorse both decode_oop_pointer
     //    and decode_klass_pointer call once base/shift are resolved, so its
     //    arithmetic IS the codec arithmetic and is fully testable with no JVM.
     //
@@ -694,7 +701,7 @@ int main()
     //    value is consumed correctly and the decoded full pointer is exactly
     //    base + (narrow << shift) for the documented extreme values:
     //    0, 1, small, 0x7FFFFFFF, 0x80000000 (sign bit), 0xFFFFFFFF (all-ones).
-    //    The widen-before-shift (uint64 cast in narrow_decode, vmhook.hpp:4450)
+    //    The widen-before-shift (uint64 cast in narrow_decode, vmhook.hpp:5293)
     //    means 0xFFFFFFFF << 3 must NOT overflow 32 bits — it must produce the
     //    full 0x7'FFFF'FFF8.  This is the exact bug class the cast prevents.
     // ===================================================================
@@ -735,7 +742,7 @@ int main()
     // L. narrow_encode — EXHAUSTIVE inverse across every mode, expected value
     //    recomputed from the documented formula
     //        narrow_encode(base, shift, addr) = uint32((addr - base) >> shift)
-    //    (vmhook.hpp:4467-4472).  Driven over addresses that are exact, in-range
+    //    (vmhook.hpp:5310-5315).  Driven over addresses that are exact, in-range
     //    representable points (base + (c << shift)) so the uint32 narrowing is
     //    lossless and the result must equal c.
     // ===================================================================
@@ -997,13 +1004,13 @@ int main()
 
     // ===================================================================
     // R. decode_klass_pointer / encode_klass_pointer — the SECOND compressed-
-    //    pointer codec (vmhook.hpp:4585 / :4638).  Structurally identical to the
+    //    pointer codec (vmhook.hpp:5428 / :5481).  Structurally identical to the
     //    OOP codec but resolves CompressedKlassPointers::_narrow_klass.{_base,
     //    _shift}.  With no JVM the VMStruct lookup fails, so only the null
     //    contract + no-JVM fall-through are determinable — exactly mirroring the
     //    OOP coverage in section A, which previously had ZERO klass-codec
-    //    counterpart.  Source of truth: the early-return guards at :4588 / :4641
-    //    (compressed/decoded == 0) and the missing-entry guards at :4613 / :4663.
+    //    counterpart.  Source of truth: the early-return guards at :5431 / :5484
+    //    (compressed/decoded == 0) and the missing-entry guards at :5456 / :5506.
     // ===================================================================
     using vmhook::hotspot::decode_klass_pointer;
     using vmhook::hotspot::encode_klass_pointer;
@@ -1047,7 +1054,7 @@ int main()
         check("decode_klass_pointer_returns_void_ptr", decode_returns_voidptr);
         check("encode_klass_pointer_returns_uint32", encode_returns_u32);
     }
-    // Both klass codec entry points are noexcept (vmhook.hpp:4585 / :4638).
+    // Both klass codec entry points are noexcept (vmhook.hpp:5428 / :5481).
     {
         int stack_anchor{ 0 };
         check("decode_klass_pointer_is_noexcept",
@@ -1072,7 +1079,7 @@ int main()
     //    primitive they both delegate to behaves identically when fed the same
     //    inputs — and that both wrappers agree on the null sentinel.  This locks
     //    the "both codecs are bitwise-identical except for the VMStruct names"
-    //    invariant the header documents (vmhook.hpp:4441-4444 / :4461-4465).
+    //    invariant the header documents (vmhook.hpp:5289-5294 / :5310-5315).
     // ===================================================================
     {
         // Both wrappers map their null sentinel the same way.
@@ -1533,6 +1540,309 @@ int main()
         check("narrow_decode_zero_with_nonzero_base_is_base_not_null",
               narrow_decode(std::uint64_t{ 0x8'0000'0000ull }, 3u, 0u)
                   == reinterpret_cast<void*>(std::uintptr_t{ 0x8'0000'0000ull }));
+    }
+
+    // ===================================================================
+    // AA. OOP-CODEC WRAPPER (decode_oop_pointer / encode_oop_pointer) — the
+    //     compressed_oops_decode feature proper, exercised end-to-end at the
+    //     PUBLIC entry points (not the shared primitive).  Everything that is
+    //     JVM-independent about the wrapper lives in the two guards that run
+    //     before any gHotSpotVMStructs lookup (compressed==0 -> nullptr at
+    //     vmhook.hpp:5337; decoded==nullptr -> 0 at :5383) plus the no-resolve
+    //     fall-throughs (:5362 / :5405).  Sections A pinned the simplest forms;
+    //     this section EXHAUSTS the wrapper's no-JVM input domain so the public
+    //     API contract is nailed down independently of the primitive sweeps.
+    // ===================================================================
+    {
+        // (AA1) decode_oop_pointer over a dense compressed sweep with NO JVM:
+        //       only compressed==0 yields nullptr via the early guard; EVERY
+        //       non-zero value falls through the unresolved-VMStruct guard and
+        //       also yields nullptr (never a crash, never a bogus pointer).
+        //       This pins that, absent a heap, the wrapper's output domain is
+        //       exactly {nullptr} over the entire 32-bit input range — proving
+        //       the no-resolve guard catches all non-zero inputs, not just the
+        //       0x1 / 0xFFFFFFFF endpoints already in section A.
+        std::vector<std::uint32_t> oop_inputs;
+        oop_inputs.push_back(0u);
+        for (std::uint32_t k{ 1u }; k <= 16u; ++k) { oop_inputs.push_back(k); }
+        for (unsigned bit{ 0u }; bit < 32u; ++bit)
+        {
+            const std::uint32_t pow2{ static_cast<std::uint32_t>(1u) << bit };
+            oop_inputs.push_back(pow2);
+            oop_inputs.push_back(pow2 - 1u);
+            oop_inputs.push_back(pow2 + 1u);
+        }
+        oop_inputs.push_back(0x7FFF'FFFFu);
+        oop_inputs.push_back(0x8000'0000u);
+        oop_inputs.push_back(0xFFFF'FFFEu);
+        oop_inputs.push_back(0xFFFF'FFFFu);
+
+        bool decode_wrapper_all_null_no_jvm{ true };
+        std::size_t decode_wrapper_cases{ 0 };
+        for (const std::uint32_t c : oop_inputs)
+        {
+            if (decode_oop_pointer(c) != nullptr)
+            {
+                decode_wrapper_all_null_no_jvm = false;
+            }
+            ++decode_wrapper_cases;
+        }
+        check("decode_oop_pointer_all_inputs_null_no_jvm",
+              decode_wrapper_all_null_no_jvm);
+        check("decode_oop_pointer_no_jvm_sweep_is_dense",
+              decode_wrapper_cases >= 100);
+
+        // (AA2) The wrapper short-circuits compressed==0 BEFORE the VMStruct
+        //       lookup, so decode_oop_pointer(0) is nullptr on EVERY JVM and in
+        //       this no-JVM build alike — i.e. the null oop never depends on a
+        //       resolvable base/shift.  (Re-pinned here in the OOP-codec section
+        //       so the public guarantee is stated where the feature lives.)
+        check("decode_oop_pointer_zero_null_is_jvm_independent",
+              decode_oop_pointer(0u) == nullptr);
+    }
+
+    // ===================================================================
+    // BB. OOP-CODEC encode_oop_pointer — the BELOW-BASE / low-sentinel guard
+    //     (vmhook.hpp:5413: `if (decoded_address < narrow_oop_base) return 0;`).
+    //     Under a live JVM with a non-zero heap base this guard maps any pointer
+    //     below the heap start to the NULL compressed oop (a known asymmetry —
+    //     a sub-base/native/stale pointer is silently encoded as "store null").
+    //     With NO JVM narrow_oop_base is unresolved, so the no-resolve guard at
+    //     :5405 fires first and the result is also 0 — meaning EVERY pointer,
+    //     including the canonical low sentinels the below-base guard exists to
+    //     reject, encodes to 0 here.  We pin that no-JVM behaviour for the exact
+    //     sentinel inputs (1, the address floor, the first valid page) so a
+    //     future change to the guard or the no-resolve path is caught, and so
+    //     the documented current contract of the OOP encoder is explicit.
+    // ===================================================================
+    {
+        // Canonical sub-base / sentinel pointers an encoder might be handed:
+        //   (void*)1            — the classic "below any heap base" sentinel
+        //   (void*)0xFFFF       — exactly the user_address_floor
+        //   (void*)0x10000      — the first address is_valid_pointer accepts
+        //   a real stack object  — a genuine non-null native pointer
+        const std::uintptr_t sentinels[]{
+            std::uintptr_t{ 0x1u },
+            std::uintptr_t{ 0xFFFFu },
+            std::uintptr_t{ 0x1'0000u },
+            std::uintptr_t{ 0x4000'0000u },
+        };
+        bool encode_sentinels_all_zero{ true };
+        for (const std::uintptr_t s : sentinels)
+        {
+            if (encode_oop_pointer(reinterpret_cast<void*>(s)) != 0u)
+            {
+                encode_sentinels_all_zero = false;
+            }
+        }
+        check("encode_oop_pointer_sub_base_sentinels_zero_no_jvm",
+              encode_sentinels_all_zero);
+
+        // A real, in-range, aligned native pointer (heap allocation) also
+        // encodes to 0 with no JVM — confirming the no-resolve path swallows
+        // even a "looks valid" pointer rather than fabricating a narrow oop.
+        {
+            std::vector<std::uint64_t> heap_block(8, 0);
+            check("encode_oop_pointer_real_heap_ptr_zero_no_jvm",
+                  encode_oop_pointer(heap_block.data()) == 0u);
+        }
+
+        // The below-base guard is exercisable in isolation via the primitive:
+        // with an injected non-zero base, narrow_encode of a sub-base address
+        // is NOT the clean 0 the wrapper returns — it underflows modularly
+        // (the wrapper's :5413 guard is what converts that into a deliberate 0).
+        // Pinning the difference documents WHERE the below-base null lives:
+        // in the wrapper, not in the arithmetic primitive.
+        {
+            const std::uint64_t base{ 0x8'0000'0000ull };
+            const std::uint64_t sub_base{ 0x1u };               // far below base
+            // Primitive: modular wrap (NOT 0) — proves it does no range check.
+            const std::uint32_t prim{ narrow_encode(base, 3u, sub_base) };
+            const std::uint32_t prim_expected{
+                static_cast<std::uint32_t>((sub_base - base) >> 3) };
+            check("narrow_encode_sub_base_is_modular_not_zero",
+                  prim == prim_expected);
+            // The wrapper would instead short-circuit to 0 via the below-base
+            // guard once base were resolved; with no JVM it is 0 via no-resolve.
+            // Either way the OOP encoder's observable answer for a sub-base
+            // pointer is 0, which the sentinel battery above already pinned.
+        }
+    }
+
+    // ===================================================================
+    // CC. OOP-CODEC arithmetic per JDK-VERSION (base, shift) regime.  The OOP
+    //     codec resolves narrow_oop_base/shift from CompressedOops (JDK 17+) or
+    //     Universe (JDK 8-16) and then performs EXACTLY narrow_decode(base,
+    //     shift, c).  We cannot read the live base/shift with no JVM, but we CAN
+    //     drive the very same primitive the OOP codec delegates to with each
+    //     (base, shift) pair HotSpot actually selects, and assert the decoded
+    //     pointer against the independently recomputed closed form.  This states
+    //     the OOP decode arithmetic exhaustively *for the OOP codec specifically*
+    //     (the generic sweeps in J/U test the shared primitive; this attributes
+    //     the result to compressed_oops_decode and maps each mode to its real
+    //     HotSpot trigger).  Source of truth for the regimes: vmhook.hpp:
+    //     5342-5345 (the version/field mapping comment in decode_oop_pointer).
+    // ===================================================================
+    {
+        // Each row is a (base, shift) the OOP codec genuinely runs with, tagged
+        // by the JDK/heap situation that produces it.  base values are the
+        // canonical HotSpot heap starts; shift is heap-size driven (0 for <4 GB,
+        // 3 for <=32 GB 8-byte-aligned oops, disabled above that).
+        struct oop_regime
+        {
+            std::uint64_t base;
+            std::uint32_t shift;
+            const char* trigger;   // documentation only
+        };
+        const oop_regime regimes[]{
+            // base==0, shift==0: <4 GB heap based at 0 — the simplest mode,
+            // common on JDK 8 with compressed oops and a small -Xmx; decode is
+            // a pure widening cast (and the regime where flaw #1's `<base` guard
+            // can never fire because base is 0).
+            { 0u,                              0u, "zero_based_unscaled_<4G" },
+            // base==0, shift==3: zero-based, 8-byte scaled, heap <=32 GB.
+            { 0u,                              3u, "zero_based_scaled8_<=32G" },
+            // base!=0, shift==0: based heap, unscaled (heap <4 GB not at 0).
+            { std::uint64_t{ 0x7F00'0000'0000ull }, 0u, "based_unscaled" },
+            // base!=0, shift==3: based + scaled, the >32 GB-style configuration.
+            { std::uint64_t{ 0x8'0000'0000ull },    3u, "based_scaled8" },
+            // A high near-ceiling base with shift 3, stressing that base+offset
+            // stays inside the canonical 47-bit user range and never wraps.
+            { std::uint64_t{ 0x7FFF'C000'0000ull },  3u, "high_based_scaled8" },
+        };
+
+        // Compressed values spanning the structurally interesting classes plus
+        // the 32-bit extremes (the values most likely to expose a shift/widen
+        // bug in the OOP decode path).
+        const std::uint32_t comps[]{
+            0u, 1u, 2u, 3u, 0x7Fu, 0x80u, 0xFFFFu, 0x1'0000u,
+            0x00FF'FFFFu, 0x7FFF'FFFFu, 0x8000'0000u, 0xFFFF'FFFEu, 0xFFFF'FFFFu,
+        };
+
+        bool oop_regime_decode_ok{ true };
+        bool oop_regime_roundtrip_ok{ true };
+        for (const oop_regime r : regimes)
+        {
+            for (const std::uint32_t c : comps)
+            {
+                // The OOP codec's decode body is `return narrow_decode(base,
+                // shift, compressed);` — reproduce it and check the closed form.
+                const std::uintptr_t got{ as_uptr(narrow_decode(r.base, r.shift, c)) };
+                const std::uintptr_t want{
+                    static_cast<std::uintptr_t>(r.base
+                        + (static_cast<std::uint64_t>(c) << r.shift)) };
+                if (got != want) { oop_regime_decode_ok = false; }
+
+                // Round-trip through the OOP encoder's arithmetic on the
+                // representable address: encode is `narrow_encode(base, shift,
+                // addr)` for addr>=base, so it must recover c exactly.
+                const std::uint32_t re{ narrow_encode(
+                    r.base, r.shift, static_cast<std::uint64_t>(got)) };
+                if (re != c) { oop_regime_roundtrip_ok = false; }
+            }
+        }
+        check("oop_decode_arithmetic_all_jdk_regimes", oop_regime_decode_ok);
+        check("oop_decode_encode_roundtrip_all_jdk_regimes", oop_regime_roundtrip_ok);
+
+        // Spot-pin two exact, human-readable decoded pointers — one per shift —
+        // so a regression produces a self-evident wrong constant, not just a
+        // failed loop flag.  JDK 17-24 zero-based shift-3 heap: compressed
+        // 0x100 -> 0x800.  JDK >32 GB based shift-3 heap (base 0x8_0000_0000):
+        // compressed 0x100 -> 0x8_0000_0800.
+        check("oop_decode_zero_based_shift3_0x100_is_0x800",
+              as_uptr(narrow_decode(0u, 3u, 0x100u)) == 0x800u);
+        check("oop_decode_based_shift3_0x100_is_base_plus_0x800",
+              as_uptr(narrow_decode(std::uint64_t{ 0x8'0000'0000ull }, 3u, 0x100u))
+                  == 0x8'0000'0800ull);
+    }
+
+    // ===================================================================
+    // DD. OOP-CODEC wrapper composition / null-identity completeness.  The only
+    //     decode<->encode identities the OOP wrapper guarantees WITHOUT a heap
+    //     base are the ones that route through the null sentinel; pin every
+    //     composition of the two public entry points over their no-JVM domain so
+    //     the wrapper's sentinel algebra is closed.  (Sections A covered the two
+    //     direct round-trips; this adds the cross-compositions and the max-input
+    //     compositions, all of which must collapse to the null/zero sentinel.)
+    // ===================================================================
+    {
+        // encode(decode(c)) == 0 for ALL c with no JVM: decode(c) is nullptr
+        // (c==0 via guard, c!=0 via no-resolve), and encode(nullptr) is 0.
+        const std::uint32_t cs[]{ 0u, 1u, 0x100u, 0x7FFF'FFFFu, 0x8000'0000u, 0xFFFF'FFFFu };
+        bool enc_of_dec_all_zero{ true };
+        for (const std::uint32_t c : cs)
+        {
+            if (encode_oop_pointer(decode_oop_pointer(c)) != 0u)
+            {
+                enc_of_dec_all_zero = false;
+            }
+        }
+        check("encode_of_decode_all_inputs_zero_no_jvm", enc_of_dec_all_zero);
+
+        // decode(encode(p)) == nullptr for several real/sentinel pointers with
+        // no JVM: encode(p) is 0 (no-resolve / below-base), decode(0) is nullptr.
+        int stack_anchor{ 0 };
+        void* const ptrs[]{
+            nullptr,
+            reinterpret_cast<void*>(std::uintptr_t{ 0x1u }),
+            reinterpret_cast<void*>(std::uintptr_t{ 0x1'0000u }),
+            &stack_anchor,
+        };
+        bool dec_of_enc_all_null{ true };
+        for (void* const p : ptrs)
+        {
+            if (decode_oop_pointer(encode_oop_pointer(p)) != nullptr)
+            {
+                dec_of_enc_all_null = false;
+            }
+        }
+        check("decode_of_encode_all_pointers_null_no_jvm", dec_of_enc_all_null);
+
+        // The OOP encoder is idempotent through the null sentinel: encoding any
+        // pointer then decoding then re-encoding stays 0.
+        check("oop_codec_triple_compose_collapses_to_zero",
+              encode_oop_pointer(
+                  decode_oop_pointer(
+                      encode_oop_pointer(&stack_anchor))) == 0u);
+    }
+
+    // ===================================================================
+    // EE. OOP-CODEC overflow / widen safety, attributed to decode_oop_pointer.
+    //     The single most important non-null property of the OOP decode formula
+    //     is that the compressed value is widened to 64 bits BEFORE the shift
+    //     (vmhook.hpp:5293), so a large narrow oop on a shift-3 heap reaches the
+    //     full ~32 GB span instead of truncating at 4 GB.  Section K pinned this
+    //     on the generic primitive; here we pin the exact OOP-relevant extreme
+    //     (the maximum object index on a <=32 GB heap) and prove the decoded
+    //     address (a) exceeds 4 GB and (b) is the precise documented ceiling, so
+    //     a future narrowing bug in the OOP path is caught by an OOP-named test.
+    // ===================================================================
+    {
+        // Max compressed oop on a zero-based shift-3 heap: 0xFFFFFFFF objects *
+        // 8 bytes == 0x7'FFFF'FFF8 (the documented <=32 GB compressed-oops
+        // ceiling).  Must NOT truncate to a 32-bit value.
+        check("oop_decode_max_shift3_reaches_32G_ceiling",
+              as_uptr(narrow_decode(0u, 3u, 0xFFFF'FFFFu)) == 0x7'FFFF'FFF8ull);
+        check("oop_decode_max_shift3_exceeds_4G",
+              as_uptr(narrow_decode(0u, 3u, 0xFFFF'FFFFu)) > 0xFFFF'FFFFull);
+        // The sign-bit compressed value must zero-extend, not sign-extend: at
+        // shift 3 the decoded address is 0x4'0000'0000 (16 GB), strictly above
+        // 4 GB and with no high-bit contamination.
+        check("oop_decode_sign_bit_shift3_zero_extends",
+              as_uptr(narrow_decode(0u, 3u, 0x8000'0000u)) == 0x4'0000'0000ull);
+        // Max compressed on a zero-based shift-0 heap is exactly the 4 GB span
+        // (each oop is the raw object address) — the boundary the shift-3 case
+        // must exceed.
+        check("oop_decode_max_shift0_is_4G_span",
+              as_uptr(narrow_decode(0u, 0u, 0xFFFF'FFFFu)) == 0xFFFF'FFFFull);
+        // Round-trip the shift-3 ceiling from a real >32 GB-style base back to
+        // the all-ones narrow oop — the OOP encoder must recover 0xFFFFFFFF.
+        {
+            const std::uint64_t base{ 0x8'0000'0000ull };
+            const std::uint64_t top{ base + (std::uint64_t{ 0xFFFF'FFFFull } << 3) };
+            check("oop_encode_max_shift3_based_recovers_all_ones",
+                  narrow_encode(base, 3u, top) == 0xFFFF'FFFFu);
+        }
     }
 
     return failures == 0 ? 0 : 1;

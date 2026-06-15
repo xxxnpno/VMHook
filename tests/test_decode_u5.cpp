@@ -1466,5 +1466,290 @@ int main()
         check("top_4096_uint32_values_roundtrip_in_five_bytes", ok);
     }
 
+    // #####################################################################
+    // ##  EXHAUSTIVE WAVE 4 — remaining per-position digit sweeps, the    ##
+    // ##  full leading-byte domain, and explicit pins of the documented   ##
+    // ##  32-bit-truncation (flaw #3) and End-sentinel-aliasing (flaw #4)  ##
+    // ##  boundaries.  Wave 2's section (G) swept the position-1 digit      ##
+    // ##  fully (1..191) but left positions 2/3/4 only spot-checked, and    ##
+    // ##  the position-0 LEADING byte was sampled (192,193,255) rather than ##
+    // ##  swept across its whole 192..255 continuation range.  Every        ##
+    // ##  expected value below is hand-derived from value = sum (b_i-1)*    ##
+    // ##  64^i and uses the SAME uint32 shift arithmetic the decoder uses,  ##
+    // ##  so the wrapping cases pin the decoder's actual result, not an     ##
+    // ##  idealised big-integer one.  All assertions are deterministic and  ##
+    // ##  platform-independent (uint32 wraparound is well-defined in C++).  ##
+    // #####################################################################
+
+    // =====================================================================
+    // (Q) COMPLETE LEADING-BYTE (position-0) DOMAIN — every byte 1..255 as
+    //     the FIRST byte, with a guaranteed terminator behind it.
+    //       * A low first byte 1..191 terminates immediately: value == b0-1,
+    //         consumes 1 (this re-pins the 1-byte domain from the leading
+    //         position with a NON-zero follow byte present, proving the
+    //         follow byte is never read once a low byte terminates).
+    //       * A continuation first byte 192..255 followed by the smallest low
+    //         byte (1, digit 0) yields value == b0-1 in two bytes, isolating
+    //         the position-0 weight (64^0 == 1) across the whole high range.
+    //     Closes bytes 192..255 at position 0, which (C) explicitly deferred.
+    // =====================================================================
+    {
+        bool low_ok{ true };
+        bool high_ok{ true };
+        int  first_bad{ -1 };
+        for (int b0{ 1 }; b0 <= 255; ++b0)
+        {
+            if (b0 < 192)
+            {
+                // Low leading byte: terminates at position 0. Put a non-zero
+                // continuation byte (200) behind it that must NOT be consumed.
+                int pos{ 0 };
+                const std::uint32_t v{ decode_at0({ static_cast<std::uint8_t>(b0), 200u }, pos) };
+                if (v != static_cast<std::uint32_t>(b0 - 1) || pos != 1)
+                {
+                    low_ok = false; if (first_bad < 0) first_bad = b0;
+                }
+            }
+            else
+            {
+                // Continuation leading byte + minimal low terminator (1 -> digit 0):
+                // value == (b0 - 1) at weight 64^0, consumes exactly 2 bytes.
+                int pos{ 0 };
+                const std::uint32_t v{ decode_at0({ static_cast<std::uint8_t>(b0), 1u }, pos) };
+                if (v != static_cast<std::uint32_t>(b0 - 1) || pos != 2)
+                {
+                    high_ok = false; if (first_bad < 0) first_bad = b0;
+                }
+            }
+        }
+        if (!low_ok || !high_ok) { std::printf("       (first failing leading byte = %d)\n", first_bad); }
+        check("leading_low_byte_1_to_191_terminates_and_ignores_follow", low_ok);
+        check("leading_continuation_byte_192_to_255_plus_min_low_is_b0_minus_1", high_ok);
+    }
+
+    // =====================================================================
+    // (R) FULL TERMINAL-DIGIT SWEEPS AT POSITIONS 2, 3 AND 4 — the partner
+    //     of (G)'s position-1 sweep.  Hold every lower position at the
+    //     minimal continuation byte 192 (digit 191) and sweep the
+    //     terminating low byte 1..191 at the position under test.  The
+    //     expected value is the all-191 prefix plus (digit) << (6*pos), built
+    //     with the decoder's own uint32 shift arithmetic so the position-4
+    //     high digits (which overflow 32 bits and wrap) are pinned exactly.
+    //     Each decode consumes pos+1 bytes.
+    // =====================================================================
+    {
+        auto prefix_sum = [](int k) -> std::uint32_t {
+            std::uint32_t s{ 0 };
+            for (int i{ 0 }; i < k; ++i) { s += static_cast<std::uint32_t>(191u) << (6 * i); }
+            return s;
+        };
+        for (int p{ 2 }; p <= 4; ++p)
+        {
+            bool value_ok{ true };
+            bool pos_ok{ true };
+            int  first_bad{ -1 };
+            const std::uint32_t base{ prefix_sum(p) };
+            for (int digit_byte{ 1 }; digit_byte <= 191; ++digit_byte)
+            {
+                std::vector<std::uint8_t> bytes(static_cast<std::size_t>(p), 192u);  // p leading continuations
+                bytes.push_back(static_cast<std::uint8_t>(digit_byte));               // terminating low byte
+                int pos{ 0 };
+                const std::uint32_t v{ decode_at0(bytes, pos) };
+                const std::uint32_t expected{
+                    base + (static_cast<std::uint32_t>(digit_byte - 1) << (6 * p)) };
+                if (v != expected) { value_ok = false; if (first_bad < 0) first_bad = digit_byte; }
+                if (pos != p + 1)  { pos_ok = false;   if (first_bad < 0) first_bad = digit_byte; }
+            }
+            if (!value_ok || !pos_ok)
+            {
+                std::printf("       (first failing position-%d terminal digit = %d)\n", p, first_bad);
+            }
+            std::string lbl_v{ std::string{ "position_" } + std::to_string(p) + "_terminal_digit_sweep_1_to_191_value" };
+            std::string lbl_p{ std::string{ "position_" } + std::to_string(p) + "_terminal_digit_sweep_1_to_191_consumes" };
+            check(lbl_v.c_str(), value_ok);
+            check(lbl_p.c_str(), pos_ok);
+        }
+    }
+
+    // =====================================================================
+    // (S) THE 191/192 LOW-vs-CONTINUATION SPLIT AT A NON-LEADING POSITION —
+    //     the `current_byte < 192` test fires at EVERY byte position, not
+    //     only position 0.  Place the boundary bytes at position 1 of a value
+    //     whose position-0 byte is a fixed continuation (192, digit 191):
+    //       * b1 == 191 (LOW): terminates a 2-byte value == 191 + 190*64
+    //         == 12351, consuming 2 — the position-1 byte does NOT continue.
+    //       * b1 == 192 (CONTINUATION): does NOT terminate; a third low byte
+    //         (1, digit 0) is then read, giving 191 + 191*64 == 12415 in 3
+    //         bytes.  The single-step change 191->192 at position 1 flips the
+    //         length from 2 to 3, isolating the split at a middle byte.
+    //     Also pin the same split at position 2 (two leading 192s).
+    // =====================================================================
+    {
+        // position-1 boundary
+        int pos_low{ 0 };
+        const std::uint32_t v_low{ decode_at0({ 192u, 191u, 200u }, pos_low) };  // 200 must be ignored
+        check("split_at_pos1_byte_191_is_low_terminator",
+              v_low == (191u + 190u * 64u) && v_low == 12351u && pos_low == 2);
+        int pos_high{ 0 };
+        const std::uint32_t v_high{ decode_at0({ 192u, 192u, 1u }, pos_high) };
+        check("split_at_pos1_byte_192_continues_to_third_byte",
+              v_high == (191u + 191u * 64u) && v_high == 12415u && pos_high == 3);
+        check("split_at_pos1_191_vs_192_flips_length_2_to_3",
+              pos_low == 2 && pos_high == 3);
+
+        // position-2 boundary (two leading continuations, then 191 vs 192 at pos 2)
+        int pos2_low{ 0 };
+        const std::uint32_t v2_low{ decode_at0({ 192u, 192u, 191u, 200u }, pos2_low) };
+        check("split_at_pos2_byte_191_is_low_terminator",
+              v2_low == (191u + 191u * 64u + 190u * 64u * 64u) && pos2_low == 3);
+        int pos2_high{ 0 };
+        const std::uint32_t v2_high{ decode_at0({ 192u, 192u, 192u, 1u }, pos2_high) };
+        check("split_at_pos2_byte_192_continues_to_fourth_byte",
+              v2_high == (191u + 191u * 64u + 191u * 64u * 64u) && pos2_high == 4);
+    }
+
+    // =====================================================================
+    // (T) POSITION-4 HIGH-DIGIT TRUNCATION (feature flaw #3, documented &
+    //     intended).  At byte_position == 4 the contribution is
+    //     (digit) << 24, so a position-4 digit >= 0x40 (== 64) places bits
+    //     above 31 that fall off uint32 — the decoder returns a deterministic
+    //     WRAPPED value, never UB (unsigned shift/overflow is well-defined).
+    //     We pin a value that SETS bit 31 and one whose top bits wrap, both
+    //     built with the decoder's exact uint32 shift math.  Prefix is four
+    //     192s (digit 191 at positions 0..3); the 5th byte is the position-4
+    //     terminal digit.
+    // =====================================================================
+    {
+        // 5th byte 192 -> digit 191 at position 4: 191<<24 = 0xBF000000 (bit 31 set).
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 192u, 192u, 192u, 192u, 192u }, pos) };
+        const std::uint32_t expected{
+            (static_cast<std::uint32_t>(191u) << 0)
+          + (static_cast<std::uint32_t>(191u) << 6)
+          + (static_cast<std::uint32_t>(191u) << 12)
+          + (static_cast<std::uint32_t>(191u) << 18)
+          + (static_cast<std::uint32_t>(191u) << 24) };
+        check("pos4_digit_191_matches_uint32_shift_sum", v == expected && pos == 5);
+        check("pos4_digit_191_sets_bit_31", (v & 0x80000000u) != 0u);
+
+        // Sweep EVERY position-4 terminal digit 1..191 and confirm the decoder
+        // result equals the wrapping uint32 shift sum for each — i.e. the
+        // documented truncation is uniform and deterministic across the whole
+        // 5th-digit range, not just at the endpoints.
+        bool sweep_ok{ true };
+        int  first_bad{ -1 };
+        const std::uint32_t base4{
+            (static_cast<std::uint32_t>(191u) << 0)
+          + (static_cast<std::uint32_t>(191u) << 6)
+          + (static_cast<std::uint32_t>(191u) << 12)
+          + (static_cast<std::uint32_t>(191u) << 18) };
+        for (int d{ 1 }; d <= 191; ++d)
+        {
+            int sp{ 0 };
+            const std::uint32_t sv{ decode_at0({ 192u, 192u, 192u, 192u, static_cast<std::uint8_t>(d) }, sp) };
+            const std::uint32_t se{ base4 + (static_cast<std::uint32_t>(d - 1) << 24) };
+            if (sv != se || sp != 5) { sweep_ok = false; if (first_bad < 0) first_bad = d; }
+        }
+        if (!sweep_ok) { std::printf("       (first failing pos4 terminal digit = %d)\n", first_bad); }
+        check("pos4_terminal_digit_sweep_1_to_191_is_wrapping_shift_sum", sweep_ok);
+    }
+
+    // =====================================================================
+    // (U) END-SENTINEL ANTI-ALIASING (feature flaw #4).  ~0u is returned for
+    //     BOTH the End(0) marker AND a genuine UINT32_MAX decode; the two are
+    //     distinguished only by the cursor delta.  Beyond UINT32_MAX itself
+    //     (pinned in section I), confirm that the LARGEST low-terminated
+    //     5-byte value reachable by the encoder (3255312510 == {255,255,255,
+    //     255,191}) is NOT ~0u — a non-degenerate real value never collides
+    //     with the End return value via the normal (low-terminated) path.
+    //     Then prove the cursor is the sole discriminator: End advances 0,
+    //     a real UINT32_MAX decode advances 5, on otherwise-identical calls.
+    // =====================================================================
+    {
+        int p_lowmax{ 0 };
+        const std::uint32_t lowmax{ decode_at0({ 255u, 255u, 255u, 255u, 191u }, p_lowmax) };
+        check("low_terminated_5byte_max_is_3255312510", lowmax == 3255312510u && p_lowmax == 5);
+        check("low_terminated_5byte_max_is_not_end_sentinel", lowmax != ~0u);
+
+        // Cursor is the discriminator: feed UINT32_MAX bytes vs a single 0.
+        int p_max{ 0 };
+        const std::uint32_t vmax{ decode_at0({ 192u, 254u, 253u, 253u, 253u }, p_max) };
+        int p_end{ 0 };
+        const std::uint32_t vend{ decode_at0({ 0u }, p_end) };
+        check("uint32_max_and_end_share_return_value", vmax == ~0u && vend == ~0u);
+        check("uint32_max_and_end_differ_only_by_cursor", p_max == 5 && p_end == 0);
+    }
+
+    // =====================================================================
+    // (V) DECODE RESULT IS BITWISE-IDENTICAL REGARDLESS OF START OFFSET — a
+    //     stronger form of (H): for a spread of values, decoding the SAME
+    //     canonical bytes placed at offsets 0..16 yields the EXACT same value
+    //     and the cursor always advances by exactly the encoded length.  This
+    //     pins that decode_u5 is a pure function of the bytes at [stream_pos,
+    //     stream_pos+len) and the start offset only shifts the window.
+    // =====================================================================
+    {
+        const std::uint32_t probes[]{ 0u, 1u, 63u, 64u, 190u, 191u, 255u, 4096u,
+                                      65535u, 16777215u, 50864255u, 3255312510u, 0xFFFFFFFFu };
+        bool ok{ true };
+        std::uint32_t first_bad{ 0 };
+        bool have_bad{ false };
+        for (const std::uint32_t val : probes)
+        {
+            const std::vector<std::uint8_t> enc{ u5_oracle::encode(val) };
+            std::uint32_t ref{ 0 };
+            for (int start{ 0 }; start <= 16; ++start)
+            {
+                std::vector<std::uint8_t> buf(static_cast<std::size_t>(start), 1u);  // filler (each is value 0)
+                buf.insert(buf.end(), enc.begin(), enc.end());
+                buf.resize(buf.size() + 8, 0u);  // peek padding
+                int pos{ start };
+                const std::uint32_t v{ vmhook::hotspot::klass::decode_u5(buf.data(), pos) };
+                if (start == 0) { ref = v; }
+                if (v != val || v != ref
+                 || static_cast<std::size_t>(pos) != static_cast<std::size_t>(start) + enc.size())
+                {
+                    ok = false; if (!have_bad) { first_bad = val; have_bad = true; }
+                }
+            }
+        }
+        if (have_bad) { std::printf("       (first failing offset-invariance value = %u)\n", first_bad); }
+        check("decode_value_is_bitwise_identical_across_start_offsets_0_to_16", ok);
+    }
+
+    // =====================================================================
+    // (W) SEQUENTIAL THREADING OF MAXIMAL-LENGTH VALUES — back-to-back decode
+    //     of three 5-byte values from one buffer, confirming the cursor
+    //     threads correctly across the longest records (the costliest case
+    //     for the per-field walk in find_field_in_stream) and lands exactly
+    //     on the trailing End(0).
+    // =====================================================================
+    {
+        const std::uint32_t a{ 50864255u };   // smallest 5-byte value
+        const std::uint32_t b{ 0xFFFFFFFFu };  // UINT32_MAX (5 bytes)
+        const std::uint32_t c{ 3255312510u };  // largest low-terminated 5-byte value
+        std::vector<std::uint8_t> stream;
+        for (std::uint32_t v : { a, b, c })
+        {
+            const std::vector<std::uint8_t> e{ u5_oracle::encode(v) };
+            stream.insert(stream.end(), e.begin(), e.end());
+        }
+        const std::size_t end_index{ stream.size() };
+        stream.push_back(0u);                  // End marker
+        stream.resize(stream.size() + 8, 0u);  // peek padding
+
+        int pos{ 0 };
+        const std::uint32_t d0{ vmhook::hotspot::klass::decode_u5(stream.data(), pos) };
+        const std::uint32_t d1{ vmhook::hotspot::klass::decode_u5(stream.data(), pos) };
+        const std::uint32_t d2{ vmhook::hotspot::klass::decode_u5(stream.data(), pos) };
+        const int pos_before_end{ pos };
+        const std::uint32_t end{ vmhook::hotspot::klass::decode_u5(stream.data(), pos) };
+        check("seq_three_5byte_values_decode_correctly", d0 == a && d1 == b && d2 == c);
+        check("seq_three_5byte_values_consume_fifteen_bytes", pos_before_end == 15);
+        check("seq_three_5byte_values_cursor_lands_on_end_index",
+              static_cast<std::size_t>(pos_before_end) == end_index);
+        check("seq_three_5byte_values_then_end_marker", end == ~0u && pos == pos_before_end);
+    }
+
     return failures == 0 ? 0 : 1;
 }

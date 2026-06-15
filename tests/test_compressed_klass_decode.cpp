@@ -57,8 +57,11 @@
 //     is_valid_pointer                ~1825  range + bit-0 + poison gate
 //     user_address_floor / ceiling    ~515/520
 #include <vmhook/vmhook.hpp>
+#include <cstddef>    // std::size_t
 #include <cstdio>
 #include <cstdint>
+#include <cstring>    // std::strcmp (klass candidate (type, field) name pins)
+#include <iterator>   // std::size (candidate-array counts for resolve_struct_entry)
 #include <vector>
 
 static int failures{ 0 };
@@ -703,6 +706,330 @@ int main()
     // in A; assert the composed 4-step identity once more as a closure pin.
     check("klass_codec_null_closure",
           decode_klass_pointer(encode_klass_pointer(decode_klass_pointer(0u))) == nullptr);
+
+    // =====================================================================
+    // N. resolve_struct_entry — the JDK-VERSION fallback walker that the klass
+    //    codec uses to find its base/shift field across HotSpot revisions.  This
+    //    is where the "JDK-specific narrow-klass differences" actually live: the
+    //    klass base/shift field migrated names across versions
+    //      JDK  8-16 : Universe::_narrow_klass._base / ._shift
+    //      JDK 17-24 : CompressedKlassPointers::_narrow_klass._base / ._shift
+    //      JDK 25+   : CompressedKlassPointers::_base / _shift  (prefix dropped)
+    //    decode_klass_pointer / encode_klass_pointer feed resolve_struct_entry an
+    //    ORDERED candidate array of exactly these three (type, field) pairs and
+    //    take the FIRST that resolves (first-match-wins).  With no JVM,
+    //    gHotSpotVMStructs is absent so EVERY candidate misses and the walker
+    //    returns nullptr — which is precisely why the wrappers degrade to
+    //    nullptr/0 off-JVM.  We pin the walker's contract directly (it is a pure,
+    //    deterministic, cross-platform loop): null for any list off-JVM, correct
+    //    handling of count==0 / single / multi candidate lists, and that the
+    //    EXACT klass candidate arrays the wrappers embed all resolve to nullptr
+    //    here (so the degrade-gracefully promise is anchored to the real names).
+    // =====================================================================
+    {
+        using vmhook::hotspot::resolve_struct_entry;
+        using vmhook::hotspot::struct_entry_candidate_t;
+        using vmhook::hotspot::vm_struct_entry_t;
+
+        // Signature / noexcept / return-type pins for the walker.
+        static_assert(
+            std::is_same_v<decltype(resolve_struct_entry(
+                               static_cast<const struct_entry_candidate_t*>(nullptr),
+                               std::size_t{ 0 })),
+                           const vm_struct_entry_t*>,
+            "resolve_struct_entry must return const vm_struct_entry_t*");
+        static_assert(
+            noexcept(resolve_struct_entry(
+                static_cast<const struct_entry_candidate_t*>(nullptr), std::size_t{ 0 })),
+            "resolve_struct_entry must be noexcept");
+
+        // The EXACT klass base-field candidate array decode_klass_pointer embeds,
+        // in version order.  Off-JVM, none resolve -> walker returns nullptr.
+        static constexpr struct_entry_candidate_t klass_base_candidates[]{
+            { "CompressedKlassPointers", "_narrow_klass._base" },  // JDK 17-24
+            { "CompressedKlassPointers", "_base" },                // JDK 25+
+            { "Universe", "_narrow_klass._base" },                 // JDK 8-16
+        };
+        static constexpr struct_entry_candidate_t klass_shift_candidates[]{
+            { "CompressedKlassPointers", "_narrow_klass._shift" }, // JDK 17-24
+            { "CompressedKlassPointers", "_shift" },               // JDK 25+
+            { "Universe", "_narrow_klass._shift" },                // JDK 8-16
+        };
+        check("resolve_klass_base_candidates_no_jvm_is_null",
+              resolve_struct_entry(klass_base_candidates,
+                                   std::size(klass_base_candidates)) == nullptr);
+        check("resolve_klass_shift_candidates_no_jvm_is_null",
+              resolve_struct_entry(klass_shift_candidates,
+                                   std::size(klass_shift_candidates)) == nullptr);
+
+        // Walking a PREFIX of the list (count < array size) is honoured: trying
+        // only the JDK17-24 name, only the JDK25+ name, only the JDK8-16 name —
+        // each a single-candidate walk — all miss off-JVM.
+        for (std::size_t take{ 1 }; take <= std::size(klass_base_candidates); ++take)
+        {
+            check("resolve_klass_base_prefix_walk_is_null",
+                  resolve_struct_entry(klass_base_candidates, take) == nullptr);
+        }
+
+        // count == 0 must short-circuit to nullptr WITHOUT dereferencing the
+        // array pointer at all (so a null pointer with count 0 is well-defined).
+        check("resolve_count_zero_null_ptr_is_null",
+              resolve_struct_entry(nullptr, 0u) == nullptr);
+        check("resolve_count_zero_valid_ptr_is_null",
+              resolve_struct_entry(klass_base_candidates, 0u) == nullptr);
+
+        // A single bogus candidate (a (type, field) pair that exists in no JVM,
+        // let alone none) resolves to nullptr.
+        static constexpr struct_entry_candidate_t bogus[]{
+            { "ZZZ_NoSuchType", "_no_such_field" },
+        };
+        check("resolve_single_bogus_candidate_is_null",
+              resolve_struct_entry(bogus, std::size(bogus)) == nullptr);
+
+        // A list of MANY bogus candidates still walks to the end and returns
+        // nullptr (the full loop is exercised, no early false-positive).
+        static constexpr struct_entry_candidate_t many_bogus[]{
+            { "A", "_a" }, { "B", "_b" }, { "C", "_c" },
+            { "D", "_d" }, { "E", "_e" }, { "F", "_f" },
+        };
+        check("resolve_many_bogus_candidates_is_null",
+              resolve_struct_entry(many_bogus, std::size(many_bogus)) == nullptr);
+
+        // The klass and oop wrappers use DIFFERENT type names — assert the klass
+        // candidate type is CompressedKlassPointers (not CompressedOops), pinning
+        // that this file's candidate arrays mirror the klass codec and would, on
+        // a live JVM, read the CLASS-space base/shift, never the heap's.
+        check("klass_candidates_target_compressed_klass_pointers",
+              std::strcmp(klass_base_candidates[0].type_name,
+                          "CompressedKlassPointers") == 0
+                  && std::strcmp(klass_shift_candidates[0].type_name,
+                                 "CompressedKlassPointers") == 0);
+        // ...and the JDK25+ tier dropped the _narrow_klass. prefix (bare _base).
+        check("klass_candidates_jdk25_tier_drops_prefix",
+              std::strcmp(klass_base_candidates[1].field_name, "_base") == 0
+                  && std::strcmp(klass_shift_candidates[1].field_name, "_shift") == 0);
+        // ...and the legacy JDK8-16 tier lives under Universe.
+        check("klass_candidates_legacy_tier_is_universe",
+              std::strcmp(klass_base_candidates[2].type_name, "Universe") == 0
+                  && std::strcmp(klass_shift_candidates[2].type_name, "Universe") == 0);
+    }
+
+    // =====================================================================
+    // O. EXHAUSTIVE shift domain 0..63 for the klass decode arithmetic.  The
+    //    klass shift HotSpot programs is 0 or 3 today, but the primitive does a
+    //    raw `uint64 << shift`, so EVERY shift in the well-defined range [0,63]
+    //    must equal base + (uint64(c) << shift) exactly (shift 64+ is C++ UB and
+    //    deliberately NOT exercised).  This widens section C/D (which stop at a
+    //    handful of shifts) to the full legal shift axis, recomputing each value
+    //    independently.  A future JDK that picks a larger klass shift is covered.
+    // =====================================================================
+    {
+        // A focused narrow set whose high bits matter under large shifts: 0 is
+        // skipped (covered elsewhere), 1 walks the shifted bit across the whole
+        // 64-bit word, and the extremes stress the widen-before-shift.
+        const std::uint32_t cs[]{ 1u, 2u, 3u, 0x7Fu, 0x8000u, 0x7FFF'FFFFu,
+                                  0x8000'0000u, 0xFFFF'FFFFu };
+        const std::uint64_t bases[]{ 0u, std::uint64_t{ 0x8'0000'0000ull } };
+        bool all_shifts_ok{ true };
+        std::size_t shift_cases{ 0 };
+        for (const std::uint64_t base : bases)
+        {
+            for (std::uint32_t sh{ 0u }; sh <= 63u; ++sh)
+            {
+                for (const std::uint32_t c : cs)
+                {
+                    const std::uintptr_t got{ as_uptr(narrow_decode(base, sh, c)) };
+                    const std::uintptr_t want{ static_cast<std::uintptr_t>(
+                        base + (static_cast<std::uint64_t>(c) << sh)) };
+                    if (got != want) { all_shifts_ok = false; }
+                    ++shift_cases;
+                }
+            }
+        }
+        check("klass_decode_all_shifts_0_to_63_exact", all_shifts_ok);
+        check("klass_decode_shift_axis_is_dense", shift_cases >= 500);
+
+        // The single-bit narrow (c==1) lands at exactly bit `shift` for every
+        // shift, base 0: the cleanest proof the shift is applied verbatim.
+        bool single_bit_ok{ true };
+        for (std::uint32_t sh{ 0u }; sh <= 63u; ++sh)
+        {
+            if (as_uptr(narrow_decode(0u, sh, 1u))
+                != static_cast<std::uintptr_t>(std::uint64_t{ 1u } << sh))
+            {
+                single_bit_ok = false;
+            }
+        }
+        check("klass_decode_c1_lands_at_bit_shift_all_shifts", single_bit_ok);
+    }
+
+    // =====================================================================
+    // P. STRUCTURAL INVARIANTS the klass decode must satisfy for any (base,
+    //    shift): monotonicity (a larger narrow never decodes below a smaller one)
+    //    and per-shift alignment (with an aligned base, the decoded address has
+    //    its low `shift` bits zero — generalising the shift-3-only grid check in
+    //    section I to the whole shift axis).  These hold by construction of the
+    //    shift-add and pin that no overflow/sign bug perturbs the ordering or the
+    //    low-bit structure within the representable (non-wrapping) range.
+    // =====================================================================
+    {
+        // Monotonicity: over a strictly increasing narrow run, decoded addresses
+        // are strictly increasing too (within the non-wrapping range), for every
+        // klass mode.  Step is exactly (1 << shift) between consecutive values.
+        bool monotone_ok{ true };
+        bool step_is_pow2_shift{ true };
+        for (const klass_mode m : kModes)
+        {
+            std::uintptr_t prev{ as_uptr(narrow_decode(m.base, m.shift, 1u)) };
+            for (std::uint32_t c{ 2u }; c <= 64u; ++c)
+            {
+                const std::uintptr_t cur{ as_uptr(narrow_decode(m.base, m.shift, c)) };
+                if (cur <= prev) { monotone_ok = false; }
+                if (cur - prev != (std::uintptr_t{ 1u } << m.shift))
+                {
+                    step_is_pow2_shift = false;
+                }
+                prev = cur;
+            }
+        }
+        check("klass_decode_monotone_increasing_all_modes", monotone_ok);
+        check("klass_decode_consecutive_step_is_2_pow_shift", step_is_pow2_shift);
+
+        // Per-shift alignment: with an 8-aligned (here: 2^k-aligned) base, the
+        // decoded address has its low `shift` bits clear for every shift 0..16.
+        // (base 0 is aligned to any power of two.)
+        bool low_shift_bits_zero{ true };
+        for (std::uint32_t sh{ 0u }; sh <= 16u; ++sh)
+        {
+            const std::uintptr_t mask{ (std::uintptr_t{ 1u } << sh) - 1u };
+            const std::uint32_t probe[]{ 1u, 2u, 7u, 100u, 0xABCDu, 0x7FFF'FFFFu };
+            for (const std::uint32_t c : probe)
+            {
+                const std::uintptr_t a{ as_uptr(narrow_decode(0u, sh, c)) };
+                if ((a & mask) != 0u) { low_shift_bits_zero = false; }
+            }
+        }
+        check("klass_decode_low_shift_bits_zero_base0_all_shifts", low_shift_bits_zero);
+    }
+
+    // =====================================================================
+    // Q. encode_klass_pointer WRAPPER — dense off-JVM fall-through on the encode
+    //    side.  Section B proves 3 pointers encode to 0 with no JVM; here we feed
+    //    a DENSE, varied set of real in-range addresses (stack, heap, a sweep of
+    //    synthetic in-range even pointers across the canonical span) and confirm
+    //    the wrapper returns 0 for ALL of them off-JVM, never a bogus non-zero
+    //    narrow.  This is the encode twin of section B's dense decode sweep.
+    // =====================================================================
+    {
+        std::vector<std::uint64_t> heap_block(16, 0);
+        int stack_anchor{ 0 };
+        bool all_zero{ true };
+        std::size_t encode_probed{ 0 };
+
+        // Real, mapped pointers.
+        if (encode_klass_pointer(&stack_anchor) != 0u) { all_zero = false; }
+        ++encode_probed;
+        if (encode_klass_pointer(heap_block.data()) != 0u) { all_zero = false; }
+        ++encode_probed;
+
+        // A sweep of synthetic, in-range, even (2-byte-aligned) addresses across
+        // the canonical user span.  None are dereferenced — encode only does
+        // arithmetic/VMStruct lookup — so passing raw values is safe here.
+        for (std::uint64_t hi{ 0x1'0000ull }; hi <= 0x7000'0000'0000ull; hi <<= 1)
+        {
+            void* const p{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(hi)) };
+            if (encode_klass_pointer(p) != 0u) { all_zero = false; }
+            ++encode_probed;
+        }
+        check("encode_klass_dense_inrange_no_jvm_all_zero", all_zero);
+        check("encode_klass_dense_sweep_is_dense", encode_probed >= 20);
+
+        // The encode wrapper is the strict inverse of decode on the null sentinel
+        // even when chained densely: encode(decode(c)) is 0 for EVERY c off-JVM
+        // (decode(c)->nullptr for c!=0, decode(0)->nullptr, encode(nullptr)->0).
+        bool chain_all_zero{ true };
+        for (const std::uint32_t c : build_dense_narrows())
+        {
+            if (encode_klass_pointer(decode_klass_pointer(c)) != 0u)
+            {
+                chain_all_zero = false;
+            }
+        }
+        check("encode_decode_chain_all_zero_no_jvm", chain_all_zero);
+    }
+
+    // =====================================================================
+    // R. KLASS vs OOP WRAPPERS — off-JVM behavioural EQUIVALENCE on the
+    //    degrade-gracefully path, asserted densely.  Section K pins that the two
+    //    entry points are DISTINCT functions and diverge on a live heap (modelled
+    //    via the primitive with different base/shift).  Here we pin the
+    //    complementary fact: with NO JVM, both wrappers collapse to the SAME
+    //    sentinel for EVERY input (decode->nullptr, encode->0), because neither
+    //    can resolve its (different) VMStruct.  So the distinction is purely the
+    //    VMStruct SOURCE, observable only when that source exists — off-JVM they
+    //    are indistinguishable, and this dense agreement proves it.
+    // =====================================================================
+    {
+        bool decode_agree{ true };
+        for (const std::uint32_t c : build_dense_narrows())
+        {
+            if (decode_klass_pointer(c) != decode_oop_pointer(c)) { decode_agree = false; }
+            // both must be null off-JVM (0 -> null guard; nonzero -> missing entry)
+            if (decode_klass_pointer(c) != nullptr) { decode_agree = false; }
+        }
+        check("klass_oop_decode_agree_and_null_dense_no_jvm", decode_agree);
+
+        bool encode_agree{ true };
+        std::vector<std::uint64_t> heap_block(8, 0);
+        int anchor{ 0 };
+        void* const probes[]{
+            nullptr,
+            &anchor,
+            heap_block.data(),
+            reinterpret_cast<void*>(std::uintptr_t{ 0x10000u }),
+            reinterpret_cast<void*>(std::uintptr_t{ 0x8'0000'0000ull }),
+        };
+        for (void* const p : probes)
+        {
+            if (encode_klass_pointer(p) != encode_oop_pointer(p)) { encode_agree = false; }
+            if (encode_klass_pointer(p) != 0u) { encode_agree = false; }
+        }
+        check("klass_oop_encode_agree_and_zero_dense_no_jvm", encode_agree);
+    }
+
+    // =====================================================================
+    // S. LOSSLESS-CHANNEL identity at the primitive level for EVERY shift 0..31.
+    //    The codec is a lossless channel for any aligned-on-the-grid value: the
+    //    bits the decode shifts OUT to the left are exactly the bits the encode
+    //    shifts back IN, so (decode then encode) recovers c for ALL 32-bit c at
+    //    ANY shift.  Section F asserts this for the curated kModes; here we sweep
+    //    the FULL shift axis 0..31 against base 0 and a non-zero base, recomputing
+    //    nothing — purely "does encode undo decode" — to pin the channel property
+    //    independent of the specific base/shift HotSpot happens to choose.
+    // =====================================================================
+    {
+        const std::uint32_t cs[]{ 1u, 2u, 0x7Fu, 0x1234u, 0x7FFF'FFFFu,
+                                  0x8000'0000u, 0xFFFF'FFFFu };
+        const std::uint64_t bases[]{ 0u, std::uint64_t{ 0x8'0000'0000ull } };
+        bool channel_ok{ true };
+        std::size_t channel_cases{ 0 };
+        for (const std::uint64_t base : bases)
+        {
+            for (std::uint32_t sh{ 0u }; sh <= 31u; ++sh)
+            {
+                for (const std::uint32_t c : cs)
+                {
+                    void* const decoded{ narrow_decode(base, sh, c) };
+                    const std::uint32_t re{ narrow_encode(
+                        base, sh, static_cast<std::uint64_t>(as_uptr(decoded))) };
+                    if (re != c) { channel_ok = false; }
+                    ++channel_cases;
+                }
+            }
+        }
+        check("klass_lossless_channel_all_shifts_0_to_31", channel_ok);
+        check("klass_lossless_channel_is_dense", channel_cases >= 400);
+    }
 
     return failures == 0 ? 0 : 1;
 }

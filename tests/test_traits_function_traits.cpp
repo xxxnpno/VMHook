@@ -180,6 +180,104 @@ namespace
         template<typename T>
         void operator()(vmhook::return_value&, T) const {}
     };
+
+    // ── STATIC member functions (task-enumerated shape) ──────────────────────
+    // A static member function has NO implicit `this`: &Struct::static_fn yields
+    // an ORDINARY function pointer R(*)(args...), which is precisely the free-fn
+    // POINTER specialisation (#1).  So &Struct::s_xxx must decompose exactly like
+    // a free function — accepted, return discarded, args verbatim — and must NOT
+    // behave like the member-pointer specialisations (#4/#5).  Nothing in the
+    // suite exercised a static member before; this pins that &Struct::static_fn
+    // is the free-fn-pointer path, not the member-pointer path.
+    struct static_host
+    {
+        static void          s_void(int, double) {}
+        static std::int64_t  s_i64(int, double) { return 0; }       // 2-slot return
+        static std::string   s_string(int, double) { return {}; }
+        static void          s_detour(vmhook::return_value&,
+                                      std::unique_ptr<sample_wrapper>,
+                                      std::int32_t, std::int64_t) {}
+    };
+
+    // ── MEMBER-function pointers: the full qualifier matrix ──────────────────
+    // member_host (above) covers const / non-const / const-noexcept / lvalue-&.
+    // These add the REMAINING C++ member-function qualifier spellings so the gap
+    // boundary is pinned for ALL of them, not just two.  The const and non-const
+    // specs (#4/#5) match ONLY the bare `const` and bare unqualified forms; every
+    // qualifier below (volatile, const volatile, &&, const &, ref/noexcept combos)
+    // matches NEITHER spec, so taken as a functor's operator() it would be a hard
+    // error — here we hold the member-POINTER type directly and assert its exact
+    // unsupported spelling (the detector-safe, build-stable way to document them).
+    struct member_quals
+    {
+        void m_volatile(int, double) volatile {}                       // never matched
+        void m_const_volatile(int, double) const volatile {}          // never matched
+        void m_rref(int, double) && {}                                 // never matched
+        void m_const_lref(int, double) const& {}                       // never matched
+        void m_nonconst_noexcept(long) noexcept {}                     // never matched
+        void m_rref_noexcept(int) && noexcept {}                       // never matched
+        // A C-style variadic MEMBER function pointer — the member analogue of the
+        // free-fn C-variadic gap.  R(C::*)(args..., ...) const matches no spec.
+        void m_cvariadic(int, ...) const {}                            // never matched
+        // Wide member pointers feeding the member-pointer arity ladder below.
+        void m_const_wide(int, int, int, int, int, int) const {}
+        int  m_nonconst_wide(int, int, int, int, int) { return 0; }
+    };
+
+    // A member pointer with reference / pointer / const-ref PARAMETERS, so the
+    // verbatim-spelling preservation is pinned on the member-pointer spec too
+    // (test exercises it on free-fn pointers; this extends it to specs #4/#5).
+    struct member_ref_params
+    {
+        void m_refs(int&, const double&, void*) const {}
+        void m_const_val(const int, const double) const {}            // top-level const dropped
+    };
+
+    // ── Functors whose operator() carries an UNSUPPORTED qualifier ───────────
+    // These are the FUNCTOR (closure-like) face of the member-qualifier gap.
+    // Their operator() IS addressable (so the void_t functor spec #3 selects),
+    // but it forwards to a member pointer the const/non-const specs do NOT match,
+    // so reading args_tuple_t off them is a HARD ERROR — they must never be fed
+    // to has_args_tuple<>.  We assert the SHAPE of &F::operator() by construction
+    // instead, documenting exactly why function_traits cannot introspect them.
+    struct volatile_call_functor
+    {
+        void operator()(vmhook::return_value&, int) volatile {}
+    };
+    struct rref_call_functor
+    {
+        void operator()(vmhook::return_value&, int) && {}
+    };
+
+    // ── Free functions whose RETURN is a reference / pointer / function ptr ───
+    // The return-type-independence matrix already covers value / two-slot / lref /
+    // const-lref returns.  These add the remaining return shapes the trait must
+    // still DISCARD: rvalue-reference return, pointer-to-function return, and a
+    // reference-to-array return — args_tuple_t must stay tuple<int,double> for all.
+    static int g_int_r{ 0 };
+    int&&             ret_rref(int, double) { return std::move(g_int_r); }
+    void            (*ret_funcptr(int, double))(int) { return nullptr; } // returns void(*)(int)
+    static int        g_arr_r[4]{ 0, 0, 0, 0 };
+    int             (&ret_arrayref(int, double))[4] { return g_arr_r; }   // returns int(&)[4]
+
+    // ── Exotic / wide primitive PARAMETER types (verbatim preservation) ──────
+    // The arg-spelling tests use int/double/void*/char.  These pin that the full
+    // set of C++ primitive parameter spellings survives the trait verbatim — the
+    // wide character types, long double, and the unsigned ladder — exactly as
+    // declared (downstream extract_frame_arg strips cv/ref; the trait does not).
+    void freefn_exotic_prims(long double, char16_t, char32_t, wchar_t) {}
+    void freefn_unsigned_ladder(unsigned char, unsigned short,
+                                unsigned int, unsigned long long) {}
+    void freefn_bool_and_nullptr(bool, std::nullptr_t) {}
+
+    // A free-function detour whose self arg is the SECOND wrapper type, to pin a
+    // distinct unique_ptr<W> element survives the pointer spec by type identity.
+    struct other_wrapper : public vmhook::object<other_wrapper>
+    {
+        using vmhook::object<other_wrapper>::object;
+    };
+    void detour_other(vmhook::return_value&, std::unique_ptr<other_wrapper>,
+                      std::int64_t, std::int32_t) {}
 }
 
 int main()
@@ -512,6 +610,253 @@ int main()
     static_assert(std::is_same_v<std::remove_cvref_t<decltype(ret_void)>, void(int, double)>,
                   "a free function named bare deduces to a function type after "
                   "remove_cvref_t — which function_traits does NOT match");
+
+    // ========================================================================
+    // 11.  STATIC MEMBER FUNCTIONS (task-enumerated shape).
+    //      &Struct::s_xxx is an ORDINARY function pointer R(*)(args...), so it
+    //      lands on the free-fn POINTER specialisation — NOT the member-pointer
+    //      specs.  Decomposes exactly like a free function: args verbatim, return
+    //      discarded, leading return_value& stripped by tuple_tail.  Pins that a
+    //      static member detour and a free-function detour are the same path.
+    // ========================================================================
+    check("static_member_args_are_int_double",
+          std::is_same_v<args_of<decltype(&static_host::s_void)>, std::tuple<int, double>>);
+    check("static_member_two_slot_return_discarded",
+          std::is_same_v<args_of<decltype(&static_host::s_i64)>, std::tuple<int, double>>);
+    check("static_member_string_return_discarded",
+          std::is_same_v<args_of<decltype(&static_host::s_string)>, std::tuple<int, double>>);
+    check("static_member_has_args_tuple",
+          has_args_tuple<decltype(&static_host::s_void)>::value);
+    // A static member function pointer has the SAME type as the equivalent free
+    // function pointer — proving it is the free-fn-ptr spec, not a member spec.
+    check("static_member_pointer_type_equals_free_fn_pointer",
+          std::is_same_v<decltype(&static_host::s_void), void(*)(int, double)>);
+    // Its full detour decomposes through tuple_tail identically to detour_free.
+    check("static_member_detour_method_args_match_free_detour",
+          std::is_same_v<method_args_of<decltype(&static_host::s_detour)>,
+                         method_args_of<decltype(&detour_free)>>);
+    check("static_member_detour_method_args_exact",
+          std::is_same_v<method_args_of<decltype(&static_host::s_detour)>,
+                         std::tuple<std::unique_ptr<sample_wrapper>,
+                                    std::int32_t, std::int64_t>>);
+
+    // ========================================================================
+    // 12.  MEMBER-FUNCTION POINTER ARITY LADDER (specs #4 and #5).
+    //      The free-fn pointer arity ladder is pinned at 0..8 above; the member-
+    //      pointer specs had only fixed small counts.  Walk the const member spec
+    //      and the non-const member spec across several widths so the variadic
+    //      argument_types... pack is exercised on BOTH member specialisations.
+    // ========================================================================
+    check("const_member_pointer_arity_2",
+          std::tuple_size_v<args_of<decltype(&member_host::m_const)>> == 2);
+    check("const_member_pointer_arity_6",
+          std::tuple_size_v<args_of<decltype(&member_quals::m_const_wide)>> == 6);
+    check("const_member_pointer_arity_6_all_ints",
+          std::is_same_v<args_of<decltype(&member_quals::m_const_wide)>,
+                         std::tuple<int, int, int, int, int, int>>);
+    check("nonconst_member_pointer_arity_1",
+          std::tuple_size_v<args_of<decltype(&member_host::m_nonconst)>> == 1);
+    check("nonconst_member_pointer_arity_5",
+          std::tuple_size_v<args_of<decltype(&member_quals::m_nonconst_wide)>> == 5);
+    check("nonconst_member_pointer_wide_return_discarded",
+          std::is_same_v<args_of<decltype(&member_quals::m_nonconst_wide)>,
+                         std::tuple<int, int, int, int, int>>);
+
+    // ========================================================================
+    // 13.  MEMBER-POINTER PARAMETER-SPELLING PRESERVATION (specs #4/#5).
+    //      Section 2 pins verbatim ref/const-ref/pointer preservation on the
+    //      free-fn pointer spec.  Pin the SAME contract on the const member spec:
+    //      reference / const-ref / pointer params survive verbatim, and a
+    //      top-level const on a by-value param is dropped (not part of the type).
+    // ========================================================================
+    check("const_member_pointer_preserves_ref_const_ref_pointer",
+          std::is_same_v<args_of<decltype(&member_ref_params::m_refs)>,
+                         std::tuple<int&, const double&, void*>>);
+    check("const_member_pointer_drops_top_level_const_on_value_params",
+          std::is_same_v<args_of<decltype(&member_ref_params::m_const_val)>,
+                         std::tuple<int, double>>);
+
+    // ========================================================================
+    // 14.  THE FULL MEMBER-QUALIFIER GAP, asserted BY CONSTRUCTION.
+    //      member_host pins const-noexcept and lvalue-& above.  These pin the
+    //      REMAINING qualifier spellings — volatile, const volatile, &&, const&,
+    //      non-const noexcept, && noexcept — as the exact member-pointer types
+    //      that match NEITHER the const nor the non-const specialisation.  Taken
+    //      as a functor operator() each is a hard error, so they are documented
+    //      by SHAPE (never via has_args_tuple).  If a future header adds specs for
+    //      these, every assertion stays true and a positive check can be added.
+    // ========================================================================
+    check("member_pointer_volatile_is_unsupported_qualifier",
+          std::is_same_v<decltype(&member_quals::m_volatile),
+                         void (member_quals::*)(int, double) volatile>);
+    check("member_pointer_const_volatile_is_unsupported_qualifier",
+          std::is_same_v<decltype(&member_quals::m_const_volatile),
+                         void (member_quals::*)(int, double) const volatile>);
+    check("member_pointer_rvalue_ref_is_unsupported_qualifier",
+          std::is_same_v<decltype(&member_quals::m_rref),
+                         void (member_quals::*)(int, double) &&>);
+    check("member_pointer_const_lvalue_ref_is_unsupported_qualifier",
+          std::is_same_v<decltype(&member_quals::m_const_lref),
+                         void (member_quals::*)(int, double) const&>);
+    check("member_pointer_nonconst_noexcept_is_unsupported_qualifier",
+          std::is_same_v<decltype(&member_quals::m_nonconst_noexcept),
+                         void (member_quals::*)(long) noexcept>);
+    check("member_pointer_rvalue_ref_noexcept_is_unsupported_qualifier",
+          std::is_same_v<decltype(&member_quals::m_rref_noexcept),
+                         void (member_quals::*)(int) && noexcept>);
+
+    // ========================================================================
+    // 15.  C-STYLE VARIADIC functions — free pointer AND member pointer.
+    //      The free C-variadic pointer is rejected (asserted §6).  Pin the MEMBER
+    //      analogue: R(C::*)(args..., ...) const has the C-variadic member-pointer
+    //      type and matches no specialisation — asserted by construction, since
+    //      its trailing ellipsis is part of the type and the member specs require
+    //      a fixed parameter pack.  (Detector-safe via the free-fn variadic side.)
+    // ========================================================================
+    check("c_variadic_member_pointer_is_unsupported_shape",
+          std::is_same_v<decltype(&member_quals::m_cvariadic),
+                         void (member_quals::*)(int, ...) const>);
+    // A C-variadic FREE function pointer with a wider fixed prefix is still
+    // rejected (the §6 case used one fixed arg; pin a multi-fixed-arg form too).
+    check("c_variadic_free_pointer_multi_fixed_has_no_args_tuple",
+          !has_args_tuple<void(*)(int, double, ...)>::value);
+
+    // ========================================================================
+    // 16.  FUNCTOR operator() carrying an UNSUPPORTED qualifier (build-breaker
+    //      face).  The functor void_t spec (#3) IS selected for these (their
+    //      operator() is addressable), but it forwards to a member pointer the
+    //      const/non-const specs do not match -> reading args_tuple_t is a hard
+    //      error.  They must NEVER be fed to has_args_tuple; assert the shape of
+    //      &F::operator() by construction instead (the closure-like analogue of
+    //      member_host's noexcept/lref by-construction pins).
+    // ========================================================================
+    check("volatile_call_functor_operator_is_volatile_qualified",
+          std::is_same_v<decltype(&volatile_call_functor::operator()),
+                         void (volatile_call_functor::*)(vmhook::return_value&, int) volatile>);
+    check("rref_call_functor_operator_is_rvalue_ref_qualified",
+          std::is_same_v<decltype(&rref_call_functor::operator()),
+                         void (rref_call_functor::*)(vmhook::return_value&, int) &&>);
+
+    // ========================================================================
+    // 17.  RETURN-TYPE INDEPENDENCE, the remaining return shapes.
+    //      §1 covered value / two-slot / lref / const-lref returns.  These add
+    //      the last return spellings the trait must still DISCARD: an rvalue-
+    //      reference return, a pointer-to-function return, and a reference-to-
+    //      array return.  args_tuple_t must stay tuple<int,double> for each.
+    // ========================================================================
+    check("ret_rvalue_ref_args_are_int_double",
+          std::is_same_v<args_of<decltype(&ret_rref)>, std::tuple<int, double>>);
+    check("ret_function_pointer_args_are_int_double",
+          std::is_same_v<args_of<decltype(&ret_funcptr)>, std::tuple<int, double>>);
+    check("ret_array_reference_args_are_int_double",
+          std::is_same_v<args_of<decltype(&ret_arrayref)>, std::tuple<int, double>>);
+    // All three exotic-return shapes agree with the plain void-return shape.
+    check("exotic_return_shapes_share_void_return_args_tuple",
+          std::is_same_v<args_of<decltype(&ret_rref)>, args_of<decltype(&ret_void)>>
+          && std::is_same_v<args_of<decltype(&ret_funcptr)>, args_of<decltype(&ret_void)>>
+          && std::is_same_v<args_of<decltype(&ret_arrayref)>, args_of<decltype(&ret_void)>>);
+
+    // ========================================================================
+    // 18.  EXOTIC / WIDE PRIMITIVE PARAMETER TYPES preserved VERBATIM.
+    //      §2 used int/double/void*/char.  Pin that the full C++ primitive
+    //      spelling set survives the trait unchanged — the wide character types,
+    //      long double, the unsigned ladder, bool and nullptr_t.  (These are the
+    //      element types extract_frame_arg then classifies downstream.)
+    // ========================================================================
+    check("freefn_preserves_long_double_and_wide_chars",
+          std::is_same_v<args_of<decltype(&freefn_exotic_prims)>,
+                         std::tuple<long double, char16_t, char32_t, wchar_t>>);
+    check("freefn_preserves_unsigned_ladder",
+          std::is_same_v<args_of<decltype(&freefn_unsigned_ladder)>,
+                         std::tuple<unsigned char, unsigned short,
+                                    unsigned int, unsigned long long>>);
+    check("freefn_preserves_bool_and_nullptr_t",
+          std::is_same_v<args_of<decltype(&freefn_bool_and_nullptr)>,
+                         std::tuple<bool, std::nullptr_t>>);
+
+    // ========================================================================
+    // 19.  std::function SPELLING PRESERVATION (the spec #2 face).
+    //      §2 pins verbatim ref/const-ref/pointer preservation on the free-fn
+    //      POINTER spec.  Pin the SAME on the std::function spec: the wrapped
+    //      signature's reference/const-ref/pointer params survive verbatim, and a
+    //      by-value vs const-ref spelling produces DIFFERENT args tuples.
+    // ========================================================================
+    check("std_function_preserves_ref_const_ref_pointer",
+          std::is_same_v<args_of<std::function<void(int&, const double&, void*)>>,
+                         std::tuple<int&, const double&, void*>>);
+    check("std_function_by_value_and_const_ref_args_differ",
+          !std::is_same_v<args_of<std::function<void(int, std::string)>>,
+                          args_of<std::function<void(const int&, const std::string&)>>>);
+    check("std_function_by_value_args_exact",
+          std::is_same_v<args_of<std::function<void(int, std::string)>>,
+                         std::tuple<int, std::string>>);
+
+    // ========================================================================
+    // 20.  DISTINCT WRAPPER ELEMENT-IDENTITY through the free-fn POINTER spec.
+    //      A second wrapper type must survive as its own unique_ptr element —
+    //      decomposition keys on the declared type, never collapsing wrappers.
+    //      (test_traits_extra.cpp pins this on a lambda; here on the pointer spec.)
+    // ========================================================================
+    check("free_detour_other_wrapper_method_args_exact",
+          std::is_same_v<method_args_of<decltype(&detour_other)>,
+                         std::tuple<std::unique_ptr<other_wrapper>,
+                                    std::int64_t, std::int32_t>>);
+    check("two_wrapper_detours_have_distinct_self_element",
+          !std::is_same_v<
+              std::tuple_element_t<0, method_args_of<decltype(&detour_free)>>,
+              std::tuple_element_t<0, method_args_of<decltype(&detour_other)>>>);
+
+    // ========================================================================
+    // 21.  COMPILE-TIME ENFORCEMENT for the new shapes (build breaks on regress).
+    // ========================================================================
+    // Static member function == free-fn-pointer path.
+    static_assert(std::is_same_v<args_of<decltype(&static_host::s_void)>,
+                                 std::tuple<int, double>>,
+                  "a static member function (&S::s) is the free-fn POINTER spec: "
+                  "args verbatim, return discarded — never the member-pointer spec");
+    static_assert(std::is_same_v<decltype(&static_host::s_void), void(*)(int, double)>,
+                  "&Struct::static_fn has an ordinary function-pointer type");
+    static_assert(has_args_tuple<decltype(&static_host::s_void)>::value,
+                  "a static member function pointer must be an accepted detour shape");
+    // Member-pointer arity ladder endpoints (both specs).
+    static_assert(std::tuple_size_v<args_of<decltype(&member_quals::m_const_wide)>> == 6,
+                  "const member-pointer spec must capture a 6-arg parameter pack");
+    static_assert(std::tuple_size_v<args_of<decltype(&member_quals::m_nonconst_wide)>> == 5,
+                  "non-const member-pointer spec must capture a 5-arg parameter pack");
+    // Member-pointer parameter spelling preserved verbatim, like the free-fn spec.
+    static_assert(std::is_same_v<args_of<decltype(&member_ref_params::m_refs)>,
+                                 std::tuple<int&, const double&, void*>>,
+                  "const member-pointer spec must preserve ref/const-ref/pointer "
+                  "parameter spellings verbatim");
+    // The full member-qualifier gap, by construction.
+    static_assert(std::is_same_v<decltype(&member_quals::m_volatile),
+                                 void (member_quals::*)(int, double) volatile>,
+                  "a volatile-qualified member function matches no function_traits "
+                  "specialisation (documented gap)");
+    static_assert(std::is_same_v<decltype(&member_quals::m_rref),
+                                 void (member_quals::*)(int, double) &&>,
+                  "an rvalue-ref-qualified member function matches no specialisation");
+    // C-variadic member pointer shape + multi-fixed free variadic rejection.
+    static_assert(std::is_same_v<decltype(&member_quals::m_cvariadic),
+                                 void (member_quals::*)(int, ...) const>,
+                  "a C-style variadic member function pointer matches no specialisation");
+    static_assert(!has_args_tuple<void(*)(int, double, ...)>::value,
+                  "a multi-fixed-arg C-variadic free-function pointer must be rejected");
+    // Exotic return shapes still discarded.
+    static_assert(std::is_same_v<args_of<decltype(&ret_rref)>, std::tuple<int, double>>,
+                  "an rvalue-reference return type must not leak into args_tuple_t");
+    static_assert(std::is_same_v<args_of<decltype(&ret_funcptr)>, std::tuple<int, double>>,
+                  "a pointer-to-function return type must not leak into args_tuple_t");
+    // Exotic primitive parameter spellings preserved verbatim.
+    static_assert(std::is_same_v<args_of<decltype(&freefn_exotic_prims)>,
+                                 std::tuple<long double, char16_t, char32_t, wchar_t>>,
+                  "long double and the wide character types must survive the trait "
+                  "verbatim as declared");
+    // std::function spelling preservation + by-value/const-ref divergence.
+    static_assert(!std::is_same_v<args_of<std::function<void(int, std::string)>>,
+                                  args_of<std::function<void(const int&, const std::string&)>>>,
+                  "std::function preserves param cv/ref spelling: by-value and "
+                  "const-ref signatures yield DIFFERENT args tuples (spec #2 contract)");
 
     std::printf("vmhook traits-function_traits: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
