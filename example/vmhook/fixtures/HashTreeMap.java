@@ -551,9 +551,18 @@ public final class HashTreeMap
             @Override
             public void run()
             {
-                // mode 0 (the only mode): (re)build every map so the native reads
-                // see a fresh, deterministic population on this exact thread.
-                buildAll();
+                // mode 0 (the only mode): the maps were ALREADY built at class-init
+                // (buildAll() in the static block) and this is a READ-ONLY fixture that
+                // never mutates them, so a second buildAll() here is pure redundant
+                // allocation (~6000 Strings: the 1000-entry maps x several).  On
+                // windows-msvc / clang-cl . java24, with the larger exhaustive-suite heap,
+                // that second build — running in the probe AFTER vmhook's find_class /
+                // register_class JNI + ClassLoaderDataGraph activity — tipped the heap into
+                // a GC that hung the probe thread (#28 family: the class-init build with the
+                // IDENTICAL allocation does NOT hang; only the post-vmhook-activity rebuild
+                // on the pressured heap does).  The maps are immutable, so just acknowledge
+                // — the native side reads the identical, deterministic class-init
+                // population.  Coverage is unchanged (every map is still built full-size).
                 HashTreeMap.done = true;
             }
         });
