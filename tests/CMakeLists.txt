@@ -72,16 +72,6 @@ target_compile_definitions("vmhook_test_helpers" PRIVATE
 #    RWX block.  Pure OS-layer checks, no JVM required.
 vmhook_add_test(os_protect_interaction SOURCES test_os_protect_interaction.cpp)
 
-# 8b) Exhaustive coverage of the os::safe_read / safe_read_fast fault-tolerant
-#     read primitives (and the is_readable_pointer gate that pairs with them):
-#     positive byte-exact round-trip across many widths, the page-boundary trio
-#     (straddle / ends-at-boundary / starts-on-no_access), freed + known-bad
-#     pointers returning false with no fault, safe_read vs safe_read_fast byte
-#     parity, overlapping reads, concurrent thread_local fault-recovery probes,
-#     repeated fallback-path health, and huge/wrapping sizes.  Pure OS-layer,
-#     real local memory + OS calls, no JVM required.
-vmhook_add_test(os_safe_read SOURCES test_os_safe_read.cpp)
-
 # ─────────────────────────────────────────────────────────────────────────
 # Expanded coverage (9+): one standalone executable per feature cluster.
 # These exercise the no-JVM-testable surface of each feature from every

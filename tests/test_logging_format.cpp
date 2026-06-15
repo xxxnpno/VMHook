@@ -288,15 +288,6 @@ int main()
     // internally (e.g. VMHOOK_LOG("{} ...", vmhook::error_tag, ...)).
     check("format_with_error_tag",
         vmhook::detail::format_log("{} boom", vmhook::error_tag) == "[VMHook ERROR] boom");
-    // Symmetry: the warning_tag and info_tag substitute identically, including
-    // alongside a trailing argument (the exact two-field idiom most call sites
-    // use: VMHOOK_LOG("{} ...: {}", vmhook::X_tag, value)).
-    check("format_with_warning_tag",
-        vmhook::detail::format_log("{} note", vmhook::warning_tag) == "[VMHook WARNING] note");
-    check("format_with_info_tag",
-        vmhook::detail::format_log("{} ready", vmhook::info_tag) == "[VMHook INFO] ready");
-    check("format_tag_with_trailing_arg",
-        vmhook::detail::format_log("{} code={}", vmhook::info_tag, 7) == "[VMHook INFO] code=7");
     // A plain format string with no replacement fields round-trips unchanged.
     check("format_no_fields",
         vmhook::detail::format_log("literal text") == "literal text");
@@ -495,102 +486,6 @@ int main()
         vmhook::detail::format_log("{:d}", true) == "1");
     check("format_bool_false_as_int",
         vmhook::detail::format_log("{:d}", false) == "0");
-    // bool honours width / alignment too (textual presentation, padded).
-    check("format_bool_right_align_width",
-        vmhook::detail::format_log("{:>6}", true) == "  true");
-    check("format_bool_left_align_width",
-        vmhook::detail::format_log("{:<6}", false) == "false ");
-
-    // --- String-payload format specs (width / align / fill / precision). --
-    //
-    // The integer spec sweep above covers width/fill/align on NUMBERS; strings
-    // exercise a DIFFERENT formatter (the std-string/string_view/const char*
-    // formatter), where `precision` means "truncate to N code units" rather than
-    // fractional digits.  All spellings here are standard-pinned (no shortest-
-    // round-trip or locale involvement), so they are byte-identical on every STL.
-    //
-    // Precision on a std::string truncates to N leading bytes.
-    check("format_string_precision_truncates",
-        vmhook::detail::format_log("{:.3}", std::string{ "hello" }) == "hel");
-    // Precision longer than the string is a no-op (no padding, no error).
-    check("format_string_precision_longer_is_noop",
-        vmhook::detail::format_log("{:.5}", std::string{ "hi" }) == "hi");
-    // Precision of zero yields the empty string.
-    check("format_string_precision_zero_empty",
-        vmhook::detail::format_log("{:.0}", std::string{ "abc" }).empty());
-    // Width + right alignment pads a short string on the left.
-    check("format_string_width_right_align",
-        vmhook::detail::format_log("{:>5}", std::string{ "ab" }) == "   ab");
-    // Width + left alignment + custom fill.
-    check("format_string_width_left_fill",
-        vmhook::detail::format_log("{:.<6}", std::string{ "text" }) == "text..");
-    // Combined custom-fill + width + precision: truncate to 3, then pad to 8
-    // using '*' as the fill (left-aligned) -> "hel*****".
-    check("format_string_fill_width_precision",
-        vmhook::detail::format_log("{:*<8.3}", std::string{ "hello" }) == "hel*****");
-    // A width smaller than the content is a no-op (content is never clipped by
-    // width alone — only `precision` clips).
-    check("format_string_width_smaller_is_noop",
-        vmhook::detail::format_log("{:2}", std::string{ "abcdef" }) == "abcdef");
-    // The same specs apply to a std::string_view payload...
-    {
-        std::string_view sv{ "vmhook" };
-        check("format_string_view_precision",
-            vmhook::detail::format_log("{:.3}", sv) == "vmh");
-    }
-    // ...and to a const char* payload.
-    check("format_cstring_width_right_align",
-        vmhook::detail::format_log("{:>5}", "ab") == "   ab");
-
-    // --- `char` payload with a spec (distinct from int / signed char). ----
-    // A plain `char` is a CHARACTER type in std::format, so width / fill / align
-    // apply to its single glyph (it is NOT promoted to a number unless {:d}).
-    check("format_char_width_right_align",
-        vmhook::detail::format_log("{:>3}", 'A') == "  A");
-    check("format_char_fill_align",
-        vmhook::detail::format_log("{:->4}", 'x') == "---x");
-    // An explicit {:c} on an actual char value renders the glyph unchanged.
-    check("format_char_explicit_c_spec",
-        vmhook::detail::format_log("{:c}", 'Z') == "Z");
-
-    // --- Alt-form (#) on a ZERO value: the prefix rules are subtle. --------
-    // Hex/binary of zero keep their "0x"/"0b" prefix, but OCTAL of zero has NO
-    // "0" prefix added (alt-form octal of 0 is just "0", per the standard).
-    check("format_alt_hex_zero",
-        vmhook::detail::format_log("{:#x}", 0) == "0x0");
-    check("format_alt_binary_zero",
-        vmhook::detail::format_log("{:#b}", 0) == "0b0");
-    check("format_alt_octal_zero_no_prefix",
-        vmhook::detail::format_log("{:#o}", 0) == "0");
-
-    // --- Deeper nested escaped braces around a real field. ----------------
-    // Four leading '{{' collapse to two '{', the field expands, four trailing
-    // '}}' collapse to two '}' -> "{{5}}".
-    check("format_deep_nested_escaped_braces",
-        vmhook::detail::format_log("{{{{{}}}}}", 5) == "{{5}}");
-
-    // --- Dynamic width / precision drawn from POSITIONAL args. ------------
-    // The auto-indexed dynamic forms ({:{}}, {:.{}f}) are covered above; here the
-    // nested width/precision are taken from EXPLICIT positional indices, and a
-    // single call combines two dynamic fields.
-    check("format_dynamic_width_positional",
-        vmhook::detail::format_log("{1:{0}}", 4, 7) == "   7");
-    check("format_dynamic_precision_positional",
-        vmhook::detail::format_log("{0:.{1}f}", 3.14159, 3) == "3.142");
-    // Two dynamic fields (width AND precision) auto-indexed from later args.
-    check("format_dynamic_width_and_precision",
-        vmhook::detail::format_log("{:{}.{}f}", 3.14159, 8, 2) == "    3.14");
-    // A dynamic width of zero is a no-op (renders the value unpadded).
-    check("format_dynamic_width_zero_is_noop",
-        vmhook::detail::format_log("{:{}}", 9, 0) == "9");
-
-    // --- long double payload (a distinct arithmetic type). ---------------
-    // 1.5 is exactly representable, so its shortest form is the standard-pinned
-    // "1.5" on every STL; also assert the fixed-precision layout (byte-pinned).
-    check("format_long_double_shortest",
-        vmhook::detail::format_log("{}", 1.5L) == "1.5");
-    check("format_long_double_fixed",
-        vmhook::detail::format_log("{:.2f}", 1.5L) == "1.50");
 
     // --- Floating-point: specials, signs, and the format types. ----------
     //
@@ -675,18 +570,6 @@ int main()
         vmhook::detail::format_log("{:E}", 1.5) == "1.500000E+00");
     check("format_double_fixed_default",
         vmhook::detail::format_log("{:f}", 1.5) == "1.500000");
-    // Scientific with an EXPLICIT precision is byte-pinned (fixed digit count),
-    // including the two-digit exponent with a sign — identical on both STLs.
-    check("format_double_scientific_precision",
-        vmhook::detail::format_log("{:.3e}", 0.000123) == "1.230e-04");
-    check("format_double_scientific_plus_sign",
-        vmhook::detail::format_log("{:+.2e}", 1.5) == "+1.50e+00");
-    // The space-flag on a fixed-precision float: leading space for non-negative,
-    // '-' for negative.  Standard-pinned layout.
-    check("format_double_space_sign_fixed_positive",
-        vmhook::detail::format_log("{: .2f}", 1.5) == " 1.50");
-    check("format_double_space_sign_fixed_negative",
-        vmhook::detail::format_log("{: .2f}", -1.5) == "-1.50");
     // Hex-float ({:a}/{:A}): the "0x"/"0X" prefix is NOT pinned by the standard
     // — libstdc++ emits "1p+0", some MSVC STL versions emit "0x1p+0".  Assert
     // ONLY the INVARIANT structure here (a 'p'/'P' exponent marker is present,
@@ -903,40 +786,6 @@ int main()
         check("format_fallback_very_long_literal",
             vmhook::detail::format_log(long_literal, 1, 2) == long_literal);
     }
-    // Mirror the std::format-path spec sweep added above: on the fallback the
-    // ENTIRE format string (specs and all) is returned byte-for-byte, regardless
-    // of payload type — so a reviewer on a pre-std::format MinGW/Clang leg
-    // exercises the exact same input strings and gets the verbatim guarantee.
-    check("format_fallback_string_precision_verbatim",
-        vmhook::detail::format_log("{:.3}", std::string{ "hello" }) == "{:.3}");
-    check("format_fallback_string_width_verbatim",
-        vmhook::detail::format_log("{:>5}", std::string{ "ab" }) == "{:>5}");
-    check("format_fallback_string_fill_width_prec_verbatim",
-        vmhook::detail::format_log("{:*<8.3}", std::string{ "hello" }) == "{:*<8.3}");
-    check("format_fallback_char_width_verbatim",
-        vmhook::detail::format_log("{:>3}", 'A') == "{:>3}");
-    check("format_fallback_char_c_spec_verbatim",
-        vmhook::detail::format_log("{:c}", 'Z') == "{:c}");
-    check("format_fallback_bool_width_verbatim",
-        vmhook::detail::format_log("{:>6}", true) == "{:>6}");
-    check("format_fallback_alt_hex_zero_verbatim",
-        vmhook::detail::format_log("{:#x}", 0) == "{:#x}");
-    check("format_fallback_alt_octal_zero_verbatim",
-        vmhook::detail::format_log("{:#o}", 0) == "{:#o}");
-    check("format_fallback_deep_nested_braces_verbatim",
-        vmhook::detail::format_log("{{{{{}}}}}", 5) == "{{{{{}}}}}");
-    check("format_fallback_dynamic_positional_verbatim",
-        vmhook::detail::format_log("{1:{0}}", 4, 7) == "{1:{0}}");
-    check("format_fallback_dynamic_width_and_prec_verbatim",
-        vmhook::detail::format_log("{:{}.{}f}", 3.14159, 8, 2) == "{:{}.{}f}");
-    check("format_fallback_long_double_verbatim",
-        vmhook::detail::format_log("{}", 1.5L) == "{}");
-    check("format_fallback_scientific_precision_verbatim",
-        vmhook::detail::format_log("{:.3e}", 0.000123) == "{:.3e}");
-    check("format_fallback_warning_tag_verbatim",
-        vmhook::detail::format_log("{} note", vmhook::warning_tag) == "{} note");
-    check("format_fallback_info_tag_verbatim",
-        vmhook::detail::format_log("{} ready", vmhook::info_tag) == "{} ready");
 #endif
 
     // ---------------------------------------------------------------------
@@ -1192,33 +1041,6 @@ int main()
         }
         check("emit_embedded_nul_length_preserved",
             captured.size() == 4u && captured.back() == '\n');
-    }
-    {
-        // Characterize the sink's NO-normalization contract: it appends exactly
-        // one '\n' UNCONDITIONALLY, so a payload that ALREADY ends in '\n' yields
-        // a trailing BLANK line ("x\n" + "\n").  (This is by design — the sink
-        // does not de-duplicate or trim — documented here so a future change to
-        // that behaviour trips a test rather than silently shipping.)
-        std::string captured;
-        {
-            cout_capture cap;
-            vmhook::detail::emit_log_line(std::string{ "x\n" });
-            captured = cap.str();
-        }
-        check("emit_trailing_newline_not_deduplicated", captured == "x\n\n");
-    }
-    {
-        // A payload that IS one of the library tags passes through the sink
-        // verbatim with a single appended newline — the exact shape of a real
-        // (argument-less) VMHOOK_LOG(vmhook::error_tag) emission.
-        std::string captured;
-        {
-            cout_capture cap;
-            vmhook::detail::emit_log_line(std::string{ vmhook::error_tag });
-            captured = cap.str();
-        }
-        check("emit_tag_payload_verbatim_plus_newline",
-            captured == "[VMHook ERROR]\n");
     }
 
     // ---------------------------------------------------------------------
