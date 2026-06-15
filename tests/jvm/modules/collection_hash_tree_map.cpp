@@ -359,8 +359,13 @@ namespace
 
     auto run_checks(vmhook_test::context& ctx) -> void
     {
+        // ─── #28-DIAG (java24 hang localization; remove once root-caused) ────
+        ctx.record("[INFO] htm DIAG A: run_checks entered; calling find_class");
         // ─── ENTRY GUARD ────────────────────────────────────────────────────
-        if (vmhook::find_class(FIXTURE) == nullptr)
+        const auto fixture_klass{ vmhook::find_class(FIXTURE) };
+        ctx.record(std::string{ "[INFO] htm DIAG B: find_class returned " }
+                   + (fixture_klass ? "non-null" : "null"));
+        if (fixture_klass == nullptr)
         {
             ctx.record("[INFO] collection_hash_tree_map: HashTreeMap not loaded/resolvable "
                        "on this run; skipping the module's live checks (no crash, no hooks).");
@@ -372,6 +377,7 @@ namespace
         vmhook::register_class<integer_box>("java/lang/Integer");
         vmhook::register_class<long_box>("java/lang/Long");
         vmhook::register_class<enum_key>("java/lang/Enum");
+        ctx.record("[INFO] htm DIAG C: 5x register_class done");
 
         // =====================================================================
         //  0. Resolution / shape.
@@ -401,7 +407,9 @@ namespace
         // =====================================================================
         //  2. Build + Java witnesses (drive mode 0 for a fresh same-thread snapshot).
         // =====================================================================
+        ctx.record("[INFO] htm DIAG D: pre-drive(0) build snapshot");
         ctx.check("htm_build_probe_completed", drive(ctx, 0));
+        ctx.record("[INFO] htm DIAG E: drive(0) returned");
         ctx.check("htm_java_hashMapSize_is_3", htm::j_size("hashMapSize") == 3);
         ctx.check("htm_java_treeMapSize_is_3", htm::j_size("treeMapSize") == 3);
         ctx.check("htm_java_treeFirstKey_is_t0", htm::j_string("treeFirstKey") == "t0");
