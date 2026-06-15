@@ -1,0 +1,31 @@
+schema_version: 1
+slug: deoptimize_methods
+title: Deoptimize Methods
+category: deopt
+status: seeded
+risk: medium
+specialist: .claude/agents/deoptimize_methods-specialist.md
+description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
+  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
+  in ~200 tokens.'
+java_versions:
+- 8
+- 11
+- 17
+- 21
+- 24
+- 25
+- 26
+tags: []
+hpp_anchors: []
+test_modules:
+- tests/jvm/modules/deoptimize_methods.cpp
+depends_on:
+- method_enumeration
+- adapter_recovery_c2i
+- method_entry_points_i2i_i2c
+related: []
+audit_docs: []
+known_bugs: []
+notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
+  for the field reference.

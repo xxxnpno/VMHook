@@ -1,0 +1,45 @@
+# Annotated example manifest — DO NOT load this file as a real feature.
+# It exists for reference and is excluded from generate/validate by name.
+#
+# Copy the shape and rename to <slug>.yaml.
+
+schema_version: 1
+slug: example_feature
+title: "Example Feature"
+category: infra
+status: seeded
+risk: medium
+specialist: .claude/agents/example_feature-specialist.md
+description: |
+  One-paragraph summary of what this feature does, what its input
+  and output contract is, and what makes it surprising.  Aim for
+  ~3-5 sentences; a spawned specialist reads this first.
+java_versions: [8, 11, 17, 21, 24, 25, 26]
+tags: [example, infra]
+hpp_anchors:
+  - symbol: vmhook::example_routine
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [1234, 1456]
+    note: "main entry point"
+  - symbol: detail::example_helper
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [1500, 1520]
+test_modules:
+  - tests/jvm/modules/example_feature.cpp
+  - tests/test_example_feature.cpp
+depends_on:
+  - wrapper_pattern
+  - vmstructs_offset_resolution
+related:
+  - some_other_feature
+audit_docs:
+  - audit/findings/example_feature.md
+known_bugs:
+  - severity: high
+    note: "Race window between install and verify_repair on JDK21+."
+    ref: "audit/LIBRARY_BUGS.md#example-1"
+  - severity: low
+    note: "Logging uses %s for a const char* that may be null on Linux."
+notes: |
+  Free-form notes — anything that does not fit cleanly above.
+  Multi-line is fine; keep it tight.

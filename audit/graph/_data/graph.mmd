@@ -1,0 +1,295 @@
+flowchart LR
+  subgraph bootstrap["Bootstrap / DLL entry"]
+    dllmain_bootstrap([dllmain_bootstrap])
+  end
+  subgraph hook["Hooking machinery (install / dispatch / trampolines)"]
+    adapter_recovery_c2i([adapter_recovery_c2i])
+    dont_inline_dont_compile([dont_inline_dont_compile])
+    hook_basic([hook_basic])
+    hook_chaining([hook_chaining])
+    hook_common_detour_dispatch([hook_common_detour_dispatch])
+    hook_install_after_jit([hook_install_after_jit])
+    hook_reinstall_after_shutdown([hook_reinstall_after_shutdown])
+    hook_signature([hook_signature])
+    hook_unhook_double_free([hook_unhook_double_free])
+    hook_verify_repair([hook_verify_repair])
+    method_entry_points_i2i_i2c([method_entry_points_i2i_i2c])
+    midi2i_trampoline_alloc([midi2i_trampoline_alloc])
+    seh_invoke_detour([seh_invoke_detour])
+  end
+  subgraph deopt["De-optimisation"]
+    deoptimize_methods([deoptimize_methods])
+  end
+  subgraph klass["Class / Klass introspection"]
+    classloader_reanchor([classloader_reanchor])
+    compressed_klass_decode([compressed_klass_decode])
+    compressed_oops_decode([compressed_oops_decode])
+    const_method_bounds([const_method_bounds])
+    constantpool_access([constantpool_access])
+    decode_oop_and_pointers([decode_oop_and_pointers])
+    find_class_context_loader([find_class_context_loader])
+    find_class_fallback([find_class_fallback])
+    instanceklass_methods_walk([instanceklass_methods_walk])
+    interface_polymorphism([interface_polymorphism])
+    klass_introspection([klass_introspection])
+    nested_classes([nested_classes])
+    poly_inherited_oop([poly_inherited_oop])
+    register_class([register_class])
+    vmstructs_offset_resolution([vmstructs_offset_resolution])
+  end
+  subgraph method["Method proxies (resolve / call / dispatch)"]
+    find_methods_by_signature([find_methods_by_signature])
+    method_call_jni_fallback([method_call_jni_fallback])
+    method_call_object([method_call_object])
+    method_call_primitives([method_call_primitives])
+    method_call_return_void([method_call_return_void])
+    method_call_string([method_call_string])
+    method_call_wide_args([method_call_wide_args])
+    method_enumeration([method_enumeration])
+    method_explicit_signature([method_explicit_signature])
+    method_flags_width([method_flags_width])
+    method_is_reference([method_is_reference])
+    method_overload([method_overload])
+    method_overload_java_dispatch([method_overload_java_dispatch])
+    method_proxy_value_t([method_proxy_value_t])
+    method_return_types([method_return_types])
+    method_static([method_static])
+    method_static_portability([method_static_portability])
+    method_throwing_call_site([method_throwing_call_site])
+    signature_parsing([signature_parsing])
+  end
+  subgraph field["Field proxies (get / set / introspection)"]
+    field_arrays_object([field_arrays_object])
+    field_arrays_primitive([field_arrays_primitive])
+    field_inherited([field_inherited])
+    field_introspection([field_introspection])
+    field_null_safety([field_null_safety])
+    field_object_ref([field_object_ref])
+    field_primitives_get([field_primitives_get])
+    field_primitives_set([field_primitives_set])
+    field_proxy_set_guards([field_proxy_set_guards])
+    field_proxy_value_t([field_proxy_value_t])
+    field_set_size_guard([field_set_size_guard])
+    field_static([field_static])
+    field_string([field_string])
+    watch_static_field([watch_static_field])
+  end
+  subgraph collection["Collection wrappers + element helpers"]
+    array_element_helpers([array_element_helpers])
+    collection_hash_tree_map([collection_hash_tree_map])
+    collection_iteration_safety([collection_iteration_safety])
+    collection_linked_list([collection_linked_list])
+    collection_list([collection_list])
+    collection_map([collection_map])
+    collection_set([collection_set])
+    collection_type_tags([collection_type_tags])
+  end
+  subgraph return["return_value (detour-side return manipulation)"]
+    interpreter_frame_walk([interpreter_frame_walk])
+    return_caller([return_caller])
+    return_frame_raw_access([return_frame_raw_access])
+    return_set_arg([return_set_arg])
+    return_set_primitives([return_set_primitives])
+    return_set_wrapper_null([return_set_wrapper_null])
+    return_stack_trace_depth([return_stack_trace_depth])
+    return_value_cancel([return_value_cancel])
+  end
+  subgraph jni["JNI plumbing (arg packing / refs / java values)"]
+    global_ref([global_ref])
+    jni_arg_packing([jni_arg_packing])
+    jni_local_ref_hygiene([jni_local_ref_hygiene])
+    make_java_array([make_java_array])
+    make_java_string([make_java_string])
+    read_java_string([read_java_string])
+  end
+  subgraph enumeration["Live-VM enumeration (heap / classes / threads)"]
+    for_each_instance([for_each_instance])
+    for_each_loaded_class([for_each_loaded_class])
+    for_each_thread([for_each_thread])
+    iterate_entries_safety([iterate_entries_safety])
+  end
+  subgraph os["OS abstraction (memory / signals / breakpoints)"]
+    hw_breakpoint_dr7([hw_breakpoint_dr7])
+    os_allocate_release([os_allocate_release])
+    os_page_size_granularity([os_page_size_granularity])
+    os_protect([os_protect])
+    os_query_region([os_query_region])
+    os_safe_read([os_safe_read])
+    os_signal_handler([os_signal_handler])
+  end
+  subgraph lifecycle["Lifecycle hooks (shutdown / class-load / exception / enum)"]
+    enum_singleton([enum_singleton])
+    on_class_loaded([on_class_loaded])
+    on_exception([on_exception])
+    shutdown_hooks_teardown([shutdown_hooks_teardown])
+  end
+  subgraph infra["Infrastructure (wrappers, traits, macros, logging)"]
+    api_surface_no_jvm([api_surface_no_jvm])
+    decode_u5_unsigned5([decode_u5_unsigned5])
+    logging_format([logging_format])
+    make_unique([make_unique])
+    platform_capability_macros([platform_capability_macros])
+    traits_function_traits([traits_function_traits])
+    unified_call_syntax([unified_call_syntax])
+    version_macros([version_macros])
+    wrapper_pattern([wrapper_pattern])
+  end
+  adapter_recovery_c2i --> method_entry_points_i2i_i2c
+  adapter_recovery_c2i --> vmstructs_offset_resolution
+  classloader_reanchor --> find_class_fallback
+  collection_hash_tree_map --> collection_map
+  collection_hash_tree_map --> collection_iteration_safety
+  collection_iteration_safety --> collection_list
+  collection_iteration_safety --> collection_set
+  collection_iteration_safety --> collection_map
+  collection_linked_list --> collection_list
+  collection_linked_list --> collection_iteration_safety
+  collection_list --> collection_type_tags
+  collection_list --> array_element_helpers
+  collection_list --> wrapper_pattern
+  collection_map --> collection_type_tags
+  collection_map --> wrapper_pattern
+  collection_set --> collection_type_tags
+  collection_set --> wrapper_pattern
+  collection_type_tags --> klass_introspection
+  compressed_klass_decode --> vmstructs_offset_resolution
+  compressed_oops_decode --> vmstructs_offset_resolution
+  const_method_bounds --> constantpool_access
+  constantpool_access --> vmstructs_offset_resolution
+  decode_oop_and_pointers --> compressed_oops_decode
+  decode_oop_and_pointers --> os_safe_read
+  deoptimize_methods --> method_enumeration
+  deoptimize_methods --> adapter_recovery_c2i
+  deoptimize_methods --> method_entry_points_i2i_i2c
+  dont_inline_dont_compile --> method_flags_width
+  dont_inline_dont_compile --> hook_basic
+  enum_singleton --> wrapper_pattern
+  enum_singleton --> klass_introspection
+  field_arrays_object --> field_object_ref
+  field_arrays_object --> array_element_helpers
+  field_arrays_object --> wrapper_pattern
+  field_arrays_primitive --> field_primitives_get
+  field_arrays_primitive --> array_element_helpers
+  field_inherited --> field_introspection
+  field_inherited --> klass_introspection
+  field_introspection --> constantpool_access
+  field_introspection --> vmstructs_offset_resolution
+  field_null_safety --> field_introspection
+  field_object_ref --> wrapper_pattern
+  field_object_ref --> compressed_oops_decode
+  field_primitives_get --> field_introspection
+  field_primitives_get --> field_proxy_value_t
+  field_primitives_set --> field_proxy_set_guards
+  field_primitives_set --> field_proxy_value_t
+  field_proxy_set_guards --> field_set_size_guard
+  field_proxy_set_guards --> field_proxy_value_t
+  field_proxy_value_t --> field_introspection
+  field_set_size_guard --> field_proxy_value_t
+  field_static --> field_introspection
+  field_string --> field_object_ref
+  field_string --> read_java_string
+  field_string --> make_java_string
+  find_class_context_loader --> find_class_fallback
+  find_class_fallback --> vmstructs_offset_resolution
+  find_class_fallback --> klass_introspection
+  find_methods_by_signature --> signature_parsing
+  find_methods_by_signature --> method_enumeration
+  for_each_instance --> klass_introspection
+  for_each_instance --> iterate_entries_safety
+  for_each_loaded_class --> iterate_entries_safety
+  for_each_loaded_class --> klass_introspection
+  for_each_thread --> iterate_entries_safety
+  global_ref --> jni_local_ref_hygiene
+  hook_basic --> midi2i_trampoline_alloc
+  hook_basic --> hook_common_detour_dispatch
+  hook_basic --> method_entry_points_i2i_i2c
+  hook_basic --> find_class_fallback
+  hook_basic --> klass_introspection
+  hook_basic --> decode_oop_and_pointers
+  hook_basic --> interpreter_frame_walk
+  hook_basic --> signature_parsing
+  hook_chaining --> hook_basic
+  hook_chaining --> midi2i_trampoline_alloc
+  hook_chaining --> hook_common_detour_dispatch
+  hook_common_detour_dispatch --> seh_invoke_detour
+  hook_common_detour_dispatch --> interpreter_frame_walk
+  hook_common_detour_dispatch --> method_entry_points_i2i_i2c
+  hook_install_after_jit --> hook_basic
+  hook_install_after_jit --> deoptimize_methods
+  hook_install_after_jit --> method_entry_points_i2i_i2c
+  hook_install_after_jit --> adapter_recovery_c2i
+  hook_reinstall_after_shutdown --> shutdown_hooks_teardown
+  hook_reinstall_after_shutdown --> hook_basic
+  hook_signature --> hook_basic
+  hook_signature --> signature_parsing
+  hook_signature --> method_explicit_signature
+  hook_unhook_double_free --> hook_basic
+  hook_unhook_double_free --> shutdown_hooks_teardown
+  hook_verify_repair --> hook_basic
+  hook_verify_repair --> midi2i_trampoline_alloc
+  instanceklass_methods_walk --> vmstructs_offset_resolution
+  interface_polymorphism --> klass_introspection
+  interface_polymorphism --> method_overload
+  jni_arg_packing --> signature_parsing
+  klass_introspection --> vmstructs_offset_resolution
+  klass_introspection --> instanceklass_methods_walk
+  klass_introspection --> compressed_klass_decode
+  make_java_array --> jni_arg_packing
+  make_java_string --> jni_local_ref_hygiene
+  make_unique --> wrapper_pattern
+  method_call_jni_fallback --> method_call_primitives
+  method_call_jni_fallback --> jni_arg_packing
+  method_call_jni_fallback --> jni_local_ref_hygiene
+  method_call_object --> method_call_primitives
+  method_call_object --> wrapper_pattern
+  method_call_primitives --> method_proxy_value_t
+  method_call_primitives --> method_enumeration
+  method_call_return_void --> method_call_primitives
+  method_call_string --> method_call_primitives
+  method_call_string --> make_java_string
+  method_call_string --> read_java_string
+  method_call_wide_args --> method_call_primitives
+  method_call_wide_args --> jni_arg_packing
+  method_entry_points_i2i_i2c --> vmstructs_offset_resolution
+  method_enumeration --> instanceklass_methods_walk
+  method_explicit_signature --> signature_parsing
+  method_explicit_signature --> method_enumeration
+  method_flags_width --> vmstructs_offset_resolution
+  method_is_reference --> signature_parsing
+  method_overload --> signature_parsing
+  method_overload --> method_explicit_signature
+  method_overload_java_dispatch --> method_overload
+  method_proxy_value_t --> wrapper_pattern
+  method_return_types --> method_call_primitives
+  method_static --> method_call_primitives
+  method_static_portability --> method_static
+  method_throwing_call_site --> method_call_primitives
+  method_throwing_call_site --> on_exception
+  midi2i_trampoline_alloc --> os_allocate_release
+  midi2i_trampoline_alloc --> os_protect
+  midi2i_trampoline_alloc --> os_query_region
+  midi2i_trampoline_alloc --> os_page_size_granularity
+  nested_classes --> klass_introspection
+  on_class_loaded --> hook_basic
+  on_exception --> hook_basic
+  os_safe_read --> os_signal_handler
+  poly_inherited_oop --> klass_introspection
+  poly_inherited_oop --> field_inherited
+  read_java_string --> compressed_oops_decode
+  register_class --> wrapper_pattern
+  register_class --> find_class_fallback
+  return_caller --> interpreter_frame_walk
+  return_frame_raw_access --> interpreter_frame_walk
+  return_set_arg --> interpreter_frame_walk
+  return_set_primitives --> interpreter_frame_walk
+  return_set_wrapper_null --> interpreter_frame_walk
+  return_set_wrapper_null --> wrapper_pattern
+  return_stack_trace_depth --> interpreter_frame_walk
+  return_stack_trace_depth --> return_caller
+  return_value_cancel --> interpreter_frame_walk
+  seh_invoke_detour --> os_signal_handler
+  shutdown_hooks_teardown --> hook_basic
+  unified_call_syntax --> method_overload
+  vmstructs_offset_resolution --> os_safe_read
+  watch_static_field --> field_static
+  watch_static_field --> hw_breakpoint_dr7

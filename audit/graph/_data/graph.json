@@ -1,0 +1,3882 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-06-15T21:12:32Z",
+  "feature_count": 109,
+  "edge_count": 166,
+  "categories": [
+    {
+      "slug": "bootstrap",
+      "title": "Bootstrap / DLL entry",
+      "features": [
+        "dllmain_bootstrap"
+      ]
+    },
+    {
+      "slug": "hook",
+      "title": "Hooking machinery (install / dispatch / trampolines)",
+      "features": [
+        "adapter_recovery_c2i",
+        "dont_inline_dont_compile",
+        "hook_basic",
+        "hook_chaining",
+        "hook_common_detour_dispatch",
+        "hook_install_after_jit",
+        "hook_reinstall_after_shutdown",
+        "hook_signature",
+        "hook_unhook_double_free",
+        "hook_verify_repair",
+        "method_entry_points_i2i_i2c",
+        "midi2i_trampoline_alloc",
+        "seh_invoke_detour"
+      ]
+    },
+    {
+      "slug": "deopt",
+      "title": "De-optimisation",
+      "features": [
+        "deoptimize_methods"
+      ]
+    },
+    {
+      "slug": "klass",
+      "title": "Class / Klass introspection",
+      "features": [
+        "classloader_reanchor",
+        "compressed_klass_decode",
+        "compressed_oops_decode",
+        "const_method_bounds",
+        "constantpool_access",
+        "decode_oop_and_pointers",
+        "find_class_context_loader",
+        "find_class_fallback",
+        "instanceklass_methods_walk",
+        "interface_polymorphism",
+        "klass_introspection",
+        "nested_classes",
+        "poly_inherited_oop",
+        "register_class",
+        "vmstructs_offset_resolution"
+      ]
+    },
+    {
+      "slug": "method",
+      "title": "Method proxies (resolve / call / dispatch)",
+      "features": [
+        "find_methods_by_signature",
+        "method_call_jni_fallback",
+        "method_call_object",
+        "method_call_primitives",
+        "method_call_return_void",
+        "method_call_string",
+        "method_call_wide_args",
+        "method_enumeration",
+        "method_explicit_signature",
+        "method_flags_width",
+        "method_is_reference",
+        "method_overload",
+        "method_overload_java_dispatch",
+        "method_proxy_value_t",
+        "method_return_types",
+        "method_static",
+        "method_static_portability",
+        "method_throwing_call_site",
+        "signature_parsing"
+      ]
+    },
+    {
+      "slug": "field",
+      "title": "Field proxies (get / set / introspection)",
+      "features": [
+        "field_arrays_object",
+        "field_arrays_primitive",
+        "field_inherited",
+        "field_introspection",
+        "field_null_safety",
+        "field_object_ref",
+        "field_primitives_get",
+        "field_primitives_set",
+        "field_proxy_set_guards",
+        "field_proxy_value_t",
+        "field_set_size_guard",
+        "field_static",
+        "field_string",
+        "watch_static_field"
+      ]
+    },
+    {
+      "slug": "collection",
+      "title": "Collection wrappers + element helpers",
+      "features": [
+        "array_element_helpers",
+        "collection_hash_tree_map",
+        "collection_iteration_safety",
+        "collection_linked_list",
+        "collection_list",
+        "collection_map",
+        "collection_set",
+        "collection_type_tags"
+      ]
+    },
+    {
+      "slug": "return",
+      "title": "return_value (detour-side return manipulation)",
+      "features": [
+        "interpreter_frame_walk",
+        "return_caller",
+        "return_frame_raw_access",
+        "return_set_arg",
+        "return_set_primitives",
+        "return_set_wrapper_null",
+        "return_stack_trace_depth",
+        "return_value_cancel"
+      ]
+    },
+    {
+      "slug": "jni",
+      "title": "JNI plumbing (arg packing / refs / java values)",
+      "features": [
+        "global_ref",
+        "jni_arg_packing",
+        "jni_local_ref_hygiene",
+        "make_java_array",
+        "make_java_string",
+        "read_java_string"
+      ]
+    },
+    {
+      "slug": "enumeration",
+      "title": "Live-VM enumeration (heap / classes / threads)",
+      "features": [
+        "for_each_instance",
+        "for_each_loaded_class",
+        "for_each_thread",
+        "iterate_entries_safety"
+      ]
+    },
+    {
+      "slug": "os",
+      "title": "OS abstraction (memory / signals / breakpoints)",
+      "features": [
+        "hw_breakpoint_dr7",
+        "os_allocate_release",
+        "os_page_size_granularity",
+        "os_protect",
+        "os_query_region",
+        "os_safe_read",
+        "os_signal_handler"
+      ]
+    },
+    {
+      "slug": "lifecycle",
+      "title": "Lifecycle hooks (shutdown / class-load / exception / enum)",
+      "features": [
+        "enum_singleton",
+        "on_class_loaded",
+        "on_exception",
+        "shutdown_hooks_teardown"
+      ]
+    },
+    {
+      "slug": "infra",
+      "title": "Infrastructure (wrappers, traits, macros, logging)",
+      "features": [
+        "api_surface_no_jvm",
+        "decode_u5_unsigned5",
+        "logging_format",
+        "make_unique",
+        "platform_capability_macros",
+        "traits_function_traits",
+        "unified_call_syntax",
+        "version_macros",
+        "wrapper_pattern"
+      ]
+    }
+  ],
+  "features": [
+    {
+      "slug": "adapter_recovery_c2i",
+      "title": "Adapter Recovery C2I",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/adapter_recovery_c2i-specialist.md",
+      "depends_on": [
+        "method_entry_points_i2i_i2c",
+        "vmstructs_offset_resolution"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "api_surface_no_jvm",
+      "title": "Api Surface No Jvm",
+      "category": "infra",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/api_surface_no_jvm-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "array_element_helpers",
+      "title": "Array Element Helpers",
+      "category": "collection",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/array_element_helpers-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_array_element_helpers.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "classloader_reanchor",
+      "title": "Classloader Reanchor",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/classloader_reanchor-specialist.md",
+      "depends_on": [
+        "find_class_fallback"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_classloader_reanchor.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "collection_hash_tree_map",
+      "title": "Collection Hash Tree Map",
+      "category": "collection",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/collection_hash_tree_map-specialist.md",
+      "depends_on": [
+        "collection_map",
+        "collection_iteration_safety"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/collection_hash_tree_map.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "collection_iteration_safety",
+      "title": "Collection Iteration Safety",
+      "category": "collection",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/collection_iteration_safety-specialist.md",
+      "depends_on": [
+        "collection_list",
+        "collection_set",
+        "collection_map"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/collection_iteration_safety.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "collection_linked_list",
+      "title": "Collection Linked List",
+      "category": "collection",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/collection_linked_list-specialist.md",
+      "depends_on": [
+        "collection_list",
+        "collection_iteration_safety"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/collection_linked_list.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "collection_list",
+      "title": "Collection List",
+      "category": "collection",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/collection_list-specialist.md",
+      "depends_on": [
+        "collection_type_tags",
+        "array_element_helpers",
+        "wrapper_pattern"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/collection_list.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "collection_map",
+      "title": "Collection Map",
+      "category": "collection",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/collection_map-specialist.md",
+      "depends_on": [
+        "collection_type_tags",
+        "wrapper_pattern"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/collection_map.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "collection_set",
+      "title": "Collection Set",
+      "category": "collection",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/collection_set-specialist.md",
+      "depends_on": [
+        "collection_type_tags",
+        "wrapper_pattern"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/collection_set.cpp",
+        "tests/jvm/modules/collection_set_exhaustive.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "collection_type_tags",
+      "title": "Collection Type Tags",
+      "category": "collection",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/collection_type_tags-specialist.md",
+      "depends_on": [
+        "klass_introspection"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_collection_type_tags.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "compressed_klass_decode",
+      "title": "Compressed Klass Decode",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/compressed_klass_decode-specialist.md",
+      "depends_on": [
+        "vmstructs_offset_resolution"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_compressed_klass_decode.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "compressed_oops_decode",
+      "title": "Compressed Oops Decode",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/compressed_oops_decode-specialist.md",
+      "depends_on": [
+        "vmstructs_offset_resolution"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/compressed_oops_decode.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "const_method_bounds",
+      "title": "Const Method Bounds",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/const_method_bounds-specialist.md",
+      "depends_on": [
+        "constantpool_access"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_const_method_bounds.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "constantpool_access",
+      "title": "Constantpool Access",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/constantpool_access-specialist.md",
+      "depends_on": [
+        "vmstructs_offset_resolution"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "decode_oop_and_pointers",
+      "title": "Decode Oop And Pointers",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/decode_oop_and_pointers-specialist.md",
+      "depends_on": [
+        "compressed_oops_decode",
+        "os_safe_read"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_decode_oop_and_pointers.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "decode_u5_unsigned5",
+      "title": "Decode U5 Unsigned5",
+      "category": "infra",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/decode_u5_unsigned5-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/decode_u5_unsigned5.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "deoptimize_methods",
+      "title": "Deoptimize Methods",
+      "category": "deopt",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/deoptimize_methods-specialist.md",
+      "depends_on": [
+        "method_enumeration",
+        "adapter_recovery_c2i",
+        "method_entry_points_i2i_i2c"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/deoptimize_methods.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "dllmain_bootstrap",
+      "title": "Dllmain Bootstrap",
+      "category": "bootstrap",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/dllmain_bootstrap-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "dont_inline_dont_compile",
+      "title": "Dont Inline Dont Compile",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/dont_inline_dont_compile-specialist.md",
+      "depends_on": [
+        "method_flags_width",
+        "hook_basic"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/dont_inline_dont_compile.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "enum_singleton",
+      "title": "Enum Singleton",
+      "category": "lifecycle",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/enum_singleton-specialist.md",
+      "depends_on": [
+        "wrapper_pattern",
+        "klass_introspection"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/enum_singleton.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_arrays_object",
+      "title": "Field Arrays Object",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_arrays_object-specialist.md",
+      "depends_on": [
+        "field_object_ref",
+        "array_element_helpers",
+        "wrapper_pattern"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_arrays_object.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_arrays_primitive",
+      "title": "Field Arrays Primitive",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_arrays_primitive-specialist.md",
+      "depends_on": [
+        "field_primitives_get",
+        "array_element_helpers"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_arrays_primitive.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_inherited",
+      "title": "Field Inherited",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_inherited-specialist.md",
+      "depends_on": [
+        "field_introspection",
+        "klass_introspection"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_inherited.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_introspection",
+      "title": "Field Introspection",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_introspection-specialist.md",
+      "depends_on": [
+        "constantpool_access",
+        "vmstructs_offset_resolution"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_introspection.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_null_safety",
+      "title": "Field Null Safety",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_null_safety-specialist.md",
+      "depends_on": [
+        "field_introspection"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_null_safety.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_object_ref",
+      "title": "Field Object Ref",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_object_ref-specialist.md",
+      "depends_on": [
+        "wrapper_pattern",
+        "compressed_oops_decode"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_object_ref.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_primitives_get",
+      "title": "Field Primitives Get",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_primitives_get-specialist.md",
+      "depends_on": [
+        "field_introspection",
+        "field_proxy_value_t"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_primitives_get.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_primitives_set",
+      "title": "Field Primitives Set",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_primitives_set-specialist.md",
+      "depends_on": [
+        "field_proxy_set_guards",
+        "field_proxy_value_t"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_primitives_set.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_proxy_set_guards",
+      "title": "Field Proxy Set Guards",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_proxy_set_guards-specialist.md",
+      "depends_on": [
+        "field_set_size_guard",
+        "field_proxy_value_t"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_field_proxy_set_guards.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_proxy_value_t",
+      "title": "Field Proxy Value T",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_proxy_value_t-specialist.md",
+      "depends_on": [
+        "field_introspection"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_set_size_guard",
+      "title": "Field Set Size Guard",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_set_size_guard-specialist.md",
+      "depends_on": [
+        "field_proxy_value_t"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_set_size_guard.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_static",
+      "title": "Field Static",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_static-specialist.md",
+      "depends_on": [
+        "field_introspection"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_static.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "field_string",
+      "title": "Field String",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/field_string-specialist.md",
+      "depends_on": [
+        "field_object_ref",
+        "read_java_string",
+        "make_java_string"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/field_string.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "find_class_context_loader",
+      "title": "Find Class Context Loader",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/find_class_context_loader-specialist.md",
+      "depends_on": [
+        "find_class_fallback"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/find_class_context_loader.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "find_class_fallback",
+      "title": "Find Class Fallback",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/find_class_fallback-specialist.md",
+      "depends_on": [
+        "vmstructs_offset_resolution",
+        "klass_introspection"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/find_class_fallback.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "find_methods_by_signature",
+      "title": "Find Methods By Signature",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/find_methods_by_signature-specialist.md",
+      "depends_on": [
+        "signature_parsing",
+        "method_enumeration"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/find_methods_by_signature.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "for_each_instance",
+      "title": "For Each Instance",
+      "category": "enumeration",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/for_each_instance-specialist.md",
+      "depends_on": [
+        "klass_introspection",
+        "iterate_entries_safety"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/for_each_instance.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "for_each_loaded_class",
+      "title": "For Each Loaded Class",
+      "category": "enumeration",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/for_each_loaded_class-specialist.md",
+      "depends_on": [
+        "iterate_entries_safety",
+        "klass_introspection"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/for_each_loaded_class.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "for_each_thread",
+      "title": "For Each Thread",
+      "category": "enumeration",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/for_each_thread-specialist.md",
+      "depends_on": [
+        "iterate_entries_safety"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/for_each_thread.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "global_ref",
+      "title": "Global Ref",
+      "category": "jni",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/global_ref-specialist.md",
+      "depends_on": [
+        "jni_local_ref_hygiene"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/global_ref.cpp",
+        "tests/test_global_ref.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "hook_basic",
+      "title": "Hook Install (basic)",
+      "category": "hook",
+      "status": "in_progress",
+      "risk": "critical",
+      "specialist": ".claude/agents/hook_basic-specialist.md",
+      "depends_on": [
+        "midi2i_trampoline_alloc",
+        "hook_common_detour_dispatch",
+        "method_entry_points_i2i_i2c",
+        "find_class_fallback",
+        "klass_introspection",
+        "decode_oop_and_pointers",
+        "interpreter_frame_walk",
+        "signature_parsing"
+      ],
+      "related": [
+        "hook_chaining",
+        "hook_signature",
+        "hook_install_after_jit",
+        "hook_verify_repair",
+        "dont_inline_dont_compile",
+        "return_value_cancel",
+        "return_set_primitives"
+      ],
+      "tags": [
+        "hook",
+        "runtime",
+        "x86_64",
+        "install"
+      ],
+      "test_modules": [
+        "tests/jvm/modules/hook_basic.cpp"
+      ],
+      "audit_docs": [
+        "audit/findings/hook_basic_install.md"
+      ],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "hook_chaining",
+      "title": "Hook Chaining",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/hook_chaining-specialist.md",
+      "depends_on": [
+        "hook_basic",
+        "midi2i_trampoline_alloc",
+        "hook_common_detour_dispatch"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/hook_chaining.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "hook_common_detour_dispatch",
+      "title": "Hook Common Detour Dispatch",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/hook_common_detour_dispatch-specialist.md",
+      "depends_on": [
+        "seh_invoke_detour",
+        "interpreter_frame_walk",
+        "method_entry_points_i2i_i2c"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "hook_install_after_jit",
+      "title": "Hook Install After Jit",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/hook_install_after_jit-specialist.md",
+      "depends_on": [
+        "hook_basic",
+        "deoptimize_methods",
+        "method_entry_points_i2i_i2c",
+        "adapter_recovery_c2i"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/hook_install_after_jit.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "hook_reinstall_after_shutdown",
+      "title": "Hook Reinstall After Shutdown",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/hook_reinstall_after_shutdown-specialist.md",
+      "depends_on": [
+        "shutdown_hooks_teardown",
+        "hook_basic"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/hook_reinstall_after_shutdown.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "hook_signature",
+      "title": "Hook Signature",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/hook_signature-specialist.md",
+      "depends_on": [
+        "hook_basic",
+        "signature_parsing",
+        "method_explicit_signature"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/hook_signature.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "hook_unhook_double_free",
+      "title": "Hook Unhook Double Free",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/hook_unhook_double_free-specialist.md",
+      "depends_on": [
+        "hook_basic",
+        "shutdown_hooks_teardown"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/hook_unhook_double_free.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "hook_verify_repair",
+      "title": "Hook Verify Repair",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/hook_verify_repair-specialist.md",
+      "depends_on": [
+        "hook_basic",
+        "midi2i_trampoline_alloc"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/hook_verify_repair.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "hw_breakpoint_dr7",
+      "title": "Hw Breakpoint Dr7",
+      "category": "os",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/hw_breakpoint_dr7-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "instanceklass_methods_walk",
+      "title": "Instanceklass Methods Walk",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/instanceklass_methods_walk-specialist.md",
+      "depends_on": [
+        "vmstructs_offset_resolution"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/instanceklass_methods_walk.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "interface_polymorphism",
+      "title": "Interface Polymorphism",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/interface_polymorphism-specialist.md",
+      "depends_on": [
+        "klass_introspection",
+        "method_overload"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/interface_polymorphism.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "interpreter_frame_walk",
+      "title": "Interpreter Frame Walk",
+      "category": "return",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/interpreter_frame_walk-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "iterate_entries_safety",
+      "title": "Iterate Entries Safety",
+      "category": "enumeration",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/iterate_entries_safety-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_iterate_entries_safety.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "jni_arg_packing",
+      "title": "Jni Arg Packing",
+      "category": "jni",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/jni_arg_packing-specialist.md",
+      "depends_on": [
+        "signature_parsing"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_jni_arg_packing.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "jni_local_ref_hygiene",
+      "title": "Jni Local Ref Hygiene",
+      "category": "jni",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/jni_local_ref_hygiene-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/jni_local_ref_hygiene.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "klass_introspection",
+      "title": "Klass Introspection",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/klass_introspection-specialist.md",
+      "depends_on": [
+        "vmstructs_offset_resolution",
+        "instanceklass_methods_walk",
+        "compressed_klass_decode"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/klass_introspection.cpp",
+        "tests/jvm/modules/klass_introspection_shapes.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "logging_format",
+      "title": "Logging Format",
+      "category": "infra",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/logging_format-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_logging_format.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "make_java_array",
+      "title": "Make Java Array",
+      "category": "jni",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/make_java_array-specialist.md",
+      "depends_on": [
+        "jni_arg_packing"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/make_java_array.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "make_java_string",
+      "title": "Make Java String",
+      "category": "jni",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/make_java_string-specialist.md",
+      "depends_on": [
+        "jni_local_ref_hygiene"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/make_java_string.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "make_unique",
+      "title": "Make Unique",
+      "category": "infra",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/make_unique-specialist.md",
+      "depends_on": [
+        "wrapper_pattern"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/make_unique.cpp",
+        "tests/test_make_unique.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_call_jni_fallback",
+      "title": "Method Call Jni Fallback",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_call_jni_fallback-specialist.md",
+      "depends_on": [
+        "method_call_primitives",
+        "jni_arg_packing",
+        "jni_local_ref_hygiene"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_call_jni_fallback.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_call_object",
+      "title": "Method Call Object",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_call_object-specialist.md",
+      "depends_on": [
+        "method_call_primitives",
+        "wrapper_pattern"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_call_object.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_call_primitives",
+      "title": "Method Call Primitives",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_call_primitives-specialist.md",
+      "depends_on": [
+        "method_proxy_value_t",
+        "method_enumeration"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_call_primitives.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_call_return_void",
+      "title": "Method Call Return Void",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_call_return_void-specialist.md",
+      "depends_on": [
+        "method_call_primitives"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_call_return_void.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_call_string",
+      "title": "Method Call String",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_call_string-specialist.md",
+      "depends_on": [
+        "method_call_primitives",
+        "make_java_string",
+        "read_java_string"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_call_string.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_call_wide_args",
+      "title": "Method Call Wide Args",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_call_wide_args-specialist.md",
+      "depends_on": [
+        "method_call_primitives",
+        "jni_arg_packing"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_call_wide_args.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_entry_points_i2i_i2c",
+      "title": "Method Entry Points I2I I2C",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_entry_points_i2i_i2c-specialist.md",
+      "depends_on": [
+        "vmstructs_offset_resolution"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_enumeration",
+      "title": "Method Enumeration",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_enumeration-specialist.md",
+      "depends_on": [
+        "instanceklass_methods_walk"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_enumeration.cpp",
+        "tests/test_method_enumeration.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_explicit_signature",
+      "title": "Method Explicit Signature",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_explicit_signature-specialist.md",
+      "depends_on": [
+        "signature_parsing",
+        "method_enumeration"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_explicit_signature.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_flags_width",
+      "title": "Method Flags Width",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_flags_width-specialist.md",
+      "depends_on": [
+        "vmstructs_offset_resolution"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_method_flags_width.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_is_reference",
+      "title": "Method Is Reference",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_is_reference-specialist.md",
+      "depends_on": [
+        "signature_parsing"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_is_reference.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_overload",
+      "title": "Method Overload",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_overload-specialist.md",
+      "depends_on": [
+        "signature_parsing",
+        "method_explicit_signature"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_overload.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_overload_java_dispatch",
+      "title": "Method Overload Java Dispatch",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_overload_java_dispatch-specialist.md",
+      "depends_on": [
+        "method_overload"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_overload_java_dispatch.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_proxy_value_t",
+      "title": "Method Proxy Value T",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_proxy_value_t-specialist.md",
+      "depends_on": [
+        "wrapper_pattern"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_method_proxy_value_t.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_return_types",
+      "title": "Method Return Types",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_return_types-specialist.md",
+      "depends_on": [
+        "method_call_primitives"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_return_types.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_static",
+      "title": "Method Static",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_static-specialist.md",
+      "depends_on": [
+        "method_call_primitives"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_static.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_static_portability",
+      "title": "Method Static Portability",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_static_portability-specialist.md",
+      "depends_on": [
+        "method_static"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_static_portability.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "method_throwing_call_site",
+      "title": "Method Throwing Call Site",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/method_throwing_call_site-specialist.md",
+      "depends_on": [
+        "method_call_primitives",
+        "on_exception"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/method_throwing_call_site.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "midi2i_trampoline_alloc",
+      "title": "Midi2I Trampoline Alloc",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/midi2i_trampoline_alloc-specialist.md",
+      "depends_on": [
+        "os_allocate_release",
+        "os_protect",
+        "os_query_region",
+        "os_page_size_granularity"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "nested_classes",
+      "title": "Nested Classes",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/nested_classes-specialist.md",
+      "depends_on": [
+        "klass_introspection"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/nested_classes.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "on_class_loaded",
+      "title": "On Class Loaded",
+      "category": "lifecycle",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/on_class_loaded-specialist.md",
+      "depends_on": [
+        "hook_basic"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/on_class_loaded.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "on_exception",
+      "title": "On Exception",
+      "category": "lifecycle",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/on_exception-specialist.md",
+      "depends_on": [
+        "hook_basic"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/on_exception.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "os_allocate_release",
+      "title": "Os Allocate Release",
+      "category": "os",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/os_allocate_release-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "os_page_size_granularity",
+      "title": "Os Page Size Granularity",
+      "category": "os",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/os_page_size_granularity-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_os_page_size_granularity.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "os_protect",
+      "title": "Os Protect",
+      "category": "os",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/os_protect-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "os_query_region",
+      "title": "Os Query Region",
+      "category": "os",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/os_query_region-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "os_safe_read",
+      "title": "Os Safe Read",
+      "category": "os",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/os_safe_read-specialist.md",
+      "depends_on": [
+        "os_signal_handler"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "os_signal_handler",
+      "title": "Os Signal Handler",
+      "category": "os",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/os_signal_handler-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "platform_capability_macros",
+      "title": "Platform Capability Macros",
+      "category": "infra",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/platform_capability_macros-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_platform_capability_macros.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "poly_inherited_oop",
+      "title": "Poly Inherited Oop",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/poly_inherited_oop-specialist.md",
+      "depends_on": [
+        "klass_introspection",
+        "field_inherited"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/poly_inherited_oop.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "read_java_string",
+      "title": "Read Java String",
+      "category": "jni",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/read_java_string-specialist.md",
+      "depends_on": [
+        "compressed_oops_decode"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/read_java_string.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "register_class",
+      "title": "Register Class",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/register_class-specialist.md",
+      "depends_on": [
+        "wrapper_pattern",
+        "find_class_fallback"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/register_class.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "return_caller",
+      "title": "Return Caller",
+      "category": "return",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/return_caller-specialist.md",
+      "depends_on": [
+        "interpreter_frame_walk"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/return_caller.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "return_frame_raw_access",
+      "title": "Return Frame Raw Access",
+      "category": "return",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/return_frame_raw_access-specialist.md",
+      "depends_on": [
+        "interpreter_frame_walk"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/return_frame_raw_access.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "return_set_arg",
+      "title": "Return Set Arg",
+      "category": "return",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/return_set_arg-specialist.md",
+      "depends_on": [
+        "interpreter_frame_walk"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/return_set_arg.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "return_set_primitives",
+      "title": "Return Set Primitives",
+      "category": "return",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/return_set_primitives-specialist.md",
+      "depends_on": [
+        "interpreter_frame_walk"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/return_set_primitives.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "return_set_wrapper_null",
+      "title": "Return Set Wrapper Null",
+      "category": "return",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/return_set_wrapper_null-specialist.md",
+      "depends_on": [
+        "interpreter_frame_walk",
+        "wrapper_pattern"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/return_set_wrapper_null.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "return_stack_trace_depth",
+      "title": "Return Stack Trace Depth",
+      "category": "return",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/return_stack_trace_depth-specialist.md",
+      "depends_on": [
+        "interpreter_frame_walk",
+        "return_caller"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/return_stack_trace_depth.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "return_value_cancel",
+      "title": "Return Value Cancel",
+      "category": "return",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/return_value_cancel-specialist.md",
+      "depends_on": [
+        "interpreter_frame_walk"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/return_value_cancel.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "seh_invoke_detour",
+      "title": "Seh Invoke Detour",
+      "category": "hook",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/seh_invoke_detour-specialist.md",
+      "depends_on": [
+        "os_signal_handler"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "shutdown_hooks_teardown",
+      "title": "Shutdown Hooks Teardown",
+      "category": "lifecycle",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/shutdown_hooks_teardown-specialist.md",
+      "depends_on": [
+        "hook_basic"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/shutdown_hooks_teardown.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "signature_parsing",
+      "title": "Signature Parsing",
+      "category": "method",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/signature_parsing-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/signature_parsing.cpp",
+        "tests/test_signature_parsing.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "traits_function_traits",
+      "title": "Traits Function Traits",
+      "category": "infra",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/traits_function_traits-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_traits_function_traits.cpp",
+        "tests/test_traits.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "unified_call_syntax",
+      "title": "Unified Call Syntax",
+      "category": "infra",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/unified_call_syntax-specialist.md",
+      "depends_on": [
+        "method_overload"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_unified_call_syntax.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "version_macros",
+      "title": "Version Macros",
+      "category": "infra",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/version_macros-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/test_version_macros.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "vmstructs_offset_resolution",
+      "title": "Vmstructs Offset Resolution",
+      "category": "klass",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/vmstructs_offset_resolution-specialist.md",
+      "depends_on": [
+        "os_safe_read"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "watch_static_field",
+      "title": "Watch Static Field",
+      "category": "field",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/watch_static_field-specialist.md",
+      "depends_on": [
+        "field_static",
+        "hw_breakpoint_dr7"
+      ],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/watch_static_field.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    },
+    {
+      "slug": "wrapper_pattern",
+      "title": "Wrapper Pattern",
+      "category": "infra",
+      "status": "seeded",
+      "risk": "medium",
+      "specialist": ".claude/agents/wrapper_pattern-specialist.md",
+      "depends_on": [],
+      "related": [],
+      "tags": [],
+      "test_modules": [
+        "tests/jvm/modules/wrapper_pattern.cpp"
+      ],
+      "audit_docs": [],
+      "java_versions": [
+        8,
+        11,
+        17,
+        21,
+        24,
+        25,
+        26
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "adapter_recovery_c2i",
+      "to": "method_entry_points_i2i_i2c",
+      "kind": "depends_on"
+    },
+    {
+      "from": "adapter_recovery_c2i",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "classloader_reanchor",
+      "to": "find_class_fallback",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_hash_tree_map",
+      "to": "collection_map",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_hash_tree_map",
+      "to": "collection_iteration_safety",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_iteration_safety",
+      "to": "collection_list",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_iteration_safety",
+      "to": "collection_set",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_iteration_safety",
+      "to": "collection_map",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_linked_list",
+      "to": "collection_list",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_linked_list",
+      "to": "collection_iteration_safety",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_list",
+      "to": "collection_type_tags",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_list",
+      "to": "array_element_helpers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_list",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_map",
+      "to": "collection_type_tags",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_map",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_set",
+      "to": "collection_type_tags",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_set",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_type_tags",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "compressed_klass_decode",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "compressed_oops_decode",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "const_method_bounds",
+      "to": "constantpool_access",
+      "kind": "depends_on"
+    },
+    {
+      "from": "constantpool_access",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "decode_oop_and_pointers",
+      "to": "compressed_oops_decode",
+      "kind": "depends_on"
+    },
+    {
+      "from": "decode_oop_and_pointers",
+      "to": "os_safe_read",
+      "kind": "depends_on"
+    },
+    {
+      "from": "deoptimize_methods",
+      "to": "method_enumeration",
+      "kind": "depends_on"
+    },
+    {
+      "from": "deoptimize_methods",
+      "to": "adapter_recovery_c2i",
+      "kind": "depends_on"
+    },
+    {
+      "from": "deoptimize_methods",
+      "to": "method_entry_points_i2i_i2c",
+      "kind": "depends_on"
+    },
+    {
+      "from": "dont_inline_dont_compile",
+      "to": "method_flags_width",
+      "kind": "depends_on"
+    },
+    {
+      "from": "dont_inline_dont_compile",
+      "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "enum_singleton",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "enum_singleton",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_arrays_object",
+      "to": "field_object_ref",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_arrays_object",
+      "to": "array_element_helpers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_arrays_object",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_arrays_primitive",
+      "to": "field_primitives_get",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_arrays_primitive",
+      "to": "array_element_helpers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_inherited",
+      "to": "field_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_inherited",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_introspection",
+      "to": "constantpool_access",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_introspection",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_null_safety",
+      "to": "field_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_object_ref",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_object_ref",
+      "to": "compressed_oops_decode",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_primitives_get",
+      "to": "field_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_primitives_get",
+      "to": "field_proxy_value_t",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_primitives_set",
+      "to": "field_proxy_set_guards",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_primitives_set",
+      "to": "field_proxy_value_t",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_proxy_set_guards",
+      "to": "field_set_size_guard",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_proxy_set_guards",
+      "to": "field_proxy_value_t",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_proxy_value_t",
+      "to": "field_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_set_size_guard",
+      "to": "field_proxy_value_t",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_static",
+      "to": "field_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_string",
+      "to": "field_object_ref",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_string",
+      "to": "read_java_string",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_string",
+      "to": "make_java_string",
+      "kind": "depends_on"
+    },
+    {
+      "from": "find_class_context_loader",
+      "to": "find_class_fallback",
+      "kind": "depends_on"
+    },
+    {
+      "from": "find_class_fallback",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "find_class_fallback",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "find_methods_by_signature",
+      "to": "signature_parsing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "find_methods_by_signature",
+      "to": "method_enumeration",
+      "kind": "depends_on"
+    },
+    {
+      "from": "for_each_instance",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "for_each_instance",
+      "to": "iterate_entries_safety",
+      "kind": "depends_on"
+    },
+    {
+      "from": "for_each_loaded_class",
+      "to": "iterate_entries_safety",
+      "kind": "depends_on"
+    },
+    {
+      "from": "for_each_loaded_class",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "for_each_thread",
+      "to": "iterate_entries_safety",
+      "kind": "depends_on"
+    },
+    {
+      "from": "global_ref",
+      "to": "jni_local_ref_hygiene",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_basic",
+      "to": "midi2i_trampoline_alloc",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_basic",
+      "to": "hook_common_detour_dispatch",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_basic",
+      "to": "method_entry_points_i2i_i2c",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_basic",
+      "to": "find_class_fallback",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_basic",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_basic",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_basic",
+      "to": "interpreter_frame_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_basic",
+      "to": "signature_parsing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_basic",
+      "to": "hook_chaining",
+      "kind": "related"
+    },
+    {
+      "from": "hook_basic",
+      "to": "hook_signature",
+      "kind": "related"
+    },
+    {
+      "from": "hook_basic",
+      "to": "hook_install_after_jit",
+      "kind": "related"
+    },
+    {
+      "from": "hook_basic",
+      "to": "hook_verify_repair",
+      "kind": "related"
+    },
+    {
+      "from": "hook_basic",
+      "to": "dont_inline_dont_compile",
+      "kind": "related"
+    },
+    {
+      "from": "hook_basic",
+      "to": "return_value_cancel",
+      "kind": "related"
+    },
+    {
+      "from": "hook_basic",
+      "to": "return_set_primitives",
+      "kind": "related"
+    },
+    {
+      "from": "hook_chaining",
+      "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_chaining",
+      "to": "midi2i_trampoline_alloc",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_chaining",
+      "to": "hook_common_detour_dispatch",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_common_detour_dispatch",
+      "to": "seh_invoke_detour",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_common_detour_dispatch",
+      "to": "interpreter_frame_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_common_detour_dispatch",
+      "to": "method_entry_points_i2i_i2c",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_install_after_jit",
+      "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_install_after_jit",
+      "to": "deoptimize_methods",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_install_after_jit",
+      "to": "method_entry_points_i2i_i2c",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_install_after_jit",
+      "to": "adapter_recovery_c2i",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_reinstall_after_shutdown",
+      "to": "shutdown_hooks_teardown",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_reinstall_after_shutdown",
+      "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_signature",
+      "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_signature",
+      "to": "signature_parsing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_signature",
+      "to": "method_explicit_signature",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_unhook_double_free",
+      "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_unhook_double_free",
+      "to": "shutdown_hooks_teardown",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_verify_repair",
+      "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_verify_repair",
+      "to": "midi2i_trampoline_alloc",
+      "kind": "depends_on"
+    },
+    {
+      "from": "instanceklass_methods_walk",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "interface_polymorphism",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "interface_polymorphism",
+      "to": "method_overload",
+      "kind": "depends_on"
+    },
+    {
+      "from": "jni_arg_packing",
+      "to": "signature_parsing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "klass_introspection",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "klass_introspection",
+      "to": "instanceklass_methods_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "klass_introspection",
+      "to": "compressed_klass_decode",
+      "kind": "depends_on"
+    },
+    {
+      "from": "make_java_array",
+      "to": "jni_arg_packing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "make_java_string",
+      "to": "jni_local_ref_hygiene",
+      "kind": "depends_on"
+    },
+    {
+      "from": "make_unique",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_jni_fallback",
+      "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_jni_fallback",
+      "to": "jni_arg_packing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_jni_fallback",
+      "to": "jni_local_ref_hygiene",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_object",
+      "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_object",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_primitives",
+      "to": "method_proxy_value_t",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_primitives",
+      "to": "method_enumeration",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_return_void",
+      "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_string",
+      "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_string",
+      "to": "make_java_string",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_string",
+      "to": "read_java_string",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_wide_args",
+      "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_wide_args",
+      "to": "jni_arg_packing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "instanceklass_methods_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_explicit_signature",
+      "to": "signature_parsing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_explicit_signature",
+      "to": "method_enumeration",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_flags_width",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_is_reference",
+      "to": "signature_parsing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_overload",
+      "to": "signature_parsing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_overload",
+      "to": "method_explicit_signature",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_overload_java_dispatch",
+      "to": "method_overload",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_proxy_value_t",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_return_types",
+      "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_static",
+      "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_static_portability",
+      "to": "method_static",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_throwing_call_site",
+      "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_throwing_call_site",
+      "to": "on_exception",
+      "kind": "depends_on"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "os_allocate_release",
+      "kind": "depends_on"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "os_protect",
+      "kind": "depends_on"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "os_query_region",
+      "kind": "depends_on"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "os_page_size_granularity",
+      "kind": "depends_on"
+    },
+    {
+      "from": "nested_classes",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "on_class_loaded",
+      "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "on_exception",
+      "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "os_safe_read",
+      "to": "os_signal_handler",
+      "kind": "depends_on"
+    },
+    {
+      "from": "poly_inherited_oop",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "poly_inherited_oop",
+      "to": "field_inherited",
+      "kind": "depends_on"
+    },
+    {
+      "from": "read_java_string",
+      "to": "compressed_oops_decode",
+      "kind": "depends_on"
+    },
+    {
+      "from": "register_class",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "register_class",
+      "to": "find_class_fallback",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_caller",
+      "to": "interpreter_frame_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_frame_raw_access",
+      "to": "interpreter_frame_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_set_arg",
+      "to": "interpreter_frame_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_set_primitives",
+      "to": "interpreter_frame_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_set_wrapper_null",
+      "to": "interpreter_frame_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_set_wrapper_null",
+      "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_stack_trace_depth",
+      "to": "interpreter_frame_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_stack_trace_depth",
+      "to": "return_caller",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_value_cancel",
+      "to": "interpreter_frame_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "seh_invoke_detour",
+      "to": "os_signal_handler",
+      "kind": "depends_on"
+    },
+    {
+      "from": "shutdown_hooks_teardown",
+      "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "unified_call_syntax",
+      "to": "method_overload",
+      "kind": "depends_on"
+    },
+    {
+      "from": "vmstructs_offset_resolution",
+      "to": "os_safe_read",
+      "kind": "depends_on"
+    },
+    {
+      "from": "watch_static_field",
+      "to": "field_static",
+      "kind": "depends_on"
+    },
+    {
+      "from": "watch_static_field",
+      "to": "hw_breakpoint_dr7",
+      "kind": "depends_on"
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+name: registry
+
+# Lints the per-feature registry under audit/features/ and confirms
+# that the derived Obsidian vault under audit/graph/ matches what
+# the generator would emit right now.  Runs only when the registry,
+# the vault, or the registry tooling changes — so it does not slow
+# down ordinary library CI.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'audit/features/**'
+      - 'audit/graph/**'
+      - '.github/workflows/registry.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'audit/features/**'
+      - 'audit/graph/**'
+      - '.github/workflows/registry.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: registry-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate + regenerate-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyYAML
+        run: python -m pip install --quiet pyyaml
+
+      - name: Validate manifests
+        run: python audit/features/validate.py
+
+      - name: Regenerate vault into a scratch dir & diff
+        # The vault under audit/graph/ is fully derived from the
+        # manifests.  If a commit edits a manifest but forgets to
+        # run `generate.py vault`, the committed vault drifts.
+        # This step rebuilds the vault in place and fails if the
+        # working tree changed afterwards.
+        shell: bash
+        run: |
+          python audit/features/generate.py vault
+          if ! git diff --quiet -- audit/graph; then
+            echo "::error::audit/graph is out of date — run 'python audit/features/generate.py vault' and commit the result"
+            git --no-pager diff --stat -- audit/graph
+            git --no-pager diff -- audit/graph | head -200
+            exit 1
+          fi

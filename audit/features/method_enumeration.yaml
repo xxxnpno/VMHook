@@ -1,0 +1,30 @@
+schema_version: 1
+slug: method_enumeration
+title: Method Enumeration
+category: method
+status: seeded
+risk: medium
+specialist: .claude/agents/method_enumeration-specialist.md
+description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
+  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
+  in ~200 tokens.'
+java_versions:
+- 8
+- 11
+- 17
+- 21
+- 24
+- 25
+- 26
+tags: []
+hpp_anchors: []
+test_modules:
+- tests/jvm/modules/method_enumeration.cpp
+- tests/test_method_enumeration.cpp
+depends_on:
+- instanceklass_methods_walk
+related: []
+audit_docs: []
+known_bugs: []
+notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
+  for the field reference.

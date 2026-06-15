@@ -1,0 +1,4 @@
+# Force LF in the registry so the CI drift check
+# (`git diff --quiet -- audit/graph` after re-running the generator)
+# is stable across Windows / Linux contributors.
+* text=auto eol=lf

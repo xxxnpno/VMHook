@@ -1,0 +1,29 @@
+schema_version: 1
+slug: collection_type_tags
+title: Collection Type Tags
+category: collection
+status: seeded
+risk: medium
+specialist: .claude/agents/collection_type_tags-specialist.md
+description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
+  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
+  in ~200 tokens.'
+java_versions:
+- 8
+- 11
+- 17
+- 21
+- 24
+- 25
+- 26
+tags: []
+hpp_anchors: []
+test_modules:
+- tests/test_collection_type_tags.cpp
+depends_on:
+- klass_introspection
+related: []
+audit_docs: []
+known_bugs: []
+notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
+  for the field reference.
