@@ -174,6 +174,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
     chk_byte("sByte0x80",   -128);
     chk_byte("sByte0xFF",   -1);
     chk_byte("sByte0xAB",   static_cast<std::int8_t>(0xAB));          //  -85
+    chk_byte("sByte0x55",   static_cast<std::int8_t>(0x55));          //   85 (alt 0101..)
+    chk_byte("sByte0xAA",   static_cast<std::int8_t>(0xAA));          //  -86 (alt 1010..)
     // Unsigned widening of byte 0xFF: signed -1 then widened to uint32 is 0xFFFFFFFF.
     {
         auto fp{ fpg::static_field("sByte0xFF") };
@@ -181,6 +183,16 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
         {
             const std::uint32_t u{ fp->get() };
             ctx.check("B_0xFF_widens_unsigned_to_FFFFFFFF", u == 0xFFFFFFFFu);
+        }
+    }
+    // Alternating-bit byte 0xAA is signed -86; widened to uint32 it sign-extends
+    // to 0xFFFFFFAA (the int8 alternative is signed, so the cast sees -86 first).
+    {
+        auto fp{ fpg::static_field("sByte0xAA") };
+        if (fp)
+        {
+            const std::uint32_t u{ fp->get() };
+            ctx.check("B_0xAA_widens_unsigned_to_FFFFFFAA", u == 0xFFFFFFAAu);
         }
     }
 
@@ -207,6 +219,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
     chk_short("sShort0x8000", static_cast<std::int16_t>(0x8000));        // -32768
     chk_short("sShort0x7FFF", 0x7FFF);                                   //  32767
     chk_short("sShortBeef",   static_cast<std::int16_t>(0xBEEF));        //  -16657
+    chk_short("sShort0x5555", 0x5555);                                   //   21845 (alt 0101..)
+    chk_short("sShort0xAAAA", static_cast<std::int16_t>(0xAAAA));        //  -21846 (alt 1010..)
 
     // int ("I") -> int32_t, index 3.
     auto chk_int = [&](const char* field, std::int32_t expected)
@@ -232,6 +246,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
     chk_int("sIntDeadBeef",   static_cast<std::int32_t>(0xDEADBEEF));
     chk_int("sInt0x7FFFFFFF", 0x7FFFFFFF);
     chk_int("sInt0x80000000", static_cast<std::int32_t>(0x80000000));
+    chk_int("sInt0x55555555", 0x55555555);                              //  alt 0101..
+    chk_int("sInt0xAAAAAAAA", static_cast<std::int32_t>(0xAAAAAAAA));   //  alt 1010..
 
     // long ("J") -> int64_t, index 4.
     auto chk_long = [&](const char* field, std::int64_t expected)
@@ -254,6 +270,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
     chk_long("sLong0x7FFFFFFFFFFFFFFF", 0x7FFFFFFFFFFFFFFFLL);
     chk_long("sLong0x8000000000000000", static_cast<std::int64_t>(0x8000000000000000ULL));
     chk_long("sLongHighBits",           static_cast<std::int64_t>(0x00000000FFFFFFFFULL)); // 4294967295
+    chk_long("sLong0x5555555555555555", static_cast<std::int64_t>(0x5555555555555555ULL)); // alt 0101..
+    chk_long("sLong0xAAAAAAAAAAAAAAAA", static_cast<std::int64_t>(0xAAAAAAAAAAAAAAAAULL)); // alt 1010..
 
     // char ("C") -> uint16_t, index 7.  Java char is a UTF-16 code unit.
     auto chk_char = [&](const char* field, std::uint16_t expected)
@@ -290,6 +308,10 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
     chk_char("sCharLoSurr", 0xDE00);
     chk_char("sCharMinSurr", 0xD800);
     chk_char("sCharMaxSurr", 0xDFFF);
+    chk_char("sCharPreSurr", 0xD7FF);  // last BMP unit before the surrogate block
+    chk_char("sCharPostSurr", 0xE000); // first BMP unit after the surrogate block
+    chk_char("sChar0x5555", 0x5555);   // alternating bits 0101..
+    chk_char("sChar0xAAAA", 0xAAAA);   // alternating bits 1010.. (high bit set, still unsigned)
 
     // Char narrowing witness: high/BMP chars truncate when forced into C++ char,
     // but the uint16_t / char16_t path is lossless.  (Audit: silent narrowing.)
@@ -349,6 +371,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
     chk_float("sFloatNegHalf", 0xBF000000); // -0.5
     chk_float("sFloatThreeQ",  0x3F400000); // 0.75
     chk_float("sFloatTwo",     0x40000000); // 2.0
+    chk_float("sFloat0x55555555", 0x55555555); // alternating-bit finite normal
+    chk_float("sFloat0xAAAAAAAA", 0xAAAAAAAA); // alternating-bit finite normal (sign bit set)
     // Ordinary value: assert the actual float compares equal (not just bits).
     {
         auto fp{ fpg::static_field("sFloatPi") };
@@ -423,6 +447,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
     chk_double("sDoubleNegHalf", 0xBFE0000000000000ULL); // -0.5
     chk_double("sDoubleThreeQ",  0x3FE8000000000000ULL); // 0.75
     chk_double("sDoubleTwo",     0x4000000000000000ULL); // 2.0
+    chk_double("sDouble0x5555555555555555", 0x5555555555555555ULL); // alternating-bit finite normal
+    chk_double("sDouble0xAAAAAAAAAAAAAAAA", 0xAAAAAAAAAAAAAAAAULL); // alternating-bit (sign bit set)
     {
         auto fp{ fpg::static_field("sDoublePi") };
         if (fp)
@@ -822,6 +848,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
             b("iByte0x80",   -128);
             b("iByte0xFF",   -1);
             b("iByte0xAB",   static_cast<std::int8_t>(0xAB));          //  -85
+            b("iByte0x55",   static_cast<std::int8_t>(0x55));          //   85 (alt 0101..)
+            b("iByte0xAA",   static_cast<std::int8_t>(0xAA));          //  -86 (alt 1010..)
             // Unsigned widening of instance byte 0xFF -> uint32 0xFFFFFFFF.
             {
                 auto fp{ inst->get_field("iByte0xFF") };
@@ -840,6 +868,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
             s("iShort0x8000", static_cast<std::int16_t>(0x8000));        // -32768
             s("iShort0x7FFF", 0x7FFF);                                   //  32767
             s("iShortBeef",   static_cast<std::int16_t>(0xBEEF));        //  -16657
+            s("iShort0x5555", 0x5555);                                   //   21845 (alt 0101..)
+            s("iShort0xAAAA", static_cast<std::int16_t>(0xAAAA));        //  -21846 (alt 1010..)
 
             // int — every boundary.
             i("iIntZero",       0);
@@ -850,6 +880,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
             i("iIntDeadBeef",   static_cast<std::int32_t>(0xDEADBEEF));
             i("iInt0x7FFFFFFF", 0x7FFFFFFF);
             i("iInt0x80000000", static_cast<std::int32_t>(0x80000000));
+            i("iInt0x55555555", 0x55555555);                            //  alt 0101..
+            i("iInt0xAAAAAAAA", static_cast<std::int32_t>(0xAAAAAAAA)); //  alt 1010..
 
             // long — every boundary.
             j("iLongZero",               0);
@@ -861,6 +893,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
             j("iLong0x7FFFFFFFFFFFFFFF", 0x7FFFFFFFFFFFFFFFLL);
             j("iLong0x8000000000000000", static_cast<std::int64_t>(0x8000000000000000ULL));
             j("iLongHighBits",           static_cast<std::int64_t>(0x00000000FFFFFFFFULL));
+            j("iLong0x5555555555555555", static_cast<std::int64_t>(0x5555555555555555ULL)); // alt 0101..
+            j("iLong0xAAAAAAAAAAAAAAAA", static_cast<std::int64_t>(0xAAAAAAAAAAAAAAAAULL)); // alt 1010..
 
             // char — full BMP + surrogate sweep.
             c("iCharNull",    0x0000);
@@ -878,6 +912,10 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
             c("iCharLoSurr",  0xDE00);
             c("iCharMinSurr", 0xD800);
             c("iCharMaxSurr", 0xDFFF);
+            c("iCharPreSurr", 0xD7FF);  // last BMP unit before the surrogate block
+            c("iCharPostSurr", 0xE000); // first BMP unit after the surrogate block
+            c("iChar0x5555",  0x5555);  // alternating bits 0101..
+            c("iChar0xAAAA",  0xAAAA);  // alternating bits 1010.. (high bit set, unsigned)
 
             // char narrowing witness on the INSTANCE path: uint16/char16 lossless,
             // C++ char truncates to the low byte (audit: silent narrowing).
@@ -913,6 +951,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
             f("iFloatNegHalf", 0xBF000000);
             f("iFloatThreeQ",  0x3F400000);
             f("iFloatTwo",     0x40000000);
+            f("iFloat0x55555555", 0x55555555); // alternating-bit finite normal
+            f("iFloat0xAAAAAAAA", 0xAAAAAAAA); // alternating-bit finite normal (sign set)
             // Semantic predicates round-tripped through the instance get().
             {
                 auto fnan{ inst->get_field("iFloatNaN") };
@@ -944,6 +984,8 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
             d("iDoubleNegHalf", 0xBFE0000000000000ULL);
             d("iDoubleThreeQ",  0x3FE8000000000000ULL);
             d("iDoubleTwo",     0x4000000000000000ULL);
+            d("iDouble0x5555555555555555", 0x5555555555555555ULL); // alternating-bit finite normal
+            d("iDouble0xAAAAAAAAAAAAAAAA", 0xAAAAAAAAAAAAAAAAULL); // alternating-bit (sign set)
             {
                 auto dnan{ inst->get_field("iDoubleNaN") };
                 auto dpinf{ inst->get_field("iDoublePosInf") };
