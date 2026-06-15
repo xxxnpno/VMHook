@@ -7418,8 +7418,9 @@ namespace vmhook
             Sets/clears HotSpot's _dont_inline flag so the JIT will not inline the
             hooked method at any call site.  The flag's WIDTH, OFFSET and BIT all
             depend on the running JDK; resolve_method_flags_slot() derives the right
-            (address,width,bit) and this performs a WIDTH-CORRECT, ATOMIC
-            read-modify-write at exactly that location:
+            (address,width,bit) and this performs a WIDTH-CORRECT read-modify-write
+            at exactly that location (ATOMIC on the live set path, fault-safe
+            non-atomic on the teardown clear path — see ATOMICITY / TEARDOWN below):
 
               JDK 11..20 : exported `mutable u2 _flags`, bit 2 -> 2-byte access.
                            BYTE-IDENTICAL to the previous implementation.
@@ -7436,13 +7437,33 @@ namespace vmhook
             belt-and-braces).  When either fails this is a no-op — strictly safer than
             guessing, and the deopt/settle path still inhibits inlining of the hook.
 
-            ATOMICITY: HotSpot mutates the same word from C2 / JVMCI / JFR compile
-            threads (Method::set_force_inline / set_hidden / the compilability bits,
-            all defended with Atomic::cmpxchg).  A plain |= / &= can lose a
-            concurrently-set bit; std::atomic_ref fetch_or / fetch_and (C++20, the
-            standard this header already targets) makes our flip race-safe.  On x86
-            the lock prefix is system-wide regardless of how HotSpot declares the
-            field, so this composes correctly with HotSpot's own CAS.
+            ATOMICITY (set / enabled==true): HotSpot mutates the same word from
+            C2 / JVMCI / JFR compile threads (Method::set_force_inline / set_hidden /
+            the compilability bits, all defended with Atomic::cmpxchg).  A plain
+            |= / &= can lose a concurrently-set bit; on the INSTALL and watchdog
+            RE-ARM paths the method is LIVE and dispatchable, so the set uses
+            std::atomic_ref::fetch_or (C++20, the standard this header already
+            targets) to stay race-safe.  On x86 the lock prefix is system-wide
+            regardless of how HotSpot declares the field, so this composes correctly
+            with HotSpot's own CAS.
+
+            TEARDOWN (clear / enabled==false): the ONLY callers are shutdown_hooks()
+            and hook_handle::stop() (the sole `false` call sites).  Both run on the
+            driver thread under g_hooked_methods_mutex, AFTER the method has been
+            removed from dispatch, never concurrently with a Java dispatch of the
+            hooked method, and the library is the sole writer of _dont_inline on a
+            Method we own — the SAME contract documented on safe_access_flags_and.
+            So atomicity is NOT required here, and a JVMTI RedefineClasses / code-
+            cache sweep between install and teardown can leave the STORED Method*
+            cold / relocated / freed.  A raw atomic_ref store to such a slot is the
+            strictly-more-dangerous WRITE variant of a cold deref: it AVs the no-SEH
+            legs (MinGW / clang-on-windows have no working SEH) or scribbles a
+            recycled Method, and atomic_ref RMWs cannot route through os::safe_write.
+            The clear therefore uses a width-correct NON-atomic os::safe_read +
+            recompute + os::safe_write (mirroring safe_access_flags_and): a cold /
+            read-only page simply skips the clear, and on a live Method the SAME
+            bytes land as the old store (metadata, not a frame read — no stk_ /
+            stack_trace POSIX regression; POSIX byte-identical for a live Method).
 
             Guarded against a null / invalid Method*: the verify-repair and shutdown
             call sites can legitimately hand a Method* that became null or aliases
@@ -7467,18 +7488,22 @@ namespace vmhook
 
             const std::uintptr_t address_value{ reinterpret_cast<std::uintptr_t>(slot.address) };
 
-            // CRASH-SAFE PROBE (watchdog re-arm path): set_dont_inline() runs on the
-            // detached auto-repair watchdog (verify_hooks Mode-3 + try_reinstall) off a
-            // STORED Method* that the JIT/GC/class-unload may have relocated or freed
-            // since install.  The atomic_ref RMW below is a RAW memory access on
+            // CRASH-SAFE PROBE (set / watchdog re-arm path): on enabled==true,
+            // set_dont_inline() runs on the install path AND on the detached
+            // auto-repair watchdog (verify_hooks Mode-3 + try_reinstall) off a STORED
+            // Method* that the JIT/GC/class-unload may have relocated or freed since
+            // install.  The atomic_ref SET below is a RAW memory access on
             // `slot.address` (== this + flags_offset); on a cold/relocated/freed Method
             // page that passes is_valid_pointer's heuristic it FAULTS — uncontained on
             // the watchdog thread, and on the no-SEH legs (MinGW / clang-on-windows) it
             // kills the JVM.  Probe the exact width-sized word through os::safe_read
             // first: if it is unreadable the Method is cold this tick, so no-op and let
             // the next tick retry.  On a warm page the probe succeeds and the
-            // width-correct ATOMIC toggle proceeds exactly as before, preserving the
-            // torn-write safety contract versus the JIT compiler thread.
+            // width-correct ATOMIC set proceeds exactly as before, preserving the
+            // torn-write safety contract versus the JIT compiler thread.  The CLEAR
+            // path (enabled==false, teardown-only) does its OWN os::safe_read +
+            // os::safe_write below, so it is fault-safe independently of this probe;
+            // the probe just lets it bail one step earlier on an already-cold page.
             const int probe_width{ slot.width_bytes == 2 ? 2 : (slot.width_bytes == 4 ? 4 : 0) };
             if (probe_width != 0)
             {
@@ -7490,11 +7515,18 @@ namespace vmhook
                 }
             }
 
-            // Width-correct, atomic toggle.  The mask (1u << bit) is representable in
-            // every width we use (bit 2 for u2, bit 12 for u4), so only the ACCESS
-            // WIDTH varies — never the mask.  Alignment is asserted per width to keep
-            // std::atomic_ref's preconditions satisfied; an unaligned target (which
-            // the resolver should never produce) degrades to a safe no-op.
+            // Width-correct toggle.  The mask (1u << bit) is representable in every
+            // width we use (bit 2 for u2, bit 12 for u4), so only the ACCESS WIDTH
+            // varies — never the mask.  Alignment is asserted per width; an unaligned
+            // target (which the resolver should never produce) degrades to a safe
+            // no-op.  The SET (enabled) path uses an atomic RMW so it composes with
+            // HotSpot's concurrent CAS while the method is LIVE (install / watchdog
+            // re-arm); alignment is also atomic_ref's precondition there.  The CLEAR
+            // (!enabled) path is teardown-only (see TEARDOWN above): no concurrency,
+            // so it uses a fault-safe NON-atomic os::safe_read + recompute +
+            // os::safe_write — the WRITE itself can never AV / scribble a recycled
+            // Method, and a cold / read-only page is skipped instead of faulting the
+            // no-SEH legs (atomic_ref cannot route through os::safe_write).
             if (slot.width_bytes == 2 && slot.dont_inline_bit < 16)
             {
                 if ((address_value % alignof(std::uint16_t)) != 0)
@@ -7502,14 +7534,25 @@ namespace vmhook
                     return;
                 }
                 const std::uint16_t mask{ static_cast<std::uint16_t>(1u << slot.dont_inline_bit) };
-                std::atomic_ref<std::uint16_t> word{ *static_cast<std::uint16_t*>(slot.address) };
                 if (enabled)
                 {
+                    std::atomic_ref<std::uint16_t> word{ *static_cast<std::uint16_t*>(slot.address) };
                     word.fetch_or(mask, std::memory_order_acq_rel);
                 }
                 else
                 {
-                    word.fetch_and(static_cast<std::uint16_t>(~mask), std::memory_order_acq_rel);
+                    // Fault-safe non-atomic clear (mirrors safe_access_flags_and).
+                    std::uint16_t word{ 0 };
+                    if (!vmhook::os::safe_read(&word, slot.address, sizeof(word)))
+                    {
+                        return;  // cold this tick — skip the clear
+                    }
+                    if ((word & mask) == 0)
+                    {
+                        return;  // already clear; no write needed
+                    }
+                    word = static_cast<std::uint16_t>(word & static_cast<std::uint16_t>(~mask));
+                    (void)vmhook::os::safe_write(slot.address, &word, sizeof(word));
                 }
             }
             else if (slot.width_bytes == 4 && slot.dont_inline_bit < 32)
@@ -7519,14 +7562,25 @@ namespace vmhook
                     return;
                 }
                 const std::uint32_t mask{ 1u << slot.dont_inline_bit };
-                std::atomic_ref<std::uint32_t> word{ *static_cast<std::uint32_t*>(slot.address) };
                 if (enabled)
                 {
+                    std::atomic_ref<std::uint32_t> word{ *static_cast<std::uint32_t*>(slot.address) };
                     word.fetch_or(mask, std::memory_order_acq_rel);
                 }
                 else
                 {
-                    word.fetch_and(~mask, std::memory_order_acq_rel);
+                    // Fault-safe non-atomic clear (mirrors safe_access_flags_and).
+                    std::uint32_t word{ 0 };
+                    if (!vmhook::os::safe_read(&word, slot.address, sizeof(word)))
+                    {
+                        return;  // cold this tick — skip the clear
+                    }
+                    if ((word & mask) == 0)
+                    {
+                        return;  // already clear; no write needed
+                    }
+                    word &= ~mask;
+                    (void)vmhook::os::safe_write(slot.address, &word, sizeof(word));
                 }
             }
             // Any other width -> unrecognised; no-op (never reached for confident slots).
