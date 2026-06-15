@@ -32,7 +32,9 @@
 //     3-byte, U+FFFD, U+FFFF max-BMP), an interior NUL inside UTF-16, an astral
 //     emoji carried as a SURROGATE PAIR -> one 4-byte sequence, the same emoji
 //     FLANKED by ASCII (the surrogate index-advance doesn't eat the next char),
-//     and a long (300-char) string.
+//     the ASTRAL RANGE EDGES (U+10000 first astral / 3->4-byte boundary / min
+//     combine -> F0 90 80 80; U+10FFFF max code point / top of the 4-byte range /
+//     max combine -> F4 8F BF BF), and a long (300-char) string.
 //   * Every NON-combining surrogate branch is characterised (never a crash): a
 //     LONE HIGH surrogate -> ED A0 BD, a LONE LOW surrogate -> ED B0 80, a
 //     REVERSED low-then-high pair -> two 3-byte CESU runs, and a high surrogate as
@@ -42,9 +44,10 @@
 //     reads a String IN FULL up to read_java_string_max_units (16M CHARACTERS),
 //     the ceiling applied UNIFORMLY to the decoded CHARACTER count (so LATIN1,
 //     UTF16, and JDK 8 char[] share ONE char ceiling -- no more asymmetric
-//     2048-char UTF-16 cap).  We prove: 4096 chars, 4097 chars (one past the OLD
-//     cap), 70000 chars (> 65536, exercising the high half-words of the int32
-//     length read), and 2049 CJK chars (UTF16 byte[] length 4098 on JDK 9+) all
+//     2048-char UTF-16 cap).  We prove: 4095 chars (one BELOW the old cap), 4096
+//     chars, 4097 chars (one past the OLD cap), 70000 chars (> 65536, exercising
+//     the high half-words of the int32 length read), 1,000,000 chars (a multi-MB
+//     body safe_read), and 2049 CJK chars (UTF16 byte[] length 4098 on JDK 9+) all
 //     decode to their COMPLETE content on EVERY layout -- not rejected to "".
 //   * The JDK-8 (char[]) and JDK-9+ (byte[]+coder) layouts decode to the
 //     IDENTICAL UTF-8 bytes -- every decode is compared to a FIXED expected byte
@@ -207,6 +210,9 @@ namespace
     const std::string k_nulUtf16{ '\x61', '\x00', '\xE6', '\x97', '\xA5' }; // a NUL U+65E5 (5 bytes)
     const std::string k_emoji   = "\xF0\x9F\x98\x80";                     // U+1F600
     const std::string k_emojiMix= "\x58\xF0\x9F\x98\x80\x59";             // X U+1F600 Y
+    // Astral RANGE EDGES (surrogate-combine + append_utf8 4-byte branch endpoints):
+    const std::string k_firstAstral = "\xF0\x90\x80\x80";                 // U+10000  (first astral)
+    const std::string k_maxAstral   = "\xF4\x8F\xBF\xBF";                 // U+10FFFF (max code point)
     // Lone high surrogate U+D83D: read_java_string does NOT combine and emits the
     // 3-byte WTF-8/CESU encoding of the surrogate code unit.  This is the helper's
     // ACTUAL behaviour (never a crash), NOT well-formed UTF-8 -- characterised.
@@ -335,6 +341,9 @@ namespace
         ctx.check("rjs_all256_field_resolves", rjs::resolves("all256"));
         ctx.check("rjs_maxBmp_field_resolves", rjs::resolves("maxBmp"));
         ctx.check("rjs_obj_nonString_field_resolves", rjs::resolves("obj"));
+        ctx.check("rjs_firstAstral_field_resolves", rjs::resolves("firstAstral"));
+        ctx.check("rjs_maxAstral_field_resolves", rjs::resolves("maxAstral"));
+        ctx.check("rjs_cap1M_field_resolves", rjs::resolves("cap1M"));
 
         // =================================================================
         //  1. LATIN1 (coder 0) DECODES -- byte-exact UTF-8.
@@ -505,6 +514,30 @@ namespace
                       && static_cast<std::uint8_t>(emoji_mix.back()) == 0x59u); // 'Y'
             ctx.record(std::string{ "[INFO] read_java_string(emojiMix) = [" } + to_hex(emoji_mix) + "] expect [" + to_hex(k_emojiMix) + "]");
 
+            // Astral RANGE EDGES via surrogate pairs (the 4-byte append_utf8 branch
+            // and the surrogate-combine arithmetic at its extremes):
+            //   firstAstral U+10000  (pair D800 DC00) -> the MINIMUM astral code
+            //     point (the 3-byte/4-byte boundary; combine = 0x10000 + 0 + 0) ->
+            //     the single 4-byte sequence F0 90 80 80.
+            //   maxAstral   U+10FFFF (pair DBFF DFFF) -> the MAXIMUM valid code
+            //     point (top of the 4-byte range; combine = 0x10000 + 0xFFC00 +
+            //     0x3FF) -> the single 4-byte sequence F4 8F BF BF.
+            // Together with `emoji` (an interior astral) these pin BOTH ends of the
+            // astral range to exactly one 4-byte UTF-8 sequence each (not two CESU
+            // 3-byte halves), proving the combine handles min and max correctly.
+            const std::string first_astral{ rjs::decode("firstAstral") };
+            ctx.check("decode_firstAstral_U10000_eq_F0908080", first_astral == k_firstAstral);
+            ctx.check("decode_firstAstral_len_4", first_astral.size() == 4);
+            ctx.check("decode_firstAstral_leads_with_F0",
+                      first_astral.size() == 4 && static_cast<std::uint8_t>(first_astral.front()) == 0xF0u);
+            const std::string max_astral{ rjs::decode("maxAstral") };
+            ctx.check("decode_maxAstral_U10FFFF_eq_F48FBFBF", max_astral == k_maxAstral);
+            ctx.check("decode_maxAstral_len_4", max_astral.size() == 4);
+            ctx.check("decode_maxAstral_leads_with_F4",
+                      max_astral.size() == 4 && static_cast<std::uint8_t>(max_astral.front()) == 0xF4u);
+            ctx.record(std::string{ "[INFO] astral edges: firstAstral(U+10000)=[" } + to_hex(first_astral)
+                       + "] maxAstral(U+10FFFF)=[" + to_hex(max_astral) + "]");
+
             // Long (300-char) UTF-16 string of U+65E5 (E6 97 A5), under the cap
             // on both layouts.
             const std::string long_cjk{ rjs::decode("longCjk") };
@@ -569,6 +602,14 @@ namespace
         //     decode to their COMPLETE content on EVERY layout.
         // =================================================================
         {
+            // 4095 ASCII chars: ONE char BELOW the OLD 4096 cap (the last length the
+            // old hard guard accepted).  Reads in full -- the LOW side of the
+            // boundary triple straddling the removed cap.
+            const std::string cap4095{ rjs::decode("cap4095") };
+            ctx.check("decode_cap4095_read_in_full", cap4095.size() == 4095);
+            ctx.check("decode_cap4095_all_x",
+                      cap4095.size() == 4095 && cap4095.front() == 'x' && cap4095.back() == 'x');
+
             // Exactly 4096 ASCII chars: LATIN1 byte[] length 4096 -> read in full.
             const std::string cap4096{ rjs::decode("cap4096") };
             ctx.check("decode_cap4096_read_in_full", cap4096.size() == 4096);
@@ -592,6 +633,17 @@ namespace
             ctx.check("decode_cap70000_all_x",
                       cap70000.size() == 70000 && cap70000.front() == 'x' && cap70000.back() == 'x');
 
+            // 1,000,000 ASCII chars: a MULTI-MEGABYTE LATIN1 String (byte[] length
+            // 1e6), far over the OLD cap yet well under the 16M-char ceiling.  This
+            // is the biggest "read a big String IN FULL" proof: the body safe_read
+            // copies ~1 MB out of the heap array into the sized vector buffer and
+            // the whole content decodes (1e6 bytes).  Allocated OUTSIDE any detour
+            // (a static field; this module installs no hooks), so no mid-detour GC.
+            const std::string cap1M{ rjs::decode("cap1M") };
+            ctx.check("decode_cap1M_read_in_full", cap1M.size() == 1000000u);
+            ctx.check("decode_cap1M_all_x",
+                      cap1M.size() == 1000000u && cap1M.front() == 'x' && cap1M.back() == 'x');
+
             // 2048 CJK chars: on JDK 9+ UTF16 byte[] length 4096; on JDK 8 char[]
             // length 2048.  Decodes to 2048*3 bytes on both layouts.
             const std::string capUtf2048{ rjs::decode("capUtf2048") };
@@ -613,10 +665,12 @@ namespace
                       capUtf2049.size() == 2049u * 3u
                       && static_cast<std::uint8_t>(capUtf2049[0]) == 0xE6u
                       && static_cast<std::uint8_t>(capUtf2049[2049u * 3u - 1]) == 0xA5u);
-            ctx.record(std::string{ "[INFO] read-in-full: cap4096 -> " }
+            ctx.record(std::string{ "[INFO] read-in-full: cap4095 -> " }
+                       + std::to_string(cap4095.size()) + " bytes, cap4096 -> "
                        + std::to_string(cap4096.size()) + " bytes, cap4097 -> "
                        + std::to_string(cap4097.size()) + " bytes, cap70000 -> "
-                       + std::to_string(cap70000.size()) + " bytes; "
+                       + std::to_string(cap70000.size()) + " bytes, cap1M -> "
+                       + std::to_string(cap1M.size()) + " bytes; "
                        + "capUtf2048 -> " + std::to_string(capUtf2048.size())
                        + ", capUtf2049 -> " + std::to_string(capUtf2049.size())
                        + " bytes (ceiling now 16M chars, uniform across layouts).");
@@ -738,11 +792,17 @@ namespace
                 ctx.check("java_emoji_cp0_is_1F600", rjs::seen_int("jEmojiCp0") == 0x1F600);
                 ctx.check("java_emojiMix_len_4", rjs::seen_int("jEmojiMixLen") == 4);
                 ctx.check("java_emojiMix_cpCount_3", rjs::seen_int("jEmojiMixCpCount") == 3);
+                ctx.check("java_firstAstral_cp0_is_10000", rjs::seen_int("jFirstAstralCp0") == 0x10000);
+                ctx.check("java_firstAstral_cpCount_1", rjs::seen_int("jFirstAstralCpCount") == 1);
+                ctx.check("java_maxAstral_cp0_is_10FFFF", rjs::seen_int("jMaxAstralCp0") == 0x10FFFF);
+                ctx.check("java_maxAstral_cpCount_1", rjs::seen_int("jMaxAstralCpCount") == 1);
                 ctx.check("java_loneHigh_len_1", rjs::seen_int("jLoneHighLen") == 1);
                 ctx.check("java_loneHigh_cp0_is_D83D", rjs::seen_int("jLoneHighCp0") == 0xD83D);
                 ctx.check("java_longCjk_len_300", rjs::seen_int("jLongCjkLen") == 300);
+                ctx.check("java_cap4095_len_4095", rjs::seen_int("jCap4095Len") == 4095);
                 ctx.check("java_cap4096_len_4096", rjs::seen_int("jCap4096Len") == 4096);
                 ctx.check("java_cap4097_len_4097", rjs::seen_int("jCap4097Len") == 4097);
+                ctx.check("java_cap1M_len_1000000", rjs::seen_int("jCap1MLen") == 1000000);
                 ctx.check("java_capUtf2048_len_2048", rjs::seen_int("jCapUtf2048Len") == 2048);
                 ctx.check("java_capUtf2049_len_2049", rjs::seen_int("jCapUtf2049Len") == 2049);
                 ctx.check("java_empty_len_0", rjs::seen_int("jEmptyLen") == 0);

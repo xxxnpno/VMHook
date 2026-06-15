@@ -580,6 +580,30 @@ namespace
                                    "(Ljava/lang/String;)Ljava/lang/String;"));
                 // The synthetic constructor is ()V -- a real declared descriptor.
                 ctx.check("live_has_init_V", has_pair(methods, "<init>", "()V"));
+                // The richer shapes the fixture declares (javap -s-verified): two
+                // WIDE args interleaved with a VOID return; a MANY-arg descriptor
+                // spanning every slot-width class (narrow + 2 wides + reference +
+                // reference-array + boolean) with a void return; a many-NARROW-arg
+                // int return; a reference arg returning a DIFFERENT reference type;
+                // a no-arg String return; and the static unique-descriptor twin of
+                // an instance method.  Each is a real, deterministic JVM descriptor
+                // (stable on every JDK 8-26) so it is safe to pin by name -- these
+                // extend the curated spot-check set beyond the per-shape minimum and
+                // give a regression in any one a precise label (the section-5b
+                // aggregate loop already runs ALL of them through the parsers, but a
+                // single failing row there names only the aggregate).
+                ctx.check("live_has_wideVoid_JDtoV", has_pair(methods, "wideVoid", "(JD)V"));
+                ctx.check("live_has_many_allslots_toV",
+                          has_pair(methods, "many",
+                                   "(IJDLjava/lang/String;[IZ)V"));
+                ctx.check("live_has_manyR_6I_toI", has_pair(methods, "manyR", "(IIIIII)I"));
+                ctx.check("live_has_boxStr_StrToObj",
+                          has_pair(methods, "boxStr",
+                                   "(Ljava/lang/String;)Ljava/lang/Object;"));
+                ctx.check("live_has_name_VtoString",
+                          has_pair(methods, "name", "()Ljava/lang/String;"));
+                ctx.check("live_has_sf_II",   has_pair(methods, "sf", "(I)I"));
+                ctx.check("live_has_tri3_DtoI", has_pair(methods, "tri3", "(D)I"));
 
                 // 5b. PARSE every live descriptor.  For EACH declared method:
                 //       - the descriptor has a well-formed (..)ret shape;
@@ -742,6 +766,68 @@ namespace
                               call_site_return_basic_type("()V") == 14);
                     ctx.check("live_init_arg_slots_is_0_count_0", ok && s == 0 && n == 0);
                     ctx.check("live_init_empty_arg_portion", a.empty());
+                }
+                // wideVoid is (JD)V: two WIDE args (long+double) -> 2 args, 4 slots,
+                // and a VOID return -> 14.  Parsed from the LIVE descriptor, this is
+                // the multi-slot-interleaved-with-void shape: it pins that two
+                // back-to-back 8-byte primitives accumulate 4 slots AND that a void
+                // return after a non-empty wide arg list extracts correctly.
+                {
+                    std::string_view a{};
+                    int s{ 0 };
+                    int n{ 0 };
+                    const std::string wv{ desc_of("wideVoid", "(JD)V") };
+                    const bool ok{ args_portion(wv, a) && count_arg_slots(a, s, n) };
+                    ctx.check("live_wideVoid_return_is_void_14",
+                              call_site_return_basic_type(wv) == 14);
+                    ctx.check("live_wideVoid_arg_slots_is_4_count_2", ok && s == 4 && n == 2);
+                }
+                // many is (IJDLjava/lang/String;[IZ)V: every slot-width class in one
+                // descriptor -- I(1) + J(2) + D(2) + ref(1) + array(1) + Z(1) ->
+                // 6 args, 8 slots, void return.  The single richest live arg list:
+                // it exercises the wide-args rule, a reference, a reference array,
+                // and a trailing narrow primitive together, all parsed from the JVM-
+                // emitted descriptor.
+                {
+                    std::string_view a{};
+                    int s{ 0 };
+                    int n{ 0 };
+                    const std::string my{
+                        desc_of("many", "(IJDLjava/lang/String;[IZ)V") };
+                    const bool ok{ args_portion(my, a) && count_arg_slots(a, s, n) };
+                    ctx.check("live_many_return_is_void_14",
+                              call_site_return_basic_type(my) == 14);
+                    ctx.check("live_many_arg_slots_is_8_count_6", ok && s == 8 && n == 6);
+                }
+                // manyR is (IIIIII)I: six NARROW args -> 6 args, 6 slots, int return
+                // -> 10.  The narrow-many counterpart to `many`, proving a long
+                // single-width arg list accumulates one slot per arg with no wide
+                // inflation and that a primitive (non-void) return after it decodes.
+                {
+                    std::string_view a{};
+                    int s{ 0 };
+                    int n{ 0 };
+                    const std::string mr{ desc_of("manyR", "(IIIIII)I") };
+                    const bool ok{ args_portion(mr, a) && count_arg_slots(a, s, n) };
+                    ctx.check("live_manyR_return_is_int_10",
+                              call_site_return_basic_type(mr) == 10);
+                    ctx.check("live_manyR_arg_slots_is_6_count_6", ok && s == 6 && n == 6);
+                }
+                // boxStr is (Ljava/lang/String;)Ljava/lang/Object;: a reference arg
+                // returning a DIFFERENT reference type -> 1 arg, 1 slot, object
+                // return 12.  Distinct from f(String)->String: same arg shape, a
+                // different (still object, still 12) return -- pins that the parser
+                // does not conflate the two reference types at the BasicType layer.
+                {
+                    std::string_view a{};
+                    int s{ 0 };
+                    int n{ 0 };
+                    const std::string bx{
+                        desc_of("boxStr", "(Ljava/lang/String;)Ljava/lang/Object;") };
+                    const bool ok{ args_portion(bx, a) && count_arg_slots(a, s, n) };
+                    ctx.check("live_boxStr_return_is_object_12",
+                              call_site_return_basic_type(bx) == 12);
+                    ctx.check("live_boxStr_arg_slots_is_1_count_1", ok && s == 1 && n == 1);
                 }
             }
         }

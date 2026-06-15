@@ -151,9 +151,17 @@ public final class MethodPrimitives
      *  set) cannot distinguish "zero-extend" from several other failure modes,
      *  but 0x8000 read as a signed 16-bit value would be -32768. */
     public char retCharHighBit()     { return (char) 0x8000; }   // 32768
+    /** (char)0xD83D == 55357: a lone UTF-16 HIGH-SURROGATE code unit.  Bit 15 is
+     *  set (so it co-witnesses zero-extension) AND it carries a busy low byte, so
+     *  it doubles as a non-byte-symmetric char-return pattern that a 16-bit decode
+     *  reading a stale neighbouring byte would corrupt.  A lone surrogate is a
+     *  perfectly legal Java `char`; it must round-trip as the unsigned value 55357,
+     *  never -10243 (its signed-16 reading) nor 0x3D (a low-byte-only read). */
+    public char retCharSurrogate()   { return (char) 0xD83D; }   // 55357
     public static char sRetCharA()      { return 'A'; }
     public static char sRetCharMax()    { return (char) 0xFFFF; }
     public static char sRetCharHighBit(){ return (char) 0x8000; }
+    public static char sRetCharSurrogate(){ return (char) 0xD83D; }
     /** (C)C echo — proves a char ARGUMENT round-trips across the full unsigned
      *  16-bit range (0xFFFF stays 0xFFFF). */
     public char echoChar(final char v)        { lastCharArg = v; return v; }
@@ -169,6 +177,12 @@ public final class MethodPrimitives
      *  "last char arg" witness the echoChar methods establish. */
     public int charHighBitToInt(final char v)        { return (int) v; }
     public static int sCharHighBitToInt(final char v){ return (int) v; }
+    /** (C)I used with the lone surrogate 0xD83D so a char arg whose value lies in
+     *  the surrogate range (bit 15 set + a busy low byte) is proven to arrive
+     *  ZERO-extended (55357), never sign-extended (-10243).  Deliberately does NOT
+     *  write lastCharArg so it cannot disturb the "last char arg" witness. */
+    public int charSurrogateToInt(final char v)        { return (int) v; }
+    public static int sCharSurrogateToInt(final char v){ return (int) v; }
 
     // ----------------------------------------------------------------------
     //  int (I)    — signed 32-bit
@@ -225,6 +239,22 @@ public final class MethodPrimitives
         mixSArg = s;
         return (i * 1000003) + (b * 7) + (c * 13) + s;
     }
+    /** (ZBCSI)I — FIVE narrow args, one of EVERY narrow kind in a single frame
+     *  (boolean, byte, char, short, int), each landing in its own one-slot local.
+     *  Extends the arg-count axis past the 4-arg (IBCS)I above and proves a
+     *  pure-narrow five-slot frame packs without cross-slot bleed: the boolean
+     *  occupies its own slot ahead of the others (a common off-by-one when the .z
+     *  slot is mis-sized) and the result mixes all five with asymmetric weights so
+     *  any slot swap, drop, or width error changes it.  Java promotes boolean->int
+     *  as 1/0, byte/short sign-extend, char zero-extends. */
+    public int mixZBCSI(final boolean z, final byte b, final char c, final short s, final int i)
+    {
+        return ((z ? 1 : 0) * 5000011) + (b * 70001) + (c * 900007) + (s * 11) + i;
+    }
+    public static int sMixZBCSI(final boolean z, final byte b, final char c, final short s, final int i)
+    {
+        return ((z ? 1 : 0) * 5000011) + (b * 70001) + (c * 900007) + (s * 11) + i;
+    }
 
     // ----------------------------------------------------------------------
     //  long (J)   — signed 64-bit (occupies TWO interpreter local slots)
@@ -275,6 +305,14 @@ public final class MethodPrimitives
     public static float sRetFloatPosInf() { return Float.POSITIVE_INFINITY; }
     public static float sRetFloatNegZero(){ return -0.0f; }
     public static float sRetFloatBusyBits(){ return Float.intBitsToFloat(0x12345678); }
+    /** Static float boundary mirrors of the instance set, so the dedicated
+     *  CallStaticFloatMethodA dispatch slot (JNI 137) is exercised across the full
+     *  magnitude range — finite one, largest-finite MAX, smallest-positive
+     *  subnormal MIN_VALUE, and -Inf — not just the NaN/Inf/-0.0 specials above. */
+    public static float sRetFloatOne()      { return 1.0f; }
+    public static float sRetFloatMax()      { return Float.MAX_VALUE; }
+    public static float sRetFloatMinValue() { return Float.MIN_VALUE; }   // smallest positive subnormal
+    public static float sRetFloatNegInf()   { return Float.NEGATIVE_INFINITY; }
 
     // ----------------------------------------------------------------------
     //  double (D)
@@ -302,6 +340,14 @@ public final class MethodPrimitives
     public static double sRetDoubleNegInf() { return Double.NEGATIVE_INFINITY; }
     public static double sRetDoubleNegZero(){ return -0.0; }
     public static double sRetDoubleBusyBits(){ return Double.longBitsToDouble(0x123456789ABCDEF0L); }
+    /** Static double boundary mirrors of the instance set, so the dedicated
+     *  CallStaticDoubleMethodA dispatch slot (JNI 140) is exercised across the full
+     *  magnitude range — finite one, largest-finite MAX, smallest-positive
+     *  subnormal MIN_VALUE, and +Inf — complementing the NaN/-Inf/-0.0 specials. */
+    public static double sRetDoubleOne()      { return 1.0; }
+    public static double sRetDoubleMax()      { return Double.MAX_VALUE; }
+    public static double sRetDoubleMinValue() { return Double.MIN_VALUE; }  // smallest positive subnormal
+    public static double sRetDoublePosInf()   { return Double.POSITIVE_INFINITY; }
 
     // ----------------------------------------------------------------------
     //  void (V)

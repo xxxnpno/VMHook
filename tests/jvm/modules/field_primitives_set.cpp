@@ -106,6 +106,14 @@ namespace
             return true;
         }
 
+        // ── typed INSTANCE GET (copy-init extraction, MSVC-unambiguous) ───
+        // Reads a named instance field through the given wrapper as uint16, used
+        // to confirm the instance "C" char-shortcut wrote the full 2-byte slot.
+        static auto get_u16_inst(fps& self, const char* name) -> std::uint16_t
+        {
+            return self.get_field(name)->get();
+        }
+
         // ── typed static GETs (copy-init extraction, MSVC-unambiguous) ────
         static auto get_bool(const char* name) -> bool       { return static_field(name)->get(); }
         static auto get_i8(const char* name) -> std::int8_t   { return static_field(name)->get(); }
@@ -269,6 +277,8 @@ namespace
         set_chk_B("0x7F",  static_cast<std::int8_t>(0x7F));          //  127
         set_chk_B("0x80",  static_cast<std::int8_t>(0x80));          // -128
         set_chk_B("0xFF",  static_cast<std::int8_t>(0xFF));          //   -1
+        set_chk_B("0x55",  static_cast<std::int8_t>(0x55));          //   85 (alternating bits)
+        set_chk_B("0xAA",  static_cast<std::int8_t>(0xAA));          //  -86 (alternating bits)
         set_chk_B("0xAB",  static_cast<std::int8_t>(0xAB));          //  -85
         // Final B value for snapshot/getter == 0xAB (-85).
     }
@@ -297,6 +307,8 @@ namespace
         set_chk_S("max",    std::numeric_limits<std::int16_t>::max()); //  32767
         set_chk_S("0x7FFF", static_cast<std::int16_t>(0x7FFF));        //  32767
         set_chk_S("0x8000", static_cast<std::int16_t>(0x8000));        // -32768
+        set_chk_S("0x5555", static_cast<std::int16_t>(0x5555));        //  21845 (alternating bits)
+        set_chk_S("0xAAAA", static_cast<std::int16_t>(0xAAAA));        // -21846 (alternating bits)
         set_chk_S("0xBEEF", static_cast<std::int16_t>(0xBEEF));        //  -16657
         // Final S value for snapshot/getter == 0xBEEF (-16657).
     }
@@ -325,6 +337,8 @@ namespace
         set_chk_I("max",        std::numeric_limits<std::int32_t>::max());
         set_chk_I("0x7FFFFFFF", static_cast<std::int32_t>(0x7FFFFFFF));
         set_chk_I("0x80000000", static_cast<std::int32_t>(0x80000000));
+        set_chk_I("0x55555555", static_cast<std::int32_t>(0x55555555)); // alternating bits
+        set_chk_I("0xAAAAAAAA", static_cast<std::int32_t>(0xAAAAAAAA)); // alternating bits
         set_chk_I("deadbeef",   static_cast<std::int32_t>(0xDEADBEEF));
         // Final I value for snapshot/getter == 0xDEADBEEF.
     }
@@ -352,6 +366,9 @@ namespace
         set_chk_J("0x7FFFFFFFFFFFFFFF", 0x7FFFFFFFFFFFFFFFLL);
         set_chk_J("0x8000000000000000", static_cast<std::int64_t>(0x8000000000000000ULL));
         set_chk_J("highbits",           static_cast<std::int64_t>(0x00000000FFFFFFFFULL)); // 4294967295
+        set_chk_J("lowbits",            static_cast<std::int64_t>(0xFFFFFFFF00000000ULL)); // high word only
+        set_chk_J("0x5555...",          static_cast<std::int64_t>(0x5555555555555555ULL)); // alternating bits
+        set_chk_J("0xAAAA...",          static_cast<std::int64_t>(0xAAAAAAAAAAAAAAAAULL)); // alternating bits
         set_chk_J("deadbeef",           static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
         // Final J value for snapshot/getter == 0xDEADBEEFCAFEBABE.
     }
@@ -376,14 +393,22 @@ namespace
             ctx.check(std::string{ "C_widens_unsigned_" } + tag, widened == static_cast<int>(value));
         };
         set_chk_C("nul",     0x0000); // '\0' -- the low boundary code unit
+        set_chk_C("one",     0x0001); // lowest non-zero code unit
         set_chk_C("space",   0x0020);
         set_chk_C("A",       0x0041);
+        set_chk_C("asciimax", 0x007F); // last 7-bit ASCII unit
+        set_chk_C("latin1lo", 0x0080); // first Latin-1-supplement / 2-byte-UTF-8 unit
         set_chk_C("highbit", 0x00E9); // 'e-acute'
+        set_chk_C("u2bytemax", 0x07FF); // last code unit encoded in 2 UTF-8 bytes
+        set_chk_C("u3bytelo",  0x0800); // first code unit needing 3 UTF-8 bytes
         set_chk_C("bmp",     0x4E2D); // CJK
+        set_chk_C("bmpmax",  0xCFFF); // a high non-surrogate BMP unit
+        set_chk_C("preminsurr", 0xD7FF); // last code unit BEFORE the surrogate range
         set_chk_C("minsurr", 0xD800); // first high surrogate
         set_chk_C("hisurr",  0xD83D);
         set_chk_C("losurr",  0xDE00);
         set_chk_C("maxsurr", 0xDFFF);
+        set_chk_C("postsurr", 0xE000); // first code unit AFTER the surrogate range
         set_chk_C("max",     0xFFFF); // Character.MAX_VALUE
         // Final C value (so far) == 0xFFFF.  The char-shortcut sub-test below
         // then drives a 1-byte char and ALSO restores 0xFFFF for the snapshot.
@@ -402,9 +427,41 @@ namespace
             ctx.check("C_char_shortcut_005A", fps::get_u16("sC") == 0x005A);
             p->set(static_cast<char>(0xE9));               // high-bit byte
             ctx.check("C_char_shortcut_high_byte_zero", fps::get_u16("sC") == 0x00E9);
+            p->set(static_cast<char>('\0'));               // NUL byte -> 0x0000
+            ctx.check("C_char_shortcut_0000", fps::get_u16("sC") == 0x0000);
+            p->set(static_cast<char>(0x7F));               // 7-bit max byte (no sign issue)
+            ctx.check("C_char_shortcut_007F", fps::get_u16("sC") == 0x007F);
+            p->set(static_cast<char>(0xFF));               // all-bits byte -> 0x00FF (zero-extended)
+            ctx.check("C_char_shortcut_00FF", fps::get_u16("sC") == 0x00FF);
             // Restore 0xFFFF so the snapshot/getter phases observe Character.MAX.
             p->set(static_cast<std::uint16_t>(0xFFFF));
             ctx.check("C_restore_FFFF", fps::get_u16("sC") == 0xFFFF);
+        }
+    }
+
+    // The SAME "C" 1-byte-char widening shortcut driven through the INSTANCE
+    // dispatch path (get_field("iC")->set(char)) -- proving the widening fires
+    // identically whether the proxy is static or instance (set() never consults
+    // the static/instance flag for the primitive path).  This combination
+    // (char-shortcut x instance dispatch) is covered by NO other phase.  Restores
+    // the documented instance-char final (0x20AC) so phases 13/15/16 are
+    // unaffected.
+    if (inst)
+    {
+        if (auto p{ inst->get_field("iC") }; p.has_value())
+        {
+            p->set('Z');                                   // 0x5A
+            ctx.check("fps_inst_C_char_shortcut_005A", fps::get_u16_inst(*inst, "iC") == 0x005A);
+            p->set(static_cast<char>(0xE9));               // high-bit byte -> zero-extended
+            ctx.check("fps_inst_C_char_shortcut_high_byte_zero", fps::get_u16_inst(*inst, "iC") == 0x00E9);
+            p->set(static_cast<char>('\0'));               // NUL byte -> 0x0000
+            ctx.check("fps_inst_C_char_shortcut_0000", fps::get_u16_inst(*inst, "iC") == 0x0000);
+            p->set(static_cast<char>(0xFF));               // all-bits byte -> 0x00FF
+            ctx.check("fps_inst_C_char_shortcut_00FF", fps::get_u16_inst(*inst, "iC") == 0x00FF);
+            // Restore the documented instance-char final (Euro sign) for the
+            // Java-observed phases.
+            p->set(static_cast<std::uint16_t>(0x20AC));
+            ctx.check("fps_inst_C_char_shortcut_restore_20AC", fps::get_u16_inst(*inst, "iC") == 0x20AC);
         }
     }
 
@@ -436,9 +493,15 @@ namespace
         set_chk_F("posinf",  0x7F800000);
         set_chk_F("neginf",  0xFF800000);
         set_chk_F("nan",     0x7FC00000); // canonical qNaN
+        set_chk_F("negnan",  0xFFC00000); // qNaN with sign bit set
         set_chk_F("snan",    0x7F800001); // signaling NaN
         set_chk_F("nanpay",  0x7FA55555); // qNaN with payload
+        set_chk_F("negsnan", 0xFF800001); // signaling NaN, sign bit set
         set_chk_F("denorm",  0x00000001);
+        set_chk_F("negmin",  0x80000001); // -Float.MIN_VALUE (negative denormal)
+        set_chk_F("maxdenorm", 0x007FFFFF); // largest subnormal (just below MIN_NORMAL)
+        set_chk_F("justabovenorm", 0x00800001); // smallest normal just above MIN_NORMAL
+        set_chk_F("negmax",  0xFF7FFFFF); // -Float.MAX_VALUE
         // Final F value for snapshot/getter == canonical NaN bits (set below).
         if (const auto p{ fps::static_field("sF") })
         {
@@ -471,9 +534,15 @@ namespace
         set_chk_D("posinf",  0x7FF0000000000000ULL);
         set_chk_D("neginf",  0xFFF0000000000000ULL);
         set_chk_D("nan",     0x7FF8000000000000ULL); // canonical qNaN
+        set_chk_D("negnan",  0xFFF8000000000000ULL); // qNaN with sign bit set
         set_chk_D("snan",    0x7FF0000000000001ULL); // signaling NaN
         set_chk_D("nanpay",  0x7FFAAAAAAAAAAAAAULL); // qNaN with payload
+        set_chk_D("negsnan", 0xFFF0000000000001ULL); // signaling NaN, sign bit set
         set_chk_D("denorm",  0x0000000000000001ULL);
+        set_chk_D("negmin",  0x8000000000000001ULL); // -Double.MIN_VALUE (negative denormal)
+        set_chk_D("maxdenorm", 0x000FFFFFFFFFFFFFULL); // largest subnormal (just below MIN_NORMAL)
+        set_chk_D("justabovenorm", 0x0010000000000001ULL); // smallest normal just above MIN_NORMAL
+        set_chk_D("negmax",  0xFFEFFFFFFFFFFFFFULL); // -Double.MAX_VALUE
         // Final D value for snapshot/getter == canonical NaN bits (set below).
         if (const auto p{ fps::static_field("sD") })
         {
@@ -540,6 +609,8 @@ namespace
             set_chk("0x7F",   static_cast<std::int8_t>(0x7F));
             set_chk("0x80",   static_cast<std::int8_t>(0x80));          // -128
             set_chk("0xFF",   static_cast<std::int8_t>(0xFF));          //   -1
+            set_chk("0x55",   static_cast<std::int8_t>(0x55));          //   85 (alternating bits)
+            set_chk("0xAA",   static_cast<std::int8_t>(0xAA));          //  -86 (alternating bits)
             set_chk("0xAB",   static_cast<std::int8_t>(0xAB));          //  -85
             set_chk("0xFE",   static_cast<std::int8_t>(0xFE));          // final = -2
         }
@@ -566,6 +637,8 @@ namespace
             set_chk("max",    std::numeric_limits<std::int16_t>::max()); //  32767
             set_chk("0x7FFF", static_cast<std::int16_t>(0x7FFF));
             set_chk("0x8000", static_cast<std::int16_t>(0x8000));        // -32768
+            set_chk("0x5555", static_cast<std::int16_t>(0x5555));        //  21845 (alternating bits)
+            set_chk("0xAAAA", static_cast<std::int16_t>(0xAAAA));        // -21846 (alternating bits)
             set_chk("0xBEEF", static_cast<std::int16_t>(0xBEEF));        // -16657
             set_chk("0xCAFE", static_cast<std::int16_t>(0xCAFE));        // final
         }
@@ -586,14 +659,21 @@ namespace
                 ctx.check(std::string{ "fps_inst_C_widens_unsigned_" } + tag, widened == static_cast<int>(value));
             };
             set_chk("nul",     0x0000);
+            set_chk("one",     0x0001); // lowest non-zero code unit
             set_chk("space",   0x0020);
             set_chk("A",       0x0041);
+            set_chk("asciimax", 0x007F); // last 7-bit ASCII unit
+            set_chk("latin1lo", 0x0080); // first Latin-1-supplement unit
             set_chk("highbit", 0x00E9); // 'e-acute'
+            set_chk("u2bytemax", 0x07FF);
+            set_chk("u3bytelo",  0x0800);
             set_chk("bmp",     0x4E2D); // CJK
+            set_chk("preminsurr", 0xD7FF); // last unit before the surrogate range
             set_chk("minsurr", 0xD800);
             set_chk("hisurr",  0xD83D);
             set_chk("losurr",  0xDE00);
             set_chk("maxsurr", 0xDFFF);
+            set_chk("postsurr", 0xE000); // first unit after the surrogate range
             set_chk("max",     0xFFFF); // Character.MAX_VALUE
             set_chk("euro",    0x20AC); // final
         }
@@ -620,6 +700,8 @@ namespace
             set_chk("max",        std::numeric_limits<std::int32_t>::max());
             set_chk("0x7FFFFFFF", static_cast<std::int32_t>(0x7FFFFFFF));
             set_chk("0x80000000", static_cast<std::int32_t>(0x80000000));
+            set_chk("0x55555555", static_cast<std::int32_t>(0x55555555)); // alternating bits
+            set_chk("0xAAAAAAAA", static_cast<std::int32_t>(0xAAAAAAAA)); // alternating bits
             set_chk("deadbeef",   static_cast<std::int32_t>(0xDEADBEEF));
             set_chk("0BADF00D",   static_cast<std::int32_t>(0x0BADF00D)); // final
         }
@@ -645,6 +727,9 @@ namespace
             set_chk("0x7FFFFFFFFFFFFFFF", 0x7FFFFFFFFFFFFFFFLL);
             set_chk("0x8000000000000000", static_cast<std::int64_t>(0x8000000000000000ULL));
             set_chk("highbits",           static_cast<std::int64_t>(0x00000000FFFFFFFFULL));
+            set_chk("lowbits",            static_cast<std::int64_t>(0xFFFFFFFF00000000ULL)); // high word only
+            set_chk("0x5555...",          static_cast<std::int64_t>(0x5555555555555555ULL)); // alternating bits
+            set_chk("0xAAAA...",          static_cast<std::int64_t>(0xAAAAAAAAAAAAAAAAULL)); // alternating bits
             set_chk("deadbeef",           static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
             set_chk("full",   0x0123456789ABCDEFLL); // final
         }
@@ -672,8 +757,12 @@ namespace
             set_chk("posinf",  0x7F800000);
             set_chk("neginf",  0xFF800000);
             set_chk("nan",     0x7FC00000); // canonical qNaN
+            set_chk("negnan",  0xFFC00000); // qNaN with sign bit set
             set_chk("snan",    0x7F800001); // signaling NaN
             set_chk("nanpay",  0x7FA55555); // qNaN with payload
+            set_chk("negmin",  0x80000001); // -Float.MIN_VALUE (negative denormal)
+            set_chk("maxdenorm", 0x007FFFFF); // largest subnormal
+            set_chk("negmax",  0xFF7FFFFF); // -Float.MAX_VALUE
             set_chk("negpi",   0xC0490FDB); // final = -pi
         }
         else { ctx.check("fps_inst_F_resolves", false); }
@@ -700,8 +789,12 @@ namespace
             set_chk("posinf",  0x7FF0000000000000ULL);
             set_chk("neginf",  0xFFF0000000000000ULL);
             set_chk("nan",     0x7FF8000000000000ULL); // canonical qNaN
+            set_chk("negnan",  0xFFF8000000000000ULL); // qNaN with sign bit set
             set_chk("snan",    0x7FF0000000000001ULL); // signaling NaN
             set_chk("nanpay",  0x7FFAAAAAAAAAAAAAULL); // qNaN with payload
+            set_chk("negmin",  0x8000000000000001ULL); // -Double.MIN_VALUE (negative denormal)
+            set_chk("maxdenorm", 0x000FFFFFFFFFFFFFULL); // largest subnormal
+            set_chk("negmax",  0xFFEFFFFFFFFFFFFFULL); // -Double.MAX_VALUE
             set_chk("pi",      0x400921FB54442D18ULL); // final
         }
         else { ctx.check("fps_inst_D_resolves", false); }
@@ -899,6 +992,47 @@ namespace
             ctx.check("repeat_F_finite", float_bits(fps::get_float("sF")) == 0x3FC00000);
             pf->set(bits_to_float(0x7FC00000));
             ctx.check("repeat_F_nan_overwrites", float_bits(fps::get_float("sF")) == 0x7FC00000);
+            // Restore the canonical-NaN final for the Java-observed phases.
+            pf->set(bits_to_float(0x7FC00000));
+            ctx.check("repeat_F_restored_nan", float_bits(fps::get_float("sF")) == 0x7FC00000);
+        }
+        // Double last-write-wins: a high-bit pattern fully replaced by another.
+        const auto pd{ fps::static_field("sD") };
+        if (pd)
+        {
+            pd->set(bits_to_double(0x4045000000000000ULL)); // 42.0
+            ctx.check("repeat_D_first", double_bits(fps::get_double("sD")) == 0x4045000000000000ULL);
+            pd->set(bits_to_double(0xC045000000000000ULL)); // -42.0
+            ctx.check("repeat_D_last_write_wins", double_bits(fps::get_double("sD")) == 0xC045000000000000ULL);
+            // Restore the canonical-NaN final for the Java-observed phases.
+            pd->set(bits_to_double(0x7FF8000000000000ULL));
+            ctx.check("repeat_D_restored_nan", double_bits(fps::get_double("sD")) == 0x7FF8000000000000ULL);
+        }
+        // Char FULL-WIDTH overwrite: write 0xFFFF then 0x0000; the result must be
+        // exactly 0x0000 with NO stale high byte left from the previous all-ones
+        // write (proves set() stores the full 2 bytes, never just the low one).
+        const auto pc{ fps::static_field("sC") };
+        if (pc)
+        {
+            pc->set(static_cast<std::uint16_t>(0xFFFF));
+            ctx.check("repeat_C_all_ones", fps::get_u16("sC") == 0xFFFF);
+            pc->set(static_cast<std::uint16_t>(0x0000));
+            ctx.check("repeat_C_full_overwrite_no_stale_high_byte", fps::get_u16("sC") == 0x0000);
+            // Restore Character.MAX final for the Java-observed phases.
+            pc->set(static_cast<std::uint16_t>(0xFFFF));
+            ctx.check("repeat_C_restored_FFFF", fps::get_u16("sC") == 0xFFFF);
+        }
+        // Byte sign-flip overwrite: 0x7F (+127) then 0x80 (-128); no OR/accumulate.
+        const auto pb{ fps::static_field("sB") };
+        if (pb)
+        {
+            pb->set(static_cast<std::int8_t>(0x7F));
+            ctx.check("repeat_B_pos", fps::get_i8("sB") == static_cast<std::int8_t>(0x7F));
+            pb->set(static_cast<std::int8_t>(0x80));
+            ctx.check("repeat_B_sign_flip_overwrite", fps::get_i8("sB") == static_cast<std::int8_t>(0x80));
+            // Restore the documented 0xAB final for the Java-observed phases.
+            pb->set(static_cast<std::int8_t>(0xAB));
+            ctx.check("repeat_B_restored_AB", fps::get_i8("sB") == static_cast<std::int8_t>(0xAB));
         }
     }
 
