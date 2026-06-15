@@ -4429,30 +4429,14 @@ namespace vmhook
 
                 vmhook::hotspot::class_loader_data* class_loader_data{ this->get_head() };
 
-                // Run-away caps — MIRROR the hardened sibling for_each_klass (below):
-                // find_klass walked the CLD graph + each CLD's _klasses linked list with
-                // NO bound, so a corrupt / cyclic _next or _next_link chain (observed on
-                // JDK24 as the loaded-class set grows: an uncached not-found lookup walks
-                // the WHOLE graph) spins forever — an uncontained HANG (java.exe never
-                // exits; no SEH involved since it's a loop, not a fault).  Bound the OUTER
-                // CLD walk at 65536 and the INNER per-CLD klass walk at 1048576 (both far
-                // above any real JVM); on overrun we fall through to the SystemDictionary /
-                // JNI context-loader path, never hang.  (#28 family — same fix shape as the
-                // tree/hash map walk caps.)
-                std::int32_t cld_visited{ 0 };
-                while (vmhook::hotspot::is_valid_pointer(class_loader_data) && class_loader_data
-                       && cld_visited < 65536)
+                while (vmhook::hotspot::is_valid_pointer(class_loader_data) && class_loader_data)
                 {
-                    ++cld_visited;
                     if (use_klasses)
                     {
                         // JDK 21+: walk the _klasses linked list
                         vmhook::hotspot::klass* current_klass{ class_loader_data->get_klasses() };
-                        std::int32_t kl_visited{ 0 };
-                        while (current_klass && vmhook::hotspot::is_valid_pointer(current_klass)
-                               && kl_visited < 1048576)
+                        while (current_klass && vmhook::hotspot::is_valid_pointer(current_klass))
                         {
-                            ++kl_visited;
                             const vmhook::hotspot::symbol* const sym{ current_klass->get_name() };
                             if (vmhook::hotspot::is_valid_pointer(sym) && sym->to_string() == class_name)
                             {
