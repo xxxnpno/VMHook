@@ -96,6 +96,25 @@ namespace
         {
             return get_method("mixIBCS", "(IBCS)I")->call(i, b, c, s);
         }
+        // char arg in the surrogate range (0xD83D) widened in the callee — proves
+        // a bit-15-set char arg with a busy low byte arrives ZERO-extended.
+        auto char_surrogate_to_int(std::uint16_t a) -> std::int32_t { return get_method("charSurrogateToInt", "(C)I")->call(a); }
+        // FIVE narrow args, one of each kind (boolean/byte/char/short/int) in ONE
+        // frame — the deep pure-narrow packing witness past the 4-arg (IBCS)I.
+        auto mix_zbcsi(bool z, std::int8_t b, std::uint16_t c, std::int16_t s, std::int32_t i) -> std::int32_t
+        {
+            return get_method("mixZBCSI", "(ZBCSI)I")->call(z, b, c, s, i);
+        }
+        // (I)I pure echo (no lastEchoArg clobber) used for INT boundary ARGS.
+        auto echo_int_pattern_arg(std::int32_t a) -> std::int32_t { return get_method("echoIntPattern", "(I)I")->call(a); }
+
+        // -- value_t conversion-operator breadth on a RETURN (instance) --
+        // Each resolves a primitive returner and converts the SAME value_t into a
+        // DIFFERENT-width / different-kind C++ target, exercising the templated
+        // operator target_type()'s static_cast leg directly (int->int64 widen,
+        // byte->int64 sign-extend, char->int64 zero-extend, int->bool truncation).
+        auto ret_as_i64(const char* n) -> std::int64_t { return get_method(n)->call(); }
+        auto ret_as_bool(const char* n) -> bool        { return get_method(n)->call(); }
 
         // value_t introspection probes (instance)
         auto is_void(const char* n) -> bool   { return get_method(n)->call().is_void(); }
@@ -129,6 +148,11 @@ namespace
         static auto smix_ibcs(std::int32_t i, std::int8_t b, std::uint16_t c, std::int16_t s) -> std::int32_t
         {
             return static_method("sMixIBCS", "(IBCS)I")->call(i, b, c, s);
+        }
+        static auto schar_surrogate_to_int(std::uint16_t a) -> std::int32_t { return static_method("sCharSurrogateToInt", "(C)I")->call(a); }
+        static auto smix_zbcsi(bool z, std::int8_t b, std::uint16_t c, std::int16_t s, std::int32_t i) -> std::int32_t
+        {
+            return static_method("sMixZBCSI", "(ZBCSI)I")->call(z, b, c, s, i);
         }
     };
 
@@ -179,6 +203,16 @@ namespace
         -> std::int32_t
     {
         return jaddi(jaddi(jaddi(jmuli(i, 1000003), jmuli(b, 7)), jmuli(c, 13)), s);
+    }
+    // The (ZBCSI)I fixture computes (z*5000011)+(b*70001)+(c*900007)+(s*11)+i with
+    // Java int wraparound, where z is the boolean promoted to 1/0, b/s are the
+    // already sign-extended ints and c the already zero-extended int.  Mirror it
+    // bit-for-bit through the unsigned helpers so boundary operands stay UB-free.
+    inline auto mix5_expect(std::int32_t z, std::int32_t b, std::int32_t c,
+                            std::int32_t s, std::int32_t i) noexcept -> std::int32_t
+    {
+        return jaddi(jaddi(jaddi(jaddi(jmuli(z, 5000011), jmuli(b, 70001)),
+                                 jmuli(c, 900007)), jmuli(s, 11)), i);
     }
 
     // Sentinel that no Java boundary value collides with, so "did the detour
@@ -231,10 +265,14 @@ namespace
     std::atomic<std::int64_t> g_char_a_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_char_max_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_char_highbit_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_surrogate{ k_uncaptured };       // 0xD83D -> 55357
+    std::atomic<std::int64_t> g_char_surrogate_stat{ k_uncaptured };
     // char must NOT sign-extend: 0xFFFF read into an int stays 65535
     std::atomic<std::int64_t> g_char_max_as_int{ k_uncaptured };
     // char bit-15-only (0x8000) read into an int must be 32768, never -32768
     std::atomic<std::int64_t> g_char_highbit_as_int{ k_uncaptured };
+    // char surrogate (0xD83D) read into an int must be 55357, never -10243
+    std::atomic<std::int64_t> g_char_surrogate_as_int{ k_uncaptured };
 
     // int
     std::atomic<std::int64_t> g_int_zero{ k_uncaptured };
@@ -283,9 +321,11 @@ namespace
     std::atomic<std::int64_t> g_arg_char_echo_max{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_char_widen_max{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_char_widen_highbit{ k_uncaptured };  // 0x8000 -> 32768
+    std::atomic<std::int64_t> g_arg_char_widen_surrogate{ k_uncaptured }; // 0xD83D -> 55357
     std::atomic<std::int64_t> g_arg_char_echo_max_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_char_widen_max_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_char_widen_highbit_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_char_widen_surrogate_stat{ k_uncaptured };
     // int arg arithmetic (II)I: ordinary sum + two's-complement overflow wrap.
     std::atomic<std::int64_t> g_arg_int_add{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_int_overflow_wrap{ k_uncaptured };
@@ -298,6 +338,14 @@ namespace
     // heterogeneous narrow args (IBCS)I: per-slot packing proof.
     std::atomic<std::int64_t> g_arg_mix_inst{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_mix_stat{ k_uncaptured };
+    // five narrow args (ZBCSI)I: deep pure-narrow packing (one of each kind).
+    std::atomic<std::int64_t> g_arg_mix5_inst{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_mix5_stat{ k_uncaptured };
+    // int boundary ARGS over a pure (I)I echo (no witness clobber).
+    std::atomic<std::int64_t> g_arg_int_echo_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_int_echo_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_int_echo_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_int_echo_negone{ k_uncaptured };
 
     // long
     std::atomic<std::int64_t> g_long_zero{ k_uncaptured };
@@ -332,6 +380,10 @@ namespace
     std::atomic<std::uint32_t> g_float_posinf_stat{ 0 };
     std::atomic<std::uint32_t> g_float_negzero_stat{ 0 };
     std::atomic<std::uint32_t> g_float_busybits_stat{ 0 };
+    std::atomic<std::uint32_t> g_float_one_stat{ 0 };
+    std::atomic<std::uint32_t> g_float_max_stat{ 0 };
+    std::atomic<std::uint32_t> g_float_minval_stat{ 0 };
+    std::atomic<std::uint32_t> g_float_neginf_stat{ 0 };
 
     // double (raw bits)
     std::atomic<bool>          g_double_captured{ false };
@@ -352,6 +404,10 @@ namespace
     std::atomic<std::uint64_t> g_double_neginf_stat{ 0 };
     std::atomic<std::uint64_t> g_double_negzero_stat{ 0 };
     std::atomic<std::uint64_t> g_double_busybits_stat{ 0 };
+    std::atomic<std::uint64_t> g_double_one_stat{ 0 };
+    std::atomic<std::uint64_t> g_double_max_stat{ 0 };
+    std::atomic<std::uint64_t> g_double_minval_stat{ 0 };
+    std::atomic<std::uint64_t> g_double_posinf_stat{ 0 };
 
     // void + introspection
     std::atomic<int> g_void_inst_is_void{ -1 };
@@ -362,6 +418,14 @@ namespace
     // Conversion-operator-on-value_t cross checks done in-detour
     std::atomic<int> g_bool_true_to_int{ -1 };   // bool true -> int == 1
     std::atomic<int> g_float_half_to_double{ -1 };// 0.5f -> double == 0.5 exactly
+    // value_t conversion breadth: SAME return value_t -> a different C++ target.
+    std::atomic<std::int64_t> g_int_max_as_i64{ k_uncaptured };     // I return -> int64 widen
+    std::atomic<std::int64_t> g_int_negone_as_i64{ k_uncaptured };  // I -1 -> int64 -1
+    std::atomic<std::int64_t> g_byte_negone_as_i64{ k_uncaptured }; // B -1 -> int64 sign-extend
+    std::atomic<std::int64_t> g_char_max_as_i64{ k_uncaptured };    // C 0xFFFF -> int64 zero-extend (65535)
+    std::atomic<int> g_int_zero_as_bool{ -1 };     // I 0 -> bool false
+    std::atomic<int> g_int_fortytwo_as_bool{ -1 }; // I 42 -> bool true
+    std::atomic<int> g_byte_zero_as_bool{ -1 };    // B 0 -> bool false
 
     auto run_all_calls(const std::unique_ptr<method_primitives>& self) -> void
     {
@@ -411,9 +475,11 @@ namespace
         g_char_max.store(s.call_char("retCharMax"));
         g_char_255.store(s.call_char("retChar255"));
         g_char_highbit.store(s.call_char("retCharHighBit"));
+        g_char_surrogate.store(s.call_char("retCharSurrogate"));
         g_char_a_stat.store(method_primitives::scall_char("sRetCharA"));
         g_char_max_stat.store(method_primitives::scall_char("sRetCharMax"));
         g_char_highbit_stat.store(method_primitives::scall_char("sRetCharHighBit"));
+        g_char_surrogate_stat.store(method_primitives::scall_char("sRetCharSurrogate"));
         // char 0xFFFF read into an int stays 65535 (zero-extend, not sign)
         {
             const std::int32_t as_int = s.get_method("retCharMax")->call();
@@ -424,6 +490,12 @@ namespace
         {
             const std::int32_t as_int = s.get_method("retCharHighBit")->call();
             g_char_highbit_as_int.store(as_int);
+        }
+        // char 0xD83D (lone high-surrogate: bit 15 set + busy low byte) read into
+        // an int must be 55357, never -10243 (its signed-16 reading).
+        {
+            const std::int32_t as_int = s.get_method("retCharSurrogate")->call();
+            g_char_surrogate_as_int.store(as_int);
         }
 
         // ---- int ----
@@ -477,9 +549,11 @@ namespace
         g_arg_char_echo_max.store(s.echo_char(static_cast<std::uint16_t>(0xFFFF)));           // 65535
         g_arg_char_widen_max.store(s.char_to_int(static_cast<std::uint16_t>(0xFFFF)));        // -> 65535
         g_arg_char_widen_highbit.store(s.char_highbit_to_int(static_cast<std::uint16_t>(0x8000))); // -> 32768
+        g_arg_char_widen_surrogate.store(s.char_surrogate_to_int(static_cast<std::uint16_t>(0xD83D))); // -> 55357
         g_arg_char_echo_max_stat.store(method_primitives::secho_char(static_cast<std::uint16_t>(0xFFFF)));
         g_arg_char_widen_max_stat.store(method_primitives::schar_to_int(static_cast<std::uint16_t>(0xFFFF)));
         g_arg_char_widen_highbit_stat.store(method_primitives::schar_highbit_to_int(static_cast<std::uint16_t>(0x8000)));
+        g_arg_char_widen_surrogate_stat.store(method_primitives::schar_surrogate_to_int(static_cast<std::uint16_t>(0xD83D)));
 
         // int args (II)I: ordinary add, then two's-complement overflow + underflow.
         g_arg_int_add.store(s.add_int(2000000000, 100000000));                                // ordinary (fits)
@@ -503,6 +577,26 @@ namespace
                                         std::numeric_limits<std::int8_t>::max(),   // 127
                                         static_cast<std::uint16_t>('Z'),           // 90
                                         std::numeric_limits<std::int16_t>::min())); // -32768
+
+        // FIVE narrow args (ZBCSI)I: one of every narrow kind in one frame.  Boundary
+        // operands so a wrong-width or swapped slot changes the asymmetric result.
+        g_arg_mix5_inst.store(s.mix_zbcsi(true,
+                                          static_cast<std::int8_t>(-1),        // byte -> -1 (signed)
+                                          static_cast<std::uint16_t>(0xFFFF),  // char -> 65535 (unsigned)
+                                          static_cast<std::int16_t>(-2),       // short -> -2 (signed)
+                                          7));                                  // int  -> 7
+        g_arg_mix5_stat.store(method_primitives::smix_zbcsi(false,
+                                          std::numeric_limits<std::int8_t>::max(),    // 127
+                                          static_cast<std::uint16_t>(0x8000),         // char -> 32768 (bit 15, zero-ext)
+                                          std::numeric_limits<std::int16_t>::min(),   // -32768
+                                          std::numeric_limits<std::int32_t>::max()));  // INT_MAX
+
+        // int boundary ARGS over a pure (I)I echo: the whole signed range survives
+        // the C++ -> .i slot -> body -> return round-trip (no witness clobber).
+        g_arg_int_echo_min.store(s.echo_int_pattern_arg(std::numeric_limits<std::int32_t>::min()));
+        g_arg_int_echo_max.store(s.echo_int_pattern_arg(std::numeric_limits<std::int32_t>::max()));
+        g_arg_int_echo_zero.store(s.echo_int_pattern_arg(0));
+        g_arg_int_echo_negone.store(s.echo_int_pattern_arg(-1));
 
         // ---- long ----
         g_long_zero.store(s.call_long("retLongZero"));
@@ -536,6 +630,10 @@ namespace
         g_float_posinf_stat.store(f2bits(method_primitives::scall_float("sRetFloatPosInf")));
         g_float_negzero_stat.store(f2bits(method_primitives::scall_float("sRetFloatNegZero")));
         g_float_busybits_stat.store(f2bits(method_primitives::scall_float("sRetFloatBusyBits")));
+        g_float_one_stat.store(f2bits(method_primitives::scall_float("sRetFloatOne")));
+        g_float_max_stat.store(f2bits(method_primitives::scall_float("sRetFloatMax")));
+        g_float_minval_stat.store(f2bits(method_primitives::scall_float("sRetFloatMinValue")));
+        g_float_neginf_stat.store(f2bits(method_primitives::scall_float("sRetFloatNegInf")));
         g_float_captured.store(true);
 
         // ---- double ----
@@ -556,6 +654,10 @@ namespace
         g_double_neginf_stat.store(d2bits(method_primitives::scall_double("sRetDoubleNegInf")));
         g_double_negzero_stat.store(d2bits(method_primitives::scall_double("sRetDoubleNegZero")));
         g_double_busybits_stat.store(d2bits(method_primitives::scall_double("sRetDoubleBusyBits")));
+        g_double_one_stat.store(d2bits(method_primitives::scall_double("sRetDoubleOne")));
+        g_double_max_stat.store(d2bits(method_primitives::scall_double("sRetDoubleMax")));
+        g_double_minval_stat.store(d2bits(method_primitives::scall_double("sRetDoubleMinValue")));
+        g_double_posinf_stat.store(d2bits(method_primitives::scall_double("sRetDoublePosInf")));
         g_double_captured.store(true);
 
         // ---- void + introspection ----
@@ -578,6 +680,18 @@ namespace
             const double h = s.get_method("retFloatHalf")->call();
             g_float_half_to_double.store(h == 0.5 ? 1 : 0);
         }
+        // value_t conversion-operator breadth: take a primitive return and convert
+        // the SAME value_t into a DIFFERENT-width / different-kind C++ target,
+        // exercising operator target_type()'s static_cast leg across the stored
+        // alternatives (int32->int64, int8->int64 sign-extend, uint16->int64
+        // zero-extend, int32->bool truncation).
+        g_int_max_as_i64.store(s.ret_as_i64("retIntMax"));        // -> 2147483647
+        g_int_negone_as_i64.store(s.ret_as_i64("retIntNegOne"));  // -> -1
+        g_byte_negone_as_i64.store(s.ret_as_i64("retByteNegOne"));// -> -1 (sign-extend)
+        g_char_max_as_i64.store(s.ret_as_i64("retCharMax"));      // -> 65535 (zero-extend)
+        g_int_zero_as_bool.store(s.ret_as_bool("retIntZero") ? 1 : 0);          // -> false
+        g_int_fortytwo_as_bool.store(s.ret_as_bool("retIntFortyTwo") ? 1 : 0);  // -> true
+        g_byte_zero_as_bool.store(s.ret_as_bool("retByteZero") ? 1 : 0);        // -> false
     }
 }
 
@@ -685,11 +799,16 @@ namespace
         // (char)0x8000 — only bit 15 set — must read 32768 (zero-extended), never
         // -32768.  This is a sharper sign-extension witness than 0xFFFF (all bits).
         ctx.check("mcp_char_highbit_32768", g_char_highbit.load() == 32768);
+        // (char)0xD83D — a lone UTF-16 high surrogate — must read 55357 (zero-
+        // extended), never -10243 (signed-16) nor 0x3D (low-byte-only).
+        ctx.check("mcp_char_surrogate_55357", g_char_surrogate.load() == 55357);
         ctx.check("mcp_char_A_static_65", g_char_a_stat.load() == 65);
         ctx.check("mcp_char_max_static_65535", g_char_max_stat.load() == 65535);
         ctx.check("mcp_char_highbit_static_32768", g_char_highbit_stat.load() == 32768);
+        ctx.check("mcp_char_surrogate_static_55357", g_char_surrogate_stat.load() == 55357);
         ctx.check("mcp_char_max_zero_extends_to_int_65535", g_char_max_as_int.load() == 65535);
         ctx.check("mcp_char_highbit_zero_extends_to_int_32768", g_char_highbit_as_int.load() == 32768);
+        ctx.check("mcp_char_surrogate_zero_extends_to_int_55357", g_char_surrogate_as_int.load() == 55357);
 
         // =====================================================================
         //  int (I) — full signed 32-bit range + argument passthrough
@@ -712,6 +831,12 @@ namespace
         // no byte reorder C++ -> .i slot -> body -> return.
         ctx.check("mcp_arg_int_pattern_echo_instance", g_arg_int_pattern_echo_inst.load() == 0x12345678LL);
         ctx.check("mcp_arg_int_pattern_echo_static", g_arg_int_pattern_echo_stat.load() == 0x12345678LL);
+        // int boundary ARGS over the same pure (I)I echo: the whole signed range
+        // survives the C++ -> .i slot -> body -> return round-trip.
+        ctx.check("mcp_arg_int_echo_min", g_arg_int_echo_min.load() == std::numeric_limits<std::int32_t>::min());
+        ctx.check("mcp_arg_int_echo_max", g_arg_int_echo_max.load() == std::numeric_limits<std::int32_t>::max());
+        ctx.check("mcp_arg_int_echo_zero", g_arg_int_echo_zero.load() == 0);
+        ctx.check("mcp_arg_int_echo_negone", g_arg_int_echo_negone.load() == -1);
         // The (I)I echo also writes lastEchoArg in Java; the last echo executed
         // in run_all_calls was the static one with -7654321.
         ctx.check("mcp_echo_side_effect_arg", method_primitives::get_last_echo_arg() == -7654321);
@@ -764,9 +889,14 @@ namespace
         // char arg 0x8000 (only bit 15 set) widened to int must be 32768, proving
         // the char ARG path zero-extends bit 15 rather than sign-extending it.
         ctx.check("mcp_arg_char_widen_highbit_zero_extends_32768", g_arg_char_widen_highbit.load() == 32768);
+        // char arg 0xD83D (lone surrogate: bit 15 + busy low byte) widened to int
+        // must be 55357, proving the char ARG path zero-extends a surrogate-range
+        // code unit rather than sign-extending it (-10243).
+        ctx.check("mcp_arg_char_widen_surrogate_zero_extends_55357", g_arg_char_widen_surrogate.load() == 55357);
         ctx.check("mcp_arg_char_echo_max_static_65535", g_arg_char_echo_max_stat.load() == 65535);
         ctx.check("mcp_arg_char_widen_max_static_zero_extends", g_arg_char_widen_max_stat.load() == 65535);
         ctx.check("mcp_arg_char_widen_highbit_static_zero_extends", g_arg_char_widen_highbit_stat.load() == 32768);
+        ctx.check("mcp_arg_char_widen_surrogate_static_zero_extends", g_arg_char_widen_surrogate_stat.load() == 55357);
         // LAST char echo executed was static sEchoChar(0xFFFF): witness (unsigned).
         ctx.check("mcp_arg_char_side_effect_max", method_primitives::get_last_char_arg() == 65535);
 
@@ -800,6 +930,20 @@ namespace
             ctx.check("mcp_arg_mix_witness_byte_slot",  method_primitives::get_mix_b_arg() == 127);
             ctx.check("mcp_arg_mix_witness_char_slot",  method_primitives::get_mix_c_arg() == 90);
             ctx.check("mcp_arg_mix_witness_short_slot", method_primitives::get_mix_s_arg() == -32768);
+        }
+
+        // FIVE narrow args (ZBCSI)I — one of every narrow kind in a single frame.
+        // Mirror Java's promotion: boolean->1/0, byte/short sign-extend, char
+        // zero-extends, all to int.  A wrong-width or swapped slot (esp. the
+        // leading boolean's own slot) changes the asymmetric result.
+        {
+            const std::int32_t expect{ mix5_expect(1, -1, 0xFFFF, -2, 7) };
+            ctx.check("mcp_arg_mix5_zbcsi_instance", g_arg_mix5_inst.load() == expect);
+        }
+        {
+            const std::int32_t expect{ mix5_expect(0, 127, 0x8000, -32768,
+                                                   std::numeric_limits<std::int32_t>::max()) };
+            ctx.check("mcp_arg_mix5_zbcsi_static", g_arg_mix5_stat.load() == expect);
         }
 
         // =====================================================================
@@ -860,6 +1004,15 @@ namespace
             const float nz = bits2f(g_float_negzero_stat.load());
             ctx.check("mcp_float_negzero_static_signbit", nz == 0.0f && std::signbit(nz));
         }
+        // static float boundary mirrors (CallStaticFloatMethodA): finite one,
+        // largest-finite MAX, smallest-positive subnormal MIN_VALUE, -Inf.
+        ctx.check("mcp_float_one_static", bits2f(g_float_one_stat.load()) == 1.0f);
+        ctx.check("mcp_float_max_static", bits2f(g_float_max_stat.load()) == std::numeric_limits<float>::max());
+        ctx.check("mcp_float_min_subnormal_static", bits2f(g_float_minval_stat.load()) == std::numeric_limits<float>::denorm_min());
+        {
+            const float ninf = bits2f(g_float_neginf_stat.load());
+            ctx.check("mcp_float_neginf_static_isinf", std::isinf(ninf) && ninf < 0.0f);
+        }
         ctx.check("mcp_float_half_widens_to_double_exact", g_float_half_to_double.load() == 1);
 
         // =====================================================================
@@ -899,6 +1052,15 @@ namespace
             const double nz = bits2d(g_double_negzero_stat.load());
             ctx.check("mcp_double_negzero_static_signbit", nz == 0.0 && std::signbit(nz));
         }
+        // static double boundary mirrors (CallStaticDoubleMethodA): finite one,
+        // largest-finite MAX, smallest-positive subnormal MIN_VALUE, +Inf.
+        ctx.check("mcp_double_one_static", bits2d(g_double_one_stat.load()) == 1.0);
+        ctx.check("mcp_double_max_static", bits2d(g_double_max_stat.load()) == std::numeric_limits<double>::max());
+        ctx.check("mcp_double_min_subnormal_static", bits2d(g_double_minval_stat.load()) == std::numeric_limits<double>::denorm_min());
+        {
+            const double pinf = bits2d(g_double_posinf_stat.load());
+            ctx.check("mcp_double_posinf_static_isinf", std::isinf(pinf) && pinf > 0.0);
+        }
 
         // =====================================================================
         //  void (V) + value_t introspection
@@ -911,6 +1073,24 @@ namespace
         // A numeric (int) return must NOT be reported as void or string.
         ctx.check("mcp_int_return_is_not_void", g_int_is_void.load() == 0);
         ctx.check("mcp_int_return_is_not_string", g_int_is_string.load() == 0);
+
+        // =====================================================================
+        //  value_t conversion-operator breadth — the SAME primitive return value_t
+        //  converted to a DIFFERENT-width / different-kind C++ target.  Exercises
+        //  operator target_type()'s static_cast leg across stored alternatives;
+        //  fully deterministic (pure C++ cast semantics on the decoded value).
+        // =====================================================================
+        // int32-stored return widened to int64 (value preserved, sign intact).
+        ctx.check("mcp_conv_int_max_to_i64", g_int_max_as_i64.load() == 2147483647LL);
+        ctx.check("mcp_conv_int_negone_to_i64", g_int_negone_as_i64.load() == -1LL);
+        // int8-stored return widened to int64 sign-extends (-1 stays -1, not 255).
+        ctx.check("mcp_conv_byte_negone_to_i64_sign_extends", g_byte_negone_as_i64.load() == -1LL);
+        // uint16-stored (char) return widened to int64 zero-extends (0xFFFF->65535).
+        ctx.check("mcp_conv_char_max_to_i64_zero_extends", g_char_max_as_i64.load() == 65535LL);
+        // numeric return narrowed to bool: zero->false, non-zero->true.
+        ctx.check("mcp_conv_int_zero_to_bool_false", g_int_zero_as_bool.load() == 0);
+        ctx.check("mcp_conv_int_fortytwo_to_bool_true", g_int_fortytwo_as_bool.load() == 1);
+        ctx.check("mcp_conv_byte_zero_to_bool_false", g_byte_zero_as_bool.load() == 0);
         }
     }
 }

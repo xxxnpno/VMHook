@@ -55,6 +55,13 @@ import vmhook.Harness;
  *     - emojiMix   "X"U+1F600"Y"     -> ASCII, surrogate pair, ASCII: proves the
  *                                       surrogate index-advance does not swallow
  *                                       the trailing 'Y' (6 bytes, 3 codepoints).
+ *     - firstAstral U+10000          -> the FIRST astral code point (surrogate
+ *                                       pair D800 DC00): the 3-byte/4-byte
+ *                                       boundary of append_utf8 and the MINIMUM of
+ *                                       the surrogate-combine formula -> F0 90 80 80.
+ *     - maxAstral  U+10FFFF          -> the MAX valid code point (surrogate pair
+ *                                       DBFF DFFF): the top of the 4-byte range and
+ *                                       the MAXIMUM combine result -> F4 8F BF BF.
  *     - loneHigh   U+D83D            -> a LONE high surrogate (no following low
  *                                       surrogate): read_java_string does NOT
  *                                       combine and emits the 3-byte WTF-8/CESU
@@ -76,11 +83,17 @@ import vmhook.Harness;
  *   now reads IN FULL up to read_java_string_max_units = 16M CHARACTERS, the
  *   ceiling applied UNIFORMLY to the decoded CHARACTER count, so no layout has a
  *   smaller effective limit):
+ *     - cap4095    4095x 'x'    -> ONE char below the OLD cap (last length the old
+ *                                  guard accepted) -> read in full (4095).
  *     - cap4096    4096x 'x'    -> LATIN1 byte[] length 4096 -> read in full.
  *     - cap4097    4097x 'x'    -> ONE char past the OLD cap -> read in full (4097).
  *     - cap70000   70000x 'x'   -> a length WAY over the OLD cap (and over 65536):
  *                                  proves the int32 length is read intact and the
  *                                  full body is decoded (no overflow) -> 70000 bytes.
+ *     - cap1M      1000000x 'x' -> a MULTI-MEGABYTE LATIN1 String (byte[] length
+ *                                  1e6), far over the old cap, well under the 16M
+ *                                  ceiling -> read in full (1e6 bytes); stresses the
+ *                                  ~1 MB body safe_read into the sized heap buffer.
  *     - capUtf2048 2048x U+65E5 -> UTF16 byte[] length 4096 -> read in full.
  *     - capUtf2049 2049x U+65E5 -> UTF16 byte[] length 4098 (2049 chars) -> read in
  *                                  full on JDK 9+ too (no more asymmetric UTF-16
@@ -190,6 +203,19 @@ public final class ReadJavaString
     // ASCII, surrogate pair, ASCII: 'X', U+1F600, 'Y'.  Proves the surrogate
     // combine advances past BOTH units and does not consume the trailing 'Y'.
     public static String emojiMix = fresh(new char[] { 'X', '\uD83D', '\uDE00', 'Y' });
+    // U+10000 -- the FIRST astral code point (the 3-byte/4-byte boundary of
+    // append_utf8 and the MINIMUM of the surrogate-combine formula: high D800 +
+    // low DC00 -> 0x10000 + 0 + 0).  Carried as the lowest surrogate pair
+    // (D800 DC00); read_java_string must combine it into the single 4-byte UTF-8
+    // sequence F0 90 80 80.  Complements `emoji` (an interior astral code point)
+    // by pinning the LOW edge of the astral / 4-byte range.
+    public static String firstAstral = fresh(new char[] { '\uD800', '\uDC00' });
+    // U+10FFFF -- the MAXIMUM valid Unicode code point (the top of the 4-byte
+    // range and the MAXIMUM of the surrogate-combine formula: high DBFF + low
+    // DFFF -> 0x10000 + 0xFFC00 + 0x3FF = 0x10FFFF).  Carried as the highest
+    // surrogate pair (DBFF DFFF); read_java_string must combine it into the
+    // single 4-byte UTF-8 sequence F4 8F BF BF.  Pins the HIGH edge of astral.
+    public static String maxAstral = fresh(new char[] { '\uDBFF', '\uDFFF' });
     // A LONE high surrogate with no following low surrogate.  read_java_string
     // cannot combine it, so it emits the surrogate code unit as a 3-byte
     // WTF-8/CESU sequence (ED A0 BD).  Constructible: a Java char[] can legally
@@ -212,6 +238,10 @@ public final class ReadJavaString
 
     // Long-String read-in-full targets (robustness bug #29 FIXED: no more 4096 cap;
     // read_java_string reads IN FULL up to 16M chars, uniformly per char count) ---
+    // 4095 ASCII chars: ONE char BELOW the OLD 4096 cap -- the last length the old
+    // guard ACCEPTED.  Pairs with cap4096 / cap4097 to pin the boundary triple
+    // (4095 / 4096 / 4097) straddling the removed hard cap.
+    public static String cap4095    = repeatChar('x', 4095);
     // Exactly 4096 ASCII chars: LATIN1 byte[] length 4096 -> read in full.
     public static String cap4096    = repeatChar('x', 4096);
     // 4097 ASCII chars: ONE char past the OLD 4096 cap -> read in full (4097 bytes).
@@ -219,6 +249,13 @@ public final class ReadJavaString
     // 70000 ASCII chars: a length WAY past the OLD cap and past 65536.  Proves the
     // int32 length is read intact and the full 70000-byte body is decoded.
     public static String cap70000   = repeatChar('x', 70000);
+    // 1,000,000 ASCII chars: a MULTI-MEGABYTE LATIN1 String (byte[] length 1e6),
+    // far above the old cap yet well under the 16M-char ceiling.  Exercises the
+    // full-read path at a size where the body safe_read copies ~1 MB into the
+    // sized heap buffer -- the single biggest "read a big String IN FULL" proof.
+    // Built OUTSIDE any detour (a static initializer, a pure read on the native
+    // side), so it never forces a mid-detour GC.
+    public static String cap1M      = repeatChar('x', 1000000);
     // 2048 CJK chars: on JDK 9+ a UTF16 byte[] length 4096; on JDK 8 a char[] length
     // 2048.  Decodes to 2048*3 UTF-8 bytes on both layouts.
     public static String capUtf2048 = repeatChar('\u65E5', 2048);
@@ -274,6 +311,10 @@ public final class ReadJavaString
     public static volatile int     jEmojiCp0;       // 0x1F600
     public static volatile int     jEmojiMixLen;    // 4 (chars: X, hi, lo, Y)
     public static volatile int     jEmojiMixCpCount;// 3 (X, U+1F600, Y)
+    public static volatile int     jFirstAstralCp0; // 0x10000  (first astral)
+    public static volatile int     jFirstAstralCpCount; // 1
+    public static volatile int     jMaxAstralCp0;   // 0x10FFFF (max code point)
+    public static volatile int     jMaxAstralCpCount;   // 1
     public static volatile int     jLoneHighLen;    // 1
     public static volatile int     jLoneHighCp0;    // 0xD83D (lone surrogate)
     public static volatile int     jLoneLowLen;     // 1
@@ -281,9 +322,11 @@ public final class ReadJavaString
     public static volatile int     jReversedPairLen;// 2
     public static volatile int     jHighAtEndLen;   // 2 (chars: X, hi surrogate)
     public static volatile int     jLongCjkLen;     // 300
+    public static volatile int     jCap4095Len;     // 4095
     public static volatile int     jCap4096Len;     // 4096
     public static volatile int     jCap4097Len;     // 4097
     public static volatile int     jCap70000Len;    // 70000
+    public static volatile int     jCap1MLen;       // 1000000
     public static volatile int     jCapUtf2048Len;  // 2048
     public static volatile int     jCapUtf2049Len;  // 2049
     public static volatile int     jEmptyLen;       // 0
@@ -401,6 +444,10 @@ public final class ReadJavaString
                 jEmojiCp0      = emoji.codePointAt(0);
                 jEmojiMixLen   = emojiMix.length();
                 jEmojiMixCpCount = emojiMix.codePointCount(0, emojiMix.length());
+                jFirstAstralCp0 = firstAstral.codePointAt(0);
+                jFirstAstralCpCount = firstAstral.codePointCount(0, firstAstral.length());
+                jMaxAstralCp0  = maxAstral.codePointAt(0);
+                jMaxAstralCpCount = maxAstral.codePointCount(0, maxAstral.length());
                 jLoneHighLen   = loneHigh.length();
                 jLoneHighCp0   = loneHigh.codePointAt(0);
                 jLoneLowLen    = loneLow.length();
@@ -408,9 +455,11 @@ public final class ReadJavaString
                 jReversedPairLen = reversedPair.length();
                 jHighAtEndLen  = highAtEnd.length();
                 jLongCjkLen    = longCjk.length();
+                jCap4095Len    = cap4095.length();
                 jCap4096Len    = cap4096.length();
                 jCap4097Len    = cap4097.length();
                 jCap70000Len   = cap70000.length();
+                jCap1MLen      = cap1M.length();
                 jCapUtf2048Len = capUtf2048.length();
                 jCapUtf2049Len = capUtf2049.length();
                 jEmptyLen      = empty.length();
