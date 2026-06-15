@@ -219,21 +219,14 @@ jobs:
         # shutdown's interpreter-revive (a cold read), exposed when a larger module
         # set shifts heap/timing. Only clang·24 (not mingw·24) -> cell-specific cold
         # fault, not a uniform leak. Stays quarantined until the residual is hardened.
+        # TRIAL (#28 un-quarantine, PR-only experiment): the clang+mingw excludes are
+        # removed to map the CURRENT no-SEH crash surface after the watchdog-disable
+        # (b738d6c) + forced-GC POSIX-gate (bc76415) + in-detour large-alloc gate
+        # (79e58be). This runs on a PR (separate concurrency group) so master stays
+        # green; the placeholder below excludes nothing, giving the full 3×7 windows
+        # matrix. Restore the real excludes before merge if no-SEH cells still crash.
         exclude:
-          # clang-on-Windows (no-SEH) — the residual cold-fault (#28) is INTERMITTENT
-          # and module-count-sensitive: as the exhaustive suite grows it crashes at a
-          # DIFFERENT module per run (hook_reinstall_after_shutdown on j24, wrapper_pattern
-          # on j21, ...), so per-cell quarantine is unsustainable whack-a-mole. Quarantine
-          # ALL clang-windows JDKs until #28 lands (every feature stays covered on
-          # msvc-windows [SEH] + linux-gcc + linux-clang + macos-clang × all 7 JDKs).
-          - compiler: clang
-          # mingw-on-Windows (the OTHER no-SEH toolchain) joined the quarantine: as
-          # batch #4 grew the suite it now crashes mid-run on ALL mingw JDKs (confirmed
-          # cold-fault — the artifact shows the suite ran deep then crashed at a hook
-          # module, NOT an injection/env failure). Both no-SEH windows legs are out until
-          # #28's revive/detour cold-read hardening lands; covered by msvc-windows (SEH) +
-          # linux-gcc + linux-clang + macos-clang × all 7 JDKs.
-          - compiler: mingw
+          - compiler: __trial_none__   # placeholder — excludes no real cell
         # The frame::get_method() os::safe_read guard (Windows) fixed the DOMINANT
         # detour-thread cold-fault — most clang·windows JDKs went green — but a
         # RESIDUAL cold deref it didn't reach (a 2nd detour-side read; task #28)
