@@ -20,6 +20,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/find_class_fallback|find_class_fallback]]
 
+## Related
+
+- [[features/find_class_context_loader|find_class_context_loader]]
+- [[features/register_class|register_class]]
+
 ## Tests
 
 - `tests/test_classloader_reanchor.cpp`

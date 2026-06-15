@@ -21,6 +21,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/method_proxy_value_t|method_proxy_value_t]]
 - [[features/method_enumeration|method_enumeration]]
 
+## Related
+
+- [[features/find_methods_by_signature|find_methods_by_signature]]
+- [[features/method_explicit_signature|method_explicit_signature]]
+
 ## Depended on by
 
 - [[features/method_call_jni_fallback|method_call_jni_fallback]]

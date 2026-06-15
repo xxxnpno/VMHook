@@ -20,6 +20,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]]
 
+## Related
+
+- [[features/adapter_recovery_c2i|adapter_recovery_c2i]]
+
 ## Depended on by
 
 - [[features/adapter_recovery_c2i|adapter_recovery_c2i]]

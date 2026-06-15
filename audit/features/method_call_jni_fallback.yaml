@@ -24,7 +24,13 @@ depends_on:
 - method_call_primitives
 - jni_arg_packing
 - jni_local_ref_hygiene
-related: []
+related:
+- method_call_wide_args
+- method_call_object
+- method_call_return_void
+- method_call_string
+- method_return_types
+- method_static
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

@@ -21,6 +21,15 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/hook_basic|hook_basic]]
 - [[features/shutdown_hooks_teardown|shutdown_hooks_teardown]]
 
+## Related
+
+- [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]]
+- [[features/dont_inline_dont_compile|dont_inline_dont_compile]]
+- [[features/hook_chaining|hook_chaining]]
+- [[features/hook_install_after_jit|hook_install_after_jit]]
+- [[features/hook_signature|hook_signature]]
+- [[features/hook_verify_repair|hook_verify_repair]]
+
 ## Tests
 
 - `tests/jvm/modules/hook_unhook_double_free.cpp`

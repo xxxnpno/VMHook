@@ -20,6 +20,15 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/method_call_primitives|method_call_primitives]]
 
+## Related
+
+- [[features/method_call_jni_fallback|method_call_jni_fallback]]
+- [[features/method_call_object|method_call_object]]
+- [[features/method_call_return_void|method_call_return_void]]
+- [[features/method_call_string|method_call_string]]
+- [[features/method_call_wide_args|method_call_wide_args]]
+- [[features/method_return_types|method_return_types]]
+
 ## Depended on by
 
 - [[features/method_static_portability|method_static_portability]]

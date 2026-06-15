@@ -24,7 +24,8 @@ depends_on:
 - field_object_ref
 - read_java_string
 - make_java_string
-related: []
+related:
+- field_arrays_object
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

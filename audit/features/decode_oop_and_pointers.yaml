@@ -23,7 +23,8 @@ test_modules:
 depends_on:
 - compressed_oops_decode
 - os_safe_read
-related: []
+related:
+- vmstructs_offset_resolution
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

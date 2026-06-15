@@ -23,7 +23,13 @@ test_modules:
 depends_on:
 - vmstructs_offset_resolution
 - klass_introspection
-related: []
+related:
+- compressed_klass_decode
+- compressed_oops_decode
+- constantpool_access
+- instanceklass_methods_walk
+- interface_polymorphism
+- klass_introspection
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

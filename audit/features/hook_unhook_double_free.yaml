@@ -23,7 +23,13 @@ test_modules:
 depends_on:
 - hook_basic
 - shutdown_hooks_teardown
-related: []
+related:
+- hook_reinstall_after_shutdown
+- dont_inline_dont_compile
+- hook_chaining
+- hook_install_after_jit
+- hook_signature
+- hook_verify_repair
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

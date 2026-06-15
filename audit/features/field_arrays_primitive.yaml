@@ -23,7 +23,8 @@ test_modules:
 depends_on:
 - field_primitives_get
 - array_element_helpers
-related: []
+related:
+- field_arrays_object
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

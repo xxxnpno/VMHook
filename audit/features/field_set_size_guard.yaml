@@ -22,7 +22,10 @@ test_modules:
 - tests/jvm/modules/field_set_size_guard.cpp
 depends_on:
 - field_proxy_value_t
-related: []
+related:
+- field_primitives_get
+- field_primitives_set
+- field_proxy_set_guards
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

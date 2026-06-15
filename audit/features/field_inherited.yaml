@@ -23,7 +23,11 @@ test_modules:
 depends_on:
 - field_introspection
 - klass_introspection
-related: []
+related:
+- field_null_safety
+- field_primitives_get
+- field_proxy_value_t
+- field_static
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

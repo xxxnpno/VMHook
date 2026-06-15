@@ -22,7 +22,13 @@ test_modules:
 - tests/jvm/modules/method_return_types.cpp
 depends_on:
 - method_call_primitives
-related: []
+related:
+- method_call_jni_fallback
+- method_call_object
+- method_call_return_void
+- method_call_string
+- method_call_wide_args
+- method_static
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

@@ -24,7 +24,9 @@ depends_on:
 - collection_list
 - collection_set
 - collection_map
-related: []
+related:
+- collection_hash_tree_map
+- collection_linked_list
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

@@ -21,6 +21,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/compressed_oops_decode|compressed_oops_decode]]
 - [[features/os_safe_read|os_safe_read]]
 
+## Related
+
+- [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]]
+
 ## Depended on by
 
 - [[features/hook_basic|hook_basic]]

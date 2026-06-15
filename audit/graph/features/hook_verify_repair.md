@@ -21,6 +21,15 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/hook_basic|hook_basic]]
 - [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]]
 
+## Related
+
+- [[features/hook_chaining|hook_chaining]]
+- [[features/dont_inline_dont_compile|dont_inline_dont_compile]]
+- [[features/hook_basic|hook_basic]]
+- [[features/hook_install_after_jit|hook_install_after_jit]]
+- [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]]
+- [[features/hook_signature|hook_signature]]
+
 ## Tests
 
 - `tests/jvm/modules/hook_verify_repair.cpp`

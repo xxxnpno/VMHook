@@ -48,6 +48,60 @@ from registry import (
 
 
 # ----------------------------------------------------------------------
+# auto-related: fill empty `related` fields from same-category siblings
+# that share at least one `depends_on` slug.  Hand-edited / non-empty
+# `related` lists are NEVER overwritten — only `[]` is replaced.
+# ----------------------------------------------------------------------
+
+# Cap so the inferred list cannot explode for dense clusters.
+AUTO_RELATED_MAX = 6
+
+
+def cmd_auto_related() -> int:
+    manifests = load_all_manifests()
+    if not manifests:
+        eprint("[auto-related] no manifests on disk — run `init` first")
+        return 1
+
+    # group slugs by category
+    by_cat: Dict[str, List[str]] = {}
+    for slug, m in manifests.items():
+        by_cat.setdefault(m.get("category", "infra"), []).append(slug)
+
+    updated: List[Tuple[str, List[str]]] = []
+    for slug, m in manifests.items():
+        # Only fill when explicitly empty.  Preserves any hand-curated value.
+        if m.get("related"):
+            continue
+        my_deps = set(m.get("depends_on") or [])
+        if not my_deps:
+            continue
+        cat = m.get("category", "infra")
+        sibs = [s for s in by_cat.get(cat, []) if s != slug]
+        scored: List[Tuple[int, str]] = []
+        for sib in sibs:
+            sib_deps = set(manifests[sib].get("depends_on") or [])
+            shared = my_deps & sib_deps
+            if shared:
+                scored.append((len(shared), sib))
+        # most overlap first, alpha as tie-breaker; cap the list length.
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        new_related = [s for _, s in scored[:AUTO_RELATED_MAX]]
+        if new_related:
+            m["related"] = new_related
+            dump_manifest(slug, m)
+            updated.append((slug, new_related))
+
+    if not updated:
+        print("[auto-related] no empty `related` fields needed seeding")
+        return 0
+    print(f"[auto-related] seeded `related` on {len(updated)} manifest(s):")
+    for slug, rel in updated:
+        print(f"  + {slug:42} -> {', '.join(rel)}")
+    return 0
+
+
+# ----------------------------------------------------------------------
 # init: stub any missing manifests
 # ----------------------------------------------------------------------
 
@@ -577,16 +631,21 @@ def main(argv: List[str]) -> int:
         "command",
         nargs="?",
         default="all",
-        choices=("init", "vault", "all", "check"),
-        help="default: all (init + vault)",
+        choices=("init", "auto-related", "vault", "all", "check"),
+        help="default: all (init + auto-related + vault)",
     )
     ns = p.parse_args(argv)
     if ns.command == "init":
         return cmd_init()
+    if ns.command == "auto-related":
+        return cmd_auto_related()
     if ns.command == "vault":
         return cmd_vault()
     if ns.command == "all":
         rc = cmd_init()
+        if rc != 0:
+            return rc
+        rc = cmd_auto_related()
         if rc != 0:
             return rc
         return cmd_vault()

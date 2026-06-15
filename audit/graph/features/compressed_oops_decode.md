@@ -20,6 +20,14 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]]
 
+## Related
+
+- [[features/compressed_klass_decode|compressed_klass_decode]]
+- [[features/constantpool_access|constantpool_access]]
+- [[features/find_class_fallback|find_class_fallback]]
+- [[features/instanceklass_methods_walk|instanceklass_methods_walk]]
+- [[features/klass_introspection|klass_introspection]]
+
 ## Depended on by
 
 - [[features/decode_oop_and_pointers|decode_oop_and_pointers]]

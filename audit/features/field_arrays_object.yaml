@@ -24,7 +24,10 @@ depends_on:
 - field_object_ref
 - array_element_helpers
 - wrapper_pattern
-related: []
+related:
+- field_arrays_primitive
+- field_object_ref
+- field_string
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

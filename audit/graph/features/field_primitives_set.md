@@ -21,6 +21,12 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/field_proxy_set_guards|field_proxy_set_guards]]
 - [[features/field_proxy_value_t|field_proxy_value_t]]
 
+## Related
+
+- [[features/field_primitives_get|field_primitives_get]]
+- [[features/field_proxy_set_guards|field_proxy_set_guards]]
+- [[features/field_set_size_guard|field_set_size_guard]]
+
 ## Tests
 
 - `tests/jvm/modules/field_primitives_set.cpp`

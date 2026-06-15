@@ -22,6 +22,15 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/jni_arg_packing|jni_arg_packing]]
 - [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]]
 
+## Related
+
+- [[features/method_call_wide_args|method_call_wide_args]]
+- [[features/method_call_object|method_call_object]]
+- [[features/method_call_return_void|method_call_return_void]]
+- [[features/method_call_string|method_call_string]]
+- [[features/method_return_types|method_return_types]]
+- [[features/method_static|method_static]]
+
 ## Tests
 
 - `tests/jvm/modules/method_call_jni_fallback.cpp`

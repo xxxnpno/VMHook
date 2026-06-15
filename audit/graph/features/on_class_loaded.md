@@ -20,6 +20,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/hook_basic|hook_basic]]
 
+## Related
+
+- [[features/on_exception|on_exception]]
+- [[features/shutdown_hooks_teardown|shutdown_hooks_teardown]]
+
 ## Tests
 
 - `tests/jvm/modules/on_class_loaded.cpp`

@@ -21,6 +21,13 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]]
 - [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]]
 
+## Related
+
+- [[features/hook_basic|hook_basic]]
+- [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]]
+- [[features/hook_install_after_jit|hook_install_after_jit]]
+- [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]]
+
 ## Depended on by
 
 - [[features/deoptimize_methods|deoptimize_methods]]

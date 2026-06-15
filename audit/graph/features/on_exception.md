@@ -20,6 +20,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/hook_basic|hook_basic]]
 
+## Related
+
+- [[features/on_class_loaded|on_class_loaded]]
+- [[features/shutdown_hooks_teardown|shutdown_hooks_teardown]]
+
 ## Depended on by
 
 - [[features/method_throwing_call_site|method_throwing_call_site]]

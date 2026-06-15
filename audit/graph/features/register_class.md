@@ -21,6 +21,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/wrapper_pattern|wrapper_pattern]]
 - [[features/find_class_fallback|find_class_fallback]]
 
+## Related
+
+- [[features/classloader_reanchor|classloader_reanchor]]
+- [[features/find_class_context_loader|find_class_context_loader]]
+
 ## Tests
 
 - `tests/jvm/modules/register_class.cpp`

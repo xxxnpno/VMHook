@@ -23,7 +23,8 @@ test_modules:
 - tests/test_global_ref.cpp
 depends_on:
 - jni_local_ref_hygiene
-related: []
+related:
+- make_java_string
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

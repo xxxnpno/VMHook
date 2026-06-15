@@ -23,7 +23,10 @@ test_modules:
 depends_on:
 - klass_introspection
 - field_inherited
-related: []
+related:
+- find_class_fallback
+- interface_polymorphism
+- nested_classes
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

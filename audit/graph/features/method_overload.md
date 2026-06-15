@@ -21,6 +21,12 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/signature_parsing|signature_parsing]]
 - [[features/method_explicit_signature|method_explicit_signature]]
 
+## Related
+
+- [[features/find_methods_by_signature|find_methods_by_signature]]
+- [[features/method_explicit_signature|method_explicit_signature]]
+- [[features/method_is_reference|method_is_reference]]
+
 ## Depended on by
 
 - [[features/interface_polymorphism|interface_polymorphism]]

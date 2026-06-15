@@ -20,6 +20,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]]
 
+## Related
+
+- [[features/make_java_string|make_java_string]]
+
 ## Tests
 
 - `tests/jvm/modules/global_ref.cpp`

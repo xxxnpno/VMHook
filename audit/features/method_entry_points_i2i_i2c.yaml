@@ -21,7 +21,8 @@ hpp_anchors: []
 test_modules: []
 depends_on:
 - vmstructs_offset_resolution
-related: []
+related:
+- adapter_recovery_c2i
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

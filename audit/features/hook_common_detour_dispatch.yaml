@@ -23,7 +23,10 @@ depends_on:
 - seh_invoke_detour
 - interpreter_frame_walk
 - method_entry_points_i2i_i2c
-related: []
+related:
+- hook_basic
+- adapter_recovery_c2i
+- hook_install_after_jit
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

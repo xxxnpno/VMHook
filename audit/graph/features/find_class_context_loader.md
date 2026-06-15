@@ -20,6 +20,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/find_class_fallback|find_class_fallback]]
 
+## Related
+
+- [[features/classloader_reanchor|classloader_reanchor]]
+- [[features/register_class|register_class]]
+
 ## Tests
 
 - `tests/jvm/modules/find_class_context_loader.cpp`

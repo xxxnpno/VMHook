@@ -22,7 +22,10 @@ test_modules:
 - tests/jvm/modules/nested_classes.cpp
 depends_on:
 - klass_introspection
-related: []
+related:
+- find_class_fallback
+- interface_polymorphism
+- poly_inherited_oop
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

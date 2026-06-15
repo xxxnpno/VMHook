@@ -21,6 +21,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/collection_map|collection_map]]
 - [[features/collection_iteration_safety|collection_iteration_safety]]
 
+## Related
+
+- [[features/collection_iteration_safety|collection_iteration_safety]]
+- [[features/collection_linked_list|collection_linked_list]]
+
 ## Tests
 
 - `tests/jvm/modules/collection_hash_tree_map.cpp`

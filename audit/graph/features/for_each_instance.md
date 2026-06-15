@@ -21,6 +21,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/klass_introspection|klass_introspection]]
 - [[features/iterate_entries_safety|iterate_entries_safety]]
 
+## Related
+
+- [[features/for_each_loaded_class|for_each_loaded_class]]
+- [[features/for_each_thread|for_each_thread]]
+
 ## Tests
 
 - `tests/jvm/modules/for_each_instance.cpp`

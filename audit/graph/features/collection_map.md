@@ -21,6 +21,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/collection_type_tags|collection_type_tags]]
 - [[features/wrapper_pattern|wrapper_pattern]]
 
+## Related
+
+- [[features/collection_list|collection_list]]
+- [[features/collection_set|collection_set]]
+
 ## Depended on by
 
 - [[features/collection_hash_tree_map|collection_hash_tree_map]]

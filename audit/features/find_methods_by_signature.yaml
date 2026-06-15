@@ -23,7 +23,11 @@ test_modules:
 depends_on:
 - signature_parsing
 - method_enumeration
-related: []
+related:
+- method_explicit_signature
+- method_call_primitives
+- method_is_reference
+- method_overload
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

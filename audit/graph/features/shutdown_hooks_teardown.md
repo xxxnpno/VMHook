@@ -20,6 +20,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/hook_basic|hook_basic]]
 
+## Related
+
+- [[features/on_class_loaded|on_class_loaded]]
+- [[features/on_exception|on_exception]]
+
 ## Depended on by
 
 - [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]]

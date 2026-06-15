@@ -21,6 +21,15 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]]
 - [[features/klass_introspection|klass_introspection]]
 
+## Related
+
+- [[features/compressed_klass_decode|compressed_klass_decode]]
+- [[features/compressed_oops_decode|compressed_oops_decode]]
+- [[features/constantpool_access|constantpool_access]]
+- [[features/instanceklass_methods_walk|instanceklass_methods_walk]]
+- [[features/interface_polymorphism|interface_polymorphism]]
+- [[features/klass_introspection|klass_introspection]]
+
 ## Depended on by
 
 - [[features/classloader_reanchor|classloader_reanchor]]

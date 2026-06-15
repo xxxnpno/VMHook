@@ -22,6 +22,12 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/interpreter_frame_walk|interpreter_frame_walk]]
 - [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]]
 
+## Related
+
+- [[features/hook_basic|hook_basic]]
+- [[features/adapter_recovery_c2i|adapter_recovery_c2i]]
+- [[features/hook_install_after_jit|hook_install_after_jit]]
+
 ## Depended on by
 
 - [[features/hook_basic|hook_basic]]

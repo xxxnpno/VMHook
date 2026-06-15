@@ -21,6 +21,12 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/klass_introspection|klass_introspection]]
 - [[features/field_inherited|field_inherited]]
 
+## Related
+
+- [[features/find_class_fallback|find_class_fallback]]
+- [[features/interface_polymorphism|interface_polymorphism]]
+- [[features/nested_classes|nested_classes]]
+
 ## Tests
 
 - `tests/jvm/modules/poly_inherited_oop.cpp`

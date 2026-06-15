@@ -20,6 +20,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/os_safe_read|os_safe_read]]
 
+## Related
+
+- [[features/decode_oop_and_pointers|decode_oop_and_pointers]]
+
 ## Depended on by
 
 - [[features/adapter_recovery_c2i|adapter_recovery_c2i]]

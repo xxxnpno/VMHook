@@ -22,7 +22,11 @@ test_modules: []
 depends_on:
 - method_entry_points_i2i_i2c
 - vmstructs_offset_resolution
-related: []
+related:
+- hook_basic
+- hook_common_detour_dispatch
+- hook_install_after_jit
+- method_entry_points_i2i_i2c
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

@@ -21,6 +21,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/field_primitives_get|field_primitives_get]]
 - [[features/array_element_helpers|array_element_helpers]]
 
+## Related
+
+- [[features/field_arrays_object|field_arrays_object]]
+
 ## Tests
 
 - `tests/jvm/modules/field_arrays_primitive.cpp`

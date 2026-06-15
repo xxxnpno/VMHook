@@ -22,6 +22,15 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/signature_parsing|signature_parsing]]
 - [[features/method_explicit_signature|method_explicit_signature]]
 
+## Related
+
+- [[features/dont_inline_dont_compile|dont_inline_dont_compile]]
+- [[features/hook_basic|hook_basic]]
+- [[features/hook_chaining|hook_chaining]]
+- [[features/hook_install_after_jit|hook_install_after_jit]]
+- [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]]
+- [[features/hook_unhook_double_free|hook_unhook_double_free]]
+
 ## Tests
 
 - `tests/jvm/modules/hook_signature.cpp`

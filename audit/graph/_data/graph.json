@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-06-15T21:12:32Z",
+  "generated_at": "2026-06-15T21:19:59Z",
   "feature_count": 109,
-  "edge_count": 166,
+  "edge_count": 434,
   "categories": [
     {
       "slug": "bootstrap",
@@ -204,7 +204,12 @@
         "method_entry_points_i2i_i2c",
         "vmstructs_offset_resolution"
       ],
-      "related": [],
+      "related": [
+        "hook_basic",
+        "hook_common_detour_dispatch",
+        "hook_install_after_jit",
+        "method_entry_points_i2i_i2c"
+      ],
       "tags": [],
       "test_modules": [],
       "audit_docs": [],
@@ -274,7 +279,10 @@
       "depends_on": [
         "find_class_fallback"
       ],
-      "related": [],
+      "related": [
+        "find_class_context_loader",
+        "register_class"
+      ],
       "tags": [],
       "test_modules": [
         "tests/test_classloader_reanchor.cpp"
@@ -301,7 +309,10 @@
         "collection_map",
         "collection_iteration_safety"
       ],
-      "related": [],
+      "related": [
+        "collection_iteration_safety",
+        "collection_linked_list"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/collection_hash_tree_map.cpp"
@@ -329,7 +340,10 @@
         "collection_set",
         "collection_map"
       ],
-      "related": [],
+      "related": [
+        "collection_hash_tree_map",
+        "collection_linked_list"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/collection_iteration_safety.cpp"
@@ -356,7 +370,10 @@
         "collection_list",
         "collection_iteration_safety"
       ],
-      "related": [],
+      "related": [
+        "collection_hash_tree_map",
+        "collection_iteration_safety"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/collection_linked_list.cpp"
@@ -384,7 +401,10 @@
         "array_element_helpers",
         "wrapper_pattern"
       ],
-      "related": [],
+      "related": [
+        "collection_map",
+        "collection_set"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/collection_list.cpp"
@@ -411,7 +431,10 @@
         "collection_type_tags",
         "wrapper_pattern"
       ],
-      "related": [],
+      "related": [
+        "collection_list",
+        "collection_set"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/collection_map.cpp"
@@ -438,7 +461,10 @@
         "collection_type_tags",
         "wrapper_pattern"
       ],
-      "related": [],
+      "related": [
+        "collection_list",
+        "collection_map"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/collection_set.cpp",
@@ -491,7 +517,13 @@
       "depends_on": [
         "vmstructs_offset_resolution"
       ],
-      "related": [],
+      "related": [
+        "compressed_oops_decode",
+        "constantpool_access",
+        "find_class_fallback",
+        "instanceklass_methods_walk",
+        "klass_introspection"
+      ],
       "tags": [],
       "test_modules": [
         "tests/test_compressed_klass_decode.cpp"
@@ -517,7 +549,13 @@
       "depends_on": [
         "vmstructs_offset_resolution"
       ],
-      "related": [],
+      "related": [
+        "compressed_klass_decode",
+        "constantpool_access",
+        "find_class_fallback",
+        "instanceklass_methods_walk",
+        "klass_introspection"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/compressed_oops_decode.cpp"
@@ -569,7 +607,13 @@
       "depends_on": [
         "vmstructs_offset_resolution"
       ],
-      "related": [],
+      "related": [
+        "compressed_klass_decode",
+        "compressed_oops_decode",
+        "find_class_fallback",
+        "instanceklass_methods_walk",
+        "klass_introspection"
+      ],
       "tags": [],
       "test_modules": [],
       "audit_docs": [],
@@ -594,7 +638,9 @@
         "compressed_oops_decode",
         "os_safe_read"
       ],
-      "related": [],
+      "related": [
+        "vmstructs_offset_resolution"
+      ],
       "tags": [],
       "test_modules": [
         "tests/test_decode_oop_and_pointers.cpp"
@@ -695,7 +741,14 @@
         "method_flags_width",
         "hook_basic"
       ],
-      "related": [],
+      "related": [
+        "hook_chaining",
+        "hook_install_after_jit",
+        "hook_reinstall_after_shutdown",
+        "hook_signature",
+        "hook_unhook_double_free",
+        "hook_verify_repair"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/dont_inline_dont_compile.cpp"
@@ -750,7 +803,11 @@
         "array_element_helpers",
         "wrapper_pattern"
       ],
-      "related": [],
+      "related": [
+        "field_arrays_primitive",
+        "field_object_ref",
+        "field_string"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/field_arrays_object.cpp"
@@ -777,7 +834,9 @@
         "field_primitives_get",
         "array_element_helpers"
       ],
-      "related": [],
+      "related": [
+        "field_arrays_object"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/field_arrays_primitive.cpp"
@@ -804,7 +863,12 @@
         "field_introspection",
         "klass_introspection"
       ],
-      "related": [],
+      "related": [
+        "field_null_safety",
+        "field_primitives_get",
+        "field_proxy_value_t",
+        "field_static"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/field_inherited.cpp"
@@ -857,7 +921,12 @@
       "depends_on": [
         "field_introspection"
       ],
-      "related": [],
+      "related": [
+        "field_inherited",
+        "field_primitives_get",
+        "field_proxy_value_t",
+        "field_static"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/field_null_safety.cpp"
@@ -884,7 +953,9 @@
         "wrapper_pattern",
         "compressed_oops_decode"
       ],
-      "related": [],
+      "related": [
+        "field_arrays_object"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/field_object_ref.cpp"
@@ -911,7 +982,14 @@
         "field_introspection",
         "field_proxy_value_t"
       ],
-      "related": [],
+      "related": [
+        "field_inherited",
+        "field_null_safety",
+        "field_primitives_set",
+        "field_proxy_set_guards",
+        "field_proxy_value_t",
+        "field_set_size_guard"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/field_primitives_get.cpp"
@@ -938,7 +1016,11 @@
         "field_proxy_set_guards",
         "field_proxy_value_t"
       ],
-      "related": [],
+      "related": [
+        "field_primitives_get",
+        "field_proxy_set_guards",
+        "field_set_size_guard"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/field_primitives_set.cpp"
@@ -965,7 +1047,11 @@
         "field_set_size_guard",
         "field_proxy_value_t"
       ],
-      "related": [],
+      "related": [
+        "field_primitives_get",
+        "field_primitives_set",
+        "field_set_size_guard"
+      ],
       "tags": [],
       "test_modules": [
         "tests/test_field_proxy_set_guards.cpp"
@@ -991,7 +1077,12 @@
       "depends_on": [
         "field_introspection"
       ],
-      "related": [],
+      "related": [
+        "field_inherited",
+        "field_null_safety",
+        "field_primitives_get",
+        "field_static"
+      ],
       "tags": [],
       "test_modules": [],
       "audit_docs": [],
@@ -1015,7 +1106,11 @@
       "depends_on": [
         "field_proxy_value_t"
       ],
-      "related": [],
+      "related": [
+        "field_primitives_get",
+        "field_primitives_set",
+        "field_proxy_set_guards"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/field_set_size_guard.cpp"
@@ -1041,7 +1136,12 @@
       "depends_on": [
         "field_introspection"
       ],
-      "related": [],
+      "related": [
+        "field_inherited",
+        "field_null_safety",
+        "field_primitives_get",
+        "field_proxy_value_t"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/field_static.cpp"
@@ -1069,7 +1169,9 @@
         "read_java_string",
         "make_java_string"
       ],
-      "related": [],
+      "related": [
+        "field_arrays_object"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/field_string.cpp"
@@ -1095,7 +1197,10 @@
       "depends_on": [
         "find_class_fallback"
       ],
-      "related": [],
+      "related": [
+        "classloader_reanchor",
+        "register_class"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/find_class_context_loader.cpp"
@@ -1122,7 +1227,14 @@
         "vmstructs_offset_resolution",
         "klass_introspection"
       ],
-      "related": [],
+      "related": [
+        "compressed_klass_decode",
+        "compressed_oops_decode",
+        "constantpool_access",
+        "instanceklass_methods_walk",
+        "interface_polymorphism",
+        "klass_introspection"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/find_class_fallback.cpp"
@@ -1149,7 +1261,12 @@
         "signature_parsing",
         "method_enumeration"
       ],
-      "related": [],
+      "related": [
+        "method_explicit_signature",
+        "method_call_primitives",
+        "method_is_reference",
+        "method_overload"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/find_methods_by_signature.cpp"
@@ -1176,7 +1293,10 @@
         "klass_introspection",
         "iterate_entries_safety"
       ],
-      "related": [],
+      "related": [
+        "for_each_loaded_class",
+        "for_each_thread"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/for_each_instance.cpp"
@@ -1203,7 +1323,10 @@
         "iterate_entries_safety",
         "klass_introspection"
       ],
-      "related": [],
+      "related": [
+        "for_each_instance",
+        "for_each_thread"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/for_each_loaded_class.cpp"
@@ -1229,7 +1352,10 @@
       "depends_on": [
         "iterate_entries_safety"
       ],
-      "related": [],
+      "related": [
+        "for_each_instance",
+        "for_each_loaded_class"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/for_each_thread.cpp"
@@ -1255,7 +1381,9 @@
       "depends_on": [
         "jni_local_ref_hygiene"
       ],
-      "related": [],
+      "related": [
+        "make_java_string"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/global_ref.cpp",
@@ -1332,7 +1460,14 @@
         "midi2i_trampoline_alloc",
         "hook_common_detour_dispatch"
       ],
-      "related": [],
+      "related": [
+        "hook_basic",
+        "hook_verify_repair",
+        "dont_inline_dont_compile",
+        "hook_install_after_jit",
+        "hook_reinstall_after_shutdown",
+        "hook_signature"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/hook_chaining.cpp"
@@ -1360,7 +1495,11 @@
         "interpreter_frame_walk",
         "method_entry_points_i2i_i2c"
       ],
-      "related": [],
+      "related": [
+        "hook_basic",
+        "adapter_recovery_c2i",
+        "hook_install_after_jit"
+      ],
       "tags": [],
       "test_modules": [],
       "audit_docs": [],
@@ -1387,7 +1526,14 @@
         "method_entry_points_i2i_i2c",
         "adapter_recovery_c2i"
       ],
-      "related": [],
+      "related": [
+        "adapter_recovery_c2i",
+        "dont_inline_dont_compile",
+        "hook_basic",
+        "hook_chaining",
+        "hook_common_detour_dispatch",
+        "hook_reinstall_after_shutdown"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/hook_install_after_jit.cpp"
@@ -1414,7 +1560,14 @@
         "shutdown_hooks_teardown",
         "hook_basic"
       ],
-      "related": [],
+      "related": [
+        "hook_unhook_double_free",
+        "dont_inline_dont_compile",
+        "hook_chaining",
+        "hook_install_after_jit",
+        "hook_signature",
+        "hook_verify_repair"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/hook_reinstall_after_shutdown.cpp"
@@ -1442,7 +1595,14 @@
         "signature_parsing",
         "method_explicit_signature"
       ],
-      "related": [],
+      "related": [
+        "dont_inline_dont_compile",
+        "hook_basic",
+        "hook_chaining",
+        "hook_install_after_jit",
+        "hook_reinstall_after_shutdown",
+        "hook_unhook_double_free"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/hook_signature.cpp"
@@ -1469,7 +1629,14 @@
         "hook_basic",
         "shutdown_hooks_teardown"
       ],
-      "related": [],
+      "related": [
+        "hook_reinstall_after_shutdown",
+        "dont_inline_dont_compile",
+        "hook_chaining",
+        "hook_install_after_jit",
+        "hook_signature",
+        "hook_verify_repair"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/hook_unhook_double_free.cpp"
@@ -1496,7 +1663,14 @@
         "hook_basic",
         "midi2i_trampoline_alloc"
       ],
-      "related": [],
+      "related": [
+        "hook_chaining",
+        "dont_inline_dont_compile",
+        "hook_basic",
+        "hook_install_after_jit",
+        "hook_reinstall_after_shutdown",
+        "hook_signature"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/hook_verify_repair.cpp"
@@ -1544,7 +1718,13 @@
       "depends_on": [
         "vmstructs_offset_resolution"
       ],
-      "related": [],
+      "related": [
+        "compressed_klass_decode",
+        "compressed_oops_decode",
+        "constantpool_access",
+        "find_class_fallback",
+        "klass_introspection"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/instanceklass_methods_walk.cpp"
@@ -1571,7 +1751,11 @@
         "klass_introspection",
         "method_overload"
       ],
-      "related": [],
+      "related": [
+        "find_class_fallback",
+        "nested_classes",
+        "poly_inherited_oop"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/interface_polymorphism.cpp"
@@ -1695,7 +1879,13 @@
         "instanceklass_methods_walk",
         "compressed_klass_decode"
       ],
-      "related": [],
+      "related": [
+        "compressed_klass_decode",
+        "compressed_oops_decode",
+        "constantpool_access",
+        "find_class_fallback",
+        "instanceklass_methods_walk"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/klass_introspection.cpp",
@@ -1772,7 +1962,9 @@
       "depends_on": [
         "jni_local_ref_hygiene"
       ],
-      "related": [],
+      "related": [
+        "global_ref"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/make_java_string.cpp"
@@ -1827,7 +2019,14 @@
         "jni_arg_packing",
         "jni_local_ref_hygiene"
       ],
-      "related": [],
+      "related": [
+        "method_call_wide_args",
+        "method_call_object",
+        "method_call_return_void",
+        "method_call_string",
+        "method_return_types",
+        "method_static"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_call_jni_fallback.cpp"
@@ -1854,7 +2053,14 @@
         "method_call_primitives",
         "wrapper_pattern"
       ],
-      "related": [],
+      "related": [
+        "method_call_jni_fallback",
+        "method_call_return_void",
+        "method_call_string",
+        "method_call_wide_args",
+        "method_proxy_value_t",
+        "method_return_types"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_call_object.cpp"
@@ -1881,7 +2087,10 @@
         "method_proxy_value_t",
         "method_enumeration"
       ],
-      "related": [],
+      "related": [
+        "find_methods_by_signature",
+        "method_explicit_signature"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_call_primitives.cpp"
@@ -1907,7 +2116,14 @@
       "depends_on": [
         "method_call_primitives"
       ],
-      "related": [],
+      "related": [
+        "method_call_jni_fallback",
+        "method_call_object",
+        "method_call_string",
+        "method_call_wide_args",
+        "method_return_types",
+        "method_static"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_call_return_void.cpp"
@@ -1935,7 +2151,14 @@
         "make_java_string",
         "read_java_string"
       ],
-      "related": [],
+      "related": [
+        "method_call_jni_fallback",
+        "method_call_object",
+        "method_call_return_void",
+        "method_call_wide_args",
+        "method_return_types",
+        "method_static"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_call_string.cpp"
@@ -1962,7 +2185,14 @@
         "method_call_primitives",
         "jni_arg_packing"
       ],
-      "related": [],
+      "related": [
+        "method_call_jni_fallback",
+        "method_call_object",
+        "method_call_return_void",
+        "method_call_string",
+        "method_return_types",
+        "method_static"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_call_wide_args.cpp"
@@ -1988,7 +2218,9 @@
       "depends_on": [
         "vmstructs_offset_resolution"
       ],
-      "related": [],
+      "related": [
+        "adapter_recovery_c2i"
+      ],
       "tags": [],
       "test_modules": [],
       "audit_docs": [],
@@ -2040,7 +2272,12 @@
         "signature_parsing",
         "method_enumeration"
       ],
-      "related": [],
+      "related": [
+        "find_methods_by_signature",
+        "method_call_primitives",
+        "method_is_reference",
+        "method_overload"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_explicit_signature.cpp"
@@ -2092,7 +2329,11 @@
       "depends_on": [
         "signature_parsing"
       ],
-      "related": [],
+      "related": [
+        "find_methods_by_signature",
+        "method_explicit_signature",
+        "method_overload"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_is_reference.cpp"
@@ -2119,7 +2360,11 @@
         "signature_parsing",
         "method_explicit_signature"
       ],
-      "related": [],
+      "related": [
+        "find_methods_by_signature",
+        "method_explicit_signature",
+        "method_is_reference"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_overload.cpp"
@@ -2171,7 +2416,9 @@
       "depends_on": [
         "wrapper_pattern"
       ],
-      "related": [],
+      "related": [
+        "method_call_object"
+      ],
       "tags": [],
       "test_modules": [
         "tests/test_method_proxy_value_t.cpp"
@@ -2197,7 +2444,14 @@
       "depends_on": [
         "method_call_primitives"
       ],
-      "related": [],
+      "related": [
+        "method_call_jni_fallback",
+        "method_call_object",
+        "method_call_return_void",
+        "method_call_string",
+        "method_call_wide_args",
+        "method_static"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_return_types.cpp"
@@ -2223,7 +2477,14 @@
       "depends_on": [
         "method_call_primitives"
       ],
-      "related": [],
+      "related": [
+        "method_call_jni_fallback",
+        "method_call_object",
+        "method_call_return_void",
+        "method_call_string",
+        "method_call_wide_args",
+        "method_return_types"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_static.cpp"
@@ -2276,7 +2537,14 @@
         "method_call_primitives",
         "on_exception"
       ],
-      "related": [],
+      "related": [
+        "method_call_jni_fallback",
+        "method_call_object",
+        "method_call_return_void",
+        "method_call_string",
+        "method_call_wide_args",
+        "method_return_types"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/method_throwing_call_site.cpp"
@@ -2329,7 +2597,11 @@
       "depends_on": [
         "klass_introspection"
       ],
-      "related": [],
+      "related": [
+        "find_class_fallback",
+        "interface_polymorphism",
+        "poly_inherited_oop"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/nested_classes.cpp"
@@ -2355,7 +2627,10 @@
       "depends_on": [
         "hook_basic"
       ],
-      "related": [],
+      "related": [
+        "on_exception",
+        "shutdown_hooks_teardown"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/on_class_loaded.cpp"
@@ -2381,7 +2656,10 @@
       "depends_on": [
         "hook_basic"
       ],
-      "related": [],
+      "related": [
+        "on_class_loaded",
+        "shutdown_hooks_teardown"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/on_exception.cpp"
@@ -2568,7 +2846,11 @@
         "klass_introspection",
         "field_inherited"
       ],
-      "related": [],
+      "related": [
+        "find_class_fallback",
+        "interface_polymorphism",
+        "nested_classes"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/poly_inherited_oop.cpp"
@@ -2621,7 +2903,10 @@
         "wrapper_pattern",
         "find_class_fallback"
       ],
-      "related": [],
+      "related": [
+        "classloader_reanchor",
+        "find_class_context_loader"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/register_class.cpp"
@@ -2647,7 +2932,14 @@
       "depends_on": [
         "interpreter_frame_walk"
       ],
-      "related": [],
+      "related": [
+        "return_frame_raw_access",
+        "return_set_arg",
+        "return_set_primitives",
+        "return_set_wrapper_null",
+        "return_stack_trace_depth",
+        "return_value_cancel"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/return_caller.cpp"
@@ -2673,7 +2965,14 @@
       "depends_on": [
         "interpreter_frame_walk"
       ],
-      "related": [],
+      "related": [
+        "return_caller",
+        "return_set_arg",
+        "return_set_primitives",
+        "return_set_wrapper_null",
+        "return_stack_trace_depth",
+        "return_value_cancel"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/return_frame_raw_access.cpp"
@@ -2699,7 +2998,14 @@
       "depends_on": [
         "interpreter_frame_walk"
       ],
-      "related": [],
+      "related": [
+        "return_caller",
+        "return_frame_raw_access",
+        "return_set_primitives",
+        "return_set_wrapper_null",
+        "return_stack_trace_depth",
+        "return_value_cancel"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/return_set_arg.cpp"
@@ -2725,7 +3031,14 @@
       "depends_on": [
         "interpreter_frame_walk"
       ],
-      "related": [],
+      "related": [
+        "return_caller",
+        "return_frame_raw_access",
+        "return_set_arg",
+        "return_set_wrapper_null",
+        "return_stack_trace_depth",
+        "return_value_cancel"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/return_set_primitives.cpp"
@@ -2752,7 +3065,14 @@
         "interpreter_frame_walk",
         "wrapper_pattern"
       ],
-      "related": [],
+      "related": [
+        "return_caller",
+        "return_frame_raw_access",
+        "return_set_arg",
+        "return_set_primitives",
+        "return_stack_trace_depth",
+        "return_value_cancel"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/return_set_wrapper_null.cpp"
@@ -2779,7 +3099,14 @@
         "interpreter_frame_walk",
         "return_caller"
       ],
-      "related": [],
+      "related": [
+        "return_caller",
+        "return_frame_raw_access",
+        "return_set_arg",
+        "return_set_primitives",
+        "return_set_wrapper_null",
+        "return_value_cancel"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/return_stack_trace_depth.cpp"
@@ -2805,7 +3132,14 @@
       "depends_on": [
         "interpreter_frame_walk"
       ],
-      "related": [],
+      "related": [
+        "return_caller",
+        "return_frame_raw_access",
+        "return_set_arg",
+        "return_set_primitives",
+        "return_set_wrapper_null",
+        "return_stack_trace_depth"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/return_value_cancel.cpp"
@@ -2855,7 +3189,10 @@
       "depends_on": [
         "hook_basic"
       ],
-      "related": [],
+      "related": [
+        "on_class_loaded",
+        "on_exception"
+      ],
       "tags": [],
       "test_modules": [
         "tests/jvm/modules/shutdown_hooks_teardown.cpp"
@@ -2981,7 +3318,9 @@
       "depends_on": [
         "os_safe_read"
       ],
-      "related": [],
+      "related": [
+        "decode_oop_and_pointers"
+      ],
       "tags": [],
       "test_modules": [],
       "audit_docs": [],
@@ -3059,9 +3398,39 @@
       "kind": "depends_on"
     },
     {
+      "from": "adapter_recovery_c2i",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "adapter_recovery_c2i",
+      "to": "hook_common_detour_dispatch",
+      "kind": "related"
+    },
+    {
+      "from": "adapter_recovery_c2i",
+      "to": "hook_install_after_jit",
+      "kind": "related"
+    },
+    {
+      "from": "adapter_recovery_c2i",
+      "to": "method_entry_points_i2i_i2c",
+      "kind": "related"
+    },
+    {
       "from": "classloader_reanchor",
       "to": "find_class_fallback",
       "kind": "depends_on"
+    },
+    {
+      "from": "classloader_reanchor",
+      "to": "find_class_context_loader",
+      "kind": "related"
+    },
+    {
+      "from": "classloader_reanchor",
+      "to": "register_class",
+      "kind": "related"
     },
     {
       "from": "collection_hash_tree_map",
@@ -3072,6 +3441,16 @@
       "from": "collection_hash_tree_map",
       "to": "collection_iteration_safety",
       "kind": "depends_on"
+    },
+    {
+      "from": "collection_hash_tree_map",
+      "to": "collection_iteration_safety",
+      "kind": "related"
+    },
+    {
+      "from": "collection_hash_tree_map",
+      "to": "collection_linked_list",
+      "kind": "related"
     },
     {
       "from": "collection_iteration_safety",
@@ -3089,6 +3468,16 @@
       "kind": "depends_on"
     },
     {
+      "from": "collection_iteration_safety",
+      "to": "collection_hash_tree_map",
+      "kind": "related"
+    },
+    {
+      "from": "collection_iteration_safety",
+      "to": "collection_linked_list",
+      "kind": "related"
+    },
+    {
       "from": "collection_linked_list",
       "to": "collection_list",
       "kind": "depends_on"
@@ -3097,6 +3486,16 @@
       "from": "collection_linked_list",
       "to": "collection_iteration_safety",
       "kind": "depends_on"
+    },
+    {
+      "from": "collection_linked_list",
+      "to": "collection_hash_tree_map",
+      "kind": "related"
+    },
+    {
+      "from": "collection_linked_list",
+      "to": "collection_iteration_safety",
+      "kind": "related"
     },
     {
       "from": "collection_list",
@@ -3114,6 +3513,16 @@
       "kind": "depends_on"
     },
     {
+      "from": "collection_list",
+      "to": "collection_map",
+      "kind": "related"
+    },
+    {
+      "from": "collection_list",
+      "to": "collection_set",
+      "kind": "related"
+    },
+    {
       "from": "collection_map",
       "to": "collection_type_tags",
       "kind": "depends_on"
@@ -3124,6 +3533,16 @@
       "kind": "depends_on"
     },
     {
+      "from": "collection_map",
+      "to": "collection_list",
+      "kind": "related"
+    },
+    {
+      "from": "collection_map",
+      "to": "collection_set",
+      "kind": "related"
+    },
+    {
       "from": "collection_set",
       "to": "collection_type_tags",
       "kind": "depends_on"
@@ -3132,6 +3551,16 @@
       "from": "collection_set",
       "to": "wrapper_pattern",
       "kind": "depends_on"
+    },
+    {
+      "from": "collection_set",
+      "to": "collection_list",
+      "kind": "related"
+    },
+    {
+      "from": "collection_set",
+      "to": "collection_map",
+      "kind": "related"
     },
     {
       "from": "collection_type_tags",
@@ -3144,9 +3573,59 @@
       "kind": "depends_on"
     },
     {
+      "from": "compressed_klass_decode",
+      "to": "compressed_oops_decode",
+      "kind": "related"
+    },
+    {
+      "from": "compressed_klass_decode",
+      "to": "constantpool_access",
+      "kind": "related"
+    },
+    {
+      "from": "compressed_klass_decode",
+      "to": "find_class_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "compressed_klass_decode",
+      "to": "instanceklass_methods_walk",
+      "kind": "related"
+    },
+    {
+      "from": "compressed_klass_decode",
+      "to": "klass_introspection",
+      "kind": "related"
+    },
+    {
       "from": "compressed_oops_decode",
       "to": "vmstructs_offset_resolution",
       "kind": "depends_on"
+    },
+    {
+      "from": "compressed_oops_decode",
+      "to": "compressed_klass_decode",
+      "kind": "related"
+    },
+    {
+      "from": "compressed_oops_decode",
+      "to": "constantpool_access",
+      "kind": "related"
+    },
+    {
+      "from": "compressed_oops_decode",
+      "to": "find_class_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "compressed_oops_decode",
+      "to": "instanceklass_methods_walk",
+      "kind": "related"
+    },
+    {
+      "from": "compressed_oops_decode",
+      "to": "klass_introspection",
+      "kind": "related"
     },
     {
       "from": "const_method_bounds",
@@ -3159,6 +3638,31 @@
       "kind": "depends_on"
     },
     {
+      "from": "constantpool_access",
+      "to": "compressed_klass_decode",
+      "kind": "related"
+    },
+    {
+      "from": "constantpool_access",
+      "to": "compressed_oops_decode",
+      "kind": "related"
+    },
+    {
+      "from": "constantpool_access",
+      "to": "find_class_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "constantpool_access",
+      "to": "instanceklass_methods_walk",
+      "kind": "related"
+    },
+    {
+      "from": "constantpool_access",
+      "to": "klass_introspection",
+      "kind": "related"
+    },
+    {
       "from": "decode_oop_and_pointers",
       "to": "compressed_oops_decode",
       "kind": "depends_on"
@@ -3167,6 +3671,11 @@
       "from": "decode_oop_and_pointers",
       "to": "os_safe_read",
       "kind": "depends_on"
+    },
+    {
+      "from": "decode_oop_and_pointers",
+      "to": "vmstructs_offset_resolution",
+      "kind": "related"
     },
     {
       "from": "deoptimize_methods",
@@ -3194,6 +3703,36 @@
       "kind": "depends_on"
     },
     {
+      "from": "dont_inline_dont_compile",
+      "to": "hook_chaining",
+      "kind": "related"
+    },
+    {
+      "from": "dont_inline_dont_compile",
+      "to": "hook_install_after_jit",
+      "kind": "related"
+    },
+    {
+      "from": "dont_inline_dont_compile",
+      "to": "hook_reinstall_after_shutdown",
+      "kind": "related"
+    },
+    {
+      "from": "dont_inline_dont_compile",
+      "to": "hook_signature",
+      "kind": "related"
+    },
+    {
+      "from": "dont_inline_dont_compile",
+      "to": "hook_unhook_double_free",
+      "kind": "related"
+    },
+    {
+      "from": "dont_inline_dont_compile",
+      "to": "hook_verify_repair",
+      "kind": "related"
+    },
+    {
       "from": "enum_singleton",
       "to": "wrapper_pattern",
       "kind": "depends_on"
@@ -3219,6 +3758,21 @@
       "kind": "depends_on"
     },
     {
+      "from": "field_arrays_object",
+      "to": "field_arrays_primitive",
+      "kind": "related"
+    },
+    {
+      "from": "field_arrays_object",
+      "to": "field_object_ref",
+      "kind": "related"
+    },
+    {
+      "from": "field_arrays_object",
+      "to": "field_string",
+      "kind": "related"
+    },
+    {
       "from": "field_arrays_primitive",
       "to": "field_primitives_get",
       "kind": "depends_on"
@@ -3229,6 +3783,11 @@
       "kind": "depends_on"
     },
     {
+      "from": "field_arrays_primitive",
+      "to": "field_arrays_object",
+      "kind": "related"
+    },
+    {
       "from": "field_inherited",
       "to": "field_introspection",
       "kind": "depends_on"
@@ -3237,6 +3796,26 @@
       "from": "field_inherited",
       "to": "klass_introspection",
       "kind": "depends_on"
+    },
+    {
+      "from": "field_inherited",
+      "to": "field_null_safety",
+      "kind": "related"
+    },
+    {
+      "from": "field_inherited",
+      "to": "field_primitives_get",
+      "kind": "related"
+    },
+    {
+      "from": "field_inherited",
+      "to": "field_proxy_value_t",
+      "kind": "related"
+    },
+    {
+      "from": "field_inherited",
+      "to": "field_static",
+      "kind": "related"
     },
     {
       "from": "field_introspection",
@@ -3254,6 +3833,26 @@
       "kind": "depends_on"
     },
     {
+      "from": "field_null_safety",
+      "to": "field_inherited",
+      "kind": "related"
+    },
+    {
+      "from": "field_null_safety",
+      "to": "field_primitives_get",
+      "kind": "related"
+    },
+    {
+      "from": "field_null_safety",
+      "to": "field_proxy_value_t",
+      "kind": "related"
+    },
+    {
+      "from": "field_null_safety",
+      "to": "field_static",
+      "kind": "related"
+    },
+    {
       "from": "field_object_ref",
       "to": "wrapper_pattern",
       "kind": "depends_on"
@@ -3264,6 +3863,11 @@
       "kind": "depends_on"
     },
     {
+      "from": "field_object_ref",
+      "to": "field_arrays_object",
+      "kind": "related"
+    },
+    {
       "from": "field_primitives_get",
       "to": "field_introspection",
       "kind": "depends_on"
@@ -3272,6 +3876,36 @@
       "from": "field_primitives_get",
       "to": "field_proxy_value_t",
       "kind": "depends_on"
+    },
+    {
+      "from": "field_primitives_get",
+      "to": "field_inherited",
+      "kind": "related"
+    },
+    {
+      "from": "field_primitives_get",
+      "to": "field_null_safety",
+      "kind": "related"
+    },
+    {
+      "from": "field_primitives_get",
+      "to": "field_primitives_set",
+      "kind": "related"
+    },
+    {
+      "from": "field_primitives_get",
+      "to": "field_proxy_set_guards",
+      "kind": "related"
+    },
+    {
+      "from": "field_primitives_get",
+      "to": "field_proxy_value_t",
+      "kind": "related"
+    },
+    {
+      "from": "field_primitives_get",
+      "to": "field_set_size_guard",
+      "kind": "related"
     },
     {
       "from": "field_primitives_set",
@@ -3284,6 +3918,21 @@
       "kind": "depends_on"
     },
     {
+      "from": "field_primitives_set",
+      "to": "field_primitives_get",
+      "kind": "related"
+    },
+    {
+      "from": "field_primitives_set",
+      "to": "field_proxy_set_guards",
+      "kind": "related"
+    },
+    {
+      "from": "field_primitives_set",
+      "to": "field_set_size_guard",
+      "kind": "related"
+    },
+    {
       "from": "field_proxy_set_guards",
       "to": "field_set_size_guard",
       "kind": "depends_on"
@@ -3294,9 +3943,44 @@
       "kind": "depends_on"
     },
     {
+      "from": "field_proxy_set_guards",
+      "to": "field_primitives_get",
+      "kind": "related"
+    },
+    {
+      "from": "field_proxy_set_guards",
+      "to": "field_primitives_set",
+      "kind": "related"
+    },
+    {
+      "from": "field_proxy_set_guards",
+      "to": "field_set_size_guard",
+      "kind": "related"
+    },
+    {
       "from": "field_proxy_value_t",
       "to": "field_introspection",
       "kind": "depends_on"
+    },
+    {
+      "from": "field_proxy_value_t",
+      "to": "field_inherited",
+      "kind": "related"
+    },
+    {
+      "from": "field_proxy_value_t",
+      "to": "field_null_safety",
+      "kind": "related"
+    },
+    {
+      "from": "field_proxy_value_t",
+      "to": "field_primitives_get",
+      "kind": "related"
+    },
+    {
+      "from": "field_proxy_value_t",
+      "to": "field_static",
+      "kind": "related"
     },
     {
       "from": "field_set_size_guard",
@@ -3304,9 +3988,44 @@
       "kind": "depends_on"
     },
     {
+      "from": "field_set_size_guard",
+      "to": "field_primitives_get",
+      "kind": "related"
+    },
+    {
+      "from": "field_set_size_guard",
+      "to": "field_primitives_set",
+      "kind": "related"
+    },
+    {
+      "from": "field_set_size_guard",
+      "to": "field_proxy_set_guards",
+      "kind": "related"
+    },
+    {
       "from": "field_static",
       "to": "field_introspection",
       "kind": "depends_on"
+    },
+    {
+      "from": "field_static",
+      "to": "field_inherited",
+      "kind": "related"
+    },
+    {
+      "from": "field_static",
+      "to": "field_null_safety",
+      "kind": "related"
+    },
+    {
+      "from": "field_static",
+      "to": "field_primitives_get",
+      "kind": "related"
+    },
+    {
+      "from": "field_static",
+      "to": "field_proxy_value_t",
+      "kind": "related"
     },
     {
       "from": "field_string",
@@ -3324,9 +4043,24 @@
       "kind": "depends_on"
     },
     {
+      "from": "field_string",
+      "to": "field_arrays_object",
+      "kind": "related"
+    },
+    {
       "from": "find_class_context_loader",
       "to": "find_class_fallback",
       "kind": "depends_on"
+    },
+    {
+      "from": "find_class_context_loader",
+      "to": "classloader_reanchor",
+      "kind": "related"
+    },
+    {
+      "from": "find_class_context_loader",
+      "to": "register_class",
+      "kind": "related"
     },
     {
       "from": "find_class_fallback",
@@ -3339,6 +4073,36 @@
       "kind": "depends_on"
     },
     {
+      "from": "find_class_fallback",
+      "to": "compressed_klass_decode",
+      "kind": "related"
+    },
+    {
+      "from": "find_class_fallback",
+      "to": "compressed_oops_decode",
+      "kind": "related"
+    },
+    {
+      "from": "find_class_fallback",
+      "to": "constantpool_access",
+      "kind": "related"
+    },
+    {
+      "from": "find_class_fallback",
+      "to": "instanceklass_methods_walk",
+      "kind": "related"
+    },
+    {
+      "from": "find_class_fallback",
+      "to": "interface_polymorphism",
+      "kind": "related"
+    },
+    {
+      "from": "find_class_fallback",
+      "to": "klass_introspection",
+      "kind": "related"
+    },
+    {
       "from": "find_methods_by_signature",
       "to": "signature_parsing",
       "kind": "depends_on"
@@ -3349,6 +4113,26 @@
       "kind": "depends_on"
     },
     {
+      "from": "find_methods_by_signature",
+      "to": "method_explicit_signature",
+      "kind": "related"
+    },
+    {
+      "from": "find_methods_by_signature",
+      "to": "method_call_primitives",
+      "kind": "related"
+    },
+    {
+      "from": "find_methods_by_signature",
+      "to": "method_is_reference",
+      "kind": "related"
+    },
+    {
+      "from": "find_methods_by_signature",
+      "to": "method_overload",
+      "kind": "related"
+    },
+    {
       "from": "for_each_instance",
       "to": "klass_introspection",
       "kind": "depends_on"
@@ -3359,6 +4143,16 @@
       "kind": "depends_on"
     },
     {
+      "from": "for_each_instance",
+      "to": "for_each_loaded_class",
+      "kind": "related"
+    },
+    {
+      "from": "for_each_instance",
+      "to": "for_each_thread",
+      "kind": "related"
+    },
+    {
       "from": "for_each_loaded_class",
       "to": "iterate_entries_safety",
       "kind": "depends_on"
@@ -3367,6 +4161,16 @@
       "from": "for_each_loaded_class",
       "to": "klass_introspection",
       "kind": "depends_on"
+    },
+    {
+      "from": "for_each_loaded_class",
+      "to": "for_each_instance",
+      "kind": "related"
+    },
+    {
+      "from": "for_each_loaded_class",
+      "to": "for_each_thread",
+      "kind": "related"
     },
     {
       "from": "for_each_thread",
@@ -3374,9 +4178,24 @@
       "kind": "depends_on"
     },
     {
+      "from": "for_each_thread",
+      "to": "for_each_instance",
+      "kind": "related"
+    },
+    {
+      "from": "for_each_thread",
+      "to": "for_each_loaded_class",
+      "kind": "related"
+    },
+    {
       "from": "global_ref",
       "to": "jni_local_ref_hygiene",
       "kind": "depends_on"
+    },
+    {
+      "from": "global_ref",
+      "to": "make_java_string",
+      "kind": "related"
     },
     {
       "from": "hook_basic",
@@ -3469,6 +4288,36 @@
       "kind": "depends_on"
     },
     {
+      "from": "hook_chaining",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "hook_chaining",
+      "to": "hook_verify_repair",
+      "kind": "related"
+    },
+    {
+      "from": "hook_chaining",
+      "to": "dont_inline_dont_compile",
+      "kind": "related"
+    },
+    {
+      "from": "hook_chaining",
+      "to": "hook_install_after_jit",
+      "kind": "related"
+    },
+    {
+      "from": "hook_chaining",
+      "to": "hook_reinstall_after_shutdown",
+      "kind": "related"
+    },
+    {
+      "from": "hook_chaining",
+      "to": "hook_signature",
+      "kind": "related"
+    },
+    {
       "from": "hook_common_detour_dispatch",
       "to": "seh_invoke_detour",
       "kind": "depends_on"
@@ -3482,6 +4331,21 @@
       "from": "hook_common_detour_dispatch",
       "to": "method_entry_points_i2i_i2c",
       "kind": "depends_on"
+    },
+    {
+      "from": "hook_common_detour_dispatch",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "hook_common_detour_dispatch",
+      "to": "adapter_recovery_c2i",
+      "kind": "related"
+    },
+    {
+      "from": "hook_common_detour_dispatch",
+      "to": "hook_install_after_jit",
+      "kind": "related"
     },
     {
       "from": "hook_install_after_jit",
@@ -3504,6 +4368,36 @@
       "kind": "depends_on"
     },
     {
+      "from": "hook_install_after_jit",
+      "to": "adapter_recovery_c2i",
+      "kind": "related"
+    },
+    {
+      "from": "hook_install_after_jit",
+      "to": "dont_inline_dont_compile",
+      "kind": "related"
+    },
+    {
+      "from": "hook_install_after_jit",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "hook_install_after_jit",
+      "to": "hook_chaining",
+      "kind": "related"
+    },
+    {
+      "from": "hook_install_after_jit",
+      "to": "hook_common_detour_dispatch",
+      "kind": "related"
+    },
+    {
+      "from": "hook_install_after_jit",
+      "to": "hook_reinstall_after_shutdown",
+      "kind": "related"
+    },
+    {
       "from": "hook_reinstall_after_shutdown",
       "to": "shutdown_hooks_teardown",
       "kind": "depends_on"
@@ -3512,6 +4406,36 @@
       "from": "hook_reinstall_after_shutdown",
       "to": "hook_basic",
       "kind": "depends_on"
+    },
+    {
+      "from": "hook_reinstall_after_shutdown",
+      "to": "hook_unhook_double_free",
+      "kind": "related"
+    },
+    {
+      "from": "hook_reinstall_after_shutdown",
+      "to": "dont_inline_dont_compile",
+      "kind": "related"
+    },
+    {
+      "from": "hook_reinstall_after_shutdown",
+      "to": "hook_chaining",
+      "kind": "related"
+    },
+    {
+      "from": "hook_reinstall_after_shutdown",
+      "to": "hook_install_after_jit",
+      "kind": "related"
+    },
+    {
+      "from": "hook_reinstall_after_shutdown",
+      "to": "hook_signature",
+      "kind": "related"
+    },
+    {
+      "from": "hook_reinstall_after_shutdown",
+      "to": "hook_verify_repair",
+      "kind": "related"
     },
     {
       "from": "hook_signature",
@@ -3529,6 +4453,36 @@
       "kind": "depends_on"
     },
     {
+      "from": "hook_signature",
+      "to": "dont_inline_dont_compile",
+      "kind": "related"
+    },
+    {
+      "from": "hook_signature",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "hook_signature",
+      "to": "hook_chaining",
+      "kind": "related"
+    },
+    {
+      "from": "hook_signature",
+      "to": "hook_install_after_jit",
+      "kind": "related"
+    },
+    {
+      "from": "hook_signature",
+      "to": "hook_reinstall_after_shutdown",
+      "kind": "related"
+    },
+    {
+      "from": "hook_signature",
+      "to": "hook_unhook_double_free",
+      "kind": "related"
+    },
+    {
       "from": "hook_unhook_double_free",
       "to": "hook_basic",
       "kind": "depends_on"
@@ -3537,6 +4491,36 @@
       "from": "hook_unhook_double_free",
       "to": "shutdown_hooks_teardown",
       "kind": "depends_on"
+    },
+    {
+      "from": "hook_unhook_double_free",
+      "to": "hook_reinstall_after_shutdown",
+      "kind": "related"
+    },
+    {
+      "from": "hook_unhook_double_free",
+      "to": "dont_inline_dont_compile",
+      "kind": "related"
+    },
+    {
+      "from": "hook_unhook_double_free",
+      "to": "hook_chaining",
+      "kind": "related"
+    },
+    {
+      "from": "hook_unhook_double_free",
+      "to": "hook_install_after_jit",
+      "kind": "related"
+    },
+    {
+      "from": "hook_unhook_double_free",
+      "to": "hook_signature",
+      "kind": "related"
+    },
+    {
+      "from": "hook_unhook_double_free",
+      "to": "hook_verify_repair",
+      "kind": "related"
     },
     {
       "from": "hook_verify_repair",
@@ -3549,9 +4533,64 @@
       "kind": "depends_on"
     },
     {
+      "from": "hook_verify_repair",
+      "to": "hook_chaining",
+      "kind": "related"
+    },
+    {
+      "from": "hook_verify_repair",
+      "to": "dont_inline_dont_compile",
+      "kind": "related"
+    },
+    {
+      "from": "hook_verify_repair",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "hook_verify_repair",
+      "to": "hook_install_after_jit",
+      "kind": "related"
+    },
+    {
+      "from": "hook_verify_repair",
+      "to": "hook_reinstall_after_shutdown",
+      "kind": "related"
+    },
+    {
+      "from": "hook_verify_repair",
+      "to": "hook_signature",
+      "kind": "related"
+    },
+    {
       "from": "instanceklass_methods_walk",
       "to": "vmstructs_offset_resolution",
       "kind": "depends_on"
+    },
+    {
+      "from": "instanceklass_methods_walk",
+      "to": "compressed_klass_decode",
+      "kind": "related"
+    },
+    {
+      "from": "instanceklass_methods_walk",
+      "to": "compressed_oops_decode",
+      "kind": "related"
+    },
+    {
+      "from": "instanceklass_methods_walk",
+      "to": "constantpool_access",
+      "kind": "related"
+    },
+    {
+      "from": "instanceklass_methods_walk",
+      "to": "find_class_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "instanceklass_methods_walk",
+      "to": "klass_introspection",
+      "kind": "related"
     },
     {
       "from": "interface_polymorphism",
@@ -3562,6 +4601,21 @@
       "from": "interface_polymorphism",
       "to": "method_overload",
       "kind": "depends_on"
+    },
+    {
+      "from": "interface_polymorphism",
+      "to": "find_class_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "interface_polymorphism",
+      "to": "nested_classes",
+      "kind": "related"
+    },
+    {
+      "from": "interface_polymorphism",
+      "to": "poly_inherited_oop",
+      "kind": "related"
     },
     {
       "from": "jni_arg_packing",
@@ -3584,6 +4638,31 @@
       "kind": "depends_on"
     },
     {
+      "from": "klass_introspection",
+      "to": "compressed_klass_decode",
+      "kind": "related"
+    },
+    {
+      "from": "klass_introspection",
+      "to": "compressed_oops_decode",
+      "kind": "related"
+    },
+    {
+      "from": "klass_introspection",
+      "to": "constantpool_access",
+      "kind": "related"
+    },
+    {
+      "from": "klass_introspection",
+      "to": "find_class_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "klass_introspection",
+      "to": "instanceklass_methods_walk",
+      "kind": "related"
+    },
+    {
       "from": "make_java_array",
       "to": "jni_arg_packing",
       "kind": "depends_on"
@@ -3592,6 +4671,11 @@
       "from": "make_java_string",
       "to": "jni_local_ref_hygiene",
       "kind": "depends_on"
+    },
+    {
+      "from": "make_java_string",
+      "to": "global_ref",
+      "kind": "related"
     },
     {
       "from": "make_unique",
@@ -3614,6 +4698,36 @@
       "kind": "depends_on"
     },
     {
+      "from": "method_call_jni_fallback",
+      "to": "method_call_wide_args",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_jni_fallback",
+      "to": "method_call_object",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_jni_fallback",
+      "to": "method_call_return_void",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_jni_fallback",
+      "to": "method_call_string",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_jni_fallback",
+      "to": "method_return_types",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_jni_fallback",
+      "to": "method_static",
+      "kind": "related"
+    },
+    {
       "from": "method_call_object",
       "to": "method_call_primitives",
       "kind": "depends_on"
@@ -3622,6 +4736,36 @@
       "from": "method_call_object",
       "to": "wrapper_pattern",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_call_object",
+      "to": "method_call_jni_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_object",
+      "to": "method_call_return_void",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_object",
+      "to": "method_call_string",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_object",
+      "to": "method_call_wide_args",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_object",
+      "to": "method_proxy_value_t",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_object",
+      "to": "method_return_types",
+      "kind": "related"
     },
     {
       "from": "method_call_primitives",
@@ -3634,9 +4778,49 @@
       "kind": "depends_on"
     },
     {
+      "from": "method_call_primitives",
+      "to": "find_methods_by_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_primitives",
+      "to": "method_explicit_signature",
+      "kind": "related"
+    },
+    {
       "from": "method_call_return_void",
       "to": "method_call_primitives",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_call_return_void",
+      "to": "method_call_jni_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_return_void",
+      "to": "method_call_object",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_return_void",
+      "to": "method_call_string",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_return_void",
+      "to": "method_call_wide_args",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_return_void",
+      "to": "method_return_types",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_return_void",
+      "to": "method_static",
+      "kind": "related"
     },
     {
       "from": "method_call_string",
@@ -3654,6 +4838,36 @@
       "kind": "depends_on"
     },
     {
+      "from": "method_call_string",
+      "to": "method_call_jni_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_string",
+      "to": "method_call_object",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_string",
+      "to": "method_call_return_void",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_string",
+      "to": "method_call_wide_args",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_string",
+      "to": "method_return_types",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_string",
+      "to": "method_static",
+      "kind": "related"
+    },
+    {
       "from": "method_call_wide_args",
       "to": "method_call_primitives",
       "kind": "depends_on"
@@ -3664,9 +4878,44 @@
       "kind": "depends_on"
     },
     {
+      "from": "method_call_wide_args",
+      "to": "method_call_jni_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_wide_args",
+      "to": "method_call_object",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_wide_args",
+      "to": "method_call_return_void",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_wide_args",
+      "to": "method_call_string",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_wide_args",
+      "to": "method_return_types",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_wide_args",
+      "to": "method_static",
+      "kind": "related"
+    },
+    {
       "from": "method_entry_points_i2i_i2c",
       "to": "vmstructs_offset_resolution",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "adapter_recovery_c2i",
+      "kind": "related"
     },
     {
       "from": "method_enumeration",
@@ -3684,6 +4933,26 @@
       "kind": "depends_on"
     },
     {
+      "from": "method_explicit_signature",
+      "to": "find_methods_by_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_explicit_signature",
+      "to": "method_call_primitives",
+      "kind": "related"
+    },
+    {
+      "from": "method_explicit_signature",
+      "to": "method_is_reference",
+      "kind": "related"
+    },
+    {
+      "from": "method_explicit_signature",
+      "to": "method_overload",
+      "kind": "related"
+    },
+    {
       "from": "method_flags_width",
       "to": "vmstructs_offset_resolution",
       "kind": "depends_on"
@@ -3692,6 +4961,21 @@
       "from": "method_is_reference",
       "to": "signature_parsing",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_is_reference",
+      "to": "find_methods_by_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_is_reference",
+      "to": "method_explicit_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_is_reference",
+      "to": "method_overload",
+      "kind": "related"
     },
     {
       "from": "method_overload",
@@ -3704,6 +4988,21 @@
       "kind": "depends_on"
     },
     {
+      "from": "method_overload",
+      "to": "find_methods_by_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_overload",
+      "to": "method_explicit_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_overload",
+      "to": "method_is_reference",
+      "kind": "related"
+    },
+    {
       "from": "method_overload_java_dispatch",
       "to": "method_overload",
       "kind": "depends_on"
@@ -3714,14 +5013,79 @@
       "kind": "depends_on"
     },
     {
+      "from": "method_proxy_value_t",
+      "to": "method_call_object",
+      "kind": "related"
+    },
+    {
       "from": "method_return_types",
       "to": "method_call_primitives",
       "kind": "depends_on"
     },
     {
+      "from": "method_return_types",
+      "to": "method_call_jni_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "method_return_types",
+      "to": "method_call_object",
+      "kind": "related"
+    },
+    {
+      "from": "method_return_types",
+      "to": "method_call_return_void",
+      "kind": "related"
+    },
+    {
+      "from": "method_return_types",
+      "to": "method_call_string",
+      "kind": "related"
+    },
+    {
+      "from": "method_return_types",
+      "to": "method_call_wide_args",
+      "kind": "related"
+    },
+    {
+      "from": "method_return_types",
+      "to": "method_static",
+      "kind": "related"
+    },
+    {
       "from": "method_static",
       "to": "method_call_primitives",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_static",
+      "to": "method_call_jni_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "method_static",
+      "to": "method_call_object",
+      "kind": "related"
+    },
+    {
+      "from": "method_static",
+      "to": "method_call_return_void",
+      "kind": "related"
+    },
+    {
+      "from": "method_static",
+      "to": "method_call_string",
+      "kind": "related"
+    },
+    {
+      "from": "method_static",
+      "to": "method_call_wide_args",
+      "kind": "related"
+    },
+    {
+      "from": "method_static",
+      "to": "method_return_types",
+      "kind": "related"
     },
     {
       "from": "method_static_portability",
@@ -3737,6 +5101,36 @@
       "from": "method_throwing_call_site",
       "to": "on_exception",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_throwing_call_site",
+      "to": "method_call_jni_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "method_throwing_call_site",
+      "to": "method_call_object",
+      "kind": "related"
+    },
+    {
+      "from": "method_throwing_call_site",
+      "to": "method_call_return_void",
+      "kind": "related"
+    },
+    {
+      "from": "method_throwing_call_site",
+      "to": "method_call_string",
+      "kind": "related"
+    },
+    {
+      "from": "method_throwing_call_site",
+      "to": "method_call_wide_args",
+      "kind": "related"
+    },
+    {
+      "from": "method_throwing_call_site",
+      "to": "method_return_types",
+      "kind": "related"
     },
     {
       "from": "midi2i_trampoline_alloc",
@@ -3764,14 +5158,49 @@
       "kind": "depends_on"
     },
     {
+      "from": "nested_classes",
+      "to": "find_class_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "nested_classes",
+      "to": "interface_polymorphism",
+      "kind": "related"
+    },
+    {
+      "from": "nested_classes",
+      "to": "poly_inherited_oop",
+      "kind": "related"
+    },
+    {
       "from": "on_class_loaded",
       "to": "hook_basic",
       "kind": "depends_on"
     },
     {
+      "from": "on_class_loaded",
+      "to": "on_exception",
+      "kind": "related"
+    },
+    {
+      "from": "on_class_loaded",
+      "to": "shutdown_hooks_teardown",
+      "kind": "related"
+    },
+    {
       "from": "on_exception",
       "to": "hook_basic",
       "kind": "depends_on"
+    },
+    {
+      "from": "on_exception",
+      "to": "on_class_loaded",
+      "kind": "related"
+    },
+    {
+      "from": "on_exception",
+      "to": "shutdown_hooks_teardown",
+      "kind": "related"
     },
     {
       "from": "os_safe_read",
@@ -3789,6 +5218,21 @@
       "kind": "depends_on"
     },
     {
+      "from": "poly_inherited_oop",
+      "to": "find_class_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "poly_inherited_oop",
+      "to": "interface_polymorphism",
+      "kind": "related"
+    },
+    {
+      "from": "poly_inherited_oop",
+      "to": "nested_classes",
+      "kind": "related"
+    },
+    {
       "from": "read_java_string",
       "to": "compressed_oops_decode",
       "kind": "depends_on"
@@ -3804,9 +5248,49 @@
       "kind": "depends_on"
     },
     {
+      "from": "register_class",
+      "to": "classloader_reanchor",
+      "kind": "related"
+    },
+    {
+      "from": "register_class",
+      "to": "find_class_context_loader",
+      "kind": "related"
+    },
+    {
       "from": "return_caller",
       "to": "interpreter_frame_walk",
       "kind": "depends_on"
+    },
+    {
+      "from": "return_caller",
+      "to": "return_frame_raw_access",
+      "kind": "related"
+    },
+    {
+      "from": "return_caller",
+      "to": "return_set_arg",
+      "kind": "related"
+    },
+    {
+      "from": "return_caller",
+      "to": "return_set_primitives",
+      "kind": "related"
+    },
+    {
+      "from": "return_caller",
+      "to": "return_set_wrapper_null",
+      "kind": "related"
+    },
+    {
+      "from": "return_caller",
+      "to": "return_stack_trace_depth",
+      "kind": "related"
+    },
+    {
+      "from": "return_caller",
+      "to": "return_value_cancel",
+      "kind": "related"
     },
     {
       "from": "return_frame_raw_access",
@@ -3814,14 +5298,104 @@
       "kind": "depends_on"
     },
     {
+      "from": "return_frame_raw_access",
+      "to": "return_caller",
+      "kind": "related"
+    },
+    {
+      "from": "return_frame_raw_access",
+      "to": "return_set_arg",
+      "kind": "related"
+    },
+    {
+      "from": "return_frame_raw_access",
+      "to": "return_set_primitives",
+      "kind": "related"
+    },
+    {
+      "from": "return_frame_raw_access",
+      "to": "return_set_wrapper_null",
+      "kind": "related"
+    },
+    {
+      "from": "return_frame_raw_access",
+      "to": "return_stack_trace_depth",
+      "kind": "related"
+    },
+    {
+      "from": "return_frame_raw_access",
+      "to": "return_value_cancel",
+      "kind": "related"
+    },
+    {
       "from": "return_set_arg",
       "to": "interpreter_frame_walk",
       "kind": "depends_on"
     },
     {
+      "from": "return_set_arg",
+      "to": "return_caller",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_arg",
+      "to": "return_frame_raw_access",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_arg",
+      "to": "return_set_primitives",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_arg",
+      "to": "return_set_wrapper_null",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_arg",
+      "to": "return_stack_trace_depth",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_arg",
+      "to": "return_value_cancel",
+      "kind": "related"
+    },
+    {
       "from": "return_set_primitives",
       "to": "interpreter_frame_walk",
       "kind": "depends_on"
+    },
+    {
+      "from": "return_set_primitives",
+      "to": "return_caller",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_primitives",
+      "to": "return_frame_raw_access",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_primitives",
+      "to": "return_set_arg",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_primitives",
+      "to": "return_set_wrapper_null",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_primitives",
+      "to": "return_stack_trace_depth",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_primitives",
+      "to": "return_value_cancel",
+      "kind": "related"
     },
     {
       "from": "return_set_wrapper_null",
@@ -3834,6 +5408,36 @@
       "kind": "depends_on"
     },
     {
+      "from": "return_set_wrapper_null",
+      "to": "return_caller",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_wrapper_null",
+      "to": "return_frame_raw_access",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_wrapper_null",
+      "to": "return_set_arg",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_wrapper_null",
+      "to": "return_set_primitives",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_wrapper_null",
+      "to": "return_stack_trace_depth",
+      "kind": "related"
+    },
+    {
+      "from": "return_set_wrapper_null",
+      "to": "return_value_cancel",
+      "kind": "related"
+    },
+    {
       "from": "return_stack_trace_depth",
       "to": "interpreter_frame_walk",
       "kind": "depends_on"
@@ -3844,9 +5448,69 @@
       "kind": "depends_on"
     },
     {
+      "from": "return_stack_trace_depth",
+      "to": "return_caller",
+      "kind": "related"
+    },
+    {
+      "from": "return_stack_trace_depth",
+      "to": "return_frame_raw_access",
+      "kind": "related"
+    },
+    {
+      "from": "return_stack_trace_depth",
+      "to": "return_set_arg",
+      "kind": "related"
+    },
+    {
+      "from": "return_stack_trace_depth",
+      "to": "return_set_primitives",
+      "kind": "related"
+    },
+    {
+      "from": "return_stack_trace_depth",
+      "to": "return_set_wrapper_null",
+      "kind": "related"
+    },
+    {
+      "from": "return_stack_trace_depth",
+      "to": "return_value_cancel",
+      "kind": "related"
+    },
+    {
       "from": "return_value_cancel",
       "to": "interpreter_frame_walk",
       "kind": "depends_on"
+    },
+    {
+      "from": "return_value_cancel",
+      "to": "return_caller",
+      "kind": "related"
+    },
+    {
+      "from": "return_value_cancel",
+      "to": "return_frame_raw_access",
+      "kind": "related"
+    },
+    {
+      "from": "return_value_cancel",
+      "to": "return_set_arg",
+      "kind": "related"
+    },
+    {
+      "from": "return_value_cancel",
+      "to": "return_set_primitives",
+      "kind": "related"
+    },
+    {
+      "from": "return_value_cancel",
+      "to": "return_set_wrapper_null",
+      "kind": "related"
+    },
+    {
+      "from": "return_value_cancel",
+      "to": "return_stack_trace_depth",
+      "kind": "related"
     },
     {
       "from": "seh_invoke_detour",
@@ -3859,6 +5523,16 @@
       "kind": "depends_on"
     },
     {
+      "from": "shutdown_hooks_teardown",
+      "to": "on_class_loaded",
+      "kind": "related"
+    },
+    {
+      "from": "shutdown_hooks_teardown",
+      "to": "on_exception",
+      "kind": "related"
+    },
+    {
       "from": "unified_call_syntax",
       "to": "method_overload",
       "kind": "depends_on"
@@ -3867,6 +5541,11 @@
       "from": "vmstructs_offset_resolution",
       "to": "os_safe_read",
       "kind": "depends_on"
+    },
+    {
+      "from": "vmstructs_offset_resolution",
+      "to": "decode_oop_and_pointers",
+      "kind": "related"
     },
     {
       "from": "watch_static_field",

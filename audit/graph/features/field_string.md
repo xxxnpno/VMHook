@@ -22,6 +22,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/read_java_string|read_java_string]]
 - [[features/make_java_string|make_java_string]]
 
+## Related
+
+- [[features/field_arrays_object|field_arrays_object]]
+
 ## Tests
 
 - `tests/jvm/modules/field_string.cpp`

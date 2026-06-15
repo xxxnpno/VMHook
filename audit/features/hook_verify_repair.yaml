@@ -23,7 +23,13 @@ test_modules:
 depends_on:
 - hook_basic
 - midi2i_trampoline_alloc
-related: []
+related:
+- hook_chaining
+- dont_inline_dont_compile
+- hook_basic
+- hook_install_after_jit
+- hook_reinstall_after_shutdown
+- hook_signature
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

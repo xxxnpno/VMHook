@@ -25,7 +25,13 @@ depends_on:
 - deoptimize_methods
 - method_entry_points_i2i_i2c
 - adapter_recovery_c2i
-related: []
+related:
+- adapter_recovery_c2i
+- dont_inline_dont_compile
+- hook_basic
+- hook_chaining
+- hook_common_detour_dispatch
+- hook_reinstall_after_shutdown
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

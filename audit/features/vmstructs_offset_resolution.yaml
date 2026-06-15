@@ -21,7 +21,8 @@ hpp_anchors: []
 test_modules: []
 depends_on:
 - os_safe_read
-related: []
+related:
+- decode_oop_and_pointers
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

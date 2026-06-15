@@ -20,6 +20,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]]
 
+## Related
+
+- [[features/global_ref|global_ref]]
+
 ## Depended on by
 
 - [[features/field_string|field_string]]

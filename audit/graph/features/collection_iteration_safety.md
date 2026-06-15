@@ -22,6 +22,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/collection_set|collection_set]]
 - [[features/collection_map|collection_map]]
 
+## Related
+
+- [[features/collection_hash_tree_map|collection_hash_tree_map]]
+- [[features/collection_linked_list|collection_linked_list]]
+
 ## Depended on by
 
 - [[features/collection_hash_tree_map|collection_hash_tree_map]]

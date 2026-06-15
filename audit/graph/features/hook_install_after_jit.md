@@ -23,6 +23,15 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]]
 - [[features/adapter_recovery_c2i|adapter_recovery_c2i]]
 
+## Related
+
+- [[features/adapter_recovery_c2i|adapter_recovery_c2i]]
+- [[features/dont_inline_dont_compile|dont_inline_dont_compile]]
+- [[features/hook_basic|hook_basic]]
+- [[features/hook_chaining|hook_chaining]]
+- [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]]
+- [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]]
+
 ## Tests
 
 - `tests/jvm/modules/hook_install_after_jit.cpp`

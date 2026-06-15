@@ -22,7 +22,10 @@ test_modules:
 - tests/jvm/modules/method_is_reference.cpp
 depends_on:
 - signature_parsing
-related: []
+related:
+- find_methods_by_signature
+- method_explicit_signature
+- method_overload
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

@@ -22,6 +22,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/array_element_helpers|array_element_helpers]]
 - [[features/wrapper_pattern|wrapper_pattern]]
 
+## Related
+
+- [[features/collection_map|collection_map]]
+- [[features/collection_set|collection_set]]
+
 ## Depended on by
 
 - [[features/collection_iteration_safety|collection_iteration_safety]]

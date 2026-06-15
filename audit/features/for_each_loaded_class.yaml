@@ -23,7 +23,9 @@ test_modules:
 depends_on:
 - iterate_entries_safety
 - klass_introspection
-related: []
+related:
+- for_each_instance
+- for_each_thread
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

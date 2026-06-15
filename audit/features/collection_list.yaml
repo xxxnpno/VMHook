@@ -24,7 +24,9 @@ depends_on:
 - collection_type_tags
 - array_element_helpers
 - wrapper_pattern
-related: []
+related:
+- collection_map
+- collection_set
 audit_docs: []
 known_bugs: []
 notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md

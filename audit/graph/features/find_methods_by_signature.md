@@ -21,6 +21,13 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/signature_parsing|signature_parsing]]
 - [[features/method_enumeration|method_enumeration]]
 
+## Related
+
+- [[features/method_explicit_signature|method_explicit_signature]]
+- [[features/method_call_primitives|method_call_primitives]]
+- [[features/method_is_reference|method_is_reference]]
+- [[features/method_overload|method_overload]]
+
 ## Tests
 
 - `tests/jvm/modules/find_methods_by_signature.cpp`

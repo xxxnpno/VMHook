@@ -20,6 +20,13 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/field_introspection|field_introspection]]
 
+## Related
+
+- [[features/field_inherited|field_inherited]]
+- [[features/field_null_safety|field_null_safety]]
+- [[features/field_primitives_get|field_primitives_get]]
+- [[features/field_static|field_static]]
+
 ## Depended on by
 
 - [[features/field_primitives_get|field_primitives_get]]

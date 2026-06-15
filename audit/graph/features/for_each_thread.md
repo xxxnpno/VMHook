@@ -20,6 +20,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/iterate_entries_safety|iterate_entries_safety]]
 
+## Related
+
+- [[features/for_each_instance|for_each_instance]]
+- [[features/for_each_loaded_class|for_each_loaded_class]]
+
 ## Tests
 
 - `tests/jvm/modules/for_each_thread.cpp`

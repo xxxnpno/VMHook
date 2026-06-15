@@ -20,6 +20,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/wrapper_pattern|wrapper_pattern]]
 
+## Related
+
+- [[features/method_call_object|method_call_object]]
+
 ## Depended on by
 
 - [[features/method_call_primitives|method_call_primitives]]

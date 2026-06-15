@@ -21,6 +21,15 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/method_flags_width|method_flags_width]]
 - [[features/hook_basic|hook_basic]]
 
+## Related
+
+- [[features/hook_chaining|hook_chaining]]
+- [[features/hook_install_after_jit|hook_install_after_jit]]
+- [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]]
+- [[features/hook_signature|hook_signature]]
+- [[features/hook_unhook_double_free|hook_unhook_double_free]]
+- [[features/hook_verify_repair|hook_verify_repair]]
+
 ## Tests
 
 - `tests/jvm/modules/dont_inline_dont_compile.cpp`
