@@ -397,6 +397,112 @@ auto test_alignment_on_live_values() -> void
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Concrete EXACT-VALUE spot checks driven by the LIVE page/granularity, not just
+// invariants.  The dense sweep above proves ordering/idempotence/alignment for
+// the host's real values; this nails down the *exact* rounded result for the
+// canonical small offsets (0, 1, page-1, page, page+1, 2*page-1, 2*page) so a
+// mask that happened to preserve the invariants but shifted by a constant would
+// still be caught.  Every expectation is computed from the queried page — there
+// is NO hard-coded 4096 anywhere here.
+// ───────────────────────────────────────────────────────────────────────────
+auto test_exact_alignment_on_live_page() -> void
+{
+    const std::uintptr_t page{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
+
+    // align_down spot values, expressed purely in terms of `page`.
+    bool down_ok{ true };
+    down_ok &= mirror_align_down(0u, page) == 0u;
+    down_ok &= mirror_align_down(1u, page) == 0u;
+    down_ok &= mirror_align_down(page - 1u, page) == 0u;
+    down_ok &= mirror_align_down(page, page) == page;
+    down_ok &= mirror_align_down(page + 1u, page) == page;
+    down_ok &= mirror_align_down(2u * page - 1u, page) == page;
+    down_ok &= mirror_align_down(2u * page, page) == 2u * page;
+    check("live_page_align_down_exact", down_ok);
+
+    // align_up spot values, same family of inputs.
+    bool up_ok{ true };
+    up_ok &= mirror_align_up(0u, page) == 0u;
+    up_ok &= mirror_align_up(1u, page) == page;
+    up_ok &= mirror_align_up(page - 1u, page) == page;
+    up_ok &= mirror_align_up(page, page) == page;            // already aligned: fixed point
+    up_ok &= mirror_align_up(page + 1u, page) == 2u * page;
+    up_ok &= mirror_align_up(2u * page, page) == 2u * page;
+    check("live_page_align_up_exact", up_ok);
+
+    // Round-up-to-page is idempotent on an already-page-rounded value for a
+    // spread of arbitrary inputs (the property the protect()/mmap sizing relies
+    // on), checked against the live page.
+    bool idempotent{ true };
+    const std::uintptr_t probes[]{ 0u, 1u, 7u, page / 2u, page, page + 17u,
+                                   3u * page + 1u, 1000u * page - 1u };
+    for (const std::uintptr_t x : probes)
+    {
+        const std::uintptr_t r{ mirror_align_up(x, page) };
+        if (mirror_align_up(r, page) != r) { idempotent = false; }
+        if (mirror_align_down(r, page) != r) { idempotent = false; }  // r is page-aligned
+    }
+    check("live_page_round_up_idempotent", idempotent);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// EXACT-VALUE checks that exercise the page↔granularity GAP on the live values.
+// On Windows granularity (64 KiB) is a strict multiple of page (4 KiB), so an
+// address that is page-aligned need NOT be granularity-aligned; the trampoline
+// allocator depends on rounding correctly across that gap.  On POSIX the two are
+// equal and the gap collapses — the gated branch below skips the strict-gap
+// assertions there but still confirms the identity.
+// ───────────────────────────────────────────────────────────────────────────
+auto test_page_granularity_gap_live() -> void
+{
+    const std::uintptr_t page{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
+    const std::uintptr_t gran{ static_cast<std::uintptr_t>(vmhook::os::allocation_granularity()) };
+
+    if (gran > page)
+    {
+        // Take a base that is exactly granularity-aligned, then step up by one
+        // page: the result is page-aligned but strictly inside the granularity
+        // block, so it must round DOWN to the block start and UP to the next
+        // block — exact boundaries computed from the live values.
+        const std::uintptr_t block{ 4u * gran };                 // some granularity block
+        const std::uintptr_t inside{ block + page };             // page-aligned, not gran-aligned
+
+        bool gap_ok{ true };
+        gap_ok &= (inside & (page - 1u)) == 0u;                  // is page-aligned
+        gap_ok &= (inside & (gran - 1u)) != 0u;                  // is NOT granularity-aligned
+        gap_ok &= mirror_align_down(inside, gran) == block;      // rounds down to block start
+        gap_ok &= mirror_align_up(inside, gran) == block + gran; // rounds up to next block
+        check("live_gap_page_inside_granularity_block", gap_ok);
+
+        // Every page offset within one granularity block rounds down to the same
+        // block base and up to the same next block (exhaustive over the gap).
+        bool all_offsets_ok{ true };
+        for (std::uintptr_t off = 0u; off < gran; off += page)
+        {
+            const std::uintptr_t a{ block + off };
+            if (mirror_align_down(a, gran) != block) { all_offsets_ok = false; }
+            const std::uintptr_t expected_up{ (off == 0u) ? block : block + gran };
+            if (mirror_align_up(a, gran) != expected_up) { all_offsets_ok = false; }
+        }
+        check("live_gap_all_page_offsets_round_consistently", all_offsets_ok);
+    }
+    else
+    {
+        // POSIX identity: granularity == page, so the gap is empty.  Confirm the
+        // collapse directly so this branch is not silently untested on POSIX.
+        check("live_gap_collapses_when_granularity_equals_page", gran == page);
+    }
+
+    // The derived ratio is itself a stable power-of-two across re-queries (it is
+    // gran/page; both are process-invariant, so the quotient must not move).
+    const std::uintptr_t ratio_a{ gran / page };
+    const std::uintptr_t ratio_b{
+        static_cast<std::uintptr_t>(vmhook::os::allocation_granularity())
+        / static_cast<std::uintptr_t>(vmhook::os::page_size()) };
+    check("live_granularity_page_ratio_stable", ratio_a == ratio_b && is_power_of_two(ratio_a));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Reproduce the POSIX protect() page-rounding arithmetic as pure runtime math
 // against the real page size and assert it yields a page-aligned base covering
 // the whole requested range.  (vmhook.hpp protect(): base &= ~(ps-1);
@@ -447,6 +553,30 @@ auto test_protect_page_rounding_formula() -> void
     check("protect_rounding_covers_full_range", covers_end);
     check("protect_rounding_size_is_page_multiple", size_page_multiple);
     check("protect_rounding_size_nonzero", size_nonzero);
+
+    // Two EXACT, hand-derivable cases (computed from `ps`, never a literal page).
+    // (a) A request that straddles the boundary between page 4 and page 5
+    //     (base addr = origin + ps - 1, length 2): base must snap back to the
+    //     start of page 4 (origin) and the rounded size must cover both pages
+    //     -> exactly 2*ps.
+    {
+        const std::uintptr_t addr{ origin + ps - 1u };
+        const std::uintptr_t end{ addr + 2u };
+        const std::uintptr_t base{ addr & ~(ps - 1u) };
+        const std::uintptr_t aligned_size{ (end - base + ps - 1u) & ~(ps - 1u) };
+        check("protect_rounding_straddle_exact_base", base == origin);
+        check("protect_rounding_straddle_exact_size", aligned_size == 2u * ps);
+    }
+    // (b) An interior, single-byte request fully inside one page rounds to that
+    //     page's base and exactly one page of length.
+    {
+        const std::uintptr_t addr{ origin + ps / 2u };
+        const std::uintptr_t end{ addr + 1u };
+        const std::uintptr_t base{ addr & ~(ps - 1u) };
+        const std::uintptr_t aligned_size{ (end - base + ps - 1u) & ~(ps - 1u) };
+        check("protect_rounding_interior_exact_base", base == origin);
+        check("protect_rounding_interior_exact_size", aligned_size == ps);
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -478,6 +608,8 @@ int main()
     test_queried_values_are_sane();
     test_queried_values_thread_stable();
     test_alignment_on_live_values();
+    test_exact_alignment_on_live_page();
+    test_page_granularity_gap_live();
     test_protect_page_rounding_formula();
     test_platform_specific_values();
 

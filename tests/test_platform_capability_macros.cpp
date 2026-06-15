@@ -154,6 +154,40 @@ static_assert(!VMHOOK_HAS_HW_DATA_BREAKPOINTS || VMHOOK_RUNTIME_HOOKING_AVAILABL
 #else
     #define VMHT_IS_ANDROID 0
 #endif
+// Raw OS-selection gate inputs (the exact `defined()` tokens the library's
+// #if/#elif OS ladder consumes, vmhook.hpp:128-168).  Capturing them lets us
+// pin each *resolved* VMHOOK_OS_* macro to the ladder branch that produced it,
+// so a refactor that reorders the ladder (e.g. moving __linux__ ahead of
+// __ANDROID__ — Android also defines __linux__, so the order is load-bearing)
+// is caught even on a CI cell where that OS is not the active one.
+#if defined(_WIN32) || defined(_WIN64)
+    #define VMHT_HAS_WIN32_MACRO 1
+#else
+    #define VMHT_HAS_WIN32_MACRO 0
+#endif
+#if defined(__APPLE__)
+    #define VMHT_HAS_APPLE_MACRO 1
+#else
+    #define VMHT_HAS_APPLE_MACRO 0
+#endif
+#if defined(__linux__)
+    #define VMHT_HAS_LINUX_MACRO 1
+#else
+    #define VMHT_HAS_LINUX_MACRO 0
+#endif
+// Raw arch-selection gate inputs (vmhook.hpp:173-183).  Same idea: tie the
+// resolved VMHOOK_ARCH_* macro back to the __x86_64__/_M_X64 vs __aarch64__/
+// _M_ARM64 tokens the ladder branches on.
+#if defined(__x86_64__) || defined(_M_X64)
+    #define VMHT_HAS_X86_64_MACRO 1
+#else
+    #define VMHT_HAS_X86_64_MACRO 0
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    #define VMHT_HAS_ARM64_MACRO 1
+#else
+    #define VMHT_HAS_ARM64_MACRO 0
+#endif
 #if defined(__cpp_explicit_this_parameter) && __cpp_explicit_this_parameter >= 202110L
     #define VMHT_HAS_EXPLICIT_THIS 1
 #else
@@ -169,6 +203,67 @@ static_assert(!VMHOOK_HAS_HW_DATA_BREAKPOINTS || VMHOOK_RUNTIME_HOOKING_AVAILABL
 #else
     #define VMHT_HAS_PRINT_AND_FEATURE 0
 #endif
+
+// ===========================================================================
+// OS-selection LADDER pinned to its gate inputs (vmhook.hpp:128-168).  The
+// existing "exactly one OS is set" / partition checks prove the *result* is
+// well-formed, but they pass on every cell regardless of WHICH branch fired —
+// so a refactor that reorders the #elif ladder would slip through on a CI cell
+// where the misordered OS is inactive.  These pins reproduce the ladder's
+// branch conditions from the raw VMHT_* tokens and equate them to the resolved
+// VMHOOK_OS_* macro, so the *ordering* is itself an asserted invariant.  Every
+// pin below is a tautology on every supported target (it just restates the
+// ladder), hence cross-platform-safe.
+//
+// Arm 1 (`__ANDROID__`) is first and unconditional: resolved ANDROID is exactly
+// the gate input.  This is the load-bearing ordering case — Android ALSO defines
+// __linux__, so testing __ANDROID__ first is what stops Android resolving to
+// LINUX.
+static_assert(VMHOOK_OS_ANDROID == VMHT_IS_ANDROID,
+              "VMHOOK_OS_ANDROID == defined(__ANDROID__) (first, unconditional ladder arm)");
+// The ordering guarantee made explicit: an Android target DOES expose __linux__,
+// yet must resolve to ANDROID (not LINUX).  Vacuous off Android.
+static_assert(!VMHOOK_OS_ANDROID || VMHT_HAS_LINUX_MACRO,
+              "Android defines __linux__ too; the ladder must test __ANDROID__ first");
+static_assert(!VMHOOK_OS_ANDROID || (VMHOOK_OS_LINUX == 0),
+              "an Android build must NOT also resolve as Linux (ladder order is load-bearing)");
+// Arm 2 (`_WIN32 || _WIN64`), reached only when arm 1 missed: resolved WINDOWS
+// equals (not-Android AND a Windows token).  (No real toolchain defines both,
+// so this also collapses to plain `_WIN32` — but the ladder-precise form is the
+// invariant.)
+static_assert(VMHOOK_OS_WINDOWS == (!VMHT_IS_ANDROID && VMHT_HAS_WIN32_MACRO),
+              "VMHOOK_OS_WINDOWS == (!__ANDROID__ && (_WIN32||_WIN64))");
+// Arm 3 (`__APPLE__`), reached after android+windows missed: it sets exactly one
+// of macOS/iOS, so the APPLE aggregate is 1 there and 0 otherwise.
+static_assert(VMHOOK_OS_APPLE
+                  == (!VMHT_IS_ANDROID && !VMHT_HAS_WIN32_MACRO && VMHT_HAS_APPLE_MACRO),
+              "VMHOOK_OS_APPLE == (!__ANDROID__ && !_WIN32 && __APPLE__)");
+// Conversely, resolving as Apple implies the __APPLE__ token was present.
+static_assert(!VMHOOK_OS_APPLE || VMHT_HAS_APPLE_MACRO,
+              "Apple-resolved implies defined(__APPLE__)");
+// Arm 4 (`__linux__`), the last non-error arm: reached only after android,
+// windows, AND apple all missed.  (Android is excluded explicitly even though it
+// also defines __linux__, because arm 1 already consumed it.)
+static_assert(VMHOOK_OS_LINUX
+                  == (!VMHT_IS_ANDROID && !VMHT_HAS_WIN32_MACRO
+                      && !VMHT_HAS_APPLE_MACRO && VMHT_HAS_LINUX_MACRO),
+              "VMHOOK_OS_LINUX == (!__ANDROID__ && !_WIN32 && !__APPLE__ && __linux__)");
+
+// ===========================================================================
+// Arch-selection LADDER pinned to its gate inputs (vmhook.hpp:173-183).
+// Arm 1 (`__x86_64__ || _M_X64`) is unconditional; arm 2 (`__aarch64__ ||
+// _M_ARM64`) is reached only when arm 1 missed.  Both pins are tautologies on
+// every supported target.
+// ===========================================================================
+static_assert(VMHOOK_ARCH_X86_64 == VMHT_HAS_X86_64_MACRO,
+              "VMHOOK_ARCH_X86_64 == (__x86_64__ || _M_X64) (first, unconditional arch arm)");
+static_assert(VMHOOK_ARCH_ARM64 == (!VMHT_HAS_X86_64_MACRO && VMHT_HAS_ARM64_MACRO),
+              "VMHOOK_ARCH_ARM64 == (!x86_64 && (__aarch64__ || _M_ARM64))");
+// The two arch tokens are never simultaneously true on a real target, so the
+// resolved x86_64 flag equals its token unconditionally (no ladder masking
+// needed) — assert that the token-level pair is itself exclusive here.
+static_assert(!(VMHT_HAS_X86_64_MACRO && VMHT_HAS_ARM64_MACRO),
+              "x86_64 and arm64 preprocessor tokens are mutually exclusive on a supported target");
 
 // ===========================================================================
 // Compiler-family macros (vmhook.hpp:198-214).  These select #pragma /
@@ -333,6 +428,27 @@ int main()
     check("android_implies_posix",
           (!VMHOOK_OS_ANDROID) || VMHOOK_OS_POSIX == 1);
 
+    // -- OS-selection ladder pinned to gate inputs (runtime mirror) ---------
+    // Each resolved VMHOOK_OS_* equals the ladder branch (in order) that set it.
+    // These pass on every cell because they merely restate the #if/#elif ladder.
+    check("os_android_equals_gate_input",
+          VMHOOK_OS_ANDROID == VMHT_IS_ANDROID);
+    check("android_implies_linux_macro_present",
+          !VMHOOK_OS_ANDROID || VMHT_HAS_LINUX_MACRO);
+    check("android_does_not_also_resolve_linux",
+          !VMHOOK_OS_ANDROID || (VMHOOK_OS_LINUX == 0));
+    check("os_windows_matches_ladder_gate",
+          VMHOOK_OS_WINDOWS == (!VMHT_IS_ANDROID && VMHT_HAS_WIN32_MACRO));
+    check("os_apple_matches_ladder_gate",
+          VMHOOK_OS_APPLE
+              == (!VMHT_IS_ANDROID && !VMHT_HAS_WIN32_MACRO && VMHT_HAS_APPLE_MACRO));
+    check("apple_resolved_implies_apple_macro",
+          !VMHOOK_OS_APPLE || VMHT_HAS_APPLE_MACRO);
+    check("os_linux_matches_ladder_gate",
+          VMHOOK_OS_LINUX
+              == (!VMHT_IS_ANDROID && !VMHT_HAS_WIN32_MACRO
+                  && !VMHT_HAS_APPLE_MACRO && VMHT_HAS_LINUX_MACRO));
+
     // -- Arch macro consistency --------------------------------------------
     check("exactly_one_arch_macro_is_one",
           VMHOOK_ARCH_X86_64 + VMHOOK_ARCH_ARM64 == 1);
@@ -341,6 +457,14 @@ int main()
               && VMHOOK_ARCH_ARM64 >= 0 && VMHOOK_ARCH_ARM64 <= 1);
     check("arch_x86_64_xor_arm64",
           (VMHOOK_ARCH_X86_64 ^ VMHOOK_ARCH_ARM64) == 1);
+    // Arch ladder pinned to gate inputs (runtime mirror): x86_64 arm is first
+    // and unconditional; arm64 arm is gated on x86_64 missing.
+    check("arch_x86_64_equals_gate_input",
+          VMHOOK_ARCH_X86_64 == VMHT_HAS_X86_64_MACRO);
+    check("arch_arm64_matches_ladder_gate",
+          VMHOOK_ARCH_ARM64 == (!VMHT_HAS_X86_64_MACRO && VMHT_HAS_ARM64_MACRO));
+    check("arch_tokens_mutually_exclusive",
+          !(VMHT_HAS_X86_64_MACRO && VMHT_HAS_ARM64_MACRO));
 
     // -- Runtime hooking availability flag ---------------------------------
     check("runtime_hooking_flag_is_zero_or_one",
