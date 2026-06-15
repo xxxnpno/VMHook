@@ -359,11 +359,30 @@ namespace
 
     auto run_checks(vmhook_test::context& ctx) -> void
     {
-        // ─── #28-DIAG (java24 hang localization; remove once root-caused) ────
-        ctx.record("[INFO] htm DIAG A: run_checks entered; calling find_class");
-        // ─── ENTRY GUARD ────────────────────────────────────────────────────
-        const auto fixture_klass{ vmhook::find_class(FIXTURE) };
-        ctx.record(std::string{ "[INFO] htm DIAG B: find_class returned " }
+        // ─── #28-DIAG (java24 find_class hang localization; remove once root-caused) ─
+        //   Splits find_class's internal chain to pinpoint the hanging sub-step on
+        //   windows-msvc/clang · java24: graph ctor -> graph.find_klass -> JNI fallback.
+        ctx.record("[INFO] htm DIAG A: run_checks entered");
+        vmhook::hotspot::klass* fixture_klass{ nullptr };
+        {
+            ctx.record("[INFO] htm DIAG B0: constructing class_loader_data_graph");
+            const vmhook::hotspot::class_loader_data_graph graph{};
+            ctx.record("[INFO] htm DIAG B1: graph ctor ok; calling graph.find_klass");
+            fixture_klass = graph.find_klass(FIXTURE);
+            ctx.record(std::string{ "[INFO] htm DIAG B2: graph.find_klass -> " }
+                       + (fixture_klass ? "non-null" : "null"));
+        }
+        if (!fixture_klass)
+        {
+            ctx.record("[INFO] htm DIAG B3: calling jni_find_class_with_context_loader");
+            fixture_klass = vmhook::detail::jni_find_class_with_context_loader(FIXTURE);
+            ctx.record(std::string{ "[INFO] htm DIAG B4: jni -> " }
+                       + (fixture_klass ? "non-null" : "null"));
+        }
+        ctx.record("[INFO] htm DIAG B5: manual resolution done; calling real find_class");
+        // ─── ENTRY GUARD (real path; populates the lookup cache for register_class) ──
+        fixture_klass = vmhook::find_class(FIXTURE);
+        ctx.record(std::string{ "[INFO] htm DIAG B: real find_class -> " }
                    + (fixture_klass ? "non-null" : "null"));
         if (fixture_klass == nullptr)
         {
