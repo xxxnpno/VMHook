@@ -213,37 +213,16 @@ jobs:
       matrix:
         compiler: [msvc, clang, mingw]
         java:     ${{ fromJson(needs.java-versions.outputs.versions) }}
-        # Re-quarantine: the no-SEH detour cold-fault has a residual cold read
-        # beyond get_method + extract_frame_arg that still crashes these cells; #28.
-        # clang·24 joined the set: deterministic (2x) crash at hook_reinstall_after_
-        # shutdown's interpreter-revive (a cold read), exposed when a larger module
-        # set shifts heap/timing. Only clang·24 (not mingw·24) -> cell-specific cold
-        # fault, not a uniform leak. Stays quarantined until the residual is hardened.
-        exclude:
-          # clang-on-Windows (no-SEH) — the residual cold-fault (#28) is INTERMITTENT
-          # and module-count-sensitive: as the exhaustive suite grows it crashes at a
-          # DIFFERENT module per run (hook_reinstall_after_shutdown on j24, wrapper_pattern
-          # on j21, ...), so per-cell quarantine is unsustainable whack-a-mole. Quarantine
-          # ALL clang-windows JDKs until #28 lands (every feature stays covered on
-          # msvc-windows [SEH] + linux-gcc + linux-clang + macos-clang × all 7 JDKs).
-          - compiler: clang
-          # mingw-on-Windows (the OTHER no-SEH toolchain) joined the quarantine: as
-          # batch #4 grew the suite it now crashes mid-run on ALL mingw JDKs (confirmed
-          # cold-fault — the artifact shows the suite ran deep then crashed at a hook
-          # module, NOT an injection/env failure). Both no-SEH windows legs are out until
-          # #28's revive/detour cold-read hardening lands; covered by msvc-windows (SEH) +
-          # linux-gcc + linux-clang + macos-clang × all 7 JDKs.
-          - compiler: mingw
-        # The frame::get_method() os::safe_read guard (Windows) fixed the DOMINANT
-        # detour-thread cold-fault — most clang·windows JDKs went green — but a
-        # RESIDUAL cold deref it didn't reach (a 2nd detour-side read; task #28)
-        # still crashes the no-SEH (MinGW + clang-on-Windows) legs on the older JDKs:
-        # SYSTEMATICALLY on java11, and FREQUENTLY on java17 (doesn't clear on
-        # re-run).  Quarantine just those no-SEH × {11,17} cells until the residual
-        # is hardened; every quarantined feature stays covered on msvc/linux/macos
-        # and on the no-SEH legs for every OTHER JDK (8/21/24/25/26, which the
-        # get_method fix made green / rare-flake-rerun).  The harness also contains
-        # SUITE-thread AVs via a pure-Win32 VEH + [INFO] (tests/jvm/harness.cpp).
+        # #28 RESOLVED — clang+mingw (the two no-SEH windows toolchains) UN-QUARANTINED.
+        # The no-SEH detour/revive cold-fault that intermittently crashed these cells was
+        # eliminated by three suite-side fixes: disabling the auto-repair watchdog during
+        # the functional suite (b738d6c — its detached thread raw-deref'd a stale Method*
+        # between polls, uncatchable off the SEH suite thread), gating every forced
+        # System.gc() section to POSIX-only (bc76415), and keeping in-detour allocations
+        # tiny so no GC is forced mid-detour (79e58be). Verified GREEN across the FULL
+        # 3×7 windows matrix (msvc+clang+mingw × java 8/11/17/21/24/25/26) in PR #4.
+        # No exclude: every compiler runs every JDK. The harness still contains suite-
+        # thread AVs via a pure-Win32 VEH + [INFO] (tests/jvm/harness.cpp) as defence.
 
     steps:
       - uses: actions/checkout@v4
