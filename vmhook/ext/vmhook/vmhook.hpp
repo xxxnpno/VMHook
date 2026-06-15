@@ -2327,7 +2327,20 @@ namespace vmhook
                 {
                     return -1;
                 }
-                return *reinterpret_cast<const std::int32_t*>(reinterpret_cast<const std::uint8_t*>(this) + entry->offset);
+                // Cold read: _length off a ConstantPool* that the watchdog
+                // (verify_hooks via get_name/get_signature) or a static-dispatch
+                // overload walk may have reached on an unmapped page after a
+                // DEOPT/class-unload.  Read fault-safe on ALL platforms
+                // (os::safe_read) so a bad page degrades to the existing -1
+                // "length unknown -> skip the bound check" sentinel instead of
+                // faulting the no-SEH legs OR the detached POSIX watchdog thread;
+                // a metadata (not frame) read, so no stk_ POSIX regression.
+                std::int32_t length{ -1 };
+                if (!vmhook::os::safe_read(&length, reinterpret_cast<const std::uint8_t*>(this) + entry->offset, sizeof(length)))
+                {
+                    return -1;
+                }
+                return length;
             }
         };
 
@@ -2436,7 +2449,15 @@ namespace vmhook
                     {
                         return nullptr;
                     }
-                    void* const entry_pointer{ base[index] };
+                    // Terminal Symbol* slot read: the is_readable_pointer probe
+                    // above is a VirtualQuery TOCTOU window — the page can be
+                    // unmapped (code-cache sweep / class-unload) between the probe
+                    // and this load.  Read the slot fault-safe on ALL platforms
+                    // (cold_read_metadata_pointer -> os::safe_read) so a cold page
+                    // yields nullptr instead of faulting the no-SEH legs or the
+                    // detached POSIX watchdog thread; a metadata read, no stk_
+                    // POSIX regression.
+                    void* const entry_pointer{ vmhook::hotspot::cold_read_metadata_pointer(&base[index]) };
                     if (!entry_pointer || !vmhook::hotspot::is_valid_pointer(entry_pointer))
                     {
                         return nullptr;
@@ -2505,7 +2526,15 @@ namespace vmhook
                     {
                         return nullptr;
                     }
-                    void* const entry_pointer{ base[index] };
+                    // Terminal Symbol* slot read: the is_readable_pointer probe
+                    // above is a VirtualQuery TOCTOU window — the page can be
+                    // unmapped (code-cache sweep / class-unload) between the probe
+                    // and this load.  Read the slot fault-safe on ALL platforms
+                    // (cold_read_metadata_pointer -> os::safe_read) so a cold page
+                    // yields nullptr instead of faulting the no-SEH legs or the
+                    // detached POSIX watchdog thread; a metadata read, no stk_
+                    // POSIX regression.
+                    void* const entry_pointer{ vmhook::hotspot::cold_read_metadata_pointer(&base[index]) };
                     if (!entry_pointer || !vmhook::hotspot::is_valid_pointer(entry_pointer))
                     {
                         return nullptr;
@@ -2763,6 +2792,54 @@ namespace vmhook
                     return true;  // already set; no write needed
                 }
                 flags_value |= mask;
+                return vmhook::os::safe_write(slot, &flags_value, sizeof(flags_value));
+            }
+
+            /*
+                @brief Fault-safe AND of bits into Method::_access_flags.
+                @details
+                Teardown counterpart of safe_access_flags_or().  shutdown_hooks() and
+                hook_handle::stop() clear NO_COMPILE on a STORED Method* during
+                teardown via a RAW READ-MODIFY-WRITE `*flags &= ~NO_COMPILE`.  A
+                JVMTI RedefineClasses (or a code-cache sweep) between install and
+                teardown can leave that Method* cold/relocated/freed — strictly more
+                dangerous than a stray read because the write also corrupts whatever
+                it lands on.  This does the read AND the write through os::safe_read /
+                os::safe_write, so a cold page simply skips the clear and never
+                faults.
+
+                Non-atomicity note: same contract as safe_access_flags_or — teardown
+                runs on the driver thread under g_hooked_methods_mutex, never
+                concurrently with a Java dispatch of the hooked method, and the
+                library is the only writer of NO_COMPILE on a Method we own, so there
+                is no torn-write hazard in practice.  Skipping the write on a cold
+                page is strictly safer than the previous raw store.  A metadata (not
+                frame) read, so no stk_ POSIX regression.
+
+                @param mask  Bits to retain (i.e. caller passes ~bits_to_clear).
+                @return true iff the read-modify-write completed (false = skipped).
+            */
+            auto safe_access_flags_and(const std::uint32_t mask) const noexcept
+                -> bool
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_access_flags") };
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return false;
+                }
+
+                std::uint8_t* const slot{ reinterpret_cast<std::uint8_t*>(
+                    const_cast<vmhook::hotspot::method*>(this)) + entry->offset };
+                std::uint32_t flags_value{ 0 };
+                if (!vmhook::os::safe_read(&flags_value, slot, sizeof(flags_value)))
+                {
+                    return false;
+                }
+                if ((flags_value & mask) == flags_value)
+                {
+                    return true;  // already clear; no write needed
+                }
+                flags_value &= mask;
                 return vmhook::os::safe_write(slot, &flags_value, sizeof(flags_value));
             }
 
@@ -6675,17 +6752,26 @@ namespace vmhook
                 static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
                 std::uint32_t old_protect{};
-                // The make-writable protect() here is already load-bearing and
-                // guarded: the && short-circuits the restore-memcpy below if it
-                // fails, so we never write the original bytes over a read-only
-                // page.  The inner execute_read protect() is a best-effort
-                // re-tighten whose failure is not load-bearing (bytes already
-                // restored; leaving the page RW does not corrupt anything).
-                if (this->target[0] == JMP_OPCODE
+                // Read the current opcode byte through os::safe_read first.  ~midi2i_hook
+                // can run during teardown after a code-cache sweep has transiently
+                // UNMAPPED the shared HotSpot i2i stub page (a GC/deopt on JDK 11+); a
+                // raw `this->target[0]` there faults UNCONTAINED and on the no-SEH legs
+                // (MinGW / clang-on-windows) seh_invoke_detour cannot trap the AV, so the
+                // JVM dies — mirroring verify_and_repair's safe_read of the same stub.
+                // If the byte is unreadable, skip the restore (the page is gone; nothing
+                // to undo).  The make-writable protect() stays load-bearing and guarded:
+                // the && short-circuits the restore below if it fails, so we never write
+                // over a read-only page; the inner execute_read protect() is a best-effort
+                // re-tighten whose failure is not load-bearing.  The restore itself goes
+                // through os::safe_write so a slot that turned cold between the protect()
+                // and the write also degrades to a no-op instead of faulting.
+                std::uint8_t first_byte{};
+                if (vmhook::os::safe_read(&first_byte, this->target, 1)
+                    && first_byte == JMP_OPCODE
                     && vmhook::os::protect(this->target, 5,
                                            vmhook::os::memory_protection::execute_rw, &old_protect))
                 {
-                    std::memcpy(this->target, this->allocated, 5);
+                    (void)vmhook::os::safe_write(this->target, this->allocated, 5);
                     vmhook::os::protect(this->target, 5,
                                         vmhook::os::memory_protection::execute_read, &old_protect);
                     vmhook::os::flush_instruction_cache(this->target, 5);
@@ -7665,8 +7751,17 @@ namespace vmhook
 
             auto try_offset = [&](const std::size_t offset) noexcept -> bool
                 {
+                    // Cold read: this scans 8-byte slots of a possibly-uncached
+                    // Method (JDK 9+ dropped the exported _adapter), so a candidate
+                    // slot can land on an unmapped page.  Read it fault-safe on ALL
+                    // platforms (os::safe_read) — a bad slot fails the probe and the
+                    // offset is rejected instead of faulting the no-SEH legs; a
+                    // metadata (not frame) read, so no stk_ POSIX regression.
                     void* candidate{};
-                    std::memcpy(&candidate, probe_bytes + offset, sizeof(candidate));
+                    if (!vmhook::os::safe_read(&candidate, probe_bytes + offset, sizeof(candidate)))
+                    {
+                        return false;
+                    }
                     return validate_adapter_handler_entry(candidate, c2i_offset);
                 };
 
@@ -10845,11 +10940,12 @@ namespace vmhook
 
             vmhook::hotspot::set_dont_inline(hooked_method_entry.method, false);
 
-            std::uint32_t* const flags{ hooked_method_entry.method->get_access_flags() };
-            if (flags)
-            {
-                *flags &= static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE);
-            }
+            // Fault-safe RMW clear of NO_COMPILE (was a raw `*flags &= ~…` on a
+            // STORED Method* that a JVMTI RedefineClasses between install and
+            // teardown can leave cold/freed — the raw write would AV or scribble
+            // a recycled Method on the no-SEH legs).  A cold page skips the clear.
+            (void)hooked_method_entry.method->safe_access_flags_and(
+                static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE));
 
             // DELIBERATELY no _code / _from_compiled_entry / _from_interpreted_entry
             // restoration for was_compiled methods.
@@ -10940,10 +11036,13 @@ namespace vmhook
             // common_detour will simply skip over methods missing
             // from g_hooked_methods.
             vmhook::hotspot::set_dont_inline(entry_it->method, false);
-            if (std::uint32_t* const flags{ entry_it->method->get_access_flags() })
-            {
-                *flags &= static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE);
-            }
+            // Fault-safe RMW clear of NO_COMPILE (was a raw `*flags &= ~…` on a
+            // STORED Method* that may be cold/relocated/freed by a JVMTI
+            // RedefineClasses between install and this single-handle stop — the raw
+            // write would AV or scribble a recycled Method on the no-SEH legs).
+            // A cold page skips the clear.
+            (void)entry_it->method->safe_access_flags_and(
+                static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE));
             // No _code / _from_compiled_entry / _from_interpreted_entry
             // restoration here either - see the long comment in
             // shutdown_hooks() for why.  Short version: the nmethod we
@@ -16095,8 +16194,16 @@ namespace vmhook
                                 vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
                             if (pool_holder_entry)
                             {
-                                auto* const holder_klass{ *reinterpret_cast<vmhook::hotspot::klass**>(
-                                    reinterpret_cast<std::uint8_t*>(cp) + pool_holder_entry->offset) };
+                                // Cold read: _pool_holder Klass* off a ConstantPool*
+                                // reached by chasing a stored Method*'s ConstMethod*.
+                                // Read fault-safe on ALL platforms
+                                // (cold_read_metadata_pointer -> os::safe_read) so a
+                                // cold/unmapped page yields nullptr instead of faulting
+                                // the no-SEH legs; a metadata (not frame) read, so no
+                                // stk_ POSIX regression.
+                                auto* const holder_klass{ reinterpret_cast<vmhook::hotspot::klass*>(
+                                    vmhook::hotspot::cold_read_metadata_pointer(
+                                        reinterpret_cast<const std::uint8_t*>(cp) + pool_holder_entry->offset)) };
                                 if (holder_klass && vmhook::hotspot::is_valid_pointer(holder_klass))
                                 {
                                     if (auto* const name_sym{ holder_klass->get_name() })
@@ -16951,10 +17058,16 @@ namespace vmhook
         {
             if (this->method)
             {
-                if (const std::uint32_t* const flags{ this->method->get_access_flags() })
-                {
-                    return (*flags & 0x0008u) != 0u;
-                }
+                // Fault-safe JVM_ACC_STATIC (0x0008) probe.  get_access_flags()
+                // returns a RAW pointer and a raw `*flags & 0x0008` would deref a
+                // stored Method* that a DEOPT/class-unload can leave cold; on the
+                // no-SEH legs that AVs the JVM.  safe_access_flags_test routes the
+                // u4 read through os::safe_read on ALL platforms: an unreadable slot
+                // yields found=false and we report not-static (the proxy's
+                // documented fallback).  This single change covers both callers —
+                // call_jni's static-dispatch gate and call()'s receiver-slot gate.
+                bool found{ false };
+                return this->method->safe_access_flags_test(0x0008u, found);
             }
             return false;
         }
@@ -17318,8 +17431,16 @@ namespace vmhook
                             vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
                         if (pool_holder_entry)
                         {
-                            auto* const holder{ *reinterpret_cast<vmhook::hotspot::klass**>(
-                                reinterpret_cast<std::uint8_t*>(cp) + pool_holder_entry->offset) };
+                            // Cold read: _pool_holder Klass* off a ConstantPool*
+                            // reached by chasing a stored Method*'s ConstMethod*.
+                            // Read fault-safe on ALL platforms
+                            // (cold_read_metadata_pointer -> os::safe_read) so a
+                            // cold/unmapped page yields nullptr instead of faulting
+                            // the no-SEH legs; a metadata (not frame) read, so no
+                            // stk_ POSIX regression.
+                            auto* const holder{ reinterpret_cast<vmhook::hotspot::klass*>(
+                                vmhook::hotspot::cold_read_metadata_pointer(
+                                    reinterpret_cast<const std::uint8_t*>(cp) + pool_holder_entry->offset)) };
                             if (holder && vmhook::hotspot::is_valid_pointer(holder))
                             {
                                 resolved_klass = holder;
@@ -17998,11 +18119,16 @@ namespace vmhook
         static auto static_method_only(vmhook::hotspot::method* const candidate) noexcept
             -> bool
         {
-            if (const std::uint32_t* const flags{ candidate->get_access_flags() })
-            {
-                return (*flags & 0x0008u) != 0u;
-            }
-            return false;
+            // Fault-safe JVM_ACC_STATIC (0x0008) probe — same hardening as
+            // method_proxy::is_static() (audit fix #6).  static_method_only is an
+            // overload-resolution gate reached on the detour path via
+            // pick_overloaded_method, so a raw `*flags & 0x0008` deref of a cold /
+            // relocated stored Method* would AV the no-SEH legs.  Route the u4 read
+            // through os::safe_read: an unreadable slot yields found=false and we
+            // report not-static (the documented fallback).  A metadata (not frame)
+            // read, so no stk_ POSIX regression.
+            bool found{ false };
+            return candidate->safe_access_flags_test(0x0008u, found);
         }
 
         /*
