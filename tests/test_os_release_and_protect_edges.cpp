@@ -36,6 +36,46 @@ static auto check(const char* name, bool ok) -> void
     if (!ok) { ++failures; }
 }
 
+// A characterization line for a behaviour that LEGITIMATELY differs across
+// kernels (e.g. partial-size release, double-release, protect-after-release):
+// it must never be asserted hard, only reported.  Keeping the format identical
+// to the sibling files' "[INFO] ... skipped/refused" convention.
+static auto info(const char* name, bool observed) -> void
+{
+    std::printf("[INFO] %s = %s\n", name, observed ? "true" : "false");
+}
+
+// ---------------------------------------------------------------------------
+// Shared teardown helpers.  Every test that flips protection must restore a
+// writable mapping before release() so no platform-level integrity check trips
+// on a read-only / no-access mapping at unmap time.  execute_rw is the natural
+// state allocate_rwx hands back; Apple arm64 / current iOS enforce W^X and
+// refuse PROT_WRITE|PROT_EXEC without the JIT entitlement, so fall back to plain
+// read_write (which is what allocate_rwx itself falls back to there).
+// ---------------------------------------------------------------------------
+static auto make_writable(void* base, std::size_t size) -> bool
+{
+    bool ok{ vmhook::os::protect(base, size,
+                                 vmhook::os::memory_protection::execute_rw, nullptr) };
+    if (!ok)
+    {
+        ok = vmhook::os::protect(base, size,
+                                 vmhook::os::memory_protection::read_write, nullptr);
+    }
+    return ok;
+}
+
+// Probe whether the first byte at `p` is readable WITHOUT faulting.  safe_read
+// kernel-validates the source (ReadProcessMemory / process_vm_readv /
+// mach_vm_read_overwrite) and returns false instead of crashing.  Not usable on
+// iOS (safe_read there is a raw memcpy that would fault on a no_access page), so
+// callers gate the no_access cases behind !VMHOOK_OS_IOS.
+static auto byte_is_readable(const void* p) -> bool
+{
+    std::uint8_t sink{ 0 };
+    return vmhook::os::safe_read(&sink, p, 1u);
+}
+
 // ---------------------------------------------------------------------------
 // Compile-time sanity on the portable memory_protection enum.  If anyone
 // renumbers these, the protect() native-mapping switch and every caller that
@@ -390,6 +430,518 @@ static auto test_page_size_and_granularity_relationship() -> void
     check("allocation_granularity_multiple_of_page_size", (gr1 % ps1) == 0);
 }
 
+// ===========================================================================
+// EXPANSION — release / allocate lifecycle edges and protect<->release
+// interaction edges that the sibling files do NOT cover.
+//
+// test_os_protect_interaction.cpp owns the deep protect behavioural matrix
+// (every enum, size-rounding, old_prot platform-asymmetry, overflow guard,
+// neighbour witness); test_os_safe_read.cpp and test_os_query_region.cpp own
+// those primitives.  This block deliberately stays on the RELEASE / ALLOCATE
+// lifecycle and the protect<->release seam:
+//   * multi-page release, allocate/release reuse cycles, sub-page + multi-page
+//     allocate writability, two-block non-aliasing, non-binding hint;
+//   * release of a region left NON-writable (read / no_access) — the sibling
+//     always restores writable first, so this seam is untested elsewhere;
+//   * partial-size / oversize / double / never-allocated release — all
+//     LEGITIMATELY platform-variable, so reported via [INFO], never asserted;
+//   * the overflow-guard early-return leaves old_prot untouched (a THIRD
+//     early-return distinct from the null/zero guards already covered above).
+// Every assertion below is a cross-platform INVARIANT; every platform-variable
+// outcome is an [INFO] characterization line.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// allocate_rwx returns memory that is immediately writable across the WHOLE
+// requested span, and a real release(ptr, size) of a multi-page region frees it
+// cleanly.  The basic round-trip in test_os_layer.cpp only touches the first
+// byte of a single page; here we stamp + read back a marker in EVERY page of a
+// multi-page allocation, proving the whole reservation is committed RW, then
+// release the entire span.
+// ---------------------------------------------------------------------------
+static auto test_allocate_rwx_multipage_writable_then_release() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    constexpr std::size_t pages{ 4 };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * pages) };
+    if (!block)
+    {
+        check("allocate_multipage_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+
+    // Write a distinct marker at the start of each page AND at the very last
+    // byte of the allocation (the far edge of the last page).
+    bool all_written{ true };
+    for (std::size_t p{ 0 }; p < pages; ++p)
+    {
+        const auto marker{ static_cast<std::uint8_t>(0xA0 + p) };
+        bytes[p * page] = marker;
+        if (bytes[p * page] != marker)
+        {
+            all_written = false;
+        }
+    }
+    bytes[page * pages - 1] = 0xEF;
+    if (bytes[page * pages - 1] != 0xEF)
+    {
+        all_written = false;
+    }
+    check("allocate_multipage_every_page_writable", all_written);
+
+    // Read every marker back — proves no page silently aliased another.
+    bool all_readback{ true };
+    for (std::size_t p{ 0 }; p < pages; ++p)
+    {
+        if (bytes[p * page] != static_cast<std::uint8_t>(0xA0 + p))
+        {
+            all_readback = false;
+        }
+    }
+    check("allocate_multipage_markers_readback_intact",
+          all_readback && bytes[page * pages - 1] == 0xEF);
+
+    // Real release of the whole multi-page reservation (size matters on POSIX:
+    // munmap unmaps exactly [block, block + page*pages)).  No crash == pass.
+    vmhook::os::release(block, page * pages);
+    check("release_multipage_full_region_no_crash", true);
+}
+
+// ---------------------------------------------------------------------------
+// Sub-page allocate: allocate_rwx(size == 1) must hand back a usable pointer.
+// The kernel rounds the mapping up to a full page, so the entire first page is
+// writable even though only 1 byte was requested.  Release with size 1 (POSIX
+// munmap rounds the length up to the page; Windows ignores size and frees the
+// whole reservation) must free it cleanly.
+// ---------------------------------------------------------------------------
+static auto test_allocate_rwx_subpage_size_one() -> void
+{
+    void* const block{ vmhook::os::allocate_rwx(nullptr, 1) };
+    check("allocate_size_one_returns_ptr", block != nullptr);
+    if (!block)
+    {
+        return;
+    }
+
+    auto* const cell{ static_cast<volatile std::uint8_t*>(block) };
+    *cell = 0x7E;
+    check("allocate_size_one_byte_writable", *cell == 0x7E);
+    *cell = 0xE7;
+    check("allocate_size_one_byte_rewritable", *cell == 0xE7);
+
+    // Release using the same tiny size the caller asked for.  POSIX munmap
+    // rounds the length up to one page; Windows VirtualFree ignores it.
+    vmhook::os::release(block, 1);
+    check("release_size_one_no_crash", true);
+}
+
+// ---------------------------------------------------------------------------
+// Two independent allocations must NOT alias: distinct base pointers, and a
+// store through one must be invisible through the other.  The trampoline
+// allocator places many stubs; if allocate_rwx ever returned overlapping
+// reservations the stubs would clobber each other.  Both blocks must be
+// simultaneously live and writable.
+// ---------------------------------------------------------------------------
+static auto test_allocate_rwx_two_blocks_do_not_alias() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const a{ vmhook::os::allocate_rwx(nullptr, page) };
+    void* const b{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!a || !b)
+    {
+        check("allocate_two_blocks_skipped_alloc_failed", false);
+        vmhook::os::release(a, page);
+        vmhook::os::release(b, page);
+        return;
+    }
+
+    check("allocate_two_blocks_distinct_pointers", a != b);
+
+    auto* const ba{ static_cast<std::uint8_t*>(a) };
+    auto* const bb{ static_cast<std::uint8_t*>(b) };
+
+    // Distinct stores; if the two blocks aliased, the second write would be
+    // visible through the first pointer.
+    ba[0] = 0x11;
+    bb[0] = 0x22;
+    check("allocate_two_blocks_no_alias_a", ba[0] == 0x11);
+    check("allocate_two_blocks_no_alias_b", bb[0] == 0x22);
+
+    // Both must remain independently writable after the cross writes.
+    ba[0] = 0x33;
+    check("allocate_two_blocks_a_still_independent", ba[0] == 0x33 && bb[0] == 0x22);
+
+    vmhook::os::release(a, page);
+    vmhook::os::release(b, page);
+    check("release_two_blocks_no_crash", true);
+}
+
+// ---------------------------------------------------------------------------
+// allocate_rwx honours an address_hint only as a NON-BINDING preference: the
+// kernel may place the mapping elsewhere.  The portable contract is merely
+// "you get SOME usable block back", so we assert non-null + writable and do NOT
+// assert the returned address equals the hint (Windows rounds the hint to the
+// allocation granularity; POSIX may ignore it entirely; ASLR moves it).
+// ---------------------------------------------------------------------------
+static auto test_allocate_rwx_hint_is_non_binding() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    const std::size_t gran{ vmhook::os::allocation_granularity() };
+
+    // A plausible, granularity-aligned hint well inside user space.  Even if the
+    // exact address is taken, allocate_rwx must still return a usable block.
+    // Mask is uintptr_t-typed so the high address bits survive on every ABI.
+    const std::uintptr_t gran_mask{ ~(static_cast<std::uintptr_t>(gran) - 1u) };
+    void* const hint{ reinterpret_cast<void*>(
+        static_cast<std::uintptr_t>(0x0000'1000'0000'0000ull) & gran_mask) };
+
+    void* const block{ vmhook::os::allocate_rwx(hint, page) };
+    check("allocate_hint_returns_usable_block", block != nullptr);
+    if (!block)
+    {
+        return;
+    }
+
+    auto* const cell{ static_cast<volatile std::uint8_t*>(block) };
+    *cell = 0x9C;
+    check("allocate_hint_block_is_writable", *cell == 0x9C);
+
+    vmhook::os::release(block, page);
+    check("release_after_hinted_alloc_no_crash", true);
+}
+
+// ---------------------------------------------------------------------------
+// allocate / release REUSE cycle: repeatedly allocate a page, use it, and
+// release it.  Proves there is no leak that accumulates across the loop (each
+// release truly returns the reservation) and that a fresh allocation after a
+// release is always writable.  We do NOT assert the address is reused (kernels
+// differ); only that every cycle yields a live, writable, releasable block.
+// ---------------------------------------------------------------------------
+static auto test_allocate_release_reuse_cycle() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    bool every_cycle_ok{ true };
+    for (int i{ 0 }; i < 16; ++i)
+    {
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            every_cycle_ok = false;
+            break;
+        }
+        auto* const cell{ static_cast<volatile std::uint8_t*>(block) };
+        const auto marker{ static_cast<std::uint8_t>(0x40 + (i & 0x3F)) };
+        *cell = marker;
+        if (*cell != marker)
+        {
+            every_cycle_ok = false;
+            vmhook::os::release(block, page);
+            break;
+        }
+        vmhook::os::release(block, page);
+    }
+    check("allocate_release_reuse_cycle_all_live_writable", every_cycle_ok);
+}
+
+// ---------------------------------------------------------------------------
+// release() must tolerate a mapping that is currently NON-writable.  The
+// sibling interaction test always restores read_write before release; this one
+// deliberately does NOT — it leaves the page in `read` (read-only) and releases
+// it directly.  munmap (POSIX) and VirtualFree (Windows) both ignore the
+// page protection, so the unmap must still succeed without faulting.
+// ---------------------------------------------------------------------------
+static auto test_release_of_read_only_mapping() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("release_readonly_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x5A;
+
+    const bool flipped{ vmhook::os::protect(block, page,
+                                            vmhook::os::memory_protection::read,
+                                            nullptr) };
+    check("release_readonly_protect_read_succeeds", flipped);
+
+    // Release WITHOUT restoring writability.  This is the seam under test.
+    vmhook::os::release(block, page);
+    check("release_of_read_only_mapping_no_crash", true);
+}
+
+// ---------------------------------------------------------------------------
+// release() must also tolerate a mapping left in `no_access`.  Gated like every
+// other no_access probe: a sandbox may refuse PROT_NONE, in which case we skip
+// (the protect itself returns false) rather than fail.  When it succeeds, the
+// release of an inaccessible mapping must still not fault.
+// ---------------------------------------------------------------------------
+static auto test_release_of_no_access_mapping() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("release_no_access_skipped_alloc_failed", false);
+        return;
+    }
+
+    const bool flipped{ vmhook::os::protect(block, page,
+                                            vmhook::os::memory_protection::no_access,
+                                            nullptr) };
+    if (!flipped)
+    {
+        std::printf("[INFO] release_no_access_skipped: protect(no_access) refused\n");
+        // Restore writable so the unmap below is of a normal mapping.
+        (void)make_writable(block, page);
+        vmhook::os::release(block, page);
+        return;
+    }
+
+    // Release WITHOUT restoring access.  Must not fault.
+    vmhook::os::release(block, page);
+    check("release_of_no_access_mapping_no_crash", true);
+}
+
+// ---------------------------------------------------------------------------
+// PLATFORM-VARIABLE: release() with a size that is SMALLER than the original
+// allocation (partial release), and a size LARGER than the allocation.
+//   * Windows: VirtualFree(addr, 0, MEM_RELEASE) ignores the size and frees the
+//     ENTIRE reservation regardless of the value passed.
+//   * POSIX: munmap(addr, n) unmaps exactly the pages spanned by [addr, addr+n)
+//     and leaves the rest mapped (partial), or unmaps beyond the allocation if
+//     n is larger (potentially unmapping adjacent unrelated pages — which is why
+//     real callers always pass the exact size).
+// The outcome therefore LEGITIMATELY differs by OS, so we never hard-assert it;
+// we only (a) report what we can observe via query_region as [INFO] and (b)
+// assert the process does not crash and we can always reclaim cleanly.  To stay
+// SAFE we allocate a generously oversized block and only ever release sizes that
+// stay WITHIN our own allocation, so no unrelated page is ever at risk.
+// ---------------------------------------------------------------------------
+static auto test_release_partial_size_is_platform_variable() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    constexpr std::size_t pages{ 4 };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * pages) };
+    if (!block)
+    {
+        check("release_partial_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x01;
+    bytes[page * (pages - 1)] = 0x02; // marker in the LAST page
+
+    // Partial release: only the first page.  On POSIX this unmaps page 0 and
+    // leaves pages 1..3 mapped; on Windows it frees the whole reservation.  We
+    // cannot portably read page 0 afterwards (it may be gone), so we only probe
+    // the LAST page via the fault-safe path and REPORT the result.
+    vmhook::os::release(block, page);
+    check("release_partial_first_page_no_crash", true);
+
+#if !VMHOOK_OS_IOS
+    // Characterization only — NOT an assertion.  On POSIX the last page is very
+    // likely still readable (only page 0 was unmapped); on Windows the whole
+    // reservation is gone so it is likely NOT readable.  Either is correct.
+    info("release_partial_last_page_still_readable_after_first_page_freed",
+         byte_is_readable(bytes + page * (pages - 1)));
+#endif
+
+    // Reclaim whatever may remain by releasing the FULL original span.  On
+    // Windows this is a (harmless) double-release of an already-freed base; on
+    // POSIX it unmaps the still-mapped tail (pages 1..3) — munmap of an
+    // already-unmapped sub-range within the call is harmless.  No crash == pass.
+    vmhook::os::release(block, page * pages);
+    check("release_partial_then_full_no_crash", true);
+}
+
+// ---------------------------------------------------------------------------
+// PLATFORM-VARIABLE: double-release of the same base.  Freeing an already-freed
+// reservation is, strictly, the caller's bug, but the wrapper must not turn it
+// into a process-killing fault.
+//   * Windows: VirtualFree on an already-released base returns 0 (error) but
+//     does not raise.
+//   * POSIX: munmap of an already-unmapped range returns -1/EINVAL, harmless.
+// We assert ONLY no-crash; the boolean outcome is not exposed by release() (it
+// returns void) so there is nothing to assert beyond survival.
+// ---------------------------------------------------------------------------
+static auto test_double_release_does_not_crash() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("double_release_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const cell{ static_cast<volatile std::uint8_t*>(block) };
+    *cell = 0x3C;
+
+    vmhook::os::release(block, page); // first, real release
+    vmhook::os::release(block, page); // second, double release of same base
+    check("double_release_same_base_no_crash", true);
+
+    // A third release, for good measure — the no-op contract must hold no matter
+    // how many times a freed base is handed back.
+    vmhook::os::release(block, page);
+    check("triple_release_same_base_no_crash", true);
+}
+
+// ---------------------------------------------------------------------------
+// PLATFORM-VARIABLE: protect() applied to a region AFTER it has been released.
+// Touching freed memory is the caller's bug; the contract we can pin portably
+// is only "protect() does not crash on a freed region".  The boolean result is
+// platform-variable (Windows VirtualProtect on a freed page -> false; POSIX
+// mprotect on an unmapped page -> ENOMEM -> false; but a kernel that has since
+// re-used the address could return true), so it is reported via [INFO], not
+// asserted.  We use the fault-safe nature of the wrappers: protect() never
+// dereferences the page itself, it only asks the kernel to re-tag it, so a
+// freed address is a clean kernel rejection rather than a fault.
+// ---------------------------------------------------------------------------
+static auto test_protect_after_release_is_platform_variable() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("protect_after_release_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const cell{ static_cast<volatile std::uint8_t*>(block) };
+    *cell = 0x6D;
+
+    vmhook::os::release(block, page);
+
+    // protect() on the now-freed region.  No crash is the invariant; the bool
+    // is characterized only.
+    const bool reprotected{ vmhook::os::protect(block, page,
+                                                vmhook::os::memory_protection::read,
+                                                nullptr) };
+    check("protect_after_release_no_crash", true);
+    info("protect_after_release_returned", reprotected);
+
+    // If the kernel happened to honour it (address was re-mapped under us), put
+    // it back to a writable state so we don't leave a stray read-only mapping;
+    // if it failed, this is a harmless no-op on a freed/again-failing region.
+    if (reprotected)
+    {
+        (void)make_writable(block, page);
+        vmhook::os::release(block, page);
+    }
+    check("protect_after_release_cleanup_no_crash", true);
+}
+
+// ---------------------------------------------------------------------------
+// The OVERFLOW-GUARD early-return is a THIRD distinct early `return false` in
+// protect() — separate from the null-address and zero-size guards already
+// covered above.  A non-null base with a size so large that base + size wraps
+// the address space must (a) return false and (b) leave a pre-seeded old_prot
+// sentinel UNTOUCHED, exactly like the other guards.  This pins that the wrap
+// guard rejects BEFORE any *old_prot write on every platform.  It is also
+// completely safe: the guard short-circuits before any syscall, so the live
+// page handed in is never disturbed.
+// ---------------------------------------------------------------------------
+static auto test_protect_overflow_guard_leaves_old_prot_untouched() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("protect_overflow_old_prot_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x5A;
+
+    constexpr std::uint32_t sentinel{ 0xDEADBEEFu };
+
+    // SIZE_MAX from a non-null base wraps the address space -> guard fires.
+    {
+        std::uint32_t op{ sentinel };
+        const bool ok{ vmhook::os::protect(block, SIZE_MAX,
+                                           vmhook::os::memory_protection::read, &op) };
+        check("protect_overflow_size_max_returns_false", !ok);
+        check("protect_overflow_size_max_leaves_old_prot_untouched", op == sentinel);
+    }
+
+    // The smallest size that still wraps from this exact base: (UINTPTR_MAX -
+    // base) + 8.  Pins the guard boundary, not just the SIZE_MAX extreme.
+    {
+        const std::uintptr_t base_addr{ reinterpret_cast<std::uintptr_t>(block) };
+        const std::uintptr_t max_addr{ ~static_cast<std::uintptr_t>(0) };
+        const std::size_t wrapping_size{
+            static_cast<std::size_t>(max_addr - base_addr) + std::size_t{ 8 } };
+        std::uint32_t op{ sentinel };
+        const bool ok{ vmhook::os::protect(block, wrapping_size,
+                                           vmhook::os::memory_protection::read, &op) };
+        check("protect_overflow_boundary_returns_false", !ok);
+        check("protect_overflow_boundary_leaves_old_prot_untouched", op == sentinel);
+    }
+
+    // The guard must also tolerate a null old_prot on the overflow path.
+    check("protect_overflow_null_old_prot_returns_false",
+          !vmhook::os::protect(block, SIZE_MAX,
+                               vmhook::os::memory_protection::read, nullptr));
+
+    // The rejected calls never touched the kernel: the page is still writable.
+    bytes[0] = 0xA5;
+    check("protect_overflow_guard_page_untouched_still_writable", bytes[0] == 0xA5);
+
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// Full installer-shaped lifecycle terminating in release, with the page left in
+// a NON-original protection at points along the way.  This is the canonical
+// trampoline pattern (flip RW, "write", flip RX) but exercised end-to-end as one
+// named sequence whose TERMINAL step is release — pinning that the whole cycle,
+// including release of a page currently tagged execute_read, never faults.
+// X-bearing transitions are treated as best-effort (W^X), never as failures.
+// ---------------------------------------------------------------------------
+static auto test_protect_cycle_then_release_lifecycle() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("protect_cycle_lifecycle_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+
+    // Flip to RW (or RWX) and "patch".
+    check("protect_cycle_make_writable", make_writable(block, page));
+    bytes[0] = 0xCC;
+    bytes[1] = 0xDD;
+    check("protect_cycle_patch_sticks", bytes[0] == 0xCC && bytes[1] == 0xDD);
+
+    // Flip to execute_read (the state a real installer leaves code in).  If W^X
+    // forbids it the page stays writable; either way the contents are intact.
+    const bool rx{ vmhook::os::protect(block, page,
+                                       vmhook::os::memory_protection::execute_read,
+                                       nullptr) };
+    if (!rx)
+    {
+        std::printf("[INFO] protect_cycle_execute_read refused (W^X); leaving page RW\n");
+    }
+    check("protect_cycle_contents_survive_rx_flip", bytes[0] == 0xCC && bytes[1] == 0xDD);
+
+    // Terminal step: release a page that is currently execute_read (NOT restored
+    // to writable first).  Must not fault.
+    vmhook::os::release(block, page);
+    check("protect_cycle_release_of_rx_page_no_crash", true);
+}
+
 int main()
 {
     test_release_zero_size_is_idempotent_noop();
@@ -400,6 +952,20 @@ int main()
     test_protect_non_page_aligned_addr_single_page();
     test_get_proc_address_null_name_guard();
     test_page_size_and_granularity_relationship();
+
+    // --- expansion: release / allocate lifecycle + protect<->release seam ---
+    test_allocate_rwx_multipage_writable_then_release();
+    test_allocate_rwx_subpage_size_one();
+    test_allocate_rwx_two_blocks_do_not_alias();
+    test_allocate_rwx_hint_is_non_binding();
+    test_allocate_release_reuse_cycle();
+    test_release_of_read_only_mapping();
+    test_release_of_no_access_mapping();
+    test_release_partial_size_is_platform_variable();
+    test_double_release_does_not_crash();
+    test_protect_after_release_is_platform_variable();
+    test_protect_overflow_guard_leaves_old_prot_untouched();
+    test_protect_cycle_then_release_lifecycle();
 
     if (failures == 0)
     {
