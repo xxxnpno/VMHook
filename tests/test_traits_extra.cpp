@@ -700,11 +700,13 @@ int main()
     // (R(args...), no pointer) matches none of the five specialisations.
     check("has_args_tuple_absent_for_free_function_type",
           !has_args_tuple<void(vmhook::return_value&, std::int32_t)>::value);
-    // A NOEXCEPT free-function pointer has a distinct type with no matching
-    // specialisation (there is no R(*)(args...) noexcept spec) -> absent.
-    // This is the detectable face of library flaw #4 (noexcept gap).
-    check("has_args_tuple_absent_for_noexcept_free_function_pointer",
-          !has_args_tuple<void(*)(vmhook::return_value&, std::int32_t) noexcept>::value);
+    // A NOEXCEPT free-function pointer is now a SUPPORTED shape: function_traits
+    // has a dedicated R(*)(args...) noexcept specialisation (noexcept is part of
+    // the function type since C++17), so its args_tuple_t is present and matches
+    // the throwing twin.  (Previously the detectable face of the noexcept gap;
+    // now closed for plain/const noexcept — ref-qualified/volatile remain gaps.)
+    check("has_args_tuple_present_for_noexcept_free_function_pointer",
+          has_args_tuple<void(*)(vmhook::return_value&, std::int32_t) noexcept>::value);
     // Overloaded / templated / generic operator() leave &F::operator()
     // ambiguous or ill-formed, so the functor spec (7498) is dropped and F
     // falls through to the undefined primary -> args_tuple_t absent.  This is
