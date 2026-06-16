@@ -51,6 +51,7 @@ compressed-oop decode, and hook install across all ~130 call sites.
 - [[features/instanceklass_methods_walk|instanceklass_methods_walk]]
 - [[features/klass_introspection|klass_introspection]]
 - [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]]
+- [[features/method_enumeration|method_enumeration]]
 - [[features/method_flags_width|method_flags_width]]
 
 ## Implementation anchors

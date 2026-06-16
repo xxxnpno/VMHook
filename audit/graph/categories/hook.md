@@ -21,8 +21,8 @@ tags: [category/hook]
 - [[features/hook_signature|hook_signature]] — `seeded` / `medium` — Hook Signature
 - [[features/hook_unhook_double_free|hook_unhook_double_free]] — `in_progress` / `high` — Hook Unhook / Double-Free Guards
 - [[features/hook_verify_repair|hook_verify_repair]] — `seeded` / `medium` — Hook Verify Repair
-- [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]] — `seeded` / `medium` — Method Entry Points I2I I2C
-- [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]] — `seeded` / `medium` — Midi2I Trampoline Alloc
+- [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]] — `in_progress` / `critical` — Method Entry Points I2I / I2C
+- [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]] — `in_progress` / `critical` — Midi2I Trampoline Alloc
 - [[features/seh_invoke_detour|seh_invoke_detour]] — `seeded` / `medium` — Seh Invoke Detour
 
 ## Dependency graph
@@ -102,5 +102,6 @@ flowchart LR
   midi2i_trampoline_alloc --> os_protect
   midi2i_trampoline_alloc --> os_query_region
   midi2i_trampoline_alloc --> os_page_size_granularity
+  midi2i_trampoline_alloc --> hook_common_detour_dispatch
   seh_invoke_detour --> os_signal_handler
 ```

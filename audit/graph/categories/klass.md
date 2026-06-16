@@ -24,7 +24,7 @@ tags: [category/klass]
 - [[features/klass_introspection|klass_introspection]] — `in_progress` / `high` — Klass Introspection
 - [[features/nested_classes|nested_classes]] — `seeded` / `medium` — Nested Classes
 - [[features/poly_inherited_oop|poly_inherited_oop]] — `seeded` / `medium` — Poly Inherited Oop
-- [[features/register_class|register_class]] — `seeded` / `medium` — Register Class
+- [[features/register_class|register_class]] — `in_progress` / `high` — Register Class
 - [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]] — `in_progress` / `critical` — VMStructs Offset Resolution
 
 ## Dependency graph
@@ -73,7 +73,9 @@ flowchart LR
   nested_classes --> klass_introspection
   poly_inherited_oop --> klass_introspection
   poly_inherited_oop --> field_inherited
-  register_class --> wrapper_pattern
   register_class --> find_class_fallback
+  register_class --> klass_introspection
+  register_class --> decode_oop_and_pointers
+  register_class --> wrapper_pattern
   vmstructs_offset_resolution --> os_safe_read
 ```

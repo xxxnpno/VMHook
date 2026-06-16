@@ -21,6 +21,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/collection_list|collection_list]]
 - [[features/field_arrays_object|field_arrays_object]]
 - [[features/field_arrays_primitive|field_arrays_primitive]]
+- [[features/read_java_string|read_java_string]]
 
 ## Tests
 

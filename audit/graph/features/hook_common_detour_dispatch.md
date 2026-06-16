@@ -32,6 +32,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/hook_basic|hook_basic]]
 - [[features/hook_chaining|hook_chaining]]
+- [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]]
 
 ## Notes
 

@@ -46,6 +46,7 @@ corrupts the entire downstream call graph silently.
 - [[features/interface_polymorphism|interface_polymorphism]]
 - [[features/nested_classes|nested_classes]]
 - [[features/poly_inherited_oop|poly_inherited_oop]]
+- [[features/register_class|register_class]]
 
 ## Implementation anchors
 

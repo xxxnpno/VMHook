@@ -4,13 +4,13 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 - **Features:** 109
 - **Categories:** 13
-- **`depends_on` edges:** 170
+- **`depends_on` edges:** 177
 
 ## Status
 
 - `queued`: 0
-- `seeded`: 98
-- `in_progress`: 11
+- `seeded`: 93
+- `in_progress`: 16
 - `audited`: 0
 - `perfected`: 0
 
@@ -32,8 +32,8 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/hook_signature|hook_signature]] — `seeded` / `medium` — Hook Signature
 - [[features/hook_unhook_double_free|hook_unhook_double_free]] — `in_progress` / `high` — Hook Unhook / Double-Free Guards
 - [[features/hook_verify_repair|hook_verify_repair]] — `seeded` / `medium` — Hook Verify Repair
-- [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]] — `seeded` / `medium` — Method Entry Points I2I I2C
-- [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]] — `seeded` / `medium` — Midi2I Trampoline Alloc
+- [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]] — `in_progress` / `critical` — Method Entry Points I2I / I2C
+- [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]] — `in_progress` / `critical` — Midi2I Trampoline Alloc
 - [[features/seh_invoke_detour|seh_invoke_detour]] — `seeded` / `medium` — Seh Invoke Detour
 
 ### [[categories/deopt|De-optimisation]] · 1 feature(s)
@@ -55,7 +55,7 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/klass_introspection|klass_introspection]] — `in_progress` / `high` — Klass Introspection
 - [[features/nested_classes|nested_classes]] — `seeded` / `medium` — Nested Classes
 - [[features/poly_inherited_oop|poly_inherited_oop]] — `seeded` / `medium` — Poly Inherited Oop
-- [[features/register_class|register_class]] — `seeded` / `medium` — Register Class
+- [[features/register_class|register_class]] — `in_progress` / `high` — Register Class
 - [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]] — `in_progress` / `critical` — VMStructs Offset Resolution
 
 ### [[categories/method|Method proxies (resolve / call / dispatch)]] · 19 feature(s)
@@ -67,7 +67,7 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/method_call_return_void|method_call_return_void]] — `seeded` / `medium` — Method Call Return Void
 - [[features/method_call_string|method_call_string]] — `seeded` / `medium` — Method Call String
 - [[features/method_call_wide_args|method_call_wide_args]] — `seeded` / `medium` — Method Call Wide Args
-- [[features/method_enumeration|method_enumeration]] — `seeded` / `medium` — Method Enumeration
+- [[features/method_enumeration|method_enumeration]] — `in_progress` / `medium` — Method Enumeration
 - [[features/method_explicit_signature|method_explicit_signature]] — `seeded` / `medium` — Method Explicit Signature
 - [[features/method_flags_width|method_flags_width]] — `seeded` / `medium` — Method Flags Width
 - [[features/method_is_reference|method_is_reference]] — `seeded` / `medium` — Method Is Reference
@@ -126,7 +126,7 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]] — `in_progress` / `high` — JNI Local Reference Hygiene
 - [[features/make_java_array|make_java_array]] — `seeded` / `medium` — Make Java Array
 - [[features/make_java_string|make_java_string]] — `seeded` / `medium` — Make Java String
-- [[features/read_java_string|read_java_string]] — `seeded` / `medium` — Read Java String
+- [[features/read_java_string|read_java_string]] — `in_progress` / `medium` — Read Java String
 
 ### [[categories/enumeration|Live-VM enumeration (heap / classes / threads)]] · 4 feature(s)
 

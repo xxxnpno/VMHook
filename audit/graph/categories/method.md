@@ -18,7 +18,7 @@ tags: [category/method]
 - [[features/method_call_return_void|method_call_return_void]] — `seeded` / `medium` — Method Call Return Void
 - [[features/method_call_string|method_call_string]] — `seeded` / `medium` — Method Call String
 - [[features/method_call_wide_args|method_call_wide_args]] — `seeded` / `medium` — Method Call Wide Args
-- [[features/method_enumeration|method_enumeration]] — `seeded` / `medium` — Method Enumeration
+- [[features/method_enumeration|method_enumeration]] — `in_progress` / `medium` — Method Enumeration
 - [[features/method_explicit_signature|method_explicit_signature]] — `seeded` / `medium` — Method Explicit Signature
 - [[features/method_flags_width|method_flags_width]] — `seeded` / `medium` — Method Flags Width
 - [[features/method_is_reference|method_is_reference]] — `seeded` / `medium` — Method Is Reference
@@ -63,6 +63,7 @@ flowchart LR
     make_java_string[/make_java_string/]
     on_exception[/on_exception/]
     read_java_string[/read_java_string/]
+    register_class[/register_class/]
     vmstructs_offset_resolution[/vmstructs_offset_resolution/]
     wrapper_pattern[/wrapper_pattern/]
   end
@@ -82,6 +83,8 @@ flowchart LR
   method_call_wide_args --> method_call_primitives
   method_call_wide_args --> jni_arg_packing
   method_enumeration --> instanceklass_methods_walk
+  method_enumeration --> vmstructs_offset_resolution
+  method_enumeration --> register_class
   method_explicit_signature --> signature_parsing
   method_explicit_signature --> method_enumeration
   method_flags_width --> vmstructs_offset_resolution

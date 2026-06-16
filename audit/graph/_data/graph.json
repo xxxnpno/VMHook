@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-06-16T11:05:36Z",
+  "generated_at": "2026-06-16T11:10:17Z",
   "feature_count": 109,
-  "edge_count": 437,
+  "edge_count": 458,
   "categories": [
     {
       "slug": "bootstrap",
@@ -2270,19 +2270,37 @@
     },
     {
       "slug": "method_entry_points_i2i_i2c",
-      "title": "Method Entry Points I2I I2C",
+      "title": "Method Entry Points I2I / I2C",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "critical",
       "specialist": ".claude/agents/method_entry_points_i2i_i2c-specialist.md",
       "depends_on": [
         "vmstructs_offset_resolution"
       ],
       "related": [
-        "adapter_recovery_c2i"
+        "adapter_recovery_c2i",
+        "midi2i_trampoline_alloc",
+        "hook_basic",
+        "hook_install_after_jit",
+        "dont_inline_dont_compile",
+        "deoptimize_methods"
       ],
-      "tags": [],
-      "test_modules": [],
+      "tags": [
+        "i2i",
+        "i2c",
+        "entry-point",
+        "method",
+        "interpreter",
+        "deopt",
+        "hotspot",
+        "jdk-version"
+      ],
+      "test_modules": [
+        "tests/jvm/modules/hook_install_after_jit.cpp",
+        "tests/jvm/modules/deoptimize_methods.cpp",
+        "tests/jvm/modules/dont_inline_dont_compile.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -2298,14 +2316,27 @@
       "slug": "method_enumeration",
       "title": "Method Enumeration",
       "category": "method",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/method_enumeration-specialist.md",
       "depends_on": [
-        "instanceklass_methods_walk"
+        "instanceklass_methods_walk",
+        "vmstructs_offset_resolution",
+        "register_class"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "find_methods_by_signature",
+        "find_class_fallback"
+      ],
+      "tags": [
+        "method",
+        "enumeration",
+        "klass",
+        "vmstruct",
+        "declared-only",
+        "instanceklass",
+        "hotspot"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_enumeration.cpp",
         "tests/test_method_enumeration.cpp"
@@ -2624,17 +2655,32 @@
       "slug": "midi2i_trampoline_alloc",
       "title": "Midi2I Trampoline Alloc",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "critical",
       "specialist": ".claude/agents/midi2i_trampoline_alloc-specialist.md",
       "depends_on": [
         "os_allocate_release",
         "os_protect",
         "os_query_region",
-        "os_page_size_granularity"
+        "os_page_size_granularity",
+        "hook_common_detour_dispatch"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "hook_basic",
+        "hook_chaining",
+        "hook_verify_repair",
+        "shutdown_hooks_teardown",
+        "method_entry_points_i2i_i2c"
+      ],
+      "tags": [
+        "trampoline",
+        "i2i",
+        "executable-page",
+        "allocation",
+        "stub",
+        "x86_64",
+        "hook"
+      ],
       "test_modules": [],
       "audit_docs": [],
       "java_versions": [
@@ -2945,14 +2991,27 @@
       "slug": "read_java_string",
       "title": "Read Java String",
       "category": "jni",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/read_java_string-specialist.md",
       "depends_on": [
-        "compressed_oops_decode"
+        "compressed_oops_decode",
+        "decode_oop_and_pointers",
+        "array_element_helpers"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "field_string",
+        "make_java_string"
+      ],
+      "tags": [
+        "jni",
+        "string",
+        "utf-16",
+        "latin1",
+        "coder",
+        "compact-strings",
+        "safe-read"
+      ],
       "test_modules": [
         "tests/jvm/modules/read_java_string.cpp"
       ],
@@ -2971,18 +3030,28 @@
       "slug": "register_class",
       "title": "Register Class",
       "category": "klass",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/register_class-specialist.md",
       "depends_on": [
-        "wrapper_pattern",
-        "find_class_fallback"
+        "find_class_fallback",
+        "klass_introspection",
+        "decode_oop_and_pointers",
+        "wrapper_pattern"
       ],
       "related": [
         "classloader_reanchor",
         "find_class_context_loader"
       ],
-      "tags": [],
+      "tags": [
+        "registry",
+        "type-map",
+        "klass",
+        "jni",
+        "factory",
+        "setup",
+        "type-index"
+      ],
       "test_modules": [
         "tests/jvm/modules/register_class.cpp"
       ],
@@ -5001,9 +5070,54 @@
       "kind": "related"
     },
     {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "midi2i_trampoline_alloc",
+      "kind": "related"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "hook_install_after_jit",
+      "kind": "related"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "dont_inline_dont_compile",
+      "kind": "related"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "deoptimize_methods",
+      "kind": "related"
+    },
+    {
       "from": "method_enumeration",
       "to": "instanceklass_methods_walk",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "register_class",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "find_methods_by_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "find_class_fallback",
+      "kind": "related"
     },
     {
       "from": "method_explicit_signature",
@@ -5236,6 +5350,36 @@
       "kind": "depends_on"
     },
     {
+      "from": "midi2i_trampoline_alloc",
+      "to": "hook_common_detour_dispatch",
+      "kind": "depends_on"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "hook_chaining",
+      "kind": "related"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "hook_verify_repair",
+      "kind": "related"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "shutdown_hooks_teardown",
+      "kind": "related"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "method_entry_points_i2i_i2c",
+      "kind": "related"
+    },
+    {
       "from": "nested_classes",
       "to": "klass_introspection",
       "kind": "depends_on"
@@ -5326,13 +5470,43 @@
       "kind": "depends_on"
     },
     {
-      "from": "register_class",
-      "to": "wrapper_pattern",
+      "from": "read_java_string",
+      "to": "decode_oop_and_pointers",
       "kind": "depends_on"
+    },
+    {
+      "from": "read_java_string",
+      "to": "array_element_helpers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "read_java_string",
+      "to": "field_string",
+      "kind": "related"
+    },
+    {
+      "from": "read_java_string",
+      "to": "make_java_string",
+      "kind": "related"
     },
     {
       "from": "register_class",
       "to": "find_class_fallback",
+      "kind": "depends_on"
+    },
+    {
+      "from": "register_class",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "register_class",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "register_class",
+      "to": "wrapper_pattern",
       "kind": "depends_on"
     },
     {

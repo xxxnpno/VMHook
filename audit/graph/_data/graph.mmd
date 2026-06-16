@@ -261,6 +261,8 @@ flowchart LR
   method_call_wide_args --> jni_arg_packing
   method_entry_points_i2i_i2c --> vmstructs_offset_resolution
   method_enumeration --> instanceklass_methods_walk
+  method_enumeration --> vmstructs_offset_resolution
+  method_enumeration --> register_class
   method_explicit_signature --> signature_parsing
   method_explicit_signature --> method_enumeration
   method_flags_width --> vmstructs_offset_resolution
@@ -278,6 +280,7 @@ flowchart LR
   midi2i_trampoline_alloc --> os_protect
   midi2i_trampoline_alloc --> os_query_region
   midi2i_trampoline_alloc --> os_page_size_granularity
+  midi2i_trampoline_alloc --> hook_common_detour_dispatch
   nested_classes --> klass_introspection
   on_class_loaded --> hook_basic
   on_exception --> hook_basic
@@ -286,8 +289,12 @@ flowchart LR
   poly_inherited_oop --> klass_introspection
   poly_inherited_oop --> field_inherited
   read_java_string --> compressed_oops_decode
-  register_class --> wrapper_pattern
+  read_java_string --> decode_oop_and_pointers
+  read_java_string --> array_element_helpers
   register_class --> find_class_fallback
+  register_class --> klass_introspection
+  register_class --> decode_oop_and_pointers
+  register_class --> wrapper_pattern
   return_caller --> interpreter_frame_walk
   return_frame_raw_access --> interpreter_frame_walk
   return_set_arg --> interpreter_frame_walk

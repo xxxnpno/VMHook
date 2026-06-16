@@ -31,6 +31,8 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/global_ref|global_ref]]
 - [[features/hook_basic|hook_basic]]
 - [[features/klass_introspection|klass_introspection]]
+- [[features/read_java_string|read_java_string]]
+- [[features/register_class|register_class]]
 
 ## Tests
 

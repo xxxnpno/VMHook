@@ -16,7 +16,7 @@ tags: [category/jni]
 - [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]] — `in_progress` / `high` — JNI Local Reference Hygiene
 - [[features/make_java_array|make_java_array]] — `seeded` / `medium` — Make Java Array
 - [[features/make_java_string|make_java_string]] — `seeded` / `medium` — Make Java String
-- [[features/read_java_string|read_java_string]] — `seeded` / `medium` — Read Java String
+- [[features/read_java_string|read_java_string]] — `in_progress` / `medium` — Read Java String
 
 ## Dependency graph
 
@@ -31,6 +31,7 @@ flowchart LR
     read_java_string([read_java_string])
   end
   subgraph external["(external deps)"]
+    array_element_helpers[/array_element_helpers/]
     compressed_oops_decode[/compressed_oops_decode/]
     decode_oop_and_pointers[/decode_oop_and_pointers/]
     signature_parsing[/signature_parsing/]
@@ -41,4 +42,6 @@ flowchart LR
   make_java_array --> jni_arg_packing
   make_java_string --> jni_local_ref_hygiene
   read_java_string --> compressed_oops_decode
+  read_java_string --> decode_oop_and_pointers
+  read_java_string --> array_element_helpers
 ```
