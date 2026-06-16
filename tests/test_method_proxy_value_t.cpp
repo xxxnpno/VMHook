@@ -53,6 +53,30 @@ struct W : vmhook::object_base
     using vmhook::object_base::object_base;
 };
 
+// Bit-exact comparison helpers.  `==` on floating point treats every NaN as
+// unequal and collapses -0.0 == +0.0, so for the bit-faithfulness assertions we
+// compare the raw object representation byte-for-byte via memcpy (the only
+// portable, type-punning-UB-free spelling).  This pins that a conversion that
+// is mathematically EXACT (every finite float -> double, an exactly-
+// representable double -> float, ±0, ±Inf — all guaranteed by IEEE-754 with no
+// implementation latitude) produces the EXACT same bits the equivalent direct
+// static_cast would, on both MinGW (libstdc++) and MSVC (STL).  NaN payloads are
+// NOT portable, so NaN is asserted via std::isnan elsewhere — never by bits.
+static auto bits_equal_f(const float a, const float b) noexcept -> bool
+{
+    std::uint32_t ba{}, bb{};
+    std::memcpy(&ba, &a, sizeof(ba));
+    std::memcpy(&bb, &b, sizeof(bb));
+    return ba == bb;
+}
+static auto bits_equal_d(const double a, const double b) noexcept -> bool
+{
+    std::uint64_t ba{}, bb{};
+    std::memcpy(&ba, &a, sizeof(ba));
+    std::memcpy(&bb, &b, sizeof(bb));
+    return ba == bb;
+}
+
 int main()
 {
     // -------------------------------------------------------------------------
@@ -1259,6 +1283,265 @@ int main()
     static_assert(std::is_swappable_v<value_t>,             "value_t swappable");
     static_assert(std::is_default_constructible_v<value_t>, "value_t default-constructible");
     check("value_t_value_semantics_compile_time_present", true);
+
+    // =========================================================================
+    // EXPANSION 3 (no-JVM, platform-invariant): BIT-EXACT float<->double through
+    // the conversion operator, and ALTERNATING-BIT integer patterns across the
+    // full cast matrix.  The earlier float blocks assert FP *properties*
+    // (isnan / isinf / signbit) and value `==`; this block additionally pins the
+    // raw OBJECT REPRESENTATION (every bit) for the conversions IEEE-754
+    // guarantees are exact, so a regression that perturbed the value would flip a
+    // bit even where `==` (which collapses -0.0 == +0.0 and rejects NaN) would
+    // not notice.  Only EXACT conversions are bit-checked: float->double is exact
+    // for every finite/zero/inf source, and double->float is exact for any value
+    // that is itself representable as a float — both with NO implementation
+    // latitude, so MinGW and MSVC must agree to the bit.  (A finite double that
+    // overflows float is UB and is NOT exercised here; the inf/nan widen/narrow
+    // properties are already covered above.)
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // float -> double widening is EXACT for every float (the value set spans the
+    // representable extremes).  We assert the result's bits equal the bits of a
+    // direct static_cast<double>(src) — the operator must not perturb a single
+    // bit.  These also implicitly pin that the operator routes float through the
+    // generic static_cast arm (no rounding, no double-rounding).
+    // -------------------------------------------------------------------------
+    {
+        const float srcs[]{
+            0.0f, -0.0f,
+            1.0f, -1.0f,
+            0.5f, -0.25f,
+            std::numeric_limits<float>::min(),               // smallest normal
+            -std::numeric_limits<float>::min(),
+            std::numeric_limits<float>::max(),               // largest finite
+            -std::numeric_limits<float>::max(),
+            std::numeric_limits<float>::denorm_min(),         // smallest subnormal
+            -std::numeric_limits<float>::denorm_min(),
+            std::numeric_limits<float>::lowest(),
+            std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity(),
+            16777216.0f,                                      // 2^24
+            1.0f / 3.0f,                                      // a non-terminating binary fraction
+        };
+        bool all_exact{ true };
+        for (const float s : srcs)
+        {
+            const double got{ static_cast<double>(value_t{ s }) };
+            const double want{ static_cast<double>(s) };
+            if (!bits_equal_d(got, want)) { all_exact = false; }
+        }
+        check("float_to_double_is_bit_exact_for_all_finite_and_inf_and_subnormal", all_exact);
+    }
+    // The float subnormal widens to a double whose VALUE equals the same magnitude
+    // (subnormal-float -> normal-double, exact) and is NOT flushed to zero.
+    check("float_subnormal_widens_nonzero_exact",
+          static_cast<double>(value_t{ std::numeric_limits<float>::denorm_min() })
+              == static_cast<double>(std::numeric_limits<float>::denorm_min())
+          && static_cast<double>(value_t{ std::numeric_limits<float>::denorm_min() }) != 0.0);
+    // Smallest float subnormal round-trips float->float (identity cast) bit-exact.
+    check("float_subnormal_self_round_trip_bit_exact",
+          bits_equal_f(static_cast<float>(value_t{ std::numeric_limits<float>::denorm_min() }),
+                       std::numeric_limits<float>::denorm_min()));
+    check("float_neg_subnormal_self_round_trip_bit_exact",
+          bits_equal_f(static_cast<float>(value_t{ -std::numeric_limits<float>::denorm_min() }),
+                       -std::numeric_limits<float>::denorm_min()));
+
+    // -------------------------------------------------------------------------
+    // double -> float narrowing is EXACT for any value that is itself a float
+    // (the cast round-trips the float magnitude through a double and back).  We
+    // build each double from a known float so the narrowing cannot round, and
+    // assert the recovered float's bits equal the original float's bits.
+    // -------------------------------------------------------------------------
+    {
+        const float floats[]{
+            0.0f, -0.0f, 1.0f, -1.0f, 0.5f, -0.25f, 1024.0f,
+            std::numeric_limits<float>::min(),
+            std::numeric_limits<float>::max(),
+            -std::numeric_limits<float>::max(),
+            std::numeric_limits<float>::denorm_min(),         // subnormal survives the round trip
+            std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity(),
+        };
+        bool all_exact{ true };
+        for (const float f : floats)
+        {
+            const double widened{ static_cast<double>(f) };   // exact (float->double)
+            const float got{ static_cast<float>(value_t{ widened }) };
+            if (!bits_equal_f(got, f)) { all_exact = false; }
+        }
+        check("double_to_float_is_bit_exact_for_float_representable_values", all_exact);
+    }
+    // A double subnormal-of-float (FLT_MIN/2 is exactly representable as a float
+    // subnormal) narrows to the matching float subnormal, NOT to zero.
+    {
+        const double half_min{ static_cast<double>(std::numeric_limits<float>::min()) / 2.0 };
+        const float narrowed{ static_cast<float>(value_t{ half_min }) };
+        check("double_to_float_subnormal_not_flushed_to_zero",
+              narrowed != 0.0f
+                  && bits_equal_f(narrowed, static_cast<float>(half_min)));
+    }
+
+    // -------------------------------------------------------------------------
+    // NaN survives the float<->double conversion as a NaN (payload/bits are NOT
+    // portable, so we assert ONLY std::isnan — never the bits — and that a
+    // float NaN widened to double then narrowed back to float is still NaN).
+    // -------------------------------------------------------------------------
+    {
+        const double d_nan{ static_cast<double>(value_t{ std::numeric_limits<float>::quiet_NaN() }) };
+        const float back{ static_cast<float>(value_t{ d_nan }) };
+        check("float_nan_widen_then_narrow_is_still_nan",
+              std::isnan(d_nan) && std::isnan(back));
+        // signaling-NaN source: still observably a NaN after widening (no claim
+        // about signaling-ness, which the cast may quiet — only NaN-ness).
+        const double d_snan{ static_cast<double>(value_t{ std::numeric_limits<float>::signaling_NaN() }) };
+        check("float_signaling_nan_widens_to_some_nan", std::isnan(d_snan));
+    }
+
+    // -------------------------------------------------------------------------
+    // float -> float / double -> double IDENTITY cast is bit-exact for the
+    // extremes (sign-bit and subnormal preservation, already value-checked above,
+    // now pinned to the bit so a future operator change cannot silently canon-
+    // icalise -0.0 to +0.0 or flush a subnormal).
+    // -------------------------------------------------------------------------
+    check("float_negative_zero_identity_bit_exact",
+          bits_equal_f(static_cast<float>(value_t{ -0.0f }), -0.0f));
+    check("float_positive_zero_identity_bit_exact",
+          bits_equal_f(static_cast<float>(value_t{ 0.0f }), 0.0f));
+    check("double_negative_zero_identity_bit_exact",
+          bits_equal_d(static_cast<double>(value_t{ -0.0 }), -0.0));
+    check("float_max_identity_bit_exact",
+          bits_equal_f(static_cast<float>(value_t{ std::numeric_limits<float>::max() }),
+                       std::numeric_limits<float>::max()));
+    check("double_max_identity_bit_exact",
+          bits_equal_d(static_cast<double>(value_t{ std::numeric_limits<double>::max() }),
+                       std::numeric_limits<double>::max()));
+    check("double_denorm_min_identity_bit_exact",
+          bits_equal_d(static_cast<double>(value_t{ std::numeric_limits<double>::denorm_min() }),
+                       std::numeric_limits<double>::denorm_min()));
+    // -0.0f widened to double is bit-identical to a directly-cast -0.0 double
+    // (the sign bit must survive the WIDENING, not just the identity cast).
+    check("float_negative_zero_widens_to_double_negative_zero_bit_exact",
+          bits_equal_d(static_cast<double>(value_t{ -0.0f }), static_cast<double>(-0.0f)));
+
+    // -------------------------------------------------------------------------
+    // ALTERNATING-BIT integer patterns (0x55.. / 0xAA.. / 0xA5.. and the all-
+    // ones / single-walking-bit edges) through every integer alternative's cast
+    // matrix.  These catch a byte-swap / sign / mask regression that uniform
+    // small values (0, 1, -1) would slip past: 0x55 and 0xAA differ in every
+    // adjacent bit and in sign, so a truncation that kept the wrong half, or a
+    // sign/zero-extension flip, changes the result.  Every expected value is the
+    // deterministic two's-complement static_cast result, identical on all
+    // platforms (two's complement is mandated since C++20).
+    // -------------------------------------------------------------------------
+    // int32 alternating-bit source -> narrow / widen / reinterpret.
+    check("int32_0x55555555_to_uint32_reinterprets",
+          static_cast<std::uint32_t>(value_t{ std::int32_t{ 0x5555'5555 } }) == 0x5555'5555u);
+    check("int32_0xAAAAAAAA_to_uint32_reinterprets",
+          static_cast<std::uint32_t>(value_t{ static_cast<std::int32_t>(0xAAAA'AAAAu) }) == 0xAAAA'AAAAu);
+    check("int32_0x55555555_to_int16_keeps_low_half",
+          static_cast<std::int16_t>(value_t{ std::int32_t{ 0x5555'5555 } }) == std::int16_t{ 0x5555 });
+    check("int32_0xAAAAAAAA_to_uint16_keeps_low_half",
+          static_cast<std::uint16_t>(value_t{ static_cast<std::int32_t>(0xAAAA'AAAAu) }) == std::uint16_t{ 0xAAAA });
+    check("int32_0x55555555_to_int8_keeps_low_byte",
+          static_cast<std::int8_t>(value_t{ std::int32_t{ 0x5555'5555 } }) == std::int8_t{ 0x55 });
+    check("int32_0xAAAAAAAA_to_int8_low_byte_is_negative",
+          static_cast<std::int8_t>(value_t{ static_cast<std::int32_t>(0xAAAA'AAAAu) }) == static_cast<std::int8_t>(0xAA));
+    check("int32_0x55555555_widens_to_int64_no_high_bits",
+          static_cast<std::int64_t>(value_t{ std::int32_t{ 0x5555'5555 } }) == 0x0000'0000'5555'5555LL);
+    check("int32_0xAAAAAAAA_widens_to_int64_sign_extends",
+          static_cast<std::int64_t>(value_t{ static_cast<std::int32_t>(0xAAAA'AAAAu) })
+              == static_cast<std::int64_t>(0xFFFF'FFFF'AAAA'AAAAull));
+
+    // int64 alternating-bit source -> truncate / reinterpret.
+    check("int64_0x5555..._to_uint32_keeps_low_32",
+          static_cast<std::uint32_t>(value_t{ std::int64_t{ 0x5555'5555'5555'5555LL } }) == 0x5555'5555u);
+    check("int64_0xAAAA..._to_uint32_keeps_low_32",
+          static_cast<std::uint32_t>(value_t{ static_cast<std::int64_t>(0xAAAA'AAAA'AAAA'AAAAull) }) == 0xAAAA'AAAAu);
+    check("int64_0xA5A5..._to_int16_keeps_low_16",
+          static_cast<std::int16_t>(value_t{ static_cast<std::int64_t>(0xA5A5'A5A5'A5A5'A5A5ull) }) == static_cast<std::int16_t>(0xA5A5));
+    check("int64_0x5A5A..._to_int8_keeps_low_byte",
+          static_cast<std::int8_t>(value_t{ static_cast<std::int64_t>(0x5A5A'5A5A'5A5A'5A5Aull) }) == std::int8_t{ 0x5A });
+    check("int64_0x5555..._to_int32_keeps_low_32_positive",
+          static_cast<std::int32_t>(value_t{ std::int64_t{ 0x1234'5678'5555'5555LL } }) == 0x5555'5555);
+    check("int64_0xAAAA..._low_32_to_int32_is_negative",
+          static_cast<std::int32_t>(value_t{ static_cast<std::int64_t>(0x0000'0000'AAAA'AAAAull) })
+              == static_cast<std::int32_t>(0xAAAA'AAAAu));
+
+    // int16 / int8 alternating-bit source -> widen with sign, narrow.
+    check("int16_0x5555_to_int32_zero_high",
+          static_cast<std::int32_t>(value_t{ std::int16_t{ 0x5555 } }) == 0x5555);
+    check("int16_0xAAAA_to_int32_sign_extends",
+          static_cast<std::int32_t>(value_t{ static_cast<std::int16_t>(0xAAAA) })
+              == static_cast<std::int32_t>(0xFFFF'AAAAu));
+    check("int8_0x55_to_int32_zero_high",
+          static_cast<std::int32_t>(value_t{ std::int8_t{ 0x55 } }) == 0x55);
+    check("int8_0xAA_to_int32_sign_extends",
+          static_cast<std::int32_t>(value_t{ static_cast<std::int8_t>(0xAA) })
+              == static_cast<std::int32_t>(0xFFFF'FFAAu));
+
+    // uint16 (char) alternating-bit source -> zero-extend / reinterpret.
+    check("uint16_0x5555_to_int32_zero_extends",
+          static_cast<std::int32_t>(value_t{ std::uint16_t{ 0x5555 } }) == 0x5555);
+    check("uint16_0xAAAA_to_int32_zero_extends_positive",
+          static_cast<std::int32_t>(value_t{ std::uint16_t{ 0xAAAA } }) == 0xAAAA);
+    check("uint16_0xAAAA_to_int16_reinterprets_negative",
+          static_cast<std::int16_t>(value_t{ std::uint16_t{ 0xAAAA } }) == static_cast<std::int16_t>(0xAAAA));
+    check("uint16_0xA5A5_to_uint32_zero_extends",
+          static_cast<std::uint32_t>(value_t{ std::uint16_t{ 0xA5A5 } }) == 0xA5A5u);
+
+    // -------------------------------------------------------------------------
+    // ALTERNATING-BIT uint32 (compressed-OOP) alternative -> void* still routes
+    // through decode_oop_pointer EXACTLY (never a truncating cast), and -> integer
+    // targets is the plain two's-complement static_cast.  With no VMStructs the
+    // decode is nullptr for every input, but we compare against the helper so the
+    // contract holds even if a JVM is ever linked into the harness.
+    // -------------------------------------------------------------------------
+    check("uint32_0x55555555_to_voidptr_matches_decode",
+          static_cast<void*>(value_t{ std::uint32_t{ 0x5555'5555 } })
+              == vmhook::hotspot::decode_oop_pointer(0x5555'5555u));
+    check("uint32_0xAAAAAAAA_to_voidptr_matches_decode",
+          static_cast<void*>(value_t{ std::uint32_t{ 0xAAAA'AAAA } })
+              == vmhook::hotspot::decode_oop_pointer(0xAAAA'AAAAu));
+    check("uint32_0xA5A5A5A5_to_voidptr_matches_decode",
+          static_cast<void*>(value_t{ std::uint32_t{ 0xA5A5'A5A5 } })
+              == vmhook::hotspot::decode_oop_pointer(0xA5A5'A5A5u));
+    check("uint32_0x55555555_to_int32_reinterprets_positive",
+          static_cast<std::int32_t>(value_t{ std::uint32_t{ 0x5555'5555 } }) == 0x5555'5555);
+    check("uint32_0xAAAAAAAA_to_int32_reinterprets_negative",
+          static_cast<std::int32_t>(value_t{ std::uint32_t{ 0xAAAA'AAAA } })
+              == static_cast<std::int32_t>(0xAAAA'AAAAu));
+    check("uint32_0xAAAAAAAA_to_int64_zero_extends",
+          static_cast<std::int64_t>(value_t{ std::uint32_t{ 0xAAAA'AAAA } }) == 0x0000'0000'AAAA'AAAALL);
+    // The alternating-bit uint32 self round-trip is bit-preserving.
+    check("uint32_0x55555555_self_round_trip",
+          static_cast<std::uint32_t>(value_t{ std::uint32_t{ 0x5555'5555 } }) == 0x5555'5555u);
+    check("uint32_0xAAAAAAAA_self_round_trip",
+          static_cast<std::uint32_t>(value_t{ std::uint32_t{ 0xAAAA'AAAA } }) == 0xAAAA'AAAAu);
+    // get_compressed_oop reads the raw 4 bytes of an alternating-bit "header"
+    // unchanged (no decode) — pins the memcpy read is byte-faithful for a pattern
+    // that a sign/endianness bug would corrupt.
+    {
+        std::uint32_t alt_header{ 0xA5A5'5A5Au };
+        vmhook::method_proxy proxy{ &alt_header, nullptr, std::string{ "()Ljava/lang/Object;" } };
+        check("get_compressed_oop_reads_alternating_bits_unchanged",
+              proxy.get_compressed_oop() == 0xA5A5'5A5Au);
+    }
+
+    // -------------------------------------------------------------------------
+    // Single walking-bit edges per integer alternative -> self round-trip, the
+    // simplest pattern that distinguishes an off-by-one bit-position bug from a
+    // correct identity cast.
+    // -------------------------------------------------------------------------
+    check("int32_high_bit_only_self_round_trip",
+          static_cast<std::int32_t>(value_t{ std::int32_t{ -2147483647 - 1 } }) == (-2147483647 - 1)); // 0x80000000
+    check("uint32_high_bit_only_self_round_trip",
+          static_cast<std::uint32_t>(value_t{ std::uint32_t{ 0x8000'0000 } }) == 0x8000'0000u);
+    check("int64_high_bit_only_self_round_trip",
+          static_cast<std::int64_t>(value_t{ std::int64_t{ -9223372036854775807LL - 1 } })
+              == (-9223372036854775807LL - 1)); // 0x8000000000000000
+    check("uint16_high_bit_only_self_round_trip",
+          static_cast<std::uint16_t>(value_t{ std::uint16_t{ 0x8000 } }) == 0x8000u);
 
     return failures == 0 ? 0 : 1;
 }
