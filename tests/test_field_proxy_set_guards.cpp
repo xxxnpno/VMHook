@@ -56,6 +56,7 @@
 
 #include <vmhook/vmhook.hpp>
 #include <cstdio>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <array>
@@ -162,6 +163,68 @@ namespace
         vmhook::field_proxy proxy{ c.field_ptr(), sig, false };
         proxy.set(value);
         return c.slot_intact() && c.sentinels_intact();
+    }
+
+    // Read the field slot back as a raw 32-bit pattern (host-native both ways).
+    auto slot_bits32(const canvas& c) -> std::uint32_t
+    {
+        std::uint32_t bits{};
+        std::memcpy(&bits, c.bytes.data() + k_lead, sizeof(bits));
+        return bits;
+    }
+
+    // Read the field slot back as a raw 64-bit pattern (host-native both ways).
+    auto slot_bits64(const canvas& c) -> std::uint64_t
+    {
+        std::uint64_t bits{};
+        std::memcpy(&bits, c.bytes.data() + k_lead, sizeof(bits));
+        return bits;
+    }
+
+    // Manufacture a float with EXACT bits (NaN / +-inf / +-0 / subnormal) and set
+    // it into "F", reporting whether those EXACT 32 bits landed AND no sentinel
+    // moved.  The float is materialised as a LOCAL and bound to set() by const-ref
+    // (set's signature is `const value_type&`), and the only operation on it is a
+    // memcpy of its address — it never transits a by-value return or an arithmetic
+    // FPU register, so a signalling NaN is NOT canonicalised to a quiet NaN even on
+    // a 32-bit x87 ABI.  The comparison is on the raw BIT PATTERN, never `==`
+    // (which is false for NaN).  IEEE-754 binary32 is mandated on every CI target.
+    auto float_bits_land(std::uint32_t bits) -> bool
+    {
+        float value{};
+        std::memcpy(&value, &bits, sizeof(value));
+        canvas c;
+        vmhook::field_proxy proxy{ c.field_ptr(), "F", false };
+        proxy.set(value);
+        return slot_bits32(c) == bits && c.sentinels_intact();
+    }
+
+    // Same as float_bits_land for double / "D" (IEEE-754 binary64).
+    auto double_bits_land(std::uint64_t bits) -> bool
+    {
+        double value{};
+        std::memcpy(&value, &bits, sizeof(value));
+        canvas c;
+        vmhook::field_proxy proxy{ c.field_ptr(), "D", false };
+        proxy.set(value);
+        return slot_bits64(c) == bits && c.sentinels_intact();
+    }
+
+    // Set a float manufactured from `bits` into an arbitrary signature and report
+    // whether the write was REJECTED (slot + sentinels intact).  Same NaN-safe
+    // local-materialise discipline as float_bits_land.
+    auto float_bits_rejected_into(const char* sig, std::uint32_t bits) -> bool
+    {
+        float value{};
+        std::memcpy(&value, &bits, sizeof(value));
+        return rejected_into(sig, value);
+    }
+
+    auto double_bits_rejected_into(const char* sig, std::uint64_t bits) -> bool
+    {
+        double value{};
+        std::memcpy(&value, &bits, sizeof(value));
+        return rejected_into(sig, value);
     }
 }
 
@@ -1231,6 +1294,499 @@ int main()
         check("read_guard_skips_reference",      !read_guard_refuses("Ljava/lang/Object;", 8));
         check("read_guard_skips_empty",          !read_guard_refuses("", 8));
         check("read_guard_skips_lone_bracket",   !read_guard_refuses("[", 8));
+    }
+
+    // ======================================================================
+    // SECTION 19 — jvm_primitive_byte_width: TOTAL single-character sweep.
+    // SECTION 1 already covers the eight primitives and a generous selection of
+    // non-primitive single chars; here we close the loop with EVERY remaining
+    // single ASCII byte the descriptor space can hold, so the switch `default`
+    // is pinned for the COMPLETE single-char alphabet (a..z, A..Z, 0..9, plus a
+    // spread of punctuation and the two boundary control bytes).  Each must be 0
+    // except the eight primitives, which are re-confirmed inside the loop.
+    // ----------------------------------------------------------------------
+    {
+        auto width_of_char{ [](char ch) -> std::size_t
+        {
+            const char s[2]{ ch, '\0' };
+            return jvm_primitive_byte_width(std::string_view{ s, 1 });
+        } };
+        auto expected_width{ [](char ch) -> std::size_t
+        {
+            switch (ch)
+            {
+            case 'Z': case 'B': return 1;
+            case 'S': case 'C': return 2;
+            case 'I': case 'F': return 4;
+            case 'J': case 'D': return 8;
+            default:            return 0;
+            }
+        } };
+
+        bool upper_ok{ true };
+        for (char ch{ 'A' }; ch <= 'Z'; ++ch)
+        {
+            if (width_of_char(ch) != expected_width(ch)) { upper_ok = false; break; }
+        }
+        check("width_sweep_all_uppercase_AZ", upper_ok);
+
+        bool lower_ok{ true };
+        for (char ch{ 'a' }; ch <= 'z'; ++ch)
+        {
+            // No lowercase letter is a JVM primitive descriptor -> all 0.
+            if (width_of_char(ch) != 0) { lower_ok = false; break; }
+        }
+        check("width_sweep_all_lowercase_az", lower_ok);
+
+        bool digit_ok{ true };
+        for (char ch{ '0' }; ch <= '9'; ++ch)
+        {
+            if (width_of_char(ch) != 0) { digit_ok = false; break; }
+        }
+        check("width_sweep_all_digits_09", digit_ok);
+
+        // A spread of single punctuation / structural descriptor bytes -> all 0
+        // (none is a primitive; the array '[' and object 'L' meaning needs >1 char).
+        bool punct_ok{ true };
+        for (const char ch : { '[', ']', '(', ')', ';', '/', '.', '<', '>', '$',
+                               '-', '+', '*', ' ', '\t', '\n', '_', '@', '#', '!' })
+        {
+            if (width_of_char(ch) != 0) { punct_ok = false; break; }
+        }
+        check("width_sweep_punctuation_all_zero", punct_ok);
+
+        // The two control-byte boundaries: a single NUL byte and 0x7F.  Both are
+        // size-1 strings, so they exercise the switch `default`, returning 0.
+        check("width_single_nul_byte_is_0", jvm_primitive_byte_width(std::string_view{ "\0", 1 }) == 0);
+        check("width_single_0x7F_is_0", width_of_char(static_cast<char>(0x7F)) == 0);
+
+        // Embedded-NUL multi-byte signatures: size != 1 so always 0, even when the
+        // first byte IS a primitive letter (the oracle never looks past size()).
+        check("width_I_then_nul_is_0", jvm_primitive_byte_width(std::string_view{ "I\0", 2 }) == 0);
+        check("width_nul_then_I_is_0", jvm_primitive_byte_width(std::string_view{ "\0I", 2 }) == 0);
+        check("width_two_nuls_is_0", jvm_primitive_byte_width(std::string_view{ "\0\0", 2 }) == 0);
+    }
+
+    // ======================================================================
+    // SECTION 20 — VALUE-EDGE sweep for ACCEPTED writes (right-sized).  For each
+    // primitive width, drive the boundary bit patterns the prompt calls out —
+    // 0x00.., all-ones, the sign bit, type min/max, and the alternating-bit
+    // patterns 0x55.. / 0xAA.. — through the matching-width field and prove the
+    // EXACT bytes land (slot_holds: value round-trips, nothing past it moves).
+    // The carriers are fixed-width unsigned integers so the bit pattern is exact
+    // and the only thing under test is "the accepted-write memcpy is faithful".
+    // ----------------------------------------------------------------------
+
+    // --- width 1 ("B"): every interesting 8-bit pattern lands verbatim ---
+    check("edge_B_zero",     accepted_into("B", std::uint8_t{ 0x00 }));
+    check("edge_B_allones",  accepted_into("B", std::uint8_t{ 0xFF }));
+    check("edge_B_signbit",  accepted_into("B", std::uint8_t{ 0x80 }));
+    check("edge_B_max_s8",   accepted_into("B", std::uint8_t{ 0x7F }));
+    check("edge_B_alt_55",   accepted_into("B", std::uint8_t{ 0x55 }));
+    check("edge_B_alt_AA",   accepted_into("B", std::uint8_t{ 0xAA }));
+    check("edge_B_one",      accepted_into("B", std::uint8_t{ 0x01 }));
+
+    // --- width 2 ("S"): 16-bit boundary patterns land verbatim ---
+    check("edge_S_zero",     accepted_into("S", std::uint16_t{ 0x0000 }));
+    check("edge_S_allones",  accepted_into("S", std::uint16_t{ 0xFFFF }));
+    check("edge_S_signbit",  accepted_into("S", std::uint16_t{ 0x8000 }));
+    check("edge_S_max_s16",  accepted_into("S", std::uint16_t{ 0x7FFF }));
+    check("edge_S_alt_5555", accepted_into("S", std::uint16_t{ 0x5555 }));
+    check("edge_S_alt_AAAA", accepted_into("S", std::uint16_t{ 0xAAAA }));
+    check("edge_S_low_byte", accepted_into("S", std::uint16_t{ 0x00FF }));
+    check("edge_S_high_byte",accepted_into("S", std::uint16_t{ 0xFF00 }));
+
+    // --- width 4 ("I"): 32-bit boundary patterns land verbatim ---
+    check("edge_I_zero",     accepted_into("I", std::uint32_t{ 0x00000000u }));
+    check("edge_I_allones",  accepted_into("I", std::uint32_t{ 0xFFFFFFFFu }));
+    check("edge_I_signbit",  accepted_into("I", std::uint32_t{ 0x80000000u }));
+    check("edge_I_max_s32",  accepted_into("I", std::uint32_t{ 0x7FFFFFFFu }));
+    check("edge_I_alt_5",    accepted_into("I", std::uint32_t{ 0x55555555u }));
+    check("edge_I_alt_A",    accepted_into("I", std::uint32_t{ 0xAAAAAAAAu }));
+    check("edge_I_one",      accepted_into("I", std::uint32_t{ 0x00000001u }));
+
+    // --- width 8 ("J"): 64-bit boundary patterns land verbatim ---
+    check("edge_J_zero",     accepted_into("J", std::uint64_t{ 0x0000000000000000ull }));
+    check("edge_J_allones",  accepted_into("J", std::uint64_t{ 0xFFFFFFFFFFFFFFFFull }));
+    check("edge_J_signbit",  accepted_into("J", std::uint64_t{ 0x8000000000000000ull }));
+    check("edge_J_max_s64",  accepted_into("J", std::uint64_t{ 0x7FFFFFFFFFFFFFFFull }));
+    check("edge_J_alt_5",    accepted_into("J", std::uint64_t{ 0x5555555555555555ull }));
+    check("edge_J_alt_A",    accepted_into("J", std::uint64_t{ 0xAAAAAAAAAAAAAAAAull }));
+    check("edge_J_one",      accepted_into("J", std::uint64_t{ 0x0000000000000001ull }));
+
+    // Signed-carrier min/max edges via the natural C++ type, to prove the value
+    // round-trips regardless of signedness (the guard is width-only).
+    check("edge_B_int8_min",  accepted_into("B", std::int8_t{ -128 }));
+    check("edge_B_int8_max",  accepted_into("B", std::int8_t{ 127 }));
+    check("edge_S_int16_min", accepted_into("S", std::int16_t{ -32768 }));
+    check("edge_S_int16_max", accepted_into("S", std::int16_t{ 32767 }));
+    check("edge_I_int32_min", accepted_into("I", std::int32_t{ -2147483647 - 1 }));
+    check("edge_I_int32_max", accepted_into("I", std::int32_t{ 2147483647 }));
+    check("edge_J_int64_min", accepted_into("J", std::int64_t{ -9223372036854775807ll - 1 }));
+    check("edge_J_int64_max", accepted_into("J", std::int64_t{ 9223372036854775807ll }));
+
+    // ======================================================================
+    // SECTION 21 — the SAME value edges, but into a MISMATCHED-width field, must
+    // every one be REJECTED (slot + sentinels intact).  This proves the size
+    // guard's verdict is independent of the value's bit pattern: a maximally
+    // "dangerous" all-ones / sign-bit value is refused exactly like a benign one
+    // whenever the width disagrees.  Covers both too-wide and too-narrow.
+    // ----------------------------------------------------------------------
+    // all-ones value of each width into every NON-matching field width:
+    check("edge_rej_u8_allones_into_S",  rejected_into("S", std::uint8_t{ 0xFF }));   // 1->2
+    check("edge_rej_u8_allones_into_I",  rejected_into("I", std::uint8_t{ 0xFF }));   // 1->4
+    check("edge_rej_u8_allones_into_J",  rejected_into("J", std::uint8_t{ 0xFF }));   // 1->8
+    check("edge_rej_u16_allones_into_B", rejected_into("B", std::uint16_t{ 0xFFFF })); // 2->1
+    check("edge_rej_u16_allones_into_I", rejected_into("I", std::uint16_t{ 0xFFFF })); // 2->4
+    check("edge_rej_u16_allones_into_J", rejected_into("J", std::uint16_t{ 0xFFFF })); // 2->8
+    check("edge_rej_u32_allones_into_B", rejected_into("B", std::uint32_t{ 0xFFFFFFFFu })); // 4->1
+    check("edge_rej_u32_allones_into_S", rejected_into("S", std::uint32_t{ 0xFFFFFFFFu })); // 4->2
+    check("edge_rej_u32_allones_into_J", rejected_into("J", std::uint32_t{ 0xFFFFFFFFu })); // 4->8
+    check("edge_rej_u64_allones_into_B", rejected_into("B", std::uint64_t{ 0xFFFFFFFFFFFFFFFFull })); // 8->1
+    check("edge_rej_u64_allones_into_S", rejected_into("S", std::uint64_t{ 0xFFFFFFFFFFFFFFFFull })); // 8->2
+    check("edge_rej_u64_allones_into_I", rejected_into("I", std::uint64_t{ 0xFFFFFFFFFFFFFFFFull })); // 8->4
+    // sign-bit-only value of each width into a non-matching field width:
+    check("edge_rej_u8_signbit_into_I",  rejected_into("I", std::uint8_t{ 0x80 }));
+    check("edge_rej_u16_signbit_into_J", rejected_into("J", std::uint16_t{ 0x8000 }));
+    check("edge_rej_u32_signbit_into_S", rejected_into("S", std::uint32_t{ 0x80000000u }));
+    check("edge_rej_u64_signbit_into_I", rejected_into("I", std::uint64_t{ 0x8000000000000000ull }));
+    // zero value (all bytes 0) into a non-matching width is STILL refused — the
+    // guard never special-cases a zero payload.
+    check("edge_rej_u32_zero_into_J",    rejected_into("J", std::uint32_t{ 0x00000000u }));
+    check("edge_rej_u64_zero_into_I",    rejected_into("I", std::uint64_t{ 0x0000000000000000ull }));
+
+    // ======================================================================
+    // SECTION 22 — FLOAT / DOUBLE bit-exact special values via memcpy (NaN, +-inf,
+    // +-0, subnormal, max-finite).  These are written RIGHT-SIZED into "F"/"D"
+    // and the EXACT bit pattern is asserted by reading the slot back as an
+    // integer (NaN-safe: we never use `==` on the float itself).  This proves the
+    // accepted-write memcpy is bit-faithful for the pathological IEEE-754 values.
+    // ----------------------------------------------------------------------
+    // --- float (binary32) ---
+    check("float_pos_zero_verbatim", float_bits_land(0x00000000u));
+    check("float_neg_zero_verbatim", float_bits_land(0x80000000u));
+    check("float_pos_inf_verbatim",  float_bits_land(0x7F800000u));
+    check("float_neg_inf_verbatim",  float_bits_land(0xFF800000u));
+    check("float_qnan_verbatim",     float_bits_land(0x7FC00000u));
+    check("float_snan_verbatim",     float_bits_land(0x7F800001u));
+    check("float_neg_nan_verbatim",  float_bits_land(0xFFC00000u));
+    check("float_min_subnormal",     float_bits_land(0x00000001u));
+    check("float_max_subnormal",     float_bits_land(0x007FFFFFu));
+    check("float_min_normal",        float_bits_land(0x00800000u));
+    check("float_max_finite",        float_bits_land(0x7F7FFFFFu));
+    check("float_one_verbatim",      float_bits_land(0x3F800000u));   // 1.0f
+    check("float_neg_one_verbatim",  float_bits_land(0xBF800000u));   // -1.0f
+
+    // --- double (binary64) ---
+    check("double_pos_zero_verbatim", double_bits_land(0x0000000000000000ull));
+    check("double_neg_zero_verbatim", double_bits_land(0x8000000000000000ull));
+    check("double_pos_inf_verbatim",  double_bits_land(0x7FF0000000000000ull));
+    check("double_neg_inf_verbatim",  double_bits_land(0xFFF0000000000000ull));
+    check("double_qnan_verbatim",     double_bits_land(0x7FF8000000000000ull));
+    check("double_snan_verbatim",     double_bits_land(0x7FF0000000000001ull));
+    check("double_min_subnormal",     double_bits_land(0x0000000000000001ull));
+    check("double_max_subnormal",     double_bits_land(0x000FFFFFFFFFFFFFull));
+    check("double_min_normal",        double_bits_land(0x0010000000000000ull));
+    check("double_max_finite",        double_bits_land(0x7FEFFFFFFFFFFFFFull));
+    check("double_one_verbatim",      double_bits_land(0x3FF0000000000000ull));   // 1.0
+    check("double_neg_one_verbatim",  double_bits_land(0xBFF0000000000000ull));   // -1.0
+
+    // [INFO] CHARACTERISATION: a float NaN into the same-width "I" field, and a
+    // double NaN into "J", pass the SIZE guard (4==4 / 8==8) and the NaN bit
+    // pattern is copied verbatim — the size guard is not a type guard, so even a
+    // pathological float bit pattern reinterpreted as an int is ACCEPTED.  Pinned
+    // so a future signature-aware type check is detected here.  (The float is
+    // materialised as a local and memcpy'd, never canonicalised through an FPU
+    // register — see float_bits_land's contract.)
+    {
+        float nan_f{};
+        const std::uint32_t nan_f_bits{ 0x7FC00000u };
+        std::memcpy(&nan_f, &nan_f_bits, sizeof(nan_f));
+        canvas c;
+        vmhook::field_proxy proxy{ c.field_ptr(), "I", false };
+        proxy.set(nan_f);   // qNaN float into an int field
+        check("confuse_float_nan_into_I_accepts_bits", slot_bits32(c) == nan_f_bits);
+        check("confuse_float_nan_into_I_keeps_sentinels", c.sentinels_intact());
+    }
+    {
+        double nan_d{};
+        const std::uint64_t nan_d_bits{ 0x7FF8000000000000ull };
+        std::memcpy(&nan_d, &nan_d_bits, sizeof(nan_d));
+        canvas c;
+        vmhook::field_proxy proxy{ c.field_ptr(), "J", false };
+        proxy.set(nan_d);   // qNaN double into a long field
+        check("confuse_double_nan_into_J_accepts_bits", slot_bits64(c) == nan_d_bits);
+        check("confuse_double_nan_into_J_keeps_sentinels", c.sentinels_intact());
+    }
+    // ...and the reverse confusion (a chosen int bit pattern into "F"/"D") lands
+    // verbatim too: -inf's bit pattern delivered as an integer.
+    {
+        canvas c;
+        vmhook::field_proxy proxy{ c.field_ptr(), "F", false };
+        proxy.set(std::uint32_t{ 0xFF800000u });   // -inf bits delivered as uint32
+        check("confuse_u32_neginf_bits_into_F_accepts", slot_bits32(c) == 0xFF800000u);
+        check("confuse_u32_neginf_bits_into_F_keeps_sentinels", c.sentinels_intact());
+    }
+
+    // Float/double into a MISMATCHED width is still refused regardless of the
+    // special value: a NaN double into "F" is too wide (8 != 4), a subnormal
+    // float into "D" is too narrow (4 != 8).
+    check("float_nan_into_D_rejects",  float_bits_rejected_into("D", 0x7FC00000u));          // 4 != 8
+    check("double_nan_into_F_rejects", double_bits_rejected_into("F", 0x7FF8000000000000ull)); // 8 != 4
+    check("float_inf_into_S_rejects",  float_bits_rejected_into("S", 0x7F800000u));          // 4 != 2
+    check("double_inf_into_I_rejects", double_bits_rejected_into("I", 0x7FF0000000000000ull)); // 8 != 4
+
+    // ======================================================================
+    // SECTION 23 — the FULL value-width x field-width matrix once more, but
+    // driven by the NATURAL C++ arithmetic types (char/short/int/long long and
+    // float/double) instead of the fixed-width uint carriers of SECTION 3.  This
+    // proves the guard routes purely on sizeof(T) regardless of the spelled type
+    // name or signedness.  Each cell branches on sizeof to stay portable (e.g.
+    // `long` is 4 bytes on Windows/LLP64 but 8 on Linux/LP64).
+    // ----------------------------------------------------------------------
+    {
+        // `signed char` / `unsigned char` / `char` are all width 1.
+        check("nat_schar_into_B_accept", accepted_into("B", static_cast<signed char>(0x12)));
+        check("nat_uchar_into_B_accept", accepted_into("B", static_cast<unsigned char>(0x34)));
+        check("nat_schar_into_I_reject", rejected_into("I", static_cast<signed char>(0x12)));
+        check("nat_uchar_into_J_reject", rejected_into("J", static_cast<unsigned char>(0x34)));
+
+        // `short` / `unsigned short` are width 2 on every supported ABI.
+        static_assert(sizeof(short) == 2, "short is 2 bytes on every CI target");
+        check("nat_short_into_S_accept",  accepted_into("S", static_cast<short>(0x1234)));
+        check("nat_ushort_into_S_accept", accepted_into("S", static_cast<unsigned short>(0xBEEF)));
+        check("nat_short_into_I_reject",  rejected_into("I", static_cast<short>(0x1234)));
+        check("nat_short_into_B_reject",  rejected_into("B", static_cast<short>(0x1234)));
+
+        // `int` / `unsigned int` are width 4 on every supported ABI.
+        static_assert(sizeof(int) == 4, "int is 4 bytes on every CI target");
+        check("nat_int_into_I_accept",  accepted_into("I", static_cast<int>(0x0BADF00D)));
+        check("nat_uint_into_I_accept", accepted_into("I", static_cast<unsigned int>(0xDEADBEEFu)));
+        check("nat_int_into_J_reject",  rejected_into("J", static_cast<int>(0x0BADF00D)));
+        check("nat_int_into_S_reject",  rejected_into("S", static_cast<int>(0x0BADF00D)));
+
+        // `long long` / `unsigned long long` are width 8 on every supported ABI.
+        static_assert(sizeof(long long) == 8, "long long is 8 bytes on every CI target");
+        check("nat_llong_into_J_accept",  accepted_into("J", static_cast<long long>(0x0123456789ABCDEFll)));
+        check("nat_ullong_into_J_accept", accepted_into("J", static_cast<unsigned long long>(0xFEDCBA9876543210ull)));
+        check("nat_llong_into_I_reject",  rejected_into("I", static_cast<long long>(0x0123456789ABCDEFll)));
+        check("nat_llong_into_B_reject",  rejected_into("B", static_cast<long long>(0x0123456789ABCDEFll)));
+
+        // `float` (always 4) / `double` (always 8) route by width too.
+        check("nat_float_into_F_accept",  accepted_into("F", 3.5F));
+        check("nat_double_into_D_accept", accepted_into("D", 2.25));
+        check("nat_float_into_D_reject",  rejected_into("D", 3.5F));   // 4 != 8
+        check("nat_double_into_F_reject", rejected_into("F", 2.25));   // 8 != 4
+
+        // `long` / `unsigned long`: 4 bytes on LLP64 (Windows), 8 on LP64
+        // (Linux/macOS).  Branch on sizeof so the verdict is correct on each.
+        if constexpr (sizeof(long) == 4)
+        {
+            check("nat_long_into_I_accept_llp64", accepted_into("I", static_cast<long>(0x0BADF00D)));
+            check("nat_long_into_J_reject_llp64", rejected_into("J", static_cast<long>(0x0BADF00D)));
+            check("nat_ulong_into_I_accept_llp64", accepted_into("I", static_cast<unsigned long>(0xDEADBEEFu)));
+        }
+        else
+        {
+            // sizeof(long) == 8 (LP64): the only other supported width.
+            check("nat_long_into_J_accept_lp64", accepted_into("J", static_cast<long>(0x0123456789ABCDEFll)));
+            check("nat_long_into_I_reject_lp64", rejected_into("I", static_cast<long>(0x0123456789ABCDEFll)));
+            check("nat_ulong_into_J_accept_lp64", accepted_into("J", static_cast<unsigned long>(0xFEDCBA9876543210ull)));
+        }
+    }
+
+    // ======================================================================
+    // SECTION 24 — std::byte and char8_t value carriers (1-byte types reaching
+    // the trivially-copyable arm).  std::byte is an ENUM (the library's "C"
+    // widening shortcut is gated on is_arithmetic||is_enum precisely so std::byte
+    // — static_cast-able to unsigned char but NOT implicitly convertible — still
+    // widens for a "C" field).  char8_t is ARITHMETIC.  Pin: both widen into "C"
+    // (zero-extended to 16 bits), both are accepted into "B" (width 1), and both
+    // are refused into wider fields.
+    // ----------------------------------------------------------------------
+    {
+        // std::byte{0xFF} into "C": widens to 0x00FF (high byte zero), NOT 0xFFFF.
+        canvas c;
+        vmhook::field_proxy proxy{ c.field_ptr(), "C", false };
+        proxy.set(std::byte{ 0xFF });
+        std::uint16_t read{};
+        std::memcpy(&read, c.field_ptr(), sizeof(read));
+        check("set_C_stdbyte_FF_widens_to_00FF", read == std::uint16_t{ 0x00FF });
+        check("set_C_stdbyte_high_byte_zero", c.bytes[k_lead + 1] == 0x00);
+        check("set_C_stdbyte_keeps_sentinels", c.sentinels_intact());
+    }
+    {
+        // std::byte{0x41} into "C": widens to 0x0041.
+        canvas c;
+        vmhook::field_proxy proxy{ c.field_ptr(), "C", false };
+        proxy.set(std::byte{ 0x41 });
+        std::uint16_t read{};
+        std::memcpy(&read, c.field_ptr(), sizeof(read));
+        check("set_C_stdbyte_41_widens_to_0041", read == std::uint16_t{ 0x0041 });
+        check("set_C_stdbyte_41_keeps_sentinels", c.sentinels_intact());
+    }
+    {
+        // char8_t{0xFF} into "C": arithmetic 1-byte type, widens to 0x00FF.
+        canvas c;
+        vmhook::field_proxy proxy{ c.field_ptr(), "C", false };
+        proxy.set(char8_t{ 0xFF });
+        std::uint16_t read{};
+        std::memcpy(&read, c.field_ptr(), sizeof(read));
+        check("set_C_char8_FF_widens_to_00FF", read == std::uint16_t{ 0x00FF });
+        check("set_C_char8_keeps_sentinels", c.sentinels_intact());
+    }
+    // std::byte / char8_t into "B" (width 1): accepted, raw byte lands.
+    {
+        canvas c;
+        vmhook::field_proxy proxy{ c.field_ptr(), "B", false };
+        proxy.set(std::byte{ 0x80 });
+        check("set_B_stdbyte_accepts", c.bytes[k_lead] == 0x80 && c.sentinels_intact());
+    }
+    check("set_B_char8_accepts", accepted_into("B", char8_t{ 0x7F }));
+    check("set_Z_stdbyte_accepts", accepted_into("Z", std::byte{ 0x01 }));
+    // std::byte / char8_t into wider fields: refused (1 != width).
+    check("set_I_stdbyte_rejects", rejected_into("I", std::byte{ 0xFF }));   // 1 != 4
+    check("set_S_stdbyte_rejects", rejected_into("S", std::byte{ 0xFF }));   // 1 != 2
+    check("set_J_char8_rejects",   rejected_into("J", char8_t{ 0xFF }));     // 1 != 8
+    // std::byte into "S" does NOT widen (widening is "C"-only) -> 1 != 2 reject.
+    check("set_S_stdbyte_no_widen", rejected_into("S", std::byte{ 0xFF }));
+
+    // ======================================================================
+    // SECTION 25 — non-primitive guard is content-INDEPENDENT.  The guard fires
+    // on the field SIGNATURE width alone, never on whether the string / vector is
+    // empty or populated.  Pin that an EMPTY std::string / std::string_view /
+    // const char* "" / empty std::vector<T> is refused into a primitive field
+    // exactly like a populated one (no write, slot + sentinels intact).  This is
+    // the complement of SECTION 10 and rules out any "skip the guard when empty"
+    // regression that an empty-container fast path could introduce.
+    // ----------------------------------------------------------------------
+    check("empty_string_refuses_I",  rejected_into("I", std::string{}));
+    check("empty_string_refuses_J",  rejected_into("J", std::string{}));
+    check("empty_string_refuses_B",  rejected_into("B", std::string{}));
+    check("empty_sview_refuses_I",   rejected_into("I", std::string_view{}));
+    check("empty_sview_refuses_D",   rejected_into("D", std::string_view{}));
+    check("empty_cstr_refuses_I",    rejected_into("I", ""));
+    check("empty_cstr_refuses_C",    rejected_into("C", ""));
+    check("empty_vec_int_refuses_I", rejected_into("I", std::vector<int>{}));
+    check("empty_vec_int_refuses_Z", rejected_into("Z", std::vector<int>{}));
+    check("empty_vec_bool_refuses_Z",rejected_into("Z", std::vector<bool>{}));
+    check("empty_vec_str_refuses_I", rejected_into("I", std::vector<std::string>{}));
+    check("empty_vec_double_refuses_D", rejected_into("D", std::vector<double>{}));
+    // A long populated string is refused identically (length never matters).
+    check("long_string_refuses_I", rejected_into("I", std::string(256, 'x')));
+
+    // ======================================================================
+    // SECTION 26 — null field_pointer combined with a NON-primitive value into a
+    // PRIMITIVE signature.  The non-primitive guard fires on the signature width
+    // FIRST (before any pointer use), so the result is a clean no-op whether the
+    // pointer is null or not — and crucially the string / vector / unique_ptr arm
+    // is never entered.  Pin that this neither writes nor faults for a null ptr.
+    // (rejected_into uses a live buffer; here we additionally drive a genuinely
+    // null pointer to prove the early guard return needs no valid storage.)
+    // ----------------------------------------------------------------------
+    {
+        vmhook::field_proxy proxy{ nullptr, "I", false };
+        proxy.set(std::string{ "42" });   // guard fires on sig width, null ptr never touched
+        check("null_ptr_string_into_I_no_op", true);
+    }
+    {
+        vmhook::field_proxy proxy{ nullptr, "J", false };
+        proxy.set(std::vector<int>{ 1, 2, 3 });
+        check("null_ptr_vector_into_J_no_op", true);
+    }
+    {
+        vmhook::field_proxy proxy{ nullptr, "F", false };
+        proxy.set(std::unique_ptr<test_wrapper>{});
+        check("null_ptr_uptr_into_F_no_op", true);
+    }
+    {
+        vmhook::field_proxy proxy{ nullptr, "C", false };
+        proxy.set("literal");   // string_view-convertible into a primitive "C"
+        check("null_ptr_cstr_into_C_no_op", true);
+    }
+    {
+        vmhook::field_proxy proxy{ nullptr, "D", false };
+        proxy.set(std::string_view{ "x" });
+        check("null_ptr_sview_into_D_no_op", true);
+    }
+
+    // ======================================================================
+    // SECTION 27 — trivially-copyable BLOB widths beyond the arithmetic carriers,
+    // exercising the size guard with multi-byte aggregates (std::array<u8,N> and
+    // trivial structs) so the guard's width arithmetic is pinned for raw blobs of
+    // EVERY width 1/2/4/8.  Matching width -> accepted (bytes land verbatim);
+    // mismatched width -> rejected.  All blobs are <= 8 bytes to fit the slot.
+    // (A NON-arithmetic blob never takes the "C" widening shortcut, so a 1-byte
+    // struct into "C" is refused, not widened — re-pinned here for the blob path.)
+    // ----------------------------------------------------------------------
+    {
+        // width-1 blob: std::array<u8,1> and a 1-byte struct.
+        const std::array<std::uint8_t, 1> a1{ { 0xA7 } };
+        check("blob_array1_into_B_accept", accepted_into("B", a1));
+        check("blob_array1_into_S_reject", rejected_into("S", a1));   // 1 != 2
+        check("blob_array1_into_I_reject", rejected_into("I", a1));   // 1 != 4
+
+        struct one_byte { std::uint8_t a; };
+        static_assert(std::is_trivially_copyable_v<one_byte>, "one_byte trivially copyable");
+        const one_byte s1{ 0x5A };
+        check("blob_struct1_into_B_accept", accepted_into("B", s1));
+        // A 1-byte NON-arithmetic struct into "C" must NOT widen (it is neither
+        // arithmetic nor enum) -> size guard sees 1 != 2 -> rejected.
+        check("blob_struct1_into_C_no_widen_reject", rejected_into("C", s1));
+
+        // width-2 blob.
+        const std::array<std::uint8_t, 2> a2{ { 0xEF, 0xBE } };
+        check("blob_array2_into_S_accept", accepted_into("S", a2));
+        check("blob_array2_into_C_accept", accepted_into("C", a2));   // 2==2, verbatim path
+        check("blob_array2_into_I_reject", rejected_into("I", a2));   // 2 != 4
+        check("blob_array2_into_B_reject", rejected_into("B", a2));   // 2 != 1
+
+        struct two_byte { std::uint8_t a, b; };
+        static_assert(std::is_trivially_copyable_v<two_byte>, "two_byte trivially copyable");
+        const two_byte s2{ 0x11, 0x22 };
+        check("blob_struct2_into_S_accept", accepted_into("S", s2));
+        check("blob_struct2_into_I_reject", rejected_into("I", s2));
+
+        // width-4 blob.
+        const std::array<std::uint8_t, 4> a4{ { 0x0D, 0xF0, 0xAD, 0x0B } };
+        check("blob_array4_into_I_accept", accepted_into("I", a4));
+        check("blob_array4_into_F_accept", accepted_into("F", a4));   // 4==4 (no type guard)
+        check("blob_array4_into_S_reject", rejected_into("S", a4));   // 4 != 2
+        check("blob_array4_into_J_reject", rejected_into("J", a4));   // 4 != 8
+
+        struct four_byte { std::uint8_t a, b, c, d; };
+        static_assert(std::is_trivially_copyable_v<four_byte>, "four_byte trivially copyable");
+        const four_byte s4{ 0xDE, 0xAD, 0xBE, 0xEF };
+        check("blob_struct4_into_I_accept", accepted_into("I", s4));
+        check("blob_struct4_into_J_reject", rejected_into("J", s4));
+
+        // width-8 blob.
+        const std::array<std::uint8_t, 8> a8{ { 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01 } };
+        check("blob_array8_into_J_accept", accepted_into("J", a8));
+        check("blob_array8_into_D_accept", accepted_into("D", a8));   // 8==8 (no type guard)
+        check("blob_array8_into_I_reject", rejected_into("I", a8));   // 8 != 4
+        check("blob_array8_into_S_reject", rejected_into("S", a8));   // 8 != 2
+
+        struct eight_byte { std::uint8_t a, b, c, d, e, f, g, h; };
+        static_assert(std::is_trivially_copyable_v<eight_byte>, "eight_byte trivially copyable");
+        const eight_byte s8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+        check("blob_struct8_into_J_accept", accepted_into("J", s8));
+        check("blob_struct8_into_I_reject", rejected_into("I", s8));
+
+        // An OVERSIZED (> 8-byte) blob into ANY primitive width is refused (the
+        // guard sees value_size != field_size for every primitive width), so no
+        // write occurs and the 8-byte slot stays intact — proving the guard
+        // protects against the widest-value / narrowest-field corruption even for
+        // a value larger than the whole slot.  We only test the REJECT direction
+        // for >8-byte blobs (an accepted >8-byte write would overrun the slot).
+        struct twelve_byte { std::uint8_t b[12]; };
+        static_assert(std::is_trivially_copyable_v<twelve_byte>, "twelve_byte trivially copyable");
+        const twelve_byte s12{ { 0 } };
+        check("blob_oversize12_into_J_reject", rejected_into("J", s12));   // 12 != 8
+        check("blob_oversize12_into_I_reject", rejected_into("I", s12));   // 12 != 4
+        check("blob_oversize12_into_B_reject", rejected_into("B", s12));   // 12 != 1
+        const std::array<std::uint8_t, 16> a16{};
+        check("blob_array16_into_J_reject", rejected_into("J", a16));      // 16 != 8
     }
 
     return failures == 0 ? 0 : 1;
