@@ -203,6 +203,74 @@ public:
     auto construct(move_only) -> void {}
 };
 
+// Wrapper exposing a NO-ARG construct() — proves the requires-probe is satisfied
+// for the empty pack (make_unique<W>() would invoke construct() on the fallback)
+// and is NOT satisfied once any arg is forwarded.  The mirror image of
+// plain_wrapper (which has no construct() at all).
+class noarg_ctor_wrapper : public vmhook::object<noarg_ctor_wrapper>
+{
+public:
+    explicit noarg_ctor_wrapper(vmhook::oop_t oop) noexcept
+        : vmhook::object<noarg_ctor_wrapper>{ oop }
+    {
+    }
+    auto construct() -> void {}
+};
+
+// Wrapper exposing construct(int, std::int64_t, double) — mirrors the JVM
+// fixture's (IJD)V constructor.  Lets the multi-arg construct() branch be pinned
+// for the exact heterogeneous pack make_unique would forward.
+class ijd_ctor_wrapper : public vmhook::object<ijd_ctor_wrapper>
+{
+public:
+    explicit ijd_ctor_wrapper(vmhook::oop_t oop) noexcept
+        : vmhook::object<ijd_ctor_wrapper>{ oop }
+    {
+    }
+    auto construct(int, std::int64_t, double) -> void {}
+};
+
+// Wrapper exposing construct(std::string, int) — mirrors the (Ljava/lang/String;I)V
+// constructor.  Used to confirm the probe is satisfied for the string-family
+// arg-shapes (std::string / const char* / std::string_view) the JNI path accepts.
+class string_int_ctor_wrapper : public vmhook::object<string_int_ctor_wrapper>
+{
+public:
+    explicit string_int_ctor_wrapper(vmhook::oop_t oop) noexcept
+        : vmhook::object<string_int_ctor_wrapper>{ oop }
+    {
+    }
+    auto construct(std::string, int) -> void {}
+};
+
+// A second move-only sink whose construct() takes the move_only by RVALUE
+// reference — the requires-probe must accept a forwarded rvalue and reject a
+// forwarded lvalue, the strictest value-category discriminator (an rvalue ref
+// cannot bind an lvalue at all, independent of copyability).
+class move_rref_sink_wrapper : public vmhook::object<move_rref_sink_wrapper>
+{
+public:
+    explicit move_rref_sink_wrapper(vmhook::oop_t oop) noexcept
+        : vmhook::object<move_rref_sink_wrapper>{ oop }
+    {
+    }
+    auto construct(move_only&&) -> void {}
+};
+
+// Wrapper used purely to exercise the object-reference *descriptor* arm of
+// jni_signature_for_arg (an object_base-derived arg / unique_ptr<object> arg
+// resolves "L<registered-name>;" or the "Ljava/lang/Object;" fallback).  Kept
+// separate from plain_wrapper so its registration state can be toggled in an
+// isolated, snapshot/restore block without perturbing the other sections.
+class object_arg_wrapper : public vmhook::object<object_arg_wrapper>
+{
+public:
+    explicit object_arg_wrapper(vmhook::oop_t oop) noexcept
+        : vmhook::object<object_arg_wrapper>{ oop }
+    {
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Replicate make_unique's EXACT construct()-detection predicate so we can
 // static_assert on it for any wrapper + forwarded value categories.  This is
@@ -245,6 +313,41 @@ static auto make_unique_is_null_and_safe(args_t&&... args) -> bool
     try { obj = vmhook::make_unique<wrapper_type>(std::forward<args_t>(args)...); }
     catch (...) { threw = true; }
     return obj == nullptr && !threw;
+}
+
+// Construct a wrapper DIRECTLY over a given (null or sentinel) oop the way
+// make_unique's success path does internally (std::make_unique<W>(oop)), then
+// assert the produced unique_ptr is a sane owning handle whose wrapped object
+// reports EXACTLY the oop it was built from via object_base::get_instance().
+// This is the no-JVM analogue of "the factory returned a usable wrapper": the
+// JVM-only paths return std::make_unique<W>(decoded_oop), and here we prove that
+// the W(oop) construction + ownership + get_instance() round-trip is fault-free
+// for any oop value (no JVM, no deref of the oop — get_instance just returns the
+// stored pointer).  `oop` is the bit-pattern get_instance() must report back.
+template<typename wrapper_type>
+static auto wrap_oop_roundtrips(vmhook::oop_t oop, bool& threw) -> bool
+{
+    threw = false;
+    try
+    {
+        std::unique_ptr<wrapper_type> p{ std::make_unique<wrapper_type>(oop) };
+        if (!p) { return false; }
+        // The wrapper must expose the exact oop it was constructed from.
+        if (p->get_instance() != oop) { return false; }
+        // Owning-handle sanity on a real (possibly non-null) pointer.
+        if (p.get() == nullptr) { return false; }
+        // Move the ownership; the moved-to handle still reports the same oop and
+        // the moved-from handle is emptied (unique_ptr move contract).
+        std::unique_ptr<wrapper_type> q{ std::move(p) };
+        if (p != nullptr) { return false; }
+        if (!q || q->get_instance() != oop) { return false; }
+        return true;
+    }
+    catch (...)
+    {
+        threw = true;
+        return false;
+    }
 }
 
 int main()
@@ -321,6 +424,52 @@ int main()
                       "unique_ptr return must be movable");
         static_assert(std::is_nothrow_move_constructible_v<ret_t>,
                       "unique_ptr move must be noexcept");
+        // Move ASSIGNMENT is also available and noexcept (the factory result can
+        // be re-seated into an existing owning slot, e.g. `obj = make_unique...`).
+        static_assert(std::is_move_assignable_v<ret_t>,
+                      "unique_ptr return must be move-assignable");
+        static_assert(std::is_nothrow_move_assignable_v<ret_t>,
+                      "unique_ptr move-assign must be noexcept");
+        // The return is NOT a raw pointer / reference / array — it is precisely the
+        // class template std::unique_ptr (a value-type owning handle).
+        static_assert(!std::is_pointer_v<ret_t>);
+        static_assert(!std::is_reference_v<ret_t>);
+        static_assert(!std::is_array_v<ret_t>);
+        static_assert(std::is_class_v<ret_t>);
+        // pointer typedef is W* (the managed raw pointer type), confirming the
+        // single-object (non-array) unique_ptr specialisation.
+        static_assert(std::is_same_v<ret_t::pointer, plain_wrapper*>,
+                      "unique_ptr<W>::pointer must be W*");
+
+        // The return type is INVARIANT to the forwarded arg pack: the SAME
+        // std::unique_ptr<W> is produced whether 0, 1, or many args of any
+        // category/type are passed (it is keyed only on the explicit W).  This is
+        // the return-type half of the perfect-forwarding contract.
+        static_assert(std::is_same_v<
+            decltype(vmhook::make_unique<plain_wrapper>(std::int8_t{ 1 })),
+            decltype(vmhook::make_unique<plain_wrapper>())>);
+        static_assert(std::is_same_v<
+            decltype(vmhook::make_unique<plain_wrapper>(1, 2L, 3.0, true, std::string{})),
+            decltype(vmhook::make_unique<plain_wrapper>())>);
+
+        // Return type holds for EVERY wrapper variant defined in this TU — the
+        // factory is uniform across the whole wrapper-shape matrix (construct()
+        // overload set never bleeds into the return type).
+        static_assert(std::is_same_v<
+            decltype(vmhook::make_unique<noarg_ctor_wrapper>()),
+            std::unique_ptr<noarg_ctor_wrapper>>);
+        static_assert(std::is_same_v<
+            decltype(vmhook::make_unique<ijd_ctor_wrapper>(1, std::int64_t{ 2 }, 3.0)),
+            std::unique_ptr<ijd_ctor_wrapper>>);
+        static_assert(std::is_same_v<
+            decltype(vmhook::make_unique<string_int_ctor_wrapper>(std::string{ "k" }, 1)),
+            std::unique_ptr<string_int_ctor_wrapper>>);
+        static_assert(std::is_same_v<
+            decltype(vmhook::make_unique<lref_ctor_wrapper>(std::declval<int&>())),
+            std::unique_ptr<lref_ctor_wrapper>>);
+        static_assert(std::is_same_v<
+            decltype(vmhook::make_unique<rref_ctor_wrapper>(7)),
+            std::unique_ptr<rref_ctor_wrapper>>);
 
         check("A_return_type_is_unique_ptr_of_wrapper_compile_time", true);
     }
@@ -390,6 +539,52 @@ int main()
         static_assert(!has_matching_construct<move_sink_wrapper, move_only&>);  // lvalue -> needs copy (deleted)
         static_assert(!has_matching_construct<move_sink_wrapper, const move_only&>);
 
+        // (5b) MOVE-ONLY arg sink whose parameter is an RVALUE REFERENCE
+        // construct(move_only&&): the binding rule (not copyability) is the
+        // discriminator — an rvalue binds, an lvalue / const-lvalue cannot bind to
+        // a non-const rvalue reference at all.  Strictest forwarding proof.
+        static_assert(has_matching_construct<move_rref_sink_wrapper, move_only>);     // prvalue
+        static_assert(has_matching_construct<move_rref_sink_wrapper, move_only&&>);   // xvalue
+        static_assert(!has_matching_construct<move_rref_sink_wrapper, move_only&>);   // lvalue
+        static_assert(!has_matching_construct<move_rref_sink_wrapper, const move_only&>);
+
+        // (6) NO-ARG construct(): satisfied ONLY by the empty pack — make_unique<W>()
+        // on the fallback would invoke construct().  Any forwarded arg makes the
+        // probe fail (arity 1+ does not match the zero-parameter construct()).
+        static_assert(has_matching_construct<noarg_ctor_wrapper>);
+        static_assert(!has_matching_construct<noarg_ctor_wrapper, int>);
+        static_assert(!has_matching_construct<noarg_ctor_wrapper, int, int>);
+        // ...and a wrapper that has NO construct() at all still fails the empty
+        // probe (the negative control for the line above).
+        static_assert(!has_matching_construct<plain_wrapper>);
+
+        // (7) MULTI-ARG construct(int, std::int64_t, double): satisfied for the
+        // exact 3-arg pack across all value-category spellings (the descriptor
+        // twin of the (IJD)V constructor), and arity-checked on both sides.
+        static_assert(has_matching_construct<ijd_ctor_wrapper, int, std::int64_t, double>);
+        static_assert(has_matching_construct<ijd_ctor_wrapper, int&, std::int64_t&, double&>);
+        static_assert(has_matching_construct<ijd_ctor_wrapper, const int&, const std::int64_t&, const double&>);
+        static_assert(has_matching_construct<ijd_ctor_wrapper, int&&, std::int64_t&&, double&&>);
+        static_assert(has_matching_construct<ijd_ctor_wrapper, short, int, float>);  // all convertible
+        static_assert(!has_matching_construct<ijd_ctor_wrapper, int, std::int64_t>);          // arity 2
+        static_assert(!has_matching_construct<ijd_ctor_wrapper, int, std::int64_t, double, int>); // arity 4
+
+        // (8) STRING-FAMILY construct(std::string, int).  IMPORTANT asymmetry:
+        // make_unique's JNI *descriptor* path accepts std::string, const char*,
+        // AND std::string_view for a String parameter (all map to
+        // "Ljava/lang/String;", see Section D), but the construct() *fallback*
+        // probe is plain C++ overload resolution against `std::string` — which
+        // accepts std::string and const char* (the implicit
+        // basic_string(const char*) ctor) yet REJECTS std::string_view, because
+        // basic_string's string_view-accepting constructor is `explicit`.  Pinned
+        // here so a regression that (de)couples the two paths is caught.
+        static_assert(has_matching_construct<string_int_ctor_wrapper, std::string, int>);
+        static_assert(has_matching_construct<string_int_ctor_wrapper, const char*, int>);
+        static_assert(!has_matching_construct<string_int_ctor_wrapper, std::string_view, int>); // explicit ctor
+        static_assert(has_matching_construct<string_int_ctor_wrapper, const std::string&, int&>);
+        static_assert(has_matching_construct<string_int_ctor_wrapper, std::string&&, int&&>);
+        static_assert(!has_matching_construct<string_int_ctor_wrapper, int, std::string>); // wrong order
+
         check("B_construct_detection_follows_forwarded_value_category", true);
     }
 
@@ -435,12 +630,36 @@ int main()
         check("D_descriptor_empty_pack_is_void_ctor",
               init_descriptor<>() == "()V");
 
-        // (b) Single-arg descriptors for representative types.
-        check("D_descriptor_int",    init_descriptor<int>() == "(I)V");
-        check("D_descriptor_long",   init_descriptor<std::int64_t>() == "(J)V");
-        check("D_descriptor_double", init_descriptor<double>() == "(D)V");
-        check("D_descriptor_bool",   init_descriptor<bool>() == "(Z)V");
-        check("D_descriptor_string", init_descriptor<std::string>() == "(Ljava/lang/String;)V");
+        // (b) Single-arg descriptors for EVERY type jni_signature_for_arg maps.
+        // These mirror the live header's per-type dispatch exactly:
+        //   bool->Z  int8/uint8->B  int16->S  uint16->C  int32/uint32->I
+        //   int64/uint64->J  float->F  double->D  string family->Ljava/lang/String;
+        // Each fixed-width std::intNN_t is endianness/word-size invariant, so the
+        // expected descriptor is identical on every platform in the CI matrix.
+        check("D_descriptor_bool",    init_descriptor<bool>() == "(Z)V");
+        check("D_descriptor_int8",    init_descriptor<std::int8_t>() == "(B)V");
+        check("D_descriptor_uint8",   init_descriptor<std::uint8_t>() == "(B)V");
+        check("D_descriptor_int16",   init_descriptor<std::int16_t>() == "(S)V");
+        // uint16 -> 'C' (Java char), DISTINCT from int16 -> 'S'.  This is the one
+        // mapping where the signedness flips the descriptor letter; pin both.
+        check("D_descriptor_uint16",  init_descriptor<std::uint16_t>() == "(C)V");
+        check("D_descriptor_int32",   init_descriptor<std::int32_t>() == "(I)V");
+        check("D_descriptor_uint32",  init_descriptor<std::uint32_t>() == "(I)V");
+        check("D_descriptor_int",     init_descriptor<int>() == "(I)V");
+        check("D_descriptor_int64",   init_descriptor<std::int64_t>() == "(J)V");
+        check("D_descriptor_uint64",  init_descriptor<std::uint64_t>() == "(J)V");
+        check("D_descriptor_long",    init_descriptor<std::int64_t>() == "(J)V");
+        check("D_descriptor_float",   init_descriptor<float>() == "(F)V");
+        check("D_descriptor_double",  init_descriptor<double>() == "(D)V");
+        check("D_descriptor_string",  init_descriptor<std::string>() == "(Ljava/lang/String;)V");
+
+        // uint16 'C' vs int16 'S' really differ (guards against a copy-paste that
+        // collapses them) — assert the descriptors are NOT equal.
+        check("D_descriptor_uint16_differs_from_int16",
+              init_descriptor<std::uint16_t>() != init_descriptor<std::int16_t>());
+        // int8/uint8 collapse to the SAME 'B' (signedness ignored for byte).
+        check("D_descriptor_int8_equals_uint8",
+              init_descriptor<std::int8_t>() == init_descriptor<std::uint8_t>());
 
         // (b') Multi-arg descriptors matching the JVM fixture's constructors
         // ()V (I)V (II)V (IJD)V (Ljava/lang/String;)V (Ljava/lang/String;I)V.
@@ -451,13 +670,37 @@ int main()
         check("D_descriptor_StringI",
               init_descriptor<std::string, int>() == "(Ljava/lang/String;I)V");
 
-        // (b'') c-string and string_view also yield the String descriptor (same
-        // decayed type family) — proving the assembly is type-, not spelling-,
-        // driven.
+        // (b'') The WHOLE string family — std::string, const char*, char*
+        // (non-const), and std::string_view — yields the SAME String descriptor
+        // (jni_signature_for_arg lists all four in one branch).  Proves the
+        // assembly is type-, not spelling-, driven.
         check("D_descriptor_cstring",
               init_descriptor<const char*>() == "(Ljava/lang/String;)V");
+        check("D_descriptor_mutable_cstring",
+              init_descriptor<char*>() == "(Ljava/lang/String;)V");
         check("D_descriptor_string_view",
               init_descriptor<std::string_view>() == "(Ljava/lang/String;)V");
+        check("D_descriptor_all_string_spellings_agree",
+              init_descriptor<std::string>() == init_descriptor<const char*>()
+                  && init_descriptor<char*>() == init_descriptor<std::string_view>()
+                  && init_descriptor<std::string>() == init_descriptor<std::string_view>());
+
+        // (b''') Longer descriptors that exercise the NEW per-type letters in a
+        // single assembled "(...)V".  These are the descriptors make_unique would
+        // hand GetMethodID for ctors taking byte/short/char/float mixes.
+        check("D_descriptor_BSCF",
+              init_descriptor<std::int8_t, std::int16_t, std::uint16_t, float>() == "(BSCF)V");
+        check("D_descriptor_ZBI",
+              init_descriptor<bool, std::uint8_t, std::int32_t>() == "(ZBI)V");
+        check("D_descriptor_FD",
+              init_descriptor<float, double>() == "(FD)V");
+        check("D_descriptor_all_primitive_letters",
+              init_descriptor<bool, std::int8_t, std::int16_t, std::uint16_t,
+                              std::int32_t, std::int64_t, float, double>() == "(ZBSCIJFD)V");
+        // String interleaved with the new primitive letters.
+        check("D_descriptor_string_then_byte_then_float",
+              init_descriptor<std::string, std::int8_t, float>()
+                  == "(Ljava/lang/String;BF)V");
 
         // (c) VALUE-CATEGORY INVARIANCE: every cv/ref spelling of (int, string)
         // decays to the SAME "(ILjava/lang/String;)V".  This is the descriptor-
@@ -495,6 +738,169 @@ int main()
               init_descriptor<const int&>() == init_descriptor<int>());
         check("D_decay_matches_bare_for_string",
               init_descriptor<std::string&&>() == init_descriptor<std::string>());
+        // Same decay invariance for EACH new primitive letter.
+        check("D_decay_matches_bare_for_int8",
+              init_descriptor<const std::int8_t&>() == init_descriptor<std::int8_t>());
+        check("D_decay_matches_bare_for_uint16",
+              init_descriptor<std::uint16_t&&>() == init_descriptor<std::uint16_t>());
+        check("D_decay_matches_bare_for_float",
+              init_descriptor<const float&>() == init_descriptor<float>());
+        check("D_decay_matches_bare_for_int64",
+              init_descriptor<std::int64_t&>() == init_descriptor<std::int64_t>());
+
+        // (c') VALUE-CATEGORY INVARIANCE over a pack of the NEW letters: every
+        // cv/ref spelling of (byte, short, char, float) decays to one descriptor.
+        const std::string canonical_bscf{ "(BSCF)V" };
+        check("D_invariance_bscf_value",
+              init_descriptor<std::int8_t, std::int16_t, std::uint16_t, float>() == canonical_bscf);
+        check("D_invariance_bscf_lref",
+              init_descriptor<std::int8_t&, std::int16_t&, std::uint16_t&, float&>() == canonical_bscf);
+        check("D_invariance_bscf_clref",
+              init_descriptor<const std::int8_t&, const std::int16_t&,
+                              const std::uint16_t&, const float&>() == canonical_bscf);
+        check("D_invariance_bscf_rref",
+              init_descriptor<std::int8_t&&, std::int16_t&&, std::uint16_t&&, float&&>() == canonical_bscf);
+        check("D_invariance_bscf_mixed",
+              init_descriptor<std::int8_t&, const std::int16_t&,
+                              std::uint16_t&&, const float>() == canonical_bscf);
+
+        // The c-string family is also category-invariant at the descriptor layer:
+        // a const char*& (lvalue ref to pointer) decays to const char* -> String.
+        check("D_invariance_cstring_lref",
+              init_descriptor<const char*&>() == init_descriptor<const char*>());
+        check("D_invariance_cstring_rref",
+              init_descriptor<const char*&&>() == init_descriptor<const char*>());
+    }
+
+    // =====================================================================
+    // SECTION D2 — OBJECT-REFERENCE arg descriptor (the wrapper-as-ctor-arg arm).
+    // make_unique can take an object_base-derived arg or a unique_ptr<wrapper>
+    // arg; jni_signature_for_arg resolves its descriptor to "L<registered-name>;"
+    // by looking the wrapper's typeid up in type_to_class_map, and FALLS BACK to
+    // "Ljava/lang/Object;" when the wrapper is unregistered.  Both arms are
+    // deterministic with no JVM (pure map lookup + string assembly), so we pin
+    // them inside a snapshot/restore block (identical discipline to Section F) to
+    // keep the suite order-independent.  This is the descriptor surface for the
+    // "constructor that takes another object" case the header comments call out.
+    // =====================================================================
+    {
+        std::unordered_map<std::type_index, std::string> saved_types{};
+        {
+            std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
+            saved_types = vmhook::type_to_class_map;
+        }
+
+        // Ensure object_arg_wrapper is UNREGISTERED, then assert the fallback.
+        {
+            std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
+            vmhook::type_to_class_map.erase(std::type_index{ typeid(object_arg_wrapper) });
+        }
+        check("D2_unregistered_object_by_value_is_jlobject",
+              init_descriptor<object_arg_wrapper>() == "(Ljava/lang/Object;)V");
+        check("D2_unregistered_unique_ptr_is_jlobject",
+              init_descriptor<std::unique_ptr<object_arg_wrapper>>() == "(Ljava/lang/Object;)V");
+
+        // Register it directly in the map (the pure-bookkeeping half of
+        // register_class; find_class needs a JVM and is out of scope), then the
+        // descriptor must read the registered binary class name.
+        vmhook::type_to_class_map.insert_or_assign(
+            std::type_index{ typeid(object_arg_wrapper) }, std::string{ "com/example/ObjArg" });
+        check("D2_registered_object_by_value_uses_class_name",
+              init_descriptor<object_arg_wrapper>() == "(Lcom/example/ObjArg;)V");
+        check("D2_registered_unique_ptr_uses_class_name",
+              init_descriptor<std::unique_ptr<object_arg_wrapper>>() == "(Lcom/example/ObjArg;)V");
+        // The by-value object arm and the unique_ptr<object> arm agree (both
+        // resolve the SAME wrapper typeid -> same "L...;" string).
+        check("D2_object_value_and_unique_ptr_descriptors_agree",
+              init_descriptor<object_arg_wrapper>()
+                  == init_descriptor<std::unique_ptr<object_arg_wrapper>>());
+        // cv/ref spellings of the object arg decay to the same descriptor.
+        check("D2_object_arg_value_category_invariant",
+              init_descriptor<const object_arg_wrapper&>() == "(Lcom/example/ObjArg;)V"
+                  && init_descriptor<object_arg_wrapper&&>() == "(Lcom/example/ObjArg;)V");
+
+        // Restore the map exactly so later sections see the prior state.
+        {
+            std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
+            vmhook::type_to_class_map = saved_types;
+        }
+        check("D2_type_map_restored",
+              vmhook::type_to_class_map == saved_types);
+    }
+
+    // =====================================================================
+    // SECTION D3 — TRAIT GATES the factory's arg pipeline depends on.
+    // make_unique's per-arg dispatch (jni_signature_for_arg / append_jni_arg)
+    // routes object-wrapper args through is_unique_ptr / is_unique_object_ptr and
+    // the object_base base test.  These traits are the compile-time gates that
+    // decide whether an arg becomes a Java object parameter vs a primitive — pin
+    // their exact behaviour (cv-ref stripping, value_type_t resolution, the
+    // object_base derivation requirement) so a regression in the gates (which
+    // would silently mis-encode every wrapper arg) is caught here, no JVM needed.
+    // =====================================================================
+    {
+        using vmhook::detail::is_unique_ptr;
+        using vmhook::detail::is_unique_ptr_v;
+        using vmhook::detail::is_unique_object_ptr;
+
+        // is_unique_ptr<T>::value — true only for unique_ptr specialisations.
+        static_assert(is_unique_ptr<std::unique_ptr<plain_wrapper>>::value);
+        static_assert(!is_unique_ptr<plain_wrapper>::value);
+        static_assert(!is_unique_ptr<int>::value);
+        static_assert(!is_unique_ptr<plain_wrapper*>::value);
+
+        // value_type_t exposes the pointee (the wrapper) — this is what
+        // jni_signature_for_arg uses to resolve the "L...;" descriptor.  It must
+        // be the WRAPPER type, NOT bool (the shadowing footgun the header warns
+        // about); pin it so that regression cannot return silently.
+        static_assert(std::is_same_v<
+            is_unique_ptr<std::unique_ptr<plain_wrapper>>::value_type_t, plain_wrapper>,
+            "is_unique_ptr<unique_ptr<W>>::value_type_t must be W (not bool)");
+        static_assert(std::is_same_v<
+            is_unique_ptr<std::unique_ptr<object_arg_wrapper>>::value_type_t, object_arg_wrapper>);
+
+        // is_unique_ptr_v strips cv-ref BEFORE testing (so a forwarded
+        // const unique_ptr<W>& arg is still recognised as a unique_ptr).
+        static_assert(is_unique_ptr_v<std::unique_ptr<plain_wrapper>>);
+        static_assert(is_unique_ptr_v<const std::unique_ptr<plain_wrapper>&>);
+        static_assert(is_unique_ptr_v<std::unique_ptr<plain_wrapper>&&>);
+        static_assert(is_unique_ptr_v<std::unique_ptr<plain_wrapper>&>);
+        static_assert(!is_unique_ptr_v<plain_wrapper>);
+        static_assert(!is_unique_ptr_v<int>);
+
+        // is_unique_object_ptr — true ONLY for unique_ptr<T> where T derives from
+        // object_base (the exact predicate that classifies an arg as a managed
+        // Java-object wrapper).  unique_ptr<int> is a unique_ptr but NOT an
+        // object-wrapper, so it must be false.
+        static_assert(is_unique_object_ptr<std::unique_ptr<plain_wrapper>>::value);
+        static_assert(is_unique_object_ptr<std::unique_ptr<ctor_wrapper>>::value);
+        static_assert(!is_unique_object_ptr<std::unique_ptr<int>>::value);
+        static_assert(!is_unique_object_ptr<plain_wrapper>::value);
+        static_assert(!is_unique_object_ptr<int>::value);
+
+        // The wrappers really do derive from object_base (the property both the
+        // descriptor arm and is_unique_object_ptr key on).  move_only is a plain
+        // user struct and must NOT be mistaken for an object wrapper.
+        static_assert(std::is_base_of_v<vmhook::object_base, plain_wrapper>);
+        static_assert(std::is_base_of_v<vmhook::object_base, object_arg_wrapper>);
+        static_assert(!std::is_base_of_v<vmhook::object_base, move_only>);
+        static_assert(!std::is_base_of_v<vmhook::object_base, int>);
+
+        // The wrapper construction contract make_unique relies on:
+        // std::make_unique<W>(oop) must be well-formed (W is constructible from a
+        // single oop_t) for EVERY wrapper — this is the call the success path
+        // makes.  oop_t is void*, so assert constructibility from void*.
+        static_assert(std::is_constructible_v<plain_wrapper, vmhook::oop_t>);
+        static_assert(std::is_constructible_v<ctor_wrapper, vmhook::oop_t>);
+        static_assert(std::is_constructible_v<bool_ctor_wrapper, vmhook::oop_t>);
+        static_assert(std::is_constructible_v<object_arg_wrapper, vmhook::oop_t>);
+        // ...and that single-oop constructor is noexcept (the wrappers mark it so;
+        // make_unique's std::make_unique<W>(oop) therefore cannot throw on the
+        // construction step itself).
+        static_assert(std::is_nothrow_constructible_v<plain_wrapper, vmhook::oop_t>);
+        static_assert(std::is_nothrow_constructible_v<object_arg_wrapper, vmhook::oop_t>);
+
+        check("D3_factory_trait_gates_compile_time", true);
     }
 
     // =====================================================================
@@ -629,6 +1035,122 @@ int main()
         //     (sizeof...(args)>0). Still null + no-throw. ---
         check("E_plain_wrapper_with_args_no_construct_branch",
               make_unique_is_null_and_safe<plain_wrapper>(1, 2, 3));
+
+        // --- NO-ARG construct() wrapper called with NO args: the construct()
+        //     branch instantiates (requires-probe satisfied for the empty pack)
+        //     yet make_unique still returns null at the thread guard. ---
+        check("E_noarg_ctor_no_args",
+              make_unique_is_null_and_safe<noarg_ctor_wrapper>());
+
+        // --- every primitive arg type ALSO on a wrapper WITH a matching
+        //     construct() (wide_ctor_wrapper::construct(long) accepts each via
+        //     promotion): exercises the construct()-branch instantiation for each
+        //     packer path, all null + no-throw. ---
+        check("E_wide_ctor_bool",   make_unique_is_null_and_safe<wide_ctor_wrapper>(true));
+        check("E_wide_ctor_int8",   make_unique_is_null_and_safe<wide_ctor_wrapper>(std::int8_t{ -1 }));
+        check("E_wide_ctor_uint8",  make_unique_is_null_and_safe<wide_ctor_wrapper>(std::uint8_t{ 1 }));
+        check("E_wide_ctor_int16",  make_unique_is_null_and_safe<wide_ctor_wrapper>(std::int16_t{ -2 }));
+        check("E_wide_ctor_uint16", make_unique_is_null_and_safe<wide_ctor_wrapper>(std::uint16_t{ 2 }));
+        check("E_wide_ctor_int32",  make_unique_is_null_and_safe<wide_ctor_wrapper>(std::int32_t{ -3 }));
+
+        // --- float arg specifically (the descriptor 'F' packer path), on the
+        //     no-construct wrapper. Distinct from the double path. ---
+        check("E_arg_float_negzero", make_unique_is_null_and_safe<plain_wrapper>(-0.0f));
+        check("E_arg_double_negzero", make_unique_is_null_and_safe<plain_wrapper>(-0.0));
+
+        // --- the (IJD) multi-arg shape on a wrapper whose construct(int,
+        //     std::int64_t, double) matches: the multi-arg construct() branch
+        //     instantiates, every category present, still null + no-throw. ---
+        {
+            int i{ 7 };
+            std::int64_t j{ 0x0123456789ABCDEFLL };
+            double d{ 3.5 };
+            check("E_ijd_ctor_lvalues",
+                  make_unique_is_null_and_safe<ijd_ctor_wrapper>(i, j, d));
+            check("E_ijd_ctor_rvalues",
+                  make_unique_is_null_and_safe<ijd_ctor_wrapper>(7, std::int64_t{ 1 }, 3.5));
+            check("E_ijd_ctor_mixed",
+                  make_unique_is_null_and_safe<ijd_ctor_wrapper>(i, std::int64_t{ 9 }, d));
+        }
+
+        // --- (String,int) shape on the matching construct() wrapper, across the
+        //     accepted string spellings (std::string + const char* lvalue). The
+        //     string_view spelling is NOT used here: construct(std::string,...)
+        //     rejects string_view (explicit ctor — Section B(8)), and routing it
+        //     through make_unique would still be a valid CALL (the JNI descriptor
+        //     path accepts string_view) but would take the "no matching
+        //     construct()" branch; we cover that distinct routing below. ---
+        {
+            const char* cstr{ "c-mix" };
+            check("E_string_int_ctor_stdstring",
+                  make_unique_is_null_and_safe<string_int_ctor_wrapper>(std::string{ "mix" }, 55));
+            check("E_string_int_ctor_cstring_lvalue",
+                  make_unique_is_null_and_safe<string_int_ctor_wrapper>(cstr, 55));
+            // string_view arg: VALID make_unique call (descriptor path accepts it)
+            // but selects the no-construct branch on the fallback. Still null.
+            check("E_string_int_ctor_string_view_no_construct_branch",
+                  make_unique_is_null_and_safe<string_int_ctor_wrapper>(std::string_view{ "sv" }, 55));
+        }
+
+        // --- OBJECT-reference args with NON-NULL sentinel handles.  A by-value
+        //     object_base wrapper and a non-null unique_ptr<wrapper> both route
+        //     through the object-handle arm (append_jni_arg re-homes the OOP into
+        //     object_handles).  With no JVM the thread guard still wins -> null,
+        //     no-throw, and crucially nothing dereferences the sentinel OOP. ---
+        {
+            object_arg_wrapper obj_sentinel{
+                reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0x1234ABCD)) };
+            check("E_arg_object_by_value_nonnull_sentinel",
+                  make_unique_is_null_and_safe<plain_wrapper>(obj_sentinel));
+
+            // A NON-NULL unique_ptr<wrapper> built over a sentinel oop. We use
+            // release() after the call to avoid std::default_delete invoking the
+            // virtual destructor on a fake (non-heap) pointer.
+            std::unique_ptr<object_arg_wrapper> up_sentinel{
+                std::make_unique<object_arg_wrapper>(
+                    reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0x5678BEEF))) };
+            check("E_arg_unique_ptr_nonnull_sentinel_rvalue",
+                  make_unique_is_null_and_safe<plain_wrapper>(std::move(up_sentinel)));
+
+            // A const unique_ptr<wrapper> LVALUE arg (forwarded as const lvalue):
+            // is_unique_ptr_v strips the cv-ref so it is still recognised as a
+            // unique_ptr object arg. Built over null so destruction is a no-op.
+            const std::unique_ptr<object_arg_wrapper> up_const_null{
+                reinterpret_cast<object_arg_wrapper*>(0) };
+            check("E_arg_unique_ptr_const_lvalue",
+                  make_unique_is_null_and_safe<plain_wrapper>(up_const_null));
+        }
+
+        // --- a multi-OBJECT-arg pack (two object handles in one <init>): the
+        //     object-handle re-home loop runs twice; still null + no-throw. ---
+        {
+            object_arg_wrapper o1{ reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0xA1)) };
+            object_arg_wrapper o2{ reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0xB2)) };
+            check("E_two_object_args",
+                  make_unique_is_null_and_safe<plain_wrapper>(o1, o2));
+            // object arg interleaved with primitives + string.
+            check("E_mixed_object_primitive_string",
+                  make_unique_is_null_and_safe<plain_wrapper>(o1, 42, std::string{ "s" }, 3.5));
+        }
+
+        // --- higher arities (6..8 args) to exercise the fold past the small
+        //     cases, every category + the new primitive types present. ---
+        {
+            int a{ 1 };
+            const int b{ 2 };
+            std::string s{ "p" };
+            check("E_six_args",
+                  make_unique_is_null_and_safe<plain_wrapper>(
+                      true, std::int8_t{ 3 }, std::int16_t{ 4 }, a, std::int64_t{ 5 }, 6.0f));
+            check("E_seven_args",
+                  make_unique_is_null_and_safe<plain_wrapper>(
+                      a, b, std::uint16_t{ 7 }, std::int64_t{ 8 }, 9.0f, 10.0, std::move(s)));
+            std::string s2{ "q" };
+            check("E_eight_args_all_categories",
+                  make_unique_is_null_and_safe<plain_wrapper>(
+                      false, std::uint8_t{ 1 }, std::int16_t{ -2 }, std::uint16_t{ 3 },
+                      a, std::int64_t{ 0x7FFFFFFFFFFFFFFFLL }, 4.5, std::move(s2)));
+        }
     }
 
     // =====================================================================
@@ -705,6 +1227,123 @@ int main()
         std::unique_ptr<plain_wrapper> rel{ vmhook::make_unique<plain_wrapper>() };
         plain_wrapper* raw{ rel.release() };
         check("F_release_null_pointer", raw == nullptr && rel == nullptr);
+    }
+
+    // =====================================================================
+    // SECTION G — WRAP-AN-OOP ROUND-TRIP (the no-JVM analogue of the factory's
+    // success path).  make_unique's success path ends in std::make_unique<W>(oop)
+    // (the JNI path returns exactly that; the TLAB path does the same before
+    // construct()).  Without a JVM we can still drive that EXACT construction
+    // ourselves over any oop bit-pattern and prove it is fault-free and that the
+    // produced wrapper reports the oop verbatim via object_base::get_instance() —
+    // i.e. the wrapper is a faithful, sane handle for whatever OOP the factory
+    // would have decoded.  get_instance() only RETURNS the stored void*; it never
+    // dereferences it, so a sentinel/non-canonical value is safe to use here.
+    // =====================================================================
+    {
+        bool threw{ false };
+
+        // Null oop -> sane default state: get_instance() == nullptr, no fault.
+        check("G_wrap_null_oop_roundtrips",
+              wrap_oop_roundtrips<plain_wrapper>(nullptr, threw) && !threw);
+        check("G_wrap_null_oop_no_throw", !threw);
+
+        // A handful of sentinel (non-null, NON-dereferenced) oop bit-patterns:
+        // each must be reported verbatim by get_instance().  Values chosen to
+        // cover low, mid, high, and all-ones pointer patterns; all are pure
+        // pointer bookkeeping (never read), so this is endianness/word-size safe.
+        const std::uintptr_t patterns[]{
+            std::uintptr_t{ 0x8 },
+            std::uintptr_t{ 0x1000 },
+            std::uintptr_t{ 0xABCD1234 },
+            static_cast<std::uintptr_t>(0xDEADBEEFu),
+            ~std::uintptr_t{ 0 },        // all-ones
+            std::uintptr_t{ 0x7FFFFFF8 } // large, 8-aligned
+        };
+        bool all_roundtrip{ true };
+        bool any_threw{ false };
+        for (const std::uintptr_t pat : patterns)
+        {
+            bool t{ false };
+            const auto oop{ reinterpret_cast<vmhook::oop_t>(pat) };
+            if (!wrap_oop_roundtrips<plain_wrapper>(oop, t)) { all_roundtrip = false; }
+            if (t) { any_threw = true; }
+        }
+        check("G_wrap_sentinel_oops_roundtrip", all_roundtrip);
+        check("G_wrap_sentinel_oops_no_throw", !any_threw);
+
+        // The round-trip holds for EVERY wrapper variant (the W(oop) ctor + the
+        // ownership + get_instance() contract is uniform across wrapper shapes).
+        const auto sentinel{ reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0xC0DE)) };
+        bool t2{ false };
+        check("G_wrap_ctor_wrapper",        wrap_oop_roundtrips<ctor_wrapper>(sentinel, t2) && !t2);
+        check("G_wrap_bool_ctor_wrapper",   wrap_oop_roundtrips<bool_ctor_wrapper>(sentinel, t2) && !t2);
+        check("G_wrap_noarg_ctor_wrapper",  wrap_oop_roundtrips<noarg_ctor_wrapper>(sentinel, t2) && !t2);
+        check("G_wrap_object_arg_wrapper",  wrap_oop_roundtrips<object_arg_wrapper>(sentinel, t2) && !t2);
+        check("G_wrap_ijd_ctor_wrapper",    wrap_oop_roundtrips<ijd_ctor_wrapper>(sentinel, t2) && !t2);
+    }
+
+    // =====================================================================
+    // SECTION G2 — WRAPPER VALUE SEMANTICS over a null oop (the object_base the
+    // factory's unique_ptr points at).  object_base defines copy (shares the OOP),
+    // move (transfers + nulls the source), and the corresponding assignments;
+    // make_unique hands out a unique_ptr<W>, but W ITSELF is a value type whose
+    // semantics matter when callers deref the pointer.  Pin them over a null/
+    // sentinel oop (no JVM, no deref): copy duplicates the OOP, move nulls the
+    // source, and every wrapper is the move-friendly handle the factory promises.
+    // =====================================================================
+    {
+        // Compile-time wrapper trait gates (what callers of the factory result
+        // can rely on): the wrapper is move-constructible/assignable and copy is
+        // available (object_base provides all four), and the move ops are noexcept.
+        static_assert(std::is_nothrow_move_constructible_v<plain_wrapper>,
+                      "wrapper move-ctor must be noexcept (object_base contract)");
+        static_assert(std::is_nothrow_move_assignable_v<plain_wrapper>,
+                      "wrapper move-assign must be noexcept (object_base contract)");
+        static_assert(std::is_copy_constructible_v<plain_wrapper>);
+        static_assert(std::is_copy_assignable_v<plain_wrapper>);
+        // The wrapper is constructible from a single oop and that ctor is explicit
+        // (guards against an accidental implicit oop_t -> wrapper conversion).
+        static_assert(std::is_constructible_v<plain_wrapper, vmhook::oop_t>);
+        static_assert(!std::is_convertible_v<vmhook::oop_t, plain_wrapper>,
+                      "oop_t -> wrapper must be EXPLICIT only");
+
+        const auto sentinel{ reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0xFEED)) };
+        bool threw{ false };
+        try
+        {
+            // Copy SHARES the OOP (both report the same instance).
+            plain_wrapper a{ sentinel };
+            plain_wrapper b{ a };
+            check("G2_copy_shares_oop",
+                  a.get_instance() == sentinel && b.get_instance() == sentinel);
+
+            // Move TRANSFERS the OOP and NULLS the source (object_base move ctor).
+            plain_wrapper c{ std::move(a) };
+            check("G2_move_transfers_oop_and_nulls_source",
+                  c.get_instance() == sentinel && a.get_instance() == nullptr);
+
+            // Move ASSIGNMENT: same transfer-and-null contract.
+            plain_wrapper d{ nullptr };
+            d = std::move(c);
+            check("G2_move_assign_transfers_and_nulls",
+                  d.get_instance() == sentinel && c.get_instance() == nullptr);
+
+            // Copy ASSIGNMENT shares the OOP.
+            plain_wrapper e{ nullptr };
+            e = d;
+            check("G2_copy_assign_shares_oop",
+                  e.get_instance() == sentinel && d.get_instance() == sentinel);
+
+            // A default/null-constructed wrapper reports a null instance.
+            plain_wrapper z{ nullptr };
+            check("G2_null_constructed_instance_is_null", z.get_instance() == nullptr);
+        }
+        catch (...)
+        {
+            threw = true;
+        }
+        check("G2_wrapper_value_semantics_no_throw", !threw);
     }
 
     return failures == 0 ? 0 : 1;
