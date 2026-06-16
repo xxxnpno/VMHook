@@ -39,6 +39,7 @@ the hook.
 ## Depended on by
 
 - [[features/deoptimize_methods|deoptimize_methods]]
+- [[features/hook_basic|hook_basic]]
 - [[features/hook_install_after_jit|hook_install_after_jit]]
 
 ## Implementation anchors

@@ -19,7 +19,7 @@ tags: [category/infra]
 - [[features/traits_function_traits|traits_function_traits]] — `seeded` / `medium` — Traits Function Traits
 - [[features/unified_call_syntax|unified_call_syntax]] — `seeded` / `medium` — Unified Call Syntax
 - [[features/version_macros|version_macros]] — `seeded` / `medium` — Version Macros
-- [[features/wrapper_pattern|wrapper_pattern]] — `seeded` / `medium` — Wrapper Pattern
+- [[features/wrapper_pattern|wrapper_pattern]] — `in_progress` / `high` — Wrapper Pattern
 
 ## Dependency graph
 
@@ -37,10 +37,16 @@ flowchart LR
     wrapper_pattern([wrapper_pattern])
   end
   subgraph external["(external deps)"]
+    decode_oop_and_pointers[/decode_oop_and_pointers/]
+    global_ref[/global_ref/]
+    jni_local_ref_hygiene[/jni_local_ref_hygiene/]
     klass_introspection[/klass_introspection/]
     method_overload[/method_overload/]
   end
   decode_u5_unsigned5 --> klass_introspection
   make_unique --> wrapper_pattern
   unified_call_syntax --> method_overload
+  wrapper_pattern --> decode_oop_and_pointers
+  wrapper_pattern --> global_ref
+  wrapper_pattern --> jni_local_ref_hygiene
 ```

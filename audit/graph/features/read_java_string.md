@@ -23,6 +23,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 ## Depended on by
 
 - [[features/field_string|field_string]]
+- [[features/make_java_string|make_java_string]]
 - [[features/method_call_string|method_call_string]]
 
 ## Tests

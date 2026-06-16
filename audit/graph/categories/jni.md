@@ -15,7 +15,7 @@ tags: [category/jni]
 - [[features/jni_arg_packing|jni_arg_packing]] — `seeded` / `medium` — Jni Arg Packing
 - [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]] — `seeded` / `medium` — Jni Local Ref Hygiene
 - [[features/make_java_array|make_java_array]] — `seeded` / `medium` — Make Java Array
-- [[features/make_java_string|make_java_string]] — `seeded` / `medium` — Make Java String
+- [[features/make_java_string|make_java_string]] — `in_progress` / `medium` — Make Java String
 - [[features/read_java_string|read_java_string]] — `seeded` / `medium` — Read Java String
 
 ## Dependency graph
@@ -37,6 +37,7 @@ flowchart LR
   global_ref --> jni_local_ref_hygiene
   jni_arg_packing --> signature_parsing
   make_java_array --> jni_arg_packing
+  make_java_string --> read_java_string
   make_java_string --> jni_local_ref_hygiene
   read_java_string --> compressed_oops_decode
 ```

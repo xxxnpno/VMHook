@@ -2,12 +2,33 @@ schema_version: 1
 slug: wrapper_pattern
 title: Wrapper Pattern
 category: infra
-status: seeded
-risk: medium
+status: in_progress
+risk: high
 specialist: .claude/agents/wrapper_pattern-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  The CRTP base every typed Java-object wrapper inherits: `object_base` (the
+  non-template base holding the raw decoded OOP) and `object<derived>` (the
+  CRTP template that exposes static accessors via `typeid(derived)`). A
+  wrapper instance is constructed from a live decoded oop_type_t (validated
+  with is_valid_pointer at the supported value_t -> unique_ptr<wrapper>
+  decode sites) and stored as a bare pointer in `instance` — NOT a JNI
+  global ref, so it does not survive a relocating GC; lifetime is the
+  detour / read window. `get_field`/`get_method` dispatch on a STATIC bit
+  read from InstanceKlass._fields and on `static_method_only()`, so a
+  single call site transparently reaches instance fields (instance+offset)
+  vs static fields (java.lang.Class mirror + offset); method resolution
+  walks the super chain and then the implemented-interface chain for
+  default methods. The dynamic klass is resolved via `typeid(*this)` (or
+  `typeid(derived)` on the static fallbacks) through `type_to_class_map`,
+  so the wrapper MUST have been registered with `register_class<W>()`
+  first or every accessor returns nullopt. Copy aliases the same OOP (no
+  refcount); move transfers and nulls the source. Portable
+  `static_field`/`static_method` accessors exist on every compiler; on GCC
+  callers MUST use them from a static context because the deducing-this
+  `get_field`/`get_method` overloads are still considered there. Blast
+  radius is high: field_proxy, method_proxy, enum singletons, collections,
+  and effectively every typed accessor reach the live JVM THROUGH a
+  wrapper.
 java_versions:
 - 8
 - 11
@@ -16,13 +37,87 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags:
+- wrapper
+- template
+- crtp
+- object-ref
+- gc-survival
+- type-map
+- dispatch
+- name-hiding
+- deducing-this
+hpp_anchors:
+  - symbol: "vmhook::object_base"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [17635, 18084]
+    note: "non-template base: ctor from oop_type_t (default nullptr) at 17643; copy = raw OOP alias, move transfers + nulls source (17656-17685); get_instance() returns the bare decoded pointer (17690-17694); instance get_field dispatches on entry->is_static (mirror at 17742-17752, instance at 17761-17762)"
+  - symbol: "vmhook::object_base::get_method (instance + name+signature + static type_index overloads)"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [17838, 18084]
+    note: "name-only walks super chain then interface-default fallback (17850-17887); name+signature pinned variant (17903-17958); static overloads gate on static_method_only() and build a proxy with null receiver (17973-18084); unknown name/signature -> nullopt with VMHOOK_LOG"
+  - symbol: "vmhook::object_base::resolve_klass (instance + type_index)"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [18092, 18138]
+    note: "instance path uses typeid(*this) (dynamic type, 18104); static path looks up type_to_class_map then vmhook::find_class (18124-18137) — this is the registration gate; an unregistered wrapper logs and returns nullptr so every accessor cascades to nullopt"
+  - symbol: "vmhook::object<derived> (CRTP template)"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [18602, 18712]
+    note: "inherits base ctors (18605); VMHOOK_HAS_DEDUCING_THIS gates the instance get_field/get_method overloads (18627-18644) and the static_view fallbacks (18666-18684); portable static_field / static_method always available (18689-18711) — use these from a static wrapper method on every compiler (GCC notes at 18619-18625)"
+  - symbol: "field_proxy::value_t -> unique_ptr<wrapper> (the supported wrapper-build site)"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [9820, 9860]
+    note: "decode_oop validated with is_valid_pointer before constructing the wrapper; field_proxy::set reaches the wrapped OOP via the base-qualified `value->vmhook::object_base::get_instance()` (9846-9850) — the library's OWN name-hiding workaround a wrapper author needs when a `static get_instance()` (e.g. enum singleton) shadows the inherited accessor"
 test_modules:
 - tests/jvm/modules/wrapper_pattern.cpp
-depends_on: []
+depends_on:
+- decode_oop_and_pointers
+- global_ref
+- jni_local_ref_hygiene
 related: []
 audit_docs: []
-known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+known_bugs:
+  - severity: low
+    note: "Instance get_field does not validate a non-null instance OOP. vmhook.hpp:17755-17762: the static branch validates the mirror with is_valid_pointer (17744), but the instance branch only null-checks `this->instance` and returns a field_proxy at `instance + offset` with no `is_valid_pointer(this->instance)` guard. A wrapper hand-constructed from a stale / garbage non-null OOP yields a proxy aliasing arbitrary memory; subsequent get()/set() reads or WRITES there. Masked in normal use because the supported build sites (value_t -> unique_ptr<wrapper>) validate before wrapping. Fix: symmetric is_valid_pointer(this->instance) before computing field_pointer. Pinned by the SAFE contract in tests/jvm/modules/wrapper_pattern.cpp gating every wrapped-OOP deref through is_valid_pointer (the *_oop_valid / safe-style assertions)."
+  - severity: low
+    note: "object_base defines no operator== and no hashing. Two wrappers naming the same Java object are not value-comparable; identity is only recoverable as raw-OOP equality (`a.get_instance() == b.get_instance()`). Makes wrappers awkward as map keys / set members and means equality is non-obvious — and the OOP is a bare decoded pointer (not a stable GC handle) so it is only meaningful within the detour / read window. Characterized as an [INFO] line plus the raw-OOP identity battery (`equality_same_instance_same_oop`, `equality_distinct_instances_differ`, `equality_alias_static_same_oop_as_instance`)."
+  - severity: low
+    note: "Mixed identity basis between instance and static resolution. The instance path resolves via typeid(*this) (dynamic type, vmhook.hpp:18104) while the static fallbacks use typeid(derived) (the CRTP parameter, e.g. 18670 / 18692). For correct CRTP (`class W : object<W>`) they agree; a misuse where the dynamic type differs from the CRTP parameter (e.g. `class D : object<Base>`) would resolve two different klasses from the two accessor families with no diagnostic. A misuse rather than a defect, but worth a note for deep wrapper hierarchies."
+  - severity: medium
+    note: "WRAPPER OOP DOES NOT SURVIVE A RELOCATING GC (no GC handle). `instance` is a bare decoded pointer (vmhook.hpp:18090); a wrapper held across a forced System.gc() may have its underlying oop relocated and the raw pointer becomes either stale-mapped or unmapped. After the harness GC-survival fix at 6d8f013 the wrapper_pattern module's mode-1 (forced System.gc() twice) is GUARDED: section 17 stops the auto-repair watchdog BEFORE the GC and os::safe_read-gates every post-GC oop-header read (the watchdog re-derefs stale Method* between 1000ms polls and otherwise tears the JVM on no-SEH toolchains). The previous unguarded form crashed MSVC. Lib follow-up: real GC survival would need a global_ref wrapping (project/global_ref) — currently INFO-gated in the module as `[INFO] wrapper_oop_post_gc_safely_readable={0|1}` rather than asserted."
+  - severity: low
+    note: "Name-hiding footgun, not a bug but a wrapper-author trap. A static member declared on a wrapper with the same name as an inherited accessor (the classic case: `static W& get_instance()` returning the singleton) HIDES `object_base::get_instance()`. An unqualified `w.get_instance()` then names the static, not the inherited raw-OOP accessor; reading the wrapped OOP requires the base-qualified `w.vmhook::object_base::get_instance()`. This is exactly what the library does at vmhook.hpp:9850 (`value->vmhook::object_base::get_instance()` inside field_proxy::set). The wrapper_pattern module pins the contract with `name_hiding_static_shadow_returns_wrapper` and `name_hiding_shadow_oop_equals_base_qualified_oop`."
+notes: |
+  Construction contract: the supported way to obtain a valid wrapper is
+  `static_field("instance")->get()` (or a method_proxy value_t) returning
+  `std::unique_ptr<W>`; the decoder validates with is_valid_pointer before
+  `new W{decoded}`. A default-constructed wrapper (`W{}`) holds a nullptr
+  OOP — static_field / static_method / get_method on it still resolve
+  through the mirror / klass, but instance get_field returns nullopt.
+
+  Portability discipline: instance methods use `get_field` / `get_method`;
+  static wrapper methods MUST use the portable `static_field` /
+  `static_method` (vmhook.hpp:18689-18711). On GCC the deducing-this
+  overloads (gated by VMHOOK_HAS_DEDUCING_THIS) are still considered from
+  a static-call context and error; MSVC/Clang correctly drop them and
+  fall through to the string_view static fallback. The header documents
+  this at 18619-18625.
+
+  GC-survival caveat (see known_bugs medium entry): wrappers are NOT
+  pinned. The 6d8f013 fix guards the wrapper_pattern test module's mode-1
+  forced-GC section by stopping the auto-repair watchdog and
+  os::safe_read-gating every post-GC oop-header read; the underlying
+  lifetime gap remains. Callers needing GC survival must wrap through
+  global_ref / jni_local_ref_hygiene.
+
+  Test module covers ~104 ctx.check assertions across: registration +
+  resolution; live-OOP construction with the name-hiding proof;
+  instance + static field dispatch for every primitive + String; null-OOP
+  wrapper edge case; instance vs static method dispatch with
+  is_static()/name()/signature() parity; overload resolution by
+  name+signature; value semantics (copy alias, move transfer + null);
+  raw-OOP equality; type-registry gate (unregistered wrapper -> nullopt
+  everywhere, no crash); and live post-dispatch state inside a
+  scoped_hook detour (self wrapper non-null + OOP-matches instance,
+  in-detour method_proxy::call gated [INFO], post-putfield aliasing of
+  the live heap).

@@ -4,13 +4,13 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 - **Features:** 109
 - **Categories:** 13
-- **`depends_on` edges:** 198
+- **`depends_on` edges:** 213
 
 ## Status
 
 - `queued`: 0
-- `seeded`: 74
-- `in_progress`: 35
+- `seeded`: 71
+- `in_progress`: 38
 - `audited`: 0
 - `perfected`: 0
 
@@ -31,7 +31,7 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]] — `seeded` / `medium` — Hook Reinstall After Shutdown
 - [[features/hook_signature|hook_signature]] — `seeded` / `medium` — Hook Signature
 - [[features/hook_unhook_double_free|hook_unhook_double_free]] — `seeded` / `medium` — Hook Unhook Double Free
-- [[features/hook_verify_repair|hook_verify_repair]] — `seeded` / `medium` — Hook Verify Repair
+- [[features/hook_verify_repair|hook_verify_repair]] — `in_progress` / `critical` — Hook Verify Repair
 - [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]] — `seeded` / `medium` — Method Entry Points I2I I2C
 - [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]] — `seeded` / `medium` — Midi2I Trampoline Alloc
 - [[features/seh_invoke_detour|seh_invoke_detour]] — `seeded` / `medium` — Seh Invoke Detour
@@ -125,7 +125,7 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/jni_arg_packing|jni_arg_packing]] — `seeded` / `medium` — Jni Arg Packing
 - [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]] — `seeded` / `medium` — Jni Local Ref Hygiene
 - [[features/make_java_array|make_java_array]] — `seeded` / `medium` — Make Java Array
-- [[features/make_java_string|make_java_string]] — `seeded` / `medium` — Make Java String
+- [[features/make_java_string|make_java_string]] — `in_progress` / `medium` — Make Java String
 - [[features/read_java_string|read_java_string]] — `seeded` / `medium` — Read Java String
 
 ### [[categories/enumeration|Live-VM enumeration (heap / classes / threads)]] · 4 feature(s)
@@ -162,4 +162,4 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/traits_function_traits|traits_function_traits]] — `seeded` / `medium` — Traits Function Traits
 - [[features/unified_call_syntax|unified_call_syntax]] — `seeded` / `medium` — Unified Call Syntax
 - [[features/version_macros|version_macros]] — `seeded` / `medium` — Version Macros
-- [[features/wrapper_pattern|wrapper_pattern]] — `seeded` / `medium` — Wrapper Pattern
+- [[features/wrapper_pattern|wrapper_pattern]] — `in_progress` / `high` — Wrapper Pattern

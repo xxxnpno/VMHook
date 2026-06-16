@@ -24,6 +24,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/make_java_string|make_java_string]]
 
+## Depended on by
+
+- [[features/wrapper_pattern|wrapper_pattern]]
+
 ## Tests
 
 - `tests/jvm/modules/global_ref.cpp`

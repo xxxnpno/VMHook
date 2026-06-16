@@ -34,6 +34,7 @@ means MSVC __try/__except contains EXCEPTION_ACCESS_VIOLATION on unreadable cold
 
 ## Depended on by
 
+- [[features/hook_basic|hook_basic]]
 - [[features/hook_install_after_jit|hook_install_after_jit]]
 
 ## Implementation anchors

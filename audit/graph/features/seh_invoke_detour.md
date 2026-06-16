@@ -22,7 +22,9 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Depended on by
 
+- [[features/hook_basic|hook_basic]]
 - [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]]
+- [[features/hook_verify_repair|hook_verify_repair]]
 
 ## Notes
 

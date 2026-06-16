@@ -20,7 +20,7 @@ tags: [category/hook]
 - [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]] — `seeded` / `medium` — Hook Reinstall After Shutdown
 - [[features/hook_signature|hook_signature]] — `seeded` / `medium` — Hook Signature
 - [[features/hook_unhook_double_free|hook_unhook_double_free]] — `seeded` / `medium` — Hook Unhook Double Free
-- [[features/hook_verify_repair|hook_verify_repair]] — `seeded` / `medium` — Hook Verify Repair
+- [[features/hook_verify_repair|hook_verify_repair]] — `in_progress` / `critical` — Hook Verify Repair
 - [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]] — `seeded` / `medium` — Method Entry Points I2I I2C
 - [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]] — `seeded` / `medium` — Midi2I Trampoline Alloc
 - [[features/seh_invoke_detour|seh_invoke_detour]] — `seeded` / `medium` — Seh Invoke Detour
@@ -56,6 +56,7 @@ flowchart LR
     os_page_size_granularity[/os_page_size_granularity/]
     os_protect[/os_protect/]
     os_query_region[/os_query_region/]
+    os_safe_read[/os_safe_read/]
     os_signal_handler[/os_signal_handler/]
     shutdown_hooks_teardown[/shutdown_hooks_teardown/]
     signature_parsing[/signature_parsing/]
@@ -70,11 +71,17 @@ flowchart LR
   hook_basic --> midi2i_trampoline_alloc
   hook_basic --> hook_common_detour_dispatch
   hook_basic --> method_entry_points_i2i_i2c
+  hook_basic --> seh_invoke_detour
   hook_basic --> find_class_fallback
   hook_basic --> klass_introspection
   hook_basic --> decode_oop_and_pointers
   hook_basic --> interpreter_frame_walk
   hook_basic --> signature_parsing
+  hook_basic --> vmstructs_offset_resolution
+  hook_basic --> adapter_recovery_c2i
+  hook_basic --> deoptimize_methods
+  hook_basic --> os_protect
+  hook_basic --> os_safe_read
   hook_chaining --> hook_basic
   hook_chaining --> midi2i_trampoline_alloc
   hook_chaining --> hook_common_detour_dispatch
@@ -94,6 +101,11 @@ flowchart LR
   hook_unhook_double_free --> shutdown_hooks_teardown
   hook_verify_repair --> hook_basic
   hook_verify_repair --> midi2i_trampoline_alloc
+  hook_verify_repair --> os_safe_read
+  hook_verify_repair --> os_protect
+  hook_verify_repair --> vmstructs_offset_resolution
+  hook_verify_repair --> seh_invoke_detour
+  hook_verify_repair --> dont_inline_dont_compile
   method_entry_points_i2i_i2c --> vmstructs_offset_resolution
   midi2i_trampoline_alloc --> os_allocate_release
   midi2i_trampoline_alloc --> os_protect

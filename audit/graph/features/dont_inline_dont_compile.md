@@ -39,6 +39,10 @@ enforced.
 - [[features/hook_unhook_double_free|hook_unhook_double_free]]
 - [[features/hook_verify_repair|hook_verify_repair]]
 
+## Depended on by
+
+- [[features/hook_verify_repair|hook_verify_repair]]
+
 ## Implementation anchors
 
 - `vmhook::hotspot::set_dont_inline(method*, bool)` — `vmhook/ext/vmhook/vmhook.hpp:7474-7535` — fault-safe set/clear of Method::_flags bit 2 (_dont_inline) with width-aware read-modify-write; called on install at 10128 and teardown at 10995

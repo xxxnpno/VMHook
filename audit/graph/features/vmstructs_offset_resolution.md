@@ -33,6 +33,8 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/deoptimize_methods|deoptimize_methods]]
 - [[features/field_introspection|field_introspection]]
 - [[features/find_class_fallback|find_class_fallback]]
+- [[features/hook_basic|hook_basic]]
+- [[features/hook_verify_repair|hook_verify_repair]]
 - [[features/instanceklass_methods_walk|instanceklass_methods_walk]]
 - [[features/klass_introspection|klass_introspection]]
 - [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]]

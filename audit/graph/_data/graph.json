@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-06-16T10:46:43Z",
+  "generated_at": "2026-06-16T10:52:36Z",
   "feature_count": 109,
-  "edge_count": 500,
+  "edge_count": 501,
   "categories": [
     {
       "slug": "bootstrap",
@@ -1716,32 +1716,38 @@
         "midi2i_trampoline_alloc",
         "hook_common_detour_dispatch",
         "method_entry_points_i2i_i2c",
+        "seh_invoke_detour",
         "find_class_fallback",
         "klass_introspection",
         "decode_oop_and_pointers",
         "interpreter_frame_walk",
-        "signature_parsing"
+        "signature_parsing",
+        "vmstructs_offset_resolution",
+        "adapter_recovery_c2i",
+        "deoptimize_methods",
+        "os_protect",
+        "os_safe_read"
       ],
-      "related": [
-        "hook_chaining",
-        "hook_signature",
-        "hook_install_after_jit",
-        "hook_verify_repair",
-        "dont_inline_dont_compile",
-        "return_value_cancel",
-        "return_set_primitives"
-      ],
+      "related": [],
       "tags": [
         "hook",
         "runtime",
+        "install",
+        "i2i-stub",
+        "trampoline",
+        "critical-path",
         "x86_64",
-        "install"
+        "interpreter-dispatch",
+        "deopt",
+        "raii"
       ],
       "test_modules": [
         "tests/jvm/modules/hook_basic.cpp"
       ],
       "audit_docs": [
-        "audit/findings/hook_basic_install.md"
+        "audit/findings/hook_basic_install.md",
+        "audit/LIBRARY_BUGS.md",
+        "audit/NO_SEH_COLDREAD_HARDENING.md"
       ],
       "java_versions": [
         8,
@@ -1961,22 +1967,31 @@
       "slug": "hook_verify_repair",
       "title": "Hook Verify Repair",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "critical",
       "specialist": ".claude/agents/hook_verify_repair-specialist.md",
       "depends_on": [
         "hook_basic",
-        "midi2i_trampoline_alloc"
+        "midi2i_trampoline_alloc",
+        "os_safe_read",
+        "os_protect",
+        "vmstructs_offset_resolution",
+        "seh_invoke_detour",
+        "dont_inline_dont_compile"
       ],
-      "related": [
-        "hook_chaining",
-        "dont_inline_dont_compile",
-        "hook_basic",
-        "hook_install_after_jit",
-        "hook_reinstall_after_shutdown",
-        "hook_signature"
+      "related": [],
+      "tags": [
+        "watchdog",
+        "drift-detection",
+        "auto-repair",
+        "safe_read",
+        "safe_write",
+        "cold-fault",
+        "jit-drift",
+        "detached-thread",
+        "no-throw",
+        "safety-net"
       ],
-      "tags": [],
       "test_modules": [
         "tests/jvm/modules/hook_verify_repair.cpp"
       ],
@@ -2261,16 +2276,26 @@
       "slug": "make_java_string",
       "title": "Make Java String",
       "category": "jni",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/make_java_string-specialist.md",
       "depends_on": [
+        "read_java_string",
         "jni_local_ref_hygiene"
       ],
-      "related": [
-        "global_ref"
+      "related": [],
+      "tags": [
+        "jni",
+        "string",
+        "utf-16",
+        "utf-8",
+        "coder",
+        "latin1",
+        "compact-strings",
+        "tlab",
+        "allocation",
+        "jdk8-classic"
       ],
-      "tags": [],
       "test_modules": [
         "tests/jvm/modules/make_java_string.cpp"
       ],
@@ -3670,12 +3695,26 @@
       "slug": "wrapper_pattern",
       "title": "Wrapper Pattern",
       "category": "infra",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/wrapper_pattern-specialist.md",
-      "depends_on": [],
+      "depends_on": [
+        "decode_oop_and_pointers",
+        "global_ref",
+        "jni_local_ref_hygiene"
+      ],
       "related": [],
-      "tags": [],
+      "tags": [
+        "wrapper",
+        "template",
+        "crtp",
+        "object-ref",
+        "gc-survival",
+        "type-map",
+        "dispatch",
+        "name-hiding",
+        "deducing-this"
+      ],
       "test_modules": [
         "tests/jvm/modules/wrapper_pattern.cpp"
       ],
@@ -4849,6 +4888,11 @@
     },
     {
       "from": "hook_basic",
+      "to": "seh_invoke_detour",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_basic",
       "to": "find_class_fallback",
       "kind": "depends_on"
     },
@@ -4874,38 +4918,28 @@
     },
     {
       "from": "hook_basic",
-      "to": "hook_chaining",
-      "kind": "related"
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
     },
     {
       "from": "hook_basic",
-      "to": "hook_signature",
-      "kind": "related"
+      "to": "adapter_recovery_c2i",
+      "kind": "depends_on"
     },
     {
       "from": "hook_basic",
-      "to": "hook_install_after_jit",
-      "kind": "related"
+      "to": "deoptimize_methods",
+      "kind": "depends_on"
     },
     {
       "from": "hook_basic",
-      "to": "hook_verify_repair",
-      "kind": "related"
+      "to": "os_protect",
+      "kind": "depends_on"
     },
     {
       "from": "hook_basic",
-      "to": "dont_inline_dont_compile",
-      "kind": "related"
-    },
-    {
-      "from": "hook_basic",
-      "to": "return_value_cancel",
-      "kind": "related"
-    },
-    {
-      "from": "hook_basic",
-      "to": "return_set_primitives",
-      "kind": "related"
+      "to": "os_safe_read",
+      "kind": "depends_on"
     },
     {
       "from": "hook_chaining",
@@ -5169,33 +5203,28 @@
     },
     {
       "from": "hook_verify_repair",
-      "to": "hook_chaining",
-      "kind": "related"
+      "to": "os_safe_read",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_verify_repair",
+      "to": "os_protect",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_verify_repair",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_verify_repair",
+      "to": "seh_invoke_detour",
+      "kind": "depends_on"
     },
     {
       "from": "hook_verify_repair",
       "to": "dont_inline_dont_compile",
-      "kind": "related"
-    },
-    {
-      "from": "hook_verify_repair",
-      "to": "hook_basic",
-      "kind": "related"
-    },
-    {
-      "from": "hook_verify_repair",
-      "to": "hook_install_after_jit",
-      "kind": "related"
-    },
-    {
-      "from": "hook_verify_repair",
-      "to": "hook_reinstall_after_shutdown",
-      "kind": "related"
-    },
-    {
-      "from": "hook_verify_repair",
-      "to": "hook_signature",
-      "kind": "related"
+      "kind": "depends_on"
     },
     {
       "from": "instanceklass_methods_walk",
@@ -5304,13 +5333,13 @@
     },
     {
       "from": "make_java_string",
-      "to": "jni_local_ref_hygiene",
+      "to": "read_java_string",
       "kind": "depends_on"
     },
     {
       "from": "make_java_string",
-      "to": "global_ref",
-      "kind": "related"
+      "to": "jni_local_ref_hygiene",
+      "kind": "depends_on"
     },
     {
       "from": "make_unique",
@@ -6190,6 +6219,21 @@
     {
       "from": "watch_static_field",
       "to": "hw_breakpoint_dr7",
+      "kind": "depends_on"
+    },
+    {
+      "from": "wrapper_pattern",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "wrapper_pattern",
+      "to": "global_ref",
+      "kind": "depends_on"
+    },
+    {
+      "from": "wrapper_pattern",
+      "to": "jni_local_ref_hygiene",
       "kind": "depends_on"
     }
   ]

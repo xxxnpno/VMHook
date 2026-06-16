@@ -22,6 +22,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/global_ref|global_ref]]
 - [[features/make_java_string|make_java_string]]
 - [[features/method_call_jni_fallback|method_call_jni_fallback]]
+- [[features/wrapper_pattern|wrapper_pattern]]
 
 ## Tests
 
