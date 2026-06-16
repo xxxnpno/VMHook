@@ -12,12 +12,16 @@
 //     specialisations below therefore has no args_tuple_t (a detectable absence
 //     via SFINAE, or — for a present-but-unsupported-qualifier operator() — a
 //     hard error; see the detectability note on has_args_tuple).
-//   * Five specialisations populate `using args_tuple_t = std::tuple<args...>`:
+//   * Eight specialisations populate `using args_tuple_t = std::tuple<args...>`:
 //       1. free-function POINTER       R(*)(args...)
 //       2. std::function               std::function<R(args...)>
-//       3. generic functor (void_t probe on &F::operator(), forwards to 4/5)
+//       3. generic functor (void_t probe on &F::operator(), forwards to 4-8)
 //       4. const member function ptr   R(C::*)(args...) const   (the lambda case)
 //       5. non-const member fn ptr     R(C::*)(args...)         (mutable lambda)
+//       6. noexcept free-fn POINTER    R(*)(args...) noexcept
+//       7. const noexcept member ptr   R(C::*)(args...) const noexcept (noexcept lambda)
+//       8. noexcept member ptr         R(C::*)(args...) noexcept       (mutable noexcept lambda)
+//     Ref-qualified (& / &&), volatile, and C-variadic member forms remain gaps.
 //   * The trait exposes ONLY args_tuple_t.  There is deliberately NO return_type
 //     / result_type / arity member (the detour's return value is delivered out
 //     of band via vmhook::return_value, never read from the callable's type).
@@ -150,8 +154,8 @@ namespace
         int           m_nonconst(long) { return 0; }
         std::string   m_const_ret(char) const { return {}; }
         std::int64_t  m_nonconst_ret(void*) { return 0; }   // two-slot return
-        void          m_const_noexcept(int) const noexcept {}   // never detected
-        void          m_lref_qualified(int) & {}                // never detected
+        void          m_const_noexcept(int) const noexcept {}   // NOW supported (spec 7)
+        void          m_lref_qualified(int) & {}                // gap: & ref-qualifier
     };
 
     // ── Functors with a single concrete operator() (accepted shapes) ─────────
@@ -214,8 +218,8 @@ namespace
         void m_const_volatile(int, double) const volatile {}          // never matched
         void m_rref(int, double) && {}                                 // never matched
         void m_const_lref(int, double) const& {}                       // never matched
-        void m_nonconst_noexcept(long) noexcept {}                     // never matched
-        void m_rref_noexcept(int) && noexcept {}                       // never matched
+        void m_nonconst_noexcept(long) noexcept {}                     // NOW supported (spec 8)
+        void m_rref_noexcept(int) && noexcept {}                       // gap: && ref-qualifier
         // A C-style variadic MEMBER function pointer — the member analogue of the
         // free-fn C-variadic gap.  R(C::*)(args..., ...) const matches no spec.
         void m_cvariadic(int, ...) const {}                            // never matched
@@ -468,13 +472,17 @@ int main()
     //     this is exactly why pass-by-name does not reach the free-fn-ptr spec.
     check("remove_cvref_of_function_reference_is_function_type",
           std::is_same_v<std::remove_cvref_t<void(&)(int, double)>, void(int, double)>);
-    // (d) A noexcept free-function POINTER has a distinct type with no matching
-    //     spec (there is no R(*)(args...) noexcept specialisation) -> absent.
-    //     This is the DETECTABLE face of the noexcept gap; the noexcept-member
-    //     face (m_const_noexcept) is a hard error and is asserted by-construction
-    //     below, never fed to the detector.
-    check("noexcept_free_fn_pointer_has_no_args_tuple",
-          !has_args_tuple<void(*)(int, double) noexcept>::value);
+    // (d) A noexcept free-function POINTER is now a SUPPORTED shape: since C++17
+    //     noexcept is part of the function type, and function_traits has a
+    //     dedicated R(*)(args...) noexcept specialisation (spec 6), so its
+    //     args_tuple_t is present and equals the throwing twin's.  (Pre-fix this
+    //     was the detectable face of the noexcept gap, now closed for
+    //     plain/const noexcept.)
+    check("noexcept_free_fn_pointer_has_args_tuple",
+          has_args_tuple<void(*)(int, double) noexcept>::value);
+    check("noexcept_free_fn_pointer_args_match_throwing_twin",
+          std::is_same_v<args_of<void(*)(int, double) noexcept>,
+                         args_of<void(*)(int, double)>>);
     // (e) A C-style variadic free-function pointer R(*)(args..., ...) is NOT
     //     captured by the R(*)(args...) spec (the trailing ellipsis is part of
     //     the function type and matches no specialisation) -> absent.
@@ -502,33 +510,29 @@ int main()
           !has_args_tuple<int member_host::*>::value);
 
     // ========================================================================
-    // 7.  noexcept does NOT change arity / args for the shapes that DO match.
-    //     The free-function POINTER spec has no noexcept variant, so a noexcept
-    //     pointer is absent (asserted above) — but a noexcept FREE FUNCTION
-    //     reached via &fn where the address yields a plain pointer (compilers
-    //     drop the noexcept from the pointed-to type only in narrow cases) is
-    //     not relied upon.  What we CAN pin without a hard error: a std::function
-    //     wrapping a noexcept-able signature exposes the same args.  (std::function
-    //     itself is never noexcept-typed, so this is the practical guarantee.)
+    // 7.  noexcept does NOT change arity / args for the shapes that match.  Both
+    //     the noexcept and non-noexcept forms now have specialisations, so a
+    //     noexcept free-fn pointer yields the SAME args tuple as its throwing
+    //     twin (asserted above), and a std::function wrapping the same signature
+    //     exposes the same args.  (std::function itself is never noexcept-typed.)
     // ========================================================================
     check("std_function_args_match_with_or_without_throwing_body",
           std::is_same_v<args_of<std::function<void(int, double)>>,
                          std::tuple<int, double>>);
 
     // ========================================================================
-    // 8.  BUILD-BREAKER shapes, asserted BY CONSTRUCTION (never via detector).
-    //     A functor whose operator() is present-and-addressable but carries a
-    //     qualifier the member-pointer specs do not cover (noexcept / lvalue-ref
-    //     qualified) makes the void_t spec select a base that is the undefined
-    //     primary — reading args_tuple_t off it is a hard error, so these must
-    //     NOT be probed.  We instead assert the *shape* of the member pointer
-    //     directly: that its type is exactly the unsupported-qualifier spelling,
-    //     documenting precisely why function_traits cannot introspect it.  (If a
-    //     future header adds noexcept/ref-qualified member specs, these stay
-    //     true and a new positive has_args_tuple check can be added then.)
-    check("member_pointer_const_noexcept_shape_is_unsupported_qualifier",
-          std::is_same_v<decltype(&member_host::m_const_noexcept),
-                         void (member_host::*)(int) const noexcept>);
+    // 8.  noexcept member functions are now SUPPORTED (dedicated const-noexcept
+    //     and noexcept member specialisations, 7/8).  A const-noexcept member
+    //     pointer decomposes to its args verbatim, exactly like its throwing twin
+    //     — the member face of the now-closed noexcept gap.  The REMAINING
+    //     build-breaker shape is the lvalue-ref-qualified member: its `&`
+    //     qualifier matches no specialisation, so reading args_tuple_t off it is
+    //     a hard error and it is asserted BY SHAPE (type identity), never probed.
+    check("member_pointer_const_noexcept_now_has_args_tuple",
+          has_args_tuple<decltype(&member_host::m_const_noexcept)>::value);
+    check("member_pointer_const_noexcept_args_verbatim",
+          std::is_same_v<args_of<decltype(&member_host::m_const_noexcept)>,
+                         std::tuple<int>>);
     check("member_pointer_lvalue_ref_qualified_shape_is_unsupported_qualifier",
           std::is_same_v<decltype(&member_host::m_lref_qualified),
                          void (member_host::*)(int) &>);
@@ -590,9 +594,9 @@ int main()
                   "this is why a free function must be passed as &fn, not by name");
     static_assert(!has_args_tuple<void(&)(int, double)>::value,
                   "a function REFERENCE type must be rejected (matches no specialisation)");
-    static_assert(!has_args_tuple<void(*)(int, double) noexcept>::value,
-                  "a noexcept free-function pointer must be rejected (no noexcept spec) — "
-                  "detectable face of the noexcept gap");
+    static_assert(has_args_tuple<void(*)(int, double) noexcept>::value,
+                  "a noexcept free-function pointer is now accepted (dedicated noexcept "
+                  "specialisation) — the noexcept gap is closed for plain/const noexcept");
     static_assert(!has_args_tuple<int(*)(int, ...)>::value,
                   "a C-style variadic free-function pointer must be rejected");
     static_assert(!has_args_tuple<overloaded_functor>::value,
@@ -677,14 +681,13 @@ int main()
                          std::tuple<int, double>>);
 
     // ========================================================================
-    // 14.  THE FULL MEMBER-QUALIFIER GAP, asserted BY CONSTRUCTION.
-    //      member_host pins const-noexcept and lvalue-& above.  These pin the
-    //      REMAINING qualifier spellings — volatile, const volatile, &&, const&,
-    //      non-const noexcept, && noexcept — as the exact member-pointer types
-    //      that match NEITHER the const nor the non-const specialisation.  Taken
-    //      as a functor operator() each is a hard error, so they are documented
-    //      by SHAPE (never via has_args_tuple).  If a future header adds specs for
-    //      these, every assertion stays true and a positive check can be added.
+    // 14.  THE REMAINING MEMBER-QUALIFIER GAPS, asserted BY CONSTRUCTION.
+    //      noexcept members are now SUPPORTED (specs 7/8) — non-const noexcept is
+    //      checked positively just below.  These pin the qualifier spellings that
+    //      STILL match no specialisation — volatile, const volatile, &&, const&,
+    //      and && noexcept (the ref-qualifier, NOT the noexcept, excludes it) — as
+    //      the exact member-pointer types.  Taken as a functor operator() each is a
+    //      hard error, so they are documented by SHAPE (never via has_args_tuple).
     // ========================================================================
     check("member_pointer_volatile_is_unsupported_qualifier",
           std::is_same_v<decltype(&member_quals::m_volatile),
@@ -698,9 +701,11 @@ int main()
     check("member_pointer_const_lvalue_ref_is_unsupported_qualifier",
           std::is_same_v<decltype(&member_quals::m_const_lref),
                          void (member_quals::*)(int, double) const&>);
-    check("member_pointer_nonconst_noexcept_is_unsupported_qualifier",
-          std::is_same_v<decltype(&member_quals::m_nonconst_noexcept),
-                         void (member_quals::*)(long) noexcept>);
+    check("member_pointer_nonconst_noexcept_now_has_args_tuple",
+          has_args_tuple<decltype(&member_quals::m_nonconst_noexcept)>::value);
+    check("member_pointer_nonconst_noexcept_args_verbatim",
+          std::is_same_v<args_of<decltype(&member_quals::m_nonconst_noexcept)>,
+                         std::tuple<long>>);
     check("member_pointer_rvalue_ref_noexcept_is_unsupported_qualifier",
           std::is_same_v<decltype(&member_quals::m_rref_noexcept),
                          void (member_quals::*)(int) && noexcept>);
@@ -857,6 +862,42 @@ int main()
                                   args_of<std::function<void(const int&, const std::string&)>>>,
                   "std::function preserves param cv/ref spelling: by-value and "
                   "const-ref signatures yield DIFFERENT args tuples (spec #2 contract)");
+
+    // ========================================================================
+    // 16.  noexcept DETOUR DECOMPOSITION — the regression guard for the noexcept
+    //      specialisations (6/7/8).  Pre-fix, feeding ANY noexcept callable
+    //      through the hook<T>() chain (args_of -> method_args_of) was a hard
+    //      compile error ("no member args_tuple_t"); this whole block now compiles
+    //      and every noexcept shape decomposes IDENTICALLY to its throwing twin.
+    //      Named detour lambdas used only in decltype/has_args_tuple match the
+    //      generic_lambda pattern above (no unused-variable warning on any CI
+    //      compiler; avoids the unevaluated-lambda C++20 feature for portability).
+    // ========================================================================
+    {
+        auto throwing_detour      = [](vmhook::return_value&, int, double) {};
+        auto noexcept_detour      = [](vmhook::return_value&, int, double) noexcept {};
+        auto noexcept_void_detour = [](vmhook::return_value&) noexcept {};
+        // A noexcept detour lambda decomposes to the SAME args as its throwing
+        // twin — this static_assert would NOT compile before the noexcept specs.
+        static_assert(std::is_same_v<args_of<decltype(noexcept_detour)>,
+                                     args_of<decltype(throwing_detour)>>,
+                      "a noexcept detour lambda must decompose to the same args as its throwing twin");
+        check("noexcept_lambda_has_args_tuple",
+              has_args_tuple<decltype(noexcept_detour)>::value);
+        check("noexcept_lambda_args_match_throwing_twin",
+              std::is_same_v<args_of<decltype(noexcept_detour)>,
+                             std::tuple<vmhook::return_value&, int, double>>);
+        check("noexcept_lambda_method_args_drop_return_value",
+              std::is_same_v<method_args_of<decltype(noexcept_detour)>,
+                             std::tuple<int, double>>);
+        check("noexcept_void_lambda_method_args_empty",
+              std::is_same_v<method_args_of<decltype(noexcept_void_detour)>,
+                             std::tuple<>>);
+    }
+    // noexcept free-function POINTER decomposes identically to its throwing twin.
+    check("noexcept_fnptr_args_match_throwing_twin",
+          std::is_same_v<args_of<void(*)(vmhook::return_value&, int, double) noexcept>,
+                         args_of<void(*)(vmhook::return_value&, int, double)>>);
 
     std::printf("vmhook traits-function_traits: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

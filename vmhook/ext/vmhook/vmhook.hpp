@@ -9112,6 +9112,16 @@ namespace vmhook
             using args_tuple_t = std::tuple<argument_types...>;
         };
 
+        // noexcept free-function pointer.  Since C++17 `noexcept` is part of the
+        // function type, so `R(*)(Args...) noexcept` is a DISTINCT type from the
+        // non-noexcept form above and needs its own specialisation — otherwise a
+        // `noexcept` detour passed by &fn falls through to the undefined primary.
+        template<typename return_type, typename... argument_types>
+        struct function_traits<return_type(*)(argument_types...) noexcept>
+        {
+            using args_tuple_t = std::tuple<argument_types...>;
+        };
+
         template<typename return_type, typename... argument_types>
         struct function_traits<std::function<return_type(argument_types...)>>
         {
@@ -9132,6 +9142,26 @@ namespace vmhook
 
         template<typename class_type, typename return_type, typename... argument_types>
         struct function_traits<return_type(class_type::*)(argument_types...)>
+        {
+            using args_tuple_t = std::tuple<argument_types...>;
+        };
+
+        // noexcept call-operator / member-function forms.  A `noexcept` lambda's
+        // operator() is `R(C::*)(Args...) const noexcept` — a DISTINCT type from
+        // the non-noexcept form (C++17 made noexcept part of the function type),
+        // so without these a `noexcept` detour decomposes to the undefined primary
+        // template ("no member named args_tuple_t") and hook<T>(...) fails to
+        // compile even though the same lambda without `noexcept` works.  Plain and
+        // const noexcept are covered here; ref-qualified (& / &&), volatile, and
+        // C-variadic member forms remain intentional gaps.
+        template<typename class_type, typename return_type, typename... argument_types>
+        struct function_traits<return_type(class_type::*)(argument_types...) const noexcept>
+        {
+            using args_tuple_t = std::tuple<argument_types...>;
+        };
+
+        template<typename class_type, typename return_type, typename... argument_types>
+        struct function_traits<return_type(class_type::*)(argument_types...) noexcept>
         {
             using args_tuple_t = std::tuple<argument_types...>;
         };
