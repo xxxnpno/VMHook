@@ -91,6 +91,7 @@ vmhook_add_test(decode_u5                       SOURCES test_decode_u5.cpp)
 vmhook_add_test(iterate_entries_safety         SOURCES test_iterate_entries_safety.cpp)
 vmhook_add_test(os_release_and_protect_edges   SOURCES test_os_release_and_protect_edges.cpp)
 vmhook_add_test(os_safe_read                   SOURCES test_os_safe_read.cpp)
+vmhook_add_test(os_query_region                SOURCES test_os_query_region.cpp)
 vmhook_add_test(array_element_helpers          SOURCES test_array_element_helpers.cpp)
 vmhook_add_test(return_value                    SOURCES test_return_value.cpp)
 vmhook_add_test(object_factory                  SOURCES test_object_factory.cpp)
@@ -98,7 +99,8 @@ vmhook_add_test(version_macros                  SOURCES test_version_macros.cpp)
 target_compile_definitions("vmhook_test_version_macros" PRIVATE
     VMHOOK_CMAKE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     VMHOOK_CMAKE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
-    VMHOOK_CMAKE_VERSION_PATCH=${PROJECT_VERSION_PATCH})
+    VMHOOK_CMAKE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+    VMHOOK_TEST_EXPECT_CMAKE_VERSION=1)
 vmhook_add_test(platform_capability_macros     SOURCES test_platform_capability_macros.cpp)
 vmhook_add_test(traits_extra                    SOURCES test_traits_extra.cpp)
 vmhook_add_test(api_surface_extended           SOURCES test_api_surface_extended.cpp)
