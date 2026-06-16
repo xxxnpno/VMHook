@@ -24,6 +24,37 @@
 #include <string>
 #include <vector>
 
+// --- Idempotence / multiple-inclusion of the header. -----------------------
+// Snapshot the four version tokens, then include the header a SECOND time and
+// re-evaluate them.  The version macros are object-like (plain integer / string
+// literals), so re-inclusion must yield byte-identical definitions -- a config
+// flag that accidentally redefined any of them to a different value would either
+// trip -Wmacro-redefined under -Werror or break these equalities.  The header
+// is #pragma once-guarded, so the second include is also a cheap proof that the
+// guard holds (no duplicate-definition explosion from pulling it in twice).
+namespace vm_version_snapshot
+{
+    constexpr int   first_major{ VMHOOK_VERSION_MAJOR };
+    constexpr int   first_minor{ VMHOOK_VERSION_MINOR };
+    constexpr int   first_patch{ VMHOOK_VERSION_PATCH };
+    constexpr long  first_packed{ VMHOOK_VERSION };
+    constexpr const char* first_string{ VMHOOK_VERSION_STRING };
+}
+#include <vmhook/vmhook.hpp> // intentional re-include: must not change anything
+static_assert(VMHOOK_VERSION_MAJOR == vm_version_snapshot::first_major,
+              "VMHOOK_VERSION_MAJOR must be stable across re-inclusion");
+static_assert(VMHOOK_VERSION_MINOR == vm_version_snapshot::first_minor,
+              "VMHOOK_VERSION_MINOR must be stable across re-inclusion");
+static_assert(VMHOOK_VERSION_PATCH == vm_version_snapshot::first_patch,
+              "VMHOOK_VERSION_PATCH must be stable across re-inclusion");
+static_assert(VMHOOK_VERSION == vm_version_snapshot::first_packed,
+              "VMHOOK_VERSION must be stable across re-inclusion");
+static_assert(VMHOOK_VERSION
+                  == VMHOOK_MAKE_VERSION(VMHOOK_VERSION_MAJOR,
+                                         VMHOOK_VERSION_MINOR,
+                                         VMHOOK_VERSION_PATCH),
+              "the packing relation must still hold after re-inclusion");
+
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
 {
@@ -146,6 +177,35 @@ static_assert(VMHOOK_MAKE_VERSION(2147, 483, 647) > VMHOOK_MAKE_VERSION(2147, 48
 // the current `int`-arithmetic macro cannot represent.
 static_assert(vm_expected_pack(2147, 999, 999) == 2147999999LL);
 static_assert(vm_expected_pack(2147, 999, 999) > 2147483647LL /* INT_MAX */);
+
+// --- (2d) Macro hygiene: the fully-parenthesised expansion is hostile to
+// adjacent-operator precedence traps in *C++ constant-expression* context too
+// (the `#if` variants live at the bottom of the file; these are their
+// static_assert twins so a regression is caught even on a config that never
+// reaches the preprocessor block).  MAKE(0,0,1) is just `1`, so each identity
+// below would FAIL the instant the macro lost its outer parens, e.g. if the
+// body became `(major)*1000000 + (minor)*1000 + (patch)` without the outer
+// `( ... )`, `2 * MAKE(0,0,1)` would parse as `2 * (0)*1000000 + ... == 1`.
+static_assert(2 * VMHOOK_MAKE_VERSION(0, 0, 1) == 2,
+              "outer parens must survive a leading `*`");
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 1) * 2 == 2,
+              "outer parens must survive a trailing `*`");
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 1) + 1 == 2,
+              "outer parens must survive a trailing `+`");
+static_assert(1 + VMHOOK_MAKE_VERSION(0, 0, 1) == 2,
+              "outer parens must survive a leading `+`");
+static_assert(-VMHOOK_MAKE_VERSION(0, 0, 1) == -1,
+              "outer parens must survive unary minus");
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 2) / VMHOOK_MAKE_VERSION(0, 0, 2) == 1,
+              "a packed value divides itself to 1 (no stray operator leakage)");
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 3) % 2 == 1,
+              "outer parens must survive a trailing `%`");
+// The macro's *arguments* are individually parenthesised, so an argument that is
+// itself an expression packs by its computed value, not token-pasted text.
+static_assert(VMHOOK_MAKE_VERSION(0, 1 + 1, 2 + 1) == VMHOOK_MAKE_VERSION(0, 2, 3),
+              "argument expressions must be evaluated, not pasted");
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 1 << 1) == VMHOOK_MAKE_VERSION(0, 0, 2),
+              "a shift argument must bind inside the argument's parens");
 
 // --- (3) Pack is order-isomorphic to lexicographic (major,minor,patch). ----
 // For a strictly ascending ladder of triples, the packed integers must be
@@ -345,6 +405,30 @@ int main()
     check("version_string_last_char_is_digit",
           !version_text.empty() && version_text.back() >= '0' && version_text.back() <= '9');
 
+    // Stringize value-vs-name regression lock (audit flaw #5).  The two-level
+    // VMHOOK_VERSION_STRING_HELPER dance exists *only* to force the component
+    // macros to expand before `#x` stringizes them.  If a future "cleanup"
+    // collapsed it to a single-level `#x`, the string would become the macro
+    // NAME ("VMHOOK_VERSION_MAJOR.…") instead of its value.  Pin that the
+    // string is purely digits and dots: NO alphabetic character at all, and in
+    // particular it must not contain the token "VMHOOK".
+    bool has_alpha{ false };
+    for (const char c : version_text)
+    {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) { has_alpha = true; }
+    }
+    check("version_string_has_no_alpha_chars", !has_alpha);
+    check("version_string_does_not_contain_macro_name",
+          version_text.find("VMHOOK") == std::string::npos);
+    // Every character is specifically a digit or a '.' (nothing else slipped in,
+    // e.g. an underscore from a pasted identifier or a quote from mis-stringize).
+    bool only_digit_or_dot{ true };
+    for (const char c : version_text)
+    {
+        if (c != '.' && (c < '0' || c > '9')) { only_digit_or_dot = false; }
+    }
+    check("version_string_is_exclusively_digits_and_dots", only_digit_or_dot);
+
     // Rebuild the expected "M.m.p" from the numeric components and compare.
     char expected[64]{};
     const int written{ std::snprintf(expected, sizeof(expected), "%d.%d.%d",
@@ -352,12 +436,23 @@ int main()
     check("version_string_snprintf_ok", written > 0 && written < static_cast<int>(sizeof(expected)));
     check("version_string_matches_components", version_text == std::string{ expected });
 
+    // Idempotence (runtime arm): the string captured before the header's second
+    // include must equal the string seen now -- ties the snapshot above to a
+    // live comparison so the re-include guard cannot silently no-op away.
+    check("version_string_stable_across_reinclude",
+          version_text == std::string{ vm_version_snapshot::first_string });
+
     // -----------------------------------------------------------------------
-    // Cross-check against the CMake project version.  By default this standalone
-    // test is NOT compiled with -DVMHOOK_CMAKE_VERSION_* (only the helpers test
-    // target defines them in tests/CMakeLists.txt), so this block is normally
-    // skipped -- when absent we only verify internal macro consistency, exactly
-    // as the audit specifies.
+    // Cross-check against the CMake project version.  tests/CMakeLists.txt
+    // compiles THIS target (vmhook_test_version_macros) with
+    // -DVMHOOK_CMAKE_VERSION_{MAJOR,MINOR,PATCH} taken from PROJECT_VERSION_*,
+    // and additionally with -DVMHOOK_TEST_EXPECT_CMAKE_VERSION=1 to record that
+    // the cross-check is *expected* to run here.  That second flag implements
+    // the audit's "negative-direction" CMake-sync guard (flaw #3): if a future
+    // CMake edit ever drops the target_compile_definitions, the
+    // VMHOOK_CMAKE_VERSION_* defs vanish but VMHOOK_TEST_EXPECT_CMAKE_VERSION
+    // stays, so this block fails LOUDLY instead of silently degrading to a
+    // no-op SKIP -- the safety net can no longer rot undetected.
     // -----------------------------------------------------------------------
 #if defined(VMHOOK_CMAKE_VERSION_MAJOR) && defined(VMHOOK_CMAKE_VERSION_MINOR) \
     && defined(VMHOOK_CMAKE_VERSION_PATCH)
@@ -371,9 +466,26 @@ int main()
           VMHOOK_MAKE_VERSION(VMHOOK_CMAKE_VERSION_MAJOR,
                               VMHOOK_CMAKE_VERSION_MINOR,
                               VMHOOK_CMAKE_VERSION_PATCH) == VMHOOK_VERSION);
+    // String form of the CMake version must also equal the header string, tying
+    // CMakeLists.txt project(VERSION ...) to VMHOOK_VERSION_STRING end to end.
+    {
+        char cmake_str[64]{};
+        const int cw{ std::snprintf(cmake_str, sizeof(cmake_str), "%d.%d.%d",
+                                    static_cast<int>(VMHOOK_CMAKE_VERSION_MAJOR),
+                                    static_cast<int>(VMHOOK_CMAKE_VERSION_MINOR),
+                                    static_cast<int>(VMHOOK_CMAKE_VERSION_PATCH)) };
+        check("cmake_version_string_matches_header_string",
+              cw > 0 && version_text == std::string{ cmake_str });
+    }
 #else
+#   if defined(VMHOOK_TEST_EXPECT_CMAKE_VERSION) && (VMHOOK_TEST_EXPECT_CMAKE_VERSION + 0)
+    // The build promised the cross-check would run here but the defs are gone:
+    // that is exactly the CMake-drift failure mode we want to catch, so fail.
+    check("cmake_version_defs_present_when_expected", false);
+#   else
     std::printf("[SKIP] cmake_version_cross_check "
                 "(VMHOOK_CMAKE_VERSION_* not defined for this target)\n");
+#   endif
 #endif
 
     // -----------------------------------------------------------------------
@@ -485,6 +597,26 @@ int main()
             // No part is empty (would mean a leading/trailing/double dot).
             check("version_string_no_empty_parts",
                   !parts[0].empty() && !parts[1].empty() && !parts[2].empty());
+
+            // Tie the STRING and the PACKED INTEGER to a single decomposed
+            // truth: parse each string field to an int and compare it to the
+            // corresponding slice of the packed value (not just to the raw
+            // component macros).  This closes the loop string -> int ==
+            // packed-decompose, so a drift in EITHER the stringize path or the
+            // pack arithmetic surfaces here even if they happened to agree with
+            // the component macros individually.
+            const int str_major{ std::stoi(parts[0]) };
+            const int str_minor{ std::stoi(parts[1]) };
+            const int str_patch{ std::stoi(parts[2]) };
+            check("version_string_major_equals_packed_decompose",
+                  str_major == (packed / 1000000));
+            check("version_string_minor_equals_packed_decompose",
+                  str_minor == ((packed / 1000) % 1000));
+            check("version_string_patch_equals_packed_decompose",
+                  str_patch == (packed % 1000));
+            // And re-packing the parsed string fields reproduces VMHOOK_VERSION.
+            check("version_string_repacks_to_version",
+                  VMHOOK_MAKE_VERSION(str_major, str_minor, str_patch) == VMHOOK_VERSION);
         }
     }
 
