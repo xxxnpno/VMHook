@@ -1747,8 +1747,17 @@ static auto test_jvm_primitive_byte_width_matrix() -> void
         check("primwidth_matches_basic_type_primitive_band", consistent);
     }
 
-    // (f) jvm_primitive_byte_width is noexcept.
-    check("primwidth_noexcept", noexcept(jvm_primitive_byte_width(std::string_view{ "I" })));
+    // (f) jvm_primitive_byte_width is noexcept.  Build the string_view argument
+    //     OUTSIDE the noexcept() operator: libc++ (macOS/iOS) does NOT mark
+    //     string_view's (const char*) constructor noexcept, so constructing the
+    //     argument inline poisons the measured expression even though the
+    //     function itself is noexcept (libstdc++ does mark it, which is why this
+    //     passed on Linux/Windows).  Measuring the call on a prebuilt lvalue
+    //     (string_view's copy is trivially noexcept) isolates the function.
+    {
+        const std::string_view prim_desc{ "I" };
+        check("primwidth_noexcept", noexcept(jvm_primitive_byte_width(prim_desc)));
+    }
 }
 
 // ---------------------------------------------------------------------------
