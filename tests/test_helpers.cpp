@@ -18,7 +18,12 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <typeindex>
 #include <vector>
 
 static int failures{ 0 };
@@ -1369,6 +1374,1393 @@ static auto test_version_string_composition() -> void
     static_assert(VMHOOK_VERSION > 0, "VMHOOK_VERSION must be a positive integer");
 }
 
+// ===========================================================================
+// EXHAUSTIVE-INPUT EXPANSION (#38-immune no-JVM lane)
+//
+// Everything below deepens the helpers that are UNIQUE to test_helpers.cpp
+// (the catch-all pure-logic helpers and the runtime factory registry), with
+// FULL input-domain coverage rather than spot checks.  Suites that already
+// have a dedicated exhaustive file (decode_u5, array elements, version macros)
+// are NOT re-expanded here; only their cross-helper INTERPLAY is touched.
+//
+// Every expected value is derived from the live header.  All cases are
+// deterministic and endianness-agnostic (values compared, never raw bytes;
+// width-dependent facts are sizeof-branched).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// E1. sig_char_to_basic_type — EXHAUSTIVE over all 256 byte values.
+//
+// The header switch maps exactly 11 descriptor chars to their HotSpot
+// BasicType integer and returns T_OBJECT (12) for everything else.  We
+// reproduce that table independently and assert agreement for every possible
+// `char` input, then assert the function is a pure function (same input ->
+// same output across repeated calls).
+// ---------------------------------------------------------------------------
+static auto expected_basic_type(unsigned char uc) -> int
+{
+    switch (static_cast<char>(uc))
+    {
+    case 'Z': return 4;
+    case 'C': return 5;
+    case 'F': return 6;
+    case 'D': return 7;
+    case 'B': return 8;
+    case 'S': return 9;
+    case 'I': return 10;
+    case 'J': return 11;
+    case 'L': return 12;
+    case '[': return 13;
+    case 'V': return 14;
+    default:  return 12;
+    }
+}
+
+static auto test_sig_char_to_basic_type_exhaustive() -> void
+{
+    bool all_match{ true };
+    bool deterministic{ true };
+    bool default_is_object{ true };
+    int  mismatch_input{ -1 };
+
+    for (int v{ 0 }; v < 256; ++v)
+    {
+        const char c{ static_cast<char>(static_cast<unsigned char>(v)) };
+        const int got{ vmhook::detail::sig_char_to_basic_type(c) };
+        const int want{ expected_basic_type(static_cast<unsigned char>(v)) };
+        if (got != want)
+        {
+            all_match = false;
+            if (mismatch_input < 0)
+            {
+                mismatch_input = v;
+            }
+        }
+        // Determinism: a second call on the same input yields the same value.
+        if (vmhook::detail::sig_char_to_basic_type(c) != got)
+        {
+            deterministic = false;
+        }
+        // Negative space: any char that is NOT one of the 11 known descriptors
+        // must collapse to the T_OBJECT (12) fallback.
+        const bool is_known{ want != 12 || c == 'L' };
+        if (!is_known && got != 12)
+        {
+            default_is_object = false;
+        }
+    }
+
+    check("sig_char_to_basic_type_exhaustive_all_256_match", all_match);
+    check("sig_char_to_basic_type_exhaustive_deterministic", deterministic);
+    check("sig_char_to_basic_type_exhaustive_unknown_defaults_T_OBJECT",
+          default_is_object);
+    if (!all_match)
+    {
+        std::printf("[INFO] sig_char_to_basic_type mismatch at input %d\n",
+                    mismatch_input);
+    }
+
+    // The two ambiguous-looking descriptors L and '[' must NOT collide with the
+    // numeric BasicType of any primitive; assert their exact documented values.
+    check("sig_char_to_basic_type_L_is_12",
+          vmhook::detail::sig_char_to_basic_type('L') == 12);
+    check("sig_char_to_basic_type_array_is_13",
+          vmhook::detail::sig_char_to_basic_type('[') == 13);
+
+    // Every primitive descriptor maps to a DISTINCT value in [4, 11]; a
+    // collision would silently mis-tag a field/return type.  Collect them and
+    // assert pairwise distinctness over the closed primitive set.
+    const std::array<char, 8> prim_chars{ 'Z', 'C', 'F', 'D', 'B', 'S', 'I', 'J' };
+    std::array<int, 8> prim_codes{};
+    for (std::size_t i{ 0 }; i < prim_chars.size(); ++i)
+    {
+        prim_codes[i] = vmhook::detail::sig_char_to_basic_type(prim_chars[i]);
+    }
+    bool prims_distinct{ true };
+    for (std::size_t i{ 0 }; i < prim_codes.size(); ++i)
+    {
+        for (std::size_t j{ i + 1 }; j < prim_codes.size(); ++j)
+        {
+            if (prim_codes[i] == prim_codes[j])
+            {
+                prims_distinct = false;
+            }
+        }
+    }
+    check("sig_char_to_basic_type_primitives_pairwise_distinct", prims_distinct);
+}
+
+// ---------------------------------------------------------------------------
+// E2. jvm_primitive_byte_width — EXHAUSTIVE over the single-char domain plus
+//     the full length domain (0, 1, 2, 3+ chars).
+//
+// Width table (JVM spec §4.3.2): Z=B=1, S=C=2, I=F=4, J=D=8; everything
+// else (reference/array/void/unknown) and every non-length-1 string -> 0.
+// ---------------------------------------------------------------------------
+static auto expected_prim_width(unsigned char uc) -> std::size_t
+{
+    switch (static_cast<char>(uc))
+    {
+    case 'Z': case 'B': return 1u;
+    case 'S': case 'C': return 2u;
+    case 'I': case 'F': return 4u;
+    case 'J': case 'D': return 8u;
+    default:            return 0u;
+    }
+}
+
+static auto test_jvm_primitive_byte_width_exhaustive() -> void
+{
+    using vmhook::detail::jvm_primitive_byte_width;
+
+    // All 256 single-character signatures.
+    bool all_single_match{ true };
+    int  single_mismatch{ -1 };
+    for (int v{ 0 }; v < 256; ++v)
+    {
+        const char c{ static_cast<char>(static_cast<unsigned char>(v)) };
+        const std::string sig(1, c);
+        const std::size_t got{ jvm_primitive_byte_width(sig) };
+        const std::size_t want{ expected_prim_width(static_cast<unsigned char>(v)) };
+        if (got != want)
+        {
+            all_single_match = false;
+            if (single_mismatch < 0)
+            {
+                single_mismatch = v;
+            }
+        }
+    }
+    check("jvm_primitive_byte_width_all_256_single_chars_match", all_single_match);
+    if (!all_single_match)
+    {
+        std::printf("[INFO] jvm_primitive_byte_width single-char mismatch at %d\n",
+                    single_mismatch);
+    }
+
+    // Length domain: only length-1 can be non-zero.  Empty + every 2-char and
+    // 3-char combination of the WIDEST-width primitive chars must still be 0,
+    // proving the size!=1 short-circuit fires before the switch.
+    check("jvm_primitive_byte_width_empty_is_zero",
+          jvm_primitive_byte_width(std::string_view{}) == 0u);
+
+    bool all_multichar_zero{ true };
+    const std::array<char, 4> w{ 'I', 'J', 'D', 'F' };  // would-be non-zero if length-1
+    for (const char a : w)
+    {
+        for (const char b : w)
+        {
+            const std::string two{ std::string(1, a) + std::string(1, b) };
+            if (jvm_primitive_byte_width(two) != 0u)
+            {
+                all_multichar_zero = false;
+            }
+            for (const char d : w)
+            {
+                const std::string three{ two + std::string(1, d) };
+                if (jvm_primitive_byte_width(three) != 0u)
+                {
+                    all_multichar_zero = false;
+                }
+            }
+        }
+    }
+    check("jvm_primitive_byte_width_multichar_all_zero", all_multichar_zero);
+
+    // Reference / array / void descriptors of realistic shape -> 0.
+    check("jvm_primitive_byte_width_object_descriptor_zero",
+          jvm_primitive_byte_width("Ljava/lang/Object;") == 0u);
+    check("jvm_primitive_byte_width_array_of_int_zero",
+          jvm_primitive_byte_width("[I") == 0u);
+    check("jvm_primitive_byte_width_array_of_object_zero",
+          jvm_primitive_byte_width("[Ljava/lang/String;") == 0u);
+    check("jvm_primitive_byte_width_void_zero",
+          jvm_primitive_byte_width("V") == 0u);
+
+    // Determinism: repeated calls agree for a representative spread.
+    bool deterministic{ true };
+    for (const char c : { 'Z', 'B', 'S', 'C', 'I', 'F', 'J', 'D', 'L', '[', 'V', 'x' })
+    {
+        const std::string sig(1, c);
+        if (jvm_primitive_byte_width(sig) != jvm_primitive_byte_width(sig))
+        {
+            deterministic = false;
+        }
+    }
+    check("jvm_primitive_byte_width_deterministic", deterministic);
+
+    // INTERPLAY: a descriptor has a non-zero primitive width IFF
+    // sig_char_to_basic_type classifies it as one of the primitive BasicTypes
+    // (4..11 excluding T_OBJECT=12).  The two helpers must agree on what a
+    // "primitive" descriptor is, or field-size validation and BasicType
+    // dispatch would disagree about the same field.
+    bool interplay_consistent{ true };
+    for (int v{ 0 }; v < 256; ++v)
+    {
+        const char c{ static_cast<char>(static_cast<unsigned char>(v)) };
+        const std::string sig(1, c);
+        const bool has_width{ jvm_primitive_byte_width(sig) != 0u };
+        const int  bt{ vmhook::detail::sig_char_to_basic_type(c) };
+        // Primitive BasicTypes are T_BOOLEAN(4)..T_LONG(11); T_OBJECT(12),
+        // T_ARRAY(13), T_VOID(14) are non-primitive.  The fallback for unknown
+        // chars is also T_OBJECT(12), which correctly has width 0.
+        const bool is_primitive_bt{ bt >= 4 && bt <= 11 };
+        if (has_width != is_primitive_bt)
+        {
+            interplay_consistent = false;
+        }
+    }
+    check("jvm_primitive_byte_width_consistent_with_basic_type",
+          interplay_consistent);
+}
+
+// ---------------------------------------------------------------------------
+// E3. memory_protection enum identity + to_native_protect EXHAUSTIVE.
+//
+// The enum's underlying values are part of the ABI; pin them at compile time.
+// Then verify to_native_protect maps each of the 5 values to the EXACT native
+// constant for this platform (derived from the live PAGE_* / PROT_* symbols,
+// not guessed), that the four "real" protections are mutually distinct, and
+// that EVERY out-of-range enum value collapses to the no_access fallback.
+// ---------------------------------------------------------------------------
+static auto test_memory_protection_enum_and_native_exhaustive() -> void
+{
+    using namespace vmhook::os;
+
+    // Compile-time enum identity — these underlying values are documented ABI.
+    static_assert(static_cast<std::uint32_t>(memory_protection::no_access) == 0u,
+                  "memory_protection::no_access must be 0");
+    static_assert(static_cast<std::uint32_t>(memory_protection::read) == 1u,
+                  "memory_protection::read must be 1");
+    static_assert(static_cast<std::uint32_t>(memory_protection::read_write) == 2u,
+                  "memory_protection::read_write must be 2");
+    static_assert(static_cast<std::uint32_t>(memory_protection::execute_read) == 3u,
+                  "memory_protection::execute_read must be 3");
+    static_assert(static_cast<std::uint32_t>(memory_protection::execute_rw) == 4u,
+                  "memory_protection::execute_rw must be 4");
+
+    const auto noaccess{ to_native_protect(memory_protection::no_access) };
+    const auto read{ to_native_protect(memory_protection::read) };
+    const auto read_write{ to_native_protect(memory_protection::read_write) };
+    const auto execute_read{ to_native_protect(memory_protection::execute_read) };
+    const auto execute_rw{ to_native_protect(memory_protection::execute_rw) };
+
+    // Exact native mapping, derived from the live platform constants.
+#if VMHOOK_OS_WINDOWS
+    check("to_native_protect_no_access_is_PAGE_NOACCESS",
+          noaccess == PAGE_NOACCESS);
+    check("to_native_protect_read_is_PAGE_READONLY",
+          read == PAGE_READONLY);
+    check("to_native_protect_read_write_is_PAGE_READWRITE",
+          read_write == PAGE_READWRITE);
+    check("to_native_protect_execute_read_is_PAGE_EXECUTE_READ",
+          execute_read == PAGE_EXECUTE_READ);
+    check("to_native_protect_execute_rw_is_PAGE_EXECUTE_READWRITE",
+          execute_rw == PAGE_EXECUTE_READWRITE);
+#else
+    check("to_native_protect_no_access_is_PROT_NONE",
+          noaccess == PROT_NONE);
+    check("to_native_protect_read_is_PROT_READ",
+          read == PROT_READ);
+    check("to_native_protect_read_write_is_PROT_READ_WRITE",
+          read_write == (PROT_READ | PROT_WRITE));
+    check("to_native_protect_execute_read_is_PROT_READ_EXEC",
+          execute_read == (PROT_READ | PROT_EXEC));
+    check("to_native_protect_execute_rw_is_PROT_READ_WRITE_EXEC",
+          execute_rw == (PROT_READ | PROT_WRITE | PROT_EXEC));
+#endif
+
+    // All five mapped values must be mutually distinct (no two intents alias).
+    const std::array<decltype(noaccess), 5> all_vals{
+        noaccess, read, read_write, execute_read, execute_rw };
+    bool distinct{ true };
+    for (std::size_t i{ 0 }; i < all_vals.size(); ++i)
+    {
+        for (std::size_t j{ i + 1 }; j < all_vals.size(); ++j)
+        {
+            if (all_vals[i] == all_vals[j])
+            {
+                distinct = false;
+            }
+        }
+    }
+    check("to_native_protect_all_five_distinct", distinct);
+
+    // Determinism: each value maps identically on repeated calls.
+    bool deterministic{ true };
+    for (std::uint32_t e{ 0 }; e <= 4u; ++e)
+    {
+        const auto mp{ static_cast<memory_protection>(e) };
+        if (to_native_protect(mp) != to_native_protect(mp))
+        {
+            deterministic = false;
+        }
+    }
+    check("to_native_protect_deterministic", deterministic);
+
+    // EXHAUSTIVE negative space: every enum value OUTSIDE {0..4} must fall back
+    // to the no_access flag.  Sweep the entire remaining 8-bit range plus a few
+    // pathological wide values.
+    bool all_fallback{ true };
+    for (std::uint32_t e{ 5u }; e < 256u; ++e)
+    {
+        if (to_native_protect(static_cast<memory_protection>(e)) != noaccess)
+        {
+            all_fallback = false;
+        }
+    }
+    check("to_native_protect_out_of_range_5_to_255_fallback", all_fallback);
+
+    for (const std::uint32_t e : { 256u, 1000u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu })
+    {
+        if (to_native_protect(static_cast<memory_protection>(e)) != noaccess)
+        {
+            all_fallback = false;
+        }
+    }
+    check("to_native_protect_extreme_unknown_values_fallback", all_fallback);
+}
+
+// ---------------------------------------------------------------------------
+// E4. build_dr7 — FULLY EXHAUSTIVE over the entire input domain.
+//
+// Domain = slot {0,1,2,3} x kind {write, read_write} x length {one, two,
+// eight, four} = 4 x 2 x 4 = 32 combinations.  Reference value computed
+// independently from the Intel-SDM formula the header documents:
+//   L<slot>  = bit (slot*2)
+//   R/W<slot> field at bit (16 + slot*4), value = enum(kind)  in {0b01, 0b11}
+//   LEN<slot> field at bit (18 + slot*4), value = enum(length) in {0..3}
+// We also assert FIELD ISOLATION: the result only ever sets bits belonging to
+// the requested slot (a shift typo would leak into a neighbour's field).
+// Windows + x86_64 only (same guard as the existing build_dr7 suite).
+// ---------------------------------------------------------------------------
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+static auto test_build_dr7_exhaustive() -> void
+{
+    using namespace vmhook::os;
+    using namespace vmhook::os::detail_dr;
+
+    struct kind_entry { data_breakpoint_kind k; std::uint64_t bits; };
+    struct len_entry  { data_breakpoint_length l; std::uint64_t bits; };
+
+    const std::array<kind_entry, 2> kinds{
+        kind_entry{ data_breakpoint_kind::write,      0b01ull },
+        kind_entry{ data_breakpoint_kind::read_write, 0b11ull } };
+    const std::array<len_entry, 4> lengths{
+        len_entry{ data_breakpoint_length::one_byte,    0b00ull },
+        len_entry{ data_breakpoint_length::two_bytes,   0b01ull },
+        len_entry{ data_breakpoint_length::eight_bytes, 0b10ull },
+        len_entry{ data_breakpoint_length::four_bytes,  0b11ull } };
+
+    bool all_match{ true };
+    bool all_isolated{ true };
+    bool deterministic{ true };
+
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        // The complete set of bit positions this slot is allowed to touch:
+        // its local-enable bit and its 4-bit R/W+LEN field.
+        const std::uint64_t local_bit{ std::uint64_t{ 1 } << (slot * 2) };
+        const std::uint64_t field_mask{ std::uint64_t{ 0b1111 } << (16 + slot * 4) };
+        const std::uint64_t allowed_mask{ local_bit | field_mask };
+
+        for (const auto& ke : kinds)
+        {
+            for (const auto& le : lengths)
+            {
+                const std::uint64_t expected{
+                    local_bit
+                    | (ke.bits << (16 + slot * 4))
+                    | (le.bits << (18 + slot * 4)) };
+
+                const std::uint64_t got{ build_dr7(slot, ke.k, le.l) };
+                if (got != expected)
+                {
+                    all_match = false;
+                }
+                // No bit outside this slot's allowed positions may be set.
+                if ((got & ~allowed_mask) != 0ull)
+                {
+                    all_isolated = false;
+                }
+                if (build_dr7(slot, ke.k, le.l) != got)
+                {
+                    deterministic = false;
+                }
+            }
+        }
+    }
+
+    check("build_dr7_exhaustive_all_32_combos_match", all_match);
+    check("build_dr7_exhaustive_field_isolation", all_isolated);
+    check("build_dr7_exhaustive_deterministic", deterministic);
+
+    // The global-enable bits (G0..G3 at odd bit positions 1,3,5,7) must NEVER
+    // be set — the helper documents that only LOCAL enables are used so the
+    // trap is per-thread, not process-wide.
+    bool no_global_enables{ true };
+    const std::uint64_t global_enable_mask{
+        (std::uint64_t{ 1 } << 1) | (std::uint64_t{ 1 } << 3)
+        | (std::uint64_t{ 1 } << 5) | (std::uint64_t{ 1 } << 7) };
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        for (const auto& ke : kinds)
+        {
+            for (const auto& le : lengths)
+            {
+                if ((build_dr7(slot, ke.k, le.l) & global_enable_mask) != 0ull)
+                {
+                    no_global_enables = false;
+                }
+            }
+        }
+    }
+    check("build_dr7_exhaustive_no_global_enables", no_global_enables);
+
+    // Distinct slots writing the SAME kind/length must produce results that
+    // differ only in the slot-specific bit positions (sanity that the slot
+    // parameter actually shifts the field).
+    const std::uint64_t s0{ build_dr7(0, data_breakpoint_kind::read_write,
+                                      data_breakpoint_length::eight_bytes) };
+    const std::uint64_t s3{ build_dr7(3, data_breakpoint_kind::read_write,
+                                      data_breakpoint_length::eight_bytes) };
+    check("build_dr7_exhaustive_slot0_ne_slot3", s0 != s3);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// E5. Factory-registry round-trip — type_to_class_map / g_type_factory_map /
+//     jni_signature_for_arg.  THE feature that lives in this file because it
+//     needs the runtime registry (register_class itself requires a live JVM
+//     via find_class, so in a no-JVM process we populate the public maps
+//     directly with exactly what register_class<T>() would write, then drive
+//     the read paths).
+//
+// Covered:
+//   * unregistered object wrapper  -> "Ljava/lang/Object;" fallback
+//   * unregistered unique_ptr<W>   -> "Ljava/lang/Object;" fallback
+//   * registered object wrapper    -> "L<name>;"
+//   * registered unique_ptr<W>     -> "L<name>;"
+//   * jni::signature_for_arg wrapper matches detail:: for the registered type
+//   * the stored factory function constructs a W from a raw oop and the
+//     wrapper round-trips that oop via get_instance()
+//
+// The maps are restored to their prior state at the end so the suite leaves
+// no global side effects (determinism across repeated runs / test ordering).
+// ---------------------------------------------------------------------------
+namespace {
+    struct registry_wrapper : public vmhook::object<registry_wrapper> {
+        using vmhook::object<registry_wrapper>::object;
+    };
+    struct registry_wrapper_unreg : public vmhook::object<registry_wrapper_unreg> {
+        using vmhook::object<registry_wrapper_unreg>::object;
+    };
+}
+
+static auto test_factory_registry_roundtrip() -> void
+{
+    using vmhook::detail::jni_signature_for_arg;
+
+    // ---- Unregistered: both the by-value-object branch and the unique_ptr
+    //      branch must hit the documented "Ljava/lang/Object;" fallback.
+    check("registry_unregistered_object_falls_back_to_Object",
+          jni_signature_for_arg<registry_wrapper_unreg>() == "Ljava/lang/Object;");
+    check("registry_unregistered_unique_ptr_falls_back_to_Object",
+          jni_signature_for_arg<std::unique_ptr<registry_wrapper_unreg>>()
+              == "Ljava/lang/Object;");
+
+    // ---- Register registry_wrapper exactly the way register_class<T>() would,
+    //      but without a JVM: populate type_to_class_map + g_type_factory_map
+    //      directly, under the same registration_mutex the library uses.
+    const std::string class_name{ "com/example/RegistryWrapper" };
+    const std::type_index key{ typeid(registry_wrapper) };
+    {
+        std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
+        vmhook::type_to_class_map.insert_or_assign(key, class_name);
+        vmhook::g_type_factory_map.emplace(class_name, +[](void* instance)
+            -> vmhook::object_base*
+            {
+                return new registry_wrapper{ instance };
+            });
+    }
+
+    // ---- Registered: the signature now resolves to the JVM class name.
+    const std::string expected_sig{ "L" + class_name + ";" };
+    check("registry_registered_object_signature_resolves",
+          jni_signature_for_arg<registry_wrapper>() == expected_sig);
+    check("registry_registered_unique_ptr_signature_resolves",
+          jni_signature_for_arg<std::unique_ptr<registry_wrapper>>() == expected_sig);
+
+    // ---- The public jni:: wrapper must delegate without drift.
+    check("registry_public_signature_for_arg_matches_detail",
+          vmhook::jni::signature_for_arg<registry_wrapper>()
+              == jni_signature_for_arg<registry_wrapper>());
+
+    // ---- The stored factory builds a wrapper from a raw oop, and the wrapper
+    //      round-trips that oop.  This is the path frame::get_arguments uses to
+    //      reconstruct C++ wrappers from decoded Java references.
+    {
+        const auto it{ vmhook::g_type_factory_map.find(class_name) };
+        check("registry_factory_present", it != vmhook::g_type_factory_map.end());
+        if (it != vmhook::g_type_factory_map.end())
+        {
+            void* const sentinel_oop{ reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(0xAABBCCDD11223340ull)) };
+            // The factory returns a raw object_base*; wrap it so it is freed.
+            std::unique_ptr<vmhook::object_base> built{ it->second(sentinel_oop) };
+            check("registry_factory_returns_non_null", built != nullptr);
+            check("registry_factory_roundtrips_oop",
+                  built && built->get_instance() == sentinel_oop);
+            // The runtime type is our wrapper, not some sliced base.
+            check("registry_factory_dynamic_type_is_wrapper",
+                  dynamic_cast<registry_wrapper*>(built.get()) != nullptr);
+        }
+    }
+
+    // ---- Determinism: a second signature query is identical.
+    check("registry_signature_deterministic",
+          jni_signature_for_arg<registry_wrapper>()
+              == jni_signature_for_arg<registry_wrapper>());
+
+    // ---- Restore global state so the suite is side-effect-free.
+    {
+        std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
+        vmhook::type_to_class_map.erase(key);
+        vmhook::g_type_factory_map.erase(class_name);
+    }
+
+    // ---- After cleanup, the type once again resolves to the fallback,
+    //      proving both the erase worked and the read path re-evaluates the map.
+    check("registry_after_cleanup_falls_back_again",
+          jni_signature_for_arg<registry_wrapper>() == "Ljava/lang/Object;");
+}
+
+// ---------------------------------------------------------------------------
+// E6. jni_signature_for_arg / jni::signature_for_arg — EXHAUSTIVE over the
+//     full set of SUPPORTED C++ argument types, asserting both the exact
+//     descriptor AND that the public wrapper delegates with zero drift.
+//
+// Note on what is intentionally NOT instantiated: char / char16_t / char32_t /
+// wchar_t are distinct types from int8_t/uint8_t/uint16_t and would hit the
+// `is_integral && sizeof==4` branch (only when 4 bytes) or the terminal
+// static_assert otherwise; instantiating an unsupported one would be a hard
+// compile error, so only types with a real branch are exercised.  The 4-byte
+// integral branch is covered via int32_t/uint32_t and the always-32-bit
+// `int`/`unsigned`.
+// ---------------------------------------------------------------------------
+template <typename arg_type>
+static auto sig_pair_ok(const char* tag, std::string_view want) -> void
+{
+    const std::string detail_sig{ vmhook::detail::jni_signature_for_arg<arg_type>() };
+    const std::string public_sig{ vmhook::jni::signature_for_arg<arg_type>() };
+    check(tag, detail_sig == want && public_sig == want && detail_sig == public_sig);
+}
+
+static auto test_jni_signature_for_arg_exhaustive() -> void
+{
+    // String-like family -> Ljava/lang/String;
+    sig_pair_ok<std::string>("sig_exhaustive_string", "Ljava/lang/String;");
+    sig_pair_ok<std::string_view>("sig_exhaustive_string_view", "Ljava/lang/String;");
+    sig_pair_ok<const char*>("sig_exhaustive_const_char_ptr", "Ljava/lang/String;");
+    sig_pair_ok<char*>("sig_exhaustive_char_ptr", "Ljava/lang/String;");
+
+    // bool -> Z
+    sig_pair_ok<bool>("sig_exhaustive_bool", "Z");
+
+    // 8-bit integers (signed AND unsigned) -> B
+    sig_pair_ok<std::int8_t>("sig_exhaustive_int8", "B");
+    sig_pair_ok<std::uint8_t>("sig_exhaustive_uint8", "B");
+
+    // int16_t -> S, uint16_t -> C
+    sig_pair_ok<std::int16_t>("sig_exhaustive_int16", "S");
+    sig_pair_ok<std::uint16_t>("sig_exhaustive_uint16", "C");
+
+    // 64-bit integers (signed AND unsigned) -> J
+    sig_pair_ok<std::int64_t>("sig_exhaustive_int64", "J");
+    sig_pair_ok<std::uint64_t>("sig_exhaustive_uint64", "J");
+
+    // float -> F, double -> D
+    sig_pair_ok<float>("sig_exhaustive_float", "F");
+    sig_pair_ok<double>("sig_exhaustive_double", "D");
+
+    // 32-bit integral branch -> I.  int32_t/uint32_t are exactly 32-bit; `int`
+    // and `unsigned int` are 32-bit on every platform vmhook supports.
+    sig_pair_ok<std::int32_t>("sig_exhaustive_int32", "I");
+    sig_pair_ok<std::uint32_t>("sig_exhaustive_uint32", "I");
+    sig_pair_ok<int>("sig_exhaustive_native_int", "I");
+    sig_pair_ok<unsigned int>("sig_exhaustive_native_uint", "I");
+
+    // Reference / cv / value-category robustness: decay must strip cv and refs
+    // so the same descriptor is produced for const&, &&, etc.
+    sig_pair_ok<const std::int32_t&>("sig_exhaustive_const_int32_ref", "I");
+    sig_pair_ok<std::string&>("sig_exhaustive_string_lref", "Ljava/lang/String;");
+    sig_pair_ok<const bool&>("sig_exhaustive_const_bool_ref", "Z");
+
+    // Every primitive descriptor produced here must be a single character; the
+    // string family is the only multi-char descriptor.  Cross-check against the
+    // primitive-width helper for round-trip consistency on the 1-char ones.
+    struct sig_width { const char* sig; std::size_t width; };
+    const std::array<sig_width, 8> table{
+        sig_width{ "Z", 1u }, sig_width{ "B", 1u },
+        sig_width{ "S", 2u }, sig_width{ "C", 2u },
+        sig_width{ "I", 4u }, sig_width{ "F", 4u },
+        sig_width{ "J", 8u }, sig_width{ "D", 8u } };
+    bool widths_match{ true };
+    for (const auto& e : table)
+    {
+        if (vmhook::detail::jvm_primitive_byte_width(e.sig) != e.width)
+        {
+            widths_match = false;
+        }
+    }
+    check("sig_exhaustive_descriptor_widths_consistent", widths_match);
+}
+
+// ---------------------------------------------------------------------------
+// E7. return_value::set — EXHAUSTIVE sign-extension / bit-fidelity coverage.
+//
+// The header sign-extends signed integral types narrower than 8 bytes via
+// static_cast<int64_t>; all other types (unsigned, 8-byte, float, double,
+// pointer, bool) take the zero-first-then-memcpy path.  We exercise:
+//   * EVERY int8_t value -128..127  (full 256-value domain) sign-extends
+//   * EVERY int16_t boundary + a stride sample
+//   * int32_t / int64_t min & max
+//   * unsigned min/max bit-fidelity (no spurious sign extension)
+//   * native char / signed char / short / int / long / long long widths
+//     (long handled via is_same_v<long,int64_t>, NOT sizeof, per LP64 rules)
+//   * cancel flag is asserted set on every single set()
+// ---------------------------------------------------------------------------
+static auto test_return_value_set_sign_extension_exhaustive() -> void
+{
+    vmhook::hotspot::return_slot slot{};
+    vmhook::return_value rv{ &slot };
+
+    // ---- EVERY int8_t value sign-extends to exactly static_cast<int64_t>(v).
+    bool all_i8_ok{ true };
+    bool all_i8_cancel{ true };
+    for (int raw{ -128 }; raw <= 127; ++raw)
+    {
+        const std::int8_t v{ static_cast<std::int8_t>(raw) };
+        slot.retval = static_cast<std::int64_t>(0x5555555555555555ull);  // poison
+        slot.cancel = false;
+        rv.set(v);
+        if (slot.retval != static_cast<std::int64_t>(v))
+        {
+            all_i8_ok = false;
+        }
+        if (!slot.cancel)
+        {
+            all_i8_cancel = false;
+        }
+    }
+    check("return_value_set_int8_full_domain_sign_extends", all_i8_ok);
+    check("return_value_set_int8_full_domain_sets_cancel", all_i8_cancel);
+
+    // ---- EVERY uint8_t value zero-extends to exactly the unsigned value.
+    bool all_u8_ok{ true };
+    for (int raw{ 0 }; raw <= 255; ++raw)
+    {
+        const std::uint8_t v{ static_cast<std::uint8_t>(raw) };
+        slot.retval = static_cast<std::int64_t>(0xAAAAAAAAAAAAAAAAull);
+        slot.cancel = false;
+        rv.set(v);
+        if (slot.retval != static_cast<std::int64_t>(static_cast<std::uint64_t>(v)))
+        {
+            all_u8_ok = false;
+        }
+    }
+    check("return_value_set_uint8_full_domain_zero_extends", all_u8_ok);
+
+    // ---- int16_t boundaries + a stride sweep across the full range.
+    bool all_i16_ok{ true };
+    const std::array<std::int32_t, 7> i16_samples{
+        -32768, -32767, -1, 0, 1, 32766, 32767 };
+    for (const std::int32_t s : i16_samples)
+    {
+        const std::int16_t v{ static_cast<std::int16_t>(s) };
+        slot.retval = -1;
+        slot.cancel = false;
+        rv.set(v);
+        if (slot.retval != static_cast<std::int64_t>(v))
+        {
+            all_i16_ok = false;
+        }
+    }
+    // Dense stride sweep (every 257th value) to catch any partial-width bug.
+    for (std::int32_t s{ -32768 }; s <= 32767; s += 257)
+    {
+        const std::int16_t v{ static_cast<std::int16_t>(s) };
+        slot.retval = 0x12345678;
+        slot.cancel = false;
+        rv.set(v);
+        if (slot.retval != static_cast<std::int64_t>(v))
+        {
+            all_i16_ok = false;
+        }
+    }
+    check("return_value_set_int16_boundaries_and_stride_sign_extend", all_i16_ok);
+
+    // ---- int32_t min/max and -1 sign-extend correctly.
+    {
+        bool ok{ true };
+        for (const std::int32_t v : { std::numeric_limits<std::int32_t>::min(),
+                                      std::int32_t{ -1 }, std::int32_t{ 0 },
+                                      std::int32_t{ 1 },
+                                      std::numeric_limits<std::int32_t>::max() })
+        {
+            slot.retval = static_cast<std::int64_t>(0xF0F0F0F0F0F0F0F0ull);
+            slot.cancel = false;
+            rv.set(v);
+            if (slot.retval != static_cast<std::int64_t>(v) || !slot.cancel)
+            {
+                ok = false;
+            }
+        }
+        check("return_value_set_int32_min_max_sign_extend", ok);
+    }
+
+    // ---- uint32_t min/max bit-fidelity: NO sign extension even with high bit.
+    {
+        bool ok{ true };
+        for (const std::uint32_t v : { std::uint32_t{ 0 }, std::uint32_t{ 1 },
+                                       std::uint32_t{ 0x7FFFFFFFu },
+                                       std::uint32_t{ 0x80000000u },
+                                       std::uint32_t{ 0xFFFFFFFFu } })
+        {
+            slot.retval = -1;
+            slot.cancel = false;
+            rv.set(v);
+            if (slot.retval != static_cast<std::int64_t>(static_cast<std::uint64_t>(v)))
+            {
+                ok = false;
+            }
+        }
+        check("return_value_set_uint32_full_range_no_sign_extend", ok);
+    }
+
+    // ---- int64_t min/max take the 8-byte memcpy path (sizeof==8, so the
+    //      sign-extend branch is NOT taken) but must still land bit-exact.
+    {
+        bool ok{ true };
+        for (const std::int64_t v : { std::numeric_limits<std::int64_t>::min(),
+                                      std::int64_t{ -1 }, std::int64_t{ 0 },
+                                      std::int64_t{ 0x0123456789ABCDEFll },
+                                      std::numeric_limits<std::int64_t>::max() })
+        {
+            slot.retval = 0;
+            slot.cancel = false;
+            rv.set(v);
+            if (slot.retval != v || !slot.cancel)
+            {
+                ok = false;
+            }
+        }
+        check("return_value_set_int64_min_max_bit_exact", ok);
+    }
+
+    // ---- uint64_t min/max bit-fidelity (memcpy path).
+    {
+        bool ok{ true };
+        for (const std::uint64_t v : { std::uint64_t{ 0 },
+                                       std::uint64_t{ 0x8000000000000000ull },
+                                       std::numeric_limits<std::uint64_t>::max() })
+        {
+            slot.retval = 0;
+            slot.cancel = false;
+            rv.set(v);
+            if (static_cast<std::uint64_t>(slot.retval) != v)
+            {
+                ok = false;
+            }
+        }
+        check("return_value_set_uint64_min_max_bit_exact", ok);
+    }
+
+    // ---- Native fixed-width-equivalent types.  `signed char` and `short`
+    //      are < 8 bytes signed integrals -> sign-extend.  `char`'s signedness
+    //      is implementation-defined, so assert via static_cast round-trip
+    //      (works whether char is signed or unsigned).
+    {
+        slot.retval = -1; slot.cancel = false;
+        rv.set(static_cast<signed char>(-7));
+        check("return_value_set_signed_char_sign_extends",
+              slot.retval == static_cast<std::int64_t>(static_cast<signed char>(-7)));
+
+        slot.retval = -1; slot.cancel = false;
+        rv.set(static_cast<short>(-12345));
+        check("return_value_set_short_sign_extends",
+              slot.retval == static_cast<std::int64_t>(static_cast<short>(-12345)));
+
+        slot.retval = static_cast<std::int64_t>(0x9999999999999999ull);
+        slot.cancel = false;
+        const char cv{ static_cast<char>(0x80) };
+        rv.set(cv);
+        // If char is signed this sign-extends; if unsigned it zero-extends.
+        // Either way the slot must equal the int64 produced by the header's
+        // own branch selection, which we mirror with the same constexpr test.
+        if constexpr (std::is_signed_v<char>)
+        {
+            check("return_value_set_char_matches_signedness",
+                  slot.retval == static_cast<std::int64_t>(cv));
+        }
+        else
+        {
+            check("return_value_set_char_matches_signedness",
+                  slot.retval == static_cast<std::int64_t>(
+                      static_cast<std::uint64_t>(static_cast<unsigned char>(cv))));
+        }
+    }
+
+    // ---- `long` / `long long`.  `long`'s width is platform-dependent: on
+    //      LP64 (macOS/Linux) it is 8 bytes and takes set()'s memcpy path; on
+    //      LLP64/ILP32 (Windows) it is 4 bytes and takes the sign-extend path.
+    //      For a small negative input BOTH paths yield (int64_t)value, so a
+    //      single value-equality assertion is universally correct.  We compare
+    //      VALUE, never sizeof-vs-int64 identity: on LP64 `long` is 64-bit yet
+    //      a DISTINCT type from std::int64_t (which is `long long` there), so a
+    //      sizeof-keyed int64-identity trait would be wrong.
+    {
+        slot.retval = 0; slot.cancel = false;
+        rv.set(static_cast<long>(-9));
+        check("return_value_set_long_value_correct",
+              slot.retval == static_cast<std::int64_t>(static_cast<long>(-9)));
+
+        slot.retval = 0; slot.cancel = false;
+        rv.set(static_cast<long long>(-0x0123456789LL));
+        check("return_value_set_long_long_value_correct",
+              slot.retval == static_cast<std::int64_t>(
+                  static_cast<long long>(-0x0123456789LL)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E8. untag_pointer — EXHAUSTIVE bit-pattern coverage.
+//
+// The header masks with user_address_ceiling (0x0000_7FFF_FFFF_FFFF), so any
+// bit at position 47..63 is stripped and bits 0..46 are preserved.  We verify:
+//   * each individual high bit 47..63 set over a canonical base is stripped
+//   * bits 0..46 survive untouched
+//   * idempotence: untag(untag(p)) == untag(p)
+//   * the result is always <= ceiling (never above the user range)
+//   * nullptr round-trips to nullptr
+// ---------------------------------------------------------------------------
+static auto test_untag_pointer_exhaustive() -> void
+{
+    const std::uintptr_t ceiling{ vmhook::os::user_address_ceiling };
+
+    // A canonical, aligned base well inside the user range.
+    const std::uintptr_t base{ 0x0000123456789AB0ull };
+
+    bool all_high_bits_stripped{ true };
+    bool all_idempotent{ true };
+    bool all_within_ceiling{ true };
+
+    for (int bit{ 47 }; bit <= 63; ++bit)
+    {
+        const std::uintptr_t tag{ std::uintptr_t{ 1 } << bit };
+        const std::uintptr_t tagged{ base | tag };
+        const void* const once{ vmhook::hotspot::untag_pointer(
+            reinterpret_cast<void*>(tagged)) };
+        const std::uintptr_t once_val{ reinterpret_cast<std::uintptr_t>(once) };
+
+        if (once_val != base)
+        {
+            all_high_bits_stripped = false;
+        }
+        // Idempotence.
+        const void* const twice{ vmhook::hotspot::untag_pointer(once) };
+        if (reinterpret_cast<std::uintptr_t>(twice) != once_val)
+        {
+            all_idempotent = false;
+        }
+        // Result never exceeds the user ceiling.
+        if (once_val > ceiling)
+        {
+            all_within_ceiling = false;
+        }
+    }
+    check("untag_pointer_strips_every_high_bit_47_to_63", all_high_bits_stripped);
+    check("untag_pointer_idempotent_over_high_bits", all_idempotent);
+    check("untag_pointer_result_within_ceiling", all_within_ceiling);
+
+    // Bits 0..46 must be PRESERVED.  Build an all-low-bits-set value (the
+    // ceiling itself is exactly bits 0..46) and confirm it survives untouched.
+    check("untag_pointer_preserves_all_low_46_bits",
+          reinterpret_cast<std::uintptr_t>(vmhook::hotspot::untag_pointer(
+              reinterpret_cast<void*>(ceiling))) == ceiling);
+
+    // All-ones pointer collapses to exactly the ceiling (every high bit gone).
+    check("untag_pointer_all_ones_becomes_ceiling",
+          reinterpret_cast<std::uintptr_t>(vmhook::hotspot::untag_pointer(
+              reinterpret_cast<void*>(~std::uintptr_t{ 0 }))) == ceiling);
+
+    // nullptr round-trips.
+    check("untag_pointer_null_roundtrips",
+          vmhook::hotspot::untag_pointer(nullptr) == nullptr);
+
+    // Determinism over a spread of inputs.
+    bool deterministic{ true };
+    for (const std::uintptr_t p : { std::uintptr_t{ 0 }, base, base | (std::uintptr_t{ 1 } << 60),
+                                    ceiling, ~std::uintptr_t{ 0 } })
+    {
+        const void* const a{ vmhook::hotspot::untag_pointer(reinterpret_cast<void*>(p)) };
+        const void* const b{ vmhook::hotspot::untag_pointer(reinterpret_cast<void*>(p)) };
+        if (a != b)
+        {
+            deterministic = false;
+        }
+    }
+    check("untag_pointer_deterministic", deterministic);
+}
+
+// ---------------------------------------------------------------------------
+// E9. Helper INTERPLAY — is_valid_pointer gates the array helpers.
+//
+// array_length / get_array_element / set_array_element each call
+// is_valid_pointer(array_oop) FIRST.  This composition means: an oop that
+// fails the validity filter (odd low bit, sentinel pattern, or out-of-range)
+// short-circuits the array op to its zero/no-op result, even though the bytes
+// it points at would otherwise be a well-formed array header.  This is the
+// cross-helper behaviour unique to this file (raw element-value coverage lives
+// in test_array_element_helpers.cpp).
+// ---------------------------------------------------------------------------
+static auto test_is_valid_pointer_gates_array_helpers() -> void
+{
+    // Build a real, well-formed fake array on the heap (length 3 at +12).
+    const std::int32_t length{ 3 };
+    std::vector<std::uint8_t> buffer(16u + 3u * sizeof(std::int32_t), std::uint8_t{ 0 });
+    std::memcpy(buffer.data() + 12, &length, sizeof(length));
+    const std::int32_t e0{ 111 };
+    const std::int32_t e1{ 222 };
+    const std::int32_t e2{ 333 };
+    std::memcpy(buffer.data() + 16 + 0 * sizeof(std::int32_t), &e0, sizeof(e0));
+    std::memcpy(buffer.data() + 16 + 1 * sizeof(std::int32_t), &e1, sizeof(e1));
+    std::memcpy(buffer.data() + 16 + 2 * sizeof(std::int32_t), &e2, sizeof(e2));
+
+    void* const good_oop{ buffer.data() };
+
+    // Precondition: the heap buffer pointer is itself a valid oop (canonical,
+    // aligned), so the array helpers see it through.
+    check("interplay_buffer_is_valid_pointer",
+          vmhook::hotspot::is_valid_pointer(good_oop));
+    check("interplay_valid_oop_length_reads",
+          vmhook::array_length(good_oop) == length);
+    check("interplay_valid_oop_element_reads",
+          vmhook::get_array_element<std::int32_t>(good_oop, 1) == e1);
+
+    // Now corrupt ONLY the pointer's low bit (set bit 0).  is_valid_pointer
+    // rejects odd addresses, so EVERY array helper must short-circuit — even
+    // though +1 byte still points inside the same heap allocation.
+    void* const odd_oop{ reinterpret_cast<void*>(
+        reinterpret_cast<std::uintptr_t>(good_oop) | std::uintptr_t{ 1 }) };
+    check("interplay_odd_oop_is_invalid",
+          !vmhook::hotspot::is_valid_pointer(odd_oop));
+    check("interplay_odd_oop_length_is_zero",
+          vmhook::array_length(odd_oop) == 0);
+    check("interplay_odd_oop_get_returns_default",
+          vmhook::get_array_element<std::int32_t>(odd_oop, 0) == 0);
+    // set on an invalid oop is a no-op: prove it did not touch the buffer.
+    vmhook::set_array_element<std::int32_t>(odd_oop, 0, 99999);
+    check("interplay_odd_oop_set_is_noop",
+          vmhook::get_array_element<std::int32_t>(good_oop, 0) == e0);
+
+    // A sentinel-low-32 pointer (rejected by is_valid_pointer) likewise gates
+    // array_length to 0 without any dereference.
+    void* const sentinel_oop{ reinterpret_cast<void*>(
+        static_cast<std::uintptr_t>(0xDEADBEEFu)) };
+    check("interplay_sentinel_oop_is_invalid",
+          !vmhook::hotspot::is_valid_pointer(sentinel_oop));
+    check("interplay_sentinel_oop_length_is_zero",
+          vmhook::array_length(sentinel_oop) == 0);
+
+    // untag ∘ is_valid composition: a GC-tagged copy of a valid oop is itself
+    // rejected (the tag bit pushes it above the ceiling / off-canonical), but
+    // untag_pointer recovers the original, which is valid again.
+    void* const tagged_oop{ reinterpret_cast<void*>(
+        reinterpret_cast<std::uintptr_t>(good_oop) | (std::uintptr_t{ 1 } << 60)) };
+    check("interplay_tagged_oop_is_invalid",
+          !vmhook::hotspot::is_valid_pointer(tagged_oop));
+    void* const recovered{ const_cast<void*>(
+        vmhook::hotspot::untag_pointer(tagged_oop)) };
+    check("interplay_untag_recovers_valid_oop",
+          vmhook::hotspot::is_valid_pointer(recovered) && recovered == good_oop);
+    check("interplay_recovered_oop_length_reads_again",
+          vmhook::array_length(recovered) == length);
+}
+
+// ---------------------------------------------------------------------------
+// E10. field_proxy::set size guard — EXHAUSTIVE primitive width matrix.
+//
+// For every primitive descriptor, the RIGHT-sized C++ type writes its bytes
+// and the WRONG-sized types are refused (sentinel bytes survive).  This
+// completes the partial coverage in test_field_proxy_set_size_guard by
+// sweeping the full {descriptor} x {1,2,4,8-byte value} grid.
+// ---------------------------------------------------------------------------
+static auto test_field_proxy_set_size_guard_matrix() -> void
+{
+    // Helper: run set<T>(value) on a freshly-poisoned 16-byte buffer for the
+    // given descriptor, return whether the FIRST `field_size` bytes changed
+    // away from the 0xE7 poison (i.e. whether a write actually happened).
+    auto wrote_field = [](std::string descriptor, auto value, std::size_t field_size) -> bool
+    {
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0xE7 });
+        vmhook::field_proxy proxy{ storage.data(), std::move(descriptor), false };
+        proxy.set(value);
+        bool changed{ false };
+        for (std::size_t i{ 0 }; i < field_size; ++i)
+        {
+            if (storage[i] != 0xE7)
+            {
+                changed = true;
+            }
+        }
+        return changed;
+    };
+
+    // Right-sized writes SUCCEED (field bytes change).
+    check("fp_matrix_Z_int8_writes",
+          wrote_field("Z", std::int8_t{ 0x5A }, 1u));
+    check("fp_matrix_B_int8_writes",
+          wrote_field("B", std::int8_t{ 0x5A }, 1u));
+    check("fp_matrix_S_int16_writes",
+          wrote_field("S", std::int16_t{ 0x1234 }, 2u));
+    check("fp_matrix_C_uint16_writes",
+          wrote_field("C", std::uint16_t{ 0x1234 }, 2u));
+    check("fp_matrix_I_int32_writes",
+          wrote_field("I", std::int32_t{ 0x12345678 }, 4u));
+    check("fp_matrix_F_float_writes",
+          wrote_field("F", 1.5f, 4u));
+    check("fp_matrix_J_int64_writes",
+          wrote_field("J", std::int64_t{ 0x0123456789ABCDEFll }, 8u));
+    check("fp_matrix_D_double_writes",
+          wrote_field("D", 2.5, 8u));
+
+    // Wrong-sized writes are REFUSED (field bytes stay poison) — sweep the
+    // mismatches that the guard exists to stop.
+    check("fp_matrix_I_rejects_int64",
+          !wrote_field("I", std::int64_t{ -1 }, 4u));
+    check("fp_matrix_I_rejects_int16",
+          !wrote_field("I", std::int16_t{ -1 }, 4u));
+    check("fp_matrix_J_rejects_int32",
+          !wrote_field("J", std::int32_t{ -1 }, 8u));
+    check("fp_matrix_S_rejects_int32",
+          !wrote_field("S", std::int32_t{ -1 }, 2u));
+    check("fp_matrix_B_rejects_int32",
+          !wrote_field("B", std::int32_t{ -1 }, 1u));
+    check("fp_matrix_D_rejects_float",
+          !wrote_field("D", 1.0f, 8u));
+    check("fp_matrix_F_rejects_double",
+          !wrote_field("F", 1.0, 4u));
+
+    // Dedicated full-clobber check: int64 into "I" must leave ALL bytes after
+    // the 4-byte field at poison (the canonical adjacent-field-corruption bug).
+    {
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0xE7 });
+        vmhook::field_proxy proxy{ storage.data(), "I", false };
+        proxy.set(std::int64_t{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEull) });
+        bool all_poison{ true };
+        for (const std::uint8_t b : storage)
+        {
+            if (b != 0xE7)
+            {
+                all_poison = false;
+            }
+        }
+        check("fp_matrix_int64_into_I_no_clobber_anywhere", all_poison);
+    }
+
+    // The "C" + 1-byte-char widening special case writes 2 bytes (not 1, not 4)
+    // and zero-extends the char into the high byte.
+    {
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0xE7 });
+        vmhook::field_proxy proxy{ storage.data(), "C", false };
+        proxy.set(char{ 'Q' });
+        std::uint16_t wide{};
+        std::memcpy(&wide, storage.data(), sizeof(wide));
+        check("fp_matrix_C_char_widens_to_uint16",
+              wide == static_cast<std::uint16_t>(static_cast<unsigned char>('Q')));
+        check("fp_matrix_C_char_widen_preserves_byte2_3",
+              storage[2] == 0xE7 && storage[3] == 0xE7);
+    }
+
+    // A 2-byte uint16 into "C" takes the normal right-sized path (NOT the
+    // char-widen branch) and still writes exactly 2 bytes.
+    check("fp_matrix_C_uint16_right_size_writes",
+          wrote_field("C", std::uint16_t{ 0xBEEF }, 2u));
+    // A 4-byte int into "C" is a size mismatch and refused.
+    check("fp_matrix_C_rejects_int32",
+          !wrote_field("C", std::int32_t{ 0x11223344 }, 2u));
+
+    // Null field_pointer is always safe regardless of descriptor / type.
+    for (const char* d : { "I", "J", "Z", "C", "Ljava/lang/String;" })
+    {
+        vmhook::field_proxy proxy{ nullptr, d, false };
+        proxy.set(std::int32_t{ 7 });
+    }
+    check("fp_matrix_null_field_pointer_all_descriptors_safe", true);
+}
+
+// ---------------------------------------------------------------------------
+// E11. convert_jni_arg (via write_jni_arg_to_slot) — EXHAUSTIVE primitive
+//      union-slot + needs_release + full-width-clear coverage.
+//
+// The header zeroes the widest union member (out.j = 0) and sets
+// needs_release = false BEFORE the per-type branch, so every primitive arg
+// lands in the correct member with the upper bytes of the 8-byte cell clean
+// and is NEVER flagged for DeleteLocalRef.  We sweep boundary values for each
+// primitive and assert (a) the right member holds the value, (b) needs_release
+// stays false, and (c) the union's full 64-bit cell has no stale high bits for
+// narrow members.
+// ---------------------------------------------------------------------------
+// Endianness-AGNOSTIC "upper bytes clean" probe for the jni_value union.
+//
+// Every union member starts at byte offset 0, and convert_jni_arg zeroes the
+// full 8-byte cell (out.j = 0) before writing a narrow member, so a value of
+// width `active_bytes` occupies object-representation bytes [0, active_bytes)
+// and the remaining bytes [active_bytes, 8) must be zero — on BOTH byte orders
+// (we test which byte OFFSETS are zero, never a value-position bit shift).
+static auto union_upper_bytes_clear(const vmhook::detail::jni_value& value,
+                                    std::size_t active_bytes) -> bool
+{
+    std::array<unsigned char, sizeof(vmhook::detail::jni_value)> bytes{};
+    std::memcpy(bytes.data(), &value, bytes.size());
+    for (std::size_t i{ active_bytes }; i < bytes.size(); ++i)
+    {
+        if (bytes[i] != 0u)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static auto test_convert_jni_arg_primitive_exhaustive() -> void
+{
+    using vmhook::detail::write_jni_arg_to_slot;
+    using vmhook::detail::jni_value;
+
+    // bool: both values land in .z, are never released, and leave bytes 1..7
+    // of the cell zero.
+    {
+        bool all_ok{ true };
+        for (const bool bv : { false, true })
+        {
+            jni_value value{};
+            void* storage{ nullptr };
+            bool needs_release{ true };
+            write_jni_arg_to_slot(value, storage, needs_release, bv);
+            if (value.z != bv || needs_release
+                || !union_upper_bytes_clear(value, sizeof(bool)))
+            {
+                all_ok = false;
+            }
+        }
+        check("convert_jni_arg_bool_both_values_clean", all_ok);
+    }
+
+    // int32_t boundaries -> .i, bytes 4..7 of the cell must be zero.
+    {
+        bool all_ok{ true };
+        for (const std::int32_t iv : { std::numeric_limits<std::int32_t>::min(),
+                                       std::int32_t{ -1 }, std::int32_t{ 0 },
+                                       std::int32_t{ 1 },
+                                       std::numeric_limits<std::int32_t>::max() })
+        {
+            jni_value value{};
+            void* storage{ nullptr };
+            bool needs_release{ true };
+            write_jni_arg_to_slot(value, storage, needs_release, iv);
+            if (value.i != iv || needs_release
+                || !union_upper_bytes_clear(value, sizeof(std::int32_t)))
+            {
+                all_ok = false;
+            }
+        }
+        check("convert_jni_arg_int32_boundaries_clean_upper", all_ok);
+    }
+
+    // int64_t boundaries -> .j (fills the whole cell), never released.
+    {
+        bool all_ok{ true };
+        for (const std::int64_t jv : { std::numeric_limits<std::int64_t>::min(),
+                                       std::int64_t{ -1 }, std::int64_t{ 0 },
+                                       std::int64_t{ 0x1122334455667788ll },
+                                       std::numeric_limits<std::int64_t>::max() })
+        {
+            jni_value value{};
+            void* storage{ nullptr };
+            bool needs_release{ true };
+            write_jni_arg_to_slot(value, storage, needs_release, jv);
+            if (value.j != jv || needs_release)
+            {
+                all_ok = false;
+            }
+        }
+        check("convert_jni_arg_int64_boundaries_no_release", all_ok);
+    }
+
+    // int8_t -> .i via the <=4-byte integral branch (NOT .b): the header maps
+    // every integral <=4 bytes through out.i.  Confirm the int32 view matches
+    // the sign-extended-to-int32 value and bytes 4..7 are clean.
+    {
+        bool all_ok{ true };
+        for (const int raw : { -128, -1, 0, 1, 127 })
+        {
+            const std::int8_t bv{ static_cast<std::int8_t>(raw) };
+            jni_value value{};
+            void* storage{ nullptr };
+            bool needs_release{ true };
+            write_jni_arg_to_slot(value, storage, needs_release, bv);
+            if (value.i != static_cast<std::int32_t>(bv) || needs_release
+                || !union_upper_bytes_clear(value, sizeof(std::int32_t)))
+            {
+                all_ok = false;
+            }
+        }
+        check("convert_jni_arg_int8_routed_through_i_clean", all_ok);
+    }
+
+    // int16_t / uint16_t -> .i branch as well (<=4 bytes integral).
+    {
+        jni_value value{};
+        void* storage{ nullptr };
+        bool needs_release{ true };
+        write_jni_arg_to_slot(value, storage, needs_release, std::int16_t{ -12345 });
+        check("convert_jni_arg_int16_to_i",
+              value.i == static_cast<std::int32_t>(std::int16_t{ -12345 })
+              && !needs_release);
+    }
+    {
+        jni_value value{};
+        void* storage{ nullptr };
+        bool needs_release{ true };
+        write_jni_arg_to_slot(value, storage, needs_release, std::uint16_t{ 0xBEEF });
+        check("convert_jni_arg_uint16_to_i",
+              value.i == static_cast<std::int32_t>(std::uint16_t{ 0xBEEF })
+              && !needs_release);
+    }
+
+    // float / double bit-fidelity, never released.  float occupies 4 bytes;
+    // bytes 4..7 must be clean.
+    {
+        jni_value value{};
+        void* storage{ nullptr };
+        bool needs_release{ true };
+        write_jni_arg_to_slot(value, storage, needs_release, 1.5f);
+        check("convert_jni_arg_float_value_and_clean_upper",
+              value.f == 1.5f && !needs_release
+              && union_upper_bytes_clear(value, sizeof(float)));
+    }
+    {
+        jni_value value{};
+        void* storage{ nullptr };
+        bool needs_release{ true };
+        write_jni_arg_to_slot(value, storage, needs_release, 2.5);
+        check("convert_jni_arg_double_value_no_release",
+              value.d == 2.5 && !needs_release);
+    }
+
+    // The smoking-gun: a jlong whose bit pattern, read back as .l, looks like a
+    // heap pointer must NOT be flagged for release (union aliasing trap).
+    {
+        jni_value value{};
+        void* storage{ nullptr };
+        bool needs_release{ true };
+        write_jni_arg_to_slot(value, storage, needs_release,
+                              std::int64_t{ 0x00007F1234567890ll });
+        check("convert_jni_arg_pointerlike_jlong_no_release",
+              value.j == 0x00007F1234567890ll && !needs_release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E12. is_valid_pointer — sentinel rejection is INDEPENDENT of the upper 32
+//      bits.  The header keys the poison-pattern switch on the LOW 32 bits, so
+//      a pointer whose low half is a known sentinel must be rejected for ANY
+//      in-range upper half.  Also re-confirm the alignment + range gates over a
+//      systematic sweep.  (Element-value array tests live elsewhere; this is
+//      pure-filter coverage unique to the helper.)
+// ---------------------------------------------------------------------------
+static auto test_is_valid_pointer_sentinel_upper_half_exhaustive() -> void
+{
+    using vmhook::hotspot::is_valid_pointer;
+
+    const std::array<std::uint32_t, 9> sentinels{
+        0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+        0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu };
+
+    // For several DISTINCT in-range upper halves, every sentinel low-32 must be
+    // rejected (the switch must not be fooled by a non-zero upper half).
+    bool all_rejected{ true };
+    const std::array<std::uint64_t, 4> upper_halves{
+        0x00000000ull, 0x00000001ull, 0x00001234ull, 0x00007FFFull };
+    for (const std::uint64_t hi : upper_halves)
+    {
+        for (const std::uint32_t lo : sentinels)
+        {
+            const std::uintptr_t addr{ static_cast<std::uintptr_t>(
+                (hi << 32) | static_cast<std::uint64_t>(lo)) };
+            // Skip combos that land outside the user range entirely (those are
+            // rejected by the range gate anyway; we want to prove the SENTINEL
+            // gate works for in-range addresses).
+            if (addr <= vmhook::os::user_address_floor
+                || addr >= vmhook::os::user_address_ceiling)
+            {
+                continue;
+            }
+            if (is_valid_pointer(reinterpret_cast<void*>(addr)))
+            {
+                all_rejected = false;
+            }
+        }
+    }
+    check("is_valid_pointer_sentinels_rejected_for_any_upper_half", all_rejected);
+
+    // A NON-sentinel low-32 with the same in-range upper halves and even
+    // alignment must be ACCEPTED — proving the switch only rejects the listed
+    // patterns, not all addresses sharing those upper halves.
+    bool all_accepted{ true };
+    for (const std::uint64_t hi : upper_halves)
+    {
+        // even, non-sentinel low half
+        const std::uintptr_t addr{ static_cast<std::uintptr_t>((hi << 32) | 0x10002000ull) };
+        if (addr <= vmhook::os::user_address_floor
+            || addr >= vmhook::os::user_address_ceiling)
+        {
+            continue;
+        }
+        if (!is_valid_pointer(reinterpret_cast<void*>(addr)))
+        {
+            all_accepted = false;
+        }
+    }
+    check("is_valid_pointer_non_sentinel_in_range_even_accepted", all_accepted);
+
+    // Alignment gate: for a fixed in-range even base, setting bit 0 always
+    // rejects; clearing it always accepts (sweep several bases).
+    bool align_consistent{ true };
+    for (const std::uint64_t base : { 0x0000000010000000ull, 0x0000123400020000ull,
+                                      0x00007FFE00000000ull })
+    {
+        const std::uintptr_t even{ static_cast<std::uintptr_t>(base & ~std::uintptr_t{ 1 }) };
+        if (even <= vmhook::os::user_address_floor
+            || even >= vmhook::os::user_address_ceiling)
+        {
+            continue;
+        }
+        const std::uintptr_t odd{ even | std::uintptr_t{ 1 } };
+        if (!is_valid_pointer(reinterpret_cast<void*>(even))
+            || is_valid_pointer(reinterpret_cast<void*>(odd)))
+        {
+            align_consistent = false;
+        }
+    }
+    check("is_valid_pointer_alignment_gate_consistent", align_consistent);
+}
+
 int main()
 {
     test_version_macros();
@@ -1405,6 +2797,22 @@ int main()
     test_dr_armed_count_refcount();
 #endif
     test_version_string_composition();
+
+    // --- Exhaustive-input expansion (#38-immune no-JVM lane) ---------------
+    test_sig_char_to_basic_type_exhaustive();
+    test_jvm_primitive_byte_width_exhaustive();
+    test_memory_protection_enum_and_native_exhaustive();
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+    test_build_dr7_exhaustive();
+#endif
+    test_factory_registry_roundtrip();
+    test_jni_signature_for_arg_exhaustive();
+    test_return_value_set_sign_extension_exhaustive();
+    test_untag_pointer_exhaustive();
+    test_is_valid_pointer_gates_array_helpers();
+    test_field_proxy_set_size_guard_matrix();
+    test_convert_jni_arg_primitive_exhaustive();
+    test_is_valid_pointer_sentinel_upper_half_exhaustive();
 
     if (failures == 0)
     {
