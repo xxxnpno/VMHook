@@ -710,14 +710,687 @@ static_assert(probe::has_static_field_accessor<void_defaulted, std::string_view>
 static_assert(probe::has_static_method_accessor<void_defaulted, std::string_view>,
               "[characterization] object<void>-derived still exposes static_method "
               "(runtime no-op via typeid(void))");
+// object<void> exposes the gate-specific same-name static get_field/get_method
+// exactly as the gate dictates (the typeid is computed at the *body*, which the
+// detector never instantiates — so the SURFACE is identical to any other
+// derived type).  Couples the void-default misuse to the gate just like a
+// well-formed wrapper.
+#if VMHOOK_HAS_DEDUCING_THIS
+static_assert(probe::has_static_get_field<void_defaulted, std::string_view>,
+              "[gate ON] object<void>-derived still exposes the same-name static "
+              "get_field surface (typeid(void) only bites at the never-instantiated body)");
+#else
+static_assert(!probe::has_static_get_field<void_defaulted, std::string_view>,
+              "[gate OFF] object<void>-derived has NO same-name static get_field, same as "
+              "any other derived type");
+#endif
+
+// =============================================================================
+// 10. INSTANCE get_method / get_method(name, sig) — full argument-shape matrix
+// =============================================================================
+// Section 2 exhausted the instance get_field argument shapes and gave get_method
+// a representative few.  Here we complete the get_method side to the SAME breadth
+// get_field already has: every name-spelling category for the 1-arg form, and the
+// full NAME x SIG cross-product for the 2-arg form.  In BOTH gate states each of
+// these is a well-formed call expression on a live object yielding the optional
+// proxy (only the SELECTED overload differs — deducing-this char const* member vs
+// the inherited / static string_view path).
+
+// 1-arg instance get_method: every name-spelling category.
+static_assert(probe::has_instance_get_method<wrapper_class, char[2]>,
+              "instance get_method must accept a char array (literal) name");
+static_assert(probe::has_instance_get_method<wrapper_class, const char[6]>,
+              "instance get_method must accept a const char array name");
+static_assert(probe::has_instance_get_method<wrapper_class, std::string&>,
+              "instance get_method(std::string lvalue) must be a valid expression");
+static_assert(probe::has_instance_get_method<wrapper_class, const std::string&>,
+              "instance get_method(const std::string&) must be a valid expression");
+static_assert(probe::has_instance_get_method<wrapper_class, const std::string_view&>,
+              "instance get_method(const string_view&) must be a valid expression");
+
+// 2-arg instance get_method: the full NAME x SIG category cross-product.  Each
+// pairing must be a viable call on a live object in both gate states.
+static_assert(probe::has_instance_get_method2<wrapper_class, const char*, const char*>,
+              "instance get_method(const char*, const char*) must be valid");
+static_assert(probe::has_instance_get_method2<wrapper_class, const char*, std::string_view>,
+              "instance get_method(const char*, string_view) must be valid");
+static_assert(probe::has_instance_get_method2<wrapper_class, std::string_view, const char*>,
+              "instance get_method(string_view, const char*) must be valid");
+static_assert(probe::has_instance_get_method2<wrapper_class, std::string_view, std::string_view>,
+              "instance get_method(string_view, string_view) must be valid");
+static_assert(probe::has_instance_get_method2<wrapper_class, std::string&, std::string&>,
+              "instance get_method(std::string, std::string) must be valid");
+static_assert(probe::has_instance_get_method2<wrapper_class, const std::string&, const std::string&>,
+              "instance get_method(const std::string&, const std::string&) must be valid");
+static_assert(probe::has_instance_get_method2<wrapper_class, char[2], char[4]>,
+              "instance get_method(char[], char[]) must be valid (array names)");
+static_assert(probe::has_instance_get_method2<wrapper_class, const char*, char[4]>,
+              "instance get_method(const char*, char[]) mixed categories must be valid");
+
+// Return type of the 1-arg instance get_method for a string_view name is still
+// the method optional (whatever overload resolution picks).
+static_assert(std::is_same_v<
+                  decltype(std::declval<wrapper_class&>().get_method(std::string_view{ "m" })),
+                  std::optional<vmhook::method_proxy>>,
+              "instance get_method(string_view) must return std::optional<method_proxy>");
+static_assert(std::is_same_v<
+                  decltype(std::declval<wrapper_class&>().get_method(
+                      std::string_view{ "m" }, std::string_view{ "()I" })),
+                  std::optional<vmhook::method_proxy>>,
+              "instance get_method(string_view, string_view) must return std::optional<method_proxy>");
+
+// =============================================================================
+// 11. PORTABLE static accessor surface — complete argument & return matrix
+// =============================================================================
+// Section 3a covered the common static_field / static_method spellings.  Here we
+// finish the matrix: the 2-arg static_method across every name x sig category,
+// array-typed names, and the RETURN TYPE of the single-arg static_method (3a only
+// pinned the 2-arg return type).  These hold on EVERY toolchain — they are the
+// gate-agnostic portable spelling.
+static_assert(probe::has_static_field_accessor<wrapper_class, char[2]>,
+              "static_field must accept a char-array (literal) name on every toolchain");
+static_assert(probe::has_static_field_accessor<wrapper_class, const std::string&>,
+              "static_field(const std::string&) must exist on every toolchain");
+static_assert(probe::has_static_field_accessor<wrapper_class, const std::string_view&>,
+              "static_field(const string_view&) must exist on every toolchain");
+static_assert(probe::has_static_method_accessor<wrapper_class, char[2]>,
+              "static_method must accept a char-array name on every toolchain");
+static_assert(probe::has_static_method_accessor<wrapper_class, std::string&>,
+              "static_method(std::string) must exist on every toolchain");
+static_assert(probe::has_static_method_accessor2<wrapper_class, std::string&, std::string&>,
+              "static_method(std::string, std::string) must exist on every toolchain");
+static_assert(probe::has_static_method_accessor2<wrapper_class, const char*, std::string_view>,
+              "static_method(const char*, string_view) mixed names must exist everywhere");
+static_assert(probe::has_static_method_accessor2<wrapper_class, std::string_view, const char*>,
+              "static_method(string_view, const char*) mixed names must exist everywhere");
+static_assert(probe::has_static_method_accessor2<wrapper_class, char[2], char[4]>,
+              "static_method(char[], char[]) array names must exist everywhere");
+
+// The single-arg static_method return type (3a only asserted the 2-arg form).
+static_assert(std::is_same_v<
+                  decltype(wrapper_class::static_method("m")),
+                  std::optional<vmhook::method_proxy>>,
+              "static_method(name) must return std::optional<method_proxy>");
+// static_field with a string_view argument return type (3a only used a literal).
+static_assert(std::is_same_v<
+                  decltype(wrapper_class::static_field(std::string_view{ "a" })),
+                  std::optional<vmhook::field_proxy>>,
+              "static_field(string_view) must return std::optional<field_proxy>");
+
+// The portable static idiom with name+signature, end to end.
+static_assert(std::is_same_v<
+                  decltype(wrapper_class::static_method("m", "()I")->call()),
+                  vmhook::method_proxy::value_t>,
+              "static_method(\"m\", \"()I\")->call() must yield method_proxy::value_t");
+
+// =============================================================================
+// 12. field_proxy::get() -> value_t : chained conversion to EVERY target
+// =============================================================================
+// Section 2 proved get_field("x")->get() yields value_t and converts to int.
+// Here we prove the chained one-liner `get_field(name)->get()` is convertible to
+// the FULL set of legitimate value_t targets, through BOTH the instance idiom AND
+// the portable static idiom — i.e. both call sites land on the same value_t whose
+// constrained operator admits the same target set.  (Unevaluated; no JVM call.)
+
+namespace chain_probe
+{
+    // The exact value_t each idiom's get() yields (instance + portable static).
+    using inst_field_value =
+        decltype(std::declval<wrapper_class&>().get_field("a")->get());
+    using stat_field_value =
+        decltype(wrapper_class::static_field("a")->get());
+
+    // Both idioms must land on field_proxy::value_t (one value-conversion surface).
+    static_assert(std::is_same_v<inst_field_value, vmhook::field_proxy::value_t>);
+    static_assert(std::is_same_v<stat_field_value, vmhook::field_proxy::value_t>);
+
+    // A compile-time check that BOTH idioms' value_t convert to target_t.
+    template<typename target_t>
+    inline constexpr bool both_field_idioms_convert_to =
+        std::is_convertible_v<inst_field_value, target_t>
+        && std::is_convertible_v<stat_field_value, target_t>;
+}
+
+static_assert(chain_probe::both_field_idioms_convert_to<bool>,
+              "get_field(name)->get() must convert to bool from instance AND static idioms");
+static_assert(chain_probe::both_field_idioms_convert_to<std::int8_t>,   "...->get() -> int8_t (both idioms)");
+static_assert(chain_probe::both_field_idioms_convert_to<std::int16_t>,  "...->get() -> int16_t (both idioms)");
+static_assert(chain_probe::both_field_idioms_convert_to<std::int32_t>,  "...->get() -> int32_t (both idioms)");
+static_assert(chain_probe::both_field_idioms_convert_to<std::int64_t>,  "...->get() -> int64_t (both idioms)");
+static_assert(chain_probe::both_field_idioms_convert_to<float>,         "...->get() -> float (both idioms)");
+static_assert(chain_probe::both_field_idioms_convert_to<double>,        "...->get() -> double (both idioms)");
+static_assert(chain_probe::both_field_idioms_convert_to<std::uint16_t>, "...->get() -> uint16_t/char (both idioms)");
+static_assert(chain_probe::both_field_idioms_convert_to<std::uint32_t>, "...->get() -> uint32_t/OOP (both idioms)");
+static_assert(chain_probe::both_field_idioms_convert_to<std::string>,   "...->get() -> std::string (both idioms)");
+static_assert(chain_probe::both_field_idioms_convert_to<void*>,         "...->get() -> void* (both idioms)");
+static_assert(chain_probe::both_field_idioms_convert_to<std::vector<int>>,
+              "...->get() -> std::vector<int> (array field, both idioms)");
+
+// The excised targets must be NON-convertible from the chained one-liner too
+// (the constraint travels with the value_t regardless of call site).
+static_assert(!std::is_convertible_v<chain_probe::inst_field_value, const char*>,
+              "get_field(name)->get() must NOT convert to const char* (excised)");
+static_assert(!std::is_convertible_v<chain_probe::stat_field_value, std::nullptr_t>,
+              "static_field(name)->get() must NOT convert to nullptr_t (excised)");
+static_assert(!std::is_convertible_v<chain_probe::inst_field_value, int*>,
+              "get_field(name)->get() must NOT convert to a non-void pointer (excised)");
+
+// as_string() is the unambiguous String extraction on the value_t get() returns
+// (NOT on the field_proxy); its return type is std::string from both idioms.
+static_assert(std::is_same_v<
+                  decltype(std::declval<wrapper_class&>().get_field("name")->get().as_string()),
+                  std::string>,
+              "get_field(name)->get().as_string() must return std::string (instance idiom)");
+static_assert(std::is_same_v<
+                  decltype(wrapper_class::static_field("name")->get().as_string()),
+                  std::string>,
+              "static_field(name)->get().as_string() must return std::string (static idiom)");
+
+// =============================================================================
+// 13. method_proxy reachable surface — introspection + value_t after a call
+// =============================================================================
+// Everything reachable from `get_method(...)->` and from `...->call()` — the
+// proxy introspectors and the method value_t's own surface.  All compile-time
+// return-type / convertibility probes; no method is ever invoked.
+
+namespace mproxy_probe
+{
+    using mp = vmhook::method_proxy;
+    using mv = vmhook::method_proxy::value_t;
+}
+
+// method_proxy introspection return types (reachable via get_method(...)->).
+static_assert(std::is_same_v<decltype(std::declval<const mproxy_probe::mp&>().name()), std::string>,
+              "method_proxy::name() must return std::string");
+static_assert(std::is_same_v<decltype(std::declval<const mproxy_probe::mp&>().signature()), std::string_view>,
+              "method_proxy::signature() must return std::string_view");
+static_assert(std::is_same_v<decltype(std::declval<const mproxy_probe::mp&>().is_static()), bool>,
+              "method_proxy::is_static() must return bool");
+static_assert(std::is_same_v<decltype(std::declval<const mproxy_probe::mp&>().is_reference()), bool>,
+              "method_proxy::is_reference() must return bool");
+
+// method value_t introspection + extraction return types.
+static_assert(std::is_same_v<decltype(std::declval<const mproxy_probe::mv&>().is_void()), bool>,
+              "method value_t::is_void() must return bool");
+static_assert(std::is_same_v<decltype(std::declval<const mproxy_probe::mv&>().is_string()), bool>,
+              "method value_t::is_string() must return bool");
+static_assert(std::is_same_v<decltype(std::declval<const mproxy_probe::mv&>().as_string()), std::string>,
+              "method value_t::as_string() must return std::string");
+
+// The full chained one-liner get_method(name)->call() -> value_t convertibility,
+// from instance AND portable static idioms.
+namespace mchain_probe
+{
+    using inst_mv = decltype(std::declval<wrapper_class&>().get_method("m")->call());
+    using stat_mv = decltype(wrapper_class::static_method("m")->call());
+    static_assert(std::is_same_v<inst_mv, vmhook::method_proxy::value_t>);
+    static_assert(std::is_same_v<stat_mv, vmhook::method_proxy::value_t>);
+
+    template<typename target_t>
+    inline constexpr bool both_method_idioms_convert_to =
+        std::is_convertible_v<inst_mv, target_t>
+        && std::is_convertible_v<stat_mv, target_t>;
+}
+static_assert(mchain_probe::both_method_idioms_convert_to<bool>,         "call() -> bool (both idioms)");
+static_assert(mchain_probe::both_method_idioms_convert_to<std::int32_t>, "call() -> int32_t (both idioms)");
+static_assert(mchain_probe::both_method_idioms_convert_to<std::int64_t>, "call() -> int64_t (both idioms)");
+static_assert(mchain_probe::both_method_idioms_convert_to<float>,        "call() -> float (both idioms)");
+static_assert(mchain_probe::both_method_idioms_convert_to<double>,       "call() -> double (both idioms)");
+static_assert(mchain_probe::both_method_idioms_convert_to<std::string>,  "call() -> std::string (both idioms)");
+static_assert(mchain_probe::both_method_idioms_convert_to<void*>,        "call() -> void* (both idioms)");
+static_assert(mchain_probe::both_method_idioms_convert_to<std::unique_ptr<other_wrapper>>,
+              "call() -> unique_ptr<W> (Object-returning method, both idioms)");
+static_assert(!mchain_probe::both_method_idioms_convert_to<const char*>,
+              "call() must NOT convert to const char* (excised, both idioms)");
+static_assert(!mchain_probe::both_method_idioms_convert_to<other_wrapper*>,
+              "call() must NOT convert to a raw wrapper pointer (excised, both idioms)");
+
+// =============================================================================
+// 14. value_t_convertible_target_v — exhaustive classification sweep
+// =============================================================================
+// The selection gate the constrained operator T() uses.  Section 5c sampled it;
+// here we sweep it to closure: EVERY variant alternative type is a legitimate
+// target; EVERY pointer-to-non-void (with every cv-qualifier combination) is
+// excised; void* with every cv combination is admitted; nullptr_t is excised;
+// container / wrapper targets are admitted; references are stripped first.
+namespace vt
+{
+    using vmhook::detail::value_t_convertible_target_v;
+}
+
+// 14a. Every alternative type carried by the variants is a legitimate target.
+static_assert(vt::value_t_convertible_target_v<bool>,          "trait: bool legitimate");
+static_assert(vt::value_t_convertible_target_v<std::int8_t>,   "trait: int8_t legitimate");
+static_assert(vt::value_t_convertible_target_v<std::int16_t>,  "trait: int16_t legitimate");
+static_assert(vt::value_t_convertible_target_v<std::int32_t>,  "trait: int32_t legitimate");
+static_assert(vt::value_t_convertible_target_v<std::int64_t>,  "trait: int64_t legitimate");
+static_assert(vt::value_t_convertible_target_v<float>,         "trait: float legitimate");
+static_assert(vt::value_t_convertible_target_v<double>,        "trait: double legitimate");
+static_assert(vt::value_t_convertible_target_v<std::uint16_t>, "trait: uint16_t legitimate");
+static_assert(vt::value_t_convertible_target_v<std::uint32_t>, "trait: uint32_t legitimate");
+
+// 14b. Other arithmetic / character targets pass through (non-pointer scalars).
+static_assert(vt::value_t_convertible_target_v<char>,          "trait: char legitimate");
+static_assert(vt::value_t_convertible_target_v<char16_t>,      "trait: char16_t legitimate");
+static_assert(vt::value_t_convertible_target_v<unsigned long long>, "trait: unsigned long long legitimate");
+static_assert(vt::value_t_convertible_target_v<long double>,   "trait: long double legitimate");
+
+// 14c. void* (the SOLE permitted pointer) under every cv-qualifier combination.
+static_assert(vt::value_t_convertible_target_v<void*>,               "trait: void* legitimate");
+static_assert(vt::value_t_convertible_target_v<const void*>,         "trait: const void* legitimate");
+static_assert(vt::value_t_convertible_target_v<volatile void*>,      "trait: volatile void* legitimate");
+static_assert(vt::value_t_convertible_target_v<const volatile void*>,"trait: const volatile void* legitimate");
+static_assert(vt::value_t_convertible_target_v<void* const>,         "trait: void* const (top-level cv stripped) legitimate");
+
+// 14d. Every pointer-to-non-void is excised, across cv-qualifiers and element types.
+static_assert(!vt::value_t_convertible_target_v<char*>,           "trait: char* excised");
+static_assert(!vt::value_t_convertible_target_v<const char*>,     "trait: const char* excised");
+static_assert(!vt::value_t_convertible_target_v<volatile char*>,  "trait: volatile char* excised");
+static_assert(!vt::value_t_convertible_target_v<int*>,            "trait: int* excised");
+static_assert(!vt::value_t_convertible_target_v<const int*>,      "trait: const int* excised");
+static_assert(!vt::value_t_convertible_target_v<double*>,         "trait: double* excised");
+static_assert(!vt::value_t_convertible_target_v<void**>,          "trait: void** (ptr-to-ptr, element is void*) excised");
+static_assert(!vt::value_t_convertible_target_v<other_wrapper*>,  "trait: W* excised");
+static_assert(!vt::value_t_convertible_target_v<const other_wrapper*>, "trait: const W* excised");
+
+// 14e. nullptr_t is excised under every cv-ref qualifier (stripped, then matched).
+static_assert(!vt::value_t_convertible_target_v<std::nullptr_t>,         "trait: nullptr_t excised");
+static_assert(!vt::value_t_convertible_target_v<const std::nullptr_t>,   "trait: const nullptr_t excised");
+static_assert(!vt::value_t_convertible_target_v<std::nullptr_t&>,        "trait: nullptr_t& excised (ref stripped)");
+static_assert(!vt::value_t_convertible_target_v<const std::nullptr_t&>,  "trait: const nullptr_t& excised");
+
+// 14f. Class / container / wrapper targets pass through.
+static_assert(vt::value_t_convertible_target_v<std::string>,                       "trait: std::string legitimate");
+static_assert(vt::value_t_convertible_target_v<std::vector<int>>,                  "trait: vector<int> legitimate");
+static_assert(vt::value_t_convertible_target_v<std::vector<std::string>>,          "trait: vector<string> legitimate");
+static_assert(vt::value_t_convertible_target_v<std::unique_ptr<other_wrapper>>,    "trait: unique_ptr<W> legitimate");
+static_assert(vt::value_t_convertible_target_v<std::unique_ptr<wrapper_class>>,    "trait: unique_ptr<wrapper_class> legitimate");
+
+// 14g. cv-ref stripping: a pointer-to-non-void stays excised through references;
+// void* stays admitted through references; a legitimate class target through ref.
+static_assert(!vt::value_t_convertible_target_v<char* const&>,     "trait: char* const& excised (ref+cv stripped)");
+static_assert(!vt::value_t_convertible_target_v<const char* const&>,"trait: const char* const& excised");
+static_assert(!vt::value_t_convertible_target_v<int* &&>,          "trait: int*&& excised");
+static_assert(vt::value_t_convertible_target_v<void* &>,           "trait: void*& legitimate (ref stripped to void*)");
+static_assert(vt::value_t_convertible_target_v<const void* const&>, "trait: const void* const& legitimate");
+static_assert(vt::value_t_convertible_target_v<std::string&&>,     "trait: std::string&& legitimate (ref stripped)");
+static_assert(vt::value_t_convertible_target_v<std::unique_ptr<other_wrapper>&&>,
+              "trait: unique_ptr<W>&& legitimate (ref stripped)");
+
+// =============================================================================
+// 15. field_proxy::set(value) — complete acceptance matrix
+// =============================================================================
+// Section 6 sampled set().  Complete it: every JVM-primitive C++ representative,
+// reference / cv-qualified categories (set takes `const value_type&`, so it must
+// accept every value category), wider vector element types, and the value_t
+// round-trip (writing back a value_t read from get()).
+static_assert(set_probe::set_ok<std::uint8_t>,   "set(uint8_t) must be viable");
+static_assert(set_probe::set_ok<std::uint16_t>,  "set(uint16_t) must be viable");
+static_assert(set_probe::set_ok<std::uint32_t>,  "set(uint32_t) must be viable (compressed OOP / char)");
+static_assert(set_probe::set_ok<std::uint64_t>,  "set(uint64_t) must be viable");
+static_assert(set_probe::set_ok<char>,           "set(char) must be viable");
+static_assert(set_probe::set_ok<char16_t>,       "set(char16_t) must be viable");
+// Reference / cv categories (set's parameter is `const value_type&`).
+static_assert(set_probe::set_ok<int&>,           "set(int& lvalue) must be viable");
+static_assert(set_probe::set_ok<const int&>,     "set(const int&) must be viable");
+static_assert(set_probe::set_ok<int&&>,          "set(int&& rvalue) must be viable");
+static_assert(set_probe::set_ok<const std::string&>, "set(const std::string&) must be viable");
+static_assert(set_probe::set_ok<std::string&&>,  "set(std::string&& rvalue) must be viable");
+// const char* / string_view string writes.
+static_assert(set_probe::set_ok<const char*>,    "set(const char*) must be viable (String field write)");
+static_assert(set_probe::set_ok<std::string_view>, "set(std::string_view) must be viable");
+// Wider vector element types (array field writes).
+static_assert(set_probe::set_ok<std::vector<bool>>,        "set(vector<bool>) must be viable");
+static_assert(set_probe::set_ok<std::vector<std::int8_t>>, "set(vector<int8_t>) must be viable");
+static_assert(set_probe::set_ok<std::vector<std::int64_t>>,"set(vector<int64_t>) must be viable");
+static_assert(set_probe::set_ok<std::vector<float>>,       "set(vector<float>) must be viable");
+static_assert(set_probe::set_ok<std::vector<double>>,      "set(vector<double>) must be viable");
+// The value_t round-trip: set() must accept the exact value_t get() returns, so
+// `proxy->set(other_proxy->get())` compiles (read-then-write idiom).
+static_assert(set_probe::set_ok<vmhook::field_proxy::value_t>,
+              "set(field_proxy::value_t) must be viable (read-then-write round-trip)");
+
+// =============================================================================
+// 16. noexcept contracts of the reachable surface
+// =============================================================================
+// Every entry point the unified call syntax routes to is documented noexcept.
+// These are compile-time noexcept(expr) probes (unevaluated operands).
+static_assert(noexcept(std::declval<const vmhook::method_proxy&>().call()),
+              "method_proxy::call() must be noexcept");
+static_assert(noexcept(std::declval<const vmhook::method_proxy&>().call(1, 2.0, true)),
+              "method_proxy::call(args...) must be noexcept");
+static_assert(noexcept(std::declval<const vmhook::field_proxy&>().get()),
+              "field_proxy::get() must be noexcept");
+static_assert(noexcept(std::declval<const vmhook::field_proxy&>().set(42)),
+              "field_proxy::set() must be noexcept");
+static_assert(noexcept(std::declval<const vmhook::field_proxy::value_t&>().as_string()),
+              "field value_t::as_string() must be noexcept");
+static_assert(noexcept(std::declval<const vmhook::method_proxy::value_t&>().as_string()),
+              "method value_t::as_string() must be noexcept");
+static_assert(noexcept(static_cast<int>(std::declval<const vmhook::field_proxy::value_t&>())),
+              "field value_t::operator T() must be noexcept");
+static_assert(noexcept(static_cast<int>(std::declval<const vmhook::method_proxy::value_t&>())),
+              "method value_t::operator T() must be noexcept");
+// The accessors themselves are NOT marked noexcept in the header (they allocate a
+// std::string for the cache key and may throw std::bad_alloc); pin that contract
+// so a future noexcept addition is a deliberate, visible change.
+static_assert(!noexcept(std::declval<wrapper_class&>().get_field("a")),
+              "instance get_field is NOT noexcept (documents the current contract)");
+static_assert(!noexcept(wrapper_class::static_field("a")),
+              "static_field is NOT noexcept (documents the current contract)");
+
+// =============================================================================
+// 17. Cross-gate equivalence + deducing-this receiver value-category matrix
+// =============================================================================
+// 17a. The instance idiom and the portable static idiom return the SAME proxy
+// optionals — the unified-syntax promise that one spelling family yields one
+// result type, independent of call context and gate state.
+static_assert(std::is_same_v<
+                  decltype(std::declval<wrapper_class&>().get_field("a")),
+                  decltype(wrapper_class::static_field("a"))>,
+              "instance get_field and portable static_field must return the same type");
+static_assert(std::is_same_v<
+                  decltype(std::declval<wrapper_class&>().get_method("m")),
+                  decltype(wrapper_class::static_method("m"))>,
+              "instance get_method and portable static_method must return the same type");
+static_assert(std::is_same_v<
+                  decltype(std::declval<wrapper_class&>().get_method("m", "()I")),
+                  decltype(wrapper_class::static_method("m", "()I"))>,
+              "instance get_method(name,sig) and portable static_method(name,sig) must match");
+
+// 17b. Receiver value-category matrix.  The deducing-this explicit-object
+// parameter is `this object_base const& self` — a const lvalue reference, which
+// binds a const lvalue, a non-const lvalue, AND an rvalue receiver.  When gate
+// OFF the inherited instance member is `const`, which is equally bindable from
+// all three categories.  So the instance idiom must be a valid expression on a
+// const object, a non-const object, and an rvalue object in BOTH gate states.
+namespace recv_probe
+{
+    template<typename recv_t>
+    concept get_field_on =
+        requires(recv_t r) { { r.get_field("a") } -> std::same_as<std::optional<vmhook::field_proxy>>; };
+    template<typename recv_t>
+    concept get_method_on =
+        requires(recv_t r) { { r.get_method("m") } -> std::same_as<std::optional<vmhook::method_proxy>>; };
+}
+// declval<T&> = lvalue, declval<const T&> = const lvalue, declval<T&&> = rvalue.
+static_assert(recv_probe::get_field_on<wrapper_class&>,
+              "get_field callable on a non-const lvalue receiver");
+static_assert(recv_probe::get_field_on<const wrapper_class&>,
+              "get_field callable on a const lvalue receiver (deducing-this self is const&)");
+static_assert(recv_probe::get_field_on<wrapper_class&&>,
+              "get_field callable on an rvalue receiver");
+static_assert(recv_probe::get_method_on<wrapper_class&>,
+              "get_method callable on a non-const lvalue receiver");
+static_assert(recv_probe::get_method_on<const wrapper_class&>,
+              "get_method callable on a const lvalue receiver");
+static_assert(recv_probe::get_method_on<wrapper_class&&>,
+              "get_method callable on an rvalue receiver");
+
+#if VMHOOK_HAS_DEDUCING_THIS
+// 17c. gate ON only: the deducing-this instance overload takes char const*.  A
+// const char* literal binds it directly; the return type is the field optional.
+// (This is the exact-match path that outranks the string_view static from an
+// instance context — the half of the unified contract that routes to the live
+// OOP.)
+static_assert(std::is_same_v<
+                  decltype(std::declval<const wrapper_class&>().get_field("a")),
+                  std::optional<vmhook::field_proxy>>,
+              "[gate ON] deducing-this get_field on a const receiver yields the field optional");
+#endif
+
+// =============================================================================
+// 18. NEGATIVE / ill-formed spellings — the rejection contract (SFINAE oracle)
+// =============================================================================
+// Detection-idiom proofs that genuinely ill-formed call shapes are NOT viable.
+// These are the SFINAE-observable negatives (overload resolution / arity), as
+// opposed to the body-instantiation negatives that call_ok cannot see.
+namespace neg_probe
+{
+    // Wrong ARITY on the accessors.
+    template<typename w>
+    concept get_field_zero_arg = requires { { w::static_field() }; };
+    template<typename w>
+    concept get_field_three_arg =
+        requires(std::string_view a) { { w::static_field(a, a, a) }; };
+    template<typename w>
+    concept static_method_three_arg =
+        requires(std::string_view a) { { w::static_method(a, a, a) }; };
+
+    // A name argument of a type with NO conversion to string_view / char const*
+    // (e.g. int) must not produce a viable call in any context.
+    template<typename w>
+    concept get_field_int_name =
+        requires(int n) { { std::declval<w&>().get_field(n) }; };
+    template<typename w>
+    concept static_field_int_name =
+        requires(int n) { { w::static_field(n) }; };
+
+    // set() with NO argument is ill-formed (the template needs one value).
+    template<typename f>
+    concept set_zero_arg = requires(const f& p) { { p.set() }; };
+}
+static_assert(!neg_probe::get_field_zero_arg<wrapper_class>,
+              "static_field() with no name must be ill-formed (a name is required)");
+static_assert(!neg_probe::get_field_three_arg<wrapper_class>,
+              "static_field(a,b,c) — there is no 3-arg field accessor");
+static_assert(!neg_probe::static_method_three_arg<wrapper_class>,
+              "static_method(a,b,c) — there is no 3-arg method accessor");
+static_assert(!neg_probe::get_field_int_name<wrapper_class>,
+              "get_field(int) must be ill-formed (int is not a name spelling)");
+static_assert(!neg_probe::static_field_int_name<wrapper_class>,
+              "static_field(int) must be ill-formed (int is not a name spelling)");
+static_assert(!neg_probe::set_zero_arg<vmhook::field_proxy>,
+              "field_proxy::set() with no value must be ill-formed");
+
+// The excised value_t conversions stated as a hard rejection oracle through the
+// detection idiom (a static_cast to an excised target must be ill-formed — the
+// constraint removes the operator from the overload set).
+namespace cast_neg
+{
+    template<typename value_t, typename target_t>
+    concept static_castable =
+        requires(const value_t& v) { { static_cast<target_t>(v) }; };
+}
+static_assert(!cast_neg::static_castable<vmhook::field_proxy::value_t, const char*>,
+              "static_cast<const char*>(field value_t) must be ill-formed (operator excised)");
+static_assert(!cast_neg::static_castable<vmhook::field_proxy::value_t, std::nullptr_t>,
+              "static_cast<nullptr_t>(field value_t) must be ill-formed (operator excised)");
+static_assert(!cast_neg::static_castable<vmhook::method_proxy::value_t, other_wrapper*>,
+              "static_cast<W*>(method value_t) must be ill-formed (operator excised)");
+// ...while a legitimate static_cast IS well-formed (positive control).
+static_assert(cast_neg::static_castable<vmhook::field_proxy::value_t, std::string>,
+              "static_cast<std::string>(field value_t) must be well-formed (operator admitted)");
+static_assert(cast_neg::static_castable<vmhook::method_proxy::value_t, void*>,
+              "static_cast<void*>(method value_t) must be well-formed (operator admitted)");
+
+// =============================================================================
+// 19. CHARACTERIZATION — the name+signature instance routing split (gate-aware)
+// =============================================================================
+// Section 8 pinned the 1-arg get_field split.  The 2-arg get_method has the SAME
+// gate-dependent routing: the deducing-this 2-arg instance overload takes
+// (char const*, char const*).  A string_view name+sig from an instance context
+// does NOT match it (gate ON) and binds the static (string_view, string_view)
+// fallback instead — observable as: the same 2-arg call is ALSO valid object-less.
+#if VMHOOK_HAS_DEDUCING_THIS
+static_assert(probe::has_static_get_method2<wrapper_class, std::string_view, std::string_view>,
+              "[characterization, gate ON] a (string_view, string_view) name+sig is ALSO "
+              "accepted object-less — an instance-context get_method(sv, sv) binds the STATIC "
+              "(string_view, string_view) fallback (typeid(derived) path), not the "
+              "(char const*, char const*) deducing-this instance overload");
+#else
+static_assert(!probe::has_static_get_method2<wrapper_class, std::string_view, std::string_view>,
+              "[characterization, gate OFF] there is NO static get_method(name, sig); a "
+              "(string_view, string_view) name+sig from an instance context binds the inherited "
+              "instance overload (live OOP), and the object-less form is ill-formed");
+#endif
+// Gate-invariant half: the instance 2-arg call expression is valid for every
+// name/sig spelling in BOTH states (only the selected overload differs).
+static_assert(probe::has_instance_get_method2<wrapper_class, const char*, const char*>
+              && probe::has_instance_get_method2<wrapper_class, std::string_view, std::string_view>
+              && probe::has_instance_get_method2<wrapper_class, std::string&, std::string&>,
+              "instance get_method(name, sig) must be valid for literal / string_view / "
+              "std::string spellings in BOTH gate states");
+
+// =============================================================================
+// 20. other_wrapper / second-wrapper surface parity
+// =============================================================================
+// The same unified call syntax must hold on a DIFFERENT registered wrapper type
+// (one declared with `using object<W>::object;` rather than a bespoke ctor) so
+// the contract is per-type, not a quirk of wrapper_class.
+static_assert(probe::has_instance_get_field<other_wrapper, const char*>,
+              "instance get_field must be callable on other_wrapper too");
+static_assert(probe::has_instance_get_method2<other_wrapper, const char*, const char*>,
+              "instance get_method(name, sig) must be callable on other_wrapper too");
+static_assert(probe::has_static_field_accessor<other_wrapper, std::string_view>,
+              "static_field must exist on other_wrapper too");
+static_assert(probe::has_static_method_accessor2<other_wrapper, std::string_view, std::string_view>,
+              "static_method(name, sig) must exist on other_wrapper too");
+static_assert(std::is_same_v<
+                  decltype(std::declval<other_wrapper&>().get_field("a")),
+                  decltype(other_wrapper::static_field("a"))>,
+              "other_wrapper: instance get_field and static_field return the same type");
+#if VMHOOK_HAS_DEDUCING_THIS
+static_assert(probe::has_static_get_field<other_wrapper, std::string_view>,
+              "[gate ON] other_wrapper also exposes the same-name static get_field");
+#else
+static_assert(!probe::has_static_get_field<other_wrapper, std::string_view>,
+              "[gate OFF] other_wrapper also lacks the same-name static get_field");
+#endif
+
+// =============================================================================
+// 21. proxy / optional value-semantics invariants the idiom relies on
+// =============================================================================
+// The `get_field(name)->get()` one-liner dereferences a std::optional<proxy>
+// without checking has_value() — that compiles iff the optional's value_type is
+// exactly the proxy and operator-> yields a proxy.  Pin those structural facts.
+static_assert(std::is_same_v<std::optional<vmhook::field_proxy>::value_type, vmhook::field_proxy>,
+              "optional<field_proxy>::value_type is field_proxy");
+static_assert(std::is_same_v<std::optional<vmhook::method_proxy>::value_type, vmhook::method_proxy>,
+              "optional<method_proxy>::value_type is method_proxy");
+static_assert(std::is_same_v<
+                  decltype(std::declval<std::optional<vmhook::field_proxy>&>().operator->()),
+                  vmhook::field_proxy*>,
+              "optional<field_proxy>::operator-> yields field_proxy* (the idiom's deref target)");
+// The proxies must be copyable/movable so the optional can hold and return them.
+static_assert(std::is_copy_constructible_v<vmhook::field_proxy>,  "field_proxy must be copy-constructible");
+static_assert(std::is_move_constructible_v<vmhook::field_proxy>,  "field_proxy must be move-constructible");
+static_assert(std::is_copy_constructible_v<vmhook::method_proxy>, "method_proxy must be copy-constructible");
+static_assert(std::is_move_constructible_v<vmhook::method_proxy>, "method_proxy must be move-constructible");
+// value_t must be a value type (held by the proxies' return-by-value get()/call()).
+static_assert(std::is_copy_constructible_v<vmhook::field_proxy::value_t>,  "field value_t copy-constructible");
+static_assert(std::is_move_constructible_v<vmhook::method_proxy::value_t>, "method value_t move-constructible");
+
+// =============================================================================
+// 22. CRTP / type-identity invariants underpinning the static path
+// =============================================================================
+// The static path keys on typeid(derived); these pin the type relationships that
+// make the deducing-this self-slice (to object_base const&) and the static
+// fallback (typeid(derived)) both well-formed.
+static_assert(std::is_base_of_v<vmhook::object<wrapper_class>, wrapper_class>,
+              "wrapper_class : object<wrapper_class> (CRTP)");
+static_assert(std::is_base_of_v<vmhook::object<other_wrapper>, other_wrapper>,
+              "other_wrapper : object<other_wrapper> (CRTP)");
+static_assert(!std::is_same_v<vmhook::object<wrapper_class>, vmhook::object<other_wrapper>>,
+              "distinct derived params yield distinct CRTP bases (distinct typeid paths)");
+// The deducing-this self parameter slices to object_base const&, so a wrapper&
+// must be convertible to object_base const& (the receiver bind the overload uses).
+static_assert(std::is_convertible_v<wrapper_class&, const vmhook::object_base&>,
+              "wrapper& converts to object_base const& (deducing-this self bind)");
+static_assert(std::is_convertible_v<const wrapper_class&, const vmhook::object_base&>,
+              "const wrapper& converts to object_base const& (deducing-this self bind)");
+// object<wrapper_class> itself derives from object_base (the substrate the
+// instance overloads forward into via self.object_base::get_field).
+static_assert(std::is_base_of_v<vmhook::object_base, vmhook::object<wrapper_class>>,
+              "object<wrapper_class> derives from object_base");
+
+// =============================================================================
+// 23. Tiny DETERMINISTIC runtime lane
+// =============================================================================
+// Almost every fact above is compile-time.  A handful of facts are genuinely
+// runtime values (the variant active-index after a value-initialisation, the
+// printed gate value) — assert those through a deterministic check() harness so
+// the executable does more than print "OK", while staying 100% JVM-free and
+// byte-identical across runs (no addresses, no time, no platform branches).
+namespace rt
+{
+    inline int g_failures{ 0 };
+    inline auto check(const bool cond, const char* what) noexcept -> void
+    {
+        if (!cond)
+        {
+            std::printf("  [FAIL] %s\n", what);
+            ++g_failures;
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
-// main(): the executable merely proves the TU compiled; all coverage above is
-// in static_asserts, evaluated by the compiler with zero runtime cost.
+// main(): runs the small deterministic runtime lane, then reports.  All the
+// heavy coverage above is in static_asserts the compiler already evaluated.
 // -----------------------------------------------------------------------------
 int main()
 {
-    std::printf("vmhook unified call-syntax (exhaustive compile-time): OK "
+    // ---- Deterministic, JVM-free runtime checks ----------------------------
+    // These touch genuine runtime VALUES (variant active indices after value-
+    // initialisation, the gate macro as a runtime int) that complement the
+    // compile-time matrix.  None depend on a JVM, an address, time, the OS, or
+    // the compiler, so the output is byte-identical on every run / platform.
+
+    // (1) The gate macro is a strict boolean at runtime too.
+    rt::check(VMHOOK_HAS_DEDUCING_THIS == 0 || VMHOOK_HAS_DEDUCING_THIS == 1,
+              "VMHOOK_HAS_DEDUCING_THIS is 0 or 1 at runtime");
+
+    // (2) A value-initialised field_proxy::value_t holds its FIRST alternative
+    // (bool) — the variant's value-initialised state the get() fast paths and
+    // the as_string() "" fallback rely on.
+    {
+        const vmhook::field_proxy::value_t fv{};
+        rt::check(fv.data.index() == 0u,
+                  "default field value_t holds alternative 0 (bool)");
+        rt::check(fv.is_reference() == false,
+                  "default field value_t is not a reference (bool alternative)");
+        // The bool alternative converts to int as 0 (the documented null-proxy
+        // numeric default behind get_field(x)->get() returning int).
+        rt::check(static_cast<int>(fv) == 0,
+                  "default field value_t converts to int 0");
+        rt::check(fv.as_string().empty(),
+                  "default field value_t as_string() is empty (numeric alternative)");
+    }
+
+    // (3) A value-initialised method_proxy::value_t holds std::monostate
+    // (alternative 0) — i.e. it reports is_void()/!is_string(), the documented
+    // "void return / call failed" state of call() before any JVM dispatch.
+    {
+        const vmhook::method_proxy::value_t mv{};
+        rt::check(mv.data.index() == 0u,
+                  "default method value_t holds alternative 0 (monostate)");
+        rt::check(mv.is_void() == true,
+                  "default method value_t is_void() is true (monostate)");
+        rt::check(mv.is_string() == false,
+                  "default method value_t is_string() is false (monostate)");
+        rt::check(mv.as_string().empty(),
+                  "default method value_t as_string() is empty (monostate)");
+        rt::check(static_cast<int>(mv) == 0,
+                  "default method value_t converts to int 0 (monostate fallback)");
+    }
+
+    // (4) The two value_t variants carry the documented alternative counts
+    // (field: 9 primitive/OOP alternatives; method: 11 incl. monostate + string).
+    rt::check(std::variant_size_v<std::remove_cvref_t<decltype(vmhook::field_proxy::value_t{}.data)>> == 9u,
+              "field value_t variant has 9 alternatives");
+    rt::check(std::variant_size_v<std::remove_cvref_t<decltype(vmhook::method_proxy::value_t{}.data)>> == 11u,
+              "method value_t variant has 11 alternatives");
+
+    if (rt::g_failures != 0)
+    {
+        std::printf("vmhook unified call-syntax: %d RUNTIME CHECK(S) FAILED "
+                    "[VMHOOK_HAS_DEDUCING_THIS=%d]\n",
+                    rt::g_failures, VMHOOK_HAS_DEDUCING_THIS);
+        return 1;
+    }
+
+    std::printf("vmhook unified call-syntax (exhaustive compile-time + runtime): OK "
                 "[VMHOOK_HAS_DEDUCING_THIS=%d]\n",
                 VMHOOK_HAS_DEDUCING_THIS);
     return 0;

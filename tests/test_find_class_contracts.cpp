@@ -153,6 +153,73 @@ namespace
         try { (void)vmhook::find_class_via_oop(nullptr, name); return true; }
         catch (...) { return false; }
     }
+
+    // The whole-family no-JVM contract for ONE name, as a single predicate:
+    //   * find_class                          -> nullptr
+    //   * jni::find_class                      -> nullptr
+    //   * jni::find_class_with_context_loader  -> nullptr
+    //   * find_class_via_oop(nullptr, .)       -> nullptr
+    //   * get_class_methods                    -> empty
+    //   * NONE of the above throws
+    //   * find_class is deterministic for the name (two calls are bit-identical;
+    //     both nullptr here, so identity also holds)
+    // Returns true iff every clause holds.  Used to run the same contract over
+    // very large programmatically-generated input matrices with a handful of
+    // aggregate [PASS]/[FAIL] lines.
+    auto family_contract_holds(std::string_view name) -> bool
+    {
+        try
+        {
+            const auto fc1{ vmhook::find_class(name) };
+            const auto fc2{ vmhook::find_class(name) };
+            if (fc1 != nullptr) { return false; }
+            if (fc2 != nullptr) { return false; }
+            if (fc1 != fc2)     { return false; }                 // determinism
+            if (vmhook::jni::find_class(name) != nullptr) { return false; }
+            if (vmhook::jni::find_class_with_context_loader(name) != nullptr) { return false; }
+            if (vmhook::find_class_via_oop(nullptr, name) != nullptr) { return false; }
+            if (!vmhook::get_class_methods(name).empty()) { return false; }
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    // Reference oracle for is_valid_pointer, re-derived from first principles
+    // straight from the documented contract (vmhook.hpp ~2018):
+    //   reject  addr <= user_address_floor (0xFFFF)
+    //   reject  addr >= user_address_ceiling (0x00007FFFFFFFFFFF)
+    //   reject  odd addresses (addr & 1)
+    //   reject  low-32-bits ∈ the documented debug-fill sentinel set
+    //   accept  everything else
+    // Cross-checking the live function against this independent reimplementation
+    // pins the exact acceptance set value-by-value (this helper, is_valid_pointer,
+    // sits on find_class's cache-hit validation path at ~8019/8022).
+    auto expected_is_valid_pointer(std::uintptr_t addr) -> bool
+    {
+        constexpr std::uintptr_t floor_v{ 0xFFFFull };
+        constexpr std::uintptr_t ceiling_v{ 0x00007FFFFFFFFFFFull };
+        if (addr <= floor_v || addr >= ceiling_v) { return false; }
+        if ((addr & 0x1ull) != 0ull)              { return false; }
+        const std::uint32_t low32{ static_cast<std::uint32_t>(addr) };
+        switch (low32)
+        {
+            case 0xDEADBEEFu:
+            case 0xCAFEBABEu:
+            case 0xCCCCCCCCu:
+            case 0xCDCDCDCDu:
+            case 0xBAADF00Du:
+            case 0xFEEEFEEEu:
+            case 0xABABABABu:
+            case 0xFDFDFDFDu:
+            case 0xDDDDDDDDu:
+                return false;
+            default:
+                return true;
+        }
+    }
 }
 
 int main()
@@ -950,6 +1017,675 @@ int main()
             if (!vmhook::get_class_methods(name).empty()) { methods_sweep_all_empty = false; }
         }
         check("get_class_methods_uniform_sweep_empty", methods_sweep_all_empty);
+    }
+
+    // ---------------------------------------------------------------------
+    // 16. EVERY descriptor type character as a standalone "name".  The JVM
+    //     field-descriptor alphabet is B C D F I J S Z (primitives) + V (void,
+    //     method-return-only) + L...; / [ (reference / array).  A bare type
+    //     char is never a loadable internal class name, so find_class is null
+    //     for each; the family contract holds for all of them.  We sweep the
+    //     valid descriptor chars, the invalid-but-plausible upper letters that
+    //     are NOT descriptor leads (A E G H K M N O P Q R T U W X Y), and the
+    //     lowercase primitives (which are valid identifier chars but not types).
+    // ---------------------------------------------------------------------
+    {
+        const char* const desc_chars[]{
+            // valid field/return descriptor leads, one char each
+            "B", "C", "D", "F", "I", "J", "S", "Z", "V",
+            "L", "[", ";", "(", ")",
+            // the upper-case letters that are NOT descriptor type leads
+            "A", "E", "G", "H", "K", "M", "N", "O",
+            "P", "Q", "R", "T", "U", "W", "X", "Y",
+            // lowercase primitives — valid Java identifier chars, never types
+            "b", "c", "d", "f", "i", "j", "s", "z", "v",
+            "l",
+        };
+        bool all_hold{ true };
+        for (const char* d : desc_chars)
+        {
+            if (!family_contract_holds(d)) { all_hold = false; }
+        }
+        check("find_class_every_descriptor_char_family_contract", all_hold);
+
+        // Each primitive descriptor as a ONE-DIMENSIONAL array: [B [C [D [F [I
+        // [J [S [Z, plus the (technically illegal) [V, plus an [L...; .  All
+        // null, family contract holds.
+        const char* const prim_arrays[]{
+            "[B", "[C", "[D", "[F", "[I", "[J", "[S", "[Z",
+            "[V",                              // void array — illegal but must not fault
+            "[Ljava/lang/Object;",
+        };
+        bool arr_hold{ true };
+        for (const char* d : prim_arrays)
+        {
+            if (!family_contract_holds(d)) { arr_hold = false; }
+        }
+        check("find_class_every_primitive_array_family_contract", arr_hold);
+    }
+
+    // ---------------------------------------------------------------------
+    // 17. Array nesting depth sweep.  Build [, [[, [[[ ... up to a generous
+    //     bound for BOTH a primitive element (I) and an object element
+    //     (Ljava/lang/Object;).  The JVM caps real array dimensions at 255,
+    //     but find_class must return null / never fault for ANY depth — these
+    //     are descriptor strings, not real classes, with no JVM present.
+    //     Covers "every array nesting depth up to a sane bound".
+    // ---------------------------------------------------------------------
+    {
+        bool prim_depths_hold{ true };
+        bool obj_depths_hold{ true };
+        std::string brackets{};
+        for (int depth{ 1 }; depth <= 300; ++depth)   // past the JVM's 255 cap
+        {
+            brackets.push_back('[');
+            const std::string prim_name{ brackets + "I" };
+            const std::string obj_name{ brackets + "Ljava/lang/Object;" };
+            if (vmhook::find_class(prim_name) != nullptr) { prim_depths_hold = false; }
+            if (vmhook::find_class(obj_name)  != nullptr) { obj_depths_hold  = false; }
+            if (!find_class_never_throws(prim_name))      { prim_depths_hold = false; }
+            if (!find_class_never_throws(obj_name))       { obj_depths_hold  = false; }
+        }
+        check("find_class_primitive_array_depth_sweep_null", prim_depths_hold);
+        check("find_class_object_array_depth_sweep_null", obj_depths_hold);
+
+        // The exact JVM-boundary depths (254, 255, 256) explicitly.
+        bool boundary_depths_hold{ true };
+        for (const int depth : { 254, 255, 256 })
+        {
+            const std::string b(static_cast<std::size_t>(depth), '[');
+            if (vmhook::find_class(b + "I") != nullptr) { boundary_depths_hold = false; }
+            if (vmhook::find_class(b + "Ljava/lang/String;") != nullptr) { boundary_depths_hold = false; }
+        }
+        check("find_class_array_depth_255_boundary_null", boundary_depths_hold);
+    }
+
+    // ---------------------------------------------------------------------
+    // 18. Field-descriptor forms (Lpkg/Type;) for a broad spread of canonical
+    //     JDK types, in BOTH slashed and dotted internal forms.  A field
+    //     descriptor is never itself a loadable class name (find_class wants
+    //     the bare internal name, not the L...; wrapper), so all are null; the
+    //     family contract holds for each.
+    // ---------------------------------------------------------------------
+    {
+        const char* const field_descriptors[]{
+            "Ljava/lang/Object;",
+            "Ljava/lang/String;",
+            "Ljava/lang/Integer;",
+            "Ljava/lang/Class;",
+            "Ljava/util/List;",
+            "Ljava/util/Map$Entry;",
+            "Ljava/lang/Thread$State;",
+            // dotted variants (find_class neither requires nor rewrites these
+            // with no JVM — they simply miss)
+            "Ljava.lang.Object;",
+            "Ljava.util.List;",
+        };
+        bool all_hold{ true };
+        for (const char* d : field_descriptors)
+        {
+            if (!family_contract_holds(d)) { all_hold = false; }
+        }
+        check("find_class_field_descriptor_forms_family_contract", all_hold);
+    }
+
+    // ---------------------------------------------------------------------
+    // 19. Dotted-vs-slashed canonical-name PARITY.  For every canonical JDK
+    //     name, both the slashed internal form and the dotted binary form must
+    //     resolve to null with no JVM (the slashed form is what find_class
+    //     expects; the dotted form simply misses — find_class does NOT
+    //     canonicalize the name on the no-JVM path).  Asserting both null pins
+    //     the no-normalization contract from both directions.
+    // ---------------------------------------------------------------------
+    {
+        const char* const slashed[]{
+            "java/lang/Object", "java/lang/String", "java/lang/Integer",
+            "java/lang/Long",   "java/lang/Short",  "java/lang/Byte",
+            "java/lang/Character", "java/lang/Boolean", "java/lang/Float",
+            "java/lang/Double", "java/lang/Void",   "java/lang/Number",
+            "java/util/ArrayList", "java/util/LinkedList", "java/util/HashMap",
+            "java/util/TreeMap", "java/util/HashSet", "java/util/Optional",
+            "java/lang/StringBuilder", "java/lang/reflect/Method",
+            "java/util/concurrent/ConcurrentHashMap",
+            "java/lang/invoke/MethodHandle",
+        };
+        const char* const dotted[]{
+            "java.lang.Object", "java.lang.String", "java.lang.Integer",
+            "java.lang.Long",   "java.lang.Short",  "java.lang.Byte",
+            "java.lang.Character", "java.lang.Boolean", "java.lang.Float",
+            "java.lang.Double", "java.lang.Void",   "java.lang.Number",
+            "java.util.ArrayList", "java.util.LinkedList", "java.util.HashMap",
+            "java.util.TreeMap", "java.util.HashSet", "java.util.Optional",
+            "java.lang.StringBuilder", "java.lang.reflect.Method",
+            "java.util.concurrent.ConcurrentHashMap",
+            "java.lang.invoke.MethodHandle",
+        };
+        bool slashed_all_null{ true };
+        bool dotted_all_null{ true };
+        for (const char* n : slashed)
+        {
+            if (!family_contract_holds(n)) { slashed_all_null = false; }
+        }
+        for (const char* n : dotted)
+        {
+            if (!family_contract_holds(n)) { dotted_all_null = false; }
+        }
+        check("find_class_canonical_slashed_form_family_contract", slashed_all_null);
+        check("find_class_canonical_dotted_form_family_contract", dotted_all_null);
+
+        // Per-name parity: the slashed and dotted forms of the SAME class agree
+        // (both null) — there is no hidden form-dependent divergence.
+        bool per_name_parity{ true };
+        const std::size_t count{ sizeof(slashed) / sizeof(slashed[0]) };
+        for (std::size_t i{ 0 }; i < count; ++i)
+        {
+            const bool s_null{ vmhook::find_class(slashed[i]) == nullptr };
+            const bool d_null{ vmhook::find_class(dotted[i])  == nullptr };
+            if (s_null != d_null) { per_name_parity = false; }
+        }
+        check("find_class_slashed_dotted_per_name_parity", per_name_parity);
+    }
+
+    // ---------------------------------------------------------------------
+    // 20. Nested / inner-class ($) name forms — every shape the JVM uses for
+    //     member, local, and anonymous classes.  Valid binary-name characters,
+    //     simply unloaded here; null + family contract for each.
+    // ---------------------------------------------------------------------
+    {
+        const char* const nested_names[]{
+            "java/util/Map$Entry",            // member class
+            "Outer$Inner",                    // simple nested
+            "Outer$Inner$Deeper",             // doubly nested
+            "Outer$1",                        // anonymous class
+            "Outer$1$2",                      // anonymous within anonymous
+            "Outer$1Local",                   // local class
+            "pkg/Outer$Inner",                // qualified nested
+            "a/b/c/Outer$Inner$1$Local",      // fully exercised
+            "$Leading",                       // leading $
+            "Trailing$",                      // trailing $
+            "Double$$Dollar",                 // doubled $
+        };
+        bool all_hold{ true };
+        for (const char* n : nested_names)
+        {
+            if (!family_contract_holds(n)) { all_hold = false; }
+        }
+        check("find_class_nested_dollar_name_forms_family_contract", all_hold);
+    }
+
+    // ---------------------------------------------------------------------
+    // 21. Method-descriptor strings fed to find_class as if they were names.
+    //     A method descriptor "(args)ret" is never a class name; every shape
+    //     must be null and never fault.  Wider than the section-12 set and run
+    //     through the WHOLE family (find_class + siblings), not just
+    //     find_methods_by_signature.
+    // ---------------------------------------------------------------------
+    {
+        const char* const method_descriptors[]{
+            "()V", "()I", "()Z", "()J", "()D", "()F", "()C", "()B", "()S",
+            "()Ljava/lang/Object;",
+            "()[I", "()[[Ljava/lang/String;",
+            "(I)V", "(II)I", "(J)J", "(ID)V",
+            "(Ljava/lang/String;)V",
+            "(Ljava/lang/String;I)Ljava/lang/String;",
+            "([B)[B", "([[I)[[I",
+            "(ILjava/lang/Object;[J)Z",
+            "(BCDFIJSZ)V",                    // every primitive arg in order
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+            // malformed / truncated descriptors
+            "(", ")", "()", "(V)V", "(I", "(L", "(Ljava/lang/String",
+            "()L", "()[",
+        };
+        bool all_hold{ true };
+        for (const char* d : method_descriptors)
+        {
+            if (!family_contract_holds(d)) { all_hold = false; }
+        }
+        check("find_class_method_descriptor_strings_family_contract", all_hold);
+    }
+
+    // ---------------------------------------------------------------------
+    // 22. Separator-pathology matrix, exhaustively, over the full descriptor /
+    //     name punctuation alphabet.  Every ordered 2-char and 3-char string
+    //     drawn from { '/', '.', '$', '[', ';', '(', ')', ' ' } — covering
+    //     every duplicate / leading / trailing / mixed separator arrangement.
+    //     None can name a class; all must be null, none may throw.  Hundreds of
+    //     inputs, two aggregate checks.
+    // ---------------------------------------------------------------------
+    {
+        const char punct[]{ '/', '.', '$', '[', ';', '(', ')', ' ' };
+        constexpr std::size_t n{ sizeof(punct) / sizeof(punct[0]) };
+
+        bool pairs_all_null{ true };
+        bool pairs_no_throw{ true };
+        for (std::size_t i{ 0 }; i < n; ++i)
+        {
+            for (std::size_t j{ 0 }; j < n; ++j)
+            {
+                const char pair[]{ punct[i], punct[j] };
+                const std::string_view sv{ pair, 2 };
+                if (vmhook::find_class(sv) != nullptr) { pairs_all_null = false; }
+                if (!find_class_never_throws(sv))      { pairs_no_throw = false; }
+            }
+        }
+        check("find_class_punct_pairs_all_null", pairs_all_null);
+        check("find_class_punct_pairs_no_throw", pairs_no_throw);
+
+        bool triples_all_null{ true };
+        for (std::size_t i{ 0 }; i < n; ++i)
+        {
+            for (std::size_t j{ 0 }; j < n; ++j)
+            {
+                for (std::size_t k{ 0 }; k < n; ++k)
+                {
+                    const char triple[]{ punct[i], punct[j], punct[k] };
+                    const std::string_view sv{ triple, 3 };
+                    if (vmhook::find_class(sv) != nullptr) { triples_all_null = false; }
+                }
+            }
+        }
+        check("find_class_punct_triples_all_null", triples_all_null);
+    }
+
+    // ---------------------------------------------------------------------
+    // 23. Wider byte / encoding sweeps (beyond section 14's single-byte pass).
+    //     (a) Every 2-byte combination 0x00..0xFF x {0x2F '/'} — a name byte
+    //         followed by a separator, and a separator followed by a name byte
+    //         — so EVERY byte value is exercised adjacent to a separator.
+    //     (b) A valid-looking name with one arbitrary byte 0x00..0xFF spliced
+    //         into the middle (length-bearing view, so NUL is included).
+    //     All null, none throw.
+    // ---------------------------------------------------------------------
+    {
+        bool byte_then_sep_null{ true };
+        bool sep_then_byte_null{ true };
+        for (int b{ 0 }; b <= 0xFF; ++b)
+        {
+            const char c{ static_cast<char>(b) };
+            const char bs[]{ c, '/' };
+            const char sb[]{ '/', c };
+            if (vmhook::find_class(std::string_view{ bs, 2 }) != nullptr) { byte_then_sep_null = false; }
+            if (vmhook::find_class(std::string_view{ sb, 2 }) != nullptr) { sep_then_byte_null = false; }
+        }
+        check("find_class_byte_then_separator_null", byte_then_sep_null);
+        check("find_class_separator_then_byte_null", sep_then_byte_null);
+
+        bool spliced_byte_null{ true };
+        bool spliced_byte_no_throw{ true };
+        for (int b{ 0 }; b <= 0xFF; ++b)
+        {
+            std::string name{ "java/lang/" };
+            name.push_back(static_cast<char>(b));   // arbitrary byte, incl. NUL
+            name += "Object";
+            const std::string_view sv{ name.data(), name.size() };
+            if (vmhook::find_class(sv) != nullptr) { spliced_byte_null = false; }
+            if (!find_class_never_throws(sv))      { spliced_byte_no_throw = false; }
+        }
+        check("find_class_spliced_arbitrary_byte_null", spliced_byte_null);
+        check("find_class_spliced_arbitrary_byte_no_throw", spliced_byte_no_throw);
+
+        // A multibyte-UTF-8 package name (valid UTF-8, never an ASCII binary
+        // name) and a high-byte / invalid-UTF-8 run.
+        const char* const encoded_names[]{
+            "caf\xC3\xA9/Bar",                 // "café/Bar" (2-byte UTF-8)
+            "\xE4\xB8\xAD\xE6\x96\x87/Type",   // CJK (3-byte UTF-8)
+            "name\xF0\x9F\x92\xA9/x",          // 4-byte UTF-8 (emoji)
+            "\xFF\xFE\xFD/raw",                // invalid UTF-8 high bytes
+            "\x80\x81/cont",                   // lone continuation bytes
+        };
+        bool encoded_hold{ true };
+        for (const char* n : encoded_names)
+        {
+            if (!family_contract_holds(n)) { encoded_hold = false; }
+        }
+        check("find_class_utf8_and_highbyte_names_family_contract", encoded_hold);
+    }
+
+    // ---------------------------------------------------------------------
+    // 24. Determinism / no-global-state-dependence.  The same input must yield
+    //     the same (null) result regardless of intervening calls on OTHER
+    //     names and regardless of cache churn.  We interleave a probe name with
+    //     unrelated lookups, overrides, and evicts of DIFFERENT names and prove
+    //     the probe's result never changes.
+    // ---------------------------------------------------------------------
+    {
+        const char* const probe{ "determinism/Probe/Klass" };
+        const auto baseline{ vmhook::find_class(probe) };       // null
+        bool stable{ baseline == nullptr };
+
+        // Hammer unrelated names / cache ops between probe reads.
+        for (int i{ 0 }; i < 100; ++i)
+        {
+            const std::string other{ "noise/Name/" + std::to_string(i) };
+            (void)vmhook::find_class(other);
+            vmhook::override_class_lookup(other, nullptr);
+            (void)vmhook::jni::find_class(other);
+            vmhook::evict_class_lookup(other);
+            const auto again{ vmhook::find_class(probe) };
+            if (again != baseline) { stable = false; }           // both null
+        }
+        check("find_class_deterministic_under_unrelated_churn", stable);
+
+        // The same name through the same entry point twice in a row is bit-
+        // identical for a batch of varied shapes (idempotent, side-effect-free
+        // for a miss).
+        const char* const shapes[]{
+            "x", "java/lang/Object", "[I", "Ljava/lang/String;",
+            "()V", "a.b.c", "weird$Inner", "trailing/",
+        };
+        bool idempotent{ true };
+        for (const char* s : shapes)
+        {
+            if (vmhook::find_class(s) != vmhook::find_class(s)) { idempotent = false; }
+            if (vmhook::jni::find_class(s) != vmhook::jni::find_class(s)) { idempotent = false; }
+            if (vmhook::jni::find_class_with_context_loader(s)
+                != vmhook::jni::find_class_with_context_loader(s)) { idempotent = false; }
+        }
+        check("find_class_entry_points_idempotent_per_name", idempotent);
+    }
+
+    // ---------------------------------------------------------------------
+    // 25. is_valid_pointer — the ONE pure helper on find_class's cache-hit
+    //     validation path (~8019/8022) — pinned exhaustively, value-by-value,
+    //     against an independent reimplementation of its documented contract.
+    //     This is the deterministic core that lets a stale / bogus cache entry
+    //     be rejected WITHOUT a dereference, so it is squarely in scope for the
+    //     resolver's no-JVM contract.  All checks are pure integer arithmetic,
+    //     identical on every platform / compiler (no address is dereferenced).
+    // ---------------------------------------------------------------------
+    {
+        // (a) Boundary values around the floor (0xFFFF) and ceiling
+        //     (0x00007FFFFFFFFFFF).  Use only EVEN candidates here so the
+        //     odd-rejection rule doesn't confound the range rule.
+        const std::uintptr_t boundary_addrs[]{
+            0x0ull, 0x2ull, 0xFFFEull,                 // <= floor -> reject
+            0xFFFFull,                                 // == floor -> reject (<=)
+            0x10000ull, 0x10002ull,                    // just above floor -> accept
+            0x00007FFFFFFFFFFEull,                     // just below ceiling -> accept
+            0x00007FFFFFFFFFFFull,                     // == ceiling -> reject (>=)
+            0x0000800000000000ull,                     // above ceiling -> reject
+            0xFFFFFFFFFFFFFFFEull,                      // far above -> reject
+        };
+        bool boundary_match{ true };
+        for (const std::uintptr_t a : boundary_addrs)
+        {
+            const bool got{ vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(a)) };
+            if (got != expected_is_valid_pointer(a)) { boundary_match = false; }
+        }
+        check("is_valid_pointer_boundary_values_match_oracle", boundary_match);
+
+        // Explicit, human-readable spot asserts for the four corners.
+        check("is_valid_pointer_rejects_null",
+              !vmhook::hotspot::is_valid_pointer(nullptr));
+        check("is_valid_pointer_rejects_floor",
+              !vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(0xFFFFull)));
+        check("is_valid_pointer_accepts_just_above_floor",
+              vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(0x10000ull)));
+        check("is_valid_pointer_rejects_ceiling",
+              !vmhook::hotspot::is_valid_pointer(
+                  reinterpret_cast<const void*>(0x00007FFFFFFFFFFFull)));
+        check("is_valid_pointer_accepts_just_below_ceiling",
+              vmhook::hotspot::is_valid_pointer(
+                  reinterpret_cast<const void*>(0x00007FFFFFFFFFFEull)));
+
+        // (b) Odd vs even at a known-in-range base: every odd address is
+        //     rejected, the matching even address (when not a sentinel) accepted.
+        bool odd_even_match{ true };
+        for (std::uintptr_t base{ 0x100000ull }; base < 0x100000ull + 512; ++base)
+        {
+            const bool got{ vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(base)) };
+            if (got != expected_is_valid_pointer(base)) { odd_even_match = false; }
+        }
+        check("is_valid_pointer_odd_even_sweep_match_oracle", odd_even_match);
+        check("is_valid_pointer_rejects_odd_in_range",
+              !vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(0x100001ull)));
+        check("is_valid_pointer_accepts_even_in_range",
+              vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(0x100000ull)));
+
+        // (c) Every documented debug-fill sentinel, EVEN-low32, placed in range:
+        //     each must be rejected by the low-32 switch even though the address
+        //     is otherwise valid (in-range + even).  Then prove the SAME low32
+        //     at a higher 64-bit address is still rejected (the check is on the
+        //     low 32 bits, independent of the high bits).
+        const std::uint32_t sentinels[]{
+            0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+            0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu,
+        };
+        bool sentinels_rejected{ true };
+        bool sentinels_high_rejected{ true };
+        bool sentinels_match_oracle{ true };
+        for (const std::uint32_t s : sentinels)
+        {
+            const std::uintptr_t low_addr{ static_cast<std::uintptr_t>(s) };
+            // low32 == sentinel, high bits 0: in-range (sentinels are > floor,
+            // < ceiling).  Even ones (CAFEBABE, CCCCCCCC, FEEEFEEE, BAADF00D,
+            // ABABABAB, FDFDFDFD, DDDDDDDD, CDCDCDCD) reach the switch; the odd
+            // ones (DEADBEEF) are already caught by the odd rule — either way
+            // the result is "reject", and matches the oracle.
+            if (vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(low_addr)))
+            {
+                sentinels_rejected = false;
+            }
+            if (vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(low_addr))
+                != expected_is_valid_pointer(low_addr))
+            {
+                sentinels_match_oracle = false;
+            }
+            // Same low32, high 32 bits set to 0x00001234 -> still in range
+            // (0x000012340000.... < ceiling 0x00007FFF........), still rejected.
+            const std::uintptr_t high_addr{ (static_cast<std::uintptr_t>(0x00001234ull) << 32)
+                                            | static_cast<std::uintptr_t>(s) };
+            if (vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(high_addr)))
+            {
+                sentinels_high_rejected = false;
+            }
+            if (vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(high_addr))
+                != expected_is_valid_pointer(high_addr))
+            {
+                sentinels_match_oracle = false;
+            }
+        }
+        check("is_valid_pointer_low_sentinels_rejected", sentinels_rejected);
+        check("is_valid_pointer_high_addr_sentinels_rejected", sentinels_high_rejected);
+        check("is_valid_pointer_sentinels_match_oracle", sentinels_match_oracle);
+
+        // (d) A non-sentinel even in-range address is accepted — proving the
+        //     rejection is the low32 pattern, not the magnitude.  Address chosen
+        //     to be in range and even on BOTH 32- and 64-bit (low 32 bits carry
+        //     the whole value, so the verdict is pointer-width-independent):
+        //     0x00100000 (1 MiB) > floor (0xFFFF), < ceiling on either width,
+        //     even, low32 = 0x00100000 (not a sentinel).
+        check("is_valid_pointer_accepts_nonsentinel_in_range",
+              vmhook::hotspot::is_valid_pointer(
+                  reinterpret_cast<const void*>(static_cast<std::uintptr_t>(0x00100000ull))));
+
+        // (e) A deterministic pseudo-random scatter across the whole 64-bit
+        //     space cross-checked against the oracle — broadest possible value
+        //     coverage, fixed seed so it is byte-identical every run.
+        bool scatter_match{ true };
+        std::uint64_t state{ 0x9E3779B97F4A7C15ull };       // fixed seed
+        for (int i{ 0 }; i < 20000; ++i)
+        {
+            // SplitMix64 — pure integer, deterministic, platform-independent.
+            state += 0x9E3779B97F4A7C15ull;
+            std::uint64_t z{ state };
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+            z =  z ^ (z >> 31);
+            const std::uintptr_t addr{ static_cast<std::uintptr_t>(z) };
+            if (vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(addr))
+                != expected_is_valid_pointer(addr))
+            {
+                scatter_match = false;
+            }
+        }
+        check("is_valid_pointer_random_scatter_matches_oracle", scatter_match);
+    }
+
+    // ---------------------------------------------------------------------
+    // 26. override_class_lookup with a VALID-looking (but fake) klass pointer,
+    //     observed through find_class WITHOUT a JVM.  An even, in-range,
+    //     non-sentinel address PASSES is_valid_pointer, so find_class's cache
+    //     hit proceeds to cached_klass->get_name() — which is itself fully
+    //     guarded (is_valid_pointer + safe_read + try/catch inside get_name /
+    //     symbol::to_string).  With no JVM the symbol read yields "" / nullptr,
+    //     the name-match fails, the entry is evicted, the graph re-walk returns
+    //     null.  Net: still nullptr, no crash, entry gone — the live-memory
+    //     counterpart to the bogus-sentinel eviction of section 6c, but for a
+    //     pointer that clears the cheap integer filter.
+    //
+    //     NOTE: this seeds the SHARED klass_lookup_cache; we save & restore the
+    //     exact prior state of every key we touch so later test ordering is
+    //     unaffected (defensive even though these are fresh probe names).
+    // ---------------------------------------------------------------------
+    {
+        // An address that PASSES is_valid_pointer on BOTH 32- and 64-bit: even,
+        // in range (> floor 0xFFFF, < ceiling on either width), low32 not a
+        // sentinel.  0x00100000 (1 MiB) carries its whole value in the low 32
+        // bits, so the verdict is pointer-width-independent — no sizeof hard-code.
+        auto* const plausible_klass{ reinterpret_cast<vmhook::hotspot::klass*>(
+            static_cast<std::uintptr_t>(0x00100000ull)) };
+        // Confirm our chosen pointer really does clear the integer filter, so
+        // this test exercises the get_name() path (not the early reject).
+        check("section26_plausible_klass_passes_is_valid_pointer",
+              vmhook::hotspot::is_valid_pointer(plausible_klass));
+
+        const char* const name{ "override/Plausible/Probe" };
+
+        // Save prior cache state for `name` (should be absent) and restore later.
+        auto cache_snapshot = [](const std::string& key)
+            -> std::pair<bool, vmhook::hotspot::klass*>
+        {
+            std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+            const auto it{ vmhook::klass_lookup_cache.find(key) };
+            if (it == vmhook::klass_lookup_cache.end()) { return { false, nullptr }; }
+            return { true, it->second };
+        };
+        auto cache_restore = [](const std::string& key,
+                                const std::pair<bool, vmhook::hotspot::klass*>& prior)
+            -> void
+        {
+            std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+            if (prior.first) { vmhook::klass_lookup_cache[key] = prior.second; }
+            else             { vmhook::klass_lookup_cache.erase(key); }
+        };
+
+        const auto prior{ cache_snapshot(name) };
+
+        vmhook::override_class_lookup(name, plausible_klass);
+        // find_class hits the cache, validates via get_name (-> "" no-JVM),
+        // name-mismatch -> evicts -> re-walks -> null.  No deref of fake memory
+        // because get_name gates everything behind is_valid_pointer + safe_read.
+        bool threw{ false };
+        vmhook::hotspot::klass* result{ plausible_klass };
+        try { result = vmhook::find_class(name); }
+        catch (...) { threw = true; }
+        check("find_class_plausible_override_no_throw", !threw);
+        check("find_class_plausible_override_returns_null", result == nullptr);
+
+        // The stale entry was evicted by that first call: a second lookup also
+        // re-walks to null (and the cache no longer pins the fake pointer).
+        check("find_class_plausible_override_evicted",
+              vmhook::find_class(name) == nullptr);
+        {
+            const auto after{ cache_snapshot(name) };
+            check("find_class_plausible_override_entry_gone", !after.first);
+        }
+
+        cache_restore(name, prior);
+    }
+
+    // ---------------------------------------------------------------------
+    // 27. reanchor_classes_via_oop return-value truth table, no JVM.  With a
+    //     null anchor it is always false (before any work).  We additionally
+    //     exercise the empty / single / multi name-list shapes to pin the
+    //     "true only if EVERY name resolved" rule at the null-anchor boundary
+    //     (where nothing resolves, so any non-empty list is false and the empty
+    //     list is vacuously... still false here, because the null-anchor guard
+    //     returns false BEFORE the per-name loop — distinct from the non-null
+    //     fake-anchor empty-list case covered in test_classloader_reanchor).
+    // ---------------------------------------------------------------------
+    {
+        check("reanchor_null_anchor_empty_list_false",
+              vmhook::reanchor_classes_via_oop(nullptr, {}) == false);
+        check("reanchor_null_anchor_single_false",
+              vmhook::reanchor_classes_via_oop(nullptr, { "a/B" }) == false);
+        check("reanchor_null_anchor_multi_false",
+              vmhook::reanchor_classes_via_oop(
+                  nullptr, { "a/B", "c/D", "e/F" }) == false);
+        // Never throws for a batch of name shapes (all with null anchor).
+        bool none_threw{ true };
+        try
+        {
+            (void)vmhook::reanchor_classes_via_oop(
+                nullptr, { "", "java/lang/Object", "[I", "Ljava/lang/String;",
+                           "()V", "weird$Inner" });
+        }
+        catch (...) { none_threw = false; }
+        check("reanchor_null_anchor_varied_shapes_no_throw", none_threw);
+    }
+
+    // ---------------------------------------------------------------------
+    // 28. Empty-name fast-reject parity ACROSS the whole family.  The empty
+    //     name is special-cased in find_class (returns before the lock); the
+    //     siblings reach it via their own no-thread gates.  Pin that every
+    //     entry point treats "" as not-found, through every constructible empty
+    //     view, and that the method overloads are empty for "".
+    // ---------------------------------------------------------------------
+    {
+        const std::string_view empties[]{
+            std::string_view{},                       // null data, 0 size
+            std::string_view{ "" },                   // valid ptr, 0 size
+        };
+        bool all_empty_null{ true };
+        for (const std::string_view e : empties)
+        {
+            if (vmhook::find_class(e) != nullptr) { all_empty_null = false; }
+            if (vmhook::jni::find_class(e) != nullptr) { all_empty_null = false; }
+            if (vmhook::jni::find_class_with_context_loader(e) != nullptr) { all_empty_null = false; }
+            if (vmhook::find_class_via_oop(nullptr, e) != nullptr) { all_empty_null = false; }
+            if (!vmhook::get_class_methods(e).empty()) { all_empty_null = false; }
+        }
+        check("empty_name_all_entry_points_not_found", all_empty_null);
+        check("find_methods_by_signature_empty_descriptor_empty",
+              vmhook::find_methods_by_signature<unreg_w>("").empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // 29. Length boundaries for the cache-key std::string construction.  Sweep
+    //     a contiguous run of lengths spanning the small-string-optimisation
+    //     boundary (15/16/23 chars on common libs) and on into heap territory,
+    //     for both a plain name and a separator-laden name.  No fixed buffer is
+    //     involved, so every length must be null + no-throw.
+    // ---------------------------------------------------------------------
+    {
+        bool plain_ok{ true };
+        bool sep_ok{ true };
+        for (std::size_t len{ 0 }; len <= 64; ++len)
+        {
+            const std::string plain(len, 'q');
+            const std::string_view plain_v{ plain.data(), plain.size() };
+            // len==0 hits the empty guard; len>0 travels the full path.
+            if (vmhook::find_class(plain_v) != nullptr) { plain_ok = false; }
+            if (!find_class_never_throws(plain_v))       { plain_ok = false; }
+
+            std::string sep{};
+            for (std::size_t i{ 0 }; i < len; ++i) { sep += (i % 2 == 0) ? 'a' : '/'; }
+            if (vmhook::find_class(sep) != nullptr) { sep_ok = false; }
+        }
+        check("find_class_length_boundary_sweep_plain_ok", plain_ok);
+        check("find_class_length_boundary_sweep_separators_ok", sep_ok);
+
+        // A handful of large powers-of-two lengths.
+        bool big_ok{ true };
+        for (const std::size_t len : { std::size_t{ 1024 }, std::size_t{ 4096 },
+                                       std::size_t{ 16384 }, std::size_t{ 65536 } })
+        {
+            const std::string big(len, 'a');
+            if (vmhook::find_class(big) != nullptr) { big_ok = false; }
+            if (!find_class_never_throws(big))       { big_ok = false; }
+        }
+        check("find_class_large_power_of_two_lengths_ok", big_ok);
     }
 
     // ---------------------------------------------------------------------

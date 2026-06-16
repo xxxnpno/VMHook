@@ -18,8 +18,11 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
@@ -157,6 +160,47 @@ namespace
         template<typename T>
         void operator()(vmhook::return_value&, T) const {}
     };
+
+    // -------------------------------------------------------------------------
+    // Representative-complete set of user-defined types, so the truth tables
+    // below can probe each trait against every C++ type *category* (not just
+    // the std:: types the existing checks use).  These cover the negative and
+    // positive space for value_t_convertible_target_v, is_vector_v,
+    // is_unique_ptr_v and is_unique_object_ptr in one place.
+    // -------------------------------------------------------------------------
+    enum unscoped_enum { unscoped_a, unscoped_b };           // unscoped enum
+    enum class scoped_enum { sa, sb };                        // scoped enum
+    enum class scoped_enum_u8 : std::uint8_t { x, y };        // fixed-underlying
+
+    union plain_union { int i; float f; };                   // a union
+
+    struct empty_struct {};                                  // empty class
+    struct data_struct { int a; double b; };                 // non-empty class
+    struct polymorphic_struct { virtual ~polymorphic_struct() = default; };
+    struct abstract_struct { virtual void f() = 0; virtual ~abstract_struct() = default; };
+    struct final_struct final { int v; };                    // final class
+
+    // A wrapper that derives from object_base WITHOUT going through object<T>,
+    // to prove is_unique_object_ptr keys on object_base, not on object<>.
+    struct direct_object_base_derived : public vmhook::object_base
+    {
+        using vmhook::object_base::object_base;
+    };
+
+    // A class that is NOT related to object_base at all.
+    struct unrelated_class { void* p; };
+
+    // Member-object and member-function pointer types (pointer-category probes
+    // that are NOT plain object pointers — value_t_convertible_target_v treats
+    // a member pointer as "not a pointer" because std::is_pointer_v is false
+    // for member pointers, so they pass the trait as a non-pointer target).
+    using member_object_ptr_t   = int data_struct::*;
+    using member_function_ptr_t = void (data_struct::*)();
+    using free_function_ptr_t   = void (*)(int);
+
+    // A small alias so the value_t truth-table rows read cleanly.
+    template<typename T>
+    inline constexpr bool conv_v = vmhook::detail::value_t_convertible_target_v<T>;
 }
 
 int main()
@@ -1018,6 +1062,594 @@ int main()
             decltype(vmhook::detail::extract_frame_arg<const std::int32_t&>(nullptr, 0)),
             std::int32_t>,
         "extract_frame_arg must strip cv/ref from its result type");
+
+    // =========================================================================
+    // WAVE: exhaustive truth table for value_t_convertible_target_v.
+    //
+    // This trait (vmhook.hpp:1822-1842) constrains field_proxy::value_t's and
+    // method_proxy::value_t's UNCONSTRAINED `template<typename T> operator T()`
+    // to its legitimate target set, removing the spurious productions
+    // (const char*, char*, W*, nullptr_t) that make a class-target static_cast
+    // ambiguous on MSVC /permissive-.  The rule, read straight off the header:
+    //
+    //   clean = std::remove_cvref_t<T>
+    //     clean == std::nullptr_t           -> false
+    //     std::is_pointer_v<clean>          -> std::is_void_v<remove_pointer_t<clean>>
+    //                                          (i.e. true ONLY for void* of any cv)
+    //     otherwise                         -> true
+    //
+    // It was previously UNTESTED in this suite.  The tables below walk every
+    // C++ type category through it: the positive set (arithmetic / void* / class
+    // / enum / union / member-pointer / std types / wrappers) and the negative
+    // set (nullptr_t and every non-void object/function pointer), plus the
+    // cv/ref-stripping the trait performs first.  Every row is a constexpr bool,
+    // and the load-bearing ones are also pinned with static_assert below.
+    // =========================================================================
+
+    // --- nullptr_t: the one scalar that is rejected -------------------------
+    check("value_t_conv_false_for_nullptr_t",
+          !conv_v<std::nullptr_t>);
+    check("value_t_conv_false_for_const_nullptr_t",
+          !conv_v<const std::nullptr_t>);
+    check("value_t_conv_false_for_nullptr_t_ref",
+          !conv_v<std::nullptr_t&>);
+    check("value_t_conv_false_for_const_nullptr_t_ref",
+          !conv_v<const std::nullptr_t&>);
+    check("value_t_conv_false_for_nullptr_t_rvalue_ref",
+          !conv_v<std::nullptr_t&&>);
+
+    // --- void* (any cv) is the SINGLE legitimate pointer target -------------
+    check("value_t_conv_true_for_void_ptr",
+          conv_v<void*>);
+    check("value_t_conv_true_for_const_void_ptr",
+          conv_v<const void*>);
+    check("value_t_conv_true_for_volatile_void_ptr",
+          conv_v<volatile void*>);
+    check("value_t_conv_true_for_const_volatile_void_ptr",
+          conv_v<const volatile void*>);
+    // pointer-TO-void with an outer cv/ref: stripped to the pointer, still void*.
+    check("value_t_conv_true_for_void_ptr_const_qualified_pointer",
+          conv_v<void* const>);
+    check("value_t_conv_true_for_void_ptr_lvalue_ref",
+          conv_v<void*&>);
+    check("value_t_conv_true_for_void_ptr_const_ref",
+          conv_v<void* const&>);
+    check("value_t_conv_true_for_void_ptr_rvalue_ref",
+          conv_v<void*&&>);
+    // oop_type_t is exactly void*, the decode target this trait must admit.
+    check("value_t_conv_true_for_oop_type_t",
+          conv_v<vmhook::oop_type_t>);
+
+    // --- every NON-void object pointer is rejected --------------------------
+    check("value_t_conv_false_for_char_ptr",
+          !conv_v<char*>);
+    check("value_t_conv_false_for_const_char_ptr",
+          !conv_v<const char*>);
+    check("value_t_conv_false_for_int_ptr",
+          !conv_v<int*>);
+    check("value_t_conv_false_for_const_int_ptr",
+          !conv_v<const int*>);
+    check("value_t_conv_false_for_double_ptr",
+          !conv_v<double*>);
+    check("value_t_conv_false_for_wrapper_ptr",
+          !conv_v<sample_wrapper*>);
+    check("value_t_conv_false_for_object_base_ptr",
+          !conv_v<vmhook::object_base*>);
+    check("value_t_conv_false_for_void_ptr_ptr",
+          !conv_v<void**>);                       // void** is a ptr-to-(non-void)
+    check("value_t_conv_false_for_const_char_ptr_ptr",
+          !conv_v<const char**>);
+    // a non-void pointer wearing outer cv/ref is still rejected after stripping.
+    check("value_t_conv_false_for_const_char_ptr_const_ref",
+          !conv_v<const char* const&>);
+    check("value_t_conv_false_for_int_ptr_rvalue_ref",
+          !conv_v<int*&&>);
+
+    // --- function pointers are pointers, but NOT object pointers; is_pointer_v
+    //     IS true for a free-function pointer and its pointee is not void, so
+    //     the trait REJECTS them.  (A member-function pointer, by contrast, is
+    //     NOT is_pointer_v, so it is accepted as a non-pointer target.)
+    check("value_t_conv_false_for_free_function_pointer",
+          !conv_v<free_function_ptr_t>);
+    check("value_t_conv_false_for_void_noarg_function_pointer",
+          !conv_v<void(*)()>);
+    check("value_t_conv_true_for_member_function_pointer",
+          conv_v<member_function_ptr_t>);
+    check("value_t_conv_true_for_member_object_pointer",
+          conv_v<member_object_ptr_t>);
+
+    // --- arithmetic targets all pass (the numeric value_t productions) ------
+    check("value_t_conv_true_for_bool",          conv_v<bool>);
+    check("value_t_conv_true_for_char",          conv_v<char>);
+    check("value_t_conv_true_for_signed_char",   conv_v<signed char>);
+    check("value_t_conv_true_for_unsigned_char", conv_v<unsigned char>);
+    check("value_t_conv_true_for_char8",         conv_v<char8_t>);
+    check("value_t_conv_true_for_char16",        conv_v<char16_t>);
+    check("value_t_conv_true_for_char32",        conv_v<char32_t>);
+    check("value_t_conv_true_for_wchar",         conv_v<wchar_t>);
+    check("value_t_conv_true_for_short",         conv_v<short>);
+    check("value_t_conv_true_for_unsigned_short",conv_v<unsigned short>);
+    check("value_t_conv_true_for_int",           conv_v<int>);
+    check("value_t_conv_true_for_unsigned_int",  conv_v<unsigned int>);
+    check("value_t_conv_true_for_long",          conv_v<long>);
+    check("value_t_conv_true_for_unsigned_long", conv_v<unsigned long>);
+    check("value_t_conv_true_for_long_long",     conv_v<long long>);
+    check("value_t_conv_true_for_ulong_long",    conv_v<unsigned long long>);
+    check("value_t_conv_true_for_float",         conv_v<float>);
+    check("value_t_conv_true_for_double",        conv_v<double>);
+    check("value_t_conv_true_for_long_double",   conv_v<long double>);
+    // fixed-width aliases (whatever they map to, all arithmetic -> all pass).
+    check("value_t_conv_true_for_int8",   conv_v<std::int8_t>);
+    check("value_t_conv_true_for_uint8",  conv_v<std::uint8_t>);
+    check("value_t_conv_true_for_int16",  conv_v<std::int16_t>);
+    check("value_t_conv_true_for_uint16", conv_v<std::uint16_t>);
+    check("value_t_conv_true_for_int32",  conv_v<std::int32_t>);
+    check("value_t_conv_true_for_uint32", conv_v<std::uint32_t>);
+    check("value_t_conv_true_for_int64",  conv_v<std::int64_t>);
+    check("value_t_conv_true_for_uint64", conv_v<std::uint64_t>);
+    // arithmetic with cv/ref stripped first: const int& -> int -> pass.
+    check("value_t_conv_true_for_const_int_ref",   conv_v<const int&>);
+    check("value_t_conv_true_for_volatile_double",  conv_v<volatile double>);
+    check("value_t_conv_true_for_int_rvalue_ref",   conv_v<int&&>);
+
+    // --- enums / unions / classes are non-pointer non-nullptr -> all pass ---
+    check("value_t_conv_true_for_unscoped_enum",   conv_v<unscoped_enum>);
+    check("value_t_conv_true_for_scoped_enum",     conv_v<scoped_enum>);
+    check("value_t_conv_true_for_scoped_enum_u8",  conv_v<scoped_enum_u8>);
+    check("value_t_conv_true_for_union",           conv_v<plain_union>);
+    check("value_t_conv_true_for_empty_struct",    conv_v<empty_struct>);
+    check("value_t_conv_true_for_data_struct",     conv_v<data_struct>);
+    check("value_t_conv_true_for_polymorphic",     conv_v<polymorphic_struct>);
+    check("value_t_conv_true_for_final_struct",    conv_v<final_struct>);
+    // abstract type as a TARGET: the trait is purely a classification predicate
+    // (it never constructs the type), so an abstract class still classifies true.
+    check("value_t_conv_true_for_abstract_struct", conv_v<abstract_struct>);
+    check("value_t_conv_true_for_enum_const_ref",  conv_v<const scoped_enum&>);
+
+    // --- the legitimate std:: value_t targets all pass ----------------------
+    check("value_t_conv_true_for_string",          conv_v<std::string>);
+    check("value_t_conv_true_for_string_view",     conv_v<std::string_view>);
+    check("value_t_conv_true_for_const_ref_string", conv_v<const std::string&>);
+    check("value_t_conv_true_for_vector_int",      conv_v<std::vector<int>>);
+    check("value_t_conv_true_for_vector_string",   conv_v<std::vector<std::string>>);
+    check("value_t_conv_true_for_unique_ptr_wrapper",
+          conv_v<std::unique_ptr<sample_wrapper>>);
+    check("value_t_conv_true_for_unique_ptr_rvalue_ref",
+          conv_v<std::unique_ptr<sample_wrapper>&&>);
+    check("value_t_conv_true_for_optional_int",    conv_v<std::optional<int>>);
+    check("value_t_conv_true_for_pair",            conv_v<std::pair<int, double>>);
+    check("value_t_conv_true_for_tuple",           conv_v<std::tuple<int, double>>);
+    // wrapper types (object<T> and object_base) as targets are classes -> pass.
+    check("value_t_conv_true_for_object_base_value", conv_v<vmhook::object_base>);
+    check("value_t_conv_true_for_wrapper_value",     conv_v<sample_wrapper>);
+
+    // --- cv/ref-stripping symmetry: every qualifier spelling of one void* and
+    //     one rejected pointer classifies the SAME as its bare form ----------
+    check("value_t_conv_void_ptr_all_cvref_spellings_agree",
+          conv_v<void*> == conv_v<const void*>
+          && conv_v<void*> == conv_v<void* const&>
+          && conv_v<void*> == conv_v<void*&&>);
+    check("value_t_conv_char_ptr_all_cvref_spellings_agree",
+          conv_v<char*> == conv_v<const char*>
+          && conv_v<char*> == conv_v<char* const&>
+          && conv_v<char*> == conv_v<char*&&>);
+
+    // =========================================================================
+    // WAVE: is_java_double_slot_v over EVERY fundamental type.
+    //
+    // The trait (vmhook.hpp:7511-7515) is true for EXACTLY remove_cvref_t<T> in
+    // { std::int64_t, std::uint64_t, double } and false for everything else.
+    // The existing checks cover a handful; this walks the entire fundamental
+    // type list so a regression that (e.g.) accidentally widened `long` on an
+    // LP64 build or `float`/`long double` anywhere is caught.  All sizeof-
+    // sensitive cases are reasoned about explicitly, never hard-coded.
+    // =========================================================================
+    // The three true types (and only these three at the std:: alias level).
+    check("jds_true_int64",  vmhook::detail::is_java_double_slot_v<std::int64_t>);
+    check("jds_true_uint64", vmhook::detail::is_java_double_slot_v<std::uint64_t>);
+    check("jds_true_double", vmhook::detail::is_java_double_slot_v<double>);
+    // void / bool / nullptr_t.
+    check("jds_false_void_ptr", !vmhook::detail::is_java_double_slot_v<void*>);
+    check("jds_false_bool",     !vmhook::detail::is_java_double_slot_v<bool>);
+    check("jds_false_nullptr_t",!vmhook::detail::is_java_double_slot_v<std::nullptr_t>);
+    // every character type is single-slot.
+    check("jds_false_char",     !vmhook::detail::is_java_double_slot_v<char>);
+    check("jds_false_schar",    !vmhook::detail::is_java_double_slot_v<signed char>);
+    check("jds_false_uchar",    !vmhook::detail::is_java_double_slot_v<unsigned char>);
+    check("jds_false_char8",    !vmhook::detail::is_java_double_slot_v<char8_t>);
+    check("jds_false_char16",   !vmhook::detail::is_java_double_slot_v<char16_t>);
+    check("jds_false_char32",   !vmhook::detail::is_java_double_slot_v<char32_t>);
+    check("jds_false_wchar",    !vmhook::detail::is_java_double_slot_v<wchar_t>);
+    // short / int are single-slot regardless of platform.
+    check("jds_false_short",    !vmhook::detail::is_java_double_slot_v<short>);
+    check("jds_false_ushort",   !vmhook::detail::is_java_double_slot_v<unsigned short>);
+    check("jds_false_int",      !vmhook::detail::is_java_double_slot_v<int>);
+    check("jds_false_uint",     !vmhook::detail::is_java_double_slot_v<unsigned int>);
+    // `long`/`unsigned long`: the trait keys on std::int64_t/std::uint64_t, NOT
+    // on `long`.  On LP64 (`long` == 64-bit) `long` IS std::int64_t, so the
+    // trait is true; on LLP64 (Windows, `long` == 32-bit) it is NOT, so false.
+    // Branch the expectation on the actual width — never hard-code it.
+    check("jds_long_matches_its_width",
+          vmhook::detail::is_java_double_slot_v<long>
+              == (sizeof(long) == 8));
+    check("jds_ulong_matches_its_width",
+          vmhook::detail::is_java_double_slot_v<unsigned long>
+              == (sizeof(unsigned long) == 8));
+    // `long long` is 64-bit everywhere we target, but it is a DISTINCT type from
+    // std::int64_t on some platforms; the trait keys on std::int64_t exactly.
+    // Whether long long == std::int64_t is implementation-defined, so derive the
+    // expectation from that identity rather than asserting a fixed answer.
+    check("jds_long_long_matches_int64_identity",
+          vmhook::detail::is_java_double_slot_v<long long>
+              == std::is_same_v<long long, std::int64_t>);
+    check("jds_ulong_long_matches_uint64_identity",
+          vmhook::detail::is_java_double_slot_v<unsigned long long>
+              == std::is_same_v<unsigned long long, std::uint64_t>);
+    // float is single-slot; long double is single-slot (it is NOT `double`).
+    check("jds_false_float",       !vmhook::detail::is_java_double_slot_v<float>);
+    check("jds_false_long_double", !vmhook::detail::is_java_double_slot_v<long double>);
+    // fixed-width narrow aliases are all single-slot.
+    check("jds_false_int8",   !vmhook::detail::is_java_double_slot_v<std::int8_t>);
+    check("jds_false_uint8",  !vmhook::detail::is_java_double_slot_v<std::uint8_t>);
+    check("jds_false_int16",  !vmhook::detail::is_java_double_slot_v<std::int16_t>);
+    check("jds_false_uint16", !vmhook::detail::is_java_double_slot_v<std::uint16_t>);
+    check("jds_false_int32",  !vmhook::detail::is_java_double_slot_v<std::int32_t>);
+    check("jds_false_uint32", !vmhook::detail::is_java_double_slot_v<std::uint32_t>);
+    // enums / pointers / class types are all single-slot (none are the 3 types).
+    check("jds_false_unscoped_enum", !vmhook::detail::is_java_double_slot_v<unscoped_enum>);
+    check("jds_false_scoped_enum",   !vmhook::detail::is_java_double_slot_v<scoped_enum>);
+    check("jds_false_data_struct",   !vmhook::detail::is_java_double_slot_v<data_struct>);
+    check("jds_false_wrapper",       !vmhook::detail::is_java_double_slot_v<sample_wrapper>);
+    // cv/ref stripping: every qualifier spelling of int64/double agrees with bare.
+    check("jds_int64_all_cvref_spellings_true",
+          vmhook::detail::is_java_double_slot_v<const std::int64_t>
+          && vmhook::detail::is_java_double_slot_v<volatile std::int64_t>
+          && vmhook::detail::is_java_double_slot_v<const volatile std::int64_t&>
+          && vmhook::detail::is_java_double_slot_v<std::int64_t&&>);
+    check("jds_double_all_cvref_spellings_true",
+          vmhook::detail::is_java_double_slot_v<const double>
+          && vmhook::detail::is_java_double_slot_v<volatile double&>
+          && vmhook::detail::is_java_double_slot_v<double&&>);
+    check("jds_int_all_cvref_spellings_false",
+          !vmhook::detail::is_java_double_slot_v<const int>
+          && !vmhook::detail::is_java_double_slot_v<volatile int&>
+          && !vmhook::detail::is_java_double_slot_v<int&&>);
+
+    // =========================================================================
+    // WAVE: is_vector_v negative space + element-type matrix.
+    //
+    // is_vector_v (vmhook.hpp:1745-1746) is is_vector<remove_cvref_t<T>>::value;
+    // is_vector<X> is true ONLY for std::vector<E, A>.  Walk the full category
+    // grid so any accidental broadening (to array / span / other containers) or
+    // narrowing (losing a custom-allocator vector) is caught.
+    // =========================================================================
+    // Positive: vectors of every category of element are still vectors.
+    check("is_vector_true_for_vector_bool",          vmhook::detail::is_vector_v<std::vector<bool>>);
+    check("is_vector_true_for_vector_char",          vmhook::detail::is_vector_v<std::vector<char>>);
+    check("is_vector_true_for_vector_double",         vmhook::detail::is_vector_v<std::vector<double>>);
+    check("is_vector_true_for_vector_void_ptr",       vmhook::detail::is_vector_v<std::vector<void*>>);
+    check("is_vector_true_for_vector_enum",           vmhook::detail::is_vector_v<std::vector<scoped_enum>>);
+    check("is_vector_true_for_vector_pair",           vmhook::detail::is_vector_v<std::vector<std::pair<int, int>>>);
+    check("is_vector_true_for_vector_wrapper_ptr",    vmhook::detail::is_vector_v<std::vector<sample_wrapper*>>);
+    // Negative: every other type category is not a vector.
+    check("is_vector_false_for_void",        !vmhook::detail::is_vector_v<void>);
+    check("is_vector_false_for_bool",        !vmhook::detail::is_vector_v<bool>);
+    check("is_vector_false_for_double",      !vmhook::detail::is_vector_v<double>);
+    check("is_vector_false_for_nullptr_t",   !vmhook::detail::is_vector_v<std::nullptr_t>);
+    check("is_vector_false_for_void_ptr",    !vmhook::detail::is_vector_v<void*>);
+    check("is_vector_false_for_enum",        !vmhook::detail::is_vector_v<scoped_enum>);
+    check("is_vector_false_for_union",       !vmhook::detail::is_vector_v<plain_union>);
+    check("is_vector_false_for_empty_struct",!vmhook::detail::is_vector_v<empty_struct>);
+    check("is_vector_false_for_string",      !vmhook::detail::is_vector_v<std::string>);
+    check("is_vector_false_for_string_view", !vmhook::detail::is_vector_v<std::string_view>);
+    check("is_vector_false_for_array",       !vmhook::detail::is_vector_v<std::array<int, 3>>);
+    check("is_vector_false_for_optional_vector",
+          !vmhook::detail::is_vector_v<std::optional<std::vector<int>>>);
+    check("is_vector_false_for_pair_of_vectors",
+          !vmhook::detail::is_vector_v<std::pair<std::vector<int>, std::vector<int>>>);
+    check("is_vector_false_for_c_array",     !vmhook::detail::is_vector_v<int[4]>);
+    check("is_vector_false_for_function_ptr", !vmhook::detail::is_vector_v<free_function_ptr_t>);
+    check("is_vector_false_for_member_ptr",  !vmhook::detail::is_vector_v<member_object_ptr_t>);
+    check("is_vector_false_for_wrapper",     !vmhook::detail::is_vector_v<sample_wrapper>);
+    // A vector with a custom (but std-conforming) allocator is still a vector,
+    // proving the trait matches the two-parameter std::vector<E, A> template.
+    check("is_vector_true_for_custom_allocator_vector",
+          vmhook::detail::is_vector_v<std::vector<int, std::allocator<int>>>);
+    // value_type_t round-trips the element for several element categories.
+    check("is_vector_value_type_t_void_ptr",
+          std::is_same_v<vector_value_t<std::vector<void*>>, void*>);
+    check("is_vector_value_type_t_enum",
+          std::is_same_v<vector_value_t<std::vector<scoped_enum>>, scoped_enum>);
+    check("is_vector_value_type_t_bool",
+          std::is_same_v<vector_value_t<std::vector<bool>>, bool>);   // genuinely bool here
+    check("is_vector_value_type_t_data_struct",
+          std::is_same_v<vector_value_t<std::vector<data_struct>>, data_struct>);
+
+    // =========================================================================
+    // WAVE: is_unique_ptr_v / is_unique_object_ptr full category grids.
+    //
+    // is_unique_ptr_v (vmhook.hpp:1783-1784) is true ONLY for std::unique_ptr;
+    // is_unique_object_ptr (vmhook.hpp:9416-9426) refines that to a unique_ptr
+    // whose pointee derives from object_base (is_base_of, hence reflexive).  The
+    // two are walked together so the relationship (object-ptr implies unique-ptr,
+    // never the converse) is pinned across every pointee category.
+    // =========================================================================
+    // is_unique_ptr_v positive: pointee category does not matter.
+    check("is_unique_ptr_true_for_unique_ptr_void",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<void, void(*)(void*)>>);
+    check("is_unique_ptr_true_for_unique_ptr_enum",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<scoped_enum>>);
+    check("is_unique_ptr_true_for_unique_ptr_array",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<int[]>>);
+    check("is_unique_ptr_true_for_unique_ptr_object_base",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<vmhook::object_base>>);
+    // is_unique_ptr_v negative: everything that is not a unique_ptr.
+    check("is_unique_ptr_false_for_void",        !vmhook::detail::is_unique_ptr_v<void>);
+    check("is_unique_ptr_false_for_nullptr_t",   !vmhook::detail::is_unique_ptr_v<std::nullptr_t>);
+    check("is_unique_ptr_false_for_void_ptr",    !vmhook::detail::is_unique_ptr_v<void*>);
+    check("is_unique_ptr_false_for_wrapper_ptr", !vmhook::detail::is_unique_ptr_v<sample_wrapper*>);
+    check("is_unique_ptr_false_for_shared_ptr_wrapper",
+          !vmhook::detail::is_unique_ptr_v<std::shared_ptr<sample_wrapper>>);
+    check("is_unique_ptr_false_for_weak_ptr",    !vmhook::detail::is_unique_ptr_v<std::weak_ptr<int>>);
+    check("is_unique_ptr_false_for_optional_unique_ptr",
+          !vmhook::detail::is_unique_ptr_v<std::optional<std::unique_ptr<int>>>);
+    check("is_unique_ptr_false_for_vector_unique_ptr",
+          !vmhook::detail::is_unique_ptr_v<std::vector<std::unique_ptr<int>>>);
+    check("is_unique_ptr_false_for_enum",        !vmhook::detail::is_unique_ptr_v<scoped_enum>);
+    check("is_unique_ptr_false_for_wrapper",     !vmhook::detail::is_unique_ptr_v<sample_wrapper>);
+    // value_type_t round-trips the pointee for several categories.
+    check("is_unique_ptr_value_type_t_enum",
+          std::is_same_v<unique_value_t<std::unique_ptr<scoped_enum>>, scoped_enum>);
+    check("is_unique_ptr_value_type_t_data_struct",
+          std::is_same_v<unique_value_t<std::unique_ptr<data_struct>>, data_struct>);
+    check("is_unique_ptr_value_type_t_other_wrapper",
+          std::is_same_v<unique_value_t<std::unique_ptr<other_wrapper>>, other_wrapper>);
+
+    // is_unique_object_ptr: true iff unique_ptr whose pointee : object_base.
+    check("is_uop_true_for_unique_ptr_direct_object_base_derived",
+          vmhook::detail::is_unique_object_ptr<std::unique_ptr<direct_object_base_derived>>::value);
+    check("is_uop_true_for_unique_ptr_other_wrapper",
+          vmhook::detail::is_unique_object_ptr<std::unique_ptr<other_wrapper>>::value);
+    check("is_uop_true_for_unique_ptr_object_base_reflexive",
+          vmhook::detail::is_unique_object_ptr<std::unique_ptr<vmhook::object_base>>::value);
+    // Negative: non-object pointees, and non-unique_ptr shapes entirely.
+    check("is_uop_false_for_unique_ptr_unrelated_class",
+          !vmhook::detail::is_unique_object_ptr<std::unique_ptr<unrelated_class>>::value);
+    check("is_uop_false_for_unique_ptr_enum",
+          !vmhook::detail::is_unique_object_ptr<std::unique_ptr<scoped_enum>>::value);
+    check("is_uop_false_for_unique_ptr_void_deleter",
+          !vmhook::detail::is_unique_object_ptr<std::unique_ptr<int>>::value);
+    check("is_uop_false_for_shared_ptr_object_base",
+          !vmhook::detail::is_unique_object_ptr<std::shared_ptr<vmhook::object_base>>::value);
+    check("is_uop_false_for_raw_object_base_ptr",
+          !vmhook::detail::is_unique_object_ptr<vmhook::object_base*>::value);
+    check("is_uop_false_for_object_base_value",
+          !vmhook::detail::is_unique_object_ptr<vmhook::object_base>::value);
+    check("is_uop_false_for_void",
+          !vmhook::detail::is_unique_object_ptr<void>::value);
+    // The refinement relationship: object-ptr implies unique-ptr for every
+    // wrapper pointee, but unique-ptr does NOT imply object-ptr for a non-wrapper.
+    check("is_uop_implies_is_unique_ptr_for_wrapper",
+          vmhook::detail::is_unique_object_ptr<std::unique_ptr<sample_wrapper>>::value
+          && vmhook::detail::is_unique_ptr_v<std::unique_ptr<sample_wrapper>>);
+    check("is_unique_ptr_does_not_imply_is_uop_for_int",
+          vmhook::detail::is_unique_ptr_v<std::unique_ptr<int>>
+          && !vmhook::detail::is_unique_object_ptr<std::unique_ptr<int>>::value);
+
+    // =========================================================================
+    // WAVE: dependent_false_v over many arities and type categories.
+    // It is constexpr false for ANY pack (vmhook.hpp:1718-1719).  Enumerate a
+    // representative spread so a regression that made it non-false for some
+    // pack shape is caught at runtime AND compile time.
+    // =========================================================================
+    check("dependent_false_v_void",        !vmhook::detail::dependent_false_v<void>);
+    check("dependent_false_v_nullptr_t",    !vmhook::detail::dependent_false_v<std::nullptr_t>);
+    check("dependent_false_v_void_ptr",     !vmhook::detail::dependent_false_v<void*>);
+    check("dependent_false_v_enum",         !vmhook::detail::dependent_false_v<scoped_enum>);
+    check("dependent_false_v_union",        !vmhook::detail::dependent_false_v<plain_union>);
+    check("dependent_false_v_ref",          !vmhook::detail::dependent_false_v<int&>);
+    check("dependent_false_v_array",        !vmhook::detail::dependent_false_v<int[4]>);
+    check("dependent_false_v_function_ptr", !vmhook::detail::dependent_false_v<free_function_ptr_t>);
+    check("dependent_false_v_object_base",  !vmhook::detail::dependent_false_v<vmhook::object_base>);
+    check("dependent_false_v_seven_args",
+          !vmhook::detail::dependent_false_v<int, long, double, std::string,
+                                             void*, scoped_enum, std::vector<int>>);
+
+    // =========================================================================
+    // WAVE: extract_frame_arg result type = remove_cvref_t<value_type>, walked
+    // across every category (vmhook.hpp:9264-9268).  The function is NEVER
+    // invoked (nullptr frame, type-level only via decltype on an unevaluated
+    // call), so this is a pure compile-time identity over the cv/ref lattice.
+    // =========================================================================
+    {
+        // arithmetic: all cv/ref spellings collapse to the bare arithmetic type.
+        check("efa_int_identity",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<int>(nullptr, 0)), int>);
+        check("efa_const_int_to_int",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<const int>(nullptr, 0)), int>);
+        check("efa_volatile_int_to_int",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<volatile int>(nullptr, 0)), int>);
+        check("efa_int_ref_to_int",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<int&>(nullptr, 0)), int>);
+        check("efa_int_rvalue_ref_to_int",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<int&&>(nullptr, 0)), int>);
+        check("efa_cv_ref_int_to_int",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<const volatile int&>(nullptr, 0)), int>);
+        check("efa_long_identity",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<std::int64_t>(nullptr, 0)), std::int64_t>);
+        check("efa_double_const_ref_to_double",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<const double&>(nullptr, 0)), double>);
+        // pointer: cv on the pointer is stripped; the POINTEE cv is preserved
+        // (remove_cvref strips top-level only).  const void* stays const void*.
+        check("efa_void_ptr_identity",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<void*>(nullptr, 0)), void*>);
+        check("efa_const_void_ptr_preserves_pointee_const",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<const void*>(nullptr, 0)), const void*>);
+        check("efa_void_ptr_const_ref_to_void_ptr",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<void* const&>(nullptr, 0)), void*>);
+        // std::string and unique_ptr targets (the OOP-decoding arms).
+        check("efa_string_const_ref_to_string",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<const std::string&>(nullptr, 0)), std::string>);
+        check("efa_unique_ptr_wrapper_const_ref",
+              std::is_same_v<
+                  decltype(vmhook::detail::extract_frame_arg<const std::unique_ptr<sample_wrapper>&>(nullptr, 0)),
+                  std::unique_ptr<sample_wrapper>>);
+        // enum target keeps its identity after stripping.
+        check("efa_enum_const_to_enum",
+              std::is_same_v<decltype(vmhook::detail::extract_frame_arg<const scoped_enum>(nullptr, 0)), scoped_enum>);
+        // by-value and const-ref of the SAME underlying type decode to one C++
+        // type — the property that lets a detour spell a param either way.
+        check("efa_byvalue_and_constref_int_agree",
+              std::is_same_v<
+                  decltype(vmhook::detail::extract_frame_arg<int>(nullptr, 0)),
+                  decltype(vmhook::detail::extract_frame_arg<const int&>(nullptr, 0))>);
+    }
+
+    // =========================================================================
+    // WAVE: java_slot_offsets edge widths, sizeof-reasoned, no hard-coded sizes.
+    //
+    // The fold (vmhook.hpp:7542-7553) advances the cursor by 2 for any arg with
+    // is_java_double_slot_v, else by 1.  Because is_java_double_slot_v keys on
+    // std::int64_t/std::uint64_t/double (NOT on `long`), the offset table for a
+    // tuple containing `long` is platform-dependent: compute the EXPECTED table
+    // from is_java_double_slot_v itself so the assertion holds on LP64 and LLP64
+    // alike.  The fixed-width tuples elsewhere in this file are unaffected.
+    // =========================================================================
+    {
+        // (long, int): if `long` is a double-slot here, the int lands at slot 2;
+        // otherwise at slot 1.  Derive the expectation from the trait, not a
+        // literal — this is the platform-correct way to pin a `long`-bearing row.
+        constexpr std::int32_t long_width{
+            vmhook::detail::is_java_double_slot_v<long> ? 2 : 1 };
+        const std::array<std::int32_t, 2> expected_long_int{ 0, long_width };
+        check("java_slot_offsets_long_int_platform_correct",
+              vmhook::detail::java_slot_offsets<std::tuple<long, std::int32_t>>::value
+                  == expected_long_int);
+
+        // (unsigned long, int): same reasoning via the unsigned-long width.
+        constexpr std::int32_t ulong_width{
+            vmhook::detail::is_java_double_slot_v<unsigned long> ? 2 : 1 };
+        const std::array<std::int32_t, 2> expected_ulong_int{ 0, ulong_width };
+        check("java_slot_offsets_ulong_int_platform_correct",
+              vmhook::detail::java_slot_offsets<std::tuple<unsigned long, std::int32_t>>::value
+                  == expected_ulong_int);
+    }
+    // A single-element tuple for each of the three two-slot types: the lone entry
+    // is always slot 0 (nothing precedes it), independent of its width.
+    check("java_slot_offsets_single_int64_is_zero",
+          (vmhook::detail::java_slot_offsets<std::tuple<std::int64_t>>::value
+           == std::array<std::int32_t, 1>{ 0 }));
+    check("java_slot_offsets_single_uint64_is_zero",
+          (vmhook::detail::java_slot_offsets<std::tuple<std::uint64_t>>::value
+           == std::array<std::int32_t, 1>{ 0 }));
+    // long double is NOT a double-slot (single slot): (long double, int) -> 0, 1.
+    check("java_slot_offsets_long_double_is_single_slot",
+          (vmhook::detail::java_slot_offsets<std::tuple<long double, std::int32_t>>::value
+           == std::array<std::int32_t, 2>{ 0, 1 }));
+    // enum / pointer / wrapper-unique_ptr args are single-slot; interleave them
+    // with a double to prove only the double widens.
+    check("java_slot_offsets_enum_double_enum",
+          (vmhook::detail::java_slot_offsets<std::tuple<scoped_enum, double, scoped_enum>>::value
+           == std::array<std::int32_t, 3>{ 0, 1, 3 }));
+    check("java_slot_offsets_uniqueptr_long_int",
+          (vmhook::detail::java_slot_offsets<
+               std::tuple<std::unique_ptr<sample_wrapper>, std::int64_t, std::int32_t>>::value
+           == std::array<std::int32_t, 3>{ 0, 1, 3 }));
+
+    // =========================================================================
+    // WAVE: tuple_tail across element categories + the has_tuple_tail detector.
+    //
+    // tuple_tail drops the first element (vmhook.hpp:7527-7531) and has an
+    // empty-tuple base (7545-7549); type_t exists for any std::tuple<...> and is
+    // absent for any non-tuple.  Walk both: many element-type tails, and the
+    // detector over a spread of non-tuple categories.
+    // =========================================================================
+    // type_t present ONLY for std::tuple specialisations.
+    check("has_tuple_tail_false_for_int",        !has_tuple_tail<int>::value);
+    check("has_tuple_tail_false_for_void",       !has_tuple_tail<void>::value);
+    check("has_tuple_tail_false_for_void_ptr",   !has_tuple_tail<void*>::value);
+    check("has_tuple_tail_false_for_pair",       !has_tuple_tail<std::pair<int, int>>::value);
+    check("has_tuple_tail_false_for_array",      !has_tuple_tail<std::array<int, 2>>::value);
+    check("has_tuple_tail_false_for_vector",     !has_tuple_tail<std::vector<int>>::value);
+    check("has_tuple_tail_true_for_empty_tuple", has_tuple_tail<std::tuple<>>::value);
+    check("has_tuple_tail_true_for_singleton",   has_tuple_tail<std::tuple<int>>::value);
+    check("has_tuple_tail_true_for_many",        has_tuple_tail<std::tuple<int, double, void*>>::value);
+    // tails preserve order and the exact (cv/ref-qualified) element spellings.
+    check("tuple_tail_singleton_to_empty",
+          std::is_same_v<typename vmhook::detail::tuple_tail<std::tuple<int>>::type_t, std::tuple<>>);
+    check("tuple_tail_preserves_cvref_elements",
+          std::is_same_v<
+              typename vmhook::detail::tuple_tail<
+                  std::tuple<void*, const int&, std::string&&, scoped_enum>>::type_t,
+              std::tuple<const int&, std::string&&, scoped_enum>>);
+    check("tuple_tail_drops_only_first_of_two_wrappers",
+          std::is_same_v<
+              typename vmhook::detail::tuple_tail<
+                  std::tuple<std::unique_ptr<sample_wrapper>, std::unique_ptr<other_wrapper>>>::type_t,
+              std::tuple<std::unique_ptr<other_wrapper>>>);
+
+    // -------------------------------------------------------------------------
+    // Compile-time enforcement for the new waves (build breaks before runtime
+    // on regression — the strongest guarantee).  One representative load-bearing
+    // fact per wave; platform-sensitive facts are expressed as derived
+    // identities so they hold on every target.
+    // -------------------------------------------------------------------------
+    // value_t_convertible_target_v: the exact contract (nullptr & non-void ptr
+    // rejected; void* and every non-pointer non-nullptr accepted).
+    static_assert(!vmhook::detail::value_t_convertible_target_v<std::nullptr_t>,
+                  "value_t target must reject std::nullptr_t");
+    static_assert(!vmhook::detail::value_t_convertible_target_v<const char*>,
+                  "value_t target must reject const char* (the MSVC-ambiguity production)");
+    static_assert(!vmhook::detail::value_t_convertible_target_v<sample_wrapper*>,
+                  "value_t target must reject a raw wrapper pointer W*");
+    static_assert(vmhook::detail::value_t_convertible_target_v<void*>,
+                  "value_t target must accept void* (the single legitimate pointer)");
+    static_assert(vmhook::detail::value_t_convertible_target_v<const void*>,
+                  "value_t target must accept const void* (cv-stripped to void*)");
+    static_assert(vmhook::detail::value_t_convertible_target_v<std::string>,
+                  "value_t target must accept std::string");
+    static_assert(vmhook::detail::value_t_convertible_target_v<std::unique_ptr<sample_wrapper>>,
+                  "value_t target must accept std::unique_ptr<W>");
+    static_assert(vmhook::detail::value_t_convertible_target_v<int>,
+                  "value_t target must accept arithmetic types");
+    static_assert(!vmhook::detail::value_t_convertible_target_v<void(*)()>,
+                  "value_t target must reject a free-function pointer (non-void pointer)");
+    static_assert(vmhook::detail::value_t_convertible_target_v<int data_struct::*>,
+                  "value_t target must accept a member pointer (not is_pointer_v)");
+    // is_java_double_slot_v: the three accepted std:: aliases, and the
+    // platform-derived `long` identity.
+    static_assert(vmhook::detail::is_java_double_slot_v<std::int64_t>
+                      && vmhook::detail::is_java_double_slot_v<std::uint64_t>
+                      && vmhook::detail::is_java_double_slot_v<double>,
+                  "int64_t / uint64_t / double are the three two-slot types");
+    static_assert(!vmhook::detail::is_java_double_slot_v<float>
+                      && !vmhook::detail::is_java_double_slot_v<long double>
+                      && !vmhook::detail::is_java_double_slot_v<int>,
+                  "float / long double / int are all single-slot");
+    static_assert(vmhook::detail::is_java_double_slot_v<long> == (sizeof(long) == 8),
+                  "is_java_double_slot_v<long> must track long's actual width (LP64 vs LLP64)");
+    // is_vector / is_unique_ptr / is_unique_object_ptr key facts.
+    static_assert(vmhook::detail::is_vector_v<std::vector<int, std::allocator<int>>>,
+                  "is_vector_v must match std::vector<E, A> with an explicit allocator");
+    static_assert(!vmhook::detail::is_vector_v<std::array<int, 3>>,
+                  "is_vector_v must NOT match std::array");
+    static_assert(vmhook::detail::is_unique_object_ptr<std::unique_ptr<vmhook::object_base>>::value,
+                  "is_unique_object_ptr is reflexive on object_base itself");
+    static_assert(!vmhook::detail::is_unique_object_ptr<std::unique_ptr<int>>::value
+                      && vmhook::detail::is_unique_ptr_v<std::unique_ptr<int>>,
+                  "unique_ptr<int> is a unique_ptr but NOT an object-ptr");
+    // extract_frame_arg result-type stripping (top-level cv/ref only).
+    static_assert(std::is_same_v<
+                      decltype(vmhook::detail::extract_frame_arg<const void*>(nullptr, 0)),
+                      const void*>,
+                  "extract_frame_arg strips TOP-LEVEL cv/ref only; const void* keeps pointee const");
+    // tuple_tail element-spelling preservation and the non-tuple absence.
+    static_assert(std::is_same_v<
+                      typename vmhook::detail::tuple_tail<std::tuple<void*, const int&>>::type_t,
+                      std::tuple<const int&>>,
+                  "tuple_tail preserves the surviving elements' cv/ref spelling verbatim");
+    static_assert(!has_tuple_tail<std::pair<int, int>>::value,
+                  "tuple_tail::type_t must be absent for a non-tuple (std::pair)");
 
     std::printf("vmhook traits-extra: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
