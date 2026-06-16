@@ -391,6 +391,15 @@ VMHOOK_JVM_MODULE(klass_introspection)
     // =====================================================================
     cp("PART B access flags (guarded _access_flags read; known shape + Modifier)");
     {
+        // gcc-14 -Wmaybe-uninitialized false-positives on the GUARDED `*af_X` reads in
+        // this block — it can't model std::optional's engaged-implies-value-initialized
+        // invariant through a `cond ? fn_returning_optional() : nullopt` init, and the
+        // build's TU count tips its heuristic (clang models it correctly + compiles
+        // clean, so this is gcc-only). Every deref below is gated by `if (af_X)`.
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
         const std::optional<std::uint32_t> af_self{
             klass_header_safely_readable(k_self) ? klass_access_flags(k_self) : std::nullopt };
         const std::optional<std::uint32_t> af_iface{
@@ -517,6 +526,9 @@ VMHOOK_JVM_MODULE(klass_introspection)
         xcheck_shared_bits("enum",     af_enum,     kli::i("enumMods"));
         xcheck_shared_bits("marker",   af_marker,   kli::i("markerMods"));
         xcheck_shared_bits("nested",   af_nested,   kli::i("nestedMods"));
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC diagnostic pop
+#endif
     }
 
     // =====================================================================

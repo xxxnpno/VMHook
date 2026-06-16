@@ -90,6 +90,7 @@ vmhook_add_test(compressed_klass_decode        SOURCES test_compressed_klass_dec
 vmhook_add_test(decode_u5                       SOURCES test_decode_u5.cpp)
 vmhook_add_test(iterate_entries_safety         SOURCES test_iterate_entries_safety.cpp)
 vmhook_add_test(os_release_and_protect_edges   SOURCES test_os_release_and_protect_edges.cpp)
+vmhook_add_test(os_safe_read                   SOURCES test_os_safe_read.cpp)
 vmhook_add_test(array_element_helpers          SOURCES test_array_element_helpers.cpp)
 vmhook_add_test(return_value                    SOURCES test_return_value.cpp)
 vmhook_add_test(object_factory                  SOURCES test_object_factory.cpp)
