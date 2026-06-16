@@ -929,6 +929,17 @@ namespace vmhook
             {
                 return false;
             }
+            // Absurd / address-space-wrapping size guard (cross-platform contract).
+            // A `size` so large that `src + size` overflows the address space can never
+            // name a valid mapped range.  Platforms disagree on how the raw read fails
+            // it — Windows ReadProcessMemory returns false, but Linux process_vm_readv
+            // can short-read and the macOS/iOS paths differ — so reject it uniformly
+            // here.  Overflow-safe: detects SIZE_MAX and any src+size that wraps past
+            // UINTPTR_MAX.
+            if (reinterpret_cast<std::uintptr_t>(src) + size < reinterpret_cast<std::uintptr_t>(src))
+            {
+                return false;
+            }
 #if VMHOOK_OS_WINDOWS
             SIZE_T transferred{ 0 };
             const BOOL ok{ ::ReadProcessMemory(::GetCurrentProcess(), src, dst,
