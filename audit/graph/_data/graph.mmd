@@ -203,6 +203,7 @@ flowchart LR
   for_each_loaded_class --> klass_introspection
   for_each_thread --> iterate_entries_safety
   global_ref --> jni_local_ref_hygiene
+  global_ref --> decode_oop_and_pointers
   hook_basic --> midi2i_trampoline_alloc
   hook_basic --> hook_common_detour_dispatch
   hook_basic --> method_entry_points_i2i_i2c
@@ -240,8 +241,8 @@ flowchart LR
   interface_polymorphism --> method_overload
   jni_arg_packing --> signature_parsing
   klass_introspection --> vmstructs_offset_resolution
-  klass_introspection --> instanceklass_methods_walk
   klass_introspection --> compressed_klass_decode
+  klass_introspection --> decode_oop_and_pointers
   make_java_array --> jni_arg_packing
   make_java_string --> jni_local_ref_hygiene
   make_unique --> wrapper_pattern
@@ -281,6 +282,7 @@ flowchart LR
   on_class_loaded --> hook_basic
   on_exception --> hook_basic
   os_safe_read --> os_signal_handler
+  os_safe_read --> seh_invoke_detour
   poly_inherited_oop --> klass_introspection
   poly_inherited_oop --> field_inherited
   read_java_string --> compressed_oops_decode

@@ -30,7 +30,6 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Depended on by
 
-- [[features/klass_introspection|klass_introspection]]
 - [[features/method_enumeration|method_enumeration]]
 
 ## Tests

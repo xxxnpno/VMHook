@@ -24,6 +24,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/hook_chaining|hook_chaining]]
 - [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]]
+- [[features/os_safe_read|os_safe_read]]
 
 ## Notes
 

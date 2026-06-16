@@ -4,13 +4,13 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 - **Features:** 109
 - **Categories:** 13
-- **`depends_on` edges:** 168
+- **`depends_on` edges:** 170
 
 ## Status
 
 - `queued`: 0
-- `seeded`: 103
-- `in_progress`: 6
+- `seeded`: 98
+- `in_progress`: 11
 - `audited`: 0
 - `perfected`: 0
 
@@ -52,11 +52,11 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/find_class_fallback|find_class_fallback]] — `seeded` / `medium` — Find Class Fallback
 - [[features/instanceklass_methods_walk|instanceklass_methods_walk]] — `seeded` / `medium` — Instanceklass Methods Walk
 - [[features/interface_polymorphism|interface_polymorphism]] — `seeded` / `medium` — Interface Polymorphism
-- [[features/klass_introspection|klass_introspection]] — `seeded` / `medium` — Klass Introspection
+- [[features/klass_introspection|klass_introspection]] — `in_progress` / `high` — Klass Introspection
 - [[features/nested_classes|nested_classes]] — `seeded` / `medium` — Nested Classes
 - [[features/poly_inherited_oop|poly_inherited_oop]] — `seeded` / `medium` — Poly Inherited Oop
 - [[features/register_class|register_class]] — `seeded` / `medium` — Register Class
-- [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]] — `seeded` / `medium` — Vmstructs Offset Resolution
+- [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]] — `in_progress` / `critical` — VMStructs Offset Resolution
 
 ### [[categories/method|Method proxies (resolve / call / dispatch)]] · 19 feature(s)
 
@@ -121,9 +121,9 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 ### [[categories/jni|JNI plumbing (arg packing / refs / java values)]] · 6 feature(s)
 
-- [[features/global_ref|global_ref]] — `seeded` / `medium` — Global Ref
+- [[features/global_ref|global_ref]] — `in_progress` / `high` — Global Ref (JNI GC-survival pin)
 - [[features/jni_arg_packing|jni_arg_packing]] — `seeded` / `medium` — Jni Arg Packing
-- [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]] — `seeded` / `medium` — Jni Local Ref Hygiene
+- [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]] — `in_progress` / `high` — JNI Local Reference Hygiene
 - [[features/make_java_array|make_java_array]] — `seeded` / `medium` — Make Java Array
 - [[features/make_java_string|make_java_string]] — `seeded` / `medium` — Make Java String
 - [[features/read_java_string|read_java_string]] — `seeded` / `medium` — Read Java String
@@ -142,7 +142,7 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/os_page_size_granularity|os_page_size_granularity]] — `seeded` / `medium` — Os Page Size Granularity
 - [[features/os_protect|os_protect]] — `seeded` / `medium` — Os Protect
 - [[features/os_query_region|os_query_region]] — `seeded` / `medium` — Os Query Region
-- [[features/os_safe_read|os_safe_read]] — `seeded` / `medium` — Os Safe Read
+- [[features/os_safe_read|os_safe_read]] — `in_progress` / `critical` — Os Safe Read
 - [[features/os_signal_handler|os_signal_handler]] — `seeded` / `medium` — Os Signal Handler
 
 ### [[categories/lifecycle|Lifecycle hooks (shutdown / class-load / exception / enum)]] · 4 feature(s)

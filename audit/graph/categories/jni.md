@@ -11,9 +11,9 @@ tags: [category/jni]
 
 ## Features
 
-- [[features/global_ref|global_ref]] — `seeded` / `medium` — Global Ref
+- [[features/global_ref|global_ref]] — `in_progress` / `high` — Global Ref (JNI GC-survival pin)
 - [[features/jni_arg_packing|jni_arg_packing]] — `seeded` / `medium` — Jni Arg Packing
-- [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]] — `seeded` / `medium` — Jni Local Ref Hygiene
+- [[features/jni_local_ref_hygiene|jni_local_ref_hygiene]] — `in_progress` / `high` — JNI Local Reference Hygiene
 - [[features/make_java_array|make_java_array]] — `seeded` / `medium` — Make Java Array
 - [[features/make_java_string|make_java_string]] — `seeded` / `medium` — Make Java String
 - [[features/read_java_string|read_java_string]] — `seeded` / `medium` — Read Java String
@@ -32,9 +32,11 @@ flowchart LR
   end
   subgraph external["(external deps)"]
     compressed_oops_decode[/compressed_oops_decode/]
+    decode_oop_and_pointers[/decode_oop_and_pointers/]
     signature_parsing[/signature_parsing/]
   end
   global_ref --> jni_local_ref_hygiene
+  global_ref --> decode_oop_and_pointers
   jni_arg_packing --> signature_parsing
   make_java_array --> jni_arg_packing
   make_java_string --> jni_local_ref_hygiene

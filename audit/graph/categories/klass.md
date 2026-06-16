@@ -21,11 +21,11 @@ tags: [category/klass]
 - [[features/find_class_fallback|find_class_fallback]] — `seeded` / `medium` — Find Class Fallback
 - [[features/instanceklass_methods_walk|instanceklass_methods_walk]] — `seeded` / `medium` — Instanceklass Methods Walk
 - [[features/interface_polymorphism|interface_polymorphism]] — `seeded` / `medium` — Interface Polymorphism
-- [[features/klass_introspection|klass_introspection]] — `seeded` / `medium` — Klass Introspection
+- [[features/klass_introspection|klass_introspection]] — `in_progress` / `high` — Klass Introspection
 - [[features/nested_classes|nested_classes]] — `seeded` / `medium` — Nested Classes
 - [[features/poly_inherited_oop|poly_inherited_oop]] — `seeded` / `medium` — Poly Inherited Oop
 - [[features/register_class|register_class]] — `seeded` / `medium` — Register Class
-- [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]] — `seeded` / `medium` — Vmstructs Offset Resolution
+- [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]] — `in_progress` / `critical` — VMStructs Offset Resolution
 
 ## Dependency graph
 
@@ -68,8 +68,8 @@ flowchart LR
   interface_polymorphism --> klass_introspection
   interface_polymorphism --> method_overload
   klass_introspection --> vmstructs_offset_resolution
-  klass_introspection --> instanceklass_methods_walk
   klass_introspection --> compressed_klass_decode
+  klass_introspection --> decode_oop_and_pointers
   nested_classes --> klass_introspection
   poly_inherited_oop --> klass_introspection
   poly_inherited_oop --> field_inherited

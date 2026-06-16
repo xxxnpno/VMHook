@@ -30,6 +30,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/register_class|register_class]]
 - [[features/return_set_wrapper_null|return_set_wrapper_null]]
 
+## Referenced from
+
+- [[features/global_ref|global_ref]]
+
 ## Tests
 
 - `tests/jvm/modules/wrapper_pattern.cpp`

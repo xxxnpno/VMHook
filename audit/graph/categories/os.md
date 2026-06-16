@@ -16,7 +16,7 @@ tags: [category/os]
 - [[features/os_page_size_granularity|os_page_size_granularity]] — `seeded` / `medium` — Os Page Size Granularity
 - [[features/os_protect|os_protect]] — `seeded` / `medium` — Os Protect
 - [[features/os_query_region|os_query_region]] — `seeded` / `medium` — Os Query Region
-- [[features/os_safe_read|os_safe_read]] — `seeded` / `medium` — Os Safe Read
+- [[features/os_safe_read|os_safe_read]] — `in_progress` / `critical` — Os Safe Read
 - [[features/os_signal_handler|os_signal_handler]] — `seeded` / `medium` — Os Signal Handler
 
 ## Dependency graph
@@ -32,5 +32,9 @@ flowchart LR
     os_safe_read([os_safe_read])
     os_signal_handler([os_signal_handler])
   end
+  subgraph external["(external deps)"]
+    seh_invoke_detour[/seh_invoke_detour/]
+  end
   os_safe_read --> os_signal_handler
+  os_safe_read --> seh_invoke_detour
 ```

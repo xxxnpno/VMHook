@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-06-16T10:57:01Z",
+  "generated_at": "2026-06-16T11:05:36Z",
   "feature_count": 109,
-  "edge_count": 434,
+  "edge_count": 437,
   "categories": [
     {
       "slug": "bootstrap",
@@ -1381,18 +1381,26 @@
     },
     {
       "slug": "global_ref",
-      "title": "Global Ref",
+      "title": "Global Ref (JNI GC-survival pin)",
       "category": "jni",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/global_ref-specialist.md",
       "depends_on": [
-        "jni_local_ref_hygiene"
+        "jni_local_ref_hygiene",
+        "decode_oop_and_pointers"
       ],
       "related": [
-        "make_java_string"
+        "make_java_string",
+        "wrapper_pattern"
       ],
-      "tags": [],
+      "tags": [
+        "jni",
+        "global-ref",
+        "gc-pin",
+        "raii",
+        "move-only"
+      ],
       "test_modules": [
         "tests/jvm/modules/global_ref.cpp",
         "tests/test_global_ref.cpp"
@@ -1879,18 +1887,31 @@
     },
     {
       "slug": "jni_local_ref_hygiene",
-      "title": "Jni Local Ref Hygiene",
+      "title": "JNI Local Reference Hygiene",
       "category": "jni",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/jni_local_ref_hygiene-specialist.md",
       "depends_on": [],
-      "related": [],
-      "tags": [],
+      "related": [
+        "global_ref"
+      ],
+      "tags": [
+        "jni",
+        "local-ref",
+        "leak",
+        "frame",
+        "hygiene",
+        "detour-thread",
+        "table-overflow"
+      ],
       "test_modules": [
         "tests/jvm/modules/jni_local_ref_hygiene.cpp"
       ],
-      "audit_docs": [],
+      "audit_docs": [
+        "audit/findings/jni_delete_local_ref_table_slot_23.md",
+        "audit/findings/method_proxy_call_jni_local_ref_leaks.md"
+      ],
       "java_versions": [
         8,
         11,
@@ -1905,27 +1926,32 @@
       "slug": "klass_introspection",
       "title": "Klass Introspection",
       "category": "klass",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/klass_introspection-specialist.md",
       "depends_on": [
         "vmstructs_offset_resolution",
-        "instanceklass_methods_walk",
-        "compressed_klass_decode"
-      ],
-      "related": [
         "compressed_klass_decode",
-        "compressed_oops_decode",
-        "constantpool_access",
-        "find_class_fallback",
-        "instanceklass_methods_walk"
+        "decode_oop_and_pointers"
       ],
-      "tags": [],
+      "related": [],
+      "tags": [
+        "klass",
+        "hotspot",
+        "vmstruct",
+        "introspection",
+        "metadata",
+        "instanceklass",
+        "safety"
+      ],
       "test_modules": [
         "tests/jvm/modules/klass_introspection.cpp",
         "tests/jvm/modules/klass_introspection_shapes.cpp"
       ],
-      "audit_docs": [],
+      "audit_docs": [
+        "audit/LIBRARY_BUGS.md",
+        "audit/NO_SEH_COLDREAD_HARDENING.md"
+      ],
       "java_versions": [
         8,
         11,
@@ -2803,16 +2829,31 @@
       "slug": "os_safe_read",
       "title": "Os Safe Read",
       "category": "os",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "critical",
       "specialist": ".claude/agents/os_safe_read-specialist.md",
       "depends_on": [
-        "os_signal_handler"
+        "os_signal_handler",
+        "seh_invoke_detour"
       ],
       "related": [],
-      "tags": [],
-      "test_modules": [],
-      "audit_docs": [],
+      "tags": [
+        "fault-safe",
+        "seh",
+        "sigaction",
+        "cold-page",
+        "safe-read",
+        "os",
+        "no-access",
+        "cross-platform"
+      ],
+      "test_modules": [
+        "tests/test_os_safe_read.cpp",
+        "tests/test_os_protect_interaction.cpp"
+      ],
+      "audit_docs": [
+        "audit/NO_SEH_COLDREAD_HARDENING.md"
+      ],
       "java_versions": [
         8,
         11,
@@ -3354,19 +3395,32 @@
     },
     {
       "slug": "vmstructs_offset_resolution",
-      "title": "Vmstructs Offset Resolution",
+      "title": "VMStructs Offset Resolution",
       "category": "klass",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "critical",
       "specialist": ".claude/agents/vmstructs_offset_resolution-specialist.md",
       "depends_on": [
         "os_safe_read"
       ],
       "related": [
-        "decode_oop_and_pointers"
+        "decode_oop_and_pointers",
+        "compressed_oops_decode",
+        "compressed_klass_decode",
+        "klass_introspection",
+        "constantpool_access"
       ],
-      "tags": [],
-      "test_modules": [],
+      "tags": [
+        "vmstructs",
+        "offset",
+        "hotspot",
+        "jdk-version",
+        "critical-path",
+        "static-cache"
+      ],
+      "test_modules": [
+        "tests/test_iterate_entries_safety.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -4243,7 +4297,17 @@
     },
     {
       "from": "global_ref",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "global_ref",
       "to": "make_java_string",
+      "kind": "related"
+    },
+    {
+      "from": "global_ref",
+      "to": "wrapper_pattern",
       "kind": "related"
     },
     {
@@ -4662,44 +4726,24 @@
       "kind": "depends_on"
     },
     {
+      "from": "jni_local_ref_hygiene",
+      "to": "global_ref",
+      "kind": "related"
+    },
+    {
       "from": "klass_introspection",
       "to": "vmstructs_offset_resolution",
       "kind": "depends_on"
     },
     {
       "from": "klass_introspection",
-      "to": "instanceklass_methods_walk",
-      "kind": "depends_on"
-    },
-    {
-      "from": "klass_introspection",
       "to": "compressed_klass_decode",
       "kind": "depends_on"
     },
     {
       "from": "klass_introspection",
-      "to": "compressed_klass_decode",
-      "kind": "related"
-    },
-    {
-      "from": "klass_introspection",
-      "to": "compressed_oops_decode",
-      "kind": "related"
-    },
-    {
-      "from": "klass_introspection",
-      "to": "constantpool_access",
-      "kind": "related"
-    },
-    {
-      "from": "klass_introspection",
-      "to": "find_class_fallback",
-      "kind": "related"
-    },
-    {
-      "from": "klass_introspection",
-      "to": "instanceklass_methods_walk",
-      "kind": "related"
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
     },
     {
       "from": "make_java_array",
@@ -5247,6 +5291,11 @@
       "kind": "depends_on"
     },
     {
+      "from": "os_safe_read",
+      "to": "seh_invoke_detour",
+      "kind": "depends_on"
+    },
+    {
       "from": "poly_inherited_oop",
       "to": "klass_introspection",
       "kind": "depends_on"
@@ -5589,6 +5638,26 @@
     {
       "from": "vmstructs_offset_resolution",
       "to": "decode_oop_and_pointers",
+      "kind": "related"
+    },
+    {
+      "from": "vmstructs_offset_resolution",
+      "to": "compressed_oops_decode",
+      "kind": "related"
+    },
+    {
+      "from": "vmstructs_offset_resolution",
+      "to": "compressed_klass_decode",
+      "kind": "related"
+    },
+    {
+      "from": "vmstructs_offset_resolution",
+      "to": "klass_introspection",
+      "kind": "related"
+    },
+    {
+      "from": "vmstructs_offset_resolution",
+      "to": "constantpool_access",
       "kind": "related"
     },
     {
