@@ -1265,16 +1265,22 @@ int main()
     check("jds_false_ushort",   !vmhook::detail::is_java_double_slot_v<unsigned short>);
     check("jds_false_int",      !vmhook::detail::is_java_double_slot_v<int>);
     check("jds_false_uint",     !vmhook::detail::is_java_double_slot_v<unsigned int>);
-    // `long`/`unsigned long`: the trait keys on std::int64_t/std::uint64_t, NOT
-    // on `long`.  On LP64 (`long` == 64-bit) `long` IS std::int64_t, so the
-    // trait is true; on LLP64 (Windows, `long` == 32-bit) it is NOT, so false.
-    // Branch the expectation on the actual width — never hard-code it.
-    check("jds_long_matches_its_width",
+    // `long`/`unsigned long`: the trait keys on std::int64_t/std::uint64_t by
+    // TYPE IDENTITY, not on width.  This is subtle across data models:
+    //   - Linux LP64:    std::int64_t IS `long`        -> trait true
+    //   - Windows LLP64:  `long` is 32-bit, != int64_t  -> trait false
+    //   - macOS LP64:     `long` is 64-bit BUT std::int64_t is `long long`,
+    //                     so `long` != std::int64_t      -> trait false (despite
+    //                     sizeof(long)==8!)
+    // Hence derive the expectation from the int64_t/uint64_t identity, NEVER
+    // from sizeof (which is wrong on macOS).  `long` is signed so it can only
+    // match int64_t; `unsigned long` only uint64_t.
+    check("jds_long_matches_int64_identity",
           vmhook::detail::is_java_double_slot_v<long>
-              == (sizeof(long) == 8));
-    check("jds_ulong_matches_its_width",
+              == std::is_same_v<long, std::int64_t>);
+    check("jds_ulong_matches_uint64_identity",
           vmhook::detail::is_java_double_slot_v<unsigned long>
-              == (sizeof(unsigned long) == 8));
+              == std::is_same_v<unsigned long, std::uint64_t>);
     // `long long` is 64-bit everywhere we target, but it is a DISTINCT type from
     // std::int64_t on some platforms; the trait keys on std::int64_t exactly.
     // Whether long long == std::int64_t is implementation-defined, so derive the
@@ -1626,8 +1632,10 @@ int main()
                       && !vmhook::detail::is_java_double_slot_v<long double>
                       && !vmhook::detail::is_java_double_slot_v<int>,
                   "float / long double / int are all single-slot");
-    static_assert(vmhook::detail::is_java_double_slot_v<long> == (sizeof(long) == 8),
-                  "is_java_double_slot_v<long> must track long's actual width (LP64 vs LLP64)");
+    static_assert(vmhook::detail::is_java_double_slot_v<long>
+                      == std::is_same_v<long, std::int64_t>,
+                  "is_java_double_slot_v<long> keys on std::int64_t identity, not width "
+                  "(macOS LP64: long is 64-bit yet != int64_t, which is long long)");
     // is_vector / is_unique_ptr / is_unique_object_ptr key facts.
     static_assert(vmhook::detail::is_vector_v<std::vector<int, std::allocator<int>>>,
                   "is_vector_v must match std::vector<E, A> with an explicit allocator");
