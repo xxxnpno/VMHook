@@ -736,6 +736,490 @@ static auto test_atomic_toggle_preserves_sibling() -> void
           (final_word & sibling_bit) == sibling_bit);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  10. TYPE-STRING MATCHING (the constexpr strcmp inside derive_method_flags_
+//      layout).  The width DECISION pivots entirely on an EXACT type_string
+//      match ("u2" selects Path A / Path B; anything else falls through).  A
+//      prefix/superstring/case/whitespace bug in that match would silently
+//      mis-select the width, so sweep the discriminating inputs exhaustively
+//      against BOTH paths.  All deterministic — pure string comparison.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_type_string_matching() -> void
+{
+    // --- Path A: flags_type must match "u2" EXACTLY to fire (width 2, bit 2). ---
+    // Every NON-"u2" type_string here must leave Path A un-fired.  With no usable
+    // _intrinsic_id the whole derivation must then be NOT confident.
+    {
+        // type_string values that are NEAR "u2" but not equal — these catch a
+        // strncmp/prefix bug (would wrongly accept "u", "u2x"), a case-folding
+        // bug ("U2"), and a trailing-garbage bug ("u2 ", "u20").
+        const char* const non_u2_types[]{
+            "u",      // strict prefix of "u2"
+            "u1",     // sibling width
+            "u4",     // sibling width
+            "u8",     // sibling width
+            "u22",    // "u2" is a prefix of this -> must NOT match
+            "u2x",    // superstring
+            "u2 ",    // trailing space
+            "u20",    // trailing digit
+            " u2",    // leading space
+            "U2",     // uppercase
+            "jint",   // a real HotSpot type_string for some fields
+            "jchar",
+            "int",
+            "short",
+            "MethodFlags",
+            "AccessFlags",
+            "x",
+            "2u",     // reversed
+            "uu2",
+        };
+        bool all_pathA_rejected{ true };
+        for (const char* const t : non_u2_types)
+        {
+            method_flags_evidence ev{};
+            ev.flags_present = true;
+            ev.flags_type   = t;
+            ev.flags_offset = 48;
+            // No intrinsic evidence -> if Path A wrongly fired we'd see confident.
+            const method_flags_layout layout{ derive_method_flags_layout(ev) };
+            if (layout.confident) { all_pathA_rejected = false; break; }
+        }
+        check("type_string_pathA_rejects_every_non_u2", all_pathA_rejected);
+
+        // The exact literal "u2" (and ONLY it) fires Path A.
+        method_flags_evidence ev_exact{};
+        ev_exact.flags_present = true;
+        ev_exact.flags_type   = "u2";
+        ev_exact.flags_offset = 48;
+        const method_flags_layout exact{ derive_method_flags_layout(ev_exact) };
+        check("type_string_pathA_accepts_exact_u2",
+              exact.confident && exact.width_bytes == 2 && exact.dont_inline_bit == 2
+              && exact.offset == 48);
+    }
+
+    // --- Path B: intrinsic_id_type must match "u2" EXACTLY to fire. -----------
+    // Re-use the same near-"u2" set; a u2 _intrinsic_id at a legal offset is the
+    // ONLY one that may derive a confident u4 _status.  In particular "u1" here is
+    // the single discriminator that keeps JDK 8 (u1 _intrinsic_id) off Path B.
+    {
+        const char* const non_u2_types[]{
+            "u", "u1", "u4", "u8", "u22", "u2x", "u2 ", " u2", "U2",
+            "jint", "jchar", "MethodFlags", "x",
+        };
+        bool all_pathB_rejected{ true };
+        for (const char* const t : non_u2_types)
+        {
+            method_flags_evidence ev{};
+            ev.intrinsic_id_present = true;
+            ev.intrinsic_id_type   = t;
+            ev.intrinsic_id_offset = 48;  // legal (>=4, 4-aligned) so ONLY the type gates
+            const method_flags_layout layout{ derive_method_flags_layout(ev) };
+            if (layout.confident) { all_pathB_rejected = false; break; }
+        }
+        check("type_string_pathB_rejects_every_non_u2_intrinsic", all_pathB_rejected);
+
+        // The exact literal "u2" at a legal offset fires Path B (width 4, bit 12).
+        method_flags_evidence ev_exact{};
+        ev_exact.intrinsic_id_present = true;
+        ev_exact.intrinsic_id_type   = "u2";
+        ev_exact.intrinsic_id_offset = 48;
+        const method_flags_layout exact{ derive_method_flags_layout(ev_exact) };
+        check("type_string_pathB_accepts_exact_u2",
+              exact.confident && exact.width_bytes == 4 && exact.dont_inline_bit == 12
+              && exact.offset == 44);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  11. PATH A OFFSET FIDELITY: Path A (exported u2 _flags) trusts the exported
+//      offset VERBATIM — unlike Path B it applies NO alignment/underflow guard,
+//      because the offset is an authoritative VMStruct fact, not a derivation.
+//      Pin that deliberate asymmetry: ANY offset (0, odd, unaligned, huge) is
+//      passed through unchanged, always width 2 / bit 2 / confident.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_pathA_offset_fidelity() -> void
+{
+    const std::uint64_t offsets[]{
+        0u,        // a u2 at offset 0 is unusual but VMStructs is authoritative
+        1u,        // odd — Path A does NOT reject (contrast Path B)
+        2u,        // 2-aligned (natural for u2) but Path A doesn't require it
+        3u, 7u,    // odd / non-power-of-two
+        44u, 48u,  // realistic 64-bit Method offsets
+        46u,       // the offset Path B would REJECT as misaligned — Path A keeps it
+        1000u,     // large
+        0xFFFFu,   // very large but in-range for u64 offset
+    };
+    bool all_verbatim{ true };
+    for (const std::uint64_t off : offsets)
+    {
+        method_flags_evidence ev{};
+        ev.flags_present = true;
+        ev.flags_type   = "u2";
+        ev.flags_offset = off;
+        const method_flags_layout layout{ derive_method_flags_layout(ev) };
+        if (!(layout.confident && layout.width_bytes == 2 && layout.dont_inline_bit == 2
+              && layout.offset == off))
+        {
+            all_verbatim = false;
+            break;
+        }
+    }
+    check("pathA_passes_through_any_offset_verbatim", all_verbatim);
+
+    // Explicitly contrast with Path B at the SAME misaligned offset: Path A keeps
+    // a u2 _flags @46 (confident), but a u2 _intrinsic_id @46 is rejected (Path B
+    // alignment guard).  This is the documented "VMStruct fact vs derivation"
+    // distinction, asserted side by side.
+    {
+        method_flags_evidence a{};
+        a.flags_present = true; a.flags_type = "u2"; a.flags_offset = 46;
+        method_flags_evidence b{};
+        b.intrinsic_id_present = true; b.intrinsic_id_type = "u2"; b.intrinsic_id_offset = 46;
+        check("pathA_keeps_misaligned_offset_but_pathB_rejects_it",
+              derive_method_flags_layout(a).confident
+              && !derive_method_flags_layout(b).confident);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  12. PATH B ALIGNMENT / UNDERFLOW BOUNDARY SWEEP.  Path B fires ONLY when the
+//      u2 _intrinsic_id offset is >= 4 AND 4-byte aligned (the u4 _status sits at
+//      intrinsic-4 and must be 4-aligned).  Sweep the whole low range so the
+//      exact accept/reject boundary is pinned, including the MINIMUM legal offset
+//      (4 -> _status at 0) and every 4-multiple vs non-multiple.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_pathB_alignment_boundary_sweep() -> void
+{
+    bool boundary_ok{ true };
+    // offsets 0..63 cover every residue class mod 4 across the realistic range.
+    for (std::uint64_t off{ 0 }; off <= 64; ++off)
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type   = "u2";
+        ev.intrinsic_id_offset = off;
+        const method_flags_layout layout{ derive_method_flags_layout(ev) };
+
+        const bool should_fire{ off >= 4u && (off % 4u) == 0u };
+        if (layout.confident != should_fire) { boundary_ok = false; break; }
+        if (should_fire)
+        {
+            // When it fires, the derived _status is ALWAYS intrinsic-4, u4, bit 12.
+            if (!(layout.offset == off - 4u && layout.width_bytes == 4
+                  && layout.dont_inline_bit == 12))
+            {
+                boundary_ok = false; break;
+            }
+        }
+        else
+        {
+            // When it refuses, the layout is the all-zero default (no guess).
+            if (!(layout.offset == 0u && layout.width_bytes == 0
+                  && layout.dont_inline_bit == 0))
+            {
+                boundary_ok = false; break;
+            }
+        }
+    }
+    check("pathB_alignment_underflow_boundary_sweep_0_to_64", boundary_ok);
+
+    // The MINIMUM legal offset (4) is the critical edge: it derives _status @0.
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type   = "u2";
+        ev.intrinsic_id_offset = 4;
+        const method_flags_layout layout{ derive_method_flags_layout(ev) };
+        check("pathB_min_legal_offset4_derives_status_at_0",
+              layout.confident && layout.offset == 0u
+              && layout.width_bytes == 4 && layout.dont_inline_bit == 12);
+    }
+
+    // One below the boundary (offset 4 - the smallest 4-aligned >=4) vs the value
+    // just under it that is also 4-aligned-in-spirit but underflows: 0 is rejected
+    // by the >=4 clause even though 0 % 4 == 0.  Pin that the >=4 clause (not just
+    // the %4 clause) is what rejects 0.
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type   = "u2";
+        ev.intrinsic_id_offset = 0;  // 0 % 4 == 0 but 0 < 4 -> underflow guard
+        check("pathB_offset0_rejected_by_underflow_not_alignment",
+              !derive_method_flags_layout(ev).confident);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  13. CO-PRESENT FIELD PRECEDENCE & *_present GATING.
+//
+//   (a) JDK 21+ MAY export _flags as a non-u2 "MethodFlags" object while ALSO
+//       exporting a u2 _intrinsic_id.  Path A must fall through (type != "u2")
+//       and Path B must win (u4 / bit 12) — the realistic "_flags exported but
+//       not the legacy width" scenario the simple BOTH-u2 precedence test does
+//       not cover.
+//   (b) The `*_present` booleans GATE their evidence: a populated type/offset
+//       with present==false must be ignored entirely.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_copresent_precedence_and_present_gating() -> void
+{
+    // (a) MethodFlags _flags + u2 _intrinsic_id -> Path B wins.
+    {
+        method_flags_evidence ev{};
+        ev.flags_present        = true;
+        ev.flags_type           = "MethodFlags";  // present but NOT u2 -> Path A skips
+        ev.flags_offset         = 40;
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type    = "u2";
+        ev.intrinsic_id_offset  = 44;
+        const method_flags_layout layout{ derive_method_flags_layout(ev) };
+        check("copresent_methodflags_plus_u2intrinsic_picks_pathB",
+              layout.confident && layout.width_bytes == 4
+              && layout.dont_inline_bit == 12 && layout.offset == 40);
+    }
+
+    // (a') Same but with a u1 _flags export co-present (also non-u2) -> Path B.
+    {
+        method_flags_evidence ev{};
+        ev.flags_present        = true;
+        ev.flags_type           = "u1";
+        ev.flags_offset         = 40;
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type    = "u2";
+        ev.intrinsic_id_offset  = 44;
+        const method_flags_layout layout{ derive_method_flags_layout(ev) };
+        check("copresent_u1flags_plus_u2intrinsic_picks_pathB",
+              layout.confident && layout.width_bytes == 4 && layout.dont_inline_bit == 12);
+    }
+
+    // (b) flags_present == false but flags_type/offset populated -> must be IGNORED
+    //     (Path A is gated by flags_present).  Fall through to Path B via intrinsic.
+    {
+        method_flags_evidence ev{};
+        ev.flags_present        = false;       // <-- gate is OFF
+        ev.flags_type           = "u2";        // would have fired Path A if honoured
+        ev.flags_offset         = 99;
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type    = "u2";
+        ev.intrinsic_id_offset  = 44;
+        const method_flags_layout layout{ derive_method_flags_layout(ev) };
+        check("present_false_flags_evidence_is_ignored",
+              layout.confident && layout.width_bytes == 4
+              && layout.dont_inline_bit == 12 && layout.offset == 40);
+    }
+
+    // (b') intrinsic_id_present == false but type/offset populated -> IGNORED, and
+    //      with no usable _flags either the whole derivation refuses.
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = false;        // <-- gate is OFF
+        ev.intrinsic_id_type    = "u2";         // would have fired Path B if honoured
+        ev.intrinsic_id_offset  = 44;
+        check("present_false_intrinsic_evidence_is_ignored",
+              !derive_method_flags_layout(ev).confident);
+    }
+
+    // (b'') BOTH present==false with everything else populated -> total refusal.
+    {
+        method_flags_evidence ev{};
+        ev.flags_present        = false;
+        ev.flags_type           = "u2";
+        ev.flags_offset         = 44;
+        ev.intrinsic_id_present = false;
+        ev.intrinsic_id_type    = "u2";
+        ev.intrinsic_id_offset  = 44;
+        check("both_present_false_refuses_despite_populated_fields",
+              !derive_method_flags_layout(ev).confident);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  14. WIDTH <-> BIT REPRESENTABILITY INVARIANT + DETERMINISM.
+//
+//   The whole point of the fix: the _dont_inline mask (1u << bit) must be
+//   representable in the chosen ACCESS WIDTH (only the width varies per band,
+//   never the mask construction).  For EVERY confident derivation the derived
+//   bit must satisfy `bit < width_bytes * 8`, and the mask must be non-zero and
+//   fit.  Plus a determinism/purity check: the same evidence yields a
+//   byte-identical result struct on repeated calls.
+// ─────────────────────────────────────────────────────────────────────────
+static auto layouts_equal(const method_flags_layout& a, const method_flags_layout& b) -> bool
+{
+    return a.offset == b.offset && a.width_bytes == b.width_bytes
+        && a.dont_inline_bit == b.dont_inline_bit && a.confident == b.confident;
+}
+
+static auto test_width_bit_representability_and_determinism() -> void
+{
+    // The set of confident bands the derivation can produce.
+    const method_flags_evidence confident_inputs[]{
+        evidence_jdk11_20,  // u2 / bit 2
+        evidence_jdk21_23,  // u4 / bit 12
+        evidence_jdk24_26,  // u4 / bit 12
+    };
+
+    bool repr_ok{ true };
+    bool mask_fits_ok{ true };
+    for (const method_flags_evidence& ev : confident_inputs)
+    {
+        const method_flags_layout layout{ derive_method_flags_layout(ev) };
+        if (!layout.confident) { repr_ok = false; break; }
+
+        // bit must be representable in width_bytes*8 bits.
+        const int width_bits{ layout.width_bytes * 8 };
+        if (!(layout.dont_inline_bit >= 0 && layout.dont_inline_bit < width_bits))
+        {
+            repr_ok = false; break;
+        }
+
+        // (1u << bit) is non-zero and, when masked to the width, unchanged.
+        const std::uint32_t mask{ 1u << layout.dont_inline_bit };
+        const std::uint32_t width_mask{
+            layout.width_bytes == 2 ? 0x0000FFFFu : 0xFFFFFFFFu };
+        if (mask == 0u || (mask & width_mask) != mask) { mask_fits_ok = false; break; }
+    }
+    check("every_confident_band_bit_fits_its_width", repr_ok);
+    check("every_confident_band_mask_representable_in_width", mask_fits_ok);
+
+    // The u2 band's bit (2) ALSO fits a hypothetical u4, but the u4 band's bit
+    // (12) does NOT fit a u1 (12 >= 8) — that alone forces a >= 2-byte access on
+    // JDK 21+.  It DOES fit numerically inside 16 bits (12 < 16); the u2 LEGACY
+    // path still can't reach it because on JDK 21+ `_flags` is a u4 MethodFlags
+    // object reached via the DERIVED Path B, not the exported u2 Path A — i.e.
+    // the width must widen because the FIELD is u4 (siblings at bits 7..10 + the
+    // not-c1/c2/osr group), not because bit 12 itself exceeds 16.  Pin exactly
+    // that: bit 12 overflows u1, sits inside the low 16, and needs the u4 field.
+    check("u2_band_bit2_would_also_fit_u4", flags_layout::jdk11_20.dont_inline_bit < 32);
+    check("u4_band_bit12_overflows_u1_but_fits_low16",
+          flags_layout::jdk21_23.dont_inline_bit >= 8      // would overflow a u1
+          && flags_layout::jdk21_23.dont_inline_bit < 16   // numerically inside 16 bits
+          && flags_layout::jdk21_23.dont_inline_bit < 32); // and inside the u4 field
+
+    // Determinism / purity: identical evidence -> identical result, twice.
+    for (const method_flags_evidence& ev : confident_inputs)
+    {
+        const method_flags_layout first{ derive_method_flags_layout(ev) };
+        const method_flags_layout second{ derive_method_flags_layout(ev) };
+        if (!layouts_equal(first, second))
+        {
+            check("derive_is_deterministic_for_confident_inputs", false);
+            return;
+        }
+    }
+    // Also for a REFUSING input (the all-zero default must be stable too).
+    {
+        const method_flags_layout r1{ derive_method_flags_layout(evidence_jdk8) };
+        const method_flags_layout r2{ derive_method_flags_layout(evidence_jdk8) };
+        check("derive_is_deterministic_for_confident_inputs",
+              layouts_equal(r1, r2) && !r1.confident);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  15. WIDTH -> BIT MAPPING TABLE over ALL JDK regimes (the authoritative
+//      cross-version contract, asserted as one coherent table).  For each band:
+//      the resolved width, the _dont_inline bit, that the bit fits the width,
+//      and that the access-flags width tracks the JDK-24 AccessFlags shrink.
+//      This is the single greppable "width/bit per JDK" matrix.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_width_to_bit_mapping_table() -> void
+{
+    using namespace flags_layout;
+
+    struct row { const band& b; int expect_width; int expect_bit; bool exported; };
+    const row table[]{
+        { jdk8,     0, 2,  false },  // no exported _flags; bit is academic (no write)
+        { jdk11_20, 2, 2,  true  },  // u2, bit 2
+        { jdk21_23, 4, 12, false },  // u4 _status (derived), bit 12
+        { jdk24_26, 4, 12, false },  // u4 _status (derived), bit 12
+    };
+
+    bool table_ok{ true };
+    for (const row& r : table)
+    {
+        if (r.b.flags_width_bytes != r.expect_width) { table_ok = false; break; }
+        if (r.b.dont_inline_bit   != r.expect_bit)   { table_ok = false; break; }
+        if (r.b.flags_exported    != r.exported)     { table_ok = false; break; }
+        // For every band that HAS a real flags word, the bit must fit the width.
+        if (r.b.flags_width_bytes > 0
+            && !(r.b.dont_inline_bit < r.b.flags_width_bytes * 8))
+        {
+            table_ok = false; break;
+        }
+    }
+    check("width_to_bit_mapping_table_consistent_all_bands", table_ok);
+
+    // Monotonic widening: _flags width never SHRINKS going forward across the
+    // bands that have a real field (u2 -> u4), and is 4 on every JDK 21+ band.
+    check("flags_width_widens_u2_to_u4_never_shrinks",
+          jdk11_20.flags_width_bytes == 2
+          && jdk21_23.flags_width_bytes == 4
+          && jdk24_26.flags_width_bytes == 4
+          && jdk21_23.flags_width_bytes >= jdk11_20.flags_width_bytes);
+
+    // The _dont_inline bit only ever moves UP (2 -> 12) across the relocation.
+    // Bit 12 needs a >= 2-byte access (overflows u1) and shares the u4 _status
+    // with the relocated compilability siblings at bits 7..10, all of which are
+    // ABOVE bit 2 — so the JDK 21+ flags WORD is materially wider/busier than the
+    // JDK 11..20 u2 word even though bit 12 itself is numerically under 16.
+    check("dont_inline_bit_relocated_up_and_needs_wide_field",
+          jdk11_20.dont_inline_bit == 2
+          && jdk21_23.dont_inline_bit == 12
+          && jdk21_23.dont_inline_bit > jdk11_20.dont_inline_bit   // moved up
+          && jdk21_23.dont_inline_bit >= 8                          // overflows u1
+          && methodflags_status_bit::is_not_c2_osr == 10            // sibling above bit 2
+          && methodflags_status_bit::is_not_c2_osr > jdk11_20.dont_inline_bit);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  16. NO_COMPILE access-flags mask (the companion constant the feature owns).
+//      It is OR'd into Method::_access_flags (u4 read) and is a pure compile-time
+//      constant — assert its exact value, that it is exactly the four documented
+//      compile-control bits, and that every bit lives in the high byte (24..27),
+//      i.e. disjoint from JVM_ACC_STATIC (bit 3) so the two never interfere.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_no_compile_mask_bits() -> void
+{
+    const std::uint32_t no_compile{ static_cast<std::uint32_t>(vmhook::hotspot::NO_COMPILE) };
+
+    constexpr std::uint32_t not_c2{ 0x02000000u };
+    constexpr std::uint32_t not_c1{ 0x04000000u };
+    constexpr std::uint32_t not_c2_osr{ 0x08000000u };
+    constexpr std::uint32_t queued{ 0x01000000u };
+
+    check("no_compile_exact_value_0x0F000000",
+          no_compile == (not_c2 | not_c1 | not_c2_osr | queued)
+          && no_compile == 0x0F000000u);
+
+    // Each of the four bits is present.
+    check("no_compile_contains_all_four_bits",
+          (no_compile & not_c2) == not_c2
+          && (no_compile & not_c1) == not_c1
+          && (no_compile & not_c2_osr) == not_c2_osr
+          && (no_compile & queued) == queued);
+
+    // Exactly four bits set (popcount == 4) — no stray bits.
+    {
+        int bits{ 0 };
+        for (std::uint32_t v{ no_compile }; v; v &= (v - 1)) { ++bits; }
+        check("no_compile_has_exactly_four_bits", bits == 4);
+    }
+
+    // All four live in the high byte (bits 24..31) -> disjoint from JVM_ACC_STATIC
+    // (bit 3, low byte).  So OR-ing NO_COMPILE never disturbs the static bit, and
+    // masking 0x0008 for is_static() never sees a NO_COMPILE bit.
+    check("no_compile_bits_are_high_byte_only",
+          (no_compile & 0x00FFFFFFu) == 0u && (no_compile & 0xFF000000u) == no_compile);
+    check("no_compile_disjoint_from_jvm_acc_static",
+          (no_compile & flags_layout::jvm_acc_static) == 0u);
+
+    // The whole mask fits in the u4 _access_flags word (it would NOT fit a u2,
+    // confirming why the access path reads u4 — the contrast the _flags path
+    // mirrors).  Bits 24..27 are unreachable through any 16-bit read.
+    check("no_compile_requires_u4_access_width",
+          (no_compile & 0x0000FFFFu) == 0u && (no_compile & 0xFFFF0000u) == no_compile);
+}
+
 int main()
 {
     test_set_dont_inline_null();
@@ -747,6 +1231,13 @@ int main()
     test_confident_guard_refusals();
     test_width_matrix_anti_clobber();
     test_atomic_toggle_preserves_sibling();
+    test_type_string_matching();
+    test_pathA_offset_fidelity();
+    test_pathB_alignment_boundary_sweep();
+    test_copresent_precedence_and_present_gating();
+    test_width_bit_representability_and_determinism();
+    test_width_to_bit_mapping_table();
+    test_no_compile_mask_bits();
 
     std::printf("\n%s: %d failure(s)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;

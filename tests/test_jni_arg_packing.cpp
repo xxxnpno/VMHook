@@ -1,13 +1,19 @@
 // Standalone unit test: detail::write_jni_arg_to_slot / append_jni_arg union-member
 // writes + needs_release tagging (regression guard for the union-aliasing
-// DeleteLocalRef bug). No JVM present -> jni_new_string_utf returns null, so the
-// needs_release tag stays false on every path here. Anything requiring a live
-// oop / running JVM (the actual DeleteLocalRef cleanup loop, Call*MethodA
-// dispatch, result-handle release) is covered by JVM integration in example.cpp.
+// DeleteLocalRef bug), the shared convert_jni_arg core, the jni_signature_for_arg
+// descriptor builder, and the pure utf8_to_utf16 decoder that decides the exact
+// content of every String arg.  No JVM present -> jni_new_string_utf16_local
+// (NewString) returns null, so the needs_release tag stays false on every string
+// path here; but the UTF-16 DECODE of the forwarded bytes is a pure function and
+// IS asserted exhaustively (Sections R/S) — interior NULs and astral scalars
+// included.  Anything requiring a live oop / running JVM (the actual
+// DeleteLocalRef cleanup loop, Call*MethodA dispatch, result-handle release, and
+// the round-trip of a built jstring) is covered by JVM integration modules.
 #include <vmhook/vmhook.hpp>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <string>
@@ -89,6 +95,26 @@ static auto bits_eq(double a, double b) -> bool
     std::memcpy(&ua, &a, sizeof ua);
     std::memcpy(&ub, &b, sizeof ub);
     return ua == ub;
+}
+
+// Helper: exact, length-counted comparison of a UTF-16 code-unit vector (what
+// vmhook::detail::utf8_to_utf16 returns, and what the counted-length NewString
+// the String-arg packer calls consumes) against an explicit code-unit list.
+// The expected units are spelled as plain ints so call sites can use hex
+// literals without std::uint16_t{} noise; each is range-checked back to 16 bits
+// so a typo'd >0xFFFF expectation cannot silently pass via truncation.
+static auto units_eq(const std::vector<std::uint16_t>& got,
+                     std::initializer_list<int> expected) -> bool
+{
+    if (got.size() != expected.size()) { return false; }
+    std::size_t k{ 0 };
+    for (const int want : expected)
+    {
+        if (want < 0 || want > 0xFFFF) { return false; }
+        if (got[k] != static_cast<std::uint16_t>(want)) { return false; }
+        ++k;
+    }
+    return true;
 }
 
 // A second object_base-derived wrapper so we can register a distinct JVM class
@@ -1166,11 +1192,15 @@ int main()
     // SECTION H — string args: null / empty / non-empty, every spelling,
     // WITHOUT a JVM.  Deterministic facts: a null const char* -> Java null
     // (value.l == nullptr, no release); every OTHER string spelling (incl
-    // empty "" and embedded-NUL std::string) routes through NewStringUTF,
-    // which has no env so returns null -> value.l == nullptr, tag false.
-    // (With a JVM the non-null cases flip to a real local ref + release; that
-    // is JVM-integration territory.)  Pins the convert_jni_arg null/empty
-    // contract in vmhook.hpp:10706-10714.
+    // empty "" and embedded-NUL std::string) routes through the length-counted
+    // UTF-16 encoder jni_new_string_utf16_local (NewString, slot 163 — NOT the
+    // legacy NewStringUTF), which has no env so returns null -> value.l ==
+    // nullptr, tag false.  (With a JVM the non-null cases flip to a real local
+    // ref + release; that is JVM-integration territory.)  Pins the
+    // convert_jni_arg null/empty contract in vmhook.hpp:12874-12903.  The
+    // CONTENT each non-null spelling would encode to (interior NULs preserved,
+    // astral scalars -> surrogate pairs) is pinned at the byte level — without
+    // a JVM — by the pure-decoder Sections R/S below.
     // =====================================================================
     {
         vmhook::detail::jni_value v{};
@@ -1198,9 +1228,11 @@ int main()
         check("H_null_char_ptr_tag_false", pack_one(null_mutable, v, storage) == false);
         check("H_null_char_ptr_l_null", v.l == nullptr);
 
-        // std::string: empty, non-empty, embedded NUL (flaw #4 territory —
-        // without a JVM all collapse to .l==null/tag false; the truncation
-        // characterization needs a live JVM).
+        // std::string: empty, non-empty, embedded NUL.  Without a JVM all
+        // collapse to .l==null/tag false (NewString has no env).  The library
+        // no longer truncates at the interior NUL (it uses the counted UTF-16
+        // path, not NewStringUTF) — Section S pins that lossless decode for the
+        // exact forwarded bytes without needing a live JVM.
         check("H_empty_std_string_tag_false_no_jvm",
               pack_one(std::string{}, v, storage) == false);
         check("H_empty_std_string_l_null_no_jvm", v.l == nullptr);
@@ -1799,6 +1831,212 @@ int main()
         const char* nul{ nullptr };
         check("Q_null_cstring_category_packs",
               pack_one_core(nul, v, storage) == false && v.l == nullptr);
+    }
+
+    // =====================================================================
+    // SECTION R — utf8_to_utf16 EXHAUSTIVE DECODE (the pure, JVM-free core
+    // that decides the EXACT content of every String arg).  convert_jni_arg's
+    // string arms (std::string / string_view / const char*) all route through
+    // jni_new_string_utf16_local, which calls vmhook::detail::utf8_to_utf16 to
+    // produce the length-counted UTF-16 code units it then hands to NewString
+    // (slot 163).  Without a JVM the NewString call returns null (asserted in
+    // Section H), but the DECODE itself is a pure function whose output fully
+    // determines what the Java String would contain.  This is exactly the
+    // "interior-NUL + astral string handling" + "exact packed bytes/value"
+    // surface the packer owns; it had ZERO no-JVM coverage here (only JVM
+    // modules exercised it).  Every expected code-unit list is derived
+    // directly from utf8_to_utf16's body (vmhook.hpp:12522): ASCII 1:1, valid
+    // 2/3/4-byte sequences -> the decoded scalar, astral (>= U+10000) -> a
+    // surrogate pair, and malformed / truncated input -> U+FFFD (advance 1).
+    // The in-memory unit order is host-endian-agnostic (a std::uint16_t value
+    // comparison, not a byte comparison), so these are cross-platform.
+    // =====================================================================
+    {
+        using vmhook::detail::utf8_to_utf16;
+
+        // ---- empty input -> empty units (the NewString(nullptr,0) form) ----
+        check("R_empty_decodes_empty", utf8_to_utf16(std::string_view{}).empty());
+        check("R_empty_literal_decodes_empty", utf8_to_utf16(std::string_view{ "" }).empty());
+
+        // ---- pure ASCII: each byte maps 1:1 to a BMP code unit -------------
+        check("R_ascii_A", units_eq(utf8_to_utf16(std::string_view{ "A" }), { 0x41 }));
+        check("R_ascii_hello",
+              units_eq(utf8_to_utf16(std::string_view{ "hello" }),
+                       { 'h', 'e', 'l', 'l', 'o' }));
+        // Lowest and highest single-byte scalars (0x00 and 0x7F).
+        check("R_ascii_del_0x7F", units_eq(utf8_to_utf16(std::string_view{ "\x7F" }), { 0x7F }));
+
+        // ---- INTERIOR NUL: a 0x00 byte is scalar U+0000, NOT a terminator --
+        // This is the heart of old flaw #4's fix: a counted decode keeps the
+        // NUL as a real code unit, so "a\0b" decodes to THREE units, not one.
+        check("R_interior_nul_preserved",
+              units_eq(utf8_to_utf16(std::string_view{ "a\0b", 3 }), { 'a', 0x00, 'b' }));
+        check("R_leading_nul_preserved",
+              units_eq(utf8_to_utf16(std::string_view{ "\0z", 2 }), { 0x00, 'z' }));
+        check("R_trailing_nul_preserved",
+              units_eq(utf8_to_utf16(std::string_view{ "z\0", 2 }), { 'z', 0x00 }));
+        check("R_only_nul_preserved",
+              units_eq(utf8_to_utf16(std::string_view{ std::string(1, '\0') }), { 0x00 }));
+        // A run of NULs all survive (length-counted, never truncated).
+        check("R_multiple_nuls_preserved",
+              units_eq(utf8_to_utf16(std::string_view{ "\0\0\0", 3 }), { 0x00, 0x00, 0x00 }));
+
+        // ---- 2-byte UTF-8 (U+0080 .. U+07FF) -> single BMP unit -----------
+        // U+00E9 'é' == C3 A9 ; U+00A2 '¢' == C2 A2 ; U+07FF (max 2-byte) ==
+        // DF BF.  Derived: ((b0&0x1F)<<6) | (b1&0x3F).
+        check("R_2byte_eacute_00E9",
+              units_eq(utf8_to_utf16(std::string_view{ "\xC3\xA9" }), { 0x00E9 }));
+        check("R_2byte_cent_00A2",
+              units_eq(utf8_to_utf16(std::string_view{ "\xC2\xA2" }), { 0x00A2 }));
+        check("R_2byte_max_07FF",
+              units_eq(utf8_to_utf16(std::string_view{ "\xDF\xBF" }), { 0x07FF }));
+
+        // ---- 3-byte UTF-8 (U+0800 .. U+FFFF) -> single BMP unit -----------
+        // U+4E2D '中' == E4 B8 AD ; U+20AC '€' == E2 82 AC ; U+FFFF (max
+        // 3-byte BMP) == EF BF BF.  Derived: ((b0&0x0F)<<12)|((b1&0x3F)<<6)|
+        // (b2&0x3F).
+        check("R_3byte_cjk_4E2D",
+              units_eq(utf8_to_utf16(std::string_view{ "\xE4\xB8\xAD" }), { 0x4E2D }));
+        check("R_3byte_euro_20AC",
+              units_eq(utf8_to_utf16(std::string_view{ "\xE2\x82\xAC" }), { 0x20AC }));
+        check("R_3byte_max_FFFF",
+              units_eq(utf8_to_utf16(std::string_view{ "\xEF\xBF\xBF" }), { 0xFFFF }));
+        // U+0800 — the lowest scalar that needs three bytes (E0 A0 80).
+        check("R_3byte_min_0800",
+              units_eq(utf8_to_utf16(std::string_view{ "\xE0\xA0\x80" }), { 0x0800 }));
+
+        // ---- 4-byte UTF-8 (ASTRAL, U+10000 .. U+10FFFF) -> SURROGATE PAIR -
+        // This is old flaw #5's fix: a standard 4-byte sequence becomes a
+        // proper UTF-16 surrogate pair, NOT mojibake.  U+1F600 (emoji) ==
+        // F0 9F 98 80.  Hand-derived pair: cp-0x10000 = 0xF600;
+        // high = 0xD800 + (0xF600>>10)=0xD83D ; low = 0xDC00 + (0xF600&0x3FF)
+        // = 0xDE00.
+        check("R_4byte_emoji_1F600_surrogate_pair",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF0\x9F\x98\x80" }),
+                       { 0xD83D, 0xDE00 }));
+        // U+10000 — the lowest astral scalar (F0 90 80 80): pair D800 DC00.
+        check("R_4byte_min_10000_surrogate_pair",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF0\x90\x80\x80" }),
+                       { 0xD800, 0xDC00 }));
+        // U+10FFFF — the maximum Unicode scalar (F4 8F BF BF): pair DBFF DFFF.
+        check("R_4byte_max_10FFFF_surrogate_pair",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF4\x8F\xBF\xBF" }),
+                       { 0xDBFF, 0xDFFF }));
+        // U+1D11E (musical G clef, F0 9D 84 9E): cp-0x10000 = 0xD11E ;
+        // high = 0xD800 + 0x34 = 0xD834 ; low = 0xDC00 + 0x11E = 0xDD1E.
+        check("R_4byte_gclef_1D11E_surrogate_pair",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF0\x9D\x84\x9E" }),
+                       { 0xD834, 0xDD1E }));
+
+        // ---- mixed ASCII + multi-byte + astral, contiguous ----------------
+        // "A中" + emoji: 0x41, 0x4E2D, then the D83D DE00 pair.  Proves the
+        // decoder advances by the right width between code points and emits
+        // the pair inline (a width-advance bug would shift everything after).
+        check("R_mixed_ascii_bmp_astral",
+              units_eq(utf8_to_utf16(std::string_view{ "A\xE4\xB8\xAD\xF0\x9F\x98\x80" }),
+                       { 0x41, 0x4E2D, 0xD83D, 0xDE00 }));
+        // Interior NUL flanked by an astral scalar — both survive together
+        // (the two fixes compose: counted length keeps the NUL, decoder makes
+        // the surrogate pair).  "\0" + emoji + "x".
+        check("R_nul_then_astral_then_ascii",
+              units_eq(utf8_to_utf16(std::string_view{ "\0\xF0\x9F\x98\x80x", 6 }),
+                       { 0x00, 0xD83D, 0xDE00, 'x' }));
+
+        // ---- MALFORMED / TRUNCATED input -> U+FFFD, advance one byte -------
+        // A lone continuation byte (0x80) matches no lead-byte pattern -> the
+        // cp stays the U+FFFD default and adv stays 1.
+        check("R_lone_continuation_is_fffd",
+              units_eq(utf8_to_utf16(std::string_view{ "\x80" }), { 0xFFFD }));
+        // A 2-byte lead with NO following byte (truncated at end): the
+        // (i+1)<size guard fails, so it falls through to U+FFFD, advance 1.
+        check("R_truncated_2byte_lead_is_fffd",
+              units_eq(utf8_to_utf16(std::string_view{ "\xC3" }), { 0xFFFD }));
+        // A 3-byte lead with only one trailing byte (needs two): guard fails,
+        // lead -> U+FFFD (advance 1), then the stray 0x80 -> another U+FFFD.
+        check("R_truncated_3byte_lead_two_fffd",
+              units_eq(utf8_to_utf16(std::string_view{ "\xE4\xB8" }), { 0xFFFD, 0xFFFD }));
+        // A 4-byte lead with only two trailing bytes (needs three): guard
+        // fails -> U+FFFD per byte until consumed (lead + two continuations).
+        check("R_truncated_4byte_lead_three_fffd",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF0\x9F\x98" }),
+                       { 0xFFFD, 0xFFFD, 0xFFFD }));
+        // 0xFF is never a valid UTF-8 lead byte -> U+FFFD.
+        check("R_invalid_FF_byte_is_fffd",
+              units_eq(utf8_to_utf16(std::string_view{ "\xFF" }), { 0xFFFD }));
+        // Recovery: a malformed byte does not desync the stream — a valid
+        // ASCII char after a lone continuation still decodes correctly.
+        check("R_recovers_after_malformed",
+              units_eq(utf8_to_utf16(std::string_view{ "\x80\x41" }), { 0xFFFD, 0x41 }));
+
+        // ---- decoded unit COUNT for an astral string (the length the packer
+        // hands to NewString): one emoji is encoded as 2 UTF-16 units, so the
+        // jstring length the JVM would build is 2, not 1.  Pin that count.
+        check("R_astral_decodes_to_two_units",
+              utf8_to_utf16(std::string_view{ "\xF0\x9F\x98\x80" }).size() == 2);
+        check("R_bmp_decodes_to_one_unit",
+              utf8_to_utf16(std::string_view{ "\xE4\xB8\xAD" }).size() == 1);
+    }
+
+    // =====================================================================
+    // SECTION S — String-ARG byte-level tie-back (no JVM).  Section H pins the
+    // no-env outcome (.l == nullptr, tag false) for every string spelling; but
+    // WHAT the Java String would contain is decided by utf8_to_utf16 run over
+    // the EXACT bytes convert_jni_arg forwards.  Here we tie the three string
+    // arg spellings (std::string with interior NUL, std::string_view over the
+    // same, const char* of an astral literal) to their expected UTF-16, so the
+    // packer's "interior-NUL + astral handled losslessly" contract is pinned at
+    // the byte level — the part the original suite could only mark as
+    // "characterization needs a live JVM".  These remain deterministic and
+    // cross-platform because they assert the PURE decode of the forwarded
+    // bytes, independent of any JNIEnv.
+    // =====================================================================
+    {
+        using vmhook::detail::utf8_to_utf16;
+
+        // (S1) std::string with an interior NUL: the bytes a packer forwards
+        // are exactly the 3-byte string; its lossless decode is { 'x',0,'y' }.
+        // (Old NewStringUTF would have truncated this to "x".)
+        {
+            const std::string arg{ "x\0y", 3 };
+            check("S_std_string_interior_nul_bytes_len3", arg.size() == 3);
+            check("S_std_string_interior_nul_decodes_lossless",
+                  units_eq(utf8_to_utf16(arg), { 'x', 0x00, 'y' }));
+        }
+
+        // (S2) std::string_view over an interior-NUL buffer decodes the same
+        // way (the view's COUNTED length is what matters, not a terminator).
+        {
+            static const char buf[]{ 'p', '\0', 'q', '\0', 'r' };
+            const std::string_view arg{ buf, sizeof buf };
+            check("S_string_view_counted_len5", arg.size() == 5);
+            check("S_string_view_interior_nuls_decodes_lossless",
+                  units_eq(utf8_to_utf16(arg), { 'p', 0x00, 'q', 0x00, 'r' }));
+        }
+
+        // (S3) const char* of an astral literal: a C string has no interior
+        // NUL, but its standard-UTF-8 astral bytes must still become a proper
+        // surrogate pair (the packer routes const char* through the same
+        // counted UTF-16 encoder, NOT NewStringUTF).  "A" + emoji.
+        {
+            const char* const arg{ "A\xF0\x9F\x98\x80" };
+            // The packer builds std::string_view{ arg } (strlen-bounded); model
+            // that exactly so the tie-back matches convert_jni_arg's behaviour.
+            check("S_const_char_astral_decodes_surrogate_pair",
+                  units_eq(utf8_to_utf16(std::string_view{ arg }),
+                           { 0x41, 0xD83D, 0xDE00 }));
+        }
+
+        // (S4) sanity: a pure-ASCII arg is byte-identical under the UTF-16
+        // path (each byte -> one BMP unit), so ASCII callers are unaffected by
+        // the lossless-UTF-16 routing.
+        check("S_ascii_arg_is_one_unit_per_byte",
+              units_eq(utf8_to_utf16(std::string_view{ "abc" }), { 'a', 'b', 'c' }));
+
+        // (S5) cross-check: the decoded unit count equals the Java String
+        // length the JVM would report — astral arg "A"+emoji is 3 UTF-16 units
+        // (1 + surrogate pair), NOT 2 code points.  Pins the length contract.
+        check("S_astral_arg_unit_count_is_three",
+              utf8_to_utf16(std::string_view{ "A\xF0\x9F\x98\x80" }).size() == 3);
     }
 
     return failures == 0 ? 0 : 1;

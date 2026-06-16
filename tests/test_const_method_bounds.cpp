@@ -128,6 +128,33 @@ static constexpr auto expected_reject(std::uint16_t index, std::int32_t cp_lengt
     return i >= n;
 }
 
+// ---------------------------------------------------------------------------
+// The OPERATOR-CHOICE differential.  FIX B uses `index >= cp_length` (the upper
+// edge is EXCLUSIVE: a pool of length N has valid indices [0, N), so index ==
+// N is out of range and MUST be rejected).  The single most likely silent
+// regression is a one-character edit to `index > cp_length`, which would let
+// index == N read base[N] - one slot PAST the entry array, i.e. exactly the
+// out-of-bounds AV FIX B exists to prevent.  This is the `>` variant written
+// out so a runtime sweep can prove the library uses `>=`, not `>`, and name the
+// exact divergence point (index == cp_length) if the operator ever flips.
+// ---------------------------------------------------------------------------
+static constexpr auto length_bound_rejects_with_gt(std::uint16_t index, std::int32_t cp_length) -> bool
+{
+    return cp_length >= 0 && index > cp_length; // the WRONG operator, for contrast
+}
+
+// Compile-time pins of the operator distinction at the load-bearing edge: the
+// real `>=` predicate and the hypothetical `>` predicate must AGREE everywhere
+// EXCEPT at index == cp_length, where `>=` rejects and `>` (wrongly) accepts.
+static_assert(length_bound_rejects(10u, 10) == true,
+              "`>=` rejects index == length (exclusive upper edge)");
+static_assert(length_bound_rejects_with_gt(10u, 10) == false,
+              "`>` would WRONGLY accept index == length - the operator differential");
+static_assert(length_bound_rejects(11u, 10) == length_bound_rejects_with_gt(11u, 10),
+              "above the edge (index > length) both operators agree: reject");
+static_assert(length_bound_rejects(9u, 10) == length_bound_rejects_with_gt(9u, 10),
+              "below the edge (index < length) both operators agree: accept");
+
 // ---- Compile-time pins of the most load-bearing boundary points. ----------
 // These fix the off-by-one edge of the bound at build time, so a future change
 // from `>=` to `>` (or `>` to `>=`) is a hard compile error, not a silent
@@ -753,6 +780,404 @@ int main()
         // to the shared validity primitive.
         check("null_slot_value_consistent_with_guard",
               !is_valid_pointer(reinterpret_cast<void*>(std::uintptr_t{ 0 })));
+    }
+
+    // =====================================================================
+    // I. The OPERATOR CHOICE  `index >= cp_length`  vs  `index > cp_length`.
+    //    The bound's upper edge is EXCLUSIVE; the one-character regression
+    //    `>=` -> `>` would admit index == cp_length and read base[cp_length],
+    //    one slot PAST the entry array - the exact out-of-bounds read FIX B
+    //    prevents.  We sweep the full structurally interesting (index, length)
+    //    space and assert: (a) the library predicate equals the `>=` semantics
+    //    everywhere; (b) it DIFFERS from the `>` variant at exactly index ==
+    //    cp_length and nowhere else, for every valid length.  A flipped
+    //    operator therefore fails a NAMED check here, not just the matrix.
+    // =====================================================================
+    {
+        // (a) For every valid length, index == length must reject under `>=`
+        //     and would (wrongly) pass under `>`.  This is THE divergence point.
+        const std::int32_t lens[]{ 0, 1, 2, 3, 16, 255, 256, 1024, 0x7FFF, 0xFFFE, 0xFFFF };
+        bool edge_rejects_with_ge{ true };
+        bool edge_passes_with_gt{ true };
+        for (const std::int32_t n : lens)
+        {
+            if (n < 0 || n > 0xFFFF) { continue; } // index must be a u2 to test the edge
+            const std::uint16_t at_edge{ static_cast<std::uint16_t>(n) };
+            if (!length_bound_rejects(at_edge, n))           { edge_rejects_with_ge = false; }
+            if (length_bound_rejects_with_gt(at_edge, n))    { edge_passes_with_gt = false; }
+        }
+        check("operator_ge_rejects_index_equals_length", edge_rejects_with_ge);
+        check("operator_gt_would_accept_index_equals_length", edge_passes_with_gt);
+
+        // (b) Away from index == length the two operators must AGREE.  Sweep a
+        //     dense band of lengths and, for each, every u2 index except the
+        //     single edge value; the library `>=` predicate and the `>` variant
+        //     must produce identical verdicts there.  This proves the ONLY
+        //     behavioural difference between the correct and the regressed
+        //     operator is the boundary slot - so the boundary slot is the whole
+        //     point of the choice.
+        bool agree_off_edge{ true };
+        std::size_t off_edge_cases{ 0 };
+        for (std::int32_t n{ 0 }; n <= 320; ++n)
+        {
+            for (std::uint32_t i{ 0u }; i <= 322u; ++i)
+            {
+                if (static_cast<std::int64_t>(i) == static_cast<std::int64_t>(n))
+                {
+                    continue; // skip the single edge where they are designed to differ
+                }
+                const std::uint16_t index{ static_cast<std::uint16_t>(i) };
+                if (length_bound_rejects(index, n) != length_bound_rejects_with_gt(index, n))
+                {
+                    agree_off_edge = false;
+                }
+                ++off_edge_cases;
+            }
+        }
+        check("operators_agree_everywhere_except_the_edge", agree_off_edge);
+        check("operator_differential_sweep_is_dense", off_edge_cases >= 100000);
+
+        // (c) Spelled-out witnesses at a concrete length so a failure reads
+        //     unambiguously: len 7 -> index 7 is the first out-of-range slot.
+        check("operator_len7_index7_rejected_by_library", length_bound_rejects(7u, 7));
+        check("operator_len7_index7_accepted_by_gt_variant", !length_bound_rejects_with_gt(7u, 7));
+        check("operator_len7_index6_accepted_by_both",
+              !length_bound_rejects(6u, 7) && !length_bound_rejects_with_gt(6u, 7));
+    }
+
+    // =====================================================================
+    // J. OVERFLOW-SAFE mixed-type comparison.  In the library the comparison is
+    //    `std::uint16_t index >= std::int32_t cp_length`.  Under the usual
+    //    arithmetic conversions the u16 widens to int (lossless: [0,65535] fits
+    //    int), then int-vs-int32 compares without surprise; there is no signed/
+    //    unsigned hazard because cp_length's negative values are handled by the
+    //    separate `cp_length >= 0` guard.  We pin that the realised comparison
+    //    equals the unambiguous int64 widening `int64(index) >= int64(cp_length)`
+    //    across the WHOLE u2 index domain crossed with the int32 lengths where a
+    //    naive narrowing would be most likely to misbehave (values around the u2
+    //    ceiling and the int32 extremes).  This is the "no value in [0,65535]
+    //    overflows the bound arithmetic" guarantee, proven against a wider type.
+    // =====================================================================
+    {
+        // Lengths chosen to stress the type boundary: values inside the u2 band
+        // (where index can straddle), values just above it (where every u2 index
+        // is below length), and the int32 extremes (where a wrong cast to a
+        // narrower/unsigned type would flip the verdict).
+        const std::int32_t stress_lengths[]{
+            0, 1, 2,
+            0x7FFE, 0x7FFF, 0x8000, 0x8001,          // around the int16 boundary
+            0xFFFE, 0xFFFF, 0x1'0000, 0x1'0001,      // around the u16 ceiling
+            0x7FFF'FFFE, std::numeric_limits<std::int32_t>::max(),
+        };
+        bool widening_consistent{ true };
+        std::size_t widening_cases{ 0 };
+        for (const std::int32_t n : stress_lengths)
+        {
+            for (std::uint32_t i{ 0u }; i <= 0xFFFFu; ++i)
+            {
+                const std::uint16_t index{ static_cast<std::uint16_t>(i) };
+                // The library's own promoted comparison, written exactly as the
+                // source would evaluate it (u16 -> int, vs int32).
+                const bool as_library{ index >= n }; // n >= 0 in all stress_lengths
+                // The unambiguous wide reference.
+                const bool as_int64{
+                    static_cast<std::int64_t>(index) >= static_cast<std::int64_t>(n) };
+                if (as_library != as_int64) { widening_consistent = false; }
+                // And the full predicate (with the >= 0 guard, all positive here)
+                // must equal the int64 reference too.
+                if (length_bound_rejects(index, n) != as_int64) { widening_consistent = false; }
+                ++widening_cases;
+            }
+        }
+        check("mixed_type_compare_matches_int64_widening_full_u2", widening_consistent);
+        check("mixed_type_widening_sweep_is_full_domain", widening_cases >= 0xFFFFu * 6u);
+
+        // The promotion direction itself: a u16 always widens to a value that is
+        // representable and non-negative, so it can never alias a negative
+        // cp_length (the case the `>= 0` guard owns).  Pin a witness at the u2
+        // max against a length one above it: 0xFFFF < 0x10000 -> accept.
+        check("maxu2_index_below_length_above_u2_ceiling_accepts",
+              !length_bound_rejects(0xFFFFu, 0x1'0000));
+        // ...and equal to it -> reject (the edge once length re-enters u2 range
+        // is unreachable for a u2 index, but length 0xFFFF makes index 0xFFFF
+        // the edge):
+        check("maxu2_index_equals_length_at_u2_ceiling_rejects",
+              length_bound_rejects(0xFFFFu, 0xFFFF));
+    }
+
+    // =====================================================================
+    // K. The  is_valid_pointer(this)  early-out of the real getters, driven
+    //    with an actually-INVALID `this`.  Section G proves the entry-absent
+    //    branch (a plausibly-aligned synthetic `this` + no-JVM VMStruct miss).
+    //    Here we prove the OTHER guard: get_length() bails on
+    //    `!is_valid_pointer(this)` (vmhook.hpp :2337) and get_constants /
+    //    get_name / get_signature bail on `!is_valid_pointer(this)`
+    //    (:2391/:2420/:2499) BEFORE applying any VMStruct offset.  A null,
+    //    poison, mis-aligned, floor or ceiling `this` must yield the sentinel /
+    //    nullptr with NO fault - the corrupt-`this` scenario FIX B's chain must
+    //    survive.  (With no JVM both branches reach the same nullptr/-1, but
+    //    these inputs exercise the is_valid_pointer gate specifically, distinct
+    //    from G's offset-lookup-miss path.)
+    // =====================================================================
+    {
+        using vmhook::hotspot::constant_pool;
+        using vmhook::hotspot::const_method;
+
+        // A spread of structurally invalid `this` values: null, the low
+        // sentinel floor, the kernel ceiling, an odd (bit-0) address, a 4-byte
+        // (not 8) aligned address, and each debug-poison pattern is_valid_pointer
+        // rejects.  Every one must drive get_length -> -1 and the symbol getters
+        // -> nullptr without faulting (reaching the assert proves no fault).
+        const std::uintptr_t bad_this[]{
+            std::uintptr_t{ 0 },                                  // null
+            vmhook::os::user_address_floor,                       // floor (rejected)
+            vmhook::os::user_address_ceiling,                     // ceiling (rejected)
+            std::uintptr_t{ 0x0000'2000'0000'0001ull },           // odd / bit-0 set
+            std::uintptr_t{ 0xDEADBEEFull },                      // poison
+            std::uintptr_t{ 0xCAFEBABEull },                      // poison
+            std::uintptr_t{ 0xCCCCCCCCull },                      // poison (MSVC stack)
+            std::uintptr_t{ 0xBAADF00Dull },                      // poison
+        };
+
+        bool length_all_minus1{ true };
+        bool constants_all_null{ true };
+        bool name_all_null{ true };
+        bool signature_all_null{ true };
+        for (const std::uintptr_t raw : bad_this)
+        {
+            auto* const cp{ reinterpret_cast<constant_pool*>(raw) };
+            auto* const cm{ reinterpret_cast<const_method*>(raw) };
+            if (cp->get_length() != -1)    { length_all_minus1 = false; }
+            if (cm->get_constants() != nullptr) { constants_all_null = false; }
+            if (cm->get_name() != nullptr)      { name_all_null = false; }
+            if (cm->get_signature() != nullptr) { signature_all_null = false; }
+        }
+        // Reaching here at all means none of the calls faulted on a bogus `this`.
+        check("invalid_this_get_length_returns_minus1_no_fault", length_all_minus1);
+        check("invalid_this_get_constants_returns_null_no_fault", constants_all_null);
+        check("invalid_this_get_name_returns_null_no_fault", name_all_null);
+        check("invalid_this_get_signature_returns_null_no_fault", signature_all_null);
+
+        // Explicit null witnesses (the single most common corruption) for each
+        // entry point, so a regression names the exact getter.  The null address
+        // is laundered through a `volatile` so the compiler cannot constant-fold
+        // the call into a literal null-`this` invocation (-Wnonnull) - at run
+        // time `this` is still 0, and the library's own is_valid_pointer(this)
+        // guard is exactly what must catch it.  This is the real corrupt-`this`
+        // path FIX B's chain has to survive, not a language-level null-deref.
+        volatile std::uintptr_t null_addr{ 0 };
+        auto* const cp_null{ reinterpret_cast<constant_pool*>(null_addr) };
+        auto* const cm_null{ reinterpret_cast<const_method*>(null_addr) };
+        check("null_this_get_length_minus1", cp_null->get_length() == -1);
+        check("null_this_get_constants_null", cm_null->get_constants() == nullptr);
+        check("null_this_get_name_null", cm_null->get_name() == nullptr);
+        check("null_this_get_signature_null", cm_null->get_signature() == nullptr);
+
+        // The sentinel a bogus `this` produces still disables the bound (it is
+        // the -1 path), so the slot probe remains the sole gate - consistent
+        // with section C and the stripped-_length JDK regime.
+        const std::int32_t len_from_bad_this{ cp_null->get_length() };
+        check("invalid_this_length_sentinel_disables_bound",
+              !length_bound_rejects(0xFFFFu, len_from_bad_this));
+    }
+
+    // =====================================================================
+    // L. ADJACENT mapped / unmapped slot boundary - the precise crash-proofing
+    //    claim of the FIX B slot probe.  We reserve a region of TWO pages but
+    //    commit only the FIRST, so the last pointer slot of page 0 is readable
+    //    and the very next slot (the first 8 bytes of the uncommitted page 1)
+    //    is NOT.  is_readable_pointer must accept the in-bounds slot and reject
+    //    its unmapped neighbour, distinguishing them at the exact page edge -
+    //    i.e. it turns the out-of-array element read into a clean nullptr at the
+    //    one boundary that matters, with NO fault.  This complements E2 (which
+    //    releases the whole block) by exercising the live mapped/unmapped seam
+    //    within a single reservation.
+    // =====================================================================
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        // Reserve+commit two pages, then flip page 1 to no_access so we have a
+        // genuine "committed page 0 | inaccessible page 1" seam.  (Pure RESERVE
+        // of page 1 is not portable through the os:: surface, but a no_access
+        // commit gives the same is_readable_pointer verdict: !readable -> false.)
+        const std::size_t two_pages{ page * 2u };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, two_pages) };
+        if (!block)
+        {
+            check("adjacent_boundary_skipped_alloc_failed", false);
+        }
+        else
+        {
+            auto* const bytes{ static_cast<volatile std::uint8_t*>(block) };
+            bytes[0] = 0x55;             // touch page 0 (committed, readable)
+            bytes[page] = 0x66;          // touch page 1 before we lock it
+            const bool locked{ vmhook::os::protect(
+                static_cast<std::uint8_t*>(block) + page, page,
+                vmhook::os::memory_protection::no_access, nullptr) };
+            if (!locked)
+            {
+                std::printf("[INFO] adjacent_boundary skipped: protect(no_access) refused\n");
+            }
+            else
+            {
+                void** const base{ static_cast<void**>(block) };
+                // Slot count fully inside page 0, and the index of the slot that
+                // straddles into page 1.  Each slot is sizeof(void*) bytes.
+                const std::size_t slots_per_page{ page / sizeof(void*) };
+                const std::size_t last_in_page0{ slots_per_page - 1u };  // readable
+                const std::size_t first_in_page1{ slots_per_page };      // NOT readable
+
+                // The last in-bounds slot is readable (probe accepts it)...
+                check("adjacent_last_mapped_slot_is_readable",
+                      is_readable_pointer(&base[last_in_page0]));
+                // ...and the immediately following slot, one element past the
+                // committed page, is rejected - NOT a fault.  This is the
+                // "base[index] one past the array" read FIX B converts to nullptr.
+                check("adjacent_first_unmapped_slot_is_rejected",
+                      !is_readable_pointer(&base[first_in_page1]));
+                // Reaching this line proves the probe on the unmapped neighbour
+                // did not fault.
+                check("adjacent_boundary_probe_did_not_fault", true);
+
+                // Tie it to the feature decision: with the bound disabled (-1)
+                // the probe is the sole gate, so the getter would ACCEPT the
+                // last-in-page slot and REJECT the first-unmapped slot.
+                check("adjacent_getter_accepts_last_mapped",
+                      !length_bound_rejects(static_cast<std::uint16_t>(last_in_page0 & 0xFFFFu), -1)
+                          && is_readable_pointer(&base[last_in_page0]));
+                check("adjacent_getter_rejects_first_unmapped",
+                      !is_readable_pointer(&base[first_in_page1]));
+
+                // Restore RW so release is clean.
+                (void)vmhook::os::protect(
+                    static_cast<std::uint8_t*>(block) + page, page,
+                    vmhook::os::memory_protection::read_write, nullptr);
+            }
+            vmhook::os::release(block, two_pages);
+        }
+    }
+
+    // =====================================================================
+    // M. The SINGLE COMPOSITE decision FIX B makes, as one reusable verdict
+    //    swept over the full cross-product of the three gates.  The getter
+    //    returns a non-null Symbol* IFF:
+    //        (1) the length bound passes:  !(cp_length >= 0 && index >= cp_length)
+    //        (2) the slot probe passes:    is_readable_pointer(&base[index])
+    //        (3) the post-read guard passes: value && is_valid_pointer(value)
+    //    Sections A-H prove each gate in isolation; this section proves they
+    //    COMPOSE correctly - a fabricated void** array with a mix of mapped
+    //    slot VALUES (real ptr / null / poison) is swept across length regimes
+    //    and indices, and the composite "would return a Symbol*" verdict is
+    //    asserted against an independent first-principles computation for every
+    //    cell.  This is the closest no-JVM mirror of the live getter's overall
+    //    behaviour.
+    // =====================================================================
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        const std::size_t slots{ 64 };
+        const std::size_t bytes{ slots * sizeof(void*) };
+        const std::size_t alloc{ ((bytes + page - 1) / page) * page };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, alloc) };
+        if (!block)
+        {
+            check("composite_skipped_alloc_failed", false);
+        }
+        else
+        {
+            *static_cast<volatile std::uint8_t*>(block) = 0x77; // commit
+            void** const base{ static_cast<void**>(block) };
+
+            // Plant a deterministic pattern of slot VALUES across the array:
+            //   index % 3 == 0 -> a real, valid pointer (points into the block)
+            //   index % 3 == 1 -> null
+            //   index % 3 == 2 -> a poison value is_valid_pointer rejects
+            int stack_anchor{ 0 };
+            (void)stack_anchor;
+            for (std::size_t i{ 0 }; i < slots; ++i)
+            {
+                switch (i % 3u)
+                {
+                    case 0u: base[i] = static_cast<void*>(&base[i]); break; // real & valid
+                    case 1u: base[i] = nullptr; break;                       // null value
+                    default: base[i] = reinterpret_cast<void*>(
+                                 static_cast<std::uintptr_t>(0xCAFEBABEu)); break; // poison
+                }
+            }
+
+            // The composite library decision, expressed once, exactly as the
+            // getter sequences it (bound -> probe -> post-read guard).
+            auto getter_returns_symbol =
+                [&](std::uint16_t index, std::int32_t cp_length) -> bool
+            {
+                if (cp_length >= 0 && index >= cp_length) { return false; }   // (1)
+                if (!is_readable_pointer(&base[index]))   { return false; }   // (2)
+                void* const v{ base[index] };
+                return v != nullptr && is_valid_pointer(v);                   // (3)
+            };
+
+            // Independent first-principles oracle over the SAME planted array.
+            auto expected_symbol =
+                [&](std::uint16_t index, std::int32_t cp_length) -> bool
+            {
+                // (1) length bound
+                if (cp_length >= 0 && static_cast<std::int64_t>(index) >= cp_length)
+                {
+                    return false;
+                }
+                // (2) slot readable - within our committed block all slots
+                //     [0,slots) are readable; outside, treat as not-our-memory.
+                if (index >= slots) { return false; }
+                if (!is_readable_pointer(&base[index])) { return false; }
+                // (3) value validity from the known planted pattern
+                const std::size_t k{ static_cast<std::size_t>(index) % 3u };
+                if (k == 1u) { return false; }      // null
+                if (k == 2u) { return false; }      // poison rejected
+                return true;                         // real & valid pointer
+            };
+
+            // Sweep length regimes: disabled (-1, -7), and several valid lengths
+            // that partition the planted array (so some indices are length-
+            // rejected and some reach the value check).
+            const std::int32_t length_regimes[]{ -1, -7, 0, 1, 8, 16, 32, 48, 64 };
+            bool composite_matches{ true };
+            std::size_t composite_cases{ 0 };
+            for (const std::int32_t n : length_regimes)
+            {
+                for (std::size_t i{ 0 }; i < slots; ++i)
+                {
+                    const std::uint16_t index{ static_cast<std::uint16_t>(i) };
+                    if (getter_returns_symbol(index, n) != expected_symbol(index, n))
+                    {
+                        composite_matches = false;
+                    }
+                    ++composite_cases;
+                }
+            }
+            check("composite_getter_decision_matches_oracle", composite_matches);
+            check("composite_decision_sweep_is_dense", composite_cases >= 9u * slots);
+
+            // Spelled-out composite witnesses on the disabled-bound regime
+            // (so the value gate is the decider):
+            //   index 0 -> real ptr -> returns a Symbol*
+            //   index 1 -> null     -> nullptr
+            //   index 2 -> poison   -> nullptr
+            check("composite_index0_real_returns_symbol", getter_returns_symbol(0u, -1));
+            check("composite_index1_null_returns_null",   !getter_returns_symbol(1u, -1));
+            check("composite_index2_poison_returns_null", !getter_returns_symbol(2u, -1));
+
+            // And that the length bound short-circuits BEFORE the (otherwise
+            // passing) value gate: index 0 holds a real ptr, but with length 0
+            // the bound rejects it first.
+            check("composite_length0_rejects_even_valid_value",
+                  !getter_returns_symbol(0u, 0));
+            // With length 1, index 0 (real ptr) passes the bound and the value
+            // gate -> Symbol*; index 1 (null) is bound-rejected (1 >= len 1).
+            check("composite_length1_index0_real_returns_symbol",
+                  getter_returns_symbol(0u, 1));
+            check("composite_length1_index1_bound_rejected",
+                  !getter_returns_symbol(1u, 1));
+
+            vmhook::os::release(block, alloc);
+        }
     }
 
     if (failures == 0)
