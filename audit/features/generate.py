@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
@@ -491,7 +492,14 @@ def _render_graph_json(manifests: Dict[str, dict]) -> str:
     return json.dumps(
         {
             "schema_version": 1,
-            "generated_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            # Deterministic per SOURCE_DATE_EPOCH (reproducible-builds standard): a
+            # wall-clock now() here made graph.json differ on every regen, so the
+            # registry "regenerate-check" (regen + git diff) failed on essentially every
+            # commit (only this line moved; counts/content matched). Default epoch 0 when
+            # unset keeps the regen reproducible so the check is stable.
+            "generated_at": _dt.datetime.fromtimestamp(
+                int(os.environ.get("SOURCE_DATE_EPOCH", "0")), _dt.timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "feature_count": len(features),
             "edge_count": len(edges),
             "categories": cats,
