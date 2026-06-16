@@ -65,6 +65,8 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <limits>
+#include <string_view>
 
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
@@ -1385,6 +1387,612 @@ static auto test_tag_lattice_total_partition() -> void
     check("tag_lattice_partition_total_is_6", (collection_side + map_side) == 6);
 }
 
+// ---------------------------------------------------------------------------
+// 9. decode_oop_pointer() returns nullptr for the ENTIRE compressed-OOP value
+//    space with no JVM loaded — the determinism cornerstone of this whole file.
+//
+// decode_oop_pointer(0) short-circuits to nullptr; every NON-zero value needs
+// CompressedOops::_narrow_oop.{_base,_shift} resolved from the live JVM's
+// gHotSpotVMStructs.  With no jvm.dll/libjvm.so in this process,
+// resolve_struct_entry() returns nullptr, so decode_oop_pointer() returns
+// nullptr for EVERY input.  That single fact is WHY value_t::to_vector /
+// to_entries (which decode the stored uint32) are empty for any stored OOP —
+// pin it directly across a representative spread of the 32-bit space so a
+// regression that started returning a non-null decode without a JVM (and thus
+// fed a wild pointer into the walks) would fail loudly here, not deep in a walk.
+// ---------------------------------------------------------------------------
+static auto test_decode_oop_pointer_all_null_no_jvm() -> void
+{
+    const std::uint32_t compressed_values[]{
+        0x00000000u, 0x00000001u, 0x00000002u, 0x00000003u, 0x00000004u,
+        0x00000007u, 0x00000008u, 0x0000000Fu, 0x000000FFu, 0x00000100u,
+        0x0000FFFFu, 0x00010000u, 0x00080000u, 0x00800000u, 0x01000000u,
+        0x08000000u, 0x10000000u, 0x40000000u, 0x7FFFFFFFu, 0x80000000u,
+        0xAAAAAAAAu, 0xC0000000u, 0xDEADBEEFu, 0xFEEEFEEEu, 0xFFFFFFFEu,
+        0xFFFFFFFFu,
+    };
+    bool all_null{ true };
+    for (const std::uint32_t c : compressed_values)
+    {
+        if (vmhook::hotspot::decode_oop_pointer(c) != nullptr) { all_null = false; }
+    }
+    check("decode_oop_pointer_all_values_null_no_jvm", all_null);
+    // Pin the two ends explicitly so the boundary cases are individually visible.
+    check("decode_oop_pointer_zero_null",     vmhook::hotspot::decode_oop_pointer(0u) == nullptr);
+    check("decode_oop_pointer_one_null",      vmhook::hotspot::decode_oop_pointer(1u) == nullptr);
+    check("decode_oop_pointer_max_null",      vmhook::hotspot::decode_oop_pointer(0xFFFFFFFFu) == nullptr);
+    // decode_oop_pointer is documented noexcept (it runs on detour threads).
+    check("decode_oop_pointer_noexcept",      noexcept(vmhook::hotspot::decode_oop_pointer(0u)));
+
+    // decode_array_oop (used by the value_t object-array branch) is the same
+    // story: nullptr for every compressed value without a JVM, so the array walk
+    // body is never entered and the branch returns empty.
+    bool all_array_null{ true };
+    for (const std::uint32_t c : compressed_values)
+    {
+        if (vmhook::decode_array_oop(c) != nullptr) { all_array_null = false; }
+    }
+    check("decode_array_oop_all_values_null_no_jvm", all_array_null);
+}
+
+// ---------------------------------------------------------------------------
+// 10. is_valid_pointer() boundary behaviour — the SECOND independent gate that
+//     makes every wrapper inert without a JVM (and rejects torn/garbage oops
+//     even WITH one).  Pure address arithmetic, fully deterministic, no JVM.
+//
+// is_valid_pointer rejects: addr <= user_address_floor (0xFFFF), addr >=
+// user_address_ceiling (0x00007FFFFFFFFFFF), odd addresses (low bit set), and a
+// fixed set of debug-fill / freed-block sentinels matched on the low 32 bits.
+// Everything in [floor+1, ceiling), even-aligned, non-sentinel, is accepted.
+// These are exactly the rules that turn the bogus 0x4 / 0x6 / 0x7 oops the other
+// sections use into "rejected -> empty".  Pinning the gate here proves the
+// empty results are EARNED by a real rejection, not an accident of some other
+// short-circuit.
+// ---------------------------------------------------------------------------
+static auto test_is_valid_pointer_boundaries() -> void
+{
+    auto ivp = [](std::uintptr_t a) noexcept -> bool
+    {
+        return vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(a));
+    };
+
+    // --- Below / at the floor (0xFFFF): always rejected. ---
+    check("ivp_null_rejected",        !ivp(0x0u));
+    check("ivp_0x4_rejected",         !ivp(0x4u));        // used as a bogus oop elsewhere
+    check("ivp_0x6_rejected",         !ivp(0x6u));
+    check("ivp_0x8_rejected",         !ivp(0x8u));
+    check("ivp_floor_value_rejected", !ivp(0xFFFFu));     // addr == floor -> rejected (<=)
+    check("ivp_just_below_floor_rejected", !ivp(0xFFFEu));
+
+    // --- At / above the ceiling: rejected.  The ceiling (0x7FFF'FFFFFFFF)
+    //     only fits a 64-bit pointer, so probe it sizeof-branched. ---
+    if constexpr (sizeof(void*) >= 8)
+    {
+        check("ivp_ceiling_value_rejected",
+              !ivp(static_cast<std::uintptr_t>(0x00007FFFFFFFFFFFull)));
+    }
+    // (We do NOT probe values strictly above the ceiling as raw addresses to
+    //  avoid any platform's pointer-canonicalisation surprises; the ceiling
+    //  itself is rejected by the >= comparison, which is the documented edge.)
+
+    // --- Odd addresses (low bit set) above the floor: rejected. ---
+    check("ivp_odd_address_rejected", !ivp(0x10001u));    // just above floor, odd
+    check("ivp_odd_large_rejected",   !ivp(0x10000001u));
+
+    // --- Debug-fill / freed-block sentinels (matched on the low 32 bits). ---
+    // The header rejects a pointer whose LOW 32 BITS exactly equal one of these
+    // (after the floor + odd-address gates).  To prove a sentinel is rejected we
+    // must keep its low 32 bits INTACT (so the switch can see them) and lift the
+    // address above the floor using a HIGH bit (bit 32) only — never touching
+    // low32.  On a 64-bit pointer that yields an in-range, possibly-odd address
+    // whose low32 IS the sentinel.  Even sentinels (0xCAFEBABE, 0xCCCCCCCC,
+    // 0xFEEEFEEE) are then rejected by the switch; odd sentinels (0xDEADBEEF,
+    // 0xBAADF00D, 0xCDCDCDCD, 0xABABABAB, 0xFDFDFDFD, 0xDDDDDDDD) are rejected by
+    // the earlier odd-address rule.  Either way the assertion below ("rejected")
+    // holds for all nine; the even ones additionally prove the switch fires.
+    // (On a 32-bit pointer platform we cannot add a high bit without altering
+    //  low32, so guard the high-bit construction on a 64-bit pointer width.)
+    if constexpr (sizeof(void*) >= 8)
+    {
+        auto above_floor_keep_low32 = [](std::uint32_t low32) noexcept -> std::uintptr_t
+        {
+            // Set bit 32 to clear the floor; low 32 bits stay exactly the sentinel.
+            return (std::uintptr_t{ 1 } << 32) | static_cast<std::uintptr_t>(low32);
+        };
+        const std::uint32_t sentinels[]{
+            0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+            0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu,
+        };
+        bool all_sentinels_rejected{ true };
+        for (const std::uint32_t s : sentinels)
+        {
+            if (ivp(above_floor_keep_low32(s))) { all_sentinels_rejected = false; }
+        }
+        check("ivp_all_debug_sentinels_rejected", all_sentinels_rejected);
+
+        // The three EVEN sentinels are rejected even though they are even and in
+        // range — proving the sentinel switch (not the floor/odd rule) fires.
+        const std::uint32_t even_sentinels[]{ 0xCAFEBABEu, 0xCCCCCCCCu, 0xFEEEFEEEu };
+        bool even_sentinels_rejected_by_switch{ true };
+        for (const std::uint32_t s : even_sentinels)
+        {
+            const std::uintptr_t a{ above_floor_keep_low32(s) };
+            // Confirm it is in-range + even (so ONLY the switch can reject it).
+            const bool in_range_even{ a > vmhook::os::user_address_floor
+                                      && a < vmhook::os::user_address_ceiling
+                                      && (a & 0x1u) == 0u };
+            if (!in_range_even || ivp(a)) { even_sentinels_rejected_by_switch = false; }
+        }
+        check("ivp_even_sentinels_rejected_by_switch", even_sentinels_rejected_by_switch);
+    }
+
+    // --- A plain even, in-range, non-sentinel address IS accepted. ---
+    // This is the positive control: it proves the gate is not rejecting
+    // EVERYTHING (which would make the empty results above meaningless).  These
+    // are pure range checks — is_valid_pointer never dereferences the address.
+    // 0x20000 fits in a 32-bit pointer, is even, above the floor, non-sentinel —
+    // accepted on EVERY pointer width.
+    check("ivp_small_even_above_floor_accepted", ivp(0x20000u));
+    // The larger probes exceed 32 bits, so only assert them where pointers are
+    // 64-bit (sizeof-branched per the cross-platform determinism rule).
+    if constexpr (sizeof(void*) >= 8)
+    {
+        check("ivp_plain_inrange_even_accepted", ivp(0x0000000100000000ull));
+        check("ivp_midrange_even_accepted", ivp(0x0000100000000000ull));
+    }
+
+    // is_valid_pointer is documented noexcept (called on detour threads).
+    check("ivp_noexcept",
+          noexcept(vmhook::hotspot::is_valid_pointer(static_cast<const void*>(nullptr))));
+
+    // The two constants the gate keys off are exactly the documented values.
+    check("user_address_floor_is_0xFFFF",
+          vmhook::os::user_address_floor == static_cast<std::uintptr_t>(0xFFFFu));
+    check("user_address_ceiling_is_canonical_user_max",
+          vmhook::os::user_address_ceiling == static_cast<std::uintptr_t>(0x00007FFFFFFFFFFFull));
+    check("user_address_floor_below_ceiling",
+          vmhook::os::user_address_floor < vmhook::os::user_address_ceiling);
+}
+
+// ---------------------------------------------------------------------------
+// 11. EXHAUSTIVE 256-byte sweep of detail::sig_char_to_basic_type — the JVM
+//     type-descriptor -> HotSpot BasicType classifier that underlies how an
+//     element descriptor is recognised.
+//
+// This is the "type -> tag" mapping at its most primitive: a single descriptor
+// byte maps to exactly one HotSpot BasicType int.  STEP 2 of the task (every
+// supported type maps to the right tag; unknown types fall to the documented
+// default; the switch is complete with no gaps) is pinned here over the FULL
+// input byte space:
+//   Z->4 C->5 F->6 D->7 B->8 S->9 I->10 J->11 L->12 [->13 V->14, default->12.
+// Note T_OBJECT(12) is BOTH the 'L' mapping AND the catch-all default — the
+// classifier is total (never throws, never UB) and its "unknown" sentinel is a
+// REAL BasicType (T_OBJECT), exactly as documented.  Stable across all JDKs.
+// ---------------------------------------------------------------------------
+static auto test_sig_char_to_basic_type_full_sweep() -> void
+{
+    using vmhook::detail::sig_char_to_basic_type;
+
+    // Reference table for the eleven explicitly-mapped descriptor bytes.
+    struct named { char c; int basic; };
+    const named mapped[]{
+        { 'Z', 4 }, { 'C', 5 }, { 'F', 6 }, { 'D', 7 }, { 'B', 8 },
+        { 'S', 9 }, { 'I', 10 }, { 'J', 11 }, { 'L', 12 }, { '[', 13 },
+        { 'V', 14 },
+    };
+
+    // (a) Each named descriptor maps to exactly its documented BasicType.
+    {
+        bool all_ok{ true };
+        for (const auto& m : mapped)
+        {
+            if (sig_char_to_basic_type(m.c) != m.basic) { all_ok = false; }
+        }
+        check("sigchar_named_descriptors_map_exactly", all_ok);
+    }
+
+    // (b) FULL 0..255 sweep: every byte not in the named set returns the
+    //     T_OBJECT(12) default; every named byte returns its own value.  This is
+    //     the no-gaps / total-default guarantee over the entire input space.
+    {
+        bool all_ok{ true };
+        int  default_count{ 0 };
+        int  nondefault_count{ 0 };
+        for (int b{ 0 }; b < 256; ++b)
+        {
+            const char c{ static_cast<char>(b) };
+            int expected{ 12 };               // T_OBJECT fallback
+            for (const auto& m : mapped)
+            {
+                if (m.c == c) { expected = m.basic; break; }
+            }
+            const int got{ sig_char_to_basic_type(c) };
+            if (got != expected) { all_ok = false; }
+            if (got == 12 && expected == 12 && c != 'L') { ++default_count; }
+            if (expected != 12) { ++nondefault_count; }
+        }
+        check("sigchar_full_256_sweep_matches_table", all_ok);
+        // Exactly ten descriptors map to a NON-T_OBJECT BasicType (Z C F D B S I
+        // J [ V — eleven named minus 'L' which IS T_OBJECT).
+        check("sigchar_exactly_ten_nondefault_descriptors", nondefault_count == 10);
+        // Of 256 bytes, 'L' plus the 245 unnamed bytes resolve to T_OBJECT(12):
+        // 256 - 10 nondefault - ('L' counted via default_count exclusion) ... pin
+        // the unnamed-default population directly: 256 minus the 11 named = 245.
+        check("sigchar_unnamed_bytes_all_default", default_count == 245);
+    }
+
+    // (c) Spot negative-space: ASCII letters NOT in the descriptor set and
+    //     punctuation / digits all fall to T_OBJECT(12), never to a wrong real
+    //     BasicType (e.g. 'i' lowercase must NOT be mistaken for 'I'->10).
+    {
+        const char junk[]{ 'A', 'E', 'G', 'H', 'K', 'M', 'N', 'O', 'P', 'Q',
+                           'R', 'T', 'U', 'W', 'X', 'Y',
+                           'a', 'i', 'j', 'l', 'z', 'v', 's', 'b',
+                           '0', '9', ' ', '/', ';', '*', '\0', '@' };
+        bool all_default{ true };
+        for (const char c : junk)
+        {
+            if (sig_char_to_basic_type(c) != 12) { all_default = false; }
+        }
+        check("sigchar_junk_bytes_all_T_OBJECT", all_default);
+        // Case sensitivity: lowercase letters never alias their uppercase
+        // descriptor counterparts.
+        check("sigchar_lowercase_i_not_int",  sig_char_to_basic_type('i') != 10);
+        check("sigchar_lowercase_z_not_bool", sig_char_to_basic_type('z') != 4);
+        check("sigchar_lowercase_l_is_default", sig_char_to_basic_type('l') == 12);
+    }
+
+    // (d) sig_char_to_basic_type is noexcept (used on detour threads).
+    check("sigchar_noexcept", noexcept(sig_char_to_basic_type('I')));
+}
+
+// ---------------------------------------------------------------------------
+// 12. EXHAUSTIVE matrix of detail::jvm_primitive_byte_width — the in-heap
+//     width of a primitive field/array-element descriptor.
+//
+// This is the tag -> width round-trip helper the array-element-width guard in
+// value_t::read_array_value keys off.  Contract (header): returns a non-zero
+// width ONLY for a length-1 primitive descriptor; 0 for references, arrays,
+// length != 1, and any unknown byte.
+//   Z=1 B=1  S=2 C=2  I=4 F=4  J=8 D=8  ; everything else = 0.
+// Sweep the full single-byte space AND the multi-char / empty cases so the
+// "size != 1 -> 0" early-out and the per-byte table are both pinned exhaustively.
+// ---------------------------------------------------------------------------
+static auto test_jvm_primitive_byte_width_matrix() -> void
+{
+    using vmhook::detail::jvm_primitive_byte_width;
+
+    struct wcase { char c; std::size_t width; };
+    const wcase widths[]{
+        { 'Z', 1 }, { 'B', 1 }, { 'S', 2 }, { 'C', 2 },
+        { 'I', 4 }, { 'F', 4 }, { 'J', 8 }, { 'D', 8 },
+    };
+
+    // (a) Each primitive descriptor reports its exact JVM width.
+    {
+        bool all_ok{ true };
+        for (const auto& w : widths)
+        {
+            const char buf[1]{ w.c };
+            if (jvm_primitive_byte_width(std::string_view{ buf, 1 }) != w.width) { all_ok = false; }
+        }
+        check("primwidth_named_descriptors_exact", all_ok);
+    }
+
+    // (b) FULL 0..255 single-byte sweep: exactly the eight primitive descriptors
+    //     are non-zero (with their documented widths); EVERY other byte is 0.
+    {
+        bool all_ok{ true };
+        int  nonzero_count{ 0 };
+        std::size_t width_sum{ 0 };
+        for (int b{ 0 }; b < 256; ++b)
+        {
+            const char c{ static_cast<char>(b) };
+            std::size_t expected{ 0 };
+            for (const auto& w : widths)
+            {
+                if (w.c == c) { expected = w.width; break; }
+            }
+            const char buf[1]{ c };
+            const std::size_t got{ jvm_primitive_byte_width(std::string_view{ buf, 1 }) };
+            if (got != expected) { all_ok = false; }
+            if (got != 0) { ++nonzero_count; width_sum += got; }
+        }
+        check("primwidth_full_256_sweep_matches_table", all_ok);
+        check("primwidth_exactly_eight_nonzero", nonzero_count == 8);
+        // 1+1+2+2+4+4+8+8 = 30 across the eight primitive descriptors.
+        check("primwidth_widths_sum_is_30", width_sum == 30u);
+    }
+
+    // (c) size != 1 -> always 0: empty, two-char, full reference / array sigs.
+    {
+        check("primwidth_empty_is_zero",      jvm_primitive_byte_width(std::string_view{}) == 0u);
+        check("primwidth_two_char_II_is_zero", jvm_primitive_byte_width(std::string_view{ "II" }) == 0u);
+        check("primwidth_array_int_is_zero",   jvm_primitive_byte_width(std::string_view{ "[I" }) == 0u);
+        check("primwidth_array_double_is_zero", jvm_primitive_byte_width(std::string_view{ "[D" }) == 0u);
+        check("primwidth_ref_string_is_zero",
+              jvm_primitive_byte_width(std::string_view{ "Ljava/lang/String;" }) == 0u);
+        check("primwidth_object_descriptor_L_two_char_is_zero",
+              jvm_primitive_byte_width(std::string_view{ "L;" }) == 0u);
+    }
+
+    // (d) Reference / array / void single bytes are 0 (NOT primitives), so the
+    //     read-array width guard correctly skips them (width 0 == "don't gate").
+    {
+        check("primwidth_single_L_is_zero", jvm_primitive_byte_width(std::string_view{ "L" }) == 0u);
+        check("primwidth_single_bracket_is_zero", jvm_primitive_byte_width(std::string_view{ "[" }) == 0u);
+        check("primwidth_single_V_is_zero", jvm_primitive_byte_width(std::string_view{ "V" }) == 0u);
+    }
+
+    // (e) Cross-check: jvm_primitive_byte_width(c)!=0 IFF the element descriptor
+    //     is a primitive (a fall-through for the object-array gate) AND its
+    //     BasicType is in the primitive band [4,11].  Ties the two helpers
+    //     together so a change to one without the other is caught.
+    {
+        bool consistent{ true };
+        for (int b{ 0 }; b < 256; ++b)
+        {
+            const char c{ static_cast<char>(b) };
+            const char buf[1]{ c };
+            const bool has_width{ jvm_primitive_byte_width(std::string_view{ buf, 1 }) != 0u };
+            const int  basic{ vmhook::detail::sig_char_to_basic_type(c) };
+            const bool is_primitive_band{ basic >= 4 && basic <= 11 };
+            // Every byte WITH a width is in the primitive band; the band byte 'V'
+            // is excluded by jvm_primitive_byte_width (void has no storage), so
+            // has_width implies primitive-band but NOT vice-versa (C/F/D/.. yes,
+            // but every primitive-band char here DOES have a width — V is 14, not
+            // in [4,11]).  So the relation is exactly: has_width == band.
+            if (has_width != is_primitive_band) { consistent = false; }
+        }
+        check("primwidth_matches_basic_type_primitive_band", consistent);
+    }
+
+    // (f) jvm_primitive_byte_width is noexcept.
+    check("primwidth_noexcept", noexcept(jvm_primitive_byte_width(std::string_view{ "I" })));
+}
+
+// ---------------------------------------------------------------------------
+// 13. clamp_safe_container_count — the constexpr "never over-allocate / never
+//     over-read" guard applied to EVERY element count this feature derives from
+//     heap memory (the ArrayList `size` field, the array_length of an Object[]
+//     in the value_t array branch, and every walk helper's reserve/loop bound).
+//
+// Contract (header): clamp raw to [0, k_max_safe_container_elems] where the cap
+// is 1<<24.  Negative / zero -> 0; raw < cap -> raw; raw >= cap -> cap.  The
+// function is constexpr, so pin its full behaviour at COMPILE TIME with
+// static_assert (the strongest possible guard) plus a runtime mirror.  This is
+// the load-bearing safety invariant for the array-walk reserve at value_t::
+// to_vector and for every walk helper — a regression that widened the cap or
+// stopped clamping negatives would let a torn heap read drive an unbounded
+// reserve/loop.
+// ---------------------------------------------------------------------------
+static auto test_clamp_safe_container_count() -> void
+{
+    using vmhook::clamp_safe_container_count;
+    constexpr std::int32_t cap{ static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) };
+
+    // --- The cap is EXACTLY 1<<24 and fits comfortably in int32. ---
+    static_assert(vmhook::k_max_safe_container_elems == (1ull << 24),
+                  "k_max_safe_container_elems must be 1<<24 (16,777,216).");
+    static_assert(cap == 16'777'216, "cap mirrors k_max_safe_container_elems as int32.");
+    static_assert(cap > 0 && cap < (std::numeric_limits<std::int32_t>::max)(),
+                  "cap must be a positive int32 with headroom.");
+
+    // --- Negative and zero collapse to 0 (a torn _length read can be negative). ---
+    static_assert(clamp_safe_container_count(0) == 0);
+    static_assert(clamp_safe_container_count(-1) == 0);
+    static_assert(clamp_safe_container_count(-12345) == 0);
+    static_assert(clamp_safe_container_count((std::numeric_limits<std::int32_t>::min)()) == 0,
+                  "INT_MIN clamps to 0, not to a wrapped positive.");
+
+    // --- In-range values pass through unchanged. ---
+    static_assert(clamp_safe_container_count(1) == 1);
+    static_assert(clamp_safe_container_count(2) == 2);
+    static_assert(clamp_safe_container_count(1000) == 1000);
+    static_assert(clamp_safe_container_count(cap - 1) == cap - 1,
+                  "the largest sub-cap value is returned verbatim.");
+
+    // --- At and above the cap, the result saturates to the cap. ---
+    static_assert(clamp_safe_container_count(cap) == cap,
+                  "exactly the cap returns the cap.");
+    static_assert(clamp_safe_container_count(cap + 1) == cap,
+                  "one past the cap saturates.");
+    static_assert(clamp_safe_container_count((std::numeric_limits<std::int32_t>::max)()) == cap,
+                  "INT_MAX saturates to the cap, never overflows.");
+
+    // --- The result is ALWAYS a valid reserve/loop bound: in [0, cap]. ---
+    static_assert(clamp_safe_container_count(-999) >= 0 && clamp_safe_container_count(-999) <= cap);
+    static_assert(clamp_safe_container_count(999'999'999) >= 0
+                  && clamp_safe_container_count(999'999'999) <= cap);
+
+    // --- clamp is idempotent: clamping a clamped value changes nothing. ---
+    static_assert(clamp_safe_container_count(clamp_safe_container_count(cap + 5)) == cap);
+    static_assert(clamp_safe_container_count(clamp_safe_container_count(-5)) == 0);
+    static_assert(clamp_safe_container_count(clamp_safe_container_count(42)) == 42);
+
+    // --- clamp is monotonic non-decreasing across the boundary samples. ---
+    static_assert(clamp_safe_container_count(-1) <= clamp_safe_container_count(0));
+    static_assert(clamp_safe_container_count(0) <= clamp_safe_container_count(1));
+    static_assert(clamp_safe_container_count(cap - 1) <= clamp_safe_container_count(cap));
+    static_assert(clamp_safe_container_count(cap) <= clamp_safe_container_count(cap + 1));
+
+    // --- Runtime mirrors of the same facts (so they show up in the PASS count
+    //     and a constexpr-evaluation quirk could never silently drop them). ---
+    check("clamp_zero_is_zero",        clamp_safe_container_count(0) == 0);
+    check("clamp_negative_is_zero",    clamp_safe_container_count(-1) == 0);
+    check("clamp_int_min_is_zero",     clamp_safe_container_count((std::numeric_limits<std::int32_t>::min)()) == 0);
+    check("clamp_one_passthrough",     clamp_safe_container_count(1) == 1);
+    check("clamp_below_cap_passthrough", clamp_safe_container_count(cap - 1) == cap - 1);
+    check("clamp_at_cap_saturates",    clamp_safe_container_count(cap) == cap);
+    check("clamp_above_cap_saturates", clamp_safe_container_count(cap + 1) == cap);
+    check("clamp_int_max_saturates",   clamp_safe_container_count((std::numeric_limits<std::int32_t>::max)()) == cap);
+    check("clamp_result_in_bounds_for_huge",
+          clamp_safe_container_count(2'000'000'000) >= 0
+          && clamp_safe_container_count(2'000'000'000) <= cap);
+    check("clamp_noexcept",            noexcept(clamp_safe_container_count(0)));
+    check("clamp_is_constexpr_usable",
+          std::integral_constant<std::int32_t, clamp_safe_container_count(5)>::value == 5);
+
+    // --- FULL byte-boundary sweep around the cap: for every offset in a small
+    //     window the result is min(max(raw,0), cap), matched against an
+    //     independent reference implementation. ---
+    {
+        auto reference = [cap](std::int64_t raw) noexcept -> std::int32_t
+        {
+            if (raw <= 0) { return 0; }
+            return static_cast<std::int32_t>(raw < cap ? raw : cap);
+        };
+        bool all_ok{ true };
+        const std::int64_t probes[]{
+            -3, -2, -1, 0, 1, 2, 3,
+            static_cast<std::int64_t>(cap) - 2, static_cast<std::int64_t>(cap) - 1,
+            static_cast<std::int64_t>(cap), static_cast<std::int64_t>(cap) + 1,
+            static_cast<std::int64_t>(cap) + 2,
+        };
+        for (const std::int64_t p : probes)
+        {
+            if (clamp_safe_container_count(static_cast<std::int32_t>(p)) != reference(p)) { all_ok = false; }
+        }
+        check("clamp_window_matches_reference_impl", all_ok);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 14. detail::value_t_convertible_target_v — the constexpr gate on value_t's
+//     conversion operator that the to_vector / to_entries entry points ride via
+//     static_cast<std::uint32_t>(*this).
+//
+// The trait permits arithmetic / std::string / std::unique_ptr<W> / std::vector
+// targets and exactly ONE pointer target (void*, the compressed-OOP decode
+// slot), while excising std::nullptr_t and every non-void pointer (char*,
+// const char*, W*).  to_vector/to_entries read the OOP as uint32 (an arithmetic
+// target, permitted), so this trait must stay TRUE for uint32 or the entry
+// points would not compile.  Pin the whole partition at compile time.
+// ---------------------------------------------------------------------------
+static auto test_value_t_convertible_target_gate() -> void
+{
+    using vmhook::detail::value_t_convertible_target_v;
+
+    // --- The slot the entry points actually use. ---
+    static_assert(value_t_convertible_target_v<std::uint32_t>,
+                  "to_vector/to_entries read the OOP via static_cast<uint32_t> — must be permitted.");
+    static_assert(value_t_convertible_target_v<void*>,
+                  "void* is the single permitted pointer target (compressed-OOP decode).");
+
+    // --- Arithmetic + bool targets: all permitted. ---
+    static_assert(value_t_convertible_target_v<bool>);
+    static_assert(value_t_convertible_target_v<std::int8_t>);
+    static_assert(value_t_convertible_target_v<std::int16_t>);
+    static_assert(value_t_convertible_target_v<std::int32_t>);
+    static_assert(value_t_convertible_target_v<std::int64_t>);
+    static_assert(value_t_convertible_target_v<std::uint16_t>);
+    static_assert(value_t_convertible_target_v<float>);
+    static_assert(value_t_convertible_target_v<double>);
+
+    // --- Class targets used by the wrappers: permitted. ---
+    static_assert(value_t_convertible_target_v<std::string>);
+    static_assert(value_t_convertible_target_v<std::unique_ptr<elem_w>>);
+    static_assert(value_t_convertible_target_v<std::vector<std::int32_t>>);
+    static_assert(value_t_convertible_target_v<std::vector<std::string>>);
+
+    // --- cv / ref qualified forms are classified by their underlying type. ---
+    static_assert(value_t_convertible_target_v<const std::uint32_t&>);
+    static_assert(value_t_convertible_target_v<const std::string&>);
+    static_assert(value_t_convertible_target_v<std::unique_ptr<elem_w>&&>);
+    static_assert(value_t_convertible_target_v<const void*>,
+                  "cv-qualified void* is still the permitted pointer target.");
+
+    // --- Excised targets: nullptr_t and every non-void pointer. ---
+    static_assert(!value_t_convertible_target_v<std::nullptr_t>,
+                  "nullptr_t is excised (collides with class-target ctors).");
+    static_assert(!value_t_convertible_target_v<char*>);
+    static_assert(!value_t_convertible_target_v<const char*>);
+    static_assert(!value_t_convertible_target_v<elem_w*>,
+                  "a raw wrapper pointer W* is excised (collides with unique_ptr<W> ctor).");
+    static_assert(!value_t_convertible_target_v<int*>);
+    static_assert(!value_t_convertible_target_v<const std::string*>);
+
+    // --- Runtime mirror: the exact conversion the entry points perform exists,
+    //     is noexcept, and yields 0 for the zero-OOP alternative. ---
+    check("value_t_uint32_conversion_yields_zero_for_zero_oop",
+          static_cast<std::uint32_t>(value_t{ std::uint32_t{ 0 } }) == 0u);
+    check("value_t_uint32_conversion_roundtrips_value",
+          static_cast<std::uint32_t>(value_t{ std::uint32_t{ 0x00ABCDEFu } }) == 0x00ABCDEFu);
+    // bool true narrows to compressed OOP 1 (the value the array gate then
+    // decodes to nullptr without a JVM).
+    check("value_t_bool_true_narrows_to_one",
+          static_cast<std::uint32_t>(value_t{ true }) == 1u);
+    check("value_t_int8_neg_one_widens_to_max",
+          static_cast<std::uint32_t>(value_t{ std::int8_t{ -1 } }) == 0xFFFFFFFFu);
+    check("value_t_void_ptr_conversion_null_no_jvm",
+          static_cast<void*>(value_t{ std::uint32_t{ 0x1234u } }) == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 15. The element / key / value wrapper TYPE CONTRACT that to_vector<E>() /
+//     to_entries<K,V>() require: E/K/V must be constructible from vmhook::oop_t
+//     (== void*), because the (runtime-unreached, but always instantiated)
+//     bodies call std::make_unique<E>(oop_t).  This is exactly the type-tag
+//     mapping's requirement on the element wrapper.
+//
+// Pin that the wrappers this test instantiates with satisfy the contract, that
+// std::make_unique<E>(oop_t) is well-formed, and that the produced
+// vector / pair element types are precisely the documented unique_ptr shapes.
+// ---------------------------------------------------------------------------
+static auto test_element_wrapper_contract() -> void
+{
+    // oop_t is void* — the element ctor argument type.
+    static_assert(std::is_same_v<vmhook::oop_t, void*>,
+                  "vmhook::oop_t is void*; element wrappers take it in their ctor.");
+
+    // Each wrapper is constructible from an oop_t and from a decoded void*.
+    static_assert(std::is_constructible_v<elem_w, vmhook::oop_t>);
+    static_assert(std::is_constructible_v<key_w, vmhook::oop_t>);
+    static_assert(std::is_constructible_v<val_w, vmhook::oop_t>);
+    static_assert(std::is_constructible_v<elem_w, void*>);
+
+    // std::make_unique<E>(oop_t) — the exact expression to_vector instantiates —
+    // is well-formed for each wrapper (so the template body compiles).
+    static_assert(requires { std::make_unique<elem_w>(std::declval<vmhook::oop_t>()); });
+    static_assert(requires { std::make_unique<key_w>(std::declval<vmhook::oop_t>()); });
+    static_assert(requires { std::make_unique<val_w>(std::declval<vmhook::oop_t>()); });
+
+    // The wrapper ctors are noexcept (matching object_base's contract), so a
+    // walk that constructs N of them on a detour thread cannot throw mid-walk.
+    static_assert(std::is_nothrow_constructible_v<elem_w, vmhook::oop_t>);
+    static_assert(std::is_nothrow_constructible_v<key_w, vmhook::oop_t>);
+
+    // The produced container element types are EXACTLY the documented shapes.
+    static_assert(std::is_same_v<
+                      decltype(std::declval<vmhook::collection>().to_vector<elem_w>()),
+                      std::vector<std::unique_ptr<elem_w>>>,
+                  "collection::to_vector<E> -> vector<unique_ptr<E>>.");
+    static_assert(std::is_same_v<
+                      decltype(std::declval<vmhook::map>().to_entries<key_w, val_w>()),
+                      std::vector<std::pair<std::unique_ptr<key_w>, std::unique_ptr<val_w>>>>,
+                  "map::to_entries<K,V> -> vector<pair<unique_ptr<K>,unique_ptr<V>>>.");
+    // The value_t delegators produce the identical shapes.
+    static_assert(std::is_same_v<
+                      decltype(std::declval<value_t>().to_vector<elem_w>()),
+                      std::vector<std::unique_ptr<elem_w>>>);
+    static_assert(std::is_same_v<
+                      decltype(std::declval<value_t>().to_entries<key_w, val_w>()),
+                      std::vector<std::pair<std::unique_ptr<key_w>, std::unique_ptr<val_w>>>>);
+
+    // A constructed-from-bogus-but-decoded-null path: make_unique<E>(nullptr)
+    // yields a non-null unique_ptr wrapping a null OOP (this is what a null Java
+    // element would have become, but the walks emit nullptr SLOTS instead — pin
+    // that the wrapper itself is still constructible from a null oop).
+    {
+        auto w{ std::make_unique<elem_w>(static_cast<vmhook::oop_t>(nullptr)) };
+        check("make_unique_elem_w_from_null_oop_nonnull_ptr", w != nullptr);
+        check("make_unique_elem_w_wraps_null_instance", w->get_instance() == nullptr);
+    }
+
+    // Runtime presence marker so this section contributes to the PASS count.
+    check("element_wrapper_contract_static_asserts_held", true);
+}
+
 int main()
 {
     // Registering the element wrappers mirrors real usage; harmless with no JVM.
@@ -1414,6 +2022,13 @@ int main()
     test_field_proxy_all_signatures_empty();
     test_value_t_call_forms();
     test_tag_lattice_total_partition();
+    test_decode_oop_pointer_all_null_no_jvm();
+    test_is_valid_pointer_boundaries();
+    test_sig_char_to_basic_type_full_sweep();
+    test_jvm_primitive_byte_width_matrix();
+    test_clamp_safe_container_count();
+    test_value_t_convertible_target_gate();
+    test_element_wrapper_contract();
 
     return failures == 0 ? 0 : 1;
 }

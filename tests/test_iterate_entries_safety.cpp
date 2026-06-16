@@ -851,6 +851,600 @@ static auto test_interleaved_getter_iterator_stress() -> void
     check("interleaved_getters_iterators_clamp_all_consistent", ok);
 }
 
+// ===========================================================================
+// EXHAUSTIVE EXPANSION (19+).
+//
+// Everything below stays inside this feature's no-JVM contract: the iterate_*
+// walkers read the cached gHotSpot* array head (nullptr here), so the loop body
+// never runs and every lookup must return nullptr WITHOUT faulting, for every
+// possible string input; and the clamp/cap that bounds every oop-derived walk
+// (clamp_safe_container_count / k_max_safe_container_elems, also the literal
+// `k_descend_cap` back-edge cap in the tree-map/tree-set walkers) is pure
+// constexpr arithmetic exercised here to its full domain.  The array-element
+// bounds helpers are owned by tests/test_array_element_helpers.cpp and are NOT
+// re-tested here.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 19. COMPLETE real (type,field) struct-query surface.
+//
+// Sections 3 and 10 sample a couple dozen pairs; this is the EXHAUSTIVE set of
+// every distinct (type_name, field_name) pair the library passes to
+// iterate_struct_entries anywhere in vmhook.hpp (collected from every call
+// site).  In a no-JVM process every one must short-circuit on the null array
+// head and return nullptr without faulting — the foundational "miss is cheap
+// and crash-free" guarantee the whole introspection layer is built on.
+// ---------------------------------------------------------------------------
+static auto test_complete_struct_query_surface_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+
+    struct pair { const char* type; const char* field; };
+    static const pair pairs[]{
+        // Symbol
+        { "Symbol", "_length" }, { "Symbol", "_body" },
+        // ConstantPool
+        { "ConstantPool", "_length" }, { "ConstantPool", "_pool_holder" },
+        // ConstMethod
+        { "ConstMethod", "_constants" }, { "ConstMethod", "_name_index" },
+        { "ConstMethod", "_signature_index" },
+        // Method (incl. the renamed-entry-point fallback pair)
+        { "Method", "_i2i_entry" }, { "Method", "_from_interpreted_entry" },
+        { "Method", "_access_flags" }, { "Method", "_flags" },
+        { "Method", "_constMethod" }, { "Method", "_code" },
+        { "Method", "_from_compiled_code_entry_point" },
+        { "Method", "_from_compiled_entry" }, { "Method", "_adapter" },
+        { "Method", "_intrinsic_id" },
+        // Klass
+        { "Klass", "_name" }, { "Klass", "_next_link" },
+        { "Klass", "_java_mirror" }, { "Klass", "_super" },
+        { "Klass", "_layout_helper" }, { "Klass", "_prototype_header" },
+        { "Klass", "_access_flags" }, { "Klass", "_class_loader_data" },
+        // InstanceKlass (incl. _fields/_fieldinfo_stream version pair)
+        { "InstanceKlass", "_methods" }, { "InstanceKlass", "_transitive_interfaces" },
+        { "InstanceKlass", "_local_interfaces" }, { "InstanceKlass", "_fieldinfo_stream" },
+        { "InstanceKlass", "_fields" }, { "InstanceKlass", "_constants" },
+        // ClassLoaderData / graph (incl. _klasses/_dictionary capability pair)
+        { "ClassLoaderData", "_klasses" }, { "ClassLoaderData", "_next" },
+        { "ClassLoaderData", "_dictionary" }, { "ClassLoaderData", "_class_loader" },
+        { "ClassLoaderDataGraph", "_head" },
+        // SystemDictionary
+        { "SystemDictionary", "_dictionary" }, { "SystemDictionary", "_shared_dictionary" },
+        // Threads / SMR / list (Java 8 vs 9+)
+        { "JavaThread", "_thread_state" }, { "JavaThread", "_suspend_flags" },
+        { "JavaThread", "_next" }, { "JavaThread", "_osthread" },
+        { "JavaThread", "_tlab" }, { "JavaThread", "_anchor" },
+        { "Thread", "_next" }, { "Thread", "_osthread" }, { "Thread", "_tlab" },
+        { "OSThread", "_thread_id" },
+        { "ThreadLocalAllocBuffer", "_top" }, { "ThreadLocalAllocBuffer", "_end" },
+        { "Threads", "_thread_list" },
+        { "ThreadsSMRSupport", "_java_thread_list" },
+        { "ThreadsList", "_length" }, { "ThreadsList", "_threads" },
+        // Heap reservation walk (compressed-oop base plausibility)
+        { "Universe", "_collectedHeap" }, { "CollectedHeap", "_reserved" },
+        { "MemRegion", "_start" }, { "MemRegion", "_word_size" },
+        // oopDesc (mark/markWord + compressed/raw klass)
+        { "oopDesc", "_mark" }, { "oopDesc", "_markWord" },
+        { "oopDesc", "_metadata._compressed_klass" }, { "oopDesc", "_metadata._klass" },
+        // Adapters / stubs / mirror offset
+        { "AdapterHandlerEntry", "_c2i_entry" },
+        { "StubRoutines", "_call_stub_entry" },
+        { "java_lang_Class", "_klass_offset" },
+    };
+
+    bool all_null{ true };
+    int count{ 0 };
+    for (const auto& p : pairs)
+    {
+        ++count;
+        if (iterate_struct_entries(p.type, p.field) != nullptr)
+        {
+            all_null = false;
+            std::printf("  surface (%s,%s) returned non-null\n", p.type, p.field);
+        }
+    }
+    check("complete_struct_query_surface_all_null", all_null);
+    // Pin the surface size so a future call site whose pair is added to the lib
+    // (and here) is consciously accounted for, not silently dropped.
+    check("complete_struct_query_surface_count_ge_60", count >= 60);
+}
+
+// ---------------------------------------------------------------------------
+// 20. JDK-version fallback chains: every (type,field) candidate in the
+//     compressed-oops / compressed-klass base+shift resolver tables, plus the
+//     other renamed-field fallback pairs.  Cross-version support rests entirely
+//     on each ABSENT candidate resolving to nullptr cheaply (the resolver tries
+//     A, then B, then C in order); a fault or a false match on any candidate
+//     would break the chain.  With no JVM every candidate is nullptr, which is
+//     exactly the "this name isn't in THIS JDK, try the next" signal.
+// ---------------------------------------------------------------------------
+static auto test_version_fallback_chains_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+
+    struct pair { const char* type; const char* field; };
+    static const pair candidates[]{
+        // CompressedOops base: JDK17-24 nested, JDK25+ flat, legacy Universe.
+        { "CompressedOops", "_narrow_oop._base" },
+        { "CompressedOops", "_base" },
+        { "Universe",       "_narrow_oop._base" },
+        // CompressedOops shift.
+        { "CompressedOops", "_narrow_oop._shift" },
+        { "CompressedOops", "_shift" },
+        { "Universe",       "_narrow_oop._shift" },
+        // CompressedKlassPointers base.
+        { "CompressedKlassPointers", "_narrow_klass._base" },
+        { "CompressedKlassPointers", "_base" },
+        { "Universe",                "_narrow_klass._base" },
+        // CompressedKlassPointers shift.
+        { "CompressedKlassPointers", "_narrow_klass._shift" },
+        { "CompressedKlassPointers", "_shift" },
+        { "Universe",                "_narrow_klass._shift" },
+    };
+
+    bool all_null{ true };
+    for (const auto& c : candidates)
+    {
+        if (iterate_struct_entries(c.type, c.field) != nullptr) { all_null = false; }
+    }
+    check("version_fallback_codec_candidates_all_null", all_null);
+
+    // The renamed-field pairs the library tries in sequence elsewhere: both
+    // spellings must be null with no JVM (so the fallback is reached safely).
+    struct rename { const char* type; const char* old_name; const char* new_name; const char* tag; };
+    static const rename renames[]{
+        { "oopDesc", "_mark", "_markWord", "rename_oop_mark" },
+        { "Method", "_from_compiled_code_entry_point", "_from_compiled_entry", "rename_method_fce" },
+        { "InstanceKlass", "_fields", "_fieldinfo_stream", "rename_ik_fields" },
+        { "ClassLoaderData", "_klasses", "_dictionary", "rename_cld_klasses" },
+    };
+    for (const auto& r : renames)
+    {
+        const bool old_null{ iterate_struct_entries(r.type, r.old_name) == nullptr };
+        const bool new_null{ iterate_struct_entries(r.type, r.new_name) == nullptr };
+        check(r.tag, old_null && new_null);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 21. COMPLETE real type-name query surface for iterate_type_entries, plus the
+//     types whose presence is JDK-version-specific (8 vs 9+).  Each must return
+//     nullptr with no JVM — including types that only exist on ONE JDK (the
+//     walker must report "absent" for the wrong-JDK type without faulting,
+//     which is the same bounds contract as the present-but-empty case here).
+// ---------------------------------------------------------------------------
+static auto test_complete_type_query_surface_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_type_entries;
+
+    static const char* const names[]{
+        // Directly queried by the library.
+        "ConstantPool", "Method",
+        // Types the struct walks reference (must also be absent-safe by name).
+        "Symbol", "ConstMethod", "Klass", "InstanceKlass", "oopDesc",
+        "narrowOop", "JavaThread", "Thread", "OSThread",
+        "ClassLoaderData", "ClassLoaderDataGraph", "SystemDictionary",
+        "CompressedOops", "CompressedKlassPointers", "Universe",
+        "CollectedHeap", "MemRegion", "ThreadLocalAllocBuffer",
+        "AdapterHandlerEntry", "StubRoutines",
+        // JDK-version-specific presence (9+ only): walker must say "absent".
+        "ThreadsSMRSupport", "ThreadsList",
+        // Common integer typedefs HotSpot publishes in gHotSpotVMTypes.
+        "intptr_t", "uintptr_t", "int", "jint", "jlong", "size_t",
+    };
+
+    bool all_null{ true };
+    int count{ 0 };
+    for (const char* const n : names)
+    {
+        ++count;
+        if (iterate_type_entries(n) != nullptr)
+        {
+            all_null = false;
+            std::printf("  type surface %s returned non-null\n", n);
+        }
+    }
+    check("complete_type_query_surface_all_null", all_null);
+    check("complete_type_query_surface_count_ge_25", count >= 25);
+}
+
+// ---------------------------------------------------------------------------
+// 22. clamp_safe_container_count — power-of-two ladder and bit-adjacent values.
+//
+// Every power of two from 2^0 up to 2^23 is strictly below the cap (2^24) and
+// must pass through as identity; 2^24 is exactly the cap; 2^25..2^30 saturate.
+// Around each power of two the values 2^k-1 and 2^k+1 must follow the same
+// piecewise rule.  This walks the clamp across every binary order of magnitude,
+// pinning that no individual bit position trips an off-by-one in the < cap test.
+// ---------------------------------------------------------------------------
+static auto test_clamp_power_of_two_ladder() -> void
+{
+    using vmhook::clamp_safe_container_count;
+
+    auto spec = [](std::int64_t raw) -> std::int32_t
+    {
+        if (raw <= 0) { return 0; }
+        return (raw < static_cast<std::int64_t>(k_cap)) ? static_cast<std::int32_t>(raw) : k_cap;
+    };
+
+    bool ladder_ok{ true };
+    // 2^0 .. 2^30 (2^31 would be negative as int32 / == INT32_MIN, covered in
+    // the boundary table); each value AND its +/-1 neighbours.
+    for (int k{ 0 }; k <= 30; ++k)
+    {
+        const std::int64_t pow{ static_cast<std::int64_t>(1) << k };
+        const std::int64_t probes[]{ pow - 1, pow, pow + 1 };
+        for (const std::int64_t v : probes)
+        {
+            if (v < (std::numeric_limits<std::int32_t>::min)()
+                || v > (std::numeric_limits<std::int32_t>::max)())
+            {
+                continue;
+            }
+            const std::int32_t got{ clamp_safe_container_count(static_cast<std::int32_t>(v)) };
+            if (got != spec(v)) { ladder_ok = false; }
+            if (got < 0 || got > k_cap) { ladder_ok = false; }
+        }
+    }
+    check("clamp_power_of_two_ladder_matches_spec", ladder_ok);
+
+    // Spot the three regimes explicitly at the powers straddling the cap.
+    check("clamp_2pow23_identity", clamp_safe_container_count(1 << 23) == (1 << 23));
+    check("clamp_2pow24_is_cap", clamp_safe_container_count(1 << 24) == k_cap);
+    check("clamp_2pow24_equals_cap_constant", (1 << 24) == k_cap);
+    check("clamp_2pow25_saturates", clamp_safe_container_count(1 << 25) == k_cap);
+    check("clamp_2pow30_saturates", clamp_safe_container_count(1 << 30) == k_cap);
+}
+
+// ---------------------------------------------------------------------------
+// 23. clamp_safe_container_count — exhaustive dense sweep of the low region.
+//
+// The honest-container regime is [0, cap]; the overwhelming majority of real
+// container counts live in the first few thousand.  Sweep EVERY integer in
+// [-1, 8192] (so the sign boundary at 0 and the small-positive identity region
+// are covered with no gaps) and require the result equals the input (clamped at
+// 0 for the single negative) — a contiguous, exhaustive identity proof over the
+// realistic input band, not just sampled points.
+// ---------------------------------------------------------------------------
+static auto test_clamp_dense_low_region() -> void
+{
+    using vmhook::clamp_safe_container_count;
+
+    bool ok{ true };
+    for (std::int32_t v{ -1 }; v <= 8192; ++v)
+    {
+        const std::int32_t expected{ v <= 0 ? 0 : v };
+        if (clamp_safe_container_count(v) != expected) { ok = false; break; }
+    }
+    check("clamp_dense_low_region_exhaustive_identity", ok);
+
+    // Also sweep a dense window at the very top of the honest range, just below
+    // the cap, where the identity must still hold to the last integer.
+    bool top_ok{ true };
+    for (std::int32_t v{ k_cap - 4096 }; v < k_cap; ++v)
+    {
+        if (clamp_safe_container_count(v) != v) { top_ok = false; break; }
+    }
+    check("clamp_dense_just_below_cap_identity", top_ok);
+}
+
+// ---------------------------------------------------------------------------
+// 24. The cap as the WALK bound: tie clamp_safe_container_count /
+//     k_max_safe_container_elems to the actual iteration caps in the library.
+//
+// The tree-map and tree-set walkers cap their left-spine descent at
+// `k_descend_cap = static_cast<int32>(k_max_safe_container_elems)` (a literal
+// back-edge / cycle / runaway-walk guard), and the HashMap/HashSet bucket walks
+// clamp the bucket count with clamp_safe_container_count.  Reconstruct those
+// exact expressions here and assert the cap value the walkers bound to is the
+// same constant the clamp saturates to — so a change to the cap moves BOTH the
+// reservation clamp and the walk cap together, and the walk can never be told to
+// iterate more than `cap` times no matter how corrupt the count.
+// ---------------------------------------------------------------------------
+static auto test_cap_is_the_walk_bound() -> void
+{
+    using vmhook::clamp_safe_container_count;
+    using vmhook::k_max_safe_container_elems;
+
+    // Reconstruct the walkers' descend cap exactly.
+    constexpr std::int32_t k_descend_cap{
+        static_cast<std::int32_t>(k_max_safe_container_elems) };
+
+    check("walk_descend_cap_equals_signed_cap", k_descend_cap == k_cap);
+    check("walk_descend_cap_positive", k_descend_cap > 0);
+
+    // The clamp can never yield a bound above the walk cap: for the most corrupt
+    // possible count (INT32_MAX) the clamp result equals the descend cap, so a
+    // count-driven loop bounded by the clamp and a pointer-walk bounded by
+    // k_descend_cap stop at the same ceiling.
+    check("clamp_max_equals_walk_cap",
+          clamp_safe_container_count((std::numeric_limits<std::int32_t>::max)()) == k_descend_cap);
+
+    // A descent counter `for (descended=0; descended < k_descend_cap; ++descended)`
+    // terminates: the loop variable is int32 and the bound is positive and
+    // representable, so descended reaches k_descend_cap and the loop exits (it
+    // cannot wrap before then because k_descend_cap < INT32_MAX).
+    check("walk_descend_cap_below_int32_max",
+          static_cast<std::int64_t>(k_descend_cap)
+              < static_cast<std::int64_t>((std::numeric_limits<std::int32_t>::max)()));
+
+    // HashMap/HashSet bucket clamp: a corrupt bucket count saturates to the cap,
+    // a torn-negative one collapses to 0 (no buckets walked), an honest one is
+    // verbatim — the three regimes that bound those table walks.
+    check("bucket_clamp_corrupt_saturates",
+          clamp_safe_container_count(2000000000) == k_cap);
+    check("bucket_clamp_negative_is_zero",
+          clamp_safe_container_count(-2000000000) == 0);
+    check("bucket_clamp_honest_verbatim",
+          clamp_safe_container_count(4096) == 4096);
+
+    // constexpr context: the descend cap is usable as a constant expression
+    // (the walkers declare it `constexpr`), proving it folds at compile time.
+    static_assert(k_descend_cap == static_cast<std::int32_t>(1ull << 24),
+                  "k_descend_cap must be the 1<<24 cap at compile time");
+    check("walk_descend_cap_constexpr", true);
+}
+
+// ---------------------------------------------------------------------------
+// 25. Single-byte name fuzz: EVERY non-NUL byte value (1..255) as a one-char
+//     type name and as a one-char field name.  A const char* cannot carry an
+//     embedded NUL, so 0 is excluded; every other byte forms a legal one-char
+//     C-string.  None can match the (empty) array, and the walker must never
+//     fault on any byte value — covering the full single-character input domain.
+// ---------------------------------------------------------------------------
+static auto test_single_byte_name_fuzz_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    bool all_null{ true };
+    for (int b{ 1 }; b <= 255; ++b)
+    {
+        char name[2]{ static_cast<char>(b), '\0' };
+        if (iterate_type_entries(name) != nullptr) { all_null = false; }
+        if (iterate_struct_entries(name, "_length") != nullptr) { all_null = false; }
+        if (iterate_struct_entries("Symbol", name) != nullptr) { all_null = false; }
+        if (iterate_struct_entries(name, name) != nullptr) { all_null = false; }
+    }
+    check("single_byte_name_fuzz_all_null", all_null);
+}
+
+// ---------------------------------------------------------------------------
+// 26. Control-character names: every ASCII control byte 0x01..0x1F plus DEL
+//     (0x7F) embedded mid-name, and a name made entirely of control bytes.
+//     HotSpot symbol names are printable ASCII, so these never match; the
+//     walker must tolerate them without faulting.  (NUL 0x00 excluded — not
+//     representable in a C-string argument.)
+// ---------------------------------------------------------------------------
+static auto test_control_char_names_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    bool all_null{ true };
+    for (int c{ 0x01 }; c <= 0x1F; ++c)
+    {
+        char mid[8]{ 'M', static_cast<char>(c), 'e', 't', 'h', static_cast<char>(c), '\0' };
+        if (iterate_type_entries(mid) != nullptr) { all_null = false; }
+        if (iterate_struct_entries(mid, "_length") != nullptr) { all_null = false; }
+        if (iterate_struct_entries("Symbol", mid) != nullptr) { all_null = false; }
+    }
+    // DEL byte.
+    {
+        char del_name[6]{ 'S', 'y', 'm', static_cast<char>(0x7F), 'b', '\0' };
+        if (iterate_type_entries(del_name) != nullptr) { all_null = false; }
+        if (iterate_struct_entries(del_name, "_x") != nullptr) { all_null = false; }
+    }
+    // All-control-byte name.
+    {
+        char all_ctrl[5]{ 0x01, 0x02, 0x03, 0x04, '\0' };
+        if (iterate_type_entries(all_ctrl) != nullptr) { all_null = false; }
+        if (iterate_struct_entries(all_ctrl, all_ctrl) != nullptr) { all_null = false; }
+    }
+    check("control_char_names_all_null", all_null);
+}
+
+// ---------------------------------------------------------------------------
+// 27. Substring / rotation / repetition near-misses of real symbol names.
+//
+// strcmp is whole-string and exact, so a substring of a real name, a rotation
+// of its characters, a doubled name, or a real name with a trailing/leading
+// extra token must NOT match.  These are the trickiest "almost real" inputs;
+// with no JVM all are nullptr, pinning that no prefix/substring/normalization
+// matching ever sneaks in.
+// ---------------------------------------------------------------------------
+static auto test_substring_rotation_near_misses_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    static const char* const type_near_misses[]{
+        "Metho",            // prefix of Method
+        "ethod",            // suffix of Method
+        "etho",             // interior substring
+        "MethodMethod",     // doubled
+        "Method2",          // trailing digit
+        "2Method",          // leading digit
+        "dohteM",           // reversed
+        "InstanceKlas",     // prefix of InstanceKlass
+        "InstanceKlasss",   // extra trailing char
+        "Instance Klass",   // embedded space
+        "Const_Method",     // underscore where none belongs
+        "constantpool",     // all-lowercase real name
+    };
+    bool type_null{ true };
+    for (const char* const t : type_near_misses)
+    {
+        if (iterate_type_entries(t) != nullptr) { type_null = false; }
+        if (iterate_struct_entries(t, "_length") != nullptr) { type_null = false; }
+    }
+    check("substring_rotation_type_near_misses_all_null", type_null);
+
+    static const char* const field_near_misses[]{
+        "constMethod",      // _constMethod without underscore
+        "__constMethod",    // doubled underscore
+        "_constMethod ",    // trailing space
+        "_constMethodd",    // doubled last char
+        "_const",           // prefix
+        "Method",           // type name as field
+        "_CONSTMETHOD",     // upper-case
+        "_const_method",    // snake instead of camel
+        "_constMethod\t",   // trailing tab
+    };
+    bool field_null{ true };
+    for (const char* const f : field_near_misses)
+    {
+        if (iterate_struct_entries("Method", f) != nullptr) { field_null = false; }
+    }
+    check("substring_field_near_misses_all_null", field_null);
+}
+
+// ---------------------------------------------------------------------------
+// 28. type_name / field_name slot independence — broader cross product.
+//
+// Each argument is matched against its OWN array column (type_name vs
+// field_name), so a real field placed in the type slot, a real type in the
+// field slot, or two reals from DIFFERENT entries must not match.  Enumerate a
+// matrix of {real type, real field, mismatched pair, both-swapped} and require
+// every cell is nullptr — pinning the two arguments never cross-contaminate.
+// ---------------------------------------------------------------------------
+static auto test_slot_independence_matrix_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+
+    static const char* const real_types[]{ "Symbol", "Method", "Klass", "oopDesc" };
+    static const char* const real_fields[]{ "_length", "_constMethod", "_name", "_mark" };
+
+    bool all_null{ true };
+    // type-in-field-slot and field-in-type-slot, full cross product.
+    for (const char* const t : real_types)
+    {
+        for (const char* const f : real_fields)
+        {
+            // Correct shape (real type, real field) — null (no JVM), but also
+            // the swapped shape (field as type, type as field) — must be null.
+            if (iterate_struct_entries(t, f) != nullptr) { all_null = false; }
+            if (iterate_struct_entries(f, t) != nullptr) { all_null = false; }
+            // type in BOTH slots, field in BOTH slots.
+            if (iterate_struct_entries(t, t) != nullptr) { all_null = false; }
+            if (iterate_struct_entries(f, f) != nullptr) { all_null = false; }
+        }
+    }
+    check("slot_independence_matrix_all_null", all_null);
+}
+
+// ---------------------------------------------------------------------------
+// 29. Maximal interleave stress + first-call-order characterization.
+//
+// Mix all four entry points (both getters, both walkers) with the clamp and the
+// module getter in one tight loop, asserting the joint invariant (all null /
+// stable / clamp correct) holds under heavy interleaving.  Also CHARACTERIZE
+// (as [INFO], never a hard assert) the documented order-of-first-call caching
+// behaviour (the getters cache the FIRST resolution permanently): here the
+// cache was necessarily seeded null by earlier sections, and stays null — we
+// report it rather than assert a particular recovery semantics, which is a
+// known library property, not a bug to gate on.
+// ---------------------------------------------------------------------------
+static auto test_maximal_interleave_and_cache_order() -> void
+{
+    using vmhook::hotspot::get_jvm_module;
+    using vmhook::hotspot::get_vm_structs;
+    using vmhook::hotspot::get_vm_types;
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    bool ok{ true };
+    for (int i{ 0 }; i < 256; ++i)
+    {
+        if (get_jvm_module() != nullptr) { ok = false; }
+        if (get_vm_structs() != nullptr) { ok = false; }
+        if (get_vm_types() != nullptr) { ok = false; }
+        if (iterate_struct_entries("Symbol", "_length") != nullptr) { ok = false; }
+        if (iterate_struct_entries(nullptr, nullptr) != nullptr) { ok = false; }
+        if (iterate_type_entries("Klass") != nullptr) { ok = false; }
+        if (iterate_type_entries("") != nullptr) { ok = false; }
+        const std::int32_t c{ vmhook::clamp_safe_container_count(i - 8) };
+        if (c != ((i - 8) <= 0 ? 0 : (i - 8))) { ok = false; }
+    }
+    check("maximal_interleave_all_consistent", ok);
+
+    // [INFO] characterization of the cache-first-resolution property (hazard 3).
+    // Not asserted as pass/fail — it documents the as-built behaviour so a future
+    // change (e.g. re-probe after libjvm load) is a conscious decision.
+    const bool module_cached_null{ get_jvm_module() == nullptr };
+    const bool structs_cached_null{ get_vm_structs() == nullptr };
+    std::printf("[INFO] getter cache (no-JVM, first resolution sticks): "
+                "module=%s structs=%s\n",
+                module_cached_null ? "null" : "non-null",
+                structs_cached_null ? "null" : "non-null");
+}
+
+// ---------------------------------------------------------------------------
+// 30. Determinism fingerprint over the whole real-symbol matrix.
+//
+// Accumulate a fingerprint of the iterate_* results over the complete real
+// query surface, repeated many times, and assert (a) the fingerprint is the
+// all-null fingerprint (every lookup nullptr) and (b) it is byte-identical
+// across every repetition — so the walkers carry no hidden per-call state and
+// the output is fully reproducible (the run-3x-byte-identical guarantee, pinned
+// from inside the test itself).
+// ---------------------------------------------------------------------------
+static auto test_determinism_fingerprint_no_jvm() -> void
+{
+    using vmhook::hotspot::iterate_struct_entries;
+    using vmhook::hotspot::iterate_type_entries;
+
+    struct pair { const char* type; const char* field; };
+    static const pair struct_pairs[]{
+        { "Symbol", "_length" }, { "Method", "_constMethod" },
+        { "Klass", "_name" }, { "oopDesc", "_mark" },
+        { "ConstantPool", "_pool_holder" }, { "InstanceKlass", "_methods" },
+        { "JavaThread", "_thread_state" }, { "CompressedOops", "_base" },
+    };
+    static const char* const type_names[]{
+        "Method", "ConstantPool", "Klass", "narrowOop", "Symbol",
+    };
+
+    auto fingerprint = [&]() -> std::uint64_t
+    {
+        std::uint64_t acc{ 1469598103934665603ull }; // FNV offset basis
+        auto mix = [&](std::uint64_t v)
+        {
+            acc ^= v;
+            acc *= 1099511628211ull;
+        };
+        for (const auto& p : struct_pairs)
+        {
+            mix(reinterpret_cast<std::uintptr_t>(iterate_struct_entries(p.type, p.field)));
+        }
+        for (const char* const n : type_names)
+        {
+            mix(reinterpret_cast<std::uintptr_t>(iterate_type_entries(n)));
+        }
+        return acc;
+    };
+
+    const std::uint64_t first{ fingerprint() };
+    bool stable{ true };
+    for (int i{ 0 }; i < 64; ++i)
+    {
+        if (fingerprint() != first) { stable = false; break; }
+    }
+    check("determinism_fingerprint_stable_across_repeats", stable);
+
+    // The all-null fingerprint: recompute the SAME FNV chain feeding nullptr for
+    // every slot (8 struct + 5 type == 13 mixes) and require it equals `first`,
+    // proving every single lookup returned nullptr (not just that the chain was
+    // stable at some nonzero value).
+    std::uint64_t expected{ 1469598103934665603ull };
+    for (int i{ 0 }; i < 13; ++i)
+    {
+        expected ^= 0ull; // nullptr
+        expected *= 1099511628211ull;
+    }
+    check("determinism_fingerprint_is_all_null", first == expected);
+}
+
 int main()
 {
     test_getters_cache_no_jvm();
@@ -871,6 +1465,18 @@ int main()
     test_near_miss_names_no_jvm();
     test_null_empty_real_permutations();
     test_interleaved_getter_iterator_stress();
+    test_complete_struct_query_surface_no_jvm();
+    test_version_fallback_chains_no_jvm();
+    test_complete_type_query_surface_no_jvm();
+    test_clamp_power_of_two_ladder();
+    test_clamp_dense_low_region();
+    test_cap_is_the_walk_bound();
+    test_single_byte_name_fuzz_no_jvm();
+    test_control_char_names_no_jvm();
+    test_substring_rotation_near_misses_no_jvm();
+    test_slot_independence_matrix_no_jvm();
+    test_maximal_interleave_and_cache_order();
+    test_determinism_fingerprint_no_jvm();
 
     return failures == 0 ? 0 : 1;
 }

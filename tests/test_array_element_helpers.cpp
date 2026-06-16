@@ -1490,6 +1490,661 @@ static auto test_compile_time_arithmetic() -> void
     }
 }
 
+// ===========================================================================
+// EXHAUSTIVE VALUE-DIMENSION EXPANSION (26-33).  Sections 1-25 exhaust the
+// INDEX / offset / bounds / guard dimensions; the element VALUE that travels
+// through the memcpy was only spot-sampled (a few ordinary numbers per width).
+// The helpers copy sizeof(T) bytes verbatim, so the value contract is "every
+// bit pattern of T survives a set->get round trip byte-identically, and is
+// deposited at exactly the oracle offset".  The sections below pin that across
+// the FULL value space: literally all 256 1-byte and all 65536 2-byte patterns,
+// every single-bit and boundary pattern for 4/8-byte widths, and the complete
+// IEEE-754 special-value set (NaN payloads, +/-0, +/-inf, subnormals) compared
+// by bits (never by ==, which mis-handles NaN and +/-0 — proven below).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 26. IEEE-754 float/double special bit patterns: NaN (quiet/signalling/payload),
+//     +/-0, +/-inf, smallest/largest subnormal, smallest normal, max, lowest,
+//     epsilon.  Each must round-trip BIT-EXACT through set->get (the helper does
+//     a raw sizeof(T) memcpy, so every pattern — including non-canonical NaNs —
+//     must survive unchanged).  Comparison is by raw bits, because:
+//       * NaN == NaN is FALSE, so an == round-trip check would wrongly FAIL even
+//         on a perfectly preserved NaN;
+//       * (-0.0) == (+0.0) is TRUE, so an == check would wrongly PASS even if a
+//         stride bug swapped -0 for +0 (different sign bit).
+//     We assert both of those facts explicitly so the rationale for bits_equal
+//     (used throughout this file) is itself tested, then prove the helpers
+//     preserve the sign bit of zero and the exact NaN payload bits.
+// ---------------------------------------------------------------------------
+static_assert(std::numeric_limits<float>::is_iec559,
+              "section 26 assumes IEEE-754 binary32 for deterministic special-value bit patterns");
+static_assert(std::numeric_limits<double>::is_iec559,
+              "section 26 assumes IEEE-754 binary64 for deterministic special-value bit patterns");
+static_assert(sizeof(float) == sizeof(std::uint32_t), "binary32 must alias uint32 for bit construction");
+static_assert(sizeof(double) == sizeof(std::uint64_t), "binary64 must alias uint64 for bit construction");
+
+// Build a float/double from an explicit IEEE-754 bit pattern (deterministic and
+// cross-platform under is_iec559; std::nan() payloads are impl-defined, so we
+// lay the bits down ourselves instead).
+static auto f32_from_bits(std::uint32_t bits) noexcept -> float
+{
+    float f{};
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+static auto f64_from_bits(std::uint64_t bits) noexcept -> double
+{
+    double d{};
+    std::memcpy(&d, &bits, sizeof(d));
+    return d;
+}
+static auto bits_of_f32(float f) noexcept -> std::uint32_t
+{
+    std::uint32_t bits{};
+    std::memcpy(&bits, &f, sizeof(bits));
+    return bits;
+}
+static auto bits_of_f64(double d) noexcept -> std::uint64_t
+{
+    std::uint64_t bits{};
+    std::memcpy(&bits, &d, sizeof(bits));
+    return bits;
+}
+
+static auto test_float_special_values() -> void
+{
+    // ---- Rationale assertions: why this file compares floats by bits. --------
+    // A signalling-vs-quiet distinction and a custom payload are only observable
+    // bit-wise; == collapses them all to "unordered".
+    {
+        const float qnan{ f32_from_bits(0x7FC00000u) };       // canonical quiet NaN
+        // NaN != NaN under IEEE ordering, yet its bits equal themselves.
+        check("f32_nan_not_eq_self_under_operator_eq", !(qnan == qnan)); // NOLINT
+        check("f32_nan_bits_equal_self", bits_equal(qnan, qnan));
+
+        const float neg_zero{ f32_from_bits(0x80000000u) };
+        const float pos_zero{ f32_from_bits(0x00000000u) };
+        // +0 == -0 is TRUE, but their bits differ — bits_equal must distinguish.
+        check("f32_neg_zero_eq_pos_zero_under_operator_eq", neg_zero == pos_zero);
+        check("f32_neg_zero_bits_differ_from_pos_zero", !bits_equal(neg_zero, pos_zero));
+        check("f32_neg_zero_sign_bit_set", bits_of_f32(neg_zero) == 0x80000000u);
+    }
+
+    // ---- float (binary32) special-value round-trip table. --------------------
+    // {label, bit pattern}.  Covers: +/-0, +/-inf, quiet NaN, signalling NaN,
+    // NaN with a non-zero low payload, NaN with sign bit, smallest positive
+    // subnormal, largest subnormal, smallest positive normal, largest finite,
+    // and an all-ones pattern (a negative NaN).
+    struct f32_case { const char* label; std::uint32_t bits; };
+    const f32_case f32_cases[]{
+        { "pos_zero",        0x00000000u },
+        { "neg_zero",        0x80000000u },
+        { "pos_inf",         0x7F800000u },
+        { "neg_inf",         0xFF800000u },
+        { "qnan",            0x7FC00000u },
+        { "snan",            0x7F800001u },  // exponent all-ones, payload nonzero, quiet bit clear
+        { "nan_payload",     0x7FABCDEFu },
+        { "neg_nan",         0xFFC00000u },
+        { "min_subnormal",   0x00000001u },
+        { "max_subnormal",   0x007FFFFFu },
+        { "min_normal",      0x00800000u },
+        { "max_finite",      0x7F7FFFFFu },
+        { "all_ones",        0xFFFFFFFFu },
+    };
+    bool all_f32_roundtrip{ true };
+    bool all_f32_at_oracle{ true };
+    for (const f32_case& c : f32_cases)
+    {
+        const std::vector<float> seed{ 0.0f, 0.0f, 0.0f };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        const float v{ f32_from_bits(c.bits) };
+
+        vmhook::set_array_element<float>(oop, 1, v);
+        // Round-trips bit-exact.
+        if (!bits_equal(vmhook::get_array_element<float>(oop, 1), v)) { all_f32_roundtrip = false; }
+        // Lands at exactly +16 + 1*4, and the raw 4 bytes equal the pattern.
+        // (compare by bits, not float ==: raw_peek<float> == v mis-handles NaN.)
+        if (bits_of_f32(raw_peek<float>(buffer, 1)) != c.bits) { all_f32_at_oracle = false; }
+        // Neighbours (still +0.0) untouched.
+        if (bits_of_f32(vmhook::get_array_element<float>(oop, 0)) != 0u) { all_f32_roundtrip = false; }
+        if (bits_of_f32(vmhook::get_array_element<float>(oop, 2)) != 0u) { all_f32_roundtrip = false; }
+    }
+    check("f32_special_values_roundtrip_bit_exact", all_f32_roundtrip);
+    check("f32_special_values_land_at_oracle_offset", all_f32_at_oracle);
+
+    // Cross-check the constructed specials against <limits> (independent oracle):
+    // the bit patterns we laid down must equal the library's own constants.
+    check("f32_pos_inf_matches_limits",
+          bits_of_f32(f32_from_bits(0x7F800000u)) == bits_of_f32(std::numeric_limits<float>::infinity()));
+    check("f32_max_finite_matches_limits",
+          bits_of_f32(f32_from_bits(0x7F7FFFFFu)) == bits_of_f32((std::numeric_limits<float>::max)()));
+    check("f32_min_normal_matches_limits",
+          bits_of_f32(f32_from_bits(0x00800000u)) == bits_of_f32((std::numeric_limits<float>::min)()));
+    check("f32_min_subnormal_matches_limits",
+          bits_of_f32(f32_from_bits(0x00000001u)) == bits_of_f32(std::numeric_limits<float>::denorm_min()));
+    check("f32_lowest_matches_neg_max_finite",
+          bits_of_f32(std::numeric_limits<float>::lowest()) == 0xFF7FFFFFu);
+
+    // ---- double (binary64) special-value round-trip table. -------------------
+    {
+        const double qnan{ f64_from_bits(0x7FF8000000000000ull) };
+        check("f64_nan_not_eq_self_under_operator_eq", !(qnan == qnan)); // NOLINT
+        check("f64_nan_bits_equal_self", bits_equal(qnan, qnan));
+        const double neg_zero{ f64_from_bits(0x8000000000000000ull) };
+        const double pos_zero{ f64_from_bits(0x0000000000000000ull) };
+        check("f64_neg_zero_eq_pos_zero_under_operator_eq", neg_zero == pos_zero);
+        check("f64_neg_zero_bits_differ_from_pos_zero", !bits_equal(neg_zero, pos_zero));
+    }
+
+    struct f64_case { const char* label; std::uint64_t bits; };
+    const f64_case f64_cases[]{
+        { "pos_zero",        0x0000000000000000ull },
+        { "neg_zero",        0x8000000000000000ull },
+        { "pos_inf",         0x7FF0000000000000ull },
+        { "neg_inf",         0xFFF0000000000000ull },
+        { "qnan",            0x7FF8000000000000ull },
+        { "snan",            0x7FF0000000000001ull },
+        { "nan_payload",     0x7FF123456789ABCDull },
+        { "neg_nan",         0xFFF8000000000000ull },
+        { "min_subnormal",   0x0000000000000001ull },
+        { "max_subnormal",   0x000FFFFFFFFFFFFFull },
+        { "min_normal",      0x0010000000000000ull },
+        { "max_finite",      0x7FEFFFFFFFFFFFFFull },
+        { "all_ones",        0xFFFFFFFFFFFFFFFFull },
+    };
+    bool all_f64_roundtrip{ true };
+    bool all_f64_at_oracle{ true };
+    for (const f64_case& c : f64_cases)
+    {
+        const std::vector<double> seed{ 0.0, 0.0, 0.0 };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        const double v{ f64_from_bits(c.bits) };
+
+        vmhook::set_array_element<double>(oop, 1, v);
+        if (!bits_equal(vmhook::get_array_element<double>(oop, 1), v)) { all_f64_roundtrip = false; }
+        if (bits_of_f64(raw_peek<double>(buffer, 1)) != c.bits) { all_f64_at_oracle = false; }
+        if (bits_of_f64(vmhook::get_array_element<double>(oop, 0)) != 0ull) { all_f64_roundtrip = false; }
+        if (bits_of_f64(vmhook::get_array_element<double>(oop, 2)) != 0ull) { all_f64_roundtrip = false; }
+    }
+    check("f64_special_values_roundtrip_bit_exact", all_f64_roundtrip);
+    check("f64_special_values_land_at_oracle_offset", all_f64_at_oracle);
+
+    check("f64_pos_inf_matches_limits",
+          bits_of_f64(f64_from_bits(0x7FF0000000000000ull)) == bits_of_f64(std::numeric_limits<double>::infinity()));
+    check("f64_max_finite_matches_limits",
+          bits_of_f64(f64_from_bits(0x7FEFFFFFFFFFFFFFull)) == bits_of_f64((std::numeric_limits<double>::max)()));
+    check("f64_min_normal_matches_limits",
+          bits_of_f64(f64_from_bits(0x0010000000000000ull)) == bits_of_f64((std::numeric_limits<double>::min)()));
+    check("f64_min_subnormal_matches_limits",
+          bits_of_f64(f64_from_bits(0x0000000000000001ull)) == bits_of_f64(std::numeric_limits<double>::denorm_min()));
+    check("f64_lowest_matches_neg_max_finite",
+          bits_of_f64(std::numeric_limits<double>::lowest()) == 0xFFEFFFFFFFFFFFFFull);
+}
+
+// ---------------------------------------------------------------------------
+// 27. Per-width integer VALUE-pattern table: 0, all-ones, sign-bit-only,
+//     INT/LONG min & max, alternating 0x55../0xAA.., 0x01/0x80, and a walking
+//     single-bit across EVERY bit position of the width.  Each pattern must
+//     round-trip bit-exact and land at the oracle offset.  Aggregated into one
+//     pass/width so the (pattern x width) matrix is exhaustive without flooding
+//     output.  Independent oracle: raw_peek at +16+i*sizeof(T).
+// ---------------------------------------------------------------------------
+template<typename T>
+static auto exercise_value_patterns(const char* label_prefix) -> void
+{
+    static_assert(std::is_integral_v<T>, "value-pattern sweep is for integer widths");
+    auto tag{ [&](const char* suffix)
+    {
+        static thread_local char storage[112];
+        std::snprintf(storage, sizeof(storage), "%s_%s", label_prefix, suffix);
+        return storage;
+    } };
+
+    using U = std::make_unsigned_t<T>;
+    constexpr int width_bits{ static_cast<int>(sizeof(T) * 8u) };
+
+    // Fixed canonical patterns (built in the unsigned domain, then bit-cast to T).
+    std::vector<U> patterns{
+        U{ 0 },
+        static_cast<U>(~U{ 0 }),                                   // all ones
+        static_cast<U>(U{ 1 } << (width_bits - 1)),               // sign bit only (== 0x80..)
+        static_cast<U>((U{ 1 } << (width_bits - 1)) - U{ 1 }),    // max positive magnitude (0x7F..)
+        U{ 1 },                                                   // low bit only (0x..01)
+    };
+    // Alternating 0x55.. and 0xAA.. spanning the full width.
+    {
+        U a{ 0 };
+        U b{ 0 };
+        for (int byte{ 0 }; byte < static_cast<int>(sizeof(T)); ++byte)
+        {
+            a = static_cast<U>(a | (static_cast<U>(0x55u) << (byte * 8)));
+            b = static_cast<U>(b | (static_cast<U>(0xAAu) << (byte * 8)));
+        }
+        patterns.push_back(a);
+        patterns.push_back(b);
+    }
+    // Walking single bit across every bit position.
+    for (int bit{ 0 }; bit < width_bits; ++bit)
+    {
+        patterns.push_back(static_cast<U>(U{ 1 } << bit));
+    }
+
+    bool all_roundtrip{ true };
+    bool all_at_oracle{ true };
+    for (const U raw : patterns)
+    {
+        T value{};
+        std::memcpy(&value, &raw, sizeof(T));   // bit-cast unsigned pattern -> T
+
+        const std::vector<T> seed(3u, T{});
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+
+        vmhook::set_array_element<T>(oop, 1, value);
+        if (!bits_equal(vmhook::get_array_element<T>(oop, 1), value)) { all_roundtrip = false; break; }
+        if (!bits_equal(raw_peek<T>(buffer, 1), value))               { all_at_oracle = false; break; }
+        // Neighbours stay zero (stride exactness for this value).
+        if (!bits_equal(vmhook::get_array_element<T>(oop, 0), T{}))   { all_roundtrip = false; break; }
+        if (!bits_equal(vmhook::get_array_element<T>(oop, 2), T{}))   { all_roundtrip = false; break; }
+    }
+    check(tag("value_patterns_roundtrip_bit_exact"), all_roundtrip);
+    check(tag("value_patterns_land_at_oracle"), all_at_oracle);
+
+    // Explicit numeric_limits endpoints as a cross-checked independent oracle:
+    // min() and max() of T must round-trip to exactly those values.
+    {
+        const std::vector<T> seed(2u, T{});
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        const T tmin{ (std::numeric_limits<T>::min)() };
+        const T tmax{ (std::numeric_limits<T>::max)() };
+        vmhook::set_array_element<T>(oop, 0, tmin);
+        vmhook::set_array_element<T>(oop, 1, tmax);
+        check(tag("limits_min_max_roundtrip"),
+              vmhook::get_array_element<T>(oop, 0) == tmin
+              && vmhook::get_array_element<T>(oop, 1) == tmax);
+    }
+}
+
+static auto test_integer_value_patterns() -> void
+{
+    exercise_value_patterns<std::uint8_t>("vp_u8");
+    exercise_value_patterns<std::int8_t>("vp_i8");
+    exercise_value_patterns<std::uint16_t>("vp_u16");
+    exercise_value_patterns<std::int16_t>("vp_i16");
+    exercise_value_patterns<std::uint32_t>("vp_u32");
+    exercise_value_patterns<std::int32_t>("vp_i32");
+    exercise_value_patterns<std::uint64_t>("vp_u64");
+    exercise_value_patterns<std::int64_t>("vp_i64");
+}
+
+// ---------------------------------------------------------------------------
+// 28. EXHAUSTIVE 1-byte value space: ALL 256 byte values round-trip through the
+//     1-byte element types.  This is literally "every possible input" for the
+//     value dimension at a 1-byte stride.  For each value we set->get and also
+//     confirm the raw backing byte equals the low 8 bits, and that the helper
+//     write touched ONLY the target byte (the slack neighbour stays zero).
+//     char's signedness is platform-defined, so we compare round-tripped values
+//     of the SAME type (signedness-agnostic) and verify the stored byte equals
+//     the value reinterpreted to its 8 raw bits.
+// ---------------------------------------------------------------------------
+template<typename T>
+static auto exhaustive_byte_values(const char* label) -> void
+{
+    static_assert(sizeof(T) == 1, "exhaustive_byte_values is for 1-byte element types");
+    // Two element slots so a write to index 0 can be checked against an
+    // untouched index 1.
+    const std::vector<T> seed{ T{}, T{} };
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    bool ok{ true };
+    for (int v{ 0 }; v <= 255 && ok; ++v)
+    {
+        const std::uint8_t raw_byte{ static_cast<std::uint8_t>(v) };
+        T value{};
+        std::memcpy(&value, &raw_byte, 1u);
+
+        // reset the neighbour so we can detect any spill.
+        vmhook::set_array_element<T>(oop, 1, T{});
+        vmhook::set_array_element<T>(oop, 0, value);
+
+        if (!bits_equal(vmhook::get_array_element<T>(oop, 0), value)) { ok = false; break; }
+        // Raw backing byte at +16 equals the value's 8 bits.
+        std::uint8_t stored{};
+        std::memcpy(&stored, buffer.data() + 16, 1u);
+        if (stored != raw_byte) { ok = false; break; }
+        // Neighbour byte at +17 untouched (still zero).
+        std::uint8_t neighbour{};
+        std::memcpy(&neighbour, buffer.data() + 17, 1u);
+        if (neighbour != 0u) { ok = false; break; }
+    }
+    check(label, ok);
+}
+
+static auto test_exhaustive_byte_values() -> void
+{
+    exhaustive_byte_values<std::uint8_t>("exhaustive_all_256_u8");
+    exhaustive_byte_values<std::int8_t>("exhaustive_all_256_i8");
+    exhaustive_byte_values<char>("exhaustive_all_256_char");
+    exhaustive_byte_values<signed char>("exhaustive_all_256_schar");
+    exhaustive_byte_values<unsigned char>("exhaustive_all_256_uchar");
+
+    // bool: only the two canonical states are well-defined to observe; cover both.
+    {
+        const std::vector<std::uint8_t> seed{ 0u, 0u };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        vmhook::set_array_element<bool>(oop, 0, false);
+        const bool got_false{ vmhook::get_array_element<bool>(oop, 0) == false };
+        vmhook::set_array_element<bool>(oop, 0, true);
+        const bool got_true{ vmhook::get_array_element<bool>(oop, 0) == true };
+        check("exhaustive_bool_both_states", got_false && got_true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 29. EXHAUSTIVE 2-byte value space: ALL 65536 values round-trip through the
+//     2-byte element types (uint16/int16/char16_t).  Feasible and fast; this is
+//     "every possible input" for the value dimension at a 2-byte stride.  Each
+//     value is verified bit-exact via the helper AND against the raw little-/
+//     big-endian-agnostic typed read at the oracle offset (we compare the
+//     correctly-typed read, never raw byte order).
+// ---------------------------------------------------------------------------
+template<typename T>
+static auto exhaustive_u16_values(const char* label) -> void
+{
+    static_assert(sizeof(T) == 2, "exhaustive_u16_values is for 2-byte element types");
+    const std::vector<T> seed{ T{}, T{} };
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    bool ok{ true };
+    for (int v{ 0 }; v <= 0xFFFF && ok; ++v)
+    {
+        const std::uint16_t raw16{ static_cast<std::uint16_t>(v) };
+        T value{};
+        std::memcpy(&value, &raw16, 2u);
+
+        vmhook::set_array_element<T>(oop, 1, T{});      // clear neighbour
+        vmhook::set_array_element<T>(oop, 0, value);
+
+        if (!bits_equal(vmhook::get_array_element<T>(oop, 0), value)) { ok = false; break; }
+        // Typed oracle read at +16 (value-level, endianness-agnostic).
+        if (!bits_equal(raw_peek<T>(buffer, 0), value)) { ok = false; break; }
+        // Neighbour slot (index 1, +18) still zero — no 2-byte spill.
+        if (!bits_equal(vmhook::get_array_element<T>(oop, 1), T{})) { ok = false; break; }
+    }
+    check(label, ok);
+}
+
+static auto test_exhaustive_u16_values() -> void
+{
+    exhaustive_u16_values<std::uint16_t>("exhaustive_all_65536_u16");
+    exhaustive_u16_values<std::int16_t>("exhaustive_all_65536_i16");
+    exhaustive_u16_values<char16_t>("exhaustive_all_65536_c16");
+}
+
+// ---------------------------------------------------------------------------
+// 30. 4-byte and 8-byte value space: the full 2^32 / 2^64 spaces are too large
+//     to enumerate, so cover the structurally-complete subset — every single-bit
+//     pattern (32 / 64 of them), every "all bits below position k" run, the
+//     alternating patterns, and the min/max/zero/all-ones endpoints — each
+//     round-tripped bit-exact and verified at the oracle offset.  A stride or
+//     truncation bug at these widths surfaces as a wrong byte in some bit.
+// ---------------------------------------------------------------------------
+template<typename UInt, typename T>
+static auto wide_bit_patterns(const char* label) -> void
+{
+    static_assert(sizeof(UInt) == sizeof(T), "unsigned shadow must match element width");
+    const std::vector<T> seed{ T{}, T{}, T{} };
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    constexpr int width_bits{ static_cast<int>(sizeof(UInt) * 8u) };
+    std::vector<UInt> patterns;
+    patterns.push_back(UInt{ 0 });
+    patterns.push_back(static_cast<UInt>(~UInt{ 0 }));
+    for (int bit{ 0 }; bit < width_bits; ++bit)
+    {
+        patterns.push_back(static_cast<UInt>(UInt{ 1 } << bit));                 // single bit
+        patterns.push_back(static_cast<UInt>((UInt{ 1 } << bit) - UInt{ 1 }));   // low run of 'bit' ones
+    }
+    // Alternating nibble patterns spanning the full width.
+    {
+        UInt a{ 0 };
+        UInt b{ 0 };
+        for (int byte{ 0 }; byte < static_cast<int>(sizeof(UInt)); ++byte)
+        {
+            a = static_cast<UInt>(a | (static_cast<UInt>(0x55u) << (byte * 8)));
+            b = static_cast<UInt>(b | (static_cast<UInt>(0xAAu) << (byte * 8)));
+        }
+        patterns.push_back(a);
+        patterns.push_back(b);
+    }
+
+    bool ok{ true };
+    for (const UInt raw : patterns)
+    {
+        T value{};
+        std::memcpy(&value, &raw, sizeof(T));
+        vmhook::set_array_element<T>(oop, 1, value);
+        if (!bits_equal(vmhook::get_array_element<T>(oop, 1), value)) { ok = false; break; }
+        if (!bits_equal(raw_peek<T>(buffer, 1), value))               { ok = false; break; }
+        // Both neighbours independent of this slot.
+        if (!bits_equal(vmhook::get_array_element<T>(oop, 0), T{}))   { ok = false; break; }
+        if (!bits_equal(vmhook::get_array_element<T>(oop, 2), T{}))   { ok = false; break; }
+        // Restore neighbour-free state for the next pattern.
+        vmhook::set_array_element<T>(oop, 1, T{});
+    }
+    check(label, ok);
+}
+
+static auto test_wide_bit_patterns() -> void
+{
+    wide_bit_patterns<std::uint32_t, std::uint32_t>("wide_bits_u32");
+    wide_bit_patterns<std::uint32_t, std::int32_t>("wide_bits_i32");
+    wide_bit_patterns<std::uint32_t, float>("wide_bits_f32");
+    wide_bit_patterns<std::uint64_t, std::uint64_t>("wide_bits_u64");
+    wide_bit_patterns<std::uint64_t, std::int64_t>("wide_bits_i64");
+    wide_bit_patterns<std::uint64_t, double>("wide_bits_f64");
+}
+
+// ---------------------------------------------------------------------------
+// 31. FULL (length x index) runtime truth table for lengths 0..8.
+//
+// Section 25 proves the half-open predicate at compile time and section 14 hits
+// representative lengths.  This enumerates EVERY (length, index) cell at runtime
+// for lengths 0..8 and indices -2..length+2, asserting the live helper agrees
+// with the half-open oracle for BOTH read (in-range -> seeded value, else
+// default) and write (in-range -> persists, else no-op), across a 1/4/8-byte
+// width.  A single off-by-one in the bounds check fails some cell here.
+// ---------------------------------------------------------------------------
+template<typename T>
+static auto length_index_truth_table(const char* label) -> void
+{
+    bool ok{ true };
+    for (std::int32_t length{ 0 }; length <= 8 && ok; ++length)
+    {
+        // Seed each slot with a recognisable, distinct value per index.
+        std::vector<T> seed(static_cast<std::size_t>(length), T{});
+        for (std::int32_t i{ 0 }; i < length; ++i)
+        {
+            T v{};
+            const std::uint64_t bits{ 0x0102030405060700ull + static_cast<std::uint64_t>(i) };
+            std::memcpy(&v, &bits, sizeof(T));
+            seed[static_cast<std::size_t>(i)] = v;
+        }
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+
+        if (vmhook::array_length(oop) != length) { ok = false; break; }
+
+        for (std::int32_t idx{ -2 }; idx <= length + 2 && ok; ++idx)
+        {
+            const bool in_range{ layout_oracle::index_in_range(idx, length) };
+
+            // READ: in-range -> the seeded value; out-of-range -> default.
+            const T got{ vmhook::get_array_element<T>(oop, opaque_index(idx)) };
+            if (in_range)
+            {
+                if (!bits_equal(got, seed[static_cast<std::size_t>(idx)])) { ok = false; break; }
+            }
+            else if (!bits_equal(got, T{})) { ok = false; break; }
+
+            // WRITE: snapshot, write a probe, verify persist-iff-in-range.
+            T probe{};
+            const std::uint64_t pbits{ 0xF1F2F3F4F5F6F7F8ull };
+            std::memcpy(&probe, &pbits, sizeof(T));
+            const std::vector<std::uint8_t> before{ buffer };
+            vmhook::set_array_element<T>(oop, opaque_index(idx), probe);
+            if (in_range)
+            {
+                if (!bits_equal(vmhook::get_array_element<T>(oop, idx), probe)) { ok = false; break; }
+                // Restore the seeded value so subsequent reads of this slot are
+                // still predictable for the rest of the row.
+                vmhook::set_array_element<T>(oop, idx, seed[static_cast<std::size_t>(idx)]);
+            }
+            else if (buffer != before) { ok = false; break; } // OOB write must be a no-op
+        }
+    }
+    check(label, ok);
+}
+
+static auto test_length_index_truth_table() -> void
+{
+    length_index_truth_table<std::uint8_t>("truth_table_len0to8_u8");
+    length_index_truth_table<std::int32_t>("truth_table_len0to8_i32");
+    length_index_truth_table<std::int64_t>("truth_table_len0to8_i64");
+}
+
+// ---------------------------------------------------------------------------
+// 32. Exhaustive INDEX bit-walk: every single-bit-set index (1,2,4,...,2^30)
+//     plus the sign bit (INT_MIN) must be REJECTED on a small honest array, and
+//     two's-complement "negative as a raw bit pattern" indices must also be
+//     rejected.  No index bit pattern above the real length may slip past the
+//     [0,length) guard.  We pick length 3 so every power-of-two index >= 4 is
+//     OOB, indices 1 and 2 are in-range (positive control), and 0 is in-range.
+// ---------------------------------------------------------------------------
+static auto test_index_bit_walk() -> void
+{
+    const std::vector<std::int32_t> seed{ 0x11111111, 0x22222222, 0x33333333 };
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    // Positive control: the three in-range indices read their seeded values.
+    check("bitwalk_inrange_controls",
+          vmhook::get_array_element<std::int32_t>(oop, 0) == 0x11111111
+          && vmhook::get_array_element<std::int32_t>(oop, 1) == 0x22222222
+          && vmhook::get_array_element<std::int32_t>(oop, 2) == 0x33333333);
+
+    // Every single-bit index from 2^2 (==4) up through 2^30 is >= length(3),
+    // so must be rejected for read (default) and write (no-op).
+    bool all_high_bits_rejected{ true };
+    const std::vector<std::uint8_t> before{ buffer };
+    for (int bit{ 2 }; bit <= 30; ++bit)
+    {
+        const std::int32_t idx{ static_cast<std::int32_t>(1) << bit };
+        if (vmhook::get_array_element<std::int32_t>(oop, opaque_index(idx)) != 0)
+        {
+            all_high_bits_rejected = false; break;
+        }
+        vmhook::set_array_element<std::int32_t>(oop, opaque_index(idx), 0x7E7E7E7E);
+    }
+    check("bitwalk_high_single_bit_indices_read_default", all_high_bits_rejected);
+    check("bitwalk_high_single_bit_writes_are_noops", buffer == before);
+
+    // The sign bit set (INT_MIN) and several "negative bit patterns" are < 0 and
+    // rejected by the first guard clause.
+    const std::int32_t negatives[]{
+        (std::numeric_limits<std::int32_t>::min)(),   // 0x80000000
+        static_cast<std::int32_t>(0xFFFFFFFFu),       // -1
+        static_cast<std::int32_t>(0xC0000000u),       // large negative
+        static_cast<std::int32_t>(0x80000001u),       // INT_MIN+1
+    };
+    bool all_neg_rejected{ true };
+    const std::vector<std::uint8_t> before2{ buffer };
+    for (const std::int32_t idx : negatives)
+    {
+        if (vmhook::get_array_element<std::int32_t>(oop, opaque_index(idx)) != 0)
+        {
+            all_neg_rejected = false; break;
+        }
+        vmhook::set_array_element<std::int32_t>(oop, opaque_index(idx), 0x5C5C5C5C);
+    }
+    check("bitwalk_negative_indices_read_default", all_neg_rejected);
+    check("bitwalk_negative_writes_are_noops", buffer == before2);
+}
+
+// ---------------------------------------------------------------------------
+// 33. array_length over a SWEEP of stored _length bit patterns, read back as a
+//     signed int32 with no clamping (section 11 covers a few; this sweeps every
+//     single-bit length value and the alternating patterns, cross-checked
+//     against a from-first-principles signed reinterpretation).  Then confirm
+//     the SIGN of the returned length governs element access: a length whose
+//     stored pattern is negative rejects index 0; a small positive length admits
+//     [0,length).  We never index past our real buffer for positive patterns.
+// ---------------------------------------------------------------------------
+static auto test_array_length_bit_sweep() -> void
+{
+    auto length_from_raw{ [](std::uint32_t raw) -> std::int32_t
+    {
+        std::vector<std::uint8_t> buf(16u, std::uint8_t{ 0 });
+        std::memcpy(buf.data() + 12, &raw, sizeof(raw));
+        return vmhook::array_length(buf.data());
+    } };
+
+    // Every single-bit pattern of the 32-bit length slot must read back as the
+    // signed reinterpretation of that exact bit pattern (independent oracle:
+    // static_cast<int32>(raw)).
+    bool all_single_bit_ok{ true };
+    for (int bit{ 0 }; bit < 32; ++bit)
+    {
+        const std::uint32_t raw{ static_cast<std::uint32_t>(1u) << bit };
+        const std::int32_t expected{ static_cast<std::int32_t>(raw) };
+        if (length_from_raw(raw) != expected) { all_single_bit_ok = false; break; }
+    }
+    check("length_every_single_bit_signed_readback", all_single_bit_ok);
+
+    // Alternating and endpoint patterns, each vs the signed reinterpretation.
+    const std::uint32_t raws[]{
+        0x00000000u, 0xFFFFFFFFu, 0x55555555u, 0xAAAAAAAAu,
+        0x7FFFFFFFu, 0x80000000u, 0x0000FFFFu, 0xFFFF0000u, 0x00FF00FFu };
+    bool all_patterns_ok{ true };
+    for (const std::uint32_t raw : raws)
+    {
+        if (length_from_raw(raw) != static_cast<std::int32_t>(raw)) { all_patterns_ok = false; break; }
+    }
+    check("length_alternating_patterns_signed_readback", all_patterns_ok);
+
+    // Sign governs access: a negative stored length (0xAAAAAAAA -> large negative)
+    // rejects index 0; a small positive length (e.g. 0x00000003 with a matching
+    // real buffer) admits [0,3).
+    {
+        // Negative-length case: header-only buffer + tiny data slack.
+        std::vector<std::uint8_t> buf(16u + sizeof(std::int32_t), std::uint8_t{ 0 });
+        const std::uint32_t neg_raw{ 0xAAAAAAAAu };
+        std::memcpy(buf.data() + 12, &neg_raw, sizeof(neg_raw));
+        check("negative_pattern_length_rejects_index0",
+              static_cast<std::int32_t>(neg_raw) < 0
+              && vmhook::get_array_element<std::int32_t>(buf.data(), opaque_index(0)) == 0);
+    }
+    {
+        // Small positive length, fully backed: [0,3) all read their seeds.
+        const std::vector<std::int32_t> seed{ 0x0A0A0A0A, 0x0B0B0B0B, 0x0C0C0C0C };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        check("small_positive_length_admits_full_range",
+              vmhook::array_length(oop) == 3
+              && vmhook::get_array_element<std::int32_t>(oop, 0) == 0x0A0A0A0A
+              && vmhook::get_array_element<std::int32_t>(oop, 2) == 0x0C0C0C0C
+              && vmhook::get_array_element<std::int32_t>(oop, opaque_index(3)) == 0);
+    }
+}
+
 int main()
 {
     test_all_widths();
@@ -1514,6 +2169,14 @@ int main()
     test_length_reads_only_offset12();
     test_clamp_safe_container_count();
     test_compile_time_arithmetic();
+    test_float_special_values();
+    test_integer_value_patterns();
+    test_exhaustive_byte_values();
+    test_exhaustive_u16_values();
+    test_wide_bit_patterns();
+    test_length_index_truth_table();
+    test_index_bit_walk();
+    test_array_length_bit_sweep();
 
     if (failures == 0)
     {
