@@ -66,6 +66,7 @@
 // ONLY the safe guarded paths and the map/factory bookkeeping; no call below can
 // reach a path that dereferences VM state.
 #include <vmhook/vmhook.hpp>
+#include <array>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -74,6 +75,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
@@ -162,6 +164,145 @@ public:
     {
     }
 };
+
+// A fourth distinct wrapper, used by the static-trait contract block and a few
+// extra runtime sections so the per-type keying / factory-distinctness proofs
+// have more than three independent typeids to draw on.
+class registry_delta : public vmhook::object<registry_delta>
+{
+public:
+    explicit registry_delta(vmhook::oop_t oop) noexcept
+        : vmhook::object<registry_delta>{ oop }
+    {
+    }
+};
+
+// ---------------------------------------------------------------------------
+// COMPILE-TIME contracts the register_class factory machinery relies on.
+//
+// register_class<T>() installs `+[](void* p) -> object_base* { return new T{p}; }`
+// and keys the type map by std::type_index{ typeid(T) }.  For that lambda to be
+// well-formed for EVERY wrapper the library can register, each wrapper T must:
+//   (a) derive from vmhook::object_base (so `object_base* = new T{...}` is a
+//       valid upcast and the factory's return type is correct),
+//   (b) derive from the CRTP base vmhook::object<T>,
+//   (c) be constructible from a raw OOP (vmhook::oop_t == void*), which is what
+//       `new T{ instance }` does, and
+//   (d) be a complete, polymorphic type (object_base has a virtual dtor) so the
+//       `delete built;` at the factory consumption site is well-defined.
+// The factory map's value type must be exactly the documented function-pointer
+// signature.  The unique_ptr trait the read-side (extract_frame_arg /
+// jni_signature_for_arg / argument_matches_descriptor) uses to peel the wrapper
+// out of `unique_ptr<W>` must recognise every cv/ref spelling.  None of this
+// needs a JVM — it is all decided by the type system, so we pin it with
+// static_assert: a regression here is a hard compile error, not a silent miss.
+// ---------------------------------------------------------------------------
+
+// (a) every wrapper derives from object_base — the factory's upcast target.
+static_assert(std::is_base_of_v<vmhook::object_base, factory_wrapper>);
+static_assert(std::is_base_of_v<vmhook::object_base, factory_wrapper_with_ctor>);
+static_assert(std::is_base_of_v<vmhook::object_base, registry_alpha>);
+static_assert(std::is_base_of_v<vmhook::object_base, registry_beta>);
+static_assert(std::is_base_of_v<vmhook::object_base, registry_gamma>);
+static_assert(std::is_base_of_v<vmhook::object_base, registry_delta>);
+static_assert(std::is_base_of_v<vmhook::object_base, registry_unmapped>);
+
+// (b) every wrapper derives from its CRTP base vmhook::object<T>.
+static_assert(std::is_base_of_v<vmhook::object<factory_wrapper>, factory_wrapper>);
+static_assert(std::is_base_of_v<vmhook::object<registry_alpha>, registry_alpha>);
+static_assert(std::is_base_of_v<vmhook::object<registry_beta>, registry_beta>);
+static_assert(std::is_base_of_v<vmhook::object<registry_gamma>, registry_gamma>);
+static_assert(std::is_base_of_v<vmhook::object<registry_delta>, registry_delta>);
+static_assert(std::is_base_of_v<vmhook::object<registry_unmapped>, registry_unmapped>);
+// object<T> itself derives from object_base (the chain the factory upcast walks).
+static_assert(std::is_base_of_v<vmhook::object_base, vmhook::object<registry_alpha>>);
+
+// (c) oop-constructibility: the factory body `new T{ instance }` needs exactly
+// this.  vmhook::oop_t is the alias the ctors take; it must be void*.
+static_assert(std::is_same_v<vmhook::oop_t, void*>);
+static_assert(std::is_same_v<vmhook::oop_type_t, void*>);
+static_assert(std::is_constructible_v<factory_wrapper, vmhook::oop_t>);
+static_assert(std::is_constructible_v<registry_alpha, vmhook::oop_t>);
+static_assert(std::is_constructible_v<registry_beta, vmhook::oop_t>);
+static_assert(std::is_constructible_v<registry_gamma, vmhook::oop_t>);
+static_assert(std::is_constructible_v<registry_delta, vmhook::oop_t>);
+static_assert(std::is_constructible_v<registry_unmapped, vmhook::oop_t>);
+// void* and the alias are the same type, and a wrapper is constructible from a
+// literal nullptr (a null Java reference) — both are what the factory may pass.
+static_assert(std::is_constructible_v<registry_alpha, void*>);
+static_assert(std::is_constructible_v<registry_alpha, std::nullptr_t>);
+// The ctor is `explicit`: a wrapper is NOT implicitly convertible FROM a void*
+// (you must say `T{p}`), which is exactly why the factory uses brace-init.
+static_assert(!std::is_convertible_v<void*, registry_alpha>);
+// The ctor takes a pointer, so an int does NOT satisfy it (no int->void*).
+static_assert(!std::is_constructible_v<registry_alpha, int>);
+// The wrapper ctors are declared noexcept, so the factory's `new T{p}` cannot
+// throw from the constructor itself (only operator new could).
+static_assert(std::is_nothrow_constructible_v<registry_alpha, vmhook::oop_t>);
+static_assert(std::is_nothrow_constructible_v<registry_delta, vmhook::oop_t>);
+
+// (d) object_base is polymorphic with a virtual destructor, so deleting a
+// derived wrapper through an object_base* (the factory's return type) is
+// well-defined — this is what every `delete built;` below relies on.
+static_assert(std::is_polymorphic_v<vmhook::object_base>);
+static_assert(std::has_virtual_destructor_v<vmhook::object_base>);
+static_assert(std::is_polymorphic_v<registry_alpha>);
+
+// The factory map's value type is exactly the documented raw function pointer
+// `object_base*(*)(void*)` — NOT a std::function, NOT returning unique_ptr (see
+// the long comment on type_factory_function_t about incomplete-type dtor
+// instantiation).  Pin both the alias and the map's mapped_type.
+static_assert(std::is_same_v<vmhook::type_factory_function_t,
+                             vmhook::object_base* (*)(void*)>);
+static_assert(std::is_same_v<
+    vmhook::type_factory_function_t,
+    std::unordered_map<std::string, vmhook::type_factory_function_t>::mapped_type>);
+static_assert(std::is_pointer_v<vmhook::type_factory_function_t>);
+// The type map is keyed by std::type_index, valued by std::string.
+static_assert(std::is_same_v<
+    std::unordered_map<std::type_index, std::string>::key_type, std::type_index>);
+static_assert(std::is_same_v<
+    decltype(vmhook::type_to_class_map)::mapped_type, std::string>);
+static_assert(std::is_same_v<
+    decltype(vmhook::g_type_factory_map)::key_type, std::string>);
+
+// The unique_ptr trait the read-side uses to peel W out of unique_ptr<W> must
+// recognise every cv/ref spelling that can appear as a hook detour parameter,
+// and report the correct element type.  These back the L<name>; descriptor that
+// extract_frame_arg / jni_signature_for_arg derive for a wrapper argument.
+static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<registry_alpha>>);
+static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<registry_alpha>>);
+static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<registry_alpha>&>);
+static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<registry_alpha>&>);
+static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<registry_alpha>&&>);
+static_assert(!vmhook::detail::is_unique_ptr_v<registry_alpha>);
+static_assert(!vmhook::detail::is_unique_ptr_v<registry_alpha*>);
+static_assert(!vmhook::detail::is_unique_ptr_v<void*>);
+static_assert(!vmhook::detail::is_unique_ptr_v<int>);
+static_assert(std::is_same_v<
+    vmhook::detail::is_unique_ptr<std::unique_ptr<registry_beta>>::value_type_t,
+    registry_beta>);
+
+// The two allocating-and-registration entry points are noexcept exactly as the
+// no-JVM contract documents (a thrown exception escaping into a hook detour
+// would be undefined behaviour).  These are unevaluated operands — nothing is
+// actually called, so no JVM is touched.
+static_assert(noexcept(vmhook::register_class<registry_alpha>(std::string_view{})));
+static_assert(noexcept(vmhook::make_java_string(std::string_view{})));
+static_assert(noexcept(vmhook::make_java_object(nullptr, std::size_t{ 0 })));
+static_assert(noexcept(vmhook::make_java_array(std::string_view{}, 0, 0u, true)));
+static_assert(noexcept(vmhook::get_class_methods<registry_alpha>()));
+static_assert(noexcept(vmhook::find_methods_by_signature<registry_alpha>(std::string_view{})));
+static_assert(noexcept(vmhook::detail::jni_signature_for_arg<registry_alpha>()));
+static_assert(noexcept(vmhook::detail::jni_signature_for_arg<std::unique_ptr<registry_alpha>>()));
+static_assert(noexcept(vmhook::detail::jni_signature_for_arg<int>()));
+// Return types of the factory entry points are exactly as documented.
+static_assert(std::is_same_v<decltype(vmhook::register_class<registry_alpha>(std::string_view{})), bool>);
+static_assert(std::is_same_v<decltype(vmhook::make_java_string(std::string_view{})), void*>);
+static_assert(std::is_same_v<decltype(vmhook::make_java_object(nullptr, std::size_t{ 0 })), void*>);
+static_assert(std::is_same_v<decltype(vmhook::make_java_array(std::string_view{}, 0, 0u, true)), void*>);
+static_assert(std::is_same_v<decltype(vmhook::make_unique<registry_alpha>()), std::unique_ptr<registry_alpha>>);
+static_assert(std::is_same_v<decltype(vmhook::detail::jni_signature_for_arg<int>()), std::string>);
 
 // ---------------------------------------------------------------------------
 // register_class's exact write sequence, reproduced with no JVM.
@@ -263,6 +404,56 @@ static auto sig() -> std::string
     return vmhook::detail::jni_signature_for_arg<arg_t>();
 }
 
+// Invoke a registered factory at `sentinel`, asserting (a) it returns non-null,
+// (b) the produced wrapper round-trips the exact pointer through get_instance(),
+// and (c) its dynamic type is exactly `expected_type` (the registered wrapper).
+// The factory body is only `new W{void*}`, which stores the pointer and touches
+// no VM state, so this is fully no-JVM.  Deletes the wrapper via object_base*
+// (virtual dtor — see the static_assert block).
+template<class expected_type>
+static auto factory_builds(const char* tag,
+                           const vmhook::type_factory_function_t factory,
+                           void* const sentinel) -> void
+{
+    vmhook::object_base* const built{ factory ? factory(sentinel) : nullptr };
+    const bool non_null{ built != nullptr };
+    const bool holds_ptr{ non_null && built->get_instance() == sentinel };
+    const bool right_type{ dynamic_cast<expected_type*>(built) != nullptr };
+    std::string name{ tag };
+    check((name + "_non_null").c_str(), non_null);
+    check((name + "_round_trips_pointer").c_str(), holds_ptr);
+    check((name + "_dynamic_type_matches").c_str(), right_type);
+    delete built;
+}
+
+// register_class<T>(name) with NO JVM: find_class(name) fails FIRST, so the call
+// must return false, never throw, and leave BOTH maps untouched (the type stays
+// absent and the name gets no factory).  Asserts the full no-JVM contract for an
+// arbitrary class-name shape.  Runs inside a map_state_guard at the call site so
+// any sibling-left entry for these never-before-seen names is irrelevant.
+template<class wrapper_type>
+static auto register_class_rejects_no_jvm(const char* tag, const std::string_view name) -> void
+{
+    const std::size_t types_before{ vmhook::type_to_class_map.size() };
+    const std::size_t factory_before{ vmhook::g_type_factory_map.size() };
+
+    bool registered{ true };
+    bool threw{ false };
+    try { registered = vmhook::register_class<wrapper_type>(name); }
+    catch (...) { threw = true; }
+
+    std::string base{ tag };
+    check((base + "_returns_false").c_str(), registered == false);
+    check((base + "_does_not_throw").c_str(), !threw);
+    check((base + "_type_map_size_unchanged").c_str(),
+          vmhook::type_to_class_map.size() == types_before);
+    check((base + "_factory_map_size_unchanged").c_str(),
+          vmhook::g_type_factory_map.size() == factory_before);
+    check((base + "_type_absent").c_str(), !type_is_registered<wrapper_type>());
+    check((base + "_factory_name_absent").c_str(),
+          factory_for_name(std::string{ name }) == nullptr);
+}
+
 // ---------------------------------------------------------------------------
 // make_java_array helpers: every overload arg is exercised, asserting the
 // negative-length guard and the no-JVM find_class failure, and that the call
@@ -362,6 +553,23 @@ int main()
     // the plain find_class() null result.  Must not index class_name.front().
     array_is_null_and_safe("make_java_array_empty_descriptor_zero_len_no_jvm_returns_null", "", 0, sizeof(std::uint8_t), true);
 
+    // Multi-dimensional array descriptors ("[[...") still take the '[' fallback
+    // branch (front()=='['), which itself bails inside ensure_current_java_thread
+    // with no JVM -> nullptr.  Cover a primitive and a reference multi-dim shape.
+    array_is_null_and_safe("make_java_array_2d_int_no_jvm_returns_null", "[[I", 4, sizeof(std::int32_t), true);
+    array_is_null_and_safe("make_java_array_3d_byte_no_jvm_returns_null", "[[[B", 2, sizeof(std::uint8_t), true);
+    array_is_null_and_safe("make_java_array_2d_string_no_jvm_returns_null", "[[Ljava/lang/String;", 2, sizeof(void*), true);
+
+    // element_size is not consulted before the no-JVM bail, so an absurd element
+    // size (0 or enormous) at a non-negative length is still a clean nullptr.
+    array_is_null_and_safe("make_java_array_zero_element_size_no_jvm_returns_null", "[I", 4, 0u, true);
+    array_is_null_and_safe("make_java_array_huge_element_size_no_jvm_returns_null", "[J", 4, static_cast<std::size_t>(1) << 20, true);
+
+    // A maximal positive length still cannot allocate without a JVM (the length
+    // guard only rejects NEGATIVE lengths; INT_MAX passes it, then find_class
+    // fails) — and must not throw or overflow.
+    array_is_null_and_safe("make_java_array_intmax_len_no_jvm_returns_null", "[B", INT_MAX, sizeof(std::uint8_t), true);
+
     // =====================================================================
     // make_java_object — no JVM and argument guards.  noexcept, -> void*.
     // First guard: ensure_current_java_thread() fails with no JVM -> nullptr,
@@ -398,6 +606,18 @@ int main()
         catch (...) { threw = true; }
         check("make_java_object_large_size_no_jvm_returns_null", result == nullptr);
         check("make_java_object_large_size_does_not_throw", !threw);
+    }
+    {
+        // SIZE_MAX requested size: the no-JVM thread guard fires before the
+        // round-up-to-8 arithmetic, so this is a clean nullptr with no overflow
+        // and no throw (a non-null klass would be needed to even reach the
+        // rounding, and we never have one without a JVM).
+        void* result{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1)) };
+        bool  threw{ false };
+        try { result = vmhook::make_java_object(nullptr, std::numeric_limits<std::size_t>::max()); }
+        catch (...) { threw = true; }
+        check("make_java_object_sizemax_no_jvm_returns_null", result == nullptr);
+        check("make_java_object_sizemax_does_not_throw", !threw);
     }
 
     // =====================================================================
@@ -1017,6 +1237,480 @@ int main()
         // The scribble name we added is gone after restore.
         check("R15_scribble_factory_gone_after_restore", factory_for_name("vmhook/test/Scribble") == nullptr);
         check("R15_scribble_type_gone_after_restore", !type_is_registered<registry_beta>());
+    }
+
+    // =====================================================================
+    // R16. jni_signature_for_arg<> EXHAUSTIVE primitive / string descriptor
+    // table.  This is a pure compile-time dispatch (noexcept, no map lookup for
+    // the non-wrapper arms), so it is 100% deterministic with no JVM and every
+    // JVM primitive's descriptor is pinned to its exact one-character token.
+    // These are the exact tokens the library appends when building a method
+    // descriptor for a hook's argument list; a wrong token silently mis-resolves
+    // overloaded methods (the very bug the dispatch table was written to fix).
+    // =====================================================================
+    {
+        // No map mutation happens in this block, but keep the guard so the
+        // section is uniform with its siblings and self-restores regardless.
+        map_state_guard guard{};
+
+        // bool -> "Z" (the ONLY type allowed to match the boolean descriptor).
+        check("R16_sig_bool_Z", sig<bool>() == "Z");
+        // Java byte is signed 8-bit; both 8-bit integrals map to "B".
+        check("R16_sig_int8_B", sig<std::int8_t>() == "B");
+        check("R16_sig_uint8_B", sig<std::uint8_t>() == "B");
+        // Java short -> "S" (signed 16-bit).
+        check("R16_sig_int16_S", sig<std::int16_t>() == "S");
+        // Java char -> "C" (UNSIGNED 16-bit / UTF-16 code unit).
+        check("R16_sig_uint16_C", sig<std::uint16_t>() == "C");
+        // NOTE (library asymmetry, see [INFO] in the agent report): we do NOT
+        // assert sig<char16_t>() here.  method_proxy::argument_matches_descriptor
+        // maps BOTH char16_t and std::uint16_t to "C", but
+        // detail::jni_signature_for_arg has no char16_t branch — char16_t is a
+        // distinct integral type (not std::uint16_t), and the only 2-byte arm is
+        // the exact `std::is_same_v<clean_t, std::uint16_t>` test, so char16_t
+        // falls through to the dependent_false_v static_assert and FAILS TO
+        // COMPILE.  Asserting it here would break the build; the divergence is
+        // characterised in the report instead of pinned with a runtime check.
+        // 32-bit integrals -> "I".
+        check("R16_sig_int32_I", sig<std::int32_t>() == "I");
+        check("R16_sig_uint32_I", sig<std::uint32_t>() == "I");
+        // 64-bit integrals -> "J".
+        check("R16_sig_int64_J", sig<std::int64_t>() == "J");
+        check("R16_sig_uint64_J", sig<std::uint64_t>() == "J");
+        // Floating point.
+        check("R16_sig_float_F", sig<float>() == "F");
+        check("R16_sig_double_D", sig<double>() == "D");
+        // Every string-like arg -> the java.lang.String descriptor.
+        check("R16_sig_std_string", sig<std::string>() == "Ljava/lang/String;");
+        check("R16_sig_string_view", sig<std::string_view>() == "Ljava/lang/String;");
+        check("R16_sig_const_char_ptr", sig<const char*>() == "Ljava/lang/String;");
+        check("R16_sig_char_ptr", sig<char*>() == "Ljava/lang/String;");
+        // cv/ref spellings decay to the same descriptor (std::decay_t in the
+        // builder), so a `const std::string&` parameter encodes identically.
+        check("R16_sig_const_string_ref", sig<const std::string&>() == "Ljava/lang/String;");
+        check("R16_sig_int32_ref_decays", sig<std::int32_t&>() == "I");
+        check("R16_sig_const_bool_decays", sig<const bool>() == "Z");
+        check("R16_sig_volatile_double_decays", sig<volatile double>() == "D");
+        // The descriptor builder is total over its supported domain — every token
+        // above is non-empty and a single char for primitives.
+        check("R16_sig_bool_single_char", sig<bool>().size() == 1u);
+        check("R16_sig_long_single_char", sig<std::int64_t>().size() == 1u);
+    }
+
+    // =====================================================================
+    // R17. register_class<T>() rejects EVERY class-name shape with no JVM.
+    // find_class(name) fails before any insert, so the call is false / no-throw
+    // / both-maps-untouched for the empty name, garbage, special characters, a
+    // dotted (wrong-separator) name, a leading-slash name, an extremely long
+    // name, and a name carrying embedded high bytes.  Each runs under its own
+    // guard and on a distinct never-seen type so suite order is irrelevant.
+    // =====================================================================
+    {
+        map_state_guard guard{};
+        register_class_rejects_no_jvm<registry_alpha>("R17_empty_name", "");
+    }
+    {
+        map_state_guard guard{};
+        register_class_rejects_no_jvm<registry_beta>("R17_garbage_name", "!!!not a class!!!");
+    }
+    {
+        map_state_guard guard{};
+        register_class_rejects_no_jvm<registry_gamma>("R17_dotted_name", "java.lang.Object");
+    }
+    {
+        map_state_guard guard{};
+        register_class_rejects_no_jvm<registry_delta>("R17_leading_slash_name", "/java/lang/Object");
+    }
+    {
+        map_state_guard guard{};
+        register_class_rejects_no_jvm<registry_unmapped>("R17_whitespace_name", "   ");
+    }
+    {
+        map_state_guard guard{};
+        const std::string very_long(8192, 'A');
+        register_class_rejects_no_jvm<registry_alpha>("R17_very_long_name", very_long);
+    }
+    {
+        map_state_guard guard{};
+        // Embedded NUL + high bytes: still just a string find_class can't resolve.
+        const std::string odd_bytes{ std::string("pkg\0\xC3\xA9/Z", 8) };
+        register_class_rejects_no_jvm<registry_beta>("R17_embedded_nul_high_bytes",
+                                                     std::string_view{ odd_bytes.data(), odd_bytes.size() });
+    }
+    {
+        map_state_guard guard{};
+        // A plausibly-real but definitely-not-loaded name: still rejected no-JVM.
+        register_class_rejects_no_jvm<registry_gamma>("R17_plausible_unloaded_name",
+                                                      "com/example/definitely/Not/Loaded$Inner");
+    }
+
+    // =====================================================================
+    // R18. Factory invocation across MANY sentinel pointer values.  The factory
+    // is `new W{void*}`; it stores the pointer verbatim, so get_instance() must
+    // return the EXACT value passed for any bit pattern — null, one, a typical
+    // aligned heap address, an odd address, and the maximum representable
+    // pointer.  Each build is the registered dynamic type.  No VM access.
+    // =====================================================================
+    {
+        map_state_guard guard{};
+        register_in_maps<registry_alpha>("vmhook/test/SentinelAlpha");
+        const vmhook::type_factory_function_t f{ factory_for_name("vmhook/test/SentinelAlpha") };
+        check("R18_factory_present", f != nullptr);
+
+        // Width-safe sentinel set: every value is derived so it fits std::uintptr_t
+        // on a 32-bit OR 64-bit pointer (no fixed wide literal that would narrow on
+        // ILP32).  Covers null, one, aligned, an arbitrary mid-range value, the
+        // high half of the address space, and all-bits-set.
+        constexpr std::uintptr_t uintptr_max{ std::numeric_limits<std::uintptr_t>::max() };
+        const std::array<std::uintptr_t, 6> sentinels{ {
+            std::uintptr_t{ 0 },
+            std::uintptr_t{ 1 },
+            std::uintptr_t{ 0x8 },
+            std::uintptr_t{ 0xABCDEF01 },     // fits 32-bit unsigned, so width-safe
+            uintptr_max >> 1,                 // high half of the address space
+            uintptr_max,                      // all bits set
+        } };
+        for (std::size_t i{ 0 }; i < sentinels.size(); ++i)
+        {
+            void* const sentinel{ reinterpret_cast<void*>(sentinels[i]) };
+            const std::string tag{ "R18_sentinel_" + std::to_string(i) };
+            factory_builds<registry_alpha>(tag.c_str(), f, sentinel);
+        }
+    }
+
+    // =====================================================================
+    // R19. Factory built at nullptr: a null Java reference decodes to a wrapper
+    // whose get_instance() is nullptr (the wrapper is still a valid, non-null
+    // object — only the OOP it carries is null).  This is exactly what the
+    // factory does for a null arg, and it must not be confused with "no wrapper".
+    // =====================================================================
+    {
+        map_state_guard guard{};
+        register_in_maps<registry_beta>("vmhook/test/NullOop");
+        const vmhook::type_factory_function_t f{ factory_for_name("vmhook/test/NullOop") };
+        vmhook::object_base* const built{ f ? f(nullptr) : nullptr };
+        check("R19_factory_returns_wrapper_for_null_oop", built != nullptr);
+        check("R19_wrapper_holds_null_oop", built != nullptr && built->get_instance() == nullptr);
+        check("R19_wrapper_dynamic_type_is_beta", dynamic_cast<registry_beta*>(built) != nullptr);
+        delete built;
+    }
+
+    // =====================================================================
+    // R20. jni::make_unique<W>(class_name, args...) — the by-NAME factory
+    // (NewObjectA path).  It is noexcept and calls find_class(class_name) first,
+    // which fails with no JVM, so it returns a null unique_ptr for every arg
+    // shape — independent of whether W is registered in the type map.  This is a
+    // distinct entry point from the by-type make_unique<W>() above (which keys
+    // off the type map; this one keys purely off the name argument).
+    // =====================================================================
+    {
+        map_state_guard guard{};
+        // Unregistered type, no ctor args.
+        std::unique_ptr<registry_alpha> a{ reinterpret_cast<registry_alpha*>(0) };
+        bool threw{ false };
+        try { a = vmhook::jni::make_unique<registry_alpha>(std::string{ "vmhook/test/ByName" }); }
+        catch (...) { threw = true; }
+        check("R20_by_name_no_args_no_jvm_null", a == nullptr);
+        check("R20_by_name_no_args_does_not_throw", !threw);
+    }
+    {
+        map_state_guard guard{};
+        // With a mix of primitive + string args — exercises make_jni_args /
+        // signature assembly instantiation, still nullptr (find_class fails).
+        std::unique_ptr<factory_wrapper_with_ctor> w{ reinterpret_cast<factory_wrapper_with_ctor*>(0) };
+        bool threw{ false };
+        try { w = vmhook::jni::make_unique<factory_wrapper_with_ctor>(std::string{ "vmhook/test/ByName2" }, 42, std::string{ "x" }); }
+        catch (...) { threw = true; }
+        check("R20_by_name_with_args_no_jvm_null", w == nullptr);
+        check("R20_by_name_with_args_does_not_throw", !threw);
+    }
+    {
+        map_state_guard guard{};
+        // Even when the type IS registered in both maps, by-name make_unique is
+        // null with no JVM (find_class still fails — registration is irrelevant
+        // to this entry point, which keys purely off the name argument).
+        register_in_maps<registry_gamma>("vmhook/test/ByName3");
+        std::unique_ptr<registry_gamma> g{ reinterpret_cast<registry_gamma*>(0) };
+        bool threw{ false };
+        try { g = vmhook::jni::make_unique<registry_gamma>(std::string{ "vmhook/test/ByName3" }); }
+        catch (...) { threw = true; }
+        check("R20_by_name_registered_no_jvm_null", g == nullptr);
+        check("R20_by_name_registered_does_not_throw", !threw);
+    }
+
+    // =====================================================================
+    // R21. make_unique<W>() (by-type) no-JVM nullptr across MORE arg arities and
+    // types — the ensure_current_java_thread() guard fires before the type-map
+    // lookup for every arity, so registration state and arg shape never change
+    // the contract.  Complements the earlier R14 / make_unique checks.
+    // =====================================================================
+    {
+        map_state_guard guard{};
+        register_in_maps<registry_delta>("vmhook/test/MUDelta");
+        check("R21_precondition_registered", type_is_registered<registry_delta>());
+
+        // No args.
+        {
+            std::unique_ptr<registry_delta> d{ reinterpret_cast<registry_delta*>(0) };
+            bool threw{ false };
+            try { d = vmhook::make_unique<registry_delta>(); }
+            catch (...) { threw = true; }
+            check("R21_no_args_null", d == nullptr);
+            check("R21_no_args_no_throw", !threw);
+        }
+        // Single int arg.
+        {
+            std::unique_ptr<registry_delta> d{ reinterpret_cast<registry_delta*>(0) };
+            bool threw{ false };
+            try { d = vmhook::make_unique<registry_delta>(1); }
+            catch (...) { threw = true; }
+            check("R21_one_arg_null", d == nullptr);
+            check("R21_one_arg_no_throw", !threw);
+        }
+        // Several heterogeneous args (int, bool, double, long).
+        {
+            std::unique_ptr<registry_delta> d{ reinterpret_cast<registry_delta*>(0) };
+            bool threw{ false };
+            try { d = vmhook::make_unique<registry_delta>(1, true, 2.0, std::int64_t{ 3 }); }
+            catch (...) { threw = true; }
+            check("R21_many_args_null", d == nullptr);
+            check("R21_many_args_no_throw", !threw);
+        }
+    }
+
+    // =====================================================================
+    // R22. type_index distinctness + factory-pointer distinctness across ALL
+    // wrapper types.  Different C++ types have distinct std::type_index values
+    // (so the per-type map keying never collides), and factory_for<T>() yields a
+    // distinct function pointer per T (so a distinct name binds a distinct
+    // factory).  These identities are platform-invariant and need no JVM.
+    // =====================================================================
+    {
+        // Distinct type_index per wrapper (the type map's key space).
+        const std::array<std::type_index, 5> idx{ {
+            std::type_index{ typeid(registry_alpha) },
+            std::type_index{ typeid(registry_beta) },
+            std::type_index{ typeid(registry_gamma) },
+            std::type_index{ typeid(registry_delta) },
+            std::type_index{ typeid(registry_unmapped) },
+        } };
+        bool all_distinct{ true };
+        for (std::size_t i{ 0 }; i < idx.size(); ++i)
+        {
+            for (std::size_t j{ i + 1 }; j < idx.size(); ++j)
+            {
+                if (idx[i] == idx[j]) { all_distinct = false; }
+            }
+        }
+        check("R22_all_type_indices_distinct", all_distinct);
+
+        // Distinct factory function pointer per wrapper type.
+        const std::array<vmhook::type_factory_function_t, 5> fac{ {
+            factory_for<registry_alpha>(),
+            factory_for<registry_beta>(),
+            factory_for<registry_gamma>(),
+            factory_for<registry_delta>(),
+            factory_for<registry_unmapped>(),
+        } };
+        bool factories_distinct{ true };
+        for (std::size_t i{ 0 }; i < fac.size(); ++i)
+        {
+            for (std::size_t j{ i + 1 }; j < fac.size(); ++j)
+            {
+                if (fac[i] == fac[j]) { factories_distinct = false; }
+            }
+        }
+        check("R22_all_factory_pointers_distinct", factories_distinct);
+        // factory_for<T>() is a stable identity: the same T yields the same
+        // pointer on every call (it decays the SAME lambda each time).
+        check("R22_factory_for_is_stable_per_type",
+              factory_for<registry_alpha>() == factory_for<registry_alpha>());
+        check("R22_factory_for_non_null", factory_for<registry_alpha>() != nullptr);
+    }
+
+    // =====================================================================
+    // R23. for_each_instance<T>() early-out is robust across visitor signatures
+    // and max_visits values when T is unregistered: it returns 0, never calls
+    // the visitor, and never throws — BEFORE touching any heap VMStruct.  We
+    // vary the cap (0, 1, and unlimited via the default) to prove the early-out
+    // precedes any cap handling.
+    // =====================================================================
+    {
+        map_state_guard guard{};
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_gamma) });
+
+        // Default (unlimited) cap, by-value unique_ptr visitor.
+        {
+            std::size_t calls{ 0 };
+            std::size_t visited{ std::numeric_limits<std::size_t>::max() };
+            bool threw{ false };
+            try
+            {
+                visited = vmhook::for_each_instance<registry_gamma>(
+                    [&calls](std::unique_ptr<registry_gamma>) { ++calls; });
+            }
+            catch (...) { threw = true; }
+            check("R23_default_cap_returns_zero", visited == 0u);
+            check("R23_default_cap_no_visitor_call", calls == 0u);
+            check("R23_default_cap_no_throw", !threw);
+        }
+        // Explicit cap of 0.
+        {
+            std::size_t calls{ 0 };
+            std::size_t visited{ std::numeric_limits<std::size_t>::max() };
+            bool threw{ false };
+            try
+            {
+                visited = vmhook::for_each_instance<registry_gamma>(
+                    [&calls](std::unique_ptr<registry_gamma>) { ++calls; }, std::size_t{ 0 });
+            }
+            catch (...) { threw = true; }
+            check("R23_cap0_returns_zero", visited == 0u);
+            check("R23_cap0_no_visitor_call", calls == 0u);
+            check("R23_cap0_no_throw", !threw);
+        }
+        // Explicit cap of 1.
+        {
+            std::size_t calls{ 0 };
+            std::size_t visited{ std::numeric_limits<std::size_t>::max() };
+            bool threw{ false };
+            try
+            {
+                visited = vmhook::for_each_instance<registry_gamma>(
+                    [&calls](std::unique_ptr<registry_gamma>) { ++calls; }, std::size_t{ 1 });
+            }
+            catch (...) { threw = true; }
+            check("R23_cap1_returns_zero", visited == 0u);
+            check("R23_cap1_no_visitor_call", calls == 0u);
+            check("R23_cap1_no_throw", !threw);
+        }
+        // A second distinct unregistered type behaves identically (no bleed).
+        {
+            vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_delta) });
+            std::size_t calls{ 0 };
+            std::size_t visited{ std::numeric_limits<std::size_t>::max() };
+            bool threw{ false };
+            try
+            {
+                visited = vmhook::for_each_instance<registry_delta>(
+                    [&calls](std::unique_ptr<registry_delta>) { ++calls; });
+            }
+            catch (...) { threw = true; }
+            check("R23_second_type_returns_zero", visited == 0u);
+            check("R23_second_type_no_visitor_call", calls == 0u);
+            check("R23_second_type_no_throw", !threw);
+        }
+    }
+
+    // =====================================================================
+    // R24. get_class_methods<W>() / find_methods_by_signature<W>() are empty for
+    // an unregistered W regardless of the descriptor queried — the type-map miss
+    // short-circuits before any find_class, so NO descriptor string can make the
+    // result non-empty.  Sweep a spread of descriptor shapes (valid, empty,
+    // garbage) and several unregistered types; all stay empty and never throw.
+    // =====================================================================
+    {
+        map_state_guard guard{};
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_gamma) });
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_delta) });
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_unmapped) });
+
+        check("R24_methods_gamma_empty", vmhook::get_class_methods<registry_gamma>().empty());
+        check("R24_methods_delta_empty", vmhook::get_class_methods<registry_delta>().empty());
+        check("R24_methods_unmapped_empty", vmhook::get_class_methods<registry_unmapped>().empty());
+
+        const std::array<std::string_view, 6> descriptors{ {
+            std::string_view{ "(I)I" },
+            std::string_view{ "()V" },
+            std::string_view{ "(Ljava/lang/String;)Z" },
+            std::string_view{ "" },
+            std::string_view{ "not-a-descriptor" },
+            std::string_view{ "(((" },
+        } };
+        for (std::size_t i{ 0 }; i < descriptors.size(); ++i)
+        {
+            const std::string tag{ "R24_find_gamma_desc_" + std::to_string(i) + "_empty" };
+            check(tag.c_str(), vmhook::find_methods_by_signature<registry_gamma>(descriptors[i]).empty());
+        }
+        // A different unregistered type, same sweep result.
+        check("R24_find_delta_valid_desc_empty",
+              vmhook::find_methods_by_signature<registry_delta>("(I)I").empty());
+        check("R24_find_unmapped_empty_desc_empty",
+              vmhook::find_methods_by_signature<registry_unmapped>("").empty());
+    }
+
+    // =====================================================================
+    // R25. Multi-rebind chain semantics on BOTH maps (no JVM).  Re-pointing one
+    // type across a sequence of names (insert_or_assign, last wins) keeps exactly
+    // one type-map entry that always resolves to the most-recent name, while each
+    // name visited along the way keeps its own factory (emplace, first wins, no
+    // erase) — so the factory map only ever GROWS.  This pins both the last-wins
+    // type binding and the monotonic factory accumulation (bug #2 at scale).
+    // =====================================================================
+    {
+        map_state_guard guard{};
+        const std::size_t factory_before{ vmhook::g_type_factory_map.size() };
+
+        register_in_maps<registry_alpha>("vmhook/test/Chain/N0");
+        register_in_maps<registry_alpha>("vmhook/test/Chain/N1");
+        register_in_maps<registry_alpha>("vmhook/test/Chain/N2");
+        register_in_maps<registry_alpha>("vmhook/test/Chain/N3");
+
+        // Exactly one type-map entry, resolving to the LAST name.
+        check("R25_single_type_entry_after_chain",
+              vmhook::type_to_class_map.count(std::type_index{ typeid(registry_alpha) }) == 1u);
+        check("R25_resolves_to_last_name", registered_name<registry_alpha>() == "vmhook/test/Chain/N3");
+
+        // Every name along the chain kept its factory (4 distinct names added).
+        check("R25_n0_factory_present", factory_for_name("vmhook/test/Chain/N0") != nullptr);
+        check("R25_n1_factory_present", factory_for_name("vmhook/test/Chain/N1") != nullptr);
+        check("R25_n2_factory_present", factory_for_name("vmhook/test/Chain/N2") != nullptr);
+        check("R25_n3_factory_present", factory_for_name("vmhook/test/Chain/N3") != nullptr);
+        check("R25_factory_map_grew_by_four",
+              vmhook::g_type_factory_map.size() == factory_before + 4u);
+        // All four name-keyed factories are the SAME pointer (same type alpha),
+        // since factory_for<alpha>() decays the same lambda — name keying does
+        // not change the underlying function, only the slot.
+        check("R25_all_chain_factories_are_alpha",
+              factory_for_name("vmhook/test/Chain/N0") == factory_for<registry_alpha>()
+              && factory_for_name("vmhook/test/Chain/N3") == factory_for<registry_alpha>());
+    }
+
+    // =====================================================================
+    // R26. Many distinct registered types resolve their OWN descriptor with no
+    // cross-talk, at scale.  We register four distinct wrapper types to four
+    // distinct names simultaneously and assert jni_signature_for_arg<W> returns
+    // each type's own L<name>; for both the by-value and unique_ptr<W> spelling,
+    // while a fifth unregistered type still falls back.  This is the read-side of
+    // the per-type type-map keying exercised end-to-end with no JVM.
+    // =====================================================================
+    {
+        map_state_guard guard{};
+        vmhook::type_to_class_map.insert_or_assign(std::type_index{ typeid(registry_alpha) }, std::string{ "pkg/A" });
+        vmhook::type_to_class_map.insert_or_assign(std::type_index{ typeid(registry_beta) },  std::string{ "pkg/B" });
+        vmhook::type_to_class_map.insert_or_assign(std::type_index{ typeid(registry_gamma) }, std::string{ "pkg/G" });
+        vmhook::type_to_class_map.insert_or_assign(std::type_index{ typeid(registry_delta) }, std::string{ "pkg/D" });
+        vmhook::type_to_class_map.erase(std::type_index{ typeid(registry_unmapped) });
+
+        check("R26_alpha_own_desc", sig<registry_alpha>() == "Lpkg/A;");
+        check("R26_beta_own_desc", sig<registry_beta>() == "Lpkg/B;");
+        check("R26_gamma_own_desc", sig<registry_gamma>() == "Lpkg/G;");
+        check("R26_delta_own_desc", sig<registry_delta>() == "Lpkg/D;");
+
+        check("R26_alpha_uptr_own_desc", sig<std::unique_ptr<registry_alpha>>() == "Lpkg/A;");
+        check("R26_beta_uptr_own_desc", sig<std::unique_ptr<registry_beta>>() == "Lpkg/B;");
+        check("R26_gamma_uptr_own_desc", sig<std::unique_ptr<registry_gamma>>() == "Lpkg/G;");
+        check("R26_delta_uptr_own_desc", sig<std::unique_ptr<registry_delta>>() == "Lpkg/D;");
+
+        // No two distinct registered types share a descriptor here.
+        check("R26_descs_pairwise_distinct",
+              sig<registry_alpha>() != sig<registry_beta>()
+              && sig<registry_beta>() != sig<registry_gamma>()
+              && sig<registry_gamma>() != sig<registry_delta>()
+              && sig<registry_alpha>() != sig<registry_delta>());
+
+        // The fifth, unregistered type still falls back to Object.
+        check("R26_unmapped_falls_back", sig<registry_unmapped>() == "Ljava/lang/Object;");
     }
 
     return failures == 0 ? 0 : 1;
