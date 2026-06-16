@@ -27,6 +27,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/hook_basic|hook_basic]]
 - [[features/hook_chaining|hook_chaining]]
+- [[features/hook_unhook_double_free|hook_unhook_double_free]]
 - [[features/hook_verify_repair|hook_verify_repair]]
 
 ## Notes

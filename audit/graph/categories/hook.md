@@ -14,12 +14,12 @@ tags: [category/hook]
 - [[features/adapter_recovery_c2i|adapter_recovery_c2i]] — `seeded` / `medium` — Adapter Recovery C2I
 - [[features/dont_inline_dont_compile|dont_inline_dont_compile]] — `seeded` / `medium` — Dont Inline Dont Compile
 - [[features/hook_basic|hook_basic]] — `in_progress` / `critical` — Hook Install (basic)
-- [[features/hook_chaining|hook_chaining]] — `seeded` / `medium` — Hook Chaining
+- [[features/hook_chaining|hook_chaining]] — `in_progress` / `high` — Hook Chaining
 - [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]] — `seeded` / `medium` — Hook Common Detour Dispatch
-- [[features/hook_install_after_jit|hook_install_after_jit]] — `seeded` / `medium` — Hook Install After Jit
+- [[features/hook_install_after_jit|hook_install_after_jit]] — `in_progress` / `critical` — Hook Install After Jit
 - [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]] — `seeded` / `medium` — Hook Reinstall After Shutdown
 - [[features/hook_signature|hook_signature]] — `seeded` / `medium` — Hook Signature
-- [[features/hook_unhook_double_free|hook_unhook_double_free]] — `seeded` / `medium` — Hook Unhook Double Free
+- [[features/hook_unhook_double_free|hook_unhook_double_free]] — `in_progress` / `high` — Hook Unhook / Double-Free Guards
 - [[features/hook_verify_repair|hook_verify_repair]] — `seeded` / `medium` — Hook Verify Repair
 - [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]] — `seeded` / `medium` — Method Entry Points I2I I2C
 - [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]] — `seeded` / `medium` — Midi2I Trampoline Alloc
@@ -76,19 +76,24 @@ flowchart LR
   hook_chaining --> hook_basic
   hook_chaining --> midi2i_trampoline_alloc
   hook_chaining --> hook_common_detour_dispatch
+  hook_chaining --> method_entry_points_i2i_i2c
+  hook_chaining --> seh_invoke_detour
+  hook_chaining --> dont_inline_dont_compile
   hook_common_detour_dispatch --> seh_invoke_detour
   hook_common_detour_dispatch --> interpreter_frame_walk
   hook_common_detour_dispatch --> method_entry_points_i2i_i2c
   hook_install_after_jit --> hook_basic
   hook_install_after_jit --> deoptimize_methods
-  hook_install_after_jit --> method_entry_points_i2i_i2c
   hook_install_after_jit --> adapter_recovery_c2i
+  hook_install_after_jit --> method_entry_points_i2i_i2c
   hook_reinstall_after_shutdown --> shutdown_hooks_teardown
   hook_reinstall_after_shutdown --> hook_basic
   hook_signature --> hook_basic
   hook_signature --> signature_parsing
   hook_signature --> method_explicit_signature
   hook_unhook_double_free --> hook_basic
+  hook_unhook_double_free --> midi2i_trampoline_alloc
+  hook_unhook_double_free --> os_protect
   hook_unhook_double_free --> shutdown_hooks_teardown
   hook_verify_repair --> hook_basic
   hook_verify_repair --> midi2i_trampoline_alloc

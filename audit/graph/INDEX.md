@@ -4,13 +4,13 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 - **Features:** 109
 - **Categories:** 13
-- **`depends_on` edges:** 159
+- **`depends_on` edges:** 168
 
 ## Status
 
 - `queued`: 0
-- `seeded`: 108
-- `in_progress`: 1
+- `seeded`: 103
+- `in_progress`: 6
 - `audited`: 0
 - `perfected`: 0
 
@@ -25,12 +25,12 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/adapter_recovery_c2i|adapter_recovery_c2i]] — `seeded` / `medium` — Adapter Recovery C2I
 - [[features/dont_inline_dont_compile|dont_inline_dont_compile]] — `seeded` / `medium` — Dont Inline Dont Compile
 - [[features/hook_basic|hook_basic]] — `in_progress` / `critical` — Hook Install (basic)
-- [[features/hook_chaining|hook_chaining]] — `seeded` / `medium` — Hook Chaining
+- [[features/hook_chaining|hook_chaining]] — `in_progress` / `high` — Hook Chaining
 - [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]] — `seeded` / `medium` — Hook Common Detour Dispatch
-- [[features/hook_install_after_jit|hook_install_after_jit]] — `seeded` / `medium` — Hook Install After Jit
+- [[features/hook_install_after_jit|hook_install_after_jit]] — `in_progress` / `critical` — Hook Install After Jit
 - [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]] — `seeded` / `medium` — Hook Reinstall After Shutdown
 - [[features/hook_signature|hook_signature]] — `seeded` / `medium` — Hook Signature
-- [[features/hook_unhook_double_free|hook_unhook_double_free]] — `seeded` / `medium` — Hook Unhook Double Free
+- [[features/hook_unhook_double_free|hook_unhook_double_free]] — `in_progress` / `high` — Hook Unhook / Double-Free Guards
 - [[features/hook_verify_repair|hook_verify_repair]] — `seeded` / `medium` — Hook Verify Repair
 - [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]] — `seeded` / `medium` — Method Entry Points I2I I2C
 - [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]] — `seeded` / `medium` — Midi2I Trampoline Alloc
@@ -78,7 +78,7 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 - [[features/method_static|method_static]] — `seeded` / `medium` — Method Static
 - [[features/method_static_portability|method_static_portability]] — `seeded` / `medium` — Method Static Portability
 - [[features/method_throwing_call_site|method_throwing_call_site]] — `seeded` / `medium` — Method Throwing Call Site
-- [[features/signature_parsing|signature_parsing]] — `seeded` / `medium` — Signature Parsing
+- [[features/signature_parsing|signature_parsing]] — `in_progress` / `medium` — Signature Parsing
 
 ### [[categories/field|Field proxies (get / set / introspection)]] · 14 feature(s)
 
@@ -130,7 +130,7 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 ### [[categories/enumeration|Live-VM enumeration (heap / classes / threads)]] · 4 feature(s)
 
-- [[features/for_each_instance|for_each_instance]] — `seeded` / `medium` — For Each Instance
+- [[features/for_each_instance|for_each_instance]] — `in_progress` / `high` — For Each Instance
 - [[features/for_each_loaded_class|for_each_loaded_class]] — `seeded` / `medium` — For Each Loaded Class
 - [[features/for_each_thread|for_each_thread]] — `seeded` / `medium` — For Each Thread
 - [[features/iterate_entries_safety|iterate_entries_safety]] — `seeded` / `medium` — Iterate Entries Safety

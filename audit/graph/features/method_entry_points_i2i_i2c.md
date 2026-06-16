@@ -29,6 +29,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/adapter_recovery_c2i|adapter_recovery_c2i]]
 - [[features/deoptimize_methods|deoptimize_methods]]
 - [[features/hook_basic|hook_basic]]
+- [[features/hook_chaining|hook_chaining]]
 - [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]]
 - [[features/hook_install_after_jit|hook_install_after_jit]]
 

@@ -30,6 +30,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/hook_unhook_double_free|hook_unhook_double_free]]
 - [[features/hook_verify_repair|hook_verify_repair]]
 
+## Depended on by
+
+- [[features/hook_chaining|hook_chaining]]
+
 ## Tests
 
 - `tests/jvm/modules/dont_inline_dont_compile.cpp`

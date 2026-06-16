@@ -18,6 +18,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Depended on by
 
+- [[features/hook_unhook_double_free|hook_unhook_double_free]]
 - [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]]
 
 ## Notes

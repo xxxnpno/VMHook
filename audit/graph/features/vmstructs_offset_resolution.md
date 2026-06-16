@@ -32,6 +32,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/constantpool_access|constantpool_access]]
 - [[features/field_introspection|field_introspection]]
 - [[features/find_class_fallback|find_class_fallback]]
+- [[features/for_each_instance|for_each_instance]]
 - [[features/instanceklass_methods_walk|instanceklass_methods_walk]]
 - [[features/klass_introspection|klass_introspection]]
 - [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]]

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-06-15T21:19:59Z",
+  "generated_at": "2026-06-16T10:57:01Z",
   "feature_count": 109,
   "edge_count": 434,
   "categories": [
@@ -1286,18 +1286,26 @@
       "slug": "for_each_instance",
       "title": "For Each Instance",
       "category": "enumeration",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/for_each_instance-specialist.md",
       "depends_on": [
+        "vmstructs_offset_resolution",
+        "decode_oop_and_pointers",
         "klass_introspection",
-        "iterate_entries_safety"
+        "register_class",
+        "compressed_klass_decode"
       ],
-      "related": [
-        "for_each_loaded_class",
-        "for_each_thread"
+      "related": [],
+      "tags": [
+        "heap-walk",
+        "gc",
+        "conservative",
+        "safepoint",
+        "enumeration",
+        "safe-read",
+        "klass-filter"
       ],
-      "tags": [],
       "test_modules": [
         "tests/jvm/modules/for_each_instance.cpp"
       ],
@@ -1452,23 +1460,28 @@
       "slug": "hook_chaining",
       "title": "Hook Chaining",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/hook_chaining-specialist.md",
       "depends_on": [
         "hook_basic",
         "midi2i_trampoline_alloc",
-        "hook_common_detour_dispatch"
+        "hook_common_detour_dispatch",
+        "method_entry_points_i2i_i2c",
+        "seh_invoke_detour",
+        "dont_inline_dont_compile"
       ],
-      "related": [
-        "hook_basic",
-        "hook_verify_repair",
-        "dont_inline_dont_compile",
-        "hook_install_after_jit",
-        "hook_reinstall_after_shutdown",
-        "hook_signature"
+      "related": [],
+      "tags": [
+        "hook",
+        "i2i-stub",
+        "trampoline",
+        "demux",
+        "multi-method",
+        "shared-stub",
+        "dispatch",
+        "raii"
       ],
-      "tags": [],
       "test_modules": [
         "tests/jvm/modules/hook_chaining.cpp"
       ],
@@ -1517,28 +1530,38 @@
       "slug": "hook_install_after_jit",
       "title": "Hook Install After Jit",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "critical",
       "specialist": ".claude/agents/hook_install_after_jit-specialist.md",
       "depends_on": [
         "hook_basic",
         "deoptimize_methods",
-        "method_entry_points_i2i_i2c",
-        "adapter_recovery_c2i"
+        "adapter_recovery_c2i",
+        "method_entry_points_i2i_i2c"
       ],
       "related": [
-        "adapter_recovery_c2i",
         "dont_inline_dont_compile",
-        "hook_basic",
         "hook_chaining",
         "hook_common_detour_dispatch",
-        "hook_reinstall_after_shutdown"
+        "hook_reinstall_after_shutdown",
+        "hook_verify_repair"
       ],
-      "tags": [],
+      "tags": [
+        "jit",
+        "deopt",
+        "code-cache",
+        "adapter",
+        "critical-path",
+        "i2i-stub",
+        "entry-points",
+        "watchdog"
+      ],
       "test_modules": [
         "tests/jvm/modules/hook_install_after_jit.cpp"
       ],
-      "audit_docs": [],
+      "audit_docs": [
+        "audit/findings/hook_install_after_jit.md"
+      ],
       "java_versions": [
         8,
         11,
@@ -1620,13 +1643,15 @@
     },
     {
       "slug": "hook_unhook_double_free",
-      "title": "Hook Unhook Double Free",
+      "title": "Hook Unhook / Double-Free Guards",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/hook_unhook_double_free-specialist.md",
       "depends_on": [
         "hook_basic",
+        "midi2i_trampoline_alloc",
+        "os_protect",
         "shutdown_hooks_teardown"
       ],
       "related": [
@@ -1637,7 +1662,16 @@
         "hook_signature",
         "hook_verify_repair"
       ],
-      "tags": [],
+      "tags": [
+        "lifetime",
+        "unhook",
+        "trampoline",
+        "idempotent",
+        "double-free",
+        "raii",
+        "hook-remove",
+        "noexcept"
+      ],
       "test_modules": [
         "tests/jvm/modules/hook_unhook_double_free.cpp"
       ],
@@ -3212,14 +3246,24 @@
       "slug": "signature_parsing",
       "title": "Signature Parsing",
       "category": "method",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/signature_parsing-specialist.md",
-      "depends_on": [],
+      "depends_on": [
+        "method_enumeration"
+      ],
       "related": [],
-      "tags": [],
+      "tags": [
+        "descriptor",
+        "jvm",
+        "parsing",
+        "type-system",
+        "basic-type",
+        "jni",
+        "field-set",
+        "call-stub"
+      ],
       "test_modules": [
-        "tests/jvm/modules/signature_parsing.cpp",
         "tests/test_signature_parsing.cpp"
       ],
       "audit_docs": [],
@@ -4134,23 +4178,28 @@
     },
     {
       "from": "for_each_instance",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "for_each_instance",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "for_each_instance",
       "to": "klass_introspection",
       "kind": "depends_on"
     },
     {
       "from": "for_each_instance",
-      "to": "iterate_entries_safety",
+      "to": "register_class",
       "kind": "depends_on"
     },
     {
       "from": "for_each_instance",
-      "to": "for_each_loaded_class",
-      "kind": "related"
-    },
-    {
-      "from": "for_each_instance",
-      "to": "for_each_thread",
-      "kind": "related"
+      "to": "compressed_klass_decode",
+      "kind": "depends_on"
     },
     {
       "from": "for_each_loaded_class",
@@ -4289,33 +4338,18 @@
     },
     {
       "from": "hook_chaining",
-      "to": "hook_basic",
-      "kind": "related"
+      "to": "method_entry_points_i2i_i2c",
+      "kind": "depends_on"
     },
     {
       "from": "hook_chaining",
-      "to": "hook_verify_repair",
-      "kind": "related"
+      "to": "seh_invoke_detour",
+      "kind": "depends_on"
     },
     {
       "from": "hook_chaining",
       "to": "dont_inline_dont_compile",
-      "kind": "related"
-    },
-    {
-      "from": "hook_chaining",
-      "to": "hook_install_after_jit",
-      "kind": "related"
-    },
-    {
-      "from": "hook_chaining",
-      "to": "hook_reinstall_after_shutdown",
-      "kind": "related"
-    },
-    {
-      "from": "hook_chaining",
-      "to": "hook_signature",
-      "kind": "related"
+      "kind": "depends_on"
     },
     {
       "from": "hook_common_detour_dispatch",
@@ -4359,27 +4393,17 @@
     },
     {
       "from": "hook_install_after_jit",
+      "to": "adapter_recovery_c2i",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_install_after_jit",
       "to": "method_entry_points_i2i_i2c",
       "kind": "depends_on"
     },
     {
       "from": "hook_install_after_jit",
-      "to": "adapter_recovery_c2i",
-      "kind": "depends_on"
-    },
-    {
-      "from": "hook_install_after_jit",
-      "to": "adapter_recovery_c2i",
-      "kind": "related"
-    },
-    {
-      "from": "hook_install_after_jit",
       "to": "dont_inline_dont_compile",
-      "kind": "related"
-    },
-    {
-      "from": "hook_install_after_jit",
-      "to": "hook_basic",
       "kind": "related"
     },
     {
@@ -4395,6 +4419,11 @@
     {
       "from": "hook_install_after_jit",
       "to": "hook_reinstall_after_shutdown",
+      "kind": "related"
+    },
+    {
+      "from": "hook_install_after_jit",
+      "to": "hook_verify_repair",
       "kind": "related"
     },
     {
@@ -4485,6 +4514,16 @@
     {
       "from": "hook_unhook_double_free",
       "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_unhook_double_free",
+      "to": "midi2i_trampoline_alloc",
+      "kind": "depends_on"
+    },
+    {
+      "from": "hook_unhook_double_free",
+      "to": "os_protect",
       "kind": "depends_on"
     },
     {
@@ -5531,6 +5570,11 @@
       "from": "shutdown_hooks_teardown",
       "to": "on_exception",
       "kind": "related"
+    },
+    {
+      "from": "signature_parsing",
+      "to": "method_enumeration",
+      "kind": "depends_on"
     },
     {
       "from": "unified_call_syntax",

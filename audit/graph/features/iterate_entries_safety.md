@@ -18,7 +18,6 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Depended on by
 
-- [[features/for_each_instance|for_each_instance]]
 - [[features/for_each_loaded_class|for_each_loaded_class]]
 - [[features/for_each_thread|for_each_thread]]
 

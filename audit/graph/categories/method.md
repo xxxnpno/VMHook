@@ -29,7 +29,7 @@ tags: [category/method]
 - [[features/method_static|method_static]] — `seeded` / `medium` — Method Static
 - [[features/method_static_portability|method_static_portability]] — `seeded` / `medium` — Method Static Portability
 - [[features/method_throwing_call_site|method_throwing_call_site]] — `seeded` / `medium` — Method Throwing Call Site
-- [[features/signature_parsing|signature_parsing]] — `seeded` / `medium` — Signature Parsing
+- [[features/signature_parsing|signature_parsing]] — `in_progress` / `medium` — Signature Parsing
 
 ## Dependency graph
 
@@ -95,4 +95,5 @@ flowchart LR
   method_static_portability --> method_static
   method_throwing_call_site --> method_call_primitives
   method_throwing_call_site --> on_exception
+  signature_parsing --> method_enumeration
 ```

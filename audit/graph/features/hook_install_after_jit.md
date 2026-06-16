@@ -2,40 +2,103 @@
 slug: hook_install_after_jit
 title: Hook Install After Jit
 category: hook
-status: seeded
-risk: medium
+status: in_progress
+risk: critical
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/hook]
+tags: [status/in_progress, risk/critical, category/hook, tag/jit, tag/deopt, tag/code-cache, tag/adapter, tag/critical-path, tag/i2i-stub, tag/entry-points, tag/watchdog]
 ---
 
 # Hook Install After Jit
 
-> **Category:** [[categories/hook|Hooking machinery (install / dispatch / trampolines)]]  ·  **Status:** `seeded`  ·  **Risk:** `medium`  ·  **Specialist:** `.claude/agents/hook_install_after_jit-specialist.md`
+> **Category:** [[categories/hook|Hooking machinery (install / dispatch / trampolines)]]  ·  **Status:** `in_progress`  ·  **Risk:** `critical`  ·  **Specialist:** `.claude/agents/hook_install_after_jit-specialist.md`
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
+Handles the case where `vmhook::hook<T>()` is called on a method whose `Method::_code`
+is already non-null at install time — i.e. the method was JIT-compiled before the hook
+was registered. Detection happens at vmhook.hpp:10144-10147: `original_code = get_code()`
+and `was_compiled = original_code != nullptr && is_valid_pointer(original_code)`. When
+`was_compiled` is true the install path must deoptimise the method before the i2i stub
+patch can take effect; without deopt `_from_interpreted_entry` still points at the i2c
+adapter and the patched stub is completely bypassed by every compiled caller. Deopt
+(vmhook.hpp:10287-10323) performs three ordered pointer stores: redirect
+`_from_interpreted_entry` to i2i, redirect `_from_compiled_entry` to the recovered c2i
+adapter (via `get_adapter()` + `get_c2i_entry_from_adapter()`), then clear `_code` last.
+If c2i recovery fails (JDK 9+ heuristic scan returns null) a conservative fallback clears
+`_code` and redirects only `_from_interpreted_entry`, accepting that compiled callers with
+stale inline caches will bypass the hook until a safepoint repairs the IC. After install
+`NO_COMPILE` is armed and the auto-repair watchdog is started; any re-JIT by HotSpot
+racing the install is caught by the watchdog within one poll interval.
 
 ## Depends on
 
 - [[features/hook_basic|hook_basic]]
 - [[features/deoptimize_methods|deoptimize_methods]]
-- [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]]
 - [[features/adapter_recovery_c2i|adapter_recovery_c2i]]
+- [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]]
 
 ## Related
 
-- [[features/adapter_recovery_c2i|adapter_recovery_c2i]]
 - [[features/dont_inline_dont_compile|dont_inline_dont_compile]]
-- [[features/hook_basic|hook_basic]]
 - [[features/hook_chaining|hook_chaining]]
 - [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]]
 - [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]]
+- [[features/hook_verify_repair|hook_verify_repair]]
+
+## Implementation anchors
+
+- `was_compiled detection + entry-point snapshot` — `vmhook/ext/vmhook/vmhook.hpp:10137-10156` — snapshots original_code, original_from_interpreted, original_from_compiled; sets was_compiled = original_code != nullptr && is_valid_pointer(original_code); logs 'is JIT-compiled' or 'is interpreted'
+- `deopt JIT-compiled targets (was_compiled branch)` — `vmhook/ext/vmhook/vmhook.hpp:10287-10323` — if was_compiled: get_adapter -> c2i_entry; redirect _from_interpreted_entry to i2i, _from_compiled_entry to c2i (or just i2i on c2i-unrecoverable fallback), then _code=nullptr last; both branches log result
+- `auto-repair watchdog ensure_started call site` — `vmhook/ext/vmhook/vmhook.hpp:10325-10328` — spawns detail::auto_repair::worker_loop on first successful install; watchdog re-applies deopt when HotSpot re-JITs a hooked method despite NO_COMPILE
+- `per-hook install deopt consumer (adapter_recovery_c2i consumer)` — `vmhook/ext/vmhook/vmhook.hpp:8251-8287` — deoptimize_methods_if inner deopt block — same three-store dance used by the per-hook install; c2i-unrecoverable forces skip (not forced deopt) in the sweep path, diverging from the install fallback
+- `deoptimize_all_jit_compiled_methods / deoptimize_methods_if` — `vmhook/ext/vmhook/vmhook.hpp:8170-8325` — sweep-based deopt API; complements per-hook deopt by flushing stale inline caches in compiled callers that have already cached the old nmethod's verified-entry-point
 
 ## Tests
 
 - `tests/jvm/modules/hook_install_after_jit.cpp`
 
+## Audit docs
+
+- `audit/findings/hook_install_after_jit.md`
+
+## Known bugs
+
+- **[high]** ARM64 store reordering between _from_compiled_entry write and _code=nullptr can hand HotSpot a stale-entry/null-code combination that crashes at the next safepoint. set_code / set_from_compiled_entry / set_from_interpreted_entry (vmhook.hpp:10295-10299) are plain non-atomic stores with no memory barriers; on ARM64 (VMHOOK_ARCH_ARM64, vmhook.hpp:176) the CPU may commit _code=nullptr before the _from_compiled_entry=c2i write is visible to another core. Same reordering hole exists in the sweep path (deoptimize_methods_if write trio) and the verify_hooks repair path. Fix: release store or std::atomic_thread_fence(memory_order_release) before each set_code(nullptr) call.  (`audit/findings/hook_install_after_jit.md`)
+- **[medium]** was_compiled is captured before NO_COMPILE propagates (vmhook.hpp:10147) and the deopt branch at 10287 re-uses the stale snapshot instead of re-reading _code. An in-flight JIT completion after the snapshot produces install returning true with _code non-null and _from_compiled_entry never redirected; the watchdog repairs this within VMHOOK_AUTO_REPAIR_INTERVAL_MS (default 1000 ms) but hook misses every compiled call in that window.  (`audit/findings/hook_install_after_jit.md`)
+- **[medium]** Stale inline caches in already-compiled callers bypass the hook even after per-hook deopt. The install deopt clears _code and redirects _from_compiled_entry (vmhook.hpp:10297), which catches fresh IC resolutions, but compiled callers whose monomorphic IC already cached the nmethod's verified-entry-point skip _from_compiled_entry entirely. The README overstates coverage; the correct workflow requires deoptimize_all_jit_compiled_methods() after hook install to flush stale ICs.  (`audit/findings/hook_install_after_jit.md`)
+- **[medium]** set_code(nullptr) silently no-ops when the VMStructs Method::_code entry is missing (vmhook.hpp:10299 calls set_code which early-returns at ~2347 if iterate_struct_entries returns null). The success log at 10300-10301 prints regardless. Install reports deopt complete but _code was never cleared; compiled callers continue to bypass the hook with no diagnostic.  (`audit/findings/hook_install_after_jit.md`)
+- **[low]** c2i-unrecoverable fallback policy diverges between per-hook install and deoptimize_methods_if sweep: install (vmhook.hpp:10317-10318) forces deopt anyway (clears _code, redirects interpreted entry only), accepting one-cycle stale-IC bypass; the sweep (vmhook.hpp:8267-8286) bumps skipped_no_c2i and leaves the method JIT-compiled. Users pairing both paths can observe inconsistent deopt behaviour for the same method depending on which path ran first.  (`audit/findings/hook_install_after_jit.md`)
+
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+JDK-version sensitivities for the deopt path. On JDK 8, Method::_adapter is exported via
+gHotSpotVMStructs so get_adapter() (vmhook.hpp:2499-2548) takes the fast path and c2i
+recovery is deterministic. On JDK 9+ the field was removed from VMStructs; recovery falls
+back to detect_adapter_offset_from_method (vmhook.hpp:6155-6251), a heuristic scan that
+has been observed to succeed on JDK 17/21/24/25 (preferred-guess slot immediately before
+_from_compiled_entry) but may fail on unknown or stripped JVM builds. When recovery fails
+the install takes the c2i-unrecoverable fallback at vmhook.hpp:10303-10322: _code is
+cleared and _from_interpreted_entry is redirected to the i2i stub, but _from_compiled_entry
+is left pointing at the (now stale) nmethod. Compiled callers with stale ICs will call
+the old nmethod for one more cycle, then the IC is repaired at the next safepoint.
+
+OSR (On-Stack Replacement) compiled frames are NOT covered by the deopt path. Per-hook
+install deoptimises the Method* entry points so future dispatch routes through the
+interpreter, but threads currently executing an OSR-compiled frame for the hooked method
+continue in the OSR nmethod for the lifetime of that activation. The hook will not fire
+for those in-flight OSR frames; it fires on the next fresh invocation after the frame
+unwinds. This is a fundamental limitation of entry-point-level hooking versus full
+HotSpot safepoint-driven deoptimisation.
+
+The auto-repair watchdog (vmhook.hpp:10325-10328) is the only defence against re-JIT
+after install. HotSpot can race an in-flight compilation through the NO_COMPILE policy
+gate before the flag is visible to the compiler thread. Watchdog poll interval is
+VMHOOK_AUTO_REPAIR_INTERVAL_MS (default 1000 ms); during that window a re-JIT'd method
+bypasses the hook entirely. The watchdog is disabled during the functional test suite
+(b738d6c) to avoid cross-tick poll raw-derefs on clang/mingw where no SEH is available.
+
+Three sites in vmhook.hpp perform the same three-store deopt dance (per-hook install at
+10295-10299, deoptimize_methods_if sweep at ~8251-8287, verify_hooks repair at ~8265-8273)
+but have drifted in their c2i-fallback policy and logging detail. A shared
+apply_method_side_deopt(method*, void* i2i) helper would unify the fix for the ARM64
+ordering bug and the was_compiled stale-snapshot race across all three sites.

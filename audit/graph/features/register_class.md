@@ -26,6 +26,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/classloader_reanchor|classloader_reanchor]]
 - [[features/find_class_context_loader|find_class_context_loader]]
 
+## Depended on by
+
+- [[features/for_each_instance|for_each_instance]]
+
 ## Tests
 
 - `tests/jvm/modules/register_class.cpp`

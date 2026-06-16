@@ -194,8 +194,11 @@ flowchart LR
   find_class_fallback --> klass_introspection
   find_methods_by_signature --> signature_parsing
   find_methods_by_signature --> method_enumeration
+  for_each_instance --> vmstructs_offset_resolution
+  for_each_instance --> decode_oop_and_pointers
   for_each_instance --> klass_introspection
-  for_each_instance --> iterate_entries_safety
+  for_each_instance --> register_class
+  for_each_instance --> compressed_klass_decode
   for_each_loaded_class --> iterate_entries_safety
   for_each_loaded_class --> klass_introspection
   for_each_thread --> iterate_entries_safety
@@ -211,19 +214,24 @@ flowchart LR
   hook_chaining --> hook_basic
   hook_chaining --> midi2i_trampoline_alloc
   hook_chaining --> hook_common_detour_dispatch
+  hook_chaining --> method_entry_points_i2i_i2c
+  hook_chaining --> seh_invoke_detour
+  hook_chaining --> dont_inline_dont_compile
   hook_common_detour_dispatch --> seh_invoke_detour
   hook_common_detour_dispatch --> interpreter_frame_walk
   hook_common_detour_dispatch --> method_entry_points_i2i_i2c
   hook_install_after_jit --> hook_basic
   hook_install_after_jit --> deoptimize_methods
-  hook_install_after_jit --> method_entry_points_i2i_i2c
   hook_install_after_jit --> adapter_recovery_c2i
+  hook_install_after_jit --> method_entry_points_i2i_i2c
   hook_reinstall_after_shutdown --> shutdown_hooks_teardown
   hook_reinstall_after_shutdown --> hook_basic
   hook_signature --> hook_basic
   hook_signature --> signature_parsing
   hook_signature --> method_explicit_signature
   hook_unhook_double_free --> hook_basic
+  hook_unhook_double_free --> midi2i_trampoline_alloc
+  hook_unhook_double_free --> os_protect
   hook_unhook_double_free --> shutdown_hooks_teardown
   hook_verify_repair --> hook_basic
   hook_verify_repair --> midi2i_trampoline_alloc
@@ -289,6 +297,7 @@ flowchart LR
   return_value_cancel --> interpreter_frame_walk
   seh_invoke_detour --> os_signal_handler
   shutdown_hooks_teardown --> hook_basic
+  signature_parsing --> method_enumeration
   unified_call_syntax --> method_overload
   vmstructs_offset_resolution --> os_safe_read
   watch_static_field --> field_static

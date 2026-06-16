@@ -22,6 +22,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Depended on by
 
+- [[features/hook_chaining|hook_chaining]]
 - [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]]
 
 ## Notes

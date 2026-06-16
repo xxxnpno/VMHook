@@ -26,6 +26,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/find_methods_by_signature|find_methods_by_signature]]
 - [[features/method_call_primitives|method_call_primitives]]
 - [[features/method_explicit_signature|method_explicit_signature]]
+- [[features/signature_parsing|signature_parsing]]
 
 ## Tests
 
