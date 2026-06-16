@@ -1837,7 +1837,10 @@ static auto test_clamp_safe_container_count() -> void
     //     window the result is min(max(raw,0), cap), matched against an
     //     independent reference implementation. ---
     {
-        auto reference = [cap](std::int64_t raw) noexcept -> std::int32_t
+        // NB: 'cap' is constexpr, so it is usable inside the lambda WITHOUT a
+        // capture. Capturing it trips clang's -Wunused-lambda-capture (-Werror);
+        // g++ stays silent, so leave the capture list empty for both.
+        auto reference = [](std::int64_t raw) noexcept -> std::int32_t
         {
             if (raw <= 0) { return 0; }
             return static_cast<std::int32_t>(raw < cap ? raw : cap);
