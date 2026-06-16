@@ -32,10 +32,18 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Depended on by
 
+- [[features/collection_hash_tree_map|collection_hash_tree_map]]
+- [[features/collection_linked_list|collection_linked_list]]
+- [[features/collection_list|collection_list]]
+- [[features/collection_set|collection_set]]
 - [[features/collection_type_tags|collection_type_tags]]
+- [[features/decode_u5_unsigned5|decode_u5_unsigned5]]
 - [[features/enum_singleton|enum_singleton]]
 - [[features/field_inherited|field_inherited]]
+- [[features/field_introspection|field_introspection]]
+- [[features/find_class_context_loader|find_class_context_loader]]
 - [[features/find_class_fallback|find_class_fallback]]
+- [[features/find_methods_by_signature|find_methods_by_signature]]
 - [[features/for_each_instance|for_each_instance]]
 - [[features/for_each_loaded_class|for_each_loaded_class]]
 - [[features/hook_basic|hook_basic]]

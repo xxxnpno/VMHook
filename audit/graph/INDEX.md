@@ -4,13 +4,13 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 - **Features:** 109
 - **Categories:** 13
-- **`depends_on` edges:** 159
+- **`depends_on` edges:** 198
 
 ## Status
 
 - `queued`: 0
-- `seeded`: 108
-- `in_progress`: 1
+- `seeded`: 74
+- `in_progress`: 35
 - `audited`: 0
 - `perfected`: 0
 
@@ -18,12 +18,12 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 ### [[categories/bootstrap|Bootstrap / DLL entry]] · 1 feature(s)
 
-- [[features/dllmain_bootstrap|dllmain_bootstrap]] — `seeded` / `medium` — Dllmain Bootstrap
+- [[features/dllmain_bootstrap|dllmain_bootstrap]] — `in_progress` / `high` — Dllmain Bootstrap
 
 ### [[categories/hook|Hooking machinery (install / dispatch / trampolines)]] · 13 feature(s)
 
-- [[features/adapter_recovery_c2i|adapter_recovery_c2i]] — `seeded` / `medium` — Adapter Recovery C2I
-- [[features/dont_inline_dont_compile|dont_inline_dont_compile]] — `seeded` / `medium` — Dont Inline Dont Compile
+- [[features/adapter_recovery_c2i|adapter_recovery_c2i]] — `in_progress` / `high` — Adapter Recovery C2I
+- [[features/dont_inline_dont_compile|dont_inline_dont_compile]] — `in_progress` / `critical` — Dont Inline Dont Compile
 - [[features/hook_basic|hook_basic]] — `in_progress` / `critical` — Hook Install (basic)
 - [[features/hook_chaining|hook_chaining]] — `seeded` / `medium` — Hook Chaining
 - [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]] — `seeded` / `medium` — Hook Common Detour Dispatch
@@ -38,17 +38,17 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 ### [[categories/deopt|De-optimisation]] · 1 feature(s)
 
-- [[features/deoptimize_methods|deoptimize_methods]] — `seeded` / `medium` — Deoptimize Methods
+- [[features/deoptimize_methods|deoptimize_methods]] — `in_progress` / `medium` — Deoptimize Methods
 
 ### [[categories/klass|Class / Klass introspection]] · 15 feature(s)
 
-- [[features/classloader_reanchor|classloader_reanchor]] — `seeded` / `medium` — Classloader Reanchor
-- [[features/compressed_klass_decode|compressed_klass_decode]] — `seeded` / `medium` — Compressed Klass Decode
-- [[features/compressed_oops_decode|compressed_oops_decode]] — `seeded` / `medium` — Compressed Oops Decode
-- [[features/const_method_bounds|const_method_bounds]] — `seeded` / `medium` — Const Method Bounds
-- [[features/constantpool_access|constantpool_access]] — `seeded` / `medium` — Constantpool Access
-- [[features/decode_oop_and_pointers|decode_oop_and_pointers]] — `seeded` / `medium` — Decode Oop And Pointers
-- [[features/find_class_context_loader|find_class_context_loader]] — `seeded` / `medium` — Find Class Context Loader
+- [[features/classloader_reanchor|classloader_reanchor]] — `in_progress` / `medium` — Classloader Reanchor
+- [[features/compressed_klass_decode|compressed_klass_decode]] — `in_progress` / `medium` — Compressed Klass Decode
+- [[features/compressed_oops_decode|compressed_oops_decode]] — `in_progress` / `medium` — Compressed Oops Decode
+- [[features/const_method_bounds|const_method_bounds]] — `in_progress` / `medium` — Const Method Bounds
+- [[features/constantpool_access|constantpool_access]] — `in_progress` / `high` — Constantpool Access
+- [[features/decode_oop_and_pointers|decode_oop_and_pointers]] — `in_progress` / `medium` — Decode Oop And Pointers
+- [[features/find_class_context_loader|find_class_context_loader]] — `in_progress` / `high` — Find Class Context Loader
 - [[features/find_class_fallback|find_class_fallback]] — `seeded` / `medium` — Find Class Fallback
 - [[features/instanceklass_methods_walk|instanceklass_methods_walk]] — `seeded` / `medium` — Instanceklass Methods Walk
 - [[features/interface_polymorphism|interface_polymorphism]] — `seeded` / `medium` — Interface Polymorphism
@@ -60,7 +60,7 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 ### [[categories/method|Method proxies (resolve / call / dispatch)]] · 19 feature(s)
 
-- [[features/find_methods_by_signature|find_methods_by_signature]] — `seeded` / `medium` — Find Methods By Signature
+- [[features/find_methods_by_signature|find_methods_by_signature]] — `in_progress` / `low` — Find Methods By Signature
 - [[features/method_call_jni_fallback|method_call_jni_fallback]] — `seeded` / `medium` — Method Call Jni Fallback
 - [[features/method_call_object|method_call_object]] — `seeded` / `medium` — Method Call Object
 - [[features/method_call_primitives|method_call_primitives]] — `seeded` / `medium` — Method Call Primitives
@@ -82,31 +82,31 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 ### [[categories/field|Field proxies (get / set / introspection)]] · 14 feature(s)
 
-- [[features/field_arrays_object|field_arrays_object]] — `seeded` / `medium` — Field Arrays Object
-- [[features/field_arrays_primitive|field_arrays_primitive]] — `seeded` / `medium` — Field Arrays Primitive
-- [[features/field_inherited|field_inherited]] — `seeded` / `medium` — Field Inherited
-- [[features/field_introspection|field_introspection]] — `seeded` / `medium` — Field Introspection
-- [[features/field_null_safety|field_null_safety]] — `seeded` / `medium` — Field Null Safety
+- [[features/field_arrays_object|field_arrays_object]] — `in_progress` / `medium` — Field Arrays Object
+- [[features/field_arrays_primitive|field_arrays_primitive]] — `in_progress` / `high` — Field Arrays Primitive
+- [[features/field_inherited|field_inherited]] — `in_progress` / `medium` — Field Inherited
+- [[features/field_introspection|field_introspection]] — `in_progress` / `medium` — Field Introspection
+- [[features/field_null_safety|field_null_safety]] — `in_progress` / `low` — Field Null Safety
 - [[features/field_object_ref|field_object_ref]] — `seeded` / `medium` — Field Object Ref
-- [[features/field_primitives_get|field_primitives_get]] — `seeded` / `medium` — Field Primitives Get
-- [[features/field_primitives_set|field_primitives_set]] — `seeded` / `medium` — Field Primitives Set
-- [[features/field_proxy_set_guards|field_proxy_set_guards]] — `seeded` / `medium` — Field Proxy Set Guards
-- [[features/field_proxy_value_t|field_proxy_value_t]] — `seeded` / `medium` — Field Proxy Value T
-- [[features/field_set_size_guard|field_set_size_guard]] — `seeded` / `medium` — Field Set Size Guard
+- [[features/field_primitives_get|field_primitives_get]] — `in_progress` / `high` — Field Primitives Get
+- [[features/field_primitives_set|field_primitives_set]] — `in_progress` / `medium` — Field Primitives Set
+- [[features/field_proxy_set_guards|field_proxy_set_guards]] — `in_progress` / `medium` — Field Proxy Set Guards
+- [[features/field_proxy_value_t|field_proxy_value_t]] — `in_progress` / `medium` — Field Proxy Value T
+- [[features/field_set_size_guard|field_set_size_guard]] — `in_progress` / `low` — Field Set Size Guard
 - [[features/field_static|field_static]] — `seeded` / `medium` — Field Static
-- [[features/field_string|field_string]] — `seeded` / `medium` — Field String
+- [[features/field_string|field_string]] — `in_progress` / `high` — Field String
 - [[features/watch_static_field|watch_static_field]] — `seeded` / `medium` — Watch Static Field
 
 ### [[categories/collection|Collection wrappers + element helpers]] · 8 feature(s)
 
-- [[features/array_element_helpers|array_element_helpers]] — `seeded` / `medium` — Array Element Helpers
-- [[features/collection_hash_tree_map|collection_hash_tree_map]] — `seeded` / `medium` — Collection Hash Tree Map
-- [[features/collection_iteration_safety|collection_iteration_safety]] — `seeded` / `medium` — Collection Iteration Safety
-- [[features/collection_linked_list|collection_linked_list]] — `seeded` / `medium` — Collection Linked List
-- [[features/collection_list|collection_list]] — `seeded` / `medium` — Collection List
-- [[features/collection_map|collection_map]] — `seeded` / `medium` — Collection Map
-- [[features/collection_set|collection_set]] — `seeded` / `medium` — Collection Set
-- [[features/collection_type_tags|collection_type_tags]] — `seeded` / `medium` — Collection Type Tags
+- [[features/array_element_helpers|array_element_helpers]] — `in_progress` / `high` — Array Element Helpers
+- [[features/collection_hash_tree_map|collection_hash_tree_map]] — `in_progress` / `high` — Collection Hash Tree Map
+- [[features/collection_iteration_safety|collection_iteration_safety]] — `in_progress` / `medium` — Collection Iteration Safety
+- [[features/collection_linked_list|collection_linked_list]] — `in_progress` / `medium` — Collection Linked List
+- [[features/collection_list|collection_list]] — `in_progress` / `medium` — Collection List
+- [[features/collection_map|collection_map]] — `in_progress` / `high` — Collection Map
+- [[features/collection_set|collection_set]] — `in_progress` / `medium` — Collection Set
+- [[features/collection_type_tags|collection_type_tags]] — `in_progress` / `medium` — Collection Type Tags
 
 ### [[categories/return|return_value (detour-side return manipulation)]] · 8 feature(s)
 
@@ -147,15 +147,15 @@ This index is rebuilt from `audit/features/*.yaml`.  Edit the manifests, not thi
 
 ### [[categories/lifecycle|Lifecycle hooks (shutdown / class-load / exception / enum)]] · 4 feature(s)
 
-- [[features/enum_singleton|enum_singleton]] — `seeded` / `medium` — Enum Singleton
+- [[features/enum_singleton|enum_singleton]] — `in_progress` / `medium` — Enum Singleton
 - [[features/on_class_loaded|on_class_loaded]] — `seeded` / `medium` — On Class Loaded
 - [[features/on_exception|on_exception]] — `seeded` / `medium` — On Exception
 - [[features/shutdown_hooks_teardown|shutdown_hooks_teardown]] — `seeded` / `medium` — Shutdown Hooks Teardown
 
 ### [[categories/infra|Infrastructure (wrappers, traits, macros, logging)]] · 9 feature(s)
 
-- [[features/api_surface_no_jvm|api_surface_no_jvm]] — `seeded` / `medium` — Api Surface No Jvm
-- [[features/decode_u5_unsigned5|decode_u5_unsigned5]] — `seeded` / `medium` — Decode U5 Unsigned5
+- [[features/api_surface_no_jvm|api_surface_no_jvm]] — `in_progress` / `medium` — API Surface (no-JVM contract)
+- [[features/decode_u5_unsigned5|decode_u5_unsigned5]] — `in_progress` / `high` — Decode U5 Unsigned5
 - [[features/logging_format|logging_format]] — `seeded` / `medium` — Logging Format
 - [[features/make_unique|make_unique]] — `seeded` / `medium` — Make Unique
 - [[features/platform_capability_macros|platform_capability_macros]] — `seeded` / `medium` — Platform Capability Macros

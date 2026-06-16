@@ -29,6 +29,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Depended on by
 
+- [[features/enum_singleton|enum_singleton]]
 - [[features/watch_static_field|watch_static_field]]
 
 ## Tests

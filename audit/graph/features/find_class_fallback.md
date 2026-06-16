@@ -33,6 +33,11 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 ## Depended on by
 
 - [[features/classloader_reanchor|classloader_reanchor]]
+- [[features/collection_linked_list|collection_linked_list]]
+- [[features/enum_singleton|enum_singleton]]
+- [[features/field_inherited|field_inherited]]
+- [[features/field_introspection|field_introspection]]
+- [[features/field_null_safety|field_null_safety]]
 - [[features/find_class_context_loader|find_class_context_loader]]
 - [[features/hook_basic|hook_basic]]
 - [[features/register_class|register_class]]

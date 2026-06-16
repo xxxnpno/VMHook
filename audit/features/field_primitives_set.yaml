@@ -2,12 +2,16 @@ schema_version: 1
 slug: field_primitives_set
 title: Field Primitives Set
 category: field
-status: seeded
+status: in_progress
 risk: medium
 specialist: .claude/agents/field_primitives_set-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  Native field write (`field_proxy::set()`) for all JVM primitives (Z/B/S/C/I/J/F/D) — the write-side
+  mirror of `field_primitives_get`. Accepts width-matched primitive values and delegates string/vector/unique_ptr
+  to specialized arms. Runs exhaustive boundary tests on real HotSpot JVMs (Java 8-26) with three
+  independent "Java-observed" channels: bytecode snapshot witnesses, compare-in-Java, and bytecode getters.
+  Covers static AND instance dispatch, bit-exact float/double writes (including sNaN/payload), the "C"
+  1-byte-char widening shortcut, null-pointer no-op, and repeatability.
 java_versions:
 - 8
 - 11
@@ -16,18 +20,50 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags: [primitives, field-write, set, boundaries, float-exact, instance-static]
+hpp_anchors:
+  - symbol: "field_proxy::set<value_type>()"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [12059, 12194]
+    note: "main dispatch on C++ value type; non-primitive guard, string/vector/unique_ptr arms, trivially-copyable primitive path with size guard and 'C' widening shortcut"
+  - symbol: "jvm_primitive_byte_width"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [12359, 12374]
+    note: "oracle for primitive widths; consulted by both guards and primitive memcpy"
+  - symbol: "field_proxy::get<return_type>()"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [11988, 12049]
+    note: "read-side inverse; module round-trips every set() through get() to prove correctness"
 test_modules:
 - tests/jvm/modules/field_primitives_set.cpp
 depends_on:
-- field_proxy_set_guards
 - field_proxy_value_t
+- field_introspection
+- field_primitives_get
 related:
 - field_primitives_get
-- field_proxy_set_guards
 - field_set_size_guard
+- field_proxy_set_guards
 audit_docs: []
-known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+known_bugs:
+  - severity: high
+    note: "set() has size guard but NO type guard (12167-12180) — same-width, wrong-kind values pass (e.g. set(float) into int reinterprets IEEE-754 bits verbatim). Characterised (not fixed) by field_set_size_guard module; field_primitives_set only writes width-matched primitives and pins width-matched writes are never refused."
+  - severity: high
+    note: "'C' widening shortcut fires for ANY 1-byte trivially-copyable, not just char (12148). set(int8_t{-1}) into 'C' lands as 0x00FF (zero-extended), not 0xFFFF. Documented char path tested; int8_t/uint8_t characterisation owned by field_set_size_guard."
+  - severity: medium
+    note: "unique_ptr<wrapper> arm writes exactly 4 bytes unconditionally (12132-12135); under -XX:-UseCompressedOops, reference fields are 8 bytes and the high 4 bytes stay stale. Out of scope for primitive set (lives in same set()), CI never exercises (default-compressed-OOPs)."
+  - severity: medium
+    note: "'Z' write width is sizeof(bool), not hard 1 (12167). On ABI where sizeof(bool) > 1, set(bool) into 'Z' has value_size != 1 == field_size and size guard refuses write. Unobservable on CI (sizeof(bool)==1 on x64 MSVC/GCC/Clang), real per standard."
+  - severity: medium
+    note: "set() returns void (12060) — rejected writes (size mismatch, non-primitive, null) give no programmatic signal, only log line. Documented gap vs method_proxy::call(). Module works around by re-reading through get() and JVM bytecode."
+  - severity: low
+    note: "Doc drift: set() doc-comment (12051-12058) says 'JVM primitives, std::string ... std::vector<T>', omits const char*/string_view/unique_ptr arms that code actually has; static_assert message (12186-12192) lists different set again."
+notes: |
+  NaN canonicalisation sensitivity: HotSpot canonicalises Float.NaN; signaling-NaN / payload survive native
+  memcpy round-trip (12059-12194 primitive path) on JDK 8..25, but x87 FPU register loading canonicalises.
+  Module routes sNaN/payload ONLY through native memcpy + value-matrix field's canonical snapshot, never
+  through Java bytecode. Java channels capture F/D as RAW bits (floatToRawIntBits/doubleToRawLongBits);
+  value-class predicates (isNaN/isInfinite/signbit) are universal hard invariants independent of
+  canonicalisation. Char encoding: pure ASCII literals, fixture compiles identically on Windows/Linux/macOS.
+  C++17 module: memcpy type-pun (no std::bit_cast), clean at -Wall -Wextra, zero new warnings. Java 8
+  source: no var/records/post-8 APIs, verified under javac -source 8 -target 8.

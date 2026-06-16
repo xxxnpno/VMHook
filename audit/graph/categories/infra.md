@@ -11,8 +11,8 @@ tags: [category/infra]
 
 ## Features
 
-- [[features/api_surface_no_jvm|api_surface_no_jvm]] — `seeded` / `medium` — Api Surface No Jvm
-- [[features/decode_u5_unsigned5|decode_u5_unsigned5]] — `seeded` / `medium` — Decode U5 Unsigned5
+- [[features/api_surface_no_jvm|api_surface_no_jvm]] — `in_progress` / `medium` — API Surface (no-JVM contract)
+- [[features/decode_u5_unsigned5|decode_u5_unsigned5]] — `in_progress` / `high` — Decode U5 Unsigned5
 - [[features/logging_format|logging_format]] — `seeded` / `medium` — Logging Format
 - [[features/make_unique|make_unique]] — `seeded` / `medium` — Make Unique
 - [[features/platform_capability_macros|platform_capability_macros]] — `seeded` / `medium` — Platform Capability Macros
@@ -37,8 +37,10 @@ flowchart LR
     wrapper_pattern([wrapper_pattern])
   end
   subgraph external["(external deps)"]
+    klass_introspection[/klass_introspection/]
     method_overload[/method_overload/]
   end
+  decode_u5_unsigned5 --> klass_introspection
   make_unique --> wrapper_pattern
   unified_call_syntax --> method_overload
 ```

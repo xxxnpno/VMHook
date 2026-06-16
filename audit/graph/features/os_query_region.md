@@ -18,6 +18,8 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Depended on by
 
+- [[features/adapter_recovery_c2i|adapter_recovery_c2i]]
+- [[features/const_method_bounds|const_method_bounds]]
 - [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]]
 
 ## Notes

@@ -2,12 +2,19 @@ schema_version: 1
 slug: field_set_size_guard
 title: Field Set Size Guard
 category: field
-status: seeded
-risk: medium
+status: in_progress
+risk: low
 specialist: .claude/agents/field_set_size_guard-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  Size/type guard + anti-clobber safety net for `field_proxy::set()` — the API
+  that writes C++ values into raw Java field storage. Every trivially-copyable
+  write is width-checked against `jvm_primitive_byte_width()` to prevent
+  too-wide C++ values from spilling into adjacent fields; non-primitives
+  (string/vector/unique_ptr) are rejected on primitive-field targets to block
+  reinterpretation as compressed OOPs. The char-widening shortcut auto-promotes
+  1-byte C++ char to 2-byte Java char ("C" field). ANTI-CLOBBER PROOF tracks
+  all three: sentinels Before/Target/After, verifies contiguity, and confirms
+  too-wide writes are refused.
 java_versions:
 - 8
 - 11
@@ -16,8 +23,24 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags: [size-guard, anti-clobber, field, safety, primitives]
+hpp_anchors:
+  - symbol: "jvm_primitive_byte_width(std::string_view)"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [15890, 15905]
+    note: "maps JVM primitive signatures (Z/B/C/S/I/J/F/D) to byte widths; 0 for non-primitives"
+  - symbol: "field_proxy::set(const value_type&) — non-primitive guard"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [15371, 15399]
+    note: "rejects string/vector/unique_ptr writes on primitive fields (fires if jvm_primitive_byte_width != 0)"
+  - symbol: "field_proxy::set(const value_type&) — char widening shortcut"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [15460, 15486]
+    note: "auto-widens 1-byte C++ char to 2-byte uint16 for Java 'C' field (if constexpr guards non-arithmetic types)"
+  - symbol: "field_proxy::set(const value_type&) — size-mismatch guard"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [15488, 15516]
+    note: "refuses trivially-copyable write if sizeof(value) != jvm_primitive_byte_width(sig); prevents clobber of adjacent fields"
 test_modules:
 - tests/jvm/modules/field_set_size_guard.cpp
 depends_on:
@@ -28,5 +51,4 @@ related:
 - field_proxy_set_guards
 audit_docs: []
 known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+notes: Stub manifest — no JDK sensitivities known at this time. Guard behavior is deterministic and does not vary across JVM versions (width mappings are part of the JVM spec).

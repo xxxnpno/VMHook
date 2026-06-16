@@ -26,6 +26,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/method_is_reference|method_is_reference]]
 - [[features/method_overload|method_overload]]
 
+## Referenced from
+
+- [[features/constantpool_access|constantpool_access]]
+
 ## Tests
 
 - `tests/jvm/modules/signature_parsing.cpp`

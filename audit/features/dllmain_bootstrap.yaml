@@ -2,12 +2,17 @@ schema_version: 1
 slug: dllmain_bootstrap
 title: Dllmain Bootstrap
 category: bootstrap
-status: seeded
-risk: medium
+status: in_progress
+risk: high
 specialist: .claude/agents/dllmain_bootstrap-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  The platform entry-point glue responsible for spawning the modular test-suite worker thread
+  exactly once when the vmhook DLL/`.so` is loaded into a live JVM (via `DllMain` on Windows
+  or ELF constructor / `JNI_OnLoad` on POSIX). Its I/O contract: one platform entry point
+  → exactly one detached worker thread → `run_test_suite()` → all modular JVM test modules.
+  The bootstrap waits a fixed 2 seconds for JVM readiness, registers thirteen baseline wrapper
+  classes, then hands off to the modular harness; if readiness fails or worker spawns twice,
+  the entire test suite is silently skipped or the loader deadlocks.
 java_versions:
 - 8
 - 11
@@ -16,12 +21,71 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags: [entry-point, worker-spawn, jvm-readiness, once_flag, test-harness, loader-callback]
+hpp_anchors:
+  - symbol: "launch_worker_once()"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [3337, 3344]
+    note: "anonymous-namespace helper; function-local static once_flag guards std::call_once + std::thread{run_test_suite}.detach()"
+  - symbol: "DllMain (Windows)"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [3359, 3367]
+    note: "DLL_PROCESS_ATTACH calls DisableThreadLibraryCalls + launch_worker_once(), no DETACH path"
+  - symbol: "vmhook_so_init() (POSIX)"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [3371, 3375]
+    note: "__attribute__((constructor)) ELF constructor; calls launch_worker_once() at .so load time"
+  - symbol: "JNI_OnLoad"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [3377, 3381]
+    note: "extern \"C\" entry; also calls launch_worker_once(), returns 0x00010008 (JNI_VERSION_1_8)"
+  - symbol: "run_test_suite()"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [3202, 3333]
+    note: "worker body: 2s sleep (3204), register_class block (3208-3220), get_instance gate (3222-3224), modular run_all (3302), write_summary + set_stop_jvm (3325-3327)"
+  - symbol: "vmhook::register_class<T>(class_name)"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [6916, 6952]
+    note: "resolves klass via find_class; returns false if not loaded; runs single-threaded before any hook fires (documented contract)"
+  - symbol: "detail::auto_repair::ensure_started()"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [8712, 8736]
+    note: "auto-repair watchdog kicked on first hook install (8292); bootstrap worker triggers this via first hook"
+  - symbol: "shutdown_hooks()"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [8770, 8868]
+    note: "resets auto_repair::g_started and hotspot::g_shutdown_requested for re-init support (but bootstrap once_flag defeats re-spawn)"
 test_modules: []
 depends_on: []
-related: []
+related:
+  - hook_basic
+  - register_class
+  - on_class_loaded
+  - shutdown_hooks_teardown
 audit_docs: []
-known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+known_bugs:
+  - severity: high
+    note: "once_flag is process-lifetime — DLL unload+reload never re-spawns worker (example.cpp:3339). Function-local static flag's \"already ran\" state lives for image lifetime; if host FreeLibrary+re-LoadLibrary without OS unmapping, second launch_worker_once() sees flag satisfied and silently does nothing. Library's shutdown_hooks() (8858-8868) is reversible for re-init support, but bootstrap defeats it via permanent once_flag. Two layers disagree on re-init. Fix: gate on resettable std::atomic_flag/bool cleared by explicit teardown, not call_once."
+  - severity: high
+    note: "Fixed 2-second sleep is only JVM-readiness gate — a race, not a handshake (example.cpp:3204). On cold/loaded box or debugger, JVM may not finish class-loading vmhook/Example within 2s, so example_class::get_instance() (3222) returns null, if(instance) (3224) fails, entire suite skipped after single Example.instance=false check (3322). No poll-until-find_class loop or JavaVM-attached check. register_class already reports not-loaded (6921-6925) but bootstrap ignores signal. Fix: replace blind sleep with bounded poll on find_class(\"vmhook/Example\") / get_instance()."
+  - severity: medium
+    note: "register_class return values all discarded (example.cpp:3208-3220). Thirteen register_class<...> calls, every result dropped. If java/lang/System (3220) or any wrapper class not loaded at 2s mark, registration silently fails (6924 logs but returns false), first symptom is confusing downstream failure in unrelated module assuming factory exists. Bootstrap should at minimum check() each registration or re-register lazily. Lower than #2 only because #2's gate fix makes most succeed."
+  - severity: medium
+    note: "No DLL_PROCESS_DETACH path / worker never joined (example.cpp:3359-3367 has only ATTACH arm; 3342 .detach()). Worker detached and outlives control flow. If host unloads DLL while run_test_suite() mid-flight (e.g. inside run_all), image code/data unmapped under running thread → hard crash. No signal, wait, or unload block. For test harness \"acceptable\" (process lives to set_stop_jvm), but as reference bootstrap a host copies, models unsafe unload. Document or guard."
+  - severity: medium
+    note: "Classic loader-lock trap if host copies bootstrap naively (example.cpp:3364-3366). Code correct: DllMain only spawns detached thread and returns immediately — does NOT call JNI, load libraries, or take locks under loader lock. Hazard subtle: detached worker then calls register_class→find_class and installs hooks, touching LoadLibrary/symbol resolution from new thread — safe only because off loader-lock thread. Host inlining run_test_suite() into DllMain would deadlock. Feature's safety entirely on .detach(); that call is load-bearing and undocumented."
+  - severity: low
+    note: "JNI_OnLoad return type is int, not jint, and version is magic literal (example.cpp:3377-3380). 0x00010008 hand-coded for JNI_VERSION_1_8. Works (ABI-identical), but hypothetical JVM rejecting <1.8 or wanting higher floor silently mis-negotiates. Also ELF constructor AND JNI_OnLoad both run on System.loadLibrary — double entry collapsed only by once_flag; if flag logic changes (flaw #1 fix), double-entry must be reconsidered."
+  - severity: low
+    note: "test_results.txt opened with relative path + trunc (example.cpp:3206). Worker CWD is host process's CWD at load time, arbitrary for injected DLL (often C:\\Windows\\System32). Truncating open means second run clobbers first; unwritable CWD yields closed ofstream whose writes silently dropped (guarded by is_open() at 3329). Not a crash, but results vanish with no diagnostic."
+notes: |
+  JDK version sensitivities are primarily JVM-timing-dependent, not version-dependent. The
+  2-second readiness gate (flaw #2) is calibrated to "fast warm JVM"; JDK 9+ module-system
+  and JDK 21+ large CDS archives or many agents can push first-class-available past JDK 8's
+  timing, causing silent suite skip. JNI_OnLoad / shutdown_hooks contracts are stable on
+  HotSpot 8..26 (all accept JNI_VERSION_1_8, all support reversible shutdown). Worker
+  hand-off semantics differ by platform (Windows DllMain vs. POSIX ELF+JNI_OnLoad), not JDK
+  version. The once_flag (3339) collapses both platforms' double-entry to single worker. The
+  auto-repair watchdog (8292→8712) started by bootstrap's first hook install has its own
+  JDK-sensitive i2i/JIT assumptions, but that sensitivity is owned by hook/auto-repair
+  specialists, not bootstrap.

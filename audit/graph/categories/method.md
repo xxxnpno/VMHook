@@ -11,7 +11,7 @@ tags: [category/method]
 
 ## Features
 
-- [[features/find_methods_by_signature|find_methods_by_signature]] — `seeded` / `medium` — Find Methods By Signature
+- [[features/find_methods_by_signature|find_methods_by_signature]] — `in_progress` / `low` — Find Methods By Signature
 - [[features/method_call_jni_fallback|method_call_jni_fallback]] — `seeded` / `medium` — Method Call Jni Fallback
 - [[features/method_call_object|method_call_object]] — `seeded` / `medium` — Method Call Object
 - [[features/method_call_primitives|method_call_primitives]] — `seeded` / `medium` — Method Call Primitives
@@ -60,6 +60,7 @@ flowchart LR
     instanceklass_methods_walk[/instanceklass_methods_walk/]
     jni_arg_packing[/jni_arg_packing/]
     jni_local_ref_hygiene[/jni_local_ref_hygiene/]
+    klass_introspection[/klass_introspection/]
     make_java_string[/make_java_string/]
     on_exception[/on_exception/]
     read_java_string[/read_java_string/]
@@ -68,6 +69,7 @@ flowchart LR
   end
   find_methods_by_signature --> signature_parsing
   find_methods_by_signature --> method_enumeration
+  find_methods_by_signature --> klass_introspection
   method_call_jni_fallback --> method_call_primitives
   method_call_jni_fallback --> jni_arg_packing
   method_call_jni_fallback --> jni_local_ref_hygiene

@@ -18,6 +18,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Depended on by
 
+- [[features/find_class_context_loader|find_class_context_loader]]
 - [[features/global_ref|global_ref]]
 - [[features/make_java_string|make_java_string]]
 - [[features/method_call_jni_fallback|method_call_jni_fallback]]

@@ -2,12 +2,17 @@ schema_version: 1
 slug: collection_map
 title: Collection Map
 category: collection
-status: seeded
-risk: medium
+status: in_progress
+risk: high
 specialist: .claude/agents/collection_map-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  Decodes a live `java.util.Map` field (HashMap, LinkedHashMap, or TreeMap) directly from
+  the JVM heap into C++ `std::vector<std::pair<unique_ptr<K>,unique_ptr<V>>>` without JNI or
+  Java call-gates. The entry surface is `field_proxy::value_t::to_entries<K,V>()`, which
+  delegates to `vmhook::map::to_entries<K,V>()`. The dispatcher selects HashMap/LinkedHashMap
+  (via `table` field bucket walk) or TreeMap (via iterative red-black `root` in-order traversal).
+  Null keys/values decode as `nullptr` in the pair. All reads happen via compressed-oops oop
+  decoding and by-name field resolution off the live klass.
 java_versions:
 - 8
 - 11
@@ -16,8 +21,48 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags: [jvm, heap, compressed-oops, collection, field-walk]
+hpp_anchors:
+  - symbol: "field_proxy::value_t::to_entries<K,V>()"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [15696, 15711]
+    note: "entry point — reads field as narrow oop, decodes, null-guards, constructs vmhook::map and delegates"
+  - symbol: "vmhook::map::to_entries<K,V>()"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [15116, 15141]
+    note: "dispatcher — selects HashMap/LinkedHashMap (table field) or TreeMap (root field) fast path"
+  - symbol: "hash_map_walk_entries<K,V,out_t>"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [15249, 15329]
+    note: "bucket walk — decodes table array, iterates buckets, follows next chains per node"
+  - symbol: "tree_map_walk_entries<K,V,out_t>"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [15414, 15521]
+    note: "iterative in-order traversal with explicit stack — no recursion, visits all nodes sorted"
+  - symbol: "klass_from_oop"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [14597, 14611]
+    note: "reads narrow klass at oop+8, decodes via decode_klass_pointer"
+  - symbol: "get_field_by_oop_klass"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [14674, 14708]
+    note: "resolves field by name off live OOP's klass header (not C++ type registry)"
+  - symbol: "decode_oop_pointer"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [4288, 4352]
+    note: "compressed-oop decode — base + (compressed << shift) using CompressedOops VMStruct"
+  - symbol: "decode_array_oop"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [16078, 16087]
+    note: "thin object/array oop variant"
+  - symbol: "array_length"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [11542, 11551]
+    note: "reads _length at array oop+12 (compressed-oops header)"
+  - symbol: "read_java_string"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [15723, 15855]
+    note: "JDK8 char[] vs JDK9+ byte[]+coder LATIN1/UTF16 branching; decodes keys"
 test_modules:
 - tests/jvm/modules/collection_map.cpp
 depends_on:
@@ -27,6 +72,24 @@ related:
 - collection_list
 - collection_set
 audit_docs: []
-known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+known_bugs:
+  - severity: high
+    note: "Entire feature silently returns empty under -XX:-UseCompressedOops (heaps >32GB). All reference loads are hardcoded 4-byte narrow oops (15700, 15266-15268, 15431-15433, 15301-15309, 15323-15325, 15463-15466, 15510-15512, 14603-14604); decode_oop_pointer returns nullptr when CompressedOops VMStruct entries absent (4342-4345); no 8-byte fallback."
+  - severity: medium
+    note: "read_java_string and array_length bake in compressed-oops header offsets (+12 for _length, +16 for data, 15762/15771/11542-11551); with compression off, klass is 8 bytes and lengths move to +16/+20 — keys and bucket indices misread."
+  - severity: medium
+    note: "Fast-path selection is purely name-based (get_field_by_oop_klass('table') shadows 'root', 15127 vs 15134); HashMap wins ties; a third-party Map with 'table' field that is not HashMap.Node[] is mis-walked (15296-15299 bails to empty silently)."
+  - severity: low
+    note: "value_t::to_entries reads field oop with no type/signature check (15700); blindly reinterprets as narrow oop; primitive-typed field would be decoded as oop and fed to klass_from_oop; downstream guard (no table/root → empty) catches non-Map, but defense-by-luck not by signature gate."
+notes: |
+  **Compressed oops assumption (dominant sensitivity).** Feature only works with
+  -XX:+UseCompressedOops (the default below ~32GB heap on JDK 8..25). Disable it or cross
+  32GB and flaws #1/#2 make every map decode empty. CI matrix runs the default, masking the
+  limitation.
+  **String layout 8 vs 9+.** read_java_string branches on presence of coder field: JDK8 has
+  UTF-16 char[] value (no coder); JDK9+ has byte[]+coder LATIN1/UTF16. Keys in fixture are
+  pure ASCII so both paths decode identically.
+  **Node/TreeNode field stability.** HashMap.Node and HashMap.TreeNode expose key/value/next
+  since Java 8; TreeMap.Entry (key/value/left/right/parent/color) stable since Java 1.2.
+  A JDK renaming any field silently breaks the walk (find_field returns nullopt, chain bails
+  to empty, 15296-15299 / 15484-15487) rather than crashing.

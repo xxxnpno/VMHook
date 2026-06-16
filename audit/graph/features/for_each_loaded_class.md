@@ -26,6 +26,10 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/for_each_instance|for_each_instance]]
 - [[features/for_each_thread|for_each_thread]]
 
+## Depended on by
+
+- [[features/deoptimize_methods|deoptimize_methods]]
+
 ## Tests
 
 - `tests/jvm/modules/for_each_loaded_class.cpp`

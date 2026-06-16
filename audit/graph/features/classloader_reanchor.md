@@ -2,19 +2,26 @@
 slug: classloader_reanchor
 title: Classloader Reanchor
 category: klass
-status: seeded
+status: in_progress
 risk: medium
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/klass]
+tags: [status/in_progress, risk/medium, category/klass, tag/jvm, tag/classloader, tag/safety, tag/cache]
 ---
 
 # Classloader Reanchor
 
-> **Category:** [[categories/klass|Class / Klass introspection]]  ·  **Status:** `seeded`  ·  **Risk:** `medium`  ·  **Specialist:** `.claude/agents/classloader_reanchor-specialist.md`
+> **Category:** [[categories/klass|Class / Klass introspection]]  ·  **Status:** `in_progress`  ·  **Risk:** `medium`  ·  **Specialist:** `.claude/agents/classloader_reanchor-specialist.md`
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
+Corrective class lookup: when `find_class(name)` returns the wrong class copy
+in a multi-loader scenario (OSGi, modded games, app servers), use an anchor
+object's loader chain to resolve the correct copy via `find_class_via_oop`,
+cache it globally via `override_class_lookup`, and make every `find_class`
+consumer follow that copy. Input: anchor OOP + class name; output: Klass* or
+nullptr. Critical for correctness in dual-loader processes but poisonous to
+the shared cache — all overrides must be save/restore paired to avoid corrupting
+downstream features.
 
 ## Depends on
 
@@ -25,10 +32,42 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/find_class_context_loader|find_class_context_loader]]
 - [[features/register_class|register_class]]
 
+## Implementation anchors
+
+- `vmhook::find_class_via_oop(anchor_oop, name)` — `vmhook/ext/vmhook/vmhook.hpp:10647-10728` — anchor resolver: wraps OOP as JNI handle, walks loader chain, calls ClassLoader.loadClass
+- `vmhook::override_class_lookup(name, k)` — `vmhook/ext/vmhook/vmhook.hpp:10742-10753` — seeds/replaces cache entry — last-write-wins, no revert tracking
+- `vmhook::evict_class_lookup(name)` — `vmhook/ext/vmhook/vmhook.hpp:10760-10771` — erases cached entry; safe no-op on absent names
+- `vmhook::reanchor_classes_via_oop(anchor_oop, {names...})` — `vmhook/ext/vmhook/vmhook.hpp:10785-10807` — batch anchor: resolves all names via anchor, overrides cache, returns true only on total success
+- `vmhook::klass_lookup_cache + klass_lookup_cache_mutex` — `vmhook/ext/vmhook/vmhook.hpp:6304-6305` — process-global shared cache consulted first by find_class (6321-6403)
+- `vmhook::jni::find_class_with_context_loader(name)` — `vmhook/ext/vmhook/vmhook.hpp:10493-10497` — public façade — delegates to detail::jni_find_class_with_context_loader (9534-9665)
+- `detail::jni_find_class_with_context_loader(name)` — `vmhook/ext/vmhook/vmhook.hpp:9534-9665` — multi-loader JNI walk: context loader → system loader → Minecraft Launch.classLoader fallback; RAII local_ref_bag
+- `detail::klass_to_class_loader_oop(k)` — `vmhook/ext/vmhook/vmhook.hpp:9713-9733` — reads Klass._class_loader_data -> ClassLoaderData._class_loader; bootstrap ⇒ null
+- `class_loader_data::get_class_loader_oop()` — `vmhook/ext/vmhook/vmhook.hpp:3253-3283` — reads ClassLoaderData::_class_loader with transparent JDK-10+ OopHandle indirection
+- `detail::capture_host_classloader_klass(candidate)` — `vmhook/ext/vmhook/vmhook.hpp:9742-9768` — CAS-publishes first non-bootstrap klass to host_classloader_klass (9701); called by find_class on fresh resolution (6395)
+- `detail::inherit_host_context_classloader_for_current_thread()` — `vmhook/ext/vmhook/vmhook.hpp:9784-9850` — re-derives loader oop per attach and Thread.setContextClassLoader on current native thread
+- `jni_oop_handle` — `vmhook/ext/vmhook/vmhook.hpp:9276-9281` — synthetic JNI handle — writes oop into caller storage, returns &storage (not deleted)
+- `jni_klass_from_class_mirror` — `vmhook/ext/vmhook/vmhook.hpp:9514-9532` — decodes jclass mirror to Klass* via java_lang_Class._klass_offset
+- `ensure_current_java_thread` — `vmhook/ext/vmhook/vmhook.hpp:4120-4163` — JNI attach; returns false in no-JVM process (crash-safety guard for out-of-process callers)
+
 ## Tests
 
 - `tests/test_classloader_reanchor.cpp`
 
+## Known bugs
+
+- **[medium]** override_class_lookup(name, nullptr) does NOT seed a durable negative entry — find_class cache-hit (6348) is 'if (cached_klass && is_valid_pointer)' so null fails guard, falls through to erase (6363), and next find_class re-resolves non-null. Doc contract (10737-10738) is false; either doc is wrong or find_class should honor sentinel-null as real negative cache (10742-10753 vs 6348 disagree).
+- **[medium]** override_class_lookup / reanchor_classes_via_oop poison process-global klass_lookup_cache (6304) with loader-specific copy, no ownership/revert tracking. Last-write-wins (10748 is =, not insert), no refcount, no restore-previous. Any caller must manually save+restore or corrupts global state for all downstream features (10742-10753, 10785-10807 vs 6304-6305).
+- **[low]** find_class_via_oop leaks anchor_class_handle / name_string / classloader local refs on early-success paths — hand-rolls DeleteLocalRef through 8 return points (10660-10727) instead of RAII local_ref_bag pattern (like jni_find_class_with_context_loader uses 9553-9571); jni_oop_handle storage (10655) is intentionally not deleted (stack pointer).
+- **[low]** find_class_via_oop dots name unconditionally (std::replace '/' to '.' at 10705-10706) so cannot resolve array names — '[Lx/Y;' becomes '[Lx.Y;' which ClassLoader.loadClass rejects. Anchor resolver for array element types always fails with no diagnostic (10705-10706).
+- **[low]** klass_to_class_loader_oop / inherit_host_context_classloader cache OopHandle-vs-direct decision and VMStruct offset in static locals keyed off FIRST call (3256-3266, get_class_loader_oop). Benign in single JVM but layout decision frozen process-wide; returned loader oop is raw heap pointer (3277-3282) that relocating GC can move — only inherit_host_context_classloader_for_current_thread re-derives per attach (9794), new callers stashing result across safepoint read stale/garbage oop.
+- **[low]** No upper bound / dedup in reanchor_classes_via_oop's initializer_list, and partial failure is silent-partial. If 3 of 4 names resolve, 3 cache entries are mutated and function returns false (10803) — caller polling-until-true (10779-10781) re-overrides the 3 already-resolved on every poll, leaving cache in half-anchored state with no signal of which name failed (10785-10807).
+
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+JDK-version sensitivities: ClassLoaderData::_class_loader layout differs (JDK 8-9 direct oop,
+JDK 10+ OopHandle); detected at runtime via VMStruct type_string (3264-3279). java_lang_Class._klass_offset
+(9523) is the single point decoding mirror to Klass*; absent on future JVMs returns nullptr with no symptom.
+Compact-strings / java.lang.String.coder (JDK 8 absent, 9+ present) is a generation marker. Bootstrap-loader
+is denoted by null _class_loader (valid result, not error, on 8..26). Minecraft net/minecraft/launchwrapper/Launch
+fallback (9642-9658) is legacy Forge path (Java 8-era), best-effort, cleanly misses on non-modded JVMs.
+ensure_current_java_thread (4120) attaches via JNI; uniform 8..26, returns false in no-JVM process (crash-safety guarantee).

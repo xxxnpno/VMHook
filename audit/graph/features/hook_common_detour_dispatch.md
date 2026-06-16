@@ -30,6 +30,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Depended on by
 
+- [[features/dont_inline_dont_compile|dont_inline_dont_compile]]
 - [[features/hook_basic|hook_basic]]
 - [[features/hook_chaining|hook_chaining]]
 

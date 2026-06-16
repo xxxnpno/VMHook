@@ -30,6 +30,7 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/compressed_klass_decode|compressed_klass_decode]]
 - [[features/compressed_oops_decode|compressed_oops_decode]]
 - [[features/constantpool_access|constantpool_access]]
+- [[features/deoptimize_methods|deoptimize_methods]]
 - [[features/field_introspection|field_introspection]]
 - [[features/find_class_fallback|find_class_fallback]]
 - [[features/instanceklass_methods_walk|instanceklass_methods_walk]]

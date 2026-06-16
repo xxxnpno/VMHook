@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-06-15T21:19:59Z",
+  "generated_at": "2026-06-16T10:46:43Z",
   "feature_count": 109,
-  "edge_count": 434,
+  "edge_count": 500,
   "categories": [
     {
       "slug": "bootstrap",
@@ -197,12 +197,13 @@
       "slug": "adapter_recovery_c2i",
       "title": "Adapter Recovery C2I",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/adapter_recovery_c2i-specialist.md",
       "depends_on": [
         "method_entry_points_i2i_i2c",
-        "vmstructs_offset_resolution"
+        "vmstructs_offset_resolution",
+        "os_query_region"
       ],
       "related": [
         "hook_basic",
@@ -210,7 +211,13 @@
         "hook_install_after_jit",
         "method_entry_points_i2i_i2c"
       ],
-      "tags": [],
+      "tags": [
+        "jvm",
+        "safety",
+        "deopt",
+        "heuristic",
+        "recovery"
+      ],
       "test_modules": [],
       "audit_docs": [],
       "java_versions": [
@@ -225,15 +232,24 @@
     },
     {
       "slug": "api_surface_no_jvm",
-      "title": "Api Surface No Jvm",
+      "title": "API Surface (no-JVM contract)",
       "category": "infra",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/api_surface_no_jvm-specialist.md",
       "depends_on": [],
       "related": [],
-      "tags": [],
-      "test_modules": [],
+      "tags": [
+        "safety",
+        "no-throw",
+        "no-jvm",
+        "compile-surface",
+        "runtime-contract"
+      ],
+      "test_modules": [
+        "tests/test_api_surface.cpp",
+        "tests/test_api_surface_extended.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -249,12 +265,25 @@
       "slug": "array_element_helpers",
       "title": "Array Element Helpers",
       "category": "collection",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/array_element_helpers-specialist.md",
       "depends_on": [],
-      "related": [],
-      "tags": [],
+      "related": [
+        "field_proxy_value_t",
+        "decode_oop_and_pointers",
+        "compressed_oops_decode",
+        "make_java_string",
+        "make_java_array"
+      ],
+      "tags": [
+        "array",
+        "pointer-arithmetic",
+        "primitive",
+        "x86_64",
+        "safety",
+        "memory"
+      ],
       "test_modules": [
         "tests/test_array_element_helpers.cpp"
       ],
@@ -273,7 +302,7 @@
       "slug": "classloader_reanchor",
       "title": "Classloader Reanchor",
       "category": "klass",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/classloader_reanchor-specialist.md",
       "depends_on": [
@@ -283,7 +312,12 @@
         "find_class_context_loader",
         "register_class"
       ],
-      "tags": [],
+      "tags": [
+        "jvm",
+        "classloader",
+        "safety",
+        "cache"
+      ],
       "test_modules": [
         "tests/test_classloader_reanchor.cpp"
       ],
@@ -302,18 +336,27 @@
       "slug": "collection_hash_tree_map",
       "title": "Collection Hash Tree Map",
       "category": "collection",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/collection_hash_tree_map-specialist.md",
       "depends_on": [
         "collection_map",
-        "collection_iteration_safety"
+        "collection_iteration_safety",
+        "decode_oop_and_pointers",
+        "klass_introspection"
       ],
       "related": [
         "collection_iteration_safety",
         "collection_linked_list"
       ],
-      "tags": [],
+      "tags": [
+        "jvm",
+        "collection",
+        "map",
+        "oops",
+        "traversal",
+        "safety"
+      ],
       "test_modules": [
         "tests/jvm/modules/collection_hash_tree_map.cpp"
       ],
@@ -332,7 +375,7 @@
       "slug": "collection_iteration_safety",
       "title": "Collection Iteration Safety",
       "category": "collection",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/collection_iteration_safety-specialist.md",
       "depends_on": [
@@ -344,7 +387,14 @@
         "collection_hash_tree_map",
         "collection_linked_list"
       ],
-      "tags": [],
+      "tags": [
+        "jvm",
+        "x86_64",
+        "safety",
+        "bounds",
+        "robustness",
+        "collection"
+      ],
       "test_modules": [
         "tests/jvm/modules/collection_iteration_safety.cpp"
       ],
@@ -363,18 +413,27 @@
       "slug": "collection_linked_list",
       "title": "Collection Linked List",
       "category": "collection",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/collection_linked_list-specialist.md",
       "depends_on": [
         "collection_list",
-        "collection_iteration_safety"
+        "collection_iteration_safety",
+        "find_class_fallback",
+        "klass_introspection",
+        "decode_oop_and_pointers"
       ],
       "related": [
         "collection_hash_tree_map",
-        "collection_iteration_safety"
+        "collection_iteration_safety",
+        "collection_list"
       ],
-      "tags": [],
+      "tags": [
+        "jvm",
+        "collection",
+        "memory-safe",
+        "field-walk"
+      ],
       "test_modules": [
         "tests/jvm/modules/collection_linked_list.cpp"
       ],
@@ -393,19 +452,26 @@
       "slug": "collection_list",
       "title": "Collection List",
       "category": "collection",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/collection_list-specialist.md",
       "depends_on": [
         "collection_type_tags",
         "array_element_helpers",
-        "wrapper_pattern"
+        "wrapper_pattern",
+        "decode_oop_and_pointers",
+        "klass_introspection"
       ],
       "related": [
         "collection_map",
         "collection_set"
       ],
-      "tags": [],
+      "tags": [
+        "jvm",
+        "collections",
+        "oop_decode",
+        "reference_walk"
+      ],
       "test_modules": [
         "tests/jvm/modules/collection_list.cpp"
       ],
@@ -424,8 +490,8 @@
       "slug": "collection_map",
       "title": "Collection Map",
       "category": "collection",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/collection_map-specialist.md",
       "depends_on": [
         "collection_type_tags",
@@ -435,7 +501,13 @@
         "collection_list",
         "collection_set"
       ],
-      "tags": [],
+      "tags": [
+        "jvm",
+        "heap",
+        "compressed-oops",
+        "collection",
+        "field-walk"
+      ],
       "test_modules": [
         "tests/jvm/modules/collection_map.cpp"
       ],
@@ -454,18 +526,27 @@
       "slug": "collection_set",
       "title": "Collection Set",
       "category": "collection",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/collection_set-specialist.md",
       "depends_on": [
         "collection_type_tags",
-        "wrapper_pattern"
+        "wrapper_pattern",
+        "decode_oop_and_pointers",
+        "klass_introspection"
       ],
       "related": [
         "collection_list",
         "collection_map"
       ],
-      "tags": [],
+      "tags": [
+        "jvm",
+        "collection",
+        "vector",
+        "HashSet",
+        "TreeSet",
+        "field-decode"
+      ],
       "test_modules": [
         "tests/jvm/modules/collection_set.cpp",
         "tests/jvm/modules/collection_set_exhaustive.cpp"
@@ -485,14 +566,31 @@
       "slug": "collection_type_tags",
       "title": "Collection Type Tags",
       "category": "collection",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/collection_type_tags-specialist.md",
       "depends_on": [
-        "klass_introspection"
+        "klass_introspection",
+        "decode_oop_and_pointers"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "collection_list",
+        "collection_set",
+        "collection_map",
+        "collection_linked_list",
+        "collection_hash_tree_map"
+      ],
+      "tags": [
+        "containers",
+        "type-tags",
+        "to_vector",
+        "to_entries",
+        "ArrayList",
+        "LinkedList",
+        "HashMap",
+        "TreeMap",
+        "field-detection"
+      ],
       "test_modules": [
         "tests/test_collection_type_tags.cpp"
       ],
@@ -511,20 +609,32 @@
       "slug": "compressed_klass_decode",
       "title": "Compressed Klass Decode",
       "category": "klass",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/compressed_klass_decode-specialist.md",
       "depends_on": [
-        "vmstructs_offset_resolution"
+        "vmstructs_offset_resolution",
+        "compressed_oops_decode",
+        "decode_oop_and_pointers"
       ],
       "related": [
         "compressed_oops_decode",
         "constantpool_access",
         "find_class_fallback",
         "instanceklass_methods_walk",
-        "klass_introspection"
+        "klass_introspection",
+        "for_each_instance",
+        "make_unique"
       ],
-      "tags": [],
+      "tags": [
+        "klass",
+        "compressed-pointers",
+        "header",
+        "metadata",
+        "OOP-sibling",
+        "Lilliput-risk",
+        "JDK-variant"
+      ],
       "test_modules": [
         "tests/test_compressed_klass_decode.cpp"
       ],
@@ -543,7 +653,7 @@
       "slug": "compressed_oops_decode",
       "title": "Compressed Oops Decode",
       "category": "klass",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/compressed_oops_decode-specialist.md",
       "depends_on": [
@@ -556,7 +666,13 @@
         "instanceklass_methods_walk",
         "klass_introspection"
       ],
-      "tags": [],
+      "tags": [
+        "oop",
+        "codec",
+        "heap",
+        "hotspot",
+        "compression"
+      ],
       "test_modules": [
         "tests/jvm/modules/compressed_oops_decode.cpp"
       ],
@@ -575,17 +691,28 @@
       "slug": "const_method_bounds",
       "title": "Const Method Bounds",
       "category": "klass",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/const_method_bounds-specialist.md",
       "depends_on": [
-        "constantpool_access"
+        "constantpool_access",
+        "decode_oop_and_pointers",
+        "os_query_region"
       ],
-      "related": [],
-      "tags": [],
-      "test_modules": [
-        "tests/test_const_method_bounds.cpp"
+      "related": [
+        "hook_basic",
+        "method_enumeration",
+        "klass_introspection",
+        "find_methods_by_signature"
       ],
+      "tags": [
+        "bounds-check",
+        "constant-pool",
+        "symbol-resolution",
+        "defensive",
+        "AV-guard"
+      ],
+      "test_modules": [],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -601,8 +728,8 @@
       "slug": "constantpool_access",
       "title": "Constantpool Access",
       "category": "klass",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/constantpool_access-specialist.md",
       "depends_on": [
         "vmstructs_offset_resolution"
@@ -612,9 +739,19 @@
         "compressed_oops_decode",
         "find_class_fallback",
         "instanceklass_methods_walk",
-        "klass_introspection"
+        "klass_introspection",
+        "signature_parsing",
+        "field_introspection",
+        "method_overload"
       ],
-      "tags": [],
+      "tags": [
+        "constant-pool",
+        "symbol",
+        "bounds",
+        "map-check",
+        "field-metadata",
+        "method-metadata"
+      ],
       "test_modules": [],
       "audit_docs": [],
       "java_versions": [
@@ -631,7 +768,7 @@
       "slug": "decode_oop_and_pointers",
       "title": "Decode Oop And Pointers",
       "category": "klass",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/decode_oop_and_pointers-specialist.md",
       "depends_on": [
@@ -639,9 +776,17 @@
         "os_safe_read"
       ],
       "related": [
-        "vmstructs_offset_resolution"
+        "vmstructs_offset_resolution",
+        "klass_introspection"
       ],
-      "tags": [],
+      "tags": [
+        "pointer",
+        "codec",
+        "compressed-oops",
+        "validation",
+        "narrow-oop",
+        "fault-safe"
+      ],
       "test_modules": [
         "tests/test_decode_oop_and_pointers.cpp"
       ],
@@ -660,20 +805,29 @@
       "slug": "decode_u5_unsigned5",
       "title": "Decode U5 Unsigned5",
       "category": "infra",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/decode_u5_unsigned5-specialist.md",
-      "depends_on": [],
-      "related": [],
-      "tags": [],
+      "depends_on": [
+        "klass_introspection"
+      ],
+      "related": [
+        "field_introspection",
+        "field_object_ref"
+      ],
+      "tags": [
+        "variable-length-encoding",
+        "unsigned5",
+        "field-stream",
+        "jdk21+",
+        "hotspot-codec"
+      ],
       "test_modules": [
-        "tests/jvm/modules/decode_u5_unsigned5.cpp"
+        "tests/jvm/modules/decode_u5_unsigned5.cpp",
+        "tests/test_decode_u5.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
-        8,
-        11,
-        17,
         21,
         24,
         25,
@@ -684,16 +838,26 @@
       "slug": "deoptimize_methods",
       "title": "Deoptimize Methods",
       "category": "deopt",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/deoptimize_methods-specialist.md",
       "depends_on": [
         "method_enumeration",
         "adapter_recovery_c2i",
-        "method_entry_points_i2i_i2c"
+        "method_entry_points_i2i_i2c",
+        "for_each_loaded_class",
+        "vmstructs_offset_resolution",
+        "instanceklass_methods_walk"
       ],
       "related": [],
-      "tags": [],
+      "tags": [
+        "jit",
+        "deoptimization",
+        "interpreter",
+        "entry-points",
+        "klass-walk",
+        "fault-safe"
+      ],
       "test_modules": [
         "tests/jvm/modules/deoptimize_methods.cpp"
       ],
@@ -712,12 +876,24 @@
       "slug": "dllmain_bootstrap",
       "title": "Dllmain Bootstrap",
       "category": "bootstrap",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/dllmain_bootstrap-specialist.md",
       "depends_on": [],
-      "related": [],
-      "tags": [],
+      "related": [
+        "hook_basic",
+        "register_class",
+        "on_class_loaded",
+        "shutdown_hooks_teardown"
+      ],
+      "tags": [
+        "entry-point",
+        "worker-spawn",
+        "jvm-readiness",
+        "once_flag",
+        "test-harness",
+        "loader-callback"
+      ],
       "test_modules": [],
       "audit_docs": [],
       "java_versions": [
@@ -734,12 +910,13 @@
       "slug": "dont_inline_dont_compile",
       "title": "Dont Inline Dont Compile",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "critical",
       "specialist": ".claude/agents/dont_inline_dont_compile-specialist.md",
       "depends_on": [
         "method_flags_width",
-        "hook_basic"
+        "hook_basic",
+        "hook_common_detour_dispatch"
       ],
       "related": [
         "hook_chaining",
@@ -749,11 +926,18 @@
         "hook_unhook_double_free",
         "hook_verify_repair"
       ],
-      "tags": [],
+      "tags": [
+        "jit-inhibitor",
+        "method-flags",
+        "compiler-guard",
+        "interpreter-dispatch"
+      ],
       "test_modules": [
         "tests/jvm/modules/dont_inline_dont_compile.cpp"
       ],
-      "audit_docs": [],
+      "audit_docs": [
+        "audit/findings/dont_inline_dont_compile_flags.md"
+      ],
       "java_versions": [
         8,
         11,
@@ -768,15 +952,27 @@
       "slug": "enum_singleton",
       "title": "Enum Singleton",
       "category": "lifecycle",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/enum_singleton-specialist.md",
       "depends_on": [
         "wrapper_pattern",
-        "klass_introspection"
+        "klass_introspection",
+        "field_introspection",
+        "field_static",
+        "compressed_oops_decode",
+        "find_class_fallback"
       ],
       "related": [],
-      "tags": [],
+      "tags": [
+        "enum",
+        "singleton",
+        "nested-class",
+        "field-read",
+        "static-field",
+        "oop-decode",
+        "reference"
+      ],
       "test_modules": [
         "tests/jvm/modules/enum_singleton.cpp"
       ],
@@ -795,20 +991,30 @@
       "slug": "field_arrays_object",
       "title": "Field Arrays Object",
       "category": "field",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/field_arrays_object-specialist.md",
       "depends_on": [
         "field_object_ref",
         "array_element_helpers",
-        "wrapper_pattern"
+        "wrapper_pattern",
+        "compressed_oops_decode"
       ],
       "related": [
         "field_arrays_primitive",
         "field_object_ref",
         "field_string"
       ],
-      "tags": [],
+      "tags": [
+        "field",
+        "reference",
+        "array",
+        "string",
+        "object",
+        "vector",
+        "compressed-oop",
+        "memory-introspection"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_arrays_object.cpp"
       ],
@@ -827,8 +1033,8 @@
       "slug": "field_arrays_primitive",
       "title": "Field Arrays Primitive",
       "category": "field",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/field_arrays_primitive-specialist.md",
       "depends_on": [
         "field_primitives_get",
@@ -837,7 +1043,14 @@
       "related": [
         "field_arrays_object"
       ],
-      "tags": [],
+      "tags": [
+        "field",
+        "array",
+        "primitive",
+        "vector",
+        "noexcept",
+        "bounds-check"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_arrays_primitive.cpp"
       ],
@@ -856,12 +1069,14 @@
       "slug": "field_inherited",
       "title": "Field Inherited",
       "category": "field",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/field_inherited-specialist.md",
       "depends_on": [
         "field_introspection",
-        "klass_introspection"
+        "klass_introspection",
+        "decode_oop_and_pointers",
+        "find_class_fallback"
       ],
       "related": [
         "field_null_safety",
@@ -869,7 +1084,12 @@
         "field_proxy_value_t",
         "field_static"
       ],
-      "tags": [],
+      "tags": [
+        "inheritance",
+        "shadowing",
+        "static-fields",
+        "access-flags-ignored"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_inherited.cpp"
       ],
@@ -888,15 +1108,26 @@
       "slug": "field_introspection",
       "title": "Field Introspection",
       "category": "field",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/field_introspection-specialist.md",
       "depends_on": [
         "constantpool_access",
-        "vmstructs_offset_resolution"
+        "vmstructs_offset_resolution",
+        "find_class_fallback",
+        "klass_introspection"
       ],
       "related": [],
-      "tags": [],
+      "tags": [
+        "introspection",
+        "field",
+        "reference",
+        "primitive",
+        "static",
+        "instance",
+        "oop",
+        "addressing"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_introspection.cpp"
       ],
@@ -915,19 +1146,26 @@
       "slug": "field_null_safety",
       "title": "Field Null Safety",
       "category": "field",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "low",
       "specialist": ".claude/agents/field_null_safety-specialist.md",
       "depends_on": [
-        "field_introspection"
+        "field_introspection",
+        "field_proxy_value_t",
+        "find_class_fallback"
       ],
       "related": [
         "field_inherited",
         "field_primitives_get",
-        "field_proxy_value_t",
         "field_static"
       ],
-      "tags": [],
+      "tags": [
+        "field",
+        "null-safety",
+        "robustness",
+        "lookup",
+        "degenerate-input"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_null_safety.cpp"
       ],
@@ -975,8 +1213,8 @@
       "slug": "field_primitives_get",
       "title": "Field Primitives Get",
       "category": "field",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/field_primitives_get-specialist.md",
       "depends_on": [
         "field_introspection",
@@ -987,10 +1225,16 @@
         "field_null_safety",
         "field_primitives_set",
         "field_proxy_set_guards",
-        "field_proxy_value_t",
         "field_set_size_guard"
       ],
-      "tags": [],
+      "tags": [
+        "primitive",
+        "field-access",
+        "variant",
+        "value_t",
+        "memcpy",
+        "descriptor"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_primitives_get.cpp"
       ],
@@ -1009,19 +1253,27 @@
       "slug": "field_primitives_set",
       "title": "Field Primitives Set",
       "category": "field",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/field_primitives_set-specialist.md",
       "depends_on": [
-        "field_proxy_set_guards",
-        "field_proxy_value_t"
+        "field_proxy_value_t",
+        "field_introspection",
+        "field_primitives_get"
       ],
       "related": [
         "field_primitives_get",
-        "field_proxy_set_guards",
-        "field_set_size_guard"
+        "field_set_size_guard",
+        "field_proxy_set_guards"
       ],
-      "tags": [],
+      "tags": [
+        "primitives",
+        "field-write",
+        "set",
+        "boundaries",
+        "float-exact",
+        "instance-static"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_primitives_set.cpp"
       ],
@@ -1040,7 +1292,7 @@
       "slug": "field_proxy_set_guards",
       "title": "Field Proxy Set Guards",
       "category": "field",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/field_proxy_set_guards-specialist.md",
       "depends_on": [
@@ -1052,7 +1304,13 @@
         "field_primitives_set",
         "field_set_size_guard"
       ],
-      "tags": [],
+      "tags": [
+        "field",
+        "safety",
+        "guard",
+        "type-check",
+        "memory-safety"
+      ],
       "test_modules": [
         "tests/test_field_proxy_set_guards.cpp"
       ],
@@ -1071,11 +1329,12 @@
       "slug": "field_proxy_value_t",
       "title": "Field Proxy Value T",
       "category": "field",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/field_proxy_value_t-specialist.md",
       "depends_on": [
-        "field_introspection"
+        "field_introspection",
+        "decode_oop_and_pointers"
       ],
       "related": [
         "field_inherited",
@@ -1083,8 +1342,19 @@
         "field_primitives_get",
         "field_static"
       ],
-      "tags": [],
-      "test_modules": [],
+      "tags": [
+        "variant",
+        "conversion",
+        "reference",
+        "OOP",
+        "null-safety",
+        "compression",
+        "descriptor-driven",
+        "test-pure-logic"
+      ],
+      "test_modules": [
+        "tests/test_field_proxy_value_conversions.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -1100,8 +1370,8 @@
       "slug": "field_set_size_guard",
       "title": "Field Set Size Guard",
       "category": "field",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "low",
       "specialist": ".claude/agents/field_set_size_guard-specialist.md",
       "depends_on": [
         "field_proxy_value_t"
@@ -1111,7 +1381,13 @@
         "field_primitives_set",
         "field_proxy_set_guards"
       ],
-      "tags": [],
+      "tags": [
+        "size-guard",
+        "anti-clobber",
+        "field",
+        "safety",
+        "primitives"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_set_size_guard.cpp"
       ],
@@ -1161,18 +1437,28 @@
       "slug": "field_string",
       "title": "Field String",
       "category": "field",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/field_string-specialist.md",
       "depends_on": [
         "field_object_ref",
         "read_java_string",
-        "make_java_string"
+        "make_java_string",
+        "array_element_helpers",
+        "decode_oop_and_pointers"
       ],
       "related": [
         "field_arrays_object"
       ],
-      "tags": [],
+      "tags": [
+        "field",
+        "string",
+        "compact-strings",
+        "utf-16",
+        "coder",
+        "array-mutation",
+        "in-place"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_string.cpp"
       ],
@@ -1191,17 +1477,30 @@
       "slug": "find_class_context_loader",
       "title": "Find Class Context Loader",
       "category": "klass",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/find_class_context_loader-specialist.md",
       "depends_on": [
-        "find_class_fallback"
+        "find_class_fallback",
+        "klass_introspection",
+        "decode_oop_and_pointers",
+        "jni_local_ref_hygiene"
       ],
       "related": [
         "classloader_reanchor",
-        "register_class"
+        "register_class",
+        "hook_basic",
+        "for_each_loaded_class"
       ],
-      "tags": [],
+      "tags": [
+        "classloader",
+        "context",
+        "bootstrap",
+        "host-inheritance",
+        "cache-override",
+        "anchor",
+        "JNI"
+      ],
       "test_modules": [
         "tests/jvm/modules/find_class_context_loader.cpp"
       ],
@@ -1254,12 +1553,13 @@
       "slug": "find_methods_by_signature",
       "title": "Find Methods By Signature",
       "category": "method",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "low",
       "specialist": ".claude/agents/find_methods_by_signature-specialist.md",
       "depends_on": [
         "signature_parsing",
-        "method_enumeration"
+        "method_enumeration",
+        "klass_introspection"
       ],
       "related": [
         "method_explicit_signature",
@@ -1267,7 +1567,12 @@
         "method_is_reference",
         "method_overload"
       ],
-      "tags": [],
+      "tags": [
+        "method-selector",
+        "descriptor",
+        "enum",
+        "declared-only"
+      ],
       "test_modules": [
         "tests/jvm/modules/find_methods_by_signature.cpp"
       ],
@@ -3399,6 +3704,11 @@
     },
     {
       "from": "adapter_recovery_c2i",
+      "to": "os_query_region",
+      "kind": "depends_on"
+    },
+    {
+      "from": "adapter_recovery_c2i",
       "to": "hook_basic",
       "kind": "related"
     },
@@ -3415,6 +3725,31 @@
     {
       "from": "adapter_recovery_c2i",
       "to": "method_entry_points_i2i_i2c",
+      "kind": "related"
+    },
+    {
+      "from": "array_element_helpers",
+      "to": "field_proxy_value_t",
+      "kind": "related"
+    },
+    {
+      "from": "array_element_helpers",
+      "to": "decode_oop_and_pointers",
+      "kind": "related"
+    },
+    {
+      "from": "array_element_helpers",
+      "to": "compressed_oops_decode",
+      "kind": "related"
+    },
+    {
+      "from": "array_element_helpers",
+      "to": "make_java_string",
+      "kind": "related"
+    },
+    {
+      "from": "array_element_helpers",
+      "to": "make_java_array",
       "kind": "related"
     },
     {
@@ -3444,6 +3779,16 @@
     },
     {
       "from": "collection_hash_tree_map",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_hash_tree_map",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_hash_tree_map",
       "to": "collection_iteration_safety",
       "kind": "related"
     },
@@ -3489,12 +3834,32 @@
     },
     {
       "from": "collection_linked_list",
+      "to": "find_class_fallback",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_linked_list",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_linked_list",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_linked_list",
       "to": "collection_hash_tree_map",
       "kind": "related"
     },
     {
       "from": "collection_linked_list",
       "to": "collection_iteration_safety",
+      "kind": "related"
+    },
+    {
+      "from": "collection_linked_list",
+      "to": "collection_list",
       "kind": "related"
     },
     {
@@ -3514,6 +3879,16 @@
     },
     {
       "from": "collection_list",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_list",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_list",
       "to": "collection_map",
       "kind": "related"
     },
@@ -3554,6 +3929,16 @@
     },
     {
       "from": "collection_set",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_set",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_set",
       "to": "collection_list",
       "kind": "related"
     },
@@ -3568,8 +3953,48 @@
       "kind": "depends_on"
     },
     {
+      "from": "collection_type_tags",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "collection_type_tags",
+      "to": "collection_list",
+      "kind": "related"
+    },
+    {
+      "from": "collection_type_tags",
+      "to": "collection_set",
+      "kind": "related"
+    },
+    {
+      "from": "collection_type_tags",
+      "to": "collection_map",
+      "kind": "related"
+    },
+    {
+      "from": "collection_type_tags",
+      "to": "collection_linked_list",
+      "kind": "related"
+    },
+    {
+      "from": "collection_type_tags",
+      "to": "collection_hash_tree_map",
+      "kind": "related"
+    },
+    {
       "from": "compressed_klass_decode",
       "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "compressed_klass_decode",
+      "to": "compressed_oops_decode",
+      "kind": "depends_on"
+    },
+    {
+      "from": "compressed_klass_decode",
+      "to": "decode_oop_and_pointers",
       "kind": "depends_on"
     },
     {
@@ -3595,6 +4020,16 @@
     {
       "from": "compressed_klass_decode",
       "to": "klass_introspection",
+      "kind": "related"
+    },
+    {
+      "from": "compressed_klass_decode",
+      "to": "for_each_instance",
+      "kind": "related"
+    },
+    {
+      "from": "compressed_klass_decode",
+      "to": "make_unique",
       "kind": "related"
     },
     {
@@ -3633,6 +4068,36 @@
       "kind": "depends_on"
     },
     {
+      "from": "const_method_bounds",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "const_method_bounds",
+      "to": "os_query_region",
+      "kind": "depends_on"
+    },
+    {
+      "from": "const_method_bounds",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "const_method_bounds",
+      "to": "method_enumeration",
+      "kind": "related"
+    },
+    {
+      "from": "const_method_bounds",
+      "to": "klass_introspection",
+      "kind": "related"
+    },
+    {
+      "from": "const_method_bounds",
+      "to": "find_methods_by_signature",
+      "kind": "related"
+    },
+    {
       "from": "constantpool_access",
       "to": "vmstructs_offset_resolution",
       "kind": "depends_on"
@@ -3663,6 +4128,21 @@
       "kind": "related"
     },
     {
+      "from": "constantpool_access",
+      "to": "signature_parsing",
+      "kind": "related"
+    },
+    {
+      "from": "constantpool_access",
+      "to": "field_introspection",
+      "kind": "related"
+    },
+    {
+      "from": "constantpool_access",
+      "to": "method_overload",
+      "kind": "related"
+    },
+    {
       "from": "decode_oop_and_pointers",
       "to": "compressed_oops_decode",
       "kind": "depends_on"
@@ -3675,6 +4155,26 @@
     {
       "from": "decode_oop_and_pointers",
       "to": "vmstructs_offset_resolution",
+      "kind": "related"
+    },
+    {
+      "from": "decode_oop_and_pointers",
+      "to": "klass_introspection",
+      "kind": "related"
+    },
+    {
+      "from": "decode_u5_unsigned5",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "decode_u5_unsigned5",
+      "to": "field_introspection",
+      "kind": "related"
+    },
+    {
+      "from": "decode_u5_unsigned5",
+      "to": "field_object_ref",
       "kind": "related"
     },
     {
@@ -3693,6 +4193,41 @@
       "kind": "depends_on"
     },
     {
+      "from": "deoptimize_methods",
+      "to": "for_each_loaded_class",
+      "kind": "depends_on"
+    },
+    {
+      "from": "deoptimize_methods",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "deoptimize_methods",
+      "to": "instanceklass_methods_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "dllmain_bootstrap",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "dllmain_bootstrap",
+      "to": "register_class",
+      "kind": "related"
+    },
+    {
+      "from": "dllmain_bootstrap",
+      "to": "on_class_loaded",
+      "kind": "related"
+    },
+    {
+      "from": "dllmain_bootstrap",
+      "to": "shutdown_hooks_teardown",
+      "kind": "related"
+    },
+    {
       "from": "dont_inline_dont_compile",
       "to": "method_flags_width",
       "kind": "depends_on"
@@ -3700,6 +4235,11 @@
     {
       "from": "dont_inline_dont_compile",
       "to": "hook_basic",
+      "kind": "depends_on"
+    },
+    {
+      "from": "dont_inline_dont_compile",
+      "to": "hook_common_detour_dispatch",
       "kind": "depends_on"
     },
     {
@@ -3743,6 +4283,26 @@
       "kind": "depends_on"
     },
     {
+      "from": "enum_singleton",
+      "to": "field_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "enum_singleton",
+      "to": "field_static",
+      "kind": "depends_on"
+    },
+    {
+      "from": "enum_singleton",
+      "to": "compressed_oops_decode",
+      "kind": "depends_on"
+    },
+    {
+      "from": "enum_singleton",
+      "to": "find_class_fallback",
+      "kind": "depends_on"
+    },
+    {
       "from": "field_arrays_object",
       "to": "field_object_ref",
       "kind": "depends_on"
@@ -3755,6 +4315,11 @@
     {
       "from": "field_arrays_object",
       "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_arrays_object",
+      "to": "compressed_oops_decode",
       "kind": "depends_on"
     },
     {
@@ -3799,6 +4364,16 @@
     },
     {
       "from": "field_inherited",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_inherited",
+      "to": "find_class_fallback",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_inherited",
       "to": "field_null_safety",
       "kind": "related"
     },
@@ -3828,8 +4403,28 @@
       "kind": "depends_on"
     },
     {
+      "from": "field_introspection",
+      "to": "find_class_fallback",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_introspection",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
       "from": "field_null_safety",
       "to": "field_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_null_safety",
+      "to": "field_proxy_value_t",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_null_safety",
+      "to": "find_class_fallback",
       "kind": "depends_on"
     },
     {
@@ -3840,11 +4435,6 @@
     {
       "from": "field_null_safety",
       "to": "field_primitives_get",
-      "kind": "related"
-    },
-    {
-      "from": "field_null_safety",
-      "to": "field_proxy_value_t",
       "kind": "related"
     },
     {
@@ -3899,22 +4489,22 @@
     },
     {
       "from": "field_primitives_get",
-      "to": "field_proxy_value_t",
-      "kind": "related"
-    },
-    {
-      "from": "field_primitives_get",
       "to": "field_set_size_guard",
       "kind": "related"
     },
     {
       "from": "field_primitives_set",
-      "to": "field_proxy_set_guards",
+      "to": "field_proxy_value_t",
       "kind": "depends_on"
     },
     {
       "from": "field_primitives_set",
-      "to": "field_proxy_value_t",
+      "to": "field_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_primitives_set",
+      "to": "field_primitives_get",
       "kind": "depends_on"
     },
     {
@@ -3924,12 +4514,12 @@
     },
     {
       "from": "field_primitives_set",
-      "to": "field_proxy_set_guards",
+      "to": "field_set_size_guard",
       "kind": "related"
     },
     {
       "from": "field_primitives_set",
-      "to": "field_set_size_guard",
+      "to": "field_proxy_set_guards",
       "kind": "related"
     },
     {
@@ -3960,6 +4550,11 @@
     {
       "from": "field_proxy_value_t",
       "to": "field_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_proxy_value_t",
+      "to": "decode_oop_and_pointers",
       "kind": "depends_on"
     },
     {
@@ -4044,6 +4639,16 @@
     },
     {
       "from": "field_string",
+      "to": "array_element_helpers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_string",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "field_string",
       "to": "field_arrays_object",
       "kind": "related"
     },
@@ -4054,12 +4659,37 @@
     },
     {
       "from": "find_class_context_loader",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "find_class_context_loader",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "find_class_context_loader",
+      "to": "jni_local_ref_hygiene",
+      "kind": "depends_on"
+    },
+    {
+      "from": "find_class_context_loader",
       "to": "classloader_reanchor",
       "kind": "related"
     },
     {
       "from": "find_class_context_loader",
       "to": "register_class",
+      "kind": "related"
+    },
+    {
+      "from": "find_class_context_loader",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "find_class_context_loader",
+      "to": "for_each_loaded_class",
       "kind": "related"
     },
     {
@@ -4110,6 +4740,11 @@
     {
       "from": "find_methods_by_signature",
       "to": "method_enumeration",
+      "kind": "depends_on"
+    },
+    {
+      "from": "find_methods_by_signature",
+      "to": "klass_introspection",
       "kind": "depends_on"
     },
     {

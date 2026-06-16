@@ -11,8 +11,8 @@ tags: [category/hook]
 
 ## Features
 
-- [[features/adapter_recovery_c2i|adapter_recovery_c2i]] — `seeded` / `medium` — Adapter Recovery C2I
-- [[features/dont_inline_dont_compile|dont_inline_dont_compile]] — `seeded` / `medium` — Dont Inline Dont Compile
+- [[features/adapter_recovery_c2i|adapter_recovery_c2i]] — `in_progress` / `high` — Adapter Recovery C2I
+- [[features/dont_inline_dont_compile|dont_inline_dont_compile]] — `in_progress` / `critical` — Dont Inline Dont Compile
 - [[features/hook_basic|hook_basic]] — `in_progress` / `critical` — Hook Install (basic)
 - [[features/hook_chaining|hook_chaining]] — `seeded` / `medium` — Hook Chaining
 - [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]] — `seeded` / `medium` — Hook Common Detour Dispatch
@@ -63,8 +63,10 @@ flowchart LR
   end
   adapter_recovery_c2i --> method_entry_points_i2i_i2c
   adapter_recovery_c2i --> vmstructs_offset_resolution
+  adapter_recovery_c2i --> os_query_region
   dont_inline_dont_compile --> method_flags_width
   dont_inline_dont_compile --> hook_basic
+  dont_inline_dont_compile --> hook_common_detour_dispatch
   hook_basic --> midi2i_trampoline_alloc
   hook_basic --> hook_common_detour_dispatch
   hook_basic --> method_entry_points_i2i_i2c

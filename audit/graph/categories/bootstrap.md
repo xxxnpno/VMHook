@@ -11,7 +11,7 @@ tags: [category/bootstrap]
 
 ## Features
 
-- [[features/dllmain_bootstrap|dllmain_bootstrap]] — `seeded` / `medium` — Dllmain Bootstrap
+- [[features/dllmain_bootstrap|dllmain_bootstrap]] — `in_progress` / `high` — Dllmain Bootstrap
 
 ## Dependency graph
 
