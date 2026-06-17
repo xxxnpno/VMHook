@@ -13639,8 +13639,15 @@ namespace vmhook
         `k` directly without walking the ClassLoaderDataGraph.  Pair it with
         find_class_via_oop() to nail the correct loader's copy once and have the
         whole SDK (every wrapper that calls find_class) follow it — the supported
-        replacement for reaching into the internal cache.  Passing a null `k`
-        seeds a negative entry; prefer evict_class_lookup() to actually forget.
+        replacement for reaching into the internal cache.  The cache is a single
+        process-global map (last writer wins; no scoping or refcount), so an
+        override is visible to every caller until evicted or overwritten.
+
+        Passing a null `k` does NOT seed a durable negative ("known-absent")
+        entry: find_class's cache-hit guard rejects a null value and erases it,
+        so the very next find_class re-walks the graph (the null heals away).
+        Use evict_class_lookup() to forget an entry — there is currently no
+        durable negative-cache semantics.
 
         Complexity: O(1).  Exception safety: noexcept.
     */
