@@ -158,13 +158,21 @@ runs.
   for tooling that wants to query it without parsing YAML.
 - `_data/graph.mmd` — the full Mermaid source, useful for
   embedding in slides / docs.
+- `.obsidian/` — a curated, committed Obsidian config (graph view
+  enabled, nodes coloured by status) so the vault opens ready to use.
+  It is regenerated too; per-user pane state (`workspace.json`) is
+  git-ignored and never committed.
 
 ## Opening in Obsidian
 
-Open `audit/graph/` as an Obsidian vault.  The graph view (sidebar
-→ Open graph view) renders the dependency relationships natively;
-filter by `tag:#status/<state>` or `path:features/` to scope the
-view.  Wikilinks resolve across the vault.
+Open the `audit/graph/` folder **itself** as an Obsidian vault — do
+*not* open a subfolder such as `categories/`, which would create a
+stray nested vault.  It is pre-configured: the graph view (sidebar →
+Open graph view) renders the dependency relationships natively, with
+nodes coloured by status (`in_progress` amber / `seeded` slate) and
+high-risk features highlighted red.  Filter by `tag:#status/<state>`
+or `path:features/` to scope the view.  Wikilinks resolve across the
+vault.
 
 ## Where the source of truth lives
 
@@ -172,6 +180,83 @@ The **manifests** under `audit/features/<slug>.yaml` are the source
 of truth.  See `audit/features/schema.md` for the schema reference
 and `audit/features/README.md` for how the registry is used.
 """
+
+
+# Obsidian vault configuration (`.obsidian/`).  Emitted so the generated vault
+# opens straight into a usable, status-coloured dependency graph instead of
+# Obsidian's bare defaults.  Read-only-vault-relevant core plugins only.
+_OBSIDIAN_CORE_PLUGINS = {
+    "file-explorer": True,
+    "global-search": True,
+    "switcher": True,
+    "graph": True,
+    "backlink": True,
+    "outgoing-link": True,
+    "tag-pane": True,
+    "properties": True,
+    "page-preview": True,
+    "outline": True,
+    "bookmarks": True,
+    "word-count": True,
+}
+
+# Graph-view defaults tuned for a ~100-node dependency graph.  colorGroups are
+# ordered first-match-wins: high-risk features stand out red regardless of
+# status, then in_progress (amber) and seeded (slate).
+_OBSIDIAN_GRAPH = {
+    "collapse-filter": True,
+    "search": "",
+    "showTags": False,
+    "showAttachments": False,
+    "hideUnresolved": True,
+    "showOrphans": True,
+    "collapse-color-groups": False,
+    "colorGroups": [
+        {"query": "tag:#risk/high", "color": {"a": 1, "rgb": 0xD04437}},
+        {"query": "tag:#status/in_progress", "color": {"a": 1, "rgb": 0xE0A030}},
+        {"query": "tag:#status/seeded", "color": {"a": 1, "rgb": 0x6E7681}},
+    ],
+    "collapse-display": True,
+    "showArrow": True,
+    "textFadeMultiplier": 0,
+    "nodeSizeMultiplier": 1,
+    "lineSizeMultiplier": 1,
+    "collapse-forces": True,
+    "centerStrength": 0.5,
+    "repelStrength": 10,
+    "linkStrength": 1,
+    "linkDistance": 250,
+    "scale": 0.15,
+    "close": False,
+}
+
+_OBSIDIAN_GITIGNORE = """\
+# Per-user Obsidian state — not part of the generated vault, never committed.
+workspace.json
+workspace-mobile.json
+"""
+
+
+def _write_obsidian_config() -> None:
+    """Emit a curated `.obsidian/` so `audit/graph/` opens as a ready-to-use
+    Obsidian vault (graph view enabled + status-coloured).  Deterministic:
+    fixed content, sorted keys, LF newlines, no timestamps — so the CI drift
+    check stays byte-stable across Windows / Linux.  Per-user pane state
+    (`workspace.json`) is git-ignored, never emitted."""
+    cfg = GRAPH_DIR / ".obsidian"
+    cfg.mkdir(parents=True, exist_ok=True)
+
+    def _dump(obj) -> str:
+        return json.dumps(obj, indent=2, sort_keys=True) + "\n"
+
+    (cfg / "app.json").write_text("{}\n", encoding="utf-8", newline="\n")
+    (cfg / "appearance.json").write_text("{}\n", encoding="utf-8", newline="\n")
+    (cfg / "core-plugins.json").write_text(
+        _dump(_OBSIDIAN_CORE_PLUGINS), encoding="utf-8", newline="\n")
+    (cfg / "graph.json").write_text(
+        _dump(_OBSIDIAN_GRAPH), encoding="utf-8", newline="\n")
+    (cfg / ".gitignore").write_text(
+        _OBSIDIAN_GITIGNORE, encoding="utf-8", newline="\n")
 
 
 def _wikilink(slug: str, target_folder: str = "features") -> str:
@@ -620,6 +705,9 @@ def cmd_vault() -> int:
         _render_full_mermaid(manifests) + "\n",
         encoding="utf-8", newline="\n",
     )
+
+    # curated .obsidian/ so the vault opens ready-to-use (graph view + colours)
+    _write_obsidian_config()
 
     feat_count = len(manifests)
     edge_count = sum(
