@@ -55,6 +55,8 @@ public final class FieldPrimitivesGet
     public static byte sByte0x80   = (byte) 0x80;      // -128
     public static byte sByte0xFF   = (byte) 0xFF;      //   -1
     public static byte sByte0xAB   = (byte) 0xAB;      //  -85
+    public static byte sByte0x55   = (byte) 0x55;      //   85 (alternating bits 0101...)
+    public static byte sByte0xAA   = (byte) 0xAA;      //  -86 (alternating bits 1010...)
 
     // =====================================================================
     //  short  ("S")  -- variant alternative: int16_t (index 2)
@@ -67,6 +69,8 @@ public final class FieldPrimitivesGet
     public static short sShort0x8000 = (short) 0x8000;  // -32768
     public static short sShort0x7FFF = (short) 0x7FFF;  //  32767
     public static short sShortBeef   = (short) 0xBEEF;  //  -16657
+    public static short sShort0x5555 = (short) 0x5555;  //   21845 (alternating 0101...)
+    public static short sShort0xAAAA = (short) 0xAAAA;  //  -21846 (alternating 1010...)
 
     // =====================================================================
     //  int  ("I")  -- variant alternative: int32_t (index 3)
@@ -79,6 +83,8 @@ public final class FieldPrimitivesGet
     public static int sIntDeadBeef   = 0xDEADBEEF;       // -559038737
     public static int sInt0x7FFFFFFF = 0x7FFFFFFF;       //  2147483647
     public static int sInt0x80000000 = 0x80000000;       // -2147483648
+    public static int sInt0x55555555 = 0x55555555;       //  1431655765 (alternating 0101...)
+    public static int sInt0xAAAAAAAA = 0xAAAAAAAA;       // -1431655766 (alternating 1010...)
 
     // =====================================================================
     //  long  ("J")  -- variant alternative: int64_t (index 4)
@@ -92,6 +98,8 @@ public final class FieldPrimitivesGet
     public static long sLong0x7FFFFFFFFFFFFFFF = 0x7FFFFFFFFFFFFFFFL;
     public static long sLong0x8000000000000000 = 0x8000000000000000L;
     public static long sLongHighBits           = 0x00000000FFFFFFFFL; // 4294967295
+    public static long sLong0x5555555555555555 = 0x5555555555555555L; // alternating 0101...
+    public static long sLong0xAAAAAAAAAAAAAAAA = 0xAAAAAAAAAAAAAAAAL; // alternating 1010...
 
     // =====================================================================
     //  char  ("C")  -- variant alternative: uint16_t (index 7), UTF-16 unit.
@@ -112,6 +120,10 @@ public final class FieldPrimitivesGet
     public static char sCharLoSurr  = 0xDE00; // low surrogate of U+1F600
     public static char sCharMinSurr = 0xD800; // first high surrogate
     public static char sCharMaxSurr = 0xDFFF; // last low surrogate
+    public static char sCharPreSurr = 0xD7FF; // last BMP unit BEFORE the surrogate block
+    public static char sCharPostSurr = 0xE000; // first BMP unit AFTER the surrogate block
+    public static char sChar0x5555  = 0x5555; // alternating bits 0101...
+    public static char sChar0xAAAA  = 0xAAAA; // alternating bits 1010...
 
     // =====================================================================
     //  float  ("F")  -- variant alternative: float (index 5).
@@ -137,6 +149,9 @@ public final class FieldPrimitivesGet
     public static float sFloatNegHalf = -0.5F;                            // 0xBF000000
     public static float sFloatThreeQ  = 0.75F;                            // 0x3F400000
     public static float sFloatTwo     = 2.0F;                             // 0x40000000
+    // Alternating-bit IEEE-754 patterns (finite, normal): asserted BIT-EXACT.
+    public static float sFloat0x55555555 = Float.intBitsToFloat(0x55555555); // +1.46e13 (alt 0101...)
+    public static float sFloat0xAAAAAAAA = Float.intBitsToFloat(0xAAAAAAAA); // -3.03e-13 (alt 1010...)
 
     // =====================================================================
     //  double  ("D")  -- variant alternative: double (index 6)
@@ -161,6 +176,9 @@ public final class FieldPrimitivesGet
     public static double sDoubleNegHalf = -0.5;                                           // 0xBFE0000000000000
     public static double sDoubleThreeQ  = 0.75;                                           // 0x3FE8000000000000
     public static double sDoubleTwo     = 2.0;                                            // 0x4000000000000000
+    // Alternating-bit IEEE-754 patterns (finite, normal): asserted BIT-EXACT.
+    public static double sDouble0x5555555555555555 = Double.longBitsToDouble(0x5555555555555555L); // alt 0101...
+    public static double sDouble0xAAAAAAAAAAAAAAAA = Double.longBitsToDouble(0xAAAAAAAAAAAAAAAAL); // alt 1010...
 
     // =====================================================================
     //  INSTANCE fields -- representative subset of each primitive so the
@@ -215,6 +233,8 @@ public final class FieldPrimitivesGet
     public byte iByte0x80   = (byte) 0x80;   // -128
     public byte iByte0xFF   = (byte) 0xFF;   //   -1 (sign-extension witness)
     public byte iByte0xAB   = (byte) 0xAB;   //  -85
+    public byte iByte0x55   = (byte) 0x55;   //   85 (alternating 0101...)
+    public byte iByte0xAA   = (byte) 0xAA;   //  -86 (alternating 1010...)
 
     // short ("S") -- remaining boundaries (Min/Max already declared above).
     public short iShortZero   = 0;
@@ -222,6 +242,8 @@ public final class FieldPrimitivesGet
     public short iShort0x8000 = (short) 0x8000; // -32768
     public short iShort0x7FFF = (short) 0x7FFF; //  32767
     public short iShortBeef   = (short) 0xBEEF; //  -16657
+    public short iShort0x5555 = (short) 0x5555; //   21845 (alternating 0101...)
+    public short iShort0xAAAA = (short) 0xAAAA; //  -21846 (alternating 1010...)
 
     // int ("I") -- remaining boundaries (Min/Max/NegOne already declared above).
     public int iIntZero       = 0;
@@ -229,6 +251,8 @@ public final class FieldPrimitivesGet
     public int iIntDeadBeef    = 0xDEADBEEF;     // -559038737
     public int iInt0x7FFFFFFF  = 0x7FFFFFFF;     //  2147483647
     public int iInt0x80000000  = 0x80000000;     // -2147483648
+    public int iInt0x55555555  = 0x55555555;     //  1431655765 (alternating 0101...)
+    public int iInt0xAAAAAAAA  = 0xAAAAAAAA;     // -1431655766 (alternating 1010...)
 
     // long ("J") -- remaining boundaries (Min/Max already declared above).
     public long iLongZero               = 0L;
@@ -238,6 +262,8 @@ public final class FieldPrimitivesGet
     public long iLong0x7FFFFFFFFFFFFFFF = 0x7FFFFFFFFFFFFFFFL;
     public long iLong0x8000000000000000 = 0x8000000000000000L;
     public long iLongHighBits           = 0x00000000FFFFFFFFL; // 4294967295
+    public long iLong0x5555555555555555 = 0x5555555555555555L; // alternating 0101...
+    public long iLong0xAAAAAAAAAAAAAAAA = 0xAAAAAAAAAAAAAAAAL; // alternating 1010...
 
     // char ("C") -- full BMP + surrogate sweep (Null/Max already declared above).
     public char iCharSpace   = 0x0020; // ' '
@@ -253,6 +279,10 @@ public final class FieldPrimitivesGet
     public char iCharLoSurr  = 0xDE00; // low surrogate of U+1F600
     public char iCharMinSurr = 0xD800; // first high surrogate
     public char iCharMaxSurr = 0xDFFF; // last low surrogate
+    public char iCharPreSurr = 0xD7FF; // last BMP unit BEFORE the surrogate block
+    public char iCharPostSurr = 0xE000; // first BMP unit AFTER the surrogate block
+    public char iChar0x5555  = 0x5555; // alternating bits 0101...
+    public char iChar0xAAAA  = 0xAAAA; // alternating bits 1010...
 
     // float ("F") -- full IEEE-754 special set + exact fractions
     // (PosInf/NaN/NegZero already declared above).  Raw bits so the native side
@@ -272,6 +302,8 @@ public final class FieldPrimitivesGet
     public float iFloatNegHalf = -0.5F;                            // 0xBF000000
     public float iFloatThreeQ  = 0.75F;                            // 0x3F400000
     public float iFloatTwo     = 2.0F;                             // 0x40000000
+    public float iFloat0x55555555 = Float.intBitsToFloat(0x55555555); // alt 0101...
+    public float iFloat0xAAAAAAAA = Float.intBitsToFloat(0xAAAAAAAA); // alt 1010...
 
     // double ("D") -- full IEEE-754 special set + exact fractions
     // (Max/NegInf/NegZero already declared above).
@@ -290,6 +322,8 @@ public final class FieldPrimitivesGet
     public double iDoubleNegHalf = -0.5;                                         // 0xBFE0000000000000
     public double iDoubleThreeQ  = 0.75;                                         // 0x3FE8000000000000
     public double iDoubleTwo     = 2.0;                                          // 0x4000000000000000
+    public double iDouble0x5555555555555555 = Double.longBitsToDouble(0x5555555555555555L); // alt 0101...
+    public double iDouble0xAAAAAAAAAAAAAAAA = Double.longBitsToDouble(0xAAAAAAAAAAAAAAAAL); // alt 1010...
 
     // =====================================================================
     //  FINAL instance primitive fields -- read through the SAME get() path.
