@@ -133,3 +133,7 @@ target_compile_definitions("vmhook_test_logging_logfile_unwritable" PRIVATE
     "VMHOOK_LOG_FILE=\"${_vmhook_bad_log_file}\""
     "VMHOOK_TEST_LOG_PATH=\"${_vmhook_bad_log_file}\"")
 vmhook_add_test(const_method_bounds            SOURCES test_const_method_bounds.cpp)
+vmhook_add_test(compressed_oops_decode         SOURCES test_compressed_oops_decode.cpp)
+vmhook_add_test(vmstructs_offset_resolution    SOURCES test_vmstructs_offset_resolution.cpp)
+vmhook_add_test(interpreter_frame_walk         SOURCES test_interpreter_frame_walk.cpp)
+vmhook_add_test(midi2i_trampoline_alloc        SOURCES test_midi2i_trampoline_alloc.cpp)
