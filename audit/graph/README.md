@@ -20,13 +20,21 @@ runs.
   for tooling that wants to query it without parsing YAML.
 - `_data/graph.mmd` — the full Mermaid source, useful for
   embedding in slides / docs.
+- `.obsidian/` — a curated, committed Obsidian config (graph view
+  enabled, nodes coloured by status) so the vault opens ready to use.
+  It is regenerated too; per-user pane state (`workspace.json`) is
+  git-ignored and never committed.
 
 ## Opening in Obsidian
 
-Open `audit/graph/` as an Obsidian vault.  The graph view (sidebar
-→ Open graph view) renders the dependency relationships natively;
-filter by `tag:#status/<state>` or `path:features/` to scope the
-view.  Wikilinks resolve across the vault.
+Open the `audit/graph/` folder **itself** as an Obsidian vault — do
+*not* open a subfolder such as `categories/`, which would create a
+stray nested vault.  It is pre-configured: the graph view (sidebar →
+Open graph view) renders the dependency relationships natively, with
+nodes coloured by status (`in_progress` amber / `seeded` slate) and
+high-risk features highlighted red.  Filter by `tag:#status/<state>`
+or `path:features/` to scope the view.  Wikilinks resolve across the
+vault.
 
 ## Where the source of truth lives
 
