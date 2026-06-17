@@ -250,9 +250,16 @@ jobs:
         run: |
           Write-Host "=== Java ${{ matrix.java }} · Windows / ${{ matrix.compiler }} ==="
 
+          # #38 mitigation (no-SEH GC-safepoint stall): give the suite a generous
+          # heap + large young gen so its natural allocation does not trigger an
+          # automatic GC mid raw-VM-walk — the GC safepoint the injected suite
+          # thread cannot poll for on windows-msvc/clang.  An explicit System.gc()
+          # in the GC-survival tests still runs, so GC coverage is preserved
+          # (unlike -XX:+UseEpsilonGC, which no-ops System.gc).  -Xmx/-Xmn are
+          # universal across JDK 8..26 (no experimental unlock needed).
           $java = Start-Process `
             -FilePath "java" `
-            -ArgumentList "-cp", "out", "vmhook.Main" `
+            -ArgumentList "-Xmx2g", "-Xmn1g", "-cp", "out", "vmhook.Main" `
             -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput "java_stdout.txt" `
             -RedirectStandardError  "java_stderr.txt"
