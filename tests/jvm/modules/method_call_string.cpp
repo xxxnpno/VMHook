@@ -23,18 +23,23 @@
 //     * call_stub fast path (stub present): the default arm calls
 //       read_java_string(result_oop), which walks the String's backing array off
 //       the heap and emits STANDARD UTF-8 — U+0000 stays a raw NUL and a
-//       supplementary scalar becomes one 4-byte sequence; it rejects length 0 or
-//       > 4096 (-> "").
+//       supplementary scalar becomes one 4-byte sequence.  It reads the String IN
+//       FULL up to read_java_string_max_units (16M chars): the old hard 4096-char
+//       cap that made longer Strings decode to "" was removed (robustness bug #29),
+//       along with the old lossy "non-ASCII -> '?'" substitution.  Only length 0
+//       (the empty string) decodes to "".
 //   So the two paths AGREE byte-for-byte on all BMP text (ASCII, Latin-1, CJK,
-//   Greek, the multi-byte boundaries) and DIFFER only on (a) supplementary-plane
-//   scalars (CESU-8 6 bytes vs standard 4), (b) any NUL (C0 80 vs raw 00),
-//   (c) the empty/null variant tag, and (d) the read_java_string 4096-char cap.
-//   This module asserts the broad agreement UNCONDITIONALLY and branches only on
-//   those divergences, picking the path-correct expectation for whichever decoder
-//   is live.  It records the live path as [INFO] so a reader of test_results.txt
-//   always knows which decoder the assertions exercised.  (The CI path is always
-//   call_jni; the call_stub branches are kept correct-by-construction from the
-//   header's deterministic decoders but are unreachable on the CI matrix.)
+//   Greek, the multi-byte boundaries) AND on arbitrarily long ASCII (no cap on
+//   either side now), and DIFFER only on (a) supplementary-plane scalars (CESU-8
+//   6 bytes vs standard 4), (b) any NUL (C0 80 vs raw 00), and (c) the empty/null
+//   variant tag.  This module asserts the broad agreement UNCONDITIONALLY
+//   (including the very-large >65536 ASCII cases, which now hold on both paths) and
+//   branches only on the astral / NUL / null-tag divergences, picking the
+//   path-correct expectation for whichever decoder is live.  It records the live
+//   path as [INFO] so a reader of test_results.txt always knows which decoder the
+//   assertions exercised.  (The CI path is always call_jni; the call_stub branches
+//   are kept correct-by-construction from the header's deterministic decoders but
+//   are unreachable on the CI matrix.)
 //
 //   (The call_jni byte expectations were cross-checked against the JVM's own
 //   modified-UTF-8 encoding — GetStringUTFChars emits exactly what
@@ -73,6 +78,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 namespace
 {
@@ -239,9 +245,10 @@ namespace
         capture(*self, "leadingNul");
         capture(*self, "trailingNul");
 
-        // Very large returns — ABOVE 4096 and ABOVE 65536 code units.  On the
-        // call_jni path GetStringUTFChars returns the whole String (no cap); on the
-        // call_stub path read_java_string rejects any length > 4096 -> "".
+        // Very large returns — ABOVE the old 4096 cap and ABOVE 65536 code units.
+        // BOTH decoders now return the whole String: GetStringUTFChars (call_jni)
+        // never capped, and read_java_string (call_stub) no longer caps either (the
+        // 4096-char cap was removed — robustness bug #29; it now reads up to 16M chars).
         if (auto proxy{ self->get_method("bigString") })
         {
             record_value("bigString:5000",  proxy->call(static_cast<std::int32_t>(5000)));
@@ -331,13 +338,80 @@ namespace
         {
             record_value("echo:maxBmp", proxy->call(std::string{ "\xEF\xBF\xBF" }));
         }
-        // echo of a >65536-code-unit arg: make_java_string routes any input above
-        // the 4096-unit TLAB ceiling to the GC-aware JNIEnv::NewString fallback,
-        // which builds the FULL String (no truncation); the call_jni return then
-        // hands all 70000 bytes back.  Proves the over-cap ARGUMENT path end to end.
+        // echo of a >65536-code-unit arg: the String-arg encoder
+        // (convert_jni_arg -> jni_new_string_utf16_local) calls JNIEnv::NewString with
+        // the full length-counted UTF-16, so the JVM builds the FULL String at any
+        // length (no cap on the ARG side).  Both return decoders then hand all 70000
+        // bytes back (read_java_string's old 4096 read cap is gone — bug #29).  Proves
+        // the over-cap ARGUMENT encode AND over-cap RETURN decode end to end.
         if (auto proxy{ self->get_method("echo") })
         {
             record_value("echo:big70000", proxy->call(std::string(70000, 'Q')));
+        }
+
+        // ---- const char* String ARG (a DISTINCT convert_jni_arg branch) -----
+        // std::string args take the std::string branch; a const char* arg takes a
+        // SEPARATE branch whose contract is: nullptr -> Java null, any non-null
+        // pointer (including the empty "") -> a real Java String, routed through the
+        // SAME length-counted UTF-16 encoder (jni_new_string_utf16_local) so astral
+        // bytes survive.  None of the existing cases exercise this branch, so add:
+        //   * a plain ASCII C-string  (-> identical round-trip),
+        //   * the empty C-string ""   (-> a real empty Java String, NOT null),
+        //   * a standard-4-byte astral C-string (-> proper surrogate pair, proven
+        //     decoder-independently by lengthOf == 2 below),
+        //   * a true nullptr          (-> Java null; echo returns null -> "").
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:cstr_ascii", proxy->call(static_cast<const char*>("c-string-arg")));
+        }
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:cstr_empty", proxy->call(static_cast<const char*>("")));
+        }
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:cstr_emoji",
+                         proxy->call(static_cast<const char*>("\xF0\x9F\x98\x80")));
+        }
+        if (auto proxy{ self->get_method("echo") })
+        {
+            // nullptr const char* -> Java null arg; echo(null) returns null, which
+            // the return decoder reports as "" (call_jni) / monostate "" (call_stub).
+            record_value("echo:cstr_null", proxy->call(static_cast<const char*>(nullptr)));
+        }
+        // Decoder-INDEPENDENT witnesses for the const char* branch via Java's own
+        // String.length(): the empty C-string must arrive as a 0-length String (NOT
+        // null -> "len=0", whereas a null arg gives "len=null"), the astral C-string
+        // must arrive as ONE supplementary scalar = 2 UTF-16 units ("len=2"), and the
+        // nullptr must arrive as Java null ("len=null").
+        if (auto proxy{ self->get_method("lengthOf") })
+        {
+            record_value("lengthOf:cstr_empty", proxy->call(static_cast<const char*>("")));
+        }
+        if (auto proxy{ self->get_method("lengthOf") })
+        {
+            record_value("lengthOf:cstr_emoji",
+                         proxy->call(static_cast<const char*>("\xF0\x9F\x98\x80")));
+        }
+        if (auto proxy{ self->get_method("lengthOf") })
+        {
+            record_value("lengthOf:cstr_null", proxy->call(static_cast<const char*>(nullptr)));
+        }
+
+        // ---- std::string_view String ARG (another DISTINCT branch) ----------
+        // convert_jni_arg has a dedicated std::string_view branch (same
+        // length-counted UTF-16 encode as std::string: interior NULs + astral
+        // scalars preserved).  Drive it with an interior-NUL view so the
+        // counted-length, no-C-string-cut property is proven on THIS branch too.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:sv_nul",
+                         proxy->call(std::string_view{ "a\0b", 3 }));
+        }
+        if (auto proxy{ self->get_method("lengthOf") })
+        {
+            record_value("lengthOf:sv_nul",
+                         proxy->call(std::string_view{ "a\0b", 3 }));
         }
 
         // concat(a, b): two String args -> one String return (INSTANCE).
@@ -629,6 +703,75 @@ namespace
             const observation echo_empty{ get("echo:empty") };
             ctx.check("echo_empty_value_empty", echo_empty.value.empty());
 
+            // ---- const char* ARG branch (distinct from the std::string branch) --
+            // Plain ASCII C-string round-trips byte-for-byte on both paths.
+            const observation echo_cstr_ascii{ get("echo:cstr_ascii") };
+            ctx.check("echo_cstr_ascii_exact",     echo_cstr_ascii.value == "c-string-arg");
+            ctx.check("echo_cstr_ascii_is_string", echo_cstr_ascii.is_string);
+            // Empty C-string "" -> a REAL empty Java String (NOT Java null): the value
+            // is "" on both paths.  The null-vs-empty distinction is pinned
+            // decoder-independently by lengthOf below (len=0, not len=null).
+            const observation echo_cstr_empty{ get("echo:cstr_empty") };
+            ctx.check("echo_cstr_empty_value_empty", echo_cstr_empty.value.empty());
+            // nullptr const char* -> Java null arg; echo(null) returns Java null, which
+            // the API reports as "" on both paths (the documented null -> empty mapping).
+            const observation echo_cstr_null{ get("echo:cstr_null") };
+            ctx.check("echo_cstr_null_value_empty", echo_cstr_null.value.empty());
+            // Astral C-string arg: the const char* branch routes through the same
+            // length-counted UTF-16 encoder, so the standard 4-byte sequence becomes a
+            // proper surrogate pair (U+1F600) — same RETURN-decoder divergence as every
+            // other astral round-trip (standard 4-byte on call_stub, 6-byte CESU-8 on
+            // call_jni).  The arg's intactness is proven decoder-independently by
+            // lengthOf:cstr_emoji == 2 below.
+            const observation echo_cstr_emoji{ get("echo:cstr_emoji") };
+            ctx.record(std::string{ "[INFO] echo:cstr_emoji (const char* astral arg) = [" }
+                       + to_hex(echo_cstr_emoji.value) + "]");
+            if (stub_path)
+            {
+                ctx.check("echo_cstr_emoji_call_stub_4byte",
+                          echo_cstr_emoji.value == "\xF0\x9F\x98\x80");
+            }
+            else
+            {
+                ctx.check("echo_cstr_emoji_call_jni_cesu8",
+                          echo_cstr_emoji.value == "\xED\xA0\xBD\xED\xB8\x80");
+            }
+            // Decoder-INDEPENDENT proof of the const char* branch's contract, via Java's
+            // own String.length() (pure-ASCII "len=N" payload, identical on both paths):
+            //   * ""        -> a 0-length Java String (NOT null): "len=0".
+            //   * nullptr   -> Java null:                          "len=null".
+            //   * astral    -> ONE supplementary scalar = 2 units: "len=2".
+            const observation len_cstr_empty{ get("lengthOf:cstr_empty") };
+            ctx.check("lengthOf_cstr_empty_is_zero_not_null", len_cstr_empty.value == "len=0");
+            const observation len_cstr_null{ get("lengthOf:cstr_null") };
+            ctx.check("lengthOf_cstr_null_is_java_null", len_cstr_null.value == "len=null");
+            const observation len_cstr_emoji{ get("lengthOf:cstr_emoji") };
+            ctx.check("lengthOf_cstr_emoji_two_units", len_cstr_emoji.value == "len=2");
+
+            // ---- std::string_view ARG branch (distinct again) -------------------
+            // An interior-NUL string_view proves the counted-length, no-C-string-cut
+            // property on the string_view branch: the Java String is 'a' U+0000 'b'
+            // (length 3), and the RETURN decoder diverges only by NUL encoding (raw 00
+            // on call_stub, C0 80 on call_jni) — same bytes as the std::string nul case.
+            const observation echo_sv_nul{ get("echo:sv_nul") };
+            ctx.record(std::string{ "[INFO] echo:sv_nul (string_view \"a\\0b\" arg) = [" }
+                       + to_hex(echo_sv_nul.value) + "]");
+            if (stub_path)
+            {
+                ctx.check("echo_sv_nul_call_stub_bytes", echo_sv_nul.value == std::string("a\0b", 3));
+                ctx.check("echo_sv_nul_call_stub_len3",  echo_sv_nul.byte_len == 3);
+            }
+            else
+            {
+                ctx.check("echo_sv_nul_call_jni_bytes",
+                          echo_sv_nul.value == std::string("\x61\xC0\x80\x62", 4));
+                ctx.check("echo_sv_nul_call_jni_len4", echo_sv_nul.byte_len == 4);
+            }
+            // Decoder-independent: the string_view branch preserved the interior NUL
+            // (Java length 3), not a C-string cut to 1.
+            const observation len_sv_nul{ get("lengthOf:sv_nul") };
+            ctx.check("lengthOf_sv_nul_interior_nul_kept", len_sv_nul.value == "len=3");
+
             // 300-char arg echoed back in full (no arg-side truncation).
             const observation echo_long{ get("echo:long") };
             ctx.check("echo_long_len_300", echo_long.byte_len == 300);
@@ -682,69 +825,52 @@ namespace
             ctx.check("repeatA64_len_64", r64.byte_len == 64);
             ctx.check("repeatA64_all_A",  r64.value == std::string(64, 'A'));
 
-            // repeatA(4096): exactly AT read_java_string's cap (length <= 4096
-            // passes), so BOTH paths return the full 4096 'A's.
+            // repeatA(4096): at the OLD cap value.  With the cap removed both paths
+            // return the full 4096 'A's (and the 5000 case below proves it keeps going
+            // past the old limit) — this case is kept as a boundary witness.
             const observation r4096{ get("repeatA:4096") };
             ctx.check("repeatA4096_len_4096", r4096.byte_len == 4096);
             ctx.check("repeatA4096_all_A",    r4096.value == std::string(4096, 'A'));
 
-            // repeatA(5000): ABOVE the cap.  call_jni's GetStringUTFChars has no
-            // cap and returns the full 5000; read_java_string rejects length >
-            // 4096 and returns "".  Each is the documented behaviour of its
-            // decoder.
+            // repeatA(5000): ABOVE the OLD 4096 read_java_string cap.  That cap was
+            // removed (robustness bug #29 raised read_java_string_max_units to 16M and
+            // dropped the "non-ASCII -> '?'" lossy substitution), so BOTH decoders now
+            // return the full 5000 'A's: call_jni's GetStringUTFChars has never capped,
+            // and read_java_string reads the whole backing array.  Pure ASCII, so the
+            // bytes are identical on both paths -> assert UNCONDITIONALLY.
             const observation r5000{ get("repeatA:5000") };
-            if (stub_path)
-            {
-                ctx.check("repeatA5000_call_stub_caps_to_empty", r5000.value.empty());
-            }
-            else
-            {
-                ctx.check("repeatA5000_call_jni_full_5000", r5000.byte_len == 5000);
-                ctx.check("repeatA5000_call_jni_all_A",
-                          r5000.value == std::string(5000, 'A'));
-            }
+            ctx.check("repeatA5000_full_5000", r5000.byte_len == 5000);
+            ctx.check("repeatA5000_all_A",     r5000.value == std::string(5000, 'A'));
 
             // ============ VERY LARGE returns: >4096 and >65536 ===============
-            // bigString(n) has NO 8192 clamp (unlike repeatA), so it returns a
-            // String far above the read_java_string backing-array cap AND above
-            // 65536 code units.  call_jni's GetStringUTFChars has no cap and returns
-            // the whole String; call_stub's read_java_string rejects any length >
-            // 4096 -> "".  Assert the path-correct contract for each.
+            // bigString(n) has NO 8192 clamp (unlike repeatA), so it returns a String
+            // far above the OLD 4096 read_java_string cap AND above 65536 / 131072 code
+            // units.  That cap is gone (robustness bug #29): read_java_string now reads
+            // up to read_java_string_max_units (16M) chars, and call_jni's
+            // GetStringUTFChars never capped — so BOTH decoders return the FULL String
+            // at any of these lengths.  Every byte is pure ASCII 'A', so the decoded
+            // bytes are identical on both paths -> assert the full content/length
+            // UNCONDITIONALLY (this is the headline "very long String, no truncation"
+            // invariant, now true on every dispatcher).
             const observation big5000{ get("bigString:5000") };
             const observation big70000{ get("bigString:70000") };
             const observation big131072{ get("bigString:131072") };
             const observation s_big70000{ get("static:staticBigString:70000") };
             ctx.check("bigString5000_captured",   big5000.captured);
             ctx.check("bigString70000_captured",  big70000.captured);
-            if (stub_path)
-            {
-                // read_java_string caps at 4096 -> every over-cap return is "".
-                ctx.check("bigString5000_call_stub_empty",   big5000.value.empty());
-                ctx.check("bigString70000_call_stub_empty",  big70000.value.empty());
-                ctx.check("bigString131072_call_stub_empty", big131072.value.empty());
-                ctx.check("staticBigString70000_call_stub_empty", s_big70000.value.empty());
-            }
-            else
-            {
-                // GetStringUTFChars returns the FULL String at any length.
-                ctx.check("bigString5000_call_jni_len_5000",   big5000.byte_len == 5000);
-                ctx.check("bigString5000_call_jni_all_A",
-                          big5000.value == std::string(5000, 'A'));
-                // >65536 — the headline large case.
-                ctx.check("bigString70000_call_jni_len_70000", big70000.byte_len == 70000);
-                ctx.check("bigString70000_call_jni_all_A",
-                          big70000.value == std::string(70000, 'A'));
-                // >131072 (2x 65536), to be thorough about "very long".
-                ctx.check("bigString131072_call_jni_len_131072",
-                          big131072.byte_len == 131072);
-                ctx.check("bigString131072_call_jni_all_A",
-                          big131072.value == std::string(131072, 'A'));
-                // Same >65536 case via the STATIC dispatch path.
-                ctx.check("staticBigString70000_call_jni_len_70000",
-                          s_big70000.byte_len == 70000);
-                ctx.check("staticBigString70000_call_jni_all_A",
-                          s_big70000.value == std::string(70000, 'A'));
-            }
+            // >4096 (above the old cap).
+            ctx.check("bigString5000_len_5000",   big5000.byte_len == 5000);
+            ctx.check("bigString5000_all_A",      big5000.value == std::string(5000, 'A'));
+            // >65536 — the headline large case.
+            ctx.check("bigString70000_len_70000", big70000.byte_len == 70000);
+            ctx.check("bigString70000_all_A",     big70000.value == std::string(70000, 'A'));
+            // >131072 (2x 65536), to be thorough about "very long".
+            ctx.check("bigString131072_len_131072", big131072.byte_len == 131072);
+            ctx.check("bigString131072_all_A",      big131072.value == std::string(131072, 'A'));
+            // Same >65536 case via the STATIC dispatch path.
+            ctx.check("staticBigString70000_len_70000", s_big70000.byte_len == 70000);
+            ctx.check("staticBigString70000_all_A",
+                      s_big70000.value == std::string(70000, 'A'));
 
             // ============ ECHO round-trips of every shape (String arg) =======
             // The String ARGUMENT is encoded by detail::convert_jni_arg via
@@ -861,21 +987,14 @@ namespace
             // >65536-code-unit arg: convert_jni_arg -> jni_new_string_utf16_local
             // calls JNIEnv::NewString with the full length-counted UTF-16 (70000 BMP
             // units), so the JVM builds the FULL String at any length (no cap on the
-            // ARG side).  The call_jni return then yields all 70000 bytes; the
-            // call_stub return caps the READ at 4096 -> "".  Over-cap ARGUMENT proof.
+            // ARG side).  The return then reads it back: GetStringUTFChars (call_jni)
+            // never capped, and read_java_string (call_stub) no longer caps either
+            // (robustness bug #29) — so BOTH paths yield all 70000 bytes.  Pure ASCII
+            // 'Q', so the bytes are identical on both paths.  This proves the over-cap
+            // ARGUMENT encode AND the over-cap RETURN decode end to end, unconditionally.
             const observation echo_big{ get("echo:big70000") };
-            if (stub_path)
-            {
-                // The arg built the full 70000-char String (make_java_string did
-                // not truncate); read_java_string just refuses to read it back.
-                ctx.check("echo_big70000_call_stub_read_capped_empty", echo_big.value.empty());
-            }
-            else
-            {
-                ctx.check("echo_big70000_call_jni_len_70000", echo_big.byte_len == 70000);
-                ctx.check("echo_big70000_call_jni_all_Q",
-                          echo_big.value == std::string(70000, 'Q'));
-            }
+            ctx.check("echo_big70000_len_70000", echo_big.byte_len == 70000);
+            ctx.check("echo_big70000_all_Q",     echo_big.value == std::string(70000, 'Q'));
 
             // ============ CODER WITNESS (Latin-1 coder 0 vs UTF-16 coder 1) ==
             // The native decode that the call_jni path uses is coder-AGNOSTIC
@@ -1167,13 +1286,12 @@ namespace
             // "a\0b" to a one-byte "a".  A length-counted UTF-16 arg never does either.
             ctx.check("no_argtrunc_echoEmoji_multibyte", echo_emoji.byte_len >= 4);
             ctx.check("no_argtrunc_echoNul_past_nul",    echo_nul.byte_len >= 3);
-            // The >65536 return is non-empty only on call_jni (call_stub caps the
-            // READ to 4096 -> ""); guard it on the path that returns it.
-            if (!stub_path)
-            {
-                ctx.check("no_truncation_bigString70000_nonempty", !big70000.value.empty());
-                ctx.check("no_truncation_echoBig70000_nonempty",   !echo_big.value.empty());
-            }
+            // The >65536 return is now non-empty on BOTH paths (the old 4096
+            // read_java_string cap that made the call_stub path return "" is gone —
+            // robustness bug #29), so these "very long String survives in full" guards
+            // hold unconditionally on every dispatcher.
+            ctx.check("no_truncation_bigString70000_nonempty", !big70000.value.empty());
+            ctx.check("no_truncation_echoBig70000_nonempty",   !echo_big.value.empty());
         }
     }
 }

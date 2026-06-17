@@ -177,12 +177,76 @@ public class FieldString extends FieldStringBase
     public static volatile String  setOverlongValue;
     public static volatile int     setOverlongLen;      // == 6 ("LONGER") after the rebind
 
+    // ----- SET-ENCODING round-trip targets ---------------------------------
+    // The existing SET targets above all write PURE ASCII.  These exercise the
+    // SET path's UTF-8 -> java.lang.String ENCODE for every non-ASCII class.
+    // field_proxy::set(std::string) -> store_string() builds the new String via
+    // the length-counted UTF-16 path (jni_new_string_utf16_local -> NewString),
+    // which is content-exact: interior NULs are kept (counted length, NOT a C
+    // string), astral scalars become proper surrogate PAIRS, and the JVM itself
+    // picks the LATIN1/UTF16 coder.  Each target starts as a private-backing
+    // placeholder; the module writes a known UTF-8 string into it, and the probe
+    // republishes Java's view (value / length / code points) so the native side
+    // proves the encode is visible to Java itself (the symmetric partner of the
+    // GET decode battery).  All start values are built via freshAscii / char[]
+    // so they own a PRIVATE backing (the shared-literal landmine never applies).
+    // A Latin-1 source (U+00E9 'é') -> Java length 1, codePointAt(0)==0x00E9.
+    public static String setLatin1Write  = freshAscii("__lat__");
+    public static volatile String  setLatin1WriteValue;
+    public static volatile int     setLatin1WriteLen;     // == 1
+    public static volatile int     setLatin1WriteCp0;     // == 0x00E9
+    // A BMP CJK source (U+65E5 日) -> Java length 1, codePointAt(0)==0x65E5.
+    public static String setCjkWrite     = freshAscii("__cjk__");
+    public static volatile String  setCjkWriteValue;
+    public static volatile int     setCjkWriteLen;        // == 1
+    public static volatile int     setCjkWriteCp0;        // == 0x65E5
+    // An ASTRAL source (U+1F600) -> Java length 2 (surrogate PAIR!), codePoint
+    // COUNT 1, codePointAt(0)==0x1F600.  Proves UTF-8 -> surrogate-pair ENCODE.
+    public static String setAstralWrite  = freshAscii("__ast__");
+    public static volatile String  setAstralWriteValue;
+    public static volatile int     setAstralWriteLen;     // == 2 (two UTF-16 units)
+    public static volatile int     setAstralWriteCpCount; // == 1
+    public static volatile int     setAstralWriteCp0;     // == 0x1F600
+    // An interior-NUL source ("a\0b") -> Java length 3, charAt(1)==0.  Proves
+    // the write is length-counted (NewStringUTF would truncate at the NUL).
+    public static String setNulWrite     = freshAscii("__nul__");
+    public static volatile String  setNulWriteValue;
+    public static volatile int     setNulWriteLen;        // == 3
+    public static volatile int     setNulWriteCp1;        // == 0 (interior NUL)
+    // An EMPTY write into a populated target -> a real empty String (length 0),
+    // NOT null and NOT left at the old value.
+    public static String setEmptyWrite   = freshAscii("populated");
+    public static volatile String  setEmptyWriteValue;
+    public static volatile int     setEmptyWriteLen;      // == 0
+    public static volatile boolean setEmptyWriteIsNull;   // == false (real "" String)
+    public static volatile boolean setEmptyWriteEqualsEmpty; // "".equals(...)
+    // Written through field_proxy::set(const char*) — the std::string_view
+    // CONVERTIBILITY arm of set(), distinct from the std::string arm above.
+    public static String setViaCharPtr   = freshAscii("__ptr__");
+    public static volatile boolean setViaCharPtrMatches;  // equals("char-ptr-set")
+    // Written through field_proxy::set(std::string_view) — same convertibility arm.
+    public static String setViaStringView = freshAscii("__sv__");
+    public static volatile boolean setViaStringViewMatches; // equals("sv-set")
+    // RE-SET: the module writes "first" then "second" into the SAME field (a
+    // second rebind over an already-rebound field).  Java must see "second".
+    public static String setReSet        = freshAscii("__pre__");
+    public static volatile String  setReSetValue;
+    public static volatile int     setReSetLen;           // == 6 ("second")
+
     // ================= SET target (instance) ===============================
     // Instance String field, mutated through an instance field_proxy.
     // Fresh char[] backing (see SET-target note above) so the write is isolated.
     public String  instAscii = freshAscii("QQQQQ");                      // len 5, write "java!"
     public static volatile String  instAsciiValue;
     public static volatile boolean instAsciiMatches;    // equals("java!")
+
+    // Instance String field written with a NON-ASCII (CJK) value through an
+    // instance field_proxy: proves the SET encode path works on an INSTANCE slot
+    // too (not just statics).  Source UTF-8 is U+65E5 日 -> Java length 1, cp 0x65E5.
+    public String  instCjk = freshAscii("__icjk__");
+    public static volatile String  instCjkValue;
+    public static volatile int     instCjkLen;          // == 1
+    public static volatile int     instCjkCp0;          // == 0x65E5
 
     // ================= GET target (instance, NEVER written) ================
     // A clean instance String the module READS (does not mutate), proving the
@@ -353,6 +417,41 @@ public class FieldString extends FieldStringBase
 
                 instAsciiValue   = self.instAscii;
                 instAsciiMatches = "java!".equals(self.instAscii);
+
+                // --- SET-ENCODING round-trip readbacks (the native side wrote a
+                //     known UTF-8 string into each; Java republishes its view so
+                //     the encode path is proven visible to the JVM itself). ----
+                setLatin1WriteValue = setLatin1Write;
+                setLatin1WriteLen   = setLatin1Write.length();           // 1
+                setLatin1WriteCp0   = setLatin1Write.isEmpty() ? -1 : setLatin1Write.codePointAt(0); // 0xE9
+
+                setCjkWriteValue = setCjkWrite;
+                setCjkWriteLen   = setCjkWrite.length();                 // 1
+                setCjkWriteCp0   = setCjkWrite.isEmpty() ? -1 : setCjkWrite.codePointAt(0); // 0x65E5
+
+                setAstralWriteValue   = setAstralWrite;
+                setAstralWriteLen     = setAstralWrite.length();         // 2 (surrogate pair)
+                setAstralWriteCpCount = setAstralWrite.codePointCount(0, setAstralWrite.length()); // 1
+                setAstralWriteCp0     = setAstralWrite.isEmpty() ? -1 : setAstralWrite.codePointAt(0); // 0x1F600
+
+                setNulWriteValue = setNulWrite;
+                setNulWriteLen   = setNulWrite.length();                 // 3
+                setNulWriteCp1   = setNulWrite.length() >= 2 ? setNulWrite.codePointAt(1) : -1; // 0
+
+                setEmptyWriteValue       = setEmptyWrite;
+                setEmptyWriteLen         = (setEmptyWrite == null) ? -1 : setEmptyWrite.length(); // 0
+                setEmptyWriteIsNull      = (setEmptyWrite == null);      // false
+                setEmptyWriteEqualsEmpty = "".equals(setEmptyWrite);     // true
+
+                setViaCharPtrMatches    = "char-ptr-set".equals(setViaCharPtr);
+                setViaStringViewMatches = "sv-set".equals(setViaStringView);
+
+                setReSetValue = setReSet;                                // "second"
+                setReSetLen   = setReSet.length();                       // 6
+
+                instCjkValue = self.instCjk;
+                instCjkLen   = self.instCjk.length();                    // 1
+                instCjkCp0   = self.instCjk.isEmpty() ? -1 : self.instCjk.codePointAt(0); // 0x65E5
 
                 // The shared literal must be untouched by native reads.
                 internedStillIntact = "INTERNED_LITERAL".equals(getInterned)

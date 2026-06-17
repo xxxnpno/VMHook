@@ -17,6 +17,19 @@
 // builds a real String, and a shared/interned String referenced elsewhere is never
 // corrupted.  These SET checks assert that new, correct behavior.
 //
+// SET ENCODING: because store_string builds the new String via the length-counted
+// UTF-16 path (jni_new_string_utf16_local -> NewString), the WRITE direction is
+// content-exact for every encoding class — so this module also writes a Latin-1
+// 'é', a BMP CJK 日, an ASTRAL emoji (U+1F600, which must become a UTF-16
+// surrogate PAIR), an interior-NUL string, and an empty string through the field,
+// then proves (via Java's own length/code-point view AND vmhook's own re-read)
+// that each round-trips to the exact UTF-8 bytes written.  It also drives the
+// std::string_view CONVERTIBILITY arm of set() (const char* / string_view, a
+// different if-constexpr branch than std::string) and a RE-SET (a second rebind
+// over an already-rebound field).  The free-helper decode core's exhaustive
+// surrogate/boundary battery lives in the sibling read_java_string module; this
+// module owns the FIELD path (field_proxy GET + SET) specifically.
+//
 // All checks run on a live JDK-21 JVM, where java.lang.String is COMPACT:
 //   coder 0 (LATIN1) => one byte per char, each code point UTF-8-ENCODED
 //                       (0xE9 -> C3 A9, 0x80 -> C2 80, 0xFF -> C3 BF);
@@ -89,6 +102,49 @@ namespace
             return true;
         }
 
+        // ---- set a static String field with a std::string carrying ARBITRARY
+        //      bytes (interior NUL / multi-byte UTF-8).  Takes a std::string BY
+        //      VALUE (not string_view) so an embedded NUL is preserved end-to-end
+        //      — a string_view built from a literal would stop at the first NUL.
+        //      Routes through the set(std::string) arm -> store_string.
+        static auto set_static_bytes(const char* name, std::string value) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return false;
+            }
+            proxy->set(value);   // lvalue std::string -> the std::string arm
+            return true;
+        }
+
+        // ---- set a static String field through field_proxy::set(const char*),
+        //      hitting the std::string_view CONVERTIBILITY arm of set() (distinct
+        //      from the std::string arm).  The literal must be NUL-free.
+        static auto set_static_charptr(const char* name, const char* literal) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return false;
+            }
+            proxy->set(literal); // const char* -> string_view convertibility arm
+            return true;
+        }
+
+        // ---- set a static String field through field_proxy::set(std::string_view),
+        //      the same convertibility arm via an explicit string_view value.
+        static auto set_static_sv(const char* name, std::string_view value) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return false;
+            }
+            proxy->set(value);   // std::string_view -> string_view convertibility arm
+            return true;
+        }
+
         // ---- set a primitive int field with a std::string (must be REFUSED by
         //      the field_proxy::set type guard).
         static auto set_int_with_string(const char* name, std::string_view value) -> bool
@@ -144,6 +200,32 @@ namespace
         static auto inst_ascii_value()     -> std::string  { return static_field("instAsciiValue")->get(); }
         static auto inst_ascii_matches()   -> bool        { return static_field("instAsciiMatches")->get(); }
         static auto interned_intact()      -> bool        { return static_field("internedStillIntact")->get(); }
+
+        // ---- SET-encoding round-trip: Java-published readbacks. ----
+        static auto set_latin1_write_value() -> std::string  { return static_field("setLatin1WriteValue")->get(); }
+        static auto set_latin1_write_len()   -> std::int32_t { return static_field("setLatin1WriteLen")->get(); }
+        static auto set_latin1_write_cp0()   -> std::int32_t { return static_field("setLatin1WriteCp0")->get(); }
+        static auto set_cjk_write_value()    -> std::string  { return static_field("setCjkWriteValue")->get(); }
+        static auto set_cjk_write_len()      -> std::int32_t { return static_field("setCjkWriteLen")->get(); }
+        static auto set_cjk_write_cp0()      -> std::int32_t { return static_field("setCjkWriteCp0")->get(); }
+        static auto set_astral_write_value()    -> std::string  { return static_field("setAstralWriteValue")->get(); }
+        static auto set_astral_write_len()      -> std::int32_t { return static_field("setAstralWriteLen")->get(); }
+        static auto set_astral_write_cpcount()  -> std::int32_t { return static_field("setAstralWriteCpCount")->get(); }
+        static auto set_astral_write_cp0()      -> std::int32_t { return static_field("setAstralWriteCp0")->get(); }
+        static auto set_nul_write_value()    -> std::string  { return static_field("setNulWriteValue")->get(); }
+        static auto set_nul_write_len()      -> std::int32_t { return static_field("setNulWriteLen")->get(); }
+        static auto set_nul_write_cp1()      -> std::int32_t { return static_field("setNulWriteCp1")->get(); }
+        static auto set_empty_write_value()  -> std::string  { return static_field("setEmptyWriteValue")->get(); }
+        static auto set_empty_write_len()    -> std::int32_t { return static_field("setEmptyWriteLen")->get(); }
+        static auto set_empty_write_is_null()-> bool         { return static_field("setEmptyWriteIsNull")->get(); }
+        static auto set_empty_write_eq_empty()-> bool        { return static_field("setEmptyWriteEqualsEmpty")->get(); }
+        static auto set_via_char_ptr_matches()  -> bool      { return static_field("setViaCharPtrMatches")->get(); }
+        static auto set_via_string_view_matches()-> bool     { return static_field("setViaStringViewMatches")->get(); }
+        static auto set_reset_value()        -> std::string  { return static_field("setReSetValue")->get(); }
+        static auto set_reset_len()          -> std::int32_t { return static_field("setReSetLen")->get(); }
+        static auto inst_cjk_value()         -> std::string  { return static_field("instCjkValue")->get(); }
+        static auto inst_cjk_len()           -> std::int32_t { return static_field("instCjkLen")->get(); }
+        static auto inst_cjk_cp0()           -> std::int32_t { return static_field("instCjkCp0")->get(); }
 
         // ---- obtain the live instance the fixture published in `self`. ----
         static auto acquire_self() -> std::unique_ptr<field_string_fixture> { return static_field("self")->get(); }
@@ -231,6 +313,59 @@ VMHOOK_JVM_MODULE(field_string)
     ctx.check("set_overlong_proxy_resolved",
               field_string_fixture::set_static("setOverlong", "LONGER"));
 
+    // ----------------------------------------------------------------------
+    // SET-ENCODING round-trip writes: write a known UTF-8 string of every
+    // non-ASCII class through field_proxy::set and prove (in PHASE 2) that
+    // store_string's UTF-8 -> java.lang.String encode is content-exact and
+    // visible to Java itself.  These exercise the WRITE direction of the same
+    // encodings the GET battery covers for the read direction.
+    // ----------------------------------------------------------------------
+
+    // Latin-1 source: UTF-8 'é' (U+00E9 = C3 A9) -> Java length 1, cp 0x00E9.
+    ctx.check("set_latin1_write_resolved",
+              field_string_fixture::set_static_bytes("setLatin1Write",
+                                                     std::string{ "\xC3\xA9" }));
+
+    // BMP CJK source: UTF-8 日 (U+65E5 = E6 97 A5) -> Java length 1, cp 0x65E5.
+    ctx.check("set_cjk_write_resolved",
+              field_string_fixture::set_static_bytes("setCjkWrite",
+                                                     std::string{ "\xE6\x97\xA5" }));
+
+    // Astral source: UTF-8 U+1F600 (F0 9F 98 80) -> Java length 2 (a surrogate
+    // PAIR), code-point count 1.  Proves store_string encodes a 4-byte UTF-8
+    // scalar into a proper UTF-16 surrogate pair.
+    ctx.check("set_astral_write_resolved",
+              field_string_fixture::set_static_bytes("setAstralWrite",
+                                                     std::string{ "\xF0\x9F\x98\x80" }));
+
+    // Interior-NUL source: the std::string is built with an EXPLICIT length so
+    // the embedded NUL is carried into store_string's length-counted UTF-16 path
+    // (NewStringUTF would truncate at the NUL).  -> Java length 3, charAt(1)==0.
+    ctx.check("set_nul_write_resolved",
+              field_string_fixture::set_static_bytes(
+                  "setNulWrite", std::string(std::string_view{ "a\0b", 3 })));
+
+    // Empty write into a populated target -> a real empty String (length 0),
+    // not null and not left at the old "populated" value.
+    ctx.check("set_empty_write_resolved",
+              field_string_fixture::set_static_bytes("setEmptyWrite", std::string{}));
+
+    // const char* through the std::string_view CONVERTIBILITY arm of set().
+    ctx.check("set_via_char_ptr_resolved",
+              field_string_fixture::set_static_charptr("setViaCharPtr", "char-ptr-set"));
+
+    // std::string_view through the same convertibility arm.
+    ctx.check("set_via_string_view_resolved",
+              field_string_fixture::set_static_sv("setViaStringView",
+                                                  std::string_view{ "sv-set" }));
+
+    // RE-SET: write "first" then "second" into the SAME field (a second rebind
+    // over an already-rebound field).  Java must see the LAST value, "second".
+    ctx.check("set_reset_first_resolved",
+              field_string_fixture::set_static("setReSet", "first"));
+    ctx.check("set_reset_second_resolved",
+              field_string_fixture::set_static("setReSet", "second"));
+
     // Instance String field, mutated through an INSTANCE field_proxy.
     {
         const auto self{ field_string_fixture::acquire_self() };
@@ -251,6 +386,20 @@ VMHOOK_JVM_MODULE(field_string)
                 // ambiguous on MSVC; `= value_t` matches the working baseline.
                 const std::string after = inst_proxy->get();
                 ctx.check("instance_set_native_readback_java", after == "java!");
+            }
+
+            // Instance NON-ASCII SET: write CJK 日 (U+65E5) through the instance
+            // field_proxy, proving the SET encode path works on an instance slot.
+            const auto inst_cjk_proxy{ self->get_field("instCjk") };
+            ctx.check("instance_cjk_field_resolved", inst_cjk_proxy.has_value());
+            if (inst_cjk_proxy.has_value())
+            {
+                inst_cjk_proxy->set(std::string{ "\xE6\x97\xA5" });
+                // Native read-back agrees immediately (pre-probe): the field now
+                // decodes to the 3-byte UTF-8 of 日.
+                const std::string after = inst_cjk_proxy->get();
+                ctx.check("instance_cjk_set_native_readback",
+                          after == std::string{ "\xE6\x97\xA5" });
             }
         }
     }
@@ -644,6 +793,86 @@ VMHOOK_JVM_MODULE(field_string)
         // field now reads the written value (no longer the old no-op "").
         ctx.check("set_empty_target_now_ignored",
                   field_string_fixture::read_static("setEmptyTgt") == "ignored");
+
+        // ======================================================================
+        // SET-ENCODING round-trip verification (the WRITE direction of the GET
+        // battery's encodings).  For each: (a) Java's OWN view of the rebound
+        // field — length / code points — proves store_string's UTF-8 -> String
+        // encode is content-exact and visible to the JVM; (b) vmhook's OWN
+        // re-read decodes back to the exact UTF-8 bytes we wrote, closing the
+        // write->read loop entirely inside the field path.  All are HARD: the
+        // decoded content/length is invariant across JDK 8-26 x GC x compiler.
+        // ======================================================================
+
+        // --- Latin-1 'é' (U+00E9): Java length 1, cp 0x00E9; vmhook re-read C3 A9. ---
+        ctx.check("set_latin1_write_java_len_1", field_string_fixture::set_latin1_write_len() == 1);
+        ctx.check("set_latin1_write_java_cp0_E9", field_string_fixture::set_latin1_write_cp0() == 0x00E9);
+        ctx.check("set_latin1_write_java_value_utf8",
+                  field_string_fixture::set_latin1_write_value() == std::string{ "\xC3\xA9" });
+        ctx.check("set_latin1_write_vmhook_reread",
+                  field_string_fixture::read_static("setLatin1Write") == std::string{ "\xC3\xA9" });
+
+        // --- CJK 日 (U+65E5): Java length 1, cp 0x65E5; vmhook re-read E6 97 A5. ---
+        ctx.check("set_cjk_write_java_len_1", field_string_fixture::set_cjk_write_len() == 1);
+        ctx.check("set_cjk_write_java_cp0_65E5", field_string_fixture::set_cjk_write_cp0() == 0x65E5);
+        ctx.check("set_cjk_write_java_value_utf8",
+                  field_string_fixture::set_cjk_write_value() == std::string{ "\xE6\x97\xA5" });
+        ctx.check("set_cjk_write_vmhook_reread",
+                  field_string_fixture::read_static("setCjkWrite") == std::string{ "\xE6\x97\xA5" });
+
+        // --- Astral U+1F600: Java length 2 (surrogate PAIR), cpCount 1, cp 0x1F600;
+        //     vmhook re-read is the one 4-byte UTF-8 sequence F0 9F 98 80.  This is
+        //     the headline SET proof: a 4-byte UTF-8 scalar -> surrogate pair ->
+        //     decoded back to the same 4-byte sequence, all through the field. ---
+        ctx.check("set_astral_write_java_len_2", field_string_fixture::set_astral_write_len() == 2);
+        ctx.check("set_astral_write_java_cpcount_1", field_string_fixture::set_astral_write_cpcount() == 1);
+        ctx.check("set_astral_write_java_cp0_1F600", field_string_fixture::set_astral_write_cp0() == 0x1F600);
+        ctx.check("set_astral_write_java_value_utf8",
+                  field_string_fixture::set_astral_write_value() == std::string{ "\xF0\x9F\x98\x80" });
+        ctx.check("set_astral_write_vmhook_reread",
+                  field_string_fixture::read_static("setAstralWrite") == std::string{ "\xF0\x9F\x98\x80" });
+
+        // --- Interior NUL ("a\0b"): Java length 3, charAt(1)==0; vmhook re-read is
+        //     the same 3 bytes with the interior NUL preserved (length-counted, not
+        //     C-string-truncated by either the write or the read). ---
+        ctx.check("set_nul_write_java_len_3", field_string_fixture::set_nul_write_len() == 3);
+        ctx.check("set_nul_write_java_cp1_is_0", field_string_fixture::set_nul_write_cp1() == 0);
+        {
+            const std::string reread{ field_string_fixture::read_static("setNulWrite") };
+            ctx.check("set_nul_write_vmhook_reread_len_3", reread.size() == 3);
+            ctx.check("set_nul_write_vmhook_reread_bytes",
+                      reread.size() == 3 && reread[0] == 'a' && reread[1] == '\0' && reread[2] == 'b');
+        }
+
+        // --- Empty write: Java sees a real empty String (length 0, NOT null),
+        //     and vmhook re-reads "". ---
+        ctx.check("set_empty_write_java_len_0", field_string_fixture::set_empty_write_len() == 0);
+        ctx.check("set_empty_write_java_not_null", !field_string_fixture::set_empty_write_is_null());
+        ctx.check("set_empty_write_java_equals_empty", field_string_fixture::set_empty_write_eq_empty());
+        ctx.check("set_empty_write_vmhook_reread_empty",
+                  field_string_fixture::read_static("setEmptyWrite").empty());
+
+        // --- set(const char*) and set(string_view) convertibility arms landed
+        //     correct values, visible to Java and to vmhook's re-read. ---
+        ctx.check("set_via_char_ptr_java_matches", field_string_fixture::set_via_char_ptr_matches());
+        ctx.check("set_via_char_ptr_vmhook_reread",
+                  field_string_fixture::read_static("setViaCharPtr") == "char-ptr-set");
+        ctx.check("set_via_string_view_java_matches", field_string_fixture::set_via_string_view_matches());
+        ctx.check("set_via_string_view_vmhook_reread",
+                  field_string_fixture::read_static("setViaStringView") == "sv-set");
+
+        // --- RE-SET: the second rebind won; Java and vmhook both see "second". ---
+        ctx.check("set_reset_java_value_second", field_string_fixture::set_reset_value() == "second");
+        ctx.check("set_reset_java_len_6", field_string_fixture::set_reset_len() == 6);
+        ctx.check("set_reset_vmhook_reread_second",
+                  field_string_fixture::read_static("setReSet") == "second");
+
+        // --- Instance NON-ASCII SET: Java length 1, cp 0x65E5; vmhook re-read
+        //     E6 97 A5 — the encode path verified on an INSTANCE slot. ---
+        ctx.check("instance_cjk_set_java_len_1", field_string_fixture::inst_cjk_len() == 1);
+        ctx.check("instance_cjk_set_java_cp0_65E5", field_string_fixture::inst_cjk_cp0() == 0x65E5);
+        ctx.check("instance_cjk_set_java_value_utf8",
+                  field_string_fixture::inst_cjk_value() == std::string{ "\xE6\x97\xA5" });
 
         // ---- FIELD REASSIGNED BETWEEN READS: the probe replaced getReassign's
         //      reference with a freshly-allocated "after2".  A NEW field_proxy

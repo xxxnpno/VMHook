@@ -1470,6 +1470,88 @@ namespace
         cap_sig_long1(s, "wtag_sig_long", "widthTag", "(J)I", 9LL);
 
         // ============================================================
+        //  DOUBLE IN THE MIDDLE FLANKED BY FLOATS: mixE(float, double, float).
+        //  The 'F'-neighbour analogue of mixC(int,double,int): a packer that mis-
+        //  expands the wide double against an 'F' slot (vs the 'I' in mixC) would
+        //  corrupt a flanking float.  The flanking floats are small exact integers
+        //  so the return and witnesses compare bit-exact.
+        // ============================================================
+        cap_mixE(s, "mixE_main", 3.0f, bits2d(0x400921FB54442D18ULL), 5.0f); // PI middle
+
+        // ============================================================
+        //  THE (JIDI) SHAPE: jidi(long, int, double, int).  Seven interpreter
+        //  slots; the first int sits between a long and a double, the second int
+        //  follows the double — a one-slot drift anywhere fails a witness.
+        // ============================================================
+        cap_jidi(s, "jidi_main",
+                 static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL),   // both halves set
+                 0x1BADCAFE,
+                 bits2d(0x400921FB54442D18ULL),                       // PI
+                 0x5EEDFACE);
+
+        // ============================================================
+        //  THE (ID J) SHAPE: idj(int, double, long).  The long must START exactly
+        //  two slots after the double's start (slot 4 for instance).
+        // ============================================================
+        cap_idj(s, "idj_main", -1, bits2d(0xC02E000000000000ULL),    // -15.0
+                static_cast<std::int64_t>(0x00000000FFFFFFFFULL));    // low-half-only long
+
+        // ============================================================
+        //  FIVE-ARG "EVERY SHAPE" TAIL: widePent(long, int, double, int, float).
+        //  Eight interpreter slots (2+1+2+1+1); a TRAILING float after a wide-heavy
+        //  frame proves the float lands on the right single slot.  The float widens
+        //  to double once (exact), so the return is bit-exact.
+        // ============================================================
+        cap_widePent(s, "widePent_main",
+                     std::numeric_limits<std::int64_t>::min(),       // long at slot 1
+                     0x0A0A0A0A,
+                     bits2d(0x400921FB54442D18ULL),                  // PI
+                     -2000000000,
+                     2.5f);                                          // trailing float
+
+        // ============================================================
+        //  DEEP PACKING — SIX adjacent longs: sixL(long x6).  Twelve contiguous
+        //  interpreter slots; every slot pair must stay distinct (no half-bleed).
+        //  Boundary mix: high-half-only, low-half-only, the +2^31 sign-extend
+        //  witness, MIN/MAX, and a both-halves-set pattern.  An asymmetric formula
+        //  (distinct multipliers) catches any neighbour swap; full-width operands
+        //  catch any truncation.  Each operand stamped to its own witness.
+        // ============================================================
+        cap_sixL(s, "sixL_main",
+                 static_cast<std::int64_t>(0xFFFFFFFF00000000ULL),   // high half only
+                 static_cast<std::int64_t>(0x00000000FFFFFFFFULL),   // low half only
+                 static_cast<std::int64_t>(0x0000000080000000ULL),   // +2^31 (sign-extend witness)
+                 std::numeric_limits<std::int64_t>::min(),
+                 std::numeric_limits<std::int64_t>::max(),
+                 static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));   // both halves set
+
+        // ============================================================
+        //  DEEP PACKING — SIX adjacent doubles: sixD(double x6).  Twelve contiguous
+        //  slots, the double-kind deep-packing witness.  Each operand is scaled by a
+        //  DISTINCT exact power of two in its own rounded step, then summed strictly
+        //  left-to-right; the native side recomputes the identical operation order so
+        //  the bits match.  Includes -0.0 and the smallest subnormal so the sign and
+        //  the denormal mantissa survive twelve-deep packing.  Each operand stamped.
+        // ============================================================
+        cap_sixD(s, "sixD_main",
+                 bits2d(0x400921FB54442D18ULL),   // PI
+                 bits2d(0x8000000000000000ULL),   // -0.0
+                 bits2d(0x0000000000000001ULL),   // smallest subnormal
+                 bits2d(0xBFF0000000000000ULL),   // -1.0
+                 bits2d(0x4005BF0A8B145769ULL),   // E
+                 bits2d(0x3FE0000000000000ULL));  // 0.5
+
+        // ============================================================
+        //  WIDE DOUBLE BETWEEN OBJECT REFERENCES: mixSD(String, double, String).
+        //  The double analogue of mixS's long-between-references.  The double must
+        //  stay bit-exact beside two 'L' slots and the two distinct-length
+        //  references must not swap.  String lengths feed the return (distinct
+        //  exact scales), each operand stamped to a witness.
+        // ============================================================
+        cap_mixSD(s, "mixSD_main", kStrA,
+                  bits2d(0x400921FB54442D18ULL), kStrC);            // PI between refs
+
+        // ============================================================
         //  STATIC variants (no receiver; first wide arg at slot 0).
         // ============================================================
         scap_long2("s_addL_min_max", "sAddL",
@@ -1493,6 +1575,30 @@ namespace
                             bits2d(0x400921FB54442D18ULL));    // PI
         scap_mixS ("s_mixS", kStrA,
                    static_cast<std::int64_t>(0xFFFFFFFF00000000ULL), kStrC);
+        // static deep-packing variants — twelve contiguous slots at the no-receiver
+        // frame (first wide arg at slot 0).  Same boundary mixes / FMA-safe formulas
+        // as the instance sixL / sixD.
+        scap_sixL ("s_sixL",
+                   static_cast<std::int64_t>(0xFFFFFFFF00000000ULL),  // high half only
+                   static_cast<std::int64_t>(0x00000000FFFFFFFFULL),  // low half only
+                   static_cast<std::int64_t>(0x0000000080000000ULL),  // +2^31
+                   std::numeric_limits<std::int64_t>::min(),
+                   std::numeric_limits<std::int64_t>::max(),
+                   static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));  // both halves
+        scap_sixD ("s_sixD",
+                   bits2d(0x400921FB54442D18ULL),   // PI
+                   bits2d(0x8000000000000000ULL),   // -0.0
+                   bits2d(0x0000000000000001ULL),   // smallest subnormal
+                   bits2d(0xBFF0000000000000ULL),   // -1.0
+                   bits2d(0x4005BF0A8B145769ULL),   // E
+                   bits2d(0x3FE0000000000000ULL));  // 0.5
+        // static (JIDIF) five-arg "every shape" tail (first arg at slot 0).
+        scap_widePent("s_widePent",
+                      std::numeric_limits<std::int64_t>::min(),
+                      0x0A0A0A0A,
+                      bits2d(0x400921FB54442D18ULL),                  // PI
+                      -2000000000,
+                      2.5f);
     }
 
     // The entire test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
@@ -2062,6 +2168,190 @@ namespace
         }
 
         // =====================================================================
+        //  DOUBLE IN THE MIDDLE FLANKED BY FLOATS (mixE).  Return recomputed in
+        //  the EXACT float-precision order Java uses — a*256.0f and c*4.0f each
+        //  rounded to float in their own step, the double widened to float once,
+        //  then summed left-to-right — so the bits match with no FMA/double-round
+        //  drift.  Both floats are small exact integers, so their witnesses are
+        //  bit-exact; the double witness is bit-exact (full 64-bit pattern).
+        // =====================================================================
+        {
+            const float  a{ 3.0f };
+            const double b{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const float  c{ 5.0f };
+            const float sa{ a * 256.0f };
+            const float sc{ c * 4.0f };
+            const float bf{ static_cast<float>(b) };
+            const float expect{ sa + bf + sc };
+            const probe_result r{ got("mixE_main") };
+            ctx.check("mixE_main_resolved", r.resolved);
+            ctx.check("mixE_main_not_void", r.dispatched);
+            ctx.check("mixE_main_return_bits", r.fbits == f2bits(expect));
+            // The flanking floats survived the two-slot double (bit-exact).
+            ctx.check("mixE_witness_a_bits", wide::wMixEa() == f2bits(a));
+            ctx.check("mixE_witness_b_bits", wide::wMixEb() == 0x400921FB54442D18ULL);
+            ctx.check("mixE_witness_c_bits_after_double", wide::wMixEc() == f2bits(c));
+        }
+
+        // =====================================================================
+        //  THE (JIDI) SHAPE (jidi = long,int,double,int).  Pure left-to-right sum
+        //  (no FMA-contractible mul+add), recomputed identically; every operand
+        //  additionally pinned by a witness, so a one-slot drift fails a witness
+        //  even if the sum coincided.
+        // =====================================================================
+        {
+            const std::int64_t a{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            const std::int32_t b{ 0x1BADCAFE };
+            const double       c{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const std::int32_t d{ 0x5EEDFACE };
+            const probe_result r{ got("jidi_main") };
+            ctx.check("jidi_main_resolved", r.resolved);
+            ctx.check("jidi_main_not_void", r.dispatched);
+            ctx.check("jidi_main_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + static_cast<double>(b)
+                                        + c + static_cast<double>(d)));
+            ctx.check("jidi_witness_a_exact",  wide::wJidiA() == a);
+            ctx.check("jidi_witness_b_intact", wide::wJidiB() == b);
+            ctx.check("jidi_witness_c_bits",   wide::wJidiC() == 0x400921FB54442D18ULL);
+            ctx.check("jidi_witness_d_intact_after_double", wide::wJidiD() == d);
+        }
+
+        // =====================================================================
+        //  THE (ID J) SHAPE (idj = int,double,long).  The long must START exactly
+        //  two slots after the double.  Pure sum; every operand pinned.
+        // =====================================================================
+        {
+            const std::int32_t a{ -1 };
+            const double       b{ bits2d(0xC02E000000000000ULL) }; // -15.0
+            const std::int64_t c{ static_cast<std::int64_t>(0x00000000FFFFFFFFULL) };
+            const probe_result r{ got("idj_main") };
+            ctx.check("idj_main_resolved", r.resolved);
+            ctx.check("idj_main_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + b + static_cast<double>(c)));
+            ctx.check("idj_witness_a_intact", wide::wIdjA() == a);
+            ctx.check("idj_witness_b_bits",   wide::wIdjB() == 0xC02E000000000000ULL);
+            ctx.check("idj_witness_c_exact_after_double", wide::wIdjC() == c);
+        }
+
+        // =====================================================================
+        //  FIVE-ARG "EVERY SHAPE" TAIL (widePent = long,int,double,int,float).
+        //  Eight interpreter slots; the TRAILING float lands on the right single
+        //  slot once two wides + two narrows precede it.  Pure left-to-right sum
+        //  (the float widens to double exactly), so bit-exact.  Each operand pinned.
+        // =====================================================================
+        {
+            const std::int64_t a{ std::numeric_limits<std::int64_t>::min() };
+            const std::int32_t b{ 0x0A0A0A0A };
+            const double       c{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const std::int32_t d{ -2000000000 };
+            const float        e{ 2.5f };
+            const probe_result r{ got("widePent_main") };
+            ctx.check("widePent_main_resolved", r.resolved);
+            ctx.check("widePent_main_not_void", r.dispatched);
+            ctx.check("widePent_main_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + static_cast<double>(b)
+                                        + c + static_cast<double>(d)
+                                        + static_cast<double>(e)));
+            ctx.check("widePent_witness_a_exact",  wide::wPentA() == a);
+            ctx.check("widePent_witness_b_intact", wide::wPentB() == b);
+            ctx.check("widePent_witness_c_bits",   wide::wPentC() == 0x400921FB54442D18ULL);
+            ctx.check("widePent_witness_d_intact", wide::wPentD() == d);
+            ctx.check("widePent_witness_e_bits_trailing", wide::wPentE() == f2bits(e));
+        }
+
+        // =====================================================================
+        //  DEEP PACKING — SIX adjacent longs (sixL).  Twelve contiguous slots; the
+        //  asymmetric per-operand multipliers + full-width sum catch any neighbour
+        //  swap or truncation across the deep pack.  Combined return AND all six
+        //  witnesses are checked.  All arithmetic is two's-complement wraparound,
+        //  mirrored via the unsigned-wrap helpers (jadd / jmul).
+        // =====================================================================
+        {
+            const std::int64_t a{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const std::int64_t b{ static_cast<std::int64_t>(0x00000000FFFFFFFFULL) };
+            const std::int64_t c{ static_cast<std::int64_t>(0x0000000080000000ULL) };
+            const std::int64_t d{ std::numeric_limits<std::int64_t>::min() };
+            const std::int64_t e{ std::numeric_limits<std::int64_t>::max() };
+            const std::int64_t f{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            // a*1000003 + b*31 + c*131 + d*524287 + e*8191 + f  (Java two's-comp)
+            const std::int64_t expect{
+                jadd(jadd(jadd(jadd(jadd(
+                    jmul(a, 1000003LL),
+                    jmul(b, 31LL)),
+                    jmul(c, 131LL)),
+                    jmul(d, 524287LL)),
+                    jmul(e, 8191LL)),
+                    f) };
+            const probe_result r{ got("sixL_main") };
+            ctx.check("sixL_main_resolved", r.resolved);
+            ctx.check("sixL_main_not_void", r.dispatched);
+            ctx.check("sixL_main_return", r.ival == expect);
+            ctx.check("sixL_witness_a_exact", wide::wSixLa() == a);
+            ctx.check("sixL_witness_b_exact", wide::wSixLb() == b);
+            ctx.check("sixL_witness_c_exact", wide::wSixLc() == c);
+            ctx.check("sixL_witness_d_exact", wide::wSixLd() == d);
+            ctx.check("sixL_witness_e_exact", wide::wSixLe() == e);
+            ctx.check("sixL_witness_f_exact", wide::wSixLf() == f);
+        }
+
+        // =====================================================================
+        //  DEEP PACKING — SIX adjacent doubles (sixD).  Twelve contiguous slots.
+        //  Return recomputed with the EXACT same split-scale-then-left-to-right-sum
+        //  the fixture uses (each product its own rounded step), so the bits match
+        //  on every target with no FMA contraction.  -0.0 and the smallest
+        //  subnormal are included so sign and denormal mantissa survive the pack.
+        //  Combined return AND all six bit-exact witnesses checked.
+        // =====================================================================
+        {
+            const double a{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const double b{ bits2d(0x8000000000000000ULL) }; // -0.0
+            const double c{ bits2d(0x0000000000000001ULL) }; // smallest subnormal
+            const double d{ bits2d(0xBFF0000000000000ULL) }; // -1.0
+            const double e{ bits2d(0x4005BF0A8B145769ULL) }; // E
+            const double f{ bits2d(0x3FE0000000000000ULL) }; // 0.5
+            const double ta{ a * 2.0 };
+            const double tb{ b * 4.0 };
+            const double tc{ c * 8.0 };
+            const double td{ d * 16.0 };
+            const double te{ e * 32.0 };
+            const double tf{ f * 64.0 };
+            const double expect{ ta + tb + tc + td + te + tf };
+            const probe_result r{ got("sixD_main") };
+            ctx.check("sixD_main_resolved", r.resolved);
+            ctx.check("sixD_main_not_void", r.dispatched);
+            ctx.check("sixD_main_return_bits", r.dbits == d2bits(expect));
+            ctx.check("sixD_witness_a_bits", wide::wSixDa() == 0x400921FB54442D18ULL);
+            ctx.check("sixD_witness_b_bits", wide::wSixDb() == 0x8000000000000000ULL);
+            ctx.check("sixD_witness_c_bits", wide::wSixDc() == 0x0000000000000001ULL);
+            ctx.check("sixD_witness_d_bits", wide::wSixDd() == 0xBFF0000000000000ULL);
+            ctx.check("sixD_witness_e_bits", wide::wSixDe() == 0x4005BF0A8B145769ULL);
+            ctx.check("sixD_witness_f_bits", wide::wSixDf() == 0x3FE0000000000000ULL);
+        }
+
+        // =====================================================================
+        //  WIDE DOUBLE BETWEEN OBJECT REFERENCES (mixSD = String,double,String).
+        //  The double analogue of mixS: the double between two 'L' slots is intact
+        //  and the two distinct-length references did not swap.  Return recomputed
+        //  from the double + known String lengths (exact scales, each its own step);
+        //  the double witness is bit-exact and each String's content is pinned.
+        // =====================================================================
+        {
+            const double b{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const double wa{ static_cast<double>(kStrLenA) * 1024.0 };
+            const double wc{ static_cast<double>(kStrLenC) * 16.0 };
+            const double expect{ b + wa + wc };
+            const probe_result r{ got("mixSD_main") };
+            ctx.check("mixSD_main_resolved", r.resolved);
+            ctx.check("mixSD_main_not_void", r.dispatched);
+            ctx.check("mixSD_main_return_bits", r.dbits == d2bits(expect));
+            // The double survived between the two reference slots (bit-exact).
+            ctx.check("mixSD_witness_double_bits", wide::wMixSDb() == 0x400921FB54442D18ULL);
+            // The references did not swap (distinct content each in its own slot).
+            ctx.check("mixSD_witness_a_content", wide::wMixSDa() == kStrA);
+            ctx.check("mixSD_witness_c_content_after_wide", wide::wMixSDc() == kStrC);
+        }
+
+        // =====================================================================
         //  STATIC variants — first wide arg at slot 0 (no receiver).
         // =====================================================================
         {
@@ -2176,6 +2466,78 @@ namespace
             ctx.check("s_mixS_witness_long_exact", wide::sWMixSb() == b);
             ctx.check("s_mixS_witness_a_content", wide::sWMixSa() == kStrA);
             ctx.check("s_mixS_witness_c_content_after_wide", wide::sWMixSc() == kStrC);
+        }
+        {
+            // STATIC SIX longs — twelve contiguous slots, first long at slot 0 (no
+            // receiver shift).  Same boundary mix + asymmetric formula as instance.
+            const std::int64_t a{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const std::int64_t b{ static_cast<std::int64_t>(0x00000000FFFFFFFFULL) };
+            const std::int64_t c{ static_cast<std::int64_t>(0x0000000080000000ULL) };
+            const std::int64_t d{ std::numeric_limits<std::int64_t>::min() };
+            const std::int64_t e{ std::numeric_limits<std::int64_t>::max() };
+            const std::int64_t f{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            const std::int64_t expect{
+                jadd(jadd(jadd(jadd(jadd(
+                    jmul(a, 1000003LL),
+                    jmul(b, 31LL)),
+                    jmul(c, 131LL)),
+                    jmul(d, 524287LL)),
+                    jmul(e, 8191LL)),
+                    f) };
+            const probe_result r{ got("s_sixL") };
+            ctx.check("s_sixL_resolved", r.resolved);
+            ctx.check("s_sixL_return", r.ival == expect);
+            ctx.check("s_sixL_witness_a_exact", wide::sWSixLa() == a);
+            ctx.check("s_sixL_witness_b_exact", wide::sWSixLb() == b);
+            ctx.check("s_sixL_witness_c_exact", wide::sWSixLc() == c);
+            ctx.check("s_sixL_witness_d_exact", wide::sWSixLd() == d);
+            ctx.check("s_sixL_witness_e_exact", wide::sWSixLe() == e);
+            ctx.check("s_sixL_witness_f_exact", wide::sWSixLf() == f);
+        }
+        {
+            // STATIC SIX doubles — twelve contiguous slots, first double at slot 0.
+            // Same FMA-safe split-scale-then-left-to-right-sum as the instance sixD.
+            const double a{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const double b{ bits2d(0x8000000000000000ULL) }; // -0.0
+            const double c{ bits2d(0x0000000000000001ULL) }; // smallest subnormal
+            const double d{ bits2d(0xBFF0000000000000ULL) }; // -1.0
+            const double e{ bits2d(0x4005BF0A8B145769ULL) }; // E
+            const double f{ bits2d(0x3FE0000000000000ULL) }; // 0.5
+            const double ta{ a * 2.0 };
+            const double tb{ b * 4.0 };
+            const double tc{ c * 8.0 };
+            const double td{ d * 16.0 };
+            const double te{ e * 32.0 };
+            const double tf{ f * 64.0 };
+            const double expect{ ta + tb + tc + td + te + tf };
+            const probe_result r{ got("s_sixD") };
+            ctx.check("s_sixD_resolved", r.resolved);
+            ctx.check("s_sixD_return_bits", r.dbits == d2bits(expect));
+            ctx.check("s_sixD_witness_a_bits", wide::sWSixDa() == 0x400921FB54442D18ULL);
+            ctx.check("s_sixD_witness_b_bits", wide::sWSixDb() == 0x8000000000000000ULL);
+            ctx.check("s_sixD_witness_c_bits", wide::sWSixDc() == 0x0000000000000001ULL);
+            ctx.check("s_sixD_witness_d_bits", wide::sWSixDd() == 0xBFF0000000000000ULL);
+            ctx.check("s_sixD_witness_e_bits", wide::sWSixDe() == 0x4005BF0A8B145769ULL);
+            ctx.check("s_sixD_witness_f_bits", wide::sWSixDf() == 0x3FE0000000000000ULL);
+        }
+        {
+            // STATIC (JIDIF) five-arg "every shape" tail (first arg at slot 0).
+            const std::int64_t a{ std::numeric_limits<std::int64_t>::min() };
+            const std::int32_t b{ 0x0A0A0A0A };
+            const double       c{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const std::int32_t d{ -2000000000 };
+            const float        e{ 2.5f };
+            const probe_result r{ got("s_widePent") };
+            ctx.check("s_widePent_resolved", r.resolved);
+            ctx.check("s_widePent_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + static_cast<double>(b)
+                                        + c + static_cast<double>(d)
+                                        + static_cast<double>(e)));
+            ctx.check("s_widePent_witness_a_exact",  wide::sWPentA() == a);
+            ctx.check("s_widePent_witness_b_intact", wide::sWPentB() == b);
+            ctx.check("s_widePent_witness_c_bits",   wide::sWPentC() == 0x400921FB54442D18ULL);
+            ctx.check("s_widePent_witness_d_intact", wide::sWPentD() == d);
+            ctx.check("s_widePent_witness_e_bits_trailing", wide::sWPentE() == f2bits(e));
         }
 
         // =====================================================================
