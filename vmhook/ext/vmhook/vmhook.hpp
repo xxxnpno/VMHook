@@ -707,9 +707,24 @@ namespace vmhook
                 return nullptr;
             }
 #if VMHOOK_OS_WINDOWS
-            return ::VirtualAlloc(address_hint, size,
-                                  MEM_COMMIT | MEM_RESERVE,
-                                  PAGE_EXECUTE_READWRITE);
+            void* result{ ::VirtualAlloc(address_hint, size,
+                                         MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE) };
+            // Honour the documented "non-binding placement preference"
+            // contract: unlike POSIX mmap (which relocates when the hint is
+            // taken), VirtualAlloc with a non-null base is binding-or-fail and
+            // returns NULL (ERROR_INVALID_ADDRESS) when the hinted range is
+            // occupied.  Retry once with no hint so an occupied preference
+            // degrades to a normal allocation instead of a hard failure.  The
+            // only hinted caller (the trampoline allocator) targets free
+            // regions, so this rescue path is rarely taken.
+            if (result == nullptr && address_hint != nullptr)
+            {
+                result = ::VirtualAlloc(nullptr, size,
+                                        MEM_COMMIT | MEM_RESERVE,
+                                        PAGE_EXECUTE_READWRITE);
+            }
+            return result;
 #else
             // Try RWX first (succeeds on Linux, Android, x86_64 macOS, and
             // older iOS).  On Apple arm64 / current iOS the kernel enforces
@@ -741,6 +756,20 @@ namespace vmhook
             but Linux munmap returns EINVAL for size == 0.  Returning early on a
             zero size keeps the cross-platform behaviour symmetric and avoids the
             useless syscall on POSIX.
+
+            Windows interior-pointer behaviour (verified): VirtualFree with
+            MEM_RELEASE expects the exact base returned by VirtualAlloc, but it
+            does NOT fail uniformly for every interior pointer.  An interior
+            pointer that still lies within the FIRST page of the reservation is
+            rounded down to the reservation base and SUCCEEDS, freeing the whole
+            reservation.  An interior pointer in a LATER page returns 0 (frees
+            nothing -> the reservation leaks).  The BOOL return is discarded
+            either way, so a genuinely failed free is silent.  All in-tree
+            callers pass the exact base, so neither outcome is hit in practice.
+
+            POSIX: munmap requires a page-aligned base and unmaps whole pages
+            spanning [address, address + size); a too-small size or an interior
+            (non-base) address leaves pages mapped and is likewise silent.
         */
         inline auto release(void* address, std::size_t size) noexcept -> void
         {
