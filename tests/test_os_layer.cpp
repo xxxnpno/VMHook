@@ -864,45 +864,36 @@ static auto test_allocate_rwx_hint_non_binding() -> void
         }
     }
 
-    // (2) Occupied hint: the address of a live local.  The CROSS-PLATFORM-true
-    // invariant is "the call never hands back the occupied address as a fresh
-    // allocation" — but the two backends reach it differently and that
-    // difference must be [INFO], not a hard assert:
-    //   * POSIX mmap treats the hint as advisory and RELOCATES to a free spot,
-    //     so a usable (different) block comes back.
-    //   * Windows VirtualAlloc treats a non-null base as binding-or-fail: an
-    //     occupied address returns NULL (ERROR_INVALID_ADDRESS) rather than
-    //     relocating.  This contradicts the header's "non-binding" doc comment
-    //     (vmhook.hpp allocate_rwx) — a real divergence, harmless in practice
-    //     because the trampoline allocator only ever hints at FREE regions.
-    // Hard-assert only the safety property (never == occupied_addr) and the
-    // usability of any block actually returned; characterise the null vs
-    // relocate split with [INFO].
+    // (2) Occupied hint: the address of a live local.  The "non-binding
+    // placement preference" contract now holds on BOTH backends, so an occupied
+    // hint ALWAYS yields a usable block that never aliases the occupied address:
+    //   * POSIX mmap treats the hint as advisory and relocates to a free spot.
+    //   * Windows VirtualAlloc is binding-or-fail on a non-null base (occupied ->
+    //     NULL); allocate_rwx now retries once with no hint, so the occupied
+    //     preference degrades to a normal allocation instead of a hard failure.
+    // This is the REGRESSION GUARD for that fix: pre-fix, Windows returned NULL
+    // here (the documented "non-binding" divergence) — it must not regress.
     {
         volatile std::uint64_t occupied{ 0xCAFEBABEu };
         void* const occupied_addr{ const_cast<void*>(
             static_cast<const volatile void*>(&occupied)) };
 
         void* const block{ vmhook::os::allocate_rwx(occupied_addr, page) };
-        // Universal: must NOT alias our live stack object.
+        // The occupied hint must now ALWAYS yield a usable block on every
+        // platform (POSIX relocates, Windows retries with no hint).
+        check("hint_occupied_returns_usable_block", block != nullptr);
+        // Universal safety: must NOT alias our live stack object.
         check("hint_occupied_never_returns_occupied_address",
               block != occupied_addr);
         if (block)
         {
             const std::uintptr_t a{ reinterpret_cast<std::uintptr_t>(block) };
-            check("hint_occupied_relocated_block_page_aligned", (a & (page - 1u)) == 0u);
-            check("hint_occupied_relocated_block_usable",
+            check("hint_occupied_block_page_aligned", (a & (page - 1u)) == 0u);
+            check("hint_occupied_block_usable",
                   write_read_whole_range(block, page, 0xD7));
             vmhook::os::release(block, page);
-            std::printf("[INFO] hint_occupied: allocator relocated off the "
-                        "occupied hint (POSIX-style advisory hint)\n");
         }
-        else
-        {
-            std::printf("[INFO] hint_occupied: allocator returned null for an "
-                        "occupied hint (Windows VirtualAlloc binding-or-fail)\n");
-        }
-        // The live local must be untouched by the whole dance, in BOTH cases.
+        // The live local must be untouched by the whole dance.
         check("hint_occupied_local_intact", occupied == 0xCAFEBABEu);
 
         // Whatever happened above, a plain hint-free allocation must still work,
