@@ -12717,16 +12717,21 @@ namespace vmhook
         /*
             @brief Returns the JNI type descriptor character(s) for a C++ argument type.
             @details
-            Maps C++ types to their JNI descriptor string at compile time:
-              std::string / string_view / const char* -> "Ljava/lang/String;"
-              bool        -> "Z"
-              int8/uint8  -> "B"
-              int16       -> "S"
-              uint16      -> "C"
-              int64/uint64-> "J"
-              float       -> "F"
-              double      -> "D"
-              other       -> "I" (treated as int)
+            Maps C++ types to their JNI descriptor string at compile time.  The
+            integral classification mirrors method_proxy::argument_matches_descriptor
+            EXACTLY (same precedence, same sizeof-based generic ladder) so the
+            descriptor builder accepts the identical type domain the overload-selector
+            does:
+              std::string / string_view / const char* / char* -> "Ljava/lang/String;"
+              bool                       -> "Z" (classified first; bool is integral)
+              char16_t / uint16_t        -> "C" (Java char: unsigned 16-bit UTF-16)
+              integral, sizeof 1         -> "B" (int8_t/uint8_t, char, char8_t, ...)
+              integral, sizeof 2         -> "S" (int16_t, wchar_t-on-Windows, ...)
+              integral, sizeof 4         -> "I" (int32_t/uint32_t, char32_t, wchar_t-on-*nix, ...)
+              integral, sizeof 8         -> "J" (int64_t/uint64_t, and long/size_t when 8 bytes)
+              float                      -> "F"
+              double                     -> "D"
+              unique_ptr<wrapper> / object_base-derived -> "Lpkg/Name;"
             Used by method_proxy::call_jni() to build the JNI method descriptor string.
 
             Exception safety: noexcept — compile-time dispatch only.
@@ -12746,21 +12751,42 @@ namespace vmhook
             }
             else if constexpr (std::is_same_v<clean_t, bool>)
             {
+                // bool is integral (sizeof 1), so it MUST be classified before the
+                // generic sizeof==1 branch below — otherwise it would mis-encode as
+                // "B".  Kept FIRST to mirror argument_matches_descriptor's order.
                 return "Z";
             }
-            else if constexpr (std::is_same_v<clean_t, std::int8_t> || std::is_same_v<clean_t, std::uint8_t>)
-            {
-                return "B";
-            }
-            else if constexpr (std::is_same_v<clean_t, std::int16_t>)
-            {
-                return "S";
-            }
-            else if constexpr (std::is_same_v<clean_t, std::uint16_t>)
+            // Java `char` is an UNSIGNED 16-bit UTF-16 code unit -> "C".  Mirror
+            // method_proxy::argument_matches_descriptor exactly: char16_t AND
+            // std::uint16_t map to "C" and are claimed BEFORE the generic 2-byte
+            // branch (which would otherwise also accept "S" for uint16_t).
+            else if constexpr (std::is_same_v<clean_t, char16_t> || std::is_same_v<clean_t, std::uint16_t>)
             {
                 return "C";
             }
-            else if constexpr (std::is_same_v<clean_t, std::int64_t> || std::is_same_v<clean_t, std::uint64_t>)
+            // Generic integral width ladder, classified by sizeof to cover the SAME
+            // type domain the overload-selector (argument_matches_descriptor)
+            // accepts.  This newly admits plain `char`, `char8_t`, `wchar_t`,
+            // `char32_t` and any other extended/implementation integral type — they
+            // used to hit the terminal dependent_false static_assert and fail to
+            // compile even though argument_matches_descriptor already accepted them,
+            // so a `char`/`char16_t`/`wchar_t` detour arg could be overload-matched
+            // but never have a JNI signature built.  The fixed-width aliases keep
+            // their previous letters: int8_t/uint8_t -> "B", int16_t -> "S",
+            // int32_t/uint32_t -> "I", int64_t/uint64_t -> "J".
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 1)
+            {
+                return "B";
+            }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 2)
+            {
+                return "S";
+            }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 4)
+            {
+                return "I";
+            }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 8)
             {
                 return "J";
             }
@@ -12771,10 +12797,6 @@ namespace vmhook
             else if constexpr (std::is_same_v<clean_t, double>)
             {
                 return "D";
-            }
-            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == sizeof(std::int32_t))
-            {
-                return "I";
             }
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {

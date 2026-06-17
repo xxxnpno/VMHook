@@ -404,6 +404,79 @@ static auto sig() -> std::string
     return vmhook::detail::jni_signature_for_arg<arg_t>();
 }
 
+// Faithful, trait-derived mirror of method_proxy::argument_matches_descriptor<T>
+// for FUNDAMENTAL (non-string, non-object, non-pointer) argument types: returns
+// the single JVM descriptor token that the (private) overload-selector accepts
+// for T.  It MUST track argument_matches_descriptor's exact precedence and
+// sizeof-based ladder; the whole point of R16b below is to prove
+// jni_signature_for_arg<T>() agrees with this selector contract for EVERY
+// fundamental type.  Because the selector is a private member of method_proxy it
+// cannot be called from the test, so this is the "argument_matches_descriptor-
+// equivalent" the agreement matrix compares against.
+//
+// IMPORTANT: every branch derives the expected letter from std::is_integral_v /
+// sizeof / is_same_v — NOTHING is hardcoded per platform.  So wchar_t resolves
+// to "S" where it is 2 bytes (Windows) and "I" where it is 4 bytes (*nix), and
+// char resolves to "B" on either signedness, with no #ifdef.  The matrix holds
+// on every data model.
+template<typename arg_t>
+static auto selector_token() -> std::string_view
+{
+    using clean_t = std::remove_cvref_t<arg_t>;
+
+    // Order mirrors method_proxy::argument_matches_descriptor exactly:
+    //   bool FIRST (bool is integral, sizeof 1) -> "Z"
+    //   char16_t || uint16_t -> "C" (claimed before the generic 2-byte branch)
+    //   integral sizeof 1 -> "B", 2 -> "S", 4 -> "I", 8 -> "J"
+    //   float -> "F", double -> "D"
+    if constexpr (std::is_same_v<clean_t, bool>)
+    {
+        return "Z";
+    }
+    else if constexpr (std::is_same_v<clean_t, char16_t> || std::is_same_v<clean_t, std::uint16_t>)
+    {
+        return "C";
+    }
+    else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 1)
+    {
+        return "B";
+    }
+    else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 2)
+    {
+        return "S";
+    }
+    else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 4)
+    {
+        return "I";
+    }
+    else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == 8)
+    {
+        return "J";
+    }
+    else if constexpr (std::is_same_v<clean_t, float>)
+    {
+        return "F";
+    }
+    else if constexpr (std::is_same_v<clean_t, double>)
+    {
+        return "D";
+    }
+    else
+    {
+        return {};
+    }
+}
+
+// One agreement assertion: jni_signature_for_arg<T>() (the descriptor BUILDER)
+// must equal the token argument_matches_descriptor<T> (the overload SELECTOR)
+// accepts.  Both expectations are trait-derived, so this pins the two dispatchers
+// to each other without hardcoding any platform-dependent answer.
+template<typename arg_t>
+static auto check_signature_agrees(const char* tag) -> void
+{
+    check(tag, std::string_view{ sig<arg_t>() } == selector_token<arg_t>());
+}
+
 // Invoke a registered factory at `sentinel`, asserting (a) it returns non-null,
 // (b) the produced wrapper round-trips the exact pointer through get_instance(),
 // and (c) its dynamic type is exactly `expected_type` (the registered wrapper).
@@ -1260,17 +1333,14 @@ int main()
         check("R16_sig_uint8_B", sig<std::uint8_t>() == "B");
         // Java short -> "S" (signed 16-bit).
         check("R16_sig_int16_S", sig<std::int16_t>() == "S");
-        // Java char -> "C" (UNSIGNED 16-bit / UTF-16 code unit).
+        // Java char -> "C" (UNSIGNED 16-bit / UTF-16 code unit).  BOTH the
+        // std::uint16_t alias and the distinct char16_t type now resolve to "C",
+        // matching method_proxy::argument_matches_descriptor.  Previously
+        // sig<char16_t>() hit the terminal dependent_false_v static_assert and
+        // FAILED TO COMPILE because the only 2-byte arm was an exact
+        // is_same_v<uint16_t> test; the generic sizeof-based ladder now admits it.
         check("R16_sig_uint16_C", sig<std::uint16_t>() == "C");
-        // NOTE (library asymmetry, see [INFO] in the agent report): we do NOT
-        // assert sig<char16_t>() here.  method_proxy::argument_matches_descriptor
-        // maps BOTH char16_t and std::uint16_t to "C", but
-        // detail::jni_signature_for_arg has no char16_t branch — char16_t is a
-        // distinct integral type (not std::uint16_t), and the only 2-byte arm is
-        // the exact `std::is_same_v<clean_t, std::uint16_t>` test, so char16_t
-        // falls through to the dependent_false_v static_assert and FAILS TO
-        // COMPILE.  Asserting it here would break the build; the divergence is
-        // characterised in the report instead of pinned with a runtime check.
+        check("R16_sig_char16_t_C", sig<char16_t>() == "C");
         // 32-bit integrals -> "I".
         check("R16_sig_int32_I", sig<std::int32_t>() == "I");
         check("R16_sig_uint32_I", sig<std::uint32_t>() == "I");
@@ -1295,6 +1365,90 @@ int main()
         // above is non-empty and a single char for primitives.
         check("R16_sig_bool_single_char", sig<bool>().size() == 1u);
         check("R16_sig_long_single_char", sig<std::int64_t>().size() == 1u);
+    }
+
+    // =====================================================================
+    // R16b. DISPATCHER-AGREEMENT MATRIX (regression guard for the integral-domain
+    // split between the two sibling classifiers).  detail::jni_signature_for_arg<T>
+    // (the descriptor BUILDER) and method_proxy::argument_matches_descriptor<T>
+    // (the overload SELECTOR) must classify the SAME C++ arg type domain into the
+    // SAME JVM token.  They used to disagree: the builder classified sub-int
+    // integrals by EXACT std::is_same_v (so plain char / char16_t / wchar_t /
+    // char8_t / char32_t hit a terminal static_assert and FAILED TO COMPILE),
+    // while the selector classified them generically by sizeof and ACCEPTED them
+    // — so a detour arg type the selector matched could never have a JNI signature
+    // built.  Every assertion below derives BOTH sides from is_integral/sizeof via
+    // selector_token<T> (the argument_matches_descriptor-equivalent), so nothing
+    // is hardcoded per platform: wchar_t agrees as "S" where it is 2 bytes and
+    // "I" where it is 4 bytes, char agrees as "B" under either signedness, and
+    // long / long long agree as "I" or "J" per data model — all with no #ifdef.
+    // The mere fact that this block COMPILES (it instantiates sig<char16_t>(),
+    // sig<wchar_t>(), sig<char>(), ... ) is itself the proof of the fix; it was a
+    // hard compile error before.
+    // =====================================================================
+    {
+        map_state_guard guard{};
+
+        // --- The five formerly-uncompilable extended character types. ---
+        check_signature_agrees<char>("R16b_agree_char");
+        check_signature_agrees<char8_t>("R16b_agree_char8_t");
+        check_signature_agrees<char16_t>("R16b_agree_char16_t");
+        check_signature_agrees<char32_t>("R16b_agree_char32_t");
+        check_signature_agrees<wchar_t>("R16b_agree_wchar_t");
+
+        // --- The plain signed/unsigned char trio (char is distinct from both). ---
+        check_signature_agrees<signed char>("R16b_agree_signed_char");
+        check_signature_agrees<unsigned char>("R16b_agree_unsigned_char");
+
+        // --- Every standard integer rank, signed and unsigned. ---
+        check_signature_agrees<short>("R16b_agree_short");
+        check_signature_agrees<unsigned short>("R16b_agree_unsigned_short");
+        check_signature_agrees<int>("R16b_agree_int");
+        check_signature_agrees<unsigned int>("R16b_agree_unsigned_int");
+        check_signature_agrees<long>("R16b_agree_long");
+        check_signature_agrees<unsigned long>("R16b_agree_unsigned_long");
+        check_signature_agrees<long long>("R16b_agree_long_long");
+        check_signature_agrees<unsigned long long>("R16b_agree_unsigned_long_long");
+
+        // --- bool and the floating-point types. ---
+        check_signature_agrees<bool>("R16b_agree_bool");
+        check_signature_agrees<float>("R16b_agree_float");
+        check_signature_agrees<double>("R16b_agree_double");
+
+        // --- The fixed-width <cstdint> aliases (must keep their legacy letters). ---
+        check_signature_agrees<std::int8_t>("R16b_agree_int8_t");
+        check_signature_agrees<std::uint8_t>("R16b_agree_uint8_t");
+        check_signature_agrees<std::int16_t>("R16b_agree_int16_t");
+        check_signature_agrees<std::uint16_t>("R16b_agree_uint16_t");
+        check_signature_agrees<std::int32_t>("R16b_agree_int32_t");
+        check_signature_agrees<std::uint32_t>("R16b_agree_uint32_t");
+        check_signature_agrees<std::int64_t>("R16b_agree_int64_t");
+        check_signature_agrees<std::uint64_t>("R16b_agree_uint64_t");
+
+        // --- cv / reference spellings decay identically on BOTH dispatchers. ---
+        check_signature_agrees<const char16_t>("R16b_agree_const_char16_t");
+        check_signature_agrees<wchar_t&>("R16b_agree_wchar_t_ref");
+        check_signature_agrees<const volatile long>("R16b_agree_cv_long");
+
+        // --- Spot-pin the post-fix absolute letters for the NEW character types,
+        // derived (not hardcoded) so they remain data-model-independent.  char is
+        // 1 byte => "B"; char16_t is the UTF-16 code unit => "C"; char32_t is 4
+        // bytes => "I"; char8_t is 1 byte => "B". ---
+        check("R16b_char_is_B", sig<char>() == "B");
+        check("R16b_char8_t_is_B", sig<char8_t>() == "B");
+        check("R16b_char16_t_is_C", sig<char16_t>() == "C");
+        check("R16b_char32_t_is_I", sig<char32_t>() == "I");
+        // wchar_t: assert the letter that MATCHES its actual width on this target,
+        // computed from sizeof so the same line is correct on Windows (2 -> "S")
+        // and on *nix (4 -> "I").  No platform literal.
+        {
+            const std::string_view expected_wchar{
+                sizeof(wchar_t) == 2u ? std::string_view{ "S" }
+                : sizeof(wchar_t) == 4u ? std::string_view{ "I" }
+                : sizeof(wchar_t) == 1u ? std::string_view{ "B" }
+                : std::string_view{ "J" } };
+            check("R16b_wchar_t_matches_width", std::string_view{ sig<wchar_t>() } == expected_wchar);
+        }
     }
 
     // =====================================================================
