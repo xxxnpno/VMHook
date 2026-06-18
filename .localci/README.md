@@ -19,7 +19,35 @@ GitHub CI is unchanged and remains authoritative — this is a fast pre-flight.
 
 # reuse the existing per-compiler build, just re-run cells
 .\.localci\run-local-ci.ps1 -NoBuild -Compilers mingw -Java 17
+
+# control concurrency (default: auto from RAM/cores; 1 = sequential)
+.\.localci\run-local-ci.ps1 -Parallel 1          # sequential
+.\.localci\run-local-ci.ps1 -Parallel 8          # 8 cells at once
 ```
+
+## Parallelism
+
+Cells run **concurrently** by default. Each cell is a real `java -Xmx4g`, so unlike
+GitHub (separate runners) we're bounded by one machine — `-Parallel 0` (the default)
+auto-picks `min(cores-1, floor((RAM_GB-4)/5))` capped at 6 (e.g. 5 on a 16-core/32 GB
+box). Builds run serially first (CPU-heavy), then cells fan out as isolated single-cell
+subprocesses (`-NoBuild`) in their own work dirs. Note: more concurrency = more JIT
+pressure, which makes timing-sensitive watchers (on_class_loaded / on_exception) flake
+*more* — a feature for surfacing the i2i-vs-JIT fragility, not a bug.
+
+## Watching a run live
+
+The harness flushes as it goes, so you can tail it:
+
+```powershell
+# within a cell, per-assertion (best granularity) — freezes on the last line if it stalls/crashes
+Get-Content .\.localci\work\msvc-java21\test_results.txt -Wait -Tail 30
+# a parallel cell's transcript
+Get-Content .\.localci\logs\cell-msvc-java21.log -Wait -Tail 30
+# build output (cmake/ninja), live
+Get-Content .\.localci\logs\build-msvc.log.build.out -Wait -Tail 30
+```
+(Run it yourself in a terminal for live colored per-cell output directly.)
 
 ## What it does (per cell, exactly like CI)
 
