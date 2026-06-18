@@ -102,6 +102,43 @@ namespace
         // Object-returning call THROUGH this (itself method-returned) wrapper:
         // the chained-call probe.  The result is another unique_ptr<child_object>.
         auto make_sibling() -> std::unique_ptr<child_object> { return get_method("makeSibling")->call(); }
+
+        // Chained call whose SECOND link is a NULL reference return: a null
+        // unique_ptr through a method-decoded receiver.
+        auto make_null_sibling() -> std::unique_ptr<child_object> { return get_method("makeNullSibling")->call(); }
+
+        // self() through this (method-returned) wrapper -> the SAME Child OOP.
+        auto self_proxy() -> std::unique_ptr<child_object> { return get_method("self")->call(); }
+    };
+
+    // Wrapper for vmhook.fixtures.MethodObject$Puppy — the TWO-level-deep
+    // concrete type returned by makePuppy() (declared Animal).  speak() is the
+    // depth-2 override; breed_id reads the inherited Dog field through the wrapper.
+    class puppy_object : public vmhook::object<puppy_object>
+    {
+    public:
+        explicit puppy_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<puppy_object>{ instance }
+        {
+        }
+
+        auto breed_id() -> std::int32_t { return get_field("breedId")->get(); }
+        auto speak()    -> std::string  { return get_method("speak")->call().as_string(); }
+    };
+
+    // Wrapper for vmhook.fixtures.MethodObject$NamedThing — the concrete IMPL
+    // class behind an interface-typed (Named) return.  name() dispatches the
+    // interface method through the runtime-decoded wrapper.
+    class named_object : public vmhook::object<named_object>
+    {
+    public:
+        explicit named_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<named_object>{ instance }
+        {
+        }
+
+        auto code()  -> std::int32_t { return get_field("code")->get(); }
+        auto name()  -> std::string  { return get_method("name")->call().as_string(); }
     };
 
     // Wrapper registered for vmhook.fixtures.MethodObject$Dog — the CONCRETE
@@ -152,6 +189,8 @@ namespace
         static auto child_identity()        -> std::int32_t { return static_field("childIdentity")->get(); }
         static auto static_child_identity() -> std::int32_t { return static_field("staticChildIdentity")->get(); }
         static auto animal_identity()       -> std::int32_t { return static_field("animalIdentity")->get(); }
+        static auto puppy_identity()        -> std::int32_t { return static_field("puppyIdentity")->get(); }
+        static auto named_identity()        -> std::int32_t { return static_field("namedIdentity")->get(); }
 
         // ── method-path object returns (the FEATURE) ───────────────────────
         auto make_child()   -> std::unique_ptr<child_object>  { return get_method("makeChild")->call(); }
@@ -170,6 +209,25 @@ namespace
         // The polymorphic Dog's overridden speak(), via the base receiver — the
         // Java-side ground truth for the override-dispatch cross-check.
         auto animal_sound() -> std::string                    { return get_method("getAnimalSound")->call().as_string(); }
+
+        // Two-level-deep polymorphic return (declared Animal, runtime Puppy).
+        auto make_puppy()   -> std::unique_ptr<puppy_object>  { return get_method("makePuppy")->call(); }
+        auto puppy_sound()  -> std::string                    { return get_method("getPuppySound")->call().as_string(); }
+        // Interface-typed return (declared Named, runtime NamedThing).
+        auto make_named()   -> std::unique_ptr<named_object>  { return get_method("makeNamed")->call(); }
+        auto named_name()   -> std::string                    { return get_method("getNamedName")->call().as_string(); }
+        // Object ARG -> object return (identity echo): pass a Child wrapper back in.
+        auto echo_child(const std::unique_ptr<child_object>& c) -> std::unique_ptr<child_object>
+        {
+            return get_method("echoChild")->call(c);
+        }
+        // int ARG selects which array Child is returned (or null when out of range).
+        auto pick_child(std::int32_t idx) -> std::unique_ptr<child_object>
+        {
+            return get_method("pickChild")->call(idx);
+        }
+        // A different method returning the SAME static Child (cross-method identity).
+        auto same_static_child() -> std::unique_ptr<child_object> { return get_method("sameStaticChild")->call(); }
 
         // ── field-path baseline (always works; no call_stub dependency) ────
         auto field_child() -> std::unique_ptr<child_object> { return get_field("child")->get(); }
@@ -248,6 +306,60 @@ namespace
     // String reference return (std::string alternative)
     std::atomic<bool> g_label_ok{ false };
 
+    // String[] ('[Ljava/lang/String;') reference return
+    std::atomic<bool>           g_strarray_decoded_nonnull{ false };
+    std::atomic<std::int32_t>   g_strarray_len{ -1 };
+    std::atomic<bool>           g_strarray_elem0_ok{ false };
+    std::atomic<bool>           g_strarray_elem2_ok{ false };
+
+    // two-level-deep polymorphic return (declared Animal, runtime Puppy)
+    std::atomic<bool>           g_puppy_nonnull{ false };
+    std::atomic<std::int32_t>   g_puppy_breed{ -1 };
+    std::string                 g_puppy_speak{};
+    std::string                 g_puppy_speak_java{};
+    std::string                 g_puppy_klass{};
+    std::atomic<std::uintptr_t> g_puppy_instance{ 0 };
+
+    // interface-typed return (declared Named, runtime NamedThing)
+    std::atomic<bool>           g_named_nonnull{ false };
+    std::atomic<std::int32_t>   g_named_code{ -1 };
+    std::string                 g_named_name{};
+    std::string                 g_named_name_java{};
+    std::string                 g_named_klass{};
+
+    // object-arg identity echo (echoChild)
+    std::atomic<bool>           g_echo_nonnull{ false };
+    std::atomic<std::int32_t>   g_echo_tag{ -1 };
+    std::atomic<bool>           g_echo_same_as_field{ false };
+
+    // arg-selected object return (pickChild)
+    std::atomic<bool>           g_pick0_nonnull{ false };
+    std::atomic<bool>           g_pick1_nonnull{ false };
+    std::atomic<bool>           g_pick2_nonnull{ false };
+    std::atomic<std::int32_t>   g_pick0_tag{ -1 };
+    std::atomic<std::int32_t>   g_pick1_tag{ -1 };
+    std::atomic<std::int32_t>   g_pick2_tag{ -1 };
+    std::atomic<bool>           g_pick_all_distinct{ false };
+    std::atomic<bool>           g_pick_oob_null{ false };
+
+    // cross-method identity: sameStaticChild() vs staticMakeChild()
+    std::atomic<bool>           g_samestatic_nonnull{ false };
+    std::atomic<std::uintptr_t> g_samestatic_instance{ 0 };
+
+    // chained NULL sibling (chained call whose 2nd link is null)
+    std::atomic<bool>           g_null_sibling_is_null{ false };
+
+    // Child.self() through a method-returned wrapper -> same Child OOP
+    std::atomic<bool>           g_child_self_nonnull{ false };
+    std::atomic<std::uintptr_t> g_child_self_instance{ 0 };
+
+    // getChild() called twice -> SAME stored OOP each time (idempotent identity)
+    std::atomic<std::uintptr_t> g_getchild_instance_2{ 0 };
+
+    // one value_t converted twice -> two non-null wrappers wrapping the SAME OOP
+    std::atomic<bool>           g_value_t_reuse_both_nonnull{ false };
+    std::atomic<bool>           g_value_t_reuse_same_oop{ false };
+
     // value_t introspection (is_void / is_string) sanity
     std::atomic<bool> g_isvoid_on_null{ false };
     std::atomic<bool> g_isstring_on_label{ false };
@@ -270,10 +382,16 @@ namespace
     constexpr std::int32_t k_int_array_0  = 11;
     constexpr std::int32_t k_int_array_3  = 44;
     constexpr std::int32_t k_int_array_len = 4;
+    constexpr std::int32_t k_dog_breed_id  = 0x0D06;  // Puppy inherits Dog.breedId
+    constexpr std::int32_t k_named_code    = 0x4A3D;
     const std::string      k_child_label   = "child-of-method";
     const std::string      k_sibling_label = "sibling-of-child";
     const std::string      k_label_string  = "label-via-method";
     const std::string      k_dog_sound     = "woof";
+    const std::string      k_puppy_sound   = "yip";
+    const std::string      k_named_name    = "named-impl";
+    const std::string      k_str_array_0   = "s0";
+    const std::string      k_str_array_2   = "s2";
 
     // Internal name of the runtime klass behind an oop, or "" if unresolvable.
     // Used to prove a polymorphic / boxed return's decoded oop carries the
@@ -377,6 +495,32 @@ namespace
                     g_sibling_label_ok.store(sib->get_label() == k_sibling_label,
                                              std::memory_order_relaxed);
                 }
+
+                // CHAINED NULL: a null reference return THROUGH the method-decoded
+                // receiver still yields a null unique_ptr (the chained null path).
+                std::unique_ptr<child_object> null_sib{ mc->make_null_sibling() };
+                g_null_sibling_is_null.store(null_sib == nullptr, std::memory_order_relaxed);
+
+                // SELF through a method-returned wrapper: Child.self() returns
+                // `this`, so the returned wrapper decodes to the SAME Child OOP.
+                std::unique_ptr<child_object> child_self{ mc->self_proxy() };
+                g_child_self_nonnull.store(child_self != nullptr, std::memory_order_relaxed);
+                if (child_self)
+                {
+                    g_child_self_instance.store(
+                        reinterpret_cast<std::uintptr_t>(child_self->get_instance()),
+                        std::memory_order_relaxed);
+                }
+            }
+
+            // IDEMPOTENT IDENTITY: getChild() returns the stored `child` field, so
+            // a SECOND call decodes to the SAME OOP (contrast makeChild's distinct).
+            std::unique_ptr<child_object> mc2{ self->get_child() };
+            if (mc2)
+            {
+                g_getchild_instance_2.store(
+                    reinterpret_cast<std::uintptr_t>(mc2->get_instance()),
+                    std::memory_order_relaxed);
             }
         }
 
@@ -580,6 +724,158 @@ namespace
                 g_isstring_on_object.store(v.is_string(), std::memory_order_relaxed);
             }
         }
+
+        // ── TWO-LEVEL-DEEP polymorphic return (declared Animal, runtime Puppy) ─
+        // Proves the runtime-type decode is depth-independent: the wrapper sees
+        // Puppy, reads Dog's inherited breedId, and speak() reaches the depth-2
+        // Puppy override (not Animal's nor Dog's).
+        {
+            g_puppy_speak_java = self->puppy_sound();   // Java ground truth
+            std::unique_ptr<puppy_object> pup{ self->make_puppy() };
+            g_puppy_nonnull.store(pup != nullptr, std::memory_order_relaxed);
+            if (pup)
+            {
+                void* const inst{ pup->get_instance() };
+                g_puppy_instance.store(reinterpret_cast<std::uintptr_t>(inst),
+                                       std::memory_order_relaxed);
+                g_puppy_klass = runtime_klass_name(inst);
+                g_puppy_breed.store(pup->breed_id(), std::memory_order_relaxed);
+                g_puppy_speak = pup->speak();
+            }
+        }
+
+        // ── INTERFACE-typed return (declared Named, runtime NamedThing) ────────
+        // The decoded oop carries the concrete IMPL klass; name() dispatches the
+        // interface method through the wrapper.
+        {
+            g_named_name_java = self->named_name();     // Java ground truth
+            std::unique_ptr<named_object> nt{ self->make_named() };
+            g_named_nonnull.store(nt != nullptr, std::memory_order_relaxed);
+            if (nt)
+            {
+                g_named_klass = runtime_klass_name(nt->get_instance());
+                g_named_code.store(nt->code(), std::memory_order_relaxed);
+                g_named_name = nt->name();
+            }
+        }
+
+        // ── OBJECT ARG -> object return (echoChild identity round-trip) ────────
+        // Pass the stored `child` (reachable from the GC-rooted singleton, so its
+        // OOP is stable) back IN as a unique_ptr<wrapper> argument; the returned
+        // OOP must equal the field's OOP.
+        {
+            std::unique_ptr<child_object> fc{ self->field_child() };
+            if (fc)
+            {
+                const std::uintptr_t fc_oop{
+                    reinterpret_cast<std::uintptr_t>(fc->get_instance()) };
+                std::unique_ptr<child_object> echoed{ self->echo_child(fc) };
+                g_echo_nonnull.store(echoed != nullptr, std::memory_order_relaxed);
+                if (echoed)
+                {
+                    g_echo_tag.store(echoed->get_tag(), std::memory_order_relaxed);
+                    g_echo_same_as_field.store(
+                        reinterpret_cast<std::uintptr_t>(echoed->get_instance()) == fc_oop,
+                        std::memory_order_relaxed);
+                }
+            }
+        }
+
+        // ── ARG-SELECTED object return (pickChild(idx)) ────────────────────────
+        // An int arg selects which array Child the call() returns: idx 0/1/2 each
+        // yield a DISTINCT non-null Child with the matching published tag; an
+        // out-of-range idx yields null (the arg-driven null path).
+        {
+            std::unique_ptr<child_object> p0{ self->pick_child(0) };
+            std::unique_ptr<child_object> p1{ self->pick_child(1) };
+            std::unique_ptr<child_object> p2{ self->pick_child(2) };
+            g_pick0_nonnull.store(p0 != nullptr, std::memory_order_relaxed);
+            g_pick1_nonnull.store(p1 != nullptr, std::memory_order_relaxed);
+            g_pick2_nonnull.store(p2 != nullptr, std::memory_order_relaxed);
+            std::uintptr_t i0{ 0 };
+            std::uintptr_t i1{ 0 };
+            std::uintptr_t i2{ 0 };
+            if (p0) { g_pick0_tag.store(p0->get_tag(), std::memory_order_relaxed);
+                      i0 = reinterpret_cast<std::uintptr_t>(p0->get_instance()); }
+            if (p1) { g_pick1_tag.store(p1->get_tag(), std::memory_order_relaxed);
+                      i1 = reinterpret_cast<std::uintptr_t>(p1->get_instance()); }
+            if (p2) { g_pick2_tag.store(p2->get_tag(), std::memory_order_relaxed);
+                      i2 = reinterpret_cast<std::uintptr_t>(p2->get_instance()); }
+            g_pick_all_distinct.store(
+                i0 != 0 && i1 != 0 && i2 != 0 && i0 != i1 && i1 != i2 && i0 != i2,
+                std::memory_order_relaxed);
+            std::unique_ptr<child_object> oob{ self->pick_child(99) };
+            g_pick_oob_null.store(oob == nullptr, std::memory_order_relaxed);
+        }
+
+        // ── CROSS-METHOD identity: sameStaticChild() == staticMakeChild() OOP ──
+        // Two DIFFERENT methods returning the one STATIC_CHILD singleton decode to
+        // the same heap object (compared against g_static_instance in the body).
+        {
+            std::unique_ptr<child_object> ssc{ self->same_static_child() };
+            g_samestatic_nonnull.store(ssc != nullptr, std::memory_order_relaxed);
+            if (ssc)
+            {
+                g_samestatic_instance.store(
+                    reinterpret_cast<std::uintptr_t>(ssc->get_instance()),
+                    std::memory_order_relaxed);
+            }
+        }
+
+        // ── ONE value_t CONVERTED TWICE -> two wrappers, SAME OOP ──────────────
+        // Each conversion of a value_t to unique_ptr<wrapper> news a fresh wrapper
+        // but decodes the SAME stored compressed OOP, so the two wrappers must be
+        // non-null and wrap the identical instance (the conversion is repeatable,
+        // not consuming).
+        {
+            auto gm{ self->get_method("getChild") };
+            if (gm)
+            {
+                const auto v{ gm->call() };
+                std::unique_ptr<child_object> w1{ v };
+                std::unique_ptr<child_object> w2{ v };
+                g_value_t_reuse_both_nonnull.store(w1 != nullptr && w2 != nullptr,
+                                                   std::memory_order_relaxed);
+                if (w1 && w2)
+                {
+                    g_value_t_reuse_same_oop.store(
+                        w1->get_instance() == w2->get_instance(),
+                        std::memory_order_relaxed);
+                }
+            }
+        }
+
+        // ── String[] ('[Ljava/lang/String;') reference return ──────────────────
+        // Decode the array oop, walk its length, and decode each element's
+        // compressed OOP into a java.lang.String via read_java_string.
+        {
+            auto sm{ self->get_method("stringArray") };
+            if (sm)
+            {
+                void* const arr{ static_cast<void*>(sm->call()) };
+                g_strarray_decoded_nonnull.store(arr != nullptr, std::memory_order_relaxed);
+                if (arr && vmhook::hotspot::is_valid_pointer(arr))
+                {
+                    g_strarray_len.store(vmhook::array_length(arr), std::memory_order_relaxed);
+                    const std::uint32_t e0{ vmhook::get_array_element<std::uint32_t>(arr, 0) };
+                    const std::uint32_t e2{ vmhook::get_array_element<std::uint32_t>(arr, 2) };
+                    void* const e0_oop{ vmhook::hotspot::decode_oop_pointer(e0) };
+                    void* const e2_oop{ vmhook::hotspot::decode_oop_pointer(e2) };
+                    if (e0_oop && vmhook::hotspot::is_valid_pointer(e0_oop))
+                    {
+                        g_strarray_elem0_ok.store(
+                            vmhook::read_java_string(e0_oop) == k_str_array_0,
+                            std::memory_order_relaxed);
+                    }
+                    if (e2_oop && vmhook::hotspot::is_valid_pointer(e2_oop))
+                    {
+                        g_strarray_elem2_ok.store(
+                            vmhook::read_java_string(e2_oop) == k_str_array_2,
+                            std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
     }
 
     // The whole body, factored out so the module wrapper can run it under a
@@ -598,6 +894,8 @@ namespace
         // The nested types are "Outer$Inner" in JVM internal form.
         vmhook::register_class<child_object>("vmhook/fixtures/MethodObject$Child");
         vmhook::register_class<dog_object>("vmhook/fixtures/MethodObject$Dog");
+        vmhook::register_class<puppy_object>("vmhook/fixtures/MethodObject$Puppy");
+        vmhook::register_class<named_object>("vmhook/fixtures/MethodObject$NamedThing");
         // Boxed-type wrapper: java.lang.Integer is a bootstrap class, always loaded.
         vmhook::register_class<integer_object>("java/lang/Integer");
 
@@ -809,6 +1107,116 @@ namespace
         ctx.check("mco_objectarray_elem1_tag_correct",
                   g_objectarray_elem1_tag.load(std::memory_order_relaxed) == k_array_tag_1);
 
+        // String[] ('[Ljava/lang/String;'): decoded oop non-null, length, elements
+        // read as java.lang.String through read_java_string.
+        ctx.check("mco_stringarray_reference_decoded_non_null",
+                  g_strarray_decoded_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_stringarray_length_correct",
+                  g_strarray_len.load(std::memory_order_relaxed) == k_array_len);
+        ctx.check("mco_stringarray_elem0_correct",
+                  g_strarray_elem0_ok.load(std::memory_order_relaxed));
+        ctx.check("mco_stringarray_elem2_correct",
+                  g_strarray_elem2_ok.load(std::memory_order_relaxed));
+
+        // ════════════════ TWO-LEVEL-DEEP polymorphic return (Puppy) ═════════
+        // makePuppy() declared Animal, runtime Puppy (Animal -> Dog -> Puppy).
+        ctx.check("mco_puppy_non_null_wrapper",
+                  g_puppy_nonnull.load(std::memory_order_relaxed));
+        // The decoded oop's runtime klass is the depth-2 Puppy, not Animal/Dog.
+        ctx.check("mco_puppy_runtime_klass_is_Puppy",
+                  ends_with(g_puppy_klass, "MethodObject$Puppy"));
+        // Dog's breedId is inherited; reading it through the Puppy wrapper works.
+        ctx.check("mco_puppy_inherited_field_read_through_wrapper",
+                  g_puppy_breed.load(std::memory_order_relaxed) == k_dog_breed_id);
+        // Virtual dispatch reaches the DEPTH-2 Puppy override (not Animal/Dog).
+        ctx.check("mco_puppy_depth2_virtual_dispatch_hits_override",
+                  g_puppy_speak == k_puppy_sound
+                  && g_puppy_speak == g_puppy_speak_java);
+        ctx.check("mco_puppy_identity_published",
+                  method_object::puppy_identity() != 0);
+
+        // ════════════════ INTERFACE-typed return (NamedThing) ══════════════
+        // makeNamed() declared Named (interface), runtime NamedThing (impl class).
+        ctx.check("mco_named_non_null_wrapper",
+                  g_named_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_named_runtime_klass_is_NamedThing",
+                  ends_with(g_named_klass, "MethodObject$NamedThing"));
+        ctx.check("mco_named_field_read_through_wrapper",
+                  g_named_code.load(std::memory_order_relaxed) == k_named_code);
+        // Interface method dispatched through the runtime-impl-decoded wrapper.
+        ctx.check("mco_named_interface_dispatch_through_wrapper",
+                  g_named_name == k_named_name && g_named_name == g_named_name_java);
+        ctx.check("mco_named_identity_published",
+                  method_object::named_identity() != 0);
+
+        // ════════════════ OBJECT ARG -> object return (echoChild) ══════════
+        // A unique_ptr<wrapper> passed back IN as an argument round-trips: the
+        // returned OOP equals the argument OOP (identity echo).
+        ctx.check("mco_echo_object_arg_non_null_wrapper",
+                  g_echo_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_echo_object_arg_tag_correct",
+                  g_echo_tag.load(std::memory_order_relaxed) == k_child_tag);
+        ctx.check("mco_echo_object_arg_returns_same_oop",
+                  g_echo_same_as_field.load(std::memory_order_relaxed));
+
+        // ════════════════ ARG-SELECTED object return (pickChild) ═══════════
+        // An int arg selects which array Child is returned: 0/1/2 each non-null
+        // with the matching published tag and all three DISTINCT; idx 99 -> null.
+        ctx.check("mco_pickchild_idx0_non_null", g_pick0_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_pickchild_idx1_non_null", g_pick1_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_pickchild_idx2_non_null", g_pick2_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_pickchild_idx0_tag_correct",
+                  g_pick0_tag.load(std::memory_order_relaxed) == k_array_tag_0);
+        ctx.check("mco_pickchild_idx1_tag_correct",
+                  g_pick1_tag.load(std::memory_order_relaxed) == k_array_tag_1);
+        ctx.check("mco_pickchild_idx2_tag_correct",
+                  g_pick2_tag.load(std::memory_order_relaxed) == k_array_tag_2);
+        ctx.check("mco_pickchild_all_three_distinct",
+                  g_pick_all_distinct.load(std::memory_order_relaxed));
+        ctx.check("mco_pickchild_out_of_range_returns_null",
+                  g_pick_oob_null.load(std::memory_order_relaxed));
+
+        // ════════════════ CROSS-METHOD identity ════════════════════════════
+        // sameStaticChild() and staticMakeChild() return the ONE STATIC_CHILD
+        // singleton; two different methods must decode to the SAME heap object.
+        ctx.check("mco_samestatic_non_null_wrapper",
+                  g_samestatic_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_cross_method_same_static_instance",
+                  g_samestatic_instance.load(std::memory_order_relaxed) != 0
+                  && g_samestatic_instance.load(std::memory_order_relaxed)
+                         == g_static_instance.load(std::memory_order_relaxed));
+
+        // ════════════════ getChild() IDEMPOTENT identity ═══════════════════
+        // getChild() returns the stored field, so a second call decodes the SAME
+        // OOP (contrast makeChild, whose two calls are distinct).
+        ctx.check("mco_getchild_idempotent_same_oop_each_call",
+                  g_getchild_instance.load(std::memory_order_relaxed) != 0
+                  && g_getchild_instance.load(std::memory_order_relaxed)
+                         == g_getchild_instance_2.load(std::memory_order_relaxed));
+
+        // ════════════════ CHAINED NULL sibling ═════════════════════════════
+        // A null reference return THROUGH a method-decoded receiver is a null ptr.
+        ctx.check("mco_chained_null_sibling_returns_null",
+                  g_null_sibling_is_null.load(std::memory_order_relaxed));
+
+        // ════════════════ Child.self() through method-returned wrapper ═════
+        // self() returns `this`, so the wrapper decodes to the SAME Child OOP as
+        // getChild() did (self-identity through a method-returned receiver).
+        ctx.check("mco_child_self_non_null_wrapper",
+                  g_child_self_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_child_self_equals_getchild_instance",
+                  g_child_self_instance.load(std::memory_order_relaxed) != 0
+                  && g_child_self_instance.load(std::memory_order_relaxed)
+                         == g_getchild_instance.load(std::memory_order_relaxed));
+
+        // ════════════════ ONE value_t converted twice ══════════════════════
+        // Converting one value_t to unique_ptr<wrapper> twice news two wrappers
+        // over the SAME decoded OOP — the conversion is repeatable, not consuming.
+        ctx.check("mco_value_t_double_conversion_both_non_null",
+                  g_value_t_reuse_both_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_value_t_double_conversion_same_oop",
+                  g_value_t_reuse_same_oop.load(std::memory_order_relaxed));
+
         // ── breadcrumbs (never affect pass/fail) ───────────────────────────
         ctx.record("[INFO] animal runtime klass = " + g_animal_klass
                    + " (declared Animal, decoded Dog); speak() via wrapper = '" + g_animal_speak
@@ -818,6 +1226,18 @@ namespace
         ctx.record("[INFO] makeChild distinct OOPs: a=0x"
                    + std::to_string(g_make_instance_a.load(std::memory_order_relaxed))
                    + " b=0x" + std::to_string(g_make_instance_b.load(std::memory_order_relaxed)));
+        ctx.record("[INFO] puppy runtime klass = " + g_puppy_klass
+                   + " (declared Animal, decoded Puppy); speak() via wrapper = '" + g_puppy_speak
+                   + "', via Java = '" + g_puppy_speak_java + "'");
+        ctx.record("[INFO] named runtime klass = " + g_named_klass
+                   + " (declared interface Named, decoded NamedThing); name() via wrapper = '"
+                   + g_named_name + "', via Java = '" + g_named_name_java + "'");
+        ctx.record("[INFO] echoChild round-trip: same-as-field="
+                   + std::string{ g_echo_same_as_field.load(std::memory_order_relaxed) ? "yes" : "no" });
+        ctx.record("[INFO] cross-method static identity: sameStaticChild=0x"
+                   + std::to_string(g_samestatic_instance.load(std::memory_order_relaxed))
+                   + " staticMakeChild=0x"
+                   + std::to_string(g_static_instance.load(std::memory_order_relaxed)));
     }
 }
 

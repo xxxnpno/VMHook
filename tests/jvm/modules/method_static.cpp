@@ -394,6 +394,69 @@ namespace
     std::atomic<std::int64_t> g_clinit_ret{ k_uncaptured };  // clinitValue() -> 0xC11C (proves <clinit> ran)
     std::atomic<int> g_clinit_post_initialized{ -1 }; // initialized field AFTER the static call -> 1
 
+    // ===================== mstat2_* DEEPER INPUT COVERAGE ====================
+    // (H) more boundary VALUES through the single-arg echoes (RETURN only — a
+    //     primitive return/echo is bit-identical on both dispatch paths, so all
+    //     hard-assertable everywhere).  We re-use the existing sEcho* methods at
+    //     additional boundaries the original module did not cover.
+    std::atomic<int>          g_echo_bool_false{ -1 };       // sEchoBool(false) -> 0
+    std::atomic<std::int64_t> g_echo_byte_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_byte_max{ k_uncaptured };   // 127
+    std::atomic<std::int64_t> g_echo_byte_min{ k_uncaptured };   // -128
+    std::atomic<std::int64_t> g_echo_short_max{ k_uncaptured };  // 32767
+    std::atomic<std::int64_t> g_echo_short_min{ k_uncaptured };  // -32768
+    std::atomic<std::int64_t> g_echo_char_zero{ k_uncaptured };  // 0
+    std::atomic<std::int64_t> g_echo_char_max{ k_uncaptured };   // 65535
+    std::atomic<std::int64_t> g_echo_char_a{ k_uncaptured };     // 'A' = 65
+    std::atomic<std::int64_t> g_echo_int_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_int_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_int_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_int_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_zero{ k_uncaptured };
+    std::atomic<std::uint32_t> g_echo_float_half{ 0 };          // sEchoFloat(0.5f)
+    std::atomic<std::uint32_t> g_echo_float_nan{ 0 };           // NaN survives echo
+    std::atomic<std::uint32_t> g_echo_float_posinf{ 0 };
+    std::atomic<std::uint32_t> g_echo_float_max{ 0 };
+    std::atomic<std::uint64_t> g_echo_double_negzero{ 0 };      // -0.0 signbit
+    std::atomic<std::uint64_t> g_echo_double_nan{ 0 };
+    std::atomic<std::uint64_t> g_echo_double_neginf{ 0 };
+    std::atomic<std::uint64_t> g_echo_double_max{ 0 };
+    std::atomic<bool>          g_echo_string_captured{ false };
+    std::string                g_echo_string_empty;            // sEchoString("") -> ""
+    std::string                g_echo_string_unicode;          // sEchoString("café") round-trip
+
+    // (I) multi-argument slot-shape digests (RETURN only, path-independent).
+    std::atomic<std::int64_t> g_sum_ii{ k_uncaptured };        // sSumII(a,b)
+    std::atomic<std::int64_t> g_sum_jj{ k_uncaptured };        // sSumJJ(a,b)
+    std::atomic<std::uint64_t> g_sum_dd{ 0 };                  // sSumDD(a,b) raw bits
+    std::atomic<bool>          g_sum_dd_captured{ false };
+    std::atomic<std::uint32_t> g_sum_ff{ 0 };                  // sSumFF(a,b) raw bits
+    std::atomic<bool>          g_sum_ff_captured{ false };
+    std::atomic<int>          g_bool_xor_tf{ -1 };             // sBoolXor(true,false) -> 1
+    std::atomic<int>          g_bool_xor_tt{ -1 };             // sBoolXor(true,true)  -> 0
+    std::atomic<std::uint64_t> g_mix_fid{ 0 };                 // sMixFID(f,i,d) raw bits
+    std::atomic<bool>          g_mix_fid_captured{ false };
+    std::atomic<std::int64_t> g_pack_prims{ k_uncaptured };    // sPackPrims(...) digest
+    std::atomic<std::int64_t> g_seven_ints{ k_uncaptured };    // s7Ints(...) weighted sum
+
+    // (J) extra overloads: float and (int,long), by C++ type and by signature.
+    std::atomic<int> g_poly_by_float{ -1 };    // sPoly(float)    -> POLY_FLOAT
+    std::atomic<int> g_poly_by_intlong{ -1 };  // sPoly(int,long) -> POLY_INTLONG
+    std::atomic<int> g_poly_sig_float{ -1 };   // static_method("sPoly","(F)I")
+    std::atomic<int> g_poly_sig_double{ -1 };  // static_method("sPoly","(D)I")
+    std::atomic<int> g_poly_sig_intint{ -1 };  // static_method("sPoly","(II)I")
+    std::atomic<int> g_poly_sig_intlong{ -1 }; // static_method("sPoly","(IJ)I")
+
+    // (K) name+signature overload that is REJECTED for a wrong/instance match.
+    std::atomic<int> g_sig_missing_overload{ -1 };  // ("sPoly","(B)I") absent -> has_value()==0
+    std::atomic<int> g_sig_instance_rejected{ -1 }; // ("iEcho","(I)I") instance -> has_value()==0
+
+    // overloaded-static sentinels for the extra overloads (mirror MethodStatic).
+    constexpr std::int32_t k_poly_float   = 7006;
+    constexpr std::int32_t k_poly_intlong = 7007;
+
     auto run_all_calls(const std::unique_ptr<method_static>& self) -> void
     {
         // ============================== PRIMITIVES ==============================
@@ -797,6 +860,136 @@ namespace
             g_clinit_post_initialized.store(clinit_probe::get_initialized() ? 1 : 0);
         }
 
+        // ================================================================
+        //  (H) MORE boundary VALUES through the single-arg echoes (RETURN
+        //      only — bit-identical on both dispatch paths).
+        // ================================================================
+        g_echo_bool_false.store(method_static::static_method("sEchoBool")->call(false) ? 1 : 0);
+
+        g_echo_byte_zero.store(static_cast<std::int8_t>(
+            method_static::static_method("sEchoByte")->call(std::int8_t{ 0 })));
+        g_echo_byte_max.store(static_cast<std::int8_t>(
+            method_static::static_method("sEchoByte")->call(std::int8_t{ 127 })));
+        g_echo_byte_min.store(static_cast<std::int8_t>(
+            method_static::static_method("sEchoByte")->call(std::int8_t{ -128 })));
+
+        g_echo_short_max.store(static_cast<std::int16_t>(
+            method_static::static_method("sEchoShort")->call(std::int16_t{ 32767 })));
+        g_echo_short_min.store(static_cast<std::int16_t>(
+            method_static::static_method("sEchoShort")->call(std::int16_t{ -32768 })));
+
+        g_echo_char_zero.store(static_cast<std::uint16_t>(
+            method_static::static_method("sEchoChar")->call(std::uint16_t{ 0 })));
+        g_echo_char_max.store(static_cast<std::uint16_t>(
+            method_static::static_method("sEchoChar")->call(std::uint16_t{ 65535 })));
+        g_echo_char_a.store(static_cast<std::uint16_t>(
+            method_static::static_method("sEchoChar")->call(std::uint16_t{ 65 })));
+
+        g_echo_int_max.store(static_cast<std::int32_t>(
+            method_static::static_method("sEchoInt")->call(std::numeric_limits<std::int32_t>::max())));
+        g_echo_int_min.store(static_cast<std::int32_t>(
+            method_static::static_method("sEchoInt")->call(std::numeric_limits<std::int32_t>::min())));
+        g_echo_int_zero.store(static_cast<std::int32_t>(
+            method_static::static_method("sEchoInt")->call(std::int32_t{ 0 })));
+        g_echo_int_negone.store(static_cast<std::int32_t>(
+            method_static::static_method("sEchoInt")->call(std::int32_t{ -1 })));
+
+        g_echo_long_max.store(static_cast<std::int64_t>(
+            method_static::static_method("sEchoLong")->call(std::numeric_limits<std::int64_t>::max())));
+        g_echo_long_min.store(static_cast<std::int64_t>(
+            method_static::static_method("sEchoLong")->call(std::numeric_limits<std::int64_t>::min())));
+        g_echo_long_zero.store(static_cast<std::int64_t>(
+            method_static::static_method("sEchoLong")->call(std::int64_t{ 0 })));
+
+        g_echo_float_half.store(f2bits(static_cast<float>(
+            method_static::static_method("sEchoFloat")->call(0.5f))));
+        g_echo_float_nan.store(f2bits(static_cast<float>(
+            method_static::static_method("sEchoFloat")->call(std::numeric_limits<float>::quiet_NaN()))));
+        g_echo_float_posinf.store(f2bits(static_cast<float>(
+            method_static::static_method("sEchoFloat")->call(std::numeric_limits<float>::infinity()))));
+        g_echo_float_max.store(f2bits(static_cast<float>(
+            method_static::static_method("sEchoFloat")->call(std::numeric_limits<float>::max()))));
+
+        g_echo_double_negzero.store(d2bits(static_cast<double>(
+            method_static::static_method("sEchoDouble")->call(-0.0))));
+        g_echo_double_nan.store(d2bits(static_cast<double>(
+            method_static::static_method("sEchoDouble")->call(std::numeric_limits<double>::quiet_NaN()))));
+        g_echo_double_neginf.store(d2bits(static_cast<double>(
+            method_static::static_method("sEchoDouble")->call(-std::numeric_limits<double>::infinity()))));
+        g_echo_double_max.store(d2bits(static_cast<double>(
+            method_static::static_method("sEchoDouble")->call(std::numeric_limits<double>::max()))));
+
+        {
+            g_echo_string_empty   = method_static::static_method("sEchoString")->call(std::string{ "" }).as_string();
+            g_echo_string_unicode = method_static::static_method("sEchoString")->call(std::string{ "caf\xC3\xA9" }).as_string();
+            g_echo_string_captured.store(true);
+        }
+
+        // ================================================================
+        //  (I) MULTI-ARGUMENT slot-shape digests (RETURN only, path-indep)
+        // ================================================================
+        g_sum_ii.store(static_cast<std::int32_t>(
+            method_static::static_method("sSumII")->call(std::int32_t{ 11 }, std::int32_t{ 22 })));
+        g_sum_jj.store(static_cast<std::int64_t>(
+            method_static::static_method("sSumJJ")->call(
+                std::int64_t{ 0x0011223344556677LL }, std::int64_t{ 0x7766554433221100LL })));
+
+        g_sum_dd.store(d2bits(static_cast<double>(
+            method_static::static_method("sSumDD")->call(2.5, 1.25))));
+        g_sum_dd_captured.store(true);
+        g_sum_ff.store(f2bits(static_cast<float>(
+            method_static::static_method("sSumFF")->call(2.5f, 1.25f))));
+        g_sum_ff_captured.store(true);
+
+        g_bool_xor_tf.store(method_static::static_method("sBoolXor")->call(true, false) ? 1 : 0);
+        g_bool_xor_tt.store(method_static::static_method("sBoolXor")->call(true, true) ? 1 : 0);
+
+        g_mix_fid.store(d2bits(static_cast<double>(
+            method_static::static_method("sMixFID")->call(1.5f, std::int32_t{ 9 }, 0.125))));
+        g_mix_fid_captured.store(true);
+
+        g_pack_prims.store(static_cast<std::int64_t>(
+            method_static::static_method("sPackPrims")->call(
+                true, std::int8_t{ -7 }, std::int16_t{ -12345 }, std::uint16_t{ 0xBEEF },
+                std::int32_t{ 0x01020304 }, std::int64_t{ 0x0011223344556677LL })));
+
+        g_seven_ints.store(static_cast<std::int32_t>(
+            method_static::static_method("s7Ints")->call(
+                std::int32_t{ 1 }, std::int32_t{ 2 }, std::int32_t{ 3 }, std::int32_t{ 4 },
+                std::int32_t{ 5 }, std::int32_t{ 6 }, std::int32_t{ 7 })));
+
+        // ================================================================
+        //  (J) EXTRA overloads — float and (int,long), by type and signature
+        // ================================================================
+        g_poly_by_float.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly")->call(2.5f)));
+        g_poly_by_intlong.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly")->call(std::int32_t{ 1 }, std::int64_t{ 2 })));
+
+        g_poly_sig_float.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly", "(F)I")->call(9.0f)));
+        g_poly_sig_double.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly", "(D)I")->call(9.0)));
+        g_poly_sig_intint.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly", "(II)I")->call(std::int32_t{ 8 }, std::int32_t{ 9 })));
+        g_poly_sig_intlong.store(static_cast<std::int32_t>(
+            method_static::static_method("sPoly", "(IJ)I")->call(std::int32_t{ 8 }, std::int64_t{ 9 })));
+
+        // ================================================================
+        //  (K) name+signature overload REJECTION (absent overload / instance)
+        // ================================================================
+        {
+            // (B)I is not a declared sPoly overload -> nullopt (static path fails
+            // closed for a non-existent signature).
+            auto missing = method_static::static_method("sPoly", "(B)I");
+            g_sig_missing_overload.store(missing.has_value() ? 1 : 0);
+
+            // iEcho IS (I)I but it is an INSTANCE method -> the JVM_ACC_STATIC gate
+            // on the static name+signature path must reject it.
+            auto inst_sig = method_static::static_method("iEcho", "(I)I");
+            g_sig_instance_rejected.store(inst_sig.has_value() ? 1 : 0);
+        }
+
         (void)self;
         g_all_calls_ran.store(true);
     }
@@ -1163,6 +1356,104 @@ VMHOOK_JVM_MODULE(method_static)
                    + std::to_string(g_clinit_pre_initialized.load())
                    + " (0 expected on a JDK where the class was loaded-but-not-initialized; "
                      "first static call then forces <clinit>)");
+
+        // ##################################################################
+        //  mstat2_* — DEEPER INPUT COVERAGE (all path-INDEPENDENT, HARD)
+        // ##################################################################
+
+        // ---- (H) more boundary VALUES through the single-arg echoes ----
+        ctx.check("mstat2_echo_bool_false", g_echo_bool_false.load() == 0);
+        ctx.check("mstat2_echo_byte_zero", g_echo_byte_zero.load() == 0);
+        ctx.check("mstat2_echo_byte_max_127", g_echo_byte_max.load() == 127);
+        ctx.check("mstat2_echo_byte_min_neg128", g_echo_byte_min.load() == -128);
+        ctx.check("mstat2_echo_short_max_32767", g_echo_short_max.load() == 32767);
+        ctx.check("mstat2_echo_short_min_neg32768", g_echo_short_min.load() == -32768);
+        ctx.check("mstat2_echo_char_zero", g_echo_char_zero.load() == 0);
+        ctx.check("mstat2_echo_char_max_65535", g_echo_char_max.load() == 65535);
+        ctx.check("mstat2_echo_char_A_65", g_echo_char_a.load() == 65);
+        ctx.check("mstat2_echo_int_max", g_echo_int_max.load() == 2147483647LL);
+        ctx.check("mstat2_echo_int_min", g_echo_int_min.load() == -2147483648LL);
+        ctx.check("mstat2_echo_int_zero", g_echo_int_zero.load() == 0);
+        ctx.check("mstat2_echo_int_negone", g_echo_int_negone.load() == -1);
+        ctx.check("mstat2_echo_long_max", g_echo_long_max.load() == std::numeric_limits<std::int64_t>::max());
+        ctx.check("mstat2_echo_long_min", g_echo_long_min.load() == std::numeric_limits<std::int64_t>::min());
+        ctx.check("mstat2_echo_long_zero", g_echo_long_zero.load() == 0);
+        ctx.check("mstat2_echo_float_half", bits2f(g_echo_float_half.load()) == 0.5f);
+        ctx.check("mstat2_echo_float_nan_isnan", std::isnan(bits2f(g_echo_float_nan.load())));
+        {
+            const float pinf = bits2f(g_echo_float_posinf.load());
+            ctx.check("mstat2_echo_float_posinf_isinf", std::isinf(pinf) && pinf > 0.0f);
+        }
+        ctx.check("mstat2_echo_float_max", bits2f(g_echo_float_max.load()) == std::numeric_limits<float>::max());
+        {
+            const double nz = bits2d(g_echo_double_negzero.load());
+            ctx.check("mstat2_echo_double_negzero_value", nz == 0.0);
+            ctx.check("mstat2_echo_double_negzero_signbit", std::signbit(nz));
+        }
+        ctx.check("mstat2_echo_double_nan_isnan", std::isnan(bits2d(g_echo_double_nan.load())));
+        {
+            const double ninf = bits2d(g_echo_double_neginf.load());
+            ctx.check("mstat2_echo_double_neginf_isinf", std::isinf(ninf) && ninf < 0.0);
+        }
+        ctx.check("mstat2_echo_double_max", bits2d(g_echo_double_max.load()) == std::numeric_limits<double>::max());
+        ctx.check("mstat2_echo_string_captured", g_echo_string_captured.load());
+        ctx.check("mstat2_echo_string_empty_round_trip", g_echo_string_empty.empty());
+        ctx.check("mstat2_echo_string_unicode_round_trip", g_echo_string_unicode == "caf\xC3\xA9");
+
+        // ---- (I) multi-argument slot-shape digests ----
+        ctx.check("mstat2_sum_ii", g_sum_ii.load() == (static_cast<std::int64_t>(11) * 1000003 + 22));
+        {
+            // Recompute a*1000003 + b with unsigned 64-bit wrapping (matches Java
+            // long arithmetic; avoids signed-overflow UB in the expectation).
+            const std::uint64_t a{ static_cast<std::uint64_t>(0x0011223344556677ULL) };
+            const std::uint64_t bb{ static_cast<std::uint64_t>(0x7766554433221100ULL) };
+            const std::int64_t expected_jj{ static_cast<std::int64_t>(a * 1000003ULL + bb) };
+            ctx.check("mstat2_sum_jj", g_sum_jj.load() == expected_jj);
+        }
+        ctx.check("mstat2_sum_dd_captured", g_sum_dd_captured.load());
+        ctx.check("mstat2_sum_dd_bits", bits2d(g_sum_dd.load()) == 11.25);
+        ctx.check("mstat2_sum_ff_captured", g_sum_ff_captured.load());
+        ctx.check("mstat2_sum_ff_bits", bits2f(g_sum_ff.load()) == 11.25f);
+        ctx.check("mstat2_bool_xor_true_false", g_bool_xor_tf.load() == 1);
+        ctx.check("mstat2_bool_xor_true_true", g_bool_xor_tt.load() == 0);
+        ctx.check("mstat2_mix_fid_captured", g_mix_fid_captured.load());
+        // 1.5*1000 + 9*7 + 0.125 = 1563.125 (all exactly representable).
+        ctx.check("mstat2_mix_fid_bits", bits2d(g_mix_fid.load()) == 1563.125);
+        // sPackPrims digest — recomputed with the SAME wrapping arithmetic Java
+        // uses (unsigned 64-bit to avoid signed-shift UB; bit-identical result).
+        {
+            const std::uint64_t z{ 1u };
+            const std::uint64_t b{ static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int8_t>(-7))) };
+            const std::uint64_t s{ static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int16_t>(-12345))) };
+            const std::uint64_t c{ static_cast<std::uint64_t>(std::uint16_t{ 0xBEEF }) };
+            const std::uint64_t i{ static_cast<std::uint64_t>(static_cast<std::int64_t>(std::int32_t{ 0x01020304 })) };
+            const std::uint64_t j{ static_cast<std::uint64_t>(static_cast<std::int64_t>(0x0011223344556677LL)) };
+            std::uint64_t acc{ 0u };
+            acc += z;
+            acc += b << 1;
+            acc += s << 9;
+            acc += c << 25;
+            acc += i << 41;
+            acc ^= j;
+            const std::int64_t expected_pack{ static_cast<std::int64_t>(acc) };
+            ctx.check("mstat2_pack_prims_digest", g_pack_prims.load() == expected_pack);
+        }
+        ctx.check("mstat2_seven_ints_weighted_sum", g_seven_ints.load() == 140);
+
+        // ---- (J) extra overloads — float and (int,long) ----
+        ctx.check("mstat2_overload_by_float", g_poly_by_float.load() == k_poly_float);
+        ctx.check("mstat2_overload_by_int_long", g_poly_by_intlong.load() == k_poly_intlong);
+        ctx.check("mstat2_overload_sig_float", g_poly_sig_float.load() == k_poly_float);
+        ctx.check("mstat2_overload_sig_double", g_poly_sig_double.load() == k_poly_double);
+        ctx.check("mstat2_overload_sig_int_int", g_poly_sig_intint.load() == k_poly_int2);
+        ctx.check("mstat2_overload_sig_int_long", g_poly_sig_intlong.load() == k_poly_intlong);
+
+        // ---- (K) name+signature overload REJECTION ----
+        // An absent signature resolves to nullopt (the static path fails closed).
+        ctx.check("mstat2_sig_absent_overload_rejected", g_sig_missing_overload.load() == 0);
+        // An instance method matched by exact (I)I is still rejected by the
+        // JVM_ACC_STATIC gate on the static name+signature path.
+        ctx.check("mstat2_sig_instance_overload_rejected", g_sig_instance_rejected.load() == 0);
     }
 
     // Suite-safety: tear down any hook this module armed so ZERO stay installed

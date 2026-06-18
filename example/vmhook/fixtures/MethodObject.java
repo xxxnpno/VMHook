@@ -112,6 +112,27 @@ public final class MethodObject
         {
             return new Child(SIBLING_TAG, SIBLING_LABEL);
         }
+
+        /**
+         * Object-returning method THROUGH a method-returned wrapper that returns
+         * null — the chained-call whose SECOND link is a null reference return.
+         * Proves a null reference return through a method-decoded receiver still
+         * yields a null unique_ptr (the chained null path).
+         */
+        public Child makeNullSibling()
+        {
+            return null;
+        }
+
+        /**
+         * Identity round-trip: returns `this`.  The native side wraps a Child,
+         * calls self() through the wrapper, and the returned wrapper must decode
+         * to the SAME Child OOP (self-identity through a method-returned wrapper).
+         */
+        public Child self()
+        {
+            return this;
+        }
     }
 
     // ── Polymorphic return hierarchy ────────────────────────────────────────
@@ -124,8 +145,9 @@ public final class MethodObject
         }
     }
 
-    /** Concrete subclass actually returned — proves the wrapper sees runtime type. */
-    public static final class Dog extends Animal
+    /** First-level subclass.  NOT final any more — Puppy extends it, so the
+     *  native side can probe a TWO-level-deep polymorphic return as well. */
+    public static class Dog extends Animal
     {
         public int breedId = DOG_BREED_ID;
 
@@ -133,6 +155,42 @@ public final class MethodObject
         public String speak()
         {
             return DOG_SOUND;
+        }
+    }
+
+    /**
+     * Two-level-deep subclass (Animal -&gt; Dog -&gt; Puppy).  makePuppy() is
+     * DECLARED to return the base Animal but returns a Puppy; the decoded
+     * wrapper must see the concrete runtime klass (Puppy), inherit Dog's
+     * breedId field, AND dispatch speak() to the Puppy override — proving the
+     * runtime-type decode is depth-independent.
+     */
+    public static final class Puppy extends Dog
+    {
+        @Override
+        public String speak()
+        {
+            return PUPPY_SOUND;
+        }
+    }
+
+    // ── Interface-typed return ──────────────────────────────────────────────
+    /** Interface a method is DECLARED to return. */
+    public interface Named
+    {
+        String name();
+    }
+
+    /** Concrete implementor actually returned — proves the wrapper decodes the
+     *  runtime IMPL class behind an interface-typed return. */
+    public static final class NamedThing implements Named
+    {
+        public int code = NAMED_CODE;
+
+        @Override
+        public String name()
+        {
+            return NAMED_NAME;
         }
     }
 
@@ -159,6 +217,19 @@ public final class MethodObject
     /** breedId of the polymorphic Dog, and the sound its speak() override returns. */
     public static final int DOG_BREED_ID = 0x0D06;        // 3334
     public static final String DOG_SOUND = "woof";
+
+    /** Sound the two-level-deep Puppy override returns (proves depth-independent
+     *  runtime dispatch through a method-decoded wrapper). */
+    public static final String PUPPY_SOUND = "yip";
+
+    /** Published field + name() result of the interface-typed NamedThing return. */
+    public static final int NAMED_CODE = 0x4A3D;          // 18989
+    public static final String NAMED_NAME = "named-impl";
+
+    /** Elements of stringArray(), in order. */
+    public static final String STR_ARRAY_0 = "s0";
+    public static final String STR_ARRAY_1 = "s1";
+    public static final String STR_ARRAY_2 = "s2";
 
     /** value boxed by boxedInt(). */
     public static final int BOXED_INT_VALUE = 0x07E5;     // 2021
@@ -202,11 +273,23 @@ public final class MethodObject
     /** identityHashCode of the Animal (a Dog) makeAnimal() returns. */
     public static volatile int animalIdentity;
 
+    /** identityHashCode of the two-level-deep Puppy makePuppy() returns. */
+    public static volatile int puppyIdentity;
+
+    /** identityHashCode of the interface-typed NamedThing makeNamed() returns. */
+    public static volatile int namedIdentity;
+
     /** The singleton static Child, so its identity is stable across calls. */
     private static final Child STATIC_CHILD = new Child(STATIC_TAG, STATIC_LABEL);
 
     /** The singleton Dog makeAnimal() returns, so its identity is stable. */
     private static final Dog ANIMAL = new Dog();
+
+    /** The singleton two-level-deep Puppy makePuppy() returns. */
+    private static final Puppy PUPPY = new Puppy();
+
+    /** The singleton interface-typed implementor makeNamed() returns. */
+    private static final NamedThing NAMED = new NamedThing();
 
     /** The fixed Child[] childArray() returns, so element identities are stable. */
     private final Child[] childArray =
@@ -226,6 +309,9 @@ public final class MethodObject
         new Child(ARRAY_TAG_1, "o1"),
         new Child(ARRAY_TAG_2, "o2"),
     };
+
+    /** The fixed String[] stringArray() returns ('[Ljava/lang/String;'). */
+    private final String[] stringArray = { STR_ARRAY_0, STR_ARRAY_1, STR_ARRAY_2 };
 
     // ── Object-returning probe targets ─────────────────────────────────────
 
@@ -327,6 +413,67 @@ public final class MethodObject
         return LABEL_STRING;
     }
 
+    /** String array reference return ('[Ljava/lang/String;') — each element is a
+     *  java.lang.String the native side decodes via read_java_string. */
+    public String[] stringArray()
+    {
+        return this.stringArray;
+    }
+
+    /**
+     * Object ARGUMENT + object return: identity echo.  The native side passes a
+     * method-returned Child wrapper back IN as the argument; this returns the
+     * very same object, so the decoded return OOP must equal the argument OOP
+     * (round-trips a unique_ptr&lt;wrapper&gt; arg through an object-returning call).
+     */
+    public Child echoChild(final Child c)
+    {
+        return c;
+    }
+
+    /**
+     * Arg-SELECTED object return: returns the childArray element at `idx`.  The
+     * native side drives idx 0/1/2 and asserts each decodes to a DISTINCT object
+     * with the matching published tag — an int arg selecting which object the
+     * call() returns.  Out-of-range idx returns null (the arg-driven null path).
+     */
+    public Child pickChild(final int idx)
+    {
+        return (idx >= 0 && idx < this.childArray.length) ? this.childArray[idx] : null;
+    }
+
+    /** Two-level-deep polymorphic return: declared Animal, runtime Puppy. */
+    public Animal makePuppy()
+    {
+        return PUPPY;
+    }
+
+    /** The Puppy override's speak() result — ground truth for the depth-2 dispatch. */
+    public String getPuppySound()
+    {
+        return PUPPY.speak();
+    }
+
+    /** Interface-typed return: declared Named, runtime NamedThing. */
+    public Named makeNamed()
+    {
+        return NAMED;
+    }
+
+    /** The interface impl's name() result — ground truth for the interface dispatch. */
+    public String getNamedName()
+    {
+        return NAMED.name();
+    }
+
+    /** A SECOND method that returns the SAME singleton Child as staticMakeChild()
+     *  — lets the native side prove two DIFFERENT methods returning one object
+     *  decode to the SAME OOP (cross-method identity). */
+    public Child sameStaticChild()
+    {
+        return STATIC_CHILD;
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -349,6 +496,8 @@ public final class MethodObject
                 MethodObject.childIdentity = System.identityHashCode(self.child);
                 MethodObject.staticChildIdentity = System.identityHashCode(STATIC_CHILD);
                 MethodObject.animalIdentity = System.identityHashCode(ANIMAL);
+                MethodObject.puppyIdentity = System.identityHashCode(PUPPY);
+                MethodObject.namedIdentity = System.identityHashCode(NAMED);
 
                 // Calling tick() through normal bytecode dispatch is what makes
                 // the native interpreter hook fire; the detour then performs the

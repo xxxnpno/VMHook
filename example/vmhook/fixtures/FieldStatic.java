@@ -217,6 +217,13 @@ public final class FieldStatic extends FieldStaticBase
     public static String  setStrEmpty = freshAscii("keep");   // native writes "" -> ""
     public static String  setStrTrunc = freshAscii("ABCDE");  // native writes long -> "toolongvalue"
 
+    // String SET targets written through the const char* / std::string_view set
+    // arms (a DIFFERENT field_proxy::set overload branch than set(std::string)).
+    // Private backings (freshAscii) so the rebind is clean and never aliases an
+    // interned literal.  Distinct initial values so a dropped write is caught.
+    public static String  setStrCstr = freshAscii("origC");   // native writes "via-cstr"
+    public static String  setStrView = freshAscii("origV");   // native writes "subview"
+
     // =====================================================================
     //  EXHAUSTIVE SET-EDGE targets, each with a matching getX() getter so the
     //  native side can (a) re-read the slot in C++ and (b) pull the value back
@@ -503,6 +510,12 @@ public final class FieldStatic extends FieldStaticBase
     }
     public static String  getStrEmpty() { return setStrEmpty; }
     public static String  getStrTrunc() { return setStrTrunc; }
+    public static String  getStrCstr()  { return setStrCstr; }
+    public static String  getStrView()  { return setStrView; }
+    // The ORIGINAL setStrShort object (static final, aliased at <clinit>): a
+    // native getter that the module pulls back to prove the original String is
+    // untouched by the rebind (still "world"), read through genuine getstatic.
+    public static String  getStrShortOriginal() { return setStrShortOriginal; }
 
     // ---- getters for the static ARRAY fields (genuine getstatic) -----------
     public static int     getIntArrLen()   { return sIntArr == null ? -1 : sIntArr.length; }
@@ -590,6 +603,8 @@ public final class FieldStatic extends FieldStaticBase
         // post-mutation content.  A private backing array gives a clean reset.
         setStr = freshAscii("AAAAA");
         setStrShort = freshAscii("world");
+        setStrCstr = freshAscii("origC");
+        setStrView = freshAscii("origV");
         guardInt = 0x11223344;
         guardLong = 0x1122334455667788L;
         guardChar = 0x0000;

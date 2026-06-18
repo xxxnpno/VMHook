@@ -305,6 +305,67 @@ public final class MethodStatic
     }
 
     // ======================================================================
+    //  MULTI-ARGUMENT slot-shape methods.  Each computes a DETERMINISTIC
+    //  digest of all its arguments and RETURNS it, so the native side proves
+    //  the C++ arg-packer maps every argument to the right slot (and, for
+    //  long/double, the right WIDE pair) with no receiver shift — and does so
+    //  PATH-INDEPENDENTLY (a primitive return is bit-identical on the call_stub
+    //  and call_jni paths, so these are all hard-asserted on every JDK).
+    // ======================================================================
+
+    /** Two ints; returns a*1000003 + b so order/slot swaps are detectable. */
+    public static int  sSumII(final int a, final int b)            { return a * 1000003 + b; }
+
+    /** Two longs; mixes both so a transposition changes the result. */
+    public static long sSumJJ(final long a, final long b)          { return a * 1000003L + b; }
+
+    /** Two doubles; returns their raw-mixed sum (bit-checked by the caller). */
+    public static double sSumDD(final double a, final double b)    { return a * 4.0 + b; }
+
+    /** Two floats; returns a mix that is order-sensitive. */
+    public static float sSumFF(final float a, final float b)       { return a * 4.0f + b; }
+
+    /** Two booleans; returns their XOR (slot-0 vs slot-1 packing of Z Z). */
+    public static boolean sBoolXor(final boolean a, final boolean b) { return a ^ b; }
+
+    /**
+     * Mixed float / int / double in declaration order — exercises the packer
+     * interleaving a 1-slot float, a 1-slot int, and a 2-slot double.  Returns a
+     * double digest that depends on each argument's value AND position.
+     */
+    public static double sMixFID(final float f, final int i, final double d)
+    {
+        return (double) f * 1000.0 + (double) i * 7.0 + d;
+    }
+
+    /**
+     * Every narrow primitive plus a WIDE long, in one call: Z B S C I J.  Returns
+     * a long digest where each argument occupies disjoint bit/scale ranges so any
+     * mis-slotting (especially the long's two-slot pair after the narrow args) is
+     * caught.
+     */
+    public static long sPackPrims(final boolean z, final byte b, final short s,
+                                  final char c, final int i, final long j)
+    {
+        long acc = 0L;
+        acc += z ? 1L : 0L;
+        acc += ((long) b) << 1;        // -7 -> contributes a signed term
+        acc += ((long) s) << 9;        // signed short
+        acc += ((long) c) << 25;       // unsigned char (zero-extended)
+        acc += ((long) i) << 41;       // int term
+        acc ^= j;                       // long term mixed in via xor
+        return acc;
+    }
+
+    /** Seven ints — the maximum C++ arg fan-out the packer slot array allows for
+     *  a static call (no receiver).  Returns a position-weighted sum. */
+    public static int s7Ints(final int a, final int b, final int c, final int d,
+                             final int e, final int f, final int g)
+    {
+        return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7;
+    }
+
+    // ======================================================================
     //  OVERLOADED static methods — all named "sPoly", told apart by signature.
     //  Each returns a DISTINCT sentinel so the native side proves WHICH overload
     //  resolved, both by C++ argument type and by an explicit signature pin.
@@ -312,17 +373,21 @@ public final class MethodStatic
     //  resolver cannot depend on source order.
     // ======================================================================
 
-    public static final int POLY_INT    = 7001;  // sPoly(int)    -> (I)I
-    public static final int POLY_LONG   = 7002;  // sPoly(long)   -> (J)I
-    public static final int POLY_DOUBLE = 7003;  // sPoly(double) -> (D)I
-    public static final int POLY_STRING = 7004;  // sPoly(String) -> (Ljava/lang/String;)I
-    public static final int POLY_INT2   = 7005;  // sPoly(int,int)-> (II)I
+    public static final int POLY_INT    = 7001;  // sPoly(int)      -> (I)I
+    public static final int POLY_LONG   = 7002;  // sPoly(long)     -> (J)I
+    public static final int POLY_DOUBLE = 7003;  // sPoly(double)   -> (D)I
+    public static final int POLY_STRING = 7004;  // sPoly(String)   -> (Ljava/lang/String;)I
+    public static final int POLY_INT2   = 7005;  // sPoly(int,int)  -> (II)I
+    public static final int POLY_FLOAT  = 7006;  // sPoly(float)    -> (F)I
+    public static final int POLY_INTLONG = 7007; // sPoly(int,long) -> (IJ)I
 
     public static int sPoly(final int a)               { return POLY_INT; }
     public static int sPoly(final String a)            { return POLY_STRING; }
     public static int sPoly(final long a)              { return POLY_LONG; }
     public static int sPoly(final double a)            { return POLY_DOUBLE; }
+    public static int sPoly(final float a)             { return POLY_FLOAT; }
     public static int sPoly(final int a, final int b)  { return POLY_INT2; }
+    public static int sPoly(final int a, final long b) { return POLY_INTLONG; }
 
     // ======================================================================
     //  INSTANCE methods — used to prove is_static() == FALSE for non-static,

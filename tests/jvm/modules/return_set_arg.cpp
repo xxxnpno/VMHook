@@ -102,12 +102,37 @@ namespace
 
         // ── bounds observation ─────────────────────────────────────────────
         static auto bounds_obs() -> std::int32_t  { std::int32_t v = static_field("boundsObs")->get(); return v; }
+
+        // ── wide-slot model observations ───────────────────────────────────
+        static auto ll_a()        -> std::int64_t { std::int64_t v = static_field("llA")->get();        return v; }
+        static auto ll_b()        -> std::int64_t { std::int64_t v = static_field("llB")->get();        return v; }
+        static auto dd_a()        -> double        { double       v = static_field("ddA")->get();        return v; }
+        static auto dd_b()        -> double        { double       v = static_field("ddB")->get();        return v; }
+        static auto ld_long()     -> std::int64_t { std::int64_t v = static_field("ldLong")->get();     return v; }
+        static auto ld_double()   -> double        { double       v = static_field("ldDouble")->get();   return v; }
+        static auto dl_double()   -> double        { double       v = static_field("dlDouble")->get();   return v; }
+        static auto dl_long()     -> std::int64_t { std::int64_t v = static_field("dlLong")->get();     return v; }
+        static auto tri_a()       -> std::int32_t { std::int32_t v = static_field("triA")->get();       return v; }
+        static auto tri_b()       -> std::int32_t { std::int32_t v = static_field("triB")->get();       return v; }
+        static auto tri_c()       -> std::int32_t { std::int32_t v = static_field("triC")->get();       return v; }
+        static auto fl_float()    -> float         { float        v = static_field("flFloat")->get();    return v; }
+        static auto fl_long()     -> std::int64_t { std::int64_t v = static_field("flLong")->get();     return v; }
+        static auto wide_probe_long() -> std::int64_t { std::int64_t v = static_field("wideProbeLong")->get(); return v; }
+        static auto wide_probe_int()  -> std::int32_t { std::int32_t v = static_field("wideProbeInt")->get();  return v; }
+
+        // ── static slot-model observations ─────────────────────────────────
+        static auto s_two_a()     -> std::int32_t { std::int32_t v = static_field("sTwoA")->get();     return v; }
+        static auto s_two_b()     -> std::int32_t { std::int32_t v = static_field("sTwoB")->get();     return v; }
+        static auto s_mix_long()  -> std::int64_t { std::int64_t v = static_field("sMixLong")->get();  return v; }
+        static auto s_mix_int()   -> std::int32_t { std::int32_t v = static_field("sMixInt")->get();   return v; }
     };
 
     // Mode selectors (mirror ReturnSetArg.java).
     constexpr std::int32_t MODE_PRIMITIVES{ 0 };
     constexpr std::int32_t MODE_SLOTS{ 1 };
     constexpr std::int32_t MODE_BOUNDS{ 2 };
+    constexpr std::int32_t MODE_WIDESLOTS{ 3 };
+    constexpr std::int32_t MODE_STATICSLOTS{ 4 };
 
     // The original value every probe passes (so a no-hook baseline observes it).
     constexpr std::int32_t ORIGINAL_INT{ 7 };
@@ -132,6 +157,40 @@ namespace
     std::atomic<bool> g_il_long_ok{ false };
     std::atomic<bool> g_di_double_ok{ false };
     std::atomic<bool> g_di_int_ok{ false };
+
+    // Wide-slot model (back-to-back / interleaved long+double).
+    std::atomic<bool> g_ll_a_ok{ false };
+    std::atomic<bool> g_ll_b_ok{ false };
+    std::atomic<bool> g_dd_a_ok{ false };
+    std::atomic<bool> g_dd_b_ok{ false };
+    std::atomic<bool> g_ld_long_ok{ false };
+    std::atomic<bool> g_ld_double_ok{ false };
+    std::atomic<bool> g_dl_double_ok{ false };
+    std::atomic<bool> g_dl_long_ok{ false };
+    std::atomic<bool> g_tri_a_ok{ false };
+    std::atomic<bool> g_tri_b_ok{ false };
+    std::atomic<bool> g_tri_c_ok{ false };
+    std::atomic<bool> g_fl_float_ok{ false };
+    std::atomic<bool> g_fl_long_ok{ false };
+    std::atomic<bool> g_wide_probe_base_ok{ false };
+    std::atomic<bool> g_wide_probe_high_ok{ false };
+
+    // Static slot model.
+    std::atomic<bool> g_s_two_a_ok{ false };
+    std::atomic<bool> g_s_two_b_ok{ false };
+    std::atomic<bool> g_s_mix_long_ok{ false };
+    std::atomic<bool> g_s_mix_int_ok{ false };
+
+    // Unsigned-source-type primitive injection (set_arg<uintN_t>(...)).
+    std::atomic<bool> g_u8_ok{ false };
+    std::atomic<bool> g_u16_ok{ false };
+    std::atomic<bool> g_u32_ok{ false };
+    std::atomic<bool> g_u64_ok{ false };
+
+    // Idempotent / double-write semantics.
+    std::atomic<bool> g_idem_ok{ false };
+    std::atomic<bool> g_dbl_first_ok{ false };
+    std::atomic<bool> g_dbl_second_ok{ false };
 
     // Bounds: every out-of-range set_arg must return false; the in-range write
     // (recorded last) must return true.
@@ -476,6 +535,138 @@ VMHOOK_JVM_MODULE(return_set_arg)
         /*s */ static_cast<std::int16_t>(31000) });
 
     // =====================================================================
+    // PART 1b — UNSIGNED C++ SOURCE TYPES: set_arg<uintN_t>(...).  The primitive
+    // branch is generic on the C++ value_type; an unsigned source takes the same
+    // zero-fill+memcpy path.  The Java method signature is unchanged (it is still
+    // takeInt/Long/Char/Short); only the C++ value passed to set_arg is unsigned.
+    // We inject high-bit-set unsigned values and assert the body's DECLARED-WIDTH
+    // field observes the exact low-N-bit truncation — deterministic regardless of
+    // sign-extension, so this is a clean HARD assert on every JDK.
+    // =====================================================================
+    {
+        reset_round();
+        rsa_fixture::set_done(false);
+
+        // uint8 -> takeByte slot 1.  0xC8 = 200; the byte field truncates to
+        // (byte)0xC8 = -56 (deterministic low-8-bit view).
+        const std::uint8_t  u8{ static_cast<std::uint8_t>(0xC8) };
+        // uint16 -> takeChar slot 1.  0xBEEF; char zero-extends, so the char field
+        // observes 0xBEEF exactly.
+        const std::uint16_t u16{ static_cast<std::uint16_t>(0xBEEF) };
+        // uint32 -> takeInt slot 1.  0xDEADBEEF; the int field is the low 32 bits.
+        const std::uint32_t u32{ 0xDEADBEEFu };
+        // uint64 -> takeLong slot 1.  Full 64-bit unsigned value round-trips.
+        const std::uint64_t u64{ 0xFEEDFACECAFEBABEull };
+
+        auto hu_byte{ vmhook::scoped_hook<rsa_fixture>("takeByte", "(B)V",
+            [u8](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int32_t)
+            { g_u8_ok.store(r.set_arg(1, u8), std::memory_order_relaxed); }) };
+        auto hu_char{ vmhook::scoped_hook<rsa_fixture>("takeChar", "(C)V",
+            [u16](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int32_t)
+            { g_u16_ok.store(r.set_arg(1, u16), std::memory_order_relaxed); }) };
+        auto hu_int{ vmhook::scoped_hook<rsa_fixture>("takeInt", "(I)V",
+            [u32](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int32_t)
+            { g_u32_ok.store(r.set_arg(1, u32), std::memory_order_relaxed); }) };
+        auto hu_long{ vmhook::scoped_hook<rsa_fixture>("takeLong", "(J)V",
+            [u64](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int64_t)
+            { g_u64_ok.store(r.set_arg(1, u64), std::memory_order_relaxed); }) };
+
+        const bool all_installed{
+            hu_byte.installed() && hu_char.installed() && hu_int.installed() && hu_long.installed() };
+        ctx.check("unsigned_all_hooks_installed", all_installed);
+
+        const bool done{ ctx.run_probe(
+            [](bool value)
+            {
+                if (value) { rsa_fixture::set_done(false); rsa_fixture::set_mode(MODE_PRIMITIVES); }
+                rsa_fixture::set_go(value);
+            },
+            []() { return rsa_fixture::get_done(); }) };
+        ctx.check("unsigned_probe_completed", done);
+
+        if (done && all_installed)
+        {
+            ctx.check("unsigned_no_java_exception", !rsa_fixture::saw_exception());
+
+            ctx.check("unsigned_u8_set_ok",  g_u8_ok.load(std::memory_order_relaxed));
+            ctx.check("unsigned_u16_set_ok", g_u16_ok.load(std::memory_order_relaxed));
+            ctx.check("unsigned_u32_set_ok", g_u32_ok.load(std::memory_order_relaxed));
+            ctx.check("unsigned_u64_set_ok", g_u64_ok.load(std::memory_order_relaxed));
+
+            // byte field == low-8-bit truncation (sign-agnostic).
+            ctx.check("unsigned_u8_byte_truncates",
+                      rsa_fixture::obs_byte() == static_cast<std::int8_t>(u8));
+            // char field zero-extends => exact 16-bit value.
+            ctx.check("unsigned_u16_char_exact",
+                      rsa_fixture::obs_char() == u16);
+            // int field == full low 32 bits.
+            ctx.check("unsigned_u32_int_exact",
+                      rsa_fixture::obs_int() == static_cast<std::int32_t>(u32));
+            // long field == full 64 bits.
+            ctx.check("unsigned_u64_long_exact",
+                      rsa_fixture::obs_long() == static_cast<std::int64_t>(u64));
+        }
+
+        ctx.record("[INFO] return_set_arg unsigned source types: set_arg<uint8/16/32/64_t> take the "
+                   "same zero-fill+memcpy primitive path as their signed twins; the body's "
+                   "declared-width field observes the exact low-N-bit value (byte 0xC8->-56, char "
+                   "0xBEEF exact, int 0xDEADBEEF exact, long 0xFEEDFACECAFEBABE exact).");
+    }
+
+    // =====================================================================
+    // PART 1c — IDEMPOTENT overwrite + DOUBLE-WRITE last-wins semantics.
+    //   * Inject the SAME value the original passes (7): set_arg must succeed and
+    //     the body still sees 7 (a no-op overwrite is still a real write).
+    //   * Call set_arg twice on the SAME slot in one detour: the SECOND value wins
+    //     (the slot holds whatever was written last before the body runs).
+    // =====================================================================
+    {
+        reset_round();
+        rsa_fixture::set_done(false);
+
+        // takeStaticInt: overwrite slot 0 with the ORIGINAL value 7 (idempotent).
+        auto h_idem{ vmhook::scoped_hook<rsa_fixture>("takeStaticInt", "(I)V",
+            [](vmhook::return_value& r, std::int32_t)
+            { g_idem_ok.store(r.set_arg(0, ORIGINAL_INT), std::memory_order_relaxed); }) };
+
+        // takeInt: write slot 1 TWICE; the body must observe the second value.
+        auto h_dbl{ vmhook::scoped_hook<rsa_fixture>("takeInt", "(I)V",
+            [](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int32_t)
+            {
+                g_dbl_first_ok.store(r.set_arg(1, static_cast<std::int32_t>(1111)), std::memory_order_relaxed);
+                g_dbl_second_ok.store(r.set_arg(1, static_cast<std::int32_t>(2222)), std::memory_order_relaxed);
+            }) };
+
+        const bool all_installed{ h_idem.installed() && h_dbl.installed() };
+        ctx.check("idem_all_hooks_installed", all_installed);
+
+        const bool done{ ctx.run_probe(
+            [](bool value)
+            {
+                if (value) { rsa_fixture::set_done(false); rsa_fixture::set_mode(MODE_PRIMITIVES); }
+                rsa_fixture::set_go(value);
+            },
+            []() { return rsa_fixture::get_done(); }) };
+        ctx.check("idem_probe_completed", done);
+
+        if (done && all_installed)
+        {
+            ctx.check("idem_no_java_exception", !rsa_fixture::saw_exception());
+            ctx.check("idem_set_ok",            g_idem_ok.load(std::memory_order_relaxed));
+            ctx.check("idem_body_saw_original", rsa_fixture::obs_static_int() == ORIGINAL_INT);
+
+            ctx.check("dbl_first_set_ok",  g_dbl_first_ok.load(std::memory_order_relaxed));
+            ctx.check("dbl_second_set_ok", g_dbl_second_ok.load(std::memory_order_relaxed));
+            // Last write wins: the body sees the SECOND value, not the first.
+            ctx.check("dbl_last_write_wins", rsa_fixture::obs_int() == 2222);
+        }
+
+        ctx.record("[INFO] return_set_arg idempotent/double-write: overwriting a slot with its own "
+                   "original value succeeds and the body sees the original; two set_arg calls on the "
+                   "same slot in one detour leave the SECOND value (last write wins) for the body.");
+    }
+
+    // =====================================================================
     // PART 2 — SLOT MODEL: wide args interleaved with narrow args.  Each value is
     // distinct so a mis-targeted slot surfaces as the wrong field changing.
     // =====================================================================
@@ -568,6 +759,225 @@ VMHOOK_JVM_MODULE(return_set_arg)
                    "matching the interpreter's lload/dload and the library read path. The int AFTER a "
                    "long (mixLongInt: this=0, long=slots1+2, int=slot3) is mutated only by "
                    "set_arg(3, ...), proving slot index (not argument ordinal) is what set_arg targets.");
+    }
+
+    // =====================================================================
+    // PART 2b — WIDE SLOT MODEL: back-to-back and interleaved long/double args.
+    // Each wide arg reserves TWO slots, so the next arg's base slot index is
+    // shifted by two.  Distinct injected values per arg make a mis-targeted slot
+    // surface as the WRONG field changing.  set_arg(base, wide) stores the 64-bit
+    // value at the lower slot (base+1) internally, so we pass the BASE slot index
+    // (1, 3, ...) and read the result back from the body.
+    // =====================================================================
+    {
+        reset_round();
+        rsa_fixture::set_done(false);
+
+        // longLong(long a, long b): this=0, a=base slot 1, b=base slot 3.
+        auto h_ll{ vmhook::scoped_hook<rsa_fixture>("longLong", "(JJ)V",
+            [](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int64_t, std::int64_t)
+            {
+                g_ll_a_ok.store(r.set_arg(1, static_cast<std::int64_t>(0x1111111122222222LL)),
+                                std::memory_order_relaxed);
+                g_ll_b_ok.store(r.set_arg(3, static_cast<std::int64_t>(0x3333333344444444LL)),
+                                std::memory_order_relaxed);
+            }) };
+
+        // doubleDouble(double a, double b): this=0, a=base slot 1, b=base slot 3.
+        auto h_dd{ vmhook::scoped_hook<rsa_fixture>("doubleDouble", "(DD)V",
+            [](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, double, double)
+            {
+                g_dd_a_ok.store(r.set_arg(1, 111.25), std::memory_order_relaxed);
+                g_dd_b_ok.store(r.set_arg(3, 222.75), std::memory_order_relaxed);
+            }) };
+
+        // longDouble(long a, double b): this=0, a=base slot 1, b=base slot 3.
+        auto h_ld{ vmhook::scoped_hook<rsa_fixture>("longDouble", "(JD)V",
+            [](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int64_t, double)
+            {
+                g_ld_long_ok.store(r.set_arg(1, static_cast<std::int64_t>(0x55667788AABBCCDDLL)),
+                                   std::memory_order_relaxed);
+                g_ld_double_ok.store(r.set_arg(3, 333.5), std::memory_order_relaxed);
+            }) };
+
+        // doubleLong(double a, long b): this=0, a=base slot 1, b=base slot 3.
+        auto h_dl{ vmhook::scoped_hook<rsa_fixture>("doubleLong", "(DJ)V",
+            [](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, double, std::int64_t)
+            {
+                g_dl_double_ok.store(r.set_arg(1, 444.125), std::memory_order_relaxed);
+                g_dl_long_ok.store(r.set_arg(3, static_cast<std::int64_t>(0x00000000CAFEBABELL)),
+                                   std::memory_order_relaxed);
+            }) };
+
+        // intIntInt(int a, int b, int c): three narrow args in slots 1, 2, 3.
+        auto h_tri{ vmhook::scoped_hook<rsa_fixture>("intIntInt", "(III)V",
+            [](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int32_t, std::int32_t, std::int32_t)
+            {
+                g_tri_a_ok.store(r.set_arg(1, static_cast<std::int32_t>(100)), std::memory_order_relaxed);
+                g_tri_b_ok.store(r.set_arg(2, static_cast<std::int32_t>(200)), std::memory_order_relaxed);
+                g_tri_c_ok.store(r.set_arg(3, static_cast<std::int32_t>(300)), std::memory_order_relaxed);
+            }) };
+
+        // floatLong(float a, long b): float is ONE slot (slot1), long base slot 2.
+        // Proves a one-slot primitive followed by a wide arg: the long base index
+        // is 2 (not 3), because the float consumed exactly one slot.
+        auto h_fl{ vmhook::scoped_hook<rsa_fixture>("floatLong", "(FJ)V",
+            [](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, float, std::int64_t)
+            {
+                g_fl_float_ok.store(r.set_arg(1, 55.5f), std::memory_order_relaxed);
+                g_fl_long_ok.store(r.set_arg(2, static_cast<std::int64_t>(0x000000007EADBEEFLL)),
+                                   std::memory_order_relaxed);
+            }) };
+
+        // wideProbe(long a, int b): this=0, a=base slot 1, b=slot 3.  Mutate ONLY
+        // the long (base slot 1) and the trailing int (slot 3); the int at slot 3
+        // is reachable only because the long reserved slots 1+2.
+        auto h_wp{ vmhook::scoped_hook<rsa_fixture>("wideProbe", "(JI)V",
+            [](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int64_t, std::int32_t)
+            {
+                g_wide_probe_base_ok.store(r.set_arg(1, static_cast<std::int64_t>(0x0102030405060708LL)),
+                                           std::memory_order_relaxed);
+                g_wide_probe_high_ok.store(r.set_arg(3, static_cast<std::int32_t>(4242)),
+                                           std::memory_order_relaxed);
+            }) };
+
+        const bool all_installed{
+            h_ll.installed() && h_dd.installed() && h_ld.installed() && h_dl.installed() &&
+            h_tri.installed() && h_fl.installed() && h_wp.installed() };
+        ctx.check("wideslots_all_hooks_installed", all_installed);
+
+        const bool done{ ctx.run_probe(
+            [](bool value)
+            {
+                if (value) { rsa_fixture::set_done(false); rsa_fixture::set_mode(MODE_WIDESLOTS); }
+                rsa_fixture::set_go(value);
+            },
+            []() { return rsa_fixture::get_done(); }) };
+        ctx.check("wideslots_probe_completed", done);
+
+        if (done && all_installed)
+        {
+            ctx.check("wideslots_no_java_exception", !rsa_fixture::saw_exception());
+
+            // longLong — two wide args back to back at base slots 1 and 3.
+            ctx.check("wideslots_ll_a_set_ok", g_ll_a_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_ll_b_set_ok", g_ll_b_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_ll_a_observed",
+                      rsa_fixture::ll_a() == static_cast<std::int64_t>(0x1111111122222222LL));
+            ctx.check("wideslots_ll_b_observed",
+                      rsa_fixture::ll_b() == static_cast<std::int64_t>(0x3333333344444444LL));
+
+            // doubleDouble — two wide doubles back to back.
+            ctx.check("wideslots_dd_a_set_ok", g_dd_a_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_dd_b_set_ok", g_dd_b_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_dd_a_observed", same_bits(rsa_fixture::dd_a(), 111.25));
+            ctx.check("wideslots_dd_b_observed", same_bits(rsa_fixture::dd_b(), 222.75));
+
+            // longDouble — wide long then wide double.
+            ctx.check("wideslots_ld_long_set_ok",   g_ld_long_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_ld_double_set_ok", g_ld_double_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_ld_long_observed",
+                      rsa_fixture::ld_long() == static_cast<std::int64_t>(0x55667788AABBCCDDLL));
+            ctx.check("wideslots_ld_double_observed", same_bits(rsa_fixture::ld_double(), 333.5));
+
+            // doubleLong — wide double then wide long.
+            ctx.check("wideslots_dl_double_set_ok", g_dl_double_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_dl_long_set_ok",   g_dl_long_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_dl_double_observed", same_bits(rsa_fixture::dl_double(), 444.125));
+            ctx.check("wideslots_dl_long_observed",
+                      rsa_fixture::dl_long() == static_cast<std::int64_t>(0x00000000CAFEBABELL));
+
+            // intIntInt — three independent narrow slots.
+            ctx.check("wideslots_tri_a_set_ok", g_tri_a_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_tri_b_set_ok", g_tri_b_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_tri_c_set_ok", g_tri_c_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_tri_a_observed_100", rsa_fixture::tri_a() == 100);
+            ctx.check("wideslots_tri_b_observed_200", rsa_fixture::tri_b() == 200);
+            ctx.check("wideslots_tri_c_observed_300", rsa_fixture::tri_c() == 300);
+
+            // floatLong — one-slot float then wide long at base slot 2.
+            ctx.check("wideslots_fl_float_set_ok", g_fl_float_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_fl_long_set_ok",  g_fl_long_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_fl_float_observed", same_bits(rsa_fixture::fl_float(), 55.5f));
+            ctx.check("wideslots_fl_long_observed",
+                      rsa_fixture::fl_long() == static_cast<std::int64_t>(0x000000007EADBEEFLL));
+
+            // wideProbe — long base 1 + trailing int slot 3 both land.
+            ctx.check("wideslots_wp_base_set_ok", g_wide_probe_base_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_wp_high_set_ok", g_wide_probe_high_ok.load(std::memory_order_relaxed));
+            ctx.check("wideslots_wp_long_observed",
+                      rsa_fixture::wide_probe_long() == static_cast<std::int64_t>(0x0102030405060708LL));
+            ctx.check("wideslots_wp_int_observed_4242", rsa_fixture::wide_probe_int() == 4242);
+        }
+
+        ctx.record("[INFO] return_set_arg wide-slot model: back-to-back wide args (longLong, "
+                   "doubleDouble, longDouble, doubleLong) each occupy a 2-slot pair, so the second "
+                   "wide arg's BASE slot index is 3 (this=0, first-wide=1+2, second-wide=3+4). A "
+                   "one-slot float before a long (floatLong) shifts the long's base to slot 2, not 3. "
+                   "All round-trip through the body's lload/dload, proving set_arg's wide write lands "
+                   "on the interpreter's lower slot for every interleaving.");
+    }
+
+    // =====================================================================
+    // PART 2c — STATIC slot model: a static method has NO 'this', so the first
+    // argument begins at slot 0 (not slot 1).  This complements the static-int
+    // single-arg case in PART 1 with multi-arg + wide-arg static shapes.
+    // =====================================================================
+    {
+        reset_round();
+        rsa_fixture::set_done(false);
+
+        // staticTwoInts(int a, int b): a=slot0, b=slot1.
+        auto h_s_two{ vmhook::scoped_hook<rsa_fixture>("staticTwoInts", "(II)V",
+            [](vmhook::return_value& r, std::int32_t, std::int32_t)
+            {
+                g_s_two_a_ok.store(r.set_arg(0, static_cast<std::int32_t>(501)), std::memory_order_relaxed);
+                g_s_two_b_ok.store(r.set_arg(1, static_cast<std::int32_t>(601)), std::memory_order_relaxed);
+            }) };
+
+        // staticLongInt(long a, int b): a=base slot 0 (slots 0+1), b=slot2.
+        // A wide arg with NO 'this' offset: the trailing int is at slot 2, proving
+        // the two-slot reservation holds from slot 0 on static methods too.
+        auto h_s_mix{ vmhook::scoped_hook<rsa_fixture>("staticLongInt", "(JI)V",
+            [](vmhook::return_value& r, std::int64_t, std::int32_t)
+            {
+                g_s_mix_long_ok.store(r.set_arg(0, static_cast<std::int64_t>(0x7766554433221100LL)),
+                                      std::memory_order_relaxed);
+                g_s_mix_int_ok.store(r.set_arg(2, static_cast<std::int32_t>(909)), std::memory_order_relaxed);
+            }) };
+
+        const bool all_installed{ h_s_two.installed() && h_s_mix.installed() };
+        ctx.check("staticslots_all_hooks_installed", all_installed);
+
+        const bool done{ ctx.run_probe(
+            [](bool value)
+            {
+                if (value) { rsa_fixture::set_done(false); rsa_fixture::set_mode(MODE_STATICSLOTS); }
+                rsa_fixture::set_go(value);
+            },
+            []() { return rsa_fixture::get_done(); }) };
+        ctx.check("staticslots_probe_completed", done);
+
+        if (done && all_installed)
+        {
+            ctx.check("staticslots_no_java_exception", !rsa_fixture::saw_exception());
+
+            ctx.check("staticslots_s_two_a_set_ok", g_s_two_a_ok.load(std::memory_order_relaxed));
+            ctx.check("staticslots_s_two_b_set_ok", g_s_two_b_ok.load(std::memory_order_relaxed));
+            ctx.check("staticslots_s_two_a_observed_501", rsa_fixture::s_two_a() == 501);
+            ctx.check("staticslots_s_two_b_observed_601", rsa_fixture::s_two_b() == 601);
+
+            ctx.check("staticslots_s_mix_long_set_ok", g_s_mix_long_ok.load(std::memory_order_relaxed));
+            ctx.check("staticslots_s_mix_int_set_ok",  g_s_mix_int_ok.load(std::memory_order_relaxed));
+            ctx.check("staticslots_s_mix_long_observed",
+                      rsa_fixture::s_mix_long() == static_cast<std::int64_t>(0x7766554433221100LL));
+            ctx.check("staticslots_s_mix_int_observed_909", rsa_fixture::s_mix_int() == 909);
+        }
+
+        ctx.record("[INFO] return_set_arg static slot model: static methods have no 'this', so the "
+                   "first arg is slot 0 (staticTwoInts: a=0,b=1) and a wide first arg reserves slots "
+                   "0+1, putting the trailing int at slot 2 (staticLongInt) - identical two-slot "
+                   "accounting to instance methods, just without the slot-0 receiver.");
     }
 
     // =====================================================================
@@ -664,9 +1074,13 @@ VMHOOK_JVM_MODULE(return_set_arg)
     ctx.record("[INFO] return_set_arg: injected int/long/double/float/boolean/byte/char/short over "
                "an interpreter ARGUMENT slot (instance slot 1 + static slot 0) across canonical, "
                "zero, signed-min/max, minus-one, -0.0, +/-Inf, qNaN, long-high-dword, "
-               "long-low-dword-max, surrogate-char, and canonical-repeat value rounds; plus the "
-               "wide/narrow slot model (twoInts, mixLongInt, intLong, doubleInt), the max_locals "
-               "bounds rejection (no wild write), and a no-hook baseline. Object/String set_arg is "
-               "intentionally OMITTED here (covered crash-proof by return_set_wrapper_null.cpp); this "
-               "module performs NO in-detour JVM allocation and NO forced GC.");
+               "long-low-dword-max, surrogate-char, and canonical-repeat value rounds; unsigned C++ "
+               "source types (uint8/16/32/64); idempotent overwrite + double-write last-wins; the "
+               "wide/narrow slot model (twoInts, mixLongInt, intLong, doubleInt) plus back-to-back "
+               "and interleaved wide args (longLong, doubleDouble, longDouble, doubleLong, floatLong, "
+               "intIntInt, wideProbe); the STATIC multi-arg + wide-arg slot model (staticTwoInts, "
+               "staticLongInt); the max_locals bounds rejection (no wild write); and a no-hook "
+               "baseline. Object/String set_arg is intentionally OMITTED here (covered crash-proof by "
+               "return_set_wrapper_null.cpp); this module performs NO in-detour JVM allocation and NO "
+               "forced GC.");
 }
