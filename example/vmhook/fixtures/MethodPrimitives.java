@@ -95,6 +95,15 @@ public final class MethodPrimitives
     /** (byte)0x55 — a value with mixed-but-positive bits, so the decode landing
      *  in the wrong width (e.g. reading a stale neighbouring byte) changes it. */
     public byte retBytePattern()     { return (byte) 0x55; }            // 85
+    /** (byte)0xAA == -86: the INVERSE alternating-bit pattern of 0x55, with bit 7
+     *  (the sign bit) SET.  Together with retBytePattern (0x55, +85) it covers both
+     *  alternating-bit phases at byte width and proves the sign bit decodes, instance
+     *  + static.  A width error reading a stale neighbour byte would change it. */
+    public byte retByteAlt()         { return (byte) 0xAA; }            // -86
+    public static byte sRetByteAlt() { return (byte) 0xAA; }
+    public static byte sRetBytePattern() { return (byte) 0x55; }
+    public static byte sRetByteZero()    { return (byte) 0; }
+    public static byte sRetByteOne()     { return (byte) 1; }
     /** (B)B echo — proves a byte ARGUMENT round-trips through the .i jvalue
      *  slot with its sign intact (-1 stays -1, not 255). */
     public byte echoByte(final byte v)        { lastByteArg = v; return v; }
@@ -119,10 +128,20 @@ public final class MethodPrimitives
     /** (short)0xFF00 == -256: bit 15 set, low byte zero.  A decode that took only
      *  the low 8 bits would read 0; correct sign-extension reads -256. */
     public short retShortHighByte()  { return (short) 0xFF00; }   // -256
+    /** (short)0x5555 == +21845: alternating-bit phase A, bit 15 CLEAR (positive). */
+    public short retShortAltPos()    { return (short) 0x5555; }   // 21845
+    /** (short)0xAAAA == -21846: alternating-bit phase B, bit 15 SET (negative).
+     *  The pair (0x5555/0xAAAA) covers both phases at short width and proves bit 15
+     *  sign-extends; reading only the low byte (0x55/0xAA) could not tell them
+     *  apart from the byte-width values. */
+    public short retShortAltNeg()    { return (short) 0xAAAA; }   // -21846
     public static short sRetShortNegOne() { return (short) -1; }
     public static short sRetShortMax()    { return Short.MAX_VALUE; }
     public static short sRetShortMin()    { return Short.MIN_VALUE; }
     public static short sRetShort255()    { return (short) 0x00FF; }
+    public static short sRetShortZero()   { return (short) 0; }
+    public static short sRetShortHighByte() { return (short) 0xFF00; }
+    public static short sRetShortAltNeg() { return (short) 0xAAAA; }
     /** (S)S echo — proves a short ARGUMENT round-trips with sign intact. */
     public short echoShort(final short v)        { lastShortArg = v; return v; }
     public static short sEchoShort(final short v){ lastShortArg = v; return v; }
@@ -158,10 +177,18 @@ public final class MethodPrimitives
      *  perfectly legal Java `char`; it must round-trip as the unsigned value 55357,
      *  never -10243 (its signed-16 reading) nor 0x3D (a low-byte-only read). */
     public char retCharSurrogate()   { return (char) 0xD83D; }   // 55357
+    /** (char)0x5555 == 21845 and (char)0xAAAA == 43690: the two alternating-bit
+     *  phases at char width.  0xAAAA has bit 15 set, so it doubles as a second
+     *  zero-extension witness (43690, never -21846) with a busy low byte. */
+    public char retCharAltLo()       { return (char) 0x5555; }   // 21845
+    public char retCharAltHi()       { return (char) 0xAAAA; }   // 43690
     public static char sRetCharA()      { return 'A'; }
     public static char sRetCharMax()    { return (char) 0xFFFF; }
     public static char sRetCharHighBit(){ return (char) 0x8000; }
     public static char sRetCharSurrogate(){ return (char) 0xD83D; }
+    public static char sRetCharZero()   { return (char) 0; }
+    public static char sRetCharAltHi()  { return (char) 0xAAAA; }
+    public static char sRetChar255()    { return (char) 0x00FF; }
     /** (C)C echo — proves a char ARGUMENT round-trips across the full unsigned
      *  16-bit range (0xFFFF stays 0xFFFF). */
     public char echoChar(final char v)        { lastCharArg = v; return v; }
@@ -201,6 +228,21 @@ public final class MethodPrimitives
      *  expose such a swap. */
     public int retIntPattern()       { return 0x12345678; }      // 305419896
     public static int sRetIntPattern() { return 0x12345678; }
+    /** 0x55555555 == +1431655765 (bit 31 CLEAR) and 0xAAAAAAAA == -1431655766
+     *  (bit 31 SET): the two alternating-bit phases at int width.  The 0xAA phase
+     *  also pins the sign bit through the 4-byte int return decode; neither value
+     *  is byte-symmetric, so a byte/word swap reorders it. */
+    public int retIntAltPos()        { return 0x55555555; }      // 1431655765
+    public int retIntAltNeg()        { return 0xAAAAAAAA; }      // -1431655766
+    public static int sRetIntZero()    { return 0; }
+    public static int sRetIntNegOne()  { return -1; }
+    public static int sRetIntAltNeg()  { return 0xAAAAAAAA; }
+    /** (I)F — the callee widens the int arg to float (exact for these magnitudes),
+     *  letting the native side feed an int and read back a float RETURN whose value
+     *  it can compare exactly: 16777216 == 2^24 (largest int exactly representable
+     *  as a float, used as an arg) and the constant returners below. */
+    public float intToFloat(final int v)        { return (float) v; }
+    public static float sIntToFloat(final int v){ return (float) v; }
     /** (I)I echo — proves argument passthrough together with the return. */
     public int echoInt(final int v)  { lastEchoArg = v; return v; }
     public static int sEchoInt(final int v) { lastEchoArg = v; return v; }
@@ -272,11 +314,21 @@ public final class MethodPrimitives
      *  64-bit decode keeps it positive.  Complements retLongHighHalf so a high/low
      *  word swap in the return path is caught from both directions. */
     public long retLongLowHalf()     { return 0x00000000FFFFFFFFL; } // 4294967295
+    /** 0x5555555555555555 == +6148914691236517205 (bit 63 CLEAR) and
+     *  0xAAAAAAAAAAAAAAAA == -6148914691236517206 (bit 63 SET): the two
+     *  alternating-bit phases at 64-bit width.  Both halves of each value are busy
+     *  and the two phases are bitwise inverses, so a high/low word swap or a 32-bit
+     *  truncation in the 8-byte return decode changes them. */
+    public long retLongAltPos()      { return 0x5555555555555555L; } // 6148914691236517205
+    public long retLongAltNeg()      { return 0xAAAAAAAAAAAAAAAAL; } // -6148914691236517206
     public static long sRetLongMax()    { return Long.MAX_VALUE; }
     public static long sRetLongMin()    { return Long.MIN_VALUE; }
     public static long sRetLongBig()    { return 0x0123456789ABCDEFL; }
     public static long sRetLongHighHalf() { return 0xFFFFFFFF00000000L; }
     public static long sRetLongLowHalf()  { return 0x00000000FFFFFFFFL; }
+    public static long sRetLongZero()     { return 0L; }
+    public static long sRetLongNegOne()   { return -1L; }
+    public static long sRetLongAltNeg()   { return 0xAAAAAAAAAAAAAAAAL; }
 
     // ----------------------------------------------------------------------
     //  float (F)
@@ -300,11 +352,33 @@ public final class MethodPrimitives
      *  similarly sparse), so a byte-order error in the 4-byte decode would slip
      *  past them — this value reorders into a different float if the words swap. */
     public float retFloatBusyBits(){ return Float.intBitsToFloat(0x12345678); }
+    /** 2.0f — the simplest exact power-of-two above one, distinct from 0.5f/1.0f. */
+    public float retFloatTwo()       { return 2.0f; }
+    /** Float.MIN_NORMAL — the smallest POSITIVE NORMAL float (0x00800000).  Distinct
+     *  from MIN_VALUE (the smallest subnormal, 0x00000001); together they bracket
+     *  the subnormal/normal boundary in the float return decode. */
+    public float retFloatMinNormal() { return Float.MIN_NORMAL; }
+    /** intBitsToFloat(0x55555555) and (0xAAAAAAAA): two finite floats whose 4-byte
+     *  patterns are alternating-bit inverses.  0xAAAAAAAA has bit 31 (the sign)
+     *  set, so it is a finite NEGATIVE float; comparing RAW bits catches a byte
+     *  swap the byte-sparse specials cannot.  (Both are ordinary finite normals,
+     *  so std::isnan/std::isinf are false — checked via raw bits, not value.) */
+    public float retFloatAltLo()     { return Float.intBitsToFloat(0x55555555); }
+    public float retFloatAltHi()     { return Float.intBitsToFloat(0xAAAAAAAA); }
+    /** 2.75f and -2.75f — finite values with a fractional part, exactly
+     *  representable, used to drive the value_t conversion operator's float->int
+     *  static_cast (truncation toward zero: 2.75f -> 2, -2.75f -> -2).  Both are
+     *  well inside int range so the narrowing cast is well-defined (no UB). */
+    public float retFloatTwoPoint75()    { return 2.75f; }
+    public float retFloatNegTwoPoint75() { return -2.75f; }
     public static float sRetFloatHalf()   { return 0.5f; }
     public static float sRetFloatNaN()    { return Float.NaN; }
     public static float sRetFloatPosInf() { return Float.POSITIVE_INFINITY; }
     public static float sRetFloatNegZero(){ return -0.0f; }
     public static float sRetFloatBusyBits(){ return Float.intBitsToFloat(0x12345678); }
+    public static float sRetFloatTwo()       { return 2.0f; }
+    public static float sRetFloatMinNormal() { return Float.MIN_NORMAL; }
+    public static float sRetFloatAltHi()     { return Float.intBitsToFloat(0xAAAAAAAA); }
     /** Static float boundary mirrors of the instance set, so the dedicated
      *  CallStaticFloatMethodA dispatch slot (JNI 137) is exercised across the full
      *  magnitude range — finite one, largest-finite MAX, smallest-positive
@@ -335,11 +409,31 @@ public final class MethodPrimitives
      *  Math.PI already has busy words, but this one's halves are deliberately
      *  asymmetric (no shared nibble run) for a sharper word-swap witness. */
     public double retDoubleBusyBits(){ return Double.longBitsToDouble(0x123456789ABCDEF0L); }
+    /** 2.0 — simplest exact power-of-two above one. */
+    public double retDoubleTwo()     { return 2.0; }
+    /** Double.MIN_NORMAL — smallest POSITIVE NORMAL double (0x0010000000000000),
+     *  distinct from MIN_VALUE (smallest subnormal); brackets the subnormal/normal
+     *  boundary in the 8-byte return decode. */
+    public double retDoubleMinNormal(){ return Double.MIN_NORMAL; }
+    /** longBitsToDouble(0x5555555555555555) and (0xAAAA...): two finite doubles
+     *  whose 8-byte patterns are alternating-bit inverses.  The 0xAA phase has bit
+     *  63 (sign) set (finite negative); RAW-bit comparison catches a high/low word
+     *  swap the byte-sparse specials cannot.  Both are ordinary finite normals. */
+    public double retDoubleAltLo()   { return Double.longBitsToDouble(0x5555555555555555L); }
+    public double retDoubleAltHi()   { return Double.longBitsToDouble(0xAAAAAAAAAAAAAAAAL); }
+    /** 2.75 and -2.75 — finite, exactly representable, drive the value_t
+     *  conversion operator's double->int64 static_cast (truncation toward zero:
+     *  2.75 -> 2, -2.75 -> -2).  Well inside int64 range (no UB). */
+    public double retDoubleTwoPoint75()    { return 2.75; }
+    public double retDoubleNegTwoPoint75() { return -2.75; }
     public static double sRetDoublePi()     { return Math.PI; }
     public static double sRetDoubleNaN()    { return Double.NaN; }
     public static double sRetDoubleNegInf() { return Double.NEGATIVE_INFINITY; }
     public static double sRetDoubleNegZero(){ return -0.0; }
     public static double sRetDoubleBusyBits(){ return Double.longBitsToDouble(0x123456789ABCDEF0L); }
+    public static double sRetDoubleTwo()       { return 2.0; }
+    public static double sRetDoubleMinNormal() { return Double.MIN_NORMAL; }
+    public static double sRetDoubleAltHi()     { return Double.longBitsToDouble(0xAAAAAAAAAAAAAAAAL); }
     /** Static double boundary mirrors of the instance set, so the dedicated
      *  CallStaticDoubleMethodA dispatch slot (JNI 140) is exercised across the full
      *  magnitude range — finite one, largest-finite MAX, smallest-positive

@@ -80,6 +80,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace
 {
@@ -140,6 +141,15 @@ namespace
         auto pick_sig(const char* sig, arg_t&& a) -> std::int32_t
         {
             return get_method("pick", sig)->call(std::forward<arg_t>(a));
+        }
+        auto pick_sig_noarg(const char* sig) -> std::int32_t
+        {
+            return get_method("pick", sig)->call();
+        }
+        template<typename a_t, typename b_t>
+        auto pick2_sig(const char* sig, a_t&& a, b_t&& b) -> std::int32_t
+        {
+            return get_method("pick", sig)->call(std::forward<a_t>(a), std::forward<b_t>(b));
         }
 
         // single-signature method (no ambiguity) + a deliberate non-matching arg.
@@ -285,6 +295,38 @@ namespace
     std::atomic<std::int64_t> g_r_object_registered{ k_unset };
     std::atomic<std::int64_t> g_r_integer_registered{ k_unset };  // pick(Integer) via java/lang/Integer wrapper
 
+    // ── ALTERNATE C++ TYPES that map to the SAME descriptor as a tested type ──
+    // These prove argument_matches_descriptor / the arg packer classify each
+    // C++ type by its TRAITS (sizeof / signedness / is_same_v), not by a single
+    // fixed-width alias.  Each must land on the SAME overload as its sibling.
+    std::atomic<std::int64_t> g_r_cstr{ k_unset };       // const char*      -> pick(String)
+    std::atomic<std::int64_t> g_r_string_view{ k_unset };// std::string_view -> pick(String)
+    std::atomic<std::int64_t> g_r_char16{ k_unset };     // char16_t         -> pick(char)
+    std::atomic<std::int64_t> g_r_uchar{ k_unset };      // unsigned char    -> pick(byte)
+    std::atomic<std::int64_t> g_r_schar{ k_unset };      // signed char      -> pick(byte)
+    std::atomic<std::int64_t> g_r_plainchar{ k_unset };  // (plain) char     -> pick(byte)
+    std::atomic<std::int64_t> g_r_uint16_as_char{ k_unset };  // uint16_t -> pick(char) (NOT short)
+    // value echoes for the alternate-type calls (right value -> right slot)
+    std::atomic<bool>         g_echo_cstr_ok{ false };
+    std::atomic<bool>         g_echo_string_view_ok{ false };
+    std::atomic<std::int64_t> g_echo_char16{ k_unset };
+    std::atomic<std::int64_t> g_echo_uchar{ k_unset };
+    std::atomic<std::int64_t> g_echo_schar{ k_unset };
+
+    // ── char/byte/short boundary round-trips (unsigned char must not sign-ext) ─
+    std::atomic<std::int64_t> g_r_char_zero{ k_unset };   // char 0x0000 -> pick(char)
+    std::atomic<std::int64_t> g_r_char_max{ k_unset };    // char 0xFFFF -> pick(char)
+    std::atomic<std::int64_t> g_echo_char_zero{ k_unset };
+    std::atomic<std::int64_t> g_echo_char_max{ k_unset };
+    std::atomic<std::int64_t> g_r_byte_min{ k_unset };    // INT8_MIN -> pick(byte)
+    std::atomic<std::int64_t> g_r_byte_max{ k_unset };    // INT8_MAX -> pick(byte)
+    std::atomic<std::int64_t> g_echo_byte_min{ k_unset };
+    std::atomic<std::int64_t> g_echo_byte_max{ k_unset };
+    std::atomic<std::int64_t> g_r_short_min{ k_unset };   // INT16_MIN -> pick(short)
+    std::atomic<std::int64_t> g_r_short_max{ k_unset };   // INT16_MAX -> pick(short)
+    std::atomic<std::int64_t> g_echo_short_min{ k_unset };
+    std::atomic<std::int64_t> g_echo_short_max{ k_unset };
+
     // boundary-value re-resolutions (same overload, extreme inputs)
     std::atomic<std::int64_t> g_r_int_min{ k_unset };
     std::atomic<std::int64_t> g_r_int_max{ k_unset };
@@ -326,6 +368,10 @@ namespace
     std::atomic<std::int64_t> g_r_long_double{ k_unset };
     std::atomic<std::int64_t> g_long_double_a{ k_unset };      // echoed long (slot0, 2 slots)
     std::atomic<std::int64_t> g_long_double_b_is_e{ -1 };      // echoed double (slot2) == 2.5 ?
+    // boundary wide-pair: LONG_MIN + a fractional double, both slots must survive
+    std::atomic<std::int64_t> g_r_long_double_boundary{ k_unset };
+    std::atomic<std::int64_t> g_long_double_boundary_a{ k_unset };
+    std::atomic<int>          g_long_double_boundary_b_ok{ -1 };
 
     // explicit-signature fast-path resolution (bypasses hierarchy walk)
     std::atomic<std::int64_t> g_sig_int{ k_unset };
@@ -333,6 +379,30 @@ namespace
     std::atomic<std::int64_t> g_sig_long{ k_unset };
     std::atomic<std::int64_t> g_sig_float{ k_unset };
     std::atomic<std::int64_t> g_sig_string{ k_unset };
+    // explicit-signature fast path across the REST of the descriptor set + the
+    // multi-arg shapes — every pinned sig must reach exactly its overload.
+    std::atomic<std::int64_t> g_sig_bool{ k_unset };
+    std::atomic<std::int64_t> g_sig_byte{ k_unset };
+    std::atomic<std::int64_t> g_sig_short{ k_unset };
+    std::atomic<std::int64_t> g_sig_char{ k_unset };
+    std::atomic<std::int64_t> g_sig_noarg{ k_unset };
+    std::atomic<std::int64_t> g_sig_object{ k_unset };
+    std::atomic<std::int64_t> g_sig_integer{ k_unset };
+    std::atomic<std::int64_t> g_sig_int_int{ k_unset };
+    std::atomic<std::int64_t> g_sig_int_int_int{ k_unset };
+    std::atomic<std::int64_t> g_sig_int_long{ k_unset };
+    std::atomic<std::int64_t> g_sig_long_int{ k_unset };
+    std::atomic<std::int64_t> g_sig_int_string{ k_unset };
+    std::atomic<std::int64_t> g_sig_string_int{ k_unset };
+    std::atomic<std::int64_t> g_sig_long_double{ k_unset };
+
+    // ── signature_pinned: an EXPLICIT sig must NOT be re-picked from the C++
+    //    arg type (resolve_compatible_method bails on signature_pinned).  Pin
+    //    (D)I but pass a C++ int: the pinned (D)I overload must STILL run
+    //    (RET_DOUBLE), proving the arg type does not override the pinned sig.
+    std::atomic<std::int64_t> g_pinned_double_with_int_arg{ k_unset };
+    std::atomic<std::int64_t> g_pinned_long_with_int_arg{ k_unset };
+    std::atomic<std::int64_t> g_pinned_string_with_object_arg{ k_unset };
 
     // single-signature method + non-matching-arg fallback
     std::atomic<std::int64_t> g_only_int_match{ k_unset };
@@ -363,6 +433,21 @@ namespace
     std::atomic<std::int64_t> g_s_sig_int{ k_unset };
     std::atomic<std::int64_t> g_s_sig_double{ k_unset };
     std::atomic<std::int64_t> g_s_sig_string{ k_unset };
+    // the REST of the static explicit-sig descriptor set + a static 2-arg sig.
+    std::atomic<std::int64_t> g_s_sig_long{ k_unset };
+    std::atomic<std::int64_t> g_s_sig_float{ k_unset };
+    std::atomic<std::int64_t> g_s_sig_bool{ k_unset };
+    std::atomic<std::int64_t> g_s_sig_byte{ k_unset };
+    std::atomic<std::int64_t> g_s_sig_short{ k_unset };
+    std::atomic<std::int64_t> g_s_sig_char{ k_unset };
+    std::atomic<std::int64_t> g_s_sig_int_int{ k_unset };
+    std::atomic<std::int64_t> g_s_sig_long_double{ k_unset };
+    // static name-only resolutions for the alternate C++ types (mirror instance).
+    std::atomic<std::int64_t> g_s_cstr{ k_unset };       // const char*   -> spick(String)
+    std::atomic<std::int64_t> g_s_char16{ k_unset };     // char16_t      -> spick(char)
+    std::atomic<std::int64_t> g_s_uchar{ k_unset };      // unsigned char -> spick(byte)
+    // static boundary re-resolutions
+    std::atomic<std::int64_t> g_s_long_double_boundary{ k_unset };  // spick(LONG_MIN, frac) -> (JD)I+SBIAS
 
     // ── ARRAY-vs-scalar resolution ─────────────────────────────────────────
     // Scalar resolution must be UNPERTURBED by the presence of array overloads
@@ -429,6 +514,52 @@ namespace
         g_echo_char.store(overload_fixture::last_char());
         g_echo_string_ok.store(overload_fixture::last_string() == std::string{ "hello" });
 
+        // ===== ALTERNATE C++ TYPES -> SAME descriptor as a tested sibling =====
+        // The matcher/arg-packer classify by TRAITS, not by a fixed-width alias,
+        // so every one of these distinct C++ types must land on the SAME overload
+        // as its sibling above.  Each echo is read IMMEDIATELY (shared slots).
+        //
+        // const char* (string literal) -> Ljava/lang/String; -> pick(String).
+        g_r_cstr.store(s.pick(static_cast<const char*>("cstr")));
+        g_echo_cstr_ok.store(overload_fixture::last_string() == std::string{ "cstr" });
+        // std::string_view -> Ljava/lang/String; -> pick(String).
+        g_r_string_view.store(s.pick(std::string_view{ "sview" }));
+        g_echo_string_view_ok.store(overload_fixture::last_string() == std::string{ "sview" });
+        // char16_t -> C -> pick(char) (Java char is an unsigned 16-bit UTF-16 unit).
+        g_r_char16.store(s.pick(static_cast<char16_t>(0x0041)));  // 'A'
+        g_echo_char16.store(overload_fixture::last_char());
+        // unsigned char -> B (sizeof 1, integral) -> pick(byte).  -2 stored as a
+        // byte must round-trip as the SIGNED Java byte value -2 (0xFE).
+        g_r_uchar.store(s.pick(static_cast<unsigned char>(0xFE)));
+        g_echo_uchar.store(overload_fixture::last_byte());
+        // signed char -> B -> pick(byte).
+        g_r_schar.store(s.pick(static_cast<signed char>(-3)));
+        g_echo_schar.store(overload_fixture::last_byte());
+        // plain char -> B (integral, sizeof 1) -> pick(byte) (NOT pick(char): Java
+        // char is uint16 'C'; a 1-byte C++ char is a Java BYTE).
+        g_r_plainchar.store(s.pick(static_cast<char>(7)));
+        // uint16_t -> C, NOT S — re-prove with a value whose low bits would also
+        // satisfy a short slot, to show the matcher refuses the 'S' descriptor.
+        g_r_uint16_as_char.store(s.pick(static_cast<std::uint16_t>(0x00FF)));
+
+        // ===== char / byte / short BOUNDARY round-trips =======================
+        // char 0x0000 and 0xFFFF must both resolve to pick(char) and round-trip
+        // UNSIGNED (0xFFFF == 65535, never -1).
+        g_r_char_zero.store(s.pick(static_cast<std::uint16_t>(0x0000)));
+        g_echo_char_zero.store(overload_fixture::last_char());
+        g_r_char_max.store(s.pick(static_cast<std::uint16_t>(0xFFFF)));
+        g_echo_char_max.store(overload_fixture::last_char());
+        // byte INT8_MIN / INT8_MAX must resolve to pick(byte) and echo exactly.
+        g_r_byte_min.store(s.pick(std::numeric_limits<std::int8_t>::min()));
+        g_echo_byte_min.store(overload_fixture::last_byte());
+        g_r_byte_max.store(s.pick(std::numeric_limits<std::int8_t>::max()));
+        g_echo_byte_max.store(overload_fixture::last_byte());
+        // short INT16_MIN / INT16_MAX must resolve to pick(short) and echo exactly.
+        g_r_short_min.store(s.pick(std::numeric_limits<std::int16_t>::min()));
+        g_echo_short_min.store(overload_fixture::last_short());
+        g_r_short_max.store(s.pick(std::numeric_limits<std::int16_t>::max()));
+        g_echo_short_max.store(overload_fixture::last_short());
+
         // ===== boundary values still resolve to the same overload ==========
         g_r_int_min.store(s.pick(std::numeric_limits<std::int32_t>::min()));
         g_r_int_max.store(s.pick(std::numeric_limits<std::int32_t>::max()));
@@ -471,6 +602,11 @@ namespace
         g_r_long_double.store(s.pick2(static_cast<std::int64_t>(123456789012345LL), 2.5));
         g_long_double_a.store(overload_fixture::last_arg2b());
         g_long_double_b_is_e.store(overload_fixture::last_double() == 2.5 ? 1 : 0);
+        // boundary wide-pair: LONG_MIN (extreme 64-bit) + a fractional double.
+        // Both two-slot params must survive unperturbed at the 64-bit edge.
+        g_r_long_double_boundary.store(s.pick2(std::numeric_limits<std::int64_t>::min(), 0.125));
+        g_long_double_boundary_a.store(overload_fixture::last_arg2b());
+        g_long_double_boundary_b_ok.store(overload_fixture::last_double() == 0.125 ? 1 : 0);
 
         // ===== explicit-signature fast path (no hierarchy walk) ============
         // get_method("pick","(I)I") -> signature_text already matches int args,
@@ -481,6 +617,44 @@ namespace
         g_sig_long.store(s.pick_sig("(J)I", static_cast<std::int64_t>(3)));
         g_sig_float.store(s.pick_sig("(F)I", 4.5f));
         g_sig_string.store(s.pick_sig("(Ljava/lang/String;)I", std::string{ "sig" }));
+        // the REST of the single-arg descriptor set via the pinned-sig path.
+        g_sig_bool.store(s.pick_sig("(Z)I", true));
+        g_sig_byte.store(s.pick_sig("(B)I", static_cast<std::int8_t>(2)));
+        g_sig_short.store(s.pick_sig("(S)I", static_cast<std::int16_t>(3)));
+        g_sig_char.store(s.pick_sig("(C)I", static_cast<std::uint16_t>(4)));
+        g_sig_noarg.store(s.pick_sig_noarg("()I"));
+        // pinned reference sigs: the carried oop is harmless (bodies ignore it).
+        g_sig_object.store(s.pick_sig("(Ljava/lang/Object;)I",
+                                      std::make_unique<java_object>(s.get_instance())));
+        g_sig_integer.store(s.pick_sig("(Ljava/lang/Integer;)I",
+                                       std::make_unique<java_integer>(s.get_instance())));
+        // multi-arg pinned sigs — each must reach exactly its overload.
+        g_sig_int_int.store(s.pick2_sig("(II)I",
+                                        static_cast<std::int32_t>(1), static_cast<std::int32_t>(2)));
+        g_sig_int_long.store(s.pick2_sig("(IJ)I",
+                                         static_cast<std::int32_t>(1), static_cast<std::int64_t>(2)));
+        g_sig_long_int.store(s.pick2_sig("(JI)I",
+                                         static_cast<std::int64_t>(1), static_cast<std::int32_t>(2)));
+        g_sig_int_string.store(s.pick2_sig("(ILjava/lang/String;)I",
+                                           static_cast<std::int32_t>(1), std::string{ "x" }));
+        g_sig_string_int.store(s.pick2_sig("(Ljava/lang/String;I)I",
+                                           std::string{ "y" }, static_cast<std::int32_t>(2)));
+        g_sig_long_double.store(s.pick2_sig("(JD)I",
+                                            static_cast<std::int64_t>(1), 2.0));
+        // 3-arg pinned sig.
+        g_sig_int_int_int.store(s.get_method("pick", "(III)I")->call(
+            static_cast<std::int32_t>(1), static_cast<std::int32_t>(2), static_cast<std::int32_t>(3)));
+
+        // ===== signature_pinned: the arg TYPE must NOT override a pinned sig ===
+        // resolve_compatible_method() returns this->method verbatim when the
+        // proxy was created from an EXPLICIT signature.  Pin (D)I but pass a C++
+        // int -> the (D)I overload (RET_DOUBLE), NOT (I)I, must dispatch.  Same
+        // for (J)I with an int arg.  And a String-typed pinned sig given an oop
+        // (Object wrapper) must still dispatch (String)I, not (Object)I.
+        g_pinned_double_with_int_arg.store(s.pick_sig("(D)I", static_cast<std::int32_t>(9)));
+        g_pinned_long_with_int_arg.store(s.pick_sig("(J)I", static_cast<std::int32_t>(9)));
+        g_pinned_string_with_object_arg.store(s.pick_sig("(Ljava/lang/String;)I",
+                                              std::make_unique<java_object>(s.get_instance())));
 
         // ===== single-signature method: matching + non-matching arg ========
         g_only_int_match.store(s.only_int(11));               // (I)I match -> 7011
@@ -556,11 +730,32 @@ namespace
         // single-arg spick(int).
         g_s_arity2.store(overload_fixture::static_method("spick")->call(
             static_cast<std::int32_t>(30), static_cast<std::int32_t>(40)));
+        // STATIC ALTERNATE C++ TYPES by name — the static resolver must classify
+        // by traits exactly as the instance resolver does (regression mirror of
+        // the alternate-type instance block).  Resolution-only (no re-echo, to
+        // avoid clobbering the echoes captured above).
+        g_s_cstr.store(overload_fixture::static_method("spick")->call(static_cast<const char*>("cs")));
+        g_s_char16.store(overload_fixture::static_method("spick")->call(static_cast<char16_t>(0x0042)));
+        g_s_uchar.store(overload_fixture::static_method("spick")->call(static_cast<unsigned char>(0x10)));
+        // STATIC boundary wide-pair: spick(LONG_MIN, frac) -> (JD)I + SBIAS.
+        g_s_long_double_boundary.store(overload_fixture::static_method("spick")->call(
+            std::numeric_limits<std::int64_t>::min(), 0.25));
 
         // explicit-signature static path: bypasses resolution -> MUST be exact.
         g_s_sig_int.store(overload_fixture::static_method("spick", "(I)I")->call(static_cast<std::int32_t>(1)));
         g_s_sig_double.store(overload_fixture::static_method("spick", "(D)I")->call(3.14));
         g_s_sig_string.store(overload_fixture::static_method("spick", "(Ljava/lang/String;)I")->call(std::string{ "s" }));
+        // the REST of the static explicit-sig descriptor set + a static 2-arg sig.
+        g_s_sig_long.store(overload_fixture::static_method("spick", "(J)I")->call(static_cast<std::int64_t>(5)));
+        g_s_sig_float.store(overload_fixture::static_method("spick", "(F)I")->call(6.5f));
+        g_s_sig_bool.store(overload_fixture::static_method("spick", "(Z)I")->call(true));
+        g_s_sig_byte.store(overload_fixture::static_method("spick", "(B)I")->call(static_cast<std::int8_t>(7)));
+        g_s_sig_short.store(overload_fixture::static_method("spick", "(S)I")->call(static_cast<std::int16_t>(8)));
+        g_s_sig_char.store(overload_fixture::static_method("spick", "(C)I")->call(static_cast<std::uint16_t>(9)));
+        g_s_sig_int_int.store(overload_fixture::static_method("spick", "(II)I")->call(
+            static_cast<std::int32_t>(1), static_cast<std::int32_t>(2)));
+        g_s_sig_long_double.store(overload_fixture::static_method("spick", "(JD)I")->call(
+            static_cast<std::int64_t>(1), 2.0));
 
         // ===== ARRAY-vs-scalar resolution ==================================
         // (1) The mere PRESENCE of pick(int[]) / pick(long[]) in the methods array
@@ -707,6 +902,40 @@ namespace
                   && g_r_double.load() != g_r_float.load()
                   && g_r_int.load() != g_r_float.load());
 
+        // The full narrow-integral set (byte/short/char/int/long) must land on
+        // FIVE mutually-distinct overloads — NO implicit widening collapse (a
+        // byte/short/char must NEVER fall through to the wider int/long overload;
+        // argument_matches_descriptor demands an EXACT descriptor letter).
+        ctx.check("mo_byte_short_char_int_long_no_widening_collapse",
+                  g_r_byte.load()  != g_r_short.load()
+                  && g_r_short.load() != g_r_char.load()
+                  && g_r_char.load()  != g_r_int.load()
+                  && g_r_int.load()   != g_r_long.load()
+                  && g_r_byte.load()  != g_r_int.load()
+                  && g_r_short.load() != g_r_int.load());
+
+        // =====================================================================
+        //  ALTERNATE C++ TYPES classify by TRAITS (sizeof / signedness /
+        //  is_same_v), not by a fixed-width alias — each lands on the SAME
+        //  overload as its sibling.  Distinct C++ types, identical descriptor.
+        // =====================================================================
+        // String family: const char* and std::string_view both -> pick(String).
+        ctx.check("mo_cstr_resolves_to_string_overload",        g_r_cstr.load()        == RET_STRING);
+        ctx.check("mo_string_view_resolves_to_string_overload", g_r_string_view.load() == RET_STRING);
+        ctx.check("mo_cstr_arg_value_echoed",        g_echo_cstr_ok.load());
+        ctx.check("mo_string_view_arg_value_echoed", g_echo_string_view_ok.load());
+        // char16_t and uint16_t both -> pick(char) (Java char is unsigned 16-bit).
+        ctx.check("mo_char16_resolves_to_char_overload",     g_r_char16.load()        == RET_CHAR);
+        ctx.check("mo_uint16_resolves_to_char_not_short",    g_r_uint16_as_char.load() == RET_CHAR);
+        ctx.check("mo_char16_arg_value_echoed",              g_echo_char16.load()     == 0x0041);
+        // unsigned char / signed char / plain char all -> pick(byte) (sizeof 1).
+        ctx.check("mo_unsigned_char_resolves_to_byte_overload", g_r_uchar.load()     == RET_BYTE);
+        ctx.check("mo_signed_char_resolves_to_byte_overload",   g_r_schar.load()     == RET_BYTE);
+        ctx.check("mo_plain_char_resolves_to_byte_overload",    g_r_plainchar.load() == RET_BYTE);
+        // unsigned char 0xFE stored in a Java byte slot is the SIGNED value -2.
+        ctx.check("mo_unsigned_char_arg_value_echoed", g_echo_uchar.load() == -2);
+        ctx.check("mo_signed_char_arg_value_echoed",   g_echo_schar.load() == -3);
+
         // =====================================================================
         //  Argument-VALUE fidelity: the right value reached the right slot.
         // =====================================================================
@@ -732,6 +961,22 @@ namespace
         // 3.0f is a float in C++ — must NOT collapse to the int overload.
         ctx.check("mo_whole_float_resolves_float_not_int",
                   g_r_float_whole.load() == RET_FLOAT);
+        // char boundary: 0x0000 and 0xFFFF both resolve to pick(char) and the
+        // 16-bit value round-trips UNSIGNED (0xFFFF -> 65535, never -1).
+        ctx.check("mo_char_zero_resolves_char",  g_r_char_zero.load() == RET_CHAR);
+        ctx.check("mo_char_max_resolves_char",   g_r_char_max.load()  == RET_CHAR);
+        ctx.check("mo_char_zero_value_echoed",   g_echo_char_zero.load() == 0x0000);
+        ctx.check("mo_char_max_value_echoed",    g_echo_char_max.load()  == 0xFFFF);
+        // byte boundary: INT8_MIN / INT8_MAX resolve to pick(byte) + echo exactly.
+        ctx.check("mo_byte_min_resolves_byte",   g_r_byte_min.load() == RET_BYTE);
+        ctx.check("mo_byte_max_resolves_byte",   g_r_byte_max.load() == RET_BYTE);
+        ctx.check("mo_byte_min_value_echoed",    g_echo_byte_min.load() == -128);
+        ctx.check("mo_byte_max_value_echoed",    g_echo_byte_max.load() == 127);
+        // short boundary: INT16_MIN / INT16_MAX resolve to pick(short) + echo.
+        ctx.check("mo_short_min_resolves_short", g_r_short_min.load() == RET_SHORT);
+        ctx.check("mo_short_max_resolves_short", g_r_short_max.load() == RET_SHORT);
+        ctx.check("mo_short_min_value_echoed",   g_echo_short_min.load() == -32768);
+        ctx.check("mo_short_max_value_echoed",   g_echo_short_max.load() == 32767);
 
         // =====================================================================
         //  ARITY-based resolution: pick() / pick(i) / pick(i,i) / pick(i,i,i).
@@ -778,6 +1023,15 @@ namespace
         // double(slot2)=2.5 (proves the two wide args did not overlap or truncate).
         ctx.check("mo_long_double_arg_slots",
                   g_long_double_a.load() == 123456789012345LL && g_long_double_b_is_e.load() == 1);
+        // boundary wide-pair: LONG_MIN + 0.125 — the (JD)I overload is still
+        // selected at the 64-bit edge, and BOTH slots survive (long == LONG_MIN,
+        // double == 0.125), proving the two wide params do not overlap/truncate
+        // even when the long is the most-negative representable value.
+        ctx.check("mo_long_double_boundary_resolves_long_double",
+                  g_r_long_double_boundary.load() == RET_LONG_DOUBLE);
+        ctx.check("mo_long_double_boundary_arg_slots",
+                  g_long_double_boundary_a.load() == std::numeric_limits<std::int64_t>::min()
+                  && g_long_double_boundary_b_ok.load() == 1);
 
         // =====================================================================
         //  Explicit-signature fast path resolves identically to name-only.
@@ -787,11 +1041,63 @@ namespace
         ctx.check("mo_sig_long_resolves_long",      g_sig_long.load()   == RET_LONG);
         ctx.check("mo_sig_float_resolves_float",    g_sig_float.load()  == RET_FLOAT);
         ctx.check("mo_sig_string_resolves_string",  g_sig_string.load() == RET_STRING);
-        // fast path and name-only path must agree on the same overload.
+        // the REST of the single-arg descriptor set via the pinned-sig path —
+        // every descriptor letter (Z B S C) + the no-arg () sig reaches exactly
+        // its overload (RESOLUTION via the signature_text fast path).
+        ctx.check("mo_sig_bool_resolves_boolean",  g_sig_bool.load()  == RET_BOOLEAN);
+        ctx.check("mo_sig_byte_resolves_byte",     g_sig_byte.load()  == RET_BYTE);
+        ctx.check("mo_sig_short_resolves_short",   g_sig_short.load() == RET_SHORT);
+        ctx.check("mo_sig_char_resolves_char",     g_sig_char.load()  == RET_CHAR);
+        ctx.check("mo_sig_noarg_resolves_noarg",   g_sig_noarg.load() == RET_NOARG);
+        // pinned reference sigs reach exactly Object / Integer.
+        ctx.check("mo_sig_object_resolves_object",   g_sig_object.load()  == RET_OBJECT);
+        ctx.check("mo_sig_integer_resolves_integer", g_sig_integer.load() == RET_INTEGER);
+        // multi-arg pinned sigs reach exactly their overload (incl. order-sensitive
+        // (IJ) vs (JI) and (ILstr) vs (Lstr;I), the 3-arg (III), and the (JD) pair).
+        ctx.check("mo_sig_int_int_resolves_int_int",         g_sig_int_int.load()     == RET_INT_INT);
+        ctx.check("mo_sig_int_int_int_resolves_int_int_int", g_sig_int_int_int.load() == RET_INT_INT_INT);
+        ctx.check("mo_sig_int_long_resolves_int_long",       g_sig_int_long.load()    == RET_INT_LONG);
+        ctx.check("mo_sig_long_int_resolves_long_int",       g_sig_long_int.load()    == RET_LONG_INT);
+        ctx.check("mo_sig_int_string_resolves_int_string",   g_sig_int_string.load()  == RET_INT_STRING);
+        ctx.check("mo_sig_string_int_resolves_string_int",   g_sig_string_int.load()  == RET_STRING_INT);
+        ctx.check("mo_sig_long_double_resolves_long_double", g_sig_long_double.load() == RET_LONG_DOUBLE);
+        ctx.check("mo_sig_int_long_vs_long_int_distinct",
+                  g_sig_int_long.load() != g_sig_long_int.load());
+        // fast path and name-only path must agree on the SAME overload — extended
+        // across the full single-arg descriptor set, not just int/double.
         ctx.check("mo_sig_path_agrees_with_nameonly_int",
                   g_sig_int.load() == g_r_int.load());
         ctx.check("mo_sig_path_agrees_with_nameonly_double",
                   g_sig_double.load() == g_r_double.load());
+        ctx.check("mo_sig_path_agrees_with_nameonly_long",
+                  g_sig_long.load() == g_r_long.load());
+        ctx.check("mo_sig_path_agrees_with_nameonly_float",
+                  g_sig_float.load() == g_r_float.load());
+        ctx.check("mo_sig_path_agrees_with_nameonly_bool",
+                  g_sig_bool.load() == g_r_bool.load());
+        ctx.check("mo_sig_path_agrees_with_nameonly_byte",
+                  g_sig_byte.load() == g_r_byte.load());
+        ctx.check("mo_sig_path_agrees_with_nameonly_short",
+                  g_sig_short.load() == g_r_short.load());
+        ctx.check("mo_sig_path_agrees_with_nameonly_char",
+                  g_sig_char.load() == g_r_char.load());
+        ctx.check("mo_sig_path_agrees_with_nameonly_string",
+                  g_sig_string.load() == g_r_string.load());
+
+        // =====================================================================
+        //  signature_pinned: an EXPLICIT sig is dispatched VERBATIM — the C++ arg
+        //  type must NOT re-pick a different overload (resolve_compatible_method
+        //  bails on signature_pinned).  Pin (D)I but pass a C++ int -> (D)I still
+        //  runs (RET_DOUBLE), NOT (I)I.  This is the guard that an explicit
+        //  combo(CharSequence) request is never silently turned into combo(String)
+        //  by an incidental arg type.
+        // =====================================================================
+        ctx.check("mo_pinned_double_sig_not_repicked_by_int_arg",
+                  g_pinned_double_with_int_arg.load() == RET_DOUBLE);
+        ctx.check("mo_pinned_long_sig_not_repicked_by_int_arg",
+                  g_pinned_long_with_int_arg.load() == RET_LONG);
+        ctx.check("mo_pinned_string_sig_not_repicked_by_object_arg",
+                  g_pinned_string_with_object_arg.load() == RET_STRING);
 
         // =====================================================================
         //  Single-signature method: matching arg resolves; non-matching arg
@@ -898,6 +1204,48 @@ namespace
                   g_s_double.load() == g_s_sig_double.load());
         ctx.check("mo_static_nameonly_agrees_with_sig_string",
                   g_s_string.load() == g_s_sig_string.load());
+
+        // STATIC explicit-signature path across the REST of the descriptor set +
+        // a static 2-arg sig.  This path BYPASSES resolution (signature_pinned),
+        // so it proves the static methods EXIST and dispatch on this JDK for every
+        // descriptor letter — independent of the (fixed) static-resolution bug.
+        ctx.check("mo_static_sig_long_exact",   g_s_sig_long.load()   == RET_LONG + SBIAS);
+        ctx.check("mo_static_sig_float_exact",  g_s_sig_float.load()  == RET_FLOAT + SBIAS);
+        ctx.check("mo_static_sig_bool_exact",   g_s_sig_bool.load()   == RET_BOOLEAN + SBIAS);
+        ctx.check("mo_static_sig_byte_exact",   g_s_sig_byte.load()   == RET_BYTE + SBIAS);
+        ctx.check("mo_static_sig_short_exact",  g_s_sig_short.load()  == RET_SHORT + SBIAS);
+        ctx.check("mo_static_sig_char_exact",   g_s_sig_char.load()   == RET_CHAR + SBIAS);
+        ctx.check("mo_static_sig_int_int_exact", g_s_sig_int_int.load() == RET_INT_INT + SBIAS);
+        ctx.check("mo_static_sig_long_double_exact",
+                  g_s_sig_long_double.load() == RET_LONG_DOUBLE + SBIAS);
+        // STATIC name-only agreement across the extended set (each name-only static
+        // resolution lands on the SAME overload as its explicit-sig twin).
+        ctx.check("mo_static_nameonly_agrees_with_sig_long",
+                  g_s_long.load() == g_s_sig_long.load());
+        ctx.check("mo_static_nameonly_agrees_with_sig_float",
+                  g_s_float.load() == g_s_sig_float.load());
+        ctx.check("mo_static_nameonly_agrees_with_sig_bool",
+                  g_s_bool.load() == g_s_sig_bool.load());
+        ctx.check("mo_static_nameonly_agrees_with_sig_byte",
+                  g_s_byte.load() == g_s_sig_byte.load());
+        ctx.check("mo_static_nameonly_agrees_with_sig_short",
+                  g_s_short.load() == g_s_sig_short.load());
+        ctx.check("mo_static_nameonly_agrees_with_sig_char",
+                  g_s_char.load() == g_s_sig_char.load());
+        ctx.check("mo_static_nameonly_agrees_with_sig_int_int",
+                  g_s_arity2.load() == g_s_sig_int_int.load());
+        ctx.check("mo_static_nameonly_agrees_with_sig_long_double",
+                  g_s_long_double.load() == g_s_sig_long_double.load());
+
+        // STATIC ALTERNATE C++ TYPES by name — the static resolver classifies by
+        // traits just like the instance one: const char* -> spick(String),
+        // char16_t -> spick(char), unsigned char -> spick(byte).
+        ctx.check("mo_static_cstr_resolves_string",   g_s_cstr.load()   == RET_STRING + SBIAS);
+        ctx.check("mo_static_char16_resolves_char",   g_s_char16.load() == RET_CHAR + SBIAS);
+        ctx.check("mo_static_uchar_resolves_byte",    g_s_uchar.load()  == RET_BYTE + SBIAS);
+        // STATIC boundary wide-pair: spick(LONG_MIN, 0.25) -> (JD)I + SBIAS.
+        ctx.check("mo_static_long_double_boundary_resolves_long_double",
+                  g_s_long_double_boundary.load() == RET_LONG_DOUBLE + SBIAS);
 
         // =====================================================================
         //  ARRAY-vs-scalar resolution.

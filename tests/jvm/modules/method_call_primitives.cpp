@@ -72,6 +72,9 @@ namespace
         auto call_float(const char* n) -> float      { return get_method(n)->call(); }
         auto call_double(const char* n) -> double    { return get_method(n)->call(); }
         auto call_int_arg(const char* n, std::int32_t a) -> std::int32_t { return get_method(n)->call(a); }
+        // (I)F: feed an int arg, read back a float RETURN (exact for the magnitudes
+        // used) — proves an int ARG and a float RETURN coexist in one dispatch.
+        auto call_int_to_float(const char* n, std::int32_t a) -> float { return get_method(n)->call(a); }
 
         // -- narrow-primitive ARGUMENT echoes (instance) --
         // Each passes the EXACT-width C++ type so detail::convert_jni_arg packs it
@@ -114,7 +117,20 @@ namespace
         // operator target_type()'s static_cast leg directly (int->int64 widen,
         // byte->int64 sign-extend, char->int64 zero-extend, int->bool truncation).
         auto ret_as_i64(const char* n) -> std::int64_t { return get_method(n)->call(); }
+        auto ret_as_i32(const char* n) -> std::int32_t { return get_method(n)->call(); }
         auto ret_as_bool(const char* n) -> bool        { return get_method(n)->call(); }
+        // Cross-KIND conversion on a RETURN value_t: a floating-point return read
+        // into an INTEGER target exercises operator target_type()'s static_cast leg
+        // float->int / double->int64 (truncation toward zero); an integral return
+        // read into a FLOAT target exercises int32->float / int64->double widening.
+        auto ret_float_as_i32(const char* n) -> std::int32_t { return get_method(n)->call(); }
+        auto ret_double_as_i64(const char* n) -> std::int64_t { return get_method(n)->call(); }
+        auto ret_int_as_float(const char* n) -> float  { return get_method(n)->call(); }
+        auto ret_long_as_double(const char* n) -> double { return get_method(n)->call(); }
+        auto ret_long_as_bool(const char* n) -> bool   { return get_method(n)->call(); }
+        // (S)->wider-int RETURN widen: a short return read into a 32-bit int proves
+        // the int16 alternative sign-extends (-1 -> -1, 0xAAAA -> -21846).
+        auto short_ret_as_int(const char* n) -> std::int32_t { return get_method(n)->call(); }
 
         // value_t introspection probes (instance)
         auto is_void(const char* n) -> bool   { return get_method(n)->call().is_void(); }
@@ -130,6 +146,7 @@ namespace
         static auto scall_float(const char* n) -> float      { return static_method(n)->call(); }
         static auto scall_double(const char* n) -> double    { return static_method(n)->call(); }
         static auto scall_int_arg(const char* n, std::int32_t a) -> std::int32_t { return static_method(n)->call(a); }
+        static auto scall_int_to_float(const char* n, std::int32_t a) -> float { return static_method(n)->call(a); }
         static auto svoid(const char* n) -> bool { return static_method(n)->call().is_void(); }
 
         // -- narrow-primitive ARGUMENT echoes (static; CallStatic<T>MethodA) --
@@ -243,6 +260,12 @@ namespace
     std::atomic<std::int64_t> g_byte_min_stat{ k_uncaptured };
     // byte sign-extension when read into a wider int
     std::atomic<std::int64_t> g_byte_negone_as_int{ k_uncaptured };
+    // byte alternating-bit phase 0xAA -> -86 (sign bit set), instance + static.
+    std::atomic<std::int64_t> g_byte_alt{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_alt_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_zero_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_one_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_pattern_stat{ k_uncaptured };
 
     // short
     std::atomic<std::int64_t> g_short_zero{ k_uncaptured };
@@ -255,6 +278,18 @@ namespace
     std::atomic<std::int64_t> g_short_max_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_short_min_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_short_255_stat{ k_uncaptured };
+    // short alternating-bit phases: 0x5555 -> +21845, 0xAAAA -> -21846.
+    std::atomic<std::int64_t> g_short_altpos{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_altneg{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_altneg_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_zero_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_highbyte_stat{ k_uncaptured };
+    // short RETURN read into a wider int — proves the int16 alternative
+    // sign-extends (negone -> -1, 0xAAAA -> -21846), the short twin of the
+    // byte/char widen-into-int return probes.
+    std::atomic<std::int64_t> g_short_negone_as_int{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_altneg_as_int{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_min_as_int{ k_uncaptured };
 
     // char  (UNSIGNED)
     std::atomic<std::int64_t> g_char_zero{ k_uncaptured };
@@ -267,6 +302,14 @@ namespace
     std::atomic<std::int64_t> g_char_highbit_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_char_surrogate{ k_uncaptured };       // 0xD83D -> 55357
     std::atomic<std::int64_t> g_char_surrogate_stat{ k_uncaptured };
+    // char alternating-bit phases: 0x5555 -> 21845, 0xAAAA -> 43690 (bit 15 set).
+    std::atomic<std::int64_t> g_char_altlo{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_althi{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_althi_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_zero_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_255_stat{ k_uncaptured };
+    // char 0xAAAA read into an int must be 43690 (zero-extend), never -21846.
+    std::atomic<std::int64_t> g_char_althi_as_int{ k_uncaptured };
     // char must NOT sign-extend: 0xFFFF read into an int stays 65535
     std::atomic<std::int64_t> g_char_max_as_int{ k_uncaptured };
     // char bit-15-only (0x8000) read into an int must be 32768, never -32768
@@ -287,9 +330,18 @@ namespace
     std::atomic<std::int64_t> g_int_pattern_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_int_echo_inst{ k_uncaptured };
     std::atomic<std::int64_t> g_int_echo_stat{ k_uncaptured };
+    // int alternating-bit phases: 0x55555555 -> +1431655765, 0xAAAAAAAA -> -1431655766.
+    std::atomic<std::int64_t> g_int_altpos{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_altneg{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_altneg_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_zero_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_negone_stat{ k_uncaptured };
     // int ARG byte-order witness (echoed-back distinct-byte pattern)
     std::atomic<std::int64_t> g_arg_int_pattern_echo_inst{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_int_pattern_echo_stat{ k_uncaptured };
+    // int ARG alternating-bit echoes over (I)I (no witness clobber).
+    std::atomic<std::int64_t> g_arg_int_echo_altpos{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_int_echo_altneg{ k_uncaptured };
 
     // ---- narrow-primitive ARGUMENT round-trips (echo / widen / arithmetic) ----
     // boolean arg (Z): echo true/false + logical NOT, instance + static.
@@ -307,6 +359,9 @@ namespace
     std::atomic<std::int64_t> g_arg_byte_widen_min{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_byte_echo_min_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_byte_widen_negone_stat{ k_uncaptured };
+    // byte arg alternating-bit widen: 0xAA -> -86 (sign), 0x55 -> +85.
+    std::atomic<std::int64_t> g_arg_byte_widen_alt{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_byte_widen_pattern{ k_uncaptured };
     // short arg (S).
     std::atomic<std::int64_t> g_arg_short_echo_min{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_short_echo_max{ k_uncaptured };
@@ -315,6 +370,9 @@ namespace
     std::atomic<std::int64_t> g_arg_short_echo_max_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_short_widen_negone_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_short_widen_pos255_stat{ k_uncaptured };
+    // short arg alternating-bit widen: 0xAAAA -> -21846 (sign), 0x5555 -> +21845.
+    std::atomic<std::int64_t> g_arg_short_widen_altneg{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_short_widen_altpos{ k_uncaptured };
     // char arg (C): echo full unsigned range + widen-to-int (zero-extension proof).
     std::atomic<std::int64_t> g_arg_char_echo_zero{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_char_echo_a{ k_uncaptured };
@@ -326,6 +384,9 @@ namespace
     std::atomic<std::int64_t> g_arg_char_widen_max_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_char_widen_highbit_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_char_widen_surrogate_stat{ k_uncaptured };
+    // char arg alternating-bit widen: 0xAAAA -> 43690 (zero-ext), 0x5555 -> 21845.
+    std::atomic<std::int64_t> g_arg_char_widen_althi{ k_uncaptured };
+    std::atomic<std::int64_t> g_arg_char_widen_altlo{ k_uncaptured };
     // int arg arithmetic (II)I: ordinary sum + two's-complement overflow wrap.
     std::atomic<std::int64_t> g_arg_int_add{ k_uncaptured };
     std::atomic<std::int64_t> g_arg_int_overflow_wrap{ k_uncaptured };
@@ -360,6 +421,12 @@ namespace
     std::atomic<std::int64_t> g_long_big_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_long_highhalf_stat{ k_uncaptured };
     std::atomic<std::int64_t> g_long_lowhalf_stat{ k_uncaptured };
+    // long alternating-bit phases (64-bit inverses).
+    std::atomic<std::int64_t> g_long_altpos{ k_uncaptured };  // 0x5555...5 -> +6148914691236517205
+    std::atomic<std::int64_t> g_long_altneg{ k_uncaptured };  // 0xAAAA...A -> -6148914691236517206
+    std::atomic<std::int64_t> g_long_altneg_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_zero_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_negone_stat{ k_uncaptured };
 
     // float (raw bits; 0 is a valid value so use a separate "captured" flag)
     std::atomic<bool>          g_float_captured{ false };
@@ -384,6 +451,13 @@ namespace
     std::atomic<std::uint32_t> g_float_max_stat{ 0 };
     std::atomic<std::uint32_t> g_float_minval_stat{ 0 };
     std::atomic<std::uint32_t> g_float_neginf_stat{ 0 };
+    std::atomic<std::uint32_t> g_float_two{ 0 };
+    std::atomic<std::uint32_t> g_float_minnormal{ 0 };
+    std::atomic<std::uint32_t> g_float_altlo{ 0 };       // intBits 0x55555555
+    std::atomic<std::uint32_t> g_float_althi{ 0 };       // intBits 0xAAAAAAAA
+    std::atomic<std::uint32_t> g_float_two_stat{ 0 };
+    std::atomic<std::uint32_t> g_float_minnormal_stat{ 0 };
+    std::atomic<std::uint32_t> g_float_althi_stat{ 0 };
 
     // double (raw bits)
     std::atomic<bool>          g_double_captured{ false };
@@ -408,6 +482,13 @@ namespace
     std::atomic<std::uint64_t> g_double_max_stat{ 0 };
     std::atomic<std::uint64_t> g_double_minval_stat{ 0 };
     std::atomic<std::uint64_t> g_double_posinf_stat{ 0 };
+    std::atomic<std::uint64_t> g_double_two{ 0 };
+    std::atomic<std::uint64_t> g_double_minnormal{ 0 };
+    std::atomic<std::uint64_t> g_double_altlo{ 0 };       // longBits 0x5555...5
+    std::atomic<std::uint64_t> g_double_althi{ 0 };       // longBits 0xAAAA...A
+    std::atomic<std::uint64_t> g_double_two_stat{ 0 };
+    std::atomic<std::uint64_t> g_double_minnormal_stat{ 0 };
+    std::atomic<std::uint64_t> g_double_althi_stat{ 0 };
 
     // void + introspection
     std::atomic<int> g_void_inst_is_void{ -1 };
@@ -426,6 +507,25 @@ namespace
     std::atomic<int> g_int_zero_as_bool{ -1 };     // I 0 -> bool false
     std::atomic<int> g_int_fortytwo_as_bool{ -1 }; // I 42 -> bool true
     std::atomic<int> g_byte_zero_as_bool{ -1 };    // B 0 -> bool false
+    // CROSS-KIND value_t conversions: float/double return -> integer target
+    // (static_cast truncation toward zero) and integer return -> float target
+    // (widening), plus short -> int64 sign-extend and long -> bool.
+    std::atomic<std::int64_t> g_short_min_as_i64{ k_uncaptured };   // S MIN -> int64 sign-extend (-32768)
+    std::atomic<std::int64_t> g_short_altneg_as_i64{ k_uncaptured };// S 0xAAAA -> -21846
+    std::atomic<std::int64_t> g_long_max_as_i64{ k_uncaptured };    // J MAX -> int64 identity
+    std::atomic<int> g_float_2p75_as_i32{ -1 };    // F 2.75 -> int 2 (trunc)
+    std::atomic<int> g_float_neg2p75_as_i32{ -1 }; // F -2.75 -> int -2 (trunc toward zero)
+    std::atomic<std::int64_t> g_double_2p75_as_i64{ k_uncaptured };    // D 2.75 -> int64 2
+    std::atomic<std::int64_t> g_double_neg2p75_as_i64{ k_uncaptured }; // D -2.75 -> int64 -2
+    std::atomic<int> g_int_42_as_float{ -1 };      // I 42 -> float 42.0 exactly
+    std::atomic<int> g_long_negone_as_double{ -1 };// J -1 -> double -1.0 exactly
+    std::atomic<int> g_long_negone_as_bool{ -1 };  // J -1 -> bool true
+    std::atomic<int> g_long_zero_as_bool{ -1 };    // J 0 -> bool false
+    // int ARG -> float RETURN (exact magnitudes): proves an int arg and a float
+    // return coexist; 16777216 == 2^24 is the largest int exact as a float.
+    std::atomic<std::uint32_t> g_arg_int_to_float_inst{ 0 };
+    std::atomic<std::uint32_t> g_arg_int_to_float_stat{ 0 };
+    std::atomic<bool>          g_arg_int_to_float_captured{ false };
 
     auto run_all_calls(const std::unique_ptr<method_primitives>& self) -> void
     {
@@ -451,6 +551,11 @@ namespace
         g_byte_negone_stat.store(method_primitives::scall_byte("sRetByteNegOne"));
         g_byte_max_stat.store(method_primitives::scall_byte("sRetByteMax"));
         g_byte_min_stat.store(method_primitives::scall_byte("sRetByteMin"));
+        g_byte_alt.store(s.call_byte("retByteAlt"));
+        g_byte_alt_stat.store(method_primitives::scall_byte("sRetByteAlt"));
+        g_byte_zero_stat.store(method_primitives::scall_byte("sRetByteZero"));
+        g_byte_one_stat.store(method_primitives::scall_byte("sRetByteOne"));
+        g_byte_pattern_stat.store(method_primitives::scall_byte("sRetBytePattern"));
         // sign-extension: value_t holding int8_t(-1) read as int must be -1
         {
             const std::int32_t as_int = s.get_method("retByteNegOne")->call();
@@ -468,6 +573,16 @@ namespace
         g_short_max_stat.store(method_primitives::scall_short("sRetShortMax"));
         g_short_min_stat.store(method_primitives::scall_short("sRetShortMin"));
         g_short_255_stat.store(method_primitives::scall_short("sRetShort255"));
+        g_short_altpos.store(s.call_short("retShortAltPos"));
+        g_short_altneg.store(s.call_short("retShortAltNeg"));
+        g_short_altneg_stat.store(method_primitives::scall_short("sRetShortAltNeg"));
+        g_short_zero_stat.store(method_primitives::scall_short("sRetShortZero"));
+        g_short_highbyte_stat.store(method_primitives::scall_short("sRetShortHighByte"));
+        // short RETURN widened into a 32-bit int target — int16 alternative
+        // sign-extends (negone -> -1, 0xAAAA -> -21846, MIN -> -32768).
+        g_short_negone_as_int.store(s.short_ret_as_int("retShortNegOne"));
+        g_short_altneg_as_int.store(s.short_ret_as_int("retShortAltNeg"));
+        g_short_min_as_int.store(s.short_ret_as_int("retShortMin"));
 
         // ---- char ----
         g_char_zero.store(s.call_char("retCharZero"));
@@ -480,6 +595,16 @@ namespace
         g_char_max_stat.store(method_primitives::scall_char("sRetCharMax"));
         g_char_highbit_stat.store(method_primitives::scall_char("sRetCharHighBit"));
         g_char_surrogate_stat.store(method_primitives::scall_char("sRetCharSurrogate"));
+        g_char_altlo.store(s.call_char("retCharAltLo"));
+        g_char_althi.store(s.call_char("retCharAltHi"));
+        g_char_althi_stat.store(method_primitives::scall_char("sRetCharAltHi"));
+        g_char_zero_stat.store(method_primitives::scall_char("sRetCharZero"));
+        g_char_255_stat.store(method_primitives::scall_char("sRetChar255"));
+        // char 0xAAAA read into an int -> 43690 (zero-extend), never -21846.
+        {
+            const std::int32_t as_int = s.get_method("retCharAltHi")->call();
+            g_char_althi_as_int.store(as_int);
+        }
         // char 0xFFFF read into an int stays 65535 (zero-extend, not sign)
         {
             const std::int32_t as_int = s.get_method("retCharMax")->call();
@@ -509,12 +634,21 @@ namespace
         g_int_min_stat.store(method_primitives::scall_int("sRetIntMin"));
         g_int_42_stat.store(method_primitives::scall_int("sRetIntFortyTwo"));
         g_int_pattern_stat.store(method_primitives::scall_int("sRetIntPattern"));
+        g_int_altpos.store(s.call_int("retIntAltPos"));
+        g_int_altneg.store(s.call_int("retIntAltNeg"));
+        g_int_altneg_stat.store(method_primitives::scall_int("sRetIntAltNeg"));
+        g_int_zero_stat.store(method_primitives::scall_int("sRetIntZero"));
+        g_int_negone_stat.store(method_primitives::scall_int("sRetIntNegOne"));
         g_int_echo_inst.store(s.call_int_arg("echoInt", 1234567));
         g_int_echo_stat.store(method_primitives::scall_int_arg("sEchoInt", -7654321));
         // distinct-byte pattern echoed back over the int ARG path (no witness
         // clobber: echoIntPattern does not touch lastEchoArg).
         g_arg_int_pattern_echo_inst.store(s.echo_int_pattern(0x12345678));
         g_arg_int_pattern_echo_stat.store(method_primitives::secho_int_pattern(0x12345678));
+        // int ARG alternating-bit phases echoed back (0x55555555 positive, 0xAAAAAAAA
+        // negative): both phases survive the C++ -> .i slot -> body -> return path.
+        g_arg_int_echo_altpos.store(s.echo_int_pattern(0x55555555));
+        g_arg_int_echo_altneg.store(s.echo_int_pattern(static_cast<std::int32_t>(0xAAAAAAAAu)));
 
         // ---- narrow-primitive ARGUMENT round-trips ----
         // boolean arg (Z): the .z slot is spec'd 0/1; echo + NOT prove both.
@@ -533,6 +667,9 @@ namespace
         g_arg_byte_widen_min.store(s.byte_to_int(std::numeric_limits<std::int8_t>::min()));// -> -128
         g_arg_byte_echo_min_stat.store(method_primitives::secho_byte(std::numeric_limits<std::int8_t>::min()));
         g_arg_byte_widen_negone_stat.store(method_primitives::sbyte_to_int(static_cast<std::int8_t>(-1)));
+        // byte arg alternating-bit widen: 0xAA -> -86 (sign-extend), 0x55 -> +85.
+        g_arg_byte_widen_alt.store(s.byte_to_int(static_cast<std::int8_t>(0xAA)));      // -86
+        g_arg_byte_widen_pattern.store(s.byte_to_int(static_cast<std::int8_t>(0x55)));  // +85
 
         // short arg (S).
         g_arg_short_echo_min.store(s.echo_short(std::numeric_limits<std::int16_t>::min())); // -32768
@@ -542,6 +679,9 @@ namespace
         g_arg_short_echo_max_stat.store(method_primitives::secho_short(std::numeric_limits<std::int16_t>::max()));
         g_arg_short_widen_negone_stat.store(method_primitives::sshort_to_int(static_cast<std::int16_t>(-1)));
         g_arg_short_widen_pos255_stat.store(method_primitives::sshort_pos_to_int(static_cast<std::int16_t>(0x00FF)));
+        // short arg alternating-bit widen: 0xAAAA -> -21846 (sign), 0x5555 -> +21845.
+        g_arg_short_widen_altneg.store(s.short_to_int(static_cast<std::int16_t>(0xAAAA)));        // -21846
+        g_arg_short_widen_altpos.store(s.short_pos_to_int(static_cast<std::int16_t>(0x5555)));    // +21845
 
         // char arg (C): echo full unsigned range + widen-to-int proves ZERO-ext.
         g_arg_char_echo_zero.store(s.echo_char(static_cast<std::uint16_t>(0)));
@@ -554,6 +694,11 @@ namespace
         g_arg_char_widen_max_stat.store(method_primitives::schar_to_int(static_cast<std::uint16_t>(0xFFFF)));
         g_arg_char_widen_highbit_stat.store(method_primitives::schar_highbit_to_int(static_cast<std::uint16_t>(0x8000)));
         g_arg_char_widen_surrogate_stat.store(method_primitives::schar_surrogate_to_int(static_cast<std::uint16_t>(0xD83D)));
+        // char arg alternating-bit widen: 0xAAAA -> 43690 (zero-ext, bit 15 set),
+        // 0x5555 -> 21845.  Reuses charToInt (the (C)I widener; does not clobber the
+        // lastCharArg witness — charToInt has no side effect).
+        g_arg_char_widen_althi.store(s.char_to_int(static_cast<std::uint16_t>(0xAAAA)));  // 43690
+        g_arg_char_widen_altlo.store(s.char_to_int(static_cast<std::uint16_t>(0x5555)));  // 21845
 
         // int args (II)I: ordinary add, then two's-complement overflow + underflow.
         g_arg_int_add.store(s.add_int(2000000000, 100000000));                                // ordinary (fits)
@@ -611,6 +756,11 @@ namespace
         g_long_big_stat.store(method_primitives::scall_long("sRetLongBig"));
         g_long_highhalf_stat.store(method_primitives::scall_long("sRetLongHighHalf"));
         g_long_lowhalf_stat.store(method_primitives::scall_long("sRetLongLowHalf"));
+        g_long_altpos.store(s.call_long("retLongAltPos"));
+        g_long_altneg.store(s.call_long("retLongAltNeg"));
+        g_long_altneg_stat.store(method_primitives::scall_long("sRetLongAltNeg"));
+        g_long_zero_stat.store(method_primitives::scall_long("sRetLongZero"));
+        g_long_negone_stat.store(method_primitives::scall_long("sRetLongNegOne"));
 
         // ---- float ----
         g_float_zero.store(f2bits(s.call_float("retFloatZero")));
@@ -634,6 +784,13 @@ namespace
         g_float_max_stat.store(f2bits(method_primitives::scall_float("sRetFloatMax")));
         g_float_minval_stat.store(f2bits(method_primitives::scall_float("sRetFloatMinValue")));
         g_float_neginf_stat.store(f2bits(method_primitives::scall_float("sRetFloatNegInf")));
+        g_float_two.store(f2bits(s.call_float("retFloatTwo")));
+        g_float_minnormal.store(f2bits(s.call_float("retFloatMinNormal")));
+        g_float_altlo.store(f2bits(s.call_float("retFloatAltLo")));
+        g_float_althi.store(f2bits(s.call_float("retFloatAltHi")));
+        g_float_two_stat.store(f2bits(method_primitives::scall_float("sRetFloatTwo")));
+        g_float_minnormal_stat.store(f2bits(method_primitives::scall_float("sRetFloatMinNormal")));
+        g_float_althi_stat.store(f2bits(method_primitives::scall_float("sRetFloatAltHi")));
         g_float_captured.store(true);
 
         // ---- double ----
@@ -658,6 +815,13 @@ namespace
         g_double_max_stat.store(d2bits(method_primitives::scall_double("sRetDoubleMax")));
         g_double_minval_stat.store(d2bits(method_primitives::scall_double("sRetDoubleMinValue")));
         g_double_posinf_stat.store(d2bits(method_primitives::scall_double("sRetDoublePosInf")));
+        g_double_two.store(d2bits(s.call_double("retDoubleTwo")));
+        g_double_minnormal.store(d2bits(s.call_double("retDoubleMinNormal")));
+        g_double_altlo.store(d2bits(s.call_double("retDoubleAltLo")));
+        g_double_althi.store(d2bits(s.call_double("retDoubleAltHi")));
+        g_double_two_stat.store(d2bits(method_primitives::scall_double("sRetDoubleTwo")));
+        g_double_minnormal_stat.store(d2bits(method_primitives::scall_double("sRetDoubleMinNormal")));
+        g_double_althi_stat.store(d2bits(method_primitives::scall_double("sRetDoubleAltHi")));
         g_double_captured.store(true);
 
         // ---- void + introspection ----
@@ -692,6 +856,33 @@ namespace
         g_int_zero_as_bool.store(s.ret_as_bool("retIntZero") ? 1 : 0);          // -> false
         g_int_fortytwo_as_bool.store(s.ret_as_bool("retIntFortyTwo") ? 1 : 0);  // -> true
         g_byte_zero_as_bool.store(s.ret_as_bool("retByteZero") ? 1 : 0);        // -> false
+
+        // ---- CROSS-KIND value_t conversions (static_cast leg across kinds) ----
+        // short return widened to int64 sign-extends (MIN -> -32768, 0xAAAA -> -21846).
+        g_short_min_as_i64.store(s.ret_as_i64("retShortMin"));
+        g_short_altneg_as_i64.store(s.ret_as_i64("retShortAltNeg"));
+        // long return read as int64 (identity for the widest integral alternative).
+        g_long_max_as_i64.store(s.ret_as_i64("retLongMax"));
+        // float return -> int32 truncates toward zero (2.75 -> 2, -2.75 -> -2).
+        g_float_2p75_as_i32.store(s.ret_float_as_i32("retFloatTwoPoint75"));
+        g_float_neg2p75_as_i32.store(s.ret_float_as_i32("retFloatNegTwoPoint75"));
+        // double return -> int64 truncates toward zero (2.75 -> 2, -2.75 -> -2).
+        g_double_2p75_as_i64.store(s.ret_double_as_i64("retDoubleTwoPoint75"));
+        g_double_neg2p75_as_i64.store(s.ret_double_as_i64("retDoubleNegTwoPoint75"));
+        // int return -> float widens (42 is exactly representable).
+        g_int_42_as_float.store(s.ret_int_as_float("retIntFortyTwo") == 42.0f ? 1 : 0);
+        // long return -> double widens (-1 is exactly representable).
+        g_long_negone_as_double.store(s.ret_long_as_double("retLongNegOne") == -1.0 ? 1 : 0);
+        // long return -> bool narrows (-1 nonzero -> true, 0 -> false).
+        g_long_negone_as_bool.store(s.ret_long_as_bool("retLongNegOne") ? 1 : 0);
+        g_long_zero_as_bool.store(s.ret_long_as_bool("retLongZero") ? 1 : 0);
+
+        // ---- int ARG -> float RETURN coexistence (exact magnitudes) ----
+        // 16777216 == 2^24 is the largest int exactly representable as a float; the
+        // (I)F callee returns (float)arg, so the captured bits must equal 16777216.0f.
+        g_arg_int_to_float_inst.store(f2bits(s.call_int_to_float("intToFloat", 16777216)));
+        g_arg_int_to_float_stat.store(f2bits(method_primitives::scall_int_to_float("sIntToFloat", 16777216)));
+        g_arg_int_to_float_captured.store(true);
     }
 }
 
@@ -771,6 +962,13 @@ namespace
         ctx.check("mcp_byte_max_static_127", g_byte_max_stat.load() == 127);
         ctx.check("mcp_byte_min_static_neg128", g_byte_min_stat.load() == -128);
         ctx.check("mcp_byte_negone_sign_extends_to_int", g_byte_negone_as_int.load() == -1);
+        // alternating-bit phase 0xAA: bit 7 (sign) set -> -86.  Pairs with the 0x55
+        // (+85) pattern to cover both phases and the sign bit at byte width.
+        ctx.check("mcp_byte_alt_0xAA_neg86", g_byte_alt.load() == -86);
+        ctx.check("mcp_byte_alt_static_neg86", g_byte_alt_stat.load() == -86);
+        ctx.check("mcp_byte_zero_static", g_byte_zero_stat.load() == 0);
+        ctx.check("mcp_byte_one_static", g_byte_one_stat.load() == 1);
+        ctx.check("mcp_byte_pattern_static_85", g_byte_pattern_stat.load() == 0x55);
 
         // =====================================================================
         //  short (S) — signed, -32768..32767
@@ -788,6 +986,18 @@ namespace
         ctx.check("mcp_short_max_static_32767", g_short_max_stat.load() == 32767);
         ctx.check("mcp_short_min_static_neg32768", g_short_min_stat.load() == -32768);
         ctx.check("mcp_short_255_static_positive", g_short_255_stat.load() == 255);
+        // alternating-bit phases at short width: 0x5555 positive, 0xAAAA negative
+        // (bit 15 sign-extends).  The byte-width 0x55/0xAA values cannot reach these.
+        ctx.check("mcp_short_altpos_0x5555_21845", g_short_altpos.load() == 21845);
+        ctx.check("mcp_short_altneg_0xAAAA_neg21846", g_short_altneg.load() == -21846);
+        ctx.check("mcp_short_altneg_static_neg21846", g_short_altneg_stat.load() == -21846);
+        ctx.check("mcp_short_zero_static", g_short_zero_stat.load() == 0);
+        ctx.check("mcp_short_highbyte_static_neg256", g_short_highbyte_stat.load() == -256);
+        // short RETURN widened into a 32-bit int sign-extends (the short twin of the
+        // byte/char widen-into-int return probes already present).
+        ctx.check("mcp_short_negone_sign_extends_to_int", g_short_negone_as_int.load() == -1);
+        ctx.check("mcp_short_altneg_sign_extends_to_int", g_short_altneg_as_int.load() == -21846);
+        ctx.check("mcp_short_min_sign_extends_to_int", g_short_min_as_int.load() == -32768);
 
         // =====================================================================
         //  char (C) — UNSIGNED, 0..65535, zero-extension on widening
@@ -809,6 +1019,14 @@ namespace
         ctx.check("mcp_char_max_zero_extends_to_int_65535", g_char_max_as_int.load() == 65535);
         ctx.check("mcp_char_highbit_zero_extends_to_int_32768", g_char_highbit_as_int.load() == 32768);
         ctx.check("mcp_char_surrogate_zero_extends_to_int_55357", g_char_surrogate_as_int.load() == 55357);
+        // alternating-bit phases at char width: 0x5555 -> 21845, 0xAAAA -> 43690.
+        // 0xAAAA has bit 15 set, so 43690 (never -21846) is a second zero-ext witness.
+        ctx.check("mcp_char_altlo_0x5555_21845", g_char_altlo.load() == 21845);
+        ctx.check("mcp_char_althi_0xAAAA_43690", g_char_althi.load() == 43690);
+        ctx.check("mcp_char_althi_static_43690", g_char_althi_stat.load() == 43690);
+        ctx.check("mcp_char_zero_static", g_char_zero_stat.load() == 0);
+        ctx.check("mcp_char_255_static", g_char_255_stat.load() == 255);
+        ctx.check("mcp_char_althi_zero_extends_to_int_43690", g_char_althi_as_int.load() == 43690);
 
         // =====================================================================
         //  int (I) — full signed 32-bit range + argument passthrough
@@ -825,6 +1043,15 @@ namespace
         ctx.check("mcp_int_min_static", g_int_min_stat.load() == -2147483648LL);
         ctx.check("mcp_int_42_static", g_int_42_stat.load() == 42);
         ctx.check("mcp_int_pattern_static_0x12345678", g_int_pattern_stat.load() == 0x12345678LL);
+        // alternating-bit phases at int width: 0x55555555 positive, 0xAAAAAAAA
+        // negative (bit 31 sign).  Neither is byte-symmetric, so a word swap reorders.
+        ctx.check("mcp_int_altpos_0x55555555", g_int_altpos.load() == 0x55555555LL);
+        ctx.check("mcp_int_altneg_0xAAAAAAAA",
+                  g_int_altneg.load() == static_cast<std::int64_t>(static_cast<std::int32_t>(0xAAAAAAAAu)));
+        ctx.check("mcp_int_altneg_static",
+                  g_int_altneg_stat.load() == static_cast<std::int64_t>(static_cast<std::int32_t>(0xAAAAAAAAu)));
+        ctx.check("mcp_int_zero_static", g_int_zero_stat.load() == 0);
+        ctx.check("mcp_int_negone_static", g_int_negone_stat.load() == -1);
         ctx.check("mcp_int_echo_instance_passthrough", g_int_echo_inst.load() == 1234567);
         ctx.check("mcp_int_echo_static_passthrough", g_int_echo_stat.load() == -7654321);
         // the same distinct-byte pattern echoed back over the int ARG path proves
@@ -837,6 +1064,11 @@ namespace
         ctx.check("mcp_arg_int_echo_max", g_arg_int_echo_max.load() == std::numeric_limits<std::int32_t>::max());
         ctx.check("mcp_arg_int_echo_zero", g_arg_int_echo_zero.load() == 0);
         ctx.check("mcp_arg_int_echo_negone", g_arg_int_echo_negone.load() == -1);
+        // alternating-bit phases echoed over (I)I survive the C++ -> .i slot -> body
+        // -> return path in both phases (positive 0x55555555, negative 0xAAAAAAAA).
+        ctx.check("mcp_arg_int_echo_altpos", g_arg_int_echo_altpos.load() == 0x55555555LL);
+        ctx.check("mcp_arg_int_echo_altneg",
+                  g_arg_int_echo_altneg.load() == static_cast<std::int64_t>(static_cast<std::int32_t>(0xAAAAAAAAu)));
         // The (I)I echo also writes lastEchoArg in Java; the last echo executed
         // in run_all_calls was the static one with -7654321.
         ctx.check("mcp_echo_side_effect_arg", method_primitives::get_last_echo_arg() == -7654321);
@@ -865,6 +1097,9 @@ namespace
         ctx.check("mcp_arg_byte_widen_min_sign_extends",    g_arg_byte_widen_min.load() == -128);
         ctx.check("mcp_arg_byte_echo_min_static", g_arg_byte_echo_min_stat.load() == -128);
         ctx.check("mcp_arg_byte_widen_negone_static", g_arg_byte_widen_negone_stat.load() == -1);
+        // byte arg alternating-bit widen: 0xAA arg sign-extends to -86, 0x55 to +85.
+        ctx.check("mcp_arg_byte_widen_alt_0xAA_neg86", g_arg_byte_widen_alt.load() == -86);
+        ctx.check("mcp_arg_byte_widen_pattern_0x55_pos85", g_arg_byte_widen_pattern.load() == 85);
         // LAST byte echo executed was static sEchoByte(-128): witness at byte width.
         ctx.check("mcp_arg_byte_side_effect_min", method_primitives::get_last_byte_arg() == -128);
 
@@ -878,6 +1113,10 @@ namespace
         ctx.check("mcp_arg_short_echo_max_static",   g_arg_short_echo_max_stat.load() == 32767);
         ctx.check("mcp_arg_short_widen_negone_static", g_arg_short_widen_negone_stat.load() == -1);
         ctx.check("mcp_arg_short_widen_pos255_static", g_arg_short_widen_pos255_stat.load() == 255);
+        // short arg alternating-bit widen: 0xAAAA arg sign-extends to -21846, 0x5555
+        // stays +21845 (bit 15 clear).
+        ctx.check("mcp_arg_short_widen_altneg_neg21846", g_arg_short_widen_altneg.load() == -21846);
+        ctx.check("mcp_arg_short_widen_altpos_pos21845", g_arg_short_widen_altpos.load() == 21845);
         // LAST short echo executed was static sEchoShort(32767): witness.
         ctx.check("mcp_arg_short_side_effect_max", method_primitives::get_last_short_arg() == 32767);
 
@@ -897,6 +1136,10 @@ namespace
         ctx.check("mcp_arg_char_widen_max_static_zero_extends", g_arg_char_widen_max_stat.load() == 65535);
         ctx.check("mcp_arg_char_widen_highbit_static_zero_extends", g_arg_char_widen_highbit_stat.load() == 32768);
         ctx.check("mcp_arg_char_widen_surrogate_static_zero_extends", g_arg_char_widen_surrogate_stat.load() == 55357);
+        // char arg alternating-bit widen: 0xAAAA arg zero-extends to 43690 (bit 15
+        // set, never -21846), 0x5555 to 21845.
+        ctx.check("mcp_arg_char_widen_althi_zero_extends_43690", g_arg_char_widen_althi.load() == 43690);
+        ctx.check("mcp_arg_char_widen_altlo_21845", g_arg_char_widen_altlo.load() == 21845);
         // LAST char echo executed was static sEchoChar(0xFFFF): witness (unsigned).
         ctx.check("mcp_arg_char_side_effect_max", method_primitives::get_last_char_arg() == 65535);
 
@@ -965,6 +1208,13 @@ namespace
         ctx.check("mcp_long_big_static", g_long_big_stat.load() == static_cast<std::int64_t>(0x0123456789ABCDEFLL));
         ctx.check("mcp_long_highhalf_static", g_long_highhalf_stat.load() == static_cast<std::int64_t>(0xFFFFFFFF00000000ULL));
         ctx.check("mcp_long_lowhalf_static_positive", g_long_lowhalf_stat.load() == static_cast<std::int64_t>(0x00000000FFFFFFFFULL));
+        // alternating-bit phases at 64-bit width (bitwise inverses): 0x5555...5
+        // positive, 0xAAAA...A negative.  Both halves busy -> catch word swap/trunc.
+        ctx.check("mcp_long_altpos_0x5555", g_long_altpos.load() == static_cast<std::int64_t>(0x5555555555555555ULL));
+        ctx.check("mcp_long_altneg_0xAAAA", g_long_altneg.load() == static_cast<std::int64_t>(0xAAAAAAAAAAAAAAAAULL));
+        ctx.check("mcp_long_altneg_static", g_long_altneg_stat.load() == static_cast<std::int64_t>(0xAAAAAAAAAAAAAAAAULL));
+        ctx.check("mcp_long_zero_static", g_long_zero_stat.load() == 0);
+        ctx.check("mcp_long_negone_static", g_long_negone_stat.load() == -1);
 
         // =====================================================================
         //  float (F) — value + IEEE-754 special-value bit fidelity
@@ -1013,6 +1263,21 @@ namespace
             const float ninf = bits2f(g_float_neginf_stat.load());
             ctx.check("mcp_float_neginf_static_isinf", std::isinf(ninf) && ninf < 0.0f);
         }
+        // 2.0f, smallest-NORMAL (distinct from the subnormal MIN_VALUE above), and
+        // the two alternating-bit raw patterns (finite normals; compare RAW bits so
+        // a byte swap is caught; 0xAAAAAAAA has the sign bit set -> finite negative).
+        ctx.check("mcp_float_two", bits2f(g_float_two.load()) == 2.0f);
+        ctx.check("mcp_float_min_normal", bits2f(g_float_minnormal.load()) == std::numeric_limits<float>::min());
+        ctx.check("mcp_float_altlo_bits_0x55555555", g_float_altlo.load() == 0x55555555u);
+        ctx.check("mcp_float_althi_bits_0xAAAAAAAA", g_float_althi.load() == 0xAAAAAAAAu);
+        {
+            const float althi = bits2f(g_float_althi.load());
+            ctx.check("mcp_float_althi_is_finite_negative",
+                      !std::isnan(althi) && !std::isinf(althi) && althi < 0.0f);
+        }
+        ctx.check("mcp_float_two_static", bits2f(g_float_two_stat.load()) == 2.0f);
+        ctx.check("mcp_float_min_normal_static", bits2f(g_float_minnormal_stat.load()) == std::numeric_limits<float>::min());
+        ctx.check("mcp_float_althi_static_bits", g_float_althi_stat.load() == 0xAAAAAAAAu);
         ctx.check("mcp_float_half_widens_to_double_exact", g_float_half_to_double.load() == 1);
 
         // =====================================================================
@@ -1061,6 +1326,21 @@ namespace
             const double pinf = bits2d(g_double_posinf_stat.load());
             ctx.check("mcp_double_posinf_static_isinf", std::isinf(pinf) && pinf > 0.0);
         }
+        // 2.0, smallest-NORMAL (distinct from the subnormal MIN_VALUE), and the two
+        // alternating-bit raw patterns (finite normals; RAW-bit compare for word-swap;
+        // 0xAA... has the sign bit set -> finite negative).
+        ctx.check("mcp_double_two", bits2d(g_double_two.load()) == 2.0);
+        ctx.check("mcp_double_min_normal", bits2d(g_double_minnormal.load()) == std::numeric_limits<double>::min());
+        ctx.check("mcp_double_altlo_bits", g_double_altlo.load() == 0x5555555555555555ULL);
+        ctx.check("mcp_double_althi_bits", g_double_althi.load() == 0xAAAAAAAAAAAAAAAAULL);
+        {
+            const double althi = bits2d(g_double_althi.load());
+            ctx.check("mcp_double_althi_is_finite_negative",
+                      !std::isnan(althi) && !std::isinf(althi) && althi < 0.0);
+        }
+        ctx.check("mcp_double_two_static", bits2d(g_double_two_stat.load()) == 2.0);
+        ctx.check("mcp_double_min_normal_static", bits2d(g_double_minnormal_stat.load()) == std::numeric_limits<double>::min());
+        ctx.check("mcp_double_althi_static_bits", g_double_althi_stat.load() == 0xAAAAAAAAAAAAAAAAULL);
 
         // =====================================================================
         //  void (V) + value_t introspection
@@ -1091,6 +1371,34 @@ namespace
         ctx.check("mcp_conv_int_zero_to_bool_false", g_int_zero_as_bool.load() == 0);
         ctx.check("mcp_conv_int_fortytwo_to_bool_true", g_int_fortytwo_as_bool.load() == 1);
         ctx.check("mcp_conv_byte_zero_to_bool_false", g_byte_zero_as_bool.load() == 0);
+        // CROSS-KIND conversions: int16 stored return widened to int64 sign-extends.
+        ctx.check("mcp_conv_short_min_to_i64_sign_extends", g_short_min_as_i64.load() == -32768LL);
+        ctx.check("mcp_conv_short_altneg_to_i64_sign_extends", g_short_altneg_as_i64.load() == -21846LL);
+        // int64 stored return read as int64 (identity for the widest integral kind).
+        ctx.check("mcp_conv_long_max_to_i64_identity",
+                  g_long_max_as_i64.load() == std::numeric_limits<std::int64_t>::max());
+        // float/double stored return -> integer target: static_cast truncates toward
+        // zero (2.75 -> 2, -2.75 -> -2).  Fully deterministic C++ cast semantics.
+        ctx.check("mcp_conv_float_2p75_to_int_truncates_2", g_float_2p75_as_i32.load() == 2);
+        ctx.check("mcp_conv_float_neg2p75_to_int_truncates_neg2", g_float_neg2p75_as_i32.load() == -2);
+        ctx.check("mcp_conv_double_2p75_to_i64_truncates_2", g_double_2p75_as_i64.load() == 2);
+        ctx.check("mcp_conv_double_neg2p75_to_i64_truncates_neg2", g_double_neg2p75_as_i64.load() == -2);
+        // integer stored return -> floating target widens exactly for these values.
+        ctx.check("mcp_conv_int_42_to_float_exact", g_int_42_as_float.load() == 1);
+        ctx.check("mcp_conv_long_negone_to_double_exact", g_long_negone_as_double.load() == 1);
+        // int64 stored return -> bool narrows: nonzero -> true, zero -> false.
+        ctx.check("mcp_conv_long_negone_to_bool_true", g_long_negone_as_bool.load() == 1);
+        ctx.check("mcp_conv_long_zero_to_bool_false", g_long_zero_as_bool.load() == 0);
+
+        // =====================================================================
+        //  int ARG -> float RETURN coexistence: feed 2^24 (largest int exact as a
+        //  float) and read the (float)arg return; the bits must equal 16777216.0f.
+        // =====================================================================
+        ctx.check("mcp_arg_int_to_float_captured", g_arg_int_to_float_captured.load());
+        ctx.check("mcp_arg_int_to_float_instance",
+                  bits2f(g_arg_int_to_float_inst.load()) == 16777216.0f);
+        ctx.check("mcp_arg_int_to_float_static",
+                  bits2f(g_arg_int_to_float_stat.load()) == 16777216.0f);
         }
     }
 }

@@ -313,6 +313,37 @@ VMHOOK_JVM_MODULE(return_set_primitives)
     const     float  f_nan_payload{ bits_to_float(0x7FAB1234u) };
     const     double d_nan_payload{ bits_to_double(0x7FF8ABCDEF012345ULL) };
 
+    // POSITIVE zero — the bit-exact twin of neg_zero (0x00000000 /
+    // 0x0000000000000000).  Forced in its own round so +0.0 and -0.0 are each
+    // pinned bit-for-bit; same_bits() distinguishes them, so a path that dropped
+    // the sign bit would pass pos_zero yet fail neg_zero (and vice-versa).
+    const     float  f_pos_zero{ bits_to_float(0x00000000u) };
+    const     double d_pos_zero{ bits_to_double(0x0000000000000000ULL) };
+
+    // LARGEST positive subnormal (float 0x007FFFFF / double
+    // 0x000FFFFFFFFFFFFF): exponent field 0, mantissa all-ones — the very top of
+    // the subnormal range, one ULP below min_normal.  Pairs with the
+    // denorm_min() round to bracket BOTH ends of the subnormal band, so a
+    // flush-to-zero arithmetic path is caught at the large end too.
+    const     float  f_subnormal_max{ bits_to_float(0x007FFFFFu) };
+    const     double d_subnormal_max{ bits_to_double(0x000FFFFFFFFFFFFFULL) };
+
+    // A NEGATIVE quiet NaN: sign bit set on top of the all-ones exponent and a
+    // quiet mantissa (float 0xFFC00000 / double 0xFFF8000000000000).  The
+    // movq-xmm0 epilogue must carry bit 63/31 too, so a sign-stripping
+    // "abs(NaN)" mishandling would flip these bits and same_bits() would catch
+    // it — a dimension the positive qNaN rounds cannot reach.
+    const     float  f_neg_qnan{ bits_to_float(0xFFC00000u) };
+    const     double d_neg_qnan{ bits_to_double(0xFFF8000000000000ULL) };
+
+    // Clean powers of two: float/double 1.0 and 2.0 have a non-trivial biased
+    // exponent with a ZERO mantissa (1.0f = 0x3F800000, 2.0f = 0x40000000,
+    // 1.0d = 0x3FF0000000000000).  Distinct from the fractional witnesses
+    // (3.5f/2.5/PI) because the mantissa is empty — proving the exponent field
+    // alone rides the slot intact.
+    const     float  f_one{ bits_to_float(0x3F800000u) };
+    const     double d_two{ bits_to_double(0x4000000000000000ULL) };
+
     // ROUND 1 — canonical "obviously not the original" values, all distinct
     // from every orig* return.  The bedrock that the force-return path works
     // at all for each primitive, on both instance and static dispatch.
@@ -654,7 +685,162 @@ VMHOOK_JVM_MODULE(return_set_primitives)
         /*d */ 24.25,
         /*c */ static_cast<std::uint16_t>(0xDC00) }); // lone low surrogate
 
-    // ROUND 25 — re-run the canonical vector a SECOND time at the very end to
+    // ROUND 25 — POSITIVE ZERO for float and double, bit-exact, in the SAME
+    // pass that forces -0.0's exact complement.  Together with the neg_zero
+    // round (ROUND 7) this pins BOTH signed zeros: a memcpy that preserved the
+    // sign bit must yield 0x00000000 here and 0x80000000 there, and same_bits()
+    // catches any conflation.  Integrals carry alternating-nibble sentinels so
+    // every bit of the integral slots is exercised in at least one round
+    // (byte 0x55=+85, short 0x5555, int 0x55555555, long 0x5555555555555555 —
+    // the positive alternating pattern; the negative twin lands in ROUND 27).
+    run_and_check(ctx, "pos_zero_alt_bits", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(0x55),                       // +85
+        /*s */ static_cast<std::int16_t>(0x5555),                    // +21845
+        /*i */ 0x55555555,                                           // +1431655765
+        /*l */ static_cast<std::int64_t>(0x5555555555555555LL),      // +6148914691236517205
+        /*f */ f_pos_zero,
+        /*d */ d_pos_zero,
+        /*c */ static_cast<std::uint16_t>(0x5555) });
+
+    // ROUND 26 — NEGATIVE alternating-nibble integrals: byte 0xAA=-86,
+    // short 0xAAAA=-21846, int 0xAAAAAAAA=INT_MIN-region negative,
+    // long 0xAAAAAAAAAAAAAAAA (sign bit set).  The bitwise complement of the
+    // pos_zero round's integrals: every OTHER bit set, top bit set, so the
+    // sign-extension branch (byte/short/int) and the long memcpy path both have
+    // to deliver a dense negative pattern — the strongest single-round check
+    // that no stray bit is dropped or flipped on the signed path.  Floats carry
+    // the clean powers of two (1.0f / 2.0d) for an exponent-only witness.
+    run_and_check(ctx, "neg_alt_bits", forced_values{
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(0xAA),                       // -86
+        /*s */ static_cast<std::int16_t>(0xAAAA),                    // -21846
+        /*i */ static_cast<std::int32_t>(0xAAAAAAAA),                // -1431655766
+        /*l */ static_cast<std::int64_t>(0xAAAAAAAAAAAAAAAAULL),     // negative
+        /*f */ f_one,
+        /*d */ d_two,
+        /*c */ static_cast<std::uint16_t>(0xAAAA) });
+
+    // ROUND 27 — float/double LARGEST positive subnormal (0x007FFFFF /
+    // 0x000FFFFFFFFFFFFF), bit-exact: exponent field 0, mantissa all-ones.  The
+    // top of the subnormal band, one ULP below min_normal; with the denorm_min
+    // round (ROUND 21) this brackets the subnormal range at BOTH ends, so a
+    // flush-to-zero / DAZ FPU path is caught no matter where in the band it
+    // would trigger.  char 0xE000 is the first code unit just AFTER the UTF-16
+    // surrogate block (D800–DFFF) — a normal BMP scalar value bordering the
+    // surrogate range.
+    run_and_check(ctx, "float_double_subnormal_max", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(27),
+        /*s */ static_cast<std::int16_t>(27),
+        /*i */ 27,
+        /*l */ static_cast<std::int64_t>(27),
+        /*f */ f_subnormal_max,
+        /*d */ d_subnormal_max,
+        /*c */ static_cast<std::uint16_t>(0xE000) }); // first post-surrogate BMP
+
+    // ROUND 28 — NEGATIVE quiet NaN (float 0xFFC00000 / double
+    // 0xFFF8000000000000): the sign bit set ON TOP of the qNaN pattern.  The
+    // movq-xmm0 epilogue must deliver bit 31 (float) / bit 63 (double) too, so a
+    // path that ever masked the NaN sign would fail here while passing every
+    // positive-NaN round.  char 0xFFFD is the Unicode REPLACEMENT CHARACTER, the
+    // top-of-BMP non-noncharacter sentinel.
+    run_and_check(ctx, "float_double_neg_nan", forced_values{
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(28),
+        /*s */ static_cast<std::int16_t>(28),
+        /*i */ 28,
+        /*l */ static_cast<std::int64_t>(28),
+        /*f */ f_neg_qnan,
+        /*d */ d_neg_qnan,
+        /*c */ static_cast<std::uint16_t>(0xFFFD) }); // U+FFFD REPLACEMENT CHAR
+
+    // ROUND 29 — FORCED-EQUALS-ORIGINAL: every slot is forced to the SAME value
+    // the orig* body would have returned anyway (origByte=11, origShort=111,
+    // origInt=1111, origLong=1111, origFloat=11.5f, origDouble=11.25,
+    // origChar='A', origBool=false).  The OBSERVED value matching is then NOT
+    // sufficient on its own — but the per-round hook-fire counters (asserted in
+    // check_round: 9 instance + 8 static) PROVE the cancel/force path executed
+    // even when the forced value is indistinguishable from the original.  This
+    // is the one round that proves set() is not silently a no-op when value ==
+    // original.  (Static origs differ from instance origs, but the static slots
+    // are forced to the instance-orig values here; that's fine — we only assert
+    // observed == forced, and the fire count proves the body was skipped.)
+    run_and_check(ctx, "forced_equals_original", forced_values{
+        /*b */ false,                                  // == origBool()
+        /*by*/ static_cast<std::int8_t>(11),           // == origByte()
+        /*s */ static_cast<std::int16_t>(111),         // == origShort()
+        /*i */ 1111,                                   // == origInt()
+        /*l */ static_cast<std::int64_t>(1111),        // == origLong()
+        /*f */ 11.5f,                                  // == origFloat()
+        /*d */ 11.25,                                  // == origDouble()
+        /*c */ static_cast<std::uint16_t>('A') });     // == origChar()
+
+    // ROUND 30 — float/double clean POWERS OF TWO (1.0 / 2.0) bit-exact on BOTH
+    // float and double slots simultaneously (the prior rounds spread powers of
+    // two across f and d separately).  1.0f=0x3F800000, 2.0d=0x4000000000000000:
+    // a meaningful biased exponent with an empty mantissa, so the exponent field
+    // alone must survive the slot.  Integrals carry small primes to keep their
+    // checks distinct from neighbouring rounds.
+    run_and_check(ctx, "float_double_powers_of_two", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(31),
+        /*s */ static_cast<std::int16_t>(127),
+        /*i */ 65537,                                  // 2^16 + 1
+        /*l */ static_cast<std::int64_t>(4294967297LL),// 2^32 + 1
+        /*f */ f_one,
+        /*d */ d_two,
+        /*c */ static_cast<std::uint16_t>(0x0041) }); // 'A'
+
+    // ROUND 31 — float/double "narrowing trap" pair: a float (0.2f) whose exact
+    // value is NOT (float)(double)0.2, and a double (1.0/3.0) that loses
+    // precision if it were ever truncated to float width.  Forcing each through
+    // its OWN-width slot and comparing bit-exactly proves the epilogue reads the
+    // correct register width (movq xmm0 delivers the full 32/64 bits; the JVM
+    // freturn/dreturn reads the matching width) — a swapped-width read would
+    // surface a wildly different pattern and same_bits() fails.
+    run_and_check(ctx, "float_double_narrowing", forced_values{
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(33),
+        /*s */ static_cast<std::int16_t>(333),
+        /*i */ 3333,
+        /*l */ static_cast<std::int64_t>(33333333333LL),
+        /*f */ 0.2f,
+        /*d */ 1.0 / 3.0,
+        /*c */ static_cast<std::uint16_t>(0x0033) }); // '3'
+
+    // ROUND 32 — char NULL and char MAX-NONSURROGATE neighbours plus short/int
+    // unsigned-top witnesses.  char 0x0000 was covered in min_zero alongside a
+    // false bool; here the char slot rides 0xD7FF — the LAST BMP code unit
+    // before the surrogate block (D800) — so the boundary just BELOW the
+    // surrogates is pinned, complementing 0xE000 (just above) and the surrogate
+    // rounds (inside).  short 0x6000 / int 0x40000000 are clean high-bit-but-
+    // positive patterns.
+    run_and_check(ctx, "char_pre_surrogate", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(0x40),         // '@' = +64
+        /*s */ static_cast<std::int16_t>(0x6000),      // +24576
+        /*i */ 0x40000000,                             // +1073741824
+        /*l */ static_cast<std::int64_t>(0x4000000000000000LL),
+        /*f */ 32.5f,
+        /*d */ 32.25,
+        /*c */ static_cast<std::uint16_t>(0xD7FF) }); // last pre-surrogate BMP
+
+    // ROUND 33 — last canonical RE-RUN before the final stability witness, but
+    // with a DIFFERENT canonical vector (distinct from ROUND 1) so the repeat
+    // also re-exercises a fresh value set rather than only re-confirming round 1.
+    // Mixed signs across every slot.
+    run_and_check(ctx, "second_canonical", forced_values{
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(-42),
+        /*s */ static_cast<std::int16_t>(-12345),
+        /*i */ -2000000000,
+        /*l */ static_cast<std::int64_t>(-1234567890123456789LL),
+        /*f */ -98.75f,
+        /*d */ 271828.18284590452,
+        /*c */ static_cast<std::uint16_t>(0x4F4B) }); // 'OK'
+
+    // ROUND 34 — re-run the canonical vector a SECOND time at the very end to
     // prove the force-return path is stable across repeated arm/disarm cycles
     // (each round installs fresh scoped_hooks; this guards against state left
     // behind by a previous round's teardown).
@@ -668,8 +854,8 @@ VMHOOK_JVM_MODULE(return_set_primitives)
         /*d */ 2.5,
         /*c */ static_cast<std::uint16_t>(0x263A) });
 
-    // ---- Lifecycle sanity: 25 rounds ran, so roundCount must be 25. -------
-    ctx.check("ran_25_rounds", rsp_fixture::round_count() == 25);
+    // ---- Lifecycle sanity: 34 rounds ran, so roundCount must be 34. -------
+    ctx.check("ran_34_rounds", rsp_fixture::round_count() == 34);
 
     // ---- Control angle: with NO hooks installed, the original values flow
     // through unchanged (proves the force-return is what changed the result,
@@ -704,11 +890,13 @@ VMHOOK_JVM_MODULE(return_set_primitives)
     }
 
     ctx.record("[INFO] return_set_primitives: forced bool/byte/short/int/long/float/double/char "
-               "on instance+static dispatch across 25 value rounds (canonical, min/zero, signed "
+               "on instance+static dispatch across 34 value rounds (canonical, min/zero, signed "
                "min/max, minus-one, high-bit, -0.0, +Inf, -Inf, qNaN, precision, long-high-dword, "
                "surrogate char, MIN+1, MAX-1, long-low-dword-max, long-2^32-carry, float/double "
                "type-max, min-normal, lowest, subnormal, custom-NaN-payload, int-sign-neighbors, "
-               "low-surrogate char, canonical-repeat) plus a no-hook baseline.");
+               "low-surrogate char, +0.0/alt-bits, neg-alt-bits, subnormal-max, neg-NaN, "
+               "forced==original, powers-of-two, narrowing-trap, pre-surrogate char, second-canonical, "
+               "canonical-repeat) plus a no-hook baseline.");
 
     // [INFO] Boolean force-return is intentionally bounded to {true,false}: the
     // return_value::set(value) API takes its argument BY TYPE, so a boolean slot

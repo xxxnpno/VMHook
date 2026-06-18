@@ -1108,6 +1108,239 @@ namespace
     }
 
     // =====================================================================
+    //  12b. EXTENDED INPUT COVERAGE -- additional boundary inputs not exercised
+    //       by phases 1-11, all SELF-RESTORING (each sub-block restores the
+    //       documented final so phases 13/15/16 observe the unchanged values).
+    //       Pure native set()->get() round-trips (no extra Java fields, no extra
+    //       heap allocation) plus the bool-into-"C" arithmetic shortcut.
+    // =====================================================================
+
+    // ---- 12b.1 STATIC float: ADDITIONAL NaN-payload + boundary bit patterns
+    //      proving the width-matched memcpy preserves ARBITRARY payloads (not
+    //      only the canonical/single-bit payloads of phase 7).  Native re-read
+    //      bit-exact + variant alternative.  Restores canonical NaN at the end.
+    {
+        auto set_chk_F = [&](const char* tag, std::uint32_t bits)
+        {
+            const auto p{ fps::static_field("sF") };
+            if (!p) { return; }
+            p->set(bits_to_float(bits));
+            const auto v{ p->get() };
+            ctx.check(std::string{ "F_xpay_variant_" } + tag, v.data.index() == kIdxFloat);
+            const float got = v;
+            ctx.check(std::string{ "F_xpay_bits_exact_" } + tag, float_bits(got) == bits);
+        };
+        set_chk_F("payload_lowbit",  0x7F800002); // sNaN, payload = 0b10
+        set_chk_F("payload_allones", 0x7FFFFFFF); // qNaN, max payload (all mantissa bits)
+        set_chk_F("payload_alt0",    0x7FAAAAAA); // qNaN, alternating-bit payload
+        set_chk_F("payload_alt1",    0x7F955555); // sNaN, alternating-bit payload
+        set_chk_F("neg_payload_max", 0xFFFFFFFF); // -qNaN, max payload, sign set
+        set_chk_F("just_below_one",  0x3F7FFFFF); // largest float < 1.0
+        set_chk_F("just_above_one",  0x3F800001); // smallest float > 1.0
+        set_chk_F("two",             0x40000000); // 2.0f exactly
+        set_chk_F("half",            0x3F000000); // 0.5f exactly
+        set_chk_F("smallest_norm_neg", 0x80800000); // -Float.MIN_NORMAL
+        // Restore canonical NaN final.
+        if (const auto p{ fps::static_field("sF") }) { p->set(bits_to_float(0x7FC00000)); }
+        ctx.check("F_xpay_restored_nan", float_bits(fps::get_float("sF")) == 0x7FC00000u);
+    }
+
+    // ---- 12b.2 STATIC double: ADDITIONAL NaN-payload + boundary bit patterns. --
+    {
+        auto set_chk_D = [&](const char* tag, std::uint64_t bits)
+        {
+            const auto p{ fps::static_field("sD") };
+            if (!p) { return; }
+            p->set(bits_to_double(bits));
+            const auto v{ p->get() };
+            ctx.check(std::string{ "D_xpay_variant_" } + tag, v.data.index() == kIdxDouble);
+            const double got = v;
+            ctx.check(std::string{ "D_xpay_bits_exact_" } + tag, double_bits(got) == bits);
+        };
+        set_chk_D("payload_lowbit",  0x7FF0000000000002ULL); // sNaN, payload = 0b10
+        set_chk_D("payload_allones", 0x7FFFFFFFFFFFFFFFULL); // qNaN, max payload
+        set_chk_D("payload_alt0",    0x7FFAAAAAAAAAAAAAULL); // qNaN, alternating payload
+        set_chk_D("payload_alt1",    0x7FF5555555555555ULL); // sNaN, alternating payload
+        set_chk_D("neg_payload_max", 0xFFFFFFFFFFFFFFFFULL); // -qNaN, max payload, sign set
+        set_chk_D("just_below_one",  0x3FEFFFFFFFFFFFFFULL); // largest double < 1.0
+        set_chk_D("just_above_one",  0x3FF0000000000001ULL); // smallest double > 1.0
+        set_chk_D("two",             0x4000000000000000ULL); // 2.0 exactly
+        set_chk_D("half",            0x3FE0000000000000ULL); // 0.5 exactly
+        set_chk_D("smallest_norm_neg", 0x8010000000000000ULL); // -Double.MIN_NORMAL
+        // Restore canonical NaN final.
+        if (const auto p{ fps::static_field("sD") }) { p->set(bits_to_double(0x7FF8000000000000ULL)); }
+        ctx.check("D_xpay_restored_nan", double_bits(fps::get_double("sD")) == 0x7FF8000000000000ULL);
+    }
+
+    // ---- 12b.3 INSTANCE float: complete the IEEE special-value set the per-field
+    //      instance matrix (phase 9) omitted -- negsnan, denorm, justabovenorm,
+    //      and several extra payload patterns -- proving the instance-dispatch
+    //      float write preserves arbitrary bits exactly like the static path.
+    //      Restores the documented instance final (-pi, 0xC0490FDB).
+    if (inst)
+    {
+        if (auto p{ inst->get_field("iF") }; p.has_value())
+        {
+            auto set_chk = [&](const char* tag, std::uint32_t bits)
+            {
+                p->set(bits_to_float(bits));
+                const auto v{ p->get() };
+                ctx.check(std::string{ "fps_inst_F_xpay_variant_" } + tag, v.data.index() == kIdxFloat);
+                const float got = v;
+                ctx.check(std::string{ "fps_inst_F_xpay_bits_exact_" } + tag, float_bits(got) == bits);
+            };
+            set_chk("negsnan",       0xFF800001); // signaling NaN, sign bit set
+            set_chk("denorm",        0x00000001); // Float.MIN_VALUE (subnormal)
+            set_chk("justabovenorm", 0x00800001); // smallest normal just above MIN_NORMAL
+            set_chk("payload_max",   0x7FFFFFFF); // qNaN, max payload
+            set_chk("payload_alt",   0x7FAAAAAA); // qNaN, alternating payload
+            set_chk("neg_payload",   0xFFAAAAAA); // -qNaN, alternating payload, sign set
+            // Restore the documented instance final (-pi).
+            p->set(bits_to_float(0xC0490FDB));
+            ctx.check("fps_inst_F_xpay_restored_negpi", float_bits(p->get()) == 0xC0490FDBu);
+        }
+    }
+
+    // ---- 12b.4 INSTANCE double: complete the omitted IEEE special-value set
+    //      (justabovenorm + extra payloads) and restore the documented final (pi).
+    if (inst)
+    {
+        if (auto p{ inst->get_field("iD") }; p.has_value())
+        {
+            auto set_chk = [&](const char* tag, std::uint64_t bits)
+            {
+                p->set(bits_to_double(bits));
+                const auto v{ p->get() };
+                ctx.check(std::string{ "fps_inst_D_xpay_variant_" } + tag, v.data.index() == kIdxDouble);
+                const double got = v;
+                ctx.check(std::string{ "fps_inst_D_xpay_bits_exact_" } + tag, double_bits(got) == bits);
+            };
+            set_chk("negsnan",       0xFFF0000000000001ULL); // signaling NaN, sign bit set
+            set_chk("justabovenorm", 0x0010000000000001ULL); // smallest normal above MIN_NORMAL
+            set_chk("payload_max",   0x7FFFFFFFFFFFFFFFULL); // qNaN, max payload
+            set_chk("payload_alt",   0x7FFAAAAAAAAAAAAAULL); // qNaN, alternating payload
+            set_chk("neg_payload",   0xFFFAAAAAAAAAAAAAULL); // -qNaN, alternating payload, sign set
+            // Restore the documented instance final (pi).
+            p->set(bits_to_double(0x400921FB54442D18ULL));
+            ctx.check("fps_inst_D_xpay_restored_pi", double_bits(p->get()) == 0x400921FB54442D18ULL);
+        }
+    }
+
+    // ---- 12b.5 "C" 1-byte ARITHMETIC-shortcut with a `bool` value type.  bool is
+    //      a 1-byte arithmetic type (sizeof(bool)==1 on every CI ABI), so it takes
+    //      the SAME widening shortcut as `char` (vmhook.hpp ~15576-15585): the
+    //      value is static_cast<unsigned char> then to uint16 and the FULL 2-byte
+    //      char slot is written.  true -> 0x0001, false -> 0x0000.  Distinct from
+    //      the char and uint16 paths; no sibling covers the bool-into-"C" value.
+    //      Restores Character.MAX so the snapshot/getter phases see 0xFFFF.
+    {
+        const auto p{ fps::static_field("sC") };
+        if (p)
+        {
+            p->set(true);
+            ctx.check("C_bool_shortcut_true_0001", fps::get_u16("sC") == 0x0001);
+            p->set(false);
+            ctx.check("C_bool_shortcut_false_0000", fps::get_u16("sC") == 0x0000);
+            // Restore Character.MAX final.
+            p->set(static_cast<std::uint16_t>(0xFFFF));
+            ctx.check("C_bool_shortcut_restored_FFFF", fps::get_u16("sC") == 0xFFFF);
+        }
+    }
+
+    // ---- 12b.6 REPEATABILITY / LAST-WRITE-WINS on the S, J and Z widths that
+    //      phase 10 did not cover (phase 10 covered I/F/D/C/B).  A pure store with
+    //      no accumulate: writing twice leaves the second value; idempotent writes
+    //      are stable.  Each restores its documented final.
+    {
+        // short: full-width overwrite, sign flip, idempotent.
+        const auto ps{ fps::static_field("sS") };
+        if (ps)
+        {
+            ps->set(static_cast<std::int16_t>(0x7FFF));
+            ctx.check("repeat_S_pos", fps::get_i16("sS") == static_cast<std::int16_t>(0x7FFF));
+            ps->set(static_cast<std::int16_t>(0x8000)); // sign flip, full overwrite
+            ctx.check("repeat_S_sign_flip_overwrite", fps::get_i16("sS") == static_cast<std::int16_t>(0x8000));
+            ps->set(static_cast<std::int16_t>(0x0000)); // clear: no stale high byte
+            ctx.check("repeat_S_full_overwrite_no_stale", fps::get_i16("sS") == 0);
+            ps->set(static_cast<std::int16_t>(0x8000)); // idempotent re-write
+            ps->set(static_cast<std::int16_t>(0x8000));
+            ctx.check("repeat_S_idempotent", fps::get_i16("sS") == static_cast<std::int16_t>(0x8000));
+            // Restore the documented 0xBEEF final.
+            ps->set(static_cast<std::int16_t>(0xBEEF));
+            ctx.check("repeat_S_restored_BEEF", fps::get_i16("sS") == static_cast<std::int16_t>(0xBEEF));
+        }
+        // long: full 8-byte overwrite, high-word/low-word independence, idempotent.
+        const auto pj{ fps::static_field("sJ") };
+        if (pj)
+        {
+            pj->set(static_cast<std::int64_t>(0xFFFFFFFFFFFFFFFFULL));
+            ctx.check("repeat_J_all_ones", static_cast<std::uint64_t>(fps::get_i64("sJ")) == 0xFFFFFFFFFFFFFFFFULL);
+            pj->set(std::int64_t{ 0 }); // clear: no stale high word
+            ctx.check("repeat_J_full_overwrite_no_stale", fps::get_i64("sJ") == 0);
+            pj->set(static_cast<std::int64_t>(0x00000000FFFFFFFFULL)); // low word only
+            ctx.check("repeat_J_low_word", static_cast<std::uint64_t>(fps::get_i64("sJ")) == 0x00000000FFFFFFFFULL);
+            pj->set(static_cast<std::int64_t>(0xFFFFFFFF00000000ULL)); // high word fully replaces
+            ctx.check("repeat_J_high_word_replaces", static_cast<std::uint64_t>(fps::get_i64("sJ")) == 0xFFFFFFFF00000000ULL);
+            // Restore the documented 0xDEADBEEFCAFEBABE final.
+            pj->set(static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
+            ctx.check("repeat_J_restored_deadbeef", static_cast<std::uint64_t>(fps::get_i64("sJ")) == 0xDEADBEEFCAFEBABEULL);
+        }
+        // boolean: last-write-wins + idempotent (a pure 0/1 store, no latch).
+        const auto pz{ fps::static_field("sZ") };
+        if (pz)
+        {
+            pz->set(false);
+            ctx.check("repeat_Z_false", fps::get_bool("sZ") == false);
+            pz->set(true);
+            ctx.check("repeat_Z_last_write_wins", fps::get_bool("sZ") == true);
+            pz->set(true); // idempotent
+            ctx.check("repeat_Z_idempotent", fps::get_bool("sZ") == true);
+            // Restore the documented `true` final.
+            ctx.check("repeat_Z_restored_true", fps::get_bool("sZ") == true);
+        }
+        // char: cross-value last-write-wins finite BMP -> surrogate -> BMP, proving
+        // no kind-dependent latching (every code unit is a plain 2-byte store).
+        const auto pc{ fps::static_field("sC") };
+        if (pc)
+        {
+            pc->set(static_cast<std::uint16_t>(0x0041)); // 'A'
+            ctx.check("repeat_C_bmp", fps::get_u16("sC") == 0x0041);
+            pc->set(static_cast<std::uint16_t>(0xD83D)); // high surrogate fully replaces
+            ctx.check("repeat_C_surrogate_replaces", fps::get_u16("sC") == 0xD83D);
+            // Restore Character.MAX final.
+            pc->set(static_cast<std::uint16_t>(0xFFFF));
+            ctx.check("repeat_C_restored_FFFF_2", fps::get_u16("sC") == 0xFFFF);
+        }
+    }
+
+    // ---- 12b.7 INSTANCE last-write-wins on the iI / iJ slots (the instance
+    //      dispatch path through get_field()->set()), confirming the instance
+    //      proxy is a pure store too.  Restores the documented instance finals.
+    if (inst)
+    {
+        if (auto p{ inst->get_field("iI") }; p.has_value())
+        {
+            p->set(std::int32_t{ 0x12345678 });
+            ctx.check("fps_inst_repeat_I_first", static_cast<std::int32_t>(p->get()) == 0x12345678);
+            p->set(static_cast<std::int32_t>(0x87654321));
+            ctx.check("fps_inst_repeat_I_last_write_wins", static_cast<std::int32_t>(p->get()) == static_cast<std::int32_t>(0x87654321));
+            // Restore the documented 0x0BADF00D instance final.
+            p->set(std::int32_t{ 0x0BADF00D });
+            ctx.check("fps_inst_repeat_I_restored", static_cast<std::int32_t>(p->get()) == 0x0BADF00D);
+        }
+        if (auto p{ inst->get_field("iJ") }; p.has_value())
+        {
+            p->set(static_cast<std::int64_t>(0x1111222233334444ULL));
+            ctx.check("fps_inst_repeat_J_first", static_cast<std::uint64_t>(p->get()) == 0x1111222233334444ULL);
+            p->set(static_cast<std::int64_t>(0x5555666677778888ULL));
+            ctx.check("fps_inst_repeat_J_last_write_wins", static_cast<std::uint64_t>(p->get()) == 0x5555666677778888ULL);
+            // Restore the documented 0x0123456789ABCDEF instance final.
+            p->set(static_cast<std::int64_t>(0x0123456789ABCDEFLL));
+            ctx.check("fps_inst_repeat_J_restored", static_cast<std::int64_t>(p->get()) == 0x0123456789ABCDEFLL);
+        }
+    }
+
+    // =====================================================================
     //  13. JAVA-OBSERVED SNAPSHOT (mode 1).  Drive the probe: run() copies
     //      every field into its seen* witness through genuine getstatic/getfield
     //      + putstatic.  Then read the witnesses back natively and assert the

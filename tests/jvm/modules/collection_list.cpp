@@ -127,6 +127,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -261,6 +262,75 @@ namespace
         }
     };
 
+    // Wrappers for boxed PRIMITIVE elements whose single field is named "value".
+    // java.lang.Boolean/Byte/Short/Character each expose a primitive "value" the
+    // value_t::get() conversion reads as an integer (bool/byte/short/char all widen
+    // to int32 cleanly).  Each box klass gets its OWN wrapper type: object::get_field
+    // resolves the field off the wrapper's REGISTERED klass (typeid(*this)), so a
+    // single shared wrapper registered to one box klass would read the others through
+    // the wrong klass's field entry — distinct types keep each registration exact.
+    // Proves the backing walk is element-TYPE-agnostic across every boxed-primitive
+    // element family.  CRTP base factors the identical body; only the registered
+    // klass differs.
+    template<typename derived_box>
+    class boxed_int_base : public vmhook::object<derived_box>
+    {
+    public:
+        explicit boxed_int_base(vmhook::oop_t instance) noexcept
+            : vmhook::object<derived_box>{ instance }
+        {
+        }
+
+        auto value() const -> std::int32_t
+        {
+            const auto f{ this->get_field("value") };
+            return f ? static_cast<std::int32_t>(f->get()) : -1;
+        }
+    };
+
+    class boolean_object : public boxed_int_base<boolean_object>
+    {
+    public:
+        using boxed_int_base<boolean_object>::boxed_int_base;
+    };
+
+    class byte_object : public boxed_int_base<byte_object>
+    {
+    public:
+        using boxed_int_base<byte_object>::boxed_int_base;
+    };
+
+    class short_object : public boxed_int_base<short_object>
+    {
+    public:
+        using boxed_int_base<short_object>::boxed_int_base;
+    };
+
+    class char_object : public boxed_int_base<char_object>
+    {
+    public:
+        using boxed_int_base<char_object>::boxed_int_base;
+    };
+
+    // Wrapper for java.lang.Double — the boxed 8-byte FLOATING element type.
+    // Reads "value" (a double) full-width via the value_t -> double conversion.
+    // The floating-point analogue of long_object; proves a D-typed (wide) boxed
+    // primitive element decodes through the element-type-agnostic backing walk.
+    class double_object : public vmhook::object<double_object>
+    {
+    public:
+        explicit double_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<double_object>{ instance }
+        {
+        }
+
+        auto value() const -> double
+        {
+            const auto f{ get_field("value") };
+            return f ? static_cast<double>(f->get()) : -1.0;
+        }
+    };
+
     // ── Fixture-mirrored constants (kept in lockstep with CollList.java) ─────
     constexpr std::int32_t MANY{ 12 };
     constexpr std::int32_t BIG{ 4096 };
@@ -290,6 +360,16 @@ namespace
     constexpr std::int32_t TEN{ 10 };
     constexpr std::int32_t SIXTEEN{ 16 };
     constexpr std::int32_t THOUSAND{ 1000 };
+
+    // Null-PATTERN coverage (all-null / null-at-boundary lists).
+    constexpr std::int32_t NULL_PATTERN_LEN{ 4 };
+
+    // Extra boxed-type coverage (Boolean / Byte / Short / Character / Double).
+    constexpr std::int32_t BOX_LEN{ 3 };
+    constexpr std::int32_t CHAR_BASE{ 'a' };
+
+    // Mixed-shape nested list (Vector inner + COW inner).
+    constexpr std::int32_t NESTED_MIX_OUTER{ 2 };
 
     // Generous wall-clock ceiling for the BIG-node LinkedList walk.  A linear
     // walk is sub-millisecond; even a heavily-loaded CI box stays well under
@@ -898,6 +978,46 @@ namespace
     bool         g_nested_map_distinct{ true };
     std::int32_t g_nested_map_nonnull{ -1 };
 
+    // Null-PATTERN lists (all-null / null-at-head / null-at-tail).
+    list_obs g_arr_all_null;
+    list_obs g_link_all_null;
+    list_obs g_arr_null_first;
+    list_obs g_link_null_first;
+    list_obs g_arr_null_last;
+
+    // Extra boxed element-type lists, observed by VALUE.
+    list_obs g_bool_arr;
+    bool     g_bool_values_ok{ false };
+    list_obs g_byte_arr;
+    bool     g_byte_values_ok{ false };
+    list_obs g_short_arr;
+    bool     g_short_values_ok{ false };
+    list_obs g_char_arr;
+    bool     g_char_values_ok{ false };
+    list_obs g_double_arr;
+    bool     g_double_values_ok{ false };
+
+    // Mixed-shape nested list (Vector inner + COW inner).
+    std::int32_t g_nested_mix_outer_n{ -1 };
+    std::int32_t g_nested_mix_inner_ok{ 0 };
+    bool         g_nested_mix_distinct{ true };
+
+    // ── PUBLIC value_t::to_vector entry-point observations ───────────────────
+    // The library's PUBLIC field-to-vector entry (field_proxy::value_t::to_vector,
+    // reached via get_field("...")->get().to_vector<T>()) — distinct from the
+    // lower-level collection::to_vector the g_tv_* group drives.  It branches on
+    // the field SIGNATURE: a 'L...;' reference List field falls through to
+    // collection::to_vector, while a '[L...;' object-array field is walked
+    // directly as a raw Java array.  Both branches are exercised here.
+    list_obs g_pv_arr_single;     // 'L' branch: ArrayList single
+    list_obs g_pv_arr_many;       // 'L' branch: ArrayList many
+    list_obs g_pv_arr_null;       // 'L' branch: ArrayList null-slot
+    list_obs g_pv_link_single;    // 'L' branch: LinkedList single
+    list_obs g_pv_link_many;      // 'L' branch: LinkedList many
+    list_obs g_pv_link_null;      // 'L' branch: LinkedList null Node.item
+    list_obs g_pv_link_big;       // 'L' branch: LinkedList declared as List (runtime-klass dispatch)
+    list_obs g_pv_elem_array;     // '[L' branch: Elem[] object-array field
+
     // Characterized-via-size() families (NOT element-decoded by the hand-walk):
     // the module reads each list's published Java size() witness (a plain int
     // field — no Java call) and asserts it matches the expected constant.
@@ -1133,6 +1253,68 @@ namespace
         values_ok = vals_ok;
     }
 
+    // Reduce a decoded vector of boxed-int wrappers (Boolean/Byte/Short/Character),
+    // proving value() == expected(index).  `expected` maps an index to the value
+    // the fixture stored at that slot.  Distinctness is NOT asserted here: the JDK
+    // INTERNS small Boolean/Byte/Short/Character boxes, so two equal values share a
+    // cached OOP (e.g. Boolean.FALSE appears twice in boolArrList) — a real, valid
+    // duplicate-OOP that the by-value check tolerates.  Shape/size/non-null are the
+    // hard structural signal; the per-element value is gated best-effort by caller.
+    template<typename box_t>
+    auto observe_boxed_ints(list_obs& o,
+                            const std::vector<std::unique_ptr<box_t>>& v,
+                            const std::function<std::int32_t(std::int32_t)>& expected,
+                            bool& values_ok) -> void
+    {
+        o.seen = true;
+        o.size = static_cast<std::int32_t>(v.size());
+        std::int32_t non_null{ 0 };
+        std::int32_t null_count{ 0 };
+        bool vals_ok{ !v.empty() };
+        for (std::size_t k{ 0 }; k < v.size(); ++k)
+        {
+            const box_t* const e{ v[k].get() };
+            if (e == nullptr) { ++null_count; vals_ok = false; continue; }
+            ++non_null;
+            if (e->value() != expected(static_cast<std::int32_t>(k))) { vals_ok = false; }
+        }
+        o.non_null = non_null;
+        o.null_count = null_count;
+        o.distinct_ok = true;   // not meaningful for interned boxes; see comment.
+        values_ok = vals_ok;
+    }
+
+    // Reduce a decoded vector of java.lang.Double wrappers, proving value() == index
+    // as a full-width 8-byte read.  Doubles are NOT interned, so distinctness holds;
+    // an exact == against the small integral values 0.0/1.0/2.0 is representable
+    // exactly in double, so the comparison is deterministic (no epsilon needed).
+    auto observe_doubles(list_obs& o,
+                         const std::vector<std::unique_ptr<double_object>>& v,
+                         bool& values_ok) -> void
+    {
+        o.seen = true;
+        o.size = static_cast<std::int32_t>(v.size());
+        std::int32_t non_null{ 0 };
+        std::int32_t null_count{ 0 };
+        bool distinct_ok{ true };
+        bool vals_ok{ !v.empty() };
+        std::unordered_set<const void*> seen_oops;
+        seen_oops.reserve(v.size() * 2 + 1);
+        for (std::size_t k{ 0 }; k < v.size(); ++k)
+        {
+            const double_object* const e{ v[k].get() };
+            if (e == nullptr) { ++null_count; vals_ok = false; continue; }
+            ++non_null;
+            if (e->value() != static_cast<double>(k)) { vals_ok = false; }
+            const void* const oop{ static_cast<const void*>(e->get_instance()) };
+            if (!seen_oops.insert(oop).second) { distinct_ok = false; }
+        }
+        o.non_null = non_null;
+        o.null_count = null_count;
+        o.distinct_ok = distinct_ok;
+        values_ok = vals_ok;
+    }
+
     // True iff a decoded inner Elem vector is a perfect dense list of `expected`:
     // exactly `expected` non-null, distinct, ascending elements with id == index
     // and tag == "e<id>".
@@ -1189,6 +1371,33 @@ namespace
         ctx.check(p + "_non_null_count", o.non_null == NULL_LIST_LEN - 1);
         ctx.check(p + "_order_preserved_around_null", o.order_ok);
         ctx.check(p + "_tags_round_trip", o.tags_ok);
+        ctx.check(p + "_non_null_distinct", o.distinct_ok);
+    }
+
+    // All-null list: exactly NULL_PATTERN_LEN slots, EVERY one null.  The walk must
+    // emit `size` slots (the bound is `size`, not the backing length), all decoded
+    // to nullptr — the degenerate all-null case the single-null lists don't cover.
+    auto check_all_null(vmhook_test::context& ctx, const std::string& p, const list_obs& o) -> void
+    {
+        ctx.check(p + "_seen", o.seen);
+        ctx.check(p + "_size_matches", o.size == NULL_PATTERN_LEN);
+        ctx.check(p + "_all_slots_null", o.null_count == NULL_PATTERN_LEN);
+        ctx.check(p + "_no_elements_decoded", o.non_null == 0);
+        ctx.check(p + "_first_null_at_index_0", o.null_at == 0);
+    }
+
+    // Null at a specified boundary index, the rest dense (id == index).  Proves the
+    // null slot is preserved positionally at the head (index 0) or tail
+    // (NULL_PATTERN_LEN-1), with order intact around it and exactly one null.
+    auto check_null_boundary(vmhook_test::context& ctx, const std::string& p,
+                             const list_obs& o, const std::int32_t null_index) -> void
+    {
+        ctx.check(p + "_seen", o.seen);
+        ctx.check(p + "_size_matches", o.size == NULL_PATTERN_LEN);
+        ctx.check(p + "_one_null_slot", o.null_count == 1);
+        ctx.check(p + "_null_at_expected_index", o.null_at == null_index);
+        ctx.check(p + "_non_null_count", o.non_null == NULL_PATTERN_LEN - 1);
+        ctx.check(p + "_order_preserved_around_null", o.order_ok);
         ctx.check(p + "_non_null_distinct", o.distinct_ok);
     }
 
@@ -1275,6 +1484,14 @@ namespace
         vmhook::register_class<integer_object>("java/lang/Integer");
         vmhook::register_class<long_object>("java/lang/Long");
         vmhook::register_class<enum_object>("java/lang/Enum");
+        // Extra boxed-primitive element types (Boolean/Byte/Short/Character/Double):
+        // each maps to its own always-loaded box klass so get_field("value")
+        // resolves the right field entry per type.
+        vmhook::register_class<boolean_object>("java/lang/Boolean");
+        vmhook::register_class<byte_object>("java/lang/Byte");
+        vmhook::register_class<short_object>("java/lang/Short");
+        vmhook::register_class<char_object>("java/lang/Character");
+        vmhook::register_class<double_object>("java/lang/Double");
 
         // Drive a build probe so populate() runs on the Java thread; then read
         // the now-populated backing stores off the worker thread.  (No detour:
@@ -1454,6 +1671,44 @@ namespace
                       walk_indexed_backing_as<enum_object>(list_oop_of("enumList")),
                       g_enum_values_ok);
 
+        // ── Extra boxed-primitive element lists (Boolean/Byte/Short/Char/Double) ─
+        observe_boxed_ints<boolean_object>(
+            g_bool_arr,
+            walk_indexed_backing_as<boolean_object>(list_oop_of("boolArrList")),
+            [](std::int32_t k) { return (k == 1) ? 1 : 0; },   // false,true,false
+            g_bool_values_ok);
+        observe_boxed_ints<byte_object>(
+            g_byte_arr,
+            walk_indexed_backing_as<byte_object>(list_oop_of("byteArrList")),
+            [](std::int32_t k) { return k; },
+            g_byte_values_ok);
+        observe_boxed_ints<short_object>(
+            g_short_arr,
+            walk_indexed_backing_as<short_object>(list_oop_of("shortArrList")),
+            [](std::int32_t k) { return k; },
+            g_short_values_ok);
+        observe_boxed_ints<char_object>(
+            g_char_arr,
+            walk_indexed_backing_as<char_object>(list_oop_of("charArrList")),
+            [](std::int32_t k) { return CHAR_BASE + k; },
+            g_char_values_ok);
+        observe_doubles(g_double_arr,
+                        walk_indexed_backing_as<double_object>(list_oop_of("doubleArrList")),
+                        g_double_values_ok);
+
+        // ── Null-PATTERN lists (all-null / null-at-head / null-at-tail) ──────
+        observe(g_arr_all_null,   walk_arraylist(list_oop_of("arrAllNull")),   true);
+        observe(g_arr_null_first, walk_arraylist(list_oop_of("arrNullFirst")), true);
+        observe(g_arr_null_last,  walk_arraylist(list_oop_of("arrNullLast")),  true);
+        {
+            void* const o{ list_oop_of("linkAllNull") };
+            observe(g_link_all_null, walk_linkedlist(o, read_int_field(o, "size", 0)), true);
+        }
+        {
+            void* const o{ list_oop_of("linkNullFirst") };
+            observe(g_link_null_first, walk_linkedlist(o, read_int_field(o, "size", 0)), true);
+        }
+
         // ── Extra-size Elem lists (positional order at 10 / 16 / 1000) ───────
         observe(g_arr_ten,      walk_arraylist(list_oop_of("arrTen")),      true);
         observe(g_arr_sixteen,  walk_arraylist(list_oop_of("arrSixteen")),  true);
@@ -1483,6 +1738,37 @@ namespace
             }
             g_nested_map_nonnull = nonnull;
             g_nested_map_distinct = distinct;
+        }
+
+        // ── Mixed-shape nested list: outer ArrayList -> Vector inner + COW inner.
+        //    Each inner is re-walked by the shape-detecting walk, which must
+        //    dispatch to walk_vector ("elementCount") and walk_cow ("array")
+        //    respectively — the nested case only covered ArrayList/LinkedList
+        //    inners before.
+        {
+            std::vector<std::unique_ptr<elem_object>> outer{
+                walk_arraylist(list_oop_of("nestedMixed")) };
+            g_nested_mix_outer_n = static_cast<std::int32_t>(outer.size());
+            std::int32_t inner_ok{ 0 };
+            std::unordered_set<const void*> seen_inner;
+            for (const auto& up : outer)
+            {
+                const elem_object* const inner{ up.get() };
+                if (inner == nullptr) { continue; }
+                void* const inner_oop{ inner->get_instance() };
+                if (!inner_oop || !vmhook::hotspot::is_valid_pointer(inner_oop)) { continue; }
+                if (!seen_inner.insert(static_cast<const void*>(inner_oop)).second)
+                {
+                    g_nested_mix_distinct = false;
+                }
+                std::vector<std::unique_ptr<elem_object>> items{
+                    walk_list_by_shape(inner_oop, 0) };
+                if (inner_list_fully_ok(items, NESTED_INNER))
+                {
+                    ++inner_ok;
+                }
+            }
+            g_nested_mix_inner_ok = inner_ok;
         }
 
         // ── List.of(...) (JDK 9+).  ListN ("elements") is hand-walked; List12
@@ -1532,6 +1818,43 @@ namespace
         // Library ArrayList fast path at a round-1000 scale (cross-oracle vs the
         // hand-walked arrThousand below).
         observe(g_tv_arr_thousand, to_vector_of(list_oop_of("arrThousand")), true);
+
+        // ── PUBLIC value_t::to_vector ENTRY POINT (get_field(...)->get().to_vector)
+        // The g_tv_* group above calls the LOWER-LEVEL vmhook::collection::to_vector
+        // directly on a decoded OOP.  Here we drive the PUBLIC field-to-vector entry
+        // — field_proxy::value_t::to_vector — which is what a real caller uses and
+        // which adds the field-SIGNATURE branch the lower-level path never sees:
+        //   * 'L...;' reference List field  -> falls through to collection::to_vector
+        //   * '[L...;' object-array field    -> walked directly as a raw Java array
+        // Both branches issue NO Java call for these shapes (ArrayList/LinkedList
+        // fast paths + the array branch), so they are safe from the no-detour body.
+        // The wrapper is built around the live singleton OOP so get_field resolves
+        // each list field off it, exactly as a detour parameter would.
+        {
+            coll_list_fixture sw{ static_cast<vmhook::oop_t>(singleton) };
+            const auto pub_to_vector{ [&sw](const char* const field)
+                -> std::vector<std::unique_ptr<elem_object>>
+            {
+                const auto f{ sw.get_field(field) };
+                if (!f) { return {}; }
+                return f->get().to_vector<elem_object>();
+            } };
+
+            // 'L...;' reference branch (ArrayList + LinkedList fast paths).
+            observe(g_pv_arr_single, pub_to_vector("arrSingle"),   true);
+            observe(g_pv_arr_many,   pub_to_vector("arrMany"),     true);
+            observe(g_pv_arr_null,   pub_to_vector("arrWithNull"), true);
+            observe(g_pv_link_single, pub_to_vector("linkSingle"),  true);
+            observe(g_pv_link_many,   pub_to_vector("linkMany"),    true);
+            observe(g_pv_link_null,   pub_to_vector("linkWithNull"),true);
+            // linkBig is DECLARED as List but is a LinkedList at runtime — proves
+            // the public entry picks the fast path from the runtime klass, not the
+            // Java static field type.
+            observe(g_pv_link_big,   pub_to_vector("linkBig"),     true);
+
+            // '[L...;' object-array branch (the documented Object[] entry point).
+            observe(g_pv_elem_array, pub_to_vector("elemArray"),   true);
+        }
 
         // ════════════════════════════════════════════════════════════════════
         //  ArrayList backing store
@@ -1720,6 +2043,72 @@ namespace
                       "compressed-oops-dependent); size/shape still checked hard.");
 
         // ════════════════════════════════════════════════════════════════════
+        //  Extra boxed-primitive element types: Boolean / Byte / Short / Character
+        //  / Double.  The backing walk is element-TYPE-agnostic; shape is HARD and
+        //  the per-element VALUE round-trip is best-effort (reference decode is
+        //  compressed-oops-dependent).  These small boxes (Boolean/Byte/Short/Char)
+        //  are JDK-INTERNED, so equal values share a cached OOP — distinctness is
+        //  not asserted for them (Double boxes are NOT interned, so it is for them).
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("boolean_arraylist_seen", g_bool_arr.seen);
+        ctx.check("boolean_arraylist_size_matches", g_bool_arr.size == BOX_LEN);
+        ctx.check("boolean_arraylist_all_non_null", g_bool_arr.non_null == BOX_LEN);
+        ctx.check("boolean_arraylist_no_null_slots", g_bool_arr.null_count == 0);
+        check_or_info(ctx, "boolean_arraylist_values_false_true_false", g_bool_values_ok,
+                      "boxed Boolean element values did not all read back as the "
+                      "false,true,false pattern on this run (reference decode is "
+                      "compressed-oops-dependent); size/shape still checked hard.");
+
+        ctx.check("byte_arraylist_seen", g_byte_arr.seen);
+        ctx.check("byte_arraylist_size_matches", g_byte_arr.size == BOX_LEN);
+        ctx.check("byte_arraylist_all_non_null", g_byte_arr.non_null == BOX_LEN);
+        ctx.check("byte_arraylist_no_null_slots", g_byte_arr.null_count == 0);
+        check_or_info(ctx, "byte_arraylist_values_equal_index", g_byte_values_ok,
+                      "boxed Byte element values did not all read back as index on this "
+                      "run (reference decode is compressed-oops-dependent); size/shape "
+                      "still checked hard.");
+
+        ctx.check("short_arraylist_seen", g_short_arr.seen);
+        ctx.check("short_arraylist_size_matches", g_short_arr.size == BOX_LEN);
+        ctx.check("short_arraylist_all_non_null", g_short_arr.non_null == BOX_LEN);
+        ctx.check("short_arraylist_no_null_slots", g_short_arr.null_count == 0);
+        check_or_info(ctx, "short_arraylist_values_equal_index", g_short_values_ok,
+                      "boxed Short element values did not all read back as index on this "
+                      "run (reference decode is compressed-oops-dependent); size/shape "
+                      "still checked hard.");
+
+        ctx.check("char_arraylist_seen", g_char_arr.seen);
+        ctx.check("char_arraylist_size_matches", g_char_arr.size == BOX_LEN);
+        ctx.check("char_arraylist_all_non_null", g_char_arr.non_null == BOX_LEN);
+        ctx.check("char_arraylist_no_null_slots", g_char_arr.null_count == 0);
+        check_or_info(ctx, "char_arraylist_values_a_b_c", g_char_values_ok,
+                      "boxed Character element values did not all read back as 'a'+index "
+                      "on this run (reference decode is compressed-oops-dependent); "
+                      "size/shape still checked hard.");
+
+        // Double: wide (8-byte) boxed primitive, NOT interned -> distinctness HARD.
+        check_typed_dense_shape(ctx, "double_arraylist", g_double_arr, BOX_LEN);
+        check_or_info(ctx, "double_arraylist_values_equal_index_full_width",
+                      g_double_values_ok,
+                      "boxed Double element values did not all read back as (double)index "
+                      "on this run; either the reference decode or the 8-byte Double.value "
+                      "read did not resolve here. size/shape still checked hard.");
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Null-PATTERN coverage: all-null lists, and null at the head / tail
+        //  boundary.  Complements the single-mid-null with-null lists already
+        //  covered — these prove the null slot is decoded correctly at index 0,
+        //  at the last index, and when EVERY slot is null, in both backing
+        //  families, with the bound staying `size`.
+        // ════════════════════════════════════════════════════════════════════
+        check_all_null(ctx, "arraylist_all_null", g_arr_all_null);
+        check_all_null(ctx, "linkedlist_all_null", g_link_all_null);
+        check_null_boundary(ctx, "arraylist_null_first", g_arr_null_first, 0);
+        check_null_boundary(ctx, "linkedlist_null_first", g_link_null_first, 0);
+        check_null_boundary(ctx, "arraylist_null_last", g_arr_null_last,
+                            NULL_PATTERN_LEN - 1);
+
+        // ════════════════════════════════════════════════════════════════════
         //  Extra SIZE coverage (10 / 16 / 1000) — positional order at each size
         //  on both backing families.  These are plain Elem lists, so the full
         //  dense bundle (size/order/tags/distinct/first/last) applies as HARD.
@@ -1751,6 +2140,17 @@ namespace
         ctx.check("nested_maps_outer_count_matches", g_nested_map_outer_n == MAP_OUTER);
         ctx.check("nested_maps_all_non_null", g_nested_map_nonnull == MAP_OUTER);
         ctx.check("nested_maps_distinct", g_nested_map_distinct);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Mixed-shape nested list: outer ArrayList -> Vector inner + COW inner.
+        //  Both inners are fully re-walked by the shape-detecting walk, proving it
+        //  dispatches a decoded element OOP to the Vector and COW backing shapes
+        //  (the nested case previously covered only ArrayList/LinkedList inners).
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("nested_mixed_outer_count_matches", g_nested_mix_outer_n == NESTED_MIX_OUTER);
+        ctx.check("nested_mixed_inners_distinct", g_nested_mix_distinct);
+        ctx.check("nested_mixed_all_inner_lists_fully_walked",
+                  g_nested_mix_inner_ok == NESTED_MIX_OUTER);
 
         // ════════════════════════════════════════════════════════════════════
         //  List.of(...) (JDK 9+).  ListN backing "elements" Object[] IS decoded
@@ -1895,6 +2295,49 @@ namespace
                   g_tv_arr_many.last_id == g_tv_link_many.last_id);
         ctx.check("to_vector_array_and_link_many_both_ordered",
                   g_tv_arr_many.order_ok && g_tv_link_many.order_ok);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  PUBLIC value_t::to_vector ENTRY POINT — get_field(...)->get().to_vector,
+        //  the call a real detour uses.  Distinct from the g_tv_* group (which
+        //  drives the lower-level collection::to_vector on a decoded OOP directly):
+        //  this exercises the field-SIGNATURE branch in value_t::to_vector —
+        //    * 'L...;' reference List field  -> collection::to_vector fast path
+        //    * '[L...;' object-array field   -> the raw-array branch
+        //  — neither of which the lower-level path can ever reach.
+        // ════════════════════════════════════════════════════════════════════
+        // 'L...;' reference branch: ArrayList single / many / null-slot.
+        check_dense(ctx, "public_to_vector_arraylist_single", g_pv_arr_single, 1);
+        check_dense(ctx, "public_to_vector_arraylist_many", g_pv_arr_many, MANY);
+        check_with_null(ctx, "public_to_vector_arraylist_with_null", g_pv_arr_null);
+
+        // 'L...;' reference branch: LinkedList single / many / null Node.item.
+        check_dense(ctx, "public_to_vector_linkedlist_single", g_pv_link_single, 1);
+        check_dense(ctx, "public_to_vector_linkedlist_many", g_pv_link_many, MANY);
+        check_with_null(ctx, "public_to_vector_linkedlist_with_null", g_pv_link_null);
+
+        // linkBig is declared `List` but is a LinkedList at runtime: the public
+        // entry must still select the LinkedList fast path from the runtime klass.
+        check_dense(ctx, "public_to_vector_linkbig_runtime_klass_dispatch",
+                    g_pv_link_big, BIG);
+
+        // '[L...;' object-array branch: the documented Object[] entry point.
+        check_dense(ctx, "public_to_vector_object_array", g_pv_elem_array, OBJ_ARR_LEN);
+
+        // The public entry must agree element-for-element with the lower-level
+        // collection::to_vector AND the hand-walk on the same lists — three
+        // independent decoders converging is a strong cross-implementation oracle.
+        ctx.check("public_to_vector_arraylist_matches_collection_to_vector",
+                  g_pv_arr_many.size == g_tv_arr_many.size
+                  && g_pv_arr_many.last_id == g_tv_arr_many.last_id);
+        ctx.check("public_to_vector_linkedlist_matches_collection_to_vector",
+                  g_pv_link_many.size == g_tv_link_many.size
+                  && g_pv_link_many.last_id == g_tv_link_many.last_id);
+        ctx.check("public_to_vector_object_array_matches_hand_walk",
+                  g_pv_elem_array.size == g_elem_array.size
+                  && g_pv_elem_array.last_id == g_elem_array.last_id);
+        ctx.check("public_to_vector_linkbig_matches_hand_walk",
+                  g_pv_link_big.size == g_link_big.size
+                  && g_pv_link_big.last_id == g_link_big.last_id);
     }   // run_collection_list_checks
 }   // anonymous namespace
 
