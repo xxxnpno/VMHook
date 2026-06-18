@@ -42,6 +42,7 @@ bottoms out in this pair of functions, so a defect here silently corrupts all re
 - [[features/enum_singleton|enum_singleton]]
 - [[features/field_arrays_object|field_arrays_object]]
 - [[features/field_object_ref|field_object_ref]]
+- [[features/make_java_array|make_java_array]]
 - [[features/read_java_string|read_java_string]]
 
 ## Implementation anchors
@@ -55,6 +56,7 @@ bottoms out in this pair of functions, so a defect here silently corrupts all re
 
 ## Tests
 
+- `tests/test_compressed_oops_decode.cpp`
 - `tests/jvm/modules/compressed_oops_decode.cpp`
 
 ## Known bugs

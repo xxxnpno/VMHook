@@ -18,14 +18,14 @@ tags: [category/klass]
 - [[features/constantpool_access|constantpool_access]] — `in_progress` / `high` — Constantpool Access
 - [[features/decode_oop_and_pointers|decode_oop_and_pointers]] — `in_progress` / `medium` — Decode Oop And Pointers
 - [[features/find_class_context_loader|find_class_context_loader]] — `in_progress` / `high` — Find Class Context Loader
-- [[features/find_class_fallback|find_class_fallback]] — `seeded` / `medium` — Find Class Fallback
-- [[features/instanceklass_methods_walk|instanceklass_methods_walk]] — `seeded` / `medium` — Instanceklass Methods Walk
+- [[features/find_class_fallback|find_class_fallback]] — `in_progress` / `medium` — Find Class Fallback
+- [[features/instanceklass_methods_walk|instanceklass_methods_walk]] — `seeded` / `high` — Instanceklass Methods Walk
 - [[features/interface_polymorphism|interface_polymorphism]] — `seeded` / `medium` — Interface Polymorphism
-- [[features/klass_introspection|klass_introspection]] — `seeded` / `medium` — Klass Introspection
+- [[features/klass_introspection|klass_introspection]] — `seeded` / `high` — Klass Introspection
 - [[features/nested_classes|nested_classes]] — `seeded` / `medium` — Nested Classes
 - [[features/poly_inherited_oop|poly_inherited_oop]] — `seeded` / `medium` — Poly Inherited Oop
 - [[features/register_class|register_class]] — `seeded` / `medium` — Register Class
-- [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]] — `seeded` / `medium` — Vmstructs Offset Resolution
+- [[features/vmstructs_offset_resolution|vmstructs_offset_resolution]] — `seeded` / `high` — Vmstructs Offset Resolution
 
 ## Dependency graph
 
@@ -80,6 +80,7 @@ flowchart LR
   klass_introspection --> instanceklass_methods_walk
   klass_introspection --> compressed_klass_decode
   nested_classes --> klass_introspection
+  nested_classes --> find_class_fallback
   poly_inherited_oop --> klass_introspection
   poly_inherited_oop --> field_inherited
   register_class --> wrapper_pattern

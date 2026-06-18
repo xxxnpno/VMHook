@@ -49,6 +49,7 @@ hpp_anchors:
     lines: [4433, 4500]
     note: "Sibling klass-pointer codec using CompressedKlassPointers / Universe::_narrow_klass; same structure and vulnerabilities as decode_oop_pointer"
 test_modules:
+- tests/test_compressed_oops_decode.cpp
 - tests/jvm/modules/compressed_oops_decode.cpp
 depends_on:
 - vmstructs_offset_resolution

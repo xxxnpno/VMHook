@@ -46,6 +46,10 @@ blind untag_pointer masking of kernel addresses (low), iOS safe_read unguarded m
 - [[features/field_string|field_string]]
 - [[features/find_class_context_loader|find_class_context_loader]]
 - [[features/hook_basic|hook_basic]]
+- [[features/interpreter_frame_walk|interpreter_frame_walk]]
+- [[features/method_call_object|method_call_object]]
+- [[features/method_proxy_value_t|method_proxy_value_t]]
+- [[features/method_return_types|method_return_types]]
 - [[features/wrapper_pattern|wrapper_pattern]]
 
 ## Implementation anchors

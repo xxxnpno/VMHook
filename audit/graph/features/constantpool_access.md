@@ -63,6 +63,10 @@ field-stream consumers skip both guards; method consumers have full protection.
 - `method_proxy JNI fallback (_pool_holder)` — `vmhook/ext/vmhook/vmhook.hpp:12687-12688` — raw _pool_holder dereference for class recovery on method_proxy failure
 - `static-overload klass recovery (_pool_holder)` — `vmhook/ext/vmhook/vmhook.hpp:13827-13828` — raw _pool_holder dereference to recover declaring class for static method overload disambiguation
 
+## Tests
+
+- `tests/test_const_method_bounds.cpp`
+
 ## Known bugs
 
 - **[high]** Field-stream constant-pool reads (klass::find_field_in_stream JDK 21+ and Array<u2> path JDK 8–17) have NO _length bound and NO per-slot is_readable_pointer check — asymmetric with const_method::get_name/get_signature bounded path. Indices decoded from heap metadata (UNSIGNED5 / u2 array) can be corrupted/mis-decoded; dereference base[idx] without guards at 2975, 2982 (stream), 3094, 3114 (Array). Access violation not recoverable nullptr. Fix: shared bounded accessor mirroring method-path guards.

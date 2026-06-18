@@ -5,24 +5,39 @@ category: os
 status: seeded
 risk: medium
 specialist: .claude/agents/os_page_size_granularity-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
-java_versions:
-- 8
-- 11
-- 17
-- 21
-- 24
-- 25
-- 26
-tags: []
-hpp_anchors: []
+description: |
+  vmhook::os::page_size / allocation_granularity — the host VM geometry queries
+  every memory operation in the library rounds to.  page_size returns the CPU
+  page size (GetSystemInfo dwPageSize on Windows; sysconf(_SC_PAGESIZE) on POSIX,
+  clamped to a 4096 floor).  allocation_granularity returns the VM reservation
+  granularity (GetSystemInfo dwAllocationGranularity on Windows, where it is the
+  64 KiB stride mmap-style hint placement must align to; identical to page_size
+  on POSIX).  Both are process-invariant.  The platform-invariant contract the
+  trampoline allocator relies on: each is a non-zero power of two >= 4096, and
+  granularity is a whole multiple of page_size (granularity % page == 0).  The
+  module also pins the align_up / align_down arithmetic built on these values.
+java_versions: [8, 11, 17, 21, 24, 25, 26]
+tags: [os, memory, x86_64, arm64]
+hpp_anchors:
+  - symbol: vmhook::os::page_size
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [486, 496]
+    note: "GetSystemInfo / sysconf(_SC_PAGESIZE) with 4096 floor"
+  - symbol: vmhook::os::allocation_granularity
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [501, 510]
+    note: "dwAllocationGranularity on Windows; == page_size on POSIX"
 test_modules:
-- tests/test_os_page_size_granularity.cpp
+  - tests/test_os_page_size_granularity.cpp
+  - tests/test_os_layer.cpp
 depends_on: []
-related: []
+related:
+  - os_allocate_release
+  - os_protect
+  - midi2i_trampoline_alloc
 audit_docs: []
 known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+notes: |
+  test_os_layer.cpp carries the exhaustive page/granularity + align_up/align_down
+  invariant sweep (power-of-two, >= 4096, granularity % page == 0, stability
+  across threads); test_os_page_size_granularity.cpp is the dedicated file.

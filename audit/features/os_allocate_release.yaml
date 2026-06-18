@@ -3,25 +3,43 @@ slug: os_allocate_release
 title: Os Allocate Release
 category: os
 status: seeded
-risk: medium
+risk: high
 specialist: .claude/agents/os_allocate_release-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
-java_versions:
-- 8
-- 11
-- 17
-- 21
-- 24
-- 25
-- 26
-tags: []
-hpp_anchors: []
-test_modules: []
-depends_on: []
-related: []
+description: |
+  vmhook::os::allocate_rwx / release — the cross-platform RWX-memory pair the
+  trampoline allocator is built on.  allocate_rwx reserves+commits `size` bytes
+  of writable, executable memory (VirtualAlloc PAGE_EXECUTE_READWRITE on Windows;
+  mmap PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANONYMOUS on POSIX, falling back to RW
+  on Apple arm64 / iOS where the kernel enforces W^X without the JIT entitlement).
+  address_hint is a non-binding placement preference: VirtualAlloc is binding-or-
+  fail, so an occupied hint is retried once with no hint; POSIX mmap simply
+  relocates.  release frees a prior allocation; release(addr, 0) and
+  release(nullptr, ...) are no-ops (munmap rejects size 0 with EINVAL, Windows
+  VirtualFree ignores size).  size==0 to allocate_rwx returns nullptr.
+java_versions: [8, 11, 17, 21, 24, 25, 26]
+tags: [os, memory, x86_64, arm64, safety]
+hpp_anchors:
+  - symbol: vmhook::os::allocate_rwx
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [703, 750]
+    note: "reserve+commit RWX; non-binding hint rescue + Apple W^X RW fallback"
+  - symbol: vmhook::os::release
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [774, 786]
+    note: "free; null/zero-size no-op guard"
+test_modules:
+  - tests/test_os_layer.cpp
+  - tests/test_os_release_and_protect_edges.cpp
+  - tests/test_os_protect_interaction.cpp
+depends_on:
+  - os_page_size_granularity
+related:
+  - os_protect
+  - os_query_region
+  - midi2i_trampoline_alloc
 audit_docs: []
 known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+notes: |
+  No dedicated JVM module — allocate/release is pure OS-layer, covered by the
+  no-JVM suites.  release(ptr, 0) idempotence + null-guard edges live in
+  test_os_release_and_protect_edges.cpp.

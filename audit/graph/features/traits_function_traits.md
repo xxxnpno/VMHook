@@ -5,7 +5,7 @@ category: infra
 status: seeded
 risk: medium
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/infra]
+tags: [status/seeded, risk/medium, category/infra, tag/traits, tag/function-traits, tag/compile-time, tag/tuple, tag/slot-offsets, tag/detour-decode, tag/no-jvm, tag/infra]
 ---
 
 # Traits Function Traits
@@ -14,13 +14,68 @@ tags: [status/seeded, risk/medium, category/infra]
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
+The compile-time callback-decomposition chain the typed vmhook::hook<T>()
+overload uses to turn a user detour (lambda / std::function / free-function
+pointer / functor) into the exact list of Java parameter types it must read out
+of the interpreter frame. The chain is function_traits<F>::args_tuple_t ->
+tuple_tail<...>::type_t (strip the leading vmhook::return_value&) ->
+java_slot_offsets<...>::value, and the result drives extract_frame_arg<T> per
+slot. function_traits is an undefined primary template plus eight populating
+specialisations (free-fn ptr +noexcept, std::function, generic-functor void_t
+probe, const / non-const / const-noexcept / noexcept member-fn ptr). It exposes
+ONLY args_tuple_t (no return_type — the detour return is delivered out of band
+via return_value). is_java_double_slot_v decides 2-slot (int64/uint64/double)
+vs 1-slot widening; java_slot_offsets folds it into a running offset array. Pure
+compile-time, no JVM: if any link mis-resolves, every detour silently reads the
+wrong slots or fails to compile.
+
+## Referenced from
+
+- [[features/interpreter_frame_walk|interpreter_frame_walk]]
+
+## Implementation anchors
+
+- `detail::function_traits (undefined primary + 8 specialisations)` — `vmhook/ext/vmhook/vmhook.hpp:9136-9200` — primary declared undefined (9136, no args_tuple_t). Specs: free-fn ptr R(*)(args...) 9139; +noexcept 9149; std::function 9155; generic-functor void_t<&F::operator()> probe 9161; const member 9167; non-const member 9173; const noexcept member 9187; noexcept member 9193. Exposes ONLY args_tuple_t. Ref-qualified (&/&&), volatile, and C-variadic member forms remain gaps -> fall to the undefined primary
+- `detail::tuple_tail (strip first element)` — `vmhook/ext/vmhook/vmhook.hpp:9208-9233` — primary declared undefined 9208; <tuple<first,rest...>> -> type_t=tuple<rest...> 9211; tuple_tail<std::tuple<>> empty-tuple specialisation NOW present at 9229 (the zero-param footgun the agent def flagged is FIXED in this header)
+- `detail::is_java_double_slot_v<T>` — `vmhook/ext/vmhook/vmhook.hpp:9271-9275` — true for int64_t / uint64_t / double after remove_cvref_t — the predicate deciding 2-slot vs 1-slot widening
+- `detail::java_slot_offsets<std::tuple<...>>` — `vmhook/ext/vmhook/vmhook.hpp:9296-9322` — fold accumulating the running slot offset (+2 per J/D via is_java_double_slot_v, +1 otherwise) into a std::array<int32_t,N>; empty-tuple specialisation at 9318
 
 ## Tests
 
-- `tests/test_traits_function_traits.cpp`
 - `tests/test_traits.cpp`
+- `tests/test_traits_extra.cpp`
+- `tests/test_traits_function_traits.cpp`
+
+## Known bugs
+
+- **[medium]** function_traits preserves arg cv/ref verbatim, so a by-value vs by-const-ref detour parameter changes method_arg_tuple_t element types. args_tuple_t is std::tuple<argument_types...> UNMODIFIED, so `const std::unique_ptr<W>&` yields a const-ref tuple element while `std::unique_ptr<W>` yields a value element. Both happen to work because is_java_double_slot_v and extract_frame_arg both call remove_cvref_t internally, but nothing in the trait normalises the tuple — the two detour spellings are different instantiations and any future code inspecting element types directly (without remove_cvref_t) diverges by parameter spelling. Hazard, not a live miscompile.
+- **[medium]** Overloaded, templated, or generic-lambda operator() silently falls through to the undefined primary template -> confusing hard error. The functor specialisation takes &F::operator() as a non-overloaded, non-template member pointer; a generic lambda ([](auto&...){}) / a two-overload functor / a templated operator() makes &F::operator() ill-formed, the void_t probe drops, and function_traits<F> resolves to the undefined primary -> 'no member named args_tuple_t' at the hook<T> instantiation. The library requires a single concrete operator() but never says so and has no static_assert for a readable diagnostic.
+- **[low]** No verification that the stripped-off first arg is actually vmhook::return_value&. tuple_tail blindly drops element 0; a user who forgets the return_value& and writes (std::unique_ptr<W>, int) has the chain silently treat the self wrapper as the return-value slot and shift every Java arg by one — self is discarded and int is read from slot 0 (the receiver's compressed-oop bits) -> garbage, no compile error. A static_assert(is_same_v<tuple_element_t<0, all_args_tuple_t>, return_value&>) would catch the most common authoring mistake.
+- **[low]** function_traits does not strip a leading ref-qualified (operator() & / &&) or volatile-qualified operator(). There are member-pointer specialisations for const, non-const, const-noexcept and noexcept only; an lvalue-ref-qualified or volatile hand-written functor falls to the undefined primary. Plain lambdas never hit this; an honest gap in the specialisation set.
 
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+Honest scope: the eight populated function_traits specialisations and the two
+tuple_tail specialisations are individually CORRECT for the inputs they match
+(proven by the existing static_asserts). Every remaining flaw is either an
+undefined-input gap or a missing-contract-check hazard — there is no case where
+a well-formed, correctly-shaped detour decomposes to the wrong tuple. NOTE: the
+agent def predates this header — the zero-param tuple_tail<std::tuple<>> gap and
+the missing noexcept member specs it lists are FIXED here (9229 / 9187 / 9193).
+
+Test coverage: three complementary pure-logic (no-JVM) files. test_traits.cpp
+drives exhaustive compile-time truth tables over a type zoo (is_java_double_slot_v,
+java_slot_offsets tables, shadow guards on is_unique_ptr/is_vector, dependent_false_v).
+test_traits_extra.cpp owns the decomposition CHAIN (function_traits -> tuple_tail
+-> java_slot_offsets, cv/ref convergence, the value_type-shadow regression guards).
+test_traits_function_traits.cpp owns the callable-SHAPE axis (all eight
+specialisations incl. noexcept, the args_tuple_t-only contract, return-type
+irrelevance). The runtime proof that the decomposition reads the right slots
+end-to-end is owned by the JVM hook-install modules, not here.
+
+JDK-independence: function_traits / tuple_tail / is_java_double_slot_v /
+java_slot_offsets are pure C++ compile-time templates — identical on JDK 8..26
+and every compiler. JDK variance only enters DOWNSTREAM in extract_frame_arg
+(compressed-OOP decode, register_class factory lookup) which consumes the tuple
+element types this chain names. The long/double 2-slot mapping is a HotSpot
+interpreter contract stable across all supported versions.

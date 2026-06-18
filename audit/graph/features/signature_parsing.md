@@ -5,7 +5,7 @@ category: method
 status: seeded
 risk: medium
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/method]
+tags: [status/seeded, risk/medium, category/method, tag/signature, tag/descriptor, tag/basic-type, tag/jni, tag/type-mapping, tag/no-jvm, tag/method, tag/field-width]
 ---
 
 # Signature Parsing
@@ -14,7 +14,26 @@ tags: [status/seeded, risk/medium, category/method]
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
+The pure, JVM-free helpers that translate between three representations of a
+method/field type: (a) a JVM type-descriptor CHARACTER -> HotSpot BasicType int
+(sig_char_to_basic_type, Z=4..V=14, unknown char falls to 12/T_OBJECT); (b) a
+JVM primitive descriptor -> in-heap BYTE WIDTH (jvm_primitive_byte_width:
+Z/B=1, S/C=2, I/F=4, J/D=8, anything else 0, with a hard size()!=1 gate); and
+(c) a C++ template type -> JNI DESCRIPTOR STRING (jni_signature_for_arg<T>:
+string-likes -> "Ljava/lang/String;", bool->Z, int8/uint8->B, int16->S,
+uint16->C, int64/uint64->J, float->F, double->D, generic 32-bit integral->I,
+registered wrapper -> "L..;" with a Ljava/lang/Object; fallback, else a hard
+static_assert). These three tables are the spine of every typed call()
+return-type decode, every field_proxy::set width guard, and every
+jni_make_unique constructor-signature build. They touch no oop and no running
+JVM, so they are exhaustively unit-testable off-VM — and must be, because a
+single wrong row silently corrupts a heap write or makes GetMethodID fail.
+
+## Related
+
+- [[features/find_methods_by_signature|find_methods_by_signature]]
+- [[features/make_unique|make_unique]]
+- [[features/field_set_size_guard|field_set_size_guard]]
 
 ## Depended on by
 
@@ -22,19 +41,53 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/hook_basic|hook_basic]]
 - [[features/hook_signature|hook_signature]]
 - [[features/jni_arg_packing|jni_arg_packing]]
+- [[features/method_enumeration|method_enumeration]]
 - [[features/method_explicit_signature|method_explicit_signature]]
 - [[features/method_is_reference|method_is_reference]]
 - [[features/method_overload|method_overload]]
 
-## Referenced from
+## Implementation anchors
 
-- [[features/constantpool_access|constantpool_access]]
+- `detail::sig_char_to_basic_type(const char)` — `vmhook/ext/vmhook/vmhook.hpp:15954-15971` — descriptor-char -> HotSpot BasicType int switch; stable enum ints Z=4,C=5,F=6,D=7,B=8,S=9,I=10,J=11,L=12,'['=13,V=14; default arm returns 12 (T_OBJECT) for EVERY unrecognized char
+- `detail::jvm_primitive_byte_width(std::string_view)` — `vmhook/ext/vmhook/vmhook.hpp:1623-1633` — primitive descriptor -> in-heap byte width; size()!=1 -> 0; Z/B=1, S/C=2, I/F=4, J/D=8, default 0. Forward-declared near 1546 because GCC -Wtemplate-body needs the name visible inside the field_proxy::set template
+- `detail::jni_signature_for_arg<arg_type>()` — `vmhook/ext/vmhook/vmhook.hpp:12772-12860` — C++ type -> JNI descriptor string; std::decay_t strips cv/ref, then a constexpr ladder. uint16->C vs int16->S unsigned-16 split; unique_ptr<wrapper> / object_base-derived -> class-map L..; with Ljava/lang/Object; fallback when unregistered; else static_assert(dependent_false_v)
+- `detail::signature_for_arg<arg_type>() (public re-export)` — `vmhook/ext/vmhook/vmhook.hpp:13490-13494` — forwards verbatim to jni_signature_for_arg — the public entry point that must never diverge from the internal one
+- `return-type extraction in method_proxy::call (rfind(')')+1 -> sig_char_to_basic_type)` — `vmhook/ext/vmhook/vmhook.hpp:16940-16960` — there is no named parse_signature function — this inline rfind(')')+1 IS the return-parse; ret_char fed to sig_char_to_basic_type, result passed to the call-stub as the BasicType while the C++ result is decoded by a SEPARATE switch on the raw char
 
 ## Tests
 
-- `tests/jvm/modules/signature_parsing.cpp`
 - `tests/test_signature_parsing.cpp`
+- `tests/jvm/modules/signature_parsing.cpp`
+
+## Known bugs
+
+- **[medium]** sig_char_to_basic_type collapses malformed/unknown return descriptors into T_OBJECT (vmhook.hpp:15969 default->12), then the call-stub trusts it as a real object return. A signature whose post-`)` char is junk (or a primitive in the wrong case, e.g. 'i') is classified T_OBJECT, so the decode default path treats an arbitrary primitive/garbage return-register value as an oop pointer. Never triggers for a well-formed signature, but converts a malformed one from a clean void/no-op failure into a heap-pointer misinterpretation. A defensive helper would map unknown -> T_VOID (14), the same value the rparen==npos path already uses.
+- **[low]** ret_char = sig[rparen + 1] indexes one past the last ')' with no bounds check (method_proxy::call return-parse). For a degenerate-but-non-empty signature that ENDS in ')' (e.g. "()" or "(I)" with the return char chopped) rparen+1 == size(), so operator[](size()) is read — UB on std::string_view (unlike std::string). Descriptors from live Method::_signature are always well-formed, but call() accepts a caller-supplied override signature, making this reachable from user input.
+- **[low]** uint16_t -> "C" is asymmetric with the BasicType table and with int16_t -> "S". jni_signature_for_arg<uint16_t> deliberately encodes Java char (C) so the round-trip is self-consistent, but a user passing `unsigned short` expecting a numeric 16-bit Java short silently gets a char parameter and GetMethodID then fails to match a (S)-taking overload with only a generic 'method not found' log. Documented design choice; the single most surprising row — every consumer/test must assert it explicitly so it never drifts.
+- **[low]** Class-map fallback to Ljava/lang/Object; for an UNregistered wrapper produces a compilable, plausible, WRONG descriptor. A constructor taking Lcom/example/Foo; will not match Ljava/lang/Object;, so jni_make_unique fails at GetMethodID with only a VMHOOK_LOG warning. Honest hazard for callers who forget register_class<T>().
 
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+The three core tables themselves are correct against JVMS § 4.3.2 and the
+HotSpot BasicType enum (T_BOOLEAN=4 .. T_VOID=14, unchanged JDK 8 -> 26). All
+the risk is at the EDGES: unknown-char policy, the unbounded [rparen+1] read at
+the call site, and the heap-width-vs-C++-sizeof coupling (jvm_primitive_byte_width
+reports HEAP width but is also reused to gate value-size comparisons; the
+char->C widening special-case lives OUTSIDE this helper at the call site, so any
+future reuse of the width helper for a new size guard must replicate it).
+
+Test coverage: tests/test_signature_parsing.cpp (dedicated pure-logic) asserts
+every valid char -> exact BasicType int plus fallback cases, all 8 primitives ->
+{1,2,4,8} plus the zero cases (V/object/array/bare L/empty/unknown/multi-char),
+the full jni_signature_for_arg<T> table incl. the uint16->C split and cv/ref
+stripping, and return-descriptor extraction (return_basic_type_of reproducing the
+rfind(')')+1 call-site). tests/jvm/modules/signature_parsing.cpp is the live-JVM
+backstop that the emitted descriptors actually match real Method entries. The
+sibling JVM modules find_methods_by_signature / hook_signature /
+method_explicit_signature exercise signatures end-to-end but are owned by other
+features (resolve/dispatch is out of scope here).
+
+JDK-version sensitivity is essentially nil for the parsing itself: BasicType ints
+and the descriptor grammar are version-invariant; differences live downstream
+(which call-stub / JNI path consumes the parsed BasicType). char-signedness is a
+host (MSVC/MinGW signed char), not JDK, concern — high bytes route to default.

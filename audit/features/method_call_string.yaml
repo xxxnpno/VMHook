@@ -3,11 +3,22 @@ slug: method_call_string
 title: Method Call String
 category: method
 status: seeded
-risk: medium
+risk: high
 specialist: .claude/agents/method_call_string-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  `method_proxy::call()` that returns `java.lang.String`, and the UTF-8 decode
+  that turns the Java String into an owned `std::string` (extracted via the
+  unambiguous `value_t::as_string()`, never the implicit conversion which is
+  ambiguous against `const char*` on MSVC). Contract:
+  `get_method("foo")->call().as_string()` returns the Java string's bytes
+  exactly. This was the site of the critical "call-stub truncation" bug (a
+  String-returning call() handed back a truncated 32-bit OOP handle instead of
+  decoding the text). The decode has TWO paths that DISAGREE on non-ASCII: the
+  call_jni fallback (the CI path) uses `jni_get_string_utf` -> GetStringUTFChars
+  which returns MODIFIED UTF-8 (U+0000 -> C0 80, supplementary scalars ->
+  CESU-8 surrogate pairs); the call-stub path uses `read_java_string` which walks
+  the String's value byte[]/char[] off the heap, SUBSTITUTES '?' for every code
+  unit >= 0x80, and REJECTS length <= 0 or > 4096 (-> "" for empty and >4096).
 java_versions:
 - 8
 - 11
@@ -16,14 +27,31 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags: [method, call, string, utf-8, modified-utf8, cesu-8, read-java-string, call-jni, decode-divergence]
+hpp_anchors:
+  - symbol: method_proxy::value_t::as_string
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [16180, 16207]
+    note: "std::visit: returns the std::string alternative as-is, read_java_string(decode_oop_pointer(v)) for the uint32 alternative, else \"\""
+  - symbol: method_proxy::call_jni ('L'/'[' String branch)
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [16233, 16870]
+    note: "the CI path: detects Ljava/lang/String;, jni_get_string_utf (GetStringUTFChars -> MODIFIED UTF-8) then jni_delete_local_ref (extract-then-release leak fix)"
+  - symbol: method_proxy::call (call-stub default arm)
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [16871, 17050]
+    note: "read_java_string(result_oop) off the heap — substitutes '?' for code units >= 0x80 and rejects length <= 0 or > 4096"
+  - symbol: detail::jni_get_string_utf / read_java_string
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [12709, 12740]
+    note: "jni_get_string_utf: null-guard, GetStringUTFChars(169) into owned std::string, ReleaseStringUTFChars(170); read_java_string defn at 20098"
 test_modules:
 - tests/jvm/modules/method_call_string.cpp
 depends_on:
 - method_call_primitives
 - make_java_string
 - read_java_string
+- jni_local_ref_hygiene
 related:
 - method_call_jni_fallback
 - method_call_object
@@ -31,7 +59,21 @@ related:
 - method_call_wide_args
 - method_return_types
 - method_static
+- field_string
 audit_docs: []
-known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+known_bugs:
+  - severity: high
+    note: "[headline bug, now fixed; the module is its regression wall] The call-stub default arm used to be value_t{static_cast<uint32_t>(result_holder)}, which truncated the 64-bit oop AND mislabelled it as a compressed OOP, so a Ljava/lang/String; call() returned \"\" on JDK 8/11/17 (call-stub present) while the JNI path returned the text. Now decodes via read_java_string on the stub and GetStringUTFChars on call_jni. The interior-NUL case (a\\0b) is the sharpest guard (a naive C-string copy would terminate at the NUL)."
+  - severity: high
+    note: "[STILL LIVE divergence] The two decoders produce DIFFERENT bytes for the same Java String: GetStringUTFChars (call_jni) preserves unicode as modified UTF-8 (BMP correct, supplementary as CESU-8 surrogate pairs), while read_java_string (call-stub) substitutes '?' for every code unit >= 0x80 and rejects strings longer than 4096. So a non-ASCII or >4096-char String returns different content depending on which dispatch path the live JDK takes — only ASCII <= 4096-char strings round-trip identically on both."
+notes: |
+  CI actually takes the call_jni path (_call_stub_entry is absent from VMStructs on
+  every JDK CI runs: 8, 11, 17, 21, 24, 25). read_java_string rejects length <= 0
+  (so the empty string returns "" on the call-stub path) and length > 4096; the
+  coder branch handles JDK 8 char[] vs JDK 9+ LATIN1 (raw byte copy) / UTF16 ('?'
+  for >= 0x80). The module uses as_string() everywhere (never the implicit
+  conversion), installs a scoped_hook on trigger(), captures results into a
+  mutex-guarded map, and asserts after run_probe. To keep the two decoders from
+  diverging, the fixture strings are ASCII; the unicode/interior-NUL cases are
+  characterized as known divergences, not hard-asserted equal across paths.
+  Java-8-only fixture; call() runs inside the trigger() detour.

@@ -3,11 +3,22 @@ slug: method_call_jni_fallback
 title: Method Call Jni Fallback
 category: method
 status: seeded
-risk: medium
+risk: high
 specialist: .claude/agents/method_call_jni_fallback-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  The JNI INVOCATION FALLBACK path of `method_proxy::call()` —
+  `method_proxy::call_jni()`. `call()` probes `find_call_stub_entry()`
+  (`StubRoutines::_call_stub_entry`): PRESENT (typ. JDK 8-20) -> interpreter
+  call-stub fast path; ABSENT (JDK 21+, and on every JDK where the entry isn't
+  exported via VMStructs — which is what CI exercises) -> `call()`
+  short-circuits straight into `call_jni()`, resolving + caching jclass +
+  jmethodID, marshalling args into a `jvalue[]`, and dispatching via the typed
+  `Call(Static)?<Type>MethodA` JNIEnv slot. The converted `value_t` MUST be
+  identical on either dispatcher. The crash-sensitive surfaces are: JNI
+  local-ref discipline (a leaked NewStringUTF / GetStringUTFChars / result ref
+  fills HotSpot's 16-entry table within ~16 iters and degrades returns), the
+  union-aliasing footgun (a primitive jvalue cell must never reach
+  DeleteLocalRef), and method-id/class-handle cache warm-up reuse.
 java_versions:
 - 8
 - 11
@@ -16,8 +27,24 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags: [method, call, jni, fallback, local-ref, jvalue, call-stub, cache]
+hpp_anchors:
+  - symbol: method_proxy::call_jni
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [16233, 16870]
+    note: "the fallback: resolve+cache jclass/jmethodID, pack jvalue[], dispatch Call(Static)?<Type>MethodA, drain pending exception"
+  - symbol: method_proxy::call (path selection)
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [16871, 16920]
+    note: "probes find_call_stub_entry(); short-circuits to call_jni after ensure_current_java_thread when the stub is absent"
+  - symbol: detail::find_call_stub_entry
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [15936, 15970]
+    note: "StubRoutines::_call_stub_entry; nullptr (the CI norm) is what makes call_jni the live path"
+  - symbol: method_proxy::value_t
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [16033, 16207]
+    note: "the path-independent result the module asserts identical across call-stub vs call_jni"
 test_modules:
 - tests/jvm/modules/method_call_jni_fallback.cpp
 depends_on:
@@ -33,5 +60,18 @@ related:
 - method_static
 audit_docs: []
 known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+notes: |
+  call() probes find_call_stub_entry() and the converted value_t is identical on
+  either dispatcher, so the module RECORDS which path is live (find_call_stub_entry)
+  and asserts the value — a thorough exercise of call() that NATURALLY drives
+  call_jni on modern JDKs while staying correct (not skipped) on the legacy
+  call-stub JDKs. The hazards stressed: detour threads attach and STAY attached
+  (never pop a JNI frame), so the default 16-entry local-ref table fills within ~16
+  iterations if a NewStringUTF / GetStringUTFChars / result ref leaks (symptom:
+  String returns come back "", reference returns null) — the module drives
+  String-RETURN, String-ARG and long+double MULTI-ARG loops 100+ times asserting
+  STABLE results; the union-aliasing footgun (a primitive jvalue cell must NEVER be
+  handed to DeleteLocalRef); cache warm-up (repeated calls reuse cached_method_id /
+  cached_class_handle without corruption). jmethodID is version-sensitive (JDK 8
+  raw Method* vs JDK 9+ tagged slot pointer); the jvalue array itself is
+  JDK-agnostic. Java-8-only fixture, hook trigger(int).

@@ -16,15 +16,15 @@ tags: [category/field]
 - [[features/field_inherited|field_inherited]] — `in_progress` / `medium` — Field Inherited
 - [[features/field_introspection|field_introspection]] — `in_progress` / `medium` — Field Introspection
 - [[features/field_null_safety|field_null_safety]] — `in_progress` / `low` — Field Null Safety
-- [[features/field_object_ref|field_object_ref]] — `seeded` / `medium` — Field Object Ref
+- [[features/field_object_ref|field_object_ref]] — `in_progress` / `medium` — Field Object Ref
 - [[features/field_primitives_get|field_primitives_get]] — `in_progress` / `high` — Field Primitives Get
 - [[features/field_primitives_set|field_primitives_set]] — `in_progress` / `medium` — Field Primitives Set
 - [[features/field_proxy_set_guards|field_proxy_set_guards]] — `in_progress` / `medium` — Field Proxy Set Guards
 - [[features/field_proxy_value_t|field_proxy_value_t]] — `in_progress` / `medium` — Field Proxy Value T
 - [[features/field_set_size_guard|field_set_size_guard]] — `in_progress` / `low` — Field Set Size Guard
-- [[features/field_static|field_static]] — `seeded` / `medium` — Field Static
+- [[features/field_static|field_static]] — `in_progress` / `medium` — Field Static
 - [[features/field_string|field_string]] — `in_progress` / `high` — Field String
-- [[features/watch_static_field|watch_static_field]] — `seeded` / `medium` — Watch Static Field
+- [[features/watch_static_field|watch_static_field]] — `seeded` / `high` — Watch Static Field
 
 ## Dependency graph
 

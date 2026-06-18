@@ -35,6 +35,7 @@ Decodes a 32-bit narrow Klass pointer (from the `_metadata._compressed_klass` sl
 ## Depended on by
 
 - [[features/klass_introspection|klass_introspection]]
+- [[features/make_java_array|make_java_array]]
 
 ## Implementation anchors
 

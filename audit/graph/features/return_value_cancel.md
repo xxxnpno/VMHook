@@ -5,7 +5,7 @@ category: return
 status: seeded
 risk: medium
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/return]
+tags: [status/seeded, risk/medium, category/return, tag/return, tag/x86_64]
 ---
 
 # Return Value Cancel
@@ -14,11 +14,16 @@ tags: [status/seeded, risk/medium, category/return]
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
-
-## Depends on
-
-- [[features/interpreter_frame_walk|interpreter_frame_walk]]
+return_value::cancel() — suppresses the hooked method's original body without
+supplying a replacement return value.  It sets the return_slot's cancel flag to
+true (leaving retval at its zero default); the trampoline checks cancel after the
+callback returns and short-circuits to the stored retval instead of running the
+original method.  This is the void-method counterpart to set<T>(value): use
+cancel() when the method returns void (or when a zero/null return is acceptable),
+set() when a specific value must be returned.  If neither cancel() nor set() is
+called, the original method runs normally.  A bare flag write — no interpreter
+frame walk, no allocation, noexcept — so it is valid regardless of whether the
+return_value carries a frame.
 
 ## Related
 
@@ -29,10 +34,17 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/return_set_wrapper_null|return_set_wrapper_null]]
 - [[features/return_stack_trace_depth|return_stack_trace_depth]]
 
+## Implementation anchors
+
+- `vmhook::return_value::cancel` — `vmhook/ext/vmhook/vmhook.hpp:1411-1415` — sets return_slot->cancel = true; leaves retval at zero
+- `vmhook::hotspot::return_slot` — `vmhook/ext/vmhook/vmhook.hpp:1313-1317` — the {cancel, retval} cell the trampoline reads after the callback
+
 ## Tests
 
 - `tests/jvm/modules/return_value_cancel.cpp`
+- `tests/test_return_value.cpp`
 
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+Bare cancel-flag write; test_return_value.cpp exercises it with no JVM.  The JVM
+module confirms the trampoline actually short-circuits the original body.

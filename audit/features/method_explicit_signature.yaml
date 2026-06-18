@@ -5,9 +5,20 @@ category: method
 status: seeded
 risk: medium
 specialist: .claude/agents/method_explicit_signature-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  `object::get_method(name, signature)` selecting a single overload by EXACT JVM
+  descriptor, and the guarantee that a wrong / absent / empty signature yields NO
+  method (so the resulting call is a safe no-op). Four signature-aware entry
+  points plus portable aliases: the instance overload and the static overload
+  (built with a null owning object), the deducing-this forwarder
+  (`VMHOOK_HAS_DEDUCING_THIS` only), and the always-available portable
+  `static_method(name, sig)`. Each walks the klass superclass chain and matches
+  with the exact compare `name == method_name && signature == method_signature`
+  (zero looseness: no empty-string short-circuit, no prefix match, no case fold),
+  pinning the proxy with `signature_pinned=true`. At call time
+  `resolve_compatible_method` honours the pinned overload verbatim (it only
+  re-resolves when the proxy's own descriptor does NOT match the supplied C++
+  args), so a no-arg / uniquely-typed-arg explicit selection survives end-to-end.
 java_versions:
 - 8
 - 11
@@ -16,8 +27,24 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags: [method, explicit-signature, overload, descriptor, exact-match, pinned, superclass-walk]
+hpp_anchors:
+  - symbol: object::get_method(name, signature) (instance, exact compare)
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [18002, 18070]
+    note: "walks superclass chain; exact name+signature compare; builds method_proxy{instance, method, sig, pinned=true} (FLAW: always passes this->instance even for a static match)"
+  - symbol: object_base::get_method(type_index, name, signature) (static, exact)
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [18135, 18200]
+    note: "same superclass walk; builds method_proxy{nullptr, method, sig, pinned=true} — null owning object, the correct choice for a static accessor"
+  - symbol: object::static_method(name, signature) (portable alias)
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [18806, 18815]
+    note: "always-available portable entry GCC users must use from a static wrapper method"
+  - symbol: method_proxy::resolve_compatible_method / signature_matches_arguments
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [17497, 17600]
+    note: "signature_pinned short-circuit + 'proxy's own descriptor already matches args' check that preserves the explicit selection unless the C++ args don't match"
 test_modules:
 - tests/jvm/modules/method_explicit_signature.cpp
 depends_on:
@@ -28,7 +55,20 @@ related:
 - method_call_primitives
 - method_is_reference
 - method_overload
+- method_static
 audit_docs: []
-known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+known_bugs:
+  - severity: low
+    note: "Instance overload sets a phantom `this` for STATIC methods: it always passes this->instance as the owning object even when the matched Method* is JVM_ACC_STATIC (the static overload correctly passes nullptr). Calling obj.get_method(\"smap\",\"(I)I\") on an instance handle to a static method yields a proxy whose object != nullptr, so call() pushes a bogus receiver into slot 0 and shifts the real arg one slot too high. Fix: peek get_access_flags() for JVM_ACC_STATIC and pass nullptr when static. The module sidesteps it by using static_method(name,sig) for the static family."
+  - severity: low
+    note: "Empty signature is a silent strict-miss with a misleading log: get_method(name, \"\") can never match (every real descriptor starts with '(') so it returns nullopt and logs the generic 'no method with this exact name+signature found', diverging silently from how hook<T>(name, signature) treats an empty signature."
+notes: |
+  The exact-match comparison has zero looseness, so defineClass(String,[B,I,I,
+  ProtectionDomain) cannot be confused with any sibling overload; the match logic
+  is solid and the only way to 'lose' an explicit selection is to call with C++
+  args that don't match the descriptor you asked for (user error, not a lookup
+  flaw). resolve_compatible_method FIRST checks signature_matches_arguments and
+  returns this->method unchanged when the proxy's own signature already matches —
+  so even combo(CharSequence) vs combo(String) is honored because a single L...;
+  parameter matches std::string. Java fixture; the module pins the static family
+  via static_method to avoid the phantom-this flaw.

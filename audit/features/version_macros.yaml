@@ -3,26 +3,58 @@ slug: version_macros
 title: Version Macros
 category: infra
 status: seeded
-risk: medium
+risk: low
 specialist: .claude/agents/version_macros-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
-java_versions:
-- 8
-- 11
-- 17
-- 21
-- 24
-- 25
-- 26
-tags: []
-hpp_anchors: []
+description: |
+  The preprocessor-only version surface of the library: the three SemVer
+  component macros (VMHOOK_VERSION_MAJOR / _MINOR / _PATCH), the packing macro
+  VMHOOK_MAKE_VERSION(major,minor,patch) that builds a comparable integer as a
+  DECIMAL pack (major*1000000 + minor*1000 + patch — each component owns a
+  3-decimal-digit field, lossless only while minor/patch < 1000), the packed
+  integer VMHOOK_VERSION, and the two-level-stringize VMHOOK_VERSION_STRING
+  ("0.5.3"). Pure compile-time: no oop, no JVM, no HotSpot. Consumers gate code
+  with `#if VMHOOK_VERSION >= VMHOOK_MAKE_VERSION(0,3,0)`. The header values are a
+  SECOND source of truth that must stay in sync with CMake `project(VERSION ...)`;
+  that equality is checked only inside the two test targets that receive
+  VMHOOK_CMAKE_VERSION_*. A non-JVM ctest failure here SKIPS the whole JVM matrix.
+java_versions: [8, 11, 17, 21, 24, 25, 26]
+tags:
+- version
+- semver
+- macros
+- preprocessor
+- infra
+- no-jvm
+- build-sync
+hpp_anchors:
+  - symbol: "VMHOOK_VERSION_MAJOR / _MINOR / _PATCH + VMHOOK_MAKE_VERSION + VMHOOK_VERSION + VMHOOK_VERSION_STRING"
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [61, 82]
+    note: "the entire feature is one contiguous block — the ONLY place these tokens are defined or used. Doc/SemVer-intent comment 61-66; component defines 67-69 (bare int literals 0/5/3); VMHOOK_MAKE_VERSION decimal pack 71-72 (((major)*1000000)+((minor)*1000)+(patch)); VMHOOK_VERSION 74-75; two-level stringize VMHOOK_VERSION_STRING_HELPER2/HELPER + dot-concat 77-82"
 test_modules:
 - tests/test_version_macros.cpp
 depends_on: []
 related: []
 audit_docs: []
-known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+known_bugs:
+  - severity: medium
+    note: "Decimal pack is lossless only inside 3-digit fields, but the header never self-asserts it. vmhook.hpp:67-72: bumping _PATCH or _MINOR to 1000 silently carries into the next field — MAKE(0,5,1000) == MAKE(0,6,0) == 6000 — so every downstream `#if VMHOOK_VERSION >= ...` gate becomes wrong with no warning. The minor<1000 / patch<1000 invariant is enforced only in the test files (test_version_macros.cpp:51-52, test_helpers.cpp), not next to the defines. Fix: static_assert/#error width guards at the definition site."
+  - severity: medium
+    note: "Header version and CMake project(VERSION) are two independent hand-synced sources of truth. vmhook.hpp:67-69 (0/5/3) vs CMakeLists.txt:4 (0.5.3); nothing generates one from the other. Equality is checked ONLY inside vmhook_test_helpers and vmhook_test_version_macros (the two targets that get VMHOOK_CMAKE_VERSION_* via target_compile_definitions); the library/consumer build never sees the CMake version. A release that bumps one and forgets the other ships a VMHOOK_VERSION disagreeing with the package version, caught only by ctest."
+  - severity: low
+    note: "Bare 1000000 / 1000 multipliers are plain int — the major field is implicitly capped at ~2147 with no diagnostic. MAKE(2148,0,0) overflows 32-bit int (UB in a constant expression -> hard compile error in a static_assert; silent wrap on a non-constexpr path). Unreachable by any realistic version; fix is an L suffix or a documented cap."
+notes: |
+  Pure preprocessor + integer arithmetic, evaluated before any JVM exists —
+  entirely JDK-independent (the dedicated test states JVM-dependent checks are
+  out of scope). The only real "version" axes are the C++ compiler/preprocessor
+  across the CI matrix (all must agree on the decimal pack and the two-level
+  stringize; MinGW is the historical -Werror blind-spot) and the CMake
+  project(VERSION 0.5.3) it must track by hand.
+
+  Test coverage: tests/test_version_macros.cpp (dedicated, ~50 checks +
+  static_asserts; receives VMHOOK_CMAKE_VERSION_* so it cross-checks the header
+  against CMake) asserts component field-widths, exact MAKE() field weights,
+  combined packs, VMHOOK_VERSION == MAKE(...), field decompose identities,
+  monotonicity/field-dominance, live-state gates, and VMHOOK_VERSION_STRING shape
+  (two dots, digits-only, snprintf rebuild). tests/test_helpers.cpp carries a
+  thinner overlapping test_version_macros() + test_version_string_composition().

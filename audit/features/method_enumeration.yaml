@@ -3,11 +3,21 @@ slug: method_enumeration
 title: Method Enumeration
 category: method
 status: seeded
-risk: medium
+risk: high
 specialist: .claude/agents/method_enumeration-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  Reading a class's `InstanceKlass::_methods` array directly (no JNI/JVMTI) into
+  `(name, JVM-descriptor)` pairs, selecting methods by descriptor when the name
+  rotates per obfuscated build, and installing a hook on the UNIQUE descriptor
+  match while REFUSING an ambiguous one. The four public entry points are
+  `get_class_methods<T>()`, `get_class_methods("internal/Name")`,
+  `find_methods_by_signature<T>(desc)` (exact string-equality, returns ALL
+  matches so the caller can detect non-uniqueness), and
+  `hook_by_signature<T>(desc, detour)` (returns false on no-match OR on > 1 match,
+  else delegates to `hook<T>`). All sit on `detail::collect_klass_methods` (the
+  shared, noexcept, try/catch-wrapped engine that walks the array skipping
+  is_valid_pointer-failing slots). Enumeration is DECLARED-only; works on classes
+  never `register_class<T>()`'d (the discovery path for obfuscated builds).
 java_versions:
 - 8
 - 11
@@ -16,15 +26,53 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags: [method, enumeration, descriptor, hook-by-signature, obfuscation, declared-only, no-jvm]
+hpp_anchors:
+  - symbol: detail::collect_klass_methods
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [8804, 8835]
+    note: "shared engine: noexcept, snapshots count+ptr once, skips is_valid_pointer-failing slots, emplaces get_name()/get_signature(), outer try/catch"
+  - symbol: vmhook::get_class_methods / find_methods_by_signature
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [8853, 8930]
+    note: "by-name (8853), by-wrapper (8873), find_methods_by_signature exact-equality filter (8913) returning ALL matches"
+  - symbol: vmhook::hook_by_signature
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [11214, 11260]
+    note: "resolves names via find_methods_by_signature; false if names.empty() (no-match) OR names.size() > 1 (ambiguous), else hook<T>(names.front(), descriptor, detour)"
+  - symbol: klass::get_methods_count / get_methods_ptr (the substrate)
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [3498, 3580]
+    note: "Array<Method*>::_length at +0 (3498), data at hardcoded x64 +8 (3537) — the real ABI risk under this feature"
 test_modules:
 - tests/jvm/modules/method_enumeration.cpp
 - tests/test_method_enumeration.cpp
+- tests/jvm/modules/find_methods_by_signature.cpp
 depends_on:
 - instanceklass_methods_walk
-related: []
+- klass_introspection
+- signature_parsing
+related:
+- find_methods_by_signature
+- klass_introspection
+- hook_signature
+- method_explicit_signature
 audit_docs: []
-known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+known_bugs:
+  - severity: medium
+    note: "The four public functions are thin and well-guarded; the defects live in the PRIMITIVES they call: get_methods_ptr hardcodes the x64 Array<Method*> +8 data offset and get_methods_count reads _length at +0 as a raw int32 with no ceiling (see instanceklass_methods_walk), and symbol::to_string yields \"\" for length > 0x1000 so a pathological method could enumerate as (\"\",\"\")."
+  - severity: low
+    note: "find_methods_by_signature does pure std::string == std::string_view exact-equality with NO normalization/validation of the descriptor, so a whitespace-padded / lowercased / dotted-form descriptor silently matches nothing (the module pins ~30 such negative inputs as empty, no crash)."
+notes: |
+  log_class_methods<T>() is compiled out in release (VMHOOK_LOG no-op), so the
+  test must use the data-returning overloads. find_class is the resolver behind all
+  overloads (name-cache with a stale-pointer guard that re-reads the cached klass's
+  own name and evicts on mismatch; ClassLoaderDataGraph walk -> context-loader JNI
+  fallback; nullptr for an unknown name = the bogus/empty-name -> empty path).
+  _methods is stable across JDK 8-26, so the method leg is far less version-sensitive
+  than the field leg; the only variance is the synthetic-method set javac emits (JDK
+  8 extra synthetics — the fixtures see 18 vs 16 members, ()V multiplicity 6 vs 5),
+  so tests assert SET membership + LOWER bounds, never an exact total. The no-JVM
+  contract (every entry point empty without throwing) is pinned by
+  tests/test_method_enumeration.cpp; the live SET + descriptor-selector + ambiguity
+  refusal coverage is in the two JVM modules.

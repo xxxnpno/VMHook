@@ -14,7 +14,7 @@ tags: [category/lifecycle]
 - [[features/enum_singleton|enum_singleton]] — `in_progress` / `medium` — Enum Singleton
 - [[features/on_class_loaded|on_class_loaded]] — `seeded` / `medium` — On Class Loaded
 - [[features/on_exception|on_exception]] — `seeded` / `medium` — On Exception
-- [[features/shutdown_hooks_teardown|shutdown_hooks_teardown]] — `seeded` / `medium` — Shutdown Hooks Teardown
+- [[features/shutdown_hooks_teardown|shutdown_hooks_teardown]] — `seeded` / `high` — Shutdown Hooks Teardown
 
 ## Dependency graph
 
