@@ -236,6 +236,77 @@ public final class ReadJavaString
     // A long (>300) UTF-16 string, under the cap on both layouts.
     public static String longCjk  = repeatChar('\u65E5', 300);
 
+    // --- EXPANDED: more surrogate-combine / NUL-position / BMP-boundary shapes ---
+    // TWO CONSECUTIVE surrogate pairs (U+1F600 U+1F601): after combining the first
+    // pair and advancing the index by 2, the loop must pick up the SECOND pair and
+    // combine it too -> two independent 4-byte UTF-8 sequences (8 bytes total,
+    // F0 9F 98 80 F0 9F 98 81).  No ASCII separator (unlike emojiMix), so this is
+    // the back-to-back combine case.
+    public static String twoEmoji = fresh(new char[] { '\uD83D', '\uDE00', '\uD83D', '\uDE01' });
+    // A high surrogate followed by a NON-low-surrogate BMP char (U+D83D then 'A'):
+    // the combine INNER guard (low in DC00..DFFF) is FALSE at a NON-end index, so
+    // the high surrogate emits as a lone 3-byte CESU and the following 'A' decodes
+    // normally -> ED A0 BD 41 (4 bytes).  Distinct from highAtEnd (high is LAST so
+    // the (i+1)<count OUTER guard is false) and reversedPair (low THEN high).
+    public static String highThenBmp = fresh(new char[] { '\uD83D', 'A' });
+    // A high surrogate followed by ANOTHER high surrogate (U+D83D U+D83D): the inner
+    // guard is false (the second unit is not a LOW surrogate), so the first emits as
+    // a lone 3-byte CESU and the loop re-examines the second high surrogate -- which,
+    // now last, also emits as a lone CESU -> ED A0 BD ED A0 BD (6 bytes).
+    public static String highThenHigh = fresh(new char[] { '\uD83D', '\uD83D' });
+    // A surrogate pair with an interior NUL AFTER it (emoji then NUL): proves the
+    // NUL following an astral code point is preserved and the index advance from the
+    // combine landed correctly -> F0 9F 98 80 00 (5 bytes).
+    public static String emojiThenNul = fresh(new char[] { '\uD83D', '\uDE00', '\0' });
+
+    // LEADING / TRAILING / ALL-NUL strings: the std::string is sized by the array
+    // length, NOT cut at the first NUL like a C string -- prove that at every NUL
+    // position, on BOTH coders.
+    // Leading NUL then ASCII (LATIN1): 00 61 62 (3 bytes).
+    public static String leadingNul = fresh(new char[] { '\0', 'a', 'b' });
+    // ASCII then trailing NUL (LATIN1): 61 62 00 (3 bytes).
+    public static String trailingNul = fresh(new char[] { 'a', 'b', '\0' });
+    // ALL NULs (LATIN1): three U+0000 chars -> 00 00 00 (3 bytes), not "".
+    public static String allNul = fresh(new char[] { '\0', '\0', '\0' });
+    // A NUL char promoted to the UTF-16 path by a neighbouring >0xFF char, with the
+    // NUL FIRST (U+0000 then U+65E5): 00 E6 97 A5 (4 bytes).  Complements nulUtf16
+    // (interior NUL) by putting the NUL at index 0 of a UTF-16 backing.
+    public static String leadingNulUtf16 = fresh(new char[] { '\0', '\u65E5' });
+
+    // BMP boundary fillers the existing set is missing:
+    // U+007F -- the LAST 1-byte UTF-8 code point, as a STANDALONE single char (the
+    // 1-byte/2-byte boundary from below; latin1Lo80 pins it from above at U+0080).
+    public static String last1Byte = fresh(new char[] { '\u007F' });
+    // U+0100 (Latin Capital A with macron) -- a >0xFF char so coder 1 (UTF16): a
+    // mid-range 2-byte UTF-8 code point on the UTF-16 path (C4 80).  bmp2to3a pins
+    // the TOP of the 2-byte range (U+07FF); this fills the interior.
+    public static String midTwoByte = fresh(new char[] { '\u0100' });
+    // U+0080 forced through the UTF-16 path: U+0080 alone is LATIN1, so pair it with
+    // a >0xFF char to promote the whole string to coder 1.  Proves the FIRST 2-byte
+    // code point (C2 80) is produced by the UTF-16 decode path too, not only LATIN1.
+    public static String firstTwoByteUtf16 = fresh(new char[] { '\u0080', '\u4E2D' });
+    // U+0801 -- ONE past the first 3-byte code point (U+0800), confirms the 3-byte
+    // encoder is not an off-by-one at its low edge (E0 A0 81).
+    public static String firstThreeBytePlus1 = fresh(new char[] { '\u0801' });
+    // U+FEFF -- a byte-order mark carried as a normal BMP char (NOT stripped):
+    // read_java_string is a verbatim decoder, so a leading BOM stays EF BB BF.
+    public static String bom = fresh(new char[] { '\uFEFF', 'a' });
+    // 'e' + U+0301 (combining acute accent): a two-code-point grapheme through the
+    // UTF-16 path (the U+0301 > 0xFF promotes it) -> 65 CC 81 (3 bytes).  Realistic
+    // decomposed text; proves sequential BMP decode across a 1-byte then 2-byte char.
+    public static String combining = fresh(new char[] { 'e', '\u0301' });
+
+    // BULK boundary cases (modest size -- keep heap small):
+    // 500x U+00E9 (LATIN1): every char takes the 2-byte LATIN1 encode -> 1000 bytes
+    // of repeating C3 A9.  longAscii exercises the 1-byte LATIN1 loop in bulk; this
+    // exercises the 2-byte LATIN1 encode in bulk (all256 only hits each high byte
+    // once).
+    public static String bulkLatin1Hi = repeatChar('\u00E9', 500);
+    // 200x U+1F600 (UTF-16 surrogate pairs): 200 astral code points back-to-back,
+    // exercising the surrogate-combine + index-advance loop IN BULK (longCjk is BMP
+    // only; the bulk combine path was otherwise untested) -> 200*4 = 800 bytes.
+    public static String bulkEmoji = repeatAstral(0x1F600, 200);
+
     // Long-String read-in-full targets (robustness bug #29 FIXED: no more 4096 cap;
     // read_java_string reads IN FULL up to 16M chars, uniformly per char count) ---
     // 4095 ASCII chars: ONE char BELOW the OLD 4096 cap -- the last length the old
@@ -344,6 +415,44 @@ public final class ReadJavaString
     public static volatile int     jCoderMaxBmp;    // 1 (UTF16)  / -1
     public static volatile boolean jHasCoderField;  // true on JDK 9+, false on 8
 
+    // --- EXPANDED-coverage cross-check witnesses ---------------------------
+    public static volatile int     jTwoEmojiLen;        // 4 (2 surrogate pairs)
+    public static volatile int     jTwoEmojiCpCount;    // 2
+    public static volatile int     jTwoEmojiCp0;        // 0x1F600
+    public static volatile int     jTwoEmojiCp1;        // 0x1F601 (codePointAt(2))
+    public static volatile int     jHighThenBmpLen;     // 2 (hi surrogate, 'A')
+    public static volatile int     jHighThenBmpCp0;     // 0xD83D (lone)
+    public static volatile int     jHighThenBmpCp1;     // 'A' == 0x41 (codePointAt(1))
+    public static volatile int     jHighThenHighLen;    // 2 (two hi surrogates)
+    public static volatile int     jHighThenHighCp0;    // 0xD83D
+    public static volatile int     jHighThenHighCp1;    // 0xD83D (codePointAt(1))
+    public static volatile int     jEmojiThenNulLen;    // 3 (hi, lo, NUL)
+    public static volatile int     jEmojiThenNulCpCount;// 2 (U+1F600, U+0000)
+    public static volatile int     jLeadingNulLen;      // 3
+    public static volatile int     jLeadingNulCp0;      // 0 (the leading NUL)
+    public static volatile int     jTrailingNulLen;     // 3
+    public static volatile int     jTrailingNulCp2;     // 0 (the trailing NUL)
+    public static volatile int     jAllNulLen;          // 3
+    public static volatile int     jLeadingNulUtf16Len; // 2 (NUL, U+65E5)
+    public static volatile int     jLeadingNulUtf16Cp0; // 0
+    public static volatile int     jLeadingNulUtf16Cp1; // 0x65E5
+    public static volatile int     jLast1ByteCp0;       // 0x007F
+    public static volatile int     jMidTwoByteCp0;      // 0x0100
+    public static volatile int     jFirstTwoByteUtf16Cp0;   // 0x0080
+    public static volatile int     jFirstTwoByteUtf16Cp1;   // 0x4E2D
+    public static volatile int     jFirstThreeBytePlus1Cp0; // 0x0801
+    public static volatile int     jBomCp0;             // 0xFEFF
+    public static volatile int     jBomLen;             // 2
+    public static volatile int     jCombiningLen;       // 2 ('e', U+0301)
+    public static volatile int     jCombiningCp1;       // 0x0301
+    public static volatile int     jBulkLatin1HiLen;    // 500
+    public static volatile int     jBulkEmojiLen;       // 400 (200 surrogate pairs)
+    public static volatile int     jBulkEmojiCpCount;   // 200
+    public static volatile int     jCoderTwoEmoji;      // 1 (UTF16) / -1
+    public static volatile int     jCoderBulkLatin1Hi;  // 0 (LATIN1) / -1
+    public static volatile int     jCoderMidTwoByte;    // 1 (UTF16) / -1
+    public static volatile int     jCoderBom;           // 1 (UTF16) / -1
+
     // ---------------------- helpers ----------------------------------------
     /** new String(char[]) -> a PRIVATE backing array (never an interned alias). */
     private static String fresh(final char[] chars)
@@ -362,6 +471,26 @@ public final class ReadJavaString
         for (int i = 0; i < n; i++)
         {
             buf[i] = c;
+        }
+        return new String(buf);
+    }
+
+    /**
+     * Build a fresh String of {@code n} repeats of the astral code point
+     * {@code cp} (cp &gt;= 0x10000), each carried as a UTF-16 surrogate pair.  Used
+     * for the bulk surrogate-combine subject; owns a private char[] via
+     * new String(char[]).  Surrogate split is done by hand to keep the source pure
+     * ASCII and Java 8 safe.
+     */
+    private static String repeatAstral(final int cp, final int n)
+    {
+        final char hi = (char) (0xD800 + ((cp - 0x10000) >> 10));
+        final char lo = (char) (0xDC00 + ((cp - 0x10000) & 0x3FF));
+        final char[] buf = new char[n * 2];
+        for (int i = 0; i < n; i++)
+        {
+            buf[i * 2]     = hi;
+            buf[i * 2 + 1] = lo;
         }
         return new String(buf);
     }
@@ -483,6 +612,44 @@ public final class ReadJavaString
                 jCoderLongCjk   = coderOf(longCjk);
                 jCoderLongAscii = coderOf(longAscii);
                 jCoderMaxBmp    = coderOf(maxBmp);
+
+                // --- EXPANDED-coverage witnesses ---------------------------
+                jTwoEmojiLen        = twoEmoji.length();
+                jTwoEmojiCpCount    = twoEmoji.codePointCount(0, twoEmoji.length());
+                jTwoEmojiCp0        = twoEmoji.codePointAt(0);
+                jTwoEmojiCp1        = twoEmoji.codePointAt(2);
+                jHighThenBmpLen     = highThenBmp.length();
+                jHighThenBmpCp0     = highThenBmp.codePointAt(0);
+                jHighThenBmpCp1     = highThenBmp.codePointAt(1);
+                jHighThenHighLen    = highThenHigh.length();
+                jHighThenHighCp0    = highThenHigh.codePointAt(0);
+                jHighThenHighCp1    = highThenHigh.codePointAt(1);
+                jEmojiThenNulLen    = emojiThenNul.length();
+                jEmojiThenNulCpCount = emojiThenNul.codePointCount(0, emojiThenNul.length());
+                jLeadingNulLen      = leadingNul.length();
+                jLeadingNulCp0      = leadingNul.codePointAt(0);
+                jTrailingNulLen     = trailingNul.length();
+                jTrailingNulCp2     = trailingNul.codePointAt(2);
+                jAllNulLen          = allNul.length();
+                jLeadingNulUtf16Len = leadingNulUtf16.length();
+                jLeadingNulUtf16Cp0 = leadingNulUtf16.codePointAt(0);
+                jLeadingNulUtf16Cp1 = leadingNulUtf16.codePointAt(1);
+                jLast1ByteCp0       = last1Byte.codePointAt(0);
+                jMidTwoByteCp0      = midTwoByte.codePointAt(0);
+                jFirstTwoByteUtf16Cp0 = firstTwoByteUtf16.codePointAt(0);
+                jFirstTwoByteUtf16Cp1 = firstTwoByteUtf16.codePointAt(1);
+                jFirstThreeBytePlus1Cp0 = firstThreeBytePlus1.codePointAt(0);
+                jBomCp0             = bom.codePointAt(0);
+                jBomLen             = bom.length();
+                jCombiningLen       = combining.length();
+                jCombiningCp1       = combining.codePointAt(1);
+                jBulkLatin1HiLen    = bulkLatin1Hi.length();
+                jBulkEmojiLen       = bulkEmoji.length();
+                jBulkEmojiCpCount   = bulkEmoji.codePointCount(0, bulkEmoji.length());
+                jCoderTwoEmoji      = coderOf(twoEmoji);
+                jCoderBulkLatin1Hi  = coderOf(bulkLatin1Hi);
+                jCoderMidTwoByte    = coderOf(midTwoByte);
+                jCoderBom           = coderOf(bom);
 
                 ReadJavaString.done = true;
             }

@@ -294,6 +294,115 @@ namespace
             return get_method(name)->call().as_string();
         }
 
+        // ---- STATIC return decoders (static_method(name)->call()).  These ride the
+        //      DISTINCT static dispatch path: jclass via the Method's pool_holder name +
+        //      FindClass, jmethodID via GetStaticMethodID -- NOT GetObjectClass/
+        //      GetMethodID.  Each pins the decoded C++ type as a copy-initialised local
+        //      exactly like the instance decoders, so the static path's return decode is
+        //      asserted to parity with the instance path. ----
+        static auto static_bool(const char* name) -> bool { return static_method(name)->call(); }
+        static auto static_i8(const char* name) -> std::int8_t { return static_method(name)->call(); }
+        static auto static_i16(const char* name) -> std::int16_t { return static_method(name)->call(); }
+        static auto static_char_as_int(const char* name) -> std::int32_t
+        {
+            const std::uint16_t raw = static_method(name)->call();
+            return static_cast<std::int32_t>(raw);
+        }
+        static auto static_i32(const char* name) -> std::int32_t { return static_method(name)->call(); }
+        static auto static_i64(const char* name) -> std::int64_t { return static_method(name)->call(); }
+        static auto static_float_bits(const char* name) -> std::uint32_t
+        {
+            const float f = static_method(name)->call();
+            std::uint32_t bits{};
+            std::memcpy(&bits, &f, sizeof(bits));
+            return bits;
+        }
+        static auto static_double_bits(const char* name) -> std::uint64_t
+        {
+            const double d = static_method(name)->call();
+            std::uint64_t bits{};
+            std::memcpy(&bits, &d, sizeof(bits));
+            return bits;
+        }
+        static auto static_string(const char* name) -> std::string
+        {
+            return static_method(name)->call().as_string();
+        }
+        static auto static_is_void(const char* name) -> bool
+        {
+            return static_method(name)->call().is_void();
+        }
+        static auto static_variant_index(const char* name) -> int
+        {
+            const auto m{ static_method(name) };
+            if (!m.has_value()) { return -1; }
+            return static_cast<int>(m->call().data.index());
+        }
+        // static reference (array / Object) -> raw decoded OOP via the void* path.
+        static auto static_reference_oop(const char* name) -> void*
+        {
+            const auto m{ static_method(name) };
+            if (!m.has_value()) { return nullptr; }
+            void* const raw = m->call();
+            if (raw == nullptr || !vmhook::hotspot::is_valid_pointer(raw)) { return nullptr; }
+            return raw;
+        }
+        // static null returner -> empty wrapper?  (Java null -> monostate on either path.)
+        static auto static_null_wrapper_is_null(const char* name) -> bool
+        {
+            const auto m{ static_method(name) };
+            if (!m.has_value()) { return true; }
+            std::unique_ptr<rt> wrapped = m->call();
+            return wrapped == nullptr;
+        }
+
+        // ---- SIGNATURE-PINNED overload resolution: get_method(name, SIGNATURE) pins an
+        //      EXACT overload (signature_pinned=true), so resolve_compatible_method honours
+        //      it verbatim and the return-type char comes from THAT overload's descriptor.
+        //      Each combo overload differs in BOTH arg type and return type; the pinned
+        //      descriptor is the only disambiguator, and the decode must match the pinned
+        //      overload's return kind. ----
+        auto combo_int(std::int32_t arg) -> std::int32_t
+        {
+            const auto m{ get_method("combo", "(I)I") };
+            if (!m.has_value()) { return 0; }
+            return m->call(arg);
+        }
+        auto combo_long(std::int64_t arg) -> std::int64_t
+        {
+            const auto m{ get_method("combo", "(J)J") };
+            if (!m.has_value()) { return 0; }
+            return m->call(arg);
+        }
+        auto combo_string(const char* arg) -> std::string
+        {
+            const auto m{ get_method("combo", "(Ljava/lang/String;)Ljava/lang/String;") };
+            if (!m.has_value()) { return {}; }
+            return m->call(arg).as_string();
+        }
+        auto combo_double_bits() -> std::uint64_t
+        {
+            const auto m{ get_method("combo", "()D") };
+            if (!m.has_value()) { return 0; }
+            const double d = m->call();
+            std::uint64_t bits{};
+            std::memcpy(&bits, &d, sizeof(bits));
+            return bits;
+        }
+        // The variant alternative each pinned overload's return decodes to (proves the
+        // return-type char is read from the RESOLVED overload, not the latched-first one).
+        auto combo_variant_index(const char* sig) -> int
+        {
+            const auto m{ get_method("combo", sig) };
+            if (!m.has_value()) { return -1; }
+            // Call with a benign arg matching the pinned signature where needed; the
+            // ()D / (I)I / (J)J / (String)String overloads each take 0 or 1 arg.
+            if (std::string{ sig } == "()D") { return static_cast<int>(m->call().data.index()); }
+            if (std::string{ sig } == "(I)I") { return static_cast<int>(m->call(std::int32_t{ 1 }).data.index()); }
+            if (std::string{ sig } == "(J)J") { return static_cast<int>(m->call(std::int64_t{ 1 }).data.index()); }
+            return static_cast<int>(m->call("q").data.index());
+        }
+
         // Sentinels distinguishing "decode produced a null wrapper" from a real 0.
         static constexpr std::int64_t  k_box_unset{ static_cast<std::int64_t>(0x7BADF00DBADF00DULL) };
         static constexpr std::uint64_t k_box_unset_bits{ 0x7BADF00DBADF00DULL };
@@ -473,6 +582,60 @@ namespace
     // nested-generic-erased-to-Object: a usable non-null reference decode.
     std::atomic<int>           g_nested_generic_usable{ -1 };
 
+    // ── NEW: additional boundary primitive returns ────────────────────────────
+    std::atomic<std::int64_t>  g_byte_zero{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_char_zero{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_char_high{ k_uncaptured64 };   // 0x8000 -> 32768 zero-extend
+    std::atomic<std::int64_t>  g_int_zero{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_int_negone{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_long_max{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_long_high_only{ k_uncaptured64 }; // low 32 bits zero
+    std::atomic<std::int64_t>  g_long_low_only{ k_uncaptured64 };  // high 32 bits zero (NOT sign-ext)
+    std::atomic<std::uint32_t> g_float_negzero_bits{ k_uncaptured_fbits };
+    std::atomic<std::uint32_t> g_float_neginf_bits{ k_uncaptured_fbits };
+    std::atomic<std::uint32_t> g_float_subnormal_bits{ k_uncaptured_fbits };
+    std::atomic<std::uint64_t> g_double_negzero_bits{ k_uncaptured_dbits };
+    std::atomic<std::uint64_t> g_double_posinf_bits{ k_uncaptured_dbits };
+    std::atomic<std::uint64_t> g_double_subnormal_bits{ k_uncaptured_dbits };
+    // NEW: additional String returns
+    std::atomic<bool>          g_str_onechar_captured{ false };
+    std::string                g_str_onechar_value{};
+    std::atomic<bool>          g_str_control_captured{ false };
+    std::string                g_str_control_value{};
+    std::atomic<int>           g_str_long_vidx{ -2 };  // a long String is still the string alt
+
+    // ── NEW: STATIC-method return decode (the GetStaticMethodID dispatch path) ──
+    std::atomic<int>           g_st_bool{ -1 };
+    std::atomic<std::int64_t>  g_st_byte{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_st_short{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_st_char{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_st_int{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_st_long{ k_uncaptured64 };
+    std::atomic<std::uint32_t> g_st_float_bits{ k_uncaptured_fbits };
+    std::atomic<std::uint64_t> g_st_double_bits{ k_uncaptured_dbits };
+    std::atomic<int>           g_st_void_is_void{ -1 };
+    std::atomic<int>           g_st_void_side_effect_ran{ -1 };
+    std::atomic<bool>          g_st_str_captured{ false };
+    std::string                g_st_str_value{};
+    std::atomic<int>           g_st_string_vidx{ -2 };
+    std::atomic<int>           g_st_int_vidx{ -2 };
+    std::atomic<int>           g_st_void_vidx{ -2 };
+    std::atomic<int>           g_st_null_wrapper_is_null{ -1 };
+    std::atomic<std::int64_t>  g_st_arr_len{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_st_arr_elem1{ k_uncaptured64 };
+    std::atomic<int>           g_st_obj_usable{ -1 };
+
+    // ── NEW: signature-pinned overload resolution -> per-overload return decode ──
+    std::atomic<std::int64_t>  g_combo_int{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_combo_long{ k_uncaptured64 };
+    std::atomic<bool>          g_combo_str_captured{ false };
+    std::string                g_combo_str_value{};
+    std::atomic<std::uint64_t> g_combo_double_bits{ k_uncaptured_dbits };
+    std::atomic<int>           g_combo_vidx_i{ -2 };
+    std::atomic<int>           g_combo_vidx_j{ -2 };
+    std::atomic<int>           g_combo_vidx_str{ -2 };
+    std::atomic<int>           g_combo_vidx_d{ -2 };
+
     auto reset_observations() -> void
     {
         g_detour_calls.store(0);
@@ -534,6 +697,37 @@ namespace
         g_charseq_captured.store(false);
         g_own_type_instance.store(0);
         g_nested_generic_usable.store(-1);
+        // new boundary primitives
+        g_byte_zero.store(k_uncaptured64);
+        g_char_zero.store(k_uncaptured64); g_char_high.store(k_uncaptured64);
+        g_int_zero.store(k_uncaptured64);  g_int_negone.store(k_uncaptured64);
+        g_long_max.store(k_uncaptured64);
+        g_long_high_only.store(k_uncaptured64); g_long_low_only.store(k_uncaptured64);
+        g_float_negzero_bits.store(k_uncaptured_fbits);
+        g_float_neginf_bits.store(k_uncaptured_fbits);
+        g_float_subnormal_bits.store(k_uncaptured_fbits);
+        g_double_negzero_bits.store(k_uncaptured_dbits);
+        g_double_posinf_bits.store(k_uncaptured_dbits);
+        g_double_subnormal_bits.store(k_uncaptured_dbits);
+        // new strings
+        g_str_onechar_captured.store(false); g_str_control_captured.store(false);
+        g_str_long_vidx.store(-2);
+        // static returns
+        g_st_bool.store(-1);   g_st_byte.store(k_uncaptured64);
+        g_st_short.store(k_uncaptured64); g_st_char.store(k_uncaptured64);
+        g_st_int.store(k_uncaptured64);   g_st_long.store(k_uncaptured64);
+        g_st_float_bits.store(k_uncaptured_fbits); g_st_double_bits.store(k_uncaptured_dbits);
+        g_st_void_is_void.store(-1); g_st_void_side_effect_ran.store(-1);
+        g_st_str_captured.store(false);
+        g_st_string_vidx.store(-2); g_st_int_vidx.store(-2); g_st_void_vidx.store(-2);
+        g_st_null_wrapper_is_null.store(-1);
+        g_st_arr_len.store(k_uncaptured64); g_st_arr_elem1.store(k_uncaptured64);
+        g_st_obj_usable.store(-1);
+        // overloads
+        g_combo_int.store(k_uncaptured64); g_combo_long.store(k_uncaptured64);
+        g_combo_str_captured.store(false); g_combo_double_bits.store(k_uncaptured_dbits);
+        g_combo_vidx_i.store(-2); g_combo_vidx_j.store(-2);
+        g_combo_vidx_str.store(-2); g_combo_vidx_d.store(-2);
     }
 
     // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run it
@@ -829,6 +1023,84 @@ namespace
                     void* const ref{ self->call_reference_oop("returnsNestedGeneric") };
                     g_nested_generic_usable.store(ref != nullptr ? 1 : 0);
                 }
+
+                // ===== NEW boundary primitive returns ============================
+                g_byte_zero.store(self->call_i8("returnsByteZero"));
+                g_char_zero.store(self->call_char_as_int("returnsCharZero"));
+                g_char_high.store(self->call_char_as_int("returnsCharHigh"));
+                g_int_zero.store(self->call_i32("returnsIntZero"));
+                g_int_negone.store(self->call_i32("returnsIntNegOne"));
+                g_long_max.store(self->call_i64("returnsLongMax"));
+                g_long_high_only.store(self->call_i64("returnsLongHighOnly"));
+                g_long_low_only.store(self->call_i64("returnsLongLowOnly"));
+                g_float_negzero_bits.store(float_bits(self->call_float("returnsFloatNegZero")));
+                g_float_neginf_bits.store(float_bits(self->call_float("returnsFloatNegInf")));
+                g_float_subnormal_bits.store(float_bits(self->call_float("returnsFloatSubnormal")));
+                g_double_negzero_bits.store(double_bits(self->call_double("returnsDoubleNegZero")));
+                g_double_posinf_bits.store(double_bits(self->call_double("returnsDoublePosInf")));
+                g_double_subnormal_bits.store(double_bits(self->call_double("returnsDoubleSubnormal")));
+
+                // ===== NEW String returns ========================================
+                {
+                    const std::string s{ self->call_string("returnsStringOneChar") };
+                    g_str_onechar_value = s;
+                    g_str_onechar_captured.store(true);
+                }
+                {
+                    const std::string s{ self->call_string("returnsStringControl") };
+                    g_str_control_value = s;
+                    g_str_control_captured.store(true);
+                }
+                g_str_long_vidx.store(self->call_variant_index("returnsStringLong"));
+
+                // ===== STATIC-method return decode (GetStaticMethodID path) ======
+                g_st_bool.store(rt::static_bool("staticReturnsBool") ? 1 : 0);
+                g_st_byte.store(rt::static_i8("staticReturnsByte"));
+                g_st_short.store(rt::static_i16("staticReturnsShort"));
+                g_st_char.store(rt::static_char_as_int("staticReturnsChar"));
+                g_st_int.store(rt::static_i32("staticReturnsInt"));
+                g_st_long.store(rt::static_i64("staticReturnsLong"));
+                g_st_float_bits.store(rt::static_float_bits("staticReturnsFloat"));
+                g_st_double_bits.store(rt::static_double_bits("staticReturnsDouble"));
+                g_st_void_is_void.store(rt::static_is_void("staticReturnsVoid") ? 1 : 0);
+                {
+                    const std::int32_t before{ rt::void_side_effect() };
+                    const bool decoded_void{ rt::static_is_void("staticReturnsVoid") };
+                    const std::int32_t after{ rt::void_side_effect() };
+                    g_st_void_side_effect_ran.store((decoded_void && after == before + 1) ? 1 : 0);
+                }
+                {
+                    const std::string s{ rt::static_string("staticReturnsString") };
+                    g_st_str_value = s;
+                    g_st_str_captured.store(true);
+                }
+                g_st_string_vidx.store(rt::static_variant_index("staticReturnsString"));
+                g_st_int_vidx.store(rt::static_variant_index("staticReturnsInt"));
+                g_st_void_vidx.store(rt::static_variant_index("staticReturnsVoid"));
+                g_st_null_wrapper_is_null.store(rt::static_null_wrapper_is_null("staticReturnsNull") ? 1 : 0);
+                {
+                    void* const a{ rt::static_reference_oop("staticReturnsIntArray") };
+                    g_st_arr_len.store(a ? vmhook::array_length(a) : k_uncaptured64);
+                    g_st_arr_elem1.store(a ? static_cast<std::int64_t>(array_elem<std::int32_t>(a, 1)) : k_uncaptured64);
+                }
+                {
+                    void* const a{ rt::static_reference_oop("staticReturnsObject") };
+                    g_st_obj_usable.store(a != nullptr ? 1 : 0);
+                }
+
+                // ===== SIGNATURE-PINNED overload resolution ======================
+                g_combo_int.store(self->combo_int(5));
+                g_combo_long.store(self->combo_long(7));
+                {
+                    const std::string s{ self->combo_string("x") };
+                    g_combo_str_value = s;
+                    g_combo_str_captured.store(true);
+                }
+                g_combo_double_bits.store(self->combo_double_bits());
+                g_combo_vidx_i.store(self->combo_variant_index("(I)I"));
+                g_combo_vidx_j.store(self->combo_variant_index("(J)J"));
+                g_combo_vidx_str.store(self->combo_variant_index("(Ljava/lang/String;)Ljava/lang/String;"));
+                g_combo_vidx_d.store(self->combo_variant_index("()D"));
             }) };
         ctx.check("rt_trigger_hook_installed", hook_installed);
 
@@ -915,6 +1187,102 @@ namespace
         // A void call() actually EXECUTED the method body (observable side effect),
         // not merely decoded an absent result -- hard-asserted on every path.
         ctx.check("mrt_void_side_effect_observed", g_void_side_effect_ran.load() == 1);
+
+        // =====================================================================
+        //  3a-bis. NEW boundary primitive decodes (hard-asserted on every path).
+        //      These extend the headline+min/max coverage with exact-zero,
+        //      all-ones, unsigned-char high-bit, and high/low-word-only longs --
+        //      each catching a specific truncation/sign-extension defect.
+        // =====================================================================
+        // byte 0 (not the k_uncaptured sentinel) -- exact zero survives.
+        ctx.check("mrt_byte_zero", g_byte_zero.load() == 0);
+        // char 0 (NUL char) zero-extends to 0, not -1.
+        ctx.check("mrt_char_zero_is_0", g_char_zero.load() == 0);
+        // char 0x8000 zero-extends to 32768 (unsigned), NOT -32768.
+        ctx.check("mrt_char_high_zero_extends_32768", g_char_high.load() == 32768);
+        // int 0 exact; int -1 is all-ones decoded as signed -1.
+        ctx.check("mrt_int_zero", g_int_zero.load() == 0);
+        ctx.check("mrt_int_negone_all_ones_is_neg1", g_int_negone.load() == -1);
+        // long max; high-word-only (low 32 bits zero) catches a "read low word" bug;
+        // low-word-only (high 32 bits zero) must NOT sign-extend the low word.
+        ctx.check("mrt_long_max", g_long_max.load() == std::numeric_limits<std::int64_t>::max());
+        ctx.check("mrt_long_high_word_only",
+                  g_long_high_only.load() == static_cast<std::int64_t>(0x1234567800000000LL));
+        ctx.check("mrt_long_low_word_only_no_sign_extend",
+                  g_long_low_only.load() == static_cast<std::int64_t>(0x00000000FFFFFFFFLL));
+        // float/double IEEE specials: -0.0 (sign bit set, distinct from +0.0), -Inf,
+        // +Inf, smallest subnormal -- each asserted by exact bits through the atomic.
+        ctx.check("mrt_float_neg_zero_bits_80000000", g_float_negzero_bits.load() == 0x80000000u);
+        ctx.check("mrt_float_neg_inf_bits_ff800000",  g_float_neginf_bits.load() == 0xFF800000u);
+        ctx.check("mrt_float_subnormal_bits_1",        g_float_subnormal_bits.load() == 0x00000001u);
+        ctx.check("mrt_double_neg_zero_bits", g_double_negzero_bits.load() == 0x8000000000000000ULL);
+        ctx.check("mrt_double_pos_inf_bits",  g_double_posinf_bits.load()  == 0x7FF0000000000000ULL);
+        ctx.check("mrt_double_subnormal_bits_1", g_double_subnormal_bits.load() == 0x0000000000000001ULL);
+
+        // =====================================================================
+        //  3a-ter. STATIC-method return decode (hard-asserted on every path).  These
+        //      ride the DISTINCT static dispatch path (jclass via the Method's
+        //      pool_holder name + FindClass, jmethodID via GetStaticMethodID), which
+        //      is separate from the instance returners' GetObjectClass/GetMethodID.
+        //      Headline values intentionally differ from the instance returners so a
+        //      decode that accidentally hit an instance method would mismatch.  The
+        //      primitives/String/void here decode independent of compressed-oops, so
+        //      they are hard-asserted unconditionally (reference statics are gated
+        //      under ref_usable below).
+        // =====================================================================
+        ctx.check("mrt_static_bool_true",  g_st_bool.load() == 1);
+        ctx.check("mrt_static_byte_neg42", g_st_byte.load() == -42);
+        ctx.check("mrt_static_short_neg23456", g_st_short.load() == -23456);
+        ctx.check("mrt_static_char_0xBEEF_48879", g_st_char.load() == 48879);
+        ctx.check("mrt_static_int_0x7EADBEEF",
+                  g_st_int.load() == static_cast<std::int64_t>(static_cast<std::int32_t>(0x7EADBEEF)));
+        ctx.check("mrt_static_long_pattern",
+                  g_st_long.load() == static_cast<std::int64_t>(-0x0FEDCBA987654321LL));
+        ctx.check("mrt_static_float_bits", g_st_float_bits.load() == 0x42F6E979u);
+        ctx.check("mrt_static_double_bits", g_st_double_bits.load() == 0xC09FE5C91D14E3BCULL);
+        ctx.check("mrt_static_void_is_void", g_st_void_is_void.load() == 1);
+        ctx.check("mrt_static_void_side_effect_observed", g_st_void_side_effect_ran.load() == 1);
+        ctx.check("mrt_static_string_captured", g_st_str_captured.load());
+        if (g_st_str_captured.load())
+        {
+            ctx.check("mrt_static_string_value", g_st_str_value == "static-hello");
+        }
+        // The static path picks the SAME value_t alternatives as the instance path:
+        // a static String is the string alt (10), a static int is i32 (4), a static
+        // void is monostate (0) -- descriptor routing is path-independent.
+        ctx.check("mrt_static_string_is_string_alt", g_st_string_vidx.load() == 10);
+        ctx.check("mrt_static_int_is_i32_alt", g_st_int_vidx.load() == 4);
+        ctx.check("mrt_static_void_is_monostate_alt", g_st_void_vidx.load() == 0);
+        // A static method returning Java null -> empty wrapper on either path
+        // (the null oop/handle short-circuits before any compressed-oop math).
+        ctx.check("mrt_static_null_yields_empty_wrapper", g_st_null_wrapper_is_null.load() == 1);
+
+        // =====================================================================
+        //  3a-quater. SIGNATURE-PINNED overload resolution (hard-asserted, path-
+        //      independent).  get_method("combo", SIGNATURE) pins an EXACT overload;
+        //      resolve_compatible_method honours it verbatim, and the return-type char
+        //      is read from THAT overload's descriptor.  Each combo overload differs in
+        //      arg AND return type, so a wrong overload selection would mis-decode the
+        //      return.  The variant index proves the return alternative came from the
+        //      pinned overload (int->i32, long->i64, String->string, ()->double).
+        // =====================================================================
+        // combo(int 5) = 5 + 0x1000 = 0x1005; combo(long 7) = 7 + 0x100000000.
+        ctx.check("mrt_combo_int_pinned_overload",
+                  g_combo_int.load() == static_cast<std::int64_t>(0x1005));
+        ctx.check("mrt_combo_long_pinned_overload",
+                  g_combo_long.load() == static_cast<std::int64_t>(0x100000007LL));
+        ctx.check("mrt_combo_string_captured", g_combo_str_captured.load());
+        if (g_combo_str_captured.load())
+        {
+            ctx.check("mrt_combo_string_pinned_overload", g_combo_str_value == "x!");
+        }
+        // combo() -> 6.25 has IEEE-754 double bits 0x4019000000000000.
+        ctx.check("mrt_combo_double_pinned_overload",
+                  g_combo_double_bits.load() == 0x4019000000000000ULL);
+        ctx.check("mrt_combo_int_overload_is_i32_alt",   g_combo_vidx_i.load() == 4);
+        ctx.check("mrt_combo_long_overload_is_i64_alt",  g_combo_vidx_j.load() == 5);
+        ctx.check("mrt_combo_string_overload_is_string_alt", g_combo_vidx_str.load() == 10);
+        ctx.check("mrt_combo_double_overload_is_double_alt", g_combo_vidx_d.load() == 7);
 
         // =====================================================================
         //  3b. DESCRIPTOR-DRIVEN TYPE ROUTING (hard-asserted on every path).  The
@@ -1017,6 +1385,28 @@ namespace
             }
             ctx.check("mrt_string_long_size_300", g_str_long_value.size() == 300u);
             ctx.check("mrt_string_long_exact", g_str_long_value == expected_long);
+        }
+        // A long (300-char) String is STILL the std::string variant alternative -- the
+        // length does not change which alternative call() picks, only the bytes.
+        ctx.check("mrt_string_long_is_string_alt", g_str_long_vidx.load() == 10);
+        // Single-char String boundary: length-1 decode is exact (not empty, not over-read).
+        ctx.check("mrt_string_onechar_captured", g_str_onechar_captured.load());
+        if (g_str_onechar_captured.load())
+        {
+            ctx.check("mrt_string_onechar_is_Z", g_str_onechar_value == "Z");
+            ctx.check("mrt_string_onechar_size_1", g_str_onechar_value.size() == 1u);
+        }
+        // All-ASCII-control String: 5 chars U+0001 U+0002 U+0008 U+0009 U+001F, all
+        // below 0x20 and none U+0000, so both dispatch paths decode the identical 5
+        // single bytes (each control char < 0x80 -> one UTF-8 byte; LATIN1 on JDK9+).
+        // Proves a control char is decoded as data, never cut as a terminator, and
+        // length is read from the array header (not a C string scan).
+        ctx.check("mrt_string_control_captured", g_str_control_captured.load());
+        if (g_str_control_captured.load())
+        {
+            const std::string expected_control{ "\x01\x02\x08\x09\x1F" };
+            ctx.check("mrt_string_control_size_5", g_str_control_value.size() == 5u);
+            ctx.check("mrt_string_control_exact_bytes", g_str_control_value == expected_control);
         }
         // Interior-NUL String: the two dispatch paths legitimately differ (standard
         // UTF-8 single 0x00 vs modified UTF-8 C0 80), so CHARACTERIZE, do not assert.
@@ -1155,6 +1545,15 @@ namespace
             // side never tries to recover the erased <...> type arguments.
             ctx.check("mrt_nested_generic_decodes_usable_reference",
                       g_nested_generic_usable.load() == 1);
+
+            // ---- STATIC reference returns (ride the reference OOP round-trip too) ----
+            // A static method returning int[]{11,22,33}: the static dispatch path
+            // recovers the array OOP and reads length + a boundary element, proving the
+            // GetStaticMethodID path's reference decode parity with the instance path.
+            ctx.check("mrt_static_int_array_len3", g_st_arr_len.load() == 3);
+            ctx.check("mrt_static_int_array_elem1_22", g_st_arr_elem1.load() == 22);
+            // A static method returning the shared Object singleton decodes usable.
+            ctx.check("mrt_static_object_decodes_usable", g_st_obj_usable.load() == 1);
         }
         else
         {
@@ -1177,6 +1576,11 @@ namespace
                        + (g_obj_wrapper_is_null.load() == 1 ? "true" : "false")
                        + " self_obj_instance=0x" + std::to_string(g_self_obj_instance.load())
                        + " receiver=0x" + std::to_string(g_receiver_instance.load()) + ".");
+            ctx.record("[INFO] method_return_types: STATIC reference decodes unusable on this "
+                       "JVM -- static int[] len=" + std::to_string(g_st_arr_len.load())
+                       + " static Object usable=" + std::to_string(g_st_obj_usable.load())
+                       + " (recorded not asserted; static PRIMITIVE/String/void/null decodes "
+                         "above are still hard-asserted).");
         }
 
         // =====================================================================

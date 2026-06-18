@@ -96,6 +96,59 @@ public final class FieldArraysObject
         }
     }
 
+    /**
+     * NON-final polymorphic base for the inherited-element / polymorphic-array
+     * coverage.  {@code Node} carries an INHERITED {@code tag} field and a
+     * {@code kind()} method; {@link Leaf} extends it and adds its OWN {@code leaf}
+     * field plus overrides {@code kind()}.  A {@code Node[]} can therefore hold a
+     * runtime MIX of {@code Node} and {@code Leaf} instances (covariance +
+     * polymorphism), and the native side reads the inherited {@code tag} through a
+     * single wrapper regardless of the concrete element class — the
+     * inherited-field-through-a-polymorphic-array-slot case the final {@link Item}
+     * cannot express.  Both implement {@link Tagged} so the same item_object
+     * wrapper also decodes them.
+     */
+    public static class Node implements Tagged
+    {
+        public int tag;   // INHERITED field — read identically on Node and Leaf.
+
+        public Node(final int tag)
+        {
+            this.tag = tag;
+        }
+
+        @Override
+        public int getTag()
+        {
+            return this.tag;
+        }
+
+        public int kind()
+        {
+            return 1;   // base discriminator.
+        }
+    }
+
+    /** Subclass of {@link Node}: inherits {@code tag}, adds its own {@code leaf}
+        field, overrides {@code kind()}.  Proves a decoded array slot reads the
+        BASE field even when the runtime object is the derived type. */
+    public static final class Leaf extends Node
+    {
+        public int leaf;
+
+        public Leaf(final int tag, final int leaf)
+        {
+            super(tag);
+            this.leaf = leaf;
+        }
+
+        @Override
+        public int kind()
+        {
+            return 2;   // derived discriminator (override dispatch).
+        }
+    }
+
     // ---- String[] fields --------------------------------------------------
 
     /** Canonical 3-element String[], all non-null. */
@@ -203,6 +256,18 @@ public final class FieldArraysObject
     /** Empty 2D Item[][] (outer length 0). */
     public static volatile Item[][] grid2dEmpty = new Item[0][];
 
+    /** Single-row 2D Item[][]: one row of one element (degenerate 2-D shape). */
+    public static volatile Item[][] grid2dSingle = { { new Item(91) } };
+
+    /** 2D Item[][] with EVERY outer row null: { null, null }. */
+    public static volatile Item[][] grid2dAllNullRows = new Item[2][];
+
+    /** 2D Item[][] with an EMPTY (length-0) inner row in the middle:
+        { row, emptyRow, row }.  The empty row is non-null but its inner length
+        is 0 — distinct from a null row. */
+    public static volatile Item[][] grid2dEmptyRow =
+        { { new Item(92) }, new Item[0], { new Item(93) } };
+
     // ---- JAGGED 2D Item[][] for explicit inner-row descent ----------------
     // The native side walks the OUTER array, then walks each non-null ROW oop as
     // an array in its own right (array_length + get_array_element per inner slot),
@@ -265,6 +330,31 @@ public final class FieldArraysObject
     /** Mixed Tagged[]: { Item(111), null, Item(113) }. */
     public static volatile Tagged[] taggedMixed =
         { new Item(111), null, new Item(113) };
+
+    // ---- POLYMORPHIC / INHERITED-element arrays ---------------------------
+    // A Node[] holding a runtime MIX of the base Node and the derived Leaf, so a
+    // single wrapper reads the INHERITED `tag` field off both concrete classes
+    // (and a null slot stays a real nullptr).  The Tagged[] sibling holds the
+    // same polymorphic mix through the interface element type.
+
+    /** Polymorphic Node[]: { Node(140), Leaf(150,7), null, Node(160) }. */
+    public static volatile Node[] polyNodes =
+        { new Node(140), new Leaf(150, 7), null, new Node(160) };
+
+    /** Tagged[] holding a Node + a Leaf (interface-typed polymorphic mix). */
+    public static volatile Tagged[] taggedPoly =
+        { new Node(170), new Leaf(180, 9) };
+
+    /** A single Leaf in a Node[] — derived-only element via a base-typed array. */
+    public static volatile Node[] leafOnly = { new Leaf(190, 11) };
+
+    // ---- ABSTRACT-superclass-typed array (Number[] holding Integers) ------
+    // Declared java.lang.Number[] (signature "[Ljava/lang/Number;") — an ABSTRACT
+    // class element type — whose runtime elements are boxed Integers.  Proves the
+    // "[L" signature branch keys on the descriptor, not on whether the L-class is
+    // concrete / abstract / interface; the native side decodes each slot as a
+    // java.lang.Integer and reads its value.
+    public static volatile Number[] numberInts = { 21, 22, 23 };
 
     // ---- Field typed plain Object that HOLDS an array (covariance) ----------
     // The DECLARED field type is java.lang.Object (signature "Ljava/lang/Object;"),
@@ -330,6 +420,14 @@ public final class FieldArraysObject
     public static volatile int taggedMixedLen;
     public static volatile int largeItemsLen;
     public static volatile int objectHoldingArrayLen;
+    public static volatile int polyNodesLen;
+    public static volatile int taggedPolyLen;
+    public static volatile int numberIntsLen;
+    public static volatile int grid2dSingleLen;
+    public static volatile int grid2dAllNullRowsLen;
+    public static volatile int grid2dEmptyRowLen;
+    public static volatile int cube3dPlane0Len;
+    public static volatile int cube3dPlane0Row0Len;
 
     /** Hookable instance method — the native module hooks this to prove the
         fixture is live and to obtain a `self` that can read instance fields. */
@@ -360,6 +458,14 @@ public final class FieldArraysObject
         taggedMixedLen   = taggedMixed.length;
         largeItemsLen    = largeItems.length;
         objectHoldingArrayLen = ((Object[]) objectHoldingArray).length;
+        polyNodesLen          = polyNodes.length;
+        taggedPolyLen         = taggedPoly.length;
+        numberIntsLen         = numberInts.length;
+        grid2dSingleLen       = grid2dSingle.length;
+        grid2dAllNullRowsLen  = grid2dAllNullRows.length;
+        grid2dEmptyRowLen     = grid2dEmptyRow.length;
+        cube3dPlane0Len       = cube3d[0].length;
+        cube3dPlane0Row0Len   = ((Object[]) cube3d[0][0]).length;
     }
 
     static

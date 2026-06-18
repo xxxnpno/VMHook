@@ -255,6 +255,35 @@ namespace
         // Raw proxy for the canonical [I field, used by the out-of-range
         // get_array_element checks (index < 0 / == length / > length).
         static auto p_static_int()         { return static_field("staticIntArray"); }
+
+        // --- TWO-element (length-2) reads, one per width class -----------------
+        static auto two_byte()   -> std::vector<std::int8_t>   { return static_field("twoByteArray")->get(); }
+        static auto two_int()    -> std::vector<std::int32_t>  { return static_field("twoIntArray")->get(); }
+        static auto two_long()   -> std::vector<std::int64_t>  { return static_field("twoLongArray")->get(); }
+        static auto two_double() -> std::vector<double>        { return static_field("twoDoubleArray")->get(); }
+
+        // --- ALL-SAME-VALUE / degenerate-bool reads ---------------------------
+        static auto same_int()   -> std::vector<std::int32_t>  { return static_field("sameIntArray")->get(); }
+        static auto all_true()   -> std::vector<bool>          { return static_field("allTrueArray")->get(); }
+        static auto all_false()  -> std::vector<bool>          { return static_field("allFalseArray")->get(); }
+
+        // --- UNSIGNED-element reinterpretation of signed sources --------------
+        // Same [B / [S / [I fields read into UNSIGNED C++ element types, firing
+        // distinct get_array_element<T> instantiations (uint8/uint16/uint32) and
+        // proving the raw bytes are reinterpreted, not sign-mangled.
+        static auto signed_byte_as_u8()   -> std::vector<std::uint8_t>  { return static_field("signedByteArray")->get(); }
+        static auto signed_short_as_u16() -> std::vector<std::uint16_t> { return static_field("signedShortArray")->get(); }
+        static auto signed_int_as_u32()   -> std::vector<std::uint32_t> { return static_field("signedIntArray")->get(); }
+        // Matching-width SIGNED controls (the same fields, ordinary read).
+        static auto signed_byte_as_i8()   -> std::vector<std::int8_t>   { return static_field("signedByteArray")->get(); }
+        static auto signed_int_as_i32()   -> std::vector<std::int32_t>  { return static_field("signedIntArray")->get(); }
+
+        // --- INSTANCE large + special reads (instance-offset path) ------------
+        auto i_large_int()     -> std::vector<std::int32_t> { return get_field("instLargeIntArray")->get(); }
+        auto i_special_float() -> std::vector<float>        { return get_field("instSpecialFloatArray")->get(); }
+
+        // char[] with embedded NUL + lone surrogate; read into vector<char>.
+        static auto nul_char() -> std::vector<char> { return static_field("nulCharArray")->get(); }
     };
 
     // ---- small comparison helpers --------------------------------------------
@@ -1265,6 +1294,206 @@ static void run_field_arrays_primitive_checks(vmhook_test::context& ctx)
                               array_oop, std::numeric_limits<std::int32_t>::min()) == 0);
             }
         }
+    }
+
+    // =========================================================================
+    // 18) TWO-element arrays (length 2) -- the smallest "many" boundary, between
+    //     the single-element (length 1) and canonical (length 3) shapes already
+    //     covered.  Exercises the read loop's first->last transition with no mid
+    //     element across the 1 / 4 / 8-byte width classes.
+    // =========================================================================
+    {
+        const std::vector<std::int8_t> byte_v{ wrapper::two_byte() };
+        ctx.check("two_byte_size2", byte_v.size() == 2);
+        ctx.check("two_byte_values",
+                  vectors_equal(byte_v, std::vector<std::int8_t>{
+                      static_cast<std::int8_t>(-100), static_cast<std::int8_t>(100) }));
+
+        const std::vector<std::int32_t> int_v{ wrapper::two_int() };
+        ctx.check("two_int_size2", int_v.size() == 2);
+        ctx.check("two_int_values",
+                  vectors_equal(int_v, std::vector<std::int32_t>{ -2000000000, 2000000000 }));
+
+        const std::vector<std::int64_t> long_v{ wrapper::two_long() };
+        ctx.check("two_long_size2", long_v.size() == 2);
+        ctx.check("two_long_values",
+                  vectors_equal(long_v, std::vector<std::int64_t>{
+                      std::numeric_limits<std::int64_t>::min() + 1,
+                      std::numeric_limits<std::int64_t>::max() - 1 }));
+
+        const std::vector<double> double_v{ wrapper::two_double() };
+        ctx.check("two_double_size2", double_v.size() == 2);
+        ctx.check("two_double_values",
+                  all_bits_equal(double_v, std::vector<double>{ -123.456, 789.0625 }));
+    }
+
+    // =========================================================================
+    // 19) ALL-SAME-VALUE / degenerate-bool arrays -- every element identical.
+    //     The ascending arrays above would still pass an index-0 spot check if
+    //     the per-element offset arithmetic were stuck; these assert the SIZE
+    //     AND that every element equals the constant, so a stuck-stride that
+    //     returned slot 0 for all indices passes here only when the size is also
+    //     right -- and the all-distinct large arrays (section 5) catch the
+    //     stride.  Together they bracket the offset arithmetic from both sides.
+    //     All-true / all-false also exercise the vector<bool> uint8!=0 decode at
+    //     its two saturated extremes.
+    // =========================================================================
+    {
+        const std::vector<std::int32_t> same_v{ wrapper::same_int() };
+        bool same_ok{ same_v.size() == 5 };
+        for (std::size_t i{ 0 }; same_ok && i < same_v.size(); ++i)
+        {
+            same_ok = same_v[i] == 777;
+        }
+        ctx.check("same_int_size5", same_v.size() == 5);
+        ctx.check("same_int_all_777", same_ok);
+
+        const std::vector<bool> at{ wrapper::all_true() };
+        bool at_ok{ at.size() == 4 };
+        for (std::size_t i{ 0 }; at_ok && i < at.size(); ++i)
+        {
+            at_ok = at[i] == true;
+        }
+        ctx.check("all_true_size4", at.size() == 4);
+        ctx.check("all_true_values", at_ok);
+
+        const std::vector<bool> af{ wrapper::all_false() };
+        bool af_ok{ af.size() == 4 };
+        for (std::size_t i{ 0 }; af_ok && i < af.size(); ++i)
+        {
+            af_ok = af[i] == false;
+        }
+        ctx.check("all_false_size4", af.size() == 4);
+        ctx.check("all_false_values", af_ok);
+    }
+
+    // =========================================================================
+    // 20) UNSIGNED-element reinterpretation -- a sign-bit-set [B / [S / [I read
+    //     into an UNSIGNED C++ element type fires a distinct get_array_element<T>
+    //     instantiation (uint8/uint16/uint32) and must reinterpret the raw bytes,
+    //     not sign-extend or mangle them.  Each is paired with a matching-width
+    //     SIGNED control proving the two views of the SAME field agree bit-for-bit
+    //     (the unsigned value is the two's-complement of the signed value).
+    // =========================================================================
+    {
+        // [B { -1, MIN, MAX } -> uint8_t { 0xFF, 0x80, 0x7F }.
+        const std::vector<std::uint8_t> bu{ wrapper::signed_byte_as_u8() };
+        ctx.check("unsigned_byte_size3", bu.size() == 3);
+        ctx.check("unsigned_byte_values",
+                  vectors_equal(bu, std::vector<std::uint8_t>{
+                      static_cast<std::uint8_t>(0xFF),
+                      static_cast<std::uint8_t>(0x80),
+                      static_cast<std::uint8_t>(0x7F) }));
+        // Signed control over the same field.
+        const std::vector<std::int8_t> bs{ wrapper::signed_byte_as_i8() };
+        ctx.check("unsigned_byte_signed_control",
+                  vectors_equal(bs, std::vector<std::int8_t>{
+                      static_cast<std::int8_t>(-1),
+                      std::numeric_limits<std::int8_t>::min(),
+                      std::numeric_limits<std::int8_t>::max() }));
+
+        // [S { -1, MIN, MAX } -> uint16_t { 0xFFFF, 0x8000, 0x7FFF }.
+        const std::vector<std::uint16_t> su{ wrapper::signed_short_as_u16() };
+        ctx.check("unsigned_short_size3", su.size() == 3);
+        ctx.check("unsigned_short_values",
+                  vectors_equal(su, std::vector<std::uint16_t>{
+                      static_cast<std::uint16_t>(0xFFFF),
+                      static_cast<std::uint16_t>(0x8000),
+                      static_cast<std::uint16_t>(0x7FFF) }));
+
+        // [I { -1, MIN, MAX } -> uint32_t { 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF }.
+        const std::vector<std::uint32_t> iu{ wrapper::signed_int_as_u32() };
+        ctx.check("unsigned_int_size3", iu.size() == 3);
+        ctx.check("unsigned_int_values",
+                  vectors_equal(iu, std::vector<std::uint32_t>{
+                      0xFFFFFFFFU, 0x80000000U, 0x7FFFFFFFU }));
+        // Signed control over the same field.
+        const std::vector<std::int32_t> is{ wrapper::signed_int_as_i32() };
+        ctx.check("unsigned_int_signed_control",
+                  vectors_equal(is, std::vector<std::int32_t>{
+                      -1, std::numeric_limits<std::int32_t>::min(),
+                      std::numeric_limits<std::int32_t>::max() }));
+    }
+
+    // =========================================================================
+    // 21) INSTANCE large + special arrays -- the 256-element large case and the
+    //     NaN/Inf/subnormal special case existed only on the STATIC path; here
+    //     the instance-offset read path covers a 64-element large int array
+    //     (deterministic formula, every element checked) and an instance special
+    //     float array (NaN / -Inf / +Inf / -0.0, bit-exact so signed-zero and
+    //     NaN survive the instance read too).
+    // =========================================================================
+    {
+        const std::unique_ptr<wrapper> self{ wrapper::get_instance() };
+        ctx.check("instance_large_wrapper_nonnull", self != nullptr);
+        if (self)
+        {
+            constexpr std::int32_t inst_len{ 64 };
+            const std::vector<std::int32_t> big{ self->i_large_int() };
+            bool big_ok{ big.size() == static_cast<std::size_t>(inst_len) };
+            for (std::int32_t i{ 0 }; big_ok && i < inst_len; ++i)
+            {
+                big_ok = big[static_cast<std::size_t>(i)] == (i * 11 - 333);
+            }
+            ctx.check("instance_large_int_size64", big.size() == static_cast<std::size_t>(inst_len));
+            ctx.check("instance_large_int_all", big_ok);
+
+            const std::vector<float> spf{ self->i_special_float() };
+            ctx.check("instance_special_float_size4", spf.size() == 4);
+            const bool spf_ok{
+                spf.size() == 4
+                && std::isnan(spf[0])
+                && spf[1] == -std::numeric_limits<float>::infinity()
+                && spf[2] == std::numeric_limits<float>::infinity()
+                && bits_equal(spf[3], -0.0f) };   // negative zero, bit-exact
+            ctx.check("instance_special_float_values", spf_ok);
+            // -0.0f must be bit-distinct from +0.0f to prove the bit-exact read.
+            ctx.check("instance_special_float_neg_zero_bits",
+                      spf.size() == 4 && !bits_equal(spf[3], 0.0f));
+        }
+    }
+
+    // =========================================================================
+    // 22) char[] with embedded NUL (0x00) + lone surrogate (0xD800) -- Java
+    //     char[] has no NUL terminator, so a 0x0000 element mid-array is a legal
+    //     code unit and the read must NOT stop early at it; a lone surrogate is
+    //     a legal char[] element (though not a valid String).  The raw uint16
+    //     layer recovers all four code units exactly (proving no early NUL
+    //     truncation); into vector<char> each narrows to its low byte.
+    // =========================================================================
+    {
+        const std::vector<char> nc{ wrapper::nul_char() };
+        ctx.check("nul_char_size4", nc.size() == 4);
+        // { 0x0000, 'Z'(0x5A), 0xD800, 0x0041 } -> low bytes { 0x00, 0x5A, 0x00, 0x41 }.
+        ctx.check("nul_char_low_bytes",
+                  vectors_equal(nc, std::vector<char>{
+                      static_cast<char>(0x00), static_cast<char>(0x5A),
+                      static_cast<char>(0x00), static_cast<char>(0x41) }));
+
+        // Raw uint16 endpoints recover the exact code units (no NUL early-out):
+        // index 0 == 0x0000, mid (index 2) == 0xD800, last (index 3) == 0x0041.
+        std::int32_t len{ -1 };
+        std::uint16_t a{}, m{}, z{};
+        const bool ok{ raw_endpoints_static<std::uint16_t>("nulCharArray", len, a, m, z) };
+        ctx.check("nul_char_raw_len4", ok && len == 4);
+        ctx.check("nul_char_raw_exact",
+                  ok && a == 0x0000 && m == 0xD800 && z == 0x0041);
+    }
+
+    // =========================================================================
+    // 23) RAW recovery of the high-code-unit unicodeCharArray -- the vector<char>
+    //     read (section 10) saw only the truncated low bytes; the raw uint16
+    //     layer recovers all four ORIGINAL code units exactly, proving the loss
+    //     is purely in the vector<char> narrowing and not in the array read.
+    //     { 'a'(0x61), 0x00FF, 0x0100, 0x20AC } -- endpoints 0/mid(2)/last(3).
+    // =========================================================================
+    {
+        std::int32_t len{ -1 };
+        std::uint16_t a{}, m{}, z{};
+        const bool ok{ raw_endpoints_static<std::uint16_t>("unicodeCharArray", len, a, m, z) };
+        ctx.check("unicode_char_raw_len4", ok && len == 4);
+        ctx.check("unicode_char_raw_exact",
+                  ok && a == 0x0061 && m == 0x0100 && z == 0x20AC);
     }
 
     // =========================================================================

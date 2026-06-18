@@ -306,6 +306,35 @@ namespace
         std::atomic<bool> fed_len_ok{ false };     // Java-observed .length == feed len
         std::atomic<bool> fed_first_last_ok{ false }; // Java-observed [0]/[last] match
         std::atomic<bool> fed_type_ok{ false };    // Java-observed getClass().getName() == descriptor
+
+        // ── NEW input coverage (all NATIVE, all primitive descriptors) ──
+        // SINGLETON round-trip: len-1 array where [0] IS [last] — the degenerate
+        // length the sparse first/mid/last probes (gated len<3) never element-test.
+        std::atomic<bool> one_tested{ false };
+        std::atomic<bool> one_ok{ false };
+        // FULL fill+verify at a small length: write EVERY index to a distinct,
+        // position-derived value and read EVERY index back — catches an interior
+        // stride/aliasing error the [0]/[mid]/[last] probes skip.
+        std::atomic<bool> full_tested{ false };
+        std::atomic<bool> full_ok{ false };
+        // OUT-OF-BOUNDS safety on the data region make_java_array hands off:
+        // an OOB get returns T{}, an OOB set is a no-op (leaves a neighbouring
+        // in-bounds element intact) — never heap corruption past the allocation.
+        std::atomic<bool> oob_tested{ false };
+        std::atomic<bool> oob_read_clamped{ false };   // get at len / -1 / INT_MAX -> T{}
+        std::atomic<bool> oob_write_noop{ false };      // set OOB left [last] intact
+        // OVER-SIZED element_size tolerance (characterises flaw #3 harmless path):
+        // passing a LARGER element_size over-allocates but _length + a true-stride
+        // round-trip must still be correct.
+        std::atomic<bool> oversize_tested{ false };
+        std::atomic<bool> oversize_len_ok{ false };
+        std::atomic<bool> oversize_rt_ok{ false };
+        // DISTINCT-ALLOCATION identity: two arrays made with the same
+        // descriptor/length are different oops (no cached/shared oop), and writing
+        // one does not disturb the other.
+        std::atomic<bool> distinct_tested{ false };
+        std::atomic<bool> distinct_oops{ false };
+        std::atomic<bool> distinct_isolated{ false };
     };
 
     enum desc_index : std::size_t
@@ -570,6 +599,257 @@ namespace
     {
         desc_result& r{ g_results[di] };
         deep_round_trip_into(di, deep_slots{ r.mid_deep_tested, r.mid_deep_first_ok, r.mid_deep_mid_ok, r.mid_deep_last_ok }, oop, len);
+    }
+
+    // ── NEW: a distinct, position-derived element value for index i.  Each type
+    //    maps the seed onto a value that is unique per index across the small
+    //    lengths used here, so a full fill+read-back can catch a slot ALIASING
+    //    another slot (which a constant fill could not).  For bool we alternate
+    //    true/false; for char we stay in the 0..0xFFFF code-unit range. ──
+    template<typename element_type>
+    auto synth(std::int32_t i) noexcept -> element_type
+    {
+        if constexpr (std::is_same_v<element_type, bool>)
+        {
+            return (i % 2) == 0;
+        }
+        else if constexpr (std::is_same_v<element_type, float>)
+        {
+            return static_cast<float>(i) * 0.5F - 1.25F;
+        }
+        else if constexpr (std::is_same_v<element_type, double>)
+        {
+            return static_cast<double>(i) * 0.25 - 3.5;
+        }
+        else if constexpr (std::is_same_v<element_type, std::uint16_t>)
+        {
+            return static_cast<std::uint16_t>(0x1000 + i);   // 0..0xFFFF
+        }
+        else
+        {
+            // Integral B/S/I/J: a small distinct value (fits int8 for [B).
+            return static_cast<element_type>(i + 1);
+        }
+    }
+
+    template<typename element_type>
+    auto bits_equal(element_type a, element_type b) noexcept -> bool
+    {
+        if constexpr (std::is_same_v<element_type, float>)
+        {
+            return float_bits(a) == float_bits(b);
+        }
+        else if constexpr (std::is_same_v<element_type, double>)
+        {
+            return double_bits(a) == double_bits(b);
+        }
+        else
+        {
+            return a == b;
+        }
+    }
+
+    // SINGLETON (len 1): [0] is also [last].  Write a boundary value, read back.
+    template<typename element_type>
+    auto singleton_check(desc_result& r, void* const oop, std::int32_t len,
+                         element_type val) -> void
+    {
+        r.one_tested.store(true);
+        if (len != 1)
+        {
+            return;
+        }
+        vmhook::set_array_element<element_type>(oop, 0, val);
+        r.one_ok.store(bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, 0), val));
+    }
+
+    // FULL fill+verify: write a DISTINCT value to every index, read every index
+    // back — proves no interior stride error and no slot aliases another.
+    template<typename element_type>
+    auto full_fill_check(desc_result& r, void* const oop, std::int32_t len) -> void
+    {
+        r.full_tested.store(true);
+        if (len <= 0)
+        {
+            return;
+        }
+        for (std::int32_t i{ 0 }; i < len; ++i)
+        {
+            vmhook::set_array_element<element_type>(oop, i, synth<element_type>(i));
+        }
+        bool all_ok{ true };
+        for (std::int32_t i{ 0 }; i < len; ++i)
+        {
+            if (!bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, i), synth<element_type>(i)))
+            {
+                all_ok = false;
+                break;
+            }
+        }
+        r.full_ok.store(all_ok);
+    }
+
+    // OUT-OF-BOUNDS safety on the made array's data region: an OOB get returns
+    // T{}, an OOB set is a no-op and leaves the in-bounds [last] element intact.
+    template<typename element_type>
+    auto oob_check(desc_result& r, void* const oop, std::int32_t len,
+                   element_type sentinel) -> void
+    {
+        r.oob_tested.store(true);
+        if (len <= 0)
+        {
+            return;
+        }
+        // Seed [last] with a sentinel, then attempt OOB writes that must NOT touch it.
+        vmhook::set_array_element<element_type>(oop, len - 1, sentinel);
+        const element_type bad{ synth<element_type>(len + 7) };
+        vmhook::set_array_element<element_type>(oop, len, bad);              // index == len
+        vmhook::set_array_element<element_type>(oop, -1, bad);               // negative
+        vmhook::set_array_element<element_type>(oop, std::numeric_limits<std::int32_t>::max(), bad);
+        r.oob_write_noop.store(
+            bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, len - 1), sentinel));
+
+        // OOB reads return the default T{} (clamped), never an out-of-allocation read.
+        const bool r_at_len{ bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, len), element_type{}) };
+        const bool r_neg{ bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, -1), element_type{}) };
+        const bool r_max{ bits_equal<element_type>(
+            vmhook::get_array_element<element_type>(oop, std::numeric_limits<std::int32_t>::max()), element_type{}) };
+        r.oob_read_clamped.store(r_at_len && r_neg && r_max);
+    }
+
+    auto singleton_for(std::size_t di, void* const oop, std::int32_t len) -> void
+    {
+        desc_result& r{ g_results[di] };
+        switch (di)
+        {
+            case D_Z: singleton_check<bool>(r, oop, len, true); break;
+            case D_B: singleton_check<std::int8_t>(r, oop, len, std::numeric_limits<std::int8_t>::max()); break;
+            case D_S: singleton_check<std::int16_t>(r, oop, len, std::numeric_limits<std::int16_t>::min()); break;
+            case D_C: singleton_check<std::uint16_t>(r, oop, len, static_cast<std::uint16_t>(0xFFFF)); break;
+            case D_I: singleton_check<std::int32_t>(r, oop, len, std::numeric_limits<std::int32_t>::max()); break;
+            case D_J: singleton_check<std::int64_t>(r, oop, len, std::numeric_limits<std::int64_t>::min()); break;
+            case D_F: singleton_check<float>(r, oop, len, -0.0F); break;
+            case D_D: singleton_check<double>(r, oop, len, std::numeric_limits<double>::quiet_NaN()); break;
+            default: break;
+        }
+    }
+
+    auto full_fill_for(std::size_t di, void* const oop, std::int32_t len) -> void
+    {
+        desc_result& r{ g_results[di] };
+        switch (di)
+        {
+            case D_Z: full_fill_check<bool>(r, oop, len); break;
+            case D_B: full_fill_check<std::int8_t>(r, oop, len); break;
+            case D_S: full_fill_check<std::int16_t>(r, oop, len); break;
+            case D_C: full_fill_check<std::uint16_t>(r, oop, len); break;
+            case D_I: full_fill_check<std::int32_t>(r, oop, len); break;
+            case D_J: full_fill_check<std::int64_t>(r, oop, len); break;
+            case D_F: full_fill_check<float>(r, oop, len); break;
+            case D_D: full_fill_check<double>(r, oop, len); break;
+            default: break;
+        }
+    }
+
+    auto oob_for(std::size_t di, void* const oop, std::int32_t len) -> void
+    {
+        desc_result& r{ g_results[di] };
+        switch (di)
+        {
+            case D_Z: oob_check<bool>(r, oop, len, true); break;
+            case D_B: oob_check<std::int8_t>(r, oop, len, static_cast<std::int8_t>(0x5A)); break;
+            case D_S: oob_check<std::int16_t>(r, oop, len, static_cast<std::int16_t>(0x5A5A)); break;
+            case D_C: oob_check<std::uint16_t>(r, oop, len, static_cast<std::uint16_t>(0xBEEF)); break;
+            case D_I: oob_check<std::int32_t>(r, oop, len, static_cast<std::int32_t>(0x5A5A5A5A)); break;
+            case D_J: oob_check<std::int64_t>(r, oop, len, static_cast<std::int64_t>(0x5A5A5A5A5A5A5A5ALL)); break;
+            case D_F: oob_check<float>(r, oop, len, 1.5F); break;
+            case D_D: oob_check<double>(r, oop, len, 1.5); break;
+            default: break;
+        }
+    }
+
+    // OVER-SIZED element_size: allocate the descriptor with a LARGER element_size
+    // than the natural stride (over-allocation is the harmless side of flaw #3),
+    // confirm _length is still correct, and confirm a TRUE-stride round-trip at
+    // [0]/[last] still works (the array remains usable; the extra bytes are slack).
+    template<typename element_type>
+    auto oversize_check(std::size_t di, element_type first_val, element_type last_val) -> void
+    {
+        desc_result& r{ g_results[di] };
+        r.oversize_tested.store(true);
+        const desc_spec& spec{ k_specs[di] };
+        constexpr std::int32_t len{ 4 };
+        // Pad the element_size by 8 bytes — over-allocates, never under.
+        void* const oop{ vmhook::make_java_array(spec.descriptor, len, spec.element_size + 8) };
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+        {
+            return;
+        }
+        r.oversize_len_ok.store(vmhook::array_length(oop) == len);
+        // Element access uses the TRUE element stride (sizeof(element_type)),
+        // independent of the over-sized allocation request.
+        vmhook::set_array_element<element_type>(oop, 0, first_val);
+        vmhook::set_array_element<element_type>(oop, len - 1, last_val);
+        const bool ok0{ bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, 0), first_val) };
+        const bool okl{ bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, len - 1), last_val) };
+        r.oversize_rt_ok.store(ok0 && okl);
+    }
+
+    // DISTINCT-ALLOCATION identity: two fresh arrays of the same descriptor/length
+    // are different oops, and a write into one is not visible in the other.
+    template<typename element_type>
+    auto distinct_check(std::size_t di, element_type a_val, element_type b_val) -> void
+    {
+        desc_result& r{ g_results[di] };
+        r.distinct_tested.store(true);
+        const desc_spec& spec{ k_specs[di] };
+        constexpr std::int32_t len{ 2 };
+        void* const a{ vmhook::make_java_array(spec.descriptor, len, spec.element_size) };
+        void* const b{ vmhook::make_java_array(spec.descriptor, len, spec.element_size) };
+        if (!a || !b || !vmhook::hotspot::is_valid_pointer(a) || !vmhook::hotspot::is_valid_pointer(b))
+        {
+            return;
+        }
+        r.distinct_oops.store(a != b);
+        vmhook::set_array_element<element_type>(a, 0, a_val);
+        vmhook::set_array_element<element_type>(b, 0, b_val);
+        // a[0] must still read a_val after b[0] was written (no aliasing), and the
+        // two reads must differ (proving they are genuinely separate buffers).
+        const bool a_intact{ bits_equal<element_type>(vmhook::get_array_element<element_type>(a, 0), a_val) };
+        const bool b_intact{ bits_equal<element_type>(vmhook::get_array_element<element_type>(b, 0), b_val) };
+        r.distinct_isolated.store(a_intact && b_intact && !bits_equal<element_type>(a_val, b_val));
+    }
+
+    auto oversize_for(std::size_t di) -> void
+    {
+        switch (di)
+        {
+            case D_Z: oversize_check<bool>(di, true, false); break;
+            case D_B: oversize_check<std::int8_t>(di, std::numeric_limits<std::int8_t>::min(), std::numeric_limits<std::int8_t>::max()); break;
+            case D_S: oversize_check<std::int16_t>(di, std::numeric_limits<std::int16_t>::min(), std::numeric_limits<std::int16_t>::max()); break;
+            case D_C: oversize_check<std::uint16_t>(di, static_cast<std::uint16_t>(0x0000), static_cast<std::uint16_t>(0xFFFF)); break;
+            case D_I: oversize_check<std::int32_t>(di, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max()); break;
+            case D_J: oversize_check<std::int64_t>(di, std::numeric_limits<std::int64_t>::min(), std::numeric_limits<std::int64_t>::max()); break;
+            case D_F: oversize_check<float>(di, std::numeric_limits<float>::quiet_NaN(), -0.0F); break;
+            case D_D: oversize_check<double>(di, std::numeric_limits<double>::quiet_NaN(), -0.0); break;
+            default: break;
+        }
+    }
+
+    auto distinct_for(std::size_t di) -> void
+    {
+        switch (di)
+        {
+            case D_Z: distinct_check<bool>(di, true, false); break;
+            case D_B: distinct_check<std::int8_t>(di, static_cast<std::int8_t>(0x11), static_cast<std::int8_t>(0x22)); break;
+            case D_S: distinct_check<std::int16_t>(di, static_cast<std::int16_t>(0x1111), static_cast<std::int16_t>(0x2222)); break;
+            case D_C: distinct_check<std::uint16_t>(di, static_cast<std::uint16_t>(0xAAAA), static_cast<std::uint16_t>(0x5555)); break;
+            case D_I: distinct_check<std::int32_t>(di, static_cast<std::int32_t>(0x11111111), static_cast<std::int32_t>(0x22222222)); break;
+            case D_J: distinct_check<std::int64_t>(di, static_cast<std::int64_t>(0x1111111111111111LL), static_cast<std::int64_t>(0x2222222222222222LL)); break;
+            case D_F: distinct_check<float>(di, 1.0F, 2.0F); break;
+            case D_D: distinct_check<double>(di, 1.0, 2.0); break;
+            default: break;
+        }
     }
 
     // ── PASS-INTO-JAVA: build a length-k_feed_len primitive array from a C++
@@ -885,10 +1165,24 @@ namespace
 
                 if (valid && !spec.is_reference)
                 {
+                    if (len == 1)
+                    {
+                        // SINGLETON: the degenerate len-1 array ([0] == [last]).
+                        singleton_for(di, oop, len);
+                    }
                     if (len == k_witness_len)
                     {
                         zero_init_for(di, oop, len);
                         element_round_trip_for(di, oop, len);
+                        // FULL fill+read-back of every index at this small length.
+                        full_fill_for(di, oop, len);
+                    }
+                    if (len == 16)
+                    {
+                        // OUT-OF-BOUNDS safety on the data region (uses a separate,
+                        // mid-size array so the OOB sentinel doesn't disturb the
+                        // round-trip slots above).
+                        oob_for(di, oop, len);
                     }
                     if (len == k_deep_len)
                     {
@@ -899,6 +1193,15 @@ namespace
                         mid_deep_round_trip_for(di, oop, len);
                     }
                 }
+            }
+
+            // ── 1b. NEW per-descriptor primitive coverage (own small allocations):
+            //        over-sized element_size tolerance + distinct-allocation
+            //        identity.  Tiny (len 2/4), never forces a GC. ──
+            if (!spec.is_reference)
+            {
+                oversize_for(di);
+                distinct_for(di);
             }
 
             // ── 2. Store a fresh representative (len 3) array into recv*. ──
@@ -1117,6 +1420,27 @@ namespace
                 ctx.check(std::string{ "native_len1000_first_round_trips_" } + tag[di], r.mid_deep_first_ok.load());
                 ctx.check(std::string{ "native_len1000_middle_round_trips_" } + tag[di], r.mid_deep_mid_ok.load());
                 ctx.check(std::string{ "native_len1000_last_round_trips_" } + tag[di], r.mid_deep_last_ok.load());
+
+                // ── NEW input coverage (all HARD on all JDKs — primitive paths). ──
+                // SINGLETON (len 1): the degenerate length where [0] IS [last].
+                ctx.check(std::string{ "native_singleton_len1_tested_" } + tag[di], r.one_tested.load());
+                ctx.check(std::string{ "native_singleton_len1_round_trips_" } + tag[di], r.one_ok.load());
+                // FULL fill+verify: every index written distinct + read back (no
+                // interior stride error, no slot aliases another).
+                ctx.check(std::string{ "native_full_fill_tested_" } + tag[di], r.full_tested.load());
+                ctx.check(std::string{ "native_full_fill_every_index_round_trips_" } + tag[di], r.full_ok.load());
+                // OUT-OF-BOUNDS safety on the made array's data region.
+                ctx.check(std::string{ "native_oob_tested_" } + tag[di], r.oob_tested.load());
+                ctx.check(std::string{ "native_oob_read_clamped_to_default_" } + tag[di], r.oob_read_clamped.load());
+                ctx.check(std::string{ "native_oob_write_is_noop_inbounds_intact_" } + tag[di], r.oob_write_noop.load());
+                // OVER-SIZED element_size tolerance (flaw #3 harmless side).
+                ctx.check(std::string{ "native_oversize_elemsize_tested_" } + tag[di], r.oversize_tested.load());
+                ctx.check(std::string{ "native_oversize_elemsize_length_ok_" } + tag[di], r.oversize_len_ok.load());
+                ctx.check(std::string{ "native_oversize_elemsize_true_stride_round_trips_" } + tag[di], r.oversize_rt_ok.load());
+                // DISTINCT-ALLOCATION identity: two arrays are separate buffers.
+                ctx.check(std::string{ "native_distinct_alloc_tested_" } + tag[di], r.distinct_tested.load());
+                ctx.check(std::string{ "native_distinct_alloc_different_oops_" } + tag[di], r.distinct_oops.load());
+                ctx.check(std::string{ "native_distinct_alloc_no_aliasing_" } + tag[di], r.distinct_isolated.load());
             }
         }
 

@@ -93,6 +93,13 @@ public final class ReturnTypes
     //    decoded bytes for whichever path this JDK takes rather than over-asserting. -
     public static final String INTERIOR_NUL = "ab\u0000cd";
 
+    // -- An all-ASCII-CONTROL String: 5 chars, each below 0x20 and none of them
+    //    U+0000 (so it is NOT the interior-NUL case).  Written with unicode
+    //    escapes
+    //    so the source is pure ASCII; stays LATIN1 on JDK9+ (every char < 0x100),
+    //    stressing the one-byte-per-char decode with non-text bytes. ---------------
+    public static final String CONTROL_STRING = "\u0001\u0002\u0008\u0009\u001F";
+
     // -- A STABLE non-null Object the native side decodes + cross-checks by OOP
     //    identity.  returnsObject() hands back THIS instance (not a fresh Object each
     //    call), so the decoded wrapper's heap pointer must equal this object's OOP. --
@@ -151,6 +158,7 @@ public final class ReturnTypes
     public byte returnsByteMax()    { return Byte.MAX_VALUE; }  // 127
     public byte returnsByteMin()    { return Byte.MIN_VALUE; }  // -128
     public byte returnsByteNegOne() { return (byte) -1; }       // sign-extension probe
+    public byte returnsByteZero()   { return (byte) 0; }        // exact-zero boundary
 
     // ========================================================================
     //  short (S) -- signed 16-bit
@@ -165,6 +173,8 @@ public final class ReturnTypes
     // ========================================================================
     public char returnsChar()    { return '?'; }          // '?' == 63 (mirrors Example)
     public char returnsCharMax() { return (char) 0xFFFF; }      // 65535, zero-extension probe
+    public char returnsCharZero(){ return (char) 0; }          // NUL char -> 0 (not -1)
+    public char returnsCharHigh(){ return (char) 0x8000; }     // top-bit-set: 32768 unsigned (NOT -32768)
 
     // ========================================================================
     //  int (I) -- signed 32-bit
@@ -172,6 +182,8 @@ public final class ReturnTypes
     public int returnsInt()    { return 0x12345678; }          // 305419896 (mirrors Example)
     public int returnsIntMax() { return Integer.MAX_VALUE; }   // 2147483647
     public int returnsIntMin() { return Integer.MIN_VALUE; }   // -2147483648
+    public int returnsIntZero(){ return 0; }                   // exact-zero boundary
+    public int returnsIntNegOne(){ return -1; }                // all-ones 0xFFFFFFFF -> -1 (signed)
 
     // ========================================================================
     //  long (J) -- signed 64-bit (two interpreter slots)
@@ -179,6 +191,11 @@ public final class ReturnTypes
     public long returnsLong()    { return 0x123456789ABCDEF0L; } // mirrors Example
     public long returnsLongMin() { return Long.MIN_VALUE; }
     public long returnsLongNeg() { return -9876543210L; }        // a negative > 32-bit magnitude
+    public long returnsLongMax() { return Long.MAX_VALUE; }      // 0x7FFFFFFFFFFFFFFF
+    // Low 32 bits ZERO: catches a "read only the low word" truncation -> would read 0.
+    public long returnsLongHighOnly() { return 0x1234567800000000L; }
+    // High 32 bits ZERO: the inverse -- a 64-bit read must NOT sign-extend the low word.
+    public long returnsLongLowOnly()  { return 0x00000000FFFFFFFFL; } // == 4294967295, NOT -1
 
     // ========================================================================
     //  float (F)
@@ -186,6 +203,9 @@ public final class ReturnTypes
     public float returnsFloat()    { return 3.1415926f; }                   // bits 0x40490FDA (mirrors Example)
     public float returnsFloatNaN() { return Float.NaN; }
     public float returnsFloatBits(){ return Float.intBitsToFloat(0x7f7fffff); } // FLT_MAX exact bit pattern
+    public float returnsFloatNegZero(){ return -0.0f; }                     // bits 0x80000000 (NOT +0.0's 0x0)
+    public float returnsFloatNegInf(){ return Float.NEGATIVE_INFINITY; }    // bits 0xFF800000
+    public float returnsFloatSubnormal(){ return Float.intBitsToFloat(0x00000001); } // smallest subnormal, bits 0x1
 
     // ========================================================================
     //  double (D)
@@ -193,6 +213,9 @@ public final class ReturnTypes
     public double returnsDouble()    { return 2.718281828459045; }                 // bits 0x4005BF0A8B145769 (mirrors Example)
     public double returnsDoubleNaN() { return Double.NaN; }
     public double returnsDoubleBits(){ return Double.longBitsToDouble(0x7fefffffffffffffL); } // DBL_MAX exact bits
+    public double returnsDoubleNegZero(){ return -0.0; }                           // bits 0x8000000000000000
+    public double returnsDoublePosInf(){ return Double.POSITIVE_INFINITY; }        // bits 0x7FF0000000000000
+    public double returnsDoubleSubnormal(){ return Double.longBitsToDouble(0x1L); }// smallest subnormal, bits 0x1
 
     // ========================================================================
     //  java.lang.String
@@ -202,6 +225,11 @@ public final class ReturnTypes
     public String returnsStringUnicode() { return UNICODE; }            // multibyte modified-UTF-8
     public String returnsStringLong()    { return LONG_STRING; }        // 300 ASCII chars, exact decode
     public String returnsStringInteriorNul() { return INTERIOR_NUL; }   // embedded U+0000
+    public String returnsStringOneChar() { return "Z"; }                // single-char (length-1) boundary
+    // All-ASCII-control String (5 chars, each < 0x20, none U+0000): stresses the
+    // one-byte-per-char decode with non-text bytes and proves a control char is
+    // never cut at a string terminator.  Returns the CONTROL_STRING constant.
+    public String returnsStringControl() { return CONTROL_STRING; }
 
     // ========================================================================
     //  primitive arrays ([Z [B [C [S [I [J [F [D) and Object[]
@@ -286,6 +314,46 @@ public final class ReturnTypes
         outer.add(inner);
         return outer;
     }
+
+    // ========================================================================
+    //  OVERLOADED returners -- SAME name "combo", DIFFERENT arg types AND different
+    //  return types.  These prove the two-arg get_method(name, SIGNATURE) pins an
+    //  EXACT overload by descriptor (signature_pinned=true) and that the return-type
+    //  char is read from the RESOLVED overload's descriptor, so each overload decodes
+    //  to the right C++ type.  The native side resolves each by its full descriptor:
+    //    combo(int)            -> "(I)I"
+    //    combo(long)           -> "(J)J"
+    //    combo(java.lang.String)-> "(Ljava/lang/String;)Ljava/lang/String;"
+    //    combo()               -> "()D"   (zero-arg overload; distinct return type)
+    //  Each return value is a fixed sentinel the module hard-codes.
+    // ========================================================================
+    public int    combo(int v)    { return v + 0x1000; }              // (I)I
+    public long   combo(long v)   { return v + 0x100000000L; }        // (J)J  (adds a HIGH-word delta)
+    public String combo(String v) { return v + "!"; }                 // (Ljava/lang/String;)Ljava/lang/String;
+    public double combo()         { return 6.25; }                    // ()D  bits 0x4019000000000000
+
+    // ========================================================================
+    //  STATIC returners -- one per BasicType + String + Object + null + an array.
+    //  These exercise the STATIC dispatch path of call() (jclass via the Method's
+    //  pool_holder name + FindClass, jmethodID via GetStaticMethodID), which is a
+    //  DISTINCT code path from the instance returners above (GetObjectClass +
+    //  GetMethodID).  The native side reaches them via static_method("name").
+    //  Headline values intentionally DIFFER from the instance returners so a decode
+    //  that accidentally hit the instance method would mismatch.
+    // ========================================================================
+    public static boolean staticReturnsBool()   { return true; }
+    public static byte    staticReturnsByte()   { return (byte) -42; }     // signed, != instance 126
+    public static short   staticReturnsShort()  { return (short) -23456; } // signed
+    public static char    staticReturnsChar()   { return (char) 0xBEEF; }  // 48879 unsigned
+    public static int     staticReturnsInt()    { return 0x7EADBEEF; }      // != instance 0x12345678
+    public static long    staticReturnsLong()   { return -0x0FEDCBA987654321L; }
+    public static float   staticReturnsFloat()  { return Float.intBitsToFloat(0x42F6E979); } // 123.456f
+    public static double  staticReturnsDouble() { return Double.longBitsToDouble(0xC09FE5C91D14E3BCL); } // -2041.4464
+    public static void    staticReturnsVoid()   { voidSideEffect++; }      // observable side effect
+    public static String  staticReturnsString() { return "static-hello"; }
+    public static Object  staticReturnsObject() { return OBJECT_SINGLETON; } // same singleton, OOP cross-check
+    public static Object  staticReturnsNull()   { return null; }
+    public static int[]   staticReturnsIntArray() { return new int[] { 11, 22, 33 }; }
 
     static
     {
