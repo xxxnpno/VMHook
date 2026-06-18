@@ -93,6 +93,8 @@ namespace
     constexpr const char* FIXTURE{ "vmhook/fixtures/FieldArraysObject" };
     constexpr const char* ITEM{ "vmhook/fixtures/FieldArraysObject$Item" };
     constexpr const char* INTEGER{ "java/lang/Integer" };
+    constexpr const char* NODE{ "vmhook/fixtures/FieldArraysObject$Node" };
+    constexpr const char* LEAF{ "vmhook/fixtures/FieldArraysObject$Leaf" };
 
     // Boxed-Integer element wrapper for the Integer[] (autoboxed) array case: a
     // readable `value` int field plus a callable intValue() method, so a decoded
@@ -127,6 +129,26 @@ namespace
 
         // Call getTag() THROUGH the wrapper (proves a dispatch-capable object).
         auto call_get_tag() -> std::int32_t { return get_method("getTag")->call(); }
+    };
+
+    // Wrapper for the polymorphic Node hierarchy (Node base + Leaf subclass).
+    // Reads the INHERITED `tag` field and calls the VIRTUAL `kind()` method, so a
+    // decoded array slot can be proven to (a) read the base field regardless of
+    // the concrete runtime class and (b) dispatch the override (kind()==2 on a
+    // Leaf, ==1 on a Node) — the polymorphic / inherited-element contract.
+    // Registered as the base "Node" class; a Leaf slot is still a Node, so the
+    // same wrapper decodes both (covariance).
+    class node_object : public vmhook::object<node_object>
+    {
+    public:
+        explicit node_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<node_object>{ instance }
+        {
+        }
+
+        auto get_tag() -> std::int32_t { return get_field("tag")->get(); }
+        auto call_get_tag() -> std::int32_t { return get_method("getTag")->call(); }
+        auto kind() -> std::int32_t { return get_method("kind")->call(); }
     };
 
     // Wrapper for vmhook.fixtures.FieldArraysObject.  Each String[] accessor
@@ -197,6 +219,16 @@ namespace
         // ---- LARGE Item[] via to_vector --------------------------------------
         static auto s_large_items()   -> std::vector<std::unique_ptr<item_object>> { return static_field("largeItems")->get().to_vector<item_object>(); }
 
+        // ---- POLYMORPHIC Node[] / Tagged[] via to_vector (node_object) -------
+        static auto s_poly_nodes()    -> std::vector<std::unique_ptr<node_object>> { return static_field("polyNodes")->get().to_vector<node_object>(); }
+        static auto s_tagged_poly()   -> std::vector<std::unique_ptr<node_object>> { return static_field("taggedPoly")->get().to_vector<node_object>(); }
+        static auto s_leaf_only()     -> std::vector<std::unique_ptr<node_object>> { return static_field("leafOnly")->get().to_vector<node_object>(); }
+
+        // ---- 2-D edge-shape Item[][] via to_vector (outer dim) ---------------
+        static auto s_grid2d_single()    -> std::vector<std::unique_ptr<item_object>> { return static_field("grid2dSingle")->get().to_vector<item_object>(); }
+        static auto s_grid2d_allnull()   -> std::vector<std::unique_ptr<item_object>> { return static_field("grid2dAllNullRows")->get().to_vector<item_object>(); }
+        static auto s_grid2d_emptyrow()  -> std::vector<std::unique_ptr<item_object>> { return static_field("grid2dEmptyRow")->get().to_vector<item_object>(); }
+
         // ---- Java-published length oracles -----------------------------------
         static auto j_static_strings_len() -> std::int32_t { return static_field("staticStringsLen")->get(); }
         static auto j_mixed_strings_len()  -> std::int32_t { return static_field("mixedStringsLen")->get(); }
@@ -218,6 +250,14 @@ namespace
         static auto j_tagged_mixed_len()   -> std::int32_t { return static_field("taggedMixedLen")->get(); }
         static auto j_large_items_len()    -> std::int32_t { return static_field("largeItemsLen")->get(); }
         static auto j_object_holding_array_len() -> std::int32_t { return static_field("objectHoldingArrayLen")->get(); }
+        static auto j_poly_nodes_len()     -> std::int32_t { return static_field("polyNodesLen")->get(); }
+        static auto j_tagged_poly_len()    -> std::int32_t { return static_field("taggedPolyLen")->get(); }
+        static auto j_number_ints_len()    -> std::int32_t { return static_field("numberIntsLen")->get(); }
+        static auto j_grid2d_single_len()  -> std::int32_t { return static_field("grid2dSingleLen")->get(); }
+        static auto j_grid2d_allnull_len() -> std::int32_t { return static_field("grid2dAllNullRowsLen")->get(); }
+        static auto j_grid2d_emptyrow_len()-> std::int32_t { return static_field("grid2dEmptyRowLen")->get(); }
+        static auto j_cube_plane0_len()    -> std::int32_t { return static_field("cube3dPlane0Len")->get(); }
+        static auto j_cube_plane0_row0_len()->std::int32_t { return static_field("cube3dPlane0Row0Len")->get(); }
     };
 
     // ---- manual Object[] walk: an independent cross-check of to_vector<T>() ---
@@ -343,6 +383,48 @@ namespace
             if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
             {
                 result.push_back(std::make_unique<integer_object>(
+                    static_cast<vmhook::oop_t>(element_oop)));
+            }
+            else
+            {
+                result.push_back(nullptr);
+            }
+        }
+        return result;
+    }
+
+    // ---- manual NODE walk (Node[] / Tagged[] polymorphic mix) ----------------
+    // Same shape as manual_item_walk, but wraps each non-null slot as a
+    // node_object so the INHERITED `tag` field + the VIRTUAL kind() method can be
+    // read off whatever concrete class (Node or Leaf) the slot actually holds.  A
+    // null slot becomes nullptr.
+    auto manual_node_walk_static(const char* name)
+        -> std::vector<std::unique_ptr<node_object>>
+    {
+        std::vector<std::unique_ptr<node_object>> result;
+        const auto proxy{ field_arrays_object_fixture::static_field(name) };
+        if (!proxy.has_value())
+        {
+            return result;
+        }
+        void* const array_oop{ vmhook::field_oop(*proxy) };
+        if (!array_oop || !vmhook::hotspot::is_valid_pointer(array_oop))
+        {
+            return result;
+        }
+        const std::int32_t length{ vmhook::array_length(array_oop) };
+        if (length <= 0)
+        {
+            return result;
+        }
+        result.reserve(static_cast<std::size_t>(length));
+        for (std::int32_t index{ 0 }; index < length; ++index)
+        {
+            void* const element_oop{ vmhook::hotspot::decode_oop_pointer(
+                vmhook::get_array_element<std::uint32_t>(array_oop, index)) };
+            if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
+            {
+                result.push_back(std::make_unique<node_object>(
                     static_cast<vmhook::oop_t>(element_oop)));
             }
             else
@@ -487,6 +569,14 @@ namespace
         vmhook::register_class<field_arrays_object_fixture>(FIXTURE);
         vmhook::register_class<item_object>(ITEM);
         vmhook::register_class<integer_object>(INTEGER);
+        vmhook::register_class<node_object>(NODE);
+
+        // Leaf (the Node subclass) is referenced only as a runtime element type of
+        // polyNodes / taggedPoly; the decode wraps each slot as the registered
+        // BASE node_object, so a dedicated Leaf wrapper is not needed.  LEAF is
+        // kept as a named constant for the shape cross-check below and is marked
+        // used here to stay -Werror clean across toolchains.
+        static_cast<void>(LEAF);
 
         using wrapper = field_arrays_object_fixture;
 
@@ -573,6 +663,30 @@ namespace
                           && proxy->is_static() && proxy->is_reference());
             }
         }
+
+        // ---- PART 0 (extended-2): shape cross-checks for the POLYMORPHIC /
+        //      inherited / abstract-superclass element kinds and the 2-D edge
+        //      shapes added for the deepened object-array coverage.
+        check_field_shape(ctx, "fao_shape_polyNodes_is_Node_array",
+                          wrapper::static_field("polyNodes"),
+                          "[Lvmhook/fixtures/FieldArraysObject$Node;", true);
+        check_field_shape(ctx, "fao_shape_taggedPoly_is_Tagged_array",
+                          wrapper::static_field("taggedPoly"),
+                          "[Lvmhook/fixtures/FieldArraysObject$Tagged;", true);
+        check_field_shape(ctx, "fao_shape_leafOnly_is_Node_array",
+                          wrapper::static_field("leafOnly"),
+                          "[Lvmhook/fixtures/FieldArraysObject$Node;", true);
+        check_field_shape(ctx, "fao_shape_numberInts_is_Number_array",
+                          wrapper::static_field("numberInts"), "[Ljava/lang/Number;", true);
+        check_field_shape(ctx, "fao_shape_grid2dSingle_is_2d_Item_array",
+                          wrapper::static_field("grid2dSingle"),
+                          "[[Lvmhook/fixtures/FieldArraysObject$Item;", true);
+        check_field_shape(ctx, "fao_shape_grid2dAllNullRows_is_2d_Item_array",
+                          wrapper::static_field("grid2dAllNullRows"),
+                          "[[Lvmhook/fixtures/FieldArraysObject$Item;", true);
+        check_field_shape(ctx, "fao_shape_grid2dEmptyRow_is_2d_Item_array",
+                          wrapper::static_field("grid2dEmptyRow"),
+                          "[[Lvmhook/fixtures/FieldArraysObject$Item;", true);
 
         // =====================================================================
         // PART A — STRING[] reads via the implicit vector<string> conversion.
@@ -1368,6 +1482,308 @@ namespace
             ctx.check("fao_bounds_null_oop_len0", vmhook::array_length(nullptr) == 0);
             ctx.check("fao_bounds_null_oop_elem0_zero",
                       vmhook::get_array_element<std::uint32_t>(nullptr, 0) == 0u);
+        }
+
+        // =====================================================================
+        // PART E — DEEPENED object-array element-access coverage:
+        //   E1  POLYMORPHIC Node[] (Node + Leaf mix) — inherited-field reads off
+        //       different concrete element classes through ONE base wrapper, plus
+        //       the virtual kind() override dispatch.
+        //   E2  Tagged[] holding a polymorphic mix (interface-typed covariance).
+        //   E3  derived-ONLY element in a base-typed array (Leaf in Node[]).
+        //   E4  ABSTRACT-superclass-typed array (Number[] holding Integers).
+        //   E5  the narrow (compressed) element word of a NULL slot is exactly 0u.
+        //   E6  get_array_element BOUNDS on an EMPTY (length-0) reference array.
+        //   E7  2-D edge shapes: single row, all-null rows, an empty inner row.
+        //   E8  DEEP 3-D leaf descent: cube3d outer -> plane -> row (length oracle).
+        //   E9  to_vector re-read determinism (non-destructive) for an Object[].
+        //   E10 field_oop / array_length cross-check vs the Java length oracle for
+        //       a STRING[] (bridging the string path with the array primitives).
+        // STRUCTURAL invariants are hard-asserted; element-VALUE / method-dispatch
+        // decodes (compressed-oops dependent) go through pass_or_info.
+        // =====================================================================
+
+        // ---- E1: POLYMORPHIC Node[] { Node(140), Leaf(150,7), null, Node(160) }
+        // The crux of the inherited/polymorphic coverage: the SAME node_object
+        // base wrapper reads the INHERITED `tag` off both a Node and a Leaf slot,
+        // and kind() dispatches the override (Leaf -> 2, Node -> 1).  The null slot
+        // stays a real nullptr.  Structural (size / null layout) is hard-asserted;
+        // the field/method value decodes are gated.
+        {
+            const std::vector<std::unique_ptr<node_object>> v{ wrapper::s_poly_nodes() };
+            ctx.check("fao_poly_size4", v.size() == 4);
+            ctx.check("fao_poly_count_matches_java",
+                      static_cast<std::int32_t>(v.size()) == wrapper::j_poly_nodes_len());
+            ctx.check("fao_poly_slot0_nonnull", v.size() == 4 && v[0] != nullptr);
+            ctx.check("fao_poly_slot1_nonnull", v.size() == 4 && v[1] != nullptr);
+            ctx.check("fao_poly_slot2_is_nullptr", v.size() == 4 && v[2] == nullptr);
+            ctx.check("fao_poly_slot3_nonnull", v.size() == 4 && v[3] != nullptr);
+            // Distinct non-null instances (identity).
+            ctx.check("fao_poly_nonnull_slots_distinct",
+                      v.size() == 4 && v[0] && v[1] && v[3]
+                      && static_cast<void*>(v[0]->get_instance()) != static_cast<void*>(v[1]->get_instance())
+                      && static_cast<void*>(v[1]->get_instance()) != static_cast<void*>(v[3]->get_instance())
+                      && static_cast<void*>(v[0]->get_instance()) != static_cast<void*>(v[3]->get_instance()));
+
+            // INHERITED `tag` field read off the base Node slot AND the derived
+            // Leaf slot through the SAME wrapper.
+            pass_or_info(ctx, "fao_poly_slot0_base_tag140",
+                         v.size() == 4 && v[0] && v[0]->get_tag() == 140,
+                         "inherited tag off a Node slot");
+            pass_or_info(ctx, "fao_poly_slot1_leaf_inherited_tag150",
+                         v.size() == 4 && v[1] && v[1]->get_tag() == 150,
+                         "inherited tag off a Leaf (derived) slot");
+            pass_or_info(ctx, "fao_poly_slot3_base_tag160",
+                         v.size() == 4 && v[3] && v[3]->get_tag() == 160,
+                         "inherited tag off a Node slot");
+            // Inherited getTag() (method path) off the derived Leaf slot.
+            pass_or_info(ctx, "fao_poly_slot1_leaf_method_tag150",
+                         v.size() == 4 && v[1] && v[1]->call_get_tag() == 150,
+                         "inherited getTag() off a Leaf slot");
+            // VIRTUAL kind() dispatches per concrete class: Node -> 1, Leaf -> 2.
+            pass_or_info(ctx, "fao_poly_slot0_kind1_base",
+                         v.size() == 4 && v[0] && v[0]->kind() == 1,
+                         "virtual kind() on a Node slot");
+            pass_or_info(ctx, "fao_poly_slot1_kind2_override",
+                         v.size() == 4 && v[1] && v[1]->kind() == 2,
+                         "virtual kind() override on a Leaf slot");
+        }
+
+        // ---- E2: Tagged[] holding a polymorphic mix { Node(170), Leaf(180,9) } -
+        // Interface-typed array covariance over a polymorphic concrete mix: the
+        // node_object base wrapper still reads the inherited tag and dispatches
+        // kind() through each interface slot.
+        {
+            const std::vector<std::unique_ptr<node_object>> v{ wrapper::s_tagged_poly() };
+            ctx.check("fao_tpoly_size2", v.size() == 2);
+            ctx.check("fao_tpoly_count_matches_java",
+                      static_cast<std::int32_t>(v.size()) == wrapper::j_tagged_poly_len());
+            ctx.check("fao_tpoly_all_nonnull", v.size() == 2 && v[0] && v[1]);
+            pass_or_info(ctx, "fao_tpoly_slot0_tag170",
+                         v.size() == 2 && v[0] && v[0]->get_tag() == 170,
+                         "inherited tag via interface[] Node slot");
+            pass_or_info(ctx, "fao_tpoly_slot1_tag180",
+                         v.size() == 2 && v[1] && v[1]->get_tag() == 180,
+                         "inherited tag via interface[] Leaf slot");
+            pass_or_info(ctx, "fao_tpoly_slot1_kind2",
+                         v.size() == 2 && v[1] && v[1]->kind() == 2,
+                         "virtual kind() override via interface[] Leaf slot");
+        }
+
+        // ---- E3: derived-ONLY element in a base-typed array { Leaf(190,11) } ---
+        // A Node[] whose sole element is a Leaf: the base wrapper reads the
+        // inherited tag and the override dispatches even though the declared
+        // element type is the base class.
+        {
+            const std::vector<std::unique_ptr<node_object>> v{ wrapper::s_leaf_only() };
+            ctx.check("fao_leafonly_size1", v.size() == 1);
+            ctx.check("fao_leafonly_slot0_nonnull", v.size() == 1 && v[0] != nullptr);
+            pass_or_info(ctx, "fao_leafonly_inherited_tag190",
+                         v.size() == 1 && v[0] && v[0]->get_tag() == 190,
+                         "inherited tag off a derived-only Node[] slot");
+            pass_or_info(ctx, "fao_leafonly_kind2_override",
+                         v.size() == 1 && v[0] && v[0]->kind() == 2,
+                         "virtual kind() override off a derived-only slot");
+        }
+
+        // ---- E4: ABSTRACT-superclass-typed Number[] holding Integers ----------
+        // Declared "[Ljava/lang/Number;" (abstract class element); runtime values
+        // are boxed Integers.  Decodes each slot as a java.lang.Integer and reads
+        // its value, proving the "[L" branch keys on the descriptor regardless of
+        // the L-class being abstract.
+        {
+            const std::vector<std::unique_ptr<integer_object>> v{
+                manual_integer_walk_static("numberInts") };
+            ctx.check("fao_number_size3", v.size() == 3);
+            ctx.check("fao_number_count_matches_java",
+                      static_cast<std::int32_t>(v.size()) == wrapper::j_number_ints_len());
+            ctx.check("fao_number_all_nonnull",
+                      v.size() == 3 && v[0] && v[1] && v[2]);
+            pass_or_info(ctx, "fao_number_elem0_value21",
+                         v.size() == 3 && v[0] && v[0]->value() == 21,
+                         "Integer.value through an abstract Number[] slot");
+            pass_or_info(ctx, "fao_number_elem2_value23",
+                         v.size() == 3 && v[2] && v[2]->value() == 23,
+                         "Integer.value through an abstract Number[] slot");
+            pass_or_info(ctx, "fao_number_elem1_method_intValue22",
+                         v.size() == 3 && v[1] && v[1]->int_value() == 22,
+                         "Integer.intValue() through an abstract Number[] slot");
+        }
+
+        // ---- E5: a NULL slot's narrow (compressed) element word is exactly 0u --
+        // The mixed Item[] { Item(1), null, Item(3) } has a null at index 1.  The
+        // raw narrow word read for that slot must be exactly 0u (a null reference
+        // is the null compressed oop), while the flanking non-null slots are
+        // non-zero.  This is the lowest-level proof that an inner null is encoded
+        // as 0, the value decode_oop_pointer maps to nullptr.
+        {
+            void* const arr{ field_array_oop_static("mixedItems") };
+            ctx.check("fao_nullword_array_oop_nonnull", arr != nullptr);
+            if (arr && vmhook::array_length(arr) == 3)
+            {
+                const std::uint32_t w0{ vmhook::get_array_element<std::uint32_t>(arr, 0) };
+                const std::uint32_t w1{ vmhook::get_array_element<std::uint32_t>(arr, 1) };
+                const std::uint32_t w2{ vmhook::get_array_element<std::uint32_t>(arr, 2) };
+                ctx.check("fao_nullword_slot1_is_zero", w1 == 0u);
+                ctx.check("fao_nullword_slots0_2_nonzero", w0 != 0u && w2 != 0u);
+                ctx.check("fao_nullword_zero_decodes_to_nullptr",
+                          vmhook::hotspot::decode_oop_pointer(0u) == nullptr);
+            }
+        }
+
+        // ---- E6: get_array_element BOUNDS on an EMPTY (length-0) array ---------
+        // emptyItems has length 0, so EVERY index (0, -1, +1) is out of range and
+        // reads 0 with no crash — the bounds contract on a zero-length reference
+        // array, distinct from the populated length-3 case in D8.
+        {
+            void* const arr{ field_array_oop_static("emptyItems") };
+            ctx.check("fao_emptybounds_oop_nonnull", arr != nullptr);
+            if (arr)
+            {
+                ctx.check("fao_emptybounds_len0", vmhook::array_length(arr) == 0);
+                ctx.check("fao_emptybounds_index0_zero",
+                          vmhook::get_array_element<std::uint32_t>(arr, 0) == 0u);
+                ctx.check("fao_emptybounds_neg_and_pos_zero",
+                          vmhook::get_array_element<std::uint32_t>(arr, -1) == 0u
+                          && vmhook::get_array_element<std::uint32_t>(arr, 1) == 0u
+                          && vmhook::get_array_element<std::uint32_t>(arr, 100) == 0u);
+            }
+        }
+
+        // ---- E7: 2-D edge shapes via to_vector + manual inner descent ---------
+        // single-row, all-null-rows, and an empty (length-0) inner row — the
+        // degenerate 2-D layouts D5/D6 don't cover.
+        {
+            // Single row of a single element: outer length 1, the row is non-null
+            // and walks to a single Item(91).
+            const std::vector<std::unique_ptr<item_object>> gs{ wrapper::s_grid2d_single() };
+            ctx.check("fao_grid_single_outer_size1", gs.size() == 1);
+            ctx.check("fao_grid_single_outer_count_matches_java",
+                      static_cast<std::int32_t>(gs.size()) == wrapper::j_grid2d_single_len());
+            ctx.check("fao_grid_single_row0_nonnull", gs.size() == 1 && gs[0] != nullptr);
+            void* const single_outer{ field_array_oop_static("grid2dSingle") };
+            if (single_outer)
+            {
+                const std::vector<void*> r0{ inner_row_oops(single_outer, 0) };
+                ctx.check("fao_grid_single_row0_width1", r0.size() == 1);
+                pass_or_info(ctx, "fao_grid_single_cell_0_0_tag91",
+                             inner_item_tag(single_outer, 0, 0, -1) == 91,
+                             "inner Item.tag (0,0) of grid2dSingle");
+            }
+
+            // All-null outer rows: outer length 2, BOTH rows decode to nullptr.
+            const std::vector<std::unique_ptr<item_object>> gn{ wrapper::s_grid2d_allnull() };
+            ctx.check("fao_grid_allnull_outer_size2", gn.size() == 2);
+            ctx.check("fao_grid_allnull_outer_count_matches_java",
+                      static_cast<std::int32_t>(gn.size()) == wrapper::j_grid2d_allnull_len());
+            ctx.check("fao_grid_allnull_both_rows_nullptr",
+                      gn.size() == 2 && gn[0] == nullptr && gn[1] == nullptr);
+            void* const allnull_outer{ field_array_oop_static("grid2dAllNullRows") };
+            if (allnull_outer)
+            {
+                const std::vector<void*> rows{ element_oops(
+                    wrapper::static_field("grid2dAllNullRows")) };
+                ctx.check("fao_grid_allnull_row_oops_both_null",
+                          rows.size() == 2 && rows[0] == nullptr && rows[1] == nullptr);
+                // Descending into a null row yields an empty inner walk, no crash.
+                ctx.check("fao_grid_allnull_null_row_inner_empty",
+                          inner_row_oops(allnull_outer, 0).empty());
+            }
+
+            // Empty inner row: { row, emptyRow, row } — the middle row is a
+            // NON-null length-0 array, distinct from a null row.
+            const std::vector<std::unique_ptr<item_object>> ge{ wrapper::s_grid2d_emptyrow() };
+            ctx.check("fao_grid_emptyrow_outer_size3", ge.size() == 3);
+            ctx.check("fao_grid_emptyrow_outer_count_matches_java",
+                      static_cast<std::int32_t>(ge.size()) == wrapper::j_grid2d_emptyrow_len());
+            ctx.check("fao_grid_emptyrow_all_rows_nonnull",
+                      ge.size() == 3 && ge[0] != nullptr && ge[1] != nullptr && ge[2] != nullptr);
+            void* const emptyrow_outer{ field_array_oop_static("grid2dEmptyRow") };
+            if (emptyrow_outer)
+            {
+                const std::vector<void*> rows{ element_oops(
+                    wrapper::static_field("grid2dEmptyRow")) };
+                // The middle row OOP is non-null (an empty array IS an object) yet
+                // its inner length is 0.
+                ctx.check("fao_grid_emptyrow_middle_row_oop_nonnull",
+                          rows.size() == 3 && rows[1] != nullptr);
+                ctx.check("fao_grid_emptyrow_middle_row_inner_empty",
+                          inner_row_oops(emptyrow_outer, 1).empty());
+                ctx.check("fao_grid_emptyrow_flank_rows_width1",
+                          inner_row_oops(emptyrow_outer, 0).size() == 1
+                          && inner_row_oops(emptyrow_outer, 2).size() == 1);
+            }
+        }
+
+        // ---- E8: DEEP 3-D leaf descent cube3d[0] -> row -> leaf ---------------
+        // D7 walked the cube to plane and counted rows; here we descend a full
+        // level deeper to the innermost row and cross-check its length against the
+        // Java oracle (cube3d[0] has 2 rows; cube3d[0][0] has 2 leaf elements).
+        {
+            void* const outer{ field_array_oop_static("cube3d") };
+            ctx.check("fao_cube_deep_outer_nonnull", outer != nullptr);
+            if (outer && vmhook::array_length(outer) >= 1)
+            {
+                const std::vector<void*> plane0{ inner_row_oops(outer, 0) };
+                ctx.check("fao_cube_deep_plane0_rowcount2",
+                          static_cast<std::int32_t>(plane0.size()) == wrapper::j_cube_plane0_len());
+                if (plane0.size() >= 1 && plane0[0]
+                    && vmhook::hotspot::is_valid_pointer(plane0[0]))
+                {
+                    // plane0[0] is the innermost Object[] row { Item(301), Item(302) }.
+                    const std::int32_t leaf_len{ vmhook::array_length(plane0[0]) };
+                    ctx.check("fao_cube_deep_row0_leafcount2",
+                              leaf_len == wrapper::j_cube_plane0_row0_len());
+                    // Decode the first leaf Item and read its tag (value -> gated).
+                    void* const leaf0{ vmhook::hotspot::decode_oop_pointer(
+                        vmhook::get_array_element<std::uint32_t>(plane0[0], 0)) };
+                    bool leaf_ok{ false };
+                    if (leaf0 && vmhook::hotspot::is_valid_pointer(leaf0))
+                    {
+                        item_object w{ static_cast<vmhook::oop_t>(leaf0) };
+                        leaf_ok = w.get_tag() == 301;
+                    }
+                    pass_or_info(ctx, "fao_cube_deep_leaf_0_0_0_tag301", leaf_ok,
+                                 "innermost 3-D leaf Item.tag (0,0,0)");
+                }
+            }
+        }
+
+        // ---- E9: to_vector re-read determinism (non-destructive) --------------
+        // Reading the SAME Object[] field through the documented to_vector twice
+        // yields identical per-slot OOPs and identical null layout — proving the
+        // documented path is a non-destructive decode (mirrors A11 for String[]).
+        {
+            const std::vector<std::unique_ptr<item_object>> a{ wrapper::s_object_mixed() };
+            const std::vector<std::unique_ptr<item_object>> b{ wrapper::s_object_mixed() };
+            ctx.check("fao_tv_reread_same_size", a.size() == b.size() && a.size() == 3);
+            ctx.check("fao_tv_reread_same_null_layout",
+                      a.size() == 3 && b.size() == 3
+                      && (a[0] != nullptr) == (b[0] != nullptr)
+                      && (a[1] == nullptr) == (b[1] == nullptr)
+                      && (a[2] != nullptr) == (b[2] != nullptr));
+            ctx.check("fao_tv_reread_same_oops",
+                      a.size() == 3 && b.size() == 3 && a[0] && a[2] && b[0] && b[2]
+                      && static_cast<void*>(a[0]->get_instance()) == static_cast<void*>(b[0]->get_instance())
+                      && static_cast<void*>(a[2]->get_instance()) == static_cast<void*>(b[2]->get_instance()));
+        }
+
+        // ---- E10: field_oop / array_length cross-check vs the Java oracle for a
+        //           STRING[] — bridges the String path with the array primitives
+        //           and proves array_length agrees with Java .length for a String[]
+        //           (D-series only cross-checked Item/Object/grid lengths).
+        {
+            void* const arr{ field_array_oop_static("staticStrings") };
+            ctx.check("fao_strlen_array_oop_nonnull", arr != nullptr);
+            if (arr)
+            {
+                ctx.check("fao_strlen_matches_java",
+                          vmhook::array_length(arr) == wrapper::j_static_strings_len());
+                // A null String[] reference -> field_array_oop_static returns
+                // nullptr -> array_length(nullptr) is 0 (no crash).
+                ctx.check("fao_strlen_null_ref_oop_is_null",
+                          field_array_oop_static("nullStringArray") == nullptr);
+            }
         }
 
         // =====================================================================

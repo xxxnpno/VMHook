@@ -236,6 +236,64 @@ public final class FieldArraysPrimitive
     public short[][]  instJaggedShortArray =
         { { (short) 1 }, { (short) -2, (short) 3 }, { (short) 4, (short) 5, (short) 6 } };
 
+    // --- TWO-element arrays (the smallest "many" boundary, length 2) ----------
+    // The flat shapes above cover length 0 / 1 / 3 / 256 / 1024 but never 2.
+    // A length-2 read exercises the loop's first->last transition with no mid.
+    public static byte[]    twoByteArray  = { (byte) -100, (byte) 100 };
+    public static int[]     twoIntArray   = { -2000000000, 2000000000 };
+    public static long[]    twoLongArray  = { Long.MIN_VALUE + 1L, Long.MAX_VALUE - 1L };
+    public static double[]  twoDoubleArray = { -123.456, 789.0625 };
+
+    // --- ALL-SAME-VALUE arrays (degenerate content, distinct from ascending) --
+    // Every element identical -- a read that accidentally reused one slot's
+    // address for all indices would still "pass" an ascending array's spot
+    // checks at index 0; an all-same array catches a stuck-stride only via the
+    // SIZE, while an all-distinct large array (above) catches the stride.  Pair
+    // both: here we assert each element equals the constant AND the size.
+    public static int[]     sameIntArray   = { 777, 777, 777, 777, 777 };
+    public static boolean[] allTrueArray   = { true, true, true, true };
+    public static boolean[] allFalseArray  = { false, false, false, false };
+
+    // --- UNSIGNED-reinterpretation source arrays ------------------------------
+    // A [B and a [S holding values whose sign bit is set, so reading them into
+    // an UNSIGNED C++ element type (uint8_t / uint16_t) through the generic
+    // vector<T> path exercises get_array_element<T>'s raw memcpy with a distinct
+    // instantiation and proves the bytes are reinterpreted, not sign-mangled.
+    // signedByteArray:  { -1, -128, 127 } -> as uint8_t { 255, 128, 127 }.
+    // signedShortArray: { -1, -32768, 32767 } -> as uint16_t { 65535, 32768, 32767 }.
+    public static byte[]    signedByteArray  = { (byte) -1, Byte.MIN_VALUE, Byte.MAX_VALUE };
+    public static short[]   signedShortArray = { (short) -1, Short.MIN_VALUE, Short.MAX_VALUE };
+    // A [I holding negatives, read into uint32_t -> { 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF }.
+    public static int[]     signedIntArray   = { -1, Integer.MIN_VALUE, Integer.MAX_VALUE };
+
+    // --- INSTANCE large + special variants ------------------------------------
+    // The static path has a 256-element large array and a NaN/Inf/subnormal
+    // special array; the INSTANCE-offset read path had neither.  A modest
+    // 64-element instance large int array (deterministic formula) plus an
+    // instance special float array close that gap at a small heap cost.
+    public static final int INST_LARGE_LEN = 64;
+    public int[]   instLargeIntArray = new int[INST_LARGE_LEN];
+    public float[] instSpecialFloatArray =
+        { Float.NaN, Float.NEGATIVE_INFINITY, Float.POSITIVE_INFINITY, -0.0f };
+
+    // Fill instLargeIntArray via a deterministic formula the native side can
+    // recompute by index (instance initialiser: runs for every constructed
+    // instance, including the static 'instance' self-reference above).
+    {
+        for (int i = 0; i < INST_LARGE_LEN; ++i)
+        {
+            instLargeIntArray[i] = i * 11 - 333;
+        }
+    }
+
+    // --- char[] with NUL (0x00) embedded and a surrogate-range code unit ------
+    // Java char[] stores raw 16-bit code units with no NUL terminator; a value
+    // of 0x0000 in the middle is a legal element, and a lone surrogate (0xD800)
+    // is a legal char (not a valid String, but a valid char[] element).  The raw
+    // uint16 read must recover all four exactly; into vector<char> each narrows
+    // to its low byte.  Pure ASCII source (all via (char) casts).
+    public static char[]    nulCharArray = { (char) 0x0000, 'Z', (char) 0xD800, (char) 0x0041 };
+
     static
     {
         for (int i = 0; i < LARGE_LEN; ++i)
@@ -293,6 +351,12 @@ public final class FieldArraysPrimitive
                 sum += staticByteCube[1][0][2];
                 sum += staticJaggedIntArray[3][2];
                 sum += instance.instIntGrid[2][1];
+                // Touch the new flat / unsigned-source / instance-large shapes
+                // so a class-init failure nulling any of them is observable.
+                sum += twoIntArray[1];
+                sum += sameIntArray[0];
+                sum += signedIntArray[2];
+                sum += instance.instLargeIntArray[INST_LARGE_LEN - 1];
                 FieldArraysPrimitive.probeChecksum = sum;
                 FieldArraysPrimitive.done = true;
             }

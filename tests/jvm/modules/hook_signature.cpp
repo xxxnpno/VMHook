@@ -37,7 +37,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -77,6 +80,34 @@ namespace
         static auto get_res_wide() -> double          { return static_field("resWide")->get(); }
         static auto get_process_int_calls() -> std::int32_t { return static_field("processIntCalls")->get(); }
 
+        // narrow(...) family results.
+        static auto get_res_nar_b() -> std::int32_t   { return static_field("resNarB")->get(); }
+        static auto get_res_nar_s() -> std::int32_t   { return static_field("resNarS")->get(); }
+        static auto get_res_nar_c() -> std::int32_t   { return static_field("resNarC")->get(); }
+        static auto get_res_nar_z() -> std::int32_t   { return static_field("resNarZ")->get(); }
+        static auto get_res_nar_f() -> float          { return static_field("resNarF")->get(); }
+
+        // null/degenerate refTake results.
+        static auto get_res_ref_obj_null() -> std::int32_t   { return static_field("resRefObjNull")->get(); }
+        static auto get_res_ref_arr_null() -> std::int32_t   { return static_field("resRefArrNull")->get(); }
+        static auto get_res_ref_str_null() -> std::int32_t   { return static_field("resRefStrNull")->get(); }
+        static auto get_res_ref_arr_empty() -> std::int32_t  { return static_field("resRefArrEmpty")->get(); }
+        static auto get_res_ref_arr_single() -> std::int32_t { return static_field("resRefArrSingle")->get(); }
+
+        // void overload (act) side-effect observations.
+        static auto get_act_invocations() -> std::int32_t { return static_field("actInvocations")->get(); }
+        static auto get_act_last_arg() -> std::int32_t    { return static_field("actLastArg")->get(); }
+        static auto set_act_invocations(std::int32_t v) -> void { static_field("actInvocations")->set(v); }
+        static auto set_act_last_arg(std::int32_t v) -> void    { static_field("actLastArg")->set(v); }
+
+        // empty-string process result.
+        static auto get_res_str_empty() -> std::int32_t { return static_field("resStrEmpty")->get(); }
+
+        // boundary-arg inputs the native side writes before raising go.
+        static auto set_b_arg_i(std::int32_t v) -> void { static_field("bArgI")->set(v); }
+        static auto set_b_arg_j(std::int64_t v) -> void { static_field("bArgJ")->set(v); }
+        static auto set_b_arg_d(double v) -> void        { static_field("bArgD")->set(v); }
+
         // Reads this instance's own seed (proves `self` is the right object).
         auto seed() const -> std::int32_t { return get_field("seed")->get(); }
     };
@@ -98,6 +129,26 @@ namespace
     constexpr std::int32_t WIDE_S_LEN{ 4 };
     constexpr std::int32_t WIDE_I{ 88 };
     constexpr std::int32_t PROCESS_INT_CALLS{ 5 };
+
+    // narrow(...) family — mirror HookSignature.NAR_* exactly.
+    constexpr std::int8_t   NAR_B{ static_cast<std::int8_t>(-5) };
+    constexpr std::int16_t  NAR_S{ static_cast<std::int16_t>(0x4321) };   // 17185
+    constexpr std::uint16_t NAR_C{ static_cast<std::uint16_t>(0xBEEF) };  // 48879
+    constexpr float         NAR_F{ 2.5F };
+    constexpr std::int32_t  ACT_ARG{ 77 };
+
+    // set_arg replacement values referenced inside NON-capturing detour lambdas
+    // (set_arg binds a forwarding reference, an odr-use, so the value must have
+    // static storage rather than being a block-scope constexpr that would need
+    // capture).  Namespace scope makes them referenceable without a capture list.
+    constexpr std::int32_t  SETARG_COMB_REPLACED{ 4242 };
+    constexpr std::int64_t  SETARG_MIX_REPLACED_J{ 0x0000000F0000000FLL };
+
+    // Boundary values the native side writes into the fixture before each probe.
+    constexpr std::int32_t INT_MIN_V{ std::numeric_limits<std::int32_t>::min() };
+    constexpr std::int32_t INT_MAX_V{ std::numeric_limits<std::int32_t>::max() };
+    constexpr std::int64_t LONG_MIN_V{ std::numeric_limits<std::int64_t>::min() };
+    constexpr std::int64_t LONG_MAX_V{ std::numeric_limits<std::int64_t>::max() };
 
     // ---- Per-overload fire counters + decoded-arg captures -----------------
     // Family A: process(...)
@@ -159,6 +210,48 @@ namespace
     std::atomic<bool>         g_wide_i_ok{ false };
     std::atomic<bool>         g_wide_self_ok{ false };
 
+    // Family F: narrow(...) — five single-slot primitive descriptors.
+    std::atomic<std::int32_t> g_fire_nar_b{ 0 };
+    std::atomic<std::int32_t> g_fire_nar_s{ 0 };
+    std::atomic<std::int32_t> g_fire_nar_c{ 0 };
+    std::atomic<std::int32_t> g_fire_nar_z{ 0 };
+    std::atomic<std::int32_t> g_fire_nar_f{ 0 };
+    std::atomic<std::int32_t> g_seen_nar_b{ 0 };
+    std::atomic<std::int32_t> g_seen_nar_s{ 0 };
+    std::atomic<std::int32_t> g_seen_nar_c{ 0 };
+    std::atomic<bool>         g_seen_nar_z{ false };
+    std::atomic<std::int64_t> g_seen_nar_f_bits{ 0 };   // bit-pattern of decoded float
+
+    // Boundary-value decode captures (modes 15/16/17).
+    std::atomic<std::int32_t> g_fire_bound_i{ 0 };
+    std::atomic<std::int64_t> g_fire_bound_j{ 0 };       // reused as fire-count proxy
+    std::atomic<std::int32_t> g_seen_bound_i{ 0 };
+    std::atomic<std::int64_t> g_seen_bound_j{ 0 };
+    std::atomic<std::int64_t> g_seen_bound_d_bits{ 0 };
+    std::atomic<std::int32_t> g_fire_bound_d{ 0 };
+
+    // Null / degenerate reference-arg captures (modes 18/19).
+    std::atomic<bool>         g_ref_obj_null_was_null{ false };
+    std::atomic<std::int32_t> g_ref_str_null_len{ -2 };
+    std::atomic<std::int32_t> g_fire_ref_obj_null{ 0 };
+    std::atomic<std::int32_t> g_fire_ref_str_null{ 0 };
+    std::atomic<std::int32_t> g_fire_ref_arr_empty{ 0 };
+    std::atomic<std::int32_t> g_fire_ref_arr_single{ 0 };
+
+    // Void overload (act) detour observations (mode 24).
+    std::atomic<std::int32_t> g_fire_act{ 0 };
+    std::atomic<std::int32_t> g_seen_act_arg{ 0 };
+
+    // set_arg arg-mutation captures (modes 25/26).
+    std::atomic<std::int32_t> g_fire_setarg_comb{ 0 };
+    std::atomic<bool>         g_setarg_comb_ret{ false };
+    std::atomic<std::int32_t> g_fire_setarg_mix{ 0 };
+    std::atomic<bool>         g_setarg_mix_ret{ false };
+
+    // Empty-string process capture (mode 27).
+    std::atomic<std::int32_t> g_fire_proc_str_empty{ 0 };
+    std::atomic<std::int32_t> g_seen_proc_str_empty_len{ -2 };
+
     auto reset_all() -> void
     {
         g_fire_proc_i.store(0); g_fire_proc_j.store(0);
@@ -183,6 +276,41 @@ namespace
         g_wide_flag_ok.store(false); g_wide_d_ok.store(false);
         g_wide_s_ok.store(false); g_wide_i_ok.store(false);
         g_wide_self_ok.store(false);
+        g_fire_nar_b.store(0); g_fire_nar_s.store(0); g_fire_nar_c.store(0);
+        g_fire_nar_z.store(0); g_fire_nar_f.store(0);
+        g_seen_nar_b.store(0); g_seen_nar_s.store(0); g_seen_nar_c.store(0);
+        g_seen_nar_z.store(false); g_seen_nar_f_bits.store(0);
+        g_fire_bound_i.store(0); g_fire_bound_j.store(0); g_fire_bound_d.store(0);
+        g_seen_bound_i.store(0); g_seen_bound_j.store(0); g_seen_bound_d_bits.store(0);
+        g_ref_obj_null_was_null.store(false); g_ref_str_null_len.store(-2);
+        g_fire_ref_obj_null.store(0); g_fire_ref_str_null.store(0);
+        g_fire_ref_arr_empty.store(0); g_fire_ref_arr_single.store(0);
+        g_fire_act.store(0); g_seen_act_arg.store(0);
+        g_fire_setarg_comb.store(0); g_setarg_comb_ret.store(false);
+        g_fire_setarg_mix.store(0); g_setarg_mix_ret.store(false);
+        g_fire_proc_str_empty.store(0); g_seen_proc_str_empty_len.store(-2);
+    }
+
+    // Reinterpret a float's bits as int64 (zero-extended) for atomic compare.
+    auto fbits(float f) -> std::int64_t
+    {
+        std::uint32_t out{};
+        std::memcpy(&out, &f, sizeof(out));
+        return static_cast<std::int64_t>(out);
+    }
+
+    // Two's-complement wrap of seed + v, computed in UNSIGNED space so the
+    // boundary blocks (INT_MAX/LONG_MAX) match Java's defined overflow without
+    // tripping C++ signed-overflow UB.
+    auto wrap_add_i(std::int32_t seed, std::int32_t v) -> std::int32_t
+    {
+        return static_cast<std::int32_t>(static_cast<std::uint32_t>(seed)
+                                         + static_cast<std::uint32_t>(v));
+    }
+    auto wrap_add_j(std::int64_t seed, std::int64_t v) -> std::int64_t
+    {
+        return static_cast<std::int64_t>(static_cast<std::uint64_t>(seed)
+                                         + static_cast<std::uint64_t>(v));
     }
 
     auto drive(vmhook_test::context& ctx, std::int32_t mode) -> bool
@@ -886,5 +1014,532 @@ VMHOOK_JVM_MODULE(hook_signature)
         // allow-through: 1.0 + 1.25 + len("wide")(=4) + 88 = 94.25
         ctx.check("wide_sig_allow_through",
                   hook_sig_fixture::get_res_wide() == (1.0 + WIDE_D + static_cast<double>(WIDE_S_LEN) + WIDE_I));
+    }
+
+    // =====================================================================
+    // Block 14 — NARROW-PRIMITIVE descriptor family: narrow(byte) (B)I,
+    //   narrow(short) (S)I, narrow(char) (C)I, narrow(boolean) (Z)I,
+    //   narrow(float) (F)F.  Five same-name overloads whose descriptors differ
+    //   ONLY in the narrow primitive kind (all single interpreter slots).  Hook
+    //   all five SIMULTANEOUSLY on their descriptors; call all five; prove each
+    //   detour fires exactly once on its own descriptor (no cross-fire) and
+    //   decodes its slot with the correct width/signedness:
+    //     byte    -> int8_t  sign-bearing (-5)
+    //     short   -> int16_t positive 17185
+    //     char    -> uint16_t unsigned 48879 (would be negative if read signed)
+    //     boolean -> bool true
+    //     float   -> float 2.5 (bit-exact)
+    // =====================================================================
+    {
+        auto h_b{ vmhook::scoped_hook<hook_sig_fixture>(
+            "narrow", "(B)I",
+            [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, std::int8_t v)
+            {
+                g_fire_nar_b.fetch_add(1, std::memory_order_relaxed);
+                g_seen_nar_b.store(static_cast<std::int32_t>(v), std::memory_order_relaxed);
+            }) };
+        auto h_s{ vmhook::scoped_hook<hook_sig_fixture>(
+            "narrow", "(S)I",
+            [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, std::int16_t v)
+            {
+                g_fire_nar_s.fetch_add(1, std::memory_order_relaxed);
+                g_seen_nar_s.store(static_cast<std::int32_t>(v), std::memory_order_relaxed);
+            }) };
+        auto h_c{ vmhook::scoped_hook<hook_sig_fixture>(
+            "narrow", "(C)I",
+            [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, std::uint16_t v)
+            {
+                g_fire_nar_c.fetch_add(1, std::memory_order_relaxed);
+                g_seen_nar_c.store(static_cast<std::int32_t>(v), std::memory_order_relaxed);
+            }) };
+        auto h_z{ vmhook::scoped_hook<hook_sig_fixture>(
+            "narrow", "(Z)I",
+            [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, bool v)
+            {
+                g_fire_nar_z.fetch_add(1, std::memory_order_relaxed);
+                g_seen_nar_z.store(v, std::memory_order_relaxed);
+            }) };
+        auto h_f{ vmhook::scoped_hook<hook_sig_fixture>(
+            "narrow", "(F)F",
+            [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, float v)
+            {
+                g_fire_nar_f.fetch_add(1, std::memory_order_relaxed);
+                g_seen_nar_f_bits.store(fbits(v), std::memory_order_relaxed);
+            }) };
+
+        ctx.check("narrow_byte_handle_installed", h_b.installed());
+        ctx.check("narrow_short_handle_installed", h_s.installed());
+        ctx.check("narrow_char_handle_installed", h_c.installed());
+        ctx.check("narrow_bool_handle_installed", h_z.installed());
+        ctx.check("narrow_float_handle_installed", h_f.installed());
+        ctx.check("five_narrow_handles_distinct",
+                  h_b.installed() && h_s.installed() && h_c.installed()
+                  && h_z.installed() && h_f.installed());
+
+        const bool done{ drive(ctx, 14) };
+        ctx.check("narrow_probe_completed", done);
+
+        // Each fired exactly once, no cross-fire.
+        ctx.check("narrow_byte_fired_once", g_fire_nar_b.load() == 1);
+        ctx.check("narrow_short_fired_once", g_fire_nar_s.load() == 1);
+        ctx.check("narrow_char_fired_once", g_fire_nar_c.load() == 1);
+        ctx.check("narrow_bool_fired_once", g_fire_nar_z.load() == 1);
+        ctx.check("narrow_float_fired_once", g_fire_nar_f.load() == 1);
+        ctx.check("narrow_byte_no_cross", g_fire_nar_b.load() <= 1);
+        ctx.check("narrow_short_no_cross", g_fire_nar_s.load() <= 1);
+        ctx.check("narrow_char_no_cross", g_fire_nar_c.load() <= 1);
+        ctx.check("narrow_bool_no_cross", g_fire_nar_z.load() <= 1);
+        ctx.check("narrow_float_no_cross", g_fire_nar_f.load() <= 1);
+
+        // Correct width / signedness decode for each narrow kind.
+        ctx.check("narrow_byte_sign_decoded", g_seen_nar_b.load() == static_cast<std::int32_t>(NAR_B));
+        ctx.check("narrow_short_decoded", g_seen_nar_s.load() == static_cast<std::int32_t>(NAR_S));
+        ctx.check("narrow_char_unsigned_decoded", g_seen_nar_c.load() == static_cast<std::int32_t>(NAR_C));
+        ctx.check("narrow_bool_true_decoded", g_seen_nar_z.load());
+        ctx.check("narrow_float_bitexact_decoded", g_seen_nar_f_bits.load() == fbits(NAR_F));
+
+        // allow-through: each original ran unmodified.
+        ctx.check("narrow_byte_allow_through", hook_sig_fixture::get_res_nar_b() == static_cast<std::int32_t>(NAR_B));
+        ctx.check("narrow_short_allow_through", hook_sig_fixture::get_res_nar_s() == static_cast<std::int32_t>(NAR_S));
+        ctx.check("narrow_char_allow_through", hook_sig_fixture::get_res_nar_c() == static_cast<std::int32_t>(NAR_C));
+        ctx.check("narrow_bool_allow_through", hook_sig_fixture::get_res_nar_z() == 1);
+        ctx.check("narrow_float_allow_through", fbits(hook_sig_fixture::get_res_nar_f()) == fbits(NAR_F + 1.0F));
+    }
+
+    // =====================================================================
+    // Block 15 — INT BOUNDARY values on the descriptor-selected process(int)
+    //   (I)I overload: INT_MIN, INT_MAX, 0, -1.  Each is written into the
+    //   fixture before the probe and decoded by the signature-selected detour.
+    //   Proves the (I)I slot decode is exact at the 32-bit extremes (no
+    //   spurious sign-extension drift from the 64-bit slot word).
+    // =====================================================================
+    {
+        const std::int32_t boundaries[]{ INT_MIN_V, INT_MAX_V, 0, -1 };
+        for (const std::int32_t b : boundaries)
+        {
+            auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+                "process", "(I)I",
+                [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, std::int32_t v)
+                {
+                    g_fire_bound_i.fetch_add(1, std::memory_order_relaxed);
+                    g_seen_bound_i.store(v, std::memory_order_relaxed);
+                }) };
+            ctx.check("int_boundary_installed", h.installed());
+
+            hook_sig_fixture::set_b_arg_i(b);
+            const bool done{ drive(ctx, 15) };
+            ctx.check("int_boundary_probe_completed", done);
+            ctx.check("int_boundary_fired_once", g_fire_bound_i.load() == 1);
+            ctx.check("int_boundary_arg_decoded_exact", g_seen_bound_i.load() == b);
+            // allow-through: process(int) returns seed + v with wrap-around.
+            ctx.check("int_boundary_allow_through",
+                      hook_sig_fixture::get_res_i() == wrap_add_i(SEED, b));
+        }
+    }
+
+    // =====================================================================
+    // Block 16 — LONG BOUNDARY values on process(long) (J)J: LONG_MIN, LONG_MAX,
+    //   0, -1.  Proves the two-slot long read reassembles the full 64 bits at
+    //   every extreme (the high slot is read through the same fault-safe path).
+    // =====================================================================
+    {
+        const std::int64_t boundaries[]{ LONG_MIN_V, LONG_MAX_V, 0, -1 };
+        for (const std::int64_t b : boundaries)
+        {
+            auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+                "process", "(J)J",
+                [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, std::int64_t v)
+                {
+                    g_fire_bound_j.fetch_add(1, std::memory_order_relaxed);
+                    g_seen_bound_j.store(v, std::memory_order_relaxed);
+                }) };
+            ctx.check("long_boundary_installed", h.installed());
+
+            hook_sig_fixture::set_b_arg_j(b);
+            const bool done{ drive(ctx, 16) };
+            ctx.check("long_boundary_probe_completed", done);
+            ctx.check("long_boundary_fired_once", g_fire_bound_j.load() == 1);
+            ctx.check("long_boundary_arg_decoded_full64", g_seen_bound_j.load() == b);
+            ctx.check("long_boundary_allow_through",
+                      hook_sig_fixture::get_res_j() == wrap_add_j(SEED, b));
+        }
+    }
+
+    // =====================================================================
+    // Block 17 — DOUBLE special values on process(double) (D)D: +0.0, -0.0,
+    //   +Inf, -Inf, NaN, smallest subnormal, max finite.  Compared by BIT
+    //   PATTERN (so -0.0 != +0.0 and NaN is matched by its exact bits), proving
+    //   the two-slot double decode is bit-exact across the IEEE-754 corners.
+    // =====================================================================
+    {
+        const double specials[]{
+            0.0,
+            -0.0,
+            std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::quiet_NaN(),
+            std::numeric_limits<double>::denorm_min(),
+            std::numeric_limits<double>::max(),
+        };
+        for (const double d : specials)
+        {
+            auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+                "process", "(D)D",
+                [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, double v)
+                {
+                    g_fire_bound_d.fetch_add(1, std::memory_order_relaxed);
+                    g_seen_bound_d_bits.store(dbits(v), std::memory_order_relaxed);
+                }) };
+            ctx.check("double_special_installed", h.installed());
+
+            hook_sig_fixture::set_b_arg_d(d);
+            const bool done{ drive(ctx, 17) };
+            ctx.check("double_special_probe_completed", done);
+            ctx.check("double_special_fired_once", g_fire_bound_d.load() == 1);
+
+            // NaN: a quiet-NaN payload can be canonicalized when a value transits
+            // an x87 register on some (non-SSE2) FP paths, so the exact bits are
+            // not portably guaranteed.  HotSpot x86_64 keeps doubles in xmm
+            // (bit-preserving), but to stay green on every cell we hard-assert
+            // bit-equality for the finite/Inf/zero corners and only RECORD the NaN
+            // bits as [INFO] while still asserting the decode produced *a* NaN.
+            const bool is_nan{ std::isnan(d) };
+            if (is_nan)
+            {
+                const std::int64_t bits{ g_seen_bound_d_bits.load() };
+                double back{};
+                std::memcpy(&back, &bits, sizeof(back));
+                ctx.check("double_special_nan_decoded_is_nan", std::isnan(back));
+                ctx.record(std::string{ "[INFO] process(double) NaN arg decoded bits = " }
+                           + std::to_string(bits));
+            }
+            else
+            {
+                ctx.check("double_special_arg_decoded_bitexact", g_seen_bound_d_bits.load() == dbits(d));
+            }
+        }
+    }
+
+    // =====================================================================
+    // Block 18 — NULL reference args: refTake(Object null), refTake(int[] null),
+    //   refTake(String null).  Hook the Object and String descriptors; prove the
+    //   detour fires, the Object wrapper decodes to nullptr (null oop), and the
+    //   String decode yields an EMPTY std::string (read_java_string of a null
+    //   oop), and the originals still ran (allow-through with the null branch).
+    // =====================================================================
+    {
+        auto h_obj{ vmhook::scoped_hook<hook_sig_fixture>(
+            "refTake", "(Ljava/lang/Object;)I",
+            [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&,
+               const std::unique_ptr<hook_sig_fixture>& o)
+            {
+                g_fire_ref_obj_null.fetch_add(1, std::memory_order_relaxed);
+                g_ref_obj_null_was_null.store(o == nullptr, std::memory_order_relaxed);
+            }) };
+        auto h_str{ vmhook::scoped_hook<hook_sig_fixture>(
+            "refTake", "(Ljava/lang/String;)I",
+            [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, const std::string& s)
+            {
+                g_fire_ref_str_null.fetch_add(1, std::memory_order_relaxed);
+                g_ref_str_null_len.store(static_cast<std::int32_t>(s.size()), std::memory_order_relaxed);
+            }) };
+        ctx.check("ref_null_obj_installed", h_obj.installed());
+        ctx.check("ref_null_str_installed", h_str.installed());
+
+        const bool done{ drive(ctx, 18) };
+        ctx.check("ref_null_probe_completed", done);
+
+        ctx.check("ref_null_obj_fired_once", g_fire_ref_obj_null.load() == 1);
+        ctx.check("ref_null_str_fired_once", g_fire_ref_str_null.load() == 1);
+        // Null Object decodes to a null wrapper (decode_oop returns nullptr).
+        ctx.check("ref_null_obj_wrapper_is_null", g_ref_obj_null_was_null.load());
+        // Null String decodes to an empty std::string (read_java_string(nullptr)).
+        ctx.check("ref_null_str_decoded_empty", g_ref_str_null_len.load() == 0);
+        // allow-through: Java's own null branches ran.
+        ctx.check("ref_null_obj_allow_through", hook_sig_fixture::get_res_ref_obj_null() == REF_TAG);
+        ctx.check("ref_null_arr_allow_through", hook_sig_fixture::get_res_ref_arr_null() == -1);
+        ctx.check("ref_null_str_allow_through", hook_sig_fixture::get_res_ref_str_null() == -1);
+    }
+
+    // =====================================================================
+    // Block 19 — DEGENERATE int[] shapes: refTake(int[]{}) [empty] and
+    //   refTake(int[]{9}) [single element], both selected by the ([I)I
+    //   descriptor.  Proves the array-reference detour fires for each shape and
+    //   that the original (returning a.length) sees 0 and 1 respectively.
+    // =====================================================================
+    {
+        auto h_arr{ vmhook::scoped_hook<hook_sig_fixture>(
+            "refTake", "([I)I",
+            [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&,
+               const std::unique_ptr<hook_sig_fixture>& a)
+            {
+                // Both shapes are NON-null arrays; count by which order they ran
+                // via a single counter (Java calls empty first, single second).
+                if (a != nullptr)
+                {
+                    if (g_fire_ref_arr_empty.load(std::memory_order_relaxed) == 0)
+                    {
+                        g_fire_ref_arr_empty.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        g_fire_ref_arr_single.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }) };
+        ctx.check("ref_arr_shapes_installed", h_arr.installed());
+
+        const bool done{ drive(ctx, 19) };
+        ctx.check("ref_arr_shapes_probe_completed", done);
+        ctx.check("ref_arr_empty_fired", g_fire_ref_arr_empty.load() == 1);
+        ctx.check("ref_arr_single_fired", g_fire_ref_arr_single.load() == 1);
+        // allow-through: lengths observed by the original.
+        ctx.check("ref_arr_empty_len_zero", hook_sig_fixture::get_res_ref_arr_empty() == 0);
+        ctx.check("ref_arr_single_len_one", hook_sig_fixture::get_res_ref_arr_single() == 1);
+    }
+
+    // =====================================================================
+    // Block 20 — FORCE-RETURN a LONG sentinel on process(long) (J)J.  Proves
+    //   force-return works through a 64-bit-return descriptor selected by
+    //   signature (the full 64-bit sentinel must reach the Java caller).
+    // =====================================================================
+    {
+        constexpr std::int64_t FORCED_J{ 0x1122334455667788LL };
+        auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+            "process", "(J)J",
+            [](vmhook::return_value& rv, const std::unique_ptr<hook_sig_fixture>&, std::int64_t)
+            {
+                g_fire_proc_j.fetch_add(1, std::memory_order_relaxed);
+                rv.set(FORCED_J);
+            }) };
+        ctx.check("force_long_installed", h.installed());
+
+        const bool done{ drive(ctx, 20) };
+        ctx.check("force_long_probe_completed", done);
+        ctx.check("force_long_fired_once", g_fire_proc_j.load() == 1);
+        ctx.check("force_long_full64_returned", hook_sig_fixture::get_res_j() == FORCED_J);
+        ctx.check("force_long_not_original",
+                  hook_sig_fixture::get_res_j() != (static_cast<std::int64_t>(SEED) + ARG_J));
+    }
+
+    // =====================================================================
+    // Block 21 — FORCE-RETURN a DOUBLE sentinel on process(double) (D)D.  Proves
+    //   force-return reaches xmm0 for a double-return descriptor selected by
+    //   signature; compared by bit pattern.
+    // =====================================================================
+    {
+        constexpr double FORCED_D{ 3.5 };
+        auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+            "process", "(D)D",
+            [](vmhook::return_value& rv, const std::unique_ptr<hook_sig_fixture>&, double)
+            {
+                g_fire_proc_d.fetch_add(1, std::memory_order_relaxed);
+                rv.set(FORCED_D);
+            }) };
+        ctx.check("force_double_installed", h.installed());
+
+        const bool done{ drive(ctx, 21) };
+        ctx.check("force_double_probe_completed", done);
+        ctx.check("force_double_fired_once", g_fire_proc_d.load() == 1);
+        ctx.check("force_double_returned", dbits(hook_sig_fixture::get_res_d()) == dbits(FORCED_D));
+        ctx.check("force_double_not_original",
+                  dbits(hook_sig_fixture::get_res_d()) != dbits(static_cast<double>(SEED) + ARG_D));
+    }
+
+    // =====================================================================
+    // Block 22 — STATIC force-return: hook static stat(int) (I)J and force a
+    //   long sentinel; leave stat(long) (J)J as allow-through.  Proves
+    //   force-return on a STATIC, descriptor-selected overload (no implicit
+    //   `this`) replaces ONLY the selected overload's return.
+    // =====================================================================
+    {
+        constexpr std::int64_t FORCED_STAT{ 0x0000ABCD0000DCBALL };
+        auto h_i{ vmhook::scoped_hook<hook_sig_fixture>(
+            "stat", "(I)J",
+            [](vmhook::return_value& rv, std::int32_t)
+            {
+                g_fire_stat_i.fetch_add(1, std::memory_order_relaxed);
+                rv.set(FORCED_STAT);
+            }) };
+        auto h_j{ vmhook::scoped_hook<hook_sig_fixture>(
+            "stat", "(J)J",
+            [](vmhook::return_value&, std::int64_t)
+            {
+                g_fire_stat_j.fetch_add(1, std::memory_order_relaxed);
+            }) };
+        ctx.check("static_force_int_installed", h_i.installed());
+        ctx.check("static_force_long_installed", h_j.installed());
+
+        const bool done{ drive(ctx, 22) };
+        ctx.check("static_force_probe_completed", done);
+        ctx.check("static_force_int_fired", g_fire_stat_i.load() == 1);
+        ctx.check("static_force_long_fired", g_fire_stat_j.load() == 1);
+        ctx.check("static_force_int_return_replaced", hook_sig_fixture::get_res_stat_i() == FORCED_STAT);
+        ctx.check("static_force_int_not_original",
+                  hook_sig_fixture::get_res_stat_i() != (static_cast<std::int64_t>(STAT_I) * 2));
+        // The allow-through static sibling returned its original v+1.
+        ctx.check("static_force_long_sibling_unmodified",
+                  hook_sig_fixture::get_res_stat_j() == (STAT_J + 1));
+    }
+
+    // =====================================================================
+    // Block 23 — FORCE-RETURN a DOUBLE through the WIDE multi-slot descriptor
+    //   (ZDLjava/lang/String;I)D.  Proves force-return works on a multi-arg,
+    //   multi-slot, double-returning overload selected by its full descriptor.
+    // =====================================================================
+    {
+        constexpr double FORCED_WIDE{ -42.5 };
+        auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+            "wide", "(ZDLjava/lang/String;I)D",
+            [](vmhook::return_value& rv, const std::unique_ptr<hook_sig_fixture>&,
+               bool, double, const std::string&, std::int32_t)
+            {
+                g_fire_wide.fetch_add(1, std::memory_order_relaxed);
+                rv.set(FORCED_WIDE);
+            }) };
+        ctx.check("wide_force_installed", h.installed());
+
+        const bool done{ drive(ctx, 23) };
+        ctx.check("wide_force_probe_completed", done);
+        ctx.check("wide_force_fired_once", g_fire_wide.load() == 1);
+        ctx.check("wide_force_double_returned", dbits(hook_sig_fixture::get_res_wide()) == dbits(FORCED_WIDE));
+        ctx.check("wide_force_not_original",
+                  dbits(hook_sig_fixture::get_res_wide())
+                  != dbits(1.0 + WIDE_D + static_cast<double>(WIDE_S_LEN) + WIDE_I));
+    }
+
+    // =====================================================================
+    // Block 24 — VOID overload: act(int) (I)V.  The descriptor return type is V.
+    //   First prove allow-through (the body's side-effect counter bumps); then,
+    //   in a fresh install, prove cancel() suppresses the body (no bump).  This
+    //   is the only descriptor whose return type is void, exercising the V leg
+    //   of the descriptor comparison and the cancel-on-void path.
+    // =====================================================================
+    {
+        // 24a — allow-through: detour fires, body runs (counter bumps).
+        hook_sig_fixture::set_act_invocations(0);
+        hook_sig_fixture::set_act_last_arg(0);
+        {
+            auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+                "act", "(I)V",
+                [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, std::int32_t v)
+                {
+                    g_fire_act.fetch_add(1, std::memory_order_relaxed);
+                    g_seen_act_arg.store(v, std::memory_order_relaxed);
+                    // allow-through: no rv.cancel()
+                }) };
+            ctx.check("void_act_allow_installed", h.installed());
+
+            const bool done{ drive(ctx, 24) };
+            ctx.check("void_act_allow_probe_completed", done);
+            ctx.check("void_act_allow_fired_once", g_fire_act.load() == 1);
+            ctx.check("void_act_allow_arg_decoded", g_seen_act_arg.load() == ACT_ARG);
+            ctx.check("void_act_allow_body_ran", hook_sig_fixture::get_act_invocations() == 1);
+            ctx.check("void_act_allow_body_saw_arg", hook_sig_fixture::get_act_last_arg() == ACT_ARG);
+        }
+
+        // 24b — cancel: detour fires, body is SUPPRESSED (counter stays put).
+        hook_sig_fixture::set_act_invocations(0);
+        hook_sig_fixture::set_act_last_arg(-1);
+        {
+            auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+                "act", "(I)V",
+                [](vmhook::return_value& rv, const std::unique_ptr<hook_sig_fixture>&, std::int32_t)
+                {
+                    g_fire_act.fetch_add(1, std::memory_order_relaxed);
+                    rv.cancel();   // suppress the original void body
+                }) };
+            ctx.check("void_act_cancel_installed", h.installed());
+
+            const bool done{ drive(ctx, 24) };
+            ctx.check("void_act_cancel_probe_completed", done);
+            // g_fire_act was reset by drive()'s reset_all(); it fired once here.
+            ctx.check("void_act_cancel_fired_once", g_fire_act.load() == 1);
+            // The body never ran: counter stayed 0, last-arg stayed -1.
+            ctx.check("void_act_cancel_body_suppressed", hook_sig_fixture::get_act_invocations() == 0);
+            ctx.check("void_act_cancel_body_arg_untouched", hook_sig_fixture::get_act_last_arg() == -1);
+        }
+    }
+
+    // =====================================================================
+    // Block 25 — set_arg ON A SIGNATURE-SELECTED overload: combine(int) (I)I.
+    //   The detour overwrites the int arg at slot 1 (slot 0 is `this`) before the
+    //   body runs; the original returns the REPLACED value.  Proves arg-mutation
+    //   targets the correct slot for a signature-selected instance overload.
+    // =====================================================================
+    {
+        auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+            "combine", "(I)I",
+            [](vmhook::return_value& rv, const std::unique_ptr<hook_sig_fixture>&, std::int32_t)
+            {
+                g_fire_setarg_comb.fetch_add(1, std::memory_order_relaxed);
+                // slot 1 = first arg for an instance method (slot 0 = this).
+                g_setarg_comb_ret.store(rv.set_arg(1, SETARG_COMB_REPLACED), std::memory_order_relaxed);
+            }) };
+        ctx.check("setarg_combine_installed", h.installed());
+
+        const bool done{ drive(ctx, 25) };
+        ctx.check("setarg_combine_probe_completed", done);
+        ctx.check("setarg_combine_fired_once", g_fire_setarg_comb.load() == 1);
+        ctx.check("setarg_combine_set_arg_ok", g_setarg_comb_ret.load());
+        // combine(int) returns its arg; the body observed the REPLACED value.
+        ctx.check("setarg_combine_body_saw_replacement",
+                  hook_sig_fixture::get_res_comb1() == SETARG_COMB_REPLACED);
+        ctx.check("setarg_combine_not_original", hook_sig_fixture::get_res_comb1() != COMB_A);
+    }
+
+    // =====================================================================
+    // Block 26 — set_arg of a LONG on mix(int,long) (IJ)J.  The long arg's base
+    //   slot is 2 (slot 0 = this, slot 1 = int).  set_arg stores the 64-bit value
+    //   at the lower slot internally; the body (a + b) must then observe the
+    //   replaced long.  Proves the two-slot set_arg base index round-trips with
+    //   the body's lload for a signature-selected overload.
+    // =====================================================================
+    {
+        auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+            "mix", "(IJ)J",
+            [](vmhook::return_value& rv, const std::unique_ptr<hook_sig_fixture>&,
+               std::int32_t, std::int64_t)
+            {
+                g_fire_setarg_mix.fetch_add(1, std::memory_order_relaxed);
+                // base slot of the long is 2: this=0, int=1, long base=2.
+                g_setarg_mix_ret.store(rv.set_arg(2, SETARG_MIX_REPLACED_J), std::memory_order_relaxed);
+            }) };
+        ctx.check("setarg_mix_installed", h.installed());
+
+        const bool done{ drive(ctx, 26) };
+        ctx.check("setarg_mix_probe_completed", done);
+        ctx.check("setarg_mix_fired_once", g_fire_setarg_mix.load() == 1);
+        ctx.check("setarg_mix_set_arg_ok", g_setarg_mix_ret.load());
+        // mix(int,long) returns a + b; a unchanged (MIX_I), b replaced.
+        ctx.check("setarg_mix_body_saw_replaced_long",
+                  hook_sig_fixture::get_res_mix_il() == (static_cast<std::int64_t>(MIX_I) + SETARG_MIX_REPLACED_J));
+        ctx.check("setarg_mix_not_original",
+                  hook_sig_fixture::get_res_mix_il() != (static_cast<std::int64_t>(MIX_I) + MIX_J));
+    }
+
+    // =====================================================================
+    // Block 27 — EMPTY-STRING reference arg on process(String)
+    //   (Ljava/lang/String;)I.  Proves the String-ref decode yields a
+    //   zero-length (but non-degenerate) std::string for a real empty Java
+    //   String, distinct from the null case (Block 18) which also yields length 0
+    //   but from a null oop — and that the original's length() sees 0.
+    // =====================================================================
+    {
+        auto h{ vmhook::scoped_hook<hook_sig_fixture>(
+            "process", "(Ljava/lang/String;)I",
+            [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, const std::string& s)
+            {
+                g_fire_proc_str_empty.fetch_add(1, std::memory_order_relaxed);
+                g_seen_proc_str_empty_len.store(static_cast<std::int32_t>(s.size()), std::memory_order_relaxed);
+            }) };
+        ctx.check("empty_string_installed", h.installed());
+
+        const bool done{ drive(ctx, 27) };
+        ctx.check("empty_string_probe_completed", done);
+        ctx.check("empty_string_fired_once", g_fire_proc_str_empty.load() == 1);
+        ctx.check("empty_string_decoded_zero_len", g_seen_proc_str_empty_len.load() == 0);
+        // allow-through: process("") returns seed + 0.
+        ctx.check("empty_string_allow_through", hook_sig_fixture::get_res_str_empty() == SEED);
     }
 }

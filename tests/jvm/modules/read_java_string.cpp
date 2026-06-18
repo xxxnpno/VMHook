@@ -232,6 +232,22 @@ namespace
     const std::string k_reversedPair = "\xED\xB0\x80\xED\xA0\xBD";        // U+DC00 then U+D83D
     const std::string k_highAtEnd= "\x58\xED\xA0\xBD";                    // 'X' then lone high surrogate
 
+    // --- EXPANDED coverage: surrogate-combine / NUL-position / BMP boundary ----
+    const std::string k_twoEmoji = "\xF0\x9F\x98\x80\xF0\x9F\x98\x81";    // U+1F600 U+1F601 (8 bytes)
+    const std::string k_highThenBmp = "\xED\xA0\xBD\x41";                 // lone hi + 'A' (4 bytes)
+    const std::string k_highThenHigh = "\xED\xA0\xBD\xED\xA0\xBD";        // two lone hi (6 bytes)
+    const std::string k_emojiThenNul{ '\xF0', '\x9F', '\x98', '\x80', '\x00' }; // emoji + NUL (5)
+    const std::string k_leadingNul{ '\x00', '\x61', '\x62' };            // NUL a b (3)
+    const std::string k_trailingNul{ '\x61', '\x62', '\x00' };           // a b NUL (3)
+    const std::string k_allNul{ '\x00', '\x00', '\x00' };                // NUL NUL NUL (3)
+    const std::string k_leadingNulUtf16{ '\x00', '\xE6', '\x97', '\xA5' }; // NUL U+65E5 (4)
+    const std::string k_last1Byte{ '\x7F' };                             // U+007F (1)
+    const std::string k_midTwoByte = "\xC4\x80";                         // U+0100 -> C4 80
+    const std::string k_firstTwoByteUtf16 = "\xC2\x80\xE4\xB8\xAD";      // U+0080 U+4E2D (C2 80 + 3)
+    const std::string k_firstThreeBytePlus1 = "\xE0\xA0\x81";            // U+0801 -> E0 A0 81
+    const std::string k_bom = "\xEF\xBB\xBF\x61";                        // U+FEFF 'a' (EF BB BF 61)
+    const std::string k_combining = "\x65\xCC\x81";                      // 'e' U+0301 (65 CC 81)
+
     // Render a std::string as "AA BB CC" hex for diagnostics.
     auto to_hex(const std::string& s) -> std::string
     {
@@ -344,6 +360,11 @@ namespace
         ctx.check("rjs_firstAstral_field_resolves", rjs::resolves("firstAstral"));
         ctx.check("rjs_maxAstral_field_resolves", rjs::resolves("maxAstral"));
         ctx.check("rjs_cap1M_field_resolves", rjs::resolves("cap1M"));
+        ctx.check("rjs_twoEmoji_field_resolves", rjs::resolves("twoEmoji"));
+        ctx.check("rjs_highThenBmp_field_resolves", rjs::resolves("highThenBmp"));
+        ctx.check("rjs_leadingNul_field_resolves", rjs::resolves("leadingNul"));
+        ctx.check("rjs_bom_field_resolves", rjs::resolves("bom"));
+        ctx.check("rjs_bulkEmoji_field_resolves", rjs::resolves("bulkEmoji"));
 
         // =================================================================
         //  1. LATIN1 (coder 0) DECODES -- byte-exact UTF-8.
@@ -433,6 +454,46 @@ namespace
             const std::string intd{ rjs::decode("interned") };
             ctx.check("decode_interned_eq_hello", intd == k_hello);
             ctx.check("decode_interned_eq_ascii_decode", intd == rjs::decode("ascii"));
+
+            // U+007F -- the LAST 1-byte UTF-8 code point as a STANDALONE char (the
+            // 1-byte/2-byte boundary from BELOW; latin1Lo80 pins it from above).
+            const std::string l1b{ rjs::decode("last1Byte") };
+            ctx.check("decode_last1Byte_U007F_eq_7F", l1b == k_last1Byte);
+            ctx.check("decode_last1Byte_len_1",
+                      l1b.size() == 1 && static_cast<std::uint8_t>(l1b[0]) == 0x7Fu);
+
+            // NUL at EVERY position (LATIN1): the std::string is sized by the array
+            // length, NOT cut at the first NUL like a C string would be.  Leading,
+            // trailing, and all-NUL each survive as the full 3 bytes -- the
+            // strongest "length-driven, not NUL-terminated" proof beyond nulLatin1.
+            const std::string lead_nul{ rjs::decode("leadingNul") };
+            ctx.check("decode_leadingNul_byte_exact", lead_nul == k_leadingNul);
+            ctx.check("decode_leadingNul_len_3_leading_nul",
+                      lead_nul.size() == 3 && lead_nul[0] == '\0'
+                      && lead_nul[1] == 'a' && lead_nul[2] == 'b');
+            const std::string trail_nul{ rjs::decode("trailingNul") };
+            ctx.check("decode_trailingNul_byte_exact", trail_nul == k_trailingNul);
+            ctx.check("decode_trailingNul_len_3_trailing_nul",
+                      trail_nul.size() == 3 && trail_nul[0] == 'a'
+                      && trail_nul[1] == 'b' && trail_nul[2] == '\0');
+            const std::string all_nul{ rjs::decode("allNul") };
+            ctx.check("decode_allNul_three_nul_bytes", all_nul == k_allNul);
+            ctx.check("decode_allNul_len_3_not_empty",
+                      all_nul.size() == 3 && all_nul != std::string{});
+            ctx.record(std::string{ "[INFO] NUL positions: leadingNul=[" } + to_hex(lead_nul)
+                       + "] trailingNul=[" + to_hex(trail_nul) + "] allNul=[" + to_hex(all_nul) + "]");
+
+            // 500x U+00E9 (LATIN1): the 2-byte LATIN1 encode in BULK -> 1000 bytes
+            // of repeating C3 A9 (longAscii covers the 1-byte LATIN1 loop in bulk;
+            // all256 hits each high byte only once -- this stresses the 2-byte path).
+            const std::string bulk_hi{ rjs::decode("bulkLatin1Hi") };
+            const std::string k_bulk_hi{ repeat_bytes("\xC3\xA9", 500) };
+            ctx.check("decode_bulkLatin1Hi_len_1000", bulk_hi.size() == 1000);
+            ctx.check("decode_bulkLatin1Hi_byte_exact", bulk_hi == k_bulk_hi);
+            ctx.check("decode_bulkLatin1Hi_tail_C3A9",
+                      bulk_hi.size() == 1000
+                      && static_cast<std::uint8_t>(bulk_hi[998]) == 0xC3u
+                      && static_cast<std::uint8_t>(bulk_hi[999]) == 0xA9u);
         }
 
         // =================================================================
@@ -571,6 +632,111 @@ namespace
                       && static_cast<std::uint8_t>(high_end[1]) == 0xEDu);     // CESU lead
             ctx.record(std::string{ "[INFO] surrogate edges: loneLow=[" } + to_hex(lone_low)
                        + "] reversedPair=[" + to_hex(rev) + "] highAtEnd=[" + to_hex(high_end) + "]");
+
+            // U+0100 -- a MID-range 2-byte UTF-8 code point on the UTF-16 path
+            // (C4 80); bmp2to3a pinned the 2-byte TOP (U+07FF), this fills interior.
+            const std::string mid2{ rjs::decode("midTwoByte") };
+            ctx.check("decode_midTwoByte_U0100_eq_C480", mid2 == k_midTwoByte);
+            ctx.check("decode_midTwoByte_len_2", mid2.size() == 2);
+
+            // U+0080 forced through the UTF-16 path (paired with a >0xFF char so the
+            // whole String is coder 1): the FIRST 2-byte code point (C2 80) produced
+            // by the UTF-16 decode loop, not just the LATIN1 path (latin1Lo80).
+            const std::string f2u{ rjs::decode("firstTwoByteUtf16") };
+            ctx.check("decode_firstTwoByteUtf16_byte_exact", f2u == k_firstTwoByteUtf16);
+            ctx.check("decode_firstTwoByteUtf16_leads_C280",
+                      f2u.size() == 5
+                      && static_cast<std::uint8_t>(f2u[0]) == 0xC2u
+                      && static_cast<std::uint8_t>(f2u[1]) == 0x80u);
+
+            // U+0801 -- ONE past the first 3-byte code point (U+0800): the 3-byte
+            // encoder is not an off-by-one at its low edge (E0 A0 81).
+            const std::string f3p{ rjs::decode("firstThreeBytePlus1") };
+            ctx.check("decode_firstThreeBytePlus1_U0801_eq_E0A081", f3p == k_firstThreeBytePlus1);
+            ctx.check("decode_firstThreeBytePlus1_len_3", f3p.size() == 3);
+
+            // U+FEFF byte-order mark + 'a': a BOM is a normal BMP char, NOT stripped
+            // (read_java_string is a verbatim decoder) -> EF BB BF 61.
+            const std::string bom{ rjs::decode("bom") };
+            ctx.check("decode_bom_not_stripped_eq_EFBBBF61", bom == k_bom);
+            ctx.check("decode_bom_len_4_with_trailing_a",
+                      bom.size() == 4 && static_cast<std::uint8_t>(bom.back()) == 0x61u);
+            ctx.record(std::string{ "[INFO] BMP fillers: midTwoByte=[" } + to_hex(mid2)
+                       + "] firstTwoByteUtf16=[" + to_hex(f2u) + "] firstThreeBytePlus1=["
+                       + to_hex(f3p) + "] bom=[" + to_hex(bom) + "]");
+
+            // 'e' + U+0301 (combining acute): a two-code-point grapheme decoded
+            // sequentially across a 1-byte then a 2-byte char -> 65 CC 81.
+            const std::string comb{ rjs::decode("combining") };
+            ctx.check("decode_combining_eq_65CC81", comb == k_combining);
+            ctx.check("decode_combining_len_3_e_then_2byte",
+                      comb.size() == 3 && static_cast<std::uint8_t>(comb[0]) == 0x65u
+                      && static_cast<std::uint8_t>(comb[1]) == 0xCCu);
+
+            // TWO CONSECUTIVE surrogate pairs (no ASCII separator): after combining
+            // the first pair and advancing the index by 2, the loop must combine the
+            // SECOND pair too -> two 4-byte sequences (the back-to-back combine case
+            // emojiMix's ASCII separator did not exercise).
+            const std::string two_emoji{ rjs::decode("twoEmoji") };
+            ctx.check("decode_twoEmoji_byte_exact", two_emoji == k_twoEmoji);
+            ctx.check("decode_twoEmoji_len_8_two_4byte_seqs",
+                      two_emoji.size() == 8
+                      && static_cast<std::uint8_t>(two_emoji[0]) == 0xF0u
+                      && static_cast<std::uint8_t>(two_emoji[4]) == 0xF0u
+                      && static_cast<std::uint8_t>(two_emoji[7]) == 0x81u);
+
+            // A high surrogate followed by a NON-low BMP char (U+D83D then 'A'): the
+            // combine INNER guard (low in DC00..DFFF) is FALSE at a NON-end index, so
+            // the high emits as lone 3-byte CESU and 'A' decodes normally -> ED A0 BD 41.
+            const std::string high_bmp{ rjs::decode("highThenBmp") };
+            ctx.check("decode_highThenBmp_eq_EDA0BD41", high_bmp == k_highThenBmp);
+            ctx.check("decode_highThenBmp_len_4_A_preserved",
+                      high_bmp.size() == 4
+                      && static_cast<std::uint8_t>(high_bmp[0]) == 0xEDu
+                      && static_cast<std::uint8_t>(high_bmp.back()) == 0x41u);
+
+            // A high surrogate followed by ANOTHER high surrogate (D83D D83D): the
+            // inner guard is false (second unit is not a LOW surrogate); the first
+            // emits as lone CESU and the loop re-examines the second high (now last)
+            // which also emits as lone CESU -> ED A0 BD ED A0 BD (the index did NOT
+            // advance past the second unit when the first failed to combine).
+            const std::string high_high{ rjs::decode("highThenHigh") };
+            ctx.check("decode_highThenHigh_eq_EDA0BD_x2", high_high == k_highThenHigh);
+            ctx.check("decode_highThenHigh_len_6", high_high.size() == 6);
+
+            // A surrogate pair followed by an interior NUL: the NUL after an astral
+            // code point survives and the combine's index advance landed correctly
+            // -> F0 9F 98 80 00 (5 bytes; NUL not a terminator).
+            const std::string emoji_nul{ rjs::decode("emojiThenNul") };
+            ctx.check("decode_emojiThenNul_byte_exact", emoji_nul == k_emojiThenNul);
+            ctx.check("decode_emojiThenNul_len_5_trailing_nul",
+                      emoji_nul.size() == 5
+                      && static_cast<std::uint8_t>(emoji_nul[0]) == 0xF0u
+                      && emoji_nul[4] == '\0');
+
+            // Leading NUL on the UTF-16 path (NUL then U+65E5, promoted to coder 1):
+            // NUL at index 0 of a UTF-16 backing survives -> 00 E6 97 A5 (4 bytes).
+            const std::string lead_nul16{ rjs::decode("leadingNulUtf16") };
+            ctx.check("decode_leadingNulUtf16_byte_exact", lead_nul16 == k_leadingNulUtf16);
+            ctx.check("decode_leadingNulUtf16_len_4_leading_nul",
+                      lead_nul16.size() == 4 && lead_nul16[0] == '\0'
+                      && static_cast<std::uint8_t>(lead_nul16[1]) == 0xE6u);
+            ctx.record(std::string{ "[INFO] combine/NUL: twoEmoji=[" } + to_hex(two_emoji)
+                       + "] highThenBmp=[" + to_hex(high_bmp) + "] highThenHigh=[" + to_hex(high_high)
+                       + "] emojiThenNul=[" + to_hex(emoji_nul) + "] leadingNulUtf16=["
+                       + to_hex(lead_nul16) + "]");
+
+            // 200x U+1F600 (UTF-16 surrogate pairs): the surrogate-combine +
+            // index-advance loop IN BULK (longCjk is BMP-only) -> 200*4 = 800 bytes
+            // of repeating F0 9F 98 80, each pair an independent astral code point.
+            const std::string bulk_emoji{ rjs::decode("bulkEmoji") };
+            const std::string k_bulk_emoji{ repeat_bytes("\xF0\x9F\x98\x80", 200) };
+            ctx.check("decode_bulkEmoji_len_800", bulk_emoji.size() == 800);
+            ctx.check("decode_bulkEmoji_byte_exact", bulk_emoji == k_bulk_emoji);
+            ctx.check("decode_bulkEmoji_tail_4byte",
+                      bulk_emoji.size() == 800
+                      && static_cast<std::uint8_t>(bulk_emoji[796]) == 0xF0u
+                      && static_cast<std::uint8_t>(bulk_emoji[799]) == 0x80u);
         }
 
         // =================================================================
@@ -829,6 +995,40 @@ namespace
                 ctx.check("java_highAtEnd_len_2", rjs::seen_int("jHighAtEndLen") == 2);
                 ctx.check("java_cap70000_len_70000", rjs::seen_int("jCap70000Len") == 70000);
 
+                // --- Java agrees on the NEWLY-added subjects too ----------------
+                ctx.check("java_twoEmoji_len_4", rjs::seen_int("jTwoEmojiLen") == 4);
+                ctx.check("java_twoEmoji_cpCount_2", rjs::seen_int("jTwoEmojiCpCount") == 2);
+                ctx.check("java_twoEmoji_cp0_is_1F600", rjs::seen_int("jTwoEmojiCp0") == 0x1F600);
+                ctx.check("java_twoEmoji_cp1_is_1F601", rjs::seen_int("jTwoEmojiCp1") == 0x1F601);
+                ctx.check("java_highThenBmp_len_2", rjs::seen_int("jHighThenBmpLen") == 2);
+                ctx.check("java_highThenBmp_cp0_is_D83D", rjs::seen_int("jHighThenBmpCp0") == 0xD83D);
+                ctx.check("java_highThenBmp_cp1_is_A", rjs::seen_int("jHighThenBmpCp1") == 0x41);
+                ctx.check("java_highThenHigh_len_2", rjs::seen_int("jHighThenHighLen") == 2);
+                ctx.check("java_highThenHigh_cp0_is_D83D", rjs::seen_int("jHighThenHighCp0") == 0xD83D);
+                ctx.check("java_highThenHigh_cp1_is_D83D", rjs::seen_int("jHighThenHighCp1") == 0xD83D);
+                ctx.check("java_emojiThenNul_len_3", rjs::seen_int("jEmojiThenNulLen") == 3);
+                ctx.check("java_emojiThenNul_cpCount_2", rjs::seen_int("jEmojiThenNulCpCount") == 2);
+                ctx.check("java_leadingNul_len_3", rjs::seen_int("jLeadingNulLen") == 3);
+                ctx.check("java_leadingNul_cp0_is_0", rjs::seen_int("jLeadingNulCp0") == 0);
+                ctx.check("java_trailingNul_len_3", rjs::seen_int("jTrailingNulLen") == 3);
+                ctx.check("java_trailingNul_cp2_is_0", rjs::seen_int("jTrailingNulCp2") == 0);
+                ctx.check("java_allNul_len_3", rjs::seen_int("jAllNulLen") == 3);
+                ctx.check("java_leadingNulUtf16_len_2", rjs::seen_int("jLeadingNulUtf16Len") == 2);
+                ctx.check("java_leadingNulUtf16_cp0_is_0", rjs::seen_int("jLeadingNulUtf16Cp0") == 0);
+                ctx.check("java_leadingNulUtf16_cp1_is_65E5", rjs::seen_int("jLeadingNulUtf16Cp1") == 0x65E5);
+                ctx.check("java_last1Byte_cp0_is_7F", rjs::seen_int("jLast1ByteCp0") == 0x007F);
+                ctx.check("java_midTwoByte_cp0_is_100", rjs::seen_int("jMidTwoByteCp0") == 0x0100);
+                ctx.check("java_firstTwoByteUtf16_cp0_is_80", rjs::seen_int("jFirstTwoByteUtf16Cp0") == 0x0080);
+                ctx.check("java_firstTwoByteUtf16_cp1_is_4E2D", rjs::seen_int("jFirstTwoByteUtf16Cp1") == 0x4E2D);
+                ctx.check("java_firstThreeBytePlus1_cp0_is_801", rjs::seen_int("jFirstThreeBytePlus1Cp0") == 0x0801);
+                ctx.check("java_bom_cp0_is_FEFF", rjs::seen_int("jBomCp0") == 0xFEFF);
+                ctx.check("java_bom_len_2", rjs::seen_int("jBomLen") == 2);
+                ctx.check("java_combining_len_2", rjs::seen_int("jCombiningLen") == 2);
+                ctx.check("java_combining_cp1_is_301", rjs::seen_int("jCombiningCp1") == 0x0301);
+                ctx.check("java_bulkLatin1Hi_len_500", rjs::seen_int("jBulkLatin1HiLen") == 500);
+                ctx.check("java_bulkEmoji_len_400", rjs::seen_int("jBulkEmojiLen") == 400);
+                ctx.check("java_bulkEmoji_cpCount_200", rjs::seen_int("jBulkEmojiCpCount") == 200);
+
                 // Physical-coder coverage (diagnostic).  When the coder field is
                 // readable (JDK 9+ with reflective access), LATIN1 cases are 0 and
                 // UTF16 cases are 1; on JDK 8 there is no coder field (the char[]
@@ -862,6 +1062,22 @@ namespace
                 if (c_emoji >= 0)     { ctx.check("java_coder_emoji_is_UTF16", c_emoji == 1); }
                 if (c_max_bmp >= 0)   { ctx.check("java_coder_maxBmp_is_UTF16", c_max_bmp == 1); }
                 if (c_long_cjk >= 0)  { ctx.check("java_coder_longCjk_is_UTF16", c_long_cjk == 1); }
+
+                // Physical coder for the NEWLY-added subjects (diagnostic + asserted
+                // only when readable).  twoEmoji/midTwoByte/bom are UTF16 (a >0xFF or
+                // astral char); bulkLatin1Hi is LATIN1 (all chars <= 0xFF).
+                const std::int32_t c_two_emoji{ rjs::seen_int("jCoderTwoEmoji") };
+                const std::int32_t c_bulk_latin1{ rjs::seen_int("jCoderBulkLatin1Hi") };
+                const std::int32_t c_mid_two{ rjs::seen_int("jCoderMidTwoByte") };
+                const std::int32_t c_bom{ rjs::seen_int("jCoderBom") };
+                ctx.record(std::string{ "[INFO] coder{twoEmoji=" } + std::to_string(c_two_emoji)
+                           + " bulkLatin1Hi=" + std::to_string(c_bulk_latin1)
+                           + " midTwoByte=" + std::to_string(c_mid_two)
+                           + " bom=" + std::to_string(c_bom) + "}");
+                if (c_two_emoji >= 0)   { ctx.check("java_coder_twoEmoji_is_UTF16", c_two_emoji == 1); }
+                if (c_bulk_latin1 >= 0) { ctx.check("java_coder_bulkLatin1Hi_is_LATIN1", c_bulk_latin1 == 0); }
+                if (c_mid_two >= 0)     { ctx.check("java_coder_midTwoByte_is_UTF16", c_mid_two == 1); }
+                if (c_bom >= 0)         { ctx.check("java_coder_bom_is_UTF16", c_bom == 1); }
             }
         }
 
@@ -879,6 +1095,15 @@ namespace
             // backing arrays were never mutated by any read above).
             ctx.check("cafe_unchanged_after_probe", rjs::decode("cafe") == k_cafe);
             ctx.check("emoji_unchanged_after_probe", rjs::decode("emoji") == k_emoji);
+
+            // A bulk surrogate-combine subject and a NUL-bearing subject re-decode
+            // identically after the probe too: the larger body safe_read and the
+            // interior-NUL handling are also pure (no mutation of the backing array).
+            ctx.check("twoEmoji_unchanged_after_probe", rjs::decode("twoEmoji") == k_twoEmoji);
+            ctx.check("leadingNul_unchanged_after_probe", rjs::decode("leadingNul") == k_leadingNul);
+            const std::string be1{ rjs::decode("bulkEmoji") };
+            const std::string be2{ rjs::decode("bulkEmoji") };
+            ctx.check("bulkEmoji_repeatable_same_bytes", be1 == be2 && be1.size() == 800);
         }
     }
 }
