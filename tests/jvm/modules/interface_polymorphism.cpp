@@ -105,6 +105,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -529,6 +531,17 @@ namespace
         // ---- read `pet` AS the DECLARED interface type ----
         auto pet_as_animal() const -> std::unique_ptr<ifp_animal> { return get_field("pet")->get(); }
 
+        // ---- read the SAME slot through DIFFERENT declared-interface lenses ----
+        // robotPet implements BOTH Animal and Named: reading it as each interface
+        // wrapper decodes the SAME oop (type-agnostic field decode), and the runtime
+        // klass is STILL Robot through either lens.  pet2 read as the Animal
+        // interface aliases the Cat the same way `pet` aliases the Dog.
+        auto robot_as_animal() const -> std::unique_ptr<ifp_animal> { return get_field("robotPet")->get(); }
+        auto robot_as_named()  const -> std::unique_ptr<ifp_named>  { return get_field("robotPet")->get(); }
+        auto pet2_as_animal()  const -> std::unique_ptr<ifp_animal> { return get_field("pet2")->get(); }
+        // ---- read the abstract-typed slot AS the abstract base wrapper ----
+        auto abs_as_abstract() const -> std::unique_ptr<ifp_abstract> { return get_field("absPet")->get(); }
+
         // ---- read the petAsDog field (concrete-typed slot to the SAME object) ----
         auto pet_alias_as_dog() const -> std::unique_ptr<ifp_dog> { return get_field("petAsDog")->get(); }
 
@@ -581,6 +594,89 @@ namespace
             return std::string{};
         }
         return sym->to_string();
+    }
+
+    // The internal (slash-separated) name of a klass*, gated null + is_valid_pointer
+    // + null symbol so a garbage klass degrades to "" rather than faulting.  Shared
+    // by the SUPERCLASS-CHAIN walk below (which reads names off klasses reached by
+    // get_super(), not off oop headers).
+    auto klass_name(vmhook::hotspot::klass* k) -> std::string
+    {
+        if (!k || !vmhook::hotspot::is_valid_pointer(k))
+        {
+            return std::string{};
+        }
+        const vmhook::hotspot::symbol* const sym{ k->get_name() };
+        if (!sym || !vmhook::hotspot::is_valid_pointer(sym))
+        {
+            return std::string{};
+        }
+        return sym->to_string();
+    }
+
+    // Walks the SUPERCLASS chain (Klass::_super only -- NOT interfaces) starting at
+    // the runtime klass read from an oop header, collecting each klass's full
+    // internal name UP to (and including) java/lang/Object.  This is the mechanical
+    // root of the interface-default-method shape: a concrete impl of an interface
+    // has java/lang/Object as its DIRECT super -- the implemented interface is NOT
+    // on this chain.  Safety-gated end to end (header safe-read + per-link
+    // is_valid_pointer); returns empty on a stale/relocated/unmapped oop so a
+    // cold-JVM relocation degrades to [INFO] rather than faulting.  Bounded depth
+    // (a runaway/corrupt _super chain can never spin) -- 16 is far above any real
+    // hierarchy here.
+    auto super_chain_from_oop(vmhook::oop_t oop) -> std::vector<std::string>
+    {
+        std::vector<std::string> chain{};
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+        {
+            return chain;
+        }
+        std::array<std::uint8_t, 16> scratch{};
+        if (!vmhook::os::safe_read(scratch.data(), oop, scratch.size()))
+        {
+            return chain;
+        }
+        vmhook::hotspot::klass* k{ vmhook::klass_from_oop(oop) };
+        for (int depth{ 0 }; depth < 16 && k && vmhook::hotspot::is_valid_pointer(k); ++depth)
+        {
+            k = k->get_super();
+            if (!k || !vmhook::hotspot::is_valid_pointer(k))
+            {
+                break;
+            }
+            const std::string n{ klass_name(k) };
+            if (n.empty())
+            {
+                break;
+            }
+            chain.push_back(n);
+            if (n == "java/lang/Object")
+            {
+                break;
+            }
+        }
+        return chain;
+    }
+
+    // True when `chain` contains exactly one element naming java/lang/Object -- the
+    // signature of a class whose DIRECT super is Object (every interface impl in
+    // this fixture: Dog/Cat/Snake/Robot/Wolf/Diamond/Concierge/Gadget/StringBox).
+    auto direct_object_super(const std::vector<std::string>& chain) -> bool
+    {
+        return chain.size() == 1 && chain.front() == "java/lang/Object";
+    }
+
+    // True when `needle` appears anywhere in `chain`.
+    auto chain_contains(const std::vector<std::string>& chain, const std::string& needle) -> bool
+    {
+        for (const std::string& s : chain)
+        {
+            if (s == needle)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     // True when the first 16 bytes of an oop header (mark word .. narrow klass)
@@ -1543,6 +1639,272 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
                           box_iface->get_instance() == box->get_instance());
                 // The interface's own klass declares the erased get() -> HARD.
                 ctx.check("ipm_box_iface_declares_erased_get", box_iface->resolves_get_erased());
+            }
+        }
+
+        // =================================================================
+        // 15. SUPERCLASS-CHAIN SHAPE (the mechanical root of the limitation).
+        //     get_method walks Klass::_super ONLY -- so the interface is NEVER on
+        //     a concrete impl's super chain.  Read each impl's runtime klass from
+        //     its oop header and walk get_super() UP to java/lang/Object, proving:
+        //       * every direct interface impl (Dog/Cat/Snake/Robot/Wolf/Diamond/
+        //         Concierge/Gadget/StringBox) has java/lang/Object as its DIRECT
+        //         and ONLY super -- the implemented interface is absent from the
+        //         chain (hence default methods need the interface FALLBACK, not the
+        //         super walk);
+        //       * Hamster's chain is AbstractPet -> Object (a REAL super, which is
+        //         exactly why describe() IS reachable by the super walk);
+        //       * GuardDog's chain is Watcher -> Object (Animal reached only
+        //         transitively-through-the-superclass, never on this chain).
+        //     Pure pointer-walk + name reads -> deterministic on every JDK/platform;
+        //     a cold-JVM relocation yields an empty chain -> [INFO], never a FAIL.
+        // =================================================================
+        struct super_case
+        {
+            const char*   label;
+            vmhook::oop_t oop;
+        };
+        const std::array<super_case, 9> object_super_cases{ {
+            { "dog",       pet_dog   ? pet_dog->get_instance()   : nullptr },
+            { "cat",       pet_cat   ? pet_cat->get_instance()   : nullptr },
+            { "snake",     pet_snake ? pet_snake->get_instance() : nullptr },
+            { "robot",     pet_robot ? pet_robot->get_instance() : nullptr },
+            { "wolf",      wolf      ? wolf->get_instance()      : nullptr },
+            { "diamond",   diamond   ? diamond->get_instance()   : nullptr },
+            { "concierge", concierge ? concierge->get_instance() : nullptr },
+            { "gadget",    gadget    ? gadget->get_instance()    : nullptr },
+            { "stringbox", box       ? box->get_instance()       : nullptr },
+        } };
+        for (const super_case& sc : object_super_cases)
+        {
+            const std::vector<std::string> chain{ super_chain_from_oop(sc.oop) };
+            if (chain.empty())
+            {
+                ctx.record(std::string("[INFO] interface_polymorphism: ") + sc.label
+                           + " super chain not readable (null/stale/relocated oop); "
+                             "skipped superclass-chain assertion.");
+                continue;
+            }
+            // Direct super is java/lang/Object and the implemented interface is NOT
+            // on the chain -> default-method lookup CANNOT use the super walk.
+            ctx.check(std::string("ipm_") + sc.label + "_direct_super_is_object",
+                      direct_object_super(chain));
+            ctx.check(std::string("ipm_") + sc.label + "_super_chain_excludes_animal_interface",
+                      !chain_contains(chain, k_animal_class));
+        }
+
+        // Hamster: a REAL abstract super on the chain (AbstractPet -> Object).
+        if (pet_hamster)
+        {
+            const std::vector<std::string> hchain{ super_chain_from_oop(pet_hamster->get_instance()) };
+            if (!hchain.empty())
+            {
+                ctx.check("ipm_hamster_super_chain_includes_abstract_base",
+                          chain_contains(hchain, k_abstract_class));
+                ctx.check("ipm_hamster_super_chain_reaches_object",
+                          chain_contains(hchain, "java/lang/Object"));
+                // First link is the abstract base (the DIRECT super) -- this is why
+                // the super walk reaches the concrete describe() declared on it.
+                ctx.check("ipm_hamster_direct_super_is_abstract_base",
+                          hchain.front() == std::string{ k_abstract_class });
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: hamster super chain not readable; skipped.");
+            }
+        }
+
+        // GuardDog: Watcher -> Object; Animal is NOT a superclass (only transitive).
+        if (guard_dog)
+        {
+            const std::vector<std::string> gchain{ super_chain_from_oop(guard_dog->get_instance()) };
+            if (!gchain.empty())
+            {
+                ctx.check("ipm_guarddog_direct_super_is_watcher",
+                          gchain.front() == std::string{ k_watcher_class });
+                ctx.check("ipm_guarddog_super_chain_reaches_object",
+                          chain_contains(gchain, "java/lang/Object"));
+                ctx.check("ipm_guarddog_super_chain_excludes_animal_interface",
+                          !chain_contains(gchain, k_animal_class));
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: guarddog super chain not readable; skipped.");
+            }
+        }
+
+        // =================================================================
+        // 16. MULTI-INTERFACE IDENTITY THROUGH DIFFERENT DECLARED LENSES.
+        //     robotPet implements Animal AND Named.  Reading the SAME slot as each
+        //     interface wrapper decodes the SAME oop (the field decode is
+        //     type-agnostic), and the runtime klass is STILL Robot through either
+        //     lens -- the declared interface never leaks into the decoded type.
+        //     Both interface methods resolve on Robot's own klass (super walk,
+        //     depth 0): Animal.speak() through the Animal lens and Named.who()
+        //     through the Named lens.  pet2 read as the Animal interface aliases the
+        //     Cat exactly as `pet`/`pet_as_animal` aliases the Dog.
+        // =================================================================
+        {
+            const auto robot_animal{ holder->robot_as_animal() };
+            const auto robot_named{ holder->robot_as_named() };
+            ctx.check("ipm_robot_as_animal_nonnull", robot_animal != nullptr);
+            ctx.check("ipm_robot_as_named_nonnull",  robot_named  != nullptr);
+            if (pet_robot && robot_animal)
+            {
+                ctx.check("ipm_robot_animal_lens_same_oop",
+                          robot_animal->get_instance() == pet_robot->get_instance());
+                // speak() (Animal-declared) resolves through the Animal lens.
+                ctx.check("ipm_robot_animal_lens_resolves_speak", robot_animal->resolves_speak());
+            }
+            if (pet_robot && robot_named)
+            {
+                ctx.check("ipm_robot_named_lens_same_oop",
+                          robot_named->get_instance() == pet_robot->get_instance());
+                // who() (Named-declared) resolves through the Named lens.
+                ctx.check("ipm_robot_named_lens_resolves_who", robot_named->resolves_who());
+            }
+            if (robot_animal && robot_named)
+            {
+                // BOTH interface lenses decode the SAME oop (one object, two
+                // declared interfaces) -> HARD pointer compare.
+                ctx.check("ipm_robot_both_iface_lenses_same_oop",
+                          robot_animal->get_instance() == robot_named->get_instance());
+                const std::string via_named{ runtime_klass_name(robot_named->get_instance()) };
+                if (!via_named.empty())
+                {
+                    ctx.check("ipm_robot_runtime_klass_via_named_lens_is_robot",
+                              ends_with(via_named, "Robot"));
+                }
+            }
+        }
+        {
+            const auto cat_animal{ holder->pet2_as_animal() };
+            if (pet_cat && cat_animal)
+            {
+                ctx.check("ipm_cat_animal_lens_same_oop",
+                          cat_animal->get_instance() == pet_cat->get_instance());
+                const std::string via_animal{ runtime_klass_name(cat_animal->get_instance()) };
+                if (!via_animal.empty())
+                {
+                    ctx.check("ipm_cat_runtime_klass_via_interface_lens_is_cat",
+                              ends_with(via_animal, "Cat"));
+                }
+            }
+        }
+
+        // =================================================================
+        // 17. METHOD ENUMERATION on the INTERFACE / multi-method / base klasses.
+        //     get_class_methods reads InstanceKlass::_methods directly (a warm
+        //     runtime-klass read, universal across JDKs).  Prove the declared shape
+        //     of each type's OWN _methods array:
+        //       * Animal interface declares BOTH speak() (abstract) and
+        //         defaultGreet() (default) -- the default lives on the interface,
+        //         which is why the impl needs the interface fallback to reach it;
+        //       * Robot declares BOTH speak() and who() (two interfaces' methods,
+        //         both overridden on the impl's own klass);
+        //       * AbstractPet declares BOTH sound() (abstract) and describe()
+        //         (concrete) -- describe() on the super is why the super walk reaches
+        //         it;
+        //       * LoudAnimal declares shout() and DiamondTop declares tag() (the
+        //         sub-/apex defaults reachable only via the transitive fallback).
+        //     Each enumeration is gated: an empty array (klass not resolvable on a
+        //     cold run) records [INFO] and skips, never FAILs.
+        // =================================================================
+        {
+            // Helper-free inline: count name matches in a klass's own _methods.
+            const auto declares = [](const std::vector<std::pair<std::string, std::string>>& ms,
+                                     const char* method_name) -> bool
+            {
+                for (const auto& [m_name, m_sig] : ms)
+                {
+                    static_cast<void>(m_sig);
+                    if (m_name == method_name)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            const auto animal_methods{ vmhook::get_class_methods(k_animal_class) };
+            if (!animal_methods.empty())
+            {
+                ctx.check("ipm_animal_iface_declares_speak",        declares(animal_methods, "speak"));
+                ctx.check("ipm_animal_iface_declares_default_greet", declares(animal_methods, "defaultGreet"));
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: Animal interface _methods enumeration empty; skipped.");
+            }
+
+            const auto robot_methods{ vmhook::get_class_methods(k_robot_class) };
+            if (!robot_methods.empty())
+            {
+                ctx.check("ipm_robot_klass_declares_speak", declares(robot_methods, "speak"));
+                ctx.check("ipm_robot_klass_declares_who",   declares(robot_methods, "who"));
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: Robot _methods enumeration empty; skipped.");
+            }
+
+            const auto abstract_methods{ vmhook::get_class_methods(k_abstract_class) };
+            if (!abstract_methods.empty())
+            {
+                ctx.check("ipm_abstract_base_declares_sound",    declares(abstract_methods, "sound"));
+                ctx.check("ipm_abstract_base_declares_describe", declares(abstract_methods, "describe"));
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: AbstractPet _methods enumeration empty; skipped.");
+            }
+
+            const auto loud_methods{ vmhook::get_class_methods(k_loudanimal_class) };
+            if (!loud_methods.empty())
+            {
+                ctx.check("ipm_loudanimal_iface_declares_shout", declares(loud_methods, "shout"));
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: LoudAnimal interface _methods enumeration empty; skipped.");
+            }
+
+            const auto diamondtop_methods{ vmhook::get_class_methods(k_diamondtop_class) };
+            if (!diamondtop_methods.empty())
+            {
+                ctx.check("ipm_diamondtop_apex_declares_tag", declares(diamondtop_methods, "tag"));
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: DiamondTop apex _methods enumeration empty; skipped.");
+            }
+        }
+
+        // =================================================================
+        // 18. ABSTRACT-BASE LENS IDENTITY: reading absPet AS the abstract-base
+        //     wrapper decodes the SAME oop as the concrete Hamster read, and both
+        //     the abstract sound() and the concrete describe() resolve on the base
+        //     klass (depth-0 super walk through the base-typed wrapper).  Parallels
+        //     the interface-lens identity above but for an ABSTRACT-CLASS lens.
+        // =================================================================
+        if (pet_hamster)
+        {
+            const auto abs_lens{ holder->abs_as_abstract() };
+            ctx.check("ipm_abs_as_abstract_nonnull", abs_lens != nullptr);
+            if (abs_lens)
+            {
+                ctx.check("ipm_abs_lens_same_oop_as_hamster",
+                          abs_lens->get_instance() == pet_hamster->get_instance());
+                // Through the abstract-base lens, both methods on the base resolve.
+                ctx.check("ipm_abs_lens_resolves_sound",    abs_lens->resolves_sound());
+                ctx.check("ipm_abs_lens_resolves_describe", abs_lens->resolves_describe());
+                // The runtime klass via the abstract-base lens is STILL the concrete
+                // Hamster (the declared abstract type never leaks into the decode).
+                const std::string via_abs{ runtime_klass_name(abs_lens->get_instance()) };
+                if (!via_abs.empty())
+                {
+                    ctx.check("ipm_abs_lens_runtime_klass_is_hamster", ends_with(via_abs, "Hamster"));
+                }
             }
         }
 

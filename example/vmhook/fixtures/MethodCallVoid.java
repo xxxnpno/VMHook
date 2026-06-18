@@ -113,6 +113,74 @@ public final class MethodCallVoid
      *  value-returning call after a void call still delivers its argument. */
     public static volatile int     lastEchoArg;
 
+    // ── repeat-dispatch counter (idempotency / no double-dispatch) ──────────
+
+    /** Bumped by voidRepeat(); the native side calls it a known number of times
+     *  and asserts the counter equals exactly that — proving each call() ran the
+     *  body exactly once (neither dropped nor doubled). */
+    public static volatile int     voidRepeatHits;
+
+    // ── boundary primitive arguments (a SECOND, edge-valued recorder) ───────
+    // Distinct from voidPrimArgs so the existing "ran exactly once" assertion on
+    // voidPrimArgs is untouched while we also exercise extreme bit patterns.
+
+    public static volatile boolean edgePrimsCalled;
+    public static volatile int     edgePrimInt;
+    public static volatile long    edgePrimLong;
+    public static volatile boolean edgePrimBool;
+    public static volatile double  edgePrimDouble;
+
+    // ── narrow / float primitive arguments (byte, short, char, float) ───────
+    // The original prim test only covers I/J/Z/D; these are the 1-slot narrow
+    // widths whose marshalling (zero/sign-extension into an interpreter slot) is
+    // otherwise unproven for a void dispatch.
+
+    public static volatile boolean narrowArgsCalled;
+    public static volatile byte    narrowArgByte;
+    public static volatile short   narrowArgShort;
+    public static volatile char    narrowArgChar;
+    public static volatile float   narrowArgFloat;
+
+    // ── degenerate String arguments (empty + null) ──────────────────────────
+
+    /** Length recorded by voidEmptyStringArg (must be 0 for the empty String). */
+    public static volatile int     emptyStringLen = -2;
+    public static volatile boolean emptyStringCalled;
+
+    /** True iff voidNullStringArg received a genuinely null reference. */
+    public static volatile boolean nullStringWasNull;
+    public static volatile boolean nullStringCalled;
+
+    // ── null Object argument ─────────────────────────────────────────────────
+
+    /** True iff voidNullObjectArg received a genuinely null reference. */
+    public static volatile boolean nullObjectWasNull;
+    public static volatile boolean nullObjectCalled;
+
+    // ── many-argument void (exercise more of the 8-slot parameter block) ────
+
+    /** Sum of the six int args voidManyArgs received, and a called flag. */
+    public static volatile boolean manyArgsCalled;
+    public static volatile int     manyArgsSum;
+    public static volatile int     manyArgsLast;
+
+    // ── string arg via the const char* / string_view packer branch ─────────
+
+    /** Recorded by voidStringArgC; proves the const-char-pointer / string_view
+     *  arg packing branch (distinct from the std::string branch) reaches a void
+     *  body with the exact text. */
+    public static volatile String  cstrArg;
+    public static volatile int     cstrArgLen = -2;
+    public static volatile boolean cstrArgCalled;
+
+    // ── static void with a primitive arg (static slot + arg marshalling) ────
+
+    /** Recorded by the STATIC voidStaticArg(int); proves a static void dispatch
+     *  delivers its argument (no receiver slot consumed) — the existing static
+     *  test is a no-arg bump only. */
+    public static volatile boolean staticArgCalled;
+    public static volatile int     staticArgInt;
+
     // ── the method the native module hooks to obtain a live thread ──────────
 
     /** Hookable instance method.  The native detour on this method performs
@@ -161,6 +229,79 @@ public final class MethodCallVoid
         objectArgNonNull  = (o != null);
         objectArgIdentity = (o == null) ? 0 : System.identityHashCode(o);
         objectArgCalled   = true;
+    }
+
+    // ── repeat-dispatch: bumps a counter; native calls it a known N times ───
+    public void voidRepeat()
+    {
+        voidRepeatHits++;
+    }
+
+    // ── boundary primitive args (a SECOND recorder, edge bit patterns) ──────
+    public void voidEdgePrims(final int i, final long j, final boolean z, final double d)
+    {
+        edgePrimInt    = i;
+        edgePrimLong   = j;
+        edgePrimBool   = z;
+        edgePrimDouble = d;
+        edgePrimsCalled = true;
+    }
+
+    // ── void with narrow / float args (byte, short, char, float) ────────────
+    // 1-slot widths whose extension into the interpreter argument slot is
+    // otherwise unproven for a no-return dispatch.
+    public void voidNarrowArgs(final byte b, final short s, final char c, final float f)
+    {
+        narrowArgByte  = b;
+        narrowArgShort = s;
+        narrowArgChar  = c;
+        narrowArgFloat = f;
+        narrowArgsCalled = true;
+    }
+
+    // ── void with an EMPTY String arg ───────────────────────────────────────
+    public void voidEmptyStringArg(final String s)
+    {
+        emptyStringLen    = (s == null) ? -1 : s.length();
+        emptyStringCalled = true;
+    }
+
+    // ── void with a NULL String arg ─────────────────────────────────────────
+    public void voidNullStringArg(final String s)
+    {
+        nullStringWasNull = (s == null);
+        nullStringCalled  = true;
+    }
+
+    // ── void with a NULL Object arg ─────────────────────────────────────────
+    public void voidNullObjectArg(final Object o)
+    {
+        nullObjectWasNull = (o == null);
+        nullObjectCalled  = true;
+    }
+
+    // ── void with MANY (six) int args — fills more of the parameter block ───
+    public void voidManyArgs(final int a, final int b, final int c,
+                             final int d, final int e, final int f)
+    {
+        manyArgsSum    = a + b + c + d + e + f;
+        manyArgsLast   = f;
+        manyArgsCalled = true;
+    }
+
+    // ── void with a String arg, recorded for the const char*/view packer ────
+    public void voidStringArgC(final String s)
+    {
+        cstrArg       = s;
+        cstrArgLen    = (s == null) ? -1 : s.length();
+        cstrArgCalled = true;
+    }
+
+    // ── STATIC void with a primitive arg (no receiver slot + arg delivered) ─
+    public static void voidStaticArg(final int v)
+    {
+        staticArgInt    = v;
+        staticArgCalled = true;
     }
 
     // ── CONTRAST: an int returner whose value_t.is_void() must be FALSE ──────

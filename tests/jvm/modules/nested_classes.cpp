@@ -333,6 +333,15 @@ namespace
     constexpr const char* k_host_descriptor  = "Lvmhook/fixtures/NestedClasses$Host;";
     constexpr const char* k_inner_descriptor = "Lvmhook/fixtures/NestedClasses$Host$Inner;";
 
+    // Super-chain anchors: every nested INSTANCE class here directly extends
+    // java.lang.Object, and the nested ENUM extends java.lang.Enum.  These are
+    // always-loaded JDK runtime classes, so resolving them by name is reliable
+    // on every JDK; the super-echo proves the `$`-nested klasses sit in the
+    // ordinary superclass hierarchy (the `$` in the name changes nothing about
+    // the super walk).
+    constexpr const char* k_object_name = "java/lang/Object";
+    constexpr const char* k_enum_name_jl = "java/lang/Enum";
+
     // The resolved klass's own name symbol == the requested `$` name?  Gated so
     // a null/garbage klass or symbol degrades to false rather than AV-ing.
     auto klass_name_is(vmhook::hotspot::klass* const k, const char* const expected) -> bool
@@ -369,6 +378,48 @@ namespace
     auto starts_with(const std::string& s, const std::string& prefix) -> bool
     {
         return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+    }
+
+    // The internal name of a klass's DIRECT super (or "" on any failure).  Pure
+    // metadata walk (get_super() + get_name()), every step is_valid_pointer-gated
+    // by the library — NO oop deref — so callers can keep the assertion HARD.
+    auto super_name_str(vmhook::hotspot::klass* const k) -> std::string
+    {
+        if (!k || !vmhook::hotspot::is_valid_pointer(k))
+        {
+            return {};
+        }
+        vmhook::hotspot::klass* const super{ k->get_super() };
+        return klass_name_str(super);
+    }
+
+    // Does klass K declare/inherit a field NAME whose find_field entry has the
+    // expected (instance/static) storage class and exact JVM descriptor?  Uses the
+    // FREE vmhook::find_field(klass, name) — a pure field-metadata walk needing no
+    // live instance and doing no oop deref — so it is HARD-assertable.  Returns the
+    // resolved entry so the caller can additionally check offset > 0.
+    auto field_entry_for(vmhook::hotspot::klass* const k, const char* const name)
+        -> std::optional<vmhook::hotspot::field_entry_t>
+    {
+        if (!k || !vmhook::hotspot::is_valid_pointer(k))
+        {
+            return std::nullopt;
+        }
+        return vmhook::find_field(k, name);
+    }
+
+    // The JVM descriptor of method NAME on klass KNAME (first declared match), or
+    // "" if absent.  Pure _methods walk via get_class_methods — no oop deref.
+    auto method_descriptor(const char* const class_name, const char* const method_name) -> std::string
+    {
+        for (const auto& m : vmhook::get_class_methods(class_name))
+        {
+            if (m.first == method_name)
+            {
+                return m.second;
+            }
+        }
+        return {};
     }
 
     // ── CRASH-PROOFING: validate an OOP before any RAW dereference ───────────
@@ -951,6 +1002,260 @@ VMHOOK_JVM_MODULE(nested_classes)
                       && ak != inner_klass && lk != inner_klass
                       && ak != host_klass && lk != host_klass);
         }
+    }
+
+    // =====================================================================
+    //  7b. SUPER-CHAIN echo: each `$`-nested klass sits in the ORDINARY
+    //      superclass hierarchy — get_super() of every nested INSTANCE class
+    //      here is java.lang.Object, and the nested ENUM's super is
+    //      java.lang.Enum.  The `$` in the internal name changes nothing about
+    //      the super walk; this proves it directly.  Pure metadata (get_super +
+    //      get_name), NO oop deref -> HARD.  Also tie the resolved super by
+    //      POINTER to the independently find_class()'d Object/Enum klass.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const object_klass{ vmhook::find_class(k_object_name) };
+        vmhook::hotspot::klass* const enum_super_klass{ vmhook::find_class(k_enum_name_jl) };
+        ctx.check("java_lang_Object_resolves", object_klass != nullptr);
+
+        // Host is a top-level static nested class -> super is Object.
+        ctx.check("host_super_is_object", super_name_str(host_klass) == std::string{ k_object_name });
+        // StaticNested / Inner / SecondInner / GenericBox / DeepNested all extend
+        // Object directly (none extends another nested class).
+        ctx.check("static_nested_super_is_object", super_name_str(static_klass) == std::string{ k_object_name });
+        ctx.check("inner_super_is_object", super_name_str(inner_klass) == std::string{ k_object_name });
+        ctx.check("second_inner_super_is_object", super_name_str(second_inner_klass) == std::string{ k_object_name });
+        ctx.check("inner_inner_super_is_object", super_name_str(inner_inner_klass) == std::string{ k_object_name });
+        ctx.check("deep_nested_super_is_object", super_name_str(deep_klass) == std::string{ k_object_name });
+        ctx.check("generic_box_super_is_object", super_name_str(generic_klass) == std::string{ k_object_name });
+        // The nested ENUM extends java.lang.Enum (NOT Object) — a distinct super.
+        ctx.check("nested_enum_super_is_enum", super_name_str(enum_klass) == std::string{ k_enum_name_jl });
+
+        // POINTER tie-back: the super klass each nested klass reports IS the very
+        // klass find_class resolved for that super (no string round-trip).
+        if (object_klass && host_klass)
+        {
+            ctx.check("host_super_klass_is_find_class_object",
+                      host_klass->get_super() == object_klass);
+        }
+        if (object_klass && inner_klass)
+        {
+            ctx.check("inner_super_klass_is_find_class_object",
+                      inner_klass->get_super() == object_klass);
+        }
+        if (enum_super_klass && enum_klass)
+        {
+            ctx.check("nested_enum_super_klass_is_find_class_enum",
+                      enum_klass->get_super() == enum_super_klass);
+        }
+        else
+        {
+            ctx.record("[INFO] nested_classes: java/lang/Enum not resolvable for super "
+                       "pointer tie-back -- enum super name-echo above is the proof.");
+        }
+
+        // The Inner's super is NOT the Host: a non-static inner does NOT extend
+        // its enclosing class — the enclosing link is the synthetic this$0 field,
+        // never the superclass.  (The cleanest way to dispel that confusion.)
+        ctx.check("inner_super_is_not_host_klass",
+                  inner_klass != nullptr && inner_klass->get_super() != host_klass);
+    }
+
+    // =====================================================================
+    //  7c. find_field METADATA on the SYNTHETIC outer references — assert the
+    //      field_entry_t shape directly off the resolved klass (the free
+    //      vmhook::find_field, no live instance, no oop deref -> HARD):
+    //        * descriptor names the enclosing class (Host / Inner),
+    //        * the synthetic field is an INSTANCE field (is_static == false),
+    //        * its object-absolute offset is past the oop header (> 0),
+    //        * its declaring_klass is the inner klass itself (declared, not
+    //          inherited — find_field records WHICH klass in the chain owns it).
+    //      This is the synthetic-field surface the wrapper's signature() check
+    //      only sees through a live instance; here it is proven instance-free.
+    // =====================================================================
+    {
+        const auto inner_this0{ field_entry_for(inner_klass, "this$0") };
+        ctx.check("inner_this0_find_field_resolves", inner_this0.has_value());
+        if (inner_this0.has_value())
+        {
+            ctx.check("inner_this0_descriptor_via_find_field_names_host",
+                      inner_this0->signature == std::string{ k_host_descriptor });
+            ctx.check("inner_this0_is_instance_field", !inner_this0->is_static);
+            ctx.check("inner_this0_offset_past_header", inner_this0->offset > 0u);
+            ctx.check("inner_this0_declared_by_inner_klass",
+                      inner_this0->declaring_klass == inner_klass);
+        }
+
+        const auto second_this0{ field_entry_for(second_inner_klass, "this$0") };
+        ctx.check("second_inner_this0_find_field_resolves", second_this0.has_value());
+        if (second_this0.has_value())
+        {
+            ctx.check("second_inner_this0_descriptor_names_host",
+                      second_this0->signature == std::string{ k_host_descriptor });
+            ctx.check("second_inner_this0_is_instance_field", !second_this0->is_static);
+        }
+
+        // InnerInner's depth-1 synthetic ref is this$1 (descriptor names Inner),
+        // and there is NO this$0 entry — assert both via the metadata path.
+        const auto ii_this1{ field_entry_for(inner_inner_klass, "this$1") };
+        ctx.check("inner_inner_this1_find_field_resolves", ii_this1.has_value());
+        if (ii_this1.has_value())
+        {
+            ctx.check("inner_inner_this1_descriptor_via_find_field_names_inner",
+                      ii_this1->signature == std::string{ k_inner_descriptor });
+            ctx.check("inner_inner_this1_is_instance_field", !ii_this1->is_static);
+        }
+        ctx.check("inner_inner_this0_find_field_absent",
+                  !field_entry_for(inner_inner_klass, "this$0").has_value());
+
+        // A STATIC nested class has NO synthetic outer reference at ANY level —
+        // the metadata walk must miss this$0 / this$1 on both static shapes.
+        ctx.check("static_nested_this0_find_field_absent",
+                  !field_entry_for(static_klass, "this$0").has_value());
+        ctx.check("deep_nested_this0_find_field_absent",
+                  !field_entry_for(deep_klass, "this$0").has_value());
+        ctx.check("deep_nested_this1_find_field_absent",
+                  !field_entry_for(deep_klass, "this$1").has_value());
+    }
+
+    // =====================================================================
+    //  7d. find_field METADATA on the ORDINARY (non-synthetic) value fields —
+    //      each is a primitive INSTANCE field whose descriptor is "I" and whose
+    //      offset lands past the oop header.  Proves the generic field-walk reads
+    //      the right shape for both the synthetic AND the plain fields of a
+    //      `$`-nested klass.  Pure metadata -> HARD.
+    // =====================================================================
+    {
+        auto check_int_instance_field = [&](const char* tag, vmhook::hotspot::klass* k,
+                                            const char* fname)
+        {
+            const auto e{ field_entry_for(k, fname) };
+            ctx.check(std::string{ tag } + "_resolves", e.has_value());
+            if (e.has_value())
+            {
+                ctx.check(std::string{ tag } + "_is_int_descriptor", e->signature == std::string{ "I" });
+                ctx.check(std::string{ tag } + "_is_instance", !e->is_static);
+                ctx.check(std::string{ tag } + "_offset_past_header", e->offset > 0u);
+            }
+        };
+        check_int_instance_field("host_outerField_meta", host_klass, "outerField");
+        check_int_instance_field("static_value_meta", static_klass, "value");
+        check_int_instance_field("inner_innerValue_meta", inner_klass, "innerValue");
+        check_int_instance_field("second_secondValue_meta", second_inner_klass, "secondValue");
+        check_int_instance_field("inner_inner_value_meta", inner_inner_klass, "innerInnerValue");
+        check_int_instance_field("deep_deepValue_meta", deep_klass, "deepValue");
+
+        // GenericBox.boxed is the ERASED reference field (descriptor Object).
+        const auto boxed_e{ field_entry_for(generic_klass, "boxed") };
+        ctx.check("generic_boxed_meta_resolves", boxed_e.has_value());
+        if (boxed_e.has_value())
+        {
+            ctx.check("generic_boxed_meta_descriptor_is_erased_object",
+                      boxed_e->signature == std::string{ "Ljava/lang/Object;" });
+            ctx.check("generic_boxed_meta_is_instance", !boxed_e->is_static);
+        }
+
+        // NEGATIVE / degenerate input: a field that does not exist on a `$`-nested
+        // klass returns nullopt (the walk reaches the top of the chain and misses),
+        // and so does a field lookup against a null klass.  These guard that the
+        // generic field-walk fails CLEANLY for bad input rather than fabricating an
+        // offset — the soft underbelly of a stale-cache offset read.
+        ctx.check("inner_bogus_field_find_field_absent",
+                  !field_entry_for(inner_klass, "noSuchFieldXYZ").has_value());
+        ctx.check("host_bogus_field_find_field_absent",
+                  !field_entry_for(host_klass, "").has_value());
+        ctx.check("null_klass_find_field_absent",
+                  !vmhook::find_field(nullptr, "outerField").has_value());
+    }
+
+    // =====================================================================
+    //  7e. INSTANCE field_proxy SHAPE — through a LIVE wrapper, the synthetic
+    //      this$0 reports as a REFERENCE, NON-static field; the ordinary value
+    //      fields report as NON-reference, NON-static.  is_reference()/is_static()
+    //      are pure proxy accessors over the cached descriptor (no oop deref), so
+    //      a successfully-acquired wrapper makes these HARD.  This is the
+    //      reference-vs-primitive branch that governs whether the this$0 decode
+    //      path (compressed-oop) runs at all.
+    // =====================================================================
+    if (inner)
+    {
+        const auto this0_proxy{ inner->get_field("this$0") };
+        ctx.check("inner_this0_proxy_resolves", this0_proxy.has_value());
+        if (this0_proxy.has_value())
+        {
+            ctx.check("inner_this0_proxy_is_reference", this0_proxy->is_reference());
+            ctx.check("inner_this0_proxy_not_static", !this0_proxy->is_static());
+        }
+        const auto innerval_proxy{ inner->get_field("innerValue") };
+        ctx.check("inner_innerValue_proxy_resolves", innerval_proxy.has_value());
+        if (innerval_proxy.has_value())
+        {
+            ctx.check("inner_innerValue_proxy_not_reference", !innerval_proxy->is_reference());
+            ctx.check("inner_innerValue_proxy_not_static", !innerval_proxy->is_static());
+        }
+        // A bogus field name on a live wrapper resolves to nullopt (no fabricated
+        // proxy) — the instance-context negative input case.
+        ctx.check("inner_bogus_field_proxy_absent",
+                  !inner->get_field("definitelyMissing").has_value());
+    }
+    if (generic_box)
+    {
+        const auto boxed_proxy{ generic_box->get_field("boxed") };
+        if (boxed_proxy.has_value())
+        {
+            // The erased Object field is a reference field (decode-eligible).
+            ctx.check("generic_boxed_proxy_is_reference", boxed_proxy->is_reference());
+        }
+    }
+
+    // =====================================================================
+    //  7f. METHOD DESCRIPTORS on the nested shapes — get_class_methods exposes
+    //      (name, JVM-descriptor); the existing phase 6 only checks NAMES, so
+    //      assert the DESCRIPTORS too (the stable, obfuscation-proof key).  Pure
+    //      _methods walk, NO oop deref -> HARD.  Every no-arg int method is "()I";
+    //      the interface op takes an int.
+    // =====================================================================
+    {
+        ctx.check("static_nested_doubled_descriptor_is_int_noarg",
+                  method_descriptor(k_static_name, "doubled") == std::string{ "()I" });
+        ctx.check("inner_outerPlusInner_descriptor_is_int_noarg",
+                  method_descriptor(k_inner_name, "outerPlusInner") == std::string{ "()I" });
+        ctx.check("second_inner_outerPlusSecond_descriptor_is_int_noarg",
+                  method_descriptor(k_second_inner_name, "outerPlusSecond") == std::string{ "()I" });
+        ctx.check("inner_inner_sumThroughBothOuters_descriptor_is_int_noarg",
+                  method_descriptor(k_inner_inner_name, "sumThroughBothOuters") == std::string{ "()I" });
+        ctx.check("deep_nested_deepDoubled_descriptor_is_int_noarg",
+                  method_descriptor(k_deep_name, "deepDoubled") == std::string{ "()I" });
+        ctx.check("nested_enum_rank_descriptor_is_int_noarg",
+                  method_descriptor(k_enum_name, "rank") == std::string{ "()I" });
+        // The interface abstract op takes an int and returns an int.
+        ctx.check("nested_iface_ifaceOp_descriptor_is_int_to_int",
+                  method_descriptor(k_iface_name, "ifaceOp") == std::string{ "(I)I" });
+        // A method that does not exist yields an empty descriptor (negative case).
+        ctx.check("static_nested_missing_method_descriptor_empty",
+                  method_descriptor(k_static_name, "noSuchMethod").empty());
+    }
+
+    // =====================================================================
+    //  7g. get_method WITH EXPLICIT SIGNATURE on a live nested wrapper — the
+    //      name+descriptor resolution path (distinct from the name-only path the
+    //      native-call phase uses).  The exact descriptor must resolve; a wrong
+    //      descriptor for the same name must NOT.  No call is made (no oop deref
+    //      on the receiver) -> HARD.
+    // =====================================================================
+    if (static_nested)
+    {
+        ctx.check("static_nested_doubled_resolves_by_exact_signature",
+                  static_nested->get_method("doubled", "()I").has_value());
+        ctx.check("static_nested_doubled_misses_on_wrong_signature",
+                  !static_nested->get_method("doubled", "(I)I").has_value());
+    }
+    if (inner)
+    {
+        ctx.check("inner_outerPlusInner_resolves_by_exact_signature",
+                  inner->get_method("outerPlusInner", "()I").has_value());
+        ctx.check("inner_missing_method_by_signature_absent",
+                  !inner->get_method("outerPlusInner", "(J)V").has_value());
     }
 
     // =====================================================================

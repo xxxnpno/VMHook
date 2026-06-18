@@ -67,6 +67,14 @@ public final class ReturnValueCancel
      * after each call (for the "cancel only every other call" angle).
      */
     public static final int MODE_VOID_TWICE = 1;
+    /**
+     * Call origVoid() three times, snapshotting the side-effect counter after
+     * each call.  Lets the native side prove the per-invocation cancel slot
+     * resets independently across MORE than two dispatches (cancel call 2 only,
+     * cancel calls 0+2, etc.) — every snapshot is captured so the native side
+     * can pin which calls ran.
+     */
+    public static final int MODE_VOID_THRICE = 2;
 
     // =======================================================================
     //  Observed return values (what the Java caller actually received).
@@ -78,6 +86,9 @@ public final class ReturnValueCancel
     public static volatile double  obsDouble     = 9876.54321;
     public static volatile boolean obsBool       = true;
     public static volatile char    obsChar       = (char) 0x5A5A;
+    public static volatile byte    obsByte       = (byte) 0x5A;
+    public static volatile short   obsShort      = (short) 0x5A5A;
+    public static volatile float   obsFloat      = 9876.5f;
     /** True iff the reference-returning method handed the caller {@code null}. */
     public static volatile boolean obsRefIsNull;
     /** Identity hash of the returned reference (0 when null) - breadcrumb. */
@@ -85,21 +96,35 @@ public final class ReturnValueCancel
 
     public static volatile int     obsStaticInt    = 0x5A5A5A5A;
     public static volatile double  obsStaticDouble = 9876.54321;
+    public static volatile long    obsStaticLong   = 0x5A5A5A5A5A5A5A5AL;
+    public static volatile boolean obsStaticBool   = true;
+    public static volatile char    obsStaticChar   = (char) 0x5A5A;
+    public static volatile byte    obsStaticByte   = (byte) 0x5A;
+    public static volatile short   obsStaticShort  = (short) 0x5A5A;
+    public static volatile float   obsStaticFloat  = 9876.5f;
 
     /** True iff the observed double was NaN (cancel must yield +0.0, not NaN). */
     public static volatile boolean obsDoubleWasNaN;
     /** True iff the observed double carried a sign bit (cancel must be +0.0). */
     public static volatile boolean obsDoubleWasNegZero;
+    /** True iff the observed float was NaN (cancel must yield +0.0f, not NaN). */
+    public static volatile boolean obsFloatWasNaN;
+    /** True iff the observed float carried a sign bit (cancel must be +0.0f). */
+    public static volatile boolean obsFloatWasNegZero;
+    /** True iff the observed STATIC float carried a sign bit. */
+    public static volatile boolean obsStaticFloatWasNegZero;
 
     // ---- Void side-effect witnesses ---------------------------------------
     /** Bumped by the void instance body; cancel must leave it untouched. */
     public static volatile int sideEffect;
     /** Bumped by the void static body; cancel must leave it untouched. */
     public static volatile int staticSideEffect;
-    /** sideEffect snapshot after the 1st VOID_TWICE call. */
+    /** sideEffect snapshot after the 1st VOID_TWICE/VOID_THRICE call. */
     public static volatile int sideEffectAfterCall1;
-    /** sideEffect snapshot after the 2nd VOID_TWICE call. */
+    /** sideEffect snapshot after the 2nd VOID_TWICE/VOID_THRICE call. */
     public static volatile int sideEffectAfterCall2;
+    /** sideEffect snapshot after the 3rd VOID_THRICE call. */
+    public static volatile int sideEffectAfterCall3;
 
     // ---- Control observations ---------------------------------------------
     /** Set true by the action if any orig* call threw (it must never throw). */
@@ -157,6 +182,29 @@ public final class ReturnValueCancel
         return new Object();
     }
 
+    /** Returns a non-zero byte (88); cancel must flip the observation to 0. */
+    public byte origByte()
+    {
+        return (byte) 88;
+    }
+
+    /** Returns a non-zero short (7777); cancel must flip the observation to 0. */
+    public short origShort()
+    {
+        return (short) 7777;
+    }
+
+    /**
+     * Returns a non-zero float (33.5); cancel must flip the observation to
+     * +0.0f (the 32-bit twin of the double case: exercises the SAME movq xmm0
+     * epilogue but a {@code freturn} that reads only the low 32 bits of the SSE
+     * register).
+     */
+    public float origFloat()
+    {
+        return 33.5f;
+    }
+
     // =======================================================================
     //  Original-return methods (static).
     // =======================================================================
@@ -177,6 +225,42 @@ public final class ReturnValueCancel
     public static double origStaticDouble()
     {
         return 22.25;
+    }
+
+    /** Returns a non-zero long with the HIGH dword set (static dispatch). */
+    public static long origStaticLong()
+    {
+        return 0x7FFFFFFF00000002L;
+    }
+
+    /** Returns {@code true} (static); cancel must flip the observation to false. */
+    public static boolean origStaticBool()
+    {
+        return true;
+    }
+
+    /** Returns 'Z' (static); cancel must flip the observation to U+0000. */
+    public static char origStaticChar()
+    {
+        return 'Z';
+    }
+
+    /** Returns a non-zero byte (66) (static); cancel must flip it to 0. */
+    public static byte origStaticByte()
+    {
+        return (byte) 66;
+    }
+
+    /** Returns a non-zero short (6666) (static); cancel must flip it to 0. */
+    public static short origStaticShort()
+    {
+        return (short) 6666;
+    }
+
+    /** Returns a non-zero float (44.5) (static); cancel must flip it to +0.0f. */
+    public static float origStaticFloat()
+    {
+        return 44.5f;
     }
 
     static
@@ -205,6 +289,18 @@ public final class ReturnValueCancel
                         self.origVoid();
                         ReturnValueCancel.sideEffectAfterCall2 = ReturnValueCancel.sideEffect;
                     }
+                    else if (ReturnValueCancel.mode == MODE_VOID_THRICE)
+                    {
+                        // Three back-to-back void calls; snapshot after each so
+                        // the native side can pin EXACTLY which of the three
+                        // dispatches the per-call cancel slot suppressed.
+                        self.origVoid();
+                        ReturnValueCancel.sideEffectAfterCall1 = ReturnValueCancel.sideEffect;
+                        self.origVoid();
+                        ReturnValueCancel.sideEffectAfterCall2 = ReturnValueCancel.sideEffect;
+                        self.origVoid();
+                        ReturnValueCancel.sideEffectAfterCall3 = ReturnValueCancel.sideEffect;
+                    }
                     else
                     {
                         // MODE_OBSERVE_ALL: call everything once, record what
@@ -228,6 +324,15 @@ public final class ReturnValueCancel
                             (d == 0.0) && ((1.0 / d) < 0.0);
                         ReturnValueCancel.obsBool   = self.origBool();
                         ReturnValueCancel.obsChar   = self.origChar();
+                        ReturnValueCancel.obsByte   = self.origByte();
+                        ReturnValueCancel.obsShort  = self.origShort();
+                        final float f               = self.origFloat();
+                        ReturnValueCancel.obsFloat  = f;
+                        ReturnValueCancel.obsFloatWasNaN     = (f != f);
+                        // Same +0.0f vs -0.0f sign probe as the double case:
+                        // 1.0f/+0.0f == +Inf, 1.0f/-0.0f == -Inf.
+                        ReturnValueCancel.obsFloatWasNegZero =
+                            (f == 0.0f) && ((1.0f / f) < 0.0f);
 
                         // Reference return (instance dispatch).
                         final Object ref = self.origRef();
@@ -238,6 +343,15 @@ public final class ReturnValueCancel
                         // Primitive returns (static dispatch).
                         ReturnValueCancel.obsStaticInt    = origStaticInt();
                         ReturnValueCancel.obsStaticDouble = origStaticDouble();
+                        ReturnValueCancel.obsStaticLong   = origStaticLong();
+                        ReturnValueCancel.obsStaticBool   = origStaticBool();
+                        ReturnValueCancel.obsStaticChar   = origStaticChar();
+                        ReturnValueCancel.obsStaticByte   = origStaticByte();
+                        ReturnValueCancel.obsStaticShort  = origStaticShort();
+                        final float sf                    = origStaticFloat();
+                        ReturnValueCancel.obsStaticFloat  = sf;
+                        ReturnValueCancel.obsStaticFloatWasNegZero =
+                            (sf == 0.0f) && ((1.0f / sf) < 0.0f);
                     }
                 }
                 catch (final Throwable t)

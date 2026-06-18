@@ -46,6 +46,8 @@ public final class FieldInherited extends FieldInheritedMid
      *   2 = mutate the child's shadow slot AND a separate base object's base
      *       shadow slot (proves the two slots are physically distinct)
      *   3 = mutate inherited + shadowed STATIC slots via putstatic
+     *   4 = mutate the child's NARROW (byte) + WIDE (long) shadow slots via
+     *       putfield (proves child-wins shadowing for non-int widths)
      */
     public static volatile int mode;
 
@@ -58,6 +60,15 @@ public final class FieldInherited extends FieldInheritedMid
     public static final int  CHILD_SHADOW_RUNTIME = 4242;       // mode 2 child write
     public static final int  INDEP_BASE_SHADOW  = 7007;         // mode 2 base-obj write
 
+    // Shadow slots of OTHER widths (byte / long): the child re-declares names
+    // already present on Base, so child-wins shadowing is observable for a
+    // NARROW and a WIDE primitive too.  Far-apart sentinels (Base copies are
+    // 0x11 / 0x00BA5E).
+    public static final byte BASE_SHADOW_BYTE   = (byte) 0x11;  // == Base.shadowedByte
+    public static final byte CHILD_SHADOW_BYTE  = (byte) 0x77;  // child shadowedByte
+    public static final long BASE_SHADOW_LONG   = 0x00BA5EL;    // == Base.shadowedLong
+    public static final long CHILD_SHADOW_LONG  = 0x7CC1D7CC1DL;// child shadowedLong
+
     public static final int  STATIC_SHADOW_BASE    = 555;       // == Base.sShadow
     public static final int  STATIC_SHADOW_CHILD   = 777;       // child sShadow
     public static final int  STATIC_SHADOW_RUNTIME = 3030;      // mode 3 child write
@@ -69,6 +80,12 @@ public final class FieldInherited extends FieldInheritedMid
     public static final float   BASE_FLOAT_RUNTIME  = 6.25f;    // init is 2.5f
     public static final double  BASE_DOUBLE_RUNTIME = 9.75d;    // init is 1.5d
 
+    // mode 4 writes the child's NARROW (byte) and WIDE (long) shadow slots, so
+    // the live read-back proves child-wins shadowing for those widths AND that
+    // the same write leaves the hidden Base copies untouched.
+    public static final byte CHILD_SHADOW_BYTE_RUNTIME = (byte) 0x3C;
+    public static final long CHILD_SHADOW_LONG_RUNTIME = 0x0DEFACED0L;
+
     // ---- The child's OWN instance field (super walk stops at depth 0) -------
     protected int childOwnInt = OWN_INT_INIT;
 
@@ -77,6 +94,8 @@ public final class FieldInherited extends FieldInheritedMid
     //  physically present and reachable through a base-typed wrapper).
     public int    shadowedInt = CHILD_SHADOW_INT;
     public String shadowedStr = "child";
+    public byte   shadowedByte = CHILD_SHADOW_BYTE;   // narrow shadow
+    public long   shadowedLong = CHILD_SHADOW_LONG;   // wide shadow
 
     // ---- Child shadows a grandparent STATIC of the same name ----------------
     public static int sShadow = STATIC_SHADOW_CHILD;
@@ -92,6 +111,17 @@ public final class FieldInherited extends FieldInheritedMid
     public int childOwn()
     {
         return this.childOwnInt;
+    }
+
+    /**
+     * Touches the child shadow slots of every width so javac does not warn them
+     * unused under -Werror-y builds and they are guaranteed present in the
+     * child's layout (distinct from the Base copies).
+     */
+    public long childShadowSum()
+    {
+        return this.shadowedInt + this.shadowedByte + this.shadowedLong
+             + (long) this.shadowedStr.length();
     }
 
     // ---- Runtime mutators driven by the probe via real bytecode ------------
@@ -129,6 +159,19 @@ public final class FieldInherited extends FieldInheritedMid
         sShadow                       = STATIC_SHADOW_RUNTIME; // child static slot
     }
 
+    /**
+     * mode 4: write the child's NARROW (byte) and WIDE (long) shadow slots via
+     * putfield.  The hidden Base copies of the same names are NOT written here,
+     * so a base-typed read-back must still see the Base init values — proving
+     * child-wins shadowing for non-int widths and that the slots are physically
+     * distinct at every width.
+     */
+    public void mutateShadowWidths()
+    {
+        this.shadowedByte = CHILD_SHADOW_BYTE_RUNTIME;
+        this.shadowedLong = CHILD_SHADOW_LONG_RUNTIME;
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -152,6 +195,9 @@ public final class FieldInherited extends FieldInheritedMid
                         break;
                     case 3:
                         FieldInherited.mutateStatics();
+                        break;
+                    case 4:
+                        FieldInherited.instance.mutateShadowWidths();
                         break;
                     default:
                         break;
