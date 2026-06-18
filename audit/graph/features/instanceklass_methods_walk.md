@@ -3,18 +3,29 @@ slug: instanceklass_methods_walk
 title: Instanceklass Methods Walk
 category: klass
 status: seeded
-risk: medium
+risk: high
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/klass]
+tags: [status/seeded, risk/high, category/klass, tag/klass, tag/method, tag/enumeration, tag/array-layout, tag/abi, tag/vmstructs, tag/x86_64]
 ---
 
 # Instanceklass Methods Walk
 
-> **Category:** [[categories/klass|Class / Klass introspection]]  ·  **Status:** `seeded`  ·  **Risk:** `medium`  ·  **Specialist:** `.claude/agents/instanceklass_methods_walk-specialist.md`
+> **Category:** [[categories/klass|Class / Klass introspection]]  ·  **Status:** `seeded`  ·  **Risk:** `high`  ·  **Specialist:** `.claude/agents/instanceklass_methods_walk-specialist.md`
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
+Turns a `klass*` (an `InstanceKlass`) into its declared method list by reading
+the HotSpot `InstanceKlass::_methods` `Array<Method*>` directly — no JNI, no
+JVMTI. `klass::get_methods_count()` reads `Array<Method*>::_length` at array
+offset +0 as a raw int32; `klass::get_methods_ptr()` hardcodes the x64
+`Array<T>` layout `[int32 _length][int32 _pad][T _data[0]...]` and skips +8 to
+the first element. `detail::collect_klass_methods()` is the canonical
+collector (per-slot `is_valid_pointer` skip, exception-swallowing), and
+`get_class_methods()`/`find_methods_by_signature<T>()` are thin wrappers over
+it. The walk lists DECLARED methods only (never inherited / Object methods) and
+is re-implemented inline at ~10 call sites (hook<T> target lookup,
+deoptimize_methods_if, static_method()->call() overload re-selection), so a
+defect here radiates across the library.
 
 ## Depends on
 
@@ -34,10 +45,33 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/klass_introspection|klass_introspection]]
 - [[features/method_enumeration|method_enumeration]]
 
+## Implementation anchors
+
+- `klass::get_methods_count` — `vmhook/ext/vmhook/vmhook.hpp:3498-3535` — reads Array<Method*>::_length at array offset +0 as a signed int32
+- `klass::get_methods_ptr` — `vmhook/ext/vmhook/vmhook.hpp:3537-3580` — hardcodes x64 Array<T> layout [int32 _length @0][pad @4][Method* _data @8], returns array_base + 8
+- `detail::collect_klass_methods` — `vmhook/ext/vmhook/vmhook.hpp:8804-8835` — canonical collector: count<=0 guard, per-slot is_valid_pointer skip, try/catch swallow
+- `vmhook::get_class_methods` — `vmhook/ext/vmhook/vmhook.hpp:8853-8875` — public by-name (8853) and by-wrapper (8873) entry points
+- `vmhook::find_methods_by_signature` — `vmhook/ext/vmhook/vmhook.hpp:8913-8930` — exact-descriptor-equality filter over get_class_methods<T>()
+
 ## Tests
 
 - `tests/jvm/modules/instanceklass_methods_walk.cpp`
 
+## Known bugs
+
+- **[high]** Array<Method*> data offset hardcoded to +8 in get_methods_ptr and length read at +0 as a raw int32 in get_methods_count — no VMStruct backs the Array<T> internal layout. Correct on every shipping LP64 HotSpot but an unchecked ABI assumption; a 32-bit VM / future layout change reads one slot early and the whole enumeration is garbage Method*s. The per-slot is_valid_pointer skip usually degrades this to a wrong/short list rather than an AV.
+- **[medium]** _length read as a signed int32 and only lower-bounded (callers guard count<=0). A large positive garbage length (only reachable if the +8 layout assumption is already wrong) passes the guard and drives a huge reserve()/loop with no ceiling (HotSpot caps at 65535 methods/class) — effectively a hang or swallowed bad_alloc.
+- **[medium]** Silent divergence between collect_klass_methods and its ~10 inline clones (hook<T> target lookup, deoptimize_methods_if, static_method()->call() overload re-selection, and the get_methods_count+get_methods_ptr index loops at vmhook.hpp:17613/17951/18016/18086/18149/18950). Currently consistent, but any future validation fix must be applied to all of them or hook<T> could resolve a Method* that get_class_methods would skip. Latent-bug factory.
+- **[medium]** _methods lists DECLARED methods only, never inherited — invisible at the API. get_class_methods('java/lang/Integer') omits equals/hashCode. The only super-walking path is static_method()->call() overload re-selection.
+- **[low]** The per-slot is_valid_pointer sentinel filter can drop a legitimate Method* whose low 32 bits equal a debug sentinel (0xCAFEBABE/0xDEADBEEF). Astronomically rare, non-deterministic across runs (ASLR) — a true false-negative path.
+
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+No VMStruct backs the Array<T> internal layout (length +0, data +8); the
+InstanceKlass::_methods VMStruct entry itself is present and version-robust
+across JDK 8-26. Synthetic-method counts vary by javac/JDK (JDK 8 access$NNN
+accessors vs JDK 11+ nestmates), so hard-assert named-method membership and
+lower bounds, RECORD total counts. enum synthetics (values/valueOf) are stable
+JDK 8-26. Symbol bodies are modified UTF-8; the symbol::to_string length clamp
+(>0x1000 -> empty) never fires for real method names. The walk is index-ordered
+over _methods so element order is stable within a run.

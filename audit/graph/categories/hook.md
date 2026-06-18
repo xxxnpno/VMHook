@@ -14,16 +14,16 @@ tags: [category/hook]
 - [[features/adapter_recovery_c2i|adapter_recovery_c2i]] — `in_progress` / `high` — Adapter Recovery C2I
 - [[features/dont_inline_dont_compile|dont_inline_dont_compile]] — `in_progress` / `critical` — Dont Inline Dont Compile
 - [[features/hook_basic|hook_basic]] — `in_progress` / `critical` — Hook Install (basic)
-- [[features/hook_chaining|hook_chaining]] — `seeded` / `medium` — Hook Chaining
-- [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]] — `seeded` / `medium` — Hook Common Detour Dispatch
-- [[features/hook_install_after_jit|hook_install_after_jit]] — `seeded` / `medium` — Hook Install After Jit
-- [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]] — `seeded` / `medium` — Hook Reinstall After Shutdown
-- [[features/hook_signature|hook_signature]] — `seeded` / `medium` — Hook Signature
-- [[features/hook_unhook_double_free|hook_unhook_double_free]] — `seeded` / `medium` — Hook Unhook Double Free
+- [[features/hook_chaining|hook_chaining]] — `in_progress` / `high` — Hook Chaining
+- [[features/hook_common_detour_dispatch|hook_common_detour_dispatch]] — `in_progress` / `critical` — Hook Common Detour Dispatch
+- [[features/hook_install_after_jit|hook_install_after_jit]] — `in_progress` / `high` — Hook Install After Jit
+- [[features/hook_reinstall_after_shutdown|hook_reinstall_after_shutdown]] — `in_progress` / `high` — Hook Reinstall After Shutdown
+- [[features/hook_signature|hook_signature]] — `in_progress` / `medium` — Hook Signature
+- [[features/hook_unhook_double_free|hook_unhook_double_free]] — `in_progress` / `high` — Hook Unhook Double Free
 - [[features/hook_verify_repair|hook_verify_repair]] — `in_progress` / `critical` — Hook Verify Repair
-- [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]] — `seeded` / `medium` — Method Entry Points I2I I2C
-- [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]] — `seeded` / `medium` — Midi2I Trampoline Alloc
-- [[features/seh_invoke_detour|seh_invoke_detour]] — `seeded` / `medium` — Seh Invoke Detour
+- [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]] — `seeded` / `critical` — Method Entry Points I2I I2C
+- [[features/midi2i_trampoline_alloc|midi2i_trampoline_alloc]] — `seeded` / `critical` — Midi2I Trampoline Alloc
+- [[features/seh_invoke_detour|seh_invoke_detour]] — `seeded` / `high` — Seh Invoke Detour
 
 ## Dependency graph
 
@@ -49,6 +49,7 @@ flowchart LR
     deoptimize_methods[/deoptimize_methods/]
     find_class_fallback[/find_class_fallback/]
     interpreter_frame_walk[/interpreter_frame_walk/]
+    iterate_entries_safety[/iterate_entries_safety/]
     klass_introspection[/klass_introspection/]
     method_explicit_signature[/method_explicit_signature/]
     method_flags_width[/method_flags_width/]
@@ -107,6 +108,7 @@ flowchart LR
   hook_verify_repair --> seh_invoke_detour
   hook_verify_repair --> dont_inline_dont_compile
   method_entry_points_i2i_i2c --> vmstructs_offset_resolution
+  method_entry_points_i2i_i2c --> iterate_entries_safety
   midi2i_trampoline_alloc --> os_allocate_release
   midi2i_trampoline_alloc --> os_protect
   midi2i_trampoline_alloc --> os_query_region

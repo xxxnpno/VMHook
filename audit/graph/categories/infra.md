@@ -13,12 +13,12 @@ tags: [category/infra]
 
 - [[features/api_surface_no_jvm|api_surface_no_jvm]] — `in_progress` / `medium` — API Surface (no-JVM contract)
 - [[features/decode_u5_unsigned5|decode_u5_unsigned5]] — `in_progress` / `high` — Decode U5 Unsigned5
-- [[features/logging_format|logging_format]] — `seeded` / `medium` — Logging Format
-- [[features/make_unique|make_unique]] — `seeded` / `medium` — Make Unique
+- [[features/logging_format|logging_format]] — `seeded` / `low` — Logging Format
+- [[features/make_unique|make_unique]] — `seeded` / `high` — Make Unique
 - [[features/platform_capability_macros|platform_capability_macros]] — `seeded` / `medium` — Platform Capability Macros
 - [[features/traits_function_traits|traits_function_traits]] — `seeded` / `medium` — Traits Function Traits
 - [[features/unified_call_syntax|unified_call_syntax]] — `seeded` / `medium` — Unified Call Syntax
-- [[features/version_macros|version_macros]] — `seeded` / `medium` — Version Macros
+- [[features/version_macros|version_macros]] — `seeded` / `low` — Version Macros
 - [[features/wrapper_pattern|wrapper_pattern]] — `in_progress` / `high` — Wrapper Pattern
 
 ## Dependency graph
@@ -39,12 +39,16 @@ flowchart LR
   subgraph external["(external deps)"]
     decode_oop_and_pointers[/decode_oop_and_pointers/]
     global_ref[/global_ref/]
+    jni_arg_packing[/jni_arg_packing/]
     jni_local_ref_hygiene[/jni_local_ref_hygiene/]
     klass_introspection[/klass_introspection/]
     method_overload[/method_overload/]
+    register_class[/register_class/]
   end
   decode_u5_unsigned5 --> klass_introspection
   make_unique --> wrapper_pattern
+  make_unique --> jni_arg_packing
+  make_unique --> register_class
   unified_call_syntax --> method_overload
   wrapper_pattern --> decode_oop_and_pointers
   wrapper_pattern --> global_ref

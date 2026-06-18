@@ -50,6 +50,10 @@ array but lack identical guards — identical AV hazard left unpatched.
 - `klass::find_field()` — `vmhook/ext/vmhook/vmhook.hpp:3088-3114` — [UNGUARDED] reads constant_pool_base[name_index] at 3094 and [sig_index] at 3114 — same CP array, no FIX B guards (flaw #1)
 - `klass::find_field_in_stream()` — `vmhook/ext/vmhook/vmhook.hpp:2975-2984` — [UNGUARDED] reads constant_pool_base[name_index]/[sig_index] at 2975-2977 / 2982-2984 — same CP array, no FIX B guards (flaw #1)
 
+## Tests
+
+- `tests/test_const_method_bounds.cpp`
+
 ## Known bugs
 
 - **[medium]** Sibling field-name/signature reads in klass::find_field() (3094, 3114) and klass::find_field_in_stream() (2975-2977, 2982-2984) use the same ConstantPool::get_base() array with u2 indices from metadata, but lack identical FIX B guards (no get_length() bound, no is_readable_pointer slot probe). They go straight to is_valid_pointer(base[index]), which dereferences before validating — identical AV hazard as the method path pre-FIX-B. The fix belongs in a shared helper (constant_pool::symbol_at(index)) used by all five call sites. JDK 8..early-21 hit klass::find_field; JDK 21.0.x+/22+ hit find_field_in_stream — different code on different versions.

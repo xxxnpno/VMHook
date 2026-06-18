@@ -3,18 +3,29 @@ slug: midi2i_trampoline_alloc
 title: Midi2I Trampoline Alloc
 category: hook
 status: seeded
-risk: medium
+risk: critical
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/hook]
+tags: [status/seeded, risk/critical, category/hook, tag/hook, tag/trampoline, tag/i2i, tag/rel32, tag/executable-alloc, tag/reachability, tag/chaining, tag/x86_64]
 ---
 
 # Midi2I Trampoline Alloc
 
-> **Category:** [[categories/hook|Hooking machinery (install / dispatch / trampolines)]]  ·  **Status:** `seeded`  ·  **Risk:** `medium`  ·  **Specialist:** `.claude/agents/midi2i_trampoline_alloc-specialist.md`
+> **Category:** [[categories/hook|Hooking machinery (install / dispatch / trampolines)]]  ·  **Status:** `seeded`  ·  **Risk:** `critical`  ·  **Specialist:** `.claude/agents/midi2i_trampoline_alloc-specialist.md`
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
+The low-level lifetime of the `vmhook::hotspot::midi2i_hook` trampoline: finding
+the i2i injection point, allocating an executable stub WITHIN 32-bit JMP range
+(+/-2 GiB) of it, baking the hand-written x64 assembly (with its detour pointer,
+je-delta, and resume/chain JMP), patching the 5-byte `0xE9` rel32 redirect at the
+target, and tearing it all down on `~midi2i_hook()` / `shutdown_hooks()`. Also
+owns the hook-chaining machinery layered on top: the `chain_resume` parameter,
+its `is_valid_pointer` gate, and `verify_and_repair()`'s re-chain logic when
+another i2i-patching DLL stomps the shared stub. `allocate_nearby_memory` is the
+single most important — and otherwise untested — invariant: the returned block
+MUST be reachable by a 32-bit relative JMP from the target. Per-ABI assembly +
+offset constants exist for Windows x64 and SysV AMD64; bails clean (error stays
+true) on non-x64 / non-HotSpot ABIs.
 
 ## Depends on
 
@@ -23,12 +34,46 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/os_query_region|os_query_region]]
 - [[features/os_page_size_granularity|os_page_size_granularity]]
 
+## Related
+
+- [[features/hook_basic|hook_basic]]
+- [[features/hook_chaining|hook_chaining]]
+- [[features/hook_verify_repair|hook_verify_repair]]
+- [[features/method_entry_points_i2i_i2c|method_entry_points_i2i_i2c]]
+- [[features/seh_invoke_detour|seh_invoke_detour]]
+
 ## Depended on by
 
 - [[features/hook_basic|hook_basic]]
 - [[features/hook_chaining|hook_chaining]]
 - [[features/hook_verify_repair|hook_verify_repair]]
 
+## Implementation anchors
+
+- `hotspot::midi2i_hook (ctor / dtor / verify_and_repair)` — `vmhook/ext/vmhook/vmhook.hpp:6447-6960` — the whole feature: ctor validates chain_resume + bakes/patches the stub; dtor restores the original 5 bytes if target still starts 0xE9 then os::release; verify_and_repair (6847) re-chains a stomped stub
+- `hotspot::find_hook_location` — `vmhook/ext/vmhook/vmhook.hpp:5650-5748` — scans the i2i stub for pattern_full (4-mov spill, JDK 8..early 21) else pattern_fallback (thread-state write, JDK 21 release / 22+); also back-scans locals_pattern to cache locals_offset; nullptr if neither hits
+- `hotspot::allocate_nearby_memory` — `vmhook/ext/vmhook/vmhook.hpp:5749-5900` — the reachability allocator: clamps a [search_min, search_max] window to +/-INT32_MAX of the target, walks regions via os::query_region, tries granularity-aligned candidates through os::allocate_rwx; the returned block MUST be E9-rel32-reachable
+- `midi2i_hook::rewrite_chain_resume` — `vmhook/ext/vmhook/vmhook.hpp:6447-6960` — recomputes the resume-JMP rel32 in place in the live trampoline; keeps a private second copy of RESUME_JMP_OFFSET per ABI that must stay in lockstep with the ctor constants
+
+## Tests
+
+- `tests/test_midi2i_trampoline_alloc.cpp`
+
+## Known bugs
+
+- **[medium]** rewrite_chain_resume keeps a SECOND, private copy of RESUME_JMP_OFFSET per ABI (0x73 Windows / 0x74 SysV) that MUST stay in lockstep with the ctor's offset constants — a latent divergence hazard if one is edited without the other.
+
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+The install path needs a live JVM and a real i2i stub, so the dedicated no-JVM
+test (tests/test_midi2i_trampoline_alloc.cpp) deliberately targets only the PURE /
+OS-level machinery: allocate_nearby_memory reachability (the returned RWX block
+within INT32_MAX of the target), the +/-2 GiB search-window clamp arithmetic,
+find_hook_location's pattern matcher driven over synthetic byte buffers (full
+JDK<=21 pattern, JDK21+/22+ fallback, locals_offset back-scan), and is_valid_pointer
+as the chain_resume gate (a security property: a bad chain pointer can never be
+adopted). HOOK_SIZE=8, JMP_SIZE=5, JMP_OPCODE=0xE9. The injection-point patterns
+split at JDK 21 (pattern_full for 8..early-21, pattern_fallback for 21-release/22+).
+x86_64-only, HotSpot-only; bails clean on non-x64/non-HotSpot via
+!VMHOOK_RUNTIME_HOOKING_AVAILABLE. risk is critical: a wrong rel32 or a misplaced /
+stomped executable stub corrupts the JVM globally.

@@ -3,22 +3,32 @@ slug: return_caller
 title: Return Caller
 category: return
 status: seeded
-risk: medium
+risk: high
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/return]
+tags: [status/seeded, risk/high, category/return, tag/return, tag/frame, tag/interpreter, tag/x86_64, tag/safety]
 ---
 
 # Return Caller
 
-> **Category:** [[categories/return|return_value (detour-side return manipulation)]]  ·  **Status:** `seeded`  ·  **Risk:** `medium`  ·  **Specialist:** `.claude/agents/return_caller-specialist.md`
+> **Category:** [[categories/return|return_value (detour-side return manipulation)]]  ·  **Status:** `seeded`  ·  **Risk:** `high`  ·  **Specialist:** `.claude/agents/return_caller-specialist.md`
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
+return_value::caller() — from inside a hook detour, returns a caller_info for the
+method that invoked the hooked method.  It walks the saved-rbp chain on the
+HotSpot x64 interpreter stack: the caller's frame base lives at [rbp] and its
+Method* at [caller_rbp - 24], from which it resolves class_name, method_name and
+signature.  Every pointer is validated through the safe-read helpers before
+dereference, so an unfamiliar (compiled/native/unidentifiable) frame yields an
+empty caller_info (method == nullptr, caller_info::valid() == false) rather than
+a crash.  When the return_value was constructed with frame == nullptr (no-frame
+default), caller() returns the empty result without touching the stack.  This is
+the single-frame front-end of the same saved-rbp walk stack_trace() generalises.
 
 ## Depends on
 
 - [[features/interpreter_frame_walk|interpreter_frame_walk]]
+- [[features/os_safe_read|os_safe_read]]
 
 ## Related
 
@@ -33,10 +43,18 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/return_stack_trace_depth|return_stack_trace_depth]]
 
+## Implementation anchors
+
+- `vmhook::return_value::caller` — `vmhook/ext/vmhook/vmhook.hpp:9551-9672` — saved-rbp walk: [rbp], Method* at [caller_rbp - 24]; safe-read gated
+- `vmhook::return_value::caller_info` — `vmhook/ext/vmhook/vmhook.hpp:1447-1461` — method/class_name/method_name/signature + valid() == (method != nullptr)
+
 ## Tests
 
 - `tests/jvm/modules/return_caller.cpp`
+- `tests/test_return_value.cpp`
 
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+test_return_value.cpp covers the no-frame default (empty caller_info, no crash)
+without a JVM; the live saved-rbp walk needs an interpreter frame and is covered
+by the JVM module.

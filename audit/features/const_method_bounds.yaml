@@ -71,7 +71,8 @@ hpp_anchors:
     file: vmhook/ext/vmhook/vmhook.hpp
     lines: [2975, 2984]
     note: "[UNGUARDED] reads constant_pool_base[name_index]/[sig_index] at 2975-2977 / 2982-2984 — same CP array, no FIX B guards (flaw #1)"
-test_modules: []
+test_modules:
+- tests/test_const_method_bounds.cpp
 depends_on:
 - constantpool_access
 - decode_oop_and_pointers

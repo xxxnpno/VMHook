@@ -3,23 +3,36 @@ slug: method_throwing_call_site
 title: Method Throwing Call Site
 category: method
 status: seeded
-risk: medium
+risk: high
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/method]
+tags: [status/seeded, risk/high, category/method, tag/method, tag/call, tag/exception, tag/throwing, tag/crash-safety, tag/exception-clear, tag/call-stub, tag/call-jni]
 ---
 
 # Method Throwing Call Site
 
-> **Category:** [[categories/method|Method proxies (resolve / call / dispatch)]]  ·  **Status:** `seeded`  ·  **Risk:** `medium`  ·  **Specialist:** `.claude/agents/method_throwing_call_site-specialist.md`
+> **Category:** [[categories/method|Method proxies (resolve / call / dispatch)]]  ·  **Status:** `seeded`  ·  **Risk:** `high`  ·  **Specialist:** `.claude/agents/method_throwing_call_site-specialist.md`
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
+Invoking a Java method that THROWS via `method_proxy::call()` from inside a live
+detour, having the Java exception unwind back into native code with NO
+access-violation, and leaving the thread/JVM in a clean, usable state for the
+next `call()`/field-read and the next test module. This is the single most
+crash-sensitive thing vmhook does — a Java exception crossing the native/Java
+boundary — so the contract is deliberately conservative: the call site
+COMPLETES, the method GENUINELY RAN with the right arg, and the thread is
+CLEARABLE. The throwing call's RETURN VALUE is explicitly NOT a contract (it is
+the dispatcher's default cell). On the call_jni path `check_callee_exception`
+runs after EVERY JNI call (ExceptionDescribe PRINTS and CLEARS), so vmhook itself
+leaves the thread clean; on the call-stub path there is NO exception check
+between the stub return and the value_t return, so a pending Java exception
+stays set — the hazard a defensive `jni_exception_clear()` neutralizes.
 
 ## Depends on
 
 - [[features/method_call_primitives|method_call_primitives]]
 - [[features/on_exception|on_exception]]
+- [[features/method_explicit_signature|method_explicit_signature]]
 
 ## Related
 
@@ -29,11 +42,32 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 - [[features/method_call_string|method_call_string]]
 - [[features/method_call_wide_args|method_call_wide_args]]
 - [[features/method_return_types|method_return_types]]
+- [[features/on_exception|on_exception]]
+
+## Implementation anchors
+
+- `method_proxy::call (Method* guard + path selection)` — `vmhook/ext/vmhook/vmhook.hpp:16871-17050` — self-guards its backing Method* before anything (stale proxy can't AV); call-stub path has NO exception check/clear between the stub return and the value_t return
+- `method_proxy::call_jni (check_callee_exception)` — `vmhook/ext/vmhook/vmhook.hpp:16233-16870` — runs check_callee_exception (16567) after EVERY JNI call: ExceptionCheck (228) + ExceptionDescribe (16, PRINTS and CLEARS) + Throwable.toString into the log; leaves the thread clean and returns the JNI default cell
+- `detail::jni_exception_clear` — `vmhook/ext/vmhook/vmhook.hpp:11677-11710` — the module's defensive clear: idempotent — reads ExceptionCheck (228) and only calls ExceptionClear (17) when one is pending; bails if current_jni_env is null
+- `detail::find_call_stub_entry` — `vmhook/ext/vmhook/vmhook.hpp:15936-15970` — the path-decider, memoised in a static so the call-stub-vs-JNI decision is resolved once per process and stable for the whole suite
 
 ## Tests
 
 - `tests/jvm/modules/method_throwing_call_site.cpp`
 
+## Known bugs
+
+- **[medium]** The CALL-STUB fast path has NO exception check and NO clear anywhere between the stub return and the value_t return — a pending Java exception stays set on the thread, so a subsequent JNI call asserts 'JNI call made with exception pending' under -Xcheck:jni. The call_jni path is clean (check_callee_exception clears via ExceptionDescribe). The module neutralizes the call-stub hazard with a defensive jni_exception_clear().
+
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+current_jni_env is a thread_local set at attach (populated inside any detour), so
+the module can assert a DEFINITE post-clear ExceptionCheck == 0 (not -1). The
+explicit get_method(\"boom\",\"(I)I\") pins the overload (signature_pinned=true) so
+resolve_compatible_method honours it verbatim and the throwing call can never
+mis-dispatch a sibling. The value_t conversion operator can also produce const
+char* (a std::string is constructible from it), the documented MSVC ambiguity the
+module avoids by copy-init (const value_t r = call(...)), never brace-init.
+find_call_stub_entry is memoised once per process. Java fixture; call() runs
+inside a live detour. The return value of the throwing call is NOT asserted (it is
+the default cell); only completion + correct-arg-run + clearability are.

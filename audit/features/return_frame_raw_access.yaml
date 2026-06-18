@@ -3,33 +3,45 @@ slug: return_frame_raw_access
 title: Return Frame Raw Access
 category: return
 status: seeded
-risk: medium
+risk: high
 specialist: .claude/agents/return_frame_raw_access-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
-java_versions:
-- 8
-- 11
-- 17
-- 21
-- 24
-- 25
-- 26
-tags: []
-hpp_anchors: []
+description: |
+  return_value::frame() — exposes the intercepted HotSpot interpreter frame
+  (vmhook::hotspot::frame*) to the detour, or nullptr when the return_value was
+  constructed without one.  It is the raw escape hatch for advanced callers that
+  want to walk the call stack themselves (read locals, the Method*, the saved rbp)
+  rather than going through the higher-level caller() / stack_trace() / set_arg()
+  helpers.  The accessor itself is a trivial getter of the private stack_frame
+  pointer; the safety burden moves to the caller, who must validate every
+  dereference (the library's own helpers route through is_valid_pointer /
+  safe_read).  Callers should prefer caller() when only the immediate caller is
+  needed; frame() exists for the cases those convenience APIs do not cover.
+java_versions: [8, 11, 17, 21, 24, 25, 26]
+tags: [return, frame, interpreter, x86_64, advanced]
+hpp_anchors:
+  - symbol: vmhook::return_value::frame
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [1525, 1535]
+    note: "trivial getter of the private stack_frame pointer; nullptr if none"
+  - symbol: vmhook::return_value
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [1344, 1539]
+    note: "the hook-callback handle; stack_frame member set at construction"
 test_modules:
-- tests/jvm/modules/return_frame_raw_access.cpp
+  - tests/jvm/modules/return_frame_raw_access.cpp
+  - tests/test_return_value.cpp
 depends_on:
-- interpreter_frame_walk
+  - interpreter_frame_walk
 related:
-- return_caller
-- return_set_arg
-- return_set_primitives
-- return_set_wrapper_null
-- return_stack_trace_depth
-- return_value_cancel
+  - return_caller
+  - return_set_arg
+  - return_set_primitives
+  - return_set_wrapper_null
+  - return_stack_trace_depth
+  - return_value_cancel
 audit_docs: []
 known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+notes: |
+  test_return_value.cpp asserts frame() returns nullptr (and caller()/stack_trace()
+  give their empty defaults) when constructed frame == nullptr, no JVM needed;
+  walking a real frame is JVM-only.

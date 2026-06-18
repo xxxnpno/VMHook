@@ -5,7 +5,7 @@ category: infra
 status: seeded
 risk: medium
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/infra]
+tags: [status/seeded, risk/medium, category/infra, tag/deducing-this, tag/explicit-object-parameter, tag/cpp23, tag/overload-resolution, tag/wrapper, tag/compile-time, tag/infra, tag/toolchain-gated]
 ---
 
 # Unified Call Syntax
@@ -14,16 +14,70 @@ tags: [status/seeded, risk/medium, category/infra]
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
+The C++23 deducing-this (explicit-object-parameter) overloads on
+vmhook::object<derived> that let the SAME call site — get_field("name") /
+get_method("name") / get_method("name","sig") — compile and resolve correctly
+from BOTH an instance C++ method (routes through the live OOP via `this`) AND a
+static C++ method of the wrapper (routes through the type_index-keyed
+static-mirror lookup), without the author picking a different spelling. The
+portable escape hatch static_field / static_method is always available. This is
+a pure compile-time / overload-resolution layer over the existing instance and
+static get_field/get_method in object_base. The feature gate is
+VMHOOK_HAS_DEDUCING_THIS (on only for MSVC + non-NDK Clang 18..19; GCC and
+Clang >= 20 compile the #else using-declaration fallback and have NO static
+get_field/get_method overloads — authors there MUST use static_field /
+static_method).
 
 ## Depends on
 
 - [[features/method_overload|method_overload]]
 
+## Related
+
+- [[features/wrapper_pattern|wrapper_pattern]]
+- [[features/field_static|field_static]]
+
+## Implementation anchors
+
+- `VMHOOK_HAS_DEDUCING_THIS feature gate` — `vmhook/ext/vmhook/vmhook.hpp:256-261` — 1 only when __cpp_explicit_this_parameter >= 202110L AND (__clang__ || _MSC_VER) AND !__ANDROID__ AND NOT (clang_major >= 20). Long rationale 232-255: GCC considers explicit-object overloads in static-call contexts and errors; Clang 20 changed overload resolution so a static-context get_field('x') binds the literal to the deducing-this overload — both fall to the #else path
+- `vmhook::object<derived> (CRTP base)` — `vmhook/ext/vmhook/vmhook.hpp:18701-18811` — using object_base::object_base (18704). #if VMHOOK_HAS_DEDUCING_THIS deducing-this instance overloads get_field(this object_base const&, char const*) / get_method(...) take char const* (NOT string_view) and forward to self.object_base::get_field(name) (18726-18743); #else re-exposes inherited instance overloads via `using object_base::get_field/get_method` (18752-18754)
+- `object<derived> static-context fallbacks + portable static accessors` — `vmhook/ext/vmhook/vmhook.hpp:18765-18810` — gated static get_field/get_method(std::string_view) forwarding to object_base::get_field(type_index{typeid(derived)}, name) (18766-18782) — the overloads the deducing-this members fall through to in static context. Always-compiled portable static_field/static_method(string_view) (18788-18810) have byte-identical bodies (same typeid(derived) lookup)
+- `object_base instance/static get_field & get_method (the substrate this routes to)` — `vmhook/ext/vmhook/vmhook.hpp:17635-18138` — instance get_field via typeid(*this)/find_field/static-vs-instance branch; static get_field(type_index) rejects a non-static field with nullopt; instance/static get_method walk the super chain / build a null-receiver proxy. The unified overloads are thin forwarders — all klass/field/mirror resolution lives here
+
 ## Tests
 
 - `tests/test_unified_call_syntax.cpp`
 
+## Known bugs
+
+- **[high]** The existing test is COMPILE-ONLY and asserts nothing about behaviour. tests/test_unified_call_syntax.cpp main() only prints OK and returns 0 — it never touches a JVM, never registers a class, never checks that an instance call vs a static call resolve to the right overload or return the right value. The entire runtime contract ('instance site reads the live OOP; static site reads the class mirror; both via one spelling') is UNVERIFIED. There is no live-JVM module for this feature.
+- **[medium]** Non-literal std::string name from an instance context silently routes through the STATIC lookup. The instance deducing-this overloads take `char const*` while the static fallbacks take `string_view`; a string LITERAL prefers char const* (instance, live OOP), but an lvalue std::string / std::string_view does NOT match char const* and instead binds the string_view static fallback (typeid(derived), class mirror). So `std::string n=...; get_field(n)` from an instance method reads the static mirror, not the live OOP — wrong-context resolution, easy to hit, completely untested. Arguably the most dangerous real trap in the feature.
+- **[medium]** object<void> (derived == void) silently breaks every static-context call. The forward declaration defaults derived to void; the static fallbacks compute typeid(derived). Instantiating vmhook::object<> / object<void> and calling a static accessor makes resolve_klass(type_index{typeid(void)}) look up void in type_to_class_map, never find it, and return nullopt forever — a runtime no-op with only a log line, no compile error. CRTP is supposed to be object<Self>; the = void default makes the misuse compile.
+- **[medium]** Instance path keys on typeid(*this) (dynamic type) but the static path keys on typeid(derived) (static CRTP parameter) — they diverge under multi-level inheritance. For correct CRTP (class W : object<W>) they agree, but for `class B : A` where `A : object<A>` a B instance resolves B's dynamic-type klass via an instance call while a static call resolves A's klass. The 'unified' site does NOT resolve the same Java class from the two contexts in a derived scenario. Subtle; only bites layered wrappers; untested.
+- **[low]** Doc/macro near-contradiction: comments around 232 / 18701 historically claimed GCC has the feature, but the gate excludes GCC (and now Clang >= 20). On those toolchains the deducing-this overloads are never emitted and authors must use static_field/static_method. The behaviour is intentional and explained in the rationale block, but the older 'GCC 14+' phrasing can mislead the next reader. Documentation defect, not a logic defect.
+
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+A thin forwarding layer: the deducing-this overloads do NOT use `derived`
+themselves (they slice the receiver to object_base const& and re-derive the
+klass via typeid(*this)); only the static fallbacks use typeid(derived). The
+char const* vs string_view split between instance overloads and static
+fallbacks is the intended instance-literal-vs-static-name discriminator, but it
+is also the source of the non-literal-std::string trap above.
+
+Test coverage TODAY: only tests/test_unified_call_syntax.cpp, which is
+compile-only (proves the header compiles on the building toolchain; asserts no
+return values, no overload selection, no JVM behaviour). The gap is a live-JVM
+module (tests/jvm/modules/unified_call_syntax.cpp does not exist yet) with a
+fixture carrying an instance field and a like-named static field with distinct
+values, proving the same spelling returns the instance value from an instance
+method and the static value from a static method, plus the flaw-targeted
+characterizations (non-literal std::string routing, object<void> no-op,
+multi-level CRTP divergence).
+
+Version axis is the TOOLCHAIN, not the JDK: VMHOOK_HAS_DEDUCING_THIS state only
+changes the spelling the author may use. The static-context calls exercise the
+java.lang.Class mirror path, so JDK 8 vs 9+ mirror/static-field-offset
+differences surface through the static fallbacks — but that exposure is inherited
+verbatim from resolve_klass / find_field / the _methods super-walk, with no
+extra guard added by this layer.

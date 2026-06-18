@@ -5,9 +5,20 @@ category: method
 status: seeded
 risk: medium
 specialist: .claude/agents/method_call_wide_args-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  `method_proxy::call(args...)` passing `long`/`double` arguments correctly — each
+  occupies TWO interpreter local slots, every other primitive (and an object
+  reference) occupies one. Defends against the bug class where a wide arg either
+  (1) TRUNCATES to 32 bits or (2) SHIFTS / corrupts the FOLLOWING parameter slot.
+  On the call-stub fast path the `pack` lambda zero-inits an `intptr_t v`, memcpys
+  the arg, and stores ONE intptr_t word per C++ argument (so a long/double fills
+  all 8 bytes of one word, a narrow arg's high 4 stay clean), counting `param_idx`
+  ONE per C++ arg (NOT per interpreter slot). On the call_jni path (taken on every
+  CI JDK) args go through `write_jni_arg_to_slot` (`value.j` for a 64-bit integral,
+  `value.d` for a double) and `Call(Static)?<T>MethodA` expands each jvalue into
+  the two interpreter locals internally. Overload selection (`int64_t`->"J",
+  `double`->"D") is re-run by both paths; an explicit `get_method(name,"(J)I")`
+  pins the exact overload.
 java_versions:
 - 8
 - 11
@@ -16,13 +27,30 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags: [method, call, wide-args, two-slot, long, double, overload, call-stub, call-jni]
+hpp_anchors:
+  - symbol: method_proxy::call (pack lambda + result decode)
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [16871, 17050]
+    note: "params[8] zero-init, generic-primitive memcpy into one intptr_t/arg, receiver in params[0] for instance; J->int64, D/F memcpy decode"
+  - symbol: method_proxy::call_jni (wide-arg packing)
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [16233, 16870]
+    note: "write_jni_arg_to_slot: value.j=0 clear then value.j for 64-bit integral / value.d for double; Call(Static)?<T>MethodA does the two-slot expansion"
+  - symbol: method_proxy::resolve_compatible_method / argument_matches_descriptor
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [17351, 17600]
+    note: "int64_t->J, double->D, int32_t->I, float->F, char16_t/uint16_t->C; signature_pinned forces the exact overload verbatim"
+  - symbol: detail::write_jni_arg_to_slot
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [13165, 13200]
+    note: "the union-cell packer the call_jni wide path uses (value.j=0 full clear before the narrow write)"
 test_modules:
 - tests/jvm/modules/method_call_wide_args.cpp
 depends_on:
 - method_call_primitives
 - jni_arg_packing
+- method_overload
 related:
 - method_call_jni_fallback
 - method_call_object
@@ -31,6 +59,17 @@ related:
 - method_return_types
 - method_static
 audit_docs: []
-known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+known_bugs:
+  - severity: medium
+    note: "The call-stub fast path's wide-arg slot accounting is unproven and suspect: call() passes ONE intptr_t word per C++ argument and sets the stub's size_of_parameters to param_idx (the C++ ARGUMENT count, NOT the JVM SLOT count). A Java (JJ)J body has interpreter parameter_size = 5 slots (this + 2 + 2) but vmhook hands the stub only 3 words for call(a,b) on an instance. Whether the call stub re-expands wide values or copies words verbatim determines if this is correct or a latent mis-read. NOT exercised on CI (the call stub is absent there)."
+notes: |
+  call() checks find_call_stub_entry(); the call_jni path is the one actually taken
+  on every CI JDK (the stub VMStruct is absent), and on that path the two-slot
+  expansion is the JVM's job (JNI Call*MethodA), not vmhook's — so the wide-arg
+  correctness CI proves is the call_jni path. argument_matches_descriptor drives the
+  overload pick: call((int64_t)x) on a name-only proxy with both an int and a long
+  overload picks long; double maps to D ONLY. The fixture exercises wide args in
+  leading / middle / trailing positions, long+double mixed, two longs, two doubles,
+  an all-wide four-arg frame, and the minimal narrow-after-wide witness — on both
+  paths, instance AND static. Java-8-only fixture; call() runs inside the
+  trigger(int) detour.

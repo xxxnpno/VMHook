@@ -5,27 +5,41 @@ category: lifecycle
 status: seeded
 risk: medium
 specialist: .claude/agents/on_class_loaded-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
-java_versions:
-- 8
-- 11
-- 17
-- 21
-- 24
-- 25
-- 26
-tags: []
-hpp_anchors: []
+description: |
+  vmhook::on_class_loaded(callback) — registers a callback fired whenever
+  java.lang.ClassLoader defines a new class.  It installs an interpreter hook on
+  ClassLoader::defineClass(String, byte[], int, int, ProtectionDomain) and
+  dispatches the callback with the internal (`/`-separated) class name read from
+  the call's first argument.  Event-driven: zero latency, zero idle cost, no
+  polling.  Returns a watch_handle whose on_stop erases the callback from the
+  shared list.  Limitations: only catches classes defined via the Java-side
+  defineClass entry (bootstrap-loaded java.*/javax.*/sun.* classes bypass it), and
+  the (String, ByteBuffer, ProtectionDomain) overload is not hooked.  Callback
+  exceptions are caught and logged (noexcept boundary); the callback runs on the
+  Java thread that triggered the definition.  After a shutdown_hooks() teardown the
+  next on_class_loaded() re-installs a live detour.
+java_versions: [8, 11, 17, 21, 24, 25, 26]
+tags: [lifecycle, hook, callback, event-driven]
+hpp_anchors:
+  - symbol: vmhook::on_class_loaded
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [20973, 21080]
+    note: "installs ClassLoader.defineClass hook; dispatches internal class name"
+  - symbol: vmhook::detail::class_load_callbacks
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [20921, 20939]
+    note: "callback registry + class_load_hook_installed flag; class_loader_wrapper"
 test_modules:
-- tests/jvm/modules/on_class_loaded.cpp
+  - tests/jvm/modules/on_class_loaded.cpp
 depends_on:
-- hook_basic
+  - hook_basic
 related:
-- on_exception
-- shutdown_hooks_teardown
+  - on_exception
+  - shutdown_hooks_teardown
+  - read_java_string
 audit_docs: []
 known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+notes: |
+  Requires a live JVM (arms a real interpreter hook on defineClass).  Shares the
+  detour re-install lifecycle with on_exception; a shutdown_hooks() drops the stale
+  callback list so the first post-shutdown register re-installs the detour.

@@ -280,64 +280,97 @@ flowchart LR
   instanceklass_methods_walk --> vmstructs_offset_resolution
   interface_polymorphism --> klass_introspection
   interface_polymorphism --> method_overload
+  interpreter_frame_walk --> vmstructs_offset_resolution
+  interpreter_frame_walk --> decode_oop_and_pointers
+  interpreter_frame_walk --> os_safe_read
+  iterate_entries_safety --> vmstructs_offset_resolution
   jni_arg_packing --> signature_parsing
+  jni_local_ref_hygiene --> jni_arg_packing
   klass_introspection --> vmstructs_offset_resolution
   klass_introspection --> instanceklass_methods_walk
   klass_introspection --> compressed_klass_decode
-  make_java_array --> jni_arg_packing
+  make_java_array --> find_class_fallback
+  make_java_array --> compressed_klass_decode
+  make_java_array --> compressed_oops_decode
   make_java_string --> read_java_string
   make_java_string --> jni_local_ref_hygiene
   make_unique --> wrapper_pattern
+  make_unique --> jni_arg_packing
+  make_unique --> register_class
   method_call_jni_fallback --> method_call_primitives
   method_call_jni_fallback --> jni_arg_packing
   method_call_jni_fallback --> jni_local_ref_hygiene
   method_call_object --> method_call_primitives
+  method_call_object --> method_proxy_value_t
   method_call_object --> wrapper_pattern
+  method_call_object --> decode_oop_and_pointers
   method_call_primitives --> method_proxy_value_t
   method_call_primitives --> method_enumeration
+  method_call_primitives --> jni_arg_packing
   method_call_return_void --> method_call_primitives
+  method_call_return_void --> method_proxy_value_t
   method_call_string --> method_call_primitives
   method_call_string --> make_java_string
   method_call_string --> read_java_string
+  method_call_string --> jni_local_ref_hygiene
   method_call_wide_args --> method_call_primitives
   method_call_wide_args --> jni_arg_packing
+  method_call_wide_args --> method_overload
   method_entry_points_i2i_i2c --> vmstructs_offset_resolution
+  method_entry_points_i2i_i2c --> iterate_entries_safety
   method_enumeration --> instanceklass_methods_walk
+  method_enumeration --> klass_introspection
+  method_enumeration --> signature_parsing
   method_explicit_signature --> signature_parsing
   method_explicit_signature --> method_enumeration
   method_flags_width --> vmstructs_offset_resolution
   method_is_reference --> signature_parsing
   method_overload --> signature_parsing
   method_overload --> method_explicit_signature
+  method_overload --> method_enumeration
   method_overload_java_dispatch --> method_overload
+  method_overload_java_dispatch --> method_call_primitives
+  method_overload_java_dispatch --> method_call_string
   method_proxy_value_t --> wrapper_pattern
+  method_proxy_value_t --> decode_oop_and_pointers
+  method_proxy_value_t --> read_java_string
   method_return_types --> method_call_primitives
+  method_return_types --> method_proxy_value_t
+  method_return_types --> read_java_string
+  method_return_types --> decode_oop_and_pointers
   method_static --> method_call_primitives
+  method_static --> method_proxy_value_t
   method_static_portability --> method_static
+  method_static_portability --> method_call_primitives
   method_throwing_call_site --> method_call_primitives
   method_throwing_call_site --> on_exception
+  method_throwing_call_site --> method_explicit_signature
   midi2i_trampoline_alloc --> os_allocate_release
   midi2i_trampoline_alloc --> os_protect
   midi2i_trampoline_alloc --> os_query_region
   midi2i_trampoline_alloc --> os_page_size_granularity
   nested_classes --> klass_introspection
+  nested_classes --> find_class_fallback
   on_class_loaded --> hook_basic
   on_exception --> hook_basic
+  os_allocate_release --> os_page_size_granularity
+  os_protect --> os_page_size_granularity
   os_safe_read --> os_signal_handler
   poly_inherited_oop --> klass_introspection
   poly_inherited_oop --> field_inherited
   read_java_string --> compressed_oops_decode
+  read_java_string --> os_safe_read
   register_class --> wrapper_pattern
   register_class --> find_class_fallback
   return_caller --> interpreter_frame_walk
+  return_caller --> os_safe_read
   return_frame_raw_access --> interpreter_frame_walk
   return_set_arg --> interpreter_frame_walk
-  return_set_primitives --> interpreter_frame_walk
-  return_set_wrapper_null --> interpreter_frame_walk
+  return_set_arg --> os_safe_read
   return_set_wrapper_null --> wrapper_pattern
   return_stack_trace_depth --> interpreter_frame_walk
   return_stack_trace_depth --> return_caller
-  return_value_cancel --> interpreter_frame_walk
+  return_stack_trace_depth --> os_safe_read
   seh_invoke_detour --> os_signal_handler
   shutdown_hooks_teardown --> hook_basic
   unified_call_syntax --> method_overload

@@ -21,6 +21,10 @@ process. This is the "library linked but JVM not attached/not yet attached" stat
 the single most common way a consumer first exercises the API, and the contract
 funnels through `os::find_jvm_module()` (null → VMStructs null → class lookup null).
 
+## Referenced from
+
+- [[features/platform_capability_macros|platform_capability_macros]]
+
 ## Implementation anchors
 
 - `os::find_jvm_module()` — `vmhook/ext/vmhook/vmhook.hpp:543-566` — scans already-loaded modules for jvm.dll/libjvm.so/libjvm.dylib; returns nullptr if absent

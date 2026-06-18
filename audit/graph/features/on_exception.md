@@ -5,7 +5,7 @@ category: lifecycle
 status: seeded
 risk: medium
 java_versions: [8, 11, 17, 21, 24, 25, 26]
-tags: [status/seeded, risk/medium, category/lifecycle]
+tags: [status/seeded, risk/medium, category/lifecycle, tag/lifecycle, tag/hook, tag/callback, tag/event-driven]
 ---
 
 # On Exception
@@ -14,7 +14,18 @@ tags: [status/seeded, risk/medium, category/lifecycle]
 
 ## Description
 
-TODO: one-paragraph summary of what this feature does and what its input/output contract is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant in ~200 tokens.
+vmhook::on_exception(callback) — registers a callback fired whenever a
+java.lang.Throwable (or any subclass) is constructed.  It installs an interpreter
+hook on Throwable::fillInStackTrace()Ljava/lang/Throwable;, which every public
+Throwable constructor calls before returning; when the hook fires it reads the
+dynamic klass off the receiver oop's narrow-klass header and dispatches the
+callback with the fully-qualified internal (`/`-separated) class name (e.g.
+"java/lang/NullPointerException").  Event-driven: zero polling, zero idle cost.
+Returns a watch_handle whose on_stop erases the callback.  Misses exceptions
+constructed with writableStackTrace=false and subclasses that override
+fillInStackTrace to a no-op (rare, some preallocated VM errors).  Callback
+exceptions are caught and logged (noexcept boundary); the callback runs on the
+Java thread that constructed the throwable.
 
 ## Depends on
 
@@ -24,10 +35,16 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 - [[features/on_class_loaded|on_class_loaded]]
 - [[features/shutdown_hooks_teardown|shutdown_hooks_teardown]]
+- [[features/klass_introspection|klass_introspection]]
 
 ## Depended on by
 
 - [[features/method_throwing_call_site|method_throwing_call_site]]
+
+## Implementation anchors
+
+- `vmhook::on_exception` — `vmhook/ext/vmhook/vmhook.hpp:21139-21252` — installs Throwable.fillInStackTrace hook; dispatches throwable klass name
+- `vmhook::detail::exception_callbacks` — `vmhook/ext/vmhook/vmhook.hpp:21088-21103` — callback registry + exception_hook_installed flag; throwable_wrapper
 
 ## Tests
 
@@ -35,4 +52,6 @@ TODO: one-paragraph summary of what this feature does and what its input/output 
 
 ## Notes
 
-Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md for the field reference.
+Requires a live JVM (arms a real interpreter hook on fillInStackTrace).  Shares
+the detour re-install lifecycle with on_class_loaded; a shutdown_hooks() drops the
+stale callback list so the first post-shutdown register re-installs the detour.

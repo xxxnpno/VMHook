@@ -89,7 +89,8 @@ hpp_anchors:
     file: vmhook/ext/vmhook/vmhook.hpp
     lines: [13827, 13828]
     note: "raw _pool_holder dereference to recover declaring class for static method overload disambiguation"
-test_modules: []
+test_modules:
+- tests/test_const_method_bounds.cpp
 depends_on:
 - vmstructs_offset_resolution
 related:

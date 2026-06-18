@@ -5,23 +5,39 @@ category: os
 status: seeded
 risk: medium
 specialist: .claude/agents/os_query_region-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
-java_versions:
-- 8
-- 11
-- 17
-- 21
-- 24
-- 25
-- 26
-tags: []
-hpp_anchors: []
-test_modules: []
+description: |
+  vmhook::os::query_region — returns a region_info describing the VM region that
+  contains a pointer (base, size, committed/free, readable, executable, guarded).
+  Used by safe_readable() and by the trampoline allocator to find a free region
+  within +/-2 GiB of the hook target.  Backends differ per platform: Windows
+  VirtualQuery (MEMORY_BASIC_INFORMATION, decoding PAGE_* flags into the portable
+  bools), Linux/Android parse /proc/self/maps (and report the gap before the next
+  mapping as free), macOS mach_vm_region, iOS returns a permissive "looks
+  committed/readable" stub (no /proc, no callable mach_vm).  A null address yields
+  a zeroed region_info.  region_info also exposes whether a page is guarded
+  (PAGE_GUARD) so the allocator never picks a guard page.
+java_versions: [8, 11, 17, 21, 24, 25, 26]
+tags: [os, memory, x86_64, arm64]
+hpp_anchors:
+  - symbol: vmhook::os::query_region
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [793, 898]
+    note: "VirtualQuery / proc-maps / mach_vm_region / iOS stub; null guard"
+  - symbol: vmhook::os::region_info
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [472, 481]
+    note: "base/size/committed/free/readable/executable/guarded result struct"
+test_modules:
+  - tests/test_os_query_region.cpp
+  - tests/test_os_protect_interaction.cpp
+  - tests/test_os_layer.cpp
 depends_on: []
-related: []
+related:
+  - os_protect
+  - os_allocate_release
+  - midi2i_trampoline_alloc
 audit_docs: []
 known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+notes: |
+  No dedicated JVM module — pure OS-layer.  protect_interaction asserts a freshly
+  allocate_rwx'd block reports committed+readable through query_region.

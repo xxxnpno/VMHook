@@ -3,11 +3,19 @@ slug: method_overload
 title: Method Overload
 category: method
 status: seeded
-risk: medium
+risk: high
 specialist: .claude/agents/method_overload-specialist.md
-description: 'TODO: one-paragraph summary of what this feature does and what its input/output contract
-  is.  Replace this with a real description so a spawned specialist can decide if the feature is relevant
-  in ~200 tokens.'
+description: |
+  `method_proxy` OVERLOAD RESOLUTION — `get_method("name")->call(args)` picking the
+  overload whose JVM parameter descriptors match the C++ argument TYPES.
+  `argument_matches_descriptor<T>` maps one C++ type to one JVM descriptor letter
+  (bool->Z, int8->B, int16->S, uint16->C, int32->I, int64->J, float->F, double->D,
+  std::string->Ljava/lang/String;, wrapper/oop->L...; with a WILDCARD fallback when
+  the wrapper isn't `register_class<>`'d); `next_argument_descriptor` tokenises one
+  param (and arrays); `signature_matches_arguments<...>` checks the whole param
+  list; `resolve_compatible_method<...>` is the picker, re-run by BOTH dispatch
+  paths on every call. `get_method("name")` resolves FIRST-by-name;
+  `get_method("name","sig")` is exact; `static_method(...)` is the static entry.
 java_versions:
 - 8
 - 11
@@ -16,18 +24,49 @@ java_versions:
 - 24
 - 25
 - 26
-tags: []
-hpp_anchors: []
+tags: [method, overload, resolution, descriptor, argument-matching, wildcard, static]
+hpp_anchors:
+  - symbol: method_proxy::argument_matches_descriptor
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [17351, 17496]
+    note: "one C++ type -> one JVM descriptor letter; wrapper/oop -> L...; with a WILDCARD fallback for an unregistered wrapper (the ambiguity flaw)"
+  - symbol: method_proxy::signature_matches_arguments
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [17497, 17541]
+    note: "the whole-param-list matcher driving the picker"
+  - symbol: method_proxy::resolve_compatible_method
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [17542, 17640]
+    note: "the picker; the DEAD static-overload path: bails `if (!resolved) return this->method` and a static proxy is built with object==nullptr so static overloads never re-pick"
+  - symbol: method_proxy::call / call_jni (resolve + dispatch)
+    file: vmhook/ext/vmhook/vmhook.hpp
+    lines: [16233, 17050]
+    note: "both paths re-run resolve_compatible_method on every call; call_jni (16233) is the CI path, call (16871) the call-stub path"
 test_modules:
 - tests/jvm/modules/method_overload.cpp
 depends_on:
 - signature_parsing
 - method_explicit_signature
+- method_enumeration
 related:
 - find_methods_by_signature
 - method_explicit_signature
 - method_is_reference
+- method_overload_java_dispatch
+- method_static
 audit_docs: []
-known_bugs: []
-notes: Stub manifest — populate hpp_anchors, depends_on, known_bugs as they become known.  See audit/features/schema.md
-  for the field reference.
+known_bugs:
+  - severity: high
+    note: "Static-overload resolution is DEAD: resolve_compatible_method bails `if (!resolved) return this->method` and every static method_proxy is built with object==nullptr, so STATIC overloads never re-pick. On JDK 21 (call stub absent) the bug is LIVE. The module records every static-overload outcome as [INFO], never fails CI for it, but DOES hard-assert the explicit-signature static path static_method(\"spick\",\"(D)I\") which bypasses resolution, proving the fixture is sound."
+  - severity: medium
+    note: "First-match-wins with no ambiguity detection for an UNREGISTERED wrapper arg: argument_matches_descriptor falls back to a WILDCARD L...; match for a wrapper type that was never register_class<>'d, so the first name-matching overload with any reference parameter is taken with no ambiguity signal. Characterized, not failed."
+notes: |
+  Each Java pick(...) overload in the fixture returns a DISTINCT int sentinel so a
+  mis-resolution is caught as a VALUE mismatch (not a crash, not 'some int came
+  back'). The module records which dispatch path is live via find_call_stub_entry()
+  and asserts the converted value_t (path-independent). argument_matches_descriptor
+  handles the two-slot J/D types in the param walk; call((int64_t)x) on a name-only
+  proxy with both int and long overloads picks long; signature_pinned (set by
+  get_method(name,sig)) forces the exact overload verbatim. Java-8-only fixture,
+  ASCII strings (so read_java_string vs GetStringUTFChars never diverges). call()
+  runs inside the detour where current_java_thread is live.

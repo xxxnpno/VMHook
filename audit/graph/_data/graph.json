@@ -2,7 +2,7 @@
   "schema_version": 1,
   "generated_at": "1970-01-01T00:00:00Z",
   "feature_count": 109,
-  "edge_count": 501,
+  "edge_count": 654,
   "categories": [
     {
       "slug": "bootstrap",
@@ -674,6 +674,7 @@
         "compression"
       ],
       "test_modules": [
+        "tests/test_compressed_oops_decode.cpp",
         "tests/jvm/modules/compressed_oops_decode.cpp"
       ],
       "audit_docs": [],
@@ -712,7 +713,9 @@
         "defensive",
         "AV-guard"
       ],
-      "test_modules": [],
+      "test_modules": [
+        "tests/test_const_method_bounds.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -752,7 +755,9 @@
         "field-metadata",
         "method-metadata"
       ],
-      "test_modules": [],
+      "test_modules": [
+        "tests/test_const_method_bounds.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -1184,7 +1189,7 @@
       "slug": "field_object_ref",
       "title": "Field Object Ref",
       "category": "field",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/field_object_ref-specialist.md",
       "depends_on": [
@@ -1192,9 +1197,21 @@
         "compressed_oops_decode"
       ],
       "related": [
-        "field_arrays_object"
+        "field_arrays_object",
+        "field_string",
+        "field_introspection"
       ],
-      "tags": [],
+      "tags": [
+        "field",
+        "reference",
+        "object",
+        "unique_ptr",
+        "compressed-oop",
+        "oop-decode",
+        "wrapper",
+        "self-ref",
+        "shared-ref"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_object_ref.cpp"
       ],
@@ -1406,7 +1423,7 @@
       "slug": "field_static",
       "title": "Field Static",
       "category": "field",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/field_static-specialist.md",
       "depends_on": [
@@ -1418,7 +1435,17 @@
         "field_primitives_get",
         "field_proxy_value_t"
       ],
-      "tags": [],
+      "tags": [
+        "field",
+        "static",
+        "mirror",
+        "get",
+        "set",
+        "size-guard",
+        "char-widening",
+        "gc-stable-mirror",
+        "putstatic"
+      ],
       "test_modules": [
         "tests/jvm/modules/field_static.cpp"
       ],
@@ -1519,7 +1546,7 @@
       "slug": "find_class_fallback",
       "title": "Find Class Fallback",
       "category": "klass",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/find_class_fallback-specialist.md",
       "depends_on": [
@@ -1532,13 +1559,25 @@
         "constantpool_access",
         "instanceklass_methods_walk",
         "interface_polymorphism",
-        "klass_introspection"
+        "klass_introspection",
+        "find_class_context_loader"
       ],
-      "tags": [],
+      "tags": [
+        "klass",
+        "class-lookup",
+        "name-cache",
+        "class-loader-data-graph",
+        "jni-fallback",
+        "context-loader",
+        "stale-cache",
+        "internal-name"
+      ],
       "test_modules": [
         "tests/jvm/modules/find_class_fallback.cpp"
       ],
-      "audit_docs": [],
+      "audit_docs": [
+        "audit/findings/find_class_jni_fallback_chain.md"
+      ],
       "java_versions": [
         8,
         11,
@@ -1591,7 +1630,7 @@
       "slug": "for_each_instance",
       "title": "For Each Instance",
       "category": "enumeration",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/for_each_instance-specialist.md",
       "depends_on": [
@@ -1602,7 +1641,17 @@
         "for_each_loaded_class",
         "for_each_thread"
       ],
-      "tags": [],
+      "tags": [
+        "enumeration",
+        "heap-scan",
+        "live-instance",
+        "safe_read",
+        "narrow-klass",
+        "conservative",
+        "best-effort",
+        "max-visits-cap",
+        "no-safepoint"
+      ],
       "test_modules": [
         "tests/jvm/modules/for_each_instance.cpp"
       ],
@@ -1621,7 +1670,7 @@
       "slug": "for_each_loaded_class",
       "title": "For Each Loaded Class",
       "category": "enumeration",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/for_each_loaded_class-specialist.md",
       "depends_on": [
@@ -1632,7 +1681,15 @@
         "for_each_instance",
         "for_each_thread"
       ],
-      "tags": [],
+      "tags": [
+        "enumeration",
+        "class-loader-data-graph",
+        "snapshot",
+        "internal-name",
+        "system-dictionary",
+        "symbol-decode",
+        "safety-caps"
+      ],
       "test_modules": [
         "tests/jvm/modules/for_each_loaded_class.cpp"
       ],
@@ -1651,7 +1708,7 @@
       "slug": "for_each_thread",
       "title": "For Each Thread",
       "category": "enumeration",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/for_each_thread-specialist.md",
       "depends_on": [
@@ -1661,7 +1718,16 @@
         "for_each_instance",
         "for_each_loaded_class"
       ],
-      "tags": [],
+      "tags": [
+        "enumeration",
+        "java-thread",
+        "thread-list",
+        "threads-smr",
+        "dedup",
+        "osthread",
+        "runaway-cap",
+        "is-valid-pointer"
+      ],
       "test_modules": [
         "tests/jvm/modules/for_each_thread.cpp"
       ],
@@ -1680,16 +1746,27 @@
       "slug": "global_ref",
       "title": "Global Ref",
       "category": "jni",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/global_ref-specialist.md",
       "depends_on": [
         "jni_local_ref_hygiene"
       ],
       "related": [
-        "make_java_string"
+        "make_java_string",
+        "find_class_context_loader"
       ],
-      "tags": [],
+      "tags": [
+        "jni",
+        "global-ref",
+        "gc-survival",
+        "move-only",
+        "raii",
+        "handle-tag-mask",
+        "new-global-ref",
+        "delete-global-ref",
+        "pin"
+      ],
       "test_modules": [
         "tests/jvm/modules/global_ref.cpp",
         "tests/test_global_ref.cpp"
@@ -1763,8 +1840,8 @@
       "slug": "hook_chaining",
       "title": "Hook Chaining",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/hook_chaining-specialist.md",
       "depends_on": [
         "hook_basic",
@@ -1779,7 +1856,17 @@
         "hook_reinstall_after_shutdown",
         "hook_signature"
       ],
-      "tags": [],
+      "tags": [
+        "hook",
+        "chaining",
+        "shared-i2i-stub",
+        "demux",
+        "one-trampoline-per-entry",
+        "first-match",
+        "per-method-counts",
+        "single-entry-drop",
+        "install-order-independence"
+      ],
       "test_modules": [
         "tests/jvm/modules/hook_chaining.cpp"
       ],
@@ -1798,8 +1885,8 @@
       "slug": "hook_common_detour_dispatch",
       "title": "Hook Common Detour Dispatch",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "critical",
       "specialist": ".claude/agents/hook_common_detour_dispatch-specialist.md",
       "depends_on": [
         "seh_invoke_detour",
@@ -1808,10 +1895,22 @@
       ],
       "related": [
         "hook_basic",
+        "hook_chaining",
         "adapter_recovery_c2i",
         "hook_install_after_jit"
       ],
-      "tags": [],
+      "tags": [
+        "hook",
+        "dispatch",
+        "common-detour",
+        "hot-path",
+        "lock-free",
+        "first-match",
+        "seh-firewall",
+        "critical-path",
+        "shutdown-bail",
+        "thread-guard"
+      ],
       "test_modules": [],
       "audit_docs": [],
       "java_versions": [
@@ -1828,8 +1927,8 @@
       "slug": "hook_install_after_jit",
       "title": "Hook Install After Jit",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/hook_install_after_jit-specialist.md",
       "depends_on": [
         "hook_basic",
@@ -1845,11 +1944,22 @@
         "hook_common_detour_dispatch",
         "hook_reinstall_after_shutdown"
       ],
-      "tags": [],
+      "tags": [
+        "hook",
+        "deopt-on-install",
+        "jit",
+        "method-code",
+        "entry-point-redirect",
+        "c2i-adapter",
+        "interpreter-routing",
+        "after-jit"
+      ],
       "test_modules": [
         "tests/jvm/modules/hook_install_after_jit.cpp"
       ],
-      "audit_docs": [],
+      "audit_docs": [
+        "audit/findings/hook_install_after_jit.md"
+      ],
       "java_versions": [
         8,
         11,
@@ -1864,8 +1974,8 @@
       "slug": "hook_reinstall_after_shutdown",
       "title": "Hook Reinstall After Shutdown",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/hook_reinstall_after_shutdown-specialist.md",
       "depends_on": [
         "shutdown_hooks_teardown",
@@ -1879,7 +1989,16 @@
         "hook_signature",
         "hook_verify_repair"
       ],
-      "tags": [],
+      "tags": [
+        "hook",
+        "lifecycle",
+        "revive",
+        "reversible-shutdown",
+        "latch-reset",
+        "watchdog-respawn",
+        "shutdown-bail",
+        "idempotent"
+      ],
       "test_modules": [
         "tests/jvm/modules/hook_reinstall_after_shutdown.cpp"
       ],
@@ -1898,7 +2017,7 @@
       "slug": "hook_signature",
       "title": "Hook Signature",
       "category": "hook",
-      "status": "seeded",
+      "status": "in_progress",
       "risk": "medium",
       "specialist": ".claude/agents/hook_signature-specialist.md",
       "depends_on": [
@@ -1914,11 +2033,21 @@
         "hook_reinstall_after_shutdown",
         "hook_unhook_double_free"
       ],
-      "tags": [],
+      "tags": [
+        "hook",
+        "signature",
+        "overload-selection",
+        "jvm-descriptor",
+        "return-type-in-descriptor",
+        "slot-table",
+        "install"
+      ],
       "test_modules": [
         "tests/jvm/modules/hook_signature.cpp"
       ],
-      "audit_docs": [],
+      "audit_docs": [
+        "audit/findings/hook_explicit_signature_install.md"
+      ],
       "java_versions": [
         8,
         11,
@@ -1933,8 +2062,8 @@
       "slug": "hook_unhook_double_free",
       "title": "Hook Unhook Double Free",
       "category": "hook",
-      "status": "seeded",
-      "risk": "medium",
+      "status": "in_progress",
+      "risk": "high",
       "specialist": ".claude/agents/hook_unhook_double_free-specialist.md",
       "depends_on": [
         "hook_basic",
@@ -1948,7 +2077,17 @@
         "hook_signature",
         "hook_verify_repair"
       ],
-      "tags": [],
+      "tags": [
+        "hook",
+        "lifecycle",
+        "uninstall",
+        "double-free",
+        "use-after-free",
+        "idempotent-stop",
+        "structural-restore",
+        "move-only",
+        "raii"
+      ],
       "test_modules": [
         "tests/jvm/modules/hook_unhook_double_free.cpp"
       ],
@@ -2011,11 +2150,23 @@
       "title": "Hw Breakpoint Dr7",
       "category": "os",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "low",
       "specialist": ".claude/agents/hw_breakpoint_dr7-specialist.md",
       "depends_on": [],
-      "related": [],
-      "tags": [],
+      "related": [
+        "watch_static_field"
+      ],
+      "tags": [
+        "os",
+        "hardware-breakpoint",
+        "dr7",
+        "debug-register",
+        "bit-mask",
+        "x86_64",
+        "windows-only",
+        "watch-static-field",
+        "compile-time-gated"
+      ],
       "test_modules": [],
       "audit_docs": [],
       "java_versions": [
@@ -2033,7 +2184,7 @@
       "title": "Instanceklass Methods Walk",
       "category": "klass",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/instanceklass_methods_walk-specialist.md",
       "depends_on": [
         "vmstructs_offset_resolution"
@@ -2045,7 +2196,15 @@
         "find_class_fallback",
         "klass_introspection"
       ],
-      "tags": [],
+      "tags": [
+        "klass",
+        "method",
+        "enumeration",
+        "array-layout",
+        "abi",
+        "vmstructs",
+        "x86_64"
+      ],
       "test_modules": [
         "tests/jvm/modules/instanceklass_methods_walk.cpp"
       ],
@@ -2076,7 +2235,15 @@
         "nested_classes",
         "poly_inherited_oop"
       ],
-      "tags": [],
+      "tags": [
+        "klass",
+        "polymorphism",
+        "interface",
+        "runtime-type",
+        "vtable",
+        "compressed-klass",
+        "default-method"
+      ],
       "test_modules": [
         "tests/jvm/modules/interface_polymorphism.cpp"
       ],
@@ -2096,12 +2263,39 @@
       "title": "Interpreter Frame Walk",
       "category": "return",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/interpreter_frame_walk-specialist.md",
-      "depends_on": [],
-      "related": [],
-      "tags": [],
-      "test_modules": [],
+      "depends_on": [
+        "vmstructs_offset_resolution",
+        "decode_oop_and_pointers",
+        "os_safe_read"
+      ],
+      "related": [
+        "return_caller",
+        "return_stack_trace_depth",
+        "return_frame_raw_access",
+        "return_set_arg",
+        "traits_function_traits"
+      ],
+      "tags": [
+        "return",
+        "frame",
+        "interpreter",
+        "saved-rbp",
+        "slot-model",
+        "two-slot",
+        "locals",
+        "x86_64",
+        "stack-walk"
+      ],
+      "test_modules": [
+        "tests/test_interpreter_frame_walk.cpp",
+        "tests/test_traits.cpp",
+        "tests/test_traits_extra.cpp",
+        "tests/test_helpers.cpp",
+        "tests/jvm/modules/return_frame_raw_access.cpp",
+        "tests/jvm/modules/return_stack_trace_depth.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -2118,11 +2312,24 @@
       "title": "Iterate Entries Safety",
       "category": "enumeration",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/iterate_entries_safety-specialist.md",
-      "depends_on": [],
-      "related": [],
-      "tags": [],
+      "depends_on": [
+        "vmstructs_offset_resolution"
+      ],
+      "related": [
+        "vmstructs_offset_resolution",
+        "for_each_loaded_class"
+      ],
+      "tags": [
+        "enumeration",
+        "vmstructs",
+        "safety",
+        "bounds",
+        "null-guard",
+        "abi",
+        "foundation"
+      ],
       "test_modules": [
         "tests/test_iterate_entries_safety.cpp"
       ],
@@ -2147,10 +2354,26 @@
       "depends_on": [
         "signature_parsing"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "jni_local_ref_hygiene",
+        "method_call_wide_args",
+        "make_unique",
+        "make_java_string",
+        "read_java_string"
+      ],
+      "tags": [
+        "jni",
+        "arg-packing",
+        "jvalue",
+        "union",
+        "local-ref",
+        "descriptor",
+        "little-endian"
+      ],
       "test_modules": [
-        "tests/test_jni_arg_packing.cpp"
+        "tests/test_jni_arg_packing.cpp",
+        "tests/jvm/modules/method_call_wide_args.cpp",
+        "tests/jvm/modules/jni_local_ref_hygiene.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -2168,15 +2391,34 @@
       "title": "Jni Local Ref Hygiene",
       "category": "jni",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/jni_local_ref_hygiene-specialist.md",
-      "depends_on": [],
-      "related": [],
-      "tags": [],
+      "depends_on": [
+        "jni_arg_packing"
+      ],
+      "related": [
+        "jni_arg_packing",
+        "method_call_string",
+        "method_call_object",
+        "return_set_arg",
+        "make_unique"
+      ],
+      "tags": [
+        "jni",
+        "local-ref",
+        "lifecycle",
+        "delete-local-ref",
+        "leak",
+        "safety",
+        "detour"
+      ],
       "test_modules": [
         "tests/jvm/modules/jni_local_ref_hygiene.cpp"
       ],
-      "audit_docs": [],
+      "audit_docs": [
+        "audit/findings/jni_delete_local_ref_table_slot_23.md",
+        "audit/findings/method_proxy_call_jni_local_ref_leaks.md"
+      ],
       "java_versions": [
         8,
         11,
@@ -2192,7 +2434,7 @@
       "title": "Klass Introspection",
       "category": "klass",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/klass_introspection-specialist.md",
       "depends_on": [
         "vmstructs_offset_resolution",
@@ -2204,12 +2446,27 @@
         "compressed_oops_decode",
         "constantpool_access",
         "find_class_fallback",
-        "instanceklass_methods_walk"
+        "instanceklass_methods_walk",
+        "method_enumeration",
+        "find_methods_by_signature",
+        "field_introspection"
       ],
-      "tags": [],
+      "tags": [
+        "klass",
+        "introspection",
+        "method",
+        "field",
+        "descriptor",
+        "vmstructs",
+        "unsigned5",
+        "x86_64"
+      ],
       "test_modules": [
         "tests/jvm/modules/klass_introspection.cpp",
-        "tests/jvm/modules/klass_introspection_shapes.cpp"
+        "tests/jvm/modules/klass_introspection_shapes.cpp",
+        "tests/jvm/modules/method_enumeration.cpp",
+        "tests/jvm/modules/find_methods_by_signature.cpp",
+        "tests/test_method_enumeration.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -2227,13 +2484,23 @@
       "title": "Logging Format",
       "category": "infra",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "low",
       "specialist": ".claude/agents/logging_format-specialist.md",
       "depends_on": [],
       "related": [],
-      "tags": [],
+      "tags": [
+        "infra",
+        "logging",
+        "std-format",
+        "no-jvm",
+        "host-cpp",
+        "never-throw",
+        "thread-safe"
+      ],
       "test_modules": [
-        "tests/test_logging_format.cpp"
+        "tests/test_logging_format.cpp",
+        "tests/test_logging_logfile.cpp",
+        "tests/test_logging_logfile_unwritable.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -2251,13 +2518,30 @@
       "title": "Make Java Array",
       "category": "jni",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/make_java_array-specialist.md",
       "depends_on": [
-        "jni_arg_packing"
+        "find_class_fallback",
+        "compressed_klass_decode",
+        "compressed_oops_decode"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "make_java_string",
+        "make_unique",
+        "field_arrays_primitive",
+        "field_arrays_object",
+        "array_element_helpers"
+      ],
+      "tags": [
+        "jni",
+        "array",
+        "allocation",
+        "tlab",
+        "arrayoop",
+        "compressed-oops",
+        "jdk8-fallback",
+        "x86_64"
+      ],
       "test_modules": [
         "tests/jvm/modules/make_java_array.cpp"
       ],
@@ -2315,13 +2599,30 @@
       "title": "Make Unique",
       "category": "infra",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/make_unique-specialist.md",
       "depends_on": [
-        "wrapper_pattern"
+        "wrapper_pattern",
+        "jni_arg_packing",
+        "register_class"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "jni_arg_packing",
+        "jni_local_ref_hygiene",
+        "make_java_array",
+        "make_java_string",
+        "method_call_object"
+      ],
+      "tags": [
+        "infra",
+        "object",
+        "allocation",
+        "newobjecta",
+        "tlab",
+        "construct",
+        "jni",
+        "register-class"
+      ],
       "test_modules": [
         "tests/jvm/modules/make_unique.cpp",
         "tests/test_make_unique.cpp"
@@ -2342,7 +2643,7 @@
       "title": "Method Call Jni Fallback",
       "category": "method",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/method_call_jni_fallback-specialist.md",
       "depends_on": [
         "method_call_primitives",
@@ -2357,7 +2658,16 @@
         "method_return_types",
         "method_static"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "call",
+        "jni",
+        "fallback",
+        "local-ref",
+        "jvalue",
+        "call-stub",
+        "cache"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_call_jni_fallback.cpp"
       ],
@@ -2377,11 +2687,13 @@
       "title": "Method Call Object",
       "category": "method",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/method_call_object-specialist.md",
       "depends_on": [
         "method_call_primitives",
-        "wrapper_pattern"
+        "method_proxy_value_t",
+        "wrapper_pattern",
+        "decode_oop_and_pointers"
       ],
       "related": [
         "method_call_jni_fallback",
@@ -2389,9 +2701,19 @@
         "method_call_string",
         "method_call_wide_args",
         "method_proxy_value_t",
-        "method_return_types"
+        "method_return_types",
+        "field_object_ref"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "call",
+        "object",
+        "reference",
+        "unique-ptr",
+        "compressed-oop",
+        "call-jni",
+        "jdk21"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_call_object.cpp"
       ],
@@ -2415,13 +2737,27 @@
       "specialist": ".claude/agents/method_call_primitives-specialist.md",
       "depends_on": [
         "method_proxy_value_t",
-        "method_enumeration"
+        "method_enumeration",
+        "jni_arg_packing"
       ],
       "related": [
         "find_methods_by_signature",
-        "method_explicit_signature"
+        "method_explicit_signature",
+        "method_return_types",
+        "method_call_wide_args",
+        "method_call_jni_fallback",
+        "method_call_return_void"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "call",
+        "primitives",
+        "value-t",
+        "call-stub",
+        "call-jni",
+        "basictype",
+        "void"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_call_primitives.cpp"
       ],
@@ -2444,7 +2780,8 @@
       "risk": "medium",
       "specialist": ".claude/agents/method_call_return_void-specialist.md",
       "depends_on": [
-        "method_call_primitives"
+        "method_call_primitives",
+        "method_proxy_value_t"
       ],
       "related": [
         "method_call_jni_fallback",
@@ -2454,7 +2791,16 @@
         "method_return_types",
         "method_static"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "call",
+        "void",
+        "monostate",
+        "is-void",
+        "call-stub",
+        "call-jni",
+        "nonvirtual"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_call_return_void.cpp"
       ],
@@ -2474,12 +2820,13 @@
       "title": "Method Call String",
       "category": "method",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/method_call_string-specialist.md",
       "depends_on": [
         "method_call_primitives",
         "make_java_string",
-        "read_java_string"
+        "read_java_string",
+        "jni_local_ref_hygiene"
       ],
       "related": [
         "method_call_jni_fallback",
@@ -2487,9 +2834,20 @@
         "method_call_return_void",
         "method_call_wide_args",
         "method_return_types",
-        "method_static"
+        "method_static",
+        "field_string"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "call",
+        "string",
+        "utf-8",
+        "modified-utf8",
+        "cesu-8",
+        "read-java-string",
+        "call-jni",
+        "decode-divergence"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_call_string.cpp"
       ],
@@ -2513,7 +2871,8 @@
       "specialist": ".claude/agents/method_call_wide_args-specialist.md",
       "depends_on": [
         "method_call_primitives",
-        "jni_arg_packing"
+        "jni_arg_packing",
+        "method_overload"
       ],
       "related": [
         "method_call_jni_fallback",
@@ -2523,7 +2882,17 @@
         "method_return_types",
         "method_static"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "call",
+        "wide-args",
+        "two-slot",
+        "long",
+        "double",
+        "overload",
+        "call-stub",
+        "call-jni"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_call_wide_args.cpp"
       ],
@@ -2543,15 +2912,32 @@
       "title": "Method Entry Points I2I I2C",
       "category": "hook",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "critical",
       "specialist": ".claude/agents/method_entry_points_i2i_i2c-specialist.md",
       "depends_on": [
-        "vmstructs_offset_resolution"
+        "vmstructs_offset_resolution",
+        "iterate_entries_safety"
       ],
       "related": [
-        "adapter_recovery_c2i"
+        "adapter_recovery_c2i",
+        "deoptimize_methods",
+        "hook_basic",
+        "hook_verify_repair",
+        "classloader_reanchor",
+        "midi2i_trampoline_alloc",
+        "method_flags_width"
       ],
-      "tags": [],
+      "tags": [
+        "hook",
+        "method",
+        "entry-point",
+        "i2i",
+        "c2i",
+        "adapter",
+        "deopt",
+        "vmstructs",
+        "x86_64"
+      ],
       "test_modules": [],
       "audit_docs": [],
       "java_versions": [
@@ -2569,16 +2955,32 @@
       "title": "Method Enumeration",
       "category": "method",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/method_enumeration-specialist.md",
       "depends_on": [
-        "instanceklass_methods_walk"
+        "instanceklass_methods_walk",
+        "klass_introspection",
+        "signature_parsing"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "find_methods_by_signature",
+        "klass_introspection",
+        "hook_signature",
+        "method_explicit_signature"
+      ],
+      "tags": [
+        "method",
+        "enumeration",
+        "descriptor",
+        "hook-by-signature",
+        "obfuscation",
+        "declared-only",
+        "no-jvm"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_enumeration.cpp",
-        "tests/test_method_enumeration.cpp"
+        "tests/test_method_enumeration.cpp",
+        "tests/jvm/modules/find_methods_by_signature.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -2606,9 +3008,18 @@
         "find_methods_by_signature",
         "method_call_primitives",
         "method_is_reference",
-        "method_overload"
+        "method_overload",
+        "method_static"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "explicit-signature",
+        "overload",
+        "descriptor",
+        "exact-match",
+        "pinned",
+        "superclass-walk"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_explicit_signature.cpp"
       ],
@@ -2628,13 +3039,26 @@
       "title": "Method Flags Width",
       "category": "method",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/method_flags_width-specialist.md",
       "depends_on": [
         "vmstructs_offset_resolution"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "method_static",
+        "method_entry_points_i2i_i2c",
+        "iterate_entries_safety"
+      ],
+      "tags": [
+        "method",
+        "flags",
+        "access-flags",
+        "width",
+        "abi",
+        "dont-inline",
+        "no-compile",
+        "vmstructs"
+      ],
       "test_modules": [
         "tests/test_method_flags_width.cpp"
       ],
@@ -2654,7 +3078,7 @@
       "title": "Method Is Reference",
       "category": "method",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "low",
       "specialist": ".claude/agents/method_is_reference-specialist.md",
       "depends_on": [
         "signature_parsing"
@@ -2662,9 +3086,17 @@
       "related": [
         "find_methods_by_signature",
         "method_explicit_signature",
-        "method_overload"
+        "method_overload",
+        "method_proxy_value_t"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "is-reference",
+        "introspection",
+        "descriptor",
+        "metadata",
+        "call-free"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_is_reference.cpp"
       ],
@@ -2684,18 +3116,29 @@
       "title": "Method Overload",
       "category": "method",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/method_overload-specialist.md",
       "depends_on": [
         "signature_parsing",
-        "method_explicit_signature"
+        "method_explicit_signature",
+        "method_enumeration"
       ],
       "related": [
         "find_methods_by_signature",
         "method_explicit_signature",
-        "method_is_reference"
+        "method_is_reference",
+        "method_overload_java_dispatch",
+        "method_static"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "overload",
+        "resolution",
+        "descriptor",
+        "argument-matching",
+        "wildcard",
+        "static"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_overload.cpp"
       ],
@@ -2718,10 +3161,25 @@
       "risk": "medium",
       "specialist": ".claude/agents/method_overload_java_dispatch-specialist.md",
       "depends_on": [
-        "method_overload"
+        "method_overload",
+        "method_call_primitives",
+        "method_call_string"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "method_overload",
+        "method_explicit_signature",
+        "find_methods_by_signature",
+        "method_return_types"
+      ],
+      "tags": [
+        "method",
+        "overload",
+        "dispatch",
+        "java-readback",
+        "resolution",
+        "side-effect",
+        "cross-check"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_overload_java_dispatch.cpp"
       ],
@@ -2744,12 +3202,27 @@
       "risk": "medium",
       "specialist": ".claude/agents/method_proxy_value_t-specialist.md",
       "depends_on": [
-        "wrapper_pattern"
+        "wrapper_pattern",
+        "decode_oop_and_pointers",
+        "read_java_string"
       ],
       "related": [
-        "method_call_object"
+        "method_call_object",
+        "method_call_string",
+        "method_call_primitives",
+        "method_return_types",
+        "method_is_reference",
+        "field_proxy_value_t"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "value-t",
+        "variant",
+        "conversion",
+        "no-jvm",
+        "as-string",
+        "compressed-oop"
+      ],
       "test_modules": [
         "tests/test_method_proxy_value_t.cpp"
       ],
@@ -2772,7 +3245,10 @@
       "risk": "medium",
       "specialist": ".claude/agents/method_return_types-specialist.md",
       "depends_on": [
-        "method_call_primitives"
+        "method_call_primitives",
+        "method_proxy_value_t",
+        "read_java_string",
+        "decode_oop_and_pointers"
       ],
       "related": [
         "method_call_jni_fallback",
@@ -2782,7 +3258,16 @@
         "method_call_wide_args",
         "method_static"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "call",
+        "return-types",
+        "value-t",
+        "basictype",
+        "decode",
+        "call-stub",
+        "call-jni"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_return_types.cpp"
       ],
@@ -2802,10 +3287,11 @@
       "title": "Method Static",
       "category": "method",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/method_static-specialist.md",
       "depends_on": [
-        "method_call_primitives"
+        "method_call_primitives",
+        "method_proxy_value_t"
       ],
       "related": [
         "method_call_jni_fallback",
@@ -2813,9 +3299,19 @@
         "method_call_return_void",
         "method_call_string",
         "method_call_wide_args",
-        "method_return_types"
+        "method_return_types",
+        "method_static_portability",
+        "method_overload"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "static",
+        "no-receiver",
+        "callstatic",
+        "pool-holder",
+        "is-static",
+        "slot-0"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_static.cpp"
       ],
@@ -2838,10 +3334,25 @@
       "risk": "medium",
       "specialist": ".claude/agents/method_static_portability-specialist.md",
       "depends_on": [
-        "method_static"
+        "method_static",
+        "method_call_primitives"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "method_static",
+        "method_overload",
+        "method_return_types",
+        "method_call_wide_args"
+      ],
+      "tags": [
+        "method",
+        "static",
+        "portability",
+        "compiler",
+        "deducing-this",
+        "slot-0",
+        "call-stub",
+        "call-jni"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_static_portability.cpp"
       ],
@@ -2861,11 +3372,12 @@
       "title": "Method Throwing Call Site",
       "category": "method",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/method_throwing_call_site-specialist.md",
       "depends_on": [
         "method_call_primitives",
-        "on_exception"
+        "on_exception",
+        "method_explicit_signature"
       ],
       "related": [
         "method_call_jni_fallback",
@@ -2873,9 +3385,19 @@
         "method_call_return_void",
         "method_call_string",
         "method_call_wide_args",
-        "method_return_types"
+        "method_return_types",
+        "on_exception"
       ],
-      "tags": [],
+      "tags": [
+        "method",
+        "call",
+        "exception",
+        "throwing",
+        "crash-safety",
+        "exception-clear",
+        "call-stub",
+        "call-jni"
+      ],
       "test_modules": [
         "tests/jvm/modules/method_throwing_call_site.cpp"
       ],
@@ -2895,7 +3417,7 @@
       "title": "Midi2I Trampoline Alloc",
       "category": "hook",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "critical",
       "specialist": ".claude/agents/midi2i_trampoline_alloc-specialist.md",
       "depends_on": [
         "os_allocate_release",
@@ -2903,9 +3425,26 @@
         "os_query_region",
         "os_page_size_granularity"
       ],
-      "related": [],
-      "tags": [],
-      "test_modules": [],
+      "related": [
+        "hook_basic",
+        "hook_chaining",
+        "hook_verify_repair",
+        "method_entry_points_i2i_i2c",
+        "seh_invoke_detour"
+      ],
+      "tags": [
+        "hook",
+        "trampoline",
+        "i2i",
+        "rel32",
+        "executable-alloc",
+        "reachability",
+        "chaining",
+        "x86_64"
+      ],
+      "test_modules": [
+        "tests/test_midi2i_trampoline_alloc.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -2925,14 +3464,21 @@
       "risk": "medium",
       "specialist": ".claude/agents/nested_classes-specialist.md",
       "depends_on": [
-        "klass_introspection"
+        "klass_introspection",
+        "find_class_fallback"
       ],
       "related": [
         "find_class_fallback",
         "interface_polymorphism",
-        "poly_inherited_oop"
+        "poly_inherited_oop",
+        "register_class"
       ],
-      "tags": [],
+      "tags": [
+        "klass",
+        "introspection",
+        "oop",
+        "composition"
+      ],
       "test_modules": [
         "tests/jvm/modules/nested_classes.cpp"
       ],
@@ -2959,9 +3505,15 @@
       ],
       "related": [
         "on_exception",
-        "shutdown_hooks_teardown"
+        "shutdown_hooks_teardown",
+        "read_java_string"
       ],
-      "tags": [],
+      "tags": [
+        "lifecycle",
+        "hook",
+        "callback",
+        "event-driven"
+      ],
       "test_modules": [
         "tests/jvm/modules/on_class_loaded.cpp"
       ],
@@ -2988,9 +3540,15 @@
       ],
       "related": [
         "on_class_loaded",
-        "shutdown_hooks_teardown"
+        "shutdown_hooks_teardown",
+        "klass_introspection"
       ],
-      "tags": [],
+      "tags": [
+        "lifecycle",
+        "hook",
+        "callback",
+        "event-driven"
+      ],
       "test_modules": [
         "tests/jvm/modules/on_exception.cpp"
       ],
@@ -3010,12 +3568,28 @@
       "title": "Os Allocate Release",
       "category": "os",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/os_allocate_release-specialist.md",
-      "depends_on": [],
-      "related": [],
-      "tags": [],
-      "test_modules": [],
+      "depends_on": [
+        "os_page_size_granularity"
+      ],
+      "related": [
+        "os_protect",
+        "os_query_region",
+        "midi2i_trampoline_alloc"
+      ],
+      "tags": [
+        "os",
+        "memory",
+        "x86_64",
+        "arm64",
+        "safety"
+      ],
+      "test_modules": [
+        "tests/test_os_layer.cpp",
+        "tests/test_os_release_and_protect_edges.cpp",
+        "tests/test_os_protect_interaction.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -3035,10 +3609,20 @@
       "risk": "medium",
       "specialist": ".claude/agents/os_page_size_granularity-specialist.md",
       "depends_on": [],
-      "related": [],
-      "tags": [],
+      "related": [
+        "os_allocate_release",
+        "os_protect",
+        "midi2i_trampoline_alloc"
+      ],
+      "tags": [
+        "os",
+        "memory",
+        "x86_64",
+        "arm64"
+      ],
       "test_modules": [
-        "tests/test_os_page_size_granularity.cpp"
+        "tests/test_os_page_size_granularity.cpp",
+        "tests/test_os_layer.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -3056,12 +3640,28 @@
       "title": "Os Protect",
       "category": "os",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/os_protect-specialist.md",
-      "depends_on": [],
-      "related": [],
-      "tags": [],
-      "test_modules": [],
+      "depends_on": [
+        "os_page_size_granularity"
+      ],
+      "related": [
+        "os_allocate_release",
+        "os_query_region",
+        "os_safe_read"
+      ],
+      "tags": [
+        "os",
+        "memory",
+        "x86_64",
+        "arm64",
+        "safety"
+      ],
+      "test_modules": [
+        "tests/test_os_protect_interaction.cpp",
+        "tests/test_os_release_and_protect_edges.cpp",
+        "tests/test_os_layer.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -3081,9 +3681,22 @@
       "risk": "medium",
       "specialist": ".claude/agents/os_query_region-specialist.md",
       "depends_on": [],
-      "related": [],
-      "tags": [],
-      "test_modules": [],
+      "related": [
+        "os_protect",
+        "os_allocate_release",
+        "midi2i_trampoline_alloc"
+      ],
+      "tags": [
+        "os",
+        "memory",
+        "x86_64",
+        "arm64"
+      ],
+      "test_modules": [
+        "tests/test_os_query_region.cpp",
+        "tests/test_os_protect_interaction.cpp",
+        "tests/test_os_layer.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -3100,14 +3713,27 @@
       "title": "Os Safe Read",
       "category": "os",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "critical",
       "specialist": ".claude/agents/os_safe_read-specialist.md",
       "depends_on": [
         "os_signal_handler"
       ],
-      "related": [],
-      "tags": [],
-      "test_modules": [],
+      "related": [
+        "os_protect",
+        "os_query_region",
+        "os_page_size_granularity"
+      ],
+      "tags": [
+        "os",
+        "memory",
+        "safety",
+        "x86_64",
+        "arm64"
+      ],
+      "test_modules": [
+        "tests/test_os_safe_read.cpp",
+        "tests/test_os_protect_interaction.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -3124,12 +3750,25 @@
       "title": "Os Signal Handler",
       "category": "os",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "critical",
       "specialist": ".claude/agents/os_signal_handler-specialist.md",
       "depends_on": [],
-      "related": [],
-      "tags": [],
-      "test_modules": [],
+      "related": [
+        "os_safe_read",
+        "seh_invoke_detour"
+      ],
+      "tags": [
+        "os",
+        "signals",
+        "safety",
+        "seh",
+        "x86_64",
+        "arm64"
+      ],
+      "test_modules": [
+        "tests/test_os_safe_read.cpp",
+        "tests/test_os_protect_interaction.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -3149,8 +3788,17 @@
       "risk": "medium",
       "specialist": ".claude/agents/platform_capability_macros-specialist.md",
       "depends_on": [],
-      "related": [],
-      "tags": [],
+      "related": [
+        "version_macros",
+        "api_surface_no_jvm"
+      ],
+      "tags": [
+        "infra",
+        "macros",
+        "x86_64",
+        "arm64",
+        "portability"
+      ],
       "test_modules": [
         "tests/test_platform_capability_macros.cpp"
       ],
@@ -3179,9 +3827,16 @@
       "related": [
         "find_class_fallback",
         "interface_polymorphism",
-        "nested_classes"
+        "nested_classes",
+        "field_inherited"
       ],
-      "tags": [],
+      "tags": [
+        "klass",
+        "introspection",
+        "field",
+        "inheritance",
+        "oop"
+      ],
       "test_modules": [
         "tests/jvm/modules/poly_inherited_oop.cpp"
       ],
@@ -3204,10 +3859,20 @@
       "risk": "medium",
       "specialist": ".claude/agents/read_java_string-specialist.md",
       "depends_on": [
-        "compressed_oops_decode"
+        "compressed_oops_decode",
+        "os_safe_read"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "make_java_string",
+        "field_string",
+        "klass_introspection"
+      ],
+      "tags": [
+        "jni",
+        "string",
+        "heap",
+        "safety"
+      ],
       "test_modules": [
         "tests/jvm/modules/read_java_string.cpp"
       ],
@@ -3235,9 +3900,15 @@
       ],
       "related": [
         "classloader_reanchor",
-        "find_class_context_loader"
+        "find_class_context_loader",
+        "hook_basic",
+        "for_each_instance"
       ],
-      "tags": [],
+      "tags": [
+        "klass",
+        "wrapper",
+        "registration"
+      ],
       "test_modules": [
         "tests/jvm/modules/register_class.cpp"
       ],
@@ -3257,10 +3928,11 @@
       "title": "Return Caller",
       "category": "return",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/return_caller-specialist.md",
       "depends_on": [
-        "interpreter_frame_walk"
+        "interpreter_frame_walk",
+        "os_safe_read"
       ],
       "related": [
         "return_frame_raw_access",
@@ -3270,9 +3942,16 @@
         "return_stack_trace_depth",
         "return_value_cancel"
       ],
-      "tags": [],
+      "tags": [
+        "return",
+        "frame",
+        "interpreter",
+        "x86_64",
+        "safety"
+      ],
       "test_modules": [
-        "tests/jvm/modules/return_caller.cpp"
+        "tests/jvm/modules/return_caller.cpp",
+        "tests/test_return_value.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -3290,7 +3969,7 @@
       "title": "Return Frame Raw Access",
       "category": "return",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/return_frame_raw_access-specialist.md",
       "depends_on": [
         "interpreter_frame_walk"
@@ -3303,9 +3982,16 @@
         "return_stack_trace_depth",
         "return_value_cancel"
       ],
-      "tags": [],
+      "tags": [
+        "return",
+        "frame",
+        "interpreter",
+        "x86_64",
+        "advanced"
+      ],
       "test_modules": [
-        "tests/jvm/modules/return_frame_raw_access.cpp"
+        "tests/jvm/modules/return_frame_raw_access.cpp",
+        "tests/test_return_value.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -3323,10 +4009,11 @@
       "title": "Return Set Arg",
       "category": "return",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/return_set_arg-specialist.md",
       "depends_on": [
-        "interpreter_frame_walk"
+        "interpreter_frame_walk",
+        "os_safe_read"
       ],
       "related": [
         "return_caller",
@@ -3336,9 +4023,16 @@
         "return_stack_trace_depth",
         "return_value_cancel"
       ],
-      "tags": [],
+      "tags": [
+        "return",
+        "frame",
+        "interpreter",
+        "x86_64",
+        "safety"
+      ],
       "test_modules": [
-        "tests/jvm/modules/return_set_arg.cpp"
+        "tests/jvm/modules/return_set_arg.cpp",
+        "tests/test_return_value.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -3358,9 +4052,7 @@
       "status": "seeded",
       "risk": "medium",
       "specialist": ".claude/agents/return_set_primitives-specialist.md",
-      "depends_on": [
-        "interpreter_frame_walk"
-      ],
+      "depends_on": [],
       "related": [
         "return_caller",
         "return_frame_raw_access",
@@ -3369,9 +4061,14 @@
         "return_stack_trace_depth",
         "return_value_cancel"
       ],
-      "tags": [],
+      "tags": [
+        "return",
+        "primitives",
+        "x86_64"
+      ],
       "test_modules": [
-        "tests/jvm/modules/return_set_primitives.cpp"
+        "tests/jvm/modules/return_set_primitives.cpp",
+        "tests/test_return_value.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -3392,7 +4089,6 @@
       "risk": "medium",
       "specialist": ".claude/agents/return_set_wrapper_null-specialist.md",
       "depends_on": [
-        "interpreter_frame_walk",
         "wrapper_pattern"
       ],
       "related": [
@@ -3403,9 +4099,15 @@
         "return_stack_trace_depth",
         "return_value_cancel"
       ],
-      "tags": [],
+      "tags": [
+        "return",
+        "oop",
+        "wrapper",
+        "x86_64"
+      ],
       "test_modules": [
-        "tests/jvm/modules/return_set_wrapper_null.cpp"
+        "tests/jvm/modules/return_set_wrapper_null.cpp",
+        "tests/test_return_value.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -3423,11 +4125,12 @@
       "title": "Return Stack Trace Depth",
       "category": "return",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/return_stack_trace_depth-specialist.md",
       "depends_on": [
         "interpreter_frame_walk",
-        "return_caller"
+        "return_caller",
+        "os_safe_read"
       ],
       "related": [
         "return_caller",
@@ -3437,9 +4140,16 @@
         "return_set_wrapper_null",
         "return_value_cancel"
       ],
-      "tags": [],
+      "tags": [
+        "return",
+        "frame",
+        "interpreter",
+        "x86_64",
+        "safety"
+      ],
       "test_modules": [
-        "tests/jvm/modules/return_stack_trace_depth.cpp"
+        "tests/jvm/modules/return_stack_trace_depth.cpp",
+        "tests/test_return_value.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -3459,9 +4169,7 @@
       "status": "seeded",
       "risk": "medium",
       "specialist": ".claude/agents/return_value_cancel-specialist.md",
-      "depends_on": [
-        "interpreter_frame_walk"
-      ],
+      "depends_on": [],
       "related": [
         "return_caller",
         "return_frame_raw_access",
@@ -3470,9 +4178,13 @@
         "return_set_wrapper_null",
         "return_stack_trace_depth"
       ],
-      "tags": [],
+      "tags": [
+        "return",
+        "x86_64"
+      ],
       "test_modules": [
-        "tests/jvm/modules/return_value_cancel.cpp"
+        "tests/jvm/modules/return_value_cancel.cpp",
+        "tests/test_return_value.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -3490,13 +4202,26 @@
       "title": "Seh Invoke Detour",
       "category": "hook",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/seh_invoke_detour-specialist.md",
       "depends_on": [
         "os_signal_handler"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "hook_basic",
+        "wrapper_pattern",
+        "decode_oop_and_pointers"
+      ],
+      "tags": [
+        "seh",
+        "crash-safety",
+        "detour",
+        "exception-handling",
+        "hook",
+        "windows",
+        "toolchain-asymmetric",
+        "safety"
+      ],
       "test_modules": [],
       "audit_docs": [],
       "java_versions": [
@@ -3514,16 +4239,26 @@
       "title": "Shutdown Hooks Teardown",
       "category": "lifecycle",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/shutdown_hooks_teardown-specialist.md",
       "depends_on": [
         "hook_basic"
       ],
       "related": [
         "on_class_loaded",
-        "on_exception"
+        "on_exception",
+        "seh_invoke_detour"
       ],
-      "tags": [],
+      "tags": [
+        "shutdown",
+        "teardown",
+        "reversibility",
+        "lifecycle",
+        "hook",
+        "watchdog",
+        "restore",
+        "safety"
+      ],
       "test_modules": [
         "tests/jvm/modules/shutdown_hooks_teardown.cpp"
       ],
@@ -3546,11 +4281,24 @@
       "risk": "medium",
       "specialist": ".claude/agents/signature_parsing-specialist.md",
       "depends_on": [],
-      "related": [],
-      "tags": [],
+      "related": [
+        "find_methods_by_signature",
+        "make_unique",
+        "field_set_size_guard"
+      ],
+      "tags": [
+        "signature",
+        "descriptor",
+        "basic-type",
+        "jni",
+        "type-mapping",
+        "no-jvm",
+        "method",
+        "field-width"
+      ],
       "test_modules": [
-        "tests/jvm/modules/signature_parsing.cpp",
-        "tests/test_signature_parsing.cpp"
+        "tests/test_signature_parsing.cpp",
+        "tests/jvm/modules/signature_parsing.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -3572,10 +4320,20 @@
       "specialist": ".claude/agents/traits_function_traits-specialist.md",
       "depends_on": [],
       "related": [],
-      "tags": [],
+      "tags": [
+        "traits",
+        "function-traits",
+        "compile-time",
+        "tuple",
+        "slot-offsets",
+        "detour-decode",
+        "no-jvm",
+        "infra"
+      ],
       "test_modules": [
-        "tests/test_traits_function_traits.cpp",
-        "tests/test_traits.cpp"
+        "tests/test_traits.cpp",
+        "tests/test_traits_extra.cpp",
+        "tests/test_traits_function_traits.cpp"
       ],
       "audit_docs": [],
       "java_versions": [
@@ -3598,8 +4356,20 @@
       "depends_on": [
         "method_overload"
       ],
-      "related": [],
-      "tags": [],
+      "related": [
+        "wrapper_pattern",
+        "field_static"
+      ],
+      "tags": [
+        "deducing-this",
+        "explicit-object-parameter",
+        "cpp23",
+        "overload-resolution",
+        "wrapper",
+        "compile-time",
+        "infra",
+        "toolchain-gated"
+      ],
       "test_modules": [
         "tests/test_unified_call_syntax.cpp"
       ],
@@ -3619,11 +4389,19 @@
       "title": "Version Macros",
       "category": "infra",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "low",
       "specialist": ".claude/agents/version_macros-specialist.md",
       "depends_on": [],
       "related": [],
-      "tags": [],
+      "tags": [
+        "version",
+        "semver",
+        "macros",
+        "preprocessor",
+        "infra",
+        "no-jvm",
+        "build-sync"
+      ],
       "test_modules": [
         "tests/test_version_macros.cpp"
       ],
@@ -3643,16 +4421,30 @@
       "title": "Vmstructs Offset Resolution",
       "category": "klass",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/vmstructs_offset_resolution-specialist.md",
       "depends_on": [
         "os_safe_read"
       ],
       "related": [
-        "decode_oop_and_pointers"
+        "decode_oop_and_pointers",
+        "compressed_oops_decode",
+        "compressed_klass_decode",
+        "klass_introspection"
       ],
-      "tags": [],
-      "test_modules": [],
+      "tags": [
+        "vmstructs",
+        "vmtypes",
+        "offset-resolution",
+        "hotspot",
+        "abi-mirror",
+        "klass",
+        "foundational",
+        "jdk-variance"
+      ],
+      "test_modules": [
+        "tests/test_vmstructs_offset_resolution.cpp"
+      ],
       "audit_docs": [],
       "java_versions": [
         8,
@@ -3669,14 +4461,23 @@
       "title": "Watch Static Field",
       "category": "field",
       "status": "seeded",
-      "risk": "medium",
+      "risk": "high",
       "specialist": ".claude/agents/watch_static_field-specialist.md",
       "depends_on": [
         "field_static",
         "hw_breakpoint_dr7"
       ],
       "related": [],
-      "tags": [],
+      "tags": [
+        "watchpoint",
+        "hardware-breakpoint",
+        "debug-registers",
+        "dr0-dr3",
+        "veh",
+        "static-field",
+        "windows",
+        "x86_64"
+      ],
       "test_modules": [
         "tests/jvm/modules/watch_static_field.cpp"
       ],
@@ -4497,6 +5298,16 @@
       "kind": "related"
     },
     {
+      "from": "field_object_ref",
+      "to": "field_string",
+      "kind": "related"
+    },
+    {
+      "from": "field_object_ref",
+      "to": "field_introspection",
+      "kind": "related"
+    },
+    {
       "from": "field_primitives_get",
       "to": "field_introspection",
       "kind": "depends_on"
@@ -4772,6 +5583,11 @@
       "kind": "related"
     },
     {
+      "from": "find_class_fallback",
+      "to": "find_class_context_loader",
+      "kind": "related"
+    },
+    {
       "from": "find_methods_by_signature",
       "to": "signature_parsing",
       "kind": "depends_on"
@@ -4869,6 +5685,11 @@
     {
       "from": "global_ref",
       "to": "make_java_string",
+      "kind": "related"
+    },
+    {
+      "from": "global_ref",
+      "to": "find_class_context_loader",
       "kind": "related"
     },
     {
@@ -5008,6 +5829,11 @@
     },
     {
       "from": "hook_common_detour_dispatch",
+      "to": "hook_chaining",
+      "kind": "related"
+    },
+    {
+      "from": "hook_common_detour_dispatch",
       "to": "adapter_recovery_c2i",
       "kind": "related"
     },
@@ -5227,6 +6053,11 @@
       "kind": "depends_on"
     },
     {
+      "from": "hw_breakpoint_dr7",
+      "to": "watch_static_field",
+      "kind": "related"
+    },
+    {
       "from": "instanceklass_methods_walk",
       "to": "vmstructs_offset_resolution",
       "kind": "depends_on"
@@ -5282,9 +6113,119 @@
       "kind": "related"
     },
     {
+      "from": "interpreter_frame_walk",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "interpreter_frame_walk",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "interpreter_frame_walk",
+      "to": "os_safe_read",
+      "kind": "depends_on"
+    },
+    {
+      "from": "interpreter_frame_walk",
+      "to": "return_caller",
+      "kind": "related"
+    },
+    {
+      "from": "interpreter_frame_walk",
+      "to": "return_stack_trace_depth",
+      "kind": "related"
+    },
+    {
+      "from": "interpreter_frame_walk",
+      "to": "return_frame_raw_access",
+      "kind": "related"
+    },
+    {
+      "from": "interpreter_frame_walk",
+      "to": "return_set_arg",
+      "kind": "related"
+    },
+    {
+      "from": "interpreter_frame_walk",
+      "to": "traits_function_traits",
+      "kind": "related"
+    },
+    {
+      "from": "iterate_entries_safety",
+      "to": "vmstructs_offset_resolution",
+      "kind": "depends_on"
+    },
+    {
+      "from": "iterate_entries_safety",
+      "to": "vmstructs_offset_resolution",
+      "kind": "related"
+    },
+    {
+      "from": "iterate_entries_safety",
+      "to": "for_each_loaded_class",
+      "kind": "related"
+    },
+    {
       "from": "jni_arg_packing",
       "to": "signature_parsing",
       "kind": "depends_on"
+    },
+    {
+      "from": "jni_arg_packing",
+      "to": "jni_local_ref_hygiene",
+      "kind": "related"
+    },
+    {
+      "from": "jni_arg_packing",
+      "to": "method_call_wide_args",
+      "kind": "related"
+    },
+    {
+      "from": "jni_arg_packing",
+      "to": "make_unique",
+      "kind": "related"
+    },
+    {
+      "from": "jni_arg_packing",
+      "to": "make_java_string",
+      "kind": "related"
+    },
+    {
+      "from": "jni_arg_packing",
+      "to": "read_java_string",
+      "kind": "related"
+    },
+    {
+      "from": "jni_local_ref_hygiene",
+      "to": "jni_arg_packing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "jni_local_ref_hygiene",
+      "to": "jni_arg_packing",
+      "kind": "related"
+    },
+    {
+      "from": "jni_local_ref_hygiene",
+      "to": "method_call_string",
+      "kind": "related"
+    },
+    {
+      "from": "jni_local_ref_hygiene",
+      "to": "method_call_object",
+      "kind": "related"
+    },
+    {
+      "from": "jni_local_ref_hygiene",
+      "to": "return_set_arg",
+      "kind": "related"
+    },
+    {
+      "from": "jni_local_ref_hygiene",
+      "to": "make_unique",
+      "kind": "related"
     },
     {
       "from": "klass_introspection",
@@ -5327,9 +6268,59 @@
       "kind": "related"
     },
     {
+      "from": "klass_introspection",
+      "to": "method_enumeration",
+      "kind": "related"
+    },
+    {
+      "from": "klass_introspection",
+      "to": "find_methods_by_signature",
+      "kind": "related"
+    },
+    {
+      "from": "klass_introspection",
+      "to": "field_introspection",
+      "kind": "related"
+    },
+    {
       "from": "make_java_array",
-      "to": "jni_arg_packing",
+      "to": "find_class_fallback",
       "kind": "depends_on"
+    },
+    {
+      "from": "make_java_array",
+      "to": "compressed_klass_decode",
+      "kind": "depends_on"
+    },
+    {
+      "from": "make_java_array",
+      "to": "compressed_oops_decode",
+      "kind": "depends_on"
+    },
+    {
+      "from": "make_java_array",
+      "to": "make_java_string",
+      "kind": "related"
+    },
+    {
+      "from": "make_java_array",
+      "to": "make_unique",
+      "kind": "related"
+    },
+    {
+      "from": "make_java_array",
+      "to": "field_arrays_primitive",
+      "kind": "related"
+    },
+    {
+      "from": "make_java_array",
+      "to": "field_arrays_object",
+      "kind": "related"
+    },
+    {
+      "from": "make_java_array",
+      "to": "array_element_helpers",
+      "kind": "related"
     },
     {
       "from": "make_java_string",
@@ -5345,6 +6336,41 @@
       "from": "make_unique",
       "to": "wrapper_pattern",
       "kind": "depends_on"
+    },
+    {
+      "from": "make_unique",
+      "to": "jni_arg_packing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "make_unique",
+      "to": "register_class",
+      "kind": "depends_on"
+    },
+    {
+      "from": "make_unique",
+      "to": "jni_arg_packing",
+      "kind": "related"
+    },
+    {
+      "from": "make_unique",
+      "to": "jni_local_ref_hygiene",
+      "kind": "related"
+    },
+    {
+      "from": "make_unique",
+      "to": "make_java_array",
+      "kind": "related"
+    },
+    {
+      "from": "make_unique",
+      "to": "make_java_string",
+      "kind": "related"
+    },
+    {
+      "from": "make_unique",
+      "to": "method_call_object",
+      "kind": "related"
     },
     {
       "from": "method_call_jni_fallback",
@@ -5398,7 +6424,17 @@
     },
     {
       "from": "method_call_object",
+      "to": "method_proxy_value_t",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_object",
       "to": "wrapper_pattern",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_object",
+      "to": "decode_oop_and_pointers",
       "kind": "depends_on"
     },
     {
@@ -5432,6 +6468,11 @@
       "kind": "related"
     },
     {
+      "from": "method_call_object",
+      "to": "field_object_ref",
+      "kind": "related"
+    },
+    {
       "from": "method_call_primitives",
       "to": "method_proxy_value_t",
       "kind": "depends_on"
@@ -5439,6 +6480,11 @@
     {
       "from": "method_call_primitives",
       "to": "method_enumeration",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_primitives",
+      "to": "jni_arg_packing",
       "kind": "depends_on"
     },
     {
@@ -5452,8 +6498,33 @@
       "kind": "related"
     },
     {
+      "from": "method_call_primitives",
+      "to": "method_return_types",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_primitives",
+      "to": "method_call_wide_args",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_primitives",
+      "to": "method_call_jni_fallback",
+      "kind": "related"
+    },
+    {
+      "from": "method_call_primitives",
+      "to": "method_call_return_void",
+      "kind": "related"
+    },
+    {
       "from": "method_call_return_void",
       "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_return_void",
+      "to": "method_proxy_value_t",
       "kind": "depends_on"
     },
     {
@@ -5503,6 +6574,11 @@
     },
     {
       "from": "method_call_string",
+      "to": "jni_local_ref_hygiene",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_string",
       "to": "method_call_jni_fallback",
       "kind": "related"
     },
@@ -5532,6 +6608,11 @@
       "kind": "related"
     },
     {
+      "from": "method_call_string",
+      "to": "field_string",
+      "kind": "related"
+    },
+    {
       "from": "method_call_wide_args",
       "to": "method_call_primitives",
       "kind": "depends_on"
@@ -5539,6 +6620,11 @@
     {
       "from": "method_call_wide_args",
       "to": "jni_arg_packing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_call_wide_args",
+      "to": "method_overload",
       "kind": "depends_on"
     },
     {
@@ -5578,13 +6664,78 @@
     },
     {
       "from": "method_entry_points_i2i_i2c",
+      "to": "iterate_entries_safety",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
       "to": "adapter_recovery_c2i",
+      "kind": "related"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "deoptimize_methods",
+      "kind": "related"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "hook_verify_repair",
+      "kind": "related"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "classloader_reanchor",
+      "kind": "related"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "midi2i_trampoline_alloc",
+      "kind": "related"
+    },
+    {
+      "from": "method_entry_points_i2i_i2c",
+      "to": "method_flags_width",
       "kind": "related"
     },
     {
       "from": "method_enumeration",
       "to": "instanceklass_methods_walk",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "signature_parsing",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "find_methods_by_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "klass_introspection",
+      "kind": "related"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "hook_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_enumeration",
+      "to": "method_explicit_signature",
+      "kind": "related"
     },
     {
       "from": "method_explicit_signature",
@@ -5617,9 +6768,29 @@
       "kind": "related"
     },
     {
+      "from": "method_explicit_signature",
+      "to": "method_static",
+      "kind": "related"
+    },
+    {
       "from": "method_flags_width",
       "to": "vmstructs_offset_resolution",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_flags_width",
+      "to": "method_static",
+      "kind": "related"
+    },
+    {
+      "from": "method_flags_width",
+      "to": "method_entry_points_i2i_i2c",
+      "kind": "related"
+    },
+    {
+      "from": "method_flags_width",
+      "to": "iterate_entries_safety",
+      "kind": "related"
     },
     {
       "from": "method_is_reference",
@@ -5642,6 +6813,11 @@
       "kind": "related"
     },
     {
+      "from": "method_is_reference",
+      "to": "method_proxy_value_t",
+      "kind": "related"
+    },
+    {
       "from": "method_overload",
       "to": "signature_parsing",
       "kind": "depends_on"
@@ -5649,6 +6825,11 @@
     {
       "from": "method_overload",
       "to": "method_explicit_signature",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_overload",
+      "to": "method_enumeration",
       "kind": "depends_on"
     },
     {
@@ -5667,9 +6848,49 @@
       "kind": "related"
     },
     {
+      "from": "method_overload",
+      "to": "method_overload_java_dispatch",
+      "kind": "related"
+    },
+    {
+      "from": "method_overload",
+      "to": "method_static",
+      "kind": "related"
+    },
+    {
       "from": "method_overload_java_dispatch",
       "to": "method_overload",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_overload_java_dispatch",
+      "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_overload_java_dispatch",
+      "to": "method_call_string",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_overload_java_dispatch",
+      "to": "method_overload",
+      "kind": "related"
+    },
+    {
+      "from": "method_overload_java_dispatch",
+      "to": "method_explicit_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_overload_java_dispatch",
+      "to": "find_methods_by_signature",
+      "kind": "related"
+    },
+    {
+      "from": "method_overload_java_dispatch",
+      "to": "method_return_types",
+      "kind": "related"
     },
     {
       "from": "method_proxy_value_t",
@@ -5678,12 +6899,62 @@
     },
     {
       "from": "method_proxy_value_t",
+      "to": "decode_oop_and_pointers",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_proxy_value_t",
+      "to": "read_java_string",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_proxy_value_t",
       "to": "method_call_object",
+      "kind": "related"
+    },
+    {
+      "from": "method_proxy_value_t",
+      "to": "method_call_string",
+      "kind": "related"
+    },
+    {
+      "from": "method_proxy_value_t",
+      "to": "method_call_primitives",
+      "kind": "related"
+    },
+    {
+      "from": "method_proxy_value_t",
+      "to": "method_return_types",
+      "kind": "related"
+    },
+    {
+      "from": "method_proxy_value_t",
+      "to": "method_is_reference",
+      "kind": "related"
+    },
+    {
+      "from": "method_proxy_value_t",
+      "to": "field_proxy_value_t",
       "kind": "related"
     },
     {
       "from": "method_return_types",
       "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_return_types",
+      "to": "method_proxy_value_t",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_return_types",
+      "to": "read_java_string",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_return_types",
+      "to": "decode_oop_and_pointers",
       "kind": "depends_on"
     },
     {
@@ -5719,6 +6990,11 @@
     {
       "from": "method_static",
       "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_static",
+      "to": "method_proxy_value_t",
       "kind": "depends_on"
     },
     {
@@ -5752,9 +7028,44 @@
       "kind": "related"
     },
     {
+      "from": "method_static",
+      "to": "method_static_portability",
+      "kind": "related"
+    },
+    {
+      "from": "method_static",
+      "to": "method_overload",
+      "kind": "related"
+    },
+    {
       "from": "method_static_portability",
       "to": "method_static",
       "kind": "depends_on"
+    },
+    {
+      "from": "method_static_portability",
+      "to": "method_call_primitives",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_static_portability",
+      "to": "method_static",
+      "kind": "related"
+    },
+    {
+      "from": "method_static_portability",
+      "to": "method_overload",
+      "kind": "related"
+    },
+    {
+      "from": "method_static_portability",
+      "to": "method_return_types",
+      "kind": "related"
+    },
+    {
+      "from": "method_static_portability",
+      "to": "method_call_wide_args",
+      "kind": "related"
     },
     {
       "from": "method_throwing_call_site",
@@ -5768,6 +7079,11 @@
     },
     {
       "from": "method_throwing_call_site",
+      "to": "method_explicit_signature",
+      "kind": "depends_on"
+    },
+    {
+      "from": "method_throwing_call_site",
       "to": "method_call_jni_fallback",
       "kind": "related"
     },
@@ -5794,6 +7110,11 @@
     {
       "from": "method_throwing_call_site",
       "to": "method_return_types",
+      "kind": "related"
+    },
+    {
+      "from": "method_throwing_call_site",
+      "to": "on_exception",
       "kind": "related"
     },
     {
@@ -5817,8 +7138,38 @@
       "kind": "depends_on"
     },
     {
+      "from": "midi2i_trampoline_alloc",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "hook_chaining",
+      "kind": "related"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "hook_verify_repair",
+      "kind": "related"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "method_entry_points_i2i_i2c",
+      "kind": "related"
+    },
+    {
+      "from": "midi2i_trampoline_alloc",
+      "to": "seh_invoke_detour",
+      "kind": "related"
+    },
+    {
       "from": "nested_classes",
       "to": "klass_introspection",
+      "kind": "depends_on"
+    },
+    {
+      "from": "nested_classes",
+      "to": "find_class_fallback",
       "kind": "depends_on"
     },
     {
@@ -5837,6 +7188,11 @@
       "kind": "related"
     },
     {
+      "from": "nested_classes",
+      "to": "register_class",
+      "kind": "related"
+    },
+    {
       "from": "on_class_loaded",
       "to": "hook_basic",
       "kind": "depends_on"
@@ -5849,6 +7205,11 @@
     {
       "from": "on_class_loaded",
       "to": "shutdown_hooks_teardown",
+      "kind": "related"
+    },
+    {
+      "from": "on_class_loaded",
+      "to": "read_java_string",
       "kind": "related"
     },
     {
@@ -5867,9 +7228,119 @@
       "kind": "related"
     },
     {
+      "from": "on_exception",
+      "to": "klass_introspection",
+      "kind": "related"
+    },
+    {
+      "from": "os_allocate_release",
+      "to": "os_page_size_granularity",
+      "kind": "depends_on"
+    },
+    {
+      "from": "os_allocate_release",
+      "to": "os_protect",
+      "kind": "related"
+    },
+    {
+      "from": "os_allocate_release",
+      "to": "os_query_region",
+      "kind": "related"
+    },
+    {
+      "from": "os_allocate_release",
+      "to": "midi2i_trampoline_alloc",
+      "kind": "related"
+    },
+    {
+      "from": "os_page_size_granularity",
+      "to": "os_allocate_release",
+      "kind": "related"
+    },
+    {
+      "from": "os_page_size_granularity",
+      "to": "os_protect",
+      "kind": "related"
+    },
+    {
+      "from": "os_page_size_granularity",
+      "to": "midi2i_trampoline_alloc",
+      "kind": "related"
+    },
+    {
+      "from": "os_protect",
+      "to": "os_page_size_granularity",
+      "kind": "depends_on"
+    },
+    {
+      "from": "os_protect",
+      "to": "os_allocate_release",
+      "kind": "related"
+    },
+    {
+      "from": "os_protect",
+      "to": "os_query_region",
+      "kind": "related"
+    },
+    {
+      "from": "os_protect",
+      "to": "os_safe_read",
+      "kind": "related"
+    },
+    {
+      "from": "os_query_region",
+      "to": "os_protect",
+      "kind": "related"
+    },
+    {
+      "from": "os_query_region",
+      "to": "os_allocate_release",
+      "kind": "related"
+    },
+    {
+      "from": "os_query_region",
+      "to": "midi2i_trampoline_alloc",
+      "kind": "related"
+    },
+    {
       "from": "os_safe_read",
       "to": "os_signal_handler",
       "kind": "depends_on"
+    },
+    {
+      "from": "os_safe_read",
+      "to": "os_protect",
+      "kind": "related"
+    },
+    {
+      "from": "os_safe_read",
+      "to": "os_query_region",
+      "kind": "related"
+    },
+    {
+      "from": "os_safe_read",
+      "to": "os_page_size_granularity",
+      "kind": "related"
+    },
+    {
+      "from": "os_signal_handler",
+      "to": "os_safe_read",
+      "kind": "related"
+    },
+    {
+      "from": "os_signal_handler",
+      "to": "seh_invoke_detour",
+      "kind": "related"
+    },
+    {
+      "from": "platform_capability_macros",
+      "to": "version_macros",
+      "kind": "related"
+    },
+    {
+      "from": "platform_capability_macros",
+      "to": "api_surface_no_jvm",
+      "kind": "related"
     },
     {
       "from": "poly_inherited_oop",
@@ -5897,9 +7368,34 @@
       "kind": "related"
     },
     {
+      "from": "poly_inherited_oop",
+      "to": "field_inherited",
+      "kind": "related"
+    },
+    {
       "from": "read_java_string",
       "to": "compressed_oops_decode",
       "kind": "depends_on"
+    },
+    {
+      "from": "read_java_string",
+      "to": "os_safe_read",
+      "kind": "depends_on"
+    },
+    {
+      "from": "read_java_string",
+      "to": "make_java_string",
+      "kind": "related"
+    },
+    {
+      "from": "read_java_string",
+      "to": "field_string",
+      "kind": "related"
+    },
+    {
+      "from": "read_java_string",
+      "to": "klass_introspection",
+      "kind": "related"
     },
     {
       "from": "register_class",
@@ -5922,8 +7418,23 @@
       "kind": "related"
     },
     {
+      "from": "register_class",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "register_class",
+      "to": "for_each_instance",
+      "kind": "related"
+    },
+    {
       "from": "return_caller",
       "to": "interpreter_frame_walk",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_caller",
+      "to": "os_safe_read",
       "kind": "depends_on"
     },
     {
@@ -5998,6 +7509,11 @@
     },
     {
       "from": "return_set_arg",
+      "to": "os_safe_read",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_set_arg",
       "to": "return_caller",
       "kind": "related"
     },
@@ -6028,11 +7544,6 @@
     },
     {
       "from": "return_set_primitives",
-      "to": "interpreter_frame_walk",
-      "kind": "depends_on"
-    },
-    {
-      "from": "return_set_primitives",
       "to": "return_caller",
       "kind": "related"
     },
@@ -6060,11 +7571,6 @@
       "from": "return_set_primitives",
       "to": "return_value_cancel",
       "kind": "related"
-    },
-    {
-      "from": "return_set_wrapper_null",
-      "to": "interpreter_frame_walk",
-      "kind": "depends_on"
     },
     {
       "from": "return_set_wrapper_null",
@@ -6113,6 +7619,11 @@
     },
     {
       "from": "return_stack_trace_depth",
+      "to": "os_safe_read",
+      "kind": "depends_on"
+    },
+    {
+      "from": "return_stack_trace_depth",
       "to": "return_caller",
       "kind": "related"
     },
@@ -6140,11 +7651,6 @@
       "from": "return_stack_trace_depth",
       "to": "return_value_cancel",
       "kind": "related"
-    },
-    {
-      "from": "return_value_cancel",
-      "to": "interpreter_frame_walk",
-      "kind": "depends_on"
     },
     {
       "from": "return_value_cancel",
@@ -6182,6 +7688,21 @@
       "kind": "depends_on"
     },
     {
+      "from": "seh_invoke_detour",
+      "to": "hook_basic",
+      "kind": "related"
+    },
+    {
+      "from": "seh_invoke_detour",
+      "to": "wrapper_pattern",
+      "kind": "related"
+    },
+    {
+      "from": "seh_invoke_detour",
+      "to": "decode_oop_and_pointers",
+      "kind": "related"
+    },
+    {
       "from": "shutdown_hooks_teardown",
       "to": "hook_basic",
       "kind": "depends_on"
@@ -6197,9 +7718,39 @@
       "kind": "related"
     },
     {
+      "from": "shutdown_hooks_teardown",
+      "to": "seh_invoke_detour",
+      "kind": "related"
+    },
+    {
+      "from": "signature_parsing",
+      "to": "find_methods_by_signature",
+      "kind": "related"
+    },
+    {
+      "from": "signature_parsing",
+      "to": "make_unique",
+      "kind": "related"
+    },
+    {
+      "from": "signature_parsing",
+      "to": "field_set_size_guard",
+      "kind": "related"
+    },
+    {
       "from": "unified_call_syntax",
       "to": "method_overload",
       "kind": "depends_on"
+    },
+    {
+      "from": "unified_call_syntax",
+      "to": "wrapper_pattern",
+      "kind": "related"
+    },
+    {
+      "from": "unified_call_syntax",
+      "to": "field_static",
+      "kind": "related"
     },
     {
       "from": "vmstructs_offset_resolution",
@@ -6209,6 +7760,21 @@
     {
       "from": "vmstructs_offset_resolution",
       "to": "decode_oop_and_pointers",
+      "kind": "related"
+    },
+    {
+      "from": "vmstructs_offset_resolution",
+      "to": "compressed_oops_decode",
+      "kind": "related"
+    },
+    {
+      "from": "vmstructs_offset_resolution",
+      "to": "compressed_klass_decode",
+      "kind": "related"
+    },
+    {
+      "from": "vmstructs_offset_resolution",
+      "to": "klass_introspection",
       "kind": "related"
     },
     {
