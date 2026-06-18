@@ -257,9 +257,16 @@ jobs:
           # in the GC-survival tests still runs, so GC coverage is preserved
           # (unlike -XX:+UseEpsilonGC, which no-ops System.gc).  -Xmx/-Xmn are
           # universal across JDK 8..26 (no experimental unlock needed).
+          # Bumped 2g/1g -> 4g/3g: as the JVM test suite grew (deepening batches),
+          # the borderline cells (clang·java25, msvc·java11) began stalling
+          # frequently — and after the HashTreeMap rebuild-once fix the stall merely
+          # RELOCATED (collection_hash_tree_map -> collection_list), confirming it is
+          # a general GC-during-walk window, not one module.  A 3g young gen (well
+          # within the 16 GB runners) absorbs far more transient allocation before
+          # any minor GC fires, widening the margin for the whole growing suite.
           $java = Start-Process `
             -FilePath "java" `
-            -ArgumentList "-Xmx2g", "-Xmn1g", "-cp", "out", "vmhook.Main" `
+            -ArgumentList "-Xmx4g", "-Xmn3g", "-cp", "out", "vmhook.Main" `
             -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput "java_stdout.txt" `
             -RedirectStandardError  "java_stderr.txt"
