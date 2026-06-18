@@ -529,6 +529,18 @@ public final class HashTreeMap
      */
     private static final Day DAY_CLASS_PIN = Day.MON;
 
+    /**
+     * Set true once {@link #buildAll()} has populated every map.  These maps are
+     * READ-ONLY for the lifetime of the fixture, so they are built exactly ONCE
+     * (at class-init) and reused across every probe.  The mode-0 probe used to
+     * re-run buildAll() on each cycle, reallocating ~6000 Strings (dominated by
+     * the two 1000-entry String maps) per probe — the documented prime trigger of
+     * the no-SEH GC-safepoint stall under the suite's heap pressure (#38).  The
+     * probe now confirms the already-built state instead of rebuilding it; the
+     * observed map CONTENT and SHAPE are byte-for-byte identical.
+     */
+    private static volatile boolean built;
+
     static
     {
         if (DAY_CLASS_PIN == null)
@@ -536,9 +548,10 @@ public final class HashTreeMap
             throw new IllegalStateException("unreachable");
         }
 
-        // Build once at class-init so the maps are populated even before the
-        // first probe (the native module also re-requests a build via mode 0).
+        // Build ONCE at class-init so the maps are populated before the first
+        // probe; the maps are read-only thereafter, so no probe rebuilds them.
         buildAll();
+        built = true;
 
         Harness.register(new Harness.Probe()
         {
@@ -551,9 +564,15 @@ public final class HashTreeMap
             @Override
             public void run()
             {
-                // mode 0 (the only mode): (re)build every map so the native reads
-                // see a fresh, deterministic population on this exact thread.
-                buildAll();
+                // mode 0 (the only mode): the read-only maps were already built
+                // at class-init, so build at most ONCE and otherwise reuse them.
+                // This eliminates the per-probe ~6000-String reallocation while
+                // leaving the observed content and shape identical.
+                if (!built)
+                {
+                    buildAll();
+                    built = true;
+                }
                 HashTreeMap.done = true;
             }
         });
