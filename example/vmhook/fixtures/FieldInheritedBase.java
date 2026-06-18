@@ -60,6 +60,36 @@ class FieldInheritedBase implements FieldInheritedIface
     public    double  baseDouble = 1.5d;                 // "D"  (exact in IEEE-754)
     public    int[]   baseIntArray = { 11, 22, 33 };     // "[I" (inherited array ref)
 
+    // ---- BOUNDARY / edge-valued inherited slots (depth-2 super walk) --------
+    // Min/max + sign-boundary values for every fixed-width primitive, so the
+    // depth-2 walk's offset read is proven to honour the FULL bit pattern (no
+    // truncation, no spurious sign extension) for each width.  Mirrored verbatim
+    // on the native side.  char is the only UNSIGNED 16-bit slot, so 0xFFFF must
+    // read back as 65535, never -1.
+    public    int     baseIntMin   = Integer.MIN_VALUE;  // 0x80000000
+    public    int     baseIntMax   = Integer.MAX_VALUE;  // 0x7FFFFFFF
+    public    int     baseIntNeg   = -1;                 // 0xFFFFFFFF (all-ones)
+    public    long    baseLongMin  = Long.MIN_VALUE;     // 0x8000000000000000
+    public    long    baseLongMax  = Long.MAX_VALUE;     // 0x7FFFFFFFFFFFFFFF
+    public    byte    baseByteMin  = Byte.MIN_VALUE;     // -128
+    public    byte    baseByteMax  = Byte.MAX_VALUE;     // 127
+    public    byte    baseByteNeg  = (byte) -1;          // 0xFF -> -1 (signed B)
+    public    short   baseShortMin = Short.MIN_VALUE;    // -32768
+    public    short   baseShortMax = Short.MAX_VALUE;    // 32767
+    public    char    baseCharMax  = (char) 0xFFFF;      // 65535 (UNSIGNED)
+    public    char    baseCharZero = (char) 0;           // 0
+    public    float   baseFloatNeg = -123.5f;            // exact, signed
+    public    double  baseDoubleNeg= -987.625d;          // exact, signed
+    public    float   baseFloatZero= 0.0f;               // +0.0
+    public    double  baseDoubleBig= 1.0e300d;           // exact-ish large magnitude
+
+    // Inherited REFERENCE ARRAY of String ("[Ljava/lang/String;"), so the
+    // depth-2 walk is proven for an OBJECT-array OOP decode (not only "[I").
+    public    String[] baseStrArray = { "alpha", "beta", "gamma" };
+
+    // Inherited reference array of int[][] is overkill for heap; a single inner
+    // String[] suffices to exercise the object-array element decode.
+
     // ---- STATIC fields at every access level -------------------------------
     protected static int sProtected = STAT_PROT_INIT;
     public    static int sPublic    = STAT_PUB_INIT;
@@ -70,6 +100,13 @@ class FieldInheritedBase implements FieldInheritedIface
     public  String shadowedStr = "base";    // base copy of the shadowed String
     public  static int sShadow  = 555;      // FieldInherited.STATIC_SHADOW_BASE
 
+    // Additional shadow slots of OTHER widths (byte / long), re-declared on the
+    // child too, so child-wins shadowing is proven for a NARROW and a WIDE
+    // primitive — not just the 4-byte int.  Base copies here; child copies live
+    // on FieldInherited with far-apart sentinel values.
+    public  byte   shadowedByte = (byte) 0x11;  // FieldInherited.BASE_SHADOW_BYTE
+    public  long   shadowedLong = 0x00BA5EL;    // FieldInherited.BASE_SHADOW_LONG
+
     // Touch private members + the every-type slots so javac does not warn them
     // unused under -Werror-y builds and so they are guaranteed present in the
     // layout.  Also reads the interface constant so its declaration is exercised.
@@ -79,6 +116,18 @@ class FieldInheritedBase implements FieldInheritedIface
         acc += (this.baseBool ? 1 : 0) + this.baseByte + this.baseChar + this.baseShort;
         acc += (int) this.baseFloat + (int) this.baseDouble;
         acc += this.baseIntArray.length;
+        // Touch the boundary + reference-array + extra-shadow slots so javac does
+        // not warn them unused under -Werror-y builds and they are guaranteed
+        // present in the layout.
+        acc += this.baseIntMin + this.baseIntMax + this.baseIntNeg;
+        acc += (int) (this.baseLongMin + this.baseLongMax);
+        acc += this.baseByteMin + this.baseByteMax + this.baseByteNeg;
+        acc += this.baseShortMin + this.baseShortMax;
+        acc += this.baseCharMax + this.baseCharZero;
+        acc += (int) (this.baseFloatNeg + this.baseDoubleNeg + this.baseFloatZero);
+        acc += (int) this.baseDoubleBig;
+        acc += this.baseStrArray.length;
+        acc += this.shadowedByte + (int) this.shadowedLong;
         return acc;
     }
 }

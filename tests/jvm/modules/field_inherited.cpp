@@ -37,6 +37,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -83,6 +84,35 @@ namespace
         auto base_float() const -> float           { return get_field("baseFloat")->get(); }
         auto base_double() const -> double         { return get_field("baseDouble")->get(); }
         auto base_int_array() const -> std::vector<std::int32_t> { return get_field("baseIntArray")->get(); }
+
+        // Inherited (depth-2) BOUNDARY slots — read THROUGH the child klass.
+        auto base_int_min() const -> std::int32_t   { return static_cast<std::int32_t>(get_field("baseIntMin")->get()); }
+        auto base_int_max() const -> std::int32_t   { return static_cast<std::int32_t>(get_field("baseIntMax")->get()); }
+        auto base_int_neg() const -> std::int32_t   { return static_cast<std::int32_t>(get_field("baseIntNeg")->get()); }
+        auto base_long_min() const -> std::int64_t  { return static_cast<std::int64_t>(get_field("baseLongMin")->get()); }
+        auto base_long_max() const -> std::int64_t  { return static_cast<std::int64_t>(get_field("baseLongMax")->get()); }
+        auto base_byte_min() const -> std::int8_t   { return static_cast<std::int8_t>(get_field("baseByteMin")->get()); }
+        auto base_byte_max() const -> std::int8_t   { return static_cast<std::int8_t>(get_field("baseByteMax")->get()); }
+        auto base_byte_neg() const -> std::int8_t   { return static_cast<std::int8_t>(get_field("baseByteNeg")->get()); }
+        auto base_short_min() const -> std::int16_t { return static_cast<std::int16_t>(get_field("baseShortMin")->get()); }
+        auto base_short_max() const -> std::int16_t { return static_cast<std::int16_t>(get_field("baseShortMax")->get()); }
+        auto base_char_max() const -> std::uint16_t { return static_cast<std::uint16_t>(get_field("baseCharMax")->get()); }
+        auto base_char_zero() const -> std::uint16_t{ return static_cast<std::uint16_t>(get_field("baseCharZero")->get()); }
+        auto base_float_neg() const -> float        { return get_field("baseFloatNeg")->get(); }
+        auto base_double_neg() const -> double       { return get_field("baseDoubleNeg")->get(); }
+        auto base_float_zero() const -> float        { return get_field("baseFloatZero")->get(); }
+        auto base_double_big() const -> double       { return get_field("baseDoubleBig")->get(); }
+
+        // Inherited (depth-2) String[] — object-array OOP decode through the walk.
+        auto base_str_array() const -> std::vector<std::string> { return get_field("baseStrArray")->get(); }
+
+        // Inherited (depth-1, Mid) WIDE + REFERENCE own fields.
+        auto mid_own_long() const -> std::int64_t  { return static_cast<std::int64_t>(get_field("midOwnLong")->get()); }
+        auto mid_own_str() const -> std::string    { return get_field("midOwnStr")->get(); }
+
+        // Child copies of the NARROW / WIDE shadow slots (walk depth 0).
+        auto shadowed_byte() const -> std::int8_t  { return static_cast<std::int8_t>(get_field("shadowedByte")->get()); }
+        auto shadowed_long() const -> std::int64_t { return static_cast<std::int64_t>(get_field("shadowedLong")->get()); }
     };
 
     // ---- Wrapper registered to the MID class.  Super walk starts at Mid. ---
@@ -94,7 +124,10 @@ namespace
         {
         }
         auto mid_own_int() const -> std::int32_t   { return static_cast<std::int32_t>(get_field("midOwnInt")->get()); }
+        auto mid_own_long() const -> std::int64_t  { return static_cast<std::int64_t>(get_field("midOwnLong")->get()); }
+        auto mid_own_str() const -> std::string    { return get_field("midOwnStr")->get(); }
         auto protected_int() const -> std::int32_t { return static_cast<std::int32_t>(get_field("protectedInt")->get()); }
+        auto base_long() const -> std::int64_t     { return static_cast<std::int64_t>(get_field("baseLong")->get()); }
         auto shadowed_int() const -> std::int32_t  { return static_cast<std::int32_t>(get_field("shadowedInt")->get()); }
     };
 
@@ -122,6 +155,9 @@ namespace
         auto protected_int() const -> std::int32_t { return static_cast<std::int32_t>(get_field("protectedInt")->get()); }
         auto public_int() const -> std::int32_t    { return static_cast<std::int32_t>(get_field("publicInt")->get()); }
         auto shadowed_int() const -> std::int32_t  { return static_cast<std::int32_t>(get_field("shadowedInt")->get()); }
+        auto shadowed_byte() const -> std::int8_t  { return static_cast<std::int8_t>(get_field("shadowedByte")->get()); }
+        auto shadowed_long() const -> std::int64_t { return static_cast<std::int64_t>(get_field("shadowedLong")->get()); }
+        auto str_array() const -> std::vector<std::string> { return get_field("baseStrArray")->get(); }
     };
 
     // ---- Wrapper registered to the INTERFACE klass.  Used ONLY for the static
@@ -188,6 +224,35 @@ namespace
     // final).  find_field's _super-only walk does NOT reach it from an
     // implementor; it resolves only through the interface's own klass.
     constexpr std::int32_t IFACE_CONST_VALUE { 0x1FACE123 };
+
+    // Base.java — BOUNDARY / edge inherited slots (depth-2 walk), mirrored verbatim.
+    constexpr std::int32_t BASE_INT_MIN   { (std::numeric_limits<std::int32_t>::min)() };
+    constexpr std::int32_t BASE_INT_MAX   { (std::numeric_limits<std::int32_t>::max)() };
+    constexpr std::int32_t BASE_INT_NEG   { -1 };
+    constexpr std::int64_t BASE_LONG_MIN  { (std::numeric_limits<std::int64_t>::min)() };
+    constexpr std::int64_t BASE_LONG_MAX  { (std::numeric_limits<std::int64_t>::max)() };
+    constexpr std::int8_t  BASE_BYTE_MIN  { (std::numeric_limits<std::int8_t>::min)() };  // -128
+    constexpr std::int8_t  BASE_BYTE_MAX  { (std::numeric_limits<std::int8_t>::max)() };  // 127
+    constexpr std::int8_t  BASE_BYTE_NEG  { static_cast<std::int8_t>(-1) };               // 0xFF
+    constexpr std::int16_t BASE_SHORT_MIN { (std::numeric_limits<std::int16_t>::min)() }; // -32768
+    constexpr std::int16_t BASE_SHORT_MAX { (std::numeric_limits<std::int16_t>::max)() }; // 32767
+    constexpr std::uint16_t BASE_CHAR_MAX { static_cast<std::uint16_t>(0xFFFF) };         // 65535
+    constexpr std::uint16_t BASE_CHAR_ZERO{ static_cast<std::uint16_t>(0) };
+    constexpr float        BASE_FLOAT_NEG { -123.5f };
+    constexpr double       BASE_DOUBLE_NEG{ -987.625 };
+    constexpr float        BASE_FLOAT_ZERO{ 0.0f };
+    constexpr double       BASE_DOUBLE_BIG{ 1.0e300 };
+
+    // Mid.java — WIDE + REFERENCE own fields (depth-1 walk).
+    constexpr std::int64_t MID_LONG_INIT  { static_cast<std::int64_t>(0x00FACADE00FACADELL) };
+
+    // Shadow slots of OTHER widths (byte / long) — child-wins crux for non-int.
+    constexpr std::int8_t  BASE_SHADOW_BYTE   { static_cast<std::int8_t>(0x11) };
+    constexpr std::int8_t  CHILD_SHADOW_BYTE  { static_cast<std::int8_t>(0x77) };
+    constexpr std::int64_t BASE_SHADOW_LONG   { static_cast<std::int64_t>(0x00BA5ELL) };
+    constexpr std::int64_t CHILD_SHADOW_LONG  { static_cast<std::int64_t>(0x7CC1D7CC1DLL) };
+    constexpr std::int8_t  CHILD_SHADOW_BYTE_RUNTIME { static_cast<std::int8_t>(0x3C) };
+    constexpr std::int64_t CHILD_SHADOW_LONG_RUNTIME { static_cast<std::int64_t>(0x0DEFACED0LL) };
 
     // Internal (JVM '/') names used for the direct klass::find_field-vs-super-walk
     // contrast and the interface-constant characterization.
@@ -542,6 +607,157 @@ VMHOOK_JVM_MODULE(field_inherited)
         }
 
         // =================================================================
+        //  BOUNDARY / EDGE inherited values — depth-2 super walk reads the FULL
+        //  bit pattern for every fixed width: min/max/sign-boundary for I J B S,
+        //  the UNSIGNED 16-bit char edge (0xFFFF must read 65535, not -1), and
+        //  signed/zero/large-magnitude float+double.  A truncating or wrongly
+        //  sign-extending offset read would corrupt one of these unambiguously.
+        // =================================================================
+        {
+            ctx.check("inherited_int_min",   child->base_int_min()   == BASE_INT_MIN);
+            ctx.check("inherited_int_max",   child->base_int_max()   == BASE_INT_MAX);
+            ctx.check("inherited_int_neg",   child->base_int_neg()   == BASE_INT_NEG);
+            ctx.check("inherited_long_min",  child->base_long_min()  == BASE_LONG_MIN);
+            ctx.check("inherited_long_max",  child->base_long_max()  == BASE_LONG_MAX);
+            ctx.check("inherited_byte_min",  child->base_byte_min()  == BASE_BYTE_MIN);
+            ctx.check("inherited_byte_max",  child->base_byte_max()  == BASE_BYTE_MAX);
+            // byte 0xFF -> -1 (the "B" slot is SIGNED); proves no zero-extension.
+            ctx.check("inherited_byte_neg_signed", child->base_byte_neg() == BASE_BYTE_NEG);
+            ctx.check("inherited_short_min", child->base_short_min() == BASE_SHORT_MIN);
+            ctx.check("inherited_short_max", child->base_short_max() == BASE_SHORT_MAX);
+            // char 0xFFFF -> 65535 (the "C" slot is UNSIGNED); proves no sign-ext.
+            ctx.check("inherited_char_max_unsigned", child->base_char_max()  == BASE_CHAR_MAX);
+            ctx.check("inherited_char_zero",         child->base_char_zero() == BASE_CHAR_ZERO);
+            ctx.check("inherited_float_neg",   child->base_float_neg()  == BASE_FLOAT_NEG);
+            ctx.check("inherited_double_neg",  child->base_double_neg() == BASE_DOUBLE_NEG);
+            ctx.check("inherited_float_zero",  child->base_float_zero() == BASE_FLOAT_ZERO);
+            ctx.check("inherited_double_big",  child->base_double_big() == BASE_DOUBLE_BIG);
+
+            // Signatures for the wide/narrow boundary slots (one each) — the walk
+            // carries the right descriptor regardless of value.
+            {
+                auto lp{ child->get_field("baseLongMin") };
+                ctx.check("inherited_long_min_signature_J",
+                          lp.has_value() && std::string{ lp->signature() } == "J");
+                auto cp{ child->get_field("baseCharMax") };
+                ctx.check("inherited_char_max_signature_C",
+                          cp.has_value() && std::string{ cp->signature() } == "C");
+            }
+        }
+
+        // =================================================================
+        //  Depth-1 (Mid) WIDE + REFERENCE own fields — proves the single-link
+        //  walk resolves a non-int (J) slot and a compressed-OOP (String) slot,
+        //  not only the 4-byte int the original depth-1 case covered.
+        // =================================================================
+        {
+            auto lp{ child->get_field("midOwnLong") };
+            ctx.check("parent_long_resolves_depth1", lp.has_value());
+            if (lp)
+            {
+                ctx.check("parent_long_signature_J", std::string{ lp->signature() } == "J");
+                ctx.check("parent_long_value_depth1", child->mid_own_long() == MID_LONG_INIT);
+            }
+            auto sp{ child->get_field("midOwnStr") };
+            ctx.check("parent_string_resolves_depth1", sp.has_value());
+            if (sp)
+            {
+                ctx.check("parent_string_is_reference", sp->is_reference() == true);
+                ctx.check("parent_string_signature",
+                          std::string{ sp->signature() } == "Ljava/lang/String;");
+                ctx.check("parent_string_value_depth1", child->mid_own_str() == "mid-str");
+            }
+        }
+
+        // =================================================================
+        //  Inherited OBJECT ARRAY (String[]) — depth-2 super walk + the
+        //  object-array OOP decode path (decode_array_oop -> per-slot
+        //  decode_oop_pointer -> read_java_string), distinct from the scalar
+        //  "[I" primitive-array case above.  Read child-typed AND base-typed: the
+        //  same non-shadowed inherited array slot must resolve to the SAME
+        //  address and the SAME element data from both start klasses.
+        // =================================================================
+        {
+            auto fp{ child->get_field("baseStrArray") };
+            ctx.check("inherited_obj_array_resolves", fp.has_value());
+            if (fp)
+            {
+                ctx.check("inherited_obj_array_signature",
+                          std::string{ fp->signature() } == "[Ljava/lang/String;");
+                ctx.check("inherited_obj_array_is_reference", fp->is_reference() == true);
+                const std::vector<std::string> v{ child->base_str_array() };
+                ctx.check("inherited_obj_array_size", v.size() == 3);
+                ctx.check("inherited_obj_array_values",
+                          v.size() == 3 && v[0] == "alpha" && v[1] == "beta" && v[2] == "gamma");
+            }
+            // base-typed read of the SAME inherited array slot: same address +
+            // same data (depth-2 from child == depth-0 from base, one slot).
+            fi_base as_base{ child->vmhook::object_base::get_instance() };
+            auto via_base{ as_base.get_field("baseStrArray") };
+            if (fp && via_base)
+            {
+                ctx.check("inherited_obj_array_same_address_both_views",
+                          fp->raw_address() == via_base->raw_address());
+                const std::vector<std::string> bv{ as_base.str_array() };
+                ctx.check("inherited_obj_array_base_view_values",
+                          bv.size() == 3 && bv[0] == "alpha" && bv[2] == "gamma");
+            }
+        }
+
+        // =================================================================
+        //  get_compressed_oop() through the walk: an inherited REFERENCE field's
+        //  compressed OOP read child-typed equals the value read base-typed (one
+        //  slot, two start klasses) and is NON-zero (the String is non-null); and
+        //  the SAME accessor on an inherited PRIMITIVE field returns 0 (the
+        //  FLAW-C guard — a primitive slot holds no OOP), proving the introspection
+        //  helper behaves correctly on fields reached via the super walk.
+        // =================================================================
+        {
+            auto cref{ child->get_field("baseStr") };
+            fi_base as_base{ child->vmhook::object_base::get_instance() };
+            auto bref{ as_base.get_field("baseStr") };
+            if (cref && bref)
+            {
+                const std::uint32_t coop{ cref->get_compressed_oop() };
+                const std::uint32_t boop{ bref->get_compressed_oop() };
+                ctx.check("inherited_ref_compressed_oop_nonzero", coop != 0u);
+                ctx.check("inherited_ref_compressed_oop_consistent_across_views",
+                          coop == boop);
+            }
+            // Primitive inherited field -> guarded 0 from get_compressed_oop().
+            auto prim{ child->get_field("protectedInt") };
+            if (prim)
+            {
+                ctx.check("inherited_primitive_compressed_oop_is_zero",
+                          prim->get_compressed_oop() == 0u);
+                ctx.check("inherited_primitive_is_not_reference",
+                          prim->is_reference() == false);
+            }
+        }
+
+        // =================================================================
+        //  as_string() explicit extraction on an inherited reference field — the
+        //  documented unambiguous spelling (vs the implicit get() conversion the
+        //  block above used).  Resolved through the depth-2 walk; child-typed and
+        //  base-typed views of the non-shadowed inherited String agree.
+        // =================================================================
+        {
+            auto cs{ child->get_field("baseStr") };
+            fi_base as_base{ child->vmhook::object_base::get_instance() };
+            auto bs{ as_base.get_field("baseStr") };
+            if (cs)
+            {
+                ctx.check("inherited_string_as_string_explicit",
+                          cs->get().as_string() == "base-str");
+            }
+            if (cs && bs)
+            {
+                ctx.check("inherited_string_as_string_consistent_views",
+                          cs->get().as_string() == bs->get().as_string());
+            }
+        }
+
+        // =================================================================
         //  SHADOWING — the crux.  The child re-declares shadowedInt /
         //  shadowedStr.  A CHILD-typed read of the child object must see the
         //  CHILD slot; a BASE-typed read of the SAME object must see the BASE
@@ -604,6 +820,51 @@ VMHOOK_JVM_MODULE(field_inherited)
                     ctx.check("shadow_string_distinct", cv != bv);
                 }
             }
+
+            // NARROW (byte) shadow: child slot 0x77 hides base 0x11.  A 1-byte
+            // shadow at a DIFFERENT offset than the int shadow proves child-wins
+            // is width-independent and the byte slot is physically separate.
+            {
+                auto cb{ child->get_field("shadowedByte") };
+                fi_base sb{ child->vmhook::object_base::get_instance() };
+                auto bb{ sb.get_field("shadowedByte") };
+                ctx.check("shadow_byte_child_resolves", cb.has_value());
+                ctx.check("shadow_byte_base_resolves", bb.has_value());
+                if (cb && bb)
+                {
+                    ctx.check("shadow_byte_child_wins",
+                              static_cast<std::int8_t>(cb->get()) == CHILD_SHADOW_BYTE);
+                    ctx.check("shadow_byte_base_unhidden",
+                              static_cast<std::int8_t>(bb->get()) == BASE_SHADOW_BYTE);
+                    ctx.check("shadow_byte_distinct", child->shadowed_byte() != sb.shadowed_byte());
+                    ctx.check("shadow_byte_addresses_differ",
+                              cb->raw_address() != bb->raw_address());
+                    ctx.check("shadow_byte_child_signature_B",
+                              std::string{ cb->signature() } == "B");
+                }
+            }
+
+            // WIDE (long) shadow: child slot hides the base copy.  An 8-byte
+            // shadow proves child-wins for the widest primitive too.
+            {
+                auto cl{ child->get_field("shadowedLong") };
+                fi_base sb{ child->vmhook::object_base::get_instance() };
+                auto bl{ sb.get_field("shadowedLong") };
+                ctx.check("shadow_long_child_resolves", cl.has_value());
+                ctx.check("shadow_long_base_resolves", bl.has_value());
+                if (cl && bl)
+                {
+                    ctx.check("shadow_long_child_wins",
+                              static_cast<std::int64_t>(cl->get()) == CHILD_SHADOW_LONG);
+                    ctx.check("shadow_long_base_unhidden",
+                              static_cast<std::int64_t>(bl->get()) == BASE_SHADOW_LONG);
+                    ctx.check("shadow_long_distinct", child->shadowed_long() != sb.shadowed_long());
+                    ctx.check("shadow_long_addresses_differ",
+                              cl->raw_address() != bl->raw_address());
+                    ctx.check("shadow_long_child_signature_J",
+                              std::string{ cl->signature() } == "J");
+                }
+            }
         }
 
         // =================================================================
@@ -636,6 +897,12 @@ VMHOOK_JVM_MODULE(field_inherited)
             fi_mid as_mid{ child->vmhook::object_base::get_instance() };
             ctx.check("mid_view_own_field_value", as_mid.mid_own_int() == MID_INT_INIT);
             ctx.check("mid_view_inherited_protected_value", as_mid.protected_int() == PROT_INT_INIT);
+            // Mid-typed reads of Mid's OWN wide + reference fields (depth 0 for
+            // Mid), and Base's wide (J) field (depth 1 for Mid) — the walk from
+            // an intermediate klass resolves non-int slots too.
+            ctx.check("mid_view_own_long_value", as_mid.mid_own_long() == MID_LONG_INIT);
+            ctx.check("mid_view_own_string_value", as_mid.mid_own_str() == "mid-str");
+            ctx.check("mid_view_inherited_long_value", as_mid.base_long() == BASE_LONG_INIT);
         }
     }
 
@@ -706,6 +973,35 @@ VMHOOK_JVM_MODULE(field_inherited)
                           via_child->raw_address() != via_base->raw_address());
             }
         }
+
+        // -- field_entry_t::declaring_klass for inherited + shadowed STATICS ---
+        //    The super-walk on the mirror chain records WHICH klass declares each
+        //    static, just as for instance fields.  An inherited static found from
+        //    the child must report Base/Mid as its declaring klass; the shadowed
+        //    static must report the CHILD klass from the child view and the BASE
+        //    klass from the base view (the two physically distinct mirror slots).
+        {
+            vmhook::hotspot::klass* const k_child{ vmhook::find_class(K_CHILD) };
+            vmhook::hotspot::klass* const k_mid  { vmhook::find_class(K_MID) };
+            vmhook::hotspot::klass* const k_base { vmhook::find_class(K_BASE) };
+            if (k_child && k_mid && k_base)
+            {
+                const auto e_prot{ vmhook::find_field(k_child, "sProtected") };
+                ctx.check("static_inherited_declaring_klass_is_base",
+                          e_prot.has_value() && e_prot->is_static
+                              && e_prot->declaring_klass == k_base);
+                const auto e_mid{ vmhook::find_field(k_child, "sMid") };
+                ctx.check("static_inherited_declaring_klass_is_mid",
+                          e_mid.has_value() && e_mid->is_static
+                              && e_mid->declaring_klass == k_mid);
+                const auto e_sh_child{ vmhook::find_field(k_child, "sShadow") };
+                ctx.check("static_shadow_declaring_klass_child_view_is_child",
+                          e_sh_child.has_value() && e_sh_child->declaring_klass == k_child);
+                const auto e_sh_base{ vmhook::find_field(k_base, "sShadow") };
+                ctx.check("static_shadow_declaring_klass_base_view_is_base",
+                          e_sh_base.has_value() && e_sh_base->declaring_klass == k_base);
+            }
+        }
     }
 
     // =====================================================================
@@ -751,6 +1047,35 @@ VMHOOK_JVM_MODULE(field_inherited)
             ctx.check("inherited_cache_same_value",
                       static_cast<std::int32_t>(a->get())
                           == static_cast<std::int32_t>(b->get()));
+        }
+
+        // The cache is keyed by the REQUESTING klass, NOT the declaring klass
+        // (vmhook.hpp note: g_field_cache<klass*, <name, entry>>).  The SAME
+        // inherited Base field resolved from three DIFFERENT start klasses
+        // (child / mid / base) populates three distinct cache keys — yet because
+        // it is one physical slot every view must resolve to the SAME address.
+        // Then a SECOND resolution from each start klass (the cache-hit path)
+        // must return that same address again: per-key stability across the walk.
+        fi_mid  as_mid { child->vmhook::object_base::get_instance() };
+        fi_base as_base{ child->vmhook::object_base::get_instance() };
+        auto c1{ child->get_field("protectedInt") };
+        auto m1{ as_mid.get_field("protectedInt") };
+        auto b1{ as_base.get_field("protectedInt") };
+        if (c1 && m1 && b1)
+        {
+            ctx.check("inherited_multikey_all_same_address",
+                      c1->raw_address() == m1->raw_address()
+                          && m1->raw_address() == b1->raw_address());
+            // Cache-hit second pass: each key resolves stably to the same slot.
+            auto c2{ child->get_field("protectedInt") };
+            auto m2{ as_mid.get_field("protectedInt") };
+            auto b2{ as_base.get_field("protectedInt") };
+            ctx.check("inherited_multikey_child_hit_stable",
+                      c2 && c2->raw_address() == c1->raw_address());
+            ctx.check("inherited_multikey_mid_hit_stable",
+                      m2 && m2->raw_address() == m1->raw_address());
+            ctx.check("inherited_multikey_base_hit_stable",
+                      b2 && b2->raw_address() == b1->raw_address());
         }
     }
 
@@ -935,6 +1260,45 @@ VMHOOK_JVM_MODULE(field_inherited)
                                     static_cast<std::int32_t>(cf->get()) == STATIC_SHADOW_RUNTIME); }
                 if (bf) { ctx.check("mode3_static_shadow_base_untouched",
                                     static_cast<std::int32_t>(bf->get()) == STATIC_SHADOW_BASE); }
+            }
+        }
+    }
+
+    // =====================================================================
+    //  LIVE mutation — mode 4: putfield the child's NARROW (byte) + WIDE (long)
+    //  shadow slots, then read each back through the walk.  Proves child-wins
+    //  shadowing resolves the LIVE post-dispatch slot at non-int widths, and
+    //  that the same write leaves the hidden Base copies of those names
+    //  untouched (read through the base wrapper) — width-independent isolation.
+    // =====================================================================
+    {
+        const bool done{ drive(ctx, 4) };
+        ctx.check("mode4_probe_completed", done);
+        if (done)
+        {
+            const auto live{ fi_child::get_instance() };
+            if (live)
+            {
+                // Child byte / long slots got the child runtime values.
+                ctx.check("mode4_child_byte_shadow_live",
+                          live->shadowed_byte() == CHILD_SHADOW_BYTE_RUNTIME);
+                ctx.check("mode4_child_long_shadow_live",
+                          live->shadowed_long() == CHILD_SHADOW_LONG_RUNTIME);
+
+                // The hidden Base copies of the same names are UNTOUCHED.
+                fi_base hidden{ live->vmhook::object_base::get_instance() };
+                auto hb{ hidden.get_field("shadowedByte") };
+                auto hl{ hidden.get_field("shadowedLong") };
+                if (hb)
+                {
+                    ctx.check("mode4_child_objects_base_byte_untouched",
+                              static_cast<std::int8_t>(hb->get()) == BASE_SHADOW_BYTE);
+                }
+                if (hl)
+                {
+                    ctx.check("mode4_child_objects_base_long_untouched",
+                              static_cast<std::int64_t>(hl->get()) == BASE_SHADOW_LONG);
+                }
             }
         }
     }

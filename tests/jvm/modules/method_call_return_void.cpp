@@ -41,8 +41,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 
 namespace
 {
@@ -85,6 +88,47 @@ namespace
 
         // -- non-corruption breadcrumb --
         static auto last_echo_arg() -> std::int32_t { return static_field("lastEchoArg")->get(); }
+
+        // -- repeat dispatch --
+        static auto void_repeat_hits() -> std::int32_t { return static_field("voidRepeatHits")->get(); }
+
+        // -- boundary primitive args (second recorder) --
+        static auto edge_prims_called() -> bool         { return static_field("edgePrimsCalled")->get(); }
+        static auto edge_prim_int()     -> std::int32_t { return static_field("edgePrimInt")->get(); }
+        static auto edge_prim_long()    -> std::int64_t { return static_field("edgePrimLong")->get(); }
+        static auto edge_prim_bool()    -> bool         { return static_field("edgePrimBool")->get(); }
+        static auto edge_prim_double()  -> double       { return static_field("edgePrimDouble")->get(); }
+
+        // -- narrow / float args --
+        static auto narrow_args_called() -> bool         { return static_field("narrowArgsCalled")->get(); }
+        static auto narrow_arg_byte()    -> std::int8_t  { return static_field("narrowArgByte")->get(); }
+        static auto narrow_arg_short()   -> std::int16_t { return static_field("narrowArgShort")->get(); }
+        static auto narrow_arg_char()    -> std::uint16_t { return static_field("narrowArgChar")->get(); }
+        static auto narrow_arg_float()   -> float        { return static_field("narrowArgFloat")->get(); }
+
+        // -- degenerate String args --
+        static auto empty_string_called() -> bool        { return static_field("emptyStringCalled")->get(); }
+        static auto empty_string_len()    -> std::int32_t { return static_field("emptyStringLen")->get(); }
+        static auto null_string_called()  -> bool        { return static_field("nullStringCalled")->get(); }
+        static auto null_string_was_null() -> bool       { return static_field("nullStringWasNull")->get(); }
+
+        // -- null Object arg --
+        static auto null_object_called()   -> bool { return static_field("nullObjectCalled")->get(); }
+        static auto null_object_was_null() -> bool { return static_field("nullObjectWasNull")->get(); }
+
+        // -- many-arg void --
+        static auto many_args_called() -> bool        { return static_field("manyArgsCalled")->get(); }
+        static auto many_args_sum()    -> std::int32_t { return static_field("manyArgsSum")->get(); }
+        static auto many_args_last()   -> std::int32_t { return static_field("manyArgsLast")->get(); }
+
+        // -- String arg via const char*/string_view packer --
+        static auto cstr_arg_called() -> bool        { return static_field("cstrArgCalled")->get(); }
+        static auto cstr_arg()        -> std::string  { return static_field("cstrArg")->get(); }
+        static auto cstr_arg_len()    -> std::int32_t { return static_field("cstrArgLen")->get(); }
+
+        // -- static void with a primitive arg --
+        static auto static_arg_called() -> bool        { return static_field("staticArgCalled")->get(); }
+        static auto static_arg_int()    -> std::int32_t { return static_field("staticArgInt")->get(); }
     };
 
     // ------------------------------------------------------------------
@@ -113,6 +157,28 @@ namespace
     std::atomic<std::int64_t> g_post_void_echo{ 0 };
     std::atomic<std::int64_t> g_post_void_retint{ 0 };
 
+    // is_void() for the NEW void scenarios (boundary prims, narrow args, empty/
+    // null string, null object, many-arg, const-char* string, static-arg,
+    // static-via-instance, repeat, explicit-signature).
+    std::atomic<int> g_void_edge_is_void{ -1 };
+    std::atomic<int> g_void_narrow_is_void{ -1 };
+    std::atomic<int> g_void_empty_str_is_void{ -1 };
+    std::atomic<int> g_void_null_str_is_void{ -1 };
+    std::atomic<int> g_void_null_obj_is_void{ -1 };
+    std::atomic<int> g_void_many_is_void{ -1 };
+    std::atomic<int> g_void_cstr_is_void{ -1 };
+    std::atomic<int> g_void_static_arg_is_void{ -1 };
+    std::atomic<int> g_void_static_via_inst_is_void{ -1 };
+    std::atomic<int> g_void_sig_is_void{ -1 };
+
+    // How many times each repeat dispatch reported is_void() (must be all-true).
+    constexpr int    k_repeat_calls{ 4 };
+    std::atomic<int> g_void_repeat_all_void{ -1 };
+
+    // The OBJECT-arg scenario also exercised through a unique_ptr<wrapper>: the
+    // packer's is_unique_ptr branch is distinct from the object_base branch.
+    std::atomic<int> g_void_uptr_obj_is_void{ -1 };
+
     // Sentinel args the native side passes, mirrored by the Java assertions.
     constexpr std::int32_t k_prim_int    = 0x0BADF00D;            // 195948557
     constexpr std::int64_t k_prim_long   = static_cast<std::int64_t>(0x0123456789ABCDEFLL);
@@ -125,6 +191,37 @@ namespace
     // String arg reaches a VOID body, so ASCII keeps the assertion exact.
     const std::string      k_string_arg  = "void-string-arg-0123456789";
     constexpr std::int32_t k_echo_arg    = 0x5A5A5A5A;            // 1515870810
+
+    // Boundary primitive sentinels for the SECOND prim recorder (voidEdgePrims):
+    // extreme bit patterns so a slot mis-width / sign-extension fault shows up.
+    constexpr std::int32_t k_edge_int    = static_cast<std::int32_t>(0x80000000); // INT_MIN
+    constexpr std::int64_t k_edge_long   = static_cast<std::int64_t>(0x8000000000000000ULL); // LONG_MIN
+    constexpr bool         k_edge_bool   = false;                // the OTHER boolean
+    constexpr double       k_edge_double = -0.0;                 // negative zero (sign bit set)
+
+    // Narrow / float sentinels (byte, short, char, float).  Each value sets the
+    // high bit of its width so a wrong-width copy would corrupt it.
+    constexpr std::int8_t  k_narrow_byte  = static_cast<std::int8_t>(0x80);   // -128
+    constexpr std::int16_t k_narrow_short = static_cast<std::int16_t>(0x8001); // -32767
+    constexpr std::uint16_t k_narrow_char = static_cast<std::uint16_t>(0xBEEF); // 48879
+    constexpr float        k_narrow_float = 2.7182817f;          // e (single precision)
+
+    // const char* string sentinel (distinct content from k_string_arg) routed
+    // through the const-char*/string_view packer branch.
+    constexpr const char*  k_cstr_arg     = "cstr-void-arg-9876543210";
+
+    // Many-arg sentinels: six ints whose sum and last value are checked.
+    constexpr std::int32_t k_many_a       = 11;
+    constexpr std::int32_t k_many_b       = 22;
+    constexpr std::int32_t k_many_c       = 33;
+    constexpr std::int32_t k_many_d       = 44;
+    constexpr std::int32_t k_many_e       = 55;
+    constexpr std::int32_t k_many_f       = 66;
+    constexpr std::int32_t k_many_sum     = k_many_a + k_many_b + k_many_c
+                                          + k_many_d + k_many_e + k_many_f; // 231
+
+    // Static-void-with-arg sentinel.
+    constexpr std::int32_t k_static_arg   = static_cast<std::int32_t>(0x0FF1CE00); // 267444096
 }
 
 VMHOOK_JVM_MODULE(method_call_return_void)
@@ -208,6 +305,167 @@ VMHOOK_JVM_MODULE(method_call_return_void)
                     }
                 }
 
+                // ---- void with BOUNDARY primitive args (INT_MIN/LONG_MIN/-0.0) --
+                // A second recorder so the existing voidPrimArgs "== 1" stays
+                // intact; here the args carry extreme bit patterns to catch a
+                // slot-width / sign-extension fault on a no-return dispatch.
+                {
+                    auto proxy{ self->get_method("voidEdgePrims") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{
+                            proxy->call(k_edge_int, k_edge_long, k_edge_bool, k_edge_double) };
+                        g_void_edge_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with NARROW / FLOAT args (byte, short, char, float) --
+                // The original prim test only covers I/J/Z/D; these are the 1-slot
+                // widths whose extension into an interpreter slot is otherwise
+                // unproven for a void dispatch.
+                {
+                    auto proxy{ self->get_method("voidNarrowArgs") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{
+                            proxy->call(k_narrow_byte, k_narrow_short, k_narrow_char, k_narrow_float) };
+                        g_void_narrow_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with an EMPTY String arg ----
+                // Degenerate but legal: an empty std::string must marshal to a
+                // length-0 java.lang.String (NOT null) and the body must observe 0.
+                {
+                    auto proxy{ self->get_method("voidEmptyStringArg") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call(std::string{}) };
+                        g_void_empty_str_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with a NULL String arg ----
+                // A null const char* routes through the const-char* packer branch
+                // and must reach the body as a genuine null reference; the void
+                // dispatch must still report is_void() (flaw #3: best-effort arg).
+                {
+                    auto proxy{ self->get_method("voidNullStringArg") };
+                    if (proxy.has_value())
+                    {
+                        const char* const null_str{ nullptr };
+                        const vmhook::method_proxy::value_t v{ proxy->call(null_str) };
+                        g_void_null_str_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with a NULL Object arg ----
+                // Passing a null unique_ptr<wrapper> marshals a null reference; the
+                // body must see null and the dispatch must still report void.
+                {
+                    auto proxy{ self->get_method("voidNullObjectArg") };
+                    if (proxy.has_value())
+                    {
+                        std::unique_ptr<method_call_void> null_obj{};
+                        const vmhook::method_proxy::value_t v{ proxy->call(std::move(null_obj)) };
+                        g_void_null_obj_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with MANY (six) int args — more of the param block ----
+                {
+                    auto proxy{ self->get_method("voidManyArgs") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{
+                            proxy->call(k_many_a, k_many_b, k_many_c, k_many_d, k_many_e, k_many_f) };
+                        g_void_many_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with a String arg via the const char* packer branch --
+                // call(const char*) hits a DIFFERENT pack() branch than
+                // call(std::string); prove it also reaches a void body verbatim.
+                {
+                    auto proxy{ self->get_method("voidStringArgC") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call(k_cstr_arg) };
+                        g_void_cstr_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with an OBJECT arg via unique_ptr<wrapper> ----
+                // Distinct packer branch (is_unique_ptr) from the object_base
+                // branch the earlier voidObjectArg test exercised; reuses the
+                // same recorder fields (objectArg*), so it must again land on the
+                // receiver identity.  Wrap the SAME live OOP.
+                {
+                    auto proxy{ self->get_method("voidObjectArg") };
+                    if (proxy.has_value())
+                    {
+                        auto uptr{ std::make_unique<method_call_void>(self->get_instance()) };
+                        const vmhook::method_proxy::value_t v{ proxy->call(std::move(uptr)) };
+                        g_void_uptr_obj_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- STATIC void WITH an arg (no receiver slot + arg delivered) -
+                {
+                    auto proxy{ method_call_void::static_method("voidStaticArg") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call(k_static_arg) };
+                        g_void_static_arg_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- STATIC void resolved THROUGH the instance wrapper ----
+                // self->get_method("voidBumpStatic") hands a static Method* back
+                // with the receiver still bound in this->object; the library's
+                // is_static() clause must omit the receiver slot so the static
+                // body runs (and bumps voidStaticHits a SECOND time).
+                {
+                    auto proxy{ self->get_method("voidBumpStatic") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_void_static_via_inst_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void INSTANCE via EXPLICIT signature overload ----
+                // get_method(name, "()V") + call(): the explicit-descriptor path,
+                // and a third bump of voidInstanceHits.
+                {
+                    auto proxy{ self->get_method("voidBumpInstance", "()V") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_void_sig_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- REPEAT dispatch: call a void method N times, prove each
+                // reported void AND the body ran exactly N times (no drop / no
+                // double-dispatch, and no poisoning between consecutive voids). --
+                {
+                    auto proxy{ self->get_method("voidRepeat") };
+                    if (proxy.has_value())
+                    {
+                        int all_void{ 1 };
+                        for (int n{ 0 }; n < k_repeat_calls; ++n)
+                        {
+                            const vmhook::method_proxy::value_t v{ proxy->call() };
+                            if (!v.is_void())
+                            {
+                                all_void = 0;
+                            }
+                        }
+                        g_void_repeat_all_void.store(all_void, std::memory_order_relaxed);
+                    }
+                }
+
                 // ---- CONTRAST: int returner — is_void() FALSE, value correct ----
                 {
                     auto proxy{ self->get_method("retInt") };
@@ -259,16 +517,23 @@ VMHOOK_JVM_MODULE(method_call_return_void)
         // =====================================================================
         // The returned value_t must report void...
         ctx.check("mcrv_void_instance_is_void", g_void_inst_is_void.load() == 1);
-        // ...and the body must have actually run (exactly once).
+        // ...and the body must have actually run.  voidInstanceHits is bumped by
+        // TWO instance dispatches: the name-only get_method("voidBumpInstance")
+        // above and the explicit-signature get_method("voidBumpInstance","()V")
+        // below, so the count must be EXACTLY 2 (proves both ran, neither
+        // doubled, and the two get_method paths land on the SAME body).
         ctx.check("mcrv_void_instance_side_effect",
-                  method_call_void::void_instance_hits() == 1);
+                  method_call_void::void_instance_hits() == 2);
 
         // =====================================================================
         //  void STATIC method (CallStaticVoidMethodA / static call_stub slot)
         // =====================================================================
         ctx.check("mcrv_void_static_is_void", g_void_stat_is_void.load() == 1);
+        // voidStaticHits is bumped by TWO static dispatches: static_method()
+        // (null receiver) and the static-via-instance get_method() below (the
+        // receiver is bound but is_static() must omit it).  Exactly 2.
         ctx.check("mcrv_void_static_side_effect",
-                  method_call_void::void_static_hits() == 1);
+                  method_call_void::void_static_hits() == 2);
 
         // =====================================================================
         //  void method with PRIMITIVE args (I, J, Z, D) — args delivered
@@ -314,6 +579,127 @@ VMHOOK_JVM_MODULE(method_call_return_void)
                   method_call_void::object_arg_identity() != 0
                   && method_call_void::object_arg_identity()
                          == method_call_void::self_identity());
+        // The SAME void Object body was also driven through a unique_ptr<wrapper>
+        // (the packer's is_unique_ptr branch, distinct from object_base); it must
+        // also report void.  Identity is already pinned above (same OOP wrapped).
+        ctx.check("mcrv_void_object_uptr_is_void", g_void_uptr_obj_is_void.load() == 1);
+
+        // =====================================================================
+        //  void method with BOUNDARY primitive args (INT_MIN/LONG_MIN/-0.0)
+        // =====================================================================
+        ctx.check("mcrv_void_edge_is_void", g_void_edge_is_void.load() == 1);
+        ctx.check("mcrv_void_edge_called", method_call_void::edge_prims_called());
+        ctx.check("mcrv_void_edge_arg_int",
+                  method_call_void::edge_prim_int() == k_edge_int);
+        ctx.check("mcrv_void_edge_arg_long",
+                  method_call_void::edge_prim_long() == k_edge_long);
+        ctx.check("mcrv_void_edge_arg_bool",
+                  method_call_void::edge_prim_bool() == k_edge_bool);
+        // -0.0 must round-trip with its sign bit intact (bit-exact, not == 0.0
+        // which would also accept +0.0): compare the raw bit patterns.
+        {
+            const double got{ method_call_void::edge_prim_double() };
+            std::uint64_t got_bits{ 0 };
+            std::uint64_t want_bits{ 0 };
+            const double want{ k_edge_double };
+            std::memcpy(&got_bits, &got, sizeof(got_bits));
+            std::memcpy(&want_bits, &want, sizeof(want_bits));
+            ctx.check("mcrv_void_edge_arg_double_neg_zero", got_bits == want_bits);
+        }
+
+        // =====================================================================
+        //  void method with NARROW / FLOAT args (byte, short, char, float)
+        // =====================================================================
+        ctx.check("mcrv_void_narrow_is_void", g_void_narrow_is_void.load() == 1);
+        ctx.check("mcrv_void_narrow_called", method_call_void::narrow_args_called());
+        ctx.check("mcrv_void_narrow_arg_byte",
+                  method_call_void::narrow_arg_byte() == k_narrow_byte);
+        ctx.check("mcrv_void_narrow_arg_short",
+                  method_call_void::narrow_arg_short() == k_narrow_short);
+        ctx.check("mcrv_void_narrow_arg_char",
+                  method_call_void::narrow_arg_char() == k_narrow_char);
+        ctx.check("mcrv_void_narrow_arg_float",
+                  method_call_void::narrow_arg_float() == k_narrow_float);
+
+        // =====================================================================
+        //  void method with an EMPTY String arg
+        // =====================================================================
+        ctx.check("mcrv_void_empty_string_is_void", g_void_empty_str_is_void.load() == 1);
+        ctx.check("mcrv_void_empty_string_called", method_call_void::empty_string_called());
+        // An empty std::string must marshal to a non-null length-0 String, NOT
+        // a null reference (len == -1 would mean the body saw null).
+        ctx.check("mcrv_void_empty_string_len_zero",
+                  method_call_void::empty_string_len() == 0);
+
+        // =====================================================================
+        //  void method with a NULL const char* String arg
+        // =====================================================================
+        // is_void() and "body ran" are path-INDEPENDENT and hard-asserted.  Note
+        // a null `const char*` arg is the ONE String case where the two dispatch
+        // backends genuinely DIVERGE: call_jni (JDK 21+) marshals nullptr -> Java
+        // null, while the call_stub path (JDK 8/11/17) routes it through
+        // make_java_string(empty) -> a non-null length-0 String.  So whether the
+        // body observed null is JDK-variant and is recorded as [INFO], never
+        // hard-asserted (the genuinely-null reference test below uses a null
+        // unique_ptr<wrapper>, which BOTH paths marshal as a real null).
+        ctx.check("mcrv_void_null_string_is_void", g_void_null_str_is_void.load() == 1);
+        ctx.check("mcrv_void_null_string_called", method_call_void::null_string_called());
+        ctx.record(std::string{ "[INFO] void null-const-char* arg observed as " }
+                   + (method_call_void::null_string_was_null()
+                          ? "Java null (call_jni nullptr convention)"
+                          : "empty String (call_stub make_java_string path)"));
+
+        // =====================================================================
+        //  void method with a NULL Object arg
+        // =====================================================================
+        ctx.check("mcrv_void_null_object_is_void", g_void_null_obj_is_void.load() == 1);
+        ctx.check("mcrv_void_null_object_called", method_call_void::null_object_called());
+        ctx.check("mcrv_void_null_object_was_null", method_call_void::null_object_was_null());
+
+        // =====================================================================
+        //  void method with MANY (six) int args
+        // =====================================================================
+        ctx.check("mcrv_void_many_is_void", g_void_many_is_void.load() == 1);
+        ctx.check("mcrv_void_many_called", method_call_void::many_args_called());
+        ctx.check("mcrv_void_many_sum", method_call_void::many_args_sum() == k_many_sum);
+        ctx.check("mcrv_void_many_last", method_call_void::many_args_last() == k_many_f);
+
+        // =====================================================================
+        //  void method with a String arg via the const char* packer branch
+        // =====================================================================
+        ctx.check("mcrv_void_cstr_is_void", g_void_cstr_is_void.load() == 1);
+        ctx.check("mcrv_void_cstr_called", method_call_void::cstr_arg_called());
+        ctx.check("mcrv_void_cstr_len_exact",
+                  static_cast<std::size_t>(method_call_void::cstr_arg_len())
+                      == std::string_view{ k_cstr_arg }.size());
+        ctx.check("mcrv_void_cstr_value_exact",
+                  method_call_void::cstr_arg() == std::string{ k_cstr_arg });
+
+        // =====================================================================
+        //  STATIC void WITH a primitive arg (no receiver + arg delivered)
+        // =====================================================================
+        ctx.check("mcrv_void_static_arg_is_void", g_void_static_arg_is_void.load() == 1);
+        ctx.check("mcrv_void_static_arg_called", method_call_void::static_arg_called());
+        ctx.check("mcrv_void_static_arg_value",
+                  method_call_void::static_arg_int() == k_static_arg);
+
+        // =====================================================================
+        //  STATIC void resolved THROUGH the instance wrapper, and an
+        //  EXPLICIT-signature instance void — both must report void.  (Their
+        //  side effects are folded into the == 2 hit-count assertions above.)
+        // =====================================================================
+        ctx.check("mcrv_void_static_via_instance_is_void",
+                  g_void_static_via_inst_is_void.load() == 1);
+        ctx.check("mcrv_void_explicit_signature_is_void",
+                  g_void_sig_is_void.load() == 1);
+
+        // =====================================================================
+        //  REPEAT dispatch — every call reported void AND the body ran exactly
+        //  k_repeat_calls times (no drop, no double-dispatch, no poisoning).
+        // =====================================================================
+        ctx.check("mcrv_void_repeat_all_void", g_void_repeat_all_void.load() == 1);
+        ctx.check("mcrv_void_repeat_count_exact",
+                  method_call_void::void_repeat_hits() == k_repeat_calls);
 
         // =====================================================================
         //  CONTRAST: an int return must NOT be reported as void or string

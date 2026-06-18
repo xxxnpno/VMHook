@@ -66,6 +66,8 @@ public final class HookChaining
      *   6 = a called A_REPEAT times, b once, c once (per-method count fidelity)
      *   7 = a once + s(int) once        (instance + static share the stub)
      *   8 = e() once + d(double) once   (no-arg frame + two-slot double)
+     *   9 = a once + s(int) S_REPEAT times (static-method count fidelity; the
+     *       instance sibling fires once while the static sibling fires many)
      */
     public static volatile int mode;
 
@@ -105,6 +107,8 @@ public final class HookChaining
     public static final int    S_ARG     = 21;
     /** How many times mode 6 calls a(int) (per-method count fidelity check). */
     public static final int    A_REPEAT  = 4;
+    /** How many times mode 9 calls the STATIC s(int) (static count fidelity). */
+    public static final int    S_REPEAT  = 3;
 
     // ---- Hookable methods (distinct argument-decode shapes) ----------------
 
@@ -226,6 +230,19 @@ public final class HookChaining
         dResult = obj.d(D_ARG);          dCalls += 1;
     }
 
+    /** a (instance) once + s (static) S_REPEAT times: static count fidelity. */
+    private static void runAAndStaticN()
+    {
+        final HookChaining obj = new HookChaining();
+        obj.seed = SEED;
+        aResult = obj.a(A_ARG);          aCalls += 1;
+        for (int n = 0; n < S_REPEAT; ++n)
+        {
+            sResult = s(S_ARG);
+            sCalls += 1;
+        }
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -264,6 +281,9 @@ public final class HookChaining
                         break;
                     case 8:
                         runEAndD();
+                        break;
+                    case 9:
+                        runAAndStaticN();
                         break;
                     default:
                         break;
