@@ -74,9 +74,11 @@
 #include "../harness.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace
@@ -215,6 +217,91 @@ namespace
                 oe::set_go(value);
             },
             []() { return oe::get_done(); });
+    }
+
+    // ---- Force Throwable.fillInStackTrace back into the interpreter so the
+    //      on_exception i2i (interpreter-entry) detour fires even when a LARGER
+    //      suite has already JIT-COMPILED it. -------------------------------------
+    //
+    // WHY THIS IS REQUIRED (the java8-only deterministic failure this module hit):
+    // on_exception() patches Throwable.fillInStackTrace()'s INTERPRETER entry
+    // (the i2i stub) via vmhook::hook<T>.  A compiled call to fillInStackTrace
+    // bypasses that interpreter entry entirely, so the detour does not fire on a
+    // method that is already in the code cache.  By the time on_exception runs in
+    // the GROWN JVM suite, every prior module's exceptions have called
+    // fillInStackTrace so many times that java8's aggressive (non-tiered) JIT has
+    // compiled it — so the watcher reports running()==true (the i2i entry IS
+    // patched) yet NEVER fires.  java11..26 tiered compilation still routes the
+    // test's own throw through the interpreter at this point, so they fire without
+    // help; but we must not depend on that timing.
+    //
+    // The fix mirrors the install-after-JIT workflow already used by hook_basic /
+    // hook_install_after_jit / make_java_string: deoptimize_methods_if() scoped to
+    // java/lang/Throwable nulls Method::_code on any CURRENTLY-compiled
+    // fillInStackTrace and repoints its entries through the interpreter i2i patch;
+    // the NO_COMPILE flag vmhook::hook<T> already armed then keeps it interpreted.
+    // deoptimize_methods_if only touches methods whose _code != null, so on a JDK /
+    // smaller-suite where fillInStackTrace is still interpreted this is a harmless
+    // no-op.  The walk is crash-safe by construction (every klass / Method / array
+    // / adapter read is fault-safe inside the library) and is the same full-graph
+    // walk hook_basic / deoptimize_methods already run in this suite, so it adds no
+    // new platform/JDK risk class.
+    //
+    // A bounded settle loop (deopt -> verify_hooks -> drive one genuine ISE ->
+    // re-check) absorbs an async recompile that lands between deopt and throw on
+    // the tiered JDKs, exactly like hook_basic's settle_interpreter_route.  It is
+    // BEST-EFFORT: it stops the instant the callback fires, and if the method
+    // genuinely cannot be driven to the interpreter route within the budget it
+    // simply returns and the module's existing HARD firing assertions still catch a
+    // real regression — the firing checks are NOT softened anywhere.
+    auto deopt_fill_in_stack_trace_until_fires(vmhook_test::context& ctx,
+                                               bool                  trap_live) -> void
+    {
+        if (!trap_live)
+        {
+            return;   // Nothing armed to settle (the hook was uninstallable).
+        }
+
+        constexpr int  k_settle_attempts{ 8 };
+        std::size_t    last_deopted{ 0 };
+        for (int attempt{ 0 }; attempt < k_settle_attempts; ++attempt)
+        {
+            // Deopt any CURRENTLY-compiled java/lang/Throwable method (this nulls
+            // fillInStackTrace's _code and routes it through the patched i2i entry).
+            last_deopted = vmhook::deoptimize_methods_if(
+                [](const std::string& class_name, vmhook::hotspot::method*) -> bool
+                {
+                    return class_name == "java/lang/Throwable";
+                });
+            // Re-arm NO_COMPILE / re-apply the hook's deopt so a just-landed
+            // recompile is absorbed.  No-op on a clean, interpreted hook.
+            (void)vmhook::verify_hooks();
+
+            reset_primary();
+            const bool done{ drive(ctx, 1) };
+            if (done && g_primary_total.load() > 0)
+            {
+                ctx.record(std::string{ "[INFO] on_exception: forced "
+                                        "Throwable.fillInStackTrace to the interpreter "
+                                        "(deopt attempt " } + std::to_string(attempt + 1)
+                           + ", " + std::to_string(last_deopted)
+                           + " method(s) deoptimised this attempt); the i2i detour now "
+                             "fires on this JDK/suite (java8 with a pre-JIT-compiled "
+                             "fillInStackTrace included).");
+                return;
+            }
+            // Let an in-flight compile / safepoint settle before re-reading.  40 ms
+            // matches the cadence hook_basic / make_java_string use for the same
+            // async-recompile race on java24-26.
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 40 });
+        }
+        ctx.record(std::string{ "[INFO] on_exception: after " }
+                   + std::to_string(k_settle_attempts)
+                   + " deopt/settle attempts on Throwable.fillInStackTrace the callback "
+                     "has not fired yet (last deopt touched "
+                   + std::to_string(last_deopted)
+                   + " method(s)); the per-scenario HARD firing assertions below will "
+                     "decide — they are not softened by this best-effort settle.");
     }
 
     // ---- The primary observing callback: tallies by type.  Touches ONLY
@@ -361,6 +448,15 @@ VMHOOK_JVM_MODULE(on_exception)
                + " (trap " + (trap_live ? "LIVE — fillInStackTrace hooked"
                                         : "DEAD — fillInStackTrace not hookable in this build/JDK")
                + ").");
+
+    // Force a possibly-already-JIT-compiled Throwable.fillInStackTrace back to the
+    // interpreter so the i2i detour fires regardless of how warm the method got in
+    // the modules that ran before us.  Without this, java8's aggressive JIT under
+    // the grown suite leaves running()==true but the watcher NEVER firing (the
+    // deterministic failure this module hit); the deopt makes firing reliable on
+    // every JDK while keeping java11..26 hard-asserted (a no-op there).  Best-effort
+    // and crash-safe — see the helper's contract.
+    deopt_fill_in_stack_trace_until_fires(ctx, trap_live);
 
     // =====================================================================
     //  2. Primary RuntimeException baseline: a GENUINE IllegalStateException
@@ -798,6 +894,13 @@ VMHOOK_JVM_MODULE(on_exception)
             ctx.check("rearm_after_shutdown_handle_empty_when_uninstallable",
                       fresh_running == false);
         }
+
+        // Same deopt as the initial install: shutdown_hooks() cleared NO_COMPILE on
+        // the old hook, so Throwable.fillInStackTrace may have been (re-)JIT-compiled
+        // by the time we re-arm.  Force it back to the interpreter so the re-armed
+        // i2i detour fires on java8 too; the fresh hook<T> re-armed NO_COMPILE, so it
+        // stays interpreted.  No-op when already interpreted.
+        deopt_fill_in_stack_trace_until_fires(ctx, fresh_running);
 
         reset_primary();
         const bool rearm_done{ drive(ctx, 1) };
