@@ -37,3 +37,9 @@ java_stderr.txt
 # and owning its exhaustive JVM test module.
 .claude/*
 !.claude/agents/
+
+# Obsidian: only the curated vault-root audit/graph/.obsidian/ is tracked (emitted by
+# generate.py). Ignore stray per-user state + accidentally-opened-subfolder vaults.
+audit/graph/**/workspace.json
+audit/graph/categories/.obsidian/
+audit/graph/categories/features/
