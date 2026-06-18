@@ -45,6 +45,21 @@ public final class HookBasic
      *   6 = instance wideArgs(boolean,double,String,int) (boolean/double/String decode + self)
      *   7 = instance touch() ONE call, used AFTER the module dropped its handle
      *       (proves the scoped_hook uninstalled — detour must NOT fire)
+     *
+     *   --- Return-value interception + arg mutation + teardown-cycle scenarios ---
+     *   8  = retInt(int)      : hook overrides the int return         (set<int>)
+     *   9  = retLong(int)     : hook overrides the long return        (set<long>)
+     *   10 = retDouble(int)   : hook overrides the double return      (set<double>, xmm0)
+     *   11 = retFloat(int)    : hook overrides the float return       (set<float>, xmm0/32)
+     *   12 = retBoolean(int)  : hook overrides the boolean return     (set<bool>)
+     *   13 = retByte(int)     : hook overrides a NEGATIVE byte return (sign-extension)
+     *   14 = retShort(int)    : hook overrides a NEGATIVE short return (sign-extension)
+     *   15 = retChar(int)     : hook overrides a char return          (zero-extension)
+     *   16 = getName()        : hook returns null reference           (set<wrapper>(nullptr))
+     *   17 = retInt(int)      : hook calls cancel() WITHOUT set -> Java observes 0
+     *   18 = touch(int)       : hook mutates the delta arg via set_arg -> body sees it
+     *   19 = touch(int)       : re-install probe (one call; counted like mode 1 but x1)
+     *   20 = retInt(int)      : plain (non-scoped) hook firing probe (one call)
      */
     public static volatile int mode;
 
@@ -81,6 +96,26 @@ public final class HookBasic
     /** Original results from the two-instance scenario. */
     public static volatile int twoInstanceResultA;
     public static volatile int twoInstanceResultB;
+
+    // ---- Return-value interception observations (modes 8-20) ---------------
+    /** What Java actually observed as the return of each typed ret* method. */
+    public static volatile int     retIntObserved;
+    public static volatile long    retLongObserved;
+    public static volatile double  retDoubleObserved;
+    public static volatile float   retFloatObserved;
+    public static volatile boolean retBooleanObserved;
+    public static volatile byte    retByteObserved;
+    public static volatile short   retShortObserved;
+    public static volatile char    retCharObserved;
+    /** Whether getName() came back null (reference-null override proof). */
+    public static volatile boolean nameWasNull;
+    /** touch() result after the hook mutated its delta arg via set_arg. */
+    public static volatile int     mutatedTouchResult;
+    /** touch() result for the re-install / plain-hook firing probes. */
+    public static volatile int     reinstallTouchResult;
+
+    /** The UN-hooked natural return of retInt() (sanity baseline). */
+    public static final int  RET_INT_NATURAL = 1;
 
     /** How many calls each mode is expected to drive (mirrored on native side). */
     public static final int INSTANCE_CALLS = 3;
@@ -150,6 +185,38 @@ public final class HookBasic
         final int slen = (s == null) ? -1 : s.length();
         return (flag ? 1.0 : 0.0) + d + slen + i;
     }
+
+    // ---- Typed-return hookable methods (return-value interception) ---------
+    // Each naturally returns a known value; a hook may override it via set<T>.
+    // The native module proves Java observes the OVERRIDDEN value (set path),
+    // the natural value (allow-through), or 0/null (cancel / null override).
+
+    /** Natural return: x + 1.  Used for int set + cancel + plain-hook probes. */
+    public int retInt(final int x)        { return x + 1; }
+
+    /** Natural return: x + 1 as a long. */
+    public long retLong(final int x)      { return (long) x + 1L; }
+
+    /** Natural return: x + 0.5 as a double. */
+    public double retDouble(final int x)  { return x + 0.5; }
+
+    /** Natural return: x + 0.25 as a float. */
+    public float retFloat(final int x)    { return x + 0.25f; }
+
+    /** Natural return: x is even. */
+    public boolean retBoolean(final int x) { return (x & 1) == 0; }
+
+    /** Natural return: low byte of x. */
+    public byte retByte(final int x)      { return (byte) x; }
+
+    /** Natural return: low short of x. */
+    public short retShort(final int x)    { return (short) x; }
+
+    /** Natural return: x as a char. */
+    public char retChar(final int x)      { return (char) x; }
+
+    /** Natural return: a non-null String (hook may force null). */
+    public String getName()              { return "HookBasic"; }
 
     private static void runInstanceTouch()
     {
@@ -223,6 +290,49 @@ public final class HookBasic
         instanceCallsMade = 1;
     }
 
+    // ---- Return-value interception drivers --------------------------------
+    // Each performs exactly ONE call to the hooked method and records what
+    // Java observes as the return.  The native module sets the hook BEFORE
+    // raising go, so the observed value reflects any set<T>/cancel override.
+
+    private static void runRetInt()     { retIntObserved     = new HookBasic().retInt(RET_INT_NATURAL); }
+    private static void runRetLong()    { retLongObserved    = new HookBasic().retLong(10); }
+    private static void runRetDouble()  { retDoubleObserved  = new HookBasic().retDouble(10); }
+    private static void runRetFloat()   { retFloatObserved   = new HookBasic().retFloat(10); }
+    private static void runRetBoolean() { retBooleanObserved = new HookBasic().retBoolean(3); }
+    private static void runRetByte()    { retByteObserved    = new HookBasic().retByte(0); }
+    private static void runRetShort()   { retShortObserved   = new HookBasic().retShort(0); }
+    private static void runRetChar()    { retCharObserved    = new HookBasic().retChar(0); }
+
+    private static void runGetName()
+    {
+        final String n = new HookBasic().getName();
+        nameWasNull = (n == null);
+    }
+
+    private static void runMutateArg()
+    {
+        // touch(int): the hook overwrites the delta arg via set_arg, then allows
+        // the body through, so the result reflects the MUTATED delta.
+        final HookBasic obj = new HookBasic();
+        obj.seed = 1000;
+        mutatedTouchResult = obj.touch(1);   // hook rewrites delta -> body sees it
+    }
+
+    private static void runReinstallTouch()
+    {
+        // One touch() call used by the re-install + plain-hook firing probes.
+        final HookBasic obj = new HookBasic();
+        obj.seed = 1000;
+        reinstallTouchResult = obj.touch(TOUCH_DELTA_0);
+    }
+
+    private static void runPlainRetInt()
+    {
+        // One retInt() call for the plain (non-scoped) hook firing probe.
+        retIntObserved = new HookBasic().retInt(RET_INT_NATURAL);
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -258,6 +368,45 @@ public final class HookBasic
                         break;
                     case 7:
                         runUninstallProbe();
+                        break;
+                    case 8:
+                        runRetInt();
+                        break;
+                    case 9:
+                        runRetLong();
+                        break;
+                    case 10:
+                        runRetDouble();
+                        break;
+                    case 11:
+                        runRetFloat();
+                        break;
+                    case 12:
+                        runRetBoolean();
+                        break;
+                    case 13:
+                        runRetByte();
+                        break;
+                    case 14:
+                        runRetShort();
+                        break;
+                    case 15:
+                        runRetChar();
+                        break;
+                    case 16:
+                        runGetName();
+                        break;
+                    case 17:
+                        runRetInt();
+                        break;
+                    case 18:
+                        runMutateArg();
+                        break;
+                    case 19:
+                        runReinstallTouch();
+                        break;
+                    case 20:
+                        runPlainRetInt();
                         break;
                     default:
                         break;

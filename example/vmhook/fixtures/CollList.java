@@ -422,6 +422,88 @@ public final class CollList
     /** 1000-element LinkedList (round large size; chain walk at scale). */
     public final LinkedList<Elem> linkThousand = new LinkedList<Elem>();
 
+    // ── All-null / null-at-boundary lists (null-PATTERN coverage) ────────────
+    /** Total length of the all-null and null-boundary lists. */
+    public static final int NULL_PATTERN_LEN = 4;
+
+    /**
+     * ArrayList whose EVERY slot is null.  Proves the walk emits exactly
+     * NULL_PATTERN_LEN slots, all null (null_count == size, no element decoded) —
+     * the degenerate all-null case the single-null lists do not cover.
+     */
+    public final ArrayList<Elem> arrAllNull = new ArrayList<Elem>();
+
+    /** LinkedList whose every Node.item is null (all-null chain walk). */
+    public final LinkedList<Elem> linkAllNull = new LinkedList<Elem>();
+
+    /**
+     * ArrayList whose FIRST slot (index 0) is null, the rest non-null with
+     * id == index.  Null at the head boundary — distinct from NULL_AT (middle).
+     */
+    public final ArrayList<Elem> arrNullFirst = new ArrayList<Elem>();
+
+    /**
+     * ArrayList whose LAST slot (index NULL_PATTERN_LEN-1) is null, the rest
+     * non-null.  Null at the tail boundary — proves the bound is `size` and the
+     * trailing null is a REAL element slot, not a phantom capacity-tail null.
+     */
+    public final ArrayList<Elem> arrNullLast = new ArrayList<Elem>();
+
+    /** LinkedList whose first Node.item is null (null at head of the chain). */
+    public final LinkedList<Elem> linkNullFirst = new LinkedList<Elem>();
+
+    // ── Extra boxed element types (Boolean / Byte / Short / Character / Double)
+    /** Element count of the small boxed-type lists. */
+    public static final int BOX_LEN = 3;
+
+    /**
+     * ArrayList&lt;Boolean&gt; alternating false,true,false.  java.lang.Boolean.value
+     * is a boolean; the native side reads it as (value() != 0) and asserts the
+     * pattern, proving a Z-typed boxed primitive element decodes through the
+     * element-type-agnostic backing walk.
+     */
+    public final ArrayList<Boolean> boolArrList = new ArrayList<Boolean>();
+
+    /**
+     * ArrayList&lt;Byte&gt; with values 0,1,2.  java.lang.Byte.value is a byte; the
+     * native side reads it as an int and asserts value == index.
+     */
+    public final ArrayList<Byte> byteArrList = new ArrayList<Byte>();
+
+    /**
+     * ArrayList&lt;Short&gt; with values 0,1,2.  java.lang.Short.value is a short; the
+     * native side reads it as an int and asserts value == index.
+     */
+    public final ArrayList<Short> shortArrList = new ArrayList<Short>();
+
+    /**
+     * ArrayList&lt;Character&gt; with values 'a','b','c'.  java.lang.Character.value is
+     * a char; the native side reads it as an int and asserts value == 'a'+index.
+     */
+    public final ArrayList<Character> charArrList = new ArrayList<Character>();
+
+    /**
+     * ArrayList&lt;Double&gt; with values 0.0,1.0,2.0.  java.lang.Double.value is a
+     * double; the native side reads it FULL-WIDTH and asserts value == index — a
+     * wide (8-byte) boxed primitive, the floating-point analogue of the Long list.
+     */
+    public final ArrayList<Double> doubleArrList = new ArrayList<Double>();
+
+    /** First Character value the native side mirrors ('a'). */
+    public static final char CHAR_BASE = 'a';
+
+    // ── Nested list whose inners are Vector / COW (broaden inner re-walk) ─────
+    /** Outer length of the mixed-shape nested list (Vector inner + COW inner). */
+    public static final int NESTED_MIX_OUTER = 2;
+
+    /**
+     * Outer ArrayList whose elements are a Vector and a CopyOnWriteArrayList (each
+     * NESTED_INNER elements).  Proves the inner shape-detecting re-walk dispatches
+     * correctly to the Vector ("elementCount") and COW ("array") backing shapes —
+     * the nested case only covered ArrayList/LinkedList inners before.
+     */
+    public final ArrayList<List<Elem>> nestedMixed = new ArrayList<List<Elem>>();
+
     // ── Nested List-of-Map (outer ArrayList walk -> inner Map OOPs) ──────────
     /**
      * Outer ArrayList whose elements are HashMaps.  The outer takes the ArrayList
@@ -636,6 +718,50 @@ public final class CollList
         {
             arrThousand.add(new Elem(i));
             linkThousand.add(new Elem(i));
+        }
+
+        // All-null lists: every slot null in both backing families.
+        for (int i = 0; i < NULL_PATTERN_LEN; ++i)
+        {
+            arrAllNull.add(null);
+            linkAllNull.add(null);
+        }
+
+        // Null at the head boundary (index 0 null, rest id == index).
+        for (int i = 0; i < NULL_PATTERN_LEN; ++i)
+        {
+            arrNullFirst.add(i == 0 ? null : new Elem(i));
+            linkNullFirst.add(i == 0 ? null : new Elem(i));
+        }
+
+        // Null at the tail boundary (last slot null, rest id == index).
+        for (int i = 0; i < NULL_PATTERN_LEN; ++i)
+        {
+            arrNullLast.add(i == NULL_PATTERN_LEN - 1 ? null : new Elem(i));
+        }
+
+        // Boxed element types beyond Integer/Long: Boolean / Byte / Short /
+        // Character / Double.  Each is BOX_LEN small elements.
+        for (int i = 0; i < BOX_LEN; ++i)
+        {
+            boolArrList.add(Boolean.valueOf(i == 1));      // false,true,false
+            byteArrList.add(Byte.valueOf((byte) i));       // 0,1,2
+            shortArrList.add(Short.valueOf((short) i));    // 0,1,2
+            charArrList.add(Character.valueOf((char) (CHAR_BASE + i))); // a,b,c
+            doubleArrList.add(Double.valueOf((double) i)); // 0.0,1.0,2.0
+        }
+
+        // Mixed-shape nested list: a Vector inner and a COW inner, each dense.
+        {
+            final Vector<Elem> innerVec = new Vector<Elem>();
+            final CopyOnWriteArrayList<Elem> innerCow = new CopyOnWriteArrayList<Elem>();
+            for (int i = 0; i < NESTED_INNER; ++i)
+            {
+                innerVec.add(new Elem(i));
+                innerCow.add(new Elem(i));
+            }
+            nestedMixed.add(innerVec);
+            nestedMixed.add(innerCow);
         }
 
         // Nested List-of-Map: MAP_OUTER HashMaps, each with MAP_INNER entries.

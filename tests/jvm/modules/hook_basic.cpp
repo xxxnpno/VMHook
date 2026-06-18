@@ -92,6 +92,19 @@ namespace
         static auto get_two_instance_result_a() -> std::int32_t { return static_field("twoInstanceResultA")->get(); }
         static auto get_two_instance_result_b() -> std::int32_t { return static_field("twoInstanceResultB")->get(); }
 
+        // --- return-value interception observations (modes 8-20) ----------
+        static auto get_ret_int_observed() -> std::int32_t     { return static_field("retIntObserved")->get(); }
+        static auto get_ret_long_observed() -> std::int64_t    { return static_field("retLongObserved")->get(); }
+        static auto get_ret_double_observed() -> double        { return static_field("retDoubleObserved")->get(); }
+        static auto get_ret_float_observed() -> float          { return static_field("retFloatObserved")->get(); }
+        static auto get_ret_boolean_observed() -> bool         { return static_field("retBooleanObserved")->get(); }
+        static auto get_ret_byte_observed() -> std::int8_t     { return static_field("retByteObserved")->get(); }
+        static auto get_ret_short_observed() -> std::int16_t   { return static_field("retShortObserved")->get(); }
+        static auto get_ret_char_observed() -> std::uint16_t   { return static_field("retCharObserved")->get(); }
+        static auto get_name_was_null() -> bool                { return static_field("nameWasNull")->get(); }
+        static auto get_mutated_touch_result() -> std::int32_t { return static_field("mutatedTouchResult")->get(); }
+        static auto get_reinstall_touch_result() -> std::int32_t { return static_field("reinstallTouchResult")->get(); }
+
         // Reads an instance's own seed (proves `self` is the right object).
         auto seed() const -> std::int32_t { return get_field("seed")->get(); }
     };
@@ -113,6 +126,22 @@ namespace
     constexpr double       WIDE_D{ 2.5 };
     constexpr std::int32_t WIDE_I{ 77 };
     constexpr std::int32_t PRIMARY_SEED{ 1000 };
+
+    // ---- Return-value interception constants (modes 8-20) ------------------
+    // The Java fixture calls each ret*(x) with x==RET_INT_X and naturally
+    // returns the "natural" value; the hook OVERRIDES it with the "*_OVERRIDE"
+    // value, and we assert Java observed the override (not the natural value).
+    constexpr std::int32_t RET_INT_NATURAL{ 1 };            // retInt(1) -> 2 natural
+    constexpr std::int32_t RET_INT_NATURAL_RESULT{ 2 };     // x + 1
+    constexpr std::int32_t RET_INT_OVERRIDE{ 0x5EED1234 };  // distinct from natural
+    constexpr std::int64_t RET_LONG_OVERRIDE{ -0x0123456789ABCDEFLL };
+    constexpr double       RET_DOUBLE_OVERRIDE{ -987654.3125 };  // exact in IEEE-754
+    constexpr float        RET_FLOAT_OVERRIDE{ -123.5f };        // exact in IEEE-754
+    constexpr std::int8_t  RET_BYTE_OVERRIDE{ static_cast<std::int8_t>(-7) };
+    constexpr std::int16_t RET_SHORT_OVERRIDE{ static_cast<std::int16_t>(-31000) };
+    constexpr std::uint16_t RET_CHAR_OVERRIDE{ static_cast<std::uint16_t>(0xBEEF) };
+    // mode 18: hook rewrites touch()'s delta arg to this value.
+    constexpr std::int32_t MUTATED_DELTA{ 555 };
 
     // The fully-qualified (JVM-internal, slash-form) class name of the fixture.
     // Used both to locate the live Method* (for the interpreter-route settle)
@@ -157,6 +186,12 @@ namespace
     std::atomic<bool>         g_wide_s_ok{ false };
     std::atomic<bool>         g_wide_i_ok{ false };
 
+    // Return-value interception observations (modes 8-20): the decoded incoming
+    // arg the detour saw, so we can prove the detour ran on the SAME call whose
+    // return Java later observed as overridden.
+    std::atomic<std::int32_t> g_ret_arg_seen{ -1 };
+    std::atomic<bool>         g_setarg_ok{ false };     // set_arg returned true
+
     auto reset_observations() -> void
     {
         g_fire_count.store(0);
@@ -182,6 +217,8 @@ namespace
         g_wide_d_ok.store(false);
         g_wide_s_ok.store(false);
         g_wide_i_ok.store(false);
+        g_ret_arg_seen.store(-1);
+        g_setarg_ok.store(false);
     }
 
     // Drives exactly one probe cycle for `mode`: resets observations + the
@@ -669,6 +706,445 @@ VMHOOK_JVM_MODULE(hook_basic)
         // allow-through: wideArgs returns 1.0 + 2.5 + len("vmhook")(=6) + 77 = 86.5
         ctx.check("wide_allow_through_result",
                   hook_basic_fixture::get_wide_result() == (1.0 + WIDE_D + 6.0 + WIDE_I));
+    }
+
+    // =====================================================================
+    // Scenario 8 — RETURN-VALUE INTERCEPTION (set<int>): the detour overrides
+    //              the int return, so Java observes the OVERRIDE, not seed-natural.
+    //              Proves the cancel/retval short-circuit path (rax) for a 32-bit
+    //              int return and that the override differs from the natural value.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "retInt", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t x)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                g_ret_arg_seen.store(x, std::memory_order_relaxed);
+                ret.set(RET_INT_OVERRIDE);   // suppress body, force this return
+            }) };
+
+        ctx.check("retint_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("retInt", "(I)I") };
+        bool done{ false };
+        drive_until_fires(ctx, 8, m, 1, 6, done);
+        ctx.check("retint_probe_completed", done);
+
+        ctx.check("retint_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("retint_detour_saw_arg", g_ret_arg_seen.load() == RET_INT_NATURAL);
+        // The natural (un-hooked) return is RET_INT_NATURAL_RESULT; the override
+        // must be observed instead, and must DIFFER from natural so a no-op hook
+        // (body ran) cannot accidentally pass.
+        ctx.check("retint_override_observed",
+                  hook_basic_fixture::get_ret_int_observed() == RET_INT_OVERRIDE);
+        ctx.check("retint_override_not_natural",
+                  hook_basic_fixture::get_ret_int_observed() != RET_INT_NATURAL_RESULT);
+    }
+
+    // =====================================================================
+    // Scenario 9 — set<long>: override a 64-bit long return (full-width rax).
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "retLong", "(I)J",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                ret.set(RET_LONG_OVERRIDE);
+            }) };
+
+        ctx.check("retlong_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("retLong", "(I)J") };
+        bool done{ false };
+        drive_until_fires(ctx, 9, m, 1, 6, done);
+        ctx.check("retlong_probe_completed", done);
+
+        ctx.check("retlong_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("retlong_override_observed",
+                  hook_basic_fixture::get_ret_long_observed() == RET_LONG_OVERRIDE);
+        // Natural would be 11; the high 32 bits of the override are non-zero, so
+        // this also proves the FULL 64 bits survived (not just the low word).
+        ctx.check("retlong_override_high_bits_survived",
+                  (hook_basic_fixture::get_ret_long_observed() >> 32) != 0);
+    }
+
+    // =====================================================================
+    // Scenario 10 — set<double>: override a double return (lands in xmm0 via the
+    //               trampoline's `movq xmm0, rax`).  Value chosen exact in IEEE-754.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "retDouble", "(I)D",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                ret.set(RET_DOUBLE_OVERRIDE);
+            }) };
+
+        ctx.check("retdouble_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("retDouble", "(I)D") };
+        bool done{ false };
+        drive_until_fires(ctx, 10, m, 1, 6, done);
+        ctx.check("retdouble_probe_completed", done);
+
+        ctx.check("retdouble_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("retdouble_override_observed",
+                  hook_basic_fixture::get_ret_double_observed() == RET_DOUBLE_OVERRIDE);
+    }
+
+    // =====================================================================
+    // Scenario 11 — set<float>: override a float return (xmm0, 32-bit lane).
+    //               Distinct from the double path (single-precision encoding).
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "retFloat", "(I)F",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                ret.set(RET_FLOAT_OVERRIDE);
+            }) };
+
+        ctx.check("retfloat_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("retFloat", "(I)F") };
+        bool done{ false };
+        drive_until_fires(ctx, 11, m, 1, 6, done);
+        ctx.check("retfloat_probe_completed", done);
+
+        ctx.check("retfloat_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("retfloat_override_observed",
+                  hook_basic_fixture::get_ret_float_observed() == RET_FLOAT_OVERRIDE);
+    }
+
+    // =====================================================================
+    // Scenario 12 — set<bool>: override a boolean return.  Natural retBoolean(3)
+    //               is false (3 is odd); the hook forces true, proving the boolean
+    //               return path and that the override flipped the natural answer.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "retBoolean", "(I)Z",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                ret.set(true);
+            }) };
+
+        ctx.check("retboolean_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("retBoolean", "(I)Z") };
+        bool done{ false };
+        drive_until_fires(ctx, 12, m, 1, 6, done);
+        ctx.check("retboolean_probe_completed", done);
+
+        ctx.check("retboolean_fired_exactly_once", g_fire_count.load() == 1);
+        // Natural retBoolean(3) == false; the override forces true.
+        ctx.check("retboolean_override_observed",
+                  hook_basic_fixture::get_ret_boolean_observed() == true);
+    }
+
+    // =====================================================================
+    // Scenario 13 — set<int8_t> of a NEGATIVE byte: proves return_value::set()
+    //               SIGN-EXTENDS sub-int signed returns (the -1 -> 0x..FF bug the
+    //               header documents).  Java reads it back as a signed byte.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "retByte", "(I)B",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                ret.set(RET_BYTE_OVERRIDE);
+            }) };
+
+        ctx.check("retbyte_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("retByte", "(I)B") };
+        bool done{ false };
+        drive_until_fires(ctx, 13, m, 1, 6, done);
+        ctx.check("retbyte_probe_completed", done);
+
+        ctx.check("retbyte_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("retbyte_negative_override_observed",
+                  hook_basic_fixture::get_ret_byte_observed() == RET_BYTE_OVERRIDE);
+        ctx.check("retbyte_override_is_negative",
+                  hook_basic_fixture::get_ret_byte_observed() < 0);
+    }
+
+    // =====================================================================
+    // Scenario 14 — set<int16_t> of a NEGATIVE short: same sign-extension proof
+    //               at 16-bit width.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "retShort", "(I)S",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                ret.set(RET_SHORT_OVERRIDE);
+            }) };
+
+        ctx.check("retshort_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("retShort", "(I)S") };
+        bool done{ false };
+        drive_until_fires(ctx, 14, m, 1, 6, done);
+        ctx.check("retshort_probe_completed", done);
+
+        ctx.check("retshort_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("retshort_negative_override_observed",
+                  hook_basic_fixture::get_ret_short_observed() == RET_SHORT_OVERRIDE);
+        ctx.check("retshort_override_is_negative",
+                  hook_basic_fixture::get_ret_short_observed() < 0);
+    }
+
+    // =====================================================================
+    // Scenario 15 — set<char>: override a char return (16-bit UNSIGNED, so a
+    //               high bit must ZERO-extend, not sign-extend).  Java reads the
+    //               char back; we compare against the unsigned override.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "retChar", "(I)C",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                ret.set(static_cast<char16_t>(RET_CHAR_OVERRIDE));
+            }) };
+
+        ctx.check("retchar_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("retChar", "(I)C") };
+        bool done{ false };
+        drive_until_fires(ctx, 15, m, 1, 6, done);
+        ctx.check("retchar_probe_completed", done);
+
+        ctx.check("retchar_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("retchar_override_observed",
+                  hook_basic_fixture::get_ret_char_observed() == RET_CHAR_OVERRIDE);
+        // 0xBEEF has the high bit set; a char must NOT sign-extend, so the
+        // observed value stays in [0, 0xFFFF] and equals the unsigned override.
+        ctx.check("retchar_zero_extended_high_bit",
+                  hook_basic_fixture::get_ret_char_observed() >= RET_CHAR_OVERRIDE);
+    }
+
+    // =====================================================================
+    // Scenario 16 — REFERENCE-NULL override: set<wrapper>(nullptr) on a method
+    //               returning String forces a null reference (writes 0 into the
+    //               retval slot).  Java observes getName() == null even though the
+    //               natural body returns a non-null String.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "getName", "()Ljava/lang/String;",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                ret.set<hook_basic_fixture>(nullptr);   // return null String
+            }) };
+
+        ctx.check("getname_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{
+            find_method("getName", "()Ljava/lang/String;") };
+        bool done{ false };
+        drive_until_fires(ctx, 16, m, 1, 6, done);
+        ctx.check("getname_probe_completed", done);
+
+        ctx.check("getname_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("getname_null_reference_override_observed",
+                  hook_basic_fixture::get_name_was_null());
+    }
+
+    // =====================================================================
+    // Scenario 17 — cancel() WITHOUT set(): the retval slot stays 0, so Java
+    //               observes 0 for an int method even though the body would have
+    //               returned RET_INT_NATURAL_RESULT.  Proves cancel suppresses the
+    //               body and the zero-initialised retval is what the caller sees.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "retInt", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                ret.cancel();   // suppress body, no explicit value -> retval == 0
+            }) };
+
+        ctx.check("cancel_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("retInt", "(I)I") };
+        bool done{ false };
+        drive_until_fires(ctx, 17, m, 1, 6, done);
+        ctx.check("cancel_probe_completed", done);
+
+        ctx.check("cancel_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("cancel_body_suppressed_returns_zero",
+                  hook_basic_fixture::get_ret_int_observed() == 0);
+        ctx.check("cancel_not_natural_result",
+                  hook_basic_fixture::get_ret_int_observed() != RET_INT_NATURAL_RESULT);
+    }
+
+    // =====================================================================
+    // Scenario 18 — set_arg(): the detour MUTATES touch()'s delta argument
+    //               in-place on the interpreter stack, then allows the body
+    //               through.  The original body now computes seed + MUTATED_DELTA,
+    //               proving argument injection reaches the running method body.
+    //               (touch(int): slot 0 == this, slot 1 == delta.)
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "touch", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t delta)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                g_ret_arg_seen.store(delta, std::memory_order_relaxed);
+                g_setarg_ok.store(ret.set_arg(1, std::int32_t{ MUTATED_DELTA }),
+                                  std::memory_order_relaxed);
+                // No set/cancel -> body runs with the rewritten delta.
+            }) };
+
+        ctx.check("setarg_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("touch", "(I)I") };
+        bool done{ false };
+        drive_until_fires(ctx, 18, m, 1, 6, done);
+        ctx.check("setarg_probe_completed", done);
+
+        ctx.check("setarg_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("setarg_detour_saw_original_delta_1", g_ret_arg_seen.load() == 1);
+        ctx.check("setarg_write_succeeded", g_setarg_ok.load());
+        // Body computed seed(1000) + MUTATED_DELTA, NOT 1000 + 1.
+        ctx.check("setarg_body_saw_mutated_delta",
+                  hook_basic_fixture::get_mutated_touch_result()
+                      == (PRIMARY_SEED + MUTATED_DELTA));
+        ctx.check("setarg_body_not_original_delta",
+                  hook_basic_fixture::get_mutated_touch_result()
+                      != (PRIMARY_SEED + 1));
+    }
+
+    // =====================================================================
+    // Scenario 19 — INSTALL / TEARDOWN CYCLE: hook touch(), drop the handle,
+    //               then re-install a DIFFERENT detour on the SAME method and
+    //               prove the new detour fires.  Guards against a half-installed
+    //               method poisoning re-install (specialist flaw #1) on a clean
+    //               install path: a fresh scoped_hook on a previously-hooked-then-
+    //               released method must install and fire again.
+    // =====================================================================
+    {
+        // First cycle: install + fire + drop.
+        std::int32_t first_cycle_fires{ -1 };
+        {
+            auto h1{ vmhook::scoped_hook<hook_basic_fixture>(
+                "touch", "(I)I",
+                [](vmhook::return_value&,
+                   const std::unique_ptr<hook_basic_fixture>&,
+                   std::int32_t)
+                {
+                    g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                }) };
+            ctx.check("reinstall_first_cycle_installed", h1.installed());
+
+            vmhook::hotspot::method* const m{ find_method("touch", "(I)I") };
+            bool done{ false };
+            drive_until_fires(ctx, 19, m, 1, 6, done);
+            ctx.check("reinstall_first_cycle_probe_completed", done);
+            first_cycle_fires = g_fire_count.load();
+            ctx.check("reinstall_first_cycle_fired", first_cycle_fires == 1);
+        }
+        // h1 dropped here -> hook uninstalled.
+
+        // Second cycle: a fresh hook on the same Method* must install AND fire.
+        {
+            auto h2{ vmhook::scoped_hook<hook_basic_fixture>(
+                "touch", "(I)I",
+                [](vmhook::return_value&,
+                   const std::unique_ptr<hook_basic_fixture>&,
+                   std::int32_t delta)
+                {
+                    g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                    g_ret_arg_seen.store(delta, std::memory_order_relaxed);
+                }) };
+            ctx.check("reinstall_second_cycle_installed", h2.installed());
+
+            vmhook::hotspot::method* const m{ find_method("touch", "(I)I") };
+            bool done{ false };
+            drive_until_fires(ctx, 19, m, 1, 6, done);
+            ctx.check("reinstall_second_cycle_probe_completed", done);
+            ctx.check("reinstall_second_cycle_fired", g_fire_count.load() == 1);
+            ctx.check("reinstall_second_cycle_decoded_arg",
+                      g_ret_arg_seen.load() == TOUCH_DELTA_0);
+            // allow-through on the re-installed hook (body still ran).
+            ctx.check("reinstall_second_cycle_allow_through",
+                      hook_basic_fixture::get_reinstall_touch_result()
+                          == (PRIMARY_SEED + TOUCH_DELTA_0));
+        }
+    }
+
+    // =====================================================================
+    // Scenario 20 — PLAIN (non-scoped) hook<T> + explicit shutdown_hooks():
+    //               install via vmhook::hook<T> (no RAII handle), prove it fires,
+    //               then tear it down with shutdown_hooks() and prove a subsequent
+    //               call does NOT fire while the body still runs.  Exercises the
+    //               non-RAII install/teardown contract distinct from scoped_hook.
+    // =====================================================================
+    {
+        const bool installed{ vmhook::hook<hook_basic_fixture>(
+            "retInt", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t x)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                g_ret_arg_seen.store(x, std::memory_order_relaxed);
+                ret.set(RET_INT_OVERRIDE);
+            }) };
+        ctx.check("plain_hook_installed", installed);
+
+        vmhook::hotspot::method* const m{ find_method("retInt", "(I)I") };
+        bool done{ false };
+        drive_until_fires(ctx, 20, m, 1, 6, done);
+        ctx.check("plain_hook_probe_completed", done);
+        ctx.check("plain_hook_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("plain_hook_decoded_arg", g_ret_arg_seen.load() == RET_INT_NATURAL);
+        ctx.check("plain_hook_override_observed",
+                  hook_basic_fixture::get_ret_int_observed() == RET_INT_OVERRIDE);
+
+        // Tear it down explicitly (no RAII handle owns it).
+        vmhook::shutdown_hooks();
+
+        // After shutdown the detour must NOT fire and the natural body runs.
+        reset_observations();
+        const bool done2{ drive(ctx, 20) };
+        ctx.check("plain_hook_teardown_probe_completed", done2);
+        ctx.check("plain_hook_teardown_did_not_fire", g_fire_count.load() == 0);
+        ctx.check("plain_hook_teardown_natural_return",
+                  hook_basic_fixture::get_ret_int_observed() == RET_INT_NATURAL_RESULT);
     }
     }
     catch (const std::exception& ex)
