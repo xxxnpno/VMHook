@@ -35,7 +35,8 @@ param(
     [string[]] $Compilers = @(),     # empty => auto-detect (mingw + any of msvc/clang present)
     [switch]   $NoBuild,             # reuse existing per-compiler builds
     [switch]   $UnitOnly,            # build + ctest only; skip the JVM cells
-    [int]      $TimeoutSec = 120     # matches CI's 120 s stall timeout
+    [int]      $TimeoutSec = 120,    # matches CI's 120 s stall timeout
+    [int]      $Parallel  = 0        # concurrent cells: 0 = auto (RAM/core based), 1 = sequential, N = N at once
 )
 
 $ErrorActionPreference = 'Stop'
@@ -109,13 +110,35 @@ function Get-JavaHome([string] $major) {
     return (Split-Path -Parent (Split-Path -Parent $javac.FullName))
 }
 
-# ── MSVC environment import (cl / clang-cl need vcvars64 in the session) ──────
+# ── Visual Studio discovery (Build Tools or full IDE) ────────────────────────
+$script:VsPath = $null
+$script:VsPathResolved = $false
+function Get-VsInstallPath {
+    if ($script:VsPathResolved) { return $script:VsPath }
+    $script:VsPathResolved = $true
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        # -products * is REQUIRED to see Build Tools (the default filter only
+        # matches Community/Professional/Enterprise IDE installs).
+        $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if ($p) { $script:VsPath = "$p".Trim() }
+    }
+    return $script:VsPath
+}
+# The clang++ that ships with VS (Component.VC.Llvm.Clang) — MSVC-ABI, not on PATH.
+function Get-VsClangBin {
+    $p = Get-VsInstallPath
+    if (-not $p) { return $null }
+    $bin = Join-Path $p 'VC\Tools\Llvm\x64\bin'
+    if (Test-Path (Join-Path $bin 'clang++.exe')) { return $bin }
+    return $null
+}
+
+# ── MSVC environment import (cl / clang need vcvars64 in the session) ─────────
 $script:VcVarsImported = $false
 function Import-VcVars {
     if ($script:VcVarsImported) { return $true }
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    if (-not (Test-Path $vswhere)) { return $false }
-    $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    $vsPath = Get-VsInstallPath
     if (-not $vsPath) { return $false }
     $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
     if (-not (Test-Path $vcvars)) { return $false }
@@ -130,10 +153,11 @@ function Import-VcVars {
 function Detect-Compilers {
     $found = @()
     if (Get-Command g++ -ErrorAction SilentlyContinue) { $found += 'mingw' }
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    $haveVs  = (Test-Path $vswhere) -and (& $vswhere -latest -property installationPath 2>$null)
-    if ($haveVs) { $found += 'msvc' }
-    if ((Get-Command clang++ -ErrorAction SilentlyContinue) -and $haveVs) { $found += 'clang' }  # clang-cl needs the MSVC STL
+    $vs = Get-VsInstallPath
+    if ($vs) { $found += 'msvc' }
+    # clang needs the MSVC STL/linker (vcvars); accept clang++ on PATH OR the
+    # clang++ bundled inside the VS install (VC.Llvm.Clang component).
+    if ($vs -and ((Get-Command clang++ -ErrorAction SilentlyContinue) -or (Get-VsClangBin))) { $found += 'clang' }
     return $found
 }
 
@@ -159,6 +183,11 @@ function Build-Compiler([string] $c) {
     }
     if ($info.needVcVars) {
         if (-not (Import-VcVars)) { Write-Bad "$c : MSVC vcvars64 not found (install VS Build Tools w/ 'Desktop C++')"; return @{ ok = $false } }
+    }
+    if ($c -eq 'clang' -and -not (Get-Command clang++ -ErrorAction SilentlyContinue)) {
+        $cb = Get-VsClangBin
+        if ($cb) { $env:PATH = "$cb;$env:PATH"; Write-Note "clang : using VS-bundled clang++ ($cb)" }
+        else { Write-Bad "$c : clang++ not found (on PATH or in VS); install LLVM or the VS 'C++ Clang' component"; return @{ ok = $false } }
     }
     Write-Head "BUILD $c (CMake Release -> vmhook.dll + injector.exe)"
     $log = Join-Path $LogDir "build-$c.log"
@@ -249,27 +278,92 @@ function Run-Cell([string] $c, [string] $major, [hashtable] $build) {
 # ── Main ─────────────────────────────────────────────────────────────────────
 $detected = Detect-Compilers
 if ($Compilers.Count -eq 0) { $Compilers = $detected }
+
+# Auto-parallelism: bound by cores AND RAM — each cell is a live `java -Xmx4g`,
+# so budget ~5 GB/cell and leave ~4 GB for the OS. (GitHub parallelises freely
+# across separate runners; locally we are capped by one machine.)
+if ($Parallel -le 0) {
+    $cores = [Environment]::ProcessorCount
+    try { $ramGB = [int][math]::Floor((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB) } catch { $ramGB = 16 }
+    $byRam = [math]::Floor(($ramGB - 4) / 5)
+    $Parallel = [math]::Min($cores - 1, $byRam)
+    if ($Parallel -lt 1) { $Parallel = 1 }
+    if ($Parallel -gt 6) { $Parallel = 6 }
+}
+
 Write-Head "LOCAL CI  (closed env: $Env)"
 Write-Host "  repo        : $RepoRoot"
 Write-Host "  compilers   : requested [$($Compilers -join ', ')]  detected [$($detected -join ', ')]"
 Write-Host "  java        : [$($Java -join ', ')]"
+Write-Host "  parallelism : $Parallel concurrent cell(s)"
 $missing = $Compilers | Where-Object { $detected -notcontains $_ }
 if ($missing) { Write-Host "  unavailable : [$($missing -join ', ')] -> SKIPPED (install to extend coverage to those cells)" -ForegroundColor Yellow }
-$Compilers = $Compilers | Where-Object { $detected -contains $_ }
+$Compilers = @($Compilers | Where-Object { $detected -contains $_ })
 if (-not $Compilers) { Write-Bad "no usable compilers detected (need at least MinGW g++ on PATH)"; exit 2 }
 
 $results = @()
+
+# 1) Build every compiler up front (serial — builds are CPU-heavy) + ctest lane.
+$builds = @{}
 foreach ($c in $Compilers) {
     $build = Build-Compiler $c
-    if (-not $build.ok) { $results += @{ cell = "$c (build)"; status = 'BUILD-FAIL'; detail = "see logs\build-$c.log" }; continue }
+    if (-not $build.ok) { $results += @{ cell = "$c (build)"; status = 'BUILD-FAIL'; detail = "see logs\build-$c.log*" }; continue }
     if ($build.ContainsKey('ctestOk') -and -not $build.ctestOk) { $results += @{ cell = "$c ctest"; status = 'CTEST-FAIL'; detail = "no-JVM lane" } }
-    if ($UnitOnly) { continue }
-    foreach ($j in $Java) {
-        Write-Note "running cell $c . java $j ..."
-        $r = Run-Cell $c $j $build
-        if   ($r.status -eq 'PASS') { Write-Ok  "$($r.cell) : $($r.detail)$(if ($r.info) { "  ($($r.info) INFO)" })" }
-        else                        { Write-Bad "$($r.cell) : $($r.status) -- $($r.detail)" }
-        $results += $r
+    $builds[$c] = $build
+}
+
+if (-not $UnitOnly) {
+    # 2) Pre-resolve (download+extract) every JDK ONCE, serially, so concurrent
+    #    cells never race on the same download.
+    foreach ($j in $Java) { Write-Note "ensuring JDK $j present"; [void](Get-JavaHome "$j") }
+
+    $cells = @()
+    foreach ($c in @($builds.Keys)) { foreach ($j in $Java) { $cells += @{ c = $c; j = "$j" } } }
+
+    if ($Parallel -le 1 -or $cells.Count -le 1) {
+        # ── sequential ──
+        foreach ($cell in $cells) {
+            Write-Note "running cell $($cell.c) . java $($cell.j) ..."
+            $r = Run-Cell $cell.c $cell.j $builds[$cell.c]
+            if ($r.status -eq 'PASS') { Write-Ok "$($r.cell) : $($r.detail)$(if ($r.info) { "  ($($r.info) INFO)" })" } else { Write-Bad "$($r.cell) : $($r.status) -- $($r.detail)" }
+            $results += $r
+        }
+    } else {
+        # ── parallel ── each cell is an isolated single-cell subprocess that
+        #    reuses the pre-built compiler (-NoBuild) and runs in its own work
+        #    dir; throttled to $Parallel at once.
+        Write-Note "running $($cells.Count) cells, $Parallel at a time (each = javac + java -Xmx4g + inject)"
+        $pending = [System.Collections.ArrayList]@($cells)
+        $running = [System.Collections.ArrayList]@()
+        while ($pending.Count -gt 0 -or $running.Count -gt 0) {
+            while ($running.Count -lt $Parallel -and $pending.Count -gt 0) {
+                $cell = $pending[0]; $pending.RemoveAt(0)
+                $clog = Join-Path $LogDir "cell-$($cell.c)-java$($cell.j).log"
+                $proc = Start-Process -FilePath 'powershell' -PassThru -WindowStyle Hidden `
+                            -RedirectStandardOutput $clog -RedirectStandardError "$clog.err" `
+                            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
+                                            '-Compilers', $cell.c, '-Java', $cell.j, '-NoBuild', '-Parallel', '1', '-TimeoutSec', "$TimeoutSec")
+                [void]$running.Add(@{ proc = $proc; cell = $cell; log = $clog })
+                Write-Note "  -> launched $($cell.c).java$($cell.j) (pid $($proc.Id))"
+            }
+            Start-Sleep -Milliseconds 700
+            foreach ($d in @($running | Where-Object { $_.proc.HasExited })) {
+                # Derive the verdict from the cell's OWN [OK]/[FAIL] line — a
+                # Start-Process -PassThru object's .ExitCode is unreliable here
+                # (often $null, and $null -eq 0 is false -> spurious FAIL).
+                $line = (Get-Content $d.log -ErrorAction SilentlyContinue | Where-Object { $_ -match '\[(OK|FAIL)\][^:]*:' } | Select-Object -Last 1)
+                $cellName = "$($d.cell.c).java$($d.cell.j)"
+                if ($line) {
+                    $status = if ($line -match '^\s*\[OK\]') { 'PASS' } else { 'FAIL' }
+                    $detail = ($line -replace '^\s*\[(OK|FAIL)\]\s+[^:]*:\s*', '').Trim()
+                } else {
+                    $status = 'FAIL'; $detail = "no verdict line - subprocess died (see $($d.log))"
+                }
+                if ($status -eq 'PASS') { Write-Ok "$cellName : $detail" } else { Write-Bad "$cellName : $detail" }
+                $results += @{ cell = $cellName; status = $status; detail = $detail }
+                [void]$running.Remove($d)
+            }
+        }
     }
 }
 
