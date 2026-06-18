@@ -56,7 +56,8 @@ public final class OnClassLoaded
      *   6 = load Probe6                       (fresh)
      *   7 = load Probe7                       (fresh)
      *   8 = load Probe8                       (fresh)
-     *   9 = load Probe9                       (fresh)
+     *   9 = load Probe9                       (fresh; fire-capable settle canary)
+     *  10 = load Probe10                      (fresh; post-shutdown settle canary)
      */
     public static volatile int which;
 
@@ -82,6 +83,7 @@ public final class OnClassLoaded
     public static final class Probe7 { public static final int BEACON = 0xB7; }
     public static final class Probe8 { public static final int BEACON = 0xB8; }
     public static final class Probe9 { public static final int BEACON = 0xB9; }
+    public static final class Probe10 { public static final int BEACON = 0xBA; }
 
     /** The simple ('$'-joined) nested name the native side expects, per `which`. */
     public static final String PROBE1_NAME = "vmhook.fixtures.OnClassLoaded$Probe1";
@@ -93,6 +95,7 @@ public final class OnClassLoaded
     public static final String PROBE7_NAME = "vmhook.fixtures.OnClassLoaded$Probe7";
     public static final String PROBE8_NAME = "vmhook.fixtures.OnClassLoaded$Probe8";
     public static final String PROBE9_NAME = "vmhook.fixtures.OnClassLoaded$Probe9";
+    public static final String PROBE10_NAME = "vmhook.fixtures.OnClassLoaded$Probe10";
 
     /**
      * Force one class to load through the application class loader.  Class.forName
@@ -156,6 +159,9 @@ public final class OnClassLoaded
                 break;
             case 9:
                 loadOk = force(PROBE9_NAME);
+                break;
+            case 10:
+                loadOk = force(PROBE10_NAME);
                 break;
             default:
                 break;
