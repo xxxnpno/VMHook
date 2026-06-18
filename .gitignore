@@ -43,3 +43,11 @@ java_stderr.txt
 audit/graph/**/workspace.json
 audit/graph/categories/.obsidian/
 audit/graph/categories/features/
+
+# Local CI closed environment: track the harness script (+ README), ignore the
+# heavy machine-specific dirs — downloaded JDKs, per-compiler builds, scratch, logs.
+.localci/jdks/
+.localci/cache/
+.localci/builds/
+.localci/work/
+.localci/logs/
