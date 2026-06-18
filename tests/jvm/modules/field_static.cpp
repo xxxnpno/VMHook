@@ -128,6 +128,119 @@ namespace
         static auto get_float(const char* name) -> float        { return static_field(name)->get(); }
         static auto get_double(const char* name) -> double      { return static_field(name)->get(); }
 
+        // ---- the field's value as a std::string via value_t::as_string() (the
+        //      explicit-intent extraction).  For a reference/String field this
+        //      decodes the OOP through read_java_string; for ANY primitive field
+        //      it yields "" (every non-uint32 variant arm returns the empty
+        //      string).  Distinct from get_string() above, which leans on the
+        //      implicit conversion operator. ----
+        static auto value_as_string(const char* name) -> std::string
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return std::string{ "<<unresolved>>" };
+            }
+            return proxy->get().as_string();
+        }
+
+        // ---- value_t::is_reference(): true iff get() populated the uint32
+        //      compressed-OOP arm (L / [ fields), false for every primitive arm.
+        //      Returns -1 when the field does not resolve so the caller can skip. ----
+        static auto value_is_reference(const char* name) -> int
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return -1;
+            }
+            return proxy->get().is_reference() ? 1 : 0;
+        }
+
+        // ---- field_proxy::is_reference(): the signature-based predicate (L / [),
+        //      distinct from value_t::is_reference() which inspects the decoded
+        //      variant arm.  For a correctly-decoded field the two must AGREE. ----
+        static auto proxy_is_reference(const char* name) -> int
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return -1;
+            }
+            return proxy->is_reference() ? 1 : 0;
+        }
+
+        // ---- field_proxy::get_compressed_oop(): the dedicated reference reader.
+        //      Must equal the u32 variant arm for a reference field, and must be
+        //      GUARDED to 0 on a primitive field (reading a primitive's bytes as a
+        //      bogus OOP is the FLAW-C hazard the guard closes). ----
+        static auto proxy_compressed_oop(const char* name) -> std::uint32_t
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return 0u;
+            }
+            return proxy->get_compressed_oop();
+        }
+
+        // ---- a reference field decoded to a void* through the value_t void*
+        //      conversion arm (decode_oop_pointer of the compressed OOP). ----
+        static auto value_as_voidp(const char* name) -> void*
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return nullptr;
+            }
+            void* const p = proxy->get();
+            return p;
+        }
+
+        // ---- contextual-bool conversion of a field's value (operator target_type
+        //      with target=bool): a numeric field is true iff its value is non-zero,
+        //      mirroring C++ contextual conversion.  Returns -1 when unresolved. ----
+        static auto value_as_bool(const char* name) -> int
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return -1;
+            }
+            const bool b = proxy->get();
+            return b ? 1 : 0;
+        }
+
+        // ---- SET a String static via a raw const char* (NUL-terminated literal):
+        //      routes through field_proxy::set's std::string_view arm
+        //      (is_convertible_to<string_view> && !std::string), a DIFFERENT
+        //      overload branch from set(std::string).  Proves the C-string write
+        //      path rebinds the field identically. ----
+        static auto set_cstr(const char* name, const char* value) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return false;
+            }
+            proxy->set(value);   // const char* -> string_view arm
+            return true;
+        }
+
+        // ---- SET a String static via an explicit std::string_view (the same
+        //      string_view arm; proves a non-NUL-bounded view writes the exact
+        //      span).  Builds the view from a std::string so its data is stable. ----
+        static auto set_strview(const char* name, std::string_view value) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return false;
+            }
+            proxy->set(value);   // string_view arm
+            return true;
+        }
+
         // ---- the JVM type descriptor of a static field, through the proxy.
         //      A clean read of the field's metadata (used to prove every type's
         //      signature decodes exactly: "Z" "B" "C" "S" "I" "J" "F" "D",
@@ -947,6 +1060,180 @@ namespace
     }
 
     // =====================================================================
+    //  5g. value_t::as_string() EXTRACTION across types.  The explicit-intent
+    //      string reader (distinct from the implicit conversion get_string()
+    //      uses): a String/reference field decodes through read_java_string;
+    //      EVERY primitive field yields "" (only the uint32 arm is a String).
+    //      This pins the documented contract that as_string() is a no-op-to-""
+    //      on a non-reference field rather than formatting the number.
+    // =====================================================================
+    {
+        // Reference / String fields decode to their text.
+        ctx.check("as_string_gStr_field_static", fs::value_as_string("gStr") == "field_static");
+        ctx.check("as_string_CONST_STR_konst",   fs::value_as_string("CONST_STR") == "konst");
+        // A NULL String field decodes to "" (read_java_string(nullptr)).
+        ctx.check("as_string_gNullStr_empty",     fs::value_as_string("gNullStr").empty());
+        // EVERY primitive field's as_string() is "" -- it is NOT the formatted
+        // number; the visitor returns "" for every non-uint32 variant arm.
+        ctx.check("as_string_primitive_I_is_empty", fs::value_as_string("gIMax").empty());
+        ctx.check("as_string_primitive_J_is_empty", fs::value_as_string("gJMax").empty());
+        ctx.check("as_string_primitive_Z_is_empty", fs::value_as_string("gZTrue").empty());
+        ctx.check("as_string_primitive_C_is_empty", fs::value_as_string("gCMax").empty());
+        ctx.check("as_string_primitive_B_is_empty", fs::value_as_string("gBMin").empty());
+        ctx.check("as_string_primitive_S_is_empty", fs::value_as_string("gSMin").empty());
+        ctx.check("as_string_primitive_F_is_empty", fs::value_as_string("gFOne").empty());
+        ctx.check("as_string_primitive_D_is_empty", fs::value_as_string("gDOne").empty());
+        // An OBJECT-reference field (not a String) decodes to "" too: the OOP is
+        // not a java.lang.String, so read_java_string yields "" (no crash).
+        ctx.check("as_string_objref_is_empty", fs::value_as_string("objA").empty());
+    }
+
+    // =====================================================================
+    //  5h. value_t::is_reference() vs field_proxy::is_reference() -- the two
+    //      "is this a reference?" predicates must AGREE for a correctly-decoded
+    //      field.  value_t::is_reference() inspects the decoded variant arm
+    //      (uint32 == reference); field_proxy::is_reference() inspects the
+    //      SIGNATURE (L / [).  Proven across every type: a char "C" field
+    //      decodes to the uint16 arm and is NOT a reference (the critical
+    //      disambiguation -- char and a compressed OOP are both unsigned, so a
+    //      naive check could confuse them).
+    // =====================================================================
+    {
+        // Reference fields: BOTH predicates true.
+        ctx.check("vis_ref_gStr_value",  fs::value_is_reference("gStr") == 1);
+        ctx.check("vis_ref_gStr_proxy",  fs::proxy_is_reference("gStr") == 1);
+        ctx.check("vis_ref_objA_value",  fs::value_is_reference("objA") == 1);
+        ctx.check("vis_ref_objA_proxy",  fs::proxy_is_reference("objA") == 1);
+        ctx.check("vis_ref_sIntArr_value", fs::value_is_reference("sIntArr") == 1);
+        ctx.check("vis_ref_sIntArr_proxy", fs::proxy_is_reference("sIntArr") == 1);
+        ctx.check("vis_ref_staticTier_value", fs::value_is_reference("staticTier") == 1);
+        ctx.check("vis_ref_staticTier_proxy", fs::proxy_is_reference("staticTier") == 1);
+        ctx.check("vis_ref_gNullStr_value", fs::value_is_reference("gNullStr") == 1);
+        ctx.check("vis_ref_gNullStr_proxy", fs::proxy_is_reference("gNullStr") == 1);
+        // Primitive fields: BOTH predicates false (the char "C" case is the
+        // disambiguation -- u16 arm, not the u32 reference arm).
+        ctx.check("vis_prim_C_value_false",  fs::value_is_reference("gCMax") == 0);
+        ctx.check("vis_prim_C_proxy_false",  fs::proxy_is_reference("gCMax") == 0);
+        ctx.check("vis_prim_I_value_false",  fs::value_is_reference("gIMax") == 0);
+        ctx.check("vis_prim_I_proxy_false",  fs::proxy_is_reference("gIMax") == 0);
+        ctx.check("vis_prim_J_value_false",  fs::value_is_reference("gJMax") == 0);
+        ctx.check("vis_prim_Z_value_false",  fs::value_is_reference("gZTrue") == 0);
+        ctx.check("vis_prim_B_value_false",  fs::value_is_reference("gBMin") == 0);
+        ctx.check("vis_prim_S_value_false",  fs::value_is_reference("gSMin") == 0);
+        ctx.check("vis_prim_F_value_false",  fs::value_is_reference("gFOne") == 0);
+        ctx.check("vis_prim_D_value_false",  fs::value_is_reference("gDOne") == 0);
+    }
+
+    // =====================================================================
+    //  5i. field_proxy::get_compressed_oop() -- the dedicated reference reader.
+    //      For a reference field it equals the u32 variant arm (the same
+    //      compressed OOP get() decodes).  For a PRIMITIVE field it is GUARDED
+    //      to 0 (FLAW-C fix): without the is_reference() guard it would read the
+    //      primitive's first 4 bytes as a bogus OOP.  We assert the guard fires
+    //      on a non-zero primitive (gIMax = 0x7FFFFFFF) -- the raw bytes are
+    //      non-zero, so a 0 result PROVES the guard, not a coincidental zero.
+    // =====================================================================
+    {
+        // Reference field: get_compressed_oop() == the u32 arm, and non-zero for
+        // a live published instance.
+        const auto pref{ fs::get_proxy("objA") };
+        if (pref)
+        {
+            const auto v{ pref->get() };
+            const std::uint32_t arm{ std::get<std::uint32_t>(v.data) };
+            ctx.check("gco_objA_matches_variant_arm", fs::proxy_compressed_oop("objA") == arm);
+            ctx.check("gco_objA_nonzero", fs::proxy_compressed_oop("objA") != 0u);
+        }
+        // String field: the compressed OOP is non-zero (gStr is a live literal).
+        ctx.check("gco_gStr_nonzero", fs::proxy_compressed_oop("gStr") != 0u);
+        // NULL String field: compressed OOP is 0.
+        ctx.check("gco_gNullStr_zero", fs::proxy_compressed_oop("gNullStr") == 0u);
+        // PRIMITIVE field with NON-ZERO bytes: the guard returns 0 anyway.
+        ctx.check("gco_primitive_IMax_guarded_zero", fs::proxy_compressed_oop("gIMax") == 0u);
+        ctx.check("gco_primitive_JMax_guarded_zero", fs::proxy_compressed_oop("gJMax") == 0u);
+        ctx.record("[INFO] field_static: field_proxy::get_compressed_oop() is GUARDED "
+                   "on is_reference() (signature L/[): on a primitive field it returns 0 "
+                   "rather than reading the value bytes as a bogus compressed OOP that "
+                   "would later decode to a wild pointer (FLAW-C, vmhook.hpp ~15702). It "
+                   "agrees with get()'s u32 variant arm for genuine reference fields.");
+    }
+
+    // =====================================================================
+    //  5j. value_t -> void* conversion arm: a reference field decodes to the
+    //      same heap address field_oop()/array_oop reaches.  Cross-checks the
+    //      void* conversion (decode_oop_pointer) against the array_oop path, and
+    //      that a primitive field's void* conversion is nullptr (only the u32
+    //      arm produces a non-null pointer).
+    // =====================================================================
+    {
+        // A static array reference decoded to void* equals array_oop()'s decode.
+        void* const via_value{ fs::value_as_voidp("sIntArr") };
+        void* const via_field_oop{ fs::array_oop("sIntArr") };
+        ctx.check("voidp_sIntArr_nonnull", via_value != nullptr);
+        ctx.check("voidp_sIntArr_matches_field_oop", via_value == via_field_oop);
+        // A live object reference decodes to a non-null, valid heap pointer.
+        void* const via_objA{ fs::value_as_voidp("objA") };
+        ctx.check("voidp_objA_nonnull_valid",
+                  via_objA != nullptr && vmhook::hotspot::is_valid_pointer(via_objA));
+        // A NULL reference decodes to nullptr.
+        ctx.check("voidp_gNullStr_null", fs::value_as_voidp("gNullStr") == nullptr);
+        // A PRIMITIVE field's void* conversion is nullptr (the conversion arm
+        // only decodes the u32 alternative; every primitive arm yields nullptr).
+        ctx.check("voidp_primitive_IMax_null", fs::value_as_voidp("gIMax") == nullptr);
+        ctx.check("voidp_primitive_D_null",    fs::value_as_voidp("gDOne") == nullptr);
+    }
+
+    // =====================================================================
+    //  5k. contextual-bool conversion of a NUMERIC field (operator bool): the
+    //      value is true iff non-zero, matching C++ contextual conversion.  The
+    //      module elsewhere reads "Z" fields as bool; here we prove the SAME
+    //      conversion on integral/float fields (a non-zero int is true, zero is
+    //      false), exercising the operator target_type path with target=bool.
+    // =====================================================================
+    {
+        ctx.check("ctxbool_gIZero_false",  fs::value_as_bool("gIZero") == 0);
+        ctx.check("ctxbool_gIOne_true",    fs::value_as_bool("gIOne") == 1);
+        ctx.check("ctxbool_gINegOne_true", fs::value_as_bool("gINegOne") == 1); // -1 != 0 -> true
+        ctx.check("ctxbool_gJZero_false",  fs::value_as_bool("gJZero") == 0);
+        ctx.check("ctxbool_gJOne_true",    fs::value_as_bool("gJOne") == 1);
+        ctx.check("ctxbool_gBZero_false",  fs::value_as_bool("gBZero") == 0);
+        ctx.check("ctxbool_gBOne_true",    fs::value_as_bool("gBOne") == 1);
+        ctx.check("ctxbool_gZTrue_true",   fs::value_as_bool("gZTrue") == 1);
+        ctx.check("ctxbool_gZFalse_false", fs::value_as_bool("gZFalse") == 0);
+        // A char field with a non-zero code unit converts to true; the NUL char to false.
+        ctx.check("ctxbool_gCA_true",      fs::value_as_bool("gCA") == 1);
+        ctx.check("ctxbool_gCNul_false",   fs::value_as_bool("gCNul") == 0);
+    }
+
+    // =====================================================================
+    //  5l. STRING SET via the const char* / std::string_view arm (a DIFFERENT
+    //      field_proxy::set overload branch than set(std::string)): proves the
+    //      C-string and view write paths rebind the field to the exact value.
+    //      Written BEFORE go; the native re-read is here and Java getters pull
+    //      them back in phase 8c.  Also proves the rebind leaves the aliased
+    //      ORIGINAL setStrShort object intact (read natively here).
+    // =====================================================================
+    {
+        // const char* literal -> string_view arm -> rebind to "via-cstr".
+        ctx.check("set_cstr_resolved", fs::set_cstr("setStrCstr", "via-cstr"));
+        ctx.check("set_cstr_native_reread", fs::get_string("setStrCstr") == "via-cstr");
+        // An explicit std::string_view -> same arm.  Build a SUB-VIEW so the
+        // span is not NUL-terminated at its end -- the write must store exactly
+        // the 7 chars "subview", not run past the view into the backing string.
+        {
+            const std::string backing{ "subview-extra" };
+            const std::string_view view{ std::string_view{ backing }.substr(0, 7) }; // "subview"
+            ctx.check("set_strview_resolved", fs::set_strview("setStrView", view));
+        }
+        ctx.check("set_strview_native_reread", fs::get_string("setStrView") == "subview");
+        // The rebind-safety guarantee, proven NATIVELY (the module so far only
+        // checked it via the Java seenStrShortOriginalIntact witness): the
+        // original setStrShort object (aliased at <clinit> as setStrShortOriginal)
+        // STILL reads "world" after setStrShort was rebound to "hi" in phase 2.
+        ctx.check("set_str_original_intact_native", fs::get_string("setStrShortOriginal") == "world");
+    }
+
+    // =====================================================================
     //  6. ERROR / NULL / EDGE paths for the static accessor.
     // =====================================================================
     {
@@ -1121,6 +1408,16 @@ namespace
         // -> "", longer write -> the FULL value, not the old keep/truncate).
         ctx.check("java_getter_StrEmpty_empty", fs::call_get_string("getStrEmpty").empty());
         ctx.check("java_getter_StrTrunc_full", fs::call_get_string("getStrTrunc") == "toolongvalue");
+
+        // ---- 8c. the const char* / string_view SET arm, pulled back through
+        //      Java getters: the C-string write and the sub-view write are both
+        //      visible to executing Java bytecode (genuine getstatic). ----
+        ctx.check("java_getter_StrCstr_viacstr", fs::call_get_string("getStrCstr") == "via-cstr");
+        ctx.check("java_getter_StrView_subview", fs::call_get_string("getStrView") == "subview");
+        // Rebind-safety via a Java getter too: the original setStrShort object is
+        // still "world" after setStrShort was rebound (object-store, no in-place
+        // mutate of the shared object).
+        ctx.check("java_getter_StrShortOriginal_world", fs::call_get_string("getStrShortOriginal") == "world");
     }
 
     // =====================================================================
@@ -1670,6 +1967,8 @@ namespace
         if (done)
         {
             ctx.check("reset_setStr_back_to_AAAAA", fs::get_string("setStr") == "AAAAA");
+            ctx.check("reset_setStrCstr_back", fs::get_string("setStrCstr") == "origC");
+            ctx.check("reset_setStrView_back", fs::get_string("setStrView") == "origV");
             ctx.check("reset_guardInt_back", fs::get_int("guardInt") == 0x11223344);
             const auto ref{ fs::acquire("objRef") };
             ctx.check("reset_objRef_back_to_A", ref != nullptr && ref->tag() == 0xA);

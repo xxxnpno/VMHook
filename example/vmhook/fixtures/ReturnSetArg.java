@@ -63,6 +63,8 @@ public final class ReturnSetArg
     public static final int MODE_PRIMITIVES = 0; // every single-arg primitive + static int
     public static final int MODE_SLOTS      = 1; // twoInts / mixLongInt / intLong / doubleInt
     public static final int MODE_BOUNDS     = 2; // boundsTarget (out-of-range rejection)
+    public static final int MODE_WIDESLOTS  = 3; // back-to-back / interleaved wide args
+    public static final int MODE_STATICSLOTS= 4; // static methods (no 'this' — args from slot 0)
 
     // The single instance the instance-method hooks dispatch through.
     public static final ReturnSetArg INSTANCE = new ReturnSetArg();
@@ -105,6 +107,39 @@ public final class ReturnSetArg
     // was rejected.  Must remain the ORIGINAL passed value (no wild write).
     public static volatile int boundsObs = 0x5A5A5A5A;
 
+    // ── Wide-slot model observations (back-to-back / interleaved long+double) ──
+    // longLong(long a, long b):  this=0, a=slots1+2, b=slots3+4.
+    public static volatile long llA;
+    public static volatile long llB;
+    // doubleDouble(double a, double b): this=0, a=slots1+2, b=slots3+4.
+    public static volatile double ddA;
+    public static volatile double ddB;
+    // longDouble(long a, double b): this=0, a=slots1+2, b=slots3+4.
+    public static volatile long   ldLong;
+    public static volatile double ldDouble;
+    // doubleLong(double a, long b): this=0, a=slots1+2, b=slots3+4.
+    public static volatile double dlDouble;
+    public static volatile long   dlLong;
+    // intIntInt(int a, int b, int c): this=0, a=1, b=2, c=3 — three narrow in a row.
+    public static volatile int triA;
+    public static volatile int triB;
+    public static volatile int triC;
+    // floatLong(float a, long b): this=0, a=slot1 (one slot), b=slots2+3.
+    public static volatile float flFloat;
+    public static volatile long  flLong;
+    // longInt at slot N+1 (the long's HIGH/reserved slot): a separate probe lets
+    // the native side prove set_arg(base) and set_arg(base+1) hit DIFFERENT slots.
+    public static volatile long wideProbeLong;
+    public static volatile int  wideProbeInt;
+
+    // ── Static slot-model observations (no 'this'; first arg begins at slot 0) ──
+    // staticTwoInts(int a, int b): a=slot0, b=slot1.
+    public static volatile int sTwoA;
+    public static volatile int sTwoB;
+    // staticLongInt(long a, int b): a=slots0+1, b=slot2.
+    public static volatile long sMixLong;
+    public static volatile int  sMixInt;
+
     /** Set true by the action if any take* call threw (it must never throw). */
     public static volatile boolean sawException;
 
@@ -129,6 +164,19 @@ public final class ReturnSetArg
 
     // ── Bounds method — body records the value it saw (must be the original) ───
     public void boundsTarget(int v) { ReturnSetArg.boundsObs = v; }
+
+    // ── Wide-slot model methods (instance) ─────────────────────────────────────
+    public void longLong(long a, long b)        { ReturnSetArg.llA = a; ReturnSetArg.llB = b; }
+    public void doubleDouble(double a, double b) { ReturnSetArg.ddA = a; ReturnSetArg.ddB = b; }
+    public void longDouble(long a, double b)     { ReturnSetArg.ldLong = a; ReturnSetArg.ldDouble = b; }
+    public void doubleLong(double a, long b)     { ReturnSetArg.dlDouble = a; ReturnSetArg.dlLong = b; }
+    public void intIntInt(int a, int b, int c)   { ReturnSetArg.triA = a; ReturnSetArg.triB = b; ReturnSetArg.triC = c; }
+    public void floatLong(float a, long b)       { ReturnSetArg.flFloat = a; ReturnSetArg.flLong = b; }
+    public void wideProbe(long a, int b)         { ReturnSetArg.wideProbeLong = a; ReturnSetArg.wideProbeInt = b; }
+
+    // ── Static slot-model methods (no 'this'; first arg begins at slot 0) ──────
+    public static void staticTwoInts(int a, int b)     { ReturnSetArg.sTwoA = a; ReturnSetArg.sTwoB = b; }
+    public static void staticLongInt(long a, int b)    { ReturnSetArg.sMixLong = a; ReturnSetArg.sMixInt = b; }
 
     static
     {
@@ -169,6 +217,21 @@ public final class ReturnSetArg
                         self.mixLongInt(7L, 8);
                         self.intLong(7, 8L);
                         self.doubleInt(7.0, 8);
+                    }
+                    else if (ReturnSetArg.mode == ReturnSetArg.MODE_WIDESLOTS)
+                    {
+                        self.longLong(7L, 8L);
+                        self.doubleDouble(7.0, 8.0);
+                        self.longDouble(7L, 8.0);
+                        self.doubleLong(7.0, 8L);
+                        self.intIntInt(7, 8, 9);
+                        self.floatLong(7.0f, 8L);
+                        self.wideProbe(7L, 8);
+                    }
+                    else if (ReturnSetArg.mode == ReturnSetArg.MODE_STATICSLOTS)
+                    {
+                        ReturnSetArg.staticTwoInts(7, 8);
+                        ReturnSetArg.staticLongInt(7L, 8);
                     }
                     else // MODE_BOUNDS
                     {

@@ -91,6 +91,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -168,6 +170,54 @@ namespace
         }
 
         auto value() const -> std::int64_t { return static_cast<std::int64_t>(get_field("value")->get()); }
+    };
+
+    // ── BOXED-CHAR wrapper: java.lang.Character (descriptor "C", uint16). ────
+    class char_box : public vmhook::object<char_box>
+    {
+    public:
+        explicit char_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<char_box>{ instance }
+        {
+        }
+
+        auto value() const -> std::int32_t { return static_cast<std::int32_t>(get_field("value")->get()); }
+    };
+
+    // ── BOXED-SHORT wrapper: java.lang.Short (descriptor "S", signed 16-bit). ─
+    class short_box : public vmhook::object<short_box>
+    {
+    public:
+        explicit short_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<short_box>{ instance }
+        {
+        }
+
+        auto value() const -> std::int32_t { return static_cast<std::int32_t>(get_field("value")->get()); }
+    };
+
+    // ── BOXED-BYTE wrapper: java.lang.Byte (descriptor "B", signed 8-bit). ───
+    class byte_box : public vmhook::object<byte_box>
+    {
+    public:
+        explicit byte_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<byte_box>{ instance }
+        {
+        }
+
+        auto value() const -> std::int32_t { return static_cast<std::int32_t>(get_field("value")->get()); }
+    };
+
+    // ── BOXED-BOOLEAN wrapper: java.lang.Boolean (descriptor "Z"). ───────────
+    class bool_box : public vmhook::object<bool_box>
+    {
+    public:
+        explicit bool_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<bool_box>{ instance }
+        {
+        }
+
+        auto value() const -> bool { return static_cast<bool>(get_field("value")->get()); }
     };
 
     // ── STRING VALUE wrapper: java.lang.String. ─────────────────────────────
@@ -264,6 +314,29 @@ namespace
                 return {};
             }
             return proxy->get().to_entries<key_type, value_type>();
+        }
+
+        // Acquire the named static Map field as an EXPLICIT vmhook::map wrapper
+        // (the field-proxy value_t -> unique_ptr<vmhook::map> conversion), so the
+        // module can exercise the wrapper's own size()/is_empty()/to_entries()
+        // surface — distinct from the implicit value_t::to_entries call site.
+        // Returns nullptr when the field is unresolved or holds a null oop.
+        static auto acquire_map(const char* field) -> std::unique_ptr<vmhook::map>
+        {
+            const auto proxy{ static_field(field) };
+            if (!proxy.has_value())
+            {
+                return nullptr;
+            }
+            return proxy->get();
+        }
+
+        // True iff the named static field currently holds a reference/String oop
+        // (value_t::is_reference introspection on the field proxy).
+        static auto field_is_reference(const char* field) -> bool
+        {
+            const auto proxy{ static_field(field) };
+            return proxy.has_value() && proxy->get().is_reference();
         }
 
         // Java-published cross-check values.
@@ -401,6 +474,10 @@ namespace
         vmhook::register_class<string_value>("java/lang/String");
         vmhook::register_class<integer_box>("java/lang/Integer");
         vmhook::register_class<long_box>("java/lang/Long");
+        vmhook::register_class<char_box>("java/lang/Character");
+        vmhook::register_class<short_box>("java/lang/Short");
+        vmhook::register_class<byte_box>("java/lang/Byte");
+        vmhook::register_class<bool_box>("java/lang/Boolean");
         vmhook::register_class<enum_key>("vmhook/fixtures/CollMap$Day");
         // nested_value carries an arbitrary container OOP; it has no fixed klass
         // of its own, so it is intentionally NOT registered.
@@ -1082,6 +1159,278 @@ namespace
         }
 
         // =====================================================================
+        // HashMap<String,String> — NON-ASCII keys AND values.  Exercises
+        // read_java_string's non-ASCII path: LATIN1 (coder 0) and UTF16 (coder 1)
+        // on JDK 9+, and the char[] path on JDK 8 — all converge on the SAME UTF-8
+        // output, so we assert EXACT UTF-8 string equality (a code-unit sum would
+        // NOT cross-check, C++ sees UTF-8 bytes while Java sees UTF-16 units).
+        //   U+00E9 -> C3 A9, U+00FC -> C3 BC, U+4E2D -> E4 B8 AD.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<string_key, string_value>("hashUnicode") };
+            ctx.check("cmap_unicode_count_is_2", static_cast<std::int32_t>(e.size()) == 2);
+            check_size_oracle("cmap_unicode", static_cast<std::int32_t>(e.size()), "hashUnicodeSize");
+
+            // Expected exact UTF-8 byte sequences (kept as explicit bytes so the
+            // SOURCE is pure-ASCII and the comparison is unambiguous on every host).
+            const std::string e_acute{ "\xC3\xA9" };           // U+00E9
+            const std::string u_umlaut{ "\xC3\xBC" };          // U+00FC
+            const std::string cjk{ "\xE4\xB8\xAD" };           // U+4E2D
+            const std::string e_acute_cjk{ e_acute + cjk };    // U+00E9 U+4E2D
+
+            std::int32_t null_kv{ 0 };
+            bool latin_pair_ok{ false };
+            bool bmp_pair_ok{ false };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; continue; }
+                const std::string k{ kv.first->text() };
+                const std::string v{ kv.second->text() };
+                if (k == e_acute && v == u_umlaut) { latin_pair_ok = true; }
+                if (k == cjk && v == e_acute_cjk) { bmp_pair_ok = true; }
+            }
+            ctx.check("cmap_unicode_no_null_kv", null_kv == 0);
+            ctx.check("cmap_unicode_latin1_pair_exact_utf8", latin_pair_ok);
+            ctx.check("cmap_unicode_utf16_pair_exact_utf8", bmp_pair_ok);
+        }
+
+        // =====================================================================
+        // HashMap<Character,Character> — boxed 16-bit char key AND value
+        // (descriptor "C", UNSIGNED 16-bit).  Proves a Character.value round-trips.
+        // 'A'(65)->'Z'(90), '0'(48)->'9'(57).
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<char_box, char_box>("hashCharKey") };
+            ctx.check("cmap_charkey_count_is_2", static_cast<std::int32_t>(e.size()) == 2);
+            check_size_oracle("cmap_charkey", static_cast<std::int32_t>(e.size()), "hashCharKeySize");
+
+            std::int64_t key_sum{ 0 }, val_sum{ 0 };
+            std::int32_t null_kv{ 0 };
+            bool pairs_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
+                const std::int32_t k{ kv.first->value() };
+                const std::int32_t v{ kv.second->value() };
+                key_sum += k;
+                val_sum += v;
+                // 'A'->'Z' (delta 25); '0'->'9' (delta 9).
+                if (!((k == 'A' && v == 'Z') || (k == '0' && v == '9'))) { pairs_ok = false; }
+            }
+            ctx.check("cmap_charkey_no_null_kv", null_kv == 0);
+            ctx.check("cmap_charkey_pairs_consistent", pairs_ok);
+            ctx.check("cmap_charkey_key_sum_matches_java",
+                      key_sum == coll_map_fixture::j_long("hashCharKeyKeySum"));
+            ctx.check("cmap_charkey_val_sum_matches_java",
+                      val_sum == coll_map_fixture::j_long("hashCharKeyValSum"));
+            ctx.check("cmap_charkey_key_sum_closed_form", key_sum == ('A' + '0'));
+        }
+
+        // =====================================================================
+        // HashMap<Short,Short> — boxed SIGNED 16-bit key AND value ("S").  Keys
+        // include a NEGATIVE short (-1); proves sign extension on a narrow field.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<short_box, short_box>("hashShortKey") };
+            ctx.check("cmap_shortkey_count_is_3", static_cast<std::int32_t>(e.size()) == SMALL_N);
+            check_size_oracle("cmap_shortkey", static_cast<std::int32_t>(e.size()), "hashShortKeySize");
+
+            std::int64_t key_sum{ 0 }, val_sum{ 0 };
+            std::int32_t null_kv{ 0 };
+            bool saw_negative_key{ false };
+            bool pairs_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
+                const std::int32_t k{ kv.first->value() };
+                const std::int32_t v{ kv.second->value() };
+                key_sum += k;
+                val_sum += v;
+                if (k < 0) { saw_negative_key = true; }
+                // value == key + 1 by construction.
+                if (v != (k + 1)) { pairs_ok = false; }
+            }
+            ctx.check("cmap_shortkey_no_null_kv", null_kv == 0);
+            ctx.check("cmap_shortkey_negative_key_present", saw_negative_key);
+            ctx.check("cmap_shortkey_pairs_consistent", pairs_ok);
+            ctx.check("cmap_shortkey_key_sum_matches_java",
+                      key_sum == coll_map_fixture::j_long("hashShortKeyKeySum"));
+            ctx.check("cmap_shortkey_val_sum_matches_java",
+                      val_sum == coll_map_fixture::j_long("hashShortKeyValSum"));
+        }
+
+        // =====================================================================
+        // HashMap<Byte,Byte> — boxed SIGNED 8-bit key AND value ("B").  Keys
+        // include a NEGATIVE byte (-1); proves sign extension on a 1-byte field.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<byte_box, byte_box>("hashByteKey") };
+            ctx.check("cmap_bytekey_count_is_3", static_cast<std::int32_t>(e.size()) == SMALL_N);
+            check_size_oracle("cmap_bytekey", static_cast<std::int32_t>(e.size()), "hashByteKeySize");
+
+            std::int64_t key_sum{ 0 }, val_sum{ 0 };
+            std::int32_t null_kv{ 0 };
+            bool saw_negative_key{ false };
+            bool pairs_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
+                const std::int32_t k{ kv.first->value() };
+                const std::int32_t v{ kv.second->value() };
+                key_sum += k;
+                val_sum += v;
+                if (k < 0) { saw_negative_key = true; }
+                // value == key - 1 by construction (a (byte) cast wrap is fine: the
+                // sums cross-check against Java's identical (byte) arithmetic).
+                if (static_cast<std::int8_t>(v) != static_cast<std::int8_t>(k - 1)) { pairs_ok = false; }
+            }
+            ctx.check("cmap_bytekey_no_null_kv", null_kv == 0);
+            ctx.check("cmap_bytekey_negative_key_present", saw_negative_key);
+            ctx.check("cmap_bytekey_pairs_consistent", pairs_ok);
+            ctx.check("cmap_bytekey_key_sum_matches_java",
+                      key_sum == coll_map_fixture::j_long("hashByteKeyKeySum"));
+            ctx.check("cmap_bytekey_val_sum_matches_java",
+                      val_sum == coll_map_fixture::j_long("hashByteKeyValSum"));
+        }
+
+        // =====================================================================
+        // HashMap<Boolean,Box> — boxed boolean key ("Z").  Exactly FALSE and TRUE.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<bool_box, box_value>("hashBoolKey") };
+            ctx.check("cmap_boolkey_count_is_2", static_cast<std::int32_t>(e.size()) == 2);
+            check_size_oracle("cmap_boolkey", static_cast<std::int32_t>(e.size()), "hashBoolKeySize");
+
+            std::int32_t null_kv{ 0 };
+            bool saw_false{ false }, saw_true{ false }, pairs_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
+                if (!kv.first->value())
+                {
+                    saw_false = true;
+                    if (kv.second->id() != 0 || kv.second->name() != "false-v") { pairs_ok = false; }
+                }
+                else
+                {
+                    saw_true = true;
+                    if (kv.second->id() != 1 || kv.second->name() != "true-v") { pairs_ok = false; }
+                }
+            }
+            ctx.check("cmap_boolkey_no_null_kv", null_kv == 0);
+            ctx.check("cmap_boolkey_both_constants_present", saw_false && saw_true);
+            ctx.check("cmap_boolkey_pairs_consistent", pairs_ok);
+        }
+
+        // =====================================================================
+        // HashMap<String,Box> — EXTREME / NEGATIVE value ids (INT_MIN, -1, 0,
+        // INT_MAX).  Proves the signed 32-bit "id" field round-trips across the
+        // FULL int range with no truncation or sign error.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of("hashNegIds") };
+            ctx.check("cmap_negids_count_is_4", static_cast<std::int32_t>(e.size()) == 4);
+            check_size_oracle("cmap_negids", static_cast<std::int32_t>(e.size()), "hashNegIdsSize");
+
+            std::int64_t id_sum{ 0 };
+            std::int32_t null_kv{ 0 };
+            bool saw_min{ false }, saw_max{ false }, saw_neg_one{ false };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; continue; }
+                const std::int32_t id{ kv.second->id() };
+                id_sum += id;
+                if (id == (std::numeric_limits<std::int32_t>::min)()) { saw_min = true; }
+                if (id == (std::numeric_limits<std::int32_t>::max)()) { saw_max = true; }
+                if (id == -1) { saw_neg_one = true; }
+            }
+            ctx.check("cmap_negids_no_null_kv", null_kv == 0);
+            ctx.check("cmap_negids_has_int_min", saw_min);
+            ctx.check("cmap_negids_has_int_max", saw_max);
+            ctx.check("cmap_negids_has_minus_one", saw_neg_one);
+            ctx.check("cmap_negids_id_sum_matches_java",
+                      id_sum == coll_map_fixture::j_long("hashNegIdsIdSum"));
+            // Closed form: INT_MIN + (-1) + 0 + INT_MAX == -2 (the +/- cancel,
+            // leaving INT_MIN+INT_MAX == -1, plus -1).
+            ctx.check("cmap_negids_id_sum_closed_form",
+                      id_sum == (static_cast<std::int64_t>((std::numeric_limits<std::int32_t>::min)())
+                                 + (std::numeric_limits<std::int32_t>::max)() + (-1) + 0));
+        }
+
+        // =====================================================================
+        // EXPLICIT vmhook::map WRAPPER API — size() / is_empty() / direct
+        // to_entries().  These exercise the map wrapper's OWN surface (distinct
+        // from the implicit value_t::to_entries call site the rest of the module
+        // uses), mirroring the sibling collection_hash_tree_map module.  Uses the
+        // already-built hashSmall / treeSmall / hashEmpty / treeEmpty — no new heap.
+        // =====================================================================
+        {
+            const auto hm{ coll_map_fixture::acquire_map("hashSmall") };
+            ctx.check("cmap_wrapper_hashsmall_acquired", hm != nullptr);
+            if (hm)
+            {
+                ctx.check("cmap_wrapper_hashsmall_size_is_3", hm->size() == SMALL_N);
+                ctx.check("cmap_wrapper_hashsmall_not_empty", hm->is_empty() == false);
+                const auto e{ hm->to_entries<string_key, box_value>() };
+                ctx.check("cmap_wrapper_hashsmall_direct_to_entries_count",
+                          static_cast<std::int32_t>(e.size()) == SMALL_N);
+                // The explicit-wrapper walk must AGREE with the implicit path.
+                const entry_stats st{ fingerprint(e) };
+                ctx.check("cmap_wrapper_hashsmall_id_sum_matches_java",
+                          st.id_sum == coll_map_fixture::j_long("hashSmallIdSum"));
+            }
+
+            const auto tm{ coll_map_fixture::acquire_map("treeSmall") };
+            ctx.check("cmap_wrapper_treesmall_acquired", tm != nullptr);
+            if (tm)
+            {
+                ctx.check("cmap_wrapper_treesmall_size_is_3", tm->size() == SMALL_N);
+                ctx.check("cmap_wrapper_treesmall_not_empty", tm->is_empty() == false);
+                const auto e{ tm->to_entries<string_key, box_value>() };
+                ctx.check("cmap_wrapper_treesmall_direct_to_entries_count",
+                          static_cast<std::int32_t>(e.size()) == SMALL_N);
+                const std::vector<std::string> keys{ keys_in_walk_order(e) };
+                ctx.check("cmap_wrapper_treesmall_keys_sorted",
+                          std::is_sorted(keys.begin(), keys.end()));
+            }
+
+            // Empty maps: Java size()==0, is_empty()==true, to_entries empty.
+            const auto he{ coll_map_fixture::acquire_map("hashEmpty") };
+            ctx.check("cmap_wrapper_hashempty_acquired", he != nullptr);
+            if (he)
+            {
+                ctx.check("cmap_wrapper_hashempty_size_zero", he->size() == 0);
+                ctx.check("cmap_wrapper_hashempty_is_empty_true", he->is_empty());
+                ctx.check("cmap_wrapper_hashempty_to_entries_empty",
+                          he->to_entries<string_key, box_value>().empty());
+            }
+
+            const auto te{ coll_map_fixture::acquire_map("treeEmpty") };
+            ctx.check("cmap_wrapper_treeempty_acquired", te != nullptr);
+            if (te)
+            {
+                ctx.check("cmap_wrapper_treeempty_size_zero", te->size() == 0);
+                ctx.check("cmap_wrapper_treeempty_is_empty_true", te->is_empty());
+                ctx.check("cmap_wrapper_treeempty_to_entries_empty",
+                          te->to_entries<string_key, box_value>().empty());
+            }
+        }
+
+        // =====================================================================
+        // field_proxy::value_t::is_reference() — a populated Map field holds a
+        // reference oop (true); a primitive size-witness field does not (false).
+        // =====================================================================
+        {
+            // A populated Map field reads as a reference oop; a primitive int
+            // size-witness field does NOT (it is the int32 value_t alternative);
+            // a (non-null) String reference field also reads as a reference.
+            ctx.check("cmap_map_field_is_reference", coll_map_fixture::field_is_reference("hashSmall"));
+            ctx.check("cmap_int_field_not_reference",
+                      coll_map_fixture::field_is_reference("hashSmallSize") == false);
+            ctx.check("cmap_string_field_is_reference", coll_map_fixture::field_is_reference("notAMap"));
+        }
+
+        // =====================================================================
         // LinkedHashMap — SMALL + MANY.  Reuses HashMap.table, so the SAME fast
         // path is taken.  Verify CONTENT via the order-independent fingerprint.
         // (Audit note: vmhook walks BUCKET order, not LinkedHashMap insertion
@@ -1287,6 +1636,70 @@ namespace
             }
             ctx.check("tree_nullvalue_null_entry_key_is_present", null_value_key_ok);
             ctx.check("tree_nullvalue_sibling_decoded", sibling_ok);
+        }
+
+        // =====================================================================
+        // TreeMap — REVERSE COMPARATOR.  Built with Collections.reverseOrder(), so
+        // a correct in-order red-black walk emits keys in the COMPARATOR's order:
+        // DESCENDING ("k2","k1","k0").  Proves the walk honours the tree's
+        // comparator rather than assuming natural ordering.  Same content as
+        // treeSmall, so the value fingerprint still cross-checks.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of("treeReverseComparator") };
+            const entry_stats st{ fingerprint(e) };
+            ctx.check("tree_revcmp_count_is_3", st.count == SMALL_N);
+            check_size_oracle("tree_revcmp", st.count, "treeReverseComparatorSize");
+            ctx.check("tree_revcmp_no_null_keys", st.null_keys == 0);
+            ctx.check("tree_revcmp_no_null_values", st.null_values == 0);
+            ctx.check("tree_revcmp_id_sum_is_3", st.id_sum == (0 + 1 + 2));
+
+            const std::vector<std::string> keys{ keys_in_walk_order(e) };
+            // In-order over a reverse comparator => DESCENDING (NOT std::is_sorted).
+            const bool descending{ std::is_sorted(keys.begin(), keys.end(),
+                                                  std::greater<std::string>{}) };
+            ctx.check("tree_revcmp_walk_is_descending", descending);
+            ctx.check("tree_revcmp_first_is_k2", !keys.empty() && keys.front() == "k2");
+            ctx.check("tree_revcmp_last_is_k0", !keys.empty() && keys.back() == "k0");
+            // The walk's first/last must match Java's comparator-ordered first/last.
+            ctx.check("tree_revcmp_first_matches_java",
+                      !keys.empty() && keys.front() == coll_map_fixture::j_string("treeReverseComparatorFirstKey"));
+            ctx.check("tree_revcmp_last_matches_java",
+                      !keys.empty() && keys.back() == coll_map_fixture::j_string("treeReverseComparatorLastKey"));
+        }
+
+        // =====================================================================
+        // TreeMap<Integer,Box> — NUMERIC key order.  Keys 10,2,1 inserted; the
+        // in-order walk emits the natural NUMERIC comparator order 1,2,10 — which
+        // is DISTINCT from the lexicographic "10"<"2" a String key would give.
+        // Proves the in-order walk emits boxed-Integer numeric ordering.
+        // =====================================================================
+        {
+            const auto e{ coll_map_fixture::entries_of_as<integer_box, box_value>("treeIntKey") };
+            ctx.check("tree_intkey_count_is_3", static_cast<std::int32_t>(e.size()) == SMALL_N);
+            check_size_oracle("tree_intkey", static_cast<std::int32_t>(e.size()), "treeIntKeySize");
+
+            std::vector<std::int32_t> keys;
+            keys.reserve(e.size());
+            bool pairs_ok{ true };
+            std::int32_t null_kv{ 0 };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
+                const std::int32_t k{ kv.first->value() };
+                keys.push_back(k);
+                // value.id == numeric key, name == "v"+key.
+                if (kv.second->id() != k) { pairs_ok = false; }
+                if (kv.second->name() != ("v" + std::to_string(k))) { pairs_ok = false; }
+            }
+            ctx.check("tree_intkey_no_null_kv", null_kv == 0);
+            ctx.check("tree_intkey_pairs_consistent", pairs_ok);
+            ctx.check("tree_intkey_numeric_ascending", std::is_sorted(keys.begin(), keys.end()));
+            ctx.check("tree_intkey_first_is_1", !keys.empty() && keys.front() == 1);
+            ctx.check("tree_intkey_last_is_10", !keys.empty() && keys.back() == 10);
+            // The numeric order 1,2,10 differs from lexicographic "1","10","2" —
+            // pin that the middle key is 2 (a String tree would put "10" there).
+            ctx.check("tree_intkey_middle_is_2", keys.size() == 3 && keys[1] == 2);
         }
 
         // =====================================================================

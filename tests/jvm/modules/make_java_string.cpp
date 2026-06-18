@@ -438,6 +438,88 @@ namespace
         // here).  Only 4095 round-trips natively; 4097 is asserted via Java length.
         cases.push_back({ "cap_minus_one_4095", repeat_bytes("x", 4095), repeat_bytes("x", 4095) });
 
+        // ── EXHAUSTIVE additions, wave 2 (mjs2_*): the encode-decision FLOORS and
+        //    the malformed-UTF-8 -> U+FFFD substitution edges the decoder
+        //    (vmhook::detail::utf8_to_utf16) handles deterministically.  All of
+        //    these are STILL self-consistent native round-trips (the library
+        //    encodes and decodes against the same memory), so expected is computed
+        //    to be exactly what read_java_string must hand back — including the
+        //    U+FFFD (EF BF BD) replacements for the malformed inputs. ──
+
+        // The UTF16-coder PROMOTION FLOOR vs the multibyte FLOOR:
+        //   U+0080 (C2 80) — the FIRST code point needing 2 UTF-8 bytes, yet still
+        //   <= 0xFF so it stays on the LATIN1 backing.  Pairs with the existing
+        //   U+00FF ceiling to bracket the whole LATIN1 multibyte range [0x80,0xFF].
+        cases.push_back({ "latin1_floor_U0080", std::string{ "\xC2\x80" }, std::string{ "\xC2\x80" } });
+        //   U+0100 (C4 80) — the FIRST code point > 0xFF, i.e. the LATIN1->UTF16
+        //   promotion floor: a single char that on its own flips a compact String
+        //   to the UTF16 coder (char_count 1, 2-byte backing).  The standalone
+        //   minimal counterpart to bmp_boundaries' bundled 00FF/0100 edge.
+        cases.push_back({ "utf16_floor_U0100", std::string{ "\xC4\x80" }, std::string{ "\xC4\x80" } });
+
+        // NUL shapes beyond the two interior-NUL cases: prove the length-counted
+        // (NOT NUL-terminated) handling at the three positions a C-string bug would
+        // mishandle differently — a SOLE NUL (the whole string is one U+0000), a
+        // LEADING NUL (a C string would see ""), and a TRAILING NUL on a UTF16
+        // backing (a C string would drop it).  Plus MULTIPLE interior NULs to prove
+        // it is not "stop at first NUL".
+        cases.push_back({ "nul_only_len1", std::string{ "\x00", 1 }, std::string{ "\x00", 1 } });
+        cases.push_back({ "leading_nul_latin1",
+                          std::string{ "\x00" "ab", 3 }, std::string{ "\x00" "ab", 3 } });
+        cases.push_back({ "trailing_nul_utf16",
+                          std::string{ "\xE6\x97\xA5\x00", 4 }, std::string{ "\xE6\x97\xA5\x00", 4 } });
+        cases.push_back({ "multi_nul_latin1",
+                          std::string{ "\x00" "a\x00" "b\x00", 5 },
+                          std::string{ "\x00" "a\x00" "b\x00", 5 } });
+
+        // MALFORMED UTF-8 -> U+FFFD (EF BF BD).  utf8_to_utf16 substitutes one
+        // U+FFFD per byte it cannot start/complete a sequence from, advancing by 1.
+        // These are well-DEFINED malformed shapes (a lead byte with too few bytes
+        // left, an orphan continuation byte) — NOT a lead followed by a wrong byte,
+        // which the masking decoder would silently mis-combine rather than replace.
+        // The round-trip is still self-consistent: the made String holds the U+FFFD
+        // units and read_java_string hands back their UTF-8 (EF BF BD) byte-exact.
+        //   truncated 2-byte lead at end-of-buffer -> ONE U+FFFD (3 bytes back).
+        cases.push_back({ "malformed_trunc_2byte_eob",
+                          std::string{ "\xC3" }, std::string{ "\xEF\xBF\xBD" } });
+        //   truncated 3-byte lead (E6 97, third byte missing): the lead becomes one
+        //   U+FFFD, then the dangling continuation 0x97 becomes a second U+FFFD ->
+        //   TWO U+FFFD (6 bytes back).
+        cases.push_back({ "malformed_trunc_3byte_eob",
+                          std::string{ "\xE6\x97" }, std::string{ "\xEF\xBF\xBD\xEF\xBF\xBD" } });
+        //   truncated 4-byte lead (F0 9F 98, fourth byte missing) -> the lead +
+        //   two dangling continuations -> THREE U+FFFD (9 bytes back).
+        cases.push_back({ "malformed_trunc_4byte_eob",
+                          std::string{ "\xF0\x9F\x98" },
+                          std::string{ "\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD" } });
+        //   a SOLE orphan continuation byte 0x80 (no lead) -> ONE U+FFFD.
+        cases.push_back({ "malformed_orphan_continuation",
+                          std::string{ "\x80" }, std::string{ "\xEF\xBF\xBD" } });
+        //   well-formed ASCII flanking a malformed lead: 'A' + lone C3 (eob) -> 'A'
+        //   then U+FFFD; proves the substitution does not eat the preceding char and
+        //   the surrounding content survives byte-exact.
+        cases.push_back({ "malformed_flanked_by_ascii",
+                          std::string{ "A\xC3" }, std::string{ "A\xEF\xBF\xBD" } });
+
+        // A LONGER surrogate-pair RUN: four consecutive astral emoji -> 8 UTF-16
+        // units (four pairs) -> 16 UTF-8 bytes.  Extends astral_two_emoji to prove
+        // the pair-advance loop stays in lockstep across several pairs, not just two.
+        cases.push_back({ "astral_four_emoji",
+                          std::string{ "\xF0\x9F\x98\x80\xF0\x9F\x98\x81"
+                                       "\xF0\x9F\x98\x82\xF0\x9F\x98\x83" },
+                          std::string{ "\xF0\x9F\x98\x80\xF0\x9F\x98\x81"
+                                       "\xF0\x9F\x98\x82\xF0\x9F\x98\x83" } });
+        // Astral pairs INTERLEAVED with ASCII (emoji,ascii,emoji,ascii,...) -> proves
+        // each pair advances exactly two units and never swallows the ASCII between
+        // pairs.  Five emoji + five ASCII letters; expected == input.
+        cases.push_back({ "astral_interleaved_ascii",
+                          std::string{ "\xF0\x9F\x98\x80" "a\xF0\x9F\x98\x81" "b"
+                                       "\xF0\x9F\x98\x82" "c\xF0\x9F\x98\x83" "d"
+                                       "\xF0\x9F\x98\x84" "e" },
+                          std::string{ "\xF0\x9F\x98\x80" "a\xF0\x9F\x98\x81" "b"
+                                       "\xF0\x9F\x98\x82" "c\xF0\x9F\x98\x83" "d"
+                                       "\xF0\x9F\x98\x84" "e" } });
+
         return cases;
     }
 
@@ -462,7 +544,7 @@ namespace
     // Wide native round-trip results, parallel to build_rt_cases().  g_rt_valid is
     // the single gate the body keys on (a valid oop implies it was non-null), so
     // we keep only the meaningful state, not a parallel non-null flag.
-    constexpr std::size_t k_max_rt{ 32 };
+    constexpr std::size_t k_max_rt{ 48 };
     std::array<std::atomic<bool>, k_max_rt> g_rt_valid{};
     std::array<std::atomic<bool>, k_max_rt> g_rt_byte_exact{};
     std::array<std::atomic<int>,  k_max_rt> g_rt_decoded_len{};  // bytes (-1 if not made)
@@ -1290,6 +1372,87 @@ namespace
                 // (0800,D7FF,E000,FFFD,FFFF) -> 3 bytes each = 15; total 21 bytes.
                 gate("mjs_bmp_boundaries_roundtrips_21byte", g_rt_valid[i].load(),
                      g_rt_decoded_len[i].load() == 21 && g_rt_byte_exact[i].load());
+            }
+            // ── EXHAUSTIVE wave-2 named property gates (mjs2_*). ──
+            else if (cases[i].label == "latin1_floor_U0080")
+            {
+                // U+0080: first 2-byte UTF-8 form, still LATIN1 backing -> 2 bytes.
+                gate("mjs2_latin1_floor_U0080_roundtrips_2byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 2 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "utf16_floor_U0100")
+            {
+                // U+0100: first code point > 0xFF (UTF16 coder), 2-byte UTF-8.
+                gate("mjs2_utf16_floor_U0100_roundtrips_2byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 2 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "nul_only_len1")
+            {
+                // A sole NUL: one U+0000 unit -> one 0x00 byte back (NOT empty).
+                gate("mjs2_nul_only_preserved_len1", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 1 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "leading_nul_latin1")
+            {
+                // NUL + "ab": 3 bytes survive (a C string would have read "").
+                gate("mjs2_leading_nul_preserved_len3", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 3 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "trailing_nul_utf16")
+            {
+                // U+65E5 (3B) + NUL (1B) on the UTF16 backing -> 4 bytes back.
+                gate("mjs2_trailing_nul_utf16_preserved_len4", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 4 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "multi_nul_latin1")
+            {
+                // NUL a NUL b NUL: 5 bytes, three embedded NULs all preserved.
+                gate("mjs2_multi_nul_preserved_len5", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 5 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "malformed_trunc_2byte_eob")
+            {
+                // Lone C3 -> one U+FFFD -> EF BF BD (3 bytes back), byte-exact.
+                gate("mjs2_malformed_trunc_2byte_one_fffd", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 3 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "malformed_trunc_3byte_eob")
+            {
+                // E6 97 -> two U+FFFD -> 6 bytes back, byte-exact.
+                gate("mjs2_malformed_trunc_3byte_two_fffd", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 6 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "malformed_trunc_4byte_eob")
+            {
+                // F0 9F 98 -> three U+FFFD -> 9 bytes back, byte-exact.
+                gate("mjs2_malformed_trunc_4byte_three_fffd", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 9 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "malformed_orphan_continuation")
+            {
+                // Sole 0x80 -> one U+FFFD -> 3 bytes back, byte-exact.
+                gate("mjs2_malformed_orphan_one_fffd", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 3 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "malformed_flanked_by_ascii")
+            {
+                // 'A' + lone C3 -> 'A' (1B) + U+FFFD (3B) = 4 bytes; the leading
+                // ASCII is NOT eaten by the substitution.
+                gate("mjs2_malformed_flanked_preserves_ascii_len4", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 4 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "astral_four_emoji")
+            {
+                // Four astral emoji -> 8 UTF-16 units -> 16 UTF-8 bytes, byte-exact.
+                gate("mjs2_astral_four_emoji_roundtrips_16byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 16 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "astral_interleaved_ascii")
+            {
+                // 5 emoji (4B each = 20B) + 5 ASCII (1B each = 5B) = 25 bytes back,
+                // byte-exact: each pair advances exactly 2 units, ASCII untouched.
+                gate("mjs2_astral_interleaved_ascii_roundtrips_25byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 25 && g_rt_byte_exact[i].load());
             }
         }
 

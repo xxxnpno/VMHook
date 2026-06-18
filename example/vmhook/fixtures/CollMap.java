@@ -289,6 +289,65 @@ public final class CollMap
     public static HashMap<String, List<Box>> hashNestedList =
         new HashMap<String, List<Box>>();
 
+    // ---- ADDED input coverage: more key/value types + boundary values ------
+
+    /**
+     * HashMap&lt;String,String&gt; with NON-ASCII keys AND values.  Exercises
+     * read_java_string's NON-ASCII path: LATIN1 (coder 0, 0x80-0xFF -&gt; 2-byte
+     * UTF-8) and UTF16 (coder 1, BMP code point -&gt; 3-byte UTF-8) on JDK 9+, and
+     * the JDK 8 char[] path — all converge on the SAME UTF-8 output, so the
+     * native side asserts exact UTF-8 string equality (a code-unit sum would NOT
+     * cross-check, since C++ sees UTF-8 bytes while Java sees UTF-16 units).
+     */
+    public static HashMap<String, String> hashUnicode = new HashMap<String, String>();
+
+    /**
+     * HashMap&lt;Character,Character&gt; — boxed 16-bit char key AND value
+     * (descriptor "C"); proves a Character.value (unsigned 16-bit) round-trips.
+     */
+    public static HashMap<Character, Character> hashCharKey = new HashMap<Character, Character>();
+
+    /**
+     * HashMap&lt;Short,Short&gt; — boxed signed 16-bit key AND value
+     * (descriptor "S"); includes a NEGATIVE short to prove sign extension.
+     */
+    public static HashMap<Short, Short> hashShortKey = new HashMap<Short, Short>();
+
+    /**
+     * HashMap&lt;Byte,Byte&gt; — boxed signed 8-bit key AND value
+     * (descriptor "B"); includes a NEGATIVE byte to prove sign extension.
+     */
+    public static HashMap<Byte, Byte> hashByteKey = new HashMap<Byte, Byte>();
+
+    /**
+     * HashMap&lt;Boolean,Box&gt; — boxed boolean key (descriptor "Z"); exactly
+     * the two constants Boolean.FALSE/TRUE, proving a boolean wrapper decodes.
+     */
+    public static HashMap<Boolean, Box> hashBoolKey = new HashMap<Boolean, Box>();
+
+    /**
+     * HashMap&lt;String,Box&gt; with EXTREME / NEGATIVE Box ids (Integer.MIN_VALUE,
+     * -1, 0, Integer.MAX_VALUE).  Proves the value's signed 32-bit "id" field is
+     * read without truncation or sign error across the full int range.
+     */
+    public static HashMap<String, Box> hashNegIds = new HashMap<String, Box>();
+
+    /**
+     * TreeMap built with a REVERSE-ORDER comparator.  A correct in-order red-black
+     * walk emits keys in the COMPARATOR's order, so this comes out DESCENDING
+     * ("k2","k1","k0") — proving the walk honours the comparator, not natural
+     * ordering.  SMALL_N entries; firstKey/lastKey published.
+     */
+    public static TreeMap<String, Box> treeReverseComparator =
+        new TreeMap<String, Box>(Collections.reverseOrder());
+
+    /**
+     * TreeMap&lt;Integer,Box&gt; — NUMERIC key order (10,2,1 inserted; in-order
+     * yields 1,2,10).  Distinct from lexicographic String order, proving the walk
+     * emits the natural NUMERIC comparator order for boxed Integer keys.
+     */
+    public static TreeMap<Integer, Box> treeIntKey = new TreeMap<Integer, Box>();
+
     // ---- CHARACTERIZED-EMPTY extra Map shapes ------------------------------
     //      Each is a real, non-empty Java Map, but its heap layout exposes no
     //      Node the walkers can follow, so to_entries reads EMPTY.  The Java
@@ -448,6 +507,29 @@ public final class CollMap
     public static volatile int enumSmallSize;
     public static volatile int mapOfNSize;
     public static volatile int mapOf1Size;
+
+    // ADDED-coverage size witnesses + content fingerprints.
+    public static volatile int hashUnicodeSize;
+    public static volatile int hashCharKeySize;
+    public static volatile int hashShortKeySize;
+    public static volatile int hashByteKeySize;
+    public static volatile int hashBoolKeySize;
+    public static volatile int hashNegIdsSize;
+    public static volatile int treeReverseComparatorSize;
+    public static volatile int treeIntKeySize;
+
+    /** hashCharKey/Short/Byte: sum/xor of boxed keys and values (signed widened to int). */
+    public static volatile long hashCharKeyKeySum;
+    public static volatile long hashCharKeyValSum;
+    public static volatile long hashShortKeyKeySum;
+    public static volatile long hashShortKeyValSum;
+    public static volatile long hashByteKeyKeySum;
+    public static volatile long hashByteKeyValSum;
+    /** hashNegIds: sum of value.id across the extreme/negative ids. */
+    public static volatile long hashNegIdsIdSum;
+    /** treeReverseComparator first/last keys (DESCENDING comparator order). */
+    public static volatile String treeReverseComparatorFirstKey;
+    public static volatile String treeReverseComparatorLastKey;
 
     /**
      * Reflective probes confirming the engineered HashMap bucket shapes, so the
@@ -799,6 +881,92 @@ public final class CollMap
             hashNestedList.put("n" + i, inner);
         }
 
+        // ---- ADDED input coverage ------------------------------------------
+
+        // Non-ASCII String->String.  Strings are built from explicit char code
+        // points so the SOURCE stays pure ASCII (compiles identically under any
+        // javac encoding 8..25); the native side asserts the exact UTF-8 decoding:
+        //   U+00E9 (e-acute) -> UTF-8 C3 A9   (LATIN1 on JDK9+, char[] on JDK8)
+        //   U+00FC (u-umlaut)-> UTF-8 C3 BC
+        //   U+4E2D (CJK)     -> UTF-8 E4 B8 AD (UTF16 coder on JDK9+)
+        hashUnicode = new HashMap<String, String>();
+        final String kLatin = new String(new char[] { (char) 0x00E9 });             // LATIN1 key
+        final String vLatin = new String(new char[] { (char) 0x00FC });             // LATIN1 value
+        final String kBmp   = new String(new char[] { (char) 0x4E2D });             // UTF16 key
+        final String vBmp   = new String(new char[] { (char) 0x00E9, (char) 0x4E2D }); // UTF16 value
+        hashUnicode.put(kLatin, vLatin);
+        hashUnicode.put(kBmp, vBmp);
+
+        // Boxed Character -> Character: key 'A'(65) -> value 'Z'(90), key '0'(48)
+        // -> value '9'(57).  Proves the unsigned-16-bit "C" descriptor decodes.
+        hashCharKey = new HashMap<Character, Character>();
+        long ckKey = 0, ckVal = 0;
+        hashCharKey.put(Character.valueOf('A'), Character.valueOf('Z'));
+        hashCharKey.put(Character.valueOf('0'), Character.valueOf('9'));
+        ckKey = 'A' + '0';
+        ckVal = 'Z' + '9';
+        hashCharKeyKeySum = ckKey;
+        hashCharKeyValSum = ckVal;
+
+        // Boxed Short -> Short including a NEGATIVE short (sign extension proof).
+        hashShortKey = new HashMap<Short, Short>();
+        final short[] shKeys = { (short) -1, (short) 7, (short) 30000 };
+        long shKey = 0, shVal = 0;
+        for (int i = 0; i < shKeys.length; ++i)
+        {
+            final short v = (short) (shKeys[i] + 1);
+            hashShortKey.put(Short.valueOf(shKeys[i]), Short.valueOf(v));
+            shKey += shKeys[i];
+            shVal += v;
+        }
+        hashShortKeyKeySum = shKey;
+        hashShortKeyValSum = shVal;
+
+        // Boxed Byte -> Byte including a NEGATIVE byte (sign extension proof).
+        hashByteKey = new HashMap<Byte, Byte>();
+        final byte[] byKeys = { (byte) -1, (byte) 5, (byte) 127 };
+        long byKey = 0, byVal = 0;
+        for (int i = 0; i < byKeys.length; ++i)
+        {
+            final byte v = (byte) (byKeys[i] - 1);
+            hashByteKey.put(Byte.valueOf(byKeys[i]), Byte.valueOf(v));
+            byKey += byKeys[i];
+            byVal += v;
+        }
+        hashByteKeyKeySum = byKey;
+        hashByteKeyValSum = byVal;
+
+        // Boxed Boolean -> Box: exactly FALSE and TRUE.
+        hashBoolKey = new HashMap<Boolean, Box>();
+        hashBoolKey.put(Boolean.FALSE, new Box(0, "false-v"));
+        hashBoolKey.put(Boolean.TRUE, new Box(1, "true-v"));
+
+        // Extreme / negative Box ids: full signed-int range round-trip.
+        hashNegIds = new HashMap<String, Box>();
+        final int[] extremeIds = { Integer.MIN_VALUE, -1, 0, Integer.MAX_VALUE };
+        long negSum = 0;
+        for (int i = 0; i < extremeIds.length; ++i)
+        {
+            hashNegIds.put("e" + i, new Box(extremeIds[i], "v" + i));
+            negSum += extremeIds[i];
+        }
+        hashNegIdsIdSum = negSum;
+
+        // TreeMap with a REVERSE comparator: in-order walk must come out DESCENDING.
+        treeReverseComparator = new TreeMap<String, Box>(Collections.reverseOrder());
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            treeReverseComparator.put("k" + i, new Box(i, "v" + i));
+        }
+        treeReverseComparatorFirstKey = treeReverseComparator.firstKey();   // "k2"
+        treeReverseComparatorLastKey = treeReverseComparator.lastKey();     // "k0"
+
+        // TreeMap<Integer,Box>: NUMERIC key order (insert 10,2,1 -> walk 1,2,10).
+        treeIntKey = new TreeMap<Integer, Box>();
+        treeIntKey.put(Integer.valueOf(10), new Box(10, "v10"));
+        treeIntKey.put(Integer.valueOf(2), new Box(2, "v2"));
+        treeIntKey.put(Integer.valueOf(1), new Box(1, "v1"));
+
         // ---- Characterized-empty extra shapes ------------------------------
 
         chmSmall = new ConcurrentHashMap<String, Box>();
@@ -892,6 +1060,15 @@ public final class CollMap
         enumSmallSize = enumSmall.size();
         mapOfNSize = (mapOfN == null) ? -1 : mapOfN.size();
         mapOf1Size = (mapOf1 == null) ? -1 : mapOf1.size();
+
+        hashUnicodeSize = hashUnicode.size();
+        hashCharKeySize = hashCharKey.size();
+        hashShortKeySize = hashShortKey.size();
+        hashByteKeySize = hashByteKey.size();
+        hashBoolKeySize = hashBoolKey.size();
+        hashNegIdsSize = hashNegIds.size();
+        treeReverseComparatorSize = treeReverseComparator.size();
+        treeIntKeySize = treeIntKey.size();
     }
 
     /** Strong holder keeping WeakHashMap keys reachable for the duration. */
