@@ -79,6 +79,7 @@ namespace
         static auto set_done(bool value) -> void      { static_field("done")->set(value); }
         static auto get_done() -> bool                { return static_field("done")->get(); }
         static auto set_mode(std::int32_t m) -> void  { static_field("mode")->set(m); }
+        static auto set_call_delta(std::int32_t d) -> void { static_field("callDelta")->set(d); }
 
         // --- recorded observations the Java side writes -------------------
         static auto get_last_hot_result() -> std::int32_t { return static_field("lastHotResult")->get(); }
@@ -132,6 +133,26 @@ namespace
                     // BEFORE the fixture's pending() observes go.
                     dip_fixture::set_done(false);
                     dip_fixture::set_mode(mode);
+                }
+                dip_fixture::set_go(value);
+            },
+            []() { return dip_fixture::get_done(); });
+    }
+
+    // Drives mode 5 (a single hot(callDelta) dispatch) with a caller-chosen
+    // delta.  Resets observations + the `done` latch, programs `callDelta` and
+    // the mode-5 selector on the rising edge BEFORE the fixture observes `go`.
+    auto drive_delta(vmhook_test::context& ctx, std::int32_t delta) -> bool
+    {
+        reset_observations();
+        return ctx.run_probe(
+            [delta](bool value)
+            {
+                if (value)
+                {
+                    dip_fixture::set_done(false);
+                    dip_fixture::set_call_delta(delta);
+                    dip_fixture::set_mode(5);
                 }
                 dip_fixture::set_go(value);
             },
@@ -346,6 +367,170 @@ namespace
         return flags != nullptr && (*flags & vmhook::hotspot::NO_COMPILE) != 0;
     }
 
+    // ---- WIDTH-CORRECT _dont_inline read-back (the WRITE path's own resolver) --
+    //
+    // get_flags() above is the deliberately u2-ONLY read view: it returns a live
+    // pointer ONLY on the JDK 11-20 band where Method::_flags is an exported
+    // 2-byte word with _dont_inline at bit 2, and nullptr on JDK 8 (u1 bitfield,
+    // nothing exported) and JDK 21+ (MethodFlags u4 _status, _dont_inline at bit
+    // 12).  That is why the bit-readback above is downgraded to [INFO] off-band.
+    //
+    // set_dont_inline() — the path vmhook ACTUALLY writes _dont_inline through —
+    // does NOT use get_flags(); it uses resolve_method_flags_slot(), which derives
+    // the width-correct (address,width_bytes,dont_inline_bit) for the running JDK
+    // (width 2 / bit 2 on 11-20, width 4 / bit 12 derived from _intrinsic_id on
+    // 21+, non-confident on JDK 8).  Reading the bit back through THAT same
+    // resolver therefore observes vmhook's real write on EVERY JDK where the
+    // resolver is confident — including JDK 21+, where get_flags() cannot.  The
+    // pure (offset,width,bit) DECISION is unit-tested without a JVM in
+    // tests/test_method_flags_width.cpp; here we exercise the LIVE round-trip
+    // (the value-correctness the pure test explicitly defers to this module).
+    //
+    // All reads go through os::safe_read on the resolver-derived address, so a
+    // cold/freed Method never faults (returns "cannot tell" instead).
+
+    // The resolved slot for `m`, or a non-confident slot if it cannot be placed.
+    auto flags_slot(vmhook::hotspot::method* const m) -> vmhook::hotspot::method_flags_slot
+    {
+        if (!m || !vmhook::hotspot::is_valid_pointer(m))
+        {
+            return {};
+        }
+        return vmhook::hotspot::resolve_method_flags_slot(m);
+    }
+
+    // True iff resolve_method_flags_slot() confidently placed the _dont_inline
+    // slot for the running JDK (false on JDK 8's u1 bitfield, or any layout the
+    // pure decision refuses).  Latched once: when confident, the width-correct
+    // readback is HARD on this JDK; when not, it is [INFO] (same as get_flags()).
+    enum class slot_state { unknown, confident, not_confident };
+    slot_state g_slot_confident{ slot_state::unknown };
+
+    auto note_slot_confidence(vmhook::hotspot::method* const m) -> void
+    {
+        if (g_slot_confident != slot_state::unknown)
+        {
+            return;
+        }
+        if (!m || !vmhook::hotspot::is_valid_pointer(m))
+        {
+            return;
+        }
+        g_slot_confident = flags_slot(m).confident ? slot_state::confident
+                                                   : slot_state::not_confident;
+    }
+
+    auto slot_confident() -> bool
+    {
+        return g_slot_confident == slot_state::confident;
+    }
+
+    // Reads the _dont_inline bit back through the WIDTH-CORRECT resolver slot
+    // (the exact location set_dont_inline writes), via os::safe_read at the
+    // resolver-reported width.  Returns -1 ("cannot tell": unconfident slot, bad
+    // pointer, or unreadable page), 0 (bit clear) or 1 (bit set).  Never faults.
+    auto dont_inline_widthcorrect(vmhook::hotspot::method* const m) -> int
+    {
+        const vmhook::hotspot::method_flags_slot slot{ flags_slot(m) };
+        if (!slot.confident || slot.address == nullptr
+            || slot.dont_inline_bit < 0 || slot.dont_inline_bit >= 32)
+        {
+            return -1;
+        }
+        const std::uint32_t mask{ static_cast<std::uint32_t>(1u) << slot.dont_inline_bit };
+        std::uint32_t word{ 0 };
+        const std::size_t width{ slot.width_bytes == 2 ? std::size_t{ 2 }
+                                 : (slot.width_bytes == 4 ? std::size_t{ 4 }
+                                                          : std::size_t{ 0 }) };
+        if (width == 0
+            || !vmhook::os::safe_read(&word, slot.address, width))
+        {
+            return -1;
+        }
+        return (word & mask) != 0 ? 1 : 0;
+    }
+
+    // Reads the FULL width-correct flags word (for the width-correct no-clobber
+    // check).  Returns false if unreadable, leaving `out` untouched.
+    auto read_flags_word_widthcorrect(vmhook::hotspot::method* const m,
+                                      std::uint32_t& out) -> bool
+    {
+        const vmhook::hotspot::method_flags_slot slot{ flags_slot(m) };
+        if (!slot.confident || slot.address == nullptr)
+        {
+            return false;
+        }
+        const std::size_t width{ slot.width_bytes == 2 ? std::size_t{ 2 }
+                                 : (slot.width_bytes == 4 ? std::size_t{ 4 }
+                                                          : std::size_t{ 0 }) };
+        if (width == 0)
+        {
+            return false;
+        }
+        std::uint32_t word{ 0 };
+        if (!vmhook::os::safe_read(&word, slot.address, width))
+        {
+            return false;
+        }
+        out = word;
+        return true;
+    }
+
+    // Best-effort wrapper for "the _dont_inline bit, read through the WIDTH-
+    // CORRECT resolver, must be SET".  HARD when the resolver is confident on
+    // this JDK (which includes JDK 21+, unlike expect_dont_inline_set's u2 view);
+    // [INFO] only when the resolver itself cannot place the slot (JDK 8).
+    auto expect_widthcorrect_set(vmhook_test::context& ctx,
+                                 const char* const name,
+                                 vmhook::hotspot::method* const m) -> void
+    {
+        if (slot_confident())
+        {
+            ctx.check(name, dont_inline_widthcorrect(m) == 1);
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] dont_inline_dont_compile: '" } + name
+                       + "' best-effort - resolve_method_flags_slot() is not "
+                         "confident on this JDK (JDK 8 u1 bitfield / unrecognised "
+                         "layout); _dont_inline write is a documented safe no-op there, "
+                         "behaviour proven by NO_COMPILE + deopt/settle.");
+        }
+    }
+
+    // Symmetric "must be CLEAR" via the width-correct resolver (teardown).
+    auto expect_widthcorrect_clear(vmhook_test::context& ctx,
+                                   const char* const name,
+                                   vmhook::hotspot::method* const m) -> void
+    {
+        if (slot_confident())
+        {
+            ctx.check(name, dont_inline_widthcorrect(m) == 0);
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] dont_inline_dont_compile: '" } + name
+                       + "' best-effort - resolve_method_flags_slot() not confident "
+                         "on this JDK; teardown proven by the detour-silent assertion.");
+        }
+    }
+
+    // True iff the fault-safe NO_COMPILE probe (safe_access_flags_test) reports
+    // the bits set AND the flags word was readable.  This is the EXACT predicate
+    // verify_hooks' Mode-3 drift check uses (vmhook.hpp:10705), so cross-checking
+    // it against the raw no_compile_set() above proves both views agree on a live
+    // Method.  `found` out-param echoes whether the safe read succeeded.
+    auto no_compile_set_safe(vmhook::hotspot::method* const m, bool& found) -> bool
+    {
+        found = false;
+        if (!m || !vmhook::hotspot::is_valid_pointer(m))
+        {
+            return false;
+        }
+        return m->safe_access_flags_test(
+            static_cast<std::uint32_t>(vmhook::hotspot::NO_COMPILE), found);
+    }
+
     // Reads Method::_code through a validated pointer.  nullptr means "not
     // currently JIT-compiled" (the deopted steady state vmhook installs).
     auto method_code(vmhook::hotspot::method* const m) -> void*
@@ -543,6 +728,11 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
         if (install_hot_observer())
         {
             note_dont_inline_observability(find_hot_method());
+            // Latch the WIDTH-CORRECT resolver confidence too.  Independent of
+            // get_flags() observability: the resolver is confident on JDK 11-20
+            // AND JDK 21+ (only JDK 8's u1 bitfield defeats it), so on JDK 21+
+            // the width-correct bit-readback is HARD where get_flags() is [INFO].
+            note_slot_confidence(find_hot_method());
         }
         vmhook::shutdown_hooks();   // leave nothing armed from the probe
         ctx.record(std::string{ "[INFO] dont_inline_dont_compile: Method::_flags "
@@ -553,6 +743,27 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
                       : "NOT observable on this JDK (JDK21+ _flags width: bit-readback "
                         "assertions downgraded to [INFO]; behaviour still hard-asserted).")
                    );
+
+        // Diagnostic for the WIDTH-CORRECT resolver (the path vmhook actually
+        // writes _dont_inline through).  Records the derived (width,bit) so
+        // test_results.txt shows which JDK band this run landed on.
+        {
+            vmhook::shutdown_hooks();
+            (void)install_hot_observer();
+            const vmhook::hotspot::method_flags_slot slot{ flags_slot(find_hot_method()) };
+            vmhook::shutdown_hooks();
+            ctx.record(std::string{ "[INFO] dont_inline_dont_compile: "
+                       "resolve_method_flags_slot() confident=" }
+                       + (slot.confident ? "true" : "false")
+                       + ", width_bytes=" + std::to_string(slot.width_bytes)
+                       + ", dont_inline_bit=" + std::to_string(slot.dont_inline_bit)
+                       + " - width-correct _dont_inline bit-readback is "
+                       + (slot_confident()
+                              ? "HARD on this JDK (observes the bit set_dont_inline "
+                                "actually writes, including JDK 21+)."
+                              : "[INFO] (JDK 8 u1 bitfield / unrecognised layout: "
+                                "set_dont_inline is a documented safe no-op)."));
+        }
     }
 
     // Clean baseline: nothing armed; the live Method* must carry NEITHER flag
@@ -566,8 +777,20 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
         if (m != nullptr)
         {
             expect_dont_inline_clear(ctx, "baseline_dont_inline_clear_before_any_hook", m);
+            // Width-correct readback (HARD on JDK 21+ too): _dont_inline must be
+            // clear before any hook.  Distinct from the u2 get_flags() view above.
+            expect_widthcorrect_clear(ctx, "baseline_dont_inline_widthcorrect_clear", m);
             ctx.check("baseline_no_compile_clear_before_any_hook",
                       !no_compile_set(m));
+
+            // The fault-safe NO_COMPILE probe (the exact predicate verify_hooks'
+            // drift check uses) must AGREE with the raw read: both clear, and the
+            // flags word readable on a live Method.
+            bool safe_found{ false };
+            const bool safe_nc{ no_compile_set_safe(m, safe_found) };
+            ctx.check("baseline_no_compile_safe_probe_readable", safe_found);
+            ctx.check("baseline_no_compile_safe_clear_agrees_raw",
+                      safe_nc == no_compile_set(m));
         }
         else
         {
@@ -593,13 +816,61 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
         if (m != nullptr)
         {
             expect_dont_inline_set(ctx, "install_set_dont_inline_bit", m);
+            // Width-correct readback through the WRITE path's own resolver: the
+            // bit set_dont_inline actually wrote must read back set.  HARD on
+            // JDK 21+ too (where the u2 get_flags() view above is only [INFO]).
+            expect_widthcorrect_set(ctx, "install_set_dont_inline_widthcorrect", m);
             ctx.check("install_set_no_compile_flags", no_compile_set(m));
+
+            // The width-correct resolver invariants must hold whenever confident:
+            // a 2- or 4-byte word, and _dont_inline at bit 2 (u2 band) or bit 12
+            // (u4 band) — never some other (width,bit) pairing.  Skipped [INFO] on
+            // the JDK-8 u1 layout where the resolver is (correctly) not confident.
+            const vmhook::hotspot::method_flags_slot slot{ flags_slot(m) };
+            if (slot_confident())
+            {
+                ctx.check("install_slot_width_is_2_or_4",
+                          slot.width_bytes == 2 || slot.width_bytes == 4);
+                ctx.check("install_slot_bit_matches_width",
+                          (slot.width_bytes == 2 && slot.dont_inline_bit == 2)
+                              || (slot.width_bytes == 4 && slot.dont_inline_bit == 12));
+                ctx.check("install_slot_address_non_null", slot.address != nullptr);
+                // On the JDK 11-20 band where get_flags() is ALSO live, the two
+                // views must point at the SAME word: the u2 read view and the
+                // width-correct write resolver agree on the address.  When
+                // get_flags() is null (JDK 8 / 21+) there is nothing to compare,
+                // so this cross-check is gated on the u2 view being observable.
+                if (dont_inline_observable() && slot.width_bytes == 2)
+                {
+                    const std::uint16_t* const u2{ m->get_flags() };
+                    ctx.check("install_u2_and_widthcorrect_same_word",
+                              u2 != nullptr
+                              && static_cast<void*>(const_cast<std::uint16_t*>(u2))
+                                     == slot.address);
+                }
+            }
+            else
+            {
+                ctx.record("[INFO] dont_inline_dont_compile scenario 1: "
+                           "resolve_method_flags_slot() not confident (JDK 8 u1 "
+                           "bitfield / unrecognised layout) - slot invariants skipped; "
+                           "set_dont_inline is a safe no-op there.");
+            }
+
             // Install deopts the method, so _code is null in the steady state.
             // hot() is saturated from earlier scenarios; an async recompile can
             // race _code non-null in the window after hook() returns, so settle
             // it with a bounded verify_hooks() (still fails on a stale-_code
             // regression).  Clean fast path = the old single-instant null read.
             ctx.check("install_left_code_null", code_settles_null(m, 12));
+
+            // The fault-safe NO_COMPILE probe must AGREE with the raw read now
+            // that the bits are set: both true, word readable on the live Method.
+            bool safe_found{ false };
+            const bool safe_nc{ no_compile_set_safe(m, safe_found) };
+            ctx.check("install_no_compile_safe_probe_readable", safe_found);
+            ctx.check("install_no_compile_safe_set_agrees_raw",
+                      safe_nc == no_compile_set(m) && safe_nc);
         }
 
         const bool done{ drive(ctx, 1) };
@@ -616,10 +887,17 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
         if (m != nullptr)
         {
             expect_dont_inline_set(ctx, "install_dont_inline_still_set_after_fire", m);
+            expect_widthcorrect_set(ctx, "install_dont_inline_widthcorrect_still_set_after_fire", m);
             ctx.check("install_no_compile_still_set_after_fire", no_compile_set(m));
         }
 
         vmhook::shutdown_hooks();   // clean up scenario 1
+        // The bulk teardown must clear the width-correct bit too (symmetric with
+        // the install-set above, and HARD on JDK 21+ unlike the u2 view).
+        if (m != nullptr)
+        {
+            expect_widthcorrect_clear(ctx, "install_dont_inline_widthcorrect_clear_after_shutdown", m);
+        }
     }
 
     // =====================================================================
@@ -640,13 +918,41 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
         if (m != nullptr)
         {
             expect_dont_inline_set(ctx, "idempotent_first_install_set_bit", m);
+            expect_widthcorrect_set(ctx, "idempotent_first_install_set_widthcorrect", m);
             const std::uint16_t flags_after_first{ read_flags_word(m) };
+            std::uint32_t wc_after_first{ 0 };
+            const bool wc_first_ok{ read_flags_word_widthcorrect(m, wc_after_first) };
 
             // Redundant second install on the same Method* — duplicate-membership
             // short-circuit returns true without re-touching the flags.
             ctx.check("idempotent_second_install_returns_true", install_hot_observer());
 
             const std::uint16_t flags_after_second{ read_flags_word(m) };
+            std::uint32_t wc_after_second{ 0 };
+            const bool wc_second_ok{ read_flags_word_widthcorrect(m, wc_after_second) };
+
+            // Width-correct no-clobber: on every JDK where the resolver is
+            // confident (including JDK 21+), the redundant second install leaves
+            // the width-correct flags word byte-identical — the idempotent set
+            // did not flip the bit twice or disturb a neighbouring bit in the u4
+            // _status word.  This is the JDK-21+-strong companion of the u2
+            // no-clobber check below.
+            if (slot_confident())
+            {
+                ctx.check("idempotent_widthcorrect_word_readable_both_snapshots",
+                          wc_first_ok && wc_second_ok);
+                if (wc_first_ok && wc_second_ok)
+                {
+                    ctx.check("idempotent_widthcorrect_word_unchanged_by_second_install",
+                              wc_after_second == wc_after_first);
+                }
+            }
+            else
+            {
+                ctx.record("[INFO] dont_inline_dont_compile scenario 2: width-correct "
+                           "no-clobber skipped - resolver not confident on this JDK "
+                           "(JDK 8 u1 bitfield); u2 no-clobber below still HARD.");
+            }
             expect_dont_inline_set(ctx, "idempotent_dont_inline_still_set_after_second", m);
             // No-clobber proof: the redundant second install left Method::_flags
             // byte-identical.  This holds regardless of the get_flags() width bug
@@ -813,6 +1119,7 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
         if (m != nullptr)
         {
             expect_dont_inline_set(ctx, "clear_pre_dont_inline_set", m);
+            expect_widthcorrect_set(ctx, "clear_pre_dont_inline_widthcorrect_set", m);
             ctx.check("clear_pre_no_compile_set", no_compile_set(m));
         }
 
@@ -824,6 +1131,9 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
             // bit-readback is best-effort on JDK 21+.  The DURABLE teardown proof
             // is the detour going silent below, asserted hard on every JDK.
             expect_dont_inline_clear(ctx, "clear_dont_inline_cleared_after_shutdown", m);
+            // Width-correct clear: HARD on JDK 21+ too (the resolver path the
+            // teardown actually clears _dont_inline through).
+            expect_widthcorrect_clear(ctx, "clear_dont_inline_widthcorrect_cleared_after_shutdown", m);
             ctx.check("clear_no_compile_cleared_after_shutdown", !no_compile_set(m));
         }
 
@@ -867,6 +1177,7 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
             if (m != nullptr)
             {
                 expect_dont_inline_set(ctx, "scoped_install_set_dont_inline", m);
+                expect_widthcorrect_set(ctx, "scoped_install_set_dont_inline_widthcorrect", m);
                 ctx.check("scoped_install_set_no_compile", no_compile_set(m));
             }
 
@@ -898,6 +1209,9 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
             // NO_COMPILE clear is HARD; _dont_inline bit-readback best-effort on
             // JDK 21+.  Detour-silent below is the durable teardown proof.
             expect_dont_inline_clear(ctx, "scoped_dont_inline_cleared_after_scope_exit", m);
+            // Width-correct clear via the resolver hook_handle::stop() uses (HARD
+            // on JDK 21+) — the RAII teardown path's own _dont_inline location.
+            expect_widthcorrect_clear(ctx, "scoped_dont_inline_widthcorrect_cleared_after_scope_exit", m);
             ctx.check("scoped_no_compile_cleared_after_scope_exit", !no_compile_set(m));
         }
 
@@ -1112,6 +1426,116 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
     }
 
     // =====================================================================
+    // Scenario 8 — EDGE-VALUE arg decode through the i2i patch.  The hooked
+    //   hot(int) is the JIT inhibitor's headline target; every earlier scenario
+    //   only ever fed it HOT_DELTA (7) or i&0xFF in the loop.  Here we drive
+    //   BOUNDARY int deltas (0, -1, INT_MIN, INT_MAX, a small negative) one at a
+    //   time through the SAME inhibited interpreter dispatch and assert:
+    //     * the detour decoded the exact int the JVM passed (XOR == delta), and
+    //     * allow-through computed seed + delta with the documented two's-
+    //       complement wraparound (INT_MIN/MAX overflow the int result, matching
+    //       Java's defined wrapping `+`).
+    //   This proves the inhibitors keep BOUNDARY-valued dispatches on the patch
+    //   exactly as they do the nominal value — an "every possible input" gap the
+    //   fixed-HOT_DELTA scenarios never covered.  Heap-modest: each delta is a
+    //   single hot() call (mode 5), no loop, no allocation.
+    //
+    //   Each delta's single-fire contract is gated BEST-EFFORT for the same
+    //   reason scenarios 3/5/7 are: hot() may carry a stale _from_interpreted_
+    //   entry from an earlier scenario's verify_hooks() (the documented JIT-
+    //   bypass limitation), so a persistent miss is recorded [INFO], not a FAIL.
+    //   The flag-set + probe-complete + no-double-fire invariants stay HARD.
+    // =====================================================================
+    {
+        ctx.check("edge_install_returns_true", install_hot_observer());
+
+        vmhook::hotspot::method* const m{ find_hot_method() };
+        ctx.check("edge_located_live_method", m != nullptr);
+        if (m != nullptr)
+        {
+            expect_dont_inline_set(ctx, "edge_install_set_dont_inline", m);
+            expect_widthcorrect_set(ctx, "edge_install_set_dont_inline_widthcorrect", m);
+            ctx.check("edge_install_set_no_compile", no_compile_set(m));
+        }
+
+        // Boundary deltas + their wrapped int results (Java `+` wraps on overflow;
+        // C++ signed overflow is UB, so compute each via well-defined unsigned
+        // arithmetic and cast back, matching the JVM's two's-complement result).
+        struct edge_case
+        {
+            const char*  tag;
+            std::int32_t delta;
+        };
+        const edge_case cases[]{
+            { "zero",     std::int32_t{ 0 } },
+            { "neg_one",  std::int32_t{ -1 } },
+            { "neg_delta", std::int32_t{ -7 } },
+            { "int_max",  static_cast<std::int32_t>(0x7FFFFFFF) },          // INT_MAX
+            { "int_min",  static_cast<std::int32_t>(0x80000000u) },         // INT_MIN
+        };
+
+        for (const edge_case& c : cases)
+        {
+            // Java result: (int)(seed + delta) with defined wraparound.
+            const std::int32_t expected{ static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(SEED)
+                + static_cast<std::uint32_t>(c.delta)) };
+
+            constexpr int attempts{ 8 };
+            bool any_probe_done{ false };
+            bool fired_once{ false };
+            for (int attempt{ 0 }; attempt < attempts && !fired_once; ++attempt)
+            {
+                (void)vmhook::verify_hooks();
+                const bool probe_done{ drive_delta(ctx, c.delta) };
+                any_probe_done = any_probe_done || probe_done;
+                if (probe_done && g_fire_count.load() == 1)
+                {
+                    fired_once = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{ 25 });
+            }
+
+            const std::string base{ std::string{ "edge_" } + c.tag };
+            // Probe handshake + no-double-fire are HARD on every JDK.
+            ctx.check(base + "_probe_completed", any_probe_done);
+            const std::int32_t fired{ g_fire_count.load() };
+            ctx.check(base + "_detour_not_double_fired", fired <= 1);
+            // Allow-through ALWAYS runs (regardless of whether the detour fired):
+            // the original body computed seed + delta with the correct wrap.  This
+            // is the Java-side witness, HARD on every JDK.
+            ctx.check(base + "_allow_through_wrapped_result",
+                      dip_fixture::get_last_hot_result() == expected);
+
+            ctx.record(std::string{ "[INFO] dont_inline_dont_compile scenario 8 (" }
+                       + c.tag + ", delta=" + std::to_string(c.delta) + "): detour fired "
+                       + std::to_string(fired) + "/1; expected wrapped result "
+                       + std::to_string(expected)
+                       + (fired_once
+                              ? " - detour decoded the boundary arg (hook reached)."
+                              : " - detour did NOT fire (documented JIT-bypass "
+                                "limitation; decode assert skipped, not a FAIL)."));
+
+            if (fired_once)
+            {
+                // The decoded int the JVM actually passed the detour matches the
+                // boundary value exactly (XOR of one fire == the delta itself).
+                ctx.check(base + "_arg_decoded_exact", g_arg_xor.load() == c.delta);
+                ctx.check(base + "_self_correct", g_self_ok_fires.load() == 1);
+            }
+        }
+
+        vmhook::shutdown_hooks();   // clean up scenario 8
+        if (m != nullptr)
+        {
+            expect_dont_inline_clear(ctx, "edge_dont_inline_cleared_after_shutdown", m);
+            expect_widthcorrect_clear(ctx, "edge_dont_inline_widthcorrect_cleared_after_shutdown", m);
+            ctx.check("edge_no_compile_cleared_after_shutdown", !no_compile_set(m));
+        }
+    }
+
+    // =====================================================================
     // FINAL CLEANUP — belt-and-braces.  Other modules run after this one, so the
     //   module MUST leave ZERO hooks armed.  Every scenario already tears its
     //   hook down; call shutdown_hooks() once more unconditionally (idempotent,
@@ -1125,7 +1549,17 @@ VMHOOK_JVM_MODULE(dont_inline_dont_compile)
             // NO_COMPILE-clear is the HARD "module left nothing armed" proof;
             // the _dont_inline bit-readback is best-effort on JDK 21+.
             expect_dont_inline_clear(ctx, "module_left_clean_dont_inline_clear", m);
+            // Width-correct clear: HARD on JDK 21+ too (the resolver path the
+            // teardown actually clears through).
+            expect_widthcorrect_clear(ctx, "module_left_clean_dont_inline_widthcorrect_clear", m);
             ctx.check("module_left_clean_no_compile_clear", !no_compile_set(m));
+            // The fault-safe NO_COMPILE probe agrees the bits are clear after a
+            // full module teardown (word readable, bits clear).
+            bool safe_found{ false };
+            const bool safe_nc{ no_compile_set_safe(m, safe_found) };
+            ctx.check("module_left_clean_no_compile_safe_probe_readable", safe_found);
+            ctx.check("module_left_clean_no_compile_safe_clear_agrees",
+                      !safe_nc && safe_nc == no_compile_set(m));
         }
     }
     ctx.check("module_left_clean_final_shutdown", true);

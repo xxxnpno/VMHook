@@ -266,6 +266,31 @@ namespace
         return false;
     }
 
+    // True once the auto-repair watchdog's `g_watchdog_running` liveness flag
+    // reaches `want` within a bounded number of ~5ms polls.  The watchdog is a
+    // DETACHED thread spawned by ensure_started() at the END of a successful
+    // hook<T>(); it flips g_watchdog_running true on entry / false on exit
+    // (worker_loop()).  Because the spawn is asynchronous, an INSTANT read right
+    // after install can observe `false` before the thread has run its first
+    // statement -- so the "watchdog became live" assertion MUST poll, not read
+    // once.  The "watchdog is gone" direction is deterministic the instant
+    // shutdown_hooks()/set_auto_repair_enabled(false) returns (both call
+    // wait_for_exit() before returning), but polling for it too is harmless and
+    // keeps both directions symmetric.  Bounded so a genuine never-spawn / never-
+    // exit regression returns false (the caller's check fails) instead of hanging.
+    auto watchdog_running_reaches(bool want, int attempts) -> bool
+    {
+        for (int attempt{ 0 }; attempt < attempts; ++attempt)
+        {
+            if (vmhook::detail::auto_repair::g_watchdog_running.load(std::memory_order_acquire) == want)
+            {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 5 });
+        }
+        return vmhook::detail::auto_repair::g_watchdog_running.load(std::memory_order_acquire) == want;
+    }
+
     // ---- Detours installed through the various paths under test -------------
     // Plain observers (allow-through: they only count + validate self/arg).
     auto install_ping_observer() -> bool
@@ -312,6 +337,29 @@ namespace
                 g_ping_self_ok.store(self != nullptr && self->seed() == SEED,
                                      std::memory_order_relaxed);
                 g_ping_arg_ok.store(delta == PING_DELTA, std::memory_order_relaxed);
+            });
+    }
+
+    // The return value the force-RETURN override detour writes.  Kept in a global
+    // (not a lambda capture) so install_ping_override stays a plain non-capturing
+    // lambda matching the rest of the module's style; the alternating-sentinel
+    // scenario rewrites this between installs to prove each REVIVE installs the
+    // NEW detour body, not a stale cached one.
+    std::atomic<std::int32_t> g_override_value{ 0 };
+
+    // Force-RETURN override installer: the detour suppresses the original body and
+    // forces the return to g_override_value.  Re-used by the alternating-sentinel
+    // revive scenario.
+    auto install_ping_override() -> bool
+    {
+        return vmhook::hook<hr_fixture>(
+            "ping",
+            [](vmhook::return_value& rv,
+               const std::unique_ptr<hr_fixture>&,
+               std::int32_t)
+            {
+                g_ping_fires.fetch_add(1, std::memory_order_relaxed);
+                rv.set(g_override_value.load(std::memory_order_relaxed));
             });
     }
 
@@ -799,6 +847,362 @@ namespace
         }
 
         // =====================================================================
+        //  10. EXPLICIT hook_handle::stop() (not RAII drop) as a teardown surface,
+        //      and its idempotency under revive.  Scenarios 4/5 only exercise the
+        //      DESTRUCTOR path (handle drops at scope exit).  stop() is also a
+        //      public method a caller may invoke EARLY (disarm now, keep the handle
+        //      object around) -- and it must be idempotent (a second stop(), then
+        //      the eventual destructor's stop(), are all safe no-ops on method ==
+        //      nullptr).  Prove: install(scoped) -> fire -> explicit stop() ->
+        //      SILENT -> redundant stop() no-crash -> the global flag is untouched
+        //      (stop() must not flip g_shutdown_requested) -> a fresh install
+        //      REVIVES and fires.
+        // =====================================================================
+        {
+            auto handle{ scoped_ping_observer() };
+            ctx.check("explicitstop_installed", handle.installed());
+            const bool d_fire{ drive(ctx, MODE_PING) };
+            ctx.check("explicitstop_probe_completed", d_fire);
+            ctx.check("explicitstop_hook_fires", g_ping_fires.load() == PING_CALLS);
+
+            // Explicit disarm via the public method (NOT the destructor).
+            handle.stop();
+            ctx.check("explicitstop_handle_not_installed_after_stop", handle.installed() == false);
+            ctx.check("explicitstop_did_not_crash", true);
+            // stop() is per-handle teardown: it must NEVER touch the global flag
+            // (same revivable-without-shutdown_hooks() contract as the RAII drop).
+            ctx.check("explicitstop_shutdown_flag_still_false",
+                      vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire) == false);
+
+            const bool d_silent{ drive(ctx, MODE_PING) };
+            ctx.check("explicitstop_after_stop_probe_completed", d_silent);
+            ctx.check("explicitstop_after_stop_detour_SILENT", g_ping_fires.load() == 0);
+            ctx.check("explicitstop_after_stop_byte_exact_original",
+                      hr_fixture::get_last_ping_result() == PING_ORIGINAL);
+
+            // Idempotency: a redundant stop() (and the destructor's stop() at the
+            // end of this scope) must be safe no-ops.
+            handle.stop();
+            ctx.check("explicitstop_redundant_stop_did_not_crash", true);
+            ctx.check("explicitstop_redundant_stop_still_not_installed", handle.installed() == false);
+
+            // The library must still revive after an explicit-stop teardown.
+            ctx.check("explicitstop_reinstall_returns_true", install_ping_observer());
+            const bool d_revive{ drive(ctx, MODE_PING) };
+            ctx.check("explicitstop_reinstall_probe_completed", d_revive);
+            ctx.check("explicitstop_reinstall_REVIVES_and_fires", g_ping_fires.load() == PING_CALLS);
+            ctx.check("explicitstop_reinstall_allow_through",
+                      hr_fixture::get_last_ping_result() == PING_ORIGINAL);
+
+            vmhook::shutdown_hooks();   // clean up (handle.stop() already disarmed)
+        }
+
+        // =====================================================================
+        //  11. hook_handle MOVE semantics across a revive.  hook_handle is
+        //      move-only; move-CONSTRUCT transfers ownership (the source becomes
+        //      not-installed, the destination disarms on drop), and move-ASSIGN
+        //      first stop()s the destination's current hook then takes the source.
+        //      A bug in move could double-disarm or leak, breaking revive.  Prove:
+        //        (a) move-construct: source becomes not-installed, dest fires,
+        //        (b) move-assign over a live handle disarms the OLD target and the
+        //            survivor fires (no double-free),
+        //        (c) the library still revives afterward.
+        // =====================================================================
+        {
+            // (a) move-construct
+            {
+                auto src{ scoped_ping_observer() };
+                ctx.check("move_src_installed", src.installed());
+                auto dst{ std::move(src) };
+                ctx.check("move_src_emptied_after_move", src.installed() == false);
+                ctx.check("move_dst_installed_after_move", dst.installed());
+                const bool d_mv{ drive(ctx, MODE_PING) };
+                ctx.check("move_construct_probe_completed", d_mv);
+                ctx.check("move_construct_hook_fires_via_dst", g_ping_fires.load() == PING_CALLS);
+                // src drops (no-op, emptied) then dst drops (disarms) here.
+            }
+            {
+                const bool d_silent{ drive(ctx, MODE_PING) };
+                ctx.check("move_after_dst_drop_probe_completed", d_silent);
+                ctx.check("move_after_dst_drop_detour_SILENT", g_ping_fires.load() == 0);
+            }
+
+            // (b) move-assign over a live handle.  `keep` starts holding the live
+            //     ping hook; move-assigning an EMPTY handle into it must stop()
+            //     keep's hook (so the detour goes silent) without crashing.  Then a
+            //     re-install proves the library is still revivable.
+            {
+                auto keep{ scoped_ping_observer() };
+                ctx.check("move_assign_keep_installed", keep.installed());
+                const bool d_pre{ drive(ctx, MODE_PING) };
+                ctx.check("move_assign_pre_probe_completed", d_pre);
+                ctx.check("move_assign_pre_hook_fires", g_ping_fires.load() == PING_CALLS);
+
+                vmhook::hook_handle empty{};      // not-installed
+                keep = std::move(empty);          // move-assign disarms keep's hook
+                ctx.check("move_assign_keep_emptied", keep.installed() == false);
+                ctx.check("move_assign_did_not_crash", true);
+
+                const bool d_silent{ drive(ctx, MODE_PING) };
+                ctx.check("move_assign_after_probe_completed", d_silent);
+                ctx.check("move_assign_after_detour_SILENT", g_ping_fires.load() == 0);
+            }
+
+            // (c) revive after the move gymnastics.
+            ctx.check("move_reinstall_returns_true", install_ping_observer());
+            const bool d_revive{ drive(ctx, MODE_PING) };
+            ctx.check("move_reinstall_probe_completed", d_revive);
+            ctx.check("move_reinstall_REVIVES_and_fires", g_ping_fires.load() == PING_CALLS);
+
+            vmhook::shutdown_hooks();   // clean up
+        }
+
+        // =====================================================================
+        //  12. DUPLICATE-INSTALL contract through a revive.  Install ping via the
+        //      low-level hook<T>() (persistent), then a scoped_hook on the SAME
+        //      method must return a NOT-installed handle (only one detour per
+        //      method fires; the first owns it).  Dropping that duplicate handle
+        //      must be a no-op that does NOT disarm the original -- the original
+        //      keeps firing.  Then shutdown_hooks() silences it and a fresh install
+        //      revives.  This pins that the duplicate-handle path never poisons the
+        //      revive lifecycle.
+        // =====================================================================
+        {
+            ctx.check("dup_primary_install_returns_true", install_ping_observer());
+            {
+                auto dup{ scoped_ping_observer() };   // same method -> already hooked
+                ctx.check("dup_scoped_handle_not_installed", dup.installed() == false);
+                // The original (low-level) hook must still fire while the duplicate
+                // handle is alive.
+                const bool d_dup{ drive(ctx, MODE_PING) };
+                ctx.check("dup_probe_completed", d_dup);
+                ctx.check("dup_original_still_fires", g_ping_fires.load() == PING_CALLS);
+                // dup drops here -> its stop() is a guaranteed no-op (method ==
+                // nullptr), so it must NOT disarm the original.
+            }
+            // Original must STILL be live after the duplicate handle dropped.
+            const bool d_after{ drive(ctx, MODE_PING) };
+            ctx.check("dup_after_drop_probe_completed", d_after);
+            ctx.check("dup_original_survives_duplicate_drop", g_ping_fires.load() == PING_CALLS);
+            ctx.check("dup_original_allow_through",
+                      hr_fixture::get_last_ping_result() == PING_ORIGINAL);
+
+            // Now tear down the real one and prove revive.
+            vmhook::shutdown_hooks();
+            const bool d_silent{ drive(ctx, MODE_PING) };
+            ctx.check("dup_after_shutdown_probe_completed", d_silent);
+            ctx.check("dup_after_shutdown_SILENT", g_ping_fires.load() == 0);
+            ctx.check("dup_reinstall_returns_true", install_ping_observer());
+            const bool d_revive{ drive(ctx, MODE_PING) };
+            ctx.check("dup_reinstall_probe_completed", d_revive);
+            ctx.check("dup_reinstall_REVIVES_and_fires", g_ping_fires.load() == PING_CALLS);
+
+            vmhook::shutdown_hooks();   // clean up
+        }
+
+        // =====================================================================
+        //  13. set_auto_repair_enabled(false) is the WATCHDOG teardown surface and
+        //      is ALSO revivable -- WITHOUT removing hooks (the header documents
+        //      that disabling raises+clears g_shutdown_requested and clears
+        //      g_started just like shutdown_hooks(), but does NOT touch
+        //      g_hooked_methods).  So a hook installed BEFORE the disable must keep
+        //      firing AFTER it (common_detour no longer early-outs because the flag
+        //      was cleared on the way out), the watchdog must be GONE
+        //      (g_watchdog_running false), and a later re-enable + install must
+        //      RESPAWN the watchdog.  No other module asserts this orthogonal
+        //      "watchdog off but hooks live" state.  Watchdog asserts gated on
+        //      auto_repair_compiled_in; the flag + still-fires asserts are HARD.
+        // =====================================================================
+        {
+            // Ensure the watchdog is enabled and spawned by the install.
+            vmhook::set_auto_repair_enabled(true);
+            ctx.check("arepair_install_returns_true", install_ping_observer());
+            if (auto_repair_compiled_in)
+            {
+                ctx.check("arepair_watchdog_live_after_install",
+                          watchdog_running_reaches(true, 200));
+            }
+            else
+            {
+                ctx.record("[INFO] arepair_watchdog_live_after_install: SKIPPED "
+                           "(VMHOOK_DISABLE_AUTO_REPAIR).");
+            }
+            const bool d_pre{ drive(ctx, MODE_PING) };
+            ctx.check("arepair_pre_probe_completed", d_pre);
+            ctx.check("arepair_pre_hook_fires", g_ping_fires.load() == PING_CALLS);
+
+            // Disable the watchdog.  This is NOT shutdown_hooks(): the hook entry
+            // must SURVIVE in g_hooked_methods, only the background thread stops.
+            vmhook::set_auto_repair_enabled(false);
+            ctx.check("arepair_after_disable_flag_clear",
+                      vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire) == false);
+            if (auto_repair_compiled_in)
+            {
+                ctx.check("arepair_watchdog_gone_after_disable",
+                          watchdog_running_reaches(false, 200));
+                ctx.check("arepair_started_reset_after_disable",
+                          vmhook::detail::auto_repair::g_started.load(std::memory_order_acquire) == false);
+            }
+            else
+            {
+                ctx.record("[INFO] arepair_watchdog_gone_after_disable: SKIPPED "
+                           "(VMHOOK_DISABLE_AUTO_REPAIR).");
+                ctx.record("[INFO] arepair_started_reset_after_disable: SKIPPED "
+                           "(VMHOOK_DISABLE_AUTO_REPAIR).");
+            }
+
+            // The headline of this scenario: the hook is STILL LIVE even though the
+            // watchdog is gone (disable cleared g_shutdown_requested, so
+            // common_detour does not early-out and the entry is still in the list).
+            const bool d_live{ drive(ctx, MODE_PING) };
+            ctx.check("arepair_hook_STILL_FIRES_after_watchdog_disabled", g_ping_fires.load() == PING_CALLS);
+            ctx.check("arepair_still_fires_probe_completed", d_live);
+            ctx.check("arepair_still_fires_allow_through",
+                      hr_fixture::get_last_ping_result() == PING_ORIGINAL);
+
+            // Re-enable: the gate flips but no thread spawns until the next install.
+            // A FRESH install must respawn the watchdog (g_started true again).
+            vmhook::set_auto_repair_enabled(true);
+            vmhook::shutdown_hooks();   // clear the surviving entry for a clean reinstall
+            ctx.check("arepair_reenable_install_returns_true", install_ping_observer());
+            if (auto_repair_compiled_in)
+            {
+                ctx.check("arepair_watchdog_respawned_after_reenable",
+                          watchdog_running_reaches(true, 200));
+                ctx.check("arepair_started_true_after_reenable",
+                          vmhook::detail::auto_repair::g_started.load(std::memory_order_acquire));
+            }
+            else
+            {
+                ctx.record("[INFO] arepair_watchdog_respawned_after_reenable: SKIPPED "
+                           "(VMHOOK_DISABLE_AUTO_REPAIR).");
+                ctx.record("[INFO] arepair_started_true_after_reenable: SKIPPED "
+                           "(VMHOOK_DISABLE_AUTO_REPAIR).");
+            }
+            const bool d_revive{ drive(ctx, MODE_PING) };
+            ctx.check("arepair_reenable_probe_completed", d_revive);
+            ctx.check("arepair_reenable_REVIVES_and_fires", g_ping_fires.load() == PING_CALLS);
+
+            vmhook::shutdown_hooks();   // clean up
+        }
+
+        // =====================================================================
+        //  14. SELECTIVE re-arm after a multi-method teardown.  Install BOTH ping
+        //      and sping, fire both; ONE shutdown_hooks() silences both; then
+        //      re-arm ONLY ping.  ping must REVIVE and fire, while sping must stay
+        //      SILENT (it was NOT re-armed) and run its byte-exact original.  This
+        //      proves the reset does not spuriously revive a method the caller
+        //      chose not to reinstall -- the revive is per-install, not a blanket
+        //      "everything that was ever hooked comes back" latch.
+        // =====================================================================
+        {
+            ctx.check("selective_install_ping", install_ping_observer());
+            ctx.check("selective_install_sping", install_sping_observer());
+            const bool d_pre{ drive(ctx, MODE_BOTH) };
+            ctx.check("selective_pre_probe_completed", d_pre);
+            ctx.check("selective_pre_ping_fired", g_ping_fires.load() == 1);
+            ctx.check("selective_pre_sping_fired", g_sping_fires.load() == 1);
+
+            vmhook::shutdown_hooks();   // silences both
+
+            // Re-arm ONLY ping.
+            ctx.check("selective_reinstall_only_ping", install_ping_observer());
+            const bool d_sel{ drive(ctx, MODE_BOTH) };
+            ctx.check("selective_probe_completed", d_sel);
+            ctx.check("selective_ping_REVIVES", g_ping_fires.load() == 1);
+            ctx.check("selective_sping_STAYS_SILENT", g_sping_fires.load() == 0);
+            ctx.check("selective_ping_allow_through",
+                      hr_fixture::get_last_ping_result() == PING_ORIGINAL);
+            // sping ran its original body (un-hooked) -> byte-exact original.
+            ctx.check("selective_sping_byte_exact_original",
+                      hr_fixture::get_last_sping_result() == SPING_ORIGINAL);
+
+            vmhook::shutdown_hooks();   // clean up
+        }
+
+        // =====================================================================
+        //  15. ALTERNATING-SENTINEL force-RETURN revive.  Scenario 7 proves a
+        //      revived OVERRIDE re-enters the dispatch path, but always with the
+        //      SAME sentinel -- a stale cached detour from the first install would
+        //      be indistinguishable.  Here each revive installs an override whose
+        //      forced return value DIFFERS from the previous cycle's (the detour
+        //      reads g_override_value, which we rewrite between installs).  Java
+        //      must observe the value from the MOST RECENT install on every cycle,
+        //      proving the revive installs the CURRENT detour body, not a stale one
+        //      latched at first install.  Each cycle is shutdown-separated.
+        // =====================================================================
+        {
+            constexpr std::int32_t sentinels[3]{ 1111111, 2222222, 3333333 };
+            static_assert(sentinels[0] != sentinels[1] && sentinels[1] != sentinels[2]
+                          && sentinels[0] != sentinels[2],
+                          "alternating sentinels must be pairwise distinct so a stale "
+                          "cached detour body is caught");
+            for (int i{ 0 }; i < 3; ++i)
+            {
+                const std::string c{ std::to_string(i) };
+                const std::int32_t want{ sentinels[i] };
+                // Each sentinel must differ from the original so the override is
+                // observable, and from its neighbours so a stale body is caught.
+                if (want == PING_ORIGINAL)
+                {
+                    ctx.record("[INFO] altsentinel: sentinel collided with original (impossible "
+                               "given the chosen constants); skipping this cycle's observe.");
+                    continue;
+                }
+
+                g_override_value.store(want, std::memory_order_relaxed);
+                ctx.check("altsentinel_cycle" + c + "_install_returns_true", install_ping_override());
+                const bool d{ drive(ctx, MODE_PING) };
+                ctx.check("altsentinel_cycle" + c + "_probe_completed", d);
+                ctx.check("altsentinel_cycle" + c + "_hook_fired",
+                          g_ping_fires.load() == PING_CALLS);
+                ctx.check("altsentinel_cycle" + c + "_java_saw_THIS_cycles_sentinel",
+                          hr_fixture::get_last_ping_result() == want);
+                ctx.check("altsentinel_cycle" + c + "_java_not_original",
+                          hr_fixture::get_last_ping_result() != PING_ORIGINAL);
+
+                vmhook::shutdown_hooks();
+                const bool d_silent{ drive(ctx, MODE_PING) };
+                ctx.check("altsentinel_cycle" + c + "_after_shutdown_probe_completed", d_silent);
+                ctx.check("altsentinel_cycle" + c + "_after_shutdown_SILENT",
+                          g_ping_fires.load() == 0);
+                ctx.check("altsentinel_cycle" + c + "_after_shutdown_byte_exact_original",
+                          hr_fixture::get_last_ping_result() == PING_ORIGINAL);
+            }
+            vmhook::shutdown_hooks();   // belt-and-braces
+        }
+
+        // =====================================================================
+        //  16. NO-OP MODE liveness sanity: drive with an out-of-range mode (the
+        //      fixture's switch `default:` does nothing) WHILE a hook is armed.  The
+        //      probe still completes and runEpoch advances (the Java thread ran),
+        //      but neither hookable method was dispatched -> the detour MUST be
+        //      silent.  This proves the module's "silent" assertions elsewhere are
+        //      genuinely keyed on dispatch (not on the probe failing to run), and
+        //      that an armed hook firing zero times is the no-dispatch case, not a
+        //      dead-detour false-negative.  Then revive on a real mode to confirm
+        //      the armed hook was live all along.
+        // =====================================================================
+        {
+            constexpr std::int32_t MODE_NONE{ 0 };
+            ctx.check("noopmode_install_returns_true", install_ping_observer());
+            const std::int32_t epoch_before{ hr_fixture::get_run_epoch() };
+            const bool d_noop{ drive(ctx, MODE_NONE) };
+            ctx.check("noopmode_probe_completed", d_noop);
+            ctx.check("noopmode_epoch_advanced",
+                      hr_fixture::get_run_epoch() == epoch_before + 1);
+            ctx.check("noopmode_armed_hook_silent_no_dispatch", g_ping_fires.load() == 0);
+
+            // Same armed hook, now a real mode -> it fires.  Proves it was live the
+            // whole time and the silence above was pure no-dispatch.
+            const bool d_real{ drive(ctx, MODE_PING) };
+            ctx.check("noopmode_real_probe_completed", d_real);
+            ctx.check("noopmode_armed_hook_fires_on_real_mode", g_ping_fires.load() == PING_CALLS);
+
+            vmhook::shutdown_hooks();   // clean up
+        }
+
+        // =====================================================================
         //  9. LIVENESS WITNESS + verify_hooks() safe-after-revive.  Across all the
         //     cycles above the Java probe must have actually run many times
         //     (runEpoch monotonic), independent of detour firing -- so a "silent"
@@ -807,8 +1211,11 @@ namespace
         // =====================================================================
         {
             const std::int32_t epoch{ hr_fixture::get_run_epoch() };
-            // We drove well over a dozen probe cycles; require a conservative floor.
-            ctx.check("liveness_run_epoch_advanced", epoch >= 10);
+            // The expanded module drives well over forty probe cycles (scenarios
+            // 1-8 plus the added 10-16); keep a conservative floor that is still a
+            // strong non-vacuous witness -- if it is not met, the Java probe was
+            // not running and every "silent" assertion above is suspect.
+            ctx.check("liveness_run_epoch_advanced", epoch >= 30);
             ctx.record(std::string{ "[INFO] hook_reinstall_after_shutdown: total Java run() epochs = " }
                        + std::to_string(epoch));
 

@@ -323,6 +323,78 @@ namespace
         return s.size();
     }
 
+    // True if a state value is one of the NAMED java_thread_state enum constants
+    // (stricter than state_in_range, which also accepts the gaps inside [0, 12]).
+    // A correctly decoded _thread_state byte for a live thread is always one of
+    // these named transition/steady states — never the unused gap value 1.  This
+    // is a per-thread sanity check on the decoded state byte; it is recorded as
+    // [INFO] rather than hard-asserted because the exact set of states HotSpot may
+    // legitimately surface is JDK-variant and a never-before-seen-but-valid value
+    // on a future JDK must not falsely redden the suite.
+    auto state_is_named(const vmhook::hotspot::java_thread_state s) -> bool
+    {
+        switch (s)
+        {
+        case vmhook::hotspot::java_thread_state::_thread_uninitialized:
+        case vmhook::hotspot::java_thread_state::_thread_new:
+        case vmhook::hotspot::java_thread_state::_thread_new_trans:
+        case vmhook::hotspot::java_thread_state::_thread_in_native:
+        case vmhook::hotspot::java_thread_state::_thread_in_native_trans:
+        case vmhook::hotspot::java_thread_state::_thread_in_vm:
+        case vmhook::hotspot::java_thread_state::_thread_in_vm_trans:
+        case vmhook::hotspot::java_thread_state::_thread_in_Java:
+        case vmhook::hotspot::java_thread_state::_thread_in_Java_trans:
+        case vmhook::hotspot::java_thread_state::_thread_blocked:
+        case vmhook::hotspot::java_thread_state::_thread_blocked_trans:
+        case vmhook::hotspot::java_thread_state::_thread_max_state:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // Cross-path round-trip: every enumerated (ptr, tid) identity must resolve
+    // back to a non-null, valid JavaThread through find_java_thread_by_os_thread_id
+    // — a DIFFERENT walk that shares the OSThread-id decode.  Returns the count of
+    // identities that round-tripped to a valid pointer (so the caller can assert
+    // ALL of them did).  Each lookup is itself bounded (the finder caps at 4096),
+    // so this is crash- and hang-safe.  We do NOT require the resolved pointer to
+    // EQUAL the enumerated pointer: the finder returns the FIRST thread whose tid
+    // matches, and on the (degenerate) chance two live threads ever share a
+    // zero-extended 32-bit tid slot the finder could pick the other one — so the
+    // load-bearing, decode-validating invariant is "resolves to SOME valid live
+    // thread", recorded alongside how many also pointer-matched exactly.
+    struct roundtrip_tally
+    {
+        std::size_t resolved{ 0 };       // tid resolved to a non-null valid thread
+        std::size_t pointer_matched{ 0 };// ...and it was the SAME JavaThread*
+        std::size_t total{ 0 };          // identities considered (nonzero tid)
+    };
+
+    auto roundtrip_identities(const std::vector<thread_identity>& ids) -> roundtrip_tally
+    {
+        roundtrip_tally t{};
+        for (const thread_identity& id : ids)
+        {
+            if (id.tid == 0)
+            {
+                continue;
+            }
+            ++t.total;
+            vmhook::hotspot::java_thread* const found{
+                vmhook::hotspot::find_java_thread_by_os_thread_id(id.tid) };
+            if (found != nullptr && vmhook::hotspot::is_valid_pointer(found))
+            {
+                ++t.resolved;
+                if (found == id.ptr)
+                {
+                    ++t.pointer_matched;
+                }
+            }
+        }
+        return t;
+    }
+
     // Drives exactly one probe cycle for `mode`: clears the latched done and
     // programs the selector on the rising edge of go, then runs the probe.
     auto drive(vmhook_test::context& ctx, std::int32_t mode) -> bool
@@ -994,6 +1066,348 @@ VMHOOK_JVM_MODULE(for_each_thread)
             ctx.check("batch_after_terminates_bounded_time", after_batch.elapsed_ms < 250.0);
             ctx.check("batch_identities_gone", !any_batch_survives(after_batch));
         }
+    }
+
+    // =====================================================================
+    // PART H — CROSS-PATH OS-TID ROUND-TRIP (NEW): every enumerated identity's
+    //   os_thread_id must resolve back to a non-null, valid JavaThread through
+    //   find_java_thread_by_os_thread_id — a DIFFERENT walk (Path-1 list scan +
+    //   Path-2 SMR fallback) that shares only the OSThread-id DECODE.  This is the
+    //   strongest portable proof the OSThread chain decoded a REAL, resolvable OS
+    //   thread id (Part B already proved it is merely non-zero): a tid that no
+    //   second walk can find would be a decode artifact, not a live thread.  Each
+    //   lookup is itself bounded (the finder caps at 4096), so this stays crash-
+    //   and hang-safe.  UNIVERSAL: 100% of nonzero tids must resolve.  The exact-
+    //   pointer match rate is recorded as [INFO] — the finder returns the FIRST
+    //   tid match and a (degenerate) shared zero-extended 32-bit slot could pick a
+    //   sibling, so "resolves to SOME valid thread" is the hard invariant.
+    // =====================================================================
+    {
+        const roundtrip_tally rt{ roundtrip_identities(base.identities) };
+        ctx.record(std::string{ "[INFO] os-tid round-trip: " }
+                   + std::to_string(rt.resolved) + "/" + std::to_string(rt.total)
+                   + " enumerated tids resolved via find_java_thread_by_os_thread_id ("
+                   + std::to_string(rt.pointer_matched) + " also pointer-matched exactly)");
+        if (rt.total >= 1)
+        {
+            // Every nonzero enumerated tid resolves to a valid live JavaThread.
+            ctx.check("roundtrip_all_tids_resolve", rt.resolved == rt.total);
+            // A solid majority must also pointer-match exactly (a different finder
+            // path would only diverge on the degenerate shared-slot case, which is
+            // not expected on a healthy JVM); recorded if it ever dips, asserted as
+            // a conservative floor so a single odd sibling can't redden it.
+            ctx.check("roundtrip_majority_pointer_match",
+                      rt.pointer_matched * 2 >= rt.total);
+        }
+        else
+        {
+            ctx.record("[INFO] no nonzero enumerated tids to round-trip "
+                       "(baseline had none) — skipped roundtrip asserts.");
+        }
+    }
+
+    // =====================================================================
+    // PART I — CURRENT-THREAD TID DECODE CORROBORATION (NEW): the current thread's
+    //   enumerated os_thread_id must (a) be non-zero and (b) round-trip through
+    //   find_java_thread_by_os_thread_id back to the SAME JavaThread* the cached
+    //   current_java_thread points at — proving the decode produced the actual
+    //   live current thread's id, cross-checked against the EXACT pointer we
+    //   already hold.  The literal-equality of the decoded tid to
+    //   vmhook::os::current_thread_id() is JDK/OS-variant (the decode reads only a
+    //   32-bit slot and zero-extends; the OS tid width differs by platform), so
+    //   that is RECORDED as [INFO], never asserted — only the non-zero + same-
+    //   pointer round-trip is hard.
+    // =====================================================================
+    if (vmhook::hotspot::current_java_thread)
+    {
+        const auto current_jt{ vmhook::hotspot::current_java_thread };
+
+        // Find the current thread's enumerated identity from the baseline pass.
+        vmhook::os::thread_id_t current_enum_tid{ 0 };
+        bool current_found_in_enum{ false };
+        for (const thread_identity& id : base.identities)
+        {
+            if (id.ptr == current_jt)
+            {
+                current_enum_tid = id.tid;
+                current_found_in_enum = true;
+                break;
+            }
+        }
+
+        if (current_found_in_enum)
+        {
+            ctx.check("current_thread_tid_nonzero", current_enum_tid != 0);
+
+            const vmhook::os::thread_id_t os_tid{ vmhook::os::current_thread_id() };
+            ctx.record(std::string{ "[INFO] current thread: enumerated tid="
+                       } + std::to_string(static_cast<std::uint64_t>(current_enum_tid))
+                       + " os::current_thread_id()="
+                       + std::to_string(static_cast<std::uint64_t>(os_tid))
+                       + " (literal equality is JDK/OS-variant — recorded, not asserted)");
+
+            if (current_enum_tid != 0)
+            {
+                vmhook::hotspot::java_thread* const resolved{
+                    vmhook::hotspot::find_java_thread_by_os_thread_id(current_enum_tid) };
+                ctx.check("current_thread_tid_resolves_to_current",
+                          resolved == current_jt);
+            }
+        }
+        else
+        {
+            ctx.record("[INFO] current_java_thread not present in baseline identities "
+                       "(unexpected but non-fatal) — skipped current-tid corroboration.");
+        }
+    }
+    else
+    {
+        ctx.record("[INFO] current_java_thread is null on the suite thread; "
+                   "skipping current-thread tid-decode corroboration.");
+    }
+
+    // =====================================================================
+    // PART J — VISITOR EXCEPTION PROPAGATES + STOP-AT-VISIT (NEW): the header
+    //   contract is "callback exceptions propagate; iteration stops at the
+    //   throwing visit."  A visitor that throws on its FIRST invocation must (a)
+    //   propagate the exception out of for_each_thread (caught here — it must NOT
+    //   crash or hang on the no-SEH toolchains, because this is ordinary C++
+    //   unwinding, not an access violation) and (b) have visited at most that one
+    //   thread, not the whole list — the closest portable analogue of the brief's
+    //   "stop-at-visit" semantics.  Bounded by construction (throws immediately),
+    //   so it can neither hang nor leak.
+    // =====================================================================
+    {
+        std::int32_t visits_before_throw{ 0 };
+        bool exception_propagated{ false };
+        const auto t0{ std::chrono::steady_clock::now() };
+        try
+        {
+            vmhook::for_each_thread([&](const vmhook::thread_info&)
+            {
+                ++visits_before_throw;
+                throw vmhook::exception{ "for_each_thread visitor stop-at-visit probe" };
+            });
+        }
+        catch (const std::exception&)
+        {
+            exception_propagated = true;
+        }
+        catch (...)
+        {
+            exception_propagated = true;
+        }
+        const auto t1{ std::chrono::steady_clock::now() };
+        const double throw_ms{ std::chrono::duration<double, std::milli>{ t1 - t0 }.count() };
+
+        // The exception must reach the caller (contract: it propagates).
+        ctx.check("visitor_exception_propagates", exception_propagated);
+        // Iteration stopped at the throwing visit: the visitor ran exactly once
+        // before the throw unwound it (stop-at-visit).  base.count was > 1 on any
+        // real JVM, so a value of 1 here proves the walk did NOT continue.
+        ctx.check("visitor_exception_stops_at_visit", visits_before_throw == 1);
+        // And it returned promptly — no hang on the unwinding path.
+        ctx.check("visitor_exception_path_bounded_time", throw_ms < 250.0);
+
+        // A subsequent CLEAN enumeration still works — the throw did not corrupt
+        // any per-call state (the walk holds only locals + a per-call visited_set).
+        const enumeration after_throw{ enumerate() };
+        ctx.check("enumeration_clean_after_visitor_throw",
+                  after_throw.count >= 1 && after_throw.all_pointers_valid);
+    }
+
+    // =====================================================================
+    // PART K — RE-ENTRANCY (NEW): for_each_thread uses only call-local state (a
+    //   per-call counter + visited_set), so a NESTED for_each_thread invoked from
+    //   inside the outer visitor must itself terminate bounded and enumerate the
+    //   same persistent core — no shared/static walk cursor that a re-entrant call
+    //   could corrupt.  We run the nested walk ONCE (on the first outer visit) to
+    //   keep it O(N), and prove the nested pass is valid, bounded, non-duplicate,
+    //   and sees a non-empty persistent core in common with the outer pass.
+    // =====================================================================
+    {
+        bool nested_ran{ false };
+        bool nested_all_valid{ true };
+        bool nested_no_dup{ true };
+        double nested_ms{ 0.0 };
+        std::vector<vmhook::hotspot::java_thread*> nested_pointers{};
+        std::int32_t outer_visits{ 0 };
+
+        vmhook::for_each_thread([&](const vmhook::thread_info&)
+        {
+            ++outer_visits;
+            if (nested_ran)
+            {
+                return; // run the nested walk only once
+            }
+            nested_ran = true;
+
+            const auto n0{ std::chrono::steady_clock::now() };
+            vmhook::for_each_thread([&](const vmhook::thread_info& inner)
+            {
+                if (inner.thread == nullptr
+                    || !vmhook::hotspot::is_valid_pointer(inner.thread))
+                {
+                    nested_all_valid = false;
+                    return;
+                }
+                nested_pointers.push_back(inner.thread);
+            });
+            const auto n1{ std::chrono::steady_clock::now() };
+            nested_ms = std::chrono::duration<double, std::milli>{ n1 - n0 }.count();
+            nested_no_dup =
+                distinct_count(nested_pointers) == nested_pointers.size();
+        });
+
+        ctx.check("reentrant_nested_ran", nested_ran);
+        if (nested_ran)
+        {
+            ctx.check("reentrant_nested_all_pointers_valid", nested_all_valid);
+            ctx.check("reentrant_nested_terminates_bounded_time", nested_ms < 250.0);
+            ctx.check("reentrant_nested_visited_at_least_one",
+                      !nested_pointers.empty());
+            ctx.check("reentrant_nested_no_duplicate_pointer", nested_no_dup);
+            ctx.check("reentrant_nested_count_below_cap",
+                      static_cast<std::int32_t>(nested_pointers.size())
+                          < FOR_EACH_THREAD_CAP);
+            // Outer and nested enumerations share a non-empty persistent core (the
+            // JVM's own long-lived threads appear in both); proves the re-entrant
+            // call did not corrupt the outer walk.
+            const std::size_t both{ intersection_count(base.pointers, nested_pointers) };
+            ctx.record(std::string{ "[INFO] re-entrant nested pass visited " }
+                       + std::to_string(nested_pointers.size())
+                       + "; outer pass made " + std::to_string(outer_visits)
+                       + " visits; persistent core with baseline = "
+                       + std::to_string(both));
+            ctx.check("reentrant_nested_shares_core", both >= 1);
+        }
+    }
+
+    // =====================================================================
+    // PART L — MULTI-PASS DRIFT (NEW, stronger than Part D's two passes): run
+    //   FIVE rapid back-to-back enumerations and prove the PERSISTENT core common
+    //   to ALL FIVE is non-empty and (where identifiable) contains the current
+    //   thread, while every pass is independently valid + bounded.  A per-call
+    //   state-corruption bug that only manifests after a few iterations (e.g. a
+    //   visited_set or cursor that is not reset between calls) would shrink the
+    //   all-five intersection toward zero or trip a validity/bound check on a
+    //   later pass — neither of which a single repeat would catch.  Exact counts
+    //   are NOT asserted (concurrent VM thread churn moves them); only the churn-
+    //   PROOF five-way intersection and the per-pass invariants are hard.
+    // =====================================================================
+    {
+        constexpr int PASSES{ 5 };
+        std::vector<enumeration> passes{};
+        passes.reserve(static_cast<std::size_t>(PASSES));
+        for (int i{ 0 }; i < PASSES; ++i)
+        {
+            passes.push_back(enumerate());
+        }
+
+        bool all_passes_valid{ true };
+        bool all_passes_bounded{ true };
+        bool all_passes_nonempty{ true };
+        bool all_passes_no_dup{ true };
+        for (const enumeration& p : passes)
+        {
+            all_passes_valid    = all_passes_valid && p.all_pointers_valid;
+            all_passes_bounded  = all_passes_bounded && (p.elapsed_ms < 250.0);
+            all_passes_nonempty = all_passes_nonempty && (p.count >= 1);
+            all_passes_no_dup   = all_passes_no_dup
+                && (distinct_count(p.pointers) == p.pointers.size());
+        }
+        ctx.check("multipass_all_valid", all_passes_valid);
+        ctx.check("multipass_all_terminate_bounded_time", all_passes_bounded);
+        ctx.check("multipass_all_visited_at_least_one", all_passes_nonempty);
+        ctx.check("multipass_all_no_duplicate_pointer", all_passes_no_dup);
+
+        // Pointers present in EVERY one of the five passes — the churn-proof
+        // persistent core.  Built by intersecting each pass's distinct set with
+        // the running core.
+        std::unordered_set<vmhook::hotspot::java_thread*> core{
+            passes.front().pointers.begin(), passes.front().pointers.end() };
+        for (std::size_t i{ 1 }; i < passes.size(); ++i)
+        {
+            const std::unordered_set<vmhook::hotspot::java_thread*> s{
+                passes[i].pointers.begin(), passes[i].pointers.end() };
+            std::unordered_set<vmhook::hotspot::java_thread*> next{};
+            for (vmhook::hotspot::java_thread* const p : core)
+            {
+                if (s.find(p) != s.end())
+                {
+                    next.insert(p);
+                }
+            }
+            core.swap(next);
+        }
+        ctx.record(std::string{ "[INFO] five-pass persistent (in-all-5) core = " }
+                   + std::to_string(core.size()));
+        ctx.check("multipass_persistent_core_nonempty", !core.empty());
+
+        if (vmhook::hotspot::current_java_thread)
+        {
+            const auto current_jt{ vmhook::hotspot::current_java_thread };
+            ctx.check("multipass_current_thread_in_all_passes",
+                      core.find(current_jt) != core.end());
+        }
+        else
+        {
+            ctx.record("[INFO] current_java_thread null on suite thread; "
+                       "skipping multipass current-thread-in-all check.");
+        }
+    }
+
+    // =====================================================================
+    // PART M — NAMED-STATE COVERAGE (NEW, [INFO]): for every baseline thread the
+    //   decoded state byte is a NAMED java_thread_state constant (stricter than
+    //   the HARD in-range check in Part B, which also accepts the unused gap value
+    //   1).  Recorded as [INFO], NOT hard-asserted: the precise set of states
+    //   HotSpot legitimately surfaces is JDK-variant, and a future-JDK-valid byte
+    //   we don't yet name must never falsely redden the suite — the HARD universal
+    //   invariant remains "in range" (Part B).  We also record the state histogram
+    //   so a human can eyeball the live thread mix.
+    // =====================================================================
+    {
+        std::int32_t named{ 0 };
+        std::int32_t unnamed{ 0 };
+        std::int32_t in_java{ 0 };
+        std::int32_t in_native{ 0 };
+        std::int32_t in_vm{ 0 };
+        std::int32_t blocked{ 0 };
+        std::int32_t other{ 0 };
+        vmhook::for_each_thread([&](const vmhook::thread_info& info)
+        {
+            if (info.thread == nullptr
+                || !vmhook::hotspot::is_valid_pointer(info.thread))
+            {
+                return;
+            }
+            if (state_is_named(info.state)) { ++named; } else { ++unnamed; }
+            switch (info.state)
+            {
+            case vmhook::hotspot::java_thread_state::_thread_in_Java:
+            case vmhook::hotspot::java_thread_state::_thread_in_Java_trans:
+                ++in_java; break;
+            case vmhook::hotspot::java_thread_state::_thread_in_native:
+            case vmhook::hotspot::java_thread_state::_thread_in_native_trans:
+                ++in_native; break;
+            case vmhook::hotspot::java_thread_state::_thread_in_vm:
+            case vmhook::hotspot::java_thread_state::_thread_in_vm_trans:
+                ++in_vm; break;
+            case vmhook::hotspot::java_thread_state::_thread_blocked:
+            case vmhook::hotspot::java_thread_state::_thread_blocked_trans:
+                ++blocked; break;
+            default:
+                ++other; break;
+            }
+        });
+        ctx.record(std::string{ "[INFO] baseline state histogram: in_Java=" }
+                   + std::to_string(in_java) + " in_native=" + std::to_string(in_native)
+                   + " in_vm=" + std::to_string(in_vm) + " blocked=" + std::to_string(blocked)
+                   + " other=" + std::to_string(other));
+        ctx.record(std::string{ "[INFO] named-state coverage: " }
+                   + std::to_string(named) + " named, " + std::to_string(unnamed)
+                   + " unnamed (unnamed is JDK-variant — recorded, not asserted)");
     }
 
     // =====================================================================

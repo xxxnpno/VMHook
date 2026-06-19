@@ -92,6 +92,27 @@ public final class JniLocalRef
      *  fail), so this must equal injectCount after the loop. */
     public static volatile int     injectNonEmptyCount;
 
+    // ── injectMixed(String,int) loop observations (set_arg union-aliasing) ────
+    // The detour injects BOTH a fresh String into slot 1 (NewStringUTF local
+    // ref + DeleteLocalRef) AND a primitive int into slot 2 (NO NewStringUTF,
+    // NO DeleteLocalRef -- a primitive jvalue cell handed to DeleteLocalRef is
+    // the union-aliasing footgun).  The body records both so the native side
+    // proves the String reached an unstarved slot AND the primitive was never
+    // mistaken for a local ref to release.
+
+    /** Bumped every time {@link #injectMixed(String,int)} runs. */
+    public static volatile int     injectMixedCount;
+
+    /** The String slot-1 value the LAST injectMixed body observed. */
+    public static volatile String  injectMixedSeen = "<unset>";
+
+    /** The int slot-2 value the LAST injectMixed body observed. */
+    public static volatile int     injectMixedIntSeen = -1;
+
+    /** How many injectMixed bodies saw BOTH a non-empty String and the exact
+     *  injected int -- must equal injectMixedCount if neither slot starved. */
+    public static volatile int     injectMixedOkCount;
+
     // ════════════════════════════════════════════════════════════════════════
     //  Instance reference-returning methods (each call() allocates a JNI local
     //  ref for the returned object that vmhook must DeleteLocalRef).
@@ -141,6 +162,70 @@ public final class JniLocalRef
         return new int[] { 3, 1, 4, 1, 5 };
     }
 
+    /** A primitive-ARG / primitive-RETURN call: the int arg's jvalue cell aliases
+     *  the union's {@code .l} member as the bit pattern 0x...0007 -- a NON-null
+     *  pointer that is NOT a JNI local ref.  vmhook's per-slot needs_release tag
+     *  must leave it false so the arg-cleanup RAII never hands it to
+     *  DeleteLocalRef (the documented union-aliasing footgun).  No local ref is
+     *  created at all, so a stable echo proves no spurious release/leak. */
+    public int echoInt(final int value)
+    {
+        return value;
+    }
+
+    /** A TWO-WORD primitive arg (long, spanning two interpreter slots): its
+     *  jvalue {@code .j} bits (0x4242424242424242 here when the native side sends
+     *  that) alias {@code .l} as a wild pointer -- the harshest union-aliasing
+     *  case for the DeleteLocalRef discriminator.  Echoes the value back. */
+    public long echoLong(final long value)
+    {
+        return value;
+    }
+
+    /** A {@code jboolean true} arg: {@code .z} == 1, which aliases {@code .l} as
+     *  0x1 -- a low, non-null bit pattern a naive null-check would pass straight
+     *  to DeleteLocalRef.  Echoes it back as an int (1/0). */
+    public int echoBool(final boolean value)
+    {
+        return value ? 1 : 0;
+    }
+
+    /** MIXED args: a String (slot 1, marshalled via NewStringUTF -> a real local
+     *  ref to release) followed by a primitive int (slot 2, NO local ref).  Only
+     *  the String slot may be released; the int slot must be left alone.  Returns
+     *  value + ":" + n so the native side proves BOTH slots arrived intact. */
+    public String echoMixed(final String value, final int n)
+    {
+        return value + ":" + n;
+    }
+
+    /** TWO String args: 2 NewStringUTF local refs (slots 1+2) + 1 returned String
+     *  local ref = THREE refs/iter; both arg slots tagged for release.  Returns
+     *  the concatenation so a starved table (any missing release) yields a
+     *  truncated / empty result the native side catches. */
+    public String concat(final String a, final String b)
+    {
+        return a + b;
+    }
+
+    /** An OBJECT arg: the receiver is passed as a synthetic JNI handle
+     *  ({@code value.l == &storage}), which the arg-cleanup must NOT DeleteLocalRef
+     *  (it is not a NewStringUTF local ref).  Returns the same object so the
+     *  native side gets an Object-return local ref to release too. */
+    public JniLocalRef echoObj(final JniLocalRef other)
+    {
+        return other;
+    }
+
+    /** A nullable String arg: when the native side passes a null C string the
+     *  arg becomes Java null (no NewStringUTF, no local ref, needs_release stays
+     *  false), so this returns -1; a non-null arg returns its length.  Proves the
+     *  null-arg path neither creates nor releases a ref. */
+    public int nullArgLen(final String value)
+    {
+        return (value == null) ? -1 : value.length();
+    }
+
     /** Instance method the native detour hooks; calling it on a real bytecode
      *  dispatch establishes current_java_thread so the detour's call() loops can
      *  dispatch.  The detour does ALL the call()/return leak-loop work here. */
@@ -165,6 +250,22 @@ public final class JniLocalRef
         }
     }
 
+    /** Mixed-arg injection target: the detour sets slot 1 (the String, via
+     *  NewStringUTF + DeleteLocalRef) AND slot 2 (the primitive int, via the
+     *  no-local-ref primitive path) on every dispatch.  Records both so the
+     *  native side proves the String reached an unstarved slot and the primitive
+     *  set_arg never mis-released a union-aliased cell. */
+    public void injectMixed(final String value, final int n)
+    {
+        injectMixedCount++;
+        injectMixedSeen = value;
+        injectMixedIntSeen = n;
+        if (value != null && value.length() > 0 && n == INJECT_MIXED_INT)
+        {
+            injectMixedOkCount++;
+        }
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     //  Static reference-returning methods (the static branch resolves the
     //  declaring jclass via FindClass -- itself a JNI local ref to release).
@@ -182,6 +283,18 @@ public final class JniLocalRef
     {
         return SINGLETON;
     }
+
+    /** STATIC String-arg echo: exercises the FindClass jclass local ref AND the
+     *  NewStringUTF arg local ref AND the returned String local ref together on
+     *  the static dispatch path -- THREE refs/iter, the harshest static case. */
+    public static String staticEcho(final String value)
+    {
+        return value;
+    }
+
+    /** The exact int the injectMixed loop injects into slot 2, so the Java body
+     *  can verify the primitive arrived unchanged. */
+    public static final int INJECT_MIXED_INT = 1337;
 
     static
     {
@@ -212,6 +325,16 @@ public final class JniLocalRef
                     // The literal here is irrelevant: the native hook overwrites
                     // slot 0 with its own fresh String before the body reads it.
                     SINGLETON.inject("original");
+                }
+
+                // (3) A loop of injectMixed(...) dispatches: each fires the
+                //     injectMixed hook so the detour sets BOTH a fresh String
+                //     (slot 1, NewStringUTF + DeleteLocalRef) and a primitive int
+                //     (slot 2, no local ref) -- exercising set_arg's union-aliasing
+                //     discriminator far past the 16-slot table.
+                for (int i = 0; i < INJECT_ITERATIONS; i++)
+                {
+                    SINGLETON.injectMixed("original", 0);
                 }
 
                 JniLocalRef.done = true;
