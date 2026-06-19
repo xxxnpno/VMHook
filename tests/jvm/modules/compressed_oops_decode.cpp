@@ -8,8 +8,8 @@
 //
 // vmhook exposes the codec at four layers (all in namespace vmhook::hotspot):
 //
-//   * narrow_decode(base, shift, compressed) -> void*        (vmhook.hpp:4521)
-//   * narrow_encode(base, shift, addr)       -> uint32_t     (vmhook.hpp:4542)
+//   * narrow_decode(base, shift, compressed) -> void*        (vmhook.hpp:5329)
+//   * narrow_encode(base, shift, addr)       -> uint32_t     (vmhook.hpp:5350)
 //         The PURE arithmetic primitives.  These ARE the codec math with NO JVM
 //         dependency: decode_oop_pointer / encode_oop_pointer delegate to them
 //         after resolving base/shift from gHotSpotVMStructs.  Driving these two
@@ -18,8 +18,8 @@
 //         boundary — without ever needing a live heap.  (The real base/shift
 //         only exist under a running HotSpot, so the public functions alone
 //         cannot be exercised across the whole formula off-JVM.)
-//   * decode_oop_pointer(compressed) -> void*               (vmhook.hpp:4566)
-//   * encode_oop_pointer(decoded)    -> uint32_t            (vmhook.hpp:4612)
+//   * decode_oop_pointer(compressed) -> void*               (vmhook.hpp:5374)
+//   * encode_oop_pointer(decoded)    -> uint32_t            (vmhook.hpp:5420)
 //         The public JVM-state-dependent wrappers.  We pin their GUARD contracts
 //         (null oop -> nullptr / 0, the only JVM-independent paths) and, when a
 //         live heap is present, round-trip a REAL object reference through them.
@@ -582,6 +582,124 @@ namespace
                       ne(0u, 3u, 0x800000028ull) == 0x00000005u);
         }
 
+        // ──────────────────────────────────────────────────────── SECTION 11
+        //  CROSS-BASE DENSE ROUND-TRIP.  Section 6's dense 0..4095 sweep only
+        //  visited TWO bases and TWO shifts; the encode->decode identity must
+        //  hold for EVERY base regime crossed with EVERY shift the codec exports.
+        //  This walks the dense low range (0..4095) over the FULL base battery x
+        //  the FULL shift battery — the round-trip identity proven across every
+        //  (base, shift) the wild produces, not just the zero/32GiB representatives.
+        //  (9 bases x 5 shifts x 4096 = 184320 distinct round-trips folded.)
+        // ====================================================================
+        {
+            bool cross_ok{ true };
+            std::size_t cross_checked{ 0 };
+            for (const std::uint64_t base : kBases)
+            {
+                for (const std::uint32_t shift : kShifts)
+                {
+                    for (std::uint32_t c{ 0 }; c < 4096u; ++c)
+                    {
+                        const std::uint64_t addr{ nd_bits(base, shift, c) };
+                        cross_ok = cross_ok && ne(base, shift, addr) == c;
+                        ++cross_checked;
+                    }
+                }
+            }
+            ctx.check("roundtrip_dense_0_to_4095_all_bases_all_shifts",
+                      cross_ok
+                      && cross_checked == (std::size(kBases) * std::size(kShifts)
+                                           * 4096u));
+        }
+
+        // ──────────────────────────────────────────────────────── SECTION 12
+        //  BASE LOW-BYTE PATTERN SWEEP.  The fixed kBases enumerate a few base
+        //  regimes; this proves the base is a PLAIN 64-bit additive offset for a
+        //  base whose low byte takes EVERY value 0x00..0xFF (a class of base the
+        //  battery doesn't enumerate).  decode(base, shift, c) - (c<<shift) must
+        //  equal base for every low byte, at every shift — i.e. no low-bit of the
+        //  base is ever masked, rounded, or folded into the shifted compressed
+        //  value.  Anchored to a high mmap-like base so the byte varies in the
+        //  presence of set high bits (catches an accidental & / alignment clamp).
+        // ====================================================================
+        {
+            const std::uint64_t base_hi{ 0x00007F1234560000ull };
+            const std::uint32_t c{ 0x00ABCDEFu };
+            bool lowbyte_ok{ true };
+            for (std::uint32_t low{ 0 }; low < 256u; ++low)
+            {
+                const std::uint64_t base{ base_hi | static_cast<std::uint64_t>(low) };
+                for (const std::uint32_t shift : kShifts)
+                {
+                    const std::uint64_t decoded{ nd_bits(base, shift, c) };
+                    const std::uint64_t shifted{
+                        static_cast<std::uint64_t>(c) << shift };
+                    lowbyte_ok = lowbyte_ok && (decoded - shifted) == base;
+                }
+            }
+            ctx.check("decode_base_low_byte_is_pure_additive_offset", lowbyte_ok);
+        }
+
+        // ──────────────────────────────────────────────────────── SECTION 13
+        //  MISALIGNMENT RESIDUE MATRIX over EVERY shift.  Section 9 pinned the
+        //  lossy-encode behaviour only at shift 3; flaw #2's "encode drops the low
+        //  `shift` bits" applies at EVERY non-zero shift.  For shift s in 1..4 and
+        //  every residue r in 1..(2^s - 1): encode of (aligned + r) yields the same
+        //  narrow value as the aligned address (the residue is dropped), and
+        //  decoding that narrow value returns the ALIGNED address — round-trip is
+        //  lossy by exactly r.  At shift 0 there is NO sub-grid residue, so encode
+        //  is exact for every offset (pinned separately).  This characterises the
+        //  documented lossy contract across the whole shift range, so a future
+        //  alignment guard is caught at every shift, not just one.
+        // ====================================================================
+        {
+            const std::uint64_t base{ 0x100000000ull };
+            const std::uint32_t c{ 0x00ABCDEFu };
+
+            bool residue_matrix_ok{ true };
+            for (std::uint32_t shift{ 1 }; shift <= 4u; ++shift)
+            {
+                const std::uint64_t aligned{ nd_bits(base, shift, c) };
+                const std::uint64_t step{
+                    static_cast<std::uint64_t>(1ull) << shift };
+                for (std::uint64_t r{ 1 }; r < step; ++r)
+                {
+                    const std::uint64_t misaligned{ aligned + r };
+                    const bool drops{ ne(base, shift, misaligned) == c };
+                    const bool back_aligned{
+                        nd_bits(base, shift, ne(base, shift, misaligned)) == aligned };
+                    residue_matrix_ok = residue_matrix_ok && drops && back_aligned;
+                }
+            }
+            ctx.check("misaligned_encode_drops_low_bits_every_shift_1_to_4",
+                      residue_matrix_ok);
+
+            // shift 0 has NO sub-grid: every +1 offset is itself a distinct narrow
+            // value, so encode is EXACT (no residue dropped) for several offsets.
+            bool shift0_exact_ok{ true };
+            const std::uint64_t aligned0{ nd_bits(base, 0u, c) };
+            for (std::uint64_t off{ 0 }; off < 8u; ++off)
+            {
+                shift0_exact_ok = shift0_exact_ok
+                                  && ne(base, 0u, aligned0 + off) == (c + off);
+            }
+            ctx.check("shift0_encode_is_exact_no_residue", shift0_exact_ok);
+
+            // The below-base wrap (flaw #1's pre-guard math) is the SAME for every
+            // shift: narrow_encode subtracts in unsigned 64-bit, so addr<base wraps
+            // and matches ref_encode exactly at each shift (the public wrapper's
+            // < base -> 0 guard sits on top of this raw wrap).
+            bool below_base_wrap_ok{ true };
+            for (const std::uint32_t shift : kShifts)
+            {
+                below_base_wrap_ok = below_base_wrap_ok
+                    && ne(0x100000000ull, shift, 0x1ull)
+                           == ref_encode(0x100000000ull, shift, 0x1ull);
+            }
+            ctx.check("primitive_encode_below_base_wraps_every_shift",
+                      below_base_wrap_ok);
+        }
+
         // ──────────────────────────────────────────────────────── SECTION 10
         //  PUBLIC-API GUARD CONTRACTS (the only JVM-independent paths of the
         //  wrappers).  decode_oop_pointer(0) is ALWAYS nullptr; encode_oop_pointer
@@ -705,6 +823,24 @@ namespace
         // read can't drive a giant shift into the cross-check arithmetic.
         ctx.check("live_shift_is_plausible_0_to_4", live_shift <= 4u);
 
+        // Classify which heap regime this run lands in (heap-size/JDK-config
+        // driven, version-independent) and record it.  shift 0 == heap fits the
+        // low 4 GiB (each oop is the raw object address; base often 0); shift 3 ==
+        // heap up to ~32 GiB (8-byte object alignment); shift 4 == hypothetical
+        // 16-byte alignment.  This is the "every legal shift (0/3/4)" angle: we
+        // can't FORCE a regime from inside the process, so we OBSERVE which one CI
+        // gave us and [INFO]-record it — the universal round-trip invariants below
+        // are asserted HARD in whichever regime this is.
+        ctx.record(std::string{ "[INFO] compressed_oops_decode: live heap regime "
+                                "shift=" } + std::to_string(live_shift)
+                   + (live_shift == 0u
+                          ? " (<=4GiB / raw-address oops)"
+                          : (live_shift == 3u
+                                 ? " (<=32GiB / 8-byte aligned oops)"
+                                 : " (uncommon alignment)"))
+                   + (live_base == 0u ? " base=0 (zero-based)"
+                                      : " base!=0 (offset heap)"));
+
         // Fixture-agnostic live cross-check: rather than depend on a specific
         // fixture String being loaded, we validate the codec IDENTITY against the
         // LIVE base/shift the codec itself resolved.  A small non-zero narrow oop
@@ -776,6 +912,117 @@ namespace
                 ctx.record("[INFO] compressed_oops_decode: live base is "
                            "zero-based — the encode(<base)->0 guard cannot fire "
                            "(every pointer is >= 0); flaw #1 not exercisable here.");
+            }
+        }
+
+        // ================================================================
+        //  REAL LIVE OBJECT round-trip — the single most important live
+        //  assertion the brief calls out: take an oop the VM ACTUALLY holds
+        //  (not a synthetic narrow value), encode it to the narrow form the VM
+        //  would store, decode that back, and prove it reconstructs the
+        //  IDENTICAL real pointer the VM uses.  We use the java.lang.Class
+        //  MIRROR oop of a loaded klass: get_java_mirror() returns a genuine,
+        //  always-present, in-heap object's full 64-bit pointer with NO fixture
+        //  and NO call gate needed.  Every step is is_valid_pointer-gated.
+        // ================================================================
+        {
+            // The String klass is resolved (entry guard above guarantees it); its
+            // java.lang.Class mirror is a real live heap object.
+            void* const mirror{ string_klass->get_java_mirror() };
+            if (mirror == nullptr || !vmhook::hotspot::is_valid_pointer(mirror))
+            {
+                ctx.record("[INFO] compressed_oops_decode: java.lang.Class mirror "
+                           "of String not resolvable (OopHandle indirection or "
+                           "unmapped on this JDK) — real-object round-trip skipped; "
+                           "the synthetic-narrow round-trip above stands.");
+            }
+            else
+            {
+                const std::uint64_t mirror_bits{
+                    reinterpret_cast<std::uint64_t>(mirror) };
+
+                // A real in-heap oop is shift-aligned and at/above the heap base,
+                // so encode must NOT take the below-base->0 guard.  When base==0
+                // and shift==0 the encode is the identity; in every regime it is a
+                // genuine narrow oop.
+                const std::uint32_t mirror_narrow{ encode_pub(mirror) };
+
+                // The brief's headline: encode then decode recovers the EXACT
+                // pointer the VM uses.  HARD only when the mirror sits at/above the
+                // heap base (so the encode guard didn't zero it) — a foreign mirror
+                // below base would (correctly, per flaw #1) encode to 0, which is
+                // not a codec defect; record that case as [INFO] instead.
+                if (mirror_bits >= live_base
+                    && ((mirror_bits - live_base)
+                        & ((static_cast<std::uint64_t>(1ull) << live_shift) - 1ull))
+                           == 0u)
+                {
+                    ctx.check("live_real_mirror_encode_nonzero",
+                              mirror_narrow != 0u);
+                    void* const round{ decode_pub(mirror_narrow) };
+                    ctx.check("live_real_mirror_roundtrip_recovers_pointer",
+                              round == mirror);
+
+                    // The decode equals the pure primitive fed the live base/shift
+                    // AND the independent reference — wrapper, primitive, textbook
+                    // math all agree on a genuine VM object.
+                    ctx.check("live_real_mirror_decode_equals_primitive",
+                              decode_pub(mirror_narrow)
+                                  == nd(live_base, live_shift, mirror_narrow));
+                    ctx.check("live_real_mirror_narrow_matches_ref_encode",
+                              mirror_narrow == ref_encode(live_base, live_shift,
+                                                          mirror_bits));
+                }
+                else
+                {
+                    ctx.record("[INFO] compressed_oops_decode: String Class mirror "
+                               "is below the live heap base or not shift-aligned "
+                               "(a non-heap / handle-backed mirror on this JDK) — "
+                               "real-object encode->decode round-trip not "
+                               "exercisable; synthetic round-trip stands.");
+                }
+
+                // PARITY with the CONSUMER decode path: every field / collection
+                // reader bottoms out in decode_array_oop, which is decode_oop_pointer
+                // plus an is_valid_pointer gate.  For a genuine in-heap narrow oop
+                // the two must produce the IDENTICAL pointer — proving the codec and
+                // the path its consumers actually call agree on real metadata.
+                if (mirror_narrow != 0u)
+                {
+                    ctx.check("live_decode_array_oop_parity_with_decode_oop_pointer",
+                              vmhook::decode_array_oop(mirror_narrow)
+                                  == decode_pub(mirror_narrow));
+                }
+
+                // A SECOND distinct live object (the Object klass mirror, always
+                // loaded) must encode to a DIFFERENT narrow oop and decode back to
+                // its own pointer — no aliasing / base-shift bleed between two real
+                // objects.  Gated: only when both mirrors resolve and sit on-grid.
+                vmhook::hotspot::klass* const object_klass{
+                    vmhook::find_class("java/lang/Object") };
+                void* const obj_mirror{
+                    object_klass ? object_klass->get_java_mirror() : nullptr };
+                if (obj_mirror != nullptr
+                    && vmhook::hotspot::is_valid_pointer(obj_mirror)
+                    && obj_mirror != mirror)
+                {
+                    const std::uint64_t obj_bits{
+                        reinterpret_cast<std::uint64_t>(obj_mirror) };
+                    const bool obj_on_grid{
+                        obj_bits >= live_base
+                        && ((obj_bits - live_base)
+                            & ((static_cast<std::uint64_t>(1ull) << live_shift) - 1ull))
+                               == 0u };
+                    if (obj_on_grid && mirror_narrow != 0u)
+                    {
+                        const std::uint32_t obj_narrow{ encode_pub(obj_mirror) };
+                        ctx.check("live_two_real_objects_distinct_narrow",
+                                  obj_narrow != mirror_narrow);
+                        ctx.check("live_two_real_objects_decode_independently",
+                                  decode_pub(obj_narrow) == obj_mirror
+                                  && decode_pub(mirror_narrow) == mirror);
+                    }
+                }
             }
         }
     }

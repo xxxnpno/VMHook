@@ -48,6 +48,8 @@ public final class DeoptProbe
      *   3 = call hotSelected(DELTA)   ONCE   (post-deopt single dispatch / hook-fire probe)
      *   4 = call hotUnselected(DELTA) ONCE   (post-deopt single dispatch / hook-fire probe)
      *   5 = warm BOTH hot methods WARM_CALLS times each (one-shot warm of the pair)
+     *   6 = warm hotStatic()   WARM_CALLS times (drive the STATIC hot method to JIT)
+     *   7 = call hotStatic(DELTA)   ONCE   (post-deopt single dispatch / hook-fire probe)
      */
     public static volatile int mode;
 
@@ -74,6 +76,15 @@ public final class DeoptProbe
     /** Number of times run() actually invoked hotUnselected() in the last cycle. */
     public static volatile int unselectedCallsMade;
 
+    /** Last value the original hotStatic() body computed. */
+    public static volatile int lastStaticResult;
+
+    /** XOR accumulator of every hotStatic() return inside one probe (defeats DCE). */
+    public static volatile long staticXor;
+
+    /** Number of times run() actually invoked hotStatic() in the last cycle. */
+    public static volatile int staticCallsMade;
+
     // ---- Constants mirrored on the native side ----------------------------
 
     /** Instance seed; hotX(delta) returns seed + delta. */
@@ -84,6 +95,12 @@ public final class DeoptProbe
 
     /** hotSelected(DELTA) / hotUnselected(DELTA) body result on a single call. */
     public static final int SINGLE_RESULT = SEED + DELTA;
+
+    /** Seed baked into the STATIC hot method (no `this`, so a class constant). */
+    public static final int STATIC_SEED = 2000;
+
+    /** hotStatic(DELTA) body result on a single call. */
+    public static final int STATIC_SINGLE_RESULT = STATIC_SEED + DELTA;
 
     /**
      * Iterations for the JIT-warming hot loops.  Comfortably above the default
@@ -111,6 +128,41 @@ public final class DeoptProbe
     public int hotUnselected(final int delta)
     {
         return this.seed + delta;
+    }
+
+    /**
+     * STATIC hot method, same (I)I descriptor as the instance pair but with no
+     * receiver.  Proves the deopt dance (and a post-deopt interpreter hook) work
+     * identically whether or not the Method has a `this` slot.
+     */
+    public static int hotStatic(final int delta)
+    {
+        return STATIC_SEED + delta;
+    }
+
+    private static void runWarmStatic(final int iterations)
+    {
+        int made = 0;
+        long acc = 0;
+        int last = 0;
+        for (int i = 0; i < iterations; ++i)
+        {
+            final int d = i & 0xFF;
+            last = hotStatic(d);
+            acc ^= last;
+            ++made;
+        }
+        lastStaticResult = last;
+        staticXor = acc;
+        staticCallsMade = made;
+    }
+
+    private static void runStaticOnce(final int delta)
+    {
+        final int r = hotStatic(delta);
+        lastStaticResult = r;
+        staticXor = r;
+        staticCallsMade = 1;
     }
 
     private static void runWarmSelected(final int iterations)
@@ -201,6 +253,12 @@ public final class DeoptProbe
                     case 5:
                         runWarmSelected(WARM_CALLS);
                         runWarmUnselected(WARM_CALLS);
+                        break;
+                    case 6:
+                        runWarmStatic(WARM_CALLS);
+                        break;
+                    case 7:
+                        runStaticOnce(DELTA);
                         break;
                     default:
                         break;

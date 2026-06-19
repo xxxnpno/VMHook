@@ -520,6 +520,92 @@ namespace
                                        "\xF0\x9F\x98\x82" "c\xF0\x9F\x98\x83" "d"
                                        "\xF0\x9F\x98\x84" "e" } });
 
+        // ── EXHAUSTIVE additions, wave 3 (mjs3_*): input CLASSES the prior waves
+        //    never exercised — combining marks (base + diacritic), RTL/bidi script,
+        //    astral code points OUTSIDE the emoji block, a non-CJK 3-byte BMP symbol,
+        //    a pure high-Latin-1 run, and a whitespace-class string.  Every one is
+        //    well-formed UTF-8, so expected == input (byte-exact UTF-8 back). ──
+
+        // COMBINING MARK: 'e' (U+0065, ASCII) + U+0301 COMBINING ACUTE ACCENT.  This
+        // is the DECOMPOSED form of 'é' — two code units (length 2) that render as one
+        // grapheme.  The combining mark U+0301 > 0xFF promotes the WHOLE String to the
+        // UTF16 coder, so the ASCII 'e' rides the 2-byte backing too.  3 UTF-8 bytes
+        // back (1 for 'e', 2 for U+0301).  Distinct from the precomposed café path.
+        cases.push_back({ "combining_e_acute_U0301",
+                          std::string{ "e\xCC\x81" }, std::string{ "e\xCC\x81" } });
+        // STACKED combining marks: 'a' + U+0300 (grave) + U+0323 (dot below) — a base
+        // with TWO combining marks (length 3, one grapheme).  Proves multiple
+        // consecutive combining code units are each preserved as ordinary chars.  5
+        // UTF-8 bytes back (1 + 2 + 2).
+        cases.push_back({ "combining_stacked_a_U0300_U0323",
+                          std::string{ "a\xCC\x80\xCC\xA3" }, std::string{ "a\xCC\x80\xCC\xA3" } });
+        // DEVANAGARI base + dependent vowel sign: U+0915 (KA) + U+093F (vowel sign I)
+        // — a combining sequence in a complex script (length 2, both 3-byte UTF-8).
+        // 6 UTF-8 bytes back.  Exercises a non-Latin combining grapheme on the UTF16
+        // backing.
+        cases.push_back({ "combining_devanagari_U0915_U093F",
+                          std::string{ "\xE0\xA4\x95\xE0\xA4\xBF" },
+                          std::string{ "\xE0\xA4\x95\xE0\xA4\xBF" } });
+
+        // RTL / BIDI: three Hebrew letters U+05D0 U+05D1 U+05D2 (aleph bet gimel) —
+        // a right-to-left script run (length 3, each a 2-byte UTF-8 / single UTF-16
+        // unit > 0xFF, so UTF16-coded).  6 UTF-8 bytes back.  The logical code-unit
+        // ORDER is what the backing array holds (bidi is a render concern), so the
+        // round-trip is byte-exact in logical order.
+        cases.push_back({ "rtl_hebrew_word",
+                          std::string{ "\xD7\x90\xD7\x91\xD7\x92" },
+                          std::string{ "\xD7\x90\xD7\x91\xD7\x92" } });
+
+        // ASTRAL OUTSIDE THE EMOJI BLOCK: U+1D11E MUSICAL SYMBOL G CLEF (plane 1,
+        // SMP) — one surrogate pair, 4-byte UTF-8.  Proves the surrogate maths is not
+        // emoji-specific.  char_count 2, one code point.
+        {
+            std::string s;
+            append_utf8(s, 0x1D11Eu);
+            cases.push_back({ "astral_musical_clef_U1D11E", s, s });
+        }
+        // ASTRAL CJK Extension B: U+20000 (plane 2, the FIRST supplementary
+        // ideograph) — surrogate pair, 4-byte UTF-8.  A different astral plane than
+        // both the emoji (plane 1, SMP) and the clef.  char_count 2.
+        {
+            std::string s;
+            append_utf8(s, 0x20000u);
+            cases.push_back({ "astral_cjk_ext_b_U20000", s, s });
+        }
+
+        // NON-CJK BMP SYMBOL, single char: U+2603 SNOWMAN — one 3-byte UTF-8 unit
+        // > 0xFF, UTF16-coded, char_count 1.  Complements one_cjk_U4E2D with a
+        // symbol-block BMP char (not an ideograph) on the single-char UTF16 path.
+        cases.push_back({ "bmp_symbol_snowman_U2603",
+                          std::string{ "\xE2\x98\x83" }, std::string{ "\xE2\x98\x83" } });
+
+        // PURE HIGH-LATIN-1 RUN: U+0080..U+00FF (128 chars, EVERY high-Latin-1 code
+        // point, each 2-byte UTF-8 but all <= 0xFF so the String stays on the LATIN1
+        // 1-byte backing).  Distinct from every_byte_0x00_0xFF (which also includes
+        // the ASCII 0x00..0x7F half): this isolates the upper-half multibyte LATIN1
+        // decode.  128 units, 256 UTF-8 bytes back.
+        {
+            std::string hi;
+            for (std::uint32_t cp{ 0x80u }; cp <= 0xFFu; ++cp) { append_utf8(hi, cp); }
+            cases.push_back({ "high_latin1_run_0x80_0xFF", hi, hi });
+        }
+
+        // WHITESPACE CLASS as ordinary content: SPACE, TAB, LF, CR, VT, FF
+        // (0x20 0x09 0x0A 0x0D 0x0B 0x0C) — 6 LATIN1 units.  Proves the common
+        // whitespace/line-ending bytes are preserved verbatim (not normalised, not
+        // delimiters).  6 UTF-8 bytes back.
+        cases.push_back({ "whitespace_class_latin1",
+                          std::string{ "\x20\x09\x0A\x0D\x0B\x0C", 6 },
+                          std::string{ "\x20\x09\x0A\x0D\x0B\x0C", 6 } });
+
+        // COMBINING MARK + ASTRAL in one string: 'e' + U+0301 + U+1F600 emoji.  Mixes
+        // a 2-unit combining grapheme with a surrogate pair (length 4, two graphemes,
+        // three code points).  Proves the combining unit and the following surrogate
+        // pair each advance correctly.  7 UTF-8 bytes back (1 + 2 + 4).
+        cases.push_back({ "combining_plus_astral",
+                          std::string{ "e\xCC\x81\xF0\x9F\x98\x80" },
+                          std::string{ "e\xCC\x81\xF0\x9F\x98\x80" } });
+
         return cases;
     }
 
@@ -587,7 +673,7 @@ namespace
     //    length the call returned.  The body then reads the Java witness fields
     //    (ccLenK / ccCpK / ccSigK / ccNullK / ccCalledK) and asserts them against
     //    the natively-computed expected length / code points / signature. ──
-    constexpr std::size_t k_num_cc{ 8 };
+    constexpr std::size_t k_num_cc{ 10 };
     std::array<std::atomic<bool>, k_num_cc> g_cc_made_valid{};   // made oop was valid
     std::array<std::atomic<bool>, k_num_cc> g_cc_call_returned{};// call() dispatched + returned
     std::array<std::atomic<int>,  k_num_cc> g_cc_call_retlen{};  // checkContent int return
@@ -636,6 +722,17 @@ namespace
         //    read_java_string decodes it in full too, and Java independently confirms
         //    the full length.
         cc.push_back({ "over_cap_100000", repeat_bytes("x", 100000) });
+        // 8: COMBINING-MARK sequence — 'e' + U+0301 (combining acute) + Devanagari
+        //    KA + vowel sign.  length 4, codePointCount 4 (no astral pairs here, so
+        //    each combining mark is its own code point), and the U+0301/U+0915/U+093F
+        //    units (> 0xFF) force the UTF16 coder.  Java MUST see the exact char
+        //    sequence (a wrong coder or a dropped combining mark flips the signature).
+        cc.push_back({ "combining_marks", std::string{ "e\xCC\x81\xE0\xA4\x95\xE0\xA4\xBF" } });
+        // 9: RTL / bidi run — three Hebrew letters U+05D0 U+05D1 U+05D2.  length 3,
+        //    codePointCount 3, UTF16-coded.  Java walks the LOGICAL code-unit order
+        //    (bidi reordering is a render concern), so the signature matches the
+        //    native fold over the same logical units.
+        cc.push_back({ "rtl_hebrew", std::string{ "\xD7\x90\xD7\x91\xD7\x92" } });
         return cc;
     }
 
@@ -1454,6 +1551,69 @@ namespace
                 gate("mjs2_astral_interleaved_ascii_roundtrips_25byte", g_rt_valid[i].load(),
                      g_rt_decoded_len[i].load() == 25 && g_rt_byte_exact[i].load());
             }
+            // ── EXHAUSTIVE wave-3 named property gates (mjs3_*). ──
+            else if (cases[i].label == "combining_e_acute_U0301")
+            {
+                // 'e' + U+0301: 2 code units, 3 UTF-8 bytes (1 + 2); UTF16-coded.
+                gate("mjs3_combining_e_acute_roundtrips_3byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 3 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "combining_stacked_a_U0300_U0323")
+            {
+                // 'a' + two combining marks: 3 code units, 5 UTF-8 bytes (1 + 2 + 2).
+                gate("mjs3_combining_stacked_roundtrips_5byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 5 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "combining_devanagari_U0915_U093F")
+            {
+                // Devanagari KA + vowel sign I: 2 units, 6 UTF-8 bytes (3 + 3).
+                gate("mjs3_combining_devanagari_roundtrips_6byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 6 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "rtl_hebrew_word")
+            {
+                // 3 Hebrew letters: 3 units, 6 UTF-8 bytes (2 each); logical order
+                // preserved byte-exact (bidi is a render-time concern only).
+                gate("mjs3_rtl_hebrew_roundtrips_6byte_logical_order", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 6 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "astral_musical_clef_U1D11E")
+            {
+                // U+1D11E (plane 1, non-emoji): surrogate pair, 4 UTF-8 bytes.
+                gate("mjs3_astral_clef_roundtrips_4byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 4 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "astral_cjk_ext_b_U20000")
+            {
+                // U+20000 (plane 2, first SIP ideograph): surrogate pair, 4 UTF-8 bytes.
+                gate("mjs3_astral_cjk_ext_b_roundtrips_4byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 4 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "bmp_symbol_snowman_U2603")
+            {
+                // U+2603 (non-CJK BMP symbol): 1 unit, 3 UTF-8 bytes; UTF16-coded.
+                gate("mjs3_bmp_symbol_snowman_roundtrips_3byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 3 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "high_latin1_run_0x80_0xFF")
+            {
+                // 128 high-Latin-1 chars, each 2-byte UTF-8 -> 256 bytes back; the
+                // String stays LATIN1-coded (all units <= 0xFF) yet round-trips exact.
+                gate("mjs3_high_latin1_run_roundtrips_256byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 256 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "whitespace_class_latin1")
+            {
+                // 6 whitespace/line-ending bytes preserved verbatim (LATIN1).
+                gate("mjs3_whitespace_class_preserved_len6", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 6 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "combining_plus_astral")
+            {
+                // 'e' + U+0301 + emoji: 4 units (2 + surrogate pair), 7 UTF-8 bytes.
+                gate("mjs3_combining_plus_astral_roundtrips_7byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 7 && g_rt_byte_exact[i].load());
+            }
         }
 
         // Lone surrogate: characterise the ACTUAL read-back (never forced).  The
@@ -1681,16 +1841,21 @@ namespace
         // =====================================================================
         {
             const std::vector<cc_case> cc{ build_cc_cases() };
-            const std::array<const char*, 8> ccf_called{
-                "ccCalled0","ccCalled1","ccCalled2","ccCalled3","ccCalled4","ccCalled5","ccCalled6","ccCalled7" };
-            const std::array<const char*, 8> ccf_len{
-                "ccLen0","ccLen1","ccLen2","ccLen3","ccLen4","ccLen5","ccLen6","ccLen7" };
-            const std::array<const char*, 8> ccf_cp{
-                "ccCp0","ccCp1","ccCp2","ccCp3","ccCp4","ccCp5","ccCp6","ccCp7" };
-            const std::array<const char*, 8> ccf_null{
-                "ccNull0","ccNull1","ccNull2","ccNull3","ccNull4","ccNull5","ccNull6","ccNull7" };
-            const std::array<const char*, 8> ccf_sig{
-                "ccSig0","ccSig1","ccSig2","ccSig3","ccSig4","ccSig5","ccSig6","ccSig7" };
+            const std::array<const char*, k_num_cc> ccf_called{
+                "ccCalled0","ccCalled1","ccCalled2","ccCalled3","ccCalled4",
+                "ccCalled5","ccCalled6","ccCalled7","ccCalled8","ccCalled9" };
+            const std::array<const char*, k_num_cc> ccf_len{
+                "ccLen0","ccLen1","ccLen2","ccLen3","ccLen4",
+                "ccLen5","ccLen6","ccLen7","ccLen8","ccLen9" };
+            const std::array<const char*, k_num_cc> ccf_cp{
+                "ccCp0","ccCp1","ccCp2","ccCp3","ccCp4",
+                "ccCp5","ccCp6","ccCp7","ccCp8","ccCp9" };
+            const std::array<const char*, k_num_cc> ccf_null{
+                "ccNull0","ccNull1","ccNull2","ccNull3","ccNull4",
+                "ccNull5","ccNull6","ccNull7","ccNull8","ccNull9" };
+            const std::array<const char*, k_num_cc> ccf_sig{
+                "ccSig0","ccSig1","ccSig2","ccSig3","ccSig4",
+                "ccSig5","ccSig6","ccSig7","ccSig8","ccSig9" };
 
             const std::size_t ncc{ cc.size() < k_num_cc ? cc.size() : k_num_cc };
             for (std::size_t i{ 0 }; i < ncc; ++i)

@@ -252,6 +252,55 @@ public final class MethodObject
     /** Return value of childLabel() — a String, the eager-decode reference. */
     public static final String LABEL_STRING = "label-via-method";
 
+    // ── VARIED-ARG-SIGNATURE object-return constants (batch-14 deepening) ───
+    // Each arg-driven object-returning method below folds its argument(s) into
+    // the returned Child's tag so the native decode is non-vacuous (the wrong
+    // arg width / lost arg would yield the wrong tag, not merely "non-null").
+
+    /** Base tag the wide-long arg method adds its (int)arg to. */
+    public static final int LONG_ARG_BASE = 0x6000;
+    /** The wide long passed by the native side to childForLong(long). */
+    public static final long LONG_ARG_VALUE = 0x0000_0001_0000_002AL; // hi+lo halves both set
+    /** Expected tag of childForLong(LONG_ARG_VALUE): BASE + (int)(v + (v>>>32)). */
+    public static final int LONG_ARG_TAG = LONG_ARG_BASE + (int) (LONG_ARG_VALUE + (LONG_ARG_VALUE >>> 32));
+
+    /** Base tag the wide-double arg method adds its rounded arg to. */
+    public static final int DOUBLE_ARG_BASE = 0x6100;
+    /** The wide double passed to childForDouble(double). */
+    public static final double DOUBLE_ARG_VALUE = 1234.5;
+    /** Expected tag of childForDouble(DOUBLE_ARG_VALUE): BASE + (int)arg. */
+    public static final int DOUBLE_ARG_TAG = DOUBLE_ARG_BASE + (int) DOUBLE_ARG_VALUE;
+
+    /** The String arg passed to childForString(String) and echoed in the label. */
+    public static final String STRING_ARG_VALUE = "arg-string";
+    /** Tag of childForString(STRING_ARG_VALUE) — encodes the arg length. */
+    public static final int STRING_ARG_TAG = 0x6200 + STRING_ARG_VALUE.length();
+
+    /** The float arg passed to childForFloat(float). */
+    public static final float FLOAT_ARG_VALUE = 2.5f;
+    /** Tag of childForFloat(FLOAT_ARG_VALUE): BASE + (int)arg. */
+    public static final int FLOAT_ARG_BASE = 0x6300;
+    public static final int FLOAT_ARG_TAG = FLOAT_ARG_BASE + (int) FLOAT_ARG_VALUE;
+
+    /** The boolean arg passed to childForBool(boolean) (true branch). */
+    public static final int BOOL_ARG_TRUE_TAG  = 0x6401;
+    public static final int BOOL_ARG_FALSE_TAG = 0x6400;
+
+    /** Args + expected tag of the MULTI-arg method childForMany(int,long,String):
+     *  tag = i + (int)l + s.length(). */
+    public static final int    MANY_ARG_INT    = 7;
+    public static final long   MANY_ARG_LONG   = 0x0000_0000_0000_1000L;
+    public static final String MANY_ARG_STRING = "many";
+    public static final int    MANY_ARG_TAG    =
+        MANY_ARG_INT + (int) MANY_ARG_LONG + MANY_ARG_STRING.length();
+
+    /** value boxed by boxedLong() (a wide boxed primitive return). */
+    public static final long BOXED_LONG_VALUE = 0x0000_0007_0000_0003L;
+    /** value boxed by boxedBool() — Boolean.TRUE. */
+    public static final boolean BOXED_BOOL_VALUE = true;
+    /** value boxed by boxedDouble(). */
+    public static final double BOXED_DOUBLE_VALUE = 6.25;
+
     // ── Stored instance state ──────────────────────────────────────────────
     /**
      * The Child instance getChild() returns and the `child` field exposes.
@@ -472,6 +521,119 @@ public final class MethodObject
     public Child sameStaticChild()
     {
         return STATIC_CHILD;
+    }
+
+    // ── VARIED-ARG-SIGNATURE object-returning methods (batch-14 deepening) ──
+    // Each folds its argument(s) into the returned Child's tag so a mis-packed,
+    // truncated, or dropped argument produces a WRONG tag the native side
+    // catches — never a vacuous "non-null and hope".
+
+    /**
+     * WIDE long arg -&gt; object return.  A 64-bit argument occupies TWO
+     * interpreter slots; the tag folds in both the low and high halves so a
+     * narrowed (32-bit) pack would yield the wrong tag.
+     */
+    public Child childForLong(final long v)
+    {
+        return new Child(LONG_ARG_BASE + (int) (v + (v >>> 32)), "long-arg");
+    }
+
+    /** WIDE double arg -&gt; object return (two slots; tag folds the rounded arg). */
+    public Child childForDouble(final double v)
+    {
+        return new Child(DOUBLE_ARG_BASE + (int) v, "double-arg");
+    }
+
+    /**
+     * String (reference) arg -&gt; object return.  The arg is echoed into the
+     * returned Child's label and its length into the tag, so a lost or wrong
+     * String arg is detectable on BOTH the tag and the label.
+     */
+    public Child childForString(final String s)
+    {
+        return new Child(0x6200 + (s == null ? -1 : s.length()), s);
+    }
+
+    /** float arg -&gt; object return (single slot; tag folds the rounded arg). */
+    public Child childForFloat(final float v)
+    {
+        return new Child(FLOAT_ARG_BASE + (int) v, "float-arg");
+    }
+
+    /** boolean arg -&gt; object return (the arg selects the tag). */
+    public Child childForBool(final boolean b)
+    {
+        return new Child(b ? BOOL_ARG_TRUE_TAG : BOOL_ARG_FALSE_TAG, "bool-arg");
+    }
+
+    /**
+     * MULTI-arg mixed-width signature -&gt; object return: int + wide long +
+     * String.  The tag folds all three, so any single mis-packed argument
+     * (wrong slot count for the long, dropped String) yields the wrong tag.
+     */
+    public Child childForMany(final int i, final long l, final String s)
+    {
+        return new Child(i + (int) l + (s == null ? 0 : s.length()), "many-arg");
+    }
+
+    /**
+     * java.lang.Object base return: declared Object, runtime is the stored
+     * `child`.  The native side decodes it through a GENERIC base wrapper and
+     * proves identity against the field child — the return type is the root
+     * reference type, not a Child, yet the OOP is the same heap object.
+     */
+    public Object childAsObject()
+    {
+        return this.child;
+    }
+
+    /**
+     * Object ARG (declared Object) returned unchanged — identity echo on the
+     * ROOT reference type.  The native side passes the stored child back in as
+     * an Object and the returned OOP must equal it (arg-unchanged identity for
+     * a non-Child declared type).
+     */
+    public Object echoObject(final Object o)
+    {
+        return o;
+    }
+
+    /**
+     * String ARG returned unchanged — identity echo whose return lands in the
+     * std::string alternative, NOT the OOP alternative.  Proves an argument can
+     * be returned unchanged AND routed to the eager-String path.
+     */
+    public String echoString(final String s)
+    {
+        return s;
+    }
+
+    /** Wide boxed-primitive return: Long.valueOf(N) typed as Object. */
+    public Object boxedLong()
+    {
+        return Long.valueOf(BOXED_LONG_VALUE);
+    }
+
+    /** Boxed boolean return: Boolean.valueOf(true) typed as Object. */
+    public Object boxedBool()
+    {
+        return Boolean.valueOf(BOXED_BOOL_VALUE);
+    }
+
+    /** Boxed double return: Double.valueOf(N) typed as Object. */
+    public Object boxedDouble()
+    {
+        return Double.valueOf(BOXED_DOUBLE_VALUE);
+    }
+
+    /**
+     * Arg-driven null on a TYPED (String) arg: returns the stored child when
+     * the arg is non-null, else null.  Drives the null branch from a reference
+     * argument (distinct from pickChild's int-out-of-range null).
+     */
+    public Child childWhenPresent(final String key)
+    {
+        return (key != null) ? this.child : null;
     }
 
     static

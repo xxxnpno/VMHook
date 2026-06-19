@@ -229,6 +229,39 @@ namespace
         // A different method returning the SAME static Child (cross-method identity).
         auto same_static_child() -> std::unique_ptr<child_object> { return get_method("sameStaticChild")->call(); }
 
+        // ── VARIED-ARG-SIGNATURE object returns (batch-14 deepening) ───────
+        // Each folds its argument(s) into the returned Child's tag, so the
+        // native decode catches a mis-packed / truncated / dropped argument.
+        auto child_for_long(std::int64_t v)  -> std::unique_ptr<child_object> { return get_method("childForLong")->call(v); }
+        auto child_for_double(double v)       -> std::unique_ptr<child_object> { return get_method("childForDouble")->call(v); }
+        auto child_for_string(const std::string& s) -> std::unique_ptr<child_object> { return get_method("childForString")->call(s); }
+        auto child_for_float(float v)         -> std::unique_ptr<child_object> { return get_method("childForFloat")->call(v); }
+        auto child_for_bool(bool b)           -> std::unique_ptr<child_object> { return get_method("childForBool")->call(b); }
+        auto child_for_many(std::int32_t i, std::int64_t l, const std::string& s) -> std::unique_ptr<child_object>
+        {
+            return get_method("childForMany")->call(i, l, s);
+        }
+        // java.lang.Object base return — runtime type is the stored Child, so
+        // the registered child wrapper decodes it; identity == field child.
+        auto child_as_object() -> std::unique_ptr<child_object> { return get_method("childAsObject")->call(); }
+        // Object ARG returned unchanged (root-type identity echo).
+        auto echo_object(const std::unique_ptr<child_object>& o) -> std::unique_ptr<child_object>
+        {
+            return get_method("echoObject")->call(o);
+        }
+        // String ARG returned unchanged — lands in the std::string alternative.
+        auto echo_string(const std::string& s) -> std::string { return get_method("echoString")->call(s).as_string(); }
+        // Wide / bool / double boxed-primitive returns (usable via Integer-shaped
+        // wrappers; we only read identity + klass name, not box-specific methods).
+        auto boxed_long()   -> std::unique_ptr<integer_object> { return get_method("boxedLong")->call(); }
+        auto boxed_bool()   -> std::unique_ptr<integer_object> { return get_method("boxedBool")->call(); }
+        auto boxed_double() -> std::unique_ptr<integer_object> { return get_method("boxedDouble")->call(); }
+        // Arg-driven null on a reference (String) arg.
+        auto child_when_present(const std::string& key) -> std::unique_ptr<child_object>
+        {
+            return get_method("childWhenPresent")->call(key);
+        }
+
         // ── field-path baseline (always works; no call_stub dependency) ────
         auto field_child() -> std::unique_ptr<child_object> { return get_field("child")->get(); }
     };
@@ -369,6 +402,45 @@ namespace
     // call-path taken
     std::atomic<bool> g_call_stub_present{ false };
 
+    // ── batch-14 deepening: varied-arg-signature object returns ────────────
+    std::atomic<bool>         g_long_arg_nonnull{ false };
+    std::atomic<std::int32_t> g_long_arg_tag{ -1 };
+    std::atomic<bool>         g_double_arg_nonnull{ false };
+    std::atomic<std::int32_t> g_double_arg_tag{ -1 };
+    std::atomic<bool>         g_string_arg_nonnull{ false };
+    std::atomic<std::int32_t> g_string_arg_tag{ -1 };
+    std::atomic<bool>         g_string_arg_label_ok{ false };
+    std::atomic<bool>         g_float_arg_nonnull{ false };
+    std::atomic<std::int32_t> g_float_arg_tag{ -1 };
+    std::atomic<bool>         g_bool_true_arg_nonnull{ false };
+    std::atomic<std::int32_t> g_bool_true_arg_tag{ -1 };
+    std::atomic<std::int32_t> g_bool_false_arg_tag{ -1 };
+    std::atomic<bool>         g_many_arg_nonnull{ false };
+    std::atomic<std::int32_t> g_many_arg_tag{ -1 };
+
+    // java.lang.Object base return (declared Object, runtime Child)
+    std::atomic<bool>           g_object_return_nonnull{ false };
+    std::atomic<std::int32_t>   g_object_return_tag{ -1 };
+    std::atomic<std::uintptr_t> g_object_return_instance{ 0 };
+    std::string                 g_object_return_klass{};
+
+    // arg-returned-unchanged on non-Child declared types
+    std::atomic<bool>           g_echo_object_nonnull{ false };
+    std::atomic<bool>           g_echo_object_same_as_field{ false };
+    std::atomic<bool>           g_echo_string_ok{ false };
+
+    // boxed-primitive variety (Long / Boolean / Double)
+    std::atomic<bool> g_boxed_long_nonnull{ false };
+    std::string       g_boxed_long_klass{};
+    std::atomic<bool> g_boxed_bool_nonnull{ false };
+    std::string       g_boxed_bool_klass{};
+    std::atomic<bool> g_boxed_double_nonnull{ false };
+    std::string       g_boxed_double_klass{};
+
+    // arg-driven null on a reference (String) arg
+    std::atomic<bool> g_present_nonnull_when_key{ false };
+    std::atomic<std::int32_t> g_present_tag{ -1 };
+
     constexpr std::int32_t k_child_tag    = 0x5EED;
     constexpr std::int32_t k_maybe_tag    = 0x1234;
     constexpr std::int32_t k_static_tag   = 0x7AC0;
@@ -392,6 +464,30 @@ namespace
     const std::string      k_named_name    = "named-impl";
     const std::string      k_str_array_0   = "s0";
     const std::string      k_str_array_2   = "s2";
+
+    // ── batch-14 deepening: varied-arg-signature expected values ───────────
+    // Computed here EXACTLY as the fixture computes them (same widths, same
+    // folds) so a wrong arg pack on the native side produces a wrong tag the
+    // assertion catches.  The long fold uses an unsigned >> 32 to mirror Java's
+    // logical >>> 32.  k_long_arg == 0x1_0000_002A (hi half 1, lo half 0x2A).
+    constexpr std::int64_t k_long_arg       = (std::int64_t{ 1 } << 32) | std::int64_t{ 0x2A };
+    constexpr std::int32_t k_long_arg_tag   =
+        0x6000 + static_cast<std::int32_t>(
+            k_long_arg + static_cast<std::int64_t>(static_cast<std::uint64_t>(k_long_arg) >> 32));
+    constexpr double       k_double_arg     = 1234.5;
+    constexpr std::int32_t k_double_arg_tag = 0x6100 + static_cast<std::int32_t>(k_double_arg);
+    const std::string      k_string_arg     = "arg-string";
+    const std::int32_t     k_string_arg_tag = 0x6200 + static_cast<std::int32_t>(k_string_arg.size());
+    constexpr float        k_float_arg      = 2.5f;
+    constexpr std::int32_t k_float_arg_tag  = 0x6300 + static_cast<std::int32_t>(k_float_arg);
+    constexpr std::int32_t k_bool_true_tag  = 0x6401;
+    constexpr std::int32_t k_bool_false_tag = 0x6400;
+    constexpr std::int32_t k_many_int       = 7;
+    constexpr std::int64_t k_many_long      = std::int64_t{ 0x1000 };
+    const std::string      k_many_string    = "many";
+    const std::int32_t     k_many_tag       =
+        k_many_int + static_cast<std::int32_t>(k_many_long)
+        + static_cast<std::int32_t>(k_many_string.size());
 
     // Internal name of the runtime klass behind an oop, or "" if unresolvable.
     // Used to prove a polymorphic / boxed return's decoded oop carries the
@@ -876,6 +972,120 @@ namespace
                 }
             }
         }
+
+        // ── VARIED-ARG-SIGNATURE object returns (batch-14 deepening) ───────────
+        // Drive an object-returning call() through every primitive arg WIDTH and
+        // reference arg kind: a wide long (two slots), a wide double (two slots),
+        // a String reference arg, a float, a boolean, and a mixed multi-arg
+        // signature (int + long + String).  Each returned Child folds its arg(s)
+        // into its tag, so a narrowed / dropped / mis-slotted argument yields a
+        // WRONG tag — the assertions are non-vacuous.
+        {
+            std::unique_ptr<child_object> cl{ self->child_for_long(k_long_arg) };
+            g_long_arg_nonnull.store(cl != nullptr, std::memory_order_relaxed);
+            if (cl) { g_long_arg_tag.store(cl->get_tag(), std::memory_order_relaxed); }
+
+            std::unique_ptr<child_object> cd{ self->child_for_double(k_double_arg) };
+            g_double_arg_nonnull.store(cd != nullptr, std::memory_order_relaxed);
+            if (cd) { g_double_arg_tag.store(cd->get_tag(), std::memory_order_relaxed); }
+
+            std::unique_ptr<child_object> cs{ self->child_for_string(k_string_arg) };
+            g_string_arg_nonnull.store(cs != nullptr, std::memory_order_relaxed);
+            if (cs)
+            {
+                g_string_arg_tag.store(cs->get_tag(), std::memory_order_relaxed);
+                // The String arg is echoed into the returned Child's label, so a
+                // lost reference arg is caught on the label too, not just the tag.
+                g_string_arg_label_ok.store(cs->get_label() == k_string_arg,
+                                            std::memory_order_relaxed);
+            }
+
+            std::unique_ptr<child_object> cf{ self->child_for_float(k_float_arg) };
+            g_float_arg_nonnull.store(cf != nullptr, std::memory_order_relaxed);
+            if (cf) { g_float_arg_tag.store(cf->get_tag(), std::memory_order_relaxed); }
+
+            std::unique_ptr<child_object> cbt{ self->child_for_bool(true) };
+            g_bool_true_arg_nonnull.store(cbt != nullptr, std::memory_order_relaxed);
+            if (cbt) { g_bool_true_arg_tag.store(cbt->get_tag(), std::memory_order_relaxed); }
+            std::unique_ptr<child_object> cbf{ self->child_for_bool(false) };
+            if (cbf) { g_bool_false_arg_tag.store(cbf->get_tag(), std::memory_order_relaxed); }
+
+            std::unique_ptr<child_object> cm{ self->child_for_many(k_many_int, k_many_long, k_many_string) };
+            g_many_arg_nonnull.store(cm != nullptr, std::memory_order_relaxed);
+            if (cm) { g_many_arg_tag.store(cm->get_tag(), std::memory_order_relaxed); }
+        }
+
+        // ── java.lang.Object BASE return (declared Object, runtime Child) ──────
+        // The return type is the ROOT reference type; the decoded oop carries the
+        // concrete runtime klass (Child) and is the SAME heap object as the field
+        // child — proving the decode is driven by the runtime oop, not the
+        // declared return type.
+        {
+            std::unique_ptr<child_object> obj{ self->child_as_object() };
+            g_object_return_nonnull.store(obj != nullptr, std::memory_order_relaxed);
+            if (obj)
+            {
+                void* const inst{ obj->get_instance() };
+                g_object_return_instance.store(reinterpret_cast<std::uintptr_t>(inst),
+                                               std::memory_order_relaxed);
+                g_object_return_klass = runtime_klass_name(inst);
+                g_object_return_tag.store(obj->get_tag(), std::memory_order_relaxed);
+            }
+        }
+
+        // ── ARG RETURNED UNCHANGED on non-Child declared types ─────────────────
+        // echoObject(Object) returns its arg unchanged: pass the stored child IN
+        // as the arg, the returned OOP must equal it (root-type identity echo).
+        // echoString(String) returns its String arg unchanged into the eager
+        // std::string alternative (an argument round-tripped through the String
+        // return path, not the OOP path).
+        {
+            std::unique_ptr<child_object> fc{ self->field_child() };
+            if (fc)
+            {
+                const std::uintptr_t fc_oop{
+                    reinterpret_cast<std::uintptr_t>(fc->get_instance()) };
+                std::unique_ptr<child_object> back{ self->echo_object(fc) };
+                g_echo_object_nonnull.store(back != nullptr, std::memory_order_relaxed);
+                if (back)
+                {
+                    g_echo_object_same_as_field.store(
+                        reinterpret_cast<std::uintptr_t>(back->get_instance()) == fc_oop,
+                        std::memory_order_relaxed);
+                }
+            }
+            g_echo_string_ok.store(self->echo_string(k_string_arg) == k_string_arg,
+                                   std::memory_order_relaxed);
+        }
+
+        // ── BOXED-PRIMITIVE VARIETY: Long / Boolean / Double ───────────────────
+        // Wide and non-int boxed returns each decode to a non-null wrapper whose
+        // runtime klass is the matching boxed type — the OOP-decode is correct
+        // for boxes wider than / different from Integer too.
+        {
+            std::unique_ptr<integer_object> bl{ self->boxed_long() };
+            g_boxed_long_nonnull.store(bl != nullptr, std::memory_order_relaxed);
+            if (bl) { g_boxed_long_klass = runtime_klass_name(bl->get_instance()); }
+
+            std::unique_ptr<integer_object> bb{ self->boxed_bool() };
+            g_boxed_bool_nonnull.store(bb != nullptr, std::memory_order_relaxed);
+            if (bb) { g_boxed_bool_klass = runtime_klass_name(bb->get_instance()); }
+
+            std::unique_ptr<integer_object> bd{ self->boxed_double() };
+            g_boxed_double_nonnull.store(bd != nullptr, std::memory_order_relaxed);
+            if (bd) { g_boxed_double_klass = runtime_klass_name(bd->get_instance()); }
+        }
+
+        // ── ARG-DRIVEN NULL on a reference (String) arg ────────────────────────
+        // childWhenPresent(key): a non-null String arg -> the stored child; a
+        // null String arg would -> null.  We drive the non-null branch (passing a
+        // real String arg yields a non-null Child) — the reference-arg companion
+        // to pickChild's int-out-of-range null path.
+        {
+            std::unique_ptr<child_object> p{ self->child_when_present(k_string_arg) };
+            g_present_nonnull_when_key.store(p != nullptr, std::memory_order_relaxed);
+            if (p) { g_present_tag.store(p->get_tag(), std::memory_order_relaxed); }
+        }
     }
 
     // The whole body, factored out so the module wrapper can run it under a
@@ -1217,6 +1427,106 @@ namespace
         ctx.check("mco_value_t_double_conversion_same_oop",
                   g_value_t_reuse_same_oop.load(std::memory_order_relaxed));
 
+        // ════════════════ VARIED-ARG-SIGNATURE object returns ══════════════
+        // Every primitive arg WIDTH and reference arg kind drives an
+        // object-returning call(); the returned Child's tag folds the arg, so a
+        // narrowed / dropped / mis-slotted argument is caught by a wrong tag.
+
+        // WIDE long arg (two interpreter slots): both halves survive the pack.
+        ctx.check("mco_arg_long_non_null_wrapper",
+                  g_long_arg_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_arg_long_tag_folds_both_halves",
+                  g_long_arg_tag.load(std::memory_order_relaxed) == k_long_arg_tag);
+
+        // WIDE double arg (two slots).
+        ctx.check("mco_arg_double_non_null_wrapper",
+                  g_double_arg_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_arg_double_tag_correct",
+                  g_double_arg_tag.load(std::memory_order_relaxed) == k_double_arg_tag);
+
+        // String (reference) arg -> object return; arg survives in tag AND label.
+        ctx.check("mco_arg_string_non_null_wrapper",
+                  g_string_arg_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_arg_string_tag_correct",
+                  g_string_arg_tag.load(std::memory_order_relaxed) == k_string_arg_tag);
+        ctx.check("mco_arg_string_label_echoes_arg",
+                  g_string_arg_label_ok.load(std::memory_order_relaxed));
+
+        // float arg (single slot).
+        ctx.check("mco_arg_float_non_null_wrapper",
+                  g_float_arg_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_arg_float_tag_correct",
+                  g_float_arg_tag.load(std::memory_order_relaxed) == k_float_arg_tag);
+
+        // boolean arg: the arg selects the tag (both branches distinguishable).
+        ctx.check("mco_arg_bool_true_non_null_wrapper",
+                  g_bool_true_arg_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_arg_bool_true_tag_correct",
+                  g_bool_true_arg_tag.load(std::memory_order_relaxed) == k_bool_true_tag);
+        ctx.check("mco_arg_bool_false_tag_correct",
+                  g_bool_false_arg_tag.load(std::memory_order_relaxed) == k_bool_false_tag);
+        ctx.check("mco_arg_bool_branches_distinct",
+                  g_bool_true_arg_tag.load(std::memory_order_relaxed)
+                      != g_bool_false_arg_tag.load(std::memory_order_relaxed));
+
+        // MULTI-arg mixed-width signature (int + wide long + String): all three
+        // arguments survive (tag folds every one).
+        ctx.check("mco_arg_many_non_null_wrapper",
+                  g_many_arg_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_arg_many_tag_folds_all_three_args",
+                  g_many_arg_tag.load(std::memory_order_relaxed) == k_many_tag);
+
+        // ════════════════ java.lang.Object BASE return ═════════════════════
+        // Declared Object, runtime Child: the decode is runtime-driven, the oop
+        // is the SAME heap object as the field child, and a field read through
+        // the wrapper works.
+        ctx.check("mco_object_base_return_non_null_wrapper",
+                  g_object_return_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_object_base_return_runtime_klass_is_Child",
+                  ends_with(g_object_return_klass, "MethodObject$Child"));
+        ctx.check("mco_object_base_return_tag_correct",
+                  g_object_return_tag.load(std::memory_order_relaxed) == k_child_tag);
+        ctx.check("mco_object_base_return_same_oop_as_field",
+                  g_object_return_instance.load(std::memory_order_relaxed) != 0
+                  && g_object_return_instance.load(std::memory_order_relaxed)
+                         == g_field_instance.load(std::memory_order_relaxed));
+
+        // ════════════════ ARG RETURNED UNCHANGED (non-Child types) ═════════
+        // echoObject(Object) round-trips the stored child: returned OOP == arg OOP.
+        // (Distinct from the echoChild block above, whose arg is declared Child;
+        // here the param is declared java.lang.Object — a widening reference arg.)
+        ctx.check("mco_echo_objecttype_arg_non_null_wrapper",
+                  g_echo_object_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_echo_objecttype_arg_returns_same_oop",
+                  g_echo_object_same_as_field.load(std::memory_order_relaxed));
+        // echoString(String) round-trips a String arg through the eager-String path.
+        ctx.check("mco_echo_stringtype_arg_returns_same_string",
+                  g_echo_string_ok.load(std::memory_order_relaxed));
+
+        // ════════════════ BOXED-PRIMITIVE VARIETY (Long/Boolean/Double) ═════
+        // Wide / non-int boxes each decode to a non-null wrapper of the matching
+        // boxed klass — the OOP decode is correct beyond Integer.
+        ctx.check("mco_boxed_long_non_null_wrapper",
+                  g_boxed_long_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_boxed_long_runtime_klass_is_Long",
+                  ends_with(g_boxed_long_klass, "Long"));
+        ctx.check("mco_boxed_bool_non_null_wrapper",
+                  g_boxed_bool_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_boxed_bool_runtime_klass_is_Boolean",
+                  ends_with(g_boxed_bool_klass, "Boolean"));
+        ctx.check("mco_boxed_double_non_null_wrapper",
+                  g_boxed_double_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_boxed_double_runtime_klass_is_Double",
+                  ends_with(g_boxed_double_klass, "Double"));
+
+        // ════════════════ ARG-DRIVEN NULL on a reference (String) arg ══════
+        // A non-null String arg -> the stored child (non-null + correct tag);
+        // the reference-arg companion to pickChild's int-out-of-range null.
+        ctx.check("mco_arg_present_string_non_null_wrapper",
+                  g_present_nonnull_when_key.load(std::memory_order_relaxed));
+        ctx.check("mco_arg_present_string_tag_correct",
+                  g_present_tag.load(std::memory_order_relaxed) == k_child_tag);
+
         // ── breadcrumbs (never affect pass/fail) ───────────────────────────
         ctx.record("[INFO] animal runtime klass = " + g_animal_klass
                    + " (declared Animal, decoded Dog); speak() via wrapper = '" + g_animal_speak
@@ -1238,6 +1548,20 @@ namespace
                    + std::to_string(g_samestatic_instance.load(std::memory_order_relaxed))
                    + " staticMakeChild=0x"
                    + std::to_string(g_static_instance.load(std::memory_order_relaxed)));
+        ctx.record("[INFO] varied-arg tags: long="
+                   + std::to_string(g_long_arg_tag.load(std::memory_order_relaxed))
+                   + " double=" + std::to_string(g_double_arg_tag.load(std::memory_order_relaxed))
+                   + " string=" + std::to_string(g_string_arg_tag.load(std::memory_order_relaxed))
+                   + " float=" + std::to_string(g_float_arg_tag.load(std::memory_order_relaxed))
+                   + " bool(t/f)=" + std::to_string(g_bool_true_arg_tag.load(std::memory_order_relaxed))
+                   + "/" + std::to_string(g_bool_false_arg_tag.load(std::memory_order_relaxed))
+                   + " many=" + std::to_string(g_many_arg_tag.load(std::memory_order_relaxed))
+                   + " (expected long=" + std::to_string(k_long_arg_tag)
+                   + " many=" + std::to_string(k_many_tag) + ")");
+        ctx.record("[INFO] object-base return runtime klass = " + g_object_return_klass
+                   + " (declared java.lang.Object, decoded Child)");
+        ctx.record("[INFO] boxed variety runtime klasses: Long=" + g_boxed_long_klass
+                   + " Boolean=" + g_boxed_bool_klass + " Double=" + g_boxed_double_klass);
     }
 }
 

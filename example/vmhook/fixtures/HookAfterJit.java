@@ -56,6 +56,29 @@ public final class HookAfterJit
      *       BEFORE the hook is installed),
      *   4 = call hot() ONCE with HOT_DELTA (post-removal: detour must NOT fire,
      *       original body still runs).
+     *   5 = WARM hotStatic() WARM_CALLS times, NO hook installed yet (drives the
+     *       JIT on a STATIC method so the native side can install after it is hot).
+     *   6 = call hotStatic() ONCE with HOT_DELTA (post-install on a static method:
+     *       detour must fire once, first arg at slot 0, allow-through OR forced).
+     *   7 = WARM both overloads over(int) and over(int,int) WARM_CALLS times,
+     *       NO hook installed yet (so the native side can hook ONE overload on an
+     *       already-hot pair and prove only the selected descriptor is detoured).
+     *   8 = call over(int) ONCE and over(int,int) ONCE with HOT_DELTA-based args
+     *       (post-install: exactly the hooked overload fires; the sibling runs raw).
+     *   9 = run the compiled caller loop callerLoop(CALLER_CALLS): a SEPARATE
+     *       method that repeatedly dispatches hot() so HotSpot can compile the
+     *       CALLER (and inline hot() into it) BEFORE the native install — the
+     *       README "catches direct callers" case.  Records how many times the
+     *       caller body actually executed (callerIterations) so native can compare
+     *       against the detour fire-count to characterise the stale-IC window.
+     *  10 = run callerLoop(CALLER_CALLS) AGAIN (post-install probe for the compiled
+     *       caller: native compares fires-vs-iterations; the deopt sweep is the
+     *       documented fix for stale inline caches).
+     *  11 = call hot() N_REPEAT times in one probe (post-install: the detour must
+     *       fire on EVERY dispatch — proves a hooked method does not silently
+     *       re-JIT past the hook within a probe; native asserts fires == N_REPEAT).
+     *  12 = call hotStatic() N_REPEAT times in one probe (same exact-count contract
+     *       on the static path).
      */
     public static volatile int mode;
 
@@ -70,6 +93,21 @@ public final class HookAfterJit
 
     /** Number of times run() actually invoked hot() in the last probe cycle. */
     public static volatile int hotCallsMade;
+
+    /** Last value the original hotStatic() body computed (allow-through proof). */
+    public static volatile int lastStaticResult;
+
+    /** Last value over(int) returned in the last probe (allow-through proof). */
+    public static volatile int lastOver1Result;
+
+    /** Last value over(int,int) returned in the last probe (allow-through proof). */
+    public static volatile int lastOver2Result;
+
+    /** XOR of every value the compiled caller loop observed (defeats DCE). */
+    public static volatile long callerResultXor;
+
+    /** Number of times the compiled caller loop body actually ran hot(). */
+    public static volatile int callerIterations;
 
     // ---- Constants mirrored on the native side ----------------------------
 
@@ -88,6 +126,30 @@ public final class HookAfterJit
      */
     public static final int WARM_CALLS = 200000;
 
+    /** Base added by the STATIC hookable method; hotStatic(delta) = STATIC_BASE + delta. */
+    public static final int STATIC_BASE = 2000;
+
+    /** Constant the single-int overload over(int) adds; over(a) = a + OVER1_ADD. */
+    public static final int OVER1_ADD = 30;
+
+    /** Constant the two-int overload over(int,int) adds; over(a,b) = a + b + OVER2_ADD. */
+    public static final int OVER2_ADD = 40;
+
+    /**
+     * Iterations of the compiled-caller loop (mode 9 / 10).  Comfortably above the
+     * tiered thresholds so HotSpot compiles callerLoop itself (and is free to
+     * inline hot() into it) BEFORE the native side installs its hook on hot().
+     */
+    public static final int CALLER_CALLS = 200000;
+
+    /**
+     * Repeat count for the "detour fires on EVERY dispatch" probes (mode 11 / 12).
+     * Small and bounded: this runs AFTER the hook is installed, so each iteration
+     * is an interpreter dispatch through the detour; we only need enough to prove
+     * the count is exact, not to re-warm the JIT.
+     */
+    public static final int N_REPEAT = 64;
+
     // ---- Hookable method --------------------------------------------------
 
     /**
@@ -97,6 +159,36 @@ public final class HookAfterJit
     public int hot(final int delta)
     {
         return this.seed + delta;
+    }
+
+    /**
+     * Hookable STATIC method.  Tiny and side-effect-light so HotSpot compiles it
+     * once it goes hot.  Has NO 'this', so its first (and only) argument lives at
+     * interpreter slot 0 — the static-method slot model the native detour relies
+     * on.  Returns STATIC_BASE + delta.
+     */
+    public static int hotStatic(final int delta)
+    {
+        return STATIC_BASE + delta;
+    }
+
+    /**
+     * Single-int overload of over().  Shares the name over with the two-int
+     * overload below; the two are distinguished ONLY by JVM descriptor, so hooking
+     * exactly one of them proves overload selection survives the after-JIT deopt.
+     * Returns a + OVER1_ADD.
+     */
+    public int over(final int a)
+    {
+        return a + OVER1_ADD;
+    }
+
+    /**
+     * Two-int overload of over().  Returns a + b + OVER2_ADD.
+     */
+    public int over(final int a, final int b)
+    {
+        return a + b + OVER2_ADD;
     }
 
     private static void runHotOnce(final int delta)
@@ -131,6 +223,114 @@ public final class HookAfterJit
         hotCallsMade = made;
     }
 
+    private static void runStaticLoop(final int iterations)
+    {
+        int made = 0;
+        long acc = 0;
+        int last = 0;
+        for (int i = 0; i < iterations; ++i)
+        {
+            final int d = i & 0xFF;
+            last = hotStatic(d);
+            acc ^= last;
+            ++made;
+        }
+        lastStaticResult = last;
+        hotResultXor = acc;
+        hotCallsMade = made;
+    }
+
+    private static void runStaticOnce(final int delta)
+    {
+        final int r = hotStatic(delta);
+        lastStaticResult = r;
+        hotResultXor = r;
+        hotCallsMade = 1;
+    }
+
+    private static void runStaticRepeat(final int times)
+    {
+        int made = 0;
+        long acc = 0;
+        int last = 0;
+        for (int i = 0; i < times; ++i)
+        {
+            last = hotStatic(HOT_DELTA);
+            acc ^= last;
+            ++made;
+        }
+        lastStaticResult = last;
+        hotResultXor = acc;
+        hotCallsMade = made;
+    }
+
+    private static void runHotRepeat(final int times)
+    {
+        final HookAfterJit obj = new HookAfterJit();
+        obj.seed = SEED;
+        int made = 0;
+        long acc = 0;
+        int last = 0;
+        for (int i = 0; i < times; ++i)
+        {
+            last = obj.hot(HOT_DELTA);
+            acc ^= last;
+            ++made;
+        }
+        lastHotResult = last;
+        hotResultXor = acc;
+        hotCallsMade = made;
+    }
+
+    private static void runOverloadLoop(final int iterations)
+    {
+        final HookAfterJit obj = new HookAfterJit();
+        obj.seed = SEED;
+        int made = 0;
+        long acc = 0;
+        int r1 = 0;
+        int r2 = 0;
+        for (int i = 0; i < iterations; ++i)
+        {
+            final int a = i & 0xFF;
+            r1 = obj.over(a);
+            r2 = obj.over(a, a);
+            acc ^= (r1 ^ r2);
+            ++made;
+        }
+        lastOver1Result = r1;
+        lastOver2Result = r2;
+        hotResultXor = acc;
+        hotCallsMade = made;
+    }
+
+    private static void runOverloadOnce()
+    {
+        final HookAfterJit obj = new HookAfterJit();
+        obj.seed = SEED;
+        lastOver1Result = obj.over(HOT_DELTA);
+        lastOver2Result = obj.over(HOT_DELTA, HOT_DELTA);
+        hotCallsMade = 2;
+    }
+
+    private static void runCallerLoop(final int iterations)
+    {
+        // A SEPARATE caller body so HotSpot can compile this loop (and is free to
+        // inline hot() into it) independently of hot() itself.  Returns through a
+        // field so the JIT cannot dead-code-eliminate the whole loop.
+        final HookAfterJit obj = new HookAfterJit();
+        obj.seed = SEED;
+        int made = 0;
+        long acc = 0;
+        for (int i = 0; i < iterations; ++i)
+        {
+            acc ^= obj.hot(HOT_DELTA);
+            ++made;
+        }
+        callerResultXor = acc;
+        callerIterations = made;
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -157,6 +357,30 @@ public final class HookAfterJit
                         break;
                     case 4:
                         runHotOnce(HOT_DELTA);
+                        break;
+                    case 5:
+                        runStaticLoop(WARM_CALLS);
+                        break;
+                    case 6:
+                        runStaticOnce(HOT_DELTA);
+                        break;
+                    case 7:
+                        runOverloadLoop(WARM_CALLS);
+                        break;
+                    case 8:
+                        runOverloadOnce();
+                        break;
+                    case 9:
+                        runCallerLoop(CALLER_CALLS);
+                        break;
+                    case 10:
+                        runCallerLoop(CALLER_CALLS);
+                        break;
+                    case 11:
+                        runHotRepeat(N_REPEAT);
+                        break;
+                    case 12:
+                        runStaticRepeat(N_REPEAT);
                         break;
                     default:
                         break;

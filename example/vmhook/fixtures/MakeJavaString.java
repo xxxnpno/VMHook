@@ -203,7 +203,13 @@ public final class MakeJavaString
     //                   a single int proves byte-for-byte content agreement (a
     //                   transposition, a dropped char, or a wrong coder all change it)
     //                   without thousands of witness fields.
-    public static final int NUM_CC = 8;
+    //    Slots 8..9 (batch-14 deepening) carry two more input classes the wide
+    //    battery lacked a Java-visible char-by-char proof for: a COMBINING-MARK
+    //    sequence (base letter + combining diacritic, where the &gt;0xFF combining
+    //    mark forces the UTF16 coder and the grapheme is two code units / one less
+    //    code point than chars) and an RTL / bidi run (Hebrew letters, 2-byte UTF-8,
+    //    also UTF16-coded).  Both prove the made String the JVM walks is char-exact.
+    public static final int NUM_CC = 10;
     public static boolean ccCalled0; public static int ccLen0; public static int ccCp0; public static boolean ccNull0; public static int ccSig0;
     public static boolean ccCalled1; public static int ccLen1; public static int ccCp1; public static boolean ccNull1; public static int ccSig1;
     public static boolean ccCalled2; public static int ccLen2; public static int ccCp2; public static boolean ccNull2; public static int ccSig2;
@@ -212,6 +218,8 @@ public final class MakeJavaString
     public static boolean ccCalled5; public static int ccLen5; public static int ccCp5; public static boolean ccNull5; public static int ccSig5;
     public static boolean ccCalled6; public static int ccLen6; public static int ccCp6; public static boolean ccNull6; public static int ccSig6;
     public static boolean ccCalled7; public static int ccLen7; public static int ccCp7; public static boolean ccNull7; public static int ccSig7;
+    public static boolean ccCalled8; public static int ccLen8; public static int ccCp8; public static boolean ccNull8; public static int ccSig8;
+    public static boolean ccCalled9; public static int ccLen9; public static int ccCp9; public static boolean ccNull9; public static int ccSig9;
 
     // =====================================================================
     //  Hooked methods.
@@ -324,6 +332,8 @@ public final class MakeJavaString
             case 5: ccCalled5 = true; ccLen5 = len; ccCp5 = cp; ccNull5 = isNull; ccSig5 = sig; break;
             case 6: ccCalled6 = true; ccLen6 = len; ccCp6 = cp; ccNull6 = isNull; ccSig6 = sig; break;
             case 7: ccCalled7 = true; ccLen7 = len; ccCp7 = cp; ccNull7 = isNull; ccSig7 = sig; break;
+            case 8: ccCalled8 = true; ccLen8 = len; ccCp8 = cp; ccNull8 = isNull; ccSig8 = sig; break;
+            case 9: ccCalled9 = true; ccLen9 = len; ccCp9 = cp; ccNull9 = isNull; ccSig9 = sig; break;
             default: break;
         }
         return len;

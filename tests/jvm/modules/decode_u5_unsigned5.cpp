@@ -506,6 +506,286 @@ namespace
             }
         }
 
+        // =========================================================== SECTION 8A
+        //  EXHAUSTIVE POSITION-0 CONTINUATION-DIGIT SWEEP.  The 1-byte loop
+        //  (SECTION 1) closes every TERMINATING first byte 1..191.  This closes
+        //  the other half: every CONTINUATION first byte 192..255 (digit b-1 in
+        //  [191,254]), each followed by a terminating second byte 1 (digit 0).
+        //  decode({fb, 1}) must equal (fb - 1) and consume exactly 2 for ALL 64
+        //  continuation first-byte values -- the complete 2-byte first-byte space.
+        // =====================================================================
+        {
+            bool all_value_ok{ true };
+            bool all_consume_ok{ true };
+            for (int fb{ 192 }; fb <= 255; ++fb)
+            {
+                int consumed{ -1 };
+                const std::uint32_t got{ decode_at0(
+                    { static_cast<std::uint8_t>(fb), 1 }, consumed) };
+                // second byte 1 -> digit1 = 0, so value is purely digit0 = fb-1.
+                all_value_ok   = all_value_ok   && (got == static_cast<std::uint32_t>(fb - 1));
+                all_consume_ok = all_consume_ok && (consumed == 2);
+            }
+            ctx.check("pos0_continuation_sweep_all_values_fb_minus_1", all_value_ok);
+            ctx.check("pos0_continuation_sweep_all_consume_two", all_consume_ok);
+        }
+
+        // =========================================================== SECTION 8B
+        //  EXHAUSTIVE MIDDLE-BYTE (POSITION-1) DIGIT SWEEP.  For a 3-byte value
+        //  {192, mid, 1}: digit0 = 191, digit1 = mid-1, digit2 = 0.  Sweep the
+        //  middle byte across BOTH halves of its domain -- terminating digits
+        //  (mid in [1,191], the value ends at 2 bytes) and continuation digits
+        //  (mid in [192,255], the value continues to a 3rd byte).  This pins the
+        //  64^1 weighting and the per-position low/high-byte split at position 1.
+        // =====================================================================
+        {
+            // mid TERMINATES (mid < 192): value = 191 + (mid-1)*64, consumes 2.
+            bool term_ok{ true };
+            for (int mid{ 1 }; mid <= 191; ++mid)
+            {
+                int consumed{ -1 };
+                const std::uint32_t got{ decode_at0(
+                    { 192, static_cast<std::uint8_t>(mid) }, consumed) };
+                const std::uint32_t expect{ 191u
+                    + static_cast<std::uint32_t>(mid - 1) * 64u };
+                term_ok = term_ok && (got == expect) && (consumed == 2);
+            }
+            ctx.check("pos1_terminating_digit_sweep_value_and_consume", term_ok);
+
+            // mid CONTINUES (mid >= 192): {192, mid, 1} -> digit2 = 0, so
+            // value = 191 + (mid-1)*64, consumes 3.
+            bool cont_ok{ true };
+            for (int mid{ 192 }; mid <= 255; ++mid)
+            {
+                int consumed{ -1 };
+                const std::uint32_t got{ decode_at0(
+                    { 192, static_cast<std::uint8_t>(mid), 1 }, consumed) };
+                const std::uint32_t expect{ 191u
+                    + static_cast<std::uint32_t>(mid - 1) * 64u };
+                cont_ok = cont_ok && (got == expect) && (consumed == 3);
+            }
+            ctx.check("pos1_continuation_digit_sweep_value_and_consume", cont_ok);
+
+            // Explicit anchor: the MAX middle continuation digit (254) with a
+            // terminating 3rd byte 2 -> {192,255,2} = 191 + 254*64 + 1*4096.
+            check_decode(ctx, "pos1_max_continuation_192_255_2_is_20543",
+                         { 192, 255, 2 },
+                         191u + 254u * 64u + 1u * 64u * 64u, 3);
+            ctx.check("pos1_max_continuation_expect_is_20543",
+                      (191u + 254u * 64u + 1u * 64u * 64u) == 20543u);
+        }
+
+        // =========================================================== SECTION 8C
+        //  PER-LENGTH EXACT MIN/MAX TABLE for ALL FIVE lengths in one uniform
+        //  sweep.  SECTION 2 covered the 1..4 -> 2..5 roll boundaries; this pins
+        //  the canonical extremes at EVERY length N = 1..5 simultaneously:
+        //    max(N) = {255 * (N-1), 191}   (all continuation digits 254 then a
+        //                                    terminating 190 -- the largest value
+        //                                    expressible in N bytes)
+        //    min(N) = {192 * (N-1), 1}     (the smallest value REQUIRING N bytes;
+        //                                    for N=1 that is {1} == value 0)
+        //  Each asserts decoded value (vs the identity oracle), consumed == N, and
+        //  that encode_ref of that value reproduces the canonical N-byte form.
+        // =====================================================================
+        {
+            const std::uint32_t len_max[]{
+                190u, 12414u, 794750u, 50864254u, 3255312510u };
+            const std::uint32_t len_min[]{
+                0u, 191u, 12415u, 794751u, 50864255u };
+            bool table_ok{ true };
+            for (int n{ 1 }; n <= 5; ++n)
+            {
+                // Build max(N) = (n-1) bytes of 255 then a 191.
+                std::vector<std::uint8_t> max_bytes(
+                    static_cast<std::size_t>(n - 1), 255u);
+                max_bytes.push_back(191u);
+                // Build min(N): for n==1 just {1}; else (n-1) bytes of 192 then 1.
+                std::vector<std::uint8_t> min_bytes{};
+                if (n == 1)
+                {
+                    min_bytes.push_back(1u);
+                }
+                else
+                {
+                    min_bytes.assign(static_cast<std::size_t>(n - 1), 192u);
+                    min_bytes.push_back(1u);
+                }
+
+                int cmax{ -1 };
+                const std::uint32_t gmax{ decode_at0(max_bytes, cmax) };
+                int cmin{ -1 };
+                const std::uint32_t gmin{ decode_at0(min_bytes, cmin) };
+
+                const std::size_t idx{ static_cast<std::size_t>(n - 1) };
+                table_ok = table_ok
+                    // max(N): value, consumed, identity oracle, canonical encoding
+                    && gmax == len_max[idx]
+                    && cmax == n
+                    && identity_ref(max_bytes) == len_max[idx]
+                    && encode_ref(len_max[idx]).size() == static_cast<std::size_t>(n)
+                    // min(N): same four cross-checks
+                    && gmin == len_min[idx]
+                    && cmin == n
+                    && identity_ref(min_bytes) == len_min[idx]
+                    && encode_ref(len_min[idx]).size() == static_cast<std::size_t>(n);
+            }
+            ctx.check("per_length_min_max_table_all_5_lengths", table_ok);
+        }
+
+        // =========================================================== SECTION 8D
+        //  FIRST-BYTE CLASSIFICATION across the ENTIRE 0..255 byte domain.  The
+        //  decoder's branch selection is driven by two comparisons on the first
+        //  byte: `== 0` (End -> rewind, return ~0u, consume 0) and `< 192`
+        //  (terminate -> consume 1) vs `>= 192` (continue -> consume >= 2).  One
+        //  loop pins the three-way split for every possible first byte, so no
+        //  byte value can silently fall into the wrong branch.  (A trailing
+        //  terminator byte 1 lets the continuation cases finish at 2 bytes.)
+        // =====================================================================
+        {
+            bool classify_ok{ true };
+            for (int fb{ 0 }; fb <= 255; ++fb)
+            {
+                int consumed{ -99 };
+                const std::uint32_t got{ decode_at0(
+                    { static_cast<std::uint8_t>(fb), 1 }, consumed) };
+                if (fb == 0)
+                {
+                    // End marker: ~0u, cursor rewound (consume 0).
+                    classify_ok = classify_ok
+                        && got == END_MARK && consumed == 0;
+                }
+                else if (fb < 192)
+                {
+                    // Terminating: value fb-1, consumes exactly 1 (2nd byte
+                    // untouched).
+                    classify_ok = classify_ok
+                        && got == static_cast<std::uint32_t>(fb - 1)
+                        && consumed == 1;
+                }
+                else
+                {
+                    // Continuation: reads the 2nd byte (digit 0) -> value fb-1,
+                    // consumes exactly 2.
+                    classify_ok = classify_ok
+                        && got == static_cast<std::uint32_t>(fb - 1)
+                        && consumed == 2;
+                }
+            }
+            ctx.check("first_byte_classification_0_to_255", classify_ok);
+        }
+
+        // =========================================================== SECTION 8E
+        //  BIT-31-SET HIGH-HALF VALUES (distinct from the all-ones max).  Several
+        //  values whose top bit is set but which are NOT 0xFFFFFFFF, each
+        //  round-tripped through encode_ref -> decode_u5.  Proves the high half of
+        //  the u32 range decodes correctly via normal 5-byte terminating
+        //  sequences (the sign-bit region a signed accumulator would mishandle).
+        // =====================================================================
+        {
+            const std::uint32_t high_vals[]{
+                0x80000000u, 0xC0000000u, 0xDEADBEEFu, 0x7FFFFFFFu,
+                0xABCDEF01u, 0xFFFFFFFEu };
+            bool high_ok{ true };
+            for (const std::uint32_t v : high_vals)
+            {
+                const std::vector<std::uint8_t> enc{ encode_ref(v) };
+                int consumed{ -1 };
+                const std::uint32_t got{ decode_at0(enc, consumed) };
+                high_ok = high_ok
+                    && got == v
+                    && consumed == static_cast<int>(enc.size())
+                    && enc.size() == 5u            // all of these need 5 bytes
+                    && identity_ref(enc) == v;
+            }
+            ctx.check("bit31_high_half_values_roundtrip", high_ok);
+        }
+
+        // =========================================================== SECTION 8F
+        //  TRUNCATED / SHORT-BUFFER BOUNDS SAFETY (the brief's "must not
+        //  over-read").  A non-terminating run of continuation bytes with NO
+        //  terminator and NO trailing zeros, placed in a heap buffer sized to
+        //  EXACTLY the number of bytes the decoder is permitted to touch (at most
+        //  5 -- MAX_LENGTH).  Because the buffer length equals the bytes the
+        //  bounded loop reads, an ASAN / guard-page build would trap on a single
+        //  byte of over-read; a clean run proves the loop's `< 5` cap keeps every
+        //  access in bounds even when the input never presents a low byte.
+        //
+        //  Crash-safe: we allocate EXACTLY `n` bytes for the n-byte cases (n<=5),
+        //  and for the degenerate all-continuation case we allocate exactly 5 (the
+        //  decoder reads no more than 5 regardless of content), so the decoder can
+        //  never step past the allocation.
+        // =====================================================================
+        {
+            bool no_overread_ok{ true };
+            // The all-continuation, no-terminator case: a buffer of EXACTLY 5
+            // bytes of 255.  The bounded `< 5` loop reads precisely 5 bytes and
+            // stops at the MAX_LENGTH cap WITHOUT seeking a 6th -- so a 5-byte
+            // allocation is exactly large enough and not one byte too small.
+            // (Note: an all-255 buffer SHORTER than 5 would make the decoder seek
+            // a further byte -- there is no low byte to terminate on -- so we do
+            // NOT feed a tight <5 all-continuation buffer; the <5 cases below all
+            // terminate within their allocation.)
+            {
+                std::vector<std::uint8_t> cap5(5u, 255u);
+                int pos{ 0 };
+                const std::uint32_t got{ decode(cap5.data(), pos) };
+                no_overread_ok = no_overread_ok
+                    && pos == 5
+                    && got == identity_ref(cap5);
+            }
+            // For n = 1..4: a buffer of exactly n bytes that DOES terminate (last
+            // byte is a low/terminating byte), sized to exactly n so a read of an
+            // (n+1)th byte would be out of bounds.  A correct decoder stops at the
+            // terminator and never touches byte n.
+            for (int n{ 1 }; n <= 4; ++n)
+            {
+                std::vector<std::uint8_t> tight(
+                    static_cast<std::size_t>(n), 255u);  // (n-1) continuations...
+                tight[static_cast<std::size_t>(n - 1)] = 191u;  // ...then terminate
+                int pos{ 0 };
+                const std::uint32_t got{ decode(tight.data(), pos) };
+                no_overread_ok = no_overread_ok
+                    && pos == n
+                    && got == identity_ref(tight);
+            }
+            // A single terminating byte in a 1-byte buffer: the tightest possible
+            // case -- exactly one readable byte, decoder must read exactly it.
+            {
+                std::vector<std::uint8_t> one(1u, 191u);
+                int pos{ 0 };
+                const std::uint32_t got{ decode(one.data(), pos) };
+                no_overread_ok = no_overread_ok && pos == 1 && got == 190u;
+            }
+            ctx.check("truncated_buffer_no_overread_bounded_read", no_overread_ok);
+        }
+
+        // =========================================================== SECTION 8G
+        //  MID-BUFFER TRUNCATION (the caller's real over-read shape).  In
+        //  find_field_in_stream the cursor is threaded through ONE Array<u1>; a
+        //  corrupt record could leave the cursor near the tail with a value that
+        //  is itself a clean terminating sequence sitting flush against the end.
+        //  Pin that a value placed at the VERY END of an exactly-sized buffer
+        //  decodes correctly and parks the cursor exactly at buffer end (no read
+        //  past the final byte).  Covers each length 1..5.
+        // =====================================================================
+        {
+            bool flush_ok{ true };
+            const std::uint32_t vals[]{ 0u, 190u, 191u, 12415u, 50864255u };
+            for (const std::uint32_t v : vals)
+            {
+                const std::vector<std::uint8_t> enc{ encode_ref(v) };
+                // Buffer is EXACTLY the encoded value, no padding: the decode must
+                // finish on the last byte and leave pos == enc.size().
+                std::vector<std::uint8_t> exact{ enc };
+                int pos{ 0 };
+                const std::uint32_t got{ decode(exact.data(), pos) };
+                flush_ok = flush_ok
+                    && got == v
+                    && pos == static_cast<int>(enc.size());
+            }
+            ctx.check("value_flush_against_buffer_end_no_overread", flush_ok);
+        }
+
         // ============================================================ SECTION 9
         //  SEQUENTIAL PACKED VALUES through one cursor.  Two angles:
         //   (a) the brief's threading example {65,192,1,3} -> 64, 191, 2 with the
