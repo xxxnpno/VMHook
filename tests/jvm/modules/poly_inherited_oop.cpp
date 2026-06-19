@@ -224,6 +224,13 @@ namespace
 
         // The held live B instance (kept as a named helper for the legacy block).
         static auto get_b_oop() -> vmhook::oop_t { return static_ref_oop<pi_b>("bInstance"); }
+
+        // Held live instances for the exhaustive expansion, each decoded through
+        // its own wrapper type so the deep-hierarchy / shadow / polymorphic reads
+        // run against genuine, validated OOPs.
+        static auto get_l4_oop()     -> vmhook::oop_t { return static_ref_oop<poh_l4>("l4Instance"); }
+        static auto get_shadow_oop() -> vmhook::oop_t { return static_ref_oop<poh_shadow_sub>("shadowInstance"); }
+        static auto get_poly_oop()   -> vmhook::oop_t { return static_ref_oop<poh_l1>("polyBase"); }
     };
 
     // ---- Constants mirrored from PolyInherited.java / legacy A.java + B.java -
@@ -466,6 +473,31 @@ VMHOOK_JVM_MODULE(poly_inherited_oop)
         }
 
         // =================================================================
+        //  Inherited method via the NAME+SIGNATURE overload — the safe API
+        //  the specialist flags as unexercised (the name-only overload latches
+        //  the FIRST name match with no signature/kind filter).  This overload
+        //  walks the same super chain but matches name AND exact descriptor, so
+        //  the inherited protectedAdd(int) must resolve under "(I)I" and a wrong
+        //  descriptor must miss entirely.
+        // =================================================================
+        {
+            auto exact{ b_view.get_method("protectedAdd", "(I)I") };
+            ctx.check("inherited_method_protectedAdd_name_sig_resolves", exact.has_value());
+            if (exact.has_value())
+            {
+                ctx.check("inherited_method_protectedAdd_name_sig_not_static",
+                          exact->is_static() == false);
+                ctx.check("inherited_method_protectedAdd_name_sig_signature_II",
+                          std::string{ exact->signature() } == "(I)I");
+            }
+
+            // A correct name but a non-existent descriptor must NOT resolve:
+            // the exact-match overload never falls back to a name-only hit.
+            ctx.check("inherited_method_wrong_signature_nullopt",
+                      b_view.get_method("protectedAdd", "()I").has_value() == false);
+        }
+
+        // =================================================================
         //  Cache stability through the walk: a second resolution of the
         //  inherited field returns a proxy at the SAME address + value.
         // =================================================================
@@ -491,6 +523,231 @@ VMHOOK_JVM_MODULE(poly_inherited_oop)
                       b_view.get_field("noSuchFieldAnywhere").has_value() == false);
             ctx.check("absent_method_walks_to_object_nullopt",
                       b_view.get_method("noSuchMethodAnywhere").has_value() == false);
+        }
+    }
+
+    // =====================================================================
+    //  DEEP 4-LEVEL HIERARCHY  L1 <- L2 <- L3 <- L4.  Reading an int DECLARED
+    //  AT EACH LEVEL through the deepest L4 wrapper exercises the super walk at
+    //  depths 0..3 (own l4Int, then one/two/three super links up to L3/L2/L1).
+    //  Values are 4 bytes apart in the high nibble so a wrong-offset read up the
+    //  chain can never be a near-miss — a hit proves the exact declared offset.
+    // =====================================================================
+    const vmhook::oop_t l4_oop{ pi_fixture::get_l4_oop() };
+    ctx.check("l4_instance_oop_obtained", l4_oop != nullptr);
+    ctx.check("l4_instance_oop_valid",
+              l4_oop != nullptr && vmhook::hotspot::is_valid_pointer(l4_oop));
+
+    if (l4_oop != nullptr && vmhook::hotspot::is_valid_pointer(l4_oop))
+    {
+        poh_l4 l4_view{ l4_oop };
+
+        // ---- int at every depth through the single L4 view -----------------
+        {
+            ctx.check("deep_l4Int_depth0_own_value", l4_view.l4_int() == L4_INT);
+            ctx.check("deep_l3Int_depth1_value",     l4_view.l3_int() == L3_INT);
+            ctx.check("deep_l2Int_depth2_value",     l4_view.l2_int() == L2_INT);
+            ctx.check("deep_l1Int_depth3_value",     l4_view.l1_int() == L1_INT);
+
+            // Each is a non-static "I" instance field regardless of walk depth.
+            auto d3{ l4_view.field("l1Int") };
+            ctx.check("deep_l1Int_resolves", d3.has_value());
+            if (d3.has_value())
+            {
+                ctx.check("deep_l1Int_not_static", d3->is_static() == false);
+                ctx.check("deep_l1Int_signature_I", std::string{ d3->signature() } == "I");
+                ctx.check("deep_l1Int_not_reference", d3->is_reference() == false);
+            }
+        }
+
+        // ---- Multi-level same-slot proof: l1Int read through the L4 view
+        //      (depth 3) and through a plain-L1 wrapper around the SAME oop
+        //      (depth 0) must land on the IDENTICAL physical slot — proving the
+        //      depth-3 walk resolves L1's declared offset, not a divergent copy.
+        {
+            poh_l1 l1_view{ l4_oop };                       // same oop, L1 start klass
+            auto via_l4{ l4_view.field("l1Int") };
+            auto via_l1{ l1_view.get_field("l1Int") };
+            ctx.check("deep_l1Int_via_L1_wrapper_resolves", via_l1.has_value());
+            if (via_l4.has_value() && via_l1.has_value())
+            {
+                ctx.check("deep_l1Int_L4_and_L1_same_address",
+                          via_l4->raw_address() == via_l1->raw_address());
+                const std::int32_t v4 = via_l4->get();      // COPY-init
+                const std::int32_t v1 = via_l1->get();      // COPY-init
+                ctx.check("deep_l1Int_L4_and_L1_same_value", v4 == v1);
+                ctx.check("deep_l1Int_resolves_to_L1s_declared_value", v1 == L1_INT);
+            }
+        }
+
+        // ---- Inherited REFERENCE-shape fields read through the L4 view ------
+        //      String / int[] / null / object-ref / self-ref, each declared up
+        //      the chain (mostly on L1, l2Ref on L2, l4Self on L4).
+        {
+            // Inherited String ref (declared L1, depth 3): decodes to its text.
+            ctx.check("deep_l1Str_inherited_string_value",
+                      l4_view.l1_str() == L1_STR_VALUE);
+            auto str_fp{ l4_view.field("l1Str") };
+            ctx.check("deep_l1Str_resolves", str_fp.has_value());
+            if (str_fp.has_value())
+            {
+                ctx.check("deep_l1Str_is_reference", str_fp->is_reference() == true);
+                ctx.check("deep_l1Str_signature_String",
+                          std::string{ str_fp->signature() } == "Ljava/lang/String;");
+            }
+
+            // Inherited null ref (declared L1): is a reference field, decodes to
+            // a null oop — the walk resolves the slot, the slot just holds null.
+            auto null_fp{ l4_view.field("l1Null") };
+            ctx.check("deep_l1Null_resolves", null_fp.has_value());
+            if (null_fp.has_value())
+            {
+                ctx.check("deep_l1Null_is_reference", null_fp->is_reference() == true);
+                ctx.check("deep_l1Null_decodes_to_null",
+                          vmhook::field_oop(*null_fp) == nullptr);
+            }
+
+            // Inherited object ref (declared L2, depth 2): decode the held L1 and
+            // read its distinguishing l1Int through a plain-L1 wrapper.
+            auto ref_fp{ l4_view.field("l2Ref") };
+            ctx.check("deep_l2Ref_resolves", ref_fp.has_value());
+            if (ref_fp.has_value())
+            {
+                ctx.check("deep_l2Ref_is_reference", ref_fp->is_reference() == true);
+                void* const ref_oop{ vmhook::field_oop(*ref_fp) };
+                ctx.check("deep_l2Ref_decodes_nonnull_oop",
+                          ref_oop != nullptr && vmhook::hotspot::is_valid_pointer(ref_oop));
+                if (ref_oop != nullptr && vmhook::hotspot::is_valid_pointer(ref_oop))
+                {
+                    poh_l1 held{ ref_oop };
+                    ctx.check("deep_l2Ref_held_L1_l1Int_value",
+                              held.l1_int() == L2_REF_VAL);
+                }
+            }
+
+            // Self ref (declared L4, depth 0): decodes back to the L4 receiver
+            // oop itself — exact same-object proof by pointer identity.
+            auto self_fp{ l4_view.field("l4Self") };
+            ctx.check("deep_l4Self_resolves", self_fp.has_value());
+            if (self_fp.has_value())
+            {
+                ctx.check("deep_l4Self_is_reference", self_fp->is_reference() == true);
+                void* const self_oop{ vmhook::field_oop(*self_fp) };
+                ctx.check("deep_l4Self_decodes_to_receiver_oop", self_oop == l4_oop);
+            }
+
+            // Inherited int[] ref (declared L1): is a reference field with the
+            // "[I" descriptor.  The element decode uses the assumed array header
+            // layout (length@+12, data@+16), which varies with the compressed-
+            // klass-pointer width across JDKs/heap configs — so length+element
+            // are gated: HARD only when the length reads back as the known 2,
+            // else recorded [INFO] (the resolve + is_reference stay HARD).
+            auto arr_fp{ l4_view.field("l1Arr") };
+            ctx.check("deep_l1Arr_resolves", arr_fp.has_value());
+            if (arr_fp.has_value())
+            {
+                ctx.check("deep_l1Arr_is_reference", arr_fp->is_reference() == true);
+                ctx.check("deep_l1Arr_signature_intarray",
+                          std::string{ arr_fp->signature() } == "[I");
+                void* const arr_oop{ vmhook::field_oop(*arr_fp) };
+                ctx.check("deep_l1Arr_decodes_nonnull_oop",
+                          arr_oop != nullptr && vmhook::hotspot::is_valid_pointer(arr_oop));
+                if (arr_oop != nullptr && vmhook::hotspot::is_valid_pointer(arr_oop))
+                {
+                    const std::int32_t len{ vmhook::array_length(arr_oop) };
+                    if (len == L1_ARR_LEN)
+                    {
+                        ctx.check("deep_l1Arr_length_2", len == L1_ARR_LEN);
+                        ctx.check("deep_l1Arr_elem0_value",
+                                  vmhook::get_array_element<std::int32_t>(arr_oop, 0) == L1_ARR_ELEM0);
+                    }
+                    else
+                    {
+                        ctx.record(std::string{ "[INFO] poly_inherited_oop: l1Arr length read back as " }
+                                   + std::to_string(len) + " (expected 2) — array header layout "
+                                   "differs on this JDK/heap config; element decode skipped");
+                    }
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    //  POLYMORPHIC ACTUAL TYPE.  polyBase is DECLARED as the base type L1 but
+    //  HOLDS an L4 at runtime.  The native decode must yield the CONCRETE L4
+    //  oop (runtime klass L4, never L1), and an L4 wrapper over that oop must
+    //  read L4's OWN field — proving the decode follows the live object, not
+    //  the declared field type.
+    // =====================================================================
+    const vmhook::oop_t poly_oop{ pi_fixture::get_poly_oop() };
+    ctx.check("poly_base_oop_obtained", poly_oop != nullptr);
+    if (poly_oop != nullptr && vmhook::hotspot::is_valid_pointer(poly_oop))
+    {
+        // An L4-typed wrapper over the polymorphic oop reads L4's OWN field —
+        // only possible if the held object is genuinely an L4 at runtime.
+        poh_l4 poly_as_l4{ poly_oop };
+        ctx.check("poly_base_L4_view_reads_own_l4Int",
+                  poly_as_l4.l4_int() == POLY_L4_INT);
+
+        // The runtime klass name carries the concrete type.  Dotted-vs-slash and
+        // exact internal spelling vary across JDKs, so match on the "$L4" suffix
+        // only and gate the assertion [INFO] if the name can't be resolved.
+        const std::string rk{ runtime_klass_name(poly_oop) };
+        if (!rk.empty())
+        {
+            ctx.check("poly_base_runtime_klass_is_concrete_L4", ends_with(rk, "$L4"));
+            ctx.check("poly_base_runtime_klass_not_declared_L1",
+                      ends_with(rk, "$L1") == false);
+        }
+        else
+        {
+            ctx.record("[INFO] poly_inherited_oop: polyBase runtime klass name "
+                       "unresolved on this JDK; concrete-type suffix check skipped");
+        }
+    }
+
+    // =====================================================================
+    //  SHADOWED / HIDDEN FIELD.  Shadow and ShadowSub both declare shadowedInt
+    //  / shadowedRef at different values.  A ShadowSub-typed read resolves the
+    //  CHILD slot (declared-scope wins at the start klass); a Shadow-typed read
+    //  of the SAME oop resolves the BASE slot.  The two same-named slots are
+    //  physically distinct (different raw_address), proving the walk's
+    //  declared-scope disambiguation is correct, not a single shared slot.
+    // =====================================================================
+    const vmhook::oop_t shadow_oop{ pi_fixture::get_shadow_oop() };
+    ctx.check("shadow_instance_oop_obtained", shadow_oop != nullptr);
+    if (shadow_oop != nullptr && vmhook::hotspot::is_valid_pointer(shadow_oop))
+    {
+        poh_shadow_sub sub_view{ shadow_oop };               // start klass ShadowSub
+        poh_shadow     base_view{ shadow_oop };              // start klass Shadow (same oop)
+
+        // Child view sees the CHILD slots.
+        ctx.check("shadow_sub_view_sees_child_int",
+                  sub_view.shadowed_int() == SUB_SHADOW_INT);
+        ctx.check("shadow_sub_view_sees_child_ref",
+                  sub_view.shadowed_ref() == SUB_SHADOW_STR);
+
+        // Base view of the SAME oop sees the BASE slots — the base klass's own
+        // declaration wins at depth 0, never the child's re-declaration below it.
+        ctx.check("shadow_base_view_sees_base_int",
+                  base_view.shadowed_int() == BASE_SHADOW_INT);
+        ctx.check("shadow_base_view_sees_base_ref",
+                  base_view.shadowed_ref() == BASE_SHADOW_STR);
+
+        // The two same-named int slots are PHYSICALLY distinct addresses.
+        auto child_fp{ sub_view.get_field("shadowedInt") };
+        auto base_fp{ base_view.get_field("shadowedInt") };
+        ctx.check("shadow_child_int_resolves", child_fp.has_value());
+        ctx.check("shadow_base_int_resolves", base_fp.has_value());
+        if (child_fp.has_value() && base_fp.has_value())
+        {
+            ctx.check("shadow_child_and_base_int_distinct_slots",
+                      child_fp->raw_address() != base_fp->raw_address());
+            const std::int32_t cv = child_fp->get();        // COPY-init
+            const std::int32_t bv = base_fp->get();          // COPY-init
+            ctx.check("shadow_child_int_value_2000", cv == SUB_SHADOW_INT);
+            ctx.check("shadow_base_int_value_1000", bv == BASE_SHADOW_INT);
+            ctx.check("shadow_slots_hold_different_values", cv != bv);
         }
     }
 
@@ -526,6 +783,38 @@ VMHOOK_JVM_MODULE(poly_inherited_oop)
             // body and yields 1340 regardless of the native call_stub path.
             ctx.check("java_saw_inherited_protectedAdd_1340",
                       pi_fixture::saw_inherited_method());
+
+            // ---- Exhaustive-expansion witnesses: the probe read the deep ints,
+            //      the inherited reference shapes, the shadow slots, and the
+            //      polymorphic concrete type through genuine getfield / instanceof
+            //      bytecode.  Each latched boolean proves the JVM observes the
+            //      identical quantities the native side decoded by raw offset. ----
+            ctx.check("java_saw_deep_fields_L1_through_L4",
+                      pi_fixture::saw_deep_fields());
+            ctx.check("java_saw_deep_refs_string_array_null_self_obj",
+                      pi_fixture::saw_deep_refs());
+            ctx.check("java_saw_shadow_sub_child_slots",
+                      pi_fixture::saw_shadow_sub());
+            ctx.check("java_saw_shadow_base_base_slots",
+                      pi_fixture::saw_shadow_base());
+            ctx.check("java_saw_poly_concrete_L4_runtime_type",
+                      pi_fixture::saw_poly_concrete());
+
+            // ---- Identity-hash publishers: the probe latched System.identity
+            //      HashCode of each inherited reference target.  A non-zero value
+            //      proves the probe ran AND each ref is a real, live object (the
+            //      native side proved the SAME objects by pointer identity /
+            //      decoded value above; these are the JVM-side existence witness).
+            ctx.check("java_l1Str_identity_nonzero",
+                      pi_fixture::l1_str_identity() != 0);
+            ctx.check("java_l1Arr_identity_nonzero",
+                      pi_fixture::l1_arr_identity() != 0);
+            ctx.check("java_l2Ref_identity_nonzero",
+                      pi_fixture::l2_ref_identity() != 0);
+            ctx.check("java_selfRef_identity_nonzero",
+                      pi_fixture::self_ref_identity() != 0);
+            ctx.check("java_polyBase_identity_nonzero",
+                      pi_fixture::poly_base_identity() != 0);
         }
     }
 

@@ -137,6 +137,14 @@ public final class CollIterSafety
     /** Length of the Object[] used for get_array_element bounds. */
     public static final int OBJ_ARR_LEN = 4;
 
+    /** Single-element containers exercise the empty->populated dispatch seam. */
+    public static final int SINGLE_ELEM_ID = 42;
+
+    /** Big HashSet / big TreeSet / big TreeMap size for the bucket/tree heavy
+     *  walk no-duplicate-key canary (their guard caps are 1&lt;&lt;20 / 1&lt;&lt;24).
+     *  Kept well under BIG so the extra heap is modest (#38 GC-safepoint lever). */
+    public static final int BIG_MAP = 1500;
+
     // ── EMPTY containers (every walk on these must return empty) ────────────
     public static List<Elem>        emptyArrayList     = new ArrayList<Elem>();
     public static List<Elem>        emptyLinkedList    = new LinkedList<Elem>();
@@ -173,6 +181,33 @@ public final class CollIterSafety
 
     // ── ROBUSTNESS: a declared-but-null collection field ────────────────────
     public static Set<Elem> nullSet = null;
+    public static Map<Elem, Elem> nullMap = null;
+    public static List<Elem> nullList = null;
+
+    // ── SINGLE-ELEMENT containers (empty->populated dispatch seam) ──────────
+    public static List<Elem>      singleArrayList     = new ArrayList<Elem>();
+    public static List<Elem>      singleLinkedList    = new LinkedList<Elem>();
+    public static Set<Elem>       singleHashSet       = new HashSet<Elem>();
+    public static Set<Elem>       singleTreeSet       = new TreeSet<Elem>();
+    public static Map<Elem, Elem> singleHashMap       = new HashMap<Elem, Elem>();
+    public static Map<Elem, Elem> singleTreeMap       = new TreeMap<Elem, Elem>();
+
+    // ── IMMUTABLE / WRAPPER degenerate shapes (Collections.* factories) ─────
+    /** Collections.singletonList: a one-element List with NO elementData/size
+     *  ArrayList layout — exercises the generic get(int) fallback path. */
+    public static List<Elem>      singletonList       = Collections.emptyList();
+    /** Collections.emptyList(): a degenerate empty List (its own EmptyList
+     *  class) — every walk must return empty without crashing. */
+    public static List<Elem>      collectionsEmptyList = Collections.emptyList();
+    /** Collections.unmodifiableList wrapping an ArrayList — the wrapper holds
+     *  the real list in a field; the walk must not crash on the wrapper. */
+    public static List<Elem>      unmodifiableList    = Collections.emptyList();
+
+    // ── BIG HashSet / TreeSet / TreeMap (heavy bucket/tree walk canaries) ────
+    public static Set<Elem>       bigHashSet          = new HashSet<Elem>();
+    public static Set<Elem>       bigTreeSet          = new TreeSet<Elem>();
+    public static Map<Elem, Elem> bigTreeMap          = new TreeMap<Elem, Elem>();
+    public static Map<Elem, Elem> bigHashMap          = new HashMap<Elem, Elem>();
 
     // ── Raw arrays for get_array_element bounds clamping ─────────────────────
     public static int[]    intArr = new int[INT_ARR_LEN];
@@ -199,6 +234,21 @@ public final class CollIterSafety
     public static volatile int outOfOrderTreeMapSize;
     public static volatile int outOfOrderTreeSetSize;
     public static volatile int setFromHashMapSize;
+
+    public static volatile int singleArrayListSize;
+    public static volatile int singleLinkedListSize;
+    public static volatile int singleHashSetSize;
+    public static volatile int singleTreeSetSize;
+    public static volatile int singleHashMapSize;
+    public static volatile int singleTreeMapSize;
+    public static volatile int singletonListSize;
+    public static volatile int collectionsEmptyListSize;
+    public static volatile int unmodifiableListSize;
+
+    public static volatile int bigHashSetSize;
+    public static volatile int bigTreeSetSize;
+    public static volatile int bigTreeMapSize;
+    public static volatile int bigHashMapSize;
 
     /** True iff at least one bin treeified in collideHashMap (red-black bin). */
     public static volatile boolean collideMapHasTreeBin;
@@ -298,7 +348,50 @@ public final class CollIterSafety
             setFromHashMap.add(new Elem(300 + i));
         }
 
+        // Single-element containers: the seam between empty (n<=0 short-circuit)
+        // and a populated walk.  One Elem id SINGLE_ELEM_ID in each.
+        singleArrayList  = new ArrayList<Elem>();
+        singleLinkedList = new LinkedList<Elem>();
+        singleHashSet    = new HashSet<Elem>();
+        singleTreeSet    = new TreeSet<Elem>();
+        singleHashMap    = new HashMap<Elem, Elem>();
+        singleTreeMap    = new TreeMap<Elem, Elem>();
+        singleArrayList.add(new Elem(SINGLE_ELEM_ID));
+        singleLinkedList.add(new Elem(SINGLE_ELEM_ID));
+        singleHashSet.add(new Elem(SINGLE_ELEM_ID));
+        singleTreeSet.add(new Elem(SINGLE_ELEM_ID));
+        singleHashMap.put(new Elem(SINGLE_ELEM_ID), new Elem(SINGLE_ELEM_ID));
+        singleTreeMap.put(new Elem(SINGLE_ELEM_ID), new Elem(SINGLE_ELEM_ID));
+
+        // Immutable / wrapper degenerate List shapes.  singletonList has a
+        // one-element non-ArrayList layout (generic get(int) fallback path);
+        // emptyList is a degenerate empty List of its own class; the
+        // unmodifiable wrapper holds the real ArrayList in a field.
+        {
+            final List<Elem> oneArr = new ArrayList<Elem>();
+            oneArr.add(new Elem(SINGLE_ELEM_ID));
+            singletonList        = Collections.singletonList(new Elem(SINGLE_ELEM_ID));
+            collectionsEmptyList = Collections.emptyList();
+            unmodifiableList     = Collections.unmodifiableList(oneArr);
+        }
+
+        // Big HashSet / TreeSet / TreeMap: heavy bucket/tree walks for the
+        // no-duplicate-key canary (each helper has its own guard cap).
+        bigHashSet = new HashSet<Elem>();
+        bigTreeSet = new TreeSet<Elem>();
+        bigTreeMap = new TreeMap<Elem, Elem>();
+        bigHashMap = new HashMap<Elem, Elem>();
+        for (int i = 0; i < BIG_MAP; ++i)
+        {
+            bigHashSet.add(new Elem(i));
+            bigTreeSet.add(new Elem(i));
+            bigTreeMap.put(new Elem(i), new Elem(i));
+            bigHashMap.put(new Elem(i), new Elem(i));
+        }
+
         nullSet = null;
+        nullMap = null;
+        nullList = null;
 
         // Raw arrays with known sentinel values for the bounds test.
         intArr = new int[INT_ARR_LEN];
@@ -333,6 +426,21 @@ public final class CollIterSafety
         outOfOrderTreeMapSize  = outOfOrderTreeMap.size();
         outOfOrderTreeSetSize  = outOfOrderTreeSet.size();
         setFromHashMapSize     = setFromHashMap.size();
+
+        singleArrayListSize      = singleArrayList.size();
+        singleLinkedListSize     = singleLinkedList.size();
+        singleHashSetSize        = singleHashSet.size();
+        singleTreeSetSize        = singleTreeSet.size();
+        singleHashMapSize        = singleHashMap.size();
+        singleTreeMapSize        = singleTreeMap.size();
+        singletonListSize        = singletonList.size();
+        collectionsEmptyListSize = collectionsEmptyList.size();
+        unmodifiableListSize     = unmodifiableList.size();
+
+        bigHashSetSize           = bigHashSet.size();
+        bigTreeSetSize           = bigTreeSet.size();
+        bigTreeMapSize           = bigTreeMap.size();
+        bigHashMapSize           = bigHashMap.size();
     }
 
     /**

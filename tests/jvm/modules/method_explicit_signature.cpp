@@ -225,6 +225,8 @@ namespace
     {
         bool        resolved{ false };
         std::string sig_text{};      // proxy->signature()
+        std::string name_text{};     // proxy->name()  (orthogonal latched-Method* proof)
+        bool        is_static{ false };  // proxy->is_static() (JVM_ACC_STATIC truth)
         bool        is_void{ false };
         bool        is_string{ false };
         std::int64_t ival{ 0 };      // numeric result (int/long/byte/short/char/bool)
@@ -247,6 +249,28 @@ namespace
         return (it != g_res.end()) ? it->second : probe_result{};
     }
 
+    // Snapshot helpers: store a single canonical scalar/string under `key` so the
+    // body can read the value AS IT WAS at the snapshot point, independent of any
+    // later (intentional) re-dispatch that overwrites the live Java field.
+    auto put_ival(const std::string& key, std::int64_t v) -> void
+    {
+        probe_result r{};
+        r.ival = v;
+        put(key, r);
+    }
+    auto put_dval(const std::string& key, double v) -> void
+    {
+        probe_result r{};
+        r.dval = v;
+        put(key, r);
+    }
+    auto put_sval(const std::string& key, const std::string& v) -> void
+    {
+        probe_result r{};
+        r.sval = v;
+        put(key, r);
+    }
+
     // --- helpers that resolve by EXACT signature and capture the proxy state --
 
     // Instance, numeric result.
@@ -261,6 +285,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call() };
             r.is_void   = v.is_void();
             r.is_string = v.is_string();
@@ -282,6 +308,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(v);
@@ -302,6 +330,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a, b) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(v);
@@ -322,6 +352,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(v);
@@ -342,6 +374,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void   = v.is_void();
             r.is_string = v.is_string();
@@ -363,6 +397,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a, n) };
             r.is_void   = v.is_void();
             r.is_string = v.is_string();
@@ -383,6 +419,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call() };
             r.is_void   = v.is_void();
             r.is_string = v.is_string();
@@ -403,6 +441,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void = v.is_void();
             r.dval    = static_cast<double>(static_cast<float>(v));
@@ -423,6 +463,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void = v.is_void();
             r.dval    = static_cast<double>(v);
@@ -443,6 +485,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(static_cast<bool>(v) ? 1 : 0);
@@ -463,6 +507,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(v);
@@ -483,6 +529,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(v);
@@ -503,6 +551,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(v);
@@ -524,6 +574,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a, b, c, d) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(v);
@@ -547,6 +599,8 @@ namespace
         if (proxy.has_value())
         {
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
         }
         put(key, r);
     }
@@ -566,6 +620,8 @@ namespace
         if (proxy.has_value())
         {
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
         }
         put(key, r);
     }
@@ -586,6 +642,8 @@ namespace
         if (proxy.has_value())
         {
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(v);
@@ -605,6 +663,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(v);
@@ -624,6 +684,8 @@ namespace
         {
             r.resolved = true;
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
             const vmhook::method_proxy::value_t v{ proxy->call(a) };
             r.is_void   = v.is_void();
             r.is_string = v.is_string();
@@ -644,6 +706,8 @@ namespace
         if (proxy.has_value())
         {
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
         }
         put(key, r);
     }
@@ -659,6 +723,8 @@ namespace
         if (proxy.has_value())
         {
             r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
         }
         put(key, r);
     }
@@ -862,6 +928,120 @@ namespace
         // ============================================================
         cap_name_only(s, "nameonly_process", "process");
         cap_name_only_call_i(s, "nameonly_process_call_i", "process", PROC_I_ARG);
+
+        // ----------------------------------------------------------------
+        //  SNAPSHOT the canonical exactly-once side-effect state HERE, before
+        //  the boundary block below re-dispatches several overloads with extreme
+        //  args (which would overwrite last-write-wins fields and bump counters).
+        //  The body's "exactly-once / canonical value" isolation checks read this
+        //  snapshot, so they stay valid regardless of the extra boundary calls.
+        // ----------------------------------------------------------------
+        {
+            put_ival("snap_proc_I_arg",  method_explicit_sig::procIntArg());
+            put_ival("snap_proc_II_a",   method_explicit_sig::procIntIntA());
+            put_ival("snap_proc_II_b",   method_explicit_sig::procIntIntB());
+            put_ival("snap_proc_J",      method_explicit_sig::procLongArg());
+            put_sval("snap_proc_str",    method_explicit_sig::procStrArg());
+            put_ival("snap_smap_i_hits", method_explicit_sig::smapIntHits());
+            put_ival("snap_shape_B",     method_explicit_sig_counters::shapeByteSeen());
+            put_ival("snap_shape_S",     method_explicit_sig_counters::shapeShortSeen());
+            put_ival("snap_shape_C",     method_explicit_sig_counters::shapeCharSeen());
+            put_ival("snap_shape_Z",     method_explicit_sig_counters::shapeBoolSeen());
+            put_dval("snap_shape_F",     static_cast<double>(method_explicit_sig_counters::shapeFloatSeen()));
+            put_dval("snap_shape_D",     method_explicit_sig_counters::shapeDoubleSeen());
+        }
+
+        // ============================================================
+        //  BOUNDARY / DEGENERATE ARGUMENT VALUES through the exact-selected
+        //  overload.  The selection is descriptor-exact; here we prove the
+        //  end-to-end dispatch survives the FULL value range of each primitive
+        //  descriptor (min/max/zero/negative/special-float), not just the small
+        //  positive constants the family above used.  Each probe re-selects the
+        //  SAME overload by the SAME exact signature, just with an extreme arg.
+        // ============================================================
+        // process(I)I with INT_MIN / INT_MAX (the +1 transform overflows by Java
+        // 2's-complement wrap, which is well-defined: INT_MAX+1 == INT_MIN).
+        cap_inst_num_i (s, "bnd_proc_I_min",  "process", SIG_PROC_I,  -2147483647 - 1);
+        cap_inst_num_i (s, "bnd_proc_I_max",  "process", SIG_PROC_I,  2147483647);
+        cap_inst_num_i (s, "bnd_proc_I_zero", "process", SIG_PROC_I,  0);
+        cap_inst_num_i (s, "bnd_proc_I_neg",  "process", SIG_PROC_I,  -1);
+        // process(J)J with LONG_MIN / LONG_MAX (transform +1000, wraps cleanly).
+        cap_inst_num_j (s, "bnd_proc_J_min",  "process", SIG_PROC_J,  (-9223372036854775807LL - 1));
+        cap_inst_num_j (s, "bnd_proc_J_max",  "process", SIG_PROC_J,  9223372036854775807LL);
+        // process(II)I with negatives and a*100 overflow at the boundary.
+        cap_inst_num_ii(s, "bnd_proc_II_neg", "process", SIG_PROC_II, -7, -3);
+        // process(String)String with the EMPTY string and with a long string.
+        cap_inst_str_s (s, "bnd_proc_S_empty", "process", SIG_PROC_S, std::string{});
+        cap_inst_str_s (s, "bnd_proc_S_long",  "process", SIG_PROC_S,
+                        std::string{ "abcdefghijklmnopqrstuvwxyz0123456789" });
+        // shapes(B)B with BYTE_MIN/MAX (the *2 transform wraps in the byte range).
+        cap_inst_byte_b (s, "bnd_shape_B_min", "shapes", SIG_SHAPE_B, static_cast<std::int8_t>(-128));
+        cap_inst_byte_b (s, "bnd_shape_B_max", "shapes", SIG_SHAPE_B, static_cast<std::int8_t>(127));
+        // shapes(S)S with SHORT_MIN/MAX (the *3 transform wraps in the short range).
+        cap_inst_short_s(s, "bnd_shape_S_min", "shapes", SIG_SHAPE_S, static_cast<std::int16_t>(-32768));
+        cap_inst_short_s(s, "bnd_shape_S_max", "shapes", SIG_SHAPE_S, static_cast<std::int16_t>(32767));
+        // shapes(C)C with the LOW ('\0') and HIGH (0xFFFF) char boundaries; the +1
+        // transform wraps 0xFFFF -> 0 (a clean unsigned-16 wrap proof).
+        cap_inst_char_c (s, "bnd_shape_C_lo", "shapes", SIG_SHAPE_C, static_cast<char16_t>(0x0000));
+        cap_inst_char_c (s, "bnd_shape_C_hi", "shapes", SIG_SHAPE_C, static_cast<char16_t>(0xFFFF));
+        // shapes(Z)Z with false (the family above used true; the negation flips it).
+        cap_inst_bool_z (s, "bnd_shape_Z_false", "shapes", SIG_SHAPE_Z, false);
+        // shapes(F)F with a negative and with zero (the *2 transform preserves sign).
+        cap_inst_flt_f  (s, "bnd_shape_F_neg",  "shapes", SIG_SHAPE_F, -3.5f);
+        cap_inst_flt_f  (s, "bnd_shape_F_zero", "shapes", SIG_SHAPE_F, 0.0f);
+        // shapes(D)D with a large magnitude (the +3.25 transform is exact here).
+        cap_inst_dbl_d  (s, "bnd_shape_D_big",  "shapes", SIG_SHAPE_D, 1.0e15);
+
+        // ============================================================
+        //  MORE WRONG / MALFORMED descriptors -> MISS.  Widen the strict-compare
+        //  coverage beyond the family above: degenerate parens, internal
+        //  whitespace, lowercase return token, a bare descriptor with no return,
+        //  a doubled parameter list, and cross-name confusion (a descriptor that
+        //  is REAL for a DIFFERENT method name must not resolve under this name).
+        // ============================================================
+        cap_miss(s, "miss_only_open_paren",   "process", "(");                  // just '('
+        cap_miss(s, "miss_only_close_paren",  "process", ")");                  // just ')'
+        cap_miss(s, "miss_empty_parens",      "process", "()");                 // no return token
+        cap_miss(s, "miss_doubled_parens",    "process", "((I))I");             // nested parens
+        cap_miss(s, "miss_internal_space",    "process", "(I) I");              // space before ret
+        cap_miss(s, "miss_leading_space",     "process", " (I)I");              // leading space
+        cap_miss(s, "miss_trailing_space",    "process", "(I)I ");              // trailing space
+        cap_miss(s, "miss_lowercase_void",    "process", "()v");                // lowercase 'v'
+        cap_miss(s, "miss_no_return_token",   "process", "(I)");                // params, no return
+        cap_miss(s, "miss_bad_ref_unterminated", "process",
+                 "(Ljava/lang/String)Ljava/lang/String;");                      // missing ';' on arg
+        // cross-name confusion: "(I)I" is a REAL descriptor of base/dupInstance,
+        // but "trigger" only has "()V"; asking trigger with (I)I must MISS.
+        cap_miss(s, "miss_crossname_trigger_I", "trigger", SIG_PROC_I);
+        // process has no zero-return-token form; "(I)Z" (bool return) is absent.
+        cap_miss(s, "miss_proc_bool_ret",     "process", "(Ljava/lang/String;)Z");
+        // combo with an extra trailing int arg (no such overload).
+        cap_miss(s, "miss_combo_extra_int",   "combo",
+                 "(Ljava/lang/CharSequence;I)Ljava/lang/String;");
+
+        // ============================================================
+        //  STATIC-PATH boundary + miss angles (static_method(name,sig)).
+        //  The static overload gates on JVM_ACC_STATIC and has NO interface
+        //  fallback, so several instance-only lookups must MISS on it.
+        // ============================================================
+        // smap(I)I with boundary int (static dispatch through null owner).
+        cap_stat_num_i ("bnd_smap_I_max", "smap", SIG_SMAP_I, 2147483647);
+        cap_stat_num_i ("bnd_smap_I_min", "smap", SIG_SMAP_I, -2147483647 - 1);
+        // static return-type twins: smap(I) returns I, NOT J / V -> both MISS.
+        cap_miss_static("miss_smap_I_ret_J", "smap", "(I)J");
+        cap_miss_static("miss_smap_I_ret_V", "smap", "(I)V");
+        // static malformed: no leading paren / trailing junk.
+        cap_miss_static("miss_smap_malformed", "smap", "I)I");
+        cap_miss_static("miss_smap_trailing",  "smap", "(I)IZ");
+        // an INHERITED INSTANCE method (base) via the STATIC path -> MISS
+        // (ACC_STATIC gate rejects it; base is not static).
+        cap_miss_static("miss_base_via_static", "base", SIG_BASE_I);
+        // an INTERFACE DEFAULT method via the STATIC path -> MISS (defaults are
+        // non-static instance methods; the static path has NO interface fallback).
+        cap_miss_static("miss_ifacedef_via_static", "ifaceDefault", SIG_IFACE_DEF_I);
+        // an INSTANCE dupInstance via static -> MISS (already covered above as
+        // dup_inst_via_static; here a smap-family wrong NAME on the static path).
+        cap_miss_static("miss_static_wrong_name", "smapz", SIG_SMAP_I);
     }
 }
 
@@ -908,10 +1088,16 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             const probe_result r{ get("proc_I") };
             ctx.check("proc_I_resolved", r.resolved);
             ctx.check("proc_I_sig_is_exact", r.sig_text == SIG_PROC_I);
+            // ORTHOGONAL latched-Method* proof: the proxy's name() equals the
+            // requested name, and it is NOT static (an instance overload).
+            ctx.check("proc_I_name_is_process", r.name_text == "process");
+            ctx.check("proc_I_not_static", !r.is_static);
             ctx.check("proc_I_not_void", !r.is_void);
             ctx.check("proc_I_returns_arg_plus_1", r.ival == (PROC_I_ARG + 1));
             // side effect: process(I) recorded its arg, the OTHER overloads did not.
-            ctx.check("proc_I_side_effect_arg", method_explicit_sig::procIntArg() == PROC_I_ARG);
+            // Read the SNAPSHOT (taken before the boundary block re-dispatched
+            // process(I) with extreme args, which is last-write-wins on this field).
+            ctx.check("proc_I_side_effect_arg", get("snap_proc_I_arg").ival == PROC_I_ARG);
         }
 
         // ===================================================================
@@ -922,8 +1108,8 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("proc_II_resolved", r.resolved);
             ctx.check("proc_II_sig_is_exact", r.sig_text == SIG_PROC_II);
             ctx.check("proc_II_returns_a100_plus_b", r.ival == (PROC_II_A * 100 + PROC_II_B));
-            ctx.check("proc_II_side_effect_a", method_explicit_sig::procIntIntA() == PROC_II_A);
-            ctx.check("proc_II_side_effect_b", method_explicit_sig::procIntIntB() == PROC_II_B);
+            ctx.check("proc_II_side_effect_a", get("snap_proc_II_a").ival == PROC_II_A);
+            ctx.check("proc_II_side_effect_b", get("snap_proc_II_b").ival == PROC_II_B);
         }
 
         // ===================================================================
@@ -934,7 +1120,7 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("proc_J_resolved", r.resolved);
             ctx.check("proc_J_sig_is_exact", r.sig_text == SIG_PROC_J);
             ctx.check("proc_J_returns_arg_plus_1000", r.ival == (PROC_J_ARG + 1000));
-            ctx.check("proc_J_side_effect", method_explicit_sig::procLongArg() == PROC_J_ARG);
+            ctx.check("proc_J_side_effect", get("snap_proc_J").ival == PROC_J_ARG);
         }
 
         // ===================================================================
@@ -946,7 +1132,7 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("proc_S_sig_is_exact", r.sig_text == SIG_PROC_S);
             ctx.check("proc_S_is_string", r.is_string);
             ctx.check("proc_S_returns_prefixed", r.sval == "S:abc");
-            ctx.check("proc_S_side_effect", method_explicit_sig::procStrArg() == "abc");
+            ctx.check("proc_S_side_effect", get("snap_proc_str").sval == "abc");
         }
 
         // ===================================================================
@@ -1045,12 +1231,19 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             const probe_result ri{ get("smap_I") };
             ctx.check("smap_I_resolved", ri.resolved);
             ctx.check("smap_I_sig_is_exact", ri.sig_text == SIG_SMAP_I);
+            ctx.check("smap_I_name_is_smap", ri.name_text == "smap");
+            // The static overload resolves a STATIC method: is_static() is JVM truth.
+            ctx.check("smap_I_is_static", ri.is_static);
             ctx.check("smap_I_returns_double", ri.ival == (SMAP_I_ARG * 2));
-            ctx.check("smap_I_side_effect_once", method_explicit_sig::smapIntHits() == 1);
+            // smapIntHits is a COUNTER; the boundary block calls smap(I) twice more,
+            // so read the snapshot (==1) taken before those extra dispatches.
+            ctx.check("smap_I_side_effect_once", get("snap_smap_i_hits").ival == 1);
 
             const probe_result rs{ get("smap_S") };
             ctx.check("smap_S_resolved", rs.resolved);
             ctx.check("smap_S_sig_is_exact", rs.sig_text == SIG_SMAP_S);
+            ctx.check("smap_S_name_is_smap", rs.name_text == "smap");
+            ctx.check("smap_S_is_static", rs.is_static);
             ctx.check("smap_S_is_string", rs.is_string);
             ctx.check("smap_S_returns_prefixed", rs.sval == "M:qq");
             ctx.check("smap_S_side_effect_once", method_explicit_sig::smapStrHits() == 1);
@@ -1113,9 +1306,12 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("noop_proc_wrong_ret_is_nullopt", !r.resolved);
             // process(I) was legitimately called once (proc_I) with PROC_I_ARG.
             // The wrong-(I)J miss must NOT have re-dispatched process(I) with
-            // 999999; processIntArg therefore stays at PROC_I_ARG.
+            // 999999; the SNAPSHOT (taken after the canonical family, before any
+            // boundary re-dispatch) therefore still reads PROC_I_ARG — proving the
+            // miss added no dispatch.  (The live field is later overwritten by the
+            // boundary block, which is a separate, intentional dispatch.)
             ctx.check("noop_did_not_dispatch_process_I",
-                      method_explicit_sig::procIntArg() == PROC_I_ARG);
+                      get("snap_proc_I_arg").ival == PROC_I_ARG);
         }
 
         // ===================================================================
@@ -1129,35 +1325,34 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("shape_F_sig_is_exact", f.sig_text == SIG_SHAPE_F);
             ctx.check("shape_F_not_void", !f.is_void);
             ctx.check("shape_F_returns_double_arg", f.dval == static_cast<double>(SHAPE_F_ARG * 2.0f));
+            // Side effects are last-write-wins fields; the boundary block re-dispatches
+            // these shapes with extreme args, so read the canonical SNAPSHOT.
             ctx.check("shape_F_side_effect",
-                      method_explicit_sig_counters::shapeFloatSeen() == SHAPE_F_ARG);
+                      get("snap_shape_F").dval == static_cast<double>(SHAPE_F_ARG));
 
             const probe_result d{ get("shape_D") };
             ctx.check("shape_D_resolved", d.resolved);
             ctx.check("shape_D_sig_is_exact", d.sig_text == SIG_SHAPE_D);
             ctx.check("shape_D_returns_arg_plus", d.dval == (SHAPE_D_ARG + 3.25));
-            ctx.check("shape_D_side_effect",
-                      method_explicit_sig_counters::shapeDoubleSeen() == SHAPE_D_ARG);
+            ctx.check("shape_D_side_effect", get("snap_shape_D").dval == SHAPE_D_ARG);
 
             const probe_result z{ get("shape_Z") };
             ctx.check("shape_Z_resolved", z.resolved);
             ctx.check("shape_Z_sig_is_exact", z.sig_text == SIG_SHAPE_Z);
             ctx.check("shape_Z_returns_negation", z.ival == 0);   // !true == false == 0
-            ctx.check("shape_Z_side_effect", method_explicit_sig_counters::shapeBoolSeen() == 1);
+            ctx.check("shape_Z_side_effect", get("snap_shape_Z").ival == 1);
 
             const probe_result b{ get("shape_B") };
             ctx.check("shape_B_resolved", b.resolved);
             ctx.check("shape_B_sig_is_exact", b.sig_text == SIG_SHAPE_B);
             ctx.check("shape_B_returns_double_arg", b.ival == (SHAPE_B_ARG * 2));
-            ctx.check("shape_B_side_effect",
-                      method_explicit_sig_counters::shapeByteSeen() == SHAPE_B_ARG);
+            ctx.check("shape_B_side_effect", get("snap_shape_B").ival == SHAPE_B_ARG);
 
             const probe_result sh{ get("shape_S") };
             ctx.check("shape_S_resolved", sh.resolved);
             ctx.check("shape_S_sig_is_exact", sh.sig_text == SIG_SHAPE_S);
             ctx.check("shape_S_returns_triple_arg", sh.ival == (SHAPE_S_ARG * 3));
-            ctx.check("shape_S_side_effect",
-                      method_explicit_sig_counters::shapeShortSeen() == SHAPE_S_ARG);
+            ctx.check("shape_S_side_effect", get("snap_shape_S").ival == SHAPE_S_ARG);
 
             const probe_result c{ get("shape_C") };
             ctx.check("shape_C_resolved", c.resolved);
@@ -1165,8 +1360,8 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("shape_C_returns_arg_plus_1",
                       c.ival == static_cast<std::int64_t>(static_cast<std::uint16_t>(SHAPE_C_ARG) + 1));
             ctx.check("shape_C_side_effect",
-                      method_explicit_sig_counters::shapeCharSeen()
-                          == static_cast<std::int32_t>(static_cast<std::uint16_t>(SHAPE_C_ARG)));
+                      get("snap_shape_C").ival
+                          == static_cast<std::int64_t>(static_cast<std::uint16_t>(SHAPE_C_ARG)));
 
             const probe_result q{ get("shape_4I") };
             ctx.check("shape_4I_resolved", q.resolved);
@@ -1227,6 +1422,8 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             const probe_result ds{ get("dup_stat_via_static") };
             ctx.check("dup_stat_via_static_resolved", ds.resolved);
             ctx.check("dup_stat_via_static_sig_is_exact", ds.sig_text == SIG_DUP_I);
+            ctx.check("dup_stat_via_static_name", ds.name_text == "dupStatic");
+            ctx.check("dup_stat_via_static_is_static", ds.is_static);
             ctx.check("dup_stat_via_static_returns_double", ds.ival == (DUP_STAT_ARG * 2));
             ctx.check("dup_stat_via_static_side_effect",
                       method_explicit_sig_counters::dupStaticSeen() == DUP_STAT_ARG);
@@ -1238,6 +1435,8 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             const probe_result di{ get("dup_inst_via_inst") };
             ctx.check("dup_inst_via_inst_resolved", di.resolved);
             ctx.check("dup_inst_via_inst_sig_is_exact", di.sig_text == SIG_DUP_I);
+            ctx.check("dup_inst_via_inst_name", di.name_text == "dupInstance");
+            ctx.check("dup_inst_via_inst_not_static", !di.is_static);
             ctx.check("dup_inst_via_inst_returns_arg_plus_1", di.ival == (DUP_INST_ARG + 1));
             ctx.check("dup_inst_via_inst_side_effect",
                       method_explicit_sig_counters::dupInstanceSeen() == DUP_INST_ARG);
@@ -1249,6 +1448,13 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             const probe_result dsi{ get("dup_stat_via_inst") };
             ctx.check("dup_stat_via_inst_resolves_flaw1", dsi.resolved);
             ctx.check("dup_stat_via_inst_sig_is_exact", dsi.sig_text == SIG_DUP_I);
+            ctx.check("dup_stat_via_inst_name", dsi.name_text == "dupStatic");
+            // is_static() reads JVM_ACC_STATIC off the Method directly: even though
+            // the INSTANCE overload handed back a proxy carrying a phantom receiver
+            // (FLAW 1), the underlying Method IS static, so is_static() reports true.
+            // This is the crisp JVM-truth witness of the flaw (we still do not call
+            // the proxy — a static dispatch through a non-null owner misbehaves).
+            ctx.check("dup_stat_via_inst_is_static_truth", dsi.is_static);
             ctx.record("[INFO] ACC_STATIC orthogonality: static_method() filters on "
                        "JVM_ACC_STATIC (dupInstance rejected), but the INSTANCE "
                        "get_method(name,sig) does NOT (dupStatic still resolves with a "
@@ -1359,35 +1565,215 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
         }
 
         // ===================================================================
+        //  BOUNDARY / DEGENERATE ARGUMENT VALUES.  The exact-descriptor selection
+        //  is unchanged; these prove the END-TO-END dispatch of the selected
+        //  overload survives the full value range (min/max/zero/negative/special),
+        //  with the Java side's transform applied (2's-complement / IEEE wrap as
+        //  appropriate).  Each still reasserts the exact signature was selected.
+        // ===================================================================
+        {
+            // process(I)I:  +1 with 2's-complement wrap.
+            const probe_result imin{ get("bnd_proc_I_min") };
+            ctx.check("bnd_proc_I_min_resolved", imin.resolved);
+            ctx.check("bnd_proc_I_min_sig", imin.sig_text == SIG_PROC_I);
+            // INT_MIN + 1 == -2147483647
+            ctx.check("bnd_proc_I_min_wraps", imin.ival == (-2147483647));
+            const probe_result imax{ get("bnd_proc_I_max") };
+            ctx.check("bnd_proc_I_max_resolved", imax.resolved);
+            ctx.check("bnd_proc_I_max_sig", imax.sig_text == SIG_PROC_I);
+            // INT_MAX + 1 wraps to INT_MIN.
+            ctx.check("bnd_proc_I_max_wraps", imax.ival == (-2147483647 - 1));
+            const probe_result izero{ get("bnd_proc_I_zero") };
+            ctx.check("bnd_proc_I_zero_resolved", izero.resolved);
+            ctx.check("bnd_proc_I_zero_result", izero.ival == 1);
+            const probe_result ineg{ get("bnd_proc_I_neg") };
+            ctx.check("bnd_proc_I_neg_resolved", ineg.resolved);
+            ctx.check("bnd_proc_I_neg_result", ineg.ival == 0);   // -1 + 1 == 0
+
+            // process(J)J:  +1000 with 2's-complement wrap.
+            const probe_result jmin{ get("bnd_proc_J_min") };
+            ctx.check("bnd_proc_J_min_resolved", jmin.resolved);
+            ctx.check("bnd_proc_J_min_sig", jmin.sig_text == SIG_PROC_J);
+            // LONG_MIN + 1000
+            ctx.check("bnd_proc_J_min_result",
+                      jmin.ival == ((-9223372036854775807LL - 1) + 1000LL));
+            const probe_result jmax{ get("bnd_proc_J_max") };
+            ctx.check("bnd_proc_J_max_resolved", jmax.resolved);
+            ctx.check("bnd_proc_J_max_sig", jmax.sig_text == SIG_PROC_J);
+            // LONG_MAX + 1000 wraps around.
+            ctx.check("bnd_proc_J_max_wraps",
+                      jmax.ival == static_cast<std::int64_t>(
+                          static_cast<std::uint64_t>(9223372036854775807LL) + 1000ULL));
+
+            // process(II)I:  a*100 + b with negatives.
+            const probe_result iineg{ get("bnd_proc_II_neg") };
+            ctx.check("bnd_proc_II_neg_resolved", iineg.resolved);
+            ctx.check("bnd_proc_II_neg_sig", iineg.sig_text == SIG_PROC_II);
+            ctx.check("bnd_proc_II_neg_result", iineg.ival == ((-7) * 100 + (-3)));
+
+            // process(String)String:  empty + long string round-trip ("S:" prefix).
+            const probe_result sempty{ get("bnd_proc_S_empty") };
+            ctx.check("bnd_proc_S_empty_resolved", sempty.resolved);
+            ctx.check("bnd_proc_S_empty_sig", sempty.sig_text == SIG_PROC_S);
+            ctx.check("bnd_proc_S_empty_is_string", sempty.is_string);
+            ctx.check("bnd_proc_S_empty_result", sempty.sval == "S:");
+            const probe_result slong{ get("bnd_proc_S_long") };
+            ctx.check("bnd_proc_S_long_resolved", slong.resolved);
+            ctx.check("bnd_proc_S_long_result",
+                      slong.sval == "S:abcdefghijklmnopqrstuvwxyz0123456789");
+
+            // shapes(B)B:  *2 with byte wrap.  -128*2 == -256 -> byte 0;
+            // 127*2 == 254 -> byte -2.  value_t carries the SIGN-EXTENDED byte.
+            const probe_result bmin{ get("bnd_shape_B_min") };
+            ctx.check("bnd_shape_B_min_resolved", bmin.resolved);
+            ctx.check("bnd_shape_B_min_sig", bmin.sig_text == SIG_SHAPE_B);
+            ctx.check("bnd_shape_B_min_wraps",
+                      bmin.ival == static_cast<std::int64_t>(static_cast<std::int8_t>(-128 * 2)));
+            const probe_result bmax{ get("bnd_shape_B_max") };
+            ctx.check("bnd_shape_B_max_resolved", bmax.resolved);
+            ctx.check("bnd_shape_B_max_wraps",
+                      bmax.ival == static_cast<std::int64_t>(static_cast<std::int8_t>(127 * 2)));
+
+            // shapes(S)S:  *3 with short wrap.
+            const probe_result shmin{ get("bnd_shape_S_min") };
+            ctx.check("bnd_shape_S_min_resolved", shmin.resolved);
+            ctx.check("bnd_shape_S_min_sig", shmin.sig_text == SIG_SHAPE_S);
+            ctx.check("bnd_shape_S_min_wraps",
+                      shmin.ival == static_cast<std::int64_t>(static_cast<std::int16_t>(-32768 * 3)));
+            const probe_result shmax{ get("bnd_shape_S_max") };
+            ctx.check("bnd_shape_S_max_resolved", shmax.resolved);
+            ctx.check("bnd_shape_S_max_wraps",
+                      shmax.ival == static_cast<std::int64_t>(static_cast<std::int16_t>(32767 * 3)));
+
+            // shapes(C)C:  +1 with unsigned-16 wrap.  '\0'+1 == 1; 0xFFFF+1 -> 0.
+            const probe_result clo{ get("bnd_shape_C_lo") };
+            ctx.check("bnd_shape_C_lo_resolved", clo.resolved);
+            ctx.check("bnd_shape_C_lo_sig", clo.sig_text == SIG_SHAPE_C);
+            ctx.check("bnd_shape_C_lo_result", clo.ival == 1);
+            const probe_result chi{ get("bnd_shape_C_hi") };
+            ctx.check("bnd_shape_C_hi_resolved", chi.resolved);
+            ctx.check("bnd_shape_C_hi_wraps", chi.ival == 0);   // (char)(0xFFFF+1) == 0
+
+            // shapes(Z)Z:  negation of false is true (1).
+            const probe_result zf{ get("bnd_shape_Z_false") };
+            ctx.check("bnd_shape_Z_false_resolved", zf.resolved);
+            ctx.check("bnd_shape_Z_false_sig", zf.sig_text == SIG_SHAPE_Z);
+            ctx.check("bnd_shape_Z_false_returns_true", zf.ival == 1);
+
+            // shapes(F)F:  *2 preserves sign; -3.5*2 == -7.0; 0*2 == 0.
+            const probe_result fneg{ get("bnd_shape_F_neg") };
+            ctx.check("bnd_shape_F_neg_resolved", fneg.resolved);
+            ctx.check("bnd_shape_F_neg_sig", fneg.sig_text == SIG_SHAPE_F);
+            ctx.check("bnd_shape_F_neg_result", fneg.dval == static_cast<double>(-3.5f * 2.0f));
+            const probe_result fz{ get("bnd_shape_F_zero") };
+            ctx.check("bnd_shape_F_zero_resolved", fz.resolved);
+            ctx.check("bnd_shape_F_zero_result", fz.dval == 0.0);
+
+            // shapes(D)D:  +3.25 at large magnitude (exact in double).
+            const probe_result dbig{ get("bnd_shape_D_big") };
+            ctx.check("bnd_shape_D_big_resolved", dbig.resolved);
+            ctx.check("bnd_shape_D_big_sig", dbig.sig_text == SIG_SHAPE_D);
+            ctx.check("bnd_shape_D_big_result", dbig.dval == (1.0e15 + 3.25));
+        }
+
+        // ===================================================================
+        //  WIDER MALFORMED / DEGENERATE descriptors -> nullopt.  Strict compare
+        //  rejects every non-exact form (degenerate parens, whitespace, wrong-
+        //  case return, missing return token, unterminated ref, cross-name).
+        // ===================================================================
+        ctx.check("miss_only_open_paren_nullopt",   !get("miss_only_open_paren").resolved);
+        ctx.check("miss_only_close_paren_nullopt",  !get("miss_only_close_paren").resolved);
+        ctx.check("miss_empty_parens_nullopt",      !get("miss_empty_parens").resolved);
+        ctx.check("miss_doubled_parens_nullopt",    !get("miss_doubled_parens").resolved);
+        ctx.check("miss_internal_space_nullopt",    !get("miss_internal_space").resolved);
+        ctx.check("miss_leading_space_nullopt",     !get("miss_leading_space").resolved);
+        ctx.check("miss_trailing_space_nullopt",    !get("miss_trailing_space").resolved);
+        ctx.check("miss_lowercase_void_nullopt",    !get("miss_lowercase_void").resolved);
+        ctx.check("miss_no_return_token_nullopt",   !get("miss_no_return_token").resolved);
+        ctx.check("miss_bad_ref_unterminated_nullopt", !get("miss_bad_ref_unterminated").resolved);
+        ctx.check("miss_crossname_trigger_I_nullopt", !get("miss_crossname_trigger_I").resolved);
+        ctx.check("miss_proc_bool_ret_nullopt",     !get("miss_proc_bool_ret").resolved);
+        ctx.check("miss_combo_extra_int_nullopt",   !get("miss_combo_extra_int").resolved);
+
+        // ===================================================================
+        //  STATIC-PATH boundary + miss angles.  static_method(name,sig) gates on
+        //  JVM_ACC_STATIC and has NO interface-default fallback.
+        // ===================================================================
+        {
+            const probe_result smax{ get("bnd_smap_I_max") };
+            ctx.check("bnd_smap_I_max_resolved", smax.resolved);
+            ctx.check("bnd_smap_I_max_sig", smax.sig_text == SIG_SMAP_I);
+            ctx.check("bnd_smap_I_max_is_static", smax.is_static);
+            // INT_MAX * 2 wraps to -2 (32-bit 2's complement).  Compute the wrap
+            // in UNSIGNED 32-bit (well-defined modular arithmetic) then reinterpret
+            // as int32 — a plain `2147483647 * 2` would be compile-time int overflow.
+            ctx.check("bnd_smap_I_max_wraps",
+                      smax.ival == static_cast<std::int64_t>(
+                          static_cast<std::int32_t>(
+                              static_cast<std::uint32_t>(2147483647) * 2u)));
+            const probe_result smin{ get("bnd_smap_I_min") };
+            ctx.check("bnd_smap_I_min_resolved", smin.resolved);
+            ctx.check("bnd_smap_I_min_wraps",
+                      smin.ival == static_cast<std::int64_t>(
+                          static_cast<std::int32_t>(
+                              static_cast<std::uint32_t>(-2147483647 - 1) * 2u)));
+
+            // static return-type twins miss (return char is load-bearing here too).
+            ctx.check("miss_smap_I_ret_J_nullopt", !get("miss_smap_I_ret_J").resolved);
+            ctx.check("miss_smap_I_ret_V_nullopt", !get("miss_smap_I_ret_V").resolved);
+            // static malformed misses.
+            ctx.check("miss_smap_malformed_nullopt", !get("miss_smap_malformed").resolved);
+            ctx.check("miss_smap_trailing_nullopt",  !get("miss_smap_trailing").resolved);
+            // instance-only / inherited-instance / interface-default names rejected
+            // on the static path.
+            ctx.check("miss_base_via_static_nullopt",     !get("miss_base_via_static").resolved);
+            ctx.check("miss_ifacedef_via_static_nullopt", !get("miss_ifacedef_via_static").resolved);
+            ctx.check("miss_static_wrong_name_nullopt",   !get("miss_static_wrong_name").resolved);
+            ctx.record("[INFO] static_method(name,sig): ACC_STATIC gate + no interface "
+                       "fallback — base(I)I (inherited instance) and ifaceDefault(I)I "
+                       "(interface default) both correctly MISS on the static path.");
+        }
+
+        // ===================================================================
         //  GLOBAL ISOLATION INVARIANTS across the whole run:
         //  every overload's side effect fired EXACTLY the expected number of
         //  times — no wrong-signature miss leaked into a real dispatch, and no
         //  exact selection picked a sibling.
+        //
+        //  For overloads the boundary block intentionally RE-DISPATCHED with
+        //  extreme args (process I/II/J/String, smap(I), shapes F/D/Z/B/S), the
+        //  canonical exactly-once value is read from the SNAPSHOT taken after the
+        //  family and before the boundary block; the live field afterwards holds
+        //  the last boundary value (a separate intentional dispatch, not a leak).
+        //  Overloads NOT re-dispatched are read live and must be EXACTLY once.
         // ===================================================================
         // process(II) ran once (proc_II); process(I) ran once (proc_I).  Their
-        // recorded args are still the legitimate ones.
-        ctx.check("isolation_proc_I_arg_intact", method_explicit_sig::procIntArg() == PROC_I_ARG);
-        ctx.check("isolation_proc_II_a_intact",  method_explicit_sig::procIntIntA() == PROC_II_A);
-        ctx.check("isolation_proc_II_b_intact",  method_explicit_sig::procIntIntB() == PROC_II_B);
-        ctx.check("isolation_proc_J_intact",     method_explicit_sig::procLongArg() == PROC_J_ARG);
+        // recorded canonical args (snapshot) are still the legitimate ones.
+        ctx.check("isolation_proc_I_arg_intact", get("snap_proc_I_arg").ival == PROC_I_ARG);
+        ctx.check("isolation_proc_II_a_intact",  get("snap_proc_II_a").ival == PROC_II_A);
+        ctx.check("isolation_proc_II_b_intact",  get("snap_proc_II_b").ival == PROC_II_B);
+        ctx.check("isolation_proc_J_intact",     get("snap_proc_J").ival == PROC_J_ARG);
+        // process()V was NEVER re-dispatched, so its live counter must be exactly 1.
         ctx.check("isolation_proc_V_one_hit",    method_explicit_sig::procVoidHits() == 1);
         // combo (FIXED #5): the explicit signature is now PINNED, so each probe
         // dispatched ITS overload exactly once — combo(CharSequence) once and
-        // combo(String) once (total two dispatches).
+        // combo(String) once (total two dispatches).  Not re-dispatched: live read.
         ctx.check("isolation_combo_cs_one", method_explicit_sig::comboCsHits() == 1);
         ctx.check("isolation_combo_st_one", method_explicit_sig::comboStHits() == 1);
         ctx.check("isolation_combo_sum_two",
                   method_explicit_sig::comboCsHits() + method_explicit_sig::comboStHits() == 2);
-        // static smap each exactly once.
-        ctx.check("isolation_smap_i_one",        method_explicit_sig::smapIntHits() == 1);
+        // static smap(I) canonical hit count from the snapshot (boundary re-ran it);
+        // smap(String) was never re-dispatched, so its live counter is exactly 1.
+        ctx.check("isolation_smap_i_one",        get("snap_smap_i_hits").ival == 1);
         ctx.check("isolation_smap_s_one",        method_explicit_sig::smapStrHits() == 1);
 
-        // descriptor-shape selectors: each scalar shape's side effect intact.
-        ctx.check("isolation_shape_F", method_explicit_sig_counters::shapeFloatSeen() == SHAPE_F_ARG);
-        ctx.check("isolation_shape_D", method_explicit_sig_counters::shapeDoubleSeen() == SHAPE_D_ARG);
-        ctx.check("isolation_shape_Z", method_explicit_sig_counters::shapeBoolSeen() == 1);
-        ctx.check("isolation_shape_B", method_explicit_sig_counters::shapeByteSeen() == SHAPE_B_ARG);
-        ctx.check("isolation_shape_S", method_explicit_sig_counters::shapeShortSeen() == SHAPE_S_ARG);
+        // descriptor-shape selectors: each scalar shape's CANONICAL side effect
+        // (snapshot) intact; shape(IIII) was not re-dispatched (live read).
+        ctx.check("isolation_shape_F", get("snap_shape_F").dval == static_cast<double>(SHAPE_F_ARG));
+        ctx.check("isolation_shape_D", get("snap_shape_D").dval == SHAPE_D_ARG);
+        ctx.check("isolation_shape_Z", get("snap_shape_Z").ival == 1);
+        ctx.check("isolation_shape_B", get("snap_shape_B").ival == SHAPE_B_ARG);
+        ctx.check("isolation_shape_S", get("snap_shape_S").ival == SHAPE_S_ARG);
         ctx.check("isolation_shape_4I",
                   method_explicit_sig_counters::shapeFourArgSeen() == (SHAPE_4A + SHAPE_4B + SHAPE_4C + SHAPE_4D));
         // dup* family: instance and static side effects each set by their own kind.
