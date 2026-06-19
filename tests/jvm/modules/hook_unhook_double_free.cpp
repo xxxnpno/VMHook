@@ -558,11 +558,29 @@ VMHOOK_JVM_MODULE(hook_unhook_double_free)
     // 10 — MOVE-ASSIGN over a LIVE handle.  operator=(&&) must stop() *this
     //   FIRST (disarming the hook it currently owns) before adopting the
     //   right-hand side's target.  So after `h = scoped_hook(...)`: the OLD
-    //   detour is removed (its entry erased) and the NEW detour is the only one
-    //   armed.  This is the exactly-once-teardown contract embedded in the move
-    //   path — the overwritten hook must be torn down exactly once, not leaked
-    //   and not double-freed.  We use two DISTINCT detours so the fire counters
-    //   prove which body actually owns the method after the assign.
+    //   hook is removed (its entry erased) and the NEW hook is the only one
+    //   armed through `h`.  This is the exactly-once-teardown contract embedded
+    //   in the move path — the overwritten hook must be torn down exactly once,
+    //   not leaked and not double-freed.
+    //
+    //   IMPORTANT real-semantics note (why the NEW hook is on a DIFFERENT method
+    //   `other`, not the same `target`):  C++ fully evaluates the right-hand-side
+    //   scoped_hook(...) BEFORE operator=(&&) runs.  At that instant `h` still
+    //   owns the OLD hook, so its entry is still in g_hooked_methods.  If the RHS
+    //   targeted the SAME Method*, vmhook::hook<T>() would see it already hooked
+    //   and — by the honest duplicate-install contract (scenario 5) — DECLINE to
+    //   register the second detour, handing scoped_hook<T>() a NOT-installed
+    //   handle.  The subsequent move-assign would then stop() the old hook and
+    //   adopt an EMPTY target, leaving `h` not-installed and NO detour armed.
+    //   That is correct, safe library behaviour (no double-free, byte-exact
+    //   restore) — it is just NOT a demonstration of the move-assign adopting a
+    //   live hook.  Using a distinct method (`other`) makes the RHS install
+    //   genuinely succeed so the move-assign actually transfers a LIVE hook,
+    //   which is what this scenario is here to prove.  The same-method
+    //   interaction is pinned HARD separately just below (10b).
+    //
+    //   OLD detour observes `target`; NEW detour observes `other` — distinct
+    //   counters so the fire tallies prove which hook `h` owns after the assign.
     // =====================================================================
     {
         auto h{ vmhook::scoped_hook<huf_fixture>(
@@ -572,7 +590,7 @@ VMHOOK_JVM_MODULE(hook_unhook_double_free)
                std::int32_t) { g_move_old_fires.fetch_add(1, std::memory_order_relaxed); }) };
         ctx.check("move_assign_old_installed", h.installed());
 
-        // Prove the OLD detour is live before the assign.
+        // Prove the OLD detour (on target) is live before the assign.
         const bool done_old{ drive(ctx, 1) };
         ctx.check("move_assign_old_probe_completed", done_old);
         ctx.check("move_assign_old_fires_before",
@@ -580,40 +598,91 @@ VMHOOK_JVM_MODULE(hook_unhook_double_free)
         ctx.check("move_assign_new_silent_before",
                   g_move_new_fires.load() == 0);
 
-        // Move-assign a fresh hook (distinct detour) over the live handle.
-        // operator=(&&) stops the OLD hook first, then adopts the NEW one.
+        // Move-assign a fresh hook on a DIFFERENT method (other) over the live
+        // handle.  The RHS install succeeds (other was not hooked), producing a
+        // live temporary; operator=(&&) then stops the OLD target hook first and
+        // adopts the NEW other hook.
         h = vmhook::scoped_hook<huf_fixture>(
-            "target", "(I)I",
+            "other", "(I)I",
             [](vmhook::return_value&,
                const std::unique_ptr<huf_fixture>&,
                std::int32_t) { g_move_new_fires.fetch_add(1, std::memory_order_relaxed); });
         ctx.check("move_assign_handle_still_installed", h.installed());
 
-        const bool done_new{ drive(ctx, 1) };
+        // Drive BOTH methods in one cycle (mode 3 = runBoth: target ONCE +
+        // other ONCE).  Only the NEW (other) detour fires; the OLD (target)
+        // detour was disarmed by the assign's stop()-first.  (If the old entry
+        // had leaked, the old counter would tick on the target call here.)
+        const bool done_new{ drive(ctx, 3) };
         ctx.check("move_assign_new_probe_completed", done_new);
-        // ONLY the new detour fires now; the old one was disarmed by the
-        // assign's stop()-first.  (If the old entry had leaked, the old counter
-        // would tick again here.)
         ctx.check("move_assign_new_fires_after",
-                  g_move_new_fires.load() == TARGET_CALLS);
+                  g_move_new_fires.load() == 1);
         ctx.check("move_assign_old_silent_after",
                   g_move_old_fires.load() == 0);
-        ctx.check("move_assign_byte_exact",
+        // Both bodies byte-exact: target restored by the stop()-first, other
+        // allow-through left untouched.
+        ctx.check("move_assign_target_byte_exact",
                   huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
-    }   // handle drops -> the new hook removed; both detours now silent.
+        ctx.check("move_assign_other_byte_exact",
+                  huf_fixture::get_last_other_result() == OTHER_ORIGINAL);
+    }   // handle drops -> the new (other) hook removed; both detours now silent.
 
-    // After the move-assign scope, the method must be byte-exact original again
-    // and neither detour fires (proves the assign left no leaked entry).
+    // After the move-assign scope, BOTH methods must be byte-exact original again
+    // and neither detour fires (proves the assign left no leaked entry — the old
+    // target entry was erased by the stop()-first, the new other entry by the
+    // handle's destructor).
     {
-        const bool done{ drive(ctx, 1) };
+        const bool done{ drive(ctx, 3) };
         ctx.check("move_assign_after_drop_probe_completed", done);
         ctx.check("move_assign_after_drop_old_silent",
                   g_move_old_fires.load() == 0);
         ctx.check("move_assign_after_drop_new_silent",
                   g_move_new_fires.load() == 0);
-        ctx.check("move_assign_after_drop_byte_exact",
+        ctx.check("move_assign_after_drop_target_byte_exact",
                   huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+        ctx.check("move_assign_after_drop_other_byte_exact",
+                  huf_fixture::get_last_other_result() == OTHER_ORIGINAL);
     }
+
+    // =====================================================================
+    // 10b — MOVE-ASSIGN onto the SAME method as the live handle: the honest
+    //   duplicate-install interaction, pinned HARD.  Because the RHS scoped_hook
+    //   is evaluated while `h` still owns the target hook, hook<T>() sees target
+    //   already hooked and DECLINES the second detour -> the RHS temporary is a
+    //   NOT-installed handle.  operator=(&&) then stop()s the old hook (erasing
+    //   its entry — exactly-once teardown) and adopts the empty target, so `h`
+    //   ends up NOT-installed and NO detour is armed.  This is safe (no
+    //   double-free, byte-exact restore), it just doesn't transfer a live hook.
+    // =====================================================================
+    {
+        auto h{ vmhook::scoped_hook<huf_fixture>(
+            "target", "(I)I",
+            [](vmhook::return_value&,
+               const std::unique_ptr<huf_fixture>&,
+               std::int32_t) { g_move_old_fires.fetch_add(1, std::memory_order_relaxed); }) };
+        ctx.check("move_assign_same_old_installed", h.installed());
+
+        // Move-assign a second hook on the SAME method.  RHS declines (duplicate)
+        // -> empty temporary; the assign disarms the old hook and adopts nothing.
+        h = vmhook::scoped_hook<huf_fixture>(
+            "target", "(I)I",
+            [](vmhook::return_value&,
+               const std::unique_ptr<huf_fixture>&,
+               std::int32_t) { g_move_new_fires.fetch_add(1, std::memory_order_relaxed); });
+        ctx.check("move_assign_same_not_installed_after", !h.installed());
+
+        // With h not-installed, the target hook was disarmed and no new one
+        // armed: NEITHER detour fires and target is byte-exact original.
+        const bool done{ drive(ctx, 1) };
+        ctx.check("move_assign_same_probe_completed", done);
+        ctx.check("move_assign_same_old_silent_after",
+                  g_move_old_fires.load() == 0);
+        ctx.check("move_assign_same_new_silent_after",
+                  g_move_new_fires.load() == 0);
+        ctx.check("move_assign_same_byte_exact",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+    }   // destructor on the empty handle -> no-op (no double-free).
+    ctx.check("move_assign_same_destructor_no_op", true);
 
     // =====================================================================
     // 11 — NAME-ONLY scoped_hook overload (empty signature).  The 2-arg
