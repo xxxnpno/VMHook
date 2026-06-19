@@ -310,6 +310,25 @@ public final class KlassIntrospection
     public static volatile boolean nestedIsInterface;    // false
     public static volatile boolean nestedIsAbstract;     // false
 
+    // Extra array-shape witnesses (every primitive array + a 1-D / 3-D reference
+    // array): isArray + final + abstract bits (the JLS stamps array classes
+    // public(component) final abstract) so the native side can cross-check that
+    // its resolved klass really is an array klass of the expected element type.
+    public static volatile boolean longArrayIsArray;     // true  ([J)
+    public static volatile boolean doubleArrayIsArray;   // true  ([D)
+    public static volatile boolean floatArrayIsArray;    // true  ([F)
+    public static volatile boolean shortArrayIsArray;    // true  ([S)
+    public static volatile boolean byteArrayIsArray;     // true  ([B)
+    public static volatile boolean charArrayIsArray;     // true  ([C)
+    public static volatile boolean boolArrayIsArray;     // true  ([Z)
+    public static volatile boolean strArray1DIsArray;    // true  ([Ljava/lang/String;)
+    public static volatile boolean intArray3DIsArray;    // true  ([[[I)
+    public static volatile boolean intArrayIsFinal;      // true  (array classes are final)
+    public static volatile boolean intArrayIsAbstract;   // true  (array classes are abstract)
+    // Array classes implement BOTH Cloneable and Serializable (JLS 4.10.3); the
+    // native get_interfaces_ptr walk on an array klass should see exactly these.
+    public static volatile int     intArrayInterfaceCount;   // 2 (Cloneable, Serializable)
+
     // Superclass NAMES (internal '/'-form) for the _super cross-check.
     public static volatile String  finalSuperName;       // .../AbstractBase
     public static volatile String  enumSuperName;        // java/lang/Enum
@@ -337,6 +356,24 @@ public final class KlassIntrospection
     // Interface witnesses.
     public static volatile boolean finalImplementsNothingDirect;  // FinalLeaf has no direct iface
     public static volatile int     cmpInterfaceCount;             // 1 (Comparable)
+    public static volatile int     nestedInterfaceCount;          // 0 (Nested implements nothing)
+    public static volatile int     baseInterfaceCount;            // 0 (Base implements nothing)
+
+    // Enum-shape witnesses: the constant count (so the native synthetic-field
+    // walk for $VALUES + the constants can be sanity-checked) and the declared
+    // field count (4 constants + the synthetic $VALUES = 5).
+    public static volatile int     suitConstantCount;    // 4 (CLUBS..SPADES)
+    public static volatile int     suitDeclaredFields;   // 5 (4 constants + $VALUES)
+
+    // Inner-class witness: a non-static inner class carries a synthetic this$0
+    // field referencing the enclosing instance — so it declares MORE fields than
+    // its source shows.  Published so the native find_field("this$0") (synthetic)
+    // probe can be corroborated without hardcoding javac's synthetic name rules.
+    public static volatile int     innerDeclaredFields;  // 2 (innerField + this$0)
+
+    // Box (generic, erased) witness: the declared method count is unaffected by
+    // erasure (get + set), and the field is a single erased Object reference.
+    public static volatile int     boxDeclaredMethods;   // 2 (get, set)
 
     // Identity/sanity witness so the probe's dispatch is observable.
     public static volatile int     tickWitness;
@@ -426,6 +463,20 @@ public final class KlassIntrospection
                 nestedIsInterface  = Nested.class.isInterface();
                 nestedIsAbstract   = Modifier.isAbstract(Nested.class.getModifiers());
 
+                // ---- extra array-shape witnesses ----------------------------
+                longArrayIsArray   = long[].class.isArray();
+                doubleArrayIsArray = double[].class.isArray();
+                floatArrayIsArray  = float[].class.isArray();
+                shortArrayIsArray  = short[].class.isArray();
+                byteArrayIsArray   = byte[].class.isArray();
+                charArrayIsArray   = char[].class.isArray();
+                boolArrayIsArray   = boolean[].class.isArray();
+                strArray1DIsArray  = String[].class.isArray();
+                intArray3DIsArray  = int[][][].class.isArray();
+                intArrayIsFinal    = Modifier.isFinal(int[].class.getModifiers());
+                intArrayIsAbstract = Modifier.isAbstract(int[].class.getModifiers());
+                intArrayInterfaceCount = int[].class.getInterfaces().length;
+
                 // ---- superclass names ---------------------------------------
                 finalSuperName    = superInternalName(FinalLeaf.class);
                 enumSuperName     = superInternalName(Suit.class);
@@ -446,6 +497,14 @@ public final class KlassIntrospection
                 cmpCompareToCount = countDeclaredNamed(Cmp.class, "compareTo");
                 cmpInterfaceCount = Cmp.class.getInterfaces().length;
                 finalImplementsNothingDirect = (FinalLeaf.class.getInterfaces().length == 0);
+                nestedInterfaceCount = Nested.class.getInterfaces().length;
+                baseInterfaceCount   = Base.class.getInterfaces().length;
+
+                // ---- enum / inner / box shape witnesses ---------------------
+                suitConstantCount   = Suit.class.getEnumConstants().length;
+                suitDeclaredFields  = Suit.class.getDeclaredFields().length;
+                innerDeclaredFields = Inner.class.getDeclaredFields().length;
+                boxDeclaredMethods  = Box.class.getDeclaredMethods().length;
 
                 // ---- real bytecode dispatch (parity) ------------------------
                 tickWitness = new KlassIntrospection().tick(41);

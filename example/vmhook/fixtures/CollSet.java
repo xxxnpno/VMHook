@@ -234,6 +234,17 @@ public final class CollSet
      */
     public static HashSet<String> hashCollisionChain = new HashSet<String>();
 
+    /**
+     * HashSet containing ONLY the single legal null element (size 1).  The
+     * backing HashMap has exactly one Node whose key is null, so the bucket walk
+     * must surface exactly one nullptr slot and nothing else — the pure-null
+     * boundary of the null-key path.
+     */
+    public static HashSet<Elem> hashOnlyNull = new HashSet<Elem>();
+
+    /** Empty LinkedHashSet — the "map" hash walk over an all-null table → 0. */
+    public static LinkedHashSet<Elem> linkedEmpty = new LinkedHashSet<Elem>();
+
     /** Two-element LinkedHashSet (also the "map" → hash_map_walk_keys path). */
     public static LinkedHashSet<Elem> linkedTwo = new LinkedHashSet<Elem>();
 
@@ -242,6 +253,21 @@ public final class CollSet
 
     /** Large LinkedHashSet. */
     public static LinkedHashSet<Elem> linkedMany = new LinkedHashSet<Elem>();
+
+    /**
+     * LinkedHashSet of Strings — the String element decode through the
+     * LinkedHashMap-backed hash walk (LinkedHashMap.Node is a HashMap.Entry whose
+     * key/next still resolve; the before/after overlay is ignored).  Content
+     * verified order-independently.  "ls0".."ls(SMALL_N-1)".
+     */
+    public static LinkedHashSet<String> linkedStrings = new LinkedHashSet<String>();
+
+    /**
+     * LinkedHashSet with the legal single null element + NULL_SET_NONNULL reals
+     * (ids 700..702).  Locks the "null element → nullptr slot" promise on the
+     * LinkedHashMap-backed path too.
+     */
+    public static LinkedHashSet<Elem> linkedWithNull = new LinkedHashSet<Elem>();
 
     /** Empty TreeSet. */
     public static TreeSet<Elem> treeEmpty = new TreeSet<Elem>();
@@ -270,6 +296,23 @@ public final class CollSet
 
     /** TreeSet of Strings — String element decode through the in-order walk. */
     public static TreeSet<String> treeStrings = new TreeSet<String>();
+
+    /**
+     * TreeSet&lt;String&gt; with an EXPLICIT reverse comparator — the in-order
+     * red-black walk must come out DESCENDING lexicographically
+     * ["cherry","banana","apple"], proving the String tree walk honours a
+     * comparator on a reference key type (not just the Elem Comparable).
+     */
+    public static TreeSet<String> treeStringsReverse =
+        new TreeSet<String>(java.util.Collections.<String>reverseOrder());
+
+    /**
+     * TreeSet built with DUPLICATE adds: SMALL_N distinct ids, then each id is
+     * re-added via a value-equal but distinct Elem object.  TreeSet dedupes by
+     * compareTo (== 0), so the size stays SMALL_N and the in-order walk surfaces
+     * each id exactly once, ascending [0,1,2].  Proves dedup survives the tree walk.
+     */
+    public static TreeSet<Elem> treeDup = new TreeSet<Elem>();
 
     public static final int SMALL_N = 3;
 
@@ -390,6 +433,42 @@ public final class CollSet
      */
     public static TreeSet<Integer> treeIntegers = new TreeSet<Integer>();
 
+    /**
+     * HashSet&lt;Long&gt; — BOXED-Long element decode: each element OOP is a
+     * java.lang.Long whose `value` field is an 8-byte primitive long.  Exercises
+     * the wide-primitive field read through the key walk (Integer covers the
+     * 4-byte case; Long covers the 8-byte case).  Values 0..INT_N-1 as longs.
+     */
+    public static HashSet<Long> hashLongs = new HashSet<Long>();
+
+    /**
+     * HashSet&lt;Character&gt; — BOXED-Character element decode: each element OOP is
+     * a java.lang.Character whose `value` field is a primitive char (u16).
+     * Values 'a'..'a'+CHAR_N-1.  The char field-read path.
+     */
+    public static HashSet<Character> hashChars = new HashSet<Character>();
+
+    /** Element count of the boxed-Character HashSet. */
+    public static final int CHAR_N = 10;
+
+    /**
+     * HashSet&lt;Boolean&gt; — the BOUNDARY boxed set: a Boolean set can hold at most
+     * the two cached singletons Boolean.TRUE / Boolean.FALSE, so this is the
+     * maximal Boolean set (size 2).  Each element OOP is a java.lang.Boolean
+     * whose `value` field is a primitive boolean; the decode must surface exactly
+     * one true and one false.
+     */
+    public static HashSet<Boolean> hashBooleans = new HashSet<Boolean>();
+
+    /**
+     * Collections.newSetFromMap(new TreeMap&lt;&gt;(reverseOrder)) — the "m"-route
+     * inspects the backing klass (TreeMap, has "root") and takes the in-order
+     * walk, which honours the TreeMap's reverse comparator → DESCENDING decode
+     * [402,401,400].  Proves the SetFromMap tree route also respects a comparator.
+     */
+    public static Set<Elem> setFromTreeMapReverse =
+        Collections.newSetFromMap(new TreeMap<Elem, Boolean>(java.util.Collections.<Elem>reverseOrder()));
+
     // ---- NON-decodable Set families (characterized via size() + [INFO]) -----
     //
     // These have NO fast-path field shape, so collection::to_vector would reach
@@ -468,9 +547,13 @@ public final class CollSet
     public static volatile int hashTreeifiedSize;
     public static volatile int hashCollisionChainSize;
     public static volatile int hashWithNullSize;
+    public static volatile int hashOnlyNullSize;
+    public static volatile int linkedEmptySize;
     public static volatile int linkedTwoSize;
     public static volatile int linkedSmallSize;
     public static volatile int linkedManySize;
+    public static volatile int linkedStringsSize;
+    public static volatile int linkedWithNullSize;
     public static volatile int treeEmptySize;
     public static volatile int treeSingleSize;
     public static volatile int treeTwoSize;
@@ -478,13 +561,19 @@ public final class CollSet
     public static volatile int treeManySize;
     public static volatile int treeReverseSize;
     public static volatile int treeStringsSize;
+    public static volatile int treeStringsReverseSize;
+    public static volatile int treeDupSize;
     public static volatile int setFromHashMapSize;
     public static volatile int setFromTreeMapSize;
+    public static volatile int setFromTreeMapReverseSize;
     public static volatile int setFromLinkedMapSize;
     public static volatile int chmKeySetSize;
     public static volatile int chmKeySetEmptySize;
     public static volatile int hashIntegersSize;
     public static volatile int treeIntegersSize;
+    public static volatile int hashLongsSize;
+    public static volatile int hashCharsSize;
+    public static volatile int hashBooleansSize;
     public static volatile int emptySetSize;
     public static volatile int singletonSetSize;
     public static volatile int unmodifiableSetSize;
@@ -498,6 +587,11 @@ public final class CollSet
     public static volatile long chmKeySetIdXor;
     public static volatile long hashIntegersValSum;
     public static volatile long hashIntegersValXor;
+    public static volatile long linkedStringsCharSum;
+    public static volatile long linkedWithNullIdSum;
+    public static volatile long hashLongsValSum;
+    public static volatile long hashLongsValXor;
+    public static volatile long hashCharsValSum;
 
     /** Whether the treeified HashSet actually treeified at least one bin. */
     public static volatile boolean treeifiedHasTreeBin;
@@ -637,6 +731,12 @@ public final class CollSet
             hashWithNull.add(new Elem(100 + i));
         }
 
+        // HashSet containing ONLY the legal single null element (size 1).
+        hashOnlyNull = new HashSet<Elem>();
+        hashOnlyNull.add(null);
+
+        linkedEmpty = new LinkedHashSet<Elem>();
+
         linkedTwo = new LinkedHashSet<Elem>();
         linkedTwo.add(new Elem(0));
         linkedTwo.add(new Elem(1));
@@ -658,6 +758,28 @@ public final class CollSet
         }
         linkedManyIdSum = lmId;
         linkedManyIdXor = lmXor;
+
+        // LinkedHashSet<String>: String decode through the LinkedHashMap hash walk.
+        linkedStrings = new LinkedHashSet<String>();
+        long lsChar = 0;
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            final String s = "ls" + i;
+            linkedStrings.add(s);
+            lsChar += codeUnitSum(s);
+        }
+        linkedStringsCharSum = lsChar;
+
+        // LinkedHashSet with one null + NULL_SET_NONNULL reals (ids 700..702).
+        linkedWithNull = new LinkedHashSet<Elem>();
+        linkedWithNull.add(null);
+        long lwnId = 0;
+        for (int i = 0; i < NULL_SET_NONNULL; ++i)
+        {
+            linkedWithNull.add(new Elem(700 + i));
+            lwnId += (700 + i);
+        }
+        linkedWithNullIdSum = lwnId;
 
         treeEmpty = new TreeSet<Elem>();
 
@@ -697,6 +819,25 @@ public final class CollSet
         treeStrings.add("apple");
         treeStrings.add("cherry");
 
+        // TreeSet<String> with reverse comparator → descending lexicographic.
+        treeStringsReverse = new TreeSet<String>(java.util.Collections.<String>reverseOrder());
+        treeStringsReverse.add("banana");
+        treeStringsReverse.add("apple");
+        treeStringsReverse.add("cherry");
+
+        // TreeSet duplicate-add: insert SMALL_N distinct ids, then re-add each via
+        // a value-equal but distinct Elem.  TreeSet dedupes by compareTo, so size
+        // stays SMALL_N and the in-order walk surfaces each id once, ascending.
+        treeDup = new TreeSet<Elem>();
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            treeDup.add(new Elem(i));
+        }
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            treeDup.add(new Elem(i));   // value-equal duplicate → absorbed
+        }
+
         setFromHashMap = Collections.newSetFromMap(new HashMap<Elem, Boolean>());
         for (int i = 0; i < SETFROMMAP_N; ++i)
         {
@@ -722,6 +863,15 @@ public final class CollSet
             sflId += (500 + i);
         }
         setFromLinkedMapIdSum = sflId;
+
+        // newSetFromMap(TreeMap with reverse comparator): "m"-route finds "root" →
+        // TREE walk, which honours the comparator → DESCENDING decode [402,401,400].
+        setFromTreeMapReverse = Collections.newSetFromMap(
+            new TreeMap<Elem, Boolean>(java.util.Collections.<Elem>reverseOrder()));
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            setFromTreeMapReverse.add(new Elem(400 + i));
+        }
 
         // ConcurrentHashMap.newKeySet(): "map" lives on the KeySetView SUPERCLASS
         // (CollectionView), so find_field must walk supers; the backing CHM has a
@@ -757,6 +907,35 @@ public final class CollSet
             treeIntegers.add(Integer.valueOf(i));
         }
 
+        // HashSet<Long>: 8-byte boxed-primitive `value` field read through the key
+        // walk.  Values 0..INT_N-1 as longs.
+        hashLongs = new HashSet<Long>();
+        long hlSum = 0, hlXor = 0;
+        for (int i = 0; i < INT_N; ++i)
+        {
+            hashLongs.add(Long.valueOf(i));
+            hlSum += i;
+            hlXor ^= i;
+        }
+        hashLongsValSum = hlSum;
+        hashLongsValXor = hlXor;
+
+        // HashSet<Character>: boxed char `value` field read.  'a'..'a'+CHAR_N-1.
+        hashChars = new HashSet<Character>();
+        long hcSum = 0;
+        for (int i = 0; i < CHAR_N; ++i)
+        {
+            final char c = (char) ('a' + i);
+            hashChars.add(Character.valueOf(c));
+            hcSum += c;
+        }
+        hashCharsValSum = hcSum;
+
+        // HashSet<Boolean>: the maximal Boolean set is {TRUE, FALSE} (size 2).
+        hashBooleans = new HashSet<Boolean>();
+        hashBooleans.add(Boolean.TRUE);
+        hashBooleans.add(Boolean.FALSE);
+
         // EnumSet (characterized only): RegularEnumSet stores a primitive long
         // bitmask, no fast-path field shape.
         enumSetSome = EnumSet.of(Thread.State.NEW, Thread.State.RUNNABLE, Thread.State.TERMINATED);
@@ -787,9 +966,13 @@ public final class CollSet
         hashTreeifiedSize = hashTreeified.size();
         hashCollisionChainSize = hashCollisionChain.size();
         hashWithNullSize = hashWithNull.size();
+        hashOnlyNullSize = hashOnlyNull.size();
+        linkedEmptySize = linkedEmpty.size();
         linkedTwoSize = linkedTwo.size();
         linkedSmallSize = linkedSmall.size();
         linkedManySize = linkedMany.size();
+        linkedStringsSize = linkedStrings.size();
+        linkedWithNullSize = linkedWithNull.size();
         treeEmptySize = treeEmpty.size();
         treeSingleSize = treeSingle.size();
         treeTwoSize = treeTwo.size();
@@ -797,13 +980,19 @@ public final class CollSet
         treeManySize = treeMany.size();
         treeReverseSize = treeReverse.size();
         treeStringsSize = treeStrings.size();
+        treeStringsReverseSize = treeStringsReverse.size();
+        treeDupSize = treeDup.size();
         setFromHashMapSize = setFromHashMap.size();
         setFromTreeMapSize = setFromTreeMap.size();
+        setFromTreeMapReverseSize = setFromTreeMapReverse.size();
         setFromLinkedMapSize = setFromLinkedMap.size();
         chmKeySetSize = chmKeySet.size();
         chmKeySetEmptySize = chmKeySetEmpty.size();
         hashIntegersSize = hashIntegers.size();
         treeIntegersSize = treeIntegers.size();
+        hashLongsSize = hashLongs.size();
+        hashCharsSize = hashChars.size();
+        hashBooleansSize = hashBooleans.size();
         emptySetSize = emptySet.size();
         singletonSetSize = singletonSet.size();
         unmodifiableSetSize = unmodifiableSet.size();

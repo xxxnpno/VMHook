@@ -49,6 +49,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -101,6 +102,32 @@ namespace
         static auto record_string_hash()     -> std::int32_t { return static_field("recordStringHash")->get(); }
 
         static auto ctor_calls() -> std::int32_t { return static_field("ctorCalls")->get(); }
+
+        // -- narrow / wide primitive ARG recorders (one per marshaller arm) --
+        static auto arg_bool_called()  -> bool        { return static_field("argBoolCalled")->get(); }
+        static auto arg_bool_value()   -> bool        { return static_field("argBoolValue")->get(); }
+        static auto arg_byte_called()  -> bool        { return static_field("argByteCalled")->get(); }
+        static auto arg_byte_value()   -> std::int32_t { return static_field("argByteValue")->get(); }
+        static auto arg_char_called()  -> bool        { return static_field("argCharCalled")->get(); }
+        static auto arg_char_value()   -> std::int32_t { return static_field("argCharValue")->get(); }
+        static auto arg_short_called() -> bool        { return static_field("argShortCalled")->get(); }
+        static auto arg_short_value()  -> std::int32_t { return static_field("argShortValue")->get(); }
+        static auto arg_float_called() -> bool        { return static_field("argFloatCalled")->get(); }
+        static auto arg_float_bits()   -> std::int32_t { return static_field("argFloatBits")->get(); }
+        static auto arg_double_called()-> bool        { return static_field("argDoubleCalled")->get(); }
+        static auto arg_double_bits()  -> std::int64_t { return static_field("argDoubleBits")->get(); }
+
+        // -- many-arg / all-two-slot shape recorders --
+        static auto six_arg_called()   -> bool        { return static_field("sixArgCalled")->get(); }
+        static auto six_arg_packed()   -> std::int64_t { return static_field("sixArgPacked")->get(); }
+        static auto four_wide_called() -> bool        { return static_field("fourWideCalled")->get(); }
+        static auto four_wide_result() -> std::int64_t { return static_field("fourWideResult")->get(); }
+
+        // -- null-reference ARG contract recorders --
+        static auto null_str_called()  -> bool        { return static_field("nullStrArgCalled")->get(); }
+        static auto null_str_was_null()-> bool        { return static_field("nullStrArgWasNull")->get(); }
+        static auto null_obj_called()  -> bool        { return static_field("nullObjArgCalled")->get(); }
+        static auto null_obj_was_null()-> bool        { return static_field("nullObjArgWasNull")->get(); }
 
         // -- instance primitive returners (convert at the exact target type) --
         auto call_bool(const char* n) -> bool          { return get_method(n)->call(); }
@@ -312,6 +339,78 @@ namespace
     std::atomic<int>          g_exc_seen_at_least_one{ -1 }; // a throw WAS observed pending pre-clear
     constexpr std::int32_t    k_exc_recovery = 0x33EC0DE5;   // recovery echo sentinel
 
+    // ── float / double SPECIAL-VALUE RETURNS (IEEE-754 fidelity decode) ─────
+    // Raw bits captured so NaN / inf / -0.0 / denormal survive the atomic.
+    std::atomic<bool>          g_fret_special_captured{ false };
+    std::atomic<std::uint32_t> g_fret_nan_bits{ 0 };
+    std::atomic<std::uint32_t> g_fret_posinf_bits{ 0 };
+    std::atomic<std::uint32_t> g_fret_neginf_bits{ 0 };
+    std::atomic<std::uint32_t> g_fret_negzero_bits{ 0 };
+    std::atomic<std::uint32_t> g_fret_denorm_bits{ 0 };
+    std::atomic<bool>          g_dret_special_captured{ false };
+    std::atomic<std::uint64_t> g_dret_nan_bits{ 0 };
+    std::atomic<std::uint64_t> g_dret_posinf_bits{ 0 };
+    std::atomic<std::uint64_t> g_dret_negzero_bits{ 0 };
+    std::atomic<std::uint64_t> g_dret_denorm_bits{ 0 };
+    // Static special-value returns (CallStatic<F|D>MethodA arm).
+    std::atomic<bool>          g_s_special_captured{ false };
+    std::atomic<std::uint32_t> g_s_fret_nan_bits{ 0 };
+    std::atomic<std::uint64_t> g_s_dret_posinf_bits{ 0 };
+    std::atomic<std::uint64_t> g_s_dret_negzero_bits{ 0 };
+
+    // ── float / double ARG round-trips (F/D marshaller arm + return decode) ──
+    std::atomic<bool>          g_fd_arg_captured{ false };
+    std::atomic<std::uint32_t> g_echo_float_bits{ 0 };       // echoFloat(-7.25f)
+    std::atomic<std::uint64_t> g_echo_double_bits{ 0 };      // echoDouble(123.456)
+    std::atomic<std::uint32_t> g_echo_float_nan_bits{ 0 };   // echoFloat(NaN)
+    std::atomic<std::uint32_t> g_s_echo_float_bits{ 0 };     // sEchoFloat(-7.25f)
+    std::atomic<std::uint64_t> g_s_echo_double_bits{ 0 };    // sEchoDouble(123.456)
+
+    // ── boundary primitive ARG echoes (int/long edge values round-trip) ─────
+    std::atomic<std::int64_t> g_echo_int_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_int_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_int_neg1{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_int_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_neg1{ k_uncaptured };
+
+    // ── many-arg / all-two-slot ARG shapes (slot-array layout proof) ────────
+    std::atomic<std::int64_t> g_six_arg_ret{ k_uncaptured };
+    std::atomic<std::int64_t> g_s_six_arg_ret{ k_uncaptured };
+    std::atomic<std::int64_t> g_four_wide_ret{ k_uncaptured };
+
+    // ── narrow/wide primitive ARG round-trips into the JVM (per arm) ─────────
+    std::atomic<int> g_arg_runs{ 0 };   // count of arg-record calls performed
+
+    // ── null-reference ARG contract ─────────────────────────────────────────
+    std::atomic<int> g_null_str_ran{ -1 };
+    std::atomic<int> g_null_obj_ran{ -1 };
+
+    // ── additional primitive-array returns (per-stride '[' arm) ─────────────
+    std::atomic<std::int64_t> g_byte_arr_len{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_arr_e0{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_arr_e2{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_arr_e3{ k_uncaptured };
+    std::atomic<std::int64_t> g_bool_arr_len{ k_uncaptured };
+    std::atomic<std::int64_t> g_bool_arr_e0{ k_uncaptured };
+    std::atomic<std::int64_t> g_bool_arr_e1{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_arr_len{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_arr_e0{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_arr_e2{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_arr_len{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_arr_e0{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_arr_e1{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_arr_e2{ k_uncaptured };
+    std::atomic<std::int64_t> g_dbl_arr_len{ k_uncaptured };
+    std::atomic<bool>         g_dbl_arr_captured{ false };
+    std::atomic<std::uint64_t> g_dbl_arr_e0_bits{ 0 };
+    std::atomic<std::uint64_t> g_dbl_arr_e2_bits{ 0 };
+    std::atomic<std::int64_t> g_flt_arr_len{ k_uncaptured };
+    std::atomic<bool>         g_flt_arr_captured{ false };
+    std::atomic<std::uint32_t> g_flt_arr_e0_bits{ 0 };
+    std::atomic<std::uint32_t> g_flt_arr_e1_bits{ 0 };
+
     // Sentinels (mirror the fixture's boundary values).
     constexpr std::int64_t k_int_ret    = 0x0BADF00DLL;            // 195948557
     constexpr std::int64_t k_long_ret   = static_cast<std::int64_t>(0x0123456789ABCDEFLL);
@@ -321,6 +420,36 @@ namespace
     constexpr std::int64_t k_sum_j      = 0x0000000100000000LL;    // 4294967296 (high dword set)
     constexpr double       k_sum_d      = 250.0;                   // exact (long)d == 250
     constexpr std::int32_t k_post_echo  = 0x1357ACE0;
+
+    // Boundary echo sentinels.
+    constexpr std::int32_t k_int_min    = static_cast<std::int32_t>(0x80000000);   // INT_MIN
+    constexpr std::int32_t k_int_max    = 0x7FFFFFFF;                              // INT_MAX
+    constexpr std::int64_t k_long_min   = static_cast<std::int64_t>(0x8000000000000000LL);
+    constexpr std::int64_t k_long_max   = 0x7FFFFFFFFFFFFFFFLL;
+
+    // float/double ARG sentinels (exactly representable -> bit-exact round trip).
+    constexpr float        k_echo_float  = -7.25f;          // exact in binary
+    constexpr double       k_echo_double = 123.456;         // not exact, but bit-stable round trip
+
+    // Six-arg / four-wide sentinels (mixed single/two-slot).
+    constexpr std::int32_t k_six_a = 7;
+    constexpr std::int64_t k_six_b = 0x0000000200000000LL;  // 8589934592 (high dword set)
+    constexpr std::int32_t k_six_c = -3;
+    constexpr double       k_six_d = 64.0;                  // exact (long)d == 64
+    constexpr std::int64_t k_six_e = static_cast<std::int64_t>(0x00000000F0000000LL);
+    constexpr std::int32_t k_six_f = 11;
+    // four-wide: (J,D,J,D) -> a + c + (long)b - (long)d
+    constexpr std::int64_t k_fw_a = static_cast<std::int64_t>(0x1111000022220000LL);
+    constexpr double       k_fw_b = 500.0;
+    constexpr std::int64_t k_fw_c = static_cast<std::int64_t>(0x0000333300004444LL);
+    constexpr double       k_fw_d = 125.0;
+
+    // Narrow primitive ARG sentinels.
+    constexpr std::int32_t k_arg_byte_int  = -7;            // (byte)-7 sign-extends to -7
+    constexpr std::int32_t k_arg_char_int  = 65535;         // (char)0xFFFF zero-extends
+    constexpr std::int32_t k_arg_short_int = -12345;        // sign-extends
+    constexpr float        k_arg_float     = 2.5f;          // exact
+    constexpr double       k_arg_double    = -8.5;          // exact
 
     auto run_all(const std::unique_ptr<method_call_jni>& self) -> void
     {
@@ -382,6 +511,281 @@ namespace
         g_echo_long.store(static_cast<std::int64_t>(s.get_method("echoLong")->call(k_echo_long)));
         g_s_echo_int.store(static_cast<std::int32_t>(
             method_call_jni::static_method("sEchoInt")->call(k_echo_int)));
+
+        // ───────── boundary primitive-arg echoes (int/long edge values) ─────────
+        // echoIntId / echoLongId return their arg WITHOUT touching lastEchoArg, so
+        // these extra echoes cannot clobber the mcj_echo_int_side_effect breadcrumb.
+        {
+            auto p{ s.get_method("echoIntId") };
+            if (p.has_value())
+            {
+                g_echo_int_min.store(static_cast<std::int32_t>(p->call(k_int_min)));
+                g_echo_int_max.store(static_cast<std::int32_t>(p->call(k_int_max)));
+                g_echo_int_neg1.store(static_cast<std::int32_t>(p->call(static_cast<std::int32_t>(-1))));
+                g_echo_int_zero.store(static_cast<std::int32_t>(p->call(static_cast<std::int32_t>(0))));
+            }
+        }
+        {
+            auto p{ s.get_method("echoLongId") };
+            if (p.has_value())
+            {
+                g_echo_long_min.store(static_cast<std::int64_t>(p->call(k_long_min)));
+                g_echo_long_max.store(static_cast<std::int64_t>(p->call(k_long_max)));
+                g_echo_long_neg1.store(static_cast<std::int64_t>(p->call(static_cast<std::int64_t>(-1))));
+            }
+        }
+
+        // ───────── float / double ARG round-trips (F/D marshaller arm) ──────────
+        // echoFloat/echoDouble round-trip an F/D arg AND decode the F/D return in
+        // one call.  Captured as raw bits so a NaN arg survives.
+        {
+            auto p{ s.get_method("echoFloat") };
+            if (p.has_value())
+            {
+                g_echo_float_bits.store(f2bits(static_cast<float>(p->call(k_echo_float))));
+                g_echo_float_nan_bits.store(
+                    f2bits(static_cast<float>(p->call(std::numeric_limits<float>::quiet_NaN()))));
+            }
+        }
+        {
+            auto p{ s.get_method("echoDouble") };
+            if (p.has_value())
+            {
+                g_echo_double_bits.store(d2bits(static_cast<double>(p->call(k_echo_double))));
+            }
+            g_fd_arg_captured.store(true);
+        }
+        {
+            auto p{ method_call_jni::static_method("sEchoFloat") };
+            if (p.has_value())
+            {
+                g_s_echo_float_bits.store(f2bits(static_cast<float>(p->call(k_echo_float))));
+            }
+        }
+        {
+            auto p{ method_call_jni::static_method("sEchoDouble") };
+            if (p.has_value())
+            {
+                g_s_echo_double_bits.store(d2bits(static_cast<double>(p->call(k_echo_double))));
+            }
+        }
+
+        // ───────── narrow / wide primitive ARG recorders (per marshaller arm) ───
+        // bool(Z), byte(B narrow out.i), char(C narrow out.i zero-ext), short(S
+        // narrow out.i sign-ext), float(F), double(D) — each body publishes a
+        // pure-int / raw-bit measurement of the JVM-side value.
+        {
+            auto p{ s.get_method("recordBool") };
+            if (p.has_value()) { p->call(true); ++g_arg_runs; }
+        }
+        {
+            auto p{ s.get_method("recordByte") };
+            if (p.has_value())
+            {
+                p->call(static_cast<std::int8_t>(k_arg_byte_int));
+                ++g_arg_runs;
+            }
+        }
+        {
+            auto p{ s.get_method("recordChar") };
+            if (p.has_value())
+            {
+                p->call(static_cast<std::uint16_t>(k_arg_char_int)); // 0xFFFF
+                ++g_arg_runs;
+            }
+        }
+        {
+            auto p{ s.get_method("recordShort") };
+            if (p.has_value())
+            {
+                p->call(static_cast<std::int16_t>(k_arg_short_int));
+                ++g_arg_runs;
+            }
+        }
+        {
+            auto p{ s.get_method("recordFloat") };
+            if (p.has_value()) { p->call(k_arg_float); ++g_arg_runs; }
+        }
+        {
+            auto p{ s.get_method("recordDouble") };
+            if (p.has_value()) { p->call(k_arg_double); ++g_arg_runs; }
+        }
+
+        // ───────── many-arg / all-two-slot ARG shapes (slot-array layout) ───────
+        // result = a + c + f + b + e + (long)d ; six args mixing single+two-slot.
+        {
+            auto p{ s.get_method("sixArg") };
+            if (p.has_value())
+            {
+                g_six_arg_ret.store(static_cast<std::int64_t>(
+                    p->call(k_six_a, k_six_b, k_six_c, k_six_d, k_six_e, k_six_f)));
+            }
+        }
+        {
+            auto p{ method_call_jni::static_method("sSixArg") };
+            if (p.has_value())
+            {
+                g_s_six_arg_ret.store(static_cast<std::int64_t>(
+                    p->call(k_six_a, k_six_b, k_six_c, k_six_d, k_six_e, k_six_f)));
+            }
+        }
+        // result = a + c + (long)b - (long)d ; four CONSECUTIVE two-slot args.
+        {
+            auto p{ s.get_method("fourWide") };
+            if (p.has_value())
+            {
+                g_four_wide_ret.store(static_cast<std::int64_t>(
+                    p->call(k_fw_a, k_fw_b, k_fw_c, k_fw_d)));
+            }
+        }
+
+        // ───────── null-reference ARG contract (null -> Java null) ──────────────
+        // A null const char* and a null unique_ptr must reach the JVM as a genuine
+        // null reference.  We pass a default-constructed null unique_ptr and a
+        // null C-string and assert the body observed null.
+        {
+            auto p{ s.get_method("consumeNullableString") };
+            if (p.has_value())
+            {
+                const char* const null_cstr{ nullptr };
+                p->call(null_cstr);
+                g_null_str_ran.store(1);
+            }
+        }
+        {
+            auto p{ s.get_method("consumeNullableObject") };
+            if (p.has_value())
+            {
+                std::unique_ptr<method_call_jni> null_obj{};
+                p->call(null_obj);
+                g_null_obj_ran.store(1);
+            }
+        }
+
+        // ───────── float / double SPECIAL-VALUE returns (IEEE-754 fidelity) ─────
+        {
+            auto pn{ s.get_method("retFloatNaN") };
+            auto pi{ s.get_method("retFloatPosInf") };
+            auto pj{ s.get_method("retFloatNegInf") };
+            auto pz{ s.get_method("retFloatNegZero") };
+            auto pd{ s.get_method("retFloatDenormal") };
+            if (pn.has_value()) { g_fret_nan_bits.store(f2bits(static_cast<float>(pn->call()))); }
+            if (pi.has_value()) { g_fret_posinf_bits.store(f2bits(static_cast<float>(pi->call()))); }
+            if (pj.has_value()) { g_fret_neginf_bits.store(f2bits(static_cast<float>(pj->call()))); }
+            if (pz.has_value()) { g_fret_negzero_bits.store(f2bits(static_cast<float>(pz->call()))); }
+            if (pd.has_value()) { g_fret_denorm_bits.store(f2bits(static_cast<float>(pd->call()))); }
+            g_fret_special_captured.store(true);
+        }
+        {
+            auto pn{ s.get_method("retDoubleNaN") };
+            auto pi{ s.get_method("retDoublePosInf") };
+            auto pz{ s.get_method("retDoubleNegZero") };
+            auto pd{ s.get_method("retDoubleDenormal") };
+            if (pn.has_value()) { g_dret_nan_bits.store(d2bits(static_cast<double>(pn->call()))); }
+            if (pi.has_value()) { g_dret_posinf_bits.store(d2bits(static_cast<double>(pi->call()))); }
+            if (pz.has_value()) { g_dret_negzero_bits.store(d2bits(static_cast<double>(pz->call()))); }
+            if (pd.has_value()) { g_dret_denorm_bits.store(d2bits(static_cast<double>(pd->call()))); }
+            g_dret_special_captured.store(true);
+        }
+        {
+            auto pn{ method_call_jni::static_method("sRetFloatNaN") };
+            auto pi{ method_call_jni::static_method("sRetDoublePosInf") };
+            auto pz{ method_call_jni::static_method("sRetDoubleNegZero") };
+            if (pn.has_value()) { g_s_fret_nan_bits.store(f2bits(static_cast<float>(pn->call()))); }
+            if (pi.has_value()) { g_s_dret_posinf_bits.store(d2bits(static_cast<double>(pi->call()))); }
+            if (pz.has_value()) { g_s_dret_negzero_bits.store(d2bits(static_cast<double>(pz->call()))); }
+            g_s_special_captured.store(true);
+        }
+
+        // ───────── additional primitive-array returns (per-stride '[' arm) ──────
+        // byte[] { -1, 0, 127, -128 } — 1-byte stride, sign-extending read.
+        {
+            auto p{ s.get_method("retByteArray") };
+            if (p.has_value())
+            {
+                void* const arr{ static_cast<void*>(p->call()) };
+                if (arr != nullptr)
+                {
+                    g_byte_arr_len.store(vmhook::array_length(arr));
+                    g_byte_arr_e0.store(vmhook::get_array_element<std::int8_t>(arr, 0));
+                    g_byte_arr_e2.store(vmhook::get_array_element<std::int8_t>(arr, 2));
+                    g_byte_arr_e3.store(vmhook::get_array_element<std::int8_t>(arr, 3));
+                }
+            }
+        }
+        // boolean[] { true, false, true } — 1-byte stride (0/1).
+        {
+            auto p{ s.get_method("retBoolArray") };
+            if (p.has_value())
+            {
+                void* const arr{ static_cast<void*>(p->call()) };
+                if (arr != nullptr)
+                {
+                    g_bool_arr_len.store(vmhook::array_length(arr));
+                    g_bool_arr_e0.store(vmhook::get_array_element<std::uint8_t>(arr, 0) != 0 ? 1 : 0);
+                    g_bool_arr_e1.store(vmhook::get_array_element<std::uint8_t>(arr, 1) != 0 ? 1 : 0);
+                }
+            }
+        }
+        // short[] { -32768, 0, 32767 } — 2-byte stride, sign.
+        {
+            auto p{ s.get_method("retShortArray") };
+            if (p.has_value())
+            {
+                void* const arr{ static_cast<void*>(p->call()) };
+                if (arr != nullptr)
+                {
+                    g_short_arr_len.store(vmhook::array_length(arr));
+                    g_short_arr_e0.store(vmhook::get_array_element<std::int16_t>(arr, 0));
+                    g_short_arr_e2.store(vmhook::get_array_element<std::int16_t>(arr, 2));
+                }
+            }
+        }
+        // char[] { 'A', 0xFFFF, '0' } — 2-byte stride, zero-extend.
+        {
+            auto p{ s.get_method("retCharArray") };
+            if (p.has_value())
+            {
+                void* const arr{ static_cast<void*>(p->call()) };
+                if (arr != nullptr)
+                {
+                    g_char_arr_len.store(vmhook::array_length(arr));
+                    g_char_arr_e0.store(vmhook::get_array_element<std::uint16_t>(arr, 0));
+                    g_char_arr_e1.store(vmhook::get_array_element<std::uint16_t>(arr, 1));
+                    g_char_arr_e2.store(vmhook::get_array_element<std::uint16_t>(arr, 2));
+                }
+            }
+        }
+        // double[] { 1.5, -2.5, 1024.0 } — 8-byte stride, IEEE bits.
+        {
+            auto p{ s.get_method("retDoubleArray") };
+            if (p.has_value())
+            {
+                void* const arr{ static_cast<void*>(p->call()) };
+                if (arr != nullptr)
+                {
+                    g_dbl_arr_len.store(vmhook::array_length(arr));
+                    g_dbl_arr_e0_bits.store(d2bits(vmhook::get_array_element<double>(arr, 0)));
+                    g_dbl_arr_e2_bits.store(d2bits(vmhook::get_array_element<double>(arr, 2)));
+                    g_dbl_arr_captured.store(true);
+                }
+            }
+        }
+        // float[] { 0.5, -0.5, 3.5, -3.5 } — 4-byte stride, IEEE bits.
+        {
+            auto p{ s.get_method("retFloatArray") };
+            if (p.has_value())
+            {
+                void* const arr{ static_cast<void*>(p->call()) };
+                if (arr != nullptr)
+                {
+                    g_flt_arr_len.store(vmhook::array_length(arr));
+                    g_flt_arr_e0_bits.store(f2bits(vmhook::get_array_element<float>(arr, 0)));
+                    g_flt_arr_e1_bits.store(f2bits(vmhook::get_array_element<float>(arr, 1)));
+                    g_flt_arr_captured.store(true);
+                }
+            }
+        }
 
         // ───────── multi-arg (int, long, double) — two-slot args ─────────
         // Expected return = i + j + (long)d.
@@ -968,6 +1372,195 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
         ctx.check("mcj_multi_arg_int", method_call_jni::multi_arg_int() == k_sum_i);
         ctx.check("mcj_multi_arg_long", method_call_jni::multi_arg_long() == k_sum_j);
         ctx.check("mcj_multi_arg_double", method_call_jni::multi_arg_double() == k_sum_d);
+
+        // ═════════════════════ boundary primitive-arg echoes ══════════════════
+        // INT_MIN / INT_MAX / -1 / 0 and LONG_MIN / LONG_MAX / -1 round-trip
+        // exactly through the narrow (out.i) and wide (out.j) marshaller arms.
+        ctx.check("mcj_echo_int_min", g_echo_int_min.load() == k_int_min);
+        ctx.check("mcj_echo_int_max", g_echo_int_max.load() == k_int_max);
+        ctx.check("mcj_echo_int_neg1", g_echo_int_neg1.load() == -1);
+        ctx.check("mcj_echo_int_zero", g_echo_int_zero.load() == 0);
+        ctx.check("mcj_echo_long_min", g_echo_long_min.load() == k_long_min);
+        ctx.check("mcj_echo_long_max", g_echo_long_max.load() == k_long_max);
+        ctx.check("mcj_echo_long_neg1", g_echo_long_neg1.load() == -1);
+
+        // ═════════════════════ float / double ARG round-trips ═════════════════
+        // The F / D marshaller arm AND the F / D return decode in one call each.
+        ctx.check("mcj_fd_arg_captured", g_fd_arg_captured.load());
+        {
+            float f{ 0.0f };
+            const std::uint32_t b{ g_echo_float_bits.load() };
+            std::memcpy(&f, &b, sizeof(f));
+            ctx.check("mcj_echo_float_arg_exact", f == k_echo_float);
+        }
+        // A NaN float arg must round-trip as a NaN (payload may be canonicalized
+        // by the JVM, so assert NaN-ness via the bit pattern's exponent/mantissa,
+        // not exact bits — exponent all ones AND non-zero mantissa).
+        {
+            const std::uint32_t b{ g_echo_float_nan_bits.load() };
+            const bool is_nan{ (b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu) != 0u };
+            ctx.check("mcj_echo_float_arg_nan_is_nan", is_nan);
+        }
+        {
+            double d{ 0.0 };
+            const std::uint64_t b{ g_echo_double_bits.load() };
+            std::memcpy(&d, &b, sizeof(d));
+            ctx.check("mcj_echo_double_arg_exact", d == k_echo_double);
+        }
+        {
+            float f{ 0.0f };
+            const std::uint32_t b{ g_s_echo_float_bits.load() };
+            std::memcpy(&f, &b, sizeof(f));
+            ctx.check("mcj_static_echo_float_arg_exact", f == k_echo_float);
+        }
+        {
+            double d{ 0.0 };
+            const std::uint64_t b{ g_s_echo_double_bits.load() };
+            std::memcpy(&d, &b, sizeof(d));
+            ctx.check("mcj_static_echo_double_arg_exact", d == k_echo_double);
+        }
+
+        // ═════════════════════ narrow / wide primitive ARG recorders ══════════
+        // Each marshaller arm (Z / B / C / S / F / D) delivered its arg verbatim.
+        ctx.check("mcj_arg_record_runs", g_arg_runs.load() == 6);
+        ctx.check("mcj_arg_bool_body_ran", method_call_jni::arg_bool_called());
+        ctx.check("mcj_arg_bool_true", method_call_jni::arg_bool_value());
+        ctx.check("mcj_arg_byte_body_ran", method_call_jni::arg_byte_called());
+        ctx.check("mcj_arg_byte_sign_extends", method_call_jni::arg_byte_value() == k_arg_byte_int);
+        ctx.check("mcj_arg_char_body_ran", method_call_jni::arg_char_called());
+        ctx.check("mcj_arg_char_zero_extends_65535", method_call_jni::arg_char_value() == k_arg_char_int);
+        ctx.check("mcj_arg_short_body_ran", method_call_jni::arg_short_called());
+        ctx.check("mcj_arg_short_sign_extends", method_call_jni::arg_short_value() == k_arg_short_int);
+        ctx.check("mcj_arg_float_body_ran", method_call_jni::arg_float_called());
+        {
+            float f{ 0.0f };
+            const std::int32_t raw{ method_call_jni::arg_float_bits() };
+            std::uint32_t b{ 0 };
+            std::memcpy(&b, &raw, sizeof(b));
+            std::memcpy(&f, &b, sizeof(f));
+            ctx.check("mcj_arg_float_value_2_5", f == k_arg_float);
+        }
+        ctx.check("mcj_arg_double_body_ran", method_call_jni::arg_double_called());
+        {
+            double d{ 0.0 };
+            const std::int64_t raw{ method_call_jni::arg_double_bits() };
+            std::uint64_t b{ 0 };
+            std::memcpy(&b, &raw, sizeof(b));
+            std::memcpy(&d, &b, sizeof(d));
+            ctx.check("mcj_arg_double_value_neg_8_5", d == k_arg_double);
+        }
+
+        // ═════════════════════ many-arg / all-two-slot ARG shapes ═════════════
+        // result = a + c + f + b + e + (long)d ; six args, mixed single/two-slot.
+        const std::int64_t expected_six{ static_cast<std::int64_t>(k_six_a)
+                                         + k_six_b + static_cast<std::int64_t>(k_six_c)
+                                         + static_cast<std::int64_t>(k_six_d)
+                                         + k_six_e + static_cast<std::int64_t>(k_six_f) };
+        ctx.check("mcj_six_arg_instance_return_correct", g_six_arg_ret.load() == expected_six);
+        ctx.check("mcj_six_arg_static_return_correct", g_s_six_arg_ret.load() == expected_six);
+        ctx.check("mcj_six_arg_body_ran", method_call_jni::six_arg_called());
+        ctx.check("mcj_six_arg_body_packed_matches", method_call_jni::six_arg_packed() == expected_six);
+        // result = a + c + (long)b - (long)d ; four consecutive two-slot args.
+        const std::int64_t expected_fw{ k_fw_a + k_fw_c
+                                        + static_cast<std::int64_t>(k_fw_b)
+                                        - static_cast<std::int64_t>(k_fw_d) };
+        ctx.check("mcj_four_wide_return_correct", g_four_wide_ret.load() == expected_fw);
+        ctx.check("mcj_four_wide_body_ran", method_call_jni::four_wide_called());
+        ctx.check("mcj_four_wide_body_result_matches", method_call_jni::four_wide_result() == expected_fw);
+
+        // ═════════════════════ null-reference ARG contract ════════════════════
+        // A null const char* and a null unique_ptr reached the JVM as Java null.
+        ctx.check("mcj_null_string_arg_ran", g_null_str_ran.load() == 1);
+        ctx.check("mcj_null_string_arg_body_ran", method_call_jni::null_str_called());
+        ctx.check("mcj_null_string_arg_was_null", method_call_jni::null_str_was_null());
+        ctx.check("mcj_null_object_arg_ran", g_null_obj_ran.load() == 1);
+        ctx.check("mcj_null_object_arg_body_ran", method_call_jni::null_obj_called());
+        ctx.check("mcj_null_object_arg_was_null", method_call_jni::null_obj_was_null());
+
+        // ═════════════════════ float / double SPECIAL-VALUE returns ═══════════
+        // IEEE-754 fidelity of the 'F'/'D' return arm for NaN / inf / -0.0 /
+        // denormal — proven via exact bit patterns (NaN tested as NaN-ness, since
+        // the JVM may canonicalize the payload).
+        ctx.check("mcj_float_special_captured", g_fret_special_captured.load());
+        {
+            const std::uint32_t b{ g_fret_nan_bits.load() };
+            const bool is_nan{ (b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu) != 0u };
+            ctx.check("mcj_float_ret_nan_is_nan", is_nan);
+        }
+        ctx.check("mcj_float_ret_pos_inf_bits", g_fret_posinf_bits.load() == 0x7F800000u);
+        ctx.check("mcj_float_ret_neg_inf_bits", g_fret_neginf_bits.load() == 0xFF800000u);
+        ctx.check("mcj_float_ret_neg_zero_bits", g_fret_negzero_bits.load() == 0x80000000u);
+        ctx.check("mcj_float_ret_denormal_bits", g_fret_denorm_bits.load() == 0x00000001u); // Float.MIN_VALUE
+        ctx.check("mcj_double_special_captured", g_dret_special_captured.load());
+        {
+            const std::uint64_t b{ g_dret_nan_bits.load() };
+            const bool is_nan{ (b & 0x7FF0000000000000ull) == 0x7FF0000000000000ull
+                               && (b & 0x000FFFFFFFFFFFFFull) != 0ull };
+            ctx.check("mcj_double_ret_nan_is_nan", is_nan);
+        }
+        ctx.check("mcj_double_ret_pos_inf_bits", g_dret_posinf_bits.load() == 0x7FF0000000000000ull);
+        ctx.check("mcj_double_ret_neg_zero_bits", g_dret_negzero_bits.load() == 0x8000000000000000ull);
+        ctx.check("mcj_double_ret_denormal_bits", g_dret_denorm_bits.load() == 0x0000000000000001ull); // Double.MIN_VALUE
+        // Static special-value returns (CallStatic<F|D>MethodA arm).
+        ctx.check("mcj_static_special_captured", g_s_special_captured.load());
+        {
+            const std::uint32_t b{ g_s_fret_nan_bits.load() };
+            const bool is_nan{ (b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu) != 0u };
+            ctx.check("mcj_static_float_ret_nan_is_nan", is_nan);
+        }
+        ctx.check("mcj_static_double_ret_pos_inf_bits", g_s_dret_posinf_bits.load() == 0x7FF0000000000000ull);
+        ctx.check("mcj_static_double_ret_neg_zero_bits", g_s_dret_negzero_bits.load() == 0x8000000000000000ull);
+
+        // ═════════════════════ additional primitive-array returns ═════════════
+        // Every element stride the '[' arm + get_array_element must handle.
+        // byte[] { -1, 0, 127, -128 } — 1-byte, sign-extending.
+        ctx.check("mcj_byte_array_length_4", g_byte_arr_len.load() == 4);
+        ctx.check("mcj_byte_array_elem0_neg1", g_byte_arr_e0.load() == -1);
+        ctx.check("mcj_byte_array_elem2_127", g_byte_arr_e2.load() == 127);
+        ctx.check("mcj_byte_array_elem3_neg128", g_byte_arr_e3.load() == -128);
+        // boolean[] { true, false, true } — 1-byte 0/1.
+        ctx.check("mcj_bool_array_length_3", g_bool_arr_len.load() == 3);
+        ctx.check("mcj_bool_array_elem0_true", g_bool_arr_e0.load() == 1);
+        ctx.check("mcj_bool_array_elem1_false", g_bool_arr_e1.load() == 0);
+        // short[] { -32768, 0, 32767 } — 2-byte, sign.
+        ctx.check("mcj_short_array_length_3", g_short_arr_len.load() == 3);
+        ctx.check("mcj_short_array_elem0_min", g_short_arr_e0.load() == -32768);
+        ctx.check("mcj_short_array_elem2_max", g_short_arr_e2.load() == 32767);
+        // char[] { 'A', 0xFFFF, '0' } — 2-byte, zero-extend.
+        ctx.check("mcj_char_array_length_3", g_char_arr_len.load() == 3);
+        ctx.check("mcj_char_array_elem0_65", g_char_arr_e0.load() == 65);
+        ctx.check("mcj_char_array_elem1_65535", g_char_arr_e1.load() == 65535);
+        ctx.check("mcj_char_array_elem2_48", g_char_arr_e2.load() == 48);
+        // double[] { 1.5, -2.5, 1024.0 } — 8-byte, IEEE bits.
+        ctx.check("mcj_double_array_length_3", g_dbl_arr_len.load() == 3);
+        ctx.check("mcj_double_array_captured", g_dbl_arr_captured.load());
+        {
+            double d{ 0.0 };
+            const std::uint64_t b{ g_dbl_arr_e0_bits.load() };
+            std::memcpy(&d, &b, sizeof(d));
+            ctx.check("mcj_double_array_elem0_1_5", d == 1.5);
+        }
+        {
+            double d{ 0.0 };
+            const std::uint64_t b{ g_dbl_arr_e2_bits.load() };
+            std::memcpy(&d, &b, sizeof(d));
+            ctx.check("mcj_double_array_elem2_1024", d == 1024.0);
+        }
+        // float[] { 0.5, -0.5, 3.5, -3.5 } — 4-byte, IEEE bits.
+        ctx.check("mcj_float_array_length_4", g_flt_arr_len.load() == 4);
+        ctx.check("mcj_float_array_captured", g_flt_arr_captured.load());
+        {
+            float f{ 0.0f };
+            const std::uint32_t b{ g_flt_arr_e0_bits.load() };
+            std::memcpy(&f, &b, sizeof(f));
+            ctx.check("mcj_float_array_elem0_0_5", f == 0.5f);
+        }
+        {
+            float f{ 0.0f };
+            const std::uint32_t b{ g_flt_arr_e1_bits.load() };
+            std::memcpy(&f, &b, sizeof(f));
+            ctx.check("mcj_float_array_elem1_neg_0_5", f == -0.5f && std::signbit(f));
+        }
 
         // ═════════════════════ String returns ═════════════════════════════════
         ctx.check("mcj_str_captured", g_str_captured.load());

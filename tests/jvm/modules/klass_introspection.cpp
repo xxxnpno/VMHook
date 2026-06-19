@@ -1107,5 +1107,470 @@ VMHOOK_JVM_MODULE(klass_introspection)
         ctx.check("wide_enumeration_deterministic", same);
     }
 
+    // =====================================================================
+    // PART L — get_java_mirror(): every loaded klass has a java.lang.Class
+    //   mirror; it is non-null, valid, and DISTINCT per klass (no two klasses
+    //   share a mirror).  An array klass also has a mirror.  No other module
+    //   exercises this accessor as a klass-shape concern.
+    // =====================================================================
+    cp("PART L get_java_mirror (per-shape mirror identity)");
+    {
+        auto mirror_of = [&](vmhook::hotspot::klass* k) -> void*
+        {
+            if (!klass_header_safely_readable(k)) { return nullptr; }
+            return k->get_java_mirror();
+        };
+        void* const mir_self   { mirror_of(k_self) };
+        void* const mir_iface  { mirror_of(k_iface) };
+        void* const mir_enum   { mirror_of(k_enum) };
+        void* const mir_wide   { mirror_of(k_wide) };
+        void* const mir_object { mirror_of(k_object) };
+
+        // Each instance/interface klass yields a non-null, valid mirror.
+        if (klass_header_safely_readable(k_self))
+        {
+            ctx.check("mirror_self_nonnull",
+                      mir_self != nullptr && vmhook::hotspot::is_valid_pointer(mir_self));
+        }
+        else { ctx.record("[INFO] self klass header not safely readable — skipped mirror."); }
+        if (klass_header_safely_readable(k_iface))
+        {
+            ctx.check("mirror_iface_nonnull",
+                      mir_iface != nullptr && vmhook::hotspot::is_valid_pointer(mir_iface));
+        }
+        if (klass_header_safely_readable(k_object))
+        {
+            ctx.check("mirror_object_nonnull",
+                      mir_object != nullptr && vmhook::hotspot::is_valid_pointer(mir_object));
+        }
+
+        // Mirrors are DISTINCT across distinct klasses (the strong identity fact).
+        if (mir_self && mir_iface && mir_enum && mir_wide && mir_object)
+        {
+            const bool all_distinct{
+                mir_self != mir_iface && mir_self != mir_enum && mir_self != mir_wide
+                && mir_self != mir_object && mir_iface != mir_enum && mir_iface != mir_wide
+                && mir_iface != mir_object && mir_enum != mir_wide && mir_enum != mir_object
+                && mir_wide != mir_object };
+            ctx.check("mirrors_distinct_across_shapes", all_distinct);
+        }
+        else { ctx.record("[INFO] one or more mirrors not readable — skipped distinctness."); }
+
+        // The same klass yields the SAME mirror on a repeat read (stable handle).
+        if (klass_header_safely_readable(k_self) && mir_self)
+        {
+            ctx.check("mirror_self_stable", k_self->get_java_mirror() == mir_self);
+        }
+
+        // An ARRAY klass also has a mirror (int[].class exists as an oop).
+        vmhook::hotspot::klass* const k_int_arr_m{ vmhook::find_class("[I") };
+        if (k_int_arr_m && klass_header_safely_readable(k_int_arr_m))
+        {
+            void* const mir_arr{ k_int_arr_m->get_java_mirror() };
+            ctx.check("mirror_intarray_nonnull",
+                      mir_arr != nullptr && vmhook::hotspot::is_valid_pointer(mir_arr));
+            if (mir_arr && mir_self)
+            {
+                ctx.check("mirror_intarray_distinct_from_self", mir_arr != mir_self);
+            }
+        }
+        else { ctx.record("[INFO] [I array klass not resolvable — skipped array mirror."); }
+    }
+
+    // =====================================================================
+    // PART M — get_prototype_header(): the mark-word prototype.  It is read
+    //   through a guarded cached offset and returns 1 (neutral) on failure, so
+    //   we only assert it is read CONSISTENTLY (same klass -> same value twice)
+    //   and record the observed value as [INFO] (the exact bit pattern is
+    //   collector/JDK dependent — biased-locking epoch, identity-hash template —
+    //   so it is NOT a portable hard value).
+    // =====================================================================
+    cp("PART M get_prototype_header (consistency, non-portable value)");
+    {
+        if (klass_header_safely_readable(k_wide))
+        {
+            const std::uintptr_t p0{ k_wide->get_prototype_header() };
+            const std::uintptr_t p1{ k_wide->get_prototype_header() };
+            ctx.check("prototype_header_stable", p0 == p1);
+            ctx.record(std::string{ "[INFO] Wide get_prototype_header() = " }
+                       + std::to_string(static_cast<unsigned long long>(p0)));
+        }
+        else { ctx.record("[INFO] wide klass header not safely readable — skipped prototype header."); }
+    }
+
+    // =====================================================================
+    // PART N — EXHAUSTIVE ARRAY KLASS SHAPES.  Every primitive array type plus a
+    //   1-D and 3-D reference array: name reflects the element descriptor and the
+    //   dimensionality, super is java.lang.Object, get_instance_size()==0 (the
+    //   array signal), and the InstanceKlass-only method enumeration degrades to
+    //   EMPTY (flaw #1 territory: an ArrayKlass has no _methods of its own).
+    // =====================================================================
+    cp("PART N exhaustive array klass shapes (every primitive + ref + multi-dim)");
+    {
+        // (descriptor, expected-element-char, expected-dim)
+        struct arr_case { const char* desc; char elem; int dim; };
+        const arr_case cases[] = {
+            { "[I", 'I', 1 }, { "[J", 'J', 1 }, { "[D", 'D', 1 }, { "[F", 'F', 1 },
+            { "[S", 'S', 1 }, { "[B", 'B', 1 }, { "[C", 'C', 1 }, { "[Z", 'Z', 1 },
+            { "[[[I", 'I', 3 },
+        };
+        for (const arr_case& c : cases)
+        {
+            vmhook::hotspot::klass* const ka{ vmhook::find_class(c.desc) };
+            const std::string tag{ std::string{ "arr_" } + c.desc };
+            if (!ka)
+            {
+                ctx.record(std::string{ "[INFO] find_class(\"" } + c.desc
+                           + "\") did not resolve on this JDK — array klass not reachable.");
+                // Even when unresolved, the by-name enumeration MUST be empty.
+                ctx.check(tag + "_methods_empty_when_unresolved",
+                          vmhook::get_class_methods(c.desc).empty());
+                continue;
+            }
+            const std::string nm{ klass_name_str(ka) };
+            ctx.check(tag + "_name_echo", nm == c.desc);
+            // Dimensionality == count of leading '[' characters.
+            int dim{ 0 };
+            while (dim < static_cast<int>(nm.size()) && nm[static_cast<std::size_t>(dim)] == '[')
+            {
+                ++dim;
+            }
+            ctx.check(tag + "_dim", dim == c.dim);
+            // For a primitive array the final char is the element descriptor.
+            ctx.check(tag + "_elem", !nm.empty() && nm.back() == c.elem);
+
+            if (klass_header_safely_readable(ka))
+            {
+                ctx.check(tag + "_super_object",
+                          klass_name_str(ka->get_super()) == N_OBJECT);
+                ctx.check(tag + "_instance_size_zero", ka->get_instance_size() == 0u);
+            }
+            else { ctx.record(std::string{ "[INFO] " } + c.desc + " klass header not safely readable — skipped super/size."); }
+
+            // *** flaw #1 boundary *** — array klass method enumeration is EMPTY.
+            ctx.check(tag + "_methods_empty", vmhook::get_class_methods(c.desc).empty());
+        }
+
+        // A 1-D reference array: name "[Ljava/lang/String;", dim 1.
+        vmhook::hotspot::klass* const k_str_arr1{ vmhook::find_class("[Ljava/lang/String;") };
+        if (k_str_arr1)
+        {
+            const std::string nm{ klass_name_str(k_str_arr1) };
+            ctx.check("strarray1d_name", nm == "[Ljava/lang/String;");
+            ctx.check("strarray1d_dim_is_1",
+                      nm.size() >= 2 && nm[0] == '[' && nm[1] == 'L');
+            if (klass_header_safely_readable(k_str_arr1))
+            {
+                ctx.check("strarray1d_super_object",
+                          klass_name_str(k_str_arr1->get_super()) == N_OBJECT);
+                ctx.check("strarray1d_instance_size_zero",
+                          k_str_arr1->get_instance_size() == 0u);
+            }
+            ctx.check("strarray1d_methods_empty",
+                      vmhook::get_class_methods("[Ljava/lang/String;").empty());
+        }
+        else { ctx.record("[INFO] find_class(\"[Ljava/lang/String;\") did not resolve."); }
+
+        // An Object[] reference array: super is still java.lang.Object.
+        vmhook::hotspot::klass* const k_obj_arr{ vmhook::find_class("[Ljava/lang/Object;") };
+        if (k_obj_arr && klass_header_safely_readable(k_obj_arr))
+        {
+            ctx.check("objarray_super_object",
+                      klass_name_str(k_obj_arr->get_super()) == N_OBJECT);
+            ctx.check("objarray_methods_empty",
+                      vmhook::get_class_methods("[Ljava/lang/Object;").empty());
+        }
+        else { ctx.record("[INFO] find_class(\"[Ljava/lang/Object;\") did not resolve."); }
+
+        // Cross-check the per-primitive isArray witnesses (every element width).
+        ctx.check("longarray_is_array_java",   kli::b("longArrayIsArray"));
+        ctx.check("doublearray_is_array_java", kli::b("doubleArrayIsArray"));
+        ctx.check("floatarray_is_array_java",  kli::b("floatArrayIsArray"));
+        ctx.check("shortarray_is_array_java",  kli::b("shortArrayIsArray"));
+        ctx.check("bytearray_is_array_java",   kli::b("byteArrayIsArray"));
+        ctx.check("chararray_is_array_java",   kli::b("charArrayIsArray"));
+        ctx.check("boolarray_is_array_java",   kli::b("boolArrayIsArray"));
+        ctx.check("strarray1d_is_array_java",  kli::b("strArray1DIsArray"));
+        ctx.check("intarray3d_is_array_java",  kli::b("intArray3DIsArray"));
+        // The JLS array-class flags: array classes are public(component) FINAL ABSTRACT.
+        ctx.check("intarray_final_java",       kli::b("intArrayIsFinal"));
+        ctx.check("intarray_abstract_java",    kli::b("intArrayIsAbstract"));
+    }
+
+    // =====================================================================
+    // PART O — get_interfaces_ptr() boundaries: a class implementing NOTHING
+    //   reports an empty/null interface set, and an array klass's interface walk
+    //   is treated as best-effort [INFO] (get_interfaces_ptr is InstanceKlass-
+    //   shaped; on an ArrayKlass the InstanceKlass offset is meaningless, so the
+    //   native walk degrades — the HARD truth is the Java witness count == 2).
+    // =====================================================================
+    cp("PART O get_interfaces_ptr boundaries (no-iface + array best-effort)");
+    {
+        // Nested implements no interfaces -> count 0 (nullptr or empty array).
+        if (klass_header_safely_readable(k_nested))
+        {
+            std::int32_t nc{ -1 };
+            vmhook::hotspot::klass** const np{ k_nested->get_interfaces_ptr(nc) };
+            // count is set to 0 on the no-interface path; if a transitive set is
+            // present (e.g. a JDK that lists Object's interfaces) accept >=0 but
+            // assert it contains nothing surprising — the strong fact is the count.
+            ctx.check("nested_interface_count_zero", nc == 0 || np == nullptr);
+        }
+        else { ctx.record("[INFO] nested klass header not safely readable — skipped iface count."); }
+        ctx.check("nested_interface_count_java", kli::i("nestedInterfaceCount") == 0);
+
+        // Base (top of the chain, no interfaces) -> count 0.
+        if (klass_header_safely_readable(k_base))
+        {
+            std::int32_t bc{ -1 };
+            vmhook::hotspot::klass** const bp{ k_base->get_interfaces_ptr(bc) };
+            ctx.check("base_interface_count_zero", bc == 0 || bp == nullptr);
+        }
+        ctx.check("base_interface_count_java", kli::i("baseInterfaceCount") == 0);
+
+        // Array klass: Java says int[] implements exactly Cloneable + Serializable.
+        // The native get_interfaces_ptr on an array klass is NOT relied on (flaw
+        // #1: InstanceKlass-shaped read on a non-InstanceKlass) — record what it
+        // returns as [INFO], keep the count HARD only on the Java side.
+        ctx.check("intarray_interface_count_java",
+                  kli::i("intArrayInterfaceCount") == 2);
+        vmhook::hotspot::klass* const k_int_arr_o{ vmhook::find_class("[I") };
+        if (k_int_arr_o && klass_header_safely_readable(k_int_arr_o))
+        {
+            std::int32_t ac{ -1 };
+            vmhook::hotspot::klass** const ap{ k_int_arr_o->get_interfaces_ptr(ac) };
+            ctx.record(std::string{ "[INFO] array-klass get_interfaces_ptr -> count=" }
+                       + std::to_string(ac) + (ap ? " (non-null base)" : " (null base)")
+                       + " (InstanceKlass-shaped read on an ArrayKlass; not authoritative).");
+        }
+    }
+
+    // =====================================================================
+    // PART P — find_methods_by_signature<T> descriptor BREADTH on Wide / enum /
+    //   iface, and AGREEMENT with the get_class_methods substrate.  The existing
+    //   module only probes the bridge descriptor on Cmp; here we sweep every
+    //   distinct Wide descriptor + a few negatives, and confirm each returned
+    //   name actually carries that descriptor in the enumeration.
+    // =====================================================================
+    cp("PART P find_methods_by_signature breadth + enumeration agreement");
+    {
+        const auto m_wide{ vmhook::get_class_methods<w_wide>() };
+
+        // Helper: every name find_methods_by_signature<T>(d) returns must be a
+        // (name, d) pair in the enumeration, and the RETURNED count must equal the
+        // enumeration's count of that descriptor.
+        auto agree = [&](const char* tag, const char* d)
+        {
+            const auto sel{ vmhook::find_methods_by_signature<w_wide>(d) };
+            const std::size_t enum_n{ count_descriptor(m_wide, d) };
+            ctx.check(std::string{ "wide_sig_count_" } + tag, sel.size() == enum_n);
+            bool every_name_present{ true };
+            for (const std::string& nm : sel)
+            {
+                if (count_pair(m_wide, nm, d) == 0) { every_name_present = false; break; }
+            }
+            ctx.check(std::string{ "wide_sig_names_present_" } + tag, every_name_present);
+        };
+        agree("retI",  "()I");    // m0
+        agree("retJ",  "()J");    // m1
+        agree("retD",  "()D");    // m2
+        agree("retV",  "()V");    // m3 (+ <init>)
+        agree("IItoI", "(II)I");  // m4
+
+        // Exact selection results on Wide.
+        const auto sel_m0{ vmhook::find_methods_by_signature<w_wide>("()I") };
+        ctx.check("wide_sig_retI_has_m0",
+                  std::find(sel_m0.begin(), sel_m0.end(), "m0") != sel_m0.end());
+        const auto sel_m4{ vmhook::find_methods_by_signature<w_wide>("(II)I") };
+        ctx.check("wide_sig_IItoI_is_m4_only",
+                  sel_m4.size() == 1 && sel_m4.front() == "m4");
+        const auto sel_v{ vmhook::find_methods_by_signature<w_wide>("()V") };
+        ctx.check("wide_sig_retV_has_m3",
+                  std::find(sel_v.begin(), sel_v.end(), "m3") != sel_v.end());
+        ctx.check("wide_sig_retV_has_init",
+                  std::find(sel_v.begin(), sel_v.end(), "<init>") != sel_v.end());
+
+        // Interface descriptor selection: (I)I selects abstractOp/defaultOp/staticOp.
+        const auto sel_iface{ vmhook::find_methods_by_signature<w_iface>("(I)I") };
+        ctx.check("iface_sig_ItoI_has_abstractOp",
+                  std::find(sel_iface.begin(), sel_iface.end(), "abstractOp") != sel_iface.end());
+        ctx.check("iface_sig_ItoI_has_defaultOp",
+                  std::find(sel_iface.begin(), sel_iface.end(), "defaultOp") != sel_iface.end());
+        ctx.check("iface_sig_ItoI_has_staticOp",
+                  std::find(sel_iface.begin(), sel_iface.end(), "staticOp") != sel_iface.end());
+        const auto m_iface_p{ vmhook::get_class_methods<w_iface>() };
+        ctx.check("iface_sig_ItoI_count_eq_enum",
+                  sel_iface.size() == count_descriptor(m_iface_p, "(I)I"));
+
+        // Enum: rank() is ()I; values()/valueOf have the enum-typed descriptors.
+        const auto sel_rank{ vmhook::find_methods_by_signature<w_enum>("()I") };
+        ctx.check("enum_sig_retI_has_rank",
+                  std::find(sel_rank.begin(), sel_rank.end(), "rank") != sel_rank.end());
+
+        // Negative descriptors on Wide: well-formed but absent -> empty.
+        ctx.check("wide_sig_absent_string_empty",
+                  vmhook::find_methods_by_signature<w_wide>("()Ljava/lang/String;").empty());
+        ctx.check("wide_sig_absent_boolean_empty",
+                  vmhook::find_methods_by_signature<w_wide>("()Z").empty());
+        ctx.check("wide_sig_absent_arity_empty",
+                  vmhook::find_methods_by_signature<w_wide>("(III)I").empty());
+        // Malformed descriptors -> empty (no normalization, pure equality).
+        ctx.check("wide_sig_empty_string_empty",
+                  vmhook::find_methods_by_signature<w_wide>("").empty());
+        ctx.check("wide_sig_no_parens_empty",
+                  vmhook::find_methods_by_signature<w_wide>("II)I").empty());
+        ctx.check("wide_sig_lowercase_empty",
+                  vmhook::find_methods_by_signature<w_wide>("()i").empty());
+        ctx.check("wide_sig_name_as_desc_empty",
+                  vmhook::find_methods_by_signature<w_wide>("m0").empty());
+    }
+
+    // =====================================================================
+    // PART Q — FIELD SHAPES per class kind: enum synthetic $VALUES + constants,
+    //   inner-class synthetic this$0, the generic-erased Box reference field, and
+    //   declared-method-count cross-checks for the shapes the existing module
+    //   only touched by membership.
+    // =====================================================================
+    cp("PART Q field shapes (enum $VALUES / inner this$0 / erased Box) + counts");
+    {
+        // --- Enum: each constant is a declared static field of the enum type ---
+        if (klass_header_safely_readable(k_enum))
+        {
+            const char* const enum_t{ "Lvmhook/fixtures/KlassIntrospection$Suit;" };
+            auto chk_const = [&](const char* cname)
+            {
+                const auto fe{ k_enum->find_field(cname) };
+                ctx.check(std::string{ "enum_const_" } + cname + "_declared", fe.has_value());
+                if (fe)
+                {
+                    ctx.check(std::string{ "enum_const_" } + cname + "_static", fe->is_static);
+                    ctx.check(std::string{ "enum_const_" } + cname + "_sig",
+                              fe->signature == enum_t);
+                }
+            };
+            chk_const("CLUBS");
+            chk_const("DIAMONDS");
+            chk_const("HEARTS");
+            chk_const("SPADES");
+            // The synthetic $VALUES holder is a static array-of-Suit field.
+            const auto fv{ k_enum->find_field("$VALUES") };
+            ctx.check("enum_has_synthetic_VALUES", fv.has_value());
+            if (fv)
+            {
+                ctx.check("enum_VALUES_static", fv->is_static);
+                ctx.check("enum_VALUES_is_suit_array",
+                          fv->signature == "[Lvmhook/fixtures/KlassIntrospection$Suit;");
+            }
+        }
+        else { ctx.record("[INFO] enum klass header not safely readable — skipped enum fields."); }
+        ctx.check("enum_constant_count_java", kli::i("suitConstantCount") == 4);
+        ctx.check("enum_declared_field_count_java", kli::i("suitDeclaredFields") == 5);
+
+        // --- Inner: the synthetic this$0 outer reference field is declared ------
+        if (klass_header_safely_readable(k_inner))
+        {
+            const auto t0{ k_inner->find_field("this$0") };
+            ctx.check("inner_has_synthetic_this0", t0.has_value());
+            if (t0)
+            {
+                ctx.check("inner_this0_instance", !t0->is_static);
+                ctx.check("inner_this0_outer_type",
+                          t0->signature == "Lvmhook/fixtures/KlassIntrospection;");
+            }
+            // The explicit innerField is also declared.
+            ctx.check("inner_has_innerField",
+                      k_inner->find_field("innerField").has_value());
+        }
+        else { ctx.record("[INFO] inner klass header not safely readable — skipped inner fields."); }
+        ctx.check("inner_declared_field_count_java", kli::i("innerDeclaredFields") == 2);
+
+        // --- Box: the erased value field is a single Object reference -----------
+        if (klass_header_safely_readable(k_box))
+        {
+            const auto bv{ k_box->find_field("value") };
+            ctx.check("box_value_declared", bv.has_value());
+            if (bv)
+            {
+                ctx.check("box_value_instance", !bv->is_static);
+                // After erasure of <T> the field type is java.lang.Object.
+                ctx.check("box_value_erased_to_object",
+                          bv->signature == "Ljava/lang/Object;");
+            }
+        }
+        else { ctx.record("[INFO] box klass header not safely readable — skipped box field."); }
+        ctx.check("box_declared_method_count_java", kli::i("boxDeclaredMethods") == 2);
+
+        // --- AbstractBase declares baseField (instance int) directly ------------
+        if (klass_header_safely_readable(k_abstract))
+        {
+            const auto bf{ k_abstract->find_field("baseField") };
+            ctx.check("abstract_declares_baseField", bf.has_value());
+            if (bf)
+            {
+                ctx.check("abstract_baseField_int", bf->signature == "I");
+                ctx.check("abstract_baseField_instance", !bf->is_static);
+            }
+        }
+    }
+
+    // =====================================================================
+    // PART R — EXTRA NEGATIVE / MALFORMED resolution inputs (no crash, empty /
+    //   null).  Broadens PART K's negative inputs with dotted names, leading-
+    //   slash names, descriptor-as-name, partial array descriptors, and a deep
+    //   bogus nested name — all must miss cleanly.
+    // =====================================================================
+    cp("PART R extra negative / malformed resolution inputs");
+    {
+        const char* const bad_names[] = {
+            "vmhook.fixtures.KlassIntrospection",   // dotted (internal form uses '/')
+            "/vmhook/fixtures/KlassIntrospection",  // leading slash
+            "Lvmhook/fixtures/KlassIntrospection;", // a field descriptor, not a name
+            "[",                                    // bare array sentinel
+            "[L",                                   // truncated reference array
+            "[Lvmhook/fixtures/NoSuchKlassZZZ;",    // array of a bogus element
+            "vmhook//fixtures//KlassIntrospection", // doubled separators
+            "   ",                                  // whitespace
+            "vmhook/fixtures/KlassIntrospection$NoSuchInner",  // bogus nested
+        };
+        for (const char* bn : bad_names)
+        {
+            const std::string tag{ std::string{ "neg_" } + bn };
+            // get_class_methods on any of these must be EMPTY and must not crash.
+            ctx.check(tag + "_methods_empty", vmhook::get_class_methods(bn).empty());
+        }
+
+        // The dotted form specifically resolves to null via find_class (the
+        // resolver expects the internal '/'-name).
+        ctx.check("dotted_name_find_class_null",
+                  vmhook::find_class("vmhook.fixtures.KlassIntrospection") == nullptr);
+        // A descriptor passed as a name does not resolve.
+        ctx.check("descriptor_as_name_find_class_null",
+                  vmhook::find_class("Lvmhook/fixtures/KlassIntrospection;") == nullptr);
+
+        // find_methods_by_signature on an unregistered type stays empty for EVERY
+        // descriptor shape (not just (I)I) — pure type-map miss, no crash.
+        ctx.check("unreg_sig_retV_empty",
+                  vmhook::find_methods_by_signature<w_unreg>("()V").empty());
+        ctx.check("unreg_sig_complex_empty",
+                  vmhook::find_methods_by_signature<w_unreg>("(IJD)Ljava/lang/Object;").empty());
+
+        // Determinism for a NON-trivial shape too (enum, with synthetics): two
+        // enumerations agree as a multiset.
+        const auto e1{ vmhook::get_class_methods<w_enum>() };
+        const auto e2{ vmhook::get_class_methods<w_enum>() };
+        bool enum_same{ e1.size() == e2.size() };
+        if (enum_same)
+        {
+            for (const auto& m : e1)
+            {
+                if (count_pair(e1, m.first, m.second) != count_pair(e2, m.first, m.second))
+                {
+                    enum_same = false; break;
+                }
+            }
+        }
+        ctx.check("enum_enumeration_deterministic", enum_same);
+    }
+
     cp("module complete (all parts reached without a no-SEH fault)");
 }
