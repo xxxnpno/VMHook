@@ -609,3 +609,41 @@ root each witness into recv* FIRST (before the length sweep) to eliminate the un
   failed ONLY on jvm·linux·gcc·java11 + jvm·windows·clang·java25 (the milestone's GC/thread-
   timing flake class), not the build. Wave 1's re-run will be judged by: build jobs green +
   no [FAIL] from the 5 NEW modules; java11/java25 flakes are the separate deflake workstream.
+
+- **2026-06-15 → 06-19 — DEEPENING CAMPAIGN (this log is stale; the live record is the
+  session memory files under `.claude/projects/.../memory/`).** Criterion #3 DONE (Java 8-26
+  green) and #38 RESOLVED-AS-MITIGATED (heap lever `-Xmx4g -Xmn3g` on the CI test-JVM; the
+  `_thread_in_native` fix is out of reach — no VMStructs-readable safepoint signal). The
+  unblocked #1-metric engine is **deepening waves**: ~6 feature-specialist agents per wave,
+  each exhaustively deepening ONE existing `tests/jvm/modules/<feature>.cpp` + its own fixture
+  (distinct files → no conflict), validated then pushed one CI cycle at a time. Merged batches
+  2-13b = **+~5000 JVM assertions**; master green.
+- **2026-06-19 — NEW MANDATORY PRE-PUSH GATE: `.localci` full windows matrix.** The two
+  documented local gates (MinGW -Werror DLL build + javac fixtures) validate SYNTAX only — they
+  cannot see runtime behavior on the injected windows JVM, which is where deepening assertions
+  actually fail. This session, two batches that passed both gates STILL reddened master:
+  (a) **batch-13** — `return_set_primitives` over-wide force-return: forcing a value WIDER than
+  the declared return type is outside `set()`'s contract (no descriptor check), so the
+  interpreter's masking/widening of the over-wide slot is PLATFORM-VARIANT (windows ALL
+  compilers incl mingw vs linux/macos) → 16 [FAIL] on every windows cell. Fixed: demote the
+  int-widened readbacks to [INFO] (native-width masked read stays HARD). (b) **batch-13b** —
+  caught BEFORE push by the new `.localci` gate (all 21 cells): `deoptimize_methods`
+  predicate over-asserted that only 3 named fixture methods compile (warm loops/<init>/run()
+  also JIT → assert non-empty name instead); `hook_install_after_jit` compiled-caller fire is
+  JIT-inlining-variant → [INFO]; plus a bundled `return_stack_trace_depth` cap-saturation flake
+  (chain shortened below the 64 cap by inlining → gate best-effort). **RULE: before pushing any
+  deepening batch, run `.\.localci\run-local-ci.ps1` (full mingw+msvc+clang × java 8-26 for
+  JIT/deopt/hook/return batches; mingw×7 minimum for read-mostly) and require a GREEN matrix.**
+  GitHub stays authoritative; `.localci` runs with HIGHER JIT pressure so it surfaces some
+  inlining flakes GitHub masks. **TWO `.localci` BLIND SPOTS (both bit batch-13b post-push):**
+  (1) it is **windows-only** — a `deoptimize_methods` [FAIL] surfaced on linux·gcc·java21/25,
+  which `.localci` never runs; (2) it cannot reliably catch **timing-flaky** checks — the
+  `hook_install_after_jit` exact-fire-count checks passed all 21 local cells yet flaked on
+  GitHub (linux·gcc·java25, windows·clang·java24) because the driver loop JIT-inlines the hooked
+  method mid-probe, making the count non-deterministic. FIX PATTERN (now applied to deopt + haj):
+  any "fires exactly N / still fires after deopt-or-JIT" assertion must be **fires ≥ 1 HARD +
+  exact count [INFO]**, with self-correctness asserted over ACTUAL fires; never hard-assert an
+  exact post-JIT/post-deopt fire count. (Also: windows·clang·java11/24 `did not exit within
+  120s` = the #38 no-SEH safepoint STALL, a re-runnable residual, not a code bug.) (Note rule #5
+  "tests on GHA only" predates `.localci`; the local harness PR #34 is a sanctioned fast
+  pre-flight, not the oracle.)
