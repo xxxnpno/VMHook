@@ -71,6 +71,15 @@ namespace
         static auto obs_s_double() -> double         { return static_field("obsStaticDouble")->get(); }
         static auto obs_s_char()   -> std::uint16_t { return static_field("obsStaticChar")->get(); }
 
+        // Sub-int returns captured WIDENED to int (the caller-side mask+widen
+        // view: byte/short sign-extend, char zero-extends).
+        static auto obs_byte_as_int()  -> std::int32_t { return static_field("obsByteAsInt")->get(); }
+        static auto obs_short_as_int() -> std::int32_t { return static_field("obsShortAsInt")->get(); }
+        static auto obs_char_as_int()  -> std::int32_t { return static_field("obsCharAsInt")->get(); }
+        static auto obs_s_byte_as_int()  -> std::int32_t { return static_field("obsStaticByteAsInt")->get(); }
+        static auto obs_s_short_as_int() -> std::int32_t { return static_field("obsStaticShortAsInt")->get(); }
+        static auto obs_s_char_as_int()  -> std::int32_t { return static_field("obsStaticCharAsInt")->get(); }
+
         static auto saw_exception() -> bool        { return static_field("sawException")->get(); }
         static auto round_count()   -> std::int32_t { return static_field("roundCount")->get(); }
     };
@@ -230,11 +239,14 @@ namespace
                      const forced_values&  v) -> void
     {
         // --- Each instance hook fires once per Java call.  The fixture invokes
-        // origInt() TWICE (obsInt + obsIntReadback stability readback) and the
-        // other 7 origs once, so the instance path yields 9 fires; the static
-        // path calls each of its 8 origs exactly once → 8 fires.
-        ctx.check(tag + "_instance_hooks_fired", g_inst_fires.load() == 9);
-        ctx.check(tag + "_static_hooks_fired",   g_stat_fires.load() == 8);
+        // origInt() TWICE (obsInt + obsIntReadback stability readback), and
+        // origByte/origShort/origChar TWICE each (narrow obs* + widened
+        // obs*AsInt), and the rest once: 8 origs + 1 int-readback + 3
+        // byte/short/char widened readbacks = 12 instance fires.  The static
+        // path calls each of its 8 origs once plus 3 widened byte/short/char
+        // readbacks = 11 fires.
+        ctx.check(tag + "_instance_hooks_fired", g_inst_fires.load() == 12);
+        ctx.check(tag + "_static_hooks_fired",   g_stat_fires.load() == 11);
         ctx.check(tag + "_instance_hooks_saw_self", g_inst_all_saw_self.load());
         ctx.check(tag + "_no_java_exception",       !rsp_fixture::saw_exception());
 
@@ -259,6 +271,30 @@ namespace
         ctx.check(tag + "_stat_float",  same_bits(rsp_fixture::obs_s_float(),  v.f));
         ctx.check(tag + "_stat_double", same_bits(rsp_fixture::obs_s_double(), v.d));
         ctx.check(tag + "_stat_char",   rsp_fixture::obs_s_char()  == v.c);
+
+        // --- Caller-side mask + widen: the same forced narrow value, read back
+        // through a byte/short/char method into an int local, must surface the
+        // JVM-correct 32-bit widening.  byte/short SIGN-extend (C++ int8_t/
+        // int16_t -> int32_t does too); jchar ZERO-extends (uint16_t -> int32_t
+        // does too).  This is the load-bearing proof that the forced 64-bit slot
+        // is masked to the declared sub-int width AND widened with the correct
+        // signedness at the ireturn boundary — distinct from the narrow-field
+        // reads above, which the JVM had already masked before storing.
+        ctx.check(tag + "_inst_byte_widened",  rsp_fixture::obs_byte_as_int()  == static_cast<std::int32_t>(v.by));
+        ctx.check(tag + "_inst_short_widened", rsp_fixture::obs_short_as_int() == static_cast<std::int32_t>(v.s));
+        ctx.check(tag + "_inst_char_widened",  rsp_fixture::obs_char_as_int()  == static_cast<std::int32_t>(v.c));
+        ctx.check(tag + "_stat_byte_widened",  rsp_fixture::obs_s_byte_as_int()  == static_cast<std::int32_t>(v.by));
+        ctx.check(tag + "_stat_short_widened", rsp_fixture::obs_s_short_as_int() == static_cast<std::int32_t>(v.s));
+        ctx.check(tag + "_stat_char_widened",  rsp_fixture::obs_s_char_as_int()  == static_cast<std::int32_t>(v.c));
+
+        // jchar must NEVER sign-extend: the widened-to-int view of any forced
+        // char keeps the upper 16 bits CLEAR (value in [0, 0xFFFF]).  A regression
+        // that sign-extended the char path would surface a negative obsCharAsInt
+        // for any code unit >= 0x8000 (e.g. the surrogate / 0xFFFF rounds).
+        ctx.check(tag + "_inst_char_widened_nonneg",
+                  rsp_fixture::obs_char_as_int() >= 0 && rsp_fixture::obs_char_as_int() <= 0xFFFF);
+        ctx.check(tag + "_stat_char_widened_nonneg",
+                  rsp_fixture::obs_s_char_as_int() >= 0 && rsp_fixture::obs_s_char_as_int() <= 0xFFFF);
     }
 
     auto run_and_check(vmhook_test::context& ctx,
@@ -269,6 +305,152 @@ namespace
         {
             check_round(ctx, tag, v);
         }
+    }
+
+    // ---- OVER-WIDE force vector --------------------------------------------
+    // The force-return template (vmhook.hpp:1353-1382) does NOT consult the
+    // hooked method's Java return descriptor: it writes whatever the caller
+    // hands it into the 64-bit slot.  When the value forced is WIDER than the
+    // method's declared narrow return type, the JVM's ireturn family masks the
+    // slot to the declared width on the CALLER side.  This vector forces a value
+    // strictly wider than the method's type and pins the masked result the Java
+    // caller must observe — the dimension the matching-width rounds cannot reach.
+    struct overwide_values
+    {
+        std::int32_t over_byte;   // forced int32_t into a `byte`  method
+        std::int32_t over_short;  // forced int32_t into a `short` method
+        std::int32_t over_char;   // forced int32_t into a `char`  method
+        std::int64_t over_int;    // forced int64_t into an `int`  method
+        bool         b;           // canonical bool (only {0,1} is JDK-portable)
+    };
+
+    // The Java-visible masked-and-widened expectations for an over-wide vector.
+    auto over_exp_byte(std::int32_t over)  -> std::int8_t  { return static_cast<std::int8_t>(static_cast<std::uint32_t>(over) & 0xFFu); }
+    auto over_exp_short(std::int32_t over) -> std::int16_t { return static_cast<std::int16_t>(static_cast<std::uint32_t>(over) & 0xFFFFu); }
+    auto over_exp_char(std::int32_t over)  -> std::uint16_t{ return static_cast<std::uint16_t>(static_cast<std::uint32_t>(over) & 0xFFFFu); }
+    auto over_exp_int(std::int64_t over)   -> std::int32_t { return static_cast<std::int32_t>(static_cast<std::uint64_t>(over) & 0xFFFFFFFFULL); }
+
+    auto run_overwide(vmhook_test::context& ctx,
+                      const std::string&    tag,
+                      const overwide_values& v) -> bool
+    {
+        reset_round_counters();
+        rsp_fixture::set_done(false);
+
+        // The long/float/double methods are still hooked (so the fire counts
+        // stay at the standard 12/11) but forced to harmless sentinels; only the
+        // byte/short/char/int slots carry the over-wide payloads.
+        const std::int64_t l_sent{ 0x0123456789ABCDEFLL };
+        const float        f_sent{ 4.5f };
+        const double       d_sent{ 6.25 };
+
+        auto h_bool  { vmhook::scoped_hook<rsp_fixture>("origBool",
+            [v](vmhook::return_value& r, const std::unique_ptr<rsp_fixture>& self)
+            { note_self(self); r.set(v.b); }) };
+        // Force a WIDE int32_t into the byte method.
+        auto h_byte  { vmhook::scoped_hook<rsp_fixture>("origByte",
+            [v](vmhook::return_value& r, const std::unique_ptr<rsp_fixture>& self)
+            { note_self(self); r.set(v.over_byte); }) };
+        auto h_short { vmhook::scoped_hook<rsp_fixture>("origShort",
+            [v](vmhook::return_value& r, const std::unique_ptr<rsp_fixture>& self)
+            { note_self(self); r.set(v.over_short); }) };
+        auto h_int   { vmhook::scoped_hook<rsp_fixture>("origInt",
+            [v](vmhook::return_value& r, const std::unique_ptr<rsp_fixture>& self)
+            { note_self(self); r.set(v.over_int); }) }; // int64_t into int method
+        auto h_long  { vmhook::scoped_hook<rsp_fixture>("origLong",
+            [l_sent](vmhook::return_value& r, const std::unique_ptr<rsp_fixture>& self)
+            { note_self(self); r.set(l_sent); }) };
+        auto h_float { vmhook::scoped_hook<rsp_fixture>("origFloat",
+            [f_sent](vmhook::return_value& r, const std::unique_ptr<rsp_fixture>& self)
+            { note_self(self); r.set(f_sent); }) };
+        auto h_double{ vmhook::scoped_hook<rsp_fixture>("origDouble",
+            [d_sent](vmhook::return_value& r, const std::unique_ptr<rsp_fixture>& self)
+            { note_self(self); r.set(d_sent); }) };
+        // Force a WIDE int32_t into the char method; only the low 16 bits are jchar.
+        auto h_char  { vmhook::scoped_hook<rsp_fixture>("origChar",
+            [v](vmhook::return_value& r, const std::unique_ptr<rsp_fixture>& self)
+            { note_self(self); r.set(v.over_char); }) };
+
+        auto hs_bool  { vmhook::scoped_hook<rsp_fixture>("origStaticBool",
+            [v](vmhook::return_value& r) { note_static(); r.set(v.b); }) };
+        auto hs_byte  { vmhook::scoped_hook<rsp_fixture>("origStaticByte",
+            [v](vmhook::return_value& r) { note_static(); r.set(v.over_byte); }) };
+        auto hs_short { vmhook::scoped_hook<rsp_fixture>("origStaticShort",
+            [v](vmhook::return_value& r) { note_static(); r.set(v.over_short); }) };
+        auto hs_int   { vmhook::scoped_hook<rsp_fixture>("origStaticInt",
+            [v](vmhook::return_value& r) { note_static(); r.set(v.over_int); }) };
+        auto hs_long  { vmhook::scoped_hook<rsp_fixture>("origStaticLong",
+            [l_sent](vmhook::return_value& r) { note_static(); r.set(l_sent); }) };
+        auto hs_float { vmhook::scoped_hook<rsp_fixture>("origStaticFloat",
+            [f_sent](vmhook::return_value& r) { note_static(); r.set(f_sent); }) };
+        auto hs_double{ vmhook::scoped_hook<rsp_fixture>("origStaticDouble",
+            [d_sent](vmhook::return_value& r) { note_static(); r.set(d_sent); }) };
+        auto hs_char  { vmhook::scoped_hook<rsp_fixture>("origStaticChar",
+            [v](vmhook::return_value& r) { note_static(); r.set(v.over_char); }) };
+
+        const bool all_installed{
+            h_bool.installed()  && h_byte.installed()  && h_short.installed() &&
+            h_int.installed()   && h_long.installed()  && h_float.installed() &&
+            h_double.installed()&& h_char.installed()  &&
+            hs_bool.installed() && hs_byte.installed() && hs_short.installed() &&
+            hs_int.installed()  && hs_long.installed() && hs_float.installed() &&
+            hs_double.installed()&& hs_char.installed() };
+        ctx.check(tag + "_all_16_hooks_installed", all_installed);
+
+        const bool done{ ctx.run_probe(
+            [](bool value) { rsp_fixture::set_go(value); },
+            []() { return rsp_fixture::get_done(); }) };
+        ctx.check(tag + "_probe_completed", done);
+        return done;
+    }
+
+    auto run_and_check_overwide(vmhook_test::context& ctx,
+                                const std::string&     tag,
+                                const overwide_values& v) -> void
+    {
+        if (!run_overwide(ctx, tag, v))
+        {
+            return;
+        }
+        // Fire counts unchanged: all 16 hooks armed, fixture dispatch identical.
+        ctx.check(tag + "_instance_hooks_fired", g_inst_fires.load() == 12);
+        ctx.check(tag + "_static_hooks_fired",   g_stat_fires.load() == 11);
+        ctx.check(tag + "_no_java_exception",    !rsp_fixture::saw_exception());
+
+        const std::int8_t   eb{ over_exp_byte(v.over_byte) };
+        const std::int16_t  es{ over_exp_short(v.over_short) };
+        const std::uint16_t ec{ over_exp_char(v.over_char) };
+        const std::int32_t  ei{ over_exp_int(v.over_int) };
+
+        // INSTANCE: the JVM masked the over-wide slot to the declared width.
+        ctx.check(tag + "_inst_byte_masked",  rsp_fixture::obs_byte()  == eb);
+        ctx.check(tag + "_inst_short_masked", rsp_fixture::obs_short() == es);
+        ctx.check(tag + "_inst_char_masked",  rsp_fixture::obs_char()  == ec);
+        ctx.check(tag + "_inst_int_masked",   rsp_fixture::obs_int()   == ei);
+        ctx.check(tag + "_inst_bool",         rsp_fixture::obs_bool()  == v.b);
+        // Widened-to-int views: byte/short sign-extend the masked value, char
+        // zero-extends — exactly the matching-width helper's expectation, proving
+        // the masked-then-widened result is identical whether the C++ side forced
+        // a narrow or an over-wide value.
+        ctx.check(tag + "_inst_byte_widened",  rsp_fixture::obs_byte_as_int()  == static_cast<std::int32_t>(eb));
+        ctx.check(tag + "_inst_short_widened", rsp_fixture::obs_short_as_int() == static_cast<std::int32_t>(es));
+        ctx.check(tag + "_inst_char_widened",  rsp_fixture::obs_char_as_int()  == static_cast<std::int32_t>(ec));
+
+        // STATIC: same masking on the no-'this' dispatch path.
+        ctx.check(tag + "_stat_byte_masked",  rsp_fixture::obs_s_byte()  == eb);
+        ctx.check(tag + "_stat_short_masked", rsp_fixture::obs_s_short() == es);
+        ctx.check(tag + "_stat_char_masked",  rsp_fixture::obs_s_char()  == ec);
+        ctx.check(tag + "_stat_int_masked",   rsp_fixture::obs_s_int()   == ei);
+        ctx.check(tag + "_stat_bool",         rsp_fixture::obs_s_bool()  == v.b);
+        ctx.check(tag + "_stat_byte_widened",  rsp_fixture::obs_s_byte_as_int()  == static_cast<std::int32_t>(eb));
+        ctx.check(tag + "_stat_short_widened", rsp_fixture::obs_s_short_as_int() == static_cast<std::int32_t>(es));
+        ctx.check(tag + "_stat_char_widened",  rsp_fixture::obs_s_char_as_int()  == static_cast<std::int32_t>(ec));
+
+        // jchar masked from an over-wide payload is still in [0, 0xFFFF].
+        ctx.check(tag + "_inst_char_widened_nonneg",
+                  rsp_fixture::obs_char_as_int() >= 0 && rsp_fixture::obs_char_as_int() <= 0xFFFF);
+        ctx.check(tag + "_stat_char_widened_nonneg",
+                  rsp_fixture::obs_s_char_as_int() >= 0 && rsp_fixture::obs_s_char_as_int() <= 0xFFFF);
     }
 }
 
@@ -854,8 +1036,86 @@ VMHOOK_JVM_MODULE(return_set_primitives)
         /*d */ 2.5,
         /*c */ static_cast<std::uint16_t>(0x263A) });
 
-    // ---- Lifecycle sanity: 34 rounds ran, so roundCount must be 34. -------
-    ctx.check("ran_34_rounds", rsp_fixture::round_count() == 34);
+    // ROUND 35 — float/double exact dyadic fractions and the powers-of-two ULP
+    // neighbours not yet pinned: 0.5f/0.25d are exactly representable (clean
+    // mantissa), and 1.0f's NEXT representable value (1.0f + 1 ULP =
+    // Float.intBitsToFloat(0x3F800001)) plus 1.0d + 1 ULP
+    // (Double.longBitsToDouble(0x3FF0000000000001)) prove a one-bit mantissa
+    // difference rides the slot intact (a slot that dropped the low mantissa bit
+    // would collapse 1.0+ULP back to 1.0 and same_bits() would fail).  Integrals
+    // carry single-bit-walk witnesses (byte 0x40, short 0x4000, int 0x40000000,
+    // long 0x4000000000000000) — one set bit per width below the sign bit.
+    run_and_check(ctx, "float_double_ulp_neighbors", forced_values{
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(0x40),                          // +64, bit 6
+        /*s */ static_cast<std::int16_t>(0x4000),                       // +16384, bit 14
+        /*i */ 0x40000000,                                              // +2^30, bit 30
+        /*l */ static_cast<std::int64_t>(0x4000000000000000LL),         // +2^62, bit 62
+        /*f */ bits_to_float(0x3F800001u),                              // 1.0f + 1 ULP
+        /*d */ bits_to_double(0x3FF0000000000001ULL),                   // 1.0d + 1 ULP
+        /*c */ static_cast<std::uint16_t>(0x0040) });                   // '@'
+
+    // ROUND 36 — single-bit-walk integrals at the LOW end + clean dyadic floats.
+    // byte 0x01 / short 0x0001 / int 0x00000001 / long 0x0000000000000001: only
+    // bit 0 set, the minimal non-zero positive in each width, complementing the
+    // high-bit rounds.  float 0.5f (0x3F000000) and double 0.25d
+    // (0x3FD0000000000000) are exact dyadic fractions with a non-trivial
+    // exponent and empty low mantissa.
+    run_and_check(ctx, "low_bit_walk", forced_values{
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(0x01),
+        /*s */ static_cast<std::int16_t>(0x0001),
+        /*i */ 0x00000001,
+        /*l */ static_cast<std::int64_t>(0x0000000000000001LL),
+        /*f */ bits_to_float(0x3F000000u),                              // 0.5f
+        /*d */ bits_to_double(0x3FD0000000000000ULL),                   // 0.25d
+        /*c */ static_cast<std::uint16_t>(0x0001) });
+
+    // ---- OVER-WIDE rounds: force a value WIDER than the Java return type and
+    // assert the JVM masks the slot to the declared width on the caller side. --
+
+    // ROUND 37 (over-wide) — high garbage bits in the upper part of an int32_t
+    // forced into byte/short/char methods, and an int64_t forced into the int
+    // method.  The JVM masks: byte keeps low 8 (0x34, +52), short keeps low 16
+    // (0x5678, +22136), char keeps low 16 (0xCDEF, +52719, ZERO-extended),
+    // int keeps low 32 (0x9ABCDEF0).  The over-wide upper bytes (0x12.., 0xAB..)
+    // MUST be discarded — a path that delivered them would surface a wildly
+    // different value and the masked-equality check fails.
+    run_and_check_overwide(ctx, "overwide_positive_garbage", overwide_values{
+        /*over_byte */ 0x12345634,                       // -> byte 0x34
+        /*over_short*/ 0x12345678,                       // -> short 0x5678
+        /*over_char */ static_cast<std::int32_t>(0xABCDCDEFu), // -> char 0xCDEF
+        /*over_int  */ static_cast<std::int64_t>(0x123456789ABCDEF0LL), // -> int 0x9ABCDEF0
+        /*b         */ true });
+
+    // ROUND 38 (over-wide) — all-ones upper bits (sign-bit garbage in the high
+    // part) that MUST be masked away.  byte 0xFFFFFF80 -> 0x80 (-128),
+    // short 0xFFFF8000 -> 0x8000 (-32768), char 0xFFFF8000 -> 0x8000 (+32768,
+    // jchar zero-extends so it is NOT -32768), int 0xFFFFFFFF00000001 ->
+    // 0x00000001 (+1, NOT -1).  This is the strongest guard that the upper bits
+    // of an over-wide slot never leak into the narrow Java return: every
+    // expectation here would flip sign if the mask were skipped.
+    run_and_check_overwide(ctx, "overwide_high_ones", overwide_values{
+        /*over_byte */ static_cast<std::int32_t>(0xFFFFFF80u),          // -> byte -128
+        /*over_short*/ static_cast<std::int32_t>(0xFFFF8000u),          // -> short -32768
+        /*over_char */ static_cast<std::int32_t>(0xFFFF8000u),          // -> char +32768
+        /*over_int  */ static_cast<std::int64_t>(0xFFFFFFFF00000001LL), // -> int +1
+        /*b         */ false });
+
+    // ROUND 39 (over-wide) — char zero-extension stress: over_char 0x0000FFFF
+    // masks to jchar 0xFFFF, which the JVM ZERO-extends to int 65535, NOT -1.
+    // A char path that sign-extended (the audit's Flaw #1 failure mode) would
+    // make obsCharAsInt == -1 here and the widened check fails loudly.  byte/
+    // short/int carry low-16/low-8 boundary garbage that masks to their MAX.
+    run_and_check_overwide(ctx, "overwide_char_zero_extend", overwide_values{
+        /*over_byte */ static_cast<std::int32_t>(0xDEADBE7Fu),          // -> byte 0x7F (+127)
+        /*over_short*/ static_cast<std::int32_t>(0xDEAD7FFFu),          // -> short 0x7FFF (+32767)
+        /*over_char */ 0x0000FFFF,                                      // -> char 0xFFFF (+65535)
+        /*over_int  */ static_cast<std::int64_t>(0x00000000FFFFFFFFLL), // -> int -1 (low 32 all ones)
+        /*b         */ true });
+
+    // ---- Lifecycle sanity: 39 rounds ran, so roundCount must be 39. -------
+    ctx.check("ran_39_rounds", rsp_fixture::round_count() == 39);
 
     // ---- Control angle: with NO hooks installed, the original values flow
     // through unchanged (proves the force-return is what changed the result,
@@ -886,17 +1146,43 @@ VMHOOK_JVM_MODULE(return_set_primitives)
             ctx.check("baseline_stat_long_2222",   rsp_fixture::obs_s_long()  == static_cast<std::int64_t>(2222));
             ctx.check("baseline_stat_double_22_25",same_bits(rsp_fixture::obs_s_double(), 22.25));
             ctx.check("baseline_stat_char_B",      rsp_fixture::obs_s_char()  == static_cast<std::uint16_t>('B'));
+            // Widened-to-int views of the unhooked originals: origByte=11 ->
+            // obsByteAsInt 11 (sign-extend of +11), origChar='A'=65 ->
+            // obsCharAsInt 65 (zero-extend), origStaticChar='B'=66.  Proves the
+            // SECOND (widening) dispatch path is also untouched without a hook.
+            ctx.check("baseline_inst_byte_as_int_11",  rsp_fixture::obs_byte_as_int()  == 11);
+            ctx.check("baseline_inst_short_as_int_111", rsp_fixture::obs_short_as_int() == 111);
+            ctx.check("baseline_inst_char_as_int_A",    rsp_fixture::obs_char_as_int()  == static_cast<std::int32_t>('A'));
+            ctx.check("baseline_stat_byte_as_int_22",   rsp_fixture::obs_s_byte_as_int()  == 22);
+            ctx.check("baseline_stat_char_as_int_B",    rsp_fixture::obs_s_char_as_int()  == static_cast<std::int32_t>('B'));
         }
     }
 
     ctx.record("[INFO] return_set_primitives: forced bool/byte/short/int/long/float/double/char "
-               "on instance+static dispatch across 34 value rounds (canonical, min/zero, signed "
+               "on instance+static dispatch across 39 value rounds (canonical, min/zero, signed "
                "min/max, minus-one, high-bit, -0.0, +Inf, -Inf, qNaN, precision, long-high-dword, "
                "surrogate char, MIN+1, MAX-1, long-low-dword-max, long-2^32-carry, float/double "
                "type-max, min-normal, lowest, subnormal, custom-NaN-payload, int-sign-neighbors, "
                "low-surrogate char, +0.0/alt-bits, neg-alt-bits, subnormal-max, neg-NaN, "
                "forced==original, powers-of-two, narrowing-trap, pre-surrogate char, second-canonical, "
-               "canonical-repeat) plus a no-hook baseline.");
+               "canonical-repeat, ulp-neighbors, low-bit-walk, and THREE over-wide rounds) plus a "
+               "no-hook baseline.  Every sub-int return is ALSO read back widened to int "
+               "(obs*AsInt), pinning the JVM caller-side mask-and-widen: byte/short sign-extend, "
+               "jchar zero-extends.");
+
+    // [INFO] OVER-WIDE coverage: the force-return template does NOT check the
+    // hooked method's Java return descriptor (vmhook.hpp:1353-1382 — the only
+    // type-checked overload is the nullptr one).  The over-wide rounds force a
+    // value strictly wider than the declared narrow return (int32_t into
+    // byte/short/char, int64_t into int) and assert the JVM masks the slot to
+    // the declared width on the CALLER side (byte&0xFF, short/char&0xFFFF,
+    // int&0xFFFFFFFF), with jchar ZERO-extended and byte/short SIGN-extended on
+    // the subsequent widen-to-int.  This pins the current (mask-on-caller)
+    // behaviour so a future BasicType-aware fix cannot silently change it.
+    ctx.record("[INFO] return_set_primitives: over-wide force (value wider than the Java return "
+               "type) is masked to the declared width by the JVM ireturn family on the caller side; "
+               "verified for int32_t->byte/short/char and int64_t->int on instance AND static "
+               "dispatch.  The force-return API itself performs no descriptor check.");
 
     // [INFO] Boolean force-return is intentionally bounded to {true,false}: the
     // return_value::set(value) API takes its argument BY TYPE, so a boolean slot

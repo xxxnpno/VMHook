@@ -54,6 +54,20 @@ public final class ReturnSetPrimitives
     public static volatile double  obsStaticDouble = 9876.54321;
     public static volatile char    obsStaticChar   = (char)  0x5A5A;
 
+    // ---- Sub-int returns captured WIDENED to int -----------------------------
+    // A byte/short/char method returns an int-on-stack value (the ireturn
+    // family); the JVM masks the forced 64-bit slot to the declared width on the
+    // caller side.  Assigning that masked narrow return into an int local makes
+    // the caller-side widening visible at full 32-bit resolution: byte/short
+    // SIGN-extend, char ZERO-extends.  These are captured by a SECOND dispatch of
+    // the same orig* method (so the byte/short/char hooks fire twice per probe).
+    public static volatile int obsByteAsInt        = 0x5A5A5A5A;
+    public static volatile int obsShortAsInt       = 0x5A5A5A5A;
+    public static volatile int obsCharAsInt        = 0x5A5A5A5A;
+    public static volatile int obsStaticByteAsInt  = 0x5A5A5A5A;
+    public static volatile int obsStaticShortAsInt = 0x5A5A5A5A;
+    public static volatile int obsStaticCharAsInt  = 0x5A5A5A5A;
+
     // ---- Control observations for the error / lifecycle angles ----
     /** Set true by the action if any orig* call threw (it must never throw). */
     public static volatile boolean sawException;
@@ -126,6 +140,17 @@ public final class ReturnSetPrimitives
                     ReturnSetPrimitives.obsStaticFloat  = origStaticFloat();
                     ReturnSetPrimitives.obsStaticDouble = origStaticDouble();
                     ReturnSetPrimitives.obsStaticChar   = origStaticChar();
+
+                    // Sub-int returns WIDENED to int — a SECOND dispatch of each
+                    // byte/short/char method, assigned into an int local so the
+                    // JVM's caller-side mask-and-widen is visible at 32 bits
+                    // (byte/short sign-extend; char zero-extends).
+                    ReturnSetPrimitives.obsByteAsInt        = self.origByte();
+                    ReturnSetPrimitives.obsShortAsInt       = self.origShort();
+                    ReturnSetPrimitives.obsCharAsInt        = self.origChar();
+                    ReturnSetPrimitives.obsStaticByteAsInt  = origStaticByte();
+                    ReturnSetPrimitives.obsStaticShortAsInt = origStaticShort();
+                    ReturnSetPrimitives.obsStaticCharAsInt  = origStaticChar();
                 }
                 catch (final Throwable t)
                 {

@@ -181,6 +181,49 @@ public final class MethodCallVoid
     public static volatile boolean staticArgCalled;
     public static volatile int     staticArgInt;
 
+    // ── throwing void methods (exception propagation across a void call) ─────
+    // Each sets a "reached" flag BEFORE it throws, so the native side can prove
+    // the Java body actually executed up to the throw point even though the
+    // call yields void and the exception is surfaced + cleared by the library.
+
+    /** True once the instance throwing-void body started (set before throw). */
+    public static volatile boolean voidThrowReached;
+    /** True once the static throwing-void body started (set before throw). */
+    public static volatile boolean voidStaticThrowReached;
+    /** The arg the throwing-with-arg body saw (recorded before it throws), so
+     *  the native side proves args are delivered even on a throwing dispatch. */
+    public static volatile boolean voidThrowArgReached;
+    public static volatile int     voidThrowArgValue;
+    /** Counts how many times the throwing body ran — the native side calls it
+     *  twice in a row to prove a throw on call N does not drop or double call N+1
+     *  and does not poison the following dispatch. */
+    public static volatile int     voidThrowReachedCount;
+
+    // ── exactly-8-slot instance void (receiver + 7 ints fills params[8]) ─────
+    // The call_stub fast path packs a fixed intptr_t params[8]; an instance call
+    // consumes locals[0] for the receiver, leaving exactly 7 argument slots.
+    // Seven ints is the maximum that still fits without the silent >8 drop, so
+    // this proves the full block is delivered right at the boundary.
+    public static volatile boolean eightSlotCalled;
+    public static volatile int     eightSlotSum;
+    public static volatile int     eightSlotLast;
+
+    // ── all-wide void (long + double, two 2-slot args back to back) ──────────
+    // Both args occupy two interpreter local slots; recording each verbatim
+    // proves consecutive wide-slot marshalling for a no-return dispatch.
+    public static volatile boolean wideOnlyCalled;
+    public static volatile long    wideOnlyLong;
+    public static volatile double  wideOnlyDouble;
+
+    // ── mixed reference + primitive + String in one void call ────────────────
+    // Exercises object_base, a primitive, and a String marshalled together in a
+    // single dispatch; the native side cross-checks all three landed.
+    public static volatile boolean mixedRefCalled;
+    public static volatile boolean mixedRefObjNonNull;
+    public static volatile int     mixedRefObjIdentity;
+    public static volatile int     mixedRefInt;
+    public static volatile int     mixedRefStrLen = -2;
+
     // ── the method the native module hooks to obtain a live thread ──────────
 
     /** Hookable instance method.  The native detour on this method performs
@@ -302,6 +345,60 @@ public final class MethodCallVoid
     {
         staticArgInt    = v;
         staticArgCalled = true;
+    }
+
+    // ── THROWING void (instance): set reached, bump counter, then throw ──────
+    // The flag/counter are written BEFORE the throw so the native side can prove
+    // the body ran; the library surfaces + clears the exception and returns void.
+    public void voidThrows()
+    {
+        voidThrowReached = true;
+        voidThrowReachedCount++;
+        throw new RuntimeException("voidThrows-intentional");
+    }
+
+    // ── THROWING void (static): static dispatch path + thrown exception ──────
+    public static void voidThrowsStatic()
+    {
+        voidStaticThrowReached = true;
+        throw new IllegalStateException("voidThrowsStatic-intentional");
+    }
+
+    // ── THROWING void WITH an arg: record the arg, then throw ────────────────
+    // Proves the argument is marshalled into the body even though the dispatch
+    // ultimately throws (the record happens before the throw).
+    public void voidThrowsArg(final int v)
+    {
+        voidThrowArgReached = true;
+        voidThrowArgValue   = v;
+        throw new RuntimeException("voidThrowsArg-intentional");
+    }
+
+    // ── exactly-8-slot instance void (receiver + 7 int args) ────────────────
+    public void voidEightSlots(final int a, final int b, final int c,
+                               final int d, final int e, final int f, final int g)
+    {
+        eightSlotSum    = a + b + c + d + e + f + g;
+        eightSlotLast   = g;
+        eightSlotCalled = true;
+    }
+
+    // ── all-wide void: long + double, two consecutive 2-slot args ───────────
+    public void voidWideOnly(final long j, final double d)
+    {
+        wideOnlyLong   = j;
+        wideOnlyDouble = d;
+        wideOnlyCalled = true;
+    }
+
+    // ── mixed reference + primitive + String in one void dispatch ───────────
+    public void voidMixedRef(final Object o, final int n, final String s)
+    {
+        mixedRefObjNonNull  = (o != null);
+        mixedRefObjIdentity = (o == null) ? 0 : System.identityHashCode(o);
+        mixedRefInt         = n;
+        mixedRefStrLen      = (s == null) ? -1 : s.length();
+        mixedRefCalled      = true;
     }
 
     // ── CONTRAST: an int returner whose value_t.is_void() must be FALSE ──────

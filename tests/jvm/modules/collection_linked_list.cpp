@@ -72,6 +72,21 @@ namespace
         }
     };
 
+    // Type-AGNOSTIC element wrapper.  The Node-chain walk reads Node.item as a
+    // raw object reference and never inspects the element class, so a LinkedList
+    // of boxed Integer / nested Cell objects walks identically to one of Strings.
+    // This wrapper carries only the decoded element OOP (no content decode, no
+    // klass registration), so the module can prove the walk over NON-String
+    // element types by asserting the returned element OOPs are valid + distinct.
+    class raw_elem : public vmhook::object<raw_elem>
+    {
+    public:
+        explicit raw_elem(vmhook::oop_t instance) noexcept
+            : vmhook::object<raw_elem>{ instance }
+        {
+        }
+    };
+
     // Host wrapper for vmhook.fixtures.LinkedListProbe.  Registered so
     // get_field("words") can resolve the field offset off the live SINGLETON.
     class llp : public vmhook::object<llp>
@@ -126,6 +141,26 @@ namespace
         static auto get_many_size_const() -> std::int32_t
         {
             const std::int32_t v = static_field("MANY_SIZE")->get();
+            return v;
+        }
+        static auto get_observed_boxed_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedBoxedSize")->get();
+            return v;
+        }
+        static auto get_observed_nested_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedNestedSize")->get();
+            return v;
+        }
+        static auto get_observed_order_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedOrderSize")->get();
+            return v;
+        }
+        static auto get_typed_size_const() -> std::int32_t
+        {
+            const std::int32_t v = static_field("TYPED_SIZE")->get();
             return v;
         }
 
@@ -219,6 +254,21 @@ namespace
                 return {};
             }
             return ll->to_vector<str_elem>();
+        }
+
+        // ---- type-agnostic raw-OOP read of an arbitrary LinkedList field ----
+        // Walks any java.util.LinkedList field as raw element OOPs (no content
+        // decode), so a LinkedList<Integer> / LinkedList<Cell> can be proven to
+        // yield the right count of valid, distinct element OOPs.
+        auto raw_via_value_to_vector(const char* name) const
+            -> std::vector<std::unique_ptr<raw_elem>>
+        {
+            const auto proxy{ this->get_field(name) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            return proxy->get().to_vector<raw_elem>();
         }
     };
 
@@ -356,6 +406,51 @@ namespace
             vmhook::linked_list_walk_items<str_elem>(oop, walk_size, direct);
             check_exact(ctx, (tagbase + "_direct").c_str(), direct, expected);
         }
+    }
+
+    // Assert a raw-OOP walk result has exactly `n` elements, every one a
+    // non-null wrapper over a pointer-valid OOP, and all element OOPs DISTINCT
+    // (no two slots alias the same object — guards against a walk that fails to
+    // advance `next` and re-emits one node).  Type-agnostic: used for the boxed
+    // Integer and nested Cell shapes.  Returns true iff the size matched.
+    auto check_raw_distinct(vmhook_test::context& ctx,
+                            const char* tag,
+                            const std::vector<std::unique_ptr<raw_elem>>& vec,
+                            const std::int32_t n) -> bool
+    {
+        const std::string t{ tag };
+        const bool size_ok{ static_cast<std::int32_t>(vec.size()) == n };
+        ctx.check(t + "_size_matches", size_ok);
+        if (!size_ok)
+        {
+            return false;
+        }
+        bool all_valid{ true };
+        for (const auto& e : vec)
+        {
+            if (!e || !vmhook::hotspot::is_valid_pointer(e->get_instance()))
+            {
+                all_valid = false;
+            }
+        }
+        ctx.check(t + "_all_elements_valid_nonnull", all_valid);
+        if (!all_valid)
+        {
+            return true;   // size matched; distinctness skipped (cannot deref)
+        }
+        bool all_distinct{ true };
+        for (std::size_t i{ 0 }; i < vec.size(); ++i)
+        {
+            for (std::size_t j{ i + 1 }; j < vec.size(); ++j)
+            {
+                if (vec[i]->get_instance() == vec[j]->get_instance())
+                {
+                    all_distinct = false;
+                }
+            }
+        }
+        ctx.check(t + "_all_element_oops_distinct", all_distinct);
+        return true;
     }
 }
 
@@ -753,7 +848,8 @@ VMHOOK_JVM_MODULE(collection_linked_list)
     // =====================================================================
     {
         const char* const shape_fields[]{
-            "emptyList", "singleList", "nullList", "dupList", "emptyStrList", "manyList" };
+            "emptyList", "singleList", "nullList", "dupList", "emptyStrList",
+            "manyList", "boxedList", "nestedList", "orderList" };
         for (const char* const field : shape_fields)
         {
             void* const oop{ inst->field_oop(field) };
@@ -769,6 +865,162 @@ VMHOOK_JVM_MODULE(collection_linked_list)
                 && pc.has_oop_field("size")
                 && !pc.has_oop_field("elementData") };
             ctx.check(tag + "_selects_node_chain_branch", predicate);
+        }
+    }
+
+    // =====================================================================
+    //  17. INSERTION-ORDER (not sort-order) invariant.  `orderList` is the
+    //      anti-sorted sequence "zulu","mike","alpha".  A walk that returned
+    //      elements in VALUE order would emit a,m,z; the first->next chain walk
+    //      must emit z,m,a — proving it preserves the chain's INSERTION order.
+    //      `words` (a,b,c) is already sorted and cannot make this distinction.
+    // =====================================================================
+    {
+        const std::vector<std::string> expected_order{
+            std::string{ "zulu" }, std::string{ "mike" }, std::string{ "alpha" } };
+        check_shape_all_paths(ctx, *inst, "orderList", std::string{ "order" },
+                              expected_order, 3);
+
+        // Explicit anti-sort assertion: the emitted sequence is NOT alphabetical.
+        const auto ov{ inst->via_value_to_vector("orderList") };
+        ctx.check("order_shape_size_is_3", ov.size() == 3u);
+        if (ov.size() == 3u)
+        {
+            const std::string s0{ slot_text(ov[0]) };
+            const std::string s1{ slot_text(ov[1]) };
+            const std::string s2{ slot_text(ov[2]) };
+            ctx.check("order_is_insertion_zulu_mike_alpha",
+                      s0 == "zulu" && s1 == "mike" && s2 == "alpha");
+            // If the walk had sorted, slot0 would be "alpha" < "mike" < "zulu";
+            // assert it is strictly NOT sorted ascending.
+            ctx.check("order_is_not_sorted_ascending", !(s0 < s1 && s1 < s2));
+        }
+        ctx.check("order_java_observed_size_is_3", llp::get_observed_order_size() == 3);
+    }
+
+    // =====================================================================
+    //  18. THREE-WAY CROSS-PATH EQUALITY on a non-trivial (null-bearing) shape.
+    //      Sections above assert each path equals the EXPECTED sequence; this
+    //      pins the three paths to EACH OTHER element-by-element on `nullList`
+    //      (which has both null and live slots), proving the cascade dispatch,
+    //      the typed-wrapper walk, and the direct free-function walk are not just
+    //      each-right-by-coincidence but mutually identical.
+    // =====================================================================
+    {
+        const auto p1{ inst->via_value_to_vector("nullList") };
+        const auto p2{ inst->via_linked_list_wrapper("nullList") };
+        void* const noop{ inst->field_oop("nullList") };
+        std::vector<std::unique_ptr<str_elem>> p3;
+        if (noop)
+        {
+            vmhook::linked_list_walk_items<str_elem>(noop, 4, p3);
+        }
+        const bool sizes_agree{ p1.size() == p2.size()
+                                && p2.size() == p3.size()
+                                && p1.size() == 4u };
+        ctx.check("nullList_three_paths_same_size", sizes_agree);
+        if (sizes_agree)
+        {
+            bool elementwise_equal{ true };
+            for (std::size_t i{ 0 }; i < p1.size(); ++i)
+            {
+                if (slot_text(p1[i]) != slot_text(p2[i])
+                    || slot_text(p2[i]) != slot_text(p3[i]))
+                {
+                    elementwise_equal = false;
+                }
+            }
+            ctx.check("nullList_three_paths_elementwise_equal", elementwise_equal);
+        }
+    }
+
+    // =====================================================================
+    //  19. BOXED-PRIMITIVE elements (LinkedList<Integer> 10,20,30,40).  The
+    //      Node-chain walk reads Node.item as a raw object reference and never
+    //      inspects the element class, so a LinkedList of boxed Integer walks
+    //      identically to one of String.  Proven type-agnostically: the walk
+    //      yields TYPED_SIZE pointer-valid, DISTINCT element OOPs (values chosen
+    //      outside the Integer cache so each box is its own object).
+    // =====================================================================
+    {
+        const std::int32_t typed_n{ llp::get_typed_size_const() };
+        ctx.check("typed_size_const_is_4", typed_n == 4);
+        ctx.check("boxed_java_observed_size_is_4", llp::get_observed_boxed_size() == 4);
+
+        check_raw_distinct(ctx, "boxed_value",
+                           inst->raw_via_value_to_vector("boxedList"), typed_n);
+
+        void* const boop{ inst->field_oop("boxedList") };
+        ctx.check("boxedList_field_decodes_to_valid_oop", boop != nullptr);
+        if (boop)
+        {
+            std::vector<std::unique_ptr<raw_elem>> direct;
+            vmhook::linked_list_walk_items<raw_elem>(boop, typed_n, direct);
+            check_raw_distinct(ctx, "boxed_direct", direct, typed_n);
+        }
+
+        // Size-as-oracle: the cascade-dispatched walk count == Java size.
+        ctx.check("boxed_native_size_matches_java",
+                  static_cast<std::int32_t>(
+                      inst->raw_via_value_to_vector("boxedList").size())
+                      == llp::get_observed_boxed_size());
+    }
+
+    // =====================================================================
+    //  20. NESTED user-defined OBJECT elements (LinkedList<Cell> tags 0..3).
+    //      A non-JDK, non-String, non-boxed element class — proves the chain
+    //      walk is element-class-agnostic over an arbitrary user type, yielding
+    //      TYPED_SIZE distinct, pointer-valid element OOPs.  No element-klass
+    //      registration is needed (we read the elements as raw OOPs).
+    // =====================================================================
+    {
+        const std::int32_t typed_n{ llp::get_typed_size_const() };
+        ctx.check("nested_java_observed_size_is_4", llp::get_observed_nested_size() == 4);
+
+        check_raw_distinct(ctx, "nested_value",
+                           inst->raw_via_value_to_vector("nestedList"), typed_n);
+
+        void* const noop{ inst->field_oop("nestedList") };
+        ctx.check("nestedList_field_decodes_to_valid_oop", noop != nullptr);
+        if (noop)
+        {
+            std::vector<std::unique_ptr<raw_elem>> direct;
+            vmhook::linked_list_walk_items<raw_elem>(noop, typed_n, direct);
+            check_raw_distinct(ctx, "nested_direct", direct, typed_n);
+        }
+
+        ctx.check("nested_native_size_matches_java",
+                  static_cast<std::int32_t>(
+                      inst->raw_via_value_to_vector("nestedList").size())
+                      == llp::get_observed_nested_size());
+    }
+
+    // =====================================================================
+    //  21. SIZE-AS-ORACLE for EVERY String shape through the CASCADE path
+    //      (collection::to_vector, not just the direct walk): the emitted count
+    //      must equal the Java-reported size of each list.  This pins the
+    //      dispatched fast-path's element count to ground truth across all the
+    //      String shapes in ONE place (each shape's content is asserted above;
+    //      this is the aggregate count-vs-size oracle).
+    // =====================================================================
+    {
+        struct shape_oracle { const char* field; std::int32_t java_size; };
+        const shape_oracle oracles[]{
+            { "words",        llp::get_observed_size() },
+            { "emptyList",    llp::get_observed_empty_size() },
+            { "singleList",   llp::get_observed_single_size() },
+            { "nullList",     llp::get_observed_null_size() },
+            { "dupList",      llp::get_observed_dup_size() },
+            { "emptyStrList", llp::get_observed_empty_str_size() },
+            { "manyList",     llp::get_observed_many_size() },
+            { "orderList",    llp::get_observed_order_size() },
+        };
+        for (const shape_oracle& o : oracles)
+        {
+            const auto vec{ inst->via_value_to_vector(o.field) };
+            const std::string tag{ o.field };
+            ctx.check(tag + "_cascade_count_equals_java_size",
+                      static_cast<std::int32_t>(vec.size()) == o.java_size);
         }
     }
 

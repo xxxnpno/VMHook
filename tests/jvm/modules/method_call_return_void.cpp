@@ -129,6 +129,30 @@ namespace
         // -- static void with a primitive arg --
         static auto static_arg_called() -> bool        { return static_field("staticArgCalled")->get(); }
         static auto static_arg_int()    -> std::int32_t { return static_field("staticArgInt")->get(); }
+
+        // -- throwing void methods --
+        static auto void_throw_reached()        -> bool        { return static_field("voidThrowReached")->get(); }
+        static auto void_static_throw_reached() -> bool        { return static_field("voidStaticThrowReached")->get(); }
+        static auto void_throw_arg_reached()    -> bool        { return static_field("voidThrowArgReached")->get(); }
+        static auto void_throw_arg_value()      -> std::int32_t { return static_field("voidThrowArgValue")->get(); }
+        static auto void_throw_reached_count()  -> std::int32_t { return static_field("voidThrowReachedCount")->get(); }
+
+        // -- exactly-8-slot instance void --
+        static auto eight_slot_called() -> bool        { return static_field("eightSlotCalled")->get(); }
+        static auto eight_slot_sum()    -> std::int32_t { return static_field("eightSlotSum")->get(); }
+        static auto eight_slot_last()   -> std::int32_t { return static_field("eightSlotLast")->get(); }
+
+        // -- all-wide void (long + double) --
+        static auto wide_only_called() -> bool   { return static_field("wideOnlyCalled")->get(); }
+        static auto wide_only_long()   -> std::int64_t { return static_field("wideOnlyLong")->get(); }
+        static auto wide_only_double() -> double { return static_field("wideOnlyDouble")->get(); }
+
+        // -- mixed ref + primitive + String void --
+        static auto mixed_ref_called()       -> bool        { return static_field("mixedRefCalled")->get(); }
+        static auto mixed_ref_obj_non_null() -> bool        { return static_field("mixedRefObjNonNull")->get(); }
+        static auto mixed_ref_obj_identity() -> std::int32_t { return static_field("mixedRefObjIdentity")->get(); }
+        static auto mixed_ref_int()          -> std::int32_t { return static_field("mixedRefInt")->get(); }
+        static auto mixed_ref_str_len()      -> std::int32_t { return static_field("mixedRefStrLen")->get(); }
     };
 
     // ------------------------------------------------------------------
@@ -179,6 +203,34 @@ namespace
     // packer's is_unique_ptr branch is distinct from the object_base branch.
     std::atomic<int> g_void_uptr_obj_is_void{ -1 };
 
+    // is_void() on the THROWING void dispatches.  A void method that throws must
+    // still report is_void() (the exception is surfaced + cleared by both the
+    // call_stub path and the call_jni path before the result decode), so these
+    // are HARD-asserted true.
+    std::atomic<int> g_void_throw_is_void{ -1 };
+    std::atomic<int> g_void_static_throw_is_void{ -1 };
+    std::atomic<int> g_void_throw_arg_is_void{ -1 };
+    // Both back-to-back throwing dispatches reported void (no poisoning between
+    // a throw and the next call on the same detour thread).
+    std::atomic<int> g_void_throw_pair_all_void{ -1 };
+
+    // The void-conversion contract: a void value_t static_cast<T>'s to a
+    // default-constructed T and as_string()'s to "".  Captured from the very
+    // first void instance call.
+    std::atomic<int>          g_void_cast_int{ -7 };
+    std::atomic<std::int64_t> g_void_cast_double_bits{ -7 };
+    std::atomic<int>          g_void_as_string_empty{ -1 };
+
+    // is_void() for the 8-slot-boundary / all-wide / mixed-ref void scenarios.
+    std::atomic<int> g_void_eight_is_void{ -1 };
+    std::atomic<int> g_void_wide_is_void{ -1 };
+    std::atomic<int> g_void_mixed_is_void{ -1 };
+
+    // A value-returning call issued IMMEDIATELY after a throwing void call, to
+    // prove the surfaced-and-cleared exception left the thread clean enough for
+    // the next dispatch to succeed (the strongest non-corruption witness).
+    std::atomic<std::int64_t> g_post_throw_echo{ -1 };
+
     // Sentinel args the native side passes, mirrored by the Java assertions.
     constexpr std::int32_t k_prim_int    = 0x0BADF00D;            // 195948557
     constexpr std::int64_t k_prim_long   = static_cast<std::int64_t>(0x0123456789ABCDEFLL);
@@ -222,6 +274,30 @@ namespace
 
     // Static-void-with-arg sentinel.
     constexpr std::int32_t k_static_arg   = static_cast<std::int32_t>(0x0FF1CE00); // 267444096
+
+    // Throwing-void-with-arg sentinel (distinct bit pattern, recorded before the
+    // body throws — proves the arg crossed the call gate on a throwing dispatch).
+    constexpr std::int32_t k_throw_arg    = static_cast<std::int32_t>(0xDEADBEEF); // -559038737
+
+    // Exactly-8-slot sentinels: seven ints (receiver + 7 == params[8] full).
+    constexpr std::int32_t k_eight_a      = 1;
+    constexpr std::int32_t k_eight_b      = 2;
+    constexpr std::int32_t k_eight_c      = 4;
+    constexpr std::int32_t k_eight_d      = 8;
+    constexpr std::int32_t k_eight_e      = 16;
+    constexpr std::int32_t k_eight_f      = 32;
+    constexpr std::int32_t k_eight_g      = 64;          // distinct "last" value
+    constexpr std::int32_t k_eight_sum    = k_eight_a + k_eight_b + k_eight_c
+                                          + k_eight_d + k_eight_e + k_eight_f
+                                          + k_eight_g;    // 127
+
+    // All-wide sentinels (long + double, each two interpreter slots).
+    constexpr std::int64_t k_wide_long    = static_cast<std::int64_t>(0x7EDCBA9876543210LL);
+    constexpr double       k_wide_double  = -2.5e300;     // large negative, sign + exponent set
+
+    // Mixed ref + primitive + String sentinels.
+    constexpr std::int32_t k_mixed_int    = static_cast<std::int32_t>(0x13572468); // 324470888
+    const std::string      k_mixed_str    = "mixed-ref-void-arg";
 }
 
 VMHOOK_JVM_MODULE(method_call_return_void)
@@ -249,12 +325,23 @@ VMHOOK_JVM_MODULE(method_call_return_void)
                 }
 
                 // ---- void INSTANCE method: is_void true + side effect ----
+                // Also capture the void-conversion contract on this result: a
+                // void value_t static_cast<T>'s to a default-constructed T and
+                // as_string()'s to "", so a caller that ignores the return gets a
+                // well-defined value rather than garbage.
                 {
                     auto proxy{ self->get_method("voidBumpInstance") };
                     if (proxy.has_value())
                     {
                         const vmhook::method_proxy::value_t v{ proxy->call() };
                         g_void_inst_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                        g_void_cast_int.store(static_cast<std::int32_t>(v), std::memory_order_relaxed);
+                        const double dcast{ static_cast<double>(v) };
+                        std::int64_t dbits{ 0 };
+                        std::memcpy(&dbits, &dcast, sizeof(dbits));
+                        g_void_cast_double_bits.store(dbits, std::memory_order_relaxed);
+                        g_void_as_string_empty.store(v.as_string().empty() ? 1 : 0,
+                                                     std::memory_order_relaxed);
                     }
                 }
 
@@ -463,6 +550,114 @@ VMHOOK_JVM_MODULE(method_call_return_void)
                             }
                         }
                         g_void_repeat_all_void.store(all_void, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with EXACTLY 8 SLOTS (receiver + 7 int args) ----
+                // The call_stub fast path packs a fixed intptr_t params[8]; an
+                // instance call uses slot 0 for the receiver, leaving exactly 7
+                // for the args.  Seven ints is the boundary that still fits, so
+                // this proves the full param block is delivered with no slot
+                // dropped right at the edge of the fixed buffer.
+                {
+                    auto proxy{ self->get_method("voidEightSlots") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{
+                            proxy->call(k_eight_a, k_eight_b, k_eight_c, k_eight_d,
+                                        k_eight_e, k_eight_f, k_eight_g) };
+                        g_void_eight_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with ALL-WIDE args (long + double, 2 slots each) ----
+                {
+                    auto proxy{ self->get_method("voidWideOnly") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{
+                            proxy->call(k_wide_long, k_wide_double) };
+                        g_void_wide_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with MIXED ref + primitive + String in one call ----
+                // Marshals an object_base receiver, a primitive, and a String
+                // together; the body records all three and the module cross-checks
+                // each landed (identity == receiver, int verbatim, exact length).
+                {
+                    auto proxy{ self->get_method("voidMixedRef") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{
+                            proxy->call(*self, k_mixed_int, k_mixed_str) };
+                        g_void_mixed_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- THROWING void (instance): body runs, throws, library
+                // surfaces + clears the exception, call() returns void, and the
+                // thread is left clean.  Proven THREE ways: is_void() true, the
+                // reached-flag set (body ran), and an immediately-following
+                // value-returning call still succeeds (no poisoning). ----
+                {
+                    auto proxy{ self->get_method("voidThrows") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_void_throw_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+
+                        // Immediately re-dispatch a value returner; if the cleared
+                        // exception had poisoned the thread this would misbehave.
+                        auto echo{ self->get_method("echoIntAfterVoid") };
+                        if (echo.has_value())
+                        {
+                            const std::int32_t r{ echo->call(k_echo_arg) };
+                            g_post_throw_echo.store(r, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // ---- THROWING void (static): static dispatch + thrown exc ----
+                {
+                    auto proxy{ method_call_void::static_method("voidThrowsStatic") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_void_static_throw_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- THROWING void WITH an arg: the arg must be marshalled into
+                // the body (recorded before the throw) even though the dispatch
+                // throws.  Proves arg delivery is independent of the throw. ----
+                {
+                    auto proxy{ self->get_method("voidThrowsArg") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call(k_throw_arg) };
+                        g_void_throw_arg_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- THROWING void TWICE in a row: a throw on call N must not
+                // drop or double call N+1.  Both must report void; the body's
+                // reached-count (1 from the single call above + 2 here == 3) is
+                // checked in the module body. ----
+                {
+                    auto proxy{ self->get_method("voidThrows") };
+                    if (proxy.has_value())
+                    {
+                        int all_void{ 1 };
+                        for (int n{ 0 }; n < 2; ++n)
+                        {
+                            const vmhook::method_proxy::value_t v{ proxy->call() };
+                            if (!v.is_void())
+                            {
+                                all_void = 0;
+                            }
+                        }
+                        g_void_throw_pair_all_void.store(all_void, std::memory_order_relaxed);
                     }
                 }
 
@@ -709,6 +904,94 @@ VMHOOK_JVM_MODULE(method_call_return_void)
         // And it must decode to the real value (proves "not void" isn't a fluke
         // from a failed call that also yields monostate -> would read as 0).
         ctx.check("mcrv_int_return_value_correct", g_int_ret_value.load() == 1337);
+
+        // =====================================================================
+        //  void RETURN-VALUE CONVERSION CONTRACT (a void result is well-defined)
+        // =====================================================================
+        // The void value_t must convert to a default-constructed target: an int
+        // cast yields 0, a double cast yields +0.0 (bit-exact, so a stray sign
+        // or payload bit would fail), and as_string() yields "".  This is what
+        // makes "ignore the return of a void call" safe rather than reading
+        // garbage out of an unread result slot.
+        ctx.check("mcrv_void_cast_int_zero", g_void_cast_int.load() == 0);
+        {
+            const double pos_zero{ 0.0 };
+            std::int64_t want_bits{ 0 };
+            std::memcpy(&want_bits, &pos_zero, sizeof(want_bits));
+            ctx.check("mcrv_void_cast_double_zero_bits",
+                      g_void_cast_double_bits.load() == want_bits);
+        }
+        ctx.check("mcrv_void_as_string_empty", g_void_as_string_empty.load() == 1);
+
+        // =====================================================================
+        //  void with EXACTLY 8 SLOTS (receiver + 7 ints) — full param block
+        // =====================================================================
+        ctx.check("mcrv_void_eight_is_void", g_void_eight_is_void.load() == 1);
+        ctx.check("mcrv_void_eight_called", method_call_void::eight_slot_called());
+        // The sum proves NO slot was dropped; the distinct last value proves the
+        // 7th (final) argument slot specifically was delivered (the boundary one).
+        ctx.check("mcrv_void_eight_sum", method_call_void::eight_slot_sum() == k_eight_sum);
+        ctx.check("mcrv_void_eight_last", method_call_void::eight_slot_last() == k_eight_g);
+
+        // =====================================================================
+        //  void with ALL-WIDE args (long + double, two 2-slot args)
+        // =====================================================================
+        ctx.check("mcrv_void_wide_is_void", g_void_wide_is_void.load() == 1);
+        ctx.check("mcrv_void_wide_called", method_call_void::wide_only_called());
+        ctx.check("mcrv_void_wide_long", method_call_void::wide_only_long() == k_wide_long);
+        ctx.check("mcrv_void_wide_double", method_call_void::wide_only_double() == k_wide_double);
+
+        // =====================================================================
+        //  void with MIXED ref + primitive + String in one call
+        // =====================================================================
+        ctx.check("mcrv_void_mixed_is_void", g_void_mixed_is_void.load() == 1);
+        ctx.check("mcrv_void_mixed_called", method_call_void::mixed_ref_called());
+        // The reference arg must be the EXACT receiver (identity match), the
+        // primitive verbatim, and the String the exact length — proving all three
+        // distinct marshalling branches landed in a single void dispatch.
+        ctx.check("mcrv_void_mixed_obj_identity_matches_receiver",
+                  method_call_void::mixed_ref_obj_non_null()
+                  && method_call_void::mixed_ref_obj_identity() != 0
+                  && method_call_void::mixed_ref_obj_identity()
+                         == method_call_void::self_identity());
+        ctx.check("mcrv_void_mixed_int", method_call_void::mixed_ref_int() == k_mixed_int);
+        ctx.check("mcrv_void_mixed_str_len",
+                  static_cast<std::size_t>(method_call_void::mixed_ref_str_len())
+                      == k_mixed_str.size());
+
+        // =====================================================================
+        //  THROWING void — exception propagation / surfacing across the call
+        // =====================================================================
+        // A void method that throws still returns a void value_t (the library
+        // surfaces + clears the pending exception on BOTH dispatch paths before
+        // the result decode), and the Java body actually ran up to the throw.
+        ctx.check("mcrv_void_throw_is_void", g_void_throw_is_void.load() == 1);
+        ctx.check("mcrv_void_throw_body_ran", method_call_void::void_throw_reached());
+        // The strongest non-corruption witness: a value-returning call issued
+        // IMMEDIATELY after the throwing void call still delivered correctly, so
+        // the cleared exception left the thread clean (no "method seemed to run
+        // but nothing happened" poisoning).
+        ctx.check("mcrv_post_throw_echo_value", g_post_throw_echo.load() == k_echo_arg);
+
+        // Static throwing void: the static dispatch path also returns void and
+        // ran its body.
+        ctx.check("mcrv_void_static_throw_is_void", g_void_static_throw_is_void.load() == 1);
+        ctx.check("mcrv_void_static_throw_body_ran",
+                  method_call_void::void_static_throw_reached());
+
+        // Throwing void WITH an arg: the argument crossed the call gate into the
+        // body (recorded before the throw) even though the dispatch threw.
+        ctx.check("mcrv_void_throw_arg_is_void", g_void_throw_arg_is_void.load() == 1);
+        ctx.check("mcrv_void_throw_arg_body_ran", method_call_void::void_throw_arg_reached());
+        ctx.check("mcrv_void_throw_arg_value",
+                  method_call_void::void_throw_arg_value() == k_throw_arg);
+
+        // Two throwing dispatches in a row both reported void, and the body ran
+        // exactly THREE times total (1 single + 2 pair) — a throw on one call
+        // neither dropped nor doubled the next.
+        ctx.check("mcrv_void_throw_pair_all_void", g_void_throw_pair_all_void.load() == 1);
+        ctx.check("mcrv_void_throw_count_exact",
+                  method_call_void::void_throw_reached_count() == 3);
 
         // =====================================================================
         //  NON-CORRUPTION: value-returning calls after the void calls

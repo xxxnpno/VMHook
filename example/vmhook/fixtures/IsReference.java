@@ -102,6 +102,42 @@ public final class IsReference
     public static String[]  sRetStringArray() { return STRING_ARRAY; }
 
     // ======================================================================
+    //  INSTANCE + STATIC: BOXED wrapper-type returns.  Every boxed type is a
+    //  Java reference ('L...;'), so is_reference() is TRUE — including the
+    //  boxed java.lang.Void ('()Ljava/lang/Void;'), which is the sharp
+    //  contrast against the PRIMITIVE void '()V' (retVoid above, FALSE).  The
+    //  boxed-vs-primitive void pair is the headline edge of this block.
+    // ======================================================================
+    public Boolean   retBoxedBool()   { return Boolean.TRUE; }
+    public Byte      retBoxedByte()   { return Byte.valueOf((byte) 1); }
+    public Short     retBoxedShort()  { return Short.valueOf((short) 2); }
+    public Character retBoxedChar()   { return Character.valueOf('A'); }
+    public Integer   retBoxedInt()    { return Integer.valueOf(3); }
+    public Long      retBoxedLong()   { return Long.valueOf(4L); }
+    public Float     retBoxedFloat()  { return Float.valueOf(0.5f); }
+    public Double    retBoxedDouble() { return Double.valueOf(6.0); }
+    public Void      retBoxedVoid()   { return null; }
+
+    public static Boolean   sRetBoxedBool()   { return Boolean.FALSE; }
+    public static Integer   sRetBoxedInt()    { return Integer.valueOf(-3); }
+    public static Long      sRetBoxedLong()   { return Long.valueOf(-4L); }
+    public static Double    sRetBoxedDouble() { return Double.valueOf(-6.0); }
+    public static Character sRetBoxedChar()   { return Character.valueOf('B'); }
+    public static Void      sRetBoxedVoid()   { return null; }
+
+    // ======================================================================
+    //  INSTANCE + STATIC: USER-defined reference returns (a nested type, by
+    //  both the concrete class and an implemented interface).  Descriptor is
+    //  'Lvmhook/fixtures/IsReference$Box;' / '$Tag;' — still 'L...;', so
+    //  is_reference() is TRUE.  Proves the verdict does NOT depend on the
+    //  type being a JDK type.
+    // ======================================================================
+    public Box retBox()        { return BOX; }
+    public Tag retTagIface()   { return BOX; }
+    public static Box sRetBox()      { return BOX; }
+    public static Tag sRetTagIface() { return BOX; }
+
+    // ======================================================================
     //  INSTANCE: every PRIMITIVE-ELEMENT array kind ([Z [B [S [C [I [J [F [D).
     //  is_reference() keys on the leading '[', so ALL of these are TRUE even
     //  though the ELEMENT type is a primitive — an array is a Java reference.
@@ -130,6 +166,30 @@ public final class IsReference
     // ======================================================================
     public java.util.List<String> retList()      { return EMPTY_LIST; }
     public CharSequence            retInterface() { return "iface"; }
+
+    // A return whose element type is a USER reference type — '[Lvmhook/.../$Box;'.
+    public Box[]     retBoxArray()    { return new Box[] { BOX }; }
+    // A very deep primitive array — '[[[[[I' — still a reference (leading '[').
+    public int[][][][][] retInt5DArray() { return new int[1][0][0][0][0]; }
+
+    // ======================================================================
+    //  STATIC twins of the array / collection / interface returns, so the
+    //  static_method() path sees the SAME '[' / 'L' return descriptors as the
+    //  instance path.  Identical descriptors prove is_reference() independent
+    //  of static-ness across EVERY reference return kind, not just scalars.
+    // ======================================================================
+    public static boolean[] sRetBoolArray()   { return new boolean[] { false }; }
+    public static byte[]    sRetByteArray()   { return new byte[] { -1 }; }
+    public static short[]   sRetShortArray()  { return new short[] { -2 }; }
+    public static char[]    sRetCharArray()   { return new char[] { 'B' }; }
+    public static long[]    sRetLongArray()   { return new long[] { -4L }; }
+    public static float[]   sRetFloatArray()  { return new float[] { -0.5f }; }
+    public static double[]  sRetDoubleArray() { return new double[] { -6.0 }; }
+    public static Object[]  sRetObjectArray() { return new Object[] { STATIC_SELF }; }
+    public static int[][]   sRetInt2DArray()  { return new int[][] { { 1 } }; }
+    public static byte[][][] sRetByte3DArray() { return new byte[][][] { { { 1 } } }; }
+    public static java.util.List<String> sRetList()      { return EMPTY_LIST; }
+    public static CharSequence            sRetInterface() { return "siface"; }
 
     // ======================================================================
     //  PARAM-LIST RED HERRING: methods whose PARAMETER list contains 'L' / '['
@@ -184,6 +244,26 @@ public final class IsReference
 
     /** A stable object the static Object returner hands back. */
     private static final Object STATIC_SELF = new Object();
+
+    // ======================================================================
+    //  USER reference types returned above.  Box is a concrete nested class
+    //  (descriptor 'Lvmhook/fixtures/IsReference$Box;'); Tag is the interface
+    //  it implements (descriptor 'Lvmhook/fixtures/IsReference$Tag;').  Both
+    //  are reference returns regardless of being user-defined.
+    // ======================================================================
+    public interface Tag
+    {
+        int kind();
+    }
+
+    public static final class Box implements Tag
+    {
+        @Override
+        public int kind() { return 7; }
+    }
+
+    /** A stable user-type payload the Box / Tag returners hand back. */
+    private static final Box BOX = new Box();
 
     static
     {

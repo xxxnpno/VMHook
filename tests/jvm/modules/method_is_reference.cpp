@@ -39,6 +39,14 @@
 //     "" , "(" , "()" all report is_reference()==false (the npos / close+1>=size
 //     guards), and a null-Method* proxy is safe (raw_method()==nullptr; any deref
 //     is gated behind vmhook::hotspot::is_valid_pointer).
+//   * EVERY reference return CLASS is swept on both paths: BOXED wrapper types
+//     (Boolean..Double, and the headline java.lang.Void which is a REFERENCE
+//     despite the word "void", opposite the primitive 'V'); USER types (a nested
+//     class + the interface it implements + a user-type array); array element
+//     kinds [Z..[D + Object[]; multi-dim [[I / [[[B and a 5-D / 7-deep array.
+//   * signature() round-trips the EXACT canonical JVM descriptor for the array /
+//     multi-dim / boxed returns (pins '[' depth + element char), and instance vs
+//     static twins share that descriptor AND agree on is_reference().
 //
 // SAFETY: is_reference()/signature() touch only signature_text (a std::string),
 // never the Method*; the one place this module reads the Method* (raw_method())
@@ -197,6 +205,103 @@ namespace
     constexpr expectation k_instance_other_refs[]{
         { "retList",      true },   // Ljava/util/List;
         { "retInterface", true },   // Ljava/lang/CharSequence;
+    };
+
+    // STATIC twins of EVERY reference return kind (arrays, multi-dim, the
+    // collection + interface).  is_reference() must be TRUE for each, agreeing
+    // with the oracle, proving static-ness never changes the verdict for the
+    // '[' / 'L' return descriptors — not just the scalars section 2 already
+    // covered.
+    constexpr expectation k_static_reference_returns[]{
+        { "sRetBoolArray",   true },   // [Z
+        { "sRetByteArray",   true },   // [B
+        { "sRetShortArray",  true },   // [S
+        { "sRetCharArray",   true },   // [C
+        { "sRetLongArray",   true },   // [J
+        { "sRetFloatArray",  true },   // [F
+        { "sRetDoubleArray", true },   // [D
+        { "sRetObjectArray", true },   // [Ljava/lang/Object;
+        { "sRetInt2DArray",  true },   // [[I
+        { "sRetByte3DArray", true },   // [[[B
+        { "sRetList",        true },   // Ljava/util/List;
+        { "sRetInterface",   true },   // Ljava/lang/CharSequence;
+    };
+
+    // BOXED wrapper-type returns: every boxed primitive is a Java REFERENCE
+    // ('L...;'), so is_reference() is TRUE — INCLUDING java.lang.Void
+    // ('()Ljava/lang/Void;'), which is the sharp contrast against the
+    // PRIMITIVE void '()V' (FALSE).  The boxed-Void vs primitive-void pair is
+    // the headline of this block: same English word "void", opposite verdict.
+    constexpr expectation k_instance_boxed[]{
+        { "retBoxedBool",   true },   // Ljava/lang/Boolean;
+        { "retBoxedByte",   true },   // Ljava/lang/Byte;
+        { "retBoxedShort",  true },   // Ljava/lang/Short;
+        { "retBoxedChar",   true },   // Ljava/lang/Character;
+        { "retBoxedInt",    true },   // Ljava/lang/Integer;
+        { "retBoxedLong",   true },   // Ljava/lang/Long;
+        { "retBoxedFloat",  true },   // Ljava/lang/Float;
+        { "retBoxedDouble", true },   // Ljava/lang/Double;
+        { "retBoxedVoid",   true },   // Ljava/lang/Void; — reference, NOT 'V'
+    };
+
+    constexpr expectation k_static_boxed[]{
+        { "sRetBoxedBool",   true },
+        { "sRetBoxedInt",    true },
+        { "sRetBoxedLong",   true },
+        { "sRetBoxedDouble", true },
+        { "sRetBoxedChar",   true },
+        { "sRetBoxedVoid",   true },   // Ljava/lang/Void; — reference, NOT 'V'
+    };
+
+    // USER-defined reference returns (a nested concrete class and the interface
+    // it implements, plus an array of the user type and a 5-D primitive array).
+    // Every descriptor is 'L...;' / '[...', so is_reference() is TRUE — the
+    // verdict does NOT depend on the type being a JDK type, nor on array depth.
+    constexpr expectation k_instance_user_refs[]{
+        { "retBox",        true },   // Lvmhook/fixtures/IsReference$Box;
+        { "retTagIface",   true },   // Lvmhook/fixtures/IsReference$Tag;
+        { "retBoxArray",   true },   // [Lvmhook/fixtures/IsReference$Box;
+        { "retInt5DArray", true },   // [[[[[I
+    };
+
+    constexpr expectation k_static_user_refs[]{
+        { "sRetBox",      true },   // Lvmhook/fixtures/IsReference$Box;
+        { "sRetTagIface", true },   // Lvmhook/fixtures/IsReference$Tag;
+    };
+
+    // Resolved-proxy EXACT-descriptor pins for the array / multi-dim returns.
+    // signature() must round-trip the canonical JVM descriptor the resolution
+    // reported — a stronger invariant than truth+oracle alone (it pins the
+    // precise '[' depth and element char, version-stable across JDK 8..26).
+    struct sig_pin
+    {
+        const char* name;
+        const char* sig;
+    };
+    constexpr sig_pin k_instance_sig_pins[]{
+        { "retBoolArray",     "()[Z" },
+        { "retByteArray",     "()[B" },
+        { "retShortArray",    "()[S" },
+        { "retCharArray",     "()[C" },
+        { "retIntArray",      "()[I" },
+        { "retLongArray",     "()[J" },
+        { "retFloatArray",    "()[F" },
+        { "retDoubleArray",   "()[D" },
+        { "retInt2DArray",    "()[[I" },
+        { "retByte3DArray",   "()[[[B" },
+        { "retInt5DArray",    "()[[[[[I" },
+        { "retObjectArray",   "()[Ljava/lang/Object;" },
+        { "retStringArray",   "()[Ljava/lang/String;" },
+        { "retString2DArray", "()[[Ljava/lang/String;" },
+        { "retString",        "()Ljava/lang/String;" },
+        { "retObject",        "()Ljava/lang/Object;" },
+        { "retBoxedInt",      "()Ljava/lang/Integer;" },
+        { "retBoxedVoid",     "()Ljava/lang/Void;" },
+        { "retVoid",          "()V" },
+        { "retInt",           "()I" },
+        { "retLong",          "()J" },
+        { "retDouble",        "()D" },
+        { "retBool",          "()Z" },
     };
 
     // PARAM-LIST RED HERRING: the parameter list carries 'L' / '[' but the
@@ -755,6 +860,207 @@ VMHOOK_JVM_MODULE(method_is_reference)
 
             const vmhook::method_proxy space{ nullptr, nullptr, std::string{ " " } };
             ctx.check("no_paren_space_false", space.is_reference() == false);
+        }
+
+        // 'L' / '[' as the return char with NO terminating ';' — is_reference()
+        // keys ONLY on the FIRST char after ')', so a missing ';' or class name
+        // does not change the verdict.  (Not a real JVM descriptor, but it pins
+        // that the accessor never scans past the return char.)
+        {
+            const vmhook::method_proxy bare_L{ nullptr, nullptr, std::string{ "()L" } };
+            ctx.check("ret_bare_L_no_semicolon_true", bare_L.is_reference() == true);
+
+            const vmhook::method_proxy bare_bracket{ nullptr, nullptr, std::string{ "()[" } };
+            ctx.check("ret_bare_bracket_true", bare_bracket.is_reference() == true);
+
+            // Boxed-Void descriptor hand-built (reference) vs primitive void.
+            const vmhook::method_proxy boxed_void{ nullptr, nullptr,
+                                                   std::string{ "()Ljava/lang/Void;" } };
+            ctx.check("hand_boxed_void_is_reference_true", boxed_void.is_reference() == true);
+
+            const vmhook::method_proxy prim_void{ nullptr, nullptr, std::string{ "()V" } };
+            ctx.check("hand_primitive_void_is_reference_false", prim_void.is_reference() == false);
+
+            // The crux contrast in one assertion: boxed Void and primitive void
+            // share the word "void" yet disagree.
+            ctx.check("boxed_void_differs_from_primitive_void",
+                      boxed_void.is_reference() != prim_void.is_reference());
+
+            // A 7-deep primitive array — leading '[' still decides -> true.
+            const vmhook::method_proxy deep_arr{ nullptr, nullptr, std::string{ "()[[[[[[[I" } };
+            ctx.check("hand_seven_deep_array_true", deep_arr.is_reference() == true);
+
+            // A user-type descriptor with a '$' nested-class name -> true.
+            const vmhook::method_proxy user_ref{ nullptr, nullptr,
+                                                 std::string{ "()Lcom/example/Outer$Inner;" } };
+            ctx.check("hand_user_nested_type_true", user_ref.is_reference() == true);
+        }
+    }
+
+    // =====================================================================
+    // 11. STATIC path: EVERY reference return kind (arrays, multi-dim, the
+    //     collection + interface twins).  Mirrors the instance sweeps of
+    //     sections 7-8 so the static_method() path is proven over the SAME
+    //     '[' / 'L' descriptors, not just the 13 scalars of section 2.
+    // =====================================================================
+    for (const expectation& e : k_static_reference_returns)
+    {
+        const auto mp{ isref::static_proxy(e.name) };
+        ctx.check(std::string{ "static_ref_resolves_" } + e.name, mp.has_value());
+        if (mp)
+        {
+            check_proxy(ctx, "static_ref", e, *mp);
+        }
+    }
+
+    // =====================================================================
+    // 12. BOXED wrapper-type returns (instance + static).  Every boxed type
+    //     is a reference; the boxed java.lang.Void is the sharp edge against
+    //     the primitive void 'V'.  Same three cross-checks per method.
+    // =====================================================================
+    if (singleton)
+    {
+        for (const expectation& e : k_instance_boxed)
+        {
+            const auto mp{ singleton->get_method(e.name) };
+            ctx.check(std::string{ "boxed_inst_resolves_" } + e.name, mp.has_value());
+            if (mp)
+            {
+                check_proxy(ctx, "boxed_inst", e, *mp);
+            }
+        }
+
+        // The boxed-Void vs primitive-void headline on RESOLVED proxies: same
+        // English "void", opposite is_reference() verdict.
+        const auto boxed_void{ singleton->get_method("retBoxedVoid") };
+        const auto prim_void{ singleton->get_method("retVoid") };
+        if (boxed_void && prim_void)
+        {
+            ctx.check("resolved_boxed_void_is_reference_true",
+                      boxed_void->is_reference() == true);
+            ctx.check("resolved_primitive_void_is_reference_false",
+                      prim_void->is_reference() == false);
+            ctx.check("resolved_boxed_void_differs_from_primitive_void",
+                      boxed_void->is_reference() != prim_void->is_reference());
+        }
+    }
+
+    for (const expectation& e : k_static_boxed)
+    {
+        const auto mp{ isref::static_proxy(e.name) };
+        ctx.check(std::string{ "boxed_static_resolves_" } + e.name, mp.has_value());
+        if (mp)
+        {
+            check_proxy(ctx, "boxed_static", e, *mp);
+        }
+    }
+
+    // =====================================================================
+    // 13. USER-defined reference returns (instance + static): a nested
+    //     concrete class, the interface it implements, an array of the user
+    //     type, and a 5-D primitive array.  Reference verdict does NOT depend
+    //     on the type being a JDK type nor on array depth.
+    // =====================================================================
+    if (singleton)
+    {
+        for (const expectation& e : k_instance_user_refs)
+        {
+            const auto mp{ singleton->get_method(e.name) };
+            ctx.check(std::string{ "userref_inst_resolves_" } + e.name, mp.has_value());
+            if (mp)
+            {
+                check_proxy(ctx, "userref_inst", e, *mp);
+            }
+        }
+    }
+    for (const expectation& e : k_static_user_refs)
+    {
+        const auto mp{ isref::static_proxy(e.name) };
+        ctx.check(std::string{ "userref_static_resolves_" } + e.name, mp.has_value());
+        if (mp)
+        {
+            check_proxy(ctx, "userref_static", e, *mp);
+        }
+    }
+
+    // =====================================================================
+    // 14. EXACT-DESCRIPTOR PINS on resolved proxies.  signature() must
+    //     round-trip the canonical JVM descriptor (precise '[' depth + element
+    //     char) the resolution reported — a stronger invariant than truth+
+    //     oracle, and version-stable across JDK 8..26.  is_reference() and the
+    //     oracle are re-checked against the pinned text for full closure.
+    // =====================================================================
+    if (singleton)
+    {
+        for (const sig_pin& p : k_instance_sig_pins)
+        {
+            const auto mp{ singleton->get_method(p.name) };
+            ctx.check(std::string{ "sigpin_resolves_" } + p.name, mp.has_value());
+            if (!mp)
+            {
+                continue;
+            }
+            const std::string sig{ mp->signature() };
+            // (a) the descriptor text is EXACTLY the canonical one expected.
+            ctx.check(std::string{ "sigpin_signature_exact_" } + p.name, sig == p.sig);
+            // (b) is_reference() agrees with the oracle run over the SAME text.
+            ctx.check(std::string{ "sigpin_is_reference_matches_oracle_" } + p.name,
+                      mp->is_reference() == oracle_is_reference(sig));
+            // (c) the oracle over the EXPECTED literal matches the accessor —
+            //     ties the JVM-reported text to the hand-derived classification.
+            ctx.check(std::string{ "sigpin_oracle_literal_matches_accessor_" } + p.name,
+                      oracle_is_reference(p.sig) == mp->is_reference());
+
+            if (sig != p.sig)
+            {
+                ctx.record(std::string{ "[INFO] sigpin " } + p.name
+                           + " expected='" + p.sig + "' actual='" + sig + "'");
+            }
+        }
+    }
+
+    // =====================================================================
+    // 15. INSTANCE vs STATIC parity for the ARRAY / reference return kinds —
+    //     not just the scalars section 3 covered.  Each instance returner and
+    //     its static twin share the identical return descriptor, so
+    //     is_reference() agrees (and is true) across the two resolution paths.
+    // =====================================================================
+    if (singleton)
+    {
+        struct twin
+        {
+            const char* inst;
+            const char* stat;
+        };
+        const twin twins[]{
+            { "retIntArray",    "sRetIntArray" },     // [I
+            { "retStringArray", "sRetStringArray" },  // [Ljava/lang/String;
+            { "retObjectArray", "sRetObjectArray" },  // [Ljava/lang/Object;
+            { "retInt2DArray",  "sRetInt2DArray" },   // [[I
+            { "retByte3DArray", "sRetByte3DArray" },  // [[[B
+            { "retList",        "sRetList" },         // Ljava/util/List;
+            { "retInterface",   "sRetInterface" },    // Ljava/lang/CharSequence;
+            { "retBox",         "sRetBox" },          // user nested class
+            { "retBoxedInt",    "sRetBoxedInt" },     // Ljava/lang/Integer;
+            { "retBoxedVoid",   "sRetBoxedVoid" },    // Ljava/lang/Void;
+        };
+        for (const twin& t : twins)
+        {
+            const auto inst_mp{ singleton->get_method(t.inst) };
+            const auto stat_mp{ isref::static_proxy(t.stat) };
+            ctx.check(std::string{ "arrparity_inst_resolves_" } + t.inst, inst_mp.has_value());
+            ctx.check(std::string{ "arrparity_static_resolves_" } + t.stat, stat_mp.has_value());
+            if (inst_mp && stat_mp)
+            {
+                ctx.check(std::string{ "arrparity_both_reference_" } + t.inst,
+                          inst_mp->is_reference() == true && stat_mp->is_reference() == true);
+                ctx.check(std::string{ "arrparity_agree_" } + t.inst,
+                          inst_mp->is_reference() == stat_mp->is_reference());
+                // The twins also share the EXACT descriptor (same return type).
+                const std::string isig{ inst_mp->signature() };
+                const std::string ssig{ stat_mp->signature() };
+                ctx.check(std::string{ "arrparity_signatures_equal_" } + t.inst, isig == ssig);
+            }
         }
     }
 }

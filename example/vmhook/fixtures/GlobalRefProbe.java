@@ -62,15 +62,29 @@ public final class GlobalRefProbe
      */
     public int sentinel;
 
-    /** ()V — leaves sentinel at its default 0 (used only if the (I)V path is unavailable). */
+    /**
+     * A reference-typed payload the native side ALSO reads back through
+     * global_ref.oop() — proving the pin tracks the object well enough to chase
+     * an embedded object field (not just a primitive).  Stamped by the (I)V
+     * constructor to a fixed, sentinel-independent constant so the native module
+     * can assert it byte-for-byte via read_java_string(.oop()-derived field).
+     * The ()V path leaves it null, which the native null-payload check relies on.
+     */
+    public String tag;
+
+    /** The exact bytes the native module expects {@link #tag} to hold after the (I)V ctor. */
+    public static final String TAG_VALUE = "pinned-tag";
+
+    /** ()V — leaves sentinel at 0 and tag at null (the no-arg / default-payload path). */
     public GlobalRefProbe()
     {
     }
 
-    /** (I)V — stamps the sentinel the native module pins and verifies. */
+    /** (I)V — stamps the sentinel AND the reference-typed tag the native module pins and verifies. */
     public GlobalRefProbe(final int value)
     {
         this.sentinel = value;
+        this.tag = TAG_VALUE;
     }
 
     // ── Probe self-registration ─────────────────────────────────────────────────

@@ -111,6 +111,13 @@ namespace
         static auto get_marker_const() -> std::int32_t { return static_field("MARKER")->get(); }
         static auto get_pinned_count() -> std::int32_t { return static_field("pinnedCount")->get(); }
 
+        // SUB_* statics are DECLARED on this base class (not on Sub), so they are
+        // resolved here against the base klass mirror — never via the Sub klass,
+        // whose own field list does not carry inherited statics.
+        static auto get_sub_pin_count() -> std::int32_t    { return static_field("SUB_PIN_COUNT")->get(); }
+        static auto get_sub_marker() -> std::int32_t       { return static_field("SUB_MARKER")->get(); }
+        static auto get_pinned_sub_count() -> std::int32_t { return static_field("pinnedSubCount")->get(); }
+
         // ── per-instance field read-back (callers MUST gate on is_valid below) ─
         auto read_id() -> std::int32_t     { return get_field("id")->get(); }
         auto read_marker() -> std::int32_t { return get_field("marker")->get(); }
@@ -133,6 +140,53 @@ namespace
         explicit fei_unregistered(vmhook::oop_t instance) noexcept
             : vmhook::object<fei_unregistered>{ instance }
         {
+        }
+    };
+
+    // Wrapper for the DERIVED subclass vmhook.fixtures.ForEachInstance$Sub.  The
+    // heap scan matches the decoded narrow-klass pointer for EXACT equality
+    // (vmhook.hpp:8697 — `decoded != static_cast<void*>(target_klass)`), so a Sub
+    // header decodes to a DIFFERENT klass than the base: a base-typed scan must
+    // never report a Sub, and a Sub-typed scan reports only Sub headers (each
+    // carrying SUB_MARKER).  This is the documented exact-klass-vs-subclass angle.
+    class fei_sub : public vmhook::object<fei_sub>
+    {
+    public:
+        explicit fei_sub(vmhook::oop_t instance) noexcept
+            : vmhook::object<fei_sub>{ instance }
+        {
+        }
+
+        // NOTE: SUB_* statics live on the BASE class mirror; read them via
+        // fei_fixture, not here (fei_sub's klass carries no inherited statics).
+        // `id` / `marker` ARE inherited instance fields, but instance field reads
+        // walk the klass field layout including supers, so they resolve fine.
+        auto read_id() -> std::int32_t     { return get_field("id")->get(); }
+        auto read_marker() -> std::int32_t { return get_field("marker")->get(); }
+
+        auto is_valid() const -> bool
+        {
+            return this->get_instance() != nullptr
+                && vmhook::hotspot::is_valid_pointer(this->get_instance());
+        }
+    };
+
+    // Wrapper for the LOADED-BUT-NEVER-INSTANTIATED nested type
+    // vmhook.fixtures.ForEachInstance$Empty.  Its klass resolves (the native side
+    // registers it) yet the fixture never constructs one, so its genuine live
+    // count is zero.  The scan must complete cleanly and crash-safely.
+    class fei_empty : public vmhook::object<fei_empty>
+    {
+    public:
+        explicit fei_empty(vmhook::oop_t instance) noexcept
+            : vmhook::object<fei_empty>{ instance }
+        {
+        }
+
+        auto is_valid() const -> bool
+        {
+            return this->get_instance() != nullptr
+                && vmhook::hotspot::is_valid_pointer(this->get_instance());
         }
     };
 
@@ -205,11 +259,85 @@ namespace
         r.elapsed_ms = std::chrono::duration<double, std::milli>{ finish - start }.count();
         return r;
     }
+
+    // One for_each_instance pass over the DERIVED fei_sub klass.  Folds the same
+    // tallies as scan() so the exact-klass invariants (every visited header is a
+    // Sub carrying SUB_MARKER, count == visited, all valid, within cap) can be
+    // asserted independently of the base scan.
+    auto scan_sub(std::size_t   max_visits,
+                  std::int32_t  sub_marker,
+                  std::int32_t  sub_pin_count) -> scan_result
+    {
+        scan_result r{};
+        const auto start{ std::chrono::steady_clock::now() };
+
+        r.returned = vmhook::for_each_instance<fei_sub>(
+            [&](std::unique_ptr<fei_sub> instance)
+            {
+                ++r.visited;
+                const bool ok{ instance != nullptr && instance->is_valid() };
+                if (!ok)
+                {
+                    r.all_valid = false;
+                    return;
+                }
+                ++r.readable;
+                const std::int32_t mk{ instance->read_marker() };
+                if (mk == sub_marker)
+                {
+                    ++r.marker_ok;
+                }
+                else
+                {
+                    ++r.marker_bad;
+                }
+                const std::int32_t id{ instance->read_id() };
+                if (id >= 0 && id < sub_pin_count)
+                {
+                    r.ids.insert(id);
+                }
+            },
+            max_visits);
+
+        const auto finish{ std::chrono::steady_clock::now() };
+        r.elapsed_ms = std::chrono::duration<double, std::milli>{ finish - start }.count();
+        return r;
+    }
+
+    // A minimal crash-safe scan over the never-instantiated fei_empty klass: counts
+    // returns/visits and confirms every wrapper had a valid OOP, timing the walk so
+    // the caller can prove it terminates bounded.  No field is read back (the type
+    // carries no sentinel of interest); the point is that scanning a registered,
+    // resolvable, but un-instantiated klass neither crashes nor hangs.
+    auto scan_empty(std::size_t max_visits) -> scan_result
+    {
+        scan_result r{};
+        const auto start{ std::chrono::steady_clock::now() };
+        r.returned = vmhook::for_each_instance<fei_empty>(
+            [&](std::unique_ptr<fei_empty> instance)
+            {
+                ++r.visited;
+                if (instance == nullptr || !instance->is_valid())
+                {
+                    r.all_valid = false;
+                }
+            },
+            max_visits);
+        const auto finish{ std::chrono::steady_clock::now() };
+        r.elapsed_ms = std::chrono::duration<double, std::milli>{ finish - start }.count();
+        return r;
+    }
 }
 
 VMHOOK_JVM_MODULE(for_each_instance)
 {
     vmhook::register_class<fei_fixture>("vmhook/fixtures/ForEachInstance");
+    // Derived subclass + never-instantiated nested type (javac emits them with the
+    // outer$Inner internal name).  Both resolve to a klass distinct from the base.
+    const bool sub_registered{
+        vmhook::register_class<fei_sub>("vmhook/fixtures/ForEachInstance$Sub") };
+    const bool empty_registered{
+        vmhook::register_class<fei_empty>("vmhook/fixtures/ForEachInstance$Empty") };
     // NOTE: fei_unregistered is intentionally NOT registered (see Part E).
 
     const std::int32_t pin_count{ fei_fixture::get_pin_count() };
@@ -240,6 +368,19 @@ VMHOOK_JVM_MODULE(for_each_instance)
     ctx.record(std::string{ "[INFO] fixture reports pinnedCount=" }
                + std::to_string(pinned_count));
     ctx.check("fixture_pinned_full_array", pinned_count == pin_count);
+
+    // The same probe also pins a small handful of DERIVED Sub instances (used by
+    // PART F).  Read the sub constants + pinned tally once, here, while the probe
+    // has just run.  These statics live on the base class mirror / Sub mirror.
+    const std::int32_t sub_pin_count{ fei_fixture::get_sub_pin_count() };
+    const std::int32_t sub_marker{ fei_fixture::get_sub_marker() };
+    const std::int32_t pinned_sub_count{ fei_fixture::get_pinned_sub_count() };
+    ctx.record(std::string{ "[INFO] for_each_instance: SUB_PIN_COUNT=" }
+               + std::to_string(sub_pin_count) + " SUB_MARKER=" + std::to_string(sub_marker)
+               + " pinnedSubCount=" + std::to_string(pinned_sub_count)
+               + " sub_registered=" + (sub_registered ? "yes" : "no")
+               + " empty_registered=" + (empty_registered ? "yes" : "no"));
+    ctx.check("fixture_pinned_full_sub_array", pinned_sub_count == sub_pin_count);
 
     // =====================================================================
     // PART B — baseline scan: the RELIABLE invariants for_each_instance promises.
@@ -323,6 +464,35 @@ VMHOOK_JVM_MODULE(for_each_instance)
     const scan_result zero_cap{ scan(0, marker_const, pin_count) };
     ctx.check("zero_cap_returns_zero", zero_cap.returned == 0);
     ctx.check("zero_cap_never_visits", zero_cap.visited == 0);
+
+    // CAP MATRIX — a bounded sweep of distinct small caps proves the cap re-check
+    // in BOTH loops (vmhook.hpp:8676 chunk loop / 8688 stride loop) holds for every
+    // boundary value, not just the one PART-C value.  Scan-modest: a handful of
+    // tiny caps, each a single O(heap) walk on a tiny test heap.  For each cap the
+    // returned tally and the visitor-call count must both stay <= cap, must equal
+    // each other (honest tally), and every wrapper must be valid.  These are all
+    // RELIABLE invariants — a breach is a real cap/tally defect.
+    {
+        const std::size_t caps[]{ 1u, 2u, 3u, 7u,
+                                  static_cast<std::size_t>(pin_count) - 1u };
+        for (const std::size_t cap : caps)
+        {
+            const scan_result cr{ scan(cap, marker_const, pin_count) };
+            const std::string suffix{ "_cap" + std::to_string(cap) };
+            ctx.check(("matrix_returned_within" + suffix),   cr.returned <= cap);
+            ctx.check(("matrix_visited_within"  + suffix),   cr.visited  <= cap);
+            ctx.check(("matrix_count_matches"   + suffix),   cr.returned == cr.visited);
+            ctx.check(("matrix_all_valid"       + suffix),   cr.all_valid);
+            // With our pinned instances live, any positive cap should surface at
+            // least one (best-effort across collectors, so RECORD not assert when
+            // it doesn't — a conservative miss is legal).  cap==1 is the
+            // exactly-one-instance angle: at most one visit, count honest.
+            ctx.record(std::string{ "[INFO] cap matrix cap=" } + std::to_string(cap)
+                       + ": returned=" + std::to_string(cr.returned)
+                       + " visited=" + std::to_string(cr.visited)
+                       + (cr.returned > 0 ? " (saw an instance)" : " (none this pass)"));
+        }
+    }
 
     // =====================================================================
     // PART D — BEST-EFFORT identity (all [INFO], NEVER a hard-fail).  The
@@ -409,5 +579,155 @@ VMHOOK_JVM_MODULE(for_each_instance)
         ctx.check("repeat_visits_within_cap", again.returned <= generous_cap);
         ctx.check("repeat_all_wrappers_valid", again.all_valid);
         ctx.check("repeat_some_marker_ok", again.readable == 0 || again.marker_ok > 0);
+    }
+
+    // =====================================================================
+    // PART F — EXACT-KLASS vs SUBCLASS.  for_each_instance matches the decoded
+    //          narrow-klass pointer for EXACT equality (vmhook.hpp:8697), so:
+    //            * a Sub-typed scan reports ONLY Sub headers (each SUB_MARKER), and
+    //            * a base-typed scan NEVER reports a Sub (different klass pointer).
+    //          The "base never sees a Sub" property is asserted via the marker /
+    //          id discriminator: the base scan's readable headers all carry the
+    //          BASE marker and base-range ids — a Sub leaking in would show
+    //          SUB_MARKER, which the base fold counts as marker_bad.  Because
+    //          SUB_PIN_COUNT (4) is tiny relative to PIN_COUNT (100), and the base
+    //          scan already hard-asserts `baseline_some_marker_ok`, the structural
+    //          discriminator we add here is the Sub scan's own purity.
+    // =====================================================================
+    if (sub_registered)
+    {
+        const std::size_t sub_cap{ static_cast<std::size_t>(sub_pin_count) * 8 + 256 };
+        const scan_result sub{ scan_sub(sub_cap, sub_marker, sub_pin_count) };
+        ctx.record(std::string{ "[INFO] sub scan: returned=" }
+                   + std::to_string(sub.returned) + " visited=" + std::to_string(sub.visited)
+                   + " readable=" + std::to_string(sub.readable)
+                   + " marker_ok=" + std::to_string(sub.marker_ok)
+                   + " marker_bad=" + std::to_string(sub.marker_bad)
+                   + " ids_seen=" + std::to_string(sub.ids.size())
+                   + " in " + std::to_string(sub.elapsed_ms) + " ms");
+
+        // RELIABLE: honest tally, all wrappers valid, bounded by cap, terminates.
+        ctx.check("sub_count_matches_returned", sub.returned == sub.visited);
+        ctx.check("sub_all_wrappers_valid",     sub.all_valid);
+        ctx.check("sub_visits_within_cap",      sub.returned <= sub_cap);
+        ctx.check("sub_scan_terminates_bounded", sub.elapsed_ms < 30000.0);
+
+        // EXACT-KLASS PURITY.  Every readable header the Sub-typed scan produced
+        // should carry SUB_MARKER, never the base MARKER — the exact-klass filter
+        // (vmhook.hpp:8697 pointer equality) hands back ONLY Sub instances, since a
+        // base ForEachInstance decodes to a DIFFERENT klass pointer and can never be
+        // visited on a Sub scan.  We HARD-assert the POSITIVE signal (at least one
+        // readable header was a real Sub carrying SUB_MARKER) — the same reliable
+        // floor the baseline uses (`baseline_some_marker_ok`).  The marker_bad split
+        // is RECORDED, not asserted: exactly as for the base scan, a moving GC that
+        // reused a matched header's page between the klass match and the field read
+        // could leave arbitrary bytes at the marker offset, so a non-zero marker_bad
+        // is a best-effort variance of a conservative raw walk, not a leak/defect.
+        if (sub.readable > 0)
+        {
+            ctx.check("sub_some_marker_ok", sub.marker_ok > 0);
+            ctx.record(std::string{ "[INFO] sub exact-klass purity: " }
+                       + std::to_string(sub.marker_ok) + "/" + std::to_string(sub.readable)
+                       + " carried SUB_MARKER (" + std::to_string(sub.marker_bad)
+                       + " mismatched"
+                       + (sub.marker_bad == 0
+                              ? "" : " — conservative-scan reused-page/false-positive")
+                       + ")");
+        }
+        else
+        {
+            // No Sub surfaced this pass (a legal conservative miss).  Record it;
+            // do NOT hard-fail — Sub instances are few and a moving/region GC can
+            // skip them.  The base scan already proves the machinery sees objects.
+            ctx.record("[INFO] sub scan produced no readable Sub this pass "
+                       "(conservative heap-walk miss — best-effort, not a defect)");
+        }
+
+        // BEST-EFFORT identity ([INFO]): how many of the SUB_PIN_COUNT distinct
+        // Sub ids the scan saw.  A conservative scan may miss any, so RECORD only.
+        ctx.record(std::string{ "[INFO] sub identity: saw " }
+                   + std::to_string(sub.ids.size()) + " of " + std::to_string(sub_pin_count)
+                   + " distinct Sub ids"
+                   + (sub.ids.size() == static_cast<std::size_t>(sub_pin_count)
+                          ? " (ALL found)" : " (some missed — conservative scan)"));
+    }
+    else
+    {
+        ctx.record("[INFO] ForEachInstance$Sub did not resolve on this JDK; "
+                   "exact-klass-vs-subclass scan skipped (best-effort)");
+    }
+
+    // =====================================================================
+    // PART G — NEVER-INSTANTIATED class is crash-safe.  fei_empty's klass resolves
+    //          (registered above) but the fixture never constructs one, so its
+    //          genuine live count is zero.  The scan over it MUST terminate cleanly,
+    //          never crash/hang, keep an honest tally, and hand back only valid
+    //          wrappers.  The count itself is best-effort: a conservative raw walk
+    //          could in principle surface a stale look-alike header whose klass
+    //          bytes alias fei_empty's, so we RECORD the returned count (expected 0)
+    //          rather than hard-asserting == 0.
+    // =====================================================================
+    if (empty_registered)
+    {
+        const std::size_t empty_cap{ 256 };
+        const scan_result empt{ scan_empty(empty_cap) };
+        ctx.record(std::string{ "[INFO] never-instantiated scan: returned=" }
+                   + std::to_string(empt.returned) + " visited=" + std::to_string(empt.visited)
+                   + " in " + std::to_string(empt.elapsed_ms) + " ms"
+                   + (empt.returned == 0 ? " (no genuine Empty — as expected)"
+                                         : " (saw look-alike header(s) — conservative scan)"));
+
+        // RELIABLE: honest tally, valid wrappers, bounded by cap, terminates — the
+        // crash-safety-on-a-never-instantiated-class promise, executable.
+        ctx.check("empty_count_matches_returned", empt.returned == empt.visited);
+        ctx.check("empty_all_wrappers_valid",     empt.all_valid);
+        ctx.check("empty_visits_within_cap",      empt.returned <= empty_cap);
+        ctx.check("empty_scan_terminates_bounded", empt.elapsed_ms < 30000.0);
+    }
+    else
+    {
+        ctx.record("[INFO] ForEachInstance$Empty did not resolve on this JDK; "
+                   "never-instantiated crash-safety scan skipped (best-effort)");
+    }
+
+    // =====================================================================
+    // PART H — ARRAY-KLASS vs INSTANCE-KLASS.  PINNED itself is a
+    //          ForEachInstance[] object whose header decodes to an ARRAY klass —
+    //          a different klass pointer than the instance klass fei_fixture is
+    //          registered on.  So the baseline (instance-klass) scan must NEVER
+    //          have surfaced the array object: the discriminator is that every
+    //          readable base header carried the BASE instance MARKER (already
+    //          proven by baseline_some_marker_ok and the marker fold).  We record
+    //          the array-klass resolution as a best-effort [INFO]: resolving the
+    //          internal name "[Lvmhook/fixtures/ForEachInstance;" via the
+    //          ClassLoaderDataGraph walk is JDK-variant, so whether find_class
+    //          returns a klass for the array type is recorded, not asserted.  The
+    //          one HARD invariant is the universal one already covered above (the
+    //          instance-klass scan is honest and crash-safe); here we only document
+    //          that the array object did not contaminate the instance-klass tally.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const array_klass{
+            vmhook::find_class("[Lvmhook/fixtures/ForEachInstance;") };
+        vmhook::hotspot::klass* const inst_klass{
+            vmhook::find_class("vmhook/fixtures/ForEachInstance") };
+        ctx.record(std::string{ "[INFO] array-klass resolution: [LForEachInstance; -> " }
+                   + (array_klass ? "resolved" : "null (JDK-variant; array names need not "
+                                                  "resolve via ClassLoaderDataGraph)")
+                   + ", instance klass -> " + (inst_klass ? "resolved" : "null"));
+        if (array_klass && inst_klass)
+        {
+            // When BOTH resolve, the array klass is structurally a DIFFERENT klass
+            // pointer than the instance klass — that pointer inequality is exactly
+            // what makes the instance-klass scan skip the ForEachInstance[] header.
+            // This is a RELIABLE structural invariant when the precondition holds.
+            ctx.check("array_klass_distinct_from_instance_klass",
+                      static_cast<void*>(array_klass) != static_cast<void*>(inst_klass));
+        }
+        else
+        {
+            ctx.record("[INFO] array-klass distinctness check skipped "
+                       "(one or both klasses did not resolve on this JDK)");
+        }
     }
 }

@@ -117,6 +117,59 @@ public final class LinkedListProbe
      */
     public final LinkedList<String> manyList = new LinkedList<String>();
 
+    // ── VARIED-ELEMENT-TYPE shapes ──────────────────────────────────────────
+    // The Node-chain walk is element-type-AGNOSTIC: it reads Node.item as a raw
+    // object reference and never looks at the element class.  These shapes prove
+    // the SAME first-&gt;next traversal yields the right COUNT of pointer-valid,
+    // distinct element OOPs when the elements are NOT java.lang.String — boxed
+    // primitives (Integer) and a user-defined nested object (Cell).  The native
+    // side reads them as raw OOPs (validity + distinctness), not as text, so no
+    // element-klass registration is needed.
+
+    /** The element count of {@link #boxedList} / {@link #nestedList}. */
+    public static final int TYPED_SIZE = 4;
+
+    /**
+     * Boxed-primitive LinkedList: Integer 10,20,30,40 in insertion order.
+     * Each element is a distinct java.lang.Integer object, so the walk must
+     * return four distinct, pointer-valid element OOPs in order.  Values are
+     * outside the [-128,127] Integer cache so each box is its own object (no
+     * accidental identity sharing that could collapse "distinct" to one OOP).
+     */
+    public final LinkedList<Integer> boxedList = new LinkedList<Integer>();
+
+    /**
+     * A tiny user-defined element type so the walk is exercised over a
+     * NON-JDK, non-String, non-boxed element class.  Just an int tag; the
+     * native side only checks the element OOPs are valid and distinct.
+     */
+    public static final class Cell
+    {
+        public final int tag;
+
+        public Cell(final int t)
+        {
+            this.tag = t;
+        }
+    }
+
+    /**
+     * Nested-object LinkedList: four distinct {@link Cell} instances with tags
+     * 0..3 in insertion order.  Proves the chain walk works over a user-defined
+     * element class, returning four distinct pointer-valid OOPs.
+     */
+    public final LinkedList<Cell> nestedList = new LinkedList<Cell>();
+
+    /**
+     * Anti-sorted distinct tokens: "zulu","mike","alpha".  Deliberately NOT in
+     * alphabetical order so a walk that returned elements in value order (rather
+     * than insertion / chain order) would visibly reorder them.  The first-&gt;next
+     * walk must yield exactly z,m,a — proving INSERTION order, not sort order, is
+     * the invariant.  (words is already a,b,c which is also sorted, so it cannot
+     * distinguish chain order from sort order; this shape can.)
+     */
+    public final LinkedList<String> orderList = new LinkedList<String>();
+
     /** Java-side observed size of {@link #words}, republished each probe run. */
     public static volatile int observedSize;
 
@@ -127,6 +180,9 @@ public final class LinkedListProbe
     public static volatile int observedDupSize;
     public static volatile int observedEmptyStrSize;
     public static volatile int observedManySize;
+    public static volatile int observedBoxedSize;
+    public static volatile int observedNestedSize;
+    public static volatile int observedOrderSize;
 
     /** A nonce the trigger detour writes, guaranteeing fresh bytecode dispatch. */
     public static volatile int triggerNonce;
@@ -163,6 +219,22 @@ public final class LinkedListProbe
         {
             manyList.add(Integer.toString(k));
         }
+
+        // Boxed Integers outside the -128..127 cache so each is a distinct box.
+        boxedList.add(Integer.valueOf(10));
+        boxedList.add(Integer.valueOf(20));
+        boxedList.add(Integer.valueOf(30));
+        boxedList.add(Integer.valueOf(40));
+
+        nestedList.add(new Cell(0));
+        nestedList.add(new Cell(1));
+        nestedList.add(new Cell(2));
+        nestedList.add(new Cell(3));
+
+        // Deliberately NOT alphabetical, so insertion order != sort order.
+        orderList.add("zulu");
+        orderList.add("mike");
+        orderList.add("alpha");
 
         populated = true;
     }
@@ -203,6 +275,9 @@ public final class LinkedListProbe
                 LinkedListProbe.observedDupSize = SINGLETON.dupList.size();
                 LinkedListProbe.observedEmptyStrSize = SINGLETON.emptyStrList.size();
                 LinkedListProbe.observedManySize = SINGLETON.manyList.size();
+                LinkedListProbe.observedBoxedSize = SINGLETON.boxedList.size();
+                LinkedListProbe.observedNestedSize = SINGLETON.nestedList.size();
+                LinkedListProbe.observedOrderSize = SINGLETON.orderList.size();
                 // Real bytecode dispatch the native scoped_hook rides; the
                 // detour is where the native side does its LinkedList reads.
                 SINGLETON.trigger(7);
