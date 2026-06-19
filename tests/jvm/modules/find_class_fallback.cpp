@@ -146,6 +146,16 @@ namespace
     // Fallback called twice on the same app name: stable pointer (idempotent).
     std::atomic<bool> g_fb_probe_stable{ false };
 
+    // find_class_via_oop on self's loader resolves the app class, and that klass
+    // equals the graph-walk find_class result (same app loader, one copy).
+    std::atomic<bool> g_via_oop_nonnull{ false };
+    std::atomic<bool> g_via_oop_matches_graph{ false };
+
+    // Plain vmhook::jni::find_class (JNI FindClass) returns a non-null handle for
+    // the app class and a null (no-crash) result for a missing class, on-thread.
+    std::atomic<bool> g_jni_find_app_nonnull{ false };
+    std::atomic<bool> g_jni_find_missing_null{ false };
+
     // The whole detour body completed without an exception escaping.
     std::atomic<bool> g_detour_completed{ false };
 }
@@ -186,6 +196,57 @@ VMHOOK_JVM_MODULE(find_class_fallback)
         ctx.check("bootstrap_distinct_klasses",
                   k_object != nullptr && k_string != nullptr
                   && k_object != k_string && k_string != k_integer);
+
+        // More bootstrap/platform names, each proven usable (name round-trip +
+        // valid mirror).  These widen the set of resolution targets across the
+        // java.lang / java.util packages.
+        vmhook::hotspot::klass* const k_class{ vmhook::find_class("java/lang/Class") };
+        ctx.check("bootstrap_Class_nonnull", k_class != nullptr);
+        ctx.check("bootstrap_Class_name_matches", klass_name(k_class) == "java/lang/Class");
+        ctx.check("bootstrap_Class_mirror_usable", klass_mirror_usable(k_class));
+
+        vmhook::hotspot::klass* const k_thread{ vmhook::find_class("java/lang/Thread") };
+        ctx.check("bootstrap_Thread_nonnull", k_thread != nullptr);
+        ctx.check("bootstrap_Thread_name_matches", klass_name(k_thread) == "java/lang/Thread");
+
+        vmhook::hotspot::klass* const k_throwable{ vmhook::find_class("java/lang/Throwable") };
+        ctx.check("bootstrap_Throwable_nonnull", k_throwable != nullptr);
+        ctx.check("bootstrap_Throwable_name_matches", klass_name(k_throwable) == "java/lang/Throwable");
+
+        vmhook::hotspot::klass* const k_hashmap{ vmhook::find_class("java/util/HashMap") };
+        ctx.check("bootstrap_HashMap_nonnull", k_hashmap != nullptr);
+        ctx.check("bootstrap_HashMap_name_matches", klass_name(k_hashmap) == "java/util/HashMap");
+
+        vmhook::hotspot::klass* const k_number{ vmhook::find_class("java/lang/Number") };
+        ctx.check("bootstrap_Number_nonnull", k_number != nullptr);
+        ctx.check("bootstrap_Number_name_matches", klass_name(k_number) == "java/lang/Number");
+
+        // SUPER-CLASS invariants that hold on EVERY JDK 8..26 (final-ish concrete
+        // hierarchy, never refactored): String extends Object directly; Integer
+        // extends Number; Number extends Object.  This proves find_class resolves
+        // BOTH ends of a stable hierarchy to the SAME klass the other's _super
+        // points at — a cross-class identity, not just per-name resolution.
+        if (k_string != nullptr && k_object != nullptr)
+        {
+            ctx.check("bootstrap_String_super_is_Object",
+                      k_string->get_super() == k_object);
+        }
+        if (k_integer != nullptr && k_number != nullptr)
+        {
+            ctx.check("bootstrap_Integer_super_is_Number",
+                      k_integer->get_super() == k_number);
+        }
+        if (k_number != nullptr && k_object != nullptr)
+        {
+            ctx.check("bootstrap_Number_super_is_Object",
+                      k_number->get_super() == k_object);
+        }
+
+        // java.lang.Object is the root: its _super is null on every JVM.
+        if (k_object != nullptr)
+        {
+            ctx.check("bootstrap_Object_has_no_super", k_object->get_super() == nullptr);
+        }
     }
 
     // =====================================================================
@@ -240,6 +301,42 @@ VMHOOK_JVM_MODULE(find_class_fallback)
         else
         {
             ctx.record("[INFO] find_class does not resolve object-array klass [Ljava/lang/String; on this JDK");
+        }
+
+        // Multi-dimensional primitive array [[I (fixture anchors a int[][]).
+        // Same JDK-variant gating: assert the descriptor name only when resolved.
+        vmhook::hotspot::klass* const k_int2d{ vmhook::find_class("[[I") };
+        if (k_int2d != nullptr)
+        {
+            ctx.check("array_2d_primitive_valid", vmhook::hotspot::is_valid_pointer(k_int2d));
+            ctx.check("array_2d_primitive_name_matches", klass_name(k_int2d) == "[[I");
+            // [[I and [I are different array klasses.
+            if (k_int_arr != nullptr)
+            {
+                ctx.check("array_2d_distinct_from_1d", k_int2d != k_int_arr);
+            }
+        }
+        else
+        {
+            ctx.record("[INFO] find_class does not resolve 2-D primitive-array klass [[I on this JDK");
+        }
+
+        // Object-array of Object [Ljava/lang/Object; (fixture anchors a Object[]).
+        vmhook::hotspot::klass* const k_obj_arr{ vmhook::find_class("[Ljava/lang/Object;") };
+        if (k_obj_arr != nullptr)
+        {
+            ctx.check("array_object_Object_valid", vmhook::hotspot::is_valid_pointer(k_obj_arr));
+            ctx.check("array_object_Object_name_matches",
+                      klass_name(k_obj_arr) == "[Ljava/lang/Object;");
+            // The element-typed object arrays are distinct from one another.
+            if (k_str_arr != nullptr)
+            {
+                ctx.check("array_object_element_distinct", k_obj_arr != k_str_arr);
+            }
+        }
+        else
+        {
+            ctx.record("[INFO] find_class does not resolve object-array klass [Ljava/lang/Object; on this JDK");
         }
     }
 
@@ -320,6 +417,31 @@ VMHOOK_JVM_MODULE(find_class_fallback)
             }
         }
         ctx.check("missing_class_repeated_stable_null", all_null);
+
+        // A bare nested-name with a '$' segment that doesn't exist -> null.
+        vmhook::hotspot::klass* const k_missing_inner{
+            vmhook::find_class("vmhook/fixtures/FindClassProbe$NoSuchInner") };
+        ctx.check("missing_nested_returns_null", k_missing_inner == nullptr);
+
+        // A multi-dim missing object-array name -> null, no crash.
+        vmhook::hotspot::klass* const k_missing_2darr{
+            vmhook::find_class("[[Lvmhook/fixtures/NoSuchClass_ZZZ;") };
+        ctx.check("missing_2d_array_returns_null", k_missing_2darr == nullptr);
+
+        // A very long bogus name (exercises the string-key hashing / walk-compare
+        // on an input no class can match) -> null, no crash.
+        std::string long_bogus{ "com/example/" };
+        for (int i{ 0 }; i < 40; ++i)
+        {
+            long_bogus += "deeply/";
+        }
+        long_bogus += "Nonexistent";
+        vmhook::hotspot::klass* const k_long{ vmhook::find_class(long_bogus) };
+        ctx.check("missing_long_name_returns_null", k_long == nullptr);
+
+        // A name that is ONLY a '$' -> null (degenerate, must not crash).
+        vmhook::hotspot::klass* const k_dollar{ vmhook::find_class("$") };
+        ctx.check("missing_dollar_only_returns_null", k_dollar == nullptr);
     }
 
     // =====================================================================
@@ -397,6 +519,117 @@ VMHOOK_JVM_MODULE(find_class_fallback)
         (void) vmhook::find_class("java.lang.String");
         ctx.check("slash_form_still_correct_after_dotted_call",
                   vmhook::find_class("java/lang/String") == k_slash);
+
+        // A leading-slash variant is NOT a valid binary name and never names a
+        // loaded class -> null, no crash.  (The graph walk compares against the
+        // klass's own '/'-form symbol which has no leading slash; the fallback's
+        // loadClass rejects it too.)
+        vmhook::hotspot::klass* const k_lead_slash{ vmhook::find_class("/java/lang/String") };
+        ctx.check("leading_slash_name_returns_null", k_lead_slash == nullptr);
+
+        // A trailing-slash variant likewise -> null.
+        vmhook::hotspot::klass* const k_trail_slash{ vmhook::find_class("java/lang/String/") };
+        ctx.check("trailing_slash_name_returns_null", k_trail_slash == nullptr);
+
+        // A single primitive descriptor letter ("I") is not a class name -> null.
+        // (It is the array-element descriptor for int, but "I" alone names no
+        // klass; only the array form "[I" does.)
+        vmhook::hotspot::klass* const k_prim_letter{ vmhook::find_class("I") };
+        ctx.check("primitive_letter_returns_null", k_prim_letter == nullptr);
+
+        // The field-descriptor form of a real class ("Ljava/lang/String;") is NOT
+        // the class's internal name (which is the bare "java/lang/String"), so the
+        // graph walk misses it.  The fallback's loadClass also rejects a leading
+        // 'L'.  Universal -> null, no crash.
+        vmhook::hotspot::klass* const k_desc{ vmhook::find_class("Ljava/lang/String;") };
+        ctx.check("descriptor_form_returns_null", k_desc == nullptr);
+
+        // After all the degenerate edge calls above, the canonical '/'-form lookup
+        // still resolves to the SAME klass — no edge input poisoned the cache.
+        ctx.check("canonical_lookup_intact_after_edges",
+                  vmhook::find_class("java/lang/String") == k_slash);
+    }
+
+    // =====================================================================
+    //  PART I — the name-cache OVERRIDE / EVICT API (this feature owns the
+    //  find_class name cache).  Exercises override_class_lookup +
+    //  evict_class_lookup against the documented contract:
+    //    (1) overriding a name to a DIFFERENT real klass redirects find_class
+    //        to that klass IFF the override's own name still matches the
+    //        requested key (cache-hit guard); an override to a klass whose name
+    //        does NOT match the key is STALE and the next find_class evicts it
+    //        and re-resolves to the genuine klass.
+    //    (2) a null override does NOT seed a durable negative — the null heals
+    //        away on the very next find_class, which re-walks the graph.
+    //    (3) evict_class_lookup forces a fresh re-walk that re-resolves the
+    //        SAME (genuine) klass.
+    //  Every override installed here is reverted to the genuine resolution
+    //  before the part ends, so the SHARED suite's cache is left clean.
+    // =====================================================================
+    {
+        // Use a brand-new, unique key so we never disturb a name another module
+        // relies on.  The key intentionally names nothing real; we override it
+        // by hand to a known klass and then evict it.
+        constexpr char OVERRIDE_KEY[]{ "vmhook/fixtures/OverrideKey_ZZZ" };
+
+        vmhook::hotspot::klass* const k_object{ vmhook::find_class("java/lang/Object") };
+        vmhook::hotspot::klass* const k_string{ vmhook::find_class("java/lang/String") };
+
+        // Baseline: the synthetic key resolves to nothing.
+        ctx.check("override_key_initially_absent",
+                  vmhook::find_class(OVERRIDE_KEY) == nullptr);
+
+        // (1a) Override the synthetic key to the Object klass.  Because Object's
+        //      OWN name ("java/lang/Object") does NOT equal the requested key,
+        //      the cache-hit guard rejects the entry as STALE on the next lookup
+        //      and re-walks — which for this nonexistent key yields null again.
+        //      So the override does NOT make a wrong-named klass resolvable.
+        if (k_object != nullptr)
+        {
+            vmhook::override_class_lookup(OVERRIDE_KEY, k_object);
+            ctx.check("override_wrong_name_is_evicted_as_stale",
+                      vmhook::find_class(OVERRIDE_KEY) == nullptr);
+        }
+
+        // (1b) Overriding a REAL name to a wrong-named klass is likewise rejected
+        //      as stale: find_class("java/lang/String") still yields the genuine
+        //      String klass, never the Object klass we tried to plant.
+        if (k_object != nullptr && k_string != nullptr)
+        {
+            vmhook::override_class_lookup("java/lang/String", k_object);
+            vmhook::hotspot::klass* const after{ vmhook::find_class("java/lang/String") };
+            ctx.check("override_real_name_wrong_klass_self_heals",
+                      after == k_string);
+            // The self-heal re-inserts the genuine klass, so a follow-up is stable.
+            ctx.check("override_self_heal_is_stable",
+                      vmhook::find_class("java/lang/String") == k_string);
+        }
+
+        // (2) A null override does NOT seed a durable negative entry: the
+        //     cache-hit guard erases a null value and re-walks, so the genuine
+        //     klass comes right back.
+        if (k_string != nullptr)
+        {
+            vmhook::override_class_lookup("java/lang/String", nullptr);
+            ctx.check("null_override_heals_away",
+                      vmhook::find_class("java/lang/String") == k_string);
+        }
+
+        // (3) evict_class_lookup forces a fresh walk that re-resolves the SAME
+        //     genuine klass (the resolution is deterministic).
+        if (k_string != nullptr)
+        {
+            vmhook::evict_class_lookup("java/lang/String");
+            vmhook::hotspot::klass* const re{ vmhook::find_class("java/lang/String") };
+            ctx.check("evict_then_rewalk_same_klass", re == k_string);
+        }
+
+        // Evicting an ABSENT key is a safe no-op (no crash, key still absent).
+        vmhook::evict_class_lookup(OVERRIDE_KEY);
+        ctx.check("evict_absent_key_safe", vmhook::find_class(OVERRIDE_KEY) == nullptr);
+
+        // Leave NOTHING planted: drop the synthetic key entirely.
+        vmhook::evict_class_lookup(OVERRIDE_KEY);
     }
 
     // =====================================================================
@@ -419,6 +652,10 @@ VMHOOK_JVM_MODULE(find_class_fallback)
         g_fb_probe_mirror_ok.store(false);
         g_fb_missing_is_null.store(false);
         g_fb_probe_stable.store(false);
+        g_via_oop_nonnull.store(false);
+        g_via_oop_matches_graph.store(false);
+        g_jni_find_app_nonnull.store(false);
+        g_jni_find_missing_null.store(false);
         g_detour_completed.store(false);
 
         auto handle{ vmhook::scoped_hook<fcp>(
@@ -462,6 +699,47 @@ VMHOOK_JVM_MODULE(find_class_fallback)
                         "vmhook/fixtures/NoSuchClass_ZZZ_Fallback") };
                 g_fb_missing_is_null.store(k_missing == nullptr, std::memory_order_relaxed);
 
+                // (4) find_class_via_oop: resolve PROBE_NAME through the loader of
+                //     the live `self` instance.  Since `self` is a FindClassProbe
+                //     instance loaded by the app loader, this resolves the SAME app
+                //     klass the graph walk yields — a third resolution route that
+                //     must agree.  Guarded: only compares when self + its oop are
+                //     present, so a degenerate detour can never crash here.
+                if (self != nullptr)
+                {
+                    void* const self_oop{ self->vmhook::object_base::get_instance() };
+                    if (self_oop != nullptr)
+                    {
+                        vmhook::hotspot::klass* const via{
+                            vmhook::find_class_via_oop(self_oop, PROBE_NAME) };
+                        g_via_oop_nonnull.store(via != nullptr, std::memory_order_relaxed);
+                        vmhook::hotspot::klass* const graph{ vmhook::find_class(PROBE_NAME) };
+                        g_via_oop_matches_graph.store(
+                            via != nullptr && via == graph, std::memory_order_relaxed);
+                    }
+                }
+
+                // (5) Plain vmhook::jni::find_class (raw JNI FindClass through this
+                //     thread's context loader): a non-null jclass handle for the app
+                //     class, and a null (no-crash) result for a missing class.
+                void* const jni_app{ vmhook::jni::find_class(PROBE_NAME) };
+                g_jni_find_app_nonnull.store(jni_app != nullptr, std::memory_order_relaxed);
+                // Release the jclass local ref so the detour leaks none across its
+                // (few) invocations on this attached thread.
+                if (jni_app != nullptr)
+                {
+                    vmhook::detail::jni_delete_local_ref(jni_app);
+                }
+                void* const jni_missing{
+                    vmhook::jni::find_class("vmhook/fixtures/NoSuchClass_ZZZ_JniDirect") };
+                g_jni_find_missing_null.store(jni_missing == nullptr, std::memory_order_relaxed);
+
+                // The raw FindClass miss above leaves a pending ClassNotFoundException
+                // in the JNIEnv.  Clear it so NO exception escapes this detour back
+                // into the hooked Java method (JNI-spec UB + a no-SEH fault risk on
+                // MinGW/clang otherwise).  Idempotent on the no-exception path.
+                vmhook::jni::exception_clear();
+
                 // Reaching here means no exception/AV escaped the fallback calls.
                 g_detour_completed.store(true, std::memory_order_relaxed);
             }) };
@@ -493,6 +771,19 @@ VMHOOK_JVM_MODULE(find_class_fallback)
         // The missing-class fallback returned null without crashing.
         ctx.check("fallback_missing_class_returns_null",
                   g_fb_missing_is_null.load(std::memory_order_relaxed));
+
+        // find_class_via_oop resolved the app class through self's loader, and it
+        // agrees with the graph-walk find_class result (same loader, one copy).
+        ctx.check("via_oop_resolved_app_class",
+                  g_via_oop_nonnull.load(std::memory_order_relaxed));
+        ctx.check("via_oop_matches_graph_walk",
+                  g_via_oop_matches_graph.load(std::memory_order_relaxed));
+
+        // Plain JNI FindClass: non-null handle for the app class, null for missing.
+        ctx.check("jni_find_class_app_nonnull",
+                  g_jni_find_app_nonnull.load(std::memory_order_relaxed));
+        ctx.check("jni_find_class_missing_null",
+                  g_jni_find_missing_null.load(std::memory_order_relaxed));
 
         ctx.record("[INFO] find_class_fallback: vmhook::find_class resolves bootstrap, "
                    "app, nested, and array-class names via the HotSpot graph walk; the "

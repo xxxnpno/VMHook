@@ -97,6 +97,11 @@ namespace
         static auto get_recorded_two_slot_long() -> std::int64_t{ return static_field("recordedTwoSlotLong")->get(); }
         static auto get_recorded_two_slot_double() -> double    { return static_field("recordedTwoSlotDouble")->get(); }
         static auto get_recorded_obj_seed() -> std::int32_t     { return static_field("recordedObjSeed")->get(); }
+        static auto get_recorded_bool() -> bool                 { return static_field("recordedBoolArg")->get(); }
+        static auto get_recorded_byte() -> std::int32_t         { return static_field("recordedByteArg")->get(); }
+        static auto get_recorded_char() -> std::int32_t         { return static_field("recordedCharArg")->get(); }
+        static auto get_recorded_short() -> std::int32_t        { return static_field("recordedShortArg")->get(); }
+        static auto get_recorded_float() -> float               { return static_field("recordedFloatArg")->get(); }
 
         // Reads this instance's own seed (proves a returned wrapper is usable).
         auto seed() const -> std::int32_t { return get_field("seed")->get(); }
@@ -141,6 +146,16 @@ namespace
     constexpr std::int32_t NUM_INT     = 6001;
     constexpr std::int32_t NUM_LONG    = 6002;
     constexpr std::int32_t NUM_DOUBLE  = 6003;
+
+    // Full-primitive overload sentinels (sPrim, lockstep with the Java file).
+    constexpr std::int32_t PRIM_BOOL   = 8001;
+    constexpr std::int32_t PRIM_BYTE   = 8002;
+    constexpr std::int32_t PRIM_CHAR   = 8003;
+    constexpr std::int32_t PRIM_SHORT  = 8004;
+    constexpr std::int32_t PRIM_INT    = 8005;
+    constexpr std::int32_t PRIM_LONG   = 8006;
+    constexpr std::int32_t PRIM_FLOAT  = 8007;
+    constexpr std::int32_t PRIM_DOUBLE = 8008;
 
     // ------------------------------------------------------------------
     //  Captured observations.  The detour writes; the module body reads.
@@ -252,6 +267,65 @@ namespace
     std::atomic<std::int64_t> g_num_double{ k_uncaptured };  // sNum(double)-> NUM_DOUBLE
     std::atomic<std::int64_t> g_num_float_nomatch{ k_uncaptured }; // sNum(float): no (F) overload
     std::atomic<int>  g_num_float_did_not_crash{ -1 };       // reached the line after the call
+
+    // -- (7) NARROW-PRIMITIVE arg shapes (Z B C S F) — echo return + recorded --
+    std::atomic<int>  g_echo_bool_true{ -1 };                 // sEchoBool(true)->true
+    std::atomic<int>  g_echo_bool_false{ -1 };                // sEchoBool(false)->false
+    std::atomic<std::int64_t> g_echo_byte_max{ k_uncaptured };// sEchoByte(127)->127
+    std::atomic<std::int64_t> g_echo_byte_min{ k_uncaptured };// sEchoByte(-128)->-128
+    std::atomic<std::int64_t> g_echo_char_max{ k_uncaptured };// sEchoChar(0xFFFF)->65535
+    std::atomic<std::int64_t> g_echo_char_a{ k_uncaptured };  // sEchoChar('A')->65
+    std::atomic<std::int64_t> g_echo_short_min{ k_uncaptured };// sEchoShort(-32768)->-32768
+    std::atomic<std::int64_t> g_echo_short_max{ k_uncaptured };// sEchoShort(32767)->32767
+    std::atomic<std::uint32_t> g_echo_float_bits{ 0 };        // sEchoFloat(0.5f)->0.5f
+    std::atomic<bool> g_echo_float_captured{ false };
+    std::atomic<std::uint32_t> g_echo_float_nan_bits{ 0 };    // sEchoFloat(NaN) preserves NaN
+    std::atomic<bool> g_echo_float_nan_captured{ false };
+
+    // -- (8) C-string + string_view arg branches + UTF-16 length round-trip --
+    std::atomic<bool> g_cstr_arg_ok{ false };                 // const char* arg -> "lit"
+    std::atomic<bool> g_sview_arg_ok{ false };                // string_view arg -> "view"
+    std::atomic<std::int64_t> g_cstr_null_len{ k_uncaptured };// (const char*)nullptr -> Java null -> -1
+    std::atomic<std::int64_t> g_interior_nul_arg_len{ k_uncaptured }; // "a\0b" arg length==3 (path-indep)
+    std::atomic<std::int64_t> g_astral_arg_len{ k_uncaptured };// "x😀y" arg length==4 UTF-16 units
+    std::atomic<bool> g_concat_ok{ false };                   // sConcat("ab","cd")=="abcd"
+    std::atomic<bool> g_concat_first_null_ok{ false };         // sConcat(null,"z")=="<null>z"
+
+    // -- (8b) interior-NUL / astral String RETURNS (value path-dependent) --
+    std::atomic<bool> g_ret_interior_nul_captured{ false };
+    std::string       g_ret_interior_nul;                     // guarded by captured flag
+    std::atomic<bool> g_ret_astral_captured{ false };
+    std::string       g_ret_astral;
+
+    // -- (9) full-primitive overload family (sPrim) resolved by C++ arg type --
+    std::atomic<std::int64_t> g_prim_bool{ k_uncaptured };
+    std::atomic<std::int64_t> g_prim_byte{ k_uncaptured };
+    std::atomic<std::int64_t> g_prim_char{ k_uncaptured };
+    std::atomic<std::int64_t> g_prim_short{ k_uncaptured };
+    std::atomic<std::int64_t> g_prim_int{ k_uncaptured };
+    std::atomic<std::int64_t> g_prim_long{ k_uncaptured };
+    std::atomic<std::int64_t> g_prim_float{ k_uncaptured };
+    std::atomic<std::int64_t> g_prim_double{ k_uncaptured };
+
+    // -- (10) value_t routing negatives (is_void/is_string FALSE cases) --
+    std::atomic<int>  g_int_not_void{ -1 };                   // int return: is_void()==false
+    std::atomic<int>  g_int_not_string{ -1 };                 // int return: is_string()==false
+    std::atomic<int>  g_void_not_string{ -1 };                // void return: is_string()==false
+    std::atomic<int>  g_double_not_string{ -1 };              // double return: is_string()==false
+    std::atomic<int>  g_obj_not_void{ -1 };                   // non-null object: is_void()==false (call_stub)
+    std::string       g_int_as_string;                        // as_string() on an int -> "" (path-indep)
+    std::atomic<bool> g_int_as_string_captured{ false };
+
+    // -- (11) extra (name,sig) explicit-overload coverage (void/bool/byte/char/short/float) --
+    std::atomic<int>  g_sig_void_is_void{ -1 };               // ("sVoid","()V")
+    std::atomic<int>  g_sig_bool_true{ -1 };                  // ("sBoolTrue","()Z")
+    std::atomic<std::int64_t> g_sig_byte_ret{ k_uncaptured }; // ("sByteMax","()B")
+    std::atomic<std::int64_t> g_sig_char_ret{ k_uncaptured }; // ("sCharMax","()C")
+    std::atomic<std::int64_t> g_sig_short_ret{ k_uncaptured };// ("sShortMin","()S")
+    std::atomic<std::uint32_t> g_sig_float_bits{ 0 };         // ("sFloatHalf","()F")
+    std::atomic<bool> g_sig_float_captured{ false };
+    std::atomic<std::int64_t> g_sig_prim_bool_disamb{ k_uncaptured }; // ("sPrim","(Z)I")
+    std::atomic<std::int64_t> g_sig_prim_double_disamb{ k_uncaptured };// ("sPrim","(D)I")
 
     auto run_all_calls(const std::unique_ptr<msc>& self) -> void
     {
@@ -493,6 +567,168 @@ namespace
             // reaching here proves the no-match path did not tear down the JVM.
             g_num_float_nomatch.store(v.is_void() ? k_uncaptured : static_cast<std::int64_t>(static_cast<std::int32_t>(v)));
             g_num_float_did_not_crash.store(1);
+        }
+
+        // ===================== (7) NARROW-PRIMITIVE arg shapes =================
+        // The remaining JVM primitive descriptors as ARGUMENTS, each via the
+        // name-unique echo whose (B)/(C)/(S)/(Z)/(F) overload the hierarchy walk
+        // resolves from the C++ arg TYPE.  Return value + recorded slot-0 field
+        // both prove no phantom receiver shifted the value.
+        g_echo_bool_true.store(msc::static_method("sEchoBool")->call(bool{ true }) ? 1 : 0);
+        g_echo_bool_false.store(msc::static_method("sEchoBool")->call(bool{ false }) ? 1 : 0);
+
+        g_echo_byte_max.store(static_cast<std::int8_t>(
+            msc::static_method("sEchoByte")->call(std::int8_t{ 127 })));
+        g_echo_byte_min.store(static_cast<std::int8_t>(
+            msc::static_method("sEchoByte")->call(std::int8_t{ -128 })));
+
+        g_echo_char_max.store(static_cast<std::uint16_t>(
+            msc::static_method("sEchoChar")->call(std::uint16_t{ 0xFFFF })));
+        g_echo_char_a.store(static_cast<std::uint16_t>(
+            msc::static_method("sEchoChar")->call(std::uint16_t{ 65 })));
+
+        g_echo_short_min.store(static_cast<std::int16_t>(
+            msc::static_method("sEchoShort")->call(std::int16_t{ -32768 })));
+        g_echo_short_max.store(static_cast<std::int16_t>(
+            msc::static_method("sEchoShort")->call(std::int16_t{ 32767 })));
+
+        {
+            const float r = msc::static_method("sEchoFloat")->call(float{ 0.5f });
+            g_echo_float_bits.store(f2bits(r));
+            g_echo_float_captured.store(true);
+            const float rn = msc::static_method("sEchoFloat")->call(
+                std::numeric_limits<float>::quiet_NaN());
+            g_echo_float_nan_bits.store(f2bits(rn));
+            g_echo_float_nan_captured.store(true);
+        }
+
+        // ===================== (8) C-string / string_view / UTF-16 arg paths ===
+        // sEchoString takes a String; the const char* and string_view ARG
+        // branches are distinct converter paths from std::string.  Null const
+        // char* must become Java null (sStringLen -> -1).
+        {
+            // Pass through a `const char*` VARIABLE (not a string literal): a
+            // literal deduces const char(&)[N], whose provably-non-null address
+            // trips g++ -Waddress / -Wnonnull-compare in the converter's
+            // `arg ? ... : nullptr` null check; a variable is the genuine
+            // const-char* converter branch anyway.
+            const char* const cstr_arg{ "c-string-literal" };
+            const auto v_cstr = msc::static_method("sEchoString")->call(cstr_arg);
+            g_cstr_arg_ok.store(v_cstr.as_string() == "c-string-literal");
+            const auto v_view = msc::static_method("sEchoString")->call(
+                std::string_view{ "string-view-arg" });
+            g_sview_arg_ok.store(v_view.as_string() == "string-view-arg");
+
+            const char* const null_cstr{ nullptr };
+            g_cstr_null_len.store(static_cast<std::int32_t>(
+                msc::static_method("sStringLen")->call(null_cstr)));
+        }
+        // Interior-NUL + astral STRING ARGUMENTS round-trip through the
+        // length-counted UTF-16 encoder (path-independent: both call paths use
+        // jni_new_string_utf16_local for String args).  Proven via the Java-side
+        // String.length() so neither truncates at the NUL.
+        g_interior_nul_arg_len.store(static_cast<std::int32_t>(
+            msc::static_method("sStringLen")->call(std::string{ "a\0b", 3 })));
+        g_astral_arg_len.store(static_cast<std::int32_t>(
+            msc::static_method("sStringLen")->call(std::string{ "x\xF0\x9F\x98\x80y" })));
+
+        // Two String args back-to-back (two reference slots, no receiver shift).
+        {
+            const auto v = msc::static_method("sConcat")->call(
+                std::string{ "ab" }, std::string{ "cd" });
+            g_concat_ok.store(v.as_string() == "abcd");
+            const char* const first_null{ nullptr };
+            const auto v2 = msc::static_method("sConcat")->call(
+                first_null, std::string{ "z" });
+            g_concat_first_null_ok.store(v2.as_string() == "<null>z");
+        }
+
+        // Interior-NUL + astral STRING RETURNS (value path-dependent: call_stub
+        // reads the backing array exactly, call_jni's GetStringUTF uses modified
+        // UTF-8 / NUL-terminates).  Captured here; value asserted only on the
+        // call_stub path, never-crash asserted on every path.
+        {
+            g_ret_interior_nul = msc::static_method("sStringInteriorNul")->call().as_string();
+            g_ret_interior_nul_captured.store(true);
+            g_ret_astral = msc::static_method("sStringAstral")->call().as_string();
+            g_ret_astral_captured.store(true);
+        }
+
+        // ===================== (9) full-primitive overload family (sPrim) ======
+        // One overloaded name spanning EVERY primitive parameter kind; the
+        // portable static path must re-pick each from the C++ arg TYPE.  The
+        // narrow kinds (Z B C S F) are the descriptors sOver/sNum never covered.
+        g_prim_bool.store(static_cast<std::int32_t>(
+            msc::static_method("sPrim")->call(bool{ true })));
+        g_prim_byte.store(static_cast<std::int32_t>(
+            msc::static_method("sPrim")->call(std::int8_t{ 1 })));
+        g_prim_char.store(static_cast<std::int32_t>(
+            msc::static_method("sPrim")->call(std::uint16_t{ 1 })));
+        g_prim_short.store(static_cast<std::int32_t>(
+            msc::static_method("sPrim")->call(std::int16_t{ 1 })));
+        g_prim_int.store(static_cast<std::int32_t>(
+            msc::static_method("sPrim")->call(std::int32_t{ 1 })));
+        g_prim_long.store(static_cast<std::int32_t>(
+            msc::static_method("sPrim")->call(std::int64_t{ 1 })));
+        g_prim_float.store(static_cast<std::int32_t>(
+            msc::static_method("sPrim")->call(float{ 1.0f })));
+        g_prim_double.store(static_cast<std::int32_t>(
+            msc::static_method("sPrim")->call(double{ 1.0 })));
+
+        // ===================== (10) value_t routing negatives ==================
+        {
+            const auto v_int = msc::static_method("sIntFortyTwo")->call();
+            g_int_not_void.store(v_int.is_void() ? 0 : 1);
+            g_int_not_string.store(v_int.is_string() ? 0 : 1);
+            g_int_as_string = v_int.as_string();   // a numeric alternative -> ""
+            g_int_as_string_captured.store(true);
+
+            const auto v_void = msc::static_method("sVoid")->call();
+            g_void_not_string.store(v_void.is_string() ? 0 : 1);
+
+            const auto v_double = msc::static_method("sDoublePi")->call();
+            g_double_not_string.store(v_double.is_string() ? 0 : 1);
+
+            const auto v_obj = msc::static_method("sMakeChild")->call();
+            g_obj_not_void.store(v_obj.is_void() ? 0 : 1);
+        }
+
+        // ===================== (11) extra (name,sig) explicit overloads ========
+        if (auto p = msc::static_method("sVoid", "()V"))
+        {
+            g_sig_void_is_void.store(p->call().is_void() ? 1 : 0);
+        }
+        if (auto p = msc::static_method("sBoolTrue", "()Z"))
+        {
+            g_sig_bool_true.store(p->call() ? 1 : 0);
+        }
+        if (auto p = msc::static_method("sByteMax", "()B"))
+        {
+            g_sig_byte_ret.store(static_cast<std::int8_t>(p->call()));
+        }
+        if (auto p = msc::static_method("sCharMax", "()C"))
+        {
+            g_sig_char_ret.store(static_cast<std::uint16_t>(p->call()));
+        }
+        if (auto p = msc::static_method("sShortMin", "()S"))
+        {
+            g_sig_short_ret.store(static_cast<std::int16_t>(p->call()));
+        }
+        if (auto p = msc::static_method("sFloatHalf", "()F"))
+        {
+            const float f = p->call();
+            g_sig_float_bits.store(f2bits(f));
+            g_sig_float_captured.store(true);
+        }
+        // Explicit-signature disambiguation of the sPrim family (pinned overload
+        // honoured verbatim — signature_pinned short-circuits re-resolution).
+        if (auto p = msc::static_method("sPrim", "(Z)I"))
+        {
+            g_sig_prim_bool_disamb.store(static_cast<std::int32_t>(p->call(bool{ true })));
+        }
+        if (auto p = msc::static_method("sPrim", "(D)I"))
+        {
+            g_sig_prim_double_disamb.store(static_cast<std::int32_t>(p->call(double{ 1.0 })));
         }
 
         (void)self;
@@ -769,5 +1005,137 @@ VMHOOK_JVM_MODULE(method_static_portability)
                    + " NUM_LONG=" + std::to_string(NUM_LONG)
                    + " NUM_DOUBLE=" + std::to_string(NUM_DOUBLE)
                    + "); value not asserted — only the no-crash fact above is.");
+
+        // ==================================================================
+        //  (7) NARROW-PRIMITIVE argument shapes (Z B C S F) — echo return AND
+        //      recorded slot-0 field.  These descriptors round-trip identically
+        //      on every path; a phantom receiver would shift / mis-decode them.
+        // ==================================================================
+        ctx.check("msp_arg_echo_bool_true", g_echo_bool_true.load() == 1);
+        ctx.check("msp_arg_echo_bool_false", g_echo_bool_false.load() == 0);
+        ctx.check("msp_arg_echo_bool_recorded_field", msc::get_recorded_bool());
+
+        ctx.check("msp_arg_echo_byte_max_127", g_echo_byte_max.load() == 127);
+        ctx.check("msp_arg_echo_byte_min_neg128", g_echo_byte_min.load() == -128);
+        // Last sEchoByte call was the min (-128); the recorder field reflects it.
+        ctx.check("msp_arg_echo_byte_recorded_field", msc::get_recorded_byte() == -128);
+
+        ctx.check("msp_arg_echo_char_max_65535", g_echo_char_max.load() == 65535);
+        ctx.check("msp_arg_echo_char_a_65", g_echo_char_a.load() == 65);
+        // Last sEchoChar call was 'A' (65); recorder field (char widened) reflects it.
+        ctx.check("msp_arg_echo_char_recorded_field", msc::get_recorded_char() == 65);
+
+        ctx.check("msp_arg_echo_short_min_neg32768", g_echo_short_min.load() == -32768);
+        ctx.check("msp_arg_echo_short_max_32767", g_echo_short_max.load() == 32767);
+        // Last sEchoShort call was the max (32767); recorder field reflects it.
+        ctx.check("msp_arg_echo_short_recorded_field", msc::get_recorded_short() == 32767);
+
+        ctx.check("msp_arg_echo_float_captured", g_echo_float_captured.load());
+        ctx.check("msp_arg_echo_float_half", bits2f(g_echo_float_bits.load()) == 0.5f);
+        ctx.check("msp_arg_echo_float_recorded_field", msc::get_recorded_float() == 0.5f);
+        ctx.check("msp_arg_echo_float_nan_captured", g_echo_float_nan_captured.load());
+        // A NaN float ARGUMENT survives the slot encode/decode as a NaN return.
+        ctx.check("msp_arg_echo_float_nan_preserved", std::isnan(bits2f(g_echo_float_nan_bits.load())));
+
+        // ==================================================================
+        //  (8) C-string / string_view ARG branches + UTF-16 length round-trip.
+        //      The const char* and string_view converter branches are distinct
+        //      from std::string; null const char* must become Java null.  The
+        //      String.length() of an interior-NUL / astral arg is path-INDEPENDENT
+        //      (both call paths use the length-counted UTF-16 arg encoder) — HARD.
+        // ==================================================================
+        ctx.check("msp_arg_cstring_literal_roundtrip", g_cstr_arg_ok.load());
+        ctx.check("msp_arg_string_view_roundtrip", g_sview_arg_ok.load());
+        ctx.check("msp_arg_null_cstring_becomes_java_null", g_cstr_null_len.load() == -1);
+        ctx.check("msp_arg_interior_nul_length_3_not_truncated", g_interior_nul_arg_len.load() == 3);
+        ctx.check("msp_arg_astral_length_4_utf16_units", g_astral_arg_len.load() == 4);
+        ctx.check("msp_arg_two_strings_concat", g_concat_ok.load());
+        ctx.check("msp_arg_two_strings_first_null", g_concat_first_null_ok.load());
+
+        // Interior-NUL / astral String RETURNS: value is path-dependent (call_jni
+        // GetStringUTF truncates at NUL / uses modified UTF-8), so only the
+        // never-crash capture is universal; exact value asserted on call_stub.
+        ctx.check("msp_ret_interior_nul_captured", g_ret_interior_nul_captured.load());
+        ctx.check("msp_ret_astral_captured", g_ret_astral_captured.load());
+        if (call_stub_present)
+        {
+            // call_stub read_java_string copies the backing array exactly: the NUL
+            // is preserved (length 3) and the astral scalar is one 4-byte UTF-8 cp.
+            ctx.check("msp_ret_interior_nul_exact_3bytes",
+                      g_ret_interior_nul == std::string("a\0b", 3));
+            ctx.check("msp_ret_astral_exact_utf8",
+                      g_ret_astral == "x\xF0\x9F\x98\x80y");
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] msp_ret_interior_nul (call_jni) len=" }
+                       + std::to_string(g_ret_interior_nul.size())
+                       + " (call_stub would be 3; GetStringUTF truncates at NUL)");
+            ctx.record(std::string{ "[INFO] msp_ret_astral (call_jni) len=" }
+                       + std::to_string(g_ret_astral.size())
+                       + " (call_stub UTF-8 would be 6; modified-UTF-8 differs)");
+        }
+
+        // ==================================================================
+        //  (9) FULL-PRIMITIVE overload family (sPrim) resolved by C++ arg TYPE
+        //      on the portable static path.  Each distinct sentinel proves the
+        //      narrow descriptor (Z B C S F) was disambiguated correctly — the
+        //      kinds sOver/sNum never exercised.
+        // ==================================================================
+        ctx.check("msp_prim_bool_resolves_Z", g_prim_bool.load() == PRIM_BOOL);
+        ctx.check("msp_prim_byte_resolves_B", g_prim_byte.load() == PRIM_BYTE);
+        ctx.check("msp_prim_char_resolves_C", g_prim_char.load() == PRIM_CHAR);
+        ctx.check("msp_prim_short_resolves_S", g_prim_short.load() == PRIM_SHORT);
+        ctx.check("msp_prim_int_resolves_I", g_prim_int.load() == PRIM_INT);
+        ctx.check("msp_prim_long_resolves_J", g_prim_long.load() == PRIM_LONG);
+        ctx.check("msp_prim_float_resolves_F", g_prim_float.load() == PRIM_FLOAT);
+        ctx.check("msp_prim_double_resolves_D", g_prim_double.load() == PRIM_DOUBLE);
+        ctx.check("msp_prim_all_eight_distinct",
+                  g_prim_bool.load() != g_prim_byte.load()
+                  && g_prim_byte.load() != g_prim_char.load()
+                  && g_prim_char.load() != g_prim_short.load()
+                  && g_prim_short.load() != g_prim_int.load()
+                  && g_prim_int.load() != g_prim_long.load()
+                  && g_prim_long.load() != g_prim_float.load()
+                  && g_prim_float.load() != g_prim_double.load());
+
+        // ==================================================================
+        //  (10) value_t routing NEGATIVES — is_void()/is_string() must be FALSE
+        //       for the alternatives they don't own, and as_string() on a numeric
+        //       alternative is "" (path-independent).
+        // ==================================================================
+        ctx.check("msp_int_return_not_void", g_int_not_void.load() == 1);
+        ctx.check("msp_int_return_not_string", g_int_not_string.load() == 1);
+        ctx.check("msp_void_return_not_string", g_void_not_string.load() == 1);
+        ctx.check("msp_double_return_not_string", g_double_not_string.load() == 1);
+        ctx.check("msp_int_as_string_captured", g_int_as_string_captured.load());
+        ctx.check("msp_int_as_string_is_empty", g_int_as_string.empty());
+        if (call_stub_present)
+        {
+            // A real object handle only exists on the call_stub path; on call_jni
+            // a truncated/null handle would route to monostate (is_void()==true).
+            ctx.check("msp_object_return_not_void", g_obj_not_void.load() == 1);
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] msp_object_return_not_void (call_jni) = " }
+                       + std::to_string(g_obj_not_void.load())
+                       + " (object handle may be truncated -> monostate on call_jni)");
+        }
+
+        // ==================================================================
+        //  (11) EXTRA (name,sig) explicit-overload coverage — void/Z/B/C/S/F
+        //       descriptors the original (name,sig) section never pinned, plus
+        //       explicit disambiguation of the sPrim family.
+        // ==================================================================
+        ctx.check("msp_sig_void_is_void", g_sig_void_is_void.load() == 1);
+        ctx.check("msp_sig_bool_true", g_sig_bool_true.load() == 1);
+        ctx.check("msp_sig_byte_max_127", g_sig_byte_ret.load() == 127);
+        ctx.check("msp_sig_char_max_65535", g_sig_char_ret.load() == 65535);
+        ctx.check("msp_sig_short_min_neg32768", g_sig_short_ret.load() == -32768);
+        ctx.check("msp_sig_float_captured", g_sig_float_captured.load());
+        ctx.check("msp_sig_float_half", bits2f(g_sig_float_bits.load()) == 0.5f);
+        ctx.check("msp_sig_prim_bool_disambiguated", g_sig_prim_bool_disamb.load() == PRIM_BOOL);
+        ctx.check("msp_sig_prim_double_disambiguated", g_sig_prim_double_disamb.load() == PRIM_DOUBLE);
     }
 }
