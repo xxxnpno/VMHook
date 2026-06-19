@@ -102,6 +102,59 @@ public final class IsReference
     public static String[]  sRetStringArray() { return STRING_ARRAY; }
 
     // ======================================================================
+    //  INSTANCE: every PRIMITIVE-ELEMENT array kind ([Z [B [S [C [I [J [F [D).
+    //  is_reference() keys on the leading '[', so ALL of these are TRUE even
+    //  though the ELEMENT type is a primitive — an array is a Java reference.
+    // ======================================================================
+    public boolean[] retBoolArray()   { return new boolean[] { true }; }
+    public byte[]    retByteArray()   { return new byte[] { 1 }; }
+    public short[]   retShortArray()  { return new short[] { 2 }; }
+    public char[]    retCharArray()   { return new char[] { 'A' }; }
+    public long[]    retLongArray()   { return new long[] { 4L }; }
+    public float[]   retFloatArray()  { return new float[] { 0.5f }; }
+    public double[]  retDoubleArray() { return new double[] { 6.0 }; }
+    public Object[]  retObjectArray() { return new Object[] { this }; }
+
+    // ======================================================================
+    //  INSTANCE: MULTI-dimensional arrays ([[I [[Ljava/lang/String; [[[B).
+    //  The return descriptor still LEADS with '[', so is_reference() is TRUE.
+    // ======================================================================
+    public int[][]      retInt2DArray()     { return new int[][] { { 1 } }; }
+    public String[][]   retString2DArray()  { return new String[][] { { "x" } }; }
+    public byte[][][]   retByte3DArray()    { return new byte[][][] { { { 1 } } }; }
+
+    // ======================================================================
+    //  INSTANCE: reference returns that are NOT String/Object — a JDK
+    //  collection type and an INTERFACE type.  Both descriptors are 'L...;',
+    //  so is_reference() is TRUE.  (Descriptor text is JDK-version-stable.)
+    // ======================================================================
+    public java.util.List<String> retList()      { return EMPTY_LIST; }
+    public CharSequence            retInterface() { return "iface"; }
+
+    // ======================================================================
+    //  PARAM-LIST RED HERRING: methods whose PARAMETER list contains 'L' / '['
+    //  (reference / array params) but whose RETURN is a primitive or void.
+    //  is_reference() must look ONLY after the ')' — the param 'L'/'[' must
+    //  NOT leak into the verdict.  These are the cases that catch a parser
+    //  that scanned the whole descriptor instead of the return slot.
+    // ======================================================================
+
+    /** takesString(Ljava/lang/String;)I — reference PARAM, primitive return. */
+    public int  takesString(final String s)   { return s == null ? 0 : s.length(); }
+
+    /** takesIntArray([I)I — array PARAM, primitive return. */
+    public int  takesIntArray(final int[] a)   { return a == null ? 0 : a.length; }
+
+    /** takesObjectArray([Ljava/lang/Object;)V — array-of-ref PARAM, void return. */
+    public void takesObjectArray(final Object[] a) { /* V: not a reference */ }
+
+    /** takesMixed(Ljava/lang/String;[IJ)Z — mixed ref+array+long params, boolean. */
+    public boolean takesMixed(final String s, final int[] a, final long n) { return false; }
+
+    /** sTakesString(Ljava/lang/String;)I — static red-herring twin. */
+    public static int sTakesString(final String s) { return s == null ? 0 : s.length(); }
+
+    // ======================================================================
     //  Overloaded pair: ONE name, primitive vs reference return, told apart
     //  ONLY by explicit JVM descriptor.  Proves is_reference() tracks the
     //  specific RESOLVED overload, not merely the method name.
@@ -124,6 +177,10 @@ public final class IsReference
     // ======================================================================
     private static final int[]    INT_ARRAY    = { 10, 20, 30 };
     private static final String[] STRING_ARRAY = { "x", "y" };
+
+    /** A stable empty List the reference-but-not-String returner hands back. */
+    private static final java.util.List<String> EMPTY_LIST =
+        java.util.Collections.emptyList();
 
     /** A stable object the static Object returner hands back. */
     private static final Object STATIC_SELF = new Object();

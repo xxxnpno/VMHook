@@ -165,6 +165,77 @@ namespace
         { "sRetIntArray",    true  },
         { "sRetStringArray", true  },
     };
+
+    // Every PRIMITIVE-ELEMENT array return (plus Object[]).  ALL are references
+    // ('[' leads the return descriptor) even though the element is a primitive —
+    // is_reference() is "is this a Java reference", and arrays always are.  This
+    // is the deliberate "[I is true" semantic, swept across every element kind.
+    constexpr expectation k_instance_primitive_arrays[]{
+        { "retBoolArray",   true },   // [Z
+        { "retByteArray",   true },   // [B
+        { "retShortArray",  true },   // [S
+        { "retCharArray",   true },   // [C
+        { "retLongArray",   true },   // [J
+        { "retFloatArray",  true },   // [F
+        { "retDoubleArray", true },   // [D
+        { "retObjectArray", true },   // [Ljava/lang/Object;
+    };
+
+    // Multi-dimensional arrays — leading '[' regardless of depth, so TRUE.
+    constexpr expectation k_instance_multidim_arrays[]{
+        { "retInt2DArray",    true },   // [[I
+        { "retString2DArray", true },   // [[Ljava/lang/String;
+        { "retByte3DArray",   true },   // [[[B
+    };
+
+    // Reference returns that are NOT String/Object: a concrete JDK type and an
+    // interface type.  Both descriptors are 'L...;', so TRUE.  Only the
+    // is_reference() truth and oracle-agreement are HARD here; the EXACT
+    // descriptor text (java/util/List vs the erased return) is NOT asserted
+    // verbatim because generic-return descriptors are spec-fixed but verbose —
+    // the truth ('L' after ')') is the invariant.
+    constexpr expectation k_instance_other_refs[]{
+        { "retList",      true },   // Ljava/util/List;
+        { "retInterface", true },   // Ljava/lang/CharSequence;
+    };
+
+    // PARAM-LIST RED HERRING: the parameter list carries 'L' / '[' but the
+    // RETURN is a primitive or void.  is_reference() must verdict ONLY on the
+    // char after ')', so every one of these is FALSE.  This is the case that
+    // catches a parser that scanned the whole descriptor.
+    constexpr expectation k_instance_param_red_herrings[]{
+        { "takesString",      false },   // (Ljava/lang/String;)I
+        { "takesIntArray",    false },   // ([I)I
+        { "takesObjectArray", false },   // ([Ljava/lang/Object;)V
+        { "takesMixed",       false },   // (Ljava/lang/String;[IJ)Z
+    };
+
+    // Run the three standard cross-checks (truth, oracle-agreement, oracle ==
+    // expectation) for one resolved proxy.  Shared by every instance-path table
+    // so a new return KIND is one table row, not a copied block.
+    auto check_proxy(vmhook_test::context& ctx,
+                     const std::string&    prefix,
+                     const expectation&    e,
+                     const vmhook::method_proxy& mp) -> void
+    {
+        const std::string sig{ mp.signature() };
+        const bool        is_ref{ mp.is_reference() };
+
+        ctx.check(prefix + "_is_reference_" + e.name, is_ref == e.expect_reference);
+        ctx.check(prefix + "_is_reference_matches_signature_" + e.name,
+                  is_ref == oracle_is_reference(sig));
+        ctx.check(prefix + "_signature_oracle_expected_" + e.name,
+                  oracle_is_reference(sig) == e.expect_reference);
+
+        if (is_ref != e.expect_reference || is_ref != oracle_is_reference(sig))
+        {
+            const char rc{ return_char(sig) };
+            ctx.record(std::string{ "[INFO] " } + prefix + " " + e.name + " signature='" + sig
+                       + "' returnChar='" + (rc ? std::string(1, rc) : std::string{ "\\0" })
+                       + "' is_reference=" + (is_ref ? "true" : "false")
+                       + " expected=" + (e.expect_reference ? "true" : "false"));
+        }
+    }
 }
 
 VMHOOK_JVM_MODULE(method_is_reference)
@@ -424,5 +495,266 @@ VMHOOK_JVM_MODULE(method_is_reference)
         // so the is_valid_pointer guard refuses any deref (no crash).
         ctx.check("null_method_proxy_not_valid_pointer",
                   vmhook::hotspot::is_valid_pointer(obj_ret.raw_method()) == false);
+    }
+
+    // =====================================================================
+    //  7. INSTANCE path: every PRIMITIVE-ELEMENT array return ([Z..[D) plus
+    //     Object[].  All TRUE — arrays are references regardless of element
+    //     kind.  This is the deliberate "[I is a reference" semantic swept
+    //     across all eight element types, the gap section 1 left at just [I.
+    // =====================================================================
+    if (singleton)
+    {
+        for (const expectation& e : k_instance_primitive_arrays)
+        {
+            const auto mp{ singleton->get_method(e.name) };
+            ctx.check(std::string{ "primarr_resolves_" } + e.name, mp.has_value());
+            if (mp)
+            {
+                check_proxy(ctx, "primarr", e, *mp);
+            }
+        }
+    }
+
+    // =====================================================================
+    //  8. INSTANCE path: MULTI-dimensional arrays ([[I, [[L..;, [[[B) and
+    //     reference returns that are neither String nor Object (a JDK
+    //     collection and an interface).  Leading '[' / 'L' => TRUE in every
+    //     case; depth and element kind never change the verdict.
+    // =====================================================================
+    if (singleton)
+    {
+        for (const expectation& e : k_instance_multidim_arrays)
+        {
+            const auto mp{ singleton->get_method(e.name) };
+            ctx.check(std::string{ "multidim_resolves_" } + e.name, mp.has_value());
+            if (mp)
+            {
+                check_proxy(ctx, "multidim", e, *mp);
+            }
+        }
+
+        for (const expectation& e : k_instance_other_refs)
+        {
+            const auto mp{ singleton->get_method(e.name) };
+            ctx.check(std::string{ "otherref_resolves_" } + e.name, mp.has_value());
+            if (mp)
+            {
+                check_proxy(ctx, "otherref", e, *mp);
+            }
+        }
+    }
+
+    // =====================================================================
+    //  9. PARAM-LIST RED HERRING (the new headline): a parameter list that
+    //     CONTAINS 'L' / '[' but a primitive / void RETURN.  is_reference()
+    //     must verdict on the char AFTER ')' only — every one of these is
+    //     FALSE.  A parser that scanned the whole descriptor (or used the
+    //     FIRST 'L'/'[' anywhere) would wrongly report true here.  Resolved
+    //     by EXACT descriptor so the proxy carries the precise param area.
+    // =====================================================================
+    if (singleton)
+    {
+        struct red_herring
+        {
+            const char* name;
+            const char* sig;
+        };
+        const red_herring herrings[]{
+            { "takesString",      "(Ljava/lang/String;)I" },
+            { "takesIntArray",    "([I)I" },
+            { "takesObjectArray", "([Ljava/lang/Object;)V" },
+            { "takesMixed",       "(Ljava/lang/String;[IJ)Z" },
+        };
+
+        // (a) resolved by EXACT descriptor — the param area is reference-heavy
+        //     yet the return is primitive/void, so is_reference() is false.
+        for (const red_herring& h : herrings)
+        {
+            const auto mp{ singleton->get_method(h.name, h.sig) };
+            ctx.check(std::string{ "redherring_resolves_" } + h.name, mp.has_value());
+            if (!mp)
+            {
+                continue;
+            }
+            const std::string sig{ mp->signature() };
+            ctx.check(std::string{ "redherring_signature_exact_" } + h.name, sig == h.sig);
+            ctx.check(std::string{ "redherring_is_reference_false_" } + h.name,
+                      mp->is_reference() == false);
+            ctx.check(std::string{ "redherring_oracle_false_" } + h.name,
+                      oracle_is_reference(sig) == false);
+        }
+
+        // (b) also resolved by NAME ONLY — same false verdict; the param 'L'/'['
+        //     does not leak in regardless of which resolution path latched the
+        //     descriptor.  (takesString/takesIntArray are unique names.)
+        for (const expectation& e : k_instance_param_red_herrings)
+        {
+            const auto mp{ singleton->get_method(e.name) };
+            ctx.check(std::string{ "redherring_nameonly_resolves_" } + e.name, mp.has_value());
+            if (mp)
+            {
+                check_proxy(ctx, "redherring_nameonly", e, *mp);
+            }
+        }
+
+        // (c) static red-herring twin: sTakesString(L..;)I — still false.
+        const auto s_mp{ isref::static_proxy("sTakesString", "(Ljava/lang/String;)I") };
+        ctx.check("static_redherring_resolves", s_mp.has_value());
+        if (s_mp)
+        {
+            const std::string sig{ s_mp->signature() };
+            ctx.check("static_redherring_is_reference_false", s_mp->is_reference() == false);
+            ctx.check("static_redherring_oracle_false", oracle_is_reference(sig) == false);
+        }
+
+        // (d) the crux contrast: a reference PARAM with a primitive RETURN
+        //     (takesString) vs a reference RETURN (retString) — the param 'L'
+        //     of the former must NOT make it look like the latter.
+        const auto inst_ref_ret{ singleton->get_method("retString") };
+        const auto inst_ref_param{ singleton->get_method("takesString", "(Ljava/lang/String;)I") };
+        if (inst_ref_ret && inst_ref_param)
+        {
+            ctx.check("redherring_param_L_not_confused_with_return_L",
+                      inst_ref_ret->is_reference() == true
+                          && inst_ref_param->is_reference() == false);
+        }
+    }
+
+    // =====================================================================
+    // 10. EXHAUSTIVE MALFORMED / EDGE descriptors — no JVM.  Sweeps every
+    //     single primitive return char, deep arrays, lowercase 'l' (NOT a
+    //     reference — only uppercase 'L' is), garbage after ')', a doubled
+    //     ')' (the find-FIRST vs find-LAST distinction the accessor relies
+    //     on), an empty param list with a reference return, and the
+    //     four-arg pinned ctor (is_reference() independent of the pinned flag).
+    //     Each proxy is hand-built; is_reference() must NOT deref.
+    // =====================================================================
+    {
+        struct desc_case
+        {
+            const char* sig;
+            bool        expect;
+            const char* label;
+        };
+        const desc_case cases[]{
+            // every single primitive return char -> false
+            { "()Z", false, "void_paren_Z" },
+            { "()B", false, "void_paren_B" },
+            { "()S", false, "void_paren_S" },
+            { "()C", false, "void_paren_C" },
+            { "()I", false, "void_paren_I" },
+            { "()J", false, "void_paren_J" },
+            { "()F", false, "void_paren_F" },
+            { "()D", false, "void_paren_D" },
+            { "()V", false, "void_paren_V" },
+            // reference returns -> true
+            { "()Ljava/lang/Object;",        true,  "ret_Object" },
+            { "()Ljava/lang/String;",        true,  "ret_String" },
+            { "()Ljava/util/List;",          true,  "ret_List" },
+            // arrays of every primitive element -> true (leading '[')
+            { "()[Z", true,  "ret_boolArray" },
+            { "()[B", true,  "ret_byteArray" },
+            { "()[S", true,  "ret_shortArray" },
+            { "()[C", true,  "ret_charArray" },
+            { "()[I", true,  "ret_intArray" },
+            { "()[J", true,  "ret_longArray" },
+            { "()[F", true,  "ret_floatArray" },
+            { "()[D", true,  "ret_doubleArray" },
+            // multi-dim arrays -> true regardless of depth
+            { "()[[I",                       true,  "ret_int2D" },
+            { "()[[[B",                      true,  "ret_byte3D" },
+            { "()[[Ljava/lang/String;",      true,  "ret_string2D" },
+            // param area carries 'L' / '[' but primitive/void return -> false
+            { "(Ljava/lang/String;)I",       false, "param_L_ret_I" },
+            { "([I)I",                       false, "param_arr_ret_I" },
+            { "([Ljava/lang/Object;)V",      false, "param_arr_ret_V" },
+            { "(Ljava/lang/String;[IJ)Z",    false, "param_mix_ret_Z" },
+            { "(Ljava/lang/Object;)J",       false, "param_L_ret_J" },
+            // lowercase 'l' is NOT a reference marker — only uppercase 'L' is.
+            { "()lava/lang/String;",         false, "lowercase_l_not_reference" },
+            // a return char that is none of L/[/primitive (garbage) -> false
+            { "()X",                         false, "garbage_X_after_paren" },
+            { "()@",                         false, "garbage_at_after_paren" },
+            // 'L' / '[' NOT in the return slot but elsewhere as trailing junk
+            // after a primitive return char -> the FIRST char after ')' wins.
+            { "()IL",                        false, "primitive_then_L" },
+            { "()V[",                        false, "void_then_bracket" },
+            // empty param list, reference return (canonical no-arg getter)
+            { "()Ljava/lang/Integer;",       true,  "noarg_boxed_ref" },
+        };
+
+        for (const desc_case& c : cases)
+        {
+            const vmhook::method_proxy mp{ nullptr, nullptr, std::string{ c.sig } };
+            ctx.check(std::string{ "malformed_is_reference_" } + c.label,
+                      mp.is_reference() == c.expect);
+            // is_reference() must agree with the independent oracle on EVERY
+            // descriptor, well-formed or not — they share the same guard logic.
+            ctx.check(std::string{ "malformed_oracle_agree_" } + c.label,
+                      mp.is_reference() == oracle_is_reference(c.sig));
+            // signature() round-trips the exact descriptor handed to the ctor.
+            const std::string round{ mp.signature() };
+            ctx.check(std::string{ "malformed_signature_roundtrip_" } + c.label,
+                      round == c.sig);
+        }
+
+        // Doubled ')' — the accessor uses find(')') (the FIRST ')'), so the
+        // char after the FIRST ')' decides.  "()L)V" -> first ')' is at index 1,
+        // next char is 'L' -> reference true.  This pins the find-FIRST contract
+        // (a find-LAST parser would look after the SECOND ')' and see 'V').
+        {
+            const vmhook::method_proxy doubled{ nullptr, nullptr, std::string{ "()L)V" } };
+            ctx.check("doubled_paren_uses_first_close_true", doubled.is_reference() == true);
+            ctx.check("doubled_paren_oracle_agree",
+                      doubled.is_reference() == oracle_is_reference("()L)V"));
+        }
+        // Mirror: "()I)L" -> after the FIRST ')' is 'I' -> false (the trailing
+        // ')L' is ignored).  Distinguishes find-FIRST from find-LAST the other way.
+        {
+            const vmhook::method_proxy doubled2{ nullptr, nullptr, std::string{ "()I)L" } };
+            ctx.check("doubled_paren_first_primitive_false", doubled2.is_reference() == false);
+        }
+
+        // Single ')' as the FIRST and only character: char after it is 'L' here.
+        {
+            const vmhook::method_proxy lead_close{ nullptr, nullptr, std::string{ ")Ljava/lang/Object;" } };
+            ctx.check("leading_close_then_L_true", lead_close.is_reference() == true);
+        }
+        // ')' first char, primitive after -> false.
+        {
+            const vmhook::method_proxy lead_close_prim{ nullptr, nullptr, std::string{ ")I" } };
+            ctx.check("leading_close_then_primitive_false", lead_close_prim.is_reference() == false);
+        }
+
+        // Four-arg PINNED ctor: is_reference() reads signature_text only and is
+        // INDEPENDENT of the pinned flag.  A pinned reference descriptor is still
+        // true; a pinned primitive is still false.
+        {
+            const vmhook::method_proxy pinned_ref{ nullptr, nullptr,
+                                                   std::string{ "()Ljava/lang/Object;" }, true };
+            ctx.check("pinned_reference_is_reference_true", pinned_ref.is_reference() == true);
+
+            const vmhook::method_proxy pinned_prim{ nullptr, nullptr, std::string{ "()I" }, true };
+            ctx.check("pinned_primitive_is_reference_false", pinned_prim.is_reference() == false);
+
+            // Same descriptor, pinned vs unpinned, agrees — the flag is inert here.
+            const vmhook::method_proxy unpinned_ref{ nullptr, nullptr,
+                                                     std::string{ "()Ljava/lang/Object;" }, false };
+            ctx.check("pinned_flag_does_not_change_is_reference",
+                      pinned_ref.is_reference() == unpinned_ref.is_reference());
+        }
+
+        // Whitespace / single-char degenerate inputs that contain no ')'.
+        {
+            const vmhook::method_proxy just_L{ nullptr, nullptr, std::string{ "L" } };
+            ctx.check("no_paren_just_L_false", just_L.is_reference() == false);
+
+            const vmhook::method_proxy just_bracket{ nullptr, nullptr, std::string{ "[" } };
+            ctx.check("no_paren_just_bracket_false", just_bracket.is_reference() == false);
+
+            const vmhook::method_proxy space{ nullptr, nullptr, std::string{ " " } };
+            ctx.check("no_paren_space_false", space.is_reference() == false);
+        }
     }
 }

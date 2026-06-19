@@ -47,6 +47,23 @@ import vmhook.Harness;
  *        the correct DISTINCT caller each fire (not a stale cache)
  *   7  = caller with a primitive-but-non-(I)I descriptor: longArgCaller(long)
  *        -> inner, so the reported signature is "(J)I" not "(I)I"
+ *   8  = caller whose descriptor packs EVERY JVM primitive kind in declaration
+ *        order: manyPrims(boolean,byte,char,short,int,float,double,long)->inner,
+ *        descriptor "(ZBCSIFDJ)I" (each base-type letter exercised once)
+ *   9  = caller whose descriptor carries ARRAY params: arrayArgs(int[],
+ *        String[][])->inner, descriptor "([I[[Ljava/lang/String;)I" (single-dim
+ *        primitive array + multi-dim reference array)
+ *  10  = caller declared in a DISTINCT nested class Helper.bridge(int)->inner,
+ *        so caller().class_name is "vmhook/fixtures/ReturnCaller$Helper" — the
+ *        class-name analogue of mode 7's signature distinctness
+ *  11  = caller that is a CONSTRUCTOR: a second ReturnCaller(int) <init> body
+ *        calls inner, so caller().method_name is the angle-bracket name "<init>"
+ *  12  = STATIC caller staticCaller(int)->inner (vs the otherwise all-instance
+ *        callers): same interpreter layout, method_name "staticCaller"
+ *  13  = the SAME interpreted caller stable(int)->inner fired THREE times in one
+ *        cycle: every fire must report the identical class/method/signature AND
+ *        the identical Method* — the stability dual of mode 6's distinctness,
+ *        and caller() must be idempotent within a single detour
  *
  * Java 8 syntax only (no var / records / switch-expr / text-blocks).
  */
@@ -87,6 +104,31 @@ public final class ReturnCaller
     public static final int  ARG_ALPHA     = 15;
     public static final int  ARG_BETA      = 16;
     public static final long ARG_LONG      = 17L;
+    public static final int  ARG_MANYPRIMS = 18;
+    public static final int  ARG_ARRAYARGS = 19;
+    public static final int  ARG_HELPER    = 20;
+    public static final int  ARG_CTOR      = 21;
+    public static final int  ARG_STATIC    = 22;
+    public static final int  ARG_STABLE    = 23;
+
+    /** How many times the stable() caller fires the leaf this cycle (mode 13). */
+    public static final int STABLE_FIRES = 3;
+
+    // ---- Constructors -------------------------------------------------------
+
+    /** Default constructor (used by the scenario runners). */
+    public ReturnCaller()
+    {
+    }
+
+    /**
+     * Int-arg constructor whose {@code <init>} body is the immediate caller of
+     * inner for mode 11, so caller().method_name is the angle-bracket "<init>".
+     */
+    public ReturnCaller(final int x)
+    {
+        this.inner(x);
+    }
 
     // ---- The fixed leaf -----------------------------------------------------
 
@@ -205,6 +247,75 @@ public final class ReturnCaller
         return this.inner((int) v);
     }
 
+    // ---- mode 8: every JVM primitive kind in one descriptor -----------------
+
+    /**
+     * Caller packing all eight base-type letters in JVM declaration order:
+     * boolean Z, byte B, char C, short S, int I, float F, double D, long J,
+     * giving descriptor "(ZBCSIFDJ)I".  Each param is touched so javac keeps it.
+     */
+    public int manyPrims(final boolean a, final byte b, final char c,
+                         final short d, final int e, final float f,
+                         final double g, final long h)
+    {
+        final int n = (a ? 1 : 0) + (b & 1) + (c & 1) + (d & 1) + (e & 1)
+                    + ((int) f & 1) + ((int) g & 1) + ((int) h & 1);
+        return this.inner(ARG_MANYPRIMS + (n & 0));
+    }
+
+    // ---- mode 9: array-typed descriptor -------------------------------------
+
+    /**
+     * Caller whose descriptor carries a single-dim primitive array and a
+     * two-dim reference array, yielding "([I[[Ljava/lang/String;)I".
+     */
+    public int arrayArgs(final int[] xs, final String[][] ss)
+    {
+        final int n = (xs != null ? xs.length : 0) + (ss != null ? ss.length : 0);
+        return this.inner(ARG_ARRAYARGS + (n & 0));
+    }
+
+    // ---- mode 10: caller in a distinct nested class -------------------------
+
+    /**
+     * Distinct nested class whose method is the immediate caller, so the
+     * reported class_name is "vmhook/fixtures/ReturnCaller$Helper" rather than
+     * the leaf's own class.  Holds the outer instance to reach inner().
+     */
+    public static final class Helper
+    {
+        private final ReturnCaller owner;
+
+        Helper(final ReturnCaller o)
+        {
+            this.owner = o;
+        }
+
+        int bridge(final int x)
+        {
+            return this.owner.inner(x) + 1;
+        }
+    }
+
+    // ---- mode 12: static caller ---------------------------------------------
+
+    /**
+     * Static immediate caller (the other callers are instance methods); the
+     * interpreter frame layout is the same, so caller() must still resolve it.
+     */
+    public static int staticCaller(final ReturnCaller owner, final int x)
+    {
+        return owner.inner(x) + 1;
+    }
+
+    // ---- mode 13: a stable caller fired repeatedly --------------------------
+
+    /** Single interpreted caller fired multiple times in one cycle (mode 13). */
+    public int stable(final int x)
+    {
+        return this.inner(x) + 1;
+    }
+
     // ---- scenario runners ---------------------------------------------------
 
     private void runOuterA()
@@ -268,6 +379,54 @@ public final class ReturnCaller
         this.longArgCaller(ARG_LONG);
     }
 
+    private void runManyPrims()
+    {
+        observed = 0;
+        innerCalls = 0;
+        this.manyPrims(true, (byte) 1, 'x', (short) 2, 3, 4.0f, 5.0, 6L);
+    }
+
+    private void runArrayArgs()
+    {
+        observed = 0;
+        innerCalls = 0;
+        final int[] xs = new int[] { 1, 2 };
+        final String[][] ss = new String[][] { { "a" } };
+        this.arrayArgs(xs, ss);
+    }
+
+    private void runHelper()
+    {
+        observed = 0;
+        innerCalls = 0;
+        new Helper(this).bridge(ARG_HELPER);
+    }
+
+    private void runConstructorCaller()
+    {
+        observed = 0;
+        innerCalls = 0;
+        // The int-arg constructor's <init> body is the immediate caller of inner.
+        new ReturnCaller(ARG_CTOR);
+    }
+
+    private void runStaticCaller()
+    {
+        observed = 0;
+        innerCalls = 0;
+        ReturnCaller.staticCaller(this, ARG_STATIC);
+    }
+
+    private void runStableCaller()
+    {
+        observed = 0;
+        innerCalls = 0;
+        for (int i = 0; i < STABLE_FIRES; i++)
+        {
+            this.stable(ARG_STABLE);
+        }
+    }
+
     /** Keeps the warmup loop from being optimised away. */
     public static volatile int warmSink;
 
@@ -307,6 +466,24 @@ public final class ReturnCaller
                         break;
                     case 7:
                         probe.runLongArgCaller();
+                        break;
+                    case 8:
+                        probe.runManyPrims();
+                        break;
+                    case 9:
+                        probe.runArrayArgs();
+                        break;
+                    case 10:
+                        probe.runHelper();
+                        break;
+                    case 11:
+                        probe.runConstructorCaller();
+                        break;
+                    case 12:
+                        probe.runStaticCaller();
+                        break;
+                    case 13:
+                        probe.runStableCaller();
                         break;
                     default:
                         break;

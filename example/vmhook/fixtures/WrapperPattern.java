@@ -163,6 +163,29 @@ public final class WrapperPattern
     public static char   sChar     = 0x20AC;          // euro sign
     public static String sName     = freshAscii("wrapper-static");
 
+    // ---- EVERY remaining primitive width as a STATIC field -----------------
+    // byte / short / float / double round out the value_t variant alternatives
+    // (i8 idx1, i16 idx2, float idx5, double idx6) that the int/long/char/bool/
+    // reference statics above did not exercise.
+    public static byte   sByte     = (byte) -7;       // i8
+    public static short  sShort    = (short) -3000;   // i16
+    public static float  sFloat    = 2.5f;            // float (exact binary)
+    public static double sDouble   = -1.25d;          // double (exact binary)
+
+    // ---- BOUNDARY / EDGE static values (every width's extremes) ------------
+    public static byte    sByteMin  = Byte.MIN_VALUE;     // -128
+    public static byte    sByteMax  = Byte.MAX_VALUE;     // 127
+    public static short   sShortMin = Short.MIN_VALUE;    // -32768
+    public static short   sShortMax = Short.MAX_VALUE;    // 32767
+    public static char    sCharZero = (char) 0;           // 0x0000
+    public static char    sCharMax  = (char) 0xFFFF;      // 65535
+    public static int     sIntMin   = Integer.MIN_VALUE;  // 0x80000000
+    public static int     sIntMax   = Integer.MAX_VALUE;  // 0x7FFFFFFF
+    public static long    sLongMin  = Long.MIN_VALUE;
+    public static long    sLongMax  = Long.MAX_VALUE;
+    public static float   sFloatNeg = -0.5f;
+    public static double  sDoubleBig = 1.0e9d + 0.5d;     // 1000000000.5, exact
+
     // A static reference to a sibling object (object-reference static field).
     public static WrapperPattern sRef = new WrapperPattern(0x100);
 
@@ -188,6 +211,34 @@ public final class WrapperPattern
     public long   iValue = 1000L;                     // mutated by bump() at runtime
     public boolean iFlag = false;
     public String iLabel = freshAscii("wrapper-instance");
+
+    // ---- EVERY remaining primitive width as an INSTANCE field --------------
+    // Values DIFFER from the static counterparts so a static/instance mix-up is
+    // caught immediately, and exercise every value_t alternative through a live
+    // oop: byte (i8), short (i16), char (u16), float, double.
+    public byte   iByte   = (byte) 42;                // i8
+    public short  iShort  = (short) 12345;            // i16
+    public char   iChar   = 'Z';                      // 0x005A
+    public float  iFloat  = 0.75f;                    // float (exact binary)
+    public double iDouble = 3.5d;                     // double (exact binary)
+
+    // ---- INSTANCE-field SET() round-trip scratch (per-published-object) -----
+    // Dedicated fields the native side WRITES through a wrapper's get_field(
+    // "...")->set(v) and reads back, then restores; isolated from every value
+    // assertion above so the write cannot perturb another check.  One per
+    // primitive class the set() path supports.
+    public int     scratchI = 0;
+    public long    scratchJ = 0L;
+    public boolean scratchZ = false;
+    public byte    scratchB = (byte) 0;
+    public short   scratchS = (short) 0;
+    public char    scratchC = (char) 0;
+    public float   scratchF = 0.0f;
+    public double  scratchD = 0.0d;
+    public String  scratchStr = freshAscii("scratch-initial");
+
+    // ---- STATIC-field SET() round-trip scratch ------------------------------
+    public static int sScratchI = 0;
 
     // =====================================================================
     //  EXHAUSTIVE-WRAPPER reference / array fields (every object shape).
@@ -252,6 +303,19 @@ public final class WrapperPattern
         return a + b;
     }
 
+    // ---- EVERY primitive-arg descriptor as an overload of `widen` -----------
+    // Same name, distinct JVM descriptors: (Z)I (B)I (S)I (C)I (J)I (F)I (D)I.
+    // The name+signature resolver must pick the EXACT descriptor; the name-only
+    // resolver returns the first by name.  None are called natively — RESOLUTION
+    // by exact descriptor is the universal (thread-free) invariant under test.
+    public static int widen(final boolean v) { return v ? 1 : 0; }
+    public static int widen(final byte v)    { return v; }
+    public static int widen(final short v)   { return v; }
+    public static int widen(final char v)    { return v; }
+    public static int widen(final long v)    { return (int) v; }
+    public static int widen(final float v)   { return (int) v; }
+    public static int widen(final double v)  { return (int) v; }
+
     // =====================================================================
     //  INSTANCE methods (incl. overloads) — instance dispatch + signatures.
     // =====================================================================
@@ -280,6 +344,17 @@ public final class WrapperPattern
     {
         return this.iId + salt;
     }
+
+    // ---- INSTANCE methods returning every primitive-width return type -------
+    // Their RESOLUTION + signature()/is_reference() introspection is the
+    // thread-free invariant the native side asserts (the values are reachable
+    // through the matching instance FIELDS already; these pin the return
+    // descriptors ()B ()S ()C ()F ()D for method_proxy::signature()).
+    public byte   getByte()   { return this.iByte; }
+    public short  getShort()  { return this.iShort; }
+    public char   getChar()   { return this.iChar; }
+    public float  getFloat()  { return this.iFloat; }
+    public double getDouble() { return this.iDouble; }
 
     /**
      * Mutates the instance field iValue via genuine putfield bytecode and

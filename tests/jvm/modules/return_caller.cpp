@@ -31,6 +31,21 @@
 //                                            fire (not a stale cache)
 //   7  longArgCaller(long) -> inner        : caller signature is (J)I, distinct
 //                                            from the leaf's own (I)I
+//   8  manyPrims(Z,B,C,S,I,F,D,J) -> inner : every JVM base-type letter decoded
+//                                            in order — signature (ZBCSIFDJ)I
+//   9  arrayArgs(int[],String[][]) -> inner: array-typed descriptor survives —
+//                                            signature ([I[[Ljava/lang/String;)I
+//  10  Helper.bridge(int) -> inner         : caller declared in a DISTINCT nested
+//                                            class — class_name is ...$Helper, the
+//                                            class-name analogue of mode 7
+//  11  ReturnCaller.<init>(int) -> inner   : CONSTRUCTOR caller — method_name is
+//                                            the angle-bracket name "<init>"
+//  12  staticCaller(...) -> inner          : STATIC caller (all others instance) —
+//                                            method_name staticCaller, same layout
+//  13  stable(int) -> inner x3             : the SAME caller fired three times —
+//                                            identical identity + identical Method*
+//                                            every fire (stability dual of mode 6),
+//                                            and caller() is idempotent in one fire
 //
 // SAFETY / CROSS-TOOLCHAIN (Java 8-26 x 5 toolchains; win-clang/mingw have NO
 // SEH, and this feature WALKS INTERPRETER FRAMES — the #1 cold-fault source):
@@ -99,8 +114,15 @@ namespace
 
     // ── Fixture-mirrored constants (kept in lockstep with ReturnCaller.java) ──
     const std::string CLASS_NAME{ "vmhook/fixtures/ReturnCaller" };
+    const std::string HELPER_CLASS_NAME{ "vmhook/fixtures/ReturnCaller$Helper" };
     const std::string SIG_II{ "(I)I" };
     const std::string SIG_JI{ "(J)I" };
+    const std::string CTOR_NAME{ "<init>" };
+
+    // mode 8: every JVM base-type letter, in declaration order (Z B C S I F D J).
+    const std::string SIG_MANYPRIMS{ "(ZBCSIFDJ)I" };
+    // mode 9: single-dim primitive array + two-dim reference array param.
+    const std::string SIG_ARRAYARGS{ "([I[[Ljava/lang/String;)I" };
 
     // The exact long descriptor for longSig(8 x Object, int) -> int.  Mirrors the
     // Java method byte-for-byte: caller().signature must equal this, untruncated.
@@ -120,6 +142,16 @@ namespace
     {
         return info.method != nullptr
             && info.class_name  == CLASS_NAME
+            && info.method_name == method
+            && info.signature   == sig;
+    }
+
+    // As `names`, but for an arbitrary declaring class (e.g. the nested Helper).
+    auto names_in(const info_t& info, const std::string& cls,
+                  const std::string& method, const std::string& sig) noexcept -> bool
+    {
+        return info.method != nullptr
+            && info.class_name  == cls
             && info.method_name == method
             && info.signature   == sig;
     }
@@ -199,6 +231,52 @@ namespace
     std::atomic<bool>         g_m7_sig_is_JI{ false };           // signature == (J)I
     std::atomic<bool>         g_m7_sig_not_II{ false };          // distinct from leaf's (I)I
 
+    // ── Mode 8 — manyPrims(Z,B,C,S,I,F,D,J) -> inner : signature (ZBCSIFDJ)I ──
+    std::atomic<std::int32_t> g_m8_fires{ 0 };
+    std::atomic<bool>         g_m8_caller_valid{ false };
+    std::atomic<bool>         g_m8_caller_is_manyPrims{ false }; // method_name == manyPrims
+    std::atomic<bool>         g_m8_sig_exact{ false };           // signature == (ZBCSIFDJ)I
+    std::atomic<bool>         g_m8_sig_not_II{ false };          // distinct from leaf's (I)I
+    std::atomic<bool>         g_m8_trace0_sig_exact{ false };
+
+    // ── Mode 9 — arrayArgs(int[],String[][]) -> inner : array descriptor ──────
+    std::atomic<std::int32_t> g_m9_fires{ 0 };
+    std::atomic<bool>         g_m9_caller_valid{ false };
+    std::atomic<bool>         g_m9_caller_is_arrayArgs{ false }; // method_name == arrayArgs
+    std::atomic<bool>         g_m9_sig_exact{ false };           // signature == ([I[[L...;)I
+    std::atomic<bool>         g_m9_sig_has_bracket{ false };     // contains '[' (array marker)
+    std::atomic<bool>         g_m9_trace0_sig_exact{ false };
+
+    // ── Mode 10 — Helper.bridge(int) -> inner : distinct nested class ─────────
+    std::atomic<std::int32_t> g_m10_fires{ 0 };
+    std::atomic<bool>         g_m10_caller_valid{ false };
+    std::atomic<bool>         g_m10_caller_is_bridge{ false };   // method_name == bridge
+    std::atomic<bool>         g_m10_class_is_helper{ false };    // class_name == ...$Helper
+    std::atomic<bool>         g_m10_class_not_outer{ false };    // != the leaf's class
+    std::atomic<bool>         g_m10_class_is_slashed{ false };   // slashed, has '$', no '.'
+
+    // ── Mode 11 — ReturnCaller.<init>(int) -> inner : constructor caller ──────
+    std::atomic<std::int32_t> g_m11_fires{ 0 };
+    std::atomic<bool>         g_m11_caller_valid{ false };
+    std::atomic<bool>         g_m11_method_is_ctor{ false };     // method_name == <init>
+    std::atomic<bool>         g_m11_class_is_fixture{ false };   // class_name == fixture
+    std::atomic<bool>         g_m11_method_not_inner{ false };
+
+    // ── Mode 12 — staticCaller(...) -> inner : static caller ──────────────────
+    std::atomic<std::int32_t> g_m12_fires{ 0 };
+    std::atomic<bool>         g_m12_caller_valid{ false };
+    std::atomic<bool>         g_m12_method_is_static{ false };   // method_name == staticCaller
+    std::atomic<bool>         g_m12_class_is_fixture{ false };
+    std::atomic<bool>         g_m12_method_not_inner{ false };
+
+    // ── Mode 13 — stable(int) -> inner x3 : identity + Method* stability ──────
+    std::atomic<std::int32_t> g_m13_fires{ 0 };
+    std::atomic<bool>         g_m13_all_valid{ true };           // every fire valid()
+    std::atomic<bool>         g_m13_all_named_stable{ true };    // every fire == stable/(I)I
+    std::atomic<bool>         g_m13_method_stable{ true };       // same Method* across fires
+    std::atomic<bool>         g_m13_idempotent{ true };          // caller() twice == itself
+    std::atomic<void*>        g_m13_first_method{ nullptr };
+
     auto reset_observations() -> void
     {
         g_m1_fires.store(0);
@@ -255,6 +333,46 @@ namespace
         g_m7_caller_is_longArg.store(false);
         g_m7_sig_is_JI.store(false);
         g_m7_sig_not_II.store(false);
+
+        g_m8_fires.store(0);
+        g_m8_caller_valid.store(false);
+        g_m8_caller_is_manyPrims.store(false);
+        g_m8_sig_exact.store(false);
+        g_m8_sig_not_II.store(false);
+        g_m8_trace0_sig_exact.store(false);
+
+        g_m9_fires.store(0);
+        g_m9_caller_valid.store(false);
+        g_m9_caller_is_arrayArgs.store(false);
+        g_m9_sig_exact.store(false);
+        g_m9_sig_has_bracket.store(false);
+        g_m9_trace0_sig_exact.store(false);
+
+        g_m10_fires.store(0);
+        g_m10_caller_valid.store(false);
+        g_m10_caller_is_bridge.store(false);
+        g_m10_class_is_helper.store(false);
+        g_m10_class_not_outer.store(false);
+        g_m10_class_is_slashed.store(false);
+
+        g_m11_fires.store(0);
+        g_m11_caller_valid.store(false);
+        g_m11_method_is_ctor.store(false);
+        g_m11_class_is_fixture.store(false);
+        g_m11_method_not_inner.store(false);
+
+        g_m12_fires.store(0);
+        g_m12_caller_valid.store(false);
+        g_m12_method_is_static.store(false);
+        g_m12_class_is_fixture.store(false);
+        g_m12_method_not_inner.store(false);
+
+        g_m13_fires.store(0);
+        g_m13_all_valid.store(true);
+        g_m13_all_named_stable.store(true);
+        g_m13_method_stable.store(true);
+        g_m13_idempotent.store(true);
+        g_m13_first_method.store(nullptr);
     }
 
     // Drives exactly one probe cycle for `mode` (rising-edge programs mode +
@@ -706,6 +824,315 @@ VMHOOK_JVM_MODULE(return_caller)
         // from the hooked leaf's (I)I.
         ctx.check("rc_m7_caller_sig_is_JI", g_m7_sig_is_JI.load());
         ctx.check("rc_m7_caller_sig_distinct_from_leaf", g_m7_sig_not_II.load());
+    }
+
+    // =====================================================================
+    // Scenario 8 — manyPrims(Z,B,C,S,I,F,D,J) -> inner.  The caller packs every
+    // JVM base-type letter, in declaration order, so caller().signature must be
+    // exactly "(ZBCSIFDJ)I" — proving the descriptor passes through verbatim and
+    // each primitive kind is decoded, not collapsed.  Distinct from the leaf's
+    // own (I)I and the same long descriptor surfaces in stack_trace()[0].
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                g_m8_fires.fetch_add(1, std::memory_order_relaxed);
+
+                const auto info{ ret.caller() };
+                g_m8_caller_valid.store(info.valid(), std::memory_order_relaxed);
+                if (info.valid())
+                {
+                    g_m8_caller_is_manyPrims.store(info.method_name == "manyPrims",
+                                                   std::memory_order_relaxed);
+                    g_m8_sig_exact.store(info.signature == SIG_MANYPRIMS,
+                                         std::memory_order_relaxed);
+                    g_m8_sig_not_II.store(info.signature != SIG_II,
+                                          std::memory_order_relaxed);
+                }
+
+                const auto trace{ ret.stack_trace() };
+                if (!trace.empty())
+                {
+                    g_m8_trace0_sig_exact.store(trace.front().signature == SIG_MANYPRIMS,
+                                                std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m8_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 8) };
+        ctx.check("rc_m8_probe_completed", done);
+        ctx.check("rc_m8_leaf_ran_once", caller_fixture::get_inner_calls() == 1);
+        ctx.check("rc_m8_fired_once", g_m8_fires.load() == 1);
+
+        ctx.check("rc_m8_caller_valid", g_m8_caller_valid.load());
+        ctx.check("rc_m8_caller_is_manyPrims", g_m8_caller_is_manyPrims.load());
+        // The headline: every base-type letter decoded, descriptor verbatim.
+        ctx.check("rc_m8_signature_is_ZBCSIFDJ", g_m8_sig_exact.load());
+        ctx.check("rc_m8_signature_distinct_from_leaf", g_m8_sig_not_II.load());
+        ctx.check("rc_m8_trace0_signature_exact", g_m8_trace0_sig_exact.load());
+    }
+
+    // =====================================================================
+    // Scenario 9 — arrayArgs(int[], String[][]) -> inner.  The caller's
+    // descriptor carries a single-dim primitive array ([I) and a two-dim
+    // reference array ([[Ljava/lang/String;), so caller().signature must be
+    // exactly "([I[[Ljava/lang/String;)I" — proving array-rank markers survive
+    // the descriptor decode.  Same descriptor in stack_trace()[0].
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                g_m9_fires.fetch_add(1, std::memory_order_relaxed);
+
+                const auto info{ ret.caller() };
+                g_m9_caller_valid.store(info.valid(), std::memory_order_relaxed);
+                if (info.valid())
+                {
+                    g_m9_caller_is_arrayArgs.store(info.method_name == "arrayArgs",
+                                                   std::memory_order_relaxed);
+                    g_m9_sig_exact.store(info.signature == SIG_ARRAYARGS,
+                                         std::memory_order_relaxed);
+                    g_m9_sig_has_bracket.store(
+                        info.signature.find('[') != std::string::npos,
+                        std::memory_order_relaxed);
+                }
+
+                const auto trace{ ret.stack_trace() };
+                if (!trace.empty())
+                {
+                    g_m9_trace0_sig_exact.store(trace.front().signature == SIG_ARRAYARGS,
+                                                std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m9_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 9) };
+        ctx.check("rc_m9_probe_completed", done);
+        ctx.check("rc_m9_leaf_ran_once", caller_fixture::get_inner_calls() == 1);
+        ctx.check("rc_m9_fired_once", g_m9_fires.load() == 1);
+
+        ctx.check("rc_m9_caller_valid", g_m9_caller_valid.load());
+        ctx.check("rc_m9_caller_is_arrayArgs", g_m9_caller_is_arrayArgs.load());
+        // The headline: array-rank markers survive verbatim.
+        ctx.check("rc_m9_signature_array_exact", g_m9_sig_exact.load());
+        ctx.check("rc_m9_signature_has_array_marker", g_m9_sig_has_bracket.load());
+        ctx.check("rc_m9_trace0_signature_exact", g_m9_trace0_sig_exact.load());
+    }
+
+    // =====================================================================
+    // Scenario 10 — Helper.bridge(int) -> inner.  The immediate caller is
+    // declared in a DISTINCT nested class, so caller().class_name must be the
+    // nested-class internal name "vmhook/fixtures/ReturnCaller$Helper", NOT the
+    // leaf's own class — the class-name analogue of mode 7's signature
+    // distinctness.  The '$'-bearing nested name is universal across HotSpot.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                g_m10_fires.fetch_add(1, std::memory_order_relaxed);
+
+                const auto info{ ret.caller() };
+                g_m10_caller_valid.store(info.valid(), std::memory_order_relaxed);
+                if (info.valid())
+                {
+                    g_m10_caller_is_bridge.store(
+                        names_in(info, HELPER_CLASS_NAME, "bridge", SIG_II),
+                        std::memory_order_relaxed);
+                    g_m10_class_is_helper.store(info.class_name == HELPER_CLASS_NAME,
+                                                std::memory_order_relaxed);
+                    g_m10_class_not_outer.store(info.class_name != CLASS_NAME,
+                                                std::memory_order_relaxed);
+                    // Slashed internal form with the nested-class '$' separator
+                    // and no dotted '.'.
+                    g_m10_class_is_slashed.store(
+                        info.class_name.find('/') != std::string::npos
+                     && info.class_name.find('$') != std::string::npos
+                     && info.class_name.find('.') == std::string::npos,
+                        std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m10_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 10) };
+        ctx.check("rc_m10_probe_completed", done);
+        ctx.check("rc_m10_leaf_ran_once", caller_fixture::get_inner_calls() == 1);
+        ctx.check("rc_m10_fired_once", g_m10_fires.load() == 1);
+
+        ctx.check("rc_m10_caller_valid", g_m10_caller_valid.load());
+        ctx.check("rc_m10_caller_is_helper_bridge", g_m10_caller_is_bridge.load());
+        // The headline: the caller's declaring class is the nested Helper, not
+        // the leaf's class.
+        ctx.check("rc_m10_class_is_nested_helper", g_m10_class_is_helper.load());
+        ctx.check("rc_m10_class_distinct_from_leaf_class", g_m10_class_not_outer.load());
+        ctx.check("rc_m10_class_is_slashed_dollar", g_m10_class_is_slashed.load());
+    }
+
+    // =====================================================================
+    // Scenario 11 — ReturnCaller.<init>(int) -> inner.  The immediate caller is
+    // a CONSTRUCTOR; HotSpot names every constructor Method "<init>", so
+    // caller().method_name must be the angle-bracket name "<init>" (not the
+    // class name, not empty) — proving caller() reports the raw Method name even
+    // for special methods.  The declaring class is still the fixture.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                g_m11_fires.fetch_add(1, std::memory_order_relaxed);
+
+                const auto info{ ret.caller() };
+                g_m11_caller_valid.store(info.valid(), std::memory_order_relaxed);
+                if (info.valid())
+                {
+                    g_m11_method_is_ctor.store(info.method_name == CTOR_NAME,
+                                               std::memory_order_relaxed);
+                    g_m11_class_is_fixture.store(info.class_name == CLASS_NAME,
+                                                 std::memory_order_relaxed);
+                    g_m11_method_not_inner.store(info.method_name != "inner",
+                                                 std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m11_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 11) };
+        ctx.check("rc_m11_probe_completed", done);
+        ctx.check("rc_m11_leaf_ran_once", caller_fixture::get_inner_calls() == 1);
+        ctx.check("rc_m11_fired_once", g_m11_fires.load() == 1);
+
+        ctx.check("rc_m11_caller_valid", g_m11_caller_valid.load());
+        // The headline: the constructor's Method name is the angle-bracket
+        // "<init>".
+        ctx.check("rc_m11_caller_method_is_ctor", g_m11_method_is_ctor.load());
+        ctx.check("rc_m11_caller_class_is_fixture", g_m11_class_is_fixture.load());
+        ctx.check("rc_m11_caller_is_not_the_leaf", g_m11_method_not_inner.load());
+    }
+
+    // =====================================================================
+    // Scenario 12 — staticCaller(...) -> inner.  Every other caller is an
+    // instance method; this one is STATIC.  The interpreter frame layout is the
+    // same regardless of dispatch kind, so caller() must still resolve it:
+    // method_name == staticCaller, declaring class == fixture.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                g_m12_fires.fetch_add(1, std::memory_order_relaxed);
+
+                const auto info{ ret.caller() };
+                g_m12_caller_valid.store(info.valid(), std::memory_order_relaxed);
+                if (info.valid())
+                {
+                    g_m12_method_is_static.store(info.method_name == "staticCaller",
+                                                 std::memory_order_relaxed);
+                    g_m12_class_is_fixture.store(info.class_name == CLASS_NAME,
+                                                 std::memory_order_relaxed);
+                    g_m12_method_not_inner.store(info.method_name != "inner",
+                                                 std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m12_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 12) };
+        ctx.check("rc_m12_probe_completed", done);
+        ctx.check("rc_m12_leaf_ran_once", caller_fixture::get_inner_calls() == 1);
+        ctx.check("rc_m12_fired_once", g_m12_fires.load() == 1);
+
+        ctx.check("rc_m12_caller_valid", g_m12_caller_valid.load());
+        // The headline: a static immediate caller resolves the same as instance
+        // callers.
+        ctx.check("rc_m12_caller_method_is_static", g_m12_method_is_static.load());
+        ctx.check("rc_m12_caller_class_is_fixture", g_m12_class_is_fixture.load());
+        ctx.check("rc_m12_caller_is_not_the_leaf", g_m12_method_not_inner.load());
+    }
+
+    // =====================================================================
+    // Scenario 13 — stable(int) -> inner, fired THREE times in one cycle.  This
+    // is the STABILITY dual of mode 6 (distinctness): the SAME interpreted
+    // caller must yield the SAME identity (class/method/signature) AND the SAME
+    // Method* on every fire.  It also exercises caller() IDEMPOTENCE within a
+    // single detour — calling it twice in one fire must return equal info (the
+    // walk reads live frame state and does not mutate it).
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                g_m13_fires.fetch_add(1, std::memory_order_relaxed);
+
+                const auto info{ ret.caller() };
+                if (!info.valid())
+                {
+                    g_m13_all_valid.store(false, std::memory_order_relaxed);
+                }
+                if (!names(info, "stable", SIG_II))
+                {
+                    g_m13_all_named_stable.store(false, std::memory_order_relaxed);
+                }
+
+                // Idempotence: a second caller() in the same detour must agree.
+                const auto info2{ ret.caller() };
+                if (!(info2.method == info.method
+                      && info2.method_name == info.method_name
+                      && info2.class_name == info.class_name
+                      && info2.signature == info.signature))
+                {
+                    g_m13_idempotent.store(false, std::memory_order_relaxed);
+                }
+
+                // Method* must be identical on every fire of the same caller.
+                void* const m{ static_cast<void*>(info.method) };
+                void* expected{ g_m13_first_method.load(std::memory_order_relaxed) };
+                if (expected == nullptr)
+                {
+                    g_m13_first_method.store(m, std::memory_order_relaxed);
+                }
+                else if (m != expected)
+                {
+                    g_m13_method_stable.store(false, std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m13_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 13) };
+        ctx.check("rc_m13_probe_completed", done);
+        ctx.check("rc_m13_leaf_ran_thrice", caller_fixture::get_inner_calls() == 3);
+        ctx.check("rc_m13_fired_thrice", g_m13_fires.load() == 3);
+
+        // Every fire of the same interpreted caller resolves identically.
+        ctx.check("rc_m13_every_fire_valid", g_m13_all_valid.load());
+        ctx.check("rc_m13_every_fire_named_stable", g_m13_all_named_stable.load());
+        // The headline: stable identity + stable Method* across repeated fires,
+        // and idempotent within a single fire.
+        ctx.check("rc_m13_method_ptr_stable", g_m13_method_stable.load());
+        ctx.check("rc_m13_caller_idempotent_in_one_fire", g_m13_idempotent.load());
     }
 
     // No detour may be left armed for the next module: every scoped_hook above
