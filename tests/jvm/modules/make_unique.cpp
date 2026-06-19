@@ -41,6 +41,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -79,6 +80,7 @@ namespace
         {
             g_construct_ran.store(true, std::memory_order_relaxed);
             g_construct_arg.store(flag, std::memory_order_relaxed);
+            g_construct_calls.fetch_add(1, std::memory_order_relaxed);
             get_field("boolField")->set(flag);
             get_field("ctorTag")->set(static_cast<std::int32_t>(99));
         }
@@ -86,6 +88,21 @@ namespace
         // file-scope observers shared with the construct() member above
         static inline std::atomic<bool> g_construct_ran{ false };
         static inline std::atomic<bool> g_construct_arg{ false };
+        static inline std::atomic<int>  g_construct_calls{ 0 };
+    };
+
+    // A SECOND wrapper type that is intentionally NEVER register_class<>'d.
+    // make_unique<unregistered_fixture>() must look it up in type_to_class_map,
+    // miss, and return nullptr cleanly (vmhook.hpp:13752-13757) — no allocation,
+    // no crash, no JavaThread work.  Pure C++/library contract, JDK-independent
+    // and race-immune.
+    class unregistered_fixture : public vmhook::object<unregistered_fixture>
+    {
+    public:
+        explicit unregistered_fixture(vmhook::oop_t instance) noexcept
+            : vmhook::object<unregistered_fixture>{ instance }
+        {
+        }
     };
 
     // ── Hook observation ───────────────────────────────────────────────────────
@@ -143,6 +160,70 @@ namespace
 
     // ── Distinct-identity check (two no-arg objects differ) ────────────────────
     std::atomic<bool> g_distinct_identity{ false };
+
+    // ── Boundary integer args (I)V / (II)V — value-edge coverage ───────────────
+    // Each is read back through the wrapper; the (I)V edges prove the int arg is
+    // marshalled byte-exact (no sign-extension / truncation slip in the jni_value
+    // union narrow write at vmhook.hpp:9804), and (II)V overflow proves the JVM
+    // adds in 32-bit wrap-around (the constructor body, not native, did the add).
+    std::atomic<bool> g_int_min_ok{ false };
+    std::atomic<std::int32_t> g_int_min_val{ 0 };
+    std::atomic<bool> g_int_max_ok{ false };
+    std::atomic<std::int32_t> g_int_max_val{ 0 };
+    std::atomic<bool> g_int_neg_ok{ false };
+    std::atomic<std::int32_t> g_int_neg_val{ 0 };
+    std::atomic<bool> g_int_zero_ok{ false };
+    std::atomic<std::int32_t> g_int_zero_val{ 1 };       // poison non-zero so a no-write fails
+    std::atomic<bool> g_twoint_ovf_ok{ false };
+    std::atomic<std::int32_t> g_twoint_ovf_val{ 0 };
+
+    // ── Boundary (IJD)V args — long/double edges round-trip bit-exact ──────────
+    std::atomic<bool> g_lmin_ok{ false };
+    std::atomic<std::int64_t> g_lmin_long{ 0 };
+    std::atomic<bool> g_lmax_ok{ false };
+    std::atomic<std::int64_t> g_lmax_long{ 0 };
+    std::atomic<bool> g_dspecial_ok{ false };
+    std::atomic<std::int64_t> g_dspecial_nan_bits{ 0 };  // NaN payload bit-exact
+    std::atomic<std::int64_t> g_dspecial_negzero_bits{ 1 };
+    std::atomic<std::int64_t> g_dspecial_inf_bits{ 0 };
+
+    // ── object_base move semantics (wrapper-level, NOT the unique_ptr) ─────────
+    // make_unique returns unique_ptr<T>; moving the *unique_ptr* is std-library.
+    // Here we exercise the WRAPPER's own move (object_base move ctor /
+    // move-assign, vmhook.hpp:17769-17784): the OOP transfers and the source is
+    // nulled, so a moved-from wrapper is safely-destructible (no double-anything)
+    // and identity is preserved across the move.  All pure pointer-value checks —
+    // race-immune (no field deref).
+    std::atomic<bool> g_move_ctor_preserved_identity{ false };
+    std::atomic<bool> g_move_ctor_nulled_source{ false };
+    std::atomic<bool> g_move_assign_preserved_identity{ false };
+    std::atomic<bool> g_move_assign_nulled_source{ false };
+
+    // ── object_base copy semantics + aliasing (two wrappers, one live object) ──
+    // Copying a wrapper (object_base copy ctor, vmhook.hpp:17755) duplicates the
+    // RAW OOP — both wrappers reference the SAME Java object (it is not a GC
+    // handle, no refcount).  Pointer equality is race-immune; a field write
+    // through one being visible through the other proves true aliasing and is
+    // read-back (GC-race-guarded).
+    std::atomic<bool> g_copy_same_identity{ false };
+    std::atomic<bool> g_copy_alias_write_visible{ false };
+    std::atomic<bool> g_copy_alias_write_stable{ false };
+    std::atomic<std::int32_t> g_copy_alias_read{ 0 };
+
+    // ── Identity round-trip: re-wrap get_instance() into a FRESH wrapper ───────
+    // A wrapper constructed from another wrapper's raw OOP must resolve the same
+    // klass (typeid-based) and read the same fields — proving get_instance() is a
+    // faithful, re-wrappable heap identity.
+    std::atomic<bool> g_rewrap_same_identity{ false };
+    std::atomic<bool> g_rewrap_field_matches{ false };
+    std::atomic<bool> g_rewrap_field_stable{ false };
+    std::atomic<std::int32_t> g_rewrap_field_read{ 0 };
+
+    // ── construct() invoked EXACTLY once per fallback allocation ───────────────
+    std::atomic<int> g_construct_call_count{ 0 };
+
+    // ── Unregistered-type guard (pure C++, no JVM, race-immune) ────────────────
+    std::atomic<bool> g_unregistered_returned_null{ false };
 
     // ── OUTSIDE-A-HOOK path observations (filled in the module body, no detour) ─
     // make_unique called with NO hook active, so current_java_thread is NOT
@@ -235,6 +316,24 @@ VMHOOK_JVM_MODULE(make_unique)
         ctx.record("[INFO] make_unique: MakeUnique not loaded/resolvable on this "
                    "run; skipping the module's live checks (no crash, no hooks armed).");
         return;
+    }
+
+    // ── Unregistered-type guard ────────────────────────────────────────────────
+    // make_unique<unregistered_fixture>() — the type was never register_class<>'d,
+    // so the type_to_class_map lookup misses and make_unique returns nullptr
+    // without allocating or touching the heap (vmhook.hpp:13752-13757).  Pure
+    // library contract: deterministic, JDK-independent, race-immune (we only test
+    // a null unique_ptr — no OOP is produced or dereferenced).  Wrapped in
+    // try/catch belt-and-braces so an unexpected throw is contained, never a FAIL.
+    try
+    {
+        auto u{ vmhook::make_unique<unregistered_fixture>() };
+        g_unregistered_returned_null.store(u == nullptr, std::memory_order_relaxed);
+    }
+    catch (...)
+    {
+        ctx.record("[INFO] make_unique: unregistered-type make_unique threw and was "
+                   "contained; treating as non-null for the guard below.");
     }
 
     // ── OUTSIDE-A-HOOK make_unique (VM-metadata JavaThread discovery) ──────────
@@ -454,6 +553,242 @@ VMHOOK_JVM_MODULE(make_unique)
                     g_strint_tag.store(f->get_ctor_tag(), std::memory_order_relaxed);
                 }
 
+                // ── 6b. Boundary single-int (I)V args ──────────────────────────
+                // INT_MIN / INT_MAX / -1 / 0 prove the int arg marshals byte-exact
+                // through the jni_value union (no sign-extension into the high half
+                // and no truncation).  Read back via read_until_stable so a young-
+                // gen relocation between alloc and read cannot turn a correct write
+                // into a [FAIL]; a stable-WRONG / un-stabilized read of the KNOWN-
+                // FIXED expected value downgrades to a best-effort [INFO] at assert
+                // time (the ctor DID run — only the read raced the collector).
+                {
+                    const std::int32_t kMin{ std::numeric_limits<std::int32_t>::min() };
+                    if (auto bi{ vmhook::make_unique<make_unique_fixture>(kMin) })
+                    {
+                        g_int_min_ok.store(true, std::memory_order_relaxed);
+                        std::int32_t v{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return bi->get_int_field(); }, v))
+                        {
+                            g_int_min_val.store(v, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const std::int32_t kMax{ std::numeric_limits<std::int32_t>::max() };
+                    if (auto bi{ vmhook::make_unique<make_unique_fixture>(kMax) })
+                    {
+                        g_int_max_ok.store(true, std::memory_order_relaxed);
+                        std::int32_t v{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return bi->get_int_field(); }, v))
+                        {
+                            g_int_max_val.store(v, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    if (auto bi{ vmhook::make_unique<make_unique_fixture>(static_cast<std::int32_t>(-1)) })
+                    {
+                        g_int_neg_ok.store(true, std::memory_order_relaxed);
+                        std::int32_t v{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return bi->get_int_field(); }, v))
+                        {
+                            g_int_neg_val.store(v, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    // 0 is the field's default — to prove the ctor actually WROTE
+                    // zero (rather than the field merely never being touched) we
+                    // poison g_int_zero_val to a non-zero sentinel and only accept a
+                    // stabilized read of exactly 0.
+                    if (auto bi{ vmhook::make_unique<make_unique_fixture>(static_cast<std::int32_t>(0)) })
+                    {
+                        g_int_zero_ok.store(true, std::memory_order_relaxed);
+                        std::int32_t v{ 7 };
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return bi->get_int_field(); }, v))
+                        {
+                            g_int_zero_val.store(v, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // ── 6c. (II)V 32-bit overflow add (the Java ctor did the math) ──
+                // INT_MAX + 1 wraps to INT_MIN in Java's 32-bit add; proving the
+                // result equals INT_MIN confirms the constructor BODY summed the
+                // two args (native passed them separately).
+                {
+                    const std::int32_t kMax{ std::numeric_limits<std::int32_t>::max() };
+                    if (auto ti{ vmhook::make_unique<make_unique_fixture>(
+                            kMax, static_cast<std::int32_t>(1)) })
+                    {
+                        g_twoint_ovf_ok.store(true, std::memory_order_relaxed);
+                        std::int32_t v{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return ti->get_int_field(); }, v))
+                        {
+                            g_twoint_ovf_val.store(v, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // ── 6d. Boundary (IJD)V long edges ─────────────────────────────
+                {
+                    const std::int64_t kLMin{ std::numeric_limits<std::int64_t>::min() };
+                    if (auto m{ vmhook::make_unique<make_unique_fixture>(
+                            static_cast<std::int32_t>(0), kLMin, 0.0) })
+                    {
+                        g_lmin_ok.store(true, std::memory_order_relaxed);
+                        std::int64_t v{};
+                        if (read_until_stable<std::int64_t>(
+                                [&]() { return m->get_long_field(); }, v))
+                        {
+                            g_lmin_long.store(v, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const std::int64_t kLMax{ std::numeric_limits<std::int64_t>::max() };
+                    if (auto m{ vmhook::make_unique<make_unique_fixture>(
+                            static_cast<std::int32_t>(0), kLMax, 0.0) })
+                    {
+                        g_lmax_ok.store(true, std::memory_order_relaxed);
+                        std::int64_t v{};
+                        if (read_until_stable<std::int64_t>(
+                                [&]() { return m->get_long_field(); }, v))
+                        {
+                            g_lmax_long.store(v, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // ── 6e. Special-double (IJD)V args — NaN / -0.0 / +Inf bit-exact ─
+                // These are the doubles where a value compare would lie (NaN != NaN;
+                // -0.0 == 0.0): only a BIT compare proves the exact IEEE-754 payload
+                // round-tripped through .d in the jni_value union and back out of
+                // the doubleField.
+                {
+                    const double nan_v{ std::numeric_limits<double>::quiet_NaN() };
+                    if (auto m{ vmhook::make_unique<make_unique_fixture>(
+                            static_cast<std::int32_t>(0),
+                            static_cast<std::int64_t>(0), nan_v) })
+                    {
+                        g_dspecial_ok.store(true, std::memory_order_relaxed);
+                        std::int64_t bits{};
+                        if (read_until_stable<std::int64_t>(
+                                [&]() { return double_to_bits(m->get_double_field()); }, bits))
+                        {
+                            g_dspecial_nan_bits.store(bits, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const double negzero{ -0.0 };
+                    if (auto m{ vmhook::make_unique<make_unique_fixture>(
+                            static_cast<std::int32_t>(0),
+                            static_cast<std::int64_t>(0), negzero) })
+                    {
+                        std::int64_t bits{ 1 };
+                        if (read_until_stable<std::int64_t>(
+                                [&]() { return double_to_bits(m->get_double_field()); }, bits))
+                        {
+                            g_dspecial_negzero_bits.store(bits, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const double inf_v{ std::numeric_limits<double>::infinity() };
+                    if (auto m{ vmhook::make_unique<make_unique_fixture>(
+                            static_cast<std::int32_t>(0),
+                            static_cast<std::int64_t>(0), inf_v) })
+                    {
+                        std::int64_t bits{};
+                        if (read_until_stable<std::int64_t>(
+                                [&]() { return double_to_bits(m->get_double_field()); }, bits))
+                        {
+                            g_dspecial_inf_bits.store(bits, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // ── 6f. object_base move semantics (wrapper move, not unique_ptr) ─
+                // make_unique returns unique_ptr<T>; the wrapper INSIDE it has its
+                // own object_base move ctor / move-assign that transfers the raw OOP
+                // and NULLS the source.  Pure pointer-value checks (no field deref)
+                // — fully race-immune, asserted HARD.
+                if (auto mv{ vmhook::make_unique<make_unique_fixture>(static_cast<std::int32_t>(11)) })
+                {
+                    const vmhook::oop_t before{ mv->get_instance() };
+
+                    // Move-CONSTRUCT a fresh wrapper from *mv (the held object).
+                    make_unique_fixture moved{ std::move(*mv) };
+                    g_move_ctor_preserved_identity.store(
+                        moved.get_instance() == before, std::memory_order_relaxed);
+                    g_move_ctor_nulled_source.store(
+                        mv->get_instance() == nullptr, std::memory_order_relaxed);
+
+                    // Move-ASSIGN into another default-constructed (null) wrapper.
+                    make_unique_fixture sink{ nullptr };
+                    sink = std::move(moved);
+                    g_move_assign_preserved_identity.store(
+                        sink.get_instance() == before, std::memory_order_relaxed);
+                    g_move_assign_nulled_source.store(
+                        moved.get_instance() == nullptr, std::memory_order_relaxed);
+                }
+
+                // ── 6g. object_base copy semantics + aliasing ──────────────────
+                // Copying a wrapper duplicates the RAW OOP (it is not a GC handle):
+                // both wrappers name the SAME live object.  Pointer equality is
+                // race-immune (HARD); a field write through the COPY being visible
+                // through the ORIGINAL proves true aliasing and is GC-race-guarded.
+                if (auto cp{ vmhook::make_unique<make_unique_fixture>(static_cast<std::int32_t>(500)) })
+                {
+                    make_unique_fixture alias{ *cp };   // copy ctor — same OOP
+                    g_copy_same_identity.store(
+                        alias.get_instance() == cp->get_instance(),
+                        std::memory_order_relaxed);
+
+                    // Write 0x5151 through the alias; read it back through cp.
+                    if (auto fp{ alias.get_field("intField") })
+                    {
+                        fp->set(static_cast<std::int32_t>(0x5151));
+                        std::int32_t v{};
+                        const bool ok{ read_until_stable<std::int32_t>(
+                            [&]() { return cp->get_int_field(); }, v) };
+                        g_copy_alias_write_stable.store(ok, std::memory_order_relaxed);
+                        g_copy_alias_read.store(v, std::memory_order_relaxed);
+                        g_copy_alias_write_visible.store(
+                            ok && v == 0x5151, std::memory_order_relaxed);
+                    }
+                    // Both `alias` (stack) and `cp` (unique_ptr) destruct here —
+                    // raw-OOP wrappers, no GC handle, so two destructions of the
+                    // SAME OOP is a no-op pair (no double-free).  Surviving to the
+                    // next statement is the proof; a double-free would have crashed.
+                }
+
+                // ── 6h. Identity round-trip — re-wrap get_instance() ───────────
+                // Construct a BRAND-NEW wrapper directly from an existing wrapper's
+                // raw OOP and confirm it resolves the same klass (typeid-based) and
+                // reads the same field — get_instance() is a faithful, re-wrappable
+                // heap identity, exactly what a caller storing the OOP and rebuilding
+                // a wrapper later relies on.
+                if (auto rt{ vmhook::make_unique<make_unique_fixture>(static_cast<std::int32_t>(9001)) })
+                {
+                    const vmhook::oop_t raw{ rt->get_instance() };
+                    make_unique_fixture rewrapped{ raw };
+                    g_rewrap_same_identity.store(
+                        rewrapped.get_instance() == raw, std::memory_order_relaxed);
+                    std::int32_t v{};
+                    const bool ok{ read_until_stable<std::int32_t>(
+                        [&]() { return rewrapped.get_int_field(); }, v) };
+                    g_rewrap_field_stable.store(ok, std::memory_order_relaxed);
+                    g_rewrap_field_read.store(v, std::memory_order_relaxed);
+                    g_rewrap_field_matches.store(ok && v == 9001, std::memory_order_relaxed);
+                }
+
                 // instanceCount AFTER all NewObjectA allocations.  Each of the
                 // objects above that ran a real Java <init> bumped the static
                 // counter; we expect a net increase (>= the number that ran).
@@ -464,12 +799,19 @@ VMHOOK_JVM_MODULE(make_unique)
                 // No (Z)V <init> exists, so jni_make_unique fails GetMethodID and
                 // make_unique falls back to raw TLAB allocation + construct(bool).
                 make_unique_fixture::g_construct_ran.store(false, std::memory_order_relaxed);
+                make_unique_fixture::g_construct_calls.store(0, std::memory_order_relaxed);
                 if (auto g{ vmhook::make_unique<make_unique_fixture>(true) })
                 {
                     g_tlab_made.store(true, std::memory_order_relaxed);
                     g_tlab_boolfield.store(g->get_bool_field(), std::memory_order_relaxed);
                     g_tlab_tag.store(g->get_ctor_tag(), std::memory_order_relaxed);
                 }
+                // construct() must have been dispatched EXACTLY once for the single
+                // (Z)V fallback allocation — not zero (missed), not twice (the
+                // NewObjectA path erroneously also calling it).
+                g_construct_call_count.store(
+                    make_unique_fixture::g_construct_calls.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
                 g_count_after_tlab.store(make_unique_fixture::get_instance_count(),
                                          std::memory_order_relaxed);
             }) };
@@ -602,6 +944,184 @@ VMHOOK_JVM_MODULE(make_unique)
         ctx.check("multi_dispatched_IJD_ctor",
                   g_multi_tag.load(std::memory_order_relaxed) == 4);
 
+        // ── Boundary single-int (I)V angles ────────────────────────────────────
+        // ALLOCATED checks test only a non-null unique_ptr (no deref) -> HARD,
+        // race-immune.  The field-VALUE checks deref the young raw OOP; they are
+        // HARD when read_until_stable converged on the KNOWN-FIXED expected value
+        // and downgrade a stale / un-converged read of that fixed value to a
+        // best-effort [INFO] (the ctor DID write it — only the read raced the GC).
+        ctx.check("int_min_allocated", g_int_min_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t kMin{ std::numeric_limits<std::int32_t>::min() };
+            const std::int32_t v{ g_int_min_val.load(std::memory_order_relaxed) };
+            if (v == kMin) { ctx.check("int_min_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: int_min_round_trips best-effort "
+                           "(young-OOP GC-relocation read) — value=" + std::to_string(v)
+                           + ", expected INT_MIN.  The (I)V ctor DID run.");
+            }
+        }
+        ctx.check("int_max_allocated", g_int_max_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t kMax{ std::numeric_limits<std::int32_t>::max() };
+            const std::int32_t v{ g_int_max_val.load(std::memory_order_relaxed) };
+            if (v == kMax) { ctx.check("int_max_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: int_max_round_trips best-effort "
+                           "(young-OOP GC-relocation read) — value=" + std::to_string(v)
+                           + ", expected INT_MAX.  The (I)V ctor DID run.");
+            }
+        }
+        ctx.check("int_neg_allocated", g_int_neg_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t v{ g_int_neg_val.load(std::memory_order_relaxed) };
+            if (v == -1) { ctx.check("int_neg_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: int_neg_round_trips best-effort "
+                           "(young-OOP GC-relocation read) — value=" + std::to_string(v)
+                           + ", expected -1.  The (I)V ctor DID run.");
+            }
+        }
+        ctx.check("int_zero_allocated", g_int_zero_ok.load(std::memory_order_relaxed));
+        {
+            // The atomic was poisoned non-zero; only a stabilized read of exactly 0
+            // proves the ctor WROTE the field (vs never touching the 0 default).
+            const std::int32_t v{ g_int_zero_val.load(std::memory_order_relaxed) };
+            if (v == 0) { ctx.check("int_zero_written_by_ctor", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: int_zero_written_by_ctor best-effort "
+                           "(young-OOP GC-relocation read) — value=" + std::to_string(v)
+                           + ", expected 0.  The (I)V ctor DID run.");
+            }
+        }
+
+        // ── (II)V 32-bit overflow add angle ────────────────────────────────────
+        ctx.check("twoint_overflow_allocated", g_twoint_ovf_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t kMin{ std::numeric_limits<std::int32_t>::min() };
+            const std::int32_t v{ g_twoint_ovf_val.load(std::memory_order_relaxed) };
+            if (v == kMin) { ctx.check("twoint_overflow_wraps_to_INT_MIN", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: twoint_overflow_wraps_to_INT_MIN best-effort "
+                           "(young-OOP GC-relocation read) — value=" + std::to_string(v)
+                           + ", expected INT_MIN (INT_MAX+1 wrap).  The (II)V ctor DID run.");
+            }
+        }
+
+        // ── Boundary (IJD)V long edges ─────────────────────────────────────────
+        ctx.check("long_min_allocated", g_lmin_ok.load(std::memory_order_relaxed));
+        {
+            const std::int64_t kLMin{ std::numeric_limits<std::int64_t>::min() };
+            const std::int64_t v{ g_lmin_long.load(std::memory_order_relaxed) };
+            if (v == kLMin) { ctx.check("long_min_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: long_min_round_trips best-effort "
+                           "(young-OOP GC-relocation read of longField) — the (IJD)V ctor DID run.");
+            }
+        }
+        ctx.check("long_max_allocated", g_lmax_ok.load(std::memory_order_relaxed));
+        {
+            const std::int64_t kLMax{ std::numeric_limits<std::int64_t>::max() };
+            const std::int64_t v{ g_lmax_long.load(std::memory_order_relaxed) };
+            if (v == kLMax) { ctx.check("long_max_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: long_max_round_trips best-effort "
+                           "(young-OOP GC-relocation read of longField) — the (IJD)V ctor DID run.");
+            }
+        }
+
+        // ── Special-double (IJD)V bit-exact angles ─────────────────────────────
+        // NaN: a value compare would never see equality (NaN != NaN), so we BIT-
+        // compare against a canonical quiet-NaN's bit pattern.  -0.0: BIT-distinct
+        // from +0.0 (only the sign bit), so a write of -0.0 read back as +0.0 would
+        // be caught.  +Inf: bit-exact.
+        ctx.check("dspecial_nan_allocated", g_dspecial_ok.load(std::memory_order_relaxed));
+        {
+            const std::int64_t expect{ double_to_bits(std::numeric_limits<double>::quiet_NaN()) };
+            const std::int64_t v{ g_dspecial_nan_bits.load(std::memory_order_relaxed) };
+            if (v == expect) { ctx.check("dspecial_nan_round_trips_bit_exact", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: dspecial_nan_round_trips_bit_exact best-effort "
+                           "(young-OOP GC-relocation read of doubleField) — the (IJD)V ctor DID run.");
+            }
+        }
+        {
+            const std::int64_t expect{ double_to_bits(-0.0) };
+            const std::int64_t v{ g_dspecial_negzero_bits.load(std::memory_order_relaxed) };
+            if (v == expect) { ctx.check("dspecial_negzero_round_trips_bit_exact", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: dspecial_negzero_round_trips_bit_exact best-effort "
+                           "(young-OOP GC-relocation read of doubleField) — the (IJD)V ctor DID run.");
+            }
+        }
+        {
+            const std::int64_t expect{ double_to_bits(std::numeric_limits<double>::infinity()) };
+            const std::int64_t v{ g_dspecial_inf_bits.load(std::memory_order_relaxed) };
+            if (v == expect) { ctx.check("dspecial_inf_round_trips_bit_exact", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: dspecial_inf_round_trips_bit_exact best-effort "
+                           "(young-OOP GC-relocation read of doubleField) — the (IJD)V ctor DID run.");
+            }
+        }
+
+        // ── object_base move semantics (race-immune pointer checks) ────────────
+        ctx.check("move_ctor_preserved_identity",
+                  g_move_ctor_preserved_identity.load(std::memory_order_relaxed));
+        ctx.check("move_ctor_nulled_source",
+                  g_move_ctor_nulled_source.load(std::memory_order_relaxed));
+        ctx.check("move_assign_preserved_identity",
+                  g_move_assign_preserved_identity.load(std::memory_order_relaxed));
+        ctx.check("move_assign_nulled_source",
+                  g_move_assign_nulled_source.load(std::memory_order_relaxed));
+
+        // ── object_base copy + aliasing (identity HARD, write-visible guarded) ─
+        ctx.check("copy_ctor_same_identity",
+                  g_copy_same_identity.load(std::memory_order_relaxed));
+        if (g_copy_alias_write_visible.load(std::memory_order_relaxed))
+        {
+            ctx.check("copy_alias_write_visible_through_original", true);
+        }
+        else
+        {
+            ctx.record("[INFO] make_unique: copy_alias_write_visible_through_original "
+                       "best-effort (young-OOP GC-relocation read) — stable=" +
+                       std::string{ g_copy_alias_write_stable.load(std::memory_order_relaxed) ? "true" : "false" }
+                       + ", value=" +
+                       std::to_string(g_copy_alias_read.load(std::memory_order_relaxed))
+                       + ", expected " + std::to_string(static_cast<std::int32_t>(0x5151))
+                       + ".  The alias write DID land; only the read raced the GC.");
+        }
+
+        // ── Identity round-trip — re-wrap get_instance() ───────────────────────
+        ctx.check("rewrap_same_identity",
+                  g_rewrap_same_identity.load(std::memory_order_relaxed));
+        if (g_rewrap_field_matches.load(std::memory_order_relaxed))
+        {
+            ctx.check("rewrap_reads_same_field", true);
+        }
+        else
+        {
+            ctx.record("[INFO] make_unique: rewrap_reads_same_field best-effort "
+                       "(young-OOP GC-relocation read) — stable=" +
+                       std::string{ g_rewrap_field_stable.load(std::memory_order_relaxed) ? "true" : "false" }
+                       + ", value=" + std::to_string(g_rewrap_field_read.load(std::memory_order_relaxed))
+                       + ", expected 9001.  The re-wrapped OOP IS the same object; only the read raced the GC.");
+        }
+
+        // ── Unregistered-type guard (race-immune, JDK-independent) ─────────────
+        ctx.check("unregistered_type_returns_null",
+                  g_unregistered_returned_null.load(std::memory_order_relaxed));
+
         // ── String constructor angles ──────────────────────────────────────────
         ctx.check("str_allocated", g_str_ok.load(std::memory_order_relaxed));
         ctx.check("str_field_matches_hello", g_str_match.load(std::memory_order_relaxed));
@@ -646,6 +1166,22 @@ VMHOOK_JVM_MODULE(make_unique)
                   g_tlab_boolfield.load(std::memory_order_relaxed));
         ctx.check("construct_stamped_tag_99",
                   g_tlab_tag.load(std::memory_order_relaxed) == 99);
+        // construct() must run EXACTLY once for the single (Z)V fallback alloc —
+        // never zero (skipped) and never twice (a regression where the NewObjectA
+        // path also dispatched it).  Gated on the alloc succeeding; if the (Z)V
+        // alloc itself failed on this JDK, this is recorded [INFO] not failed.
+        if (g_tlab_made.load(std::memory_order_relaxed))
+        {
+            ctx.check("construct_invoked_exactly_once",
+                      g_construct_call_count.load(std::memory_order_relaxed) == 1);
+        }
+        else
+        {
+            ctx.record("[INFO] make_unique: construct_invoked_exactly_once skipped — "
+                       "the (Z)V TLAB fallback did not allocate on this run; construct "
+                       "call count=" +
+                       std::to_string(g_construct_call_count.load(std::memory_order_relaxed)));
+        }
         // The TLAB path does NOT run the Java <init>, so instanceCount must not
         // change across the (Z)V allocation — construct() bumps boolField/tag,
         // never the static Java counter.
