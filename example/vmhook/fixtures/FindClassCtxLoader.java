@@ -68,20 +68,6 @@ public final class FindClassCtxLoader
     public static volatile int secondaryTicks;
 
     /**
-     * Scenario selector the native side sets on the rising edge of {@code go}
-     * (mode 0 = ordinary reanchor pass; mode 1 = GC-churn pass that drives a few
-     * {@link System#gc()} rounds BEFORE dispatching {@link #anchorTick()} again, so
-     * the native detour re-exercises {@code find_class_via_oop(self, ...)} on a live
-     * anchor after a (possibly relocating) collection).  The GC pass is only ever
-     * driven on non-Windows toolchains by the native module (the forced-GC platform
-     * gate), so mode stays 0 on Windows.
-     */
-    public static volatile int mode;
-
-    /** How many {@link System#gc()} rounds the GC-churn pass has driven. */
-    public static volatile int gcRounds;
-
-    /**
      * A distinctive known-value static field on this APP-loaded class.  The native
      * side resolves this field's entry through the context-loader-resolved klass
      * (proving the klass is genuinely usable for member access, not merely
@@ -132,25 +118,6 @@ public final class FindClassCtxLoader
             @Override
             public void run()
             {
-                // Mode 1: drive a handful of collections (with young-gen churn) so a
-                // relocating collector has every chance to MOVE live objects before
-                // the native detour re-resolves classes through the live anchor.  The
-                // anchorTick() dispatch below then runs post-GC on a live JavaThread,
-                // so find_class_via_oop(self, ...) is exercised across a collection.
-                if (FindClassCtxLoader.mode == 1)
-                {
-                    for (int round = 0; round < 4; round++)
-                    {
-                        final byte[] churn = new byte[1 << 16];
-                        if (churn.length != (1 << 16))
-                        {
-                            throw new IllegalStateException("unreachable");
-                        }
-                        System.gc();
-                        FindClassCtxLoader.gcRounds++;
-                    }
-                }
-
                 // Real bytecode dispatch the native scoped_hook rides.  Inside the
                 // anchorTick() detour the native side has a live JavaThread (whose
                 // context loader is this app loader) AND a live `self` instance to
