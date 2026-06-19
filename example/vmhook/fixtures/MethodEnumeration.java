@@ -160,6 +160,51 @@ public final class MethodEnumeration
         return a + (long) b;
     }
 
+    // =======================================================================
+    // Nested static class: a same-NAME overload set + a TWO-way descriptor
+    // collision, purpose-built for the descriptor-hook resolution axis that the
+    // top-level class does NOT exercise (it has no same-name overloads, and its
+    // smallest descriptor collision is the 3-way (I)I / 6-way ()V — never the
+    // minimal size()==2 boundary that hook_by_signature's "ambiguous" branch
+    // turns on).  Resolved by its internal `$`-name; force-loaded via the ANCHOR
+    // below (the harness loader only Class.forName's the TOP-LEVEL fixture, so a
+    // nested klass must be referenced to be loaded).  None of these methods is
+    // ever DISPATCHED by the probe — the native side reads their enumeration and
+    // installs (never-firing) signature hooks on the unique descriptors only.
+    public static final class Overloads
+    {
+        // ---- Same-NAME overloads: one name `pick`, FOUR distinct descriptors.
+        //      Proves descriptor-uniqueness coexists with name-collision: the
+        //      name rotates per obfuscated build, the descriptor does not.
+        /** (I)I — pick overload #1. */
+        public int pick(final int a)                     { return a; }
+        /** (II)I — pick overload #2 (arity discriminator). */
+        public int pick(final int a, final int b)        { return a + b; }
+        /** (J)I — pick overload #3 (arg-WIDTH discriminator, same arity as #1). */
+        public int pick(final long a)                    { return (int) a; }
+        /** (IJ)I — pick overload #4 (mixed two-slot). */
+        public int pick(final int a, final long b)       { return a + (int) b; }
+
+        // ---- TWO-way descriptor collision: two DIFFERENT names, SAME ()I.
+        //      The MINIMAL size()>1 case hook_by_signature must REFUSE.
+        /** ()I — collides with beta. */
+        public int alpha()                               { return 1; }
+        /** ()I — collides with alpha. */
+        public int beta()                                { return 2; }
+
+        // ---- Genuinely-unique descriptors (instance + static) for the
+        //      accept-on-unique install path; never dispatched, so a leaked
+        //      persistent hook is harmless.
+        /** (D)V — unique (double arg, void return). */
+        public void solo(final double d)                 { }
+        /** ()J — unique static (no-arg long return). */
+        public static long sSolo()                       { return 0L; }
+    }
+
+    // Force-load anchor: referencing Overloads.class loads the nested klass at
+    // this class's <clinit> time so find_class("...$Overloads") resolves it.
+    static final Class<?> ANCHOR_OVERLOADS = Overloads.class;
+
     // ---- Probe dispatch ---------------------------------------------------
 
     private static void runIdLong()

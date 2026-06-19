@@ -162,12 +162,27 @@ namespace
         }
     };
 
+    // Wrapper for the nested vmhook.fixtures.MethodEnumeration$Overloads class
+    // (PART J-M).  Registered by its internal `$`-name so the by-TYPE overloads
+    // resolve it.  None of its methods is ever DISPATCHED — the module reads its
+    // enumeration and installs (never-firing) signature hooks on its unique
+    // descriptors only, so a leaked persistent hook is harmless.
+    class me_overloads : public vmhook::object<me_overloads>
+    {
+    public:
+        explicit me_overloads(vmhook::oop_t instance) noexcept
+            : vmhook::object<me_overloads>{ instance }
+        {
+        }
+    };
+
     // ---- Fixture-mirrored constants (lockstep with MethodEnumeration.java) --
     constexpr std::int32_t SEED{ 7 };
     constexpr std::int64_t IDLONG_ARG{ 0x0102030405060708LL };
     constexpr std::int32_t IDINT_ARG{ 1234 };
 
     constexpr char CLASS_NAME[]{ "vmhook/fixtures/MethodEnumeration" };
+    constexpr char OVERLOADS_NAME[]{ "vmhook/fixtures/MethodEnumeration$Overloads" };
 
     // ---- (J)J hook observations (the unique-descriptor install/fire target) -
     std::atomic<std::int32_t> g_jj_fire_count{ 0 };
@@ -253,8 +268,9 @@ VMHOOK_JVM_MODULE(method_enumeration)
         ctx.record(std::string{ "[INFO] method_enumeration checkpoint: " } + where);
     };
 
-    cp("register_class<me_fixture>");
+    cp("register_class<me_fixture> + <me_overloads>");
     vmhook::register_class<me_fixture>("vmhook/fixtures/MethodEnumeration");
+    vmhook::register_class<me_overloads>(OVERLOADS_NAME);
 
     // =====================================================================
     // PART A — get_class_methods<T>(): the real declared (name, descriptor) set.
@@ -704,6 +720,301 @@ VMHOOK_JVM_MODULE(method_enumeration)
             {
             }) };
         ctx.check("hook_by_sig_unique_static_JDJ_installed_true", installed);
+    }
+
+    // =====================================================================
+    // PART J — OVERLOADS: one NAME, many DESCRIPTORS (nested $Overloads class).
+    //   The top-level fixture has zero same-name overloads, so this is the only
+    //   place the enumeration's "name collides, descriptor disambiguates" axis is
+    //   exercised end-to-end through BOTH public read overloads.  Pure metaspace
+    //   metadata (by-name + by-type) -> no oop deref -> HARD.
+    // =====================================================================
+    cp("PART J overload enumeration ($Overloads — metaspace metadata, no deref)");
+    const std::vector<std::pair<std::string, std::string>> ov_by_type{
+        vmhook::get_class_methods<me_overloads>() };
+    const std::vector<std::pair<std::string, std::string>> ov_by_name{
+        vmhook::get_class_methods(OVERLOADS_NAME) };
+
+    ctx.record(std::string{ "[INFO] $Overloads get_class_methods<T>() returned " }
+               + std::to_string(ov_by_type.size()) + " method(s)");
+
+    // The nested class must have loaded (force-load anchor in the fixture).  If a
+    // JDK/loader quirk left it unloaded, BOTH overloads return empty and the
+    // remaining PART-J/K/L checks would be vacuous — so gate the whole block on a
+    // single HARD non-empty assertion that pins "the nested klass resolved".
+    ctx.check("ov_by_type_nonempty", !ov_by_type.empty());
+    ctx.check("ov_by_name_nonempty", !ov_by_name.empty());
+
+    // by-NAME agrees with by-TYPE on the nested class too (same size + multiset).
+    ctx.check("ov_by_name_same_size_as_by_type",
+              ov_by_name.size() == ov_by_type.size());
+    bool ov_name_eq_type{ true };
+    for (const std::pair<std::string, std::string>& m : ov_by_type)
+    {
+        if (count_pair(ov_by_name, m.first, m.second)
+            != count_pair(ov_by_type, m.first, m.second))
+        {
+            ov_name_eq_type = false;
+            break;
+        }
+    }
+    ctx.check("ov_by_name_matches_by_type_each_pair", ov_name_eq_type);
+
+    // The same NAME `pick` appears FOUR times, each with a DISTINCT descriptor
+    // (overload set).  This is the introspection invariant obfuscation can't
+    // perturb: HotSpot keeps every overload as its own Method* in _methods.
+    ctx.check("ov_pick_name_count_4",
+              std::count_if(ov_by_type.begin(), ov_by_type.end(),
+                            [](const std::pair<std::string, std::string>& m)
+                            { return m.first == "pick"; }) == 4);
+    ctx.check("ov_pick_II_unique",  count_pair(ov_by_type, "pick", "(I)I")  == 1);
+    ctx.check("ov_pick_III_unique", count_pair(ov_by_type, "pick", "(II)I") == 1);
+    ctx.check("ov_pick_JI_unique",  count_pair(ov_by_type, "pick", "(J)I")  == 1);
+    ctx.check("ov_pick_IJI_unique", count_pair(ov_by_type, "pick", "(IJ)I") == 1);
+
+    // The two-way descriptor collision: alpha + beta, two NAMES, ONE descriptor.
+    ctx.check("ov_alpha_retI",  count_pair(ov_by_type, "alpha", "()I") == 1);
+    ctx.check("ov_beta_retI",   count_pair(ov_by_type, "beta",  "()I") == 1);
+    ctx.check("ov_retI_collision_2", count_descriptor(ov_by_type, "()I") == 2);
+
+    // Unique instance + static descriptors on the nested class.
+    ctx.check("ov_solo_DV_unique", count_pair(ov_by_type, "solo",  "(D)V") == 1);
+    ctx.check("ov_sSolo_retJ_unique", count_pair(ov_by_type, "sSolo", "()J") == 1);
+    ctx.check("ov_solo_DV_descr_unique", count_descriptor(ov_by_type, "(D)V") == 1);
+    ctx.check("ov_sSolo_retJ_descr_unique", count_descriptor(ov_by_type, "()J") == 1);
+
+    // Synthetic <init> ()V present (every nested instance class has one); the
+    // nested class has NO static initializer, so <clinit> is recorded [INFO]
+    // only (its presence is a JDK/javac choice we must not HARD-assert).
+    ctx.check("ov_includes_synthetic_init",
+              count_pair(ov_by_type, "<init>", "()V") >= 1);
+    ctx.record(std::string{ "[INFO] $Overloads <clinit> present: " }
+               + (has_name(ov_by_type, "<clinit>") ? "yes" : "no"));
+
+    // Inherited java.lang.Object methods still excluded on the nested class.
+    ctx.check("ov_excludes_inherited_toString", !has_name(ov_by_type, "toString"));
+    ctx.check("ov_excludes_inherited_equals",   !has_name(ov_by_type, "equals"));
+
+    // No empty pair; every descriptor well-formed (same hygiene as PART A).
+    ctx.check("ov_no_empty_name_or_descriptor",
+              std::none_of(ov_by_type.begin(), ov_by_type.end(),
+                           [](const std::pair<std::string, std::string>& m)
+                           { return m.first.empty() || m.second.empty(); }));
+    ctx.check("ov_all_descriptors_wellformed",
+              std::all_of(ov_by_type.begin(), ov_by_type.end(),
+                          [](const std::pair<std::string, std::string>& m)
+                          { return !m.second.empty() && m.second.front() == '('
+                                   && m.second.find(')') != std::string::npos; }));
+
+    // HARD lower bound: 4 pick overloads + alpha + beta + solo + sSolo + <init> = 9
+    // (any extra JDK synthetic only grows it — upper bound deliberately open).
+    ctx.check("ov_total_at_least_9", ov_by_type.size() >= 9);
+
+    // =====================================================================
+    // PART K — find_methods_by_signature<me_overloads>: per-overload selection.
+    //   Each overload's UNIQUE descriptor resolves to exactly {pick} (the SAME
+    //   name for four different descriptors); the ()I collision resolves to BOTH
+    //   {alpha, beta}.  Metaspace filter, no oop deref -> HARD.
+    // =====================================================================
+    cp("PART K find_methods_by_signature<$Overloads> per-overload");
+    {
+        const std::vector<std::string> p1{ vmhook::find_methods_by_signature<me_overloads>("(I)I") };
+        ctx.check("ov_find_II_is_pick",  p1.size() == 1 && p1.front() == "pick");
+        const std::vector<std::string> p2{ vmhook::find_methods_by_signature<me_overloads>("(II)I") };
+        ctx.check("ov_find_III_is_pick", p2.size() == 1 && p2.front() == "pick");
+        const std::vector<std::string> p3{ vmhook::find_methods_by_signature<me_overloads>("(J)I") };
+        ctx.check("ov_find_JI_is_pick",  p3.size() == 1 && p3.front() == "pick");
+        const std::vector<std::string> p4{ vmhook::find_methods_by_signature<me_overloads>("(IJ)I") };
+        ctx.check("ov_find_IJI_is_pick", p4.size() == 1 && p4.front() == "pick");
+
+        // The minimal multi-match: exactly TWO names share ()I.
+        const std::vector<std::string> c{ vmhook::find_methods_by_signature<me_overloads>("()I") };
+        ctx.check("ov_find_retI_size_2", c.size() == 2);
+        ctx.check("ov_find_retI_has_alpha",
+                  std::find(c.begin(), c.end(), "alpha") != c.end());
+        ctx.check("ov_find_retI_has_beta",
+                  std::find(c.begin(), c.end(), "beta") != c.end());
+
+        const std::vector<std::string> sd{ vmhook::find_methods_by_signature<me_overloads>("(D)V") };
+        ctx.check("ov_find_DV_is_solo", sd.size() == 1 && sd.front() == "solo");
+        const std::vector<std::string> ss{ vmhook::find_methods_by_signature<me_overloads>("()J") };
+        ctx.check("ov_find_retJ_is_sSolo", ss.size() == 1 && ss.front() == "sSolo");
+
+        // Negative: the top-level fixture's (J)J does NOT exist on $Overloads.
+        ctx.check("ov_find_JJ_empty",
+                  vmhook::find_methods_by_signature<me_overloads>("(J)J").empty());
+
+        // find AGREES with the enumeration multiplicities on the nested class.
+        ctx.check("ov_find_II_eq_enum",   p1.size() == count_descriptor(ov_by_type, "(I)I"));
+        ctx.check("ov_find_retI_eq_enum", c.size()  == count_descriptor(ov_by_type, "()I"));
+        ctx.check("ov_find_DV_eq_enum",   sd.size() == count_descriptor(ov_by_type, "(D)V"));
+    }
+
+    // =====================================================================
+    // PART L — hook_by_signature<me_overloads>: the size()==2 REFUSE boundary
+    //   and the per-overload ACCEPT path.  Every method here is NEVER dispatched
+    //   (no probe), so NO detour ever runs and NO oop is dereferenced -> these
+    //   are pure resolution decisions, crash-proof even on a no-SEH toolchain.
+    //   The accepted installs are persistent (flaw #5) but harmless: the JVM
+    //   exits right after and nothing ever calls these methods.
+    // =====================================================================
+    cp("PART L hook_by_signature<$Overloads> — size==2 refuse + per-overload accept");
+    {
+        // REFUSE on the MINIMAL multi-match (exactly two methods share ()I).
+        // This is the smallest size()>1 the "ambiguous" branch can see — the
+        // top-level (I)I (3) and ()V (>=6) collisions never pin the 2 boundary.
+        std::atomic<std::int32_t> retI_fire{ 0 };
+        const bool refused_2way{ vmhook::hook_by_signature<me_overloads>(
+            "()I",
+            [&retI_fire](vmhook::return_value&,
+                         const std::unique_ptr<me_overloads>&)
+            {
+                retI_fire.fetch_add(1, std::memory_order_relaxed);
+            }) };
+        ctx.check("ov_hook_retI_2way_refused_false", refused_2way == false);
+        ctx.check("ov_hook_retI_2way_nothing_fired", retI_fire.load() == 0);
+
+        // ACCEPT on each UNIQUE overload descriptor — install success is decided
+        // purely by descriptor uniqueness, across arity (II/III) and width (J/IJ)
+        // variants of the SAME name `pick`, plus a void/double and a static.
+        const bool acc_III{ vmhook::hook_by_signature<me_overloads>(
+            "(II)I",
+            [](vmhook::return_value&, const std::unique_ptr<me_overloads>&,
+               std::int32_t, std::int32_t) { }) };
+        ctx.check("ov_hook_pick_III_installed_true", acc_III);
+
+        const bool acc_JI{ vmhook::hook_by_signature<me_overloads>(
+            "(J)I",
+            [](vmhook::return_value&, const std::unique_ptr<me_overloads>&,
+               std::int64_t) { }) };
+        ctx.check("ov_hook_pick_JI_installed_true", acc_JI);
+
+        const bool acc_IJI{ vmhook::hook_by_signature<me_overloads>(
+            "(IJ)I",
+            [](vmhook::return_value&, const std::unique_ptr<me_overloads>&,
+               std::int32_t, std::int64_t) { }) };
+        ctx.check("ov_hook_pick_IJI_installed_true", acc_IJI);
+
+        const bool acc_DV{ vmhook::hook_by_signature<me_overloads>(
+            "(D)V",
+            [](vmhook::return_value&, const std::unique_ptr<me_overloads>&,
+               double) { }) };
+        ctx.check("ov_hook_solo_DV_installed_true", acc_DV);
+
+        // Static unique: the detour omits `self` (static-method convention).
+        const bool acc_sJ{ vmhook::hook_by_signature<me_overloads>(
+            "()J",
+            [](vmhook::return_value&) { }) };
+        ctx.check("ov_hook_sSolo_retJ_installed_true", acc_sJ);
+
+        // A unique descriptor `pick` (I)I IS hookable on $Overloads even though
+        // (I)I is a 3-way collision on the TOP-LEVEL fixture — uniqueness is
+        // per-class, proving the resolver scopes to the right klass.
+        const bool acc_II_here{ vmhook::hook_by_signature<me_overloads>(
+            "(I)I",
+            [](vmhook::return_value&, const std::unique_ptr<me_overloads>&,
+               std::int32_t) { }) };
+        ctx.check("ov_hook_pick_II_installed_true_per_class", acc_II_here);
+
+        // REFUSE on a descriptor nothing on $Overloads declares (no-match path).
+        const bool refused_absent{ vmhook::hook_by_signature<me_overloads>(
+            "(J)J",
+            [](vmhook::return_value&, const std::unique_ptr<me_overloads>&,
+               std::int64_t) { }) };
+        ctx.check("ov_hook_absent_JJ_refused_false", refused_absent == false);
+    }
+
+    // =====================================================================
+    // PART M — top-level fixture: install-on-UNIQUE across MORE descriptor
+    //   shapes than PART E/I, plus enum<->find consistency over EVERY unique
+    //   descriptor and by-name resolution-robustness negatives.
+    //
+    //   These installs target genuinely-unique TOP-LEVEL methods that the probe
+    //   NEVER dispatches (mode 1 = idLong only, mode 2 = idInt only), so the
+    //   detours never run — no oop deref, crash-proof.  Persistent (flaw #5) but
+    //   harmless (JVM exits; nothing calls strLen/sumArr/mix/flag/makeObj).
+    // =====================================================================
+    cp("PART M install-on-unique (more shapes) + enum/find consistency + name negatives");
+    {
+        // Reference-arg unique descriptor (String -> a std::string detour arg,
+        // matching the library's reference-decode convention).
+        const bool acc_strI{ vmhook::hook_by_signature<me_fixture>(
+            "(Ljava/lang/String;)I",
+            [](vmhook::return_value&, const std::unique_ptr<me_fixture>&,
+               const std::string&) { }) };
+        ctx.check("hook_by_sig_strLen_strI_installed_true", acc_strI);
+
+        // Array-arg unique descriptor (int[] -> a wrapper unique_ptr arg).
+        const bool acc_arr{ vmhook::hook_by_signature<me_fixture>(
+            "([I)I",
+            [](vmhook::return_value&, const std::unique_ptr<me_fixture>&,
+               const std::unique_ptr<me_fixture>&) { }) };
+        ctx.check("hook_by_sig_sumArr_arrII_installed_true", acc_arr);
+
+        // Multi-slot (int+long+double) unique descriptor.
+        const bool acc_mix{ vmhook::hook_by_signature<me_fixture>(
+            "(IJD)D",
+            [](vmhook::return_value&, const std::unique_ptr<me_fixture>&,
+               std::int32_t, std::int64_t, double) { }) };
+        ctx.check("hook_by_sig_mix_IJDD_installed_true", acc_mix);
+
+        // Boolean-return unique descriptor.
+        const bool acc_flag{ vmhook::hook_by_signature<me_fixture>(
+            "()Z",
+            [](vmhook::return_value&, const std::unique_ptr<me_fixture>&) { }) };
+        ctx.check("hook_by_sig_flag_Z_installed_true", acc_flag);
+
+        // Reference-return unique descriptor.
+        const bool acc_obj{ vmhook::hook_by_signature<me_fixture>(
+            "()Ljava/lang/Object;",
+            [](vmhook::return_value&, const std::unique_ptr<me_fixture>&) { }) };
+        ctx.check("hook_by_sig_makeObj_objret_installed_true", acc_obj);
+    }
+
+    // enum <-> find consistency over EVERY unique top-level descriptor (PART D
+    // only cross-checked JJ/II/V).  For each, find size == count_descriptor and
+    // the single returned name carries that exact descriptor in the pair list.
+    {
+        const auto consistent = [&](const char* desc, const char* expect_name) -> bool
+        {
+            const std::vector<std::string> got{
+                vmhook::find_methods_by_signature<me_fixture>(desc) };
+            return got.size() == count_descriptor(by_type, desc)
+                   && got.size() == 1 && got.front() == expect_name
+                   && count_pair(by_type, expect_name, desc) == 1;
+        };
+        ctx.check("consistency_strI_strLen",  consistent("(Ljava/lang/String;)I", "strLen"));
+        ctx.check("consistency_arrII_sumArr", consistent("([I)I", "sumArr"));
+        ctx.check("consistency_IJDD_mix",     consistent("(IJD)D", "mix"));
+        ctx.check("consistency_Z_flag",       consistent("()Z", "flag"));
+        ctx.check("consistency_objret_makeObj", consistent("()Ljava/lang/Object;", "makeObj"));
+        ctx.check("consistency_JDJ_sWide",    consistent("(JD)J", "sWide"));
+    }
+
+    // by-NAME resolution-robustness negatives: malformed / wrong-form class names
+    // degrade to EMPTY, never crash.  All flow through find_class, which short-
+    // circuits or graph-walk-misses — no oop deref.
+    {
+        // A 300-char garbage name can never name a loaded class.
+        ctx.check("by_long_garbage_name_empty",
+                  vmhook::get_class_methods(std::string(300, 'Z')).empty());
+        // A name with embedded whitespace is not a valid internal name.
+        ctx.check("by_whitespace_name_empty",
+                  vmhook::get_class_methods("vmhook/fixtures/Method Enumeration").empty());
+        // Trailing junk after a real name -> different (unloaded) name -> empty.
+        ctx.check("by_trailing_junk_name_empty",
+                  vmhook::get_class_methods("vmhook/fixtures/MethodEnumerationZZZ").empty());
+        // A bare nested separator with no nested class -> empty.
+        ctx.check("by_dangling_dollar_name_empty",
+                  vmhook::get_class_methods("vmhook/fixtures/MethodEnumeration$NoSuch").empty());
+        // DOTTED (java.lang form) resolution is environment-variant: on some
+        // JDKs the JNI loadClass fallback resolves it, on others not.  Record the
+        // observation but do NOT hard-assert either way (matches the sibling
+        // walk module's documented dotted-form caveat).
+        const bool dotted_empty{
+            vmhook::get_class_methods("vmhook.fixtures.MethodEnumeration").empty() };
+        ctx.record(std::string{ "[INFO] dotted-form get_class_methods empty: " }
+                   + (dotted_empty ? "yes" : "no"));
     }
 
     cp("module complete (all parts reached without a no-SEH fault)");

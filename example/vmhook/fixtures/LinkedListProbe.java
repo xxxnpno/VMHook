@@ -72,8 +72,61 @@ public final class LinkedListProbe
      */
     public final LinkedList<String> words = new LinkedList<String>();
 
-    /** Java-side observed size, republished each probe run for a cross-check. */
+    // ── Additional LinkedList SHAPES the native side walks ──────────────────
+    // Every list is a java.util.LinkedList&lt;String&gt; so the SAME Node-chain
+    // (first -&gt; item/next) walk applies to all of them; only the contents and
+    // length differ.  This lets the native module prove the walk over empty /
+    // single / many / null-bearing / duplicate / empty-string shapes.
+
+    /** Empty LinkedList: size 0, first == null.  Walk must yield 0 elements. */
+    public final LinkedList<String> emptyList = new LinkedList<String>();
+
+    /** Single-element LinkedList: first -&gt; "solo" -&gt; null. */
+    public final LinkedList<String> singleList = new LinkedList<String>();
+
+    /**
+     * Null-bearing LinkedList: first -&gt; null -&gt; "mid" -&gt; null -&gt; null.
+     * The chain has real Nodes at every position; the Node.item reference is
+     * what is null, so the native walk must preserve each null slot as a
+     * nullptr wrapper WITHOUT desyncing the first-&gt;next traversal.
+     */
+    public final LinkedList<String> nullList = new LinkedList<String>();
+
+    /**
+     * Duplicate-element LinkedList: "dup","dup","dup".  A List keeps every
+     * occurrence (unlike a Set), so the walk must return all three.
+     */
+    public final LinkedList<String> dupList = new LinkedList<String>();
+
+    /**
+     * Empty-string + normal element: first -&gt; "" -&gt; "tail" -&gt; null.
+     * read_java_string returns "" for a legitimately empty Java String; this
+     * shape asserts an empty element is still a non-null, pointer-valid wrapper
+     * (distinct from a null slot) whose decoded content is exactly "".
+     */
+    public final LinkedList<String> emptyStrList = new LinkedList<String>();
+
+    /** The element count of {@link #manyList}, mirrored to the native side. */
+    public static final int MANY_SIZE = 16;
+
+    /**
+     * A modest "many" LinkedList: element k is the decimal string of k, for
+     * k in [0, MANY_SIZE).  Long enough that a node-chain walk visiting each
+     * link in order is meaningfully exercised, small enough to stay well under
+     * the test JVM heap lever.
+     */
+    public final LinkedList<String> manyList = new LinkedList<String>();
+
+    /** Java-side observed size of {@link #words}, republished each probe run. */
     public static volatile int observedSize;
+
+    /** Java-side observed sizes of the additional shapes (cross-checks). */
+    public static volatile int observedEmptySize;
+    public static volatile int observedSingleSize;
+    public static volatile int observedNullSize;
+    public static volatile int observedDupSize;
+    public static volatile int observedEmptyStrSize;
+    public static volatile int observedManySize;
 
     /** A nonce the trigger detour writes, guaranteeing fresh bytecode dispatch. */
     public static volatile int triggerNonce;
@@ -89,6 +142,28 @@ public final class LinkedListProbe
         words.add(WORD0);
         words.add(WORD1);
         words.add(WORD2);
+
+        // emptyList stays empty on purpose.
+
+        singleList.add("solo");
+
+        nullList.add(null);
+        nullList.add("mid");
+        nullList.add(null);
+        nullList.add(null);
+
+        dupList.add("dup");
+        dupList.add("dup");
+        dupList.add("dup");
+
+        emptyStrList.add("");
+        emptyStrList.add("tail");
+
+        for (int k = 0; k < MANY_SIZE; k++)
+        {
+            manyList.add(Integer.toString(k));
+        }
+
         populated = true;
     }
 
@@ -122,6 +197,12 @@ public final class LinkedListProbe
             {
                 SINGLETON.populate();
                 LinkedListProbe.observedSize = SINGLETON.words.size();
+                LinkedListProbe.observedEmptySize = SINGLETON.emptyList.size();
+                LinkedListProbe.observedSingleSize = SINGLETON.singleList.size();
+                LinkedListProbe.observedNullSize = SINGLETON.nullList.size();
+                LinkedListProbe.observedDupSize = SINGLETON.dupList.size();
+                LinkedListProbe.observedEmptyStrSize = SINGLETON.emptyStrList.size();
+                LinkedListProbe.observedManySize = SINGLETON.manyList.size();
                 // Real bytecode dispatch the native scoped_hook rides; the
                 // detour is where the native side does its LinkedList reads.
                 SINGLETON.trigger(7);

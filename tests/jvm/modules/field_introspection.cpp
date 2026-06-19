@@ -23,10 +23,14 @@
 //
 //   * signature()         (vmhook.hpp:11759-11763) — returns the exact JVM type
 //     descriptor for EVERY field shape: the eight primitives Z B S I J F D C,
-//     Ljava/lang/String;, [I, [[I, [Ljava/lang/Object;, [Ljava/lang/String;,
-//     Ljava/lang/Object;, an interface ref Ljava/lang/Runnable;, and a self
-//     reference Lvmhook/fixtures/FieldIntrospection;.  Verified for static AND
-//     instance proxies, and proven to be a stable view aliasing the proxy.
+//     Ljava/lang/String;, [I, [[I, [Ljava/lang/Object;, [[Ljava/lang/Object;,
+//     [Ljava/lang/String;, Ljava/lang/Object;, an interface ref
+//     Ljava/lang/Runnable;, and a self reference Lvmhook/fixtures/FieldIntrospection;.
+//     Verified for static AND instance proxies, on synthetic stack proxies
+//     (verbatim view of every primitive char + V + degenerate forms), and proven
+//     to be a stable view aliasing the proxy.  FINAL fields carry the SAME
+//     descriptor as their mutable twins (none of the five accessors surface
+//     JVM_ACC_FINAL — finality-blind).
 //
 //   * is_static()         (vmhook.hpp:11787-11791) — true for every static
 //     field, false for every instance field; cross-proven by reading a STATIC
@@ -101,6 +105,9 @@ namespace
         static auto s_str_array_len()   -> std::int32_t { return static_field("sStrArrayLength")->get(); }
         static auto s_string_len()      -> std::int32_t { return static_field("sStringLength")->get(); }
         static auto i_int_array_len()   -> std::int32_t { return static_field("iIntArrayLength")->get(); }
+        static auto s_int_array2d_len() -> std::int32_t { return static_field("sIntArray2DLength")->get(); }
+        static auto s_obj_array2d_len() -> std::int32_t { return static_field("sObjArray2DLength")->get(); }
+        static auto s_str_array_elem0_len() -> std::int32_t { return static_field("sStrArrayElem0Length")->get(); }
 
         // Read the static `sLong` field's raw 8 bytes for the get_compressed_oop
         // low-half truncation proof.
@@ -334,6 +341,16 @@ VMHOOK_JVM_MODULE(field_introspection)
     chk_static_sig("sSelfRef",   "Lvmhook/fixtures/FieldIntrospection;");
     chk_static_sig("sNullString","Ljava/lang/String;");   // descriptor is type-based, not value-based
     chk_static_sig("sNullArray", "[I");
+    chk_static_sig("sObjArray2D","[[Ljava/lang/Object;");  // deepest reference-of-reference array shape
+    // FINAL fields carry the SAME descriptor as their non-final twins — none of
+    // the five accessors surface JVM_ACC_FINAL, so signature() is finality-blind.
+    chk_static_sig("sFinalInt",    "I");
+    chk_static_sig("sFinalString", "Ljava/lang/String;");
+    ctx.record("[INFO] finality-blindness: none of signature/is_static/is_reference/"
+               "raw_address/get_compressed_oop expose JVM_ACC_FINAL — a `final` field "
+               "is indistinguishable from its mutable twin across all five accessors "
+               "(field_entry_t carries offset/is_static/signature/declaring_klass only, "
+               "no access-flag bitfield).");
 
     // signature() of INSTANCE fields (descriptor is identical to the static
     // twin where the type matches; exercises the instance get_field path).
@@ -366,6 +383,30 @@ VMHOOK_JVM_MODULE(field_introspection)
             chk_inst_sig("iIntArray", "[I");
             chk_inst_sig("iObject",   "Ljava/lang/Object;");
             chk_inst_sig("iNullString","Ljava/lang/String;");
+            chk_inst_sig("iFinalInt", "I");   // instance final — descriptor unaffected by finality
+        }
+    }
+
+    // signature() exhaustive descriptor-byte stress on STACK proxies — every
+    // single-char primitive descriptor plus degenerate / non-primitive shapes,
+    // proving signature() is a verbatim view of whatever the proxy was built with
+    // (no normalization, no validation) and that .size() never strays.
+    {
+        cp("SECTION A.stack (signature verbatim view on synthetic proxies)");
+        struct SigRow { const char* desc; };
+        const SigRow stack_sigs[] = {
+            { "Z" }, { "B" }, { "S" }, { "I" }, { "J" }, { "F" }, { "D" }, { "C" },
+            { "V" },                                  // void descriptor (never a field, but verbatim)
+            { "Ljava/lang/Thread;" }, { "[J" }, { "[[[I" },
+            { "[Ljava/lang/Object;" }, { "" },        // empty signature survives verbatim
+        };
+        for (const SigRow& r : stack_sigs)
+        {
+            vmhook::field_proxy fp{ nullptr, r.desc, false };
+            ctx.check(std::string{ "sig_stack_verbatim_" } + r.desc,
+                      std::string{ fp.signature() } == r.desc);
+            ctx.check(std::string{ "sig_stack_size_" } + r.desc,
+                      fp.signature().size() == std::char_traits<char>::length(r.desc));
         }
     }
 
@@ -399,7 +440,8 @@ VMHOOK_JVM_MODULE(field_introspection)
         const char* static_fields[] = {
             "sBool", "sByte", "sShort", "sInt", "sLong", "sFloat", "sDouble",
             "sChar", "sString", "sIntArray", "sObjArray", "sObject", "sRunnable",
-            "sSelfRef", "sNullString"
+            "sSelfRef", "sNullString", "sObjArray2D",
+            "sFinalInt", "sFinalString"   // final statics are STILL static
         };
         for (const char* f : static_fields)
         {
@@ -413,7 +455,8 @@ VMHOOK_JVM_MODULE(field_introspection)
         {
             const char* instance_fields[] = {
                 "iBool", "iByte", "iShort", "iInt", "iLong", "iFloat", "iDouble",
-                "iChar", "iString", "iIntArray", "iObject", "iNullString"
+                "iChar", "iString", "iIntArray", "iObject", "iNullString",
+                "iFinalInt"   // final instance field is STILL non-static
             };
             for (const char* f : instance_fields)
             {
@@ -450,7 +493,8 @@ VMHOOK_JVM_MODULE(field_introspection)
             { "sString",     true }, { "sIntArray",  true }, { "sIntArray2D", true },
             { "sObjArray",   true }, { "sStrArray",  true }, { "sObject",     true },
             { "sRunnable",   true }, { "sSelfRef",   true }, { "sNullString", true },
-            { "sNullArray",  true },
+            { "sNullArray",  true }, { "sObjArray2D", true },
+            { "sFinalInt",   false }, { "sFinalString", true },  // finality-blind
         };
         for (const Row& r : rows)
         {
@@ -478,6 +522,62 @@ VMHOOK_JVM_MODULE(field_introspection)
             vmhook::field_proxy bare_a{ nullptr, "[", false };
             ctx.check("is_reference_bare_L_true", bare_l.is_reference() == true);
             ctx.check("is_reference_bare_bracket_true", bare_a.is_reference() == true);
+        }
+
+        // EVERY single-char primitive descriptor classifies as NON-reference, and
+        // 'V' (void) — which is neither a reference nor a sized primitive — is also
+        // false (front char is not 'L'/'['); these pin is_reference's front-byte
+        // rule across the whole primitive alphabet on synthetic proxies.
+        {
+            const char* non_ref_chars[] = { "Z", "B", "S", "I", "J", "F", "D", "C", "V" };
+            for (const char* d : non_ref_chars)
+            {
+                vmhook::field_proxy fp{ nullptr, d, false };
+                ctx.check(std::string{ "is_reference_primitive_char_false_" } + d,
+                          fp.is_reference() == false);
+            }
+            // A multi-char descriptor whose first byte is a primitive letter is
+            // STILL non-reference (front byte 'I'), and is NOT a sized primitive
+            // (jvm_primitive_byte_width requires size()==1) — so is_reference and
+            // the primitive-complement DISAGREE here.  This documents that
+            // is_reference is a pure front-byte test, not a true type classifier.
+            vmhook::field_proxy multi{ nullptr, "II", false };
+            ctx.check("is_reference_multichar_primitive_front_false",
+                      multi.is_reference() == false);
+            ctx.check("is_reference_multichar_not_sized_primitive",
+                      vmhook::detail::jvm_primitive_byte_width(multi.signature()) == 0);
+        }
+    }
+
+    // SECTION C.inst — is_reference() on genuine INSTANCE fields, and its exact
+    // complement-of-primitive relationship, on the live instance proxy path
+    // (Section C above is static-only).  Proxy metadata only → no oop deref → HARD.
+    {
+        cp("SECTION C.inst (is_reference on instance fields — metadata only)");
+        const auto inst{ fi_fixture::get_instance() };
+        if (inst)
+        {
+            struct IRow { const char* field; bool is_ref; };
+            const IRow irows[] = {
+                { "iBool",   false }, { "iByte",   false }, { "iShort",  false },
+                { "iInt",    false }, { "iLong",   false }, { "iFloat",  false },
+                { "iDouble", false }, { "iChar",   false }, { "iFinalInt", false },
+                { "iString",   true }, { "iIntArray", true }, { "iObject",   true },
+                { "iNullString", true },
+            };
+            for (const IRow& r : irows)
+            {
+                auto fp{ inst->get_field(r.field) };
+                ctx.check(std::string{ "is_reference_instance_" } + r.field,
+                          fp.has_value() && fp->is_reference() == r.is_ref);
+                if (fp)
+                {
+                    const bool primitive{
+                        vmhook::detail::jvm_primitive_byte_width(fp->signature()) != 0 };
+                    ctx.check(std::string{ "is_reference_instance_complement_" } + r.field,
+                              fp->is_reference() == !primitive);
+                }
+            }
         }
     }
 
@@ -524,6 +624,26 @@ VMHOOK_JVM_MODULE(field_introspection)
         chk_static_addr("sString", 4);   // compressed-OOP slot (4B) under default UseCompressedOops
         chk_static_addr("sIntArray", 4);
         chk_static_addr("sObject", 4);
+        chk_static_addr("sObjArray2D", 4);
+        // FINAL statics resolve to a real mirror+offset slot exactly like a
+        // non-final static — raw_address is finality-blind.
+        chk_static_addr("sFinalInt",    4);
+        chk_static_addr("sFinalString", 4);
+
+        // A final and a non-final static of the SAME shape occupy DISTINCT slots
+        // (different offsets) yet both resolve non-null and width-aligned — pins
+        // that finality does not collapse or alias the addressing.
+        {
+            auto fin{ fi_fixture::static_field("sFinalInt") };
+            auto non{ fi_fixture::static_field("sInt") };
+            if (fin && non)
+            {
+                ctx.check("raw_addr_final_vs_nonfinal_distinct_slots",
+                          fin->raw_address() != nullptr
+                          && non->raw_address() != nullptr
+                          && fin->raw_address() != non->raw_address());
+            }
+        }
 
         // D.2 — raw_address is the EXACT byte get() reads.  For a primitive int
         // field, the 4 bytes at raw_address must equal get() as int32.  This
@@ -549,6 +669,19 @@ VMHOOK_JVM_MODULE(field_introspection)
                 std::int64_t via_addr{};
                 std::memcpy(&via_addr, fp->raw_address(), sizeof(via_addr));
                 ctx.check("raw_addr_static_long_bytes_equal_get", via_addr == via_get);
+            }
+        }
+        // FINAL static int: get() reads the right value AND the raw_address bytes
+        // match — the read path treats a final field exactly like a mutable one.
+        {
+            auto fp{ fi_fixture::static_field("sFinalInt") };
+            if (fp)
+            {
+                const std::int32_t via_get{ fp->get() };
+                std::int32_t via_addr{};
+                std::memcpy(&via_addr, fp->raw_address(), sizeof(via_addr));
+                ctx.check("raw_addr_static_final_int_bytes_equal_get", via_addr == via_get);
+                ctx.check("raw_addr_static_final_int_matches_java", via_get == 0x12345678);
             }
         }
 
@@ -608,6 +741,8 @@ VMHOOK_JVM_MODULE(field_introspection)
             chk_inst_addr("iDouble", 8);
             chk_inst_addr("iString", 4);
             chk_inst_addr("iIntArray", 4);
+            chk_inst_addr("iObject", 4);
+            chk_inst_addr("iFinalInt", 4);   // final instance field — addressing unaffected
 
             // Two DIFFERENT instance fields on the SAME object have DIFFERENT
             // raw addresses (offsets differ).  raw_address() only — no deref → HARD.
@@ -913,6 +1048,158 @@ VMHOOK_JVM_MODULE(field_introspection)
             }
         }
 
+        // E.6b — String[] reference ([Ljava/lang/String;): decoded length matches
+        //        the Java witness, klass name is "[Ljava/lang/String;", and the
+        //        first element decodes to a real String of the published length.
+        {
+            cp("SECTION E.6b (static sStrArray — mirror slot, content decode guarded)");
+            auto fp{ fi_fixture::static_field("sStrArray") };
+            if (fp)
+            {
+                const std::uint32_t raw{ fp->get_compressed_oop() };
+                ctx.check("cmp_oop_strarray_nonzero", raw != 0);
+                void* const decoded{ vmhook::hotspot::decode_oop_pointer(raw) };
+                ctx.check("cmp_oop_strarray_get_equals_decode",
+                          static_cast<void*>(fp->get()) == decoded);
+                const std::int32_t len{ safe_array_length(decoded) };
+                if (len >= 0)
+                {
+                    ctx.check("cmp_oop_strarray_length_matches_java",
+                              len == fi_fixture::s_str_array_len() && len == 2);
+                    // Element 0 is a compressed-OOP slot; decode it and verify it is
+                    // the real String "x" (length 1) — proving an Object/String[]
+                    // element decode chains correctly off get_compressed_oop's oop.
+                    const std::uint32_t e0_raw{
+                        safe_array_element<std::uint32_t>(decoded, 0) };
+                    void* const e0{ vmhook::hotspot::decode_oop_pointer(e0_raw) };
+                    const std::string e0_text{ safe_read_java_string(e0) };
+                    if (!e0_text.empty())
+                    {
+                        ctx.check("cmp_oop_strarray_elem0_decodes",
+                                  static_cast<std::int32_t>(e0_text.size())
+                                      == fi_fixture::s_str_array_elem0_len());
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] cmp_oop_strarray_elem0: element String header not "
+                                   "safely readable (stale/relocated) — skipped value assert.");
+                    }
+                }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_strarray: array header not safely readable "
+                               "(stale/relocated) — skipped length/elem asserts.");
+                }
+                const std::string kn{ klass_name_of_field(*fp) };
+                if (!kn.empty())
+                {
+                    ctx.check("cmp_oop_strarray_klass_name", kn == "[Ljava/lang/String;");
+                }
+            }
+        }
+
+        // E.6c — int[][] reference ([[I): the OUTER array's length matches Java and
+        //        its klass name is "[[I"; element 0 (an int[]) decodes to a real
+        //        inner array whose length matches the fixture's first inner row.
+        {
+            cp("SECTION E.6c (static sIntArray2D — mirror slot, content decode guarded)");
+            auto fp{ fi_fixture::static_field("sIntArray2D") };
+            if (fp)
+            {
+                ctx.check("cmp_oop_intarray2d_is_reference", fp->is_reference());
+                void* const decoded{ vmhook::hotspot::decode_oop_pointer(fp->get_compressed_oop()) };
+                ctx.check("cmp_oop_intarray2d_get_equals_decode",
+                          static_cast<void*>(fp->get()) == decoded);
+                const std::int32_t len{ safe_array_length(decoded) };
+                if (len >= 0)
+                {
+                    ctx.check("cmp_oop_intarray2d_length_matches_java",
+                              len == fi_fixture::s_int_array2d_len() && len == 2);
+                    // Inner row 0 is itself a reference (an int[]) — decode it and
+                    // check its int-array length is 2 ({1,2}).
+                    const std::uint32_t inner_raw{
+                        safe_array_element<std::uint32_t>(decoded, 0) };
+                    void* const inner{ vmhook::hotspot::decode_oop_pointer(inner_raw) };
+                    const std::int32_t inner_len{ safe_array_length(inner) };
+                    if (inner_len >= 0)
+                    {
+                        ctx.check("cmp_oop_intarray2d_inner0_length", inner_len == 2);
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] cmp_oop_intarray2d_inner0: inner array header not "
+                                   "safely readable (stale/relocated) — skipped length assert.");
+                    }
+                }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_intarray2d: outer array header not safely "
+                               "readable (stale/relocated) — skipped length asserts.");
+                }
+                const std::string kn{ klass_name_of_field(*fp) };
+                if (!kn.empty())
+                {
+                    ctx.check("cmp_oop_intarray2d_klass_name", kn == "[[I");
+                }
+            }
+        }
+
+        // E.6d — Object[][] reference ([[Ljava/lang/Object;): outer length + klass
+        //        name for the deepest reference-of-reference array shape.
+        {
+            cp("SECTION E.6d (static sObjArray2D — mirror slot, content decode guarded)");
+            auto fp{ fi_fixture::static_field("sObjArray2D") };
+            if (fp)
+            {
+                void* const decoded{ vmhook::hotspot::decode_oop_pointer(fp->get_compressed_oop()) };
+                ctx.check("cmp_oop_objarray2d_get_equals_decode",
+                          static_cast<void*>(fp->get()) == decoded);
+                const std::int32_t len{ safe_array_length(decoded) };
+                if (len >= 0)
+                {
+                    ctx.check("cmp_oop_objarray2d_length_matches_java",
+                              len == fi_fixture::s_obj_array2d_len() && len == 2);
+                }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_objarray2d: array header not safely readable "
+                               "(stale/relocated) — skipped length assert.");
+                }
+                const std::string kn{ klass_name_of_field(*fp) };
+                if (!kn.empty())
+                {
+                    ctx.check("cmp_oop_objarray2d_klass_name", kn == "[[Ljava/lang/Object;");
+                }
+            }
+        }
+
+        // E.6e — FINAL static reference (sFinalString): get_compressed_oop on a
+        //        final reference field decodes exactly like a mutable one (finality
+        //        is invisible to the read path).
+        {
+            cp("SECTION E.6e (static sFinalString — mirror slot, content decode guarded)");
+            auto fp{ fi_fixture::static_field("sFinalString") };
+            if (fp)
+            {
+                ctx.check("cmp_oop_final_string_is_reference", fp->is_reference());
+                const std::uint32_t raw{ fp->get_compressed_oop() };
+                ctx.check("cmp_oop_final_string_nonzero", raw != 0);
+                void* const decoded{ vmhook::hotspot::decode_oop_pointer(raw) };
+                ctx.check("cmp_oop_final_string_get_equals_decode",
+                          static_cast<void*>(fp->get()) == decoded);
+                const std::string text{ safe_read_java_string(decoded) };
+                if (!text.empty())
+                {
+                    ctx.check("cmp_oop_final_string_value", text == "final-static");
+                }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_final_string: decoded header not safely readable "
+                               "(stale/relocated) — skipped value assert.");
+                }
+            }
+        }
+
         // E.7 — INSTANCE reference field (iString): get_compressed_oop on an
         //       instance proxy decodes to the real instance String.
         //
@@ -985,6 +1272,38 @@ VMHOOK_JVM_MODULE(field_introspection)
                 {
                     ctx.record("[INFO] cmp_oop_instance_intarray: instance slot not safely "
                                "readable (instance relocated) — skipped length assert (transient).");
+                }
+
+                // iObject — a plain Object instance reference field.  Proves the
+                // instance get_compressed_oop / get(void*) decode-agreement holds
+                // for a non-array, non-String reference too; the decoded oop's
+                // klass is java/lang/Object.
+                cp("SECTION E.7 iObject (instance get_compressed_oop — probe slot)");
+                auto fo{ inst->get_field("iObject") };
+                if (fo && instance_field_read_safe(inst_oop, *fo, sizeof(std::uint32_t)))
+                {
+                    const std::uint32_t raw{ fo->get_compressed_oop() };
+                    void* const decoded{ vmhook::hotspot::decode_oop_pointer(raw) };
+                    ctx.check("cmp_oop_instance_object_nonzero", raw != 0);
+                    ctx.check("cmp_oop_instance_object_get_equals_decode",
+                              static_cast<void*>(fo->get()) == decoded);
+                    cp("SECTION E.7 iObject content (klass_from_oop — probe header)");
+                    const std::string kn{ klass_name_of_field(*fo) };
+                    if (!kn.empty())
+                    {
+                        ctx.check("cmp_oop_instance_object_klass_name",
+                                  kn == "java/lang/Object");
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] cmp_oop_instance_object: referent header not safely "
+                                   "readable (stale/relocated) — skipped klass-name assert.");
+                    }
+                }
+                else
+                {
+                    ctx.record("[INFO] cmp_oop_instance_object: instance slot not safely "
+                               "readable (instance relocated) — skipped asserts (transient).");
                 }
             }
         }
@@ -1075,6 +1394,49 @@ VMHOOK_JVM_MODULE(field_introspection)
             ctx.check("cmp_oop_reads_exactly_4_bytes_at_pointer",
                       fp.get_compressed_oop() == sentinel);
             ctx.check("cmp_oop_does_not_overread_adjacent", guard == 0xCAFEBABEu);
+        }
+
+        // F.6 — the is_reference() gate fires identically for an ARRAY descriptor
+        //       ('[' front byte): an array-typed stack proxy reads its 4 sentinel
+        //       bytes (same path as the 'L' case), confirming the guard admits
+        //       BOTH reference forms, not just object refs.
+        {
+            std::uint8_t buf[8] = { 0 };
+            const std::uint32_t sentinel{ 0x0A0B0C0Du };
+            std::memcpy(buf, &sentinel, sizeof(sentinel));
+            vmhook::field_proxy fp{ buf, "[I", false };
+            ctx.check("cmp_oop_array_descriptor_reads_4_bytes",
+                      fp.get_compressed_oop() == sentinel);
+            vmhook::field_proxy fp2{ buf, "[[Ljava/lang/Object;", false };
+            ctx.check("cmp_oop_nested_array_descriptor_reads_4_bytes",
+                      fp2.get_compressed_oop() == sentinel);
+        }
+
+        // F.7 — every PRIMITIVE single-char descriptor is gated to 0 by
+        //       is_reference() BEFORE any memcpy, even over a planted non-zero
+        //       buffer — proving FLAW-C's fix covers the whole primitive alphabet
+        //       (not just the I/J fields tested live in F.2/F.3).
+        {
+            std::uint8_t buf[8] = { 0 };
+            const std::uint32_t planted{ 0xFEEDFACEu };
+            std::memcpy(buf, &planted, sizeof(planted));
+            const char* prim_chars[] = { "Z", "B", "S", "I", "J", "F", "D", "C" };
+            for (const char* d : prim_chars)
+            {
+                vmhook::field_proxy fp{ buf, d, false };
+                ctx.check(std::string{ "cmp_oop_primitive_guarded_zero_" } + d,
+                          fp.get_compressed_oop() == 0u);
+            }
+            // 'V' (void) and a multi-char descriptor are also non-reference → 0.
+            vmhook::field_proxy v{ buf, "V", false };
+            ctx.check("cmp_oop_void_guarded_zero", v.get_compressed_oop() == 0u);
+            vmhook::field_proxy multi{ buf, "II", false };
+            ctx.check("cmp_oop_multichar_primitive_guarded_zero",
+                      multi.get_compressed_oop() == 0u);
+            // The empty-signature proxy is non-reference → 0 (no front byte).
+            vmhook::field_proxy empty{ buf, "", false };
+            ctx.check("cmp_oop_empty_signature_guarded_zero",
+                      empty.get_compressed_oop() == 0u);
         }
     }
 

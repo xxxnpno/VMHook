@@ -92,6 +92,43 @@ namespace
             return v;
         }
 
+        // ---- Java-observed sizes of the additional LinkedList shapes ----
+        static auto get_observed_empty_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedEmptySize")->get();
+            return v;
+        }
+        static auto get_observed_single_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedSingleSize")->get();
+            return v;
+        }
+        static auto get_observed_null_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedNullSize")->get();
+            return v;
+        }
+        static auto get_observed_dup_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedDupSize")->get();
+            return v;
+        }
+        static auto get_observed_empty_str_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedEmptyStrSize")->get();
+            return v;
+        }
+        static auto get_observed_many_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedManySize")->get();
+            return v;
+        }
+        static auto get_many_size_const() -> std::int32_t
+        {
+            const std::int32_t v = static_field("MANY_SIZE")->get();
+            return v;
+        }
+
         // ---- acquire the published SINGLETON instance wrapper ----
         static auto singleton() -> std::unique_ptr<llp> { return static_field("SINGLETON")->get(); }
 
@@ -130,7 +167,18 @@ namespace
         //      the field-shape predicate proof) ----
         auto words_oop() const -> void*
         {
-            const auto proxy{ this->get_field("words") };
+            return this->field_oop("words");
+        }
+
+        // ---- the raw decoded OOP of ANY LinkedList field on this instance ----
+        // Generalises words_oop() so the additional shapes (emptyList,
+        // singleList, nullList, dupList, emptyStrList, manyList) can each be
+        // walked the same three ways.  Returns nullptr on a missing field or an
+        // invalid decode (an EMPTY LinkedList still decodes to a valid list OOP —
+        // it is the list object that is non-null, only its `first` is null).
+        auto field_oop(const char* name) const -> void*
+        {
+            const auto proxy{ this->get_field(name) };
             if (!proxy.has_value())
             {
                 return nullptr;
@@ -142,6 +190,35 @@ namespace
                 return nullptr;
             }
             return oop;
+        }
+
+        // ---- path (1) for an arbitrary LinkedList field ----
+        auto via_value_to_vector(const char* name) const
+            -> std::vector<std::unique_ptr<str_elem>>
+        {
+            const auto proxy{ this->get_field(name) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            return proxy->get().to_vector<str_elem>();
+        }
+
+        // ---- path (2) for an arbitrary LinkedList field ----
+        auto via_linked_list_wrapper(const char* name) const
+            -> std::vector<std::unique_ptr<str_elem>>
+        {
+            const auto proxy{ this->get_field(name) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            std::unique_ptr<vmhook::linked_list> ll = proxy->get();   // copy-init
+            if (!ll)
+            {
+                return {};
+            }
+            return ll->to_vector<str_elem>();
         }
     };
 
@@ -208,6 +285,77 @@ namespace
                   && vec[2]->content() == "charlie"
                   && vec[0]->content() != vec[1]->content()
                   && vec[1]->content() != vec[2]->content());
+    }
+
+    // Decode a slot's content, treating a null/invalid wrapper as the sentinel
+    // "<null>" so a null Node.item slot is distinguishable from a real "" string
+    // (read_java_string returns "" for BOTH a null backing AND an empty Java
+    // string — flaw #6 — so we must branch on the WRAPPER being null, not on the
+    // decoded content, to tell a null element from an empty one).
+    auto slot_text(const std::unique_ptr<str_elem>& e) -> std::string
+    {
+        if (!e || !vmhook::hotspot::is_valid_pointer(e->get_instance()))
+        {
+            return std::string{ "<null>" };
+        }
+        return e->content();
+    }
+
+    // Assert a to_vector result is exactly `expected` (in order), where each
+    // expected entry is either a real string or the "<null>" sentinel for a null
+    // Node.item slot.  Path-tagged so a failure pinpoints which read path / shape
+    // regressed.  Returns true iff the size matched (so callers can gate further
+    // per-shape assertions).
+    auto check_exact(vmhook_test::context& ctx,
+                     const char* path,
+                     const std::vector<std::unique_ptr<str_elem>>& vec,
+                     const std::vector<std::string>& expected) -> bool
+    {
+        const std::string tag{ path };
+        const bool size_ok{ vec.size() == expected.size() };
+        ctx.check(tag + "_size_matches", size_ok);
+        if (!size_ok)
+        {
+            return false;
+        }
+        bool all_match{ true };
+        for (std::size_t i{ 0 }; i < vec.size(); ++i)
+        {
+            if (slot_text(vec[i]) != expected[i])
+            {
+                all_match = false;
+            }
+        }
+        ctx.check(tag + "_elements_match_in_order", all_match);
+        return true;
+    }
+
+    // Run a shape through ALL THREE read paths (value_t::to_vector, the typed
+    // linked_list wrapper, and a direct linked_list_walk_items on the list OOP),
+    // asserting each path yields exactly `expected`.  `walk_size` is the size
+    // handed to the DIRECT walk — normally the real element count.  This is the
+    // workhorse that proves the Node-chain walk handles every shape identically
+    // across the three documented entry points.
+    auto check_shape_all_paths(vmhook_test::context& ctx,
+                               llp& inst,
+                               const char* field,
+                               const std::string& tagbase,
+                               const std::vector<std::string>& expected,
+                               const std::int32_t walk_size) -> void
+    {
+        check_exact(ctx, (tagbase + "_value").c_str(),
+                    inst.via_value_to_vector(field), expected);
+        check_exact(ctx, (tagbase + "_wrapper").c_str(),
+                    inst.via_linked_list_wrapper(field), expected);
+
+        void* const oop{ inst.field_oop(field) };
+        ctx.check(tagbase + "_field_decodes_to_valid_oop", oop != nullptr);
+        if (oop)
+        {
+            std::vector<std::unique_ptr<str_elem>> direct;
+            vmhook::linked_list_walk_items<str_elem>(oop, walk_size, direct);
+            check_exact(ctx, (tagbase + "_direct").c_str(), direct, expected);
+        }
     }
 }
 
@@ -365,6 +513,263 @@ VMHOOK_JVM_MODULE(collection_linked_list)
         const auto vec{ inst->words_via_value_to_vector() };
         ctx.check("native_size_matches_java_observed_size",
                   static_cast<std::int32_t>(vec.size()) == llp::get_observed_size());
+    }
+
+    // =====================================================================
+    //  8. EMPTY LinkedList shape (size 0, first == null).
+    //     The Java side reports size 0 and `first` is null, so the cascade's
+    //     LinkedList branch takes the `n > 0` guard FALSE and returns an empty
+    //     vector without walking; a direct linked_list_walk_items with size 0
+    //     also no-ops.  Proves the empty shape reads back as 0 elements on every
+    //     path (NOT a spurious element, NOT a fault).  Note flaw #3: an empty
+    //     list and a decode failure both yield {} — we additionally assert the
+    //     list OOP itself is a valid (non-null) object, distinguishing "empty
+    //     collection" from "could not read the field" here.
+    // =====================================================================
+    {
+        void* const empty_oop{ inst->field_oop("emptyList") };
+        ctx.check("emptyList_field_decodes_to_valid_oop", empty_oop != nullptr);
+
+        const std::vector<std::string> expected_empty{};
+        check_exact(ctx, "empty_value",
+                    inst->via_value_to_vector("emptyList"), expected_empty);
+        check_exact(ctx, "empty_wrapper",
+                    inst->via_linked_list_wrapper("emptyList"), expected_empty);
+
+        // Direct walk with the REAL size (0): must yield nothing and not fault.
+        if (empty_oop)
+        {
+            std::vector<std::unique_ptr<str_elem>> direct0;
+            vmhook::linked_list_walk_items<str_elem>(empty_oop, 0, direct0);
+            ctx.check("empty_direct_size0_yields_empty", direct0.empty());
+
+            // Degenerate: a POSITIVE size on a list whose `first` is null.  The
+            // walk's loop guard is `i < size AND is_valid_pointer(node_oop)`;
+            // node_oop is decoded from a null `first`, so the FIRST iteration's
+            // pointer guard is false and the walk yields 0 elements regardless of
+            // the (wrong) size.  This is the size-says-more-than-the-chain-holds
+            // case for an empty chain — it must NOT fabricate elements.
+            std::vector<std::unique_ptr<str_elem>> direct_overclaim;
+            vmhook::linked_list_walk_items<str_elem>(empty_oop, 5, direct_overclaim);
+            ctx.check("empty_direct_oversize_still_empty", direct_overclaim.empty());
+        }
+
+        ctx.check("empty_java_observed_size_is_0", llp::get_observed_empty_size() == 0);
+    }
+
+    // =====================================================================
+    //  9. SINGLE-element LinkedList shape (first -> "solo" -> null).
+    //     The minimal non-empty chain: exactly one Node, one item, next == null.
+    // =====================================================================
+    {
+        const std::vector<std::string> expected_single{ std::string{ "solo" } };
+        check_shape_all_paths(ctx, *inst, "singleList", std::string{ "single" },
+                              expected_single, 1);
+        ctx.check("single_java_observed_size_is_1", llp::get_observed_single_size() == 1);
+    }
+
+    // =====================================================================
+    //  10. NULL-bearing LinkedList shape (null, "mid", null, null).
+    //      Every position is a real Node; the Node.item REFERENCE is null at
+    //      indices 0/2/3.  The walk must (a) advance first->next across a Node
+    //      whose item is null without desyncing, and (b) preserve each null item
+    //      as a nullptr wrapper while keeping "mid" at index 1.  This is the
+    //      core null-element-preservation proof for the chain walk.
+    // =====================================================================
+    {
+        const std::vector<std::string> expected_null{
+            std::string{ "<null>" }, std::string{ "mid" },
+            std::string{ "<null>" }, std::string{ "<null>" } };
+        check_shape_all_paths(ctx, *inst, "nullList", std::string{ "nulls" },
+                              expected_null, 4);
+
+        // Explicit: the non-null slot sits at index 1 and only there.
+        const auto nv{ inst->via_value_to_vector("nullList") };
+        ctx.check("null_shape_size_is_4", nv.size() == 4u);
+        if (nv.size() == 4u)
+        {
+            const bool slot0_null{ !nv[0] || !vmhook::hotspot::is_valid_pointer(nv[0]->get_instance()) };
+            const bool slot1_live{ nv[1] && vmhook::hotspot::is_valid_pointer(nv[1]->get_instance()) };
+            const bool slot2_null{ !nv[2] || !vmhook::hotspot::is_valid_pointer(nv[2]->get_instance()) };
+            const bool slot3_null{ !nv[3] || !vmhook::hotspot::is_valid_pointer(nv[3]->get_instance()) };
+            ctx.check("null_shape_slot0_is_null", slot0_null);
+            ctx.check("null_shape_slot1_is_live_mid",
+                      slot1_live && nv[1]->content() == "mid");
+            ctx.check("null_shape_slot2_is_null", slot2_null);
+            ctx.check("null_shape_slot3_is_null", slot3_null);
+        }
+        ctx.check("null_java_observed_size_is_4", llp::get_observed_null_size() == 4);
+    }
+
+    // =====================================================================
+    //  11. DUPLICATE-element LinkedList shape ("dup","dup","dup").
+    //      A List keeps every occurrence (unlike a Set, which would collapse
+    //      them to one).  The walk must return all three identical elements;
+    //      this guards against any accidental de-duplication and proves the
+    //      chain length — not the distinct-value count — drives the result.
+    // =====================================================================
+    {
+        const std::vector<std::string> expected_dup{
+            std::string{ "dup" }, std::string{ "dup" }, std::string{ "dup" } };
+        check_shape_all_paths(ctx, *inst, "dupList", std::string{ "dupes" },
+                              expected_dup, 3);
+        ctx.check("dup_java_observed_size_is_3", llp::get_observed_dup_size() == 3);
+    }
+
+    // =====================================================================
+    //  12. EMPTY-STRING element shape ("" , "tail").
+    //      A legitimately empty Java String element must read back as a NON-null,
+    //      pointer-valid wrapper whose content() is exactly "" — distinct from a
+    //      null Node.item slot (which yields a null wrapper).  This exercises the
+    //      element-content boundary flaw #6 notes (read_java_string returns "" for
+    //      both empty and null backing); here we assert the WRAPPER is non-null so
+    //      the empty-string element is correctly NOT a null slot.
+    // =====================================================================
+    {
+        const std::vector<std::string> expected_estr{
+            std::string{}, std::string{ "tail" } };
+        // check_exact's slot_text returns the real "" for a live empty-string
+        // wrapper (it only substitutes "<null>" when the WRAPPER is null), so the
+        // empty string compares equal to expected[0] == "".
+        check_shape_all_paths(ctx, *inst, "emptyStrList", std::string{ "estr" },
+                              expected_estr, 2);
+
+        const auto ev{ inst->via_value_to_vector("emptyStrList") };
+        ctx.check("emptyStr_shape_size_is_2", ev.size() == 2u);
+        if (ev.size() == 2u)
+        {
+            // Index 0 is an EMPTY STRING element: the wrapper must be live
+            // (non-null, pointer-valid) and its content exactly "".
+            const bool elem0_live{ ev[0] && vmhook::hotspot::is_valid_pointer(ev[0]->get_instance()) };
+            ctx.check("emptyStr_elem0_wrapper_is_nonnull", elem0_live);
+            ctx.check("emptyStr_elem0_content_is_empty",
+                      elem0_live && ev[0]->content().empty());
+            ctx.check("emptyStr_elem1_is_tail",
+                      ev[1] && vmhook::hotspot::is_valid_pointer(ev[1]->get_instance())
+                      && ev[1]->content() == "tail");
+        }
+        ctx.check("emptyStr_java_observed_size_is_2", llp::get_observed_empty_str_size() == 2);
+    }
+
+    // =====================================================================
+    //  13. MANY-element LinkedList shape (16 decimal-string elements 0..15).
+    //      A longer chain than `words` so the first->next traversal is exercised
+    //      over many links; proves order is preserved across the whole chain and
+    //      that every element decodes to its own distinct String.  Heap stays
+    //      modest (16 short ASCII strings).
+    // =====================================================================
+    {
+        const std::int32_t many_n{ llp::get_observed_many_size() };
+        const std::int32_t many_const{ llp::get_many_size_const() };
+        ctx.check("many_java_observed_size_is_16", many_n == 16);
+        ctx.check("many_const_matches_observed", many_const == many_n);
+
+        // Build the expected sequence "0","1",...,"15" from the live MANY_SIZE
+        // const so the assertion tracks the fixture rather than a magic literal.
+        std::vector<std::string> expected_many;
+        if (many_const > 0 && many_const <= 4096)
+        {
+            expected_many.reserve(static_cast<std::size_t>(many_const));
+            for (std::int32_t k{ 0 }; k < many_const; ++k)
+            {
+                expected_many.push_back(std::to_string(k));
+            }
+        }
+        check_shape_all_paths(ctx, *inst, "manyList", std::string{ "many" },
+                              expected_many, many_const);
+    }
+
+    // =====================================================================
+    //  14. NODE-CHAIN-WALK vs SIZE: the direct walk's `size` argument is an
+    //      upper BOUND, not the source of truth (the chain's null terminator is).
+    //      On the `words` list (real length 3) we probe the asymmetry flaw #2
+    //      documents, all crash-safe (the loop is bounded by BOTH i < size AND a
+    //      live is_valid_pointer(node_oop)):
+    //        * size LARGER than the chain -> the null `next` terminator stops the
+    //          walk at the true end; result is the real 3 (NOT padded with nulls).
+    //        * size SMALLER than the chain -> the walk is truncated to `size`
+    //          (the documented truncate-low behaviour); result is the first 2.
+    //        * size 0 -> the size<=0 guard returns immediately; 0 elements.
+    // =====================================================================
+    {
+        // size LARGER than the 3-element chain: terminator wins, exactly 3.
+        std::vector<std::unique_ptr<str_elem>> over;
+        vmhook::linked_list_walk_items<str_elem>(list_oop, 9, over);
+        ctx.check("words_walk_oversize_stops_at_terminator", over.size() == 3u);
+        if (over.size() == 3u)
+        {
+            ctx.check("words_walk_oversize_content_intact",
+                      slot_text(over[0]) == "alpha"
+                      && slot_text(over[1]) == "bravo"
+                      && slot_text(over[2]) == "charlie");
+        }
+
+        // size SMALLER than the chain: truncated to exactly `size` elements.
+        std::vector<std::unique_ptr<str_elem>> under;
+        vmhook::linked_list_walk_items<str_elem>(list_oop, 2, under);
+        ctx.check("words_walk_undersize_truncates_to_2", under.size() == 2u);
+        if (under.size() == 2u)
+        {
+            ctx.check("words_walk_undersize_keeps_prefix_order",
+                      slot_text(under[0]) == "alpha"
+                      && slot_text(under[1]) == "bravo");
+        }
+
+        // size 0: immediate guard, no walk, no fault.
+        std::vector<std::unique_ptr<str_elem>> zero;
+        vmhook::linked_list_walk_items<str_elem>(list_oop, 0, zero);
+        ctx.check("words_walk_size0_yields_empty", zero.empty());
+
+        // negative size: same guard (size <= 0), no fault.
+        std::vector<std::unique_ptr<str_elem>> neg;
+        vmhook::linked_list_walk_items<str_elem>(list_oop, -3, neg);
+        ctx.check("words_walk_negative_size_yields_empty", neg.empty());
+    }
+
+    // =====================================================================
+    //  15. CRASH-SAFETY: linked_list_walk_items on a null / invalid list OOP.
+    //      The size<=0 / null / !is_valid_pointer guards must return cleanly
+    //      with an empty vector and no fault on every degenerate input.
+    // =====================================================================
+    {
+        std::vector<std::unique_ptr<str_elem>> on_null;
+        vmhook::linked_list_walk_items<str_elem>(nullptr, 3, on_null);
+        ctx.check("walk_on_null_oop_yields_empty", on_null.empty());
+
+        // A clearly-bogus, non-null pointer: is_valid_pointer must reject it.
+        std::vector<std::unique_ptr<str_elem>> on_bogus;
+        vmhook::linked_list_walk_items<str_elem>(
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1)), 3, on_bogus);
+        ctx.check("walk_on_bogus_oop_yields_empty", on_bogus.empty());
+    }
+
+    // =====================================================================
+    //  16. Every distinct shape is a java.util.LinkedList -> the SAME field-shape
+    //      predicate (first+size present, elementData absent) selects the
+    //      Node-chain branch for ALL of them, not just `words`.  Asserted on the
+    //      LIVE klass of each list OOP via the probe_collection subclass.  (All
+    //      these lists share one LinkedList klass, but reading the predicate off
+    //      each live OOP independently proves the routing is per-OOP and uniform.)
+    // =====================================================================
+    {
+        const char* const shape_fields[]{
+            "emptyList", "singleList", "nullList", "dupList", "emptyStrList", "manyList" };
+        for (const char* const field : shape_fields)
+        {
+            void* const oop{ inst->field_oop(field) };
+            const std::string tag{ field };
+            ctx.check(tag + "_shape_field_decodes", oop != nullptr);
+            if (!oop)
+            {
+                continue;
+            }
+            const probe_collection pc{ oop };
+            const bool predicate{
+                pc.has_oop_field("first")
+                && pc.has_oop_field("size")
+                && !pc.has_oop_field("elementData") };
+            ctx.check(tag + "_selects_node_chain_branch", predicate);
+        }
     }
 
     // No hooks were installed by this module, so there is nothing to tear down.

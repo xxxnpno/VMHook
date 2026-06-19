@@ -99,11 +99,31 @@ public final class FieldIntrospection
     /** Lvmhook/fixtures/FieldIntrospection; — a self-typed reference. */
     public static FieldIntrospection sSelfRef;
 
+    /** [Ljava/lang/String; twin already above; add [[Ljava/lang/Object; — a
+        reference-element-of-reference-element array (descriptor "[[Ljava/lang/Object;"). */
+    public static Object[][] sObjArray2D = new Object[][] { { "p" }, { "q", "r" } };
+
     /** A null reference field — get_compressed_oop must read 0, decode to null. */
     public static String sNullString = null;
 
     /** A null array field. */
     public static int[] sNullArray = null;
+
+    // =====================================================================
+    //  FINAL fields — none of the five field_proxy accessors surface the
+    //  JVM_ACC_FINAL flag (signature/is_static/is_reference/raw_address/
+    //  get_compressed_oop are blind to finality), so the native side proves
+    //  a `final` field behaves IDENTICALLY to a non-final twin of the same
+    //  shape.  Distinct sentinel values keep the value asserts unambiguous.
+    // =====================================================================
+    /** static final I — same descriptor/static/non-ref as sInt. */
+    public static final int sFinalInt = 0x12345678;
+
+    /** static final Ljava/lang/String; — same descriptor/static/ref as sString. */
+    public static final String sFinalString = "final-static";
+
+    /** instance final I — same descriptor/non-static/non-ref as iInt. */
+    public final int iFinalInt = 0x0DEFACED;
 
     // =====================================================================
     //  INSTANCE fields — mirror the primitive + reference set so is_static()
@@ -136,6 +156,9 @@ public final class FieldIntrospection
     public static volatile int sIntArrayElem0;
     public static volatile int sObjArrayLength;
     public static volatile int sStrArrayLength;
+    public static volatile int sIntArray2DLength;
+    public static volatile int sObjArray2DLength;
+    public static volatile int sStrArrayElem0Length;
     public static volatile int sSelfRefIdentityHash;
     public static volatile int iStringIdentityHash;
     public static volatile int iObjectIdentityHash;
@@ -162,6 +185,10 @@ public final class FieldIntrospection
         sIntArrayElem0        = (sIntArray == null || sIntArray.length == 0) ? -1 : sIntArray[0];
         sObjArrayLength       = (sObjArray == null) ? -1 : sObjArray.length;
         sStrArrayLength       = (sStrArray == null) ? -1 : sStrArray.length;
+        sIntArray2DLength     = (sIntArray2D == null) ? -1 : sIntArray2D.length;
+        sObjArray2DLength     = (sObjArray2D == null) ? -1 : sObjArray2D.length;
+        sStrArrayElem0Length  = (sStrArray == null || sStrArray.length == 0
+                                 || sStrArray[0] == null) ? -1 : sStrArray[0].length();
         sSelfRefIdentityHash  = System.identityHashCode(sSelfRef);
         sStringLength         = (sString == null) ? -1 : sString.length();
 

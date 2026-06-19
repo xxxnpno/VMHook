@@ -106,6 +106,7 @@
 #include <utility>
 #include <bit>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <typeindex>
@@ -287,10 +288,15 @@ namespace
         auto rank_resolves() const -> bool { return get_method("rank").has_value(); }
     };
 
-    // value_t variant-alternative indices (must match field_proxy::value_t order).
+    // value_t variant-alternative indices (must match field_proxy::value_t order:
+    // bool, i8, i16, i32, i64, float, double, u16, u32).
     constexpr std::size_t kIdxBool = 0;
+    constexpr std::size_t kIdxI8   = 1;
+    constexpr std::size_t kIdxI16  = 2;
     constexpr std::size_t kIdxI32  = 3;
     constexpr std::size_t kIdxI64  = 4;
+    constexpr std::size_t kIdxFloat  = 5;
+    constexpr std::size_t kIdxDouble = 6;
     constexpr std::size_t kIdxU16  = 7;
     constexpr std::size_t kIdxU32  = 8;   // reference / compressed OOP
 
@@ -724,6 +730,419 @@ namespace
             ctx.check("overload_instance_describe_int_resolves", d1.has_value());
             if (d0) { ctx.check("overload_instance_describe_void_signature", std::string{ d0->signature() } == "()I"); }
             if (d1) { ctx.check("overload_instance_describe_int_signature", std::string{ d1->signature() } == "(I)I"); }
+            // A non-existent INSTANCE overload signature (name exists, sig does
+            // not) -> nullopt — parity with the static combine bad-sig check.
+            ctx.check("overload_instance_describe_bad_sig_nullopt",
+                      inst->get_method("describe", "(J)I").has_value() == false);
+        }
+    }
+
+    // =====================================================================
+    //  6a. EVERY REMAINING PRIMITIVE WIDTH as an INSTANCE field — byte (i8),
+    //      short (i16), char (u16), float, double.  Together with section 2
+    //      (int/long/boolean/String) this exercises every value_t alternative
+    //      through a LIVE OOP: variant index, decoded value, is_static()==false,
+    //      and the exact JVM signature.  (char appears both here and as a static
+    //      in section 3; the INSTANCE char path is the new coverage.)
+    // =====================================================================
+    if (inst)
+    {
+        // byte iByte == 42  (i8 alternative)
+        {
+            const auto p{ inst->get_field("iByte") };
+            ctx.check("inst_field_iByte_resolves", p.has_value());
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("inst_field_iByte_variant_i8", v.data.index() == kIdxI8);
+                ctx.check("inst_field_iByte_value", static_cast<std::int8_t>(v) == static_cast<std::int8_t>(42));
+                ctx.check("inst_field_iByte_is_static_false", p->is_static() == false);
+                ctx.check("inst_field_iByte_signature_B", std::string{ p->signature() } == "B");
+                ctx.check("inst_field_iByte_not_reference", p->is_reference() == false);
+            }
+        }
+        // short iShort == 12345  (i16 alternative)
+        {
+            const auto p{ inst->get_field("iShort") };
+            ctx.check("inst_field_iShort_resolves", p.has_value());
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("inst_field_iShort_variant_i16", v.data.index() == kIdxI16);
+                ctx.check("inst_field_iShort_value", static_cast<std::int16_t>(v) == static_cast<std::int16_t>(12345));
+                ctx.check("inst_field_iShort_signature_S", std::string{ p->signature() } == "S");
+            }
+        }
+        // char iChar == 'Z' (0x5A)  (u16 alternative through a live oop)
+        {
+            const auto p{ inst->get_field("iChar") };
+            ctx.check("inst_field_iChar_resolves", p.has_value());
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("inst_field_iChar_variant_u16", v.data.index() == kIdxU16);
+                ctx.check("inst_field_iChar_value", static_cast<std::uint16_t>(v) == static_cast<std::uint16_t>('Z'));
+                ctx.check("inst_field_iChar_signature_C", std::string{ p->signature() } == "C");
+            }
+        }
+        // float iFloat == 0.75f  (exact in binary -> exact equality is safe)
+        {
+            const auto p{ inst->get_field("iFloat") };
+            ctx.check("inst_field_iFloat_resolves", p.has_value());
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("inst_field_iFloat_variant_float", v.data.index() == kIdxFloat);
+                ctx.check("inst_field_iFloat_value", static_cast<float>(v) == 0.75f);
+                ctx.check("inst_field_iFloat_signature_F", std::string{ p->signature() } == "F");
+            }
+        }
+        // double iDouble == 3.5  (exact in binary)
+        {
+            const auto p{ inst->get_field("iDouble") };
+            ctx.check("inst_field_iDouble_resolves", p.has_value());
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("inst_field_iDouble_variant_double", v.data.index() == kIdxDouble);
+                ctx.check("inst_field_iDouble_value", static_cast<double>(v) == 3.5);
+                ctx.check("inst_field_iDouble_signature_D", std::string{ p->signature() } == "D");
+            }
+        }
+    }
+
+    // =====================================================================
+    //  6b. EVERY REMAINING PRIMITIVE WIDTH as a STATIC field — byte/short/
+    //      float/double via static_field, with variant index + signature +
+    //      is_static()==true.  Statics differ in value from the instance copies
+    //      so a static/instance mix-up surfaces immediately.
+    // =====================================================================
+    {
+        // byte sByte == -7
+        {
+            const auto p{ wp::static_field("sByte") };
+            ctx.check("static_field_sByte_resolves", p.has_value());
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("static_field_sByte_variant_i8", v.data.index() == kIdxI8);
+                ctx.check("static_field_sByte_value", static_cast<std::int8_t>(v) == static_cast<std::int8_t>(-7));
+                ctx.check("static_field_sByte_is_static_true", p->is_static() == true);
+                ctx.check("static_field_sByte_signature_B", std::string{ p->signature() } == "B");
+            }
+        }
+        // short sShort == -3000
+        {
+            const auto p{ wp::static_field("sShort") };
+            ctx.check("static_field_sShort_resolves", p.has_value());
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("static_field_sShort_variant_i16", v.data.index() == kIdxI16);
+                ctx.check("static_field_sShort_value", static_cast<std::int16_t>(v) == static_cast<std::int16_t>(-3000));
+                ctx.check("static_field_sShort_signature_S", std::string{ p->signature() } == "S");
+            }
+        }
+        // float sFloat == 2.5f
+        {
+            const auto p{ wp::static_field("sFloat") };
+            ctx.check("static_field_sFloat_resolves", p.has_value());
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("static_field_sFloat_variant_float", v.data.index() == kIdxFloat);
+                ctx.check("static_field_sFloat_value", static_cast<float>(v) == 2.5f);
+                ctx.check("static_field_sFloat_signature_F", std::string{ p->signature() } == "F");
+            }
+        }
+        // double sDouble == -1.25
+        {
+            const auto p{ wp::static_field("sDouble") };
+            ctx.check("static_field_sDouble_resolves", p.has_value());
+            if (p)
+            {
+                const auto v{ p->get() };
+                ctx.check("static_field_sDouble_variant_double", v.data.index() == kIdxDouble);
+                ctx.check("static_field_sDouble_value", static_cast<double>(v) == -1.25);
+                ctx.check("static_field_sDouble_signature_D", std::string{ p->signature() } == "D");
+            }
+        }
+    }
+
+    // =====================================================================
+    //  6c. BOUNDARY / EDGE VALUES across every width (min/max + sign-extension).
+    //      A wrapper read must reproduce the JVM's exact bit pattern at the
+    //      extremes (the value_t static_cast must not clamp or lose sign).
+    // =====================================================================
+    {
+        // byte extremes -128 / 127 (sign-extension through the i8 alternative).
+        {
+            const auto lo{ wp::static_field("sByteMin") };
+            const auto hi{ wp::static_field("sByteMax") };
+            if (lo) { ctx.check("edge_sByteMin", static_cast<std::int8_t>(lo->get()) == static_cast<std::int8_t>(-128)); }
+            if (hi) { ctx.check("edge_sByteMax", static_cast<std::int8_t>(hi->get()) == static_cast<std::int8_t>(127)); }
+        }
+        // short extremes -32768 / 32767.
+        {
+            const auto lo{ wp::static_field("sShortMin") };
+            const auto hi{ wp::static_field("sShortMax") };
+            if (lo) { ctx.check("edge_sShortMin", static_cast<std::int16_t>(lo->get()) == static_cast<std::int16_t>(-32768)); }
+            if (hi) { ctx.check("edge_sShortMax", static_cast<std::int16_t>(hi->get()) == static_cast<std::int16_t>(32767)); }
+        }
+        // char extremes 0x0000 / 0xFFFF (unsigned u16, no sign-extension).
+        {
+            const auto lo{ wp::static_field("sCharZero") };
+            const auto hi{ wp::static_field("sCharMax") };
+            if (lo) { ctx.check("edge_sCharZero", static_cast<std::uint16_t>(lo->get()) == static_cast<std::uint16_t>(0x0000)); }
+            if (hi) { ctx.check("edge_sCharMax", static_cast<std::uint16_t>(hi->get()) == static_cast<std::uint16_t>(0xFFFF)); }
+        }
+        // int extremes 0x80000000 / 0x7FFFFFFF.
+        {
+            const auto lo{ wp::static_field("sIntMin") };
+            const auto hi{ wp::static_field("sIntMax") };
+            if (lo) { ctx.check("edge_sIntMin", static_cast<std::int32_t>(lo->get()) == static_cast<std::int32_t>(0x80000000)); }
+            if (hi) { ctx.check("edge_sIntMax", static_cast<std::int32_t>(hi->get()) == static_cast<std::int32_t>(0x7FFFFFFF)); }
+        }
+        // long extremes (full 64-bit min/max).
+        {
+            const auto lo{ wp::static_field("sLongMin") };
+            const auto hi{ wp::static_field("sLongMax") };
+            if (lo) { ctx.check("edge_sLongMin", static_cast<std::int64_t>(lo->get()) == (std::numeric_limits<std::int64_t>::min)()); }
+            if (hi) { ctx.check("edge_sLongMax", static_cast<std::int64_t>(hi->get()) == (std::numeric_limits<std::int64_t>::max)()); }
+        }
+        // float / double non-trivial values (both exact in binary).
+        {
+            const auto fn{ wp::static_field("sFloatNeg") };
+            const auto db{ wp::static_field("sDoubleBig") };
+            if (fn) { ctx.check("edge_sFloatNeg", static_cast<float>(fn->get()) == -0.5f); }
+            if (db) { ctx.check("edge_sDoubleBig", static_cast<double>(db->get()) == (1.0e9 + 0.5)); }
+        }
+    }
+
+    // =====================================================================
+    //  6d. METHOD OVERLOAD RESOLUTION BY EXACT primitive-arg DESCRIPTOR.
+    //      `widen` has seven overloads differing only in arg type: (Z)I (B)I
+    //      (S)I (C)I (J)I (F)I (D)I.  The name+signature resolver must pick the
+    //      exact descriptor; the name-only resolver returns SOME overload (the
+    //      first by klass order).  RESOLUTION is thread-free -> HARD everywhere.
+    // =====================================================================
+    {
+        struct widen_case { const char* sig; const char* name; };
+        const widen_case cases[]{
+            { "(Z)I", "overload_widen_Z" },
+            { "(B)I", "overload_widen_B" },
+            { "(S)I", "overload_widen_S" },
+            { "(C)I", "overload_widen_C" },
+            { "(J)I", "overload_widen_J" },
+            { "(F)I", "overload_widen_F" },
+            { "(D)I", "overload_widen_D" },
+        };
+        for (const auto& c : cases)
+        {
+            const auto m{ wp::static_method("widen", c.sig) };
+            ctx.check(std::string{ c.name } + "_resolves", m.has_value());
+            if (m)
+            {
+                ctx.check(std::string{ c.name } + "_exact_signature",
+                          std::string{ m->signature() } == c.sig);
+                ctx.check(std::string{ c.name } + "_is_static_true", m->is_static() == true);
+            }
+        }
+        // Name-only resolves SOME widen overload (introspection only).
+        ctx.check("overload_widen_name_only_resolves", wp::static_method("widen").has_value());
+        // A descriptor that no widen overload has -> nullopt (name exists,
+        // this exact sig does not): (I)I is NOT among the seven.
+        ctx.check("overload_widen_absent_sig_nullopt",
+                  wp::static_method("widen", "(I)I").has_value() == false);
+        // A bad static name+signature where the NAME is unknown -> nullopt.
+        ctx.check("overload_widen_unknown_name_sig_nullopt",
+                  wp::static_method("noSuchWiden", "(I)I").has_value() == false);
+    }
+
+    // =====================================================================
+    //  6e. INSTANCE METHOD RETURN-TYPE DESCRIPTORS — getByte/Short/Char/Float/
+    //      Double resolve and report the exact return descriptor.  Pure
+    //      introspection (no live thread): RESOLUTION + signature() are HARD.
+    // =====================================================================
+    if (inst)
+    {
+        struct ret_case { const char* method; const char* sig; };
+        const ret_case rets[]{
+            { "getByte",   "()B" },
+            { "getShort",  "()S" },
+            { "getChar",   "()C" },
+            { "getFloat",  "()F" },
+            { "getDouble", "()D" },
+        };
+        for (const auto& r : rets)
+        {
+            const auto m{ inst->get_method(r.method) };
+            ctx.check(std::string{ "ret_" } + r.method + "_resolves", m.has_value());
+            if (m)
+            {
+                ctx.check(std::string{ "ret_" } + r.method + "_signature",
+                          std::string{ m->signature() } == r.sig);
+                // All five return primitives -> is_reference() must be false.
+                ctx.check(std::string{ "ret_" } + r.method + "_not_reference",
+                          m->is_reference() == false);
+            }
+        }
+    }
+
+    // =====================================================================
+    //  6f. FIELD set() ROUND-TRIP through a wrapper (the instance + static
+    //      WRITE path the run_probe never exercises natively).  Each scratch
+    //      field is written through get_field("...")->set(v) then read back
+    //      through a fresh proxy; the instance scratch fields cover every
+    //      primitive width the set() path supports plus a String reference.
+    //      These scratch fields are dedicated to this section (no other check
+    //      reads them), so the writes cannot perturb any other assertion.
+    //
+    //      NOTE: set() into a primitive field is a direct in-place store at
+    //      instance+offset (no JNI, no thread), so this is HARD on every cell.
+    //      The String set() rebinds the slot to a freshly-built java.lang.String
+    //      (library bug #30 path) and is likewise thread-free.
+    // =====================================================================
+    if (inst && instance_oop)
+    {
+        wp w{ instance_oop };
+
+        // int scratchI
+        {
+            const auto sp{ w.get_field("scratchI") };
+            ctx.check("setrt_scratchI_resolves", sp.has_value());
+            if (sp)
+            {
+                sp->set(static_cast<std::int32_t>(0x1234ABCD));
+                const auto rp{ w.get_field("scratchI") };
+                if (rp) { ctx.check("setrt_scratchI_roundtrip",
+                                    static_cast<std::int32_t>(rp->get()) == static_cast<std::int32_t>(0x1234ABCD)); }
+            }
+        }
+        // long scratchJ
+        {
+            const auto sp{ w.get_field("scratchJ") };
+            if (sp)
+            {
+                sp->set(static_cast<std::int64_t>(0x0102030405060708LL));
+                const auto rp{ w.get_field("scratchJ") };
+                if (rp) { ctx.check("setrt_scratchJ_roundtrip",
+                                    static_cast<std::int64_t>(rp->get()) == 0x0102030405060708LL); }
+            }
+        }
+        // boolean scratchZ
+        {
+            const auto sp{ w.get_field("scratchZ") };
+            if (sp)
+            {
+                sp->set(true);
+                const auto rp{ w.get_field("scratchZ") };
+                if (rp) { ctx.check("setrt_scratchZ_roundtrip", static_cast<bool>(rp->get()) == true); }
+            }
+        }
+        // byte scratchB
+        {
+            const auto sp{ w.get_field("scratchB") };
+            if (sp)
+            {
+                sp->set(static_cast<std::int8_t>(-99));
+                const auto rp{ w.get_field("scratchB") };
+                if (rp) { ctx.check("setrt_scratchB_roundtrip",
+                                    static_cast<std::int8_t>(rp->get()) == static_cast<std::int8_t>(-99)); }
+            }
+        }
+        // short scratchS
+        {
+            const auto sp{ w.get_field("scratchS") };
+            if (sp)
+            {
+                sp->set(static_cast<std::int16_t>(-12321));
+                const auto rp{ w.get_field("scratchS") };
+                if (rp) { ctx.check("setrt_scratchS_roundtrip",
+                                    static_cast<std::int16_t>(rp->get()) == static_cast<std::int16_t>(-12321)); }
+            }
+        }
+        // char scratchC
+        {
+            const auto sp{ w.get_field("scratchC") };
+            if (sp)
+            {
+                sp->set(static_cast<std::uint16_t>(0xBEEF));
+                const auto rp{ w.get_field("scratchC") };
+                if (rp) { ctx.check("setrt_scratchC_roundtrip",
+                                    static_cast<std::uint16_t>(rp->get()) == static_cast<std::uint16_t>(0xBEEF)); }
+            }
+        }
+        // float scratchF (exact-binary value)
+        {
+            const auto sp{ w.get_field("scratchF") };
+            if (sp)
+            {
+                sp->set(1.5f);
+                const auto rp{ w.get_field("scratchF") };
+                if (rp) { ctx.check("setrt_scratchF_roundtrip", static_cast<float>(rp->get()) == 1.5f); }
+            }
+        }
+        // double scratchD (exact-binary value)
+        {
+            const auto sp{ w.get_field("scratchD") };
+            if (sp)
+            {
+                sp->set(-2.25);
+                const auto rp{ w.get_field("scratchD") };
+                if (rp) { ctx.check("setrt_scratchD_roundtrip", static_cast<double>(rp->get()) == -2.25); }
+            }
+        }
+        // String scratchStr — set() rebinds the slot to a new java.lang.String.
+        {
+            const auto sp{ w.get_field("scratchStr") };
+            if (sp)
+            {
+                sp->set(std::string{ "scratch-written" });
+                const auto rp{ w.get_field("scratchStr") };
+                if (rp) { ctx.check("setrt_scratchStr_roundtrip", rp->get().as_string() == "scratch-written"); }
+            }
+        }
+
+        // STATIC field set() round-trip (writes the class-mirror slot).
+        {
+            const auto sp{ wp::static_field("sScratchI") };
+            ctx.check("setrt_static_sScratchI_resolves", sp.has_value());
+            if (sp)
+            {
+                sp->set(static_cast<std::int32_t>(777));
+                const auto rp{ wp::static_field("sScratchI") };
+                if (rp) { ctx.check("setrt_static_sScratchI_roundtrip",
+                                    static_cast<std::int32_t>(rp->get()) == 777); }
+            }
+        }
+    }
+
+    // =====================================================================
+    //  6g. DEGENERATE / EDGE NAME inputs — graceful nullopt, never a crash.
+    //      Empty name, whitespace-only name, and a near-miss case-mismatch must
+    //      all resolve to nullopt (no exception, no deref) for both field and
+    //      method lookups, instance and static.
+    // =====================================================================
+    {
+        ctx.check("degenerate_static_field_empty_name_nullopt",
+                  wp::static_field("").has_value() == false);
+        ctx.check("degenerate_static_field_whitespace_nullopt",
+                  wp::static_field("  ").has_value() == false);
+        ctx.check("degenerate_static_field_case_mismatch_nullopt",
+                  wp::static_field("STAG").has_value() == false);
+        ctx.check("degenerate_static_method_empty_name_nullopt",
+                  wp::static_method("").has_value() == false);
+        ctx.check("degenerate_static_method_empty_sig_nullopt",
+                  wp::static_method("staticTag", "").has_value() == false);
+        if (inst)
+        {
+            ctx.check("degenerate_instance_field_empty_name_nullopt",
+                      inst->get_field("").has_value() == false);
+            ctx.check("degenerate_instance_method_empty_name_nullopt",
+                      inst->get_method("").has_value() == false);
+            ctx.check("degenerate_instance_method_empty_sig_nullopt",
+                      inst->get_method("getId", "").has_value() == false);
         }
     }
 
