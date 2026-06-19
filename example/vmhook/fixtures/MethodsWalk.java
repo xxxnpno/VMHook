@@ -217,6 +217,35 @@ public class MethodsWalk
     public void méthodé()                        { /* "méthodé" */ }
     public void 名前()                            { /* "名前" (Japanese) */ }
 
+    // SINGLE-PRIMITIVE RETURN descriptors -- one method per primitive return code
+    // so the decode of every primitive return char (Z/C/S/B/F/J) is byte-exact.
+    // (int () I and void () V are already covered via ov/syncM; these add the
+    // five OTHER single-primitive returns the existing set never decodes.)
+    public boolean retZ()                        { return true; }   // ()Z
+    public char    retC()                        { return 'x'; }    // ()C
+    public short   retS()                        { return (short) 1; } // ()S
+    public byte    retB()                        { return (byte) 2; }  // ()B
+    public float   retF()                        { return 1.0f; }   // ()F
+    public long    retJ()                        { return 3L; }     // ()J
+
+    // ARRAY RETURN descriptors -- a return slot that is an array (1-D primitive,
+    // 2-D primitive, 1-D reference).  The descriptor's '[' prefix lives in the
+    // RETURN position, which the arg-side array tests never exercise.
+    public int[]      retArrI()                  { return null; }   // ()[I
+    public long[][]   retArr2J()                 { return null; }   // ()[[J
+    public String[]   retArrStr()                { return null; }   // ()[Ljava/lang/String;
+
+    // VISIBILITY modifiers do NOT change the descriptor and the walk is access-
+    // AGNOSTIC (reads _methods regardless of JVM_ACC_*): a private and a protected
+    // method are enumerated exactly like a public one.  Unique descriptors so the
+    // (I)I / ()V multiplicity assertions elsewhere are not disturbed.
+    private int    privM(final char c)           { return c; }      // (C)I
+    protected long protM(final byte b)           { return b; }      // (B)J
+
+    // STATIC NATIVE (declared; never linked) -- a native method that is ALSO
+    // static still has an _methods entry; unique name + descriptor.
+    public static native void snat(int x);                          // (I)V
+
     // =======================================================================
     //  NESTED TYPES (force-loaded below; resolved by internal `$`-name).
     // =======================================================================
@@ -250,6 +279,19 @@ public class MethodsWalk
     {
         public abstract int shape(int x);
         public int concrete(final int x)        { return x; }
+    }
+
+    /**
+     * A CONCRETE subclass of Abstract that OVERRIDES the abstract shape(int).  The
+     * override is DECLARED on this class, so its walk lists shape(int) + a new own
+     * method + <init>; it does NOT list the inherited concrete(int).  Pins that an
+     * overriding class enumerates its OWN override (not the abstract parent's slot).
+     */
+    public static class ConcreteSub extends Abstract
+    {
+        @Override
+        public int shape(final int x)           { return x + 1; }
+        public int extra(final int x)           { return x + 2; }
     }
 
     // ---- 3-level hierarchy: Base <- Mid <- Sub (walk lists OWN methods only) --
@@ -286,6 +328,42 @@ public class MethodsWalk
         ALPHA, BETA, GAMMA;
 
         public int rank()                       { return ordinal() + 1; }
+    }
+
+    /**
+     * An ENUM with a constant-specific body, which makes each constant a synthetic
+     * ANONYMOUS SUBCLASS of the enum and forces the user method to be ABSTRACT on
+     * the enum klass.  The enum's OWN _methods still carries the JDK-stable
+     * values()/valueOf(String) plus the abstract apply(int); the constant bodies
+     * live on the anon subclasses, NOT on this klass.  A distinct enum shape from
+     * Vals (whose user method is concrete).
+     */
+    public enum EnumAbstract
+    {
+        ADD
+        {
+            @Override
+            public int apply(final int x)       { return x + 1; }
+        },
+        SUB
+        {
+            @Override
+            public int apply(final int x)       { return x - 1; }
+        };
+
+        public abstract int apply(int x);       // (I)I  abstract on the enum klass
+    }
+
+    /**
+     * A GENERIC class (type parameter on the CLASS).  The type variable erases to
+     * its bound (Object here) in every method descriptor, so echo(T) walks as
+     * (Ljava/lang/Object;)Ljava/lang/Object; -- class-level erasure, distinct from
+     * the method-level generics on the top-level class.
+     */
+    public static class Generic<T>
+    {
+        public T echo(final T x)                { return x; }   // (Lj.l.Object;)Lj.l.Object;
+        public int sizeOf(final T x)            { return (x == null) ? 0 : 1; } // (Lj.l.Object;)I
     }
 
     /** An ANNOTATION type: its elements are abstract methods in _methods. */
@@ -339,10 +417,13 @@ public class MethodsWalk
     static final Class<?> ANCHOR_MARKER   = Marker.class;
     static final Class<?> ANCHOR_IFACE    = Iface.class;
     static final Class<?> ANCHOR_ABSTRACT = Abstract.class;
+    static final Class<?> ANCHOR_CONCRETE = ConcreteSub.class;
     static final Class<?> ANCHOR_BASE     = Base.class;
     static final Class<?> ANCHOR_MID      = Mid.class;
     static final Class<?> ANCHOR_SUB      = Sub.class;
     static final Class<?> ANCHOR_VALS     = Vals.class;
+    static final Class<?> ANCHOR_ENUMABS  = EnumAbstract.class;
+    static final Class<?> ANCHOR_GENERIC  = Generic.class;
     static final Class<?> ANCHOR_ANNO     = Anno.class;
     static final Class<?> ANCHOR_MANY     = Many.class;
     static final Class<?> ANCHOR_INNER    = Inner.class;

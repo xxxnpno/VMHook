@@ -69,6 +69,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 namespace
 {
@@ -86,10 +87,51 @@ namespace
     constexpr std::int64_t H_LONG_ARG    = 7;
     constexpr std::int64_t H_LONG_EXPECT = 7007;    // 7 + 7000
 
+    // `g` family: distinct single-slot primitive descriptors (S/B/C/Z/F/I).
+    constexpr std::int16_t  G_SHORT_ARG    = 12;
+    constexpr std::int32_t  G_SHORT_EXPECT = 1012;  // 12 + 1000
+    constexpr std::int8_t   G_BYTE_ARG     = 5;
+    constexpr std::int32_t  G_BYTE_EXPECT  = 2005;  // 5 + 2000
+    constexpr char16_t      G_CHAR_ARG     = u'A';  // 65
+    constexpr std::int32_t  G_CHAR_EXPECT  = 3065;  // 65 + 3000
+    constexpr bool          G_BOOL_ARG     = true;
+    constexpr std::int32_t  G_BOOL_EXPECT  = 1;
+    constexpr float         G_FLOAT_ARG    = 2.5f;
+    constexpr float         G_FLOAT_EXPECT = 4002.75f; // 2.5 + 4000.25
+    constexpr std::int32_t  G_INT_ARG      = 9;
+    constexpr std::int32_t  G_INT_EXPECT   = 5009;  // 9 + 5000
+
+    // `p` family: position-dependent multi-arg.
+    constexpr std::int32_t  P_IS_INT    = 7;
+    constexpr const char*   P_IS_STR    = "x";
+    constexpr const char*   P_IS_EXPECT = "IS:7:x";
+    constexpr std::int32_t  P_SI_INT    = 8;
+    constexpr const char*   P_SI_STR    = "y";
+    constexpr const char*   P_SI_EXPECT = "SI:y:8";
+
+    // `sf` single-String-overload: one Java body, three C++ spellings reach it.
+    constexpr const char*   SF_ARG    = "bar";
+    constexpr const char*   SF_EXPECT = "{bar}";   // "{" + s + "}"
+
     // Exact JVM descriptors of every `f` overload (single source of truth).
     constexpr const char* SIG_F_I  = "(I)I";
     constexpr const char* SIG_F_S  = "(Ljava/lang/String;)Ljava/lang/String;";
     constexpr const char* SIG_F_II = "(II)I";
+
+    // Exact JVM descriptors of the `g` overloads (explicit-signature path).
+    constexpr const char* SIG_G_S = "(S)I";
+    constexpr const char* SIG_G_B = "(B)I";
+    constexpr const char* SIG_G_C = "(C)I";
+    constexpr const char* SIG_G_Z = "(Z)I";
+    constexpr const char* SIG_G_F = "(F)F";
+    constexpr const char* SIG_G_I = "(I)I";
+
+    // Exact JVM descriptors of the `p` overloads.
+    constexpr const char* SIG_P_IS = "(ILjava/lang/String;)Ljava/lang/String;";
+    constexpr const char* SIG_P_SI = "(Ljava/lang/String;I)Ljava/lang/String;";
+
+    // Exact JVM descriptor of the `sf` single-String overload.
+    constexpr const char* SIG_SF = "(Ljava/lang/String;)Ljava/lang/String;";
 
     // Sentinel for "this capture slot was never written" — distinct from any real
     // result so a body assertion can tell "detour did not run that call" apart
@@ -127,6 +169,30 @@ namespace
         static auto last_h_result() -> std::int64_t { return static_field("lastHResult")->get(); }
         static auto h_int_hits()  -> std::int32_t { return static_field("hIntHits")->get(); }
         static auto h_long_hits() -> std::int32_t { return static_field("hLongHits")->get(); }
+
+        // ── `g` family (distinct single-slot primitive descriptors) ───────────
+        static auto last_g_arg()    -> std::int64_t { return static_field("lastGArg")->get(); }
+        static auto last_g_result() -> std::int64_t { return static_field("lastGResult")->get(); }
+        static auto g_short_hits() -> std::int32_t { return static_field("gShortHits")->get(); }
+        static auto g_byte_hits()  -> std::int32_t { return static_field("gByteHits")->get(); }
+        static auto g_char_hits()  -> std::int32_t { return static_field("gCharHits")->get(); }
+        static auto g_bool_hits()  -> std::int32_t { return static_field("gBoolHits")->get(); }
+        static auto g_float_hits() -> std::int32_t { return static_field("gFloatHits")->get(); }
+        static auto g_int_hits()   -> std::int32_t { return static_field("gIntHits")->get(); }
+
+        // ── `p` family (position-dependent multi-arg) ─────────────────────────
+        static auto last_p_result() -> std::string  { return static_field("lastPResult")->get(); }
+        static auto p_is_hits() -> std::int32_t { return static_field("pIsHits")->get(); }
+        static auto p_si_hits() -> std::int32_t { return static_field("pSiHits")->get(); }
+
+        // ── `sf` single-String-overload family ────────────────────────────────
+        static auto last_sf_arg() -> std::string { return static_field("lastSfArg")->get(); }
+        static auto sf_hits()     -> std::int32_t { return static_field("sfHits")->get(); }
+
+        // ── `w` widen-only family ─────────────────────────────────────────────
+        static auto last_w_arg()    -> std::int64_t { return static_field("lastWArg")->get(); }
+        static auto w_long_hits()   -> std::int32_t { return static_field("wLongHits")->get(); }
+        static auto w_double_hits() -> std::int32_t { return static_field("wDoubleHits")->get(); }
     };
 
     // ── One captured dispatch result, recorded inside the detour ──────────────
@@ -139,6 +205,7 @@ namespace
         bool         is_void{ false };
         bool         is_string{ false };
         std::int64_t ival{ k_unset };    // numeric result (copy-init via static_cast)
+        double       dval{ 0.0 };        // floating result (static_cast<double>)
         std::string  sval{};             // string result (value_t::as_string())
     };
 
@@ -303,6 +370,229 @@ namespace
         put(key, r);
     }
 
+    // ── `g` family captures: distinct single-slot primitive descriptors ───────
+    // C++-typed name-only call(): resolution must follow the C++ argument TYPE's
+    // EXACT descriptor (no widening between sibling primitives).  Templated over
+    // the C++ arg type so one helper exercises short/byte/char/bool/int.
+    template<typename arg_t>
+    auto cap_named_g_num(const overload_dispatch& self,
+                         const std::string&       key,
+                         arg_t                    a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("g") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.ival      = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // C++-typed name-only call() for the FLOAT overload (g(F)F) — captures the
+    // floating result via static_cast<double> (the value_t arithmetic operator).
+    auto cap_named_g_float(const overload_dispatch& self,
+                           const std::string&       key,
+                           float                    a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("g") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.dval      = static_cast<double>(v);
+        }
+        put(key, r);
+    }
+
+    // Explicit-signature call() for a `g` numeric overload (pinned descriptor),
+    // templated over the C++ arg type passed at the call site.
+    template<typename arg_t>
+    auto cap_sig_g_num(const overload_dispatch& self,
+                       const std::string&       key,
+                       const char*              sig,
+                       arg_t                    a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("g", sig) };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.ival      = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Explicit-signature call() for the FLOAT overload.
+    auto cap_sig_g_float(const overload_dispatch& self,
+                         const std::string&       key,
+                         const char*              sig,
+                         float                    a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("g", sig) };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.dval      = static_cast<double>(v);
+        }
+        put(key, r);
+    }
+
+    // Single-String-overload `sf` calls driven by each C++ String spelling.
+    // All of std::string / const char* / std::string_view map to
+    // Ljava/lang/String; and must reach the SAME (and ONLY) sf overload.
+    auto cap_sf_cstr(const overload_dispatch& self,
+                     const std::string&       key,
+                     const char*              a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("sf") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.sval      = v.as_string();
+        }
+        put(key, r);
+    }
+
+    auto cap_sf_sview(const overload_dispatch& self,
+                      const std::string&       key,
+                      std::string_view         a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("sf") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.sval      = v.as_string();
+        }
+        put(key, r);
+    }
+
+    auto cap_sf_string(const overload_dispatch& self,
+                       const std::string&       key,
+                       const std::string&       a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("sf") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.sval      = v.as_string();
+        }
+        put(key, r);
+    }
+
+    // Explicit-signature `sf` call (pinned String descriptor) via const char*.
+    auto cap_sf_sig(const overload_dispatch& self,
+                    const std::string&       key,
+                    const char*              a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("sf", SIG_SF) };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.sval      = v.as_string();
+        }
+        put(key, r);
+    }
+
+    // C++-typed name-only call for the position-dependent `p(int,String)` form.
+    auto cap_named_p_is(const overload_dispatch& self,
+                        const std::string&       key,
+                        std::int32_t             n,
+                        const std::string&       s) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("p") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(n, s) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.sval      = v.as_string();
+        }
+        put(key, r);
+    }
+
+    // C++-typed name-only call for the position-dependent `p(String,int)` form.
+    auto cap_named_p_si(const overload_dispatch& self,
+                        const std::string&       key,
+                        const std::string&       s,
+                        std::int32_t             n) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("p") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(s, n) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.sval      = v.as_string();
+        }
+        put(key, r);
+    }
+
+    // No-widening probe: widen-only family `w` (w(long), w(double) — NO w(int)),
+    // called with a C++ int.  argument_matches_descriptor<int> -> "I" matches
+    // NEITHER overload, so resolve_compatible_method falls back to first-by-name
+    // (vmhook does NOT widen int->long/double).  Both fallbacks are primitive.
+    auto cap_nomatch_w_int(const overload_dispatch& self,
+                           const std::string&       key,
+                           std::int32_t             a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("w") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.ival      = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
     // Run every capture inside the detour against the live receiver.
     auto run_all(const std::unique_ptr<overload_dispatch>& self) -> void
     {
@@ -332,6 +622,49 @@ namespace
         //  No-match fallback (primitive-only `h`, called with a double).
         // ============================================================
         cap_nomatch_h_double(s, "nomatch_h", 9.5);
+
+        // ============================================================
+        //  (3) DISTINCT SINGLE-SLOT PRIMITIVE DESCRIPTORS (`g` family).
+        //  Each C++ arg type must resolve its EXACT descriptor sibling
+        //  (no widening between primitives).  Two paths each (typed +
+        //  explicit-signature), so every overload's counter reads 2.
+        // ============================================================
+        cap_named_g_num<std::int16_t>(s, "g_short", G_SHORT_ARG);   // short  -> (S)I
+        cap_named_g_num<std::int8_t> (s, "g_byte",  G_BYTE_ARG);    // byte   -> (B)I
+        cap_named_g_num<char16_t>    (s, "g_char",  G_CHAR_ARG);    // char   -> (C)I
+        cap_named_g_num<bool>        (s, "g_bool",  G_BOOL_ARG);    // bool   -> (Z)I
+        cap_named_g_num<std::int32_t>(s, "g_int",   G_INT_ARG);     // int    -> (I)I
+        cap_named_g_float            (s, "g_float", G_FLOAT_ARG);   // float  -> (F)F
+
+        cap_sig_g_num<std::int16_t>(s, "g_short_sig", SIG_G_S, G_SHORT_ARG);
+        cap_sig_g_num<std::int8_t> (s, "g_byte_sig",  SIG_G_B, G_BYTE_ARG);
+        cap_sig_g_num<char16_t>    (s, "g_char_sig",  SIG_G_C, G_CHAR_ARG);
+        cap_sig_g_num<bool>        (s, "g_bool_sig",  SIG_G_Z, G_BOOL_ARG);
+        cap_sig_g_num<std::int32_t>(s, "g_int_sig",   SIG_G_I, G_INT_ARG);
+        cap_sig_g_float            (s, "g_float_sig", SIG_G_F, G_FLOAT_ARG);
+
+        // ============================================================
+        //  (4) STRING DESCRIPTOR from every C++ String spelling, against the
+        //  single-overload `sf` family (std::string / const char* / string_view
+        //  all map to Ljava/lang/String; and must reach the SAME body).
+        // ============================================================
+        cap_sf_string(s, "sf_string", std::string{ SF_ARG });       // std::string -> String
+        cap_sf_cstr  (s, "sf_cstr",   SF_ARG);                      // const char* -> String
+        cap_sf_sview (s, "sf_sview",  std::string_view{ SF_ARG });  // string_view -> String
+        cap_sf_sig   (s, "sf_sig",    SF_ARG);                      // explicit-sig -> String
+
+        // ============================================================
+        //  (5) POSITION-DEPENDENT MULTI-ARG (`p` family).
+        //  Arg ORDER drives the descriptor: (ILjava/lang/String;) vs
+        //  (Ljava/lang/String;I).
+        // ============================================================
+        cap_named_p_is(s, "p_is", P_IS_INT, std::string{ P_IS_STR });
+        cap_named_p_si(s, "p_si", std::string{ P_SI_STR }, P_SI_INT);
+
+        // ============================================================
+        //  (6) NO-WIDENING fallback (widen-only `w`, called with a C++ int).
+        // ============================================================
+        cap_nomatch_w_int(s, "nomatch_w", 100);
     }
 }
 
@@ -585,6 +918,232 @@ VMHOOK_JVM_MODULE(method_overload_java_dispatch)
             static_cast<void>(H_INT_EXPECT);
             static_cast<void>(H_LONG_ARG);
             static_cast<void>(H_LONG_EXPECT);
+        }
+
+        // ===================================================================
+        //  (3) DISTINCT SINGLE-SLOT PRIMITIVE DESCRIPTORS — `g` family.
+        //
+        //  argument_matches_descriptor maps EACH C++ scalar to ONE exact JVM
+        //  descriptor with NO widening between sibling primitives:
+        //      int16_t  -> S      int8_t  -> B      char16_t -> C
+        //      bool     -> Z      float   -> F      int32_t  -> I
+        //  So a C++-typed call("g", <arg>) must dispatch the matching descriptor
+        //  overload and NO other.  Each overload is category-1 (single
+        //  interpreter slot) so it dispatches identically on the call_stub and
+        //  call_jni paths across every JDK.  We prove WHICH ran two ways: the
+        //  returned VALUE, and Java's per-overload hit counter + arg echo.
+        // ===================================================================
+        {
+            const dispatch_result rs{ got("g_short") };
+            ctx.check("g_short_resolved", rs.resolved);
+            ctx.check("g_short_not_void", !rs.is_void);
+            ctx.check("g_short_not_string", !rs.is_string);
+            ctx.check("g_short_result", rs.ival == G_SHORT_EXPECT);
+
+            const dispatch_result rb{ got("g_byte") };
+            ctx.check("g_byte_resolved", rb.resolved);
+            ctx.check("g_byte_not_void", !rb.is_void);
+            ctx.check("g_byte_result", rb.ival == G_BYTE_EXPECT);
+
+            const dispatch_result rc{ got("g_char") };
+            ctx.check("g_char_resolved", rc.resolved);
+            ctx.check("g_char_not_void", !rc.is_void);
+            ctx.check("g_char_result", rc.ival == G_CHAR_EXPECT);
+
+            const dispatch_result rz{ got("g_bool") };
+            ctx.check("g_bool_resolved", rz.resolved);
+            ctx.check("g_bool_not_void", !rz.is_void);
+            ctx.check("g_bool_result", rz.ival == G_BOOL_EXPECT);
+
+            const dispatch_result ri{ got("g_int") };
+            ctx.check("g_int_resolved", ri.resolved);
+            ctx.check("g_int_not_void", !ri.is_void);
+            ctx.check("g_int_result", ri.ival == G_INT_EXPECT);
+
+            const dispatch_result rf{ got("g_float") };
+            ctx.check("g_float_resolved", rf.resolved);
+            ctx.check("g_float_not_void", !rf.is_void);
+            ctx.check("g_float_not_string", !rf.is_string);
+            // float result decoded as the F alternative -> double; tolerate tiny
+            // float-rounding (G_FLOAT_EXPECT is exactly representable, but compare
+            // with an epsilon to stay portable across FPU rounding modes).
+            ctx.check("g_float_result",
+                      rf.dval > (static_cast<double>(G_FLOAT_EXPECT) - 0.01)
+                      && rf.dval < (static_cast<double>(G_FLOAT_EXPECT) + 0.01));
+        }
+
+        // (3b) EXPLICIT-SIGNATURE path for the `g` overloads — pinned descriptor
+        // is reported verbatim by signature() and dispatches the same overload.
+        {
+            const dispatch_result rs{ got("g_short_sig") };
+            ctx.check("g_short_sig_resolved", rs.resolved);
+            ctx.check("g_short_sig_is_S", rs.sig_text == SIG_G_S);
+            ctx.check("g_short_sig_result", rs.ival == G_SHORT_EXPECT);
+
+            const dispatch_result rb{ got("g_byte_sig") };
+            ctx.check("g_byte_sig_resolved", rb.resolved);
+            ctx.check("g_byte_sig_is_B", rb.sig_text == SIG_G_B);
+            ctx.check("g_byte_sig_result", rb.ival == G_BYTE_EXPECT);
+
+            const dispatch_result rc{ got("g_char_sig") };
+            ctx.check("g_char_sig_resolved", rc.resolved);
+            ctx.check("g_char_sig_is_C", rc.sig_text == SIG_G_C);
+            ctx.check("g_char_sig_result", rc.ival == G_CHAR_EXPECT);
+
+            const dispatch_result rz{ got("g_bool_sig") };
+            ctx.check("g_bool_sig_resolved", rz.resolved);
+            ctx.check("g_bool_sig_is_Z", rz.sig_text == SIG_G_Z);
+            ctx.check("g_bool_sig_result", rz.ival == G_BOOL_EXPECT);
+
+            const dispatch_result ri{ got("g_int_sig") };
+            ctx.check("g_int_sig_resolved", ri.resolved);
+            ctx.check("g_int_sig_is_I", ri.sig_text == SIG_G_I);
+            ctx.check("g_int_sig_result", ri.ival == G_INT_EXPECT);
+
+            const dispatch_result rf{ got("g_float_sig") };
+            ctx.check("g_float_sig_resolved", rf.resolved);
+            ctx.check("g_float_sig_is_F", rf.sig_text == SIG_G_F);
+            ctx.check("g_float_sig_result",
+                      rf.dval > (static_cast<double>(G_FLOAT_EXPECT) - 0.01)
+                      && rf.dval < (static_cast<double>(G_FLOAT_EXPECT) + 0.01));
+        }
+
+        // (3c) Cross-path agreement for the `g` family (typed vs explicit-sig).
+        ctx.check("g_paths_agree_short", got("g_short").ival == got("g_short_sig").ival);
+        ctx.check("g_paths_agree_byte",  got("g_byte").ival  == got("g_byte_sig").ival);
+        ctx.check("g_paths_agree_char",  got("g_char").ival  == got("g_char_sig").ival);
+        ctx.check("g_paths_agree_bool",  got("g_bool").ival  == got("g_bool_sig").ival);
+        ctx.check("g_paths_agree_int",   got("g_int").ival   == got("g_int_sig").ival);
+
+        // (3d) JAVA-SIDE READBACK of the `g` family: each overload fired EXACTLY
+        // twice (typed + explicit-sig) and recorded its own arg.  This is the
+        // descriptor-disambiguation proof — char16_t did NOT cross into S, int16_t
+        // did NOT cross into C, etc.  Each counter == 2 means no sibling leaked.
+        ctx.check("java_g_short_hits_two", overload_dispatch::g_short_hits() == 2);
+        ctx.check("java_g_byte_hits_two",  overload_dispatch::g_byte_hits()  == 2);
+        ctx.check("java_g_char_hits_two",  overload_dispatch::g_char_hits()  == 2);
+        ctx.check("java_g_bool_hits_two",  overload_dispatch::g_bool_hits()  == 2);
+        ctx.check("java_g_float_hits_two", overload_dispatch::g_float_hits() == 2);
+        ctx.check("java_g_int_hits_two",   overload_dispatch::g_int_hits()   == 2);
+
+        // (3e) ISOLATION across the WHOLE `g` family: six overloads, each twice,
+        // total = 12 dispatches, none leaked into a sibling descriptor.
+        ctx.check("isolation_g_total_twelve",
+                  overload_dispatch::g_short_hits()
+                      + overload_dispatch::g_byte_hits()
+                      + overload_dispatch::g_char_hits()
+                      + overload_dispatch::g_bool_hits()
+                      + overload_dispatch::g_float_hits()
+                      + overload_dispatch::g_int_hits() == 12);
+
+        // ===================================================================
+        //  (4) STRING DESCRIPTOR from EVERY C++ String spelling — `sf` family.
+        //  std::string, const char*, and std::string_view all map to
+        //  Ljava/lang/String; (argument_matches_descriptor's three String forms),
+        //  so each dispatches the SAME (and ONLY) sf overload and returns "{bar}".
+        //  A fourth call pins the descriptor explicitly.  Proves all spellings
+        //  resolve identically and the value flows back on every path.
+        // ===================================================================
+        {
+            const dispatch_result rstr{ got("sf_string") };
+            ctx.check("sf_string_resolved", rstr.resolved);
+            ctx.check("sf_string_is_string", rstr.is_string);
+            ctx.check("sf_string_result", rstr.sval == SF_EXPECT);
+
+            const dispatch_result rc{ got("sf_cstr") };
+            ctx.check("sf_cstr_resolved", rc.resolved);
+            ctx.check("sf_cstr_is_string", rc.is_string);
+            ctx.check("sf_cstr_result", rc.sval == SF_EXPECT);
+
+            const dispatch_result rv{ got("sf_sview") };
+            ctx.check("sf_sview_resolved", rv.resolved);
+            ctx.check("sf_sview_is_string", rv.is_string);
+            ctx.check("sf_sview_result", rv.sval == SF_EXPECT);
+
+            const dispatch_result rsig{ got("sf_sig") };
+            ctx.check("sf_sig_resolved", rsig.resolved);
+            ctx.check("sf_sig_is_string_sig", rsig.sig_text == SIG_SF);
+            ctx.check("sf_sig_is_string", rsig.is_string);
+            ctx.check("sf_sig_result", rsig.sval == SF_EXPECT);
+
+            // All FOUR forms agree on the returned value.
+            ctx.check("sf_string_forms_agree",
+                      rstr.sval == rc.sval && rc.sval == rv.sval && rv.sval == rsig.sval);
+        }
+        // Java-side readback: the SINGLE sf overload absorbed all FOUR String-typed
+        // dispatches (3 typed spellings + 1 explicit-sig) and recorded the arg.
+        ctx.check("java_sf_hits_four", overload_dispatch::sf_hits() == 4);
+        ctx.check("java_sf_arg_echo",  overload_dispatch::last_sf_arg() == SF_ARG);
+
+        // ===================================================================
+        //  (5) POSITION-DEPENDENT MULTI-ARG — `p` family.
+        //  p(int,String) and p(String,int) differ ONLY by argument ORDER.  The
+        //  C++ pack order drives the descriptor the resolver builds:
+        //      call(int, std::string) -> (ILjava/lang/String;)
+        //      call(std::string, int) -> (Ljava/lang/String;I)
+        //  Proving the resolver respects positional descriptor matching, not just
+        //  the SET of argument types.
+        // ===================================================================
+        {
+            const dispatch_result ris{ got("p_is") };
+            ctx.check("p_is_resolved", ris.resolved);
+            ctx.check("p_is_is_string", ris.is_string);
+            ctx.check("p_is_result", ris.sval == P_IS_EXPECT);
+
+            const dispatch_result rsi{ got("p_si") };
+            ctx.check("p_si_resolved", rsi.resolved);
+            ctx.check("p_si_is_string", rsi.is_string);
+            ctx.check("p_si_result", rsi.sval == P_SI_EXPECT);
+
+            // The two results are DISTINCT — the ordering genuinely mattered.
+            ctx.check("p_order_distinct", ris.sval != rsi.sval);
+        }
+        // Java-side readback: each positional form fired EXACTLY once and no
+        // cross-firing (the int-first call did NOT hit p(String,int) etc.).
+        ctx.check("java_p_is_hits_one", overload_dispatch::p_is_hits() == 1);
+        ctx.check("java_p_si_hits_one", overload_dispatch::p_si_hits() == 1);
+        ctx.check("java_p_last_result_si",
+                  overload_dispatch::last_p_result() == P_SI_EXPECT);
+
+        // ===================================================================
+        //  (6) NO-WIDENING fallback — widen-only `w` (no narrow overload).
+        //  argument_matches_descriptor is EXACT-WIDTH: a C++ int (descriptor I)
+        //  matches NEITHER w(long)/J NOR w(double)/D.  vmhook does NOT apply Java
+        //  widening (int->long / int->double), so resolve_compatible_method finds
+        //  no match and falls back to the first-by-name w overload — exactly the
+        //  documented no-match behaviour, NOT monostate.  Both fallbacks are
+        //  primitive (no reference slot), so this is a SAFE dispatch.  Which
+        //  overload is "first" is HotSpot Symbol-ordering arbitrary, so we
+        //  characterize ACTUAL behaviour and record the choice as [INFO].
+        // ===================================================================
+        {
+            const dispatch_result r{ got("nomatch_w") };
+            ctx.check("nomatch_w_resolved", r.resolved);
+            // Real value came back -> fell back to first-by-name (NOT refused).
+            ctx.check("nomatch_w_not_void_falls_back", !r.is_void);
+            ctx.check("nomatch_w_not_string_primitive_family", !r.is_string);
+
+            const std::int32_t w_l{ overload_dispatch::w_long_hits() };
+            const std::int32_t w_d{ overload_dispatch::w_double_hits() };
+            // EXACTLY one of the two widen-only overloads fired — proving there was
+            // no widening (no I-overload exists to match) AND no double-dispatch.
+            ctx.check("nomatch_w_exactly_one_overload_fired", (w_l + w_d) == 1);
+            // The int (I) NEVER matched a widened (J/D) overload by descriptor —
+            // i.e. resolution did NOT silently widen; if it HAD widened it would
+            // still have fired one overload, so the discriminator is that the
+            // matched-path counter equals the fallback path: we cannot pin the
+            // numeric result (raw-bit reinterpretation per flaw #1), only that the
+            // family ran once total.
+            const std::string which{
+                (w_l == 1) ? "w(long) [(J)J]"
+                           : (w_d == 1) ? "w(double) [(D)D]"
+                                        : "<<none — UNEXPECTED>>" };
+            ctx.record(std::string{ "[INFO] no-widening w(int 100): C++ int (I) matched NO widen-only "
+                                    "overload (no Java int->long/double widening); fell back to "
+                                    "first-by-name = " } + which
+                       + " (HotSpot _methods Symbol-ordering arbitrary); returned value = "
+                       + std::to_string(r.ival)
+                       + ", lastWArg=" + std::to_string(overload_dispatch::last_w_arg()) + ".");
         }
     }
     // scoped_hook `handle` disarms here — NO hook left armed; shutdown_hooks()

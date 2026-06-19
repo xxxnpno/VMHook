@@ -67,6 +67,45 @@ public final class OverloadDispatch
     public static final long   H_LONG_ARG     = 7L;          // h(long) -> 7007
     public static final long   H_LONG_EXPECT  = 7007L;       // x + 7000
 
+    // ── Distinct single-slot primitive descriptors for the `g` family ──────────
+    // Each overload has a UNIQUE JVM descriptor (S / B / C / Z / F / I) so a
+    // C++-typed call() must pick exactly one via argument_matches_descriptor's
+    // EXACT-WIDTH mapping (int16_t->S, int8_t->B, char16_t->C, bool->Z, float->F,
+    // int32_t->I) with NO Java-widening between them.  All are category-1 (single
+    // interpreter slot) so they dispatch correctly on BOTH the call_stub and
+    // call_jni paths on every JDK.  Each body bumps its own counter and echoes its
+    // (widened-to-long) argument so the native side can confirm WHICH ran.
+    public static final short  G_SHORT_ARG    = 12;          // g(short)   -> 1012
+    public static final int    G_SHORT_EXPECT = 1012;        // x + 1000
+    public static final byte   G_BYTE_ARG     = 5;           // g(byte)    -> 2005
+    public static final int    G_BYTE_EXPECT  = 2005;        // x + 2000
+    public static final char   G_CHAR_ARG     = 'A';         // g(char)    -> 'A'(65)+3000 = 3065
+    public static final int    G_CHAR_EXPECT  = 3065;        // x + 3000
+    public static final boolean G_BOOL_ARG    = true;        // g(boolean) -> 1
+    public static final int    G_BOOL_EXPECT  = 1;           // true -> 1
+    public static final float  G_FLOAT_ARG    = 2.5f;        // g(float)   -> 2.5 + 4000.25 = 4002.75
+    public static final float  G_FLOAT_EXPECT = 4002.75f;    // x + 4000.25
+    public static final int    G_INT_ARG      = 9;           // g(int)     -> 5009
+    public static final int    G_INT_EXPECT   = 5009;        // x + 5000
+
+    // ── Position-dependent multi-arg family `p` ────────────────────────────────
+    // p(int,String) and p(String,int) share a name and arity but differ only by
+    // argument ORDER, so the descriptor the resolver must build depends on the
+    // C++ argument-pack order: (ILjava/lang/String;) vs (Ljava/lang/String;I).
+    public static final int    P_IS_INT       = 7;           // p(int,String)
+    public static final String P_IS_STR       = "x";
+    public static final String P_IS_EXPECT    = "IS:7:x";
+    public static final int    P_SI_INT       = 8;           // p(String,int)
+    public static final String P_SI_STR       = "y";
+    public static final String P_SI_EXPECT    = "SI:y:8";
+
+    // ── Widen-only family `w` (no narrow overload) ─────────────────────────────
+    // w(long) and w(double) ONLY — there is NO w(int).  Calling w() with a C++
+    // int (descriptor I) matches NEITHER, so resolve_compatible_method falls back
+    // to the first-by-name overload: vmhook does NOT perform Java widening
+    // (int->long / int->double).  Both fallbacks are primitive (no reference
+    // slot), so the no-match dispatch is safe.
+
     // ── Per-overload Java-recorded side effects (proof of WHICH body ran) ──────
     // Each overload records its own argument(s)/result + bumps its hit counter, so
     // the native side can confirm — purely from Java's observable state — that the
@@ -88,6 +127,33 @@ public final class OverloadDispatch
     public static volatile long    lastHResult;      // last h(*) result (widened)
     public static volatile int     hIntHits;         // h(int)  invocation count
     public static volatile int     hLongHits;        // h(long) invocation count
+
+    // `g` family echoes (each overload widens its arg/result into a long slot) +
+    // per-overload hit counters, so the native side proves WHICH descriptor the
+    // C++-typed call() resolved without depending on any field-typed readback.
+    public static volatile long    lastGArg;         // last g(*) argument (widened)
+    public static volatile long    lastGResult;      // last g(*) result (widened, *1000 scaled)
+    public static volatile int     gShortHits;       // g(short)   invocation count
+    public static volatile int     gByteHits;        // g(byte)    invocation count
+    public static volatile int     gCharHits;        // g(char)    invocation count
+    public static volatile int     gBoolHits;        // g(boolean) invocation count
+    public static volatile int     gFloatHits;       // g(float)   invocation count
+    public static volatile int     gIntHits;         // g(int)     invocation count
+
+    // `p` family echoes (position-dependent multi-arg).
+    public static volatile String  lastPResult;      // last p(*) formatted result
+    public static volatile int     pIsHits;          // p(int,String) invocation count
+    public static volatile int     pSiHits;          // p(String,int) invocation count
+
+    // single-String-overload family `sf` echoes (const char* / string_view / std::string
+    // all map to Ljava/lang/String; and must reach this ONE overload).
+    public static volatile String  lastSfArg;        // last sf(String) argument
+    public static volatile int     sfHits;           // sf(String) invocation count
+
+    // `w` widen-only family echoes (no narrow overload).
+    public static volatile long    lastWArg;         // last w(*) argument (widened)
+    public static volatile int     wLongHits;        // w(long)   invocation count
+    public static volatile int     wDoubleHits;      // w(double) invocation count
 
     /** tick() invocation count — handshake proof the detour fired. */
     public static volatile int     tickCount;
@@ -161,6 +227,119 @@ public final class OverloadDispatch
         lastHResult = x + 7000L;
         hLongHits++;
         return x + 7000L;
+    }
+
+    // ── The distinct single-slot `g` family (one overload per descriptor) ──────
+    // Declaration order is again scrambled relative to descriptor order; the
+    // resolver must pick by the C++ argument TYPE, not source position.
+
+    /** g(S)I -> x + 1000 */
+    public int g(final short x)
+    {
+        final int r = x + 1000;
+        lastGArg = x;
+        lastGResult = r;
+        gShortHits++;
+        return r;
+    }
+
+    /** g(Z)I -> (b ? 1 : 0) */
+    public int g(final boolean b)
+    {
+        final int r = b ? 1 : 0;
+        lastGArg = b ? 1L : 0L;
+        lastGResult = r;
+        gBoolHits++;
+        return r;
+    }
+
+    /** g(B)I -> x + 2000 */
+    public int g(final byte x)
+    {
+        final int r = x + 2000;
+        lastGArg = x;
+        lastGResult = r;
+        gByteHits++;
+        return r;
+    }
+
+    /** g(F)F -> x + 4000.25 */
+    public float g(final float x)
+    {
+        final float r = x + 4000.25f;
+        lastGArg = (long) x;
+        lastGResult = (long) r;
+        gFloatHits++;
+        return r;
+    }
+
+    /** g(C)I -> x + 3000 */
+    public int g(final char x)
+    {
+        final int r = x + 3000;
+        lastGArg = x;
+        lastGResult = r;
+        gCharHits++;
+        return r;
+    }
+
+    /** g(I)I -> x + 5000 */
+    public int g(final int x)
+    {
+        final int r = x + 5000;
+        lastGArg = x;
+        lastGResult = r;
+        gIntHits++;
+        return r;
+    }
+
+    // ── Position-dependent multi-arg family `p` ────────────────────────────────
+
+    /** p(ILjava/lang/String;)Ljava/lang/String; -> "IS:" + n + ":" + s */
+    public String p(final int n, final String s)
+    {
+        final String r = "IS:" + n + ":" + s;
+        lastPResult = r;
+        pIsHits++;
+        return r;
+    }
+
+    /** p(Ljava/lang/String;I)Ljava/lang/String; -> "SI:" + s + ":" + n */
+    public String p(final String s, final int n)
+    {
+        final String r = "SI:" + s + ":" + n;
+        lastPResult = r;
+        pSiHits++;
+        return r;
+    }
+
+    // ── Widen-only family `w` (no narrow overload; proves NO Java widening) ─────
+
+    /** w(J)J -> x + 60000 */
+    public long w(final long x)
+    {
+        lastWArg = x;
+        wLongHits++;
+        return x + 60000L;
+    }
+
+    /** w(D)D -> x + 70000.0 */
+    public double w(final double x)
+    {
+        lastWArg = (long) x;
+        wDoubleHits++;
+        return x + 70000.0;
+    }
+
+    // ── Single-String-overload family `sf` (one overload, three C++ spellings) ─
+
+    /** sf(Ljava/lang/String;)Ljava/lang/String; -> "{" + s + "}" */
+    public String sf(final String s)
+    {
+        final String r = "{" + s + "}";
+        lastSfArg = s;
+        sfHits++;
+        return r;
     }
 
     static

@@ -84,6 +84,24 @@ public final class FieldSetGuard
     public static String  okStr = "guard";
 
     // =====================================================================
+    //  BOUNDARY / EXTREME correct-width round-trip targets.  Each gets a
+    //  correct-width native write of an extreme bit pattern (min / max /
+    //  all-ones / NaN / Inf / -0.0 / denormal); the native side proves the value
+    //  round-trips natively and (via the bnd* snapshot) that Java observed the
+    //  exact bits -- a wide correct-width memcpy must preserve every bit, not just
+    //  the low ones, at the numeric extremes where a sloppy write is most likely
+    //  to drop a bit.  Initial values are 0 / distinct so a dropped write shows.
+    // =====================================================================
+    public static boolean bndZ = false;   // native writes false then true
+    public static byte    bndB = 0;       // native writes (byte)0x80 = -128 (min)
+    public static short   bndS = 0;       // native writes (short)0x8000 = -32768 (min)
+    public static char    bndC = 0;       // native writes 0xFFFF (max char)
+    public static int     bndI = 0;       // native writes 0x80000000 (Integer.MIN_VALUE)
+    public static long    bndJ = 0L;      // native writes 0x8000000000000000 (Long.MIN_VALUE)
+    public static float   bndF = 0.0f;    // native writes a float NaN bit pattern
+    public static double  bndD = 0.0;     // native writes a double -0.0 bit pattern
+
+    // =====================================================================
     //  TYPE-CONFUSION (same-width, wrong KIND) targets.  field_proxy::set's
     //  guard is a *size* guard only: set(float) into an "I" field passes (both
     //  4 bytes) and writes the IEEE-754 bit pattern; set(int32) into an "F"
@@ -156,6 +174,20 @@ public final class FieldSetGuard
     public char clobC       = 0x1111;
     public char clobCAfter  = 0x7BBB;
 
+    // =====================================================================
+    //  NON-PRIMITIVE anti-clobber trio (4-byte int width).  The width-mismatch
+    //  trios above prove a too-WIDE primitive write does not spill.  This trio
+    //  proves the SYMMETRIC guard (string / vector / unique_ptr into a primitive)
+    //  is ALSO anti-clobber: a refused non-primitive write into npClobI -- which
+    //  in the unguarded legacy path would have reinterpreted the int bytes as a
+    //  compressed OOP and written through a wild address -- leaves BOTH sentinels
+    //  (and the target) byte-for-byte intact.  Distinct from the clobI trio so the
+    //  two probes never perturb each other.
+    // =====================================================================
+    public int npClobIBefore = 0x6CCC_CCCC;
+    public int npClobI       = 0x6DDD_DDDD;
+    public int npClobIAfter  = 0x6EEE_EEEE;
+
     // A live instance the native side wraps to reach the clob* instance fields.
     public static FieldSetGuard instance = new FieldSetGuard();
 
@@ -220,6 +252,21 @@ public final class FieldSetGuard
     public static boolean seenRefSlotIsNull;
     public static int     seenRefSlotTag;
 
+    // Boundary round-trip witnesses (float/double captured as raw bits).
+    public static boolean bndSeenZ;
+    public static byte    bndSeenB;
+    public static short   bndSeenS;
+    public static char    bndSeenC;
+    public static int     bndSeenI;
+    public static long    bndSeenJ;
+    public static int     bndSeenFBits;   // Float.floatToRawIntBits(bndF)
+    public static long    bndSeenDBits;   // Double.doubleToRawLongBits(bndD)
+
+    // Non-primitive anti-clobber witnesses (instance trio snapshot).
+    public static int     seenNpClobIBefore;
+    public static int     seenNpClobI;
+    public static int     seenNpClobIAfter;
+
     // ---- Java getters (pulled natively via static_method to prove the write is
     //      visible to executing Java bytecode, not just a memory peek) ----
     public static boolean getOkZ()  { return okZ; }
@@ -234,6 +281,9 @@ public final class FieldSetGuard
     public static int     getRefSlotTag(){ return refSlot == null ? -1 : refSlot.tag; }
     public static boolean refSlotIsB()  { return refSlot == refB; }
     public static boolean refSlotIsNull(){ return refSlot == null; }
+    public static int     getBndI()     { return bndI; }      // Integer.MIN_VALUE after native write
+    public static long    getBndJ()     { return bndJ; }      // Long.MIN_VALUE after native write
+    public static int     getBndC()     { return bndC; }      // 0xFFFF widened unsigned to int
 
     /**
      * Hookable instance method (an interpreter-hook anchor, parallel to
@@ -298,6 +348,21 @@ public final class FieldSetGuard
         seenRefSlotIsB = (refSlot == refB);
         seenRefSlotIsNull = (refSlot == null);
         seenRefSlotTag = (refSlot == null) ? -1 : refSlot.tag;
+
+        // ---- boundary round-trip targets (raw bit views for FP) ----
+        bndSeenZ = bndZ;
+        bndSeenB = bndB;
+        bndSeenS = bndS;
+        bndSeenC = bndC;
+        bndSeenI = bndI;
+        bndSeenJ = bndJ;
+        bndSeenFBits = Float.floatToRawIntBits(bndF);
+        bndSeenDBits = Double.doubleToRawLongBits(bndD);
+
+        // ---- non-primitive anti-clobber trio (must all be unchanged) ----
+        seenNpClobIBefore = s.npClobIBefore;
+        seenNpClobI       = s.npClobI;
+        seenNpClobIAfter  = s.npClobIAfter;
     }
 
     static

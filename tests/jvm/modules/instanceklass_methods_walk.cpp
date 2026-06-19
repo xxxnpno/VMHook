@@ -117,10 +117,13 @@ namespace
     class mw_marker   : public vmhook::object<mw_marker>   { public: explicit mw_marker(vmhook::oop_t i) noexcept   : vmhook::object<mw_marker>{ i } {} };
     class mw_iface    : public vmhook::object<mw_iface>    { public: explicit mw_iface(vmhook::oop_t i) noexcept    : vmhook::object<mw_iface>{ i } {} };
     class mw_abstract : public vmhook::object<mw_abstract> { public: explicit mw_abstract(vmhook::oop_t i) noexcept : vmhook::object<mw_abstract>{ i } {} };
+    class mw_concrete : public vmhook::object<mw_concrete> { public: explicit mw_concrete(vmhook::oop_t i) noexcept : vmhook::object<mw_concrete>{ i } {} };
     class mw_base     : public vmhook::object<mw_base>     { public: explicit mw_base(vmhook::oop_t i) noexcept     : vmhook::object<mw_base>{ i } {} };
     class mw_mid      : public vmhook::object<mw_mid>      { public: explicit mw_mid(vmhook::oop_t i) noexcept      : vmhook::object<mw_mid>{ i } {} };
     class mw_sub      : public vmhook::object<mw_sub>      { public: explicit mw_sub(vmhook::oop_t i) noexcept      : vmhook::object<mw_sub>{ i } {} };
     class mw_vals     : public vmhook::object<mw_vals>     { public: explicit mw_vals(vmhook::oop_t i) noexcept     : vmhook::object<mw_vals>{ i } {} };
+    class mw_enumabs  : public vmhook::object<mw_enumabs>  { public: explicit mw_enumabs(vmhook::oop_t i) noexcept  : vmhook::object<mw_enumabs>{ i } {} };
+    class mw_generic  : public vmhook::object<mw_generic>  { public: explicit mw_generic(vmhook::oop_t i) noexcept  : vmhook::object<mw_generic>{ i } {} };
     class mw_anno     : public vmhook::object<mw_anno>     { public: explicit mw_anno(vmhook::oop_t i) noexcept     : vmhook::object<mw_anno>{ i } {} };
     class mw_many     : public vmhook::object<mw_many>     { public: explicit mw_many(vmhook::oop_t i) noexcept     : vmhook::object<mw_many>{ i } {} };
     class mw_inner    : public vmhook::object<mw_inner>    { public: explicit mw_inner(vmhook::oop_t i) noexcept    : vmhook::object<mw_inner>{ i } {} };
@@ -139,10 +142,13 @@ namespace
     constexpr char NAME_MARKER[]{ "vmhook/fixtures/MethodsWalk$Marker" };
     constexpr char NAME_IFACE[]{ "vmhook/fixtures/MethodsWalk$Iface" };
     constexpr char NAME_ABSTRACT[]{ "vmhook/fixtures/MethodsWalk$Abstract" };
+    constexpr char NAME_CONCRETE[]{ "vmhook/fixtures/MethodsWalk$ConcreteSub" };
     constexpr char NAME_BASE[]{ "vmhook/fixtures/MethodsWalk$Base" };
     constexpr char NAME_MID[]{ "vmhook/fixtures/MethodsWalk$Mid" };
     constexpr char NAME_SUB[]{ "vmhook/fixtures/MethodsWalk$Sub" };
     constexpr char NAME_VALS[]{ "vmhook/fixtures/MethodsWalk$Vals" };
+    constexpr char NAME_ENUMABS[]{ "vmhook/fixtures/MethodsWalk$EnumAbstract" };
+    constexpr char NAME_GENERIC[]{ "vmhook/fixtures/MethodsWalk$Generic" };
     constexpr char NAME_ANNO[]{ "vmhook/fixtures/MethodsWalk$Anno" };
     constexpr char NAME_MANY[]{ "vmhook/fixtures/MethodsWalk$Many" };
     constexpr char NAME_INNER[]{ "vmhook/fixtures/MethodsWalk$Inner" };
@@ -229,10 +235,13 @@ VMHOOK_JVM_MODULE(instanceklass_methods_walk)
     vmhook::register_class<mw_marker>(NAME_MARKER);
     vmhook::register_class<mw_iface>(NAME_IFACE);
     vmhook::register_class<mw_abstract>(NAME_ABSTRACT);
+    vmhook::register_class<mw_concrete>(NAME_CONCRETE);
     vmhook::register_class<mw_base>(NAME_BASE);
     vmhook::register_class<mw_mid>(NAME_MID);
     vmhook::register_class<mw_sub>(NAME_SUB);
     vmhook::register_class<mw_vals>(NAME_VALS);
+    vmhook::register_class<mw_enumabs>(NAME_ENUMABS);
+    vmhook::register_class<mw_generic>(NAME_GENERIC);
     vmhook::register_class<mw_anno>(NAME_ANNO);
     vmhook::register_class<mw_many>(NAME_MANY);
     vmhook::register_class<mw_inner>(NAME_INNER);
@@ -330,6 +339,31 @@ VMHOOK_JVM_MODULE(instanceklass_methods_walk)
     // newInner returns the inner type.
     ctx.check("has_newInner",
               count_pair(top, "newInner", "()Lvmhook/fixtures/MethodsWalk$Inner;") == 1);
+
+    // SINGLE-PRIMITIVE RETURN descriptors: one method per primitive return char.
+    // (int/void returns are already implied by ov/syncM; these add the five
+    // OTHER single-primitive return codes the walk must decode byte-exact.)
+    ctx.check("has_retZ_Z", count_pair(top, "retZ", "()Z") == 1);
+    ctx.check("has_retC_C", count_pair(top, "retC", "()C") == 1);
+    ctx.check("has_retS_S", count_pair(top, "retS", "()S") == 1);
+    ctx.check("has_retB_B", count_pair(top, "retB", "()B") == 1);
+    ctx.check("has_retF_F", count_pair(top, "retF", "()F") == 1);
+    ctx.check("has_retJ_J", count_pair(top, "retJ", "()J") == 1);
+
+    // ARRAY RETURN descriptors: the '[' lives in the RETURN slot (1-D prim,
+    // 2-D prim, 1-D reference) — never exercised by the arg-side array tests.
+    ctx.check("has_retArrI",   count_pair(top, "retArrI",   "()[I") == 1);
+    ctx.check("has_retArr2J",  count_pair(top, "retArr2J",  "()[[J") == 1);
+    ctx.check("has_retArrStr", count_pair(top, "retArrStr", "()[Ljava/lang/String;") == 1);
+
+    // VISIBILITY-agnostic enumeration: a private and a protected method appear
+    // exactly like a public one (the walk reads _methods regardless of
+    // JVM_ACC_*).  Unique descriptors so the (I)I/()V counts are undisturbed.
+    ctx.check("has_privM_CI",  count_pair(top, "privM", "(C)I") == 1); // private
+    ctx.check("has_protM_BJ",  count_pair(top, "protM", "(B)J") == 1); // protected
+
+    // STATIC NATIVE (declared; never linked) still has an _methods entry.
+    ctx.check("has_snat_IV",   count_pair(top, "snat", "(I)V") == 1);
 
     // synthetic members live in _methods.
     ctx.check("has_init_V",   count_pair(top, "<init>",   "()V") >= 1);
@@ -709,6 +743,227 @@ VMHOOK_JVM_MODULE(instanceklass_methods_walk)
         vmhook::log_class_methods<mw_empty>();
         const std::size_t after{ vmhook::get_class_methods<mw>().size() };
         ctx.check("log_class_methods_no_side_effect", before == after);
+    }
+
+    // =====================================================================
+    // PART 19 — RAW per-slot DECODE parity (deeper than PART 1's count==size).
+    //   PART 1 pins count == collector.size().  This pins the DECODE: walk the
+    //   raw get_methods_ptr() array element-by-element, call get_name()/
+    //   get_signature() on each slot DIRECTLY, and assert the resulting ordered
+    //   pair vector is byte-for-byte IDENTICAL to the collector's output.  This
+    //   proves the collector adds nothing and drops nothing vs the bare accessor
+    //   walk (the +0 length / +8 data ABI decoded through the real Method*).
+    //   All metaspace reads (Method*/Symbol* native + stable) -> HARD.
+    // =====================================================================
+    cp("PART 19 raw per-slot decode parity (metaspace metadata)");
+    {
+        vmhook::hotspot::klass* const top_klass{
+            reinterpret_cast<vmhook::hotspot::klass*>(vmhook::find_class(NAME_TOP)) };
+        ctx.check("decode_klass_resolved", top_klass != nullptr);
+
+        if (top_klass != nullptr)
+        {
+            const std::int32_t raw_count{ top_klass->get_methods_count() };
+            vmhook::hotspot::method** const raw_ptr{ top_klass->get_methods_ptr() };
+
+            pair_list raw_decoded{};
+            bool decode_ran{ raw_ptr != nullptr && raw_count > 0 };
+            if (decode_ran)
+            {
+                raw_decoded.reserve(static_cast<std::size_t>(raw_count));
+                for (std::int32_t i{ 0 }; i < raw_count; ++i)
+                {
+                    vmhook::hotspot::method* const m{ raw_ptr[i] };
+                    if (!m || !vmhook::hotspot::is_valid_pointer(m))
+                    {
+                        continue; // mirror the collector's per-slot skip
+                    }
+                    const std::string nm{ m->get_name() };
+                    const std::string sg{ m->get_signature() };
+                    raw_decoded.emplace_back(nm, sg);
+                }
+            }
+            ctx.check("decode_ran", decode_ran);
+
+            // The raw decode equals the collector — element-for-element, in order
+            // (the collector IS this exact loop; this is the behavioural pin).
+            const pair_list collected{ vmhook::get_class_methods(NAME_TOP) };
+            ctx.check("decode_size_eq_collector", raw_decoded.size() == collected.size());
+            ctx.check("decode_identical_to_collector", raw_decoded == collected);
+
+            // Every decoded slot is non-empty on both axes (no decode-fail / no
+            // empty-name slot survived) — the flaw-#5 property at the RAW layer.
+            const bool raw_no_empty{ std::none_of(raw_decoded.begin(), raw_decoded.end(),
+                [](const std::pair<std::string, std::string>& p)
+                { return p.first.empty() || p.second.empty(); }) };
+            ctx.check("decode_no_empty_pair", raw_no_empty);
+
+            // A known unique method is present in the RAW decode (proves the loop
+            // reached real Method*s, not a degenerate empty walk).
+            ctx.check("decode_has_idLong",
+                      count_pair(raw_decoded, "idLong", "(J)J") == 1);
+        }
+    }
+
+    // =====================================================================
+    // PART 20 — Concrete subclass of an abstract parent OVERRIDES the abstract
+    //   method: the override is DECLARED on the child, so its walk lists shape(I)
+    //   + the child's own extra(I) + <init>; it does NOT list the inherited
+    //   concrete(I) (a non-overridden parent method stays on the parent only).
+    // =====================================================================
+    cp("PART 20 concrete subclass override enumeration");
+    {
+        const pair_list cs{ vmhook::get_class_methods<mw_concrete>() };
+        ctx.check("concrete_has_override_shape", count_pair(cs, "shape", "(I)I") == 1);
+        ctx.check("concrete_has_extra",         count_pair(cs, "extra", "(I)I") == 1);
+        ctx.check("concrete_has_init",          count_pair(cs, "<init>", "()V") == 1);
+        // The parent's non-overridden concrete(I) is NOT declared on the child.
+        ctx.check("concrete_excludes_inherited_concrete", !has_name(cs, "concrete"));
+        ctx.check("concrete_excludes_toString",           !has_name(cs, "toString"));
+        // shape + extra + <init> = 3 declared (a plain override of a same-
+        // signature method emits no bridge).  Lower-bounded so a JDK that adds a
+        // synthetic cannot redden CI; the exact membership above pins the set.
+        ctx.check("concrete_size_at_least_3", cs.size() >= 3);
+        ctx.record(std::string{ "[INFO] ConcreteSub method count = " }
+                   + std::to_string(cs.size()));
+    }
+
+    // =====================================================================
+    // PART 21 — Enum with a constant-specific body: the user method is ABSTRACT
+    //   on the enum klass (constant bodies live on synthetic anon subclasses).
+    //   values()/valueOf(String) stay JDK-stable; the abstract apply(I) is on
+    //   THIS klass; the constant-body overrides are NOT (they are on the anon
+    //   subclasses, which this bare walk never climbs into).
+    // =====================================================================
+    cp("PART 21 enum with abstract constant-specific method");
+    {
+        const pair_list ea{ vmhook::get_class_methods<mw_enumabs>() };
+        ctx.check("enumabs_has_values",
+                  count_pair(ea, "values", "()[Lvmhook/fixtures/MethodsWalk$EnumAbstract;") == 1);
+        ctx.check("enumabs_has_valueOf",
+                  count_pair(ea, "valueOf",
+                             "(Ljava/lang/String;)Lvmhook/fixtures/MethodsWalk$EnumAbstract;") == 1);
+        ctx.check("enumabs_has_abstract_apply", count_pair(ea, "apply", "(I)I") == 1);
+        ctx.check("enumabs_has_init",   has_name(ea, "<init>"));
+        ctx.check("enumabs_has_clinit", has_name(ea, "<clinit>"));
+        // apply appears exactly once on the enum klass (the constant overrides
+        // are on the anon subclasses, not enumerated by this bare walk).
+        ctx.check("enumabs_apply_once_on_klass", count_name(ea, "apply") == 1);
+        ctx.check("enumabs_no_empty",
+                  std::none_of(ea.begin(), ea.end(),
+                      [](const std::pair<std::string, std::string>& p)
+                      { return p.first.empty() || p.second.empty(); }));
+    }
+
+    // =====================================================================
+    // PART 22 — Generic CLASS (type parameter on the class): the type variable
+    //   erases to its bound (Object) in every method descriptor.  echo(T) walks
+    //   as (Ljava/lang/Object;)Ljava/lang/Object;; sizeOf(T) as (Lj.l.Object;)I.
+    //   Class-level erasure, distinct from the top-level method-level generics.
+    // =====================================================================
+    cp("PART 22 generic-class erasure");
+    {
+        const pair_list ge{ vmhook::get_class_methods<mw_generic>() };
+        ctx.check("generic_has_echo_erased",
+                  count_pair(ge, "echo", "(Ljava/lang/Object;)Ljava/lang/Object;") == 1);
+        ctx.check("generic_has_sizeOf_erased",
+                  count_pair(ge, "sizeOf", "(Ljava/lang/Object;)I") == 1);
+        ctx.check("generic_has_init", count_pair(ge, "<init>", "()V") == 1);
+        // Erasure must have replaced the type variable T with its bound: the
+        // un-erased generic-signature form (TT;)TT; must NOT appear as the JVM
+        // DESCRIPTOR (that form lives only in the Signature attribute, never in
+        // _methods' descriptor symbol the walk reads).
+        ctx.check("generic_no_typevar_leak", count_descriptor(ge, "(TT;)TT;") == 0);
+        ctx.check("generic_echo_count_1", count_name(ge, "echo") == 1);
+    }
+
+    // =====================================================================
+    // PART 23 — find_methods_by_signature<W> substrate consistency on THIS
+    //   fixture's KNOWN descriptors (fmbs's own module pins its OWN fixture;
+    //   this pins the filter against the methods-walk fixture's exact map).  For
+    //   every probed descriptor, find(...).size() == its multiplicity in
+    //   get_class_methods<mw>(), and every returned name carries that descriptor.
+    // =====================================================================
+    cp("PART 23 find_methods_by_signature substrate consistency");
+    {
+        const auto check_desc = [&](const char* tag, const std::string& descriptor)
+        {
+            const std::vector<std::string> names{
+                vmhook::find_methods_by_signature<mw>(descriptor) };
+            const std::size_t multiplicity{ count_descriptor(top, descriptor) };
+            ctx.check(std::string{ "fmbs_size_eq_mult_" } + tag,
+                      names.size() == multiplicity);
+            // Every returned NAME actually carries this descriptor in the pair list.
+            bool every_name_carries{ true };
+            for (const std::string& n : names)
+            {
+                if (count_pair(top, n, descriptor) != 1)
+                {
+                    every_name_carries = false;
+                    break;
+                }
+            }
+            ctx.check(std::string{ "fmbs_names_carry_desc_" } + tag, every_name_carries);
+        };
+
+        check_desc("II",   "(I)I");                 // si + ii + nat + fin + ov = 5
+        check_desc("JJ",   "(J)J");                 // ov(long) + idLong = 2
+        check_desc("V",    "()V");                  // many: syncM + uniques + <init>/<clinit>
+        check_desc("Z",    "()Z");                  // retZ -> exactly 1
+        check_desc("allP", "(ZBCSIJFD)V");          // allPrims -> exactly 1
+        check_desc("deep", "([[[Ljava/lang/String;)V"); // deep -> exactly 1
+        check_desc("none", "(Lno/such/Type;)V");    // nothing declares -> 0
+
+        // The unique-descriptor case resolves to exactly one name, and it is the
+        // expected one — the canonical "rotate the name, keep the descriptor" use.
+        const std::vector<std::string> z_names{
+            vmhook::find_methods_by_signature<mw>("()Z") };
+        ctx.check("fmbs_Z_unique_is_retZ",
+                  z_names.size() == 1 && z_names.front() == "retZ");
+
+        // (J)J is non-unique (2) — find returns BOTH, never silently the first.
+        const std::vector<std::string> jj_names{
+            vmhook::find_methods_by_signature<mw>("(J)J") };
+        ctx.check("fmbs_JJ_returns_both",
+                  jj_names.size() == 2
+                  && std::count(jj_names.begin(), jj_names.end(), std::string{ "ov" }) == 1
+                  && std::count(jj_names.begin(), jj_names.end(), std::string{ "idLong" }) == 1);
+
+        // Unregistered wrapper -> empty for ANY descriptor (flaw #6 at the filter).
+        ctx.check("fmbs_unregistered_empty",
+                  vmhook::find_methods_by_signature<mw_unregistered>("(I)I").empty());
+    }
+
+    // =====================================================================
+    // PART 24 — Expanded bad-input degradation: more malformed class-name shapes
+    //   all return empty and never crash (extends PART 16).  Pure metadata
+    //   lookups; reaching the end is the no-crash witness.
+    // =====================================================================
+    cp("PART 24 expanded bad-input degradation");
+    {
+        ctx.check("whitespace_name_empty",
+                  vmhook::get_class_methods("   ").empty());
+        ctx.check("trailing_slash_empty",
+                  vmhook::get_class_methods("vmhook/fixtures/MethodsWalk/").empty());
+        ctx.check("leading_slash_empty",
+                  vmhook::get_class_methods("/vmhook/fixtures/MethodsWalk").empty());
+        // A primitive type name and an array descriptor are not InstanceKlass
+        // internal names -> empty, never a crash.
+        ctx.check("primitive_name_empty", vmhook::get_class_methods("int").empty());
+        ctx.check("array_desc_name_empty", vmhook::get_class_methods("[I").empty());
+        ctx.check("obj_array_desc_empty",
+                  vmhook::get_class_methods("[Ljava/lang/String;").empty());
+        // A wrong-case nested name (the JVM is case-sensitive) -> empty.
+        ctx.check("wrongcase_nested_empty",
+                  vmhook::get_class_methods("vmhook/fixtures/methodswalk$Empty").empty());
+        // A name with an embedded NUL byte -> empty, never a crash (the resolver
+        // must not walk past / mis-handle the NUL).  Length 28 = 23 chars +
+        // NUL + "Walk" (4), so the NUL is interior, not a terminator.
+        ctx.check("embedded_nul_name_empty",
+                  vmhook::get_class_methods(std::string{ "vmhook/fixtures/Methods\0Walk", 28 }).empty());
+        // A bare top-level name without package -> empty.
+        ctx.check("bare_name_empty", vmhook::get_class_methods("MethodsWalk").empty());
+        ctx.check("bad_input_24_no_crash", true); // reached => no fault on any probe
     }
 
     cp("module complete (all parts reached without a no-SEH fault)");

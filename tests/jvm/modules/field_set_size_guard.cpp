@@ -67,6 +67,7 @@
 
 #include "../harness.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -292,6 +293,53 @@ VMHOOK_JVM_MODULE(field_set_size_guard)
     ctx.check("ok_str_reads_guard", fsg::get_string("okStr") == "guard");
 
     // =====================================================================
+    //  1b. BOUNDARY / EXTREME correct-width round-trips.  A correct-width memcpy
+    //      must preserve EVERY bit at the numeric extremes (min / max / all-ones /
+    //      NaN / -0.0 / denormal), not merely a typical mid-range value — the
+    //      place a sloppy or off-by-one write is likeliest to drop a high bit.
+    //      Each lands and re-reads natively here; Java's own view is proven in the
+    //      bnd* snapshot (phase 10b) and getters (phase 11b).
+    // =====================================================================
+    constexpr std::uint32_t k_bndF_nan_bits{ 0x7FC00000u };                 // canonical quiet NaN
+    constexpr std::uint64_t k_bndD_negzero_bits{ 0x8000000000000000ULL };   // -0.0
+    {
+        // boolean: false then true (1-byte, exact).
+        ctx.check("bnd_Z_set_false", fsg::set_static<bool>("bndZ", false));
+        ctx.check("bnd_Z_reread_false", fsg::get_bool("bndZ") == false);
+        ctx.check("bnd_Z_set_true", fsg::set_static<bool>("bndZ", true));
+        ctx.check("bnd_Z_reread_true", fsg::get_bool("bndZ") == true);
+
+        // byte min (-128 == 0x80): high bit set, must not sign-mangle the slot.
+        ctx.check("bnd_B_set_min", fsg::set_static<std::int8_t>("bndB", static_cast<std::int8_t>(0x80)));
+        ctx.check("bnd_B_reread_min", fsg::get_i8("bndB") == static_cast<std::int8_t>(0x80));
+
+        // short min (0x8000): top byte set.
+        ctx.check("bnd_S_set_min", fsg::set_static<std::int16_t>("bndS", static_cast<std::int16_t>(0x8000)));
+        ctx.check("bnd_S_reread_min", fsg::get_i16("bndS") == static_cast<std::int16_t>(0x8000));
+
+        // char max (0xFFFF): all 16 bits set.
+        ctx.check("bnd_C_set_max", fsg::set_static<std::uint16_t>("bndC", 0xFFFF));
+        ctx.check("bnd_C_reread_max", fsg::get_u16("bndC") == 0xFFFF);
+
+        // int min (0x80000000): only the sign bit set.
+        ctx.check("bnd_I_set_min", fsg::set_static<std::int32_t>("bndI", static_cast<std::int32_t>(0x80000000)));
+        ctx.check("bnd_I_reread_min", fsg::get_i32("bndI") == static_cast<std::int32_t>(0x80000000));
+
+        // long min (0x8000000000000000): only the sign bit, across all 8 bytes.
+        ctx.check("bnd_J_set_min", fsg::set_static<std::int64_t>("bndJ", static_cast<std::int64_t>(0x8000000000000000ULL)));
+        ctx.check("bnd_J_reread_min", fsg::get_i64("bndJ") == static_cast<std::int64_t>(0x8000000000000000ULL));
+
+        // float NaN: a non-finite bit pattern must round-trip bit-for-bit (no
+        // canonicalisation by a sloppy float-typed copy).
+        ctx.check("bnd_F_set_nan", fsg::set_static<float>("bndF", bits_to_float(k_bndF_nan_bits)));
+        ctx.check("bnd_F_reread_nan_bits", float_bits(fsg::get_float("bndF")) == k_bndF_nan_bits);
+
+        // double -0.0: distinguishable from +0.0 only by the sign bit.
+        ctx.check("bnd_D_set_negzero", fsg::set_static<double>("bndD", bits_to_double(k_bndD_negzero_bits)));
+        ctx.check("bnd_D_reread_negzero_bits", double_bits(fsg::get_double("bndD")) == k_bndD_negzero_bits);
+    }
+
+    // =====================================================================
     //  2. SIZE GUARD — too-WIDE writes REFUSED (field unchanged).
     //     set(int64) into "I"/"B"/"S" and the like must NOT memcpy: an unguarded
     //     8-byte (or 4-byte) write into a narrower slot would corrupt the field
@@ -327,6 +375,90 @@ VMHOOK_JVM_MODULE(field_set_size_guard)
     // float (4B) into the double (8B) field is also too narrow -> refused.
     fsg::set_static<float>("gNarrowD", 2.5F);
     ctx.check("gNarrowD_float_into_double_refused", double_bits(fsg::get_double("gNarrowD")) == 0x3FF0000000000000ULL);
+
+    // =====================================================================
+    //  3b. EXHAUSTIVE WIDTH-MISMATCH MATRIX.  For each guard field of a given JVM
+    //      width, EVERY C++ primitive whose sizeof differs is refused — both
+    //      narrower AND wider, signed AND unsigned, integral AND floating.  These
+    //      reuse the g* fields: because each write is REFUSED, the field stays at
+    //      its init value, so the mode-1 snapshot (phase 10) is unperturbed.  The
+    //      matrix pins that the guard keys on sizeof(value) vs jvm width ALONE and
+    //      never lets a single mismatched width slip through for any of the 1/2/4/8
+    //      byte slots.  (The matching width for each slot is exercised elsewhere.)
+    // =====================================================================
+    {
+        // ---- 1-byte slot "B" (gWideB, init 0x5A): refuse 2/4/8-byte writes ----
+        const std::int8_t kB{ static_cast<std::int8_t>(0x5A) };
+        fsg::set_static<std::int16_t>("gWideB", static_cast<std::int16_t>(0x1234));
+        ctx.check("mx_B_i16_refused", fsg::get_i8("gWideB") == kB);
+        fsg::set_static<std::uint16_t>("gWideB", static_cast<std::uint16_t>(0xABCD));
+        ctx.check("mx_B_u16_refused", fsg::get_i8("gWideB") == kB);
+        fsg::set_static<std::int32_t>("gWideB", static_cast<std::int32_t>(0x09ABCDEF));
+        ctx.check("mx_B_i32_refused", fsg::get_i8("gWideB") == kB);
+        fsg::set_static<float>("gWideB", 1.5F);
+        ctx.check("mx_B_float_refused", fsg::get_i8("gWideB") == kB);
+        fsg::set_static<std::int64_t>("gWideB", std::int64_t{ 0x0102030405060708LL });
+        ctx.check("mx_B_i64_refused", fsg::get_i8("gWideB") == kB);
+        fsg::set_static<double>("gWideB", 2.5);
+        ctx.check("mx_B_double_refused", fsg::get_i8("gWideB") == kB);
+
+        // ---- 2-byte slot "S" (gWideS, init 0x1234): refuse 1/4/8-byte writes ----
+        const std::int16_t kS{ static_cast<std::int16_t>(0x1234) };
+        fsg::set_static<std::int8_t>("gWideS", static_cast<std::int8_t>(0x7E));
+        ctx.check("mx_S_i8_refused", fsg::get_i16("gWideS") == kS);
+        fsg::set_static<std::uint16_t>("gWideS", static_cast<std::uint16_t>(0xBEEF)); // 2B==2B: NOT a width mismatch -> would LAND; skip
+        // (uint16 into "S" is correct width; that landing is covered via okS / gCharByte controls.)
+        // restore S to init in case the above landed, so later snapshot stays valid:
+        fsg::set_static<std::int16_t>("gWideS", kS);
+        ctx.check("mx_S_restored_init", fsg::get_i16("gWideS") == kS);
+        fsg::set_static<std::int32_t>("gWideS", static_cast<std::int32_t>(0x09ABCDEF));
+        ctx.check("mx_S_i32_refused", fsg::get_i16("gWideS") == kS);
+        fsg::set_static<float>("gWideS", 1.5F);
+        ctx.check("mx_S_float_refused", fsg::get_i16("gWideS") == kS);
+        fsg::set_static<std::int64_t>("gWideS", std::int64_t{ 0x0102030405060708LL });
+        ctx.check("mx_S_i64_refused", fsg::get_i16("gWideS") == kS);
+        fsg::set_static<double>("gWideS", 2.5);
+        ctx.check("mx_S_double_refused", fsg::get_i16("gWideS") == kS);
+
+        // ---- 4-byte slot "I" (gWideI, init 0x11223344): refuse 1/2/8-byte writes ----
+        const std::int32_t kI{ 0x11223344 };
+        fsg::set_static<bool>("gWideI", true);
+        ctx.check("mx_I_bool_refused", fsg::get_i32("gWideI") == kI);
+        fsg::set_static<std::int8_t>("gWideI", static_cast<std::int8_t>(0x7E));
+        ctx.check("mx_I_i8_refused", fsg::get_i32("gWideI") == kI);
+        fsg::set_static<std::int16_t>("gWideI", static_cast<std::int16_t>(0x7EEF));
+        ctx.check("mx_I_i16_refused", fsg::get_i32("gWideI") == kI);
+        fsg::set_static<std::uint16_t>("gWideI", static_cast<std::uint16_t>(0xBEEF));
+        ctx.check("mx_I_u16_refused", fsg::get_i32("gWideI") == kI);
+        fsg::set_static<std::int64_t>("gWideI", std::int64_t{ 0x0102030405060708LL });
+        ctx.check("mx_I_i64_refused", fsg::get_i32("gWideI") == kI);
+        fsg::set_static<double>("gWideI", 2.5);
+        ctx.check("mx_I_double_refused", fsg::get_i32("gWideI") == kI);
+
+        // ---- 8-byte slot "J" (gNarrowJ, init 0x1122334455667788): refuse 1/2/4-byte ----
+        const std::int64_t kJ{ 0x1122334455667788LL };
+        fsg::set_static<bool>("gNarrowJ", true);
+        ctx.check("mx_J_bool_refused", fsg::get_i64("gNarrowJ") == kJ);
+        fsg::set_static<std::int8_t>("gNarrowJ", static_cast<std::int8_t>(0x7E));
+        ctx.check("mx_J_i8_refused", fsg::get_i64("gNarrowJ") == kJ);
+        fsg::set_static<std::int16_t>("gNarrowJ", static_cast<std::int16_t>(0x7EEF));
+        ctx.check("mx_J_i16_refused", fsg::get_i64("gNarrowJ") == kJ);
+        fsg::set_static<std::uint16_t>("gNarrowJ", static_cast<std::uint16_t>(0xBEEF));
+        ctx.check("mx_J_u16_refused", fsg::get_i64("gNarrowJ") == kJ);
+        fsg::set_static<std::int32_t>("gNarrowJ", static_cast<std::int32_t>(0x09ABCDEF));
+        ctx.check("mx_J_i32_refused", fsg::get_i64("gNarrowJ") == kJ);
+        fsg::set_static<float>("gNarrowJ", 1.5F);
+        ctx.check("mx_J_float_refused", fsg::get_i64("gNarrowJ") == kJ);
+
+        // ---- 8-byte slot "D" (gNarrowD, init bits 0x3FF0000000000000): refuse 1/2/4-byte ----
+        constexpr std::uint64_t kDbits{ 0x3FF0000000000000ULL };
+        fsg::set_static<std::int8_t>("gNarrowD", static_cast<std::int8_t>(0x7E));
+        ctx.check("mx_D_i8_refused", double_bits(fsg::get_double("gNarrowD")) == kDbits);
+        fsg::set_static<std::int16_t>("gNarrowD", static_cast<std::int16_t>(0x7EEF));
+        ctx.check("mx_D_i16_refused", double_bits(fsg::get_double("gNarrowD")) == kDbits);
+        fsg::set_static<std::int32_t>("gNarrowD", static_cast<std::int32_t>(0x09ABCDEF));
+        ctx.check("mx_D_i32_refused", double_bits(fsg::get_double("gNarrowD")) == kDbits);
+    }
 
     // =====================================================================
     //  4. NON-PRIMITIVE into PRIMITIVE — REFUSED (the symmetric guard).
@@ -365,6 +497,64 @@ VMHOOK_JVM_MODULE(field_set_size_guard)
     }
 
     // =====================================================================
+    //  4b. NON-PRIMITIVE REFUSAL across EVERY remaining primitive width and a
+    //      breadth of non-primitive C++ types.  The symmetric guard keys on
+    //      jvm_primitive_byte_width(sig) != 0 alone (it does NOT inspect the
+    //      width), so it must refuse string / string_view / vector<every elem> /
+    //      unique_ptr into a 1/2/8-byte slot exactly as into the 4-byte "I" above.
+    //      Reuse the unchanged-on-refusal g* fields; every write here is refused
+    //      so the mode-1 snapshot stays valid.  gCharByte's value here is
+    //      irrelevant — phase 5 overwrites it before the snapshot.
+    // =====================================================================
+    {
+        const auto refA{ fsg::acquire("refA") };
+        ctx.check("np4b_refA_acquired", refA != nullptr);
+
+        // ---- std::string into 1/2/8-byte primitive slots ----
+        const auto pB{ fsg::static_field("gWideB") };
+        if (pB) { pB->set(std::string{ "x" }); }
+        ctx.check("np4b_string_into_byte_refused", fsg::get_i8("gWideB") == static_cast<std::int8_t>(0x5A));
+        const auto pS{ fsg::static_field("gWideS") };
+        if (pS) { pS->set(std::string{ "yy" }); }
+        ctx.check("np4b_string_into_short_refused", fsg::get_i16("gWideS") == static_cast<std::int16_t>(0x1234));
+        const auto pJ{ fsg::static_field("gNarrowJ") };
+        if (pJ) { pJ->set(std::string{ "zzzzzzzz" }); }
+        ctx.check("np4b_string_into_long_refused", fsg::get_i64("gNarrowJ") == 0x1122334455667788LL);
+        const auto pD{ fsg::static_field("gNarrowD") };
+        if (pD) { pD->set(std::string{ "dddddddd" }); }
+        ctx.check("np4b_string_into_double_refused", double_bits(fsg::get_double("gNarrowD")) == 0x3FF0000000000000ULL);
+        const auto pC{ fsg::static_field("gCharByte") };
+        if (pC) { pC->set(std::string{ "cc" }); }
+        ctx.check("np4b_string_into_char_refused_noncrash", fsg::static_field("gCharByte").has_value());
+
+        // ---- string_view / const char* into a primitive ----
+        if (pJ) { pJ->set(std::string_view{ "viewview" }); }
+        ctx.check("np4b_string_view_into_long_refused", fsg::get_i64("gNarrowJ") == 0x1122334455667788LL);
+        if (pD) { pD->set("ccharptr"); }
+        ctx.check("np4b_cstr_into_double_refused", double_bits(fsg::get_double("gNarrowD")) == 0x3FF0000000000000ULL);
+
+        // ---- std::vector<various element types> into a primitive ----
+        if (pS) { const std::vector<std::int64_t> v{ 1, 2 }; pS->set(v); }
+        ctx.check("np4b_vector_i64_into_short_refused", fsg::get_i16("gWideS") == static_cast<std::int16_t>(0x1234));
+        if (pJ) { const std::vector<double> v{ 1.0, 2.0 }; pJ->set(v); }
+        ctx.check("np4b_vector_double_into_long_refused", fsg::get_i64("gNarrowJ") == 0x1122334455667788LL);
+        if (pB) { const std::vector<bool> v{ true, false }; pB->set(v); }
+        ctx.check("np4b_vector_bool_into_byte_refused", fsg::get_i8("gWideB") == static_cast<std::int8_t>(0x5A));
+        if (pB) { const std::vector<std::string> v{ "a", "bb" }; pB->set(v); }
+        ctx.check("np4b_vector_string_into_byte_refused", fsg::get_i8("gWideB") == static_cast<std::int8_t>(0x5A));
+
+        // ---- unique_ptr<wrapper> into 1/2/8-byte slots ----
+        if (pB) { pB->set(refA); }
+        ctx.check("np4b_unique_ptr_into_byte_refused", fsg::get_i8("gWideB") == static_cast<std::int8_t>(0x5A));
+        if (pS) { pS->set(refA); }
+        ctx.check("np4b_unique_ptr_into_short_refused", fsg::get_i16("gWideS") == static_cast<std::int16_t>(0x1234));
+        if (pJ) { pJ->set(refA); }
+        ctx.check("np4b_unique_ptr_into_long_refused", fsg::get_i64("gNarrowJ") == 0x1122334455667788LL);
+        if (pD) { pD->set(refA); }
+        ctx.check("np4b_unique_ptr_into_double_refused", double_bits(fsg::get_double("gNarrowD")) == 0x3FF0000000000000ULL);
+    }
+
+    // =====================================================================
     //  5. "C" 1-byte -> 2-byte WIDENING shortcut.  A C++ char (1 byte) into a
     //     "C" field (2 bytes) must land the FULL 2-byte Java char (0x00NN),
     //     never a half-written value, never sign-extended.
@@ -377,6 +567,62 @@ VMHOOK_JVM_MODULE(field_set_size_guard)
     // A correctly-sized uint16 into "C" also lands intact (control for widening).
     fsg::set_static<std::uint16_t>("gCharByte", 0x20AC);     // euro sign
     ctx.check("gCharByte_uint16_intact", fsg::get_u16("gCharByte") == 0x20AC);
+
+    // =====================================================================
+    //  5b. WIDENING-SHORTCUT BREADTH.  The "C" + sizeof==1 widening fires for ANY
+    //      1-byte arithmetic / enum value type, not just `char` (header gates on
+    //      is_arithmetic_v || is_enum_v, NOT is_same_v<char>).  Each lands as a
+    //      16-bit value with the high byte ZERO via static_cast<unsigned char>:
+    //      so a NEGATIVE signed 1-byte value zero-extends (0xNN, never 0xFFNN),
+    //      pinning that a future tightening to is_same_v<char> would break callers
+    //      passing int8_t / uint8_t / std::byte / bool.  Restores euro 0x20AC at
+    //      the end so the snapshot's gCharByte expectation holds.
+    // =====================================================================
+    {
+        // signed int8_t -1 (0xFF) -> 0x00FF (zero-extended, not 0xFFFF).
+        fsg::set_static<std::int8_t>("gCharByte", static_cast<std::int8_t>(-1));
+        ctx.check("wb_int8_neg1_widens_to_00FF", fsg::get_u16("gCharByte") == 0x00FF);
+        // unsigned uint8_t 0xFF -> also 0x00FF.
+        fsg::set_static<std::uint8_t>("gCharByte", static_cast<std::uint8_t>(0xFF));
+        ctx.check("wb_uint8_FF_widens_to_00FF", fsg::get_u16("gCharByte") == 0x00FF);
+        // unsigned char 0x41 ('A') -> 0x0041.
+        fsg::set_static<unsigned char>("gCharByte", static_cast<unsigned char>(0x41));
+        ctx.check("wb_uchar_41_widens_to_0041", fsg::get_u16("gCharByte") == 0x0041);
+        // std::byte 0x7F (static_cast-able, not implicitly convertible) -> 0x007F.
+        fsg::set_static<std::byte>("gCharByte", std::byte{ 0x7F });
+        ctx.check("wb_stdbyte_7F_widens_to_007F", fsg::get_u16("gCharByte") == 0x007F);
+        // bool true (1 byte) -> 0x0001; bool false -> 0x0000.
+        fsg::set_static<bool>("gCharByte", true);
+        ctx.check("wb_bool_true_widens_to_0001", fsg::get_u16("gCharByte") == 0x0001);
+        fsg::set_static<bool>("gCharByte", false);
+        ctx.check("wb_bool_false_widens_to_0000", fsg::get_u16("gCharByte") == 0x0000);
+        // restore the euro so phase 10's snapshot expectation (0x20AC) holds.
+        fsg::set_static<std::uint16_t>("gCharByte", 0x20AC);
+        ctx.check("wb_gCharByte_restored_euro", fsg::get_u16("gCharByte") == 0x20AC);
+    }
+
+    // =====================================================================
+    //  5c. NON-"C" 1-byte writes are NOT widened — the shortcut is gated on
+    //      signature=="C".  A C++ `char` (1 byte) into a "B" field (1 byte) is a
+    //      correct-width plain memcpy (lands the single byte); into a 2/4/8-byte
+    //      slot it is a too-narrow refused write (NOT silently widened to fit).
+    //      gWideB stays at 0x5A across the refused parts; the one correct-width
+    //      landing writes-then-restores so the snapshot (gWideB unchanged) holds.
+    // =====================================================================
+    {
+        // char into "B": correct width (1==1) -> the byte lands.
+        fsg::set_static<char>("gWideB", static_cast<char>(0x2D));
+        ctx.check("nc_char_into_byte_lands", fsg::get_i8("gWideB") == static_cast<std::int8_t>(0x2D));
+        // restore gWideB to its declared init so the snapshot sees it unchanged.
+        fsg::set_static<std::int8_t>("gWideB", static_cast<std::int8_t>(0x5A));
+        ctx.check("nc_gWideB_restored_init", fsg::get_i8("gWideB") == static_cast<std::int8_t>(0x5A));
+        // char (1B) into "S" (2B): too narrow, NOT widened -> refused.
+        fsg::set_static<char>("gWideS", static_cast<char>(0x2D));
+        ctx.check("nc_char_into_short_refused", fsg::get_i16("gWideS") == static_cast<std::int16_t>(0x1234));
+        // char (1B) into "I" (4B): too narrow -> refused.
+        fsg::set_static<char>("gWideI", static_cast<char>(0x2D));
+        ctx.check("nc_char_into_int_refused", fsg::get_i32("gWideI") == 0x11223344);
+    }
 
     // =====================================================================
     //  6. TYPE-CONFUSION CHARACTERISATION (a guard LIMITATION, not a fixable
@@ -596,6 +842,62 @@ VMHOOK_JVM_MODULE(field_set_size_guard)
                     }
                 }
             }
+
+            // ---- NON-PRIMITIVE anti-clobber (4B int trio): the SYMMETRIC guard
+            //      is the anti-clobber here.  A string / vector / unique_ptr write
+            //      into npClobI (an "I" field) would, in the unguarded legacy path,
+            //      reinterpret the 4 int bytes as a compressed OOP and write through
+            //      a wild heap address — so the refusal must leave npClobI AND both
+            //      same-width sentinels byte-for-byte intact, exactly like the
+            //      width-mismatch trios above. ----
+            {
+                const auto pb{ inst->field("npClobIBefore") };
+                const auto pm{ inst->field("npClobI") };
+                const auto pa{ inst->field("npClobIAfter") };
+                ctx.check("npClobI_trio_resolves", pb.has_value() && pm.has_value() && pa.has_value());
+                if (pb && pm && pa)
+                {
+                    auto read_i32 = [](const vmhook::field_proxy& p) -> std::int32_t { const std::int32_t v = p.get(); return v; };
+                    ctx.check("npClobI_before_init", read_i32(*pb) == static_cast<std::int32_t>(0x6CCCCCCC));
+                    ctx.check("npClobI_mid_init",     read_i32(*pm) == static_cast<std::int32_t>(0x6DDDDDDD));
+                    ctx.check("npClobI_after_init",   read_i32(*pa) == static_cast<std::int32_t>(0x6EEEEEEE));
+
+                    const std::uintptr_t ab{ addr_of(pb) };
+                    const std::uintptr_t am{ addr_of(pm) };
+                    const std::uintptr_t aa{ addr_of(pa) };
+                    const bool contiguous{ ab != 0 && am == ab + 4 && aa == am + 4 };
+
+                    const auto refLive{ fsg::acquire("refA") };
+                    ctx.check("npClobI_refA_acquired", refLive != nullptr);
+
+                    // refused string write into the middle "I" slot.
+                    pm->set(std::string{ "9999" });
+                    ctx.check("npClobI_mid_unchanged_by_string", read_i32(*pm) == static_cast<std::int32_t>(0x6DDDDDDD));
+                    // refused vector write.
+                    { const std::vector<int> v{ 1, 2, 3, 4 }; pm->set(v); }
+                    ctx.check("npClobI_mid_unchanged_by_vector", read_i32(*pm) == static_cast<std::int32_t>(0x6DDDDDDD));
+                    // refused unique_ptr write.
+                    pm->set(refLive);
+                    ctx.check("npClobI_mid_unchanged_by_unique_ptr", read_i32(*pm) == static_cast<std::int32_t>(0x6DDDDDDD));
+
+                    // Both sentinels intact after all three refused non-primitive writes.
+                    ctx.check("npClobI_before_intact", read_i32(*pb) == static_cast<std::int32_t>(0x6CCCCCCC));
+                    ctx.check("npClobI_after_intact",  read_i32(*pa) == static_cast<std::int32_t>(0x6EEEEEEE));
+                    if (contiguous)
+                    {
+                        ctx.check("npClobI_trio_contiguous", true);
+                        ctx.check("npClobI_neighbour_not_clobbered_by_nonprimitive",
+                                  read_i32(*pb) == static_cast<std::int32_t>(0x6CCCCCCC)
+                                  && read_i32(*pa) == static_cast<std::int32_t>(0x6EEEEEEE));
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] field_set_size_guard: npClobI trio not contiguous "
+                                   "on this layout; cross-slot non-primitive anti-clobber check "
+                                   "skipped, per-slot unchanged checks still run.");
+                    }
+                }
+            }
         }
     }
 
@@ -723,6 +1025,21 @@ VMHOOK_JVM_MODULE(field_set_size_guard)
             ctx.check("java_seen_refSlot_not_A", fsg::get_bool("seenRefSlotIsA") == false);
             ctx.check("java_seen_refSlot_not_null", fsg::get_bool("seenRefSlotIsNull") == false);
             ctx.check("java_seen_refSlot_tag_B", fsg::get_i32("seenRefSlotTag") == 0xB);
+
+            // ---- boundary / extreme correct-width writes, as seen by Java ----
+            ctx.check("java_seen_bndZ_true", fsg::get_bool("bndSeenZ") == true);
+            ctx.check("java_seen_bndB_min",  fsg::get_i8("bndSeenB") == static_cast<std::int8_t>(0x80));
+            ctx.check("java_seen_bndS_min",  fsg::get_i16("bndSeenS") == static_cast<std::int16_t>(0x8000));
+            ctx.check("java_seen_bndC_max",  fsg::get_u16("bndSeenC") == 0xFFFF);
+            ctx.check("java_seen_bndI_min",  fsg::get_i32("bndSeenI") == static_cast<std::int32_t>(0x80000000));
+            ctx.check("java_seen_bndJ_min",  fsg::get_i64("bndSeenJ") == static_cast<std::int64_t>(0x8000000000000000ULL));
+            ctx.check("java_seen_bndF_nan_bits", static_cast<std::uint32_t>(fsg::get_i32("bndSeenFBits")) == k_bndF_nan_bits);
+            ctx.check("java_seen_bndD_negzero_bits", static_cast<std::uint64_t>(fsg::get_i64("bndSeenDBits")) == k_bndD_negzero_bits);
+
+            // ---- non-primitive anti-clobber trio UNCHANGED, as seen by Java ----
+            ctx.check("java_seen_npClobIBefore_intact", fsg::get_i32("seenNpClobIBefore") == static_cast<std::int32_t>(0x6CCCCCCC));
+            ctx.check("java_seen_npClobI_intact",       fsg::get_i32("seenNpClobI") == static_cast<std::int32_t>(0x6DDDDDDD));
+            ctx.check("java_seen_npClobIAfter_intact",  fsg::get_i32("seenNpClobIAfter") == static_cast<std::int32_t>(0x6EEEEEEE));
         }
     }
 
@@ -744,5 +1061,10 @@ VMHOOK_JVM_MODULE(field_set_size_guard)
         ctx.check("java_getter_refSlotIsB", fsg::call_get_bool("refSlotIsB") == true);
         ctx.check("java_getter_refSlotIsNull_false", fsg::call_get_bool("refSlotIsNull") == false);
         ctx.check("java_getter_refSlotTag_B", fsg::call_get_i32("getRefSlotTag") == 0xB);
+
+        // ---- boundary writes visible to executing Java bytecode ----
+        ctx.check("java_getter_bndI_min", fsg::call_get_i32("getBndI") == static_cast<std::int32_t>(0x80000000));
+        ctx.check("java_getter_bndJ_min", fsg::call_get_i64("getBndJ") == static_cast<std::int64_t>(0x8000000000000000ULL));
+        ctx.check("java_getter_bndC_max", fsg::call_get_i32("getBndC") == 0xFFFF); // char widened unsigned
     }
 }

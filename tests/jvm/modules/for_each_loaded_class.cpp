@@ -122,6 +122,26 @@ namespace
         bool                       own_seen{ false };
         bool                       own_klass_valid{ false };
         bool                       own_name_roundtrips{ false };
+        // The klass* the visitor handed us for the OWN fixture and for the
+        // bootstrap canary java/lang/Object (nullptr if that name was not
+        // enumerated this pass) — used for the cross-path POINTER IDENTITY angle
+        // (enumeration's klass* must equal find_class()'s klass* for the SAME
+        // name, on the graph-walk JDKs).
+        vmhook::hotspot::klass*    own_klass_ptr{ nullptr };
+        vmhook::hotspot::klass*    object_klass_ptr{ nullptr };
+        // PREDICATE / FILTERING-visitor angle: how many enumerated names fall
+        // under a couple of stable JVM prefixes.  These are not exact (the
+        // universe varies across the JDK matrix) but give robust HARD lower
+        // bounds — a real JVM always holds many java/lang/* classes.
+        std::size_t                java_prefix{ 0 };       // names under "java/"
+        std::size_t                java_lang_prefix{ 0 };  // names under "java/lang/"
+        // ARRAY / NESTED structural characterization, folded over the walk so the
+        // form of each family member is validated WHEN it is enumerated (presence
+        // itself stays [INFO] / JDK-gated, but a malformed member is a HARD fail).
+        std::size_t                array_names{ 0 };       // names starting with '['
+        bool                       array_form_ok{ true };  // every '[' name well-shaped
+        std::size_t                dollar_names{ 0 };      // names containing '$'
+        bool                       dollar_form_ok{ true };  // every '$' name well-shaped
     };
 
     // Wrapper for vmhook.fixtures.ForEachLoadedClass.  Deriving from
@@ -166,6 +186,38 @@ namespace
         return true;
     }
 
+    // An array descriptor is well-shaped when, after its leading run of '[' (the
+    // dimension count, >=1), the element tag is a legal JVM field descriptor:
+    // one of the primitive tags (Z B C S I J F D) for a primitive array, or a
+    // reference tag 'L<internal-name>;' for an object array (ending in ';').  This
+    // is the structural form check applied to every enumerated name beginning with
+    // '[' — presence of array klasses stays JDK-gated, but the SHAPE of any that
+    // are surfaced is a HARD invariant (a torn array symbol would violate it).
+    auto array_descriptor_wellformed(const std::string& name) -> bool
+    {
+        std::size_t dims{ 0 };
+        while (dims < name.size() && name[dims] == '[')
+        {
+            ++dims;
+        }
+        if (dims == 0 || dims >= name.size())   // no element tag after the '['s
+        {
+            return false;
+        }
+        const char tag{ name[dims] };
+        switch (tag)
+        {
+            case 'Z': case 'B': case 'C': case 'S':
+            case 'I': case 'J': case 'F': case 'D':
+                return dims + 1 == name.size();   // primitive: exactly one tag byte
+            case 'L':
+                // Object array: 'L' <non-empty internal name> ';'
+                return name.size() >= dims + 3 && name.back() == ';';
+            default:
+                return false;
+        }
+    }
+
     // Runs ONE full for_each_loaded_class pass and folds every observation into a
     // single `enumeration`.  Every klass dereference is guarded by is_valid_pointer
     // so a torn pointer in the snapshot can never crash the JVM from this test.
@@ -186,6 +238,45 @@ namespace
                 else if (!name_is_wellformed(name))
                 {
                     result.any_bad_name = true;
+                }
+
+                // PREDICATE / FILTERING-visitor tallies (selective enumeration):
+                // count names under a couple of always-present JVM prefixes.  A
+                // visitor that filters by prefix is a first-class use of the API
+                // (vmhook.hpp's own example filters "net/minecraft/"); these
+                // counters let the caller assert a robust lower bound.
+                if (name.rfind("java/", 0) == 0)
+                {
+                    ++result.java_prefix;
+                    if (name.rfind("java/lang/", 0) == 0)
+                    {
+                        ++result.java_lang_prefix;
+                    }
+                }
+
+                // ARRAY-name structural validation (only when an array klass was
+                // surfaced — presence is JDK-variant, but FORM is universal).
+                if (!name.empty() && name.front() == '[')
+                {
+                    ++result.array_names;
+                    if (!array_descriptor_wellformed(name))
+                    {
+                        result.array_form_ok = false;
+                    }
+                }
+
+                // NESTED ('$') name structural validation: an inner/nested klass
+                // name is "<outer>$<member>" — the '$' is neither the first nor
+                // the last byte, and the whole thing is well-formed.  (Array names
+                // never contain '$', so the two families do not overlap.)
+                if (name.find('$') != std::string::npos)
+                {
+                    ++result.dollar_names;
+                    const std::size_t pos{ name.find('$') };
+                    if (pos == 0 || pos + 1 >= name.size() || !name_is_wellformed(name))
+                    {
+                        result.dollar_form_ok = false;
+                    }
                 }
 
                 // The library NEVER hands the visitor a null klass: both walk
@@ -242,10 +333,17 @@ namespace
                 {
                     result.own_seen = true;
                     result.own_klass_valid = true;   // proven valid above.
+                    result.own_klass_ptr = k;        // capture for the find_class identity angle.
                     if (vmhook::hotspot::is_valid_pointer(sym))
                     {
                         result.own_name_roundtrips = (sym->to_string() == OWN_FIXTURE);
                     }
+                }
+                // Capture the bootstrap canary's klass* for the same cross-path
+                // pointer-identity check (it must equal find_class("java/lang/Object")).
+                else if (name == "java/lang/Object")
+                {
+                    result.object_klass_ptr = k;
                 }
             });
 
@@ -579,6 +677,106 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
                + (e1.names.contains("vmhook/Example") ? "enumerated"
                                                        : "NOT enumerated"));
 
+    // ---- PREDICATE / FILTERING visitor: robust lower bounds by prefix. ------
+    // A selective visitor (filter by name prefix) is a first-class use of the
+    // API.  The java/ and java/lang/ subsets are present on EVERY HotSpot before
+    // any user code (the bootstrap loader holds hundreds of java/lang/* classes),
+    // so a generous lower bound is a HARD portable floor on every JDK, including
+    // the JDK8 dictionary walk (the bootstrap region is exactly what its
+    // SystemDictionary fallback covers most reliably).  Exact counts are NOT
+    // asserted (the universe varies); only "many" is.
+    ctx.record(std::string{ "[INFO] for_each_loaded_class: pass-1 prefix tallies — java/=" }
+               + std::to_string(e1.java_prefix) + " java/lang/="
+               + std::to_string(e1.java_lang_prefix));
+    ctx.check("filter_java_prefix_over_50", e1.java_prefix > 50);
+    ctx.check("filter_java_lang_prefix_over_20", e1.java_lang_prefix > 20);
+    // The java/lang/ subset is a strict subset of the java/ subset (monotone
+    // refinement of the predicate) — a self-consistency invariant on every JDK.
+    ctx.check("filter_java_lang_subset_of_java", e1.java_lang_prefix <= e1.java_prefix);
+    // The java/ subset is itself a subset of the whole snapshot.
+    ctx.check("filter_java_subset_of_all", e1.java_prefix <= e1.names.size());
+
+    // ---- Visitor-invocation SELF-CONSISTENCY (the counters reconcile). ------
+    // Every visit was classified into exactly one bucket: null, invalid, or a
+    // valid klass (which was then either a first-seen or a duplicate pointer).
+    // So count == null + invalid + (distinct ptrs) + (dup-ptr visits).  This
+    // proves no visit was silently dropped or double-counted in our folding, on
+    // every JDK (it is arithmetic over our own tallies, not a JVM property).
+    const std::size_t reconciled{ e1.null_klass + e1.invalid_klass
+                                  + e1.ptrs.size() + e1.dup_ptr };
+    ctx.check("visit_counters_reconcile", reconciled == e1.count);
+    // distinct names never exceed distinct pointers + duplicate-pointer visits
+    // is not generally true, but distinct names <= total visits always is (each
+    // name came from at least one visit).
+    ctx.check("distinct_names_le_count", e1.names.size() <= e1.count);
+
+    // ---- ARRAY-name STRUCTURAL form (HARD when any array is surfaced). ------
+    // Presence of array klasses is JDK-variant ([INFO] above), but IF the walk
+    // surfaces any name starting with '[', that name MUST be a well-shaped JVM
+    // array descriptor ('['+ <prim-tag> | '['+ 'L'<name>';').  A torn array
+    // symbol would fail this.  The check is non-vacuous only when arrays appear,
+    // so record the population and assert the form universally (true vacuously
+    // when zero arrays, which never weakens a JDK that does surface them).
+    ctx.record(std::string{ "[INFO] for_each_loaded_class: pass-1 array-descriptor names=" }
+               + std::to_string(e1.array_names));
+    ctx.check("array_descriptors_wellformed", e1.array_form_ok);
+
+    // ---- NESTED ('$') name STRUCTURAL form (HARD when any nested surfaces). --
+    // Likewise: nested-class names carry '$' that is neither first nor last byte.
+    // The HotSpot bootstrap loader holds many nested classes (e.g.
+    // java/util/Map$Entry) on every JDK, so this population is non-empty in
+    // practice on every build, and a malformed nested name is a HARD fail.
+    ctx.record(std::string{ "[INFO] for_each_loaded_class: pass-1 nested ('$') names=" }
+               + std::to_string(e1.dollar_names));
+    ctx.check("nested_names_wellformed", e1.dollar_form_ok);
+
+    // ---- CROSS-PATH POINTER IDENTITY: enumeration klass* == find_class klass*.
+    // find_class resolves a name through find_klass (the SAME ClassLoaderDataGraph
+    // walk) on JDK 9+, so the klass* the enumeration handed us for a given name
+    // and the klass* find_class returns for that name describe the SAME live
+    // Klass — they must be pointer-equal.  This is the strongest "the pointer is
+    // the real Klass, reached two independent ways" proof.  HARD on JDK 9+ for the
+    // bootstrap canary (always enumerated there); on JDK 8 find_class may route
+    // through the JNI fallback / a different cache, so record [INFO].  Object's
+    // ptr was captured during the walk above.
+    vmhook::hotspot::klass* const object_via_find{ vmhook::find_class("java/lang/Object") };
+    ctx.check("object_resolvable_via_find_class", object_via_find != nullptr);
+    if (!jdk8 && e1.object_klass_ptr != nullptr && object_via_find != nullptr)
+    {
+        ctx.check("object_klass_pointer_identity_across_paths",
+                  e1.object_klass_ptr == object_via_find);
+    }
+    else
+    {
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: java/lang/Object cross-path "
+                                "pointer identity not asserted (jdk8 or not enumerated this pass) — "
+                                "enumerated ptr " }
+                   + (e1.object_klass_ptr ? "captured" : "absent") + ", find_class ptr "
+                   + (object_via_find ? "non-null" : "null"));
+    }
+    // Same identity angle for the OWN application fixture (when enumerated): the
+    // walk's klass* must equal find_class(OWN_FIXTURE).  Rides gate_own_fixture so
+    // it is HARD whenever the fixture was actually surfaced (a mismatch FAILS even
+    // on JDK8), best-effort only on a genuine JDK8 enumeration miss.
+    vmhook::hotspot::klass* const own_via_find{ vmhook::find_class(OWN_FIXTURE) };
+    const bool own_ptr_identity{ e1.own_klass_ptr != nullptr
+                                 && own_via_find != nullptr
+                                 && e1.own_klass_ptr == own_via_find };
+    if (!jdk8)
+    {
+        gate_own_fixture("own_fixture_pointer_identity_across_paths",
+                         own_ptr_identity, own_enumerated);
+    }
+    else
+    {
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: OWN fixture cross-path "
+                                "pointer identity not asserted on JDK8 (find_class JNI fallback "
+                                "may resolve via a different path); enumerated=" }
+                   + (e1.own_klass_ptr ? "yes" : "no") + " find_class="
+                   + (own_via_find ? "yes" : "no")
+                   + " equal=" + (own_ptr_identity ? "yes" : "no"));
+    }
+
     // =====================================================================
     // PASS 2 — snapshot stability: an independent enumeration agrees on every
     // robust invariant.  Enumeration is repeatable and side-effect-free; a
@@ -609,6 +807,13 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
     ctx.check("pass2_no_null_klass_delivered", e2.null_klass == 0);
     ctx.check("pass2_no_invalid_klass_delivered", e2.invalid_klass == 0);
     ctx.check("pass2_introspecting_visitor_safe", e2.introspect_safe);
+    // Pass-2 re-proves the structural form invariants and the predicate floors —
+    // these hold on every independent walk, not just the first.
+    ctx.check("pass2_array_descriptors_wellformed", e2.array_form_ok);
+    ctx.check("pass2_nested_names_wellformed", e2.dollar_form_ok);
+    ctx.check("pass2_filter_java_prefix_over_50", e2.java_prefix > 50);
+    ctx.check("pass2_visit_counters_reconcile",
+              e2.null_klass + e2.invalid_klass + e2.ptrs.size() + e2.dup_ptr == e2.count);
     // Empty names tolerated (see pass-1 rationale) — record, never hard-fail.
     ctx.record(std::string{ "[INFO] for_each_loaded_class: pass-2 empty-name visit " }
                + (e2.any_empty_name ? "present (VM-internal/anonymous klass — tolerated)"
@@ -632,6 +837,19 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
     // the robust, lottery-free analogue of "the same app class set every time".
     ctx.check("stable_app_loader_reached_across_passes",
               (count_app_classes(e1.names) >= 1) == (count_app_classes(e2.names) >= 1));
+    // The bootstrap java/lang/ subset is the deterministic CORE of the snapshot:
+    // it does not vanish or balloon between two back-to-back walks.  Both passes
+    // must clear the same robust floor, and the two prefix counts stay within the
+    // same small drift band (a handful of classes may lazy-load between snapshots,
+    // but the bootstrap java/lang/ region is fully loaded long before this module
+    // runs).  HARD on every JDK — the bootstrap region is what the JDK8 walk
+    // covers most reliably, so this does not ride the per-entry app lottery.
+    const std::size_t jl_lo{ e1.java_lang_prefix < e2.java_lang_prefix
+                                 ? e1.java_lang_prefix : e2.java_lang_prefix };
+    const std::size_t jl_hi{ e1.java_lang_prefix < e2.java_lang_prefix
+                                 ? e2.java_lang_prefix : e1.java_lang_prefix };
+    ctx.check("pass2_filter_java_lang_prefix_over_20", e2.java_lang_prefix > 20);
+    ctx.check("stable_java_lang_prefix_across_passes", (jl_hi - jl_lo) <= 64);
     // The OWN-fixture cross-pass agreement is only deterministic where the walk
     // lists every app class (JDK 9+, HARD).  On JDK8 the two passes can disagree
     // because the SystemDictionary walk drops entries non-deterministically, so we
@@ -728,6 +946,30 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
         const enumeration after{ enumerate_once() };
         ctx.check("enumeration_healthy_after_contained_throw", after.count > 100);
         ctx.check("enumeration_valid_after_contained_throw", after.all_klass_valid);
+
+        // BOUNDARY: a throw on the VERY FIRST visit halts immediately — the
+        // exception is the ONLY stop mechanism the API offers, and it works even
+        // at the very first klass (no off-by-one that runs one extra visit).  The
+        // library's catch contains it the same way; control returns; exactly one
+        // visit happened.
+        std::size_t first_visit_count{ 0 };
+        bool         first_walk_returned{ false };
+        try
+        {
+            vmhook::for_each_loaded_class(
+                [&](const std::string&, vmhook::hotspot::klass*)
+                {
+                    ++first_visit_count;
+                    throw vmhook::exception{ "for_each_loaded_class first-visit throw probe" };
+                });
+            first_walk_returned = true;
+        }
+        catch (...)
+        {
+            first_walk_returned = false;
+        }
+        ctx.check("throw_on_first_visit_contained", first_walk_returned);
+        ctx.check("throw_on_first_visit_stopped_at_one", first_visit_count == 1);
     }
 
     // =====================================================================
@@ -812,5 +1054,48 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
                    + (!late_in_pre && late_in_post
                           ? "appeared between snapshot 1 and 2 (snapshot freshness confirmed)"
                           : "did not show a clean absent->present transition this run"));
+
+        // ---- The FRESHLY-LOADED klass is genuinely USABLE, two ways. --------
+        // When the late class WAS surfaced post-load, the klass* the walk handed
+        // us for it must be valid, round-trip its own _name back to LATE_FIXTURE,
+        // and be pointer-equal to find_class(LATE_FIXTURE) — exactly the same
+        // usability + cross-path identity proof PASS 1 makes for the OWN fixture,
+        // but for a class loaded AFTER startup.  Re-derived with a focused walk so
+        // the base enumeration struct stays minimal.  HARD on JDK 9+ (where
+        // late_in_post is itself hard); skipped on JDK 8 / when not surfaced.
+        if (!jdk8 && late_in_post)
+        {
+            vmhook::hotspot::klass* late_ptr{ nullptr };
+            bool                    late_roundtrips{ false };
+            vmhook::for_each_loaded_class(
+                [&](const std::string& name, vmhook::hotspot::klass* const k)
+                {
+                    if (name != LATE_FIXTURE || late_ptr != nullptr)
+                    {
+                        return;   // only the first hit for the target name.
+                    }
+                    if (k == nullptr || !vmhook::hotspot::is_valid_pointer(k))
+                    {
+                        return;
+                    }
+                    late_ptr = k;
+                    const vmhook::hotspot::symbol* const sym{ k->get_name() };
+                    if (vmhook::hotspot::is_valid_pointer(sym))
+                    {
+                        late_roundtrips = (sym->to_string() == LATE_FIXTURE);
+                    }
+                });
+            ctx.check("freshness_late_klass_pointer_valid", late_ptr != nullptr);
+            ctx.check("freshness_late_klass_name_roundtrips", late_roundtrips);
+            vmhook::hotspot::klass* const late_via_find{ vmhook::find_class(LATE_FIXTURE) };
+            ctx.check("freshness_late_klass_pointer_identity_across_paths",
+                      late_ptr != nullptr && late_ptr == late_via_find);
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] for_each_loaded_class: freshly-loaded klass "
+                                    "usability/identity not asserted (jdk8 or late class not "
+                                    "surfaced post-load)" });
+        }
     }
 }
