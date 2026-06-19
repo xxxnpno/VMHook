@@ -55,6 +55,13 @@ public final class MethodEnumeration
      *   2 = call idInt(IDINT_ARG)    (a method whose descriptor (I)I is SHARED;
      *                                  used to confirm a refused signature-hook
      *                                  never installed -> detour must NOT fire)
+     *   3..7 = dispatch one Overloads method ONCE each, so its i2i interpreter
+     *          entry is RESOLVED/LINKED before the native side installs a
+     *          hook_by_signature on it.  hook_by_signature patches the method's
+     *          i2i stub; an as-yet-uncalled method still points at the lazy
+     *          unresolved-link stub, so the install would fail.  Calling the
+     *          target once links it; the install then genuinely succeeds.  See
+     *          the Overloads doc below for the per-mode mapping.
      */
     public static volatile int mode;
 
@@ -161,49 +168,80 @@ public final class MethodEnumeration
     }
 
     // =======================================================================
-    // Nested static class: a same-NAME overload set + a TWO-way descriptor
-    // collision, purpose-built for the descriptor-hook resolution axis that the
-    // top-level class does NOT exercise (it has no same-name overloads, and its
-    // smallest descriptor collision is the 3-way (I)I / 6-way ()V — never the
-    // minimal size()==2 boundary that hook_by_signature's "ambiguous" branch
-    // turns on).  Resolved by its internal `$`-name; force-loaded via the ANCHOR
-    // below (the harness loader only Class.forName's the TOP-LEVEL fixture, so a
-    // nested klass must be referenced to be loaded).  None of these methods is
-    // ever DISPATCHED by the probe — the native side reads their enumeration and
-    // installs (never-firing) signature hooks on the unique descriptors only.
+    // Nested class for the PER-CLASS, descriptor-UNIQUE scoping proof.
+    //
+    // Internal name: vmhook/fixtures/MethodEnumeration$Overloads.
+    //
+    // The point of method_enumeration's signature API is that resolution is
+    // SCOPED to one klass: a descriptor that is shared (or absent) on the
+    // top-level MethodEnumeration can be UNIQUE here, and hooking by signature
+    // on this klass must pick THIS klass's lone match, never reach across to
+    // the enclosing class's collisions.  The descriptors below are chosen so:
+    //
+    //   (II)I  -> UNIQUE here (pickII)        ; ABSENT on MethodEnumeration
+    //   (J)I   -> UNIQUE here (pickJI)        ; ABSENT on MethodEnumeration
+    //   (IJ)I  -> UNIQUE here (pickIJI)       ; ABSENT on MethodEnumeration
+    //   (D)V   -> UNIQUE here (soloDV)        ; ABSENT on MethodEnumeration
+    //   ()J    -> UNIQUE here (static sSolo)  ; ABSENT on MethodEnumeration
+    //   (I)I   -> UNIQUE here (just idI)      ; 3-WAY SHARED on MethodEnumeration
+    //
+    // The (I)I row is the sharpest cross-class invariant: the SAME descriptor
+    // is unique on this klass but a 3-way collision on the enclosing one, so
+    // find_methods_by_signature must answer differently per <T>.
+    //
+    // hook_by_signature patches a method's i2i interpreter stub, which only
+    // exists once the method has been LINKED (called at least once).  So each
+    // install-target is dispatched once via a runXxx() driver below (modes
+    // 3..7) BEFORE the native side installs on it; the install then succeeds.
+    // =======================================================================
     public static final class Overloads
     {
-        // ---- Same-NAME overloads: one name `pick`, FOUR distinct descriptors.
-        //      Proves descriptor-uniqueness coexists with name-collision: the
-        //      name rotates per obfuscated build, the descriptor does not.
-        /** (I)I — pick overload #1. */
-        public int pick(final int a)                     { return a; }
-        /** (II)I — pick overload #2 (arity discriminator). */
-        public int pick(final int a, final int b)        { return a + b; }
-        /** (J)I — pick overload #3 (arg-WIDTH discriminator, same arity as #1). */
-        public int pick(final long a)                    { return (int) a; }
-        /** (IJ)I — pick overload #4 (mixed two-slot). */
-        public int pick(final int a, final long b)       { return a + (int) b; }
+        /** (II)I — UNIQUE on Overloads; (II)I is absent on MethodEnumeration. */
+        public int pickII(final int a, final int b)
+        {
+            return a + b;
+        }
 
-        // ---- TWO-way descriptor collision: two DIFFERENT names, SAME ()I.
-        //      The MINIMAL size()>1 case hook_by_signature must REFUSE.
-        /** ()I — collides with beta. */
-        public int alpha()                               { return 1; }
-        /** ()I — collides with alpha. */
-        public int beta()                                { return 2; }
+        /** (J)I — UNIQUE on Overloads; (J)I is absent on MethodEnumeration. */
+        public int pickJI(final long a)
+        {
+            return (int) a;
+        }
 
-        // ---- Genuinely-unique descriptors (instance + static) for the
-        //      accept-on-unique install path; never dispatched, so a leaked
-        //      persistent hook is harmless.
-        /** (D)V — unique (double arg, void return). */
-        public void solo(final double d)                 { }
-        /** ()J — unique static (no-arg long return). */
-        public static long sSolo()                       { return 0L; }
+        /** (IJ)I — UNIQUE on Overloads (int + long spans two slots). */
+        public int pickIJI(final int a, final long b)
+        {
+            return a + (int) b;
+        }
+
+        /** (D)V — UNIQUE on Overloads; ()V here would collide, (D)V does not. */
+        public void soloDV(final double d)
+        {
+            lastSoloDV = d;
+        }
+
+        /** ()J — UNIQUE on Overloads; static, no-arg, long return. */
+        public static long sSolo()
+        {
+            lastSSolo = 99L;
+            return lastSSolo;
+        }
+
+        /**
+         * (I)I — UNIQUE on Overloads, but the SAME descriptor is a 3-way
+         * collision on the enclosing MethodEnumeration (idInt/addInt/sId).
+         */
+        public int idI(final int x)
+        {
+            return x;
+        }
     }
 
-    // Force-load anchor: referencing Overloads.class loads the nested klass at
-    // this class's <clinit> time so find_class("...$Overloads") resolves it.
-    static final Class<?> ANCHOR_OVERLOADS = Overloads.class;
+    /** Last argument the Overloads.soloDV body saw (allow-through proof). */
+    public static volatile double lastSoloDV;
+
+    /** Last value the Overloads.sSolo body returned (allow-through proof). */
+    public static volatile long lastSSolo;
 
     // ---- Probe dispatch ---------------------------------------------------
 
@@ -220,6 +258,39 @@ public final class MethodEnumeration
         // idInt's descriptor (I)I is shared, so hook_by_signature<(I)I> must have
         // REFUSED; calling it proves the detour stays silent (no install).
         lastIdInt = obj.idInt(IDINT_ARG);
+    }
+
+    // Each driver dispatches ONE Overloads method exactly once so its i2i
+    // interpreter entry is linked; the native side then installs a
+    // hook_by_signature on that descriptor and the install succeeds.
+
+    private static void runPickII()
+    {
+        final Overloads o = new Overloads();
+        o.pickII(1, 2);
+    }
+
+    private static void runPickJI()
+    {
+        final Overloads o = new Overloads();
+        o.pickJI(3L);
+    }
+
+    private static void runPickIJI()
+    {
+        final Overloads o = new Overloads();
+        o.pickIJI(4, 5L);
+    }
+
+    private static void runSoloDV()
+    {
+        final Overloads o = new Overloads();
+        o.soloDV(1.5);
+    }
+
+    private static void runSSolo()
+    {
+        Overloads.sSolo();
     }
 
     static
@@ -242,6 +313,21 @@ public final class MethodEnumeration
                         break;
                     case 2:
                         runIdInt();
+                        break;
+                    case 3:
+                        runPickII();
+                        break;
+                    case 4:
+                        runPickJI();
+                        break;
+                    case 5:
+                        runPickIJI();
+                        break;
+                    case 6:
+                        runSoloDV();
+                        break;
+                    case 7:
+                        runSSolo();
                         break;
                     default:
                         break;
