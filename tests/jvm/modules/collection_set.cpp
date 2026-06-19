@@ -36,12 +36,18 @@
 //       Node.next chain stays populated, so the key walk must still surface every
 //       element — the TreeNode-via-Node-super find_field path)
 //     * legal single NULL element + reals → a nullptr slot for the null
+//     * ONLY a null element (size 1) → exactly one nullptr slot, no real element
+//     * HashSet<Long>    (8-byte boxed-primitive value field read)
+//     * HashSet<Character> (boxed char value field read)
+//     * HashSet<Boolean>  (the BOUNDARY boxed set: maximal size is {TRUE,FALSE})
 //
 //   LinkedHashSet (also map → SAME hash_map_walk_keys):
-//     * TWO + small + many — CONTENT verified order-independently; insertion
-//       order deliberately NOT required, characterizing the documented [low]
-//       "LinkedHashSet insertion order is silently lost" behaviour (vmhook walks
-//       bucket order, ignoring the LinkedHashMap before/after overlay).
+//     * empty + TWO + small + many — CONTENT verified order-independently;
+//       insertion order deliberately NOT required, characterizing the documented
+//       [low] "LinkedHashSet insertion order is silently lost" behaviour (vmhook
+//       walks bucket order, ignoring the LinkedHashMap before/after overlay).
+//     * LinkedHashSet<String> (String decode through the LinkedHashMap hash walk)
+//     * LinkedHashSet with one null + reals (null-slot on the linked path)
 //
 //   TreeSet  (m → tree_map_walk_keys):
 //     * empty (root null → 0 elements, no throw)
@@ -49,7 +55,10 @@
 //       SORTED element order, asserted EXACTLY.
 //     * REVERSE comparator (Collections.reverseOrder()) — the in-order walk must
 //       honour the comparator and come out DESCENDING by id, NOT natural order.
-//     * TreeSet<String> (sorted lexicographic order, exact).
+//     * DUPLICATE-add (compareTo-equal re-adds) → dedup survives the tree walk.
+//     * TreeSet<String> (sorted lexicographic order, exact) + REVERSE-comparator
+//       TreeSet<String> (descending lexicographic, proves the comparator is
+//       honoured on a reference key type too).
 //     * TreeSet<Integer> (BOXED element; ascending numeric order, exact).
 //
 //   Boxed-Integer element decode (java.lang.Integer.value read as a primitive):
@@ -63,6 +72,8 @@
 //       hash walk; was a [medium] bug that returned empty, now FIXED — full decode.
 //     * Collections.newSetFromMap(new TreeMap<>())   "m" → TreeMap (root) → TREE
 //       walk → SORTED decode (proves the router picks the tree walk by klass).
+//     * Collections.newSetFromMap(new TreeMap<>(reverseOrder))  "m" → TreeMap →
+//       TREE walk honours the comparator → DESCENDING decode.
 //     * Collections.newSetFromMap(new LinkedHashMap<>())  "m" → LinkedHashMap
 //       (table, no root) → hash walk → content decode (bucket order).
 //     * ConcurrentHashMap.newKeySet()                "map" resolved off the
@@ -188,6 +199,58 @@ namespace
         }
     };
 
+    // ── BOXED-Long element wrapper: java.lang.Long. ────────────────────────
+    // For HashSet<Long>, each element OOP is a boxed Long; value() reads its
+    // primitive 8-byte `value` long field directly — the wide-primitive
+    // field-read angle (Integer covers 4-byte, Long covers 8-byte).
+    class long_box : public vmhook::object<long_box>
+    {
+    public:
+        explicit long_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<long_box>{ instance }
+        {
+        }
+
+        auto value() const -> std::int64_t
+        {
+            return static_cast<std::int64_t>(get_field("value")->get());
+        }
+    };
+
+    // ── BOXED-Character element wrapper: java.lang.Character. ───────────────
+    // For HashSet<Character>, each element OOP is a boxed Character; value()
+    // reads its primitive `value` char (u16) field.
+    class char_box : public vmhook::object<char_box>
+    {
+    public:
+        explicit char_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<char_box>{ instance }
+        {
+        }
+
+        auto value() const -> std::int32_t
+        {
+            return static_cast<std::int32_t>(get_field("value")->get());
+        }
+    };
+
+    // ── BOXED-Boolean element wrapper: java.lang.Boolean. ──────────────────
+    // For HashSet<Boolean>, each element OOP is a boxed Boolean; value() reads
+    // its primitive `value` boolean field.
+    class bool_box : public vmhook::object<bool_box>
+    {
+    public:
+        explicit bool_box(vmhook::oop_t instance) noexcept
+            : vmhook::object<bool_box>{ instance }
+        {
+        }
+
+        auto value() const -> bool
+        {
+            return static_cast<bool>(get_field("value")->get());
+        }
+    };
+
     // ── Fixture wrapper: vmhook.fixtures.CollSet. ───────────────────────────
     class coll_set_fixture : public vmhook::object<coll_set_fixture>
     {
@@ -242,6 +305,42 @@ namespace
             return proxy->get().to_vector<integer_box>();
         }
 
+        // Same, decoded to a boxed-Long vector (HashSet<Long>).
+        static auto longs_of(const char* field)
+            -> std::vector<std::unique_ptr<long_box>>
+        {
+            const auto proxy{ static_field(field) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            return proxy->get().to_vector<long_box>();
+        }
+
+        // Same, decoded to a boxed-Character vector (HashSet<Character>).
+        static auto chars_of(const char* field)
+            -> std::vector<std::unique_ptr<char_box>>
+        {
+            const auto proxy{ static_field(field) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            return proxy->get().to_vector<char_box>();
+        }
+
+        // Same, decoded to a boxed-Boolean vector (HashSet<Boolean>).
+        static auto bools_of(const char* field)
+            -> std::vector<std::unique_ptr<bool_box>>
+        {
+            const auto proxy{ static_field(field) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            return proxy->get().to_vector<bool_box>();
+        }
+
         // Java-published cross-check values (pure heap-field reads — no Java call).
         static auto j_size(const char* f) -> std::int32_t { return static_field(f)->get(); }
         static auto j_long(const char* f) -> std::int64_t { return static_field(f)->get(); }
@@ -261,6 +360,7 @@ namespace
     constexpr std::int32_t SETFROMMAP_N{ 4 };
     constexpr std::int32_t CHM_N{ 50 };
     constexpr std::int32_t INT_N{ 40 };
+    constexpr std::int32_t CHAR_N{ 10 };
 
     // ── Hook observation (pilot-style proof). ───────────────────────────────
     std::atomic<int>          g_hook_calls{ 0 };
@@ -485,6 +585,9 @@ namespace
         vmhook::register_class<elem_object>("vmhook/fixtures/CollSet$Elem");
         vmhook::register_class<string_element>("java/lang/String");
         vmhook::register_class<integer_box>("java/lang/Integer");
+        vmhook::register_class<long_box>("java/lang/Long");
+        vmhook::register_class<char_box>("java/lang/Character");
+        vmhook::register_class<bool_box>("java/lang/Boolean");
 
         // The fixture's static initializer already built every set (buildAll()).
         // Drive one mode-0 probe first so the build also runs on the Java thread
@@ -765,6 +868,23 @@ namespace
         }
 
         // =====================================================================
+        // HashSet — ONLY the legal single NULL element (size 1).  The pure-null
+        // boundary: the backing HashMap has exactly one Node whose key is null, so
+        // the bucket walk must emit EXACTLY one nullptr slot and no real element.
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::elems_of("hashOnlyNull") };
+            const elem_stats st{ fingerprint(v) };
+            ctx.check("hash_onlynull_count_is_1", st.count == 1);
+            ctx.check("hash_onlynull_count_matches_java",
+                      st.count == coll_set_fixture::j_size("hashOnlyNullSize"));
+            ctx.check("hash_onlynull_exactly_one_null", st.null_count == 1);
+            ctx.check("hash_onlynull_no_real_elements",
+                      (st.count - st.null_count) == 0);
+            ctx.check("hash_onlynull_id_sum_zero", st.id_sum == 0);
+        }
+
+        // =====================================================================
         // LinkedHashSet — TWO + SMALL + MANY.  Reuses HashSet's "map"→
         // hash_map_walk_keys fast path, so the SAME walker runs.  Verify CONTENT
         // order-independently.  (Audit [low]: vmhook walks BUCKET order, NOT
@@ -819,6 +939,64 @@ namespace
             const auto ids{ id_set(v) };
             ctx.check("linked_many_membership_complete",
                       ids.size() == static_cast<std::size_t>(MANY_N));
+        }
+
+        // =====================================================================
+        // LinkedHashSet — EMPTY.  map exists, all buckets null → 0, no throw.
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::elems_of("linkedEmpty") };
+            ctx.check("linked_empty_size_zero", v.empty());
+            ctx.check("linked_empty_java_size_zero",
+                      coll_set_fixture::j_size("linkedEmptySize") == 0);
+        }
+
+        // =====================================================================
+        // LinkedHashSet<String> — String element decode through the
+        // LinkedHashMap-backed hash walk (LinkedHashMap.Entry's key/next resolve
+        // via the superclass-walking find_field; the before/after overlay is
+        // ignored).  Content verified order-independently.  "ls0".."ls2".
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::strings_of("linkedStrings") };
+            const string_stats st{ fingerprint_strings(v) };
+            ctx.check("linked_strings_count_is_3", st.count == SMALL_N);
+            ctx.check("linked_strings_count_matches_java",
+                      st.count == coll_set_fixture::j_size("linkedStringsSize"));
+            ctx.check("linked_strings_no_null", st.null_count == 0);
+            ctx.check("linked_strings_char_sum_matches_java",
+                      st.char_sum == coll_set_fixture::j_long("linkedStringsCharSum"));
+            ctx.check("linked_strings_all_distinct", st.distinct_text);
+
+            std::unordered_set<std::string> texts;
+            for (const auto& up : v) { if (up) { texts.insert(up->text()); } }
+            ctx.check("linked_strings_contains_ls0", texts.count("ls0") == 1);
+            ctx.check("linked_strings_contains_ls2",
+                      texts.count("ls" + std::to_string(SMALL_N - 1)) == 1);
+        }
+
+        // =====================================================================
+        // LinkedHashSet — one legal NULL + NULL_SET_NONNULL reals (ids 700..702).
+        // Locks the "null element → nullptr slot" promise on the LinkedHashMap-
+        // backed path too (mirrors hashWithNull but through the linked overlay).
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::elems_of("linkedWithNull") };
+            const elem_stats st{ fingerprint(v) };
+            ctx.check("linked_withnull_count_is_4",
+                      st.count == NULL_SET_NONNULL + 1);
+            ctx.check("linked_withnull_count_matches_java",
+                      st.count == coll_set_fixture::j_size("linkedWithNullSize"));
+            ctx.check("linked_withnull_exactly_one_null", st.null_count == 1);
+            ctx.check("linked_withnull_nonnull_count",
+                      (st.count - st.null_count) == NULL_SET_NONNULL);
+            ctx.check("linked_withnull_id_sum_matches_java",
+                      st.id_sum == coll_set_fixture::j_long("linkedWithNullIdSum"));
+            ctx.check("linked_withnull_nonnull_distinct", st.distinct_oops);
+            ctx.check("linked_withnull_nonnull_tags_ok", st.tags_consistent);
+            const auto ids{ id_set(v) };
+            ctx.check("linked_withnull_contains_700", ids.count(700) == 1);
+            ctx.check("linked_withnull_contains_702", ids.count(702) == 1);
         }
 
         // =====================================================================
@@ -978,6 +1156,59 @@ namespace
         }
 
         // =====================================================================
+        // TreeSet<String> — REVERSE comparator.  The in-order red-black walk must
+        // honour the comparator and come out DESCENDING lexicographically
+        // ["cherry","banana","apple"] — proves the tree walk respects a comparator
+        // on a reference (String) key type, not just the Elem Comparable.
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::strings_of("treeStringsReverse") };
+            const string_stats st{ fingerprint_strings(v) };
+            ctx.check("tree_strings_rev_count_is_3", st.count == SMALL_N);
+            ctx.check("tree_strings_rev_count_matches_java",
+                      st.count == coll_set_fixture::j_size("treeStringsReverseSize"));
+            ctx.check("tree_strings_rev_no_null", st.null_count == 0);
+
+            std::vector<std::string> order;
+            order.reserve(v.size());
+            for (const auto& up : v) { order.push_back(up ? up->text() : std::string{}); }
+            ctx.check("tree_strings_rev_is_descending",
+                      std::is_sorted(order.begin(), order.end(), std::greater<std::string>{}));
+            ctx.check("tree_strings_rev_first_is_cherry",
+                      !order.empty() && order.front() == "cherry");
+            ctx.check("tree_strings_rev_last_is_apple",
+                      !order.empty() && order.back() == "apple");
+            ctx.check("tree_strings_rev_exact_sequence",
+                      order.size() == 3 && order[0] == "cherry"
+                      && order[1] == "banana" && order[2] == "apple");
+        }
+
+        // =====================================================================
+        // TreeSet — DUPLICATE-ADD.  SMALL_N distinct ids, each re-added via a
+        // value-equal (compareTo==0) but distinct Elem.  TreeSet dedupes by the
+        // comparator, so the size stays SMALL_N and the in-order walk surfaces each
+        // id exactly once, ascending [0,1,2] — set dedup survives the tree walk.
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::elems_of("treeDup") };
+            const elem_stats st{ fingerprint(v) };
+            ctx.check("tree_dup_count_is_3", st.count == SMALL_N);
+            ctx.check("tree_dup_count_matches_java",
+                      st.count == coll_set_fixture::j_size("treeDupSize"));
+            ctx.check("tree_dup_no_null", st.null_count == 0);
+            ctx.check("tree_dup_all_distinct", st.distinct_oops);
+            ctx.check("tree_dup_tags_round_trip", st.tags_consistent);
+            const std::vector<std::int32_t> order{ ids_in_order(v) };
+            ctx.check("tree_dup_in_sorted_order",
+                      order.size() == 3 && order[0] == 0 && order[1] == 1 && order[2] == 2);
+            ctx.check("tree_dup_strictly_ascending",
+                      std::is_sorted(order.begin(), order.end()));
+            const auto ids{ id_set(v) };
+            ctx.check("tree_dup_each_id_once",
+                      ids.size() == static_cast<std::size_t>(SMALL_N));
+        }
+
+        // =====================================================================
         // Collections.newSetFromMap(new TreeMap<>())  — the "m" backing-field
         // name collides with TreeSet AND setFromHashMap, but the backing map is a
         // TreeMap (HAS "root").  to_vector's "m"-route inspects the backing-map
@@ -1013,6 +1244,40 @@ namespace
                        "a TreeMap (has 'root'); to_vector's klass-shape router takes "
                        "the in-order red-black walk → SORTED decode (vs the HashMap-"
                        "backed setFromHashMap which takes the bucket walk).");
+        }
+
+        // =====================================================================
+        // Collections.newSetFromMap(new TreeMap<>(reverseOrder))  — the "m"-route
+        // finds "root" on the backing TreeMap and takes the in-order walk, which
+        // honours the TreeMap's REVERSE comparator → DESCENDING decode
+        // [402,401,400].  Proves the SetFromMap tree route respects a comparator
+        // exactly like a plain reverse-comparator TreeSet.  Ids 400..402.
+        // =====================================================================
+        {
+            const std::int32_t java_size{ coll_set_fixture::j_size("setFromTreeMapReverseSize") };
+            ctx.check("setfromtreemap_rev_java_size_is_3", java_size == SMALL_N);
+
+            const auto v{ coll_set_fixture::elems_of("setFromTreeMapReverse") };
+            const elem_stats st{ fingerprint(v) };
+            ctx.check("setfromtreemap_rev_count_is_3", st.count == SMALL_N);
+            ctx.check("setfromtreemap_rev_count_matches_java", st.count == java_size);
+            ctx.check("setfromtreemap_rev_no_null", st.null_count == 0);
+            ctx.check("setfromtreemap_rev_distinct", st.distinct_oops);
+            ctx.check("setfromtreemap_rev_tags_round_trip", st.tags_consistent);
+
+            const std::vector<std::int32_t> order{ ids_in_order(v) };
+            bool descending{ order.size() == static_cast<std::size_t>(SMALL_N) };
+            for (std::size_t k{ 0 }; descending && k < order.size(); ++k)
+            {
+                if (order[k] != 402 - static_cast<std::int32_t>(k)) { descending = false; }
+            }
+            ctx.check("setfromtreemap_rev_in_descending_order", descending);
+            ctx.check("setfromtreemap_rev_is_reverse_sorted",
+                      std::is_sorted(order.begin(), order.end(), std::greater<std::int32_t>{}));
+            ctx.check("setfromtreemap_rev_first_is_402",
+                      !order.empty() && order.front() == 402);
+            ctx.check("setfromtreemap_rev_last_is_400",
+                      !order.empty() && order.back() == 400);
         }
 
         // =====================================================================
@@ -1156,6 +1421,112 @@ namespace
             ctx.check("tree_ints_first_is_0", !order.empty() && order.front() == 0);
             ctx.check("tree_ints_last_is_max",
                       !order.empty() && order.back() == INT_N - 1);
+        }
+
+        // =====================================================================
+        // HashSet<Long>  — BOXED-Long element decode: the 8-byte primitive `value`
+        // field read (Integer covered 4-byte; Long covers the wide case).  Order-
+        // independent value fingerprint (sum/xor vs Java + closed form), full
+        // membership 0..INT_N-1.
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::longs_of("hashLongs") };
+            std::int32_t count{ 0 };
+            std::int32_t null_count{ 0 };
+            std::int64_t val_sum{ 0 };
+            std::int64_t val_xor{ 0 };
+            std::unordered_set<const void*> seen;
+            std::unordered_set<std::int64_t> vals;
+            for (const auto& up : v)
+            {
+                ++count;
+                if (up == nullptr) { ++null_count; continue; }
+                const std::int64_t val{ up->value() };
+                val_sum += val;
+                val_xor ^= val;
+                seen.insert(static_cast<const void*>(up->get_instance()));
+                vals.insert(val);
+            }
+            ctx.check("hash_longs_count_is_n", count == INT_N);
+            ctx.check("hash_longs_count_matches_java",
+                      count == coll_set_fixture::j_size("hashLongsSize"));
+            ctx.check("hash_longs_no_null", null_count == 0);
+            ctx.check("hash_longs_val_sum_matches_java",
+                      val_sum == coll_set_fixture::j_long("hashLongsValSum"));
+            ctx.check("hash_longs_val_xor_matches_java",
+                      val_xor == coll_set_fixture::j_long("hashLongsValXor"));
+            ctx.check("hash_longs_val_sum_closed_form",
+                      val_sum == (static_cast<std::int64_t>(INT_N) * (INT_N - 1)) / 2);
+            ctx.check("hash_longs_all_distinct_oops",
+                      seen.size() == static_cast<std::size_t>(count - null_count));
+            bool all_present{ vals.size() == static_cast<std::size_t>(INT_N) };
+            for (std::int64_t i{ 0 }; i < INT_N; ++i)
+            {
+                if (vals.find(i) == vals.end()) { all_present = false; }
+            }
+            ctx.check("hash_longs_every_value_present", all_present);
+        }
+
+        // =====================================================================
+        // HashSet<Character>  — BOXED-Character element decode: the primitive
+        // `char value` (u16) field read.  Values 'a'..'a'+CHAR_N-1; order-
+        // independent char-sum vs Java + membership.
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::chars_of("hashChars") };
+            std::int32_t count{ 0 };
+            std::int32_t null_count{ 0 };
+            std::int64_t char_sum{ 0 };
+            std::unordered_set<std::int32_t> vals;
+            for (const auto& up : v)
+            {
+                ++count;
+                if (up == nullptr) { ++null_count; continue; }
+                const std::int32_t c{ up->value() };
+                char_sum += c;
+                vals.insert(c);
+            }
+            ctx.check("hash_chars_count_is_n", count == CHAR_N);
+            ctx.check("hash_chars_count_matches_java",
+                      count == coll_set_fixture::j_size("hashCharsSize"));
+            ctx.check("hash_chars_no_null", null_count == 0);
+            ctx.check("hash_chars_char_sum_matches_java",
+                      char_sum == coll_set_fixture::j_long("hashCharsValSum"));
+            bool all_present{ vals.size() == static_cast<std::size_t>(CHAR_N) };
+            for (std::int32_t i{ 0 }; i < CHAR_N; ++i)
+            {
+                if (vals.find('a' + i) == vals.end()) { all_present = false; }
+            }
+            ctx.check("hash_chars_every_value_present", all_present);
+            ctx.check("hash_chars_contains_a", vals.count('a') == 1);
+            ctx.check("hash_chars_contains_last",
+                      vals.count('a' + CHAR_N - 1) == 1);
+        }
+
+        // =====================================================================
+        // HashSet<Boolean>  — the BOUNDARY boxed set.  A Boolean set can hold at
+        // most {TRUE, FALSE}, so this is the maximal Boolean set (size 2); the
+        // decode must surface exactly one true and one false.  Exercises the
+        // primitive `boolean value` field read.
+        // =====================================================================
+        {
+            const auto v{ coll_set_fixture::bools_of("hashBooleans") };
+            std::int32_t count{ 0 };
+            std::int32_t null_count{ 0 };
+            std::int32_t true_count{ 0 };
+            std::int32_t false_count{ 0 };
+            for (const auto& up : v)
+            {
+                ++count;
+                if (up == nullptr) { ++null_count; continue; }
+                if (up->value()) { ++true_count; } else { ++false_count; }
+            }
+            ctx.check("hash_bools_count_is_2", count == TWO);
+            ctx.check("hash_bools_count_matches_java",
+                      count == coll_set_fixture::j_size("hashBooleansSize"));
+            ctx.check("hash_bools_no_null", null_count == 0);
+            ctx.check("hash_bools_exactly_one_true", true_count == 1);
+            ctx.check("hash_bools_exactly_one_false", false_count == 1);
         }
 
         // =====================================================================
@@ -1322,6 +1693,15 @@ namespace
             ctx.check("hash_many_reread_same_count", sa.count == sb.count);
             ctx.check("hash_many_reread_same_id_sum", sa.id_sum == sb.id_sum);
             ctx.check("hash_many_reread_same_id_xor", sa.id_xor == sb.id_xor);
+
+            // The TreeSet in-order walk must likewise be repeatable: decoding
+            // treeMany twice yields the same exact ascending sequence (the
+            // iterative-stack walk leaves the red-black tree untouched).
+            const std::vector<std::int32_t> ta{ ids_in_order(coll_set_fixture::elems_of("treeMany")) };
+            const std::vector<std::int32_t> tb{ ids_in_order(coll_set_fixture::elems_of("treeMany")) };
+            ctx.check("tree_many_reread_same_sequence", ta == tb);
+            ctx.check("tree_many_reread_still_sorted",
+                      std::is_sorted(tb.begin(), tb.end()));
         }
 
         // =====================================================================

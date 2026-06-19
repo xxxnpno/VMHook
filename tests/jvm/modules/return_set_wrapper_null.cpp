@@ -114,10 +114,14 @@ namespace
         static auto byval_donor()  -> std::unique_ptr<donor_object> { return static_field("BYVAL_DONOR")->get(); }
         static auto decoy()        -> std::unique_ptr<decoy_object> { return static_field("DECOY")->get(); }
         static auto string_donor() -> std::unique_ptr<vmhook::object_base> { return static_field("STRING_DONOR_REF")->get(); }
+        static auto donor2()       -> std::unique_ptr<donor_object> { return static_field("DONOR2")->get(); }
+        static auto recv_donor()   -> std::unique_ptr<donor_object> { return static_field("RECV_DONOR")->get(); }
 
         static auto donor_identity()       -> std::int32_t { std::int32_t v = static_field("donorIdentity")->get();      return v; }
         static auto byval_donor_identity() -> std::int32_t { std::int32_t v = static_field("byvalDonorIdentity")->get(); return v; }
         static auto decoy_identity()       -> std::int32_t { std::int32_t v = static_field("decoyIdentity")->get();      return v; }
+        static auto donor2_identity()      -> std::int32_t { std::int32_t v = static_field("donor2Identity")->get();     return v; }
+        static auto recv_donor_identity()  -> std::int32_t { std::int32_t v = static_field("recvDonorIdentity")->get();  return v; }
 
         // ── allow-through observations ─────────────────────────────────────
         static auto obj_was_null() -> bool        { bool v = static_field("objWasNull")->get(); return v; }
@@ -152,16 +156,64 @@ namespace
         static auto str_len()      -> std::int32_t { std::int32_t v = static_field("strLen")->get(); return v; }
         static auto str_seen()     -> std::string { std::string s = static_field("strSeen")->get(); return s; }
 
+        // ── object-over-NULL-original (post-fix allow-through) ─────────────
+        static auto null_orig_was_null() -> bool        { bool v = static_field("nullOrigWasNull")->get(); return v; }
+        static auto null_orig_tag()      -> std::int32_t { std::int32_t v = static_field("nullOrigTag")->get(); return v; }
+        static auto null_orig_identity() -> std::int32_t { std::int32_t v = static_field("nullOrigIdentity")->get(); return v; }
+
+        // ── double / then-null inject ──────────────────────────────────────
+        static auto replace_was_null() -> bool        { bool v = static_field("replaceWasNull")->get(); return v; }
+        static auto replace_tag()      -> std::int32_t { std::int32_t v = static_field("replaceTag")->get(); return v; }
+        static auto then_null_was_null() -> bool { bool v = static_field("thenNullWasNull")->get(); return v; }
+
+        // ── two-arg (inject slot 1, both slots) ────────────────────────────
+        static auto two_first_only_a()         -> std::int32_t { std::int32_t v = static_field("twoFirstOnlyA")->get(); return v; }
+        static auto two_first_only_b()         -> std::int32_t { std::int32_t v = static_field("twoFirstOnlyB")->get(); return v; }
+        static auto two_first_only_a_was_null()-> bool { bool v = static_field("twoFirstOnlyAWasNull")->get(); return v; }
+        static auto two_first_only_b_was_null()-> bool { bool v = static_field("twoFirstOnlyBWasNull")->get(); return v; }
+        static auto both_a()         -> std::int32_t { std::int32_t v = static_field("bothA")->get(); return v; }
+        static auto both_b()         -> std::int32_t { std::int32_t v = static_field("bothB")->get(); return v; }
+        static auto both_a_was_null()-> bool { bool v = static_field("bothAWasNull")->get(); return v; }
+        static auto both_b_was_null()-> bool { bool v = static_field("bothBWasNull")->get(); return v; }
+
+        // ── mixed null (null after a primitive) ────────────────────────────
+        static auto mixed_null_n()         -> std::int32_t { std::int32_t v = static_field("mixedNullN")->get(); return v; }
+        static auto mixed_null_x_was_null()-> bool { bool v = static_field("mixedNullXWasNull")->get(); return v; }
+
+        // ── fresh on a static slot ─────────────────────────────────────────
+        static auto fresh_static_was_null()-> bool { bool v = static_field("freshStaticWasNull")->get(); return v; }
+        static auto fresh_static_tag()     -> std::int32_t { std::int32_t v = static_field("freshStaticTag")->get(); return v; }
+
+        // ── by-value String / by-value null ────────────────────────────────
+        static auto byval_str_was_null() -> bool        { bool v = static_field("byvalStrWasNull")->get(); return v; }
+        static auto byval_str_len()      -> std::int32_t { std::int32_t v = static_field("byvalStrLen")->get(); return v; }
+        static auto byval_str_seen()     -> std::string { std::string s = static_field("byvalStrSeen")->get(); return s; }
+        static auto byval_null_was_null()-> bool { bool v = static_field("byvalNullWasNull")->get(); return v; }
+
+        // ── out-of-range rejection ─────────────────────────────────────────
+        static auto oob_was_null() -> bool        { bool v = static_field("oobWasNull")->get(); return v; }
+        static auto oob_tag()      -> std::int32_t { std::int32_t v = static_field("oobTag")->get(); return v; }
+
+        // ── receiver swap (slot 0 of an instance Donor method) ─────────────
+        static auto recv_was_null() -> bool        { bool v = static_field("recvWasNull")->get(); return v; }
+        static auto recv_tag()      -> std::int32_t { std::int32_t v = static_field("recvTag")->get(); return v; }
+        static auto recv_identity() -> std::int32_t { std::int32_t v = static_field("recvIdentity")->get(); return v; }
+
         // ── cancel-only witnesses (must remain false — body never ran) ─────
-        static auto over_null_body_ran() -> bool { bool v = static_field("overNullBodyRan")->get(); return v; }
-        static auto wrong_body_ran()     -> bool { bool v = static_field("wrongBodyRan")->get(); return v; }
+        static auto over_null_body_ran()    -> bool { bool v = static_field("overNullBodyRan")->get(); return v; }
+        static auto wrong_body_ran()        -> bool { bool v = static_field("wrongBodyRan")->get(); return v; }
+        static auto wrong_byval_body_ran()  -> bool { bool v = static_field("wrongByValBodyRan")->get(); return v; }
     };
 
     // Mirrored fixture constants (kept in lockstep with ReturnSetWrapperNull.java).
-    constexpr std::int32_t DONOR_TAG       = 0x0D04;    // 3332
-    constexpr std::int32_t BYVAL_DONOR_TAG = 0x0BABE;   // 48318
-    constexpr std::int32_t FRESH_DONOR_TAG = 0x7E57;    // 32343
-    const std::string      STRING_DONOR    = "injected-object-string";
+    constexpr std::int32_t DONOR_TAG        = 0x0D04;    // 3332
+    constexpr std::int32_t BYVAL_DONOR_TAG  = 0x0BABE;   // 48318
+    constexpr std::int32_t FRESH_DONOR_TAG  = 0x7E57;    // 32343
+    constexpr std::int32_t DONOR2_TAG       = 0x0D2D2;   // 53970
+    constexpr std::int32_t FRESH_STATIC_TAG = 0x57A7;    // 22439
+    constexpr std::int32_t RECV_TAG         = 0x4EC0;    // 20160
+    constexpr std::int32_t SENTINEL_TAG     = 0x5E11;    // 24081
+    const std::string      STRING_DONOR     = "injected-object-string";
 
     // ── per-hook observation state (captured in the detours) ────────────────
 
@@ -210,6 +262,59 @@ namespace
     std::atomic<std::uintptr_t> g_wrong_slot_decoded{ 0 };
     std::atomic<bool>           g_wrong_slot_valid{ false };
     std::atomic<bool>           g_wrong_cancelled{ false };
+
+    // ── deepening additions ─────────────────────────────────────────────────
+
+    // takeNullOriginal (object over a genuinely-null slot, post-fix allow-through).
+    // The detour reads the slot NATIVELY (gated) to prove the wide oop landed, AND
+    // allows the body through (the fix guarantees a wide store) to prove the body
+    // can dereference it.  Both proofs gate the same scenario.
+    std::atomic<bool>           g_no_set_ok{ false };
+    std::atomic<bool>           g_no_donor_resolved{ false };
+    std::atomic<std::uintptr_t> g_no_expected_oop{ 0 };
+    std::atomic<std::uintptr_t> g_no_slot_decoded{ 0 };
+    std::atomic<bool>           g_no_slot_valid{ false };
+
+    // takeReplace (double inject — last write wins).
+    std::atomic<bool> g_replace_first_ok{ false };
+    std::atomic<bool> g_replace_second_ok{ false };
+
+    // takeThenNull (object then empty uptr).
+    std::atomic<bool> g_thennull_obj_ok{ false };
+    std::atomic<bool> g_thennull_null_ok{ false };
+
+    // takeTwoFirst (inject slot 1, slot 2 survives) / takeTwoBoth (inject both).
+    std::atomic<bool> g_two_a_set_ok{ false };
+    std::atomic<bool> g_both_a_set_ok{ false };
+    std::atomic<bool> g_both_b_set_ok{ false };
+
+    // takeMixedNull (null after a primitive).
+    std::atomic<bool> g_mixednull_set_ok{ false };
+
+    // takeFreshStatic (make_unique on static slot 0).
+    std::atomic<bool> g_freshstatic_made{ false };
+    std::atomic<bool> g_freshstatic_set_ok{ false };
+
+    // takeByValString (object_base by value) / takeByValNull (by-value null).
+    std::atomic<bool> g_byvalstr_resolved{ false };
+    std::atomic<bool> g_byvalstr_set_ok{ false };
+    std::atomic<bool> g_byvalnull_set_ok{ false };
+
+    // takeOobObject (out-of-range index rejection).
+    std::atomic<bool> g_oob_neg_returned_false{ false };
+    std::atomic<bool> g_oob_hi_returned_false{ false };
+
+    // publishReceiver (receiver swap — slot 0 of an instance Donor method).
+    std::atomic<bool> g_recv_self_ok{ false };
+    std::atomic<bool> g_recv_donor_resolved{ false };
+    std::atomic<bool> g_recv_set_ok{ false };
+
+    // Cancel-only: takeWrongByVal (Decoy by value into a Donor slot).
+    std::atomic<bool>           g_wrongbv_set_ok{ false };
+    std::atomic<std::uintptr_t> g_wrongbv_expected_oop{ 0 };
+    std::atomic<std::uintptr_t> g_wrongbv_slot_decoded{ 0 };
+    std::atomic<bool>           g_wrongbv_slot_valid{ false };
+    std::atomic<bool>           g_wrongbv_cancelled{ false };
 
     auto as_uptr(void* p) -> std::uintptr_t { return reinterpret_cast<std::uintptr_t>(p); }
 
@@ -469,6 +574,237 @@ VMHOOK_JVM_MODULE(return_set_wrapper_null)
             }) };
         ctx.check("rsw_wrong_hook_installed", h_wrong.installed());
 
+        // ── ALLOW-THROUGH (post-fix): takeNullOriginal — OBJECT over NULL slot ─
+        // The probe passes null, so set_arg overwrites a genuinely-null slot.
+        // store_oop now ALWAYS writes a wide oop (the narrow-over-null corruption
+        // is fixed), so we (a) prove the wide oop landed via a native gated read
+        // AND (b) allow the body through to dereference the injected DONOR.
+        auto h_no{ vmhook::scoped_hook<rsw_fixture>(
+            "takeNullOriginal", "(Lvmhook/fixtures/ReturnSetWrapperNull$Donor;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<rsw_fixture>&,
+               const std::unique_ptr<donor_object>& /*incoming(null)*/)
+            {
+                std::unique_ptr<donor_object> d{ rsw_fixture::donor() };
+                g_no_donor_resolved.store(d != nullptr, std::memory_order_relaxed);
+                if (d)
+                {
+                    g_no_expected_oop.store(as_uptr(d->get_instance()), std::memory_order_relaxed);
+                    g_no_set_ok.store(ret.set_arg(1, std::move(d)), std::memory_order_relaxed);
+                    void* const decoded{ decode_slot_oop_gated(ret.frame(), 1) };
+                    g_no_slot_decoded.store(as_uptr(decoded), std::memory_order_relaxed);
+                    g_no_slot_valid.store(
+                        decoded != nullptr && vmhook::hotspot::is_valid_pointer(decoded),
+                        std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("rsw_no_hook_installed", h_no.installed());
+
+        // ── ALLOW-THROUGH: takeReplace — DOUBLE inject, last write wins ────
+        auto h_replace{ vmhook::scoped_hook<rsw_fixture>(
+            "takeReplace", "(Lvmhook/fixtures/ReturnSetWrapperNull$Donor;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<rsw_fixture>&,
+               const std::unique_ptr<donor_object>& /*incoming(sentinel)*/)
+            {
+                std::unique_ptr<donor_object> d1{ rsw_fixture::donor() };
+                if (d1)
+                {
+                    g_replace_first_ok.store(ret.set_arg(1, std::move(d1)), std::memory_order_relaxed);
+                }
+                std::unique_ptr<donor_object> d2{ rsw_fixture::donor2() };
+                if (d2)
+                {
+                    g_replace_second_ok.store(ret.set_arg(1, std::move(d2)), std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("rsw_replace_hook_installed", h_replace.installed());
+
+        // ── ALLOW-THROUGH: takeThenNull — object THEN empty uptr (null wins) ─
+        auto h_thennull{ vmhook::scoped_hook<rsw_fixture>(
+            "takeThenNull", "(Lvmhook/fixtures/ReturnSetWrapperNull$Donor;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<rsw_fixture>&,
+               const std::unique_ptr<donor_object>& /*incoming(sentinel)*/)
+            {
+                std::unique_ptr<donor_object> d{ rsw_fixture::donor() };
+                if (d)
+                {
+                    g_thennull_obj_ok.store(ret.set_arg(1, std::move(d)), std::memory_order_relaxed);
+                }
+                std::unique_ptr<donor_object> empty{};
+                g_thennull_null_ok.store(ret.set_arg(1, std::move(empty)), std::memory_order_relaxed);
+            }) };
+        ctx.check("rsw_thennull_hook_installed", h_thennull.installed());
+
+        // ── ALLOW-THROUGH: takeTwoFirst — inject slot 1; slot 2 survives ───
+        auto h_twofirst{ vmhook::scoped_hook<rsw_fixture>(
+            "takeTwoFirst",
+            "(Lvmhook/fixtures/ReturnSetWrapperNull$Donor;Lvmhook/fixtures/ReturnSetWrapperNull$Donor;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<rsw_fixture>&,
+               const std::unique_ptr<donor_object>& /*a(sentinel)*/,
+               const std::unique_ptr<donor_object>& /*b(Donor 22)*/)
+            {
+                std::unique_ptr<donor_object> d{ rsw_fixture::donor() };
+                if (d)
+                {
+                    g_two_a_set_ok.store(ret.set_arg(1, std::move(d)), std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("rsw_twofirst_hook_installed", h_twofirst.installed());
+
+        // ── ALLOW-THROUGH: takeTwoBoth — inject BOTH slots in one detour ───
+        auto h_twoboth{ vmhook::scoped_hook<rsw_fixture>(
+            "takeTwoBoth",
+            "(Lvmhook/fixtures/ReturnSetWrapperNull$Donor;Lvmhook/fixtures/ReturnSetWrapperNull$Donor;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<rsw_fixture>&,
+               const std::unique_ptr<donor_object>& /*a(sentinel)*/,
+               const std::unique_ptr<donor_object>& /*b(sentinel)*/)
+            {
+                std::unique_ptr<donor_object> a{ rsw_fixture::donor() };
+                if (a)
+                {
+                    g_both_a_set_ok.store(ret.set_arg(1, std::move(a)), std::memory_order_relaxed);
+                }
+                std::unique_ptr<donor_object> b{ rsw_fixture::donor2() };
+                if (b)
+                {
+                    g_both_b_set_ok.store(ret.set_arg(2, std::move(b)), std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("rsw_twoboth_hook_installed", h_twoboth.installed());
+
+        // ── ALLOW-THROUGH (null inject): takeMixedNull — null AFTER a primitive ─
+        auto h_mixednull{ vmhook::scoped_hook<rsw_fixture>(
+            "takeMixedNull", "(ILvmhook/fixtures/ReturnSetWrapperNull$Donor;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<rsw_fixture>&,
+               std::int32_t /*n*/,
+               const std::unique_ptr<donor_object>& /*x(DONOR)*/)
+            {
+                std::unique_ptr<donor_object> empty{};
+                g_mixednull_set_ok.store(ret.set_arg(2, std::move(empty)), std::memory_order_relaxed);
+            }) };
+        ctx.check("rsw_mixednull_hook_installed", h_mixednull.installed());
+
+        // ── ALLOW-THROUGH: takeFreshStatic — make_unique onto a STATIC slot 0 ─
+        auto h_freshstatic{ vmhook::scoped_hook<rsw_fixture>(
+            "takeFreshStatic", "(Lvmhook/fixtures/ReturnSetWrapperNull$Donor;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<donor_object>& /*incoming(sentinel)*/)
+            {
+                std::unique_ptr<donor_object> fresh{
+                    vmhook::make_unique<donor_object>(static_cast<std::int32_t>(FRESH_STATIC_TAG)) };
+                g_freshstatic_made.store(fresh != nullptr, std::memory_order_relaxed);
+                if (fresh)
+                {
+                    g_freshstatic_set_ok.store(ret.set_arg(0, std::move(fresh)), std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("rsw_freshstatic_hook_installed", h_freshstatic.installed());
+
+        // ── ALLOW-THROUGH: takeByValString — object_base BY VALUE (String) ──
+        auto h_byvalstr{ vmhook::scoped_hook<rsw_fixture>(
+            "takeByValString", "(Ljava/lang/String;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<rsw_fixture>&,
+               const std::string& /*incoming "before"*/)
+            {
+                std::unique_ptr<vmhook::object_base> s{ rsw_fixture::string_donor() };
+                g_byvalstr_resolved.store(s != nullptr, std::memory_order_relaxed);
+                if (s && s->get_instance())
+                {
+                    vmhook::object_base by_value{ s->get_instance() };   // by value
+                    g_byvalstr_set_ok.store(ret.set_arg(1, by_value), std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("rsw_byvalstr_hook_installed", h_byvalstr.installed());
+
+        // ── ALLOW-THROUGH (null inject): takeByValNull — by-value NULL instance ─
+        // A wrapper built over a null oop drives store_oop(nullptr) through the
+        // object_base-by-value branch -> literal null (always safe).
+        auto h_byvalnull{ vmhook::scoped_hook<rsw_fixture>(
+            "takeByValNull", "(Lvmhook/fixtures/ReturnSetWrapperNull$Donor;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<rsw_fixture>&,
+               const std::unique_ptr<donor_object>& /*incoming(DONOR)*/)
+            {
+                donor_object null_wrapper{ nullptr };   // get_instance() == nullptr
+                g_byvalnull_set_ok.store(ret.set_arg(1, null_wrapper), std::memory_order_relaxed);
+            }) };
+        ctx.check("rsw_byvalnull_hook_installed", h_byvalnull.installed());
+
+        // ── ALLOW-THROUGH: takeOobObject — out-of-range index REJECTED ─────
+        // Negative and above-max-locals indices must return false and leave the
+        // slot untouched; the body runs and must still observe the SENTINEL.
+        auto h_oob{ vmhook::scoped_hook<rsw_fixture>(
+            "takeOobObject", "(Lvmhook/fixtures/ReturnSetWrapperNull$Donor;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<rsw_fixture>&,
+               const std::unique_ptr<donor_object>& /*incoming(sentinel)*/)
+            {
+                std::unique_ptr<donor_object> dneg{ rsw_fixture::donor() };
+                if (dneg)
+                {
+                    g_oob_neg_returned_false.store(
+                        !ret.set_arg(-1, std::move(dneg)), std::memory_order_relaxed);
+                }
+                std::unique_ptr<donor_object> dhi{ rsw_fixture::donor() };
+                if (dhi)
+                {
+                    g_oob_hi_returned_false.store(
+                        !ret.set_arg(0x10000, std::move(dhi)), std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("rsw_oob_hook_installed", h_oob.installed());
+
+        // ── ALLOW-THROUGH: publishReceiver — RECEIVER SWAP on Donor slot 0 ──
+        // publishReceiver is an INSTANCE method on Donor; slot 0 is its receiver.
+        // We inject RECV_DONOR over slot 0, so the body's `this` becomes RECV_DONOR
+        // and it publishes RECV_TAG instead of the original RECV_ORIG_TAG.  The
+        // original receiver is a non-null Donor (wide oop in slot 0), so the swap
+        // is crash-safe to dereference.  Hooked on the donor_object wrapper type.
+        auto h_recv{ vmhook::scoped_hook<donor_object>(
+            "publishReceiver", "()V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<donor_object>& self)
+            {
+                g_recv_self_ok.store(self != nullptr, std::memory_order_relaxed);
+                std::unique_ptr<donor_object> rd{ rsw_fixture::recv_donor() };
+                g_recv_donor_resolved.store(rd != nullptr, std::memory_order_relaxed);
+                if (rd)
+                {
+                    g_recv_set_ok.store(ret.set_arg(0, std::move(rd)), std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("rsw_recv_hook_installed", h_recv.installed());
+
+        // ── CANCEL-ONLY: takeWrongByVal — Decoy BY VALUE into a Donor slot ──
+        auto h_wrongbv{ vmhook::scoped_hook<rsw_fixture>(
+            "takeWrongByVal", "(Lvmhook/fixtures/ReturnSetWrapperNull$Donor;)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<rsw_fixture>&,
+               const std::unique_ptr<donor_object>& /*incoming(sentinel)*/)
+            {
+                std::unique_ptr<decoy_object> dc{ rsw_fixture::decoy() };
+                if (dc && dc->get_instance())
+                {
+                    decoy_object by_value{ dc->get_instance() };   // by value
+                    g_wrongbv_expected_oop.store(as_uptr(by_value.get_instance()), std::memory_order_relaxed);
+                    g_wrongbv_set_ok.store(ret.set_arg(1, by_value), std::memory_order_relaxed);
+                    void* const decoded{ decode_slot_oop_gated(ret.frame(), 1) };
+                    g_wrongbv_slot_decoded.store(as_uptr(decoded), std::memory_order_relaxed);
+                    g_wrongbv_slot_valid.store(
+                        decoded != nullptr && vmhook::hotspot::is_valid_pointer(decoded),
+                        std::memory_order_relaxed);
+                }
+                ret.cancel();
+                g_wrongbv_cancelled.store(true, std::memory_order_relaxed);
+            }) };
+        ctx.check("rsw_wrongbv_hook_installed", h_wrongbv.installed());
+
         // ── Drive every method once (single real bytecode dispatch each) ───
         const bool done{ ctx.run_probe(
             [](bool value) { if (value) { rsw_fixture::set_done(false); rsw_fixture::set_mode(0); } rsw_fixture::set_go(value); },
@@ -480,6 +816,8 @@ VMHOOK_JVM_MODULE(return_set_wrapper_null)
         ctx.check("rsw_donor_identity_published", rsw_fixture::donor_identity() != 0);
         ctx.check("rsw_byval_donor_identity_published", rsw_fixture::byval_donor_identity() != 0);
         ctx.check("rsw_decoy_identity_published", rsw_fixture::decoy_identity() != 0);
+        ctx.check("rsw_donor2_identity_published", rsw_fixture::donor2_identity() != 0);
+        ctx.check("rsw_recv_donor_identity_published", rsw_fixture::recv_donor_identity() != 0);
 
         ctx.record("[INFO] return_set_wrapper_null: allow-through object injections write OVER a "
                    "non-null sentinel Donor (a wide OOP), so store_oop's raw-store branch fires and "
@@ -602,6 +940,120 @@ VMHOOK_JVM_MODULE(return_set_wrapper_null)
                    "body is CANCELLED — a getfield/invokevirtual against a Decoy-as-Donor is UB. Same "
                    "no-klass-check flaw class field_object_ref.cpp documents for the field-decode path; "
                    "characterized, not a CI failure.");
+
+        // ==================================================================
+        // ALLOW-THROUGH: takeNullOriginal — OBJECT injected over a NULL slot.
+        // POST-FIX: store_oop always writes a wide oop, so the narrow-over-null
+        // corruption is gone.  We prove the wide DONOR landed via the NATIVE
+        // gated read-back AND let the body dereference it (field + identity) —
+        // the exact scenario that crashed the JVM before the fix, now safe.
+        // ==================================================================
+        ctx.check("rsw_no_donor_resolved", g_no_donor_resolved.load(std::memory_order_relaxed));
+        ctx.check("rsw_no_set_arg_returned_true", g_no_set_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_no_slot_decoded_valid", g_no_slot_valid.load(std::memory_order_relaxed));
+        ctx.check("rsw_no_slot_is_donor_oop",
+                  g_no_slot_decoded.load(std::memory_order_relaxed)
+                      == g_no_expected_oop.load(std::memory_order_relaxed)
+                  && g_no_expected_oop.load(std::memory_order_relaxed) != 0);
+        ctx.check("rsw_no_body_not_null", !rsw_fixture::null_orig_was_null());
+        ctx.check("rsw_no_body_tag_is_donor", rsw_fixture::null_orig_tag() == DONOR_TAG);
+        ctx.check("rsw_no_body_identity_is_donor",
+                  rsw_fixture::null_orig_identity() == rsw_fixture::donor_identity()
+                  && rsw_fixture::null_orig_identity() != 0);
+        ctx.record("[INFO] return_set_wrapper_null: the narrow-over-null store_oop bug is FIXED in the "
+                   "current header (vmhook.hpp ~9895-9912 — store_oop now ALWAYS writes a wide 64-bit "
+                   "oop). takeNullOriginal injects the DONOR over a genuinely-null slot and the body "
+                   "safely dereferences it (tag + identity match), proving the fix end-to-end. The "
+                   "legacy takeOverNull path is kept as a native gated-read characterization that also "
+                   "now lands the wide oop; both are HARD assertions.");
+
+        // ── takeReplace (double inject — last write wins) ──────────────────
+        ctx.check("rsw_replace_first_set_arg_returned_true", g_replace_first_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_replace_second_set_arg_returned_true", g_replace_second_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_replace_body_not_null", !rsw_fixture::replace_was_null());
+        ctx.check("rsw_replace_body_tag_is_donor2_last_wins", rsw_fixture::replace_tag() == DONOR2_TAG);
+
+        // ── takeThenNull (object then empty uptr — null supersedes) ────────
+        ctx.check("rsw_thennull_obj_set_arg_returned_true", g_thennull_obj_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_thennull_null_set_arg_returned_true", g_thennull_null_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_thennull_body_is_null", rsw_fixture::then_null_was_null());
+
+        // ── takeTwoFirst (inject slot 1; slot 2 survives) ──────────────────
+        ctx.check("rsw_twofirst_a_set_arg_returned_true", g_two_a_set_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_twofirst_a_body_is_donor",
+                  !rsw_fixture::two_first_only_a_was_null()
+                  && rsw_fixture::two_first_only_a() == DONOR_TAG);
+        ctx.check("rsw_twofirst_b_body_untouched_22",
+                  !rsw_fixture::two_first_only_b_was_null()
+                  && rsw_fixture::two_first_only_b() == 22);
+
+        // ── takeTwoBoth (inject BOTH slots in one detour) ──────────────────
+        ctx.check("rsw_twoboth_a_set_arg_returned_true", g_both_a_set_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_twoboth_b_set_arg_returned_true", g_both_b_set_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_twoboth_a_body_is_donor",
+                  !rsw_fixture::both_a_was_null() && rsw_fixture::both_a() == DONOR_TAG);
+        ctx.check("rsw_twoboth_b_body_is_donor2",
+                  !rsw_fixture::both_b_was_null() && rsw_fixture::both_b() == DONOR2_TAG);
+
+        // ── takeMixedNull (null into the object slot AFTER a primitive) ────
+        ctx.check("rsw_mixednull_set_arg_returned_true", g_mixednull_set_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_mixednull_x_body_is_null", rsw_fixture::mixed_null_x_was_null());
+        ctx.check("rsw_mixednull_n_body_untouched_7373", rsw_fixture::mixed_null_n() == 7373);
+
+        // ── takeFreshStatic (make_unique onto a STATIC slot 0) ─────────────
+        ctx.check("rsw_freshstatic_allocated", g_freshstatic_made.load(std::memory_order_relaxed));
+        ctx.check("rsw_freshstatic_set_arg_returned_true", g_freshstatic_set_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_freshstatic_body_not_null", !rsw_fixture::fresh_static_was_null());
+        ctx.check("rsw_freshstatic_body_tag_is_fresh", rsw_fixture::fresh_static_tag() == FRESH_STATIC_TAG);
+
+        // ── takeByValString (object_base BY VALUE — String wrapper) ────────
+        ctx.check("rsw_byvalstr_donor_resolved", g_byvalstr_resolved.load(std::memory_order_relaxed));
+        ctx.check("rsw_byvalstr_set_arg_returned_true", g_byvalstr_set_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_byvalstr_body_not_null", !rsw_fixture::byval_str_was_null());
+        ctx.check("rsw_byvalstr_body_content_is_donor", rsw_fixture::byval_str_seen() == STRING_DONOR);
+        ctx.check("rsw_byvalstr_body_len_matches",
+                  rsw_fixture::byval_str_len() == static_cast<std::int32_t>(STRING_DONOR.size()));
+
+        // ── takeByValNull (object_base by value with a NULL instance) ──────
+        ctx.check("rsw_byvalnull_set_arg_returned_true", g_byvalnull_set_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_byvalnull_body_is_null", rsw_fixture::byval_null_was_null());
+
+        // ── takeOobObject (out-of-range index REJECTED; SENTINEL survives) ─
+        ctx.check("rsw_oob_negative_returned_false", g_oob_neg_returned_false.load(std::memory_order_relaxed));
+        ctx.check("rsw_oob_above_max_returned_false", g_oob_hi_returned_false.load(std::memory_order_relaxed));
+        ctx.check("rsw_oob_body_not_null", !rsw_fixture::oob_was_null());
+        ctx.check("rsw_oob_body_tag_is_sentinel_survived", rsw_fixture::oob_tag() == SENTINEL_TAG);
+        ctx.record("[INFO] return_set_wrapper_null: out-of-range object set_arg (index -1 and 0x10000, "
+                   "just past JVM max_locals 0xFFFF) returns false and the fault-safe write_slot makes it "
+                   "a NO-OP — the original SENTINEL Donor survives in the slot (no wild write).");
+
+        // ── publishReceiver (RECEIVER swap on Donor slot 0) ────────────────
+        ctx.check("rsw_recv_detour_saw_self", g_recv_self_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_recv_donor_resolved", g_recv_donor_resolved.load(std::memory_order_relaxed));
+        ctx.check("rsw_recv_set_arg_returned_true", g_recv_set_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_recv_body_not_null", !rsw_fixture::recv_was_null());
+        ctx.check("rsw_recv_body_tag_is_replacement", rsw_fixture::recv_tag() == RECV_TAG);
+        ctx.check("rsw_recv_body_identity_is_replacement",
+                  rsw_fixture::recv_identity() == rsw_fixture::recv_donor_identity()
+                  && rsw_fixture::recv_identity() != 0);
+        ctx.record("[INFO] return_set_wrapper_null: set_arg(0, wrapper) on an INSTANCE method swaps the "
+                   "RECEIVER (`this`), not a parameter — publishReceiver's body observes the injected "
+                   "RECV_DONOR (tag + identity), proving slot 0 of an instance method is the receiver and "
+                   "set_arg targets the raw slot index regardless of receiver-vs-param.");
+
+        // ── CANCEL-ONLY: takeWrongByVal — Decoy BY VALUE into a Donor slot ─
+        ctx.check("rsw_wrongbv_set_arg_returned_true", g_wrongbv_set_ok.load(std::memory_order_relaxed));
+        ctx.check("rsw_wrongbv_cancelled", g_wrongbv_cancelled.load(std::memory_order_relaxed));
+        ctx.check("rsw_wrongbv_body_did_not_run", !rsw_fixture::wrong_byval_body_ran());
+        ctx.check("rsw_wrongbv_slot_decoded_valid", g_wrongbv_slot_valid.load(std::memory_order_relaxed));
+        ctx.check("rsw_wrongbv_slot_is_decoy_oop",
+                  g_wrongbv_slot_decoded.load(std::memory_order_relaxed)
+                      == g_wrongbv_expected_oop.load(std::memory_order_relaxed)
+                  && g_wrongbv_expected_oop.load(std::memory_order_relaxed) != 0);
+        ctx.record("[INFO] return_set_wrapper_null cross-type via the OBJECT_BASE-BY-VALUE branch: a "
+                   "Decoy injected by value into a Donor-typed slot is ACCEPTED (no klass check on the "
+                   "by-value branch either). Native gated read-back confirms the Decoy oop landed; body "
+                   "CANCELLED. Same no-klass-check flaw class as the unique_ptr branch (takeWrongType).");
     }
 
     // =====================================================================
@@ -633,12 +1085,14 @@ VMHOOK_JVM_MODULE(return_set_wrapper_null)
     }
 
     ctx.record("[INFO] return_set_wrapper_null: proved set_arg object/null injection — "
-               "unique_ptr<wrapper> (published donor + make_unique fresh) and object_base-by-value "
-               "into a reference slot make the body observe the INJECTED object (identity + field read "
-               "through it) when the overwritten slot held a wide OOP; empty unique_ptr makes the body "
-               "observe Java null; verified instance (slot 1) AND static (slot 0), slot-2 targeting "
-               "among consecutive object args, an object arg following a primitive, a real String "
-               "object injected into a String slot, and a null String injection. The narrow-over-null "
-               "store_oop bug and the wrong-type (Decoy into Donor slot) acceptance are characterized "
-               "NATIVELY + CANCELLED (crash-proof under C2).");
+               "unique_ptr<wrapper> (published donor + make_unique fresh, instance AND static slot 0) "
+               "and object_base-by-value (Donor + String wrapper) into a reference slot make the body "
+               "observe the INJECTED object (identity + field read through it); empty unique_ptr / "
+               "null-instance by-value make the body observe Java null. Deepened coverage: object over "
+               "a genuinely-NULL slot now allow-through (the narrow-over-null store_oop bug is FIXED — "
+               "wide store always), double-inject last-write-wins, object-then-null, inject slot 1 vs "
+               "slot 2 vs BOTH slots in one detour, null after a primitive, out-of-range index "
+               "rejection (SENTINEL survives), and RECEIVER swap (set_arg(0) on an instance method). "
+               "Cross-type injection via BOTH the unique_ptr and object_base-by-value branches (Decoy "
+               "into a Donor slot, no klass check) is characterized NATIVELY + CANCELLED (crash-proof).");
 }

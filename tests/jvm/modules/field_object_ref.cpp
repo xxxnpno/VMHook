@@ -108,6 +108,23 @@ namespace
         auto next()   -> std::unique_ptr<ref_object> { return get_field("next")->get(); }
     };
 
+    // Wrapper for vmhook.fixtures.FieldObjectRef$SubRef — a SUBCLASS of Ref used
+    // for the polymorphic / inherited angle.  Reads the SubRef-only `extra` field
+    // and the inherited `val`; compute() is overridden on SubRef so dispatch
+    // through this concrete wrapper lands in SubRef's body (val*3+extra).
+    class sub_ref_object : public vmhook::object<sub_ref_object>
+    {
+    public:
+        explicit sub_ref_object(vmhook::oop_t instance) noexcept
+            : vmhook::object<sub_ref_object>{ instance }
+        {
+        }
+
+        auto val()     -> std::int32_t { return get_field("val")->get(); }
+        auto extra()   -> std::int32_t { return get_field("extra")->get(); }
+        auto compute() -> std::int32_t { return get_method("compute")->call(); }
+    };
+
     // Wrapper for vmhook.fixtures.FieldObjectRef$TagImpl — the concrete impl
     // behind the interface-typed `tag` field.  tag_value() dispatches the
     // interface method through the concrete wrapper.
@@ -235,6 +252,36 @@ namespace
         // the decode is type-agnostic (it wraps whatever the slot points at).
         auto obj_as_ref()   -> std::unique_ptr<ref_object> { return get_field("objAsRef")->get(); }
 
+        // POLYMORPHIC: a Ref-declared field holding a SubRef.  Reading it through
+        // the BASE ref_object wrapper is a subclass-through-base (IS-A) read; the
+        // same slot read through the CONCRETE sub_ref_object wrapper exposes the
+        // SubRef-only `extra` field.
+        auto poly_ref()        -> std::unique_ptr<ref_object>     { return get_field("polyRef")->get(); }
+        auto poly_ref_as_sub() -> std::unique_ptr<sub_ref_object> { return get_field("polyRef")->get(); }
+
+        // NULL shapes across every declared reference type (null-slot invariant).
+        auto null_obj()   -> std::unique_ptr<ref_object>      { return get_field("nullObj")->get(); }
+        auto null_tag()   -> std::unique_ptr<tag_impl_object> { return get_field("nullTag")->get(); }
+        auto null_array() -> std::unique_ptr<ref_object>      { return get_field("nullArray")->get(); }
+        auto null_boxed() -> std::unique_ptr<integer_object>  { return get_field("nullBoxed")->get(); }
+        auto null_str()   -> std::string                      { return get_field("nullStr")->get(); }
+
+        // Mutable scratch slots for the object-reference SET/GET round-trip.
+        auto writable_ref() -> std::unique_ptr<ref_object> { return get_field("writableRef")->get(); }
+        auto set_target()   -> std::unique_ptr<ref_object> { return get_field("setTarget")->get(); }
+        auto writable_str() -> std::string                 { return get_field("writableStr")->get(); }
+        // Object-reference SET: rebind `writableRef` to the object the supplied
+        // wrapper points at (a null/empty unique_ptr writes a NULL reference).
+        // This is the public field_proxy::set(unique_ptr<W>) putfield path; the
+        // wrapper's referent must stay reachable (it is always another live field
+        // slot of the SAME object in this test) across the store.
+        auto set_writable_ref(const std::unique_ptr<ref_object>& target) -> void
+        {
+            get_field("writableRef")->set(target);
+        }
+        // String-field SET: rebind `writableStr` to a freshly-built String.
+        auto set_writable_str(const std::string& v) -> void { get_field("writableStr")->set(v); }
+
         // STRING-typed field read into the value_t std::string alternative.
         auto str_ref() -> std::string { return get_field("strRef")->get(); }
 
@@ -300,6 +347,8 @@ namespace
         static auto ref_array_identity()  -> std::int32_t { return static_field("refArrayIdentity")->get(); }
         static auto other_identity()      -> std::int32_t { return static_field("otherIdentity")->get(); }
         static auto self_identity()       -> std::int32_t { return static_field("selfIdentity")->get(); }
+        static auto poly_ref_identity()   -> std::int32_t { return static_field("polyRefIdentity")->get(); }
+        static auto obj_as_ref_identity() -> std::int32_t { return static_field("objAsRefIdentity")->get(); }
     };
 
     // ── hook observation ───────────────────────────────────────────────────
@@ -313,14 +362,23 @@ namespace
     constexpr std::int32_t FINAL_REF_VAL    = 0x3333;
     constexpr std::int32_t VOLATILE_REF_VAL = 0x4444;
     constexpr std::int32_t ARRAY_ELEM0_VAL  = 700;
+    constexpr std::int32_t ARRAY_ELEM1_VAL  = 800;
+    constexpr std::int32_t ARRAY_LEN        = 2;
     constexpr std::int32_t OTHER_REF_VAL    = 0x6363;
     constexpr std::int32_t PRIMITIVE_INT_VALUE = 0x04D2;   // 1234
     constexpr std::int32_t BOXED_INT_VALUE  = 0x07E5;       // 2021
     constexpr std::int32_t TAG_SLOT_VALUE   = 0x0539;       // 1337
+    constexpr std::int32_t POLY_REF_VAL     = 0x7070;
+    constexpr std::int32_t POLY_REF_EXTRA   = 0x000A;
+    constexpr std::int32_t WRITABLE_REF_VAL = 0x1357;
+    constexpr std::int32_t SET_TARGET_VAL   = 0x2468;
     const std::string      REF_LABEL        = "ref-of-field";
     const std::string      STATIC_REF_LABEL = "static-ref";
     const std::string      NESTED_REF_LABEL = "nested-ref";
     const std::string      STR_REF_VALUE    = "string-ref-field";
+    const std::string      POLY_REF_LABEL    = "poly-ref";
+    const std::string      WRITABLE_STR_SEED = "writable-seed";
+    const std::string      SET_STR_VALUE     = "set-via-native";
 
     // Internal name of a runtime klass behind an oop, or "" if unresolvable.
     // Used to prove an interface- / Object-typed field's decoded oop carries the
@@ -369,6 +427,7 @@ namespace
 
         vmhook::register_class<holder_object>(FIXTURE);
         vmhook::register_class<ref_object>("vmhook/fixtures/FieldObjectRef$Ref");
+        vmhook::register_class<sub_ref_object>("vmhook/fixtures/FieldObjectRef$SubRef");
         vmhook::register_class<tag_impl_object>("vmhook/fixtures/FieldObjectRef$TagImpl");
         vmhook::register_class<tag_iface_object>("vmhook/fixtures/FieldObjectRef$Tag");
         vmhook::register_class<decoy_object>("vmhook/fixtures/FieldObjectRef$Decoy");
@@ -770,6 +829,265 @@ namespace
                 ctx.check("primitive_field_oop_is_nullptr",
                           holder->ref_field_oop("primitiveInt") == nullptr);
             }
+
+            // ==================================================================
+            // POLYMORPHIC / INHERITED — a Ref-declared field holding a SubRef.
+            // (1) Read through the BASE ref_object wrapper: a subclass-through-
+            //     base (IS-A) read is ACCEPTED, the inherited `val` slot reads
+            //     back, and the OVERRIDDEN virtual compute() dispatches to
+            //     SubRef's body (val*3+extra), NOT Ref's (val*2+1) — the proof
+            //     that a field-decoded base wrapper does true virtual dispatch.
+            // (2) Read the SAME slot through the CONCRETE sub_ref_object wrapper:
+            //     the SubRef-only `extra` field is reachable, and the runtime
+            //     klass is SubRef.  Both decode to the SAME oop.
+            // ==================================================================
+            {
+                ctx.check("poly_field_signature_is_Ref",
+                          holder->field_signature("polyRef")
+                          == "Lvmhook/fixtures/FieldObjectRef$Ref;");
+
+                const auto pbase{ holder->poly_ref() };
+                ctx.check("poly_ref_through_base_wrapper_non_null", pbase != nullptr);
+                if (pbase)
+                {
+                    ctx.check("poly_ref_inherited_int_read", pbase->val() == POLY_REF_VAL);
+                    // The inherited String slot reads back through the base wrapper.
+                    ctx.check("poly_ref_inherited_string_read",
+                              pbase->label() == POLY_REF_LABEL);
+                    // VIRTUAL DISPATCH: compute() is overridden on SubRef, so a
+                    // call through the base wrapper must land in SubRef's body.
+                    ctx.check("poly_ref_overridden_method_dispatches_to_subclass",
+                              pbase->compute() == POLY_REF_VAL * 3 + POLY_REF_EXTRA);
+                    // ...and decidedly NOT Ref's compute() (val*2+1).
+                    ctx.check("poly_ref_dispatch_is_not_base_body",
+                              pbase->compute() != POLY_REF_VAL * 2 + 1);
+                    ctx.check("poly_ref_runtime_klass_is_SubRef",
+                              ends_with(runtime_klass_name(pbase->get_instance()), "SubRef"));
+                }
+
+                const auto psub{ holder->poly_ref_as_sub() };
+                ctx.check("poly_ref_through_concrete_wrapper_non_null", psub != nullptr);
+                if (psub)
+                {
+                    ctx.check("poly_ref_subclass_only_field_read",
+                              psub->extra() == POLY_REF_EXTRA);
+                    ctx.check("poly_ref_subclass_inherited_field_read",
+                              psub->val() == POLY_REF_VAL);
+                    ctx.check("poly_ref_subclass_method_dispatch",
+                              psub->compute() == POLY_REF_VAL * 3 + POLY_REF_EXTRA);
+                }
+
+                // Both wrappers decoded the SAME slot -> the SAME oop.
+                if (pbase && psub)
+                {
+                    ctx.check("poly_ref_base_and_concrete_same_oop",
+                              pbase->get_instance() == psub->get_instance()
+                              && pbase->get_instance() != nullptr);
+                }
+            }
+
+            // ==================================================================
+            // NULL across EVERY declared reference shape — the null-slot invariant
+            // must hold uniformly: a null Object / interface / array / boxed /
+            // String slot decodes to a null wrapper (or "" for String), a zero
+            // compressed OOP, and a null field_oop.  (The plain Ref `nullRef` and
+            // the static null are asserted elsewhere; this is the type matrix.)
+            // ==================================================================
+            {
+                struct null_case { const char* name; const char* sig; };
+                const null_case cases[]{
+                    { "nullObj",   "Ljava/lang/Object;" },
+                    { "nullTag",   "Lvmhook/fixtures/FieldObjectRef$Tag;" },
+                    { "nullArray", "[Lvmhook/fixtures/FieldObjectRef$Ref;" },
+                    { "nullBoxed", "Ljava/lang/Integer;" },
+                    { "nullStr",   "Ljava/lang/String;" },
+                };
+                for (const auto& c : cases)
+                {
+                    const std::string base{ std::string{ "null_shape_" } + c.name };
+                    ctx.check(base + "_is_reference_true",
+                              holder->field_is_reference(c.name));
+                    ctx.check(base + "_signature_exact",
+                              holder->field_signature(c.name) == c.sig);
+                    ctx.check(base + "_compressed_is_zero",
+                              holder->ref_compressed(c.name) == 0u);
+                    ctx.check(base + "_field_oop_is_nullptr",
+                              holder->ref_field_oop(c.name) == nullptr);
+                    // value_t::operator void* of a null slot also decodes to null.
+                    ctx.check(base + "_value_voidp_is_nullptr",
+                              holder->ref_value_as_voidp(c.name) == nullptr);
+                }
+                // The typed wrappers / string read of the same null slots.
+                ctx.check("null_shape_obj_wrapper_nullptr",   holder->null_obj()   == nullptr);
+                ctx.check("null_shape_tag_wrapper_nullptr",   holder->null_tag()   == nullptr);
+                ctx.check("null_shape_array_wrapper_nullptr", holder->null_array() == nullptr);
+                ctx.check("null_shape_boxed_wrapper_nullptr", holder->null_boxed() == nullptr);
+                ctx.check("null_shape_str_empty_string",      holder->null_str().empty());
+            }
+
+            // ==================================================================
+            // COMPRESSED-OOP ROUND-TRIP across a BATTERY of reference shapes (not
+            // just `ref`).  For each non-null reference field: the decoded oop is
+            // valid, re-encode(decode(x)) == x, decode(re-encode) lands on the
+            // same oop, AND value_t::operator void* agrees with field_oop().
+            // This generalises the single-field identity proof to every shape the
+            // fixture declares (instance / final / volatile / boxed / interface /
+            // string / Object / poly), so a per-shape decode regression is caught.
+            // ==================================================================
+            {
+                const char* const roundtrip_fields[]{
+                    "ref", "finalRef", "volatileRef", "boxedInt", "tag",
+                    "strRef", "objAsRef", "objAsString", "polyRef", "refArray",
+                };
+                for (const char* const name : roundtrip_fields)
+                {
+                    const std::string base{ std::string{ "roundtrip_" } + name };
+                    const std::uint32_t compressed{ holder->ref_compressed(name) };
+                    void* const decoded{ holder->ref_field_oop(name) };
+                    ctx.check(base + "_compressed_non_zero", compressed != 0u);
+                    ctx.check(base + "_decodes_valid",
+                              decoded != nullptr
+                              && vmhook::hotspot::is_valid_pointer(decoded));
+                    if (decoded && vmhook::hotspot::is_valid_pointer(decoded))
+                    {
+                        const std::uint32_t reencoded{
+                            vmhook::hotspot::encode_oop_pointer(decoded) };
+                        ctx.check(base + "_reencode_equals_compressed",
+                                  reencoded == compressed);
+                        ctx.check(base + "_decode_reencode_is_identity",
+                                  vmhook::hotspot::decode_oop_pointer(reencoded) == decoded);
+                        ctx.check(base + "_value_voidp_equals_field_oop",
+                                  holder->ref_value_as_voidp(name) == decoded);
+                    }
+                }
+            }
+
+            // ==================================================================
+            // DISTINCTNESS MATRIX — independently-allocated reference fields must
+            // decode to DISTINCT heap oops, while the two declared aliases (ref /
+            // refAlias / objAsRef) must coincide.  Proves the decode is reading
+            // each field's OWN slot, not echoing one cached oop everywhere.
+            // ==================================================================
+            {
+                void* const o_ref{ holder->ref_field_oop("ref") };
+                void* const o_final{ holder->ref_field_oop("finalRef") };
+                void* const o_vol{ holder->ref_field_oop("volatileRef") };
+                void* const o_poly{ holder->ref_field_oop("polyRef") };
+                void* const o_str{ holder->ref_field_oop("strRef") };
+                void* const o_boxed{ holder->ref_field_oop("boxedInt") };
+                ctx.check("distinct_ref_vs_final",  o_ref != nullptr && o_ref != o_final);
+                ctx.check("distinct_ref_vs_vol",    o_ref != nullptr && o_ref != o_vol);
+                ctx.check("distinct_ref_vs_poly",   o_ref != nullptr && o_ref != o_poly);
+                ctx.check("distinct_final_vs_vol",  o_final != nullptr && o_final != o_vol);
+                ctx.check("distinct_str_vs_ref",    o_str != nullptr && o_str != o_ref);
+                ctx.check("distinct_boxed_vs_ref",  o_boxed != nullptr && o_boxed != o_ref);
+                // The three declared aliases of the SAME object coincide.
+                void* const o_alias{ holder->ref_field_oop("refAlias") };
+                void* const o_obj{ holder->ref_field_oop("objAsRef") };
+                ctx.check("alias_ref_refAlias_objAsRef_all_equal",
+                          o_ref != nullptr && o_ref == o_alias && o_ref == o_obj);
+            }
+
+            // ==================================================================
+            // OBJECT-REFERENCE SET/GET ROUND-TRIP (the "set" half of get/set).
+            // writableRef is a mutable Ref slot seeded with WRITABLE_REF_VAL.
+            //   (1) GET sees the seed,
+            //   (2) SET it to the `setTarget` object (a putfield via
+            //       set(unique_ptr<W>)); GET now sees SET_TARGET_VAL and the same
+            //       oop as setTarget,
+            //   (3) SET it to a NULL reference (empty unique_ptr); GET decodes to
+            //       a null wrapper and a zero compressed OOP — proving a write can
+            //       install the null-slot state the read invariant depends on,
+            //   (4) RESTORE the original referent so later modules / re-reads see
+            //       a clean fixture.
+            // setTarget stays a live field the whole time, so its referent is a
+            // GC root across every store (GC-safe value contract).
+            // ==================================================================
+            {
+                const auto seed{ holder->writable_ref() };
+                ctx.check("set_get_seed_non_null", seed != nullptr);
+                if (seed)
+                {
+                    ctx.check("set_get_seed_value", seed->val() == WRITABLE_REF_VAL);
+                }
+                void* const original_oop{ holder->ref_field_oop("writableRef") };
+
+                // (2) SET -> setTarget.
+                {
+                    auto target{ holder->set_target() };
+                    void* const target_oop{ holder->ref_field_oop("setTarget") };
+                    ctx.check("set_get_target_seed_non_null",
+                              target != nullptr && target_oop != nullptr);
+                    holder->set_writable_ref(target);
+                    const auto after{ holder->writable_ref() };
+                    ctx.check("set_get_after_set_non_null", after != nullptr);
+                    if (after)
+                    {
+                        ctx.check("set_get_after_set_value", after->val() == SET_TARGET_VAL);
+                        ctx.check("set_get_after_set_same_oop_as_target",
+                                  after->get_instance() == target_oop);
+                    }
+                    ctx.check("set_get_after_set_compressed_matches_target",
+                              holder->ref_compressed("writableRef")
+                              == holder->ref_compressed("setTarget"));
+                }
+
+                // (3) SET -> null reference via an empty unique_ptr.
+                {
+                    const std::unique_ptr<ref_object> nothing{};
+                    holder->set_writable_ref(nothing);
+                    const auto after_null{ holder->writable_ref() };
+                    ctx.check("set_get_after_null_set_decodes_to_nullptr",
+                              after_null == nullptr);
+                    ctx.check("set_get_after_null_set_compressed_zero",
+                              holder->ref_compressed("writableRef") == 0u);
+                    ctx.check("set_get_after_null_set_field_oop_nullptr",
+                              holder->ref_field_oop("writableRef") == nullptr);
+                }
+
+                // (4) RESTORE the original referent (re-encode the original oop
+                // through the writableRef slot via the seed wrapper we still hold).
+                if (seed)
+                {
+                    holder->set_writable_ref(seed);
+                    const auto restored{ holder->writable_ref() };
+                    ctx.check("set_get_restored_non_null", restored != nullptr);
+                    if (restored)
+                    {
+                        ctx.check("set_get_restored_value",
+                                  restored->val() == WRITABLE_REF_VAL);
+                        ctx.check("set_get_restored_same_oop",
+                                  restored->get_instance() == original_oop);
+                    }
+                }
+            }
+
+            // ==================================================================
+            // STRING-FIELD SET/GET ROUND-TRIP — rebinding a String field via
+            // set(std::string) is an object-reference store of a freshly-built
+            // String (library bug #30).  Write a new value, read it back, then
+            // RESTORE the seed so the fixture is left clean.
+            // ==================================================================
+            {
+                ctx.check("str_set_seed_value", holder->writable_str() == WRITABLE_STR_SEED);
+                holder->set_writable_str(SET_STR_VALUE);
+                ctx.check("str_set_after_write_value",
+                          holder->writable_str() == SET_STR_VALUE);
+                // The rebound slot still decodes to a valid String oop.
+                void* const new_str_oop{ holder->ref_field_oop("writableStr") };
+                ctx.check("str_set_rebound_oop_valid",
+                          new_str_oop != nullptr
+                          && vmhook::hotspot::is_valid_pointer(new_str_oop));
+                if (new_str_oop && vmhook::hotspot::is_valid_pointer(new_str_oop))
+                {
+                    ctx.check("str_set_rebound_runtime_klass_is_String",
+                              ends_with(runtime_klass_name(new_str_oop), "String"));
+                }
+                // RESTORE.
+                holder->set_writable_str(WRITABLE_STR_SEED);
+                ctx.check("str_set_restored_value",
+                          holder->writable_str() == WRITABLE_STR_SEED);
+            }
         }
 
         // ── static object-reference field reads (pre-probe, side-effect free) ─
@@ -881,9 +1199,34 @@ namespace
             // ref and refAlias published identities are equal (same object).
             ctx.check("java_ref_and_alias_identity_equal",
                       holder_object::ref_identity() == holder_object::ref_alias_identity());
+            // objAsRef (Object-declared) and ref (Ref-declared) hold the SAME
+            // object, so their PUBLISHED identities (computed Java-side) match —
+            // the Java-truth twin of the native "same oop" alias check.
+            ctx.check("java_objAsRef_and_ref_identity_equal",
+                      holder_object::obj_as_ref_identity() == holder_object::ref_identity());
             // other's published identity differs from the singleton's ref identity.
             ctx.check("java_other_identity_differs_from_ref",
                       holder_object::other_identity() != holder_object::ref_identity());
+            // poly identity published, distinct from ref (a different object).
+            ctx.check("java_poly_identity_published",
+                      holder_object::poly_ref_identity() != 0);
+            ctx.check("java_poly_identity_differs_from_ref",
+                      holder_object::poly_ref_identity() != holder_object::ref_identity());
+
+            // ── SELF ref is a SHARED ref to the receiver: self.ref oop == the
+            //    receiver's own ref oop (a self-loop walked one level deep).  `s`
+            //    is a holder_object (self holds `this`), so it carries the SAME
+            //    guarded ref_field_oop helper. ──────────────────────────────────
+            {
+                const auto s{ holder2->self_ref() };
+                if (s)
+                {
+                    void* const self_ref_oop{ s->ref_field_oop("ref") };
+                    void* const recv_ref_oop{ holder2->ref_field_oop("ref") };
+                    ctx.check("self_ref_nested_ref_equals_receiver_ref",
+                              self_ref_oop != nullptr && self_ref_oop == recv_ref_oop);
+                }
+            }
 
             // ── nested ref reachable post-probe and carries the wired value ─
             {
@@ -912,6 +1255,15 @@ namespace
                           arr_oop != nullptr && vmhook::hotspot::is_valid_pointer(arr_oop));
                 if (arr_oop && vmhook::hotspot::is_valid_pointer(arr_oop))
                 {
+                    // The Ref[] header reports the declared element count.
+                    ctx.check("array_length_matches_fixture",
+                              vmhook::array_length(arr_oop) == ARRAY_LEN);
+                    // The array's runtime klass is a Ref[] (its name ends with the
+                    // element descriptor, "[Lvmhook/fixtures/FieldObjectRef$Ref;").
+                    ctx.check("array_runtime_klass_is_ref_array",
+                              ends_with(runtime_klass_name(arr_oop),
+                                        "FieldObjectRef$Ref;"));
+
                     // Element 0 compressed OOP lives at array data start (offset 16).
                     const std::uint32_t elem0_compressed{
                         vmhook::get_array_element<std::uint32_t>(arr_oop, 0) };
@@ -926,6 +1278,58 @@ namespace
                         ref_object elem0{ elem0_oop };
                         ctx.check("array_elem0_is_usable_ref",
                                   elem0.val() == ARRAY_ELEM0_VAL);
+                        ctx.check("array_elem0_method_dispatch",
+                                  elem0.compute() == ARRAY_ELEM0_VAL * 2 + 1);
+                    }
+
+                    // Element 1 (the SECOND element) decodes to the OTHER Ref and
+                    // is distinct from element 0 — proves the per-index stride is
+                    // honest, not echoing element 0.
+                    const std::uint32_t elem1_compressed{
+                        vmhook::get_array_element<std::uint32_t>(arr_oop, 1) };
+                    ctx.check("array_elem1_compressed_non_zero", elem1_compressed != 0u);
+                    ctx.check("array_elem0_and_elem1_distinct",
+                              elem0_compressed != elem1_compressed);
+                    void* const elem1_oop{
+                        vmhook::hotspot::decode_oop_pointer(elem1_compressed) };
+                    if (elem1_oop && vmhook::hotspot::is_valid_pointer(elem1_oop))
+                    {
+                        ref_object elem1{ elem1_oop };
+                        ctx.check("array_elem1_is_usable_ref",
+                                  elem1.val() == ARRAY_ELEM1_VAL);
+                    }
+
+                    // OUT-OF-BOUNDS read is bounds-checked and yields the zero
+                    // default (no fault, no garbage) — the array helper's safety.
+                    ctx.check("array_oob_index_returns_zero",
+                              vmhook::get_array_element<std::uint32_t>(arr_oop, ARRAY_LEN) == 0u);
+                    ctx.check("array_negative_index_returns_zero",
+                              vmhook::get_array_element<std::uint32_t>(arr_oop, -1) == 0u);
+                }
+
+                // ── '[L' field walked DIRECTLY as a vector of usable wrappers ──
+                // value_t::to_vector<ref_object>() is the LIBRARY-blessed way to
+                // read a Ref[] field (contrast flaw B's single-wrapper reject): it
+                // decodes the array oop and builds one wrapper per element.
+                const auto proxy{ holder2->get_field("refArray") };
+                if (proxy.has_value())
+                {
+                    const auto vec{ proxy->get().to_vector<ref_object>() };
+                    ctx.check("array_to_vector_length",
+                              static_cast<std::int32_t>(vec.size()) == ARRAY_LEN);
+                    if (vec.size() == static_cast<std::size_t>(ARRAY_LEN)
+                        && vec[0] && vec[1])
+                    {
+                        ctx.check("array_to_vector_elem0_usable",
+                                  vec[0]->val() == ARRAY_ELEM0_VAL);
+                        ctx.check("array_to_vector_elem1_usable",
+                                  vec[1]->val() == ARRAY_ELEM1_VAL);
+                        ctx.check("array_to_vector_elements_distinct",
+                                  vec[0]->get_instance() != vec[1]->get_instance()
+                                  && vec[0]->get_instance() != nullptr);
+                        // method dispatch through a vector-decoded wrapper.
+                        ctx.check("array_to_vector_elem0_method",
+                                  vec[0]->compute() == ARRAY_ELEM0_VAL * 2 + 1);
                     }
                 }
             }

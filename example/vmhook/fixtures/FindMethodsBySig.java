@@ -301,6 +301,81 @@ public final class FindMethodsBySig
     }
 
     // =======================================================================
+    //  Array element-type and dimension coverage.  A descriptor's array part is
+    //  just a run of '[' followed by the element descriptor, so element TYPE and
+    //  dimension COUNT both discriminate.  These give find a wide spread of
+    //  array shapes that the (int[])-only fixture above did not exercise.
+    // =======================================================================
+
+    /** ([J)[J -- a WIDE (long) element array in and out. */
+    public long[] arrJ(final long[] a)
+    {
+        return (a == null) ? new long[0] : a;
+    }
+
+    /** ([D)[D -- a WIDE (double) element array in and out. */
+    public double[] arrD(final double[] a)
+    {
+        return (a == null) ? new double[0] : a;
+    }
+
+    /** ([Z)[Z -- a boolean element array (single-slot, distinct tag Z). */
+    public boolean[] arrZ(final boolean[] a)
+    {
+        return (a == null) ? new boolean[0] : a;
+    }
+
+    /** ([B)[B -- a byte element array. */
+    public byte[] arrB(final byte[] a)
+    {
+        return (a == null) ? new byte[0] : a;
+    }
+
+    /** ([[[I)[[[I -- a THREE-dimensional int array (dimension-count discriminator). */
+    public int[][][] arr3(final int[][][] a)
+    {
+        return (a == null) ? new int[0][][] : a;
+    }
+
+    /**
+     * ([I)I -- a primitive-array ARG with a SCALAR return.  This is also the
+     * descriptor a {@code varargs} int... parameter compiles to: varargs is pure
+     * syntactic sugar over an array, so the descriptor carries NO vararg marker.
+     * Distinct from ([I)[I {arr} (array return) and from (I)I {f, sf} (scalar arg).
+     */
+    public int sumArr(final int... xs)
+    {
+        int s = 0;
+        if (xs != null)
+        {
+            for (int i = 0; i < xs.length; i++)
+            {
+                s += xs[i];
+            }
+        }
+        return s;
+    }
+
+    // =======================================================================
+    //  Reference-type coverage beyond String: an Object<->Object identity and a
+    //  TWO-reference-arg method.  Proves the reference tag L...; discriminates by
+    //  the exact internal class name, and that consecutive reference args are
+    //  parsed as separate slots.
+    // =======================================================================
+
+    /** (Ljava/lang/Object;)Ljava/lang/Object; -- Object in, Object out (NOT String). */
+    public Object idObj(final Object o)
+    {
+        return o;
+    }
+
+    /** (Ljava/lang/String;Ljava/lang/Object;)V -- TWO reference args, VOID return. */
+    public void twoRef(final String s, final Object o)
+    {
+        // no-op
+    }
+
+    // =======================================================================
     //  Static methods.  The descriptor walk ignores JVM_ACC_STATIC, so these
     //  appear in the SAME result set as the instance methods of equal descriptor.
     // =======================================================================
@@ -321,6 +396,35 @@ public final class FindMethodsBySig
     public static long sUnique(final long a, final long b)
     {
         return a + b;
+    }
+
+    /**
+     * ([J)[J -- a STATIC long-array method that SHARES its descriptor with the
+     * instance arrJ(long[]).  Proves a SHARED ARRAY descriptor returns the full
+     * set { arrJ, sArrJ } (static + instance) exactly like the scalar (I)I case.
+     */
+    public static long[] sArrJ(final long[] a)
+    {
+        return (a == null) ? new long[0] : a;
+    }
+
+    /**
+     * ([I)I -- a STATIC varargs partner sharing the descriptor of the instance
+     * sumArr(int...).  ([I)I therefore returns the full set { sumArr, sVararg }:
+     * a second proof that varargs compiles to a plain array descriptor AND that a
+     * static varargs co-enumerates with an instance one.
+     */
+    public static int sVararg(final int... xs)
+    {
+        int s = 0;
+        if (xs != null)
+        {
+            for (int i = 0; i < xs.length; i++)
+            {
+                s += xs[i];
+            }
+        }
+        return s;
     }
 
     /**

@@ -140,6 +140,38 @@ public final class MethodCallJni
     // single observable effect is the increment.
     public static volatile int     ctorCalls;
 
+    // ── recorded narrow / wide primitive ARG shapes (marshaller arm proof) ───
+    //
+    // The jvalue marshaller (convert_jni_arg) has DISTINCT arms for bool(Z),
+    // narrow integrals via out.i (byte/char/short/int), 64-bit via out.j (long),
+    // float(F), double(D).  The existing module only echoes int + long; these
+    // recorders publish pure-int / raw-bit measurements of every other arm so the
+    // native side proves each marshalled arg arrived in the JVM verbatim.
+    public static volatile boolean argBoolCalled;
+    public static volatile boolean argBoolValue;        // echoBool(true)
+    public static volatile boolean argByteCalled;
+    public static volatile int     argByteValue;        // (int) byte arg, sign-extended
+    public static volatile boolean argCharCalled;
+    public static volatile int     argCharValue;        // (int) char arg, zero-extended
+    public static volatile boolean argShortCalled;
+    public static volatile int     argShortValue;       // (int) short arg, sign-extended
+    public static volatile boolean argFloatCalled;
+    public static volatile int     argFloatBits;        // Float.floatToRawIntBits(arg)
+    public static volatile boolean argDoubleCalled;
+    public static volatile long    argDoubleBits;       // Double.doubleToRawLongBits(arg)
+
+    // ── recorded many-arg / all-two-slot shapes (slot-array layout proof) ────
+    public static volatile boolean sixArgCalled;
+    public static volatile long    sixArgPacked;        // a derived sum proving all six landed
+    public static volatile boolean fourWideCalled;
+    public static volatile long    fourWideResult;      // (J,D,J,D) interleave proof
+
+    // ── recorded null-reference arg contract ────────────────────────────────
+    public static volatile boolean nullStrArgCalled;
+    public static volatile boolean nullStrArgWasNull;   // const char* nullptr -> Java null
+    public static volatile boolean nullObjArgCalled;
+    public static volatile boolean nullObjArgWasNull;   // unique_ptr null -> Java null
+
     /** No-arg constructor: side-effect is ONLY the static counter bump, so the
      *  nonvirtual re-invocation test can re-run it on a live object harmlessly. */
     public MethodCallJni()
@@ -178,6 +210,105 @@ public final class MethodCallJni
     // Single-primitive ARG echoes (prove a primitive arg is marshalled).
     public int  echoInt(final int v)   { lastEchoArg = v; return v; }
     public long echoLong(final long v) { return v; }
+
+    // ── float / double SPECIAL-VALUE returners (IEEE-754 fidelity decode) ────
+    // The existing module only checks 3.5f / e; these pin the special-value
+    // decode of the 'F' and 'D' return arms (NaN canonical bits, +/-inf, -0.0,
+    // a denormal) so the raw-bit transfer through Call(Static)?<F|D>MethodA is
+    // proven for the full IEEE-754 range, not just two ordinary finite values.
+    public float  retFloatNaN()      { return Float.NaN; }
+    public float  retFloatPosInf()   { return Float.POSITIVE_INFINITY; }
+    public float  retFloatNegInf()   { return Float.NEGATIVE_INFINITY; }
+    public float  retFloatNegZero()  { return -0.0f; }
+    public float  retFloatDenormal() { return Float.MIN_VALUE; }            // smallest subnormal
+    public double retDoubleNaN()     { return Double.NaN; }
+    public double retDoublePosInf()  { return Double.POSITIVE_INFINITY; }
+    public double retDoubleNegZero() { return -0.0d; }
+    public double retDoubleDenormal(){ return Double.MIN_VALUE; }           // smallest subnormal
+
+    // ── primitive-ARG echoes at boundary values (round-trip into the JVM) ────
+    // Return the arg derived so the native side can pin the exact marshalled
+    // value.  echoIntId does NOT touch lastEchoArg (so it never clobbers the
+    // sibling mcj_echo_int_side_effect breadcrumb) — it just returns its arg.
+    public int    echoIntId(final int v)        { return v; }
+    public long   echoLongId(final long v)      { return v; }
+
+    // ── narrow / wide primitive ARG recorders (one per marshaller arm) ───────
+    // Each records a pure-int / raw-bit measurement of the JVM-side value so the
+    // native side proves the specific convert_jni_arg arm marshalled correctly.
+    public void recordBool(final boolean b)
+    {
+        argBoolValue  = b;
+        argBoolCalled = true;
+    }
+    public void recordByte(final byte b)
+    {
+        argByteValue  = b;            // widens with sign extension in Java
+        argByteCalled = true;
+    }
+    public void recordChar(final char c)
+    {
+        argCharValue  = c;            // widens with ZERO extension in Java
+        argCharCalled = true;
+    }
+    public void recordShort(final short s)
+    {
+        argShortValue  = s;           // widens with sign extension
+        argShortCalled = true;
+    }
+    public void recordFloat(final float f)
+    {
+        argFloatBits   = Float.floatToRawIntBits(f);
+        argFloatCalled = true;
+    }
+    public void recordDouble(final double d)
+    {
+        argDoubleBits   = Double.doubleToRawLongBits(d);
+        argDoubleCalled = true;
+    }
+
+    // float ARG -> float return and double ARG -> double return (round-trip the
+    // F and D marshaller arms AND the F/D return decode in one call each).
+    public float  echoFloat(final float f)   { return f; }
+    public double echoDouble(final double d) { return d; }
+
+    // ── many-arg / all-two-slot shapes (slot-array layout beyond I,J,D) ──────
+    // Six args mixing single- and two-slot kinds: int, long, int, double, long,
+    // int.  Returns a value derived from ALL SIX so a misplaced slot is caught.
+    //   result = a + c + f + b + e + (long) d
+    public long sixArg(final int a, final long b, final int c,
+                       final double d, final long e, final int f)
+    {
+        sixArgPacked = ((long) a) + b + ((long) c) + (long) d + e + ((long) f);
+        sixArgCalled = true;
+        return sixArgPacked;
+    }
+
+    // Four consecutive TWO-SLOT args (long, double, long, double): the hardest
+    // case for the jvalue slot array — every cell is 8 bytes.  Returns a derived
+    // long so one value pins the order.
+    //   result = a + c + (long) b - (long) d
+    public long fourWide(final long a, final double b, final long c, final double d)
+    {
+        fourWideResult = a + c + (long) b - (long) d;
+        fourWideCalled = true;
+        return fourWideResult;
+    }
+
+    // ── null-reference ARG consumers (null-pointer convention proof) ─────────
+    // The library maps a null const char* / null unique_ptr to Java null; these
+    // bodies publish whether the received reference was null so the native side
+    // proves the null-arg path reaches the JVM as a genuine null.
+    public void consumeNullableString(final String s)
+    {
+        nullStrArgWasNull = (s == null);
+        nullStrArgCalled  = true;
+    }
+    public void consumeNullableObject(final Object o)
+    {
+        nullObjArgWasNull = (o == null);
+        nullObjArgCalled  = true;
+    }
 
     // Multi-arg primitive with a long (2 slots) and a double (2 slots) between
     // single-slot ints.  Returns a derived long so the native side can verify
@@ -264,6 +395,40 @@ public final class MethodCallJni
         return new String[] { "alpha", "bravo", "charlie" };
     }
 
+    // Additional primitive-array returns covering EVERY element stride the
+    // crash-safe get_array_element reader must handle on the '[' arm:
+    //   byte[]   -> 1-byte stride (sign-extending read)
+    //   boolean[]-> 1-byte stride (0/1)
+    //   short[]  -> 2-byte stride (sign)
+    //   char[]   -> 2-byte stride (zero-extend)
+    //   double[] -> 8-byte stride (IEEE bits)
+    //   float[]  -> 4-byte stride (IEEE bits)
+    // Small (<=4 elements) to keep the heap budget modest.
+    public byte[] retByteArray()
+    {
+        return new byte[] { (byte) -1, (byte) 0, (byte) 127, (byte) -128 };
+    }
+    public boolean[] retBoolArray()
+    {
+        return new boolean[] { true, false, true };
+    }
+    public short[] retShortArray()
+    {
+        return new short[] { (short) -32768, (short) 0, (short) 32767 };
+    }
+    public char[] retCharArray()
+    {
+        return new char[] { 'A', (char) 0xFFFF, '0' };          // 65, 65535, 48
+    }
+    public double[] retDoubleArray()
+    {
+        return new double[] { 1.5d, -2.5d, 1024.0d };
+    }
+    public float[] retFloatArray()
+    {
+        return new float[] { 0.5f, -0.5f, 3.5f, -3.5f };
+    }
+
     // String return used by the tight leak loop: a fresh constant each call.
     public String loopString()
     {
@@ -348,6 +513,24 @@ public final class MethodCallJni
     {
         return ((long) i) + j + (long) d;
     }
+
+    // Static float / double special-value returns (CallStatic<F|D>MethodA arm).
+    public static float  sRetFloatNaN()     { return Float.NaN; }
+    public static double sRetDoublePosInf() { return Double.POSITIVE_INFINITY; }
+    public static double sRetDoubleNegZero(){ return -0.0d; }
+
+    // Static six-arg (mirrors the instance sixArg slot-array layout, but on the
+    // CallStatic*MethodA path where there is NO receiver slot).
+    //   result = a + c + f + b + e + (long) d
+    public static long sSixArg(final int a, final long b, final int c,
+                               final double d, final long e, final int f)
+    {
+        return ((long) a) + b + ((long) c) + (long) d + e + ((long) f);
+    }
+
+    // Static float/double ARG echoes (the F/D arg arm on the static path).
+    public static float  sEchoFloat(final float f)   { return f; }
+    public static double sEchoDouble(final double d) { return d; }
 
     // Static Object return (non-String reference): the published SINGLETON.
     public static MethodCallJni sRetSingleton()

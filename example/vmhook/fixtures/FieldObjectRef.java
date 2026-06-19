@@ -106,6 +106,33 @@ public final class FieldObjectRef
         }
     }
 
+    /**
+     * A SUBCLASS of Ref used for the polymorphic / inherited angle.  A field
+     * declared Ref but holding a SubRef proves the base-typed wrapper reads the
+     * inherited int slot AND that the OVERRIDDEN virtual compute() dispatches to
+     * SubRef's body through a base-typed (Ref) wrapper.  Its runtime klass is
+     * SubRef even when read through a Ref wrapper (IS-A: SubRef's super chain
+     * contains Ref, so the klass-match guard accepts the read).
+     */
+    public static final class SubRef extends Ref
+    {
+        public int extra;
+
+        public SubRef(final int val, final String label, final int extra)
+        {
+            super(val, label);
+            this.extra = extra;
+        }
+
+        /** Overrides Ref.compute() so virtual dispatch through a Ref wrapper
+         *  lands HERE, not in Ref. */
+        @Override
+        public int compute()
+        {
+            return this.val * 3 + this.extra;
+        }
+    }
+
     // ── The reference type the wrappers walk ───────────────────────────────
     /**
      * The object a Holder field points at.  Has a primitive int (val), a String
@@ -113,7 +140,7 @@ public final class FieldObjectRef
      * native side can prove a field-decoded wrapper is fully usable: read a
      * primitive, read a String, AND dispatch a real virtual call through it.
      */
-    public static final class Ref
+    public static class Ref
     {
         public int val;
         public String label;
@@ -174,6 +201,13 @@ public final class FieldObjectRef
     public static final String STR_REF_VALUE    = "string-ref-field";
     public static final int    BOXED_INT_VALUE  = 0x07E5;   // 2021
     public static final int    TAG_SLOT_VALUE   = 0x0539;   // 1337
+    public static final int    POLY_REF_VAL     = 0x7070;   // SubRef.val
+    public static final int    POLY_REF_EXTRA   = 0x000A;   // SubRef.extra
+    public static final String POLY_REF_LABEL   = "poly-ref";
+    public static final int    WRITABLE_REF_VAL = 0x1357;   // writableRef seed value
+    public static final int    SET_TARGET_VAL   = 0x2468;   // the ref the SET test writes
+    public static final String WRITABLE_STR_SEED = "writable-seed";
+    public static final String SET_STR_VALUE     = "set-via-native";
 
     // ── Instance reference fields (read through an INSTANCE field_proxy) ────
 
@@ -219,6 +253,59 @@ public final class FieldObjectRef
     /** A field declared java.lang.Object holding a String at runtime. */
     public Object objAsString = STR_REF_VALUE;
 
+    /**
+     * POLYMORPHIC / inherited angle: declared Ref, holds a SubRef.  Read through
+     * a Ref wrapper, the inherited int slot reads back POLY_REF_VAL and the
+     * OVERRIDDEN compute() dispatches to SubRef's body (val*3+extra), proving
+     * virtual dispatch through a base-typed wrapper and that the klass-match
+     * guard accepts a subclass-through-base read (SubRef IS-A Ref).
+     */
+    public Ref polyRef = new SubRef(POLY_REF_VAL, POLY_REF_LABEL, POLY_REF_EXTRA);
+
+    // ── NULL reference shapes across every declared type (null-slot invariant) ─
+    /** Null java.lang.Object reference. */
+    public Object nullObj = null;
+    /** Null INTERFACE-typed reference. */
+    public Tag nullTag = null;
+    /** Null object-ARRAY reference. */
+    public Ref[] nullArray = null;
+    /** Null boxed java.lang.Integer reference. */
+    public Integer nullBoxed = null;
+    /** Null java.lang.String reference. */
+    public String nullStr = null;
+
+    // ── Mutable scratch slots for the object-reference SET/GET round-trip ──────
+    /**
+     * A mutable Ref slot the native side writes (object-reference store) and
+     * reads back, then RESTORES.  Seeded non-null so the set test can prove a
+     * non-null -&gt; null -&gt; non-null round-trip.  Distinct from every other
+     * field so a stray write never corrupts another scenario.
+     */
+    public Ref writableRef = makeRef(WRITABLE_REF_VAL, "writable-ref");
+
+    /**
+     * A SECOND strong reference to writableRef's original seed object.  The
+     * native SET test overwrites the writableRef slot (to setTarget, then null)
+     * before restoring it; this field keeps the original seed object permanently
+     * GC-reachable so the native restore (re-storing the seed's decoded oop) can
+     * never reference a collected object.  Initialised right after writableRef.
+     */
+    public Ref writableRefKeepAlive = this.writableRef;
+
+    /**
+     * A pre-built Ref the native SET test rebinds writableRef to; reading
+     * writableRef back must then see SET_TARGET_VAL.  Kept reachable as its own
+     * field so it is a live GC root across the native store.
+     */
+    public Ref setTarget = makeRef(SET_TARGET_VAL, "set-target");
+
+    /**
+     * A mutable String slot the native side rebinds via set(std::string) and
+     * reads back, then RESTORES — the String-field write (object-reference
+     * rebind) round-trip.
+     */
+    public String writableStr = WRITABLE_STR_SEED;
+
     /** An object-ARRAY field ('[' descriptor) — the signature-shape angle. */
     public Ref[] refArray =
     {
@@ -261,6 +348,7 @@ public final class FieldObjectRef
     public static volatile int tagIdentity;
     public static volatile int objAsRefIdentity;
     public static volatile int objAsStringIdentity;
+    public static volatile int polyRefIdentity;
 
     /** Helper so the field initialisers and run() build Refs identically. */
     private static Ref makeRef(final int val, final String label)
@@ -336,6 +424,7 @@ public final class FieldObjectRef
                 FieldObjectRef.tagIdentity            = System.identityHashCode(s.tag);
                 FieldObjectRef.objAsRefIdentity       = System.identityHashCode(s.objAsRef);
                 FieldObjectRef.objAsStringIdentity    = System.identityHashCode(s.objAsString);
+                FieldObjectRef.polyRefIdentity        = System.identityHashCode(s.polyRef);
 
                 // Real bytecode dispatch -> native interpreter hook fires.
                 s.tick(7);

@@ -19,6 +19,10 @@
 //   REFERENCE vs PRIM    : (..String;)..String; {f,sf} ; ()Ljava/lang/Object; {makeObj}
 //                          (..String;)..Object; {boxStr} ; ()..String; {name}
 //   ARRAYS               : ([I)[I {arr} ; ([[I)[[I {arr2} ; ([L..String;)[L..String; {arrStr}
+//   ARRAY ELEM-TYPE      : ([J)[J {arrJ,sArrJ} ; ([D)[D {arrD} ; ([Z)[Z {arrZ} ; ([B)[B {arrB}
+//   ARRAY DIM=3          : ([[[I)[[[I {arr3}  (dimension-count discriminator)
+//   VARARGS              : ([I)I {sumArr,sVararg}  (T... compiles to [T, no vararg marker)
+//   REF (non-String)     : (Lj.l.Object;)Lj.l.Object; {idObj} ; (Lj.l.String;Lj.l.Object;)V {twoRef}
 //   MULTI-SLOT / WIDE    : (IJD)D {mix} ; (JJ)J {sUnique} ; (JD)V {wideVoid}
 //   MANY-ARG             : (IJDLjava/lang/String;[IZ)V {many} ; (IIIIII)I {manyR}
 //   STATIC == INSTANCE   : (I)I returns BOTH instance f AND static sf
@@ -186,6 +190,20 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
     ctx.check("substrate_has_tri1_DI", has_pair(all_methods, "tri1", "(D)I"));
     ctx.check("substrate_has_tri2_DI", has_pair(all_methods, "tri2", "(D)I"));
     ctx.check("substrate_has_tri3_DI", has_pair(all_methods, "tri3", "(D)I"));
+    // ...and the array element-type / dimension / varargs / reference shapes added
+    // for this deepening pass (all verified with `javap -s` on JDK 8/11/17/21).
+    ctx.check("substrate_has_arrJ_aJ",  has_pair(all_methods, "arrJ", "([J)[J"));
+    ctx.check("substrate_has_sArrJ_aJ", has_pair(all_methods, "sArrJ", "([J)[J"));
+    ctx.check("substrate_has_arrD_aD",  has_pair(all_methods, "arrD", "([D)[D"));
+    ctx.check("substrate_has_arrZ_aZ",  has_pair(all_methods, "arrZ", "([Z)[Z"));
+    ctx.check("substrate_has_arrB_aB",  has_pair(all_methods, "arrB", "([B)[B"));
+    ctx.check("substrate_has_arr3_a3I", has_pair(all_methods, "arr3", "([[[I)[[[I"));
+    ctx.check("substrate_has_sumArr_aII",  has_pair(all_methods, "sumArr", "([I)I"));
+    ctx.check("substrate_has_sVararg_aII", has_pair(all_methods, "sVararg", "([I)I"));
+    ctx.check("substrate_has_idObj_OO",
+              has_pair(all_methods, "idObj", "(Ljava/lang/Object;)Ljava/lang/Object;"));
+    ctx.check("substrate_has_twoRef_SOV",
+              has_pair(all_methods, "twoRef", "(Ljava/lang/String;Ljava/lang/Object;)V"));
 
     // =====================================================================
     //  1. SHARED descriptor (I)I -> the FULL set { f, sf }.  This is the
@@ -421,6 +439,133 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
     }
 
     // =====================================================================
+    //  5d. ARRAY ELEMENT-TYPE discrimination.  An array descriptor is a run of
+    //      '[' followed by the element descriptor, so the ELEMENT TYPE is a
+    //      discriminator: ([J)[J, ([D)[D, ([Z)[Z, ([B)[B are four distinct
+    //      arrays even though they share the 1-D, in==out shape.  ([J)[J also
+    //      SHARES across a static (sArrJ) and an instance (arrJ) method -- the
+    //      headline full-set guarantee, on a WIDE-element array this time.
+    // =====================================================================
+    {
+        // ([J)[J -- the SHARED wide-element-array set { arrJ, sArrJ }.
+        const name_list aj{ find_sig("([J)[J") };
+        ctx.check("arrJ_size_2", aj.size() == 2);
+        ctx.check("arrJ_has_arrJ", contains(aj, "arrJ"));
+        ctx.check("arrJ_has_sArrJ", contains(aj, "sArrJ"));
+        ctx.check("arrJ_is_exactly_arrJ_sArrJ",
+                  same_multiset(aj, name_list{ "arrJ", "sArrJ" }));
+        ctx.check("arrJ_arrJ_once", count_name(aj, "arrJ") == 1);
+        ctx.check("arrJ_sArrJ_once", count_name(aj, "sArrJ") == 1);
+
+        // ([D)[D / ([Z)[Z / ([B)[B -- each a distinct SINGLETON by element type.
+        const name_list ad{ find_sig("([D)[D") };
+        ctx.check("arrD_size_1", ad.size() == 1);
+        ctx.check("arrD_is_arrD", ad.size() == 1 && ad.front() == "arrD");
+
+        const name_list az{ find_sig("([Z)[Z") };
+        ctx.check("arrZ_size_1", az.size() == 1);
+        ctx.check("arrZ_is_arrZ", az.size() == 1 && az.front() == "arrZ");
+
+        const name_list ab{ find_sig("([B)[B") };
+        ctx.check("arrB_size_1", ab.size() == 1);
+        ctx.check("arrB_is_arrB", ab.size() == 1 && ab.front() == "arrB");
+
+        // Element-type CROSS-matches must NOT happen: the long-array set must not
+        // contain the double-array method, and vice-versa.
+        ctx.check("arrJ_excludes_arrD", !contains(aj, "arrD"));
+        ctx.check("arrD_excludes_arrJ", !contains(ad, "arrJ"));
+        ctx.check("arrZ_excludes_arrB", !contains(az, "arrB"));
+        // The original int-array ([I)[I {arr} must NOT bleed into any of these.
+        ctx.check("arrJ_excludes_arr", !contains(aj, "arr"));
+        ctx.check("arrD_excludes_arr", !contains(ad, "arr"));
+    }
+
+    // =====================================================================
+    //  5e. ARRAY DIMENSION-COUNT discrimination at depth 3.  ([[[I)[[[I {arr3}
+    //      must be exactly { arr3 } and must NOT be reachable by the 1-D ([I)[I
+    //      {arr} or the 2-D ([[I)[[I {arr2} descriptors (and vice-versa).  This
+    //      extends the 1-D-vs-2-D cross-match negative already present to a 3-D
+    //      apex, pinning that EACH extra '[' is a distinct descriptor.
+    // =====================================================================
+    {
+        const name_list a3{ find_sig("([[[I)[[[I") };
+        ctx.check("arr3_size_1", a3.size() == 1);
+        ctx.check("arr3_is_arr3", a3.size() == 1 && a3.front() == "arr3");
+
+        const name_list a1{ find_sig("([I)[I") };
+        const name_list a2{ find_sig("([[I)[[I") };
+        // Cross-dimension matrix: no descriptor of one depth matches another depth.
+        ctx.check("arr1_excludes_arr3", !contains(a1, "arr3"));
+        ctx.check("arr2_excludes_arr3", !contains(a2, "arr3"));
+        ctx.check("arr3_excludes_arr", !contains(a3, "arr"));
+        ctx.check("arr3_excludes_arr2", !contains(a3, "arr2"));
+        // A mismatched in/out dimension (2-D in, 1-D out) is declared by NOTHING.
+        ctx.check("arr_2in_1out_empty", find_sig("([[I)[I").empty());
+        ctx.check("arr_1in_2out_empty", find_sig("([I)[[I").empty());
+        ctx.check("arr_3in_2out_empty", find_sig("([[[I)[[I").empty());
+    }
+
+    // =====================================================================
+    //  5f. VARARGS is a plain ARRAY descriptor.  A `T... xs` parameter compiles
+    //      to a `[T` descriptor with NO vararg marker, so ([I)I -- the descriptor
+    //      of both sumArr(int...) and the static sVararg(int...) -- returns the
+    //      full set { sumArr, sVararg }.  This proves (a) varargs carries no
+    //      special descriptor bit, (b) a primitive-array ARG with a SCALAR return
+    //      is distinct from ([I)[I {arr} (array return) and from (I)I {f, sf}
+    //      (scalar arg), and (c) a static varargs co-enumerates with an instance.
+    // =====================================================================
+    {
+        const name_list aii{ find_sig("([I)I") };
+        ctx.check("varargAII_size_2", aii.size() == 2);
+        ctx.check("varargAII_has_sumArr", contains(aii, "sumArr"));
+        ctx.check("varargAII_has_sVararg", contains(aii, "sVararg"));
+        ctx.check("varargAII_is_exactly_sumArr_sVararg",
+                  same_multiset(aii, name_list{ "sumArr", "sVararg" }));
+        // The array-arg/scalar-return shape must NOT collide with the
+        // array-arg/array-return {arr} or the scalar-arg/scalar-return {f, sf}.
+        ctx.check("varargAII_excludes_arr", !contains(aii, "arr"));   // arr is ([I)[I
+        ctx.check("varargAII_excludes_f", !contains(aii, "f"));       // f is (I)I
+        ctx.check("varargAII_excludes_sf", !contains(aii, "sf"));     // sf is (I)I
+        // Reverse: the (I)I scalar-arg set must NOT contain the varargs methods.
+        const name_list ii{ find_sig("(I)I") };
+        ctx.check("II_excludes_sumArr", !contains(ii, "sumArr"));
+        // ...and ([I)[I {arr} must NOT contain the varargs methods either.
+        const name_list arr{ find_sig("([I)[I") };
+        ctx.check("arrII_excludes_sumArr", !contains(arr, "sumArr"));
+    }
+
+    // =====================================================================
+    //  5g. REFERENCE-TYPE discrimination beyond String.  The L...; tag matches
+    //      the EXACT internal class name, so (Ljava/lang/Object;)Ljava/lang/Object;
+    //      {idObj} is a distinct match from the String->String set {f, sf} and the
+    //      String->Object {boxStr}.  A two-reference-arg method
+    //      (Ljava/lang/String;Ljava/lang/Object;)V {twoRef} proves consecutive
+    //      reference args parse as separate slots and is a unique singleton.
+    // =====================================================================
+    {
+        const name_list oo{ find_sig("(Ljava/lang/Object;)Ljava/lang/Object;") };
+        ctx.check("objObj_size_1", oo.size() == 1);
+        ctx.check("objObj_is_idObj", oo.size() == 1 && oo.front() == "idObj");
+        // Object->Object must NOT contain the String->String or String->Object set.
+        ctx.check("objObj_excludes_f", !contains(oo, "f"));
+        ctx.check("objObj_excludes_sf", !contains(oo, "sf"));
+        ctx.check("objObj_excludes_boxStr", !contains(oo, "boxStr"));
+        // ...and the String->String set must NOT contain idObj (arg type differs).
+        const name_list ss{ find_sig("(Ljava/lang/String;)Ljava/lang/String;") };
+        ctx.check("strStr_excludes_idObj", !contains(ss, "idObj"));
+
+        // (Ljava/lang/String;Ljava/lang/Object;)V -- two reference args, VOID.
+        const name_list two{ find_sig("(Ljava/lang/String;Ljava/lang/Object;)V") };
+        ctx.check("twoRef_size_1", two.size() == 1);
+        ctx.check("twoRef_is_twoRef", two.size() == 1 && two.front() == "twoRef");
+        // Arg-ORDER matters: the swapped (Object, String) descriptor is absent.
+        ctx.check("twoRef_swapped_args_empty",
+                  find_sig("(Ljava/lang/Object;Ljava/lang/String;)V").empty());
+        // Dropping one ref arg (single String -> void) is absent (no such method).
+        ctx.check("twoRef_one_arg_empty", find_sig("(Ljava/lang/String;)V").empty());
+    }
+
+    // =====================================================================
     //  6. CONSISTENCY with the substrate: for EVERY descriptor we test, the
     //     find(...) size equals the descriptor's multiplicity in
     //     get_class_methods<W>(), and every returned NAME actually carries that
@@ -437,7 +582,12 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
             // task-named shapes added to the fixture (singletons + the 3-way set):
             "(JD)V", "(IJDLjava/lang/String;[IZ)V", "(IIIIII)I",
             "(Ljava/lang/String;)Ljava/lang/Object;", "()Ljava/lang/String;",
-            "(D)I"
+            "(D)I",
+            // deepening-pass shapes: array element type / dimension / varargs /
+            // reference (incl. the two SHARED sets ([J)[J and ([I)I):
+            "([J)[J", "([D)[D", "([Z)[Z", "([B)[B", "([[[I)[[[I", "([I)I",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            "(Ljava/lang/String;Ljava/lang/Object;)V"
         };
         bool all_sizes_agree{ true };
         bool all_names_carry_descriptor{ true };
@@ -474,7 +624,10 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
         }
         const char* probe_descs[]{ "(I)I", "(J)J", "()V", "([I)[I", "(JJ)J",
                                    "(D)I", "(JD)V", "()Ljava/lang/String;",
-                                   "(Ljava/lang/String;)Ljava/lang/Object;" };
+                                   "(Ljava/lang/String;)Ljava/lang/Object;",
+                                   "([J)[J", "([D)[D", "([[[I)[[[I", "([I)I",
+                                   "(Ljava/lang/Object;)Ljava/lang/Object;",
+                                   "(Ljava/lang/String;Ljava/lang/Object;)V" };
         bool every_name_real{ true };
         bool no_empty_name{ true };
         for (const char* d : probe_descs)
@@ -568,6 +721,58 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
         //     (java.lang.String#length ()I would match retI by descriptor, so use
         //     a String-specific descriptor that FindMethodsBySig does not declare).
         ctx.check("foreign_method_desc_empty", find_sig("(II)Ljava/lang/String;").empty());
+
+        // (l) PREFIX / SUBSTRING non-matching.  The compare is whole-string ==,
+        //     not startswith/contains, so neither a strict prefix of a real
+        //     descriptor nor a real descriptor with extra tail matches.
+        ctx.check("prefix_of_II_empty", find_sig("(I)").empty());        // prefix of (I)I
+        ctx.check("II_with_tail_empty", find_sig("(I)II").empty());      // (I)I + tail 'I'
+        ctx.check("prefix_of_arr_empty", find_sig("([I)[").empty());     // prefix of ([I)[I
+        ctx.check("strdesc_prefix_empty",
+                  find_sig("(Ljava/lang/String;)Ljava/lang/String").empty()); // missing ';'
+
+        // (m) ARRAY element-type / wide-element near-misses.  ([J)[J {arrJ,sArrJ}
+        //     and ([D)[D {arrD} are declared; a wrong element-tag or a wrong
+        //     in/out element-tag pairing matches NOTHING.
+        ctx.check("arrJ_wrong_ret_elem_empty", find_sig("([J)[I").empty()); // long[] in, int[] out
+        ctx.check("arrD_wrong_ret_elem_empty", find_sig("([D)[J").empty()); // double[] in, long[] out
+        ctx.check("arrF_undeclared_empty", find_sig("([F)[F").empty());     // no float[] method
+        ctx.check("arrC_undeclared_empty", find_sig("([C)[C").empty());     // no char[] method
+        ctx.check("arrS_undeclared_empty", find_sig("([S)[S").empty());     // no short[] method
+        // varargs is ([I)I; the wide-element variant ([J)J / ([J)I is absent.
+        ctx.check("vararg_wide_elem_JJ_empty", find_sig("([J)J").empty());
+        ctx.check("vararg_wide_elem_JI_empty", find_sig("([J)I").empty());
+
+        // (n) REFERENCE-class near-misses.  The L...; tag is matched by EXACT
+        //     internal class name: a wrong class, an Object<->String swap, or a
+        //     reference array of the wrong element class matches nothing.
+        //     idObj is (Ljava/lang/Object;)Ljava/lang/Object;; boxStr is
+        //     (Ljava/lang/String;)Ljava/lang/Object;.
+        ctx.check("wrong_ref_class_empty",
+                  find_sig("(Ljava/lang/Integer;)Ljava/lang/Integer;").empty());
+        ctx.check("obj_to_str_empty",
+                  find_sig("(Ljava/lang/Object;)Ljava/lang/String;").empty()); // not declared
+        // arrStr is ([Ljava/lang/String;)[Ljava/lang/String;; an Object[] variant
+        // (different element class) is declared by nothing.
+        ctx.check("objarr_undeclared_empty",
+                  find_sig("([Ljava/lang/Object;)[Ljava/lang/Object;").empty());
+        // capital-L typo inside the package path (case-sensitive class name).
+        ctx.check("capital_L_in_package_empty",
+                  find_sig("(Ljava/Lang/String;)Ljava/Lang/String;").empty());
+        // dotted form of a reference ARRAY descriptor (internal form uses '/').
+        ctx.check("dotted_array_form_empty",
+                  find_sig("([Ljava.lang.String;)[Ljava.lang.String;").empty());
+
+        // (o) ARITY near-misses on the multi-arg shapes.  twoRef is
+        //     (Ljava/lang/String;Ljava/lang/Object;)V; adding/removing a slot or
+        //     swapping arg order is absent.  manyR is (IIIIII)I; a 7-int variant
+        //     is absent (the 5-int one is checked above).
+        ctx.check("manyR_7I_empty", find_sig("(IIIIIII)I").empty());
+        ctx.check("twoRef_extra_arg_empty",
+                  find_sig("(Ljava/lang/String;Ljava/lang/Object;I)V").empty());
+        // mixed-slot near-miss: (IJD)D {mix} with the int dropped -> (JD)D absent
+        // (already covered as (JD)D), and with args reordered -> (DJI)D absent.
+        ctx.check("mix_reordered_empty", find_sig("(DJI)D").empty());
     }
 
     // =====================================================================
@@ -612,6 +817,11 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
         const name_list before_arr{ find_sig("([I)[I") };
         const name_list before_jjj{ find_sig("(JJ)J") };
         const name_list before_vv{ find_sig("()V") };
+        // Two of the deepening shapes too: the SHARED wide-array set ([J)[J and
+        // the SHARED varargs set ([I)I -- proving the new array/varargs entries
+        // are as stable across dispatch/JIT as the scalar ones.
+        const name_list before_aj{ find_sig("([J)[J") };
+        const name_list before_aii{ find_sig("([I)I") };
         const std::size_t before_total{ vmhook::get_class_methods<fmbs>().size() };
 
         const bool probe_done{ ctx.run_probe(
@@ -644,6 +854,8 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
             const name_list after_arr{ find_sig("([I)[I") };
             const name_list after_jjj{ find_sig("(JJ)J") };
             const name_list after_vv{ find_sig("()V") };
+            const name_list after_aj{ find_sig("([J)[J") };
+            const name_list after_aii{ find_sig("([I)I") };
             const std::size_t after_total{ vmhook::get_class_methods<fmbs>().size() };
 
             ctx.check("post_dispatch_II_stable", same_multiset(before_ii, after_ii));
@@ -657,6 +869,12 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
             ctx.check("post_dispatch_JJJ_stable", same_multiset(before_jjj, after_jjj));
             ctx.check("post_dispatch_V_size_stable", before_vv.size() == after_vv.size());
             ctx.check("post_dispatch_V_stable", same_multiset(before_vv, after_vv));
+            ctx.check("post_dispatch_arrJ_stable", same_multiset(before_aj, after_aj));
+            ctx.check("post_dispatch_arrJ_still_arrJ_sArrJ",
+                      same_multiset(after_aj, name_list{ "arrJ", "sArrJ" }));
+            ctx.check("post_dispatch_vararg_stable", same_multiset(before_aii, after_aii));
+            ctx.check("post_dispatch_vararg_still_sumArr_sVararg",
+                      same_multiset(after_aii, name_list{ "sumArr", "sVararg" }));
             ctx.check("post_dispatch_total_count_stable", before_total == after_total);
         }
     }
@@ -684,5 +902,16 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
         ctx.check("by_name_DI_count_matches_find",
                   count_descriptor(by_name, "(D)I") == find_sig("(D)I").size());
         ctx.check("by_name_DI_count_is_3", count_descriptor(by_name, "(D)I") == 3);
+        // The two SHARED deepening sets are equally strong by-name cross-checks:
+        // ([J)[J {arrJ,sArrJ} and ([I)I {sumArr,sVararg} must each report
+        // multiplicity 2 through the internal-name klass, matching find exactly.
+        ctx.check("by_name_arrJ_count_matches_find",
+                  count_descriptor(by_name, "([J)[J") == find_sig("([J)[J").size());
+        ctx.check("by_name_arrJ_count_is_2", count_descriptor(by_name, "([J)[J") == 2);
+        ctx.check("by_name_vararg_count_matches_find",
+                  count_descriptor(by_name, "([I)I") == find_sig("([I)I").size());
+        ctx.check("by_name_vararg_count_is_2", count_descriptor(by_name, "([I)I") == 2);
+        ctx.check("by_name_arr3_count_matches_find",
+                  count_descriptor(by_name, "([[[I)[[[I") == find_sig("([[[I)[[[I").size());
     }
 }
