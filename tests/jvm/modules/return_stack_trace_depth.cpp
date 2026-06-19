@@ -129,6 +129,17 @@ namespace
 
     // The default cap documented by stack_trace(max_depth = 64).
     constexpr std::size_t  DEFAULT_CAP{ 64 };
+    // An explicit cap comfortably ABOVE the default but well within the
+    // guard-deep chain (GUARD_DEPTH=80 interpreter frames + the named chain +
+    // the run/probe frames), so stack_trace(BIG_CAP) reaches strictly deeper
+    // than the 64-frame default — proving the default truncates at the cap, not
+    // at the natural end of an only-64-deep chain.
+    constexpr std::size_t  BIG_CAP{ 72 };
+    static_assert(BIG_CAP > DEFAULT_CAP,
+                  "BIG_CAP must exceed the default cap to prove cap-bounded truncation");
+    static_assert(static_cast<std::int32_t>(BIG_CAP) < GUARD_DEPTH,
+                  "BIG_CAP must stay within the guard recursion so the deeper walk "
+                  "still never reaches the compiled Harness.tickAll frame");
     static_assert(GUARD_DEPTH > static_cast<std::int32_t>(DEFAULT_CAP),
                   "guard recursion must out-depth the default cap so a capped walk "
                   "never reaches the compiled Harness.tickAll frame");
@@ -204,6 +215,38 @@ namespace
     // [INFO]-only positional observations (fragile fixed-index claims).
     std::atomic<bool>         g_t_first_immediate_shallow{ false };
     std::atomic<bool>         g_t_second_immediate_mid{ false };
+    // Both guard-deep traces fill to the same 64 cap (HARD); each is well-formed.
+    std::atomic<bool>         g_t_first_wellformed{ false };
+    std::atomic<bool>         g_t_second_wellformed{ false };
+
+    // ── Mode 1 (extra) — frame well-formedness + caller()/front() FULL agreement
+    // Every frame the walk RETURNS must be well-formed: the library breaks the
+    // walk the instant a name fails to resolve, so a returned frame can never
+    // carry an empty method_name / class_name / signature or a null method.
+    std::atomic<bool>         g_k_all_frames_wellformed{ false };
+    // caller()/front() agree on ALL FOUR fields, not just method+name.
+    std::atomic<bool>         g_k_front_full_agrees_caller{ false };
+    // The hooked leaf inner(I)I must NOT appear in its own caller trace (the
+    // walk starts at the IMMEDIATE caller, never the leaf itself).
+    std::atomic<bool>         g_k_leaf_absent_from_trace{ false };
+    // Calling stack_trace() twice in the SAME detour yields an identical method
+    // sequence — no per-call cursor mutation / single-shot exhaustion bug.
+    std::atomic<bool>         g_k_idempotent{ false };
+
+    // ── Mode 2 (extra) — wider cap sweep + monotonicity + saturation ──────────
+    std::atomic<std::size_t>  g_d_size_3{ 0 };       // stack_trace(3)
+    std::atomic<std::size_t>  g_d_size_big{ 0 };     // stack_trace(BIG_CAP) — chain is guard-deep
+    std::atomic<bool>         g_d_caps_nondecreasing{ false };  // 1<=2<=3<=default
+    std::atomic<bool>         g_d_cap3_prefix_of_big{ false };  // cap3 == big[0..3)
+    std::atomic<bool>         g_d_big_exceeds_default{ false }; // explicit cap > 64 reaches deeper than the 64 default
+
+    // ── Mode 3 (extra) — recursion pointer identity + cap saturation ──────────
+    std::atomic<std::size_t>  g_r_cap100_size{ 0 };          // stack_trace(100) on a 120-deep chain
+    std::atomic<std::size_t>  g_r_cap100_recurse_run{ 0 };   // uniform recurse run within cap100
+    std::atomic<bool>         g_r_cap5_prefix_of_default{ false };
+    std::atomic<std::int32_t> g_r_distinct_recurse_methods{ -1 }; // # distinct Method* among recurse frames (must be 1)
+    std::atomic<bool>         g_r_all_frames_wellformed{ false };
+    std::atomic<bool>         g_r_default_lt_chain{ false };  // default cap (64) < the real 120-deep chain => cap (not chain end) bounds it
 
     auto reset_observations() -> void
     {
@@ -219,6 +262,10 @@ namespace
         g_k_immediate_is_mid.store(false);
         g_k_mid_index.store(-1);
         g_k_outer_index.store(-1);
+        g_k_all_frames_wellformed.store(false);
+        g_k_front_full_agrees_caller.store(false);
+        g_k_leaf_absent_from_trace.store(false);
+        g_k_idempotent.store(false);
 
         g_d_fires.store(0);
         g_d_size_1.store(0);
@@ -230,6 +277,11 @@ namespace
         g_d_chain_mid_then_outer.store(false);
         g_d_cap1_is_mid.store(false);
         g_d_cap2_mid_then_outer.store(false);
+        g_d_size_3.store(0);
+        g_d_size_big.store(0);
+        g_d_caps_nondecreasing.store(false);
+        g_d_cap3_prefix_of_big.store(false);
+        g_d_big_exceeds_default.store(false);
 
         g_r_fires.store(0);
         g_r_default_size.store(0);
@@ -237,6 +289,12 @@ namespace
         g_r_uniform_run.store(0);
         g_r_no_spin.store(false);
         g_r_front_valid.store(false);
+        g_r_cap100_size.store(0);
+        g_r_cap100_recurse_run.store(0);
+        g_r_cap5_prefix_of_default.store(false);
+        g_r_distinct_recurse_methods.store(-1);
+        g_r_all_frames_wellformed.store(false);
+        g_r_default_lt_chain.store(false);
 
         g_t_fires.store(0);
         g_t_size_first.store(0);
@@ -251,6 +309,8 @@ namespace
         g_t_second_nonempty.store(false);
         g_t_first_immediate_shallow.store(false);
         g_t_second_immediate_mid.store(false);
+        g_t_first_wellformed.store(false);
+        g_t_second_wellformed.store(false);
     }
 
     // Returns true when the caller_info names the given method of our fixture
@@ -330,6 +390,53 @@ namespace
         for (std::size_t i{ 0 }; i < shorter.size(); ++i)
         {
             if (shorter[i].method != longer[i].method)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // True when EVERY frame the walk returned is structurally well-formed: a
+    // non-null method and all three name strings non-empty.  This is a HARD
+    // universal invariant: stack_trace() breaks the walk the instant a Method*
+    // name fails to resolve, so a RETURNED frame can never carry an empty
+    // method_name (and a real interpreter Method always has a class_name +
+    // signature too).  An empty trace is treated as a non-result (false) so a
+    // failed capture cannot pass this vacuously.  Reads only the std::string /
+    // method* fields, so it cannot fault.
+    auto all_frames_wellformed(const trace_t& trace) noexcept -> bool
+    {
+        if (trace.empty())
+        {
+            return false;
+        }
+        for (const auto& f : trace)
+        {
+            if (f.method == nullptr
+                || f.method_name.empty()
+                || f.class_name.empty()
+                || f.signature.empty())
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Compares two traces element-wise by Method* only (never dereferenced):
+    // same length and same pointer at every index.  Used to prove stack_trace()
+    // is idempotent within a single detour (no per-call cursor / single-shot
+    // exhaustion bug).
+    auto same_method_sequence(const trace_t& a, const trace_t& b) noexcept -> bool
+    {
+        if (a.size() != b.size() || a.empty())
+        {
+            return false;
+        }
+        for (std::size_t i{ 0 }; i < a.size(); ++i)
+        {
+            if (a[i].method != b[i].method)
             {
                 return false;
             }
@@ -479,6 +586,37 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
                 g_k_outer_index.store(
                     outer_idx == NPOS ? -1 : static_cast<std::int32_t>(outer_idx),
                     std::memory_order_relaxed);
+
+                // Universal invariant: every RETURNED frame is well-formed (the
+                // walk breaks the instant a name fails to resolve, so a frame in
+                // the result can never be half-populated).
+                g_k_all_frames_wellformed.store(all_frames_wellformed(trace),
+                                                std::memory_order_relaxed);
+
+                // front() agrees with caller() on ALL FOUR fields (not just
+                // method+name) — they read the same immediate frame by
+                // construction, so this is robust.
+                if (!trace.empty() && info.valid())
+                {
+                    g_k_front_full_agrees_caller.store(
+                        trace.front().method      == info.method
+                     && trace.front().method_name == info.method_name
+                     && trace.front().class_name  == info.class_name
+                     && trace.front().signature   == info.signature,
+                        std::memory_order_relaxed);
+                }
+
+                // The hooked leaf inner(I)I must NOT appear in its own caller
+                // trace: the walk starts at the IMMEDIATE caller, never the leaf.
+                g_k_leaf_absent_from_trace.store(
+                    find_fixture_frame(trace, "inner") == NPOS,
+                    std::memory_order_relaxed);
+
+                // Idempotency: a second walk in the SAME detour yields the
+                // identical Method* sequence (no per-call cursor mutation).
+                const auto trace2{ ret.stack_trace() };
+                g_k_idempotent.store(same_method_sequence(trace, trace2),
+                                     std::memory_order_relaxed);
             }) };
 
         ctx.check("stk_known_hook_installed", handle.installed());
@@ -503,6 +641,14 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
         // The headline difference vs caller(): outer is reachable but is NOT the
         // immediate caller — the multi-frame walk sees further than caller().
         ctx.check("stk_known_outer_beyond_caller", g_k_outer_beyond_caller.load());
+        // Every returned frame is structurally well-formed (universal invariant).
+        ctx.check("stk_known_all_frames_wellformed", g_k_all_frames_wellformed.load());
+        // front() == caller() on ALL FOUR fields, not just method+name.
+        ctx.check("stk_known_front_full_agrees_caller", g_k_front_full_agrees_caller.load());
+        // The hooked leaf does NOT appear in its own caller trace.
+        ctx.check("stk_known_leaf_absent_from_trace", g_k_leaf_absent_from_trace.load());
+        // The walk is idempotent within one detour (no single-shot exhaustion).
+        ctx.check("stk_known_idempotent", g_k_idempotent.load());
 
         // The fragile fixed-position claim (immediate caller is EXACTLY mid) is
         // recorded VISIBLY, never asserted: its failure is a benign frame-layout
@@ -535,13 +681,17 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
 
                 const auto cap1{ ret.stack_trace(1) };
                 const auto cap2{ ret.stack_trace(2) };
+                const auto cap3{ ret.stack_trace(3) };
                 const auto cap0{ ret.stack_trace(0) };   // documented: promotes to default
                 const auto capd{ ret.stack_trace() };    // explicit default
+                const auto capbig{ ret.stack_trace(BIG_CAP) }; // > default, chain is guard-deep
 
                 g_d_size_1.store(cap1.size(), std::memory_order_relaxed);
                 g_d_size_2.store(cap2.size(), std::memory_order_relaxed);
+                g_d_size_3.store(cap3.size(), std::memory_order_relaxed);
                 g_d_size_0.store(cap0.size(), std::memory_order_relaxed);
                 g_d_size_default.store(capd.size(), std::memory_order_relaxed);
+                g_d_size_big.store(capbig.size(), std::memory_order_relaxed);
 
                 // TRUNCATION-AS-PREFIX (position-independent): a smaller cap is the
                 // element-wise prefix of a larger capture, whatever the frames are.
@@ -549,6 +699,19 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
                                               std::memory_order_relaxed);
                 g_d_cap2_prefix_of_default.store(is_method_prefix(cap2, capd),
                                                  std::memory_order_relaxed);
+                g_d_cap3_prefix_of_big.store(is_method_prefix(cap3, capbig),
+                                             std::memory_order_relaxed);
+                // Caps are non-decreasing as the budget grows: 1 <= 2 <= 3 <= default.
+                g_d_caps_nondecreasing.store(
+                    cap1.size() <= cap2.size()
+                 && cap2.size() <= cap3.size()
+                 && cap3.size() <= capd.size(),
+                    std::memory_order_relaxed);
+                // An explicit cap ABOVE the default reaches strictly deeper than the
+                // 64-frame default — proving the default truncates AT the cap, not at
+                // the natural end of an only-64-deep chain (the chain is guard-deep).
+                g_d_big_exceeds_default.store(capbig.size() > capd.size(),
+                                              std::memory_order_relaxed);
                 // The live chain mid -> outer appears IN ORDER in the default trace
                 // (search-based; robust to where mid/outer actually land).
                 g_d_chain_mid_then_outer.store(chain_in_order(capd, "mid", "outer"),
@@ -590,6 +753,19 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
         ctx.check("stk_depth_default_ge_cap2", g_d_size_default.load() >= g_d_size_2.load());
         ctx.check("stk_depth_default_within_cap", g_d_size_default.load() <= DEFAULT_CAP);
 
+        // Wider cap sweep: stack_trace(3) is exactly 3 and a genuine prefix of a
+        // deeper capture; caps grow monotonically as the budget grows.
+        ctx.check("stk_depth_cap3_size_is_3", g_d_size_3.load() == 3);
+        ctx.check("stk_depth_cap3_prefix_of_big", g_d_cap3_prefix_of_big.load());
+        ctx.check("stk_depth_caps_nondecreasing", g_d_caps_nondecreasing.load());
+        // The default size is EXACTLY the cap here (the chain is guard-deep, so the
+        // 64-frame budget — not the chain end — bounds the default trace).
+        ctx.check("stk_depth_default_is_exactly_cap", g_d_size_default.load() == DEFAULT_CAP);
+        // An explicit cap above the default reaches strictly deeper than the
+        // default: the cap, not the natural chain end, is what truncates.
+        ctx.check("stk_depth_big_exceeds_default", g_d_big_exceeds_default.load());
+        ctx.check("stk_depth_big_size_is_cap", g_d_size_big.load() == BIG_CAP);
+
         ctx.record(std::string{ "[INFO] return_stack_trace_depth: caps {1,2,0->def,def} = {" }
                    + std::to_string(g_d_size_1.load()) + ","
                    + std::to_string(g_d_size_2.load()) + ","
@@ -616,19 +792,43 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
 
                 const auto trace{ ret.stack_trace() };   // default cap
                 const auto cap5{ ret.stack_trace(5) };
+                // 100 < DEEP_RECURSION (120) but > DEFAULT_CAP (64): on a chain
+                // 120 interpreter frames deep this returns exactly 100, proving an
+                // explicit cap ABOVE the default still truncates at the cap (the
+                // chain has not ended yet) rather than saturating at 64.
+                const auto cap100{ ret.stack_trace(100) };
 
                 g_r_default_size.store(trace.size(), std::memory_order_relaxed);
                 g_r_cap5_size.store(cap5.size(), std::memory_order_relaxed);
+                g_r_cap100_size.store(cap100.size(), std::memory_order_relaxed);
                 // "No spin": a sane walk can never exceed the cap; if the saved-rbp
                 // chain looped, the internal max_depth guard still bounds it AT the
                 // cap, so size <= cap is the terminated-cleanly proof.
                 g_r_no_spin.store(trace.size() <= DEFAULT_CAP, std::memory_order_relaxed);
                 g_r_front_valid.store(!trace.empty() && trace.front().method != nullptr,
                                       std::memory_order_relaxed);
+                // The default (64) is strictly less than the real 120-deep chain, so
+                // the cap — not the chain end — is what bounds the default trace.
+                g_r_default_lt_chain.store(
+                    trace.size() < static_cast<std::size_t>(DEEP_RECURSION),
+                    std::memory_order_relaxed);
+                // cap5 is an element-wise prefix of the default trace (truncation
+                // preserves order even deep in a recursion).
+                g_r_cap5_prefix_of_default.store(is_method_prefix(cap5, trace),
+                                                 std::memory_order_relaxed);
+                // Every returned frame is well-formed (universal invariant).
+                g_r_all_frames_wellformed.store(all_frames_wellformed(trace),
+                                                std::memory_order_relaxed);
 
-                // Longest run of consecutive frames that all name recurse(I)I.
+                // Longest run of consecutive frames that all name recurse(I)I, and
+                // (within that run) the number of DISTINCT Method* — for a single
+                // self-recursive method every frame shares ONE Method*, so a long
+                // run must collapse to exactly one distinct pointer.
                 std::size_t best{ 0 };
                 std::size_t run{ 0 };
+                void* run_method{ nullptr };
+                std::size_t run_distinct{ 0 };
+                std::size_t best_distinct{ 0 };
                 for (const auto& f : trace)
                 {
                     if (f.method != nullptr
@@ -636,18 +836,53 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
                         && f.method_name == "recurse"
                         && f.signature   == SIG_II)
                     {
+                        if (run == 0 || f.method != run_method)
+                        {
+                            // A new distinct Method* within this consecutive run.
+                            ++run_distinct;
+                            run_method = static_cast<void*>(f.method);
+                        }
                         ++run;
                         if (run > best)
                         {
                             best = run;
+                            best_distinct = run_distinct;
                         }
                     }
                     else
                     {
                         run = 0;
+                        run_distinct = 0;
+                        run_method = nullptr;
                     }
                 }
                 g_r_uniform_run.store(best, std::memory_order_relaxed);
+                g_r_distinct_recurse_methods.store(
+                    static_cast<std::int32_t>(best_distinct), std::memory_order_relaxed);
+
+                // Uniform recurse run within the 100-cap capture (independent of
+                // the default), recomputed the same way.
+                std::size_t best100{ 0 };
+                std::size_t run100{ 0 };
+                for (const auto& f : cap100)
+                {
+                    if (f.method != nullptr
+                        && f.class_name  == CLASS_NAME
+                        && f.method_name == "recurse"
+                        && f.signature   == SIG_II)
+                    {
+                        ++run100;
+                        if (run100 > best100)
+                        {
+                            best100 = run100;
+                        }
+                    }
+                    else
+                    {
+                        run100 = 0;
+                    }
+                }
+                g_r_cap100_recurse_run.store(best100, std::memory_order_relaxed);
             }) };
 
         ctx.check("stk_recurse_hook_installed", handle.installed());
@@ -667,12 +902,30 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
         ctx.check("stk_recurse_uniform_run_long", g_r_uniform_run.load() >= 32);
         // Explicit cap below the real depth truncates to exactly that many frames.
         ctx.check("stk_recurse_cap5_size_is_5", g_r_cap5_size.load() == 5);
+        // cap5 is a genuine prefix of the default trace (order preserved deep down).
+        ctx.check("stk_recurse_cap5_prefix_of_default", g_r_cap5_prefix_of_default.load());
+        // Every returned frame is well-formed (universal invariant).
+        ctx.check("stk_recurse_all_frames_wellformed", g_r_all_frames_wellformed.load());
+        // The default (64) is strictly less than the real 120-deep chain: the cap,
+        // not the natural chain end, is what bounds the default trace.
+        ctx.check("stk_recurse_default_lt_chain", g_r_default_lt_chain.load());
+        // A long uniform recurse run collapses to EXACTLY one distinct Method* —
+        // every frame of a single self-recursive method shares one Method*.
+        ctx.check("stk_recurse_run_single_method", g_r_distinct_recurse_methods.load() == 1);
+        // An explicit cap of 100 on a 120-deep chain returns EXACTLY 100 frames
+        // (above the 64 default but below the chain end): the cap, not the 64
+        // default, is what bounds it — and almost all 100 are recurse frames.
+        ctx.check("stk_recurse_cap100_size_is_100", g_r_cap100_size.load() == 100);
+        ctx.check("stk_recurse_cap100_run_long", g_r_cap100_recurse_run.load() >= 90);
 
         ctx.record(std::string{ "[INFO] return_stack_trace_depth: recurse(" }
                    + std::to_string(DEEP_RECURSION) + ") default trace size = "
                    + std::to_string(g_r_default_size.load()) + " (cap " + std::to_string(DEFAULT_CAP)
                    + "), longest uniform recurse-run = " + std::to_string(g_r_uniform_run.load())
-                   + ", stack_trace(5) = " + std::to_string(g_r_cap5_size.load()) + ".");
+                   + " (distinct method* in run = " + std::to_string(g_r_distinct_recurse_methods.load())
+                   + "), stack_trace(5) = " + std::to_string(g_r_cap5_size.load())
+                   + ", stack_trace(100) = " + std::to_string(g_r_cap100_size.load())
+                   + " (run " + std::to_string(g_r_cap100_recurse_run.load()) + ").");
     }
 
     // =====================================================================
@@ -714,6 +967,8 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
                     g_t_first_immediate_shallow.store(
                         !trace.empty() && is_fixture_frame(trace.front(), "shallow"),
                         std::memory_order_relaxed);
+                    g_t_first_wellformed.store(all_frames_wellformed(trace),
+                                               std::memory_order_relaxed);
                 }
                 else if (order == 1)
                 {
@@ -736,6 +991,8 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
                     g_t_second_immediate_mid.store(
                         !trace.empty() && is_fixture_frame(trace.front(), "mid"),
                         std::memory_order_relaxed);
+                    g_t_second_wellformed.store(all_frames_wellformed(trace),
+                                                std::memory_order_relaxed);
                 }
             }) };
 
@@ -779,6 +1036,19 @@ VMHOOK_JVM_MODULE(return_stack_trace_depth)
                       g_t_first_shallow_method.load() != g_t_second_mid_method.load());
         }
         else { ctx.record("[INFO] stk_two_callers_distinct: a caller frame was inlined away — best-effort"); }
+
+        // Both fires walk guard-deep chains (GUARD_DEPTH=80 > 64), so each default
+        // trace fills to the same 64 cap: the two captures are the SAME LENGTH and
+        // both saturate the cap.  This is a HARD invariant (the cap, not the chain
+        // shape, bounds both), independent of which named frame each contains.
+        ctx.check("stk_two_both_hit_cap",
+                  g_t_size_first.load() == DEFAULT_CAP
+               && g_t_size_second.load() == DEFAULT_CAP);
+        ctx.check("stk_two_equal_length",
+                  g_t_size_first.load() == g_t_size_second.load());
+        // Every returned frame in each fire is well-formed (universal invariant).
+        ctx.check("stk_two_first_wellformed", g_t_first_wellformed.load());
+        ctx.check("stk_two_second_wellformed", g_t_second_wellformed.load());
 
         // The fragile fixed-position claim (immediate caller is EXACTLY shallow/mid)
         // is recorded VISIBLY, never asserted — its failure is a benign frame-layout

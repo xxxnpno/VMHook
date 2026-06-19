@@ -118,6 +118,42 @@ namespace
 
         auto rgb_resolves() const -> bool { return get_field("rgb").has_value(); }
 
+        // ---- field_proxy introspection on the enum-body field `rgb` (primitive) ----
+        // A primitive instance field is NOT a reference and NOT static; its JVM
+        // descriptor is "I".  Asserted so the proxy contract is pinned for the
+        // primitive case that sits alongside the enum-reference fields.
+        auto rgb_is_reference() const -> bool
+        {
+            const auto p{ get_field("rgb") };
+            return p.has_value() && p->is_reference();
+        }
+        auto rgb_is_static() const -> bool
+        {
+            const auto p{ get_field("rgb") };
+            return p.has_value() && p->is_static();
+        }
+        auto rgb_signature() const -> std::string
+        {
+            const auto p{ get_field("rgb") };
+            return p.has_value() ? std::string{ p->signature() } : std::string{};
+        }
+        // get_compressed_oop() on a PRIMITIVE field must be guarded to 0 (FLAW-C).
+        auto rgb_compressed_oop() const -> std::uint32_t
+        {
+            const auto p{ get_field("rgb") };
+            return p.has_value() ? p->get_compressed_oop() : 1u;
+        }
+        auto name_signature() const -> std::string
+        {
+            const auto p{ get_field("name") };
+            return p.has_value() ? std::string{ p->signature() } : std::string{};
+        }
+        auto ordinal_signature() const -> std::string
+        {
+            const auto p{ get_field("ordinal") };
+            return p.has_value() ? std::string{ p->signature() } : std::string{};
+        }
+
         // ---- inherited java.lang.Enum state (super-chain field reads) ----
         auto get_name() const -> std::string { return get_field("name")->get(); }
 
@@ -175,6 +211,25 @@ namespace
 
         static auto values_array_resolves() -> bool { return static_field("$VALUES").has_value(); }
 
+        // ---- field_proxy introspection on the synthetic $VALUES array static ----
+        // $VALUES is a STATIC, REFERENCE (array) field whose descriptor is
+        // '[Lvmhook/fixtures/EnumSingleton$Color;'.
+        static auto values_is_reference() -> bool
+        {
+            const auto p{ static_field("$VALUES") };
+            return p.has_value() && p->is_reference();
+        }
+        static auto values_is_static() -> bool
+        {
+            const auto p{ static_field("$VALUES") };
+            return p.has_value() && p->is_static();
+        }
+        static auto values_signature() -> std::string
+        {
+            const auto p{ static_field("$VALUES") };
+            return p.has_value() ? std::string{ p->signature() } : std::string{};
+        }
+
         // ---- bare OOP for identity / distinctness (gated by caller) ----
         auto oop() const -> void* { return this->vmhook::object_base::get_instance(); }
     };
@@ -200,6 +255,18 @@ namespace
         auto get_symbol() const -> std::string { return get_field("symbol")->get(); }
 
         auto symbol_resolves() const -> bool { return get_field("symbol").has_value(); }
+
+        // symbol is a reference (String) instance field — descriptor 'Ljava/lang/String;'.
+        auto symbol_is_reference() const -> bool
+        {
+            const auto p{ get_field("symbol") };
+            return p.has_value() && p->is_reference();
+        }
+        auto symbol_signature() const -> std::string
+        {
+            const auto p{ get_field("symbol") };
+            return p.has_value() ? std::string{ p->signature() } : std::string{};
+        }
 
         // ---- inherited java.lang.Enum state ----
         auto get_name() const -> std::string { return get_field("name")->get(); }
@@ -249,6 +316,10 @@ namespace
 
         static auto values_array_resolves() -> bool { return static_field("$VALUES").has_value(); }
 
+        // ---- synthetic static methods values()/valueOf on the enum class ----
+        static auto values_method_resolves() -> bool { return static_method("values").has_value(); }
+        static auto value_of_method_resolves() -> bool { return static_method("valueOf").has_value(); }
+
         auto oop() const -> void* { return this->vmhook::object_base::get_instance(); }
     };
 
@@ -266,10 +337,30 @@ namespace
         {
         }
 
+        static constexpr std::int32_t k_call_unavailable{ -1 };
+
         auto get_tag() const -> std::int32_t { return get_field("tag")->get(); }
         auto tag_resolves() const -> bool { return get_field("tag").has_value(); }
         auto get_name() const -> std::string { return get_field("name")->get(); }
         auto get_ordinal() const -> std::int32_t { return get_field("ordinal")->get(); }
+
+        // ---- enum-body instance method tag() (native; best-effort) ----
+        auto tag_method_resolves() const -> bool { return get_method("tag").has_value(); }
+        auto tag_native() const -> std::int32_t
+        {
+            const auto m{ get_method("tag") };
+            if (!m.has_value())
+            {
+                return k_call_unavailable;
+            }
+            const auto result{ m->call() };
+            if (result.is_void())
+            {
+                return k_call_unavailable;
+            }
+            const std::int32_t v = result;
+            return v;
+        }
 
         static auto acquire_constant(const char* name) -> std::unique_ptr<lonely_enum> { return static_field(name)->get(); }
         static auto constant_resolves(const char* name) -> bool { return static_field(name).has_value(); }
@@ -313,6 +404,19 @@ namespace
         // The canonical private-static-final INSTANCE slot.
         static auto acquire_instance() -> std::unique_ptr<classic_singleton> { return static_field("INSTANCE")->get(); }
         static auto instance_resolves() -> bool { return static_field("INSTANCE").has_value(); }
+
+        // The canonical accessor getInstance() — resolves on the class; the native
+        // call is best-effort (the Java witness classicSameInstance proves idempotence).
+        static auto get_instance_method_resolves() -> bool { return static_method("getInstance").has_value(); }
+        static auto get_instance_native() -> std::unique_ptr<classic_singleton>
+        {
+            const auto m{ static_method("getInstance") };
+            if (!m.has_value())
+            {
+                return nullptr;
+            }
+            return m->call();
+        }
 
         static auto instance_oop() -> void*
         {
@@ -459,6 +563,53 @@ namespace
                 vmhook::get_array_element<std::uint32_t>(array_oop, i)));
         }
         return out;
+    }
+
+    // Read an enum_color's `rgb` directly off a bare (already-decoded) element OOP
+    // by wrapping it — proves a $VALUES element OOP is a usable enum singleton, not
+    // merely OOP-equal to the constant static.  Fully gated; -1 on a bad OOP.
+    auto rgb_of_oop(void* const color_oop) -> std::int32_t
+    {
+        if (!color_oop || !vmhook::hotspot::is_valid_pointer(color_oop))
+        {
+            return -1;
+        }
+        const enum_color wrapped{ static_cast<vmhook::oop_t>(color_oop) };
+        if (!wrapped.rgb_resolves())
+        {
+            return -1;
+        }
+        return wrapped.get_rgb();
+    }
+
+    // Read an enum_color's `ordinal` off a bare element OOP (gated; -1 on failure).
+    auto ordinal_of_oop(void* const color_oop) -> std::int32_t
+    {
+        if (!color_oop || !vmhook::hotspot::is_valid_pointer(color_oop))
+        {
+            return -1;
+        }
+        const enum_color wrapped{ static_cast<vmhook::oop_t>(color_oop) };
+        if (!wrapped.ordinal_resolves())
+        {
+            return -1;
+        }
+        return wrapped.get_ordinal();
+    }
+
+    // Read an enum_color's `name` off a bare element OOP (gated; "" on failure).
+    auto name_of_oop(void* const color_oop) -> std::string
+    {
+        if (!color_oop || !vmhook::hotspot::is_valid_pointer(color_oop))
+        {
+            return std::string{};
+        }
+        const enum_color wrapped{ static_cast<vmhook::oop_t>(color_oop) };
+        if (!wrapped.name_resolves())
+        {
+            return std::string{};
+        }
+        return wrapped.get_name();
     }
 
     // The runtime ('/'-separated) klass name of an OOP, read by decoding the
@@ -619,6 +770,13 @@ namespace
         //     constant IS the values() element — enum identity invariant).
         // =====================================================================
         ctx.check("color_values_array_resolves", enum_color::values_array_resolves());
+        // $VALUES is a STATIC, REFERENCE (array) field; its descriptor is the
+        // '[L...;' array type of the enum.  Pin the proxy contract for the
+        // array-reference case (distinct from the plain 'L...;' reference fields).
+        ctx.check("color_values_field_is_reference", enum_color::values_is_reference());
+        ctx.check("color_values_field_is_static",    enum_color::values_is_static());
+        ctx.check("color_values_field_signature_is_array_of_color",
+                  enum_color::values_signature() == std::string{ "[L" } + k_color_class + ";");
         {
             void* const array_oop{ enum_color::values_array_oop() };
             ctx.check("color_values_array_oop_valid",
@@ -638,6 +796,24 @@ namespace
                     ctx.check("color_values_elem2_is_BLUE",  elems[2] == blue->oop());
                     ctx.check("color_values_elements_distinct",
                               elems[0] != elems[1] && elems[1] != elems[2] && elems[0] != elems[2]);
+
+                    // Each element OOP is itself a USABLE enum singleton: wrap the
+                    // bare element OOP and read `rgb` / `ordinal` / `name` off it.
+                    // This proves the values()-array element is a live decode-able
+                    // OOP (not merely pointer-equal to the constant static), and
+                    // pins the ORDINAL-ORDERING invariant natively: values()[i]
+                    // has ordinal i and the matching packed-RGB.
+                    ctx.check("color_values_elem0_rgb_is_RED",   rgb_of_oop(elems[0]) == static_cast<std::int32_t>(0xFF0000));
+                    ctx.check("color_values_elem1_rgb_is_GREEN", rgb_of_oop(elems[1]) == static_cast<std::int32_t>(0x00FF00));
+                    ctx.check("color_values_elem2_rgb_is_BLUE",  rgb_of_oop(elems[2]) == static_cast<std::int32_t>(0x0000FF));
+
+                    ctx.check("color_values_elem0_ordinal_is_0", ordinal_of_oop(elems[0]) == 0);
+                    ctx.check("color_values_elem1_ordinal_is_1", ordinal_of_oop(elems[1]) == 1);
+                    ctx.check("color_values_elem2_ordinal_is_2", ordinal_of_oop(elems[2]) == 2);
+
+                    ctx.check("color_values_elem0_name_is_RED",   name_of_oop(elems[0]) == "RED");
+                    ctx.check("color_values_elem1_name_is_GREEN", name_of_oop(elems[1]) == "GREEN");
+                    ctx.check("color_values_elem2_name_is_BLUE",  name_of_oop(elems[2]) == "BLUE");
                 }
             }
         }
@@ -700,6 +876,56 @@ namespace
                       static_proxy.has_value()
                       && std::string{ static_proxy->signature() }
                              == std::string{ "L" } + k_color_class + ";");
+        }
+
+        // ---- field_proxy is_reference()/is_static() classification ----
+        // The enum-reference fields ARE references; favoriteColor is an INSTANCE
+        // field (not static), staticColor is STATIC.  The primitive enum-body
+        // field `rgb` is NEITHER a reference NOR static, with descriptor "I".
+        if (holder)
+        {
+            const auto fav_proxy{ holder->get_field("favoriteColor") };
+            ctx.check("favoriteColor_proxy_is_reference",
+                      fav_proxy.has_value() && fav_proxy->is_reference());
+            ctx.check("favoriteColor_proxy_is_not_static",
+                      fav_proxy.has_value() && !fav_proxy->is_static());
+        }
+        {
+            const auto stat_proxy{ enum_holder::static_field("staticColor") };
+            ctx.check("staticColor_proxy_is_reference",
+                      stat_proxy.has_value() && stat_proxy->is_reference());
+            ctx.check("staticColor_proxy_is_static",
+                      stat_proxy.has_value() && stat_proxy->is_static());
+        }
+        if (live(green))
+        {
+            ctx.check("enum_rgb_proxy_is_not_reference", !green->rgb_is_reference());
+            ctx.check("enum_rgb_proxy_is_not_static",    !green->rgb_is_static());
+            ctx.check("enum_rgb_descriptor_is_I",        green->rgb_signature() == "I");
+            // get_compressed_oop() on a PRIMITIVE field is guarded to 0 (FLAW-C):
+            // it must NOT read the int payload as a bogus compressed OOP.
+            ctx.check("enum_rgb_compressed_oop_guarded_zero", green->rgb_compressed_oop() == 0u);
+            // Inherited java.lang.Enum field descriptors: name is a String ref,
+            // ordinal is an int.
+            ctx.check("enum_name_descriptor_is_String",
+                      green->name_signature() == "Ljava/lang/String;");
+            ctx.check("enum_ordinal_descriptor_is_I", green->ordinal_signature() == "I");
+        }
+
+        // ---- get_compressed_oop() of a REFERENCE field is non-zero and decodes
+        //      to the SAME OOP that field_oop() yields (two spellings, one slot) --
+        {
+            const auto stat_proxy{ enum_holder::static_field("staticColor") };
+            if (stat_proxy.has_value())
+            {
+                const std::uint32_t narrow{ stat_proxy->get_compressed_oop() };
+                ctx.check("staticColor_compressed_oop_nonzero", narrow != 0u);
+                void* const decoded{ vmhook::hotspot::decode_oop_pointer(narrow) };
+                void* const via_field_oop{ vmhook::field_oop(*stat_proxy) };
+                ctx.check("staticColor_compressed_oop_decodes_to_field_oop",
+                          decoded == via_field_oop
+                          && (!live(blue) || decoded == blue->oop()));
+            }
         }
 
         // =====================================================================
@@ -892,11 +1118,19 @@ namespace
             {
                 ctx.check("op_PLUS_symbol_resolves", plus->symbol_resolves());
                 ctx.check("op_PLUS_symbol_is_plus",  plus->get_symbol() == "+");
+                // symbol is a String reference field — descriptor 'Ljava/lang/String;'.
+                ctx.check("op_PLUS_symbol_is_reference", plus->symbol_is_reference());
+                ctx.check("op_PLUS_symbol_descriptor_is_String",
+                          plus->symbol_signature() == "Ljava/lang/String;");
             }
             if (live(times))
             {
                 ctx.check("op_TIMES_symbol_is_star", times->get_symbol() == "*");
             }
+
+            // ---- synthetic static methods values()/valueOf resolve on Op too ----
+            ctx.check("op_values_method_resolves",  op_enum::values_method_resolves());
+            ctx.check("op_valueOf_method_resolves", op_enum::value_of_method_resolves());
 
             // ---- inherited name()/ordinal() ----
             if (live(plus))
@@ -970,6 +1204,50 @@ namespace
                                "the result (\"op:+\") is proven via the Java witness "
                                "(java_op_PLUS_label_is_op_plus).");
                     ctx.check("op_PLUS_label_native_best_effort", true);
+                }
+            }
+
+            // ---- Op values()/valueOf via NATIVE static_method (best-effort) ----
+            // Mirrors the Color path: assert the returned shape only when the call
+            // gate is live; otherwise [INFO] (robust proof = java_op_values_length_is_2
+            // / java_op_valueOf_PLUS_is_PLUS).
+            {
+                const auto m_values{ op_enum::static_method("values") };
+                if (m_values.has_value())
+                {
+                    const auto result{ m_values->call() };
+                    if (result.is_void())
+                    {
+                        ctx.record("[INFO] enum_singleton: native Op.values() had no live call gate; "
+                                   "length proven via $VALUES and the Java witness "
+                                   "(java_op_values_length_is_2).");
+                        ctx.check("op_values_native_best_effort", true);
+                    }
+                    else
+                    {
+                        void* const arr = result;
+                        ctx.check("op_values_native_best_effort",
+                                  arr != nullptr && vmhook::hotspot::is_valid_pointer(arr)
+                                  && vmhook::array_length(arr) == 2);
+                    }
+                }
+
+                const auto m_value_of{ op_enum::static_method("valueOf") };
+                if (m_value_of.has_value() && live(plus))
+                {
+                    std::unique_ptr<op_enum> got{ m_value_of->call(std::string{ "PLUS" }) };
+                    if (!got)
+                    {
+                        ctx.record("[INFO] enum_singleton: native Op.valueOf(\"PLUS\") had no live "
+                                   "call gate; identity proven via the Java witness "
+                                   "(java_op_valueOf_PLUS_is_PLUS).");
+                        ctx.check("op_valueOf_native_best_effort", true);
+                    }
+                    else
+                    {
+                        ctx.check("op_valueOf_native_best_effort",
+                                  live(got) && got->oop() == plus->oop());
+                    }
                 }
             }
 
@@ -1110,6 +1388,25 @@ namespace
                 ctx.check("lonely_INSTANCE_ordinal_is_0",     sole->get_ordinal() == 0);
                 ctx.check("lonely_INSTANCE_tag_resolves",     sole->tag_resolves());
                 ctx.check("lonely_INSTANCE_tag_is_sentinel",  sole->get_tag() == static_cast<std::int32_t>(0x515E));
+                // Native instance method tag() on the single-constant enum:
+                // resolution is HARD; the call itself is best-effort (proven via
+                // the Java witness java_lonely_tag_is_sentinel otherwise).
+                ctx.check("lonely_INSTANCE_tag_method_resolves", sole->tag_method_resolves());
+                {
+                    const std::int32_t native_tag{ sole->tag_native() };
+                    if (native_tag == lonely_enum::k_call_unavailable)
+                    {
+                        ctx.record("[INFO] enum_singleton: native Lonely.INSTANCE.tag() had no live "
+                                   "call gate; the sentinel (0x515E) is proven via the field read and "
+                                   "the Java witness (java_lonely_tag_is_sentinel).");
+                        ctx.check("lonely_INSTANCE_tag_native_best_effort", true);
+                    }
+                    else
+                    {
+                        ctx.check("lonely_INSTANCE_tag_native_best_effort",
+                                  native_tag == static_cast<std::int32_t>(0x515E));
+                    }
+                }
                 // The single constant's leaf klass IS the enum class (no body).
                 const std::string kn{ runtime_klass_name(sole->oop()) };
                 if (!kn.empty())
@@ -1185,6 +1482,30 @@ namespace
                 if (live(inst))
                 {
                     ctx.check("classic_wrapper_oop_matches_field", inst->oop() == a);
+                }
+            }
+
+            // ---- canonical accessor getInstance() — best-effort native ----
+            // Resolution is HARD; the native call result (when the gate is live)
+            // returns the very INSTANCE OOP.  When unavailable, idempotence is
+            // proven by the Java witness java_classic_same_instance.
+            ctx.check("classic_getInstance_method_resolves",
+                      classic_singleton::get_instance_method_resolves());
+            {
+                auto via_call{ classic_singleton::get_instance_native() };
+                if (!via_call)
+                {
+                    ctx.record("[INFO] enum_singleton: native ClassicSingleton.getInstance() had no "
+                               "live call gate; idempotence + identity proven via the Java witness "
+                               "(java_classic_same_instance) and the static-slot OOP-stability above.");
+                    ctx.check("classic_getInstance_native_best_effort", true);
+                }
+                else
+                {
+                    void* const slot{ classic_singleton::instance_oop() };
+                    ctx.check("classic_getInstance_native_best_effort",
+                              live(via_call) && via_call->oop() == slot
+                              && via_call->get_magic() == static_cast<std::int32_t>(0x5A5A5A5A));
                 }
             }
         }

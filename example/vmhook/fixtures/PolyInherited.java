@@ -63,6 +63,17 @@ public final class PolyInherited
     public static volatile boolean sawShadowBase;        // base-typed read sees BASE shadow slots
     public static volatile boolean sawPolyConcrete;      // L1-typed field holds an L4 at runtime
 
+    // ---- Published identity hash codes for the inherited reference targets,
+    //      latched by the probe through System.identityHashCode so the native
+    //      module can cross-check that the OOP it decoded by raw offset is the
+    //      SAME object the JVM sees (an exact same-object witness, not just a
+    //      same-value one).  Zero until the probe runs. -------------------------
+    public static volatile int l1StrIdentity;            // identity of l4.l1Str
+    public static volatile int l1ArrIdentity;            // identity of l4.l1Arr
+    public static volatile int l2RefIdentity;            // identity of l4.l2Ref
+    public static volatile int selfRefIdentity;          // identity of l4.l4Self (== l4 itself)
+    public static volatile int polyBaseIdentity;         // identity of polyBase (the L4 it holds)
+
     // ---- Canonical values (mirrored on the native side) --------------------
     public static final int PROTECTED_INT     = 1337;    // A.protectedInt init
     public static final int B_INT             = 42;      // B.bInt init
@@ -278,6 +289,15 @@ public final class PolyInherited
                 PolyInherited.sawPolyConcrete =
                        (PolyInherited.polyBase instanceof L4)
                     && (((L4) PolyInherited.polyBase).l4Int == POLY_L4_INT);
+
+                // ---- Publish identity hashes of the inherited reference targets
+                //      so the native module can prove the OOP it decoded by raw
+                //      offset is the SAME object (exact same-object witness). -----
+                PolyInherited.l1StrIdentity   = System.identityHashCode(l4.l1Str);
+                PolyInherited.l1ArrIdentity   = System.identityHashCode(l4.l1Arr);
+                PolyInherited.l2RefIdentity   = System.identityHashCode(l4.l2Ref);
+                PolyInherited.selfRefIdentity = System.identityHashCode(l4.l4Self);
+                PolyInherited.polyBaseIdentity = System.identityHashCode(PolyInherited.polyBase);
 
                 PolyInherited.done = true;
             }

@@ -51,6 +51,19 @@
 // elements.  The module HARD-asserts the full decode (section 7); the call must
 // not crash.
 //
+// DEEPENED: in addition to the empty / big-list / null-list / oversized /
+// colliding / out-of-order / setFromMap / array-bounds shapes, this module also
+// covers (a) SINGLE-element containers across all six families (the
+// empty->populated dispatch seam, lone element id checked), (b) Collections.*
+// degenerate List shapes (emptyList / singletonList / unmodifiableList — the
+// generic get(int) fallback + wrapper layouts), (c) BIG bucket/tree walks
+// (HashSet/TreeSet/TreeMap/HashMap @ 1500 — the heavy no-duplicate-KEY canary
+// for hash_map_walk_keys / tree_map_walk_keys guard caps), (d) declared-NULL
+// collection/map/list fields + a MISSING field name (empty, no crash), and (e)
+// a FULL in-bounds array sweep, narrow-width (int16/int8) reads, every Object[]
+// in-bounds slot, more OOB indices, and the bounds primitive on a null / non-
+// array oop (the load-bearing guard every walk sits on).
+//
 // C++17 (no std::bit_cast); MSVC copy-init (never brace-init) from value_t.
 #include <vmhook/vmhook.hpp>
 
@@ -84,6 +97,8 @@ namespace
     constexpr std::int32_t SETFROMMAP_N{ 5 };
     constexpr std::int32_t INT_ARR_LEN{ 8 };
     constexpr std::int32_t OBJ_ARR_LEN{ 4 };
+    constexpr std::int32_t SINGLE_ELEM_ID{ 42 };
+    constexpr std::int32_t BIG_MAP{ 1500 };
 
     // ── ELEMENT wrapper: vmhook.fixtures.CollIterSafety$Elem. ───────────────
     // to_vector / the walk helpers build make_unique<elem_object> from each
@@ -168,6 +183,57 @@ namespace
     walk_obs g_oo_treemap;          // entries
 
     walk_obs g_setfrommap;          // FIXED: full HashMap-backed decode
+
+    // ── Single-element containers (empty->populated dispatch seam). ──────────
+    walk_obs g_single_arraylist;
+    walk_obs g_single_linkedlist;
+    walk_obs g_single_hashset;
+    walk_obs g_single_treeset;
+    walk_obs g_single_hashmap;      // entries
+    walk_obs g_single_treemap;      // entries
+    // The lone element of each single-* container must decode to id 42.  Stored
+    // as the observed id (or INT_MIN if not exactly-one-non-null-element).
+    std::atomic<std::int32_t> g_single_arraylist_id{ std::numeric_limits<std::int32_t>::min() };
+    std::atomic<std::int32_t> g_single_linkedlist_id{ std::numeric_limits<std::int32_t>::min() };
+    std::atomic<std::int32_t> g_single_hashset_id{ std::numeric_limits<std::int32_t>::min() };
+    std::atomic<std::int32_t> g_single_treeset_id{ std::numeric_limits<std::int32_t>::min() };
+
+    // ── Immutable / wrapper degenerate List shapes. ──────────────────────────
+    walk_obs g_singleton_list;          // size 1, generic get(int) fallback
+    walk_obs g_collections_empty_list;  // size 0 degenerate List
+    walk_obs g_unmodifiable_list;       // wrapper over a 1-element ArrayList
+
+    // ── Big bucket/tree walks (heavy no-dup-key canary). ─────────────────────
+    walk_obs g_big_hashset;
+    walk_obs g_big_treeset;
+    walk_obs g_big_treemap;             // entries
+    walk_obs g_big_hashmap;             // entries
+
+    // ── ROBUSTNESS: declared-but-null collection / map / list fields. ────────
+    walk_obs g_null_set;
+    walk_obs g_null_map;                // entries
+    walk_obs g_null_list_field;
+    // A missing field name -> empty vector (helper's !f short-circuit).
+    walk_obs g_missing_field;
+    walk_obs g_missing_field_entries;   // entries
+
+    // ── get_array_element ROBUSTNESS on degenerate oops (HARD, universal). ───
+    std::atomic<bool> g_arrlen_null_is_zero{ false };       // array_length(nullptr)==0
+    std::atomic<bool> g_getelem_null_is_zero{ false };      // get_array_element(nullptr,0)==0
+    std::atomic<bool> g_arrlen_nonarray_safe{ false };      // array_length(Elem oop) didn't crash
+    std::atomic<bool> g_getelem_nonarray_safe{ false };     // get_array_element(Elem oop, huge) didn't crash
+    // EVERY in-bounds int slot read back its sentinel (full sweep, not just 3).
+    std::atomic<bool> g_int_all_inbounds_ok{ false };
+    // Narrow-width in-bounds reads of int[] (stride/widened-multiply path):
+    // intArr[0] low 2 bytes == 1000 (LE int16), low byte == (1000 & 0xFF).
+    std::atomic<bool> g_int_int16_read_ok{ false };
+    std::atomic<bool> g_int_int8_read_ok{ false };
+    // Object[] EVERY in-bounds slot decodes to its Elem id (700..703).
+    std::atomic<bool> g_obj_all_inbounds_ok{ false };
+    // Extra OOB object indices clamp to 0.
+    std::atomic<bool> g_obj_oob_intmin_clamped{ false };
+    std::atomic<bool> g_obj_oob_intmax_clamped{ false };
+    std::atomic<bool> g_obj_oob_lenp1_clamped{ false };
 
     // ── get_array_element bounds outcomes (HARD, universal). ─────────────────
     // In-bounds reads (must equal the sentinel value).
@@ -268,6 +334,29 @@ namespace
         o.distinct_ok.store(distinct_ok, std::memory_order_relaxed);
     }
 
+    // Extract the id() of the lone non-null Elem in a decoded vector; returns
+    // INT_MIN if the vector does not hold exactly one non-null element (so the
+    // caller can assert "exactly one element, id == expected").
+    auto single_elem_id(const std::vector<std::unique_ptr<elem_object>>& v)
+        -> std::int32_t
+    {
+        const elem_object* only{ nullptr };
+        std::int32_t non_null{ 0 };
+        for (const auto& up : v)
+        {
+            if (up.get() != nullptr)
+            {
+                ++non_null;
+                only = up.get();
+            }
+        }
+        if (non_null != 1 || only == nullptr)
+        {
+            return std::numeric_limits<std::int32_t>::min();
+        }
+        return only->id();
+    }
+
     // to_vector a named collection field off a live instance wrapper.
     template<typename element_type>
     auto vec_of(const fixture_wrapper& self, const char* field)
@@ -357,6 +446,50 @@ namespace
         // ── FIXED: newSetFromMap(HashMap) routes to the HashMap key walk. ─────
         observe_vec(g_setfrommap, vec_of<elem_object>(*self, "setFromHashMap"));
 
+        // ── SINGLE-ELEMENT containers (empty->populated dispatch seam). ──────
+        {
+            const auto sa{ vec_of<elem_object>(*self, "singleArrayList") };
+            g_single_arraylist_id.store(single_elem_id(sa), std::memory_order_relaxed);
+            observe_vec(g_single_arraylist, sa);
+
+            const auto sl{ vec_of<elem_object>(*self, "singleLinkedList") };
+            g_single_linkedlist_id.store(single_elem_id(sl), std::memory_order_relaxed);
+            observe_vec(g_single_linkedlist, sl);
+
+            const auto sh{ vec_of<elem_object>(*self, "singleHashSet") };
+            g_single_hashset_id.store(single_elem_id(sh), std::memory_order_relaxed);
+            observe_vec(g_single_hashset, sh);
+
+            const auto st{ vec_of<elem_object>(*self, "singleTreeSet") };
+            g_single_treeset_id.store(single_elem_id(st), std::memory_order_relaxed);
+            observe_vec(g_single_treeset, st);
+
+            observe_entries(g_single_hashmap, entries_of<elem_object, elem_object>(*self, "singleHashMap"));
+            observe_entries(g_single_treemap, entries_of<elem_object, elem_object>(*self, "singleTreeMap"));
+        }
+
+        // ── IMMUTABLE / WRAPPER degenerate List shapes. ──────────────────────
+        observe_vec(g_singleton_list,         vec_of<elem_object>(*self, "singletonList"));
+        observe_vec(g_collections_empty_list, vec_of<elem_object>(*self, "collectionsEmptyList"));
+        observe_vec(g_unmodifiable_list,       vec_of<elem_object>(*self, "unmodifiableList"));
+
+        // ── BIG bucket / tree walks (heavy no-dup-key canary). ───────────────
+        observe_vec(g_big_hashset,    vec_of<elem_object>(*self, "bigHashSet"));
+        observe_vec(g_big_treeset,    vec_of<elem_object>(*self, "bigTreeSet"));
+        observe_entries(g_big_treemap, entries_of<elem_object, elem_object>(*self, "bigTreeMap"));
+        observe_entries(g_big_hashmap, entries_of<elem_object, elem_object>(*self, "bigHashMap"));
+
+        // ── ROBUSTNESS: declared-null fields + a missing field name. ─────────
+        //   A null collection field decodes to a null oop -> empty vector; a
+        //   missing field name short-circuits in vec_of/entries_of (the !f path).
+        //   Both must return an empty container, never crash.
+        observe_vec(g_null_set,        vec_of<elem_object>(*self, "nullSet"));
+        observe_entries(g_null_map,    entries_of<elem_object, elem_object>(*self, "nullMap"));
+        observe_vec(g_null_list_field, vec_of<elem_object>(*self, "nullList"));
+        observe_vec(g_missing_field,   vec_of<elem_object>(*self, "noSuchCollectionField_xyz"));
+        observe_entries(g_missing_field_entries,
+                        entries_of<elem_object, elem_object>(*self, "noSuchMapField_xyz"));
+
         // ── get_array_element bounds clamp (HARD, universal). ────────────────
         {
             void* const int_arr{ array_oop_of(*self, "intArr") };
@@ -376,6 +509,34 @@ namespace
                 g_int_inbounds_last_ok.store(
                     vmhook::get_array_element<std::int32_t>(int_arr, INT_ARR_LEN - 1)
                         == 1000 + INT_ARR_LEN - 1,
+                    std::memory_order_relaxed);
+
+                // FULL in-bounds sweep: EVERY index k in [0,len) reads 1000+k.
+                {
+                    bool all_ok{ true };
+                    for (std::int32_t k{ 0 }; k < INT_ARR_LEN; ++k)
+                    {
+                        if (vmhook::get_array_element<std::int32_t>(int_arr, k) != 1000 + k)
+                        {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                    g_int_all_inbounds_ok.store(all_ok, std::memory_order_relaxed);
+                }
+
+                // Narrow-width in-bounds reads exercise the stride / widened-
+                // multiply path: on little-endian x64 (every CI target) the low
+                // 2 bytes of intArr[0]==1000 read as int16 1000, the low byte as
+                // (1000 & 0xFF)==232.  Stride is sizeof(T), so int16 index 0 / int8
+                // index 0 both read from byte +16 of the data region.
+                g_int_int16_read_ok.store(
+                    vmhook::get_array_element<std::int16_t>(int_arr, 0)
+                        == static_cast<std::int16_t>(1000),
+                    std::memory_order_relaxed);
+                g_int_int8_read_ok.store(
+                    static_cast<std::uint8_t>(vmhook::get_array_element<std::int8_t>(int_arr, 0))
+                        == static_cast<std::uint8_t>(1000 & 0xFF),
                     std::memory_order_relaxed);
 
                 // Out-of-bounds: every OOB index clamps to T{} (0) and never
@@ -415,14 +576,88 @@ namespace
                     elem_object w{ static_cast<vmhook::oop_t>(e0_oop) };
                     g_obj_inbounds_ok.store(w.id() == 700, std::memory_order_relaxed);
                 }
+
+                // FULL in-bounds sweep: EVERY slot k decodes to a valid Elem with
+                // id 700+k.  Gated on the narrow-oop decode actually producing a
+                // valid pointer (compressed-oops dependency); when every slot
+                // decoded a pointer and the id matched, this is the strong proof.
+                {
+                    bool all_ok{ true };
+                    bool any_decoded{ false };
+                    for (std::int32_t k{ 0 }; k < OBJ_ARR_LEN; ++k)
+                    {
+                        const std::uint32_t ek{ vmhook::get_array_element<std::uint32_t>(obj_arr, k) };
+                        void* const ek_oop{ vmhook::hotspot::decode_oop_pointer(ek) };
+                        if (ek_oop && vmhook::hotspot::is_valid_pointer(ek_oop))
+                        {
+                            any_decoded = true;
+                            elem_object w{ static_cast<vmhook::oop_t>(ek_oop) };
+                            if (w.id() != 700 + k)
+                            {
+                                all_ok = false;
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                    g_obj_all_inbounds_ok.store(any_decoded && all_ok, std::memory_order_relaxed);
+                }
+
                 // Out-of-bounds object element reads clamp to 0 (the narrow-oop
-                // T{}); decode of 0 is null -> no deref.
+                // T{}); decode of 0 is null -> no deref.  Hammer every boundary.
                 g_obj_oob_eqlen_clamped.store(
                     vmhook::get_array_element<std::uint32_t>(obj_arr, OBJ_ARR_LEN) == 0,
                     std::memory_order_relaxed);
                 g_obj_oob_neg_clamped.store(
                     vmhook::get_array_element<std::uint32_t>(obj_arr, -7) == 0,
                     std::memory_order_relaxed);
+                g_obj_oob_intmin_clamped.store(
+                    vmhook::get_array_element<std::uint32_t>(
+                        obj_arr, std::numeric_limits<std::int32_t>::min()) == 0,
+                    std::memory_order_relaxed);
+                g_obj_oob_intmax_clamped.store(
+                    vmhook::get_array_element<std::uint32_t>(
+                        obj_arr, std::numeric_limits<std::int32_t>::max()) == 0,
+                    std::memory_order_relaxed);
+                g_obj_oob_lenp1_clamped.store(
+                    vmhook::get_array_element<std::uint32_t>(obj_arr, OBJ_ARR_LEN + 1) == 0,
+                    std::memory_order_relaxed);
+            }
+
+            // ── DEGENERATE-OOP robustness for the bounds primitive itself. ───
+            //   array_length / get_array_element on nullptr and on a NON-array
+            //   instance oop must return 0 / T{} and NEVER crash.  These are the
+            //   load-bearing guards every bucket/array walk above sits on.
+            g_arrlen_null_is_zero.store(
+                vmhook::array_length(nullptr) == 0, std::memory_order_relaxed);
+            g_getelem_null_is_zero.store(
+                vmhook::get_array_element<std::int32_t>(nullptr, 0) == 0,
+                std::memory_order_relaxed);
+
+            // A non-array instance oop: the fixture instance `self` itself.  Its
+            // klass is an InstanceKlass, not an array klass, so the +12 "length"
+            // slot is whatever instance bytes live there; array_length must not
+            // crash (it is is_valid_pointer-gated) and a get with a huge index
+            // must clamp.  We assert NO CRASH (reaching the next store proves it)
+            // and that a wildly-OOB index on it clamps to 0 regardless of the
+            // garbage length it reads.
+            {
+                void* const nonarray{ static_cast<void*>(self->get_instance()) };
+                if (nonarray && vmhook::hotspot::is_valid_pointer(nonarray))
+                {
+                    (void)vmhook::array_length(nonarray);   // must not crash
+                    g_arrlen_nonarray_safe.store(true, std::memory_order_relaxed);
+
+                    // INT_MIN index can never be in bounds (index < 0 guard) so
+                    // it clamps to 0 no matter what garbage length is read.
+                    const std::int32_t v{ vmhook::get_array_element<std::int32_t>(
+                        nonarray, std::numeric_limits<std::int32_t>::min()) };
+                    g_getelem_nonarray_safe.store(v == 0, std::memory_order_relaxed);
+                }
             }
         }
     }
@@ -587,15 +822,22 @@ namespace
     // Out-of-order tree containers: in-order walk surfaces all TREE_N.
     size_match("oo_treeset", g_oo_treeset, "outOfOrderTreeSetSize", TREE_N);
     size_match("oo_treemap", g_oo_treemap, "outOfOrderTreeMapSize", TREE_N);
+    // Big bucket / tree containers: the heavy hash/tree walks surface all BIG_MAP.
+    size_match("big_hashset", g_big_hashset, "bigHashSetSize", BIG_MAP);
+    size_match("big_treeset", g_big_treeset, "bigTreeSetSize", BIG_MAP);
+    size_match("big_treemap", g_big_treemap, "bigTreeMapSize", BIG_MAP);
+    size_match("big_hashmap", g_big_hashmap, "bigHashMapSize", BIG_MAP);
 
     ctx.record(std::string{ "[INFO] collection_iteration_safety: " }
                + std::to_string(static_cast<int>(shapes_matched)) + "/"
                + std::to_string(static_cast<int>(shapes_total))
                + " populated shapes decoded a size that matched the Java oracle.");
     // HARD majority floor: the size-match layer genuinely works for most shapes.
-    // 7 populated shapes; require a strict majority so a real regression is caught
-    // while a single GC/decode-stressed tail on an exotic config is tolerated.
-    ctx.check("size_oracle_majority_matched", shapes_matched >= 4);
+    // 11 populated shapes now; require a strict majority so a real regression is
+    // caught while a single GC/decode-stressed tail on an exotic config is
+    // tolerated.  (shapes_total == 11; majority floor scaled accordingly.)
+    ctx.check("size_oracle_majority_matched",
+              shapes_matched >= (shapes_total / 2) + 1);
 
     // =====================================================================
     //  4. NULL-bearing lists — count == size; nulls are nullptr SLOTS (kept,
@@ -736,6 +978,11 @@ namespace
         ctx.check("array_intarr_inbounds_first_is_1000", g_int_inbounds_first_ok.load());
         ctx.check("array_intarr_inbounds_mid_correct", g_int_inbounds_mid_ok.load());
         ctx.check("array_intarr_inbounds_last_correct", g_int_inbounds_last_ok.load());
+        // EVERY in-bounds index read back its sentinel (full sweep).
+        ctx.check("array_intarr_all_inbounds_correct", g_int_all_inbounds_ok.load());
+        // Narrow-width in-bounds reads (stride / widened-multiply path).
+        ctx.check("array_intarr_int16_read_correct", g_int_int16_read_ok.load());
+        ctx.check("array_intarr_int8_read_correct", g_int_int8_read_ok.load());
 
         // Out-of-bounds reads clamp to 0 (guard fired; no OOB read, no crash).
         ctx.check("array_intarr_neg1_clamped", g_int_neg1_clamped.load());
@@ -749,8 +996,170 @@ namespace
         ctx.check("array_objarr_recovered", g_obj_arr_valid.load());
         ctx.check("array_objarr_length_is_4", g_obj_arr_len.load() == OBJ_ARR_LEN);
         ctx.check("array_objarr_inbounds_elem_id_700", g_obj_inbounds_ok.load());
+        // EVERY in-bounds slot decoded to its Elem id 700+k (gated on decode).
+        if (g_obj_inbounds_ok.load())
+        {
+            ctx.check("array_objarr_all_inbounds_elem_ids", g_obj_all_inbounds_ok.load());
+        }
+        else
+        {
+            ctx.record("[INFO] array_objarr_all_inbounds: SKIPPED — element 0 did not "
+                       "decode to a valid Elem on this JVM (compressed-oops dependency); "
+                       "the OOB clamps below stay HARD.");
+        }
         ctx.check("array_objarr_oob_eqlen_clamped", g_obj_oob_eqlen_clamped.load());
         ctx.check("array_objarr_oob_neg_clamped", g_obj_oob_neg_clamped.load());
+        ctx.check("array_objarr_oob_intmin_clamped", g_obj_oob_intmin_clamped.load());
+        ctx.check("array_objarr_oob_intmax_clamped", g_obj_oob_intmax_clamped.load());
+        ctx.check("array_objarr_oob_lenp1_clamped", g_obj_oob_lenp1_clamped.load());
+
+        // The bounds primitive itself is robust on degenerate oops (HARD,
+        // universal): nullptr -> 0 / T{}; a non-array instance oop never crashes
+        // and a wildly-OOB index on it still clamps to 0.
+        ctx.check("array_length_null_is_zero", g_arrlen_null_is_zero.load());
+        ctx.check("array_getelem_null_is_zero", g_getelem_null_is_zero.load());
+        ctx.check("array_length_nonarray_no_crash", g_arrlen_nonarray_safe.load());
+        ctx.check("array_getelem_nonarray_intmin_clamped", g_getelem_nonarray_safe.load());
+    }
+
+    // =====================================================================
+    //  9. SINGLE-ELEMENT containers — the empty->populated dispatch seam.
+    //     Each one-element container must decode to EXACTLY one element with
+    //     id SINGLE_ELEM_ID (42), count==1, no nulls, distinct.  size==1 (Java
+    //     oracle) is HARD on every JDK; the decoded-id/count is best-effort
+    //     gated on the (compressed-oops) element decode producing anything.
+    // =====================================================================
+    {
+        const auto check_single = [&ctx](const char* tag, walk_obs& o,
+                                         const char* size_field,
+                                         std::atomic<std::int32_t>* id_cell) -> void
+        {
+            ctx.check(std::string{ "single_seen_" } + tag, o.seen.load());
+            ctx.check(std::string{ "single_java_size_is_1_" } + tag,
+                      fixture_wrapper::j_size(size_field) == 1);
+            const std::int32_t decoded{ o.count.load() };
+            if (decoded > 0)
+            {
+                ctx.check(std::string{ "single_count_is_1_" } + tag, decoded == 1);
+                ctx.check(std::string{ "single_no_null_slots_" } + tag,
+                          o.null_count.load() == 0);
+                ctx.check(std::string{ "single_one_nonnull_" } + tag,
+                          o.non_null.load() == 1);
+                ctx.check(std::string{ "single_distinct_" } + tag, o.distinct_ok.load());
+                if (id_cell != nullptr)
+                {
+                    ctx.check(std::string{ "single_elem_id_is_42_" } + tag,
+                              id_cell->load() == SINGLE_ELEM_ID);
+                }
+            }
+            else
+            {
+                ctx.record(std::string{ "[INFO] single_" } + tag
+                           + ": SKIPPED — decoded 0 of 1 on this JVM "
+                             "(compressed-oops element decode).");
+            }
+        };
+        check_single("arraylist",  g_single_arraylist,  "singleArrayListSize",  &g_single_arraylist_id);
+        check_single("linkedlist", g_single_linkedlist, "singleLinkedListSize", &g_single_linkedlist_id);
+        check_single("hashset",    g_single_hashset,    "singleHashSetSize",    &g_single_hashset_id);
+        check_single("treeset",    g_single_treeset,    "singleTreeSetSize",    &g_single_treeset_id);
+        check_single("hashmap",    g_single_hashmap,    "singleHashMapSize",    nullptr);
+        check_single("treemap",    g_single_treemap,    "singleTreeMapSize",    nullptr);
+    }
+
+    // =====================================================================
+    //  10. IMMUTABLE / WRAPPER degenerate List shapes (Collections.*).
+    //      - Collections.emptyList(): degenerate empty List (its own class) —
+    //        the walk must return empty without crashing (HARD).
+    //      - Collections.singletonList / unmodifiableList: one logical element;
+    //        the walk must not crash and must not over-/under-run.  Their layout
+    //        is JDK-variant (SingletonList has an "element" field, not size/
+    //        elementData; the unmodifiable wrapper holds the real list in a
+    //        field), so the EXACT decoded count is [INFO]; size==1 (Java) is HARD.
+    // =====================================================================
+    {
+        ctx.check("collections_emptylist_seen", g_collections_empty_list.seen.load());
+        ctx.check("collections_emptylist_java_size_zero",
+                  fixture_wrapper::j_size("collectionsEmptyListSize") == 0);
+        ctx.check("collections_emptylist_count_zero",
+                  g_collections_empty_list.count.load() == 0);
+        ctx.check("collections_emptylist_no_null_slots",
+                  g_collections_empty_list.null_count.load() == 0);
+
+        ctx.check("singletonlist_seen", g_singleton_list.seen.load());
+        ctx.check("singletonlist_java_size_is_1",
+                  fixture_wrapper::j_size("singletonListSize") == 1);
+        ctx.check("singletonlist_no_dup_oop", g_singleton_list.distinct_ok.load());
+        ctx.record(std::string{ "[INFO] singletonList decoded count = " }
+                   + std::to_string(g_singleton_list.count.load())
+                   + " (layout is JDK-variant: SingletonList has no size/elementData "
+                     "and goes through the get(int) fallback — count not hard-asserted).");
+
+        ctx.check("unmodifiablelist_seen", g_unmodifiable_list.seen.load());
+        ctx.check("unmodifiablelist_java_size_is_1",
+                  fixture_wrapper::j_size("unmodifiableListSize") == 1);
+        ctx.check("unmodifiablelist_no_dup_oop", g_unmodifiable_list.distinct_ok.load());
+        ctx.record(std::string{ "[INFO] unmodifiableList decoded count = " }
+                   + std::to_string(g_unmodifiable_list.count.load())
+                   + " (wrapper layout is JDK-variant; the walk must only not crash / "
+                     "not duplicate — count not hard-asserted).");
+    }
+
+    // =====================================================================
+    //  11. BIG bucket / tree walks — the heavy no-duplicate-KEY canary for
+    //      hash_map_walk_keys (guard cap 1<<20) and tree_map_walk_keys /
+    //      *_entries (cap 1<<24).  A cycle / re-emit in a bucket-next chain or a
+    //      red-black descent collapses key distinctness; an early stop / over-run
+    //      breaks the count.  HARD whenever the big walk decoded anything; a HARD
+    //      floor that at least ONE big bucket/tree walk produced the full BIG_MAP
+    //      with distinct keys keeps the canary non-vacuous.
+    // =====================================================================
+    {
+        const auto big_canary = [&ctx](const char* tag, walk_obs& o) -> bool
+        {
+            const std::int32_t n{ o.count.load() };
+            if (n > 0)
+            {
+                ctx.check(std::string{ "big_no_dup_key_" } + tag, o.distinct_ok.load());
+                ctx.check(std::string{ "big_no_null_slots_" } + tag,
+                          o.null_count.load() == 0);
+                ctx.check(std::string{ "big_terminated_at_bigmap_" } + tag, n == BIG_MAP);
+                return n == BIG_MAP && o.distinct_ok.load();
+            }
+            ctx.record(std::string{ "[INFO] big_" } + tag
+                       + ": SKIPPED heavy no-dup canary — decoded 0 on this JVM.");
+            return false;
+        };
+        const bool hs{ big_canary("hashset", g_big_hashset) };
+        const bool ts{ big_canary("treeset", g_big_treeset) };
+        const bool tm{ big_canary("treemap", g_big_treemap) };
+        const bool hm{ big_canary("hashmap", g_big_hashmap) };
+        ctx.check("big_bucket_tree_at_least_one_full_distinct", hs || ts || tm || hm);
+    }
+
+    // =====================================================================
+    //  12. ROBUSTNESS — declared-NULL collection / map / list fields and a
+    //      MISSING field name.  Every one must yield an EMPTY container and
+    //      NEVER crash (HARD, universal — no element decode involved).
+    //        * null field -> field decodes to a null oop -> empty.
+    //        * missing field name -> vec_of/entries_of's !f short-circuit.
+    // =====================================================================
+    {
+        const auto check_degenerate = [&ctx](const char* tag, walk_obs& o)
+        {
+            ctx.check(std::string{ "degenerate_seen_" } + tag, o.seen.load());
+            ctx.check(std::string{ "degenerate_count_zero_" } + tag, o.count.load() == 0);
+            ctx.check(std::string{ "degenerate_no_null_slots_" } + tag,
+                      o.null_count.load() == 0);
+        };
+        check_degenerate("null_set",          g_null_set);
+        check_degenerate("null_map",          g_null_map);
+        check_degenerate("null_list",         g_null_list_field);
+        check_degenerate("missing_field",     g_missing_field);
+        check_degenerate("missing_field_map", g_missing_field_entries);
+        ctx.record("[INFO] collection_iteration_safety: null collection/map/list "
+                   "fields and a non-existent field name all returned an empty "
+                   "container without crashing (HARD, universal).");
     }
 
     // scoped_hook `handle` uninstalls here at scope exit — nothing left armed.

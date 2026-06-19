@@ -817,6 +817,400 @@ static void run_field_null_safety_checks(vmhook_test::context& ctx)
     }
 
     // =====================================================================
+    //  12. WILD (non-null but INVALID) field_pointer get() — the SECOND guard
+    //      in field_proxy::get() (vmhook.hpp:15371-15376): after the null check,
+    //      a non-null pointer that fails is_valid_pointer (AND whose 2-byte-
+    //      aligned base also fails) takes the SAME int32-zero / signature-echo
+    //      fallback as a null pointer, WITHOUT dereferencing the wild address.
+    //      The null phase (3) only covered pointer==nullptr; this covers the
+    //      bogus-but-non-null case, which is a DISTINCT code path.
+    //
+    //      The chosen address (0x4) is below user_address_floor on every
+    //      platform, so BOTH the direct is_valid_pointer check and the (& ~1)
+    //      base check reject it -> the fallback is taken and the wild address is
+    //      NEVER read.  (A sentinel like 0xDEADBEEF would also be rejected by the
+    //      poison-pattern table; 0x4 is the simplest universally-rejected probe.)
+    //
+    //      IMPORTANT — get() ONLY: field_proxy::set() has NO is_valid_pointer
+    //      gate (the trivially-copyable branch memcpy's straight into a non-null
+    //      field_pointer), so a wild-pointer set() WOULD write to 0x4 and fault.
+    //      We therefore exercise the wild pointer through get() / get_compressed_oop()
+    //      (both gated) ONLY, never set() — that asymmetry is by design.
+    // =====================================================================
+    {
+        void* const wild{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x4)) };
+        const char* sigs[] = {
+            "Z", "B", "S", "C", "I", "J", "F", "D",
+            "Ljava/lang/String;", "[I", "[[D", "",
+        };
+        for (const char* sig : sigs)
+        {
+            vmhook::field_proxy fp{ wild, sig, true };
+            const auto v{ fp.get() };
+            const std::string tag{ sig };
+
+            // Wild-pointer fallback is the SAME documented int32-zero default.
+            ctx.check(std::string{ "wild_get_variant_is_int32_" } + tag,
+                      v.data.index() == kIdxI32);
+            ctx.check(std::string{ "wild_get_signature_preserved_" } + tag,
+                      v.signature == sig);
+            const std::int32_t as_i32 = v;
+            ctx.check(std::string{ "wild_get_int_is_zero_" } + tag, as_i32 == 0);
+            const std::int64_t as_i64 = v;
+            ctx.check(std::string{ "wild_get_long_is_zero_" } + tag, as_i64 == 0);
+            const double as_double = v;
+            ctx.check(std::string{ "wild_get_double_is_zero_" } + tag, as_double == 0.0);
+
+            // raw_address() ECHOES the wild pointer verbatim (it never derefs);
+            // the safety lives entirely in get(), not in the stored address.
+            ctx.check(std::string{ "wild_raw_address_echoed_" } + tag,
+                      fp.raw_address() == wild);
+        }
+        // A wild REFERENCE proxy's get_compressed_oop() is guarded the same way
+        // (vmhook.hpp:15740) -> 0, no deref of the wild address.
+        {
+            vmhook::field_proxy fp_ref{ wild, "Ljava/lang/String;", true };
+            ctx.check("wild_get_compressed_oop_zero", fp_ref.get_compressed_oop() == 0u);
+            const std::string s = fp_ref.get().as_string();
+            ctx.check("wild_get_string_empty", s.empty());
+        }
+    }
+    // CONTRAST: wild-pointer reads touched no real state.
+    ctx.check("post_wild_get_okInt_intact", fns::get_ok_int() == 1234);
+    ctx.check("post_wild_get_canary_intact", fns::get_canary() == kCanaryInt);
+
+    // =====================================================================
+    //  13. NULL-proxy value_t conversion matrix — COMPLETE the set of typed
+    //      conversions the int32-zero fallback must satisfy.  Phase 3 covered
+    //      int32 / int64 / bool / double / float; here we add the narrower /
+    //      unsigned alternatives (int8 / int16 / uint16 / char / uint32 / void*),
+    //      all of which must collapse to a zero / null value off the int32-zero
+    //      fallback without crashing.
+    // =====================================================================
+    {
+        vmhook::field_proxy fp{ nullptr, "Ljava/lang/String;", false };
+        const auto v{ fp.get() };
+        const std::int8_t as_i8 = v;
+        ctx.check("null_get_int8_zero", as_i8 == 0);
+        const std::int16_t as_i16 = v;
+        ctx.check("null_get_int16_zero", as_i16 == 0);
+        const std::uint16_t as_u16 = v;
+        ctx.check("null_get_uint16_zero", as_u16 == 0u);
+        const char as_char = v;
+        ctx.check("null_get_char_zero", as_char == '\0');
+        const std::uint32_t as_u32 = v;
+        ctx.check("null_get_uint32_zero", as_u32 == 0u);
+        // void* conversion of the int32-zero fallback decodes a 0 compressed OOP
+        // -> null pointer (no wild decode, no crash).
+        void* const as_ptr = v;
+        ctx.check("null_get_voidptr_null", as_ptr == nullptr);
+    }
+
+    // =====================================================================
+    //  14. get_compressed_oop() / is_reference() are SIGNATURE-driven and
+    //      pointer-independent — exhaustive over signature SHAPES on null proxies.
+    //        * get_compressed_oop() on a PRIMITIVE-sig null proxy returns 0 via
+    //          the is_reference() guard (vmhook.hpp:15702), a DIFFERENT guard
+    //          than the null-pointer one — a primitive proxy never reads its first
+    //          4 bytes as an OOP even if it had a pointer.
+    //        * is_reference() is true iff signature[0] is 'L' or '[' (front()
+    //          guarded for ""), so an array of ANY rank, an "L..." of any class,
+    //          and the bare "[" are references; a method descriptor "(I)V", a
+    //          lowercase "i", whitespace, and the empty string are not.
+    // =====================================================================
+    {
+        // Primitive null proxies: get_compressed_oop() is 0 (is_reference guard).
+        const char* prim_sigs[] = { "Z", "B", "S", "C", "I", "J", "F", "D" };
+        for (const char* sig : prim_sigs)
+        {
+            vmhook::field_proxy fp{ nullptr, sig, true };
+            ctx.check(std::string{ "null_primitive_get_compressed_oop_zero_" } + sig,
+                      fp.get_compressed_oop() == 0u);
+            ctx.check(std::string{ "null_primitive_is_reference_false_" } + sig,
+                      fp.is_reference() == false);
+        }
+
+        // is_reference() TRUE shapes (signature begins with 'L' or '[').
+        const char* ref_sigs[] = {
+            "Ljava/lang/Object;", "Lfoo/Bar;", "[I", "[[[J",
+            "[Ljava/lang/String;", "[",  // bare '[' — front() is '[', so true
+            "Lx;",
+        };
+        for (const char* sig : ref_sigs)
+        {
+            vmhook::field_proxy fp{ nullptr, sig, false };
+            ctx.check(std::string{ "null_is_reference_true_" } + sig,
+                      fp.is_reference() == true);
+        }
+
+        // is_reference() FALSE shapes (not 'L'/'[' / empty).
+        const char* nonref_sigs[] = {
+            "(I)V",  // method descriptor-looking
+            "i",     // lowercase, not a real descriptor
+            " ",     // whitespace
+            "V",     // void
+            "",      // empty
+            "QFoo;", // a 'Q'-leading malformed descriptor (not 'L'/'[')
+            "?",
+        };
+        for (const char* sig : nonref_sigs)
+        {
+            vmhook::field_proxy fp{ nullptr, sig, false };
+            const std::string tag{ sig };
+            ctx.check(std::string{ "null_is_reference_false_shape_" } + tag,
+                      fp.is_reference() == false);
+            // A non-reference proxy's get_compressed_oop() is likewise 0.
+            ctx.check(std::string{ "null_nonref_get_compressed_oop_zero_" } + tag,
+                      fp.get_compressed_oop() == 0u);
+        }
+    }
+
+    // =====================================================================
+    //  15. MORE absent-name SHAPES (beyond phase 1/2) — whitespace, tab, dotted /
+    //      slashed, a name equal to a SIGNATURE descriptor, a name equal to a real
+    //      METHOD name (methods are not fields), a Unicode name, and a name that
+    //      is a real field name with surrounding whitespace.  All -> nullopt, no
+    //      crash, no treating the decoration as a match.
+    // =====================================================================
+    {
+        const char* absent_shapes[] = {
+            " okInt",          // leading space
+            "okInt ",          // trailing space
+            "\tokInt",         // tab prefix
+            "ok\tInt",         // embedded tab
+            "ok.Int",          // dotted
+            "ok/Int",          // slashed
+            "I",               // a bare descriptor as a name
+            "Ljava/lang/String;",  // a full descriptor as a name
+            "getOkInt",        // a real METHOD name (not a field)
+            "mutateOkInt",     // a real method name
+            "okInt\n",         // trailing newline
+            "\xC3\xA9okInt",   // a UTF-8 'e-acute' prefix (non-ASCII name)
+        };
+        for (const char* name : absent_shapes)
+        {
+            // Every shape here is a NON-field (decorated real name, descriptor,
+            // or method name) and must resolve to nullopt — none of the
+            // decoration may be silently stripped into a match.
+            ctx.check(std::string{ "absent_shape_" } + name,
+                      fns::resolves(name) == false);
+        }
+
+        // A genuine `public static final int` (RUNTIME_OK_INT) IS a declared
+        // field in the class metadata on every JDK (a ConstantValue-backed static
+        // final still appears in _fields / _fieldinfo_stream), so it resolves.
+        // This is a normal declared field, NOT a compiler-synthetic one (the
+        // this$0/$VALUES surfacing variance does not apply), so the resolve is a
+        // hard universal invariant.
+        ctx.check("static_final_constant_resolves", fns::resolves("RUNTIME_OK_INT"));
+    }
+    ctx.check("post_absent_shapes_okInt_intact", fns::get_ok_int() == 1234);
+
+    // =====================================================================
+    //  16. NULL-proxy get()/set() over MORE array / nested signature classes —
+    //      every primitive array rank plus a deep multi-dim, so the null fallback
+    //      is pinned for the full descriptor space, not just the phase-3 subset.
+    //      Reads stay int32-zero; sets stay safe no-ops (proven by the canary).
+    // =====================================================================
+    {
+        const char* arr_sigs[] = {
+            "[Z", "[B", "[S", "[C", "[J", "[F",
+            "[[I", "[[[Ljava/lang/Object;",
+            "[Lfoo/Bar;",
+        };
+        for (const char* sig : arr_sigs)
+        {
+            vmhook::field_proxy fp{ nullptr, sig, false };
+            const auto v{ fp.get() };
+            const std::string tag{ sig };
+            ctx.check(std::string{ "null_array_get_int32_" } + tag, v.data.index() == kIdxI32);
+            // value_t::is_reference() is FALSE: the null fallback stores int32,
+            // not the uint32 (compressed-OOP) alternative — even for an array sig.
+            ctx.check(std::string{ "null_array_value_is_reference_false_" } + tag,
+                      v.is_reference() == false);
+            // field_proxy::is_reference() (signature-only) is TRUE for every array.
+            ctx.check(std::string{ "null_array_proxy_is_reference_true_" } + tag,
+                      fp.is_reference() == true);
+            // A string-decode of an array-typed null proxy is "" (int32-zero ->
+            // 0 compressed OOP -> null -> empty), not a crash.
+            const std::string s = fp.get().as_string();
+            ctx.check(std::string{ "null_array_as_string_empty_" } + tag, s.empty());
+            // Safe no-op set (trivially-copyable branch early-returns on the null
+            // field_pointer — NO allocation; the String-set path is already
+            // covered in phase 5, so we deliberately avoid a per-sig JNI String
+            // build here to stay heap-modest).
+            fp.set(std::int32_t{ 0x7EADBEEF });
+        }
+        ctx.check("null_array_set_no_crash", true);
+    }
+    ctx.check("post_null_array_canary_intact", fns::get_canary() == kCanaryInt);
+
+    // =====================================================================
+    //  17. WRONG signature over a REAL field pointer — WIDER coverage than phase
+    //      8 (which used okInt only).  Over the genuine mirror storage of fields
+    //      of EACH width, lie about the descriptor.  The address is valid mirror
+    //      memory, so get() reinterprets the bytes for the claimed type WITHOUT
+    //      crashing; we pin the deterministic reinterpretation and re-read the
+    //      field correctly afterwards to prove the wrong-sig reads were
+    //      non-mutating.  This includes a WIDER-than-the-real-field read (an "8-
+    //      byte" claim over a 1-byte field) — still a safe read off the mapped
+    //      mirror, no fault.
+    // =====================================================================
+    {
+        // okLong == 0x0123456789ABCDEF read as "I" -> low 4 bytes 0x89ABCDEF.
+        void* const ok_long_addr{ fns::raw_addr_of("okLong") };
+        if (ok_long_addr)
+        {
+            vmhook::field_proxy wrong{ ok_long_addr, "I", true };
+            const auto v{ wrong.get() };
+            ctx.check("wrongsig_okLong_as_I_variant", v.data.index() == kIdxI32);
+            const std::int32_t i = v;
+            ctx.check("wrongsig_okLong_as_I_low_word",
+                      i == static_cast<std::int32_t>(0x89ABCDEF));
+            // Correct "J" control read.
+            vmhook::field_proxy correct{ ok_long_addr, "J", true };
+            const std::int64_t l = correct.get();
+            ctx.check("wrongsig_okLong_control_J_value", l == 0x0123456789ABCDEFLL);
+        }
+
+        // okDouble (Math.PI bits) read as "J" -> the raw 64-bit pattern.
+        void* const ok_double_addr{ fns::raw_addr_of("okDouble") };
+        if (ok_double_addr)
+        {
+            vmhook::field_proxy wrong{ ok_double_addr, "J", true };
+            const auto v{ wrong.get() };
+            ctx.check("wrongsig_okDouble_as_J_variant", v.data.index() == kIdxI64);
+            const std::int64_t bits = v;
+            ctx.check("wrongsig_okDouble_as_J_is_pi_bits",
+                      bits == static_cast<std::int64_t>(0x400921FB54442D18ULL));
+        }
+
+        // okFloat (1.5f == 0x3FC00000) read as "I" -> the raw bits.
+        void* const ok_float_addr{ fns::raw_addr_of("okFloat") };
+        if (ok_float_addr)
+        {
+            vmhook::field_proxy wrong{ ok_float_addr, "I", true };
+            const std::int32_t bits = wrong.get();
+            ctx.check("wrongsig_okFloat_as_I_is_1p5_bits", bits == 0x3FC00000);
+        }
+
+        // okByte (1 byte) read as "J" (8-byte claim): a WIDER read off a valid,
+        // mapped mirror slot.  It does NOT crash (safe_read_fast over mapped
+        // mirror memory); we only assert NO crash + the low byte is the real one,
+        // not the exact wide value (the upper 7 bytes are adjacent mirror data and
+        // are JDK-layout-dependent, so they are NOT pinned).
+        void* const ok_byte_addr{ fns::raw_addr_of("okByte") };
+        if (ok_byte_addr)
+        {
+            vmhook::field_proxy wrong{ ok_byte_addr, "J", true };
+            const auto v{ wrong.get() };
+            ctx.check("wrongsig_okByte_as_J_variant", v.data.index() == kIdxI64);
+            const std::int64_t wide = v;
+            const std::uint8_t low_byte{ static_cast<std::uint8_t>(static_cast<std::uint64_t>(wide) & 0xFFu) };
+            ctx.check("wrongsig_okByte_as_J_low_byte_is_0x7B",
+                      low_byte == static_cast<std::uint8_t>(0x7B));
+        }
+
+        // okStr (a REFERENCE field) read as "I" -> the 4 compressed-OOP bytes as
+        // an int32 (NO decode attempted on this path), non-zero, no crash.
+        void* const ok_str_addr{ fns::raw_addr_of("okStr") };
+        if (ok_str_addr)
+        {
+            vmhook::field_proxy wrong{ ok_str_addr, "I", true };
+            const auto v{ wrong.get() };
+            ctx.check("wrongsig_okStr_as_I_variant", v.data.index() == kIdxI32);
+            const std::int32_t raw = v;
+            ctx.check("wrongsig_okStr_as_I_nonzero", raw != 0);  // "ok" is interned -> non-null OOP
+        }
+
+        // CONTRAST: every real field still reads its real value (all wrong-sig
+        // reads were non-mutating over valid addresses).
+        ctx.check("post_wrongsig_wide_okInt_intact", fns::get_ok_int() == 1234);
+        ctx.check("post_wrongsig_wide_canary_intact", fns::get_canary() == kCanaryInt);
+        ctx.check("post_wrongsig_wide_okStr_intact", fns::get_ok_str() == "ok");
+    }
+
+    // =====================================================================
+    //  18. Degenerate names on a LIVE instance wrapper — phase 6 proved the
+    //      null-oop wrapper handles absent names; this proves the LIVE-instance
+    //      get_field(name) path is equally robust to empty / long / garbage /
+    //      whitespace names (the find_field miss happens before any instance
+    //      deref, so it is nullopt regardless of the live oop), while a real
+    //      instance field STILL resolves on the same wrapper.
+    // =====================================================================
+    {
+        const auto inst{ fns::get_instance() };
+        if (inst)
+        {
+            ctx.check("live_instance_empty_name_nullopt",
+                      inst->field("").has_value() == false);
+            const std::string huge(2048, 'Q');
+            ctx.check("live_instance_long_name_nullopt",
+                      inst->field(huge.c_str()).has_value() == false);
+            ctx.check("live_instance_whitespace_name_nullopt",
+                      inst->field("  ").has_value() == false);
+            ctx.check("live_instance_descriptor_as_name_nullopt",
+                      inst->field("I").has_value() == false);
+            ctx.check("live_instance_method_as_name_nullopt",
+                      inst->field("getOkInt").has_value() == false);
+            // A real instance field STILL resolves on the same wrapper right after
+            // the garbage names (no cache poisoning on the instance path either).
+            ctx.check("live_instance_real_field_after_garbage",
+                      inst->field("iInt").has_value() == true);
+            // And a static field read through the live wrapper still works too.
+            {
+                const auto p{ inst->field("okStr") };
+                if (p) { ctx.check("live_instance_static_str_after_garbage", p->get().as_string() == "ok"); }
+            }
+        }
+    }
+
+    // =====================================================================
+    //  19. Null-oop wrapper reads a STATIC ARRAY / every static primitive class
+    //      via the mirror — extends phase 6 (which only read okInt / okStr) to
+    //      prove the mirror-read path works through a null-oop wrapper for EVERY
+    //      static signature class, not just int / String.
+    // =====================================================================
+    {
+        fns null_wrapper{ nullptr };
+        // Static array through the null-oop wrapper resolves + is a reference.
+        {
+            const auto p{ null_wrapper.field("okArr") };
+            ctx.check("null_oop_wrapper_static_arr_resolves", p.has_value());
+            if (p)
+            {
+                ctx.check("null_oop_wrapper_static_arr_is_reference", p->is_reference() == true);
+                ctx.check("null_oop_wrapper_static_arr_signature",
+                          std::string{ p->signature() } == "[I");
+            }
+        }
+        // Every static primitive class resolves through the null-oop wrapper and
+        // reads its baked value (the mirror is reached regardless of the null oop).
+        {
+            const auto p{ null_wrapper.field("okBool") };
+            if (p) { const bool b = p->get(); ctx.check("null_oop_wrapper_okBool_true", b == true); }
+        }
+        {
+            const auto p{ null_wrapper.field("okByte") };
+            if (p) { const std::int8_t b = p->get(); ctx.check("null_oop_wrapper_okByte_0x7B", b == static_cast<std::int8_t>(0x7B)); }
+        }
+        {
+            const auto p{ null_wrapper.field("okLong") };
+            if (p) { const std::int64_t l = p->get(); ctx.check("null_oop_wrapper_okLong", l == 0x0123456789ABCDEFLL); }
+        }
+        {
+            const auto p{ null_wrapper.field("okDouble") };
+            if (p)
+            {
+                const double d = p->get();
+                std::uint64_t bits{};
+                std::memcpy(&bits, &d, sizeof(bits));
+                ctx.check("null_oop_wrapper_okDouble_pi_bits", bits == 0x400921FB54442D18ULL);
+            }
+        }
+    }
+
+    // =====================================================================
     //  11. RUNTIME — drive the probe (genuine putstatic on okInt) and prove the
     //      VALID read path reflects live, post-dispatch JVM state EVEN AFTER all
     //      the degenerate calls above.  This is the positive proof that none of
