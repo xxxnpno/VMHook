@@ -71,6 +71,8 @@ public final class MethodStaticCall
     public static volatile long   recordedTwoSlotLong;     // long  arg of (long,double)
     public static volatile double recordedTwoSlotDouble;   // double arg of (long,double)
     public static volatile int    recordedObjSeed;         // seed read off an object arg
+    public static volatile boolean recordedBoolArg;        // bool arg (1 slot, written as int 0/1)
+    public static volatile float   recordedFloatArg;       // float arg (1 slot, IEEE-exact bits)
 
     /** Counts how many times any static recorder ran (allow-through proof). */
     public static volatile int    staticRecorderHits;
@@ -173,6 +175,30 @@ public final class MethodStaticCall
 
     /** Echoes a String argument straight back (object/reference arg shape). */
     public static String sEchoString(final String v) { return v; }
+
+    /**
+     * Records a boolean arg (one interpreter slot, the JVM writes the value as a
+     * full int 0/1) at slot 0 — no receiver shift.  Returns it so the native side
+     * can assert both the return value and the recorded field.
+     */
+    public static boolean sEchoBool(final boolean v)
+    {
+        recordedBoolArg = v;
+        ++staticRecorderHits;
+        return v;
+    }
+
+    /**
+     * Records a float arg (one interpreter slot) at slot 0 — no receiver shift.
+     * Returns it so the native side can assert IEEE-exact bits (not a value that
+     * may differ after a float-double-float widening round trip).
+     */
+    public static float sEchoFloat(final float v)
+    {
+        recordedFloatArg = v;
+        ++staticRecorderHits;
+        return v;
+    }
 
     /** Records a long arg (2 slots) at slot 0 — no receiver shift. Returns it. */
     public static long sRecordLong(final long v)
@@ -282,108 +308,6 @@ public final class MethodStaticCall
     public static int sNum(final double v) { return NUM_DOUBLE; }
 
     // ======================================================================
-    //  NARROW-PRIMITIVE argument echoes — the remaining JVM primitive
-    //  descriptors that the native arg-converter maps but the original
-    //  module never exercised AS ARGUMENTS: boolean (Z), byte (B), char (C),
-    //  short (S), float (F).  Each records the arg it ACTUALLY saw at slot 0
-    //  AND returns it; a phantom receiver would shift the value or mis-decode.
-    // ======================================================================
-
-    public static volatile boolean recordedBoolArg;
-    public static volatile int     recordedByteArg;   // widened so native reads it back exactly
-    public static volatile int     recordedCharArg;   // char widened to int (0..65535)
-    public static volatile int     recordedShortArg;
-    public static volatile float   recordedFloatArg;
-
-    /** Echoes a boolean argument (descriptor Z); records what slot 0 held. */
-    public static boolean sEchoBool(final boolean v)
-    {
-        recordedBoolArg = v;
-        ++staticRecorderHits;
-        return v;
-    }
-
-    /** Echoes a byte argument (descriptor B); records the sign-correct value. */
-    public static byte sEchoByte(final byte v)
-    {
-        recordedByteArg = v;
-        ++staticRecorderHits;
-        return v;
-    }
-
-    /** Echoes a char argument (descriptor C); records the unsigned 0..65535 value. */
-    public static char sEchoChar(final char v)
-    {
-        recordedCharArg = v;
-        ++staticRecorderHits;
-        return v;
-    }
-
-    /** Echoes a short argument (descriptor S); records the signed value. */
-    public static short sEchoShort(final short v)
-    {
-        recordedShortArg = v;
-        ++staticRecorderHits;
-        return v;
-    }
-
-    /** Echoes a float argument (descriptor F); records it for a raw-bit compare. */
-    public static float sEchoFloat(final float v)
-    {
-        recordedFloatArg = v;
-        ++staticRecorderHits;
-        return v;
-    }
-
-    /**
-     * Returns the length (in UTF-16 code units) of its String argument, so the
-     * native side can prove an interior-NUL or astral-scalar String survived the
-     * length-counted UTF-16 arg encoder without being truncated at a NUL.
-     */
-    public static int sStringLen(final String v) { return v == null ? -1 : v.length(); }
-
-    /** Concatenates two String args back-to-back (two reference slots, no receiver). */
-    public static String sConcat(final String a, final String b)
-    {
-        return (a == null ? "<null>" : a) + (b == null ? "<null>" : b);
-    }
-
-    // ---- String returns at extra boundaries ------------------------------
-
-    /** A String whose content is exactly one embedded NUL between two letters. */
-    public static String sStringInteriorNul() { return "a\u0000b"; }
-
-    /** A String carrying an astral (supplementary-plane) scalar: U+1F600. */
-    public static String sStringAstral() { return "x\uD83D\uDE00y"; }
-
-    // ======================================================================
-    //  FULL-PRIMITIVE overload family — sPrim(...) carries a DISTINCT sentinel
-    //  for every JVM primitive parameter kind (Z B C S I J F D).  The native
-    //  side resolves each by the C++ argument TYPE on the portable static path;
-    //  the narrow kinds (Z B C S F) are exactly the descriptors the original
-    //  sOver/sNum families never disambiguated.  Distinct sentinels prove WHICH
-    //  overload ran — a mis-pick into the wrong primitive kind would mismatch.
-    // ======================================================================
-
-    public static final int PRIM_BOOL   = 8001;
-    public static final int PRIM_BYTE   = 8002;
-    public static final int PRIM_CHAR   = 8003;
-    public static final int PRIM_SHORT  = 8004;
-    public static final int PRIM_INT    = 8005;
-    public static final int PRIM_LONG   = 8006;
-    public static final int PRIM_FLOAT  = 8007;
-    public static final int PRIM_DOUBLE = 8008;
-
-    public static int sPrim(final boolean v) { return PRIM_BOOL; }
-    public static int sPrim(final byte v)    { return PRIM_BYTE; }
-    public static int sPrim(final char v)    { return PRIM_CHAR; }
-    public static int sPrim(final short v)   { return PRIM_SHORT; }
-    public static int sPrim(final int v)     { return PRIM_INT; }
-    public static int sPrim(final long v)    { return PRIM_LONG; }
-    public static int sPrim(final float v)   { return PRIM_FLOAT; }
-    public static int sPrim(final double v)  { return PRIM_DOUBLE; }
-
-    // ======================================================================
     //  INSTANCE methods — only to prove is_static()==FALSE for non-static via
     //  the portable path (get_method through the live receiver).
     // ======================================================================
@@ -421,9 +345,6 @@ public final class MethodStaticCall
                 recordedTwoSlotDouble = 0.0d;
                 recordedObjSeed       = 0;
                 recordedBoolArg       = false;
-                recordedByteArg       = 0;
-                recordedCharArg       = 0;
-                recordedShortArg      = 0;
                 recordedFloatArg      = 0.0f;
 
                 final MethodStaticCall instance = new MethodStaticCall();
