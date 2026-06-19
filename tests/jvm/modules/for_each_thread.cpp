@@ -353,17 +353,21 @@ namespace
         }
     }
 
-    // Cross-path round-trip: every enumerated (ptr, tid) identity must resolve
-    // back to a non-null, valid JavaThread through find_java_thread_by_os_thread_id
-    // — a DIFFERENT walk that shares the OSThread-id decode.  Returns the count of
-    // identities that round-tripped to a valid pointer (so the caller can assert
-    // ALL of them did).  Each lookup is itself bounded (the finder caps at 4096),
-    // so this is crash- and hang-safe.  We do NOT require the resolved pointer to
-    // EQUAL the enumerated pointer: the finder returns the FIRST thread whose tid
-    // matches, and on the (degenerate) chance two live threads ever share a
-    // zero-extended 32-bit tid slot the finder could pick the other one — so the
-    // load-bearing, decode-validating invariant is "resolves to SOME valid live
-    // thread", recorded alongside how many also pointer-matched exactly.
+    // Cross-path round-trip TALLY: how many enumerated (ptr, tid) identities
+    // resolve back to a non-null, valid JavaThread through
+    // find_java_thread_by_os_thread_id — a DIFFERENT walk that shares the
+    // OSThread-id decode.  Each lookup is itself bounded (the finder caps at 4096),
+    // so this is crash- and hang-safe.  The caller uses this for an [INFO] resolve
+    // RATE only — it is NOT safe to assert resolved == total, because the
+    // enumeration is a snapshot and the resolve is a later walk: TRANSIENT JVM
+    // threads (JIT/GC/service daemons, JDK 21+ virtual-thread carriers) legitimately
+    // EXIT between the two, so a tid that was live at snapshot can be gone at resolve
+    // through no fault of the decode.  The stable-thread round-trip (the current
+    // thread, alive for the whole test) is what the caller hard-asserts instead.
+    // We also do NOT require the resolved pointer to EQUAL the enumerated pointer:
+    // the finder returns the FIRST thread whose tid matches, and on the (degenerate)
+    // chance two live threads ever share a zero-extended 32-bit tid slot the finder
+    // could pick the other one — so pointer_matched is recorded for info too.
     struct roundtrip_tally
     {
         std::size_t resolved{ 0 };       // tid resolved to a non-null valid thread
@@ -1069,40 +1073,103 @@ VMHOOK_JVM_MODULE(for_each_thread)
     }
 
     // =====================================================================
-    // PART H — CROSS-PATH OS-TID ROUND-TRIP (NEW): every enumerated identity's
-    //   os_thread_id must resolve back to a non-null, valid JavaThread through
+    // PART H — CROSS-PATH OS-TID ROUND-TRIP (NEW): an enumerated identity's
+    //   os_thread_id should resolve back to a non-null, valid JavaThread through
     //   find_java_thread_by_os_thread_id — a DIFFERENT walk (Path-1 list scan +
     //   Path-2 SMR fallback) that shares only the OSThread-id DECODE.  This is the
     //   strongest portable proof the OSThread chain decoded a REAL, resolvable OS
     //   thread id (Part B already proved it is merely non-zero): a tid that no
     //   second walk can find would be a decode artifact, not a live thread.  Each
     //   lookup is itself bounded (the finder caps at 4096), so this stays crash-
-    //   and hang-safe.  UNIVERSAL: 100% of nonzero tids must resolve.  The exact-
-    //   pointer match rate is recorded as [INFO] — the finder returns the FIRST
-    //   tid match and a (degenerate) shared zero-extended 32-bit slot could pick a
-    //   sibling, so "resolves to SOME valid thread" is the hard invariant.
+    //   and hang-safe.
+    //
+    //   HARDENING (cross-toolchain, the batch-12 [for_each_thread fix pending]):
+    //   "100% of enumerated tids resolve" is NOT a universal invariant.  The
+    //   enumeration is a SNAPSHOT; find_java_thread_by_os_thread_id is a SECOND,
+    //   later walk.  Between the two, TRANSIENT JVM threads legitimately EXIT — JIT
+    //   compiler threads (C1/C2), GC workers, the Reference Handler / Cleaner /
+    //   service daemons, and on JDK 21+ virtual-thread CARRIER threads spin up and
+    //   down continuously — so a tid that was live at snapshot can be gone by the
+    //   resolve, failing to round-trip through NO fault of the decode or the
+    //   library.  This reddened java21/24 intermittently (whichever JDK happened to
+    //   retire a thread mid-test).  So:
+    //     * HARD — the round-trip of a thread we KNOW is alive for the whole test:
+    //       the current/suite thread.  We snapshot it and immediately resolve its
+    //       tid back to the SAME JavaThread* we hold.  (Any test-created worker is
+    //       already proven to round-trip implicitly via its lifecycle in Part E;
+    //       here the current thread is the guaranteed-stable anchor.)  Part I below
+    //       independently hard-asserts current_thread_tid_resolves_to_current too.
+    //     * [INFO] — the resolve rate over the WHOLE freshly-snapshotted set and
+    //       the exact-pointer-match rate.  These vary with transient liveness, so
+    //       they are recorded (with the transient-thread explanation), never a FAIL.
+    //   We resolve over a FRESH enumeration taken right here (not the module-start
+    //   `base`, which is seconds and a whole batch spawn/drain old) so the snapshot
+    //   ↔ resolve window is as small as possible and the [INFO] rate is meaningful.
     // =====================================================================
     {
-        const roundtrip_tally rt{ roundtrip_identities(base.identities) };
-        ctx.record(std::string{ "[INFO] os-tid round-trip: " }
-                   + std::to_string(rt.resolved) + "/" + std::to_string(rt.total)
-                   + " enumerated tids resolved via find_java_thread_by_os_thread_id ("
-                   + std::to_string(rt.pointer_matched) + " also pointer-matched exactly)");
-        if (rt.total >= 1)
+        // HARD: the current/suite thread is alive for the entire test — its tid
+        // MUST round-trip back to the exact JavaThread* we hold.  This is the
+        // stable-thread round-trip that does not depend on any transient liveness.
+        if (vmhook::hotspot::current_java_thread)
         {
-            // Every nonzero enumerated tid resolves to a valid live JavaThread.
-            ctx.check("roundtrip_all_tids_resolve", rt.resolved == rt.total);
-            // A solid majority must also pointer-match exactly (a different finder
-            // path would only diverge on the degenerate shared-slot case, which is
-            // not expected on a healthy JVM); recorded if it ever dips, asserted as
-            // a conservative floor so a single odd sibling can't redden it.
-            ctx.check("roundtrip_majority_pointer_match",
-                      rt.pointer_matched * 2 >= rt.total);
+            const auto current_jt{ vmhook::hotspot::current_java_thread };
+            const enumeration h_now{ enumerate() };
+
+            vmhook::os::thread_id_t current_tid{ 0 };
+            bool current_in_enum{ false };
+            for (const thread_identity& id : h_now.identities)
+            {
+                if (id.ptr == current_jt)
+                {
+                    current_tid = id.tid;
+                    current_in_enum = true;
+                    break;
+                }
+            }
+
+            if (current_in_enum && current_tid != 0)
+            {
+                vmhook::hotspot::java_thread* const resolved{
+                    vmhook::hotspot::find_java_thread_by_os_thread_id(current_tid) };
+                // Resolves to a non-null, valid, SAME JavaThread* — the stable
+                // round-trip proof (decode + cross-path finder agree on a thread we
+                // KNOW is live for the whole test).
+                ctx.check("roundtrip_stable_current_resolves",
+                          resolved != nullptr
+                              && vmhook::hotspot::is_valid_pointer(resolved)
+                              && resolved == current_jt);
+            }
+            else
+            {
+                ctx.record("[INFO] current thread not present with a nonzero tid in the "
+                           "fresh round-trip enumeration (unexpected but non-fatal) — "
+                           "skipped roundtrip_stable_current_resolves.");
+            }
+
+            // [INFO] only: how the WHOLE fresh set round-tripped.  The remainder are
+            // transient JVM threads (JIT/GC/service/VT-carrier) that exited between
+            // this snapshot and the per-tid resolve — never a FAIL.
+            const roundtrip_tally rt{ roundtrip_identities(h_now.identities) };
+            ctx.record(std::string{ "[INFO] os-tid round-trip: " }
+                       + std::to_string(rt.resolved) + "/" + std::to_string(rt.total)
+                       + " enumerated tids re-resolved via find_java_thread_by_os_thread_id ("
+                       + std::to_string(rt.pointer_matched)
+                       + " also pointer-matched exactly); any remainder are transient "
+                         "JVM threads (JIT/GC/service/VT-carrier) that exited between "
+                         "the snapshot and the resolve — informational, not asserted.");
         }
         else
         {
-            ctx.record("[INFO] no nonzero enumerated tids to round-trip "
-                       "(baseline had none) — skipped roundtrip asserts.");
+            // No current JavaThread on the suite thread (native, non-Java thread):
+            // we have no guaranteed-stable anchor to hard-assert, so record the
+            // whole-set rate for info and skip the stable round-trip symmetrically.
+            const enumeration h_now{ enumerate() };
+            const roundtrip_tally rt{ roundtrip_identities(h_now.identities) };
+            ctx.record(std::string{ "[INFO] os-tid round-trip (no current-thread anchor): " }
+                       + std::to_string(rt.resolved) + "/" + std::to_string(rt.total)
+                       + " enumerated tids re-resolved (" + std::to_string(rt.pointer_matched)
+                       + " pointer-matched); current_java_thread is null on the suite "
+                         "thread — skipped roundtrip_stable_current_resolves.");
         }
     }
 
