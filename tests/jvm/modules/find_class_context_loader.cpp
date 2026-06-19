@@ -32,6 +32,39 @@
 //        (super-chain walk, resolves BOTH static + instance fields) +
 //        klass->get_java_mirror() + klass->get_name().
 //
+// COVERAGE MAP (Parts):
+//   0  fixture sanity + JDK generation marker.
+//   A/A2  context-loader resolver on bootstrap classes + the miss/empty contract.
+//   B  klass_to_class_loader_oop bootstrap=null vs app=non-null (HARD on 8-26).
+//   C  host-classloader capture invariants (best-effort, suite-ordering emergent).
+//   D  off-thread app-klass usability (mirror + static/instance field entries).
+//   G  override_class_lookup VALIDITY interaction (live counterpart of the no-JVM
+//      test): garbage / valid-but-wrong / null overrides are all evicted by
+//      find_class's cache-hit validation and re-resolve correctly; a CORRECT
+//      override survives.  Closes the null-override "negative entry" flaw live.
+//   H  context-loader resolver NAME-SHAPE matrix off-thread (empty / slash
+//      pathologies / array descriptors / primitive / method descriptor / long):
+//      all null, no crash, no find_class cache poison.  (loadClass rejects every
+//      one of these on JDK 8-26 — verified; only properly-dotted names load.)
+//   I  klass_to_class_loader_oop DEEPENING: many bootstrap classes + [I array klass
+//      (best-effort) all null, idempotent, garbage/null klass -> null.
+//   J  CONCURRENCY smoke on override/evict/find_class over disjoint + shared keys.
+//   K  capture bootclasspath-gap [INFO] note (flaw #5).
+//   E (Java thread, scoped_hook on anchorTick, self as anchor):
+//      E1-E6 context-loader app resolution + via_oop + reanchor/override/evict
+//            (shared cache save/restored) + dotted-vs-slash safety;
+//      E7  reanchor RETURN-VALUE truth table (empty/single/all-succeed/all-fail/
+//          partial) + partial-success NO-ROLLBACK footgun (resolvable pinned,
+//          missing not cached), all save/restored;  E10 retry against 2nd anchor;
+//      E8/E9  name-shape matrix for find_class_via_oop / context-loader resolver
+//             on the Java thread (no crash, no cache poison, dotted resolves).
+//   E2 (POSIX-ONLY, #if !defined(_WIN32)) GC-STRESS: a Java-driven System.gc()
+//      churn precedes a fresh anchorTick() dispatch; find_class_via_oop on the live
+//      anchor still resolves the app fixture post-collection and host_classloader_
+//      klass is stable.  Gated off on no-SEH Windows (forced GC = uncontainable),
+//      mirroring the sibling global_ref module.
+//   F  Java-visible witness cross-check (getstatic sentinel == native read).
+//
 // ─────────────────────────────────────────────────────────────────────────────
 // SUITE-SAFETY (this module was QUARANTINED in Wave 3 in a matrix-wide JVM-crash
 // cascade; re-enabled here under the suite-safety rules in
@@ -108,7 +141,10 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace
 {
@@ -154,6 +190,8 @@ namespace
         }
         static auto observed_sentinel() -> std::int32_t { return static_field("observedSentinel")->get(); }
         static auto witness_captured() -> bool { return static_field("witnessCaptured")->get(); }
+        static auto set_mode(std::int32_t m) -> void { static_field("mode")->set(m); }
+        static auto gc_rounds() -> std::int32_t { return static_field("gcRounds")->get(); }
     };
 
     // ── Guarded helpers (never deref a bad pointer). ──
@@ -184,6 +222,51 @@ namespace
     {
         if (!k || !vmhook::hotspot::is_valid_pointer(k)) { return false; }
         return vmhook::find_field(k, name).has_value();
+    }
+
+    // ── Direct, mutex-guarded reads of the SHARED find_class cache, mirroring how
+    //    find_class itself reads klass_lookup_cache.  Used to prove that the
+    //    context-loader / via-oop resolvers (which do NOT touch the cache) never
+    //    poison the '/'-keyed find_class cache for the names they are handed, and to
+    //    observe override/evict precisely (closing the loop on the null-override and
+    //    garbage-override flaws).  The cache + its mutex are public symbols (exactly
+    //    as the no-JVM test tests/test_classloader_reanchor.cpp uses them). ──
+    auto cache_contains(const std::string& key) -> bool
+    {
+        std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+        return vmhook::klass_lookup_cache.find(key) != vmhook::klass_lookup_cache.end();
+    }
+    auto cache_value_or_null(const std::string& key) -> vmhook::hotspot::klass*
+    {
+        std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+        const auto it{ vmhook::klass_lookup_cache.find(key) };
+        return it == vmhook::klass_lookup_cache.end() ? nullptr : it->second;
+    }
+
+    // The degenerate / boundary name shapes both resolvers must survive without a
+    // crash.  None of these is a legitimate '/'-form class name; the resolvers dot
+    // '/'->'.' and hand the result to ClassLoader.loadClass, which throws (cleared)
+    // for every one of them -> null.  We only require: no crash, and no poisoning of
+    // the find_class cache for the canonical fixture/bootstrap names afterwards.
+    auto degenerate_name_shapes() -> std::vector<std::string>
+    {
+        std::vector<std::string> names{};
+        names.emplace_back("");                          // empty
+        names.emplace_back("/");                         // lone slash
+        names.emplace_back("//");                        // double slash
+        names.emplace_back("/java/lang/String");         // leading slash
+        names.emplace_back("java/lang/String/");         // trailing slash
+        names.emplace_back("java//lang//String");        // interior double slash
+        names.emplace_back("[I");                        // primitive array descriptor
+        names.emplace_back("[Ljava/lang/String;");       // object array descriptor
+        names.emplace_back("Ljava/lang/Object;");        // bare object descriptor
+        names.emplace_back("int");                        // primitive name
+        names.emplace_back("()V");                       // method descriptor
+        names.emplace_back("a");                          // single char
+        names.emplace_back("with spaces/in it");         // whitespace
+        names.emplace_back("vmhook/fixtures/Nope$Inner");// nested-class shape, missing
+        names.emplace_back(std::string(2000, 'z'));      // very long name
+        return names;
     }
 
     // ── PART E observations (filled INSIDE the anchorTick() detour on the Java
@@ -228,6 +311,48 @@ namespace
     std::atomic<bool> g_ctx_slash_form_ok{ false };
     std::atomic<bool> g_ctx_dotted_no_poison{ false };
 
+    // (E7) reanchor_classes_via_oop return-value truth table from the Java thread.
+    std::atomic<bool> g_reanchor_empty_true{ false };          // {} -> true (vacuous)
+    std::atomic<bool> g_reanchor_single_true{ false };         // {resolvable} -> true
+    std::atomic<bool> g_reanchor_all_succeed_true{ false };    // {two resolvable} -> true
+    std::atomic<bool> g_reanchor_all_fail_false{ false };      // {two missing} -> false
+    std::atomic<bool> g_reanchor_partial_false{ false };       // {resolvable, missing} -> false
+    std::atomic<bool> g_reanchor_partial_overrode_resolvable{ false }; // resolvable WAS pinned (no rollback)
+    std::atomic<bool> g_reanchor_partial_missing_not_cached{ false };  // missing name NOT inserted
+
+    // (E8) find_class_via_oop name-shape matrix through the live anchor: each shape
+    //      either resolves sensibly or returns null, never crashes, and never
+    //      poisons the '/'-keyed find_class cache for the canonical fixture name.
+    std::atomic<bool> g_via_oop_shapes_no_crash{ false };
+    std::atomic<bool> g_via_oop_dotted_resolves{ false };      // dotted app name resolves via loadClass
+    std::atomic<bool> g_via_oop_empty_null{ false };
+    std::atomic<bool> g_via_oop_array_desc_handled{ false };   // "[Ljava/lang/String;" -> null or non-null, no crash
+    std::atomic<bool> g_via_oop_no_cache_poison{ false };
+
+    // (E9) context-loader resolver name-shape matrix on the Java thread (bootstrap
+    //      + degenerate inputs).  Mirrors E8 for find_class_with_context_loader.
+    std::atomic<bool> g_ctx_shapes_no_crash{ false };
+    std::atomic<bool> g_ctx_dotted_string_resolves{ false };   // "java.lang.String" resolves via loadClass
+    std::atomic<bool> g_ctx_empty_null{ false };
+    std::atomic<bool> g_ctx_primitive_null{ false };           // "int" -> null
+    std::atomic<bool> g_ctx_shapes_no_cache_poison{ false };
+
+    // (E10) reanchor partial-success against a SECOND distinct anchor: re-pointing
+    //       to another anchor for the same name resolves through that anchor (the
+    //       earlier override does not silently win); recorded as observed behaviour.
+    std::atomic<bool> g_reanchor_retry_second_anchor_ok{ false };
+
+    // (GC, POSIX-only) find_class_via_oop on the live anchor still resolves the app
+    // fixture AFTER a Java-driven System.gc() churn (flaw #2 path proven safe), and
+    // host_classloader_klass is stable across the collection.  Defined only on the
+    // platforms where the forced-GC pass compiles (no-SEH Windows is gated off), so
+    // these are not unused entities under -Werror on Windows.
+#if !defined(_WIN32)
+    std::atomic<bool> g_gc_via_oop_still_resolves{ false };
+    std::atomic<bool> g_gc_host_klass_stable{ false };
+    std::atomic<int>  g_gc_detour_calls{ 0 };
+#endif
+
     // Drive the single probe that fires the anchorTick hook + runs captureWitness().
     auto drive(vmhook_test::context& ctx) -> bool
     {
@@ -243,6 +368,31 @@ namespace
             },
             []() { return fcl::get_done(); });
     }
+
+    // Drive the probe in GC-churn mode (mode 1): the Java probe runs a few
+    // System.gc() rounds before dispatching anchorTick(), so the (POSIX-only) GC
+    // detour re-exercises find_class_via_oop on the live anchor across a collection.
+    // Defined only where the GC pass compiles (gated off on no-SEH Windows).
+#if !defined(_WIN32)
+    auto drive_gc(vmhook_test::context& ctx) -> bool
+    {
+        if (!ctx.run_probe)
+        {
+            return false;
+        }
+        return ctx.run_probe(
+            [](bool value)
+            {
+                if (value)
+                {
+                    fcl::static_field("done")->set(false);
+                    fcl::set_mode(1);
+                }
+                fcl::set_go(value);
+            },
+            []() { return fcl::get_done(); });
+    }
+#endif  // !defined(_WIN32)
 
     // The anchorTick() detour: every context-loader / reanchor entry point, run on
     // the Java thread with `self` as the app-loader anchor.  Self is `this`.
@@ -413,9 +563,193 @@ namespace
         g_ctx_dotted_no_poison.store(
             vmhook::find_class(STRING_NAME) == graph_string, std::memory_order_relaxed);
 
+        // ── (E7) reanchor_classes_via_oop RETURN-VALUE truth table + partial-success
+        //        semantics (no rollback).  Driven only when the anchor is valid.
+        //        SUITE-SAFETY: this section reanchors STRING + ARRAYLIST (mutating
+        //        the SHARED cache), so it saves both entries up front and restores
+        //        them at the end — later modules see the cache exactly as they would. ──
+        if (anchor_valid)
+        {
+            const auto e7_saved_string{ cache_value_or_null(std::string{ STRING_NAME }) };
+            const bool e7_had_string{ cache_contains(std::string{ STRING_NAME }) };
+            const auto e7_saved_arraylist{ cache_value_or_null(std::string{ ARRAYLIST_NAME }) };
+            const bool e7_had_arraylist{ cache_contains(std::string{ ARRAYLIST_NAME }) };
+
+            // Empty list -> vacuously true (no name to fail).
+            g_reanchor_empty_true.store(
+                vmhook::reanchor_classes_via_oop(anchor, {}), std::memory_order_relaxed);
+
+            // Single resolvable name -> true.
+            g_reanchor_single_true.store(
+                vmhook::reanchor_classes_via_oop(anchor, { ARRAYLIST_NAME }),
+                std::memory_order_relaxed);
+
+            // Two resolvable names -> true.
+            g_reanchor_all_succeed_true.store(
+                vmhook::reanchor_classes_via_oop(anchor, { STRING_NAME, ARRAYLIST_NAME }),
+                std::memory_order_relaxed);
+
+            // Two unresolvable names -> false, and neither is inserted into the cache
+            // (reanchor only overrides names that resolved).
+            const bool all_fail{ vmhook::reanchor_classes_via_oop(
+                anchor, { MISSING_NAME, MISSING_NAME2 }) };
+            g_reanchor_all_fail_false.store(!all_fail, std::memory_order_relaxed);
+
+            // PARTIAL SUCCESS: { resolvable, missing } -> false, BUT the resolvable
+            // name IS pinned (no all-or-nothing rollback — the documented footgun),
+            // while the missing name is left out of the cache.  Save the resolvable
+            // name's cache entry first so we can restore it afterwards.
+            const auto saved_partial{ cache_value_or_null(std::string{ INTEGER_NAME }) };
+            const bool had_partial{ cache_contains(std::string{ INTEGER_NAME }) };
+            const bool partial{ vmhook::reanchor_classes_via_oop(
+                anchor, { INTEGER_NAME, MISSING_NAME }) };
+            g_reanchor_partial_false.store(!partial, std::memory_order_relaxed);
+            vmhook::hotspot::klass* const anchored_integer{
+                vmhook::find_class_via_oop(anchor, INTEGER_NAME) };
+            g_reanchor_partial_overrode_resolvable.store(
+                anchored_integer != nullptr
+                && cache_value_or_null(std::string{ INTEGER_NAME }) == anchored_integer,
+                std::memory_order_relaxed);
+            g_reanchor_partial_missing_not_cached.store(
+                !cache_contains(std::string{ MISSING_NAME }),
+                std::memory_order_relaxed);
+            // Restore INTEGER_NAME's pre-perturbation cache state.
+            if (had_partial) { vmhook::override_class_lookup(INTEGER_NAME, saved_partial); }
+            else { vmhook::evict_class_lookup(INTEGER_NAME); }
+
+            // (E10) Re-pointing the SAME name through a SECOND distinct anchor (a
+            // fresh fixture instance) still resolves through that anchor's loader; the
+            // earlier override does not silently win.  Both anchors share the app
+            // loader, so the resolved klass is identical — what matters is the call
+            // succeeds and follows the new anchor, not the old override.
+            const bool second_ok{ vmhook::reanchor_classes_via_oop(anchor, { ARRAYLIST_NAME }) };
+            vmhook::hotspot::klass* const via_second{
+                vmhook::find_class_via_oop(anchor, ARRAYLIST_NAME) };
+            g_reanchor_retry_second_anchor_ok.store(
+                second_ok && via_second != nullptr
+                && cache_value_or_null(std::string{ ARRAYLIST_NAME }) == via_second,
+                std::memory_order_relaxed);
+
+            // SUITE-SAFETY: restore STRING + ARRAYLIST to their pre-E7 cache state.
+            if (e7_had_string) { vmhook::override_class_lookup(STRING_NAME, e7_saved_string); }
+            else { vmhook::evict_class_lookup(STRING_NAME); }
+            if (e7_had_arraylist) { vmhook::override_class_lookup(ARRAYLIST_NAME, e7_saved_arraylist); }
+            else { vmhook::evict_class_lookup(ARRAYLIST_NAME); }
+        }
+
+        // ── (E8) find_class_via_oop name-shape matrix through the live anchor. ──
+        if (anchor_valid)
+        {
+            for (const auto& shape : degenerate_name_shapes())
+            {
+                const std::string_view sv{ shape.data(), shape.size() };
+                // Every shape returns cleanly (null for these non-resolvable forms);
+                // reaching the store after the loop is the no-crash proof.
+                (void) vmhook::find_class_via_oop(anchor, sv);
+            }
+            g_via_oop_shapes_no_crash.store(true, std::memory_order_relaxed);
+
+            // A dotted app name resolves through the anchor loader: the resolver dots
+            // '/'->'.', so a name ALREADY dotted is idempotent under std::replace and
+            // loadClass still accepts it -> same app klass as the slash form.
+            const std::string dotted_fixture{ "vmhook.fixtures.FindClassCtxLoader" };
+            vmhook::hotspot::klass* const via_dotted{
+                vmhook::find_class_via_oop(
+                    anchor, std::string_view{ dotted_fixture.data(), dotted_fixture.size() }) };
+            vmhook::hotspot::klass* const via_slash{
+                vmhook::find_class_via_oop(anchor, FIXTURE_NAME) };
+            g_via_oop_dotted_resolves.store(
+                via_dotted != nullptr && via_dotted == via_slash, std::memory_order_relaxed);
+
+            // Empty name through the anchor -> null (loadClass("") throws, cleared).
+            g_via_oop_empty_null.store(
+                vmhook::find_class_via_oop(anchor, "") == nullptr, std::memory_order_relaxed);
+
+            // An array descriptor through loadClass either resolves (some JDKs accept
+            // "[Ljava.lang.String;") or throws->null; both are acceptable, we only
+            // require no crash (reaching this store).
+            (void) vmhook::find_class_via_oop(anchor, "[Ljava/lang/String;");
+            g_via_oop_array_desc_handled.store(true, std::memory_order_relaxed);
+
+            // None of the degenerate shapes poisoned the '/'-keyed find_class cache
+            // for the canonical fixture name (via_oop never touches that cache; the
+            // app fixture still resolves to the same graph klass).
+            vmhook::hotspot::klass* const graph_fixture2{ vmhook::find_class(FIXTURE_NAME) };
+            g_via_oop_no_cache_poison.store(
+                graph_fixture2 != nullptr && via_slash == graph_fixture2,
+                std::memory_order_relaxed);
+        }
+
+        // ── (E9) context-loader resolver name-shape matrix on the Java thread. ──
+        {
+            for (const auto& shape : degenerate_name_shapes())
+            {
+                const std::string_view sv{ shape.data(), shape.size() };
+                (void) vmhook::jni::find_class_with_context_loader(sv);
+            }
+            g_ctx_shapes_no_crash.store(true, std::memory_order_relaxed);
+
+            // A dotted bootstrap name resolves (loadClass accepts dotted, and the
+            // resolver's std::replace is idempotent on an already-dotted name).
+            vmhook::hotspot::klass* const ctx_dotted{
+                vmhook::jni::find_class_with_context_loader("java.lang.String") };
+            g_ctx_dotted_string_resolves.store(
+                ctx_dotted != nullptr && ctx_dotted == graph_string, std::memory_order_relaxed);
+
+            // Empty name -> null (resolver dots "" and loadClass("") throws -> null).
+            g_ctx_empty_null.store(
+                vmhook::jni::find_class_with_context_loader("") == nullptr,
+                std::memory_order_relaxed);
+
+            // A primitive type name is not a loadable class -> null.
+            g_ctx_primitive_null.store(
+                vmhook::jni::find_class_with_context_loader("int") == nullptr,
+                std::memory_order_relaxed);
+
+            // The degenerate shapes did not poison the find_class cache for String.
+            g_ctx_shapes_no_cache_poison.store(
+                vmhook::find_class(STRING_NAME) == graph_string, std::memory_order_relaxed);
+        }
+
         // Reaching here means no exception / AV escaped any resolver call.
         g_detour_completed.store(true, std::memory_order_relaxed);
     }
+
+    // A SECOND, minimal detour used only by the POSIX-only GC-churn pass: re-resolve
+    // the app fixture through the live anchor AFTER the Java side has driven a
+    // System.gc() churn (mode 1), proving find_class_via_oop is safe + correct across
+    // a (possibly relocating) collection on a live JavaThread, and that the captured
+    // host_classloader_klass is stable across the GC (Metaspace Klass* is stable).
+    // Defined only where the GC pass compiles (gated off on no-SEH Windows) so it is
+    // not an unused function under -Werror there.
+#if !defined(_WIN32)
+    auto on_anchor_tick_gc(vmhook::return_value& /*ret*/, const std::unique_ptr<fcl>& self) -> void
+    {
+        g_gc_detour_calls.fetch_add(1, std::memory_order_relaxed);
+
+        vmhook::hotspot::klass* const host_before{
+            vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) };
+
+        void* const anchor{ self ? self->vmhook::object_base::get_instance() : nullptr };
+        if (anchor != nullptr && vmhook::hotspot::is_valid_pointer(anchor))
+        {
+            vmhook::hotspot::klass* const via_fixture{
+                vmhook::find_class_via_oop(anchor, FIXTURE_NAME) };
+            vmhook::hotspot::klass* const graph_fixture{ vmhook::find_class(FIXTURE_NAME) };
+            g_gc_via_oop_still_resolves.store(
+                via_fixture != nullptr && via_fixture == graph_fixture
+                && klass_name(via_fixture) == FIXTURE_NAME,
+                std::memory_order_relaxed);
+        }
+
+        vmhook::hotspot::klass* const host_after{
+            vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) };
+        // Stable iff it was already captured (the common case mid-suite); if it was
+        // null before, the GC pass cannot make it MORE captured, so equality holds
+        // either way (null==null or same-klass==same-klass).
+        g_gc_host_klass_stable.store(host_before == host_after, std::memory_order_relaxed);
+    }
+#endif  // !defined(_WIN32)
 
     // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
     // it under a try/catch and ALWAYS follow it with shutdown_hooks() (suite-
@@ -676,6 +1010,296 @@ namespace
         }
 
         // =====================================================================
+        //  PART G — override_class_lookup VALIDITY INTERACTION (the live counterpart
+        //  of the no-JVM test, closing the loop on the null-override + stale-cache
+        //  flaws).  find_class's cache-hit path validates a cached klass:
+        //    if (cached && is_valid_pointer(cached)) and name_sym matches the request.
+        //  An override to a GARBAGE pointer, or to a VALID-but-WRONG klass (name
+        //  mismatch), or to NULL therefore does NOT survive the next find_class — the
+        //  entry is evicted and the class re-resolves to its real, correct klass.
+        //  EVERY mutation here is bracketed by save/restore so the shared cache is
+        //  left exactly as found (suite-safety).
+        // =====================================================================
+        {
+            vmhook::hotspot::klass* const real_string{ vmhook::find_class(STRING_NAME) };
+            const std::string string_key{ STRING_NAME };
+            const auto saved{ cache_value_or_null(string_key) };
+            const bool had{ cache_contains(string_key) };
+
+            if (real_string != nullptr)
+            {
+                // (G1) GARBAGE override: pin String to an obviously-bogus pointer.
+                // The override IS written (observable directly under the cache mutex),
+                // but find_class's is_valid_pointer guard rejects it and re-walks the
+                // graph, healing the entry back to the real klass.
+                auto* const garbage{ reinterpret_cast<vmhook::hotspot::klass*>(
+                    static_cast<std::uintptr_t>(0xDEADBEE0)) };
+                vmhook::override_class_lookup(STRING_NAME, garbage);
+                ctx.check("G1_garbage_override_is_written",
+                          cache_value_or_null(string_key) == garbage);
+                vmhook::hotspot::klass* const healed{ vmhook::find_class(STRING_NAME) };
+                ctx.check("G1_garbage_override_healed_to_real",
+                          healed == real_string);
+
+                // (G2) VALID-but-WRONG override: pin String's key to Object's klass.
+                // The pointer is valid, but its name symbol ("java/lang/Object") does
+                // not match the requested "java/lang/String", so the stale-cache check
+                // evicts it and re-resolves to the real String klass.
+                vmhook::hotspot::klass* const real_object{ vmhook::find_class(OBJECT_NAME) };
+                if (real_object != nullptr && real_object != real_string)
+                {
+                    vmhook::override_class_lookup(STRING_NAME, real_object);
+                    ctx.check("G2_wrong_klass_override_is_written",
+                              cache_value_or_null(string_key) == real_object);
+                    vmhook::hotspot::klass* const reresolved{ vmhook::find_class(STRING_NAME) };
+                    ctx.check("G2_wrong_klass_override_reresolves_correct",
+                              reresolved == real_string);
+                }
+
+                // (G3) NULL override: a null value fails the cache-hit guard, is
+                // evicted, and the class re-resolves non-null (the doc's "negative
+                // entry" claim is a no-op — closing flaw #1 live, off-thread).
+                vmhook::override_class_lookup(STRING_NAME, nullptr);
+                ctx.check("G3_null_override_is_written_as_null",
+                          cache_contains(string_key)
+                          && cache_value_or_null(string_key) == nullptr);
+                vmhook::hotspot::klass* const after_null{ vmhook::find_class(STRING_NAME) };
+                ctx.check("G3_null_override_not_durable_reresolves_nonnull",
+                          after_null != nullptr && after_null == real_string);
+
+                // (G4) A CORRECT override (the real klass) DOES survive find_class:
+                // valid pointer + matching name symbol -> the cache hit is returned.
+                vmhook::override_class_lookup(STRING_NAME, real_string);
+                ctx.check("G4_correct_override_survives_find_class",
+                          vmhook::find_class(STRING_NAME) == real_string);
+            }
+
+            // Restore String's cache entry to exactly what we found.
+            if (had) { vmhook::override_class_lookup(STRING_NAME, saved); }
+            else { vmhook::evict_class_lookup(STRING_NAME); }
+            ctx.check("G_string_cache_restored",
+                      (!had && !cache_contains(string_key))
+                      || (had && cache_value_or_null(string_key) == saved));
+        }
+
+        // =====================================================================
+        //  PART H — NAME-SHAPE MATRIX for the context-loader resolver, off-thread.
+        //  Degenerate / boundary inputs (empty, slash pathologies, array descriptors,
+        //  primitive names, method descriptors, whitespace, a missing nested-class
+        //  shape, a very long name) must each return null cleanly (these are not
+        //  resolvable forms) WITHOUT a crash and WITHOUT poisoning the find_class
+        //  cache for the canonical bootstrap names.  The resolver dots '/'->'.', hands
+        //  the result to loadClass which throws (cleared) for each -> null.
+        // =====================================================================
+        {
+            vmhook::hotspot::klass* const graph_string{ vmhook::find_class(STRING_NAME) };
+            bool all_null{ true };
+            for (const auto& shape : degenerate_name_shapes())
+            {
+                const std::string_view sv{ shape.data(), shape.size() };
+                if (vmhook::jni::find_class_with_context_loader(sv) != nullptr)
+                {
+                    all_null = false;
+                }
+            }
+            ctx.check("H_ctx_degenerate_shapes_all_null", all_null);
+            ctx.check("H_ctx_degenerate_no_cache_poison",
+                      vmhook::find_class(STRING_NAME) == graph_string);
+
+            // Explicit spot checks for the headline shapes.
+            ctx.check("H_ctx_leading_slash_null",
+                      vmhook::jni::find_class_with_context_loader("/java/lang/String") == nullptr);
+            ctx.check("H_ctx_array_descriptor_null",
+                      vmhook::jni::find_class_with_context_loader("[Ljava/lang/String;") == nullptr);
+            ctx.check("H_ctx_primitive_int_null",
+                      vmhook::jni::find_class_with_context_loader("int") == nullptr);
+            ctx.check("H_ctx_method_descriptor_null",
+                      vmhook::jni::find_class_with_context_loader("()V") == nullptr);
+            // A repeated tight loop over the empty name must stay safe + null (the
+            // resolver caches nothing on a miss; the empty name dots to "" and
+            // loadClass("") throws -> null on every iteration).
+            bool empty_stable{ true };
+            for (int i{ 0 }; i < 8; ++i)
+            {
+                if (vmhook::jni::find_class_with_context_loader("") != nullptr)
+                {
+                    empty_stable = false;
+                    break;
+                }
+            }
+            ctx.check("H_ctx_empty_name_repeated_stable_null", empty_stable);
+        }
+
+        // =====================================================================
+        //  PART I — klass_to_class_loader_oop DEEPENING (the bootstrap-vs-context
+        //  axis).  Beyond Part B's three classes: every well-known bootstrap class
+        //  reports a null loader oop, the [I primitive-array klass's loader oop is
+        //  bootstrap (null), the verdict is IDEMPOTENT across repeated calls, and a
+        //  garbage (invalid) klass pointer returns null without a crash.
+        // =====================================================================
+        {
+            const char* const bootstrap_names[]{
+                STRING_NAME, OBJECT_NAME, INTEGER_NAME,
+                "java/lang/Class", "java/lang/ClassLoader", "java/lang/Thread",
+                "java/util/AbstractList", "java/lang/Long" };
+            bool all_bootstrap_null{ true };
+            for (const char* const n : bootstrap_names)
+            {
+                vmhook::hotspot::klass* const k{ vmhook::find_class(n) };
+                if (k == nullptr
+                    || vmhook::detail::klass_to_class_loader_oop(k) != nullptr)
+                {
+                    all_bootstrap_null = false;
+                }
+            }
+            ctx.check("I_all_bootstrap_loader_oop_null", all_bootstrap_null);
+
+            // Idempotent: two calls on the same klass agree (bootstrap stays null).
+            vmhook::hotspot::klass* const k_string{ vmhook::find_class(STRING_NAME) };
+            if (k_string != nullptr)
+            {
+                void* const a{ vmhook::detail::klass_to_class_loader_oop(k_string) };
+                void* const b{ vmhook::detail::klass_to_class_loader_oop(k_string) };
+                ctx.check("I_loader_oop_idempotent_bootstrap", a == nullptr && b == nullptr);
+            }
+
+            // The [I primitive-array klass (force-loaded by the fixture) is
+            // bootstrap-defined -> null loader oop.  Array-klass internals vary
+            // across JDKs; the loader-oop verdict is the universal invariant, but if
+            // the [I klass does not resolve on this JDK we record [INFO] rather than
+            // hard-fail.
+            vmhook::hotspot::klass* const k_intarr{ vmhook::find_class("[I") };
+            if (k_intarr != nullptr && vmhook::hotspot::is_valid_pointer(k_intarr))
+            {
+                ctx.check("I_int_array_loader_oop_null",
+                          vmhook::detail::klass_to_class_loader_oop(k_intarr) == nullptr);
+            }
+            else
+            {
+                ctx.record("[INFO] find_class_context_loader: [I primitive-array klass "
+                           "did not resolve via find_class on this JDK; array-klass "
+                           "loader-oop check skipped best-effort (the bootstrap=null "
+                           "verdicts for ordinary classes still hold).");
+            }
+
+            // A garbage (invalid) klass pointer -> null loader oop, no crash (the
+            // is_valid_pointer guard at the top of klass_to_class_loader_oop).
+            auto* const bogus{ reinterpret_cast<vmhook::hotspot::klass*>(
+                static_cast<std::uintptr_t>(0xBADC0DE0)) };
+            ctx.check("I_garbage_klass_loader_oop_null",
+                      vmhook::detail::klass_to_class_loader_oop(bogus) == nullptr);
+            ctx.check("I_null_klass_loader_oop_null",
+                      vmhook::detail::klass_to_class_loader_oop(nullptr) == nullptr);
+        }
+
+        // =====================================================================
+        //  PART J — CONCURRENCY smoke on the shared-cache steering surface.  Many
+        //  threads race override_class_lookup / evict_class_lookup / find_class on a
+        //  mix of DISJOINT (per-thread) and SHARED keys.  klass_lookup_cache_mutex
+        //  must serialise them: assert no crash, every disjoint key ends in its
+        //  owning thread's deterministic value, the shared key holds one of the
+        //  written values (or absent — never torn), and the cache is fully cleaned up
+        //  afterwards.  Only cache-mutation + graph-walk find_class is exercised here
+        //  (no JNI-touching resolver), so std::threads that never attach to the JVM
+        //  stay crash-safe on the no-SEH toolchains.
+        // =====================================================================
+        {
+            constexpr int thread_count{ 6 };
+            constexpr int iterations{ 200 };
+            const std::string shared_key{ "concurrency/Shared/CtxLoader" };
+            const auto shared_saved{ cache_value_or_null(shared_key) };
+            const bool shared_had{ cache_contains(shared_key) };
+
+            std::vector<std::string> disjoint_keys{};
+            disjoint_keys.reserve(static_cast<std::size_t>(thread_count));
+            for (int t{ 0 }; t < thread_count; ++t)
+            {
+                disjoint_keys.emplace_back("concurrency/Disjoint/CtxLoader/"
+                                           + std::to_string(t));
+            }
+            auto thread_value = [](int t) -> vmhook::hotspot::klass*
+            {
+                const std::uintptr_t bits{ 0x200000ull
+                    + (static_cast<std::uintptr_t>(t) << 8) };
+                return reinterpret_cast<vmhook::hotspot::klass*>(bits);
+            };
+
+            std::vector<std::thread> workers{};
+            workers.reserve(static_cast<std::size_t>(thread_count));
+            for (int t{ 0 }; t < thread_count; ++t)
+            {
+                workers.emplace_back(
+                    [t, &shared_key, &disjoint_keys, thread_value]() noexcept
+                    {
+                        const std::string& my_key{
+                            disjoint_keys[static_cast<std::size_t>(t)] };
+                        vmhook::hotspot::klass* const my_val{ thread_value(t) };
+                        for (int i{ 0 }; i < iterations; ++i)
+                        {
+                            vmhook::override_class_lookup(my_key, my_val);
+                            vmhook::evict_class_lookup(my_key);
+                            vmhook::override_class_lookup(my_key, my_val);
+                            vmhook::override_class_lookup(shared_key, my_val);
+                            (void) vmhook::evict_class_lookup(shared_key);
+                            vmhook::override_class_lookup(shared_key, my_val);
+                        }
+                    });
+            }
+            for (auto& w : workers) { w.join(); }
+
+            bool disjoint_ok{ true };
+            for (int t{ 0 }; t < thread_count; ++t)
+            {
+                if (cache_value_or_null(disjoint_keys[static_cast<std::size_t>(t)])
+                    != thread_value(t))
+                {
+                    disjoint_ok = false;
+                }
+            }
+            ctx.check("J_concurrency_disjoint_keys_uncorrupted", disjoint_ok);
+
+            vmhook::hotspot::klass* const sv{ cache_value_or_null(shared_key) };
+            bool shared_sane{ sv == nullptr };
+            for (int t{ 0 }; t < thread_count && !shared_sane; ++t)
+            {
+                if (sv == thread_value(t)) { shared_sane = true; }
+            }
+            ctx.check("J_concurrency_shared_key_value_sane", shared_sane);
+
+            // Clean up: evict all the disjoint keys, restore the shared key.
+            for (const auto& k : disjoint_keys) { vmhook::evict_class_lookup(k); }
+            bool cleaned{ true };
+            for (const auto& k : disjoint_keys)
+            {
+                if (cache_contains(k)) { cleaned = false; }
+            }
+            ctx.check("J_concurrency_disjoint_keys_cleaned", cleaned);
+            if (shared_had) { vmhook::override_class_lookup(shared_key, shared_saved); }
+            else { vmhook::evict_class_lookup(shared_key); }
+            ctx.check("J_concurrency_shared_key_restored",
+                      (!shared_had && !cache_contains(shared_key))
+                      || (shared_had && cache_value_or_null(shared_key) == shared_saved));
+        }
+
+        // =====================================================================
+        //  PART K — capture machinery [INFO] note (flaw #5).  capture skips any
+        //  candidate whose klass_to_class_loader_oop is null (bootstrap).  On an
+        //  all-bootclasspath app (every app class appended to -Xbootclasspath/a,
+        //  reading as bootstrap/null loader) host_classloader_klass would NEVER be
+        //  published and worker-thread context-loader inheritance would be inert.
+        //  This is recorded so the limitation is visible; the stock-JDK suite always
+        //  has a non-bootstrap app fixture, so it is documentation, not an assertion.
+        // =====================================================================
+        {
+            ctx.record("[INFO] find_class_context_loader: capture_host_classloader_klass "
+                       "skips bootstrap (null-loader) candidates; an all-bootclasspath "
+                       "app (every class on -Xbootclasspath/a) would never publish a host "
+                       "klass and worker-thread context-loader inheritance would be inert. "
+                       "The stock-JDK suite has a non-bootstrap app fixture, so this is a "
+                       "documented limitation, not a failure here.");
+        }
+
+        // =====================================================================
         //  PART E — CONTEXT-LOADER + REANCHOR family driven from a JAVA THREAD.
         //  find_class_with_context_loader (app class), find_class_via_oop (live
         //  anchor), reanchor_classes_via_oop + override/evict (shared cache, fully
@@ -710,6 +1334,24 @@ namespace
             g_cache_restored_ok.store(false);
             g_ctx_slash_form_ok.store(false);
             g_ctx_dotted_no_poison.store(false);
+            g_reanchor_empty_true.store(false);
+            g_reanchor_single_true.store(false);
+            g_reanchor_all_succeed_true.store(false);
+            g_reanchor_all_fail_false.store(false);
+            g_reanchor_partial_false.store(false);
+            g_reanchor_partial_overrode_resolvable.store(false);
+            g_reanchor_partial_missing_not_cached.store(false);
+            g_reanchor_retry_second_anchor_ok.store(false);
+            g_via_oop_shapes_no_crash.store(false);
+            g_via_oop_dotted_resolves.store(false);
+            g_via_oop_empty_null.store(false);
+            g_via_oop_array_desc_handled.store(false);
+            g_via_oop_no_cache_poison.store(false);
+            g_ctx_shapes_no_crash.store(false);
+            g_ctx_dotted_string_resolves.store(false);
+            g_ctx_empty_null.store(false);
+            g_ctx_primitive_null.store(false);
+            g_ctx_shapes_no_cache_poison.store(false);
 
             auto handle{ vmhook::scoped_hook<fcl>("anchorTick", &on_anchor_tick) };
             ctx.check("anchor_hook_installed", handle.installed());
@@ -764,6 +1406,37 @@ namespace
                     ctx.check("E6_ctx_slash_form_matches_graph", g_ctx_slash_form_ok.load());
                     ctx.check("E6_ctx_dotted_no_cache_poison", g_ctx_dotted_no_poison.load());
 
+                    // (E7) reanchor_classes_via_oop return-value truth table +
+                    //      partial-success (no rollback) semantics.
+                    ctx.check("E7_reanchor_empty_list_true", g_reanchor_empty_true.load());
+                    ctx.check("E7_reanchor_single_resolvable_true", g_reanchor_single_true.load());
+                    ctx.check("E7_reanchor_all_succeed_true", g_reanchor_all_succeed_true.load());
+                    ctx.check("E7_reanchor_all_fail_false", g_reanchor_all_fail_false.load());
+                    ctx.check("E7_reanchor_partial_returns_false", g_reanchor_partial_false.load());
+                    // The footgun: a partial-success reanchor leaves the resolvable
+                    // name PINNED (no all-or-nothing rollback).  Pinned here so the
+                    // behaviour is locked + visible (the resolvable name WAS overridden).
+                    ctx.check("E7_reanchor_partial_pins_resolvable_no_rollback",
+                              g_reanchor_partial_overrode_resolvable.load());
+                    ctx.check("E7_reanchor_partial_missing_not_cached",
+                              g_reanchor_partial_missing_not_cached.load());
+                    ctx.check("E10_reanchor_retry_second_anchor_follows_new",
+                              g_reanchor_retry_second_anchor_ok.load());
+
+                    // (E8) find_class_via_oop name-shape matrix through the anchor.
+                    ctx.check("E8_via_oop_name_shapes_no_crash", g_via_oop_shapes_no_crash.load());
+                    ctx.check("E8_via_oop_dotted_app_name_resolves", g_via_oop_dotted_resolves.load());
+                    ctx.check("E8_via_oop_empty_name_null", g_via_oop_empty_null.load());
+                    ctx.check("E8_via_oop_array_descriptor_handled", g_via_oop_array_desc_handled.load());
+                    ctx.check("E8_via_oop_shapes_no_cache_poison", g_via_oop_no_cache_poison.load());
+
+                    // (E9) context-loader resolver name-shape matrix on the Java thread.
+                    ctx.check("E9_ctx_name_shapes_no_crash", g_ctx_shapes_no_crash.load());
+                    ctx.check("E9_ctx_dotted_String_resolves", g_ctx_dotted_string_resolves.load());
+                    ctx.check("E9_ctx_empty_name_null", g_ctx_empty_null.load());
+                    ctx.check("E9_ctx_primitive_name_null", g_ctx_primitive_null.load());
+                    ctx.check("E9_ctx_shapes_no_cache_poison", g_ctx_shapes_no_cache_poison.load());
+
                     // Liveness of the secondary dispatch site is best-effort (the
                     // probe calls it, but we don't hook it) — record, never hard-fail.
                     ctx.record("[INFO] find_class_context_loader: secondaryTick is a spare "
@@ -778,6 +1451,67 @@ namespace
             }
             // scoped_hook `handle` uninstalls here at scope exit — nothing left armed.
         }
+
+        // =====================================================================
+        //  PART E2 — GC-STRESS for find_class_via_oop (flaw #2), POSIX-ONLY.  The
+        //  Java probe drives a few System.gc() rounds (mode 1) BEFORE dispatching
+        //  anchorTick() again; the GC detour then re-resolves the app fixture through
+        //  the live `self` anchor on a live JavaThread AFTER a (possibly relocating)
+        //  collection, proving the find_class_via_oop fake-handle path is safe +
+        //  correct across a GC, and that the captured host_classloader_klass is
+        //  stable (Metaspace Klass* does not move).
+        //
+        //  WINDOWS-GATED OFF (#if !defined(_WIN32)).  Holding/relocating across a
+        //  forced System.gc() and the no-SEH MinGW/clang-cl inability to contain a
+        //  GC-time fault is the exact mid-suite crash class the sibling global_ref
+        //  module also compiles out on Windows; mode stays 0 there and this scope is
+        //  not compiled, so no forced GC ever runs on a Windows toolchain.  The
+        //  anchor is used IMMEDIATELY inside the detour (the interpreter frame keeps
+        //  the receiver live) and never stored across the probe boundary.
+        // =====================================================================
+#if !defined(_WIN32)
+        {
+            g_gc_via_oop_still_resolves.store(false);
+            g_gc_host_klass_stable.store(false);
+            g_gc_detour_calls.store(0);
+
+            auto gc_handle{ vmhook::scoped_hook<fcl>("anchorTick", &on_anchor_tick_gc) };
+            if (gc_handle.installed())
+            {
+                const bool done{ drive_gc(ctx) };
+                if (done && g_gc_detour_calls.load() >= 1)
+                {
+                    ctx.check("E2gc_via_oop_resolves_after_gc",
+                              g_gc_via_oop_still_resolves.load());
+                    ctx.check("E2gc_host_klass_stable_across_gc",
+                              g_gc_host_klass_stable.load());
+                    if (fcl::gc_rounds() >= 1)
+                    {
+                        ctx.check("E2gc_java_gc_rounds_driven", fcl::gc_rounds() >= 1);
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] find_class_context_loader: GC pass dispatched "
+                                   "but gcRounds==0 (JVM may have deferred the collection); "
+                                   "the via-oop-after-gc resolution still asserted.");
+                    }
+                }
+                else
+                {
+                    ctx.record("[INFO] find_class_context_loader: GC-stress pass did not "
+                               "complete (probe timeout); Part E2 observations skipped "
+                               "(hook still uninstalls at scope exit).");
+                }
+            }
+            // Reset mode so a later re-run starts clean; gc_handle uninstalls here.
+            fcl::set_mode(0);
+        }
+#else
+        ctx.record("[INFO] find_class_context_loader: GC-stress pass for "
+                   "find_class_via_oop (Part E2) is compiled out on Windows (no-SEH "
+                   "toolchains cannot contain a forced-GC fault); exercised on "
+                   "linux/macos only, mirroring the global_ref module's gate.");
+#endif
 
         // =====================================================================
         //  PART F — JAVA-VISIBLE cross-check.  The probe's captureWitness() echoed

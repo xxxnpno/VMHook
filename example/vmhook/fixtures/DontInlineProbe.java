@@ -48,8 +48,17 @@ public final class DontInlineProbe
      *   3 = GC churn (allocate garbage + System.gc()) then call hot() ONCE
      *       (characterise whether the flags survive a collection / safepoint)
      *   4 = call hot() ONCE       (post-teardown / post-repair re-check)
+     *   5 = call hot(callDelta) ONCE using the native-supplied `callDelta`
+     *       (edge-value arg decode: 0 / -1 / MIN / MAX through the i2i patch)
      */
     public static volatile int mode;
+
+    /**
+     * The delta the native side wants mode 5 to feed hot().  Set BEFORE `go` so
+     * one probe cycle drives exactly the boundary value about to be asserted on.
+     * Modes 1/3/4 ignore this and use the fixed HOT_DELTA.
+     */
+    public static volatile int callDelta;
 
     /** Seed for the hot() instance method; hot(delta) returns seed + delta. */
     private int seed = SEED;
@@ -127,6 +136,21 @@ public final class DontInlineProbe
         hotCallsMade = made;
     }
 
+    private static void runHotEdge(final int delta)
+    {
+        // Mode 5: identical shape to runHotOnce but with a caller-chosen delta,
+        // so the native side can drive boundary int values (0, -1, MIN, MAX)
+        // through the i2i interpreter patch and assert the detour decodes each
+        // exactly and the allow-through body computes seed + delta (with the
+        // usual two's-complement wraparound for MIN/MAX).
+        final DontInlineProbe obj = new DontInlineProbe();
+        obj.seed = SEED;
+        final int r = obj.hot(delta);
+        lastHotResult = r;
+        hotResultXor = r;
+        hotCallsMade = 1;
+    }
+
     private static void runGcThenHot(final int delta)
     {
         // Force GC churn so the native side can check whether the Method flags
@@ -175,6 +199,9 @@ public final class DontInlineProbe
                         break;
                     case 4:
                         runHotOnce(HOT_DELTA);
+                        break;
+                    case 5:
+                        runHotEdge(DontInlineProbe.callDelta);
                         break;
                     default:
                         break;

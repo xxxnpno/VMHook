@@ -83,6 +83,13 @@ namespace
         static auto get_inject_seen() -> std::string         { std::string x = static_field("injectSeen")->get(); return x; }
         static auto get_inject_nonempty_count() -> std::int32_t { std::int32_t x = static_field("injectNonEmptyCount")->get(); return x; }
         static auto get_inject_iterations() -> std::int32_t  { std::int32_t x = static_field("INJECT_ITERATIONS")->get(); return x; }
+
+        // injectMixed() loop observables (set_arg union-aliasing path).
+        static auto get_inject_mixed_count() -> std::int32_t     { std::int32_t x = static_field("injectMixedCount")->get(); return x; }
+        static auto get_inject_mixed_seen() -> std::string       { std::string x = static_field("injectMixedSeen")->get(); return x; }
+        static auto get_inject_mixed_int_seen() -> std::int32_t  { std::int32_t x = static_field("injectMixedIntSeen")->get(); return x; }
+        static auto get_inject_mixed_ok_count() -> std::int32_t  { std::int32_t x = static_field("injectMixedOkCount")->get(); return x; }
+        static auto get_inject_mixed_int() -> std::int32_t       { std::int32_t x = static_field("INJECT_MIXED_INT")->get(); return x; }
     };
 
     // ── Captured observations: the detour writes, the module body reads. ──────
@@ -126,8 +133,71 @@ namespace
     std::atomic<int> g_mix_loop_iters{ 0 };
     std::atomic<int> g_mix_loop_failures{ -1 };
 
+    // PRIMITIVE-ARG loop (echoInt): the int's jvalue cell aliases .l as a wild
+    // pointer; needs_release stays false so it is NEVER handed to DeleteLocalRef.
+    // No local ref is created at all, so a stable echo is the union-aliasing proof.
+    std::atomic<int> g_int_loop_iters{ 0 };
+    std::atomic<int> g_int_loop_mismatches{ -1 };
+
+    // TWO-WORD primitive-arg loop (echoLong): .j bits alias .l as a wild pointer.
+    std::atomic<int> g_long_loop_iters{ 0 };
+    std::atomic<int> g_long_loop_mismatches{ -1 };
+
+    // BOOLEAN-arg loop (echoBool): .z == 1 aliases .l as 0x1 (low non-null ptr).
+    std::atomic<int> g_bool_loop_iters{ 0 };
+    std::atomic<int> g_bool_loop_mismatches{ -1 };
+
+    // MIXED-arg loop (echoMixed: String slot released, int slot NOT): only the
+    // String slot's NewStringUTF ref is released; the primitive slot's tag stays
+    // false. Both args must arrive intact every iteration.
+    std::atomic<int> g_mixed_loop_iters{ 0 };
+    std::atomic<int> g_mixed_loop_mismatches{ -1 };
+
+    // TWO-String-arg loop (concat: 2 NewStringUTF refs + 1 result = 3 refs/iter).
+    std::atomic<int> g_concat_loop_iters{ 0 };
+    std::atomic<int> g_concat_loop_mismatches{ -1 };
+
+    // OBJECT-arg loop (echoObj: synthetic handle arg must NOT be released + the
+    // Object-return ref must be). Decoded non-null on every iteration.
+    std::atomic<int> g_objarg_loop_iters{ 0 };
+    std::atomic<int> g_objarg_loop_nonnull{ -1 };
+
+    // NULL-String-arg loop (nullArgLen: null C string -> Java null, no ref, no
+    // release). Every iteration must return -1 (the body saw null).
+    std::atomic<int> g_nullarg_loop_iters{ 0 };
+    std::atomic<int> g_nullarg_loop_mismatches{ -1 };
+
+    // EMPTY-String-arg loop (echo with ""): a non-null empty arg becomes a real
+    // empty Java String (a NewStringUTF ref to release), distinct from Java null.
+    std::atomic<int> g_emptyarg_loop_iters{ 0 };
+    std::atomic<int> g_emptyarg_loop_mismatches{ -1 };
+
+    // STATIC String-arg echo loop (staticEcho: FindClass ref + NewStringUTF arg
+    // ref + result ref = 3 refs/iter on the static path).
+    std::atomic<int> g_secho_loop_iters{ 0 };
+    std::atomic<int> g_secho_loop_mismatches{ -1 };
+
     // Post-loop sanity: a single call AFTER every loop still works.
     std::atomic<bool> g_post_loop_str_ok{ false };
+
+    // set_arg union-aliasing loop driven by the injectMixed() hook.
+    std::atomic<int> g_inject_mixed_hook_calls{ 0 };
+    std::atomic<int> g_inject_mixed_str_ok{ 0 };
+    std::atomic<int> g_inject_mixed_int_ok{ 0 };
+
+    const std::string k_empty_payload{ "" };
+    const std::string k_concat_a{ "concat-A-" };
+    const std::string k_concat_b{ "concat-B-end" };
+    const std::string k_mixed_payload{ "mixed-arg-str" };
+    const std::int32_t k_mixed_n{ 424242 };
+    const std::int64_t k_long_payload{ static_cast<std::int64_t>(0x4242424242424242LL) };
+    const std::string k_inject_mixed_payload{ "set-arg-mixed-loop" };
+
+    // The exact int the injectMixed hook injects into slot 2. Must match the
+    // fixture's JniLocalRef.INJECT_MIXED_INT (asserted at runtime via
+    // get_inject_mixed_int()). A compile-time constant (not a captured value) so
+    // the stateless hook lambda can reference it.
+    constexpr std::int32_t JLR_MIXED_INT{ 1337 };
 
     // set_arg(String) loop driven by the inject() hook.
     std::atomic<int>  g_inject_hook_calls{ 0 };
@@ -406,6 +476,231 @@ namespace
             g_mix_loop_failures.store(failures);
         }
 
+        constexpr int kPrim = 160;  // primitive / object / null / empty arg loops
+
+        // ── PRIMITIVE-ARG loop (echoInt): union-aliasing discriminator ────────
+        // The int arg's jvalue cell aliases the union's .l as a non-null wild
+        // pointer. vmhook's per-slot needs_release tag must stay false so the
+        // arg-cleanup RAII never hands it to DeleteLocalRef. No local ref is
+        // created on this path, so a stable echo across the loop is the proof
+        // that no spurious release fired (a bad release would crash / corrupt,
+        // and a phantom leak cannot exist here — the control case).
+        {
+            auto proxy{ s.get_method("echoInt") };
+            int mism{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                if (!proxy.has_value())
+                {
+                    mism = kPrim;
+                    break;
+                }
+                // copy-init via value_t's conversion operator (no as_int()).
+                std::int32_t r = proxy->call(i);
+                if (r != i)
+                {
+                    ++mism;
+                }
+            }
+            g_int_loop_iters.store(kPrim);
+            g_int_loop_mismatches.store(mism);
+        }
+
+        // ── TWO-WORD primitive-arg loop (echoLong): .j aliases .l as a wild ptr ─
+        // 0x4242424242424242 as a jlong: if vmhook ever read .l back to classify
+        // the slot it would DeleteLocalRef this garbage address. Stable echo of
+        // the exact 64-bit value proves the long slot was left untouched.
+        {
+            auto proxy{ s.get_method("echoLong") };
+            int mism{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                if (!proxy.has_value())
+                {
+                    mism = kPrim;
+                    break;
+                }
+                std::int64_t r = proxy->call(k_long_payload);  // copy-init
+                if (r != k_long_payload)
+                {
+                    ++mism;
+                }
+            }
+            g_long_loop_iters.store(kPrim);
+            g_long_loop_mismatches.store(mism);
+        }
+
+        // ── BOOLEAN-arg loop (echoBool): .z == 1 aliases .l as 0x1 ────────────
+        // jboolean true -> .z byte 0x01, which aliases .l as the pointer 0x1: a
+        // low, non-null value a naive null-check passes straight to
+        // DeleteLocalRef. needs_release must still be false. Echo returns 1.
+        {
+            auto proxy{ s.get_method("echoBool") };
+            int mism{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                if (!proxy.has_value())
+                {
+                    mism = kPrim;
+                    break;
+                }
+                std::int32_t r = proxy->call(true);  // copy-init
+                if (r != 1)
+                {
+                    ++mism;
+                }
+            }
+            g_bool_loop_iters.store(kPrim);
+            g_bool_loop_mismatches.store(mism);
+        }
+
+        // ── MIXED-arg loop (echoMixed: String slot released, int slot NOT) ────
+        // Only slot 1 (the String, a NewStringUTF local ref) is tagged for
+        // release; slot 2 (the int) must keep needs_release false. A starved
+        // table (missing String release) yields a truncated / empty result; a
+        // bad primitive-slot release crashes. Both args must arrive every iter.
+        {
+            auto proxy{ s.get_method("echoMixed") };
+            const std::string want{ k_mixed_payload + ":" + std::to_string(k_mixed_n) };
+            int mism{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                if (!proxy.has_value())
+                {
+                    mism = kPrim;
+                    break;
+                }
+                if (proxy->call(k_mixed_payload, k_mixed_n).as_string() != want)
+                {
+                    ++mism;
+                }
+            }
+            g_mixed_loop_iters.store(kPrim);
+            g_mixed_loop_mismatches.store(mism);
+        }
+
+        // ── TWO-String-arg loop (concat: 3 refs/iter) ─────────────────────────
+        // Two NewStringUTF arg refs (slots 1+2) + the returned String ref. The
+        // table starves THREE times as fast if any release is missing; the
+        // concatenation must equal a+b every iteration.
+        {
+            auto proxy{ s.get_method("concat") };
+            const std::string want{ k_concat_a + k_concat_b };
+            int mism{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                if (!proxy.has_value())
+                {
+                    mism = kPrim;
+                    break;
+                }
+                if (proxy->call(k_concat_a, k_concat_b).as_string() != want)
+                {
+                    ++mism;
+                }
+            }
+            g_concat_loop_iters.store(kPrim);
+            g_concat_loop_mismatches.store(mism);
+        }
+
+        // ── OBJECT-arg loop (echoObj): synthetic handle arg NOT released ──────
+        // The receiver is passed as an object arg: write_jni_arg_to_slot points
+        // value.l at &handle_storage[i] (a self-pointer), leaving needs_release
+        // false — the arg-cleanup must NOT DeleteLocalRef it (deleting the stack
+        // cell's address is the synthetic-handle footgun). The Object RETURN ref
+        // still must be released. Decoded non-null on every iteration.
+        {
+            auto proxy{ s.get_method("echoObj") };
+            int nonnull{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                if (!proxy.has_value())
+                {
+                    nonnull = -1;
+                    break;
+                }
+                std::unique_ptr<jni_local_ref> w = proxy->call(self);  // copy-init (MSVC C2440)
+                if (w)
+                {
+                    ++nonnull;
+                }
+            }
+            g_objarg_loop_iters.store(kPrim);
+            g_objarg_loop_nonnull.store(nonnull);
+        }
+
+        // ── NULL-String-arg loop (nullArgLen): null C string -> Java null ─────
+        // A null const char* maps to Java null with NO NewStringUTF and
+        // needs_release false — the arg-cleanup must skip it. The body sees null
+        // and returns -1 every iteration (a leak/overflow cannot manifest here
+        // since no ref is created, so this pins the no-ref / no-release path).
+        {
+            auto proxy{ s.get_method("nullArgLen") };
+            int mism{ 0 };
+            const char* const null_str{ nullptr };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                if (!proxy.has_value())
+                {
+                    mism = kPrim;
+                    break;
+                }
+                std::int32_t r = proxy->call(null_str);  // copy-init
+                if (r != -1)
+                {
+                    ++mism;
+                }
+            }
+            g_nullarg_loop_iters.store(kPrim);
+            g_nullarg_loop_mismatches.store(mism);
+        }
+
+        // ── EMPTY-String-arg loop (echo with ""): real empty Java String ──────
+        // A non-null empty "" becomes a REAL empty Java String (a NewStringUTF
+        // local ref to release), distinct from Java null. The echo round-trips
+        // to "" every iteration; the arg ref is released each time.
+        {
+            auto proxy{ s.get_method("echo") };
+            int mism{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                if (!proxy.has_value())
+                {
+                    mism = kPrim;
+                    break;
+                }
+                if (!proxy->call(k_empty_payload).as_string().empty())
+                {
+                    ++mism;
+                }
+            }
+            g_emptyarg_loop_iters.store(kPrim);
+            g_emptyarg_loop_mismatches.store(mism);
+        }
+
+        // ── STATIC String-arg echo loop (staticEcho: 3 refs/iter, static path) ─
+        // The harshest static case: FindClass jclass ref + NewStringUTF arg ref
+        // + CallStaticObjectMethodA result ref, all per dispatch. Every echo
+        // must round-trip to the payload.
+        {
+            auto proxy{ jni_local_ref::static_method("staticEcho") };
+            int mism{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                if (!proxy.has_value())
+                {
+                    mism = kPrim;
+                    break;
+                }
+                if (proxy->call(k_echo_payload).as_string() != k_echo_payload)
+                {
+                    ++mism;
+                }
+            }
+            g_secho_loop_iters.store(kPrim);
+            g_secho_loop_mismatches.store(mism);
+        }
+
         // ── POST-LOOP sanity: a single String call after all the loops works ──
         // Hundreds of allocate+release cycles later, the table is healthy and a
         // fresh dispatch still decodes its String.
@@ -464,8 +759,37 @@ VMHOOK_JVM_MODULE(jni_local_ref_hygiene)
                 }
             }) };
 
+        // Hook 3: injectMixed(String,int) — each dispatch the detour injects BOTH
+        // a fresh String into slot 1 (set_arg routes through NewStringUTF +
+        // DeleteLocalRef) AND a primitive int into slot 2 (set_arg's primitive
+        // path: NO NewStringUTF, NO DeleteLocalRef — a primitive jvalue cell must
+        // never be handed to DeleteLocalRef, the union-aliasing footgun). Driven
+        // far past the 16-slot table, this pins both the String-release discipline
+        // and the no-release-for-primitives discipline of set_arg simultaneously.
+        auto h_inject_mixed{ vmhook::scoped_hook<jni_local_ref>(
+            "injectMixed", "(Ljava/lang/String;I)V",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<jni_local_ref>&,
+               const std::string& /*original*/,
+               std::int32_t /*n*/)
+            {
+                g_inject_mixed_hook_calls.fetch_add(1, std::memory_order_relaxed);
+                if (ret.set_arg(1, std::string_view{ k_inject_mixed_payload }))
+                {
+                    g_inject_mixed_str_ok.fetch_add(1, std::memory_order_relaxed);
+                }
+                // Primitive set_arg: slot 2 is the int. No local ref is created
+                // here, so nothing must be released; a stable readback proves the
+                // primitive path never mis-fired DeleteLocalRef on a union cell.
+                if (ret.set_arg(2, static_cast<std::int32_t>(JLR_MIXED_INT)))
+                {
+                    g_inject_mixed_int_ok.fetch_add(1, std::memory_order_relaxed);
+                }
+            }) };
+
         ctx.check("jlr_trigger_hook_installed", h_trigger.installed());
         ctx.check("jlr_inject_hook_installed", h_inject.installed());
+        ctx.check("jlr_inject_mixed_hook_installed", h_inject_mixed.installed());
 
         const bool done{ ctx.run_probe(
             [](bool v) { jni_local_ref::set_go(v); },
@@ -552,6 +876,83 @@ VMHOOK_JVM_MODULE(jni_local_ref_hygiene)
         ctx.check("jlr_interleaved_no_leak_zero_failures",
                   g_mix_loop_failures.load() == 0);
 
+        // ════════════ PRIMITIVE-ARG union-aliasing discipline (echoInt) ════════
+        // The int arg's jvalue cell aliases the union's .l as a non-null wild
+        // pointer; vmhook's per-slot needs_release tag must stay false so the
+        // arg-cleanup never DeleteLocalRef's it. No local ref exists on this path,
+        // so a stable echo across all iterations is the union-aliasing proof (a
+        // spurious release would have crashed long before the count completed).
+        ctx.check("jlr_primitive_int_arg_loop_ran", g_int_loop_iters.load() == 160);
+        ctx.check("jlr_primitive_int_arg_no_misrelease_zero_mismatches",
+                  g_int_loop_mismatches.load() == 0);
+
+        // ════════════ TWO-WORD primitive-arg discipline (echoLong) ════════════
+        // 0x4242424242424242 as a jlong: its .j bits alias .l as a wild pointer —
+        // the harshest DeleteLocalRef-discriminator case. Exact 64-bit echo every
+        // iteration proves the long slot was never read back as a local ref.
+        ctx.check("jlr_primitive_long_arg_loop_ran", g_long_loop_iters.load() == 160);
+        ctx.check("jlr_primitive_long_arg_no_misrelease_zero_mismatches",
+                  g_long_loop_mismatches.load() == 0);
+
+        // ════════════ BOOLEAN-arg discipline (echoBool, .z==1 aliases .l=0x1) ══
+        // jboolean true -> .z 0x01 aliases .l as the pointer 0x1: a low, non-null
+        // value a naive null-check would pass to DeleteLocalRef. needs_release
+        // stays false; echo returns 1 every iteration.
+        ctx.check("jlr_primitive_bool_arg_loop_ran", g_bool_loop_iters.load() == 160);
+        ctx.check("jlr_primitive_bool_arg_no_misrelease_zero_mismatches",
+                  g_bool_loop_mismatches.load() == 0);
+
+        // ════════════ MIXED-arg per-slot discipline (echoMixed) ═══════════════
+        // Slot 1 (String) is the only NewStringUTF ref to release; slot 2 (int)
+        // must keep needs_release false. Both args arrive intact every iteration:
+        // a missing String release starves the table (truncated/empty result); a
+        // bad primitive-slot release crashes. Zero mismatches == correct per-slot
+        // discrimination under sustained pressure.
+        ctx.check("jlr_mixed_arg_loop_ran", g_mixed_loop_iters.load() == 160);
+        ctx.check("jlr_mixed_arg_per_slot_release_zero_mismatches",
+                  g_mixed_loop_mismatches.load() == 0);
+
+        // ════════════ TWO-String-arg discipline (concat, 3 refs/iter) ═════════
+        // Two NewStringUTF arg refs + the returned String ref starve the table 3x
+        // as fast if any release is missing; the concatenation must equal a+b
+        // every iteration.
+        ctx.check("jlr_concat_two_string_args_loop_ran", g_concat_loop_iters.load() == 160);
+        ctx.check("jlr_concat_two_string_args_no_leak_zero_mismatches",
+                  g_concat_loop_mismatches.load() == 0);
+
+        // ════════════ OBJECT-arg synthetic-handle discipline (echoObj) ════════
+        // The object arg's value.l points at the stack handle_storage cell (a
+        // self-pointer), so needs_release stays false — the arg-cleanup must NOT
+        // DeleteLocalRef the stack address. The Object RETURN ref still must be
+        // released. Decoded non-null on every iteration == both disciplines held.
+        ctx.check("jlr_object_arg_loop_ran", g_objarg_loop_iters.load() == 160);
+        ctx.check("jlr_object_arg_all_iters_non_null",
+                  g_objarg_loop_nonnull.load() == 160);
+
+        // ════════════ NULL-String-arg discipline (nullArgLen) ═════════════════
+        // A null const char* -> Java null with NO NewStringUTF and needs_release
+        // false (the arg-cleanup must skip the slot). The body sees null and
+        // returns -1 every iteration — pins the no-ref / no-release arg path.
+        ctx.check("jlr_null_string_arg_loop_ran", g_nullarg_loop_iters.load() == 160);
+        ctx.check("jlr_null_string_arg_always_java_null_zero_mismatches",
+                  g_nullarg_loop_mismatches.load() == 0);
+
+        // ════════════ EMPTY-String-arg discipline (echo "") ═══════════════════
+        // A non-null "" becomes a REAL empty Java String (a NewStringUTF local ref
+        // to release), distinct from Java null. The echo round-trips to "" every
+        // iteration; the arg ref is released each time.
+        ctx.check("jlr_empty_string_arg_loop_ran", g_emptyarg_loop_iters.load() == 160);
+        ctx.check("jlr_empty_string_arg_no_leak_zero_mismatches",
+                  g_emptyarg_loop_mismatches.load() == 0);
+
+        // ════════════ STATIC String-arg discipline (staticEcho, 3 refs/iter) ══
+        // FindClass jclass ref + NewStringUTF arg ref + CallStaticObjectMethodA
+        // result ref, all per dispatch on the static path. Every echo round-trips
+        // to the payload == all three released each iteration.
+        ctx.check("jlr_static_string_arg_loop_ran", g_secho_loop_iters.load() == 160);
+        ctx.check("jlr_static_string_arg_no_leak_zero_mismatches",
+                  g_secho_loop_mismatches.load() == 0);
+
         // ════════════════ POST-LOOP non-degradation ═══════════════════════════
         // After hundreds of allocate+release cycles a fresh dispatch still works.
         ctx.check("jlr_post_loop_call_still_works",
@@ -597,5 +998,53 @@ VMHOOK_JVM_MODULE(jni_local_ref_hygiene)
                       == static_cast<std::int32_t>(k_inject_payload.size()));
         ctx.check("jlr_setarg_last_body_content_exact",
                   jni_local_ref::get_inject_seen() == k_inject_payload);
+
+        // ════════════ set_arg UNION-ALIASING discipline (injectMixed) ═════════
+        // The probe dispatched injectMixed(String,int) INJECT_ITERATIONS times;
+        // each dispatch the detour set BOTH slot 1 (a fresh String via set_arg ->
+        // NewStringUTF + DeleteLocalRef) AND slot 2 (a primitive int via set_arg's
+        // no-local-ref primitive path — which must NEVER hand the union-aliased
+        // cell to DeleteLocalRef). Far past the 16-slot table, this pins the
+        // String-release discipline and the no-release-for-primitives discipline
+        // of set_arg at once: a String leak starves the table (empty injectMixed
+        // String), and a bad primitive release would crash.
+        const std::int32_t fixture_mixed_int{ jni_local_ref::get_inject_mixed_int() };
+        ctx.record("[INFO] jlr set_arg(union-aliasing) loop: injectMixed hook fired "
+                   + std::to_string(g_inject_mixed_hook_calls.load())
+                   + " time(s), set_arg(String) true " + std::to_string(g_inject_mixed_str_ok.load())
+                   + ", set_arg(int) true " + std::to_string(g_inject_mixed_int_ok.load())
+                   + "; body ran " + std::to_string(jni_local_ref::get_inject_mixed_count())
+                   + " time(s), saw BOTH slots intact "
+                   + std::to_string(jni_local_ref::get_inject_mixed_ok_count()) + " time(s).");
+
+        // The fixture's injected-int constant matches the value the hook injects:
+        // a hard invariant (both sides hard-code 1337) guarding accidental drift.
+        ctx.check("jlr_setarg_mixed_int_constant_matches", fixture_mixed_int == JLR_MIXED_INT);
+        ctx.check("jlr_setarg_mixed_hook_fired_each_dispatch",
+                  g_inject_mixed_hook_calls.load() == inject_iters && inject_iters > 0);
+        // Every set_arg(String) on slot 1 succeeded — no NewStringUTF failure /
+        // table exhaustion across the whole loop.
+        ctx.check("jlr_setarg_mixed_all_string_injections_true",
+                  g_inject_mixed_str_ok.load() == g_inject_mixed_hook_calls.load()
+                  && g_inject_mixed_hook_calls.load() > 0);
+        // Every set_arg(int) on slot 2 succeeded — the primitive path stored the
+        // value (and, critically, allocated/released NOTHING).
+        ctx.check("jlr_setarg_mixed_all_int_injections_true",
+                  g_inject_mixed_int_ok.load() == g_inject_mixed_hook_calls.load()
+                  && g_inject_mixed_hook_calls.load() > 0);
+        // Every body observed BOTH a non-empty String (slot 1, unstarved) AND the
+        // exact injected int (slot 2, the primitive arrived unchanged): the
+        // simultaneous proof that the String ref was released and the primitive
+        // cell was NEVER mistaken for a ref to release.
+        ctx.check("jlr_setarg_mixed_every_body_saw_both_slots",
+                  jni_local_ref::get_inject_mixed_ok_count() == jni_local_ref::get_inject_mixed_count()
+                  && jni_local_ref::get_inject_mixed_count() == inject_iters);
+        // The LAST body saw the exact injected primitive int — the union-aliased
+        // slot delivered the right bits after the whole loop, not garbage.
+        ctx.check("jlr_setarg_mixed_last_body_int_exact",
+                  jni_local_ref::get_inject_mixed_int_seen() == JLR_MIXED_INT);
+        // The LAST body saw the exact injected String content.
+        ctx.check("jlr_setarg_mixed_last_body_string_exact",
+                  jni_local_ref::get_inject_mixed_seen() == k_inject_mixed_payload);
     }
 }
