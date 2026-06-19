@@ -58,6 +58,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace
 {
@@ -115,6 +116,12 @@ namespace
     // (declined) must never fire.
     std::atomic<std::int32_t> g_dup_first_fires{ 0 };
     std::atomic<std::int32_t> g_dup_second_fires{ 0 };
+    // Move-semantics scenario: two distinct detours wired through ONE handle
+    // variable across a move-assign, so we can prove which body the surviving
+    // handle owns after the overwrite (the old hook must be disarmed, the new
+    // one armed).
+    std::atomic<std::int32_t> g_move_old_fires{ 0 };
+    std::atomic<std::int32_t> g_move_new_fires{ 0 };
 
     auto reset_observations() -> void
     {
@@ -126,6 +133,8 @@ namespace
         g_other_arg_ok.store(false);
         g_dup_first_fires.store(0);
         g_dup_second_fires.store(0);
+        g_move_old_fires.store(0);
+        g_move_new_fires.store(0);
     }
 
     // Drives exactly one probe cycle for `mode`: resets observations + the
@@ -486,6 +495,371 @@ VMHOOK_JVM_MODULE(hook_unhook_double_free)
         ctx.check("static_remove_byte_exact_original",
                   huf_fixture::get_last_static_target_result() == STATIC_TARGET_ORIGINAL);
     }
+
+    // =====================================================================
+    // 8 — DEFAULT-CONSTRUCTED handle: a hook_handle that never owned a target.
+    //   installed()==false from birth; stop() is a guaranteed no-op (the
+    //   `if (!this->method) return;` gate), the destructor is a no-op, and a
+    //   double stop() on it cannot crash / double-free.  This is the empty-handle
+    //   leg of the idempotency contract that the scoped_hook scenarios above only
+    //   reach AFTER a stop() — here it is exercised from the start.
+    // =====================================================================
+    {
+        vmhook::hook_handle empty{};
+        ctx.check("default_handle_not_installed", !empty.installed());
+        empty.stop();
+        ctx.check("default_handle_stop_no_op", !empty.installed());
+        empty.stop();   // double no-op
+        ctx.check("default_handle_double_stop_no_op", !empty.installed());
+    }   // destructor on the empty handle -> no-op.
+    ctx.check("default_handle_destructor_no_op", true);
+
+    // =====================================================================
+    // 9 — MOVE-CONSTRUCT a handle.  Moving an installed handle TRANSFERS
+    //   ownership of the single entry: the source becomes not-installed (its
+    //   method is nulled) so its later stop()/destructor is a no-op, while the
+    //   destination owns the live hook and is the one that disarms.  Proves the
+    //   move ctor cannot double-free (only ONE handle ever owns the entry) and
+    //   does not prematurely disarm (the hook keeps firing through the move).
+    // =====================================================================
+    {
+        auto src{ vmhook::scoped_hook<huf_fixture>("target", "(I)I", target_observer()) };
+        ctx.check("move_ctor_src_installed_before", src.installed());
+
+        vmhook::hook_handle dst{ std::move(src) };
+        ctx.check("move_ctor_src_emptied", !src.installed());
+        ctx.check("move_ctor_dst_owns", dst.installed());
+
+        // The moved-from source's explicit stop() must be a no-op and must NOT
+        // disarm the hook the destination now owns.
+        src.stop();
+        ctx.check("move_ctor_src_stop_no_op", !src.installed());
+
+        const bool done{ drive(ctx, 1) };
+        ctx.check("move_ctor_probe_completed", done);
+        ctx.check("move_ctor_hook_still_fires_through_move",
+                  g_target_fires.load() == TARGET_CALLS);
+        ctx.check("move_ctor_byte_exact",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+
+        // Destination disarms the one real entry.
+        dst.stop();
+        ctx.check("move_ctor_dst_stop_installed_false", !dst.installed());
+
+        const bool done_after{ drive(ctx, 1) };
+        ctx.check("move_ctor_after_stop_probe_completed", done_after);
+        ctx.check("move_ctor_after_stop_silent", g_target_fires.load() == 0);
+        ctx.check("move_ctor_after_stop_byte_exact",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+    }   // both src (already empty) and dst (already stopped) destruct -> no-op.
+    ctx.check("move_ctor_destructors_no_op", true);
+
+    // =====================================================================
+    // 10 — MOVE-ASSIGN over a LIVE handle.  operator=(&&) must stop() *this
+    //   FIRST (disarming the hook it currently owns) before adopting the
+    //   right-hand side's target.  So after `h = scoped_hook(...)`: the OLD
+    //   detour is removed (its entry erased) and the NEW detour is the only one
+    //   armed.  This is the exactly-once-teardown contract embedded in the move
+    //   path — the overwritten hook must be torn down exactly once, not leaked
+    //   and not double-freed.  We use two DISTINCT detours so the fire counters
+    //   prove which body actually owns the method after the assign.
+    // =====================================================================
+    {
+        auto h{ vmhook::scoped_hook<huf_fixture>(
+            "target", "(I)I",
+            [](vmhook::return_value&,
+               const std::unique_ptr<huf_fixture>&,
+               std::int32_t) { g_move_old_fires.fetch_add(1, std::memory_order_relaxed); }) };
+        ctx.check("move_assign_old_installed", h.installed());
+
+        // Prove the OLD detour is live before the assign.
+        const bool done_old{ drive(ctx, 1) };
+        ctx.check("move_assign_old_probe_completed", done_old);
+        ctx.check("move_assign_old_fires_before",
+                  g_move_old_fires.load() == TARGET_CALLS);
+        ctx.check("move_assign_new_silent_before",
+                  g_move_new_fires.load() == 0);
+
+        // Move-assign a fresh hook (distinct detour) over the live handle.
+        // operator=(&&) stops the OLD hook first, then adopts the NEW one.
+        h = vmhook::scoped_hook<huf_fixture>(
+            "target", "(I)I",
+            [](vmhook::return_value&,
+               const std::unique_ptr<huf_fixture>&,
+               std::int32_t) { g_move_new_fires.fetch_add(1, std::memory_order_relaxed); });
+        ctx.check("move_assign_handle_still_installed", h.installed());
+
+        const bool done_new{ drive(ctx, 1) };
+        ctx.check("move_assign_new_probe_completed", done_new);
+        // ONLY the new detour fires now; the old one was disarmed by the
+        // assign's stop()-first.  (If the old entry had leaked, the old counter
+        // would tick again here.)
+        ctx.check("move_assign_new_fires_after",
+                  g_move_new_fires.load() == TARGET_CALLS);
+        ctx.check("move_assign_old_silent_after",
+                  g_move_old_fires.load() == 0);
+        ctx.check("move_assign_byte_exact",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+    }   // handle drops -> the new hook removed; both detours now silent.
+
+    // After the move-assign scope, the method must be byte-exact original again
+    // and neither detour fires (proves the assign left no leaked entry).
+    {
+        const bool done{ drive(ctx, 1) };
+        ctx.check("move_assign_after_drop_probe_completed", done);
+        ctx.check("move_assign_after_drop_old_silent",
+                  g_move_old_fires.load() == 0);
+        ctx.check("move_assign_after_drop_new_silent",
+                  g_move_new_fires.load() == 0);
+        ctx.check("move_assign_after_drop_byte_exact",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+    }
+
+    // =====================================================================
+    // 11 — NAME-ONLY scoped_hook overload (empty signature).  The 2-arg
+    //   scoped_hook<T>(name, detour) resolves the method by name alone; the
+    //   remove path must disarm it just as cleanly as the explicit-signature
+    //   form.  (target() is unique on the fixture, so name-only resolution is
+    //   unambiguous.)
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<huf_fixture>("target", target_observer()) };
+        ctx.check("name_only_installed", handle.installed());
+
+        const bool done{ drive(ctx, 1) };
+        ctx.check("name_only_probe_completed", done);
+        ctx.check("name_only_fired", g_target_fires.load() == TARGET_CALLS);
+        ctx.check("name_only_byte_exact",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+
+        handle.stop();
+        ctx.check("name_only_installed_false_after_stop", !handle.installed());
+        handle.stop();   // idempotent
+        ctx.check("name_only_double_stop_still_false", !handle.installed());
+
+        const bool done_after{ drive(ctx, 1) };
+        ctx.check("name_only_after_stop_probe_completed", done_after);
+        ctx.check("name_only_after_stop_silent", g_target_fires.load() == 0);
+        ctx.check("name_only_after_stop_byte_exact",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+    }
+
+    // =====================================================================
+    // 12 — cancel() suppression then byte-exact restore (a SECOND strong proof,
+    //   distinct from 2b's rv.set(SENTINEL)).  rv.cancel() suppresses the
+    //   ORIGINAL body WITHOUT writing a return value, so Java observes the
+    //   default-initialised result (0 — `int last = 0;` in runTarget() is never
+    //   overwritten because the body never runs).  0 differs from the original
+    //   7017, proving the hook was genuinely in the dispatch path and the body
+    //   really was suppressed.  After stop() the original body must run again and
+    //   Java must re-observe 7017 (no double-restore corruption, no lingering
+    //   suppression).
+    // =====================================================================
+    {
+        constexpr std::int32_t CANCEL_RESULT{ 0 };
+        static_assert(CANCEL_RESULT != TARGET_ORIGINAL,
+                      "cancelled body must yield a value distinct from the original");
+
+        auto handle{ vmhook::scoped_hook<huf_fixture>(
+            "target", "(I)I",
+            [](vmhook::return_value& rv,
+               const std::unique_ptr<huf_fixture>&,
+               std::int32_t)
+            {
+                g_target_fires.fetch_add(1, std::memory_order_relaxed);
+                rv.cancel();   // suppress the original body; write no value
+            }) };
+        ctx.check("cancel_installed", handle.installed());
+
+        const bool done{ drive(ctx, 1) };
+        ctx.check("cancel_probe_completed", done);
+        ctx.check("cancel_hook_fired", g_target_fires.load() == TARGET_CALLS);
+        ctx.check("cancel_java_saw_suppressed_default",
+                  huf_fixture::get_last_target_result() == CANCEL_RESULT);
+        ctx.check("cancel_java_did_not_see_original",
+                  huf_fixture::get_last_target_result() != TARGET_ORIGINAL);
+
+        handle.stop();
+        const bool done_after{ drive(ctx, 1) };
+        ctx.check("cancel_after_stop_probe_completed", done_after);
+        ctx.check("cancel_after_stop_detour_silent", g_target_fires.load() == 0);
+        ctx.check("cancel_after_stop_byte_exact_original",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+        ctx.check("cancel_after_stop_no_longer_suppressed",
+                  huf_fixture::get_last_target_result() != CANCEL_RESULT);
+    }
+
+    // =====================================================================
+    // 13 — RAPID install/remove CHURN.  Repeat install -> drive -> stop a few
+    //   times in a tight loop.  Every cycle must re-arm cleanly (the entry was
+    //   fully cleared by the previous stop()), fire exactly TARGET_CALLS, and
+    //   leave the body byte-exact — proving stop() leaves NO residue that drifts
+    //   the table or poisons the next install.  Heap-modest: small iteration
+    //   count, each cycle drives the same lightweight probe.
+    // =====================================================================
+    {
+        constexpr std::int32_t CHURN_CYCLES{ 5 };
+        std::int32_t armed_ok{ 0 };
+        std::int32_t fired_ok{ 0 };
+        std::int32_t byte_exact_ok{ 0 };
+        std::int32_t removed_ok{ 0 };
+        for (std::int32_t cycle{ 0 }; cycle < CHURN_CYCLES; ++cycle)
+        {
+            auto handle{ vmhook::scoped_hook<huf_fixture>("target", "(I)I", target_observer()) };
+            if (handle.installed())
+            {
+                ++armed_ok;
+            }
+            const bool done{ drive(ctx, 1) };
+            if (done && g_target_fires.load() == TARGET_CALLS)
+            {
+                ++fired_ok;
+            }
+            if (huf_fixture::get_last_target_result() == TARGET_ORIGINAL)
+            {
+                ++byte_exact_ok;
+            }
+            handle.stop();
+            if (!handle.installed())
+            {
+                ++removed_ok;
+            }
+        }
+        ctx.check("churn_all_armed", armed_ok == CHURN_CYCLES);
+        ctx.check("churn_all_fired_exactly", fired_ok == CHURN_CYCLES);
+        ctx.check("churn_all_byte_exact", byte_exact_ok == CHURN_CYCLES);
+        ctx.check("churn_all_removed", removed_ok == CHURN_CYCLES);
+
+        // After the churn the table is clean: a final drive sees no detour.
+        const bool done{ drive(ctx, 1) };
+        ctx.check("churn_after_probe_completed", done);
+        ctx.check("churn_after_silent", g_target_fires.load() == 0);
+        ctx.check("churn_after_byte_exact",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+    }
+
+    // =====================================================================
+    // 14 — THREE distinct methods armed at once (target + other + staticTarget),
+    //   remove the MIDDLE one (other) only.  Stronger collateral-damage proof
+    //   than scenario 6: with three entries sharing the same i2i common_detour,
+    //   removing exactly one must leave the OTHER TWO firing and byte-exact.
+    // =====================================================================
+    {
+        auto h_t{ vmhook::scoped_hook<huf_fixture>("target", "(I)I", target_observer()) };
+        auto h_o{ vmhook::scoped_hook<huf_fixture>("other", "(I)I", other_observer()) };
+        auto h_s{ vmhook::scoped_hook<huf_fixture>(
+            "staticTarget", "(I)I",
+            [](vmhook::return_value&, std::int32_t)
+            {
+                g_static_target_fires.fetch_add(1, std::memory_order_relaxed);
+            }) };
+        ctx.check("tri_target_installed", h_t.installed());
+        ctx.check("tri_other_installed", h_o.installed());
+        ctx.check("tri_static_installed", h_s.installed());
+
+        // Drive target+other together (mode 3), then static (mode 4): all three
+        // bodies run.  Each drive resets observations, so check after each.
+        const bool d_both{ drive(ctx, 3) };
+        ctx.check("tri_both_probe_completed", d_both);
+        ctx.check("tri_target_fires_armed", g_target_fires.load() == 1);
+        ctx.check("tri_other_fires_armed", g_other_fires.load() == 1);
+        const bool d_static{ drive(ctx, 4) };
+        ctx.check("tri_static_probe_completed", d_static);
+        ctx.check("tri_static_fires_armed", g_static_target_fires.load() == 1);
+
+        // Remove the MIDDLE entry (other) only.
+        h_o.stop();
+        ctx.check("tri_other_installed_false_after_stop", !h_o.installed());
+        ctx.check("tri_target_still_installed", h_t.installed());
+        ctx.check("tri_static_still_installed", h_s.installed());
+
+        // target + other drive: target STILL fires, other is silent + byte-exact.
+        const bool d_both2{ drive(ctx, 3) };
+        ctx.check("tri_after_remove_both_probe_completed", d_both2);
+        ctx.check("tri_target_still_fires_after_other_removed",
+                  g_target_fires.load() == 1);
+        ctx.check("tri_other_silent_after_removed", g_other_fires.load() == 0);
+        ctx.check("tri_other_byte_exact_after_removed",
+                  huf_fixture::get_last_other_result() == OTHER_ORIGINAL);
+        ctx.check("tri_target_byte_exact_after_other_removed",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+
+        // static drive: the third entry STILL fires (untouched by the middle
+        // removal).
+        const bool d_static2{ drive(ctx, 4) };
+        ctx.check("tri_after_remove_static_probe_completed", d_static2);
+        ctx.check("tri_static_still_fires_after_other_removed",
+                  g_static_target_fires.load() == 1);
+        ctx.check("tri_static_byte_exact_after_other_removed",
+                  huf_fixture::get_last_static_target_result() == STATIC_TARGET_ORIGINAL);
+    }   // h_t and h_s drop here -> all three hooks now gone.
+
+    // All three dropped: none fire, all byte-exact.
+    {
+        const bool d_both{ drive(ctx, 3) };
+        ctx.check("tri_all_dropped_both_probe_completed", d_both);
+        ctx.check("tri_all_dropped_target_silent", g_target_fires.load() == 0);
+        ctx.check("tri_all_dropped_other_silent", g_other_fires.load() == 0);
+        const bool d_static{ drive(ctx, 4) };
+        ctx.check("tri_all_dropped_static_probe_completed", d_static);
+        ctx.check("tri_all_dropped_static_silent", g_static_target_fires.load() == 0);
+        ctx.check("tri_all_dropped_target_byte_exact",
+                  huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+        ctx.check("tri_all_dropped_other_byte_exact",
+                  huf_fixture::get_last_other_result() == OTHER_ORIGINAL);
+        ctx.check("tri_all_dropped_static_byte_exact",
+                  huf_fixture::get_last_static_target_result() == STATIC_TARGET_ORIGINAL);
+    }
+
+    // =====================================================================
+    // 15 — DUPLICATE install, drop the REAL OWNER while the not-installed
+    //   duplicate is still alive.  Reinforces scenario 5 from the other angle:
+    //   the FIRST scoped_hook owns the entry; the SECOND is a not-installed
+    //   handle.  Dropping the owner (h1.stop()) must disarm the hook even though
+    //   the empty duplicate (h2) is still in scope, and h2's eventual
+    //   destruction must remain a no-op (it never owned the entry, so it can
+    //   neither resurrect nor double-free it).
+    // =====================================================================
+    {
+        auto h2_outer{ vmhook::hook_handle{} };   // empty, populated below
+        {
+            auto h1{ vmhook::scoped_hook<huf_fixture>(
+                "target", "(I)I",
+                [](vmhook::return_value&,
+                   const std::unique_ptr<huf_fixture>&,
+                   std::int32_t) { g_dup_first_fires.fetch_add(1, std::memory_order_relaxed); }) };
+            auto h2{ vmhook::scoped_hook<huf_fixture>(
+                "target", "(I)I",
+                [](vmhook::return_value&,
+                   const std::unique_ptr<huf_fixture>&,
+                   std::int32_t) { g_dup_second_fires.fetch_add(1, std::memory_order_relaxed); }) };
+            ctx.check("dup2_h1_installed", h1.installed());
+            ctx.check("dup2_h2_not_installed", !h2.installed());
+
+            // Drop the REAL OWNER explicitly while the empty duplicate lives on.
+            h1.stop();
+            ctx.check("dup2_h1_stop_installed_false", !h1.installed());
+
+            // The hook is now gone even though h2 is still in scope.
+            const bool done{ drive(ctx, 1) };
+            ctx.check("dup2_after_owner_drop_probe_completed", done);
+            ctx.check("dup2_after_owner_drop_first_silent",
+                      g_dup_first_fires.load() == 0);
+            ctx.check("dup2_after_owner_drop_second_silent",
+                      g_dup_second_fires.load() == 0);
+            ctx.check("dup2_after_owner_drop_byte_exact",
+                      huf_fixture::get_last_target_result() == TARGET_ORIGINAL);
+
+            // Move the (empty) duplicate out so its destruction happens AFTER
+            // the inner scope — confirming a moved empty handle is still inert.
+            h2_outer = std::move(h2);
+            ctx.check("dup2_h2_still_not_installed_after_move", !h2_outer.installed());
+        }   // h1 (already stopped) destructs -> no-op.
+        // The moved-out empty duplicate is still inert; explicit stop() no-op.
+        h2_outer.stop();
+        ctx.check("dup2_outer_duplicate_stop_no_op", !h2_outer.installed());
+    }   // h2_outer destructs (empty) -> no-op.
+    ctx.check("dup2_destructors_no_op", true);
 
     // =====================================================================
     // FINAL CLEANUP — belt-and-braces.  Other modules run after this one, so the

@@ -88,6 +88,12 @@ public final class FindClassProbe
     /** Keeps the [Ljava/lang/String; object-array klass loaded + reachable. */
     public static String[] strArrayAnchor;
 
+    /** Keeps the [[I two-dimensional primitive-array klass loaded + reachable. */
+    public static int[][] prim2dArrayAnchor;
+
+    /** Keeps the [Ljava/lang/Object; object-array klass loaded + reachable. */
+    public static Object[] objArrayAnchor;
+
     /**
      * A nested (inner, non-static) class.  Its internal name is
      * vmhook/fixtures/FindClassProbe$Inner.  Carries its own sentinel so the
@@ -113,6 +119,8 @@ public final class FindClassProbe
         // Force-load the array klasses and anchor them.
         primIntArrayAnchor = new int[] { 1, 2, 3 };
         strArrayAnchor = new String[] { "alpha", "omega" };
+        prim2dArrayAnchor = new int[][] { { 1 }, { 2, 3 } };
+        objArrayAnchor = new Object[] { "obj", Integer.valueOf(7) };
 
         Harness.register(new Harness.Probe()
         {

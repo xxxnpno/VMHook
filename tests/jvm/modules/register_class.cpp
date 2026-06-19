@@ -111,6 +111,8 @@ namespace
     constexpr std::int32_t MARKER{ 0x5AFE7A11 };       // 1526182929
     constexpr std::int32_t CLASS_TOKEN{ 0x1357BD13 };  // 323158291
     constexpr std::int32_t ANCHOR_ARG{ 0x0CA75 };      // 51829
+    constexpr std::int64_t CLASS_TOKEN_LONG{ 0x0123456789ABCDEFLL };
+    constexpr const char    CLASS_LABEL[]{ "RegisterClassFix" };
 
     // ---- Primary wrapper for vmhook.fixtures.RegisterClassFix --------------
     // Deriving from vmhook::object<rc> gives the wrapper the vtable register_class
@@ -135,6 +137,22 @@ namespace
         static auto resolves(const char* name) -> bool { return static_field(name).has_value(); }
         static auto get_class_token() -> std::int32_t  { return static_field("classToken")->get(); }
         static auto get_anchor_calls() -> std::int32_t { return static_field("anchorCalls")->get(); }
+
+        // Static-method resolution THROUGH the registered wrapper (the
+        // resolve_klass -> _methods-walk consumer of type_to_class_map).
+        // Resolution-only (.has_value()); never called, to stay heap-modest.
+        static auto resolves_static_method(const char* name) -> bool
+        {
+            return static_method(name).has_value();
+        }
+        static auto resolves_static_method(const char* name, const char* sig) -> bool
+        {
+            return static_method(name, sig).has_value();
+        }
+        // Differently-typed static fields, each resolved through the SAME map path.
+        static auto get_class_token_long() -> std::int64_t { return static_field("classTokenLong")->get(); }
+        static auto get_class_flag() -> bool               { return static_field("classFlag")->get(); }
+        static auto get_class_label() -> std::string       { return static_field("classLabel")->get(); }
 
         // Instance-side read of `marker` (used INSIDE the detour through the
         // factory-built wrapper).  Inherited get_field; safe on a valid oop.
@@ -357,13 +375,78 @@ namespace
             ctx.check("get_class_methods_lists_anchor", has_anchor);
 
             // find_methods_by_signature<W>() -> the int->int anchor descriptor.
+            // Both `anchor` (instance) and `staticAnchor` (static) share the (I)I
+            // descriptor, so the result must contain BOTH names (it returns ALL
+            // matches by contract -- proving descriptor matching is name-agnostic).
             const auto anchor_names{ vmhook::find_methods_by_signature<rc>("(I)I") };
             bool fm_has_anchor{ false };
+            bool fm_has_static_anchor{ false };
             for (const std::string& nm : anchor_names)
             {
-                if (nm == "anchor") { fm_has_anchor = true; break; }
+                if (nm == "anchor") { fm_has_anchor = true; }
+                if (nm == "staticAnchor") { fm_has_static_anchor = true; }
             }
             ctx.check("find_methods_by_signature_finds_anchor", fm_has_anchor);
+            ctx.check("find_methods_by_signature_finds_static_anchor", fm_has_static_anchor);
+            // A descriptor that matches NO declared method -> empty (registered
+            // type, wrong signature: distinct from the unregistered->empty case).
+            ctx.check("find_methods_by_signature_unmatched_descriptor_empty",
+                      vmhook::find_methods_by_signature<rc>("(DD)Ljava/lang/Object;").empty());
+
+            // ---- static_method resolution THROUGH the registered wrapper -------
+            // staticAnchor IS static -> resolves; the instance method anchor is
+            // NOT static -> static_method must REJECT it (the JVM_ACC_STATIC gate
+            // on the same resolve_klass path).  Resolution-only; never called.
+            ctx.check("registered_static_method_resolves_staticAnchor",
+                      rc::resolves_static_method("staticAnchor"));
+            ctx.check("registered_static_method_rejects_instance_anchor",
+                      !rc::resolves_static_method("anchor"));
+            ctx.check("registered_static_method_with_sig_resolves_staticAnchor",
+                      rc::resolves_static_method("staticAnchor", "(I)I"));
+            ctx.check("registered_static_method_missing_name_nullopt",
+                      !rc::resolves_static_method("noSuchStaticMethod_ZZZ"));
+
+            // ---- differently-typed static fields all resolve via the map -------
+            // Once the klass is reached through type_to_class_map, fields of any
+            // descriptor (J / Z / Ljava/lang/String;) resolve and read correctly.
+            ctx.check("registered_static_field_long_resolves",
+                      rc::resolves("classTokenLong"));
+            ctx.check("registered_static_field_long_value",
+                      rc::get_class_token_long() == CLASS_TOKEN_LONG);
+            ctx.check("registered_static_field_bool_resolves",
+                      rc::resolves("classFlag"));
+            ctx.check("registered_static_field_bool_value",
+                      rc::get_class_flag() == true);
+            ctx.check("registered_static_field_string_resolves",
+                      rc::resolves("classLabel"));
+            ctx.check("registered_static_field_string_value",
+                      rc::get_class_label() == CLASS_LABEL);
+
+            // ---- get_field(type_index, name) static overload directly ----------
+            // static_field forwards to this; assert the type_index overload (the
+            // raw resolve_klass consumer) resolves the same field independently.
+            ctx.check("get_field_by_type_index_resolves_static",
+                      vmhook::object_base::get_field(
+                          std::type_index{ typeid(rc) }, "classToken").has_value());
+            ctx.check("get_field_by_type_index_rejects_instance_marker",
+                      !vmhook::object_base::get_field(
+                          std::type_index{ typeid(rc) }, "marker").has_value());
+
+            // ---- get_class_methods(string_view) by-NAME overload ---------------
+            // This overload does NOT consult type_to_class_map (it is find_class
+            // direct), so it must list anchor for the class name WHETHER OR NOT a
+            // wrapper type is registered.  Contrast with the <W>() template above.
+            const auto by_name{ vmhook::get_class_methods(RC_CLASS) };
+            bool by_name_has_anchor{ false };
+            for (const auto& entry : by_name)
+            {
+                if (entry.first == "anchor") { by_name_has_anchor = true; break; }
+            }
+            ctx.check("get_class_methods_by_name_lists_anchor", by_name_has_anchor);
+            // The map-keyed template and the find_class-direct by-name overload
+            // see the SAME class -> identical method-count for RC_CLASS.
+            ctx.check("get_class_methods_template_matches_by_name_count",
+                      methods.size() == by_name.size());
         }
 
         // =====================================================================
@@ -379,6 +462,27 @@ namespace
                       vmhook::get_class_methods<never_registered>().empty());
             ctx.check("unregistered_find_methods_by_signature_empty",
                       vmhook::find_methods_by_signature<never_registered>("(I)I").empty());
+            // static_method on an unregistered wrapper -> nullopt (resolve_klass
+            // misses the type map; another resolve_klass consumer beyond
+            // static_field that must also degrade gracefully).
+            ctx.check("unregistered_static_method_nullopt",
+                      !never_registered::static_method("staticAnchor").has_value());
+            ctx.check("unregistered_static_method_with_sig_nullopt",
+                      !never_registered::static_method("staticAnchor", "(I)I").has_value());
+            ctx.check("unregistered_get_field_by_type_index_nullopt",
+                      !vmhook::object_base::get_field(
+                          std::type_index{ typeid(never_registered) }, "classToken").has_value());
+            // make_unique<W>() on an unregistered type -> nullptr (the type-map
+            // miss is hit BEFORE any allocation; cheap, no Java object created).
+            ctx.check("unregistered_make_unique_nullptr",
+                      vmhook::make_unique<never_registered>() == nullptr);
+            // The by-NAME get_class_methods overload is map-INDEPENDENT: it
+            // resolves RC_CLASS by find_class regardless of which wrapper type (if
+            // any) is registered, so it lists anchor even though never_registered
+            // is not in the map.  This isolates the type-map's role to the <W>()
+            // template path only.
+            ctx.check("by_name_overload_is_map_independent",
+                      !vmhook::get_class_methods(RC_CLASS).empty());
             // for_each_instance<W> must early-out to 0 visits for an unregistered
             // type (it returns 0 on the type_to_class_map miss BEFORE touching any
             // heap VMStruct) -- and must not crash.  The visitor is never called.
@@ -405,12 +509,25 @@ namespace
                       factory_for(bogus) == nullptr);
             ctx.check("bogus_static_field_nullopt",
                       !bogus_w::static_field("go").has_value());
+            ctx.check("bogus_static_method_nullopt",
+                      !bogus_w::static_method("staticAnchor").has_value());
             ctx.check("bogus_get_class_methods_empty",
                       vmhook::get_class_methods<bogus_w>().empty());
+            ctx.check("bogus_make_unique_nullptr",
+                      vmhook::make_unique<bogus_w>() == nullptr);
             // Empty-string class name: also a miss, also graceful.
             const bool empty_ok{ vmhook::register_class<bogus_w>("") };
             ctx.check("register_returns_false_for_empty_name", !empty_ok);
             ctx.check("bogus_type_still_unregistered_after_empty",
+                      !type_is_registered(std::type_index{ typeid(bogus_w) }));
+            ctx.check("empty_name_has_no_factory_entry",
+                      factory_for("") == nullptr);
+            // A null class-name pointer is degenerate input the API also rejects
+            // (find_class fails first; no map touched, no crash).  string_view from
+            // a null+0 is well-defined and yields an empty name -> same miss.
+            const bool whitespace_ok{ vmhook::register_class<bogus_w>("   ") };
+            ctx.check("register_returns_false_for_whitespace_name", !whitespace_ok);
+            ctx.check("bogus_type_still_unregistered_after_whitespace",
                       !type_is_registered(std::type_index{ typeid(bogus_w) }));
         }
 
@@ -454,6 +571,10 @@ namespace
                       reborn_w::static_field("classToken").has_value());
             ctx.check("reborn_on_RC_misses_ALT_only_field",
                       !reborn_w::static_field("sIntZero").has_value());
+            // Method resolution also tracks the binding: bound to RC, reborn_w
+            // resolves RC's staticAnchor.
+            ctx.check("reborn_on_RC_resolves_RC_static_method",
+                      reborn_w::static_method("staticAnchor").has_value());
 
             // Re-point reborn_w to ALT_CLASS.
             const bool second{ vmhook::register_class<reborn_w>(ALT_CLASS) };
@@ -469,6 +590,12 @@ namespace
                       reborn_w::static_field("sIntZero").has_value());
             ctx.check("reborn_on_ALT_misses_RC_only_field",
                       !reborn_w::static_field("classToken").has_value());
+            // ...and after the re-point reborn_w's staticAnchor resolution FLIPS
+            // to a miss (ALT_CLASS / FieldPrimitivesGet has no staticAnchor) --
+            // a method-resolution witness of the re-point complementing the field
+            // witness above.
+            ctx.check("reborn_on_ALT_misses_RC_static_method",
+                      !reborn_w::static_method("staticAnchor").has_value());
             // get_class_methods now reflects the ALT class.
             ctx.check("reborn_get_class_methods_nonempty_after_repoint",
                       !vmhook::get_class_methods<reborn_w>().empty());
@@ -511,6 +638,22 @@ namespace
                       factory_for(RC_CLASS) != nullptr
                       && factory_for(ALT_CLASS) != nullptr
                       && factory_for(RC_CLASS) != factory_for(ALT_CLASS));
+            // Method resolution is ALSO keyed per-wrapper through the map: rc
+            // resolves its OWN staticAnchor; alt_w (FieldPrimitivesGet, which has
+            // no such method) does NOT -- proving static_method's resolve_klass
+            // follows each type's distinct binding, not a shared klass.
+            ctx.check("two_classes_rc_resolves_own_static_method",
+                      rc::resolves_static_method("staticAnchor"));
+            ctx.check("two_classes_alt_misses_rc_static_method",
+                      !alt_w::static_method("staticAnchor").has_value());
+            // get_class_methods<W>() also tracks each wrapper's own class: rc's
+            // list contains anchor; alt_w's does not.
+            bool alt_has_anchor{ false };
+            for (const auto& entry : vmhook::get_class_methods<alt_w>())
+            {
+                if (entry.first == "anchor") { alt_has_anchor = true; break; }
+            }
+            ctx.check("two_classes_alt_methods_miss_rc_anchor", !alt_has_anchor);
         }
 
         // =====================================================================

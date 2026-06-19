@@ -112,7 +112,22 @@ namespace
         SC_NESTED       = 7,  // throwNested(-8)     -> throw from a NESTED Java call
         SC_STATIC       = 8,  // sBoom(-9)           -> STATIC throwing method
         SC_AFTER_OK     = 9,  // throwAfterSuccess(-10) -> throw AFTER committed work
-        SC_COUNT        = 10
+        // ── return-descriptor variety (the unwound-path ret_char decode) ──
+        SC_RET_VOID     = 10, // throwVoid(int)      -> (I)V  'V' decode on throw
+        SC_RET_LONG     = 11, // throwLong(int)      -> (I)J  'J' 64-bit default cell
+        SC_RET_DOUBLE   = 12, // throwDouble(int)    -> (I)D  'D' default cell
+        SC_RET_BOOL     = 13, // throwBool(int)      -> (I)Z  'Z' decode
+        SC_RET_STRING   = 14, // throwString(int)    -> (I)Lj/l/String; reference decode
+        // ── argument-shape variety (the pack() branch under a throw) ──
+        SC_ARG_NONE     = 15, // throwNoArg()        -> ()I   no-extra-arg pack
+        SC_ARG_LONG     = 16, // throwLongArg(long)  -> (J)I  wide-long pack
+        SC_ARG_DOUBLE   = 17, // throwDoubleArg(dbl) -> (D)I  wide-double pack
+        SC_ARG_STRING   = 18, // throwStringArg(Str) -> (Lj/l/String;)I  ref pack
+        SC_ARG_TWO      = 19, // throwTwoArgs(int,long) -> (IJ)I  multi-slot pack
+        // ── extra unwind shapes ──
+        SC_DEEP3        = 20, // throwDeep3(int)     -> 3-frame unwind
+        SC_FINALLY      = 21, // throwInFinally(int) -> throw through a finally
+        SC_COUNT        = 22
     };
 
     // Wrapper for vmhook.fixtures.ThrowingMethod.  Instance-context accessors
@@ -141,6 +156,12 @@ namespace
 
         static auto entered(const char* name) -> std::int32_t { return static_field(name)->get(); }
         static auto last_arg(const char* name) -> std::int32_t { return static_field(name)->get(); }
+
+        // Wide / reference witnesses recorded by the argument-shape throwing
+        // methods BEFORE they throw (read back to prove the marshalled arg
+        // arrived intact across the boundary the exception then unwinds).
+        static auto long_field(const char* name) -> std::int64_t { return static_field(name)->get(); }
+        static auto string_field(const char* name) -> std::string { return static_field(name)->get().as_string(); }
     };
 
     constexpr std::int64_t k_uncaptured{ static_cast<std::int64_t>(0xDEADBEEFCAFEF00DULL) };
@@ -257,80 +278,65 @@ namespace
     std::atomic<bool> g_self_valid{ false };
     std::atomic<int>  g_call_stub_present{ -1 };   // find_call_stub_entry() != null
 
-    // Resolve + identity-check + drive ONE throwing call() for `o`, capturing the
-    // post-throw cleanliness and health observations.  `arg` is the marshalled
-    // sentinel; `name`/`sig` select the method.  `is_static_call` chooses the
-    // static dispatch for the static scenario.  No-throw by construction.
-    auto run_throwing_scenario(const std::unique_ptr<throwfix>& self,
-                               obs& o,
-                               const char* name,
-                               const char* sig,
-                               std::int32_t arg,
-                               bool is_static_call,
-                               std::int32_t safe_add_arg) noexcept -> void
+    // ── boundary / non-throwing-branch / idempotency observations ───────────
+    // A separate cycle that drives the SAME boom proxy through its NON-throwing
+    // branch (x >= 0 returns x) AND its throwing branch on the same thread, plus
+    // a back-to-back double throw with NO recovery call between (proving the
+    // defensive clear is idempotent), and an INT_MIN boundary throw.
+    struct boundary_obs
     {
-        // Resolve the throwing method (instance proxy unless static).
-        if (is_static_call)
+        std::atomic<bool>         proxy_resolved{ false };
+        // boom(0): non-throwing branch; value_t must be int32 0 and is_void false.
+        std::atomic<bool>         nothrow_zero_reached{ false };
+        std::atomic<bool>         nothrow_zero_is_int32{ false };
+        std::atomic<bool>         nothrow_zero_is_void{ true };
+        std::atomic<std::int64_t> nothrow_zero_value{ k_uncaptured };
+        std::atomic<int>          nothrow_zero_pending{ -1 };   // ExceptionCheck after (must be 0)
+        // boom(INT_MAX): non-throwing branch returns INT_MAX.
+        std::atomic<bool>         nothrow_max_reached{ false };
+        std::atomic<std::int64_t> nothrow_max_value{ k_uncaptured };
+        // boom(INT_MIN): throwing branch (boundary-most negative).
+        std::atomic<bool>         intmin_reached{ false };
+        std::atomic<bool>         intmin_clean{ false };
+        // Back-to-back throw with NO recovery between (idempotent clear).
+        std::atomic<bool>         double_first_reached{ false };
+        std::atomic<bool>         double_second_reached{ false };
+        std::atomic<int>          double_pending_after{ -1 };   // ExceptionCheck after both (must be 0)
+        // A benign safeAdd AFTER the whole boundary sequence must still work.
+        std::atomic<bool>         recovery_ok{ false };
+        std::atomic<std::int64_t> recovery_value{ k_uncaptured };
+    };
+    boundary_obs g_boundary;
+
+    constexpr std::int32_t k_int_max{ 0x7FFFFFFF };
+    constexpr std::int32_t k_int_min{ static_cast<std::int32_t>(0x80000000U) };
+
+    // Snapshot the dispatch return-value shape of a throwing call() into `o`.
+    // Always [INFO]-only on the native side (a throwing call's "return" is the
+    // dispatcher's zero default cell, not a contract).
+    auto record_return_shape(obs& o, const vmhook::method_proxy::value_t& result) noexcept -> void
+    {
+        o.reached_after.store(true);
+        o.ret_is_void.store(result.is_void());
+        o.ret_variant.store(static_cast<int>(result.data.index()));
+        const bool is_int32{ std::holds_alternative<std::int32_t>(result.data) };
+        o.ret_is_int32.store(is_int32);
+        if (is_int32)
         {
-            auto proxy{ throwfix::static_method(name, sig) };
-            if (!proxy.has_value())
-            {
-                return;
-            }
-            o.resolved.store(true);
-            if (proxy->name() != std::string_view{ name }
-                || proxy->signature() != std::string_view{ sig })
-            {
-                return;
-            }
-            o.identity_ok.store(true);
-
-            // THE THROWING CALL (static).  Copy-init the value_t (never brace).
-            const vmhook::method_proxy::value_t result = proxy->call(arg);
-            o.reached_after.store(true);
-            o.ret_is_void.store(result.is_void());
-            o.ret_variant.store(static_cast<int>(result.data.index()));
-            const bool is_int32{ std::holds_alternative<std::int32_t>(result.data) };
-            o.ret_is_int32.store(is_int32);
-            if (is_int32)
-            {
-                const std::int32_t iv = result;
-                o.ret_int.store(static_cast<std::int64_t>(iv));
-            }
+            const std::int32_t iv = result;
+            o.ret_int.store(static_cast<std::int64_t>(iv));
         }
-        else
-        {
-            if (!self)
-            {
-                return;
-            }
-            auto proxy{ self->get_method(name, sig) };
-            if (!proxy.has_value())
-            {
-                return;
-            }
-            o.resolved.store(true);
-            if (proxy->name() != std::string_view{ name }
-                || proxy->signature() != std::string_view{ sig })
-            {
-                return;
-            }
-            o.identity_ok.store(true);
+    }
 
-            // THE THROWING CALL (instance).  Copy-init the value_t (never brace).
-            const vmhook::method_proxy::value_t result = proxy->call(arg);
-            o.reached_after.store(true);
-            o.ret_is_void.store(result.is_void());
-            o.ret_variant.store(static_cast<int>(result.data.index()));
-            const bool is_int32{ std::holds_alternative<std::int32_t>(result.data) };
-            o.ret_is_int32.store(is_int32);
-            if (is_int32)
-            {
-                const std::int32_t iv = result;
-                o.ret_int.store(static_cast<std::int64_t>(iv));
-            }
-        }
-
+    // The UNIVERSAL post-throw tail shared by every throwing scenario: snapshot
+    // the pre-clear exception state, run the defensive clear, then prove the
+    // thread is healthy (benign safeAdd() recovers + returns N+1, an instance
+    // field read returns the sentinel, a static field read returns its sentinel).
+    // Captures into `o`.  `safe_add_arg` is the recovery call's argument.
+    auto post_throw_cleanup_and_health(const std::unique_ptr<throwfix>& self,
+                                       obs& o,
+                                       std::int32_t safe_add_arg) noexcept -> void
+    {
         // Guarantee a non-null JNIEnv before reading the pre-clear state, so the
         // snapshot is a DEFINITE 1/0 (not -1 unknown env) on both paths.
         static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
@@ -384,6 +390,238 @@ namespace
         static_cast<void>(raw_clear_pending_exception());
     }
 
+    // Resolve + identity-check + drive ONE throwing call() for `o`, capturing the
+    // post-throw cleanliness and health observations.  `arg` is the marshalled
+    // sentinel; `name`/`sig` select the method.  `is_static_call` chooses the
+    // static dispatch for the static scenario.  No-throw by construction.
+    auto run_throwing_scenario(const std::unique_ptr<throwfix>& self,
+                               obs& o,
+                               const char* name,
+                               const char* sig,
+                               std::int32_t arg,
+                               bool is_static_call,
+                               std::int32_t safe_add_arg) noexcept -> void
+    {
+        // Resolve the throwing method (instance proxy unless static).
+        if (is_static_call)
+        {
+            auto proxy{ throwfix::static_method(name, sig) };
+            if (!proxy.has_value())
+            {
+                return;
+            }
+            o.resolved.store(true);
+            if (proxy->name() != std::string_view{ name }
+                || proxy->signature() != std::string_view{ sig })
+            {
+                return;
+            }
+            o.identity_ok.store(true);
+
+            // THE THROWING CALL (static).  Copy-init the value_t (never brace).
+            const vmhook::method_proxy::value_t result = proxy->call(arg);
+            record_return_shape(o, result);
+        }
+        else
+        {
+            if (!self)
+            {
+                return;
+            }
+            auto proxy{ self->get_method(name, sig) };
+            if (!proxy.has_value())
+            {
+                return;
+            }
+            o.resolved.store(true);
+            if (proxy->name() != std::string_view{ name }
+                || proxy->signature() != std::string_view{ sig })
+            {
+                return;
+            }
+            o.identity_ok.store(true);
+
+            // THE THROWING CALL (instance).  Copy-init the value_t (never brace).
+            const vmhook::method_proxy::value_t result = proxy->call(arg);
+            record_return_shape(o, result);
+        }
+
+        post_throw_cleanup_and_health(self, o, safe_add_arg);
+    }
+
+    // ── argument-shape throwing runners ──────────────────────────────────────
+    // Each resolves the throwing method by EXACT name+signature, checks the proxy
+    // identity, drives ONE throwing call() with the shape-specific argument
+    // (copy-init the value_t), records the return shape, then runs the shared
+    // cleanliness + health tail.  The Java body records the marshalled argument
+    // BEFORE throwing, so the body-entered / received-arg witnesses (asserted by
+    // the caller) prove the shape-specific arg crossed the boundary intact.
+
+    auto run_throwing_no_arg(const std::unique_ptr<throwfix>& self, obs& o,
+                             std::int32_t safe_add_arg) noexcept -> void
+    {
+        if (!self) { return; }
+        auto proxy{ self->get_method("throwNoArg", "()I") };
+        if (!proxy.has_value()) { return; }
+        o.resolved.store(true);
+        if (proxy->name() != std::string_view{ "throwNoArg" }
+            || proxy->signature() != std::string_view{ "()I" }) { return; }
+        o.identity_ok.store(true);
+        const vmhook::method_proxy::value_t result = proxy->call();
+        record_return_shape(o, result);
+        post_throw_cleanup_and_health(self, o, safe_add_arg);
+    }
+
+    auto run_throwing_long_arg(const std::unique_ptr<throwfix>& self, obs& o,
+                               std::int64_t arg, std::int32_t safe_add_arg) noexcept -> void
+    {
+        if (!self) { return; }
+        auto proxy{ self->get_method("throwLongArg", "(J)I") };
+        if (!proxy.has_value()) { return; }
+        o.resolved.store(true);
+        if (proxy->name() != std::string_view{ "throwLongArg" }
+            || proxy->signature() != std::string_view{ "(J)I" }) { return; }
+        o.identity_ok.store(true);
+        const vmhook::method_proxy::value_t result = proxy->call(arg);
+        record_return_shape(o, result);
+        post_throw_cleanup_and_health(self, o, safe_add_arg);
+    }
+
+    auto run_throwing_double_arg(const std::unique_ptr<throwfix>& self, obs& o,
+                                 double arg, std::int32_t safe_add_arg) noexcept -> void
+    {
+        if (!self) { return; }
+        auto proxy{ self->get_method("throwDoubleArg", "(D)I") };
+        if (!proxy.has_value()) { return; }
+        o.resolved.store(true);
+        if (proxy->name() != std::string_view{ "throwDoubleArg" }
+            || proxy->signature() != std::string_view{ "(D)I" }) { return; }
+        o.identity_ok.store(true);
+        const vmhook::method_proxy::value_t result = proxy->call(arg);
+        record_return_shape(o, result);
+        post_throw_cleanup_and_health(self, o, safe_add_arg);
+    }
+
+    auto run_throwing_string_arg(const std::unique_ptr<throwfix>& self, obs& o,
+                                 const std::string& arg, std::int32_t safe_add_arg) noexcept -> void
+    {
+        if (!self) { return; }
+        auto proxy{ self->get_method("throwStringArg", "(Ljava/lang/String;)I") };
+        if (!proxy.has_value()) { return; }
+        o.resolved.store(true);
+        if (proxy->name() != std::string_view{ "throwStringArg" }
+            || proxy->signature() != std::string_view{ "(Ljava/lang/String;)I" }) { return; }
+        o.identity_ok.store(true);
+        const vmhook::method_proxy::value_t result = proxy->call(arg);
+        record_return_shape(o, result);
+        post_throw_cleanup_and_health(self, o, safe_add_arg);
+    }
+
+    auto run_throwing_two_args(const std::unique_ptr<throwfix>& self, obs& o,
+                               std::int32_t a, std::int64_t b, std::int32_t safe_add_arg) noexcept -> void
+    {
+        if (!self) { return; }
+        auto proxy{ self->get_method("throwTwoArgs", "(IJ)I") };
+        if (!proxy.has_value()) { return; }
+        o.resolved.store(true);
+        if (proxy->name() != std::string_view{ "throwTwoArgs" }
+            || proxy->signature() != std::string_view{ "(IJ)I" }) { return; }
+        o.identity_ok.store(true);
+        const vmhook::method_proxy::value_t result = proxy->call(a, b);
+        record_return_shape(o, result);
+        post_throw_cleanup_and_health(self, o, safe_add_arg);
+    }
+
+    // Boundary / non-throwing-branch / idempotency drive: ONE detour cycle that
+    // exercises a family of edge inputs on the SAME boom proxy.  Proves:
+    //   (1) the proxy that JUST threw is reusable for a NON-throwing call —
+    //       boom(0) and boom(INT_MAX) return their argument (the real
+    //       non-throwing branch), value_t is the int32 alternative (NOT void),
+    //       and no exception is pending after a non-throwing call;
+    //   (2) the most-negative boundary arg (INT_MIN) throws and clears cleanly;
+    //   (3) two throwing calls BACK-TO-BACK with NO recovery call between leave
+    //       the thread clean (the defensive clear is idempotent across throws);
+    //   (4) a benign safeAdd() still works after the whole sequence.
+    auto run_boundary_sequence(const std::unique_ptr<throwfix>& self) noexcept -> void
+    {
+        if (!self) { return; }
+        auto boom{ self->get_method("boom", "(I)I") };
+        if (!boom.has_value()) { return; }
+        g_boundary.proxy_resolved.store(true);
+
+        // (1a) Non-throwing branch: boom(0) -> 0.  No throw, so no clear needed,
+        // but we snapshot ExceptionCheck to prove a non-throwing call leaves it 0.
+        {
+            const vmhook::method_proxy::value_t r = boom->call(static_cast<std::int32_t>(0));
+            g_boundary.nothrow_zero_reached.store(true);
+            g_boundary.nothrow_zero_is_void.store(r.is_void());
+            const bool is_int32{ std::holds_alternative<std::int32_t>(r.data) };
+            g_boundary.nothrow_zero_is_int32.store(is_int32);
+            if (is_int32)
+            {
+                const std::int32_t v = r;
+                g_boundary.nothrow_zero_value.store(static_cast<std::int64_t>(v));
+            }
+            static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
+            g_boundary.nothrow_zero_pending.store(jni_exception_pending());
+        }
+
+        // (1b) Non-throwing branch boundary: boom(INT_MAX) -> INT_MAX.
+        {
+            const vmhook::method_proxy::value_t r = boom->call(k_int_max);
+            g_boundary.nothrow_max_reached.store(true);
+            if (std::holds_alternative<std::int32_t>(r.data))
+            {
+                const std::int32_t v = r;
+                g_boundary.nothrow_max_value.store(static_cast<std::int64_t>(v));
+            }
+        }
+
+        // (2) Most-negative boundary arg throws; clear and verify clean.
+        {
+            const vmhook::method_proxy::value_t r = boom->call(k_int_min);
+            g_boundary.intmin_reached.store(true);
+            static_cast<void>(r.is_void());
+            g_boundary.intmin_clean.store(defensive_clear() == 0);
+        }
+
+        // (3) Two throws BACK-TO-BACK, NO recovery between, ONE clear after.
+        {
+            const vmhook::method_proxy::value_t r1 = boom->call(static_cast<std::int32_t>(-100));
+            g_boundary.double_first_reached.store(true);
+            static_cast<void>(r1.is_void());
+            const vmhook::method_proxy::value_t r2 = boom->call(static_cast<std::int32_t>(-200));
+            g_boundary.double_second_reached.store(true);
+            static_cast<void>(r2.is_void());
+            g_boundary.double_pending_after.store(defensive_clear());
+        }
+
+        // (4) Benign recovery call after the whole boundary sequence.
+        {
+            auto sa{ self->get_method("safeAdd", "(I)I") };
+            if (sa.has_value())
+            {
+                const vmhook::method_proxy::value_t r = sa->call(static_cast<std::int32_t>(199));
+                if (std::holds_alternative<std::int32_t>(r.data))
+                {
+                    const std::int32_t v = r;
+                    g_boundary.recovery_value.store(static_cast<std::int64_t>(v));
+                    g_boundary.recovery_ok.store(true);
+                }
+                vmhook::detail::jni_exception_clear();
+            }
+        }
+
+        // Final clear so nothing escapes into vmhook.Main.
+        static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
+        vmhook::detail::jni_exception_clear();
+        static_cast<void>(raw_clear_pending_exception());
+    }
+
+    // A scenario id reserved for the boundary cycle (drive() programs `scenario`
+    // with it; the detour dispatches to run_boundary_sequence).
+    constexpr std::int32_t SC_BOUNDARY{ 1000 };
+
     // The trigger() detour: read the requested scenario from the fixture, drive
     // the matching throwing call(), and do all post-throw work.  No-throw by
     // construction.  NOT noexcept (function_traits has no noexcept arm).
@@ -420,7 +658,25 @@ namespace
         case SC_NESTED:   run_throwing_scenario(self, g_obs[SC_NESTED],   "throwNested",     "(I)I", -8,  false, 107); break;
         case SC_STATIC:   run_throwing_scenario(self, g_obs[SC_STATIC],   "sBoom",           "(I)I", -9,  true,  108); break;
         case SC_AFTER_OK: run_throwing_scenario(self, g_obs[SC_AFTER_OK], "throwAfterSuccess","(I)I", -10, false, 109); break;
-        default: break;
+        // ── return-descriptor variety: (I)<ret>, int arg, recorded before throw ──
+        case SC_RET_VOID:   run_throwing_scenario(self, g_obs[SC_RET_VOID],   "throwVoid",   "(I)V",                  -11, false, 110); break;
+        case SC_RET_LONG:   run_throwing_scenario(self, g_obs[SC_RET_LONG],   "throwLong",   "(I)J",                  -12, false, 111); break;
+        case SC_RET_DOUBLE: run_throwing_scenario(self, g_obs[SC_RET_DOUBLE], "throwDouble", "(I)D",                  -13, false, 112); break;
+        case SC_RET_BOOL:   run_throwing_scenario(self, g_obs[SC_RET_BOOL],   "throwBool",   "(I)Z",                  -14, false, 113); break;
+        case SC_RET_STRING: run_throwing_scenario(self, g_obs[SC_RET_STRING], "throwString", "(I)Ljava/lang/String;", -15, false, 114); break;
+        // ── argument-shape variety: dedicated runners marshal the wide/ref arg ──
+        case SC_ARG_NONE:   run_throwing_no_arg    (self, g_obs[SC_ARG_NONE],                                              115); break;
+        case SC_ARG_LONG:   run_throwing_long_arg  (self, g_obs[SC_ARG_LONG],   static_cast<std::int64_t>(0x0123456789ABCDEFLL), 116); break;
+        case SC_ARG_DOUBLE: run_throwing_double_arg(self, g_obs[SC_ARG_DOUBLE], 3.141592653589793,                              117); break;
+        case SC_ARG_STRING: run_throwing_string_arg(self, g_obs[SC_ARG_STRING], std::string{ "throw-arg-marshal" },             118); break;
+        case SC_ARG_TWO:    run_throwing_two_args  (self, g_obs[SC_ARG_TWO],    static_cast<std::int32_t>(0x6A6A),
+                                                    static_cast<std::int64_t>(0x7EDCBA9812345678LL),                            119); break;
+        // ── extra unwind shapes ──
+        case SC_DEEP3:    run_throwing_scenario(self, g_obs[SC_DEEP3],    "throwDeep3",    "(I)I", -21, false, 120); break;
+        case SC_FINALLY:  run_throwing_scenario(self, g_obs[SC_FINALLY],  "throwInFinally","(I)I", -22, false, 121); break;
+        default:
+            if (sc == SC_BOUNDARY) { run_boundary_sequence(self); }
+            break;
         }
     }
 
@@ -442,18 +698,17 @@ namespace
             []() { return throwfix::get_done(); });
     }
 
-    // Per-scenario assertion block.  `prefix` is unique per scenario so failures
-    // are unambiguous; `entered_field`/`arg_field` are the Java witnesses;
-    // `expected_arg` is the sentinel the native side marshalled; `safe_add_arg`
-    // is what safeAdd was called with this cycle (recovery proof returns +1).
-    auto assert_scenario(vmhook_test::context& ctx,
-                         const char* prefix,
-                         bool probe_done,
-                         const obs& o,
-                         const char* entered_field,
-                         const char* arg_field,
-                         std::int32_t expected_arg,
-                         std::int32_t safe_add_arg) -> void
+    // The portion of the per-scenario contract that is IDENTICAL for every
+    // throwing call regardless of its argument shape or return descriptor:
+    // resolution + identity, the headline "reached the line after call()" proof,
+    // the thread-left-clean invariant, and the post-throw JVM-health triad.
+    // Returns false (and records the skip) when the probe did not complete this
+    // cycle, so callers can short-circuit their shape-specific witness checks.
+    auto assert_common_triad(vmhook_test::context& ctx,
+                             const char* prefix,
+                             bool probe_done,
+                             const obs& o,
+                             std::int32_t safe_add_arg) -> bool
     {
         const auto name = [&](const char* suffix) { return std::string{ prefix } + "_" + suffix; };
 
@@ -462,7 +717,7 @@ namespace
         {
             ctx.record("[INFO] method_throwing_call_site/" + std::string{ prefix }
                        + ": probe did not complete; observations not captured this cycle.");
-            return;
+            return false;
         }
 
         // Resolution + identity survived the in-detour guards.
@@ -471,10 +726,6 @@ namespace
 
         // *** THE headline proof: the line after the throwing call() executed. ***
         ctx.check(name("reached_line_after_throwing_call"), o.reached_after.load());
-
-        // The throwing method genuinely ran with our marshalled arg.
-        ctx.check(name("body_entered"),     throwfix::entered(entered_field) >= 1);
-        ctx.check(name("received_arg"),     throwfix::last_arg(arg_field) == expected_arg);
 
         // Thread left CLEAN (universal HARD invariant on every toolchain/JDK).
         ctx.check(name("no_pending_exception_after_clear"), o.clean_after_clear.load());
@@ -513,6 +764,30 @@ namespace
                   : "-1 (no JNIEnv / slot)");
             ctx.record(line);
         }
+        return true;
+    }
+
+    // Per-scenario assertion block for the int-arg throwing methods.  `prefix` is
+    // unique per scenario so failures are unambiguous; `entered_field`/`arg_field`
+    // are the Java witnesses; `expected_arg` is the sentinel the native side
+    // marshalled; `safe_add_arg` is what safeAdd was called with this cycle.
+    auto assert_scenario(vmhook_test::context& ctx,
+                         const char* prefix,
+                         bool probe_done,
+                         const obs& o,
+                         const char* entered_field,
+                         const char* arg_field,
+                         std::int32_t expected_arg,
+                         std::int32_t safe_add_arg) -> void
+    {
+        if (!assert_common_triad(ctx, prefix, probe_done, o, safe_add_arg))
+        {
+            return;
+        }
+        const auto name = [&](const char* suffix) { return std::string{ prefix } + "_" + suffix; };
+        // The throwing method genuinely ran with our marshalled int arg.
+        ctx.check(name("body_entered"), throwfix::entered(entered_field) >= 1);
+        ctx.check(name("received_arg"), throwfix::last_arg(arg_field) == expected_arg);
     }
 }
 
@@ -540,6 +815,19 @@ VMHOOK_JVM_MODULE(method_throwing_call_site)
     ctx.check("tcs_sBoomEntered_field_resolves",  throwfix::resolves("sBoomEntered"));
     ctx.check("tcs_afterSuccessEntered_field_resolves", throwfix::resolves("afterSuccessEntered"));
     ctx.check("tcs_staticHealth_field_resolves",  throwfix::resolves("staticHealthField"));
+    // New return-descriptor + argument-shape + extra-unwind witnesses.
+    ctx.check("tcs_voidEntered_field_resolves",      throwfix::resolves("voidEntered"));
+    ctx.check("tcs_longRetEntered_field_resolves",   throwfix::resolves("longRetEntered"));
+    ctx.check("tcs_doubleRetEntered_field_resolves", throwfix::resolves("doubleRetEntered"));
+    ctx.check("tcs_boolRetEntered_field_resolves",   throwfix::resolves("boolRetEntered"));
+    ctx.check("tcs_stringRetEntered_field_resolves", throwfix::resolves("stringRetEntered"));
+    ctx.check("tcs_noArgEntered_field_resolves",     throwfix::resolves("noArgEntered"));
+    ctx.check("tcs_longArgLast_field_resolves",      throwfix::resolves("longArgLast"));
+    ctx.check("tcs_doubleArgLastBits_field_resolves",throwfix::resolves("doubleArgLastBits"));
+    ctx.check("tcs_stringArgLastLen_field_resolves", throwfix::resolves("stringArgLastLen"));
+    ctx.check("tcs_twoArgsLastB_field_resolves",     throwfix::resolves("twoArgsLastB"));
+    ctx.check("tcs_deep3InnerEntered_field_resolves",throwfix::resolves("deep3InnerEntered"));
+    ctx.check("tcs_finallyRan_field_resolves",       throwfix::resolves("finallyRan"));
 
     // Contract up front so it is in the results even if a probe never completes.
     ctx.record("[INFO] method_throwing_call_site: a Java method invoked via "
@@ -616,14 +904,167 @@ VMHOOK_JVM_MODULE(method_throwing_call_site)
     const bool d_after   { drive(ctx, SC_AFTER_OK) };
     assert_scenario(ctx, "tcs_after_ok", d_after,    g_obs[SC_AFTER_OK], "afterSuccessEntered","afterSuccessLastArg", -10, 109);
 
+    // ── return-descriptor variety: same int-arg contract, different ret_char ──
+    const bool d_ret_void   { drive(ctx, SC_RET_VOID)   };
+    assert_scenario(ctx, "tcs_ret_void",   d_ret_void,   g_obs[SC_RET_VOID],   "voidEntered",      "voidLastArg",      -11, 110);
+    const bool d_ret_long   { drive(ctx, SC_RET_LONG)   };
+    assert_scenario(ctx, "tcs_ret_long",   d_ret_long,   g_obs[SC_RET_LONG],   "longRetEntered",   "longRetLastArg",   -12, 111);
+    const bool d_ret_double { drive(ctx, SC_RET_DOUBLE) };
+    assert_scenario(ctx, "tcs_ret_double", d_ret_double, g_obs[SC_RET_DOUBLE], "doubleRetEntered", "doubleRetLastArg", -13, 112);
+    const bool d_ret_bool   { drive(ctx, SC_RET_BOOL)   };
+    assert_scenario(ctx, "tcs_ret_bool",   d_ret_bool,   g_obs[SC_RET_BOOL],   "boolRetEntered",   "boolRetLastArg",   -14, 113);
+    const bool d_ret_string { drive(ctx, SC_RET_STRING) };
+    assert_scenario(ctx, "tcs_ret_string", d_ret_string, g_obs[SC_RET_STRING], "stringRetEntered", "stringRetLastArg", -15, 114);
+
+    // Characterize the unwound-path return SHAPE per return descriptor (the
+    // "default cell": result_holder was never written by the throwing callee).
+    // [INFO] only — a throwing call's return value is not a contract — but it
+    // documents the decoded variant for each width so a future regression that
+    // (e.g.) started returning monostate uniformly is visible.
+    if (d_ret_void)
+    {
+        ctx.record("[INFO] method_throwing_call_site/tcs_ret_void: (I)V throwing call -> is_void="
+                   + std::string(g_obs[SC_RET_VOID].ret_is_void.load() ? "true" : "false")
+                   + " variant=" + std::to_string(g_obs[SC_RET_VOID].ret_variant.load())
+                   + " (void decode on the unwound path).");
+    }
+    if (d_ret_long)
+    {
+        ctx.record("[INFO] method_throwing_call_site/tcs_ret_long: (I)J throwing call -> variant="
+                   + std::to_string(g_obs[SC_RET_LONG].ret_variant.load())
+                   + " (64-bit default-cell decode; NOT asserted).");
+    }
+    if (d_ret_string)
+    {
+        ctx.record("[INFO] method_throwing_call_site/tcs_ret_string: (I)Ljava/lang/String; throwing "
+                   "call -> is_void=" + std::string(g_obs[SC_RET_STRING].ret_is_void.load() ? "true" : "false")
+                   + " variant=" + std::to_string(g_obs[SC_RET_STRING].ret_variant.load())
+                   + " (reference decode of the zero default cell -> null -> monostate).");
+    }
+
+    // ── argument-shape variety: dedicated witnesses prove the wide/ref arg ──
+    const bool d_arg_none   { drive(ctx, SC_ARG_NONE)   };
+    if (assert_common_triad(ctx, "tcs_arg_none", d_arg_none, g_obs[SC_ARG_NONE], 115))
+    {
+        ctx.check("tcs_arg_none_body_entered", throwfix::entered("noArgEntered") >= 1);
+    }
+
+    const bool d_arg_long   { drive(ctx, SC_ARG_LONG)   };
+    if (assert_common_triad(ctx, "tcs_arg_long", d_arg_long, g_obs[SC_ARG_LONG], 116))
+    {
+        ctx.check("tcs_arg_long_body_entered", throwfix::entered("longArgEntered") >= 1);
+        // The full 64-bit arg crossed the boundary intact (a truncation/shift
+        // would corrupt this even though the method threw).
+        ctx.check("tcs_arg_long_received_full_64bit",
+                  throwfix::long_field("longArgLast")
+                  == static_cast<std::int64_t>(0x0123456789ABCDEFLL));
+    }
+
+    const bool d_arg_double { drive(ctx, SC_ARG_DOUBLE) };
+    if (assert_common_triad(ctx, "tcs_arg_double", d_arg_double, g_obs[SC_ARG_DOUBLE], 117))
+    {
+        ctx.check("tcs_arg_double_body_entered", throwfix::entered("doubleArgEntered") >= 1);
+        // doubleToRawLongBits(3.141592653589793) == 0x400921FB54442D18 (Math.PI).
+        ctx.check("tcs_arg_double_received_exact_bits",
+                  throwfix::long_field("doubleArgLastBits")
+                  == static_cast<std::int64_t>(0x400921FB54442D18LL));
+    }
+
+    const bool d_arg_string { drive(ctx, SC_ARG_STRING) };
+    if (assert_common_triad(ctx, "tcs_arg_string", d_arg_string, g_obs[SC_ARG_STRING], 118))
+    {
+        ctx.check("tcs_arg_string_body_entered", throwfix::entered("stringArgEntered") >= 1);
+        // The marshalled java.lang.String reached the body: its length matches and
+        // its decoded content equals the native sentinel.
+        ctx.check("tcs_arg_string_received_length",
+                  throwfix::last_arg("stringArgLastLen")
+                  == static_cast<std::int32_t>(std::string{ "throw-arg-marshal" }.size()));
+        ctx.check("tcs_arg_string_received_value",
+                  throwfix::string_field("stringArgLastValue") == "throw-arg-marshal");
+    }
+
+    const bool d_arg_two    { drive(ctx, SC_ARG_TWO)    };
+    if (assert_common_triad(ctx, "tcs_arg_two", d_arg_two, g_obs[SC_ARG_TWO], 119))
+    {
+        ctx.check("tcs_arg_two_body_entered", throwfix::entered("twoArgsEntered") >= 1);
+        // The int and the wide long both arrived intact across the two-slot frame
+        // (a slot-shift from the wide arg would corrupt one of these).
+        ctx.check("tcs_arg_two_received_int",
+                  throwfix::last_arg("twoArgsLastA") == static_cast<std::int32_t>(0x6A6A));
+        ctx.check("tcs_arg_two_received_long",
+                  throwfix::long_field("twoArgsLastB")
+                  == static_cast<std::int64_t>(0x7EDCBA9812345678LL));
+    }
+
+    // ── extra unwind shapes ──
+    const bool d_deep3   { drive(ctx, SC_DEEP3)   };
+    assert_scenario(ctx, "tcs_deep3",   d_deep3,   g_obs[SC_DEEP3],   "deep3Entered",   "deep3LastArg",   -21, 120);
+    const bool d_finally { drive(ctx, SC_FINALLY) };
+    assert_scenario(ctx, "tcs_finally", d_finally, g_obs[SC_FINALLY], "finallyEntered", "finallyLastArg", -22, 121);
+
+    // The three-frame unwind ran every intermediate frame; the finally handler's
+    // committed side effect ran on the way out.
+    if (d_deep3)
+    {
+        ctx.check("tcs_deep3_mid_frame_entered",   throwfix::entered("deep3MidEntered")   >= 1);
+        ctx.check("tcs_deep3_inner_frame_entered", throwfix::entered("deep3InnerEntered") >= 1);
+    }
+    if (d_finally)
+    {
+        ctx.check("tcs_finally_handler_ran", throwfix::entered("finallyRan") >= 1);
+    }
+
+    // =====================================================================
+    //  2b. Boundary / non-throwing-branch / idempotency cycle (one drive).
+    // =====================================================================
+    const bool d_boundary{ drive(ctx, SC_BOUNDARY) };
+    ctx.check("tcs_boundary_probe_completed", d_boundary);
+    if (d_boundary)
+    {
+        ctx.check("tcs_boundary_proxy_resolved", g_boundary.proxy_resolved.load());
+
+        // (1) The SAME proxy that throws is reusable for the NON-throwing branch:
+        //     boom(0) -> 0 (int32 alternative, NOT void), no pending exception.
+        ctx.check("tcs_boundary_nothrow_zero_reached",  g_boundary.nothrow_zero_reached.load());
+        ctx.check("tcs_boundary_nothrow_zero_is_int32", g_boundary.nothrow_zero_is_int32.load());
+        ctx.check("tcs_boundary_nothrow_zero_not_void", !g_boundary.nothrow_zero_is_void.load());
+        ctx.check("tcs_boundary_nothrow_zero_value_is_zero",
+                  g_boundary.nothrow_zero_value.load() == 0);
+        ctx.check("tcs_boundary_nothrow_call_left_thread_clean",
+                  g_boundary.nothrow_zero_pending.load() == 0);
+
+        // (1b) boom(INT_MAX) non-throwing branch returns INT_MAX exactly.
+        ctx.check("tcs_boundary_nothrow_max_reached", g_boundary.nothrow_max_reached.load());
+        ctx.check("tcs_boundary_nothrow_max_value_is_int_max",
+                  g_boundary.nothrow_max_value.load() == static_cast<std::int64_t>(k_int_max));
+
+        // (2) INT_MIN throwing-branch boundary unwinds and clears cleanly.
+        ctx.check("tcs_boundary_intmin_reached", g_boundary.intmin_reached.load());
+        ctx.check("tcs_boundary_intmin_clean",   g_boundary.intmin_clean.load());
+
+        // (3) Two throws back-to-back with NO recovery between leave the thread
+        //     clean after a SINGLE clear (the defensive clear is idempotent).
+        ctx.check("tcs_boundary_double_first_reached",  g_boundary.double_first_reached.load());
+        ctx.check("tcs_boundary_double_second_reached", g_boundary.double_second_reached.load());
+        ctx.check("tcs_boundary_double_thread_clean_after_both",
+                  g_boundary.double_pending_after.load() == 0);
+
+        // (4) A benign call still works after the whole boundary sequence.
+        ctx.check("tcs_boundary_recovery_ok", g_boundary.recovery_ok.load());
+        ctx.check("tcs_boundary_recovery_value_plus_one",
+                  g_boundary.recovery_value.load() == static_cast<std::int64_t>(200));
+    }
+
     // =====================================================================
     //  3. Cross-scenario invariants — the throws did not wedge the handshake
     //     and the inner Java frame of the nested throw genuinely ran.
     // =====================================================================
-    ctx.check("tcs_detour_ran_each_cycle", g_detour_calls.load() == SC_COUNT);
+    // One detour per throwing scenario PLUS the boundary cycle.
+    constexpr int k_total_cycles{ static_cast<int>(SC_COUNT) + 1 };
+    ctx.check("tcs_detour_ran_each_cycle", g_detour_calls.load() == k_total_cycles);
     ctx.check("tcs_self_valid_in_detour",  g_self_valid.load());
     // trigger() ran exactly once per cycle (the throws never re-entered it).
-    ctx.check("tcs_trigger_count_matches_cycles", throwfix::get_trigger_count() == SC_COUNT);
+    ctx.check("tcs_trigger_count_matches_cycles", throwfix::get_trigger_count() == k_total_cycles);
     // The nested-throw scenario unwound through the inner deep() frame too.
     ctx.check("tcs_nested_inner_frame_entered", throwfix::entered("nestedDeepEntered") >= 1);
     // safeAddCalls advanced: throwAfterSuccess committed its increment BEFORE

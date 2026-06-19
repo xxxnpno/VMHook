@@ -110,6 +110,52 @@ public final class ThrowingMethod
     public static volatile int afterSuccessEntered;
     public static volatile int afterSuccessLastArg;
 
+    // ── RETURN-DESCRIPTOR-variety witnesses (throwVoid / throwLong / ...) ───
+    /** throwVoid(int): (I)V — call() decodes 'V' (monostate) on the unwind. */
+    public static volatile int voidEntered;
+    public static volatile int voidLastArg;
+    /** throwLong(int): (I)J — call() decodes 'J' (64-bit default cell). */
+    public static volatile int longRetEntered;
+    public static volatile int longRetLastArg;
+    /** throwDouble(int): (I)D — call() decodes 'D' (double default cell). */
+    public static volatile int doubleRetEntered;
+    public static volatile int doubleRetLastArg;
+    /** throwBool(int): (I)Z — call() decodes 'Z'. */
+    public static volatile int boolRetEntered;
+    public static volatile int boolRetLastArg;
+    /** throwString(int): (I)Ljava/lang/String; — call() takes the object decode. */
+    public static volatile int stringRetEntered;
+    public static volatile int stringRetLastArg;
+
+    // ── ARGUMENT-SHAPE-variety witnesses (throwNoArg / throwLongArg / ...) ──
+    /** throwNoArg(): ()I — no extra-arg pack. */
+    public static volatile int noArgEntered;
+    /** throwLongArg(long): (J)I — full 64-bit arg recorded before the throw. */
+    public static volatile int  longArgEntered;
+    public static volatile long longArgLast;
+    /** throwDoubleArg(double): (D)I — arg's raw bits recorded before the throw. */
+    public static volatile int  doubleArgEntered;
+    public static volatile long doubleArgLastBits;
+    /** throwStringArg(String): (Ljava/lang/String;)I — marshalled String proven. */
+    public static volatile int    stringArgEntered;
+    public static volatile int    stringArgLastLen;
+    public static volatile String stringArgLastValue;
+    /** throwTwoArgs(int,long): (IJ)I — int then wide long, slot-shift witness. */
+    public static volatile int  twoArgsEntered;
+    public static volatile int  twoArgsLastA;
+    public static volatile long twoArgsLastB;
+
+    // ── extra unwind-shape witnesses (throwDeep3 / throwInFinally) ──────────
+    /** throwDeep3(int): unwinds three Java frames before reaching native. */
+    public static volatile int deep3Entered;
+    public static volatile int deep3MidEntered;
+    public static volatile int deep3InnerEntered;
+    public static volatile int deep3LastArg;
+    /** throwInFinally(int): throw that traverses a finally handler on the way out. */
+    public static volatile int finallyEntered;
+    public static volatile int finallyRan;
+    public static volatile int finallyLastArg;
+
     /** Bumped every time the benign control method safeAdd() runs.  The native
      *  side calls safeAdd AFTER a throw, so a growing value proves the JVM/thread
      *  is still able to dispatch Java bytecode post-exception. */
@@ -282,6 +328,160 @@ public final class ThrowingMethod
         afterSuccessEntered++;
         safeAddCalls++; // the "successful work" that commits before the throw
         throw new IllegalStateException("after-success:" + x);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  RETURN-DESCRIPTOR variety: throwing methods whose return type is NOT (I)I.
+    //  These exercise every ret_char decode branch of method_proxy::call() on the
+    //  unwound (exception) path — where result_holder was NEVER written by the
+    //  callee, so the decoded value is the dispatcher's zero default cell.  The
+    //  return value is therefore [INFO] only on the native side; what is asserted
+    //  is the same triad (body ran with our arg, thread clean, JVM healthy).
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** Throws after recording its arg; declared VOID so call() decodes 'V' ->
+     *  monostate even though the method never returns normally. */
+    public void throwVoid(final int x)
+    {
+        voidEntered++;
+        voidLastArg = x;
+        throw new IllegalStateException("void:" + x);
+    }
+
+    /** Throws after recording its arg; declared LONG so call() takes the 64-bit
+     *  'J' decode branch on the unwound path (the default-cell caveat at 64 bits). */
+    public long throwLong(final int x)
+    {
+        longRetEntered++;
+        longRetLastArg = x;
+        throw new IllegalStateException("long:" + x);
+    }
+
+    /** Throws after recording its arg; declared DOUBLE so call() takes the 'D'
+     *  decode branch on the unwound path. */
+    public double throwDouble(final int x)
+    {
+        doubleRetEntered++;
+        doubleRetLastArg = x;
+        throw new IllegalStateException("double:" + x);
+    }
+
+    /** Throws after recording its arg; declared BOOLEAN so call() takes the 'Z'
+     *  decode branch on the unwound path. */
+    public boolean throwBool(final int x)
+    {
+        boolRetEntered++;
+        boolRetLastArg = x;
+        throw new IllegalStateException("bool:" + x);
+    }
+
+    /** Throws after recording its arg; declared to return a reference
+     *  (java.lang.String) so call() takes the object-decode branch on the unwound
+     *  path (result_holder is the zero default cell, so the decoded "reference" is
+     *  null -> monostate; verified [INFO]-only). */
+    public String throwString(final int x)
+    {
+        stringRetEntered++;
+        stringRetLastArg = x;
+        throw new IllegalStateException("string:" + x);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  ARGUMENT-SHAPE variety: throwing methods whose parameter list is NOT a
+    //  single int.  These exercise the call() pack() branches (no-arg, wide long,
+    //  wide double, String reference, multi-slot) on a method that then THROWS, so
+    //  the marshalled argument is recorded BEFORE the throw and proven to have
+    //  arrived intact across the native->Java boundary that the exception unwinds.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** Zero-arg throwing method: () I.  Proves the no-extra-arg pack path (only
+     *  the receiver slot) survives a throw. */
+    public int throwNoArg()
+    {
+        noArgEntered++;
+        throw new IllegalStateException("no-arg");
+    }
+
+    /** Wide LONG arg then throw: (J)I.  Records the full 64-bit arg first so a
+     *  truncated/ shifted wide arg would be caught even though the call throws. */
+    public int throwLongArg(final long v)
+    {
+        longArgEntered++;
+        longArgLast = v;
+        throw new IllegalStateException("long-arg:" + v);
+    }
+
+    /** Wide DOUBLE arg then throw: (D)I.  Records the arg's raw bits via
+     *  Double.doubleToRawLongBits so the witness is bit-exact. */
+    public int throwDoubleArg(final double v)
+    {
+        doubleArgEntered++;
+        doubleArgLastBits = Double.doubleToRawLongBits(v);
+        throw new IllegalStateException("double-arg");
+    }
+
+    /** STRING reference arg then throw: (Ljava/lang/String;)I.  Records the
+     *  argument's length and a copy so the marshalled java.lang.String is proven
+     *  to have reached the body before the unwind. */
+    public int throwStringArg(final String s)
+    {
+        stringArgEntered++;
+        stringArgLastLen = (s == null) ? -1 : s.length();
+        stringArgLastValue = s;
+        throw new IllegalStateException("string-arg");
+    }
+
+    /** MULTI-SLOT args then throw: (IJ)I — an int followed by a wide long, so the
+     *  long occupies two interpreter local slots after a one-slot int.  Records
+     *  both so a slot-shift would be caught. */
+    public int throwTwoArgs(final int a, final long b)
+    {
+        twoArgsEntered++;
+        twoArgsLastA = a;
+        twoArgsLastB = b;
+        throw new IllegalStateException("two-args:" + a + "/" + b);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Extra UNWIND shapes.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** Throws through THREE Java frames (deeper than throwNested's two) so the
+     *  exception unwinds an extra interpreter frame before reaching native code. */
+    public int throwDeep3(final int x)
+    {
+        deep3Entered++;
+        deep3LastArg = x;
+        return deep3b(x);
+    }
+
+    private int deep3b(final int x)
+    {
+        deep3MidEntered++;
+        return deep3c(x);
+    }
+
+    private int deep3c(final int x)
+    {
+        deep3InnerEntered++;
+        throw new IllegalStateException("deep3:" + x);
+    }
+
+    /** Throws from inside a try whose FINALLY block also runs real work before the
+     *  exception propagates — proves a throw that traverses a finally handler on
+     *  the way out still leaves the thread clean. */
+    public int throwInFinally(final int x)
+    {
+        finallyEntered++;
+        finallyLastArg = x;
+        try
+        {
+            throw new IllegalStateException("finally-try:" + x);
+        }
+        finally
+        {
+            finallyRan++; // committed side effect on the unwind path
+        }
     }
 
     // ── benign control method: the JVM-health witness after the throw ───────

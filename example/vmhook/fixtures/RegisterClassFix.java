@@ -54,6 +54,14 @@ public final class RegisterClassFix
     // registered wrapper -> static accessor path.
     public static int classToken = 0x1357BD13; // 323158291
 
+    // Differently-typed static fields, all resolved THROUGH the registered
+    // wrapper's static_field(...) path.  They prove the type_to_class_map ->
+    // resolve_klass -> find_field resolution is signature-agnostic: once the
+    // klass is reached via the map, fields of any descriptor resolve.
+    public static long  classTokenLong = 0x0123456789ABCDEFL;
+    public static boolean classFlag = true;
+    public static String classLabel = "RegisterClassFix";
+
     // Witness: how many times the anchored method ran (Java-visible), so the
     // native side can correlate fire-count with real dispatch.
     public static volatile int anchorCalls;
@@ -76,6 +84,19 @@ public final class RegisterClassFix
     {
         anchorCalls = anchorCalls + 1;
         return this.marker + delta;
+    }
+
+    /**
+     * A STATIC method (distinct descriptor from the instance anchor) the native
+     * module resolves through the registered wrapper's static_method(...) path,
+     * proving the type_to_class_map -&gt; resolve_klass -&gt; method walk reaches a
+     * static method, and that static_method(...) correctly REJECTS the instance
+     * anchor.  The native side never CALLS this (resolution-only) to stay
+     * heap-modest; the value is incidental.
+     */
+    public static int staticAnchor(final int delta)
+    {
+        return classToken + delta;
     }
 
     static
