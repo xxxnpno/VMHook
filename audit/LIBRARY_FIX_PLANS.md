@@ -47,6 +47,23 @@ Source-verified fix-plans from the 10-agent investigation wave (2026-06-20), one
 - **Test:** the two reads are currently GATED [INFO] in field_inherited.cpp (resolution/signature/is_reference kept HARD). The fix flips the two value reads back to HARD `== "iface-const"` / `== "base-static-str"`.
 - **Risk:** unknown until root-caused — investigate FIRST; the read path is shared with the working direct-class + primitive cases, so a fix must not regress those. Add a field_static interface/grandparent reference-static cell to lock it.
 
+### 12. method::get_access_flags missing is_valid_pointer(this) guard — LOW (clean, additive) — found batch-21
+- **Bug:** `method::get_access_flags()` (vmhook.hpp:2728-2747) is the ONLY accessor in the entry cluster that does NOT guard `this` before computing `this + offset` — every sibling does: `get_i2i_entry` (2660), `get_from_interpreted_entry`/`get_from_compiled_entry` (3243), `get_code` (3129), `get_adapter` (3326), `get_flags` (2948) all `if (!entry || !is_valid_pointer(this)) return nullptr/0;`. On a freed/aliased Method* (the verify_hooks mode-3 path) it returns a non-null WILD `this+offset` pointer; a caller that derefs the returned `uint32*` faults uncontained on no-SEH.
+- **Fix:** add `if (!entry || !vmhook::hotspot::is_valid_pointer(this)) return nullptr;` at the top of get_access_flags, mirroring get_flags (2948). Trivial, additive, can't regress the warm path.
+- **Test:** method_entry_points_i2i_i2c already pins it (scenario 8 `null_bad_method_get_access_flags_did_not_crash`, characterized [INFO]); flip to HARD-returns-null after the fix.
+- **Risk:** nil.
+
+### 13. klass::find_field unbounded constant-pool index read — MEDIUM (AV hazard) — found batch-21
+- **Bug:** `klass::find_field` (vmhook.hpp:4070, :4090) reads `constant_pool_base[name_index]` / `[sig_index]` (u2 indices from class metadata) with NO length bound and NO `is_readable_pointer(&base[index])` probe — straight to `is_valid_pointer(value)` which DEREFS the slot word before validating. This is the field-path twin of the method-path FIX-B that already closed exactly this (`:2483-2505` / `:2560-2582`); left open for fields. Secondary: the `data[field_slot_index*6 + k]` walk (:4062-4079) is bounded only by `array_length/6`, never against the Array<u2> page extent. Also get_length() (:2379) reads `_length` after only is_valid_pointer(this), no is_readable_pointer — fault-safety rests entirely on os::safe_read.
+- **Fix:** mirror the method-path FIX-B: bound the CP index against the pool length + route the slot read through os::safe_read / is_readable_pointer before the is_valid_pointer deref.
+- **Test:** const_method_bounds (no-JVM) pins the bound invariants; add a field-path negative.
+- **Risk:** low (additive guard on a currently-unbounded read).
+
+### 14. NO-SEH cold reference-array / young-oop CRASH (field_arrays_object class) — the #28-lineage root cause
+- **Bug:** decoding a cold / GC-relocated young reference-array element oop, and especially a JNI method dispatch on a cold-decoded element (e.g. Item.getTag()), faults UNCONTAINED on a no-SEH toolchain (mingw / clang-cl) and KILLS the JVM (observed: clang-cl java8 died mid field_arrays_object inst_item, clang-cl java25 in the after-GC block — both "no TOTAL line"). KEY LESSON: best-effort `pass_or_info` gating stops a [FAIL] but NOT the crash — the fault is during the READ, before the check resolves. Library os::safe_read hardens a plain read but CANNOT make a JNI dispatch on a stale oop safe.
+- **Fix (test-side, applied):** guard the crash-prone reads with `#if (defined(_MSC_VER) && !defined(__clang__)) || !defined(_WIN32)` (real MSVC SEH + POSIX only; skip mingw/clang-cl), mirroring dont_inline scenario 7. **Fix (library, future):** route every reference-array element-oop decode through os::safe_read on Windows so a plain decode returns garbage instead of faulting; method-dispatch-on-cold-element stays test-gated.
+- **Risk:** the #if guard removes the read coverage on mingw/clang-cl (kept on MSVC + linux + macos). The library os::safe_read fix is the real cure for the decode half.
+
 ## TIER 2 — needs special handling / coupling (apply after Tier 1, carefully)
 
 ### 7. register_class factory-map asymmetry — HIGH (cross-type downcast UB)
