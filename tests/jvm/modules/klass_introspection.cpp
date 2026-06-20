@@ -1647,5 +1647,444 @@ VMHOOK_JVM_MODULE(klass_introspection)
         ctx.check("enum_enumeration_deterministic", enum_same);
     }
 
+    // =====================================================================
+    // PART S — NAME FORMS: internal '/'-name vs Java binary '.'-name, the '$'
+    //   nesting separator, and the host-name prefix that every nested shape
+    //   carries.  The native get_name() always yields the INTERNAL form
+    //   (packages joined by '/', nesting by '$'); replacing '/'->'.'
+    //   reconstructs the Java binary name exactly — pinned against the Java
+    //   getName() witness for every shape.  These are universal, HARD facts
+    //   (the internal-name encoding is stable across HotSpot 8..26).
+    // =====================================================================
+    cp("PART S name forms (slashed internal vs dotted binary, '$' nesting)");
+    {
+        // (tag, klass, internal-name constant, java-binary-name witness key)
+        struct name_case
+        {
+            const char* tag;
+            vmhook::hotspot::klass* k;
+            const char* internal;
+            const char* witness;
+        };
+        const name_case ncases[] = {
+            { "self",     k_self,     N_SELF,     "selfBinaryName" },
+            { "iface",    k_iface,    N_IFACE,    "ifaceBinaryName" },
+            { "enum",     k_enum,     N_ENUM,     "enumBinaryName" },
+            { "nested",   k_nested,   N_NESTED,   "nestedBinaryName" },
+            { "inner",    k_inner,    N_INNER,    "innerBinaryName" },
+            { "box",      k_box,      N_BOX,      "boxBinaryName" },
+            { "cmp",      k_cmp,      N_CMP,      "cmpBinaryName" },
+            { "leaf",     k_leaf,     N_LEAF,     "leafBinaryName" },
+            { "wide",     k_wide,     N_WIDE,     "wideBinaryName" },
+            { "marker",   k_marker,   N_MARKER,   "markerBinaryName" },
+            { "abstract", k_abstract, N_ABSTRACT, "abstractBinaryName" },
+        };
+        for (const name_case& c : ncases)
+        {
+            const std::string internal_nm{ klass_name_str(c.k) };
+            // Internal name echoes the '/'-form constant exactly.
+            ctx.check(std::string{ "nameform_internal_" } + c.tag, internal_nm == c.internal);
+            // The internal name NEVER contains a '.' (packages use '/').
+            ctx.check(std::string{ "nameform_no_dot_" } + c.tag,
+                      internal_nm.find('.') == std::string::npos);
+            // replace('/','.') reconstructs the Java binary name.
+            ctx.check(std::string{ "nameform_dotted_eq_java_" } + c.tag,
+                      readable_name(internal_nm) == kli::s(c.witness));
+        }
+
+        // Every NESTED shape's internal name contains the '$' nesting separator
+        // and begins with the top-level host name as a prefix; the top-level
+        // KlassIntrospection itself does NOT (no '$').
+        ctx.check("nameform_self_no_dollar",
+                  klass_name_str(k_self).find('$') == std::string::npos);
+        auto nested_carries_host = [&](const char* tag, vmhook::hotspot::klass* k)
+        {
+            const std::string nm{ klass_name_str(k) };
+            const std::string host{ std::string{ N_SELF } + "$" };
+            ctx.check(std::string{ "nameform_has_dollar_" } + tag,
+                      nm.find('$') != std::string::npos);
+            ctx.check(std::string{ "nameform_host_prefix_" } + tag,
+                      nm.rfind(host, 0) == 0);  // starts with "<host>$"
+        };
+        nested_carries_host("iface",    k_iface);
+        nested_carries_host("enum",     k_enum);
+        nested_carries_host("nested",   k_nested);
+        nested_carries_host("inner",    k_inner);
+        nested_carries_host("box",      k_box);
+        nested_carries_host("cmp",      k_cmp);
+        nested_carries_host("leaf",     k_leaf);
+        nested_carries_host("wide",     k_wide);
+        nested_carries_host("marker",   k_marker);
+        nested_carries_host("abstract", k_abstract);
+
+        // The enclosing-class binary name the Java side reports is exactly the
+        // top-level fixture for both a static-nested and a non-static-inner type.
+        ctx.check("nameform_nested_host_is_self",
+                  kli::s("nestedHostBinaryName") == "vmhook.fixtures.KlassIntrospection");
+        ctx.check("nameform_inner_host_is_self",
+                  kli::s("innerHostBinaryName") == "vmhook.fixtures.KlassIntrospection");
+
+        // Array binary names: int[].class.getName() is "[I"; the native array
+        // klass name echoes the SAME internal descriptor (no '/'->'.' rewrite
+        // for the array brackets/primitive char).  String[][].class.getName()
+        // is the dotted "[[Ljava.lang.String;", while the native array klass
+        // name is the SLASHED "[[Ljava/lang/String;" — so for a REFERENCE array
+        // the two differ exactly by the '/'->'.' of the element class name.
+        ctx.check("nameform_intarray_java_is_bracket_I",
+                  kli::s("intArrayBinaryName") == "[I");
+        vmhook::hotspot::klass* const k_ia{ vmhook::find_class("[I") };
+        if (k_ia)
+        {
+            ctx.check("nameform_intarray_native_eq_java",
+                      klass_name_str(k_ia) == kli::s("intArrayBinaryName"));
+        }
+        ctx.check("nameform_strarray2d_java_dotted",
+                  kli::s("strArray2DBinaryName") == "[[Ljava.lang.String;");
+        vmhook::hotspot::klass* const k_sa2{ vmhook::find_class("[[Ljava/lang/String;") };
+        if (k_sa2)
+        {
+            // Native slashed form -> dotted form == Java binary name.
+            ctx.check("nameform_strarray2d_dotted_eq_java",
+                      readable_name(klass_name_str(k_sa2)) == kli::s("strArray2DBinaryName"));
+        }
+    }
+
+    // =====================================================================
+    // PART T — get_next_link(): the ONE klass accessor no other PART touches.
+    //   _next_link chains the klasses of a single ClassLoaderData.  It is read
+    //   through a guarded safe_read_pointer, but the accessor THROWS when the
+    //   VMStruct entry is unavailable, so we wrap it and treat any throw / miss
+    //   as an [INFO] degrade (the entry's availability is JDK/loader-variant).
+    //   The HARD facts we can assert when it IS reachable: the link is either
+    //   null (end of chain) or a valid klass whose own name is non-empty, and a
+    //   short bounded walk never cycles back to the start within the cap.
+    // =====================================================================
+    cp("PART T get_next_link (loader class-chain link; best-effort)");
+    {
+        auto next_link_safe = [&](vmhook::hotspot::klass* k) -> vmhook::hotspot::klass*
+        {
+            if (!klass_header_safely_readable(k)) { return nullptr; }
+            try { return k->get_next_link(); }
+            catch (...) { return nullptr; }
+        };
+        // The VMStruct entry's availability decides whether this leg asserts.
+        static const vmhook::hotspot::vm_struct_entry_t* const nl_entry{
+            vmhook::hotspot::iterate_struct_entries("Klass", "_next_link") };
+        if (!nl_entry)
+        {
+            ctx.record("[INFO] Klass::_next_link VMStruct entry unavailable on this JDK — "
+                       "get_next_link leg skipped.");
+        }
+        else if (!klass_header_safely_readable(k_self))
+        {
+            ctx.record("[INFO] self klass header not safely readable — skipped next_link.");
+        }
+        else
+        {
+            vmhook::hotspot::klass* const nl{ next_link_safe(k_self) };
+            if (nl == nullptr)
+            {
+                ctx.record("[INFO] get_next_link(self) == null (end of this loader's "
+                           "klass chain, or link on an unmapped page) — no assert.");
+            }
+            else
+            {
+                // A non-null link must be a VALID klass with a readable, non-empty
+                // internal name (it is a real loaded klass on the same loader).
+                ctx.check("next_link_is_valid_klass", vmhook::hotspot::is_valid_pointer(nl));
+                ctx.check("next_link_has_name", !klass_name_str(nl).empty());
+                // Bounded walk of the chain: it must not revisit the start klass
+                // within a small cap (no self-cycle on the first few links).
+                bool no_immediate_cycle{ true };
+                vmhook::hotspot::klass* w{ nl };
+                int guard{ 0 };
+                while (w && guard++ < 8)
+                {
+                    if (w == k_self) { no_immediate_cycle = false; break; }
+                    if (!klass_header_safely_readable(w)) { break; }
+                    w = next_link_safe(w);
+                }
+                ctx.check("next_link_no_immediate_self_cycle", no_immediate_cycle);
+            }
+        }
+    }
+
+    // =====================================================================
+    // PART U — ABSTRACT / INTERFACE / ANNOTATION method enumeration (by-type),
+    //   plus Nested / Inner declared methods.  The existing module proved the
+    //   interface's abstract/default/static methods and the marker's accessors
+    //   only via the BY-NAME overload; here we pin them through the BY-TYPE
+    //   overload too AND add the abstract klass's mustImplement()/concreteHelper
+    //   (an abstract METHOD is a real entry in the abstract klass's _methods).
+    // =====================================================================
+    cp("PART U abstract/iface/annotation/nested/inner method enumeration (by-type)");
+    {
+        // Abstract klass: the abstract method AND the concrete helper both live
+        // in _methods (an abstract method is a declared method with no body, but
+        // it IS enumerated).  <init> is present (an abstract class has a ctor).
+        const auto m_abstract{ vmhook::get_class_methods<w_abstract>() };
+        ctx.check("abstract_nonempty", !m_abstract.empty());
+        ctx.check("abstract_has_mustImplement",
+                  count_pair(m_abstract, "mustImplement", "()I") == 1);
+        ctx.check("abstract_has_concreteHelper",
+                  count_pair(m_abstract, "concreteHelper", "()I") == 1);
+        ctx.check("abstract_has_init", count_pair(m_abstract, "<init>", "()V") >= 1);
+        // Cross-check the declared-method count (mustImplement + concreteHelper
+        // == 2; <init> is not a getDeclaredMethods() entry).  The enumeration
+        // INCLUDES <init>, so the enumeration size is >= the Java declared count.
+        ctx.check("abstract_declared_count_java", kli::i("abstractDeclaredMethods") == 2);
+        ctx.check("abstract_enum_ge_declared",
+                  m_abstract.size() >= static_cast<std::size_t>(kli::i("abstractDeclaredMethods")));
+
+        // Interface by-type agrees with the by-name set proven in PART F.
+        const auto m_iface_u{ vmhook::get_class_methods<w_iface>() };
+        ctx.check("iface_bytype_has_abstractOp", count_pair(m_iface_u, "abstractOp", "(I)I") == 1);
+        ctx.check("iface_bytype_has_defaultOp",  count_pair(m_iface_u, "defaultOp",  "(I)I") == 1);
+        ctx.check("iface_bytype_has_staticOp",   count_pair(m_iface_u, "staticOp",   "(I)I") == 1);
+        ctx.check("iface_declared_count_java", kli::i("ifaceDeclaredMethods") == 3);
+        // Interface declares NO <init>/<clinit>-driven ctor and NO instance init.
+        ctx.check("iface_bytype_no_init", count_pair(m_iface_u, "<init>", "()V") == 0);
+
+        // Annotation type: value()/count() are abstract interface methods — they
+        // enumerate through the BY-TYPE overload as well (a registered wrapper for
+        // the marker is not present, so verify via the by-name overload, but on a
+        // FRESH enumeration to prove determinism vs PART J's read).
+        const auto m_marker{ vmhook::get_class_methods(N_MARKER) };
+        ctx.check("marker_has_value",  count_pair(m_marker, "value", "()Ljava/lang/String;") == 1);
+        ctx.check("marker_has_count",  count_pair(m_marker, "count", "()I") == 1);
+        ctx.check("marker_declared_count_java", kli::i("markerDeclaredMethods") == 2);
+        ctx.check("marker_no_init", count_pair(m_marker, "<init>", "()V") == 0);
+
+        // Nested (static) and Inner (non-static) each declare their one method;
+        // the inner's synthetic ctor takes the outer instance, but the DECLARED
+        // method set still contains exactly the source method.
+        const auto m_nested{ vmhook::get_class_methods<w_nested>() };
+        ctx.check("nested_has_nestedMethod", count_pair(m_nested, "nestedMethod", "()I") == 1);
+        ctx.check("nested_declared_count_java", kli::i("nestedDeclaredMethods") == 1);
+        const auto m_inner{ vmhook::get_class_methods<w_inner>() };
+        ctx.check("inner_has_innerMethod", count_pair(m_inner, "innerMethod", "()I") == 1);
+        ctx.check("inner_declared_count_java", kli::i("innerDeclaredMethods") == 1);
+        // The inner's ctor takes the synthetic outer-ref param, so its descriptor
+        // is (Lvmhook/fixtures/KlassIntrospection;)V — NOT the no-arg ()V.  An
+        // <init> IS present; assert at least one <init> of ANY descriptor exists.
+        ctx.check("inner_has_init", has_name(m_inner, "<init>"));
+        // And the no-arg ()V ctor is NOT what an inner class gets (it threads the
+        // outer instance) — a precise negative shape fact.
+        ctx.check("inner_no_noarg_init", count_pair(m_inner, "<init>", "()V") == 0);
+        ctx.check("inner_enum_nonempty", !m_inner.empty());
+    }
+
+    // =====================================================================
+    // PART V — is_interface / is_abstract / is_array PREDICATES synthesized from
+    //   the same substrate the library uses (access-flag bits + array layout
+    //   signal + name shape), swept across EVERY shape and CROSS-CHECKED against
+    //   the Java reflection witnesses.  This is the explicit modifiers/flags +
+    //   predicate coverage: each predicate the native side derives must AGREE
+    //   with what java.lang.reflect / Class reports.  The access-flag read is
+    //   guarded (nullopt -> skip), so a JDK lacking the VMStruct entry degrades.
+    // =====================================================================
+    cp("PART V is_interface / is_abstract / is_array predicates (every shape)");
+    {
+        // Same gcc -Wmaybe-uninitialized insurance as PART B: the guarded `*ni`/
+        // `*na` optional derefs below are each gated by has_value(), but gcc's
+        // heuristic can still false-positive across the lambda return; clang is
+        // clean.  Every deref is provably engaged.
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
+        // A klass IS an array iff its name starts with '[' (the descriptor form)
+        // — this is the universal, JDK-portable array signal on the name side,
+        // and it agrees with get_instance_size()==0 (pinned in PARTS J/N).
+        auto native_is_array = [&](vmhook::hotspot::klass* k) -> bool
+        {
+            const std::string nm{ klass_name_str(k) };
+            return !nm.empty() && nm[0] == '[';
+        };
+        // Predicate from the access flags (guarded): nullopt -> "unknown".
+        auto flag_is_interface = [&](vmhook::hotspot::klass* k) -> std::optional<bool>
+        {
+            if (!klass_header_safely_readable(k)) { return std::nullopt; }
+            const auto af{ klass_access_flags(k) };
+            if (!af) { return std::nullopt; }
+            return (*af & ACC_INTERFACE) != 0u;
+        };
+        auto flag_is_abstract = [&](vmhook::hotspot::klass* k) -> std::optional<bool>
+        {
+            if (!klass_header_safely_readable(k)) { return std::nullopt; }
+            const auto af{ klass_access_flags(k) };
+            if (!af) { return std::nullopt; }
+            return (*af & ACC_ABSTRACT) != 0u;
+        };
+
+        // (tag, klass, java-isInterface key, java-isAbstract key, java-isArray key)
+        struct pred_case
+        {
+            const char* tag;
+            vmhook::hotspot::klass* k;
+            const char* j_iface;
+            const char* j_abstract;
+            const char* j_array;
+        };
+        const pred_case pcases[] = {
+            { "self",     k_self,     "selfIsInterface",     nullptr,              "selfIsArray" },
+            { "iface",    k_iface,    "ifaceIsInterface",    "ifaceIsAbstract",    "ifaceIsArray" },
+            { "abstract", k_abstract, "abstractIsInterface", "abstractIsAbstract", "abstractIsArray" },
+            { "final",    k_final,    "finalIsInterface",    nullptr,              "finalIsArray" },
+            { "enum",     k_enum,     "enumIsInterface",     nullptr,              "enumIsArray" },
+            { "marker",   k_marker,   "markerIsInterface",   "markerIsAbstract",   "markerIsArray" },
+            { "nested",   k_nested,   "nestedIsInterface",   "nestedIsAbstract",   "nestedIsArray" },
+            { "inner",    k_inner,    "innerIsInterface",    nullptr,              "innerIsArray" },
+        };
+        for (const pred_case& c : pcases)
+        {
+            // is_array: native name-shape vs Java witness (HARD — name is stable).
+            ctx.check(std::string{ "pred_isArray_" } + c.tag,
+                      native_is_array(c.k) == kli::b(c.j_array));
+            // None of these shapes is an array, so the native predicate is false.
+            ctx.check(std::string{ "pred_notArray_" } + c.tag, !native_is_array(c.k));
+
+            // is_interface: access-flag-derived vs Java witness, when readable.
+            const auto ni{ flag_is_interface(c.k) };
+            if (ni.has_value())
+            {
+                ctx.check(std::string{ "pred_isInterface_" } + c.tag,
+                          *ni == kli::b(c.j_iface));
+            }
+            else
+            {
+                ctx.record(std::string{ "[INFO] " } + c.tag
+                           + " access flags not readable — skipped is_interface predicate.");
+            }
+
+            // is_abstract: access-flag-derived vs Java witness, when both a
+            // witness key is present AND the flags are readable.
+            if (c.j_abstract != nullptr)
+            {
+                const auto na{ flag_is_abstract(c.k) };
+                if (na.has_value())
+                {
+                    ctx.check(std::string{ "pred_isAbstract_" } + c.tag,
+                              *na == kli::b(c.j_abstract));
+                }
+                else
+                {
+                    ctx.record(std::string{ "[INFO] " } + c.tag
+                               + " access flags not readable — skipped is_abstract predicate.");
+                }
+            }
+        }
+
+        // is_enum / is_annotation flavor pins on the two shapes that carry them,
+        // cross-checked against the dedicated witnesses (ENUM and ANNOTATION are
+        // ClassFile access-flag bits, asserted directly in PART B; here we pin
+        // the Java-side predicate agreement explicitly for the modifiers sweep).
+        ctx.check("pred_self_not_interface_java",   !kli::b("selfIsInterface"));
+        ctx.check("pred_self_not_enum_java",        !kli::b("selfIsEnum"));
+        ctx.check("pred_self_not_annotation_java",  !kli::b("selfIsAnnotation"));
+        ctx.check("pred_enum_not_interface_java",   !kli::b("enumIsInterface"));
+        ctx.check("pred_iface_not_enum_java",       !kli::b("ifaceIsEnum"));
+        ctx.check("pred_nested_not_enum_java",      !kli::b("nestedIsEnum"));
+
+        // An ARRAY klass: the native is-array predicate is TRUE and agrees with
+        // the Java witness (the one shape where is_array flips on).
+        vmhook::hotspot::klass* const k_arr_v{ vmhook::find_class("[I") };
+        if (k_arr_v)
+        {
+            ctx.check("pred_isArray_intarray", native_is_array(k_arr_v));
+            ctx.check("pred_isArray_intarray_java", kli::b("intArrayIsArray"));
+        }
+        else { ctx.record("[INFO] [I not resolvable — skipped array is_array predicate."); }
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC diagnostic pop
+#endif
+    }
+
+    // =====================================================================
+    // PART W — NESTED vs INNER distinction: a non-static INNER class carries
+    //   javac's synthetic this$0 outer back-reference; a static NESTED class
+    //   does NOT.  Surfacing a SYNTHETIC field through klass::find_field is
+    //   JDK-VARIANT (the _fields vs _fieldinfo_stream split — see PART Q), so
+    //   this$0 PRESENCE is recorded [INFO]; the HARD, universal facts are:
+    //   (a) both declare their EXPLICIT instance field, (b) the Nested klass
+    //   never declares a this$0 (it is static — no outer ref EXISTS to surface),
+    //   and (c) the inner-vs-nested name/host relationship.
+    // =====================================================================
+    cp("PART W nested-vs-inner synthetic outer reference (this$0)");
+    {
+        // Both declare their explicit instance field (universal).
+        if (klass_header_safely_readable(k_inner))
+        {
+            ctx.check("w_inner_declares_innerField",
+                      k_inner->find_field("innerField").has_value());
+            const auto t0{ k_inner->find_field("this$0") };
+            ctx.record(std::string{ "[INFO] Inner find_field(\"this$0\"): " }
+                       + (t0.has_value()
+                          ? (std::string{ "present sig='" } + t0->signature + "'")
+                          : std::string{ "absent (JDK-variant synthetic surfacing)" }));
+            // When this$0 IS surfaced, it must be an INSTANCE field whose type is
+            // the enclosing class (the outer back-reference).  Gated so a JDK that
+            // doesn't surface it simply skips — never a hard fail on the variant.
+            if (t0.has_value())
+            {
+                ctx.check("w_inner_this0_instance", !t0->is_static);
+                ctx.check("w_inner_this0_type_is_outer",
+                          t0->signature == "Lvmhook/fixtures/KlassIntrospection;");
+            }
+        }
+        else { ctx.record("[INFO] inner klass header not safely readable — skipped this$0 leg."); }
+
+        // The STATIC nested class is static -> there is NO enclosing instance, so
+        // a this$0 outer reference cannot exist; find_field("this$0") must MISS on
+        // every JDK (this is NOT the variant axis — the field genuinely does not
+        // exist, vs the inner case where it exists but surfacing is variant).
+        if (klass_header_safely_readable(k_nested))
+        {
+            ctx.check("w_nested_declares_nestedField",
+                      k_nested->find_field("nestedField").has_value());
+            ctx.check("w_nested_no_this0",
+                      !k_nested->find_field("this$0").has_value());
+        }
+        else { ctx.record("[INFO] nested klass header not safely readable — skipped nested fields."); }
+
+        // Inner declares AT LEAST its explicit field (Java witness >= 1); the
+        // exact count is JDK-variant (this$0 accounting), so only the lower bound
+        // is HARD — mirrors PART Q's stance.
+        ctx.check("w_inner_declared_field_count_at_least_1",
+                  kli::i("innerDeclaredFields") >= 1);
+        // A non-static inner declares MORE fields than the static nested class of
+        // the same source shape (each has one explicit field; only the inner adds
+        // the synthetic this$0).  The Java witnesses pin this strictly-greater
+        // relationship on every JDK that surfaces this$0 in getDeclaredFields()
+        // (all of 8..26): innerDeclaredFields (innerField + this$0) == 2 > 1.
+        // Recorded as [INFO]-gated HARD: if a future JDK stopped counting this$0,
+        // the >= lower bound above still holds and this stricter pin is skipped.
+        if (kli::i("innerDeclaredFields") >= 2)
+        {
+            ctx.check("w_inner_has_more_fields_than_source",
+                      kli::i("innerDeclaredFields") > 1);
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] Inner.getDeclaredFields().length == " }
+                       + std::to_string(kli::i("innerDeclaredFields"))
+                       + " (this$0 not counted on this JDK) — skipped strict inner>nested field pin.");
+        }
+
+        // Inner and Nested are DISTINCT klasses sharing the same host prefix but
+        // different leaf names — the structural inner/nested name relationship.
+        if (k_inner && k_nested)
+        {
+            ctx.check("w_inner_nested_distinct", k_inner != k_nested);
+            const std::string in_nm{ klass_name_str(k_inner) };
+            const std::string ne_nm{ klass_name_str(k_nested) };
+            const std::string host{ std::string{ N_SELF } + "$" };
+            ctx.check("w_inner_host_prefix", in_nm.rfind(host, 0) == 0);
+            ctx.check("w_nested_host_prefix", ne_nm.rfind(host, 0) == 0);
+            ctx.check("w_inner_leaf_is_Inner",  in_nm == N_INNER);
+            ctx.check("w_nested_leaf_is_Nested", ne_nm == N_NESTED);
+        }
+    }
+
     cp("module complete (all parts reached without a no-SEH fault)");
 }

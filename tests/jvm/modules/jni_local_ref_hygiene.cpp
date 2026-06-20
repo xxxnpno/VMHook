@@ -120,6 +120,13 @@ namespace
     std::atomic<int> g_arr_loop_iters{ 0 };
     std::atomic<int> g_arr_loop_nonnull{ -1 };
 
+    // FRESH typed-array-RETURN loop (makeBytes '[B', makeChars '[C', makeObjArray
+    // '[L...;'): a BRAND-NEW heap array of each element kind every iteration, so
+    // no array pooling can mask a leaked CallObjectMethodA ref on the '[' arm.
+    // Every iteration must decode all three to a non-null oop.
+    std::atomic<int> g_typedarr_loop_iters{ 0 };
+    std::atomic<int> g_typedarr_loop_failures{ -1 };  // # iters any of the 3 came back null
+
     // STATIC String-RETURN loop (FindClass jclass ref + CallStaticObjectMethodA).
     std::atomic<int> g_sstr_loop_iters{ 0 };
     std::atomic<int> g_sstr_loop_distinct{ -1 };
@@ -177,8 +184,45 @@ namespace
     std::atomic<int> g_secho_loop_iters{ 0 };
     std::atomic<int> g_secho_loop_mismatches{ -1 };
 
+    // NATIVE make_java_string loop (vmhook::make_java_string -> the internal
+    // jni_new_string_utf16_local NewString local ref + DeleteLocalRef on the JNI
+    // path). Driven directly from the detour (no Java call()): each iteration
+    // allocates a brand-new String oop and decodes it back. Stable byte-exact
+    // round-trip across the loop == the internal local ref is released each time.
+    std::atomic<int> g_mkstr_loop_iters{ 0 };
+    std::atomic<int> g_mkstr_loop_mismatches{ -1 };   // # iters whose decode != payload
+    std::atomic<int> g_mkstr_loop_nonnull{ -1 };      // # iters that decoded a valid oop
+
+    // NATIVE make_java_array loop (vmhook::make_java_array -> the JNI fallback
+    // New<Type>Array local ref + DeleteLocalRef on the '[' path). Driven directly
+    // from the detour: a fresh primitive array oop each iteration, length-checked.
+    std::atomic<int> g_mkarr_loop_iters{ 0 };
+    std::atomic<int> g_mkarr_loop_badlen{ -1 };       // # iters whose array_length != requested
+    std::atomic<int> g_mkarr_loop_nonnull{ -1 };      // # iters that allocated a valid oop
+
+    // NATIVE find_class MISS loop (vmhook::find_class on an absent class): the
+    // miss path is NOT cached, so every iteration re-walks the graph and drives
+    // jni_find_class_with_context_loader, which creates + DeleteLocalRefs FindClass
+    // / NewStringUTF handles AND clears the pending ClassNotFound exception. A
+    // missing release / un-cleared exception would starve the table / poison the
+    // next JNI call; every iteration must still return null with the JVM healthy.
+    std::atomic<int> g_fcmiss_loop_iters{ 0 };
+    std::atomic<int> g_fcmiss_loop_nonnull{ -1 };     // # iters that wrongly returned non-null
+
+    // NATIVE find_class HIT loop (vmhook::find_class on a present class): the
+    // first hit resolves + caches; subsequent hits return the SAME cached klass.
+    // The FindClass / GetObjectClass local refs of the resolution must be released
+    // and the cached pointer must stay stable across the whole loop.
+    std::atomic<int> g_fchit_loop_iters{ 0 };
+    std::atomic<int> g_fchit_loop_distinct{ -1 };     // distinct klass ptrs seen; 1 == stable
+    std::atomic<int> g_fchit_loop_null{ -1 };         // # iters that returned null (must be 0)
+
     // Post-loop sanity: a single call AFTER every loop still works.
     std::atomic<bool> g_post_loop_str_ok{ false };
+
+    // Post-NATIVE-loop sanity: a fresh make_java_string AFTER all the native
+    // ref-churn loops still decodes byte-exact (the table is healthy).
+    std::atomic<bool> g_post_native_mkstr_ok{ false };
 
     // set_arg union-aliasing loop driven by the injectMixed() hook.
     std::atomic<int> g_inject_mixed_hook_calls{ 0 };
@@ -208,6 +252,25 @@ namespace
     // NewStringUTF ref, not the C++ string identity).
     const std::string k_inject_payload{ "set-arg-local-ref-loop" };
     const std::string k_echo_payload{ "echo-local-ref-loop" };
+
+    // Payload for the NATIVE make_java_string loop: pure ASCII (Java-8 fixture
+    // discipline) and well under the read_java_string cap so the only thing that
+    // can break the byte-exact round-trip is a starved local-ref table.
+    const std::string k_mkstr_payload{ "make-java-string-local-ref-loop" };
+
+    // The class names the NATIVE find_class loops resolve. The HIT name is the
+    // fixture's own internal name (guaranteed loaded — the detour is running in
+    // its trigger() body). The MISS name can never name a loaded class, so its
+    // resolution re-walks + re-drives the context-loader JNI path every iteration
+    // (uncached), churning FindClass/NewStringUTF local refs and a ClassNotFound
+    // exception that must be cleared each time.
+    const std::string k_fc_hit_name{ "vmhook/fixtures/JniLocalRef" };
+    const std::string k_fc_miss_name{ "vmhook/fixtures/NoSuchClass_jlr_hygiene_$$" };
+
+    // Length / element_size for the NATIVE make_java_array loop (a fresh int[]
+    // each iteration). Small + bounded; the leak guard is array_length stability,
+    // not the contents.
+    constexpr std::int32_t k_mkarr_len{ 6 };
 
     // Run the whole detour-side battery on the live receiver.
     auto run_loops(const std::unique_ptr<jni_local_ref>& self) -> void
@@ -374,6 +437,44 @@ namespace
             }
             g_arr_loop_iters.store(kArr);
             g_arr_loop_nonnull.store(nonnull);
+        }
+
+        // ── FRESH typed-array-RETURN loop: '[B' + '[C' + '[L...;' per iter ─────
+        // makeBytes / makeChars / makeObjArray each return a BRAND-NEW heap array
+        // every call (no pooling), so a leaked CallObjectMethodA ref on the '['
+        // arm cannot hide behind a reused array. All three must decode non-null on
+        // every iteration. The object-array ('[Ljava/lang/String;') exercises the
+        // reference-array decode shape distinctly from the primitive arrays.
+        {
+            auto p_b{ s.get_method("makeBytes") };
+            auto p_c{ s.get_method("makeChars") };
+            auto p_o{ s.get_method("makeObjArray") };
+            int failures{ 0 };
+            for (int i{ 0 }; i < kArr; ++i)
+            {
+                bool ok{ p_b.has_value() && p_c.has_value() && p_o.has_value() };
+                if (ok)
+                {
+                    const auto vb{ p_b->call() };
+                    if (static_cast<void*>(vb) == nullptr) { ok = false; }
+                }
+                if (ok)
+                {
+                    const auto vc{ p_c->call() };
+                    if (static_cast<void*>(vc) == nullptr) { ok = false; }
+                }
+                if (ok)
+                {
+                    const auto vo{ p_o->call() };
+                    if (static_cast<void*>(vo) == nullptr) { ok = false; }
+                }
+                if (!ok)
+                {
+                    ++failures;
+                }
+            }
+            g_typedarr_loop_iters.store(kArr);
+            g_typedarr_loop_failures.store(failures);
         }
 
         // ── STATIC String-RETURN loop: FindClass jclass ref each dispatch ─────
@@ -701,6 +802,129 @@ namespace
             g_secho_loop_mismatches.store(mism);
         }
 
+        // ── NATIVE make_java_string loop: internal NewString local ref release ─
+        // vmhook::make_java_string allocates a Java String OOP; its JNI path uses
+        // jni_new_string_utf16_local (a NewString LOCAL ref) and DeleteLocalRefs
+        // the handle after extracting the OOP (vmhook.hpp comment "Skipping
+        // DeleteLocalRef would leak one local per call"). Driven directly from the
+        // detour (no Java call()), far past the 16-slot table: a missing release
+        // would starve the table and later make_java_string calls would return
+        // null / decode "". Every iteration must decode byte-exact to the payload.
+        {
+            int mism{ 0 };
+            int nonnull{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                void* const oop{ vmhook::make_java_string(k_mkstr_payload) };
+                if (oop != nullptr && vmhook::hotspot::is_valid_pointer(oop))
+                {
+                    ++nonnull;
+                    // copy-init from read_java_string (never brace-init).
+                    const std::string decoded = vmhook::read_java_string(oop);
+                    if (decoded != k_mkstr_payload)
+                    {
+                        ++mism;
+                    }
+                }
+                else
+                {
+                    ++mism;
+                }
+            }
+            g_mkstr_loop_iters.store(kPrim);
+            g_mkstr_loop_mismatches.store(mism);
+            g_mkstr_loop_nonnull.store(nonnull);
+        }
+
+        // ── NATIVE make_java_array loop: internal New<Type>Array local ref ─────
+        // vmhook::make_java_array's JNI fallback allocates via New<Type>Array (a
+        // LOCAL ref) and DeleteLocalRefs the array_handle after decoding the oop
+        // (vmhook.hpp make_java_array). A fresh int[] each iteration; the leak
+        // guard is array_length == requested on every iteration (a starved table
+        // would return null / a malformed array). Element size is the int width.
+        {
+            int badlen{ 0 };
+            int nonnull{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                void* const oop{ vmhook::make_java_array(
+                    "[I", k_mkarr_len, sizeof(std::int32_t)) };
+                if (oop != nullptr && vmhook::hotspot::is_valid_pointer(oop))
+                {
+                    ++nonnull;
+                    if (vmhook::array_length(oop) != k_mkarr_len)
+                    {
+                        ++badlen;
+                    }
+                }
+                else
+                {
+                    ++badlen;
+                }
+            }
+            g_mkarr_loop_iters.store(kPrim);
+            g_mkarr_loop_badlen.store(badlen);
+            g_mkarr_loop_nonnull.store(nonnull);
+        }
+
+        // ── NATIVE find_class HIT loop: cached klass + resolution ref release ──
+        // vmhook::find_class on a loaded class resolves via the
+        // ClassLoaderDataGraph walk (and on a context-loader fallback releases its
+        // FindClass / GetObjectClass local refs), caches the klass, then returns
+        // the SAME cached pointer on every subsequent call. distinct == 1 and zero
+        // nulls across the loop == stable resolution with its local refs released.
+        {
+            void* first{ nullptr };
+            bool have_first{ false };
+            int distinct{ 0 };
+            int nulls{ 0 };
+            for (int i{ 0 }; i < kPrim; ++i)
+            {
+                void* const k{ static_cast<void*>(vmhook::find_class(k_fc_hit_name)) };
+                if (k == nullptr)
+                {
+                    ++nulls;
+                    continue;
+                }
+                if (!have_first)
+                {
+                    first = k;
+                    have_first = true;
+                    distinct = 1;
+                }
+                else if (k != first)
+                {
+                    ++distinct;
+                }
+            }
+            g_fchit_loop_iters.store(kPrim);
+            g_fchit_loop_distinct.store(distinct);
+            g_fchit_loop_null.store(nulls);
+        }
+
+        // ── NATIVE find_class MISS loop: uncached re-walk + exception clear ────
+        // A name that can never resolve is NOT cached, so every iteration re-walks
+        // the graph and re-drives jni_find_class_with_context_loader, which creates
+        // + DeleteLocalRefs FindClass / NewStringUTF handles AND clears the pending
+        // ClassNotFound exception. A leaked ref or an un-cleared exception would
+        // starve the table / poison the next JNI call; every iteration must still
+        // return null with the JVM healthy. Bounded (kStaticMiss) to stay modest:
+        // the miss path is heavier than a cache hit. null on every iteration ==
+        // the no-resolution path stayed leak-free and exception-clean.
+        {
+            constexpr int kStaticMiss{ 64 };
+            int nonnull{ 0 };
+            for (int i{ 0 }; i < kStaticMiss; ++i)
+            {
+                if (vmhook::find_class(k_fc_miss_name) != nullptr)
+                {
+                    ++nonnull;
+                }
+            }
+            g_fcmiss_loop_iters.store(kStaticMiss);
+            g_fcmiss_loop_nonnull.store(nonnull);
+        }
+
         // ── POST-LOOP sanity: a single String call after all the loops works ──
         // Hundreds of allocate+release cycles later, the table is healthy and a
         // fresh dispatch still decodes its String.
@@ -711,6 +935,18 @@ namespace
                 g_post_loop_str_ok.store(proxy->call().as_string() == "local-ref-stable",
                                          std::memory_order_relaxed);
             }
+        }
+
+        // ── POST-NATIVE sanity: a fresh make_java_string after all native loops ─
+        // After the make_java_string / make_java_array / find_class ref-churn
+        // loops, a brand-new native String allocation still decodes byte-exact:
+        // the internal local-ref discipline left the table healthy.
+        {
+            void* const oop{ vmhook::make_java_string(k_mkstr_payload) };
+            const bool ok{ oop != nullptr
+                           && vmhook::hotspot::is_valid_pointer(oop)
+                           && vmhook::read_java_string(oop) == k_mkstr_payload };
+            g_post_native_mkstr_ok.store(ok, std::memory_order_relaxed);
         }
     }
 }
@@ -856,6 +1092,15 @@ VMHOOK_JVM_MODULE(jni_local_ref_hygiene)
         ctx.check("jlr_array_return_all_iters_non_null",
                   g_arr_loop_nonnull.load() == 160);
 
+        // ════════════════ FRESH typed-array-RETURN ('[B'/'[C'/'[L') discipline ═
+        // makeBytes / makeChars / makeObjArray each return a brand-new heap array
+        // every call; all three decode non-null on every iteration == the
+        // CallObjectMethodA '[' arm ref is released across every element kind,
+        // including the reference-array ('[Ljava/lang/String;') decode shape.
+        ctx.check("jlr_typed_array_return_loop_ran", g_typedarr_loop_iters.load() == 160);
+        ctx.check("jlr_typed_array_return_no_leak_zero_failures",
+                  g_typedarr_loop_failures.load() == 0);
+
         // ════════════════ STATIC String-RETURN (FindClass) discipline ═════════
         // The FindClass jclass local ref AND the CallStaticObjectMethodA result
         // ref are both released each dispatch: stable single value across the loop.
@@ -957,6 +1202,58 @@ VMHOOK_JVM_MODULE(jni_local_ref_hygiene)
         // After hundreds of allocate+release cycles a fresh dispatch still works.
         ctx.check("jlr_post_loop_call_still_works",
                   g_post_loop_str_ok.load(std::memory_order_relaxed));
+
+        // ════════════ NATIVE make_java_string local-ref discipline ════════════
+        // vmhook::make_java_string's JNI path allocates a NewString LOCAL ref and
+        // DeleteLocalRefs the handle after extracting the OOP. Driven directly
+        // from the detour far past the 16-slot table: byte-exact decode on every
+        // iteration (zero mismatches, all non-null) == the internal local ref is
+        // released each time (a leak would starve the table -> null oop / "").
+        ctx.check("jlr_native_make_string_loop_ran", g_mkstr_loop_iters.load() == 160);
+        ctx.check("jlr_native_make_string_all_iters_non_null",
+                  g_mkstr_loop_nonnull.load() == 160);
+        ctx.check("jlr_native_make_string_no_leak_zero_mismatches",
+                  g_mkstr_loop_mismatches.load() == 0);
+
+        // ════════════ NATIVE make_java_array local-ref discipline ═════════════
+        // vmhook::make_java_array's JNI fallback allocates via New<Type>Array (a
+        // LOCAL ref) and DeleteLocalRefs the array_handle after decoding the oop.
+        // A fresh int[] each iteration; array_length == requested on every
+        // iteration (zero bad lengths, all non-null) == the internal local ref is
+        // released each time.
+        ctx.check("jlr_native_make_array_loop_ran", g_mkarr_loop_iters.load() == 160);
+        ctx.check("jlr_native_make_array_all_iters_non_null",
+                  g_mkarr_loop_nonnull.load() == 160);
+        ctx.check("jlr_native_make_array_no_leak_correct_length_every_iter",
+                  g_mkarr_loop_badlen.load() == 0);
+
+        // ════════════ NATIVE find_class HIT local-ref discipline ══════════════
+        // find_class on a loaded class resolves + caches once and returns the SAME
+        // klass thereafter; the resolution's FindClass / GetObjectClass local refs
+        // are released. distinct == 1 and zero nulls across the loop == stable,
+        // leak-free resolution.
+        ctx.check("jlr_native_find_class_hit_loop_ran", g_fchit_loop_iters.load() == 160);
+        ctx.check("jlr_native_find_class_hit_stable_single_klass",
+                  g_fchit_loop_distinct.load() == 1);
+        ctx.check("jlr_native_find_class_hit_never_null",
+                  g_fchit_loop_null.load() == 0);
+
+        // ════════════ NATIVE find_class MISS local-ref + exception discipline ══
+        // An absent class is never cached, so every iteration re-walks the graph
+        // and re-drives the context-loader JNI path, which creates + DeleteLocalRefs
+        // FindClass / NewStringUTF handles AND clears the pending ClassNotFound
+        // exception. Every iteration returns null with the JVM healthy == that
+        // uncached path is leak-free and exception-clean (a leaked ref / un-cleared
+        // exception would starve the table or poison the next JNI call).
+        ctx.check("jlr_native_find_class_miss_loop_ran", g_fcmiss_loop_iters.load() == 64);
+        ctx.check("jlr_native_find_class_miss_always_null",
+                  g_fcmiss_loop_nonnull.load() == 0);
+
+        // ════════════ POST-NATIVE non-degradation ═════════════════════════════
+        // After the native ref-churn loops a fresh make_java_string still decodes
+        // byte-exact: the internal local-ref discipline left the table healthy.
+        ctx.check("jlr_post_native_make_string_still_byte_exact",
+                  g_post_native_mkstr_ok.load(std::memory_order_relaxed));
 
         // ════════════════ set_arg(String) local-ref discipline ════════════════
         // The probe dispatched inject() JniLocalRef.INJECT_ITERATIONS times; each

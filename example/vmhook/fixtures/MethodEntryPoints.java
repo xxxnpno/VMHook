@@ -45,6 +45,11 @@ public final class MethodEntryPoints
      *   2 = warm warm()         WARM_CALLS times (drive it to JIT compilation)
      *   3 = call touched(DELTA) ONCE  (link the second instance method)
      *   4 = call sset(DELTA)    ONCE  (link the static throwaway method)
+     *   5 = call iset(DELTA)    ONCE  (link the SECOND static throwaway method)
+     *   6 = call touched(DELTA) WARM_CALLS times (drive the second instance
+     *                           method to its own JIT-compiled state, so the
+     *                           native side can prove the adapter offset latches
+     *                           independently of warm() ever compiling)
      */
     public static volatile int mode;
 
@@ -62,11 +67,20 @@ public final class MethodEntryPoints
     /** Last value the original sset() body computed. */
     public static volatile int lastSsetResult;
 
+    /** Last value the original iset() body computed. */
+    public static volatile int lastIsetResult;
+
     /** XOR accumulator of every warm() return inside one probe (defeats DCE). */
     public static volatile long warmXor;
 
+    /** XOR accumulator of every touched() return inside one probe (defeats DCE). */
+    public static volatile long touchedXor;
+
     /** Number of times run() actually invoked warm() in the last cycle. */
     public static volatile int warmCallsMade;
+
+    /** Number of times run() actually invoked touched() in the last cycle. */
+    public static volatile int touchedCallsMade;
 
     // ---- Constants mirrored on the native side ----------------------------
 
@@ -81,6 +95,9 @@ public final class MethodEntryPoints
 
     /** sset(DELTA) body result (static; no seed). */
     public static final int SSET_RESULT = DELTA + 100;
+
+    /** iset(DELTA) body result (static; no seed). */
+    public static final int ISET_RESULT = DELTA + 200;
 
     /**
      * Iterations for the JIT-warming hot loop.  Comfortably above the default
@@ -117,6 +134,18 @@ public final class MethodEntryPoints
     public static int sset(final int delta)
     {
         return delta + 100;
+    }
+
+    /**
+     * A SECOND STATIC method, dispatched once.  Gives the native side a second,
+     * independent clean throwaway target for the entry-point setter round-trip
+     * so it can prove setter/getter offset agreement on a method distinct from
+     * sset() (and never hooked) -- the FIX-C dance must land identically on any
+     * Method, not just the first one probed.
+     */
+    public static int iset(final int delta)
+    {
+        return delta + 200;
     }
 
     /**
@@ -165,9 +194,33 @@ public final class MethodEntryPoints
         lastTouchedResult = obj.touched(delta);
     }
 
+    private static void runWarmTouched(final int iterations)
+    {
+        final MethodEntryPoints obj = new MethodEntryPoints();
+        obj.seed = SEED;
+        int made = 0;
+        long acc = 0;
+        int last = 0;
+        for (int i = 0; i < iterations; ++i)
+        {
+            final int d = i & 0xFF;
+            last = obj.touched(d);
+            acc ^= last;
+            ++made;
+        }
+        lastTouchedResult = last;
+        touchedXor = acc;
+        touchedCallsMade = made;
+    }
+
     private static void runCallSsetOnce(final int delta)
     {
         lastSsetResult = sset(delta);
+    }
+
+    private static void runCallISetOnce(final int delta)
+    {
+        lastIsetResult = iset(delta);
     }
 
     static
@@ -196,6 +249,12 @@ public final class MethodEntryPoints
                         break;
                     case 4:
                         runCallSsetOnce(DELTA);
+                        break;
+                    case 5:
+                        runCallISetOnce(DELTA);
+                        break;
+                    case 6:
+                        runWarmTouched(WARM_CALLS);
                         break;
                     default:
                         break;

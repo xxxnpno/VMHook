@@ -162,6 +162,33 @@ public final class JniLocalRef
         return new int[] { 3, 1, 4, 1, 5 };
     }
 
+    /** A primitive byte-array reference return ('[B' descriptor): a FRESH byte[]
+     *  each call so the returned array is a brand-new heap object / local ref
+     *  every iteration -- no pooling to mask a leak.  Same CallObjectMethodA
+     *  local-ref release on the '[' arm as makeArray, but on a different element
+     *  type so the decoder's element-kind path is exercised too. */
+    public byte[] makeBytes()
+    {
+        return new byte[] { 7, 8, 9, 10, 11, 12 };
+    }
+
+    /** A primitive char-array reference return ('[C' descriptor): a FRESH char[]
+     *  each call.  Another '[' arm release on a two-byte element type. */
+    public char[] makeChars()
+    {
+        return new char[] { 'l', 'o', 'c', 'a', 'l', 'r', 'e', 'f' };
+    }
+
+    /** A REFERENCE-array reference return ('[Ljava/lang/String;' descriptor): a
+     *  FRESH String[] each call.  The returned array is itself a CallObjectMethodA
+     *  local ref to release on the '[' arm; unlike the primitive arrays its
+     *  elements are object references, so this stresses the object-array decode
+     *  shape distinctly from makeArray/makeBytes/makeChars. */
+    public String[] makeObjArray()
+    {
+        return new String[] { "a", "b", "c" };
+    }
+
     /** A primitive-ARG / primitive-RETURN call: the int arg's jvalue cell aliases
      *  the union's {@code .l} member as the bit pattern 0x...0007 -- a NON-null
      *  pointer that is NOT a JNI local ref.  vmhook's per-slot needs_release tag

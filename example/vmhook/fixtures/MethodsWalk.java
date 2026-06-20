@@ -274,6 +274,24 @@ public class MethodsWalk
         }
     }
 
+    /**
+     * An interface that has a NON-constant static-final field, which forces javac
+     * to emit a &lt;clinit&gt; on the INTERFACE klass (a compile-time-constant
+     * primitive / String would inline and emit no &lt;clinit&gt;).  Pins that the
+     * walk enumerates an interface's &lt;clinit&gt; entry, while the interface still
+     * has NO &lt;init&gt; (interfaces never get a constructor).  Its abstract op is
+     * also enumerated:
+     *   int  cOp(int)   (I)I   abstract
+     *   &lt;clinit&gt;     ()V    (initializes MARK = new Object())
+     */
+    public interface IfaceClinit
+    {
+        // Non-constant initializer => the interface gets a <clinit>.
+        Object MARK = new Object();
+
+        int cOp(int x);
+    }
+
     /** Abstract class: <init> + abstract + concrete. */
     public abstract static class Abstract
     {
@@ -416,6 +434,7 @@ public class MethodsWalk
     static final Class<?> ANCHOR_EMPTY    = Empty.class;
     static final Class<?> ANCHOR_MARKER   = Marker.class;
     static final Class<?> ANCHOR_IFACE    = Iface.class;
+    static final Class<?> ANCHOR_IFACECL  = IfaceClinit.class;
     static final Class<?> ANCHOR_ABSTRACT = Abstract.class;
     static final Class<?> ANCHOR_CONCRETE = ConcreteSub.class;
     static final Class<?> ANCHOR_BASE     = Base.class;

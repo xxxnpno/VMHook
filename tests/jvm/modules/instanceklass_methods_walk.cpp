@@ -116,6 +116,7 @@ namespace
     class mw_empty    : public vmhook::object<mw_empty>    { public: explicit mw_empty(vmhook::oop_t i) noexcept    : vmhook::object<mw_empty>{ i } {} };
     class mw_marker   : public vmhook::object<mw_marker>   { public: explicit mw_marker(vmhook::oop_t i) noexcept   : vmhook::object<mw_marker>{ i } {} };
     class mw_iface    : public vmhook::object<mw_iface>    { public: explicit mw_iface(vmhook::oop_t i) noexcept    : vmhook::object<mw_iface>{ i } {} };
+    class mw_ifacecl  : public vmhook::object<mw_ifacecl>  { public: explicit mw_ifacecl(vmhook::oop_t i) noexcept  : vmhook::object<mw_ifacecl>{ i } {} };
     class mw_abstract : public vmhook::object<mw_abstract> { public: explicit mw_abstract(vmhook::oop_t i) noexcept : vmhook::object<mw_abstract>{ i } {} };
     class mw_concrete : public vmhook::object<mw_concrete> { public: explicit mw_concrete(vmhook::oop_t i) noexcept : vmhook::object<mw_concrete>{ i } {} };
     class mw_base     : public vmhook::object<mw_base>     { public: explicit mw_base(vmhook::oop_t i) noexcept     : vmhook::object<mw_base>{ i } {} };
@@ -141,6 +142,7 @@ namespace
     constexpr char NAME_EMPTY[]{ "vmhook/fixtures/MethodsWalk$Empty" };
     constexpr char NAME_MARKER[]{ "vmhook/fixtures/MethodsWalk$Marker" };
     constexpr char NAME_IFACE[]{ "vmhook/fixtures/MethodsWalk$Iface" };
+    constexpr char NAME_IFACECL[]{ "vmhook/fixtures/MethodsWalk$IfaceClinit" };
     constexpr char NAME_ABSTRACT[]{ "vmhook/fixtures/MethodsWalk$Abstract" };
     constexpr char NAME_CONCRETE[]{ "vmhook/fixtures/MethodsWalk$ConcreteSub" };
     constexpr char NAME_BASE[]{ "vmhook/fixtures/MethodsWalk$Base" };
@@ -234,6 +236,7 @@ VMHOOK_JVM_MODULE(instanceklass_methods_walk)
     vmhook::register_class<mw_empty>(NAME_EMPTY);
     vmhook::register_class<mw_marker>(NAME_MARKER);
     vmhook::register_class<mw_iface>(NAME_IFACE);
+    vmhook::register_class<mw_ifacecl>(NAME_IFACECL);
     vmhook::register_class<mw_abstract>(NAME_ABSTRACT);
     vmhook::register_class<mw_concrete>(NAME_CONCRETE);
     vmhook::register_class<mw_base>(NAME_BASE);
@@ -964,6 +967,232 @@ VMHOOK_JVM_MODULE(instanceklass_methods_walk)
         // A bare top-level name without package -> empty.
         ctx.check("bare_name_empty", vmhook::get_class_methods("MethodsWalk").empty());
         ctx.check("bad_input_24_no_crash", true); // reached => no fault on any probe
+    }
+
+    // =====================================================================
+    // PART 25 — Superclass-chain walk via get_super() (the ONE walk primitive
+    //   the module never drove).  PART 7 pins that Sub's BARE walk excludes
+    //   inherited methods; this pins the COMPLEMENT: walking get_super() up the
+    //   Sub -> Mid -> Base -> Object chain and unioning each level's OWN declared
+    //   methods RECOVERS exactly those excluded names.  get_super() is
+    //   is_valid_pointer-guarded; every level read is pure metaspace metadata
+    //   (Klass* native + stable, never GC-relocated) -> HARD, cannot fault cold.
+    // =====================================================================
+    cp("PART 25 superclass-chain walk (get_super union recovers inherited)");
+    {
+        vmhook::hotspot::klass* const sub_klass{
+            reinterpret_cast<vmhook::hotspot::klass*>(vmhook::find_class(NAME_SUB)) };
+        ctx.check("chain_sub_resolved", sub_klass != nullptr);
+
+        if (sub_klass != nullptr)
+        {
+            // Walk Sub -> super -> super ... collecting each level's OWN declared
+            // (name,desc) pairs into one union, bounded so a corrupt _super loop
+            // can never spin (a real chain to Object is < 8 deep here).
+            pair_list chain_union{};
+            name_list level_first_names{};   // a witness name per level, in order
+            std::int32_t levels{ 0 };
+            for (vmhook::hotspot::klass* k{ sub_klass };
+                 k != nullptr && levels < 16;
+                 k = k->get_super(), ++levels)
+            {
+                if (!vmhook::hotspot::is_valid_pointer(k))
+                {
+                    break;
+                }
+                const pair_list lvl{ vmhook::detail::collect_klass_methods(k) };
+                for (const std::pair<std::string, std::string>& m : lvl)
+                {
+                    chain_union.push_back(m);
+                }
+                if (!lvl.empty())
+                {
+                    level_first_names.push_back(lvl.front().first);
+                }
+            }
+            ctx.check("chain_has_multiple_levels", levels >= 4); // Sub,Mid,Base,Object,...
+            ctx.record(std::string{ "[INFO] superclass chain depth from Sub = " }
+                       + std::to_string(levels));
+
+            // The union over the chain RECOVERS every name Sub's bare walk excluded.
+            ctx.check("chain_recovers_subOnly",    has_name(chain_union, "subOnly"));
+            ctx.check("chain_recovers_midOnly",    has_name(chain_union, "midOnly"));
+            ctx.check("chain_recovers_baseOnly",   has_name(chain_union, "baseOnly"));
+            ctx.check("chain_recovers_baseStatic", has_name(chain_union, "baseStatic"));
+
+            // Object's OWN declared methods are reachable at the chain TOP — proving
+            // Sub's exclusion of toString/hashCode/equals is a PLACEMENT fact (they
+            // live on Object), not an enumeration failure.
+            ctx.check("chain_recovers_object_toString", has_name(chain_union, "toString"));
+            ctx.check("chain_recovers_object_hashCode", has_name(chain_union, "hashCode"));
+            ctx.check("chain_recovers_object_equals",   has_name(chain_union, "equals"));
+
+            // And the SINGLE-level Sub walk still does NOT contain the parent-only
+            // names (re-affirms the PART 7 exclusion against the same klass object).
+            const pair_list sub_only{ vmhook::detail::collect_klass_methods(sub_klass) };
+            ctx.check("chain_sub_level_excludes_midOnly",  !has_name(sub_only, "midOnly"));
+            ctx.check("chain_sub_level_excludes_baseOnly", !has_name(sub_only, "baseOnly"));
+            ctx.check("chain_sub_level_excludes_toString", !has_name(sub_only, "toString"));
+
+            // No level produced an empty-name witness (every collected level decoded).
+            ctx.check("chain_levels_decoded_nonempty",
+                      std::none_of(level_first_names.begin(), level_first_names.end(),
+                                   [](const std::string& s) { return s.empty(); }));
+        }
+    }
+
+    // =====================================================================
+    // PART 26 — <clinit> PRESENCE is a placement/class-file fact, not runtime.
+    //   A class with NO static initialization (Empty) has NO <clinit>; a class
+    //   WITH static field inits + a static block (top-level MethodsWalk) HAS one;
+    //   an interface whose static-final field has a NON-constant initializer
+    //   (IfaceClinit) HAS a <clinit> but still NO <init>.  Pins that the walk
+    //   reports <clinit> exactly when the class file carries it.
+    // =====================================================================
+    cp("PART 26 <clinit> presence is a class-file fact");
+    {
+        const pair_list empty_methods{ vmhook::get_class_methods<mw_empty>() };
+        ctx.check("empty_has_no_clinit", !has_name(empty_methods, "<clinit>"));
+        ctx.check("empty_still_has_init", count_pair(empty_methods, "<init>", "()V") == 1);
+
+        // The top-level class genuinely has a <clinit> (static field inits + block).
+        ctx.check("top_has_clinit_fact", count_pair(top, "<clinit>", "()V") == 1);
+
+        // IfaceClinit: <clinit> present (non-constant static-final), <init> absent.
+        const pair_list ifc{ vmhook::get_class_methods<mw_ifacecl>() };
+        ctx.check("ifacecl_has_clinit", count_pair(ifc, "<clinit>", "()V") == 1);
+        ctx.check("ifacecl_no_init",    !has_name(ifc, "<init>"));
+    }
+
+    // =====================================================================
+    // PART 27 — Interface with a <clinit>: abstract op + the <clinit> are the
+    //   ONLY entries; no <init>, no inherited Object method declared.
+    // =====================================================================
+    cp("PART 27 interface-with-clinit enumeration");
+    {
+        const pair_list ifc{ vmhook::get_class_methods<mw_ifacecl>() };
+        ctx.check("ifacecl_has_cOp",   count_pair(ifc, "cOp", "(I)I") == 1);
+        ctx.check("ifacecl_excludes_toString", !has_name(ifc, "toString"));
+        // cOp (abstract) + <clinit> == exactly 2 entries (interface, no <init>).
+        ctx.check("ifacecl_size_2", ifc.size() == 2);
+        ctx.check("ifacecl_no_empty",
+                  std::none_of(ifc.begin(), ifc.end(),
+                      [](const std::pair<std::string, std::string>& p)
+                      { return p.first.empty() || p.second.empty(); }));
+    }
+
+    // =====================================================================
+    // PART 28 — RAW accessor robustness on a NON-klass pointer: the
+    //   get_methods_count()/get_methods_ptr() guard rejects a pointer that fails
+    //   is_valid_pointer(this) BEFORE any deref, so a garbage `this` degrades to
+    //   0 / nullptr (never a fault), and collect_klass_methods(garbage) is empty.
+    //   The sentinels are chosen to be is_valid_pointer-REJECTED (odd / below the
+    //   user floor), so nothing is dereferenced -> crash-safe even with no SEH.
+    // =====================================================================
+    cp("PART 28 raw accessor robustness on a non-klass pointer");
+    {
+        // 0x1 (odd, below floor) and 0xDEADBEEF (a debug-fill sentinel) both fail
+        // is_valid_pointer; the accessors must short-circuit to 0 / nullptr.
+        vmhook::hotspot::klass* const garbage_a{
+            reinterpret_cast<vmhook::hotspot::klass*>(static_cast<std::uintptr_t>(0x1)) };
+        vmhook::hotspot::klass* const garbage_b{
+            reinterpret_cast<vmhook::hotspot::klass*>(static_cast<std::uintptr_t>(0xDEADBEEFULL)) };
+
+        ctx.check("garbage_a_rejected_by_is_valid",
+                  !vmhook::hotspot::is_valid_pointer(garbage_a));
+        ctx.check("garbage_b_rejected_by_is_valid",
+                  !vmhook::hotspot::is_valid_pointer(garbage_b));
+
+        ctx.check("garbage_a_count_zero", garbage_a->get_methods_count() == 0);
+        ctx.check("garbage_a_ptr_null",   garbage_a->get_methods_ptr() == nullptr);
+        ctx.check("garbage_b_count_zero", garbage_b->get_methods_count() == 0);
+        ctx.check("garbage_b_ptr_null",   garbage_b->get_methods_ptr() == nullptr);
+
+        // The collector on a guard-rejected klass yields an empty list, never a fault.
+        ctx.check("collect_garbage_a_empty",
+                  vmhook::detail::collect_klass_methods(garbage_a).empty());
+        ctx.check("collect_garbage_b_empty",
+                  vmhook::detail::collect_klass_methods(garbage_b).empty());
+        // A literal null klass collects to empty too (the collector's first guard).
+        ctx.check("collect_null_empty",
+                  vmhook::detail::collect_klass_methods(nullptr).empty());
+        ctx.check("part28_no_crash", true); // reached => guards held, no deref fault
+    }
+
+    // =====================================================================
+    // PART 29 — Per-klass ISOLATION: the walk reads ONE klass's _methods, so a
+    //   name/descriptor declared on one nested type is ABSENT from a sibling's
+    //   walk.  Many's m00..m49 ()V are not on Empty; Empty's set is a strict
+    //   subset of Many's by size; idLong (top-level) is on neither nested type.
+    // =====================================================================
+    cp("PART 29 per-klass isolation (no cross-klass bleed)");
+    {
+        const pair_list many{ vmhook::get_class_methods<mw_many>() };
+        const pair_list empty_methods{ vmhook::get_class_methods<mw_empty>() };
+
+        ctx.check("isolation_many_has_m00", count_pair(many, "m00", "()V") == 1);
+        ctx.check("isolation_empty_lacks_m00", !has_name(empty_methods, "m00"));
+        ctx.check("isolation_empty_lacks_m49", !has_name(empty_methods, "m49"));
+        ctx.check("isolation_empty_smaller_than_many",
+                  empty_methods.size() < many.size());
+
+        // The top-level-only idLong/allPrims are on NEITHER nested type.
+        ctx.check("isolation_many_lacks_idLong",  !has_name(many, "idLong"));
+        ctx.check("isolation_empty_lacks_idLong", !has_name(empty_methods, "idLong"));
+        ctx.check("isolation_many_lacks_allPrims", !has_name(many, "allPrims"));
+
+        // touch() is Many-only; it never appears on the top-level class either.
+        ctx.check("isolation_top_lacks_touch", !has_name(top, "touch"));
+        ctx.check("isolation_many_has_touch", count_pair(many, "touch", "()V") == 1);
+    }
+
+    // =====================================================================
+    // PART 30 — Broad determinism net: collect EVERY registered nested type
+    //   twice and assert each is ordered-identical and free of empty pairs.  One
+    //   sweep pins the ordered-stability + no-decode-fail invariants across all
+    //   class SHAPES (class / interface / abstract / enum / annotation / inner /
+    //   generic / hierarchy levels) at once.  Pure metaspace -> HARD.
+    // =====================================================================
+    cp("PART 30 broad determinism sweep over every nested shape");
+    {
+        const name_list every_name{
+            NAME_TOP, NAME_EMPTY, NAME_IFACE, NAME_IFACECL, NAME_ABSTRACT,
+            NAME_CONCRETE, NAME_BASE, NAME_MID, NAME_SUB, NAME_VALS,
+            NAME_ENUMABS, NAME_GENERIC, NAME_ANNO, NAME_MANY, NAME_INNER };
+
+        bool all_ordered_identical{ true };
+        bool all_no_empty{ true };
+        std::size_t resolved_count{ 0 };
+        for (const std::string& cls : every_name)
+        {
+            const pair_list a{ vmhook::get_class_methods(cls) };
+            const pair_list b{ vmhook::get_class_methods(cls) };
+            if (a != b)
+            {
+                all_ordered_identical = false;
+            }
+            for (const std::pair<std::string, std::string>& m : a)
+            {
+                if (m.first.empty() || m.second.empty())
+                {
+                    all_no_empty = false;
+                    break;
+                }
+            }
+            // Marker is the only EMPTY-by-design type and is intentionally not in
+            // this list, so every entry here must resolve to a non-empty set.
+            if (!a.empty())
+            {
+                ++resolved_count;
+            }
+        }
+        ctx.check("sweep_all_ordered_identical", all_ordered_identical);
+        ctx.check("sweep_all_no_empty_pairs", all_no_empty);
+        ctx.check("sweep_all_15_resolved_nonempty",
+                  resolved_count == every_name.size());
+        ctx.record(std::string{ "[INFO] determinism sweep resolved " }
+                   + std::to_string(resolved_count) + " of "
+                   + std::to_string(every_name.size()) + " nested shapes non-empty.");
     }
 
     cp("module complete (all parts reached without a no-SEH fault)");

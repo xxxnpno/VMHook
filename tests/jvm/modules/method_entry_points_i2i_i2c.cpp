@@ -88,7 +88,10 @@ namespace
         // --- recorded observations the Java side writes -------------------
         static auto get_last_warm_result() -> std::int32_t    { return static_field("lastWarmResult")->get(); }
         static auto get_last_touched_result() -> std::int32_t { return static_field("lastTouchedResult")->get(); }
+        static auto get_last_sset_result() -> std::int32_t    { return static_field("lastSsetResult")->get(); }
+        static auto get_last_iset_result() -> std::int32_t    { return static_field("lastIsetResult")->get(); }
         static auto get_warm_calls_made() -> std::int32_t     { return static_field("warmCallsMade")->get(); }
+        static auto get_touched_calls_made() -> std::int32_t  { return static_field("touchedCallsMade")->get(); }
 
         // Reads this instance's own seed (proves the detour's `self` is correct).
         auto seed() const -> std::int32_t { return get_field("seed")->get(); }
@@ -98,12 +101,15 @@ namespace
     constexpr std::int32_t SEED{ 2000 };
     constexpr std::int32_t DELTA{ 11 };
     constexpr std::int32_t SINGLE_RESULT{ SEED + DELTA };   // warm(DELTA) body result
+    constexpr std::int32_t SSET_RESULT{ DELTA + 100 };      // sset(DELTA) body result
+    constexpr std::int32_t ISET_RESULT{ DELTA + 200 };      // iset(DELTA) body result
     constexpr std::int32_t WARM_CALLS{ 200000 };
 
     constexpr const char* FIXTURE_CLASS{ "vmhook/fixtures/MethodEntryPoints" };
     constexpr const char* WARM_NAME{ "warm" };
     constexpr const char* TOUCHED_NAME{ "touched" };
     constexpr const char* SSET_NAME{ "sset" };
+    constexpr const char* ISET_NAME{ "iset" };
     constexpr const char* QUIET_NAME{ "quiet" };
     constexpr const char* HOT_SIG{ "(I)I" };
 
@@ -112,6 +118,8 @@ namespace
     constexpr std::int32_t MODE_WARM{ 2 };
     constexpr std::int32_t MODE_CALL_TOUCHED_ONCE{ 3 };
     constexpr std::int32_t MODE_CALL_SSET_ONCE{ 4 };
+    constexpr std::int32_t MODE_CALL_ISET_ONCE{ 5 };
+    constexpr std::int32_t MODE_WARM_TOUCHED{ 6 };
 
     // ---- Hook observation state (reset per scenario) -----------------------
     std::atomic<std::int32_t> g_fire_count{ 0 };
@@ -191,6 +199,38 @@ namespace
         return info.committed && info.executable;
     }
 
+    // True iff `p` points at committed + readable memory (a real mapped page),
+    // regardless of executability.  Distinguishes a readable-but-non-exec slot
+    // (data) from a code-cache stub.  query_region never faults.
+    auto points_into_readable(void* const p) -> bool
+    {
+        if (!p || !vmhook::hotspot::is_valid_pointer(p))
+        {
+            return false;
+        }
+        const vmhook::os::region_info info{ vmhook::os::query_region(p) };
+        return info.committed && info.readable;
+    }
+
+    // Compact human label for an entry-point pointer, for [INFO] characterisation:
+    // null / executable-code-cache-stub / readable-non-exec / unmapped.
+    auto entry_kind(void* const p) -> std::string
+    {
+        if (p == nullptr)
+        {
+            return std::string{ "null" };
+        }
+        if (points_into_executable(p))
+        {
+            return std::string{ "executable-stub" };
+        }
+        if (points_into_readable(p))
+        {
+            return std::string{ "readable-non-exec" };
+        }
+        return std::string{ "non-null-unmapped" };
+    }
+
     // Reads Method::_code through a validated pointer.  nullptr means "not
     // currently JIT-compiled" (the deopted steady state vmhook installs).
     auto method_code(vmhook::hotspot::method* const m) -> void*
@@ -232,11 +272,13 @@ namespace
         return std::string{ "<neither exported>" };
     }
 
-    // Drives warm() through the hot loop a bounded number of times, polling for
-    // HotSpot's async compiler to populate Method::_code.  Best-effort: a -Xint /
-    // busy runner returns false and the caller folds that into an [INFO].
+    // Drives `mode` (a warming loop) a bounded number of times, polling for
+    // HotSpot's async compiler to populate Method::_code on `m`.  Best-effort: a
+    // -Xint / busy runner returns false and the caller folds that into an [INFO].
     // Mirrors deoptimize_methods.cpp::warm_to_jit.
-    auto warm_to_jit(vmhook_test::context& ctx, vmhook::hotspot::method* const m) -> bool
+    auto warm_method_to_jit(vmhook_test::context& ctx,
+                            vmhook::hotspot::method* const m,
+                            const std::int32_t mode) -> bool
     {
         constexpr std::int32_t max_rounds{ 5 };
         constexpr std::chrono::milliseconds settle_budget{ 1500 };
@@ -244,7 +286,7 @@ namespace
 
         for (std::int32_t round{ 0 }; round < max_rounds; ++round)
         {
-            const bool warm_done{ drive(ctx, MODE_WARM) };
+            const bool warm_done{ drive(ctx, mode) };
             if (!warm_done)
             {
                 continue;
@@ -264,6 +306,12 @@ namespace
             }
         }
         return method_code(m) != nullptr;
+    }
+
+    // Convenience: warm warm() itself (the headline method) to a JIT state.
+    auto warm_to_jit(vmhook_test::context& ctx, vmhook::hotspot::method* const m) -> bool
+    {
+        return warm_method_to_jit(ctx, m, MODE_WARM);
     }
 
     // Installs a scoped allow-through observer on FIXTURE_CLASS::<name>(I)I.
@@ -299,22 +347,52 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
 
     // Link every method we read up front (interpreted dispatch must run at least
     // once before a method's entry points are in their steady interpreted state).
-    // warm/touched/sset are dispatched here; quiet is deliberately NEVER dispatched.
+    // warm/touched/sset/iset are dispatched here; quiet is deliberately NEVER
+    // dispatched (its get_i2i_entry would THROW on a never-linked lazy stub on
+    // some JDKs -- the un-dispatched boundary the brief calls out; we dispatch
+    // every method whose i2i we read HARD, and only read quiet's behind guards).
     const bool warm_linked{ drive(ctx, MODE_CALL_WARM_ONCE) };
     const bool touched_linked{ drive(ctx, MODE_CALL_TOUCHED_ONCE) };
     const bool sset_linked{ drive(ctx, MODE_CALL_SSET_ONCE) };
+    const bool iset_linked{ drive(ctx, MODE_CALL_ISET_ONCE) };
     ctx.check("link_warm_probe_completed", warm_linked);
     ctx.check("link_touched_probe_completed", touched_linked);
     ctx.check("link_sset_probe_completed", sset_linked);
+    ctx.check("link_iset_probe_completed", iset_linked);
+    // The linking probes ran the real Java bodies -- byte-exact results prove the
+    // dispatch actually executed (so the methods are genuinely linked, not just
+    // that the handshake latched).  These guard against a fixture/probe-wiring
+    // regression that would make every later "linked method" assertion vacuous.
+    ctx.check("link_warm_body_ran", mep_fixture::get_last_warm_result() == SINGLE_RESULT);
+    ctx.check("link_touched_body_ran", mep_fixture::get_last_touched_result() == SINGLE_RESULT);
+    ctx.check("link_sset_body_ran", mep_fixture::get_last_sset_result() == SSET_RESULT);
+    ctx.check("link_iset_body_ran", mep_fixture::get_last_iset_result() == ISET_RESULT);
 
     vmhook::hotspot::method* const warm_m{ find_method(WARM_NAME) };
     vmhook::hotspot::method* const touched_m{ find_method(TOUCHED_NAME) };
     vmhook::hotspot::method* const sset_m{ find_method(SSET_NAME) };
+    vmhook::hotspot::method* const iset_m{ find_method(ISET_NAME) };
     vmhook::hotspot::method* const quiet_m{ find_method(QUIET_NAME) };
     ctx.check("located_warm_method", warm_m != nullptr);
     ctx.check("located_touched_method", touched_m != nullptr);
     ctx.check("located_sset_method", sset_m != nullptr);
+    ctx.check("located_iset_method", iset_m != nullptr);
     ctx.check("located_quiet_method", quiet_m != nullptr);
+
+    // Every located Method* is a DISTINCT object (the methods array holds one
+    // entry per declared method).  A collision would mean find_method matched the
+    // wrong slot and every downstream per-method assertion is measuring the wrong
+    // method -- catch that here, HARD.
+    if (warm_m != nullptr && touched_m != nullptr && sset_m != nullptr
+        && iset_m != nullptr && quiet_m != nullptr)
+    {
+        const bool all_distinct{
+            warm_m != touched_m && warm_m != sset_m && warm_m != iset_m
+            && warm_m != quiet_m && touched_m != sset_m && touched_m != iset_m
+            && touched_m != quiet_m && sset_m != iset_m && sset_m != quiet_m
+            && iset_m != quiet_m };
+        ctx.check("located_methods_all_distinct", all_distinct);
+    }
 
     // =====================================================================
     // Scenario 1 -- RAW ACCESSOR ROUND-TRIP on a clean interpreted method.
@@ -373,6 +451,43 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
                    "interp_routes_through_i2i=" } + (interp_routes_through_i2i(warm_m) ? "yes" : "no")
                    + " (_from_interpreted_entry " + (interp_routes_through_i2i(warm_m) ? "==" : "!=")
                    + " _i2i_entry on this linked-but-unhooked method).");
+
+        // i2i vs i2c DISTINCTION (the module's namesake).  On a LINKED but
+        // uncompiled method:
+        //   * _i2i_entry            -> the interpreter ("interp-to-interp") stub,
+        //   * _from_interpreted_entry -> normally the same i2i stub,
+        //   * _from_compiled_entry  -> the i2c adapter ("interp-to-compiled"
+        //     bridge) so a compiled caller can transition into the interpreter.
+        // The two are DIFFERENT addresses (the whole reason FIX-C must write both
+        // _from_interpreted_entry=i2i AND _from_compiled_entry=c2i): the i2i
+        // interpreter stub is not the same code as the i2c adapter.  Characterise
+        // (not hard -- a JDK could collapse them) but log the kinds so a future
+        // regression that aliases them is visible.
+        ctx.record(std::string{ "[INFO] method_entry_points_i2i_i2c scenario 1: i2i-vs-i2c on linked "
+                   "uncompiled warm(): _i2i_entry=" } + entry_kind(i2i_1)
+                   + ", _from_interpreted_entry=" + entry_kind(fie_1)
+                   + ", _from_compiled_entry(i2c)=" + entry_kind(fce)
+                   + "; i2i " + (i2i_1 != nullptr && fce != nullptr && i2i_1 == fce
+                                     ? "== _from_compiled_entry (aliased -- unusual)"
+                                     : "!= _from_compiled_entry (distinct i2i stub vs i2c adapter -- "
+                                       "the expected shape)") + ".");
+
+        // The access-flags / flags accessors are mutated in lockstep with the
+        // entry points at every install/deopt site, so this feature touches them.
+        // On a clean linked method they must RESOLVE to a readable field pointer
+        // (the offset is class-wide).  get_flags() can legitimately return null on
+        // a JDK whose Method::_flags is not exported as u2 (8-12 u1 / 21+ u4) --
+        // so that one is characterised, not hard.  get_access_flags() is exported
+        // on every JDK 8..26, so its non-null resolution is HARD.
+        std::uint32_t* const af{ warm_m->get_access_flags() };
+        ctx.check("raw_access_flags_resolves_nonnull", af != nullptr);
+        ctx.check("raw_access_flags_points_into_readable",
+                  af == nullptr ? false : points_into_readable(af));
+        std::uint16_t* const fl{ warm_m->get_flags() };
+        ctx.record(std::string{ "[INFO] method_entry_points_i2i_i2c scenario 1: get_flags() (u2-width "
+                   "_flags) = " } + (fl == nullptr ? "null (not exported as u2 on this JDK -- 8-12 u1 / "
+                   "21+ MethodFlags-u4; bug #7, the bit-readback is wrong-width there)"
+                   : "non-null (exported u2, JDK 13-20)") + "; access_flags resolves regardless.");
     }
     else
     {
@@ -437,14 +552,76 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
         }
 
         // The static method is still callable after the round-trip (we restored
-        // every entry point) -- prove the JVM is intact.
+        // every entry point) -- prove the JVM is intact AND byte-exact.
         const bool done{ drive(ctx, MODE_CALL_SSET_ONCE) };
         ctx.check("setter_sset_still_callable_after_roundtrip", done);
+        ctx.check("setter_sset_byte_exact_after_roundtrip",
+                  mep_fixture::get_last_sset_result() == SSET_RESULT);
     }
     else
     {
         ctx.record("[INFO] method_entry_points_i2i_i2c scenario 2: sset Method* unavailable -- "
                    "setter round-trip skipped (no crash).");
+    }
+
+    // ---- Scenario 2b -- the same setter round-trip on a DIFFERENT, never-hooked
+    //   static method (iset).  The FIX-C dance must land identically on ANY
+    //   Method, not just the first one probed: setter/getter offset agreement is
+    //   a class-wide property, so proving it on a second method guards against an
+    //   accidental per-method offset cache that happened to be right for sset.
+    //   Crucially this also exercises the EXACT FIX-C redirect in isolation:
+    //   write _from_interpreted_entry = _i2i_entry and assert
+    //   interp_routes_through_i2i() flips to true (the install path's invariant,
+    //   reproduced without installing a hook), then restore.
+    if (iset_m != nullptr)
+    {
+        void* const i2i{ iset_m->get_i2i_entry() };
+        void* const fie_orig{ iset_m->get_from_interpreted_entry() };
+        void* const fce_orig{ iset_m->get_from_compiled_entry() };
+        ctx.check("setter2_iset_i2i_nonnull", i2i != nullptr);
+
+        if (i2i != nullptr)
+        {
+            // FIX-C redirect in isolation: point the interpreted entry at the i2i
+            // stub; interp_routes_through_i2i MUST now report yes (this is the
+            // single write set_from_interpreted_entry(i2i) the install/re-anchor
+            // path performs, vmhook.hpp:8449-8452 / 8609-8611).
+            iset_m->set_from_interpreted_entry(i2i);
+            ctx.check("setter2_fix_c_redirect_makes_interp_route_i2i",
+                      interp_routes_through_i2i(iset_m));
+            // Restore and confirm the route reverts (proves the write was the only
+            // thing changing the predicate, not some incidental state).
+            iset_m->set_from_interpreted_entry(fie_orig);
+            ctx.check("setter2_fie_restored_to_original",
+                      iset_m->get_from_interpreted_entry() == fie_orig);
+
+            // _from_compiled_entry round-trip on this second method (offset
+            // agreement is method-agnostic).
+            iset_m->set_from_compiled_entry(i2i);
+            ctx.check("setter2_fce_readback_equals_written",
+                      iset_m->get_from_compiled_entry() == i2i);
+            iset_m->set_from_compiled_entry(fce_orig);
+            ctx.check("setter2_fce_restored_to_original",
+                      iset_m->get_from_compiled_entry() == fce_orig);
+
+            // _code round-trip on this second method (deopt trigger + restore).
+            void* const code_orig{ method_code(iset_m) };
+            iset_m->set_code(nullptr);
+            ctx.check("setter2_code_null_readback", iset_m->get_code() == nullptr);
+            iset_m->set_code(code_orig);
+            ctx.check("setter2_code_restored_to_original", method_code(iset_m) == code_orig);
+        }
+
+        // iset still callable + byte-exact after the full round-trip.
+        const bool done{ drive(ctx, MODE_CALL_ISET_ONCE) };
+        ctx.check("setter2_iset_still_callable_after_roundtrip", done);
+        ctx.check("setter2_iset_byte_exact_after_roundtrip",
+                  mep_fixture::get_last_iset_result() == ISET_RESULT);
+    }
+    else
+    {
+        ctx.record("[INFO] method_entry_points_i2i_i2c scenario 2b: iset Method* unavailable -- "
+                   "second setter round-trip skipped (no crash).");
     }
 
     // =====================================================================
@@ -516,6 +693,13 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
     // =====================================================================
     if (warm_m != nullptr)
     {
+        // Snapshot the i2i entry BEFORE warming.  The interpreter stub address is
+        // a per-method invariant: JIT compilation populates _code and may rewrite
+        // _from_interpreted_entry/_from_compiled_entry, but the _i2i_entry stub
+        // itself does not move.  Captured here so we can assert stability across
+        // the JIT transition below.
+        void* const i2i_before_jit{ warm_m->get_i2i_entry() };
+
         const bool warmed{ warm_to_jit(ctx, warm_m) };
         void* const code_before{ method_code(warm_m) };
         ctx.record(std::string{ "[INFO] method_entry_points_i2i_i2c scenario 4: warm warm() -> _code=" }
@@ -523,8 +707,30 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
                                                "c2i checks skipped)"
                                              : "NON-null (JIT-compiled)") + ".");
 
+        // ENTRY STABILITY across the JIT transition (HARD whether or not it
+        // actually compiled -- _i2i_entry is invariant either way): reading
+        // get_i2i_entry() after the warm loop returns the SAME stub address.  This
+        // is the property find_hook_location depends on: the i2i hook-location
+        // target must not drift under the method just because it got hotter.
+        void* const i2i_after_jit{ warm_m->get_i2i_entry() };
+        ctx.check("jit_i2i_entry_stable_across_warm_loop",
+                  i2i_before_jit != nullptr && i2i_before_jit == i2i_after_jit);
+
         if (warmed && code_before != nullptr)
         {
+            // On a freshly JIT-compiled, NOT-yet-hooked method the interpreter no
+            // longer routes through the i2i stub: HotSpot points
+            // _from_interpreted_entry at the i2c adapter so an interpreted caller
+            // transitions into the compiled body.  So interp_routes_through_i2i is
+            // EXPECTED to be false here -- this is precisely the state a hook
+            // install must repair by writing _from_interpreted_entry = i2i.
+            // Characterise (JDK-variant), don't hard-assert.
+            ctx.record(std::string{ "[INFO] method_entry_points_i2i_i2c scenario 4: on the JIT-compiled "
+                       "but unhooked warm(), interp_routes_through_i2i=" }
+                       + (interp_routes_through_i2i(warm_m) ? "yes" : "no (interp now routes to the i2c "
+                         "adapter -> a hook install must rewrite _from_interpreted_entry=i2i to fire)")
+                       + "; this is the FIX-C drift the install path repairs.");
+
             // On a compiled method _from_compiled_entry is the compiled nmethod's
             // verified entry (NOT the c2i adapter) -- it must point into executable
             // memory.  Universal once we know the method really compiled.
@@ -619,11 +825,26 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
     // =====================================================================
     if (warm_m != nullptr && touched_m != nullptr)
     {
+        // Independently drive touched() to its own JIT-compiled state.  This makes
+        // the adapter offset latchable even on a runner where warm() declined to
+        // compile in scenario 4 (different inlining/timing), giving the
+        // process-wide-latch assertion a fair chance instead of folding straight
+        // to the vacuous-skip [INFO].  Best-effort; gated below on the latch.
+        const bool touched_warmed{ warm_method_to_jit(ctx, touched_m, MODE_WARM_TOUCHED) };
+        ctx.record(std::string{ "[INFO] method_entry_points_i2i_i2c scenario 5: warm touched() -> _code=" }
+                   + (method_code(touched_m) == nullptr ? "null (declined/raced)" : "NON-null (compiled)")
+                   + " (warmed=" + (touched_warmed ? "yes" : "no") + ").");
+
         void* const adapter_warm{ warm_m->get_adapter() };
         void* const adapter_touched{ touched_m->get_adapter() };
-        // Stability: re-reading get_adapter() on warm() is identical (offset cached).
+        // Stability: re-reading get_adapter() on warm() is identical across THREE
+        // successive reads (the JDK 9+ offset cache must be sticky once latched;
+        // bug #4's sentinel collision would surface as a non-sticky re-probe that
+        // could return a different validated offset on a later call).
+        void* const adapter_warm_r2{ warm_m->get_adapter() };
+        void* const adapter_warm_r3{ warm_m->get_adapter() };
         ctx.check("adapter_warm_stable_across_reads",
-                  adapter_warm == warm_m->get_adapter());
+                  adapter_warm == adapter_warm_r2 && adapter_warm_r2 == adapter_warm_r3);
 
         if (adapter_warm != nullptr)
         {
@@ -631,6 +852,25 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
             // non-null adapter through the same cached offset.  HARD in this branch.
             ctx.check("adapter_offset_process_wide_resolves_second_method",
                       adapter_touched != nullptr);
+            // touched() too must be stable across reads now the offset is latched.
+            ctx.check("adapter_touched_stable_across_reads",
+                      adapter_touched == touched_m->get_adapter());
+            // A THIRD method (sset, a STATIC (I)I) resolves through the same cached
+            // offset too -- proves the latch is genuinely method/kind-agnostic, not
+            // accidentally right only for the two instance methods.  Gated on sset
+            // being located; characterised because a static method's adapter may be
+            // shaped/shared differently, but on a latched offset it must be a valid
+            // pointer if non-null and must not crash.
+            if (sset_m != nullptr)
+            {
+                void* const adapter_sset{ sset_m->get_adapter() };
+                ctx.check("adapter_static_method_resolves_or_null_no_crash",
+                          adapter_sset == nullptr
+                              || vmhook::hotspot::is_valid_pointer(adapter_sset));
+                ctx.record(std::string{ "[INFO] method_entry_points_i2i_i2c scenario 5: get_adapter() on "
+                           "the STATIC sset() through the latched offset = " }
+                           + (adapter_sset == nullptr ? "null" : "non-null/valid") + ".");
+            }
             // Each method's adapter is a DISTINCT object (different methods have
             // different AdapterHandlerEntry instances unless they share a signature;
             // warm and touched share (I)I so HotSpot MAY share the adapter -- so we
@@ -657,6 +897,15 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
                        "validated a candidate) -- the process-wide-offset assertion is vacuous and "
                        "skipped. This is the retry-not-cache-failure design (Forge 1.8.9 lesson, "
                        "vmhook.hpp:3345-3362); both methods returning null is correct here.");
+            // RETRY-NOT-CACHE-FAILURE proof: even when nothing latched, calling
+            // get_adapter() repeatedly is consistent (stays null) and NEVER caches
+            // the failure as a poison sentinel that would wedge it forever (the
+            // disastrous SIZE_MAX behaviour the comment at vmhook.hpp:3345-3362
+            // warns against).  Both must remain null and the calls must not crash.
+            ctx.check("adapter_unlatched_warm_consistently_null",
+                      warm_m->get_adapter() == nullptr);
+            ctx.check("adapter_unlatched_touched_consistently_null",
+                      touched_m->get_adapter() == nullptr);
         }
     }
 
@@ -702,20 +951,48 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
     if (quiet_m != nullptr)
     {
         void* const i2i{ quiet_m->get_i2i_entry() };
+        void* const i2i_r2{ quiet_m->get_i2i_entry() };   // stability on an unlinked method
         void* const fie{ quiet_m->get_from_interpreted_entry() };
         void* const fce{ quiet_m->get_from_compiled_entry() };
         // The accessors didn't crash and the pointer is valid -- HARD.
         ctx.check("quiet_method_pointer_still_valid",
                   vmhook::hotspot::is_valid_pointer(quiet_m));
-        // _i2i_entry is class-wide-resolvable even on a never-linked method.
+        // _i2i_entry is class-wide-resolvable even on a never-linked method.  The
+        // get_i2i_entry() throw->catch->null path means a never-dispatched method
+        // can legitimately return null on some JDKs (the lazy-link-stub case the
+        // brief flags); on the JDKs where it resolves it must be a real stub.
         ctx.check("quiet_i2i_entry_nonnull", i2i != nullptr);
+        // Whatever it returned, two reads agree (cached offset) -- HARD even when
+        // null (null==null).  Guards against a non-deterministic unlinked read.
+        ctx.check("quiet_i2i_entry_stable_across_reads", i2i == i2i_r2);
+        // If non-null it must be a real executable stub, never garbage.
+        ctx.check("quiet_i2i_entry_executable_if_nonnull",
+                  i2i == nullptr || points_into_executable(i2i));
         ctx.check("quiet_code_null_on_never_called_method", method_code(quiet_m) == nullptr);
+
+        // LINKED-vs-UNLINKED i2i comparison (the brief's explicit angle).  warm()
+        // is dispatched (linked); quiet() never was.  Both share the same class and
+        // the same (I)I signature, so HotSpot MAY hand them the SAME i2i interpreter
+        // entry-point stub (the i2i stub is selected by method kind/signature, not
+        // identity) -- OR a distinct lazy-resolution stub for the unlinked one.
+        // Characterise (JDK-variant) -- never hard-assert either equal or distinct.
+        if (warm_m != nullptr)
+        {
+            void* const warm_i2i{ warm_m->get_i2i_entry() };
+            ctx.record(std::string{ "[INFO] method_entry_points_i2i_i2c scenario 7: linked-vs-unlinked "
+                       "i2i: warm()(linked)=" } + entry_kind(warm_i2i) + ", quiet()(never-dispatched)="
+                       + entry_kind(i2i) + " -- they are "
+                       + (warm_i2i != nullptr && warm_i2i == i2i
+                              ? "the SAME stub (shared (I)I interpreter entry)"
+                              : "DIFFERENT (quiet may carry a lazy-resolution stub)") + ".");
+        }
+
         ctx.record(std::string{ "[INFO] method_entry_points_i2i_i2c scenario 7: never-dispatched quiet() "
-                   "_i2i_entry=" } + (i2i == nullptr ? "null" : "non-null")
-                   + ", _from_interpreted_entry=" + (fie == nullptr ? "null" : "non-null")
+                   "_i2i_entry=" } + entry_kind(i2i)
+                   + ", _from_interpreted_entry=" + entry_kind(fie)
                    + (i2i != nullptr && fie != nullptr && i2i == fie ? " (==i2i)" : " (!=i2i -- "
                      "lazy link stub on this never-linked method)")
-                   + ", _from_compiled_entry=" + (fce == nullptr ? "null" : "non-null") + ".");
+                   + ", _from_compiled_entry=" + entry_kind(fce) + ".");
     }
     else
     {
@@ -732,6 +1009,9 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
     {
         // get_c2i_entry_from_adapter(nullptr) -> null (vmhook.hpp:7643).
         ctx.check("null_get_c2i_from_null_adapter",
+                  vmhook::hotspot::get_c2i_entry_from_adapter(nullptr) == nullptr);
+        // Idempotent on null: a second call is also null and does not crash.
+        ctx.check("null_get_c2i_from_null_adapter_repeat",
                   vmhook::hotspot::get_c2i_entry_from_adapter(nullptr) == nullptr);
 
         // get_c2i_entry_from_adapter on a non-AHE but readable address (the
@@ -757,12 +1037,38 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
                   bad->get_from_compiled_entry() == nullptr);
         ctx.check("null_bad_method_get_code_returns_null", bad->get_code() == nullptr);
         ctx.check("null_bad_method_get_adapter_returns_null", bad->get_adapter() == nullptr);
+        // get_flags() guards `this` (is_valid_pointer(this) at vmhook.hpp:2948)
+        // before computing this+offset, so a bad Method* yields a NULL field
+        // pointer -- never a wild address the watchdog's set_dont_inline() would
+        // then WRITE to.  HARD.
+        ctx.check("null_bad_method_get_flags_returns_null", bad->get_flags() == nullptr);
+        // get_access_flags() does NOT guard `this` (it only checks the VMStruct
+        // entry, vmhook.hpp:2728-2747): on a JDK that exports _access_flags it
+        // returns this+offset = a NON-null WILD pointer for a 0x1 Method*.  The
+        // call itself does not crash (it only computes an address, never derefs),
+        // which is the universal we assert; the wild-pointer return is the
+        // characterised hazard (a caller that DEREFERENCED it would fault -- but
+        // every real caller validates the Method* first).  We must NOT deref it.
+        std::uint32_t* const bad_af{ bad->get_access_flags() };
+        ctx.check("null_bad_method_get_access_flags_did_not_crash", true);
+        ctx.record(std::string{ "[INFO] method_entry_points_i2i_i2c scenario 8: get_access_flags() on a "
+                   "0x1 Method* returned " } + (bad_af == nullptr ? "null (VMStruct not exported, or a "
+                   "future guard added)" : "a NON-null WILD pointer (no is_valid_pointer(this) guard -- "
+                   "vmhook.hpp:2728-2747; safe only because the address is never dereferenced here)")
+                   + "; the call did not crash.");
         // The setters on a bad Method* are silent no-ops (no crash); reaching the
         // assert after calling all three is the proof.
         bad->set_from_interpreted_entry(nullptr);
         bad->set_from_compiled_entry(nullptr);
         bad->set_code(nullptr);
         ctx.check("null_bad_method_setters_are_noop_no_crash", true);
+        // A NON-null but wild sentinel written into a bad Method*'s setters is also
+        // a silent no-op (the guard rejects `this` before computing this+offset, so
+        // nothing is written anywhere) -- reaching the assert proves no crash.
+        bad->set_from_interpreted_entry(reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1234)));
+        bad->set_from_compiled_entry(reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1234)));
+        bad->set_code(reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1234)));
+        ctx.check("null_bad_method_setters_nonnull_arg_still_noop_no_crash", true);
 
         // detect_adapter_offset_from_method(nullptr) -> 0 (vmhook.hpp:7832).
         ctx.check("null_detect_adapter_offset_from_null_method",

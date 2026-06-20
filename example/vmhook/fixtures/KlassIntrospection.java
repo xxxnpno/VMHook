@@ -378,6 +378,66 @@ public final class KlassIntrospection
     // Identity/sanity witness so the probe's dispatch is observable.
     public static volatile int     tickWitness;
 
+    // -----------------------------------------------------------------------
+    //  BATCH-21 DEEPENING witnesses (name FORMS, is_* predicates, host-name,
+    //  abstract/marker method counts).  All published by the same probe run().
+    // -----------------------------------------------------------------------
+
+    // Class.getName() forms.  The JVM-internal name the native get_name() reads
+    // uses '/' as the package separator and '$' as the nesting separator; the
+    // Java binary name uses '.' for packages and '$' for nesting.  We publish
+    // the dotted binary name of every nested shape so the native side can
+    // cross-check that internal_name.replace('/','.') == binary name.
+    public static volatile String  selfBinaryName;       // vmhook.fixtures.KlassIntrospection
+    public static volatile String  ifaceBinaryName;      // ...$Iface
+    public static volatile String  enumBinaryName;       // ...$Suit
+    public static volatile String  nestedBinaryName;     // ...$Nested
+    public static volatile String  innerBinaryName;      // ...$Inner
+    public static volatile String  boxBinaryName;        // ...$Box
+    public static volatile String  cmpBinaryName;        // ...$Cmp
+    public static volatile String  leafBinaryName;       // ...$Leaf
+    public static volatile String  wideBinaryName;       // ...$Wide
+    public static volatile String  markerBinaryName;     // ...$Marker
+    public static volatile String  abstractBinaryName;   // ...$AbstractBase
+    public static volatile String  intArrayBinaryName;   // [I  (getName() of int[].class)
+    public static volatile String  strArray2DBinaryName; // [[Ljava.lang.String;
+
+    // Nesting-host (enclosing class) binary names, so the native side can pin
+    // that every nested shape's name carries the host name as a '$'-prefix.
+    public static volatile String  nestedHostBinaryName; // vmhook.fixtures.KlassIntrospection
+    public static volatile String  innerHostBinaryName;  // vmhook.fixtures.KlassIntrospection
+
+    // is_* predicate witnesses (Java truth) for EVERY shape, so the native side
+    // can cross-check its access-flag/layout-derived predicates uniformly.
+    public static volatile boolean selfIsInterface;      // false
+    public static volatile boolean selfIsArray;          // false
+    public static volatile boolean selfIsEnum;           // false
+    public static volatile boolean selfIsAnnotation;     // false
+    public static volatile boolean abstractIsInterface;  // false
+    public static volatile boolean abstractIsArray;      // false
+    public static volatile boolean enumIsInterface;      // false
+    public static volatile boolean enumIsArray;          // false
+    public static volatile boolean ifaceIsArray;         // false
+    public static volatile boolean ifaceIsAbstract;      // true (interfaces are abstract)
+    public static volatile boolean ifaceIsEnum;          // false
+    public static volatile boolean markerIsArray;        // false
+    public static volatile boolean markerIsAbstract;     // true (annotations are interfaces)
+    public static volatile boolean finalIsArray;         // false
+    public static volatile boolean finalIsInterface;     // false
+    public static volatile boolean finalIsAbstract;      // false
+    public static volatile boolean nestedIsArray;        // false
+    public static volatile boolean nestedIsEnum;         // false
+    public static volatile boolean innerIsInterface;     // false
+    public static volatile boolean innerIsArray;         // false
+
+    // Abstract-shape method witnesses: the abstract method mustImplement() and
+    // the concrete helper both live in the abstract klass's _methods array.
+    public static volatile int     abstractDeclaredMethods;  // 2 (mustImplement + concreteHelper)
+    public static volatile int     ifaceDeclaredMethods;     // 3 (abstractOp/defaultOp/staticOp)
+    public static volatile int     markerDeclaredMethods;    // 2 (value + count)
+    public static volatile int     nestedDeclaredMethods;    // 1 (nestedMethod)
+    public static volatile int     innerDeclaredMethods;     // 1 (innerMethod)
+
     // Force-load anchors: referencing these class literals in <clinit> ensures
     // the nested/inner/annotation types are LOADED (the harness loader skips
     // $-nested classes), so find_class can resolve them from native code.
@@ -505,6 +565,55 @@ public final class KlassIntrospection
                 suitDeclaredFields  = Suit.class.getDeclaredFields().length;
                 innerDeclaredFields = Inner.class.getDeclaredFields().length;
                 boxDeclaredMethods  = Box.class.getDeclaredMethods().length;
+
+                // ---- BATCH-21: name FORMS (binary '.'-names) ----------------
+                selfBinaryName       = KlassIntrospection.class.getName();
+                ifaceBinaryName      = Iface.class.getName();
+                enumBinaryName       = Suit.class.getName();
+                nestedBinaryName     = Nested.class.getName();
+                innerBinaryName      = Inner.class.getName();
+                boxBinaryName        = Box.class.getName();
+                cmpBinaryName        = Cmp.class.getName();
+                leafBinaryName       = Leaf.class.getName();
+                wideBinaryName       = Wide.class.getName();
+                markerBinaryName     = Marker.class.getName();
+                abstractBinaryName   = AbstractBase.class.getName();
+                intArrayBinaryName   = int[].class.getName();
+                strArray2DBinaryName = String[][].class.getName();
+
+                // ---- BATCH-21: nesting host (enclosing class) binary names ---
+                nestedHostBinaryName = Nested.class.getEnclosingClass().getName();
+                innerHostBinaryName  = Inner.class.getEnclosingClass().getName();
+
+                // ---- BATCH-21: is_* predicates for every shape --------------
+                selfIsInterface     = KlassIntrospection.class.isInterface();
+                selfIsArray         = KlassIntrospection.class.isArray();
+                selfIsEnum          = KlassIntrospection.class.isEnum();
+                selfIsAnnotation    = KlassIntrospection.class.isAnnotation();
+                abstractIsInterface = AbstractBase.class.isInterface();
+                abstractIsArray     = AbstractBase.class.isArray();
+                enumIsInterface     = Suit.class.isInterface();
+                enumIsArray         = Suit.class.isArray();
+                ifaceIsArray        = Iface.class.isArray();
+                ifaceIsAbstract     = Modifier.isAbstract(Iface.class.getModifiers());
+                ifaceIsEnum         = Iface.class.isEnum();
+                markerIsArray       = Marker.class.isArray();
+                markerIsAbstract    = Modifier.isAbstract(Marker.class.getModifiers());
+                finalIsArray        = FinalLeaf.class.isArray();
+                finalIsInterface    = FinalLeaf.class.isInterface();
+                finalIsAbstract     = Modifier.isAbstract(FinalLeaf.class.getModifiers());
+                nestedIsArray       = Nested.class.isArray();
+                nestedIsEnum        = Nested.class.isEnum();
+                innerIsInterface    = Inner.class.isInterface();
+                innerIsArray        = Inner.class.isArray();
+
+                // ---- BATCH-21: declared-method counts for the shapes the ----
+                //      native side only touched by membership before.
+                abstractDeclaredMethods = AbstractBase.class.getDeclaredMethods().length;
+                ifaceDeclaredMethods    = Iface.class.getDeclaredMethods().length;
+                markerDeclaredMethods   = Marker.class.getDeclaredMethods().length;
+                nestedDeclaredMethods   = Nested.class.getDeclaredMethods().length;
+                innerDeclaredMethods    = Inner.class.getDeclaredMethods().length;
 
                 // ---- real bytecode dispatch (parity) ------------------------
                 tickWitness = new KlassIntrospection().tick(41);

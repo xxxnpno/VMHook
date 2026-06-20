@@ -102,6 +102,43 @@ public final class FindClassCtxLoader
      */
     public static int[] intArrayAnchor;
 
+    /**
+     * A live BOOTSTRAP-loaded anchor object ({@code java.lang.Object}, defined by
+     * the boot loader).  The native side uses this with
+     * {@code find_class_via_oop(bootstrapAnchor, ...)} to exercise the documented
+     * edge where the anchor's {@code getClassLoader()} is null: the loader is
+     * bootstrap, so the resolver currently returns nullptr with no bootstrap
+     * fallback (audit finding 13590-13593).  Kept reachable as a static so the
+     * native side can wrap its oop as an anchor inside the detour.
+     */
+    public static Object bootstrapAnchor = new Object();
+
+    /**
+     * A live bootstrap-loaded {@code java.lang.String} anchor — a second flavour of
+     * bootstrap anchor (also a {@code getClassLoader()==null} object) so the native
+     * side can confirm the bootstrap-anchor behaviour is not Object-specific.
+     */
+    public static String bootstrapStringAnchor = "ctxloader-bootstrap-anchor";
+
+    /**
+     * A NESTED static class so the native side can resolve a nested binary name
+     * ({@code vmhook/fixtures/FindClassCtxLoader$Nested}) through the context loader
+     * and through {@code find_class_via_oop}, proving the dollar-separated nested
+     * name round-trips and the resolved klass is usable (its own static field
+     * resolves).  Force-instantiated below so its klass is loaded before the probe.
+     */
+    public static final class Nested
+    {
+        /** A distinctive known-value static on the nested class (usability probe). */
+        public static int nestedSentinel = 0x0BEEF00D;
+
+        /** An instance field so a static/instance mix-up on the nested klass shows. */
+        public int nestedInstanceMark = 0x0FEEDBAC;
+    }
+
+    /** Force-loads the {@link Nested} klass so it is resolvable during the probe. */
+    public static Nested nestedAnchor = new Nested();
+
     static
     {
         // Anchor the [I array klass so reanchor lookups have it in the graph.
