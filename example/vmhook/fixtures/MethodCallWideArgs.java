@@ -269,6 +269,48 @@ public final class MethodCallWideArgs
     public static volatile int    sWPentD = (int) SENTINEL;
     public static volatile float  sWPentE = (float) SENTINEL;
 
+    // septa(int,int,int,int,int,int,long) — SEVEN args, six leading narrow ints
+    // then a TRAILING wide long.  For an INSTANCE call the receiver takes slot 0,
+    // the six ints take slots 1..6, and the long takes slots 7..8 — so the long's
+    // FIRST word lands in the last writable call-stub word (params[7]) and the
+    // long must NOT be truncated, dropped, or shifted at that boundary.  This is
+    // the deepest instance frame the call-stub params[8] can hold without the wide
+    // arg's leading word spilling past the array.  All seven operands stamped.
+    public static volatile int  wSeptaA = (int) SENTINEL;
+    public static volatile int  wSeptaB = (int) SENTINEL;
+    public static volatile int  wSeptaC = (int) SENTINEL;
+    public static volatile int  wSeptaD = (int) SENTINEL;
+    public static volatile int  wSeptaE = (int) SENTINEL;
+    public static volatile int  wSeptaF = (int) SENTINEL;
+    public static volatile long wSeptaG = SENTINEL;
+    // octa(int,int,int,int,int,int,int,long) — EIGHT args, seven leading narrow
+    // ints then a TRAILING wide long, dispatched STATICALLY so the no-receiver
+    // frame puts the seven ints in slots 0..6 and the long in slots 7..8 (its
+    // leading word in the last call-stub word params[7]).  This is the maximum
+    // arg count call() packs (param_idx caps at 8); a wide value as the 8th arg
+    // is the explicit boundary witness for "the last argument is wide and must
+    // survive".  All eight operands stamped.
+    public static volatile int  sWOctaA = (int) SENTINEL;
+    public static volatile int  sWOctaB = (int) SENTINEL;
+    public static volatile int  sWOctaC = (int) SENTINEL;
+    public static volatile int  sWOctaD = (int) SENTINEL;
+    public static volatile int  sWOctaE = (int) SENTINEL;
+    public static volatile int  sWOctaF = (int) SENTINEL;
+    public static volatile int  sWOctaG = (int) SENTINEL;
+    public static volatile long sWOctaH = SENTINEL;
+    // octaD(int,int,int,int,int,int,int,double) — the DOUBLE analogue of octa:
+    // seven narrow ints then a TRAILING wide double as the 8th arg, dispatched
+    // statically.  Proves the 'D'-kind eighth arg lands bit-exact at the boundary
+    // (NaN payload / sign survive the deepest pack).  All eight operands stamped.
+    public static volatile int    sWOctaDa = (int) SENTINEL;
+    public static volatile int    sWOctaDb = (int) SENTINEL;
+    public static volatile int    sWOctaDc = (int) SENTINEL;
+    public static volatile int    sWOctaDd = (int) SENTINEL;
+    public static volatile int    sWOctaDe = (int) SENTINEL;
+    public static volatile int    sWOctaDf = (int) SENTINEL;
+    public static volatile int    sWOctaDg = (int) SENTINEL;
+    public static volatile double sWOctaDh = Double.NaN;
+
     /** Held so the native side can build an instance wrapper for instance calls. */
     public static MethodCallWideArgs instance = new MethodCallWideArgs();
 
@@ -641,6 +683,28 @@ public final class MethodCallWideArgs
         return b + wa + wc;
     }
 
+    /** SEVEN args: six narrow ints then a TRAILING wide long.  For an instance
+     *  call the receiver is slot 0, the ints fill slots 1..6 and the long fills
+     *  slots 7..8, so the long's leading word lands in the last writable call-stub
+     *  word.  Distinct small multipliers (each a separate term) catch any neighbour
+     *  swap; the full 64-bit contribution of the trailing long catches a truncation
+     *  or a drop of the boundary arg.  Every operand stamped.  Java two's-complement
+     *  wraparound throughout (mirrored on the native side via unsigned-wrap helpers). */
+    public long septa(final int a, final int b, final int c,
+                      final int d, final int e, final int f, final long g)
+    {
+        wSeptaA = a;
+        wSeptaB = b;
+        wSeptaC = c;
+        wSeptaD = d;
+        wSeptaE = e;
+        wSeptaF = f;
+        wSeptaG = g;
+        return ((long) a) * 3L + ((long) b) * 31L + ((long) c) * 131L
+             + ((long) d) * 524287L + ((long) e) * 8191L + ((long) f) * 17L
+             + g * 1000003L;
+    }
+
     // ======================================================================
     //  Overload pair that ONLY differs by a wide-vs-narrow parameter kind, so
     //  resolve_compatible_method() must pick the long overload for a C++ int64
@@ -796,6 +860,50 @@ public final class MethodCallWideArgs
         sWPentD = d;
         sWPentE = e;
         return (double) a + (double) b + c + (double) d + (double) e;
+    }
+
+    /** EIGHT args: seven narrow ints then a TRAILING wide long, STATIC (no
+     *  receiver) so the ints fill slots 0..6 and the long fills slots 7..8 — its
+     *  leading word in the last call-stub word params[7].  This is the maximum
+     *  arg count call() packs; a wide value as the 8th arg is the boundary witness
+     *  that the last argument is wide and survives.  Distinct multipliers catch a
+     *  swap; the full 64-bit trailing long catches a truncation/drop.  All stamped.
+     *  Java two's-complement wraparound (mirrored via unsigned-wrap helpers). */
+    public static long sOcta(final int a, final int b, final int c, final int d,
+                             final int e, final int f, final int g, final long h)
+    {
+        sWOctaA = a;
+        sWOctaB = b;
+        sWOctaC = c;
+        sWOctaD = d;
+        sWOctaE = e;
+        sWOctaF = f;
+        sWOctaG = g;
+        sWOctaH = h;
+        return ((long) a) * 3L + ((long) b) * 31L + ((long) c) * 131L
+             + ((long) d) * 524287L + ((long) e) * 8191L + ((long) f) * 17L
+             + ((long) g) * 41L + h * 1000003L;
+    }
+
+    /** The DOUBLE analogue of sOcta: seven narrow ints then a TRAILING wide
+     *  double as the 8th arg, STATIC.  Proves the 'D'-kind eighth argument lands
+     *  bit-exact at the boundary.  The seven ints are summed (widened to double in
+     *  their own step), then the trailing double is added last; the native side
+     *  recomputes the identical left-to-right order so the bits match with no FMA
+     *  contraction.  All eight operands stamped (the double read back bit-exact). */
+    public static double sOctaD(final int a, final int b, final int c, final int d,
+                                final int e, final int f, final int g, final double h)
+    {
+        sWOctaDa = a;
+        sWOctaDb = b;
+        sWOctaDc = c;
+        sWOctaDd = d;
+        sWOctaDe = e;
+        sWOctaDf = f;
+        sWOctaDg = g;
+        sWOctaDh = h;
+        return (double) a + (double) b + (double) c + (double) d
+             + (double) e + (double) f + (double) g + h;
     }
 
     static

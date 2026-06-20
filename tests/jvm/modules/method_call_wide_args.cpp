@@ -345,6 +345,32 @@ namespace
         static auto sWPentC() -> std::uint64_t { return d2bits_field("sWPentC"); }
         static auto sWPentD() -> std::int32_t  { return static_field("sWPentD")->get(); }
         static auto sWPentE() -> std::uint32_t { return f2bits_field("sWPentE"); }
+        // septa(int x6, long) — TRAILING wide long at the deepest instance slot.
+        static auto wSeptaA() -> std::int32_t { return static_field("wSeptaA")->get(); }
+        static auto wSeptaB() -> std::int32_t { return static_field("wSeptaB")->get(); }
+        static auto wSeptaC() -> std::int32_t { return static_field("wSeptaC")->get(); }
+        static auto wSeptaD() -> std::int32_t { return static_field("wSeptaD")->get(); }
+        static auto wSeptaE() -> std::int32_t { return static_field("wSeptaE")->get(); }
+        static auto wSeptaF() -> std::int32_t { return static_field("wSeptaF")->get(); }
+        static auto wSeptaG() -> std::int64_t { return static_field("wSeptaG")->get(); }
+        // sOcta(int x7, long) — TRAILING wide long as the 8th (last packable) arg.
+        static auto sWOctaA() -> std::int32_t { return static_field("sWOctaA")->get(); }
+        static auto sWOctaB() -> std::int32_t { return static_field("sWOctaB")->get(); }
+        static auto sWOctaC() -> std::int32_t { return static_field("sWOctaC")->get(); }
+        static auto sWOctaD() -> std::int32_t { return static_field("sWOctaD")->get(); }
+        static auto sWOctaE() -> std::int32_t { return static_field("sWOctaE")->get(); }
+        static auto sWOctaF() -> std::int32_t { return static_field("sWOctaF")->get(); }
+        static auto sWOctaG() -> std::int32_t { return static_field("sWOctaG")->get(); }
+        static auto sWOctaH() -> std::int64_t { return static_field("sWOctaH")->get(); }
+        // sOctaD(int x7, double) — TRAILING wide double as the 8th arg (raw bits).
+        static auto sWOctaDa() -> std::int32_t  { return static_field("sWOctaDa")->get(); }
+        static auto sWOctaDb() -> std::int32_t  { return static_field("sWOctaDb")->get(); }
+        static auto sWOctaDc() -> std::int32_t  { return static_field("sWOctaDc")->get(); }
+        static auto sWOctaDd() -> std::int32_t  { return static_field("sWOctaDd")->get(); }
+        static auto sWOctaDe() -> std::int32_t  { return static_field("sWOctaDe")->get(); }
+        static auto sWOctaDf() -> std::int32_t  { return static_field("sWOctaDf")->get(); }
+        static auto sWOctaDg() -> std::int32_t  { return static_field("sWOctaDg")->get(); }
+        static auto sWOctaDh() -> std::uint64_t { return d2bits_field("sWOctaDh"); }
     };
 
     // ---------------------------------------------------------------------
@@ -864,6 +890,26 @@ namespace
         put(key, r);
     }
 
+    // Instance, returns long, (int,int,int,int,int,int,long) — SEVEN args, the
+    // trailing wide long lands at the deepest writable instance call-stub slot.
+    auto cap_septa(const wide& self, const std::string& key,
+                   std::int32_t a, std::int32_t b, std::int32_t c,
+                   std::int32_t d, std::int32_t e, std::int32_t f,
+                   std::int64_t g) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("septa") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e, f, g);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
     // Instance, returns long, (long x6) — six adjacent longs, deep slot packing.
     auto cap_sixL(const wide& self, const std::string& key,
                   std::int64_t a, std::int64_t b, std::int64_t c,
@@ -1178,6 +1224,47 @@ namespace
         put(key, r);
     }
 
+    // Static (int x7, long) — EIGHT args, the trailing wide long is the 8th (and
+    // last packable) argument; with no receiver the long fills slots 7..8.
+    auto scap_octa(const std::string& key,
+                   std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d,
+                   std::int32_t e, std::int32_t f, std::int32_t g,
+                   std::int64_t h) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sOcta") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e, f, g, h);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Static (int x7, double) — EIGHT args, the trailing wide DOUBLE is the 8th
+    // argument; proves the 'D'-kind eighth arg lands bit-exact at the boundary.
+    auto scap_octaD(const std::string& key,
+                    std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d,
+                    std::int32_t e, std::int32_t f, std::int32_t g,
+                    double h) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sOctaD") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e, f, g, h);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
     // ---- EXPLICIT-SIGNATURE capture (pin a wide overload by descriptor) -------
     auto cap_sig_long1(const wide& self, const std::string& key,
                        const char* name, const char* sig, std::int64_t a) -> void
@@ -1258,6 +1345,49 @@ namespace
             }
             put("wrong_mixA_all_long", r);
         }
+
+        // ============================================================
+        //  BOUNDARY-EXTREME WIDE ARG IN A FLANKED POSITION.  The *_main flanked
+        //  shapes below use mild operands (PI, 2.5, small longs); these re-run the
+        //  SAME shapes with the wide arg at an EXTREME (subnormal / Inf / NaN /
+        //  MAX_VALUE / +2^31 sign-extend witness / all-ones -1) so a truncation,
+        //  sign-extension, or NaN-mangle in the flanked slot is caught while the
+        //  narrow neighbours survive.  They run BEFORE the *_main calls so the
+        //  later legit calls leave the LAST-call witnesses in the state those
+        //  *_main witness assertions expect; here we assert ONLY the combined
+        //  return, which alone pins the wide operand's full 64-bit width.
+        // ============================================================
+        // scaleD with the smallest subnormal as the wide leading double.
+        cap_scaleD(s, "scaleD_subnormal", bits2d(0x0000000000000001ULL), 3);
+        // scaleD with +Inf: Inf * n stays Inf bit-exact iff the double is intact.
+        cap_scaleD(s, "scaleD_inf", bits2d(0x7FF0000000000000ULL), 2);
+        // mixC with the middle double = MAX_VALUE and INT_MIN/INT_MAX flanks.
+        cap_mixC(s, "mixC_extreme",
+                 std::numeric_limits<std::int32_t>::min(),
+                 bits2d(0x7FEFFFFFFFFFFFFFULL),               // MAX_VALUE
+                 std::numeric_limits<std::int32_t>::max());
+        // mixD all-four-wide at the extremes: LONG_MIN, +Inf, LONG_MAX, qNaN.
+        // The sum becomes NaN (Inf/NaN dominate); both sides agree bit-for-bit.
+        cap_mixD(s, "mixD_extreme",
+                 std::numeric_limits<std::int64_t>::min(),
+                 bits2d(0x7FF0000000000000ULL),               // +Inf
+                 std::numeric_limits<std::int64_t>::max(),
+                 bits2d(0x7FF8000000000000ULL));              // qNaN
+        // addL with BOTH operands all-ones (-1): the full-width 0xFFFF..FFFF
+        // pattern — a 32-bit truncation reads the same low word but a different
+        // product/sum; the unsigned-wrap formula pins the true value.
+        cap_long2(s, "addL_allones", "addL", -1LL, -1LL);
+        // idj with the long operand = +2^31 (low word "looks negative-int"): a
+        // sign-extend-from-32 bug flips the long's sign and the sum changes.
+        cap_idj(s, "idj_pos2to31", 7, bits2d(0x3FF0000000000000ULL),  // +1.0
+                static_cast<std::int64_t>(0x0000000080000000ULL));
+        // jidi with the leading long = LONG_MIN and the middle double = -0.0; the
+        // two narrow ints (INT_MAX / INT_MIN) must survive across both wide kinds.
+        cap_jidi(s, "jidi_extreme",
+                 std::numeric_limits<std::int64_t>::min(),
+                 std::numeric_limits<std::int32_t>::max(),
+                 bits2d(0x8000000000000000ULL),               // -0.0
+                 std::numeric_limits<std::int32_t>::min());
 
         // ============================================================
         //  Single-long ECHO across the full boundary set (idL).  Proves the
@@ -1552,6 +1682,19 @@ namespace
                   bits2d(0x400921FB54442D18ULL), kStrC);            // PI between refs
 
         // ============================================================
+        //  TRAILING WIDE AT THE DEEPEST INSTANCE SLOT: septa(int x6, long).  The
+        //  receiver takes slot 0, the six ints slots 1..6, and the long slots 7..8
+        //  — so the long's leading word lands in the LAST writable call-stub word
+        //  (params[7]).  This is the boundary case for "the trailing argument is
+        //  wide AND the frame is as deep as the params[8] array allows for an
+        //  instance call".  The middle long has BOTH halves set (worst case for a
+        //  high-bits leak past the array edge).  All seven operands stamped.
+        // ============================================================
+        cap_septa(s, "septa_main",
+                  0x0A0A0A0A, -7, 0x13572468, -2000000000, 0x7FFFFFFF, 0x5EEDFACE,
+                  static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
+
+        // ============================================================
         //  STATIC variants (no receiver; first wide arg at slot 0).
         // ============================================================
         scap_long2("s_addL_min_max", "sAddL",
@@ -1599,6 +1742,18 @@ namespace
                       bits2d(0x400921FB54442D18ULL),                  // PI
                       -2000000000,
                       2.5f);
+        // STATIC EIGHT-ARG frames with a TRAILING wide as the 8th (last packable)
+        // argument.  No receiver, so the seven narrow ints fill slots 0..6 and the
+        // wide fills slots 7..8 — its leading word in the LAST call-stub word
+        // params[7].  sOcta trails a long, sOctaD trails a double; both prove the
+        // maximum-arity wide tail survives with no truncation/drop at the boundary.
+        scap_octa("s_octa",
+                  0x0A0A0A0A, -7, 0x13572468, -2000000000,
+                  0x7FFFFFFF, 0x5EEDFACE, std::numeric_limits<std::int32_t>::min(),
+                  static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
+        scap_octaD("s_octaD",
+                   1, 2, 3, 4, 5, 6, std::numeric_limits<std::int32_t>::max(),
+                   bits2d(0x400921FB54442D18ULL));                    // PI as 8th
     }
 
     // The entire test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
@@ -2352,6 +2507,135 @@ namespace
         }
 
         // =====================================================================
+        //  BOUNDARY-EXTREME WIDE ARG IN A FLANKED POSITION.  These re-run the
+        //  flanked shapes (scaleD / mixC / mixD / addL / idj / jidi) with the wide
+        //  operand at an EXTREME — subnormal, +Inf, NaN, MAX_VALUE, +2^31 (the
+        //  sign-extend witness), all-ones -1, -0.0 — so a truncation / sign-extend
+        //  / NaN-mangle in the flanked slot changes the combined return.  Asserted
+        //  by combined return only (these run before the *_main calls in run_all,
+        //  so the *_main witness assertions above keep their LAST-call values).
+        //  The deterministic formula / bit-exact double makes each return pin the
+        //  wide operand's full 64-bit width independent of the witness.
+        // =====================================================================
+        {
+            // scaleD(subnormal, 3): subnormal * 3 stays a subnormal bit-exactly
+            // iff the leading double reached the callee with its full mantissa.
+            const double x{ bits2d(0x0000000000000001ULL) };
+            const std::int32_t n{ 3 };
+            const probe_result r{ got("scaleD_subnormal") };
+            ctx.check("scaleD_subnormal_resolved", r.resolved);
+            ctx.check("scaleD_subnormal_return_bits", r.dbits == d2bits(x * static_cast<double>(n)));
+        }
+        {
+            // scaleD(+Inf, 2): Inf * 2 == Inf bit-exact iff the double is intact.
+            const double x{ bits2d(0x7FF0000000000000ULL) };
+            const std::int32_t n{ 2 };
+            const probe_result r{ got("scaleD_inf") };
+            ctx.check("scaleD_inf_resolved", r.resolved);
+            ctx.check("scaleD_inf_return_bits", r.dbits == d2bits(x * static_cast<double>(n)));
+        }
+        {
+            // mixC(INT_MIN, MAX_VALUE, INT_MAX): the middle double is the largest
+            // finite; a truncation would not survive the b + a + c recomposition,
+            // and the INT_MIN/INT_MAX flanks catch a shift aliasing the double's
+            // words into a neighbour.
+            const std::int32_t a{ std::numeric_limits<std::int32_t>::min() };
+            const double       b{ bits2d(0x7FEFFFFFFFFFFFFFULL) }; // MAX_VALUE
+            const std::int32_t c{ std::numeric_limits<std::int32_t>::max() };
+            const probe_result r{ got("mixC_extreme") };
+            ctx.check("mixC_extreme_resolved", r.resolved);
+            ctx.check("mixC_extreme_return_bits",
+                      r.dbits == d2bits(b + static_cast<double>(a) + static_cast<double>(c)));
+        }
+        {
+            // mixD(LONG_MIN, +Inf, LONG_MAX, qNaN): the sum is NaN (Inf/NaN
+            // dominate); both sides produce the identical NaN bit pattern, so a
+            // wide-kind swap or truncation that changed any operand would change it.
+            const std::int64_t a{ std::numeric_limits<std::int64_t>::min() };
+            const double       b{ bits2d(0x7FF0000000000000ULL) }; // +Inf
+            const std::int64_t c{ std::numeric_limits<std::int64_t>::max() };
+            const double       d{ bits2d(0x7FF8000000000000ULL) }; // qNaN
+            const probe_result r{ got("mixD_extreme") };
+            ctx.check("mixD_extreme_resolved", r.resolved);
+            ctx.check("mixD_extreme_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + b + static_cast<double>(c) + d));
+        }
+        {
+            // addL(-1, -1): full-width 0xFFFF..FFFF in both operands.  -1*1000003
+            // + -1 wraps in two's complement; the unsigned-wrap formula pins it.  A
+            // 32-bit truncation reads the same low word but a different product.
+            const probe_result r{ got("addL_allones") };
+            ctx.check("addL_allones_resolved", r.resolved);
+            ctx.check("addL_allones_return", r.ival == jadd(jmul(-1LL, 1000003LL), -1LL));
+        }
+        {
+            // idj(7, +1.0, +2^31): the long's low word is 0x80000000 ("negative as
+            // int") but the value is +2^31; a sign-extend-from-32 bug flips its sign
+            // and the (double)a + b + (double)c sum changes.
+            const std::int32_t a{ 7 };
+            const double       b{ bits2d(0x3FF0000000000000ULL) }; // +1.0
+            const std::int64_t c{ static_cast<std::int64_t>(0x0000000080000000ULL) };
+            const probe_result r{ got("idj_pos2to31") };
+            ctx.check("idj_pos2to31_resolved", r.resolved);
+            ctx.check("idj_pos2to31_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + b + static_cast<double>(c)));
+        }
+        {
+            // jidi(LONG_MIN, INT_MAX, -0.0, INT_MIN): leading long extreme, middle
+            // double = -0.0, two narrow ints at their extremes across both wide
+            // kinds.  The pure sum pins each operand's full width.
+            const std::int64_t a{ std::numeric_limits<std::int64_t>::min() };
+            const std::int32_t b{ std::numeric_limits<std::int32_t>::max() };
+            const double       c{ bits2d(0x8000000000000000ULL) }; // -0.0
+            const std::int32_t d{ std::numeric_limits<std::int32_t>::min() };
+            const probe_result r{ got("jidi_extreme") };
+            ctx.check("jidi_extreme_resolved", r.resolved);
+            ctx.check("jidi_extreme_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + static_cast<double>(b)
+                                        + c + static_cast<double>(d)));
+        }
+
+        // =====================================================================
+        //  TRAILING WIDE AT THE DEEPEST INSTANCE SLOT (septa = int x6, long).  The
+        //  receiver is slot 0, the six ints slots 1..6, the long slots 7..8 — its
+        //  leading word in the LAST writable call-stub word (params[7]).  Combined
+        //  return (full 64-bit trailing long + asymmetric narrow multipliers) AND
+        //  all seven witnesses, so a truncation/drop/shift of the boundary wide arg
+        //  fails the return and the wSeptaG witness independently.
+        // =====================================================================
+        {
+            const std::int32_t a{ 0x0A0A0A0A };
+            const std::int32_t b{ -7 };
+            const std::int32_t c{ 0x13572468 };
+            const std::int32_t d{ -2000000000 };
+            const std::int32_t e{ 0x7FFFFFFF };
+            const std::int32_t f{ 0x5EEDFACE };
+            const std::int64_t g{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            // a*3 + b*31 + c*131 + d*524287 + e*8191 + f*17 + g*1000003 (two's-comp)
+            const std::int64_t expect{
+                jadd(jadd(jadd(jadd(jadd(jadd(
+                    jmul(static_cast<std::int64_t>(a), 3LL),
+                    jmul(static_cast<std::int64_t>(b), 31LL)),
+                    jmul(static_cast<std::int64_t>(c), 131LL)),
+                    jmul(static_cast<std::int64_t>(d), 524287LL)),
+                    jmul(static_cast<std::int64_t>(e), 8191LL)),
+                    jmul(static_cast<std::int64_t>(f), 17LL)),
+                    jmul(g, 1000003LL)) };
+            const probe_result r{ got("septa_main") };
+            ctx.check("septa_main_resolved", r.resolved);
+            ctx.check("septa_main_not_void", r.dispatched);
+            ctx.check("septa_main_return", r.ival == expect);
+            ctx.check("septa_witness_a_intact", wide::wSeptaA() == a);
+            ctx.check("septa_witness_b_intact", wide::wSeptaB() == b);
+            ctx.check("septa_witness_c_intact", wide::wSeptaC() == c);
+            ctx.check("septa_witness_d_intact", wide::wSeptaD() == d);
+            ctx.check("septa_witness_e_intact", wide::wSeptaE() == e);
+            ctx.check("septa_witness_f_intact", wide::wSeptaF() == f);
+            // The trailing wide long at the deepest instance slot is exact.
+            ctx.check("septa_witness_g_long_exact_at_boundary", wide::wSeptaG() == g);
+        }
+
+        // =====================================================================
         //  STATIC variants — first wide arg at slot 0 (no receiver).
         // =====================================================================
         {
@@ -2538,6 +2822,78 @@ namespace
             ctx.check("s_widePent_witness_c_bits",   wide::sWPentC() == 0x400921FB54442D18ULL);
             ctx.check("s_widePent_witness_d_intact", wide::sWPentD() == d);
             ctx.check("s_widePent_witness_e_bits_trailing", wide::sWPentE() == f2bits(e));
+        }
+        {
+            // STATIC EIGHT-ARG, TRAILING WIDE LONG as the 8th (last packable) arg.
+            // No receiver: seven ints in slots 0..6, the long in slots 7..8 (its
+            // leading word in the LAST call-stub word params[7]).  Combined return
+            // (full 64-bit trailing long + asymmetric narrow multipliers) AND all
+            // eight witnesses; a truncation/drop/shift of the boundary wide fails
+            // the return and the sWOctaH witness independently.
+            const std::int32_t a{ 0x0A0A0A0A };
+            const std::int32_t b{ -7 };
+            const std::int32_t c{ 0x13572468 };
+            const std::int32_t d{ -2000000000 };
+            const std::int32_t e{ 0x7FFFFFFF };
+            const std::int32_t f{ 0x5EEDFACE };
+            const std::int32_t g{ std::numeric_limits<std::int32_t>::min() };
+            const std::int64_t h{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            // a*3 + b*31 + c*131 + d*524287 + e*8191 + f*17 + g*41 + h*1000003
+            const std::int64_t expect{
+                jadd(jadd(jadd(jadd(jadd(jadd(jadd(
+                    jmul(static_cast<std::int64_t>(a), 3LL),
+                    jmul(static_cast<std::int64_t>(b), 31LL)),
+                    jmul(static_cast<std::int64_t>(c), 131LL)),
+                    jmul(static_cast<std::int64_t>(d), 524287LL)),
+                    jmul(static_cast<std::int64_t>(e), 8191LL)),
+                    jmul(static_cast<std::int64_t>(f), 17LL)),
+                    jmul(static_cast<std::int64_t>(g), 41LL)),
+                    jmul(h, 1000003LL)) };
+            const probe_result r{ got("s_octa") };
+            ctx.check("s_octa_resolved", r.resolved);
+            ctx.check("s_octa_not_void", r.dispatched);
+            ctx.check("s_octa_return", r.ival == expect);
+            ctx.check("s_octa_witness_a_intact", wide::sWOctaA() == a);
+            ctx.check("s_octa_witness_b_intact", wide::sWOctaB() == b);
+            ctx.check("s_octa_witness_c_intact", wide::sWOctaC() == c);
+            ctx.check("s_octa_witness_d_intact", wide::sWOctaD() == d);
+            ctx.check("s_octa_witness_e_intact", wide::sWOctaE() == e);
+            ctx.check("s_octa_witness_f_intact", wide::sWOctaF() == f);
+            ctx.check("s_octa_witness_g_intact", wide::sWOctaG() == g);
+            // The trailing wide long as the 8th argument is exact.
+            ctx.check("s_octa_witness_h_long_exact_8th_arg", wide::sWOctaH() == h);
+        }
+        {
+            // STATIC EIGHT-ARG, TRAILING WIDE DOUBLE as the 8th arg.  Proves the
+            // 'D'-kind eighth argument lands bit-exact at the boundary; the pure
+            // left-to-right sum is recomputed in the identical order so the bits
+            // match.  Combined return AND all eight witnesses (double bit-exact).
+            const std::int32_t a{ 1 };
+            const std::int32_t b{ 2 };
+            const std::int32_t c{ 3 };
+            const std::int32_t d{ 4 };
+            const std::int32_t e{ 5 };
+            const std::int32_t f{ 6 };
+            const std::int32_t g{ std::numeric_limits<std::int32_t>::max() };
+            const double       h{ bits2d(0x400921FB54442D18ULL) }; // PI as 8th
+            const double expect{ static_cast<double>(a) + static_cast<double>(b)
+                                 + static_cast<double>(c) + static_cast<double>(d)
+                                 + static_cast<double>(e) + static_cast<double>(f)
+                                 + static_cast<double>(g) + h };
+            const probe_result r{ got("s_octaD") };
+            ctx.check("s_octaD_resolved", r.resolved);
+            ctx.check("s_octaD_not_void", r.dispatched);
+            ctx.check("s_octaD_return_bits", r.dbits == d2bits(expect));
+            ctx.check("s_octaD_witness_a_intact", wide::sWOctaDa() == a);
+            ctx.check("s_octaD_witness_b_intact", wide::sWOctaDb() == b);
+            ctx.check("s_octaD_witness_c_intact", wide::sWOctaDc() == c);
+            ctx.check("s_octaD_witness_d_intact", wide::sWOctaDd() == d);
+            ctx.check("s_octaD_witness_e_intact", wide::sWOctaDe() == e);
+            ctx.check("s_octaD_witness_f_intact", wide::sWOctaDf() == f);
+            ctx.check("s_octaD_witness_g_intact", wide::sWOctaDg() == g);
+            // The trailing wide double as the 8th argument is bit-exact.
+            ctx.check("s_octaD_witness_h_double_bits_8th_arg",
+                      wide::sWOctaDh() == 0x400921FB54442D18ULL);
         }
 
         // =====================================================================
