@@ -41,6 +41,12 @@ Source-verified fix-plans from the 10-agent investigation wave (2026-06-20), one
 - **Test:** CI injection step stays green; self-process unit check of the matcher; negative (bad DLL → false).
 - **Risk:** low; only fixes false-negatives. Verify CMake link unchanged (use K32* prefix).
 
+### 11. reference (String) static read via inherited/interface mirror — MEDIUM (correctness; found batch-18)
+- **Bug:** reading a REFERENCE (String) `static final` field through `wrapper::static_field(name)->get()` returns the WRONG value when the declaring klass is reached via inheritance or an interface, while (a) the PRIMITIVE sibling (long) resolved through the SAME mirror reads correctly AND (b) a reference static on a DIRECT class (field_static.cpp) reads correctly. Repro (both fail uniformly mingw×8-26, siblings pass): field_inherited.cpp `iface_const_str_value_via_iface_wrapper` (IFACE_CONST_STR on the interface's own mirror) + `static_inherited_grandparent_str_value` (Base.sStr via the depth-2 child wrapper).
+- **Suspected:** the reference-static VALUE read (field_proxy::get reference branch / static-mirror+offset resolution ~vmhook.hpp:13947) mis-resolves the declaring-klass mirror or the static-oop offset for a NON-DIRECT declaring klass, or decodes the compressed oop against the wrong base. The primitive path (raw bits at declaring_klass mirror+offset) is correct — isolating it to the reference decode/offset for inherited/interface holders. NOTE: resolution + is_static/is_reference + signature all PASS; only the value differs.
+- **Test:** the two reads are currently GATED [INFO] in field_inherited.cpp (resolution/signature/is_reference kept HARD). The fix flips the two value reads back to HARD `== "iface-const"` / `== "base-static-str"`.
+- **Risk:** unknown until root-caused — investigate FIRST; the read path is shared with the working direct-class + primitive cases, so a fix must not regress those. Add a field_static interface/grandparent reference-static cell to lock it.
+
 ## TIER 2 — needs special handling / coupling (apply after Tier 1, carefully)
 
 ### 7. register_class factory-map asymmetry — HIGH (cross-type downcast UB)
