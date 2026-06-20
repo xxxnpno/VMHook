@@ -20508,6 +20508,33 @@ namespace vmhook
             return;
         }
 
+        // ELEMENT-WIDTH GUARD (mirrors read_array_value's refusal at 14817 and the
+        // scalar field_proxy::set size-mismatch guard at 15601).  set_array_element
+        // strides the backing array by sizeof(the C++ element), but the array's ACTUAL
+        // element width is fixed by its JVM descriptor ([Z/[B=1, [S/[C=2, [I/[F=4,
+        // [J/[D=8).  A wider C++ element (e.g. an int written into a byte[]) would write
+        // PAST each element into adjacent heap = CORRUPTION; a narrower one mis-strides.
+        // Refuse the write on any mismatch.  The char/"[C" branch below legitimately
+        // writes uint16 (width 2), so it is carved out of this numeric comparison.
+        if constexpr (!std::is_same_v<element_type, char>)
+        {
+            const std::string signature{ field.signature() };
+            if (signature.size() >= 2 && signature.front() == '[')
+            {
+                const std::size_t field_element_width{
+                    vmhook::detail::jvm_primitive_byte_width(signature.substr(1)) };
+                if (field_element_width != 0 && sizeof(element_type) != field_element_width)
+                {
+                    VMHOOK_LOG("{} set_prim_array: element-width mismatch (C++ element={}B, "
+                               "JVM array element={}B, sig='{}') - refusing the write to avoid "
+                               "corrupting the array data.  Write a std::vector whose element "
+                               "matches the array's primitive width.",
+                               vmhook::error_tag, sizeof(element_type), field_element_width, signature);
+                    return;
+                }
+            }
+        }
+
         const std::int32_t length{ (std::min)(vmhook::array_length(array_oop), static_cast<std::int32_t>(values.size())) };
         for (std::int32_t index{ 0 }; index < length; ++index)
         {

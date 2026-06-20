@@ -1514,6 +1514,55 @@ static void run_field_arrays_primitive_checks(vmhook_test::context& ctx)
         const std::vector<float> sp_b{ wrapper::sp_float() };
         ctx.check("reread_special_float_stable", all_bits_equal(sp_a, sp_b));
     }
+
+    // =========================================================================
+    // 13) set_prim_array ELEMENT-WIDTH GUARD (heap-corruption fix regression).
+    //     set_array_element strides by sizeof(the C++ element); the Java array's
+    //     element width is fixed by its descriptor.  Writing a WIDER C++ element
+    //     (int -> byte[], long -> int[]) would stride past each slot into adjacent
+    //     heap (corruption).  The library guard (vmhook.hpp set_prim_array, mirror
+    //     of the read guard at 14817) must REFUSE such a write, leaving the array
+    //     UNCHANGED, while a matching-width write still lands.  Refusal cases do
+    //     not mutate; the one matching-width control is restored, so the module
+    //     stays suite-safe.
+    // =========================================================================
+    {
+        const std::unique_ptr<wrapper> self{ wrapper::get_instance() };
+        if (self)
+        {
+            // int (4B) written into byte[] (1B) -> REFUSED -> byte[] unchanged.
+            const std::vector<std::byte> byte_before{ self->i_byte() };
+            self->get_field("instByteArray")->set(
+                std::vector<std::int32_t>{ 0x11111111, 0x22222222, 0x33333333 });
+            ctx.check("setprimarray_wide_int_into_byte_refused",
+                      vectors_equal(self->i_byte(), byte_before));
+
+            // int (4B) written into short[] (2B) -> REFUSED.
+            const std::vector<std::int16_t> short_before{ self->i_short() };
+            self->get_field("instShortArray")->set(
+                std::vector<std::int32_t>{ 0x4444, 0x5555, 0x6666 });
+            ctx.check("setprimarray_wide_int_into_short_refused",
+                      vectors_equal(self->i_short(), short_before));
+
+            // long (8B) written into int[] (4B) -> REFUSED.
+            const std::vector<std::int32_t> int_before{ self->i_int() };
+            self->get_field("instIntArray")->set(std::vector<std::int64_t>{
+                0x1111111122222222LL, 0x3333333344444444LL, 0x5555555566666666LL });
+            ctx.check("setprimarray_wide_long_into_int_refused",
+                      vectors_equal(self->i_int(), int_before));
+
+            // Matching-width control: a std::byte vector into byte[] (1B==1B) LANDS,
+            // proving the guard does not block correct-width writes.  Restore after.
+            self->get_field("instByteArray")->set(
+                std::vector<std::byte>{ std::byte{ 7 }, std::byte{ 8 }, std::byte{ 9 } });
+            ctx.check("setprimarray_matching_byte_write_lands",
+                      vectors_equal(self->i_byte(), std::vector<std::byte>{
+                          std::byte{ 7 }, std::byte{ 8 }, std::byte{ 9 } }));
+            self->get_field("instByteArray")->set(byte_before);   // restore {4,5,6}
+            ctx.check("setprimarray_restored_after_control",
+                      vectors_equal(self->i_byte(), byte_before));
+        }
+    }
 }
 
 VMHOOK_JVM_MODULE(field_arrays_primitive)
