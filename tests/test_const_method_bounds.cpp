@@ -73,10 +73,12 @@
 // iOS where there is no fault-safe probe).
 #include <vmhook/vmhook.hpp>
 
+#include <bit>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 static int failures{ 0 };
@@ -187,6 +189,107 @@ static_assert(length_bound_rejects(0xFFFFu, std::numeric_limits<std::int32_t>::m
 static_assert(length_bound_rejects(10u, 10) == expected_reject(10u, 10), "oracle agree A");
 static_assert(length_bound_rejects(9u, 10)  == expected_reject(9u, 10),  "oracle agree B");
 static_assert(length_bound_rejects(0xFFFFu, -1) == expected_reject(0xFFFFu, -1), "oracle agree C");
+
+// ===========================================================================
+// Faithful local re-implementation of the FIELD-RECORD bound that the sibling
+// readers in klass::find_field (vmhook.hpp :4062-4090, Array<u2> path) and
+// klass::find_field_in_stream LACK.  This is flaw #1 from the feature notes:
+// those four sites read constant_pool_base[name_index] / [sig_index] with NO
+// length bound and NO is_readable_pointer(&base[index]) slot probe, going
+// straight to is_valid_pointer(VALUE) - which dereferences base[index] (reads
+// the slot word) BEFORE validating, the exact AV hazard FIX B closed for the
+// method path but NOT for the field path.  We re-implement the *correct* bound
+// the field path SHOULD apply (the same `index >= cp_length` FIX B uses for
+// methods) so the partition can be swept and pinned; the live test that the
+// fix was actually applied belongs in the JVM module, but the decision LOGIC -
+// identical to the method bound - is exercised here so a future shared helper
+// (constant_pool::symbol_at) has a spec to satisfy.
+//
+// Separately, the field record walk indexes `data[field_slot_index*6 + slot]`
+// bounded only by `array_length / 6` (vmhook.hpp :4062).  The per-element u2
+// index into the Array<u2> must satisfy  slot_index*6 + 5 < array_length  to
+// stay inside the array - a second, smaller out-of-bounds surface in the same
+// function (flaw #1, JDK-8 branch).  We model that record bound too.
+// ===========================================================================
+static constexpr auto field_symbol_index_in_range(std::uint16_t index, std::int32_t cp_length) -> bool
+{
+    // The bound the field readers OUGHT to apply, mirroring the method bound:
+    // a valid cp index is [0, cp_length); cp_length < 0 means "unknown -> skip".
+    return cp_length < 0 || index < cp_length;
+}
+
+// The last u2 slot a field record touches is field_slot_index*6 + 5.  The
+// record is fully in-array iff that highest touched slot is < array_length.
+// Returns TRUE when reading record `field_slot_index` would stay inside an
+// Array<u2> of `array_length` u2 elements (the bound the JDK-8 path relies on
+// via integer division `array_length / 6`).
+static constexpr auto field_record_in_array(std::int64_t field_slot_index, std::int32_t array_length) -> bool
+{
+    if (field_slot_index < 0 || array_length <= 0)
+    {
+        return false;
+    }
+    const std::int64_t highest_touched_slot{ field_slot_index * 6 + 5 };
+    return highest_touched_slot < static_cast<std::int64_t>(array_length);
+}
+
+// The library's loop bound: it iterates field_slot_index in [0, array_length/6).
+// Pin that integer division never lets the loop touch a slot past the array:
+// for the LAST iterated record (array_length/6 - 1) the highest touched slot
+// (record*6+5) must still be < array_length whenever array_length >= 6.
+static_assert(field_record_in_array(0, 6) == true,
+              "record 0 of a 6-element Array<u2> is fully in range");
+static_assert(field_record_in_array(0, 5) == false,
+              "record 0 needs 6 slots; a 5-element array cannot hold it");
+static_assert(field_record_in_array(1, 12) == true,
+              "record 1 (slots 6..11) fits a 12-element array");
+static_assert(field_record_in_array(1, 11) == false,
+              "record 1 touches slot 11; an 11-element array's max index is 10");
+static_assert(field_record_in_array(2, 13) == false,
+              "record 2 touches slot 17; a 13-element array (the JDK-8 trailing-"
+              "count case, 2*6+1) must NOT iterate record 2 - division floors it out");
+// The loop's own guard: with a trailing _java_fields_count u2 the array length
+// is records*6 + 1; integer division array_length/6 == records, so the partial
+// trailing slot is never iterated.  Pin that for a 2-record class (length 13).
+static_assert((13 / 6) == 2, "array_length/6 floors the trailing partial slot away");
+static_assert(field_record_in_array(13 / 6 - 1, 13) == true,
+              "the LAST record the loop iterates (record 1) is fully in-array");
+
+// The field-symbol bound mirrors the method bound exactly - pin equivalence so
+// a future shared helper cannot diverge the two.
+static_assert(field_symbol_index_in_range(5u, 10) == !length_bound_rejects(5u, 10),
+              "in-range field index is the complement of the method reject bound");
+static_assert(field_symbol_index_in_range(10u, 10) == !length_bound_rejects(10u, 10),
+              "field index == length is out of range, same as the method bound");
+static_assert(field_symbol_index_in_range(0xFFFFu, -1) == !length_bound_rejects(0xFFFFu, -1),
+              "unknown length disables BOTH the field and the method bound identically");
+
+// ---------------------------------------------------------------------------
+// The size/locals/stack/param u2 fields of ConstMethod are read elsewhere as
+// raw u2 words; FIX B does NOT bound them (they are not cp indices), but the
+// task asks to pin the u2-domain clamp invariants a malformed/huge value lands
+// on.  `clamp_u2` models the truncation any 16-bit metadata field undergoes:
+// a value is stored in 16 bits, so the in-memory field can only ever present
+// [0, 65535] no matter how corrupt the wider source was.  This is the structural
+// ceiling that makes "index is a u2" a HARD upper bound the length check can
+// rely on (the method index can never exceed 0xFFFF, so a length >= 0x10000
+// can never be reached by any index - section J's premise, proven here at the
+// type level).
+// ---------------------------------------------------------------------------
+static constexpr auto clamp_u2(std::uint64_t wide) -> std::uint16_t
+{
+    return static_cast<std::uint16_t>(wide & 0xFFFFu);
+}
+static_assert(clamp_u2(0u) == 0u, "u2 clamp of 0 is 0");
+static_assert(clamp_u2(0xFFFFu) == 0xFFFFu, "u2 clamp preserves the max in-range value");
+static_assert(clamp_u2(0x1'0000u) == 0u, "u2 clamp wraps 0x10000 to 0 (16-bit truncation)");
+static_assert(clamp_u2(0x1'0001u) == 1u, "u2 clamp wraps 0x10001 to 1");
+static_assert(clamp_u2(0xFFFF'FFFF'FFFF'FFFFull) == 0xFFFFu,
+              "u2 clamp of all-ones is 0xFFFF - a corrupt-huge field still presents a u2");
+// Therefore no method index can ever reach a length at or above 0x10000:
+static_assert(0xFFFFu < 0x1'0000,
+              "max u2 index is strictly below 0x10000, so a pool length >= 0x10000 "
+              "is unreachable by any index - the bound is vacuously safe there");
 
 int main()
 {
@@ -1178,6 +1281,413 @@ int main()
 
             vmhook::os::release(block, alloc);
         }
+    }
+
+    // =====================================================================
+    // N. Per-length EDGE sweep across a wide band of lengths.  Section A2
+    //    enumerates the full u2 domain for 8 sample lengths; here we instead
+    //    sweep MANY lengths and, for each, assert the three load-bearing edge
+    //    indices in one pass: index == length-1 (last valid -> PASS), index ==
+    //    length (first out-of-range -> REJECT), index == length+1 (REJECT).
+    //    This pins the off-by-one at EVERY length in a dense band, so a future
+    //    operator/constant drift names the exact length where the edge moved.
+    // =====================================================================
+    {
+        bool last_valid_passes{ true };
+        bool edge_rejects{ true };
+        bool above_edge_rejects{ true };
+        std::size_t edge_cases{ 0 };
+        // Lengths from 1 up through the u2 ceiling (so length-1, length and
+        // length+1 are all expressible as u2 where they fit).  Skip 0 (no
+        // last-valid index exists) - it is pinned separately in section B.
+        for (std::int32_t n{ 1 }; n <= 0x1'0000; ++n)
+        {
+            // last valid index = n-1, only meaningful when it fits a u2.
+            if (n - 1 <= 0xFFFF)
+            {
+                if (length_bound_rejects(static_cast<std::uint16_t>(n - 1), n))
+                {
+                    last_valid_passes = false;
+                }
+            }
+            // edge index = n, when it fits a u2 (n <= 0xFFFF).
+            if (n <= 0xFFFF)
+            {
+                if (!length_bound_rejects(static_cast<std::uint16_t>(n), n))
+                {
+                    edge_rejects = false;
+                }
+            }
+            // above-edge index = n+1, when it fits a u2.
+            if (n + 1 <= 0xFFFF)
+            {
+                if (!length_bound_rejects(static_cast<std::uint16_t>(n + 1), n))
+                {
+                    above_edge_rejects = false;
+                }
+            }
+            ++edge_cases;
+            // Sample-stride to keep the sweep bounded but dense: test every
+            // length up to 2048 (where edges cluster) then stride to the ceiling.
+            if (n >= 2048 && n < 0x1'0000 - 4)
+            {
+                n += 1021; // prime-ish stride avoids aliasing with any period
+            }
+        }
+        check("per_length_last_valid_index_passes", last_valid_passes);
+        check("per_length_edge_index_rejects", edge_rejects);
+        check("per_length_above_edge_index_rejects", above_edge_rejects);
+        check("per_length_edge_sweep_is_dense", edge_cases >= 2048);
+    }
+
+    // =====================================================================
+    // O. NO UPPER SANITY CAP on cp_length (flaw #4).  get_length() returns the
+    //    raw _length word with no ceiling, so a corrupt-huge positive length
+    //    (>= 0x10000) makes `index >= cp_length` vacuously false for EVERY
+    //    realistic u2 index - the length bound admits everything and protection
+    //    falls entirely to the slot probe.  We pin that documented behaviour as
+    //    an invariant (not a crash): for any length at/above the u2 ceiling,
+    //    no u2 index is rejected by the length bound, AND the slot probe must
+    //    then still reject an unmapped slot (so the composite is still safe).
+    // =====================================================================
+    {
+        const std::int32_t huge_lengths[]{
+            0x1'0000, 0x10'0000, 0x4000'0000, 0x7FFF'FFFE,
+            std::numeric_limits<std::int32_t>::max(),
+        };
+        bool huge_admits_every_u2{ true };
+        for (const std::int32_t n : huge_lengths)
+        {
+            const std::uint32_t sample[]{
+                0u, 1u, 255u, 256u, 1024u, 0x7FFFu, 0x8000u, 0xFFFEu, 0xFFFFu,
+            };
+            for (const std::uint32_t i : sample)
+            {
+                if (length_bound_rejects(static_cast<std::uint16_t>(i), n))
+                {
+                    huge_admits_every_u2 = false;
+                }
+            }
+        }
+        check("flaw4_huge_length_admits_every_u2_index", huge_admits_every_u2);
+
+        // The compensating guarantee: even with the length bound disabled by a
+        // huge length, the slot probe rejects a genuinely unmapped slot - so a
+        // corrupt-huge _length does NOT reopen the AV.  Build an unmapped
+        // address and confirm the probe (the sole remaining gate) refuses it.
+        {
+            const std::size_t page{ vmhook::os::page_size() };
+            void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+            if (!block)
+            {
+                check("flaw4_huge_length_probe_skipped_alloc_failed", false);
+            }
+            else
+            {
+                *static_cast<volatile std::uint8_t*>(block) = 0x5A;
+                vmhook::os::release(block, page);
+                // After release the page is (commonly) unmapped; the probe must
+                // not fault and, in the common case, returns false.  The bound
+                // is disabled (INT32_MAX), so the probe alone decides.
+                const bool bound_off{ !length_bound_rejects(0u,
+                                          std::numeric_limits<std::int32_t>::max()) };
+                const bool probe_after_release{ is_readable_pointer(block) };
+                check("flaw4_huge_length_bound_is_off", bound_off);
+                check("flaw4_huge_length_probe_did_not_fault", true); // survived
+                if (!probe_after_release)
+                {
+                    check("flaw4_huge_length_unmapped_slot_still_rejected",
+                          bound_off && !probe_after_release);
+                }
+                else
+                {
+                    std::printf("[INFO] flaw4 unmapped slot remapped after release; "
+                                "probe still safe (no fault)\n");
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    // P. The u2 index domain itself.  The library reads `index` as a
+    //    std::uint16_t (vmhook.hpp :2461 / :2538) directly from the ConstMethod
+    //    field via os::safe_read into a u2-sized destination, so NO value the
+    //    field can present is ever negative and none exceeds 0xFFFF.  We pin:
+    //      * round-trip truncation: any wider corrupt source narrows to its low
+    //        16 bits (clamp_u2), and that narrowed value is what the bound sees;
+    //      * the negative side is owned EXCLUSIVELY by the `cp_length >= 0`
+    //        guard, never by the index (an index is unsigned, can't be < 0);
+    //      * the partition point for any in-u2-range length equals the length.
+    // =====================================================================
+    {
+        // P1. Truncation: a corrupt 64-bit source presents only its low 16 bits
+        // as the u2 index, and the bound's verdict depends only on those bits.
+        bool truncation_consistent{ true };
+        bool clamp_equals_explicit_mask{ true };
+        const std::uint64_t wide_sources[]{
+            0u, 1u, 0xFFFFu, 0x1'0000u, 0x1'0001u, 0xDEAD'0000u, 0xDEAD'0005u,
+            0xFFFF'FFFFu, 0x1'2345'6789u, 0xFFFF'FFFF'FFFF'FFFFull,
+        };
+        const std::int32_t probe_len{ 16 };
+        for (const std::uint64_t w : wide_sources)
+        {
+            const std::uint16_t narrowed{ clamp_u2(w) };
+            const bool via_clamp{ length_bound_rejects(narrowed, probe_len) };
+            // clamp_u2 must equal an explicit low-16-bit mask of the source -
+            // asserted unconditionally so the verdict is portable and the local
+            // is always consumed.
+            if (narrowed != static_cast<std::uint16_t>(w & 0xFFFFu))
+            {
+                clamp_equals_explicit_mask = false;
+            }
+            // Independent: take the low 16 bits a different way (memcpy of the
+            // low half) and feed THAT - must agree, proving the bound is a pure
+            // function of the 16-bit field, not of the discarded high bits.  On a
+            // big-endian host memcpy of the low storage bytes is the HIGH value
+            // word, so gate the cross-check to little-endian (every CI host).
+            std::uint16_t copied{ 0 };
+            std::memcpy(&copied, &w, sizeof(copied));
+            const bool via_copy{ length_bound_rejects(copied, probe_len) };
+            const bool host_is_le{ std::endian::native == std::endian::little };
+            const bool cross_check_ok{ !host_is_le || via_clamp == via_copy };
+            if (!cross_check_ok) { truncation_consistent = false; }
+        }
+        check("u2_index_clamp_equals_explicit_low16_mask", clamp_equals_explicit_mask);
+        check("u2_index_bound_depends_only_on_low16", truncation_consistent);
+
+        // P2. The index type is unsigned 16-bit: it can never be negative, so
+        // the negative half of the comparison space is structurally owned by
+        // the cp_length>=0 guard.  Pin the type and the "no negative index"
+        // property the library relies on.
+        check("u2_index_type_is_uint16",
+              std::is_same_v<std::uint16_t, decltype(clamp_u2(0u))>);
+        check("u2_index_is_unsigned", std::is_unsigned_v<std::uint16_t>);
+        // For any length, an index of 0 (the smallest possible u2) is rejected
+        // iff the length is 0 (empty pool) - never because the index is "below
+        // zero", which cannot happen.
+        check("u2_index_zero_rejected_only_when_len_zero",
+              length_bound_rejects(0u, 0) && !length_bound_rejects(0u, 1));
+
+        // P3. Exhaustive partition witness at a representative in-u2-range
+        // length, computed against the unsigned index domain directly (no
+        // sign-extension anywhere): for length L every index < L passes and
+        // every index in [L, 65536) rejects.  Proven for L = 0x1234.
+        {
+            const std::int32_t L{ 0x1234 };
+            bool partition_ok{ true };
+            for (std::uint32_t i{ 0u }; i <= 0xFFFFu; ++i)
+            {
+                const bool rejected{ length_bound_rejects(static_cast<std::uint16_t>(i), L) };
+                const bool want{ i >= static_cast<std::uint32_t>(L) };
+                if (rejected != want) { partition_ok = false; break; }
+            }
+            check("u2_index_partition_exact_at_0x1234", partition_ok);
+        }
+    }
+
+    // =====================================================================
+    // Q. get_length() crosses a VMStruct offset (this + entry->offset) to read
+    //    a 4-byte _length WITHOUT a per-address is_readable_pointer probe on
+    //    that field address (flaw #5): it guards is_valid_pointer(this)
+    //    (range+alignment+poison) and then reads via os::safe_read.  The
+    //    fault-safety therefore rests on os::safe_read, NOT on a region probe.
+    //    With no JVM the entry is null and get_length() returns -1 before any
+    //    offset is applied, so we cannot drive the offset read here - but we
+    //    CAN pin the contract that matters: get_length() is the one FIX-B-path
+    //    read whose safety on a bogus-but-aligned `this` depends on safe_read,
+    //    and it must degrade to -1 (never fault) for every structurally-valid-
+    //    looking-but-bogus `this`.  (The live offset-read AV-safety is a JVM
+    //    concern; here we lock the no-JVM sentinel + no-fault property.)
+    // =====================================================================
+    {
+        using vmhook::hotspot::constant_pool;
+
+        // Addresses that PASS is_valid_pointer(this) (in-range, 8-aligned, not
+        // poison) so the get_length() body would proceed to the offset read on
+        // a JDK that exports _length.  With no JVM the entry is null -> -1 is
+        // returned before the read; the property under test is that this is
+        // reached without faulting for a `this` that looks valid but is bogus.
+        const std::uintptr_t plausible_this[]{
+            std::uintptr_t{ 0x0000'2000'0000'0000ull }, // aligned, in-range
+            std::uintptr_t{ 0x0000'3000'0000'0008ull },
+            std::uintptr_t{ 0x0000'4000'0000'1000ull },
+            std::uintptr_t{ 0x0000'5000'0000'0010ull },
+        };
+        bool all_minus1{ true };
+        for (const std::uintptr_t raw : plausible_this)
+        {
+            auto* const cp{ reinterpret_cast<constant_pool*>(raw) };
+            if (cp->get_length() != -1) { all_minus1 = false; }
+        }
+        check("flaw5_get_length_aligned_bogus_this_returns_minus1_no_fault", all_minus1);
+        // And the sentinel disables the bound, so a stripped-_length JDK (the
+        // same code path as the no-JVM case) resolves names via the slot probe.
+        check("flaw5_get_length_sentinel_disables_bound",
+              !length_bound_rejects(0xFFFFu, -1));
+        // get_length() is declared noexcept - the offset read cannot escape as
+        // an exception even if it were to be reached; pin the contract.
+        {
+            alignas(16) static std::uint8_t q_storage[64]{};
+            auto* const cp{ reinterpret_cast<constant_pool*>(&q_storage[0]) };
+            check("flaw5_get_length_is_noexcept", noexcept(cp->get_length()));
+        }
+    }
+
+    // =====================================================================
+    // R. The FIELD-SYMBOL sibling bound (flaw #1).  klass::find_field /
+    //    find_field_in_stream read constant_pool_base[name_index] and
+    //    [sig_index] - the SAME ConstantPool::get_base() array, indexed by a u2
+    //    from class metadata - with NO length bound and NO slot probe (the AV
+    //    hazard FIX B closed for methods, left open for fields).  The live "fix
+    //    was applied" check is a JVM concern; the DECISION LOGIC the fix should
+    //    use is identical to the method bound and is swept here so the eventual
+    //    shared helper has a spec.  We assert:
+    //      (a) the field bound the readers OUGHT to apply equals the complement
+    //          of the method reject bound on the full structurally-interesting
+    //          matrix (so one shared helper can serve all five sites);
+    //      (b) the field-RECORD walk (data[slot*6+k]) stays inside the Array<u2>
+    //          exactly when slot*6+5 < array_length, with the library's
+    //          integer-division loop bound (array_length/6) never overstepping.
+    // =====================================================================
+    {
+        // (a) Field-symbol index bound == complement of method reject bound,
+        //     over the same exhaustive (index, length) matrix shape as A1.
+        std::vector<std::int32_t> lengths;
+        lengths.push_back(-1);
+        lengths.push_back(-7);
+        for (std::int32_t n{ 0 }; n <= 16; ++n) { lengths.push_back(n); }
+        const std::int32_t pin_lengths[]{ 255, 256, 1024, 0xFFFF, 0x1'0000,
+                                          std::numeric_limits<std::int32_t>::max() };
+        for (const std::int32_t n : pin_lengths) { lengths.push_back(n); }
+
+        bool field_bound_matches_method{ true };
+        std::size_t field_cases{ 0 };
+        for (const std::int32_t n : lengths)
+        {
+            const std::uint32_t idxs[]{
+                0u, 1u, 2u, 255u, 256u, 1024u, 0xFFFEu, 0xFFFFu,
+            };
+            for (const std::uint32_t raw : idxs)
+            {
+                const std::uint16_t index{ static_cast<std::uint16_t>(raw) };
+                const bool in_range{ field_symbol_index_in_range(index, n) };
+                const bool method_accepts{ !length_bound_rejects(index, n) };
+                if (in_range != method_accepts) { field_bound_matches_method = false; }
+                ++field_cases;
+            }
+        }
+        check("flaw1_field_symbol_bound_equals_method_bound", field_bound_matches_method);
+        check("flaw1_field_symbol_matrix_is_dense", field_cases >= 100);
+
+        // Spelled-out witnesses: a field name_index AT cp_length is out of range
+        // (must be rejected by the helper FIX B did not add); below it is in.
+        check("flaw1_field_name_index_at_length_out_of_range",
+              !field_symbol_index_in_range(64u, 64));
+        check("flaw1_field_name_index_below_length_in_range",
+              field_symbol_index_in_range(63u, 64));
+        check("flaw1_field_index_unknown_length_admitted",
+              field_symbol_index_in_range(0xFFFFu, -1));
+
+        // (b) Field-record-walk array bound: sweep record indices against a band
+        //     of Array<u2> lengths and assert field_record_in_array matches the
+        //     first-principles `slot*6+5 < array_length`, AND that the library's
+        //     loop bound (array_length/6) only ever iterates in-array records.
+        bool record_bound_correct{ true };
+        bool loop_never_oversteps{ true };
+        std::size_t record_cases{ 0 };
+        for (std::int32_t array_length{ 0 }; array_length <= 256; ++array_length)
+        {
+            const std::int32_t records_iterated{ array_length / 6 }; // library bound
+            for (std::int64_t slot_index{ 0 }; slot_index <= 50; ++slot_index)
+            {
+                const bool in_array{ field_record_in_array(slot_index, array_length) };
+                const bool fp{ array_length > 0 && slot_index >= 0
+                               && (slot_index * 6 + 5) < static_cast<std::int64_t>(array_length) };
+                if (in_array != fp) { record_bound_correct = false; }
+                ++record_cases;
+            }
+            // Every record the library's loop ACTUALLY visits must be in-array.
+            for (std::int32_t r{ 0 }; r < records_iterated; ++r)
+            {
+                if (!field_record_in_array(r, array_length)) { loop_never_oversteps = false; }
+            }
+        }
+        check("flaw1_field_record_array_bound_correct", record_bound_correct);
+        check("flaw1_field_record_loop_never_oversteps_array", loop_never_oversteps);
+        check("flaw1_field_record_sweep_is_dense", record_cases >= 1000);
+
+        // The JDK-8 trailing-_java_fields_count case: a class with R fields has
+        // an Array<u2> of length R*6 + 1; the loop iterates exactly R records
+        // and never touches the trailing partial slot.
+        for (std::int32_t R{ 1 }; R <= 40; ++R)
+        {
+            const std::int32_t array_length{ R * 6 + 1 };
+            const bool loop_count_ok{ (array_length / 6) == R };
+            const bool last_record_in_array{ field_record_in_array(R - 1, array_length) };
+            const bool trailing_slot_not_iterated{ !field_record_in_array(R, array_length) };
+            if (!(loop_count_ok && last_record_in_array && trailing_slot_not_iterated))
+            {
+                check("flaw1_jdk8_trailing_count_walk_safe", false);
+                break;
+            }
+            if (R == 40)
+            {
+                check("flaw1_jdk8_trailing_count_walk_safe", true);
+            }
+        }
+    }
+
+    // =====================================================================
+    // S. STRUCTURAL bytecode/locals/stack/param u2 fields - clamp invariants.
+    //    These ConstMethod fields (_code_size, _max_stack, _max_locals,
+    //    _size_of_parameters) are NOT cp indices and FIX B does not bound them,
+    //    but the task asks to pin the boundary-size clamp behaviour every 16-bit
+    //    metadata field shares: a value is physically stored in 16 bits, so the
+    //    in-memory presentation is ALWAYS in [0, 65535] - the structural ceiling
+    //    that lets the method index serve as a HARD upper bound for the length
+    //    check.  We sweep the clamp at every structurally interesting width.
+    // =====================================================================
+    {
+        // Boundary sizes: 0, 1, the byte/short edges, the u2 max, and just over.
+        const std::uint64_t boundary_sizes[]{
+            0u, 1u, 2u,
+            0x7Fu, 0x80u, 0xFFu, 0x100u,          // byte edge
+            0x7FFFu, 0x8000u, 0xFFFEu, 0xFFFFu,    // u2 edge (max in-range)
+            0x1'0000u, 0x1'0001u,                  // overflow the u2 (wraps)
+            0xFFFF'FFFFu, 0x1'FFFFu,               // wider corruption
+        };
+        bool all_in_u2_after_clamp{ true };
+        bool clamp_is_low16{ true };
+        for (const std::uint64_t s : boundary_sizes)
+        {
+            const std::uint16_t clamped{ clamp_u2(s) };
+            // A clamped u2 has no bits set above bit 15.  Widen to 32 bits first
+            // (so the comparison is a genuine runtime check, not a tautology on
+            // a 16-bit type) and assert the high half is clear.
+            const std::uint32_t widened{ static_cast<std::uint32_t>(clamped) };
+            if ((widened & 0xFFFF'0000u) != 0u) { all_in_u2_after_clamp = false; }
+            // And exactly the low 16 bits of the source.
+            if (clamped != static_cast<std::uint16_t>(s & 0xFFFFu)) { clamp_is_low16 = false; }
+        }
+        check("size_field_clamp_always_in_u2_range", all_in_u2_after_clamp);
+        check("size_field_clamp_is_low16_of_source", clamp_is_low16);
+
+        // The load-bearing consequence for the bound: because EVERY index is a
+        // clamped u2 (<= 0xFFFF), a pool whose length exceeds the u2 domain can
+        // never have its upper edge reached, so the length bound is well-defined
+        // for all representable indices.  Witness at the exact u2 ceiling: index
+        // 0xFFFF is the only index that can be the edge, and only for length
+        // 0xFFFF (rejected) or admitted for any larger length.
+        check("size_field_maxu2_is_edge_only_at_len_maxu2",
+              length_bound_rejects(0xFFFFu, 0xFFFF)
+                  && !length_bound_rejects(0xFFFFu, 0x1'0000));
+
+        // Malformed/huge value clamped: a corrupt all-ones 64-bit size presents
+        // 0xFFFF; a corrupt 0x10000 presents 0 (the smallest); neither escapes
+        // the u2 domain, so neither can corrupt the bound arithmetic into UB.
+        check("size_field_allones_clamps_to_maxu2", clamp_u2(0xFFFF'FFFF'FFFF'FFFFull) == 0xFFFFu);
+        check("size_field_0x10000_clamps_to_zero", clamp_u2(0x1'0000u) == 0u);
+        check("size_field_0x10001_clamps_to_one", clamp_u2(0x1'0001u) == 1u);
     }
 
     if (failures == 0)

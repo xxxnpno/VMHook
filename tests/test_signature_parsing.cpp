@@ -1993,5 +1993,297 @@ int main()
                             std::int64_t, float, double, std::string>()
               == "(SCIJFDLjava/lang/String;)V");
 
+    // =====================================================================
+    // EXHAUSTIVE PASS 8 — the GENERIC sizeof integral ladder + remaining
+    // whole-descriptor adversarial shapes.
+    //
+    // The live jni_signature_for_arg (vmhook.hpp:12772) is NOT a fixed-width
+    // typedef ladder — it is `bool -> Z`, then `char16_t|uint16_t -> C`, then a
+    // GENERIC `is_integral && sizeof==N` ladder (N=1->B, 2->S, 4->I, 8->J),
+    // then float/double, then the wrapper/object class-map branches.  Earlier
+    // passes only instantiated the fixed-width std::intNN_t aliases; this pass
+    // drives the *character* integral types (`char`, `char8_t`, `char16_t`,
+    // `signed char`, `unsigned char`) that route through that generic ladder and
+    // that the older comments wrongly claimed "fail to compile".  It also closes
+    // the last whole-descriptor parse gaps: branch-ORDER invariants, object names
+    // whose bytes collide with structural tokens, and a fresh malformed batch.
+    // Every expected value derives only from the confirmed sig_char_to_basic_type
+    // / jvm_primitive_byte_width / jni_signature_for_arg tables in vmhook.hpp.
+    // =====================================================================
+
+    // ---- generic sizeof==1 integral branch: every 1-byte char type -> "B" ----
+    // `char`, `signed char`, `unsigned char`, and `char8_t` are all 1-byte
+    // integrals that are NOT bool and NOT uint16_t/char16_t, so they fall to the
+    // generic sizeof==1 branch -> "B".  (signed char == int8_t is already pinned;
+    // plain `char` and `char8_t` are the genuinely new rows the generic ladder
+    // admits — the OLD fixed-width ladder static_asserted on them.)  Java has no
+    // unsigned byte, so every 8-bit integral collapses to the one byte tag 'B'.
+    check("jni_sig_plain_char_is_B",
+          vmhook::detail::jni_signature_for_arg<char>() == "B");
+    check("jni_sig_unsigned_char_is_B",
+          vmhook::detail::jni_signature_for_arg<unsigned char>() == "B");
+    check("jni_sig_char8_t_is_B",
+          vmhook::detail::jni_signature_for_arg<char8_t>() == "B");
+    // sizeof(char)==1 is mandated by the standard, so this branch is reached on
+    // every target — pin the property the routing keys on.
+    check("jni_sig_char_routes_via_sizeof1_branch_property",
+          std::is_integral_v<char> && sizeof(char) == 1
+          && !std::is_same_v<std::decay_t<char>, bool>
+          && !std::is_same_v<std::decay_t<char>, std::uint16_t>);
+
+    // ---- char16_t now maps to "C" (the corrected ladder) ---------------------
+    // The unsigned-16 / Java-char branch claims `char16_t || uint16_t` BEFORE the
+    // generic sizeof==2 branch, so char16_t -> "C" (NOT the static_assert the old
+    // comments described, and NOT "S").  This is the symmetric partner to
+    // uint16_t->C and is what makes a C++ UTF-16 unit a Java `char` arg.
+    check("jni_sig_char16_t_is_C",
+          vmhook::detail::jni_signature_for_arg<char16_t>() == "C");
+    // char16_t and uint16_t agree on "C"; int16_t (a DISTINCT, signed 2-byte
+    // integral with no special branch) takes the generic sizeof==2 -> "S".  Pin
+    // all three together so the "which 16-bit types are Java char" set is fixed.
+    check("jni_sig_char16_uint16_both_C_int16_S",
+             vmhook::detail::jni_signature_for_arg<char16_t>() == "C"
+          && vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C"
+          && vmhook::detail::jni_signature_for_arg<std::int16_t>() == "S");
+    // cv/ref qualified char16_t still decays to "C".
+    check("jni_sig_const_ref_char16_t_is_C",
+          vmhook::detail::jni_signature_for_arg<const char16_t&>() == "C");
+
+    // ---- branch-ORDER invariants (the ordering is load-bearing) --------------
+    // bool is a 1-byte integral; if the generic sizeof==1 branch ran first it
+    // would mis-encode bool as "B".  The bool branch is claimed FIRST, so bool ->
+    // "Z" while every OTHER 1-byte integral -> "B".  Pin the discriminating pair.
+    check("jni_sig_bool_is_Z_not_B_branch_order",
+             vmhook::detail::jni_signature_for_arg<bool>() == "Z"
+          && vmhook::detail::jni_signature_for_arg<char>() == "B"
+          && vmhook::detail::jni_signature_for_arg<bool>()
+                 != vmhook::detail::jni_signature_for_arg<char>());
+    // uint16_t is a 2-byte integral; the char-branch claims it BEFORE the generic
+    // sizeof==2 branch, so it is "C" not "S".  int16_t (no special branch) is the
+    // sizeof==2 fall-through -> "S".  The order is what separates them.
+    check("jni_sig_uint16_C_before_generic_sizeof2_S_branch_order",
+             vmhook::detail::jni_signature_for_arg<std::uint16_t>() == "C"
+          && vmhook::detail::jni_signature_for_arg<std::int16_t>() == "S"
+          && vmhook::detail::jni_signature_for_arg<std::uint16_t>()
+                 != vmhook::detail::jni_signature_for_arg<std::int16_t>());
+
+    // ---- ctor signature: the new char-type rows compose end-to-end -----------
+    // The character integral tags must compose into a whole <init> descriptor
+    // exactly like the fixed-width aliases.  A mixed pack with `char` ('B') and
+    // `char16_t` ('C') proves the generic-ladder tags survive the fold.
+    check("ctor_sig_char_and_char16_pack",
+          ctor_signature_of<char, char16_t, char8_t>() == "(BCB)V");
+    check("ctor_sig_char_with_string_and_int",
+          ctor_signature_of<char, std::string, int>()
+              == "(BLjava/lang/String;I)V");
+
+    // ---- public re-export parity on the new char rows ------------------------
+    // vmhook::jni::signature_for_arg forwards verbatim, so it must agree on the
+    // character types too — pin parity on the genuinely-new branches.
+    check("signature_for_arg_parity_char_B",
+          vmhook::jni::signature_for_arg<char>()
+              == vmhook::detail::jni_signature_for_arg<char>());
+    check("signature_for_arg_parity_char16_C",
+          vmhook::jni::signature_for_arg<char16_t>()
+              == vmhook::detail::jni_signature_for_arg<char16_t>());
+    check("signature_for_arg_parity_char16_value_is_C",
+          vmhook::jni::signature_for_arg<char16_t>() == "C");
+
+    // ---- field descriptor: object names whose BYTES collide with tokens ------
+    // The object-name scanner consumes everything up to the FIRST ';' verbatim,
+    // so a class name byte-stream containing '(' ')' '[' 'V' 'I' etc. is parsed
+    // as NAME content, not as structural descriptor tokens.  These are not legal
+    // Java identifiers, but the walk is a byte scanner: it must terminate at the
+    // first ';' and consume exactly that span.  Proves no structural byte inside
+    // an L...; is special.
+    {
+        const std::string_view weird{ "Lweird(name)[V/Type;" };
+        const field_descriptor_parse f{ parse_one_field_descriptor(weird, 0) };
+        check("fielddesc_object_name_with_token_bytes_consumed_to_semicolon",
+              f.ok && f.basic_type == 12 && f.array_dims == 0
+              && f.consumed == weird.size());
+    }
+    // The name scanner stops at the FIRST ';': a second ';' later is NOT consumed
+    // by this field — "La;b;" parses the object "La;" (consume 3) and leaves "b;".
+    {
+        const field_descriptor_parse f{ parse_one_field_descriptor("La;b;", 0) };
+        check("fielddesc_object_stops_at_first_semicolon",
+              f.ok && f.basic_type == 12 && f.consumed == 3);
+    }
+    // A high-byte / "unicode-ish" sequence inside the class name is just name
+    // bytes; the scanner terminates at ';' and consumes the whole span.  (Built
+    // as a named array so the string_view never dangles.)
+    {
+        const char unicode_name[]{ 'L', 'p', '/', static_cast<char>(0xC3),
+                                   static_cast<char>(0xA9), 'X', ';', '\0' };
+        const std::string_view sv{ unicode_name, 7 };
+        const field_descriptor_parse f{ parse_one_field_descriptor(sv, 0) };
+        check("fielddesc_object_high_byte_name_consumed_to_semicolon",
+              f.ok && f.basic_type == 12 && f.consumed == 7);
+    }
+    // Empty class name "L;": the scanner finds ';' at index 1 immediately, so the
+    // walk ACCEPTS it as a 2-byte object (this reference walk is permissive about
+    // the empty name; JVMS forbids it, but sig_char_to_basic_type-based walking
+    // does not validate name content).  Pin the walk's actual behaviour so a
+    // future stricter parser is a visible change.
+    {
+        const field_descriptor_parse f{ parse_one_field_descriptor("L;", 0) };
+        check("fielddesc_empty_object_name_L_semicolon_accepted_consume_2",
+              f.ok && f.basic_type == 12 && f.consumed == 2);
+    }
+
+    // ---- method descriptor: object-name token bytes do not desync the walk ----
+    // A parameter object whose name contains ')' must NOT be mistaken for the
+    // method's closing paren — the walk consumes the object through its ';'
+    // first, then meets the real ')'.  One arg, one slot, int return.
+    {
+        const method_descriptor_parse m{
+            parse_method_descriptor("(Lhas)paren;)I") };
+        check("methoddesc_param_object_name_with_rparen_byte_one_arg_int_ret",
+              m.ok && m.arg_count == 1 && m.arg_slots == 1
+              && m.return_basic == 10 && m.return_dims == 0);
+    }
+    // A RETURN object whose name contains '(' and ')' bytes: rfind-free full walk
+    // still classifies it T_OBJECT after consuming the param list.
+    {
+        const method_descriptor_parse m{
+            parse_method_descriptor("(I)Lret(with)parens;") };
+        check("methoddesc_return_object_name_with_paren_bytes_is_object_12",
+              m.ok && m.arg_count == 1 && m.arg_slots == 1
+              && m.return_basic == 12 && m.return_dims == 0);
+    }
+
+    // ---- method descriptor: maximal-width slot accumulation ------------------
+    // 8 doubles + 8 longs interleaved: 16 args, 32 slots (every one is two-slot).
+    // Proves the slot accumulator does not saturate or wrap on an all-wide pack.
+    {
+        std::string all_wide{ "(" };
+        for (int i{ 0 }; i < 8; ++i) { all_wide += "DJ"; }
+        all_wide += ")V";
+        const method_descriptor_parse m{ parse_method_descriptor(all_wide) };
+        check("methoddesc_8double_8long_interleaved_is_16args_32slots",
+              m.ok && m.arg_count == 16 && m.arg_slots == 32
+              && m.return_basic == 14);
+    }
+    // A pack alternating single- and two-slot types so arg_count and arg_slots
+    // diverge by a known amount: (I J I J I J) -> 6 args, 9 slots.
+    {
+        const method_descriptor_parse m{ parse_method_descriptor("(IJIJIJ)V") };
+        check("methoddesc_alternating_int_long_is_6args_9slots",
+              m.ok && m.arg_count == 6 && m.arg_slots == 9);
+    }
+
+    // ---- method descriptor: a wide return after a wide param -----------------
+    // (J)D — one long param (2 slots), double return (T_DOUBLE 7).  The return's
+    // own width is irrelevant to arg_slots; only PARAMS count toward slots.
+    {
+        const method_descriptor_parse m{ parse_method_descriptor("(J)D") };
+        check("methoddesc_long_param_double_return_2slots_doubleret",
+              m.ok && m.arg_count == 1 && m.arg_slots == 2
+              && m.return_basic == 7 && m.return_dims == 0);
+    }
+
+    // ---- fresh MALFORMED batch (shapes not in the pass-6 list) ---------------
+    // More structural faults, each must reject (ok=false) with no overrun.
+    {
+        const char* more_bad_methods[]{
+            "()I extra",              // trailing space+letter after primitive ret
+            "(I)Ljava/lang/String",   // return object missing terminating ';'
+            "([V)V",                  // array of 'V' (V is not a valid element)
+            "(II))V",                 // doubled close paren before return
+            "((I)V",                  // doubled open paren (param 'I' then stray)
+            "(I;)V",                  // stray ';' where a descriptor is expected
+            "(Ljava/lang/String;",    // object param ok but no ')' and no return
+            "()[",                    // array return marker with no element
+            "()L;extra",              // empty object return then trailing junk
+            "(D)Vx",                  // void return not the final byte
+            "( )V",                   // space is not a valid parameter descriptor
+        };
+        bool all_rejected{ true };
+        for (const char* d : more_bad_methods)
+        {
+            if (parse_method_descriptor(d).ok) { all_rejected = false; }
+        }
+        check("methoddesc_fresh_malformed_batch_all_rejected_no_overrun", all_rejected);
+    }
+    // A method descriptor containing an embedded NUL inside the param region:
+    // the NUL is an unknown field byte -> the param walk fails -> whole reject,
+    // and the string_view's size (not the NUL) bounds the scan.
+    {
+        const char with_nul[]{ '(', 'I', '\0', 'J', ')', 'V', '\0' };
+        const std::string_view sv{ with_nul, 6 };
+        check("methoddesc_embedded_nul_param_byte_rejected",
+              !parse_method_descriptor(sv).ok);
+    }
+    // ...whereas the SAME bytes with the NUL as the WHOLE element are rejected at
+    // field level too (NUL is sig_char_to_basic_type==12 but width==0, so it is
+    // not a primitive and not 'L'/'[' -> not a valid field lead).
+    {
+        const char nul_field[]{ '\0', '\0' };
+        check("fielddesc_lone_nul_byte_rejected",
+              !parse_one_field_descriptor(std::string_view{ nul_field, 1 }, 0).ok);
+    }
+
+    // ---- fresh malformed FIELD batch -----------------------------------------
+    {
+        const char* more_bad_fields[]{
+            "[V",                     // array of void
+            "[[V",                    // 2-D array of void
+            "[;",                     // array of stray ';'
+            "II",                     // two primitives is not ONE field descriptor
+                                      //   (parse_one consumes only the first 'I';
+                                      //   ok=true with consumed==1 — so this is
+                                      //   asserted via consumed, NOT via !ok, below)
+            "L/no/leading/semicolon", // object missing ';'
+        };
+        // The first three and the last are outright invalid (ok=false); "II"
+        // is the special case where parse_one SUCCEEDS on the first byte only.
+        check("fielddesc_array_of_void_1d_rejected",
+              !parse_one_field_descriptor(more_bad_fields[0], 0).ok);
+        check("fielddesc_array_of_void_2d_rejected",
+              !parse_one_field_descriptor(more_bad_fields[1], 0).ok);
+        check("fielddesc_array_of_stray_semicolon_rejected",
+              !parse_one_field_descriptor(more_bad_fields[2], 0).ok);
+        check("fielddesc_object_no_terminator_rejected",
+              !parse_one_field_descriptor(more_bad_fields[4], 0).ok);
+        // "II": ONE field descriptor parse consumes exactly the first 'I' and
+        // STOPS — it does not greedily swallow the trailing 'I'.  This is the
+        // contract parse_method_descriptor relies on to advance arg-by-arg.
+        {
+            const field_descriptor_parse f{ parse_one_field_descriptor("II", 0) };
+            check("fielddesc_two_primitives_parses_only_first_consume_1",
+                  f.ok && f.basic_type == 10 && f.consumed == 1);
+        }
+    }
+
+    // ---- whole-descriptor round-trip: param-count == sum over fields ----------
+    // For a well-formed descriptor, walking each parameter field one at a time
+    // (using parse_one_field_descriptor + consumed to advance) must reproduce the
+    // same arg_count and arg_slots parse_method_descriptor reports.  This pins the
+    // two code paths (single-field walk vs whole-method walk) agree, exercising
+    // the `consumed`-driven advance directly on a non-trivial mixed signature.
+    {
+        const std::string_view sig{ "(IJLjava/lang/Object;[DF)Ljava/lang/String;" };
+        // Manual field-by-field walk of the parameter region.
+        int    manual_args{ 0 };
+        int    manual_slots{ 0 };
+        bool   manual_ok{ true };
+        std::size_t pos{ 1 }; // skip '('
+        while (pos < sig.size() && sig[pos] != ')')
+        {
+            const field_descriptor_parse f{ parse_one_field_descriptor(sig, pos) };
+            if (!f.ok || f.consumed == 0) { manual_ok = false; break; }
+            ++manual_args;
+            manual_slots += (f.basic_type == 11 || f.basic_type == 7) ? 2 : 1;
+            pos += f.consumed;
+        }
+        const method_descriptor_parse m{ parse_method_descriptor(sig) };
+        check("methoddesc_manual_field_walk_matches_whole_parse",
+              manual_ok && m.ok
+              && m.arg_count == manual_args && m.arg_slots == manual_slots
+              && m.arg_count == 5 && m.arg_slots == 6
+              && m.return_basic == 12);
+    }
+
     return failures == 0 ? 0 : 1;
 }

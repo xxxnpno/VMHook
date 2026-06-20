@@ -76,6 +76,50 @@ namespace
     using vmhook::hotspot::get_jvm_module;
     using vmhook::hotspot::vm_struct_entry_t;
     using vmhook::hotspot::vm_type_entry_t;
+    using vmhook::hotspot::resolve_struct_entry;
+    using vmhook::hotspot::struct_entry_candidate_t;
+
+    // A standalone re-implementation of the EXACT iterate_struct_entries walk
+    // semantics (loop terminator `entry && entry->type_name`, the defensive
+    // `if (!entry->field_name) continue;` partial-entry skip, exact double
+    // strcmp, first-match-wins) over a CALLER-SUPPLIED head.  The real resolver
+    // reads the cached global head and takes no array parameter, so a fabricated
+    // in-process table cannot be driven through the public API in a no-JVM
+    // process.  This mirror lets the success path — match-found, ->offset /
+    // ->address / ->is_static read-back, terminator handling, partial-entry
+    // skip, no-match exhaustion, first-wins on duplicates — be pinned
+    // deterministically as pure struct math.  It is intentionally byte-for-byte
+    // the same control flow as vmhook.hpp's iterate_struct_entries so a drift in
+    // the documented walk contract is caught here even though the global cannot
+    // be populated.
+    auto walk_struct_table(const vm_struct_entry_t* head,
+                           const char* const type_name,
+                           const char* const field_name) -> const vm_struct_entry_t*
+    {
+        if (!type_name || !field_name) { return nullptr; }
+        for (const vm_struct_entry_t* entry{ head }; entry && entry->type_name; ++entry)
+        {
+            if (!entry->field_name) { continue; }
+            if (!std::strcmp(entry->type_name, type_name)
+                && !std::strcmp(entry->field_name, field_name))
+            {
+                return entry;
+            }
+        }
+        return nullptr;
+    }
+
+    // Mirror of iterate_type_entries' walk over a caller-supplied head.
+    auto walk_type_table(const vm_type_entry_t* head,
+                         const char* const type_name) -> const vm_type_entry_t*
+    {
+        if (!type_name) { return nullptr; }
+        for (const vm_type_entry_t* entry{ head }; entry && entry->type_name; ++entry)
+        {
+            if (!std::strcmp(entry->type_name, type_name)) { return entry; }
+        }
+        return nullptr;
+    }
 
     // -----------------------------------------------------------------------
     // 1. The cached getters: nullptr in a no-JVM process, and STABLE.
@@ -484,6 +528,29 @@ namespace
               iterate_struct_entries(control_bytes, "_length") == nullptr);
         check("type_high_bytes", iterate_type_entries(high_bytes) == nullptr);
         check("type_control_bytes", iterate_type_entries(control_bytes) == nullptr);
+
+        // Embedded-NUL trailing bytes: "_length\0Z" with explicit length — strcmp
+        // stops at the NUL so the effective field key is exactly "_length".  No
+        // JVM here, so still nullptr; the positive NUL-truncation proof is below.
+        const std::string field_with_nul{ std::string{ "_length" } + '\0' + "Z" };
+        check("struct_embedded_nul_field_prefix",
+              iterate_struct_entries("Symbol", field_with_nul.c_str()) == nullptr);
+
+        // POSITIVE proof of strcmp NUL-truncation against a POPULATED table: a
+        // key "Symbol\0GARBAGE" must MATCH the "Symbol" row (strcmp ignores
+        // everything from the NUL on) and must NOT read into the trailing bytes.
+        // The match-found path makes this observable; the no-JVM lane otherwise
+        // only ever sees nullptr.
+        const vm_struct_entry_t nul_table[]{
+            { "Symbol", "_length", "u4", 0, 24ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        const std::string type_with_nul{ std::string{ "Symbol" } + '\0' + "GARBAGE" };
+        const std::string fld_with_nul{ std::string{ "_length" } + '\0' + "MORE" };
+        const vm_struct_entry_t* const nul_hit{
+            walk_struct_table(nul_table, type_with_nul.c_str(), fld_with_nul.c_str()) };
+        check("struct_embedded_nul_truncates_to_prefix_match",
+              nul_hit != nullptr && nul_hit->offset == 24ull);
     }
 
     // -----------------------------------------------------------------------
@@ -558,6 +625,344 @@ namespace
               !structs_null || iterate_struct_entries("Method", "_constMethod") == nullptr);
         check("type_null_when_head_null",
               !types_null || iterate_type_entries("Method") == nullptr);
+    }
+
+    // -----------------------------------------------------------------------
+    // 13b. resolve_struct_entry — the candidate-chain walker.  The four
+    //     compressed-pointer codecs do NOT call iterate_struct_entries directly;
+    //     they hand resolve_struct_entry an ORDERED array of (type,field)
+    //     candidates and take the first that resolves, which is the whole
+    //     mechanism behind the cross-JDK base/shift fallbacks.  In a no-JVM
+    //     process every candidate resolves nullptr, so resolve_struct_entry must
+    //     walk the WHOLE array and return nullptr — and critically must handle
+    //     count==0 (empty list) WITHOUT touching the candidates pointer, and a
+    //     null candidates pointer when count==0.  These are pure-logic contracts.
+    // -----------------------------------------------------------------------
+    auto test_resolve_struct_entry_candidate_chain() -> void
+    {
+        // count==0 must short-circuit the loop entirely: the candidates pointer
+        // is never dereferenced.  Pass a null pointer to prove it is untouched.
+        check("resolve_count_zero_null_ptr",
+              resolve_struct_entry(nullptr, 0u) == nullptr);
+
+        // count==0 with a non-null (but unread) array.
+        static const struct_entry_candidate_t one[]{ { "Symbol", "_length" } };
+        check("resolve_count_zero_unread_array",
+              resolve_struct_entry(one, 0u) == nullptr);
+
+        // Single candidate, absent in a no-JVM process.
+        check("resolve_single_candidate_null",
+              resolve_struct_entry(one, 1u) == nullptr);
+
+        // The EXACT real codec candidate arrays, in the try-order the header
+        // uses (CompressedOops::_narrow_oop._base -> _base -> Universe...).
+        // Every one is absent with no JVM, so the chain exhausts to nullptr —
+        // which is precisely the "this JDK has none of these, decode is
+        // disabled" signal the codec relies on.
+        static const struct_entry_candidate_t oop_base[]{
+            { "CompressedOops", "_narrow_oop._base" },
+            { "CompressedOops", "_base" },
+            { "Universe", "_narrow_oop._base" },
+        };
+        static const struct_entry_candidate_t oop_shift[]{
+            { "CompressedOops", "_narrow_oop._shift" },
+            { "CompressedOops", "_shift" },
+            { "Universe", "_narrow_oop._shift" },
+        };
+        static const struct_entry_candidate_t klass_base[]{
+            { "CompressedKlassPointers", "_narrow_klass._base" },
+            { "CompressedKlassPointers", "_base" },
+            { "Universe", "_narrow_klass._base" },
+        };
+        static const struct_entry_candidate_t klass_shift[]{
+            { "CompressedKlassPointers", "_narrow_klass._shift" },
+            { "CompressedKlassPointers", "_shift" },
+            { "Universe", "_narrow_klass._shift" },
+        };
+        check("resolve_oop_base_chain_null", resolve_struct_entry(oop_base, 3u) == nullptr);
+        check("resolve_oop_shift_chain_null", resolve_struct_entry(oop_shift, 3u) == nullptr);
+        check("resolve_klass_base_chain_null", resolve_struct_entry(klass_base, 3u) == nullptr);
+        check("resolve_klass_shift_chain_null", resolve_struct_entry(klass_shift, 3u) == nullptr);
+
+        // A long candidate list (every renamed pair the library knows) walked in
+        // one go — exhausts to nullptr, no fault, no dependence on list length.
+        static const struct_entry_candidate_t many[]{
+            { "oopDesc", "_mark" }, { "oopDesc", "_markWord" },
+            { "Method", "_from_compiled_code_entry_point" },
+            { "Method", "_from_compiled_entry" },
+            { "InstanceKlass", "_fields" }, { "InstanceKlass", "_fieldinfo_stream" },
+            { "ClassLoaderData", "_klasses" }, { "ClassLoaderData", "_dictionary" },
+            { "oopDesc", "_metadata._compressed_klass" }, { "oopDesc", "_metadata._klass" },
+            { "Threads", "_thread_list" }, { "ThreadsSMRSupport", "_java_thread_list" },
+        };
+        check("resolve_many_candidates_null",
+              resolve_struct_entry(many, sizeof(many) / sizeof(many[0])) == nullptr);
+
+        // A candidate whose entries contain nulls/empties — resolve_struct_entry
+        // forwards them to iterate_struct_entries, whose null-arg guard absorbs
+        // them; still nullptr, still no fault.
+        static const struct_entry_candidate_t degenerate[]{
+            { nullptr, "_x" }, { "X", nullptr }, { "", "" }, { nullptr, nullptr },
+        };
+        check("resolve_degenerate_candidates_null",
+              resolve_struct_entry(degenerate, 4u) == nullptr);
+
+        // Determinism: repeating the same chain resolution always returns
+        // nullptr (resolve_struct_entry caches nothing itself).
+        bool stable{ true };
+        for (int i{ 0 }; i < 512; ++i)
+        {
+            if (resolve_struct_entry(oop_base, 3u) != nullptr) { stable = false; }
+            if (resolve_struct_entry(many, sizeof(many) / sizeof(many[0])) != nullptr) { stable = false; }
+            if (resolve_struct_entry(nullptr, 0u) != nullptr) { stable = false; }
+        }
+        check("resolve_chain_deterministic_null", stable);
+
+        // struct_entry_candidate_t aggregate layout — two const char* the codecs
+        // build constexpr arrays of.  Pin the member set + that it is a plain
+        // aggregate (brace-init with two strings round-trips).
+        static_assert(std::is_same_v<decltype(struct_entry_candidate_t::type_name), const char*>,
+                      "candidate type_name must be const char*");
+        static_assert(std::is_same_v<decltype(struct_entry_candidate_t::field_name), const char*>,
+                      "candidate field_name must be const char*");
+        constexpr struct_entry_candidate_t c{ "T", "F" };
+        check("candidate_aggregate_roundtrip",
+              std::strcmp(c.type_name, "T") == 0 && std::strcmp(c.field_name, "F") == 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // 13c. Per-pair named struct-surface assertions.  Section 4 collapses the
+    //     whole call-site surface into a single boolean, so a regression that
+    //     resurrected ONE pair would print an opaque failure.  These name the
+    //     highest-value pairs individually (the renamed/version-switch fields
+    //     whose presence drives a code branch), so a regression points at the
+    //     exact (type,field).  All nullptr with no JVM.
+    // -----------------------------------------------------------------------
+    auto test_named_struct_surface_pairs() -> void
+    {
+        struct named { const char* tag; const char* type; const char* field; };
+        static const named pairs[]{
+            { "pair_symbol_length", "Symbol", "_length" },
+            { "pair_symbol_body", "Symbol", "_body" },
+            { "pair_method_constmethod", "Method", "_constMethod" },
+            { "pair_method_i2i_entry", "Method", "_i2i_entry" },
+            { "pair_method_code", "Method", "_code" },
+            { "pair_method_adapter", "Method", "_adapter" },
+            { "pair_method_access_flags", "Method", "_access_flags" },
+            { "pair_method_flags", "Method", "_flags" },
+            { "pair_method_intrinsic_id", "Method", "_intrinsic_id" },
+            { "pair_method_fce_point", "Method", "_from_compiled_code_entry_point" },
+            { "pair_method_fce_short", "Method", "_from_compiled_entry" },
+            { "pair_constmethod_constants", "ConstMethod", "_constants" },
+            { "pair_constmethod_name_index", "ConstMethod", "_name_index" },
+            { "pair_constmethod_signature_index", "ConstMethod", "_signature_index" },
+            { "pair_constantpool_length", "ConstantPool", "_length" },
+            { "pair_constantpool_pool_holder", "ConstantPool", "_pool_holder" },
+            { "pair_klass_name", "Klass", "_name" },
+            { "pair_klass_java_mirror", "Klass", "_java_mirror" },
+            { "pair_klass_super", "Klass", "_super" },
+            { "pair_klass_next_link", "Klass", "_next_link" },
+            { "pair_klass_class_loader_data", "Klass", "_class_loader_data" },
+            { "pair_ik_methods", "InstanceKlass", "_methods" },
+            { "pair_ik_fields", "InstanceKlass", "_fields" },
+            { "pair_ik_fieldinfo_stream", "InstanceKlass", "_fieldinfo_stream" },
+            { "pair_cld_klasses", "ClassLoaderData", "_klasses" },
+            { "pair_cld_dictionary", "ClassLoaderData", "_dictionary" },
+            { "pair_cldg_head", "ClassLoaderDataGraph", "_head" },
+            { "pair_oop_mark", "oopDesc", "_mark" },
+            { "pair_oop_markword", "oopDesc", "_markWord" },
+            { "pair_oop_compressed_klass", "oopDesc", "_metadata._compressed_klass" },
+            { "pair_oop_klass", "oopDesc", "_metadata._klass" },
+            { "pair_jlc_klass_offset", "java_lang_Class", "_klass_offset" },
+            { "pair_stub_call_stub_entry", "StubRoutines", "_call_stub_entry" },
+            { "pair_adapter_c2i_entry", "AdapterHandlerEntry", "_c2i_entry" },
+        };
+        for (const auto& p : pairs)
+        {
+            check(p.tag, iterate_struct_entries(p.type, p.field) == nullptr);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 13d. Synthetic populated-table walk (success path).  Section 4..12 cover
+    //     ABSENT-table behaviour exhaustively; this pins the MATCH-FOUND path —
+    //     the resolver's entire reason to exist — using walk_struct_table, a
+    //     byte-for-byte mirror of iterate_struct_entries over a local synthetic
+    //     array (the real global cannot be populated in a no-JVM process).  This
+    //     directly exercises flaw #1 (offset vs address, is_static surfaced) and
+    //     flaw #4 (terminator / partial-entry / off-by-one) deterministically.
+    // -----------------------------------------------------------------------
+    auto test_synthetic_table_walk() -> void
+    {
+        int static_sentinel_a{ 0 };
+        int static_sentinel_b{ 0 };
+
+        // A populated table ending in a zeroed terminator.  Mix of instance
+        // (is_static==0, ->offset live) and static (is_static==1, ->address
+        // live) entries, plus a PARTIAL entry (type set, field null) the walk
+        // must SKIP without faulting and without stopping the walk, and a
+        // duplicate (Method,_code) to pin first-wins.
+        const vm_struct_entry_t table[]{
+            { "Symbol", "_length",  "u4", 0, 8ull,  nullptr },
+            { "Symbol", nullptr,    "u1", 0, 999ull, nullptr },          // partial: skipped
+            { "Method", "_code",    "nmethod*", 0, 0x48ull, nullptr },   // first dup
+            { "oopDesc","_mark",    "markWord", 0, 0ull,  nullptr },
+            { "Universe","_collectedHeap", "CollectedHeap*", 1, 0ull, &static_sentinel_a },
+            { "CompressedOops","_base", "address", 1, 0ull, &static_sentinel_b },
+            { "Method", "_code",    "nmethod*", 0, 0xDEADull, nullptr }, // dup: never reached
+            { "Method", "_offset_max", "u8", 0, 0xFFFFFFFFFFFFFFFFull, nullptr },
+            { nullptr,  nullptr,    nullptr, 0, 0ull, nullptr },         // terminator
+        };
+        const vm_struct_entry_t* const head{ table };
+
+        // Exact match on an INSTANCE field returns the entry; ->offset is live,
+        // ->is_static==0, and ->offset round-trips the synthetic value exactly.
+        const vm_struct_entry_t* const sym{ walk_struct_table(head, "Symbol", "_length") };
+        check("synth_instance_match_nonnull", sym != nullptr);
+        check("synth_instance_offset_exact", sym != nullptr && sym->offset == 8ull);
+        check("synth_instance_is_static_zero", sym != nullptr && sym->is_static == 0);
+
+        // The partial entry (Symbol,<null field>) at row 2 is skipped by the
+        // `continue` and does NOT stop the walk — a later real row is still
+        // reachable.  Prove it: the Method row AFTER the partial resolves.
+        const vm_struct_entry_t* const meth{ walk_struct_table(head, "Method", "_code") };
+        check("synth_after_partial_reachable", meth != nullptr);
+
+        // First-wins on duplicate (Method,_code): the 0x48 row, not 0xDEAD.
+        check("synth_duplicate_first_wins", meth != nullptr && meth->offset == 0x48ull);
+
+        // STATIC field: ->address is the live word (the sentinel), ->is_static==1.
+        // This is flaw #1 — the caller must read ->address, not ->offset.
+        const vm_struct_entry_t* const heap{ walk_struct_table(head, "Universe", "_collectedHeap") };
+        check("synth_static_match_nonnull", heap != nullptr);
+        check("synth_static_is_static_one", heap != nullptr && heap->is_static == 1);
+        check("synth_static_address_live", heap != nullptr && heap->address == &static_sentinel_a);
+
+        // A second static entry resolves to its OWN distinct address — the two
+        // statics are not aliased.
+        const vm_struct_entry_t* const cbase{ walk_struct_table(head, "CompressedOops", "_base") };
+        check("synth_static_b_address_live",
+              cbase != nullptr && cbase->address == &static_sentinel_b
+              && cbase->address != &static_sentinel_a);
+
+        // Full uint64 offset round-trips through the walk with no 32-bit
+        // truncation (the entry just before the terminator).
+        const vm_struct_entry_t* const omax{ walk_struct_table(head, "Method", "_offset_max") };
+        check("synth_offset_max_uint64",
+              omax != nullptr && omax->offset == 0xFFFFFFFFFFFFFFFFull);
+
+        // No-match exhaustion on a FULLY-POPULATED table: walk every row to the
+        // terminator and return nullptr (distinct from the trivially-empty-array
+        // case the rest of the file covers).
+        check("synth_no_match_exhausts_null",
+              walk_struct_table(head, "Klass", "_name") == nullptr);
+        check("synth_wrong_field_on_real_type_null",
+              walk_struct_table(head, "Symbol", "_body") == nullptr);
+        check("synth_wrong_type_on_real_field_null",
+              walk_struct_table(head, "ConstMethod", "_length") == nullptr);
+
+        // Argument independence with a populated table: swapping (type,field)
+        // must NOT match the row where the strings appear in the other column.
+        check("synth_swapped_args_no_match",
+              walk_struct_table(head, "_length", "Symbol") == nullptr);
+
+        // Case sensitivity / near-miss against a populated table: strcmp is exact.
+        check("synth_case_mismatch_null",
+              walk_struct_table(head, "symbol", "_length") == nullptr);
+        check("synth_field_case_mismatch_null",
+              walk_struct_table(head, "Symbol", "_Length") == nullptr);
+        check("synth_field_prefix_null",
+              walk_struct_table(head, "Method", "_cod") == nullptr);
+        check("synth_field_superstring_null",
+              walk_struct_table(head, "Method", "_code_entry") == nullptr);
+
+        // Null args against a populated table still short-circuit (guard runs
+        // before any row is touched).
+        check("synth_null_type_guard", walk_struct_table(head, nullptr, "_length") == nullptr);
+        check("synth_null_field_guard", walk_struct_table(head, "Symbol", nullptr) == nullptr);
+
+        // A null head (the no-JVM shape) terminates immediately.
+        check("synth_null_head_null",
+              walk_struct_table(nullptr, "Symbol", "_length") == nullptr);
+
+        // A table whose VERY FIRST entry is the terminator (zeroed type_name)
+        // returns nullptr for any query — the empty-but-non-null-head shape.
+        const vm_struct_entry_t empty_table[]{ { nullptr, nullptr, nullptr, 0, 0ull, nullptr } };
+        check("synth_first_is_terminator_null",
+              walk_struct_table(empty_table, "Symbol", "_length") == nullptr);
+
+        // Off-by-one: the match is the LAST real row immediately before the
+        // terminator — it must still be found (loop reads it before the
+        // terminator stops the walk).
+        const vm_struct_entry_t last_row_table[]{
+            { "A", "_a", "x", 0, 1ull, nullptr },
+            { "B", "_b", "x", 0, 2ull, nullptr },
+            { "Z", "_z", "x", 0, 0x1234ull, nullptr },                  // last real row
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        const vm_struct_entry_t* const last{ walk_struct_table(last_row_table, "Z", "_z") };
+        check("synth_last_row_before_terminator_found",
+              last != nullptr && last->offset == 0x1234ull);
+
+        // A partial entry as the FIRST row (type set, field null) followed by
+        // the real match — the `continue` must not skip the later valid row.
+        const vm_struct_entry_t partial_first_table[]{
+            { "Symbol", nullptr, "x", 0, 7ull, nullptr },               // partial first
+            { "Symbol", "_length", "u4", 0, 16ull, nullptr },           // real match after
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        const vm_struct_entry_t* const after_partial{
+            walk_struct_table(partial_first_table, "Symbol", "_length") };
+        check("synth_partial_first_then_match",
+              after_partial != nullptr && after_partial->offset == 16ull);
+    }
+
+    // -----------------------------------------------------------------------
+    // 13e. Synthetic TYPE-table walk (success path) — the gHotSpotVMTypes
+    //     mirror.  Pins iterate_type_entries' match-found path: a populated
+    //     vm_type_entry_t array resolves a type by name and reads back its
+    //     classification (is_oop_type_type / is_integer_type / is_unsigned) and
+    //     64-bit size, exercising the flaw-#6-named member positively.
+    // -----------------------------------------------------------------------
+    auto test_synthetic_type_walk() -> void
+    {
+        const vm_type_entry_t types[]{
+            { "oopDesc",     "",       1, 0, 0, 0ull },                  // oop type
+            { "InstanceKlass","Klass", 0, 0, 0, 0ull },
+            { "jint",        nullptr,  0, 1, 0, 4ull },                  // signed integer
+            { "size_t",      nullptr,  0, 1, 1, 8ull },                  // unsigned integer
+            { "narrowOop",   nullptr,  0, 1, 1, 0xFFFFFFFFFFFFFFFFull }, // full-width size
+            { nullptr, nullptr, 0, 0, 0, 0ull },                        // terminator
+        };
+        const vm_type_entry_t* const head{ types };
+
+        const vm_type_entry_t* const oop{ walk_type_table(head, "oopDesc") };
+        check("synth_type_oop_nonnull", oop != nullptr);
+        check("synth_type_oop_is_oop", oop != nullptr && oop->is_oop_type_type == 1);
+        check("synth_type_oop_not_integer", oop != nullptr && oop->is_integer_type == 0);
+
+        const vm_type_entry_t* const ji{ walk_type_table(head, "jint") };
+        check("synth_type_jint_integer",
+              ji != nullptr && ji->is_integer_type == 1 && ji->is_unsigned == 0 && ji->size == 4ull);
+
+        const vm_type_entry_t* const sz{ walk_type_table(head, "size_t") };
+        check("synth_type_sizet_unsigned",
+              sz != nullptr && sz->is_unsigned == 1 && sz->size == 8ull);
+
+        const vm_type_entry_t* const ik{ walk_type_table(head, "InstanceKlass") };
+        check("synth_type_superclass_readback",
+              ik != nullptr && ik->superclass_name != nullptr
+              && std::strcmp(ik->superclass_name, "Klass") == 0);
+
+        const vm_type_entry_t* const no{ walk_type_table(head, "narrowOop") };
+        check("synth_type_size_full_uint64",
+              no != nullptr && no->size == 0xFFFFFFFFFFFFFFFFull);
+
+        // No-match on a populated type table.
+        check("synth_type_no_match_null", walk_type_table(head, "Method") == nullptr);
+        check("synth_type_case_mismatch_null", walk_type_table(head, "OOPDESC") == nullptr);
+        check("synth_type_null_arg_guard", walk_type_table(head, nullptr) == nullptr);
+        check("synth_type_null_head_null", walk_type_table(nullptr, "oopDesc") == nullptr);
     }
 
     // -----------------------------------------------------------------------
@@ -723,6 +1128,10 @@ auto main() -> int
     test_pathological_lengths();
     test_determinism_and_no_global_state();
     test_walker_implies_getter();
+    test_resolve_struct_entry_candidate_chain();
+    test_named_struct_surface_pairs();
+    test_synthetic_table_walk();
+    test_synthetic_type_walk();
     test_struct_entry_abi_layout();
     test_type_entry_abi_layout();
     test_terminator_shape();

@@ -38,9 +38,11 @@
 // the encoder's below-base / no-resolve null behaviour incl. flaw #1 (BB), and
 // pin the widen-before-shift overflow safety of the OOP decode formula (EE).
 #include <vmhook/vmhook.hpp>
+#include <bit>           // std::bit_cast — explicit (libc++ pulls nothing transitively)
 #include <cstdio>
 #include <cstdint>
 #include <string>
+#include <type_traits>   // std::is_same_v — explicit, do not rely on a transitive pull
 #include <vector>
 
 static int failures{ 0 };
@@ -1843,6 +1845,308 @@ int main()
             check("oop_encode_max_shift3_based_recovers_all_ones",
                   narrow_encode(base, 3u, top) == 0xFFFF'FFFFu);
         }
+    }
+
+    // ===================================================================
+    // FF. KLASS-CODEC arithmetic per JDK-VERSION (base, shift) regime — the
+    //     compressed_klass_decode counterpart to section CC.  decode_klass_pointer
+    //     resolves CompressedKlassPointers::_narrow_klass.{_base,_shift} (JDK 17-24),
+    //     CompressedKlassPointers::{_base,_shift} (JDK 25+) or Universe::_narrow_klass
+    //     (JDK 8-16) and then performs EXACTLY narrow_decode(base, shift, c)
+    //     (vmhook.hpp decode_klass_pointer body: `return narrow_decode(base, shift,
+    //     compressed);`).  Section CC attributed the decode arithmetic to the OOP
+    //     codec; this attributes the SAME shared primitive to the KLASS codec across
+    //     the (base, shift) regimes HotSpot selects for klass pointers.
+    //
+    //     Klass-pointer encoding has a smaller, fixed bit width in practice:
+    //     compressed-class-pointers use shift 0 (unscaled) or shift 3 (8-byte
+    //     metaspace alignment).  The base is the compressed-class-space start (0 on
+    //     small heaps, non-zero when class space is based).  We drive the primitive
+    //     the klass codec delegates to with each such (base, shift) and check the
+    //     decode against the independently recomputed closed form, plus the inverse
+    //     round-trip — closing the klass-codec arithmetic gap section R (null-only)
+    //     left open.
+    // ===================================================================
+    {
+        struct klass_regime
+        {
+            std::uint64_t base;
+            std::uint32_t shift;
+            const char* trigger;   // documentation only
+        };
+        const klass_regime regimes[]{
+            // base==0, shift==0: unscaled, zero-based compressed class space —
+            // common on JDK 8 / small heaps where klass ids index from 0.
+            { 0u,                              0u, "klass_zero_based_unscaled" },
+            // base==0, shift==3: zero-based, 8-byte metaspace alignment.
+            { 0u,                              3u, "klass_zero_based_scaled8" },
+            // base!=0, shift==0: based class space, unscaled.
+            { std::uint64_t{ 0x7F00'0000'0000ull }, 0u, "klass_based_unscaled" },
+            // base!=0, shift==3: based + scaled — the typical compressed-class
+            // configuration once the class space is given a non-zero base.
+            { std::uint64_t{ 0x8'0000'0000ull },    3u, "klass_based_scaled8" },
+            // High near-ceiling base with shift 3: stresses that base+offset stays
+            // inside the canonical 47-bit user range and never wraps for klasses.
+            { std::uint64_t{ 0x7FFF'C000'0000ull },  3u, "klass_high_based_scaled8" },
+        };
+        const std::uint32_t comps[]{
+            0u, 1u, 2u, 3u, 0x7Fu, 0x80u, 0xFFFFu, 0x1'0000u,
+            0x00FF'FFFFu, 0x7FFF'FFFFu, 0x8000'0000u, 0xFFFF'FFFEu, 0xFFFF'FFFFu,
+        };
+
+        bool klass_regime_decode_ok{ true };
+        bool klass_regime_roundtrip_ok{ true };
+        for (const klass_regime r : regimes)
+        {
+            for (const std::uint32_t c : comps)
+            {
+                // decode_klass_pointer's body is `narrow_decode(base, shift, c)` —
+                // reproduce it and check against the documented closed form.
+                const std::uintptr_t got{ as_uptr(narrow_decode(r.base, r.shift, c)) };
+                const std::uintptr_t want{
+                    static_cast<std::uintptr_t>(r.base
+                        + (static_cast<std::uint64_t>(c) << r.shift)) };
+                if (got != want) { klass_regime_decode_ok = false; }
+                // encode_klass_pointer's body is `narrow_encode(base, shift, addr)`
+                // for addr >= base, so it must recover c exactly on the
+                // representable address.
+                const std::uint32_t re{ narrow_encode(
+                    r.base, r.shift, static_cast<std::uint64_t>(got)) };
+                if (re != c) { klass_regime_roundtrip_ok = false; }
+            }
+        }
+        check("klass_decode_arithmetic_all_jdk_regimes", klass_regime_decode_ok);
+        check("klass_decode_encode_roundtrip_all_jdk_regimes", klass_regime_roundtrip_ok);
+
+        // Spot-pin two exact, human-readable decoded klass pointers, one per
+        // shift, so a regression yields a self-evident wrong constant.  Zero-based
+        // shift-3 metaspace: compressed 0x100 -> 0x800.  Based shift-3 metaspace
+        // (base 0x8_0000_0000): compressed 0x100 -> 0x8_0000_0800.  These mirror
+        // the OOP spot-pins in CC and prove the klass path uses the identical
+        // shift-add (there is exactly one decode formula, shared by both codecs).
+        check("klass_decode_zero_based_shift3_0x100_is_0x800",
+              as_uptr(narrow_decode(0u, 3u, 0x100u)) == 0x800u);
+        check("klass_decode_based_shift3_0x100_is_base_plus_0x800",
+              as_uptr(narrow_decode(std::uint64_t{ 0x8'0000'0000ull }, 3u, 0x100u))
+                  == 0x8'0000'0800ull);
+
+        // The klass codec's widen-before-shift safety (mirror of EE for the OOP
+        // codec): max compressed klass on a shift-3 metaspace must reach the full
+        // 0x7'FFFF'FFF8 span and exceed 4 GB, never truncate at 32 bits.
+        check("klass_decode_max_shift3_reaches_32G_ceiling",
+              as_uptr(narrow_decode(0u, 3u, 0xFFFF'FFFFu)) == 0x7'FFFF'FFF8ull);
+        check("klass_decode_max_shift3_exceeds_4G",
+              as_uptr(narrow_decode(0u, 3u, 0xFFFF'FFFFu)) > 0xFFFF'FFFFull);
+        check("klass_decode_sign_bit_shift3_zero_extends",
+              as_uptr(narrow_decode(0u, 3u, 0x8000'0000u)) == 0x4'0000'0000ull);
+    }
+
+    // ===================================================================
+    // GG. KLASS-CODEC wrapper (decode_klass_pointer / encode_klass_pointer) —
+    //     the no-JVM input-domain and below-base/sentinel coverage that section
+    //     BB provides for the OOP encoder but which had NO klass counterpart.
+    //     With no JVM the VMStruct lookup fails, so every non-zero input decodes
+    //     to nullptr (no-resolve guard) and every pointer encodes to 0 (no-resolve
+    //     / below-base guard).  We pin that the klass wrapper's output domain is
+    //     exactly {nullptr} / {0} over its whole 32-bit / pointer input range —
+    //     proving the guards catch ALL inputs, not just the endpoints in R.
+    // ===================================================================
+    {
+        // (GG1) decode_klass_pointer over a dense compressed sweep with NO JVM:
+        //       only compressed==0 hits the early guard; every non-zero value
+        //       hits the no-resolve guard.  Both yield nullptr, never a crash,
+        //       never a fabricated pointer.
+        std::vector<std::uint32_t> klass_inputs;
+        klass_inputs.push_back(0u);
+        for (std::uint32_t k{ 1u }; k <= 16u; ++k) { klass_inputs.push_back(k); }
+        for (unsigned bit{ 0u }; bit < 32u; ++bit)
+        {
+            const std::uint32_t pow2{ static_cast<std::uint32_t>(1u) << bit };
+            klass_inputs.push_back(pow2);
+            klass_inputs.push_back(pow2 - 1u);
+            klass_inputs.push_back(pow2 + 1u);
+        }
+        klass_inputs.push_back(0x7FFF'FFFFu);
+        klass_inputs.push_back(0x8000'0000u);
+        klass_inputs.push_back(0xFFFF'FFFEu);
+        klass_inputs.push_back(0xFFFF'FFFFu);
+
+        bool klass_decode_all_null_no_jvm{ true };
+        std::size_t klass_decode_cases{ 0 };
+        for (const std::uint32_t c : klass_inputs)
+        {
+            if (decode_klass_pointer(c) != nullptr)
+            {
+                klass_decode_all_null_no_jvm = false;
+            }
+            ++klass_decode_cases;
+        }
+        check("decode_klass_pointer_all_inputs_null_no_jvm",
+              klass_decode_all_null_no_jvm);
+        check("decode_klass_pointer_no_jvm_sweep_is_dense",
+              klass_decode_cases >= 100);
+
+        // (GG2) encode_klass_pointer of the canonical sub-base / sentinel pointers
+        //       the below-base guard (vmhook.hpp encode_klass_pointer: `if
+        //       (decoded_address < base) return 0;`) exists to reject — with no
+        //       JVM the no-resolve guard fires first, so every one encodes to 0.
+        //       This mirrors BB for the klass encoder.
+        int klass_stack_anchor{ 0 };
+        const std::uintptr_t klass_sentinels[]{
+            std::uintptr_t{ 0x1u },
+            std::uintptr_t{ 0xFFFFu },
+            std::uintptr_t{ 0x1'0000u },
+            std::uintptr_t{ 0x4000'0000u },
+        };
+        bool klass_encode_sentinels_zero{ true };
+        for (const std::uintptr_t s : klass_sentinels)
+        {
+            if (encode_klass_pointer(reinterpret_cast<void*>(s)) != 0u)
+            {
+                klass_encode_sentinels_zero = false;
+            }
+        }
+        if (encode_klass_pointer(&klass_stack_anchor) != 0u)
+        {
+            klass_encode_sentinels_zero = false;
+        }
+        check("encode_klass_pointer_sub_base_sentinels_zero_no_jvm",
+              klass_encode_sentinels_zero);
+
+        // (GG3) Wrapper sentinel algebra closure (mirror of DD for the OOP codec):
+        //       encode(decode(c)) collapses to 0 for ALL c, and decode(encode(p))
+        //       collapses to nullptr for any pointer, with no JVM.
+        const std::uint32_t cs[]{ 0u, 1u, 0x100u, 0x7FFF'FFFFu, 0x8000'0000u, 0xFFFF'FFFFu };
+        bool klass_enc_of_dec_all_zero{ true };
+        for (const std::uint32_t c : cs)
+        {
+            if (encode_klass_pointer(decode_klass_pointer(c)) != 0u)
+            {
+                klass_enc_of_dec_all_zero = false;
+            }
+        }
+        check("encode_of_decode_klass_all_inputs_zero_no_jvm", klass_enc_of_dec_all_zero);
+
+        void* const ptrs[]{
+            nullptr,
+            reinterpret_cast<void*>(std::uintptr_t{ 0x1u }),
+            reinterpret_cast<void*>(std::uintptr_t{ 0x1'0000u }),
+            &klass_stack_anchor,
+        };
+        bool klass_dec_of_enc_all_null{ true };
+        for (void* const p : ptrs)
+        {
+            if (decode_klass_pointer(encode_klass_pointer(p)) != nullptr)
+            {
+                klass_dec_of_enc_all_null = false;
+            }
+        }
+        check("decode_of_encode_klass_all_pointers_null_no_jvm", klass_dec_of_enc_all_null);
+    }
+
+    // ===================================================================
+    // HH. std::bit_cast pointer-pun cross-check of the decode result.  The whole
+    //     suite uses reinterpret_cast / as_uptr to compare the decoded void*
+    //     against an integer; this section adds an INDEPENDENT type-pun path via
+    //     std::bit_cast (the portability-correct way to reinterpret a void* as a
+    //     uintptr_t without aliasing UB) and confirms the two punning methods
+    //     agree bit-for-bit.  std::bit_cast<void*,std::uintptr_t> is the inverse,
+    //     so bit_cast(uptr) must reproduce the exact pointer the codec returned.
+    //     This pins that the decoded value survives a lossless round-trip through
+    //     the object representation — the strongest "no bits lost" statement —
+    //     and exercises <bit> on every STL combo the matrix builds.
+    // ===================================================================
+    {
+        struct mode { std::uint64_t base; std::uint32_t shift; };
+        const mode modes[]{
+            { 0u, 0u }, { 0u, 3u }, { 0u, 4u },
+            { std::uint64_t{ 0x1'0000'0000ull },    0u },
+            { std::uint64_t{ 0x8'0000'0000ull },    3u },
+            { std::uint64_t{ 0x7FFF'FFFF'8000ull }, 4u },
+        };
+        const std::uint32_t vals[]{
+            1u, 2u, 0x7Fu, 0x1000u, 0x7FFF'FFFFu, 0x8000'0000u, 0xFFFF'FFFFu,
+        };
+        // sizeof(void*) == sizeof(std::uintptr_t) is a precondition for bit_cast
+        // between them; pin it so a hypothetical 32-bit build fails loudly here
+        // rather than silently truncating.
+        check("bitcast_pointer_width_matches_uintptr",
+              sizeof(void*) == sizeof(std::uintptr_t));
+
+        bool bitcast_agrees_with_reinterpret{ true };
+        bool bitcast_inverse_roundtrips{ true };
+        for (const mode m : modes)
+        {
+            for (const std::uint32_t v : vals)
+            {
+                void* const decoded{ narrow_decode(m.base, m.shift, v) };
+                // Pun #1: the suite's reinterpret_cast path.
+                const std::uintptr_t via_reinterpret{ as_uptr(decoded) };
+                // Pun #2: std::bit_cast, the aliasing-safe object-representation copy.
+                const std::uintptr_t via_bitcast{ std::bit_cast<std::uintptr_t>(decoded) };
+                if (via_reinterpret != via_bitcast)
+                {
+                    bitcast_agrees_with_reinterpret = false;
+                }
+                // The decoded integer must equal the independently widened formula.
+                const std::uintptr_t want{
+                    static_cast<std::uintptr_t>(m.base
+                        + (static_cast<std::uint64_t>(v) << m.shift)) };
+                if (via_bitcast != want) { bitcast_agrees_with_reinterpret = false; }
+                // Inverse: bit_cast the integer back to a pointer and confirm it is
+                // identical to the codec's own returned pointer (lossless pun).
+                void* const back{ std::bit_cast<void*>(via_bitcast) };
+                if (back != decoded) { bitcast_inverse_roundtrips = false; }
+            }
+        }
+        check("narrow_decode_bitcast_matches_reinterpret_all_modes",
+              bitcast_agrees_with_reinterpret);
+        check("narrow_decode_bitcast_inverse_roundtrips_all_modes",
+              bitcast_inverse_roundtrips);
+    }
+
+    // ===================================================================
+    // II. SHIFT-STEP GRANULARITY completeness — section P pinned the 8-byte step
+    //     at shift 3; this pins the step at EVERY shift 0..4, so the per-shift
+    //     "consecutive compressed values are 2^shift bytes apart" grid law is
+    //     stated for all object-alignment regimes the codec runs under (1, 2, 4,
+    //     8, 16 bytes), not just the shift-3 case.  Consecutive decoded addresses
+    //     must differ by exactly 2^shift, and a base-aligned decode must land on
+    //     the 2^shift grid (low `shift` bits clear).
+    // ===================================================================
+    {
+        const std::uint32_t shifts[]{ 0u, 1u, 2u, 3u, 4u };
+        bool step_is_pow2_all_shifts{ true };
+        bool grid_aligned_all_shifts{ true };
+        for (const std::uint32_t sh : shifts)
+        {
+            const std::uintptr_t expected_step{ std::uintptr_t{ 1u } << sh };
+            const std::uintptr_t grid_mask{ expected_step - 1u };
+            // Walk a short run of consecutive compressed values from a grid-aligned
+            // base; every adjacent pair must be exactly 2^shift bytes apart.
+            const std::uint64_t base{ 0x8'0000'0000ull };  // multiple of 16 -> grid for all sh<=4
+            std::uintptr_t prev{ as_uptr(narrow_decode(base, sh, 1000u)) };
+            for (std::uint32_t c{ 1001u }; c <= 1010u; ++c)
+            {
+                const std::uintptr_t cur{ as_uptr(narrow_decode(base, sh, c)) };
+                if (cur - prev != expected_step) { step_is_pow2_all_shifts = false; }
+                if ((cur & grid_mask) != 0u) { grid_aligned_all_shifts = false; }
+                prev = cur;
+            }
+        }
+        check("narrow_decode_step_is_pow2_all_shifts", step_is_pow2_all_shifts);
+        check("narrow_decode_result_grid_aligned_all_shifts", grid_aligned_all_shifts);
+
+        // Explicit, human-readable step pins for the two most common klass/oop
+        // regimes that section P did not name: shift 0 (1-byte step, unscaled) and
+        // shift 4 (16-byte step).  A regression in the scale factor surfaces as a
+        // wrong constant rather than a loop flag.
+        check("narrow_decode_shift0_step_is_1",
+              as_uptr(narrow_decode(0u, 0u, 51u)) - as_uptr(narrow_decode(0u, 0u, 50u)) == 1u);
+        check("narrow_decode_shift4_step_is_16",
+              as_uptr(narrow_decode(0u, 4u, 51u)) - as_uptr(narrow_decode(0u, 4u, 50u)) == 16u);
+        check("narrow_decode_shift4_0x100_is_0x1000",
+              as_uptr(narrow_decode(0u, 4u, 0x100u)) == 0x1000u);
     }
 
     return failures == 0 ? 0 : 1;

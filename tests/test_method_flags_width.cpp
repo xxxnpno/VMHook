@@ -34,6 +34,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1220,6 +1221,530 @@ static auto test_no_compile_mask_bits() -> void
           (no_compile & 0x0000FFFFu) == 0u && (no_compile & 0xFFFF0000u) == no_compile);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  17. FULL JVM_ACC_* class-file access-flag bit table (the bits that live in
+//      Method::_access_flags — the u4-read accessor's domain).  These are the
+//      Java class-file modifier bits HotSpot stores in the LOW 16 bits of
+//      AccessFlags; they NEVER moved across JDK 8..26 (only the high-byte
+//      compile-control bits relocated in JDK 24).  Pin every documented bit's
+//      exact value, prove each is a single bit, and prove the WHOLE class-file
+//      group sits in the low 16 bits so a u2 OR a u4 read sees it identically —
+//      this is precisely why is_static() masking 0x0008 out of a u4 read is
+//      width-independent (the contrast that justifies the _flags type-string fix).
+// ─────────────────────────────────────────────────────────────────────────
+namespace acc
+{
+    // Canonical JVM_ACC_* values from the class-file format (jvm.h / accessFlags.hpp);
+    // identical on every JDK 8..26.  Each is one bit in the low byte / low 16.
+    struct named_bit { const char* name; std::uint32_t value; };
+    constexpr named_bit table[]{
+        { "PUBLIC",       0x0001u },
+        { "PRIVATE",      0x0002u },
+        { "PROTECTED",    0x0004u },
+        { "STATIC",       0x0008u },
+        { "FINAL",        0x0010u },
+        { "SYNCHRONIZED", 0x0020u },  // (== SUPER for classes; == VOLATILE-adjacent slot)
+        { "BRIDGE",       0x0040u },  // (== VOLATILE for fields)
+        { "VARARGS",      0x0080u },  // (== TRANSIENT for fields)
+        { "NATIVE",       0x0100u },
+        { "INTERFACE",    0x0200u },
+        { "ABSTRACT",     0x0400u },
+        { "STRICT",       0x0800u },
+        { "SYNTHETIC",    0x1000u },
+        { "ANNOTATION",   0x2000u },
+        { "ENUM",         0x4000u },
+        { "MODULE",       0x8000u },  // (== MANDATED in some contexts) — top of low 16
+    };
+}
+
+static auto popcount32(std::uint32_t v) -> int
+{
+    int n{ 0 };
+    for (; v; v &= (v - 1)) { ++n; }
+    return n;
+}
+
+static auto test_jvm_acc_bit_table() -> void
+{
+    // Every documented JVM_ACC_* modifier is a SINGLE bit and lives in the low 16.
+    bool all_single_bit{ true };
+    bool all_low16{ true };
+    for (const acc::named_bit& b : acc::table)
+    {
+        if (popcount32(b.value) != 1) { all_single_bit = false; break; }
+        if ((b.value & 0xFFFF0000u) != 0u) { all_low16 = false; break; }
+    }
+    check("jvm_acc_every_modifier_is_single_bit", all_single_bit);
+    check("jvm_acc_every_modifier_in_low16", all_low16);
+
+    // The values are pairwise DISTINCT and densely cover bits 0..15 (each of the
+    // 16 low bits is claimed exactly once by this table — no gaps, no dupes).
+    {
+        std::uint32_t orall{ 0 };
+        int count{ 0 };
+        for (const acc::named_bit& b : acc::table) { orall |= b.value; ++count; }
+        check("jvm_acc_table_covers_all_16_low_bits", orall == 0x0000FFFFu && count == 16);
+        check("jvm_acc_table_bits_are_pairwise_distinct", popcount32(orall) == count);
+    }
+
+    // STATIC is exactly bit 3 / 0x0008 and lives in the LOW byte — the single
+    // fact that makes is_static() width-independent across the JDK 24 u4->u2
+    // AccessFlags shrink (a u2 read and a u4 read agree on bit 3).
+    check("jvm_acc_static_is_bit3_low_byte",
+          flags_layout::jvm_acc_static == 0x0008u
+          && (flags_layout::jvm_acc_static & 0x00FFu) == flags_layout::jvm_acc_static
+          && popcount32(flags_layout::jvm_acc_static) == 1);
+
+    // NATIVE / ABSTRACT / INTERFACE — the predicate bits the access-flag accessors
+    // read — are all within the low 16, so the u4 read masks them identically to a
+    // hypothetical u2 read (verified by truncating each to 16 bits below).
+    for (const acc::named_bit& b : acc::table)
+    {
+        const std::uint16_t as_u2{ static_cast<std::uint16_t>(b.value) };
+        // Round-tripping through a 16-bit access loses NOTHING for any class-file bit.
+        check((std::string{ "jvm_acc_" } + b.name + "_survives_u2_truncation").c_str(),
+              static_cast<std::uint32_t>(as_u2) == b.value);
+    }
+
+    // The class-file group (low 16) is DISJOINT from the NO_COMPILE high-byte mask
+    // (bits 24..27): no modifier bit overlaps a compile-control bit, so OR-ing
+    // NO_COMPILE can never flip a modifier and masking a modifier never sees one.
+    {
+        std::uint32_t orall{ 0 };
+        for (const acc::named_bit& b : acc::table) { orall |= b.value; }
+        const std::uint32_t no_compile{ static_cast<std::uint32_t>(vmhook::hotspot::NO_COMPILE) };
+        check("jvm_acc_classfile_group_disjoint_from_no_compile",
+              (orall & no_compile) == 0u);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  18. ACCESS-FLAG PREDICATE MASKING is WIDTH-STABLE.  The is_static / is_native
+//      / is_abstract / is_final style predicates are `(_access_flags & BIT) != 0`
+//      reads.  Model that read at BOTH a 2-byte and a 4-byte access width over a
+//      synthesised access-flags word and prove the boolean result is identical —
+//      i.e. the predicate does not depend on whether AccessFlags is u2 (JDK 24+)
+//      or u4 (<=23), because every modifier bit is in the low 16.  Uses memcpy to
+//      lay the object representation (never compares a possibly-trap bool; the
+//      predicate result is a plain integer comparison, not a stored bool).
+// ─────────────────────────────────────────────────────────────────────────
+static auto predicate_u2(const std::uint8_t* base, std::uint32_t bit) -> bool
+{
+    std::uint16_t w{};
+    std::memcpy(&w, base, sizeof(w));
+    return (static_cast<std::uint32_t>(w) & bit) != 0u;
+}
+static auto predicate_u4(const std::uint8_t* base, std::uint32_t bit) -> bool
+{
+    std::uint32_t w{};
+    std::memcpy(&w, base, sizeof(w));
+    return (w & bit) != 0u;
+}
+
+static auto test_access_flag_predicate_width_stability() -> void
+{
+    // Synthesise a realistic access-flags word: a public static native final method
+    // (low-16 modifiers) PLUS the NO_COMPILE high byte set (the library OR's it in).
+    // Both a u2 read and a u4 read must agree on every LOW-16 predicate.
+    const std::uint32_t word{
+        0x0001u   // PUBLIC
+        | 0x0008u // STATIC
+        | 0x0010u // FINAL
+        | 0x0100u // NATIVE
+        | static_cast<std::uint32_t>(vmhook::hotspot::NO_COMPILE) };  // high byte
+
+    alignas(4) std::array<std::uint8_t, 8> buf{};
+    std::memcpy(buf.data(), &word, sizeof(word));
+
+    struct probe { const char* name; std::uint32_t bit; bool expect; };
+    const probe probes[]{
+        { "PUBLIC",  0x0001u, true  },
+        { "PRIVATE", 0x0002u, false },
+        { "STATIC",  0x0008u, true  },
+        { "FINAL",   0x0010u, true  },
+        { "NATIVE",  0x0100u, true  },
+        { "ABSTRACT",0x0400u, false },
+    };
+    bool all_agree{ true };
+    bool all_correct{ true };
+    for (const probe& p : probes)
+    {
+        const bool b2{ predicate_u2(buf.data(), p.bit) };
+        const bool b4{ predicate_u4(buf.data(), p.bit) };
+        if (b2 != b4) { all_agree = false; }
+        if (b4 != p.expect) { all_correct = false; }
+    }
+    check("access_predicate_u2_and_u4_agree_on_low16", all_agree);
+    check("access_predicate_low16_results_correct", all_correct);
+
+    // The static bit specifically: present in this word, read true at BOTH widths,
+    // and the JDK-24 u2 read does NOT see the NO_COMPILE high byte at all (the high
+    // byte is OUTSIDE a 16-bit read window) — so a NO_COMPILE OR can never spoof a
+    // false-positive on any class-file predicate.
+    check("access_static_bit_true_at_both_widths",
+          predicate_u2(buf.data(), 0x0008u) && predicate_u4(buf.data(), 0x0008u));
+    check("access_no_compile_invisible_to_u2_read",
+          predicate_u2(buf.data(), static_cast<std::uint32_t>(vmhook::hotspot::NO_COMPILE)) == false
+          && predicate_u4(buf.data(), static_cast<std::uint32_t>(vmhook::hotspot::NO_COMPILE)));
+
+    // An INSTANCE method (STATIC bit clear) reads is_static==false at both widths.
+    {
+        const std::uint32_t instance_word{ 0x0001u | 0x0100u };  // public native, NOT static
+        alignas(4) std::array<std::uint8_t, 8> ibuf{};
+        std::memcpy(ibuf.data(), &instance_word, sizeof(instance_word));
+        check("access_instance_method_is_static_false_both_widths",
+              predicate_u2(ibuf.data(), 0x0008u) == false
+              && predicate_u4(ibuf.data(), 0x0008u) == false);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  19. EXHAUSTIVE bit-fits-width sweep (0..31) for u1 / u2 / u4.  The width fix
+//      hinges on "the access WIDTH must be wide enough to hold the bit".  For
+//      every bit 0..31 assert the exact representability in each width and the
+//      boundary at 8 (u1) / 16 (u2) / 32 (u4).  Then pin the two REAL bands:
+//      bit 2 fits u1/u2/u4; bit 12 fits u2/u4 but NOT u1 — the single arithmetic
+//      reason JDK 21+ cannot use a u1 access even though bit 12 < 16.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_bit_fits_width_exhaustive() -> void
+{
+    bool sweep_ok{ true };
+    for (int bit{ 0 }; bit < 32; ++bit)
+    {
+        const bool fits_u1{ bit < 8 };
+        const bool fits_u2{ bit < 16 };
+        const bool fits_u4{ bit < 32 };
+        // (1u << bit) is well-defined for bit in [0,31]; mask must be non-zero and,
+        // when bit fits a width, be representable inside that width's mask.
+        const std::uint32_t mask{ 1u << bit };
+        if (mask == 0u) { sweep_ok = false; break; }
+        if (fits_u1 && (mask & 0x000000FFu) != mask) { sweep_ok = false; break; }
+        if (fits_u2 && (mask & 0x0000FFFFu) != mask) { sweep_ok = false; break; }
+        if (fits_u4 && (mask & 0xFFFFFFFFu) != mask) { sweep_ok = false; break; }
+        // And the converse: a bit that does NOT fit u1/u2 must spill out of that mask.
+        if (!fits_u1 && (mask & 0x000000FFu) != 0u) { sweep_ok = false; break; }
+        if (!fits_u2 && (mask & 0x0000FFFFu) != 0u) { sweep_ok = false; break; }
+    }
+    check("bit_fits_width_exhaustive_0_to_31", sweep_ok);
+
+    // The two real _dont_inline bits against the boundary.
+    check("dont_inline_bit2_fits_u1_u2_u4",
+          (1u << 2) <= 0xFFu && (1u << 2) <= 0xFFFFu && (1u << 2) <= 0xFFFFFFFFu);
+    check("dont_inline_bit12_needs_at_least_u2",
+          (1u << 12) > 0xFFu          // overflows a u1 -> JDK 21+ cannot use 1-byte access
+          && (1u << 12) <= 0xFFFFu     // fits inside 16 bits numerically
+          && (1u << 12) <= 0xFFFFFFFFu);
+
+    // The boundary bits themselves: bit 7 is the LAST u1 bit, bit 8 the FIRST that
+    // overflows u1; bit 15 the LAST u2 bit, bit 16 the FIRST that overflows u2.
+    check("bit7_is_last_u1_bit_8_overflows",
+          ((1u << 7) & 0xFFu) == (1u << 7) && ((1u << 8) & 0xFFu) == 0u);
+    check("bit15_is_last_u2_bit_16_overflows",
+          ((1u << 15) & 0xFFFFu) == (1u << 15) && ((1u << 16) & 0xFFFFu) == 0u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  20. ALL-SET / ALL-CLEAR slot toggling with FULL-WORD anti-clobber.  The
+//      width-matrix test (#8) toggles ONE bit on a zeroed slot.  Here drive the
+//      OTHER extreme: seed the slot ALL-ONES, toggle dont_inline OFF then back ON,
+//      and the inverse from ALL-ZERO.  Proves the width-correct RMW (a) flips only
+//      the target bit out of a fully-populated word and (b) preserves every OTHER
+//      bit in the slot AND every byte outside it.  This is the worst-case sibling
+//      survival check (15 / 31 unrelated bits live simultaneously).
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_all_set_all_clear_slot_toggle() -> void
+{
+    const method_flags_evidence bands[]{ evidence_jdk11_20, evidence_jdk21_23 };
+    const char* const tags[]{ "u2", "u4" };
+
+    for (std::size_t k{ 0 }; k < 2; ++k)
+    {
+        const method_flags_layout layout{ derive_method_flags_layout(bands[k]) };
+        if (!layout.confident) { check("all_set_clear_band_confident", false); continue; }
+
+        const std::uint32_t width_mask{ layout.width_bytes == 2 ? 0x0000FFFFu : 0xFFFFFFFFu };
+        const std::uint32_t target{ 1u << layout.dont_inline_bit };
+
+        // --- Seed ALL-ONES across the slot; CLEAR dont_inline; only it drops. ---
+        {
+            alignas(16) std::array<std::uint8_t, 128> buffer{};
+            buffer.fill(0xC3);  // recognizable neighbour pattern
+            std::memset(buffer.data() + layout.offset, 0xFF,
+                        static_cast<std::size_t>(layout.width_bytes));
+            const std::array<std::uint8_t, 128> snap{ buffer };
+
+            toggle_like_set_dont_inline(buffer.data(), layout, /*enabled*/ false);
+            const std::uint32_t after{ read_word(buffer.data(), layout) & width_mask };
+
+            // dont_inline bit cleared; ALL OTHER in-slot bits still set.
+            check((std::string{ "all_ones_" } + tags[k] + "_only_target_cleared").c_str(),
+                  (after & target) == 0u && after == (width_mask & ~target));
+
+            // Bytes OUTSIDE the slot untouched.
+            bool outside_intact{ true };
+            for (std::size_t i{ 0 }; i < buffer.size(); ++i)
+            {
+                const bool inside{ i >= layout.offset
+                                   && i < layout.offset + static_cast<std::size_t>(layout.width_bytes) };
+                if (!inside && buffer[i] != snap[i]) { outside_intact = false; break; }
+            }
+            check((std::string{ "all_ones_" } + tags[k] + "_no_adjacent_clobber").c_str(),
+                  outside_intact);
+
+            // Re-SET dont_inline -> slot returns to ALL-ONES (full reversibility).
+            toggle_like_set_dont_inline(buffer.data(), layout, /*enabled*/ true);
+            check((std::string{ "all_ones_" } + tags[k] + "_reset_restores_all_ones").c_str(),
+                  (read_word(buffer.data(), layout) & width_mask) == width_mask);
+        }
+
+        // --- Seed ALL-ZERO; SET dont_inline; only it rises; CLEAR -> zero again. ---
+        {
+            alignas(16) std::array<std::uint8_t, 128> buffer{};
+            buffer.fill(0x3C);
+            std::memset(buffer.data() + layout.offset, 0x00,
+                        static_cast<std::size_t>(layout.width_bytes));
+
+            toggle_like_set_dont_inline(buffer.data(), layout, /*enabled*/ true);
+            check((std::string{ "all_zero_" } + tags[k] + "_only_target_set").c_str(),
+                  (read_word(buffer.data(), layout) & width_mask) == target);
+
+            toggle_like_set_dont_inline(buffer.data(), layout, /*enabled*/ false);
+            check((std::string{ "all_zero_" } + tags[k] + "_clear_returns_to_zero").c_str(),
+                  (read_word(buffer.data(), layout) & width_mask) == 0u);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  21. SIBLING-BIT INDEPENDENCE CROSS-PRODUCT on the JDK 21+ u4 _status word.
+//      Toggle dont_inline (bit 12) while EACH relocated compile-control sibling
+//      (queued=7, not_c2=8, not_c1=9, not_c2_osr=10, force_inline=11) is held set,
+//      and prove the sibling is untouched by both the set and the clear.  This is
+//      the cross-product the JDK 24 relocation made necessary: dont_inline now
+//      SHARES its word with the not_compilable group, so the RMW must be surgical.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_status_word_sibling_independence() -> void
+{
+    using namespace flags_layout::methodflags_status_bit;
+    const method_flags_layout layout{ derive_method_flags_layout(evidence_jdk21_23) };
+    check("sibling_indep_band_is_u4_bit12",
+          layout.confident && layout.width_bytes == 4 && layout.dont_inline_bit == 12);
+
+    const int siblings[]{ queued_for_compilation, is_not_c2_compilable,
+                          is_not_c1_compilable, is_not_c2_osr, force_inline };
+
+    bool all_independent{ true };
+    for (const int sib : siblings)
+    {
+        if (sib == 12) { all_independent = false; break; }  // must differ from target
+        alignas(16) std::array<std::uint8_t, 64> buffer{};
+        buffer.fill(0x00);
+        const std::uint32_t sib_mask{ 1u << sib };
+        std::memcpy(buffer.data() + layout.offset, &sib_mask, sizeof(sib_mask));
+
+        // SET dont_inline: sibling must survive, target must rise.
+        toggle_like_set_dont_inline(buffer.data(), layout, true);
+        const std::uint32_t after_set{ read_word(buffer.data(), layout) };
+        if ((after_set & sib_mask) != sib_mask) { all_independent = false; break; }
+        if ((after_set & (1u << 12)) == 0u)     { all_independent = false; break; }
+        if (after_set != (sib_mask | (1u << 12))) { all_independent = false; break; }
+
+        // CLEAR dont_inline: sibling STILL survives, target drops.
+        toggle_like_set_dont_inline(buffer.data(), layout, false);
+        const std::uint32_t after_clear{ read_word(buffer.data(), layout) };
+        if (after_clear != sib_mask) { all_independent = false; break; }
+    }
+    check("status_word_dont_inline_independent_of_every_sibling", all_independent);
+
+    // The whole NO_COMPILE-relocated group held set AT ONCE, then dont_inline
+    // toggled — every group bit survives both transitions.
+    {
+        alignas(16) std::array<std::uint8_t, 64> buffer{};
+        buffer.fill(0x00);
+        std::uint32_t group{ 0 };
+        for (const int sib : siblings) { group |= (1u << sib); }
+        std::memcpy(buffer.data() + layout.offset, &group, sizeof(group));
+
+        toggle_like_set_dont_inline(buffer.data(), layout, true);
+        const std::uint32_t set_state{ read_word(buffer.data(), layout) };
+        toggle_like_set_dont_inline(buffer.data(), layout, false);
+        const std::uint32_t clear_state{ read_word(buffer.data(), layout) };
+
+        check("status_word_full_sibling_group_survives_set",
+              (set_state & group) == group && (set_state & (1u << 12)) != 0u);
+        check("status_word_full_sibling_group_survives_clear",
+              clear_state == group && (clear_state & (1u << 12)) == 0u);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  22. ENDIANNESS-INDEPENDENT byte placement of the toggled bit.  The toggle
+//      writes through a typed std::uint16_t*/uint32_t*, so the READ-BACK through
+//      the SAME typed width is endianness-correct BY CONSTRUCTION.  Pin that
+//      invariant explicitly: lay the bit via the toggle, then recover it via a
+//      memcpy into the object representation and a typed reinterpret of the same
+//      width — both must report the SAME value as `read_word`, on big- or
+//      little-endian.  We assert the TYPED-read invariant (portable), and only
+//      record the concrete byte index as an [INFO]-style derived fact gated on
+//      std::endian (never a hard cross-endian string/byte assertion).
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_toggle_byte_placement_endianness() -> void
+{
+    const method_flags_layout layout{ derive_method_flags_layout(evidence_jdk21_23) };  // u4, bit 12
+    alignas(16) std::array<std::uint8_t, 64> buffer{};
+    buffer.fill(0x00);
+    std::memset(buffer.data() + layout.offset, 0x00, static_cast<std::size_t>(layout.width_bytes));
+
+    toggle_like_set_dont_inline(buffer.data(), layout, true);
+
+    // (a) Typed read-back == read_word helper == the constructed mask, regardless
+    //     of host endianness (the typed store/load round-trips natively).
+    const std::uint32_t via_helper{ read_word(buffer.data(), layout) };
+    std::uint32_t via_memcpy{};
+    std::memcpy(&via_memcpy, buffer.data() + layout.offset, sizeof(via_memcpy));
+    check("toggle_typed_readback_matches_memcpy_object_repr",
+          via_helper == via_memcpy && via_helper == (1u << 12));
+
+    // (b) Object-representation byte index of bit 12 is endianness-DEPENDENT, so we
+    //     derive the expected nonzero byte from std::endian and assert THAT — never
+    //     a fixed byte index.  Bit 12 lives in byte 1 (little-endian) or byte 2
+    //     (big-endian) of the 4-byte word.  On a mixed/unknown endianness we only
+    //     assert "exactly one byte is nonzero and it holds 0x10".
+    int nonzero_bytes{ 0 };
+    int nonzero_index{ -1 };
+    std::uint8_t nonzero_value{ 0 };
+    for (int i{ 0 }; i < 4; ++i)
+    {
+        const std::uint8_t bv{ buffer[layout.offset + static_cast<std::size_t>(i)] };
+        if (bv != 0) { ++nonzero_bytes; nonzero_index = i; nonzero_value = bv; }
+    }
+    check("toggle_bit12_occupies_exactly_one_object_byte",
+          nonzero_bytes == 1 && nonzero_value == 0x10u);
+
+    if constexpr (std::endian::native == std::endian::little)
+    {
+        check("toggle_bit12_byte_index_little_endian", nonzero_index == 1);
+    }
+    else if constexpr (std::endian::native == std::endian::big)
+    {
+        check("toggle_bit12_byte_index_big_endian", nonzero_index == 2);
+    }
+    else
+    {
+        // Mixed-endian host: the typed-read invariant above already covers
+        // correctness; the concrete byte index is not portably assertable.
+        check("toggle_bit12_byte_index_mixed_endian_invariant_only", nonzero_bytes == 1);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  23. SIGNED `~NO_COMPILE` TEARDOWN CLEAR round-trip (robustness hazard #6).
+//      The teardown clears NO_COMPILE with `*flags &= static_cast<uint32_t>(~NO_COMPILE)`
+//      where NO_COMPILE is std::int32_t.  Prove that the signed complement, once
+//      cast to u4, clears EXACTLY the four high-byte compile-control bits and
+//      DISTURBS NOTHING else — across a full-ones access-flags word, a low-16
+//      modifier word, and the realistic OR'd word.  This is the sign-extension
+//      hazard pinned as a no-op-today / regression-anchor-tomorrow fact.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_no_compile_signed_clear_roundtrip() -> void
+{
+    const std::int32_t no_compile_signed{ vmhook::hotspot::NO_COMPILE };
+    const std::uint32_t clear_mask{ static_cast<std::uint32_t>(~no_compile_signed) };
+    const std::uint32_t no_compile{ static_cast<std::uint32_t>(no_compile_signed) };
+
+    // The clear mask is exactly the bitwise-NOT of the 4-bit NO_COMPILE pattern in
+    // u4 — no sign extension surprise (the four bits are in bits 24..27, well below
+    // the sign bit 31, so ~ at int32 then cast to u4 is the clean 0xF0FFFFFF).
+    check("no_compile_clear_mask_is_exact_complement",
+          clear_mask == 0xF0FFFFFFu && clear_mask == (~no_compile));
+
+    // OR then AND-clear round-trips to the original on every shape of starting word.
+    const std::uint32_t starts[]{
+        0x00000000u,
+        0xFFFFFFFFu,
+        0x0000FFFFu,                                   // all class-file modifiers
+        0x00000009u,                                   // public static
+        0x0001u | 0x0008u | 0x0100u,                   // public static native
+        0x12345678u,                                   // arbitrary
+    };
+    bool roundtrip_ok{ true };
+    for (const std::uint32_t s : starts)
+    {
+        const std::uint32_t with_nc{ s | no_compile };       // install OR
+        const std::uint32_t cleared{ with_nc & clear_mask };  // teardown AND
+        // After OR+clear, the NO_COMPILE bits are gone and EVERY other bit is exactly
+        // as in the original `s` (OR set only NO_COMPILE bits; clear removed only them).
+        if ((cleared & no_compile) != 0u) { roundtrip_ok = false; break; }
+        if ((cleared & ~no_compile) != (s & ~no_compile)) { roundtrip_ok = false; break; }
+        // The low-16 class-file modifiers in particular are byte-identical to start.
+        if ((cleared & 0x0000FFFFu) != (s & 0x0000FFFFu)) { roundtrip_ok = false; break; }
+    }
+    check("no_compile_or_then_signed_clear_roundtrips_all_words", roundtrip_ok);
+
+    // JVM_ACC_STATIC specifically survives the install-OR + teardown-clear cycle
+    // untouched (the static-dispatch decision must read the SAME value afterward).
+    {
+        const std::uint32_t s{ 0x0008u };                       // a lone static method
+        const std::uint32_t cycled{ (s | no_compile) & clear_mask };
+        check("no_compile_cycle_preserves_jvm_acc_static",
+              (cycled & 0x0008u) == 0x0008u && cycled == s);
+    }
+
+    // The signed complement must NOT have set any bit at or above 28 spuriously via
+    // sign extension: bits 28..31 of the clear mask are all 1 (untouched), bits
+    // 24..27 are 0 (the cleared NO_COMPILE bits), low 24 are 1.
+    check("no_compile_clear_mask_high_nibble_intact",
+          (clear_mask & 0xF0000000u) == 0xF0000000u   // bits 28..31 preserved
+          && (clear_mask & 0x0F000000u) == 0u          // bits 24..27 cleared
+          && (clear_mask & 0x00FFFFFFu) == 0x00FFFFFFu);// low 24 preserved
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  24. WIDTH-DRIVEN-NOT-VERSION-DRIVEN guarantee.  The derivation must select the
+//      width from the EXPORTED EVIDENCE (type_string + intrinsic layout), never
+//      from a compiled-in JDK version number.  Prove the SAME evidence shape yields
+//      the SAME width irrespective of the (irrelevant) absolute offsets, and that
+//      a u2-exported-flags shape ALWAYS yields width 2 while a u2-intrinsic-only
+//      shape ALWAYS yields width 4 — the version is never consulted.
+// ─────────────────────────────────────────────────────────────────────────
+static auto test_width_is_evidence_driven_not_version_driven() -> void
+{
+    // Same Path-A shape (exported u2 _flags) at many offsets -> ALWAYS width 2 / bit 2.
+    bool pathA_always_u2{ true };
+    for (std::uint64_t off : { std::uint64_t{ 0 }, std::uint64_t{ 16 }, std::uint64_t{ 44 },
+                               std::uint64_t{ 256 }, std::uint64_t{ 4096 } })
+    {
+        method_flags_evidence ev{};
+        ev.flags_present = true; ev.flags_type = "u2"; ev.flags_offset = off;
+        const method_flags_layout l{ derive_method_flags_layout(ev) };
+        if (!(l.confident && l.width_bytes == 2 && l.dont_inline_bit == 2)) { pathA_always_u2 = false; break; }
+    }
+    check("width_pathA_evidence_always_u2_any_offset", pathA_always_u2);
+
+    // Same Path-B shape (u2 intrinsic only) at many legal offsets -> ALWAYS width 4 / bit 12.
+    bool pathB_always_u4{ true };
+    for (std::uint64_t off : { std::uint64_t{ 4 }, std::uint64_t{ 8 }, std::uint64_t{ 44 },
+                               std::uint64_t{ 256 }, std::uint64_t{ 4096 } })
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = true; ev.intrinsic_id_type = "u2"; ev.intrinsic_id_offset = off;
+        const method_flags_layout l{ derive_method_flags_layout(ev) };
+        if (!(l.confident && l.width_bytes == 4 && l.dont_inline_bit == 12)) { pathB_always_u4 = false; break; }
+    }
+    check("width_pathB_evidence_always_u4_any_legal_offset", pathB_always_u4);
+
+    // A u4-exported _flags ("MethodFlags") WITHOUT a usable u2 intrinsic must NOT be
+    // confidently width-4-guessed from its mere presence — the derivation refuses to
+    // place a write it cannot prove (no version shortcut rescues it).
+    {
+        method_flags_evidence ev{};
+        ev.flags_present = true; ev.flags_type = "MethodFlags"; ev.flags_offset = 40;
+        // no intrinsic evidence at all
+        check("width_methodflags_alone_refuses_no_version_shortcut",
+              !derive_method_flags_layout(ev).confident);
+    }
+}
+
 int main()
 {
     test_set_dont_inline_null();
@@ -1238,6 +1763,14 @@ int main()
     test_width_bit_representability_and_determinism();
     test_width_to_bit_mapping_table();
     test_no_compile_mask_bits();
+    test_jvm_acc_bit_table();
+    test_access_flag_predicate_width_stability();
+    test_bit_fits_width_exhaustive();
+    test_all_set_all_clear_slot_toggle();
+    test_status_word_sibling_independence();
+    test_toggle_byte_placement_endianness();
+    test_no_compile_signed_clear_roundtrip();
+    test_width_is_evidence_driven_not_version_driven();
 
     std::printf("\n%s: %d failure(s)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;
