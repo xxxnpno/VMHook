@@ -52,11 +52,18 @@ import vmhook.Harness;
  * fixture never writes them, but the convention is kept for safety parity with
  * the other fixtures.
  *
+ * INHERITED-MEMBER additions (so the native module can prove the wrapper's
+ * super-chain resolution walk, not just same-class lookup): WrapperPattern now
+ * {@code extends WrapperBase}, a sibling top-level class declaring an inherited
+ * instance field, an inherited static field, and an inherited instance method.
+ * The wrapper for WrapperPattern resolves each of these through the get_super()
+ * walk that every object_base get_field/get_method overload runs.
+ *
  * JAVA 8 SOURCE ONLY: anonymous Probe class, no var / records / switch-expr /
  * text-blocks / lambdas-in-fields / post-8 APIs.  Non-ASCII char values use
  * numeric / \\uXXXX escapes so javac agrees under Cp1252 (Windows) and UTF-8.
  */
-public final class WrapperPattern
+public final class WrapperPattern extends WrapperBase
 {
     // -- go / done handshake driven by the native module via run_probe ------
     public static volatile boolean go;
@@ -421,5 +428,38 @@ public final class WrapperPattern
                 WrapperPattern.done = true;
             }
         });
+    }
+}
+
+/**
+ * Superclass of WrapperPattern (sibling top-level class, emitted as its own
+ * WrapperBase.class).  It exists so the native module can prove the wrapper's
+ * resolution walks the get_super() chain: a wrapper registered for the SUBCLASS
+ * resolves these inherited members through the superclass.
+ *
+ *   - baseTag    : an inherited INSTANCE field (read through a subclass oop),
+ *   - baseStatic : an inherited STATIC field (resolved through the declaring
+ *     class's mirror, not the subclass mirror),
+ *   - baseId()   : an inherited INSTANCE method dispatched through the subclass.
+ *
+ * Values are distinct constants the native side mirrors so an inherited-member
+ * mix-up surfaces immediately.  JAVA 8 SOURCE ONLY.
+ */
+class WrapperBase
+{
+    /** Inherited INSTANCE field — same on every subclass instance. */
+    public int baseTag = 0x0BA5E000;          // 195108864
+
+    /** Inherited STATIC field — lives on WrapperBase's mirror. */
+    public static int baseStatic = 0x0BA5E5;  // 765669
+
+    WrapperBase()
+    {
+    }
+
+    /** Inherited INSTANCE method (resolution must find it up the super chain). */
+    public long baseId()
+    {
+        return this.baseTag;
     }
 }

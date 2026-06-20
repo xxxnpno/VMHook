@@ -35,6 +35,15 @@ class FieldInheritedBase implements FieldInheritedIface
     static final int  STAT_PUB_RUNTIME  = 0x6262;
     static final int  STAT_PRV_INIT     = 300;
 
+    // A WIDE (J) inherited static and a REFERENCE (String) inherited static, so
+    // the depth-2 super walk on the class MIRROR is proven for a non-int static
+    // descriptor too (the existing inherited statics are all I-typed).  The
+    // declaring-class mirror offset is what makes find_field's declaring_klass
+    // attribution load-bearing for these — read through the (smaller) child
+    // mirror they would land in adjacent heap.
+    static final long   STAT_LONG_INIT = 0x00C0FFEE0BADF00DL;
+    static final String STAT_STR_INIT  = "base-static-str";
+
     // ---- INSTANCE fields at every access level (find_field ignores access) -
     protected int    protectedInt = PROT_INT_INIT;   // inherited PROTECTED
     public    int    publicInt    = PUB_INT_INIT;    // inherited PUBLIC
@@ -46,6 +55,13 @@ class FieldInheritedBase implements FieldInheritedIface
     // reference decode (not just I-typed slots).
     protected long   baseLong     = 0x00BA5E_0000BA5EL;
     public    String baseStr      = "base-str";
+
+    // A PRIVATE inherited REFERENCE (String) at depth 2.  Java source on the
+    // child can never name it, but find_field reads by raw offset and ignores
+    // access flags, so the child-typed walk must resolve it and read its value
+    // through the compressed-OOP decode — proving access-independence for a
+    // reference slot, not only the int privateInt above.
+    private   String basePrivateStr = "base-private-str";
 
     // ---- One inherited field of EVERY remaining JVM primitive type, plus an
     //      array reference, so the depth-2 super walk + field_proxy::get() are
@@ -95,6 +111,10 @@ class FieldInheritedBase implements FieldInheritedIface
     public    static int sPublic    = STAT_PUB_INIT;
     private   static int sPrivate   = STAT_PRV_INIT;
 
+    // WIDE + REFERENCE inherited statics (depth-2 walk on the class mirror).
+    protected static long   sLong = STAT_LONG_INIT;
+    public    static String sStr  = STAT_STR_INIT;
+
     // ---- Shadow slots: the child RE-DECLARES these same names --------------
     public  int    shadowedInt = 1111;      // FieldInherited.BASE_SHADOW_INT
     public  String shadowedStr = "base";    // base copy of the shadowed String
@@ -106,6 +126,12 @@ class FieldInheritedBase implements FieldInheritedIface
     // on FieldInherited with far-apart sentinel values.
     public  byte   shadowedByte = (byte) 0x11;  // FieldInherited.BASE_SHADOW_BYTE
     public  long   shadowedLong = 0x00BA5EL;    // FieldInherited.BASE_SHADOW_LONG
+
+    // CHAR + SHORT shadow base slots (child re-declares both), so child-wins
+    // shadowing is proven for the UNSIGNED 16-bit and the signed 16-bit widths
+    // too — between the narrow byte and the wide long already covered.
+    public  char   shadowedChar  = (char) 0x00B5;   // FieldInherited.BASE_SHADOW_CHAR
+    public  short  shadowedShort = (short) 0x0BA5;  // FieldInherited.BASE_SHADOW_SHORT
 
     // Touch private members + the every-type slots so javac does not warn them
     // unused under -Werror-y builds and so they are guaranteed present in the
@@ -128,6 +154,9 @@ class FieldInheritedBase implements FieldInheritedIface
         acc += (int) this.baseDoubleBig;
         acc += this.baseStrArray.length;
         acc += this.shadowedByte + (int) this.shadowedLong;
+        acc += this.shadowedChar + this.shadowedShort;
+        acc += this.basePrivateStr.length();
+        acc += (int) FieldInheritedBase.sLong + FieldInheritedBase.sStr.length();
         return acc;
     }
 }

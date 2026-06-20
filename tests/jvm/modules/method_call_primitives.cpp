@@ -131,6 +131,27 @@ namespace
         // (S)->wider-int RETURN widen: a short return read into a 32-bit int proves
         // the int16 alternative sign-extends (-1 -> -1, 0xAAAA -> -21846).
         auto short_ret_as_int(const char* n) -> std::int32_t { return get_method(n)->call(); }
+        // -- batch-18 cross-kind conversion breadth on a RETURN (instance) --
+        // Each converts the SAME primitive return value_t into a target whose KIND
+        // differs from the stored alternative, exercising operator target_type()'s
+        // static_cast leg the existing probes do not reach: a float return into a
+        // 64-bit integer (trunc), a double return into a 32-bit integer (trunc), and
+        // every integral kind into a wider FLOATING target (lossless widen for the
+        // exact magnitudes used).  All read through one templated conversion site.
+        auto ret_float_as_i64(const char* n) -> std::int64_t { return get_method(n)->call(); }
+        auto ret_double_as_i32(const char* n) -> std::int32_t { return get_method(n)->call(); }
+        auto ret_float_as_double(const char* n) -> double { return get_method(n)->call(); }
+        auto ret_byte_as_float(const char* n) -> float { return get_method(n)->call(); }
+        auto ret_byte_as_double(const char* n) -> double { return get_method(n)->call(); }
+        auto ret_short_as_float(const char* n) -> float { return get_method(n)->call(); }
+        auto ret_short_as_double(const char* n) -> double { return get_method(n)->call(); }
+        auto ret_char_as_double(const char* n) -> double { return get_method(n)->call(); }
+        auto ret_int_as_double(const char* n) -> double { return get_method(n)->call(); }
+        auto ret_long_as_float(const char* n) -> float { return get_method(n)->call(); }
+        // (I)J widen ARG path: an int arg read back as a long RETURN — the long twin
+        // of call_int_to_float, proving an int ARG and a J RETURN coexist and the int
+        // arrived SIGN-extended into the 64-bit result.
+        auto call_int_to_long(const char* n, std::int32_t a) -> std::int64_t { return get_method(n)->call(a); }
 
         // value_t introspection probes (instance)
         auto is_void(const char* n) -> bool   { return get_method(n)->call().is_void(); }
@@ -147,7 +168,13 @@ namespace
         static auto scall_double(const char* n) -> double    { return static_method(n)->call(); }
         static auto scall_int_arg(const char* n, std::int32_t a) -> std::int32_t { return static_method(n)->call(a); }
         static auto scall_int_to_float(const char* n, std::int32_t a) -> float { return static_method(n)->call(a); }
+        static auto scall_int_to_long(const char* n, std::int32_t a) -> std::int64_t { return static_method(n)->call(a); }
         static auto svoid(const char* n) -> bool { return static_method(n)->call().is_void(); }
+        // static value_t introspection probes — is_void()/is_string() on a STATIC
+        // primitive return must both be false (the static dispatch slot still yields
+        // a populated, non-void, non-string value_t).
+        static auto sis_void(const char* n) -> bool   { return static_method(n)->call().is_void(); }
+        static auto sis_string(const char* n) -> bool { return static_method(n)->call().is_string(); }
 
         // -- narrow-primitive ARGUMENT echoes (static; CallStatic<T>MethodA) --
         static auto secho_bool(bool a) -> bool                  { return static_method("sEchoBool", "(Z)Z")->call(a); }
@@ -527,6 +554,71 @@ namespace
     std::atomic<std::uint32_t> g_arg_int_to_float_stat{ 0 };
     std::atomic<bool>          g_arg_int_to_float_captured{ false };
 
+    // ---- batch-18 deepening: additional captures ----
+    // bool false converted to int via value_t must be 0 (the twin of the existing
+    // bool-true->1 probe; together they pin both phases of the Z conversion).
+    std::atomic<int> g_bool_false_to_int{ -1 };
+    // value_t conversion breadth — additional same-value_t -> different-target reads
+    // that the existing block does not cover.
+    std::atomic<std::int64_t> g_byte_max_as_i64{ k_uncaptured };    // B 127 -> int64 127
+    std::atomic<std::int64_t> g_byte_zero_as_i64{ k_uncaptured };   // B 0 -> int64 0
+    std::atomic<std::int64_t> g_char_zero_as_i64{ k_uncaptured };   // C 0 -> int64 0
+    std::atomic<std::int64_t> g_char_highbit_as_i64{ k_uncaptured };// C 0x8000 -> int64 32768 (zero-ext)
+    std::atomic<std::int64_t> g_short_max_as_i64{ k_uncaptured };   // S 32767 -> int64 32767
+    std::atomic<std::int64_t> g_int_min_as_i64{ k_uncaptured };     // I MIN -> int64 -2147483648
+    std::atomic<std::int64_t> g_int_pattern_as_i64{ k_uncaptured }; // I 0x12345678 -> int64 305419896
+    std::atomic<std::int64_t> g_long_min_as_i64{ k_uncaptured };    // J MIN -> int64 identity
+    std::atomic<std::int64_t> g_long_altneg_as_i64{ k_uncaptured }; // J 0xAAAA..A -> int64 identity
+    // CROSS-KIND truncation on the OTHER float/double target widths:
+    // float return -> int64 target, double return -> int32 target, with non-trivial
+    // six/seven-digit magnitudes so the truncation keeps the full integer part.
+    std::atomic<std::int64_t> g_float_bigwhole_as_i64{ k_uncaptured };    // F 1000000.5 -> 1000000
+    std::atomic<std::int64_t> g_float_negbigwhole_as_i64{ k_uncaptured }; // F -1000000.5 -> -1000000
+    std::atomic<int>          g_double_bigwhole_as_i32{ -2 };             // D 1234567.5 -> 1234567
+    std::atomic<int>          g_double_negbigwhole_as_i32{ -2 };          // D -1234567.5 -> -1234567
+    // integral return -> wider FLOATING target, captured as raw bits so the EXACT
+    // value is asserted (these magnitudes are all exactly representable).
+    std::atomic<std::uint32_t> g_byte_negone_as_float{ 0 };   // B -1 -> -1.0f
+    std::atomic<std::uint32_t> g_short_min_as_float{ 0 };     // S -32768 -> -32768.0f
+    std::atomic<std::uint32_t> g_int_pow24_as_float{ 0 };     // I 2^24 -> 16777216.0f
+    std::atomic<std::uint32_t> g_long_negone_as_float{ 0 };   // J -1 -> -1.0f
+    std::atomic<std::uint64_t> g_byte_negone_as_double{ 0 };  // B -1 -> -1.0
+    std::atomic<std::uint64_t> g_char_max_as_double{ 0 };     // C 65535 -> 65535.0
+    std::atomic<std::uint64_t> g_short_min_as_double{ 0 };    // S -32768 -> -32768.0
+    std::atomic<std::uint64_t> g_int_max_as_double{ 0 };      // I 2147483647 -> 2147483647.0
+    std::atomic<std::uint64_t> g_long_pow40_as_double{ 0 };   // J 2^40 -> 1099511627776.0
+    std::atomic<std::uint64_t> g_float_max_as_double{ 0 };    // F FLT_MAX -> exact double widen
+    std::atomic<bool>          g_conv18_captured{ false };
+    // is_void()/is_string() must be false across EVERY non-void primitive return
+    // kind (instance), not just int — float/double/long/char/byte/short/bool.
+    std::atomic<int> g_float_is_void{ -1 };
+    std::atomic<int> g_double_is_void{ -1 };
+    std::atomic<int> g_long_is_void{ -1 };
+    std::atomic<int> g_char_is_void{ -1 };
+    std::atomic<int> g_byte_is_void{ -1 };
+    std::atomic<int> g_short_is_void{ -1 };
+    std::atomic<int> g_bool_is_void{ -1 };
+    std::atomic<int> g_float_is_string{ -1 };
+    std::atomic<int> g_long_is_string{ -1 };
+    // static-return introspection: is_void()/is_string() false on a STATIC int return.
+    std::atomic<int> g_sint_is_void{ -1 };
+    std::atomic<int> g_sint_is_string{ -1 };
+    std::atomic<int> g_svoid_int_is_void{ -1 };  // is_void() true on a STATIC void return
+    // (I)J widen ARG -> long RETURN coexistence: int arg sign-extends into the long.
+    std::atomic<std::int64_t> g_arg_int_to_long_negone_inst{ k_uncaptured };  // -1 -> -1
+    std::atomic<std::int64_t> g_arg_int_to_long_max_inst{ k_uncaptured };     // INT_MAX -> 2147483647
+    std::atomic<std::int64_t> g_arg_int_to_long_min_inst{ k_uncaptured };     // INT_MIN -> -2147483648
+    std::atomic<std::int64_t> g_arg_int_to_long_negone_stat{ k_uncaptured };  // -1 -> -1 (static)
+    std::atomic<bool>         g_arg_int_to_long_captured{ false };
+    // additional POSITIVE-boundary narrow ARG widen probes (the existing block
+    // leans on negative/sign-bit cases; these prove the positive boundaries arrive
+    // intact through the .i slot): byte 0 / byte MAX / short 0 / short MAX / char 'A'.
+    std::atomic<std::int64_t> g_arg_byte_widen_zero{ k_uncaptured };   // 0 -> 0
+    std::atomic<std::int64_t> g_arg_byte_widen_max{ k_uncaptured };    // 127 -> 127
+    std::atomic<std::int64_t> g_arg_short_widen_zero{ k_uncaptured };  // 0 -> 0
+    std::atomic<std::int64_t> g_arg_short_widen_max{ k_uncaptured };   // 32767 -> 32767
+    std::atomic<std::int64_t> g_arg_char_widen_a{ k_uncaptured };      // 'A' -> 65
+
     auto run_all_calls(const std::unique_ptr<method_primitives>& self) -> void
     {
         if (!self)
@@ -883,6 +975,76 @@ namespace
         g_arg_int_to_float_inst.store(f2bits(s.call_int_to_float("intToFloat", 16777216)));
         g_arg_int_to_float_stat.store(f2bits(method_primitives::scall_int_to_float("sIntToFloat", 16777216)));
         g_arg_int_to_float_captured.store(true);
+
+        // ================================================================
+        //  batch-18 deepening captures
+        // ================================================================
+        // bool false -> int 0 (twin of the bool-true->1 probe above).
+        {
+            const std::int32_t btoi = s.get_method("retBoolFalse")->call();
+            g_bool_false_to_int.store(btoi);
+        }
+
+        // value_t conversion breadth — more same-value_t -> int64 reads.
+        g_byte_max_as_i64.store(s.ret_as_i64("retByteMax"));            // 127
+        g_byte_zero_as_i64.store(s.ret_as_i64("retByteZero"));          // 0
+        g_char_zero_as_i64.store(s.ret_as_i64("retCharZero"));          // 0
+        g_char_highbit_as_i64.store(s.ret_as_i64("retCharHighBit"));    // 32768 (zero-ext)
+        g_short_max_as_i64.store(s.ret_as_i64("retShortMax"));          // 32767
+        g_int_min_as_i64.store(s.ret_as_i64("retIntMin"));              // -2147483648
+        g_int_pattern_as_i64.store(s.ret_as_i64("retIntPattern"));      // 305419896
+        g_long_min_as_i64.store(s.ret_as_i64("retLongMin"));            // identity
+        g_long_altneg_as_i64.store(s.ret_as_i64("retLongAltNeg"));      // identity
+
+        // CROSS-KIND truncation on the OTHER float/double target widths:
+        // float -> int64 and double -> int32, with six/seven-digit magnitudes.
+        g_float_bigwhole_as_i64.store(s.ret_float_as_i64("retFloatBigWhole"));        // 1000000
+        g_float_negbigwhole_as_i64.store(s.ret_float_as_i64("retFloatNegBigWhole"));  // -1000000
+        g_double_bigwhole_as_i32.store(s.ret_double_as_i32("retDoubleBigWhole"));     // 1234567
+        g_double_negbigwhole_as_i32.store(s.ret_double_as_i32("retDoubleNegBigWhole"));// -1234567
+
+        // integral / float return -> wider FLOATING target (raw bits -> exact value).
+        g_byte_negone_as_float.store(f2bits(s.ret_byte_as_float("retByteNegOne")));   // -1.0f
+        g_short_min_as_float.store(f2bits(s.ret_short_as_float("retShortMin")));      // -32768.0f
+        g_int_pow24_as_float.store(f2bits(s.ret_int_as_float("retIntPow2to24")));     // 16777216.0f
+        g_long_negone_as_float.store(f2bits(s.ret_long_as_float("retLongNegOne")));   // -1.0f
+        g_byte_negone_as_double.store(d2bits(s.ret_byte_as_double("retByteNegOne"))); // -1.0
+        g_char_max_as_double.store(d2bits(s.ret_char_as_double("retCharMax")));       // 65535.0
+        g_short_min_as_double.store(d2bits(s.ret_short_as_double("retShortMin")));    // -32768.0
+        g_int_max_as_double.store(d2bits(s.ret_int_as_double("retIntMax")));          // 2147483647.0
+        g_long_pow40_as_double.store(d2bits(s.ret_long_as_double("retLongPow2to40")));// 1099511627776.0
+        g_float_max_as_double.store(d2bits(s.ret_float_as_double("retFloatMax")));    // exact widen
+        g_conv18_captured.store(true);
+
+        // is_void()/is_string() must be false across every non-void primitive kind.
+        g_float_is_void.store(s.is_void("retFloatHalf") ? 1 : 0);
+        g_double_is_void.store(s.is_void("retDoublePi") ? 1 : 0);
+        g_long_is_void.store(s.is_void("retLongMax") ? 1 : 0);
+        g_char_is_void.store(s.is_void("retCharA") ? 1 : 0);
+        g_byte_is_void.store(s.is_void("retByteMax") ? 1 : 0);
+        g_short_is_void.store(s.is_void("retShortMax") ? 1 : 0);
+        g_bool_is_void.store(s.is_void("retBoolTrue") ? 1 : 0);
+        g_float_is_string.store(s.is_string("retFloatHalf") ? 1 : 0);
+        g_long_is_string.store(s.is_string("retLongMax") ? 1 : 0);
+        // static-return introspection.
+        g_sint_is_void.store(method_primitives::sis_void("sRetIntFortyTwo") ? 1 : 0);
+        g_sint_is_string.store(method_primitives::sis_string("sRetIntFortyTwo") ? 1 : 0);
+        g_svoid_int_is_void.store(method_primitives::svoid("sRetVoidBump") ? 1 : 0);
+
+        // (I)J widen ARG -> long RETURN: int arg sign-extends into the 64-bit result.
+        g_arg_int_to_long_negone_inst.store(s.call_int_to_long("intToLong", -1));                            // -1
+        g_arg_int_to_long_max_inst.store(s.call_int_to_long("intToLong", std::numeric_limits<std::int32_t>::max())); // 2147483647
+        g_arg_int_to_long_min_inst.store(s.call_int_to_long("intToLong", std::numeric_limits<std::int32_t>::min())); // -2147483648
+        g_arg_int_to_long_negone_stat.store(method_primitives::scall_int_to_long("sIntToLong", -1));         // -1
+        g_arg_int_to_long_captured.store(true);
+
+        // POSITIVE-boundary narrow ARG widen probes (the .i slot delivers the
+        // positive boundaries intact, complementing the negative/sign-bit cases).
+        g_arg_byte_widen_zero.store(s.byte_to_int(static_cast<std::int8_t>(0)));                            // 0
+        g_arg_byte_widen_max.store(s.byte_to_int(std::numeric_limits<std::int8_t>::max()));                 // 127
+        g_arg_short_widen_zero.store(s.short_to_int(static_cast<std::int16_t>(0)));                         // 0
+        g_arg_short_widen_max.store(s.short_pos_to_int(std::numeric_limits<std::int16_t>::max()));          // 32767
+        g_arg_char_widen_a.store(s.char_to_int(static_cast<std::uint16_t>('A')));                           // 65
     }
 }
 
@@ -1347,9 +1509,14 @@ namespace
         // =====================================================================
         ctx.check("mcp_void_instance_is_void", g_void_inst_is_void.load() == 1);
         ctx.check("mcp_void_static_is_void", g_void_stat_is_void.load() == 1);
-        // void side effects: instance bump once, static bump once.
+        // void side effects: the instance void is bumped once; the STATIC void
+        // (sRetVoidBump) is invoked by BOTH svoid("sRetVoidBump") probes
+        // (g_void_stat_is_void + g_svoid_int_is_void), so its counter equals the
+        // number of those call sites, not 1.  The invariant under test is that a void
+        // call actually RUNS the method body (a real side effect) -> assert >= 1 for the
+        // static rather than an incidental exact count.
         ctx.check("mcp_void_instance_side_effect", method_primitives::get_void_instance_hits() == 1);
-        ctx.check("mcp_void_static_side_effect", method_primitives::get_void_static_hits() == 1);
+        ctx.check("mcp_void_static_side_effect", method_primitives::get_void_static_hits() >= 1);
         // A numeric (int) return must NOT be reported as void or string.
         ctx.check("mcp_int_return_is_not_void", g_int_is_void.load() == 0);
         ctx.check("mcp_int_return_is_not_string", g_int_is_string.load() == 0);
@@ -1399,6 +1566,91 @@ namespace
                   bits2f(g_arg_int_to_float_inst.load()) == 16777216.0f);
         ctx.check("mcp_arg_int_to_float_static",
                   bits2f(g_arg_int_to_float_stat.load()) == 16777216.0f);
+
+        // =====================================================================
+        //  BATCH-18 DEEPENING
+        // =====================================================================
+        // bool false -> int 0 (twin of the bool-true->1 conversion already checked).
+        ctx.check("mcp_bool_false_to_int_is_0", g_bool_false_to_int.load() == 0);
+
+        // ---- value_t conversion breadth: more same-value_t -> int64 reads ----
+        // POSITIVE byte/short boundaries widen WITHOUT sign artifacts; char high bit
+        // and char zero zero-extend; int MIN / int distinct-byte pattern widen with
+        // sign and byte order intact; long MIN / long 0xAAAA..A read as identity.
+        ctx.check("mcp_conv_byte_max_to_i64_127", g_byte_max_as_i64.load() == 127LL);
+        ctx.check("mcp_conv_byte_zero_to_i64_0", g_byte_zero_as_i64.load() == 0LL);
+        ctx.check("mcp_conv_char_zero_to_i64_0", g_char_zero_as_i64.load() == 0LL);
+        ctx.check("mcp_conv_char_highbit_to_i64_zero_extends_32768", g_char_highbit_as_i64.load() == 32768LL);
+        ctx.check("mcp_conv_short_max_to_i64_32767", g_short_max_as_i64.load() == 32767LL);
+        ctx.check("mcp_conv_int_min_to_i64_neg2147483648", g_int_min_as_i64.load() == -2147483648LL);
+        ctx.check("mcp_conv_int_pattern_to_i64_305419896", g_int_pattern_as_i64.load() == 0x12345678LL);
+        ctx.check("mcp_conv_long_min_to_i64_identity",
+                  g_long_min_as_i64.load() == std::numeric_limits<std::int64_t>::min());
+        ctx.check("mcp_conv_long_altneg_to_i64_identity",
+                  g_long_altneg_as_i64.load() == static_cast<std::int64_t>(0xAAAAAAAAAAAAAAAAULL));
+
+        // ---- cross-kind truncation on the OTHER fp target widths ----
+        // float return -> int64 target truncates toward zero, keeping the full
+        // six-digit magnitude (1000000.5 -> 1000000, not 0 or 1000001 or a low digit).
+        ctx.check("mcp_conv_float_bigwhole_to_i64_truncates_1000000", g_float_bigwhole_as_i64.load() == 1000000LL);
+        ctx.check("mcp_conv_float_negbigwhole_to_i64_truncates_neg1000000", g_float_negbigwhole_as_i64.load() == -1000000LL);
+        // double return -> int32 target truncates toward zero, keeping the full
+        // seven-digit magnitude (1234567.5 -> 1234567).
+        ctx.check("mcp_conv_double_bigwhole_to_i32_truncates_1234567", g_double_bigwhole_as_i32.load() == 1234567);
+        ctx.check("mcp_conv_double_negbigwhole_to_i32_truncates_neg1234567", g_double_negbigwhole_as_i32.load() == -1234567);
+
+        // ---- integral / float return -> wider FLOATING target (exact magnitudes) ----
+        // Each captured as RAW bits, so the assertion pins the EXACT representable
+        // value (not just "nonzero"); a wrong static_cast leg would change the bits.
+        ctx.check("mcp_conv18_captured", g_conv18_captured.load());
+        ctx.check("mcp_conv_byte_negone_to_float_neg1", bits2f(g_byte_negone_as_float.load()) == -1.0f);
+        ctx.check("mcp_conv_short_min_to_float_neg32768", bits2f(g_short_min_as_float.load()) == -32768.0f);
+        ctx.check("mcp_conv_int_pow24_to_float_exact", bits2f(g_int_pow24_as_float.load()) == 16777216.0f);
+        ctx.check("mcp_conv_long_negone_to_float_neg1", bits2f(g_long_negone_as_float.load()) == -1.0f);
+        ctx.check("mcp_conv_byte_negone_to_double_neg1", bits2d(g_byte_negone_as_double.load()) == -1.0);
+        ctx.check("mcp_conv_char_max_to_double_65535", bits2d(g_char_max_as_double.load()) == 65535.0);
+        ctx.check("mcp_conv_short_min_to_double_neg32768", bits2d(g_short_min_as_double.load()) == -32768.0);
+        ctx.check("mcp_conv_int_max_to_double_exact", bits2d(g_int_max_as_double.load()) == 2147483647.0);
+        ctx.check("mcp_conv_long_pow40_to_double_exact", bits2d(g_long_pow40_as_double.load()) == 1099511627776.0);
+        // FLT_MAX widens to double LOSSLESSLY and equals the same value promoted in C++.
+        ctx.check("mcp_conv_float_max_to_double_exact",
+                  bits2d(g_float_max_as_double.load()) == static_cast<double>(std::numeric_limits<float>::max()));
+
+        // ---- is_void()/is_string() false across EVERY non-void primitive kind ----
+        // A populated primitive value_t is neither void nor string regardless of the
+        // stored alternative; only a true void return (monostate) is is_void().
+        ctx.check("mcp_float_return_is_not_void",  g_float_is_void.load()  == 0);
+        ctx.check("mcp_double_return_is_not_void", g_double_is_void.load() == 0);
+        ctx.check("mcp_long_return_is_not_void",   g_long_is_void.load()   == 0);
+        ctx.check("mcp_char_return_is_not_void",   g_char_is_void.load()   == 0);
+        ctx.check("mcp_byte_return_is_not_void",   g_byte_is_void.load()   == 0);
+        ctx.check("mcp_short_return_is_not_void",  g_short_is_void.load()  == 0);
+        ctx.check("mcp_bool_return_is_not_void",   g_bool_is_void.load()   == 0);
+        ctx.check("mcp_float_return_is_not_string", g_float_is_string.load() == 0);
+        ctx.check("mcp_long_return_is_not_string",  g_long_is_string.load()  == 0);
+        // static-return introspection: a STATIC int return is non-void/non-string,
+        // and a STATIC void return IS void.
+        ctx.check("mcp_static_int_return_is_not_void",   g_sint_is_void.load()   == 0);
+        ctx.check("mcp_static_int_return_is_not_string", g_sint_is_string.load() == 0);
+        ctx.check("mcp_static_void_return_is_void",      g_svoid_int_is_void.load() == 1);
+
+        // ---- (I)J widen ARG -> long RETURN coexistence ----
+        // The int arg arrives SIGN-extended into the 64-bit result: -1 -> -1 (never
+        // 4294967295), INT_MAX/INT_MIN widen to their exact 64-bit values.
+        ctx.check("mcp_arg_int_to_long_captured", g_arg_int_to_long_captured.load());
+        ctx.check("mcp_arg_int_to_long_negone_instance", g_arg_int_to_long_negone_inst.load() == -1LL);
+        ctx.check("mcp_arg_int_to_long_max_instance", g_arg_int_to_long_max_inst.load() == 2147483647LL);
+        ctx.check("mcp_arg_int_to_long_min_instance", g_arg_int_to_long_min_inst.load() == -2147483648LL);
+        ctx.check("mcp_arg_int_to_long_negone_static", g_arg_int_to_long_negone_stat.load() == -1LL);
+
+        // ---- POSITIVE-boundary narrow ARG widen probes ----
+        // The .i slot delivers positive byte/short/char boundaries intact, the
+        // positive twin of the negative/sign-bit widen probes above.
+        ctx.check("mcp_arg_byte_widen_zero", g_arg_byte_widen_zero.load() == 0);
+        ctx.check("mcp_arg_byte_widen_max_127", g_arg_byte_widen_max.load() == 127);
+        ctx.check("mcp_arg_short_widen_zero", g_arg_short_widen_zero.load() == 0);
+        ctx.check("mcp_arg_short_widen_max_32767", g_arg_short_widen_max.load() == 32767);
+        ctx.check("mcp_arg_char_widen_A_65", g_arg_char_widen_a.load() == 65);
         }
     }
 }

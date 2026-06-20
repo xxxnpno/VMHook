@@ -48,6 +48,9 @@ public final class FieldInherited extends FieldInheritedMid
      *   3 = mutate inherited + shadowed STATIC slots via putstatic
      *   4 = mutate the child's NARROW (byte) + WIDE (long) shadow slots via
      *       putfield (proves child-wins shadowing for non-int widths)
+     *   5 = mutate the child's CHAR (unsigned 16-bit) + SHORT (signed 16-bit)
+     *       shadow slots via putfield (proves child-wins shadowing for the two
+     *       16-bit widths and that the hidden Base copies stay untouched)
      */
     public static volatile int mode;
 
@@ -68,6 +71,16 @@ public final class FieldInherited extends FieldInheritedMid
     public static final byte CHILD_SHADOW_BYTE  = (byte) 0x77;  // child shadowedByte
     public static final long BASE_SHADOW_LONG   = 0x00BA5EL;    // == Base.shadowedLong
     public static final long CHILD_SHADOW_LONG  = 0x7CC1D7CC1DL;// child shadowedLong
+
+    // CHAR / SHORT shadow sentinels — far apart from the Base copies so a
+    // misdirected read can never be a near-miss.  char is UNSIGNED 16-bit, so the
+    // child sentinel deliberately has its top bit set (0xC1D7 -> 49623, never -1).
+    public static final char  BASE_SHADOW_CHAR   = (char)  0x00B5;  // == Base.shadowedChar
+    public static final char  CHILD_SHADOW_CHAR  = (char)  0xC1D7;  // child shadowedChar (49623)
+    public static final short BASE_SHADOW_SHORT  = (short) 0x0BA5;  // == Base.shadowedShort
+    public static final short CHILD_SHADOW_SHORT = (short) 0x7CC1;  // child shadowedShort (31937)
+    public static final char  CHILD_SHADOW_CHAR_RUNTIME  = (char)  0xFACE; // mode 5 char write
+    public static final short CHILD_SHADOW_SHORT_RUNTIME = (short) 0x5EED; // mode 5 short write
 
     public static final int  STATIC_SHADOW_BASE    = 555;       // == Base.sShadow
     public static final int  STATIC_SHADOW_CHILD   = 777;       // child sShadow
@@ -96,6 +109,8 @@ public final class FieldInherited extends FieldInheritedMid
     public String shadowedStr = "child";
     public byte   shadowedByte = CHILD_SHADOW_BYTE;   // narrow shadow
     public long   shadowedLong = CHILD_SHADOW_LONG;   // wide shadow
+    public char   shadowedChar  = CHILD_SHADOW_CHAR;  // unsigned 16-bit shadow
+    public short  shadowedShort = CHILD_SHADOW_SHORT; // signed 16-bit shadow
 
     // ---- Child shadows a grandparent STATIC of the same name ----------------
     public static int sShadow = STATIC_SHADOW_CHILD;
@@ -121,7 +136,8 @@ public final class FieldInherited extends FieldInheritedMid
     public long childShadowSum()
     {
         return this.shadowedInt + this.shadowedByte + this.shadowedLong
-             + (long) this.shadowedStr.length();
+             + (long) this.shadowedStr.length()
+             + this.shadowedChar + this.shadowedShort;
     }
 
     // ---- Runtime mutators driven by the probe via real bytecode ------------
@@ -172,6 +188,19 @@ public final class FieldInherited extends FieldInheritedMid
         this.shadowedLong = CHILD_SHADOW_LONG_RUNTIME;
     }
 
+    /**
+     * mode 5: write the child's CHAR (unsigned 16-bit) and SHORT (signed 16-bit)
+     * shadow slots via putfield.  The hidden Base copies of the same names are
+     * NOT written, so a base-typed read-back must still see the Base init values
+     * — proving child-wins shadowing for the two 16-bit widths and that the
+     * slots are physically distinct.
+     */
+    public void mutateShadowChars()
+    {
+        this.shadowedChar  = CHILD_SHADOW_CHAR_RUNTIME;
+        this.shadowedShort = CHILD_SHADOW_SHORT_RUNTIME;
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -198,6 +227,9 @@ public final class FieldInherited extends FieldInheritedMid
                         break;
                     case 4:
                         FieldInherited.instance.mutateShadowWidths();
+                        break;
+                    case 5:
+                        FieldInherited.instance.mutateShadowChars();
                         break;
                     default:
                         break;

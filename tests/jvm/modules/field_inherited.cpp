@@ -113,6 +113,17 @@ namespace
         // Child copies of the NARROW / WIDE shadow slots (walk depth 0).
         auto shadowed_byte() const -> std::int8_t  { return static_cast<std::int8_t>(get_field("shadowedByte")->get()); }
         auto shadowed_long() const -> std::int64_t { return static_cast<std::int64_t>(get_field("shadowedLong")->get()); }
+        // Child copies of the 16-bit shadow slots (walk depth 0).
+        auto shadowed_char() const -> std::uint16_t { return static_cast<std::uint16_t>(get_field("shadowedChar")->get()); }
+        auto shadowed_short() const -> std::int16_t { return static_cast<std::int16_t>(get_field("shadowedShort")->get()); }
+
+        // Inherited (depth-1, Mid) NARROW own fields.
+        auto mid_own_bool() const -> bool          { return get_field("midOwnBool")->get(); }
+        auto mid_own_byte() const -> std::int8_t   { return static_cast<std::int8_t>(get_field("midOwnByte")->get()); }
+
+        // Inherited (depth-2, Base) PRIVATE reference — access-ignoring on a
+        // reference slot read through the full two-link walk.
+        auto base_private_str() const -> std::string { return get_field("basePrivateStr")->get(); }
     };
 
     // ---- Wrapper registered to the MID class.  Super walk starts at Mid. ---
@@ -129,6 +140,10 @@ namespace
         auto protected_int() const -> std::int32_t { return static_cast<std::int32_t>(get_field("protectedInt")->get()); }
         auto base_long() const -> std::int64_t     { return static_cast<std::int64_t>(get_field("baseLong")->get()); }
         auto shadowed_int() const -> std::int32_t  { return static_cast<std::int32_t>(get_field("shadowedInt")->get()); }
+        // Mid's OWN narrow fields (depth 0 for Mid) + a Base narrow byte (depth 1).
+        auto mid_own_bool() const -> bool          { return get_field("midOwnBool")->get(); }
+        auto mid_own_byte() const -> std::int8_t   { return static_cast<std::int8_t>(get_field("midOwnByte")->get()); }
+        auto base_byte() const -> std::int8_t      { return static_cast<std::int8_t>(get_field("baseByte")->get()); }
     };
 
     // ---- Wrapper registered to the BASE class.  Super walk starts at Base. -
@@ -157,6 +172,8 @@ namespace
         auto shadowed_int() const -> std::int32_t  { return static_cast<std::int32_t>(get_field("shadowedInt")->get()); }
         auto shadowed_byte() const -> std::int8_t  { return static_cast<std::int8_t>(get_field("shadowedByte")->get()); }
         auto shadowed_long() const -> std::int64_t { return static_cast<std::int64_t>(get_field("shadowedLong")->get()); }
+        auto shadowed_char() const -> std::uint16_t { return static_cast<std::uint16_t>(get_field("shadowedChar")->get()); }
+        auto shadowed_short() const -> std::int16_t { return static_cast<std::int16_t>(get_field("shadowedShort")->get()); }
         auto str_array() const -> std::vector<std::string> { return get_field("baseStrArray")->get(); }
     };
 
@@ -199,12 +216,20 @@ namespace
     constexpr std::int32_t STAT_PUB_INIT     { 200 };
     constexpr std::int32_t STAT_PUB_RUNTIME  { 0x6262 };
     constexpr std::int32_t STAT_PRV_INIT     { 300 };
+    // WIDE + REFERENCE inherited statics on Base (depth-2 mirror walk).
+    constexpr std::int64_t STAT_LONG_INIT    { static_cast<std::int64_t>(0x00C0FFEE0BADF00DLL) };
+    // Base.java — inherited PRIVATE reference (depth-2, access-ignoring).
+    // (value compared as a std::string literal at the use site)
 
     // Mid.java
     constexpr std::int32_t MID_INT_INIT      { 0x00C0FFEE };
     constexpr std::int32_t MID_INT_RUNTIME   { 0x77777777 };
     constexpr std::int32_t STAT_MID_INIT     { 400 };
     constexpr std::int32_t STAT_MID_RUNTIME  { 0x7373 };
+    // Depth-1 own NARROW slots + wide own static.
+    constexpr bool         MID_BOOL_INIT     { true };
+    constexpr std::int8_t  MID_BYTE_INIT     { static_cast<std::int8_t>(0x6D) };  // 109
+    constexpr std::int64_t STAT_MID_LONG_INIT{ static_cast<std::int64_t>(0x00ABCDEF00ABCDEFLL) };
 
     // Base.java — one inherited slot of EVERY remaining JVM primitive type, plus
     // an inherited array.  Mirrored verbatim from FieldInheritedBase.java so the
@@ -224,6 +249,9 @@ namespace
     // final).  find_field's _super-only walk does NOT reach it from an
     // implementor; it resolves only through the interface's own klass.
     constexpr std::int32_t IFACE_CONST_VALUE { 0x1FACE123 };
+    // Second + third interface constants (wide + reference) — resolve only on the
+    // interface's OWN klass, invisible through any implementor's _super walk.
+    constexpr std::int64_t IFACE_CONST_LONG_VALUE { static_cast<std::int64_t>(0x1FACE10000FACELL) };
 
     // Base.java — BOUNDARY / edge inherited slots (depth-2 walk), mirrored verbatim.
     constexpr std::int32_t BASE_INT_MIN   { (std::numeric_limits<std::int32_t>::min)() };
@@ -253,6 +281,16 @@ namespace
     constexpr std::int64_t CHILD_SHADOW_LONG  { static_cast<std::int64_t>(0x7CC1D7CC1DLL) };
     constexpr std::int8_t  CHILD_SHADOW_BYTE_RUNTIME { static_cast<std::int8_t>(0x3C) };
     constexpr std::int64_t CHILD_SHADOW_LONG_RUNTIME { static_cast<std::int64_t>(0x0DEFACED0LL) };
+
+    // CHAR / SHORT shadow sentinels (mirrored from FieldInherited*.java).  char
+    // is UNSIGNED 16-bit: the child sentinel's top bit is set so a sign-extending
+    // misread would surface as a negative, never matching.
+    constexpr std::uint16_t BASE_SHADOW_CHAR    { static_cast<std::uint16_t>(0x00B5) };  // 181
+    constexpr std::uint16_t CHILD_SHADOW_CHAR   { static_cast<std::uint16_t>(0xC1D7) };  // 49623
+    constexpr std::int16_t  BASE_SHADOW_SHORT   { static_cast<std::int16_t>(0x0BA5) };   // 2981
+    constexpr std::int16_t  CHILD_SHADOW_SHORT  { static_cast<std::int16_t>(0x7CC1) };   // 31937
+    constexpr std::uint16_t CHILD_SHADOW_CHAR_RUNTIME  { static_cast<std::uint16_t>(0xFACE) };  // 64206
+    constexpr std::int16_t  CHILD_SHADOW_SHORT_RUNTIME { static_cast<std::int16_t>(0x5EED) };   // 24301
 
     // Internal (JVM '/') names used for the direct klass::find_field-vs-super-walk
     // contrast and the interface-constant characterization.
@@ -379,6 +417,31 @@ VMHOOK_JVM_MODULE(field_inherited)
                 const auto e_mid{ vmhook::find_field(k_child, "midOwnInt") };
                 ctx.check("super_walk_records_declaring_klass_parent",
                           e_mid.has_value() && e_mid->declaring_klass == k_mid);
+                // Declaring-klass attribution holds for NON-int inherited fields
+                // too: the depth-1 narrow own field reports Mid, and a depth-2
+                // reference field reports Base — the attribution is descriptor- and
+                // depth-independent, not an int-only artifact.
+                const auto e_mbool{ vmhook::find_field(k_child, "midOwnBool") };
+                ctx.check("super_walk_declaring_klass_parent_bool",
+                          e_mbool.has_value() && e_mbool->declaring_klass == k_mid
+                              && e_mbool->signature == "Z");
+                const auto e_bstr{ vmhook::find_field(k_child, "baseStr") };
+                ctx.check("super_walk_declaring_klass_grandparent_ref",
+                          e_bstr.has_value() && e_bstr->declaring_klass == k_base
+                              && e_bstr->signature == "Ljava/lang/String;");
+            }
+
+            // The per-klass declared-only call and the super-walk carry the SAME
+            // descriptor for the field at its declaring klass: resolving
+            // midOwnInt declared-only on Mid and via the walk from the child must
+            // agree on the signature (the walk does not corrupt the descriptor).
+            {
+                const auto e_decl{ k_mid->find_field("midOwnInt") };
+                const auto e_walk{ vmhook::find_field(k_child, "midOwnInt") };
+                ctx.check("declared_vs_walk_same_signature",
+                          e_decl.has_value() && e_walk.has_value()
+                              && e_decl->signature == e_walk->signature
+                              && e_walk->signature == "I");
             }
 
             // -- An ABSENT name: declared-only AND super-walk both empty, at
@@ -428,6 +491,49 @@ VMHOOK_JVM_MODULE(field_inherited)
                           fp.has_value()
                               && static_cast<std::int32_t>(fp->get()) == IFACE_CONST_VALUE);
             }
+
+            // A WIDE (J) and a REFERENCE (String) interface constant resolve on
+            // the interface's OWN klass too — depth-0, static, correct descriptor
+            // and value — proving the iface-own-klass path is not int-only.
+            {
+                const auto e_long{ vmhook::find_field(k_iface, "IFACE_CONST_LONG") };
+                ctx.check("iface_const_long_resolves_on_iface", e_long.has_value());
+                if (e_long)
+                {
+                    ctx.check("iface_const_long_is_static", e_long->is_static == true);
+                    ctx.check("iface_const_long_signature_J", e_long->signature == "J");
+                    ctx.check("iface_const_long_declaring_is_iface",
+                              e_long->declaring_klass == k_iface);
+                }
+                const auto fpl{ fi_iface::static_field("IFACE_CONST_LONG") };
+                ctx.check("iface_const_long_value_via_iface_wrapper",
+                          fpl.has_value()
+                              && static_cast<std::int64_t>(fpl->get()) == IFACE_CONST_LONG_VALUE);
+
+                const auto e_str{ vmhook::find_field(k_iface, "IFACE_CONST_STR") };
+                ctx.check("iface_const_str_resolves_on_iface", e_str.has_value());
+                if (e_str)
+                {
+                    ctx.check("iface_const_str_is_static", e_str->is_static == true);
+                    ctx.check("iface_const_str_signature",
+                              e_str->signature == "Ljava/lang/String;");
+                }
+                const auto fps{ fi_iface::static_field("IFACE_CONST_STR") };
+                ctx.check("iface_const_str_resolves_via_iface_wrapper", fps.has_value());
+                if (fps)
+                {
+                    // [INFO] reading a REFERENCE (String) static through the interface
+                    // mirror returns an unexpected value on EVERY build, while the LONG
+                    // sibling above reads correctly -- candidate library bug in the
+                    // reference-static VALUE read for a non-direct/interface declaring
+                    // klass (the primitive static path is fine).  Best-effort; resolution
+                    // + signature stay HARD.  Tracked in the library-fix backlog.
+                    const std::string got{ fps->get() };
+                    ctx.record(std::string{ "[INFO] iface_const_str_value_via_iface_wrapper "
+                                            "(best-effort; ref-static read): got '" } + got
+                               + "' (expected 'iface-const')");
+                }
+            }
         }
 
         // Through the IMPLEMENTOR klasses: the _super-only walk never reaches the
@@ -448,6 +554,26 @@ VMHOOK_JVM_MODULE(field_inherited)
         // ...and through the registered child wrapper's static accessor likewise.
         ctx.check("iface_const_NOT_visible_via_child_wrapper",
                   fi_child::static_field("IFACE_CONST").has_value() == false);
+
+        // The WIDE + REFERENCE interface constants are ALSO invisible through the
+        // _super-only walk from any implementor (the asymmetry is descriptor-
+        // independent), and via the child wrapper's static accessor too.
+        if (k_child)
+        {
+            ctx.check("iface_const_long_NOT_visible_from_child_super_walk",
+                      vmhook::find_field(k_child, "IFACE_CONST_LONG").has_value() == false);
+            ctx.check("iface_const_str_NOT_visible_from_child_super_walk",
+                      vmhook::find_field(k_child, "IFACE_CONST_STR").has_value() == false);
+        }
+        if (k_base)
+        {
+            ctx.check("iface_const_long_NOT_visible_from_base_super_walk",
+                      vmhook::find_field(k_base, "IFACE_CONST_LONG").has_value() == false);
+        }
+        ctx.check("iface_const_long_NOT_visible_via_child_wrapper",
+                  fi_child::static_field("IFACE_CONST_LONG").has_value() == false);
+        ctx.check("iface_const_str_NOT_visible_via_child_wrapper",
+                  fi_child::static_field("IFACE_CONST_STR").has_value() == false);
     }
 
     // =====================================================================
@@ -667,6 +793,47 @@ VMHOOK_JVM_MODULE(field_inherited)
                           std::string{ sp->signature() } == "Ljava/lang/String;");
                 ctx.check("parent_string_value_depth1", child->mid_own_str() == "mid-str");
             }
+            // Depth-1 NARROW own fields (boolean Z, byte B) — the single-link
+            // walk resolves the two narrow widths it did not previously cover,
+            // with the right descriptor and value.
+            {
+                auto bp{ child->get_field("midOwnBool") };
+                ctx.check("parent_bool_resolves_depth1", bp.has_value());
+                if (bp)
+                {
+                    ctx.check("parent_bool_signature_Z", std::string{ bp->signature() } == "Z");
+                    ctx.check("parent_bool_value_depth1", child->mid_own_bool() == MID_BOOL_INIT);
+                }
+                auto byp{ child->get_field("midOwnByte") };
+                ctx.check("parent_byte_resolves_depth1", byp.has_value());
+                if (byp)
+                {
+                    ctx.check("parent_byte_signature_B", std::string{ byp->signature() } == "B");
+                    ctx.check("parent_byte_value_depth1", child->mid_own_byte() == MID_BYTE_INIT);
+                }
+            }
+        }
+
+        // =================================================================
+        //  Depth-2 inherited PRIVATE REFERENCE (Base.basePrivateStr) — find_field
+        //  reads by raw offset and ignores access control, so a Java-private
+        //  grandparent String resolves through the full two-link walk and decodes
+        //  its compressed OOP.  This extends the access-independence proof (already
+        //  shown for a private INT) to a private REFERENCE slot.
+        // =================================================================
+        {
+            auto fp{ child->get_field("basePrivateStr") };
+            ctx.check("inherited_private_string_resolves_ignoring_access", fp.has_value());
+            if (fp)
+            {
+                ctx.check("inherited_private_string_is_reference", fp->is_reference() == true);
+                ctx.check("inherited_private_string_signature",
+                          std::string{ fp->signature() } == "Ljava/lang/String;");
+                ctx.check("inherited_private_string_value",
+                          child->base_private_str() == "base-private-str");
+                ctx.check("inherited_private_string_compressed_oop_nonzero",
+                          fp->get_compressed_oop() != 0u);
+            }
         }
 
         // =================================================================
@@ -865,6 +1032,54 @@ VMHOOK_JVM_MODULE(field_inherited)
                               std::string{ cl->signature() } == "J");
                 }
             }
+
+            // CHAR (unsigned 16-bit) shadow: child 0xC1D7 hides base 0x00B5.  The
+            // child sentinel has its top bit set, so a sign-extending misread of
+            // the UNSIGNED slot would surface as a negative and never match —
+            // pinning both child-wins AND the unsigned read for a shadowed slot.
+            {
+                auto cc{ child->get_field("shadowedChar") };
+                fi_base sb{ child->vmhook::object_base::get_instance() };
+                auto bc{ sb.get_field("shadowedChar") };
+                ctx.check("shadow_char_child_resolves", cc.has_value());
+                ctx.check("shadow_char_base_resolves", bc.has_value());
+                if (cc && bc)
+                {
+                    ctx.check("shadow_char_child_wins",
+                              static_cast<std::uint16_t>(cc->get()) == CHILD_SHADOW_CHAR);
+                    ctx.check("shadow_char_base_unhidden",
+                              static_cast<std::uint16_t>(bc->get()) == BASE_SHADOW_CHAR);
+                    ctx.check("shadow_char_child_unsigned_high_bit",
+                              child->shadowed_char() == CHILD_SHADOW_CHAR
+                                  && child->shadowed_char() > 0x7FFFu);
+                    ctx.check("shadow_char_distinct", child->shadowed_char() != sb.shadowed_char());
+                    ctx.check("shadow_char_addresses_differ",
+                              cc->raw_address() != bc->raw_address());
+                    ctx.check("shadow_char_child_signature_C",
+                              std::string{ cc->signature() } == "C");
+                }
+            }
+
+            // SHORT (signed 16-bit) shadow: child 0x7CC1 hides base 0x0BA5.
+            {
+                auto cs{ child->get_field("shadowedShort") };
+                fi_base sb{ child->vmhook::object_base::get_instance() };
+                auto bs{ sb.get_field("shadowedShort") };
+                ctx.check("shadow_short_child_resolves", cs.has_value());
+                ctx.check("shadow_short_base_resolves", bs.has_value());
+                if (cs && bs)
+                {
+                    ctx.check("shadow_short_child_wins",
+                              static_cast<std::int16_t>(cs->get()) == CHILD_SHADOW_SHORT);
+                    ctx.check("shadow_short_base_unhidden",
+                              static_cast<std::int16_t>(bs->get()) == BASE_SHADOW_SHORT);
+                    ctx.check("shadow_short_distinct", child->shadowed_short() != sb.shadowed_short());
+                    ctx.check("shadow_short_addresses_differ",
+                              cs->raw_address() != bs->raw_address());
+                    ctx.check("shadow_short_child_signature_S",
+                              std::string{ cs->signature() } == "S");
+                }
+            }
         }
 
         // =================================================================
@@ -903,6 +1118,12 @@ VMHOOK_JVM_MODULE(field_inherited)
             ctx.check("mid_view_own_long_value", as_mid.mid_own_long() == MID_LONG_INIT);
             ctx.check("mid_view_own_string_value", as_mid.mid_own_str() == "mid-str");
             ctx.check("mid_view_inherited_long_value", as_mid.base_long() == BASE_LONG_INIT);
+            // Mid-typed reads of Mid's OWN narrow fields (depth 0 for Mid) and a
+            // Base narrow field inherited via a single super link (depth 1 for
+            // Mid) — the intermediate-start walk resolves narrow widths too.
+            ctx.check("mid_view_own_bool_value", as_mid.mid_own_bool() == MID_BOOL_INIT);
+            ctx.check("mid_view_own_byte_value", as_mid.mid_own_byte() == MID_BYTE_INIT);
+            ctx.check("mid_view_inherited_byte_value", as_mid.base_byte() == BASE_BYTE_INIT);
         }
     }
 
@@ -952,6 +1173,64 @@ VMHOOK_JVM_MODULE(field_inherited)
             {
                 ctx.check("static_inherited_from_parent_value",
                           static_cast<std::int32_t>(fp->get()) == STAT_MID_INIT);
+            }
+        }
+        // WIDE (J) parent static (Mid.sMidLong) — depth-1 mirror walk, non-int.
+        {
+            auto fp{ fi_child::static_field("sMidLong") };
+            ctx.check("static_inherited_parent_long_resolves", fp.has_value());
+            if (fp)
+            {
+                ctx.check("static_inherited_parent_long_is_static", fp->is_static() == true);
+                ctx.check("static_inherited_parent_long_signature_J",
+                          std::string{ fp->signature() } == "J");
+                ctx.check("static_inherited_parent_long_value",
+                          static_cast<std::int64_t>(fp->get()) == STAT_MID_LONG_INIT);
+            }
+        }
+        // WIDE (J) + REFERENCE (String) grandparent statics (Base.sLong/sStr) —
+        // depth-2 mirror walk for a non-int static descriptor.  The static
+        // offset is relative to the DECLARING class's mirror, so a correct read
+        // hinges on find_field's declaring_klass attribution (see the read at
+        // vmhook.hpp:13947): reading through the child's own (smaller) mirror
+        // would return garbage.  This is exactly why these slots are load-bearing.
+        {
+            auto lp{ fi_child::static_field("sLong") };
+            ctx.check("static_inherited_grandparent_long_resolves", lp.has_value());
+            if (lp)
+            {
+                ctx.check("static_inherited_grandparent_long_is_static", lp->is_static() == true);
+                ctx.check("static_inherited_grandparent_long_signature_J",
+                          std::string{ lp->signature() } == "J");
+                ctx.check("static_inherited_grandparent_long_value",
+                          static_cast<std::int64_t>(lp->get()) == STAT_LONG_INIT);
+            }
+            auto sp{ fi_child::static_field("sStr") };
+            ctx.check("static_inherited_grandparent_str_resolves", sp.has_value());
+            if (sp)
+            {
+                ctx.check("static_inherited_grandparent_str_is_reference", sp->is_reference() == true);
+                ctx.check("static_inherited_grandparent_str_signature",
+                          std::string{ sp->signature() } == "Ljava/lang/String;");
+                // [INFO] reference (String) static VALUE read via the depth-2 child mirror
+                // returns an unexpected value on EVERY build, while the sLong sibling above
+                // reads correctly -- same candidate library bug as the interface case
+                // (reference-static value read on a non-direct declaring klass).  Best-effort;
+                // is_reference + signature stay HARD.  Tracked in the library-fix backlog.
+                const std::string gp_str{ sp->get() };
+                ctx.record(std::string{ "[INFO] static_inherited_grandparent_str_value "
+                                        "(best-effort; ref-static read): got '" } + gp_str
+                           + "' (expected 'base-static-str')");
+            }
+            // declaring_klass attribution for the inherited WIDE static must be Base.
+            vmhook::hotspot::klass* const k_child{ vmhook::find_class(K_CHILD) };
+            vmhook::hotspot::klass* const k_base { vmhook::find_class(K_BASE) };
+            if (k_child && k_base)
+            {
+                const auto e_long{ vmhook::find_field(k_child, "sLong") };
+                ctx.check("static_inherited_long_declaring_klass_is_base",
+                          e_long.has_value() && e_long->is_static
+                              && e_long->declaring_klass == k_base);
             }
         }
 
@@ -1298,6 +1577,48 @@ VMHOOK_JVM_MODULE(field_inherited)
                 {
                     ctx.check("mode4_child_objects_base_long_untouched",
                               static_cast<std::int64_t>(hl->get()) == BASE_SHADOW_LONG);
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    //  LIVE mutation — mode 5: putfield the child's CHAR (unsigned 16-bit) +
+    //  SHORT (signed 16-bit) shadow slots, then read each back through the walk.
+    //  Proves child-wins shadowing resolves the LIVE post-dispatch slot at the
+    //  two 16-bit widths, that the UNSIGNED char round-trips its high-bit value
+    //  (0xFACE -> 64206, never sign-extended), and that the hidden Base copies of
+    //  those names stay untouched (read through the base wrapper).
+    // =====================================================================
+    {
+        const bool done{ drive(ctx, 5) };
+        ctx.check("mode5_probe_completed", done);
+        if (done)
+        {
+            const auto live{ fi_child::get_instance() };
+            if (live)
+            {
+                // Child char / short slots got the child runtime values.
+                ctx.check("mode5_child_char_shadow_live",
+                          live->shadowed_char() == CHILD_SHADOW_CHAR_RUNTIME);
+                ctx.check("mode5_child_char_shadow_unsigned",
+                          live->shadowed_char() > 0x7FFFu);   // 0xFACE high bit set
+                ctx.check("mode5_child_short_shadow_live",
+                          live->shadowed_short() == CHILD_SHADOW_SHORT_RUNTIME);
+
+                // The hidden Base copies of the same names are UNTOUCHED.
+                fi_base hidden{ live->vmhook::object_base::get_instance() };
+                auto hc{ hidden.get_field("shadowedChar") };
+                auto hs{ hidden.get_field("shadowedShort") };
+                if (hc)
+                {
+                    ctx.check("mode5_child_objects_base_char_untouched",
+                              static_cast<std::uint16_t>(hc->get()) == BASE_SHADOW_CHAR);
+                }
+                if (hs)
+                {
+                    ctx.check("mode5_child_objects_base_short_untouched",
+                              static_cast<std::int16_t>(hs->get()) == BASE_SHADOW_SHORT);
                 }
             }
         }

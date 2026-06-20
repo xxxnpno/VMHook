@@ -248,6 +248,31 @@ namespace
     const std::string k_bom = "\xEF\xBB\xBF\x61";                        // U+FEFF 'a' (EF BB BF 61)
     const std::string k_combining = "\x65\xCC\x81";                      // 'e' U+0301 (65 CC 81)
 
+    // --- BATCH-18 expected sequences: astral plane-walk + 3-byte boundary -------
+    // append_utf8 4-byte branch interior (lead byte from cp>>18; firstAstral/maxAstral
+    // pin only the extremes -- these walk the lead nibble F0->F4 and the continuation
+    // arithmetic through the middle of the astral range).
+    const std::string k_astral10001  = "\xF0\x90\x80\x81";               // U+10001  (first astral + 1)
+    const std::string k_astral1FFFF  = "\xF0\x9F\xBF\xBF";               // U+1FFFF  (top of plane 1)
+    const std::string k_astral20000  = "\xF0\xA0\x80\x80";               // U+20000  (start of plane 2)
+    const std::string k_astralFFFFF  = "\xF3\xBF\xBF\xBF";               // U+FFFFF  (top of plane 15, F3 lead)
+    const std::string k_astral100000 = "\xF4\x80\x80\x80";               // U+100000 (start of plane 16, F4 lead)
+    // 3-byte / 2-byte boundary fillers the existing set is missing.
+    const std::string k_bmp07FE      = "\xDF\xBE";                       // U+07FE (2-byte interior, top-1)
+    const std::string k_noncharFFFE  = "\xEF\xBF\xBE";                   // U+FFFE (noncharacter, NOT stripped)
+    const std::string k_bmp1000      = "\xE1\x80\x80";                   // U+1000 (first E1-lead 3-byte point)
+    // Coder-boundary identical-output property.
+    const std::string k_asciiPlain   = "\x41\x42";                       // "AB" LATIN1 -> 41 42
+    const std::string k_asciiInUtf16 = "\x41\x42\xE4\xB8\xAD";           // "AB" + U+4E2D, UTF16 path -> 41 42 + 3
+    // Multi-script: every UTF-8 width 1..4 in one pass.
+    const std::string k_multiScript  = "\x41\xCE\xB1\xD0\x94\xD7\x90\xE4\xB8\xAD\xF0\x9F\x98\x80";
+    // Replacement char as CONTENT (passthrough, not sanitised).
+    const std::string k_replInAscii  = "\x61\xEF\xBF\xBD\x62";           // 'a' U+FFFD 'b' -> 5 bytes
+    // NUL before a pair, lone-low resync, CJK-flanked pair.
+    const std::string k_nulThenEmoji{ '\x00', '\xF0', '\x9F', '\x98', '\x80' };   // NUL + emoji (5)
+    const std::string k_lowThenPair  = "\xED\xB0\x80\xF0\x9F\x98\x80";   // lone-low CESU + astral (7)
+    const std::string k_emojiCjkFlank = "\xE4\xB8\xAD\xF0\x9F\x98\x80\xE4\xB8\xAD"; // CJK emoji CJK (10)
+
     // Render a std::string as "AA BB CC" hex for diagnostics.
     auto to_hex(const std::string& s) -> std::string
     {
@@ -365,6 +390,12 @@ namespace
         ctx.check("rjs_leadingNul_field_resolves", rjs::resolves("leadingNul"));
         ctx.check("rjs_bom_field_resolves", rjs::resolves("bom"));
         ctx.check("rjs_bulkEmoji_field_resolves", rjs::resolves("bulkEmoji"));
+        ctx.check("rjs_astral10001_field_resolves", rjs::resolves("astral10001"));
+        ctx.check("rjs_astral100000_field_resolves", rjs::resolves("astral100000"));
+        ctx.check("rjs_noncharFFFE_field_resolves", rjs::resolves("noncharFFFE"));
+        ctx.check("rjs_asciiInUtf16_field_resolves", rjs::resolves("asciiInUtf16"));
+        ctx.check("rjs_multiScript_field_resolves", rjs::resolves("multiScript"));
+        ctx.check("rjs_lowThenPair_field_resolves", rjs::resolves("lowThenPair"));
 
         // =================================================================
         //  1. LATIN1 (coder 0) DECODES -- byte-exact UTF-8.
@@ -494,6 +525,13 @@ namespace
                       bulk_hi.size() == 1000
                       && static_cast<std::uint8_t>(bulk_hi[998]) == 0xC3u
                       && static_cast<std::uint8_t>(bulk_hi[999]) == 0xA9u);
+
+            // Pure-ASCII "AB" -> stored LATIN1 (coder 0) -> 41 42.  The LATIN1 half
+            // of the coder-boundary identical-output property (the UTF16 half is in
+            // section 2: the same 'A','B' prefix decoded out of a UTF16 backing).
+            const std::string ascii_plain{ rjs::decode("asciiPlain") };
+            ctx.check("decode_asciiPlain_eq_4142", ascii_plain == k_asciiPlain);
+            ctx.check("decode_asciiPlain_len_2", ascii_plain.size() == 2);
         }
 
         // =================================================================
@@ -737,6 +775,143 @@ namespace
                       bulk_emoji.size() == 800
                       && static_cast<std::uint8_t>(bulk_emoji[796]) == 0xF0u
                       && static_cast<std::uint8_t>(bulk_emoji[799]) == 0x80u);
+
+            // --- BATCH-18: astral PLANE-WALK (the 4-byte append_utf8 interior) ----
+            // firstAstral (U+10000) and maxAstral (U+10FFFF) pin the two extremes of
+            // the 4-byte branch.  These five walk the lead byte F0->F4 and the
+            // continuation arithmetic through the middle, so a (cp>>18)/(cp>>12)
+            // shift-or-mask slip cannot hide between the endpoints.  Each astral code
+            // point is ONE 4-byte sequence (a combined surrogate pair), never two
+            // 3-byte CESU halves.
+            //   U+10001  -> F0 90 80 81  (first astral + 1: combine low bit reaches
+            //                             the trailing continuation byte)
+            //   U+1FFFF  -> F0 9F BF BF  (top of plane 1, still an F0 lead)
+            //   U+20000  -> F0 A0 80 80  (start of plane 2: 2nd byte rolls 80->A0)
+            //   U+FFFFF  -> F3 BF BF BF  (top of plane 15: lead nibble reaches F3)
+            //   U+100000 -> F4 80 80 80  (start of plane 16: F4 lead, all 80 tail)
+            const std::string a10001{ rjs::decode("astral10001") };
+            ctx.check("decode_astral10001_U10001_eq_F0908081", a10001 == k_astral10001);
+            ctx.check("decode_astral10001_len_4_leads_F0",
+                      a10001.size() == 4
+                      && static_cast<std::uint8_t>(a10001.front()) == 0xF0u
+                      && static_cast<std::uint8_t>(a10001.back()) == 0x81u);
+            const std::string a1ffff{ rjs::decode("astral1FFFF") };
+            ctx.check("decode_astral1FFFF_U1FFFF_eq_F09FBFBF", a1ffff == k_astral1FFFF);
+            ctx.check("decode_astral1FFFF_len_4", a1ffff.size() == 4);
+            const std::string a20000{ rjs::decode("astral20000") };
+            ctx.check("decode_astral20000_U20000_eq_F0A08080", a20000 == k_astral20000);
+            ctx.check("decode_astral20000_second_byte_A0",
+                      a20000.size() == 4 && static_cast<std::uint8_t>(a20000[1]) == 0xA0u);
+            const std::string afffff{ rjs::decode("astralFFFFF") };
+            ctx.check("decode_astralFFFFF_UFFFFF_eq_F3BFBFBF", afffff == k_astralFFFFF);
+            ctx.check("decode_astralFFFFF_leads_F3",
+                      afffff.size() == 4 && static_cast<std::uint8_t>(afffff.front()) == 0xF3u);
+            const std::string a100000{ rjs::decode("astral100000") };
+            ctx.check("decode_astral100000_U100000_eq_F4808080", a100000 == k_astral100000);
+            ctx.check("decode_astral100000_leads_F4",
+                      a100000.size() == 4 && static_cast<std::uint8_t>(a100000.front()) == 0xF4u);
+            ctx.record(std::string{ "[INFO] astral plane-walk: 10001=[" } + to_hex(a10001)
+                       + "] 1FFFF=[" + to_hex(a1ffff) + "] 20000=[" + to_hex(a20000)
+                       + "] FFFFF=[" + to_hex(afffff) + "] 100000=[" + to_hex(a100000) + "]");
+
+            // --- BATCH-18: 2-byte interior + noncharacter + 3-byte lead-nibble walk -
+            // U+07FE: ONE below the 2-byte top (DF BE); bmp2to3a pinned the top (DF BF),
+            // this guards the (cp>>6)/(cp&3F) low bits one step in.
+            const std::string b07fe{ rjs::decode("bmp07FE") };
+            ctx.check("decode_bmp07FE_U07FE_eq_DFBE", b07fe == k_bmp07FE);
+            ctx.check("decode_bmp07FE_len_2", b07fe.size() == 2);
+            // U+FFFE: a Unicode NONCHARACTER -- read_java_string is a passthrough
+            // decoder, so it emits the verbatim 3-byte UTF-8 (EF BF BE), NOT stripped
+            // and NOT replaced with U+FFFD.  Distinct from replacement (FFFD->EFBFBD)
+            // and maxBmp (FFFF->EFBFBF): proves no noncharacter special-casing.
+            const std::string ncfffe{ rjs::decode("noncharFFFE") };
+            ctx.check("decode_noncharFFFE_UFFFE_eq_EFBFBE", ncfffe == k_noncharFFFE);
+            ctx.check("decode_noncharFFFE_len_3_not_replaced",
+                      ncfffe.size() == 3 && ncfffe != k_replacement);
+            // U+1000: the FIRST E1-lead 3-byte code point (E1 80 80); bmp2to3b pinned
+            // U+0800 (E0 lead) -- this walks the 3-byte lead nibble off E0 to E1.
+            const std::string b1000{ rjs::decode("bmp1000") };
+            ctx.check("decode_bmp1000_U1000_eq_E18080", b1000 == k_bmp1000);
+            ctx.check("decode_bmp1000_leads_E1",
+                      b1000.size() == 3 && static_cast<std::uint8_t>(b1000.front()) == 0xE1u);
+            ctx.record(std::string{ "[INFO] bmp fillers: 07FE=[" } + to_hex(b07fe)
+                       + "] FFFE=[" + to_hex(ncfffe) + "] 1000=[" + to_hex(b1000) + "]");
+
+            // --- BATCH-18: COMPACT-STRING CODER-BOUNDARY identical-output property --
+            // asciiInUtf16 is "AB" + U+4E2D, so the WHOLE String is UTF16 (coder 1);
+            // its first two chars are ASCII 'A','B' pushed through the UTF-16 decode
+            // path -> 41 42 E4 B8 AD.  The headline cross-coder invariant: the ASCII
+            // PREFIX decoded out of a UTF16 backing is byte-IDENTICAL to asciiPlain
+            // decoded out of a LATIN1 backing -- ASCII content reads the same on
+            // EITHER coder.  (decode(asciiPlain) was asserted == 41 42 in section 1.)
+            const std::string ascii_u16{ rjs::decode("asciiInUtf16") };
+            ctx.check("decode_asciiInUtf16_byte_exact", ascii_u16 == k_asciiInUtf16);
+            ctx.check("decode_asciiInUtf16_ascii_prefix_matches_latin1",
+                      ascii_u16.size() == 5
+                      && ascii_u16.substr(0, 2) == rjs::decode("asciiPlain")
+                      && ascii_u16.substr(0, 2) == k_asciiPlain);
+            ctx.record(std::string{ "[INFO] coder-boundary: asciiPlain(LATIN1)=[" }
+                       + to_hex(rjs::decode("asciiPlain")) + "] asciiInUtf16(UTF16)=["
+                       + to_hex(ascii_u16) + "] (ASCII prefix identical).");
+
+            // --- BATCH-18: MULTI-SCRIPT single decode pass (every UTF-8 width 1..4) -
+            // A(1) Greek(2) Cyrillic(2) Hebrew(2) CJK(3) emoji(4) back-to-back: the
+            // UTF-16 path must emit mixed-width output in one pass and combine the
+            // trailing surrogate pair without disturbing the BMP chars before it.
+            const std::string multi{ rjs::decode("multiScript") };
+            ctx.check("decode_multiScript_byte_exact", multi == k_multiScript);
+            ctx.check("decode_multiScript_len_14_widths_1to4",
+                      multi.size() == 14
+                      && static_cast<std::uint8_t>(multi.front()) == 0x41u   // 'A' 1-byte
+                      && static_cast<std::uint8_t>(multi[1]) == 0xCEu        // Greek 2-byte lead
+                      && static_cast<std::uint8_t>(multi[10]) == 0xF0u);     // emoji 4-byte lead
+            ctx.record(std::string{ "[INFO] read_java_string(multiScript) = [" } + to_hex(multi)
+                       + "] expect [" + to_hex(k_multiScript) + "]");
+
+            // --- BATCH-18: U+FFFD as CONTENT (passthrough, not a sanitiser) --------
+            // 'a' U+FFFD 'b' -> 61 EF BF BD 62: a replacement char that is genuinely
+            // part of the string survives as its 3-byte UTF-8 -- read_java_string
+            // neither inserts nor strips U+FFFD.
+            const std::string repl_in{ rjs::decode("replInAscii") };
+            ctx.check("decode_replInAscii_byte_exact", repl_in == k_replInAscii);
+            ctx.check("decode_replInAscii_len_5_flanked_by_ascii",
+                      repl_in.size() == 5
+                      && static_cast<std::uint8_t>(repl_in.front()) == 0x61u
+                      && static_cast<std::uint8_t>(repl_in.back()) == 0x62u
+                      && static_cast<std::uint8_t>(repl_in[1]) == 0xEFu);
+
+            // --- BATCH-18: surrogate-combine index-advance edge cases --------------
+            // NUL immediately BEFORE a pair: the leading NUL survives and the combine
+            // starting at index 1 advances correctly -> 00 F0 9F 98 80 (5 bytes).
+            const std::string nul_emoji{ rjs::decode("nulThenEmoji") };
+            ctx.check("decode_nulThenEmoji_byte_exact", nul_emoji == k_nulThenEmoji);
+            ctx.check("decode_nulThenEmoji_len_5_leading_nul",
+                      nul_emoji.size() == 5
+                      && nul_emoji[0] == '\0'
+                      && static_cast<std::uint8_t>(nul_emoji[1]) == 0xF0u);
+            // A lone LOW surrogate THEN a VALID pair: the lone low emits as 3-byte
+            // CESU, then the decoder RESYNCS and combines the following hi+lo into one
+            // 4-byte astral char -> ED B0 80 F0 9F 98 80 (7 bytes).  A malformed unit
+            // must not desync the combine for the well-formed pair that follows.
+            const std::string low_pair{ rjs::decode("lowThenPair") };
+            ctx.check("decode_lowThenPair_byte_exact", low_pair == k_lowThenPair);
+            ctx.check("decode_lowThenPair_len_7_cesu_then_4byte",
+                      low_pair.size() == 7
+                      && static_cast<std::uint8_t>(low_pair.front()) == 0xEDu  // lone-low CESU lead
+                      && static_cast<std::uint8_t>(low_pair[3]) == 0xF0u);     // combined astral lead
+            // A valid pair flanked by 3-byte CJK (emojiMix used 1-byte ASCII flanks):
+            // E4 B8 AD F0 9F 98 80 E4 B8 AD (10 bytes).  Proves the combine advances
+            // correctly when the neighbours are themselves multi-byte.
+            const std::string cjk_flank{ rjs::decode("emojiCjkFlank") };
+            ctx.check("decode_emojiCjkFlank_byte_exact", cjk_flank == k_emojiCjkFlank);
+            ctx.check("decode_emojiCjkFlank_len_10_cjk_emoji_cjk",
+                      cjk_flank.size() == 10
+                      && static_cast<std::uint8_t>(cjk_flank.front()) == 0xE4u // leading CJK
+                      && static_cast<std::uint8_t>(cjk_flank[3]) == 0xF0u      // astral lead
+                      && static_cast<std::uint8_t>(cjk_flank[7]) == 0xE4u);    // trailing CJK
+            ctx.record(std::string{ "[INFO] combine edges: nulThenEmoji=[" } + to_hex(nul_emoji)
+                       + "] lowThenPair=[" + to_hex(low_pair) + "] emojiCjkFlank=["
+                       + to_hex(cjk_flank) + "]");
         }
 
         // =================================================================
@@ -1078,6 +1253,53 @@ namespace
                 if (c_bulk_latin1 >= 0) { ctx.check("java_coder_bulkLatin1Hi_is_LATIN1", c_bulk_latin1 == 0); }
                 if (c_mid_two >= 0)     { ctx.check("java_coder_midTwoByte_is_UTF16", c_mid_two == 1); }
                 if (c_bom >= 0)         { ctx.check("java_coder_bom_is_UTF16", c_bom == 1); }
+
+                // --- BATCH-18: Java agrees on the new subjects' code points --------
+                // Astral plane-walk: Java's codePointAt(0) is the combined code point
+                // and codePointCount is 1 (one astral char, two UTF-16 chars).  These
+                // are the SAME values our native decode produced the 4-byte UTF-8 for,
+                // cross-confirming the surrogate-combine arithmetic at each plane.
+                ctx.check("java_astral10001_cp0_is_10001", rjs::seen_int("jAstral10001Cp0") == 0x10001);
+                ctx.check("java_astral10001_cpCount_1", rjs::seen_int("jAstral10001CpCount") == 1);
+                ctx.check("java_astral1FFFF_cp0_is_1FFFF", rjs::seen_int("jAstral1FFFFCp0") == 0x1FFFF);
+                ctx.check("java_astral20000_cp0_is_20000", rjs::seen_int("jAstral20000Cp0") == 0x20000);
+                ctx.check("java_astralFFFFF_cp0_is_FFFFF", rjs::seen_int("jAstralFFFFFCp0") == 0xFFFFF);
+                ctx.check("java_astral100000_cp0_is_100000", rjs::seen_int("jAstral100000Cp0") == 0x100000);
+                // BMP boundary fillers.
+                ctx.check("java_bmp07FE_cp0_is_7FE", rjs::seen_int("jBmp07FECp0") == 0x07FE);
+                ctx.check("java_noncharFFFE_cp0_is_FFFE", rjs::seen_int("jNoncharFFFECp0") == 0xFFFE);
+                ctx.check("java_bmp1000_cp0_is_1000", rjs::seen_int("jBmp1000Cp0") == 0x1000);
+                // Coder-boundary lengths.
+                ctx.check("java_asciiPlain_len_2", rjs::seen_int("jAsciiPlainLen") == 2);
+                ctx.check("java_asciiInUtf16_len_3", rjs::seen_int("jAsciiInUtf16Len") == 3);
+                // Multi-script: 7 UTF-16 chars, 6 code points, last code point U+1F600.
+                ctx.check("java_multiScript_len_7", rjs::seen_int("jMultiScriptLen") == 7);
+                ctx.check("java_multiScript_cpCount_6", rjs::seen_int("jMultiScriptCpCount") == 6);
+                ctx.check("java_multiScript_cpLast_is_1F600", rjs::seen_int("jMultiScriptCpLast") == 0x1F600);
+                // Replacement-as-content.
+                ctx.check("java_replInAscii_len_3", rjs::seen_int("jReplInAsciiLen") == 3);
+                ctx.check("java_replInAscii_cp1_is_FFFD", rjs::seen_int("jReplInAsciiCp1") == 0xFFFD);
+                // Surrogate-combine edges.
+                ctx.check("java_nulThenEmoji_len_3", rjs::seen_int("jNulThenEmojiLen") == 3);
+                ctx.check("java_nulThenEmoji_cpCount_2", rjs::seen_int("jNulThenEmojiCpCount") == 2);
+                ctx.check("java_lowThenPair_len_3", rjs::seen_int("jLowThenPairLen") == 3);
+                ctx.check("java_lowThenPair_cpCount_2", rjs::seen_int("jLowThenPairCpCount") == 2);
+                ctx.check("java_emojiCjkFlank_len_4", rjs::seen_int("jEmojiCjkFlankLen") == 4);
+                ctx.check("java_emojiCjkFlank_cpCount_3", rjs::seen_int("jEmojiCjkFlankCpCount") == 3);
+
+                // Physical coder for the coder-boundary pair (diagnostic + asserted
+                // only when readable): asciiPlain is LATIN1 (0), asciiInUtf16 and
+                // multiScript are UTF16 (1) -- this is what makes asciiInUtf16 the
+                // genuine cross-coder witness (same ASCII content, different backing).
+                const std::int32_t c_ascii_plain{ rjs::seen_int("jCoderAsciiPlain") };
+                const std::int32_t c_ascii_u16{ rjs::seen_int("jCoderAsciiInUtf16") };
+                const std::int32_t c_multi{ rjs::seen_int("jCoderMultiScript") };
+                ctx.record(std::string{ "[INFO] coder{asciiPlain=" } + std::to_string(c_ascii_plain)
+                           + " asciiInUtf16=" + std::to_string(c_ascii_u16)
+                           + " multiScript=" + std::to_string(c_multi) + "}");
+                if (c_ascii_plain >= 0) { ctx.check("java_coder_asciiPlain_is_LATIN1", c_ascii_plain == 0); }
+                if (c_ascii_u16 >= 0)   { ctx.check("java_coder_asciiInUtf16_is_UTF16", c_ascii_u16 == 1); }
+                if (c_multi >= 0)       { ctx.check("java_coder_multiScript_is_UTF16", c_multi == 1); }
             }
         }
 
@@ -1104,6 +1326,16 @@ namespace
             const std::string be1{ rjs::decode("bulkEmoji") };
             const std::string be2{ rjs::decode("bulkEmoji") };
             ctx.check("bulkEmoji_repeatable_same_bytes", be1 == be2 && be1.size() == 800);
+
+            // BATCH-18: the astral plane-walk and multi-script subjects re-decode
+            // byte-identically after the probe ran -- the 4-byte combine path and the
+            // mixed-width pass are also pure (no mutation of the backing array).
+            ctx.check("astral100000_unchanged_after_probe",
+                      rjs::decode("astral100000") == k_astral100000);
+            ctx.check("multiScript_unchanged_after_probe",
+                      rjs::decode("multiScript") == k_multiScript);
+            ctx.check("lowThenPair_unchanged_after_probe",
+                      rjs::decode("lowThenPair") == k_lowThenPair);
         }
     }
 }

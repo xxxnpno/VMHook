@@ -26,6 +26,14 @@ class FieldInheritedMid extends FieldInheritedBase
     static final long   MID_LONG_INIT = 0x00FACADE00FACADEL;
     static final String MID_STR_INIT  = "mid-str";
 
+    // Depth-1 own slots of the two narrow primitive types the parent level did
+    // not yet cover (boolean Z, byte B), so the single-super-link walk is proven
+    // for those widths as well as the I / J / String it already exercises.
+    static final boolean MID_BOOL_INIT = true;
+    static final byte    MID_BYTE_INIT = (byte) 0x6D;   // 'm'-ish sentinel = 109
+    // A WIDE (J) own static inherited via a single super link.
+    static final long    STAT_MID_LONG_INIT = 0x00ABCDEF00ABCDEFL;
+
     // Own instance field — inherited by the child via a single super link.
     public int midOwnInt = MID_INT_INIT;
 
@@ -35,13 +43,22 @@ class FieldInheritedMid extends FieldInheritedBase
     public long   midOwnLong = MID_LONG_INIT;
     public String midOwnStr  = MID_STR_INIT;
 
+    // Own NARROW (Z / B) instance fields — depth-1 inherited by the child.
+    public boolean midOwnBool = MID_BOOL_INIT;
+    public byte    midOwnByte = MID_BYTE_INIT;
+
     // Own static — inherited static reached by a single super link.
     public static int sMid = STAT_MID_INIT;
+
+    // Own WIDE (J) static — depth-1 inherited static on the class mirror.
+    public static long sMidLong = STAT_MID_LONG_INIT;
 
     // Touch the new own slots so javac does not warn them unused under -Werror-y
     // builds and they are guaranteed present in the layout.
     long midSum()
     {
-        return this.midOwnInt + this.midOwnLong + this.midOwnStr.length();
+        return this.midOwnInt + this.midOwnLong + this.midOwnStr.length()
+             + (this.midOwnBool ? 1 : 0) + this.midOwnByte
+             + FieldInheritedMid.sMidLong;
     }
 }

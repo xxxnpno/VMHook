@@ -476,6 +476,164 @@ namespace
                          proxy->call(std::string{ "L+" }, std::string{ "R" }));
         }
 
+        // ---- FRESH-OOP unicode slices + built-empty boundary ---------------
+        // subOf(value, b, e) returns value.substring(b,e) — a FRESH (non-interned)
+        // String OOP.  Drive it three ways:
+        //   * a unicode (CJK) slice -> proves a fresh non-interned MULTIBYTE OOP
+        //     decodes correctly (not just the interned constant-pool CJK case),
+        //   * an EMPTY slice (b == e) -> a fresh empty String OOP, distinct from
+        //     the interned literal returned by empty(),
+        //   * a slice that drops the first ASCII char -> a fresh ASCII OOP.
+        if (auto proxy{ self->get_method("subOf") })
+        {
+            record_value("subOf:cjk_full",
+                         proxy->call(std::string{ "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E" },
+                                     static_cast<std::int32_t>(0), static_cast<std::int32_t>(3)));
+        }
+        if (auto proxy{ self->get_method("subOf") })
+        {
+            record_value("subOf:cjk_tail",
+                         proxy->call(std::string{ "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E" },
+                                     static_cast<std::int32_t>(1), static_cast<std::int32_t>(3)));
+        }
+        if (auto proxy{ self->get_method("subOf") })
+        {
+            record_value("subOf:empty_slice",
+                         proxy->call(std::string{ "abcdef" },
+                                     static_cast<std::int32_t>(2), static_cast<std::int32_t>(2)));
+        }
+        // builtA(0): a fresh EMPTY String OOP from a StringBuilder (NOT the interned
+        // "" literal) — proves the empty-from-builder boundary on the heap path.
+        if (auto proxy{ self->get_method("builtA") })
+        {
+            record_value("builtA:0", proxy->call(static_cast<std::int32_t>(0)));
+        }
+        // Length-1 multibyte returns: one CJK char (3 bytes) and one Latin-1 char
+        // (2 bytes).  A length-1 String is a distinct degenerate from the empty and
+        // multi-char cases; both are BMP -> path-independent exact bytes.
+        capture(*self, "singleCjk");
+        capture(*self, "singleLatin1");
+
+        // ---- Unicode / boundary ARG round-trips (arg-encoder coverage) ------
+        // Greek (2-byte) arg -> identical 4 bytes back (BMP, path-independent):
+        // proves the arg encoder handles a pure 2-byte-sequence string.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:greek", proxy->call(std::string{ "\xCE\xB1\xCE\xB2" }));
+        }
+        // 2-byte + 3-byte mix arg (ü ñ €) -> identical 7 bytes back: proves the arg
+        // encoder spans the 2/3-byte boundary in one string.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:mixed",
+                         proxy->call(std::string{ "\xC3\xBC\xC3\xB1\xE2\x82\xAC" }));
+        }
+        // Replacement char U+FFFD arg -> identical 3 bytes (EF BF BD) back.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:replacement", proxy->call(std::string{ "\xEF\xBF\xBD" }));
+        }
+        // Latin-1 RESUME arg (two U+00E9) -> identical 8 bytes back: repeated
+        // 2-byte sequences in a longer string.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:resume",
+                         proxy->call(std::string{ "r\xC3\xA9sum\xC3\xA9" }));
+        }
+        // Combined hardest ARG: an astral scalar IMMEDIATELY followed by an
+        // interior NUL ("<emoji>\0z").  Proves the arg encoder preserves BOTH a
+        // surrogate pair AND a raw NUL in one length-counted string.  Java length
+        // is 4 (2 surrogate units + U+0000 + 'z'), proven decoder-independently via
+        // lengthOf below; the RETURN bytes diverge only by the astral+NUL encoding.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:emoji_nul",
+                         proxy->call(std::string("\xF0\x9F\x98\x80\x00z", 6)));
+        }
+        if (auto proxy{ self->get_method("lengthOf") })
+        {
+            record_value("lengthOf:emoji_nul",
+                         proxy->call(std::string("\xF0\x9F\x98\x80\x00z", 6)));
+        }
+        // Lone-high-surrogate ARG round-trip: the arg is the 3-byte CESU encoding
+        // of U+D83D (ED A0 BD).  utf8_to_utf16 decodes that surrogate code unit to
+        // a single UTF-16 unit (Java length 1, proven via lengthOf below), and the
+        // RETURN re-encodes it as the 3-byte CESU form on BOTH paths (read_java_string
+        // and GetStringUTFChars agree on a lone surrogate) -> path-independent.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:lone_surrogate",
+                         proxy->call(std::string{ "\xED\xA0\xBD" }));
+        }
+        if (auto proxy{ self->get_method("lengthOf") })
+        {
+            record_value("lengthOf:lone_surrogate",
+                         proxy->call(std::string{ "\xED\xA0\xBD" }));
+        }
+
+        // ---- Unicode + empty-arg multi-arg concat / charAt -----------------
+        // concat of two Latin-1 args -> the two are joined on the JAVA side, so the
+        // return is the concatenation re-encoded by the live decoder; BMP so
+        // path-independent.  "caf"+U+00E9 ++ U+00E9+"sum" = caf,U+00E9,U+00E9,sum.
+        if (auto proxy{ self->get_method("concat") })
+        {
+            record_value("concat:unicode",
+                         proxy->call(std::string{ "caf\xC3\xA9" }, std::string{ "\xC3\xA9sum" }));
+        }
+        // concat with an EMPTY first arg -> identity of the second (proves an empty
+        // String ARG in a multi-arg call is a real empty String, not null/dropped).
+        if (auto proxy{ self->get_method("concat") })
+        {
+            record_value("concat:empty_lhs",
+                         proxy->call(std::string{}, std::string{ "tail" }));
+        }
+        // charAtOf on a CJK arg at index 1 -> the single middle CJK char U+672C
+        // (3 bytes E6 9C AC).  A String+int->String overload returning a MULTIBYTE
+        // single char; BMP so path-independent and hard-assertable.
+        if (auto proxy{ self->get_method("charAtOf") })
+        {
+            record_value("charAtOf:cjk1",
+                         proxy->call(std::string{ "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E" },
+                                     static_cast<std::int32_t>(1)));
+        }
+
+        // ---- 16-bit length-boundary returns (no uint16 wraparound) ----------
+        // bigString at 65535 / 65536 / 65537 — straddling the 16-bit boundary —
+        // proves the length read (an int32 arrayOop length) never truncates to 16
+        // bits.  Pure ASCII 'A' so identical on both paths; asserted in full.
+        if (auto proxy{ self->get_method("bigString") })
+        {
+            record_value("bigString:65535", proxy->call(static_cast<std::int32_t>(65535)));
+        }
+        if (auto proxy{ self->get_method("bigString") })
+        {
+            record_value("bigString:65537", proxy->call(static_cast<std::int32_t>(65537)));
+        }
+
+        // ---- STATIC unicode / fresh-OOP / arg-length coverage ---------------
+        capture_static("staticGreek");
+        capture_static("staticBuiltEmpty");
+        if (auto proxy{ method_string_fixture::static_method(
+                "staticLengthOf", "(Ljava/lang/String;)Ljava/lang/String;") })
+        {
+            // STATIC arg-encoder length witness for an astral arg: must arrive as 2
+            // UTF-16 units on the STATIC dispatch path too (not just the instance one).
+            record_value("staticLengthOf:emoji",
+                         proxy->call(std::string{ "\xF0\x9F\x98\x80" }));
+        }
+        if (auto proxy{ method_string_fixture::static_method(
+                "staticLengthOf", "(Ljava/lang/String;)Ljava/lang/String;") })
+        {
+            // STATIC arg-encoder length witness for an interior-NUL arg: 3 units.
+            record_value("staticLengthOf:nul", proxy->call(std::string("a\0b", 3)));
+        }
+        if (auto proxy{ method_string_fixture::static_method(
+                "staticLengthOf", "(Ljava/lang/String;)Ljava/lang/String;") })
+        {
+            // STATIC null arg -> Java null -> "len=null" (the static null-arg path).
+            record_value("staticLengthOf:null", proxy->call(static_cast<const char*>(nullptr)));
+        }
+
         // Length / cap angles via repeatA(int).
         if (auto proxy{ self->get_method("repeatA") })
         {
@@ -1255,6 +1413,164 @@ namespace
                 ctx.check("staticInteriorNul_call_jni", s_inul.value == std::string("\x61\xC0\x80\x62", 4));
             }
 
+            // ============ FRESH-OOP slices + built-empty boundary ============
+            // subOf returns a FRESH (non-interned) substring OOP; the CJK slices
+            // prove a fresh MULTIBYTE String decodes byte-exactly (BMP -> both paths
+            // agree), and the empty slice proves a fresh empty OOP -> "".
+
+            const observation sub_cjk_full{ get("subOf:cjk_full") };
+            ctx.check("subOf_cjk_full_captured", sub_cjk_full.captured);
+            ctx.check("subOf_cjk_full_value",
+                      sub_cjk_full.value == "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E");
+            ctx.check("subOf_cjk_full_len_9", sub_cjk_full.byte_len == 9);
+
+            // substring(1,3) of the 3-CJK-char string -> the last two CJK chars
+            // (U+672C U+8A9E) = 6 bytes; a fresh OOP whose backing differs from the
+            // arg's, so this exercises decode of a sliced (offset) multibyte String.
+            const observation sub_cjk_tail{ get("subOf:cjk_tail") };
+            ctx.check("subOf_cjk_tail_value",
+                      sub_cjk_tail.value == "\xE6\x9C\xAC\xE8\xAA\x9E");
+            ctx.check("subOf_cjk_tail_len_6", sub_cjk_tail.byte_len == 6);
+
+            // Empty slice (begin == end) -> a fresh empty String OOP -> "" on both
+            // paths.  Distinct production from the interned empty() literal.
+            const observation sub_empty{ get("subOf:empty_slice") };
+            ctx.check("subOf_empty_slice_captured", sub_empty.captured);
+            ctx.check("subOf_empty_slice_value_empty", sub_empty.value.empty());
+            ctx.check("subOf_empty_slice_len_0", sub_empty.byte_len == 0);
+
+            // builtA(0): a fresh EMPTY String from a StringBuilder (not interned).
+            const observation built0{ get("builtA:0") };
+            ctx.check("builtA0_captured", built0.captured);
+            ctx.check("builtA0_value_empty", built0.value.empty());
+            ctx.check("builtA0_len_0", built0.byte_len == 0);
+
+            // ---- Length-1 multibyte returns --------------------------------
+            // Single CJK char U+65E5 -> 3 bytes; single Latin-1 char U+00E9 -> 2
+            // bytes.  BMP, path-independent; the length-1 multibyte degenerate.
+            const observation single_cjk{ get("singleCjk") };
+            ctx.check("singleCjk_captured",  single_cjk.captured);
+            ctx.check("singleCjk_value",     single_cjk.value == "\xE6\x97\xA5");
+            ctx.check("singleCjk_len_3",     single_cjk.byte_len == 3);
+            ctx.check("singleCjk_is_string", single_cjk.is_string);
+
+            const observation single_lat{ get("singleLatin1") };
+            ctx.check("singleLatin1_value", single_lat.value == "\xC3\xA9");
+            ctx.check("singleLatin1_len_2", single_lat.byte_len == 2);
+
+            // ============ Unicode / boundary ARG round-trips =================
+            // BMP arg round-trips are path-INDEPENDENT (both decoders agree).
+
+            const observation echo_greek{ get("echo:greek") };
+            ctx.check("echo_greek_round_trip", echo_greek.value == "\xCE\xB1\xCE\xB2");
+            ctx.check("echo_greek_len_4",      echo_greek.byte_len == 4);
+
+            const observation echo_mixed{ get("echo:mixed") };
+            ctx.check("echo_mixed_round_trip",
+                      echo_mixed.value == "\xC3\xBC\xC3\xB1\xE2\x82\xAC");
+            ctx.check("echo_mixed_len_7", echo_mixed.byte_len == 7);
+
+            const observation echo_repl{ get("echo:replacement") };
+            ctx.check("echo_replacement_round_trip", echo_repl.value == "\xEF\xBF\xBD");
+            ctx.check("echo_replacement_len_3",      echo_repl.byte_len == 3);
+
+            const observation echo_resume{ get("echo:resume") };
+            ctx.check("echo_resume_round_trip", echo_resume.value == "r\xC3\xA9sum\xC3\xA9");
+            ctx.check("echo_resume_len_8",      echo_resume.byte_len == 8);
+
+            // Lone-high-surrogate ARG: the CESU-3-byte input arrives as a single
+            // UTF-16 unit (Java length 1) and the return re-encodes it to the same
+            // 3-byte CESU form on BOTH paths -> path-independent round-trip.
+            const observation echo_lone{ get("echo:lone_surrogate") };
+            ctx.check("echo_lone_surrogate_round_trip", echo_lone.value == "\xED\xA0\xBD");
+            ctx.check("echo_lone_surrogate_len_3",      echo_lone.byte_len == 3);
+            const observation len_lone{ get("lengthOf:lone_surrogate") };
+            ctx.check("lengthOf_lone_surrogate_one_unit", len_lone.value == "len=1");
+
+            // Combined astral+NUL ARG ("<emoji>\0z"): Java length 4 (2 surrogate
+            // units + U+0000 + 'z'), proven decoder-independently below.  The RETURN
+            // bytes diverge only by the astral + NUL encoding:
+            //   * call_stub  = standard UTF-8: F0 9F 98 80 00 7A (6 bytes, raw NUL).
+            //   * call_jni   = modified UTF-8: ED A0 BD ED B8 80 C0 80 7A (9 bytes,
+            //     CESU astral + C0 80 NUL).
+            const observation echo_emoji_nul{ get("echo:emoji_nul") };
+            ctx.record(std::string{ "[INFO] echo:emoji_nul (astral+NUL arg) = [" }
+                       + to_hex(echo_emoji_nul.value) + "]");
+            if (stub_path)
+            {
+                ctx.check("echo_emoji_nul_call_stub_bytes",
+                          echo_emoji_nul.value == std::string("\xF0\x9F\x98\x80\x00z", 6));
+                ctx.check("echo_emoji_nul_call_stub_len6", echo_emoji_nul.byte_len == 6);
+            }
+            else
+            {
+                ctx.check("echo_emoji_nul_call_jni_bytes",
+                          echo_emoji_nul.value
+                              == std::string("\xED\xA0\xBD\xED\xB8\x80\xC0\x80z", 9));
+                ctx.check("echo_emoji_nul_call_jni_len9", echo_emoji_nul.byte_len == 9);
+            }
+            // Decoder-independent: the astral+NUL arg arrived as 4 UTF-16 units (the
+            // surrogate pair + U+0000 + 'z'), proving NEITHER the astral pair was
+            // collapsed NOR the NUL truncated the arg.
+            const observation len_emoji_nul{ get("lengthOf:emoji_nul") };
+            ctx.check("lengthOf_emoji_nul_four_units", len_emoji_nul.value == "len=4");
+
+            // ============ Unicode / empty-arg multi-arg ======================
+
+            // concat of two Latin-1 args -> caf + U+00E9 + U+00E9 + sum, re-encoded
+            // by the live decoder.  BMP -> path-independent: caf C3A9 C3A9 sum.
+            const observation concat_uni{ get("concat:unicode") };
+            ctx.check("concat_unicode_value",
+                      concat_uni.value == "caf\xC3\xA9\xC3\xA9sum");
+            ctx.check("concat_unicode_len_10", concat_uni.byte_len == 10);
+
+            // concat with an empty FIRST arg -> identity of the second (the empty
+            // String arg is a real "" String in a multi-arg call, not null/dropped).
+            const observation concat_empty_lhs{ get("concat:empty_lhs") };
+            ctx.check("concat_empty_lhs_value", concat_empty_lhs.value == "tail");
+
+            // charAtOf(CJK, 1) -> the middle CJK char U+672C (3 bytes), proving a
+            // String+int->String overload returning a MULTIBYTE single char.  BMP,
+            // so path-independent and HARD-asserted (unlike the ASCII charAtOf case,
+            // which stays an [INFO] characterization).
+            const observation char_cjk{ get("charAtOf:cjk1") };
+            ctx.check("charAtOf_cjk1_value",  char_cjk.value == "\xE6\x9C\xAC");
+            ctx.check("charAtOf_cjk1_len_3",  char_cjk.byte_len == 3);
+
+            // ============ 16-bit length-boundary returns =====================
+            // 65535 / 65537 'A's straddle the 16-bit boundary; pure ASCII so both
+            // paths agree.  Proves the int32 arrayOop length read never truncates
+            // to 16 bits (a uint16 wraparound would give 0 or a tiny length).
+            const observation big65535{ get("bigString:65535") };
+            ctx.check("bigString65535_len_65535", big65535.byte_len == 65535);
+            ctx.check("bigString65535_all_A",     big65535.value == std::string(65535, 'A'));
+            const observation big65537{ get("bigString:65537") };
+            ctx.check("bigString65537_len_65537", big65537.byte_len == 65537);
+            ctx.check("bigString65537_all_A",     big65537.value == std::string(65537, 'A'));
+
+            // ============ STATIC unicode / fresh-OOP / arg-length ============
+
+            // Static Greek (2-byte) through the static dispatch path -> 4 bytes.
+            const observation s_greek{ get("static:staticGreek") };
+            ctx.check("staticGreek_value", s_greek.value == "\xCE\xB1\xCE\xB2");
+            ctx.check("staticGreek_len_4", s_greek.byte_len == 4);
+
+            // Static built-empty -> a fresh empty String via the STATIC path -> "".
+            const observation s_built_empty{ get("static:staticBuiltEmpty") };
+            ctx.check("staticBuiltEmpty_captured",    s_built_empty.captured);
+            ctx.check("staticBuiltEmpty_value_empty", s_built_empty.value.empty());
+
+            // STATIC arg-encoder length witnesses (decoder-independent "len=N"):
+            // the astral arg must arrive as 2 UTF-16 units and the interior-NUL arg
+            // as 3 units on the STATIC dispatch path too (not just the instance one),
+            // and a null arg must arrive as Java null.
+            const observation s_len_emoji{ get("staticLengthOf:emoji") };
+            ctx.check("staticLengthOf_emoji_two_units", s_len_emoji.value == "len=2");
+            const observation s_len_nul{ get("staticLengthOf:nul") };
+            ctx.check("staticLengthOf_nul_three_units", s_len_nul.value == "len=3");
+            const observation s_len_null{ get("staticLengthOf:null") };
+            ctx.check("staticLengthOf_null_is_java_null", s_len_null.value == "len=null");
+
             // ============ REGRESSION GUARD (the headline truncation bug) =====
             // The call-stub truncation bug made EVERY non-empty String return ""
             // on JDKs with the call stub.  Pin that it does not happen: known
@@ -1280,12 +1596,23 @@ namespace
             ctx.check("no_truncation_maxBmp_nonempty",        !max_bmp.value.empty());
             ctx.check("no_truncation_loneSurrogate_nonempty", !lone_hi.value.empty());
             ctx.check("no_truncation_unicodeWs_nonempty",     !uws.value.empty());
+            // Fresh (non-interned) unicode slice + length-1 multibyte returns are
+            // non-empty on both paths — a fresh sliced OOP and a single multibyte
+            // char are exactly the shapes a naive ASCII-only or interned-only decode
+            // would mishandle.
+            ctx.check("no_truncation_subCjk_nonempty",     !sub_cjk_full.value.empty());
+            ctx.check("no_truncation_singleCjk_nonempty",  !single_cjk.value.empty());
+            ctx.check("no_truncation_singleLatin1_nonempty", !single_lat.value.empty());
             // ARG-ENCODER guard (the fix): the astral and interior-NUL ARGS must come
             // back with MORE than one byte on every path — the old NewStringUTF encoder
             // collapsed the emoji to a single U+00F0 (2 bytes C3 B0) and truncated
             // "a\0b" to a one-byte "a".  A length-counted UTF-16 arg never does either.
             ctx.check("no_argtrunc_echoEmoji_multibyte", echo_emoji.byte_len >= 4);
             ctx.check("no_argtrunc_echoNul_past_nul",    echo_nul.byte_len >= 3);
+            // The combined astral+NUL arg must come back with MORE than the astral
+            // scalar alone — proving the trailing NUL + 'z' survived the arg encode
+            // (a C-string-cut encoder would stop at the NUL, dropping the 'z').
+            ctx.check("no_argtrunc_echoEmojiNul_past_nul", echo_emoji_nul.byte_len >= 6);
             // The >65536 return is now non-empty on BOTH paths (the old 4096
             // read_java_string cap that made the call_stub path return "" is gone —
             // robustness bug #29), so these "very long String survives in full" guards

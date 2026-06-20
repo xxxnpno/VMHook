@@ -179,6 +179,13 @@ namespace
         auto get_iValue() const -> std::int64_t { return get_field("iValue")->get(); }
         auto get_iLabel() const -> std::string  { return get_field("iLabel")->get().as_string(); }
 
+        // ---- INHERITED members (declared on superclass WrapperBase) ---------
+        // Resolved through the get_super() walk that every object_base
+        // get_field/get_method overload runs.  baseTag is an inherited INSTANCE
+        // field; baseStatic an inherited STATIC field on WrapperBase's mirror.
+        auto get_baseTag() const -> std::int32_t { return get_field("baseTag")->get(); }
+        static auto get_baseStatic() -> std::int32_t { return static_field("baseStatic")->get(); }
+
         // ---- exhaustive object-shape reference / array reads ----------------
         // A nested wrapped reference (a Node) decoded into its own wrapper.
         auto node() const -> std::unique_ptr<wp_node> { return get_field("node")->get(); }
@@ -311,6 +318,9 @@ namespace
     constexpr std::int32_t HEARTS_RANK = 3;
     const std::string      HELLO_GREETING{ "hello wrapper" };
     const std::string      NODE_HEAD_LABEL{ "node-head" };
+    // Inherited members declared on the superclass WrapperBase (section 18).
+    constexpr std::int32_t BASE_TAG    = 0x0BA5E000;
+    constexpr std::int32_t BASE_STATIC = 0x0BA5E5;
 
     // True if `haystack` ends with `suffix` (klass-name suffix checks).
     auto ends_with(const std::string& haystack, const std::string& suffix) -> bool
@@ -697,6 +707,55 @@ namespace
         if (inst)
         {
             ctx.check("instance_method_unknown_is_nullopt", inst->get_method("noSuchMethod").has_value() == false);
+        }
+    }
+
+    // =====================================================================
+    //  5a. STATIC/INSTANCE KIND GATE through the wrapper accessors.
+    //      The PORTABLE static accessors are kind-strict by construction:
+    //        * static_method(name) walks the klass but returns ONLY a method
+    //          whose ACC_STATIC bit is set (object_base::static_method_only gate,
+    //          vmhook.hpp:18099) — naming an INSTANCE method (getId) -> nullopt;
+    //        * static_field(name) requires entry->is_static (vmhook.hpp:17900) —
+    //          naming an INSTANCE field (iId) -> nullopt.
+    //      The instance get_field/get_method accessors, by contrast, are kind-
+    //      AGNOSTIC: they return the first NAME match regardless of kind and report
+    //      the JVM's truth via is_static().  So inst->get_method("staticTag")
+    //      RESOLVES (a static method reached through the instance accessor) and
+    //      reports is_static()==true — the method-side mirror of section 3's
+    //      static-field-through-the-instance-accessor check.  All thread-free
+    //      (klass scan only) -> HARD on every JDK.
+    // =====================================================================
+    {
+        // static accessor naming an INSTANCE member -> nullopt (kind-strict).
+        ctx.check("static_method_names_instance_method_nullopt",
+                  wp::static_method("getId").has_value() == false);
+        ctx.check("static_field_names_instance_field_nullopt",
+                  wp::static_field("iId").has_value() == false);
+        // ...and a name+signature static lookup of an instance method -> nullopt.
+        ctx.check("static_method_sig_names_instance_method_nullopt",
+                  wp::static_method("getId", "()I").has_value() == false);
+
+        if (inst)
+        {
+            // instance accessor naming a STATIC method -> RESOLVES, is_static()==true.
+            const auto sm_via_inst{ inst->get_method("staticTag") };
+            ctx.check("instance_method_accessor_resolves_static_method", sm_via_inst.has_value());
+            if (sm_via_inst)
+            {
+                ctx.check("instance_method_accessor_static_method_is_static_true",
+                          sm_via_inst->is_static() == true);
+                ctx.check("instance_method_accessor_static_method_name",
+                          sm_via_inst->name() == "staticTag");
+            }
+            // instance accessor naming an INSTANCE method -> is_static()==false
+            // (the kind-agnostic accessor reports the JVM truth either way).
+            const auto im_via_inst{ inst->get_method("getId") };
+            if (im_via_inst)
+            {
+                ctx.check("instance_method_accessor_instance_method_is_static_false",
+                          im_via_inst->is_static() == false);
+            }
         }
     }
 
@@ -1189,6 +1248,48 @@ namespace
     }
 
     // =====================================================================
+    //  7a. VALUE-SEMANTICS EDGES — self-assignment safety + a MOVED-FROM wrapper
+    //      is a usable null-oop wrapper (not merely "source nulled").
+    //        * copy SELF-assign keeps the OOP (copy-assign is =default; the move
+    //          guard `if (this != &other)` is on the MOVE path, vmhook.hpp:17778,
+    //          so this proves the copy path is self-safe by construction);
+    //        * move SELF-assign keeps the OOP (the self-guard returns early
+    //          WITHOUT nulling — the documented purpose of that guard);
+    //        * after a move-OUT, the source behaves exactly like a nullptr wrapper:
+    //          base OOP null, instance get_field nullopt, but static_field STILL
+    //          resolves through the mirror (a moved-from wrapper is safe to reuse).
+    //      All pure C++ object-model invariants over a live oop -> HARD.
+    // =====================================================================
+    if (inst && instance_oop)
+    {
+        // Self copy-assignment must not corrupt or drop the OOP.
+        wp self_copy{ instance_oop };
+        wp* const self_copy_alias{ &self_copy };
+        self_copy = *self_copy_alias;   // self copy-assign via an alias (no -Wself-assign)
+        ctx.check("self_copy_assign_keeps_oop",
+                  self_copy.vmhook::object_base::get_instance() == instance_oop);
+
+        // Self move-assignment hits the `this != &other` guard -> OOP preserved,
+        // NOT nulled (proving the guard's reason for being).
+        wp self_move{ instance_oop };
+        wp* const self_move_alias{ &self_move };
+        self_move = std::move(*self_move_alias);   // self move-assign via an alias
+        ctx.check("self_move_assign_keeps_oop_via_guard",
+                  self_move.vmhook::object_base::get_instance() == instance_oop);
+
+        // A MOVED-FROM wrapper is a fully usable null-oop wrapper.
+        wp donor{ instance_oop };
+        wp taker{ std::move(donor) };
+        (void)taker;
+        ctx.check("moved_from_wrapper_base_oop_null",
+                  donor.vmhook::object_base::get_instance() == nullptr);   // NOLINT(bugprone-use-after-move)
+        ctx.check("moved_from_wrapper_instance_field_nullopt",
+                  donor.get_field("iId").has_value() == false);            // NOLINT(bugprone-use-after-move)
+        ctx.check("moved_from_wrapper_static_field_still_resolves",
+                  donor.get_field("sTag").has_value());                    // NOLINT(bugprone-use-after-move)
+    }
+
+    // =====================================================================
     //  8. EQUALITY (characterized) — object_base has NO operator==, so equality
     //     is raw-OOP identity.  Two wrappers to the SAME instance share an OOP;
     //     DISTINCT instances differ; the alias static decodes to the same OOP.
@@ -1263,6 +1364,86 @@ namespace
         const wp_unregistered u{ nullptr };
         ctx.check("unregistered_type_instance_get_field_nullopt",
                   u.get_field("sTag").has_value() == false);
+    }
+
+    // =====================================================================
+    //  10a. A RAW object_base (the NON-CRTP base) over a LIVE oop.
+    //       A plain vmhook::object_base wraps any oop and round-trips it through
+    //       get_instance(), but its instance get_field/get_method resolve the
+    //       klass via typeid(*this) == typeid(object_base) (vmhook.hpp:18203),
+    //       which is NEVER register_class<>'d — so EVERY field/method lookup
+    //       returns nullopt gracefully (no crash), even over a perfectly valid
+    //       oop.  This pins the dynamic-type resolution contract: identity is
+    //       carried by the oop, but FIELD/METHOD dispatch needs the registered
+    //       wrapper type.  (The same gate flaw #3 notes for misused CRTP, here
+    //       exercised in the SAFE direction.)  Thread-free -> HARD.
+    // =====================================================================
+    if (inst && instance_oop)
+    {
+        const vmhook::object_base raw{ instance_oop };
+        // The oop round-trips by identity through the generic base.
+        ctx.check("raw_object_base_get_instance_matches", raw.get_instance() == instance_oop);
+        // But field/method dispatch is gated by the (unregistered) dynamic type.
+        ctx.check("raw_object_base_instance_field_nullopt",
+                  raw.get_field("iId").has_value() == false);
+        ctx.check("raw_object_base_static_field_nullopt",
+                  raw.get_field("sTag").has_value() == false);
+        ctx.check("raw_object_base_get_method_nullopt",
+                  raw.get_method("getId").has_value() == false);
+    }
+
+    // =====================================================================
+    //  10b. WRAPPER OVER A STALE / GARBAGE NON-NULL oop (flaw #1, SAFE contract).
+    //       object_base::get_field's INSTANCE branch (vmhook.hpp:17854-17861)
+    //       null-checks this->instance but does NOT is_valid_pointer-guard it
+    //       (the STATIC branch validates its mirror at 17843; the instance branch
+    //       does not).  So a wrapper built from a bogus-but-non-null, aligned oop
+    //       still RESOLVES an instance field -> the proxy aliases arbitrary memory
+    //       and a subsequent get()/set() would read/WRITE there.  We pin the SAFE
+    //       contract WITHOUT ever dereferencing it: the field RESOLVES
+    //       (has_value()==true) yet the wrapped oop is NOT is_valid_pointer, so a
+    //       caller MUST gate the deref (exactly what every section here does).  A
+    //       garbage value the JVM never maps + is_valid_pointer is the gate.  No
+    //       deref, no fault — characterizes the documented missing guard.
+    // =====================================================================
+    {
+        // A small, aligned, non-null sentinel the JVM will never have mapped as a
+        // heap oop.  We only ever test is_valid_pointer / has_value on it; never
+        // read through it, so it can never fault.
+        void* const garbage_oop{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x2A0u)) };
+        const wp stale{ garbage_oop };
+        // The wrapper holds exactly the bogus oop (base accessor is a raw copy).
+        // HARD: identity is just a raw pointer copy, independent of validity.
+        ctx.check("stale_oop_wrapper_holds_bogus_oop",
+                  stale.vmhook::object_base::get_instance() == garbage_oop);
+        // The SAFE contract a caller MUST honour (HARD, universal): the bogus oop
+        // fails is_valid_pointer, so a correct caller gates the deref and skips it.
+        ctx.check("stale_oop_is_not_valid_pointer",
+                  vmhook::hotspot::is_valid_pointer(garbage_oop) == false);
+        // CHARACTERIZATION (not HARD): the instance branch does NOT validate
+        // this->instance, so the field proxy is PRODUCED even over a garbage oop
+        // (flaw #1).  We record the current behaviour either way — never deref it —
+        // so a future is_valid_pointer guard in get_field would NOT redden this.
+        if (stale.get_field("iId").has_value())
+        {
+            ctx.record("[INFO] wrapper_pattern: get_field('iId') on a stale/garbage non-null "
+                       "oop currently RESOLVES (proxy produced) — flaw #1's unguarded instance "
+                       "branch; the proxy is never dereferenced here (is_valid_pointer gates it).");
+        }
+        else
+        {
+            ctx.record("[INFO] wrapper_pattern: get_field('iId') on a stale/garbage non-null "
+                       "oop returned nullopt on this build (the instance branch appears to "
+                       "validate this->instance — flaw #1 mitigated); no deref attempted.");
+        }
+        // Stable result line regardless of which branch ran (mutually exclusive).
+        ctx.check("stale_oop_instance_field_characterized", true);
+        ctx.record("[INFO] wrapper_pattern: object_base::get_field's instance branch "
+                   "(vmhook.hpp:17854-17861) does NOT is_valid_pointer-guard this->instance "
+                   "(only the static branch validates its mirror), so a wrapper built from a "
+                   "stale/garbage non-null oop yields a field_proxy aliasing arbitrary memory; "
+                   "callers must gate the deref with is_valid_pointer (flaw #1, low — masked "
+                   "in normal use because the value_t->unique_ptr decode paths validate first).");
     }
 
     // =====================================================================
@@ -1607,6 +1788,70 @@ namespace
             vmhook::object_base* const vobase{ via_object.get() };
             ctx.check("object_typed_field_base_view_identity",
                       vobase->get_instance() == instance_oop);
+        }
+    }
+
+    // =====================================================================
+    //  16a. INHERITED MEMBERS via the get_super() resolution walk.
+    //       WrapperPattern extends WrapperBase; the wrapper is registered for the
+    //       SUBCLASS only.  Every object_base get_field/get_method overload walks
+    //       k = k->get_super() (vmhook.hpp:17949/18014/18084), so the inherited
+    //       members resolve through the superclass even though no wrapper is
+    //       registered for WrapperBase:
+    //         * inherited INSTANCE field baseTag — read through the subclass oop;
+    //         * inherited STATIC field baseStatic — resolved through the DECLARING
+    //           class's mirror (find_field records declaring_klass, 17841/17909),
+    //           NOT the subclass mirror, so the value is correct;
+    //         * inherited INSTANCE method baseId — found up the super chain,
+    //           is_static()==false, exact signature ()J.
+    //       All thread-free (klass scan only) -> HARD on every JDK.
+    // =====================================================================
+    if (inst)
+    {
+        // Inherited INSTANCE field through the live subclass oop.
+        {
+            const auto p{ inst->get_field("baseTag") };
+            ctx.check("inherited_instance_field_baseTag_resolves", p.has_value());
+            if (p)
+            {
+                ctx.check("inherited_instance_field_baseTag_is_static_false",
+                          p->is_static() == false);
+                ctx.check("inherited_instance_field_baseTag_value",
+                          static_cast<std::int32_t>(p->get()) == BASE_TAG);
+                ctx.check("inherited_instance_field_baseTag_signature_I",
+                          std::string{ p->signature() } == "I");
+            }
+        }
+        // The clean accessor reads the same inherited value.
+        ctx.check("inherited_instance_field_baseTag_via_accessor",
+                  inst->get_baseTag() == BASE_TAG);
+
+        // Inherited STATIC field — resolved via the DECLARING class's mirror.
+        {
+            const auto p{ wp::static_field("baseStatic") };
+            ctx.check("inherited_static_field_baseStatic_resolves", p.has_value());
+            if (p)
+            {
+                ctx.check("inherited_static_field_baseStatic_is_static_true",
+                          p->is_static() == true);
+                ctx.check("inherited_static_field_baseStatic_value",
+                          static_cast<std::int32_t>(p->get()) == BASE_STATIC);
+            }
+        }
+        ctx.check("inherited_static_field_baseStatic_via_accessor",
+                  wp::get_baseStatic() == BASE_STATIC);
+
+        // Inherited INSTANCE method found up the super chain.
+        {
+            const auto m{ inst->get_method("baseId") };
+            ctx.check("inherited_instance_method_baseId_resolves", m.has_value());
+            if (m)
+            {
+                ctx.check("inherited_instance_method_baseId_is_static_false",
+                          m->is_static() == false);
+                ctx.check("inherited_instance_method_baseId_signature_J",
+                          std::string{ m->signature() } == "()J");
+            }
         }
     }
 

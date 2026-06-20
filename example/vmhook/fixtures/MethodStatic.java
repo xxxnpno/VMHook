@@ -366,6 +366,77 @@ public final class MethodStatic
     }
 
     // ======================================================================
+    //  BATCH-18 DEEPENING — additional slot-shape / boundary methods.
+    //  Every method here RETURNS a deterministic digest of its arguments so the
+    //  native side proves the C++ arg-packer mapped each value to the right
+    //  slot (and, for long/double, the right WIDE pair) with no receiver shift.
+    //  All RETURNS are primitive, hence bit-identical on the call_stub and
+    //  call_jni paths => hard-asserted on every JDK.
+    // ======================================================================
+
+    /**
+     * Eight ints — EXACTLY the maximum argument fan-out both dispatch paths
+     * support for a static call (the call-stub params[8] slot array and the
+     * call_jni jvalue[8] array are each capped at 8, enforced at compile time;
+     * a static call has no receiver so all eight slots carry real arguments).
+     * Returns a position-weighted sum so any single mis-slot is detectable.
+     */
+    public static int s8Ints(final int a, final int b, final int c, final int d,
+                             final int e, final int f, final int g, final int h)
+    {
+        return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8;
+    }
+
+    /**
+     * Wide/narrow interleave: long, int, long, int — four PACKED arg values, two
+     * of them WIDE (each long occupies two interpreter locals but one C++ pack
+     * slot).  Returns a digest where each argument lands in a disjoint range so a
+     * transposition of either wide pair, or of either narrow int, changes the
+     * result.  Complements sPackPrims (which trails its single long).
+     */
+    public static long sWideShape(final long p, final int q, final long r, final int s)
+    {
+        return p * 7L + ((long) q << 3) + r * 31L + ((long) s << 50);
+    }
+
+    /**
+     * Three doubles — three consecutive WIDE pairs, no narrow slot between them.
+     * Returns a position-weighted mix (all terms exactly representable) so the
+     * packer's handling of back-to-back two-slot arguments is bit-checked.
+     */
+    public static double sThreeD(final double a, final double b, final double c)
+    {
+        return a * 64.0 + b * 8.0 + c;
+    }
+
+    /**
+     * Reuse-the-proxy probe: a plain int echo with a DIFFERENT name from
+     * sEchoInt so a single resolved proxy can be call()'d twice with distinct
+     * arguments and each result checked — proving a method_proxy is not
+     * single-shot.  Returns its argument unchanged.
+     */
+    public static int sEchoInt2(final int v) { return v; }
+
+    /**
+     * Records the identity hash of an object argument exactly like sArgIdentity,
+     * but is a SECOND method so a child returned by one static call can be fed
+     * back in as the argument of another (proving an oop the library itself
+     * decoded round-trips back through the arg-packer).  Returns the identity
+     * (0 for null).
+     */
+    public static int sArgIdentity2(final Object arg)
+    {
+        return (arg == null) ? 0 : System.identityHashCode(arg);
+    }
+
+    /** Length of a String argument (-1 for null) — distinct null-String-ARG path
+     *  from the null-String-RETURN cases.  A null arg must yield -1, NOT crash. */
+    public static int sStringArgLen(final String arg)
+    {
+        return (arg == null) ? -1 : arg.length();
+    }
+
+    // ======================================================================
     //  OVERLOADED static methods — all named "sPoly", told apart by signature.
     //  Each returns a DISTINCT sentinel so the native side proves WHICH overload
     //  resolved, both by C++ argument type and by an explicit signature pin.
@@ -465,6 +536,16 @@ public final class MethodStatic
         int IFACE_STATIC_VALUE = 0x8484;  // 33924  (interface fields are implicitly static final)
 
         static int ifaceStaticValue() { return IFACE_STATIC_VALUE; }
+
+        /**
+         * An interface DEFAULT method (Java 8+).  A default method is a NON-static
+         * INSTANCE method that lives on the interface's own _methods array, so it
+         * is exactly the trap the static-resolution gate must reject:
+         * static_method("ifaceDefaultValue") on the interface wrapper must return
+         * nullopt (the JVM_ACC_STATIC filter skips it), even though a name-only
+         * scan of the interface klass would otherwise match it.
+         */
+        default int ifaceDefaultValue() { return 0x4242; }
     }
 
     // ======================================================================

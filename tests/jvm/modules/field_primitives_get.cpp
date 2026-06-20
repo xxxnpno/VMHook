@@ -1309,6 +1309,258 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
     }
 
     // =====================================================================
+    //  is_reference() / as_string() NEGATIVE space on PRIMITIVES (batch-18).
+    //  Every primitive descriptor stores a numeric/bool variant alternative, so
+    //  is_reference() (true only for the uint32 compressed-OOP alternative) must
+    //  be FALSE, and as_string() must yield "" (it decodes only the uint32
+    //  alternative).  This complements data.index(): the index pins WHICH
+    //  primitive alternative; is_reference()==false pins that it is NOT the OOP
+    //  alternative — the exact predicate a caller uses to branch ref-vs-value.
+    // =====================================================================
+    {
+        const char* prim_fields[] = {
+            "sBoolTrue", "sByteMin", "sShortMax", "sIntMin", "sLongMax",
+            "sFloatPi", "sDoublePi", "sCharMax"
+        };
+        for (const char* field : prim_fields)
+        {
+            auto fp{ fpg::static_field(field) };
+            ctx.check(std::string{ "prim_resolves_" } + field, fp.has_value());
+            if (!fp) { continue; }
+            const auto v{ fp->get() };
+            ctx.check(std::string{ "prim_is_reference_false_" } + field,
+                      v.is_reference() == false);
+            ctx.check(std::string{ "prim_as_string_empty_" } + field,
+                      v.as_string().empty());
+        }
+    }
+
+    // =====================================================================
+    //  REAL reference field (String) — POSITIVE counterpart: is_reference()
+    //  must be TRUE (the uint32 OOP alternative) and as_string() must decode the
+    //  genuine java.lang.String, proving the predicate/decoder that the
+    //  primitives above correctly REJECT.  Degrades to [INFO] only if the field
+    //  is absent (it is declared in the fixture, so it resolves on every run).
+    // =====================================================================
+    {
+        auto fp{ fpg::static_field("sRefString") };
+        if (fp)
+        {
+            const auto v{ fp->get() };
+            ctx.check("ref_string_variant_is_uint32", v.data.index() == kIdxU32);
+            ctx.check("ref_string_is_reference_true", v.is_reference() == true);
+            ctx.check("ref_string_signature", v.signature == "Ljava/lang/String;");
+            ctx.check("ref_string_as_string_value", v.as_string() == "vmhook-fpg-ref");
+        }
+        else
+        {
+            ctx.record("[INFO] field_primitives_get: sRefString absent; skipping "
+                       "the reference-field is_reference()/as_string() positive checks.");
+        }
+    }
+
+    // =====================================================================
+    //  FINITE float/double -> integer conversion path (batch-18).  The audit
+    //  flags static_cast<int>(non-finite) as UB and static_cast<bool>(NaN) as a
+    //  spurious true; the CONVERSE — a FINITE F/D field converted to an integer
+    //  target — is well-defined C++ truncation toward zero, and the module never
+    //  exercised it.  Read each finite operand through get() and assert the int
+    //  conversion truncates toward zero, the long conversion agrees, and the bool
+    //  conversion is (value != 0).  Operands are exactly representable so there is
+    //  no rounding ambiguity; only FINITE fields are used here (the UB case is
+    //  deliberately NOT executed).
+    // =====================================================================
+    {
+        auto chk_f2i = [&](const char* field, int expected_int, bool expected_bool)
+        {
+            auto fp{ fpg::static_field(field) };
+            ctx.check(std::string{ "f2i_resolves_" } + field, fp.has_value());
+            if (!fp) { return; }
+            const auto v{ fp->get() };
+            ctx.check(std::string{ "f2i_variant_is_float_" } + field, v.data.index() == kIdxFloat);
+            const int as_int{ v };
+            ctx.check(std::string{ "f2i_int_truncates_" } + field, as_int == expected_int);
+            const std::int64_t as_long{ v };
+            ctx.check(std::string{ "f2i_long_agrees_" } + field,
+                      as_long == static_cast<std::int64_t>(expected_int));
+            const bool as_bool{ v };
+            ctx.check(std::string{ "f2i_bool_is_nonzero_" } + field, as_bool == expected_bool);
+        };
+        chk_f2i("sFloatIntTwo",       2, true);
+        chk_f2i("sFloatNegThreeHalf", -1, true); // -1.5 -> -1 toward zero
+        chk_f2i("sFloatFracDn",       2, true);  //  2.75 -> 2 toward zero
+        chk_f2i("sFloatPosZero",      0, false); // +0.0 -> 0, bool false
+        // 2^20 exceeds short range but is exactly representable: int conversion exact.
+        {
+            auto fp{ fpg::static_field("sFloatBigExact") };
+            if (fp) { const int g{ fp->get() }; ctx.check("f2i_float_big_exact", g == 1048576); }
+        }
+
+        auto chk_d2i = [&](const char* field, int expected_int, bool expected_bool)
+        {
+            auto fp{ fpg::static_field(field) };
+            ctx.check(std::string{ "d2i_resolves_" } + field, fp.has_value());
+            if (!fp) { return; }
+            const auto v{ fp->get() };
+            ctx.check(std::string{ "d2i_variant_is_double_" } + field, v.data.index() == kIdxDouble);
+            const int as_int{ v };
+            ctx.check(std::string{ "d2i_int_truncates_" } + field, as_int == expected_int);
+            const std::int64_t as_long{ v };
+            ctx.check(std::string{ "d2i_long_agrees_" } + field,
+                      as_long == static_cast<std::int64_t>(expected_int));
+            const bool as_bool{ v };
+            ctx.check(std::string{ "d2i_bool_is_nonzero_" } + field, as_bool == expected_bool);
+        };
+        chk_d2i("sDoubleIntThree",    3, true);
+        chk_d2i("sDoubleNegFiveHalf", -2, true); // -2.5 -> -2 toward zero
+        chk_d2i("sDoubleFracDn",      3, true);  //  3.25 -> 3 toward zero
+        chk_d2i("sDoublePosZero",     0, false); // +0.0 -> 0, bool false
+        {
+            auto fp{ fpg::static_field("sDoubleBigExact") };
+            if (fp) { const long long g{ fp->get() }; ctx.check("d2i_double_big_exact", g == 16777216LL); }
+        }
+    }
+
+    // =====================================================================
+    //  EXTRA char-narrowing witnesses (batch-18).  The module pins narrowing on
+    //  Bmp/HighBit; extend to the surrogate units and the high-bit alternating
+    //  pattern, where the lossless uint16/char16 path keeps the full code unit
+    //  while a 1-byte C++ char truncates to the low byte (audit: silent char
+    //  narrowing).  Each asserts BOTH the lossless full value AND the low byte.
+    // =====================================================================
+    {
+        struct narrow_case { const char* field; std::uint16_t full; unsigned char low; };
+        const narrow_case cases[] = {
+            { "sCharHiSurr",  0xD83D, 0x3D },
+            { "sCharLoSurr",  0xDE00, 0x00 },
+            { "sChar0xAAAA",  0xAAAA, 0xAA },
+            { "sCharPostSurr", 0xE000, 0x00 },
+        };
+        for (const auto& c : cases)
+        {
+            auto fp{ fpg::static_field(c.field) };
+            if (!fp) { continue; }
+            const auto v{ fp->get() };
+            const std::uint16_t full{ v };
+            const char16_t wide{ v };
+            const char narrowed{ v };
+            ctx.check(std::string{ "C_narrow_full_lossless_" } + c.field, full == c.full);
+            ctx.check(std::string{ "C_narrow_char16_lossless_" } + c.field,
+                      wide == static_cast<char16_t>(c.full));
+            ctx.check(std::string{ "C_narrow_char_low_byte_" } + c.field,
+                      static_cast<unsigned char>(narrowed) == c.low);
+        }
+    }
+
+    // =====================================================================
+    //  Per-type signature() ACCESSOR parity (batch-18).  The value_t.signature
+    //  member is asserted per field above; here the field_proxy::signature()
+    //  METHOD is round-tripped for EVERY primitive descriptor (only "I" was
+    //  covered).  Pins that the descriptor the proxy carries is the exact one
+    //  get() dispatched on, for each of Z B S I J F D C.
+    // =====================================================================
+    {
+        struct sig_case { const char* field; const char* sig; };
+        const sig_case sigs[] = {
+            { "sBoolTrue", "Z" }, { "sByteMin", "B" }, { "sShortMax", "S" },
+            { "sIntMin", "I" },   { "sLongMax", "J" }, { "sFloatPi", "F" },
+            { "sDoublePi", "D" }, { "sCharMax", "C" },
+        };
+        for (const auto& sc : sigs)
+        {
+            auto fp{ fpg::static_field(sc.field) };
+            if (!fp) { continue; }
+            ctx.check(std::string{ "signature_method_" } + sc.field,
+                      std::string{ fp->signature() } == sc.sig);
+            ctx.check(std::string{ "signature_method_is_static_" } + sc.field,
+                      fp->is_static() == true);
+        }
+    }
+
+    // =====================================================================
+    //  raw_address width-alignment for EVERY primitive width (batch-18).  The
+    //  module checked int (4) and double (8); extend to byte/bool (1), short/char
+    //  (2), long (8) and float (4) — get() reads exactly sizeof(width) bytes from
+    //  this pointer, so the pointer must be non-null and at least natural-width
+    //  aligned for each descriptor.  (1-byte fields are trivially 1-aligned; we
+    //  still assert non-null to pin the resolved address exists.)
+    // =====================================================================
+    {
+        auto chk_addr = [&](const char* field, std::size_t align)
+        {
+            auto fp{ fpg::static_field(field) };
+            if (!fp) { return; }
+            const void* a{ fp->raw_address() };
+            ctx.check(std::string{ "addr_nonnull_" } + field, a != nullptr);
+            const auto u{ reinterpret_cast<std::uintptr_t>(a) };
+            ctx.check(std::string{ "addr_aligned_" } + field, (u % align) == 0);
+        };
+        chk_addr("sByteMax",  1);
+        chk_addr("sBoolTrue", 1);
+        chk_addr("sShortMax", alignof(std::int16_t));
+        chk_addr("sCharMax",  alignof(std::uint16_t));
+        chk_addr("sLongMax",  alignof(std::int64_t));
+        chk_addr("sFloatPi",  alignof(float));
+    }
+
+    // =====================================================================
+    //  Repeatability for F and C (batch-18).  Only J was re-read twice; extend
+    //  the purity proof (value + variant alternative stable across two reads) to
+    //  a float bit pattern and a char, confirming get() is a side-effect-free
+    //  copy for those descriptors too.
+    // =====================================================================
+    {
+        auto fa{ fpg::static_field("sFloatNaNPay") };
+        auto fb{ fpg::static_field("sFloatNaNPay") };
+        if (fa && fb)
+        {
+            const auto va{ fa->get() };
+            const auto vb{ fb->get() };
+            const float a{ va };
+            const float b{ vb };
+            ctx.check("repeatable_F_same_bits", float_bits(a) == float_bits(b));
+            ctx.check("repeatable_F_same_variant", va.data.index() == vb.data.index());
+        }
+        auto ca{ fpg::static_field("sCharBmp") };
+        auto cb{ fpg::static_field("sCharBmp") };
+        if (ca && cb)
+        {
+            const auto va{ ca->get() };
+            const auto vb{ cb->get() };
+            const std::uint16_t a{ va };
+            const std::uint16_t b{ vb };
+            ctx.check("repeatable_C_same_value", a == b && a == 0x4E2D);
+            ctx.check("repeatable_C_same_variant", va.data.index() == vb.data.index());
+        }
+    }
+
+    // =====================================================================
+    //  Mixed-width neighbour sign-extension witness (batch-18).  mixByte (0x5A)
+    //  sits between two ints; reading it is value-checked above, but its
+    //  sign/zero-extension and is_reference()==false were not pinned.  0x5A is a
+    //  positive byte (high bit clear) so it widens to int 90 and to uint32 0x5A
+    //  with NO sign extension — the positive-byte counterpart to the 0xFF/0xAA
+    //  sign-extension witnesses.
+    // =====================================================================
+    {
+        const auto inst{ fpg::get_instance() };
+        if (inst)
+        {
+            auto fp{ inst->get_field("mixByte") };
+            if (fp)
+            {
+                const auto v{ fp->get() };
+                ctx.check("mixByte_variant_is_int8", v.data.index() == kIdxI8);
+                ctx.check("mixByte_is_reference_false", v.is_reference() == false);
+                const int widened{ v };
+                ctx.check("mixByte_widens_to_90", widened == 90);
+                const std::uint32_t u{ v };
+                ctx.check("mixByte_unsigned_no_signext", u == 0x5Au);
+            }
+        }
+    }
+
+    // =====================================================================
     //  raw_address sanity: a resolved primitive proxy exposes a non-null,
     //  width-aligned field address (get() reads from exactly this pointer).
     // =====================================================================

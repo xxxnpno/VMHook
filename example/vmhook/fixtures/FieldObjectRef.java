@@ -146,11 +146,21 @@ public final class FieldObjectRef
         public String label;
         public Ref next;        // nested object reference (a Ref-typed field on a Ref)
 
+        /**
+         * An INHERITED object-reference field: declared on the base Ref and so
+         * present (at the SAME offset) on every SubRef.  Wired in run() to the
+         * holding FieldObjectRef, so the native side can read an inherited 'L'
+         * slot through a SubRef wrapper and confirm it decodes to the owner
+         * instance (the inherited-object-field angle).
+         */
+        public FieldObjectRef owner;
+
         public Ref(final int val, final String label)
         {
             this.val = val;
             this.label = label;
             this.next = null;
+            this.owner = null;
         }
 
         /** Method dispatched through a field-decoded wrapper (usability proof). */
@@ -206,6 +216,10 @@ public final class FieldObjectRef
     public static final String POLY_REF_LABEL   = "poly-ref";
     public static final int    WRITABLE_REF_VAL = 0x1357;   // writableRef seed value
     public static final int    SET_TARGET_VAL   = 0x2468;   // the ref the SET test writes
+    public static final int    CYCLE_REF_VAL    = 0x1A2B;   // self-cycle Ref's val
+    public static final int    CHAIN_HEAD_VAL   = 0x0C0C;   // depth-2 chain head val
+    public static final int    CHAIN_MID_VAL    = 0x0D0D;   // depth-2 chain middle val
+    public static final int    CHAIN_TAIL_VAL   = 0x0E0E;   // depth-2 chain tail val
     public static final String WRITABLE_STR_SEED = "writable-seed";
     public static final String SET_STR_VALUE     = "set-via-native";
 
@@ -261,6 +275,23 @@ public final class FieldObjectRef
      * guard accepts a subclass-through-base read (SubRef IS-A Ref).
      */
     public Ref polyRef = new SubRef(POLY_REF_VAL, POLY_REF_LABEL, POLY_REF_EXTRA);
+
+    /**
+     * SELF-CYCLE angle: a Ref whose `next` is wired (in run()) to point back at
+     * itself.  Proves the field decode reads a slot WITHOUT recursing: reading
+     * cycleRef.next must yield the SAME oop as cycleRef (a one-step self-loop),
+     * and the decode must not loop forever.  Left unwired at construction so the
+     * eager field initialisers never form a cycle before run().
+     */
+    public Ref cycleRef = makeRef(CYCLE_REF_VAL, "cycle-ref");
+
+    /**
+     * DEPTH-2 nested chain angle: a Ref whose `next.next` is wired in run().
+     * Proves the recursive object-ref decode works more than one level deep
+     * (ref.next.next), each level a fresh field decode through the prior
+     * field-decoded wrapper.
+     */
+    public Ref chainHead = makeRef(CHAIN_HEAD_VAL, "chain-head");
 
     // ── NULL reference shapes across every declared type (null-slot invariant) ─
     /** Null java.lang.Object reference. */
@@ -349,6 +380,10 @@ public final class FieldObjectRef
     public static volatile int objAsRefIdentity;
     public static volatile int objAsStringIdentity;
     public static volatile int polyRefIdentity;
+    public static volatile int ownerIdentity;        // ref.owner (inherited object slot via Ref)
+    public static volatile int polyOwnerIdentity;    // polyRef.owner (inherited object slot via SubRef)
+    public static volatile int cycleRefIdentity;     // cycleRef (self-loop receiver)
+    public static volatile int chainTailIdentity;    // chainHead.next.next (depth-2 nested)
 
     /** Helper so the field initialisers and run() build Refs identically. */
     private static Ref makeRef(final int val, final String label)
@@ -407,6 +442,28 @@ public final class FieldObjectRef
                     s.other = makeOther();
                 }
 
+                // INHERITED OBJECT FIELD: wire the `owner` slot (declared on Ref,
+                // inherited by SubRef) on both a plain Ref and the SubRef so the
+                // native side can read an inherited 'L' slot through both wrappers.
+                s.ref.owner = s;
+                s.polyRef.owner = s;
+
+                // SELF-CYCLE: point cycleRef.next back at cycleRef itself (a
+                // one-step self-loop the native decode must read without recursing).
+                if (s.cycleRef.next == null)
+                {
+                    s.cycleRef.next = s.cycleRef;
+                }
+
+                // DEPTH-2 chain: chainHead -> mid -> tail, each its own object, so
+                // a native ref.next.next walk decodes two levels deep.
+                if (s.chainHead.next == null)
+                {
+                    final Ref mid = makeRef(CHAIN_MID_VAL, "chain-mid");
+                    mid.next = makeRef(CHAIN_TAIL_VAL, "chain-tail");
+                    s.chainHead.next = mid;
+                }
+
                 // Publish identities the native side cross-checks against the
                 // OOPs it decodes from each field slot.
                 FieldObjectRef.refIdentity            = System.identityHashCode(s.ref);
@@ -425,6 +482,10 @@ public final class FieldObjectRef
                 FieldObjectRef.objAsRefIdentity       = System.identityHashCode(s.objAsRef);
                 FieldObjectRef.objAsStringIdentity    = System.identityHashCode(s.objAsString);
                 FieldObjectRef.polyRefIdentity        = System.identityHashCode(s.polyRef);
+                FieldObjectRef.ownerIdentity          = System.identityHashCode(s.ref.owner);
+                FieldObjectRef.polyOwnerIdentity      = System.identityHashCode(s.polyRef.owner);
+                FieldObjectRef.cycleRefIdentity       = System.identityHashCode(s.cycleRef);
+                FieldObjectRef.chainTailIdentity      = System.identityHashCode(s.chainHead.next.next);
 
                 // Real bytecode dispatch -> native interpreter hook fires.
                 s.tick(7);

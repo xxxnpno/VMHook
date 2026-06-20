@@ -458,6 +458,54 @@ public final class MethodString
     }
 
     /**
+     * substring(begin, end) of a native-supplied String -- yields a FRESH
+     * (non-interned) String OOP whose content is a slice of the arg.  Lets the
+     * native side prove fresh-OOP decode of a unicode slice and of an EMPTY slice
+     * (begin == end) that is distinct from the literal {@link #empty()}.
+     */
+    public String subOf(String value, int begin, int end)
+    {
+        return value.substring(begin, end);
+    }
+
+    /**
+     * Returns a String of exactly {@code n} 'A' characters built via a fresh
+     * StringBuilder (clamped to 0..8192), so the native side can request an EMPTY
+     * builder result (n == 0) -- a fresh empty String OOP distinct from the
+     * interned literal "".
+     */
+    public String builtA(int n)
+    {
+        int count = n;
+        if (count < 0)
+        {
+            count = 0;
+        }
+        if (count > 8192)
+        {
+            count = 8192;
+        }
+        StringBuilder sb = new StringBuilder(count);
+        for (int i = 0; i < count; i++)
+        {
+            sb.append('A');
+        }
+        return sb.toString();
+    }
+
+    /** A single CJK char U+65E5 (Java length 1, 3 bytes UTF-8) -- length-1 multibyte. */
+    public String singleCjk()
+    {
+        return "\u65e5";
+    }
+
+    /** A single Latin-1 high char U+00E9 (Java length 1, 2 bytes UTF-8). */
+    public String singleLatin1()
+    {
+        return "\u00e9";
+    }
+
+    /**
      * Returns a String whose length is exactly {@code n} (clamped to 0..8192),
      * filled with 'A'.  Lets the native side probe the 4096-char backing-array
      * cap that {@code read_java_string} enforces and that {@code make_java_string}
@@ -579,6 +627,38 @@ public final class MethodString
     public static String staticLoneSurrogate()
     {
         return LONE_HIGH_SURROGATE;
+    }
+
+    /** Static single Greek char U+03B1 (2-byte multibyte) via the static path. */
+    public static String staticGreek()
+    {
+        return GREEK;
+    }
+
+    /**
+     * Static empty-builder result via the static call path: a fresh empty String
+     * OOP (built, NOT the interned literal "") -- the static counterpart of the
+     * built-empty boundary the native side probes through {@link #builtA(int)}.
+     */
+    public static String staticBuiltEmpty()
+    {
+        StringBuilder sb = new StringBuilder();
+        return sb.toString();
+    }
+
+    /**
+     * Static String-arg length probe through the static call path: returns
+     * "len=null" for a null arg, else "len=" + the arg's Java char (UTF-16 unit)
+     * count.  Lets the native side prove the STATIC arg-encoder built the right
+     * length for astral / interior-NUL args (a decoder-independent witness).
+     */
+    public static String staticLengthOf(String value)
+    {
+        if (value == null)
+        {
+            return "len=null";
+        }
+        return "len=" + value.length();
     }
 
     /**

@@ -457,6 +457,42 @@ namespace
     constexpr std::int32_t k_poly_float   = 7006;
     constexpr std::int32_t k_poly_intlong = 7007;
 
+    // ===================== mstat3_* BATCH-18 DEEPENING ======================
+    // (L) 8-arg static call — EXACTLY the maximum both dispatch paths support
+    //     (params[8] / jvalue[8], compile-time capped at 8; a static call has no
+    //     receiver so all 8 slots carry real args).  Position-weighted sum, HARD.
+    std::atomic<std::int64_t> g_eight_ints{ k_uncaptured };       // s8Ints(1..8)
+
+    // (M) wide/narrow interleave + back-to-back wide pairs (RETURN only, HARD).
+    std::atomic<std::int64_t>  g_wide_shape{ k_uncaptured };      // sWideShape(J,I,J,I)
+    std::atomic<std::uint64_t> g_three_d{ 0 };                    // sThreeD(D,D,D) raw bits
+    std::atomic<bool>          g_three_d_captured{ false };
+
+    // (N) proxy REUSE — one resolved proxy, two call()s with distinct args.
+    std::atomic<std::int64_t> g_reuse_first{ k_uncaptured };      // sEchoInt2 call #1
+    std::atomic<std::int64_t> g_reuse_second{ k_uncaptured };     // sEchoInt2 call #2 (same proxy)
+
+    // (O) object-arg ROUND-TRIP of a library-decoded child (path-dependent on the
+    //     child being non-null, so the comparison is gated; the no-crash + null
+    //     branch are path-independent and hard-asserted).
+    std::atomic<int> g_roundtrip_attempted{ 0 };                  // 1 once a non-null child was obtained
+    std::atomic<int> g_roundtrip_identity_matches{ -1 };          // id via sArgIdentity2 == id via sArgIdentity
+    std::atomic<int> g_roundtrip_null_zero{ -1 };                 // sArgIdentity2(null) == 0 (path-indep)
+
+    // (P) null + non-trivial String ARGUMENT (distinct from null String RETURN).
+    std::atomic<std::int64_t> g_string_arg_len_null{ k_uncaptured };    // sStringArgLen(null) -> -1
+    std::atomic<std::int64_t> g_string_arg_len_unicode{ k_uncaptured }; // sStringArgLen("café") -> 4 code units
+
+    // (Q) interface DEFAULT (instance) method is REJECTED by the static gate.
+    std::atomic<int> g_iface_default_rejected{ -1 };  // static_method("ifaceDefaultValue").has_value()==0
+    std::atomic<int> g_iface_default_sig_rejected{ -1 }; // name+sig form also rejected
+
+    // (R) INHERITED static via the SUB resolved by NAME+SIGNATURE (the pinned
+    //     path through the super-chain walk; the module already covers name-only).
+    std::atomic<int> g_inherited_sig_resolves{ -1 };
+    std::atomic<int> g_inherited_sig_is_static{ -1 };
+    std::atomic<std::int64_t> g_inherited_sig_ret{ k_uncaptured };  // -> 0x5151
+
     auto run_all_calls(const std::unique_ptr<method_static>& self) -> void
     {
         // ============================== PRIMITIVES ==============================
@@ -990,6 +1026,93 @@ namespace
             g_sig_instance_rejected.store(inst_sig.has_value() ? 1 : 0);
         }
 
+        // ##################################################################
+        //  mstat3_* — BATCH-18 DEEPENING (new inputs; all primitive returns are
+        //  path-independent + HARD unless noted).
+        // ##################################################################
+
+        // ---- (L) 8-arg static call — the maximum arity (no receiver) ----
+        // params[8]/jvalue[8] are both compile-time capped at 8 (a 9-arg call()
+        // would fail to COMPILE on either path — so 8 is the tested ceiling and
+        // a runtime 9-arg overflow case is impossible by construction).
+        g_eight_ints.store(static_cast<std::int32_t>(
+            method_static::static_method("s8Ints")->call(
+                std::int32_t{ 1 }, std::int32_t{ 2 }, std::int32_t{ 3 }, std::int32_t{ 4 },
+                std::int32_t{ 5 }, std::int32_t{ 6 }, std::int32_t{ 7 }, std::int32_t{ 8 })));
+
+        // ---- (M) wide/narrow interleave + back-to-back wide pairs ----
+        g_wide_shape.store(static_cast<std::int64_t>(
+            method_static::static_method("sWideShape")->call(
+                std::int64_t{ 0x0011223344556677LL }, std::int32_t{ 3 },
+                std::int64_t{ 0x7766554433221100LL }, std::int32_t{ -5 })));
+        g_three_d.store(d2bits(static_cast<double>(
+            method_static::static_method("sThreeD")->call(1.5, 0.25, 0.125))));
+        g_three_d_captured.store(true);
+
+        // ---- (N) proxy REUSE — one proxy, two call()s ----
+        {
+            auto p = method_static::static_method("sEchoInt2");
+            if (p)
+            {
+                g_reuse_first.store(static_cast<std::int32_t>(p->call(std::int32_t{ 111 })));
+                g_reuse_second.store(static_cast<std::int32_t>(p->call(std::int32_t{ -222 })));
+            }
+        }
+
+        // ---- (O) object-arg ROUND-TRIP of a library-decoded child ----
+        // sMakeChild returns a real child whose usability is call-path dependent;
+        // when it is non-null we feed its oop BACK in as the argument of
+        // sArgIdentity2 and confirm the identity hash matches what sArgIdentity
+        // reports for the same oop.  The null branch is path-independent.
+        {
+            std::unique_ptr<method_static> child = method_static::static_method("sMakeChild")->call();
+            if (child != nullptr)
+            {
+                const vmhook::oop_t child_oop{ child->get_instance() };
+                if (child_oop != nullptr)
+                {
+                    g_roundtrip_attempted.store(1);
+                    auto c1{ std::make_unique<oop_carrier>(child_oop) };
+                    const std::int32_t id_a = method_static::static_method("sArgIdentity2")->call(std::move(c1));
+                    auto c2{ std::make_unique<oop_carrier>(child_oop) };
+                    const std::int32_t id_b = method_static::static_method("sArgIdentity")->call(std::move(c2));
+                    g_roundtrip_identity_matches.store((id_a != 0 && id_a == id_b) ? 1 : 0);
+                }
+            }
+            std::unique_ptr<oop_carrier> none{};
+            g_roundtrip_null_zero.store(
+                static_cast<std::int64_t>(
+                    method_static::static_method("sArgIdentity2")->call(std::move(none))) == 0 ? 1 : 0);
+        }
+
+        // ---- (P) null + non-trivial String ARGUMENT ----
+        {
+            std::unique_ptr<oop_carrier> none{};
+            g_string_arg_len_null.store(static_cast<std::int32_t>(
+                method_static::static_method("sStringArgLen")->call(std::move(none))));
+        }
+        g_string_arg_len_unicode.store(static_cast<std::int32_t>(
+            method_static::static_method("sStringArgLen")->call(std::string{ "caf\xC3\xA9" })));
+
+        // ---- (Q) interface DEFAULT (instance) method rejected by static gate ---
+        {
+            auto p = static_iface::static_method("ifaceDefaultValue");
+            g_iface_default_rejected.store(p.has_value() ? 1 : 0);
+            auto p_sig = static_iface::static_method("ifaceDefaultValue", "()I");
+            g_iface_default_sig_rejected.store(p_sig.has_value() ? 1 : 0);
+        }
+
+        // ---- (R) inherited static via SUB, resolved by NAME+SIGNATURE ----
+        {
+            auto p = static_sub::static_method("baseStaticValue", "()I");
+            g_inherited_sig_resolves.store(p.has_value() ? 1 : 0);
+            if (p)
+            {
+                g_inherited_sig_is_static.store(p->is_static() ? 1 : 0);
+                g_inherited_sig_ret.store(static_cast<std::int32_t>(p->call()));
+            }
+        }
+
         (void)self;
         g_all_calls_ran.store(true);
     }
@@ -1454,6 +1577,70 @@ VMHOOK_JVM_MODULE(method_static)
         // An instance method matched by exact (I)I is still rejected by the
         // JVM_ACC_STATIC gate on the static name+signature path.
         ctx.check("mstat2_sig_instance_overload_rejected", g_sig_instance_rejected.load() == 0);
+
+        // ##################################################################
+        //  mstat3_* — BATCH-18 DEEPENING (all path-INDEPENDENT, HARD)
+        // ##################################################################
+
+        // ---- (L) 8-arg static call — the maximum supported arity ----
+        // 1 + 2*2 + 3*3 + 4*4 + 5*5 + 6*6 + 7*7 + 8*8 = 1+4+9+16+25+36+49+64 = 204.
+        ctx.check("mstat3_eight_ints_weighted_sum", g_eight_ints.load() == 204);
+
+        // ---- (M) wide/narrow interleave + back-to-back wide pairs ----
+        {
+            // sWideShape(p,q,r,s) = p*7 + (q<<3) + r*31 + (s<<50), Java long math
+            // (recomputed with unsigned 64-bit wrapping to avoid signed-overflow UB).
+            const std::uint64_t p{ static_cast<std::uint64_t>(0x0011223344556677ULL) };
+            const std::uint64_t q{ static_cast<std::uint64_t>(static_cast<std::int64_t>(std::int32_t{ 3 })) };
+            const std::uint64_t r{ static_cast<std::uint64_t>(0x7766554433221100ULL) };
+            const std::uint64_t s{ static_cast<std::uint64_t>(static_cast<std::int64_t>(std::int32_t{ -5 })) };
+            const std::int64_t expected_wide{ static_cast<std::int64_t>(
+                p * 7ULL + (q << 3) + r * 31ULL + (s << 50)) };
+            ctx.check("mstat3_wide_shape_digest", g_wide_shape.load() == expected_wide);
+        }
+        ctx.check("mstat3_three_d_captured", g_three_d_captured.load());
+        // 1.5*64 + 0.25*8 + 0.125 = 96 + 2 + 0.125 = 98.125 (exactly representable).
+        ctx.check("mstat3_three_d_bits", bits2d(g_three_d.load()) == 98.125);
+
+        // ---- (N) proxy REUSE — one proxy serves two distinct calls ----
+        ctx.check("mstat3_proxy_reuse_first", g_reuse_first.load() == 111);
+        ctx.check("mstat3_proxy_reuse_second", g_reuse_second.load() == -222);
+
+        // ---- (O) object-arg ROUND-TRIP of a library-decoded child ----
+        // The null branch is path-independent and HARD; the non-null identity
+        // match needs a usable returned child (call-path dependent) so it is
+        // asserted only when the round-trip was attempted, recorded otherwise.
+        ctx.check("mstat3_object_arg_roundtrip_null_zero", g_roundtrip_null_zero.load() == 1);
+        if (g_roundtrip_attempted.load() == 1)
+        {
+            ctx.check("mstat3_object_arg_roundtrip_identity_matches",
+                      g_roundtrip_identity_matches.load() == 1);
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] mstat3_object_arg_roundtrip: sMakeChild returned no "
+                                    "usable oop on this path (call_jni) — identity round-trip "
+                                    "characterized only (no crash)." });
+        }
+
+        // ---- (P) null + non-trivial String ARGUMENT ----
+        // A null String argument must reach the static method as Java null -> -1
+        // (path-independent; distinct from the null String RETURN cases above).
+        ctx.check("mstat3_string_arg_null_len_neg1", g_string_arg_len_null.load() == -1);
+        // "café" is 4 UTF-16 code units (é is a single BMP code point) -> length 4.
+        ctx.check("mstat3_string_arg_unicode_len_4", g_string_arg_len_unicode.load() == 4);
+
+        // ---- (Q) interface DEFAULT method rejected by the static gate ----
+        // A default method is a NON-static instance method on the interface's own
+        // _methods array — the static name(+sig) resolution must skip it.
+        ctx.check("mstat3_iface_default_rejected", g_iface_default_rejected.load() == 0);
+        ctx.check("mstat3_iface_default_sig_rejected", g_iface_default_sig_rejected.load() == 0);
+
+        // ---- (R) inherited static via SUB, resolved by NAME+SIGNATURE ----
+        ctx.check("mstat3_inherited_sig_resolves", g_inherited_sig_resolves.load() == 1);
+        ctx.check("mstat3_inherited_sig_is_static", g_inherited_sig_is_static.load() == 1);
+        ctx.check("mstat3_inherited_sig_returns_super_value",
+                  g_inherited_sig_ret.load() == k_base_static);
     }
 
     // Suite-safety: tear down any hook this module armed so ZERO stay installed

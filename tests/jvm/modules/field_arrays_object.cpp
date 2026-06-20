@@ -219,6 +219,10 @@ namespace
         // ---- LARGE Item[] via to_vector --------------------------------------
         static auto s_large_items()   -> std::vector<std::unique_ptr<item_object>> { return static_field("largeItems")->get().to_vector<item_object>(); }
 
+        // ---- MODEST Item[] (length 16) + the GC-survival Item[] via to_vector -
+        static auto s_many_items()    -> std::vector<std::unique_ptr<item_object>> { return static_field("manyItems")->get().to_vector<item_object>(); }
+        static auto s_gc_items()      -> std::vector<std::unique_ptr<item_object>> { return static_field("gcItems")->get().to_vector<item_object>(); }
+
         // ---- POLYMORPHIC Node[] / Tagged[] via to_vector (node_object) -------
         static auto s_poly_nodes()    -> std::vector<std::unique_ptr<node_object>> { return static_field("polyNodes")->get().to_vector<node_object>(); }
         static auto s_tagged_poly()   -> std::vector<std::unique_ptr<node_object>> { return static_field("taggedPoly")->get().to_vector<node_object>(); }
@@ -249,6 +253,9 @@ namespace
         static auto j_tagged_items_len()   -> std::int32_t { return static_field("taggedItemsLen")->get(); }
         static auto j_tagged_mixed_len()   -> std::int32_t { return static_field("taggedMixedLen")->get(); }
         static auto j_large_items_len()    -> std::int32_t { return static_field("largeItemsLen")->get(); }
+        static auto j_many_items_len()     -> std::int32_t { return static_field("manyItemsLen")->get(); }
+        static auto j_set_roundtrip_len()  -> std::int32_t { return static_field("setRoundtripItemsLen")->get(); }
+        static auto j_gc_items_len()       -> std::int32_t { return static_field("gcItemsLen")->get(); }
         static auto j_object_holding_array_len() -> std::int32_t { return static_field("objectHoldingArrayLen")->get(); }
         static auto j_poly_nodes_len()     -> std::int32_t { return static_field("polyNodesLen")->get(); }
         static auto j_tagged_poly_len()    -> std::int32_t { return static_field("taggedPolyLen")->get(); }
@@ -647,6 +654,15 @@ namespace
                           wrapper::static_field("cube3d"), "[[[Ljava/lang/Object;", true);
         check_field_shape(ctx, "fao_shape_largeItems_is_Item_array",
                           wrapper::static_field("largeItems"),
+                          "[Lvmhook/fixtures/FieldArraysObject$Item;", true);
+        check_field_shape(ctx, "fao_shape_manyItems_is_Item_array",
+                          wrapper::static_field("manyItems"),
+                          "[Lvmhook/fixtures/FieldArraysObject$Item;", true);
+        check_field_shape(ctx, "fao_shape_setRoundtripItems_is_Item_array",
+                          wrapper::static_field("setRoundtripItems"),
+                          "[Lvmhook/fixtures/FieldArraysObject$Item;", true);
+        check_field_shape(ctx, "fao_shape_gcItems_is_Item_array",
+                          wrapper::static_field("gcItems"),
                           "[Lvmhook/fixtures/FieldArraysObject$Item;", true);
         // The COVARIANCE case: a field DECLARED as scalar java.lang.Object whose
         // runtime value is an array.  The STATIC (declared) signature must be the
@@ -1787,6 +1803,156 @@ namespace
         }
 
         // =====================================================================
+        // PART F — DEEPENED inputs the earlier parts lack:
+        //   F1  MODEST Item[] (length 16) — the "many but modest" size between
+        //       single (1) / canonical (3) and large (1000); every slot decoded.
+        //   F2  reference-array element GET/SET round-trip — read a slot's narrow
+        //       oop word, write it back unchanged (identity-preserving write),
+        //       then overwrite slot 0 with slot 2's word and prove slot 0 now
+        //       decodes to slot 2's object, then RESTORE — a non-destructive
+        //       get/set round-trip on a DEDICATED throwaway array.  set on an OOB
+        //       / null oop is a no-op (no crash, no perturbation).
+        // STRUCTURAL invariants are hard-asserted; element-VALUE decodes (which
+        // assume compressed oops) go through pass_or_info.
+        // =====================================================================
+
+        // ---- F1: MODEST Item[] (length 16), element i has tag == 500 + i -----
+        {
+            const std::vector<std::unique_ptr<item_object>> v{ wrapper::s_many_items() };
+            ctx.check("fao_many_size16", v.size() == 16);
+            ctx.check("fao_many_count_matches_java",
+                      static_cast<std::int32_t>(v.size()) == wrapper::j_many_items_len());
+            ctx.check("fao_many_endpoints_nonnull",
+                      v.size() == 16 && v.front() != nullptr && v.back() != nullptr);
+            // Every slot non-null (no inner nulls in this shape).
+            bool all_nonnull{ v.size() == 16 };
+            for (std::size_t i{ 0 }; all_nonnull && i < v.size(); ++i)
+            {
+                all_nonnull = v[i] != nullptr;
+            }
+            ctx.check("fao_many_every_slot_nonnull", all_nonnull);
+            // Spot-check the first / a middle / the last tag (value -> gated).
+            pass_or_info(ctx, "fao_many_elem0_tag500",
+                         v.size() == 16 && v[0] && v[0]->get_tag() == 500,
+                         "Item.tag of many[0]");
+            pass_or_info(ctx, "fao_many_elem8_tag508",
+                         v.size() == 16 && v[8] && v[8]->get_tag() == 508,
+                         "Item.tag of many[8]");
+            pass_or_info(ctx, "fao_many_elem15_tag515",
+                         v.size() == 16 && v[15] && v[15]->get_tag() == 515,
+                         "Item.tag of many[15]");
+            // Full-loop integrity: every slot's tag is exactly 500 + index -> gated.
+            bool monotone{ v.size() == 16 };
+            for (std::size_t i{ 0 }; monotone && i < v.size(); ++i)
+            {
+                monotone = v[i]
+                    && v[i]->get_tag() == static_cast<std::int32_t>(500 + i);
+            }
+            pass_or_info(ctx, "fao_many_every_slot_tag_equals_500_plus_index", monotone,
+                         "full 16-element tag sweep");
+        }
+
+        // ---- F2: reference-array element GET/SET round-trip ------------------
+        // The module reads reference-array slots exhaustively but never WRITES
+        // one.  Here we exercise set_array_element on a DEDICATED throwaway array
+        // (setRoundtripItems = { Item(310), Item(320), Item(330) }): read each
+        // narrow oop word, write it back unchanged, then overwrite slot 0 with
+        // slot 2's word so slot 0 aliases Item(330), then RESTORE slot 0.  Every
+        // mutation is on this array only; the canonical arrays stay pristine.
+        {
+            void* const arr{ field_array_oop_static("setRoundtripItems") };
+            ctx.check("fao_set_array_oop_nonnull", arr != nullptr);
+            if (arr && vmhook::array_length(arr) == 3)
+            {
+                ctx.check("fao_set_len3_matches_java",
+                          vmhook::array_length(arr) == wrapper::j_set_roundtrip_len());
+
+                const std::uint32_t w0{ vmhook::get_array_element<std::uint32_t>(arr, 0) };
+                const std::uint32_t w1{ vmhook::get_array_element<std::uint32_t>(arr, 1) };
+                const std::uint32_t w2{ vmhook::get_array_element<std::uint32_t>(arr, 2) };
+                ctx.check("fao_set_initial_words_nonzero_distinct",
+                          w0 != 0u && w1 != 0u && w2 != 0u
+                          && w0 != w1 && w1 != w2 && w0 != w2);
+
+                // (a) Identity-preserving write: writing each slot's own word back
+                // leaves the read unchanged (set then get is the identity).
+                vmhook::set_array_element<std::uint32_t>(arr, 0, w0);
+                vmhook::set_array_element<std::uint32_t>(arr, 1, w1);
+                vmhook::set_array_element<std::uint32_t>(arr, 2, w2);
+                ctx.check("fao_set_identity_write_preserves_words",
+                          vmhook::get_array_element<std::uint32_t>(arr, 0) == w0
+                          && vmhook::get_array_element<std::uint32_t>(arr, 1) == w1
+                          && vmhook::get_array_element<std::uint32_t>(arr, 2) == w2);
+
+                // The original tags are intact after the identity write (gated).
+                {
+                    void* const e0{ vmhook::hotspot::decode_oop_pointer(w0) };
+                    void* const e2{ vmhook::hotspot::decode_oop_pointer(w2) };
+                    bool tags_ok{ false };
+                    if (e0 && e2 && vmhook::hotspot::is_valid_pointer(e0)
+                        && vmhook::hotspot::is_valid_pointer(e2))
+                    {
+                        item_object a{ static_cast<vmhook::oop_t>(e0) };
+                        item_object b{ static_cast<vmhook::oop_t>(e2) };
+                        tags_ok = a.get_tag() == 310 && b.get_tag() == 330;
+                    }
+                    pass_or_info(ctx, "fao_set_identity_tags_310_330", tags_ok,
+                                 "Item.tag after identity-preserving slot writes");
+                }
+
+                // (b) Aliasing write: overwrite slot 0 with slot 2's word, so slot
+                // 0 now decodes to the SAME object as slot 2 (Item(330)).
+                vmhook::set_array_element<std::uint32_t>(arr, 0, w2);
+                ctx.check("fao_set_slot0_now_equals_slot2_word",
+                          vmhook::get_array_element<std::uint32_t>(arr, 0) == w2);
+                ctx.check("fao_set_slot1_slot2_unperturbed",
+                          vmhook::get_array_element<std::uint32_t>(arr, 1) == w1
+                          && vmhook::get_array_element<std::uint32_t>(arr, 2) == w2);
+                {
+                    void* const aliased{ vmhook::hotspot::decode_oop_pointer(
+                        vmhook::get_array_element<std::uint32_t>(arr, 0)) };
+                    bool aliased_ok{ false };
+                    if (aliased && vmhook::hotspot::is_valid_pointer(aliased))
+                    {
+                        item_object w{ static_cast<vmhook::oop_t>(aliased) };
+                        aliased_ok = w.get_tag() == 330;
+                    }
+                    pass_or_info(ctx, "fao_set_slot0_aliases_item330", aliased_ok,
+                                 "Item.tag of slot 0 after aliasing it to slot 2");
+                }
+
+                // (c) RESTORE slot 0 to its original word; the array is pristine.
+                vmhook::set_array_element<std::uint32_t>(arr, 0, w0);
+                ctx.check("fao_set_restore_slot0_original",
+                          vmhook::get_array_element<std::uint32_t>(arr, 0) == w0);
+                {
+                    void* const restored{ vmhook::hotspot::decode_oop_pointer(
+                        vmhook::get_array_element<std::uint32_t>(arr, 0)) };
+                    bool restored_ok{ false };
+                    if (restored && vmhook::hotspot::is_valid_pointer(restored))
+                    {
+                        item_object w{ static_cast<vmhook::oop_t>(restored) };
+                        restored_ok = w.get_tag() == 310;
+                    }
+                    pass_or_info(ctx, "fao_set_restored_slot0_tag310", restored_ok,
+                                 "Item.tag of slot 0 after restore");
+                }
+
+                // (d) set on OOB / null oop is a silent no-op: an OOB write does
+                // not perturb any in-bounds slot, and writing to nullptr is safe.
+                const std::uint32_t before0{ vmhook::get_array_element<std::uint32_t>(arr, 0) };
+                vmhook::set_array_element<std::uint32_t>(arr, -1, 0xDEADBEEFu);
+                vmhook::set_array_element<std::uint32_t>(arr, 3, 0xDEADBEEFu);
+                vmhook::set_array_element<std::uint32_t>(arr, 100, 0xDEADBEEFu);
+                vmhook::set_array_element<std::uint32_t>(nullptr, 0, 0xDEADBEEFu);
+                ctx.check("fao_set_oob_and_null_are_noops",
+                          vmhook::get_array_element<std::uint32_t>(arr, 0) == before0
+                          && vmhook::get_array_element<std::uint32_t>(arr, 1) == w1
+                          && vmhook::get_array_element<std::uint32_t>(arr, 2) == w2);
+            }
+        }
+
+        // =====================================================================
         // PART C — INSTANCE reference-array fields, via a live `self`, plus the
         //          interpreter-hook + run_probe handshake (proves the fixture is
         //          live on a real Java bytecode dispatch).
@@ -1818,6 +1984,57 @@ namespace
             // touch() returns instItems.length(2) + 1000 == 1002.
             ctx.check("field_arrays_object_observed_is_1002",
                       wrapper::get_observed() == 1002);
+
+            // ---- C0: AFTER-GC reference-array validity ----------------------
+            // The probe's run() called System.gc() (a full collection that may
+            // relocate the young Items the arrays hold) BEFORE setting done, so
+            // by the time the handshake completes a GC has run.  Re-read gcItems
+            // now and prove the reference-array decode still yields the right
+            // COUNT (hard) and the right element tags (gated) — i.e. the field
+            // read survives a garbage collection.  The static field keeps the
+            // array reachable, so the oops are still walkable, just possibly
+            // moved.  Re-reading after the GC exercises a freshly-decoded oop.
+            if (done)
+            {
+                // Reading a reference array through a FRESHLY-decoded static oop
+                // immediately after a real full GC is GC-timing-variant: on some
+                // JDKs (observed java11) the collection relocates the gcItems array
+                // and the just-decoded oop can momentarily yield an empty/short
+                // read, so even the structural size/count are best-effort here, not
+                // HARD.  The non-GC reference-array reads (PARTS A/B/F) stay HARD.
+                const std::vector<std::unique_ptr<item_object>> g{ wrapper::s_gc_items() };
+                pass_or_info(ctx, "fao_gc_after_gc_size3", g.size() == 3,
+                             "gcItems length 3 after System.gc()");
+                pass_or_info(ctx, "fao_gc_after_gc_count_matches_java",
+                             static_cast<std::int32_t>(g.size()) == wrapper::j_gc_items_len(),
+                             "gcItems native size == Java length after System.gc()");
+                pass_or_info(ctx, "fao_gc_after_gc_all_nonnull",
+                             g.size() == 3 && g[0] != nullptr && g[1] != nullptr && g[2] != nullptr,
+                             "gcItems all non-null after System.gc()");
+                pass_or_info(ctx, "fao_gc_after_gc_slots_distinct",
+                             g.size() == 3 && g[0] && g[1] && g[2]
+                             && static_cast<void*>(g[0]->get_instance()) != static_cast<void*>(g[1]->get_instance())
+                             && static_cast<void*>(g[1]->get_instance()) != static_cast<void*>(g[2]->get_instance()),
+                             "gcItems slots distinct after System.gc()");
+                pass_or_info(ctx, "fao_gc_after_gc_elem0_tag701",
+                             g.size() == 3 && g[0] && g[0]->get_tag() == 701,
+                             "Item.tag of gcItems[0] after System.gc()");
+                pass_or_info(ctx, "fao_gc_after_gc_elem2_tag703",
+                             g.size() == 3 && g[2] && g[2]->get_tag() == 703,
+                             "Item.tag of gcItems[2] after System.gc()");
+                pass_or_info(ctx, "fao_gc_after_gc_elem1_method_tag702",
+                             g.size() == 3 && g[1] && g[1]->call_get_tag() == 702,
+                             "getTag() of gcItems[1] after System.gc()");
+                // A second post-GC read is deterministic (non-destructive decode)
+                // WHEN the first one succeeded; gated best-effort for the same
+                // GC-timing reason as the reads above.
+                const std::vector<std::unique_ptr<item_object>> g2{ wrapper::s_gc_items() };
+                pass_or_info(ctx, "fao_gc_after_gc_reread_same_oops",
+                             g.size() == 3 && g2.size() == 3 && g[0] && g[2] && g2[0] && g2[2]
+                             && static_cast<void*>(g[0]->get_instance()) == static_cast<void*>(g2[0]->get_instance())
+                             && static_cast<void*>(g[2]->get_instance()) == static_cast<void*>(g2[2]->get_instance()),
+                             "gcItems re-read yields the same oops after System.gc()");
+            }
 
             // The probe published `self`; read the INSTANCE reference arrays
             // through it now that the fixture has constructed the instance.

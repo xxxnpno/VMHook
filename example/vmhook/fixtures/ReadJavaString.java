@@ -307,6 +307,80 @@ public final class ReadJavaString
     // only; the bulk combine path was otherwise untested) -> 200*4 = 800 bytes.
     public static String bulkEmoji = repeatAstral(0x1F600, 200);
 
+    // --- BATCH-18: astral PLANE-WALK + 3-byte boundary + coder-boundary shapes ---
+    // The append_utf8 4-byte branch derives the lead byte from (cp >> 18): U+10000
+    // ..U+3FFFF lead with F0, U+40000..U+FFFFF with F1/F2/F3, U+100000..U+10FFFF with
+    // F4.  firstAstral (U+10000) and maxAstral (U+10FFFF) pin only the two extremes;
+    // these fillers walk the lead byte and the continuation-byte arithmetic through
+    // the interior so a (cp >> 18) / (cp >> 12) shift-or-mask error cannot hide.  All
+    // non-ASCII chars are written as \\uXXXX escapes so the source stays pure ASCII.
+    // U+10001 -- first astral + 1: combine low bit set (lo == DC01) -> F0 90 80 81.
+    public static String astral10001  = fresh(new char[] { '\uD800', '\uDC01' });
+    // U+1FFFF -- TOP of plane 1 (still F0 lead): pair D83F DFFF -> F0 9F BF BF.
+    public static String astral1FFFF  = fresh(new char[] { '\uD83F', '\uDFFF' });
+    // U+20000 -- START of plane 2 (F0 lead, second byte rolls to A0): pair D840 DC00
+    // -> F0 A0 80 80.  Proves the (cp >> 12) & 3F continuation advances correctly.
+    public static String astral20000  = fresh(new char[] { '\uD840', '\uDC00' });
+    // U+FFFFF -- TOP of plane 15 (F3 lead): pair DBBF DFFF -> F3 BF BF BF.  Walks the
+    // 4-byte lead nibble OFF F0 to F3 -- the interior firstAstral/maxAstral skip.
+    public static String astralFFFFF  = fresh(new char[] { '\uDBBF', '\uDFFF' });
+    // U+100000 -- START of plane 16 (F4 lead, all continuation bytes 80): pair DBC0
+    // DC00 -> F4 80 80 80.  The low edge of the F4 lead range (maxAstral is its top).
+    public static String astral100000 = fresh(new char[] { '\uDBC0', '\uDC00' });
+
+    // U+07FE -- ONE below the 2-byte top (U+07FF): interior of the 2-byte range,
+    // DF BE.  bmp2to3a pins the top; this guards the (cp >> 6) low bits.
+    public static String bmp07FE      = fresh(new char[] { '\u07FE' });
+    // U+FFFE -- a NONCHARACTER just below U+FFFF: a verbatim 3-byte char (EF BF BE),
+    // NOT stripped or replaced.  Distinct from replacement (U+FFFD) and maxBmp (FFFF):
+    // proves read_java_string does not special-case Unicode noncharacters.
+    public static String noncharFFFE  = fresh(new char[] { '\uFFFE' });
+    // U+1000 -- the FIRST E1-lead 3-byte code point (E1 80 80): bmp2to3b pins the
+    // FIRST 3-byte point (U+0800, E0 lead); this walks the 3-byte lead nibble off E0.
+    public static String bmp1000      = fresh(new char[] { '\u1000' });
+
+    // COMPACT-STRING CODER BOUNDARY (identical-output property): the SAME ASCII
+    // content decoded out of a LATIN1 backing and out of a UTF16 backing must yield
+    // byte-identical UTF-8.  asciiPlain is pure ASCII "AB" so the JVM stores it
+    // LATIN1 (coder 0) -> 41 42.  asciiInUtf16 is "AB" + a >0xFF CJK char, which
+    // promotes the WHOLE String to UTF16 (coder 1); its first two chars are the same
+    // ASCII 'A','B' pushed through the UTF-16 decode path -> 41 42 E4 B8 AD.  The
+    // module asserts the ASCII prefix (first two bytes) of the UTF16 decode equals
+    // asciiPlain byte-for-byte: ASCII content decodes the same on either coder.
+    public static String asciiPlain   = fresh(new char[] { 'A', 'B' });
+    public static String asciiInUtf16 = fresh(new char[] { 'A', 'B', '\u4E2D' });
+
+    // MULTI-SCRIPT single String: Latin 'A', Greek alpha (U+03B1, 2-byte CE B1),
+    // Cyrillic (U+0414, 2-byte D0 94), Hebrew (U+05D0, 2-byte D7 90), CJK (U+4E2D,
+    // 3-byte E4 B8 AD), astral emoji (U+1F600, 4-byte F0 9F 98 80) -- every UTF-8
+    // width 1..4 in one decode pass, forcing the UTF-16 path (the astral + >0xFF
+    // chars) to handle mixed-width output back-to-back.
+    public static String multiScript  = fresh(new char[] {
+        'A', '\u03B1', '\u0414', '\u05D0', '\u4E2D', '\uD83D', '\uDE00' });
+
+    // U+FFFD (replacement char) used as CONTENT, flanked by ASCII: 'a', U+FFFD, 'b'
+    // -> 61 EF BF BD 62 (5 bytes).  Proves a replacement char that is genuinely part
+    // of the string survives as its 3-byte UTF-8 -- read_java_string never INSERTS or
+    // removes U+FFFD (it is a passthrough decoder, not a sanitiser).
+    public static String replInAscii  = fresh(new char[] { 'a', '\uFFFD', 'b' });
+
+    // A NUL immediately BEFORE a surrogate pair (NUL, hi, lo): proves the combine's
+    // index advance is correct when a pair starts at index 1, and the leading NUL is
+    // preserved -> 00 F0 9F 98 80 (5 bytes).  Complements emojiThenNul (NUL after).
+    public static String nulThenEmoji = fresh(new char[] { '\0', '\uD83D', '\uDE00' });
+
+    // A lone LOW surrogate THEN a VALID pair (lo, hi, lo): the leading lone low emits
+    // as 3-byte CESU, then the decoder RESYNCS and combines the following hi+lo into
+    // one 4-byte astral char -> ED B0 80 F0 9F 98 80 (7 bytes).  Proves a malformed
+    // unit does not desync the combine for the well-formed pair that follows.
+    public static String lowThenPair  = fresh(new char[] { '\uDC00', '\uD83D', '\uDE00' });
+
+    // A VALID pair flanked by 3-byte CJK (emojiMix is the 1-byte-ASCII-flanked
+    // variant): CJK U+4E2D, emoji U+1F600, CJK U+4E2D -> E4 B8 AD F0 9F 98 80
+    // E4 B8 AD (11 bytes).  Proves the surrogate combine advances correctly when
+    // flanked by 3-byte (not 1-byte ASCII) neighbours.
+    public static String emojiCjkFlank = fresh(new char[] { '\u4E2D', '\uD83D', '\uDE00', '\u4E2D' });
+
     // Long-String read-in-full targets (robustness bug #29 FIXED: no more 4096 cap;
     // read_java_string reads IN FULL up to 16M chars, uniformly per char count) ---
     // 4095 ASCII chars: ONE char BELOW the OLD 4096 cap -- the last length the old
@@ -452,6 +526,33 @@ public final class ReadJavaString
     public static volatile int     jCoderBulkLatin1Hi;  // 0 (LATIN1) / -1
     public static volatile int     jCoderMidTwoByte;    // 1 (UTF16) / -1
     public static volatile int     jCoderBom;           // 1 (UTF16) / -1
+
+    // --- BATCH-18 cross-check witnesses ---------------------------------------
+    public static volatile int     jAstral10001Cp0;     // 0x10001
+    public static volatile int     jAstral10001CpCount; // 1
+    public static volatile int     jAstral1FFFFCp0;     // 0x1FFFF
+    public static volatile int     jAstral20000Cp0;     // 0x20000
+    public static volatile int     jAstralFFFFFCp0;     // 0xFFFFF
+    public static volatile int     jAstral100000Cp0;    // 0x100000
+    public static volatile int     jBmp07FECp0;         // 0x07FE
+    public static volatile int     jNoncharFFFECp0;     // 0xFFFE
+    public static volatile int     jBmp1000Cp0;         // 0x1000
+    public static volatile int     jAsciiPlainLen;      // 2
+    public static volatile int     jAsciiInUtf16Len;    // 3
+    public static volatile int     jMultiScriptLen;     // 7 (chars; 6 code points)
+    public static volatile int     jMultiScriptCpCount; // 6
+    public static volatile int     jMultiScriptCpLast;  // 0x1F600
+    public static volatile int     jReplInAsciiLen;     // 3
+    public static volatile int     jReplInAsciiCp1;     // 0xFFFD
+    public static volatile int     jNulThenEmojiLen;    // 3 (NUL, hi, lo)
+    public static volatile int     jNulThenEmojiCpCount;// 2 (U+0000, U+1F600)
+    public static volatile int     jLowThenPairLen;     // 3 (lo, hi, lo)
+    public static volatile int     jLowThenPairCpCount; // 2 (U+DC00 lone, U+1F600)
+    public static volatile int     jEmojiCjkFlankLen;   // 4 (CJK, hi, lo, CJK)
+    public static volatile int     jEmojiCjkFlankCpCount; // 3
+    public static volatile int     jCoderAsciiPlain;    // 0 (LATIN1) / -1
+    public static volatile int     jCoderAsciiInUtf16;  // 1 (UTF16) / -1
+    public static volatile int     jCoderMultiScript;   // 1 (UTF16) / -1
 
     // ---------------------- helpers ----------------------------------------
     /** new String(char[]) -> a PRIVATE backing array (never an interned alias). */
@@ -650,6 +751,34 @@ public final class ReadJavaString
                 jCoderBulkLatin1Hi  = coderOf(bulkLatin1Hi);
                 jCoderMidTwoByte    = coderOf(midTwoByte);
                 jCoderBom           = coderOf(bom);
+
+
+                // --- BATCH-18 witness assignments --------------------------
+                jAstral10001Cp0     = astral10001.codePointAt(0);
+                jAstral10001CpCount = astral10001.codePointCount(0, astral10001.length());
+                jAstral1FFFFCp0     = astral1FFFF.codePointAt(0);
+                jAstral20000Cp0     = astral20000.codePointAt(0);
+                jAstralFFFFFCp0     = astralFFFFF.codePointAt(0);
+                jAstral100000Cp0    = astral100000.codePointAt(0);
+                jBmp07FECp0         = bmp07FE.codePointAt(0);
+                jNoncharFFFECp0     = noncharFFFE.codePointAt(0);
+                jBmp1000Cp0         = bmp1000.codePointAt(0);
+                jAsciiPlainLen      = asciiPlain.length();
+                jAsciiInUtf16Len    = asciiInUtf16.length();
+                jMultiScriptLen     = multiScript.length();
+                jMultiScriptCpCount = multiScript.codePointCount(0, multiScript.length());
+                jMultiScriptCpLast  = multiScript.codePointAt(multiScript.length() - 2);
+                jReplInAsciiLen     = replInAscii.length();
+                jReplInAsciiCp1     = replInAscii.codePointAt(1);
+                jNulThenEmojiLen    = nulThenEmoji.length();
+                jNulThenEmojiCpCount = nulThenEmoji.codePointCount(0, nulThenEmoji.length());
+                jLowThenPairLen     = lowThenPair.length();
+                jLowThenPairCpCount = lowThenPair.codePointCount(0, lowThenPair.length());
+                jEmojiCjkFlankLen   = emojiCjkFlank.length();
+                jEmojiCjkFlankCpCount = emojiCjkFlank.codePointCount(0, emojiCjkFlank.length());
+                jCoderAsciiPlain    = coderOf(asciiPlain);
+                jCoderAsciiInUtf16  = coderOf(asciiInUtf16);
+                jCoderMultiScript   = coderOf(multiScript);
 
                 ReadJavaString.done = true;
             }

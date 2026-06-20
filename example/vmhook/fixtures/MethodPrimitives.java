@@ -444,6 +444,32 @@ public final class MethodPrimitives
     public static double sRetDoublePosInf()   { return Double.POSITIVE_INFINITY; }
 
     // ----------------------------------------------------------------------
+    //  cross-kind value_t conversion drivers (batch-18 deepening)
+    //  Finite values with a non-trivial MAGNITUDE and a fractional part, so the
+    //  value_t conversion operator's float/double -> integer static_cast leg is
+    //  exercised on more than the small +/-2.75 used elsewhere: a six-digit whole
+    //  part proves the truncation keeps the full integer magnitude (not just the
+    //  ones digit) and the .5 fraction proves it truncates toward zero, not rounds.
+    // ----------------------------------------------------------------------
+    public float  retFloatBigWhole()       { return 1000000.5f; }   // -> int 1000000
+    public float  retFloatNegBigWhole()    { return -1000000.5f; }  // -> int -1000000
+    public double retDoubleBigWhole()      { return 1234567.5; }    // -> long 1234567
+    public double retDoubleNegBigWhole()   { return -1234567.5; }   // -> long -1234567
+    /** 2^40 (1099511627776): exactly representable as BOTH a long and a double, so
+     *  a long RETURN read into a double target is a lossless cross-kind widen whose
+     *  exact value the native side can compare (not just "nonzero"). */
+    public long   retLongPow2to40()        { return 1099511627776L; }
+    /** 2^24 (16777216): the largest int whose successor is NOT exactly a float, used
+     *  as an int RETURN read into a float target (exact widen) — the return-side twin
+     *  of the (I)F intToFloat ARG path. */
+    public int    retIntPow2to24()         { return 16777216; }
+    /** (I)J — the callee widens the int arg to long.  Proves an int ARG and a long
+     *  RETURN coexist in one dispatch and that the int arrived SIGN-extended into the
+     *  64-bit result (arg -1 -> long -1, never 4294967295). */
+    public long   intToLong(final int v)        { return (long) v; }
+    public static long sIntToLong(final int v)  { return (long) v; }
+
+    // ----------------------------------------------------------------------
     //  void (V)
     // ----------------------------------------------------------------------
     public void retVoidBump()        { voidInstanceHits++; }

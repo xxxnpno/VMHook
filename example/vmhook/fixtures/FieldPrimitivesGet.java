@@ -181,6 +181,31 @@ public final class FieldPrimitivesGet
     public static double sDouble0xAAAAAAAAAAAAAAAA = Double.longBitsToDouble(0xAAAAAAAAAAAAAAAAL); // alt 1010...
 
     // =====================================================================
+    //  FINITE FP -> integer conversion operands (batch-18 deepen).  These hold
+    //  EXACTLY-representable, FINITE float/double values whose static_cast<int>
+    //  result is well-defined (truncation toward zero) -- the audit's "F/D into
+    //  an integer target" path, exercised ONLY on finite operands so the cast is
+    //  NOT the UB non-finite case.  Distinct values so a wrong field surfaces.
+    // =====================================================================
+    public static float  sFloatIntTwo      = 2.0F;    // -> int 2
+    public static float  sFloatNegThreeHalf = -1.5F;  // -> int -1 (toward zero)
+    public static float  sFloatFracDn      = 2.75F;   // -> int 2  (toward zero)
+    public static float  sFloatBigExact    = 1048576.0F; // 2^20: > short range, exact
+    public static double sDoubleIntThree    = 3.0;    // -> int 3
+    public static double sDoubleNegFiveHalf = -2.5;   // -> int -2 (toward zero)
+    public static double sDoubleFracDn      = 3.25;   // -> int 3  (toward zero)
+    public static double sDoubleBigExact    = 16777216.0; // 2^24: > short range, exact
+
+    // =====================================================================
+    //  A real reference (String) field + a primitive's-eye-view negative space.
+    //  sRefString proves is_reference()==true and as_string() decodes a genuine
+    //  java.lang.String, the positive counterpart to the primitive checks that
+    //  assert is_reference()==false / as_string()=="".  Value is pure ASCII so it
+    //  compiles identically regardless of the source-file -encoding.
+    // =====================================================================
+    public static String sRefString = "vmhook-fpg-ref";
+
+    // =====================================================================
     //  INSTANCE fields -- representative subset of each primitive so the
     //  instance-dispatch path of get() is exercised.  Values intentionally
     //  DIFFER from the static ones so a static/instance mix-up is caught.

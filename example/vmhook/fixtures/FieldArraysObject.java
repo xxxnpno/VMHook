@@ -389,6 +389,49 @@ public final class FieldArraysObject
         return out;
     }
 
+    // ---- MODEST Item[] (length 16) -----------------------------------------
+    // Bridges the gap between the SINGLE (1) / canonical (3) shapes and the
+    // LARGE (1000) one: a realistic "many but modest" length so the per-element
+    // decode loop is exercised at a mid-size count without the 1000-element
+    // cost.  Element i carries tag == 500 + i, so each slot's identity is
+    // value-checkable and the tag range (>= 500) cannot collide with any other
+    // fixture array's tags.
+
+    /** Modest Item[] of length 16; element i has tag == 500 + i. */
+    public static volatile Item[] manyItems = buildManyItems(16);
+
+    private static Item[] buildManyItems(final int n)
+    {
+        final Item[] out = new Item[n];
+        for (int i = 0; i < n; i++)
+        {
+            out[i] = new Item(500 + i);
+        }
+        return out;
+    }
+
+    // ---- Dedicated Item[] for the reference-array element SET round-trip ----
+    // The native side performs a reference-array get/set round-trip on THIS
+    // array only (read a slot's narrow oop word, write it back unchanged, then
+    // overwrite a slot with another slot's word and restore), so the shared
+    // canonical staticItems / mixedItems stay pristine for every other check.
+    // Three distinct, all-non-null Items so a swapped slot's tag is unambiguous.
+
+    /** Throwaway 3-element Item[] for the native element-SET round-trip. */
+    public static volatile Item[] setRoundtripItems =
+        { new Item(310), new Item(320), new Item(330) };
+
+    // ---- Item[] re-validated AFTER an explicit Java-driven System.gc() -------
+    // The probe's run() calls System.gc() (a full collection that may relocate
+    // young objects) and re-publishes the lengths, so the native side can read
+    // this array AFTER a GC has run and prove the decode path still yields the
+    // right COUNT and element tags — i.e. a reference-array field read survives
+    // a garbage collection (the oops the array slots hold are still walkable).
+
+    /** Item[] the native side re-reads after a probe-driven System.gc(). */
+    public static volatile Item[] gcItems =
+        { new Item(701), new Item(702), new Item(703) };
+
     // ---- Published values for native cross-checks -------------------------
     // Each Item carries a UNIQUE tag, so the native side proves it decoded the
     // right object by reading tag through the wrapper (field AND getTag method).
@@ -419,6 +462,9 @@ public final class FieldArraysObject
     public static volatile int taggedItemsLen;
     public static volatile int taggedMixedLen;
     public static volatile int largeItemsLen;
+    public static volatile int manyItemsLen;
+    public static volatile int setRoundtripItemsLen;
+    public static volatile int gcItemsLen;
     public static volatile int objectHoldingArrayLen;
     public static volatile int polyNodesLen;
     public static volatile int taggedPolyLen;
@@ -457,6 +503,9 @@ public final class FieldArraysObject
         taggedItemsLen   = taggedItems.length;
         taggedMixedLen   = taggedMixed.length;
         largeItemsLen    = largeItems.length;
+        manyItemsLen         = manyItems.length;
+        setRoundtripItemsLen = setRoundtripItems.length;
+        gcItemsLen           = gcItems.length;
         objectHoldingArrayLen = ((Object[]) objectHoldingArray).length;
         polyNodesLen          = polyNodes.length;
         taggedPolyLen         = taggedPoly.length;
@@ -497,8 +546,20 @@ public final class FieldArraysObject
                 // Idempotent re-publish (lengths are constants); kept so the
                 // oracle is correct even if a future probe mutates the arrays.
                 publishLengths();
-                // Drive a real bytecode dispatch so the interpreter hook fires.
+                // Drive a real bytecode dispatch FIRST, while the interpreter
+                // hook's i2i patch is still intact.  A full-GC safepoint can
+                // re-resolve a hooked method's entries and drop the patch
+                // (observed on java11) with the auto-repair watchdog disabled
+                // mid-suite, so touch() MUST be observed by the hook BEFORE any
+                // collection runs -- otherwise the hook silently misses the call.
                 FieldArraysObject.observed = instance.touch(1000);
+                // THEN drive an explicit collection before the native after-GC
+                // reads (PART C0 runs after this handshake).  A full GC may
+                // relocate the young Items the reference arrays hold; the native
+                // side re-reads gcItems and proves the decode still yields the
+                // right count + tags, i.e. a reference-array read survives a GC.
+                // The static fields keep the arrays reachable, so nothing is freed.
+                System.gc();
                 FieldArraysObject.done = true;
             }
         });

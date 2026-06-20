@@ -88,6 +88,11 @@ namespace
 {
     constexpr char FIXTURE[]{ "vmhook/fixtures/FieldObjectRef" };
 
+    // Forward declaration: ref_object::owner() decodes a back-reference to the
+    // holding FieldObjectRef, whose wrapper is defined further down.  The body is
+    // therefore defined out-of-line after holder_object is complete.
+    class holder_object;
+
     // Wrapper for vmhook.fixtures.FieldObjectRef$Ref — the object the Holder
     // fields point at.  Exposes the int / String / nested-ref reads and the
     // compute() method used to prove a field-decoded wrapper is fully usable.
@@ -106,6 +111,18 @@ namespace
         // The nested object-reference field (a Ref-typed field ON a Ref): proves
         // recursive object-ref decode through a field-decoded wrapper.
         auto next()   -> std::unique_ptr<ref_object> { return get_field("next")->get(); }
+        // The INHERITED object-reference field (declared on Ref): a back-ref to
+        // the holding FieldObjectRef.  Read through the base wrapper here and,
+        // because SubRef inherits it, through the SubRef wrapper too.  Defined
+        // out-of-line (holder_object is not yet complete here).
+        auto owner() -> std::unique_ptr<holder_object>;
+        // Boolean-resolver at the helper boundary (allowed outside accessors): is
+        // the named field resolvable on THIS wrapper's klass?
+        auto field_oop_of(const char* name) -> void*
+        {
+            const auto proxy{ get_field(name) };
+            return proxy.has_value() ? vmhook::field_oop(*proxy) : nullptr;
+        }
     };
 
     // Wrapper for vmhook.fixtures.FieldObjectRef$SubRef — a SUBCLASS of Ref used
@@ -123,6 +140,15 @@ namespace
         auto val()     -> std::int32_t { return get_field("val")->get(); }
         auto extra()   -> std::int32_t { return get_field("extra")->get(); }
         auto compute() -> std::int32_t { return get_method("compute")->call(); }
+        // The INHERITED object field, reached through the CONCRETE SubRef wrapper
+        // (declared on the base Ref, present at the same offset on SubRef).
+        // Defined out-of-line (holder_object incomplete here).
+        auto owner() -> std::unique_ptr<holder_object>;
+        auto owner_oop() -> void*
+        {
+            const auto proxy{ get_field("owner") };
+            return proxy.has_value() ? vmhook::field_oop(*proxy) : nullptr;
+        }
     };
 
     // Wrapper for vmhook.fixtures.FieldObjectRef$TagImpl — the concrete impl
@@ -259,6 +285,14 @@ namespace
         auto poly_ref()        -> std::unique_ptr<ref_object>     { return get_field("polyRef")->get(); }
         auto poly_ref_as_sub() -> std::unique_ptr<sub_ref_object> { return get_field("polyRef")->get(); }
 
+        // SELF-CYCLE: a Ref whose `next` is wired (in run()) to itself.  Reading
+        // cycleRef.next must decode to the SAME oop as cycleRef — a one-step
+        // self-loop the decode reads WITHOUT recursing.
+        auto cycle_ref() -> std::unique_ptr<ref_object> { return get_field("cycleRef")->get(); }
+        // DEPTH-2 chain head: chainHead.next.next walks two levels of nested
+        // object-ref decode, each level a fresh field decode.
+        auto chain_head() -> std::unique_ptr<ref_object> { return get_field("chainHead")->get(); }
+
         // NULL shapes across every declared reference type (null-slot invariant).
         auto null_obj()   -> std::unique_ptr<ref_object>      { return get_field("nullObj")->get(); }
         auto null_tag()   -> std::unique_ptr<tag_impl_object> { return get_field("nullTag")->get(); }
@@ -293,6 +327,20 @@ namespace
         // array-vs-object: the `refArray` field is '[' (Ref[]); decoding it as a
         // single unique_ptr<ref_object> is now REJECTED (flaw B fixed).
         auto ref_array_as_ref() -> std::unique_ptr<ref_object> { return get_field("refArray")->get(); }
+
+        // Generic wrong-wrapper-type read of ANY named Ref-typed slot through the
+        // Decoy wrapper — the klass-match guard must refuse every one (flaw A), not
+        // just the single `ref` slot.  Returns the (expected-null) decoy wrapper.
+        auto field_as_decoy(const char* name) -> std::unique_ptr<decoy_object>
+        {
+            return get_field(name)->get();
+        }
+        // Generic same-klass Ref read of a named slot (must STILL be usable after
+        // the guard) — paired with field_as_decoy to prove the guard is fail-open.
+        auto field_as_ref(const char* name) -> std::unique_ptr<ref_object>
+        {
+            return get_field(name)->get();
+        }
 
         // ── raw-slot helpers for compressed-OOP correctness ────────────────
         // These take a field NAME and return a scalar; the has_value() check is a
@@ -339,6 +387,34 @@ namespace
         static auto static_ref()      -> std::unique_ptr<ref_object> { return static_field("staticRef")->get(); }
         static auto static_null_ref() -> std::unique_ptr<ref_object> { return static_field("staticNullRef")->get(); }
 
+        // Static-slot raw helpers (mirror+offset path) for the static round-trip /
+        // operator-void* identity.  has_value() is a boolean-resolver guard at the
+        // helper boundary, not a sentinel inside a wrapper accessor.
+        static auto static_compressed(const char* name) -> std::uint32_t
+        {
+            const auto proxy{ static_field(name) };
+            return proxy.has_value() ? proxy->get_compressed_oop() : 0u;
+        }
+        static auto static_field_oop(const char* name) -> void*
+        {
+            const auto proxy{ static_field(name) };
+            return proxy.has_value() ? vmhook::field_oop(*proxy) : nullptr;
+        }
+        static auto static_value_as_voidp(const char* name) -> void*
+        {
+            return static_cast<void*>(static_field(name)->get());
+        }
+        static auto static_field_is_reference(const char* name) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            return proxy.has_value() && proxy->is_reference();
+        }
+        static auto static_field_signature(const char* name) -> std::string
+        {
+            const auto proxy{ static_field(name) };
+            return proxy.has_value() ? std::string{ proxy->signature() } : std::string{};
+        }
+
         // ── published identities (exact cross-checks) ──────────────────────
         static auto ref_identity()        -> std::int32_t { return static_field("refIdentity")->get(); }
         static auto ref_alias_identity()  -> std::int32_t { return static_field("refAliasIdentity")->get(); }
@@ -349,7 +425,22 @@ namespace
         static auto self_identity()       -> std::int32_t { return static_field("selfIdentity")->get(); }
         static auto poly_ref_identity()   -> std::int32_t { return static_field("polyRefIdentity")->get(); }
         static auto obj_as_ref_identity() -> std::int32_t { return static_field("objAsRefIdentity")->get(); }
+        static auto owner_identity()      -> std::int32_t { return static_field("ownerIdentity")->get(); }
+        static auto poly_owner_identity() -> std::int32_t { return static_field("polyOwnerIdentity")->get(); }
+        static auto cycle_ref_identity()  -> std::int32_t { return static_field("cycleRefIdentity")->get(); }
+        static auto chain_tail_identity() -> std::int32_t { return static_field("chainTailIdentity")->get(); }
     };
+
+    // Out-of-line bodies for the inherited-object-field accessors (holder_object
+    // is now complete, so the unique_ptr<holder_object> decode is well-formed).
+    inline auto ref_object::owner() -> std::unique_ptr<holder_object>
+    {
+        return get_field("owner")->get();
+    }
+    inline auto sub_ref_object::owner() -> std::unique_ptr<holder_object>
+    {
+        return get_field("owner")->get();
+    }
 
     // ── hook observation ───────────────────────────────────────────────────
     std::atomic<int>  g_detour_calls{ 0 };
@@ -372,6 +463,10 @@ namespace
     constexpr std::int32_t POLY_REF_EXTRA   = 0x000A;
     constexpr std::int32_t WRITABLE_REF_VAL = 0x1357;
     constexpr std::int32_t SET_TARGET_VAL   = 0x2468;
+    constexpr std::int32_t CYCLE_REF_VAL    = 0x1A2B;
+    constexpr std::int32_t CHAIN_HEAD_VAL   = 0x0C0C;
+    constexpr std::int32_t CHAIN_MID_VAL    = 0x0D0D;
+    constexpr std::int32_t CHAIN_TAIL_VAL   = 0x0E0E;
     const std::string      REF_LABEL        = "ref-of-field";
     const std::string      STATIC_REF_LABEL = "static-ref";
     const std::string      NESTED_REF_LABEL = "nested-ref";
@@ -487,6 +582,48 @@ namespace
                                "probe's run() executes; pre-probe it correctly decodes "
                                "to a null unique_ptr. Non-null nested read asserted in "
                                "PART 3.");
+
+                    // INHERITED OBJECT FIELD pre-probe: `owner` is declared on Ref
+                    // and wired to the holder only inside run().  Pre-probe it is a
+                    // genuinely-null inherited 'L' slot — it must resolve (the field
+                    // EXISTS on Ref) yet decode to a null unique_ptr and a zero
+                    // compressed OOP.  The same field reached through a SubRef
+                    // wrapper proves the slot is truly inherited.
+                    ctx.check("inherited_owner_field_resolves_on_ref",
+                              r->get_field("owner").has_value());
+                    ctx.check("inherited_owner_is_reference_on_ref",
+                              r->get_field("owner").has_value()
+                              && r->get_field("owner")->is_reference());
+                    const auto own_pre{ r->owner() };
+                    ctx.check("inherited_owner_null_pre_probe_decodes_to_nullptr",
+                              own_pre == nullptr);
+                    ctx.check("inherited_owner_field_oop_nullptr_pre_probe",
+                              r->field_oop_of("owner") == nullptr);
+                    ctx.record("[INFO] inherited object field `owner` (declared on Ref) "
+                               "is unwired (null) pre-probe; it resolves and correctly "
+                               "decodes to a null unique_ptr. Non-null inherited read "
+                               "(via Ref AND SubRef) asserted in PART 3.");
+                }
+            }
+
+            // ── SELF-CYCLE + DEPTH-2 CHAIN are wired in run(); pre-probe their
+            //    nested `next` slots are still null (the same null-slot invariant
+            //    one level deep).  The wired self-loop / two-level walk is asserted
+            //    in PART 3. ───────────────────────────────────────────────────────
+            {
+                const auto cyc{ holder->cycle_ref() };
+                ctx.check("cycle_ref_seed_non_null_pre_probe", cyc != nullptr);
+                if (cyc)
+                {
+                    ctx.check("cycle_ref_seed_value", cyc->val() == CYCLE_REF_VAL);
+                    ctx.check("cycle_ref_next_null_pre_probe", cyc->next() == nullptr);
+                }
+                const auto ch{ holder->chain_head() };
+                ctx.check("chain_head_seed_non_null_pre_probe", ch != nullptr);
+                if (ch)
+                {
+                    ctx.check("chain_head_seed_value", ch->val() == CHAIN_HEAD_VAL);
+                    ctx.check("chain_head_next_null_pre_probe", ch->next() == nullptr);
                 }
             }
 
@@ -636,6 +773,18 @@ namespace
                     ctx.check("object_field_string_runtime_klass_is_String",
                               ends_with(runtime_klass_name(oop), "String"));
                 }
+                // The value_t string alternative keys on the TARGET type, not the
+                // declared 'Ljava/lang/Object;' signature: an Object-typed slot
+                // that holds a real String oop reads back as the String's chars
+                // via the blessed as_string() spelling.
+                const auto obj_str_proxy{ holder->get_field("objAsString") };
+                ctx.check("object_field_string_reads_as_std_string",
+                          obj_str_proxy.has_value()
+                          && obj_str_proxy->get().as_string() == STR_REF_VALUE);
+                // ...and it is the SAME oop as the dedicated `strRef` String field
+                // (both hold the SAME interned String literal STR_REF_VALUE).
+                ctx.check("object_field_string_same_oop_as_strRef",
+                          oop != nullptr && oop == holder->ref_field_oop("strRef"));
             }
 
             // ── compressed-OOP decode correctness (the heart of the feature) ─
@@ -785,6 +934,35 @@ namespace
                                    "still accepted (the fix's concern). Dispatch not asserted.");
                     }
                 }
+            }
+
+            // ── FLAW A is PER-DECODE: the cross-klass refusal fires for EVERY
+            //    Ref-typed slot, not just `ref`.  Read finalRef / volatileRef /
+            //    polyRef (all hold a Ref or a SubRef IS-A Ref) through the Decoy
+            //    wrapper — each must be refused (nullptr) — and re-read each through
+            //    the correct Ref wrapper to prove the guard stayed fail-open.  The
+            //    field's compressed OOP is non-zero throughout (the slot is live),
+            //    so a null wrapper here is a REFUSAL, never an empty slot. ─────────
+            {
+                const char* const ref_typed_slots[]{ "finalRef", "volatileRef", "polyRef" };
+                for (const char* const name : ref_typed_slots)
+                {
+                    const std::string base{ std::string{ "flawA_per_slot_" } + name };
+                    // The slot is genuinely non-null (a real Ref/SubRef oop).
+                    ctx.check(base + "_slot_is_live",
+                              holder->ref_compressed(name) != 0u);
+                    // Decoy read of THIS Ref-typed slot is refused.
+                    ctx.check(base + "_decoy_read_refused",
+                              holder->field_as_decoy(name) == nullptr);
+                    // Same slot through the correct Ref wrapper is still usable.
+                    const auto ok{ holder->field_as_ref(name) };
+                    ctx.check(base + "_ref_read_still_usable",
+                              ok != nullptr && ok->get_instance() != nullptr);
+                }
+                ctx.record("[INFO] FLAW A guard verified PER-SLOT: the cross-klass "
+                           "refusal is a property of every Ref-typed decode (finalRef / "
+                           "volatileRef / polyRef), not a one-off on `ref`; each stays "
+                           "fail-open for the correct Ref wrapper.");
             }
 
             // ==================================================================
@@ -1103,6 +1281,58 @@ namespace
 
             const auto snr{ holder_object::static_null_ref() };
             ctx.check("static_null_ref_decodes_to_nullptr", snr == nullptr);
+
+            // ── STATIC-SLOT introspection + compressed-OOP ROUND-TRIP ──────────
+            // The static path resolves the slot through the java.lang.Class mirror
+            // + field offset, NOT an object header.  The full decode identity must
+            // hold there too: is_reference / signature are exact, the compressed
+            // OOP is non-zero, re-encode(decode(x)) == x, decode(re-encode) lands on
+            // the same oop, operator void* agrees with field_oop(), and the wrapper
+            // instance equals the decoded oop.
+            ctx.check("static_ref_is_reference_true",
+                      holder_object::static_field_is_reference("staticRef"));
+            ctx.check("static_ref_signature_is_Ref",
+                      holder_object::static_field_signature("staticRef")
+                      == "Lvmhook/fixtures/FieldObjectRef$Ref;");
+            {
+                const std::uint32_t compressed{ holder_object::static_compressed("staticRef") };
+                void* const decoded{ holder_object::static_field_oop("staticRef") };
+                ctx.check("static_ref_compressed_non_zero", compressed != 0u);
+                ctx.check("static_ref_field_oop_valid",
+                          decoded != nullptr && vmhook::hotspot::is_valid_pointer(decoded));
+                if (decoded && vmhook::hotspot::is_valid_pointer(decoded))
+                {
+                    const std::uint32_t reencoded{
+                        vmhook::hotspot::encode_oop_pointer(decoded) };
+                    ctx.check("static_ref_reencode_equals_compressed",
+                              reencoded == compressed);
+                    ctx.check("static_ref_decode_reencode_is_identity",
+                              vmhook::hotspot::decode_oop_pointer(reencoded) == decoded);
+                    ctx.check("static_ref_value_voidp_equals_field_oop",
+                              holder_object::static_value_as_voidp("staticRef") == decoded);
+                    ctx.check("static_ref_wrapper_instance_equals_decoded",
+                              sr != nullptr && sr->get_instance() == decoded);
+                }
+            }
+            // The static NULL slot: a null static reference decodes to a null
+            // wrapper, a zero compressed OOP, and a null field_oop (the null-slot
+            // invariant on the mirror+offset path).
+            ctx.check("static_null_ref_is_reference_true",
+                      holder_object::static_field_is_reference("staticNullRef"));
+            ctx.check("static_null_ref_compressed_is_zero",
+                      holder_object::static_compressed("staticNullRef") == 0u);
+            ctx.check("static_null_ref_field_oop_is_nullptr",
+                      holder_object::static_field_oop("staticNullRef") == nullptr);
+            ctx.check("static_null_ref_value_voidp_is_nullptr",
+                      holder_object::static_value_as_voidp("staticNullRef") == nullptr);
+            // The static and the INSTANCE staticRef-vs-ref oops are DISTINCT objects.
+            if (holder)
+            {
+                ctx.check("static_ref_distinct_from_instance_ref",
+                          holder_object::static_field_oop("staticRef") != nullptr
+                          && holder_object::static_field_oop("staticRef")
+                             != holder->ref_field_oop("ref"));
+            }
         }
 
         // =====================================================================
@@ -1245,6 +1475,144 @@ namespace
                                   n->compute() == NESTED_REF_VAL * 2 + 1);
                     }
                 }
+            }
+
+            // ── INHERITED OBJECT FIELD (declared on Ref) decodes to the owner ──
+            // `owner` lives on the base Ref and is wired in run() to the holder.
+            // (1) Through the BASE ref_object wrapper it decodes to the SINGLETON
+            //     (a usable holder_object) — a plain inherited 'L' slot read.
+            // (2) Through the CONCRETE SubRef wrapper (polyRef holds a SubRef, which
+            //     INHERITS owner at the same offset) it decodes to the SAME holder
+            //     oop — proving the inherited slot is honoured by a subclass wrapper.
+            {
+                const auto r{ holder2->ref() };
+                if (r)
+                {
+                    const auto own{ r->owner() };
+                    ctx.check("inherited_owner_non_null_post_probe", own != nullptr);
+                    if (own)
+                    {
+                        // The owner back-ref decodes to the receiver (the holder).
+                        ctx.check("inherited_owner_decodes_to_holder",
+                                  own->get_instance() == holder2->get_instance()
+                                  && own->get_instance() != nullptr);
+                        // ...and it is fully usable: its own `ref` reads REF_VAL.
+                        const auto owner_ref{ own->ref() };
+                        ctx.check("inherited_owner_is_usable_holder",
+                                  owner_ref != nullptr && owner_ref->val() == REF_VAL);
+                    }
+                    // The `ref.owner` oop equals the SINGLETON's own instance oop.
+                    ctx.check("inherited_owner_oop_equals_holder_instance",
+                              r->field_oop_of("owner") == holder2->get_instance()
+                              && r->field_oop_of("owner") != nullptr);
+                }
+
+                // Same inherited slot, reached through the concrete SubRef wrapper.
+                const auto psub{ holder2->poly_ref_as_sub() };
+                ctx.check("inherited_owner_subref_wrapper_non_null", psub != nullptr);
+                if (psub)
+                {
+                    const auto sub_owner{ psub->owner() };
+                    ctx.check("inherited_owner_via_subref_non_null", sub_owner != nullptr);
+                    if (sub_owner)
+                    {
+                        ctx.check("inherited_owner_via_subref_decodes_to_holder",
+                                  sub_owner->get_instance() == holder2->get_instance()
+                                  && sub_owner->get_instance() != nullptr);
+                    }
+                    // The inherited slot read through the SubRef wrapper resolves to
+                    // the SAME holder oop as via the base wrapper — the offset of an
+                    // inherited field is identical on the subclass.
+                    ctx.check("inherited_owner_subref_oop_equals_holder",
+                              psub->owner_oop() == holder2->get_instance()
+                              && psub->owner_oop() != nullptr);
+                }
+
+                // Java-published witnesses: ref.owner and polyRef.owner both point
+                // at the singleton, so both identities equal the singleton's own
+                // identity (the Java-truth twin of the native "== holder" checks).
+                ctx.check("java_owner_identity_published",
+                          holder_object::owner_identity() != 0);
+                ctx.check("java_poly_owner_identity_published",
+                          holder_object::poly_owner_identity() != 0);
+                ctx.check("java_owner_and_poly_owner_identity_equal",
+                          holder_object::owner_identity()
+                          == holder_object::poly_owner_identity());
+            }
+
+            // ── SELF-CYCLE: cycleRef.next is wired to cycleRef itself ──────────
+            // The decode reads a slot, never recurses, so a one-step self-loop is
+            // observable: cycleRef.next decodes to the SAME oop as cycleRef.  Proven
+            // both by oop identity and by reading the same `val` one hop deep.
+            {
+                const auto cyc{ holder2->cycle_ref() };
+                ctx.check("cycle_ref_non_null_post_probe", cyc != nullptr);
+                if (cyc)
+                {
+                    void* const cyc_oop{ cyc->get_instance() };
+                    const auto loop{ cyc->next() };
+                    ctx.check("cycle_ref_next_non_null_post_probe", loop != nullptr);
+                    if (loop)
+                    {
+                        // The self-loop: next decodes back to the SAME oop.
+                        ctx.check("cycle_ref_next_is_self_same_oop",
+                                  loop->get_instance() == cyc_oop && cyc_oop != nullptr);
+                        // ...and one hop deep reads the SAME val (it IS the same obj).
+                        ctx.check("cycle_ref_next_reads_same_value",
+                                  loop->val() == CYCLE_REF_VAL);
+                        // The compressed OOP of cycleRef.next equals cycleRef's slot.
+                        const auto cyc_proxy{ holder2->get_field("cycleRef") };
+                        const auto loop_proxy{ cyc->get_field("next") };
+                        ctx.check("cycle_ref_next_compressed_equals_self",
+                                  cyc_proxy.has_value() && loop_proxy.has_value()
+                                  && cyc_proxy->get_compressed_oop() != 0u
+                                  && cyc_proxy->get_compressed_oop()
+                                     == loop_proxy->get_compressed_oop());
+                    }
+                }
+                ctx.check("java_cycle_ref_identity_published",
+                          holder_object::cycle_ref_identity() != 0);
+            }
+
+            // ── DEPTH-2 CHAIN: chainHead -> mid -> tail, each a fresh decode ──
+            // Walks two levels of nested object-ref decode through field-decoded
+            // wrappers and proves each level is a DISTINCT object carrying its own
+            // wired value (head/mid/tail), and a method dispatches at the deepest.
+            {
+                const auto head{ holder2->chain_head() };
+                ctx.check("chain_head_non_null_post_probe", head != nullptr);
+                if (head)
+                {
+                    ctx.check("chain_head_value_post_probe", head->val() == CHAIN_HEAD_VAL);
+                    const auto mid{ head->next() };
+                    ctx.check("chain_mid_non_null", mid != nullptr);
+                    if (mid)
+                    {
+                        ctx.check("chain_mid_value", mid->val() == CHAIN_MID_VAL);
+                        ctx.check("chain_mid_distinct_from_head",
+                                  mid->get_instance() != head->get_instance()
+                                  && mid->get_instance() != nullptr);
+                        const auto tail{ mid->next() };
+                        ctx.check("chain_tail_non_null", tail != nullptr);
+                        if (tail)
+                        {
+                            ctx.check("chain_tail_value", tail->val() == CHAIN_TAIL_VAL);
+                            ctx.check("chain_tail_distinct_from_mid",
+                                      tail->get_instance() != mid->get_instance()
+                                      && tail->get_instance() != head->get_instance()
+                                      && tail->get_instance() != nullptr);
+                            // method dispatch TWO levels deep through field-decoded
+                            // wrappers.
+                            ctx.check("chain_tail_method_dispatch",
+                                      tail->compute() == CHAIN_TAIL_VAL * 2 + 1);
+                            // The deepest level is unterminated (tail.next is null).
+                            ctx.check("chain_tail_next_is_null",
+                                      tail->next() == nullptr);
+                        }
+                    }
+                }
+                ctx.check("java_chain_tail_identity_published",
+                          holder_object::chain_tail_identity() != 0);
             }
 
             // ── array element walk (the CORRECT way; contrasts flaw B) ──────
