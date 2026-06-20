@@ -16,7 +16,7 @@ Source-verified fix-plans from the 10-agent investigation wave (2026-06-20), one
 - **Test:** `for_each_thread.cpp` non-regression on mingw×8-26 (warm path byte-identical; safe_read returns same bytes for mapped slots).
 - **Risk:** none on warm path. Plain struct-field reads (not frame-walk), so no POSIX range-check regression risk → apply uniformly.
 
-### 3. call_jni cache mis-keying across overloads — HIGH (JDK21+)
+### 3. call_jni cache mis-keying across overloads — HIGH (JDK21+) — DONE (cached_keyed_signature)
 - **Bug:** call_jni caches jmethodID/jclass/cached_ret_char per-proxy (16258/16282/16324) gated by presence (`!cached_*`), NOT by signature. A reused name-only proxy that calls overload A then B reuses A's methodID + ret_char for B → wrong method invoked, return decoded as wrong type. Surfaces on the call_jni path (every CI JDK; "JDK21+" = where call stub is absent).
 - **Fix:** add `mutable std::string cached_keyed_signature;`; right after `effective_signature` is computed (~16264), `if (cached_keyed_signature != effective_signature) { reset cached_method_id/class_handle/ret_char; cached_keyed_signature = effective_signature; }`. The existing `!ret_char`/`!cached_method_id` gates then re-resolve.
 - **Test:** `method_call_jni_fallback.cpp` + fixture — `int combo(int)` / `String combo(String)`, call both through ONE held proxy, both orders. Pre-fix the 2nd call returns wrong type.

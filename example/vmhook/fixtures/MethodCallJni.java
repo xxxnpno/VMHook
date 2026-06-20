@@ -339,6 +339,14 @@ public final class MethodCallJni
         return s;
     }
 
+    // OVERLOAD PAIR for the call_jni cache-mis-keying regression (library #3):
+    // SAME name, different descriptor, DIFFERENT return type.  A reused name-only
+    // method_proxy must RE-RESOLVE per call rather than reuse the first overload's
+    // cached jmethodID / return-type char (which would invoke the wrong method and
+    // decode the return as the wrong type).
+    public int    combo(final int x)    { return x + 100; }
+    public String combo(final String s) { return s + "!"; }
+
     // String ARG -> void (prove a String reaches a no-return body).
     public void consumeString(final String s)
     {

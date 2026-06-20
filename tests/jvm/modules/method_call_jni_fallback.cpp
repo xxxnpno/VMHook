@@ -207,6 +207,13 @@ namespace
     std::atomic<std::int64_t> g_echo_long{ k_uncaptured };
     std::atomic<std::int64_t> g_s_echo_int{ k_uncaptured };
 
+    // call_jni cache mis-keying regression (library #3): ONE held name-only proxy
+    // reused across two overloads (combo(int)->int, combo(String)->String).
+    std::atomic<std::int64_t> g_combo_int_first{ k_uncaptured };      // combo(5) FIRST -> 105
+    std::atomic<int>          g_combo_str_after_int{ -1 };            // combo("hi") after int -> "hi!"
+    std::atomic<std::int64_t> g_combo_int_after_str{ k_uncaptured };  // combo(7) after String -> 107
+    std::atomic<int>          g_combo_str_first{ -1 };                // combo("yo") FIRST -> "yo!"
+
     // multi-arg (int, long, double) returns + side effects (instance + static)
     std::atomic<std::int64_t> g_sum_ild{ k_uncaptured };
     std::atomic<std::int64_t> g_s_sum_ild{ k_uncaptured };
@@ -511,6 +518,28 @@ namespace
         g_echo_long.store(static_cast<std::int64_t>(s.get_method("echoLong")->call(k_echo_long)));
         g_s_echo_int.store(static_cast<std::int32_t>(
             method_call_jni::static_method("sEchoInt")->call(k_echo_int)));
+
+        // ───────── call_jni cache mis-keying (library #3) ─────────
+        // ONE held name-only proxy reused across two overloads with DIFFERENT
+        // return types (combo(int)->int, combo(String)->String).  Pre-fix, the
+        // 2nd call reused the 1st overload's cached jmethodID + return-type char,
+        // invoking the wrong method and decoding its return as the wrong type.
+        {
+            auto p{ s.get_method("combo") };
+            if (p.has_value())
+            {
+                g_combo_int_first.store(static_cast<std::int64_t>(p->call(static_cast<std::int32_t>(5))));
+                g_combo_str_after_int.store(p->call(std::string{ "hi" }).as_string() == "hi!" ? 1 : 0);
+            }
+        }
+        {
+            auto p{ s.get_method("combo") };
+            if (p.has_value())
+            {
+                g_combo_str_first.store(p->call(std::string{ "yo" }).as_string() == "yo!" ? 1 : 0);
+                g_combo_int_after_str.store(static_cast<std::int64_t>(p->call(static_cast<std::int32_t>(7))));
+            }
+        }
 
         // ───────── boundary primitive-arg echoes (int/long edge values) ─────────
         // echoIntId / echoLongId return their arg WITHOUT touching lastEchoArg, so
@@ -1360,6 +1389,15 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
         ctx.check("mcj_echo_int_side_effect", method_call_jni::last_echo_arg() == k_post_echo); // last echo was the post-loop one
         ctx.check("mcj_echo_long_passthrough", g_echo_long.load() == k_echo_long);
         ctx.check("mcj_static_echo_int_passthrough", g_s_echo_int.load() == k_echo_int);
+
+        // ───── call_jni cache mis-keying (library #3): a reused name-only proxy
+        // must re-resolve per overload.  combo(5)=105 then combo("hi")="hi!" through
+        // ONE proxy, and the reverse order through another — pre-fix the 2nd call in
+        // each pair returned the wrong type/value from the 1st overload's cache.
+        ctx.check("mcj_combo_int_first_returns_105", g_combo_int_first.load() == 105);
+        ctx.check("mcj_combo_str_after_int_returns_hibang", g_combo_str_after_int.load() == 1);
+        ctx.check("mcj_combo_str_first_returns_yobang", g_combo_str_first.load() == 1);
+        ctx.check("mcj_combo_int_after_str_returns_107", g_combo_int_after_str.load() == 107);
 
         // ═════════════════════ multi-arg (I,J,D) two-slot args ════════════════
         // result = i + j + (long)d ; proves long + double both landed correctly.

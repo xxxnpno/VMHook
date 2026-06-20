@@ -16263,6 +16263,21 @@ namespace vmhook
                        this->cached_effective_signature)
                     : this->signature_text };
 
+            // Invalidate the per-overload caches (jmethodID / jclass / ret-type char)
+            // when the resolved overload's descriptor differs from the one they were
+            // primed for.  effective_signature is recomputed every call (above), but the
+            // method_id/class/ret_char caches are gated only on "not yet resolved", so a
+            // reused name-only proxy that calls overload A then overload B would otherwise
+            // reuse A's jmethodID + return-type char for B -> wrong method invoked, return
+            // decoded as the wrong type.  Re-key here so the gates below re-resolve.
+            if (this->cached_keyed_signature != effective_signature)
+            {
+                this->cached_keyed_signature = effective_signature;
+                this->cached_method_id       = nullptr;
+                this->cached_class_handle     = nullptr;
+                this->cached_ret_char        = 0;
+            }
+
             // NOTE: a fail-safe "refuse dispatch when no overload matches the C++
             // args" guard was tried here but signature_matches_arguments() has a
             // false-NEGATIVE for unique_ptr<T> / object arguments (it does not map
@@ -17664,6 +17679,14 @@ namespace vmhook
         // here so the call_jni dispatch uses the right signature for
         // GetMethodID / ret-type peek / return-type-string detection.
         mutable std::string cached_effective_signature{};
+        // The effective descriptor the per-overload caches above (cached_method_id,
+        // cached_class_handle, cached_ret_char) were resolved FOR.  A reused name-only
+        // proxy can resolve a DIFFERENT overload between calls (A then B); those caches
+        // are otherwise gated only on "!= null / != 0", so they would dispatch B through
+        // A's jmethodID and decode B's return as A's type.  When the resolved
+        // effective_signature differs from this key, the caches are invalidated and
+        // re-resolved for the new overload.  Empty = no call has primed the caches yet.
+        mutable std::string cached_keyed_signature{};
     };
 
     // --- Object base class ----------------------------------------------------
