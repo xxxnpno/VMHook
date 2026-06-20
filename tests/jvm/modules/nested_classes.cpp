@@ -351,6 +351,35 @@ namespace
         auto no_this0() const -> bool { return !get_field("this$0").has_value(); }
     };
 
+    // A STATIC class nested inside the interface-member class (4-segment $-name):
+    // `int deepIfaceValue` + `int deepIfacePlusConst()`.  No synthetic outer ref.
+    class iface_inner_w : public vmhook::object<iface_inner_w>
+    {
+    public:
+        explicit iface_inner_w(vmhook::oop_t instance) noexcept
+            : vmhook::object<iface_inner_w>{ instance }
+        {
+        }
+
+        auto get_deep_iface_value() const -> std::int32_t { return get_field("deepIfaceValue")->get(); }
+        auto no_this0() const -> bool { return !get_field("this$0").has_value(); }
+        auto no_this1() const -> bool { return !get_field("this$1").has_value(); }
+    };
+
+    // A member class of the nested ANNOTATION (implicitly static): `int
+    // annoMemberValue` + `int annoMemberPlusWeight()`.  No synthetic outer ref.
+    class anno_member_w : public vmhook::object<anno_member_w>
+    {
+    public:
+        explicit anno_member_w(vmhook::oop_t instance) noexcept
+            : vmhook::object<anno_member_w>{ instance }
+        {
+        }
+
+        auto get_anno_member_value() const -> std::int32_t { return get_field("annoMemberValue")->get(); }
+        auto no_this0() const -> bool { return !get_field("this$0").has_value(); }
+    };
+
     // Fully-qualified internal `$` names (the STABLE resolution targets).
     constexpr const char* k_fixture_name      = "vmhook/fixtures/NestedClasses";
     constexpr const char* k_host_name         = "vmhook/fixtures/NestedClasses$Host";
@@ -371,6 +400,20 @@ namespace
     constexpr const char* k_enum_static_name  = "vmhook/fixtures/NestedClasses$NestedEnum$EnumStatic";
     constexpr const char* k_iface_member_name = "vmhook/fixtures/NestedClasses$NestedIface$IfaceMember";
     constexpr const char* k_host_color_name   = "vmhook/fixtures/NestedClasses$Host$HostColor";
+    // Batch-19 deepening: a STATIC class nested inside an interface-member (a
+    // 4-segment $-name whose enclosing chain runs through an INTERFACE at the
+    // root, then a member class, then a static class), and a member class of the
+    // nested ANNOTATION (an @interface — the third interface-like encloser after
+    // plain interface and enum).  Both are implicitly/explicitly static -> no
+    // synthetic outer reference.  Each probes the `$`-name path for an
+    // enclosing-chain shape the earlier targets never exercised.
+    constexpr const char* k_iface_inner_name  = "vmhook/fixtures/NestedClasses$NestedIface$IfaceMember$IfaceInnerInner";
+    constexpr const char* k_anno_member_name  = "vmhook/fixtures/NestedClasses$NestedAnno$AnnoMember";
+
+    // The internal `$`-name of the fixture top-level using DOTTED separators — NOT
+    // a valid HotSpot internal name (those use '/'), used only to characterise the
+    // dotted-vs-slashed sensitivity of find_class as [INFO] (JDK/loader-variant).
+    constexpr const char* k_inner_name_dotted = "vmhook.fixtures.NestedClasses$Host$Inner";
 
     // Descriptors the synthetic outer-reference slots must carry.
     constexpr const char* k_host_descriptor  = "Lvmhook/fixtures/NestedClasses$Host;";
@@ -545,6 +588,8 @@ VMHOOK_JVM_MODULE(nested_classes)
     vmhook::register_class<generic_box_w>(k_generic_name);
     vmhook::register_class<enum_static_w>(k_enum_static_name);
     vmhook::register_class<iface_member_w>(k_iface_member_name);
+    vmhook::register_class<iface_inner_w>(k_iface_inner_name);
+    vmhook::register_class<anno_member_w>(k_anno_member_name);
 
     // =====================================================================
     //  0. The fixture resolves and its publication fields are reachable.
@@ -573,6 +618,8 @@ VMHOOK_JVM_MODULE(nested_classes)
     vmhook::hotspot::klass* const enum_static_klass{ vmhook::find_class(k_enum_static_name) };
     vmhook::hotspot::klass* const iface_member_klass{ vmhook::find_class(k_iface_member_name) };
     vmhook::hotspot::klass* const host_color_klass{ vmhook::find_class(k_host_color_name) };
+    vmhook::hotspot::klass* const iface_inner_klass{ vmhook::find_class(k_iface_inner_name) };
+    vmhook::hotspot::klass* const anno_member_klass{ vmhook::find_class(k_anno_member_name) };
 
     ctx.check("find_class_host_resolves", host_klass != nullptr);
     ctx.check("find_class_static_nested_resolves", static_klass != nullptr);
@@ -587,6 +634,10 @@ VMHOOK_JVM_MODULE(nested_classes)
     ctx.check("find_class_enum_static_resolves", enum_static_klass != nullptr);
     ctx.check("find_class_iface_member_resolves", iface_member_klass != nullptr);
     ctx.check("find_class_host_color_resolves", host_color_klass != nullptr);
+    // Batch-19: a 4-segment $-name rooted in an INTERFACE, and a member class of
+    // an ANNOTATION — both resolve by their multi-segment internal $-name.
+    ctx.check("find_class_iface_inner_resolves", iface_inner_klass != nullptr);
+    ctx.check("find_class_anno_member_resolves", anno_member_klass != nullptr);
 
     ctx.check("host_klass_name_echoes_dollar_name", klass_name_is(host_klass, k_host_name));
     ctx.check("static_nested_klass_name_echoes_dollar_name", klass_name_is(static_klass, k_static_name));
@@ -604,6 +655,35 @@ VMHOOK_JVM_MODULE(nested_classes)
     ctx.check("enum_static_klass_name_echoes_dollar_name", klass_name_is(enum_static_klass, k_enum_static_name));
     ctx.check("iface_member_klass_name_echoes_dollar_name", klass_name_is(iface_member_klass, k_iface_member_name));
     ctx.check("host_color_klass_name_echoes_dollar_name", klass_name_is(host_color_klass, k_host_color_name));
+    // The 4-segment iface-rooted name and the annotation-member name echo exactly:
+    // the `$`-name resolver does not care that an interface/annotation sits in the
+    // enclosing chain.
+    ctx.check("iface_inner_klass_name_echoes_dollar_name", klass_name_is(iface_inner_klass, k_iface_inner_name));
+    ctx.check("anno_member_klass_name_echoes_dollar_name", klass_name_is(anno_member_klass, k_anno_member_name));
+
+    // DOTTED-vs-SLASHED sensitivity of find_class — JDK/loader-variant, [INFO]
+    // ONLY (never asserted either way).  HotSpot internal names use '/'; a dotted
+    // name ("vmhook.fixtures...") is not the canonical internal form.  find_class
+    // may still resolve it via the JNI context-loader fallback (which accepts
+    // dotted binary names) on some builds and miss on others — recording which is
+    // the documented behaviour, asserting it would be wrong (see the module banner
+    // and flaw notes on dotted-vs-slashed being JDK-variant).
+    {
+        vmhook::hotspot::klass* const dotted{ vmhook::find_class(k_inner_name_dotted) };
+        ctx.record(std::string{ "[INFO] nested_classes: find_class(dotted '" }
+                   + k_inner_name_dotted + "') "
+                   + (dotted != nullptr ? "RESOLVED (JNI dotted-name fallback present)"
+                                        : "missed (slashed internal name is the canonical form)")
+                   + " -- dotted-vs-slashed is JDK/loader-variant; not asserted.");
+        // If it DID resolve, it must be the SAME klass the slashed name resolves
+        // (a dotted alias can never resolve to a DIFFERENT klass) — that invariant
+        // IS safe to assert HARD when the optional resolution happened.
+        if (dotted != nullptr && inner_klass != nullptr)
+        {
+            ctx.check("dotted_name_if_resolved_is_same_klass_as_slashed",
+                      dotted == inner_klass);
+        }
+    }
 
     // The two inner classes of the SAME outer Host are DISTINCT klasses (one of
     // the headline multiplicity facts).
@@ -620,6 +700,19 @@ VMHOOK_JVM_MODULE(nested_classes)
               && static_klass != inner_klass && inner_klass != inner_inner_klass
               && static_klass != deep_klass && iface_klass != enum_klass
               && enum_klass != anno_klass && anno_klass != generic_klass);
+
+    // The two batch-19 deeper-chain klasses are distinct from each other and from
+    // their respective enclosing types (the 4-segment iface-inner != the member it
+    // nests in; the anno-member != the annotation it nests in).  Pure pointer
+    // comparison -> HARD.
+    ctx.check("iface_inner_distinct_from_its_member_and_iface",
+              iface_inner_klass != nullptr && iface_member_klass != nullptr
+              && iface_klass != nullptr
+              && iface_inner_klass != iface_member_klass
+              && iface_inner_klass != iface_klass);
+    ctx.check("anno_member_distinct_from_its_annotation",
+              anno_member_klass != nullptr && anno_klass != nullptr
+              && anno_member_klass != anno_klass);
 
     // =====================================================================
     //  2. Acquire the force-instantiated STABLE singletons and read each
@@ -846,6 +939,32 @@ VMHOOK_JVM_MODULE(nested_classes)
                     // Read innerValue THROUGH the this$1-decoded Inner wrapper.
                     ctx.check("inner_inner_this1_innerValue_readback_99",
                               this1_inner->get_inner_value() == 99);
+
+                    // TWO-HOP synthetic-link chain: the this$1-decoded Inner has its
+                    // OWN this$0 -> Host.  Decode it from the Inner wrapper we just
+                    // recovered (NOT the originally-acquired `inner`), so the chain
+                    // InnerInner.this$1 -> Inner.this$0 -> Host is walked end to end
+                    // purely through synthetic links.  The terminal Host must be the
+                    // very `host` singleton by IDENTITY (pointer compare -> HARD), and
+                    // outerField must read back 7 through that twice-decoded wrapper.
+                    ctx.check("two_hop_inner_inner_this1_has_this0",
+                              this1_inner->this0_resolves());
+                    const auto hop_host{ this1_inner->get_this0_host() };
+                    ctx.check("two_hop_inner_inner_to_host_decodes_nonnull",
+                              hop_host != nullptr);
+                    if (hop_host && host)
+                    {
+                        vmhook::oop_t const hop_oop{ hop_host->get_instance() };
+                        ctx.check("two_hop_inner_inner_terminal_is_host_instance",
+                                  hop_oop != nullptr
+                                  && vmhook::hotspot::is_valid_pointer(hop_oop)
+                                  && hop_oop == host->get_instance());
+                        if (hop_oop && oop_header_safely_readable(hop_oop))
+                        {
+                            ctx.check("two_hop_inner_inner_terminal_outerField_7",
+                                      hop_host->get_outer_field() == 7);
+                        }
+                    }
                 }
             }
         }
@@ -1316,6 +1435,51 @@ VMHOOK_JVM_MODULE(nested_classes)
     }
 
     // =====================================================================
+    //  7g2. SYNTHETIC CONSTRUCTOR PARAM — the method-side mirror of the this$0
+    //      field contract.  For a non-static inner class javac injects a synthetic
+    //      LEADING constructor parameter of the enclosing type so the ctor can wire
+    //      this$0; the Inner's `<init>` descriptor therefore STARTS WITH
+    //      "(Lvmhook/fixtures/NestedClasses$Host;" .  A STATIC nested class's ctor
+    //      carries NO such leading enclosing param.  Pure _methods walk (no oop
+    //      deref) -> HARD; this proves the synthetic outer wiring is visible on the
+    //      method surface too, not only as the this$0 field.
+    // =====================================================================
+    {
+        auto any_init_param0_is = [&](const char* class_name, const std::string& want_prefix) -> bool
+        {
+            for (const auto& m : vmhook::get_class_methods(class_name))
+            {
+                if (m.first == "<init>" && starts_with(m.second, want_prefix))
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const std::string inner_ctor_prefix{ std::string{ "(" } + k_host_descriptor };
+        // The Inner ctor's FIRST param is the enclosing Host (wires this$0).
+        ctx.check("inner_ctor_has_synthetic_leading_host_param",
+                  any_init_param0_is(k_inner_name, inner_ctor_prefix));
+        // SecondInner's ctor likewise leads with the enclosing Host.
+        ctx.check("second_inner_ctor_has_synthetic_leading_host_param",
+                  any_init_param0_is(k_second_inner_name, inner_ctor_prefix));
+        // InnerInner's ctor leads with the enclosing INNER (wires this$1), so its
+        // first param descriptor is the Inner type, NOT the Host.
+        const std::string inner_inner_ctor_prefix{ std::string{ "(" } + k_inner_descriptor };
+        ctx.check("inner_inner_ctor_has_synthetic_leading_inner_param",
+                  any_init_param0_is(k_inner_inner_name, inner_inner_ctor_prefix));
+        // A STATIC nested class's ctor has NO synthetic leading enclosing param:
+        // StaticNested's only ctor is StaticNested(int) -> descriptor "(I)V".  Assert
+        // it does NOT lead with the Host descriptor (the static-nesting negative on
+        // the method surface).
+        ctx.check("static_nested_ctor_has_no_leading_host_param",
+                  !any_init_param0_is(k_static_name, inner_ctor_prefix));
+        // And StaticNested's declared (int) ctor is present with the plain "(I)V".
+        ctx.check("static_nested_has_int_ctor",
+                  any_init_param0_is(k_static_name, std::string{ "(I)V" }));
+    }
+
+    // =====================================================================
     //  7h. BATCH-17 ENCLOSING-TYPE SHAPES — a static class nested under an ENUM,
     //      a member class of an INTERFACE, and an ENUM nested in a class.  Each
     //      adds an enclosing-type the earlier targets never exercised, and each
@@ -1534,6 +1698,133 @@ VMHOOK_JVM_MODULE(nested_classes)
     }
 
     // =====================================================================
+    //  7j. BATCH-19 DEEPER ENCLOSING-CHAIN SHAPES — a STATIC class nested 4 deep
+    //      whose enclosing chain is rooted in an INTERFACE
+    //      (NestedIface$IfaceMember$IfaceInnerInner), and a member class of an
+    //      ANNOTATION (NestedAnno$AnnoMember).  Each adds an enclosing CHAIN the
+    //      earlier targets never exercised (interface-at-root-of-a-4-segment-name;
+    //      annotation-as-immediate-encloser) and asserts the SAME contract bundle:
+    //      acquire/read the declared field, klass-from-oop tie-back, the
+    //      static-nesting negative (NO this$N at any level), the int-field metadata
+    //      shape, the super-chain echo, and the method descriptor.
+    // =====================================================================
+    {
+        const auto iface_inner{ nc::acquire<iface_inner_w>("ifaceInnerInnerInst") };
+        const auto anno_member{ nc::acquire<anno_member_w>("annoMemberInst") };
+
+        ctx.check("iface_inner_instance_acquired", iface_inner != nullptr);
+        ctx.check("anno_member_instance_acquired", anno_member != nullptr);
+
+        // -- declared int field reads (mirrored values), header-probe gated ------
+        if (iface_inner)
+        {
+            read_int_field("iface_inner_value_is_88", iface_inner->get_instance(),
+                           [&] { return iface_inner->get_deep_iface_value(); }, 88);
+        }
+        if (anno_member)
+        {
+            read_int_field("anno_member_value_is_250", anno_member->get_instance(),
+                           [&] { return anno_member->get_anno_member_value(); }, 250);
+        }
+
+        // -- klass-from-oop tie-back: the acquired oop carries the by-name klass --
+        if (iface_inner)
+        {
+            klass_tie_back("iface_inner_oop_klass_matches_find_class",
+                           iface_inner->get_instance(), iface_inner_klass);
+        }
+        if (anno_member)
+        {
+            klass_tie_back("anno_member_oop_klass_matches_find_class",
+                           anno_member->get_instance(), anno_member_klass);
+        }
+
+        // -- static-nesting negatives via the LIVE wrapper (field metadata walk;
+        //    no oop deref) -- neither shape carries a synthetic outer ref.  HARD.
+        if (iface_inner)
+        {
+            ctx.check("iface_inner_has_no_this0", iface_inner->no_this0());
+            ctx.check("iface_inner_has_no_this1", iface_inner->no_this1());
+        }
+        if (anno_member)
+        {
+            ctx.check("anno_member_has_no_this0", anno_member->no_this0());
+        }
+
+        // -- the same negatives proven instance-free off the resolved klass ------
+        ctx.check("iface_inner_this0_find_field_absent",
+                  !field_entry_for(iface_inner_klass, "this$0").has_value());
+        ctx.check("iface_inner_this1_find_field_absent",
+                  !field_entry_for(iface_inner_klass, "this$1").has_value());
+        ctx.check("anno_member_this0_find_field_absent",
+                  !field_entry_for(anno_member_klass, "this$0").has_value());
+
+        // -- the declared int fields resolve as INSTANCE "I" off the resolved
+        //    klass (pure metadata; offset past header) -> HARD.
+        {
+            const auto ii_e{ field_entry_for(iface_inner_klass, "deepIfaceValue") };
+            ctx.check("iface_inner_value_meta_resolves", ii_e.has_value());
+            if (ii_e.has_value())
+            {
+                ctx.check("iface_inner_value_meta_is_int", ii_e->signature == std::string{ "I" });
+                ctx.check("iface_inner_value_meta_is_instance", !ii_e->is_static);
+                ctx.check("iface_inner_value_meta_offset_past_header", ii_e->offset > 0u);
+            }
+            const auto am_e{ field_entry_for(anno_member_klass, "annoMemberValue") };
+            ctx.check("anno_member_value_meta_resolves", am_e.has_value());
+            if (am_e.has_value())
+            {
+                ctx.check("anno_member_value_meta_is_int", am_e->signature == std::string{ "I" });
+                ctx.check("anno_member_value_meta_is_instance", !am_e->is_static);
+            }
+        }
+
+        // -- super-chain: both extend java.lang.Object directly (a static class,
+        //    however deeply nested or whatever its enclosers, has Object as super).
+        //    Pure metadata (get_super + get_name) -> HARD.
+        ctx.check("iface_inner_super_is_object",
+                  super_name_str(iface_inner_klass) == std::string{ k_object_name });
+        ctx.check("anno_member_super_is_object",
+                  super_name_str(anno_member_klass) == std::string{ k_object_name });
+
+        // -- method descriptors (stable obfuscation-proof key) ------------------
+        ctx.check("iface_inner_deepIfacePlusConst_descriptor_is_int_noarg",
+                  method_descriptor(k_iface_inner_name, "deepIfacePlusConst") == std::string{ "()I" });
+        ctx.check("anno_member_annoMemberPlusWeight_descriptor_is_int_noarg",
+                  method_descriptor(k_anno_member_name, "annoMemberPlusWeight") == std::string{ "()I" });
+    }
+
+    // =====================================================================
+    //  7k. find_field CACHE STABILITY on a `$`-nested klass — a repeated lookup
+    //      of the SAME (klass, name) pair returns the SAME field_entry_t shape
+    //      (offset + descriptor + storage class).  This is the read-side of
+    //      flaw #1 (g_field_cache is keyed on the bare klass* and never
+    //      re-validated): with NO redefine in play the offset MUST be stable across
+    //      calls, so a drift here would be a real cache-coherence regression.  Pure
+    //      metadata -> HARD.  We deliberately probe both a SYNTHETIC field (this$0)
+    //      and an ORDINARY field (innerValue) since they take different storage
+    //      formats (UNSIGNED5 stream vs Array<u2>) on different JDKs.
+    // =====================================================================
+    {
+        auto entry_stable = [&](const char* tag, vmhook::hotspot::klass* k, const char* fname)
+        {
+            const auto a{ field_entry_for(k, fname) };
+            const auto b{ field_entry_for(k, fname) };
+            const bool both{ a.has_value() && b.has_value() };
+            ctx.check(std::string{ tag } + "_both_resolve", both);
+            if (both)
+            {
+                ctx.check(std::string{ tag } + "_offset_stable", a->offset == b->offset);
+                ctx.check(std::string{ tag } + "_descriptor_stable", a->signature == b->signature);
+                ctx.check(std::string{ tag } + "_storage_class_stable", a->is_static == b->is_static);
+            }
+        };
+        entry_stable("inner_this0_cache", inner_klass, "this$0");
+        entry_stable("inner_innerValue_cache", inner_klass, "innerValue");
+        entry_stable("host_outerField_cache", host_klass, "outerField");
+    }
+
+    // =====================================================================
     //  8. Native interpreter-call ATTEMPTS (degrade gracefully to [INFO]).
     //     A no-arg int instance method on a nested class may return monostate
     //     via the call_jni fallback on some JDK builds; never FAIL on that.
@@ -1652,6 +1943,38 @@ VMHOOK_JVM_MODULE(nested_classes)
             ctx.check("composite_anon_iface_parts_sum_to_4250",
                       (8 + 4242) == nc::get_int("anonIfaceOpValue"));
         }
+
+        // Mode 4: the batch-19 deeper-chain shapes + enum reflection round-trips +
+        // the two-hop synthetic-link composite, all through REAL bytecode.
+        const bool done4{ drive(ctx, 4) };
+        ctx.check("composite_probe_mode4_completed", done4);
+        if (done4)
+        {
+            // Static-in-iface-member: deepIfaceValue(88) + IFACE_CONST(17) == 105.
+            ctx.check("probe_iface_inner_plus_const_is_105",
+                      nc::get_int("ifaceInnerInnerValue") == 105);
+            ctx.check("composite_iface_inner_parts_sum_to_105",
+                      (88 + 17) == nc::get_int("ifaceInnerInnerValue"));
+            // Anno-member declared no-arg int method: 250 + 0 == 250.
+            ctx.check("probe_anno_member_value_is_250",
+                      nc::get_int("annoMemberValue") == 250);
+            // Synthetic values() arrays have the declared constant count.
+            ctx.check("probe_nested_enum_values_len_is_3",
+                      nc::get_int("nestedEnumValuesLen") == 3);
+            ctx.check("probe_host_color_values_len_is_3",
+                      nc::get_int("hostColorValuesLen") == 3);
+            // valueOf round-trip: NestedEnum.valueOf("GAMMA").rank() == ordinal(2)+1.
+            ctx.check("probe_nested_enum_valueOf_rank_is_3",
+                      nc::get_int("nestedEnumValueOfRank") == 3);
+            // Two-hop synthetic-link composite re-proven through real bytecode: the
+            // InnerInner reads Host.outerField via this$1 -> Inner -> this$0 -> Host
+            // plus innerValue plus its own field == 7 + 99 + 11 == 117.  Corroborates
+            // the native two-hop identity decode in phase 4c JDK-independently.
+            ctx.check("probe_two_hop_inner_inner_is_117",
+                      nc::get_int("twoHopInnerInnerValue") == 117);
+            ctx.check("composite_two_hop_parts_sum_to_117",
+                      (7 + 99 + 11) == nc::get_int("twoHopInnerInnerValue"));
+        }
     }
 
     // =====================================================================
@@ -1674,5 +1997,7 @@ VMHOOK_JVM_MODULE(nested_classes)
         ctx.check("enum_static_identity_published_nonzero", nc::get_int("enumStaticIdentity") != 0);
         ctx.check("iface_member_identity_published_nonzero", nc::get_int("ifaceMemberIdentity") != 0);
         ctx.check("anonymous_iface_identity_published_nonzero", nc::get_int("anonymousIfaceIdentity") != 0);
+        ctx.check("iface_inner_identity_published_nonzero", nc::get_int("ifaceInnerInnerIdentity") != 0);
+        ctx.check("anno_member_identity_published_nonzero", nc::get_int("annoMemberIdentity") != 0);
     }
 }

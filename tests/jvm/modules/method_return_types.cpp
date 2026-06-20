@@ -381,6 +381,73 @@ namespace
             return m->call();   // uint32 OOP alt -> static_cast<int32>
         }
 
+        // ---- MISMATCH (void direction): decode a VOID return as a reference / string.
+        //      A void return stores the monostate alternative, which is neither the OOP
+        //      (uint32) alternative nor a std::string; so the void* / unique_ptr / string
+        //      conversions all fall through to a default-constructed result -- null / empty
+        //      / "" -- never a crash and never a fabricated pointer.  These pin the
+        //      monostate->{void*,unique_ptr,std::string} branches of the conversion
+        //      operator, which the existing int-as-reference mismatch does NOT exercise. -
+        auto call_void_as_pointer_is_null(const char* name) -> bool
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return true; }
+            void* const raw = m->call();   // monostate alt -> no void* cast -> nullptr
+            return raw == nullptr;
+        }
+        auto call_void_as_wrapper_is_null(const char* name) -> bool
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return true; }
+            std::unique_ptr<rt> wrapped = m->call();   // monostate alt -> empty unique_ptr
+            return wrapped == nullptr;
+        }
+        auto call_void_as_string_size(const char* name) -> std::int64_t
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return -1; }
+            return static_cast<std::int64_t>(m->call().as_string().size());  // monostate -> ""
+        }
+
+        // ---- MISMATCH (String direction): decode a STRING return as a reference (void* /
+        //      unique_ptr<rt>).  The String return stores the std::string alternative, NOT
+        //      the uint32 OOP alternative, so neither the void* branch (gated on uint32) nor
+        //      the unique_ptr branch (gated on uint32) fires -- both yield null/empty.  This
+        //      is the String-side counterpart of the int-as-reference mismatch and proves
+        //      the eager-std::string alternative is never mistaken for a compressed OOP. ----
+        auto call_string_as_pointer_is_null(const char* name) -> bool
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return true; }
+            void* const raw = m->call();   // std::string alt -> not the OOP alt -> nullptr
+            return raw == nullptr;
+        }
+        auto call_string_as_wrapper_is_null(const char* name) -> bool
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return true; }
+            std::unique_ptr<rt> wrapped = m->call();   // std::string alt -> empty unique_ptr
+            return wrapped == nullptr;
+        }
+
+        // ---- WIDENED extreme readbacks: read a narrow signed extreme into a WIDER int to
+        //      prove the high bit sign-extends across the whole width (the headline set only
+        //      widens the -1 cases; these widen the MIN/MAX extremes).  byte/short min are
+        //      the strongest sign-extension witnesses (a single mis-masked bit shows). ----
+        auto call_i8_min_as_int(const char* name) -> std::int32_t { return get_method(name)->call(); }
+        auto call_i16_min_as_int(const char* name) -> std::int32_t { return get_method(name)->call(); }
+        auto call_i16_max_as_int(const char* name) -> std::int32_t { return get_method(name)->call(); }
+        // int MIN/MAX read into a wider i64: MIN must sign-extend to a negative i64, MAX must
+        // stay positive -- proves i32->i64 widening preserves sign at both extremes.
+        auto call_i32_as_i64(const char* name) -> std::int64_t { return get_method(name)->call(); }
+
+        // ---- static widened char (zero-extend on the static path) ----
+        static auto static_char_as_int_wide(const char* name) -> std::int32_t
+        {
+            const std::uint16_t raw = static_method(name)->call();
+            return static_cast<std::int32_t>(raw);
+        }
+
         // ---- INTERFACE-typed return whose runtime value is a String.  The descriptor
         //      is Ljava/lang/CharSequence; (NOT Ljava/lang/String;), so call() stores a
         //      generic reference; as_string() recovers the text via read_java_string on
@@ -810,6 +877,39 @@ namespace
     std::atomic<std::int64_t>  g_st_boxed_int{ rt::k_box_unset };
     std::atomic<std::int64_t>  g_st_str_empty_size{ k_uncaptured64 };
 
+    // ── batch-19 deepening: widened extremes, void/string graceful-mismatch decode
+    //    directions, new primitive sentinels, and per-return predicate contrasts. ──
+    // widened narrow signed extremes -> wider int sign-extends across the full width.
+    std::atomic<std::int64_t>  g_byte_min_wide{ k_uncaptured64 };   // -128 widened -> -128
+    std::atomic<std::int64_t>  g_short_min_wide{ k_uncaptured64 };  // -32768 widened -> -32768
+    std::atomic<std::int64_t>  g_short_max_wide{ k_uncaptured64 };  // 32767 widened -> 32767
+    std::atomic<std::int64_t>  g_int_min_as_i64{ k_uncaptured64 };  // INT_MIN widened -> negative i64
+    std::atomic<std::int64_t>  g_int_max_as_i64{ k_uncaptured64 };  // INT_MAX widened -> positive i64
+    // new primitive returners with distinct sentinels.
+    std::atomic<std::int64_t>  g_char_one{ k_uncaptured64 };          // (char)1 -> 1 (unsigned low end)
+    std::atomic<std::int64_t>  g_int_highbit{ k_uncaptured64 };       // 0x89ABCDEF -> -1985229329
+    std::atomic<std::int64_t>  g_long_low_sign_bit{ k_uncaptured64 }; // 0x80000000L -> 2147483648 (positive)
+    // void/string graceful-mismatch decode directions (monostate / std::string alt).
+    std::atomic<int>           g_void_as_ptr_null{ -1 };
+    std::atomic<int>           g_void_as_wrapper_null{ -1 };
+    std::atomic<std::int64_t>  g_void_as_string_size{ k_uncaptured64 };
+    std::atomic<int>           g_string_as_ptr_null{ -1 };
+    std::atomic<int>           g_string_as_wrapper_null{ -1 };
+    // per-return predicate contrasts not yet pinned: is_string false on EVERY primitive,
+    // is_void false on the empty/unicode String, bool/false return is the bool alt.
+    std::atomic<int>           g_bool_is_string{ -1 };
+    std::atomic<int>           g_byte_is_string{ -1 };
+    std::atomic<int>           g_long_is_string{ -1 };
+    std::atomic<int>           g_double_is_string{ -1 };
+    std::atomic<int>           g_char_is_string{ -1 };
+    std::atomic<int>           g_str_empty_is_void{ -1 };
+    std::atomic<int>           g_str_empty_is_string{ -1 };
+    std::atomic<int>           g_str_uni_is_string{ -1 };
+    std::atomic<int>           g_vidx_bool_false{ -2 };  // returnsBoolFalse is still the bool alt
+    // static-path widened char (zero-extend) + static low-sign-bit long (full 64-bit read).
+    std::atomic<std::int64_t>  g_st_char_wide{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_st_long_low_sign_bit{ k_uncaptured64 };
+
     auto reset_observations() -> void
     {
         g_detour_calls.store(0);
@@ -918,6 +1018,21 @@ namespace
         g_combo_bool.store(-2); g_combo_char.store(k_uncaptured64);
         g_combo_vidx_z.store(-2); g_combo_vidx_c.store(-2);
         g_st_boxed_int.store(rt::k_box_unset); g_st_str_empty_size.store(k_uncaptured64);
+        // batch-19
+        g_byte_min_wide.store(k_uncaptured64);  g_short_min_wide.store(k_uncaptured64);
+        g_short_max_wide.store(k_uncaptured64);
+        g_int_min_as_i64.store(k_uncaptured64); g_int_max_as_i64.store(k_uncaptured64);
+        g_char_one.store(k_uncaptured64);       g_int_highbit.store(k_uncaptured64);
+        g_long_low_sign_bit.store(k_uncaptured64);
+        g_void_as_ptr_null.store(-1);     g_void_as_wrapper_null.store(-1);
+        g_void_as_string_size.store(k_uncaptured64);
+        g_string_as_ptr_null.store(-1);   g_string_as_wrapper_null.store(-1);
+        g_bool_is_string.store(-1); g_byte_is_string.store(-1);
+        g_long_is_string.store(-1); g_double_is_string.store(-1);
+        g_char_is_string.store(-1);
+        g_str_empty_is_void.store(-1);  g_str_empty_is_string.store(-1);
+        g_str_uni_is_string.store(-1);  g_vidx_bool_false.store(-2);
+        g_st_char_wide.store(k_uncaptured64); g_st_long_low_sign_bit.store(k_uncaptured64);
     }
 
     // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run it
@@ -1326,6 +1441,49 @@ namespace
                 // static boxed Integer + static empty String.
                 g_st_boxed_int.store(rt::static_boxed_int("staticReturnsBoxedInteger"));
                 g_st_str_empty_size.store(rt::static_string_size("staticReturnsStringEmpty"));
+
+                // ===== batch-19 deepening =========================================
+                // Widened signed extremes: byte/short MIN and short MAX read into a
+                // wider int prove the high bit sign-extends across the full width (the
+                // headline set only widened the -1 cases).
+                g_byte_min_wide.store(self->call_i8_min_as_int("returnsByteMin"));
+                g_short_min_wide.store(self->call_i16_min_as_int("returnsShortMin"));
+                g_short_max_wide.store(self->call_i16_max_as_int("returnsShortMax"));
+                // int MIN/MAX read into a wider i64: MIN stays negative, MAX stays positive.
+                g_int_min_as_i64.store(self->call_i32_as_i64("returnsIntMin"));
+                g_int_max_as_i64.store(self->call_i32_as_i64("returnsIntMax"));
+                // New primitive returners with distinct sentinels.
+                g_char_one.store(self->call_char_as_int("returnsCharOne"));
+                g_int_highbit.store(self->call_i32("returnsIntHighBit"));
+                g_long_low_sign_bit.store(self->call_i64("returnsLongLowSignBit"));
+                // Graceful wrong-type decode -- VOID return read as reference / string:
+                // the monostate alternative yields null / empty / "" (never a crash).
+                g_void_as_ptr_null.store(self->call_void_as_pointer_is_null("returnsVoid") ? 1 : 0);
+                g_void_as_wrapper_null.store(self->call_void_as_wrapper_is_null("returnsVoid") ? 1 : 0);
+                g_void_as_string_size.store(self->call_void_as_string_size("returnsVoid"));
+                // Graceful wrong-type decode -- STRING return read as reference: the
+                // std::string alternative is not the OOP alternative -> null / empty.
+                g_string_as_ptr_null.store(self->call_string_as_pointer_is_null("returnsString") ? 1 : 0);
+                g_string_as_wrapper_null.store(self->call_string_as_wrapper_is_null("returnsString") ? 1 : 0);
+                // is_string() is FALSE on every primitive return (only the int/float
+                // contrast was pinned before; widen to bool/byte/long/double/char).
+                g_bool_is_string.store(self->call_is_string("returnsBool") ? 1 : 0);
+                g_byte_is_string.store(self->call_is_string("returnsByte") ? 1 : 0);
+                g_long_is_string.store(self->call_is_string("returnsLong") ? 1 : 0);
+                g_double_is_string.store(self->call_is_string("returnsDouble") ? 1 : 0);
+                g_char_is_string.store(self->call_is_string("returnsChar") ? 1 : 0);
+                // The empty/unicode String returns are is_string() true, is_void() false
+                // (only the headline String had its predicates pinned before).
+                g_str_empty_is_void.store(self->call_is_void("returnsStringEmpty") ? 1 : 0);
+                g_str_empty_is_string.store(self->call_is_string("returnsStringEmpty") ? 1 : 0);
+                g_str_uni_is_string.store(self->call_is_string("returnsStringUnicode") ? 1 : 0);
+                // returnsBoolFalse routes to the bool alternative just like returnsBool
+                // (the value differs, the descriptor-selected alternative does not).
+                g_vidx_bool_false.store(self->call_variant_index("returnsBoolFalse"));
+                // Static-path widened char (zero-extend) + static low-sign-bit long (full
+                // 64-bit read) -- the static-dispatch counterparts of the instance witnesses.
+                g_st_char_wide.store(rt::static_char_as_int_wide("staticReturnsChar"));
+                g_st_long_low_sign_bit.store(rt::static_i64("staticReturnsLongLowSignBit"));
             }) };
         ctx.check("rt_trigger_hook_installed", hook_installed);
 
@@ -1480,6 +1638,65 @@ namespace
         // A static method returning "" decodes to a zero-length std::string on the
         // GetStaticMethodID path -- parity with the instance empty-String decode.
         ctx.check("mrt_static_string_empty_size_0", g_st_str_empty_size.load() == 0);
+
+        // =====================================================================
+        //  3a-quinquies. batch-19 deepening (hard-asserted, path-independent).  All
+        //      of these decode primitives / void / std::string alternatives, whose
+        //      width/sign/alternative-routing is independent of compressed-oops, so
+        //      they hold on BOTH the call_stub and the call_jni dispatch paths.
+        // =====================================================================
+        // Widened signed extremes: a narrow MIN/MAX read into a wider int sign-extends
+        // across the full width (a single mis-masked high bit would show).  byte MIN
+        // -128 and short MIN -32768 widen to the same negative; short MAX 32767 stays.
+        ctx.check("mrt_byte_min_widens_to_neg128", g_byte_min_wide.load() == -128);
+        ctx.check("mrt_short_min_widens_to_neg32768", g_short_min_wide.load() == -32768);
+        ctx.check("mrt_short_max_widens_to_32767", g_short_max_wide.load() == 32767);
+        // int MIN widened to i64 stays negative (sign-extended); int MAX stays positive.
+        ctx.check("mrt_int_min_widens_to_i64_negative",
+                  g_int_min_as_i64.load() == static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()));
+        ctx.check("mrt_int_max_widens_to_i64_positive",
+                  g_int_max_as_i64.load() == static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()));
+        // char 1 (smallest non-zero) zero-extends to 1 -- distinct from char 0 and 0xFFFF.
+        ctx.check("mrt_char_one_is_1", g_char_one.load() == 1);
+        // int 0x89ABCDEF (high bit set) decodes as the signed value -1985229329.
+        ctx.check("mrt_int_highbit_signed",
+                  g_int_highbit.load() == static_cast<std::int64_t>(static_cast<std::int32_t>(0x89ABCDEF)));
+        // long 0x0000000080000000: full 64-bit read is POSITIVE 2147483648; a "read low
+        // word + sign-extend" bug would read it as a negative 0xFFFFFFFF80000000.
+        ctx.check("mrt_long_low_sign_bit_is_positive",
+                  g_long_low_sign_bit.load() == static_cast<std::int64_t>(0x0000000080000000LL));
+        // Graceful wrong-type decode -- VOID return read as a reference / string: the
+        // monostate alternative is neither the OOP alt nor the std::string alt, so the
+        // void* / unique_ptr / as_string() conversions yield null / empty / "" (no crash).
+        ctx.check("mrt_void_as_pointer_is_null",  g_void_as_ptr_null.load() == 1);
+        ctx.check("mrt_void_as_wrapper_is_null",  g_void_as_wrapper_null.load() == 1);
+        ctx.check("mrt_void_as_string_is_empty",  g_void_as_string_size.load() == 0);
+        // Graceful wrong-type decode -- STRING return read as a reference: the eager
+        // std::string alternative is never mistaken for a compressed OOP, so the
+        // void* / unique_ptr conversions yield null / empty (no fabricated pointer).
+        ctx.check("mrt_string_as_pointer_is_null", g_string_as_ptr_null.load() == 1);
+        ctx.check("mrt_string_as_wrapper_is_null", g_string_as_wrapper_null.load() == 1);
+        // is_string() is FALSE on every primitive return (bool/byte/long/double/char) --
+        // widens the int/float-only predicate contrast to the full primitive set.
+        ctx.check("mrt_bool_is_string_false",   g_bool_is_string.load() == 0);
+        ctx.check("mrt_byte_is_string_false",   g_byte_is_string.load() == 0);
+        ctx.check("mrt_long_is_string_false",   g_long_is_string.load() == 0);
+        ctx.check("mrt_double_is_string_false", g_double_is_string.load() == 0);
+        ctx.check("mrt_char_is_string_false",   g_char_is_string.load() == 0);
+        // The empty/unicode String returns: is_string() true, is_void() false (only the
+        // headline String had its predicates pinned before).
+        ctx.check("mrt_string_empty_is_string_true", g_str_empty_is_string.load() == 1);
+        ctx.check("mrt_string_empty_is_void_false",  g_str_empty_is_void.load() == 0);
+        ctx.check("mrt_string_unicode_is_string_true", g_str_uni_is_string.load() == 1);
+        // returnsBoolFalse routes to the bool alternative (alt 1) -- value differs from
+        // returnsBool, descriptor-selected alternative does not.
+        ctx.check("mrt_route_bool_false_is_bool_alt", g_vidx_bool_false.load() == 1);
+        // Static-path widened char 0xBEEF (48879) zero-extends (unsigned) on the
+        // GetStaticMethodID path -- parity with the instance returnsCharMax witness.
+        ctx.check("mrt_static_char_widens_zero_extend_48879", g_st_char_wide.load() == 48879);
+        // Static-path long 0x0000000080000000: full 64-bit read positive 2147483648 too.
+        ctx.check("mrt_static_long_low_sign_bit_is_positive",
+                  g_st_long_low_sign_bit.load() == static_cast<std::int64_t>(0x0000000080000000LL));
 
         // =====================================================================
         //  3a-ter. STATIC-method return decode (hard-asserted on every path).  These

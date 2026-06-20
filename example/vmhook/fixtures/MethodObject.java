@@ -210,6 +210,10 @@ public final class MethodObject
     /** label of the static Child. */
     public static final String STATIC_LABEL = "static-child";
 
+    /** tag of each FRESH Child new'd by staticFreshChild() (distinct-each-call
+     *  on the static dispatch path). */
+    public static final int STATIC_FRESH_TAG = 0x7AC1;    // 31425
+
     /** tag/label of the chained Child returned by Child.makeSibling(). */
     public static final int SIBLING_TAG = 0x51B;          // 1307
     public static final String SIBLING_LABEL = "sibling-of-child";
@@ -521,6 +525,29 @@ public final class MethodObject
     public Child sameStaticChild()
     {
         return STATIC_CHILD;
+    }
+
+    /**
+     * STATIC method that new's a FRESH Child every call — the static-call
+     * companion to makeChild()'s distinct-each-call probe.  Two static calls
+     * must decode to two DISTINCT non-null instances, proving fresh-allocation
+     * identity holds on the STATIC dispatch path, not only the instance one.
+     */
+    public static Child staticFreshChild()
+    {
+        return new Child(STATIC_FRESH_TAG, "static-fresh");
+    }
+
+    /**
+     * Subtype-as-arg identity echo: declared to take AND return the base Animal,
+     * but the native side passes a Dog wrapper IN.  The returned OOP must equal
+     * the argument OOP, and its runtime klass is the concrete Dog — a widening
+     * reference arg (Dog -&gt; Animal) round-tripped through an object-returning
+     * call() whose decode is still driven by the runtime oop.
+     */
+    public Animal echoAnimal(final Animal a)
+    {
+        return a;
     }
 
     // ── VARIED-ARG-SIGNATURE object-returning methods (batch-14 deepening) ──

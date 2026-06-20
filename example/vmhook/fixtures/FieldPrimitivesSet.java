@@ -43,8 +43,24 @@ import vmhook.Harness;
  *
  * JAVA 8 SOURCE ONLY: anonymous Probe class; no var / records / switch-expr /
  * text blocks / List.of / Stream.toList / any post-8 java.* API.
+ *
+ * INHERITANCE: this class extends FieldPrimitivesSetBase (declared at the foot
+ * of this file).  The base owns one INHERITED settable field per primitive
+ * width, both static (bsZ..bsD) and instance (biZ..biD); the native side writes
+ * them through the SUBCLASS wrapper (static_field / get_field on
+ * FieldPrimitivesSet), exercising field_proxy::set()'s superclass-chain offset
+ * resolution -- a write into a field the wrapper class does NOT itself declare.
+ * Each inherited field is pre-set to its own sentinel so a refused / no-op write
+ * is detectable, and the base exposes getters + snapshot witnesses so the JVM's
+ * OWN bytecode confirms the inherited write landed.
+ *
+ * VOLATILE: a parallel set of `volatile` primitive fields (vsZ..vsD static,
+ * viZ..viD instance) proves field_proxy::set() writes the same plain slot for a
+ * volatile field -- ACC_VOLATILE is a JMM access-ordering attribute, not a
+ * storage-layout one, so a raw memcpy lands identically and every subsequent
+ * Java getstatic/getfield observes it.
  */
-public final class FieldPrimitivesSet
+public final class FieldPrimitivesSet extends FieldPrimitivesSetBase
 {
     // -- go / done handshake + scenario selector driven by run_probe --------
     public static volatile boolean go;
@@ -54,7 +70,9 @@ public final class FieldPrimitivesSet
     // =====================================================================
     //  SENTINEL constants -- the value each field holds before any native
     //  write.  Distinct from every value the native side will write, so a
-    //  refused / no-op set() leaves a detectable fingerprint.
+    //  refused / no-op set() leaves a detectable fingerprint.  Declared HERE,
+    //  ahead of the volatile/inherited fields below, so their initializers can
+    //  reference them by simple name without an illegal forward reference.
     // =====================================================================
     public static final boolean SENT_Z   = false;          // native always writes from a real bool
     public static final byte    SENT_B   = (byte) 0x5A;     // 90
@@ -64,6 +82,79 @@ public final class FieldPrimitivesSet
     public static final long    SENT_J   = 0x5A5A5A5A5A5A5A5AL;
     public static final int     SENT_F_BITS = 0x5A5A5A5A;   // a quiet, finite float pattern
     public static final long    SENT_D_BITS = 0x5A5A5A5A5A5A5A5AL;
+
+    // =====================================================================
+    //  VOLATILE settable fields, one per primitive, pre-set to the sentinel.
+    //  ACC_VOLATILE only constrains JMM access ordering, never the in-heap slot
+    //  layout, so field_proxy::set()'s raw memcpy must land identically to a
+    //  plain field and every later getstatic/getfield must observe it.
+    // =====================================================================
+    public static volatile boolean vsZ = SENT_Z;
+    public static volatile byte    vsB = SENT_B;
+    public static volatile short   vsS = SENT_S;
+    public static volatile char    vsC = SENT_C;
+    public static volatile int     vsI = SENT_I;
+    public static volatile long    vsJ = SENT_J;
+    public static volatile float   vsF = Float.intBitsToFloat(SENT_F_BITS);
+    public static volatile double  vsD = Double.longBitsToDouble(SENT_D_BITS);
+
+    public volatile boolean viZ = SENT_Z;
+    public volatile byte    viB = SENT_B;
+    public volatile short   viS = SENT_S;
+    public volatile char    viC = SENT_C;
+    public volatile int     viI = SENT_I;
+    public volatile long    viJ = SENT_J;
+    public volatile float   viF = Float.intBitsToFloat(SENT_F_BITS);
+    public volatile double  viD = Double.longBitsToDouble(SENT_D_BITS);
+
+    // Witnesses for the VOLATILE-field write (mode 1 snapshot), F/D as raw bits.
+    public static int  seenVsCBits;   // vsC as plain int (unsigned)
+    public static long seenVsJ;
+    public static int  seenVsFBits;
+    public static long seenVsDBits;
+    public static int  seenViCBits;
+    public static long seenViJ;
+    public static int  seenViFBits;
+    public static long seenViDBits;
+
+    // VOLATILE getters (Java's own bytecode reads each volatile field).
+    public static boolean getVsZ()     { return vsZ; }
+    public static byte    getVsB()     { return vsB; }
+    public static short   getVsS()     { return vsS; }
+    public static int     getVsC()     { return vsC; }           // char -> unsigned int
+    public static int     getVsI()     { return vsI; }
+    public static long    getVsJ()     { return vsJ; }
+    public static int     getVsFBits() { return Float.floatToRawIntBits(vsF); }
+    public static long    getVsDBits() { return Double.doubleToRawLongBits(vsD); }
+    public static boolean getViZ()     { return instance.viZ; }
+    public static byte    getViB()     { return instance.viB; }
+    public static short   getViS()     { return instance.viS; }
+    public static int     getViC()     { return instance.viC; }  // char -> unsigned int
+    public static int     getViI()     { return instance.viI; }
+    public static long    getViJ()     { return instance.viJ; }
+    public static int     getViFBits() { return Float.floatToRawIntBits(instance.viF); }
+    public static long    getViDBits() { return Double.doubleToRawLongBits(instance.viD); }
+
+    // INHERITED getters: Java bytecode reads the base-declared field through the
+    // subclass instance (genuine getfield / getstatic, super-chain offset).
+    public static int  getBsCBits() { return bsC; }              // inherited static char
+    public static long getBsJ()     { return bsJ; }              // inherited static long
+    public static int  getBsFBits() { return Float.floatToRawIntBits(bsF); }
+    public static long getBsDBits() { return Double.doubleToRawLongBits(bsD); }
+    public static boolean getBiZ()  { return instance.biZ; }     // inherited instance bool
+    public static byte    getBiB()  { return instance.biB; }
+    public static short   getBiS()  { return instance.biS; }
+    public static int     getBiC()  { return instance.biC; }     // char -> unsigned int
+    public static int     getBiI()  { return instance.biI; }
+    public static long    getBiJ()  { return instance.biJ; }
+    public static int     getBiFBits() { return Float.floatToRawIntBits(instance.biF); }
+    public static long    getBiDBits() { return Double.doubleToRawLongBits(instance.biD); }
+
+    // =====================================================================
+    //  SENTINEL constants (SENT_Z .. SENT_D_BITS) are declared ABOVE, ahead of
+    //  the volatile/inherited fields, so those initializers can reference them
+    //  without an illegal forward reference.
+    // =====================================================================
 
     // =====================================================================
     //  STATIC settable fields, one per primitive, pre-set to the sentinel.
@@ -355,6 +446,20 @@ public final class FieldPrimitivesSet
         // sequential-write witnesses
         seenSeqA = instance.seqA;
         seenSeqB = instance.seqB;
+
+        // volatile witnesses (genuine getstatic / getfield on volatile slots)
+        seenVsCBits = vsC;
+        seenVsJ     = vsJ;
+        seenVsFBits = Float.floatToRawIntBits(vsF);
+        seenVsDBits = Double.doubleToRawLongBits(vsD);
+        seenViCBits = instance.viC;
+        seenViJ     = instance.viJ;
+        seenViFBits = Float.floatToRawIntBits(instance.viF);
+        seenViDBits = Double.doubleToRawLongBits(instance.viD);
+
+        // inherited witnesses (super-chain getstatic / getfield through the
+        // held subclass instance, which IS-A FieldPrimitivesSetBase).
+        instance.snapshotInherited(instance);
     }
 
     /**
@@ -421,5 +526,95 @@ public final class FieldPrimitivesSet
                 FieldPrimitivesSet.done = true;
             }
         });
+    }
+}
+
+/**
+ * Superclass of FieldPrimitivesSet.  Declares one INHERITED settable field per
+ * primitive width, both static (bs*) and instance (bi*).  The native side writes
+ * these through the SUBCLASS wrapper, so field_proxy::set() must resolve the
+ * field offset by walking the superclass chain.  Each field carries its OWN
+ * sentinel (distinct base pattern 0xB5) so a refused / no-op write into an
+ * inherited slot is detectable, and a snapshot copies each into a witness so the
+ * JVM's own getstatic/getfield confirms the inherited write landed.
+ *
+ * Package-private (not public) so it may share FieldPrimitivesSet.java; Java 8
+ * source only.
+ */
+class FieldPrimitivesSetBase
+{
+    // Base sentinels -- distinct from the subclass SENT_* patterns so an
+    // inherited write is unambiguous (0xB5 vs 0x5A nibble swaps).
+    static final byte  BSENT_B = (byte) 0xB5;
+    static final short BSENT_S = (short) 0xB5B5;
+    static final char  BSENT_C = 0xB5B5;
+    static final int   BSENT_I = 0xB5B5B5B5;
+    static final long  BSENT_J = 0xB5B5B5B5B5B5B5B5L;
+    static final int   BSENT_F_BITS = 0x3FB504F3; // ~sqrt(2): a quiet finite float
+    static final long  BSENT_D_BITS = 0x3FF6A09E667F3BCDL;
+
+    // Inherited STATIC settable fields.
+    public static boolean bsZ = false;
+    public static byte    bsB = BSENT_B;
+    public static short   bsS = BSENT_S;
+    public static char    bsC = BSENT_C;
+    public static int     bsI = BSENT_I;
+    public static long    bsJ = BSENT_J;
+    public static float   bsF = Float.intBitsToFloat(BSENT_F_BITS);
+    public static double  bsD = Double.longBitsToDouble(BSENT_D_BITS);
+
+    // Inherited INSTANCE settable fields.
+    public boolean biZ = false;
+    public byte    biB = BSENT_B;
+    public short   biS = BSENT_S;
+    public char    biC = BSENT_C;
+    public int     biI = BSENT_I;
+    public long    biJ = BSENT_J;
+    public float   biF = Float.intBitsToFloat(BSENT_F_BITS);
+    public double  biD = Double.longBitsToDouble(BSENT_D_BITS);
+
+    // Witnesses for the INHERITED-field write (mode 1 snapshot); F/D raw bits.
+    public static boolean seenBsZ;
+    public static byte    seenBsB;
+    public static short   seenBsS;
+    public static int     seenBsCBits;
+    public static int     seenBsI;
+    public static long    seenBsJ;
+    public static int     seenBsFBits;
+    public static long    seenBsDBits;
+    public static boolean seenBiZ;
+    public static byte    seenBiB;
+    public static short   seenBiS;
+    public static int     seenBiCBits;
+    public static int     seenBiI;
+    public static long    seenBiJ;
+    public static int     seenBiFBits;
+    public static long    seenBiDBits;
+
+    /**
+     * Snapshots every inherited field into its witness via genuine getstatic /
+     * getfield bytecode (invoked from the subclass probe through the held
+     * instance, so the getfield reads the inherited slot of a real subclass
+     * object).  F/D captured as raw bits.
+     */
+    void snapshotInherited(FieldPrimitivesSetBase self)
+    {
+        seenBsZ     = bsZ;
+        seenBsB     = bsB;
+        seenBsS     = bsS;
+        seenBsCBits = bsC;
+        seenBsI     = bsI;
+        seenBsJ     = bsJ;
+        seenBsFBits = Float.floatToRawIntBits(bsF);
+        seenBsDBits = Double.doubleToRawLongBits(bsD);
+
+        seenBiZ     = self.biZ;
+        seenBiB     = self.biB;
+        seenBiS     = self.biS;
+        seenBiCBits = self.biC;
+        seenBiI     = self.biI;
+        seenBiJ     = self.biJ;
+        seenBiFBits = Float.floatToRawIntBits(self.biF);
+        seenBiDBits = Double.doubleToRawLongBits(self.biD);
     }
 }

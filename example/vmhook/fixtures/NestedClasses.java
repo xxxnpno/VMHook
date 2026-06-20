@@ -88,6 +88,9 @@ public final class NestedClasses
      *       through REAL bytecode and publish their results.
      *   3 = drive the static-in-inner / iface-member / host-enum / anon-of-iface
      *       methods through REAL bytecode and publish their results.
+     *   4 = drive the batch-19 shapes (static-in-iface-member, anno-member),
+     *       the enum values()/valueOf round-trips, and the two-hop inner-in-inner
+     *       composite through REAL bytecode and publish their results.
      */
     public static volatile int mode;
 
@@ -108,6 +111,12 @@ public final class NestedClasses
     public static final int ENUM_STATIC_INIT     = 13;  // NestedEnum$EnumStatic.enumStaticValue
     public static final int IFACE_MEMBER_INIT    = 70;  // NestedIface$IfaceMember.ifaceMemberValue
     public static final int HOST_COLOR_CODE      = 11;  // Host$HostColor.GREEN.code() == ordinal()+10
+
+    // ── Batch-19 deterministic constants (further shapes / two-hop links) ─────
+    public static final int ANNO_MEMBER_INIT   = 250;   // NestedAnno$AnnoMember.annoMemberValue
+    public static final int IFACE_INNER_INIT   = 88;    // NestedIface$IfaceMember$IfaceInnerInner.deepIfaceValue
+    public static final int NESTED_ENUM_COUNT  = 3;     // NestedEnum.values().length (ALPHA/BETA/GAMMA)
+    public static final int HOST_COLOR_COUNT   = 3;     // Host.HostColor.values().length (RED/GREEN/BLUE)
 
     // ── The outer holder.  STATIC nested so it needs no NestedClasses instance,
     //    yet still produces the 3-level internal name NestedClasses$Host and is
@@ -257,6 +266,23 @@ public final class NestedClasses
             {
                 return this.ifaceMemberValue + IFACE_CONST;
             }
+
+            // ---- a STATIC class nested inside an interface-member class --------
+            //   Internal name: NestedClasses$NestedIface$IfaceMember$IfaceInnerInner
+            //   (a 4-segment $-name whose enclosing CHAIN runs IFACE -> member ->
+            //   static class).  Explicitly static, so NO synthetic outer reference
+            //   at any level.  Proves the multi-segment $-name path stays correct
+            //   when an interface sits anywhere in the enclosing chain, not just
+            //   at the leaf.
+            public static class IfaceInnerInner
+            {
+                public int deepIfaceValue = IFACE_INNER_INIT;
+
+                public int deepIfacePlusConst()
+                {
+                    return this.deepIfaceValue + IFACE_CONST;
+                }
+            }
         }
     }
 
@@ -294,6 +320,24 @@ public final class NestedClasses
     {
         String label() default "n";
         int weight() default 0;
+
+        // ---- a member CLASS of an ANNOTATION (an @interface is an interface, so
+        //   its member types are implicitly PUBLIC STATIC -> no synthetic outer
+        //   reference).  Internal name: NestedClasses$NestedAnno$AnnoMember.  Proves
+        //   the `$`-name resolution + field/method access work when the immediate
+        //   enclosing type is an ANNOTATION (the third interface-like encloser, after
+        //   plain interface and enum). ─────────────────────────────────────────
+        class AnnoMember
+        {
+            public int annoMemberValue = ANNO_MEMBER_INIT;
+
+            public int annoMemberPlusWeight()
+            {
+                // weight() default is 0; this just exercises a declared no-arg int
+                // method on a class nested under an annotation.
+                return this.annoMemberValue + 0;
+            }
+        }
     }
 
     // ── Generic (erased) nested class: the type parameter vanishes. ──────────
@@ -412,6 +456,13 @@ public final class NestedClasses
     /** A member class of the nested INTERFACE (implicitly static; no this$0). */
     public static final NestedIface.IfaceMember ifaceMemberInst = new NestedIface.IfaceMember();
 
+    /** A STATIC class nested inside the iface-member (4-segment $-name; no this$N). */
+    public static final NestedIface.IfaceMember.IfaceInnerInner ifaceInnerInnerInst =
+        new NestedIface.IfaceMember.IfaceInnerInner();
+
+    /** A member class of the nested ANNOTATION (implicitly static; no this$0). */
+    public static final NestedAnno.AnnoMember annoMemberInst = new NestedAnno.AnnoMember();
+
     /** A live anonymous-class instance (klass resolved from the oop, not by name). */
     public static final Object anonymousInst = SELF.makeAnonymous();
 
@@ -443,6 +494,8 @@ public final class NestedClasses
     public static volatile int localIdentity;
     public static volatile int enumStaticIdentity;
     public static volatile int ifaceMemberIdentity;
+    public static volatile int ifaceInnerInnerIdentity;
+    public static volatile int annoMemberIdentity;
 
     // ── Probe-published composite results (the JDK-independent proofs) ───────
     /** Set by mode 1 to innerInst.outerPlusInner(); native asserts == 106. */
@@ -472,6 +525,24 @@ public final class NestedClasses
     /** Set by mode 3 to the anon-iface instance's ifaceOp(8); native asserts == 4250. */
     public static volatile int anonIfaceOpValue;
 
+    // ── Mode 4: batch-19 deeper-shape composites + values()/valueOf round-trips ─
+    /** Set by mode 4 to ifaceInnerInnerInst.deepIfacePlusConst(); native asserts == 105 (88+17). */
+    public static volatile int ifaceInnerInnerValue;
+    /** Set by mode 4 to annoMemberInst.annoMemberPlusWeight(); native asserts == 250. */
+    public static volatile int annoMemberValue;
+    /** Set by mode 4 to NestedEnum.values().length; native asserts == 3. */
+    public static volatile int nestedEnumValuesLen;
+    /** Set by mode 4 to Host.HostColor.values().length; native asserts == 3. */
+    public static volatile int hostColorValuesLen;
+    /** Set by mode 4 to NestedEnum.valueOf("GAMMA").rank(); native asserts == 3 (valueOf round-trip). */
+    public static volatile int nestedEnumValueOfRank;
+    /**
+     * Set by mode 4 to a TWO-HOP read: innerInnerInst.sumThroughBothOuters() walks
+     * this$1 -> Inner, then Inner's this$0 -> Host; native asserts == 117 again here
+     * to corroborate the two-hop synthetic-link chain through real bytecode.
+     */
+    public static volatile int twoHopInnerInnerValue;
+
     static
     {
         // Publish identities once at load (also valid before any probe runs).
@@ -488,6 +559,8 @@ public final class NestedClasses
         localIdentity        = System.identityHashCode(localInst);
         enumStaticIdentity   = System.identityHashCode(enumStaticInst);
         ifaceMemberIdentity  = System.identityHashCode(ifaceMemberInst);
+        ifaceInnerInnerIdentity = System.identityHashCode(ifaceInnerInnerInst);
+        annoMemberIdentity   = System.identityHashCode(annoMemberInst);
 
         Harness.register(new Harness.Probe()
         {
@@ -547,6 +620,23 @@ public final class NestedClasses
                     NestedClasses.hostColorCodeValue = Host.HostColor.GREEN.code();
                     NestedClasses.anonIfaceOpValue =
                         ((NestedIface) NestedClasses.anonymousIfaceInst).ifaceOp(8);
+                }
+                else if (NestedClasses.mode == 4)
+                {
+                    // Batch-19 deeper-shape composites + enum reflection round-trips,
+                    // all through REAL bytecode.
+                    NestedClasses.ifaceInnerInnerValue =
+                        NestedClasses.ifaceInnerInnerInst.deepIfacePlusConst();
+                    NestedClasses.annoMemberValue =
+                        NestedClasses.annoMemberInst.annoMemberPlusWeight();
+                    NestedClasses.nestedEnumValuesLen = NestedEnum.values().length;
+                    NestedClasses.hostColorValuesLen  = Host.HostColor.values().length;
+                    // valueOf round-trip: parse "GAMMA" back to the constant, rank()==3.
+                    NestedClasses.nestedEnumValueOfRank =
+                        NestedEnum.valueOf("GAMMA").rank();
+                    // Two-hop synthetic-link walk (this$1 -> Inner -> this$0 -> Host).
+                    NestedClasses.twoHopInnerInnerValue =
+                        NestedClasses.innerInnerInst.sumThroughBothOuters();
                 }
                 NestedClasses.done = true;
             }

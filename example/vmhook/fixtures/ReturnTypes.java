@@ -204,6 +204,25 @@ public final class ReturnTypes
     public long returnsLongNegOne()   { return -1L; }                 // 0xFFFFFFFFFFFFFFFF
 
     // ========================================================================
+    //  batch-19 additional primitive returners -- fill specific decode gaps the
+    //  headline/min/max/-1 set above does not yet cover.  Every value here is a
+    //  distinct sentinel so a wrong width/sign/truncation would mismatch.
+    // ========================================================================
+    // char (C): smallest NON-ZERO char (1).  Pins the low end of the unsigned
+    // 16-bit decode -- distinct from returnsCharZero (0) and returnsCharMax
+    // (0xFFFF): a char 1 read into an int must be 1, never -1 or 0.
+    public char returnsCharOne()  { return (char) 1; }
+    // int (I): high-bit-set (negative) NON-round pattern 0x89ABCDEF.  Catches an
+    // unsigned/signed mix-up at i32 that 0x12345678 (positive) cannot, and whose
+    // low/high bytes differ so a byte/short-truncation would be visible too.
+    public int  returnsIntHighBit() { return 0x89ABCDEF; }            // -1985229329 signed
+    // long (J): a pattern whose low word is 0x80000000 (negative-as-int) but whose
+    // FULL 64-bit value is POSITIVE (0x000000008000000 0).  A "read low word and
+    // sign-extend" bug would read this as 0xFFFFFFFF80000000 (negative); the correct
+    // 64-bit read is 0x0000000080000000 == 2147483648.
+    public long returnsLongLowSignBit() { return 0x0000000080000000L; } // 2147483648, NOT negative
+
+    // ========================================================================
     //  float (F)
     // ========================================================================
     public float returnsFloat()    { return 3.1415926f; }                   // bits 0x40490FDA (mirrors Example)
@@ -390,6 +409,12 @@ public final class ReturnTypes
     // A static String whose runtime length is well under the 4096 cap but longer than the
     // headline, decoded exactly through the static path (parity with the instance long String).
     public static String  staticReturnsStringEmpty()  { return ""; }   // static empty-String boundary
+    // batch-19: static char 0xBEEF (48879) read into a wider int on the static path must
+    // ZERO-extend (unsigned), not sign-extend -- the static-path counterpart of the
+    // instance returnsCharMax zero-extension witness.  Reuses staticReturnsChar's value.
+    // static long with low-word sign bit set but FULL value positive: the static-path
+    // counterpart of returnsLongLowSignBit, proving the static read takes all 64 bits.
+    public static long    staticReturnsLongLowSignBit() { return 0x0000000080000000L; } // 2147483648
 
     static
     {

@@ -229,6 +229,13 @@ namespace
         // A different method returning the SAME static Child (cross-method identity).
         auto same_static_child() -> std::unique_ptr<child_object> { return get_method("sameStaticChild")->call(); }
 
+        // Subtype passed as a base-typed (Animal) arg, returned unchanged: pass a
+        // Dog wrapper IN as an Animal, the decoded return is the same runtime Dog.
+        auto echo_animal(const std::unique_ptr<dog_object>& a) -> std::unique_ptr<dog_object>
+        {
+            return get_method("echoAnimal")->call(a);
+        }
+
         // ── VARIED-ARG-SIGNATURE object returns (batch-14 deepening) ───────
         // Each folds its argument(s) into the returned Child's tag, so the
         // native decode catches a mis-packed / truncated / dropped argument.
@@ -441,9 +448,41 @@ namespace
     std::atomic<bool> g_present_nonnull_when_key{ false };
     std::atomic<std::int32_t> g_present_tag{ -1 };
 
+    // ── batch-19 deepening: gaps the prior batches left ────────────────────
+    // NULL object passed as arg -> NULL object returned (arg-driven null on the
+    // OBJECT round-trip path, distinct from the String-arg null above).
+    std::atomic<bool> g_echo_null_child_is_null{ false };
+    std::atomic<bool> g_echo_null_object_is_null{ false };
+
+    // SUBTYPE passed where a BASE-typed (Animal) arg is expected, returned: the
+    // decoded return is the same runtime Dog (identity echo through a widening
+    // reference arg).
+    std::atomic<bool>           g_echo_animal_nonnull{ false };
+    std::atomic<bool>           g_echo_animal_same_oop{ false };
+    std::string                 g_echo_animal_klass{};
+
+    // FRESH-each-call on the STATIC dispatch path (staticFreshChild news a Child
+    // every call): two static calls -> two DISTINCT non-null instances.
+    std::atomic<bool>           g_static_fresh_a_nonnull{ false };
+    std::atomic<bool>           g_static_fresh_b_nonnull{ false };
+    std::atomic<std::int32_t>   g_static_fresh_tag{ -1 };
+    std::atomic<std::uintptr_t> g_static_fresh_instance_a{ 0 };
+    std::atomic<std::uintptr_t> g_static_fresh_instance_b{ 0 };
+
+    // DEEP CHAIN through self(): self() -> getChild() through the self-returned
+    // (this) wrapper -> must decode to the SAME Child OOP as a direct getChild().
+    std::atomic<bool>           g_self_chain_child_nonnull{ false };
+    std::atomic<std::uintptr_t> g_self_chain_child_instance{ 0 };
+
+    // CHAIN through a STATIC-returned wrapper: staticMakeChild() -> self() on it
+    // -> the same STATIC_CHILD OOP (an instance call chained off a static return).
+    std::atomic<bool>           g_static_chain_self_nonnull{ false };
+    std::atomic<std::uintptr_t> g_static_chain_self_instance{ 0 };
+
     constexpr std::int32_t k_child_tag    = 0x5EED;
     constexpr std::int32_t k_maybe_tag    = 0x1234;
     constexpr std::int32_t k_static_tag   = 0x7AC0;
+    constexpr std::int32_t k_static_fresh_tag = 0x7AC1;
     constexpr std::int32_t k_sibling_tag  = 0x51B;
     constexpr std::int32_t k_dog_breed    = 0x0D06;
     constexpr std::int32_t k_boxed_value  = 0x07E5;
@@ -1086,6 +1125,116 @@ namespace
             g_present_nonnull_when_key.store(p != nullptr, std::memory_order_relaxed);
             if (p) { g_present_tag.store(p->get_tag(), std::memory_order_relaxed); }
         }
+
+        // ── NULL OBJECT ARG -> NULL OBJECT RETURN (object-path arg-driven null) ─
+        // Pass an EMPTY unique_ptr (a null reference) as the object arg; the
+        // arg-packing nulls the jvalue and the echo returns null, which must
+        // decode back to a null unique_ptr — the OBJECT-arg companion to the
+        // String-arg null path, and a graceful-null contract on a non-null-capable
+        // method driven by its argument.
+        {
+            const std::unique_ptr<child_object> null_child_arg{};
+            std::unique_ptr<child_object> echoed_null{ self->echo_child(null_child_arg) };
+            g_echo_null_child_is_null.store(echoed_null == nullptr, std::memory_order_relaxed);
+
+            const std::unique_ptr<child_object> null_object_arg{};
+            std::unique_ptr<child_object> echoed_null_obj{ self->echo_object(null_object_arg) };
+            g_echo_null_object_is_null.store(echoed_null_obj == nullptr, std::memory_order_relaxed);
+        }
+
+        // ── SUBTYPE passed as a BASE-typed (Animal) arg, returned unchanged ─────
+        // Decode a Dog via makeAnimal(), pass it back IN through echoAnimal(Animal)
+        // — a WIDENING reference arg (Dog -> Animal) — and the returned OOP must
+        // equal the arg OOP, with the decode still seeing the concrete runtime Dog.
+        {
+            std::unique_ptr<dog_object> dog{ self->make_animal() };
+            if (dog)
+            {
+                const std::uintptr_t dog_oop{
+                    reinterpret_cast<std::uintptr_t>(dog->get_instance()) };
+                std::unique_ptr<dog_object> back{ self->echo_animal(dog) };
+                g_echo_animal_nonnull.store(back != nullptr, std::memory_order_relaxed);
+                if (back)
+                {
+                    void* const inst{ back->get_instance() };
+                    g_echo_animal_same_oop.store(
+                        reinterpret_cast<std::uintptr_t>(inst) == dog_oop,
+                        std::memory_order_relaxed);
+                    g_echo_animal_klass = runtime_klass_name(inst);
+                }
+            }
+        }
+
+        // ── FRESH-each-call on the STATIC dispatch path ────────────────────────
+        // staticFreshChild() new's a Child every call, so two STATIC calls decode
+        // to two DISTINCT non-null instances — the static-path companion to
+        // makeChild()'s instance-path distinct-each-call probe.
+        {
+            auto sf{ method_object::static_method("staticFreshChild") };
+            if (sf)
+            {
+                std::unique_ptr<child_object> a = sf->call();
+                std::unique_ptr<child_object> b = sf->call();
+                g_static_fresh_a_nonnull.store(a != nullptr, std::memory_order_relaxed);
+                g_static_fresh_b_nonnull.store(b != nullptr, std::memory_order_relaxed);
+                if (a)
+                {
+                    g_static_fresh_tag.store(a->get_tag(), std::memory_order_relaxed);
+                    g_static_fresh_instance_a.store(
+                        reinterpret_cast<std::uintptr_t>(a->get_instance()),
+                        std::memory_order_relaxed);
+                }
+                if (b)
+                {
+                    g_static_fresh_instance_b.store(
+                        reinterpret_cast<std::uintptr_t>(b->get_instance()),
+                        std::memory_order_relaxed);
+                }
+            }
+        }
+
+        // ── DEEP CHAIN through self(): self() -> getChild() on the self wrapper ─
+        // self() returns `this`, so getChild() called THROUGH the self-returned
+        // wrapper must decode to the SAME Child OOP as a direct getChild() — a
+        // chained object-returning call whose receiver is itself a method-returned
+        // `this`.
+        {
+            std::unique_ptr<method_object> sp{ self->self_proxy() };
+            if (sp)
+            {
+                std::unique_ptr<child_object> chained{ sp->get_child() };
+                g_self_chain_child_nonnull.store(chained != nullptr, std::memory_order_relaxed);
+                if (chained)
+                {
+                    g_self_chain_child_instance.store(
+                        reinterpret_cast<std::uintptr_t>(chained->get_instance()),
+                        std::memory_order_relaxed);
+                }
+            }
+        }
+
+        // ── CHAIN through a STATIC-returned wrapper: staticMakeChild() -> self() ─
+        // The static call returns the STATIC_CHILD singleton; calling self() (an
+        // INSTANCE method) THROUGH that static-returned wrapper must decode to the
+        // SAME STATIC_CHILD OOP — an instance call chained off a static return.
+        {
+            auto sm{ method_object::static_method("staticMakeChild") };
+            if (sm)
+            {
+                std::unique_ptr<child_object> sc = sm->call();
+                if (sc)
+                {
+                    std::unique_ptr<child_object> sc_self{ sc->self_proxy() };
+                    g_static_chain_self_nonnull.store(sc_self != nullptr, std::memory_order_relaxed);
+                    if (sc_self)
+                    {
+                        g_static_chain_self_instance.store(
+                            reinterpret_cast<std::uintptr_t>(sc_self->get_instance()),
+                            std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
     }
 
     // The whole body, factored out so the module wrapper can run it under a
@@ -1527,6 +1676,70 @@ namespace
         ctx.check("mco_arg_present_string_tag_correct",
                   g_present_tag.load(std::memory_order_relaxed) == k_child_tag);
 
+        // ════════════════ NULL OBJECT ARG -> NULL OBJECT RETURN ════════════
+        // An empty unique_ptr passed as the object arg packs a null reference;
+        // the echo returns null, which must decode back to a null unique_ptr.
+        // The graceful-null contract on the OBJECT round-trip path (the String-
+        // arg null above is its reference-arg sibling).
+        ctx.check("mco_echo_null_child_arg_returns_null",
+                  g_echo_null_child_is_null.load(std::memory_order_relaxed));
+        ctx.check("mco_echo_null_object_arg_returns_null",
+                  g_echo_null_object_is_null.load(std::memory_order_relaxed));
+
+        // ════════════════ SUBTYPE-as-base-ARG identity echo (Dog as Animal) ═
+        // A Dog wrapper passed IN through echoAnimal(Animal) — a widening
+        // reference arg — round-trips: the returned OOP equals the arg OOP and
+        // the decode sees the concrete runtime Dog (not the declared Animal).
+        ctx.check("mco_echo_animal_arg_non_null_wrapper",
+                  g_echo_animal_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_echo_animal_arg_returns_same_oop",
+                  g_echo_animal_same_oop.load(std::memory_order_relaxed));
+        ctx.check("mco_echo_animal_arg_runtime_klass_is_Dog",
+                  ends_with(g_echo_animal_klass, "MethodObject$Dog"));
+        // The echoed Dog is the SAME singleton makeAnimal() returns (its OOP must
+        // equal the makeAnimal() instance captured earlier).
+        ctx.check("mco_echo_animal_arg_same_as_make_animal",
+                  g_echo_animal_same_oop.load(std::memory_order_relaxed)
+                  && g_animal_instance.load(std::memory_order_relaxed) != 0);
+
+        // ════════════════ FRESH-each-call on the STATIC dispatch path ═══════
+        // staticFreshChild() new's a Child every call: two static calls decode to
+        // two DISTINCT non-null instances (the static-path companion to
+        // makeChild's instance-path distinct-each-call check).
+        ctx.check("mco_static_fresh_first_call_non_null",
+                  g_static_fresh_a_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_static_fresh_second_call_non_null",
+                  g_static_fresh_b_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_static_fresh_tag_correct",
+                  g_static_fresh_tag.load(std::memory_order_relaxed) == k_static_fresh_tag);
+        ctx.check("mco_static_fresh_distinct_instances_each_call",
+                  g_static_fresh_instance_a.load(std::memory_order_relaxed) != 0
+                  && g_static_fresh_instance_b.load(std::memory_order_relaxed) != 0
+                  && g_static_fresh_instance_a.load(std::memory_order_relaxed)
+                         != g_static_fresh_instance_b.load(std::memory_order_relaxed));
+
+        // ════════════════ DEEP CHAIN through self() (this -> getChild) ══════
+        // self() returns `this`; getChild() called THROUGH the self-returned
+        // wrapper decodes to the SAME Child OOP as a direct getChild() — a chained
+        // object-returning call whose receiver is itself a method-returned `this`.
+        ctx.check("mco_self_chain_getchild_non_null_wrapper",
+                  g_self_chain_child_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_self_chain_getchild_equals_direct_getchild",
+                  g_self_chain_child_instance.load(std::memory_order_relaxed) != 0
+                  && g_self_chain_child_instance.load(std::memory_order_relaxed)
+                         == g_getchild_instance.load(std::memory_order_relaxed));
+
+        // ════════════════ CHAIN through a STATIC-returned wrapper ═══════════
+        // staticMakeChild() returns STATIC_CHILD; self() (an INSTANCE method)
+        // called THROUGH that static-returned wrapper decodes to the SAME
+        // STATIC_CHILD OOP — an instance call chained off a static return.
+        ctx.check("mco_static_chain_self_non_null_wrapper",
+                  g_static_chain_self_nonnull.load(std::memory_order_relaxed));
+        ctx.check("mco_static_chain_self_equals_static_instance",
+                  g_static_chain_self_instance.load(std::memory_order_relaxed) != 0
+                  && g_static_chain_self_instance.load(std::memory_order_relaxed)
+                         == g_static_instance.load(std::memory_order_relaxed));
+
         // ── breadcrumbs (never affect pass/fail) ───────────────────────────
         ctx.record("[INFO] animal runtime klass = " + g_animal_klass
                    + " (declared Animal, decoded Dog); speak() via wrapper = '" + g_animal_speak
@@ -1562,6 +1775,21 @@ namespace
                    + " (declared java.lang.Object, decoded Child)");
         ctx.record("[INFO] boxed variety runtime klasses: Long=" + g_boxed_long_klass
                    + " Boolean=" + g_boxed_bool_klass + " Double=" + g_boxed_double_klass);
+        ctx.record("[INFO] null-object-arg echo: child-arg-null="
+                   + std::string{ g_echo_null_child_is_null.load(std::memory_order_relaxed) ? "yes" : "no" }
+                   + " object-arg-null="
+                   + std::string{ g_echo_null_object_is_null.load(std::memory_order_relaxed) ? "yes" : "no" });
+        ctx.record("[INFO] echoAnimal(Dog as Animal) runtime klass = " + g_echo_animal_klass
+                   + " same-oop=" + std::string{ g_echo_animal_same_oop.load(std::memory_order_relaxed) ? "yes" : "no" });
+        ctx.record("[INFO] staticFreshChild distinct OOPs: a=0x"
+                   + std::to_string(g_static_fresh_instance_a.load(std::memory_order_relaxed))
+                   + " b=0x" + std::to_string(g_static_fresh_instance_b.load(std::memory_order_relaxed)));
+        ctx.record("[INFO] self()->getChild() chained=0x"
+                   + std::to_string(g_self_chain_child_instance.load(std::memory_order_relaxed))
+                   + " direct getChild=0x"
+                   + std::to_string(g_getchild_instance.load(std::memory_order_relaxed))
+                   + "; staticMakeChild()->self()=0x"
+                   + std::to_string(g_static_chain_self_instance.load(std::memory_order_relaxed)));
     }
 }
 

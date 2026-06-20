@@ -63,6 +63,16 @@ public final class PolyInherited
     public static volatile boolean sawShadowBase;        // base-typed read sees BASE shadow slots
     public static volatile boolean sawPolyConcrete;      // L1-typed field holds an L4 at runtime
 
+    // ---- Witnesses for the polymorphic-METHOD-dispatch + interface-default
+    //      expansion.  Each latched by the probe through real invokevirtual /
+    //      invokeinterface bytecode so the native module can cross-check that the
+    //      JVM resolves the same override / default method vmhook found by walking
+    //      the super (and, for defaults, the implemented-interface) chain. --------
+    public static volatile boolean sawOverrideDispatch;  // L4.chainValue() override wins (== L4_CHAIN)
+    public static volatile boolean sawBaseChainValue;    // a plain L1 still yields L1.chainValue (== L1_CHAIN)
+    public static volatile boolean sawIfaceDefault;      // IfaceImpl.greet() default method (== GREET_VALUE)
+    public static volatile boolean sawIfaceConst;        // interface constant field readable from Java (== KONST)
+
     // ---- Published identity hash codes for the inherited reference targets,
     //      latched by the probe through System.identityHashCode so the native
     //      module can cross-check that the OOP it decoded by raw offset is the
@@ -100,6 +110,20 @@ public final class PolyInherited
 
     // ---- Canonical value for the polymorphic field's concrete L4 ------------
     public static final int  POLY_L4_INT      = 0x0F6F0006;   // l4Poly's l4Int
+
+    // ---- Canonical values for the polymorphic-METHOD-dispatch chain ----------
+    //      chainValue() is declared on L1 and OVERRIDDEN on L4.  Reading it
+    //      through the deepest-class wrapper must resolve the L4 override (the
+    //      get_method walk starts at the start klass and takes the FIRST name
+    //      match, so the most-derived declaration wins), while a plain-L1 wrapper
+    //      resolves L1's base body.  Far apart so a wrong pick can never alias.
+    public static final int  L1_CHAIN          = 0x11AA0001;   // L1.chainValue() body
+    public static final int  L4_CHAIN          = 0x44DD0004;   // L4.chainValue() override body
+
+    // ---- Canonical values for the interface default method + interface const --
+    public static final int  GREET_VALUE       = 0x6E710007;   // Greeter.greet() default body
+    public static final int  KONST             = 0x6B057ADD;   // Konst.KONST interface constant
+    public static final int  IFACE_DESCRIBE    = 0x4E730008;   // IfaceImpl.describe() override
 
     /**
      * Super class — declares the inherited protected instance field and the
@@ -146,6 +170,13 @@ public final class PolyInherited
         String l1Str  = L1_STR_VALUE;           // inherited String ref
         int[]  l1Arr  = new int[] { L1_ARR_ELEM0, L1_ARR_ELEM1 };  // inherited array ref
         Object l1Null = null;                   // inherited null ref (must decode to null)
+
+        // Base body of the polymorphic-dispatch method (overridden on L4).  A
+        // plain L1 yields L1_CHAIN; an L4 (start-klass-first walk) yields L4_CHAIN.
+        int chainValue()
+        {
+            return L1_CHAIN;
+        }
     }
 
     /** Grandparent — int at depth 2, plus an L1-typed object reference. */
@@ -175,7 +206,20 @@ public final class PolyInherited
         {
             this.l4Self = this;
         }
+
+        // Override of L1.chainValue().  Because get_method walks from the START
+        // klass (L4) downward through supers and takes the FIRST name match, the
+        // L4 declaration here is the one resolved through an L4 wrapper — the
+        // polymorphic-method-dispatch / override-vs-inherited-precedence angle.
+        @Override
+        int chainValue()
+        {
+            return L4_CHAIN;
+        }
     }
+
+    /** A plain L1 instance the native side wraps to read L1's BASE chainValue. */
+    public static final L1 l1Plain = new L1();
 
     /** Builds the plain L1 that l2Ref points at, with a distinguishing l1Int. */
     private static L1 makeL1Ref()
@@ -236,6 +280,65 @@ public final class PolyInherited
     // ---- The live ShadowSub the native side wraps two ways (sub + base) ------
     public static final ShadowSub shadowInstance = new ShadowSub();
 
+    // ======================================================================
+    //  INTERFACE DEFAULT METHOD + INTERFACE CONSTANT.
+    //
+    //  get_method's super-chain walk falls back to the implemented-interface
+    //  chain, so an inherited interface DEFAULT method (greet) declared on an
+    //  interface — not on the class or any superclass — IS reachable through the
+    //  concrete wrapper.  An ABSTRACT interface method (describe) has no body on
+    //  the interface, so the walk resolves the class OVERRIDE; a STATIC interface
+    //  helper is NOT a default and must NOT be returned for an instance lookup.
+    //
+    //  find_field, by contrast, walks ONLY the superclass chain (never
+    //  interfaces), so the interface CONSTANT field KONST is NOT resolvable
+    //  through an instance get_field — a clean asymmetry the native side asserts.
+    // ======================================================================
+
+    /** Interface contributing a DEFAULT method, an ABSTRACT method, and a STATIC
+     *  helper — three method KINDS the interface fallback must disambiguate. */
+    interface Greeter
+    {
+        /** DEFAULT method (has a body on the interface): the walk MUST find it. */
+        default int greet()
+        {
+            return GREET_VALUE;
+        }
+
+        /** ABSTRACT method (no body here): the class override is what resolves. */
+        int describe();
+
+        /** STATIC interface helper: NOT a default, must NOT resolve for instance. */
+        static int helper()
+        {
+            return -1;
+        }
+    }
+
+    /** Interface declaring a compile-time CONSTANT field.  find_field never walks
+     *  interfaces, so KONST is invisible to an instance get_field (negative). */
+    interface Konst
+    {
+        int KONST_FIELD = KONST;
+    }
+
+    /** Implements both interfaces; overrides only the abstract describe().  It
+     *  does NOT redeclare greet(), so greet() resolves via the interface-default
+     *  fallback, and KONST_FIELD is inherited as a Java constant (never a slot). */
+    static class IfaceImpl implements Greeter, Konst
+    {
+        int ownInt = IFACE_DESCRIBE;
+
+        @Override
+        public int describe()
+        {
+            return IFACE_DESCRIBE;
+        }
+    }
+
+    /** The live IfaceImpl the native side wraps to drive the interface angles. */
+    public static final IfaceImpl ifaceInstance = new IfaceImpl();
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -289,6 +392,22 @@ public final class PolyInherited
                 PolyInherited.sawPolyConcrete =
                        (PolyInherited.polyBase instanceof L4)
                     && (((L4) PolyInherited.polyBase).l4Int == POLY_L4_INT);
+
+                // ---- Polymorphic METHOD dispatch: chainValue() through an L4
+                //      (virtual dispatch picks the L4 override) vs through a plain
+                //      L1 (picks L1's base body).  Real invokevirtual bytecode. ---
+                PolyInherited.sawOverrideDispatch = (l4.chainValue() == L4_CHAIN);
+                PolyInherited.sawBaseChainValue   = (PolyInherited.l1Plain.chainValue() == L1_CHAIN);
+
+                // ---- Interface default method + interface constant.  greet() is
+                //      a DEFAULT method (invokeinterface resolves the interface
+                //      body); KONST_FIELD is an interface constant read as a plain
+                //      Java constant.  Both witnessed through genuine bytecode. ----
+                final IfaceImpl impl = PolyInherited.ifaceInstance;
+                final Greeter   greeterView = impl;            // widened to the interface
+                PolyInherited.sawIfaceDefault = (greeterView.greet() == GREET_VALUE)
+                                                && (impl.describe() == IFACE_DESCRIBE);
+                PolyInherited.sawIfaceConst   = (Konst.KONST_FIELD == KONST);
 
                 // ---- Publish identity hashes of the inherited reference targets
                 //      so the native module can prove the OOP it decoded by raw

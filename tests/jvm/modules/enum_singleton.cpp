@@ -262,6 +262,12 @@ namespace
             const auto p{ get_field("symbol") };
             return p.has_value() && p->is_reference();
         }
+        // ...and an INSTANCE field (not static) — pins the symbol proxy contract.
+        auto symbol_is_static() const -> bool
+        {
+            const auto p{ get_field("symbol") };
+            return p.has_value() && p->is_static();
+        }
         auto symbol_signature() const -> std::string
         {
             const auto p{ get_field("symbol") };
@@ -272,6 +278,23 @@ namespace
         auto get_name() const -> std::string { return get_field("name")->get(); }
 
         auto get_ordinal() const -> std::int32_t { return get_field("ordinal")->get(); }
+
+        auto name_resolves() const -> bool { return get_field("name").has_value(); }
+
+        auto ordinal_resolves() const -> bool { return get_field("ordinal").has_value(); }
+
+        // Inherited java.lang.Enum descriptors, resolved through Op's super-chain
+        // (Op -> Enum) — a distinct find_field walk from Color's.
+        auto name_signature() const -> std::string
+        {
+            const auto p{ get_field("name") };
+            return p.has_value() ? std::string{ p->signature() } : std::string{};
+        }
+        auto ordinal_signature() const -> std::string
+        {
+            const auto p{ get_field("ordinal") };
+            return p.has_value() ? std::string{ p->signature() } : std::string{};
+        }
 
         // ---- constant-specific abstract method ----
         // NOTE: we intentionally do NOT dispatch apply() natively.  This wrapper
@@ -316,6 +339,25 @@ namespace
 
         static auto values_array_resolves() -> bool { return static_field("$VALUES").has_value(); }
 
+        // ---- field_proxy introspection on Op's synthetic $VALUES array static ----
+        // STATIC, REFERENCE (array); descriptor '[Lvmhook/fixtures/EnumSingleton$Op;'
+        // (the ABSTRACT BASE type, NOT the per-constant $1/$2 subclasses).
+        static auto values_is_reference() -> bool
+        {
+            const auto p{ static_field("$VALUES") };
+            return p.has_value() && p->is_reference();
+        }
+        static auto values_is_static() -> bool
+        {
+            const auto p{ static_field("$VALUES") };
+            return p.has_value() && p->is_static();
+        }
+        static auto values_signature() -> std::string
+        {
+            const auto p{ static_field("$VALUES") };
+            return p.has_value() ? std::string{ p->signature() } : std::string{};
+        }
+
         // ---- synthetic static methods values()/valueOf on the enum class ----
         static auto values_method_resolves() -> bool { return static_method("values").has_value(); }
         static auto value_of_method_resolves() -> bool { return static_method("valueOf").has_value(); }
@@ -343,6 +385,26 @@ namespace
         auto tag_resolves() const -> bool { return get_field("tag").has_value(); }
         auto get_name() const -> std::string { return get_field("name")->get(); }
         auto get_ordinal() const -> std::int32_t { return get_field("ordinal")->get(); }
+
+        // ---- field_proxy introspection on the single-constant enum body field ----
+        // `tag` is a primitive int instance field: NOT a reference, NOT static,
+        // descriptor "I" — the same contract proven for Color.rgb, on a
+        // single-constant enum klass.
+        auto tag_is_reference() const -> bool
+        {
+            const auto p{ get_field("tag") };
+            return p.has_value() && p->is_reference();
+        }
+        auto tag_is_static() const -> bool
+        {
+            const auto p{ get_field("tag") };
+            return p.has_value() && p->is_static();
+        }
+        auto tag_signature() const -> std::string
+        {
+            const auto p{ get_field("tag") };
+            return p.has_value() ? std::string{ p->signature() } : std::string{};
+        }
 
         // ---- enum-body instance method tag() (native; best-effort) ----
         auto tag_method_resolves() const -> bool { return get_method("tag").has_value(); }
@@ -612,6 +674,51 @@ namespace
         return wrapped.get_name();
     }
 
+    // ---- the same trio for a bare Op element OOP --------------------------------
+    // Proves an Op.$VALUES element OOP is itself a USABLE Op singleton (its
+    // enum-body `symbol` + inherited name/ordinal read off the bare OOP), not
+    // merely pointer-equal to the constant static.  Fully gated; sentinel on a
+    // bad OOP.
+    auto op_symbol_of_oop(void* const op_oop) -> std::string
+    {
+        if (!op_oop || !vmhook::hotspot::is_valid_pointer(op_oop))
+        {
+            return std::string{};
+        }
+        const op_enum wrapped{ static_cast<vmhook::oop_t>(op_oop) };
+        if (!wrapped.symbol_resolves())
+        {
+            return std::string{};
+        }
+        return wrapped.get_symbol();
+    }
+    auto op_name_of_oop(void* const op_oop) -> std::string
+    {
+        if (!op_oop || !vmhook::hotspot::is_valid_pointer(op_oop))
+        {
+            return std::string{};
+        }
+        const op_enum wrapped{ static_cast<vmhook::oop_t>(op_oop) };
+        if (!wrapped.name_resolves())
+        {
+            return std::string{};
+        }
+        return wrapped.get_name();
+    }
+    auto op_ordinal_of_oop(void* const op_oop) -> std::int32_t
+    {
+        if (!op_oop || !vmhook::hotspot::is_valid_pointer(op_oop))
+        {
+            return -1;
+        }
+        const op_enum wrapped{ static_cast<vmhook::oop_t>(op_oop) };
+        if (!wrapped.ordinal_resolves())
+        {
+            return -1;
+        }
+        return wrapped.get_ordinal();
+    }
+
     // The runtime ('/'-separated) klass name of an OOP, read by decoding the
     // narrow-klass slot in the object header (klass_from_oop) and stringifying
     // the Klass::_name symbol.  FULLY GATED: klass_from_oop RAW-derefs oop+8 and
@@ -814,6 +921,21 @@ namespace
                     ctx.check("color_values_elem0_name_is_RED",   name_of_oop(elems[0]) == "RED");
                     ctx.check("color_values_elem1_name_is_GREEN", name_of_oop(elems[1]) == "GREEN");
                     ctx.check("color_values_elem2_name_is_BLUE",  name_of_oop(elems[2]) == "BLUE");
+
+                    // CROSS-PATH IDENTITY: the values()-array element OOP is the
+                    // SAME OOP the INSTANCE / STATIC reference fields decode to —
+                    // three independent decode paths (array element, instance
+                    // field, static field) all alias the one constant singleton.
+                    if (live(favorite))
+                    {
+                        ctx.check("color_values_elem1_oop_is_favoriteColor",
+                                  elems[1] == favorite->oop());
+                    }
+                    if (live(static_color))
+                    {
+                        ctx.check("color_values_elem2_oop_is_staticColor",
+                                  elems[2] == static_color->oop());
+                    }
                 }
             }
         }
@@ -996,6 +1118,16 @@ namespace
             // equals the BLUE constant's.
             ctx.check("java_color_valueOf_BLUE_is_BLUE_singleton",
                       enum_holder::seen_int("valueOfBlueIdentity") == blue_id);
+
+            // values() hands back a FRESH array each call (the array-copy
+            // contract), whose elements are still the canonical singletons.
+            ctx.check("java_color_values_returns_fresh_array",
+                      enum_holder::seen_bool("colorValuesFreshCopy"));
+            ctx.check("java_color_values_element_is_stable_singleton",
+                      enum_holder::seen_bool("colorValuesElemStableSingleton"));
+            // valueOf NEGATIVE path: an unknown constant name throws.
+            ctx.check("java_color_valueOf_bad_name_throws",
+                      enum_holder::seen_bool("colorValueOfBadNameThrew"));
         }
 
         // =====================================================================
@@ -1120,12 +1252,41 @@ namespace
                 ctx.check("op_PLUS_symbol_is_plus",  plus->get_symbol() == "+");
                 // symbol is a String reference field — descriptor 'Ljava/lang/String;'.
                 ctx.check("op_PLUS_symbol_is_reference", plus->symbol_is_reference());
+                // symbol is an INSTANCE field — NOT static.
+                ctx.check("op_PLUS_symbol_is_not_static", !plus->symbol_is_static());
                 ctx.check("op_PLUS_symbol_descriptor_is_String",
                           plus->symbol_signature() == "Ljava/lang/String;");
+                // Inherited java.lang.Enum descriptors resolve through Op's own
+                // super-chain (Op -> Enum), independent of Color's walk.
+                ctx.check("op_name_descriptor_is_String",
+                          plus->name_signature() == "Ljava/lang/String;");
+                ctx.check("op_ordinal_descriptor_is_I", plus->ordinal_signature() == "I");
             }
             if (live(times))
             {
                 ctx.check("op_TIMES_symbol_is_star", times->get_symbol() == "*");
+            }
+
+            // ---- CROSS-ENUM identity / klass distinctness ----
+            // Constants of DIFFERENT enums are DIFFERENT heap objects (distinct
+            // OOPs) and belong to DIFFERENT klasses.  This proves the constant
+            // singletons are not conflated across enums (a Color is never an Op).
+            if (live(green) && live(plus))
+            {
+                ctx.check("cross_enum_GREEN_not_PLUS_oop", green->oop() != plus->oop());
+            }
+            if (live(red) && live(times))
+            {
+                ctx.check("cross_enum_RED_not_TIMES_oop", red->oop() != times->oop());
+            }
+            if (live(green) && live(plus))
+            {
+                const std::string kg{ runtime_klass_name(green->oop()) };
+                const std::string kp{ runtime_klass_name(plus->oop()) };
+                if (!kg.empty() && !kp.empty())
+                {
+                    ctx.check("cross_enum_Color_Op_distinct_runtime_klass", kg != kp);
+                }
             }
 
             // ---- synthetic static methods values()/valueOf resolve on Op too ----
@@ -1143,6 +1304,12 @@ namespace
                 ctx.check("op_TIMES_name_is_TIMES", times->get_name() == "TIMES");
                 ctx.check("op_TIMES_ordinal_is_1",  times->get_ordinal() == 1);
             }
+            // Native Op name read == the published java.lang.Enum.name() witness.
+            if (done && live(plus))
+            {
+                ctx.check("native_PLUS_name_matches_java_witness",
+                          plus->get_name() == enum_holder::seen_str("plusNameSeen"));
+            }
 
             // ---- identity / distinctness + $VALUES backing array ----
             ctx.check("op_PLUS_TIMES_distinct_oops",
@@ -1153,6 +1320,13 @@ namespace
                           live(plus) && live(plus_again) && plus->oop() == plus_again->oop());
             }
             ctx.check("op_values_array_resolves", op_enum::values_array_resolves());
+            // $VALUES on Op is a STATIC, REFERENCE (array) field; its descriptor
+            // is the ABSTRACT BASE array type '[Lvmhook/fixtures/EnumSingleton$Op;'
+            // (NOT the per-constant $1/$2 subclass types).
+            ctx.check("op_values_field_is_reference", op_enum::values_is_reference());
+            ctx.check("op_values_field_is_static",    op_enum::values_is_static());
+            ctx.check("op_values_field_signature_is_array_of_op",
+                      op_enum::values_signature() == std::string{ "[L" } + k_op_class + ";");
             {
                 void* const array_oop{ op_enum::values_array_oop() };
                 if (array_oop && vmhook::hotspot::is_valid_pointer(array_oop))
@@ -1163,6 +1337,17 @@ namespace
                     {
                         ctx.check("op_values_elem0_is_PLUS",  elems[0] == plus->oop());
                         ctx.check("op_values_elem1_is_TIMES", elems[1] == times->oop());
+
+                        // Each element OOP is a USABLE Op singleton: read its
+                        // enum-body `symbol` + inherited name/ordinal off the bare
+                        // element OOP (proves it is a live decode-able singleton in
+                        // declaration order, not merely pointer-equal).
+                        ctx.check("op_values_elem0_symbol_is_plus",  op_symbol_of_oop(elems[0]) == "+");
+                        ctx.check("op_values_elem1_symbol_is_star",  op_symbol_of_oop(elems[1]) == "*");
+                        ctx.check("op_values_elem0_name_is_PLUS",    op_name_of_oop(elems[0]) == "PLUS");
+                        ctx.check("op_values_elem1_name_is_TIMES",   op_name_of_oop(elems[1]) == "TIMES");
+                        ctx.check("op_values_elem0_ordinal_is_0",    op_ordinal_of_oop(elems[0]) == 0);
+                        ctx.check("op_values_elem1_ordinal_is_1",    op_ordinal_of_oop(elems[1]) == 1);
                     }
                 }
                 else
@@ -1306,6 +1491,8 @@ namespace
             ctx.check("java_op_PLUS_label_is_op_plus",  enum_holder::seen_str("plusLabelSeen") == "op:+");
             ctx.check("java_op_TIMES_label_is_op_star", enum_holder::seen_str("timesLabelSeen") == "op:*");
             ctx.check("java_op_valueOf_PLUS_is_PLUS", enum_holder::seen_bool("valueOfPlusIsPlus"));
+            ctx.check("java_op_valueOf_bad_name_throws",
+                      enum_holder::seen_bool("opValueOfBadNameThrew"));
             ctx.check("java_op_PLUS_ordinal_is_0",  enum_holder::seen_int("plusOrdinal") == 0);
             ctx.check("java_op_TIMES_ordinal_is_1", enum_holder::seen_int("timesOrdinal") == 1);
             ctx.check("java_op_PLUS_TIMES_distinct_identity",
@@ -1388,6 +1575,11 @@ namespace
                 ctx.check("lonely_INSTANCE_ordinal_is_0",     sole->get_ordinal() == 0);
                 ctx.check("lonely_INSTANCE_tag_resolves",     sole->tag_resolves());
                 ctx.check("lonely_INSTANCE_tag_is_sentinel",  sole->get_tag() == static_cast<std::int32_t>(0x515E));
+                // `tag` is a primitive int instance field on the single-constant
+                // enum body: NOT a reference, NOT static, descriptor "I".
+                ctx.check("lonely_INSTANCE_tag_is_not_reference", !sole->tag_is_reference());
+                ctx.check("lonely_INSTANCE_tag_is_not_static",    !sole->tag_is_static());
+                ctx.check("lonely_INSTANCE_tag_descriptor_is_I",  sole->tag_signature() == "I");
                 // Native instance method tag() on the single-constant enum:
                 // resolution is HARD; the call itself is best-effort (proven via
                 // the Java witness java_lonely_tag_is_sentinel otherwise).
@@ -1579,6 +1771,11 @@ namespace
                 ctx.check("native_RED_name_matches_java_witness",
                           red->get_name() == enum_holder::seen_str("redNameSeen"));
             }
+            if (live(blue))
+            {
+                ctx.check("native_BLUE_name_matches_java_witness",
+                          blue->get_name() == enum_holder::seen_str("blueNameSeen"));
+            }
         }
 
         // =====================================================================
@@ -1607,8 +1804,11 @@ namespace
             // EnumMap / EnumSet contents (the robust proof for the un-wrapped types).
             ctx.check("java_enummap_size_is_3",      enum_holder::seen_int("colorNamesSize") == 3);
             ctx.check("java_enummap_get_GREEN_is_g", enum_holder::seen_str("colorNamesGreen") == "g");
+            ctx.check("java_enummap_get_RED_is_r",   enum_holder::seen_str("colorNamesRed") == "r");
+            ctx.check("java_enummap_get_BLUE_is_b",  enum_holder::seen_str("colorNamesBlue") == "b");
             ctx.check("java_enumset_size_is_1",      enum_holder::seen_int("warmColorsSize") == 1);
             ctx.check("java_enumset_contains_RED",   enum_holder::seen_bool("warmColorsHasRed"));
+            ctx.check("java_enumset_excludes_GREEN", !enum_holder::seen_bool("warmColorsHasGreen"));
             ctx.check("java_enumset_excludes_BLUE",  !enum_holder::seen_bool("warmColorsHasBlue"));
             // Corroborate the native klass characterisation with the Java names.
             ctx.check("java_enummap_className_is_EnumMap",

@@ -135,6 +135,20 @@ public final class InterfacePoly
      */
     public interface Animal
     {
+        /**
+         * An INTERFACE CONSTANT: every field declared in an interface is
+         * implicitly {@code public static final}, so this is a compile-time
+         * constant living on the {@code Animal} interface's own mirror (NOT on
+         * any implementor). The native side reads it through {@code static_field}
+         * keyed on the interface klass, proving a constant declared on an
+         * interface is reachable exactly like a class static. ASCII so it lands
+         * in the LATIN1 / char-array branch of read_java_string on every JDK.
+         */
+        String KINGDOM = "animalia";
+
+        /** A primitive interface constant (int), read as a static off the iface. */
+        int LEGS_DEFAULT = 4;
+
         /** Abstract: every implementation overrides this. */
         String speak();
 
@@ -164,6 +178,9 @@ public final class InterfacePoly
      */
     public interface Named
     {
+        /** A SECOND interface's own constant (proves per-interface constants). */
+        String REALM = "named-realm";
+
         /** Abstract: returns the implementor's identity string. */
         String who();
     }
@@ -759,6 +776,16 @@ public final class InterfacePoly
     /** StringBox.get() dispatched through the concrete (covariant) reference. */
     public static volatile String boxGetSeen = "";
 
+    /**
+     * The {@code Animal.KINGDOM} interface constant as the JVM resolves it
+     * (Java-side {@code getstatic} off the interface), published so native can
+     * cross-check the value it read off the interface mirror byte-for-byte.
+     */
+    public static volatile String animalKingdomSeen = "";
+
+    /** The {@code Named.REALM} interface constant (second interface) for cross-check. */
+    public static volatile String namedRealmSeen = "";
+
     /** True after the probe confirms all four Animal impls dispatch distinctly. */
     public static volatile boolean allImplsDistinctSeen;
 
@@ -843,6 +870,12 @@ public final class InterfacePoly
                 // Generic interface + covariant impl -> bridge method; dispatch
                 // through the declared Box<String> ref reaches the real body.
                 InterfacePoly.boxGetSeen = s.box.get();
+
+                // Interface CONSTANTS (implicitly public static final): the JVM's
+                // own getstatic off each interface, published for the native
+                // cross-check against the value read off the interface mirror.
+                InterfacePoly.animalKingdomSeen = Animal.KINGDOM;
+                InterfacePoly.namedRealmSeen    = Named.REALM;
 
                 // All four Animal impls produce mutually distinct speak() results.
                 InterfacePoly.allImplsDistinctSeen =

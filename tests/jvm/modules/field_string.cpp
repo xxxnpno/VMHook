@@ -200,6 +200,12 @@ namespace
         static auto j_emoji_run_cp0()     -> std::int32_t { return static_field("jEmojiRunCp0")->get(); }
         static auto j_inherited_cjk_value() -> std::string { return static_field("jInheritedCjkValue")->get(); }
 
+        // ---- Java-published facts for the batch-19 GET deepening edges. ----
+        static auto j_u007f_cp1()           -> std::int32_t { return static_field("jU007FCp1")->get(); }
+        static auto j_before_surrogate_cp0()-> std::int32_t { return static_field("jBeforeSurrogateCp0")->get(); }
+        static auto j_after_surrogate_cp0() -> std::int32_t { return static_field("jAfterSurrogateCp0")->get(); }
+        static auto j_static_inherited_cjk_value() -> std::string { return static_field("jStaticInheritedCjkValue")->get(); }
+
         static auto set_ascii_eq_matches() -> bool        { return static_field("setAsciiEqMatches")->get(); }
         static auto set_ascii_eq_len()     -> std::int32_t { return static_field("setAsciiEqLen")->get(); }
         static auto set_ascii_eq_value()   -> std::string  { return static_field("setAsciiEqValue")->get(); }
@@ -238,6 +244,21 @@ namespace
         static auto set_via_string_view_matches()-> bool     { return static_field("setViaStringViewMatches")->get(); }
         static auto set_reset_value()        -> std::string  { return static_field("setReSetValue")->get(); }
         static auto set_reset_len()          -> std::int32_t { return static_field("setReSetLen")->get(); }
+        // ---- batch-19 SET-encoding readbacks. ----
+        static auto set_max_bmp_write_value() -> std::string  { return static_field("setMaxBmpWriteValue")->get(); }
+        static auto set_max_bmp_write_len()   -> std::int32_t { return static_field("setMaxBmpWriteLen")->get(); }
+        static auto set_max_bmp_write_cp0()   -> std::int32_t { return static_field("setMaxBmpWriteCp0")->get(); }
+        static auto set_mixed_write_value()    -> std::string  { return static_field("setMixedWriteValue")->get(); }
+        static auto set_mixed_write_len()      -> std::int32_t { return static_field("setMixedWriteLen")->get(); }
+        static auto set_mixed_write_cpcount()  -> std::int32_t { return static_field("setMixedWriteCpCount")->get(); }
+        static auto set_mixed_write_cp3()      -> std::int32_t { return static_field("setMixedWriteCp3")->get(); }
+        static auto set_long_write_len()       -> std::int32_t { return static_field("setLongWriteLen")->get(); }
+        static auto set_long_write_all_l()     -> bool         { return static_field("setLongWriteAllL")->get(); }
+        static auto set_re_encode_len()        -> std::int32_t { return static_field("setReEncodeLen")->get(); }
+        static auto set_re_encode_cpcount()    -> std::int32_t { return static_field("setReEncodeCpCount")->get(); }
+        static auto set_re_encode_cp1()        -> std::int32_t { return static_field("setReEncodeCp1")->get(); }
+        static auto set_inherited_writable_value()   -> std::string { return static_field("setInheritedWritableValue")->get(); }
+        static auto set_inherited_writable_matches() -> bool        { return static_field("setInheritedWritableMatches")->get(); }
         static auto inst_cjk_value()         -> std::string  { return static_field("instCjkValue")->get(); }
         static auto inst_cjk_len()           -> std::int32_t { return static_field("instCjkLen")->get(); }
         static auto inst_cjk_cp0()           -> std::int32_t { return static_field("instCjkCp0")->get(); }
@@ -381,6 +402,40 @@ VMHOOK_JVM_MODULE(field_string)
     ctx.check("set_reset_second_resolved",
               field_string_fixture::set_static("setReSet", "second"));
 
+    // ----------------------------------------------------------------------
+    // BATCH-19 SET-ENCODING writes: a single 3-byte BMP scalar, a MIXED
+    // multi-encode buffer, a MODEST-long ASCII string, and a RE-ENCODE re-set
+    // that flips the compact-string coder class.  Each proves store_string's
+    // UTF-8 -> java.lang.String encode for a class the prior battery lacked.
+    // ----------------------------------------------------------------------
+
+    // Max-BMP source: UTF-8 U+FFFF (EF BF BF) -> Java length 1, cp 0xFFFF.
+    // A single 3-byte UTF-8 scalar -> exactly ONE UTF-16 code unit.
+    ctx.check("set_max_bmp_write_resolved",
+              field_string_fixture::set_static_bytes("setMaxBmpWrite",
+                                                     std::string{ "\xEF\xBF\xBF" }));
+
+    // Mixed source in one write: 'A' + 'é'(C3 A9) + 日(E6 97 A5) + emoji(F0 9F 98 80)
+    // -> Java length 5 (UTF-16 units), code-point count 4.  A heterogeneous buffer.
+    ctx.check("set_mixed_write_resolved",
+              field_string_fixture::set_static_bytes(
+                  "setMixedWrite",
+                  std::string{ "A\xC3\xA9\xE6\x97\xA5\xF0\x9F\x98\x80" }));
+
+    // Modest-long ASCII (300 'L') into a 7-char placeholder backing: the rebind
+    // allocates the full length regardless of the old backing size.
+    ctx.check("set_long_write_resolved",
+              field_string_fixture::set_static_bytes("setLongWrite",
+                                                     std::string(300u, 'L')));
+
+    // RE-ENCODE re-set: ASCII "plain" then OVERWRITE with "Z" + emoji.  The second
+    // rebind changes the coder class (LATIN1 -> UTF-16); Java must see the LAST one.
+    ctx.check("set_re_encode_first_resolved",
+              field_string_fixture::set_static("setReEncode", "plain"));
+    ctx.check("set_re_encode_second_resolved",
+              field_string_fixture::set_static_bytes("setReEncode",
+                                                     std::string{ "Z\xF0\x9F\x98\x80" }));
+
     // Instance String field, mutated through an INSTANCE field_proxy.
     {
         const auto self{ field_string_fixture::acquire_self() };
@@ -415,6 +470,29 @@ VMHOOK_JVM_MODULE(field_string)
                 const std::string after = inst_cjk_proxy->get();
                 ctx.check("instance_cjk_set_native_readback",
                           after == std::string{ "\xE6\x97\xA5" });
+            }
+
+            // INHERITED writable INSTANCE String (declared on FieldStringBase):
+            // rebind it through the CHILD instance field_proxy, proving SET (not
+            // just GET) resolves an inherited slot via the super walk.  The slot
+            // resolution + signature are HARD; the rebound value is re-verified
+            // through Java in PHASE 2.
+            const auto inh_writable_proxy{ self->get_field("inheritedWritable") };
+            ctx.check("instance_inherited_writable_field_resolved",
+                      inh_writable_proxy.has_value());
+            if (inh_writable_proxy.has_value())
+            {
+                ctx.check("instance_inherited_writable_signature",
+                          std::string{ inh_writable_proxy->signature() } == "Ljava/lang/String;");
+                // Pre-write read resolves the base's initial value via the super walk.
+                const std::string before = inh_writable_proxy->get();
+                ctx.check("instance_inherited_writable_initial_value",
+                          before == "base-writable");
+                inh_writable_proxy->set(std::string{ "child-wrote" });
+                // Native read-back agrees immediately (pre-probe).
+                const std::string after = inh_writable_proxy->get();
+                ctx.check("instance_inherited_writable_native_readback",
+                          after == "child-wrote");
             }
         }
     }
@@ -830,6 +908,55 @@ VMHOOK_JVM_MODULE(field_string)
     ctx.check("fstr_emoji_run_direct_equals_proxy",
               field_string_fixture::read_static_direct("getEmojiRun") == emoji_run);
 
+    // ======================================================================
+    // BATCH-19 GET DEEPENING — encoder-boundary EDGES the prior battery lacked.
+    // Each value's expected UTF-8 was cross-checked against String.getBytes(UTF_8);
+    // every read goes through the clean one-liner AND read_static_direct, asserting
+    // the two paths AGREE.  Content round-trip is HARD (banked rule).
+    // ======================================================================
+
+    // --- U+007F (DEL): the LAST 1-byte ASCII code point -> a SINGLE 0x7F byte
+    //     (LATIN1 coder 0), embedded between 'a' and 'b'.  Completes the 1->2 byte
+    //     encoder boundary from the LOW side (getLo80 = U+0080 from the high side).
+    //     "a\x7Fb" -> 61 7F 62, length 3. ---
+    const std::string u007f{ field_string_fixture::read_static("getU007F") };
+    ctx.check("fstr_u007f_value", u007f == std::string{ "a\x7F" "b" });
+    ctx.check("fstr_u007f_len_3", u007f.size() == 3);
+    ctx.check("fstr_u007f_mid_is_7F",
+              u007f.size() == 3 && static_cast<unsigned char>(u007f[1]) == 0x7F);
+    ctx.check("fstr_u007f_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getU007F") == u007f);
+
+    // --- U+D7FF: the LAST BMP scalar BEFORE the surrogate range -> plain 3-byte
+    //     UTF-8 ED 9F BF (UTF-16 coder 1).  Must NOT be mistaken for a surrogate
+    //     by the pair-combining branch (low edge of the "ordinary BMP" check). ---
+    const std::string before_surr{ field_string_fixture::read_static("getBeforeSurrogate") };
+    ctx.check("fstr_before_surrogate_utf8_ED9FBF",
+              before_surr == std::string{ "\xED\x9F\xBF" });
+    ctx.check("fstr_before_surrogate_len_3", before_surr.size() == 3);
+    ctx.check("fstr_before_surrogate_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getBeforeSurrogate") == before_surr);
+
+    // --- U+E000: the FIRST BMP scalar AFTER the surrogate range -> plain 3-byte
+    //     UTF-8 EE 80 80 (UTF-16 coder 1).  High edge of the "ordinary BMP, not a
+    //     surrogate" check (getBeforeSurrogate is the low edge). ---
+    const std::string after_surr{ field_string_fixture::read_static("getAfterSurrogate") };
+    ctx.check("fstr_after_surrogate_utf8_EE8080",
+              after_surr == std::string{ "\xEE\x80\x80" });
+    ctx.check("fstr_after_surrogate_len_3", after_surr.size() == 3);
+    ctx.check("fstr_after_surrogate_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getAfterSurrogate") == after_surr);
+
+    // --- INHERITED STATIC non-ASCII String, declared only on FieldStringBase,
+    //     resolved through the CHILD wrapper's static_field super walk, feeding the
+    //     UTF-16 decode path.  語 (U+8A9E) -> 3 UTF-8 bytes E8 AA 9E. ---
+    const std::string static_inherited_cjk{ field_string_fixture::read_static("sInheritedCjk") };
+    ctx.check("fstr_static_inherited_cjk_value",
+              static_inherited_cjk == std::string{ "\xE8\xAA\x9E" });
+    ctx.check("fstr_static_inherited_cjk_len_3", static_inherited_cjk.size() == 3);
+    ctx.check("fstr_static_inherited_cjk_direct_equals_proxy",
+              field_string_fixture::read_static_direct("sInheritedCjk") == static_inherited_cjk);
+
     // --- NON-String object field accessed as a String: read_java_string is fed
     //     a non-String oop (an int[] held in an Object field).  It must DEGRADE
     //     GRACEFULLY (return "" or a bounded best-effort decode) and NEVER crash.
@@ -934,6 +1061,20 @@ VMHOOK_JVM_MODULE(field_string)
         ctx.check("fstr_java_inherited_cjk_value",
                   field_string_fixture::j_inherited_cjk_value()
                   == std::string{ "\xE6\x97\xA5\xE6\x9C\xAC" });
+
+        // ---- Java-side cross-checks of the batch-19 GET deepening edges:
+        //      prove the bytes vmhook decoded correspond to the real Java String
+        //      code points (the authoritative cross-check). ----
+        ctx.check("fstr_java_u007f_cp1_is_7F", field_string_fixture::j_u007f_cp1() == 0x7F);
+        ctx.check("fstr_java_before_surrogate_cp0_is_D7FF",
+                  field_string_fixture::j_before_surrogate_cp0() == 0xD7FF);
+        ctx.check("fstr_java_after_surrogate_cp0_is_E000",
+                  field_string_fixture::j_after_surrogate_cp0() == 0xE000);
+        // Java sees the SAME 語 value vmhook decoded for the inherited STATIC
+        // non-ASCII field (proves the static super walk + UTF-16 decode agree).
+        ctx.check("fstr_java_static_inherited_cjk_value",
+                  field_string_fixture::j_static_inherited_cjk_value()
+                  == std::string{ "\xE8\xAA\x9E" });
 
         // ---- SET write-back verified THROUGH JAVA (the contract). ----
         // Clean full overwrite landed and is visible to Java.
@@ -1062,6 +1203,62 @@ VMHOOK_JVM_MODULE(field_string)
         ctx.check("set_reset_vmhook_reread_second",
                   field_string_fixture::read_static("setReSet") == "second");
 
+        // --- Max-BMP write U+FFFF: Java length 1, cp 0xFFFF; vmhook re-read EF BF BF.
+        //     A single 3-byte UTF-8 scalar encoded to exactly one UTF-16 unit. ---
+        ctx.check("set_max_bmp_write_java_len_1", field_string_fixture::set_max_bmp_write_len() == 1);
+        ctx.check("set_max_bmp_write_java_cp0_FFFF",
+                  field_string_fixture::set_max_bmp_write_cp0() == 0xFFFF);
+        ctx.check("set_max_bmp_write_java_value_utf8",
+                  field_string_fixture::set_max_bmp_write_value() == std::string{ "\xEF\xBF\xBF" });
+        ctx.check("set_max_bmp_write_vmhook_reread",
+                  field_string_fixture::read_static("setMaxBmpWrite") == std::string{ "\xEF\xBF\xBF" });
+
+        // --- Mixed write: Java length 5 (UTF-16 units), cpCount 4, cp[3]==0x1F600;
+        //     vmhook re-read is the exact heterogeneous UTF-8 buffer.  Proves the
+        //     encoder handles a buffer of 1/2/3/4-byte scalars in one call. ---
+        ctx.check("set_mixed_write_java_len_5", field_string_fixture::set_mixed_write_len() == 5);
+        ctx.check("set_mixed_write_java_cpcount_4", field_string_fixture::set_mixed_write_cpcount() == 4);
+        ctx.check("set_mixed_write_java_cp3_1F600",
+                  field_string_fixture::set_mixed_write_cp3() == 0x1F600);
+        ctx.check("set_mixed_write_java_value_utf8",
+                  field_string_fixture::set_mixed_write_value()
+                  == std::string{ "A\xC3\xA9\xE6\x97\xA5\xF0\x9F\x98\x80" });
+        ctx.check("set_mixed_write_vmhook_reread",
+                  field_string_fixture::read_static("setMixedWrite")
+                  == std::string{ "A\xC3\xA9\xE6\x97\xA5\xF0\x9F\x98\x80" });
+
+        // --- Modest-long write (300 'L'): the rebind allocates the FULL length
+        //     regardless of the old short backing.  Java sees 300 chars, all 'L';
+        //     vmhook re-reads 300 'L' bytes. ---
+        ctx.check("set_long_write_java_len_300", field_string_fixture::set_long_write_len() == 300);
+        ctx.check("set_long_write_java_all_L", field_string_fixture::set_long_write_all_l());
+        {
+            const std::string reread{ field_string_fixture::read_static("setLongWrite") };
+            ctx.check("set_long_write_vmhook_reread_len_300", reread.size() == 300u);
+            ctx.check("set_long_write_vmhook_reread_all_L",
+                      reread == std::string(300u, 'L'));
+        }
+
+        // --- RE-ENCODE re-set: the second rebind flipped LATIN1 -> UTF-16.  Java
+        //     sees length 3 (Z + surrogate pair), cpCount 2, cp[1]==0x1F600; vmhook
+        //     re-reads 'Z' + the 4-byte emoji.  Proves each rebind builds a String
+        //     of the correct encoding (not a coder-stuck in-place edit). ---
+        ctx.check("set_re_encode_java_len_3", field_string_fixture::set_re_encode_len() == 3);
+        ctx.check("set_re_encode_java_cpcount_2", field_string_fixture::set_re_encode_cpcount() == 2);
+        ctx.check("set_re_encode_java_cp1_1F600",
+                  field_string_fixture::set_re_encode_cp1() == 0x1F600);
+        ctx.check("set_re_encode_vmhook_reread",
+                  field_string_fixture::read_static("setReEncode")
+                  == std::string{ "Z\xF0\x9F\x98\x80" });
+
+        // --- INHERITED writable INSTANCE String rebound through the child instance
+        //     field_proxy: Java sees "child-wrote" on the inherited slot (the SET
+        //     super walk resolved and rebound the base-declared field). ---
+        ctx.check("set_inherited_writable_java_matches",
+                  field_string_fixture::set_inherited_writable_matches());
+        ctx.check("set_inherited_writable_java_value",
+                  field_string_fixture::set_inherited_writable_value() == "child-wrote");
+
         // --- Instance NON-ASCII SET: Java length 1, cp 0x65E5; vmhook re-read
         //     E6 97 A5 — the encode path verified on an INSTANCE slot. ---
         ctx.check("instance_cjk_set_java_len_1", field_string_fixture::inst_cjk_len() == 1);
@@ -1127,6 +1324,15 @@ VMHOOK_JVM_MODULE(field_string)
                 {
                     const std::string v = inh->get();
                     ctx.check("fstr_inherited_instance_reread_after_probe", v == "base-inherited");
+                }
+                // The inherited writable instance slot, rebound in PHASE 1, still
+                // reads "child-wrote" via a FRESH instance proxy post-probe — the
+                // SET super-walk rebind is stable and re-resolvable.
+                const auto inh_w{ self_after->get_field("inheritedWritable") };
+                if (inh_w.has_value())
+                {
+                    const std::string v = inh_w->get();
+                    ctx.check("fstr_inherited_writable_reread_after_probe", v == "child-wrote");
                 }
             }
         }

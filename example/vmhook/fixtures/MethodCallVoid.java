@@ -48,7 +48,8 @@ import vmhook.Harness;
  *
  * Java 8 syntax only (no var / records / switch-expressions / lambdas).
  */
-public final class MethodCallVoid
+public final class MethodCallVoid extends MethodCallVoidBase
+        implements MethodCallVoidMixin
 {
     /** Native sets this true to request the action; clears it after. */
     public static volatile boolean go;
@@ -223,6 +224,32 @@ public final class MethodCallVoid
     public static volatile int     mixedRefObjIdentity;
     public static volatile int     mixedRefInt;
     public static volatile int     mixedRefStrLen = -2;
+
+    // ── INHERITED instance void (declared on MethodCallVoidBase) ─────────────
+    // Resolved through the concrete MethodCallVoid wrapper via get_method's
+    // SUPERCLASS-CHAIN walk; proves a void method NOT declared on the wrapped
+    // class itself still dispatches.  Counter lives on the base class.
+
+    // ── INTERFACE-DEFAULT void (declared on MethodCallVoidMixin) ─────────────
+    // Reached via get_method's implemented-interface DEFAULT-method fallback;
+    // proves a void `default` method on an interface dispatches through the
+    // concrete wrapper.  Counter lives on the interface.
+
+    // ── interleaved mixed-width void args (int, long, int, double) ───────────
+    // Slots alternate 1,2,1,2 so a wrong running slot-index would corrupt the
+    // arg AFTER a wide one.  Distinct recorder from voidPrimArgs/voidWideOnly.
+    public static volatile boolean interleavedCalled;
+    public static volatile int     interleavedInt1;
+    public static volatile long    interleavedLong;
+    public static volatile int     interleavedInt2;
+    public static volatile double  interleavedDouble;
+
+    // ── mixed floating-point widths in one void call (float + double) ────────
+    // float is 1 slot, double is 2; recording both proves an F and a D marshal
+    // together (voidNarrowArgs has float alone, voidWideOnly double alone).
+    public static volatile boolean mixedFpCalled;
+    public static volatile float   mixedFpFloat;
+    public static volatile double  mixedFpDouble;
 
     // ── the method the native module hooks to obtain a live thread ──────────
 
@@ -401,6 +428,27 @@ public final class MethodCallVoid
         mixedRefCalled      = true;
     }
 
+    // ── interleaved mixed-width void args (int, long, int, double) ──────────
+    // The interpreter slot index must advance 1,2,1,2 across these; if the
+    // running index miscounts a wide arg the int AFTER the long, or the double
+    // after the second int, would be corrupted.  Recorded verbatim.
+    public void voidInterleaved(final int a, final long b, final int c, final double d)
+    {
+        interleavedInt1   = a;
+        interleavedLong   = b;
+        interleavedInt2   = c;
+        interleavedDouble = d;
+        interleavedCalled = true;
+    }
+
+    // ── mixed floating-point widths in one void call (float + double) ────────
+    public void voidMixedFp(final float f, final double d)
+    {
+        mixedFpFloat  = f;
+        mixedFpDouble = d;
+        mixedFpCalled = true;
+    }
+
     // ── CONTRAST: an int returner whose value_t.is_void() must be FALSE ──────
     public int retInt()
     {
@@ -451,4 +499,68 @@ public final class MethodCallVoid
      * so the published identity matches the receiver the detour sees as `self`.
      */
     public static final MethodCallVoid SINGLETON = new MethodCallVoid();
+}
+
+/**
+ * Abstract base of {@link MethodCallVoid}.  Hosts a void INSTANCE method and a
+ * void STATIC method that the wrapped subclass does NOT redeclare, so the native
+ * side proves a void dispatch reaches a method found via the SUPERCLASS-CHAIN
+ * walk (not the wrapped class's own _methods array).
+ *
+ * The hit counters live here (package-private) so the native side can read them
+ * back through the MethodCallVoid wrapper: vmhook's static-field resolution
+ * walks get_super(), so a field declared on this base is reachable from the
+ * subclass klass.  The interface-default counter also lives here for the same
+ * reason (an interface's own static fields are NOT on the superclass chain, and
+ * interface fields are implicitly final anyway).
+ *
+ * Java 8 syntax only.
+ */
+abstract class MethodCallVoidBase
+{
+    /** Bumped by the inherited INSTANCE void method (declared here). */
+    static volatile int voidInheritedHits;
+
+    /** Bumped by the inherited STATIC void method (declared here). */
+    static volatile int voidInheritedStaticHits;
+
+    /** Bumped by the interface DEFAULT void method (declared on the mixin but
+     *  recorded here so the subclass super-chain can reach it). */
+    static volatile int voidDefaultHits;
+
+    /** Inherited INSTANCE void: resolved through the subclass wrapper via the
+     *  superclass-chain walk in object::get_method. */
+    public void voidInheritedInstance()
+    {
+        voidInheritedHits++;
+    }
+
+    /** Inherited STATIC void: resolved through static_method() (which walks the
+     *  superclass chain and gates on the static-only flag). */
+    public static void voidInheritedStatic()
+    {
+        voidInheritedStaticHits++;
+    }
+}
+
+/**
+ * Interface implemented by {@link MethodCallVoid}, contributing a void
+ * {@code default} method.  The native side reaches it via get_method's
+ * IMPLEMENTED-INTERFACE default-method fallback (tried after the superclass
+ * chain misses), proving a void {@code default} method dispatches through the
+ * concrete wrapper.
+ *
+ * The body records into MethodCallVoidBase.voidDefaultHits (an interface cannot
+ * hold a mutable static field, and interface static fields are not on the
+ * implementor's superclass chain).
+ *
+ * Java 8 syntax only.
+ */
+interface MethodCallVoidMixin
+{
+    /** Void DEFAULT method: reached through the interface-default fallback. */
+    default void voidDefaultMethod()
+    {
+        MethodCallVoidBase.voidDefaultHits++;
+    }
 }

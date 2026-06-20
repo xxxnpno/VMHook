@@ -165,6 +165,26 @@ public class FieldString extends FieldStringBase
     // Value 日本 (U+65E5 U+672C) -> 6 UTF-8 bytes E6 97 A5 E6 9C AC.  (Field lives
     // on the base; see inheritedCjk there.)
 
+    // ----- batch-19 GET deepening: encoder-boundary EDGES the battery lacked ---
+    // U+007F (DEL) -> the LAST 1-byte ASCII code point; STILL LATIN1 (coder 0) and
+    // a SINGLE UTF-8 byte 0x7F.  Pairs with getLo80 (U+0080, first 2-byte) to nail
+    // the 1->2 byte encoder boundary from the LOW side (getLo80 covers it from the
+    // high side).  Embedded between letters so it is not a trailing-byte artifact.
+    public static String getU007F       = makeU007F();                   // 'a' DEL 'b'
+    // U+D7FF -> the LAST BMP scalar BEFORE the surrogate range (D800..DFFF); a
+    // plain 3-byte UTF-8 code point (ED 9F BF) stored UTF-16 (coder 1).  Proves a
+    // unit JUST below the surrogate block is decoded as an ordinary BMP char and
+    // is NOT mistaken for a surrogate by the pair-combining branch.
+    public static String getBeforeSurrogate = new String(new char[]{ (char) 0xD7FF });
+    // U+E000 -> the FIRST BMP scalar AFTER the surrogate range; a plain 3-byte
+    // UTF-8 code point (EE 80 80) stored UTF-16 (coder 1).  The high edge of the
+    // "ordinary BMP, not a surrogate" check (getBeforeSurrogate is the low edge).
+    public static String getAfterSurrogate  = new String(new char[]{ (char) 0xE000 });
+    // INHERITED STATIC non-ASCII String (declared only on the base): proves the
+    // static super walk on the class mirror feeds the UTF-16 decode path.  Value
+    // 語 (U+8A9E) -> 3 UTF-8 bytes E8 AA 9E.  (Field lives on the base;
+    // see sInheritedCjk there.)
+
     // Java-published facts about the GET targets (native cross-checks these).
     public static volatile int     jAsciiLen;
     public static volatile int     jLatin1Len;
@@ -202,6 +222,11 @@ public class FieldString extends FieldStringBase
     public static volatile int     jEmojiRunCpCount;    // == 100
     public static volatile int     jEmojiRunCp0;        // == 0x1F4A9
     public static volatile String  jInheritedCjkValue;  // inherited non-ASCII instance String
+    // ...for the batch-19 GET deepening edges.
+    public static volatile int     jU007FCp1;           // codePointAt(1) == 0x7F (DEL)
+    public static volatile int     jBeforeSurrogateCp0; // == 0xD7FF
+    public static volatile int     jAfterSurrogateCp0;  // == 0xE000
+    public static volatile String  jStaticInheritedCjkValue; // inherited non-ASCII static String
 
     // ================= SET targets (static) ================================
     // field_proxy::set(std::string) REBINDS the field to a freshly-built String
@@ -295,6 +320,45 @@ public class FieldString extends FieldStringBase
     public static volatile String  setReSetValue;
     public static volatile int     setReSetLen;           // == 6 ("second")
 
+    // ----- batch-19 SET deepening: encode classes the SET battery lacked -------
+    // A 3-byte BMP source (U+FFFF, max BMP) -> Java length 1, codePointAt(0)==0xFFFF.
+    // The SET battery covered 2-byte ('é'), surrogate-pair (astral) and ASCII, but
+    // not a SINGLE 3-byte UTF-8 scalar -> ONE UTF-16 unit.  vmhook re-read EF BF BF.
+    public static String setMaxBmpWrite  = freshAscii("__mbm__");
+    public static volatile String  setMaxBmpWriteValue;
+    public static volatile int     setMaxBmpWriteLen;     // == 1
+    public static volatile int     setMaxBmpWriteCp0;     // == 0xFFFF
+    // A MIXED multi-code-point source in ONE write: 'A' + U+00E9 (2-byte) + U+65E5
+    // (3-byte) + U+1F600 (4-byte astral surrogate pair) -> Java length 5 (1 ASCII +
+    // 1 Latin1 + 1 CJK + 2 surrogate units), codePointCount 4.  Proves store_string
+    // encodes a HETEROGENEOUS UTF-8 buffer (not just isolated single scalars).
+    public static String setMixedWrite   = freshAscii("__mix__");
+    public static volatile String  setMixedWriteValue;
+    public static volatile int     setMixedWriteLen;      // == 5 (UTF-16 units)
+    public static volatile int     setMixedWriteCpCount;  // == 4
+    public static volatile int     setMixedWriteCp3;      // == 0x1F600 (the astral cp)
+    // A MODEST-long ASCII source (300 'L') into a SHORT backing -> the rebind
+    // allocates ANY length, so Java sees the FULL 300 chars (no truncation to the
+    // backing).  Strengthens setOverlong ("LONGER", 6) with a length well past the
+    // old in-place backing size; heap-modest.
+    public static String setLongWrite    = freshAscii("__lng__");
+    public static volatile int     setLongWriteLen;       // == 300
+    public static volatile boolean setLongWriteAllL;      // every char == 'L'
+    // RE-ENCODE re-set: write ASCII "plain" then OVERWRITE with an astral string
+    // ("Z" + U+1F600).  The second rebind changes the compact-string CODER class
+    // (LATIN1 -> UTF-16), proving the rebind builds a brand-new String of the
+    // correct encoding each time (not a coder-stuck in-place edit).  Java sees the
+    // LAST value; codePointCount == 2, codePointAt(1) == 0x1F600.
+    public static String setReEncode     = freshAscii("__renc__");
+    public static volatile int     setReEncodeLen;        // == 3 (Z + surrogate pair)
+    public static volatile int     setReEncodeCpCount;    // == 2
+    public static volatile int     setReEncodeCp1;        // == 0x1F600
+    // INHERITED writable INSTANCE String (declared on FieldStringBase): the module
+    // rebinds it through the CHILD instance field_proxy, proving SET resolves an
+    // inherited slot via the super walk.  Write "child-wrote" -> Java sees it.
+    public static volatile String  setInheritedWritableValue;
+    public static volatile boolean setInheritedWritableMatches; // equals("child-wrote")
+
     // ================= SET target (instance) ===============================
     // Instance String field, mutated through an instance field_proxy.
     // Fresh char[] backing (see SET-target note above) so the write is isolated.
@@ -370,6 +434,13 @@ public class FieldString extends FieldStringBase
         // a TAB b LF c CR d  -- all ASCII control/print bytes, LATIN1 coder 0.
         final char[] c = { 'a', (char) 0x0009, 'b', (char) 0x000A,
                            'c', (char) 0x000D, 'd' };
+        return new String(c);
+    }
+
+    private static String makeU007F()
+    {
+        // a DEL b  -- U+007F is the last 1-byte ASCII code point; LATIN1 coder 0.
+        final char[] c = { 'a', (char) 0x007F, 'b' };
         return new String(c);
     }
 
@@ -524,6 +595,12 @@ public class FieldString extends FieldStringBase
                 jEmojiRunCp0     = getEmojiRun.codePointAt(0);    // 0x1F4A9
                 jInheritedCjkValue = self.inheritedCjk;           // inherited non-ASCII
 
+                // --- Java-observed facts about the batch-19 GET deepening edges ----
+                jU007FCp1           = getU007F.codePointAt(1);    // 0x7F (DEL)
+                jBeforeSurrogateCp0 = getBeforeSurrogate.codePointAt(0); // 0xD7FF
+                jAfterSurrogateCp0  = getAfterSurrogate.codePointAt(0);  // 0xE000
+                jStaticInheritedCjkValue = FieldStringBase.sInheritedCjk; // inherited non-ASCII static
+
                 // --- reassign getReassign to a NEW backing String.  The module
                 //     read it as "before" BEFORE the probe; a fresh field_proxy
                 //     read AFTER the probe must see this new value.  Built via
@@ -586,6 +663,31 @@ public class FieldString extends FieldStringBase
 
                 setReSetValue = setReSet;                                // "second"
                 setReSetLen   = setReSet.length();                       // 6
+
+                // --- batch-19 SET-encoding readbacks ------------------------
+                setMaxBmpWriteValue = setMaxBmpWrite;
+                setMaxBmpWriteLen   = setMaxBmpWrite.length();           // 1
+                setMaxBmpWriteCp0   = setMaxBmpWrite.isEmpty() ? -1 : setMaxBmpWrite.codePointAt(0); // 0xFFFF
+
+                setMixedWriteValue   = setMixedWrite;
+                setMixedWriteLen     = setMixedWrite.length();           // 5 (UTF-16 units)
+                setMixedWriteCpCount = setMixedWrite.codePointCount(0, setMixedWrite.length()); // 4
+                setMixedWriteCp3     = setMixedWrite.length() >= 4 ? setMixedWrite.codePointAt(3) : -1; // 0x1F600
+
+                setLongWriteLen = setLongWrite.length();                 // 300
+                boolean allL = setLongWrite.length() == 300;
+                for (int i = 0; allL && i < setLongWrite.length(); i++)
+                {
+                    if (setLongWrite.charAt(i) != 'L') { allL = false; }
+                }
+                setLongWriteAllL = allL;
+
+                setReEncodeLen     = setReEncode.length();               // 3 (Z + surrogate pair)
+                setReEncodeCpCount = setReEncode.codePointCount(0, setReEncode.length()); // 2
+                setReEncodeCp1     = setReEncode.length() >= 2 ? setReEncode.codePointAt(1) : -1; // 0x1F600
+
+                setInheritedWritableValue   = self.inheritedWritable;
+                setInheritedWritableMatches = "child-wrote".equals(self.inheritedWritable);
 
                 instCjkValue = self.instCjk;
                 instCjkLen   = self.instCjk.length();                    // 1

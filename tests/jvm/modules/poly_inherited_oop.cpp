@@ -171,6 +171,20 @@ namespace
         auto shadowed_ref() const -> std::string  { return get_field("shadowedRef")->get(); }
     };
 
+    // -- Interface-impl wrapper: registered to IfaceImpl, so get_method walks
+    //    IfaceImpl's super chain (Object) and then falls back to the implemented-
+    //    interface chain, where the DEFAULT greet() lives.  get_field walks ONLY
+    //    supers, so the interface constant KONST_FIELD is invisible here. --------
+    class poh_iface : public vmhook::object<poh_iface>
+    {
+    public:
+        explicit poh_iface(vmhook::oop_t instance) noexcept
+            : vmhook::object<poh_iface>{ instance }
+        {
+        }
+        auto own_int() const -> std::int32_t { return get_field("ownInt")->get(); }
+    };
+
     // ---- Wrapper registered to the FIXTURE class, owning the go/done
     //      handshake, the Java-side witnesses, and the held B instance. -------
     class pi_fixture : public vmhook::object<pi_fixture>
@@ -197,6 +211,12 @@ namespace
         static auto saw_shadow_sub() -> bool    { return static_field("sawShadowSub")->get(); }
         static auto saw_shadow_base() -> bool   { return static_field("sawShadowBase")->get(); }
         static auto saw_poly_concrete() -> bool { return static_field("sawPolyConcrete")->get(); }
+
+        // -- Witnesses for the polymorphic-METHOD-dispatch + interface angles --
+        static auto saw_override_dispatch() -> bool { return static_field("sawOverrideDispatch")->get(); }
+        static auto saw_base_chain_value() -> bool  { return static_field("sawBaseChainValue")->get(); }
+        static auto saw_iface_default() -> bool     { return static_field("sawIfaceDefault")->get(); }
+        static auto saw_iface_const() -> bool       { return static_field("sawIfaceConst")->get(); }
 
         // -- Published identity hash codes (exact native-oop cross-checks) --
         static auto l1_str_identity() -> std::int32_t   { return static_field("l1StrIdentity")->get(); }
@@ -231,6 +251,8 @@ namespace
         static auto get_l4_oop()     -> vmhook::oop_t { return static_ref_oop<poh_l4>("l4Instance"); }
         static auto get_shadow_oop() -> vmhook::oop_t { return static_ref_oop<poh_shadow_sub>("shadowInstance"); }
         static auto get_poly_oop()   -> vmhook::oop_t { return static_ref_oop<poh_l1>("polyBase"); }
+        static auto get_l1_plain_oop() -> vmhook::oop_t { return static_ref_oop<poh_l1>("l1Plain"); }
+        static auto get_iface_oop()    -> vmhook::oop_t { return static_ref_oop<poh_iface>("ifaceInstance"); }
     };
 
     // ---- Constants mirrored from PolyInherited.java / legacy A.java + B.java -
@@ -258,6 +280,14 @@ namespace
     // ---- Constant for the polymorphic field's concrete L4 ------------------
     constexpr std::int32_t POLY_L4_INT  { 0x0F6F0006 };   // l4Poly's l4Int
 
+    // ---- Constants for the polymorphic-METHOD-dispatch override chain -------
+    constexpr std::int32_t L1_CHAIN     { 0x11AA0001 };   // L1.chainValue() body
+    constexpr std::int32_t L4_CHAIN     { 0x44DD0004 };   // L4.chainValue() override body
+
+    // ---- Constants for the interface default method + interface constant ----
+    constexpr std::int32_t GREET_VALUE    { 0x6E710007 }; // Greeter.greet() default body
+    constexpr std::int32_t IFACE_DESCRIBE { 0x4E730008 }; // IfaceImpl.describe() override / ownInt
+
     // ---- Internal (JVM, slash-separated) class names.  javac emits the nested
     //      static classes as PolyInherited$A / PolyInherited$B (confirmed via
     //      javap), so these are the names register_class<>() and find_class()
@@ -270,6 +300,7 @@ namespace
     constexpr const char* L4_NAME      { "vmhook/fixtures/PolyInherited$L4" };
     constexpr const char* SHADOW_NAME      { "vmhook/fixtures/PolyInherited$Shadow" };
     constexpr const char* SHADOW_SUB_NAME  { "vmhook/fixtures/PolyInherited$ShadowSub" };
+    constexpr const char* IFACE_IMPL_NAME  { "vmhook/fixtures/PolyInherited$IfaceImpl" };
 
     // ---- Internal name of the runtime klass behind an oop, or "" if it can't
     //      be resolved.  Used to prove the polymorphic L1-declared field's
@@ -311,6 +342,7 @@ VMHOOK_JVM_MODULE(poly_inherited_oop)
     vmhook::register_class<poh_l4>(L4_NAME);
     vmhook::register_class<poh_shadow>(SHADOW_NAME);
     vmhook::register_class<poh_shadow_sub>(SHADOW_SUB_NAME);
+    vmhook::register_class<poh_iface>(IFACE_IMPL_NAME);
 
     // Record which dispatch path the live JDK uses for call(), for diagnostics.
     const bool call_gate_present{ vmhook::detail::find_call_stub_entry() != nullptr };
@@ -673,6 +705,219 @@ VMHOOK_JVM_MODULE(poly_inherited_oop)
     }
 
     // =====================================================================
+    //  POLYMORPHIC METHOD DISPATCH / OVERRIDE-VS-INHERITED PRECEDENCE.
+    //  chainValue() is declared on L1 and OVERRIDDEN on L4.  get_method walks
+    //  from the START klass downward through supers and returns the FIRST name
+    //  match, so an L4 wrapper resolves the L4 OVERRIDE (most-derived wins) while
+    //  a plain-L1 wrapper resolves L1's base body — the methods are physically
+    //  DIFFERENT Method* and (when the call gate is present) return DIFFERENT
+    //  values.  Resolution/identity is HARD; the CALL is gated on the call gate
+    //  (the Java witness proves the values unconditionally below).
+    // =====================================================================
+    {
+        const vmhook::oop_t l4_for_dispatch{ pi_fixture::get_l4_oop() };
+        const vmhook::oop_t l1_plain_oop{ pi_fixture::get_l1_plain_oop() };
+        ctx.check("dispatch_l4_oop_obtained", l4_for_dispatch != nullptr);
+        ctx.check("dispatch_l1_plain_oop_obtained", l1_plain_oop != nullptr);
+
+        const bool both_valid{
+            l4_for_dispatch != nullptr && vmhook::hotspot::is_valid_pointer(l4_for_dispatch)
+            && l1_plain_oop != nullptr && vmhook::hotspot::is_valid_pointer(l1_plain_oop) };
+
+        if (both_valid)
+        {
+            poh_l4 l4_view{ l4_for_dispatch };
+            poh_l1 l1_view{ l1_plain_oop };
+
+            auto via_l4{ l4_view.get_method("chainValue") };
+            auto via_l1{ l1_view.get_method("chainValue") };
+            ctx.check("override_chainValue_resolves_via_L4_view", via_l4.has_value());
+            ctx.check("base_chainValue_resolves_via_L1_view", via_l1.has_value());
+
+            if (via_l4.has_value())
+            {
+                ctx.check("override_chainValue_not_static", via_l4->is_static() == false);
+                ctx.check("override_chainValue_signature_returns_int",
+                          std::string{ via_l4->signature() } == "()I");
+            }
+            if (via_l1.has_value())
+            {
+                ctx.check("base_chainValue_not_static", via_l1->is_static() == false);
+                ctx.check("base_chainValue_signature_returns_int",
+                          std::string{ via_l1->signature() } == "()I");
+            }
+
+            // The L4 override and the L1 base are PHYSICALLY DISTINCT Method*:
+            // the start-klass-first walk latched the most-derived declaration
+            // through the L4 view and the base one through the L1 view — proving
+            // override precedence is by declared scope, not a single shared slot.
+            if (via_l4.has_value() && via_l1.has_value())
+            {
+                ctx.check("override_and_base_chainValue_distinct_methods",
+                          via_l4->raw_method() != via_l1->raw_method());
+            }
+
+            // The SAME L4 oop read through an L1 wrapper resolves L1's BASE body,
+            // NOT the L4 override: get_method starts at the wrapper's REGISTERED
+            // klass (typeid(*this)), and an L4 oop wrapped as L1 starts the walk
+            // at L1 — so the START KLASS (the wrapper type), not the oop's runtime
+            // type, picks the Method*.  Same start klass over different oops ->
+            // same Method*; same oop with a deeper start klass -> the override.
+            // (Resolution/identity HARD; the wrapper-type-drives-the-walk
+            // invariant, distinct from Java's runtime virtual dispatch.)
+            {
+                poh_l1 l4_as_l1{ l4_for_dispatch };           // L4 oop, L1 start klass
+                auto via_l4_as_l1{ l4_as_l1.get_method("chainValue") };
+                ctx.check("override_chainValue_L4_oop_as_L1_resolves",
+                          via_l4_as_l1.has_value());
+                if (via_l4_as_l1.has_value() && via_l1.has_value())
+                {
+                    // Same start klass (L1) over different oops -> same Method*.
+                    ctx.check("chainValue_L1_start_klass_same_method_any_oop",
+                              via_l4_as_l1->raw_method() == via_l1->raw_method());
+                }
+                if (via_l4_as_l1.has_value() && via_l4.has_value())
+                {
+                    // L1-start (base body) vs L4-start (override) on the SAME oop
+                    // are DIFFERENT Method* — the start klass, not the oop, picks.
+                    ctx.check("chainValue_start_klass_picks_method_not_oop",
+                              via_l4_as_l1->raw_method() != via_l4->raw_method());
+                }
+            }
+
+            // CALL is best-effort (needs the call gate): the L4 view returns the
+            // override body L4_CHAIN, the L1 view the base body L1_CHAIN.
+            if (call_gate_present && via_l4.has_value() && via_l1.has_value())
+            {
+                const std::int32_t r4 = via_l4->call();        // COPY-init
+                const std::int32_t r1 = via_l1->call();        // COPY-init
+                ctx.check("override_chainValue_call_returns_L4_body",
+                          r4 == L4_CHAIN);
+                ctx.check("base_chainValue_call_returns_L1_body",
+                          r1 == L1_CHAIN);
+                ctx.check("override_and_base_chainValue_differ", r4 != r1);
+            }
+            else if (!call_gate_present)
+            {
+                ctx.record("[INFO] poly_inherited_oop: chainValue() override/base "
+                           "calls skipped (call_stub_entry absent); method identity "
+                           "+ the Java witness are the verified limit");
+            }
+        }
+    }
+
+    // =====================================================================
+    //  INTERFACE DEFAULT METHOD vs INTERFACE CONSTANT — the resolution
+    //  asymmetry between get_method (walks supers THEN implemented interfaces)
+    //  and get_field (walks supers ONLY).  IfaceImpl implements Greeter (default
+    //  greet, abstract describe, static helper) and Konst (constant KONST_FIELD).
+    //   * greet()  : DEFAULT method, found via the interface fallback;
+    //   * describe(): ABSTRACT on the interface, resolves the CLASS override;
+    //   * helper() : STATIC interface helper, NOT a default -> not resolved;
+    //   * KONST_FIELD: interface constant, NOT walked by find_field -> nullopt;
+    //   * ownInt   : the impl's OWN instance field, resolves at depth 0.
+    // =====================================================================
+    const vmhook::oop_t iface_oop{ pi_fixture::get_iface_oop() };
+    ctx.check("iface_instance_oop_obtained", iface_oop != nullptr);
+    if (iface_oop != nullptr && vmhook::hotspot::is_valid_pointer(iface_oop))
+    {
+        poh_iface impl_view{ iface_oop };
+
+        // -- OWN instance field still resolves at depth 0 (sanity anchor). ----
+        ctx.check("iface_impl_own_field_resolves",
+                  impl_view.get_field("ownInt").has_value());
+        ctx.check("iface_impl_own_field_value",
+                  impl_view.own_int() == IFACE_DESCRIBE);
+
+        // -- DEFAULT interface method greet() found via the interface fallback
+        //    even though neither IfaceImpl nor any superclass declares it.  The
+        //    fallback depends on the implemented-interface VMStructs being
+        //    exported (get_interfaces_ptr / safe_interface_methods); on a JDK
+        //    that does NOT export them find_interface_default_method fails CLOSED
+        //    and greet() resolves to nullopt.  So FINDABILITY is gated [INFO]
+        //    (JDK-variant), but WHEN found the shape is HARD, and the wrong-sig
+        //    MISS is HARD either way (nullopt regardless of the fallback).  The
+        //    Java witness (real invokeinterface) proves the semantics
+        //    unconditionally below.
+        {
+            auto greet{ impl_view.get_method("greet") };
+            if (greet.has_value())
+            {
+                ctx.record("[INFO] poly_inherited_oop: interface DEFAULT greet() "
+                           "resolved via the implemented-interface fallback on this JDK");
+                ctx.check("iface_default_greet_not_static", greet->is_static() == false);
+                ctx.check("iface_default_greet_signature_returns_int",
+                          std::string{ greet->signature() } == "()I");
+
+                // Name+signature overload resolves the same default under "()I".
+                auto greet_sig{ impl_view.get_method("greet", "()I") };
+                ctx.check("iface_default_greet_name_sig_resolves", greet_sig.has_value());
+
+                // CALL best-effort (gated on the call gate): body returns GREET_VALUE.
+                if (call_gate_present)
+                {
+                    const std::int32_t gv = greet->call();     // COPY-init
+                    ctx.check("iface_default_greet_call_returns_value",
+                              gv == GREET_VALUE);
+                }
+            }
+            else
+            {
+                ctx.record("[INFO] poly_inherited_oop: interface DEFAULT greet() not "
+                           "resolved (implemented-interface VMStructs absent on this "
+                           "JDK); Java invokeinterface witness is the verified limit");
+            }
+
+            // A correct name but a non-existent descriptor must NOT resolve under
+            // the exact-match overload — HARD regardless of the interface fallback
+            // (the fallback also honours the signature filter, so a wrong "(I)I"
+            // never matches greet's "()I").
+            ctx.check("iface_default_greet_wrong_sig_nullopt",
+                      impl_view.get_method("greet", "(I)I").has_value() == false);
+        }
+
+        // -- ABSTRACT interface method describe(): the interface declaration has
+        //    no body, so the CLASS override is what resolves (via the superclass
+        //    walk, before the interface fallback is even consulted). ------------
+        {
+            auto describe{ impl_view.get_method("describe") };
+            ctx.check("iface_abstract_describe_resolves_class_override",
+                      describe.has_value());
+            if (describe.has_value())
+            {
+                ctx.check("iface_abstract_describe_not_static",
+                          describe->is_static() == false);
+                ctx.check("iface_abstract_describe_signature_returns_int",
+                          std::string{ describe->signature() } == "()I");
+                if (call_gate_present)
+                {
+                    const std::int32_t dv = describe->call(); // COPY-init
+                    ctx.check("iface_abstract_describe_call_returns_override",
+                              dv == IFACE_DESCRIBE);
+                }
+            }
+        }
+
+        // -- STATIC interface helper() is NOT a default method: the interface
+        //    fallback's default-only gate skips it, so an instance get_method
+        //    must NOT return it.  (Negative: clean nullopt, not a crash.) -------
+        ctx.check("iface_static_helper_not_resolved_as_instance_method",
+                  impl_view.get_method("helper").has_value() == false);
+
+        // -- INTERFACE CONSTANT KONST_FIELD: find_field walks ONLY the
+        //    superclass chain (never interfaces), so the constant is invisible
+        //    to an instance get_field -> nullopt.  This is the deliberate
+        //    asymmetry vs get_method's interface fallback above. -----------------
+        ctx.check("iface_constant_field_not_visible_to_get_field",
+                  impl_view.get_field("KONST_FIELD").has_value() == false);
+
+        // -- A name absent from IfaceImpl, its supers, AND its interfaces still
+        //    returns nullopt for get_method (full walk + interface fallback). ---
+        ctx.check("iface_absent_method_nullopt",
+                  impl_view.get_method("noSuchInterfaceMethod").has_value() == false);
+    }
+
+    // =====================================================================
     //  POLYMORPHIC ACTUAL TYPE.  polyBase is DECLARED as the base type L1 but
     //  HOLDS an L4 at runtime.  The native decode must yield the CONCRETE L4
     //  oop (runtime klass L4, never L1), and an L4 wrapper over that oop must
@@ -799,6 +1044,20 @@ VMHOOK_JVM_MODULE(poly_inherited_oop)
                       pi_fixture::saw_shadow_base());
             ctx.check("java_saw_poly_concrete_L4_runtime_type",
                       pi_fixture::saw_poly_concrete());
+
+            // ---- Polymorphic-method-dispatch + interface witnesses.  Java's own
+            //      invokevirtual / invokeinterface runs on the Java thread (no
+            //      native call gate), so these are asserted UNCONDITIONALLY — they
+            //      prove the override / default-method SEMANTICS even on JDKs where
+            //      the native chainValue()/greet() calls above were skipped. -------
+            ctx.check("java_saw_override_dispatch_L4_chainValue",
+                      pi_fixture::saw_override_dispatch());
+            ctx.check("java_saw_base_chainValue_L1_body",
+                      pi_fixture::saw_base_chain_value());
+            ctx.check("java_saw_iface_default_greet_and_describe",
+                      pi_fixture::saw_iface_default());
+            ctx.check("java_saw_iface_constant_field",
+                      pi_fixture::saw_iface_const());
 
             // ---- Identity-hash publishers: the probe latched System.identity
             //      HashCode of each inherited reference target.  A non-zero value

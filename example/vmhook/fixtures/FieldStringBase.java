@@ -42,11 +42,24 @@ class FieldStringBase
     // same super walk on the java.lang.Class mirror through the child wrapper.
     public static String sInheritedStr = "base-static-inherited";
 
+    // Inherited STATIC String with NON-ASCII (CJK) content, declared ONLY on the
+    // base.  Proves the super walk on the class mirror feeds the UTF-16 decode
+    // path (sInheritedStr above is pure ASCII).  Value 語 (U+8A9E, the third kanji
+    // of 日本語) -> 3 UTF-8 bytes E8 AA 9E; built from a char[] -> private backing.
+    public static String sInheritedCjk = new String(new char[]{ (char) 0x8A9E });
+
+    // Inherited writable INSTANCE String, declared ONLY on the base.  The child's
+    // instance field_proxy::set() rebinds it via the super walk, proving SET (not
+    // just GET) resolves an inherited slot.  Built from a char[] -> private
+    // backing so the rebind cannot disturb a shared literal.
+    public String inheritedWritable = new String("base-writable".toCharArray());
+
     // Touch the static so javac never warns it unused and it is guaranteed to
     // be present (and class-initialized) in the layout.
     String describe()
     {
         return this.inheritedStr + "/" + FieldStringBase.sInheritedStr
-                + "/" + this.inheritedCjk;
+                + "/" + this.inheritedCjk + "/" + FieldStringBase.sInheritedCjk
+                + "/" + this.inheritedWritable;
     }
 }

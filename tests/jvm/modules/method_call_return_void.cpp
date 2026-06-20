@@ -153,6 +153,26 @@ namespace
         static auto mixed_ref_obj_identity() -> std::int32_t { return static_field("mixedRefObjIdentity")->get(); }
         static auto mixed_ref_int()          -> std::int32_t { return static_field("mixedRefInt")->get(); }
         static auto mixed_ref_str_len()      -> std::int32_t { return static_field("mixedRefStrLen")->get(); }
+
+        // -- INHERITED instance / static void (declared on MethodCallVoidBase,
+        //    read back through the subclass wrapper via the super-chain walk) --
+        static auto void_inherited_hits()        -> std::int32_t { return static_field("voidInheritedHits")->get(); }
+        static auto void_inherited_static_hits() -> std::int32_t { return static_field("voidInheritedStaticHits")->get(); }
+
+        // -- INTERFACE-DEFAULT void (recorded on the base for super-chain reach) --
+        static auto void_default_hits() -> std::int32_t { return static_field("voidDefaultHits")->get(); }
+
+        // -- interleaved mixed-width void args (int, long, int, double) --
+        static auto interleaved_called() -> bool         { return static_field("interleavedCalled")->get(); }
+        static auto interleaved_int1()   -> std::int32_t { return static_field("interleavedInt1")->get(); }
+        static auto interleaved_long()   -> std::int64_t { return static_field("interleavedLong")->get(); }
+        static auto interleaved_int2()   -> std::int32_t { return static_field("interleavedInt2")->get(); }
+        static auto interleaved_double() -> double       { return static_field("interleavedDouble")->get(); }
+
+        // -- mixed floating-point void args (float + double) --
+        static auto mixed_fp_called() -> bool   { return static_field("mixedFpCalled")->get(); }
+        static auto mixed_fp_float()  -> float  { return static_field("mixedFpFloat")->get(); }
+        static auto mixed_fp_double() -> double { return static_field("mixedFpDouble")->get(); }
     };
 
     // ------------------------------------------------------------------
@@ -226,6 +246,19 @@ namespace
     std::atomic<int> g_void_wide_is_void{ -1 };
     std::atomic<int> g_void_mixed_is_void{ -1 };
 
+    // is_void() for the INHERITED (instance + static, via static_method AND via
+    // the instance wrapper) and INTERFACE-DEFAULT void scenarios — a void method
+    // NOT declared on the wrapped class itself must still dispatch (super-chain /
+    // interface-default resolution) and report void.
+    std::atomic<int> g_void_inherited_inst_is_void{ -1 };
+    std::atomic<int> g_void_inherited_static_is_void{ -1 };
+    std::atomic<int> g_void_inherited_static_via_inst_is_void{ -1 };
+    std::atomic<int> g_void_default_is_void{ -1 };
+
+    // is_void() for the interleaved mixed-width and mixed-FP arg void scenarios.
+    std::atomic<int> g_void_interleaved_is_void{ -1 };
+    std::atomic<int> g_void_mixed_fp_is_void{ -1 };
+
     // A value-returning call issued IMMEDIATELY after a throwing void call, to
     // prove the surfaced-and-cleared exception left the thread clean enough for
     // the next dispatch to succeed (the strongest non-corruption witness).
@@ -298,6 +331,18 @@ namespace
     // Mixed ref + primitive + String sentinels.
     constexpr std::int32_t k_mixed_int    = static_cast<std::int32_t>(0x13572468); // 324470888
     const std::string      k_mixed_str    = "mixed-ref-void-arg";
+
+    // Interleaved mixed-width sentinels (int, long, int, double): the slot index
+    // must advance 1,2,1,2.  Distinct bit patterns so a slot mis-count corrupts a
+    // detectable arg.  The SECOND int specifically follows a wide (long) arg.
+    constexpr std::int32_t k_inter_int1   = static_cast<std::int32_t>(0x0A0B0C0D); // 168496141
+    constexpr std::int64_t k_inter_long   = static_cast<std::int64_t>(0x7766554433221100LL);
+    constexpr std::int32_t k_inter_int2   = static_cast<std::int32_t>(0x7EADBEEF); // distinct, +ve high bit clear
+    constexpr double       k_inter_double = 1.6180339887498949;  // golden ratio
+
+    // Mixed floating-point sentinels (float + double in one call).
+    constexpr float        k_mixed_fp_f   = -1.4142135f;         // -sqrt(2), single
+    constexpr double       k_mixed_fp_d   = 2.718281828459045;   // e, double
 }
 
 VMHOOK_JVM_MODULE(method_call_return_void)
@@ -661,6 +706,85 @@ VMHOOK_JVM_MODULE(method_call_return_void)
                     }
                 }
 
+                // ---- INHERITED instance void (declared on the base class) ----
+                // get_method walks the SUPERCLASS chain, so a void method the
+                // wrapped class does NOT itself declare must still resolve and
+                // dispatch.  Proves a void call reaches an inherited body.
+                {
+                    auto proxy{ self->get_method("voidInheritedInstance") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_void_inherited_inst_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- INHERITED static void (declared on the base class) ----
+                // static_method() walks the superclass chain (gated on the
+                // static-only flag); a static void NOT on the wrapped class must
+                // still resolve.  Called both via static_method() (null receiver)
+                // and via the instance wrapper (receiver bound but is_static()
+                // omits the slot) — both must report void and run the body.
+                {
+                    auto proxy{ method_call_void::static_method("voidInheritedStatic") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_void_inherited_static_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+                {
+                    auto proxy{ self->get_method("voidInheritedStatic") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_void_inherited_static_via_inst_is_void.store(v.is_void() ? 1 : 0,
+                                                                       std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- INTERFACE-DEFAULT void (declared on the mixin interface) -
+                // get_method's superclass walk misses (the method is on an
+                // implemented interface, not the class hierarchy), so the
+                // implemented-interface DEFAULT-method fallback must find it; the
+                // void `default` body then dispatches through the concrete wrapper.
+                {
+                    auto proxy{ self->get_method("voidDefaultMethod") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_void_default_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with INTERLEAVED mixed-width args (I, J, I, D) ----
+                // Slots advance 1,2,1,2: the second int sits AFTER a wide (long)
+                // arg and the double AFTER that int, so a running-slot-index fault
+                // would corrupt an arg that the adjacent-wide voidWideOnly test
+                // cannot catch.  Each arg is read back verbatim later.
+                {
+                    auto proxy{ self->get_method("voidInterleaved") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{
+                            proxy->call(k_inter_int1, k_inter_long, k_inter_int2, k_inter_double) };
+                        g_void_interleaved_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- void with MIXED floating-point widths (F, D) ----
+                // float (1 slot) and double (2 slots) marshalled together; the
+                // existing tests cover each FP width only in isolation.
+                {
+                    auto proxy{ self->get_method("voidMixedFp") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{
+                            proxy->call(k_mixed_fp_f, k_mixed_fp_d) };
+                        g_void_mixed_fp_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
                 // ---- CONTRAST: int returner — is_void() FALSE, value correct ----
                 {
                     auto proxy{ self->get_method("retInt") };
@@ -895,6 +1019,67 @@ VMHOOK_JVM_MODULE(method_call_return_void)
         ctx.check("mcrv_void_repeat_all_void", g_void_repeat_all_void.load() == 1);
         ctx.check("mcrv_void_repeat_count_exact",
                   method_call_void::void_repeat_hits() == k_repeat_calls);
+
+        // =====================================================================
+        //  INHERITED instance void (declared on MethodCallVoidBase)
+        // =====================================================================
+        // A void method the wrapped class does NOT itself declare must still
+        // dispatch through the subclass wrapper via the superclass-chain walk.
+        ctx.check("mcrv_void_inherited_instance_is_void",
+                  g_void_inherited_inst_is_void.load() == 1);
+        // Side effect: >= 1 (not an exact count — a probe re-entry would bump it
+        // again, and BANKED RULE forbids hard-asserting an exact fire count).
+        ctx.check("mcrv_void_inherited_instance_side_effect",
+                  method_call_void::void_inherited_hits() >= 1);
+
+        // =====================================================================
+        //  INHERITED static void (declared on MethodCallVoidBase)
+        // =====================================================================
+        // Resolved via static_method() (null receiver) AND via the instance
+        // wrapper (receiver bound, is_static() omits the slot) — both report void.
+        ctx.check("mcrv_void_inherited_static_is_void",
+                  g_void_inherited_static_is_void.load() == 1);
+        ctx.check("mcrv_void_inherited_static_via_instance_is_void",
+                  g_void_inherited_static_via_inst_is_void.load() == 1);
+        // Two static dispatches ran, so >= 2 here; assert the weaker >= 1 to stay
+        // robust to probe re-entry per the banked exact-count rule.
+        ctx.check("mcrv_void_inherited_static_side_effect",
+                  method_call_void::void_inherited_static_hits() >= 1);
+
+        // =====================================================================
+        //  INTERFACE-DEFAULT void (declared on MethodCallVoidMixin)
+        // =====================================================================
+        // Reached via get_method's implemented-interface DEFAULT-method fallback
+        // (after the superclass chain misses); the void default body dispatches.
+        ctx.check("mcrv_void_default_is_void", g_void_default_is_void.load() == 1);
+        ctx.check("mcrv_void_default_side_effect",
+                  method_call_void::void_default_hits() >= 1);
+
+        // =====================================================================
+        //  void with INTERLEAVED mixed-width args (int, long, int, double)
+        // =====================================================================
+        ctx.check("mcrv_void_interleaved_is_void", g_void_interleaved_is_void.load() == 1);
+        ctx.check("mcrv_void_interleaved_called", method_call_void::interleaved_called());
+        // Each arg verbatim — the second int (after the wide long) and the double
+        // (after that int) are the slots a running-index fault would corrupt.
+        ctx.check("mcrv_void_interleaved_int1",
+                  method_call_void::interleaved_int1() == k_inter_int1);
+        ctx.check("mcrv_void_interleaved_long",
+                  method_call_void::interleaved_long() == k_inter_long);
+        ctx.check("mcrv_void_interleaved_int2",
+                  method_call_void::interleaved_int2() == k_inter_int2);
+        ctx.check("mcrv_void_interleaved_double",
+                  method_call_void::interleaved_double() == k_inter_double);
+
+        // =====================================================================
+        //  void with MIXED floating-point widths (float + double)
+        // =====================================================================
+        ctx.check("mcrv_void_mixed_fp_is_void", g_void_mixed_fp_is_void.load() == 1);
+        ctx.check("mcrv_void_mixed_fp_called", method_call_void::mixed_fp_called());
+        ctx.check("mcrv_void_mixed_fp_float",
+                  method_call_void::mixed_fp_float() == k_mixed_fp_f);
+        ctx.check("mcrv_void_mixed_fp_double",
+                  method_call_void::mixed_fp_double() == k_mixed_fp_d);
 
         // =====================================================================
         //  CONTRAST: an int return must NOT be reported as void or string

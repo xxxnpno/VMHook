@@ -259,6 +259,12 @@ public final class EnumSingleton
     public static volatile int     colorValuesLen;        // Color.values().length == 3
     public static volatile boolean valueOfGreenIsGreen;   // Color.valueOf("GREEN") == GREEN
     public static volatile int     valueOfBlueIdentity;   // id of Color.valueOf("BLUE")
+    // values() returns a FRESH defensive copy (a distinct array each call) whose
+    // ELEMENTS are still the canonical singletons — the enum array-copy contract.
+    public static volatile boolean colorValuesFreshCopy;          // values() != values()
+    public static volatile boolean colorValuesElemStableSingleton;// values()[1] == GREEN
+    // valueOf's NEGATIVE path: an unknown name throws IllegalArgumentException.
+    public static volatile boolean colorValueOfBadNameThrew;      // Color.valueOf("NOPE") throws
 
     // ---- Per-constant name()/ordinal() witnesses (so name/ordinal reads are
     //      cross-checked against the JVM's own values) ----
@@ -273,6 +279,7 @@ public final class EnumSingleton
     public static volatile String  plusLabelSeen;         // PLUS.label() == "op:+"
     public static volatile String  timesLabelSeen;        // TIMES.label() == "op:*"
     public static volatile boolean valueOfPlusIsPlus;     // Op.valueOf("PLUS") == PLUS
+    public static volatile boolean opValueOfBadNameThrew; // Op.valueOf("NOPE") throws
     public static volatile int     plusOrdinal;           // == 0
     public static volatile int     timesOrdinal;          // == 1
     public static volatile int     plusIdentity;          // id of Op.PLUS
@@ -307,9 +314,12 @@ public final class EnumSingleton
     //      native side has no wrapper, so contents are proven Java-side) ------
     public static volatile int     colorNamesSize;        // COLOR_NAMES.size() == 3
     public static volatile String  colorNamesGreen;       // COLOR_NAMES.get(GREEN) == "g"
+    public static volatile String  colorNamesRed;         // COLOR_NAMES.get(RED)   == "r"
+    public static volatile String  colorNamesBlue;        // COLOR_NAMES.get(BLUE)  == "b"
     public static volatile String  colorNamesClassName;   // COLOR_NAMES.getClass().getName()
     public static volatile int     warmColorsSize;        // WARM_COLORS.size() == 1
     public static volatile boolean warmColorsHasRed;      // WARM_COLORS.contains(RED)
+    public static volatile boolean warmColorsHasGreen;    // WARM_COLORS.contains(GREEN) == false
     public static volatile boolean warmColorsHasBlue;     // WARM_COLORS.contains(BLUE) == false
     public static volatile String  warmColorsClassName;   // WARM_COLORS.getClass().getName()
 
@@ -363,6 +373,21 @@ public final class EnumSingleton
                 EnumSingleton.colorValuesLen      = Color.values().length;
                 EnumSingleton.valueOfGreenIsGreen = Color.valueOf("GREEN") == Color.GREEN;
                 EnumSingleton.valueOfBlueIdentity = System.identityHashCode(Color.valueOf("BLUE"));
+                // values() hands back a fresh copy each call, but the elements ARE
+                // the canonical singletons (array-copy contract, element identity).
+                EnumSingleton.colorValuesFreshCopy           = Color.values() != Color.values();
+                EnumSingleton.colorValuesElemStableSingleton = Color.values()[1] == Color.GREEN;
+                // valueOf negative path: an unknown name must throw.
+                boolean colorBadThrew = false;
+                try
+                {
+                    Color.valueOf("NOPE");
+                }
+                catch (final IllegalArgumentException expected)
+                {
+                    colorBadThrew = true;
+                }
+                EnumSingleton.colorValueOfBadNameThrew = colorBadThrew;
                 EnumSingleton.redOrdinal          = Color.RED.ordinal();
                 EnumSingleton.greenOrdinal        = Color.GREEN.ordinal();
                 EnumSingleton.blueOrdinal         = Color.BLUE.ordinal();
@@ -375,6 +400,16 @@ public final class EnumSingleton
                 EnumSingleton.plusLabelSeen    = Op.PLUS.label();
                 EnumSingleton.timesLabelSeen   = Op.TIMES.label();
                 EnumSingleton.valueOfPlusIsPlus = Op.valueOf("PLUS") == Op.PLUS;
+                boolean opBadThrew = false;
+                try
+                {
+                    Op.valueOf("NOPE");
+                }
+                catch (final IllegalArgumentException expected)
+                {
+                    opBadThrew = true;
+                }
+                EnumSingleton.opValueOfBadNameThrew = opBadThrew;
                 EnumSingleton.plusOrdinal      = Op.PLUS.ordinal();
                 EnumSingleton.timesOrdinal     = Op.TIMES.ordinal();
                 EnumSingleton.plusIdentity     = System.identityHashCode(Op.PLUS);
@@ -411,9 +446,12 @@ public final class EnumSingleton
                 // EnumMap / EnumSet keyed on Color — contents proven Java-side.
                 EnumSingleton.colorNamesSize      = COLOR_NAMES.size();
                 EnumSingleton.colorNamesGreen     = COLOR_NAMES.get(Color.GREEN);
+                EnumSingleton.colorNamesRed       = COLOR_NAMES.get(Color.RED);
+                EnumSingleton.colorNamesBlue      = COLOR_NAMES.get(Color.BLUE);
                 EnumSingleton.colorNamesClassName = COLOR_NAMES.getClass().getName();
                 EnumSingleton.warmColorsSize      = WARM_COLORS.size();
                 EnumSingleton.warmColorsHasRed    = WARM_COLORS.contains(Color.RED);
+                EnumSingleton.warmColorsHasGreen  = WARM_COLORS.contains(Color.GREEN);
                 EnumSingleton.warmColorsHasBlue   = WARM_COLORS.contains(Color.BLUE);
                 EnumSingleton.warmColorsClassName = WARM_COLORS.getClass().getName();
 

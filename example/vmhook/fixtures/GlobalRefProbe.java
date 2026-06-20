@@ -30,8 +30,12 @@ import vmhook.Harness;
  *   2 = survive-GC phase.  Force System.gc() several times (a relocating
  *       young/full collection may move the still-pinned object), THEN dispatch
  *       trigger() again so the native detour — now running post-GC on a live
- *       JavaThread — re-reads the sentinel through the SAME pin's .oop() and
- *       finally releases it.
+ *       JavaThread — re-reads BOTH the primitive sentinel AND the embedded `tag`
+ *       object reference through the SAME pin's .oop(), confirms the pin's raw
+ *       handle is byte-identical pre/post-GC (a relocating collector moves the
+ *       slot contents, never the handle), and finally releases it.  The handle
+ *       check holds across every collector; the live-oop re-reads are gated
+ *       native-side on the post-GC address being safely re-derivable.
  *
  * Java 8 syntax only (anonymous Probe class; no var/lambda/switch-expr).
  */
@@ -69,6 +73,14 @@ public final class GlobalRefProbe
      * constructor to a fixed, sentinel-independent constant so the native module
      * can assert it byte-for-byte via read_java_string(.oop()-derived field).
      * The ()V path leaves it null, which the native null-payload check relies on.
+     *
+     * Read back TWICE by the native module: once pre-GC in phase 1 (proving the
+     * fresh pin chases an object reference) and again post-GC in phase 2 (proving
+     * the embedded OBJECT reference — not merely the primitive sentinel — survives
+     * a relocating collection through the SAME global ref).  Both reads compare
+     * against {@link #TAG_VALUE}; the post-GC read is gated native-side on the oop
+     * being safely re-derivable (a relocating G1 may leave it non-dereferenceable,
+     * which the native module records as informational rather than asserting).
      */
     public String tag;
 

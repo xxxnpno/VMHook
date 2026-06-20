@@ -1341,6 +1341,380 @@ namespace
     }
 
     // =====================================================================
+    //  12c. INHERITED FIELD WRITES.  The bs*/bi* fields are declared on
+    //       FieldPrimitivesSetBase, NOT on FieldPrimitivesSet, but the native
+    //       side writes them through the SUBCLASS wrapper (static_field("bsI"),
+    //       inst->get_field("biI")).  field_proxy::set() must resolve the slot by
+    //       walking the superclass chain (vmhook::find_field's super walk) and
+    //       land the value at the inherited offset.  Each field starts at the
+    //       base sentinel 0xB5...; we drive the full boundary matrix per width,
+    //       native re-read bit-exact + correct variant alternative, then leave a
+    //       DOCUMENTED final that phase 13b (snapshot) and phase 16b (getters)
+    //       observe Java-side.  This is the SET mirror's inheritance authority --
+    //       no sibling exercises set() into a field the wrapper does not declare.
+    //
+    //       Inherited finals (last write):
+    //         bsZ=true bsB=0x6B bsS=0x6BBB bsC=0x6BCC bsI=0x6B12C3D4
+    //         bsJ=0x6B11223344556677 bsF=2.5f bsD=0.5
+    //         biZ=true biB=0x7D biS=0x7DDD biC=0x4E2D biI=0x7D55AA33
+    //         biJ=0x7D8899AABBCCDDEE biF=-1.0f biD=-2.0
+    // =====================================================================
+    {
+        // -- inherited STATIC, one explicit per-width round-trip (boundary +
+        //    final), resolved through the subclass static_field on bs* names. ----
+        if (const auto p{ fps::static_field("bsZ") })
+        {
+            p->set(false);
+            ctx.check("inh_bsZ_variant", p->get().data.index() == kIdxBool);
+            ctx.check("inh_bsZ_false", fps::get_bool("bsZ") == false);
+            p->set(true); // final
+            ctx.check("inh_bsZ_final_true", fps::get_bool("bsZ") == true);
+        }
+        else { ctx.check("inh_bsZ_resolves", false); }
+
+        if (const auto p{ fps::static_field("bsB") })
+        {
+            p->set(static_cast<std::int8_t>(std::numeric_limits<std::int8_t>::min()));
+            ctx.check("inh_bsB_min", fps::get_i8("bsB") == std::numeric_limits<std::int8_t>::min());
+            p->set(static_cast<std::int8_t>(std::numeric_limits<std::int8_t>::max()));
+            ctx.check("inh_bsB_max", fps::get_i8("bsB") == std::numeric_limits<std::int8_t>::max());
+            p->set(static_cast<std::int8_t>(0x6B)); // final
+            ctx.check("inh_bsB_variant", p->get().data.index() == kIdxI8);
+            ctx.check("inh_bsB_final", fps::get_i8("bsB") == static_cast<std::int8_t>(0x6B));
+        }
+        else { ctx.check("inh_bsB_resolves", false); }
+
+        if (const auto p{ fps::static_field("bsS") })
+        {
+            p->set(static_cast<std::int16_t>(std::numeric_limits<std::int16_t>::min()));
+            ctx.check("inh_bsS_min", fps::get_i16("bsS") == std::numeric_limits<std::int16_t>::min());
+            p->set(static_cast<std::int16_t>(0x6BBB)); // final
+            ctx.check("inh_bsS_variant", p->get().data.index() == kIdxI16);
+            ctx.check("inh_bsS_final", fps::get_i16("bsS") == static_cast<std::int16_t>(0x6BBB));
+        }
+        else { ctx.check("inh_bsS_resolves", false); }
+
+        if (const auto p{ fps::static_field("bsC") })
+        {
+            p->set(static_cast<std::uint16_t>(0x0000));
+            ctx.check("inh_bsC_zero", fps::get_u16("bsC") == 0x0000);
+            p->set(static_cast<std::uint16_t>(0xFFFF));
+            ctx.check("inh_bsC_max", fps::get_u16("bsC") == 0xFFFF);
+            p->set(static_cast<std::uint16_t>(0x6BCC)); // final
+            ctx.check("inh_bsC_variant", p->get().data.index() == kIdxU16);
+            ctx.check("inh_bsC_final", fps::get_u16("bsC") == 0x6BCC);
+        }
+        else { ctx.check("inh_bsC_resolves", false); }
+
+        if (const auto p{ fps::static_field("bsI") })
+        {
+            p->set(std::numeric_limits<std::int32_t>::min());
+            ctx.check("inh_bsI_min", fps::get_i32("bsI") == std::numeric_limits<std::int32_t>::min());
+            p->set(static_cast<std::int32_t>(0x6B12C3D4)); // final
+            ctx.check("inh_bsI_variant", p->get().data.index() == kIdxI32);
+            ctx.check("inh_bsI_final", fps::get_i32("bsI") == 0x6B12C3D4);
+        }
+        else { ctx.check("inh_bsI_resolves", false); }
+
+        if (const auto p{ fps::static_field("bsJ") })
+        {
+            p->set(std::numeric_limits<std::int64_t>::min());
+            ctx.check("inh_bsJ_min", fps::get_i64("bsJ") == std::numeric_limits<std::int64_t>::min());
+            p->set(static_cast<std::int64_t>(0x6B11223344556677LL)); // final
+            ctx.check("inh_bsJ_variant", p->get().data.index() == kIdxI64);
+            ctx.check("inh_bsJ_final", fps::get_i64("bsJ") == 0x6B11223344556677LL);
+        }
+        else { ctx.check("inh_bsJ_resolves", false); }
+
+        if (const auto p{ fps::static_field("bsF") })
+        {
+            p->set(bits_to_float(0x7FC00000)); // canonical NaN round-trip
+            ctx.check("inh_bsF_nan", float_bits(fps::get_float("bsF")) == 0x7FC00000u);
+            p->set(2.5F); // final
+            ctx.check("inh_bsF_variant", p->get().data.index() == kIdxFloat);
+            ctx.check("inh_bsF_final", float_bits(fps::get_float("bsF")) == 0x40200000u);
+        }
+        else { ctx.check("inh_bsF_resolves", false); }
+
+        if (const auto p{ fps::static_field("bsD") })
+        {
+            p->set(bits_to_double(0x7FF0000000000000ULL)); // +Inf round-trip
+            ctx.check("inh_bsD_posinf", double_bits(fps::get_double("bsD")) == 0x7FF0000000000000ULL);
+            p->set(0.5); // final
+            ctx.check("inh_bsD_variant", p->get().data.index() == kIdxDouble);
+            ctx.check("inh_bsD_final", double_bits(fps::get_double("bsD")) == 0x3FE0000000000000ULL);
+        }
+        else { ctx.check("inh_bsD_resolves", false); }
+
+        // -- inherited INSTANCE, resolved through the subclass instance wrapper
+        //    on bi* names (super-chain offset for a real subclass object). -------
+        if (inst)
+        {
+            if (auto p{ inst->get_field("biZ") }; p.has_value())
+            {
+                p->set(false);
+                ctx.check("inh_biZ_false", static_cast<bool>(p->get()) == false);
+                p->set(true); // final
+                ctx.check("inh_biZ_variant", p->get().data.index() == kIdxBool);
+                ctx.check("inh_biZ_final_true", static_cast<bool>(p->get()) == true);
+            }
+            else { ctx.check("inh_biZ_resolves", false); }
+
+            if (auto p{ inst->get_field("biB") }; p.has_value())
+            {
+                p->set(static_cast<std::int8_t>(0xFF)); // -1
+                ctx.check("inh_biB_negone", static_cast<std::int8_t>(p->get()) == static_cast<std::int8_t>(-1));
+                p->set(static_cast<std::int8_t>(0x7D)); // final
+                ctx.check("inh_biB_variant", p->get().data.index() == kIdxI8);
+                ctx.check("inh_biB_final", static_cast<std::int8_t>(p->get()) == static_cast<std::int8_t>(0x7D));
+            }
+            else { ctx.check("inh_biB_resolves", false); }
+
+            if (auto p{ inst->get_field("biS") }; p.has_value())
+            {
+                p->set(static_cast<std::int16_t>(std::numeric_limits<std::int16_t>::max()));
+                ctx.check("inh_biS_max", static_cast<std::int16_t>(p->get()) == std::numeric_limits<std::int16_t>::max());
+                p->set(static_cast<std::int16_t>(0x7DDD)); // final
+                ctx.check("inh_biS_variant", p->get().data.index() == kIdxI16);
+                ctx.check("inh_biS_final", static_cast<std::int16_t>(p->get()) == static_cast<std::int16_t>(0x7DDD));
+            }
+            else { ctx.check("inh_biS_resolves", false); }
+
+            if (auto p{ inst->get_field("biC") }; p.has_value())
+            {
+                p->set(static_cast<std::uint16_t>(0xD800)); // surrogate code unit
+                ctx.check("inh_biC_surrogate", static_cast<std::uint16_t>(p->get()) == 0xD800);
+                p->set(static_cast<std::uint16_t>(0x4E2D)); // CJK final
+                ctx.check("inh_biC_variant", p->get().data.index() == kIdxU16);
+                ctx.check("inh_biC_final", static_cast<std::uint16_t>(p->get()) == 0x4E2D);
+            }
+            else { ctx.check("inh_biC_resolves", false); }
+
+            if (auto p{ inst->get_field("biI") }; p.has_value())
+            {
+                p->set(std::numeric_limits<std::int32_t>::max());
+                ctx.check("inh_biI_max", static_cast<std::int32_t>(p->get()) == std::numeric_limits<std::int32_t>::max());
+                p->set(std::int32_t{ 0x7D55AA33 }); // final
+                ctx.check("inh_biI_variant", p->get().data.index() == kIdxI32);
+                ctx.check("inh_biI_final", static_cast<std::int32_t>(p->get()) == 0x7D55AA33);
+            }
+            else { ctx.check("inh_biI_resolves", false); }
+
+            if (auto p{ inst->get_field("biJ") }; p.has_value())
+            {
+                p->set(std::numeric_limits<std::int64_t>::max());
+                ctx.check("inh_biJ_max", static_cast<std::int64_t>(p->get()) == std::numeric_limits<std::int64_t>::max());
+                p->set(std::int64_t{ 0x7D8899AABBCCDDEELL }); // final
+                ctx.check("inh_biJ_variant", p->get().data.index() == kIdxI64);
+                ctx.check("inh_biJ_final", static_cast<std::int64_t>(p->get()) == 0x7D8899AABBCCDDEELL);
+            }
+            else { ctx.check("inh_biJ_resolves", false); }
+
+            if (auto p{ inst->get_field("biF") }; p.has_value())
+            {
+                p->set(bits_to_float(0x00000001)); // denormal round-trip
+                ctx.check("inh_biF_denorm", float_bits(p->get()) == 0x00000001u);
+                p->set(-1.0F); // final
+                ctx.check("inh_biF_variant", p->get().data.index() == kIdxFloat);
+                ctx.check("inh_biF_final", float_bits(p->get()) == 0xBF800000u);
+            }
+            else { ctx.check("inh_biF_resolves", false); }
+
+            if (auto p{ inst->get_field("biD") }; p.has_value())
+            {
+                p->set(bits_to_double(0x0000000000000001ULL)); // denormal round-trip
+                ctx.check("inh_biD_denorm", double_bits(p->get()) == 0x0000000000000001ULL);
+                p->set(-2.0); // final
+                ctx.check("inh_biD_variant", p->get().data.index() == kIdxDouble);
+                ctx.check("inh_biD_final", double_bits(p->get()) == 0xC000000000000000ULL);
+            }
+            else { ctx.check("inh_biD_resolves", false); }
+        }
+    }
+
+    // =====================================================================
+    //  12d. VOLATILE FIELD WRITES.  The vs*/vi* fields are `volatile`; ACC_VOLATILE
+    //       is a JMM access-ordering attribute, NOT a storage-layout one, so the
+    //       slot is a plain offset and field_proxy::set()'s raw memcpy must land
+    //       identically to a non-volatile field.  Native re-read bit-exact +
+    //       correct variant alternative; documented finals observed Java-side in
+    //       phase 13b (snapshot) and 16b (getters) prove the volatile read sees
+    //       the native write.
+    //
+    //       Volatile finals (last write):
+    //         vsZ=true vsB=0xC3 vsS=0xC3C3 vsC=0x20AC vsI=0xC0FFEE11
+    //         vsJ=0xC0FFEE11C0FFEE22 vsF=+Inf vsD=-Inf
+    //         viZ=false viB=0x3C viS=0x3C3C viC=0xFFFF viI=0x11EEFFC0
+    //         viJ=0x22EEFFC011EEFFC0 viF=-0.0f viD=+0.0
+    // =====================================================================
+    {
+        // -- volatile STATIC ----
+        if (const auto p{ fps::static_field("vsZ") })
+        {
+            p->set(false);
+            ctx.check("vol_vsZ_false", fps::get_bool("vsZ") == false);
+            p->set(true); // final
+            ctx.check("vol_vsZ_variant", p->get().data.index() == kIdxBool);
+            ctx.check("vol_vsZ_final_true", fps::get_bool("vsZ") == true);
+        }
+        else { ctx.check("vol_vsZ_resolves", false); }
+
+        if (const auto p{ fps::static_field("vsB") })
+        {
+            p->set(static_cast<std::int8_t>(0x80)); // min
+            ctx.check("vol_vsB_min", fps::get_i8("vsB") == std::numeric_limits<std::int8_t>::min());
+            p->set(static_cast<std::int8_t>(0xC3)); // final
+            ctx.check("vol_vsB_variant", p->get().data.index() == kIdxI8);
+            ctx.check("vol_vsB_final", fps::get_i8("vsB") == static_cast<std::int8_t>(0xC3));
+        }
+        else { ctx.check("vol_vsB_resolves", false); }
+
+        if (const auto p{ fps::static_field("vsS") })
+        {
+            p->set(static_cast<std::int16_t>(0x7FFF)); // max
+            ctx.check("vol_vsS_max", fps::get_i16("vsS") == std::numeric_limits<std::int16_t>::max());
+            p->set(static_cast<std::int16_t>(0xC3C3)); // final
+            ctx.check("vol_vsS_variant", p->get().data.index() == kIdxI16);
+            ctx.check("vol_vsS_final", fps::get_i16("vsS") == static_cast<std::int16_t>(0xC3C3));
+        }
+        else { ctx.check("vol_vsS_resolves", false); }
+
+        if (const auto p{ fps::static_field("vsC") })
+        {
+            p->set(static_cast<std::uint16_t>(0x0000));
+            ctx.check("vol_vsC_zero", fps::get_u16("vsC") == 0x0000);
+            p->set(static_cast<std::uint16_t>(0x20AC)); // Euro final
+            ctx.check("vol_vsC_variant", p->get().data.index() == kIdxU16);
+            ctx.check("vol_vsC_final", fps::get_u16("vsC") == 0x20AC);
+        }
+        else { ctx.check("vol_vsC_resolves", false); }
+
+        if (const auto p{ fps::static_field("vsI") })
+        {
+            p->set(std::int32_t{ -1 });
+            ctx.check("vol_vsI_negone", fps::get_i32("vsI") == -1);
+            p->set(static_cast<std::int32_t>(0xC0FFEE11)); // final
+            ctx.check("vol_vsI_variant", p->get().data.index() == kIdxI32);
+            ctx.check("vol_vsI_final", static_cast<std::uint32_t>(fps::get_i32("vsI")) == 0xC0FFEE11u);
+        }
+        else { ctx.check("vol_vsI_resolves", false); }
+
+        if (const auto p{ fps::static_field("vsJ") })
+        {
+            p->set(std::int64_t{ -1 });
+            ctx.check("vol_vsJ_negone", fps::get_i64("vsJ") == -1);
+            p->set(static_cast<std::int64_t>(0xC0FFEE11C0FFEE22ULL)); // final
+            ctx.check("vol_vsJ_variant", p->get().data.index() == kIdxI64);
+            ctx.check("vol_vsJ_final", static_cast<std::uint64_t>(fps::get_i64("vsJ")) == 0xC0FFEE11C0FFEE22ULL);
+        }
+        else { ctx.check("vol_vsJ_resolves", false); }
+
+        if (const auto p{ fps::static_field("vsF") })
+        {
+            p->set(bits_to_float(0x7FC00000)); // NaN round-trip
+            ctx.check("vol_vsF_nan", float_bits(fps::get_float("vsF")) == 0x7FC00000u);
+            p->set(bits_to_float(0x7F800000)); // +Inf final
+            ctx.check("vol_vsF_variant", p->get().data.index() == kIdxFloat);
+            ctx.check("vol_vsF_final", float_bits(fps::get_float("vsF")) == 0x7F800000u);
+        }
+        else { ctx.check("vol_vsF_resolves", false); }
+
+        if (const auto p{ fps::static_field("vsD") })
+        {
+            p->set(bits_to_double(0x8000000000000000ULL)); // -0.0 round-trip
+            ctx.check("vol_vsD_negzero", double_bits(fps::get_double("vsD")) == 0x8000000000000000ULL);
+            p->set(bits_to_double(0xFFF0000000000000ULL)); // -Inf final
+            ctx.check("vol_vsD_variant", p->get().data.index() == kIdxDouble);
+            ctx.check("vol_vsD_final", double_bits(fps::get_double("vsD")) == 0xFFF0000000000000ULL);
+        }
+        else { ctx.check("vol_vsD_resolves", false); }
+
+        // -- volatile INSTANCE ----
+        if (inst)
+        {
+            if (auto p{ inst->get_field("viZ") }; p.has_value())
+            {
+                p->set(true);
+                ctx.check("vol_viZ_true", static_cast<bool>(p->get()) == true);
+                p->set(false); // final
+                ctx.check("vol_viZ_variant", p->get().data.index() == kIdxBool);
+                ctx.check("vol_viZ_final_false", static_cast<bool>(p->get()) == false);
+            }
+            else { ctx.check("vol_viZ_resolves", false); }
+
+            if (auto p{ inst->get_field("viB") }; p.has_value())
+            {
+                p->set(static_cast<std::int8_t>(0x7F)); // max
+                ctx.check("vol_viB_max", static_cast<std::int8_t>(p->get()) == std::numeric_limits<std::int8_t>::max());
+                p->set(static_cast<std::int8_t>(0x3C)); // final
+                ctx.check("vol_viB_variant", p->get().data.index() == kIdxI8);
+                ctx.check("vol_viB_final", static_cast<std::int8_t>(p->get()) == static_cast<std::int8_t>(0x3C));
+            }
+            else { ctx.check("vol_viB_resolves", false); }
+
+            if (auto p{ inst->get_field("viS") }; p.has_value())
+            {
+                p->set(static_cast<std::int16_t>(0x8000)); // min
+                ctx.check("vol_viS_min", static_cast<std::int16_t>(p->get()) == std::numeric_limits<std::int16_t>::min());
+                p->set(static_cast<std::int16_t>(0x3C3C)); // final
+                ctx.check("vol_viS_variant", p->get().data.index() == kIdxI16);
+                ctx.check("vol_viS_final", static_cast<std::int16_t>(p->get()) == static_cast<std::int16_t>(0x3C3C));
+            }
+            else { ctx.check("vol_viS_resolves", false); }
+
+            if (auto p{ inst->get_field("viC") }; p.has_value())
+            {
+                p->set(static_cast<std::uint16_t>(0x0041)); // 'A'
+                ctx.check("vol_viC_A", static_cast<std::uint16_t>(p->get()) == 0x0041);
+                p->set(static_cast<std::uint16_t>(0xFFFF)); // Character.MAX final
+                ctx.check("vol_viC_variant", p->get().data.index() == kIdxU16);
+                ctx.check("vol_viC_final", static_cast<std::uint16_t>(p->get()) == 0xFFFF);
+            }
+            else { ctx.check("vol_viC_resolves", false); }
+
+            if (auto p{ inst->get_field("viI") }; p.has_value())
+            {
+                p->set(std::numeric_limits<std::int32_t>::min());
+                ctx.check("vol_viI_min", static_cast<std::int32_t>(p->get()) == std::numeric_limits<std::int32_t>::min());
+                p->set(static_cast<std::int32_t>(0x11EEFFC0)); // final
+                ctx.check("vol_viI_variant", p->get().data.index() == kIdxI32);
+                ctx.check("vol_viI_final", static_cast<std::uint32_t>(static_cast<std::int32_t>(p->get())) == 0x11EEFFC0u);
+            }
+            else { ctx.check("vol_viI_resolves", false); }
+
+            if (auto p{ inst->get_field("viJ") }; p.has_value())
+            {
+                p->set(std::numeric_limits<std::int64_t>::min());
+                ctx.check("vol_viJ_min", static_cast<std::int64_t>(p->get()) == std::numeric_limits<std::int64_t>::min());
+                p->set(static_cast<std::int64_t>(0x22EEFFC011EEFFC0ULL)); // final
+                ctx.check("vol_viJ_variant", p->get().data.index() == kIdxI64);
+                ctx.check("vol_viJ_final", static_cast<std::uint64_t>(static_cast<std::int64_t>(p->get())) == 0x22EEFFC011EEFFC0ULL);
+            }
+            else { ctx.check("vol_viJ_resolves", false); }
+
+            if (auto p{ inst->get_field("viF") }; p.has_value())
+            {
+                p->set(bits_to_float(0x7F800000)); // +Inf round-trip
+                ctx.check("vol_viF_posinf", float_bits(p->get()) == 0x7F800000u);
+                p->set(bits_to_float(0x80000000)); // -0.0 final
+                ctx.check("vol_viF_variant", p->get().data.index() == kIdxFloat);
+                ctx.check("vol_viF_final", float_bits(p->get()) == 0x80000000u);
+            }
+            else { ctx.check("vol_viF_resolves", false); }
+
+            if (auto p{ inst->get_field("viD") }; p.has_value())
+            {
+                p->set(bits_to_double(0x7FF8000000000000ULL)); // NaN round-trip
+                ctx.check("vol_viD_nan", double_bits(p->get()) == 0x7FF8000000000000ULL);
+                p->set(bits_to_double(0x0000000000000000ULL)); // +0.0 final
+                ctx.check("vol_viD_variant", p->get().data.index() == kIdxDouble);
+                ctx.check("vol_viD_final", double_bits(p->get()) == 0x0000000000000000ULL);
+            }
+            else { ctx.check("vol_viD_resolves", false); }
+        }
+    }
+
+    // =====================================================================
     //  13. JAVA-OBSERVED SNAPSHOT (mode 1).  Drive the probe: run() copies
     //      every field into its seen* witness through genuine getstatic/getfield
     //      + putstatic.  Then read the witnesses back natively and assert the
@@ -1419,6 +1793,43 @@ namespace
                 fin_seen("java_seen_finF_bits", static_cast<std::uint32_t>(fps::get_i32("seenFinFBits")) == 0x40200000u);
                 fin_seen("java_seen_finD_pi_bits", static_cast<std::uint64_t>(fps::get_i64("seenFinDBits")) == 0x400921FB54442D18ULL);
             }
+
+            // ---- INHERITED + VOLATILE witnesses, as observed by Java (mode-1
+            //      snapshot now also captures bs*/bi* via the super-chain getfield
+            //      and vs*/vi* via the volatile getstatic/getfield).  These are the
+            //      Java-observed half of phases 12c/12d: the JVM's OWN bytecode read
+            //      the inherited-offset slot and the volatile slot and saw exactly
+            //      the native-written final.  The witness fields themselves are read
+            //      back through the subclass wrapper (seenBs* live on the base, so
+            //      THIS read also exercises the super-chain resolution). ----
+            // inherited statics
+            ctx.check("java_seen_bsZ_true", fps::get_bool("seenBsZ") == true);
+            ctx.check("java_seen_bsB_6B",   fps::get_i8("seenBsB") == static_cast<std::int8_t>(0x6B));
+            ctx.check("java_seen_bsS_6BBB", fps::get_i16("seenBsS") == static_cast<std::int16_t>(0x6BBB));
+            ctx.check("java_seen_bsC_6BCC", static_cast<std::uint32_t>(fps::get_i32("seenBsCBits")) == 0x6BCCu);
+            ctx.check("java_seen_bsI_final", fps::get_i32("seenBsI") == 0x6B12C3D4);
+            ctx.check("java_seen_bsJ_final", fps::get_i64("seenBsJ") == 0x6B11223344556677LL);
+            ctx.check("java_seen_bsF_bits", static_cast<std::uint32_t>(fps::get_i32("seenBsFBits")) == 0x40200000u);
+            ctx.check("java_seen_bsD_bits", static_cast<std::uint64_t>(fps::get_i64("seenBsDBits")) == 0x3FE0000000000000ULL);
+            // inherited instances
+            ctx.check("java_seen_biZ_true", fps::get_bool("seenBiZ") == true);
+            ctx.check("java_seen_biB_7D",   fps::get_i8("seenBiB") == static_cast<std::int8_t>(0x7D));
+            ctx.check("java_seen_biS_7DDD", fps::get_i16("seenBiS") == static_cast<std::int16_t>(0x7DDD));
+            ctx.check("java_seen_biC_4E2D", static_cast<std::uint32_t>(fps::get_i32("seenBiCBits")) == 0x4E2Du);
+            ctx.check("java_seen_biI_final", fps::get_i32("seenBiI") == 0x7D55AA33);
+            ctx.check("java_seen_biJ_final", static_cast<std::uint64_t>(fps::get_i64("seenBiJ")) == 0x7D8899AABBCCDDEEULL);
+            ctx.check("java_seen_biF_bits", static_cast<std::uint32_t>(fps::get_i32("seenBiFBits")) == 0xBF800000u);
+            ctx.check("java_seen_biD_bits", static_cast<std::uint64_t>(fps::get_i64("seenBiDBits")) == 0xC000000000000000ULL);
+            // volatile statics (C/J/F/D witnesses captured; Z/B/S via getters in 16b)
+            ctx.check("java_seen_vsC_20AC", static_cast<std::uint32_t>(fps::get_i32("seenVsCBits")) == 0x20ACu);
+            ctx.check("java_seen_vsJ_final", static_cast<std::uint64_t>(fps::get_i64("seenVsJ")) == 0xC0FFEE11C0FFEE22ULL);
+            ctx.check("java_seen_vsF_posinf_bits", static_cast<std::uint32_t>(fps::get_i32("seenVsFBits")) == 0x7F800000u);
+            ctx.check("java_seen_vsD_neginf_bits", static_cast<std::uint64_t>(fps::get_i64("seenVsDBits")) == 0xFFF0000000000000ULL);
+            // volatile instances
+            ctx.check("java_seen_viC_FFFF", static_cast<std::uint32_t>(fps::get_i32("seenViCBits")) == 0xFFFFu);
+            ctx.check("java_seen_viJ_final", static_cast<std::uint64_t>(fps::get_i64("seenViJ")) == 0x22EEFFC011EEFFC0ULL);
+            ctx.check("java_seen_viF_negzero_bits", static_cast<std::uint32_t>(fps::get_i32("seenViFBits")) == 0x80000000u);
+            ctx.check("java_seen_viD_poszero_bits", static_cast<std::uint64_t>(fps::get_i64("seenViDBits")) == 0x0000000000000000ULL);
         }
     }
 
@@ -1595,6 +2006,77 @@ namespace
             fin_getter("java_getter_finJ_full", fps::call_i64("getFinJ") == 0x0123456789ABCDEFLL);
             fin_getter("java_getter_finF_bits", static_cast<std::uint32_t>(fps::call_i32("getFinFBits")) == 0x40200000u);
             fin_getter("java_getter_finD_pi_bits", static_cast<std::uint64_t>(fps::call_i64("getFinDBits")) == 0x400921FB54442D18ULL);
+        }
+    }
+
+    // =====================================================================
+    //  16b. JAVA GETTER READBACK for the INHERITED + VOLATILE fields.  Java's own
+    //       bytecode reads each base-declared (super-chain) and volatile field and
+    //       returns it -- the third confirmation that the native write into an
+    //       inherited offset / a volatile slot is visible to executing Java code.
+    //       char getters return unsigned int; F/D getters return raw bits.  These
+    //       are plain mutable fields (NOT final), so the read is never folded:
+    //       hard checks.
+    // =====================================================================
+    {
+        // inherited statics
+        ctx.check("java_getter_bsC_6BCC", fps::call_i32("getBsCBits") == 0x6BCC); // char widened unsigned
+        ctx.check("java_getter_bsJ_final", fps::call_i64("getBsJ") == 0x6B11223344556677LL);
+        ctx.check("java_getter_bsF_bits", static_cast<std::uint32_t>(fps::call_i32("getBsFBits")) == 0x40200000u);
+        ctx.check("java_getter_bsD_bits", static_cast<std::uint64_t>(fps::call_i64("getBsDBits")) == 0x3FE0000000000000ULL);
+        // inherited instances
+        ctx.check("java_getter_biZ_true", fps::call_bool("getBiZ") == true);
+        ctx.check("java_getter_biB_7D",   fps::call_i8("getBiB") == static_cast<std::int8_t>(0x7D));
+        ctx.check("java_getter_biS_7DDD", fps::call_i16("getBiS") == static_cast<std::int16_t>(0x7DDD));
+        ctx.check("java_getter_biC_4E2D", fps::call_i32("getBiC") == 0x4E2D); // char widened unsigned
+        ctx.check("java_getter_biI_final", fps::call_i32("getBiI") == 0x7D55AA33);
+        ctx.check("java_getter_biJ_final", static_cast<std::uint64_t>(fps::call_i64("getBiJ")) == 0x7D8899AABBCCDDEEULL);
+        ctx.check("java_getter_biF_bits", static_cast<std::uint32_t>(fps::call_i32("getBiFBits")) == 0xBF800000u);
+        ctx.check("java_getter_biD_bits", static_cast<std::uint64_t>(fps::call_i64("getBiDBits")) == 0xC000000000000000ULL);
+        // volatile statics (full Z/B/S/C/I/J/F/D getter set)
+        ctx.check("java_getter_vsZ_true", fps::call_bool("getVsZ") == true);
+        ctx.check("java_getter_vsB_C3",   fps::call_i8("getVsB") == static_cast<std::int8_t>(0xC3));
+        ctx.check("java_getter_vsS_C3C3", fps::call_i16("getVsS") == static_cast<std::int16_t>(0xC3C3));
+        ctx.check("java_getter_vsC_20AC", fps::call_i32("getVsC") == 0x20AC); // char widened unsigned
+        ctx.check("java_getter_vsI_final", static_cast<std::uint32_t>(fps::call_i32("getVsI")) == 0xC0FFEE11u);
+        ctx.check("java_getter_vsJ_final", static_cast<std::uint64_t>(fps::call_i64("getVsJ")) == 0xC0FFEE11C0FFEE22ULL);
+        ctx.check("java_getter_vsF_posinf_bits", static_cast<std::uint32_t>(fps::call_i32("getVsFBits")) == 0x7F800000u);
+        ctx.check("java_getter_vsD_neginf_bits", static_cast<std::uint64_t>(fps::call_i64("getVsDBits")) == 0xFFF0000000000000ULL);
+        // volatile instances (full set)
+        ctx.check("java_getter_viZ_false", fps::call_bool("getViZ") == false);
+        ctx.check("java_getter_viB_3C",   fps::call_i8("getViB") == static_cast<std::int8_t>(0x3C));
+        ctx.check("java_getter_viS_3C3C", fps::call_i16("getViS") == static_cast<std::int16_t>(0x3C3C));
+        ctx.check("java_getter_viC_FFFF", fps::call_i32("getViC") == 0xFFFF); // char widened unsigned
+        ctx.check("java_getter_viI_final", static_cast<std::uint32_t>(fps::call_i32("getViI")) == 0x11EEFFC0u);
+        ctx.check("java_getter_viJ_final", static_cast<std::uint64_t>(fps::call_i64("getViJ")) == 0x22EEFFC011EEFFC0ULL);
+        ctx.check("java_getter_viF_negzero_bits", static_cast<std::uint32_t>(fps::call_i32("getViFBits")) == 0x80000000u);
+        ctx.check("java_getter_viD_poszero_bits", static_cast<std::uint64_t>(fps::call_i64("getViDBits")) == 0x0000000000000000ULL);
+    }
+
+    // =====================================================================
+    //  16c. INHERITED / VOLATILE GUARD INTERACTION.  The size guard must apply
+    //       identically when the slot is reached via the super-chain or is
+    //       volatile: a too-wide write into the inherited 4-byte "I" slot and the
+    //       volatile 4-byte "I" slot is REFUSED, leaving the field at its final.
+    //       Confirms guard semantics are offset-resolution- and access-mode-
+    //       independent (still a pure SIZE check).  Self-restoring: the seed IS
+    //       the documented final, so the Java-observed phases above already ran
+    //       and these writes are refused -> finals are preserved regardless.
+    // =====================================================================
+    {
+        if (const auto p{ fps::static_field("bsI") })
+        {
+            // bsI holds its 0x6B12C3D4 final; a too-wide 8B write is refused.
+            p->set(std::int64_t{ 0x1122334455667788LL });
+            ctx.check("inh_guard_bsI_too_wide_refused", fps::get_i32("bsI") == 0x6B12C3D4);
+        }
+        if (const auto p{ fps::static_field("vsI") })
+        {
+            // vsI holds its 0xC0FFEE11 final; a too-wide 8B write into the 4B
+            // volatile "I" slot is refused (guard is access-mode-independent).
+            p->set(std::int64_t{ 0x1122334455667788LL });
+            ctx.check("vol_guard_vsI_too_wide_refused",
+                      static_cast<std::uint32_t>(fps::get_i32("vsI")) == 0xC0FFEE11u);
         }
     }
 

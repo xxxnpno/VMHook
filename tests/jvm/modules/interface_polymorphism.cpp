@@ -474,6 +474,15 @@ namespace
         static auto resolves_static_brand() -> bool { return static_method("brand").has_value(); }
         // The static call itself (best-effort: interpreter may be no-value).
         static auto static_brand() -> std::string { return static_method("brand")->call().as_string(); }
+
+        // ---- is_static GATE (the two duals on the interface's OWN klass) -----
+        // use() is an ABSTRACT INSTANCE method -> NOT resolvable as a static.
+        static auto resolves_use_as_static()  -> bool { return static_method("use").has_value(); }
+        // brand() is a STATIC method -> the static walk surfaces it; the instance
+        // method walk (get_method) must NOT bind a static as an own instance method.
+        // (Probed via a throwaway wrapper instance since get_method is non-static;
+        // the oop is never dereferenced for a pure resolvability check.)
+        auto resolves_brand_as_instance() const -> bool { return get_method("brand").has_value(); }
     };
 
     // ── Wrapper for the DECLARED interface type (InterfacePoly$Animal) ──────
@@ -493,6 +502,27 @@ namespace
 
         auto resolves_speak()         const -> bool { return get_method("speak").has_value(); }
         auto resolves_default_greet() const -> bool { return get_method("defaultGreet").has_value(); }
+
+        // CALL defaultGreet() through the interface-typed wrapper: the default body
+        // lives on THIS very klass, so the depth-0 superclass walk binds it without
+        // the interface fallback.  Best-effort at the call site (interpreter may be
+        // no-value); the receiver is a concrete impl, so the JVM still dispatches
+        // virtually -- through the interface lens this lands on the impl's resolved
+        // defaultGreet() (inherited body for Dog/Cat, overridden body for Snake).
+        auto default_greet() const -> std::string { return get_method("defaultGreet")->call().as_string(); }
+
+        // ---- INTERFACE CONSTANTS (implicitly public static final) -----------
+        // Read off the Animal interface's OWN mirror via the static-field path.
+        // An interface constant is reachable exactly like a class static.
+        static auto kingdom()          -> std::string  { return static_field("KINGDOM")->get(); }
+        static auto legs_default()     -> std::int32_t { return static_field("LEGS_DEFAULT")->get(); }
+        static auto resolves_kingdom() -> bool { return static_field("KINGDOM").has_value(); }
+        static auto resolves_legs_default() -> bool { return static_field("LEGS_DEFAULT").has_value(); }
+
+        // ---- is_static GATE on interface methods (negative dual) -------------
+        // speak() is an ABSTRACT instance method on the interface: it must NOT be
+        // resolvable through the STATIC method path.  Contrast with Toolish.brand().
+        static auto resolves_speak_as_static() -> bool { return static_method("speak").has_value(); }
     };
 
     // ── Wrapper for the SECOND interface (InterfacePoly$Named) ──────────────
@@ -505,6 +535,10 @@ namespace
         }
 
         auto resolves_who() const -> bool { return get_method("who").has_value(); }
+
+        // The SECOND interface's own constant, read off the Named mirror.
+        static auto realm()          -> std::string { return static_field("REALM")->get(); }
+        static auto resolves_realm() -> bool { return static_field("REALM").has_value(); }
     };
 
     // ── Wrapper for the ABSTRACT base (InterfacePoly$AbstractPet) ───────────
@@ -2031,6 +2065,299 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
         }
 
         // =================================================================
+        // 22. INTERFACE CONSTANTS (implicitly public static final): an interface
+        //     field is a compile-time constant on the INTERFACE's own mirror, NOT
+        //     on any implementor.  Read Animal.KINGDOM (String) and
+        //     Animal.LEGS_DEFAULT (int) -- and Named.REALM on the second interface
+        //     -- straight off each interface klass via the static-field path,
+        //     proving a constant declared on an interface is reachable exactly like
+        //     a class static.  Resolvability HARD on every JDK that loaded the
+        //     interface; the value reads are RAW (off the mirror), so where the
+        //     read returns a value it is asserted HARD and cross-checked against
+        //     the JVM's own getstatic witness in scenario 8.
+        // =================================================================
+        {
+            // String constant on the Animal interface mirror.
+            ctx.check("ipm_animal_iface_constant_kingdom_resolves", ifp_animal::resolves_kingdom());
+            const std::string kingdom{ ifp_animal::kingdom() };
+            if (!kingdom.empty())
+            {
+                ctx.check("ipm_animal_iface_constant_kingdom_value", kingdom == "animalia");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: Animal.KINGDOM interface constant read empty "
+                           "(mirror not readable on this run); resolvability proven HARD above.");
+            }
+
+            // Primitive (int) constant on the SAME interface mirror.
+            ctx.check("ipm_animal_iface_constant_legs_default_resolves", ifp_animal::resolves_legs_default());
+            ctx.check("ipm_animal_iface_constant_legs_default_value",
+                      ifp_animal::legs_default() == 4);
+
+            // Second interface's own constant (per-interface constants are distinct).
+            ctx.check("ipm_named_iface_constant_realm_resolves", ifp_named::resolves_realm());
+            const std::string realm{ ifp_named::realm() };
+            if (!realm.empty())
+            {
+                ctx.check("ipm_named_iface_constant_realm_value", realm == "named-realm");
+            }
+        }
+
+        // =================================================================
+        // 23. CALLING the interface DEFAULT body through the INTERFACE-typed
+        //     wrapper.  Scenario 7 only probed resolvability through ifp_animal;
+        //     here we CALL defaultGreet() through the Animal lens over the Dog and
+        //     the Snake oops.  The default body lives on the Animal klass (the
+        //     wrapper's own klass), so it binds at depth 0 WITHOUT the interface
+        //     fallback -- resolvability HARD.  The receiver is a concrete impl, so
+        //     the JVM dispatches virtually: through the Animal lens the call lands
+        //     on each impl's RESOLVED defaultGreet() -- the INHERITED body for Dog,
+        //     the OVERRIDDEN body for Snake.  Call best-effort (no-value JDK -> [INFO]).
+        // =================================================================
+        if (pet_dog)
+        {
+            const auto dog_iface{ holder->pet_as_animal() };
+            if (dog_iface)
+            {
+                // Own-klass default on the Animal lens -> binds at depth 0, HARD.
+                ctx.check("ipm_animal_lens_over_dog_resolves_default_greet",
+                          dog_iface->resolves_default_greet());
+                if (oop_readable(dog_iface->get_instance()))
+                {
+                    const std::string greet{ dog_iface->default_greet() };
+                    if (!greet.empty())
+                    {
+                        // Dog INHERITS the default -> "interface-default-greet:" + "Rex says woof".
+                        ctx.check("ipm_animal_lens_over_dog_default_greet_inherited_form",
+                                  contains(greet, "interface-default-greet"));
+                        ctx.check("ipm_animal_lens_over_dog_default_greet_embeds_speak",
+                                  contains(greet, "woof"));
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] interface_polymorphism: defaultGreet() via the Animal lens over Dog "
+                                   "returned no value on this JDK build; resolvability proven HARD above.");
+                    }
+                }
+            }
+        }
+        if (pet_snake)
+        {
+            const auto snake_iface{ holder->pet3_as_animal() };
+            if (snake_iface && oop_readable(snake_iface->get_instance()))
+            {
+                const std::string greet{ snake_iface->default_greet() };
+                if (!greet.empty())
+                {
+                    // Snake OVERRIDES the default -> the virtual dispatch through the
+                    // interface lens reaches SNAKE's body, never the inherited form.
+                    ctx.check("ipm_animal_lens_over_snake_default_greet_is_override",
+                              contains(greet, "snake-greet"));
+                    ctx.check("ipm_animal_lens_over_snake_default_greet_not_inherited",
+                              !contains(greet, "interface-default-greet"));
+                }
+                else
+                {
+                    ctx.record("[INFO] interface_polymorphism: defaultGreet() via the Animal lens over Snake "
+                               "returned no value on this JDK build; the Java override witness still holds.");
+                }
+            }
+        }
+
+        // =================================================================
+        // 24. is_static GATE on interface methods (static_method's ACC_STATIC
+        //     filter, the negatives that close the static/instance partition).
+        //     Toolish declares a STATIC brand() and an ABSTRACT INSTANCE use().
+        //       * use() must NOT be resolvable through static_method() on the
+        //         Toolish klass -- static_method applies static_method_only, so an
+        //         instance method is invisible to the static walk (HARD);
+        //       * Animal.speak() (abstract instance) must NOT resolve as a static
+        //         either (HARD).
+        //     The positive halves (brand() as static; use()/speak() as instance)
+        //     are already asserted in scenarios 13/16.  ASYMMETRY (characterised,
+        //     not a FAIL): the INSTANCE get_method walk does NOT filter ACC_STATIC,
+        //     so asking the Toolish wrapper for brand() as an instance method DOES
+        //     surface the static by name -- documented here so a future "fix" of
+        //     the helper does not silently flip a HARD assertion.
+        // =================================================================
+        if (vmhook::find_class(k_toolish_class) != nullptr)
+        {
+            // STATIC walk must NOT surface the abstract instance use() -> HARD.
+            ctx.check("ipm_toolish_abstract_use_not_resolvable_as_static",
+                      !ifp_toolish::resolves_use_as_static());
+
+            // Characterise the instance-walk asymmetry (no ACC_STATIC filter on
+            // get_method): the static brand() IS surfaced by name on the Toolish
+            // wrapper's own klass.  Pure resolvability -> the null oop is never
+            // dereferenced (get_method resolves the klass via the type registry).
+            ifp_toolish toolish_probe{ nullptr };
+            if (toolish_probe.resolves_brand_as_instance())
+            {
+                ctx.record("[INFO] interface_polymorphism: the INSTANCE get_method walk surfaced the STATIC "
+                           "brand() by name on the Toolish wrapper's OWN klass (get_method does not filter "
+                           "ACC_STATIC; only static_method/get_method-static applies static_method_only).  "
+                           "Expected asymmetry, characterised; not a failure.");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: the instance get_method walk did NOT surface the "
+                           "static brand() on the Toolish wrapper on this build.");
+            }
+        }
+        // Animal.speak() is an abstract INSTANCE method -> not a static -> HARD.
+        ctx.check("ipm_animal_abstract_speak_not_resolvable_as_static",
+                  !ifp_animal::resolves_speak_as_static());
+
+        // =================================================================
+        // 25. HOOKING THROUGH THE INTERFACE-TYPED WRAPPER (the abstract-method
+        //     install gate).  Scenario 21 hooks speak() through CONCRETE wrappers
+        //     (Dog/Cat), each of which has a real i2i interpreter entry.  Through
+        //     the INTERFACE wrapper (ifp_animal) speak() is the ABSTRACT interface
+        //     method, which has NO i2i entry to patch -- so the install must FAIL
+        //     CLEANLY (scoped_hook returns an un-installed handle), never crash and
+        //     never leave anything armed.  We assert the handle is NOT installed
+        //     (HARD: a clean refusal), and the scoped handle's drop is a no-op.
+        //     This is the interface-typed-receiver hooking input the concrete-
+        //     wrapper scenario does not cover.
+        // =================================================================
+        {
+            std::atomic<int> iface_abstract_fires{ 0 };
+            {
+                auto iface_hook{ vmhook::scoped_hook<ifp_animal>(
+                    "speak",
+                    [&iface_abstract_fires](vmhook::return_value&, const std::unique_ptr<ifp_animal>&)
+                    {
+                        // An abstract interface method is never dispatched directly,
+                        // so this detour must never fire even if a stub gets patched.
+                        iface_abstract_fires.fetch_add(1, std::memory_order_relaxed);
+                    }) };
+                // Abstract interface methods carry no real i2i entry to patch, so the
+                // install is EXPECTED to refuse cleanly.  The load-bearing invariant
+                // is "no crash + nothing armed at block exit" (scoped RAII), so the
+                // install OUTCOME itself is characterised, not hard-asserted (a JDK
+                // that patches the shared abstract-error stub is still safe).
+                if (!iface_hook.installed())
+                {
+                    ctx.record("[INFO] interface_polymorphism: hooking the ABSTRACT interface method speak() "
+                               "through the Animal interface wrapper did not install (no i2i entry on an "
+                               "abstract method); clean refusal -- the expected outcome.");
+                }
+                else
+                {
+                    ctx.record("[INFO] interface_polymorphism: scoped_hook on the ABSTRACT interface speak() "
+                               "reported installed on this build; the scoped RAII still disarms it at block "
+                               "exit (characterised, not a failure).");
+                }
+                // Drive the probe: abstract speak() is NEVER the dispatch target (the
+                // probe always invokes a CONCRETE override), so the interface-abstract
+                // detour must not fire regardless of install outcome.
+                drive(ctx, 0);
+                ctx.check("ipm_interface_abstract_speak_hook_never_fires",
+                          iface_abstract_fires.load() == 0);
+                // iface_hook drops here: a no-op uninstall on an un-installed handle,
+                // or a clean detach if a stub was patched -> nothing armed.
+            }
+        }
+
+        // =================================================================
+        // 26. FORCED RETURN through a hook on a polymorphic dispatch.  Hook Dog's
+        //     speak() (the Animal-interface-declared, Dog-overridden method) and
+        //     FORCE a sentinel String return via return_value::set(jstring) +
+        //     cancel.  Driving the probe makes the JVM dispatch s.pet.speak()
+        //     through real bytecode and publish what it OBSERVED into petSpeakSeen.
+        //     When the i2i detour fires, the Java side sees the FORCED value (the
+        //     hook overrode the polymorphic result) -> HARD; when the hot probe is
+        //     JIT-inlined past the detour the witness is the normal "woof" -> [INFO],
+        //     never a FAIL (mirrors the fire-count gate).  Dispatch-then-install +
+        //     scoped RAII: nothing armed after the block.
+        // =================================================================
+        if (pet_dog)
+        {
+            // Build the forced jstring ONCE on the test thread and PIN it against GC
+            // (it is held across drive() cycles that run Java and may relocate the
+            // heap).  The detour reads forced_pin.oop() so it always reflects the
+            // CURRENT relocated address.  Empty pin => skip (allocation failed).
+            const vmhook::oop_t forced_raw{ vmhook::make_java_string("forced-speak-override") };
+            vmhook::jni::global_ref forced_pin{ vmhook::pin(forced_raw) };
+
+            // Pre-link: dispatch Dog.speak() once so its i2i entry exists before we
+            // patch it (install-on-unlinked would otherwise fail).
+            const bool prelink_done{ drive(ctx, 0) };
+            ctx.record(std::string("[INFO] interface_polymorphism: forced-return pre-install drive ")
+                       + (prelink_done ? "completed" : "did not complete")
+                       + " (links Dog.speak() i2i entry before the forcing hook).");
+
+            std::atomic<int> force_fires{ 0 };
+            if (forced_pin)
+            {
+                auto force_hook{ vmhook::scoped_hook<ifp_dog>(
+                    "speak",
+                    [&forced_pin, &force_fires](vmhook::return_value& ret, const std::unique_ptr<ifp_dog>&)
+                    {
+                        force_fires.fetch_add(1, std::memory_order_relaxed);
+                        // Override the polymorphic String result with the pinned
+                        // sentinel's CURRENT oop (set() flips cancel so the original
+                        // body's value is dropped).
+                        ret.set<vmhook::oop_t>(forced_pin.oop());
+                    }) };
+
+                if (force_hook.installed())
+                {
+                    ctx.check("ipm_dog_speak_force_hook_installed", force_hook.installed());
+
+                    // Drive until the detour fires (or we give up): the JIT may inline
+                    // the hot probe so the forced value never lands.
+                    for (int attempt{ 0 }; attempt < 6 && force_fires.load() == 0; ++attempt)
+                    {
+                        drive(ctx, 0);
+                    }
+
+                    if (force_fires.load() >= 1)
+                    {
+                        // The hook fired -> the JVM's own dispatch observed the FORCED
+                        // value, proving a hook can override a polymorphic return.
+                        const std::string observed{ ifp_holder::java_witness("petSpeakSeen") };
+                        if (!observed.empty())
+                        {
+                            ctx.check("ipm_forced_return_overrides_polymorphic_dispatch",
+                                      contains(observed, "forced-speak-override"));
+                        }
+                        else
+                        {
+                            ctx.record("[INFO] interface_polymorphism: forcing hook fired but petSpeakSeen "
+                                       "witness was empty on this run; skipped the forced-value content assert.");
+                        }
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] interface_polymorphism: the forcing hook on Dog.speak() never routed "
+                                   "through the i2i detour (hot probe JIT-inlined before it); forced-return is "
+                                   "best-effort -- the install + clean teardown still hold.  Not a failure.");
+                    }
+                }
+                else
+                {
+                    ctx.record("[INFO] interface_polymorphism: forcing scoped_hook on Dog.speak() did not install "
+                               "on this JDK build (lazy-link stub / fast-JIT); forced-return assertion skipped.");
+                }
+                // force_hook drops here -> Dog.speak() unhooked, slot restored.
+            }
+            // Re-drive ONCE after the hook is gone so petSpeakSeen reverts to the
+            // real polymorphic value -- proving the forced override did not persist.
+            const bool restored_done{ drive(ctx, 0) };
+            if (restored_done)
+            {
+                const std::string after{ ifp_holder::java_witness("petSpeakSeen") };
+                if (!after.empty())
+                {
+                    ctx.check("ipm_forced_return_did_not_persist_after_unhook",
+                              contains(after, "woof") && !contains(after, "forced-speak-override"));
+                }
+            }
+        }
+
+        // =================================================================
         // 21. HOOKING AN INTERFACE-DECLARED METHOD (fires per implementer).
         //     speak() is declared on the Animal interface and overridden by every
         //     impl.  Hooking it on TWO different implementers (Dog and Cat) and
@@ -2258,6 +2585,25 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
             ctx.check("java_toolish_static_brand_body",    contains(j_brand, "toolish-brand"));
             // Generic/bridge: dispatch through Box<String> reaches the real body.
             ctx.check("java_box_get_reaches_real_body",    contains(j_box, "boxed:"));
+
+            // Interface CONSTANTS: the JVM's own getstatic off each interface.
+            const std::string j_kingdom{ ifp_holder::java_witness("animalKingdomSeen") };
+            const std::string j_realm{   ifp_holder::java_witness("namedRealmSeen") };
+            ctx.check("java_animal_iface_constant_kingdom", contains(j_kingdom, "animalia"));
+            ctx.check("java_named_iface_constant_realm",    contains(j_realm,   "named-realm"));
+            // Cross-check: native read off the mirror == the JVM's getstatic value.
+            {
+                const std::string native_kingdom{ ifp_animal::kingdom() };
+                if (!native_kingdom.empty())
+                {
+                    ctx.check("native_and_java_animal_kingdom_agree", native_kingdom == j_kingdom);
+                }
+                const std::string native_realm{ ifp_named::realm() };
+                if (!native_realm.empty())
+                {
+                    ctx.check("native_and_java_named_realm_agree", native_realm == j_realm);
+                }
+            }
 
             // Cross-check: where the NATIVE call also returned a value, native and
             // Java agree byte-for-byte (gated, so a no-value JDK build never fails).
