@@ -115,6 +115,67 @@ namespace
         static auto s_int_raw()  -> std::int32_t { return static_field("sInt")->get(); }
     };
 
+    // ── varied-shape wrappers for field-metadata enumeration (Sections I–L) ────
+    // Each is a minimal object<T> registered for a nested fixture class.  We only
+    // need static_field()/get_field() name resolution on them — the metadata
+    // accessors (signature/is_static/is_reference/raw_address) key off the proxy
+    // built by that resolution, so no extra members are required.
+
+    // ZERO-field shape (FieldIntrospection$Empty): every lookup must miss.
+    class fi_empty : public vmhook::object<fi_empty>
+    {
+    public:
+        explicit fi_empty(vmhook::oop_t instance) noexcept
+            : vmhook::object<fi_empty>{ instance } {}
+    };
+
+    // ONLY-static shape (FieldIntrospection$OnlyStatic).
+    class fi_only_static : public vmhook::object<fi_only_static>
+    {
+    public:
+        explicit fi_only_static(vmhook::oop_t instance) noexcept
+            : vmhook::object<fi_only_static>{ instance } {}
+    };
+
+    // ONLY-instance shape (FieldIntrospection$OnlyInstance); the live instance is
+    // published as FieldIntrospection.onlyInstance.
+    class fi_only_instance : public vmhook::object<fi_only_instance>
+    {
+    public:
+        explicit fi_only_instance(vmhook::oop_t instance) noexcept
+            : vmhook::object<fi_only_instance>{ instance } {}
+    };
+
+    // Inheritance base (FieldIntrospection$Base).
+    class fi_base : public vmhook::object<fi_base>
+    {
+    public:
+        explicit fi_base(vmhook::oop_t instance) noexcept
+            : vmhook::object<fi_base>{ instance } {}
+    };
+
+    // Inheritance leaf (FieldIntrospection$Derived); the live instance is
+    // published as FieldIntrospection.derived.
+    class fi_derived : public vmhook::object<fi_derived>
+    {
+    public:
+        explicit fi_derived(vmhook::oop_t instance) noexcept
+            : vmhook::object<fi_derived>{ instance } {}
+
+        // The live Derived / OnlyInstance the fixture published.  Their static
+        // slots live on FieldIntrospection's mirror, so resolve through the
+        // primary wrapper (GCC-portable static_field), then re-type the oop.
+        static auto get_derived() -> std::unique_ptr<fi_derived>
+        {
+            return fi_fixture::static_field("derived")->get();
+        }
+    };
+
+    auto get_only_instance() -> std::unique_ptr<fi_only_instance>
+    {
+        return fi_fixture::static_field("onlyInstance")->get();
+    }
+
     std::atomic<int>          g_hook_calls{ 0 };
     std::atomic<bool>         g_hook_saw_self{ false };
 
@@ -279,6 +340,17 @@ namespace
 VMHOOK_JVM_MODULE(field_introspection)
 {
     vmhook::register_class<fi_fixture>("vmhook/fixtures/FieldIntrospection");
+    // Sibling wrappers for the varied-shape field-metadata enumeration (Sections
+    // I–L).  Registering an absent/unloaded nested class is harmless — every
+    // resolution through that wrapper then returns nullopt and the dependent
+    // checks are individually guarded.  These nested classes are loaded by
+    // FieldIntrospection's <clinit> (onlyInstance/derived construction references
+    // them; OnlyStatic/Base/Empty are referenced by the wrappers below).
+    vmhook::register_class<fi_empty>("vmhook/fixtures/FieldIntrospection$Empty");
+    vmhook::register_class<fi_only_static>("vmhook/fixtures/FieldIntrospection$OnlyStatic");
+    vmhook::register_class<fi_only_instance>("vmhook/fixtures/FieldIntrospection$OnlyInstance");
+    vmhook::register_class<fi_base>("vmhook/fixtures/FieldIntrospection$Base");
+    vmhook::register_class<fi_derived>("vmhook/fixtures/FieldIntrospection$Derived");
 
     // The klass for independent offset recomputation (find_class returns the
     // HotSpot klass* as void*).
@@ -1437,6 +1509,403 @@ VMHOOK_JVM_MODULE(field_introspection)
             vmhook::field_proxy empty{ buf, "", false };
             ctx.check("cmp_oop_empty_signature_guarded_zero",
                       empty.get_compressed_oop() == 0u);
+        }
+    }
+
+    // =====================================================================
+    //  SECTION I — field-metadata ENUMERATION across VARIED class shapes.
+    //  There is NO public field-enumeration API (find_field is by-name and walks
+    //  the super chain); the honest "enumerate the fields of a class" coverage is
+    //  to resolve every DECLARED field by name through a wrapper registered for
+    //  that class and assert its {descriptor, is_static, is_reference, offset}
+    //  metadata matches the true Java declaration.  Shapes covered here:
+    //    I.0  ZERO-field class            (FieldIntrospection$Empty)
+    //    I.1  ONLY-static class           (FieldIntrospection$OnlyStatic)
+    //    I.2  ONLY-instance class         (FieldIntrospection$OnlyInstance)
+    //  All static reads touch the nested class's OWN mirror (old-gen, stable) →
+    //  HARD; instance metadata checks (I.2) read proxy POINTERS only (raw_address
+    //  is base_oop+offset arithmetic, no oop deref) → HARD.  Descriptor / static /
+    //  reference classification NEVER deref an oop, so they are HARD everywhere.
+    // =====================================================================
+    cp("SECTION I (field metadata across varied class shapes)");
+    {
+        // Reusable metadata asserter for a STATIC field on an arbitrary wrapper.
+        // Proves descriptor, is_static==true, is_reference==(L/[ front byte) AND
+        // that is_reference is the exact complement of "sized primitive".
+        struct ShapeRow { const char* field; const char* desc; bool is_ref; };
+
+        // I.0 — ZERO-field class: every declared-field lookup misses cleanly, and
+        // a degenerate / absent name also misses — no crash, no fabricated proxy.
+        {
+            cp("SECTION I.0 (Empty — zero fields, all lookups miss)");
+            const bool empty_loaded{
+                vmhook::find_class("vmhook/fixtures/FieldIntrospection$Empty") != nullptr };
+            ctx.check("shape_empty_class_loaded", empty_loaded);
+            if (empty_loaded)
+            {
+                // No DECLARED field named these exists on Empty; static_field must
+                // return nullopt (Empty has no instance to wrap, so we probe the
+                // static path, which still walks Empty + its supers j.l.Object).
+                ctx.check("shape_empty_no_field_absent",
+                          fi_empty::static_field("nonexistentField").has_value() == false);
+                ctx.check("shape_empty_no_field_oiInt",
+                          fi_empty::static_field("oiInt").has_value() == false);
+                // An EMPTY-string and an obviously-garbage name also miss, no crash.
+                ctx.check("shape_empty_empty_name_absent",
+                          fi_empty::static_field("").has_value() == false);
+                ctx.check("shape_empty_garbage_name_absent",
+                          fi_empty::static_field("\x01\x02not a field").has_value() == false);
+            }
+        }
+
+        // I.1 — ONLY-static class: enumerate every declared static field, one per
+        // descriptor family.  Each resolves, is_static==true, descriptor matches,
+        // is_reference matches, raw_address is non-null and width-aligned, and
+        // distinct fields occupy distinct slots.
+        {
+            cp("SECTION I.1 (OnlyStatic — every static field's metadata)");
+            const bool loaded{
+                vmhook::find_class("vmhook/fixtures/FieldIntrospection$OnlyStatic") != nullptr };
+            ctx.check("shape_onlystatic_class_loaded", loaded);
+            if (loaded)
+            {
+                const ShapeRow rows[] = {
+                    { "osInt",    "I",                  false },
+                    { "osLong",   "J",                  false },
+                    { "osString", "Ljava/lang/String;", true  },
+                    { "osArray",  "[I",                 true  },
+                    { "osObject", "Ljava/lang/Object;", true  },
+                };
+                void* prev_addr{ nullptr };
+                for (const ShapeRow& r : rows)
+                {
+                    auto fp{ fi_only_static::static_field(r.field) };
+                    ctx.check(std::string{ "shape_onlystatic_resolves_" } + r.field,
+                              fp.has_value());
+                    if (!fp) { continue; }
+                    ctx.check(std::string{ "shape_onlystatic_is_static_" } + r.field,
+                              fp->is_static() == true);
+                    ctx.check(std::string{ "shape_onlystatic_sig_" } + r.field,
+                              std::string{ fp->signature() } == r.desc);
+                    ctx.check(std::string{ "shape_onlystatic_is_ref_" } + r.field,
+                              fp->is_reference() == r.is_ref);
+                    const bool primitive{
+                        vmhook::detail::jvm_primitive_byte_width(fp->signature()) != 0 };
+                    ctx.check(std::string{ "shape_onlystatic_ref_complement_" } + r.field,
+                              fp->is_reference() == !primitive);
+                    ctx.check(std::string{ "shape_onlystatic_addr_nonnull_" } + r.field,
+                              fp->raw_address() != nullptr);
+                    // Distinct declared statics occupy DISTINCT mirror slots.
+                    if (prev_addr)
+                    {
+                        ctx.check(std::string{ "shape_onlystatic_addr_distinct_" } + r.field,
+                                  fp->raw_address() != prev_addr);
+                    }
+                    prev_addr = fp->raw_address();
+                }
+                // A genuine static value crosscheck: osInt reads the declared
+                // constant through the nested mirror (HARD — old-gen mirror slot).
+                auto vi{ fi_only_static::static_field("osInt") };
+                if (vi)
+                {
+                    const std::int32_t got{ vi->get() };
+                    ctx.check("shape_onlystatic_osInt_value", got == 0x010203);
+                }
+                // This class declares NO instance fields: an instance-only name is
+                // absent on the static path too (no such field anywhere on it).
+                ctx.check("shape_onlystatic_no_instance_field",
+                          fi_only_static::static_field("oiInt").has_value() == false);
+            }
+        }
+
+        // I.2 — ONLY-instance class: enumerate every declared instance field via
+        // the LIVE OnlyInstance wrapper.  is_static==false, descriptor / reference
+        // match, raw_address == oop+offset (recomputed) and lies after the header.
+        // All checks read proxy metadata / pointer arithmetic only → no oop deref
+        // → HARD even though the OnlyInstance object is young-gen.
+        {
+            cp("SECTION I.2 (OnlyInstance — every instance field's metadata)");
+            vmhook::hotspot::klass* const oi_klass{
+                reinterpret_cast<vmhook::hotspot::klass*>(
+                    vmhook::find_class("vmhook/fixtures/FieldIntrospection$OnlyInstance")) };
+            const auto oi{ get_only_instance() };
+            ctx.check("shape_onlyinstance_wrapper_obtained", oi != nullptr);
+            if (oi && oi_klass)
+            {
+                void* const oop{ oi->vmhook::object_base::get_instance() };
+                ctx.check("shape_onlyinstance_oop_valid",
+                          oop != nullptr && vmhook::hotspot::is_valid_pointer(oop));
+                if (oop)
+                {
+                    const ShapeRow rows[] = {
+                        { "oiBool",   "Z",                  false },
+                        { "oiInt",    "I",                  false },
+                        { "oiDouble", "D",                  false },
+                        { "oiString", "Ljava/lang/String;", true  },
+                        { "oiArray",  "[I",                 true  },
+                    };
+                    for (const ShapeRow& r : rows)
+                    {
+                        auto fp{ oi->get_field(r.field) };
+                        ctx.check(std::string{ "shape_onlyinstance_resolves_" } + r.field,
+                                  fp.has_value());
+                        if (!fp) { continue; }
+                        ctx.check(std::string{ "shape_onlyinstance_is_static_false_" } + r.field,
+                                  fp->is_static() == false);
+                        ctx.check(std::string{ "shape_onlyinstance_sig_" } + r.field,
+                                  std::string{ fp->signature() } == r.desc);
+                        ctx.check(std::string{ "shape_onlyinstance_is_ref_" } + r.field,
+                                  fp->is_reference() == r.is_ref);
+                        void* const got{ fp->raw_address() };
+                        void* const expected{ recompute_instance_addr(oi_klass, oop, r.field) };
+                        ctx.check(std::string{ "shape_onlyinstance_addr_eq_oop_offset_" } + r.field,
+                                  got != nullptr && expected != nullptr && got == expected);
+                        ctx.check(std::string{ "shape_onlyinstance_addr_after_header_" } + r.field,
+                                  reinterpret_cast<std::uint8_t*>(got)
+                                      > reinterpret_cast<std::uint8_t*>(oop));
+                    }
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    //  SECTION J — INHERITED vs DECLARED scope.  find_field walks the super
+    //  chain (vmhook.hpp ~13890), so a field DECLARED on Base resolves through a
+    //  Derived wrapper.  Prove that:
+    //    - a Derived-declared field (derivedInstance) resolves with correct
+    //      metadata,
+    //    - Base-declared fields (baseInstance / baseRef / baseStatic) ALSO
+    //      resolve through the Derived wrapper (inheritance), with correct
+    //      metadata, and at the SAME raw_address as resolving them through a Base
+    //      wrapper on the SAME oop (instance) / the Base mirror is independent
+    //      (static).
+    //  Instance metadata reads are pointer-arithmetic only → HARD; the Base
+    //  static is on Base's OWN mirror (old-gen) → HARD.
+    // =====================================================================
+    cp("SECTION J (inherited vs declared scope)");
+    {
+        vmhook::hotspot::klass* const derived_klass{
+            reinterpret_cast<vmhook::hotspot::klass*>(
+                vmhook::find_class("vmhook/fixtures/FieldIntrospection$Derived")) };
+        const auto der{ fi_derived::get_derived() };
+        ctx.check("inherit_derived_wrapper_obtained", der != nullptr);
+        if (der && derived_klass)
+        {
+            void* const oop{ der->vmhook::object_base::get_instance() };
+            ctx.check("inherit_derived_oop_valid",
+                      oop != nullptr && vmhook::hotspot::is_valid_pointer(oop));
+
+            // J.1 — the field DECLARED on Derived resolves with correct metadata.
+            {
+                auto fp{ der->get_field("derivedInstance") };
+                ctx.check("inherit_declared_resolves", fp.has_value());
+                if (fp)
+                {
+                    ctx.check("inherit_declared_is_static_false", fp->is_static() == false);
+                    ctx.check("inherit_declared_sig", std::string{ fp->signature() } == "I");
+                    ctx.check("inherit_declared_not_reference", fp->is_reference() == false);
+                    if (oop)
+                    {
+                        ctx.check("inherit_declared_addr_eq_oop_offset",
+                                  fp->raw_address()
+                                      == recompute_instance_addr(derived_klass, oop, "derivedInstance"));
+                    }
+                }
+            }
+
+            // J.2 — Base-declared INSTANCE fields resolve THROUGH the Derived
+            // wrapper (super-chain walk).  Metadata matches, and the resolved
+            // raw_address equals oop+offset recomputed against the SAME oop.
+            {
+                struct IR { const char* field; const char* desc; bool is_ref; };
+                const IR irows[] = {
+                    { "baseInstance", "I",                  false },
+                    { "baseRef",      "Ljava/lang/String;", true  },
+                };
+                for (const IR& r : irows)
+                {
+                    auto fp{ der->get_field(r.field) };
+                    ctx.check(std::string{ "inherit_inst_resolves_" } + r.field,
+                              fp.has_value());
+                    if (!fp) { continue; }
+                    ctx.check(std::string{ "inherit_inst_is_static_false_" } + r.field,
+                              fp->is_static() == false);
+                    ctx.check(std::string{ "inherit_inst_sig_" } + r.field,
+                              std::string{ fp->signature() } == r.desc);
+                    ctx.check(std::string{ "inherit_inst_is_ref_" } + r.field,
+                              fp->is_reference() == r.is_ref);
+                    if (oop)
+                    {
+                        // recompute_instance_addr walks find_field from the START
+                        // klass (Derived) too, so it equally finds the inherited
+                        // field — the two must agree byte-for-byte.
+                        ctx.check(std::string{ "inherit_inst_addr_eq_oop_offset_" } + r.field,
+                                  fp->raw_address() != nullptr
+                                      && fp->raw_address()
+                                             == recompute_instance_addr(derived_klass, oop, r.field));
+                    }
+                }
+            }
+
+            // J.3 — a Base-declared inherited field resolved through the Derived
+            // wrapper lands at the SAME raw_address as resolving it through a Base
+            // wrapper on the SAME underlying oop (re-typed): the inherited slot is
+            // a single object-absolute offset regardless of which subclass starts
+            // the lookup.  Pointer compare only → HARD.
+            if (oop)
+            {
+                auto via_derived{ der->get_field("baseInstance") };
+                // Wrap the SAME oop as a Base to resolve the inherited slot from
+                // the declaring class's own view.
+                fi_base base_view{ vmhook::oop_t{ oop } };
+                auto via_base{ base_view.get_field("baseInstance") };
+                if (via_derived && via_base)
+                {
+                    ctx.check("inherit_same_slot_through_base_and_derived",
+                              via_derived->raw_address() == via_base->raw_address());
+                }
+            }
+
+            // J.4 — Base-declared STATIC field resolves through the Derived wrapper
+            // and reads its declared value off Base's OWN mirror (old-gen → HARD).
+            {
+                auto fp{ fi_derived::static_field("baseStatic") };
+                ctx.check("inherit_static_resolves_via_derived", fp.has_value());
+                if (fp)
+                {
+                    ctx.check("inherit_static_is_static_true", fp->is_static() == true);
+                    ctx.check("inherit_static_sig", std::string{ fp->signature() } == "I");
+                    ctx.check("inherit_static_addr_nonnull", fp->raw_address() != nullptr);
+                    const std::int32_t got{ fp->get() };
+                    ctx.check("inherit_static_value", got == 0x0BA5E000);
+                }
+                // Resolving the SAME inherited static through a Base wrapper yields
+                // the SAME mirror+offset address (the declaring-klass mirror is
+                // Base's regardless of the start klass — the load-bearing
+                // declaring_klass fix-up).  Address compare only → HARD.
+                auto via_base{ fi_base::static_field("baseStatic") };
+                if (fp && via_base)
+                {
+                    ctx.check("inherit_static_same_addr_base_and_derived",
+                              fp->raw_address() == via_base->raw_address());
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    //  SECTION K — MODIFIER / VISIBILITY blindness.  field_entry_t carries NO
+    //  general access-flag bitfield, so none of the five accessors can surface
+    //  volatile / transient / private / public.  Prove a volatile/transient/
+    //  private field's {descriptor, is_static, is_reference} metadata is
+    //  IDENTICAL to a plain twin, and that a private field is still resolvable by
+    //  name (visibility-blind).  All reads are static-mirror or pointer-only.
+    // =====================================================================
+    cp("SECTION K (modifier / visibility blindness)");
+    {
+        // K.1 — volatile static int twin of sInt: same descriptor / static /
+        // non-reference; resolves and reads its declared value.
+        {
+            auto vol{ fi_fixture::static_field("sVolatileInt") };
+            auto plain{ fi_fixture::static_field("sInt") };
+            ctx.check("modblind_volatile_resolves", vol.has_value());
+            if (vol && plain)
+            {
+                ctx.check("modblind_volatile_sig_eq_plain",
+                          std::string{ vol->signature() } == std::string{ plain->signature() });
+                ctx.check("modblind_volatile_is_static_eq_plain",
+                          vol->is_static() == plain->is_static());
+                ctx.check("modblind_volatile_is_ref_eq_plain",
+                          vol->is_reference() == plain->is_reference());
+                ctx.check("modblind_volatile_value",
+                          static_cast<std::int32_t>(vol->get()) == 0x5A5A5A5A);
+            }
+        }
+
+        // K.2 — private static String: resolvable by name despite being private;
+        // descriptor / static / reference are the normal reference-field metadata.
+        {
+            auto fp{ fi_fixture::static_field("sPrivateString") };
+            ctx.check("modblind_private_static_resolves", fp.has_value());
+            if (fp)
+            {
+                ctx.check("modblind_private_static_sig",
+                          std::string{ fp->signature() } == "Ljava/lang/String;");
+                ctx.check("modblind_private_static_is_static", fp->is_static() == true);
+                ctx.check("modblind_private_static_is_ref", fp->is_reference() == true);
+            }
+        }
+
+        // K.3 — transient + private INSTANCE int fields: same descriptor / non-
+        // static / non-reference as iInt.  Pointer / metadata only → HARD.
+        {
+            cp("SECTION K.3 (transient/private instance metadata — pointer only)");
+            const auto inst{ fi_fixture::get_instance() };
+            if (inst)
+            {
+                auto plain{ inst->get_field("iInt") };
+                auto tr{ inst->get_field("iTransientInt") };
+                ctx.check("modblind_transient_resolves", tr.has_value());
+                if (tr && plain)
+                {
+                    ctx.check("modblind_transient_sig_eq_plain",
+                              std::string{ tr->signature() } == std::string{ plain->signature() });
+                    ctx.check("modblind_transient_is_static_false", tr->is_static() == false);
+                    ctx.check("modblind_transient_is_ref_false", tr->is_reference() == false);
+                    ctx.check("modblind_transient_addr_nonnull", tr->raw_address() != nullptr);
+                }
+                auto pr{ inst->get_field("iPrivateInt") };
+                ctx.check("modblind_private_instance_resolves", pr.has_value());
+                if (pr)
+                {
+                    ctx.check("modblind_private_instance_sig", std::string{ pr->signature() } == "I");
+                    ctx.check("modblind_private_instance_is_static_false", pr->is_static() == false);
+                    ctx.check("modblind_private_instance_is_ref_false", pr->is_reference() == false);
+                }
+            }
+        }
+
+        ctx.record("[INFO] modifier/visibility-blindness: signature/is_static/is_reference/"
+                   "raw_address/get_compressed_oop expose NEITHER JVM_ACC_VOLATILE/TRANSIENT "
+                   "nor the access level (PRIVATE/PUBLIC) — field_entry_t carries only "
+                   "offset/is_static/signature/declaring_klass, so a volatile/transient/"
+                   "private field is metadata-indistinguishable from a plain twin and a "
+                   "private field is resolvable by name regardless of access control.");
+    }
+
+    // =====================================================================
+    //  SECTION L — DEGENERATE field-lookup inputs (no crash).  An absent name,
+    //  an empty name, and a garbage/over-long name must all resolve to nullopt
+    //  on BOTH the static and (where an instance exists) the instance path,
+    //  never fabricating a proxy and never faulting.
+    // =====================================================================
+    cp("SECTION L (degenerate field-lookup inputs — no crash)");
+    {
+        ctx.check("degenerate_static_absent_name",
+                  fi_fixture::static_field("definitelyNotAField").has_value() == false);
+        ctx.check("degenerate_static_empty_name",
+                  fi_fixture::static_field("").has_value() == false);
+        ctx.check("degenerate_static_garbage_name",
+                  fi_fixture::static_field("\xFF\xFE not-a-field \t\n").has_value() == false);
+        // A 512-char name cannot match any declared field — must miss cleanly.
+        {
+            const std::string long_name(512, 'q');
+            ctx.check("degenerate_static_overlong_name",
+                      fi_fixture::static_field(long_name.c_str()).has_value() == false);
+        }
+        // Asking for an INSTANCE field name on the STATIC path misses (iInt is not
+        // static) — static_field walks for JVM_ACC_STATIC and only the static slot
+        // would be returned; an instance-only name has no static entry.
+        const auto inst{ fi_fixture::get_instance() };
+        if (inst)
+        {
+            ctx.check("degenerate_instance_absent_name",
+                      inst->get_field("definitelyNotAField").has_value() == false);
+            ctx.check("degenerate_instance_empty_name",
+                      inst->get_field("").has_value() == false);
+            ctx.check("degenerate_instance_garbage_name",
+                      inst->get_field("\x01\x02\x03nope").has_value() == false);
         }
     }
 

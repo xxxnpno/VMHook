@@ -58,6 +58,13 @@ public final class OnClassLoaded
      *   8 = load Probe8                       (fresh)
      *   9 = load Probe9                       (fresh; fire-capable settle canary)
      *  10 = load Probe10                      (fresh; post-shutdown settle canary)
+     *  11 = load ProbeIface                   (fresh INTERFACE bytecode shape)
+     *  12 = load ProbeArrays                  (fresh class carrying array descriptors)
+     *  13 = load ProbeInner                   (fresh NON-static member inner class)
+     *  14 = define ProbeCustom via a CUSTOM   (fresh, defined by a user ClassLoader
+     *       ClassLoader (not the app loader)   subclass calling defineClass(byte[]))
+     *  15 = attempt a NON-EXISTENT class       (load FAILS cleanly; no defineClass)
+     *  16 = load ProbeAfterFail                (fresh; proves the watcher survives 15)
      */
     public static volatile int which;
 
@@ -69,6 +76,22 @@ public final class OnClassLoaded
 
     /** True iff every load run() attempted this cycle succeeded. */
     public static volatile boolean loadOk;
+
+    /**
+     * True iff the custom-classloader cycle (which==14) defined ProbeCustom
+     * through a user ClassLoader subclass (NOT the application loader) and got
+     * back a usable Class.  Read independently of the watcher callback.
+     */
+    public static volatile boolean customLoadOk;
+
+    /**
+     * True iff the fail-to-load cycle (which==15) caught the expected load failure
+     * WITHOUT escaping — proves the armed watcher does not destabilise a failing
+     * load.  The defineClass for a non-existent class never happens, so the
+     * watcher must stay silent for that name; this flag only proves the Java side
+     * failed cleanly (no crash, exception contained).
+     */
+    public static volatile boolean loadFailedCleanly;
 
     // ---- Fresh-load targets ------------------------------------------------
     // Distinct nested classes, never referenced elsewhere, so HotSpot does not
@@ -85,6 +108,32 @@ public final class OnClassLoaded
     public static final class Probe9 { public static final int BEACON = 0xB9; }
     public static final class Probe10 { public static final int BEACON = 0xBA; }
 
+    // ---- Varied class SHAPES (distinct bytecode forms the watcher must see) ----
+    // An INTERFACE: a non-class bytecode shape still flows through defineClass.
+    public interface ProbeIface { int BEACON = 0xC1; }
+
+    // A class whose <clinit> builds arrays, so its constant pool carries array
+    // type descriptors ([I, [[J, [Ljava/lang/String;) — a fatter defineClass.
+    public static final class ProbeArrays
+    {
+        public static final int[]      ONE = new int[] { 0xC2 };
+        public static final long[][]   TWO = new long[][] { { 0xC2L } };
+        public static final String[]   STR = new String[] { "C2" };
+    }
+
+    // A NON-static member inner class — distinct nested shape (synthetic this$0
+    // outer reference) from the static nested ProbeN classes above.
+    public final class ProbeInner { public final int beacon = 0xC3; }
+
+    // The class the custom loader (below) defines from real .class bytes.  It is
+    // never referenced by name elsewhere, so it stays pristine until which==14
+    // forces the custom loader to define it.
+    public static final class ProbeCustom { public static final int BEACON = 0xC4; }
+
+    // A pristine class loaded AFTER the deliberate fail cycle (which==16) to prove
+    // the watcher and JVM survived a failed load and still observe a fresh one.
+    public static final class ProbeAfterFail { public static final int BEACON = 0xC5; }
+
     /** The simple ('$'-joined) nested name the native side expects, per `which`. */
     public static final String PROBE1_NAME = "vmhook.fixtures.OnClassLoaded$Probe1";
     public static final String PROBE2_NAME = "vmhook.fixtures.OnClassLoaded$Probe2";
@@ -96,6 +145,56 @@ public final class OnClassLoaded
     public static final String PROBE8_NAME = "vmhook.fixtures.OnClassLoaded$Probe8";
     public static final String PROBE9_NAME = "vmhook.fixtures.OnClassLoaded$Probe9";
     public static final String PROBE10_NAME = "vmhook.fixtures.OnClassLoaded$Probe10";
+    public static final String IFACE_NAME  = "vmhook.fixtures.OnClassLoaded$ProbeIface";
+    public static final String ARRAYS_NAME = "vmhook.fixtures.OnClassLoaded$ProbeArrays";
+    public static final String INNER_NAME  = "vmhook.fixtures.OnClassLoaded$ProbeInner";
+    public static final String CUSTOM_NAME = "vmhook.fixtures.OnClassLoaded$ProbeCustom";
+    public static final String AFTERFAIL_NAME = "vmhook.fixtures.OnClassLoaded$ProbeAfterFail";
+    /** A name that resolves to NO class on any loader; used by the fail cycle. */
+    public static final String MISSING_NAME = "vmhook.fixtures.OnClassLoaded$NoSuchProbe";
+
+    /**
+     * A user ClassLoader subclass that defines ProbeCustom from the real .class
+     * bytes (read out of the application loader as a resource).  It calls the
+     * inherited, hooked {@code java.lang.ClassLoader.defineClass(String, byte[],
+     * int, int, ProtectionDomain)} directly, so the watcher must observe the load
+     * even though the loader is NOT the application loader.  Java-8 safe: plain
+     * stream copy, no NIO/var/try-with-resources-on-multiple needed.
+     */
+    static final class CustomLoader extends ClassLoader
+    {
+        CustomLoader(final ClassLoader parent)
+        {
+            super(parent);
+        }
+
+        Class<?> define(final String binaryName) throws Exception
+        {
+            final String resource = binaryName.replace('.', '/') + ".class";
+            final java.io.InputStream in = getParent().getResourceAsStream(resource);
+            if (in == null)
+            {
+                throw new ClassNotFoundException("no bytes for " + binaryName);
+            }
+            try
+            {
+                final java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+                final byte[] chunk = new byte[4096];
+                int n;
+                while ((n = in.read(chunk)) > 0)
+                {
+                    buf.write(chunk, 0, n);
+                }
+                final byte[] bytes = buf.toByteArray();
+                // Inherited, hooked ClassLoader.defineClass(String,byte[],int,int,PD).
+                return defineClass(binaryName, bytes, 0, bytes.length, null);
+            }
+            finally
+            {
+                in.close();
+            }
+        }
+    }
 
     /**
      * Force one class to load through the application class loader.  Class.forName
@@ -123,10 +222,39 @@ public final class OnClassLoaded
         }
     }
 
+    /**
+     * Define {@code binaryName} through a fresh CustomLoader (a user ClassLoader
+     * subclass), NOT the application loader.  Routes through the inherited hooked
+     * {@code ClassLoader.defineClass(String,byte[],int,int,ProtectionDomain)}, so
+     * the armed watcher must observe it.  Records the binary name + bumps the
+     * count exactly like {@link #force}, so the native witnesses are uniform.
+     */
+    private static boolean forceCustom(final String binaryName)
+    {
+        try
+        {
+            final CustomLoader loader = new CustomLoader(OnClassLoaded.class.getClassLoader());
+            final Class<?> defined = loader.define(binaryName);
+            customLoadOk = defined != null
+                    && defined.getName().equals(binaryName)
+                    && defined.getClassLoader() == loader;
+            lastLoadedName = binaryName;
+            loadCount++;
+            return customLoadOk;
+        }
+        catch (final Throwable t)
+        {
+            System.err.println("[WARN] OnClassLoaded.forceCustom(" + binaryName + "): " + t);
+            return false;
+        }
+    }
+
     private static void runScenario()
     {
         loadCount = 0;
         loadOk = false;
+        customLoadOk = false;
+        loadFailedCleanly = false;
         switch (which)
         {
             case 1:
@@ -162,6 +290,34 @@ public final class OnClassLoaded
                 break;
             case 10:
                 loadOk = force(PROBE10_NAME);
+                break;
+            case 11:
+                // Fresh INTERFACE — a non-class bytecode shape still defineClass'd.
+                loadOk = force(IFACE_NAME);
+                break;
+            case 12:
+                // Fresh class carrying array descriptors in its constant pool.
+                loadOk = force(ARRAYS_NAME);
+                break;
+            case 13:
+                // Fresh NON-static member inner class (synthetic this$0 shape).
+                loadOk = force(INNER_NAME);
+                break;
+            case 14:
+                // Fresh class defined by a CUSTOM ClassLoader (not the app loader).
+                loadOk = forceCustom(CUSTOM_NAME);
+                break;
+            case 15:
+                // A class that FAILS to load: Class.forName must throw and be
+                // caught cleanly.  No defineClass occurs, so the armed watcher
+                // must stay silent; loadOk stays false, loadFailedCleanly true.
+                loadOk = force(MISSING_NAME);
+                loadFailedCleanly = !loadOk;
+                break;
+            case 16:
+                // A fresh good load AFTER the failed one — proves the watcher
+                // (and the JVM) survived the failure and still observes loads.
+                loadOk = force(AFTERFAIL_NAME);
                 break;
             default:
                 break;

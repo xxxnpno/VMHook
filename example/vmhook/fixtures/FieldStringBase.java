@@ -32,6 +32,12 @@ class FieldStringBase
     // instance field_proxy resolves it via the super walk (depth 1).
     public String inheritedStr = "base-inherited";
 
+    // Inherited INSTANCE String with NON-ASCII (CJK) content, declared ONLY on
+    // the base.  Proves the super-walk field resolution feeds the UTF-16 decode
+    // path (the other inherited fields are pure ASCII / LATIN1).  Value 日本
+    // (U+65E5 U+672C); built from a char[] so it owns a private backing.
+    public String inheritedCjk = new String(new char[]{ (char) 0x65E5, (char) 0x672C });
+
     // Inherited STATIC String, declared ONLY on the base.  Resolved via the
     // same super walk on the java.lang.Class mirror through the child wrapper.
     public static String sInheritedStr = "base-static-inherited";
@@ -40,6 +46,7 @@ class FieldStringBase
     // be present (and class-initialized) in the layout.
     String describe()
     {
-        return this.inheritedStr + "/" + FieldStringBase.sInheritedStr;
+        return this.inheritedStr + "/" + FieldStringBase.sInheritedStr
+                + "/" + this.inheritedCjk;
     }
 }

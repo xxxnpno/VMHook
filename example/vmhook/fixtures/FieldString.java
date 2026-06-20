@@ -117,6 +117,54 @@ public class FieldString extends FieldStringBase
     // prove a fresh field_proxy read sees the NEW backing (GC-sensitive -> [INFO]).
     public static String getReassign    = freshAscii("before");          // -> "after2"
 
+    // ----- batch-17 GET deepening: "every possible read" the battery lacked ----
+    // ASCII control characters (TAB 0x09, LF 0x0A, CR 0x0D) embedded between
+    // letters.  All <= 0x7F so the String stores LATIN1 (coder 0) and decodes
+    // byte-verbatim — proves read_java_string preserves control bytes (no
+    // newline/tab normalisation) and is line-ending agnostic.  7 bytes.
+    public static String getControls    = makeControls();                // a\t b\n c\r d
+
+    // COMPACT-STRING CODER BOUNDARY — content identity across both backings.
+    // The same shared ASCII prefix "Shared!" is the head of TWO Strings: one that
+    // stays LATIN1 (coder 0, all cp <= 0xFF) and one promoted to UTF-16 (coder 1)
+    // by a trailing astral scalar.  read_java_string must decode the shared prefix
+    // to the IDENTICAL 7 UTF-8 bytes on BOTH layouts (the native side asserts the
+    // first 7 decoded bytes are equal), proving the LATIN1 and UTF-16 decode paths
+    // agree on common content.  The Latin1 one also carries a trailing 'é' (cp
+    // 0x00E9, still <= 0xFF -> stays coder 0).
+    public static String getCoderLatin1Prefix = makeCoderLatin1Prefix();  // "Shared!é"
+    public static String getCoderUtf16Prefix  = makeCoderUtf16Prefix();   // "Shared!" + U+1F4A9
+
+    // U+07FF -> the LAST 2-byte UTF-8 code point (DF BF); > 0xFF so stored UTF-16
+    // (coder 1).  Pairs with getLo80 (C2 80, first 2-byte) and getU0800 (E0 A0 80,
+    // first 3-byte) to nail the 2-byte/3-byte encoder boundary from BOTH sides.
+    public static String getU07FF       = new String(new char[]{ (char) 0x07FF });
+    // U+10000 -> the SMALLEST astral code point (4-byte UTF-8 F0 90 80 80); the
+    // surrogate-pair low edge (D800 DC00).  Pairs with getAstral (U+1F600, mid).
+    public static String getAstralMin   = new String(Character.toChars(0x10000));
+    // U+10FFFF -> the LARGEST valid Unicode code point (4-byte UTF-8 F4 8F BF BF);
+    // the surrogate-pair high edge (DBFF DFFF).  Proves the surrogate-combining
+    // arithmetic is exact at the very top of the code space.
+    public static String getAstralMax   = new String(Character.toChars(0x10FFFF));
+    // U+FFFD REPLACEMENT CHARACTER assigned as REAL content (not an error path):
+    // a legitimate 3-byte BMP char (EF BF BD) that must round-trip verbatim, never
+    // confused with read_java_string's own degrade-to-"" behaviour.
+    public static String getReplacement = new String(new char[]{ (char) 0xFFFD });
+    // Multi-script BMP: Latin 'A' + Greek alpha (U+03B1) + Hiragana 'i' (U+3044) +
+    // Hangul 'ga' (U+AC00).  > 0xFF -> UTF-16 (coder 1); decodes to a mix of 1-,
+    // 2- and 3-byte UTF-8 sequences in one string.  Bytes: 41 CE B1 E3 81 84 EA B0 80.
+    public static String getMultiScript = makeMultiScript();
+    // MODEST-long UTF-16 with REPEATED surrogate pairs: 100 copies of U+1F4A9
+    // (PILE OF POO, 4-byte UTF-8 F0 9F 92 A9).  byte[] length 400 (200 UTF-16
+    // units), decodes to 100 * 4 = 400 UTF-8 bytes.  Exercises the surrogate-pair
+    // combining loop MANY times in one decode (heap-modest, 100 code points).
+    public static String getEmojiRun    = makeEmojiRun(100);
+    // INHERITED INSTANCE String with NON-ASCII (CJK) content, declared only on
+    // FieldStringBase: proves the super-walk field resolution feeds the UTF-16
+    // decode path (the existing inherited fields are pure ASCII / LATIN1 only).
+    // Value 日本 (U+65E5 U+672C) -> 6 UTF-8 bytes E6 97 A5 E6 9C AC.  (Field lives
+    // on the base; see inheritedCjk there.)
+
     // Java-published facts about the GET targets (native cross-checks these).
     public static volatile int     jAsciiLen;
     public static volatile int     jLatin1Len;
@@ -140,6 +188,20 @@ public class FieldString extends FieldStringBase
     public static volatile String  jStaticInheritedValue; // inherited static String, read in Java
     public static volatile String  jInstGetOnlyValue;   // clean instance String, read in Java
     public static volatile String  jReassignAfterValue; // getReassign AFTER the probe reassigns it
+    // ...for the batch-17 GET deepening targets.
+    public static volatile int     jControlsLen;        // == 7
+    public static volatile int     jControlsCp1;        // == 0x09 (TAB)
+    public static volatile int     jCoderLatin1Cp7;     // codePointAt(7) == 0x00E9 (trailing é)
+    public static volatile int     jCoderUtf16Cp7;      // codePointAt(7) == 0x1F4A9 (trailing astral)
+    public static volatile int     jU07FFCp0;           // == 0x07FF
+    public static volatile int     jAstralMinCp0;       // == 0x10000
+    public static volatile int     jAstralMaxCp0;       // == 0x10FFFF
+    public static volatile int     jReplacementCp0;     // == 0xFFFD
+    public static volatile int     jMultiScriptLen;     // == 4 (chars)
+    public static volatile int     jMultiScriptCp3;     // == 0xAC00 (Hangul ga)
+    public static volatile int     jEmojiRunCpCount;    // == 100
+    public static volatile int     jEmojiRunCp0;        // == 0x1F4A9
+    public static volatile String  jInheritedCjkValue;  // inherited non-ASCII instance String
 
     // ================= SET targets (static) ================================
     // field_proxy::set(std::string) REBINDS the field to a freshly-built String
@@ -262,6 +324,14 @@ public class FieldString extends FieldStringBase
     // A primitive int field.  Native attempts field_proxy::set(std::string) on
     // it; the type guard must REFUSE the write and leave this unchanged.
     public static int notAStringInt = 12345;
+    // A NON-String object reference field (java.lang.Object holding an int[]).
+    // Native reads its compressed OOP and feeds it to read_java_string, which
+    // resolves java/lang/String's `value` offset and treats the bytes there as a
+    // backing-array OOP.  For a non-String object that slot is NOT a valid String
+    // backing array, so read_java_string must DEGRADE GRACEFULLY (return "" or a
+    // bounded best-effort decode) and NEVER crash.  The native side asserts only
+    // no-crash + a bounded (short) result via [INFO] — exact bytes are undefined.
+    public static Object notAStringObj = new int[]{ 1, 2, 3, 4 };
     // A String the native side reads but never writes; used to prove that
     // reading an interned literal does not corrupt the shared pool.
     public static volatile boolean internedStillIntact;
@@ -293,6 +363,59 @@ public class FieldString extends FieldStringBase
         // Five Latin-1 'AA' so coder is 0 and backing length is 5 bytes.
         final char[] c = { 'A', 'A', 'A', 'A', 'A' };
         return new String(c);
+    }
+
+    private static String makeControls()
+    {
+        // a TAB b LF c CR d  -- all ASCII control/print bytes, LATIN1 coder 0.
+        final char[] c = { 'a', (char) 0x0009, 'b', (char) 0x000A,
+                           'c', (char) 0x000D, 'd' };
+        return new String(c);
+    }
+
+    private static String makeCoderLatin1Prefix()
+    {
+        // "Shared!" + 'é' -- all code points <= 0xFF -> LATIN1 (coder 0).  The
+        // first 7 chars are the shared ASCII prefix.
+        final char[] c = { 'S', 'h', 'a', 'r', 'e', 'd', '!', (char) 0x00E9 };
+        return new String(c);
+    }
+
+    private static String makeCoderUtf16Prefix()
+    {
+        // "Shared!" + U+1F4A9 -- the trailing astral scalar forces the WHOLE
+        // String to UTF-16 (coder 1), but the shared ASCII prefix must still
+        // decode to the IDENTICAL 7 UTF-8 bytes as the LATIN1 sibling above.
+        final StringBuilder b = new StringBuilder();
+        b.append("Shared!");
+        b.appendCodePoint(0x1F4A9);
+        return b.toString();
+    }
+
+    /**
+     * Builds 'A' + Greek alpha (U+03B1) + Hiragana 'i' (U+3044) + Hangul 'ga'
+     * (U+AC00).  Contains code points &gt; 0xFF so the String stores UTF-16
+     * (coder 1) and decodes to a mix of 1-, 2- and 3-byte UTF-8 sequences.
+     */
+    private static String makeMultiScript()
+    {
+        final char[] c = { 'A', (char) 0x03B1, (char) 0x3044, (char) 0xAC00 };
+        return new String(c);
+    }
+
+    /**
+     * Builds {@code count} copies of U+1F4A9 (a 4-byte astral scalar carried as
+     * a UTF-16 surrogate pair), to exercise the surrogate-pair combining loop
+     * many times in one decode.  Heap-modest: count is small (100).
+     */
+    private static String makeEmojiRun(final int count)
+    {
+        final StringBuilder b = new StringBuilder();
+        for (int i = 0; i < count; i++)
+        {
+            b.appendCodePoint(0x1F4A9);
+        }
+        return b.toString();
     }
 
     /**
@@ -385,6 +508,21 @@ public class FieldString extends FieldStringBase
                 jInheritedStrValue    = self.inheritedStr;       // inherited instance String
                 jStaticInheritedValue = FieldStringBase.sInheritedStr;
                 jInstGetOnlyValue     = self.instGetOnly;        // clean instance String
+
+                // --- Java-observed facts about the batch-17 GET deepening ----
+                jControlsLen     = getControls.length();          // 7
+                jControlsCp1     = getControls.codePointAt(1);    // 0x09 (TAB)
+                jCoderLatin1Cp7  = getCoderLatin1Prefix.codePointAt(7); // 0x00E9
+                jCoderUtf16Cp7   = getCoderUtf16Prefix.codePointAt(7);  // 0x1F4A9
+                jU07FFCp0        = getU07FF.codePointAt(0);       // 0x07FF
+                jAstralMinCp0    = getAstralMin.codePointAt(0);   // 0x10000
+                jAstralMaxCp0    = getAstralMax.codePointAt(0);   // 0x10FFFF
+                jReplacementCp0  = getReplacement.codePointAt(0); // 0xFFFD
+                jMultiScriptLen  = getMultiScript.length();       // 4
+                jMultiScriptCp3  = getMultiScript.codePointAt(3); // 0xAC00
+                jEmojiRunCpCount = getEmojiRun.codePointCount(0, getEmojiRun.length()); // 100
+                jEmojiRunCp0     = getEmojiRun.codePointAt(0);    // 0x1F4A9
+                jInheritedCjkValue = self.inheritedCjk;           // inherited non-ASCII
 
                 // --- reassign getReassign to a NEW backing String.  The module
                 //     read it as "before" BEFORE the probe; a fresh field_proxy

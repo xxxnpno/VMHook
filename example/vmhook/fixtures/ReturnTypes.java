@@ -167,6 +167,7 @@ public final class ReturnTypes
     public short returnsShortMax()    { return Short.MAX_VALUE; }  // 32767
     public short returnsShortMin()    { return Short.MIN_VALUE; }  // -32768
     public short returnsShortNegOne() { return (short) -1; }
+    public short returnsShortZero()   { return (short) 0; }       // exact-zero boundary
 
     // ========================================================================
     //  char (C) -- UNSIGNED 16-bit
@@ -196,6 +197,11 @@ public final class ReturnTypes
     public long returnsLongHighOnly() { return 0x1234567800000000L; }
     // High 32 bits ZERO: the inverse -- a 64-bit read must NOT sign-extend the low word.
     public long returnsLongLowOnly()  { return 0x00000000FFFFFFFFL; } // == 4294967295, NOT -1
+    public long returnsLongZero()     { return 0L; }                  // exact-zero boundary (all 64 bits clear)
+    // All-ones 64-bit -> -1L.  Distinct from returnsLongLowOnly (low word == 0xFFFFFFFF,
+    // high word == 0): a buggy "read low word and sign-extend" would read BOTH as -1,
+    // so the pair pins that the long read takes the full 64 bits, not a sign-extended low word.
+    public long returnsLongNegOne()   { return -1L; }                 // 0xFFFFFFFFFFFFFFFF
 
     // ========================================================================
     //  float (F)
@@ -204,8 +210,13 @@ public final class ReturnTypes
     public float returnsFloatNaN() { return Float.NaN; }
     public float returnsFloatBits(){ return Float.intBitsToFloat(0x7f7fffff); } // FLT_MAX exact bit pattern
     public float returnsFloatNegZero(){ return -0.0f; }                     // bits 0x80000000 (NOT +0.0's 0x0)
+    public float returnsFloatPosZero(){ return 0.0f; }                      // bits 0x00000000 (the +0.0 counterpart)
     public float returnsFloatNegInf(){ return Float.NEGATIVE_INFINITY; }    // bits 0xFF800000
+    public float returnsFloatPosInf(){ return Float.POSITIVE_INFINITY; }    // bits 0x7F800000 (the +Inf counterpart)
     public float returnsFloatSubnormal(){ return Float.intBitsToFloat(0x00000001); } // smallest subnormal, bits 0x1
+    // A NaN with a SPECIFIC non-canonical payload (sign bit + a low mantissa bit set):
+    // proves the exact 32 bits survive the decode, not merely "some NaN".
+    public float returnsFloatNanPayload(){ return Float.intBitsToFloat(0xFFC00001); } // signaling-pattern NaN, exact bits
 
     // ========================================================================
     //  double (D)
@@ -214,8 +225,12 @@ public final class ReturnTypes
     public double returnsDoubleNaN() { return Double.NaN; }
     public double returnsDoubleBits(){ return Double.longBitsToDouble(0x7fefffffffffffffL); } // DBL_MAX exact bits
     public double returnsDoubleNegZero(){ return -0.0; }                           // bits 0x8000000000000000
+    public double returnsDoublePosZero(){ return 0.0; }                            // bits 0x0000000000000000 (the +0.0 counterpart)
     public double returnsDoublePosInf(){ return Double.POSITIVE_INFINITY; }        // bits 0x7FF0000000000000
+    public double returnsDoubleNegInf(){ return Double.NEGATIVE_INFINITY; }        // bits 0xFFF0000000000000 (the -Inf counterpart)
     public double returnsDoubleSubnormal(){ return Double.longBitsToDouble(0x1L); }// smallest subnormal, bits 0x1
+    // A double NaN with a SPECIFIC non-canonical payload: exact 64 bits must survive.
+    public double returnsDoubleNanPayload(){ return Double.longBitsToDouble(0xFFF8000000000001L); } // exact-bits NaN
 
     // ========================================================================
     //  java.lang.String
@@ -258,6 +273,15 @@ public final class ReturnTypes
     public Integer returnsBoxedInteger() { return Integer.valueOf(0x12345678); }
     public Long    returnsBoxedLong()    { return Long.valueOf(0x123456789ABCDEF0L); }
     public Double  returnsBoxedDouble()  { return Double.valueOf(2.718281828459045); }
+    // -- the remaining JLS box types: Boolean / Byte / Short / Character / Float.  Each
+    //    decodes to a reference value_t; the native side wraps it and reads the boxed
+    //    value back through booleanValue()/byteValue()/shortValue()/charValue()/floatValue().
+    //    Values chosen distinct so a wrong wrapper/decode would mismatch. -------------
+    public Boolean   returnsBoxedBoolean()  { return Boolean.valueOf(true); }
+    public Byte      returnsBoxedByte()     { return Byte.valueOf((byte) -7); }
+    public Short     returnsBoxedShort()    { return Short.valueOf((short) -3210); }
+    public Character returnsBoxedCharacter(){ return Character.valueOf((char) 0xCAFE); } // 51966 unsigned
+    public Float     returnsBoxedFloat()    { return Float.valueOf(3.1415926f); }        // bits 0x40490FDA
 
     // ========================================================================
     //  Object / null-returning method
@@ -331,6 +355,11 @@ public final class ReturnTypes
     public long   combo(long v)   { return v + 0x100000000L; }        // (J)J  (adds a HIGH-word delta)
     public String combo(String v) { return v + "!"; }                 // (Ljava/lang/String;)Ljava/lang/String;
     public double combo()         { return 6.25; }                    // ()D  bits 0x4019000000000000
+    // Two MORE pinned overloads whose return type is a SUB-INT / boolean BasicType: the
+    // descriptor is the sole disambiguator and the decode must pick the matching narrow
+    // value_t alternative (boolean -> bool alt 1; char -> u16 alt 8), not int.
+    public boolean combo(boolean v) { return !v; }                    // (Z)Z   -> bool alt
+    public char    combo(char v)    { return (char) (v + 1); }        // (C)C   -> u16 alt
 
     // ========================================================================
     //  STATIC returners -- one per BasicType + String + Object + null + an array.
@@ -354,6 +383,13 @@ public final class ReturnTypes
     public static Object  staticReturnsObject() { return OBJECT_SINGLETON; } // same singleton, OOP cross-check
     public static Object  staticReturnsNull()   { return null; }
     public static int[]   staticReturnsIntArray() { return new int[] { 11, 22, 33 }; }
+    // A static method returning a BOXED Integer: the static dispatch path recovers the
+    // wrapper OOP, and the native side reads the boxed value back through intValue() --
+    // proving the GetStaticMethodID reference decode wraps a non-array reference too.
+    public static Integer staticReturnsBoxedInteger() { return Integer.valueOf(0x5A5A5A5A); }
+    // A static String whose runtime length is well under the 4096 cap but longer than the
+    // headline, decoded exactly through the static path (parity with the instance long String).
+    public static String  staticReturnsStringEmpty()  { return ""; }   // static empty-String boundary
 
     static
     {

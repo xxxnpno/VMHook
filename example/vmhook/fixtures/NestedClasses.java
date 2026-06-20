@@ -86,6 +86,8 @@ public final class NestedClasses
      *       proof) — also fires any interpreter hook on a genuine dispatch.
      *   2 = drive the deeply-nested / inner-in-inner / nested-enum methods
      *       through REAL bytecode and publish their results.
+     *   3 = drive the static-in-inner / iface-member / host-enum / anon-of-iface
+     *       methods through REAL bytecode and publish their results.
      */
     public static volatile int mode;
 
@@ -103,6 +105,9 @@ public final class NestedClasses
     public static final int GENERIC_BOX_INIT   = 321;   // GenericBox.boxed (erased Object holding Integer)
     public static final int LOCAL_INIT         = 7777;  // local class field
     public static final int NESTED_ENUM_RANK   = 3;     // NestedEnum.GAMMA.rank() == ordinal()+1
+    public static final int ENUM_STATIC_INIT     = 13;  // NestedEnum$EnumStatic.enumStaticValue
+    public static final int IFACE_MEMBER_INIT    = 70;  // NestedIface$IfaceMember.ifaceMemberValue
+    public static final int HOST_COLOR_CODE      = 11;  // Host$HostColor.GREEN.code() == ordinal()+10
 
     // ── The outer holder.  STATIC nested so it needs no NestedClasses instance,
     //    yet still produces the 3-level internal name NestedClasses$Host and is
@@ -207,6 +212,22 @@ public final class NestedClasses
         {
             return new SecondInner();
         }
+
+        // ---- ENUM nested INSIDE the Host class (4-segment enum name) ---------
+        //   Internal name: NestedClasses$Host$HostColor.  An enum nested one level
+        //   deeper than NestedEnum: its super is still java.lang.Enum, it still
+        //   carries the synthetic values()/valueOf()/$VALUES, and a `$`-nested enum
+        //   resolves by its multi-segment $-name exactly like any other shape.  A
+        //   static nested type (an enum is implicitly static), so NO this$N.
+        public enum HostColor
+        {
+            RED, GREEN, BLUE;
+
+            public int code()
+            {
+                return this.ordinal() + 10;
+            }
+        }
     }
 
     // ── Nested INTERFACE (an InstanceKlass under the hood). ──────────────────
@@ -221,6 +242,22 @@ public final class NestedClasses
         {
             return IFACE_CONST;
         }
+
+        // ---- a NESTED CLASS of an INTERFACE (implicitly static -> no this$0) --
+        //   Internal name: NestedClasses$NestedIface$IfaceMember.  A member type
+        //   of an interface is implicitly PUBLIC STATIC, so even though it is a
+        //   class nested inside an interface it carries NO synthetic outer
+        //   reference.  Proves the `$`-name resolution + field/method access work
+        //   for a class whose immediate encloser is an interface (not a class).
+        class IfaceMember
+        {
+            public int ifaceMemberValue = IFACE_MEMBER_INIT;
+
+            public int memberPlusConst()
+            {
+                return this.ifaceMemberValue + IFACE_CONST;
+            }
+        }
     }
 
     // ── Nested ENUM (super is java.lang.Enum; ENUM+FINAL access bits). ────────
@@ -232,6 +269,22 @@ public final class NestedClasses
         public int rank()
         {
             return this.ordinal() + 1;
+        }
+
+        // ---- a STATIC nested class whose immediate encloser is an ENUM -------
+        //   Internal name: NestedClasses$NestedEnum$EnumStatic.  A static nested
+        //   class can be declared inside an enum (an enum is implicitly a class);
+        //   it carries NO synthetic outer reference.  Proves the `$`-name path and
+        //   field/method access work when the enclosing type is an enum, not a
+        //   plain class — a 3-segment $-name whose middle segment is an enum.
+        public static class EnumStatic
+        {
+            public int enumStaticValue = ENUM_STATIC_INIT;
+
+            public int tripled()
+            {
+                return this.enumStaticValue * 3;
+            }
         }
     }
 
@@ -291,6 +344,27 @@ public final class NestedClasses
     }
 
     /**
+     * Builds a SECOND anonymous class instance, this one implementing the NESTED
+     * interface {@link NestedIface} (not Runnable).  javac names it with another
+     * unstable ordinal (NestedClasses$2 or similar) and its DIRECT super is
+     * java.lang.Object while it implements NestedClasses$NestedIface — so the
+     * native side resolves the klass from the live oop and asserts the
+     * Outer$&lt;ordinal&gt; shape, distinct from the Runnable anonymous.  Carries a
+     * this$0 back to this NestedClasses instance.
+     */
+    public Object makeAnonymousIface()
+    {
+        return new NestedIface()
+        {
+            @Override
+            public int ifaceOp(final int x)
+            {
+                return x + NestedClasses.this.selfMarker;
+            }
+        };
+    }
+
+    /**
      * Builds a LOCAL class instance.  javac names it NestedClasses$1LocalCounter
      * (the $1 ordinal is unstable) and injects a this$0 -> this NestedClasses
      * instance.  Returned as Object for the same reason as the anonymous case.
@@ -332,8 +406,17 @@ public final class NestedClasses
     /** A generic (erased) box holding an Integer. */
     public static final GenericBox<Integer> genericBoxInst = new GenericBox<Integer>(Integer.valueOf(GENERIC_BOX_INIT));
 
+    /** A STATIC nested class declared INSIDE the nested ENUM (no this$N). */
+    public static final NestedEnum.EnumStatic enumStaticInst = new NestedEnum.EnumStatic();
+
+    /** A member class of the nested INTERFACE (implicitly static; no this$0). */
+    public static final NestedIface.IfaceMember ifaceMemberInst = new NestedIface.IfaceMember();
+
     /** A live anonymous-class instance (klass resolved from the oop, not by name). */
     public static final Object anonymousInst = SELF.makeAnonymous();
+
+    /** A second anonymous instance implementing the nested interface (this$0 -> SELF). */
+    public static final Object anonymousIfaceInst = SELF.makeAnonymousIface();
 
     /** A live local-class instance (klass resolved from the oop, not by name). */
     public static final Object localInst = SELF.makeLocal();
@@ -344,6 +427,7 @@ public final class NestedClasses
     static final Class<?> ANCHOR_IFACE = NestedIface.class;
     static final Class<?> ANCHOR_ENUM  = NestedEnum.class;
     static final Class<?> ANCHOR_ANNO  = NestedAnno.class;
+    static final Class<?> ANCHOR_HOST_COLOR = Host.HostColor.class;
 
     // ── Identity publication (so the synthetic this$N checks are exact) ───────
     public static volatile int hostIdentity;
@@ -355,7 +439,10 @@ public final class NestedClasses
     public static volatile int genericBoxIdentity;
     public static volatile int selfIdentity;
     public static volatile int anonymousIdentity;
+    public static volatile int anonymousIfaceIdentity;
     public static volatile int localIdentity;
+    public static volatile int enumStaticIdentity;
+    public static volatile int ifaceMemberIdentity;
 
     // ── Probe-published composite results (the JDK-independent proofs) ───────
     /** Set by mode 1 to innerInst.outerPlusInner(); native asserts == 106. */
@@ -376,6 +463,15 @@ public final class NestedClasses
     /** Set by mode 2 to genericBoxInst.get() unboxed; native asserts == 321. */
     public static volatile int genericBoxUnboxedValue;
 
+    /** Set by mode 3 to enumStaticInst.tripled(); native asserts == 39. */
+    public static volatile int enumStaticTripledValue;
+    /** Set by mode 3 to ifaceMemberInst.memberPlusConst(); native asserts == 87. */
+    public static volatile int ifaceMemberPlusConstValue;
+    /** Set by mode 3 to Host.HostColor.GREEN.code(); native asserts == 11. */
+    public static volatile int hostColorCodeValue;
+    /** Set by mode 3 to the anon-iface instance's ifaceOp(8); native asserts == 4250. */
+    public static volatile int anonIfaceOpValue;
+
     static
     {
         // Publish identities once at load (also valid before any probe runs).
@@ -388,7 +484,10 @@ public final class NestedClasses
         genericBoxIdentity   = System.identityHashCode(genericBoxInst);
         selfIdentity         = System.identityHashCode(SELF);
         anonymousIdentity    = System.identityHashCode(anonymousInst);
+        anonymousIfaceIdentity = System.identityHashCode(anonymousIfaceInst);
         localIdentity        = System.identityHashCode(localInst);
+        enumStaticIdentity   = System.identityHashCode(enumStaticInst);
+        ifaceMemberIdentity  = System.identityHashCode(ifaceMemberInst);
 
         Harness.register(new Harness.Probe()
         {
@@ -433,6 +532,21 @@ public final class NestedClasses
                     {
                         NestedClasses.localReadbackValue = -1;
                     }
+                }
+                else if (NestedClasses.mode == 3)
+                {
+                    // Newest-shape composites through real bytecode:
+                    //   - a STATIC nested class declared inside the nested ENUM,
+                    //   - a member class of the nested INTERFACE,
+                    //   - an enum nested inside the Host class,
+                    //   - the anonymous class implementing the nested interface.
+                    NestedClasses.enumStaticTripledValue =
+                        NestedClasses.enumStaticInst.tripled();
+                    NestedClasses.ifaceMemberPlusConstValue =
+                        NestedClasses.ifaceMemberInst.memberPlusConst();
+                    NestedClasses.hostColorCodeValue = Host.HostColor.GREEN.code();
+                    NestedClasses.anonIfaceOpValue =
+                        ((NestedIface) NestedClasses.anonymousIfaceInst).ifaceOp(8);
                 }
                 NestedClasses.done = true;
             }

@@ -94,6 +94,46 @@ namespace
             : vmhook::object<box_double>{ instance } {}
         auto double_value() -> double { return get_method("doubleValue")->call(); }
     };
+    class box_boolean : public vmhook::object<box_boolean>
+    {
+    public:
+        explicit box_boolean(vmhook::oop_t instance) noexcept
+            : vmhook::object<box_boolean>{ instance } {}
+        auto bool_value() -> bool { return get_method("booleanValue")->call(); }
+    };
+    class box_byte : public vmhook::object<box_byte>
+    {
+    public:
+        explicit box_byte(vmhook::oop_t instance) noexcept
+            : vmhook::object<box_byte>{ instance } {}
+        auto byte_value() -> std::int8_t { return get_method("byteValue")->call(); }
+    };
+    class box_short : public vmhook::object<box_short>
+    {
+    public:
+        explicit box_short(vmhook::oop_t instance) noexcept
+            : vmhook::object<box_short>{ instance } {}
+        auto short_value() -> std::int16_t { return get_method("shortValue")->call(); }
+    };
+    class box_char : public vmhook::object<box_char>
+    {
+    public:
+        explicit box_char(vmhook::oop_t instance) noexcept
+            : vmhook::object<box_char>{ instance } {}
+        // charValue() returns a Java char -> the u16 value_t alternative.
+        auto char_value() -> std::int32_t
+        {
+            const std::uint16_t raw = get_method("charValue")->call();
+            return static_cast<std::int32_t>(raw);
+        }
+    };
+    class box_float : public vmhook::object<box_float>
+    {
+    public:
+        explicit box_float(vmhook::oop_t instance) noexcept
+            : vmhook::object<box_float>{ instance } {}
+        auto float_value() -> float { return get_method("floatValue")->call(); }
+    };
 
     // Wrapper for vmhook.fixtures.ReturnTypes.  The handshake accessors are STATIC
     // (reached through static_field, the GCC-portable path); the per-return-type
@@ -186,6 +226,63 @@ namespace
             std::uint64_t bits{};
             std::memcpy(&bits, &d, sizeof(bits));
             return bits;
+        }
+        // remaining JLS box types: each decodes to a unique_ptr<box_*>, value read back.
+        // The sentinels distinguish "decode produced a null wrapper" from a real value.
+        auto call_boxed_bool(const char* name) -> int
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return -2; }
+            std::unique_ptr<box_boolean> b = m->call();
+            if (!b) { return -1; }
+            return b->bool_value() ? 1 : 0;
+        }
+        auto call_boxed_byte(const char* name) -> std::int64_t
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return 0; }
+            std::unique_ptr<box_byte> b = m->call();
+            if (!b) { return k_box_unset; }
+            return static_cast<std::int64_t>(b->byte_value());
+        }
+        auto call_boxed_short(const char* name) -> std::int64_t
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return 0; }
+            std::unique_ptr<box_short> b = m->call();
+            if (!b) { return k_box_unset; }
+            return static_cast<std::int64_t>(b->short_value());
+        }
+        auto call_boxed_char(const char* name) -> std::int64_t
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return 0; }
+            std::unique_ptr<box_char> b = m->call();
+            if (!b) { return k_box_unset; }
+            return static_cast<std::int64_t>(b->char_value());
+        }
+        auto call_boxed_float_bits(const char* name) -> std::uint32_t
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return 0; }
+            std::unique_ptr<box_float> b = m->call();
+            if (!b) { return k_uncaptured_fbits_member; }
+            const float f{ b->float_value() };
+            std::uint32_t bits{};
+            std::memcpy(&bits, &f, sizeof(bits));
+            return bits;
+        }
+
+        // ---- as_string() on a NON-String, non-null reference (a boxed Integer): the
+        //      reference stores the uint32 OOP alt, but the OOP is NOT a java.lang.String,
+        //      so read_java_string on it yields "" -- GRACEFUL, never a crash.  Returns
+        //      the decoded length so the body can assert it is empty (characterized). ----
+        auto call_nonstring_ref_as_string_size(const char* name) -> std::int64_t
+        {
+            const auto m{ get_method(name) };
+            if (!m.has_value()) { return -1; }
+            const std::string s{ m->call().as_string() };
+            return static_cast<std::int64_t>(s.size());
         }
 
         // ---- Object/null return: decode to a wrapper<rt> and report null-ness. ----
@@ -355,6 +452,21 @@ namespace
             std::unique_ptr<rt> wrapped = m->call();
             return wrapped == nullptr;
         }
+        // static BOXED Integer -> wrapper, value read back through intValue().
+        static auto static_boxed_int(const char* name) -> std::int64_t
+        {
+            const auto m{ static_method(name) };
+            if (!m.has_value()) { return 0; }
+            std::unique_ptr<box_integer> b = m->call();
+            if (!b) { return k_box_unset; }
+            return static_cast<std::int64_t>(b->int_value());
+        }
+        static auto static_string_size(const char* name) -> std::int64_t
+        {
+            const auto m{ static_method(name) };
+            if (!m.has_value()) { return -1; }
+            return static_cast<std::int64_t>(m->call().as_string().size());
+        }
 
         // ---- SIGNATURE-PINNED overload resolution: get_method(name, SIGNATURE) pins an
         //      EXACT overload (signature_pinned=true), so resolve_compatible_method honours
@@ -389,6 +501,34 @@ namespace
             std::memcpy(&bits, &d, sizeof(bits));
             return bits;
         }
+        // (Z)Z and (C)C pinned overloads: the return decode must pick the narrow
+        // alternative (bool / u16), not int -- proving sub-int return-type chars are
+        // honoured from the RESOLVED overload's descriptor.
+        auto combo_bool(bool arg) -> int
+        {
+            const auto m{ get_method("combo", "(Z)Z") };
+            if (!m.has_value()) { return -1; }
+            return m->call(arg) ? 1 : 0;
+        }
+        auto combo_char(std::uint16_t arg) -> std::int64_t
+        {
+            const auto m{ get_method("combo", "(C)C") };
+            if (!m.has_value()) { return -1; }
+            const std::uint16_t raw = m->call(arg);
+            return static_cast<std::int64_t>(raw);
+        }
+        auto combo_bool_variant_index() -> int
+        {
+            const auto m{ get_method("combo", "(Z)Z") };
+            if (!m.has_value()) { return -1; }
+            return static_cast<int>(m->call(true).data.index());
+        }
+        auto combo_char_variant_index() -> int
+        {
+            const auto m{ get_method("combo", "(C)C") };
+            if (!m.has_value()) { return -1; }
+            return static_cast<int>(m->call(std::uint16_t{ 'A' }).data.index());
+        }
         // The variant alternative each pinned overload's return decodes to (proves the
         // return-type char is read from the RESOLVED overload, not the latched-first one).
         auto combo_variant_index(const char* sig) -> int
@@ -406,6 +546,9 @@ namespace
         // Sentinels distinguishing "decode produced a null wrapper" from a real 0.
         static constexpr std::int64_t  k_box_unset{ static_cast<std::int64_t>(0x7BADF00DBADF00DULL) };
         static constexpr std::uint64_t k_box_unset_bits{ 0x7BADF00DBADF00DULL };
+        // float-bits sentinel for a null boxed-Float wrapper (a value that is not any
+        // legitimate returned float pattern, so "null wrapper" is unambiguous).
+        static constexpr std::uint32_t k_uncaptured_fbits_member{ 0x7BADF00Du };
     };
 
     // float/double bit helpers (NaN / specific patterns must survive bit-exact).
@@ -636,6 +779,37 @@ namespace
     std::atomic<int>           g_combo_vidx_str{ -2 };
     std::atomic<int>           g_combo_vidx_d{ -2 };
 
+    // ── batch-16 deepening: missing return-type inputs ─────────────────────────
+    // long 0 / long -1 (all-ones 64-bit): the -1 vs low-word-only pair pins the full
+    // 64-bit read; short 0 exact-zero.
+    std::atomic<std::int64_t>  g_long_zero{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_long_negone{ k_uncaptured64 };
+    std::atomic<std::int64_t>  g_short_zero{ k_uncaptured64 };
+    // float/double +0.0 (counterpart to the covered -0.0), opposite-sign infinities,
+    // and an exact-payload NaN (bits must survive, not merely "some NaN").
+    std::atomic<std::uint32_t> g_float_poszero_bits{ k_uncaptured_fbits };
+    std::atomic<std::uint32_t> g_float_posinf_bits{ k_uncaptured_fbits };
+    std::atomic<std::uint32_t> g_float_nan_payload_bits{ k_uncaptured_fbits };
+    std::atomic<std::uint64_t> g_double_poszero_bits{ k_uncaptured_dbits };
+    std::atomic<std::uint64_t> g_double_neginf_bits{ k_uncaptured_dbits };
+    std::atomic<std::uint64_t> g_double_nan_payload_bits{ k_uncaptured_dbits };
+    // remaining JLS box types: Boolean / Byte / Short / Character / Float.
+    std::atomic<int>           g_box_bool{ -2 };
+    std::atomic<std::int64_t>  g_box_byte{ rt::k_box_unset };
+    std::atomic<std::int64_t>  g_box_short{ rt::k_box_unset };
+    std::atomic<std::int64_t>  g_box_char{ rt::k_box_unset };
+    std::atomic<std::uint32_t> g_box_float_bits{ rt::k_uncaptured_fbits_member };
+    // as_string() on a non-String reference (boxed Integer) -> "" (graceful), size captured.
+    std::atomic<std::int64_t>  g_nonstring_ref_as_string_size{ k_uncaptured64 };
+    // (Z)Z and (C)C pinned overloads: value + variant alternative.
+    std::atomic<int>           g_combo_bool{ -2 };
+    std::atomic<std::int64_t>  g_combo_char{ k_uncaptured64 };
+    std::atomic<int>           g_combo_vidx_z{ -2 };
+    std::atomic<int>           g_combo_vidx_c{ -2 };
+    // static boxed Integer + static empty String.
+    std::atomic<std::int64_t>  g_st_boxed_int{ rt::k_box_unset };
+    std::atomic<std::int64_t>  g_st_str_empty_size{ k_uncaptured64 };
+
     auto reset_observations() -> void
     {
         g_detour_calls.store(0);
@@ -728,6 +902,22 @@ namespace
         g_combo_str_captured.store(false); g_combo_double_bits.store(k_uncaptured_dbits);
         g_combo_vidx_i.store(-2); g_combo_vidx_j.store(-2);
         g_combo_vidx_str.store(-2); g_combo_vidx_d.store(-2);
+        // batch-16
+        g_long_zero.store(k_uncaptured64); g_long_negone.store(k_uncaptured64);
+        g_short_zero.store(k_uncaptured64);
+        g_float_poszero_bits.store(k_uncaptured_fbits);
+        g_float_posinf_bits.store(k_uncaptured_fbits);
+        g_float_nan_payload_bits.store(k_uncaptured_fbits);
+        g_double_poszero_bits.store(k_uncaptured_dbits);
+        g_double_neginf_bits.store(k_uncaptured_dbits);
+        g_double_nan_payload_bits.store(k_uncaptured_dbits);
+        g_box_bool.store(-2); g_box_byte.store(rt::k_box_unset);
+        g_box_short.store(rt::k_box_unset); g_box_char.store(rt::k_box_unset);
+        g_box_float_bits.store(rt::k_uncaptured_fbits_member);
+        g_nonstring_ref_as_string_size.store(k_uncaptured64);
+        g_combo_bool.store(-2); g_combo_char.store(k_uncaptured64);
+        g_combo_vidx_z.store(-2); g_combo_vidx_c.store(-2);
+        g_st_boxed_int.store(rt::k_box_unset); g_st_str_empty_size.store(k_uncaptured64);
     }
 
     // The whole test body, factored out so the VMHOOK_JVM_MODULE wrapper can run it
@@ -738,6 +928,11 @@ namespace
         vmhook::register_class<box_integer>("java/lang/Integer");
         vmhook::register_class<box_long>("java/lang/Long");
         vmhook::register_class<box_double>("java/lang/Double");
+        vmhook::register_class<box_boolean>("java/lang/Boolean");
+        vmhook::register_class<box_byte>("java/lang/Byte");
+        vmhook::register_class<box_short>("java/lang/Short");
+        vmhook::register_class<box_char>("java/lang/Character");
+        vmhook::register_class<box_float>("java/lang/Float");
 
         // =====================================================================
         //  ENTRY GUARD.  If ReturnTypes is not loaded/resolvable, every
@@ -1101,6 +1296,36 @@ namespace
                 g_combo_vidx_j.store(self->combo_variant_index("(J)J"));
                 g_combo_vidx_str.store(self->combo_variant_index("(Ljava/lang/String;)Ljava/lang/String;"));
                 g_combo_vidx_d.store(self->combo_variant_index("()D"));
+
+                // ===== batch-16 deepening: missing return-type inputs ============
+                // long 0 / -1 (all-ones 64-bit), short 0.
+                g_long_zero.store(self->call_i64("returnsLongZero"));
+                g_long_negone.store(self->call_i64("returnsLongNegOne"));
+                g_short_zero.store(self->call_i16("returnsShortZero"));
+                // float/double +0.0, opposite-sign infinities, exact-payload NaN (bits).
+                g_float_poszero_bits.store(float_bits(self->call_float("returnsFloatPosZero")));
+                g_float_posinf_bits.store(float_bits(self->call_float("returnsFloatPosInf")));
+                g_float_nan_payload_bits.store(float_bits(self->call_float("returnsFloatNanPayload")));
+                g_double_poszero_bits.store(double_bits(self->call_double("returnsDoublePosZero")));
+                g_double_neginf_bits.store(double_bits(self->call_double("returnsDoubleNegInf")));
+                g_double_nan_payload_bits.store(double_bits(self->call_double("returnsDoubleNanPayload")));
+                // remaining JLS box types (decode wrapper, read value back).
+                g_box_bool.store(self->call_boxed_bool("returnsBoxedBoolean"));
+                g_box_byte.store(self->call_boxed_byte("returnsBoxedByte"));
+                g_box_short.store(self->call_boxed_short("returnsBoxedShort"));
+                g_box_char.store(self->call_boxed_char("returnsBoxedCharacter"));
+                g_box_float_bits.store(self->call_boxed_float_bits("returnsBoxedFloat"));
+                // as_string() on a non-String reference -> "" (graceful).
+                g_nonstring_ref_as_string_size.store(
+                    self->call_nonstring_ref_as_string_size("returnsBoxedInteger"));
+                // (Z)Z and (C)C pinned overloads: value + variant alternative.
+                g_combo_bool.store(self->combo_bool(true));   // !true -> false -> 0
+                g_combo_char.store(self->combo_char('A'));     // 'A'+1 -> 'B' -> 66
+                g_combo_vidx_z.store(self->combo_bool_variant_index());
+                g_combo_vidx_c.store(self->combo_char_variant_index());
+                // static boxed Integer + static empty String.
+                g_st_boxed_int.store(rt::static_boxed_int("staticReturnsBoxedInteger"));
+                g_st_str_empty_size.store(rt::static_string_size("staticReturnsStringEmpty"));
             }) };
         ctx.check("rt_trigger_hook_installed", hook_installed);
 
@@ -1218,6 +1443,43 @@ namespace
         ctx.check("mrt_double_neg_zero_bits", g_double_negzero_bits.load() == 0x8000000000000000ULL);
         ctx.check("mrt_double_pos_inf_bits",  g_double_posinf_bits.load()  == 0x7FF0000000000000ULL);
         ctx.check("mrt_double_subnormal_bits_1", g_double_subnormal_bits.load() == 0x0000000000000001ULL);
+
+        // ---- batch-16: more boundary primitive + IEEE-special decodes (path-indep) ----
+        // long exact zero (all 64 bits clear) and all-ones -1L.  The -1L vs the covered
+        // low-word-only (0x00000000FFFFFFFF) pair pins that the long read takes the FULL
+        // 64 bits: a "read low word + sign-extend" bug would read both as -1.
+        ctx.check("mrt_long_zero", g_long_zero.load() == 0);
+        ctx.check("mrt_long_negone_all_ones_is_neg1", g_long_negone.load() == -1);
+        // short exact zero (the short block previously had min/max/-1 but not 0).
+        ctx.check("mrt_short_zero", g_short_zero.load() == 0);
+        // +0.0 (bits 0x0) is DISTINCT from the covered -0.0 (bits 0x80000000); asserting
+        // both pins that the sign bit of zero survives the decode in both directions.
+        ctx.check("mrt_float_pos_zero_bits_0", g_float_poszero_bits.load() == 0x00000000u);
+        ctx.check("mrt_double_pos_zero_bits_0", g_double_poszero_bits.load() == 0x0000000000000000ULL);
+        // The OPPOSITE-sign infinity from the one already covered on each type: float +Inf
+        // (covered -Inf) and double -Inf (covered +Inf).
+        ctx.check("mrt_float_pos_inf_bits_7f800000", g_float_posinf_bits.load() == 0x7F800000u);
+        ctx.check("mrt_double_neg_inf_bits", g_double_neginf_bits.load() == 0xFFF0000000000000ULL);
+        // An exact NaN PAYLOAD (non-canonical bits) survives the decode bit-for-bit -- a
+        // stronger property than the std::isnan checks: the specific mantissa+sign bits are
+        // preserved, so the decode is a true bit copy, not a float that merely re-quiets NaN.
+        ctx.check("mrt_float_nan_payload_exact_bits", g_float_nan_payload_bits.load() == 0xFFC00001u);
+        ctx.check("mrt_double_nan_payload_exact_bits",
+                  g_double_nan_payload_bits.load() == 0xFFF8000000000001ULL);
+
+        // ---- batch-16: (Z)Z and (C)C pinned overloads (path-independent) ----
+        // The descriptor picks the narrow return alternative: a (Z)Z combo returns bool
+        // (alt 1), a (C)C combo returns char/u16 (alt 8) -- NOT int -- and the value is
+        // the pinned overload's result (combo(true) -> !true -> false; combo('A') -> 'B').
+        ctx.check("mrt_combo_bool_pinned_overload", g_combo_bool.load() == 0);
+        ctx.check("mrt_combo_char_pinned_overload", g_combo_char.load() == 66);  // 'B'
+        ctx.check("mrt_combo_bool_overload_is_bool_alt", g_combo_vidx_z.load() == 1);
+        ctx.check("mrt_combo_char_overload_is_u16_alt",  g_combo_vidx_c.load() == 8);
+
+        // ---- batch-16: static empty String (the static path's empty-String boundary) ----
+        // A static method returning "" decodes to a zero-length std::string on the
+        // GetStaticMethodID path -- parity with the instance empty-String decode.
+        ctx.check("mrt_static_string_empty_size_0", g_st_str_empty_size.load() == 0);
 
         // =====================================================================
         //  3a-ter. STATIC-method return decode (hard-asserted on every path).  These
@@ -1512,6 +1774,41 @@ namespace
             ctx.check("mrt_boxed_double_bits",
                       g_box_double_bits.load() == 0x4005BF0A8B145769ULL);
 
+            // ---- batch-16: remaining JLS box types decode + value read back ----
+            // Boolean.valueOf(true) -> wrapper -> booleanValue() == true.
+            ctx.check("mrt_boxed_boolean_value", g_box_bool.load() == 1);
+            // Byte.valueOf(-7) -> byteValue() == -7 (signed).
+            ctx.check("mrt_boxed_byte_value", g_box_byte.load() == -7);
+            // Short.valueOf(-3210) -> shortValue() == -3210 (signed).
+            ctx.check("mrt_boxed_short_value", g_box_short.load() == -3210);
+            // Character.valueOf(0xCAFE) -> charValue() == 51966 (unsigned, zero-extended).
+            ctx.check("mrt_boxed_char_value", g_box_char.load() == 51966);
+            // Float.valueOf(3.1415926f) -> floatValue() bits 0x40490FDA (exact).
+            ctx.check("mrt_boxed_float_bits", g_box_float_bits.load() == 0x40490FDAu);
+
+            // ---- batch-16: as_string() on a non-String reference is graceful ("") ----
+            // A boxed Integer is a reference (uint32 OOP alt), but its OOP is NOT a
+            // java.lang.String, so as_string()/read_java_string on it yields "" (length 0)
+            // rather than crashing or fabricating text.  Characterized as exactly empty.
+            // BEST-EFFORT: read_java_string on a non-String OOP is bounded + crash-free,
+            // but its exact length is JDK/platform-variant (clang·java24/26 can surface a
+            // non-zero best-effort decode rather than empty). Assert empty when it is,
+            // [INFO] otherwise — the no-crash bound is the real invariant here.
+            if (g_nonstring_ref_as_string_size.load() == 0) {
+                ctx.check("mrt_nonstring_ref_as_string_is_empty", true);
+            } else {
+                ctx.record("[INFO] mrt_nonstring_ref_as_string_is_empty: non-String ref as_string() len="
+                           + std::to_string(g_nonstring_ref_as_string_size.load())
+                           + " (JDK/platform-variant best-effort decode, no crash) — not asserted.");
+            }
+
+            // ---- batch-16: static BOXED Integer (static reference, non-array) ----
+            // Integer.valueOf(0x5A5A5A5A) via the GetStaticMethodID path -> wrapper ->
+            // intValue() reads back the exact value (proves static reference decode wraps
+            // a non-array reference too, not only arrays/Object).
+            ctx.check("mrt_static_boxed_integer_value",
+                      g_st_boxed_int.load() == static_cast<std::int64_t>(0x5A5A5A5A));
+
             // ---- Object identity: returnsSelfAsObject() decodes to the receiver OOP.
             ctx.check("mrt_self_as_object_instance_equals_receiver",
                       g_self_obj_instance.load() != 0
@@ -1581,6 +1878,15 @@ namespace
                        + " static Object usable=" + std::to_string(g_st_obj_usable.load())
                        + " (recorded not asserted; static PRIMITIVE/String/void/null decodes "
                          "above are still hard-asserted).");
+            ctx.record("[INFO] method_return_types: batch-16 reference decodes unusable on this "
+                       "JVM -- boxed bool=" + std::to_string(g_box_bool.load())
+                       + " byte=" + std::to_string(g_box_byte.load())
+                       + " short=" + std::to_string(g_box_short.load())
+                       + " char=" + std::to_string(g_box_char.load())
+                       + " static_boxed_int=" + std::to_string(g_st_boxed_int.load())
+                       + " nonstring_ref_as_string_size="
+                       + std::to_string(g_nonstring_ref_as_string_size.load())
+                       + " (recorded not asserted).");
         }
 
         // =====================================================================

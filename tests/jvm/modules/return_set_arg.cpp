@@ -125,6 +125,20 @@ namespace
         static auto s_two_b()     -> std::int32_t { std::int32_t v = static_field("sTwoB")->get();     return v; }
         static auto s_mix_long()  -> std::int64_t { std::int64_t v = static_field("sMixLong")->get();  return v; }
         static auto s_mix_int()   -> std::int32_t { std::int32_t v = static_field("sMixInt")->get();   return v; }
+
+        // ── receiver-swap / bool-polarity / over-wide / reserved-slot ──────
+        static auto ignore_this_v()    -> std::int32_t { std::int32_t v = static_field("ignoreThisV")->get();    return v; }
+        static auto ignore_this_ran()  -> bool         { bool v = static_field("ignoreThisRan")->get();          return v; }
+        static auto set_ignore_this_ran(bool value)    -> void { static_field("ignoreThisRan")->set(value); }
+        static auto bool_poly()        -> bool         { bool v = static_field("boolPoly")->get();                return v; }
+        static auto ow_byte()          -> std::int8_t  { std::int8_t  v = static_field("owByte")->get();          return v; }
+        static auto ow_byte_wide()     -> std::int32_t { std::int32_t v = static_field("owByteWide")->get();      return v; }
+        static auto ow_char()          -> std::uint16_t{ std::uint16_t v = static_field("owChar")->get();         return v; }
+        static auto ow_char_wide()     -> std::int32_t { std::int32_t v = static_field("owCharWide")->get();      return v; }
+        static auto ow_short()         -> std::int16_t { std::int16_t v = static_field("owShort")->get();         return v; }
+        static auto ow_short_wide()    -> std::int32_t { std::int32_t v = static_field("owShortWide")->get();     return v; }
+        static auto resv_long()        -> std::int64_t { std::int64_t v = static_field("resvLong")->get();        return v; }
+        static auto resv_int()         -> std::int32_t { std::int32_t v = static_field("resvInt")->get();         return v; }
     };
 
     // Mode selectors (mirror ReturnSetArg.java).
@@ -133,6 +147,7 @@ namespace
     constexpr std::int32_t MODE_BOUNDS{ 2 };
     constexpr std::int32_t MODE_WIDESLOTS{ 3 };
     constexpr std::int32_t MODE_STATICSLOTS{ 4 };
+    constexpr std::int32_t MODE_EXTRA{ 5 };
 
     // The original value every probe passes (so a no-hook baseline observes it).
     constexpr std::int32_t ORIGINAL_INT{ 7 };
@@ -180,6 +195,15 @@ namespace
     std::atomic<bool> g_s_two_b_ok{ false };
     std::atomic<bool> g_s_mix_long_ok{ false };
     std::atomic<bool> g_s_mix_int_ok{ false };
+
+    // EXTRA round: receiver-swap / bool-polarity / over-wide / reserved-slot.
+    std::atomic<bool> g_recv0_ok{ false };       // set_arg(0) on instance returned true
+    std::atomic<bool> g_recv1_ok{ false };       // set_arg(1) on the same detour returned true
+    std::atomic<bool> g_bool_poly_ok{ false };   // boolPolyTake injection returned true
+    std::atomic<bool> g_ow_byte_ok{ false };     // over-wide int into byte slot returned true
+    std::atomic<bool> g_ow_char_ok{ false };
+    std::atomic<bool> g_ow_short_ok{ false };
+    std::atomic<bool> g_resv_long_ok{ false };   // set_arg(2) on resvLongInt returned true
 
     // Unsigned-source-type primitive injection (set_arg<uintN_t>(...)).
     std::atomic<bool> g_u8_ok{ false };
@@ -523,6 +547,60 @@ VMHOOK_JVM_MODULE(return_set_arg)
         /*c */ static_cast<std::uint16_t>(0xD83D),         // high surrogate
         /*s */ static_cast<std::int16_t>(13) });
 
+    // ROUND: plus-one / smallest-magnitude integers; char 0x0001; bool false.
+    run_and_check_prim(ctx, "plus_one", prim_values{
+        /*i */ 1,
+        /*l */ static_cast<std::int64_t>(1),
+        /*d */ 1.0,
+        /*f */ 1.0f,
+        /*b */ false,
+        /*by*/ static_cast<std::int8_t>(1),
+        /*c */ static_cast<std::uint16_t>(0x0001),
+        /*s */ static_cast<std::int16_t>(1) });
+
+    // ROUND: IEEE-754 smallest positive SUBNORMAL float/double — must round-trip
+    // bit-exactly (the memcpy path makes no float canonicalisation).
+    run_and_check_prim(ctx, "subnormal_min", prim_values{
+        /*i */ 11, /*l */ static_cast<std::int64_t>(11),
+        /*d */ std::numeric_limits<double>::denorm_min(),
+        /*f */ std::numeric_limits<float>::denorm_min(),
+        /*b */ true, /*by*/ static_cast<std::int8_t>(11),
+        /*c */ static_cast<std::uint16_t>(11), /*s */ static_cast<std::int16_t>(11) });
+
+    // ROUND: largest finite float/double + smallest-normal — full-magnitude finite
+    // values that are NOT specials.
+    run_and_check_prim(ctx, "finite_extremes", prim_values{
+        /*i */ 12, /*l */ static_cast<std::int64_t>(12),
+        /*d */ std::numeric_limits<double>::max(),
+        /*f */ std::numeric_limits<float>::lowest(),   // -FLT_MAX (negative, finite)
+        /*b */ false, /*by*/ static_cast<std::int8_t>(12),
+        /*c */ static_cast<std::uint16_t>(12), /*s */ static_cast<std::int16_t>(12) });
+
+    // ROUND: signaling-NaN bit pattern (distinct from the quiet-NaN round) — the
+    // memcpy path must preserve the EXACT mantissa bits, not canonicalise to qNaN.
+    {
+        std::uint32_t snan_bits{ 0x7FA00000u }; // a signaling-NaN float bit pattern
+        std::uint64_t snan_bits_d{ 0x7FF4000000000000ull };
+        float  f_snan{};  std::memcpy(&f_snan, &snan_bits,   sizeof(f_snan));
+        double d_snan{};  std::memcpy(&d_snan, &snan_bits_d, sizeof(d_snan));
+        run_and_check_prim(ctx, "snan", prim_values{
+            /*i */ 14, /*l */ static_cast<std::int64_t>(14),
+            /*d */ d_snan, /*f */ f_snan,
+            /*b */ true, /*by*/ static_cast<std::int8_t>(14),
+            /*c */ static_cast<std::uint16_t>(14), /*s */ static_cast<std::int16_t>(14) });
+    }
+
+    // ROUND: byte/short PLUS-bit-boundary (0x7F / 0x7FFF — the largest positive)
+    // and char low-surrogate 0xDFFF (high-bit-set, must zero-extend).
+    run_and_check_prim(ctx, "subint_pos_boundary", prim_values{
+        /*i */ 0x40000000,
+        /*l */ static_cast<std::int64_t>(0x4000000000000000LL),
+        /*d */ 6.25, /*f */ 6.5f,
+        /*b */ true,
+        /*by*/ static_cast<std::int8_t>(0x7F),       // 127
+        /*c */ static_cast<std::uint16_t>(0xDFFF),   // low surrogate, zero-extend
+        /*s */ static_cast<std::int16_t>(0x7FFF) }); // 32767
+
     // ROUND: re-run canonical at the end (stable across arm/disarm cycles).
     run_and_check_prim(ctx, "canonical_repeat", prim_values{
         /*i */ 42,
@@ -664,6 +742,60 @@ VMHOOK_JVM_MODULE(return_set_arg)
         ctx.record("[INFO] return_set_arg idempotent/double-write: overwriting a slot with its own "
                    "original value succeeds and the body sees the original; two set_arg calls on the "
                    "same slot in one detour leave the SECOND value (last write wins) for the body.");
+    }
+
+    // =====================================================================
+    // PART 1d — BOOLEAN POLARITY MATRIX: the boolean slot is read by the body as
+    // an int (iload) and narrowed to a single bit.  Prove BOTH polarities round-
+    // trip and that only bit 0 of the injected slot matters (a high-bit-set int
+    // source still narrows to its low bit).  The probe's original is false, so the
+    // false->true direction is the visible change; the true->true / false->false
+    // identity directions are covered by the canonical/zero rounds above.
+    // =====================================================================
+    {
+        struct bool_case { const char* tag; std::int32_t inject; bool expect; };
+        const bool_case cases[]{
+            { "true",        1,          true  },  // canonical true
+            { "false",       0,          false },  // canonical false (== original)
+            { "high_bit_0",  0x7FFFFFFE, false },  // bit0==0 -> false despite high bits
+            { "high_bit_1",  0x7FFFFFFF, true  },  // bit0==1 -> true  despite high bits
+            { "minus_one",  -1,          true  },  // 0xFFFFFFFF -> bit0==1 -> true
+            { "two",         2,          false },  // bit0==0 -> false (even value)
+        };
+        for (const bool_case& c : cases)
+        {
+            g_bool_poly_ok.store(false, std::memory_order_relaxed);
+            rsa_fixture::set_done(false);
+
+            const std::int32_t inject{ c.inject };
+            auto h_bp{ vmhook::scoped_hook<rsa_fixture>("boolPolyTake", "(Z)V",
+                [inject](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int32_t)
+                { g_bool_poly_ok.store(r.set_arg(1, inject), std::memory_order_relaxed); }) };
+
+            const std::string tag{ std::string{ "boolpoly_" } + c.tag };
+            ctx.check(tag + "_hook_installed", h_bp.installed());
+
+            const bool done{ ctx.run_probe(
+                [](bool value)
+                {
+                    if (value) { rsa_fixture::set_done(false); rsa_fixture::set_mode(MODE_EXTRA); }
+                    rsa_fixture::set_go(value);
+                },
+                []() { return rsa_fixture::get_done(); }) };
+            ctx.check(tag + "_probe_completed", done);
+
+            if (done && h_bp.installed())
+            {
+                ctx.check(tag + "_no_java_exception", !rsa_fixture::saw_exception());
+                ctx.check(tag + "_set_ok",  g_bool_poly_ok.load(std::memory_order_relaxed));
+                ctx.check(tag + "_observed", rsa_fixture::bool_poly() == c.expect);
+            }
+        }
+
+        ctx.record("[INFO] return_set_arg boolean polarity: the boolean slot is narrowed to bit 0 by "
+                   "the body, so injecting an int with any high bits set still resolves to true/false "
+                   "by its low bit (0x7FFFFFFE->false, 0x7FFFFFFF->true, -1->true, 2->false); both "
+                   "canonical polarities round-trip.");
     }
 
     // =====================================================================
@@ -1039,6 +1171,136 @@ VMHOOK_JVM_MODULE(return_set_arg)
     }
 
     // =====================================================================
+    // PART 5 — RECEIVER SWAP + OVER-WIDE-INTO-NARROW + RESERVED-SLOT distinctness.
+    // All exercised in ONE MODE_EXTRA probe so each fires exactly once.
+    //
+    //  * ignoreThis(int v): set_arg(0, ...) overwrites the 'this' receiver slot.
+    //    The body never dereferences 'this', so this is crash-safe; we prove the
+    //    write to slot 0 RETURNS TRUE (the receiver slot is writable) and that the
+    //    independent set_arg(1, ...) mutates the slot-1 arg — i.e. slot 0 and slot
+    //    1 are distinct, and the body still ran to completion (no crash).
+    //
+    //  * owByteTake/owCharTake/owShortTake: inject an int value WIDER than the
+    //    declared byte/char/short.  The native-width masked readback is HARD
+    //    (stable across the matrix); the int-WIDENED readback is platform-variant
+    //    (windows vs linux) and is recorded [INFO], never asserted.
+    //
+    //  * resvLongInt(long a, int b): the long's value occupies slot 2, b is at
+    //    slot 3.  A caller who thinks set_arg's index is an ARGUMENT ordinal calls
+    //    set_arg(2, ...) to change "the second argument" b — but slot 2 is part of
+    //    the long, and b is untouched.  Prove set_arg(2,...) does NOT change b at
+    //    slot 3: set_arg targets a raw SLOT index, not an argument ordinal (the
+    //    documented Flaw #1 behaviour, pinned).
+    // =====================================================================
+    {
+        g_recv0_ok.store(false, std::memory_order_relaxed);
+        g_recv1_ok.store(false, std::memory_order_relaxed);
+        g_ow_byte_ok.store(false, std::memory_order_relaxed);
+        g_ow_char_ok.store(false, std::memory_order_relaxed);
+        g_ow_short_ok.store(false, std::memory_order_relaxed);
+        g_resv_long_ok.store(false, std::memory_order_relaxed);
+        rsa_fixture::set_ignore_this_ran(false);
+        rsa_fixture::set_done(false);
+
+        // RECEIVER SWAP: overwrite slot 0 ('this') AND slot 1 (the int arg).  The
+        // receiver value we write is an arbitrary primitive (the body ignores it);
+        // the slot-1 arg becomes 4321 and must be observed by the body.
+        auto h_recv{ vmhook::scoped_hook<rsa_fixture>("ignoreThis", "(I)V",
+            [](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int32_t)
+            {
+                g_recv0_ok.store(r.set_arg(0, static_cast<std::int32_t>(0x6B6B6B6B)), std::memory_order_relaxed);
+                g_recv1_ok.store(r.set_arg(1, static_cast<std::int32_t>(4321)),       std::memory_order_relaxed);
+            }) };
+
+        // OVER-WIDE into narrow slots: an int wider than the declared sub-int type.
+        const std::int32_t OW_INJECT{ 0x12345678 };
+        auto h_owb{ vmhook::scoped_hook<rsa_fixture>("owByteTake", "(B)V",
+            [OW_INJECT](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int32_t)
+            { g_ow_byte_ok.store(r.set_arg(1, OW_INJECT), std::memory_order_relaxed); }) };
+        auto h_owc{ vmhook::scoped_hook<rsa_fixture>("owCharTake", "(C)V",
+            [OW_INJECT](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int32_t)
+            { g_ow_char_ok.store(r.set_arg(1, OW_INJECT), std::memory_order_relaxed); }) };
+        auto h_ows{ vmhook::scoped_hook<rsa_fixture>("owShortTake", "(S)V",
+            [OW_INJECT](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int32_t)
+            { g_ow_short_ok.store(r.set_arg(1, OW_INJECT), std::memory_order_relaxed); }) };
+
+        // RESERVED SLOT (Flaw #1 pin): resvLongInt(long a, int b): this=0,
+        // a=base slot 1 (its 64-bit value lives at the lower slot 2), b=slot 3.
+        // A user who treats set_arg's index as an ARGUMENT ordinal would call
+        // set_arg(2, ...) to change "the second argument" b — but slot 2 is the
+        // long's value slot, and b is at slot 3.  So set_arg(2, int) does NOT
+        // change b; the trailing int must remain the ORIGINAL 8.  We do NOT write
+        // the long's base slot here (that would itself land on slot 2 and the int
+        // clobber would corrupt it), keeping the demonstration clean: ONE int
+        // write at slot 2, then prove b@slot3 is untouched.
+        auto h_resv{ vmhook::scoped_hook<rsa_fixture>("resvLongInt", "(JI)V",
+            [](vmhook::return_value& r, const std::unique_ptr<rsa_fixture>&, std::int64_t, std::int32_t)
+            {
+                g_resv_long_ok.store(r.set_arg(2, static_cast<std::int32_t>(0x7777)),
+                                     std::memory_order_relaxed);
+            }) };
+
+        const bool all_installed{
+            h_recv.installed() && h_owb.installed() && h_owc.installed() &&
+            h_ows.installed()  && h_resv.installed() };
+        ctx.check("extra_all_hooks_installed", all_installed);
+
+        const bool done{ ctx.run_probe(
+            [](bool value)
+            {
+                if (value) { rsa_fixture::set_done(false); rsa_fixture::set_mode(MODE_EXTRA); }
+                rsa_fixture::set_go(value);
+            },
+            []() { return rsa_fixture::get_done(); }) };
+        ctx.check("extra_probe_completed", done);
+
+        if (done && all_installed)
+        {
+            ctx.check("extra_no_java_exception", !rsa_fixture::saw_exception());
+
+            // ── receiver swap ──
+            ctx.check("extra_recv0_set_ok",       g_recv0_ok.load(std::memory_order_relaxed));
+            ctx.check("extra_recv1_set_ok",       g_recv1_ok.load(std::memory_order_relaxed));
+            ctx.check("extra_recv_body_ran",      rsa_fixture::ignore_this_ran());
+            ctx.check("extra_recv_arg_observed",  rsa_fixture::ignore_this_v() == 4321);
+
+            // ── over-wide into narrow: native-width masked view is HARD ──
+            const std::int8_t   want_byte { static_cast<std::int8_t>(OW_INJECT) };
+            const std::uint16_t want_char { static_cast<std::uint16_t>(OW_INJECT) };
+            const std::int16_t  want_short{ static_cast<std::int16_t>(OW_INJECT) };
+            ctx.check("extra_ow_byte_set_ok",  g_ow_byte_ok.load(std::memory_order_relaxed));
+            ctx.check("extra_ow_char_set_ok",  g_ow_char_ok.load(std::memory_order_relaxed));
+            ctx.check("extra_ow_short_set_ok", g_ow_short_ok.load(std::memory_order_relaxed));
+            ctx.check("extra_ow_byte_masked",  rsa_fixture::ow_byte()  == want_byte);
+            ctx.check("extra_ow_char_masked",  rsa_fixture::ow_char()  == want_char);
+            ctx.check("extra_ow_short_masked", rsa_fixture::ow_short() == want_short);
+
+            // The int-WIDENED readback of an over-wide injection is platform-variant
+            // (windows vs linux mask/widen the over-wide slot differently); record
+            // it [INFO], never assert.
+            ctx.record("[INFO] return_set_arg over-wide-into-narrow: injected int 0x12345678 over a "
+                       "byte/char/short slot. Native-width masked views (HARD): byte=0x78, char=0x5678, "
+                       "short=0x5678. Observed int-WIDENED views (platform-variant, [INFO] only): byte_wide="
+                       + std::to_string(rsa_fixture::ow_byte_wide())
+                       + ", char_wide=" + std::to_string(rsa_fixture::ow_char_wide())
+                       + ", short_wide=" + std::to_string(rsa_fixture::ow_short_wide()) + ".");
+
+            // ── reserved-slot distinctness (Flaw #1, pinned) ──
+            // set_arg(2, int) (the long's value slot) returns true (a valid in-range
+            // write) but does NOT touch b at slot 3: b must remain the ORIGINAL 8.
+            ctx.check("extra_resv_set_ok", g_resv_long_ok.load(std::memory_order_relaxed));
+            ctx.check("extra_resv_int_untouched", rsa_fixture::resv_int() == 8);
+        }
+
+        ctx.record("[INFO] return_set_arg receiver-swap / reserved-slot: set_arg(0, ...) overwrites the "
+                   "'this' receiver slot of an instance method (returns true; crash-safe only because "
+                   "the body never dereferences 'this'), and is distinct from set_arg(1, ...) which "
+                   "mutates the first arg. Writing a long's RESERVED high slot (set_arg(2,...) on "
+                   "resvLongInt) does NOT change the trailing int at slot 3 - set_arg targets a raw "
+                   "SLOT index, never an argument ordinal (documented Flaw #1).");
+    }
+
+    // =====================================================================
     // PART 4 — no-hook BASELINE: with no set_arg installed, the original passed
     // arguments flow through unchanged (proves set_arg is what changed the values
     // above, not some ambient effect).
@@ -1073,14 +1335,18 @@ VMHOOK_JVM_MODULE(return_set_arg)
 
     ctx.record("[INFO] return_set_arg: injected int/long/double/float/boolean/byte/char/short over "
                "an interpreter ARGUMENT slot (instance slot 1 + static slot 0) across canonical, "
-               "zero, signed-min/max, minus-one, -0.0, +/-Inf, qNaN, long-high-dword, "
-               "long-low-dword-max, surrogate-char, and canonical-repeat value rounds; unsigned C++ "
-               "source types (uint8/16/32/64); idempotent overwrite + double-write last-wins; the "
-               "wide/narrow slot model (twoInts, mixLongInt, intLong, doubleInt) plus back-to-back "
-               "and interleaved wide args (longLong, doubleDouble, longDouble, doubleLong, floatLong, "
-               "intIntInt, wideProbe); the STATIC multi-arg + wide-arg slot model (staticTwoInts, "
-               "staticLongInt); the max_locals bounds rejection (no wild write); and a no-hook "
-               "baseline. Object/String set_arg is intentionally OMITTED here (covered crash-proof by "
-               "return_set_wrapper_null.cpp); this module performs NO in-detour JVM allocation and NO "
-               "forced GC.");
+               "zero, signed-min/max, plus-one, minus-one, -0.0, +/-Inf, qNaN, sNaN, subnormal-min, "
+               "finite-extremes, long-high-dword, long-low-dword-max, surrogate-char, subint-pos-"
+               "boundary, and canonical-repeat value rounds; unsigned C++ source types "
+               "(uint8/16/32/64); the boolean polarity matrix (only bit 0 of the slot matters); "
+               "idempotent overwrite + double-write last-wins; the wide/narrow slot model (twoInts, "
+               "mixLongInt, intLong, doubleInt) plus back-to-back and interleaved wide args (longLong, "
+               "doubleDouble, longDouble, doubleLong, floatLong, intIntInt, wideProbe); the STATIC "
+               "multi-arg + wide-arg slot model (staticTwoInts, staticLongInt); the receiver swap "
+               "(set_arg(0) on an instance method) + reserved-slot distinctness (writing a long's high "
+               "slot does not change the trailing arg); the over-wide-into-narrow masking case "
+               "(native-width HARD, int-widened [INFO]); the max_locals bounds rejection (no wild "
+               "write); and a no-hook baseline. Object/String set_arg is intentionally OMITTED here "
+               "(covered crash-proof by return_set_wrapper_null.cpp); this module performs NO in-detour "
+               "JVM allocation and NO forced GC.");
 }

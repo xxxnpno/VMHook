@@ -3,8 +3,13 @@ package vmhook.fixtures;
 import vmhook.Harness;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 
 /**
@@ -150,6 +155,26 @@ public final class CollSetExhaustive
     /** Number of Day constants (== Day.values().length). */
     public static final int DAY_N = 5;
 
+    /** Distinct ids in the dedup set; each is added re-DUP_REPEAT times. */
+    public static final int DEDUP_DISTINCT = 12;
+    public static final int DUP_REPEAT = 3;
+
+    /** Small element count shared by the single-shape and linked-set scenarios. */
+    public static final int SMALL_N = 3;
+
+    /** Element count for the LinkedHashSet many-bucket content walk. */
+    public static final int LINKED_N = 20;
+
+    /** Element count for the String-element sets. */
+    public static final int STR_N = 8;
+
+    /** Element count of the null-bearing set: NULL_REALS reals + one null. */
+    public static final int NULL_REALS = 3;
+
+    /** Element counts for the newSetFromMap routing-fix characterization. */
+    public static final int SFM_HASH_N = 5;
+    public static final int SFM_TREE_N = 5;
+
     // ---- The Set fields the native module reads via to_vector --------------
 
     /** HashSet&lt;Long&gt; — boxed 64-bit element decode (bucket walk). */
@@ -186,6 +211,81 @@ public final class CollSetExhaustive
     /** A declared Set field deliberately left NULL (to_vector must stay empty). */
     public static HashSet<Elem> nullSet = null;
 
+    // ---- Foundational shapes (empty / single / dedup / null-element) --------
+
+    /** Empty HashSet — table all-null, the bucket walk must emit 0, never read. */
+    public static HashSet<Elem> emptyHash = new HashSet<Elem>();
+
+    /** Empty TreeSet — root null, the in-order walk must return 0, never throw. */
+    public static TreeSet<Elem> emptyTree = new TreeSet<Elem>();
+
+    /** Empty LinkedHashSet — same hash walk as HashSet, must emit 0. */
+    public static LinkedHashSet<Elem> emptyLinked = new LinkedHashSet<Elem>();
+
+    /** Single-element HashSet — the smallest non-empty bucket walk. */
+    public static HashSet<Elem> singleHash = new HashSet<Elem>();
+
+    /** Single-element TreeSet — the smallest non-empty in-order walk. */
+    public static TreeSet<Elem> singleTree = new TreeSet<Elem>();
+
+    /**
+     * HashSet that received each of DEDUP_DISTINCT ids DUP_REPEAT times via a
+     * fresh, value-equal Elem (equals/hashCode by id).  The Set deduplicates, so
+     * the decode must surface each id EXACTLY once — set semantics survive the
+     * walk.  size() is DEDUP_DISTINCT, not DEDUP_DISTINCT*DUP_REPEAT.
+     */
+    public static HashSet<Elem> dedupHash = new HashSet<Elem>();
+
+    /**
+     * HashSet holding NULL_REALS real Elem PLUS one legal null element.  A
+     * HashSet permits a single null (TreeSet does not), so the decode must yield
+     * exactly one nullptr slot and NULL_REALS non-null elements.
+     */
+    public static HashSet<Elem> nullElemHash = new HashSet<Elem>();
+
+    // ---- LinkedHashSet (map -> SAME hash_map_walk_keys; order [INFO]) -------
+
+    /**
+     * LinkedHashSet of LINKED_N Elem.  vmhook walks the backing LinkedHashMap's
+     * `table` buckets (NOT its before/after insertion-order overlay), so the
+     * decode is correct AS A SET (every element once) but in BUCKET order.  The
+     * native side verifies content order-independently and records the documented
+     * "insertion order is silently lost" behaviour as [INFO].
+     */
+    public static LinkedHashSet<Elem> linkedMany = new LinkedHashSet<Elem>();
+
+    /** LinkedHashSet of SMALL_N String elements (String decode via the hash walk). */
+    public static LinkedHashSet<String> linkedStr = new LinkedHashSet<String>();
+
+    // ---- String-element sets (key walk yields String OOPs) -----------------
+
+    /** HashSet of STR_N String elements — order-independent char-sum cross-check. */
+    public static HashSet<String> hashStr = new HashSet<String>();
+
+    /** TreeSet of String elements — exact ascending lexicographic in-order walk. */
+    public static TreeSet<String> treeStr = new TreeSet<String>();
+
+    // ---- newSetFromMap routing-fix characterization ------------------------
+
+    /**
+     * Collections.newSetFromMap(new HashMap()).  The wrapper stores its backing
+     * map in a field literally named `m` — the same probe TreeSet uses — but the
+     * cascade now inspects the backing map's REAL klass: a HashMap has `table`
+     * (no `root`), so the router picks the hash walk and the Set decodes fully.
+     * (This was once a [medium] bug that returned 0 of N; it is now FIXED.)
+     */
+    public static Set<Elem> setFromHashMap =
+        Collections.newSetFromMap(new HashMap<Elem, Boolean>());
+
+    /**
+     * Collections.newSetFromMap(new TreeMap()).  Backing map has a `root`, so the
+     * router picks the in-order tree walk and the Set decodes SORTED ascending —
+     * proving the router selects the walker by the backing klass, not the field
+     * name.
+     */
+    public static Set<Elem> setFromTreeMap =
+        Collections.newSetFromMap(new TreeMap<Elem, Boolean>());
+
     // ---- Published cross-check values (order-independent + size oracle) -----
 
     public static volatile long hashLongsValSum;
@@ -202,6 +302,21 @@ public final class CollSetExhaustive
 
     public static volatile long setOfListsValSum;      // sum over ALL inner ints
 
+    public static volatile long singleHashIdSum;
+    public static volatile long singleTreeIdSum;
+    public static volatile long dedupHashIdSum;        // sum over DISTINCT ids
+    public static volatile long nullElemRealsIdSum;    // sum over the non-null reals
+
+    public static volatile long linkedManyIdSum;
+    public static volatile long linkedManyIdXor;
+    public static volatile long linkedStrCharSum;      // sum of all element code units
+
+    public static volatile long hashStrCharSum;        // order-independent char sum
+    // treeStr is verified by exact lexicographic order on the native side.
+
+    public static volatile long setFromHashMapIdSum;
+    public static volatile long setFromTreeMapIdSum;
+
     /** Java's own size() for the count==size oracle. */
     public static volatile int hashLongsSize;
     public static volatile int treeLongsSize;
@@ -211,6 +326,20 @@ public final class CollSetExhaustive
     public static volatile int hashCap17Size;
     public static volatile int hashThousandSize;
     public static volatile int setOfListsSize;
+
+    public static volatile int emptyHashSize;
+    public static volatile int emptyTreeSize;
+    public static volatile int emptyLinkedSize;
+    public static volatile int singleHashSize;
+    public static volatile int singleTreeSize;
+    public static volatile int dedupHashSize;          // == DEDUP_DISTINCT (deduped)
+    public static volatile int nullElemHashSize;       // == NULL_REALS + 1 (null counts)
+    public static volatile int linkedManySize;
+    public static volatile int linkedStrSize;
+    public static volatile int hashStrSize;
+    public static volatile int treeStrSize;
+    public static volatile int setFromHashMapSize;
+    public static volatile int setFromTreeMapSize;
 
     // ---- Hookable method (pilot-style interpreter-hook proof) --------------
 
@@ -328,6 +457,104 @@ public final class CollSetExhaustive
         }
         setOfListsValSum = solSum;
 
+        // Foundational shapes: empty / single / dedup / null-element.
+        emptyHash = new HashSet<Elem>();
+        emptyTree = new TreeSet<Elem>();
+        emptyLinked = new LinkedHashSet<Elem>();
+
+        singleHash = new HashSet<Elem>();
+        singleHash.add(new Elem(7));
+        singleHashIdSum = 7;
+
+        singleTree = new TreeSet<Elem>();
+        singleTree.add(new Elem(9));
+        singleTreeIdSum = 9;
+
+        // Dedup: add each distinct id DUP_REPEAT times via a fresh value-equal
+        // Elem; the Set keeps exactly one per id.
+        dedupHash = new HashSet<Elem>();
+        long dedupSum = 0;
+        for (int i = 0; i < DEDUP_DISTINCT; ++i)
+        {
+            for (int r = 0; r < DUP_REPEAT; ++r)
+            {
+                dedupHash.add(new Elem(i));   // value-equal re-add; deduplicated
+            }
+            dedupSum += i;
+        }
+        dedupHashIdSum = dedupSum;
+
+        // One legal null element plus NULL_REALS reals (ids 100..100+NULL_REALS-1).
+        nullElemHash = new HashSet<Elem>();
+        nullElemHash.add(null);
+        long nullRealsSum = 0;
+        for (int i = 0; i < NULL_REALS; ++i)
+        {
+            final int id = 100 + i;
+            nullElemHash.add(new Elem(id));
+            nullRealsSum += id;
+        }
+        nullElemRealsIdSum = nullRealsSum;
+
+        // LinkedHashSet (content verified order-independently; bucket order).
+        linkedMany = new LinkedHashSet<Elem>();
+        long lmSum = 0, lmXor = 0;
+        for (int i = 0; i < LINKED_N; ++i)
+        {
+            linkedMany.add(new Elem(i));
+            lmSum += i;
+            lmXor ^= i;
+        }
+        linkedManyIdSum = lmSum;
+        linkedManyIdXor = lmXor;
+
+        linkedStr = new LinkedHashSet<String>();
+        long lsChar = 0;
+        for (int i = 0; i < SMALL_N; ++i)
+        {
+            final String s = "ls" + i;
+            linkedStr.add(s);
+            lsChar += codeUnitSum(s);
+        }
+        linkedStrCharSum = lsChar;
+
+        // String-element sets: HashSet (order-independent) + TreeSet (sorted).
+        hashStr = new HashSet<String>();
+        long hsChar = 0;
+        for (int i = 0; i < STR_N; ++i)
+        {
+            final String s = "h" + i;
+            hashStr.add(s);
+            hsChar += codeUnitSum(s);
+        }
+        hashStrCharSum = hsChar;
+
+        treeStr = new TreeSet<String>();
+        // Insert scrambled; the in-order walk must come out ascending lexicographic.
+        treeStr.add("delta");
+        treeStr.add("alpha");
+        treeStr.add("charlie");
+        treeStr.add("bravo");
+
+        // newSetFromMap routing-fix characterization.
+        setFromHashMap = Collections.newSetFromMap(new HashMap<Elem, Boolean>());
+        long sfhSum = 0;
+        for (int i = 0; i < SFM_HASH_N; ++i)
+        {
+            setFromHashMap.add(new Elem(i));
+            sfhSum += i;
+        }
+        setFromHashMapIdSum = sfhSum;
+
+        setFromTreeMap = Collections.newSetFromMap(new TreeMap<Elem, Boolean>());
+        long sftSum = 0;
+        for (int i = SFM_TREE_N - 1; i >= 0; --i)   // insert descending; tree re-sorts
+        {
+            setFromTreeMap.add(new Elem(i));
+            sftSum += i;
+        }
+        setFromTreeMapIdSum = sftSum;
+
         nullSet = null;
 
         hashLongsSize = hashLongs.size();
@@ -338,6 +565,20 @@ public final class CollSetExhaustive
         hashCap17Size = hashCap17.size();
         hashThousandSize = hashThousand.size();
         setOfListsSize = setOfLists.size();
+
+        emptyHashSize = emptyHash.size();
+        emptyTreeSize = emptyTree.size();
+        emptyLinkedSize = emptyLinked.size();
+        singleHashSize = singleHash.size();
+        singleTreeSize = singleTree.size();
+        dedupHashSize = dedupHash.size();
+        nullElemHashSize = nullElemHash.size();
+        linkedManySize = linkedMany.size();
+        linkedStrSize = linkedStr.size();
+        hashStrSize = hashStr.size();
+        treeStrSize = treeStr.size();
+        setFromHashMapSize = setFromHashMap.size();
+        setFromTreeMapSize = setFromTreeMap.size();
     }
 
     /**

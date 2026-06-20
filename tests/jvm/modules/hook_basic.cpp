@@ -105,6 +105,16 @@ namespace
         static auto get_mutated_touch_result() -> std::int32_t { return static_field("mutatedTouchResult")->get(); }
         static auto get_reinstall_touch_result() -> std::int32_t { return static_field("reinstallTouchResult")->get(); }
 
+        // --- deepening (batch-16) observations ----------------------------
+        static auto get_many_args_result() -> std::int64_t        { return static_field("manyArgsResult")->get(); }
+        static auto get_static_many_args_result() -> std::int64_t { return static_field("staticManyArgsResult")->get(); }
+        static auto get_boundary_combine_result() -> std::int64_t { return static_field("boundaryCombineResult")->get(); }
+        static auto get_float_arg_result() -> float               { return static_field("floatArgResult")->get(); }
+        static auto get_null_ref_args_both_null() -> bool         { return static_field("nullRefArgsBothNull")->get(); }
+        static auto get_obj_arg_result() -> std::int32_t          { return static_field("objArgResult")->get(); }
+        static auto get_coexist_instance_result() -> std::int32_t { return static_field("coexistInstanceResult")->get(); }
+        static auto get_coexist_static_result() -> std::int32_t   { return static_field("coexistStaticResult")->get(); }
+
         // Reads an instance's own seed (proves `self` is the right object).
         auto seed() const -> std::int32_t { return get_field("seed")->get(); }
     };
@@ -126,6 +136,37 @@ namespace
     constexpr double       WIDE_D{ 2.5 };
     constexpr std::int32_t WIDE_I{ 77 };
     constexpr std::int32_t PRIMARY_SEED{ 1000 };
+
+    // ---- Deepening (batch-16) constants (lockstep with HookBasic.java) -----
+    // manyArgs(int,long,int,double,int,String,long,int): slot alignment past 8 args.
+    constexpr std::int32_t MANY_A{ 11 };
+    constexpr std::int64_t MANY_B{ 0x0A0B0C0D0E0F1011LL };
+    constexpr std::int32_t MANY_C{ 22 };
+    constexpr double       MANY_D{ 6.5 };
+    constexpr std::int32_t MANY_E{ 33 };
+    constexpr std::int32_t MANY_F_LEN{ 4 };                       // "many".length()
+    constexpr std::int64_t MANY_G{ -0x7FEEDDCCBBAA9988LL };
+    constexpr std::int32_t MANY_H{ 44 };
+    // staticManyArgs(long,int,double,String,int,long): wide-first.
+    constexpr std::int64_t SMANY_A{ 0x1213141516171819LL };
+    constexpr std::int32_t SMANY_B{ 55 };
+    constexpr double       SMANY_C{ -12.75 };
+    constexpr std::int32_t SMANY_D_LEN{ 5 };                      // "swide".length()
+    constexpr std::int32_t SMANY_E{ 66 };
+    constexpr std::int64_t SMANY_F{ 0x2122232425262728LL };
+    // floatArg(float,int).
+    constexpr float        FLOAT_ARG{ -3.25f };
+    constexpr std::int32_t FLOAT_TRAILING_I{ 88 };
+    // objArg(HookBasic,int).
+    constexpr std::int32_t OBJ_ARG_SEED{ 7777 };
+    constexpr std::int32_t OBJ_ARG_DELTA{ 9 };
+    // coexist.
+    constexpr std::int32_t COEXIST_INSTANCE_DELTA{ 13 };
+    constexpr std::int32_t COEXIST_STATIC_DELTA{ 21 };
+    // boundaryCombine extreme/all-ones argument sets.
+    constexpr std::int32_t INT_MIN_J{ -2147483647 - 1 };         // Integer.MIN_VALUE
+    constexpr std::int32_t INT_MAX_J{ 2147483647 };              // Integer.MAX_VALUE
+    constexpr std::int64_t LONG_MIN_J{ -9223372036854775807LL - 1 }; // Long.MIN_VALUE
 
     // ---- Return-value interception constants (modes 8-20) ------------------
     // The Java fixture calls each ret*(x) with x==RET_INT_X and naturally
@@ -192,6 +233,44 @@ namespace
     std::atomic<std::int32_t> g_ret_arg_seen{ -1 };
     std::atomic<bool>         g_setarg_ok{ false };     // set_arg returned true
 
+    // ---- Deepening (batch-16) observations --------------------------------
+    // manyArgs / staticManyArgs: each decoded arg matched its expected value.
+    std::atomic<bool> g_many_self_ok{ false };
+    std::atomic<bool> g_many_a_ok{ false };
+    std::atomic<bool> g_many_b_ok{ false };
+    std::atomic<bool> g_many_c_ok{ false };
+    std::atomic<bool> g_many_d_ok{ false };
+    std::atomic<bool> g_many_e_ok{ false };
+    std::atomic<bool> g_many_f_ok{ false };
+    std::atomic<bool> g_many_g_ok{ false };
+    std::atomic<bool> g_many_h_ok{ false };
+    std::atomic<bool> g_smany_a_ok{ false };
+    std::atomic<bool> g_smany_b_ok{ false };
+    std::atomic<bool> g_smany_c_ok{ false };
+    std::atomic<bool> g_smany_d_ok{ false };
+    std::atomic<bool> g_smany_e_ok{ false };
+    std::atomic<bool> g_smany_f_ok{ false };
+    // boundaryCombine: the exact decoded args (so we can assert the boundary value).
+    std::atomic<std::int32_t> g_bound_a{ 0 };
+    std::atomic<std::int64_t> g_bound_b{ 0 };
+    std::atomic<std::int32_t> g_bound_c{ 0 };
+    // floatArg.
+    std::atomic<bool> g_float_self_ok{ false };
+    std::atomic<bool> g_float_f_ok{ false };
+    std::atomic<bool> g_float_i_ok{ false };
+    // nullRefArgs: string-arg decoded empty, object-arg decoded null.
+    std::atomic<bool> g_nullref_string_empty{ false };
+    std::atomic<bool> g_nullref_obj_null{ false };
+    // objArg: object-arg (not the receiver) decoded to the right seed.
+    std::atomic<bool> g_objarg_other_nonnull{ false };
+    std::atomic<std::int32_t> g_objarg_other_seed{ -1 };
+    std::atomic<std::int32_t> g_objarg_delta{ -1 };
+    // coexist: separate fire counters + decoded args for the two methods.
+    std::atomic<std::int32_t> g_coexist_instance_fires{ 0 };
+    std::atomic<std::int32_t> g_coexist_static_fires{ 0 };
+    std::atomic<std::int32_t> g_coexist_instance_delta{ -1 };
+    std::atomic<std::int32_t> g_coexist_static_delta{ -1 };
+
     auto reset_observations() -> void
     {
         g_fire_count.store(0);
@@ -219,6 +298,36 @@ namespace
         g_wide_i_ok.store(false);
         g_ret_arg_seen.store(-1);
         g_setarg_ok.store(false);
+        g_many_self_ok.store(false);
+        g_many_a_ok.store(false);
+        g_many_b_ok.store(false);
+        g_many_c_ok.store(false);
+        g_many_d_ok.store(false);
+        g_many_e_ok.store(false);
+        g_many_f_ok.store(false);
+        g_many_g_ok.store(false);
+        g_many_h_ok.store(false);
+        g_smany_a_ok.store(false);
+        g_smany_b_ok.store(false);
+        g_smany_c_ok.store(false);
+        g_smany_d_ok.store(false);
+        g_smany_e_ok.store(false);
+        g_smany_f_ok.store(false);
+        g_bound_a.store(0);
+        g_bound_b.store(0);
+        g_bound_c.store(0);
+        g_float_self_ok.store(false);
+        g_float_f_ok.store(false);
+        g_float_i_ok.store(false);
+        g_nullref_string_empty.store(false);
+        g_nullref_obj_null.store(false);
+        g_objarg_other_nonnull.store(false);
+        g_objarg_other_seed.store(-1);
+        g_objarg_delta.store(-1);
+        g_coexist_instance_fires.store(0);
+        g_coexist_static_fires.store(0);
+        g_coexist_instance_delta.store(-1);
+        g_coexist_static_delta.store(-1);
     }
 
     // Drives exactly one probe cycle for `mode`: resets observations + the
@@ -1145,6 +1254,374 @@ VMHOOK_JVM_MODULE(hook_basic)
         ctx.check("plain_hook_teardown_did_not_fire", g_fire_count.load() == 0);
         ctx.check("plain_hook_teardown_natural_return",
                   hook_basic_fixture::get_ret_int_observed() == RET_INT_NATURAL_RESULT);
+    }
+
+    // =====================================================================
+    // Scenario 21 — INSTANCE manyArgs(int,long,int,double,int,String,long,int):
+    //               EIGHT args with TWO longs + a double + a String interleaved.
+    //               Proves java_slot_offsets keeps every trailing arg aligned PAST
+    //               the 8-arg / register boundary (MANY_H sits at slot 11 after
+    //               this + two J's + one D + a ref).  Self correct; allow-through.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "manyArgs", "(IJIDILjava/lang/String;JI)J",
+            [](vmhook::return_value&,
+               const std::unique_ptr<hook_basic_fixture>& self,
+               std::int32_t a, std::int64_t b, std::int32_t c, double d,
+               std::int32_t e, const std::string& f, std::int64_t g, std::int32_t h)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                g_many_self_ok.store(self != nullptr && self->seed() == PRIMARY_SEED,
+                                     std::memory_order_relaxed);
+                g_many_a_ok.store(a == MANY_A, std::memory_order_relaxed);
+                g_many_b_ok.store(b == MANY_B, std::memory_order_relaxed);
+                g_many_c_ok.store(c == MANY_C, std::memory_order_relaxed);
+                g_many_d_ok.store(d == MANY_D, std::memory_order_relaxed);
+                g_many_e_ok.store(e == MANY_E, std::memory_order_relaxed);
+                g_many_f_ok.store(f == "many", std::memory_order_relaxed);
+                g_many_g_ok.store(g == MANY_G, std::memory_order_relaxed);
+                g_many_h_ok.store(h == MANY_H, std::memory_order_relaxed);
+            }) };
+
+        ctx.check("many_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{
+            find_method("manyArgs", "(IJIDILjava/lang/String;JI)J") };
+        bool done{ false };
+        drive_until_fires(ctx, 21, m, 1, 6, done);
+        ctx.check("many_probe_completed", done);
+
+        ctx.check("many_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("many_self_correct", g_many_self_ok.load());
+        ctx.check("many_arg_a_int_slot1", g_many_a_ok.load());
+        ctx.check("many_arg_b_long_slot2", g_many_b_ok.load());
+        ctx.check("many_arg_c_int_after_long", g_many_c_ok.load());
+        ctx.check("many_arg_d_double_after_int", g_many_d_ok.load());
+        ctx.check("many_arg_e_int_after_double", g_many_e_ok.load());
+        ctx.check("many_arg_f_string_after_double", g_many_f_ok.load());
+        ctx.check("many_arg_g_long_after_ref", g_many_g_ok.load());
+        ctx.check("many_arg_h_trailing_int_past_8_boundary", g_many_h_ok.load());
+        // allow-through: body summed seed + a + b + c + (long)d + e + len("many") + g + h.
+        ctx.check("many_allow_through_result",
+                  hook_basic_fixture::get_many_args_result()
+                      == static_cast<std::int64_t>(PRIMARY_SEED) + MANY_A + MANY_B
+                         + MANY_C + static_cast<std::int64_t>(MANY_D) + MANY_E
+                         + MANY_F_LEN + MANY_G + MANY_H);
+    }
+
+    // =====================================================================
+    // Scenario 22 — STATIC staticManyArgs(long,int,double,String,int,long):
+    //               WIDE-FIRST (long at slot 0-1, NO this), so the offset table
+    //               starts with a 2-slot type at index 0; the trailing long lands
+    //               at slot 7-8.  No self; allow-through.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "staticManyArgs", "(JIDLjava/lang/String;IJ)J",
+            [](vmhook::return_value&,
+               std::int64_t a, std::int32_t b, double c, const std::string& d,
+               std::int32_t e, std::int64_t f)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                g_smany_a_ok.store(a == SMANY_A, std::memory_order_relaxed);
+                g_smany_b_ok.store(b == SMANY_B, std::memory_order_relaxed);
+                g_smany_c_ok.store(c == SMANY_C, std::memory_order_relaxed);
+                g_smany_d_ok.store(d == "swide", std::memory_order_relaxed);
+                g_smany_e_ok.store(e == SMANY_E, std::memory_order_relaxed);
+                g_smany_f_ok.store(f == SMANY_F, std::memory_order_relaxed);
+            }) };
+
+        ctx.check("static_many_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{
+            find_method("staticManyArgs", "(JIDLjava/lang/String;IJ)J") };
+        bool done{ false };
+        drive_until_fires(ctx, 22, m, 1, 6, done);
+        ctx.check("static_many_probe_completed", done);
+
+        ctx.check("static_many_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("static_many_arg_a_long_slot0_wide_first", g_smany_a_ok.load());
+        ctx.check("static_many_arg_b_int_after_long", g_smany_b_ok.load());
+        ctx.check("static_many_arg_c_double_after_int", g_smany_c_ok.load());
+        ctx.check("static_many_arg_d_string_after_double", g_smany_d_ok.load());
+        ctx.check("static_many_arg_e_int_after_ref", g_smany_e_ok.load());
+        ctx.check("static_many_arg_f_trailing_long", g_smany_f_ok.load());
+        ctx.check("static_many_allow_through_result",
+                  hook_basic_fixture::get_static_many_args_result()
+                      == SMANY_A + SMANY_B + static_cast<std::int64_t>(SMANY_C)
+                         + SMANY_D_LEN + SMANY_E + SMANY_F);
+    }
+
+    // =====================================================================
+    // Scenario 23 — boundaryCombine(int,long,int) with EXTREME primitive values
+    //               (Integer.MIN_VALUE, Long.MIN_VALUE, Integer.MAX_VALUE): the
+    //               decoder must reproduce the exact two's-complement bit patterns
+    //               at the int and long edges.  Self-less body; allow-through.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "boundaryCombine", "(IJI)J",
+            [](vmhook::return_value&,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t a, std::int64_t b, std::int32_t c)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                g_bound_a.store(a, std::memory_order_relaxed);
+                g_bound_b.store(b, std::memory_order_relaxed);
+                g_bound_c.store(c, std::memory_order_relaxed);
+            }) };
+
+        ctx.check("boundary_extreme_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("boundaryCombine", "(IJI)J") };
+        bool done{ false };
+        drive_until_fires(ctx, 23, m, 1, 6, done);
+        ctx.check("boundary_extreme_probe_completed", done);
+
+        ctx.check("boundary_extreme_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("boundary_extreme_int_min_decoded", g_bound_a.load() == INT_MIN_J);
+        ctx.check("boundary_extreme_long_min_decoded", g_bound_b.load() == LONG_MIN_J);
+        ctx.check("boundary_extreme_int_max_after_long_decoded",
+                  g_bound_c.load() == INT_MAX_J);
+        // Compute the wrapping sum in DEFINED unsigned arithmetic (two's-complement
+        // wrap), matching Java's defined long overflow — a signed int64 sum here
+        // overflows (INT_MIN + LONG_MIN underflows) which is C++ UB and folds
+        // compiler-dependently, diverging from the Java side.
+        const std::uint64_t boundary_expected{
+            static_cast<std::uint64_t>(static_cast<std::int64_t>(INT_MIN_J))
+          + static_cast<std::uint64_t>(LONG_MIN_J)
+          + static_cast<std::uint64_t>(static_cast<std::int64_t>(INT_MAX_J)) };
+        ctx.check("boundary_extreme_allow_through_result",
+                  hook_basic_fixture::get_boundary_combine_result()
+                      == static_cast<std::int64_t>(boundary_expected));
+    }
+
+    // =====================================================================
+    // Scenario 24 — boundaryCombine again with an ALL-ONES long (-1L) between
+    //               Integer.MAX_VALUE and Integer.MIN_VALUE: -1L is 0xFFFF...FF,
+    //               so every bit of the wide slot pair is set — a high-word decode
+    //               bug (reading only the low 32 bits) would surface here.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "boundaryCombine", "(IJI)J",
+            [](vmhook::return_value&,
+               const std::unique_ptr<hook_basic_fixture>&,
+               std::int32_t a, std::int64_t b, std::int32_t c)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                g_bound_a.store(a, std::memory_order_relaxed);
+                g_bound_b.store(b, std::memory_order_relaxed);
+                g_bound_c.store(c, std::memory_order_relaxed);
+            }) };
+
+        ctx.check("boundary_allones_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("boundaryCombine", "(IJI)J") };
+        bool done{ false };
+        drive_until_fires(ctx, 24, m, 1, 6, done);
+        ctx.check("boundary_allones_probe_completed", done);
+
+        ctx.check("boundary_allones_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("boundary_allones_int_max_decoded", g_bound_a.load() == INT_MAX_J);
+        ctx.check("boundary_allones_minus1_long_decoded", g_bound_b.load() == -1LL);
+        ctx.check("boundary_allones_high_word_all_set",
+                  (g_bound_b.load() >> 32) == -1LL);
+        ctx.check("boundary_allones_int_min_after_long_decoded",
+                  g_bound_c.load() == INT_MIN_J);
+        ctx.check("boundary_allones_allow_through_result",
+                  hook_basic_fixture::get_boundary_combine_result()
+                      == static_cast<std::int64_t>(INT_MAX_J) + (-1LL) + INT_MIN_J);
+    }
+
+    // =====================================================================
+    // Scenario 25 — INSTANCE floatArg(float,int): a FLOAT argument (1-slot, a
+    //               distinct decode lane from int — the low 32 bits of the slot
+    //               hold the IEEE-754 single) followed by a trailing int.  Value
+    //               chosen exact in IEEE-754 so the equality is bit-exact.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "floatArg", "(FI)D",
+            [](vmhook::return_value&,
+               const std::unique_ptr<hook_basic_fixture>& self,
+               float f, std::int32_t i)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                g_float_self_ok.store(self != nullptr && self->seed() == 0,
+                                      std::memory_order_relaxed);
+                g_float_f_ok.store(f == FLOAT_ARG, std::memory_order_relaxed);
+                g_float_i_ok.store(i == FLOAT_TRAILING_I, std::memory_order_relaxed);
+            }) };
+
+        ctx.check("float_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{ find_method("floatArg", "(FI)D") };
+        bool done{ false };
+        drive_until_fires(ctx, 25, m, 1, 6, done);
+        ctx.check("float_probe_completed", done);
+
+        ctx.check("float_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("float_self_correct", g_float_self_ok.load());
+        ctx.check("float_arg_decoded", g_float_f_ok.load());
+        ctx.check("float_trailing_int_after_float_decoded", g_float_i_ok.load());
+        // allow-through: body returns (double)f + i.
+        ctx.check("float_allow_through_result",
+                  hook_basic_fixture::get_float_arg_result()
+                      == static_cast<float>(static_cast<double>(FLOAT_ARG) + FLOAT_TRAILING_I));
+    }
+
+    // =====================================================================
+    // Scenario 26 — INSTANCE nullRefArgs(String,HookBasic): BOTH reference args
+    //               passed null.  A null String arg decodes through read_java_string
+    //               to an EMPTY std::string (not a crash); a null object arg decodes
+    //               to a null unique_ptr.  Body confirms both were null (allow-through).
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "nullRefArgs", "(Ljava/lang/String;Lvmhook/fixtures/HookBasic;)Z",
+            [](vmhook::return_value&,
+               const std::unique_ptr<hook_basic_fixture>&,
+               const std::string& s, const std::unique_ptr<hook_basic_fixture>& obj)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                g_nullref_string_empty.store(s.empty(), std::memory_order_relaxed);
+                g_nullref_obj_null.store(obj == nullptr, std::memory_order_relaxed);
+            }) };
+
+        ctx.check("nullref_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{
+            find_method("nullRefArgs", "(Ljava/lang/String;Lvmhook/fixtures/HookBasic;)Z") };
+        bool done{ false };
+        drive_until_fires(ctx, 26, m, 1, 6, done);
+        ctx.check("nullref_probe_completed", done);
+
+        ctx.check("nullref_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("nullref_null_string_decodes_empty", g_nullref_string_empty.load());
+        ctx.check("nullref_null_object_decodes_null", g_nullref_obj_null.load());
+        // allow-through: body saw both null too.
+        ctx.check("nullref_allow_through_both_null",
+                  hook_basic_fixture::get_null_ref_args_both_null());
+    }
+
+    // =====================================================================
+    // Scenario 27 — INSTANCE objArg(HookBasic,int): a REAL object-wrapper arg
+    //               distinct from `this`.  The detour decodes `other` and reads
+    //               ITS seed — proving an object ARGUMENT (not the receiver) is
+    //               decoded to the correct instance.  Allow-through.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<hook_basic_fixture>(
+            "objArg", "(Lvmhook/fixtures/HookBasic;I)I",
+            [](vmhook::return_value&,
+               const std::unique_ptr<hook_basic_fixture>& self,
+               const std::unique_ptr<hook_basic_fixture>& other, std::int32_t delta)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                // self is the receiver (seed 0); other is the passed-in object.
+                g_objarg_other_nonnull.store(
+                    self != nullptr && self->seed() == 0 && other != nullptr,
+                    std::memory_order_relaxed);
+                g_objarg_other_seed.store(other != nullptr ? other->seed() : -1,
+                                          std::memory_order_relaxed);
+                g_objarg_delta.store(delta, std::memory_order_relaxed);
+            }) };
+
+        ctx.check("objarg_scoped_hook_installed", handle.installed());
+
+        vmhook::hotspot::method* const m{
+            find_method("objArg", "(Lvmhook/fixtures/HookBasic;I)I") };
+        bool done{ false };
+        drive_until_fires(ctx, 27, m, 1, 6, done);
+        ctx.check("objarg_probe_completed", done);
+
+        ctx.check("objarg_fired_exactly_once", g_fire_count.load() == 1);
+        ctx.check("objarg_other_nonnull_and_self_is_receiver",
+                  g_objarg_other_nonnull.load());
+        ctx.check("objarg_other_seed_is_correct_object",
+                  g_objarg_other_seed.load() == OBJ_ARG_SEED);
+        ctx.check("objarg_delta_after_object_decoded",
+                  g_objarg_delta.load() == OBJ_ARG_DELTA);
+        // allow-through: body returns other.seed + delta.
+        ctx.check("objarg_allow_through_result",
+                  hook_basic_fixture::get_obj_arg_result() == (OBJ_ARG_SEED + OBJ_ARG_DELTA));
+    }
+
+    // =====================================================================
+    // Scenario 28 — TWO DISTINCT hooks coexisting: touch() (instance) AND
+    //               staticTouch() (static) are both installed, then ONE dispatch
+    //               calls each exactly once.  Both detours must fire in the SAME
+    //               probe cycle, each decoding ITS OWN arg from ITS OWN frame —
+    //               proving multiple hooks on different methods (sharing the one
+    //               patched i2i stub) each fire for their method only.
+    // =====================================================================
+    {
+        auto h_instance{ vmhook::scoped_hook<hook_basic_fixture>(
+            "touch", "(I)I",
+            [](vmhook::return_value&,
+               const std::unique_ptr<hook_basic_fixture>& self,
+               std::int32_t delta)
+            {
+                g_coexist_instance_fires.fetch_add(1, std::memory_order_relaxed);
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                if (self != nullptr && self->seed() == PRIMARY_SEED)
+                {
+                    g_coexist_instance_delta.store(delta, std::memory_order_relaxed);
+                }
+            }) };
+        auto h_static{ vmhook::scoped_hook<hook_basic_fixture>(
+            "staticTouch", "(I)I",
+            [](vmhook::return_value&, std::int32_t delta)
+            {
+                g_coexist_static_fires.fetch_add(1, std::memory_order_relaxed);
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                g_coexist_static_delta.store(delta, std::memory_order_relaxed);
+            }) };
+
+        ctx.check("coexist_instance_hook_installed", h_instance.installed());
+        ctx.check("coexist_static_hook_installed", h_static.installed());
+
+        // Settle BOTH methods to the interpreter route before driving.
+        vmhook::hotspot::method* const m_instance{ find_method("touch", "(I)I") };
+        vmhook::hotspot::method* const m_static{ find_method("staticTouch", "(I)I") };
+        bool done{ false };
+        for (int attempt{ 0 }; attempt < 6; ++attempt)
+        {
+            (void)settle_interpreter_route(m_instance, 12);
+            (void)settle_interpreter_route(m_static, 12);
+            done = drive(ctx, 28);
+            if (done && g_coexist_instance_fires.load() == 1
+                     && g_coexist_static_fires.load() == 1)
+            {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 25 });
+        }
+        ctx.check("coexist_probe_completed", done);
+
+        // Both methods are COLD single-dispatch in this probe -> each fires once.
+        ctx.check("coexist_instance_fired", g_coexist_instance_fires.load() >= 1);
+        ctx.check("coexist_instance_not_doubled",
+                  g_coexist_instance_fires.load() <= 1);
+        ctx.check("coexist_static_fired", g_coexist_static_fires.load() >= 1);
+        ctx.check("coexist_static_not_doubled",
+                  g_coexist_static_fires.load() <= 1);
+        // Each detour decoded ITS OWN method's arg (not the other's).
+        ctx.check("coexist_instance_decoded_own_arg",
+                  g_coexist_instance_delta.load() == COEXIST_INSTANCE_DELTA);
+        ctx.check("coexist_static_decoded_own_arg",
+                  g_coexist_static_delta.load() == COEXIST_STATIC_DELTA);
+        ctx.check("coexist_args_are_distinct",
+                  g_coexist_instance_delta.load() != g_coexist_static_delta.load());
+        // allow-through on both methods.
+        ctx.check("coexist_instance_allow_through",
+                  hook_basic_fixture::get_coexist_instance_result()
+                      == (PRIMARY_SEED + COEXIST_INSTANCE_DELTA));
+        ctx.check("coexist_static_allow_through",
+                  hook_basic_fixture::get_coexist_static_result()
+                      == (COEXIST_STATIC_DELTA * 2));
     }
     }
     catch (const std::exception& ex)

@@ -20,11 +20,17 @@
 //     * NESTED ENUM              NestedClasses$NestedEnum
 //     * NESTED ANNOTATION        NestedClasses$NestedAnno
 //     * GENERIC nested (erased)  NestedClasses$GenericBox  (boxed: Ljava/lang/Object;)
+//     * STATIC class under ENUM  NestedClasses$NestedEnum$EnumStatic  (no this$N)
+//     * MEMBER class of IFACE    NestedClasses$NestedIface$IfaceMember (implicit
+//                                   static -> no this$0)
+//     * ENUM under a class       NestedClasses$Host$HostColor (super java.lang.Enum)
 //
 //   UNSTABLE-name shapes (the `$N` ordinal is source-order-assigned, so NO fixed
 //   name identifies them — resolved by reading the klass off a PUBLISHED INSTANCE
 //   oop, never by name; the JDK8 enumeration quirk is characterised [INFO]):
 //     * ANONYMOUS class          NestedClasses$1     (a Runnable; this$0 -> fixture)
+//     * ANONYMOUS of IFACE       NestedClasses$N     (impl NestedIface; this$0 ->
+//                                   fixture; super Object, NOT the interface)
 //     * LOCAL class              NestedClasses$1LocalCounter (this$0 -> fixture)
 //
 // WHAT THIS MODULE PROVES on a live JVM (Java 8/11/17/21/24/25 x MSVC/Clang/GCC):
@@ -316,6 +322,35 @@ namespace
         }
     };
 
+    // A STATIC nested class declared inside the nested ENUM: `int enumStaticValue`
+    // + `int tripled()`.  No synthetic outer reference (static).
+    class enum_static_w : public vmhook::object<enum_static_w>
+    {
+    public:
+        explicit enum_static_w(vmhook::oop_t instance) noexcept
+            : vmhook::object<enum_static_w>{ instance }
+        {
+        }
+
+        auto get_enum_static_value() const -> std::int32_t { return get_field("enumStaticValue")->get(); }
+        auto no_this0() const -> bool { return !get_field("this$0").has_value(); }
+        auto no_this1() const -> bool { return !get_field("this$1").has_value(); }
+    };
+
+    // A member class of the nested INTERFACE: `int ifaceMemberValue` +
+    // `int memberPlusConst()`.  Implicitly static -> no synthetic outer reference.
+    class iface_member_w : public vmhook::object<iface_member_w>
+    {
+    public:
+        explicit iface_member_w(vmhook::oop_t instance) noexcept
+            : vmhook::object<iface_member_w>{ instance }
+        {
+        }
+
+        auto get_iface_member_value() const -> std::int32_t { return get_field("ifaceMemberValue")->get(); }
+        auto no_this0() const -> bool { return !get_field("this$0").has_value(); }
+    };
+
     // Fully-qualified internal `$` names (the STABLE resolution targets).
     constexpr const char* k_fixture_name      = "vmhook/fixtures/NestedClasses";
     constexpr const char* k_host_name         = "vmhook/fixtures/NestedClasses$Host";
@@ -328,6 +363,14 @@ namespace
     constexpr const char* k_enum_name         = "vmhook/fixtures/NestedClasses$NestedEnum";
     constexpr const char* k_anno_name         = "vmhook/fixtures/NestedClasses$NestedAnno";
     constexpr const char* k_generic_name      = "vmhook/fixtures/NestedClasses$GenericBox";
+    // Batch-17 deepening: new STABLE `$`-name targets — a static nested class
+    // whose enclosing type is the nested ENUM, a member class of the nested
+    // INTERFACE, and an ENUM nested directly inside the Host class.  Each probes
+    // the `$`-name path for an enclosing-type shape (enum / interface / class)
+    // the earlier targets did not cover.
+    constexpr const char* k_enum_static_name  = "vmhook/fixtures/NestedClasses$NestedEnum$EnumStatic";
+    constexpr const char* k_iface_member_name = "vmhook/fixtures/NestedClasses$NestedIface$IfaceMember";
+    constexpr const char* k_host_color_name   = "vmhook/fixtures/NestedClasses$Host$HostColor";
 
     // Descriptors the synthetic outer-reference slots must carry.
     constexpr const char* k_host_descriptor  = "Lvmhook/fixtures/NestedClasses$Host;";
@@ -500,6 +543,8 @@ VMHOOK_JVM_MODULE(nested_classes)
     vmhook::register_class<inner_inner_w>(k_inner_inner_name);
     vmhook::register_class<deep_nested_w>(k_deep_name);
     vmhook::register_class<generic_box_w>(k_generic_name);
+    vmhook::register_class<enum_static_w>(k_enum_static_name);
+    vmhook::register_class<iface_member_w>(k_iface_member_name);
 
     // =====================================================================
     //  0. The fixture resolves and its publication fields are reachable.
@@ -525,6 +570,9 @@ VMHOOK_JVM_MODULE(nested_classes)
     vmhook::hotspot::klass* const enum_klass{ vmhook::find_class(k_enum_name) };
     vmhook::hotspot::klass* const anno_klass{ vmhook::find_class(k_anno_name) };
     vmhook::hotspot::klass* const generic_klass{ vmhook::find_class(k_generic_name) };
+    vmhook::hotspot::klass* const enum_static_klass{ vmhook::find_class(k_enum_static_name) };
+    vmhook::hotspot::klass* const iface_member_klass{ vmhook::find_class(k_iface_member_name) };
+    vmhook::hotspot::klass* const host_color_klass{ vmhook::find_class(k_host_color_name) };
 
     ctx.check("find_class_host_resolves", host_klass != nullptr);
     ctx.check("find_class_static_nested_resolves", static_klass != nullptr);
@@ -536,6 +584,9 @@ VMHOOK_JVM_MODULE(nested_classes)
     ctx.check("find_class_nested_enum_resolves", enum_klass != nullptr);
     ctx.check("find_class_nested_anno_resolves", anno_klass != nullptr);
     ctx.check("find_class_generic_resolves", generic_klass != nullptr);
+    ctx.check("find_class_enum_static_resolves", enum_static_klass != nullptr);
+    ctx.check("find_class_iface_member_resolves", iface_member_klass != nullptr);
+    ctx.check("find_class_host_color_resolves", host_color_klass != nullptr);
 
     ctx.check("host_klass_name_echoes_dollar_name", klass_name_is(host_klass, k_host_name));
     ctx.check("static_nested_klass_name_echoes_dollar_name", klass_name_is(static_klass, k_static_name));
@@ -547,6 +598,12 @@ VMHOOK_JVM_MODULE(nested_classes)
     ctx.check("nested_enum_klass_name_echoes_dollar_name", klass_name_is(enum_klass, k_enum_name));
     ctx.check("nested_anno_klass_name_echoes_dollar_name", klass_name_is(anno_klass, k_anno_name));
     ctx.check("generic_klass_name_echoes_dollar_name", klass_name_is(generic_klass, k_generic_name));
+    // The three new enclosing-type shapes echo their exact multi-segment $-name:
+    // a static class under an ENUM, a member class under an INTERFACE, an ENUM
+    // under a class.  The `$`-name resolver is enclosing-type-agnostic.
+    ctx.check("enum_static_klass_name_echoes_dollar_name", klass_name_is(enum_static_klass, k_enum_static_name));
+    ctx.check("iface_member_klass_name_echoes_dollar_name", klass_name_is(iface_member_klass, k_iface_member_name));
+    ctx.check("host_color_klass_name_echoes_dollar_name", klass_name_is(host_color_klass, k_host_color_name));
 
     // The two inner classes of the SAME outer Host are DISTINCT klasses (one of
     // the headline multiplicity facts).
@@ -1259,6 +1316,224 @@ VMHOOK_JVM_MODULE(nested_classes)
     }
 
     // =====================================================================
+    //  7h. BATCH-17 ENCLOSING-TYPE SHAPES — a static class nested under an ENUM,
+    //      a member class of an INTERFACE, and an ENUM nested in a class.  Each
+    //      adds an enclosing-type the earlier targets never exercised, and each
+    //      asserts the SAME contract bundle: acquire/read the declared field
+    //      (mirrored value), klass-from-oop tie-back, the static-nesting negative
+    //      (NO this$N), and the super-chain echo.  Synthetic-member surfaces that
+    //      drift by JDK ($VALUES, the enum's synthetic ctor) are gated [INFO].
+    // =====================================================================
+    {
+        const auto enum_static{ nc::acquire<enum_static_w>("enumStaticInst") };
+        const auto iface_member{ nc::acquire<iface_member_w>("ifaceMemberInst") };
+
+        ctx.check("enum_static_instance_acquired", enum_static != nullptr);
+        ctx.check("iface_member_instance_acquired", iface_member != nullptr);
+
+        // -- declared int field reads (mirrored values), header-probe gated ------
+        if (enum_static)
+        {
+            read_int_field("enum_static_value_is_13", enum_static->get_instance(),
+                           [&] { return enum_static->get_enum_static_value(); }, 13);
+        }
+        if (iface_member)
+        {
+            read_int_field("iface_member_value_is_70", iface_member->get_instance(),
+                           [&] { return iface_member->get_iface_member_value(); }, 70);
+        }
+
+        // -- klass-from-oop tie-back: the acquired oop carries the by-name klass --
+        if (enum_static)
+        {
+            klass_tie_back("enum_static_oop_klass_matches_find_class",
+                           enum_static->get_instance(), enum_static_klass);
+        }
+        if (iface_member)
+        {
+            klass_tie_back("iface_member_oop_klass_matches_find_class",
+                           iface_member->get_instance(), iface_member_klass);
+        }
+
+        // -- static-nesting negatives via the LIVE wrapper (no oop deref: a field
+        //    metadata walk) — neither static-under-enum nor iface-member carries a
+        //    synthetic outer reference at ANY level.  HARD.
+        if (enum_static)
+        {
+            ctx.check("enum_static_has_no_this0", enum_static->no_this0());
+            ctx.check("enum_static_has_no_this1", enum_static->no_this1());
+        }
+        if (iface_member)
+        {
+            ctx.check("iface_member_has_no_this0", iface_member->no_this0());
+        }
+
+        // -- the same negatives proven instance-free off the resolved klass ------
+        ctx.check("enum_static_this0_find_field_absent",
+                  !field_entry_for(enum_static_klass, "this$0").has_value());
+        ctx.check("enum_static_this1_find_field_absent",
+                  !field_entry_for(enum_static_klass, "this$1").has_value());
+        ctx.check("iface_member_this0_find_field_absent",
+                  !field_entry_for(iface_member_klass, "this$0").has_value());
+        ctx.check("host_color_this0_find_field_absent",
+                  !field_entry_for(host_color_klass, "this$0").has_value());
+
+        // -- the declared int fields resolve as INSTANCE "I" off the resolved
+        //    klass (pure metadata; offset past header) -> HARD.
+        {
+            const auto es_e{ field_entry_for(enum_static_klass, "enumStaticValue") };
+            ctx.check("enum_static_value_meta_resolves", es_e.has_value());
+            if (es_e.has_value())
+            {
+                ctx.check("enum_static_value_meta_is_int", es_e->signature == std::string{ "I" });
+                ctx.check("enum_static_value_meta_is_instance", !es_e->is_static);
+                ctx.check("enum_static_value_meta_offset_past_header", es_e->offset > 0u);
+            }
+            const auto im_e{ field_entry_for(iface_member_klass, "ifaceMemberValue") };
+            ctx.check("iface_member_value_meta_resolves", im_e.has_value());
+            if (im_e.has_value())
+            {
+                ctx.check("iface_member_value_meta_is_int", im_e->signature == std::string{ "I" });
+                ctx.check("iface_member_value_meta_is_instance", !im_e->is_static);
+            }
+        }
+
+        // -- super-chain: the static-under-enum and the iface-member both extend
+        //    java.lang.Object directly; the Host-nested enum extends
+        //    java.lang.Enum.  Pure metadata (get_super + get_name) -> HARD.
+        ctx.check("enum_static_super_is_object",
+                  super_name_str(enum_static_klass) == std::string{ k_object_name });
+        ctx.check("iface_member_super_is_object",
+                  super_name_str(iface_member_klass) == std::string{ k_object_name });
+        ctx.check("host_color_super_is_enum",
+                  super_name_str(host_color_klass) == std::string{ k_enum_name_jl });
+
+        // -- the new klasses are DISTINCT from each other and from the prior
+        //    same-named shapes (EnumStatic != the top-level NestedEnum, the
+        //    Host-nested enum != the top-level NestedEnum, etc.).  Pure pointer
+        //    comparison -> HARD.
+        ctx.check("batch17_new_klasses_mutually_distinct",
+                  enum_static_klass && iface_member_klass && host_color_klass
+                  && enum_static_klass != iface_member_klass
+                  && enum_static_klass != host_color_klass
+                  && iface_member_klass != host_color_klass);
+        ctx.check("host_color_enum_distinct_from_top_level_enum",
+                  host_color_klass != nullptr && enum_klass != nullptr
+                  && host_color_klass != enum_klass);
+        ctx.check("enum_static_distinct_from_its_enclosing_enum",
+                  enum_static_klass != nullptr && enum_klass != nullptr
+                  && enum_static_klass != enum_klass);
+        ctx.check("iface_member_distinct_from_its_enclosing_iface",
+                  iface_member_klass != nullptr && iface_klass != nullptr
+                  && iface_member_klass != iface_klass);
+
+        // -- method descriptors on the new shapes (stable obfuscation-proof key) --
+        ctx.check("enum_static_tripled_descriptor_is_int_noarg",
+                  method_descriptor(k_enum_static_name, "tripled") == std::string{ "()I" });
+        ctx.check("iface_member_memberPlusConst_descriptor_is_int_noarg",
+                  method_descriptor(k_iface_member_name, "memberPlusConst") == std::string{ "()I" });
+        ctx.check("host_color_code_descriptor_is_int_noarg",
+                  method_descriptor(k_host_color_name, "code") == std::string{ "()I" });
+
+        // -- the Host-nested enum exposes the synthetic values()/valueOf and the
+        //    declared code(); its enum constants RED/GREEN/BLUE are static fields.
+        //    values()/valueOf presence is a stable javac contract -> HARD; the
+        //    synthetic $VALUES backing field's NAME drifts by JDK, so gate [INFO].
+        {
+            const auto hc_methods{ vmhook::get_class_methods(k_host_color_name) };
+            bool hc_has_values{ false };
+            bool hc_has_valueof{ false };
+            bool hc_has_code{ false };
+            for (const auto& m : hc_methods)
+            {
+                if (m.first == "values")  { hc_has_values = true; }
+                if (m.first == "valueOf") { hc_has_valueof = true; }
+                if (m.first == "code")    { hc_has_code = true; }
+            }
+            ctx.check("host_color_has_synthetic_values", hc_has_values);
+            ctx.check("host_color_has_synthetic_valueOf", hc_has_valueof);
+            ctx.check("host_color_has_declared_code", hc_has_code);
+            // A declared enum constant resolves as a static field on the enum.
+            ctx.check("host_color_GREEN_constant_field_resolves",
+                      vmhook::find_field(host_color_klass, "GREEN").has_value());
+
+            // The synthetic $VALUES array backing field is JDK-variant in name
+            // ($VALUES on modern javac, ENUM$VALUES on very old) — record which one
+            // is present without asserting either (best-effort).
+            const bool has_dollar_values{
+                vmhook::find_field(host_color_klass, "$VALUES").has_value() };
+            const bool has_enum_dollar_values{
+                vmhook::find_field(host_color_klass, "ENUM$VALUES").has_value() };
+            ctx.record(std::string{ "[INFO] nested_classes: Host$HostColor synthetic enum-array "
+                                    "backing field: $VALUES=" }
+                       + (has_dollar_values ? "present" : "absent")
+                       + " ENUM$VALUES="
+                       + (has_enum_dollar_values ? "present" : "absent")
+                       + " (name is JDK-variant; not asserted).");
+        }
+    }
+
+    // =====================================================================
+    //  7i. SECOND UNSTABLE shape — an ANONYMOUS class implementing the NESTED
+    //      INTERFACE (not Runnable).  Resolved from its published instance oop
+    //      (the $N ordinal is unstable), it must: resolve a non-null klass, carry
+    //      the Outer$<ordinal> name shape, be DISTINCT from the Runnable anon, and
+    //      its synthetic this$0 must point back at the fixture SELF.
+    // =====================================================================
+    {
+        void* const anon_iface_oop{ nc::field_oop("anonymousIfaceInst") };
+        void* const anon_oop{ nc::field_oop("anonymousInst") };
+        void* const self_oop{ nc::field_oop("SELF") };
+
+        ctx.check("anonymous_iface_instance_oop_nonnull",
+                  anon_iface_oop != nullptr && vmhook::hotspot::is_valid_pointer(anon_iface_oop));
+
+        const std::string fixture_prefix{ std::string{ k_fixture_name } + "$" };
+
+        if (anon_iface_oop && oop_header_safely_readable(anon_iface_oop))
+        {
+            vmhook::hotspot::klass* const aik{ vmhook::klass_from_oop(anon_iface_oop) };
+            ctx.check("anonymous_iface_klass_from_oop_nonnull", aik != nullptr);
+            const std::string ai_name{ klass_name_str(aik) };
+            ctx.check("anonymous_iface_klass_name_has_outer_dollar_shape",
+                      starts_with(ai_name, fixture_prefix));
+            // Its DIRECT super is java.lang.Object (it IMPLEMENTS the interface,
+            // it does not extend it) — the cleanest dispel of the "anon extends
+            // its interface" confusion.  Pure metadata -> HARD.
+            ctx.check("anonymous_iface_super_is_object",
+                      super_name_str(aik) == std::string{ k_object_name });
+            ctx.record(std::string{ "[INFO] nested_classes: interface-impl anonymous class resolved "
+                                    "by INSTANCE (name='" } + ai_name + "'); its $N ordinal is "
+                       "source-order assigned and NOT a contractual find_class target.");
+
+            // Distinct from the Runnable anonymous class.
+            if (anon_oop && oop_header_safely_readable(anon_oop))
+            {
+                vmhook::hotspot::klass* const runnable_anon{ vmhook::klass_from_oop(anon_oop) };
+                ctx.check("two_anonymous_classes_are_distinct_klasses",
+                          aik != nullptr && runnable_anon != nullptr && aik != runnable_anon);
+            }
+
+            // Its synthetic this$0 -> the fixture SELF instance (identity).
+            const auto ai_this0{ vmhook::find_field(aik, "this$0") };
+            ctx.check("anonymous_iface_has_synthetic_this0", ai_this0.has_value());
+            if (ai_this0.has_value() && self_oop)
+            {
+                const std::uint32_t narrow{ vmhook::get_field<std::uint32_t>(
+                    anon_iface_oop, aik, "this$0") };
+                void* const decoded{ vmhook::hotspot::decode_oop_pointer(narrow) };
+                ctx.check("anonymous_iface_this0_identity_is_fixture_self",
+                          decoded == self_oop);
+            }
+        }
+        else if (anon_iface_oop)
+        {
+            ctx.record("[INFO] nested_classes: interface-impl anonymous instance header not safely "
+                       "readable -- skipped klass/this$0 resolution.");
+        }
+    }
+
+    // =====================================================================
     //  8. Native interpreter-call ATTEMPTS (degrade gracefully to [INFO]).
     //     A no-arg int instance method on a nested class may return monostate
     //     via the call_jni fallback on some JDK builds; never FAIL on that.
@@ -1354,6 +1629,29 @@ VMHOOK_JVM_MODULE(nested_classes)
             // Local class read-through (selfMarker 4242 + localValue 7777 == 12019).
             ctx.check("probe_local_readback_is_12019", nc::get_int("localReadbackValue") == (4242 + 7777));
         }
+
+        // Mode 3: the batch-17 enclosing-type shapes through REAL bytecode.
+        const bool done3{ drive(ctx, 3) };
+        ctx.check("composite_probe_mode3_completed", done3);
+        if (done3)
+        {
+            // Static-under-enum tripled: 13 * 3 == 39.
+            ctx.check("probe_enum_static_tripled_is_39",
+                      nc::get_int("enumStaticTripledValue") == 39);
+            // Iface member: ifaceMemberValue(70) + IFACE_CONST(17) == 87.
+            ctx.check("probe_iface_member_plus_const_is_87",
+                      nc::get_int("ifaceMemberPlusConstValue") == 87);
+            ctx.check("composite_iface_member_parts_sum_to_87",
+                      (70 + 17) == nc::get_int("ifaceMemberPlusConstValue"));
+            // Host-nested enum: GREEN.code() == ordinal(1)+10 == 11.
+            ctx.check("probe_host_color_code_is_11",
+                      nc::get_int("hostColorCodeValue") == 11);
+            // Anon-of-interface ifaceOp(8): 8 + selfMarker(4242) == 4250.
+            ctx.check("probe_anon_iface_op_is_4250",
+                      nc::get_int("anonIfaceOpValue") == 4250);
+            ctx.check("composite_anon_iface_parts_sum_to_4250",
+                      (8 + 4242) == nc::get_int("anonIfaceOpValue"));
+        }
     }
 
     // =====================================================================
@@ -1373,5 +1671,8 @@ VMHOOK_JVM_MODULE(nested_classes)
         ctx.check("self_identity_published_nonzero", nc::get_int("selfIdentity") != 0);
         ctx.check("anonymous_identity_published_nonzero", nc::get_int("anonymousIdentity") != 0);
         ctx.check("local_identity_published_nonzero", nc::get_int("localIdentity") != 0);
+        ctx.check("enum_static_identity_published_nonzero", nc::get_int("enumStaticIdentity") != 0);
+        ctx.check("iface_member_identity_published_nonzero", nc::get_int("ifaceMemberIdentity") != 0);
+        ctx.check("anonymous_iface_identity_published_nonzero", nc::get_int("anonymousIfaceIdentity") != 0);
     }
 }

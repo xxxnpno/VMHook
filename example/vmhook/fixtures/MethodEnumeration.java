@@ -62,6 +62,10 @@ public final class MethodEnumeration
      *          unresolved-link stub, so the install would fail.  Calling the
      *          target once links it; the install then genuinely succeeds.  See
      *          the Overloads doc below for the per-mode mapping.
+     *   8  = link SameNameOverloads.pick(long) -> (J)I (then native scoped_hook).
+     *   10 = link + drive Sub.shared(int) -> (I)I override (then scoped_hook).
+     *   11 = link + drive ArraySigs.oneD(long[]) -> ([J)J (then scoped_hook fire).
+     *   12 = link + drive Tiny.only() -> ()V (then scoped_hook fire).
      */
     public static volatile int mode;
 
@@ -243,6 +247,202 @@ public final class MethodEnumeration
     /** Last value the Overloads.sSolo body returned (allow-through proof). */
     public static volatile long lastSSolo;
 
+    // =======================================================================
+    // FEW-METHODS shape.  The whole declared set is { only()V, <init>()V } and
+    // nothing else: NO static fields and NO static block, so this klass has NO
+    // <clinit> at all.  Contrasts the enclosing MethodEnumeration (a static {}
+    // block + static-field initializers GUARANTEE its <clinit>), letting the
+    // native side assert get_class_methods reports <clinit> ABSENT here and
+    // PRESENT there -- proving the enumeration distinguishes the two, not that
+    // <clinit> is universal.  Internal name: ...MethodEnumeration$Tiny.
+    // =======================================================================
+    public static final class Tiny
+    {
+        /** ()V -- the single declared user method (drives a scoped_hook fire). */
+        public void only()
+        {
+            lastTinyOnly++;
+        }
+    }
+
+    /** Counts Tiny.only() dispatches (allow-through proof for mode 12). */
+    public static volatile int lastTinyOnly;
+
+    // =======================================================================
+    // TRUE SAME-NAME OVERLOADS: one method name, FOUR distinct descriptors.
+    // get_class_methods must list all four under the single name `pick`, and
+    // find_methods_by_signature must answer per-descriptor (each of the four is
+    // UNIQUE here), while a name lookup is descriptor-agnostic.  This is the
+    // overload axis the enclosing class lacks (its collisions are across
+    // DIFFERENT names sharing a descriptor; here it is ONE name across
+    // descriptors).  Internal name: ...MethodEnumeration$SameNameOverloads.
+    // =======================================================================
+    public static final class SameNameOverloads
+    {
+        /** pick (I)I */
+        public int pick(final int a)
+        {
+            return a;
+        }
+
+        /** pick (J)I -- same name, distinct descriptor. */
+        public int pick(final long a)
+        {
+            return (int) a;
+        }
+
+        /** pick (II)I -- same name, distinct descriptor. */
+        public int pick(final int a, final int b)
+        {
+            return a + b;
+        }
+
+        /** pick (Ljava/lang/String;)I -- same name, reference arg. */
+        public int pick(final String s)
+        {
+            return (s == null) ? -1 : s.length();
+        }
+    }
+
+    // =======================================================================
+    // INHERITED-vs-DECLARED.  Sub extends Base, OVERRIDES shared(I)I, and adds
+    // subOnly()V; Base also declares baseOnly()V.  get_class_methods<Sub> must
+    // list ONLY Sub's declared methods (shared + subOnly + <init>) and NEVER the
+    // inherited baseOnly -- the documented "declared, not resolved" scope.  The
+    // override has the SAME descriptor as the parent method, so javac emits no
+    // bridge: Sub.shared appears exactly once.  Internal names:
+    // ...MethodEnumeration$Base and ...MethodEnumeration$Sub.
+    // =======================================================================
+    public static class Base
+    {
+        /** (I)I -- overridden by Sub. */
+        public int shared(final int x)
+        {
+            return x;
+        }
+
+        /** ()V -- declared on Base only; must NOT appear in Sub's enumeration. */
+        public void baseOnly()
+        {
+        }
+    }
+
+    public static final class Sub extends Base
+    {
+        /** (I)I -- override (same descriptor -> no bridge). */
+        @Override
+        public int shared(final int x)
+        {
+            lastSubShared = x;
+            return x + 1;
+        }
+
+        /** ()V -- declared only on Sub. */
+        public void subOnly()
+        {
+        }
+    }
+
+    /** Last arg Sub.shared saw (allow-through proof for mode 10). */
+    public static volatile int lastSubShared;
+
+    // =======================================================================
+    // INTERFACE shape: an abstract method, a default method, and a static
+    // method ALL live in _methods.  get_class_methods must enumerate all three;
+    // an interface has NO <init>.  hook_by_signature on the ABSTRACT req(I)I is
+    // a resolution-only probe on the native side (an abstract method has no body
+    // to dispatch, so the native side never drives it -- it only proves the
+    // descriptor is uniquely RESOLVED).  Internal name:
+    // ...MethodEnumeration$Iface.
+    // =======================================================================
+    public interface Iface
+    {
+        /** (I)I -- abstract (no body). */
+        int req(int x);
+
+        /** (I)I -- default method (shares (I)I with req and stat). */
+        default int def(final int x)
+        {
+            return x + 1;
+        }
+
+        /** (I)I -- static interface method (shares (I)I). */
+        static int stat(final int x)
+        {
+            return x + 2;
+        }
+    }
+
+    // =======================================================================
+    // ABSTRACT CLASS: an abstract method + a concrete method + the synthetic
+    // <init>.  abstractOp(I)I is abstract (in _methods, no body); concreteOp(I)I
+    // is real.  uniqueAbs(D)D is a genuinely-UNIQUE descriptor on this klass for
+    // a no-collision find/refuse contrast.  Internal name:
+    // ...MethodEnumeration$AbstractShape.
+    // =======================================================================
+    public abstract static class AbstractShape
+    {
+        /** (I)I -- abstract. */
+        public abstract int abstractOp(int x);
+
+        /** (I)I -- concrete (shares (I)I with abstractOp on this klass). */
+        public int concreteOp(final int x)
+        {
+            return x;
+        }
+
+        /** (D)D -- UNIQUE on AbstractShape. */
+        public double uniqueAbs(final double d)
+        {
+            return d;
+        }
+    }
+
+    // =======================================================================
+    // ARRAY-TYPED SIGNATURES, scoped to their own klass so each is UNIQUE here
+    // (the enclosing class only has the single ([I)I).  oneD([J)J is the
+    // drive+fire target (a long-array arg + long return through a scoped_hook).
+    // Internal name: ...MethodEnumeration$ArraySigs.
+    // =======================================================================
+    public static final class ArraySigs
+    {
+        /** ([J)J -- long-array arg, long return (drive+fire target, mode 11). */
+        public long oneD(final long[] a)
+        {
+            long total = 0;
+            if (a != null)
+            {
+                for (long v : a)
+                {
+                    total += v;
+                }
+            }
+            lastOneD = total;
+            return total;
+        }
+
+        /** ([[I)I -- 2-D int array. */
+        public int twoD(final int[][] a)
+        {
+            return (a == null) ? -1 : a.length;
+        }
+
+        /** ([Ljava/lang/String;)I -- reference array. */
+        public int objArr(final String[] a)
+        {
+            return (a == null) ? -1 : a.length;
+        }
+
+        /** ()[I -- array RETURN (the '[' lives in the return slot). */
+        public int[] retArr()
+        {
+            return new int[] { 1, 2, 3 };
+        }
+    }
+
+    /** Last total ArraySigs.oneD summed (allow-through proof for mode 11). */
+    public static volatile long lastOneD;
+
     // ---- Probe dispatch ---------------------------------------------------
 
     private static void runIdLong()
@@ -293,6 +493,39 @@ public final class MethodEnumeration
         Overloads.sSolo();
     }
 
+    // Links SameNameOverloads.pick(long) so a (J)I scoped_hook can install.
+    private static void runPickJ()
+    {
+        final SameNameOverloads o = new SameNameOverloads();
+        o.pick(7L);
+    }
+
+    // Links + drives Sub.shared(int) (the override) so a (I)I scoped_hook on Sub
+    // installs and fires on real bytecode.
+    private static void runSubShared()
+    {
+        final Sub s = new Sub();
+        s.shared(SUBSHARED_ARG);
+    }
+
+    // Links + drives ArraySigs.oneD(long[]) so a ([J)J scoped_hook installs and
+    // fires, proving array-descriptor resolution + install + dispatch.
+    private static void runOneD()
+    {
+        final ArraySigs a = new ArraySigs();
+        a.oneD(new long[] { 10L, 20L, 30L });
+    }
+
+    // Links + drives Tiny.only() so a ()V scoped_hook on Tiny installs and fires.
+    private static void runTinyOnly()
+    {
+        final Tiny t = new Tiny();
+        t.only();
+    }
+
+    /** Argument runSubShared passes to Sub.shared (mirrored native-side). */
+    public static final int SUBSHARED_ARG = 41;
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -328,6 +561,18 @@ public final class MethodEnumeration
                         break;
                     case 7:
                         runSSolo();
+                        break;
+                    case 8:
+                        runPickJ();
+                        break;
+                    case 10:
+                        runSubShared();
+                        break;
+                    case 11:
+                        runOneD();
+                        break;
+                    case 12:
+                        runTinyOnly();
                         break;
                     default:
                         break;

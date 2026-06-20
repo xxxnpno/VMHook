@@ -43,6 +43,9 @@ public final class HookVerifyRepair
      *   3 = call hot() WARM_CALLS times — used AFTER native clears NO_COMPILE,
      *       to give HotSpot a window to actually compile the method
      *   4 = call hot() ONCE — post-repair re-check (detour must fire again)
+     *   5 = call cold() ONCE — second-method smoke (multi-hook verify scenarios)
+     *   6 = call BOTH hot() and cold() ONCE each — drives both hooked methods in
+     *       one probe so the native side can assert a multi-hook verify count
      */
     public static volatile int mode;
 
@@ -57,6 +60,12 @@ public final class HookVerifyRepair
 
     /** Number of times run() actually invoked hot() in the last probe cycle. */
     public static volatile int hotCallsMade;
+
+    /** Last value the original cold() body computed (allow-through proof). */
+    public static volatile int lastColdResult;
+
+    /** Number of times run() actually invoked cold() in the last probe cycle. */
+    public static volatile int coldCallsMade;
 
     // ---- Constants mirrored on the native side ----------------------------
 
@@ -86,6 +95,39 @@ public final class HookVerifyRepair
     public int hot(final int delta)
     {
         return this.seed + delta;
+    }
+
+    /**
+     * Second hookable instance method, distinct Method* from hot() but the same
+     * tiny shape.  Used by the multi-hook verify scenarios so the native side can
+     * arm two independent hooks and assert verify_hooks() counts drift per hook.
+     * Returns seed + delta, like hot().
+     */
+    public int cold(final int delta)
+    {
+        return this.seed + delta;
+    }
+
+    private static void runColdOnce(final int delta)
+    {
+        final HookVerifyRepair obj = new HookVerifyRepair();
+        obj.seed = SEED;
+        final int r = obj.cold(delta);
+        lastColdResult = r;
+        coldCallsMade = 1;
+    }
+
+    private static void runBothOnce(final int delta)
+    {
+        final HookVerifyRepair obj = new HookVerifyRepair();
+        obj.seed = SEED;
+        final int rh = obj.hot(delta);
+        final int rc = obj.cold(delta);
+        lastHotResult = rh;
+        hotResultXor = rh;
+        hotCallsMade = 1;
+        lastColdResult = rc;
+        coldCallsMade = 1;
     }
 
     private static void runHotOnce(final int delta)
@@ -146,6 +188,12 @@ public final class HookVerifyRepair
                         break;
                     case 4:
                         runHotOnce(HOT_DELTA);
+                        break;
+                    case 5:
+                        runColdOnce(HOT_DELTA);
+                        break;
+                    case 6:
+                        runBothOnce(HOT_DELTA);
                         break;
                     default:
                         break;

@@ -69,6 +69,14 @@ namespace
         static auto obs_float()  -> float         { return static_field("obsFloat")->get(); }
         static auto obs_ref_is_null()  -> bool          { return static_field("obsRefIsNull")->get(); }
         static auto obs_ref_identity() -> std::int32_t  { return static_field("obsRefIdentity")->get(); }
+        static auto obs_str_is_null()  -> bool          { return static_field("obsStrIsNull")->get(); }
+        static auto obs_str_len()      -> std::int32_t  { return static_field("obsStrLen")->get(); }
+        static auto obs_static_str_is_null() -> bool         { return static_field("obsStaticStrIsNull")->get(); }
+        static auto obs_static_str_len()     -> std::int32_t { return static_field("obsStaticStrLen")->get(); }
+        static auto obs_arg_return()        -> std::int32_t { return static_field("obsArgReturn")->get(); }
+        static auto obs_static_arg_return() -> std::int32_t { return static_field("obsStaticArgReturn")->get(); }
+        static auto arg_echo()         -> std::int32_t { return static_field("argEcho")->get(); }
+        static auto static_arg_echo()  -> std::int32_t { return static_field("staticArgEcho")->get(); }
         static auto obs_double_was_nan()      -> bool { return static_field("obsDoubleWasNaN")->get(); }
         static auto obs_double_was_neg_zero() -> bool { return static_field("obsDoubleWasNegZero")->get(); }
         static auto obs_float_was_nan()       -> bool { return static_field("obsFloatWasNaN")->get(); }
@@ -230,6 +238,16 @@ VMHOOK_JVM_MODULE(return_value_cancel)
             ctx.check("baseline_static_byte_is_66",    rvc_fixture::obs_static_byte()  == static_cast<std::int8_t>(66));
             ctx.check("baseline_static_short_is_6666", rvc_fixture::obs_static_short() == static_cast<std::int16_t>(6666));
             ctx.check("baseline_static_float_is_44_5", rvc_fixture::obs_static_float() == 44.5f);
+            // String returns flow non-null with their original length.
+            ctx.check("baseline_str_not_null",        !rvc_fixture::obs_str_is_null());
+            ctx.check("baseline_str_len_is_orig",     rvc_fixture::obs_str_len() == 10);
+            ctx.check("baseline_static_str_not_null", !rvc_fixture::obs_static_str_is_null());
+            ctx.check("baseline_static_str_len_is_orig", rvc_fixture::obs_static_str_len() == 10);
+            // Arg-taking bodies ran with the caller's argument: echo + return.
+            ctx.check("baseline_arg_return_is_303",        rvc_fixture::obs_arg_return() == 303);
+            ctx.check("baseline_arg_echo_is_303",          rvc_fixture::arg_echo() == 303);
+            ctx.check("baseline_static_arg_return_is_404", rvc_fixture::obs_static_arg_return() == 404);
+            ctx.check("baseline_static_arg_echo_is_404",   rvc_fixture::static_arg_echo() == 404);
             // Void bodies ran: their side effects advanced.
             ctx.check("baseline_void_side_effect_ran",        rvc_fixture::side_effect() == 7);
             ctx.check("baseline_static_void_side_effect_ran", rvc_fixture::static_side_effect() == 13);
@@ -281,6 +299,12 @@ VMHOOK_JVM_MODULE(return_value_cancel)
         auto h_float { vmhook::scoped_hook<rvc_fixture>("origFloat",
             [](vmhook::return_value& r, const std::unique_ptr<rvc_fixture>& self)
             { note_inst(self); r.cancel(); }) };
+        auto h_str   { vmhook::scoped_hook<rvc_fixture>("origStr",
+            [](vmhook::return_value& r, const std::unique_ptr<rvc_fixture>& self)
+            { note_inst(self); r.cancel(); }) };
+        auto h_arg   { vmhook::scoped_hook<rvc_fixture>("origIntFromArg",
+            [](vmhook::return_value& r, const std::unique_ptr<rvc_fixture>& self)
+            { note_inst(self); r.cancel(); }) };
 
         // STATIC hooks — cancel only (no 'this').  Every static return descriptor
         // is exercised so the static dispatch path's zero-fill is proven for the
@@ -303,22 +327,32 @@ VMHOOK_JVM_MODULE(return_value_cancel)
             [](vmhook::return_value& r) { note_static(); r.cancel(); }) };
         auto hs_float { vmhook::scoped_hook<rvc_fixture>("origStaticFloat",
             [](vmhook::return_value& r) { note_static(); r.cancel(); }) };
+        auto hs_str   { vmhook::scoped_hook<rvc_fixture>("origStaticStr",
+            [](vmhook::return_value& r) { note_static(); r.cancel(); }) };
+        auto hs_arg   { vmhook::scoped_hook<rvc_fixture>("origStaticIntFromArg",
+            [](vmhook::return_value& r) { note_static(); r.cancel(); }) };
 
         const bool all_installed{
             h_void.installed()  && h_int.installed()  && h_long.installed()  &&
             h_double.installed()&& h_bool.installed() && h_char.installed()  &&
             h_ref.installed()   && h_byte.installed() && h_short.installed() &&
-            h_float.installed() &&
+            h_float.installed() && h_str.installed()  && h_arg.installed()   &&
             hs_void.installed() && hs_int.installed() && hs_double.installed() &&
             hs_long.installed() && hs_bool.installed()&& hs_char.installed()  &&
-            hs_byte.installed() && hs_short.installed()&& hs_float.installed() };
-        ctx.check("cancel_all_19_hooks_installed", all_installed);
+            hs_byte.installed() && hs_short.installed()&& hs_float.installed()&&
+            hs_str.installed()  && hs_arg.installed() };
+        ctx.check("cancel_all_23_hooks_installed", all_installed);
+
+        // Snapshot the arg-echo side-effect witnesses so the cancel round can
+        // assert the arg-taking bodies NEVER ran (echo unchanged).
+        const std::int32_t arg_echo_before{ rvc_fixture::arg_echo() };
+        const std::int32_t static_arg_echo_before{ rvc_fixture::static_arg_echo() };
 
         if (run_observe_probe(ctx, "cancel"))
         {
-            // Every detour fired exactly once: 10 instance + 9 static.
-            ctx.check("cancel_instance_hooks_fired_10", g_inst_fires.load() == 10);
-            ctx.check("cancel_static_hooks_fired_9",    g_stat_fires.load() == 9);
+            // Every detour fired exactly once: 12 instance + 11 static.
+            ctx.check("cancel_instance_hooks_fired_12", g_inst_fires.load() == 12);
+            ctx.check("cancel_static_hooks_fired_11",   g_stat_fires.load() == 11);
             ctx.check("cancel_instance_hooks_saw_self", g_inst_all_saw_self.load());
             ctx.check("cancel_no_java_exception",       !rvc_fixture::saw_exception());
 
@@ -350,6 +384,15 @@ VMHOOK_JVM_MODULE(return_value_cancel)
             // reference: null.
             ctx.check("cancel_ref_returns_null",     rvc_fixture::obs_ref_is_null());
             ctx.check("cancel_ref_identity_zero",    rvc_fixture::obs_ref_identity() == 0);
+            // String returner: cancel yields null (same zero-oop path as Object),
+            // and the breadcrumb length is the null marker (-1).
+            ctx.check("cancel_str_returns_null",     rvc_fixture::obs_str_is_null());
+            ctx.check("cancel_str_len_is_null_marker", rvc_fixture::obs_str_len() == -1);
+            // Arg-taking instance method: cancel suppresses the body, so the
+            // return is the zero-fill (0) AND the body's argEcho side effect did
+            // NOT happen (still the pre-round sentinel) — the headline invariant.
+            ctx.check("cancel_arg_return_zero",      rvc_fixture::obs_arg_return() == 0);
+            ctx.check("cancel_arg_body_skipped",     rvc_fixture::arg_echo() == arg_echo_before);
 
             // NON-VOID static: same zero-fill on the static dispatch path, now
             // proven for every static return descriptor.
@@ -367,6 +410,14 @@ VMHOOK_JVM_MODULE(return_value_cancel)
                       is_positive_zero(rvc_fixture::obs_static_float()));
             ctx.check("cancel_static_float_not_neg_zero",
                       !rvc_fixture::obs_static_float_was_neg_zero());
+            // static String returner -> null; static arg method -> body skipped,
+            // return is the zero-fill, staticArgEcho unchanged.
+            ctx.check("cancel_static_str_returns_null", rvc_fixture::obs_static_str_is_null());
+            ctx.check("cancel_static_str_len_is_null_marker",
+                      rvc_fixture::obs_static_str_len() == -1);
+            ctx.check("cancel_static_arg_return_zero", rvc_fixture::obs_static_arg_return() == 0);
+            ctx.check("cancel_static_arg_body_skipped",
+                      rvc_fixture::static_arg_echo() == static_arg_echo_before);
         }
     }
 
@@ -389,17 +440,22 @@ VMHOOK_JVM_MODULE(return_value_cancel)
             [](vmhook::return_value&, const std::unique_ptr<rvc_fixture>& self) { note_inst(self); }) };
         auto h_ref   { vmhook::scoped_hook<rvc_fixture>("origRef",
             [](vmhook::return_value&, const std::unique_ptr<rvc_fixture>& self) { note_inst(self); }) };
+        auto h_str   { vmhook::scoped_hook<rvc_fixture>("origStr",
+            [](vmhook::return_value&, const std::unique_ptr<rvc_fixture>& self) { note_inst(self); }) };
+        auto h_arg   { vmhook::scoped_hook<rvc_fixture>("origIntFromArg",
+            [](vmhook::return_value&, const std::unique_ptr<rvc_fixture>& self) { note_inst(self); }) };
         auto hs_int  { vmhook::scoped_hook<rvc_fixture>("origStaticInt",
             [](vmhook::return_value&) { note_static(); }) };
 
         const bool all_installed{
             h_void.installed() && h_int.installed() && h_double.installed() &&
-            h_ref.installed()  && hs_int.installed() };
+            h_ref.installed()  && h_str.installed() && h_arg.installed()    &&
+            hs_int.installed() };
         ctx.check("allow_hooks_installed", all_installed);
 
         if (run_observe_probe(ctx, "allow"))
         {
-            ctx.check("allow_instance_hooks_fired", g_inst_fires.load() >= 4);
+            ctx.check("allow_instance_hooks_fired", g_inst_fires.load() >= 6);
             ctx.check("allow_static_hook_fired",    g_stat_fires.load() >= 1);
             ctx.check("allow_no_java_exception",    !rvc_fixture::saw_exception());
 
@@ -410,6 +466,12 @@ VMHOOK_JVM_MODULE(return_value_cancel)
             ctx.check("allow_double_is_original",   rvc_fixture::obs_double() == 11.25);
             ctx.check("allow_ref_not_null",         !rvc_fixture::obs_ref_is_null());
             ctx.check("allow_static_int_is_original", rvc_fixture::obs_static_int() == 2222);
+            // String returner flows non-null; arg method echoes + returns the
+            // caller's argument (the body ran, no set_arg, no cancel).
+            ctx.check("allow_str_not_null",         !rvc_fixture::obs_str_is_null());
+            ctx.check("allow_str_len_is_original",  rvc_fixture::obs_str_len() == 10);
+            ctx.check("allow_arg_return_is_303",    rvc_fixture::obs_arg_return() == 303);
+            ctx.check("allow_arg_echo_is_303",      rvc_fixture::arg_echo() == 303);
         }
     }
 
@@ -778,6 +840,143 @@ VMHOOK_JVM_MODULE(return_value_cancel)
     }
 
     // ===================================================================
+    // ROUND 5f — SET_ARG + CANCEL (orthogonal mutations).  The detour mutates
+    // the method's incoming int argument via set_arg(1, ...) AND cancels.  cancel
+    // suppresses the body, so the body NEVER reads the mutated arg: argEcho stays
+    // at its pre-round sentinel and the Java caller receives the zero-fill return
+    // (0), NOT the injected argument.  This proves set_arg writes the locals array
+    // while cancel independently skips the body that would consume it — the two
+    // operations touch different state (interpreter locals vs the return slot's
+    // cancel flag) and do not interfere.
+    // ===================================================================
+    {
+        reset_counters();
+        const std::int32_t arg_echo_before{ rvc_fixture::arg_echo() };
+        const std::int32_t static_arg_echo_before{ rvc_fixture::static_arg_echo() };
+        std::atomic<bool> inst_set_arg_ok{ false };
+        std::atomic<bool> stat_set_arg_ok{ false };
+
+        // instance: slot 0 = this, slot 1 = first arg.
+        auto h_arg{ vmhook::scoped_hook<rvc_fixture>("origIntFromArg",
+            [&inst_set_arg_ok](vmhook::return_value& r, const std::unique_ptr<rvc_fixture>& self)
+            {
+                note_inst(self);
+                inst_set_arg_ok.store(r.set_arg(1, static_cast<std::int32_t>(555)),
+                                      std::memory_order_relaxed);
+                r.cancel();
+            }) };
+        // static: slot 0 = first arg (no this).
+        auto hs_arg{ vmhook::scoped_hook<rvc_fixture>("origStaticIntFromArg",
+            [&stat_set_arg_ok](vmhook::return_value& r)
+            {
+                note_static();
+                stat_set_arg_ok.store(r.set_arg(0, static_cast<std::int32_t>(666)),
+                                      std::memory_order_relaxed);
+                r.cancel();
+            }) };
+
+        ctx.check("set_arg_cancel_hooks_installed", h_arg.installed() && hs_arg.installed());
+
+        if (run_observe_probe(ctx, "set_arg_cancel"))
+        {
+            ctx.check("set_arg_cancel_no_java_exception", !rvc_fixture::saw_exception());
+            // set_arg accepted the in-range slot write.
+            ctx.check("set_arg_cancel_inst_set_arg_accepted", inst_set_arg_ok.load());
+            ctx.check("set_arg_cancel_stat_set_arg_accepted", stat_set_arg_ok.load());
+            // Body suppressed: caller gets the zero-fill, NOT 555 / 666.
+            ctx.check("set_arg_cancel_inst_return_zero",  rvc_fixture::obs_arg_return() == 0);
+            ctx.check("set_arg_cancel_stat_return_zero",  rvc_fixture::obs_static_arg_return() == 0);
+            // Body never ran: argEcho unchanged (proves cancel skipped the body
+            // that would have consumed the mutated argument).
+            ctx.check("set_arg_cancel_inst_body_skipped",
+                      rvc_fixture::arg_echo() == arg_echo_before);
+            ctx.check("set_arg_cancel_stat_body_skipped",
+                      rvc_fixture::static_arg_echo() == static_arg_echo_before);
+        }
+    }
+
+    // ===================================================================
+    // ROUND 5g — SET_ARG-ONLY control (allow-through) on the SAME arg methods.
+    // No cancel: the body RUNS and observes the set_arg mutation, so argEcho and
+    // the returned value both become the INJECTED argument (not the caller's 303 /
+    // 404).  This is the indispensable control for ROUND 5f: it proves set_arg
+    // genuinely reaches the interpreter locals on these methods, so 5f's "return
+    // is zero, echo unchanged" is caused by cancel suppressing the body — not by
+    // set_arg silently failing.
+    // ===================================================================
+    {
+        reset_counters();
+        std::atomic<bool> inst_set_arg_ok{ false };
+        std::atomic<bool> stat_set_arg_ok{ false };
+
+        auto h_arg{ vmhook::scoped_hook<rvc_fixture>("origIntFromArg",
+            [&inst_set_arg_ok](vmhook::return_value& r, const std::unique_ptr<rvc_fixture>& self)
+            {
+                note_inst(self);
+                inst_set_arg_ok.store(r.set_arg(1, static_cast<std::int32_t>(555)),
+                                      std::memory_order_relaxed);
+                // no cancel -> body runs and consumes the replacement
+            }) };
+        auto hs_arg{ vmhook::scoped_hook<rvc_fixture>("origStaticIntFromArg",
+            [&stat_set_arg_ok](vmhook::return_value& r)
+            {
+                note_static();
+                stat_set_arg_ok.store(r.set_arg(0, static_cast<std::int32_t>(666)),
+                                      std::memory_order_relaxed);
+            }) };
+
+        ctx.check("set_arg_only_hooks_installed", h_arg.installed() && hs_arg.installed());
+
+        if (run_observe_probe(ctx, "set_arg_only"))
+        {
+            ctx.check("set_arg_only_no_java_exception", !rvc_fixture::saw_exception());
+            ctx.check("set_arg_only_inst_accepted", inst_set_arg_ok.load());
+            ctx.check("set_arg_only_stat_accepted", stat_set_arg_ok.load());
+            // Body ran on the REPLACED argument: echo + return are the injected
+            // value, not the caller's 303 / 404.
+            ctx.check("set_arg_only_inst_echo_is_555",   rvc_fixture::arg_echo() == 555);
+            ctx.check("set_arg_only_inst_return_is_555", rvc_fixture::obs_arg_return() == 555);
+            ctx.check("set_arg_only_stat_echo_is_666",   rvc_fixture::static_arg_echo() == 666);
+            ctx.check("set_arg_only_stat_return_is_666", rvc_fixture::obs_static_arg_return() == 666);
+        }
+    }
+
+    // ===================================================================
+    // ROUND 5h — SET_ARG + SET (force a DIFFERENT return than the arg).  The
+    // detour mutates the argument AND forces a return value with set() (no
+    // cancel).  Because set() delivers its own value, the caller sees the FORCED
+    // return (7000), independent of the mutated arg — but the body still runs, so
+    // argEcho proves the set_arg mutation landed (555).  Separates the two return
+    // overrides on a method whose natural return is its argument: set_arg feeds
+    // the body, set() overrides what the caller ultimately observes.
+    // ===================================================================
+    {
+        reset_counters();
+        std::atomic<bool> inst_set_arg_ok{ false };
+
+        auto h_arg{ vmhook::scoped_hook<rvc_fixture>("origIntFromArg",
+            [&inst_set_arg_ok](vmhook::return_value& r, const std::unique_ptr<rvc_fixture>& self)
+            {
+                note_inst(self);
+                inst_set_arg_ok.store(r.set_arg(1, static_cast<std::int32_t>(555)),
+                                      std::memory_order_relaxed);
+                r.set(static_cast<std::int32_t>(7000));
+            }) };
+
+        ctx.check("set_arg_and_set_hook_installed", h_arg.installed());
+
+        if (run_observe_probe(ctx, "set_arg_and_set"))
+        {
+            ctx.check("set_arg_and_set_no_java_exception", !rvc_fixture::saw_exception());
+            ctx.check("set_arg_and_set_accepted", inst_set_arg_ok.load());
+            // Body ran on the replacement arg (echo proves set_arg landed)...
+            ctx.check("set_arg_and_set_echo_is_555", rvc_fixture::arg_echo() == 555);
+            // ...but set() overrides the OBSERVED return to 7000, not 555.
+            ctx.check("set_arg_and_set_return_is_7000", rvc_fixture::obs_arg_return() == 7000);
+        }
+    }
+
+    // ===================================================================
     // ROUND 6 — PER-INVOCATION cancel state.  A single hook on origVoid()
     // cancels ONLY the first call of each probe and lets the second through.
     // The probe (MODE_VOID_TWICE) calls origVoid() twice and snapshots the
@@ -1034,6 +1233,13 @@ VMHOOK_JVM_MODULE(return_value_cancel)
                       rvc_fixture::obs_static_long() == static_cast<std::int64_t>(0x7FFFFFFF00000002LL));
             ctx.check("final_baseline_static_float_is_44_5",
                       rvc_fixture::obs_static_float() == 44.5f);
+            // String + arg-taking methods also flow original on clean teardown.
+            ctx.check("final_baseline_str_not_null", !rvc_fixture::obs_str_is_null());
+            ctx.check("final_baseline_str_len_is_orig", rvc_fixture::obs_str_len() == 10);
+            ctx.check("final_baseline_arg_return_is_303", rvc_fixture::obs_arg_return() == 303);
+            ctx.check("final_baseline_arg_echo_is_303",   rvc_fixture::arg_echo() == 303);
+            ctx.check("final_baseline_static_arg_return_is_404",
+                      rvc_fixture::obs_static_arg_return() == 404);
         }
     }
 
@@ -1045,6 +1251,9 @@ VMHOOK_JVM_MODULE(return_value_cancel)
                "cancel+set both orders (canonical AND boundary: INT_MIN/INT_MAX/LONG full-64/-0.0/"
                "NaN-payload/byte-1/char-0xFFFF survive set across cancel), cancel-set-cancel triple "
                "interleave, mixed-fate (cancel/set/allow in one probe — no cross-slot leak), the "
+               "String returner cancel -> null (instance+static), cancel+set_arg (arg mutated but "
+               "body suppressed -> zero-fill return, echo unchanged) vs set_arg-only control (body "
+               "runs on the injected arg) vs set_arg+set (set() overrides the observed return), "
                "typed-null set<wrapper>(nullptr) overload, N-times idempotent cancel, per-invocation "
                "cancel state across 2 calls in BOTH directions and across 3 calls (suppress middle), "
                "cancel re-fire across 3 probes on one installed hook, and a clean arm/disarm lifecycle "

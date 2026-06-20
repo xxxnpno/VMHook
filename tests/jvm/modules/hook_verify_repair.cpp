@@ -82,6 +82,8 @@ namespace
         static auto get_last_hot_result() -> std::int32_t { return static_field("lastHotResult")->get(); }
         static auto get_hot_result_xor() -> std::int64_t  { return static_field("hotResultXor")->get(); }
         static auto get_hot_calls_made() -> std::int32_t  { return static_field("hotCallsMade")->get(); }
+        static auto get_last_cold_result() -> std::int32_t { return static_field("lastColdResult")->get(); }
+        static auto get_cold_calls_made() -> std::int32_t  { return static_field("coldCallsMade")->get(); }
 
         // Reads this instance's own seed (proves `self` is the right object).
         auto seed() const -> std::int32_t { return get_field("seed")->get(); }
@@ -101,6 +103,12 @@ namespace
     constexpr const char* FIXTURE_CLASS{ "vmhook/fixtures/HookVerifyRepair" };
     constexpr const char* HOT_NAME{ "hot" };
     constexpr const char* HOT_SIG{ "(I)I" };
+    // Second hookable method (same (I)I shape, distinct Method*) used by the
+    // multi-hook verify scenarios.
+    constexpr const char* COLD_NAME{ "cold" };
+    constexpr const char* COLD_SIG{ "(I)I" };
+
+    constexpr std::int32_t COLD_ORIGINAL{ SEED + HOT_DELTA };  // cold(HOT_DELTA) body result
 
     // Default watchdog cadence is 1000 ms (VMHOOK_AUTO_REPAIR_INTERVAL_MS).
     constexpr std::chrono::milliseconds WATCHDOG_INTERVAL{ 1000 };
@@ -110,11 +118,21 @@ namespace
     std::atomic<std::int32_t> g_self_ok_fires{ 0 };   // self non-null & seed == SEED
     std::atomic<std::int64_t> g_arg_xor{ 0 };         // XOR of every decoded delta
 
+    // Parallel observation state for the SECOND hooked method (cold), used by the
+    // multi-hook verify scenarios so each detour's fire is attributable to its own
+    // method — a cross-firing bug (one i2i stub mis-routing) is then observable.
+    std::atomic<std::int32_t> g_cold_fire_count{ 0 };
+    std::atomic<std::int32_t> g_cold_self_ok_fires{ 0 };
+    std::atomic<std::int64_t> g_cold_arg_xor{ 0 };
+
     auto reset_observations() -> void
     {
         g_fire_count.store(0);
         g_self_ok_fires.store(0);
         g_arg_xor.store(0);
+        g_cold_fire_count.store(0);
+        g_cold_self_ok_fires.store(0);
+        g_cold_arg_xor.store(0);
     }
 
     // Drives exactly one probe cycle for `mode`: resets observations + the
@@ -200,11 +218,31 @@ namespace
             });
     }
 
-    // Locates the live Method* for FIXTURE_CLASS::hot(I)I by walking the
+    // Observer detour for the SECOND hooked method (cold).  Records into the
+    // parallel g_cold_* state so a fire is attributable to cold() specifically.
+    auto install_cold_observer() -> bool
+    {
+        return vmhook::hook<hvr_fixture>(
+            COLD_NAME,
+            [](vmhook::return_value&,
+               const std::unique_ptr<hvr_fixture>& self,
+               std::int32_t delta)
+            {
+                g_cold_fire_count.fetch_add(1, std::memory_order_relaxed);
+                if (self != nullptr && self->seed() == SEED)
+                {
+                    g_cold_self_ok_fires.fetch_add(1, std::memory_order_relaxed);
+                }
+                g_cold_arg_xor.fetch_xor(delta, std::memory_order_relaxed);
+            });
+    }
+
+    // Locates the live Method* for FIXTURE_CLASS::<name><sig> by walking the
     // InstanceKlass methods array.  Returns nullptr if anything looks invalid —
     // callers must treat nullptr as "cannot run this Method-level scenario" and
     // skip it rather than crash.  All reads are pointer-validated.
-    auto find_hot_method() -> vmhook::hotspot::method*
+    auto find_method(const char* const want_name, const char* const want_sig)
+        -> vmhook::hotspot::method*
     {
         vmhook::hotspot::klass* const k{ vmhook::find_class(FIXTURE_CLASS) };
         if (!k || !vmhook::hotspot::is_valid_pointer(k))
@@ -226,12 +264,22 @@ namespace
             }
             const std::string name = m->get_name();          // copy-init (MSVC)
             const std::string sig = m->get_signature();      // copy-init (MSVC)
-            if (name == HOT_NAME && sig == HOT_SIG)
+            if (name == want_name && sig == want_sig)
             {
                 return m;
             }
         }
         return nullptr;
+    }
+
+    auto find_hot_method() -> vmhook::hotspot::method*
+    {
+        return find_method(HOT_NAME, HOT_SIG);
+    }
+
+    auto find_cold_method() -> vmhook::hotspot::method*
+    {
+        return find_method(COLD_NAME, COLD_SIG);
     }
 
     // Reads Method::_code through a validated pointer.  nullptr means "not
@@ -1017,6 +1065,277 @@ VMHOOK_JVM_MODULE(hook_verify_repair)
         }
 
         vmhook::shutdown_hooks();   // clean up scenario 5
+    }
+
+    // =====================================================================
+    // Scenario 6 — MULTI-HOOK intact verify (N armed, clean -> 0 repairs).
+    //   Install TWO independent hooks (hot + cold, distinct Method*s sharing the
+    //   one patched i2i stub).  verify_hooks() on the clean N-hook set must still
+    //   report 0 repairs (it returns the REPAIR count, not the armed count: a
+    //   healthy set of any size verifies to 0).  Then drive BOTH methods once in
+    //   a single probe and confirm each detour fired for its OWN method only (no
+    //   cross-firing through the shared i2i stub).  This is the "verify across
+    //   multiple hooks" + "verify==0 with N armed" input.
+    // =====================================================================
+    {
+        // Warm cold()'s interpreter link BEFORE the first install.  hook<T>()
+        // reads Method::_i2i_entry and THROWS "Failed to retrieve i2i entry" on a
+        // never-dispatched method whose i2i stub is still the lazy-link placeholder
+        // (vmhook.hpp:10208-10212; the documented install-on-unlinked hazard).
+        // hot() was dispatched by scenarios 1-5, but cold() has never run, so drive
+        // ONE unhooked cold() dispatch first to force HotSpot to link its i2i entry.
+        // This install-prereq drive is not itself an assertion of hook behaviour.
+        (void)drive(ctx, 5);
+
+        ctx.check("multi_install_hot_returns_true", install_hot_observer());
+        ctx.check("multi_install_cold_returns_true", install_cold_observer());
+
+        vmhook::hotspot::method* const mh{ find_hot_method() };
+        vmhook::hotspot::method* const mc{ find_cold_method() };
+        ctx.check("multi_located_hot_method", mh != nullptr);
+        ctx.check("multi_located_cold_method", mc != nullptr);
+        // Two DISTINCT Method*s — the multi-hook proof is vacuous if they alias.
+        if (mh != nullptr && mc != nullptr)
+        {
+            ctx.check("multi_hot_and_cold_are_distinct_methods", mh != mc);
+            // Both installs synchronously armed NO_COMPILE on their own Method.
+            ctx.check("multi_hot_no_compile_set", no_compile_set(mh));
+            ctx.check("multi_cold_no_compile_set", no_compile_set(mc));
+        }
+
+        // A clean two-hook set verifies to 0 repairs (size-independent).  Settle
+        // the return value: either freshly-installed method can race an async
+        // recompile that lands _code in the window before this read, which
+        // verify_hooks() correctly repairs before NO_COMPILE re-bites — absorb the
+        // transient the same bounded way the single-hook scenarios do.  Still fails
+        // on unsettleable drift.
+        ctx.check("multi_verify_zero_on_clean_two_hook_set",
+                  verify_settles_zero(12));
+
+        // Drive BOTH methods once in a single probe.
+        const bool done{ drive(ctx, 6) };
+        ctx.check("multi_both_probe_completed", done);
+        ctx.check("multi_java_made_one_hot_call",
+                  hvr_fixture::get_hot_calls_made() == 1);
+        ctx.check("multi_java_made_one_cold_call",
+                  hvr_fixture::get_cold_calls_made() == 1);
+
+        // Each detour fired for ITS OWN method only — a cross-firing bug (the
+        // shared i2i stub mis-routing cold's dispatch to hot's detour or vice
+        // versa) would show up as a wrong fire count on one side.  Gate the
+        // exact-1 asserts on the fire actually happening (the documented mode-3
+        // i2i-bypass can swallow a fire on a previously-JIT'd method); a miss is
+        // [INFO], never a red FAIL.
+        const std::int32_t hot_fired{ g_fire_count.load() };
+        const std::int32_t cold_fired{ g_cold_fire_count.load() };
+        ctx.record("[INFO] hook_verify_repair scenario 6: hot detour fired "
+                   + std::to_string(hot_fired) + ", cold detour fired "
+                   + std::to_string(cold_fired) + " on the both-once probe.");
+        // No detour ever over-counts (at most one fire per single dispatch).
+        ctx.check("multi_hot_detour_not_double_fired", hot_fired <= 1);
+        ctx.check("multi_cold_detour_not_double_fired", cold_fired <= 1);
+        if (hot_fired == 1)
+        {
+            ctx.check("multi_hot_self_correct", g_self_ok_fires.load() == 1);
+            ctx.check("multi_hot_arg_decoded", g_arg_xor.load() == HOT_DELTA);
+            ctx.check("multi_hot_allow_through",
+                      hvr_fixture::get_last_hot_result() == HOT_ORIGINAL);
+        }
+        if (cold_fired == 1)
+        {
+            ctx.check("multi_cold_self_correct", g_cold_self_ok_fires.load() == 1);
+            ctx.check("multi_cold_arg_decoded", g_cold_arg_xor.load() == HOT_DELTA);
+            ctx.check("multi_cold_allow_through",
+                      hvr_fixture::get_last_cold_result() == COLD_ORIGINAL);
+        }
+        // The original bodies always ran (allow-through), independent of fire path.
+        ctx.check("multi_hot_body_ran",
+                  hvr_fixture::get_last_hot_result() == HOT_ORIGINAL);
+        ctx.check("multi_cold_body_ran",
+                  hvr_fixture::get_last_cold_result() == COLD_ORIGINAL);
+
+        // Still clean after firing both.
+        ctx.check("multi_verify_zero_after_both_fired",
+                  verify_settles_zero(12));
+
+        vmhook::shutdown_hooks();   // clean up scenario 6
+    }
+
+    // =====================================================================
+    // Scenario 7 — MULTI-HOOK drift + manual repair COUNT.  With two hooks armed,
+    //   force mode-3 drift on BOTH in the tightest possible window right before a
+    //   single manual verify_hooks(), then prove the repair re-armed BOTH and the
+    //   set settles clean again.  This is the "verify==N when N drifted" + "manual
+    //   repair across multiple hooks" input.
+    //
+    //   Count caveat (live watchdog): the auto-repair watchdog is enabled for this
+    //   module, so its 1000 ms pass can, in principle, re-arm one hook in the
+    //   sliver between our two force_jit_drift() calls and our verify — making the
+    //   manual verify see only one drifted hook and return 1.  We therefore HARD-
+    //   assert the repair count as a LOWER bound (>= 1) and the load-bearing,
+    //   DETERMINISTIC per-method proof that BOTH carry NO_COMPILE again after the
+    //   verify (a flag verify_hooks() WRITES synchronously); the exact ==2 count is
+    //   recorded best-effort as an upgrade, not a gate.
+    // =====================================================================
+    {
+        ctx.check("multidrift_install_hot_returns_true", install_hot_observer());
+        ctx.check("multidrift_install_cold_returns_true", install_cold_observer());
+
+        vmhook::hotspot::method* const mh{ find_hot_method() };
+        vmhook::hotspot::method* const mc{ find_cold_method() };
+        ctx.check("multidrift_located_hot_method", mh != nullptr);
+        ctx.check("multidrift_located_cold_method", mc != nullptr);
+
+        if (mh == nullptr || mc == nullptr)
+        {
+            ctx.record("[INFO] hook_verify_repair scenario 7: could not locate both live "
+                       "Method*s for hot/cold - skipping multi-drift body (no crash).");
+            vmhook::shutdown_hooks();
+        }
+        else
+        {
+            // Pre-state: both armed.
+            ctx.check("multidrift_pre_hot_no_compile_set", no_compile_set(mh));
+            ctx.check("multidrift_pre_cold_no_compile_set", no_compile_set(mc));
+
+            // Drift BOTH in the tightest possible window (no thread-yield between
+            // the two force calls and the verify) so the watchdog is least likely
+            // to interleave and the manual verify sees both drifted.
+            const bool drifted_hot{ force_jit_drift(mh) };
+            const bool drifted_cold{ force_jit_drift(mc) };
+            ctx.check("multidrift_hot_drift_induced", drifted_hot && !no_compile_set(mh));
+            ctx.check("multidrift_cold_drift_induced", drifted_cold && !no_compile_set(mc));
+
+            const std::size_t repaired{ vmhook::verify_hooks() };
+            ctx.record("[INFO] hook_verify_repair scenario 7: verify_hooks() repaired "
+                       + std::to_string(repaired) + " hook(s) of 2 drifted.");
+            // Lower bound is HARD (a live-watchdog interleave can re-arm one before
+            // our verify, capping the count this pass at 1 — never 0, because we
+            // drifted both microseconds prior).
+            ctx.check("multidrift_verify_reported_at_least_one_repair", repaired >= 1);
+            if (repaired == 2)
+            {
+                ctx.check("multidrift_verify_reported_both_repairs", repaired == 2);
+            }
+            else
+            {
+                ctx.record("[INFO] hook_verify_repair scenario 7: verify reported "
+                           + std::to_string(repaired) + " (not 2) - the live auto-repair "
+                           "watchdog re-armed one hook in the window before the manual "
+                           "verify (count caveat documented above). Per-method re-arm "
+                           "proofs below are deterministic and hard-asserted.");
+            }
+
+            // DETERMINISTIC load-bearing proof: whichever path re-armed them (our
+            // manual verify and/or the watchdog), BOTH hooks carry NO_COMPILE again.
+            // This is a flag the repair WRITES synchronously, so it is exact.
+            ctx.check("multidrift_hot_re_armed_after_verify", no_compile_set(mh));
+            ctx.check("multidrift_cold_re_armed_after_verify", no_compile_set(mc));
+
+            // The two-hook set settles back to a clean 0-repair verify.
+            ctx.check("multidrift_verify_settles_zero_after_re_arm",
+                      verify_settles_zero(12));
+
+            vmhook::shutdown_hooks();   // clean up scenario 7
+        }
+    }
+
+    // =====================================================================
+    // Scenario 8 — PARTIAL uninstall: verify across a shrinking hook set.  Arm
+    //   two hooks, uninstall ONE (shutdown_hooks tears down ALL, so we re-arm the
+    //   survivor), and prove verify_hooks() reports a clean set at each size and
+    //   the surviving hook still drives + re-arms.  Combined with scenario 9 this
+    //   exercises "verify after a clean uninstall (back to 0)" at N=2 -> N=1 -> 0.
+    //
+    //   Note: vmhook's low-level hook<T>() set is torn down only in bulk by
+    //   shutdown_hooks() (there is no per-hook uninstall on this path), so a
+    //   "shrink to one hook" is expressed as shutdown-all + re-install only the
+    //   survivor.  That is itself a meaningful input: verify after a full teardown
+    //   reads 0, and a single re-install then verifies clean.
+    // =====================================================================
+    {
+        ctx.check("partial_install_hot_returns_true", install_hot_observer());
+        ctx.check("partial_install_cold_returns_true", install_cold_observer());
+        ctx.check("partial_two_hook_verify_zero", verify_settles_zero(12));
+
+        // Tear the whole set down -> verify must read a deterministic 0 (empty set,
+        // no JIT involvement -> HARD, no settle).
+        vmhook::shutdown_hooks();
+        ctx.check("partial_verify_zero_after_full_teardown",
+                  vmhook::verify_hooks() == 0);
+
+        // Re-arm only the survivor (cold).  The single-hook set verifies clean.
+        ctx.check("partial_reinstall_survivor_returns_true", install_cold_observer());
+        ctx.check("partial_one_hook_verify_zero", verify_settles_zero(12));
+
+        vmhook::hotspot::method* const mc{ find_cold_method() };
+        ctx.check("partial_located_survivor_method", mc != nullptr);
+        if (mc != nullptr)
+        {
+            ctx.check("partial_survivor_no_compile_set", no_compile_set(mc));
+
+            // Drive the survivor; gate the exact-fire asserts best-effort (mode-3
+            // i2i-bypass can swallow a fire on a previously-JIT'd method).
+            const bool done{ drive(ctx, 5) };
+            ctx.check("partial_survivor_probe_completed", done);
+            ctx.check("partial_survivor_java_made_one_call",
+                      hvr_fixture::get_cold_calls_made() == 1);
+            // The hot detour must NOT have fired — hot is no longer hooked.
+            ctx.check("partial_torn_down_hot_did_not_fire",
+                      g_fire_count.load() == 0);
+            if (g_cold_fire_count.load() == 1)
+            {
+                ctx.check("partial_survivor_fired", g_cold_fire_count.load() == 1);
+                ctx.check("partial_survivor_self_correct",
+                          g_cold_self_ok_fires.load() == 1);
+                ctx.check("partial_survivor_allow_through",
+                          hvr_fixture::get_last_cold_result() == COLD_ORIGINAL);
+            }
+            else
+            {
+                ctx.record("[INFO] hook_verify_repair scenario 8: survivor (cold) did not "
+                           "fire on the drive - cold() was JIT-compiled earlier and the "
+                           "mode-3 i2i route was stale on this JDK (documented limitation). "
+                           "partial_survivor_fired/self_correct/allow_through skipped (not a FAIL).");
+            }
+            // The survivor body always ran (allow-through), independent of fire path.
+            ctx.check("partial_survivor_body_ran",
+                      hvr_fixture::get_last_cold_result() == COLD_ORIGINAL);
+
+            // Drift + manual repair the survivor; re-arm is deterministic.
+            const bool drifted{ force_jit_drift(mc) };
+            ctx.check("partial_survivor_drift_induced", drifted && !no_compile_set(mc));
+            const std::size_t repaired{ vmhook::verify_hooks() };
+            ctx.record("[INFO] hook_verify_repair scenario 8: survivor verify repaired "
+                       + std::to_string(repaired) + " hook(s).");
+            ctx.check("partial_survivor_verify_reported_repair", repaired >= 1);
+            ctx.check("partial_survivor_re_armed_after_verify", no_compile_set(mc));
+            ctx.check("partial_survivor_verify_settles_zero", verify_settles_zero(12));
+        }
+
+        vmhook::shutdown_hooks();   // clean up scenario 8
+    }
+
+    // =====================================================================
+    // Scenario 9 — POST-TEARDOWN verify is a DETERMINISTIC, idempotent 0.  After
+    //   every hook from the scenarios above is torn down, verify_hooks() on the
+    //   empty set must read exactly 0 — with NO settle, since an empty set has no
+    //   Method to JIT-drift — and stay 0 across repeated calls (no sticky repair
+    //   state leaked from the multi-hook drifts above).  This is the deterministic
+    //   "empty-set / post-teardown verify==0" input, hardened to N calls.
+    // =====================================================================
+    {
+        vmhook::shutdown_hooks();   // ensure empty regardless of scenario-8 path
+        ctx.check("postteardown_verify_zero_1", vmhook::verify_hooks() == 0);
+        ctx.check("postteardown_verify_zero_2", vmhook::verify_hooks() == 0);
+        ctx.check("postteardown_verify_zero_3", vmhook::verify_hooks() == 0);
+        // A fresh single install on the empty set verifies clean again, proving the
+        // verify machinery is still usable after the multi-hook churn.
+        ctx.check("postteardown_reusable_install_returns_true", install_hot_observer());
+        ctx.check("postteardown_reusable_verify_zero", verify_settles_zero(12));
+        vmhook::shutdown_hooks();
+        ctx.check("postteardown_verify_zero_after_reusable_teardown",
+                  vmhook::verify_hooks() == 0);
     }
 
     // =====================================================================

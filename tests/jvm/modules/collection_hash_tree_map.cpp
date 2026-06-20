@@ -225,6 +225,21 @@ namespace
         return sum;
     }
 
+    // The canonical "something's wrong" tripwire: the Java size() method (a real
+    // call-gate dispatch) and the raw-OOP structural walk are INDEPENDENT code
+    // paths; under a silent mis-decode (compressed-oops disabled / a renamed
+    // table field / a chain cycle) they diverge with no exception.  size() ==
+    // to_entries().size() is therefore a HARD invariant on every populated map.
+    template<typename key_type, typename value_type>
+    auto size_oracle(vmhook_test::context& ctx, const std::string& name,
+                     vmhook::map& m) -> void
+    {
+        const std::int32_t reported{ m.size() };
+        const std::int32_t walked{
+            static_cast<std::int32_t>(m.to_entries<key_type, value_type>().size()) };
+        ctx.check(name, reported == walked);
+    }
+
     // Drive one probe cycle for `mode`.
     auto drive(vmhook_test::context& ctx, std::int32_t mode) -> bool
     {
@@ -938,6 +953,357 @@ namespace
             for (const auto& kv : b) { if (kv.first) { cb += code_unit_sum(kv.first->text()); } }
             ctx.check("htm_reread_same_count", a.size() == b.size());
             soft_value_check(ctx, "htm_reread_same_key_char_sum", ca == cb);
+        }
+
+        // =====================================================================
+        // 20. SIZE ORACLE TRIPWIRE — Java size() (a real call-gate dispatch) ==
+        //     to_entries().size() (the raw-OOP structural walk) on EVERY shape.
+        //     These two paths are independent; a silent mis-decode (compressed-
+        //     oops disabled, renamed table field, chain cycle) makes them
+        //     diverge with no exception, so equality is HARD on every map.
+        // =====================================================================
+        {
+            static constexpr std::array<const char*, 11> str_hash_fields{
+                "hashMap", "hashOne", "hashEight", "hashNine", "hashSixteen",
+                "hashSeventeen", "hashResize13", "hashColl7", "hashTreeBin",
+                "hashNullKey", "hashNullVal" };
+            for (const char* f : str_hash_fields)
+            {
+                const auto m{ htm::acquire_map(f) };
+                if (m)
+                {
+                    size_oracle<str_oop, str_oop>(
+                        ctx, std::string{ "htm_size_oracle_" } + f, *m);
+                }
+            }
+            static constexpr std::array<const char*, 5> str_tree_fields{
+                "treeMap", "treeOne", "treeEight", "treeDescending", "treeNullVal" };
+            for (const char* f : str_tree_fields)
+            {
+                const auto m{ htm::acquire_map(f) };
+                if (m)
+                {
+                    size_oracle<str_oop, str_oop>(
+                        ctx, std::string{ "htm_size_oracle_" } + f, *m);
+                }
+            }
+        }
+
+        // =====================================================================
+        // 21. EMPTY maps via the WRAPPER — size()==0 and is_empty()==true on a
+        //     populated-but-empty HashMap and TreeMap (the table/root field
+        //     resolves; the walk returns empty -- "empty" and "table not yet
+        //     allocated" are indistinguishable here, which is correct).
+        // =====================================================================
+        {
+            const auto hm{ htm::acquire_map("hashEmpty") };
+            ctx.check("htm_hash_empty_wrapper_acquired", hm != nullptr);
+            if (hm)
+            {
+                ctx.check("htm_hash_empty_wrapper_size_zero", hm->size() == 0);
+                ctx.check("htm_hash_empty_wrapper_is_empty", hm->is_empty() == true);
+                ctx.check("htm_hash_empty_wrapper_entries_empty",
+                          (hm->to_entries<str_oop, str_oop>().empty()));
+            }
+            const auto tm{ htm::acquire_map("treeEmpty") };
+            ctx.check("htm_tree_empty_wrapper_acquired", tm != nullptr);
+            if (tm)
+            {
+                ctx.check("htm_tree_empty_wrapper_size_zero", tm->size() == 0);
+                ctx.check("htm_tree_empty_wrapper_is_empty", tm->is_empty() == true);
+                ctx.check("htm_tree_empty_wrapper_entries_empty",
+                          (tm->to_entries<str_oop, str_oop>().empty()));
+            }
+        }
+
+        // =====================================================================
+        // 22. SINGLE-ENTRY HashMap via the EXPLICIT hash_map wrapper — one bucket
+        //     head, NO Node.next chain.  size()==1, is_empty()==false, one pair.
+        // =====================================================================
+        {
+            const auto hm{ htm::acquire_hash_map("hashOne") };
+            ctx.check("htm_one_hash_map_wrapper_acquired", hm != nullptr);
+            if (hm)
+            {
+                ctx.check("htm_one_hash_map_size_is_1", hm->size() == 1);
+                ctx.check("htm_one_hash_map_not_empty", hm->is_empty() == false);
+                const auto e{ hm->to_entries<str_oop, str_oop>() };
+                ctx.check("htm_one_hash_map_entries_size_is_1",
+                          static_cast<std::int32_t>(e.size()) == 1);
+                bool k0v0{ false };
+                if (e.size() == 1 && e[0].first && e[0].second)
+                {
+                    k0v0 = (e[0].first->text() == "k0" && e[0].second->text() == "v0");
+                }
+                soft_value_check(ctx, "htm_one_hash_map_pair_is_k0_v0", k0v0);
+            }
+        }
+
+        // =====================================================================
+        // 23. EXACTLY 8 colliding keys — 8 is the treeify THRESHOLD, but at cap 16
+        //     the table RESIZES (MIN_TREEIFY_CAPACITY=64) rather than treeifying,
+        //     so the bin stays a plain Node.next chain.  count oracle + distinct
+        //     HARD; the chain walk surfaces all 8 across the rehash.
+        // =====================================================================
+        {
+            const auto e{ htm::entries_of<str_oop, str_oop>("hashColl8") };
+            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
+            ctx.check("htm_coll8_count_matches_java_size", decoded == htm::j_size("hashColl8Size"));
+            ctx.check("htm_coll8_count_never_over_reads", decoded <= htm::j_size("hashColl8Size"));
+            ctx.check("htm_coll8_count_is_8", decoded == N8);
+
+            std::unordered_set<const void*> oops;
+            std::unordered_set<std::string> vals;
+            std::int32_t null_kv{ 0 };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; continue; }
+                void* const koop{ kv.first->get_instance() };
+                if (koop && vmhook::hotspot::is_valid_pointer(koop)) { oops.insert(koop); }
+                vals.insert(kv.second->text());
+            }
+            ctx.check("htm_coll8_no_null_kv", null_kv == 0);
+            ctx.check("htm_coll8_all_oops_distinct_no_cycle",
+                      oops.size() == static_cast<std::size_t>(decoded));
+            bool vals_ok{ vals.size() == static_cast<std::size_t>(N8) };
+            for (std::int32_t i{ 0 }; i < N8 && vals_ok; ++i)
+            {
+                if (vals.find("e" + std::to_string(i)) == vals.end()) { vals_ok = false; }
+            }
+            soft_value_check(ctx, "htm_coll8_all_values_present", vals_ok);
+            ctx.record(std::string{ "[INFO] htm_coll8: bucket treeified (Java best-effort) = " }
+                       + (htm::j_bool("hashColl8IsTree") ? "yes (unexpected at cap 16)"
+                                                         : "no (resized, plain Node chain)"));
+        }
+
+        // =====================================================================
+        // 24. LinkedHashMap — NEW shape.  Reuses HashMap.table, so it routes
+        //     through the SAME "table" fast path.  CONTENT completeness (count
+        //     oracle + every key present + distinct OOPs) is HARD; iteration
+        //     ORDER is BUCKET order (NOT insertion order), recorded [INFO]
+        //     because for LinkedHashMap order is the contract the walk does NOT
+        //     honour -- the documented flaw, characterized not asserted.
+        // =====================================================================
+        {
+            const auto lm{ htm::acquire_map("linkedSmall") };
+            ctx.check("htm_linked_wrapper_acquired", lm != nullptr);
+            if (lm)
+            {
+                ctx.check("htm_linked_size_is_4", lm->size() == 4);
+                ctx.check("htm_linked_not_empty", lm->is_empty() == false);
+                size_oracle<str_oop, str_oop>(ctx, "htm_linked_size_oracle", *lm);
+            }
+            const auto e{ htm::entries_of<str_oop, str_oop>("linkedSmall") };
+            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
+            ctx.check("htm_linked_count_matches_java_size", decoded == htm::j_size("linkedSmallSize"));
+            ctx.check("htm_linked_count_is_4", decoded == 4);
+
+            std::unordered_set<const void*> oops;
+            std::unordered_set<std::string> keys;
+            std::vector<std::string> order;
+            std::int32_t null_kv{ 0 };
+            bool pairs_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; continue; }
+                void* const koop{ kv.first->get_instance() };
+                if (koop && vmhook::hotspot::is_valid_pointer(koop)) { oops.insert(koop); }
+                const std::string key{ kv.first->text() };
+                keys.insert(key);
+                order.push_back(key);
+                // Recipe: ka->wa kb->wb kc->wc kd->wd (key "k"+c pairs "w"+c).
+                if (key.size() == 2 && key.front() == 'k')
+                {
+                    if (kv.second->text() != ("w" + key.substr(1))) { pairs_ok = false; }
+                }
+                else { pairs_ok = false; }
+            }
+            ctx.check("htm_linked_no_null_kv", null_kv == 0);
+            ctx.check("htm_linked_all_oops_distinct_no_cycle",
+                      oops.size() == static_cast<std::size_t>(decoded));
+            ctx.check("htm_linked_all_keys_present",
+                      keys.count("ka") == 1 && keys.count("kb") == 1
+                          && keys.count("kc") == 1 && keys.count("kd") == 1
+                          && keys.size() == 4);
+            soft_value_check(ctx, "htm_linked_pairs_consistent", pairs_ok);
+            // Order is BUCKET order, not insertion order: characterize, do NOT assert.
+            const bool insertion_order{ order.size() == 4 && order[0] == "ka"
+                                        && order[1] == "kb" && order[2] == "kc"
+                                        && order[3] == "kd" };
+            ctx.record(std::string{ "[INFO] htm_linked: iteration order from the table walk = "
+                                    "BUCKET order; happens to equal insertion order this run = " }
+                       + (insertion_order ? "yes" : "no")
+                       + " (LinkedHashMap insertion order is NOT honoured by the bucket walk -- "
+                         "documented; content completeness is the HARD contract).");
+
+            // Empty LinkedHashMap: the table field resolves (lazily null) -> empty.
+            const auto e_empty{ htm::entries_of<str_oop, str_oop>("linkedEmpty") };
+            ctx.check("htm_linked_empty_returns_empty", e_empty.empty());
+            ctx.check("htm_linked_empty_java_size_zero", htm::j_size("linkedEmptySize") == 0);
+        }
+
+        // =====================================================================
+        // 25. HashMap with a null KEY *and* a null VALUE *and* a normal entry in
+        //     the SAME map.  BOTH nullptr sentinels must coexist; count == 3.
+        //     A missing entry can never masquerade as a real value (sentinel !=
+        //     miss): exactly one null-key entry, exactly one null-value entry.
+        // =====================================================================
+        {
+            const auto e{ htm::entries_of<str_oop, str_oop>("hashNullBoth") };
+            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
+            ctx.check("htm_nullboth_count_matches_java_size", decoded == htm::j_size("hashNullBothSize"));
+            ctx.check("htm_nullboth_count_is_3", decoded == 3);
+
+            std::int32_t null_keys{ 0 }, null_values{ 0 };
+            bool null_key_val_ok{ false }, null_val_key_ok{ false }, normal_ok{ false };
+            for (const auto& kv : e)
+            {
+                if (!kv.first)
+                {
+                    ++null_keys;
+                    null_key_val_ok = (kv.second != nullptr && kv.second->text() == "vnull");
+                    continue;
+                }
+                const std::string key{ kv.first->text() };
+                if (!kv.second)
+                {
+                    ++null_values;
+                    null_val_key_ok = (key == "realkey");
+                    continue;
+                }
+                if (key == "both" && kv.second->text() == "ok") { normal_ok = true; }
+            }
+            ctx.check("htm_nullboth_exactly_one_null_key", null_keys == 1);
+            ctx.check("htm_nullboth_exactly_one_null_value", null_values == 1);
+            soft_value_check(ctx, "htm_nullboth_null_key_value_decoded", null_key_val_ok);
+            soft_value_check(ctx, "htm_nullboth_null_value_key_decoded", null_val_key_ok);
+            soft_value_check(ctx, "htm_nullboth_normal_entry_decoded", normal_ok);
+        }
+
+        // =====================================================================
+        // 26. Empty-string KEY and empty-string VALUE (legal; zero-length String).
+        //     read_java_string must decode a length-0 String to "".  count==2,
+        //     the "" key/value present, the normal sibling intact.
+        // =====================================================================
+        {
+            const auto e{ htm::entries_of<str_oop, str_oop>("hashEmptyStr") };
+            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
+            ctx.check("htm_emptystr_count_matches_java_size", decoded == htm::j_size("hashEmptyStrSize"));
+            ctx.check("htm_emptystr_count_is_2", decoded == 2);
+
+            std::int32_t null_kv{ 0 };
+            bool empty_pair_ok{ false }, sibling_ok{ false };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; continue; }
+                const std::string key{ kv.first->text() };
+                const std::string val{ kv.second->text() };
+                if (key.empty() && val.empty()) { empty_pair_ok = true; }
+                if (key == "nonempty" && val == "x") { sibling_ok = true; }
+            }
+            ctx.check("htm_emptystr_no_null_kv", null_kv == 0);
+            soft_value_check(ctx, "htm_emptystr_empty_pair_present", empty_pair_ok);
+            soft_value_check(ctx, "htm_emptystr_sibling_present", sibling_ok);
+        }
+
+        // =====================================================================
+        // 27. SINGLE-NODE TreeMap via the map wrapper — root with null left/right.
+        //     size()==1, in-order yields exactly the one node, front==back.
+        // =====================================================================
+        {
+            const auto tm{ htm::acquire_map("treeOneNode") };
+            ctx.check("htm_tree_one_node_wrapper_acquired", tm != nullptr);
+            if (tm)
+            {
+                ctx.check("htm_tree_one_node_size_is_1", tm->size() == 1);
+                ctx.check("htm_tree_one_node_not_empty", tm->is_empty() == false);
+                const auto e{ tm->to_entries<str_oop, str_oop>() };
+                ctx.check("htm_tree_one_node_entries_size_is_1",
+                          static_cast<std::int32_t>(e.size()) == 1);
+                if (e.size() == 1 && e.front().first)
+                {
+                    const std::string key{ e.front().first->text() };
+                    soft_value_check(ctx, "htm_tree_one_node_key_matches_java",
+                                     key == htm::j_string("treeOneNodeKey"));
+                    bool val_ok{ e.front().second != nullptr
+                                 && e.front().second->text() == "solo" };
+                    soft_value_check(ctx, "htm_tree_one_node_value_is_solo", val_ok);
+                }
+            }
+        }
+
+        // =====================================================================
+        // 28. TreeMap<Integer,Integer> spanning NEGATIVE through positive — the
+        //     in-order walk must yield SIGNED-numeric ascending (-5..4); a
+        //     lexicographic / unsigned sort would mis-order the negatives.
+        //     count + signed ascending + exact sequence HARD.
+        // =====================================================================
+        {
+            const auto e{ htm::entries_of<integer_box, integer_box>("treeSigned") };
+            const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
+            ctx.check("htm_tree_signed_count_matches_java_size", decoded == htm::j_size("treeSignedSize"));
+            ctx.check("htm_tree_signed_count_is_10", decoded == 10);
+
+            std::vector<std::int32_t> keys;
+            keys.reserve(e.size());
+            std::int32_t null_kv{ 0 };
+            bool pairs_ok{ true };
+            for (const auto& kv : e)
+            {
+                if (!kv.first || !kv.second) { ++null_kv; pairs_ok = false; keys.push_back(0); continue; }
+                const std::int32_t k{ kv.first->value() };
+                keys.push_back(k);
+                if (kv.second->value() != (k * 2)) { pairs_ok = false; }
+            }
+            ctx.check("htm_tree_signed_no_null_kv", null_kv == 0);
+            ctx.check("htm_tree_signed_keys_signed_ascending",
+                      std::is_sorted(keys.begin(), keys.end()));
+            // Exact signed sequence -5,-4,...,4 (proves SIGNED, not unsigned/lexical).
+            bool exact{ keys.size() == 10 };
+            for (std::size_t i{ 0 }; exact && i < keys.size(); ++i)
+            {
+                if (keys[i] != (static_cast<std::int32_t>(i) - 5)) { exact = false; }
+            }
+            ctx.check("htm_tree_signed_exact_minus5_to_4", exact);
+            ctx.check("htm_tree_signed_first_matches_java",
+                      !keys.empty() && keys.front() == htm::j_int("treeSignedFirst"));
+            ctx.check("htm_tree_signed_last_matches_java",
+                      !keys.empty() && keys.back() == htm::j_int("treeSignedLast"));
+            soft_value_check(ctx, "htm_tree_signed_values_are_key_times_2", pairs_ok);
+        }
+
+        // =====================================================================
+        // 29. NULL-OOP wrapper robustness — acquiring a declared-but-null map
+        //     field yields a wrapper over a null OOP; size() and to_entries()
+        //     must be safe (size 0, empty walk), never a crash / wild walk.
+        // =====================================================================
+        {
+            const auto hm{ htm::acquire_hash_map("hashNull") };
+            // The field is declared null, so static_field resolves but get()
+            // yields a wrapper over a null oop (or nullptr) -- both are safe.
+            if (hm)
+            {
+                ctx.check("htm_null_oop_hash_wrapper_size_zero", hm->size() == 0);
+                ctx.check("htm_null_oop_hash_wrapper_is_empty", hm->is_empty() == true);
+                ctx.check("htm_null_oop_hash_wrapper_entries_empty",
+                          (hm->to_entries<str_oop, str_oop>().empty()));
+            }
+            else
+            {
+                ctx.check("htm_null_oop_hash_wrapper_nullptr_is_safe", true);
+            }
+            const auto tm{ htm::acquire_map("treeNull") };
+            if (tm)
+            {
+                ctx.check("htm_null_oop_tree_wrapper_size_zero", tm->size() == 0);
+                ctx.check("htm_null_oop_tree_wrapper_is_empty", tm->is_empty() == true);
+                ctx.check("htm_null_oop_tree_wrapper_entries_empty",
+                          (tm->to_entries<str_oop, str_oop>().empty()));
+            }
+            else
+            {
+                ctx.check("htm_null_oop_tree_wrapper_nullptr_is_safe", true);
+            }
         }
     }   // run_checks
 }   // anonymous namespace

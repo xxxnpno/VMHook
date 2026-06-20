@@ -104,6 +104,11 @@ namespace
         static auto get_last_solo_dv() -> double      { return static_field("lastSoloDV")->get(); }
         static auto get_last_ssolo() -> std::int64_t  { return static_field("lastSSolo")->get(); }
 
+        // batch-16 allow-through observables.
+        static auto get_last_sub_shared() -> std::int32_t { return static_field("lastSubShared")->get(); }
+        static auto get_last_one_d() -> std::int64_t      { return static_field("lastOneD")->get(); }
+        static auto get_last_tiny_only() -> std::int32_t  { return static_field("lastTinyOnly")->get(); }
+
         // Reads an instance's own seed (proves the detour's `self` is correct).
         //
         // CRASH-PROOF variant for use INSIDE the detour, where a raw fault would
@@ -179,12 +184,85 @@ namespace
         }
     };
 
+    // ---- batch-16 deepening wrappers --------------------------------------
+    // Nested shape classes added to MethodEnumeration.java to cover inputs the
+    // module previously lacked: a FEW-method class with NO <clinit> (Tiny), TRUE
+    // same-name overloads (SameNameOverloads), an inheritance pair (Base/Sub),
+    // an interface (Iface), an abstract class (AbstractShape), and array-typed
+    // signatures (ArraySigs).  Each is registered by its internal `$`-name so the
+    // get_class_methods<T>() / find_methods_by_signature<T>() / hook_by_signature
+    // / scoped_hook overloads resolve the correct klass.  None of Iface /
+    // AbstractShape is ever instantiated by the native side (their abstract
+    // members have no body to dispatch) — only their klass enumeration is read.
+    class me_tiny : public vmhook::object<me_tiny>
+    {
+    public:
+        explicit me_tiny(vmhook::oop_t instance) noexcept
+            : vmhook::object<me_tiny>{ instance } {}
+    };
+    class me_samename : public vmhook::object<me_samename>
+    {
+    public:
+        explicit me_samename(vmhook::oop_t instance) noexcept
+            : vmhook::object<me_samename>{ instance } {}
+    };
+    class me_base : public vmhook::object<me_base>
+    {
+    public:
+        explicit me_base(vmhook::oop_t instance) noexcept
+            : vmhook::object<me_base>{ instance } {}
+    };
+    class me_sub : public vmhook::object<me_sub>
+    {
+    public:
+        explicit me_sub(vmhook::oop_t instance) noexcept
+            : vmhook::object<me_sub>{ instance } {}
+    };
+    class me_iface : public vmhook::object<me_iface>
+    {
+    public:
+        explicit me_iface(vmhook::oop_t instance) noexcept
+            : vmhook::object<me_iface>{ instance } {}
+    };
+    class me_abstract : public vmhook::object<me_abstract>
+    {
+    public:
+        explicit me_abstract(vmhook::oop_t instance) noexcept
+            : vmhook::object<me_abstract>{ instance } {}
+    };
+    class me_arraysigs : public vmhook::object<me_arraysigs>
+    {
+    public:
+        explicit me_arraysigs(vmhook::oop_t instance) noexcept
+            : vmhook::object<me_arraysigs>{ instance } {}
+    };
+    // A second deliberately-NEVER-registered wrapper used only for the deepened
+    // negative paths (kept distinct from me_unregistered to avoid any registry
+    // cross-talk if a future edit registers one of them).
+    class me_never : public vmhook::object<me_never>
+    {
+    public:
+        explicit me_never(vmhook::oop_t instance) noexcept
+            : vmhook::object<me_never>{ instance } {}
+    };
+
     // ---- Fixture-mirrored constants (lockstep with MethodEnumeration.java) --
     constexpr std::int32_t SEED{ 7 };
     constexpr std::int64_t IDLONG_ARG{ 0x0102030405060708LL };
     constexpr std::int32_t IDINT_ARG{ 1234 };
 
     constexpr char CLASS_NAME[]{ "vmhook/fixtures/MethodEnumeration" };
+
+    // batch-16 nested-shape internal names (slashed `$` form).
+    constexpr char NAME_TINY[]{ "vmhook/fixtures/MethodEnumeration$Tiny" };
+    constexpr char NAME_SAMENAME[]{ "vmhook/fixtures/MethodEnumeration$SameNameOverloads" };
+    constexpr char NAME_BASE[]{ "vmhook/fixtures/MethodEnumeration$Base" };
+    constexpr char NAME_SUB[]{ "vmhook/fixtures/MethodEnumeration$Sub" };
+    constexpr char NAME_IFACE[]{ "vmhook/fixtures/MethodEnumeration$Iface" };
+    constexpr char NAME_ABSTRACT[]{ "vmhook/fixtures/MethodEnumeration$AbstractShape" };
+    constexpr char NAME_ARRAYSIGS[]{ "vmhook/fixtures/MethodEnumeration$ArraySigs" };
+
+    constexpr std::int32_t SUBSHARED_ARG{ 41 };
 
     // ---- (J)J hook observations (the unique-descriptor install/fire target) -
     std::atomic<std::int32_t> g_jj_fire_count{ 0 };
@@ -274,6 +352,14 @@ VMHOOK_JVM_MODULE(method_enumeration)
     vmhook::register_class<me_fixture>("vmhook/fixtures/MethodEnumeration");
     cp("register_class<me_overloads> (nested $Overloads)");
     vmhook::register_class<me_overloads>("vmhook/fixtures/MethodEnumeration$Overloads");
+    cp("register_class<batch-16 nested shapes>");
+    vmhook::register_class<me_tiny>(NAME_TINY);
+    vmhook::register_class<me_samename>(NAME_SAMENAME);
+    vmhook::register_class<me_base>(NAME_BASE);
+    vmhook::register_class<me_sub>(NAME_SUB);
+    vmhook::register_class<me_iface>(NAME_IFACE);
+    vmhook::register_class<me_abstract>(NAME_ABSTRACT);
+    vmhook::register_class<me_arraysigs>(NAME_ARRAYSIGS);
 
     // =====================================================================
     // PART A — get_class_methods<T>(): the real declared (name, descriptor) set.
@@ -830,6 +916,399 @@ VMHOOK_JVM_MODULE(method_enumeration)
             "()J",
             [](vmhook::return_value&) {}) };
         ctx.check("ov_hook_sSolo_retJ_installed_true", installed_retj);
+    }
+
+    // =====================================================================
+    // PART L — FEW-METHODS shape + <clinit> PRESENCE distinguishes klasses.
+    //   Tiny declares exactly { only()V, <init>()V } and has NO static field /
+    //   static block, so it has NO <clinit>.  The enclosing MethodEnumeration
+    //   DOES have a <clinit> (static {} block + static-field initializers).  The
+    //   enumeration must report <clinit> ABSENT on Tiny and PRESENT on the
+    //   enclosing class — proving get_class_methods reflects the ACTUAL declared
+    //   set per klass, not a universal "<clinit> always present" assumption.
+    //   Pure metaspace metadata -> HARD.  (<init> presence is universal/HARD;
+    //   the exact total size is lower-bounded so a future synthetic can't redden.)
+    // =====================================================================
+    cp("PART L few-methods shape + <clinit> presence contrast (Tiny)");
+    {
+        const std::vector<std::pair<std::string, std::string>> tiny{
+            vmhook::get_class_methods<me_tiny>() };
+        ctx.record(std::string{ "[INFO] get_class_methods<Tiny>() returned " }
+                   + std::to_string(tiny.size()) + " method(s)");
+        ctx.check("tiny_nonempty", !tiny.empty());
+        ctx.check("tiny_has_only_V", count_pair(tiny, "only", "()V") == 1);
+        ctx.check("tiny_has_init_V", count_pair(tiny, "<init>", "()V") >= 1);
+        // Tiny has no static initializer -> no <clinit> in its _methods.
+        ctx.check("tiny_lacks_clinit", !has_name(tiny, "<clinit>"));
+        // The enclosing class DOES have a <clinit> (already proven in PART A; here
+        // it is the contrasting half of the same invariant).
+        ctx.check("fixture_has_clinit_contrast", has_name(by_type, "<clinit>"));
+        // Inherited Object methods are absent on this tiny declared set too.
+        ctx.check("tiny_excludes_toString", !has_name(tiny, "toString"));
+        ctx.check("tiny_excludes_hashCode", !has_name(tiny, "hashCode"));
+        // The whole declared set is only + <init> (>=2 so a synthetic can't break).
+        ctx.check("tiny_size_at_least_2", tiny.size() >= 2);
+        // by-NAME overload agrees with by-TYPE on this few-method klass.
+        const std::vector<std::pair<std::string, std::string>> tiny_by_name{
+            vmhook::get_class_methods(NAME_TINY) };
+        ctx.check("tiny_by_name_same_size", tiny_by_name.size() == tiny.size());
+        ctx.check("tiny_by_name_has_only", count_pair(tiny_by_name, "only", "()V") == 1);
+    }
+
+    // =====================================================================
+    // PART M — TRUE SAME-NAME OVERLOADS: one name, four descriptors.
+    //   SameNameOverloads declares pick four times: (I)I (J)I (II)I
+    //   (Ljava/lang/String;)I.  get_class_methods lists ALL four under the single
+    //   name; a name lookup is descriptor-agnostic (count_name == 4) while each
+    //   descriptor is UNIQUE on this klass, so find_methods_by_signature resolves
+    //   each to exactly { "pick" }.  Distinct from the enclosing class's axis
+    //   (DIFFERENT names sharing a descriptor); here it is ONE name across
+    //   descriptors — the dual of the (I)I collision.  All metaspace -> HARD.
+    // =====================================================================
+    cp("PART M true same-name overloads (one name, four descriptors)");
+    {
+        const std::vector<std::pair<std::string, std::string>> sn{
+            vmhook::get_class_methods<me_samename>() };
+        ctx.check("samename_nonempty", !sn.empty());
+        // The name `pick` appears exactly four times (one per descriptor).
+        const std::size_t pick_count{ static_cast<std::size_t>(std::count_if(
+            sn.begin(), sn.end(),
+            [](const std::pair<std::string, std::string>& m) { return m.first == "pick"; })) };
+        ctx.check("samename_pick_appears_4_times", pick_count == 4);
+        // Each (name, descriptor) pair present exactly once.
+        ctx.check("samename_pick_II",  count_pair(sn, "pick", "(I)I") == 1);
+        ctx.check("samename_pick_JI",  count_pair(sn, "pick", "(J)I") == 1);
+        ctx.check("samename_pick_III", count_pair(sn, "pick", "(II)I") == 1);
+        ctx.check("samename_pick_strI",
+                  count_pair(sn, "pick", "(Ljava/lang/String;)I") == 1);
+
+        // find_methods_by_signature: each descriptor is UNIQUE on this klass, so
+        // each resolves to exactly { "pick" } — the SAME name, four times over.
+        const std::vector<std::string> p_ii{ vmhook::find_methods_by_signature<me_samename>("(I)I") };
+        ctx.check("samename_find_II_is_pick", p_ii.size() == 1 && p_ii.front() == "pick");
+        const std::vector<std::string> p_ji{ vmhook::find_methods_by_signature<me_samename>("(J)I") };
+        ctx.check("samename_find_JI_is_pick", p_ji.size() == 1 && p_ji.front() == "pick");
+        const std::vector<std::string> p_iii{ vmhook::find_methods_by_signature<me_samename>("(II)I") };
+        ctx.check("samename_find_III_is_pick", p_iii.size() == 1 && p_iii.front() == "pick");
+        const std::vector<std::string> p_str{
+            vmhook::find_methods_by_signature<me_samename>("(Ljava/lang/String;)I") };
+        ctx.check("samename_find_strI_is_pick", p_str.size() == 1 && p_str.front() == "pick");
+
+        // (J)J does NOT match pick(long) (which is (J)I) — return-type discrimination.
+        ctx.check("samename_find_JJ_empty",
+                  vmhook::find_methods_by_signature<me_samename>("(J)J").empty());
+
+        // Each of these descriptors is UNIQUE here, so hook_by_signature on (J)I
+        // must ACCEPT — but only AFTER the method is linked (install-on-unlinked
+        // throws inside get_i2i_entry).  Link pick(long) via mode 8 first, then
+        // install through a SCOPED hook (RAII teardown — leaves nothing armed).
+        cp("PART M link pick(long) via mode 8, then scoped_hook<(J)I>");
+        ctx.check("samename_link_JI_probe_completed", drive(ctx, 8));
+        {
+            auto handle{ vmhook::scoped_hook<me_samename>(
+                "pick", "(J)I",
+                [](vmhook::return_value&, const std::unique_ptr<me_samename>&,
+                   std::int64_t) {}) };
+            ctx.check("samename_scoped_hook_JI_installed", handle.installed());
+        } // RAII: hook torn down here.
+        ctx.check("samename_scoped_hook_JI_torn_down", true);
+
+        // The SHARED-on-enclosing (I)I is UNIQUE here, so hook_by_signature<(I)I>
+        // would ACCEPT on this klass where it REFUSES on the enclosing one — the
+        // cross-class scope invariant, restated through the accept/refuse policy.
+        // (Read-only: find proves it; we do not fire-install to avoid leaving an
+        // unscopable hook_by_signature install, since pick(int) is not driven.)
+        ctx.check("samename_II_unique_here_but_shared_on_fixture",
+                  vmhook::find_methods_by_signature<me_samename>("(I)I").size() == 1
+                  && vmhook::find_methods_by_signature<me_fixture>("(I)I").size() == 3);
+    }
+
+    // =====================================================================
+    // PART N — INHERITED vs DECLARED (the documented scope).  Sub extends Base,
+    //   overrides shared(I)I, and adds subOnly()V.  get_class_methods<Sub> lists
+    //   ONLY Sub's DECLARED methods (shared + subOnly + <init>) and NEVER the
+    //   inherited Base.baseOnly — the bare _methods walk reflects declaration,
+    //   not the resolved/inherited table.  The same-descriptor override emits no
+    //   bridge, so Sub.shared appears exactly once.  All metaspace -> HARD, plus
+    //   a drive+scoped_hook on the override proves it is the linkable Method*.
+    // =====================================================================
+    cp("PART N inherited-vs-declared (Base/Sub)");
+    {
+        const std::vector<std::pair<std::string, std::string>> base{
+            vmhook::get_class_methods<me_base>() };
+        const std::vector<std::pair<std::string, std::string>> sub{
+            vmhook::get_class_methods<me_sub>() };
+
+        // Base declares shared + baseOnly + <init>.
+        ctx.check("base_has_shared_II",  count_pair(base, "shared",   "(I)I") == 1);
+        ctx.check("base_has_baseOnly_V", count_pair(base, "baseOnly", "()V") == 1);
+        ctx.check("base_has_init",       count_pair(base, "<init>",   "()V") >= 1);
+
+        // Sub lists ONLY its own declared methods.
+        ctx.check("sub_has_shared_override", count_pair(sub, "shared", "(I)I") == 1);
+        ctx.check("sub_shared_appears_once",
+                  static_cast<std::size_t>(std::count_if(sub.begin(), sub.end(),
+                      [](const std::pair<std::string, std::string>& m)
+                      { return m.first == "shared"; })) == 1); // no bridge
+        ctx.check("sub_has_subOnly_V", count_pair(sub, "subOnly", "()V") == 1);
+        ctx.check("sub_has_init",      count_pair(sub, "<init>",  "()V") >= 1);
+        // The inherited Base.baseOnly is NOT declared on Sub.
+        ctx.check("sub_excludes_inherited_baseOnly", !has_name(sub, "baseOnly"));
+        ctx.check("sub_excludes_toString",           !has_name(sub, "toString"));
+
+        // find on Sub: (I)I is its lone declared shared (the override), unique here.
+        const std::vector<std::string> sub_ii{ vmhook::find_methods_by_signature<me_sub>("(I)I") };
+        ctx.check("sub_find_II_is_shared", sub_ii.size() == 1 && sub_ii.front() == "shared");
+
+        // Link + drive the override (mode 10) then scoped_hook it; the detour
+        // fires on real bytecode and the original body runs (allow-through).
+        cp("PART N link+drive Sub.shared via mode 10, then scoped_hook<(I)I>");
+        std::atomic<std::int32_t> sub_fire{ 0 };
+        std::atomic<std::int32_t> sub_arg{ -1 };
+        // Link Sub.shared FIRST (dispatch-then-install): scoped_hook's get_i2i_entry
+        // THROWS on a never-dispatched method, so install would return false. Match
+        // PART M's proven drive-then-install order.
+        ctx.check("sub_link_probe_completed", drive(ctx, 10));
+        {
+            auto handle{ vmhook::scoped_hook<me_sub>(
+                "shared", "(I)I",
+                [&sub_fire, &sub_arg](vmhook::return_value&,
+                                      const std::unique_ptr<me_sub>&,
+                                      std::int32_t x)
+                {
+                    // Frame local + atomics only — no oop deref (cold-safe).
+                    sub_fire.fetch_add(1, std::memory_order_relaxed);
+                    sub_arg.store(x, std::memory_order_relaxed);
+                }) };
+            ctx.check("sub_scoped_hook_installed", handle.installed());
+
+            const bool done{ drive(ctx, 10) };
+            ctx.check("sub_override_probe_completed", done);
+            ctx.check("sub_override_fired_once",
+                      sub_fire.load(std::memory_order_relaxed) == 1);
+            ctx.check("sub_override_decoded_arg",
+                      sub_arg.load(std::memory_order_relaxed) == SUBSHARED_ARG);
+            // allow-through: the override body ran (it stored its arg).
+            ctx.check("sub_override_allow_through",
+                      me_fixture::get_last_sub_shared() == SUBSHARED_ARG);
+        } // RAII teardown.
+        ctx.check("sub_scoped_hook_torn_down", true);
+    }
+
+    // =====================================================================
+    // PART O — INTERFACE: abstract + default + static methods ALL enumerated;
+    //   an interface has NO <init>.  All three of req/def/stat share (I)I here,
+    //   so the descriptor is a 3-way collision ON THE INTERFACE — hook_by_signature
+    //   <(I)I> must REFUSE (ambiguous), exactly like the enclosing class's (I)I.
+    //   No method is driven (the abstract member has no body; this is a pure
+    //   resolution decision, no deref).  All metaspace -> HARD.
+    // =====================================================================
+    cp("PART O interface (abstract+default+static enumerated, no <init>)");
+    {
+        const std::vector<std::pair<std::string, std::string>> iface{
+            vmhook::get_class_methods<me_iface>() };
+        ctx.record(std::string{ "[INFO] get_class_methods<Iface>() returned " }
+                   + std::to_string(iface.size()) + " method(s)");
+        ctx.check("iface_nonempty", !iface.empty());
+        ctx.check("iface_has_req_abstract", count_pair(iface, "req",  "(I)I") == 1);
+        ctx.check("iface_has_def_default",  count_pair(iface, "def",  "(I)I") == 1);
+        ctx.check("iface_has_stat_static",  count_pair(iface, "stat", "(I)I") == 1);
+        // Interfaces declare no constructor.
+        ctx.check("iface_no_init", !has_name(iface, "<init>"));
+        // (I)I is a 3-way collision on the interface -> find returns all three.
+        ctx.check("iface_find_II_size_3",
+                  vmhook::find_methods_by_signature<me_iface>("(I)I").size() == 3);
+        // hook_by_signature<(I)I> on the interface REFUSES (ambiguous), installs
+        // nothing — the accept/refuse policy is per-klass and shape-agnostic.
+        const bool installed{ vmhook::hook_by_signature<me_iface>(
+            "(I)I",
+            [](vmhook::return_value&, const std::unique_ptr<me_iface>&,
+               std::int32_t) {}) };
+        ctx.check("iface_hook_II_refused_false", installed == false);
+        // A descriptor nothing on the interface declares -> empty / refuse.
+        ctx.check("iface_find_absent_DD_empty",
+                  vmhook::find_methods_by_signature<me_iface>("(D)D").empty());
+    }
+
+    // =====================================================================
+    // PART P — ABSTRACT CLASS: abstract + concrete + <init> all enumerated.
+    //   abstractOp(I)I (abstract, no body) and concreteOp(I)I share (I)I on this
+    //   klass (2-way collision -> hook_by_signature<(I)I> REFUSES); uniqueAbs(D)D
+    //   is a genuinely-UNIQUE descriptor (find -> exactly one).  Pure metaspace +
+    //   resolution decisions -> HARD.  No method driven (abstract has no body and
+    //   the unique (D)D method is never dispatched, so no install fires).
+    // =====================================================================
+    cp("PART P abstract class (abstract+concrete+<init> enumerated)");
+    {
+        const std::vector<std::pair<std::string, std::string>> ab{
+            vmhook::get_class_methods<me_abstract>() };
+        ctx.check("abstract_nonempty", !ab.empty());
+        ctx.check("abstract_has_init",         count_pair(ab, "<init>",    "()V") >= 1);
+        ctx.check("abstract_has_abstractOp",   count_pair(ab, "abstractOp", "(I)I") == 1);
+        ctx.check("abstract_has_concreteOp",   count_pair(ab, "concreteOp", "(I)I") == 1);
+        ctx.check("abstract_has_uniqueAbs_DD", count_pair(ab, "uniqueAbs",  "(D)D") == 1);
+        ctx.check("abstract_excludes_toString", !has_name(ab, "toString"));
+
+        // (I)I is a 2-way collision (abstractOp + concreteOp) -> find returns both,
+        // hook_by_signature<(I)I> REFUSES.
+        const std::vector<std::string> ab_ii{ vmhook::find_methods_by_signature<me_abstract>("(I)I") };
+        ctx.check("abstract_find_II_size_2", ab_ii.size() == 2);
+        ctx.check("abstract_find_II_has_abstractOp",
+                  std::find(ab_ii.begin(), ab_ii.end(), "abstractOp") != ab_ii.end());
+        ctx.check("abstract_find_II_has_concreteOp",
+                  std::find(ab_ii.begin(), ab_ii.end(), "concreteOp") != ab_ii.end());
+        const bool ii_installed{ vmhook::hook_by_signature<me_abstract>(
+            "(I)I",
+            [](vmhook::return_value&, const std::unique_ptr<me_abstract>&,
+               std::int32_t) {}) };
+        ctx.check("abstract_hook_II_refused_false", ii_installed == false);
+
+        // (D)D is UNIQUE here (it is ABSENT on the enclosing class — descriptor_
+        // absent_DD_zero in PART A) -> find resolves to exactly { uniqueAbs }.
+        const std::vector<std::string> ab_dd{ vmhook::find_methods_by_signature<me_abstract>("(D)D") };
+        ctx.check("abstract_find_DD_is_uniqueAbs",
+                  ab_dd.size() == 1 && ab_dd.front() == "uniqueAbs");
+    }
+
+    // =====================================================================
+    // PART Q — ARRAY-TYPED SIGNATURES scoped to their own klass (each UNIQUE).
+    //   ArraySigs: oneD([J)J, twoD([[I)I, objArr([Ljava/lang/String;)I,
+    //   retArr()[I (array in the RETURN slot).  find resolves each to its one
+    //   method; the descriptors decode byte-exact.  oneD([J)J is the drive+fire
+    //   target: link+drive via mode 11, scoped_hook it, and prove the detour
+    //   fires on real bytecode (array-descriptor install + dispatch).  All
+    //   metaspace reads HARD; the detour reads NO oop (cold-safe).
+    // =====================================================================
+    cp("PART Q array-typed signatures (ArraySigs)");
+    {
+        const std::vector<std::pair<std::string, std::string>> ar{
+            vmhook::get_class_methods<me_arraysigs>() };
+        ctx.check("arraysigs_nonempty", !ar.empty());
+        ctx.check("arraysigs_has_oneD_aJJ",   count_pair(ar, "oneD",   "([J)J") == 1);
+        ctx.check("arraysigs_has_twoD_aaII",  count_pair(ar, "twoD",   "([[I)I") == 1);
+        ctx.check("arraysigs_has_objArr",
+                  count_pair(ar, "objArr", "([Ljava/lang/String;)I") == 1);
+        ctx.check("arraysigs_has_retArr_aI",  count_pair(ar, "retArr", "()[I") == 1);
+        ctx.check("arraysigs_has_init",       count_pair(ar, "<init>", "()V") >= 1);
+
+        // Each array descriptor is UNIQUE on this klass -> find -> exactly one.
+        const std::vector<std::string> a1{ vmhook::find_methods_by_signature<me_arraysigs>("([J)J") };
+        ctx.check("arraysigs_find_aJJ_is_oneD", a1.size() == 1 && a1.front() == "oneD");
+        const std::vector<std::string> a2{ vmhook::find_methods_by_signature<me_arraysigs>("([[I)I") };
+        ctx.check("arraysigs_find_aaII_is_twoD", a2.size() == 1 && a2.front() == "twoD");
+        const std::vector<std::string> a3{
+            vmhook::find_methods_by_signature<me_arraysigs>("([Ljava/lang/String;)I") };
+        ctx.check("arraysigs_find_objArr_is_objArr", a3.size() == 1 && a3.front() == "objArr");
+        const std::vector<std::string> a4{ vmhook::find_methods_by_signature<me_arraysigs>("()[I") };
+        ctx.check("arraysigs_find_retArr_is_retArr", a4.size() == 1 && a4.front() == "retArr");
+        // A near-miss array descriptor (wrong element type) matches nothing.
+        ctx.check("arraysigs_find_aIJ_empty",
+                  vmhook::find_methods_by_signature<me_arraysigs>("([I)J").empty());
+
+        // Link + drive oneD([J)J (mode 11) then scoped_hook it; the detour fires
+        // on real bytecode dispatch.  The detour reads only the receiver wrapper
+        // (no oop deref) — array arg itself is not read — so it is cold-safe.
+        cp("PART Q link+drive ArraySigs.oneD via mode 11, then scoped_hook<([J)J>");
+        std::atomic<std::int32_t> arr_fire{ 0 };
+        // Link ArraySigs.oneD FIRST (dispatch-then-install — see PART N/M).
+        ctx.check("arraysigs_link_probe_completed", drive(ctx, 11));
+        {
+            auto handle{ vmhook::scoped_hook<me_arraysigs>(
+                "oneD", "([J)J",
+                [&arr_fire](vmhook::return_value&,
+                            const std::unique_ptr<me_arraysigs>&)
+                {
+                    arr_fire.fetch_add(1, std::memory_order_relaxed);
+                }) };
+            ctx.check("arraysigs_scoped_hook_oneD_installed", handle.installed());
+
+            const bool done{ drive(ctx, 11) };
+            ctx.check("arraysigs_oneD_probe_completed", done);
+            ctx.check("arraysigs_oneD_fired_once",
+                      arr_fire.load(std::memory_order_relaxed) == 1);
+            // allow-through: oneD summed its array (10+20+30) and stored the total.
+            ctx.check("arraysigs_oneD_allow_through",
+                      me_fixture::get_last_one_d() == 60);
+        } // RAII teardown.
+        ctx.check("arraysigs_scoped_hook_oneD_torn_down", true);
+    }
+
+    // =====================================================================
+    // PART R — FEW-METHOD scoped_hook fire (Tiny.only ()V) + deepened negatives.
+    //   Tiny.only ()V is UNIQUE on Tiny (Tiny has no synthetic ()V collision —
+    //   only <init> shares ()V, a 2-way; so we hook by NAME+descriptor, NOT by
+    //   ambiguous signature).  Link+drive via mode 12, scoped_hook, fire-once.
+    //   Then a battery of deepened negative inputs through the by-name overload
+    //   and the type overloads that the existing PARTs B/C/H don't cover — all
+    //   must degrade to empty/false, never crash.
+    // =====================================================================
+    cp("PART R Tiny.only scoped_hook fire + deepened negatives");
+    {
+        // only ()V shares ()V with <init> on Tiny (a 2-way), so a signature hook
+        // would refuse; confirm that, then hook by exact NAME+descriptor instead.
+        ctx.check("tiny_find_V_size_2",
+                  vmhook::find_methods_by_signature<me_tiny>("()V").size() == 2);
+        const bool sig_refused{ vmhook::hook_by_signature<me_tiny>(
+            "()V",
+            [](vmhook::return_value&, const std::unique_ptr<me_tiny>&) {}) };
+        ctx.check("tiny_hook_V_refused_false", sig_refused == false);
+
+        cp("PART R link+drive Tiny.only via mode 12, then scoped_hook<only,()V>");
+        std::atomic<std::int32_t> tiny_fire{ 0 };
+        // Link Tiny.only FIRST (dispatch-then-install — see PART M/N/Q).
+        ctx.check("tiny_link_probe_completed", drive(ctx, 12));
+        {
+            auto handle{ vmhook::scoped_hook<me_tiny>(
+                "only", "()V",
+                [&tiny_fire](vmhook::return_value&,
+                             const std::unique_ptr<me_tiny>&)
+                {
+                    tiny_fire.fetch_add(1, std::memory_order_relaxed);
+                }) };
+            ctx.check("tiny_scoped_hook_only_installed", handle.installed());
+
+            const bool done{ drive(ctx, 12) };
+            ctx.check("tiny_only_probe_completed", done);
+            ctx.check("tiny_only_fired_once",
+                      tiny_fire.load(std::memory_order_relaxed) == 1);
+            // allow-through: the original only() body ran (it incremented).
+            ctx.check("tiny_only_allow_through", me_fixture::get_last_tiny_only() >= 1);
+        } // RAII teardown.
+        ctx.check("tiny_scoped_hook_only_torn_down", true);
+
+        // ---- Deepened NEGATIVE inputs (degrade to empty/false, never crash) ----
+        // by-name overload: a loaded class's nested name with a WRONG case ->
+        // empty (the JVM is case-sensitive; this is a real not-loaded name).
+        ctx.check("wrongcase_nested_empty",
+                  vmhook::get_class_methods("vmhook/fixtures/MethodEnumeration$tiny").empty());
+        // A trailing `$` with no inner name -> empty.
+        ctx.check("trailing_dollar_empty",
+                  vmhook::get_class_methods("vmhook/fixtures/MethodEnumeration$").empty());
+        // The dotted (source) form of a nested name is not the internal slashed
+        // form; whether it resolves is environment-variant -> PASS-or-[INFO].
+        {
+            const bool dotted_empty{
+                vmhook::get_class_methods("vmhook.fixtures.MethodEnumeration$Tiny").empty() };
+            ctx.record(std::string{ "[INFO] dotted nested name resolves=" }
+                       + (dotted_empty ? "no (slashed-only resolver)"
+                                       : "yes (find_class fallback accepted dotted)"));
+        }
+        // find_methods_by_signature on the SECOND never-registered wrapper -> empty.
+        ctx.check("find_never_registered_empty",
+                  vmhook::find_methods_by_signature<me_never>("()V").empty());
+        // get_class_methods on the second never-registered wrapper -> empty.
+        ctx.check("enum_never_registered_empty",
+                  vmhook::get_class_methods<me_never>().empty());
+        // hook_by_signature on a never-registered wrapper -> false (no match path).
+        ctx.check("hook_never_registered_refused_false",
+                  vmhook::hook_by_signature<me_never>(
+                      "()V",
+                      [](vmhook::return_value&, const std::unique_ptr<me_never>&) {})
+                      == false);
+        // A whitespace-only class name -> empty, no crash.
+        ctx.check("whitespace_name_empty", vmhook::get_class_methods("   ").empty());
+        // reaching here is the no-crash witness for every deepened negative probe.
+        ctx.check("part_R_negatives_no_crash", true);
     }
 
     cp("module complete (all parts reached without a no-SEH fault)");

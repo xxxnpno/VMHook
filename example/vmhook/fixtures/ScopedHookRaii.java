@@ -53,6 +53,7 @@ public final class ScopedHookRaii
      *   6  = over(int) once            (overloaded; short overload target)
      *   7  = over(int,int) once        (overloaded; long-signature target)
      *   8  = alpha(int) + over(int) one cycle (mixed)
+     *   9  = alpha(int) + beta(int) one cycle (two-hook exception-unwind path)
      */
     public static volatile int mode;
 
@@ -197,6 +198,16 @@ public final class ScopedHookRaii
         overICalls += 1;
     }
 
+    private static void runAlphaAndBeta()
+    {
+        final ScopedHookRaii obj = new ScopedHookRaii();
+        obj.seed = SEED;
+        alphaResult = obj.alpha(ALPHA_DELTA);
+        alphaCalls += 1;
+        betaResult = obj.beta(BETA_DELTA);
+        betaCalls += 1;
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -235,6 +246,9 @@ public final class ScopedHookRaii
                         break;
                     case 8:
                         runAlphaAndOverI();
+                        break;
+                    case 9:
+                        runAlphaAndBeta();
                         break;
                     default:
                         break;

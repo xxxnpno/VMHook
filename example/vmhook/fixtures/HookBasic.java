@@ -60,6 +60,25 @@ public final class HookBasic
      *   18 = touch(int)       : hook mutates the delta arg via set_arg -> body sees it
      *   19 = touch(int)       : re-install probe (one call; counted like mode 1 but x1)
      *   20 = retInt(int)      : plain (non-scoped) hook firing probe (one call)
+     *
+     *   --- Deepening (batch-16): arg-shape input classes ----------------------
+     *   21 = manyArgs(...)        : instance, 8 args incl TWO longs + a double +
+     *                               a String interleaved (slot alignment past the
+     *                               8-arg boundary; every trailing slot correct)
+     *   22 = staticManyArgs(...)  : static twin, WIDE-FIRST ordering (long at slot
+     *                               0-1), no `this`
+     *   23 = boundaryCombine(...) : combine driven with Integer.MIN / Long.MIN /
+     *                               Integer.MAX (extreme primitive arg values)
+     *   24 = boundaryCombine(...) : same method, driven with Integer.MAX / -1L
+     *                               (all-ones long) / Integer.MIN
+     *   25 = floatArg(float,int)  : instance, float arg decode + trailing int
+     *   26 = nullRefArgs(String,HookBasic) : null String arg (-> empty std::string)
+     *                               + null object arg (-> null unique_ptr)
+     *   27 = objArg(HookBasic,int) : a REAL (non-this) object-wrapper arg whose
+     *                               seed the detour reads (object arg != receiver)
+     *   28 = coexist : touch() AND staticTouch() BOTH hooked at once, both called
+     *                  in one dispatch (two distinct hooks coexisting, each decodes
+     *                  its own arg)
      */
     public static volatile int mode;
 
@@ -114,6 +133,22 @@ public final class HookBasic
     /** touch() result for the re-install / plain-hook firing probes. */
     public static volatile int     reinstallTouchResult;
 
+    // ---- Deepening (batch-16) observations --------------------------------
+    /** manyArgs() / staticManyArgs() allow-through results. */
+    public static volatile long    manyArgsResult;
+    public static volatile long    staticManyArgsResult;
+    /** boundaryCombine() allow-through result. */
+    public static volatile long    boundaryCombineResult;
+    /** floatArg() allow-through result. */
+    public static volatile float   floatArgResult;
+    /** nullRefArgs() allow-through result (true iff both refs were null). */
+    public static volatile boolean nullRefArgsBothNull;
+    /** objArg() allow-through result (the seed of the passed-in object). */
+    public static volatile int     objArgResult;
+    /** coexist allow-through results for the two simultaneously-hooked methods. */
+    public static volatile int     coexistInstanceResult;
+    public static volatile int     coexistStaticResult;
+
     /** The UN-hooked natural return of retInt() (sanity baseline). */
     public static final int  RET_INT_NATURAL = 1;
 
@@ -145,6 +180,47 @@ public final class HookBasic
     public static final double WIDE_D = 2.5;
     public static final String WIDE_S = "vmhook";
     public static final int WIDE_I = 77;
+
+    // ---- Deepening (batch-16) constants -----------------------------------
+    /**
+     * manyArgs(int,long,int,double,int,String,long,int): EIGHT declared args
+     * with TWO longs + a double interleaved, so a correct decoder must keep
+     * every trailing slot aligned well PAST the 8-arg / register-allocation
+     * boundary.  Declaration-order values, chosen so each differs from the
+     * others (a slot-shift would surface as a mismatched decode).
+     */
+    public static final int    MANY_A = 11;                       // slot (this=0) 1
+    public static final long   MANY_B = 0x0A0B0C0D0E0F1011L;      // slots 2-3 (wide)
+    public static final int    MANY_C = 22;                       // slot 4
+    public static final double MANY_D = 6.5;                      // slots 5-6 (wide, exact)
+    public static final int    MANY_E = 33;                       // slot 7
+    public static final String MANY_F = "many";                   // slot 8 (ref)
+    public static final long   MANY_G = -0x7FEEDDCCBBAA9988L;     // slots 9-10 (wide)
+    public static final int    MANY_H = 44;                       // slot 11 (trailing int)
+
+    /**
+     * staticManyArgs(long,int,double,String,int,long): WIDE-FIRST (long at
+     * slot 0-1, no `this`), exercising the offset table from index 0 with a
+     * 2-slot leading type.
+     */
+    public static final long   SMANY_A = 0x1213141516171819L;    // slots 0-1 (wide, first)
+    public static final int    SMANY_B = 55;                      // slot 2
+    public static final double SMANY_C = -12.75;                  // slots 3-4 (wide, exact)
+    public static final String SMANY_D = "swide";                 // slot 5 (ref)
+    public static final int    SMANY_E = 66;                      // slot 6
+    public static final long   SMANY_F = 0x2122232425262728L;    // slots 7-8 (wide, trailing)
+
+    /** floatArg(float,int): a float arg (1-slot, distinct decode lane) + trailing int. */
+    public static final float  FLOAT_ARG = -3.25f;                // exact in IEEE-754
+    public static final int    FLOAT_TRAILING_I = 88;
+
+    /** objArg(HookBasic,int): the passed-in object's seed (distinct from `this`). */
+    public static final int    OBJ_ARG_SEED = 7777;
+    public static final int    OBJ_ARG_DELTA = 9;
+
+    /** coexist: the two arg values fed to the two simultaneously-hooked methods. */
+    public static final int    COEXIST_INSTANCE_DELTA = 13;
+    public static final int    COEXIST_STATIC_DELTA = 21;
 
     // ---- Hookable methods -------------------------------------------------
 
@@ -184,6 +260,63 @@ public final class HookBasic
     {
         final int slen = (s == null) ? -1 : s.length();
         return (flag ? 1.0 : 0.0) + d + slen + i;
+    }
+
+    /**
+     * Eight-argument instance method with TWO longs and a double interleaved.
+     * A correct slot decoder must keep every trailing arg aligned past the
+     * 8-arg / register boundary; the original body sums them so allow-through
+     * proves the body ran with the unmodified args.
+     */
+    public long manyArgs(final int a, final long b, final int c, final double d,
+                         final int e, final String f, final long g, final int h)
+    {
+        final int flen = (f == null) ? -1 : f.length();
+        return this.seed + a + b + c + (long) d + e + flen + g + h;
+    }
+
+    /** Static twin of manyArgs with a WIDE leading arg (long at slot 0-1, no `this`). */
+    public static long staticManyArgs(final long a, final int b, final double c,
+                                      final String d, final int e, final long f)
+    {
+        final int dlen = (d == null) ? -1 : d.length();
+        return a + b + (long) c + dlen + e + f;
+    }
+
+    /**
+     * combine() variant driven with EXTREME primitive arg values (Integer.MIN,
+     * Long.MIN, -1L all-ones, etc.).  Same (int,long,int) shape; the body sums
+     * with a wide accumulator so overflow is well-defined two's-complement.
+     */
+    public long boundaryCombine(final int a, final long b, final int c)
+    {
+        return (long) a + b + c;
+    }
+
+    /** Float arg (1-slot, distinct lane) followed by a trailing int. */
+    public double floatArg(final float f, final int i)
+    {
+        return (double) f + i;
+    }
+
+    /**
+     * Two reference args, both passed null by the driver: a String (decodes to
+     * an empty std::string in the detour) and a HookBasic object (decodes to a
+     * null unique_ptr).  Body reports whether both were null.
+     */
+    public boolean nullRefArgs(final String s, final HookBasic obj)
+    {
+        return s == null && obj == null;
+    }
+
+    /**
+     * A REAL object-wrapper arg distinct from `this`: the detour decodes `other`
+     * and reads ITS seed, proving an object ARGUMENT (not the receiver) is
+     * decoded to the correct instance.  Body returns the other's seed + delta.
+     */
+    public int objArg(final HookBasic other, final int delta)
+    {
+        return other.seed + delta;
     }
 
     // ---- Typed-return hookable methods (return-value interception) ---------
@@ -333,6 +466,72 @@ public final class HookBasic
         retIntObserved = new HookBasic().retInt(RET_INT_NATURAL);
     }
 
+    // ---- Deepening (batch-16) drivers -------------------------------------
+
+    private static void runManyArgs()
+    {
+        final HookBasic obj = new HookBasic();
+        obj.seed = 1000;
+        manyArgsResult = obj.manyArgs(MANY_A, MANY_B, MANY_C, MANY_D,
+                                      MANY_E, MANY_F, MANY_G, MANY_H);
+    }
+
+    private static void runStaticManyArgs()
+    {
+        staticManyArgsResult = staticManyArgs(SMANY_A, SMANY_B, SMANY_C,
+                                              SMANY_D, SMANY_E, SMANY_F);
+    }
+
+    private static void runBoundaryCombineExtreme()
+    {
+        final HookBasic obj = new HookBasic();
+        obj.seed = 1000;
+        boundaryCombineResult =
+            obj.boundaryCombine(Integer.MIN_VALUE, Long.MIN_VALUE, Integer.MAX_VALUE);
+    }
+
+    private static void runBoundaryCombineAllOnes()
+    {
+        final HookBasic obj = new HookBasic();
+        obj.seed = 1000;
+        boundaryCombineResult =
+            obj.boundaryCombine(Integer.MAX_VALUE, -1L, Integer.MIN_VALUE);
+    }
+
+    private static void runFloatArg()
+    {
+        final HookBasic obj = new HookBasic();
+        obj.seed = 0;
+        floatArgResult = (float) obj.floatArg(FLOAT_ARG, FLOAT_TRAILING_I);
+    }
+
+    private static void runNullRefArgs()
+    {
+        final HookBasic obj = new HookBasic();
+        obj.seed = 0;
+        nullRefArgsBothNull = obj.nullRefArgs(null, null);
+    }
+
+    private static void runObjArg()
+    {
+        final HookBasic receiver = new HookBasic();
+        receiver.seed = 0;
+        final HookBasic other = new HookBasic();
+        other.seed = OBJ_ARG_SEED;
+        objArgResult = receiver.objArg(other, OBJ_ARG_DELTA);
+    }
+
+    private static void runCoexist()
+    {
+        // Both touch() (instance) and staticTouch() (static) are hooked at once.
+        // One dispatch calls each exactly once so both detours fire in the same
+        // probe cycle, each decoding its own arg.
+        final HookBasic obj = new HookBasic();
+        obj.seed = 1000;
+        coexistInstanceResult = obj.touch(COEXIST_INSTANCE_DELTA);
+        coexistStaticResult = staticTouch(COEXIST_STATIC_DELTA);
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -407,6 +606,30 @@ public final class HookBasic
                         break;
                     case 20:
                         runPlainRetInt();
+                        break;
+                    case 21:
+                        runManyArgs();
+                        break;
+                    case 22:
+                        runStaticManyArgs();
+                        break;
+                    case 23:
+                        runBoundaryCombineExtreme();
+                        break;
+                    case 24:
+                        runBoundaryCombineAllOnes();
+                        break;
+                    case 25:
+                        runFloatArg();
+                        break;
+                    case 26:
+                        runNullRefArgs();
+                        break;
+                    case 27:
+                        runObjArg();
+                        break;
+                    case 28:
+                        runCoexist();
                         break;
                     default:
                         break;

@@ -471,6 +471,147 @@ namespace
         }
 
         // =====================================================================
+        //  3b. jni_signature_for_arg<T> -- EXTENDED / NATIVE-SPELLED integral and
+        //      character-type matrix.  Section 3 pins the fixed-WIDTH aliases
+        //      (std::int*_t / std::uint*_t); this section pins the SPELLINGS those
+        //      aliases map FROM (plain `char`, `short`, `int`, `long long`, ...)
+        //      plus the extended char types -- the exact type domain the helper's
+        //      sizeof-driven generic-integral ladder (vmhook.hpp ~12806-12821) now
+        //      admits, after the older `dependent_false` fallback for these was
+        //      replaced.  Every row is HARD and universal because it is either a
+        //      type-identity invariant (plain `char` is a 1-byte integral on every
+        //      target) or constexpr-gated on the platform width so only the
+        //      compilable arm instantiates.
+        // =====================================================================
+        {
+            // char16_t is the Java-`char` sibling of std::uint16_t: BOTH are claimed
+            // by the explicit C-branch BEFORE the generic 2-byte ladder (which would
+            // otherwise hand char16_t the "S" of a signed short).  Section 3 only
+            // covers char32_t (-> I); this pins the 16-bit char type -> "C".
+            static_assert(sizeof(char16_t) == 2, "char16_t is a 16-bit type");
+            ctx.check("jnisig_char16_t_is_C_not_S",
+                         vmhook::detail::jni_signature_for_arg<char16_t>() == "C"
+                      && vmhook::detail::jni_signature_for_arg<char16_t>()
+                             != vmhook::detail::jni_signature_for_arg<std::int16_t>());
+            // char16_t round-trips through the BasicType table to T_CHAR(5), exactly
+            // like std::uint16_t.
+            ctx.check("jnisig_char16_t_roundtrips_to_T_CHAR_5",
+                      vmhook::detail::sig_char_to_basic_type(
+                          vmhook::detail::jni_signature_for_arg<char16_t>()[0]) == 5);
+
+            // Plain `char`, `signed char`, `unsigned char` are all 1-byte integrals
+            // and route through the generic sizeof==1 branch to "B" (Java byte).
+            // (`char` is distinct from BOTH signed/unsigned char as a type, but all
+            // three are size-1 integrals.)  This is the row the helper UPGRADED from
+            // a hard static_assert to a real branch, so it must stay green.
+            static_assert(std::is_integral_v<char> && sizeof(char) == 1, "char is 1-byte integral");
+            ctx.check("jnisig_plain_char_is_B",
+                      vmhook::detail::jni_signature_for_arg<char>() == "B");
+            ctx.check("jnisig_signed_unsigned_char_are_B",
+                         vmhook::detail::jni_signature_for_arg<signed char>() == "B"
+                      && vmhook::detail::jni_signature_for_arg<unsigned char>() == "B");
+            // char round-trips to T_BYTE(8) via the table.
+            ctx.check("jnisig_plain_char_roundtrips_to_T_BYTE_8",
+                      vmhook::detail::sig_char_to_basic_type(
+                          vmhook::detail::jni_signature_for_arg<char>()[0]) == 8);
+
+            // wchar_t: a 2-byte integral on Windows (-> generic "S", Java short) or a
+            // 4-byte integral on the SysV LP64 targets (-> generic "I", Java int).
+            // It is NEVER uint16_t, so it never reaches the explicit C-branch -- it
+            // takes the SIGNED generic ladder.  Gate on its actual width so only the
+            // compilable arm instantiates and the assertion is exact on each target.
+            if constexpr (std::is_integral_v<wchar_t> && sizeof(wchar_t) == 2)
+            {
+                ctx.check("jnisig_wchar_t_is_S_on_2byte_target",
+                          vmhook::detail::jni_signature_for_arg<wchar_t>() == "S");
+            }
+            else if constexpr (std::is_integral_v<wchar_t> && sizeof(wchar_t) == 4)
+            {
+                ctx.check("jnisig_wchar_t_is_I_on_4byte_target",
+                          vmhook::detail::jni_signature_for_arg<wchar_t>() == "I");
+            }
+
+            // NATIVE-SPELLED fixed-width siblings: assert the spelling the C++ code
+            // actually writes (short / int / long long) maps as the width ladder
+            // dictates, INDEPENDENT of whether it is the same type as the std::*_t
+            // alias.  `short`/`int`/`long long` are signed; only their WIDTH decides
+            // the letter, except the explicit-C uint16 split which keys on the EXACT
+            // unsigned-16 type.  Each row is constexpr-gated on the native width so
+            // it is exact on LP64 (short2/int4/longlong8) and any LLP64 host alike.
+            if constexpr (std::is_integral_v<short> && sizeof(short) == 2)
+            {
+                // signed `short` is NOT the explicit-C type, so it is "S".
+                ctx.check("jnisig_native_short_is_S",
+                          vmhook::detail::jni_signature_for_arg<short>() == "S");
+            }
+            if constexpr (std::is_integral_v<int> && sizeof(int) == 4)
+            {
+                ctx.check("jnisig_native_int_is_I",
+                          vmhook::detail::jni_signature_for_arg<int>() == "I"
+                          && vmhook::detail::jni_signature_for_arg<unsigned int>() == "I");
+            }
+            if constexpr (std::is_integral_v<long long> && sizeof(long long) == 8)
+            {
+                ctx.check("jnisig_native_longlong_is_J",
+                          vmhook::detail::jni_signature_for_arg<long long>() == "J"
+                          && vmhook::detail::jni_signature_for_arg<unsigned long long>() == "J");
+            }
+
+            // `unsigned short` is the platform's unsigned-16 type.  On EVERY target
+            // where it IS std::uint16_t (the universal case for a 16-bit short) it
+            // hits the explicit C-branch -> "C", NOT the generic-2-byte "S".  Gate on
+            // the type identity so the assertion is only made where it is an
+            // invariant (it is, on every supported target, but the gate keeps the
+            // row honest if some exotic host ever made them distinct types).
+            if constexpr (std::is_same_v<unsigned short, std::uint16_t>)
+            {
+                ctx.check("jnisig_native_unsigned_short_is_C_when_uint16",
+                          vmhook::detail::jni_signature_for_arg<unsigned short>() == "C");
+            }
+
+            // ptrdiff_t is the signed pointer-difference type: 8-byte -> "J" on LP64
+            // and LLP64 (pointers are 64-bit on every target this library runs on),
+            // 4-byte -> "I" on a hypothetical 32-bit host.  Gate on its width.
+            if constexpr (std::is_integral_v<std::ptrdiff_t>
+                          && sizeof(std::ptrdiff_t) == 8)
+            {
+                ctx.check("jnisig_ptrdiff_t_is_J_on_64bit",
+                          vmhook::detail::jni_signature_for_arg<std::ptrdiff_t>() == "J");
+            }
+            else if constexpr (std::is_integral_v<std::ptrdiff_t>
+                               && sizeof(std::ptrdiff_t) == 4)
+            {
+                ctx.check("jnisig_ptrdiff_t_is_I_on_32bit",
+                          vmhook::detail::jni_signature_for_arg<std::ptrdiff_t>() == "I");
+            }
+
+            // EXHAUSTIVE width->letter invariant for the generic integral ladder:
+            // for the canonical signed integer type OF EACH WIDTH the helper admits,
+            // the emitted letter's byte-width (via jvm_primitive_byte_width) equals
+            // the C++ type's sizeof.  This pins the helper's letter against the
+            // width table in ONE place, so a ladder-threshold typo (e.g. sizeof==4
+            // accidentally emitting "S") fails loudly.  uint16/char16 are EXCLUDED
+            // here (they intentionally emit "C", whose 2-byte width still matches,
+            // but their letter is asserted by the dedicated rows above).
+            {
+                const bool width_letter_consistent{
+                       vmhook::detail::jvm_primitive_byte_width(
+                           vmhook::detail::jni_signature_for_arg<std::int8_t>()) == sizeof(std::int8_t)
+                    && vmhook::detail::jvm_primitive_byte_width(
+                           vmhook::detail::jni_signature_for_arg<std::int16_t>()) == sizeof(std::int16_t)
+                    && vmhook::detail::jvm_primitive_byte_width(
+                           vmhook::detail::jni_signature_for_arg<std::int32_t>()) == sizeof(std::int32_t)
+                    && vmhook::detail::jvm_primitive_byte_width(
+                           vmhook::detail::jni_signature_for_arg<std::int64_t>()) == sizeof(std::int64_t)
+                    && vmhook::detail::jvm_primitive_byte_width(
+                           vmhook::detail::jni_signature_for_arg<float>()) == sizeof(float)
+                    && vmhook::detail::jvm_primitive_byte_width(
+                           vmhook::detail::jni_signature_for_arg<double>()) == sizeof(double) };
+                ctx.check("jnisig_emitted_letter_width_matches_sizeof", width_letter_consistent);
+            }
+        }
+
+        // =====================================================================
         //  4. Return-descriptor extraction -- the live call-site policy.
         //     Reproduces method_proxy::call's bounds-and-validity-guarded
         //     rfind(')')+1 (vmhook.hpp ~14146-14174): well-formed returns map to
@@ -877,6 +1018,49 @@ namespace
                 s += ")V";
                 ctx.check("ctor_int8_int16_float_is_BSF_V", s == "(BSF)V");
             }
+            // (char16_t, char) -> "(CB)V": the extended char types compose into a
+            // constructor descriptor exactly as their letters dictate (char16 -> C,
+            // plain char -> B).  This pins the now-admitted extended-integral domain
+            // end-to-end through the same fold jni_make_unique uses.
+            {
+                std::string s{ "(" };
+                s += vmhook::detail::jni_signature_for_arg<char16_t>();
+                s += vmhook::detail::jni_signature_for_arg<char>();
+                s += ")V";
+                ctx.check("ctor_char16_char_is_CB_V", s == "(CB)V");
+            }
+            // The fold runs over std::decay_t of each arg (vmhook.hpp ~13260 uses
+            // remove_cvref; the public re-export uses decay -- both strip cv/ref):
+            // a pack of cv/ref-qualified types must build the SAME descriptor as the
+            // bare types.  (const string&, double&&, volatile bool) -> "(LString;DZ)V".
+            {
+                std::string s{ "(" };
+                s += vmhook::detail::jni_signature_for_arg<const std::string&>();
+                s += vmhook::detail::jni_signature_for_arg<double&&>();
+                s += vmhook::detail::jni_signature_for_arg<volatile bool>();
+                s += ")V";
+                ctx.check("ctor_cvref_qualified_pack_decays_to_LString_D_Z_V",
+                          s == "(Ljava/lang/String;DZ)V");
+            }
+            // A many-arg constructor mixing every primitive letter once + a String,
+            // proving the fold has no cap and orders parts left-to-right:
+            // (bool,int8,int16,uint16,int32,int64,float,double,String) ->
+            // "(ZBSCIJFDLjava/lang/String;)V".
+            {
+                std::string s{ "(" };
+                s += vmhook::detail::jni_signature_for_arg<bool>();
+                s += vmhook::detail::jni_signature_for_arg<std::int8_t>();
+                s += vmhook::detail::jni_signature_for_arg<std::int16_t>();
+                s += vmhook::detail::jni_signature_for_arg<std::uint16_t>();
+                s += vmhook::detail::jni_signature_for_arg<std::int32_t>();
+                s += vmhook::detail::jni_signature_for_arg<std::int64_t>();
+                s += vmhook::detail::jni_signature_for_arg<float>();
+                s += vmhook::detail::jni_signature_for_arg<double>();
+                s += vmhook::detail::jni_signature_for_arg<std::string>();
+                s += ")V";
+                ctx.check("ctor_every_primitive_plus_string_is_ZBSCIJFD_LString_V",
+                          s == "(ZBSCIJFDLjava/lang/String;)V");
+            }
         }
 
         // =====================================================================
@@ -1059,6 +1243,29 @@ namespace
                 { "(JJJJJ)J", 11, 10, 5 },                                  // five wides -> 10 slots
                 { "([[[ILjava/lang/String;D)V", 14, 4, 3 },                 // 3-D arr(1)+ref(1)+D(2)
                 { "([Ljava/lang/String;[[Ljava/lang/Object;)V", 14, 2, 2 }, // two ref arrays
+                // The array-of-WIDE rule: [J / [D are REFERENCES (one slot each),
+                // NOT two -- only a BARE top-level J/D is the two-slot category.
+                // These rows put an array-of-long and an array-of-double next to a
+                // bare long and a bare double so the slot count proves the parser
+                // keys the 2-slot rule on "no preceding '[' ", not on the J/D char.
+                { "([J)V", 14, 1, 1 },                                      // array-of-long: 1 slot
+                { "([D)V", 14, 1, 1 },                                      // array-of-double: 1 slot
+                { "([JJ)V", 14, 3, 2 },                                     // [J(1) + bare J(2) = 3
+                { "([DD)V", 14, 3, 2 },                                     // [D(1) + bare D(2) = 3
+                { "(J[J)V", 14, 3, 2 },                                     // bare J(2) + [J(1) = 3
+                { "([[J[[D)V", 14, 2, 2 },                                  // 2-D arr-of-long + 2-D arr-of-double: 2 slots
+                // A wide arg WEDGED between two narrows, with a trailing array:
+                // I(1)+J(2)+I(1)+[I(1) = 5 slots, 4 args, int return.
+                { "(IJI[I)I", 10, 5, 4 },
+                // A reference whose internal name contains letters that ARE arg
+                // descriptor chars (I, J, D, Z, ...) -- the 'L'...';' scan must
+                // consume them as NAME bytes, never as further args: 1 ref slot.
+                { "(LIJDZ;)V", 14, 1, 1 },
+                // Two such references back to back -> 2 slots, 2 args.
+                { "(LIJDZ;LBSCF;)V", 14, 2, 2 },
+                // Single boolean, char, byte, short returns after a mixed arg list.
+                { "(I)Z", 4, 1, 1 }, { "(I)C", 5, 1, 1 },
+                { "(I)B", 8, 1, 1 }, { "(I)S", 9, 1, 1 },
             };
             bool method_ok{ true };
             for (const method_row& mr : method_rows)
@@ -1071,6 +1278,33 @@ namespace
                 if (call_site_return_basic_type(mr.sig) != mr.ret) { method_ok = false; }
             }
             ctx.check("sigparse_method_descriptor_slot_and_return_matrix", method_ok);
+
+            // -- 8e'. The array-of-wide-vs-bare-wide slot rule, pinned in isolation
+            //    so a regression names THIS invariant precisely: a bare top-level
+            //    J / D is two slots; the SAME element under one-or-more '[' is a
+            //    single reference slot.  We compute each pair from the LIVE parser
+            //    and assert the exact delta (bare = array + 1). --
+            {
+                auto slots_of = [](const char* sig) -> int
+                {
+                    std::string_view ap{};
+                    int s{ -1 };
+                    int n{ 0 };
+                    return (args_portion(sig, ap) && count_arg_slots(ap, s, n)) ? s : -1;
+                };
+                ctx.check("sigparse_bare_long_2_slots_array_long_1_slot",
+                             slots_of("(J)V") == 2
+                          && slots_of("([J)V") == 1
+                          && slots_of("([[J)V") == 1);
+                ctx.check("sigparse_bare_double_2_slots_array_double_1_slot",
+                             slots_of("(D)V") == 2
+                          && slots_of("([D)V") == 1
+                          && slots_of("([[[D)V") == 1);
+                ctx.check("sigparse_array_of_wide_does_not_inflate_slots",
+                             slots_of("([JJ)V") == 3          // [J(1)+J(2)
+                          && slots_of("(J[J)V") == 3          // J(2)+[J(1)
+                          && slots_of("([D[J)V") == 2);       // [D(1)+[J(1)
+            }
 
             // -- 8f. A genuinely-large parameter list: 64 long args -> 64 args /
             //    128 slots, void return.  Proves the arg walk has no fixed cap and
@@ -1181,6 +1415,11 @@ namespace
                 { "(1)V",     true, false },                // digit as arg char
                 { "( )V",     true, false },                // space as arg char
                 { "(;)V",     true, false },                // stray ';'
+                { "([;)V",    true, false },                // '[' then ';' (no element type)
+                { "([Q)V",    true, false },                // array of an illegal element char
+                { "(J;)V",    true, false },                // bare J then stray ';'
+                { "(IIQ)V",   true, false },                // two good args then garbage
+                { "([ILjava/lang/String)V", true, false },  // good [I then unterminated L
                 // ')' before '(' : args_portion sees rp < lp -> false.
                 { ")(",       false, false },
                 // Well-formed empty / valid lists: BOTH succeed (control rows).
@@ -1188,6 +1427,15 @@ namespace
                 { "(I)V",     true, true },
                 { "(IJD)D",   true, true },
                 { "([[Ljava/lang/Object;)V", true, true },
+                // DEGENERATE-BUT-TOLERATED: an EMPTY-name reference 'L;' is not a
+                // legal JVM descriptor (the JVM never emits it), but the grammar
+                // walk treats 'L'..first-';' as one reference and ACCEPTS it -- the
+                // ';' at i+1 terminates the (empty) name.  Pinned so the parser's
+                // lenient acceptance of this shape is a known, non-crashing fact,
+                // not an accidental over-read.  It is a 1-slot reference.
+                { "(L;)V",    true, true },
+                { "(L;L;)V",  true, true },                 // two empty-name refs -> 2 slots
+                { "([L;)V",   true, true },                 // array of empty-name ref -> 1 slot
             };
             bool all_bad_args_graceful{ true };
             for (const bad_args& b : bad_arg_rows)
@@ -1209,6 +1457,31 @@ namespace
                 }
             }
             ctx.check("sigparse_all_malformed_arg_lists_graceful", all_bad_args_graceful);
+
+            // The empty-name-reference rows accept; pin their EXACT slot/arg counts
+            // so "tolerated as a 1-slot reference" is a named, asserted fact.
+            {
+                auto sn = [](const char* sig, int& s, int& n) -> bool
+                {
+                    std::string_view ap{};
+                    s = -1;
+                    n = -1;
+                    return args_portion(sig, ap) && count_arg_slots(ap, s, n);
+                };
+                int s1{ 0 };
+                int n1{ 0 };
+                int s2{ 0 };
+                int n2{ 0 };
+                int s3{ 0 };
+                int n3{ 0 };
+                const bool ok1{ sn("(L;)V", s1, n1) };
+                const bool ok2{ sn("(L;L;)V", s2, n2) };
+                const bool ok3{ sn("([L;)V", s3, n3) };
+                ctx.check("sigparse_empty_name_reference_is_one_slot",
+                             ok1 && s1 == 1 && n1 == 1
+                          && ok2 && s2 == 2 && n2 == 2
+                          && ok3 && s3 == 1 && n3 == 1);
+            }
 
             // -- 9c. TRUNCATION sweep: every proper prefix of a fully-formed,
             //    multi-shape descriptor is fed to BOTH surfaces.  Not one prefix

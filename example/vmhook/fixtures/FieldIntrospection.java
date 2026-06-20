@@ -42,6 +42,12 @@ public final class FieldIntrospection
     /** The action sets this true when it has run; native polls it. */
     public static volatile boolean done;
 
+    /** Forces OnlyStatic's &lt;clinit&gt; to run, so its raw static slots hold their
+        declared values when the native side reads them: a raw VMStructs static-field
+        read goes straight to the slot and does NOT trigger Java lazy class init, so an
+        only-static class that nothing else touches would read 0. */
+    public static final int onlyStaticInitForce = OnlyStatic.osInt;
+
     /**
      * Scenario selector.  The native module sets this and resets `done` BEFORE
      * raising `go` for each probe cycle.
@@ -207,10 +213,98 @@ public final class FieldIntrospection
         return this.iInt + delta;
     }
 
+    // =====================================================================
+    //  MODIFIER-BLINDNESS twins.  field_entry_t carries only offset / is_static
+    //  / signature / declaring_klass — NO general access-flag bitfield — so NONE
+    //  of the five accessors can surface JVM_ACC_VOLATILE / TRANSIENT / PRIVATE /
+    //  PUBLIC.  These fields are declared with those modifiers so the native side
+    //  can prove their {descriptor, is_static, is_reference, offset} metadata is
+    //  IDENTICAL to a plain twin of the same shape (modifier-blind), and that a
+    //  private field is still resolvable by name (visibility-blind).
+    // =====================================================================
+    /** volatile static I — same descriptor/static/non-ref as sInt. */
+    public static volatile int sVolatileInt = 0x5A5A5A5A;
+
+    /** transient instance I — transient is a heap-layout no-op for a non-array
+        field; descriptor/offset must be a normal slot exactly like iInt. */
+    public transient int iTransientInt = 0x7E7E7E7E;
+
+    /** private instance I — resolvable by name regardless of access control. */
+    @SuppressWarnings("unused")
+    private int iPrivateInt = 0x33333333;
+
+    /** private static Ljava/lang/String; — resolvable static reference. */
+    @SuppressWarnings("unused")
+    private static String sPrivateString = "private-static";
+
+    // =====================================================================
+    //  VARIED-SHAPE nested classes for field-ENUMERATION / metadata coverage.
+    //  The native module resolves each declared field BY NAME through a wrapper
+    //  registered for the nested class and asserts the metadata matches the true
+    //  Java declaration below.  Shapes: ZERO fields, ONLY-static, ONLY-instance,
+    //  and a Base/Derived pair for inherited-vs-declared scope.
+    // =====================================================================
+
+    /** ZERO declared fields — degenerate shape; every field lookup must miss
+        cleanly (nullopt), never crash. */
+    public static final class Empty
+    {
+    }
+
+    /** ONLY-static fields, one per descriptor family (primitive / String / array /
+        Object).  No instance fields at all. */
+    public static final class OnlyStatic
+    {
+        public static int     osInt    = 0x010203;
+        public static long     osLong   = 0x1020304050607080L;
+        public static String   osString = "only-static-string";
+        public static int[]    osArray  = new int[] { 1, 2, 3, 4 };
+        public static Object   osObject = new Object();
+    }
+
+    /** ONLY-instance fields — no statics.  Kept reachable through `onlyInstance`. */
+    public static final class OnlyInstance
+    {
+        public boolean oiBool   = true;
+        public int      oiInt    = 0x0C0FFEE;
+        public double   oiDouble = 7.25d;
+        public String   oiString = "only-instance-string";
+        public int[]    oiArray  = new int[] { 9, 8 };
+    }
+
+    /** Inheritance base: declares both a static and an instance field that a
+        subclass wrapper must resolve through the super-chain walk. */
+    public static class Base
+    {
+        public static int baseStatic = 0x0BA5E000;
+        public int          baseInstance = 0x0BA51;
+        public String       baseRef = "base-ref";
+    }
+
+    /** Derived: declares ONE field of its own and INHERITS Base's fields.  The
+        native side resolves both `derivedInstance` (declared HERE) and
+        `baseInstance` / `baseStatic` / `baseRef` (inherited) through a single
+        Derived wrapper, proving find_field walks the super chain and records the
+        declaring klass. */
+    public static final class Derived extends Base
+    {
+        public int derivedInstance = 0x0DE21;
+    }
+
+    /** A single live OnlyInstance the native side wraps for instance-field
+        metadata introspection on the only-instance shape. */
+    public static volatile OnlyInstance onlyInstance;
+
+    /** A single live Derived the native side wraps for the inherited-vs-declared
+        scope checks. */
+    public static volatile Derived derived;
+
     static
     {
         sSelfRef = new FieldIntrospection();
         instance = new FieldIntrospection();
+        onlyInstance = new OnlyInstance();
+        derived = new Derived();
         publishWitnesses();
 
         Harness.register(new Harness.Probe()

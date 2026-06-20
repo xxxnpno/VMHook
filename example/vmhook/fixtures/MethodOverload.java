@@ -37,15 +37,23 @@ import vmhook.Harness;
  *     class resolves to exactly its overload,
  *   - ARITY overloads: pick() / pick(int) / pick(int,int) / pick(int,int,int)
  *     all share the name "pick" and are told apart purely by argument count,
+ *     including the HIGH-arity pair pick(int x8) / pick(int x9) that straddles
+ *     the 8-jvalue interpreter/JNI argument-packing boundary,
  *   - two-arg type-order overloads: pick(int,long) vs pick(long,int) vs
  *     pick(int,String) vs pick(String,int) vs pick(long,double) — proves the
  *     matcher checks EACH parameter slot (primitive AND reference), respects
  *     ORDER (int,String vs String,int share a type multiset but differ by slot),
  *     and walks two CONSECUTIVE wide (two-slot) params (long,double -> "(JD)I"),
- *   - ARRAY-vs-scalar overloads: pick(int[]) / pick(long[]) ("[I" / "[J") sit
- *     alongside pick(int) / pick(long) so the native side proves the resolver's
- *     array-token parser walks past a '[' descriptor when matching a scalar arg
- *     and reaches the array body for an explicit "([I)I" / "([J)I" call,
+ *   - same-type two-arg overloads: pick(double,double) / pick(float,float) /
+ *     pick(boolean,boolean) and the two-reference shapes pick(Object,Object) /
+ *     pick(Integer,Integer) — each pair told apart from the mixed pairs and from
+ *     each other purely by per-slot descriptor, with both same-width slots proven
+ *     to survive independently,
+ *   - ARRAY-vs-scalar overloads: pick(int[]) / pick(long[]) / pick(char[])
+ *     ("[I" / "[J" / "[C") sit alongside pick(int) / pick(long) / pick(char) so
+ *     the native side proves the resolver's array-token parser walks past a '['
+ *     descriptor when matching a scalar arg and reaches the array body for an
+ *     explicit "([I)I" / "([J)I" / "([C)I" call,
  *   - per-overload boundary values (INT_MIN/MAX, LONG_MIN/MAX, the float-vs-
  *     double-vs-int-vs-long ambiguity of the literal 3) recorded via lastArg*,
  *   - STATIC overloads mirrored as spick(...) so the native side can exercise
@@ -114,11 +122,33 @@ public final class MethodOverload
     //   long+double adjacency — is owned by the method_call_wide_args module's
     //   jd/dj/addD/mixD methods; this overload exists so the RESOLVER's two-wide
     //   parameter walk is exercised in the overload-disambiguation module.)
-    // Array overloads: descriptor "[I" / "[J" — a leading '[' the matcher must
-    // parse via next_argument_descriptor's array branch and treat as DISTINCT
-    // from the scalar "I" / "J" overloads (array-vs-scalar disambiguation).
+    // Array overloads: descriptor "[I" / "[J" / "[C" — a leading '[' the matcher
+    // must parse via next_argument_descriptor's array branch and treat as DISTINCT
+    // from the scalar "I" / "J" / "C" overloads (array-vs-scalar disambiguation).
     public static final int RET_INT_ARRAY   = 1031;  // pick(int[])
     public static final int RET_LONG_ARRAY  = 1032;  // pick(long[])
+    public static final int RET_CHAR_ARRAY  = 1033;  // pick(char[])  — a THIRD array
+    //   element type "[C", so the array-token parser is exercised on more than the
+    //   {int,long} pair and a char[] resolves DISTINCTLY from int[]/long[].
+
+    // Same-type two-arg shapes the resolver must tell apart from the mixed-type
+    // pairs above (and from each other) purely by their per-slot descriptors.
+    public static final int RET_DOUBLE_DOUBLE = 1041;  // pick(double,double)  "(DD)I"
+    public static final int RET_FLOAT_FLOAT   = 1042;  // pick(float,float)    "(FF)I"
+    public static final int RET_BOOL_BOOL     = 1043;  // pick(boolean,boolean)"(ZZ)I"
+    // Two-REFERENCE overloads: each slot's reference CLASS is matched, so a
+    // (Object,Object) call must NOT collapse onto (Integer,Integer) and vice
+    // versa — per-slot 'L...;' discrimination in a two-reference shape.
+    public static final int RET_OBJ_OBJ       = 1044;  // pick(Object,Object)
+    public static final int RET_INT_INT_REFS  = 1045;  // pick(Integer,Integer)
+
+    // High-arity overloads that straddle the 8-argument interpreter/JNI packing
+    // boundary: pick(int x8) fills exactly eight jvalue slots, pick(int x9) needs
+    // a ninth.  Resolution must disambiguate them from each other and from the
+    // lower arities purely by argument COUNT; the native side also proves every
+    // slot's value survived (echoed via lastArgCount + lastArgFirst/lastArgLast).
+    public static final int RET_INT8  = 1051;  // pick(int x8)  "(IIIIIIII)I"
+    public static final int RET_INT9  = 1052;  // pick(int x9)  "(IIIIIIIII)I"
 
     // Static twins reuse the SAME sentinels + a +100 bias so the native side
     // can tell an instance hit from a static hit even if a JDK quirk routed one
@@ -142,6 +172,19 @@ public final class MethodOverload
     // native side can prove the right array landed in the right (array) slot.
     public static volatile int     lastArrayLen;
     public static volatile long    lastArrayHead;
+    // High-arity echoes: the argument COUNT plus the FIRST and LAST argument of
+    // the last variadic-shaped pick(int x8)/(int x9) call, so the native side can
+    // prove that the 8th/9th slot did not get dropped or aliased at the packing
+    // boundary.  (The fixture itself sums nothing — it records the edge slots.)
+    public static volatile int     lastArgCount;
+    public static volatile int     lastArgFirst;
+    public static volatile int     lastArgLast;
+    // Same-type two-arg echoes: the two double/float/boolean operands of the last
+    // (DD)/(FF)/(ZZ) call, so the native side proves both same-width slots survived
+    // distinctly (a second double slot must not overwrite the first).
+    public static volatile double  lastDoubleArgB;
+    public static volatile float   lastFloatArgB;
+    public static volatile boolean lastBoolArgB;
 
     // ── The hook site ──────────────────────────────────────────────────────
     /**
@@ -198,6 +241,43 @@ public final class MethodOverload
     // must reach exactly these bodies.  echoed via lastArrayLen / lastArrayHead.
     public int pick(final int[] a)  { lastArrayLen = (a == null ? -1 : a.length); lastArrayHead = (a == null || a.length == 0 ? 0L : a[0]);          return RET_INT_ARRAY;  }
     public int pick(final long[] a) { lastArrayLen = (a == null ? -1 : a.length); lastArrayHead = (a == null || a.length == 0 ? 0L : a[0]);          return RET_LONG_ARRAY; }
+    // THIRD array element type "[C": a char[] must resolve distinctly from the
+    // int[]/long[] arrays AND from the scalar char overload (the array-token
+    // parser walks the leading '[' then matches 'C').  Head echoed as an int.
+    public int pick(final char[] a) { lastArrayLen = (a == null ? -1 : a.length); lastArrayHead = (a == null || a.length == 0 ? 0L : (long) a[0]); return RET_CHAR_ARRAY; }
+
+    // ── Same-type two-arg overloads (per-slot descriptor disambiguation) ────
+    // Two wide FP slots "(DD)I": both doubles echoed to prove they did not
+    // overlap (the second must not clobber the first).
+    public int pick(final double a, final double b) { lastDoubleArg = a; lastDoubleArgB = b; return RET_DOUBLE_DOUBLE; }
+    // Two narrow FP slots "(FF)I".
+    public int pick(final float a, final float b)   { lastFloatArg = a;  lastFloatArgB = b;  return RET_FLOAT_FLOAT; }
+    // Two boolean slots "(ZZ)I" — the narrowest primitive pair.
+    public int pick(final boolean a, final boolean b) { lastBoolArg = a; lastBoolArgB = b;   return RET_BOOL_BOOL; }
+    // Two-REFERENCE shapes: each slot's reference CLASS is matched, so a wrapper
+    // registered as java/lang/Object resolves to pick(Object,Object) and one
+    // registered as java/lang/Integer to pick(Integer,Integer) — never the other.
+    // Bodies ignore the oops (resolution-only; the native side may pass oops of a
+    // different runtime type, as with the single-reference Object/Integer picks).
+    public int pick(final Object a, final Object b)   { return RET_OBJ_OBJ; }
+    public int pick(final Integer a, final Integer b) { return RET_INT_INT_REFS; }
+
+    // ── High-arity overloads straddling the 8-argument packing boundary ─────
+    // pick(int x8) fills exactly eight jvalue slots; pick(int x9) needs a ninth.
+    // The resolver tells them apart purely by arg COUNT.  Echo the count and the
+    // first/last operand so the native side proves no slot was dropped or aliased.
+    public int pick(final int a, final int b, final int c, final int d,
+                    final int e, final int f, final int g, final int h)
+    {
+        lastArgCount = 8; lastArgFirst = a; lastArgLast = h;
+        return RET_INT8;
+    }
+    public int pick(final int a, final int b, final int c, final int d,
+                    final int e, final int f, final int g, final int h, final int i)
+    {
+        lastArgCount = 9; lastArgFirst = a; lastArgLast = i;
+        return RET_INT9;
+    }
 
     // ── Static overloads: ALL named "spick" ────────────────────────────────
     // Mirrors the instance "pick" set across the FULL primitive descriptor set
@@ -224,6 +304,16 @@ public final class MethodOverload
     // distinct from any single-wide or narrow static overload.  RESOLUTION focus;
     // wide-slot packing fidelity is owned by method_call_wide_args.
     public static int spick(final long a, final double b) { lastArg2B = a; lastDoubleArg = b; return RET_LONG_DOUBLE + SBIAS; }
+    // STATIC high-arity twin straddling the 8-arg boundary: spick(int x8) must be
+    // selected by an 8-int static call (and told from every lower static arity),
+    // exercising the static call packer at exactly eight jvalue slots.  Echoes the
+    // count + edge operands (shared lastArg* fields) like its instance twin.
+    public static int spick(final int a, final int b, final int c, final int d,
+                            final int e, final int f, final int g, final int h)
+    {
+        lastArgCount = 8; lastArgFirst = a; lastArgLast = h;
+        return RET_INT8 + SBIAS;
+    }
 
     // ── A method with exactly ONE signature, for the no-overload baseline ──
     // Single signature => no ambiguity => resolves on every path.  The native

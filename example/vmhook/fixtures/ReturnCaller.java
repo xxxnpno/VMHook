@@ -64,6 +64,25 @@ import vmhook.Harness;
  *        cycle: every fire must report the identical class/method/signature AND
  *        the identical Method* — the stability dual of mode 6's distinctness,
  *        and caller() must be idempotent within a single detour
+ *  14  = caller with an OBJECT return type objRetCaller(int)->inner, descriptor
+ *        "(I)Ljava/lang/String;" — every other caller returns int, so this proves
+ *        caller().signature decodes the RETURN type (a reference one), not just
+ *        the parameter list
+ *  15  = caller returning VOID voidRetCaller(int)->inner, descriptor "(I)V" — the
+ *        return tail is the single letter V, distinct from every "(...)I"/"(...)J"
+ *        caller, proving the void return descriptor survives the decode
+ *  16  = caller returning a WIDE primitive wideRetCaller(int)->inner, descriptor
+ *        "(I)J" — the return slot is a 64-bit long, the return-type analogue of
+ *        mode 7's (J)I wide PARAM
+ *  17  = a FIXED shallow chain capTop(int)->capMid(int)->inner exercised with
+ *        EXPLICIT stack_trace caps: stack_trace(1/2/3) truncation + the magic
+ *        stack_trace(0)->64 promotion contract (this module otherwise only ever
+ *        calls the default-cap stack_trace())
+ *  18  = two DISTINCT callers discrimA(int)->inner then discrimB(int)->inner in
+ *        one cycle (like mode 6) but used for the trace EXCLUSION invariant:
+ *        fire 0's trace must NOT name discrimB and fire 1's must NOT name discrimA
+ *        (a trace cannot contain a frame that is not on its chain — HARD even
+ *        under JIT inlining, which can only REMOVE frames, never add a foreign one)
  *
  * Java 8 syntax only (no var / records / switch-expr / text-blocks).
  */
@@ -110,6 +129,12 @@ public final class ReturnCaller
     public static final int  ARG_CTOR      = 21;
     public static final int  ARG_STATIC    = 22;
     public static final int  ARG_STABLE    = 23;
+    public static final int  ARG_OBJRET    = 24;
+    public static final int  ARG_VOIDRET   = 25;
+    public static final int  ARG_WIDERET   = 26;
+    public static final int  ARG_CAP       = 27;
+    public static final int  ARG_DISCRIM_A = 28;
+    public static final int  ARG_DISCRIM_B = 29;
 
     /** How many times the stable() caller fires the leaf this cycle (mode 13). */
     public static final int STABLE_FIRES = 3;
@@ -316,6 +341,76 @@ public final class ReturnCaller
         return this.inner(x) + 1;
     }
 
+    // ---- mode 14: caller with an OBJECT return type -------------------------
+
+    /**
+     * Caller whose descriptor RETURNS a reference type:
+     * "(I)Ljava/lang/String;".  Every other caller returns int, so this is the
+     * only one proving caller().signature decodes a reference RETURN type, not
+     * just the parameter list.  The returned String is published so javac cannot
+     * fold the call away.
+     */
+    public String objRetCaller(final int x)
+    {
+        final int r = this.inner(x);
+        return Integer.toString(r);
+    }
+
+    // ---- mode 15: caller returning void -------------------------------------
+
+    /**
+     * Caller whose descriptor RETURNS void: "(I)V".  The single-letter V return
+     * tail is distinct from every "(...)I" / "(...)J" caller, proving the void
+     * return descriptor survives the decode verbatim.
+     */
+    public void voidRetCaller(final int x)
+    {
+        ReturnCaller.voidSink = this.inner(x);
+    }
+
+    // ---- mode 16: caller returning a wide primitive -------------------------
+
+    /**
+     * Caller whose descriptor RETURNS a wide primitive long: "(I)J".  This is the
+     * return-type analogue of mode 7's (J)I wide PARAM — proving a 64-bit return
+     * slot decodes to the single letter J in the descriptor tail.
+     */
+    public long wideRetCaller(final int x)
+    {
+        return (long) this.inner(x) * 3L;
+    }
+
+    // ---- mode 17: a fixed shallow chain for explicit-cap stack_trace ---------
+
+    /** Top of the fixed shallow chain for mode 17 (one frame above capMid). */
+    public int capTop(final int x)
+    {
+        return this.capMid(x + 1) + 1;
+    }
+
+    /** Immediate caller of inner in the mode-17 fixed shallow chain. */
+    public int capMid(final int x)
+    {
+        return this.inner(x + 1) + 1;
+    }
+
+    // ---- mode 18: two distinct callers for the trace EXCLUSION invariant ----
+
+    /** First distinct caller for the mode-18 exclusion test. */
+    public int discrimA(final int x)
+    {
+        return this.inner(x) + 1;
+    }
+
+    /** Second distinct caller for the mode-18 exclusion test. */
+    public int discrimB(final int x)
+    {
+        return this.inner(x) + 2;
+    }
+
+    /** Keeps voidRetCaller's leaf result observable (mode 15). */
+    public static volatile int voidSink;
+
     // ---- scenario runners ---------------------------------------------------
 
     private void runOuterA()
@@ -427,8 +522,48 @@ public final class ReturnCaller
         }
     }
 
+    private void runObjRetCaller()
+    {
+        observed = 0;
+        innerCalls = 0;
+        ReturnCaller.objSink = this.objRetCaller(ARG_OBJRET);
+    }
+
+    private void runVoidRetCaller()
+    {
+        observed = 0;
+        innerCalls = 0;
+        this.voidRetCaller(ARG_VOIDRET);
+    }
+
+    private void runWideRetCaller()
+    {
+        observed = 0;
+        innerCalls = 0;
+        ReturnCaller.wideSink = this.wideRetCaller(ARG_WIDERET);
+    }
+
+    private void runCapChain()
+    {
+        observed = 0;
+        innerCalls = 0;
+        this.capTop(ARG_CAP);
+    }
+
+    private void runDiscrim()
+    {
+        observed = 0;
+        innerCalls = 0;
+        this.discrimA(ARG_DISCRIM_A);
+        this.discrimB(ARG_DISCRIM_B);
+    }
+
     /** Keeps the warmup loop from being optimised away. */
     public static volatile int warmSink;
+
+    /** Sinks keeping the mode 14/16 caller results observable. */
+    public static volatile String objSink;
+    public static volatile long   wideSink;
 
     static
     {
@@ -484,6 +619,21 @@ public final class ReturnCaller
                         break;
                     case 13:
                         probe.runStableCaller();
+                        break;
+                    case 14:
+                        probe.runObjRetCaller();
+                        break;
+                    case 15:
+                        probe.runVoidRetCaller();
+                        break;
+                    case 16:
+                        probe.runWideRetCaller();
+                        break;
+                    case 17:
+                        probe.runCapChain();
+                        break;
+                    case 18:
+                        probe.runDiscrim();
                         break;
                     default:
                         break;

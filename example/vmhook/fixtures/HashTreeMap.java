@@ -3,6 +3,7 @@ package vmhook.fixtures;
 import vmhook.Harness;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.TreeMap;
 
 /**
@@ -166,6 +167,34 @@ public final class HashTreeMap
     public static HashMap<String, String> hashNull     = null;
 
     // =======================================================================
+    //  Batch-16 deepening — additional small HashMap shapes (all heap-modest).
+    // =======================================================================
+
+    /**
+     * EXACTLY 8 colliding keys in ONE bucket.  8 is the treeify THRESHOLD, but
+     * at the default capacity 16 the table resizes (MIN_TREEIFY_CAPACITY = 64)
+     * instead of treeifying, so the bin stays a plain {@code Node.next} chain.
+     * This pins the boundary opposite hashColl7 (7) and hashTreeBin (12).
+     */
+    public static HashMap<String, String> hashColl8    = new HashMap<String, String>();
+
+    /** LinkedHashMap (insertion-order map) — reuses HashMap.table; walked via the
+     *  same "table" fast path.  Built {ka,kb,kc,kd} so the native side can prove
+     *  CONTENT completeness (HARD) while recording iteration order [INFO]. */
+    public static LinkedHashMap<String, String> linkedSmall = new LinkedHashMap<String, String>();
+
+    /** Empty LinkedHashMap — the "table" field resolves but is lazily null. */
+    public static LinkedHashMap<String, String> linkedEmpty = new LinkedHashMap<String, String>();
+
+    /** One null KEY, one null VALUE, AND one normal entry in the SAME map (both
+     *  legal in HashMap).  Both nullptr sentinels must coexist; count == 3. */
+    public static HashMap<String, String> hashNullBoth = new HashMap<String, String>();
+
+    /** Empty-string KEY and empty-string VALUE (adversarial but legal content;
+     *  read_java_string must decode the zero-length String). */
+    public static HashMap<String, String> hashEmptyStr = new HashMap<String, String>();
+
+    // =======================================================================
     //  TreeMap shapes — String key/value unless noted.
     // =======================================================================
 
@@ -186,6 +215,14 @@ public final class HashTreeMap
 
     /** A declared TreeMap field deliberately left NULL (walk must stay empty). */
     public static TreeMap<String, String> treeNull        = null;
+
+    /** Single-node TreeMap (root with null left/right); first == last. */
+    public static TreeMap<String, String> treeOneNode    = new TreeMap<String, String>();
+
+    /** Integer keys spanning NEGATIVE through positive, inserted scrambled.  The
+     *  in-order walk must yield SIGNED-numeric ascending (-5..4); a lexicographic
+     *  or unsigned sort would mis-order the negatives. */
+    public static TreeMap<Integer, Integer> treeSigned   = new TreeMap<Integer, Integer>();
 
     // =======================================================================
     //  Published cross-check witnesses (size oracle + order-independent sums).
@@ -216,6 +253,19 @@ public final class HashTreeMap
     public static volatile int treeDescendingSize;
     public static volatile int treeNullValSize;
     public static volatile int treeIntKeySize;
+
+    // Batch-16 deepening witnesses.
+    public static volatile int hashColl8Size;
+    public static volatile boolean hashColl8IsTree;
+    public static volatile int linkedSmallSize;
+    public static volatile int linkedEmptySize;
+    public static volatile int hashNullBothSize;
+    public static volatile int hashEmptyStrSize;
+    public static volatile int treeOneNodeSize;
+    public static volatile String treeOneNodeKey;
+    public static volatile int treeSignedSize;
+    public static volatile int treeSignedFirst;   // signed min key (-5)
+    public static volatile int treeSignedLast;    // signed max key (4)
 
     /** Order-independent key code-unit sums for the larger HashMaps. */
     public static volatile long hashThousandKeyCharSum;
@@ -520,6 +570,62 @@ public final class HashTreeMap
         treeIntKeyLast = treeIntKey.lastKey().intValue();
 
         treeNull = null;
+
+        // ---- Batch-16 deepening shapes (all small, built ONCE) -------------
+
+        // EXACTLY 8 colliding keys: 8 == treeify threshold, but at default cap 16
+        // the table resizes instead (MIN_TREEIFY_CAPACITY 64), so the bin stays a
+        // plain Node.next chain.  The walk must surface all 8 across the rehash.
+        hashColl8 = new HashMap<String, String>();
+        final String[] coll8 = collidingKeys(N8);
+        for (int i = 0; i < coll8.length; ++i)
+        {
+            hashColl8.put(coll8[i], "e" + i);
+        }
+        hashColl8Size = hashColl8.size();
+        hashColl8IsTree = hasTreeNodeBin(hashColl8);   // expect false (resized, not treeified)
+
+        // LinkedHashMap (insertion order) — same HashMap.table layout.  The walk
+        // returns BUCKET order, not insertion order; native records that [INFO].
+        linkedSmall = new LinkedHashMap<String, String>();
+        linkedSmall.put("ka", "wa");
+        linkedSmall.put("kb", "wb");
+        linkedSmall.put("kc", "wc");
+        linkedSmall.put("kd", "wd");
+        linkedSmallSize = linkedSmall.size();
+
+        linkedEmpty = new LinkedHashMap<String, String>();
+        linkedEmptySize = linkedEmpty.size();
+
+        // One null KEY, one null VALUE, one normal entry — both sentinels coexist.
+        hashNullBoth = new HashMap<String, String>();
+        hashNullBoth.put(null, "vnull");        // null key -> real value
+        hashNullBoth.put("realkey", null);      // real key -> null value
+        hashNullBoth.put("both", "ok");         // normal entry
+        hashNullBothSize = hashNullBoth.size();
+
+        // Empty-string key AND empty-string value (legal; zero-length Strings).
+        hashEmptyStr = new HashMap<String, String>();
+        hashEmptyStr.put("", "");               // "" -> ""
+        hashEmptyStr.put("nonempty", "x");      // a normal sibling so size == 2
+        hashEmptyStrSize = hashEmptyStr.size();
+
+        // Single-node TreeMap (root with null left/right).
+        treeOneNode = new TreeMap<String, String>();
+        treeOneNode.put("only", "solo");
+        treeOneNodeSize = treeOneNode.size();
+        treeOneNodeKey = treeOneNode.firstKey();
+
+        // Integer TreeMap spanning NEGATIVE through positive, inserted scrambled.
+        treeSigned = new TreeMap<Integer, Integer>();
+        final int[] signedOrder = { 3, -2, 0, -5, 4, 1, -1, 2, -3, -4 };
+        for (int i = 0; i < signedOrder.length; ++i)
+        {
+            treeSigned.put(Integer.valueOf(signedOrder[i]), Integer.valueOf(signedOrder[i] * 2));
+        }
+        treeSignedSize = treeSigned.size();
+        treeSignedFirst = treeSigned.firstKey().intValue();   // -5
+        treeSignedLast = treeSigned.lastKey().intValue();      // 4
     }
 
     /**

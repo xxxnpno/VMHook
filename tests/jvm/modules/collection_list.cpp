@@ -371,6 +371,19 @@ namespace
     // Mixed-shape nested list (Vector inner + COW inner).
     constexpr std::int32_t NESTED_MIX_OUTER{ 2 };
 
+    // Aliased-duplicate lists (same Elem object at every slot).
+    constexpr std::int32_t ALIAS_LEN{ 4 };
+    constexpr std::int32_t ALIAS_VAL{ 7 };
+
+    // Heterogeneous List<Object> (String,Integer,Elem,null,Elem).
+    constexpr std::int32_t HETERO_LEN{ 5 };
+    constexpr std::int32_t HETERO_NULL_AT{ 3 };
+
+    // Shuffled-insertion-order lists.  SHUF_ORDER is a fixed non-sorted
+    // permutation of 0..SHUF_LEN-1 kept in lockstep with CollList.java.
+    constexpr std::int32_t SHUF_LEN{ 6 };
+    constexpr std::int32_t SHUF_ORDER[]{ 3, 0, 5, 1, 4, 2 };
+
     // Generous wall-clock ceiling for the BIG-node LinkedList walk.  A linear
     // walk is sub-millisecond; even a heavily-loaded CI box stays well under
     // this.  A quadratic per-node regression would blow far past it, so this is
@@ -1001,6 +1014,65 @@ namespace
     std::int32_t g_nested_mix_outer_n{ -1 };
     std::int32_t g_nested_mix_inner_ok{ 0 };
     bool         g_nested_mix_distinct{ true };
+
+    // Aliased-duplicate lists: ONE Elem at every slot.  Walk must emit the SAME
+    // OOP ALIAS_LEN times (no dedup, no slot dropped); since the slots ARE the
+    // same heap object, distinct_ok is EXPECTED false here — that is the
+    // legitimate-repeated-OOP case, not a cycle.  We assert size / non-null /
+    // values, and that exactly ONE unique OOP backs all the slots.
+    list_obs     g_arr_alias;
+    list_obs     g_link_alias;
+    std::int32_t g_arr_alias_unique_oops{ -1 };
+    std::int32_t g_link_alias_unique_oops{ -1 };
+    bool         g_arr_alias_all_val{ false };
+    bool         g_link_alias_all_val{ false };
+
+    // Heterogeneous List<Object>: one decoded OOP per slot regardless of class.
+    list_obs     g_hetero;                  // observed count-only (varied types)
+    std::int32_t g_hetero_nonnull{ -1 };
+    std::int32_t g_hetero_null_at{ -2 };
+    bool         g_hetero_elem_slots_ok{ false };  // indices 2 & 4 are valid Elems
+    bool         g_hetero_elem4_id_ok{ false };    // index 4 Elem has id == 4
+
+    // Shuffled-insertion-order lists: vec[k].id == SHUF_ORDER[k] (insertion, not
+    // sorted).  insertion_ok proves the walk preserves insertion order.
+    list_obs g_arr_shuffled;
+    list_obs g_link_shuffled;
+    bool     g_arr_shuf_insertion_ok{ false };
+    bool     g_link_shuf_insertion_ok{ false };
+
+    // Size-1 null-only lists (the smallest "has a null" case).
+    list_obs g_arr_single_null;
+    list_obs g_link_single_null;
+
+    // get_array_element bounds probe: reading an index AT and PAST the real
+    // backing-array length must yield compressed-0 (-> nullptr), never an OOB
+    // read.  Recorded as booleans the assertion block checks HARD.
+    bool g_bounds_in_range_nonzero{ false };  // index 0 of a non-empty array != 0
+    bool g_bounds_at_length_zero{ false };    // index == length -> 0
+    bool g_bounds_past_length_zero{ false };  // index == length+7 -> 0
+    bool g_bounds_negative_zero{ false };     // negative index -> 0
+
+    // Adversarial / degenerate walk inputs that must NOT crash and must return an
+    // EMPTY vector (wrong-shape / non-list OOP / nullptr).  Each records the
+    // decoded size; the assertion block proves 0 + no crash (we reached the check).
+    std::int32_t g_adv_null_arraylist{ -1 };   // walk_arraylist(nullptr)
+    std::int32_t g_adv_null_linkedlist{ -1 };  // walk_linkedlist(nullptr, n)
+    std::int32_t g_adv_elem_as_list{ -1 };     // walk_arraylist(an Elem OOP)
+    std::int32_t g_adv_string_as_list{ -1 };   // walk_list_by_shape(a String OOP)
+    std::int32_t g_adv_array_as_list{ -1 };    // walk_arraylist(an Object[] OOP)
+    std::int32_t g_adv_linked_bogus_n{ -1 };   // walk_linkedlist(empty, huge n)
+    std::int32_t g_adv_shape_null{ -1 };       // walk_list_by_shape(nullptr)
+    bool         g_adv_reached_end{ false };    // all adversarial calls returned
+
+    // Size-as-oracle: emitted element count == the list's own published size().
+    bool g_oracle_arr_many{ false };
+    bool g_oracle_link_many{ false };
+    bool g_oracle_arr_thousand{ false };
+    bool g_oracle_link_thousand{ false };
+    bool g_oracle_arr_alias{ false };
+    bool g_oracle_hetero{ false };
+    bool g_oracle_arr_shuffled{ false };
 
     // ── PUBLIC value_t::to_vector entry-point observations ───────────────────
     // The library's PUBLIC field-to-vector entry (field_proxy::value_t::to_vector,
@@ -1771,6 +1843,217 @@ namespace
             g_nested_mix_inner_ok = inner_ok;
         }
 
+        // ── Aliased-duplicate lists: the SAME Elem at every slot ─────────────
+        // The decoded element OOP is LEGITIMATELY identical across all slots, so
+        // the walk must still emit ALIAS_LEN slots (no dedup) each carrying the
+        // SAME OOP and value ALIAS_VAL.  We count the UNIQUE OOPs (must be 1) and
+        // the value of every slot (must be ALIAS_VAL).  This separates an honest
+        // repeated reference from the cycle/dup-node corruption the distinctness
+        // check guards: a real list of one aliased object is NOT corruption.
+        {
+            const auto observe_alias{ [](list_obs& o,
+                                         const std::vector<std::unique_ptr<elem_object>>& v,
+                                         std::int32_t& unique_oops, bool& all_val) -> void
+            {
+                o.seen = true;
+                o.size = static_cast<std::int32_t>(v.size());
+                std::int32_t non_null{ 0 };
+                std::int32_t null_count{ 0 };
+                bool vals_ok{ !v.empty() };
+                std::unordered_set<const void*> seen_oops;
+                for (const auto& up : v)
+                {
+                    const elem_object* const e{ up.get() };
+                    if (e == nullptr) { ++null_count; vals_ok = false; continue; }
+                    ++non_null;
+                    if (e->id() != ALIAS_VAL) { vals_ok = false; }
+                    seen_oops.insert(static_cast<const void*>(e->get_instance()));
+                }
+                o.non_null = non_null;
+                o.null_count = null_count;
+                unique_oops = static_cast<std::int32_t>(seen_oops.size());
+                all_val = vals_ok;
+            } };
+            observe_alias(g_arr_alias, walk_arraylist(list_oop_of("arrAlias")),
+                          g_arr_alias_unique_oops, g_arr_alias_all_val);
+            {
+                void* const o{ list_oop_of("linkAlias") };
+                observe_alias(g_link_alias,
+                              walk_linkedlist(o, read_int_field(o, "size", 0)),
+                              g_link_alias_unique_oops, g_link_alias_all_val);
+            }
+        }
+
+        // ── Heterogeneous List<Object>: String,Integer,Elem,null,Elem ───────
+        // One decoded OOP per slot regardless of the slot's runtime class; the
+        // null slot becomes nullptr.  We only interpret the two REAL Elem slots
+        // (indices 2 and 4) through the Elem wrapper — index 4 carries id == 4.
+        {
+            std::vector<std::unique_ptr<elem_object>> hetero{
+                walk_arraylist(list_oop_of("heteroList")) };
+            observe_count_only(g_hetero, hetero);
+            std::int32_t nonnull{ 0 };
+            std::int32_t first_null{ -1 };
+            for (std::size_t k{ 0 }; k < hetero.size(); ++k)
+            {
+                if (hetero[k].get() == nullptr)
+                {
+                    if (first_null < 0) { first_null = static_cast<std::int32_t>(k); }
+                    continue;
+                }
+                ++nonnull;
+            }
+            g_hetero_nonnull = nonnull;
+            g_hetero_null_at = first_null;
+            // Slots 2 and 4 are the genuine Elem objects: both must be present,
+            // distinct, valid; slot 4's id reads back as 4 through the Elem wrapper.
+            const bool have_slots{ hetero.size() == static_cast<std::size_t>(HETERO_LEN) };
+            const elem_object* const e2{ have_slots ? hetero[2].get() : nullptr };
+            const elem_object* const e4{ have_slots ? hetero[4].get() : nullptr };
+            g_hetero_elem_slots_ok =
+                e2 != nullptr && e4 != nullptr
+                && e2->get_instance() != e4->get_instance();
+            g_hetero_elem4_id_ok = (e4 != nullptr) && (e4->id() == 4);
+        }
+
+        // ── Shuffled-insertion-order lists: vec[k].id == SHUF_ORDER[k] ───────
+        // Proves the walk preserves INSERTION order, not sorted order.  The ids
+        // were added in the SHUF_ORDER permutation (non-ascending), so a sorted
+        // or reordered walk would read a wrong id at some position.
+        {
+            const auto observe_shuffled{ [](list_obs& o,
+                                            const std::vector<std::unique_ptr<elem_object>>& v,
+                                            bool& insertion_ok) -> void
+            {
+                o.seen = true;
+                o.size = static_cast<std::int32_t>(v.size());
+                std::int32_t non_null{ 0 };
+                bool ins_ok{ static_cast<std::int32_t>(v.size()) == SHUF_LEN };
+                for (std::size_t k{ 0 }; k < v.size(); ++k)
+                {
+                    const elem_object* const e{ v[k].get() };
+                    if (e == nullptr) { ins_ok = false; continue; }
+                    ++non_null;
+                    if (k >= static_cast<std::size_t>(SHUF_LEN)
+                        || e->id() != SHUF_ORDER[k])
+                    {
+                        ins_ok = false;
+                    }
+                }
+                o.non_null = non_null;
+                o.null_count = o.size - non_null;
+                insertion_ok = ins_ok;
+            } };
+            observe_shuffled(g_arr_shuffled, walk_arraylist(list_oop_of("arrShuffled")),
+                             g_arr_shuf_insertion_ok);
+            {
+                void* const o{ list_oop_of("linkShuffled") };
+                observe_shuffled(g_link_shuffled,
+                                 walk_linkedlist(o, read_int_field(o, "size", 0)),
+                                 g_link_shuf_insertion_ok);
+            }
+        }
+
+        // ── Size-1 null-only lists (smallest "has a null") ──────────────────
+        observe(g_arr_single_null, walk_arraylist(list_oop_of("arrSingleNull")), true);
+        {
+            void* const o{ list_oop_of("linkSingleNull") };
+            observe(g_link_single_null,
+                    walk_linkedlist(o, read_int_field(o, "size", 0)), true);
+        }
+
+        // ── get_array_element bounds probe (direct) ─────────────────────────
+        // get_array_element bounds-checks `index` against the real array_length
+        // and returns T{} (compressed 0 -> nullptr) for any index >= length or < 0.
+        // Probe the elemArray backing array directly at index 0 (in range), at the
+        // length (one past the last valid), well past it, and at a negative index.
+        {
+            void* const arr{ list_oop_of("elemArray") };   // a real Object[] OOP
+            if (arr && vmhook::hotspot::is_valid_pointer(arr))
+            {
+                const std::int32_t len{ vmhook::array_length(arr) };
+                g_bounds_in_range_nonzero =
+                    (len > 0)
+                    && (vmhook::get_array_element<std::uint32_t>(arr, 0) != 0u);
+                g_bounds_at_length_zero =
+                    (vmhook::get_array_element<std::uint32_t>(arr, len) == 0u);
+                g_bounds_past_length_zero =
+                    (vmhook::get_array_element<std::uint32_t>(arr, len + 7) == 0u);
+                g_bounds_negative_zero =
+                    (vmhook::get_array_element<std::uint32_t>(arr, -1) == 0u);
+            }
+        }
+
+        // ── Adversarial / degenerate walk inputs: must NOT crash, must be empty.
+        // Feed the walks nullptr, a non-list OOP (an Elem), a String, a raw
+        // Object[], and an absurd LinkedList size.  Each walk gates on field
+        // presence / is_valid_pointer, so a wrong-shape OOP yields an empty vector
+        // (no recognised backing field) and a nullptr yields empty immediately —
+        // never a crash, cycle, or OOB.  Reaching g_adv_reached_end proves no call
+        // faulted.  (This is the crash-safety HARD angle on the walk surface.)
+        {
+            g_adv_null_arraylist =
+                static_cast<std::int32_t>(walk_arraylist(nullptr).size());
+            g_adv_null_linkedlist =
+                static_cast<std::int32_t>(walk_linkedlist(nullptr, MANY).size());
+            g_adv_shape_null =
+                static_cast<std::int32_t>(walk_list_by_shape(nullptr, 0).size());
+
+            // A real Elem OOP (no "size"/"elementData"/"first" -> empty).  Reuse
+            // the singleton's ELEM_CLASS_PIN-independent route: read one element
+            // out of arrSingle as a concrete non-list OOP.
+            std::vector<std::unique_ptr<elem_object>> one{
+                walk_arraylist(list_oop_of("arrSingle")) };
+            void* const elem_oop{ (!one.empty() && one[0]) ? one[0]->get_instance()
+                                                            : nullptr };
+            g_adv_elem_as_list =
+                static_cast<std::int32_t>(walk_arraylist(elem_oop).size());
+
+            // A String OOP (from strList slot 0): wrong shape for every backing.
+            void* const str_list{ list_oop_of("strList") };
+            void* const str_oop{ read_ref_field_oop(str_list, "elementData") };
+            // str_oop is the backing Object[]; route it through walk_list_by_shape,
+            // which (lacking size/first/array/a/elements/element/list/c on a raw
+            // array klass) must return empty without crashing.
+            g_adv_string_as_list =
+                static_cast<std::int32_t>(walk_list_by_shape(str_oop, 0).size());
+
+            // A raw Object[] OOP fed to walk_arraylist (an array klass has no
+            // "size"/"elementData" instance fields) -> empty, no crash.
+            void* const obj_arr{ list_oop_of("elemArray") };
+            g_adv_array_as_list =
+                static_cast<std::int32_t>(walk_arraylist(obj_arr).size());
+
+            // An EMPTY LinkedList walked with an absurd claimed size: first==null
+            // so the loop exits at the first iteration regardless of the bound —
+            // no run-away, no crash.
+            void* const empty_link{ list_oop_of("linkEmpty") };
+            g_adv_linked_bogus_n = static_cast<std::int32_t>(
+                walk_linkedlist(empty_link, MAX_SAFE_COUNT).size());
+
+            g_adv_reached_end = true;
+        }
+
+        // ── Size-as-oracle: emitted count == the list's published size() ────
+        // The fixture publishes each list's own size() as a plain int field; the
+        // walk's emitted element count must equal it exactly.  This is the
+        // size-as-oracle invariant stated directly against the Java-reported size,
+        // independent of the mirrored constants.
+        g_oracle_arr_many =
+            (g_arr_many.size == read_int_field(singleton, "arrManySize", -1));
+        g_oracle_link_many =
+            (g_link_many.size == read_int_field(singleton, "linkManySize", -1));
+        g_oracle_arr_thousand =
+            (g_arr_thousand.size == read_int_field(singleton, "arrThousandSize", -1));
+        g_oracle_link_thousand =
+            (g_link_thousand.size == read_int_field(singleton, "linkThousandSize", -1));
+        g_oracle_arr_alias =
+            (g_arr_alias.size == read_int_field(singleton, "arrAliasSize", -1));
+        g_oracle_hetero =
+            (g_hetero.size == read_int_field(singleton, "heteroListSize", -1));
+        g_oracle_arr_shuffled =
+            (g_arr_shuffled.size == read_int_field(singleton, "arrShuffledSize", -1));
+
         // ── List.of(...) (JDK 9+).  ListN ("elements") is hand-walked; List12
         //    ("e0"/"e1" with an EMPTY sentinel) is characterized via size().  The
         //    fixture publishes listOfAvailable + per-list size() witnesses.
@@ -2151,6 +2434,127 @@ namespace
         ctx.check("nested_mixed_inners_distinct", g_nested_mix_distinct);
         ctx.check("nested_mixed_all_inner_lists_fully_walked",
                   g_nested_mix_inner_ok == NESTED_MIX_OUTER);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Aliased-duplicate lists: ONE Elem object stored at every slot.  The
+        //  decoded element OOP is LEGITIMATELY the SAME across all slots, so the
+        //  walk must still emit ALIAS_LEN slots (no dedup, no slot dropped), each
+        //  value == ALIAS_VAL, and exactly ONE unique backing OOP — proving an
+        //  honest repeated reference is handled (and is NOT the cycle/dup-node
+        //  corruption the distinctness check guards in the BIG LinkedList case).
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("arraylist_alias_seen", g_arr_alias.seen);
+        ctx.check("arraylist_alias_size_matches", g_arr_alias.size == ALIAS_LEN);
+        ctx.check("arraylist_alias_all_non_null", g_arr_alias.non_null == ALIAS_LEN);
+        ctx.check("arraylist_alias_no_null_slots", g_arr_alias.null_count == 0);
+        ctx.check("arraylist_alias_single_unique_oop", g_arr_alias_unique_oops == 1);
+        ctx.check("arraylist_alias_all_values_equal_ALIAS_VAL", g_arr_alias_all_val);
+
+        ctx.check("linkedlist_alias_seen", g_link_alias.seen);
+        ctx.check("linkedlist_alias_size_matches", g_link_alias.size == ALIAS_LEN);
+        ctx.check("linkedlist_alias_all_non_null", g_link_alias.non_null == ALIAS_LEN);
+        ctx.check("linkedlist_alias_no_null_slots", g_link_alias.null_count == 0);
+        ctx.check("linkedlist_alias_single_unique_oop", g_link_alias_unique_oops == 1);
+        ctx.check("linkedlist_alias_all_values_equal_ALIAS_VAL", g_link_alias_all_val);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Heterogeneous List<Object>: String, Integer, Elem, null, Elem — five
+        //  different runtime element types (and a null) in one ArrayList.  The
+        //  walk hands back one decoded OOP per slot regardless of class; the null
+        //  slot is nullptr; the two genuine Elem slots (2 and 4) decode to
+        //  distinct valid Elem objects and slot 4 reads id == 4 through the Elem
+        //  wrapper — element-type-agnostic decoding proven at the slot level.
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("hetero_seen", g_hetero.seen);
+        ctx.check("hetero_size_matches", g_hetero.size == HETERO_LEN);
+        ctx.check("hetero_one_null_slot", g_hetero.null_count == 1);
+        ctx.check("hetero_null_at_expected_index", g_hetero_null_at == HETERO_NULL_AT);
+        ctx.check("hetero_non_null_count", g_hetero_nonnull == HETERO_LEN - 1);
+        ctx.check("hetero_elem_slots_distinct_and_valid", g_hetero_elem_slots_ok);
+        check_or_info(ctx, "hetero_elem4_id_reads_back_4", g_hetero_elem4_id_ok,
+                      "the Elem at heteroList index 4 did not read id == 4 on this run "
+                      "(reference decode is compressed-oops-dependent); shape/null pattern "
+                      "still checked hard.");
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Shuffled-insertion-order lists: ids were added in a NON-sorted
+        //  permutation (SHUF_ORDER).  The walk must preserve INSERTION order, so
+        //  vec[k].id == SHUF_ORDER[k] for every k — a list that sorted or
+        //  reordered its walk would read a wrong id at some position.  This is the
+        //  List insertion-order invariant stated against a permutation that is
+        //  neither ascending nor descending (the ascending dense lists cannot
+        //  distinguish "insertion order preserved" from "happens to be sorted").
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("arraylist_shuffled_seen", g_arr_shuffled.seen);
+        ctx.check("arraylist_shuffled_size_matches", g_arr_shuffled.size == SHUF_LEN);
+        ctx.check("arraylist_shuffled_all_non_null", g_arr_shuffled.non_null == SHUF_LEN);
+        ctx.check("arraylist_shuffled_insertion_order_preserved", g_arr_shuf_insertion_ok);
+
+        ctx.check("linkedlist_shuffled_seen", g_link_shuffled.seen);
+        ctx.check("linkedlist_shuffled_size_matches", g_link_shuffled.size == SHUF_LEN);
+        ctx.check("linkedlist_shuffled_all_non_null", g_link_shuffled.non_null == SHUF_LEN);
+        ctx.check("linkedlist_shuffled_insertion_order_preserved", g_link_shuf_insertion_ok);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Size-1 null-only lists: a length-1 list whose only slot is null.  The
+        //  smallest "has a null" case — size 1, one null slot, zero non-null, the
+        //  lone slot decoded to nullptr (the bound is `size`==1).
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("arraylist_single_null_seen", g_arr_single_null.seen);
+        ctx.check("arraylist_single_null_size_is_1", g_arr_single_null.size == 1);
+        ctx.check("arraylist_single_null_one_null_slot", g_arr_single_null.null_count == 1);
+        ctx.check("arraylist_single_null_no_elements", g_arr_single_null.non_null == 0);
+        ctx.check("arraylist_single_null_at_index_0", g_arr_single_null.null_at == 0);
+
+        ctx.check("linkedlist_single_null_seen", g_link_single_null.seen);
+        ctx.check("linkedlist_single_null_size_is_1", g_link_single_null.size == 1);
+        ctx.check("linkedlist_single_null_one_null_slot", g_link_single_null.null_count == 1);
+        ctx.check("linkedlist_single_null_no_elements", g_link_single_null.non_null == 0);
+        ctx.check("linkedlist_single_null_at_index_0", g_link_single_null.null_at == 0);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  get_array_element bounds: in-range reads a real slot; index == length,
+        //  index past length, and a negative index all return compressed 0
+        //  (-> nullptr), NEVER an out-of-bounds read.  Probed directly against the
+        //  elemArray backing Object[] (length OBJ_ARR_LEN).
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("get_array_element_in_range_nonzero", g_bounds_in_range_nonzero);
+        ctx.check("get_array_element_at_length_is_zero", g_bounds_at_length_zero);
+        ctx.check("get_array_element_past_length_is_zero", g_bounds_past_length_zero);
+        ctx.check("get_array_element_negative_index_is_zero", g_bounds_negative_zero);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Adversarial / degenerate walk inputs: nullptr, a non-list Elem OOP, a
+        //  raw Object[] OOP, a wrong-shape OOP, and an absurd LinkedList size.
+        //  Each walk gates on backing-field presence + is_valid_pointer, so a
+        //  wrong-shape or null input yields an EMPTY vector — no crash, no cycle,
+        //  no OOB.  Reaching g_adv_reached_end proves every call returned.  This
+        //  is the crash-safety HARD angle on the walk surface itself.
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("adversarial_all_calls_returned_no_crash", g_adv_reached_end);
+        ctx.check("adversarial_null_arraylist_empty", g_adv_null_arraylist == 0);
+        ctx.check("adversarial_null_linkedlist_empty", g_adv_null_linkedlist == 0);
+        ctx.check("adversarial_null_shape_walk_empty", g_adv_shape_null == 0);
+        ctx.check("adversarial_elem_as_arraylist_empty", g_adv_elem_as_list == 0);
+        ctx.check("adversarial_objarray_shape_walk_empty", g_adv_string_as_list == 0);
+        ctx.check("adversarial_objarray_as_arraylist_empty", g_adv_array_as_list == 0);
+        ctx.check("adversarial_empty_linkedlist_bogus_size_empty",
+                  g_adv_linked_bogus_n == 0);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Size-as-oracle: emitted element count == the list's OWN published
+        //  size() (a plain int witness field the fixture exposes).  Asserts the
+        //  walk emits exactly as many elements as the list reports, stated
+        //  directly against the Java-reported size rather than a mirrored constant
+        //  — across both core families, the at-scale lists, and the new shapes.
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("size_oracle_arraylist_many", g_oracle_arr_many);
+        ctx.check("size_oracle_linkedlist_many", g_oracle_link_many);
+        ctx.check("size_oracle_arraylist_thousand", g_oracle_arr_thousand);
+        ctx.check("size_oracle_linkedlist_thousand", g_oracle_link_thousand);
+        ctx.check("size_oracle_arraylist_alias", g_oracle_arr_alias);
+        ctx.check("size_oracle_heterogeneous", g_oracle_hetero);
+        ctx.check("size_oracle_arraylist_shuffled", g_oracle_arr_shuffled);
 
         // ════════════════════════════════════════════════════════════════════
         //  List.of(...) (JDK 9+).  ListN backing "elements" Object[] IS decoded

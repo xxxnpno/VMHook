@@ -92,9 +92,18 @@
 //     * a bare "[" / array-of-void "[V" (malformed element)           -> nullptr.
 //     * a never-loaded array element type
 //       ("[Lvmhook/fixtures/NoSuchClass;")                            -> nullptr.
+//     * a reference descriptor missing its ';' ("[Ljava/lang/Object")  -> nullptr.
+//     * a truncated reference descriptor ("[L", no element name)       -> nullptr.
+//     * a multi-dim array of a never-loaded element
+//       ("[[Lvmhook/fixtures/NoSuchClass;")                            -> nullptr.
+//     * element_size == 0 on a valid PRIMITIVE descriptor -> graceful header-only
+//       allocation: non-null on the TLAB fast path with the _length slot still
+//       written (degenerate but never a crash; no data region is accessed).
 //     * allow_jni_fallback=false on a valid PRIMITIVE descriptor still succeeds
-//       on the (untouched) TLAB fast path -> non-null (characterises the new 4th
-//       parameter without depending on a GC firing).
+//       on the (untouched) TLAB fast path -> non-null + element round-trip
+//       (characterises the 4th parameter without depending on a GC firing); the
+//       same flag on a REFERENCE descriptor is best-effort (the flag gates only
+//       the primitive GC slow path, so the outcome is unchanged either way).
 //
 // JDK-8 GATING: the reference-array allocation ([L... / [[...) depends on the
 // FIX-D JNI FindClass fallback resolving an Obj/ArrayKlass on JDK 8.  Where it
@@ -335,6 +344,26 @@ namespace
         std::atomic<bool> distinct_tested{ false };
         std::atomic<bool> distinct_oops{ false };
         std::atomic<bool> distinct_isolated{ false };
+        // LEN-2 round-trip: the smallest length with DISTINCT [0] and [last] (no
+        // middle).  The element_round_trip above keys off len==3; len 2 is the only
+        // multi-element length the first/last probes never element-test, so a [0]
+        // vs [last] stride mistake that aliases adjacent slots at the smallest
+        // non-degenerate size is caught here.
+        std::atomic<bool> pair_tested{ false };
+        std::atomic<bool> pair_first_ok{ false };
+        std::atomic<bool> pair_last_ok{ false };
+        // ZERO element_size tolerance: make_java_array("[X", n, 0) allocates a
+        // header-only object (16 + n*0 bytes) and still writes the _length slot.
+        // It is a degenerate input (no usable data region) but must be GRACEFUL —
+        // non-null on the TLAB fast path with the correct _length, never a crash.
+        std::atomic<bool> zero_elem_tested{ false };
+        std::atomic<bool> zero_elem_nonnull{ false };
+        std::atomic<bool> zero_elem_len_ok{ false };
+        // allow_jni_fallback=false on this PRIMITIVE descriptor: the untouched TLAB
+        // fast path still allocates a usable array at a small length (the 4th
+        // parameter only gates the GC slow path, which a small alloc never needs).
+        std::atomic<bool> no_fallback_tested{ false };
+        std::atomic<bool> no_fallback_ok{ false };
     };
 
     enum desc_index : std::size_t
@@ -380,7 +409,11 @@ namespace
     std::atomic<bool> g_array_of_void_null{ false };
     std::atomic<bool> g_missing_elem_class_null{ false };
     std::atomic<bool> g_neg_len_valid_desc_null{ false };
+    std::atomic<bool> g_ref_no_semicolon_null{ false };       // "[Ljava/lang/Object" (no ';')
+    std::atomic<bool> g_truncated_ref_null{ false };          // "[L" (no element name)
+    std::atomic<bool> g_multidim_missing_elem_null{ false };  // "[[Lvmhook/.../NoSuchClass;"
     std::atomic<bool> g_no_fallback_primitive_ok{ false };
+    std::atomic<bool> g_no_fallback_reference_nonnull{ false }; // [Ljava/lang/Object; w/ fallback off
     std::atomic<bool> g_multidim_nonnull{ false };
     std::atomic<bool> g_multidim_valid{ false };
     std::atomic<bool> g_multidim_len_ok{ false };
@@ -820,6 +853,100 @@ namespace
         r.distinct_isolated.store(a_intact && b_intact && !bits_equal<element_type>(a_val, b_val));
     }
 
+    // LEN-2 round-trip: the smallest length where [0] and [last] are DISTINCT
+    // slots with no middle.  Writes a boundary value into each and reads both back
+    // BIT-EXACT — catches a [0]/[last] stride/alias mistake at the smallest
+    // non-degenerate multi-element size (3 is the smallest the main probe covers).
+    template<typename element_type>
+    auto pair_check(std::size_t di, element_type first_val, element_type last_val) -> void
+    {
+        desc_result& r{ g_results[di] };
+        r.pair_tested.store(true);
+        const desc_spec& spec{ k_specs[di] };
+        constexpr std::int32_t len{ 2 };
+        void* const oop{ vmhook::make_java_array(spec.descriptor, len, spec.element_size) };
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop) || vmhook::array_length(oop) != len)
+        {
+            return;
+        }
+        vmhook::set_array_element<element_type>(oop, 0, first_val);
+        vmhook::set_array_element<element_type>(oop, len - 1, last_val);
+        r.pair_first_ok.store(bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, 0), first_val));
+        r.pair_last_ok.store(bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, len - 1), last_val));
+    }
+
+    // ZERO element_size: a degenerate input that allocates a header-only object
+    // (16 + n*0 bytes) but still writes the _length slot.  Must be GRACEFUL —
+    // non-null with the right _length, never a crash.  (No data-region access is
+    // attempted: there is no usable data region at element_size 0.)
+    auto zero_elem_check(std::size_t di) -> void
+    {
+        desc_result& r{ g_results[di] };
+        r.zero_elem_tested.store(true);
+        const desc_spec& spec{ k_specs[di] };
+        constexpr std::int32_t len{ 3 };
+        void* const oop{ vmhook::make_java_array(spec.descriptor, len, 0) };
+        const bool nn{ oop != nullptr };
+        const bool valid{ nn && vmhook::hotspot::is_valid_pointer(oop) };
+        r.zero_elem_nonnull.store(valid);
+        r.zero_elem_len_ok.store(valid && vmhook::array_length(oop) == len);
+    }
+
+    // allow_jni_fallback=false on a PRIMITIVE descriptor: the untouched TLAB fast
+    // path still allocates a usable array at a small length and survives a true-
+    // stride round-trip (the 4th parameter only gates the GC-aware JNI slow path,
+    // which a tiny allocation never reaches).
+    template<typename element_type>
+    auto no_fallback_check(std::size_t di, element_type first_val, element_type last_val) -> void
+    {
+        desc_result& r{ g_results[di] };
+        r.no_fallback_tested.store(true);
+        const desc_spec& spec{ k_specs[di] };
+        constexpr std::int32_t len{ 3 };
+        void* const oop{ vmhook::make_java_array(spec.descriptor, len, spec.element_size, /*allow_jni_fallback=*/false) };
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop) || vmhook::array_length(oop) != len)
+        {
+            return;
+        }
+        vmhook::set_array_element<element_type>(oop, 0, first_val);
+        vmhook::set_array_element<element_type>(oop, len - 1, last_val);
+        const bool ok0{ bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, 0), first_val) };
+        const bool okl{ bits_equal<element_type>(vmhook::get_array_element<element_type>(oop, len - 1), last_val) };
+        r.no_fallback_ok.store(ok0 && okl);
+    }
+
+    auto pair_for(std::size_t di) -> void
+    {
+        switch (di)
+        {
+            case D_Z: pair_check<bool>(di, true, false); break;
+            case D_B: pair_check<std::int8_t>(di, std::numeric_limits<std::int8_t>::min(), std::numeric_limits<std::int8_t>::max()); break;
+            case D_S: pair_check<std::int16_t>(di, std::numeric_limits<std::int16_t>::min(), std::numeric_limits<std::int16_t>::max()); break;
+            case D_C: pair_check<std::uint16_t>(di, static_cast<std::uint16_t>(0x0000), static_cast<std::uint16_t>(0xFFFF)); break;
+            case D_I: pair_check<std::int32_t>(di, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max()); break;
+            case D_J: pair_check<std::int64_t>(di, std::numeric_limits<std::int64_t>::min(), std::numeric_limits<std::int64_t>::max()); break;
+            case D_F: pair_check<float>(di, std::numeric_limits<float>::quiet_NaN(), -0.0F); break;
+            case D_D: pair_check<double>(di, std::numeric_limits<double>::quiet_NaN(), -0.0); break;
+            default: break;
+        }
+    }
+
+    auto no_fallback_for(std::size_t di) -> void
+    {
+        switch (di)
+        {
+            case D_Z: no_fallback_check<bool>(di, true, false); break;
+            case D_B: no_fallback_check<std::int8_t>(di, std::numeric_limits<std::int8_t>::min(), std::numeric_limits<std::int8_t>::max()); break;
+            case D_S: no_fallback_check<std::int16_t>(di, std::numeric_limits<std::int16_t>::min(), std::numeric_limits<std::int16_t>::max()); break;
+            case D_C: no_fallback_check<std::uint16_t>(di, static_cast<std::uint16_t>(0x0000), static_cast<std::uint16_t>(0xFFFF)); break;
+            case D_I: no_fallback_check<std::int32_t>(di, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max()); break;
+            case D_J: no_fallback_check<std::int64_t>(di, std::numeric_limits<std::int64_t>::min(), std::numeric_limits<std::int64_t>::max()); break;
+            case D_F: no_fallback_check<float>(di, std::numeric_limits<float>::quiet_NaN(), -0.0F); break;
+            case D_D: no_fallback_check<double>(di, std::numeric_limits<double>::quiet_NaN(), -0.0); break;
+            default: break;
+        }
+    }
+
     auto oversize_for(std::size_t di) -> void
     {
         switch (di)
@@ -1202,6 +1329,10 @@ namespace
             {
                 oversize_for(di);
                 distinct_for(di);
+                // NEW small-allocation inputs (all heap-modest, no GC pressure):
+                pair_for(di);          // len-2: distinct [0]/[last], no middle
+                zero_elem_check(di);   // element_size == 0 (header-only, graceful)
+                no_fallback_for(di);   // allow_jni_fallback=false on the fast path
             }
 
             // ── 2. Store a fresh representative (len 3) array into recv*. ──
@@ -1251,11 +1382,35 @@ namespace
             vmhook::make_java_array("[V", 1, 1) == nullptr);
         g_missing_elem_class_null.store(
             vmhook::make_java_array("[Lvmhook/fixtures/NoSuchClass12345;", 1, sizeof(std::uint32_t)) == nullptr);
+        // A reference-array descriptor MISSING its trailing ';' — malformed, the
+        // JNI FindClass fallback must reject it (no klass, graceful null).
+        g_ref_no_semicolon_null.store(
+            vmhook::make_java_array("[Ljava/lang/Object", 1, sizeof(std::uint32_t)) == nullptr);
+        // A truncated reference-array descriptor: '[L' with no element name at all.
+        g_truncated_ref_null.store(
+            vmhook::make_java_array("[L", 1, sizeof(std::uint32_t)) == nullptr);
+        // A MULTI-DIM array of a never-loaded element type ("[[L...NoSuchClass;").
+        g_multidim_missing_elem_null.store(
+            vmhook::make_java_array("[[Lvmhook/fixtures/NoSuchClass12345;", 1, sizeof(std::uint32_t)) == nullptr);
 
         // ── 5. allow_jni_fallback=false on a valid PRIMITIVE descriptor. ──
         {
             void* const oop{ vmhook::make_java_array("[I", k_witness_len, sizeof(std::int32_t), /*allow_jni_fallback=*/false) };
             g_no_fallback_primitive_ok.store(
+                oop != nullptr
+                && vmhook::hotspot::is_valid_pointer(oop)
+                && vmhook::array_length(oop) == k_witness_len);
+        }
+
+        // ── 5b. allow_jni_fallback=false on a valid REFERENCE descriptor.  The 4th
+        //        parameter only gates the PRIMITIVE GC slow path (there is no
+        //        NewObjectArray fallback), so a reference array's outcome is the
+        //        SAME with the flag on or off: it allocates on the (untouched) TLAB
+        //        fast path or returns null.  Best-effort: HARD when non-null (a real
+        //        ObjArrayKlass oop of the right length), [INFO] when null. ──
+        {
+            void* const oop{ vmhook::make_java_array("[Ljava/lang/Object;", k_witness_len, sizeof(std::uint32_t), /*allow_jni_fallback=*/false) };
+            g_no_fallback_reference_nonnull.store(
                 oop != nullptr
                 && vmhook::hotspot::is_valid_pointer(oop)
                 && vmhook::array_length(oop) == k_witness_len);
@@ -1441,6 +1596,19 @@ namespace
                 ctx.check(std::string{ "native_distinct_alloc_tested_" } + tag[di], r.distinct_tested.load());
                 ctx.check(std::string{ "native_distinct_alloc_different_oops_" } + tag[di], r.distinct_oops.load());
                 ctx.check(std::string{ "native_distinct_alloc_no_aliasing_" } + tag[di], r.distinct_isolated.load());
+                // LEN-2 round-trip: the smallest length with distinct [0]/[last].
+                ctx.check(std::string{ "native_pair_len2_tested_" } + tag[di], r.pair_tested.load());
+                ctx.check(std::string{ "native_pair_len2_first_round_trips_" } + tag[di], r.pair_first_ok.load());
+                ctx.check(std::string{ "native_pair_len2_last_round_trips_" } + tag[di], r.pair_last_ok.load());
+                // ZERO element_size: degenerate header-only alloc is still graceful
+                // (non-null on the fast path, _length written) — never a crash.
+                ctx.check(std::string{ "native_zero_elemsize_tested_" } + tag[di], r.zero_elem_tested.load());
+                ctx.check(std::string{ "native_zero_elemsize_nonnull_" } + tag[di], r.zero_elem_nonnull.load());
+                ctx.check(std::string{ "native_zero_elemsize_length_ok_" } + tag[di], r.zero_elem_len_ok.load());
+                // allow_jni_fallback=false: the untouched TLAB fast path still
+                // allocates + round-trips a small primitive array per descriptor.
+                ctx.check(std::string{ "native_no_fallback_tested_" } + tag[di], r.no_fallback_tested.load());
+                ctx.check(std::string{ "native_no_fallback_fast_path_round_trips_" } + tag[di], r.no_fallback_ok.load());
             }
         }
 
@@ -1562,11 +1730,29 @@ namespace
         ctx.check("guard_bare_bracket_descriptor_returns_null", g_bare_bracket_null.load());
         ctx.check("guard_array_of_void_returns_null", g_array_of_void_null.load());
         ctx.check("guard_missing_element_class_returns_null", g_missing_elem_class_null.load());
+        ctx.check("guard_reference_descriptor_missing_semicolon_returns_null", g_ref_no_semicolon_null.load());
+        ctx.check("guard_truncated_reference_descriptor_returns_null", g_truncated_ref_null.load());
+        ctx.check("guard_multidim_missing_element_class_returns_null", g_multidim_missing_elem_null.load());
 
         // =================================================================
         //  6. allow_jni_fallback parameter.
         // =================================================================
         ctx.check("allow_jni_fallback_false_primitive_still_allocates", g_no_fallback_primitive_ok.load());
+        // Reference descriptor with the fallback OFF: best-effort.  The flag does
+        // not change a reference array's outcome (no NewObjectArray slow path), so
+        // when it allocates the oop must be a valid len-3 array; null is the JDK-8 /
+        // GC-active config and is recorded [INFO], never a hard fail.
+        if (g_no_fallback_reference_nonnull.load())
+        {
+            ctx.check("allow_jni_fallback_false_reference_fast_path_valid", g_no_fallback_reference_nonnull.load());
+        }
+        else
+        {
+            ctx.record("[INFO] allow_jni_fallback_false_reference: SKIPPED — [Ljava/lang/Object; "
+                       "returned null with the fallback off (reference arrays have no NewObjectArray "
+                       "slow path; same as the JDK-8 / GC-active best-effort gate). Primitive coverage "
+                       "of the flag is the hard floor.");
+        }
 
         // =================================================================
         //  7. MULTI-DIM array ("[[I").

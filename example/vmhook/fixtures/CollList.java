@@ -512,6 +512,99 @@ public final class CollList
      */
     public final ArrayList<Map<String, Elem>> nestedMaps = new ArrayList<Map<String, Elem>>();
 
+    // ── Aliased-duplicate list: the SAME Elem object stored at several indices ─
+    /** Element count of the aliased-duplicate lists. */
+    public static final int ALIAS_LEN = 4;
+
+    /** The id/tag shared by every (aliased) slot of the aliased-dup lists. */
+    public static final int ALIAS_VAL = 7;
+
+    /**
+     * ArrayList holding ONE Elem object at EVERY index (the identical reference
+     * added ALIAS_LEN times).  Distinct from arrDup, whose elements are equal in
+     * value but distinct heap objects: here the decoded element OOP is LEGITIMATELY
+     * the SAME across all slots.  Proves the walk emits the aliased OOP once per
+     * slot (no dedup, no slot dropped) and that an honest repeated-OOP is NOT
+     * mistaken for the cycle/dup-node corruption signal the distinctness check
+     * guards against — the count must still be ALIAS_LEN with every value ALIAS_VAL.
+     */
+    public final ArrayList<Elem> arrAlias = new ArrayList<Elem>();
+
+    /** LinkedList holding the SAME Elem at every node (aliased chain). */
+    public final LinkedList<Elem> linkAlias = new LinkedList<Elem>();
+
+    // ── Heterogeneous list: elements of VARIED runtime types in one list ──────
+    /** Element count of the heterogeneous List<Object> (String,Integer,Elem,null,Elem). */
+    public static final int HETERO_LEN = 5;
+
+    /** Index of the null slot inside the heterogeneous list. */
+    public static final int HETERO_NULL_AT = 3;
+
+    /**
+     * A List&lt;Object&gt; whose slots hold a java.lang.String, a java.lang.Integer, a
+     * CollList$Elem, a null, and another CollList$Elem — five DIFFERENT runtime
+     * element types (and a null) in one ArrayList.  Proves the backing walk is
+     * element-type-agnostic AT THE SLOT LEVEL: it hands back one decoded OOP per
+     * slot regardless of each slot's class, with the null slot becoming nullptr,
+     * the count exactly HETERO_LEN, and the two non-null Elem slots (indices 2 and 4)
+     * decoding to distinct, valid Elem objects.  Index 4's Elem carries id == 4 so
+     * the native side can read it through the Elem wrapper.
+     */
+    public final ArrayList<Object> heteroList = new ArrayList<Object>();
+
+    // ── Shuffled-insertion-order list: NON-ascending insertion order ─────────
+    /** Element count of the shuffled-order lists. */
+    public static final int SHUF_LEN = 6;
+
+    /**
+     * The insertion order of ids in the shuffled lists.  It is a fixed permutation
+     * of 0..SHUF_LEN-1 that is NEITHER ascending NOR descending, so the native side
+     * can prove the walk preserves INSERTION order (vec[k].id == SHUF_ORDER[k]),
+     * which a list that merely happened to be sorted would fail.  Equal length to
+     * SHUF_LEN; kept in lockstep with collection_list.cpp.
+     */
+    public static final int[] SHUF_ORDER = { 3, 0, 5, 1, 4, 2 };
+
+    /**
+     * ArrayList whose elements are added in SHUF_ORDER (a non-sorted permutation).
+     * The native side asserts vec[k].id == SHUF_ORDER[k] for every k — an exact
+     * insertion-order (NOT sorted-order) proof.  An implementation that sorted or
+     * reordered the walk would read the wrong id at some position.
+     */
+    public final ArrayList<Elem> arrShuffled = new ArrayList<Elem>();
+
+    /** LinkedList whose elements are added in SHUF_ORDER (chain insertion order). */
+    public final LinkedList<Elem> linkShuffled = new LinkedList<Elem>();
+
+    // ── Size-1 null-only lists (the smallest "has a null" case) ──────────────
+    /**
+     * ArrayList holding exactly one element, which is null.  The single-element
+     * degenerate of the null pattern: size 1, one null slot, zero non-null — proves
+     * a length-1 list whose only slot is null decodes to a one-element all-null
+     * vector (the bound is `size`==1, the lone slot becomes nullptr).
+     */
+    public final ArrayList<Elem> arrSingleNull = new ArrayList<Elem>();
+
+    /** LinkedList holding exactly one node whose item is null (size-1 null chain). */
+    public final LinkedList<Elem> linkSingleNull = new LinkedList<Elem>();
+
+    // ── Published Java size() witnesses for the new size-as-oracle checks ────
+    /**
+     * size() of arrMany / linkMany / arrThousand / linkThousand published as plain
+     * int fields, so the native side can assert "emitted element count == the list's
+     * own reported size()" — the size-as-oracle invariant — WITHOUT a Java call from
+     * the worker body.  (synchronizedViewSize / vecManySize / cowManySize already
+     * cover the wrapper / Vector / COW families; these cover the two core families
+     * and the at-scale lists.)
+     */
+    public volatile int arrManySize;
+    public volatile int linkManySize;
+    public volatile int arrThousandSize;
+    public volatile int linkThousandSize;
+    public volatile int arrAliasSize;
+    public volatile int heteroListSize;
+    public volatile int arrShuffledSize;
+
     // ── subList views (CHARACTERIZED via size(), not decoded) ────────────────
     /** ArrayList.subList(SUB_FROM, SUB_TO) over arrMany — ArrayList$SubList. */
     public List<Elem> arrSubList;
@@ -775,6 +868,32 @@ public final class CollList
             nestedMaps.add(inner);
         }
 
+        // Aliased-duplicate lists: ONE Elem object stored at EVERY index/node.
+        final Elem aliased = new Elem(ALIAS_VAL);
+        for (int i = 0; i < ALIAS_LEN; ++i)
+        {
+            arrAlias.add(aliased);
+            linkAlias.add(aliased);
+        }
+
+        // Heterogeneous list: a String, an Integer, an Elem, a null, an Elem.
+        heteroList.add("hetero");          // 0: java.lang.String
+        heteroList.add(Integer.valueOf(1)); // 1: java.lang.Integer
+        heteroList.add(new Elem(2));       // 2: CollList$Elem (id 2)
+        heteroList.add(null);              // 3: null slot
+        heteroList.add(new Elem(4));       // 4: CollList$Elem (id 4)
+
+        // Shuffled-insertion-order lists: add ids in the SHUF_ORDER permutation.
+        for (int i = 0; i < SHUF_LEN; ++i)
+        {
+            arrShuffled.add(new Elem(SHUF_ORDER[i]));
+            linkShuffled.add(new Elem(SHUF_ORDER[i]));
+        }
+
+        // Size-1 null-only lists: the single slot is null.
+        arrSingleNull.add(null);
+        linkSingleNull.add(null);
+
         // subList views over the MANY lists; characterized via published size().
         arrSubList = arrMany.subList(SUB_FROM, SUB_TO);
         linkSubList = linkMany.subList(SUB_FROM, SUB_TO);
@@ -789,6 +908,13 @@ public final class CollList
         synchronizedViewSize = synchronizedView.size();
         vecManySize = vecMany.size();
         cowManySize = cowMany.size();
+        arrManySize = arrMany.size();
+        linkManySize = linkMany.size();
+        arrThousandSize = arrThousand.size();
+        linkThousandSize = linkThousand.size();
+        arrAliasSize = arrAlias.size();
+        heteroListSize = heteroList.size();
+        arrShuffledSize = arrShuffled.size();
 
         populated = true;
     }

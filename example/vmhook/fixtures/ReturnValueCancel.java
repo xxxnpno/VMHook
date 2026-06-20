@@ -71,7 +71,7 @@ public final class ReturnValueCancel
      * Call origVoid() three times, snapshotting the side-effect counter after
      * each call.  Lets the native side prove the per-invocation cancel slot
      * resets independently across MORE than two dispatches (cancel call 2 only,
-     * cancel calls 0+2, etc.) — every snapshot is captured so the native side
+     * cancel calls 0+2, etc.) - every snapshot is captured so the native side
      * can pin which calls ran.
      */
     public static final int MODE_VOID_THRICE = 2;
@@ -93,6 +93,22 @@ public final class ReturnValueCancel
     public static volatile boolean obsRefIsNull;
     /** Identity hash of the returned reference (0 when null) - breadcrumb. */
     public static volatile int     obsRefIdentity;
+
+    /**
+     * True iff the {@code String}-returning instance method handed the caller
+     * {@code null}.  A {@code String} return rides the SAME reference-null cancel
+     * path as a bare {@code Object} return (a zero oop is null regardless of the
+     * declared static type), so cancel() on a {@code String} returner must yield
+     * {@code null} exactly as origRef does.  Seeded non-null so "hook never fired"
+     * is distinguishable from "cancel forced null".
+     */
+    public static volatile boolean obsStrIsNull;
+    /** Length of the returned String (-1 when null) - breadcrumb. */
+    public static volatile int     obsStrLen = -1;
+    /** True iff the STATIC String-returning method handed the caller null. */
+    public static volatile boolean obsStaticStrIsNull;
+    /** Length of the returned static String (-1 when null) - breadcrumb. */
+    public static volatile int     obsStaticStrLen = -1;
 
     public static volatile int     obsStaticInt    = 0x5A5A5A5A;
     public static volatile double  obsStaticDouble = 9876.54321;
@@ -125,6 +141,22 @@ public final class ReturnValueCancel
     public static volatile int sideEffectAfterCall2;
     /** sideEffect snapshot after the 3rd VOID_THRICE call. */
     public static volatile int sideEffectAfterCall3;
+
+    /**
+     * Echo of the argument the arg-taking instance body actually consumed.  The
+     * body writes {@code argEcho = arg} as a side effect AND returns {@code arg}.
+     * Lets the native side prove, for cancel+set_arg, that a CANCELLED body never
+     * ran (argEcho unchanged from its pre-call sentinel) while an ALLOWED body DID
+     * observe the set_arg mutation (argEcho == injected value).  Seeded to a
+     * sentinel no test injects.
+     */
+    public static volatile int argEcho = 0x6B6B6B6B;
+    /** Echo of the argument the arg-taking STATIC body consumed (same role). */
+    public static volatile int staticArgEcho = 0x6B6B6B6B;
+    /** Observed RETURN of the arg-taking instance method (it returns its arg). */
+    public static volatile int obsArgReturn = 0x5A5A5A5A;
+    /** Observed RETURN of the arg-taking STATIC method (it returns its arg). */
+    public static volatile int obsStaticArgReturn = 0x5A5A5A5A;
 
     // ---- Control observations ---------------------------------------------
     /** Set true by the action if any orig* call threw (it must never throw). */
@@ -205,6 +237,28 @@ public final class ReturnValueCancel
         return 33.5f;
     }
 
+    /**
+     * Returns a fixed non-null, non-empty {@code String} (cancel must hand the
+     * caller {@code null}).  Distinct from origRef's bare {@code Object}: proves
+     * the cancel zero-fill yields null for a typed reference return too.
+     */
+    public String origStr()
+    {
+        return "alpha-orig";
+    }
+
+    /**
+     * Takes one {@code int} arg, records it as a side effect, and returns it.
+     * Used for the cancel+set_arg angle: an allowed body observes the set_arg
+     * mutation (argEcho == injected, return == injected); a cancelled body never
+     * runs (argEcho unchanged) and the caller gets the zero-fill return.
+     */
+    public int origIntFromArg(int arg)
+    {
+        argEcho = arg;
+        return arg;
+    }
+
     // =======================================================================
     //  Original-return methods (static).
     // =======================================================================
@@ -261,6 +315,22 @@ public final class ReturnValueCancel
     public static float origStaticFloat()
     {
         return 44.5f;
+    }
+
+    /** Returns a fixed non-null static {@code String}; cancel must yield null. */
+    public static String origStaticStr()
+    {
+        return "omega-orig";
+    }
+
+    /**
+     * Static twin of origIntFromArg: records its {@code int} arg as a side effect
+     * and returns it.  Slot 0 is the first arg (no {@code this}).
+     */
+    public static int origStaticIntFromArg(int arg)
+    {
+        staticArgEcho = arg;
+        return arg;
     }
 
     static
@@ -352,6 +422,22 @@ public final class ReturnValueCancel
                         ReturnValueCancel.obsStaticFloat  = sf;
                         ReturnValueCancel.obsStaticFloatWasNegZero =
                             (sf == 0.0f) && ((1.0f / sf) < 0.0f);
+
+                        // String returns (instance + static): cancel must yield
+                        // null exactly as the bare-Object case does.
+                        final String s = self.origStr();
+                        ReturnValueCancel.obsStrIsNull = (s == null);
+                        ReturnValueCancel.obsStrLen    = (s == null) ? -1 : s.length();
+                        final String ss = origStaticStr();
+                        ReturnValueCancel.obsStaticStrIsNull = (ss == null);
+                        ReturnValueCancel.obsStaticStrLen    = (ss == null) ? -1 : ss.length();
+
+                        // Arg-taking methods: the caller passes a fixed argument
+                        // the native side never injects (303 / 404).  With no hook
+                        // the body echoes and returns that argument; a set_arg hook
+                        // replaces it; a cancel hook suppresses the body entirely.
+                        ReturnValueCancel.obsArgReturn       = self.origIntFromArg(303);
+                        ReturnValueCancel.obsStaticArgReturn = origStaticIntFromArg(404);
                     }
                 }
                 catch (final Throwable t)

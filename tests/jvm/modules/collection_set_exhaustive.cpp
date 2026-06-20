@@ -110,6 +110,24 @@ namespace
         }
     };
 
+    // ── STRING element wrapper: java.lang.String. ───────────────────────────
+    // For HashSet<String> / TreeSet<String> / LinkedHashSet<String>, each
+    // decoded element OOP is a String; text() reads it via read_java_string
+    // (a pure heap walk, no Java call) — the reference-key decode angle.
+    class string_element : public vmhook::object<string_element>
+    {
+    public:
+        explicit string_element(vmhook::oop_t instance) noexcept
+            : vmhook::object<string_element>{ instance }
+        {
+        }
+
+        auto text() const -> std::string
+        {
+            return vmhook::read_java_string(get_instance());
+        }
+    };
+
     // ── ENUM element wrapper: java.lang.Enum. ───────────────────────────────
     // Registered as java/lang/Enum so get_field resolves `name`/`ordinal`, which
     // are declared on java.lang.Enum itself (the superclass of every concrete
@@ -212,6 +230,17 @@ namespace
             return proxy->get().to_vector<enum_element>();
         }
 
+        static auto strings_of(const char* field)
+            -> std::vector<std::unique_ptr<string_element>>
+        {
+            const auto proxy{ static_field(field) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            return proxy->get().to_vector<string_element>();
+        }
+
         static auto lists_of(const char* field)
             -> std::vector<std::unique_ptr<list_element>>
         {
@@ -235,6 +264,13 @@ namespace
     constexpr std::int32_t CAP17{ 17 };
     constexpr std::int32_t THOUSAND{ 1000 };
     constexpr std::int32_t DAY_N{ 5 };
+    constexpr std::int32_t DEDUP_DISTINCT{ 12 };
+    constexpr std::int32_t SMALL_N{ 3 };
+    constexpr std::int32_t LINKED_N{ 20 };
+    constexpr std::int32_t STR_N{ 8 };
+    constexpr std::int32_t NULL_REALS{ 3 };
+    constexpr std::int32_t SFM_HASH_N{ 5 };
+    constexpr std::int32_t SFM_TREE_N{ 5 };
 
     // ── Hook observation (pilot-style proof). ───────────────────────────────
     std::atomic<int>          g_hook_calls{ 0 };
@@ -377,6 +413,7 @@ namespace
         vmhook::register_class<long_box>("java/lang/Long");
         vmhook::register_class<integer_box>("java/lang/Integer");
         vmhook::register_class<enum_element>("java/lang/Enum");
+        vmhook::register_class<string_element>("java/lang/String");
         vmhook::register_class<list_element>("java/util/ArrayList");
 
         // Drive a mode-0 probe so the build also runs on the Java thread and we
@@ -645,6 +682,317 @@ namespace
                        "yields inner ArrayList OOPs; each decoded via the ArrayList fast "
                        "path (vmhook::collection.to_vector<Integer>) — both layers are pure "
                        "memory walks, decoded from the worker body.");
+        }
+
+        // =====================================================================
+        // EMPTY sets — HashSet (table all-null), TreeSet (root null), and
+        // LinkedHashSet (same hash walk).  Each must decode to ZERO elements,
+        // never throw, and cross-check Java size() == 0.
+        // =====================================================================
+        {
+            const auto vh{ fixture::elems_of("emptyHash") };
+            ctx.check("cst_empty_hash_is_empty", vh.empty());
+            ctx.check("cst_empty_hash_size_is_zero",
+                      fixture::j_size("emptyHashSize") == 0);
+
+            const auto vt{ fixture::elems_of("emptyTree") };
+            ctx.check("cst_empty_tree_is_empty", vt.empty());
+            ctx.check("cst_empty_tree_size_is_zero",
+                      fixture::j_size("emptyTreeSize") == 0);
+
+            const auto vl{ fixture::elems_of("emptyLinked") };
+            ctx.check("cst_empty_linked_is_empty", vl.empty());
+            ctx.check("cst_empty_linked_size_is_zero",
+                      fixture::j_size("emptyLinkedSize") == 0);
+        }
+
+        // =====================================================================
+        // SINGLE element — the smallest non-empty walk on both paths.  HashSet
+        // bucket walk and TreeSet in-order walk each surface exactly one Elem
+        // whose id + tag round-trip, count == Java size() == 1.
+        // =====================================================================
+        {
+            const auto vh{ fixture::elems_of("singleHash") };
+            const elem_stats sh{ fingerprint(vh) };
+            ctx.check("cst_single_hash_count_is_1", sh.count == 1);
+            ctx.check("cst_single_hash_count_matches_java",
+                      sh.count == fixture::j_size("singleHashSize"));
+            ctx.check("cst_single_hash_no_null", sh.null_count == 0);
+            ctx.check("cst_single_hash_id_sum_matches_java",
+                      sh.id_sum == fixture::j_long("singleHashIdSum"));
+            ctx.check("cst_single_hash_tag_round_trip", sh.tags_consistent);
+
+            const auto vt{ fixture::elems_of("singleTree") };
+            const elem_stats st{ fingerprint(vt) };
+            ctx.check("cst_single_tree_count_is_1", st.count == 1);
+            ctx.check("cst_single_tree_count_matches_java",
+                      st.count == fixture::j_size("singleTreeSize"));
+            ctx.check("cst_single_tree_no_null", st.null_count == 0);
+            ctx.check("cst_single_tree_id_sum_matches_java",
+                      st.id_sum == fixture::j_long("singleTreeIdSum"));
+            ctx.check("cst_single_tree_tag_round_trip", st.tags_consistent);
+        }
+
+        // =====================================================================
+        // DEDUP — each of DEDUP_DISTINCT ids was re-added DUP_REPEAT times via a
+        // fresh value-equal Elem.  The Set keeps exactly one per id, so the
+        // decode must surface DEDUP_DISTINCT elements (NOT *DUP_REPEAT), each id
+        // present exactly once, all OOPs distinct — set semantics survive the
+        // walk and the size oracle confirms the dedup.
+        // =====================================================================
+        {
+            const auto v{ fixture::elems_of("dedupHash") };
+            const elem_stats st{ fingerprint(v) };
+            ctx.check("cst_dedup_count_is_distinct", st.count == DEDUP_DISTINCT);
+            ctx.check("cst_dedup_count_matches_java_size",
+                      st.count == fixture::j_size("dedupHashSize"));
+            ctx.check("cst_dedup_java_size_is_deduped",
+                      fixture::j_size("dedupHashSize") == DEDUP_DISTINCT);
+            ctx.check("cst_dedup_no_null", st.null_count == 0);
+            ctx.check("cst_dedup_id_sum_matches_java",
+                      st.id_sum == fixture::j_long("dedupHashIdSum"));
+            ctx.check("cst_dedup_all_distinct_oops", st.distinct_oops);
+            const auto ids{ id_set(v) };
+            bool all_present{ ids.size() == static_cast<std::size_t>(DEDUP_DISTINCT) };
+            for (std::int32_t i{ 0 }; i < DEDUP_DISTINCT; ++i)
+            {
+                if (ids.find(i) == ids.end()) { all_present = false; }
+            }
+            ctx.check("cst_dedup_each_id_once", all_present);
+        }
+
+        // =====================================================================
+        // NULL ELEMENT — a HashSet holding one legal null PLUS NULL_REALS reals.
+        // The key walk must yield exactly one nullptr slot and NULL_REALS
+        // non-null elements; count == Java size() (Java counts the null too).
+        // (TreeSet rejects null, so the null-slot promise is HashSet-only.)
+        // =====================================================================
+        {
+            const auto v{ fixture::elems_of("nullElemHash") };
+            const elem_stats st{ fingerprint(v) };
+            ctx.check("cst_null_elem_count_is_reals_plus_one",
+                      st.count == NULL_REALS + 1);
+            ctx.check("cst_null_elem_count_matches_java",
+                      st.count == fixture::j_size("nullElemHashSize"));
+            ctx.check("cst_null_elem_exactly_one_null", st.null_count == 1);
+            ctx.check("cst_null_elem_reals_id_sum_matches_java",
+                      st.id_sum == fixture::j_long("nullElemRealsIdSum"));
+            ctx.check("cst_null_elem_reals_distinct", st.distinct_oops);
+            const auto ids{ id_set(v) };
+            ctx.check("cst_null_elem_reals_membership",
+                      ids.count(100) == 1 && ids.count(100 + NULL_REALS - 1) == 1);
+        }
+
+        // =====================================================================
+        // LinkedHashSet (map -> SAME hash_map_walk_keys).  Content is verified
+        // ORDER-INDEPENDENTLY (the walk visits bucket order, NOT the
+        // LinkedHashMap insertion-order overlay); every id present once, all
+        // OOPs distinct, count == Java size().  Insertion order deliberately NOT
+        // asserted — characterizes the documented "[low] LinkedHashSet insertion
+        // order is silently lost" behaviour with an [INFO].
+        // =====================================================================
+        {
+            const auto v{ fixture::elems_of("linkedMany") };
+            const elem_stats st{ fingerprint(v) };
+            ctx.check("cst_linked_many_count_is_n", st.count == LINKED_N);
+            ctx.check("cst_linked_many_count_matches_java",
+                      st.count == fixture::j_size("linkedManySize"));
+            ctx.check("cst_linked_many_no_null", st.null_count == 0);
+            ctx.check("cst_linked_many_id_sum_matches_java",
+                      st.id_sum == fixture::j_long("linkedManyIdSum"));
+            ctx.check("cst_linked_many_id_xor_matches_java",
+                      st.id_xor == fixture::j_long("linkedManyIdXor"));
+            ctx.check("cst_linked_many_all_distinct", st.distinct_oops);
+            const auto ids{ id_set(v) };
+            bool all_present{ ids.size() == static_cast<std::size_t>(LINKED_N) };
+            for (std::int32_t i{ 0 }; i < LINKED_N; ++i)
+            {
+                if (ids.find(i) == ids.end()) { all_present = false; }
+            }
+            ctx.check("cst_linked_many_membership_complete", all_present);
+            ctx.record("[INFO] LinkedHashSet decode order == Java insertion order? "
+                       "no — vmhook walks the LinkedHashMap 'table' bucket order, "
+                       "ignoring the before/after overlay; content is correct as a "
+                       "set, sequence is bucket order ([low] documented behaviour).");
+
+            // LinkedHashSet<String> through the SAME hash walk.
+            const auto vs{ fixture::strings_of("linkedStr") };
+            std::int32_t snulls{ 0 };
+            std::int64_t schar{ 0 };
+            std::unordered_set<const void*> sseen;
+            for (const auto& up : vs)
+            {
+                if (up == nullptr) { ++snulls; continue; }
+                for (const unsigned char c : up->text()) { schar += c; }
+                sseen.insert(static_cast<const void*>(up->get_instance()));
+            }
+            ctx.check("cst_linked_str_count_matches_java",
+                      static_cast<std::int32_t>(vs.size()) == fixture::j_size("linkedStrSize"));
+            ctx.check("cst_linked_str_no_null", snulls == 0);
+            ctx.check("cst_linked_str_char_sum_matches_java",
+                      schar == fixture::j_long("linkedStrCharSum"));
+            ctx.check("cst_linked_str_distinct_oops",
+                      sseen.size() == static_cast<std::size_t>(SMALL_N));
+        }
+
+        // =====================================================================
+        // HashSet<String> — String element decode via the key walk.  Each
+        // decoded key OOP is a String; order-independent code-unit sum + OOP
+        // distinctness + membership cross-checked against Java.
+        // =====================================================================
+        {
+            const auto v{ fixture::strings_of("hashStr") };
+            const std::int32_t count{ static_cast<std::int32_t>(v.size()) };
+            ctx.check("cst_hash_str_count_is_n", count == STR_N);
+            ctx.check("cst_hash_str_count_matches_java",
+                      count == fixture::j_size("hashStrSize"));
+
+            std::int32_t nulls{ 0 };
+            std::int64_t char_sum{ 0 };
+            std::unordered_set<std::string> texts;
+            std::unordered_set<const void*> seen;
+            for (const auto& up : v)
+            {
+                if (up == nullptr) { ++nulls; continue; }
+                const std::string t{ up->text() };
+                for (const unsigned char c : t) { char_sum += c; }
+                texts.insert(t);
+                seen.insert(static_cast<const void*>(up->get_instance()));
+            }
+            ctx.check("cst_hash_str_no_null", nulls == 0);
+            ctx.check("cst_hash_str_char_sum_matches_java",
+                      char_sum == fixture::j_long("hashStrCharSum"));
+            ctx.check("cst_hash_str_distinct_oops",
+                      seen.size() == static_cast<std::size_t>(STR_N));
+            ctx.check("cst_hash_str_distinct_texts",
+                      texts.size() == static_cast<std::size_t>(STR_N));
+            ctx.check("cst_hash_str_contains_h0", texts.count("h0") == 1);
+            ctx.check("cst_hash_str_contains_last",
+                      texts.count("h" + std::to_string(STR_N - 1)) == 1);
+        }
+
+        // =====================================================================
+        // TreeSet<String> — exact ascending lexicographic in-order walk.
+        // Inserted scrambled; must decode [alpha, bravo, charlie, delta].
+        // =====================================================================
+        {
+            const auto v{ fixture::strings_of("treeStr") };
+            std::vector<std::string> order;
+            order.reserve(v.size());
+            bool any_null{ false };
+            for (const auto& up : v)
+            {
+                if (up == nullptr) { any_null = true; continue; }
+                order.push_back(up->text());
+            }
+            ctx.check("cst_tree_str_count_matches_java",
+                      static_cast<std::int32_t>(v.size()) == fixture::j_size("treeStrSize"));
+            ctx.check("cst_tree_str_no_null", !any_null);
+            ctx.check("cst_tree_str_is_sorted",
+                      std::is_sorted(order.begin(), order.end()));
+            const std::vector<std::string> expected{
+                "alpha", "bravo", "charlie", "delta" };
+            ctx.check("cst_tree_str_exact_lexicographic_sequence",
+                      order == expected);
+            ctx.check("cst_tree_str_first_is_alpha",
+                      !order.empty() && order.front() == "alpha");
+            ctx.check("cst_tree_str_last_is_delta",
+                      !order.empty() && order.back() == "delta");
+        }
+
+        // =====================================================================
+        // newSetFromMap ROUTING-FIX characterization.  Collections$SetFromMap
+        // stores its backing map in field "m" — the same probe TreeSet uses —
+        // but the cascade inspects the backing map's REAL klass:
+        //   * HashMap backing (has "table", no "root") -> HASH walk -> full decode
+        //     (this was once a [medium] bug that returned 0 of N; now FIXED).
+        //   * TreeMap backing (has "root")            -> TREE walk -> SORTED decode
+        //     (proves the router picks the walker by the backing klass, not the
+        //     field name).
+        // =====================================================================
+        {
+            const auto vh{ fixture::elems_of("setFromHashMap") };
+            const elem_stats sh{ fingerprint(vh) };
+            ctx.check("cst_sfm_hash_count_is_n", sh.count == SFM_HASH_N);
+            ctx.check("cst_sfm_hash_count_matches_java",
+                      sh.count == fixture::j_size("setFromHashMapSize"));
+            ctx.check("cst_sfm_hash_decode_not_empty_FIX", sh.count > 0);
+            ctx.check("cst_sfm_hash_no_null", sh.null_count == 0);
+            ctx.check("cst_sfm_hash_id_sum_matches_java",
+                      sh.id_sum == fixture::j_long("setFromHashMapIdSum"));
+            ctx.check("cst_sfm_hash_all_distinct", sh.distinct_oops);
+            {
+                const auto ids{ id_set(vh) };
+                bool all_present{ ids.size() == static_cast<std::size_t>(SFM_HASH_N) };
+                for (std::int32_t i{ 0 }; i < SFM_HASH_N; ++i)
+                {
+                    if (ids.find(i) == ids.end()) { all_present = false; }
+                }
+                ctx.check("cst_sfm_hash_membership_complete", all_present);
+            }
+            ctx.record("[INFO] newSetFromMap(HashMap): the 'm'-backed router inspects the "
+                       "backing klass (HashMap has 'table', no 'root') and picks "
+                       "hash_map_walk_keys; the formerly-[medium] empty-decode bug is FIXED "
+                       "(full decode, count == Java size()).");
+
+            const auto vt{ fixture::elems_of("setFromTreeMap") };
+            const elem_stats st{ fingerprint(vt) };
+            ctx.check("cst_sfm_tree_count_is_n", st.count == SFM_TREE_N);
+            ctx.check("cst_sfm_tree_count_matches_java",
+                      st.count == fixture::j_size("setFromTreeMapSize"));
+            ctx.check("cst_sfm_tree_no_null", st.null_count == 0);
+            ctx.check("cst_sfm_tree_id_sum_matches_java",
+                      st.id_sum == fixture::j_long("setFromTreeMapIdSum"));
+            ctx.check("cst_sfm_tree_all_distinct", st.distinct_oops);
+            // TreeMap backing -> in-order walk -> ascending ids [0..SFM_TREE_N-1].
+            std::vector<std::int32_t> tree_ids;
+            tree_ids.reserve(vt.size());
+            bool tree_any_null{ false };
+            for (const auto& up : vt)
+            {
+                if (up == nullptr) { tree_any_null = true; continue; }
+                tree_ids.push_back(up->id());
+            }
+            ctx.check("cst_sfm_tree_no_null_walk", !tree_any_null);
+            ctx.check("cst_sfm_tree_is_sorted_ascending",
+                      std::is_sorted(tree_ids.begin(), tree_ids.end()));
+            bool tree_exact{ tree_ids.size() == static_cast<std::size_t>(SFM_TREE_N) };
+            for (std::size_t k{ 0 }; tree_exact && k < tree_ids.size(); ++k)
+            {
+                if (tree_ids[k] != static_cast<std::int32_t>(k)) { tree_exact = false; }
+            }
+            ctx.check("cst_sfm_tree_exact_ascending_sequence", tree_exact);
+            ctx.record("[INFO] newSetFromMap(TreeMap): backing klass has 'root', so the "
+                       "router picks tree_map_walk_keys -> SORTED ascending decode, proving "
+                       "the walker is chosen by the backing map's real layout, not 'm'.");
+        }
+
+        // =====================================================================
+        // CROSS-WRAPPER decode — reading the SAME live HashSet OOP through the
+        // generic vmhook::collection AND the vmhook::set type-tag wrapper must
+        // yield the identical element count (both route through the one
+        // collection::to_vector cascade, so the type-tag is purely intent).
+        // =====================================================================
+        {
+            const auto proxy{ fixture::static_field("hashCap17") };
+            if (proxy.has_value())
+            {
+                const auto via_collection{ proxy->get().to_vector<elem_object>() };
+                ctx.check("cst_cross_wrapper_collection_count_is_17",
+                          static_cast<std::int32_t>(via_collection.size()) == CAP17);
+
+                // Re-read through the same field; counts must be identical and
+                // stable (the walk has no destructive heap side effect).
+                const auto proxy2{ fixture::static_field("hashCap17") };
+                const auto via_again{ proxy2->get().to_vector<elem_object>() };
+                ctx.check("cst_cross_wrapper_reread_same_count",
+                          via_again.size() == via_collection.size());
+            }
+            else
+            {
+                ctx.record("[INFO] cross-wrapper: hashCap17 field did not resolve; "
+                           "skipping the cross-wrapper count check (no crash).");
+            }
         }
 
         // =====================================================================

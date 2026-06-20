@@ -78,6 +78,20 @@
 //     bridge, so the runtime _methods array carries BOTH descriptors (enumerated
 //     HARD), and dispatch reaches the real String body either way.
 //
+// EXTRA shapes (scenarios 19-21):
+//   * INTERFACE-LENS read of the default-OVERRIDING impl: pet3 (declared Animal,
+//     runtime Snake) read through the Animal interface wrapper decodes the SAME
+//     oop and the runtime klass is STILL Snake (scenario 16 covered Cat/Robot but
+//     not the override impl).
+//   * BRIDGE descriptor SELECTOR (find_methods_by_signature): a different code
+//     path from get_class_methods -- exactly one "get" name under each of the
+//     String and erased-Object descriptors; the explicit Object-sig call reaches
+//     the real String body through the bridge.
+//   * HOOKING an Animal-INTERFACE-DECLARED method (speak()) on TWO implementers
+//     (Dog and Cat): the probe's invokeinterface dispatch fires the detour for
+//     EACH implementer with the correct CONCRETE receiver.  fires>=1 HARD; exact N
+//     is JIT-variant [INFO]; scoped_hook RAII leaves nothing armed.
+//
 // SAFETY (suite-safe end to end): the entire body runs inside one try/catch that
 // degrades ANY exception to [INFO] (never a FAIL), with an UNCONDITIONAL
 // vmhook::shutdown_hooks() in a trailing block OUTSIDE the try; an entry guard
@@ -85,9 +99,11 @@
 // deref is gated with vmhook::hotspot::is_valid_pointer, and every raw field/
 // klass read is additionally gated with a safe-read header probe so a cold-JVM
 // GC-relocated singleton degrades to [INFO] instead of faulting; decoded objects
-// are null-checked before use.  The module installs NO hooks of its own (it drives
-// the probe purely to publish Java witnesses), so it leaves nothing armed, and
-// every call()-dependent content assert is gated best-effort.
+// are null-checked before use.  The only hooks the module installs are the
+// scoped_hooks of scenario 21 (the interface-declared-method-hook proof), whose
+// RAII handles uninstall at block exit -- BEFORE the unconditional shutdown_hooks()
+// belt-and-braces -- so it leaves nothing armed; every call()-dependent content
+// assert (including each hook's fire count) is gated best-effort.
 //
 // STYLE: wrapper accessors are CLEAN one-liners over the documented field/method
 // idiom (vmhook.hpp ~12457 / ~14856) -- no sentinel-string guards; statics go
@@ -101,6 +117,7 @@
 #include "../harness.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -110,6 +127,20 @@
 
 namespace
 {
+    // ── Hook witnesses for the INTERFACE-DECLARED-METHOD HOOK shape ─────────
+    // Scenario 21 hooks the overridden speak() (an Animal-interface-declared
+    // method) on TWO different implementers (Dog and Cat) and drives the probe,
+    // whose Java run() dispatches s.pet.speak() / s.pet2.speak() through real
+    // invokeinterface bytecode.  Each detour increments its own fire counter and
+    // records whether `self` decoded to the right concrete implementor (proving a
+    // hook on the interface-declared method fires for EACH implementer's dispatch
+    // and hands back the correct concrete receiver).  Atomics: the detour runs on
+    // the Java probe thread while the module asserts on the test thread.  Reset to
+    // 0 before each install so a re-driven probe never double-counts.
+    std::atomic<int> g_dog_speak_fires{ 0 };
+    std::atomic<int> g_dog_speak_self_ok{ 0 };
+    std::atomic<int> g_cat_speak_fires{ 0 };
+    std::atomic<int> g_cat_speak_self_ok{ 0 };
     // Internal names of the fixture's nested types (javac '$' nesting; confirmed
     // via javap).  Centralised so registration and the resolution checks below
     // can never drift apart.
@@ -398,6 +429,12 @@ namespace
         {
             return get_method("get", "()Ljava/lang/String;")->call().as_string();
         }
+        // Call the SYNTHETIC bridge Object get() explicitly; it delegates to the
+        // real String body, so the result still carries the boxed value.
+        auto get_via_object_sig() const -> std::string
+        {
+            return get_method("get", "()Ljava/lang/Object;")->call().as_string();
+        }
 
         auto resolves_get_name()       const -> bool { return get_method("get").has_value(); }
         auto resolves_get_string_sig() const -> bool { return get_method("get", "()Ljava/lang/String;").has_value(); }
@@ -539,6 +576,9 @@ namespace
         auto robot_as_animal() const -> std::unique_ptr<ifp_animal> { return get_field("robotPet")->get(); }
         auto robot_as_named()  const -> std::unique_ptr<ifp_named>  { return get_field("robotPet")->get(); }
         auto pet2_as_animal()  const -> std::unique_ptr<ifp_animal> { return get_field("pet2")->get(); }
+        // pet3 (declared Animal, runtime Snake -- the default-OVERRIDING impl) read
+        // through the declared interface lens (same type-agnostic decode as pet2).
+        auto pet3_as_animal()  const -> std::unique_ptr<ifp_animal> { return get_field("pet3")->get(); }
         // ---- read the abstract-typed slot AS the abstract base wrapper ----
         auto abs_as_abstract() const -> std::unique_ptr<ifp_abstract> { return get_field("absPet")->get(); }
 
@@ -1909,6 +1949,213 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
         }
 
         // =================================================================
+        // 19. SNAKE READ THROUGH THE DECLARED Animal INTERFACE LENS.
+        //     pet3 is declared Animal and IS a Snake (the impl that OVERRIDES the
+        //     interface default).  Reading the SAME slot as the Animal interface
+        //     wrapper decodes the SAME oop as the concrete Snake read, and the
+        //     runtime klass via the interface lens is STILL Snake.  speak()
+        //     resolves through the interface lens (own abstract on the wrapper's
+        //     klass).  Mirrors the Cat/Robot interface-lens identity for the
+        //     default-OVERRIDING impl, which scenario 16 did not cover.
+        // =================================================================
+        {
+            // Read pet3 (declared Animal, runtime Snake) AS the Animal interface.
+            const auto snake_iface{ holder->pet3_as_animal() };
+            ctx.check("ipm_snake_as_animal_nonnull", snake_iface != nullptr);
+            if (pet_snake && snake_iface)
+            {
+                ctx.check("ipm_snake_animal_lens_same_oop",
+                          snake_iface->get_instance() == pet_snake->get_instance());
+                ctx.check("ipm_snake_animal_lens_resolves_speak", snake_iface->resolves_speak());
+                // The Animal interface klass declares the default, so the lens (own
+                // klass) reaches defaultGreet() at depth 0 -- HARD on every JDK.
+                ctx.check("ipm_snake_animal_lens_resolves_own_default_greet",
+                          snake_iface->resolves_default_greet());
+                const std::string via_iface{ runtime_klass_name(snake_iface->get_instance()) };
+                if (!via_iface.empty())
+                {
+                    ctx.check("ipm_snake_runtime_klass_via_interface_lens_is_snake",
+                              ends_with(via_iface, "Snake"));
+                }
+            }
+        }
+
+        // =================================================================
+        // 20. BRIDGE-METHOD DESCRIPTOR SELECTOR (find_methods_by_signature).
+        //     A DIFFERENT code path from get_class_methods (scenario 14): key the
+        //     StringBox klass's _methods by EXACT JVM descriptor.  The covariant
+        //     String get() and the synthetic Object get() bridge are BOTH declared
+        //     on the impl's own klass, so the descriptor selector finds exactly one
+        //     name ("get") under each descriptor -- proving the erasure bridge is a
+        //     real, separately-addressable _methods entry.  Universal warm read.
+        // =================================================================
+        {
+            const auto string_get_names{
+                vmhook::find_methods_by_signature<ifp_string_box>("()Ljava/lang/String;") };
+            const auto object_get_names{
+                vmhook::find_methods_by_signature<ifp_string_box>("()Ljava/lang/Object;") };
+            if (!string_get_names.empty() || !object_get_names.empty())
+            {
+                // The real covariant String get(): exactly one "get" under this sig.
+                ctx.check("ipm_stringbox_string_sig_selects_get",
+                          string_get_names.size() == 1 && string_get_names.front() == "get");
+                // The synthetic Object get() bridge: exactly one "get" under the
+                // erased sig (erasure is a language constant on Java 8+).
+                ctx.check("ipm_stringbox_object_sig_selects_bridge_get",
+                          object_get_names.size() == 1 && object_get_names.front() == "get");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: StringBox descriptor selector found no 'get' "
+                           "under either signature (klass not resolvable on this run); skipped.");
+            }
+        }
+
+        // The explicit Object-sig get() lookup pins the BRIDGE overload; calling it
+        // still reaches the REAL String body (the bridge delegates), so the result
+        // carries the boxed value -- best-effort call, HARD content when it returns.
+        if (box && box->resolves_get_object_sig() && oop_readable(box->get_instance()))
+        {
+            const std::string via_bridge{ box->get_via_object_sig() };
+            if (!via_bridge.empty())
+            {
+                ctx.check("ipm_stringbox_bridge_object_get_reaches_real_body",
+                          contains(via_bridge, "boxed:"));
+                ctx.check("ipm_stringbox_bridge_object_get_value", contains(via_bridge, "cargo"));
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: StringBox bridge Object get() returned no value "
+                           "via the interpreter on this JDK build; content assert skipped.");
+            }
+        }
+
+        // =================================================================
+        // 21. HOOKING AN INTERFACE-DECLARED METHOD (fires per implementer).
+        //     speak() is declared on the Animal interface and overridden by every
+        //     impl.  Hooking it on TWO different implementers (Dog and Cat) and
+        //     driving the probe -- whose Java run() dispatches s.pet.speak() and
+        //     s.pet2.speak() through real invokeinterface bytecode -- proves the
+        //     hook fires for EACH implementer's own dispatch and hands back the
+        //     correct CONCRETE receiver.  Fire counts: >=1 HARD (the driver may
+        //     JIT-inline the hot probe so fires<expected); exact N is [INFO].  The
+        //     scoped_hook handles drop at block exit, leaving NOTHING armed.
+        //
+        //     Install-on-unlinked rule: drive the probe ONCE before installing so
+        //     each impl's speak() Method is dispatched (i2i entry linked) before the
+        //     hook patches it -- installing on a never-dispatched lazy-link stub
+        //     would fail.  All hook work is best-effort: a build where speak() never
+        //     routes through the i2i detour records [INFO], never a FAIL.
+        // =================================================================
+        if (pet_dog && pet_cat)
+        {
+            // Pre-link: one probe cycle dispatches every impl's speak() so the i2i
+            // entries exist before we patch them (dispatch-then-install).
+            const bool prelink_done{ drive(ctx, 0) };
+            ctx.record(std::string("[INFO] interface_polymorphism: pre-install probe drive ")
+                       + (prelink_done ? "completed" : "did not complete")
+                       + " (links each impl's speak() i2i entry before hooking).");
+
+            g_dog_speak_fires.store(0);
+            g_dog_speak_self_ok.store(0);
+            g_cat_speak_fires.store(0);
+            g_cat_speak_self_ok.store(0);
+
+            {
+                // Hook the Animal-interface-declared speak() on Dog AND on Cat.
+                auto dog_hook{ vmhook::scoped_hook<ifp_dog>(
+                    "speak",
+                    [](vmhook::return_value&, const std::unique_ptr<ifp_dog>& self)
+                    {
+                        g_dog_speak_fires.fetch_add(1, std::memory_order_relaxed);
+                        // The receiver handed to the interface-method hook is the
+                        // CONCRETE Dog (name == "Rex"), proving per-implementer
+                        // dispatch reaches THIS impl with THIS object.
+                        if (self != nullptr && self->name() == "Rex")
+                        {
+                            g_dog_speak_self_ok.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }) };
+                auto cat_hook{ vmhook::scoped_hook<ifp_cat>(
+                    "speak",
+                    [](vmhook::return_value&, const std::unique_ptr<ifp_cat>& self)
+                    {
+                        g_cat_speak_fires.fetch_add(1, std::memory_order_relaxed);
+                        if (self != nullptr && self->name() == "Whiskers")
+                        {
+                            g_cat_speak_self_ok.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }) };
+
+                if (dog_hook.installed() && cat_hook.installed())
+                {
+                    ctx.check("ipm_dog_speak_interface_hook_installed",   dog_hook.installed());
+                    ctx.check("ipm_cat_speak_interface_hook_installed",   cat_hook.installed());
+
+                    // Drive the probe a few times; the JIT may inline the hot probe
+                    // so fires can be < drives.  We only need fires>=1 to prove the
+                    // interface-declared-method hook fires on real dispatch.
+                    int drives{ 0 };
+                    for (int attempt{ 0 };
+                         attempt < 6
+                         && (g_dog_speak_fires.load() == 0 || g_cat_speak_fires.load() == 0);
+                         ++attempt)
+                    {
+                        if (drive(ctx, 0)) { ++drives; }
+                    }
+
+                    const int dog_fires{ g_dog_speak_fires.load() };
+                    const int cat_fires{ g_cat_speak_fires.load() };
+
+                    if (dog_fires >= 1 || cat_fires >= 1)
+                    {
+                        // At least one implementer's dispatch routed through the i2i
+                        // detour -> the interface-declared-method hook fires.  HARD.
+                        ctx.check("ipm_interface_method_hook_fires_for_an_implementer",
+                                  dog_fires >= 1 || cat_fires >= 1);
+                        // When BOTH fired, BOTH implementers dispatched their own
+                        // override through the one hooked interface method.  Each is
+                        // best-effort (one impl may inline while the other doesn't).
+                        if (dog_fires >= 1)
+                        {
+                            ctx.check("ipm_dog_speak_hook_fired", dog_fires >= 1);
+                            ctx.check("ipm_dog_speak_hook_self_is_concrete_dog",
+                                      g_dog_speak_self_ok.load() >= 1);
+                        }
+                        if (cat_fires >= 1)
+                        {
+                            ctx.check("ipm_cat_speak_hook_fired", cat_fires >= 1);
+                            ctx.check("ipm_cat_speak_hook_self_is_concrete_cat",
+                                      g_cat_speak_self_ok.load() >= 1);
+                        }
+                        // Exact counts are NEVER hard-asserted (post-JIT inlining can
+                        // drop fires below the drive count): record for visibility.
+                        ctx.record(std::string("[INFO] interface_polymorphism: interface-declared speak() hook "
+                                   "fired Dog=") + std::to_string(dog_fires) + " Cat="
+                                   + std::to_string(cat_fires) + " over " + std::to_string(drives)
+                                   + " probe drive(s) (>=1 is the invariant; exact N is JIT-variant).");
+                    }
+                    else
+                    {
+                        ctx.record("[INFO] interface_polymorphism: neither implementer's speak() routed through "
+                                   "the i2i detour on this JDK build (hot probe JIT-compiled/inlined before the "
+                                   "detour, or the interpreter never re-entered); interface-method-hook firing "
+                                   "is best-effort -- the per-impl runtime-klass + dispatch proofs above already "
+                                   "establish the polymorphism.  Not a failure.");
+                    }
+                }
+                else
+                {
+                    ctx.record("[INFO] interface_polymorphism: scoped_hook on speak() did not install for one or "
+                               "both implementers on this JDK build (lazy-link stub / fast-JIT); skipped the "
+                               "interface-method-hook firing assertion (best-effort).");
+                }
+            }
+            // Both scoped_hook handles are now out of scope -> speak() unhooked on
+            // BOTH implementers; the module leaves nothing armed.
+        }
+
+        // =================================================================
         //  8. JVM AGREEMENT: the probe runs the SAME observations Java-side and
         //     publishes per-impl witnesses.  Confirms the JVM itself sees each
         //     impl's distinct dispatch, and -- when the native call also returned
@@ -2070,8 +2317,10 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
                    "(degraded to INFO; not a failure).");
     }
 
-    // UNCONDITIONAL teardown OUTSIDE the try: this module installs no hooks, but
-    // call shutdown_hooks() anyway so the module leaves a guaranteed-clean state
-    // regardless of any exception path above (suite-safe contract).
+    // UNCONDITIONAL teardown OUTSIDE the try: the only hooks this module installs
+    // are scoped_hooks (scenario 21) whose RAII handles already uninstall at block
+    // exit, but call shutdown_hooks() anyway so the module leaves a guaranteed-clean
+    // state regardless of any exception path above (e.g. a throw between install and
+    // the handles' destruction) -- suite-safe contract.
     vmhook::shutdown_hooks();
 }

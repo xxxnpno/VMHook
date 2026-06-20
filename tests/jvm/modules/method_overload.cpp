@@ -105,6 +105,7 @@ namespace
         static auto last_int()    -> std::int32_t { return static_field("lastIntArg")->get(); }
         static auto last_long()   -> std::int64_t { return static_field("lastLongArg")->get(); }
         static auto last_double() -> double       { return static_field("lastDoubleArg")->get(); }
+        static auto last_float()  -> float        { return static_field("lastFloatArg")->get(); }
         static auto last_bool()   -> bool         { return static_field("lastBoolArg")->get(); }
         static auto last_byte()   -> std::int8_t  { return static_field("lastByteArg")->get(); }
         static auto last_short()  -> std::int16_t { return static_field("lastShortArg")->get(); }
@@ -114,6 +115,12 @@ namespace
         static auto last_arg2b()  -> std::int64_t { return static_field("lastArg2B")->get(); }
         static auto last_array_len()  -> std::int32_t { return static_field("lastArrayLen")->get(); }
         static auto last_array_head() -> std::int64_t { return static_field("lastArrayHead")->get(); }
+        static auto last_arg_count()  -> std::int32_t { return static_field("lastArgCount")->get(); }
+        static auto last_arg_first()  -> std::int32_t { return static_field("lastArgFirst")->get(); }
+        static auto last_arg_last()   -> std::int32_t { return static_field("lastArgLast")->get(); }
+        static auto last_double_b()   -> double       { return static_field("lastDoubleArgB")->get(); }
+        static auto last_float_b()    -> float        { return static_field("lastFloatArgB")->get(); }
+        static auto last_bool_b()     -> bool         { return static_field("lastBoolArgB")->get(); }
 
         // ── name-only instance resolution helpers (the FEATURE) ────────────
         // Each returns the resolved overload's int sentinel.
@@ -134,6 +141,17 @@ namespace
         {
             return get_method("pick")->call(std::forward<a_t>(a), std::forward<b_t>(b), std::forward<c_t>(c));
         }
+
+        // High-arity name-only resolution: 8 ints (fills exactly eight jvalue
+        // slots) and 9 ints (needs a ninth) — the >8-arg packing boundary.  The
+        // resolver disambiguates pick(int x8) / pick(int x9) by ARITY alone.
+        auto pick8(std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d,
+                   std::int32_t e, std::int32_t f, std::int32_t g, std::int32_t h) -> std::int32_t
+        {
+            return get_method("pick")->call(a, b, c, d, e, f, g, h);
+        }
+        // NOTE: a 9-arg pick is NOT callable through method_proxy::call (it has a
+        // `max 8 arguments` static_assert), so 8 args is the testable packing boundary.
 
         // explicit-signature resolution: bypasses the hierarchy walk (the
         // signature_text fast-path at resolve_compatible_method:13307).
@@ -264,6 +282,14 @@ namespace
     constexpr std::int32_t RET_LONG_DOUBLE = 1027;  // pick(long,double)-> (JD)I  (two wide slots)
     constexpr std::int32_t RET_INT_ARRAY   = 1031;  // pick(int[])  -> ([I)I
     constexpr std::int32_t RET_LONG_ARRAY  = 1032;  // pick(long[]) -> ([J)I
+    constexpr std::int32_t RET_CHAR_ARRAY  = 1033;  // pick(char[]) -> ([C)I
+    constexpr std::int32_t RET_DOUBLE_DOUBLE = 1041;  // pick(double,double) -> (DD)I
+    constexpr std::int32_t RET_FLOAT_FLOAT   = 1042;  // pick(float,float)   -> (FF)I
+    constexpr std::int32_t RET_BOOL_BOOL     = 1043;  // pick(boolean,boolean)-> (ZZ)I
+    constexpr std::int32_t RET_OBJ_OBJ       = 1044;  // pick(Object,Object) -> (Lo;Lo;)I
+    constexpr std::int32_t RET_INT_INT_REFS  = 1045;  // pick(Integer,Integer)-> (Li;Li;)I
+    constexpr std::int32_t RET_INT8        = 1051;  // pick(int x8)  -> (IIIIIIII)I  (8-slot boundary)
+    constexpr std::int32_t RET_INT9        = 1052;  // pick(int x9)  -> (IIIIIIIII)I (9-slot boundary)
     constexpr std::int32_t RET_ONLY_REF    = 8500;  // onlyRef(Integer) sole-overload fallback sentinel
     constexpr std::int32_t SBIAS           = 100;
 
@@ -465,6 +491,42 @@ namespace
     std::atomic<int>          g_arr_long_attempted{ 0 };
     std::atomic<std::int64_t> g_r_int_scalar_amid_arrays{ k_unset };  // scalar int still -> (I)I
     std::atomic<std::int64_t> g_r_long_scalar_amid_arrays{ k_unset }; // scalar long still -> (J)I
+    // char[] — a THIRD array element type, driven via the pinned "([C)I" sig.
+    std::atomic<std::int64_t> g_arr_char_sig{ k_unset };      // pick_sig("([C)I", char[])
+    std::atomic<std::int64_t> g_arr_char_len{ k_unset };      // echoed char[] length
+    std::atomic<int>          g_arr_char_attempted{ 0 };
+    std::atomic<std::int64_t> g_r_char_scalar_amid_arrays{ k_unset };  // scalar char still -> (C)I
+
+    // ── same-type two-arg overload resolution (per-slot descriptor) ──────────
+    std::atomic<std::int64_t> g_r_double_double{ k_unset };   // pick(double,double) -> (DD)I
+    std::atomic<int>          g_double_double_a_ok{ -1 };     // slot0 double == 1.5 ?
+    std::atomic<int>          g_double_double_b_ok{ -1 };     // slot1 double == 2.5 ?
+    std::atomic<std::int64_t> g_r_float_float{ k_unset };     // pick(float,float)   -> (FF)I
+    std::atomic<int>          g_float_float_a_ok{ -1 };
+    std::atomic<int>          g_float_float_b_ok{ -1 };
+    std::atomic<std::int64_t> g_r_bool_bool{ k_unset };       // pick(boolean,boolean) -> (ZZ)I
+    std::atomic<int>          g_bool_bool_a{ -1 };            // slot0 == true  -> 1
+    std::atomic<int>          g_bool_bool_b{ -1 };            // slot1 == false -> 0
+
+    // ── two-reference overload resolution (per-slot reference CLASS) ─────────
+    std::atomic<std::int64_t> g_r_obj_obj{ k_unset };         // pick(Object,Object)   -> (Lo;Lo;)I
+    std::atomic<std::int64_t> g_r_int_int_refs{ k_unset };    // pick(Integer,Integer) -> (Li;Li;)I
+
+    // ── HIGH-arity (>8-arg) resolution + slot-fidelity at the packing edge ───
+    std::atomic<std::int64_t> g_r_int8{ k_unset };            // pick(int x8) -> RET_INT8
+    std::atomic<std::int64_t> g_int8_count{ k_unset };        // echoed arg count (8)
+    std::atomic<std::int64_t> g_int8_first{ k_unset };        // echoed slot0
+    std::atomic<std::int64_t> g_int8_last{ k_unset };         // echoed slot7 (8th arg)
+    // (g_int9/pick9 removed: call() caps at 8 args, the 9-arg overload is uncallable)
+    // null-oop reference disambiguation: a wrapper carrying a NULL oop still
+    // resolves by C++ TYPE (the resolver never dereferences the oop), so a null
+    // java_integer resolves to pick(Integer); the body ignores the oop.
+    std::atomic<std::int64_t> g_r_null_integer{ k_unset };    // null-oop Integer -> RET_INTEGER
+    std::atomic<std::int64_t> g_r_null_object{ k_unset };     // null-oop Object  -> RET_OBJECT
+    std::atomic<std::int64_t> g_s_null_integer{ k_unset };    // STATIC null-oop Integer -> +SBIAS
+    // STATIC high-arity twin: spick(int x8) by name (8-slot boundary).
+    std::atomic<std::int64_t> g_s_int8{ k_unset };
+    std::atomic<std::int64_t> g_s_int8_count{ k_unset };
 
     // ── ambiguous unregistered-wrapper resolution (nondeterministic; [INFO]) ─
     std::atomic<std::int64_t> g_amb_unregistered{ k_unset };
@@ -608,6 +670,63 @@ namespace
         g_long_double_boundary_a.store(overload_fixture::last_arg2b());
         g_long_double_boundary_b_ok.store(overload_fixture::last_double() == 0.125 ? 1 : 0);
 
+        // ===== same-type two-arg overloads: per-slot descriptor + slot survival =
+        // pick(double,double) "(DD)I" — two wide FP slots; both must survive and
+        // not overlap.  Echoes read IMMEDIATELY (the (JD)I/(D)I calls reuse the
+        // double slots).
+        g_r_double_double.store(s.pick2(1.5, 2.5));
+        g_double_double_a_ok.store(overload_fixture::last_double() == 1.5 ? 1 : 0);
+        g_double_double_b_ok.store(overload_fixture::last_double_b() == 2.5 ? 1 : 0);
+        // pick(float,float) "(FF)I" — two narrow FP slots.
+        g_r_float_float.store(s.pick2(1.25f, 3.75f));
+        g_float_float_a_ok.store(overload_fixture::last_float() == 1.25f ? 1 : 0);
+        g_float_float_b_ok.store(overload_fixture::last_float_b() == 3.75f ? 1 : 0);
+        // pick(boolean,boolean) "(ZZ)I" — the narrowest primitive pair; (true,false)
+        // proves the second slot did not mirror the first.
+        g_r_bool_bool.store(s.pick2(true, false));
+        g_bool_bool_a.store(overload_fixture::last_bool() ? 1 : 0);
+        g_bool_bool_b.store(overload_fixture::last_bool_b() ? 1 : 0);
+
+        // ===== two-REFERENCE overloads: per-slot reference CLASS ===============
+        // pick(Object,Object) vs pick(Integer,Integer): each slot's 'L...;' class
+        // is matched, so an (Object,Object) call must NOT collapse onto the Integer
+        // pair and vice versa.  Bodies ignore the oops (resolution-only).
+        {
+            auto a{ std::make_unique<java_object>(s.get_instance()) };
+            auto b{ std::make_unique<java_object>(s.get_instance()) };
+            g_r_obj_obj.store(s.get_method("pick")->call(std::move(a), std::move(b)));
+        }
+        {
+            auto a{ std::make_unique<java_integer>(s.get_instance()) };
+            auto b{ std::make_unique<java_integer>(s.get_instance()) };
+            g_r_int_int_refs.store(s.get_method("pick")->call(std::move(a), std::move(b)));
+        }
+
+        // ===== HIGH-arity (>8-arg) resolution at the jvalue packing boundary ===
+        // pick(int x8) fills exactly eight jvalue slots; pick(int x9) needs a
+        // ninth.  Resolution is by ARITY alone; the echoes prove the 8th/9th slot
+        // survived (was neither dropped nor aliased onto an earlier slot).
+        g_r_int8.store(s.pick8(81, 82, 83, 84, 85, 86, 87, 88));
+        g_int8_count.store(overload_fixture::last_arg_count());
+        g_int8_first.store(overload_fixture::last_arg_first());
+        g_int8_last.store(overload_fixture::last_arg_last());
+        // (9-arg pick removed — not callable through call(); 8 args is the boundary)
+
+        // ===== null-oop reference disambiguation ==============================
+        // A wrapper carrying a NULL oop still resolves by its C++ TYPE — the
+        // resolver classifies the arg via argument_matches_descriptor (a compile-
+        // time trait check) and NEVER dereferences the oop.  pick(Integer) /
+        // pick(Object) bodies ignore the oop, so a null carrier is memory-safe and
+        // must still land on RET_INTEGER / RET_OBJECT.
+        {
+            auto null_integer{ std::make_unique<java_integer>(nullptr) };
+            g_r_null_integer.store(s.get_method("pick")->call(std::move(null_integer)));
+        }
+        {
+            auto null_object{ std::make_unique<java_object>(nullptr) };
+            g_r_null_object.store(s.get_method("pick")->call(std::move(null_object)));
+        }
+
         // ===== explicit-signature fast path (no hierarchy walk) ============
         // get_method("pick","(I)I") -> signature_text already matches int args,
         // so resolve_compatible_method returns this->method immediately.  Must
@@ -740,6 +859,22 @@ namespace
         // STATIC boundary wide-pair: spick(LONG_MIN, frac) -> (JD)I + SBIAS.
         g_s_long_double_boundary.store(overload_fixture::static_method("spick")->call(
             std::numeric_limits<std::int64_t>::min(), 0.25));
+        // STATIC HIGH-arity twin: spick(int x8) by name (8-jvalue packing boundary).
+        // The static resolver (klass from _pool_holder, fix #7) must select the
+        // 8-arg overload over every lower static arity.  Echoes the count.
+        g_s_int8.store(overload_fixture::static_method("spick")->call(
+            static_cast<std::int32_t>(1), static_cast<std::int32_t>(2),
+            static_cast<std::int32_t>(3), static_cast<std::int32_t>(4),
+            static_cast<std::int32_t>(5), static_cast<std::int32_t>(6),
+            static_cast<std::int32_t>(7), static_cast<std::int32_t>(8)));
+        g_s_int8_count.store(overload_fixture::last_arg_count());
+        // STATIC null-oop reference disambiguation: a null-oop java_integer must
+        // still re-pick spick(Integer) on the historically-broken static path
+        // (resolution is by C++ type; the body ignores the oop).
+        {
+            auto null_integer{ std::make_unique<java_integer>(nullptr) };
+            g_s_null_integer.store(overload_fixture::static_method("spick")->call(std::move(null_integer)));
+        }
 
         // explicit-signature static path: bypasses resolution -> MUST be exact.
         g_s_sig_int.store(overload_fixture::static_method("spick", "(I)I")->call(static_cast<std::int32_t>(1)));
@@ -765,6 +900,9 @@ namespace
         //     (I)I / (J)I — never on the array overload.
         g_r_int_scalar_amid_arrays.store(s.pick(static_cast<std::int32_t>(77)));
         g_r_long_scalar_amid_arrays.store(s.pick(static_cast<std::int64_t>(88)));
+        // A scalar char must ALSO be unperturbed by the char[] overload's presence
+        // (the array-token parser walks past "[C" so a uint16 arg lands on (C)I).
+        g_r_char_scalar_amid_arrays.store(s.pick(static_cast<std::uint16_t>(0x0042)));
         // (2) An explicit "([I)I" / "([J)I" call must reach the ARRAY body.  Build a
         //     real Java int[3]/long[2], wrap the oop, dispatch via the pinned
         //     signature.  Fully guarded: if allocation fails, the call is skipped and
@@ -787,6 +925,18 @@ namespace
                 g_arr_long_sig.store(s.pick_sig("([J)I", std::make_unique<array_carrier>(long_arr)));
                 g_arr_long_len.store(overload_fixture::last_array_len());
                 g_arr_long_head.store(overload_fixture::last_array_head());
+            }
+        }
+        // char[] — a THIRD array element type "([C)I".  Java char is a 16-bit
+        // unsigned code unit, so the element size is sizeof(std::uint16_t).  Same
+        // guarded pattern: skip with [INFO] if the alloc fails.
+        {
+            void* const char_arr{ vmhook::make_java_array("[C", 4, sizeof(std::uint16_t)) };
+            if (char_arr && vmhook::hotspot::is_valid_pointer(char_arr))
+            {
+                g_arr_char_attempted.store(1);
+                g_arr_char_sig.store(s.pick_sig("([C)I", std::make_unique<array_carrier>(char_arr)));
+                g_arr_char_len.store(overload_fixture::last_array_len());
             }
         }
 
@@ -1034,6 +1184,73 @@ namespace
                   && g_long_double_boundary_b_ok.load() == 1);
 
         // =====================================================================
+        //  Same-type two-arg overloads: per-slot descriptor disambiguation and
+        //  independent survival of the two same-width slots.
+        // =====================================================================
+        ctx.check("mo_double_double_resolves_double_double", g_r_double_double.load() == RET_DOUBLE_DOUBLE);
+        ctx.check("mo_double_double_slots_survive",
+                  g_double_double_a_ok.load() == 1 && g_double_double_b_ok.load() == 1);
+        ctx.check("mo_float_float_resolves_float_float", g_r_float_float.load() == RET_FLOAT_FLOAT);
+        ctx.check("mo_float_float_slots_survive",
+                  g_float_float_a_ok.load() == 1 && g_float_float_b_ok.load() == 1);
+        ctx.check("mo_bool_bool_resolves_bool_bool", g_r_bool_bool.load() == RET_BOOL_BOOL);
+        // (true,false): slot0 stayed true, slot1 stayed false — the second boolean
+        // slot did not mirror the first.
+        ctx.check("mo_bool_bool_slots_survive",
+                  g_bool_bool_a.load() == 1 && g_bool_bool_b.load() == 0);
+        // The same-type pairs are mutually distinct AND distinct from the mixed
+        // (JD)I pair — the resolver did not collapse any wide/narrow pair onto
+        // another two-arg overload.
+        ctx.check("mo_same_type_pairs_all_distinct",
+                  g_r_double_double.load() != g_r_float_float.load()
+                  && g_r_float_float.load() != g_r_bool_bool.load()
+                  && g_r_double_double.load() != g_r_bool_bool.load()
+                  && g_r_double_double.load() != g_r_long_double.load());
+
+        // =====================================================================
+        //  Two-REFERENCE overloads: per-slot reference CLASS discrimination.
+        //  pick(Object,Object) and pick(Integer,Integer) must NOT collapse onto
+        //  each other (each slot's 'L...;' class is matched), nor onto the single-
+        //  reference overloads.
+        // =====================================================================
+        ctx.check("mo_obj_obj_resolves_object_object",     g_r_obj_obj.load()      == RET_OBJ_OBJ);
+        ctx.check("mo_integer_integer_resolves_int_refs",  g_r_int_int_refs.load() == RET_INT_INT_REFS);
+        ctx.check("mo_two_ref_overloads_distinct",
+                  g_r_obj_obj.load() != g_r_int_int_refs.load());
+        // and distinct from the single-reference Object / Integer overloads
+        // (a 2-ref shape is told from a 1-ref shape by ARITY, not just by class).
+        ctx.check("mo_two_ref_distinct_from_single_ref",
+                  g_r_obj_obj.load() != g_r_object_registered.load()
+                  && g_r_int_int_refs.load() != g_r_integer_registered.load());
+
+        // =====================================================================
+        //  HIGH-arity (>8-arg) resolution at the jvalue packing boundary.
+        //  pick(int x8) fills exactly eight slots, pick(int x9) needs a ninth;
+        //  the resolver tells them apart by ARITY, and every slot's value
+        //  survived (the 8th/9th arg was neither dropped nor aliased).
+        // =====================================================================
+        ctx.check("mo_arity8_resolves_int8", g_r_int8.load() == RET_INT8);
+        // 8-arg edge slots: count==8, slot0==81, slot7(8th)==88 — the 8-jvalue packing
+        // boundary (call() static_asserts max 8 args, so 9 is not callable/testable).
+        ctx.check("mo_arity8_arg_slots",
+                  g_int8_count.load() == 8 && g_int8_first.load() == 81 && g_int8_last.load() == 88);
+        // high arities are distinct from every low arity (0..3) — no collapse.
+        ctx.check("mo_high_arity_distinct_from_low",
+                  g_r_int8.load() != g_r_arity3.load()
+                  && g_r_int8.load() != g_r_arity2.load());
+
+        // =====================================================================
+        //  NULL-oop reference disambiguation: a wrapper carrying a NULL oop still
+        //  resolves by its C++ TYPE — argument_matches_descriptor is a compile-
+        //  time trait check that never dereferences the oop.  So a null Integer
+        //  wrapper still lands on pick(Integer) and a null Object on pick(Object),
+        //  and the process survives (bodies ignore the oop).
+        // =====================================================================
+        ctx.check("mo_null_integer_resolves_integer", g_r_null_integer.load() == RET_INTEGER);
+        ctx.check("mo_null_object_resolves_object",    g_r_null_object.load()  == RET_OBJECT);
+        ctx.check("mo_null_refs_distinct", g_r_null_integer.load() != g_r_null_object.load());
+
+        // =====================================================================
         //  Explicit-signature fast path resolves identically to name-only.
         // =====================================================================
         ctx.check("mo_sig_int_resolves_int",       g_sig_int.load()    == RET_INT);
@@ -1246,6 +1463,16 @@ namespace
         // STATIC boundary wide-pair: spick(LONG_MIN, 0.25) -> (JD)I + SBIAS.
         ctx.check("mo_static_long_double_boundary_resolves_long_double",
                   g_s_long_double_boundary.load() == RET_LONG_DOUBLE + SBIAS);
+        // STATIC HIGH-arity: spick(int x8) re-picked over every lower static arity
+        // on the (historically-broken) static path, at the 8-jvalue boundary.
+        ctx.check("mo_static_arity8_resolves_int8", g_s_int8.load() == RET_INT8 + SBIAS);
+        ctx.check("mo_static_arity8_arg_count", g_s_int8_count.load() == 8);
+        ctx.check("mo_static_arity8_distinct_from_arity2",
+                  g_s_int8.load() != g_s_arity2.load());
+        // STATIC null-oop reference: a null Integer wrapper still re-picks
+        // spick(Integer) (resolution by C++ type, never an oop deref).
+        ctx.check("mo_static_null_integer_resolves_integer",
+                  g_s_null_integer.load() == RET_INTEGER + SBIAS);
 
         // =====================================================================
         //  ARRAY-vs-scalar resolution.
@@ -1258,6 +1485,9 @@ namespace
                   g_r_int_scalar_amid_arrays.load() == RET_INT);
         ctx.check("mo_scalar_long_unperturbed_by_array_overload",
                   g_r_long_scalar_amid_arrays.load() == RET_LONG);
+        // a scalar char is likewise unperturbed by the char[] overload's presence.
+        ctx.check("mo_scalar_char_unperturbed_by_array_overload",
+                  g_r_char_scalar_amid_arrays.load() == RET_CHAR);
         // (2) Explicit "([I)I" / "([J)I" calls reach the ARRAY bodies (distinct
         //     from each other and from every scalar overload).  Guarded on the
         //     array allocation having succeeded; if it did not, record [INFO].
@@ -1283,10 +1513,29 @@ namespace
             ctx.record("[INFO] long[] allocation unavailable in this detour — "
                        "explicit ([J)I array dispatch skipped (no fault, no FAIL)");
         }
+        if (g_arr_char_attempted.load() == 1)
+        {
+            // ([C)I reaches the char[] body — a THIRD array element type, distinct
+            // from int[]/long[] and from the scalar char overload.
+            ctx.check("mo_char_array_sig_resolves_char_array", g_arr_char_sig.load() == RET_CHAR_ARRAY);
+            ctx.check("mo_char_array_arg_landed", g_arr_char_len.load() == 4);
+            ctx.check("mo_char_array_distinct_from_scalar_char",
+                      g_arr_char_sig.load() != g_r_char.load());
+        }
+        else
+        {
+            ctx.record("[INFO] char[] allocation unavailable in this detour — "
+                       "explicit ([C)I array dispatch skipped (no fault, no FAIL)");
+        }
         if (g_arr_int_attempted.load() == 1 && g_arr_long_attempted.load() == 1)
         {
             ctx.check("mo_int_array_vs_long_array_distinct",
                       g_arr_int_sig.load() != g_arr_long_sig.load());
+        }
+        if (g_arr_int_attempted.load() == 1 && g_arr_char_attempted.load() == 1)
+        {
+            ctx.check("mo_int_array_vs_char_array_distinct",
+                      g_arr_int_sig.load() != g_arr_char_sig.load());
         }
 
         // =====================================================================

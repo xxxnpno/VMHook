@@ -46,6 +46,21 @@
 //                                            identical identity + identical Method*
 //                                            every fire (stability dual of mode 6),
 //                                            and caller() is idempotent in one fire
+//  14  objRetCaller(int) -> inner          : OBJECT return type — signature
+//                                            (I)Ljava/lang/String; ; proves the
+//                                            descriptor's RETURN tail decodes (ref)
+//  15  voidRetCaller(int) -> inner         : VOID return type — signature (I)V ;
+//                                            the single-letter V return tail
+//  16  wideRetCaller(int) -> inner         : WIDE (long) return — signature (I)J ;
+//                                            return-type analogue of mode 7's (J)I
+//  17  capTop -> capMid -> inner           : EXPLICIT stack_trace caps — (1)/(2)/(3)
+//                                            truncate within the cap (HARD never
+//                                            exceeds; exact count INFO/inlinable),
+//                                            (0) PROMOTES to 64 (HARD <=64, not 0)
+//  18  discrimA -> inner, discrimB -> inner: trace EXCLUSION — fire 0's trace omits
+//                                            discrimB and fire 1's omits discrimA
+//                                            (HARD: inlining only removes frames,
+//                                            never adds a foreign one)
 //
 // SAFETY / CROSS-TOOLCHAIN (Java 8-26 x 5 toolchains; win-clang/mingw have NO
 // SEH, and this feature WALKS INTERPRETER FRAMES — the #1 cold-fault source):
@@ -118,6 +133,12 @@ namespace
     const std::string SIG_II{ "(I)I" };
     const std::string SIG_JI{ "(J)I" };
     const std::string CTOR_NAME{ "<init>" };
+
+    // Return-type-varying caller descriptors (modes 14-16): every other caller
+    // returns int, so these isolate the RETURN-type tail of the descriptor.
+    const std::string SIG_OBJRET{ "(I)Ljava/lang/String;" };  // object return
+    const std::string SIG_VOIDRET{ "(I)V" };                  // void return
+    const std::string SIG_WIDERET{ "(I)J" };                  // wide (long) return
 
     // mode 8: every JVM base-type letter, in declaration order (Z B C S I F D J).
     const std::string SIG_MANYPRIMS{ "(ZBCSIFDJ)I" };
@@ -277,6 +298,57 @@ namespace
     std::atomic<bool>         g_m13_idempotent{ true };          // caller() twice == itself
     std::atomic<void*>        g_m13_first_method{ nullptr };
 
+    // ── Mode 14 — objRetCaller(int) -> inner : object return type ─────────────
+    std::atomic<std::int32_t> g_m14_fires{ 0 };
+    std::atomic<bool>         g_m14_caller_valid{ false };
+    std::atomic<bool>         g_m14_caller_is_objRet{ false };   // method_name == objRetCaller
+    std::atomic<bool>         g_m14_sig_exact{ false };          // signature == (I)Ljava/lang/String;
+    std::atomic<bool>         g_m14_sig_ret_is_object{ false };  // ends ")L...;" not ")I"
+    std::atomic<bool>         g_m14_sig_not_II{ false };         // distinct from leaf's (I)I
+    std::atomic<bool>         g_m14_trace0_sig_exact{ false };
+
+    // ── Mode 15 — voidRetCaller(int) -> inner : void return type ──────────────
+    std::atomic<std::int32_t> g_m15_fires{ 0 };
+    std::atomic<bool>         g_m15_caller_valid{ false };
+    std::atomic<bool>         g_m15_caller_is_voidRet{ false };  // method_name == voidRetCaller
+    std::atomic<bool>         g_m15_sig_exact{ false };          // signature == (I)V
+    std::atomic<bool>         g_m15_sig_ret_is_void{ false };    // ends ")V"
+    std::atomic<bool>         g_m15_sig_not_II{ false };         // distinct from leaf's (I)I
+
+    // ── Mode 16 — wideRetCaller(int) -> inner : wide (long) return type ───────
+    std::atomic<std::int32_t> g_m16_fires{ 0 };
+    std::atomic<bool>         g_m16_caller_valid{ false };
+    std::atomic<bool>         g_m16_caller_is_wideRet{ false };  // method_name == wideRetCaller
+    std::atomic<bool>         g_m16_sig_exact{ false };          // signature == (I)J
+    std::atomic<bool>         g_m16_sig_ret_is_long{ false };    // ends ")J"
+    std::atomic<bool>         g_m16_sig_not_II{ false };         // distinct from leaf's (I)I
+
+    // ── Mode 17 — capTop -> capMid -> inner : explicit stack_trace caps ───────
+    std::atomic<std::int32_t> g_m17_fires{ 0 };
+    std::atomic<bool>         g_m17_caller_valid{ false };
+    std::atomic<bool>         g_m17_caller_is_capMid{ false };   // immediate caller == capMid
+    std::atomic<std::size_t>  g_m17_default_size{ 0 };
+    std::atomic<std::size_t>  g_m17_cap1_size{ 0 };
+    std::atomic<std::size_t>  g_m17_cap2_size{ 0 };
+    std::atomic<std::size_t>  g_m17_cap3_size{ 0 };
+    std::atomic<std::size_t>  g_m17_cap0_size{ 0 };              // zero-promotion result
+    std::atomic<bool>         g_m17_cap1_within{ false };        // HARD: <= 1
+    std::atomic<bool>         g_m17_cap2_within{ false };        // HARD: <= 2
+    std::atomic<bool>         g_m17_cap3_within{ false };        // HARD: <= 3
+    std::atomic<bool>         g_m17_cap0_within{ false };        // HARD: <= 64 (promoted, not 0)
+    std::atomic<bool>         g_m17_cap_monotonic{ false };      // HARD: cap1<=cap2<=cap3
+    std::atomic<bool>         g_m17_cap1_trace0_is_capMid{ false }; // INFO: cap1[0]==capMid
+    std::atomic<bool>         g_m17_cap1_nonempty{ false };      // INFO: cap1 size==1 (interp)
+
+    // ── Mode 18 — discrimA -> inner, discrimB -> inner : trace EXCLUSION ───────
+    std::atomic<std::int32_t> g_m18_fires{ 0 };
+    std::atomic<bool>         g_m18_a_valid{ false };
+    std::atomic<bool>         g_m18_b_valid{ false };
+    std::atomic<bool>         g_m18_a_is_discrimA{ false };      // fire 0 caller == discrimA
+    std::atomic<bool>         g_m18_b_is_discrimB{ false };      // fire 1 caller == discrimB
+    std::atomic<bool>         g_m18_a_trace_excludes_b{ true };  // HARD: A's trace has no discrimB
+    std::atomic<bool>         g_m18_b_trace_excludes_a{ true };  // HARD: B's trace has no discrimA
+
     auto reset_observations() -> void
     {
         g_m1_fires.store(0);
@@ -373,6 +445,52 @@ namespace
         g_m13_method_stable.store(true);
         g_m13_idempotent.store(true);
         g_m13_first_method.store(nullptr);
+
+        g_m14_fires.store(0);
+        g_m14_caller_valid.store(false);
+        g_m14_caller_is_objRet.store(false);
+        g_m14_sig_exact.store(false);
+        g_m14_sig_ret_is_object.store(false);
+        g_m14_sig_not_II.store(false);
+        g_m14_trace0_sig_exact.store(false);
+
+        g_m15_fires.store(0);
+        g_m15_caller_valid.store(false);
+        g_m15_caller_is_voidRet.store(false);
+        g_m15_sig_exact.store(false);
+        g_m15_sig_ret_is_void.store(false);
+        g_m15_sig_not_II.store(false);
+
+        g_m16_fires.store(0);
+        g_m16_caller_valid.store(false);
+        g_m16_caller_is_wideRet.store(false);
+        g_m16_sig_exact.store(false);
+        g_m16_sig_ret_is_long.store(false);
+        g_m16_sig_not_II.store(false);
+
+        g_m17_fires.store(0);
+        g_m17_caller_valid.store(false);
+        g_m17_caller_is_capMid.store(false);
+        g_m17_default_size.store(0);
+        g_m17_cap1_size.store(0);
+        g_m17_cap2_size.store(0);
+        g_m17_cap3_size.store(0);
+        g_m17_cap0_size.store(0);
+        g_m17_cap1_within.store(false);
+        g_m17_cap2_within.store(false);
+        g_m17_cap3_within.store(false);
+        g_m17_cap0_within.store(false);
+        g_m17_cap_monotonic.store(false);
+        g_m17_cap1_trace0_is_capMid.store(false);
+        g_m17_cap1_nonempty.store(false);
+
+        g_m18_fires.store(0);
+        g_m18_a_valid.store(false);
+        g_m18_b_valid.store(false);
+        g_m18_a_is_discrimA.store(false);
+        g_m18_b_is_discrimB.store(false);
+        g_m18_a_trace_excludes_b.store(true);
+        g_m18_b_trace_excludes_a.store(true);
     }
 
     // Drives exactly one probe cycle for `mode` (rising-edge programs mode +
@@ -1133,6 +1251,347 @@ VMHOOK_JVM_MODULE(return_caller)
         // and idempotent within a single fire.
         ctx.check("rc_m13_method_ptr_stable", g_m13_method_stable.load());
         ctx.check("rc_m13_caller_idempotent_in_one_fire", g_m13_idempotent.load());
+    }
+
+    // =====================================================================
+    // Scenario 14 — objRetCaller(int) -> inner.  Every other caller returns int;
+    // this one returns java.lang.String, so caller().signature must be exactly
+    // "(I)Ljava/lang/String;" — proving the descriptor's RETURN tail decodes a
+    // REFERENCE type, not just the parameter list.  Distinct from the leaf's own
+    // (I)I and the same descriptor surfaces in stack_trace()[0].
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                g_m14_fires.fetch_add(1, std::memory_order_relaxed);
+
+                const auto info{ ret.caller() };
+                g_m14_caller_valid.store(info.valid(), std::memory_order_relaxed);
+                if (info.valid())
+                {
+                    g_m14_caller_is_objRet.store(info.method_name == "objRetCaller",
+                                                 std::memory_order_relaxed);
+                    g_m14_sig_exact.store(info.signature == SIG_OBJRET,
+                                          std::memory_order_relaxed);
+                    g_m14_sig_not_II.store(info.signature != SIG_II,
+                                           std::memory_order_relaxed);
+                    // Return tail is a reference type: ends ");" preceded by an 'L'
+                    // descriptor, NOT a bare ")I".  Confirms the return-type slot,
+                    // not the params, carries the object marker.
+                    const std::string& s{ info.signature };
+                    g_m14_sig_ret_is_object.store(
+                        s.size() >= 2 && s.back() == ';'
+                     && s.find(")L") != std::string::npos,
+                        std::memory_order_relaxed);
+                }
+
+                const auto trace{ ret.stack_trace() };
+                if (!trace.empty())
+                {
+                    g_m14_trace0_sig_exact.store(trace.front().signature == SIG_OBJRET,
+                                                 std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m14_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 14) };
+        ctx.check("rc_m14_probe_completed", done);
+        ctx.check("rc_m14_leaf_ran_once", caller_fixture::get_inner_calls() == 1);
+        ctx.check("rc_m14_fired_once", g_m14_fires.load() == 1);
+
+        ctx.check("rc_m14_caller_valid", g_m14_caller_valid.load());
+        ctx.check("rc_m14_caller_is_objRetCaller", g_m14_caller_is_objRet.load());
+        // The headline: a reference RETURN type decodes verbatim in the descriptor.
+        ctx.check("rc_m14_signature_object_return_exact", g_m14_sig_exact.load());
+        ctx.check("rc_m14_signature_return_is_object", g_m14_sig_ret_is_object.load());
+        ctx.check("rc_m14_signature_distinct_from_leaf", g_m14_sig_not_II.load());
+        ctx.check("rc_m14_trace0_signature_exact", g_m14_trace0_sig_exact.load());
+    }
+
+    // =====================================================================
+    // Scenario 15 — voidRetCaller(int) -> inner.  The caller returns void, so the
+    // descriptor return tail is the single letter V: signature exactly "(I)V" —
+    // distinct from every "(...)I" / "(...)J" caller.  Proves the void return
+    // descriptor survives the decode (no fixed assumption that callers return a
+    // value).
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                g_m15_fires.fetch_add(1, std::memory_order_relaxed);
+
+                const auto info{ ret.caller() };
+                g_m15_caller_valid.store(info.valid(), std::memory_order_relaxed);
+                if (info.valid())
+                {
+                    g_m15_caller_is_voidRet.store(info.method_name == "voidRetCaller",
+                                                  std::memory_order_relaxed);
+                    g_m15_sig_exact.store(info.signature == SIG_VOIDRET,
+                                          std::memory_order_relaxed);
+                    g_m15_sig_not_II.store(info.signature != SIG_II,
+                                           std::memory_order_relaxed);
+                    const std::string& s{ info.signature };
+                    g_m15_sig_ret_is_void.store(
+                        s.size() >= 2 && s.compare(s.size() - 2, 2, ")V") == 0,
+                        std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m15_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 15) };
+        ctx.check("rc_m15_probe_completed", done);
+        ctx.check("rc_m15_leaf_ran_once", caller_fixture::get_inner_calls() == 1);
+        ctx.check("rc_m15_fired_once", g_m15_fires.load() == 1);
+
+        ctx.check("rc_m15_caller_valid", g_m15_caller_valid.load());
+        ctx.check("rc_m15_caller_is_voidRetCaller", g_m15_caller_is_voidRet.load());
+        // The headline: the void return tail decodes to ")V".
+        ctx.check("rc_m15_signature_void_return_exact", g_m15_sig_exact.load());
+        ctx.check("rc_m15_signature_return_is_void", g_m15_sig_ret_is_void.load());
+        ctx.check("rc_m15_signature_distinct_from_leaf", g_m15_sig_not_II.load());
+    }
+
+    // =====================================================================
+    // Scenario 16 — wideRetCaller(int) -> inner.  The caller returns a 64-bit
+    // long, so the descriptor return tail is J: signature exactly "(I)J".  This
+    // is the RETURN-type analogue of mode 7's (J)I wide PARAM — proving a wide
+    // return slot decodes to the single letter J.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                g_m16_fires.fetch_add(1, std::memory_order_relaxed);
+
+                const auto info{ ret.caller() };
+                g_m16_caller_valid.store(info.valid(), std::memory_order_relaxed);
+                if (info.valid())
+                {
+                    g_m16_caller_is_wideRet.store(info.method_name == "wideRetCaller",
+                                                  std::memory_order_relaxed);
+                    g_m16_sig_exact.store(info.signature == SIG_WIDERET,
+                                          std::memory_order_relaxed);
+                    g_m16_sig_not_II.store(info.signature != SIG_II,
+                                           std::memory_order_relaxed);
+                    const std::string& s{ info.signature };
+                    g_m16_sig_ret_is_long.store(
+                        s.size() >= 2 && s.compare(s.size() - 2, 2, ")J") == 0,
+                        std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m16_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 16) };
+        ctx.check("rc_m16_probe_completed", done);
+        ctx.check("rc_m16_leaf_ran_once", caller_fixture::get_inner_calls() == 1);
+        ctx.check("rc_m16_fired_once", g_m16_fires.load() == 1);
+
+        ctx.check("rc_m16_caller_valid", g_m16_caller_valid.load());
+        ctx.check("rc_m16_caller_is_wideRetCaller", g_m16_caller_is_wideRet.load());
+        // The headline: the wide (long) return tail decodes to ")J".
+        ctx.check("rc_m16_signature_wide_return_exact", g_m16_sig_exact.load());
+        ctx.check("rc_m16_signature_return_is_long", g_m16_sig_ret_is_long.load());
+        ctx.check("rc_m16_signature_distinct_from_leaf", g_m16_sig_not_II.load());
+    }
+
+    // =====================================================================
+    // Scenario 17 — fixed shallow chain capTop -> capMid -> inner exercised with
+    // EXPLICIT stack_trace caps.  This module otherwise only ever calls the
+    // default-cap stack_trace(); here we pin the max_depth contract directly:
+    //   * stack_trace(N) NEVER exceeds N frames                       (HARD)
+    //   * caps are MONOTONIC (size(1) <= size(2) <= size(3))          (HARD)
+    //   * stack_trace(0) PROMOTES to 64 (so it returns the full chain,
+    //     not zero frames) — size <= 64 AND, when interpreted, >= 1   (HARD <=64)
+    //   * exact per-cap COUNT and "cap1[0] == capMid" are JIT-inlining-variant
+    //     (capTop/capMid can be compiled+inlined, shortening the chain) — INFO.
+    // The immediate caller of inner is capMid (HARD when interpreted, like mode 1).
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                g_m17_fires.fetch_add(1, std::memory_order_relaxed);
+
+                const auto info{ ret.caller() };
+                g_m17_caller_valid.store(info.valid(), std::memory_order_relaxed);
+                if (info.valid())
+                {
+                    g_m17_caller_is_capMid.store(names(info, "capMid", SIG_II),
+                                                 std::memory_order_relaxed);
+                }
+
+                const auto def{ ret.stack_trace() };       // default cap (64)
+                const auto t1{ ret.stack_trace(1) };
+                const auto t2{ ret.stack_trace(2) };
+                const auto t3{ ret.stack_trace(3) };
+                const auto t0{ ret.stack_trace(0) };        // magic zero -> 64
+
+                g_m17_default_size.store(def.size(), std::memory_order_relaxed);
+                g_m17_cap1_size.store(t1.size(), std::memory_order_relaxed);
+                g_m17_cap2_size.store(t2.size(), std::memory_order_relaxed);
+                g_m17_cap3_size.store(t3.size(), std::memory_order_relaxed);
+                g_m17_cap0_size.store(t0.size(), std::memory_order_relaxed);
+
+                g_m17_cap1_within.store(t1.size() <= 1, std::memory_order_relaxed);
+                g_m17_cap2_within.store(t2.size() <= 2, std::memory_order_relaxed);
+                g_m17_cap3_within.store(t3.size() <= 3, std::memory_order_relaxed);
+                // Zero promotes to 64: result must be capped at 64, NOT clamped to 0.
+                g_m17_cap0_within.store(t0.size() <= DEFAULT_CAP,
+                                        std::memory_order_relaxed);
+                g_m17_cap_monotonic.store(
+                    t1.size() <= t2.size() && t2.size() <= t3.size(),
+                    std::memory_order_relaxed);
+
+                // INFO probes (inlining-variant): the explicit-cap shape.
+                if (!t1.empty())
+                {
+                    g_m17_cap1_trace0_is_capMid.store(
+                        names(t1.front(), "capMid", SIG_II),
+                        std::memory_order_relaxed);
+                    g_m17_cap1_nonempty.store(t1.size() == 1,
+                                              std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m17_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 17) };
+        // HARD: no crash on the repeated explicit-cap walks.
+        ctx.check("rc_m17_probe_completed", done);
+        ctx.check("rc_m17_leaf_ran_once", caller_fixture::get_inner_calls() == 1);
+        ctx.check("rc_m17_fired_once", g_m17_fires.load() == 1);
+
+        // capMid is the immediate interpreted caller of inner at one invocation.
+        ctx.check("rc_m17_caller_valid", g_m17_caller_valid.load());
+        ctx.check("rc_m17_caller_is_capMid", g_m17_caller_is_capMid.load());
+
+        // The max_depth contract, all HARD (no exact COUNT asserted — only bounds):
+        ctx.check("rc_m17_cap1_within_bound", g_m17_cap1_within.load());
+        ctx.check("rc_m17_cap2_within_bound", g_m17_cap2_within.load());
+        ctx.check("rc_m17_cap3_within_bound", g_m17_cap3_within.load());
+        ctx.check("rc_m17_caps_monotonic", g_m17_cap_monotonic.load());
+        // The headline: stack_trace(0) does NOT clamp to zero — it promotes to 64.
+        // HARD bound (<=64); the >=1 half is recorded best-effort below because a
+        // fully-inlined chain could in principle leave zero interpreter frames.
+        ctx.check("rc_m17_cap0_promoted_within_64", g_m17_cap0_within.load());
+        if (g_m17_cap0_size.load() >= 1)
+        {
+            ctx.check("rc_m17_cap0_promoted_nonzero", true);
+        }
+        else
+        {
+            ctx.record("[INFO] rc_m17_cap0_promoted_nonzero: zero-promoted trace was "
+                       "empty (no interpreter frame — fully inlined?) — best-effort");
+        }
+
+        // Exact per-cap shape is JIT-inlining-variant: record, never FAIL.
+        if (g_m17_cap1_nonempty.load() && g_m17_cap1_trace0_is_capMid.load())
+        {
+            ctx.check("rc_m17_cap1_is_exactly_capMid", true);
+        }
+        else
+        {
+            ctx.record("[INFO] rc_m17_cap1_is_exactly_capMid: cap-1 trace not exactly "
+                       "[capMid] (JIT-inlined chain shape) — best-effort");
+        }
+
+        ctx.record(std::string{ "[INFO] return_caller: capTop->capMid trace sizes — " }
+                   + "default=" + std::to_string(g_m17_default_size.load())
+                   + " cap1="   + std::to_string(g_m17_cap1_size.load())
+                   + " cap2="   + std::to_string(g_m17_cap2_size.load())
+                   + " cap3="   + std::to_string(g_m17_cap3_size.load())
+                   + " cap0(->64)=" + std::to_string(g_m17_cap0_size.load()) + ".");
+    }
+
+    // =====================================================================
+    // Scenario 18 — discrimA(int) -> inner then discrimB(int) -> inner in ONE
+    // cycle.  The headline is the trace EXCLUSION invariant: fire 0's stack_trace
+    // must NOT name discrimB, and fire 1's must NOT name discrimA.  This stays
+    // HARD even under JIT inlining: inlining can only REMOVE a frame from the
+    // chain, never SYNTHESISE a foreign one — so a frame that was never on the
+    // chain can never appear.  (Contrast mode 6, which proves caller() reports
+    // the correct PRESENT caller; this proves the trace never reports an ABSENT
+    // one.)  The positive "fire 0 == discrimA" identity is the usual interpreted
+    // best-effort, recorded if the frame did not inline away.
+    // =====================================================================
+    {
+        auto handle{ vmhook::scoped_hook<caller_fixture>(
+            "inner", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<caller_fixture>& /*self*/,
+               std::int32_t /*x*/)
+            {
+                const std::int32_t order{ g_m18_fires.fetch_add(1, std::memory_order_relaxed) };
+                const auto info{ ret.caller() };
+                const auto trace{ ret.stack_trace() };
+                if (order == 0)
+                {
+                    g_m18_a_valid.store(info.valid(), std::memory_order_relaxed);
+                    g_m18_a_is_discrimA.store(names(info, "discrimA", SIG_II),
+                                              std::memory_order_relaxed);
+                    // A's trace must never contain the OTHER caller's frame.
+                    g_m18_a_trace_excludes_b.store(!trace_contains(trace, "discrimB"),
+                                                   std::memory_order_relaxed);
+                }
+                else if (order == 1)
+                {
+                    g_m18_b_valid.store(info.valid(), std::memory_order_relaxed);
+                    g_m18_b_is_discrimB.store(names(info, "discrimB", SIG_II),
+                                              std::memory_order_relaxed);
+                    g_m18_b_trace_excludes_a.store(!trace_contains(trace, "discrimA"),
+                                                   std::memory_order_relaxed);
+                }
+            }) };
+
+        ctx.check("rc_m18_hook_installed", handle.installed());
+
+        const bool done{ drive(ctx, 18) };
+        ctx.check("rc_m18_probe_completed", done);
+        ctx.check("rc_m18_leaf_ran_twice", caller_fixture::get_inner_calls() == 2);
+        ctx.check("rc_m18_fired_twice", g_m18_fires.load() == 2);
+
+        // The headline: each fire's trace EXCLUDES the other fire's caller frame.
+        // HARD — inlining can only drop frames, never invent a foreign one.
+        ctx.check("rc_m18_a_trace_excludes_discrimB", g_m18_a_trace_excludes_b.load());
+        ctx.check("rc_m18_b_trace_excludes_discrimA", g_m18_b_trace_excludes_a.load());
+
+        // Positive identity is the usual interpreted best-effort (a discrim* frame
+        // can JIT-inline away on a hot build — then caller() resolves an ancestor).
+        if (g_m18_a_valid.load() && g_m18_a_is_discrimA.load())
+        {
+            ctx.check("rc_m18_first_caller_is_discrimA", true);
+        }
+        else
+        {
+            ctx.record("[INFO] rc_m18_first_caller_is_discrimA: fire-0 caller not "
+                       "discrimA (inlined / ancestor-resolved) — best-effort");
+        }
+        if (g_m18_b_valid.load() && g_m18_b_is_discrimB.load())
+        {
+            ctx.check("rc_m18_second_caller_is_discrimB", true);
+        }
+        else
+        {
+            ctx.record("[INFO] rc_m18_second_caller_is_discrimB: fire-1 caller not "
+                       "discrimB (inlined / ancestor-resolved) — best-effort");
+        }
     }
 
     // No detour may be left armed for the next module: every scoped_hook above

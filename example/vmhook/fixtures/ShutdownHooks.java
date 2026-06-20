@@ -45,6 +45,10 @@ public final class ShutdownHooks
      *   4 = instance gamma(int,long,int) once
      *       (a third, multi-slot method so "removes hooks on multiple methods"
      *        spans 3 distinct Method* across instance/static/multi-arg shapes)
+     *   5 = alpha(int) once AND beta(int) once AND gamma(int,long,int) once, all
+     *       in the SAME run() (single-probe whole-set teardown: one
+     *       shutdown_hooks() must silence all THREE shapes observed in one
+     *       bytecode dispatch, and every original body must read back byte-exact)
      */
     public static volatile int mode;
 
@@ -161,6 +165,18 @@ public final class ShutdownHooks
         gammaCallsMade = 1;
     }
 
+    private static void runAll()
+    {
+        final ShutdownHooks obj = new ShutdownHooks();
+        obj.seed = SEED;
+        lastAlphaResult = obj.alpha(ALPHA_DELTA);
+        alphaCallsMade = 1;
+        lastBetaResult = beta(BETA_DELTA);
+        betaCallsMade = 1;
+        lastGammaResult = obj.gamma(GAMMA_A, GAMMA_B, GAMMA_C);
+        gammaCallsMade = 1;
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -187,6 +203,9 @@ public final class ShutdownHooks
                         break;
                     case 4:
                         runGamma();
+                        break;
+                    case 5:
+                        runAll();
                         break;
                     default:
                         break;

@@ -65,6 +65,7 @@ public final class ReturnSetArg
     public static final int MODE_BOUNDS     = 2; // boundsTarget (out-of-range rejection)
     public static final int MODE_WIDESLOTS  = 3; // back-to-back / interleaved wide args
     public static final int MODE_STATICSLOTS= 4; // static methods (no 'this' — args from slot 0)
+    public static final int MODE_EXTRA      = 5; // receiver-swap / bool-polarity / over-wide / reserved-slot
 
     // The single instance the instance-method hooks dispatch through.
     public static final ReturnSetArg INSTANCE = new ReturnSetArg();
@@ -140,6 +141,41 @@ public final class ReturnSetArg
     public static volatile long sMixLong;
     public static volatile int  sMixInt;
 
+    // ── Receiver-swap observation (set_arg(0) overwrites the 'this' slot) ──────
+    // ignoreThis(int v) NEVER dereferences 'this' in its body (it reads only the
+    // slot-1 arg), so overwriting slot 0 (the receiver) with a primitive is
+    // crash-safe: the body can run to completion without touching the corrupted
+    // receiver.  The native side proves set_arg(0) on an instance method returns
+    // true (the receiver slot is writable) AND that the slot-1 arg is mutated
+    // independently — i.e. set_arg(0) and set_arg(1) hit different slots.
+    public static volatile int ignoreThisV = 0x5A5A5A5A; // the slot-1 arg the body saw
+    public static volatile boolean ignoreThisRan;        // proves the body completed
+
+    // ── Boolean-polarity observation (only the low bit of the slot matters) ────
+    // boolPoly(boolean v) copies the received boolean into a field; the native
+    // side injects both polarities and high-bit-set int sources to prove the JVM
+    // reads only bit 0 of the slot.
+    public static volatile boolean boolPoly;
+
+    // ── Over-wide-into-narrow observation (platform-variant masking) ───────────
+    // The body widens each sub-int arg to int (the *Wide fields) AND keeps the
+    // declared-width view (the narrow fields).  When the native side injects an
+    // int value WIDER than the declared byte/char/short, the narrow masked view
+    // is stable (HARD) but the int-widened view is platform-variant ([INFO]).
+    public static volatile byte  owByte      = (byte)  0x5A;
+    public static volatile int   owByteWide  = 0x5A5A5A5A;
+    public static volatile char  owChar      = (char)  0x5A5A;
+    public static volatile int   owCharWide  = 0x5A5A5A5A;
+    public static volatile short owShort     = (short) 0x5AA5;
+    public static volatile int   owShortWide = 0x5A5A5A5A;
+
+    // ── Reserved-slot probe (Flaw #1: index is a SLOT, not an argument ordinal) ─
+    // resvLong(long a, int b): this=0, a=slots1+2, b=slot3.  Writing the long's
+    // RESERVED high slot (set_arg(2,...)) must NOT change b at slot 3 — it proves
+    // set_arg targets a raw slot index, not an argument position.
+    public static volatile long resvLong;
+    public static volatile int  resvInt;
+
     /** Set true by the action if any take* call threw (it must never throw). */
     public static volatile boolean sawException;
 
@@ -177,6 +213,23 @@ public final class ReturnSetArg
     // ── Static slot-model methods (no 'this'; first arg begins at slot 0) ──────
     public static void staticTwoInts(int a, int b)     { ReturnSetArg.sTwoA = a; ReturnSetArg.sTwoB = b; }
     public static void staticLongInt(long a, int b)    { ReturnSetArg.sMixLong = a; ReturnSetArg.sMixInt = b; }
+
+    // ── Receiver-swap method: NEVER touches 'this' (reads only the slot-1 arg) ──
+    // Crash-safe to overwrite slot 0 (the receiver) because the body dereferences
+    // nothing through 'this' — it only copies the slot-1 int and records that it
+    // ran.  (No instance-field write via 'this'; the writes are to static fields.)
+    public void ignoreThis(int v) { ReturnSetArg.ignoreThisV = v; ReturnSetArg.ignoreThisRan = true; }
+
+    // ── Boolean-polarity method ─────────────────────────────────────────────────
+    public void boolPolyTake(boolean v) { ReturnSetArg.boolPoly = v; }
+
+    // ── Over-wide-into-narrow methods (widen the sub-int arg to int + keep narrow)
+    public void owByteTake(byte v)   { ReturnSetArg.owByte  = v; ReturnSetArg.owByteWide  = v; }
+    public void owCharTake(char v)   { ReturnSetArg.owChar  = v; ReturnSetArg.owCharWide  = v; }
+    public void owShortTake(short v) { ReturnSetArg.owShort = v; ReturnSetArg.owShortWide = v; }
+
+    // ── Reserved-slot probe (long's high slot is reserved; b lives one slot on) ──
+    public void resvLongInt(long a, int b) { ReturnSetArg.resvLong = a; ReturnSetArg.resvInt = b; }
 
     static
     {
@@ -232,6 +285,15 @@ public final class ReturnSetArg
                     {
                         ReturnSetArg.staticTwoInts(7, 8);
                         ReturnSetArg.staticLongInt(7L, 8);
+                    }
+                    else if (ReturnSetArg.mode == ReturnSetArg.MODE_EXTRA)
+                    {
+                        self.ignoreThis(7);
+                        self.boolPolyTake(false);
+                        self.owByteTake((byte) 7);
+                        self.owCharTake((char) 7);
+                        self.owShortTake((short) 7);
+                        self.resvLongInt(7L, 8);
                     }
                     else // MODE_BOUNDS
                     {

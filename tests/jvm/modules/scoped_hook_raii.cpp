@@ -41,6 +41,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 namespace
@@ -234,6 +235,17 @@ VMHOOK_JVM_MODULE(scoped_hook_raii)
     vmhook::register_class<shr_fixture>("vmhook/fixtures/ScopedHookRaii");
     // NOTE: unregistered_fixture is deliberately NOT registered.
 
+    // Deterministic post-teardown invariant used throughout this module:
+    // vmhook::verify_hooks() returns the number of DRIFTED/REPAIRED hook entries
+    // — with the suite's auto-repair watchdog disabled and after a CLEAN scoped
+    // teardown it returns 0 (no drift, nothing to repair).  Combined with the
+    // behavioural "detour silent after scope" probe, a verify==0 reading is a
+    // HARD, JDK-independent proof that the scope left NOTHING armed/drifting.
+    // (Note: this is NOT a fire-count assertion, so it is immune to the
+    // post-JIT/post-deopt fire-count nondeterminism — see the firing checks.)
+    // Baseline at module entry: any prior module is contractually clean here.
+    ctx.check("module_entry_verify_hooks_zero", vmhook::verify_hooks() == 0);
+
     // =====================================================================
     // 0 — Compile-time + JVM-free invariants of the handle type itself.
     //     (Move-only, nothrow-destructible; default handle is empty and its
@@ -296,6 +308,8 @@ VMHOOK_JVM_MODULE(scoped_hook_raii)
         ctx.check("after_scope_original_still_ran",
                   shr_fixture::get_alpha_result() == (SEED + ALPHA_DELTA));
     }
+    // HARD: the normal-scope-exit destructor left a clean, drift-free hook set.
+    ctx.check("after_scope_verify_hooks_zero", vmhook::verify_hooks() == 0);
 
     // =====================================================================
     // 3 — installed() flips to false after an EXPLICIT stop(), the detour no
@@ -615,7 +629,206 @@ VMHOOK_JVM_MODULE(scoped_hook_raii)
         ctx.check("unregistered_type_not_installed", !handle.installed());
     }
 
+    // =====================================================================
+    // 15 — EARLY-RETURN teardown.  A scoped_hook armed inside a helper that
+    //      RETURNS before its closing brace must still be torn down by the
+    //      handle destructor on the way out (RAII does not require reaching the
+    //      end of the block).  After the helper returns: alpha is silent, the
+    //      original body still ran, and the hook set is drift-free.
+    // =====================================================================
+    {
+        // Helper arms alpha, drives ONE cycle (proving it fired while armed),
+        // then takes an EARLY return — the scoped_hook's destructor runs as the
+        // frame unwinds past the `return`, NOT at a closing-brace fall-through.
+        const auto armed_then_early_return = [&ctx]() -> bool
+        {
+            auto handle{ vmhook::scoped_hook<shr_fixture>("alpha", "(I)I", alpha_detour()) };
+            if (!handle.installed())
+            {
+                return false;
+            }
+            const bool done{ drive(ctx, 1) };
+            ctx.check("early_return_in_scope_probe_completed", done);
+            ctx.check("early_return_fired_in_scope", g_alpha_fires.load() == 1);
+            return true;   // EARLY exit — handle destructs here.
+        };
+
+        const std::int32_t before{ shr_fixture::get_alpha_calls() };
+        const bool armed_ok{ armed_then_early_return() };
+        ctx.check("early_return_helper_reported_armed", armed_ok);
+
+        // Helper has returned: the hook must be gone.  Drive alpha again and
+        // confirm the detour is silent while the original body still runs.
+        const bool done{ drive(ctx, 1) };
+        ctx.check("early_return_after_probe_completed", done);
+        ctx.check("early_return_java_called_alpha_once",
+                  shr_fixture::get_alpha_calls() - before == 2);   // in-scope + after
+        ctx.check("early_return_detour_silent_after", g_alpha_fires.load() == 0);
+        ctx.check("early_return_original_still_ran",
+                  shr_fixture::get_alpha_result() == (SEED + ALPHA_DELTA));
+        ctx.check("early_return_verify_hooks_zero", vmhook::verify_hooks() == 0);
+    }
+
+    // =====================================================================
+    // 16 — EXCEPTION-UNWIND teardown.  A scoped_hook armed in a scope that
+    //      unwinds via a C++ throw must be uninstalled by the handle destructor
+    //      as the stack unwinds (the destructor runs during unwinding, before
+    //      the catch).  After the catch: alpha is silent, the original body
+    //      still ran, and the hook set is drift-free.  This is the path that a
+    //      naive "remove the hook just before the normal return" implementation
+    //      would LEAK — RAII is the only thing that closes it.
+    // =====================================================================
+    {
+        const std::int32_t before{ shr_fixture::get_alpha_calls() };
+        bool caught{ false };
+        bool fired_in_scope{ false };
+        try
+        {
+            auto handle{ vmhook::scoped_hook<shr_fixture>("alpha", "(I)I", alpha_detour()) };
+            ctx.check("exception_unwind_installed_before_throw", handle.installed());
+
+            const bool done{ drive(ctx, 1) };
+            ctx.check("exception_unwind_in_scope_probe_completed", done);
+            fired_in_scope = (g_alpha_fires.load() == 1);
+
+            throw std::runtime_error{ "scoped_hook unwind probe" };
+        }   // handle destructor runs HERE during unwinding -> hook removed.
+        catch (const std::runtime_error&)
+        {
+            caught = true;
+        }
+        ctx.check("exception_unwind_caught", caught);
+        ctx.check("exception_unwind_fired_in_scope", fired_in_scope);
+
+        // Post-unwind: the hook must be gone.  Drive alpha again; detour silent.
+        const bool done{ drive(ctx, 1) };
+        ctx.check("exception_unwind_after_probe_completed", done);
+        ctx.check("exception_unwind_java_called_alpha",
+                  shr_fixture::get_alpha_calls() - before == 2);   // in-scope + after
+        ctx.check("exception_unwind_detour_silent_after", g_alpha_fires.load() == 0);
+        ctx.check("exception_unwind_original_still_ran",
+                  shr_fixture::get_alpha_result() == (SEED + ALPHA_DELTA));
+        ctx.check("exception_unwind_verify_hooks_zero", vmhook::verify_hooks() == 0);
+    }
+
+    // =====================================================================
+    // 17 — LOOP RE-ENTRY: install + drive + uninstall N times cleanly.  Each
+    //      iteration arms alpha in a fresh scope, fires it exactly once while
+    //      armed, then drops the handle at the iteration's closing brace.  The
+    //      hook set must return to drift-free after EVERY iteration (no stale
+    //      entry accumulates), and the final post-loop probe must be silent.
+    //      Proves the install/uninstall cycle is repeatable, not one-shot.
+    // =====================================================================
+    {
+        constexpr std::int32_t LOOP_N{ 5 };
+        bool every_iter_installed{ true };
+        bool every_iter_fired{ true };
+        bool every_iter_verify_zero{ true };
+        const std::int32_t before{ shr_fixture::get_alpha_calls() };
+
+        for (std::int32_t i{ 0 }; i < LOOP_N; ++i)
+        {
+            auto handle{ vmhook::scoped_hook<shr_fixture>("alpha", "(I)I", alpha_detour()) };
+            every_iter_installed = every_iter_installed && handle.installed();
+
+            const bool done{ drive(ctx, 1) };
+            every_iter_fired = every_iter_fired && done && (g_alpha_fires.load() == 1);
+            // handle drops at the brace below -> hook removed for this iteration.
+        }   // <- per-iteration teardown
+
+        // After the loop fully exited (last handle destroyed), the set is clean.
+        every_iter_verify_zero = (vmhook::verify_hooks() == 0);
+
+        ctx.check("loop_reentry_every_iter_installed", every_iter_installed);
+        ctx.check("loop_reentry_every_iter_fired_once", every_iter_fired);
+        ctx.check("loop_reentry_java_called_alpha_n_times",
+                  shr_fixture::get_alpha_calls() - before == LOOP_N);
+        ctx.check("loop_reentry_verify_hooks_zero_after_loop", every_iter_verify_zero);
+
+        // Final probe: alpha must be silent now that the loop's last handle is gone.
+        reset_fires();
+        const std::int32_t before_final{ shr_fixture::get_alpha_calls() };
+        const bool done{ drive(ctx, 1) };
+        ctx.check("loop_reentry_after_loop_probe_completed", done);
+        ctx.check("loop_reentry_after_loop_java_called",
+                  shr_fixture::get_alpha_calls() - before_final == 1);
+        ctx.check("loop_reentry_after_loop_detour_silent", g_alpha_fires.load() == 0);
+    }
+
+    // =====================================================================
+    // 18 — SELF move-assignment is a guarded no-op.  operator=(&&) checks
+    //      `this != &other`, so `h = std::move(h)` must NOT stop()-then-adopt
+    //      its own (now-nulled) target — the handle must stay installed and the
+    //      hook keep firing.  (Self-move that disarmed would be a silent
+    //      double-disarm / use-after-clear bug.)
+    // =====================================================================
+    {
+        auto h{ vmhook::scoped_hook<shr_fixture>("alpha", "(I)I", alpha_detour()) };
+        ctx.check("self_moveassign_installed_before", h.installed());
+
+        // Route through a reference to dodge the obvious self-move warning while
+        // still exercising the operator=(&&) self-assignment guard at runtime.
+        vmhook::hook_handle& alias{ h };
+        h = std::move(alias);
+        ctx.check("self_moveassign_still_installed", h.installed());
+
+        const std::int32_t before{ shr_fixture::get_alpha_calls() };
+        const bool done{ drive(ctx, 1) };
+        ctx.check("self_moveassign_probe_completed", done);
+        ctx.check("self_moveassign_java_called_alpha_once",
+                  shr_fixture::get_alpha_calls() - before == 1);
+        ctx.check("self_moveassign_still_fires", g_alpha_fires.load() == 1);
+    }   // h drops here -> hook removed.
+    ctx.check("self_moveassign_verify_hooks_zero", vmhook::verify_hooks() == 0);
+
+    // =====================================================================
+    // 19 — TWO scoped_hooks torn down together by ONE exception unwind.  Both
+    //      alpha and beta are armed in the same scope; a throw must run BOTH
+    //      destructors during unwinding (reverse declaration order: beta then
+    //      alpha) so NEITHER hook survives.  After the catch, driving alpha+beta
+    //      leaves both detours silent and the hook set drift-free — the
+    //      multi-hook generalisation of scenario 16.
+    // =====================================================================
+    {
+        const std::int32_t alpha_before{ shr_fixture::get_alpha_calls() };
+        const std::int32_t beta_before{ shr_fixture::get_beta_calls() };
+        bool caught{ false };
+        bool both_fired_in_scope{ false };
+        try
+        {
+            auto h_alpha{ vmhook::scoped_hook<shr_fixture>("alpha", "(I)I", alpha_detour()) };
+            auto h_beta{ vmhook::scoped_hook<shr_fixture>("beta", "(I)I", beta_detour()) };
+            ctx.check("two_hook_unwind_alpha_installed", h_alpha.installed());
+            ctx.check("two_hook_unwind_beta_installed", h_beta.installed());
+
+            const bool done{ drive(ctx, 9) };
+            ctx.check("two_hook_unwind_in_scope_probe_completed", done);
+            both_fired_in_scope = (g_alpha_fires.load() == 1 && g_beta_fires.load() == 1);
+
+            throw std::runtime_error{ "two-hook scoped_hook unwind probe" };
+        }   // h_beta then h_alpha destruct HERE during unwinding -> both removed.
+        catch (const std::runtime_error&)
+        {
+            caught = true;
+        }
+        ctx.check("two_hook_unwind_caught", caught);
+        ctx.check("two_hook_unwind_both_fired_in_scope", both_fired_in_scope);
+
+        // Post-unwind: both hooks gone.  Drive alpha+beta; both detours silent.
+        const bool done{ drive(ctx, 9) };
+        ctx.check("two_hook_unwind_after_probe_completed", done);
+        ctx.check("two_hook_unwind_java_called_alpha",
+                  shr_fixture::get_alpha_calls() - alpha_before == 2);
+        ctx.check("two_hook_unwind_java_called_beta",
+                  shr_fixture::get_beta_calls() - beta_before == 2);
+        ctx.check("two_hook_unwind_alpha_silent_after", g_alpha_fires.load() == 0);
+        ctx.check("two_hook_unwind_beta_silent_after", g_beta_fires.load() == 0);
+        ctx.check("two_hook_unwind_verify_hooks_zero", vmhook::verify_hooks() == 0);
+    }
+
     // Leave no scoped_hook installed behind us for later modules sharing the JVM:
     // every handle above was scope-local and has been destroyed by this point.
+    // Final HARD proof: a drift-free, fully-disarmed hook set at module exit.
+    ctx.check("module_left_clean_final_verify_zero", vmhook::verify_hooks() == 0);
     ctx.check("module_left_no_hooks_armed", true);
 }

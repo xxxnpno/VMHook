@@ -111,6 +111,8 @@ namespace
         static auto get_load_count() -> std::int32_t  { return static_field("loadCount")->get(); }
         static auto get_load_ok() -> bool             { return static_field("loadOk")->get(); }
         static auto get_last_loaded_name() -> std::string { return static_field("lastLoadedName")->get(); }
+        static auto get_custom_load_ok() -> bool      { return static_field("customLoadOk")->get(); }
+        static auto get_load_failed_cleanly() -> bool { return static_field("loadFailedCleanly")->get(); }
     };
 
     // ---- Expected INTERNAL ('/'-separated) names the callback must observe.
@@ -132,6 +134,15 @@ namespace
     // Probe1..Probe8 pristine for their own fresh-load scenarios.
     const std::string PROBE9_INTERNAL  = "vmhook/fixtures/OnClassLoaded$Probe9";
     const std::string PROBE10_INTERNAL = "vmhook/fixtures/OnClassLoaded$Probe10";
+    // ---- Varied class-SHAPE targets (batch-15 deepening): an interface, an
+    // array-bearing class, a non-static inner class, and a class defined by a
+    // CUSTOM (non-app) ClassLoader.  Each is a brand-new klass forced by its own
+    // `which` selector; the watcher must report each by its INTERNAL slash name.
+    const std::string IFACE_INTERNAL     = "vmhook/fixtures/OnClassLoaded$ProbeIface";
+    const std::string ARRAYS_INTERNAL    = "vmhook/fixtures/OnClassLoaded$ProbeArrays";
+    const std::string INNER_INTERNAL     = "vmhook/fixtures/OnClassLoaded$ProbeInner";
+    const std::string CUSTOM_INTERNAL    = "vmhook/fixtures/OnClassLoaded$ProbeCustom";
+    const std::string AFTERFAIL_INTERNAL = "vmhook/fixtures/OnClassLoaded$ProbeAfterFail";
 
     // ---- Callback observation state (reset before each probe cycle) --------
     // The callback runs on the Java thread; names are captured under a mutex,
@@ -567,6 +578,173 @@ VMHOOK_JVM_MODULE(on_class_loaded)
         }
     }
     // watcher dropped -> clean (detour still installed, no callbacks registered).
+
+    // =====================================================================
+    // Scenario 6b — VARIED CLASS SHAPES + CUSTOM LOADER + FAIL-SURVIVE
+    //   (batch-15 deepening: "every possible input" for the load the watcher
+    //   observes).  One armed watcher drives a sweep of input shapes the earlier
+    //   scenarios never exercised — all plain static nested classes there:
+    //     11 = an INTERFACE  (ProbeIface)        — non-class bytecode shape,
+    //     12 = an ARRAY-bearing class (ProbeArrays) — array descriptors in the CP,
+    //     13 = a NON-static inner class (ProbeInner) — synthetic this$0 shape,
+    //     14 = a class defined by a CUSTOM ClassLoader (ProbeCustom) — NOT the app
+    //          loader; the inherited hooked ClassLoader.defineClass still fires,
+    //     15 = a class that FAILS to load (NoSuchProbe) — no defineClass, the
+    //          armed watcher stays silent and the JVM is not destabilised,
+    //     16 = a fresh good load AFTER the failure (ProbeAfterFail) — proves the
+    //          watcher + JVM survived the failed load and still observe a load.
+    //   HARD invariants on EVERY JDK: each load behaves as Java expects (load_ok /
+    //   custom_load_ok / failed-cleanly witnesses), the watcher never crashes, and
+    //   the must-NOT-observe negative (no event for the failed name) holds.  The
+    //   "watcher observed shape X" positives are gated on fire_capable exactly like
+    //   the earlier scenarios — defineClass JIT state still governs observation.
+    // =====================================================================
+    {
+        auto watcher{ vmhook::on_class_loaded(
+            [](const std::string& name) { primary_callback(name); }) };
+        ctx.check("shapes_handle_running", watcher.running());
+
+        // --- 11: INTERFACE -------------------------------------------------
+        const bool done_iface{ drive(ctx, 11) };
+        ctx.check("iface_probe_completed", done_iface);
+        ctx.check("iface_java_loaded",
+                  on_class_loaded_fixture::get_load_ok()
+                      && on_class_loaded_fixture::get_load_count() == 1);
+        if (fire_capable)
+        {
+            ctx.check("iface_callback_fired_once", g_fire_count.load() == 1);
+            ctx.check("iface_callback_saw_iface", saw(IFACE_INTERNAL));
+            ctx.check("iface_name_is_internal_slash_form",
+                      !saw("vmhook.fixtures.OnClassLoaded$ProbeIface"));
+            ctx.check("iface_no_empty_name", !g_saw_empty_name.load());
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] on_class_loaded: interface shape (ProbeIface) — "
+                                    "defineClass un-deoptimisable on this JDK; fire_count=" }
+                       + std::to_string(g_fire_count.load())
+                       + " recorded as [INFO].  Java witness proved the load ran (HARD).");
+        }
+
+        // --- 12: ARRAY-bearing class --------------------------------------
+        const bool done_arr{ drive(ctx, 12) };
+        ctx.check("arrays_probe_completed", done_arr);
+        ctx.check("arrays_java_loaded",
+                  on_class_loaded_fixture::get_load_ok()
+                      && on_class_loaded_fixture::get_load_count() == 1);
+        if (fire_capable)
+        {
+            // The class itself is ONE defineClass; the [I/[[J/[Ljava... array
+            // klasses its <clinit> builds are made internally (anewarray), NOT via
+            // ClassLoader.defineClass, so exactly one event with the class's name.
+            ctx.check("arrays_callback_fired_once", g_fire_count.load() == 1);
+            ctx.check("arrays_callback_saw_arrays", saw(ARRAYS_INTERNAL));
+            ctx.check("arrays_no_array_klass_events",
+                      !saw("[I") && !saw("[[J") && !g_saw_empty_name.load());
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] on_class_loaded: array-bearing shape (ProbeArrays) "
+                                    "— defineClass un-deoptimisable on this JDK; fire_count=" }
+                       + std::to_string(g_fire_count.load())
+                       + " recorded as [INFO].  Java witness proved the load ran (HARD).");
+        }
+
+        // --- 13: NON-static inner class -----------------------------------
+        const bool done_inner{ drive(ctx, 13) };
+        ctx.check("inner_probe_completed", done_inner);
+        ctx.check("inner_java_loaded",
+                  on_class_loaded_fixture::get_load_ok()
+                      && on_class_loaded_fixture::get_load_count() == 1);
+        if (fire_capable)
+        {
+            ctx.check("inner_callback_fired_once", g_fire_count.load() == 1);
+            ctx.check("inner_callback_saw_inner", saw(INNER_INTERNAL));
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] on_class_loaded: inner-class shape (ProbeInner) — "
+                                    "defineClass un-deoptimisable on this JDK; fire_count=" }
+                       + std::to_string(g_fire_count.load())
+                       + " recorded as [INFO].  Java witness proved the load ran (HARD).");
+        }
+
+        // --- 14: CUSTOM ClassLoader (not the app loader) ------------------
+        const bool done_custom{ drive(ctx, 14) };
+        ctx.check("custom_probe_completed", done_custom);
+        // HARD on every JDK: the user loader genuinely defined the class and got a
+        // usable Class whose loader is that custom loader (the fixture asserts the
+        // loader identity), independent of whether the watcher observed it.
+        ctx.check("custom_java_defined_by_custom_loader",
+                  on_class_loaded_fixture::get_custom_load_ok());
+        ctx.check("custom_java_load_count_is_1",
+                  on_class_loaded_fixture::get_load_count() == 1);
+        if (fire_capable)
+        {
+            // The hooked method is java/lang/ClassLoader.defineClass, so a custom
+            // subclass calling the inherited defineClass fires the SAME detour, and
+            // the name still arrives in INTERNAL slash form.
+            // A custom loader's defineClass path can legitimately fire the watcher
+            // MORE than once (loader machinery / nested defines), so assert >= 1 and
+            // record the exact count; saw_custom below is the real "observed THIS
+            // class" proof (the exact-1 count is not a portable invariant here).
+            ctx.check("custom_callback_fired", g_fire_count.load() >= 1);
+            ctx.record("[INFO] on_class_loaded custom-loader fire_count="
+                       + std::to_string(g_fire_count.load()));
+            ctx.check("custom_callback_saw_custom", saw(CUSTOM_INTERNAL));
+            ctx.check("custom_name_is_internal_slash_form",
+                      !saw("vmhook.fixtures.OnClassLoaded$ProbeCustom"));
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] on_class_loaded: custom-loader define (ProbeCustom) "
+                                    "— defineClass un-deoptimisable on this JDK; fire_count=" }
+                       + std::to_string(g_fire_count.load())
+                       + " recorded as [INFO].  Java witness proved a custom loader defined the "
+                         "class (custom_load_ok asserted HARD).");
+        }
+
+        // --- 15: a class that FAILS to load -------------------------------
+        // No defineClass happens for a non-existent class, so the armed watcher
+        // MUST stay silent for that name on EVERY JDK, and the JVM must not be
+        // destabilised by a failing load while a watcher is armed.
+        const bool done_fail{ drive(ctx, 15) };
+        ctx.check("fail_probe_completed", done_fail);
+        ctx.check("fail_java_load_did_not_succeed",
+                  !on_class_loaded_fixture::get_load_ok());
+        ctx.check("fail_java_caught_cleanly",
+                  on_class_loaded_fixture::get_load_failed_cleanly());
+        // The watcher armed but no defineClass for the missing name -> no event for
+        // it.  HARD on every JDK (it holds whether or not the detour is fire-capable
+        // — there simply is no event to observe).
+        ctx.check("fail_no_event_for_missing_name",
+                  !saw("vmhook/fixtures/OnClassLoaded$NoSuchProbe")
+                      && !saw("vmhook.fixtures.OnClassLoaded$NoSuchProbe"));
+
+        // --- 16: a fresh good load AFTER the failure ----------------------
+        // Proves the watcher (and the JVM) survived the failed load and still
+        // observe a brand-new class.  load witness HARD; observation gated.
+        const bool done_after{ drive(ctx, 16) };
+        ctx.check("afterfail_probe_completed", done_after);
+        ctx.check("afterfail_java_loaded",
+                  on_class_loaded_fixture::get_load_ok()
+                      && on_class_loaded_fixture::get_load_count() == 1);
+        if (fire_capable)
+        {
+            ctx.check("afterfail_callback_fired_once", g_fire_count.load() == 1);
+            ctx.check("afterfail_callback_saw_afterfail", saw(AFTERFAIL_INTERNAL));
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] on_class_loaded: fresh load after a failed load "
+                                    "(ProbeAfterFail) — defineClass un-deoptimisable on this JDK; "
+                                    "fire_count=" }
+                       + std::to_string(g_fire_count.load())
+                       + " recorded as [INFO].  Java witness proved the post-failure load ran "
+                         "(HARD) — the watcher survived the failure.");
+        }
+    }
+    // watcher dropped here -> callbacks removed; detour stays installed.
 
     // =====================================================================
     // Scenario 7 — RE-ARM AFTER shutdown_hooks() (regression guard for audit

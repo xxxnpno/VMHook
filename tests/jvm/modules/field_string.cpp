@@ -185,6 +185,21 @@ namespace
         static auto j_inst_get_only_value()   -> std::string { return static_field("jInstGetOnlyValue")->get(); }
         static auto j_reassign_after_value()  -> std::string { return static_field("jReassignAfterValue")->get(); }
 
+        // ---- Java-published facts for the batch-17 GET deepening targets. ----
+        static auto j_controls_len()      -> std::int32_t { return static_field("jControlsLen")->get(); }
+        static auto j_controls_cp1()      -> std::int32_t { return static_field("jControlsCp1")->get(); }
+        static auto j_coder_latin1_cp7()  -> std::int32_t { return static_field("jCoderLatin1Cp7")->get(); }
+        static auto j_coder_utf16_cp7()   -> std::int32_t { return static_field("jCoderUtf16Cp7")->get(); }
+        static auto j_u07ff_cp0()         -> std::int32_t { return static_field("jU07FFCp0")->get(); }
+        static auto j_astral_min_cp0()    -> std::int32_t { return static_field("jAstralMinCp0")->get(); }
+        static auto j_astral_max_cp0()    -> std::int32_t { return static_field("jAstralMaxCp0")->get(); }
+        static auto j_replacement_cp0()   -> std::int32_t { return static_field("jReplacementCp0")->get(); }
+        static auto j_multi_script_len()  -> std::int32_t { return static_field("jMultiScriptLen")->get(); }
+        static auto j_multi_script_cp3()  -> std::int32_t { return static_field("jMultiScriptCp3")->get(); }
+        static auto j_emoji_run_cpcount() -> std::int32_t { return static_field("jEmojiRunCpCount")->get(); }
+        static auto j_emoji_run_cp0()     -> std::int32_t { return static_field("jEmojiRunCp0")->get(); }
+        static auto j_inherited_cjk_value() -> std::string { return static_field("jInheritedCjkValue")->get(); }
+
         static auto set_ascii_eq_matches() -> bool        { return static_field("setAsciiEqMatches")->get(); }
         static auto set_ascii_eq_len()     -> std::int32_t { return static_field("setAsciiEqLen")->get(); }
         static auto set_ascii_eq_value()   -> std::string  { return static_field("setAsciiEqValue")->get(); }
@@ -677,8 +692,159 @@ VMHOOK_JVM_MODULE(field_string)
                 const std::string get_only = get_only_proxy->get();
                 ctx.check("fstr_instance_get_only_value", get_only == "instance-get");
             }
+
+            // INHERITED INSTANCE non-ASCII String, declared only on the base:
+            // proves the super-walk resolution feeds the UTF-16 decode path.
+            // 日本 (U+65E5 U+672C) -> UTF-8 E6 97 A5 E6 9C AC, 6 bytes.
+            const auto inh_cjk_proxy{ self->get_field("inheritedCjk") };
+            ctx.check("fstr_inherited_cjk_field_resolves", inh_cjk_proxy.has_value());
+            if (inh_cjk_proxy.has_value())
+            {
+                const std::string inh_cjk = inh_cjk_proxy->get();
+                ctx.check("fstr_inherited_cjk_value",
+                          inh_cjk == std::string{ "\xE6\x97\xA5\xE6\x9C\xAC" });
+                ctx.check("fstr_inherited_cjk_utf8_len_6", inh_cjk.size() == 6);
+            }
         }
     }
+
+    // ======================================================================
+    // BATCH-17 GET DEEPENING — "every possible String-field read" the prior
+    // battery lacked.  Each value's expected UTF-8 was cross-checked against
+    // String.getBytes(UTF_8); every read goes through the clean one-liner
+    // (read_static -> field_proxy::get -> read_java_string) AND is re-decoded
+    // directly on the raw backing OOP (read_static_direct), asserting the two
+    // paths AGREE.  Content round-trip is HARD (banked rule).
+    // ======================================================================
+
+    // --- ASCII control chars (TAB/LF/CR) preserved byte-verbatim (LATIN1). ---
+    // "a\tb\nc\rd" -> 61 09 62 0A 63 0D 64, length 7.
+    const std::string controls{ field_string_fixture::read_static("getControls") };
+    ctx.check("fstr_controls_len_7", controls.size() == 7);
+    ctx.check("fstr_controls_bytes",
+              controls == std::string{ "a\tb\nc\rd" });
+    ctx.check("fstr_controls_byte1_is_tab",
+              controls.size() == 7 && static_cast<unsigned char>(controls[1]) == 0x09);
+    ctx.check("fstr_controls_byte3_is_lf",
+              controls.size() == 7 && static_cast<unsigned char>(controls[3]) == 0x0A);
+    ctx.check("fstr_controls_byte5_is_cr",
+              controls.size() == 7 && static_cast<unsigned char>(controls[5]) == 0x0D);
+    ctx.check("fstr_controls_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getControls") == controls);
+
+    // --- COMPACT-STRING CODER BOUNDARY: the SAME ASCII prefix "Shared!" decodes
+    //     to IDENTICAL bytes whether the backing is LATIN1 (coder 0) or UTF-16
+    //     (coder 1).  The LATIN1 string is "Shared!é" (cp's all <= 0xFF); the
+    //     UTF-16 string is "Shared!" + U+1F4A9 (the astral promotes the whole
+    //     string to coder 1).  Assert the first 7 decoded UTF-8 bytes match. ---
+    const std::string coder_latin1{ field_string_fixture::read_static("getCoderLatin1Prefix") };
+    const std::string coder_utf16{ field_string_fixture::read_static("getCoderUtf16Prefix") };
+    ctx.record(std::string{ "[INFO] fstr coder boundary: latin1='" } + coder_latin1
+               + "' (" + hex_bytes(coder_latin1) + ") utf16='" + coder_utf16
+               + "' (" + hex_bytes(coder_utf16) + ")");
+    ctx.check("fstr_coder_latin1_prefix_shared",
+              coder_latin1.size() >= 7 && coder_latin1.substr(0, 7) == "Shared!");
+    ctx.check("fstr_coder_utf16_prefix_shared",
+              coder_utf16.size() >= 7 && coder_utf16.substr(0, 7) == "Shared!");
+    // The decisive identity check: both decode paths agree on the shared prefix.
+    ctx.check("fstr_coder_boundary_shared_prefix_identical",
+              coder_latin1.size() >= 7 && coder_utf16.size() >= 7
+              && coder_latin1.substr(0, 7) == coder_utf16.substr(0, 7));
+    // Full content per layout: LATIN1 tail 'é' (C3 A9); UTF-16 tail U+1F4A9 (F0 9F 92 A9).
+    ctx.check("fstr_coder_latin1_full_value",
+              coder_latin1 == std::string{ "Shared!\xC3\xA9" });
+    ctx.check("fstr_coder_utf16_full_value",
+              coder_utf16 == std::string{ "Shared!\xF0\x9F\x92\xA9" });
+    ctx.check("fstr_coder_latin1_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getCoderLatin1Prefix") == coder_latin1);
+    ctx.check("fstr_coder_utf16_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getCoderUtf16Prefix") == coder_utf16);
+
+    // --- U+07FF -> the LAST 2-byte UTF-8 code point (DF BF); UTF-16 (coder 1).
+    //     Completes the 2-byte boundary with getLo80 (C2 80, first) and the
+    //     3-byte boundary with getU0800 (E0 A0 80, first). ---
+    const std::string u07ff{ field_string_fixture::read_static("getU07FF") };
+    ctx.check("fstr_u07ff_utf8_DFBF", u07ff == std::string{ "\xDF\xBF" });
+    ctx.check("fstr_u07ff_utf8_len_2", u07ff.size() == 2);
+    ctx.check("fstr_u07ff_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getU07FF") == u07ff);
+
+    // --- U+10000 -> the SMALLEST astral scalar (surrogate pair D800 DC00) ->
+    //     4-byte UTF-8 F0 90 80 80.  Lower edge of the surrogate-combining math. ---
+    const std::string astral_min{ field_string_fixture::read_static("getAstralMin") };
+    ctx.check("fstr_astral_min_utf8_F0908080",
+              astral_min == std::string{ "\xF0\x90\x80\x80" });
+    ctx.check("fstr_astral_min_utf8_len_4", astral_min.size() == 4);
+    ctx.check("fstr_astral_min_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getAstralMin") == astral_min);
+
+    // --- U+10FFFF -> the LARGEST valid code point (surrogate pair DBFF DFFF) ->
+    //     4-byte UTF-8 F4 8F BF BF.  Upper edge of the surrogate-combining math. ---
+    const std::string astral_max{ field_string_fixture::read_static("getAstralMax") };
+    ctx.check("fstr_astral_max_utf8_F48FBFBF",
+              astral_max == std::string{ "\xF4\x8F\xBF\xBF" });
+    ctx.check("fstr_astral_max_utf8_len_4", astral_max.size() == 4);
+    ctx.check("fstr_astral_max_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getAstralMax") == astral_max);
+
+    // --- U+FFFD REPLACEMENT CHARACTER as REAL content (EF BF BD): a legitimate
+    //     3-byte BMP char that must round-trip verbatim, NOT confused with the
+    //     decode's own degrade-to-"" path. ---
+    const std::string replacement{ field_string_fixture::read_static("getReplacement") };
+    ctx.check("fstr_replacement_utf8_EFBFBD",
+              replacement == std::string{ "\xEF\xBF\xBD" });
+    ctx.check("fstr_replacement_utf8_len_3", replacement.size() == 3);
+    ctx.check("fstr_replacement_not_empty", !replacement.empty());
+    ctx.check("fstr_replacement_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getReplacement") == replacement);
+
+    // --- Multi-script BMP: 'A' + U+03B1 + U+3044 + U+AC00 -> a 1/2/3-byte UTF-8
+    //     mix in one string: 41  CE B1  E3 81 84  EA B0 80, length 9. ---
+    const std::string multi{ field_string_fixture::read_static("getMultiScript") };
+    ctx.record(std::string{ "[INFO] fstr getMultiScript bytes: " } + hex_bytes(multi));
+    ctx.check("fstr_multi_script_value",
+              multi == std::string{ "A\xCE\xB1\xE3\x81\x84\xEA\xB0\x80" });
+    ctx.check("fstr_multi_script_len_9", multi.size() == 9);
+    ctx.check("fstr_multi_script_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getMultiScript") == multi);
+
+    // --- MODEST-long UTF-16 with 100 REPEATED surrogate pairs (U+1F4A9):
+    //     decodes to 100 * 4 = 400 UTF-8 bytes (F0 9F 92 A9 x100).  Exercises the
+    //     surrogate-pair combining loop many times; heap-modest. ---
+    const std::string emoji_run{ field_string_fixture::read_static("getEmojiRun") };
+    ctx.check("fstr_emoji_run_utf8_len_400", emoji_run.size() == 400);
+    {
+        std::string expected_run;
+        expected_run.reserve(400);
+        for (int i{ 0 }; i < 100; ++i)
+        {
+            expected_run += std::string{ "\xF0\x9F\x92\xA9" };
+        }
+        ctx.check("fstr_emoji_run_byte_exact", emoji_run == expected_run);
+    }
+    ctx.check("fstr_emoji_run_first_pair_F0",
+              emoji_run.size() == 400
+              && static_cast<unsigned char>(emoji_run[0]) == 0xF0
+              && static_cast<unsigned char>(emoji_run[396]) == 0xF0
+              && static_cast<unsigned char>(emoji_run[399]) == 0xA9);
+    ctx.check("fstr_emoji_run_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getEmojiRun") == emoji_run);
+
+    // --- NON-String object field accessed as a String: read_java_string is fed
+    //     a non-String oop (an int[] held in an Object field).  It must DEGRADE
+    //     GRACEFULLY (return "" or a bounded best-effort decode) and NEVER crash.
+    //     Exact bytes are undefined, so we ONLY assert no-crash + boundedness;
+    //     the raw observation is recorded as [INFO].  (Reaching this line at all
+    //     proves it did not fault the suite.) ---
+    const std::string not_a_string{ field_string_fixture::read_static("notAStringObj") };
+    ctx.record(std::string{ "[INFO] fstr notAStringObj decoded len=" }
+               + std::to_string(not_a_string.size()) + " bytes: " + hex_bytes(not_a_string));
+    ctx.check("fstr_non_string_object_no_crash_bounded",
+              not_a_string.size() <= 64u);
+    // The direct path over the same field must also be crash-safe and agree with
+    // the proxy path (both reuse the guarded read_java_string -> deterministic).
+    ctx.check("fstr_non_string_object_direct_equals_proxy",
+              field_string_fixture::read_static_direct("notAStringObj") == not_a_string);
 
     // ----------------------------------------------------------------------
     // PHASE 2: install the interpreter hook and run the probe, which fires a
@@ -739,6 +905,35 @@ VMHOOK_JVM_MODULE(field_string)
                   field_string_fixture::j_static_inherited_value() == "base-static-inherited");
         ctx.check("fstr_java_inst_get_only_value",
                   field_string_fixture::j_inst_get_only_value() == "instance-get");
+
+        // ---- Java-side cross-checks of the batch-17 GET deepening targets:
+        //      prove the bytes vmhook decoded correspond to the real Java String
+        //      code points / lengths (the authoritative cross-check). ----
+        ctx.check("fstr_java_controls_len_7", field_string_fixture::j_controls_len() == 7);
+        ctx.check("fstr_java_controls_cp1_is_tab", field_string_fixture::j_controls_cp1() == 0x09);
+        ctx.check("fstr_java_coder_latin1_cp7_is_E9",
+                  field_string_fixture::j_coder_latin1_cp7() == 0x00E9);
+        ctx.check("fstr_java_coder_utf16_cp7_is_1F4A9",
+                  field_string_fixture::j_coder_utf16_cp7() == 0x1F4A9);
+        ctx.check("fstr_java_u07ff_cp0_is_7FF", field_string_fixture::j_u07ff_cp0() == 0x07FF);
+        ctx.check("fstr_java_astral_min_cp0_is_10000",
+                  field_string_fixture::j_astral_min_cp0() == 0x10000);
+        ctx.check("fstr_java_astral_max_cp0_is_10FFFF",
+                  field_string_fixture::j_astral_max_cp0() == 0x10FFFF);
+        ctx.check("fstr_java_replacement_cp0_is_FFFD",
+                  field_string_fixture::j_replacement_cp0() == 0xFFFD);
+        ctx.check("fstr_java_multi_script_len_4", field_string_fixture::j_multi_script_len() == 4);
+        ctx.check("fstr_java_multi_script_cp3_is_AC00",
+                  field_string_fixture::j_multi_script_cp3() == 0xAC00);
+        ctx.check("fstr_java_emoji_run_cpcount_100",
+                  field_string_fixture::j_emoji_run_cpcount() == 100);
+        ctx.check("fstr_java_emoji_run_cp0_is_1F4A9",
+                  field_string_fixture::j_emoji_run_cp0() == 0x1F4A9);
+        // Java sees the SAME 日本 value vmhook decoded for the inherited non-ASCII
+        // instance field (proves the super-walk + UTF-16 decode agree with Java).
+        ctx.check("fstr_java_inherited_cjk_value",
+                  field_string_fixture::j_inherited_cjk_value()
+                  == std::string{ "\xE6\x97\xA5\xE6\x9C\xAC" });
 
         // ---- SET write-back verified THROUGH JAVA (the contract). ----
         // Clean full overwrite landed and is visible to Java.

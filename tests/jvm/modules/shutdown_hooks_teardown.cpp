@@ -50,6 +50,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <string>
 
@@ -180,12 +181,41 @@ namespace
                                       std::memory_order_relaxed);
             });
     }
+
+    // Sentinel the static-beta force-return hook injects so Java observes a value
+    // that the original body (delta*3) can NEVER produce — proving the detour was
+    // really in the static-dispatch path, and (after teardown) that the static
+    // method body is restored byte-exact rather than the detour merely going quiet.
+    constexpr std::int32_t BETA_SENTINEL{ 7770007 };
+    static_assert(BETA_SENTINEL != BETA_ORIGINAL,
+                  "static-beta sentinel must differ from the original so the override is observable");
+
+    auto install_beta_force_return() -> bool
+    {
+        return vmhook::hook<shutdown_fixture>(
+            "beta",
+            [](vmhook::return_value& rv, std::int32_t)
+            {
+                g_beta_fires.fetch_add(1, std::memory_order_relaxed);
+                rv.set(BETA_SENTINEL);   // suppress original static body, force return
+            });
+    }
 }
 
 VMHOOK_JVM_MODULE(shutdown_hooks_teardown)
 {
     vmhook::register_class<shutdown_fixture>("vmhook/fixtures/ShutdownHooks");
 
+    // CRASH-SAFETY: this module calls the GLOBAL shutdown_hooks() (which tears
+    // down EVERY other module's state) and transiently enables the auto-repair
+    // watchdog.  A C++ throw mid-body must NOT leak a hook or leave the watchdog
+    // gate on into the next module, so the whole scenario body runs inside a
+    // try/catch and the UNCONDITIONAL final cleanup (shutdown_hooks() +
+    // watchdog-off) lives OUTSIDE the try.  (The no-SEH Windows hard-fault path is
+    // handled separately by the harness __try + ctx.reset(); this catch covers the
+    // C++-exception path so a single throw cannot void the whole run's total.)
+    try
+    {
     // =====================================================================
     // Scenario 0 — PRE-FLIGHT: shutdown_hooks() with NO hooks installed is a
     //   safe no-op, AND it leaves the library fully usable (a subsequent install
@@ -198,6 +228,13 @@ VMHOOK_JVM_MODULE(shutdown_hooks_teardown)
         vmhook::shutdown_hooks();   // no hooks installed
         vmhook::shutdown_hooks();   // double-call on empty state
         ctx.check("empty_shutdown_did_not_crash", true);  // reaching here == no SEH/throw
+
+        // Deterministic table-empty oracle: with no hooks installed, verify_hooks()
+        // has nothing to repair and MUST return 0.  This is the HARD post-teardown
+        // invariant the audit asks for ("verify_hooks()==0 after"), independent of
+        // any JIT fire-count timing.  (verify_hooks counts hooks it had to repair;
+        // an empty table returns 0 deterministically on every platform.)
+        ctx.check("empty_state_verify_hooks_is_zero", vmhook::verify_hooks() == 0u);
 
         // Library must still work after an empty teardown: install + fire.
         ctx.check("install_after_empty_shutdown_returns_true", install_alpha_observer());
@@ -236,6 +273,10 @@ VMHOOK_JVM_MODULE(shutdown_hooks_teardown)
 
         // --- Beat 2: shutdown_hooks() -> detour silent, original byte-exact ---
         vmhook::shutdown_hooks();
+        // Deterministic table-empty oracle BEFORE the behavioural re-drive: the
+        // teardown loop cleared g_hooked_methods, so there is nothing to repair.
+        ctx.check("reinstall_beat2_verify_hooks_zero_after_teardown",
+                  vmhook::verify_hooks() == 0u);
         const bool done2{ drive(ctx, 1) };
         ctx.check("reinstall_beat2_probe_completed", done2);
         ctx.check("reinstall_beat2_java_still_ran",
@@ -340,6 +381,11 @@ VMHOOK_JVM_MODULE(shutdown_hooks_teardown)
 
         // --- the ONE teardown that must remove all three ---
         vmhook::shutdown_hooks();
+        // Deterministic whole-table-empty oracle: all THREE entries (alpha+beta+
+        // gamma) were in g_hooked_methods; after one teardown there is nothing to
+        // repair, so verify_hooks() returns 0 (independent of any fire timing).
+        ctx.check("multi_after_shutdown_verify_hooks_zero",
+                  vmhook::verify_hooks() == 0u);
 
         // alpha silent + original.
         const bool e_alpha{ drive(ctx, 1) };
@@ -408,12 +454,267 @@ VMHOOK_JVM_MODULE(shutdown_hooks_teardown)
     }
 
     // =====================================================================
-    // FINAL CLEANUP — belt-and-braces.  Other modules run after this one, so the
-    //   module MUST leave ZERO hooks armed.  Every scenario above already calls
+    // Scenario 5 — WHOLE-SET teardown observed in ONE bytecode dispatch (mode 5
+    //   = runAll: alpha+beta+gamma each fire once in a SINGLE run()).  Distinct
+    //   input from scenario 3 (which drove each method in its own probe): here all
+    //   three Method* shapes are live in the SAME interpreter dispatch, then ONE
+    //   shutdown_hooks() must silence the whole set within one probe and every
+    //   original body must read back byte-exact.  Pairs the deterministic
+    //   verify_hooks()==0 oracle with the behavioural "all silent" proof.
+    // =====================================================================
+    {
+        ctx.check("whole_install_alpha", install_alpha_observer());
+        ctx.check("whole_install_beta", install_beta_observer());
+        ctx.check("whole_install_gamma", install_gamma_observer());
+
+        const bool d_all{ drive(ctx, 5) };
+        ctx.check("whole_probe_completed", d_all);
+        ctx.check("whole_alpha_fired_once", g_alpha_fires.load() == 1);
+        ctx.check("whole_beta_fired_once", g_beta_fires.load() == 1);
+        ctx.check("whole_gamma_fired_once", g_gamma_fires.load() == 1);
+        ctx.check("whole_beta_arg_decoded", g_beta_arg_ok.load());
+        ctx.check("whole_gamma_args_decoded", g_gamma_args_ok.load());
+        ctx.check("whole_alpha_allow_through",
+                  shutdown_fixture::get_last_alpha_result() == ALPHA_ORIGINAL);
+        ctx.check("whole_beta_allow_through",
+                  shutdown_fixture::get_last_beta_result() == BETA_ORIGINAL);
+        ctx.check("whole_gamma_allow_through",
+                  shutdown_fixture::get_last_gamma_result() == GAMMA_ORIGINAL);
+
+        // ONE teardown silences the whole set — proven inside ONE probe cycle.
+        vmhook::shutdown_hooks();
+        ctx.check("whole_after_shutdown_verify_hooks_zero",
+                  vmhook::verify_hooks() == 0u);
+
+        const bool e_all{ drive(ctx, 5) };
+        ctx.check("whole_after_shutdown_probe_completed", e_all);
+        ctx.check("whole_after_shutdown_alpha_silent", g_alpha_fires.load() == 0);
+        ctx.check("whole_after_shutdown_beta_silent", g_beta_fires.load() == 0);
+        ctx.check("whole_after_shutdown_gamma_silent", g_gamma_fires.load() == 0);
+        ctx.check("whole_after_shutdown_alpha_original",
+                  shutdown_fixture::get_last_alpha_result() == ALPHA_ORIGINAL);
+        ctx.check("whole_after_shutdown_beta_original",
+                  shutdown_fixture::get_last_beta_result() == BETA_ORIGINAL);
+        ctx.check("whole_after_shutdown_gamma_original",
+                  shutdown_fixture::get_last_gamma_result() == GAMMA_ORIGINAL);
+
+        vmhook::shutdown_hooks();   // belt-and-braces (already clean)
+    }
+
+    // =====================================================================
+    // Scenario 6 — STATIC-method body restored byte-exact via the STRONG
+    //   force-RETURN proof.  Scenario 2 proved this for the INSTANCE method alpha;
+    //   beta is a STATIC method (a different Method* shape / dispatch slot), so we
+    //   prove teardown genuinely restores a static body too: a force-return hook
+    //   makes Java observe BETA_SENTINEL (which delta*3 can never equal), then
+    //   shutdown_hooks() makes Java observe the unmodified delta*3 again.
+    // =====================================================================
+    {
+        ctx.check("static_force_return_install", install_beta_force_return());
+
+        const bool d1{ drive(ctx, 2) };
+        ctx.check("static_force_return_probe_completed", d1);
+        ctx.check("static_force_return_hook_fired", g_beta_fires.load() == BETA_CALLS);
+        ctx.check("static_force_return_java_saw_sentinel",
+                  shutdown_fixture::get_last_beta_result() == BETA_SENTINEL);
+        ctx.check("static_force_return_java_did_not_see_original",
+                  shutdown_fixture::get_last_beta_result() != BETA_ORIGINAL);
+
+        // Teardown must restore the ORIGINAL static body byte-for-byte.
+        vmhook::shutdown_hooks();
+        ctx.check("static_force_return_after_shutdown_verify_hooks_zero",
+                  vmhook::verify_hooks() == 0u);
+        const bool d2{ drive(ctx, 2) };
+        ctx.check("static_force_return_after_shutdown_probe_completed", d2);
+        ctx.check("static_force_return_after_shutdown_detour_silent",
+                  g_beta_fires.load() == 0);
+        ctx.check("static_force_return_after_shutdown_byte_exact_original",
+                  shutdown_fixture::get_last_beta_result() == BETA_ORIGINAL);
+        ctx.check("static_force_return_after_shutdown_no_longer_sentinel",
+                  shutdown_fixture::get_last_beta_result() != BETA_SENTINEL);
+
+        vmhook::shutdown_hooks();   // belt-and-braces (already clean)
+    }
+
+    // =====================================================================
+    // Scenario 7 — MIXED scoped_hook + low-level hook<T>, both torn down by ONE
+    //   shutdown_hooks().  scoped_hook normally RAII-uninstalls at scope exit, but
+    //   shutdown_hooks() is the BULK teardown — it must remove a scoped entry too
+    //   (they all live in g_hooked_methods).  Two further edges proven here:
+    //     * a hook_handle that OUTLIVES a shutdown_hooks() destructs SAFELY — its
+    //       stop() finds nothing in the now-empty list and no-ops (no double-free);
+    //     * the library is still revivable: a fresh install after the mixed
+    //       teardown fires again.
+    // =====================================================================
+    {
+        // beta via the RAII path, alpha via the low-level path — distinct methods.
+        auto beta_handle{ vmhook::scoped_hook<shutdown_fixture>(
+            "beta",
+            [](vmhook::return_value&, std::int32_t delta)
+            {
+                g_beta_fires.fetch_add(1, std::memory_order_relaxed);
+                g_beta_arg_ok.store(delta == BETA_DELTA, std::memory_order_relaxed);
+            }) };
+        ctx.check("mixed_scoped_beta_installed", beta_handle.installed());
+        ctx.check("mixed_manual_alpha_installed", install_alpha_observer());
+
+        // Both fire while installed (alpha once + beta once in one run via mode 3).
+        const bool d1{ drive(ctx, 3) };
+        ctx.check("mixed_pre_probe_completed", d1);
+        ctx.check("mixed_pre_alpha_fired", g_alpha_fires.load() == 1);
+        ctx.check("mixed_pre_beta_fired", g_beta_fires.load() == 1);
+        ctx.check("mixed_pre_beta_arg_decoded", g_beta_arg_ok.load());
+
+        // ONE bulk teardown removes BOTH the scoped and the manual entry.
+        vmhook::shutdown_hooks();
+        ctx.check("mixed_after_shutdown_verify_hooks_zero",
+                  vmhook::verify_hooks() == 0u);
+        // The scoped handle still reports installed() (it holds its Method* until
+        // its own stop()), but the underlying entry is already gone — proving
+        // shutdown_hooks() tears scoped hooks down too.
+        const bool d2{ drive(ctx, 3) };
+        ctx.check("mixed_post_probe_completed", d2);
+        ctx.check("mixed_post_alpha_silent", g_alpha_fires.load() == 0);
+        ctx.check("mixed_post_beta_silent", g_beta_fires.load() == 0);
+        ctx.check("mixed_post_alpha_original",
+                  shutdown_fixture::get_last_alpha_result() == ALPHA_ORIGINAL);
+        ctx.check("mixed_post_beta_original",
+                  shutdown_fixture::get_last_beta_result() == BETA_ORIGINAL);
+
+        // Still revivable after a mixed teardown: a fresh manual install fires.
+        ctx.check("mixed_reinstall_returns_true", install_alpha_observer());
+        const bool d3{ drive(ctx, 1) };
+        ctx.check("mixed_reinstall_probe_completed", d3);
+        ctx.check("mixed_reinstall_fires_after_mixed_teardown",
+                  g_alpha_fires.load() == ALPHA_CALLS);
+
+        vmhook::shutdown_hooks();   // clean up the revived manual hook
+
+        // beta_handle now destructs at end of this block: its Method* is non-null
+        // but g_hooked_methods is empty, so stop() finds nothing and no-ops.  No
+        // crash / double-free == suite-safe.  (Implicitly proven by reaching the
+        // post-block check below without faulting.)
+    }
+    ctx.check("mixed_scoped_handle_outliving_shutdown_destructs_safely", true);
+
+    // =====================================================================
+    // Scenario 8 — MANY-CYCLE reversibility: the three-beat dance is not just
+    //   once-reversible, it survives REPEATED teardown/re-install cycles with no
+    //   latch creeping back.  install -> fires -> shutdown -> silent -> repeat.
+    //   If g_shutdown_requested (or the watcher latch) ever re-latched across
+    //   cycles, a later cycle's fresh hook would go silent — caught here.
+    // =====================================================================
+    {
+        constexpr int CYCLES{ 4 };
+        bool every_cycle_fired{ true };
+        bool every_cycle_silent_after_shutdown{ true };
+        bool every_cycle_verify_zero{ true };
+        for (int cycle{ 0 }; cycle < CYCLES; ++cycle)
+        {
+            const bool installed{ install_alpha_observer() };
+            if (!installed)
+            {
+                every_cycle_fired = false;
+            }
+
+            const bool fired{ drive(ctx, 1) };
+            if (!fired || g_alpha_fires.load() != ALPHA_CALLS)
+            {
+                every_cycle_fired = false;
+            }
+            if (shutdown_fixture::get_last_alpha_result() != ALPHA_ORIGINAL)
+            {
+                every_cycle_fired = false;   // allow-through must hold every cycle
+            }
+
+            vmhook::shutdown_hooks();
+            if (vmhook::verify_hooks() != 0u)
+            {
+                every_cycle_verify_zero = false;
+            }
+
+            const bool silent_run{ drive(ctx, 1) };
+            if (!silent_run || g_alpha_fires.load() != 0
+                || shutdown_fixture::get_last_alpha_result() != ALPHA_ORIGINAL)
+            {
+                every_cycle_silent_after_shutdown = false;
+            }
+        }
+        ctx.check("many_cycle_each_install_fires", every_cycle_fired);
+        ctx.check("many_cycle_each_shutdown_silences", every_cycle_silent_after_shutdown);
+        ctx.check("many_cycle_each_teardown_verify_hooks_zero", every_cycle_verify_zero);
+
+        vmhook::shutdown_hooks();   // ensure clean after the loop
+    }
+
+    // =====================================================================
+    // Scenario 9 — WATCHDOG respawn across teardown (the OTHER half of the audit
+    //   bug: "the auto-repair watchdog refused to respawn after shutdown").
+    //   shutdown_hooks() must wait_for_exit() the live watchdog AND clear its
+    //   g_started latch, so a re-enabled gate + fresh install can spawn a brand
+    //   new watchdog whose detour fires.  This module otherwise runs with the
+    //   watchdog OFF (suite contract); we enable it ONLY for this GC-quiet probe
+    //   and disable it again at the end so NOTHING leaks to later modules.
+    // =====================================================================
+    {
+        vmhook::set_auto_repair_enabled(true);
+        ctx.check("watchdog_gate_enabled", vmhook::auto_repair_enabled());
+
+        // Install with the watchdog gate on -> the first hook<T>() may spawn it.
+        ctx.check("watchdog_install_returns_true", install_alpha_observer());
+        const bool w1{ drive(ctx, 1) };
+        ctx.check("watchdog_pre_probe_completed", w1);
+        ctx.check("watchdog_pre_hook_fired", g_alpha_fires.load() == ALPHA_CALLS);
+
+        // shutdown_hooks() must tear down the watchdog (wait_for_exit + clear
+        // g_started) AND the hook, reversibly.
+        vmhook::shutdown_hooks();
+        ctx.check("watchdog_after_shutdown_verify_hooks_zero",
+                  vmhook::verify_hooks() == 0u);
+        const bool w2{ drive(ctx, 1) };
+        ctx.check("watchdog_after_shutdown_probe_completed", w2);
+        ctx.check("watchdog_after_shutdown_detour_silent", g_alpha_fires.load() == 0);
+
+        // Re-install with the gate STILL enabled -> a brand-new watchdog must be
+        // allowed to spawn (g_started was cleared) and the fresh detour MUST fire.
+        // This is the "watchdog refused to respawn" regression litmus.
+        ctx.check("watchdog_reinstall_returns_true", install_alpha_observer());
+        const bool w3{ drive(ctx, 1) };
+        ctx.check("watchdog_reinstall_probe_completed", w3);
+        ctx.check("watchdog_reinstall_fires_after_respawn",
+                  g_alpha_fires.load() == ALPHA_CALLS);
+
+        // Tear down the hook, then turn the watchdog OFF and prove it is off, so
+        // the suite contract (watchdog OFF at module end) is restored.
+        vmhook::shutdown_hooks();
+        vmhook::set_auto_repair_enabled(false);
+        ctx.check("watchdog_gate_disabled_at_end", !vmhook::auto_repair_enabled());
+    }
+    }
+    catch (const std::exception& ex)
+    {
+        // A throw anywhere above must not void the run: record it and fall through
+        // to the UNCONDITIONAL cleanup below.
+        ctx.record(std::string{ "[INFO] shutdown_hooks_teardown: scenario body threw: " } + ex.what());
+    }
+    catch (...)
+    {
+        ctx.record("[INFO] shutdown_hooks_teardown: scenario body threw a non-std exception");
+    }
+
+    // =====================================================================
+    // FINAL CLEANUP — belt-and-braces, OUTSIDE the try so it runs on every path
+    //   (normal exit OR a caught throw).  Other modules run after this one, so the
+    //   module MUST leave ZERO hooks armed AND the auto-repair watchdog OFF (we
+    //   enabled it in scenario 9).  Every scenario above already calls
     //   shutdown_hooks() at its end, but call it once more unconditionally (it is
-    //   idempotent and safe-when-empty, both proven above) so the post-condition
-    //   is unmistakable.
+    //   idempotent and safe-when-empty, both proven above) and force the watchdog
+    //   gate off again so the post-condition is unmistakable on every path —
+    //   leaving the global state CLEAN and REVIVABLE for whatever module runs next.
     // =====================================================================
     vmhook::shutdown_hooks();
+    vmhook::set_auto_repair_enabled(false);   // suite contract: watchdog OFF on exit
+    ctx.check("module_final_verify_hooks_zero", vmhook::verify_hooks() == 0u);
+    ctx.check("module_final_watchdog_off", !vmhook::auto_repair_enabled());
     ctx.check("module_left_clean_final_shutdown", true);
 }
