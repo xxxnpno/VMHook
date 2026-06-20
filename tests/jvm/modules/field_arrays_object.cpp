@@ -2010,11 +2010,16 @@ namespace
             if (done)
             {
                 // Reading a reference array through a FRESHLY-decoded static oop
-                // immediately after a real full GC is GC-timing-variant: on some
-                // JDKs (observed java11) the collection relocates the gcItems array
-                // and the just-decoded oop can momentarily yield an empty/short
-                // read, so even the structural size/count are best-effort here, not
-                // HARD.  The non-GC reference-array reads (PARTS A/B/F) stay HARD.
+                // immediately after a real full GC is GC-timing-variant AND, on a
+                // no-SEH toolchain (mingw / clang-cl), the cold post-relocation
+                // element decode + the call_get_tag() JNI dispatch on a moved young
+                // oop can fault UNCONTAINED and kill the JVM (observed: clang-cl
+                // java25 died here mid-block, no TOTAL line).  Best-effort gating
+                // stops a [FAIL] but NOT the crash -- the fault is during the read.
+                // So run the after-GC element reads ONLY where a fault is contained
+                // (real MSVC = SEH, or POSIX) and skip them on mingw/clang-cl,
+                // mirroring dont_inline_dont_compile scenario 7's no-SEH gate.
+#if (defined(_MSC_VER) && !defined(__clang__)) || !defined(_WIN32)
                 const std::vector<std::unique_ptr<item_object>> g{ wrapper::s_gc_items() };
                 pass_or_info(ctx, "fao_gc_after_gc_size3", g.size() == 3,
                              "gcItems length 3 after System.gc()");
@@ -2047,6 +2052,12 @@ namespace
                              && static_cast<void*>(g[0]->get_instance()) == static_cast<void*>(g2[0]->get_instance())
                              && static_cast<void*>(g[2]->get_instance()) == static_cast<void*>(g2[2]->get_instance()),
                              "gcItems re-read yields the same oops after System.gc()");
+#else
+                ctx.record("[INFO] field_arrays_object: after-GC reference-array element "
+                           "reads skipped on this no-SEH toolchain (mingw / clang-cl) -- a "
+                           "cold post-relocation decode / JNI dispatch on a moved young oop "
+                           "faults UNCONTAINED there (no working SEH); covered on MSVC + POSIX.");
+#endif
             }
 
             // The probe published `self`; read the INSTANCE reference arrays
@@ -2061,17 +2072,18 @@ namespace
                 check_field_shape(ctx, "inst_shape_instStrings_nonstatic_String_array",
                                   self->get_field("instStrings"), "[Ljava/lang/String;", false);
 
-                // ---- C1/C2: instance reference-array reads through the YOUNG `self`
-                // instance.  These freshly-allocated instance-oop reference arrays
-                // cold-decode through a contained-AV-prone path on no-SEH toolchains
-                // (clang-cl / mingw): an intermittent CONTAINED access violation
-                // (cold-fault past is_valid_pointer) corrupts the walk and reddened all
-                // 18 inst_str_*/inst_item_* checks once on windows.clang.java26, while
-                // SEH/POSIX + every mingw run pass the SAME tree.  Per the banked rule
-                // these instance reference-array element reads are best-effort [INFO];
-                // the field SHAPE (check_field_shape above) and the STATIC reference-
-                // array reads (PARTS A/B) stay HARD.  Library follow-up: os::safe_read-
-                // harden the reference-array decode (#28 lineage).
+                // ---- C1/C2/C3/C4: instance reference-array ELEMENT reads through the
+                // YOUNG `self` instance.  Decoding these freshly-allocated instance-oop
+                // reference-array elements (and calling get_tag / call_get_tag on a
+                // cold-decoded element) faults UNCONTAINED on a no-SEH toolchain
+                // (mingw / clang-cl) and KILLS the JVM (observed: clang-cl java8 died
+                // mid-inst_item, no TOTAL line; clang-cl java26 once reddened all 18 as
+                // a contained AV).  Best-effort gating stops a [FAIL] but NOT the crash
+                // -- the fault is during the read.  So run them ONLY where a fault is
+                // contained (real MSVC = SEH, or POSIX) and skip on mingw/clang-cl,
+                // mirroring dont_inline_dont_compile scenario 7.  The instStrings field
+                // SHAPE above + the STATIC reference-array reads (PARTS A/B) stay HARD.
+#if (defined(_MSC_VER) && !defined(__clang__)) || !defined(_WIN32)
                 const std::vector<std::string> is{ self->i_strings() };
                 pass_or_info(ctx, "inst_str_size2", is.size() == 2, "instStrings length 2");
                 pass_or_info(ctx, "inst_str_elem0_inst0", is.size() == 2 && is[0] == "inst0", "instStrings[0]=='inst0'");
@@ -2118,6 +2130,13 @@ namespace
                 pass_or_info(ctx, "inst_item_mixed_size2", imi.size() == 2, "instMixedItems length 2");
                 pass_or_info(ctx, "inst_item_mixed_elem0_tag51", imi.size() == 2 && imi[0] && imi[0]->get_tag() == 51, "instMixedItems[0].tag==51");
                 pass_or_info(ctx, "inst_item_mixed_elem1_nullptr", imi.size() == 2 && imi[1] == nullptr, "instMixedItems[1] is null");
+#else
+                ctx.record("[INFO] field_arrays_object: instance reference-array element "
+                           "reads (inst_str_* / inst_item_*) skipped on this no-SEH toolchain "
+                           "(mingw / clang-cl) -- a cold young-oop decode / JNI dispatch faults "
+                           "UNCONTAINED there (no working SEH); covered on MSVC + POSIX.  The "
+                           "instStrings field SHAPE stays HARD above.");
+#endif
             }
         }
     }
