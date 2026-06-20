@@ -109,6 +109,21 @@ namespace
     constexpr const char* SIG_INIT_I   = "(I)V";
     constexpr const char* SIG_INIT_S   = "(Ljava/lang/String;)V";
 
+    // covariant-return cov() — leaf override + synthetic bridge differ ONLY by ret
+    constexpr const char* SIG_COV_STR  = "()Ljava/lang/String;";       // real override
+    constexpr const char* SIG_COV_CS   = "()Ljava/lang/CharSequence;"; // synthetic bridge
+
+    // wide-mixed-arg family (multi-slot interleave); base(JI)J inherited
+    constexpr const char* SIG_WIDE_JI  = "(JI)J";
+    constexpr const char* SIG_WIDE_DI  = "(DI)D";
+    constexpr const char* SIG_WIDE_JJ  = "(JJ)J";
+    constexpr const char* SIG_BASE_JI  = "(JI)J";
+
+    // void-with-args + object-return descriptors
+    constexpr const char* SIG_SINK_IIV = "(II)V";
+    constexpr const char* SIG_MAKEOBJ  = "()Ljava/lang/Object;";
+    constexpr const char* SIG_MAKENUM  = "()Ljava/lang/Number;";
+
     // ---- constants mirrored from MethodExplicitSig.java ----------------------
     constexpr std::int32_t PROC_I_ARG{ 41 };
     constexpr std::int32_t PROC_II_A{ 3 };
@@ -140,6 +155,18 @@ namespace
     constexpr std::int64_t IFACE_DEF_J_ARG{ 4 };
     constexpr std::int32_t IFACE_ABS_ARG{ 80 };
 
+    // wide-mixed-arg + void-with-args + inherited-wide args (mirror Java)
+    constexpr std::int64_t WIDE_JI_J_ARG{ 6 };
+    constexpr std::int32_t WIDE_JI_I_ARG{ 5 };
+    constexpr double       WIDE_DI_D_ARG{ 2.5 };
+    constexpr std::int32_t WIDE_DI_I_ARG{ 4 };
+    constexpr std::int64_t WIDE_JJ_A_ARG{ 40 };
+    constexpr std::int64_t WIDE_JJ_B_ARG{ 9 };
+    constexpr std::int32_t SINK_II_A{ 12 };
+    constexpr std::int32_t SINK_II_B{ 34 };
+    constexpr std::int64_t BASE_JI_A{ 8 };
+    constexpr std::int32_t BASE_JI_B{ 3 };
+
     // Wrapper for vmhook.fixtures.MethodExplicitSig.
     class method_explicit_sig : public vmhook::object<method_explicit_sig>
     {
@@ -167,6 +194,11 @@ namespace
         static auto comboStHits() -> std::int32_t  { return static_field("comboStHits")->get(); }
         static auto smapIntHits() -> std::int32_t  { return static_field("smapIntHits")->get(); }
         static auto smapStrHits() -> std::int32_t  { return static_field("smapStrHits")->get(); }
+        static auto covStrSeen() -> std::string    { return static_field("covStrSeen")->get(); }
+        static auto wideJiSeen() -> std::int64_t   { return static_field("wideJiSeen")->get(); }
+        static auto wideDiSeen() -> double         { return static_field("wideDiSeen")->get(); }
+        static auto wideJjSeen() -> std::int64_t   { return static_field("wideJjSeen")->get(); }
+        static auto sinkIiSeen() -> std::int32_t   { return static_field("sinkIiSeen")->get(); }
     };
 
     // Reads the inherited-overload tallies off the SUPERCLASS mirror.  The base
@@ -181,6 +213,8 @@ namespace
         }
         static auto baseIntSeen() -> std::int32_t    { return static_field("baseIntSeen")->get(); }
         static auto baseIntIntSeen() -> std::int32_t { return static_field("baseIntIntSeen")->get(); }
+        static auto baseLongIntSeen() -> std::int64_t { return static_field("baseLongIntSeen")->get(); }
+        static auto covBaseSeen() -> std::int32_t    { return static_field("covBaseSeen")->get(); }
     };
 
     // Reads side-effect tallies written from places that cannot host mutable
@@ -384,6 +418,28 @@ namespace
         put(key, r);
     }
 
+    // Instance, String result, NO args (e.g. covariant cov()Ljava/lang/String;).
+    auto cap_inst_str_s_noarg(const method_explicit_sig& self,
+                              const std::string&         key,
+                              const char*                name,
+                              const char*                sig) -> void
+    {
+        probe_result r{};
+        auto proxy{ self.get_method(name, sig) };
+        if (proxy.has_value())
+        {
+            r.resolved = true;
+            r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
+            const vmhook::method_proxy::value_t v{ proxy->call() };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.sval      = v.as_string();
+        }
+        put(key, r);
+    }
+
     // Instance, String result, (String, int) args.
     auto cap_inst_str_si(const method_explicit_sig& self,
                          const std::string&         key,
@@ -579,6 +635,94 @@ namespace
             const vmhook::method_proxy::value_t v{ proxy->call(a, b, c, d) };
             r.is_void = v.is_void();
             r.ival    = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, numeric result, (long, int) args — wide+narrow interleave.
+    auto cap_inst_num_ji(const method_explicit_sig& self,
+                         const std::string&         key,
+                         const char*                name,
+                         const char*                sig,
+                         std::int64_t a, std::int32_t b) -> void
+    {
+        probe_result r{};
+        auto proxy{ self.get_method(name, sig) };
+        if (proxy.has_value())
+        {
+            r.resolved = true;
+            r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
+            const vmhook::method_proxy::value_t v{ proxy->call(a, b) };
+            r.is_void = v.is_void();
+            r.ival    = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, DOUBLE result, (double, int) args — wide+narrow interleave.
+    auto cap_inst_dbl_di(const method_explicit_sig& self,
+                         const std::string&         key,
+                         const char*                name,
+                         const char*                sig,
+                         double a, std::int32_t b) -> void
+    {
+        probe_result r{};
+        auto proxy{ self.get_method(name, sig) };
+        if (proxy.has_value())
+        {
+            r.resolved = true;
+            r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
+            const vmhook::method_proxy::value_t v{ proxy->call(a, b) };
+            r.is_void = v.is_void();
+            r.dval    = static_cast<double>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, numeric result, (long, long) args — two wide slots.
+    auto cap_inst_num_jj(const method_explicit_sig& self,
+                         const std::string&         key,
+                         const char*                name,
+                         const char*                sig,
+                         std::int64_t a, std::int64_t b) -> void
+    {
+        probe_result r{};
+        auto proxy{ self.get_method(name, sig) };
+        if (proxy.has_value())
+        {
+            r.resolved = true;
+            r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
+            const vmhook::method_proxy::value_t v{ proxy->call(a, b) };
+            r.is_void = v.is_void();
+            r.ival    = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, VOID result, (int, int) args — void-with-args dispatch.
+    auto cap_inst_void_ii(const method_explicit_sig& self,
+                          const std::string&         key,
+                          const char*                name,
+                          const char*                sig,
+                          std::int32_t a, std::int32_t b) -> void
+    {
+        probe_result r{};
+        auto proxy{ self.get_method(name, sig) };
+        if (proxy.has_value())
+        {
+            r.resolved = true;
+            r.sig_text = std::string{ proxy->signature() };
+            r.name_text = proxy->name();
+            r.is_static = proxy->is_static();
+            const vmhook::method_proxy::value_t v{ proxy->call(a, b) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
         }
         put(key, r);
     }
@@ -796,6 +940,64 @@ namespace
         // ============================================================
         cap_inst_num_i (s, "base_I",  "base", SIG_BASE_I,  BASE_I_ARG);
         cap_inst_num_ii(s, "base_II", "base", SIG_BASE_II, BASE_II_A, BASE_II_B);
+        // INHERITED wide-mixed-arg overload base(JI)J — the hierarchy walk must
+        // pick this multi-slot (long+int) descriptor distinctly from base(I)I /
+        // base(II)I, and the call must pack the two interpreter slots correctly.
+        cap_inst_num_ji(s, "base_JI", "base", SIG_BASE_JI, BASE_JI_A, BASE_JI_B);
+
+        // ============================================================
+        //  COVARIANT-RETURN selection: cov() is declared CharSequence on the base
+        //  and overridden to String on the leaf, so javac emits BOTH the real
+        //  override ()Ljava/lang/String; AND a synthetic bridge
+        //  ()Ljava/lang/CharSequence; onto the leaf.  The two entries differ ONLY
+        //  by return descriptor — the exact-signature compare keys on the FULL
+        //  descriptor and selects each independently.  We call() the real override
+        //  (String return) and prove its side effect + return; the bridge is
+        //  LOOKUP-ONLY (dispatching the bridge re-enters the override, so calling
+        //  it is not an independent observation — its EXISTENCE by exact descriptor
+        //  is the feature).  On a JDK that does not synthesize the bridge the
+        //  lookup simply MISSES, which we characterize as [INFO] rather than red.
+        // ============================================================
+        cap_inst_str_s_noarg(s, "cov_str", "cov", SIG_COV_STR);
+        cap_lookup_only(s, "cov_bridge", "cov", SIG_COV_CS);
+
+        // ============================================================
+        //  WIDE-MIXED-ARG family (wide): multi-slot descriptors interleaving a
+        //  long/double (two interpreter slots) with a narrow arg.  Each exact
+        //  descriptor selects its own overload and the dispatch packs the slots.
+        // ============================================================
+        cap_inst_num_ji(s, "wide_JI", "wide", SIG_WIDE_JI, WIDE_JI_J_ARG, WIDE_JI_I_ARG);
+        cap_inst_dbl_di(s, "wide_DI", "wide", SIG_WIDE_DI, WIDE_DI_D_ARG, WIDE_DI_I_ARG);
+        cap_inst_num_jj(s, "wide_JJ", "wide", SIG_WIDE_JJ, WIDE_JJ_A_ARG, WIDE_JJ_B_ARG);
+
+        // ============================================================
+        //  VOID-WITH-ARGS: sink(II)V — the 'V' return descriptor selected
+        //  alongside a NON-empty parameter list (distinct from process()V).
+        // ============================================================
+        cap_inst_void_ii(s, "sink_IIV", "sink", SIG_SINK_IIV, SINK_II_A, SINK_II_B);
+
+        // ============================================================
+        //  OBJECT-RETURN descriptors (non-String): makeObj()Object and
+        //  makeNum()Number selected by exact descriptor.  LOOKUP-ONLY (calling a
+        //  reference-returning method yields a wrapper, not the feature here); the
+        //  point is the exact compare distinguishes ()Ljava/lang/Object; from
+        //  ()Ljava/lang/Number; and rejects a wrong object-return descriptor.
+        // ============================================================
+        cap_lookup_only(s, "make_obj", "makeObj", SIG_MAKEOBJ);
+        cap_lookup_only(s, "make_num", "makeNum", SIG_MAKENUM);
+        // wrong object-return descriptor on makeObj must MISS (it returns Object,
+        // not String/Number); and makeNum with the Object descriptor must MISS.
+        cap_miss(s, "miss_makeobj_as_string", "makeObj", "()Ljava/lang/String;");
+        cap_miss(s, "miss_makenum_as_object", "makeNum", SIG_MAKEOBJ);
+
+        // wide family wrong / malformed descriptors -> MISS:
+        cap_miss(s, "miss_wide_ij",  "wide", "(IJ)J");   // slot order swapped (int then long)
+        cap_miss(s, "miss_wide_id",  "wide", "(ID)D");   // swapped int/double
+        cap_miss(s, "miss_wide_ji_wrong_ret", "wide", "(JI)I"); // (JI) returns J not I
+        cap_miss(s, "miss_sink_ret", "sink", "(II)I");   // sink returns V not I
+        cap_miss(s, "miss_sink_arity", "sink", "(I)V");  // no single-int sink overload
+        // covariant: a third return descriptor that does NOT exist for cov().
+        cap_miss(s, "miss_cov_object_ret", "cov", SIG_MAKEOBJ); // no ()Object cov
 
         // ============================================================
         //  WRONG-SIGNATURE / ABSENT-SIGNATURE: every one must MISS (nullopt) and
@@ -1266,6 +1468,153 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("base_II_returns_a_minus_b", rii.ival == (BASE_II_A - BASE_II_B));
             ctx.check("base_II_side_effect",
                       method_explicit_sig_base::baseIntIntSeen() == (BASE_II_A * 1000 + BASE_II_B));
+
+            // INHERITED wide-mixed-arg base(JI)J: hierarchy walk picked the
+            // multi-slot descriptor, and the two interpreter slots (long+int)
+            // packed correctly -> a*1000 + b.
+            const probe_result rji{ get("base_JI") };
+            ctx.check("base_JI_resolved", rji.resolved);
+            ctx.check("base_JI_sig_is_exact", rji.sig_text == SIG_BASE_JI);
+            ctx.check("base_JI_name_is_base", rji.name_text == "base");
+            ctx.check("base_JI_not_static", !rji.is_static);
+            ctx.check("base_JI_returns_packed",
+                      rji.ival == (BASE_JI_A * 1000 + BASE_JI_B));
+            ctx.check("base_JI_side_effect",
+                      method_explicit_sig_base::baseLongIntSeen() == (BASE_JI_A * 1000 + BASE_JI_B));
+        }
+
+        // ===================================================================
+        //  COVARIANT RETURN: cov() declared CharSequence on the base, overridden
+        //  to String on the leaf.  javac normally synthesizes a bridge
+        //  cov()Ljava/lang/CharSequence; alongside the real cov()Ljava/lang/String;
+        //  so the leaf _methods array holds TWO cov() entries differing ONLY by
+        //  the return descriptor.  The exact-signature lookup keys on the FULL
+        //  descriptor and selects each independently.
+        // ===================================================================
+        {
+            const probe_result cstr{ get("cov_str") };
+            ctx.check("cov_str_resolved", cstr.resolved);
+            ctx.check("cov_str_sig_is_string_ret", cstr.sig_text == SIG_COV_STR);
+            ctx.check("cov_str_name_is_cov", cstr.name_text == "cov");
+            ctx.check("cov_str_is_string", cstr.is_string);
+            // The leaf override ran (returns "leaf-cov"); the un-overridden base
+            // body NEVER ran (covBaseSeen stays 0) — virtual dispatch reached the
+            // leaf, not the supertype declaration.
+            ctx.check("cov_str_returns_leaf", cstr.sval == "leaf-cov");
+            ctx.check("cov_str_side_effect", method_explicit_sig::covStrSeen() == "leaf-cov");
+            ctx.check("cov_base_body_never_ran", method_explicit_sig_base::covBaseSeen() == 0);
+
+            // The synthetic bridge cov()Ljava/lang/CharSequence; — LOOKUP-ONLY.
+            // Its presence is JDK/javac-dependent (a bridge is emitted for the
+            // covariant override on every mainstream javac, but we do not red the
+            // matrix if a given build elides it): PASS when found, [INFO] otherwise.
+            const probe_result cbr{ get("cov_bridge") };
+            if (cbr.resolved)
+            {
+                ctx.check("cov_bridge_sig_is_charsequence_ret", cbr.sig_text == SIG_COV_CS);
+                ctx.check("cov_bridge_name_is_cov", cbr.name_text == "cov");
+                // The two cov() proxies differ ONLY by return descriptor.
+                ctx.check("cov_two_proxies_differ_only_by_return",
+                          cbr.sig_text != cstr.sig_text);
+                ctx.record("[INFO] covariant cov(): leaf holds BOTH the real override "
+                           + cstr.sig_text + " and the synthetic bridge " + cbr.sig_text
+                           + " — exact-signature lookup selected each by return descriptor.");
+            }
+            else
+            {
+                ctx.record("[INFO] covariant cov(): synthetic bridge ()Ljava/lang/"
+                           "CharSequence; not present on this build (javac/JDK variant); "
+                           "only the real override ()Ljava/lang/String; resolved.");
+            }
+            // A cov() descriptor that does not exist for either entry misses.
+            ctx.check("miss_cov_object_ret_nullopt", !get("miss_cov_object_ret").resolved);
+        }
+
+        // ===================================================================
+        //  WIDE-MIXED-ARG family (wide): multi-slot descriptors (long/double take
+        //  two interpreter slots).  Each exact descriptor selects its overload and
+        //  the dispatch packs the interleaved slots correctly.
+        // ===================================================================
+        {
+            const probe_result wji{ get("wide_JI") };
+            ctx.check("wide_JI_resolved", wji.resolved);
+            ctx.check("wide_JI_sig_is_exact", wji.sig_text == SIG_WIDE_JI);
+            ctx.check("wide_JI_name_is_wide", wji.name_text == "wide");
+            ctx.check("wide_JI_returns_packed",
+                      wji.ival == (WIDE_JI_J_ARG * 1000 + WIDE_JI_I_ARG));
+            ctx.check("wide_JI_side_effect",
+                      method_explicit_sig::wideJiSeen() == (WIDE_JI_J_ARG * 1000 + WIDE_JI_I_ARG));
+
+            const probe_result wdi{ get("wide_DI") };
+            ctx.check("wide_DI_resolved", wdi.resolved);
+            ctx.check("wide_DI_sig_is_exact", wdi.sig_text == SIG_WIDE_DI);
+            ctx.check("wide_DI_returns_sum",
+                      wdi.dval == (WIDE_DI_D_ARG + static_cast<double>(WIDE_DI_I_ARG)));
+            ctx.check("wide_DI_side_effect",
+                      method_explicit_sig::wideDiSeen()
+                          == (WIDE_DI_D_ARG + static_cast<double>(WIDE_DI_I_ARG)));
+
+            const probe_result wjj{ get("wide_JJ") };
+            ctx.check("wide_JJ_resolved", wjj.resolved);
+            ctx.check("wide_JJ_sig_is_exact", wjj.sig_text == SIG_WIDE_JJ);
+            ctx.check("wide_JJ_returns_diff", wjj.ival == (WIDE_JJ_A_ARG - WIDE_JJ_B_ARG));
+            ctx.check("wide_JJ_side_effect",
+                      method_explicit_sig::wideJjSeen() == (WIDE_JJ_A_ARG - WIDE_JJ_B_ARG));
+
+            // The three wide proxies carry three distinct descriptors.
+            ctx.check("wide_three_distinct",
+                      wji.sig_text != wdi.sig_text && wdi.sig_text != wjj.sig_text
+                          && wji.sig_text != wjj.sig_text);
+
+            // wrong / swapped-slot-order / wrong-return wide descriptors MISS.
+            ctx.check("miss_wide_ij_nullopt", !get("miss_wide_ij").resolved);
+            ctx.check("miss_wide_id_nullopt", !get("miss_wide_id").resolved);
+            ctx.check("miss_wide_ji_wrong_ret_nullopt", !get("miss_wide_ji_wrong_ret").resolved);
+            ctx.record("[INFO] wide-mixed-arg: (JI)J / (DI)D / (JJ)J each selected by exact "
+                       "descriptor and dispatched with correct multi-slot packing; the "
+                       "slot-order-swapped (IJ)J / (ID)D and wrong-return (JI)I all MISS.");
+        }
+
+        // ===================================================================
+        //  VOID-WITH-ARGS: sink(II)V — the 'V' return descriptor selected with a
+        //  NON-empty parameter list (distinct from process()V).
+        // ===================================================================
+        {
+            const probe_result sk{ get("sink_IIV") };
+            ctx.check("sink_IIV_resolved", sk.resolved);
+            ctx.check("sink_IIV_sig_is_exact", sk.sig_text == SIG_SINK_IIV);
+            ctx.check("sink_IIV_name_is_sink", sk.name_text == "sink");
+            ctx.check("sink_IIV_is_void", sk.is_void);
+            ctx.check("sink_IIV_is_not_string", !sk.is_string);
+            ctx.check("sink_IIV_side_effect",
+                      method_explicit_sig::sinkIiSeen() == (SINK_II_A * 1000 + SINK_II_B));
+            // wrong-return / wrong-arity sink descriptors miss.
+            ctx.check("miss_sink_ret_nullopt",   !get("miss_sink_ret").resolved);
+            ctx.check("miss_sink_arity_nullopt", !get("miss_sink_arity").resolved);
+        }
+
+        // ===================================================================
+        //  OBJECT-RETURN descriptors (non-String): makeObj()Object, makeNum()Number
+        //  selected by exact descriptor (LOOKUP-ONLY).  A wrong object-return
+        //  descriptor misses — the reference return type is part of the descriptor
+        //  just like a primitive one.
+        // ===================================================================
+        {
+            const probe_result mo{ get("make_obj") };
+            ctx.check("make_obj_resolved", mo.resolved);
+            ctx.check("make_obj_sig_is_object_ret", mo.sig_text == SIG_MAKEOBJ);
+            ctx.check("make_obj_name", mo.name_text == "makeObj");
+            const probe_result mn{ get("make_num") };
+            ctx.check("make_num_resolved", mn.resolved);
+            ctx.check("make_num_sig_is_number_ret", mn.sig_text == SIG_MAKENUM);
+            ctx.check("make_num_name", mn.name_text == "makeNum");
+            // The two object-return descriptors differ.
+            ctx.check("obj_returns_distinct", mo.sig_text != mn.sig_text);
+            // Wrong object-return descriptors miss.
+            ctx.check("miss_makeobj_as_string_nullopt", !get("miss_makeobj_as_string").resolved);
+            ctx.check("miss_makenum_as_object_nullopt", !get("miss_makenum_as_object").resolved);
+            ctx.record("[INFO] object-return descriptor is load-bearing: makeObj()Object and "
+                       "makeNum()Number resolve, but makeObj()String / makeNum()Object MISS.");
         }
 
         // ===================================================================
@@ -1786,6 +2135,21 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
         // constructors were lookup-only: NO ctor side effect fired.
         ctx.check("isolation_init_no_int_dispatch", method_explicit_sig_counters::initIntSeen() == 0);
         ctx.check("isolation_init_no_str_dispatch", method_explicit_sig_counters::initStrSeen().empty());
+        // inherited wide-mixed-arg base(JI)J dispatched once with its packed value
+        // (never re-dispatched by the boundary block -> live read is canonical).
+        ctx.check("isolation_base_JI", method_explicit_sig_base::baseLongIntSeen() == (BASE_JI_A * 1000 + BASE_JI_B));
+        // covariant: the leaf override ran exactly once; the base body never ran.
+        ctx.check("isolation_cov_leaf", method_explicit_sig::covStrSeen() == "leaf-cov");
+        ctx.check("isolation_cov_base_unran", method_explicit_sig_base::covBaseSeen() == 0);
+        // wide family side effects each set by their own overload (not re-dispatched).
+        ctx.check("isolation_wide_JI", method_explicit_sig::wideJiSeen() == (WIDE_JI_J_ARG * 1000 + WIDE_JI_I_ARG));
+        ctx.check("isolation_wide_DI",
+                  method_explicit_sig::wideDiSeen() == (WIDE_DI_D_ARG + static_cast<double>(WIDE_DI_I_ARG)));
+        ctx.check("isolation_wide_JJ", method_explicit_sig::wideJjSeen() == (WIDE_JJ_A_ARG - WIDE_JJ_B_ARG));
+        // void-with-args sink(II)V dispatched once.
+        ctx.check("isolation_sink_IIV", method_explicit_sig::sinkIiSeen() == (SINK_II_A * 1000 + SINK_II_B));
+        // object-return makeObj/makeNum were lookup-only: neither dispatched (no
+        // observable side effect exists to leak; the proxies carried exact sigs).
     }
 
     // UNCONDITIONAL teardown: the scoped_hook above is RAII (its destructor at

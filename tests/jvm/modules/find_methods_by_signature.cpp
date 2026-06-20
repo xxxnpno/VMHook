@@ -204,6 +204,29 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
               has_pair(all_methods, "idObj", "(Ljava/lang/Object;)Ljava/lang/Object;"));
     ctx.check("substrate_has_twoRef_SOV",
               has_pair(all_methods, "twoRef", "(Ljava/lang/String;Ljava/lang/Object;)V"));
+    // ...and the batch-20 deepening shapes: 2-D reference array, interface-typed
+    // reference, the class's OWN type, the narrow/wide no-arg returns, and the
+    // four-way (F)I set (all verified by reasoning the JVM descriptor grammar; the
+    // descriptors are JDK-stable internal-form strings).
+    ctx.check("substrate_has_arrStr2_a2S",
+              has_pair(all_methods, "arrStr2",
+                       "([[Ljava/lang/String;)[[Ljava/lang/String;"));
+    ctx.check("substrate_has_seq_CSCS",
+              has_pair(all_methods, "seq",
+                       "(Ljava/lang/CharSequence;)Ljava/lang/CharSequence;"));
+    ctx.check("substrate_has_self_TT",
+              has_pair(all_methods, "self",
+                       "(Lvmhook/fixtures/FindMethodsBySig;)Lvmhook/fixtures/FindMethodsBySig;"));
+    ctx.check("substrate_has_retF_F", has_pair(all_methods, "retF", "()F"));
+    ctx.check("substrate_has_retD_D", has_pair(all_methods, "retD", "()D"));
+    ctx.check("substrate_has_retZ_Z", has_pair(all_methods, "retZ", "()Z"));
+    ctx.check("substrate_has_retB_B", has_pair(all_methods, "retB", "()B"));
+    ctx.check("substrate_has_retC_C", has_pair(all_methods, "retC", "()C"));
+    ctx.check("substrate_has_retS_S", has_pair(all_methods, "retS", "()S"));
+    ctx.check("substrate_has_q1_FI", has_pair(all_methods, "q1", "(F)I"));
+    ctx.check("substrate_has_q2_FI", has_pair(all_methods, "q2", "(F)I"));
+    ctx.check("substrate_has_q3_FI", has_pair(all_methods, "q3", "(F)I"));
+    ctx.check("substrate_has_q4_FI", has_pair(all_methods, "q4", "(F)I"));
 
     // =====================================================================
     //  1. SHARED descriptor (I)I -> the FULL set { f, sf }.  This is the
@@ -566,6 +589,200 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
     }
 
     // =====================================================================
+    //  5h. MULTI-DIMENSIONAL REFERENCE array + INTERFACE + SELF reference types.
+    //      ([[Ljava/lang/String;)[[Ljava/lang/String; {arrStr2} nests the '[' run
+    //      AHEAD of the L...; element tag and must be distinct from the 1-D
+    //      reference array {arrStr} and the 2-D PRIMITIVE array {arr2}.  An
+    //      interface-typed reference (CharSequence) and the class's OWN type are
+    //      just reference class names: each a unique singleton, neither reachable
+    //      by a sibling reference descriptor even when the Java types are related
+    //      (String IS-A CharSequence, but the descriptor names the STATIC type).
+    // =====================================================================
+    {
+        const name_list as2{ find_sig("([[Ljava/lang/String;)[[Ljava/lang/String;") };
+        ctx.check("arrStr2_size_1", as2.size() == 1);
+        ctx.check("arrStr2_is_arrStr2", as2.size() == 1 && as2.front() == "arrStr2");
+        // 2-D reference array must NOT collide with 1-D reference array {arrStr}
+        // nor with the 2-D PRIMITIVE int array {arr2}.
+        const name_list as1{ find_sig("([Ljava/lang/String;)[Ljava/lang/String;") };
+        ctx.check("arrStr2_excludes_arrStr", !contains(as2, "arrStr"));
+        ctx.check("arrStr_excludes_arrStr2", !contains(as1, "arrStr2"));
+        ctx.check("arr2_prim_excludes_arrStr2",
+                  !contains(find_sig("([[I)[[I"), "arrStr2"));
+        // A dimension/element mismatch on the reference array is declared by nothing.
+        ctx.check("refarr_1in_2out_empty",
+                  find_sig("([Ljava/lang/String;)[[Ljava/lang/String;").empty());
+
+        // Interface-typed reference: (Ljava/lang/CharSequence;)Ljava/lang/CharSequence;
+        // {seq}, a unique singleton, NOT reachable via String or Object descriptors.
+        const name_list cs{ find_sig("(Ljava/lang/CharSequence;)Ljava/lang/CharSequence;") };
+        ctx.check("seq_size_1", cs.size() == 1);
+        ctx.check("seq_is_seq", cs.size() == 1 && cs.front() == "seq");
+        ctx.check("strStr_excludes_seq",
+                  !contains(find_sig("(Ljava/lang/String;)Ljava/lang/String;"), "seq"));
+        ctx.check("objObj_excludes_seq",
+                  !contains(find_sig("(Ljava/lang/Object;)Ljava/lang/Object;"), "seq"));
+        // The supertype-substitution near-miss: a String passed where CharSequence
+        // is declared has descriptor (Ljava/lang/String;)Ljava/lang/CharSequence;,
+        // declared by nothing (descriptors are invariant in the static type).
+        ctx.check("seq_str_in_cs_out_empty",
+                  find_sig("(Ljava/lang/String;)Ljava/lang/CharSequence;").empty());
+
+        // Self-referential class type: (Lvmhook/fixtures/FindMethodsBySig;).. {self}.
+        const name_list slf{ find_sig(
+            "(Lvmhook/fixtures/FindMethodsBySig;)Lvmhook/fixtures/FindMethodsBySig;") };
+        ctx.check("self_size_1", slf.size() == 1);
+        ctx.check("self_is_self", slf.size() == 1 && slf.front() == "self");
+        // The dotted (source) form of the self type matches nothing.
+        ctx.check("self_dotted_empty",
+                  find_sig("(Lvmhook.fixtures.FindMethodsBySig;)Lvmhook.fixtures.FindMethodsBySig;")
+                      .empty());
+    }
+
+    // =====================================================================
+    //  5i. NO-ARG NARROW/WIDE RETURN-TYPE discrimination completed.  Section 5
+    //      covered ()V/()I/()J/()Lj.l.Object;/()Lj.l.String;; here are the
+    //      remaining primitive return tags on the empty arg list: ()F ()D ()Z
+    //      ()B ()C ()S -- each a genuine singleton (no synthetic returns these
+    //      with zero args on any JDK), proving the RETURN-TYPE tag fully
+    //      partitions the no-arg methods.
+    // =====================================================================
+    {
+        struct ret_case { const char* desc; const char* name; };
+        const ret_case cases[]{
+            { "()F", "retF" }, { "()D", "retD" }, { "()Z", "retZ" },
+            { "()B", "retB" }, { "()C", "retC" }, { "()S", "retS" }
+        };
+        for (const ret_case& rc : cases)
+        {
+            const name_list r{ find_sig(rc.desc) };
+            ctx.check(std::string{ "noarg_" } + rc.name + "_size_1", r.size() == 1);
+            ctx.check(std::string{ "noarg_" } + rc.name + "_is_expected",
+                      r.size() == 1 && r.front() == rc.name);
+        }
+        // Cross-exclusion: the wide ()D set must not contain the narrow-return
+        // methods and vice-versa; ()F (retF) and ()D (retD) are NOT the same set.
+        ctx.check("noargD_excludes_retF", !contains(find_sig("()D"), "retF"));
+        ctx.check("noargF_excludes_retD", !contains(find_sig("()F"), "retD"));
+        ctx.check("noargF_excludes_retI", !contains(find_sig("()F"), "retI"));
+        // ()Z is single-byte tag Z, distinct from ()I (retI) and ()B (retB).
+        ctx.check("noargZ_excludes_retI", !contains(find_sig("()Z"), "retI"));
+        ctx.check("noargZ_excludes_retB", !contains(find_sig("()Z"), "retB"));
+        ctx.check("noargB_excludes_retZ", !contains(find_sig("()B"), "retZ"));
+    }
+
+    // =====================================================================
+    //  5j. FOUR-WAY shared descriptor (F)I -> { q1, q2, q3, q4 }.  Pushes the
+    //      headline "return ALL matches" past N=3 to N=4: three instance methods
+    //      (q1, q2, q3) and one static (q4) co-enumerate on a single descriptor.
+    //      Also proves the FLOAT arg tag (F) discriminates against the DOUBLE arg
+    //      (D)I {tri1,tri2,tri3} set -- same int return, different arg width.
+    // =====================================================================
+    {
+        const name_list fi{ find_sig("(F)I") };
+        ctx.check("FI_size_4", fi.size() == 4);
+        ctx.check("FI_has_q1", contains(fi, "q1"));
+        ctx.check("FI_has_q2", contains(fi, "q2"));
+        ctx.check("FI_has_q3", contains(fi, "q3"));
+        ctx.check("FI_has_q4", contains(fi, "q4"));
+        ctx.check("FI_is_exactly_q1234",
+                  same_multiset(fi, name_list{ "q1", "q2", "q3", "q4" }));
+        ctx.check("FI_q1_once", count_name(fi, "q1") == 1);
+        ctx.check("FI_q4_once", count_name(fi, "q4") == 1);
+        // FLOAT-arg vs DOUBLE-arg discrimination: (F)I and (D)I are disjoint sets.
+        ctx.check("FI_excludes_tri1", !contains(fi, "tri1"));
+        ctx.check("DI_excludes_q1", !contains(find_sig("(D)I"), "q1"));
+        // (F)I must not bleed into (F)F {ffn} (same arg, different return).
+        ctx.check("FI_excludes_ffn", !contains(fi, "ffn"));
+    }
+
+    // =====================================================================
+    //  5k. OVERLOADED-NAME cross-descriptor invariant.  The name `f` is declared
+    //      on FOUR distinct descriptors -- (I)I, (J)J, ()V, and
+    //      (Ljava/lang/String;)Ljava/lang/String; -- so `f` must appear in EXACTLY
+    //      those four result sets and in NO other.  This pins that find partitions
+    //      a single overloaded NAME correctly across descriptors (the inverse view
+    //      of the multi-method-per-descriptor sets above).
+    // =====================================================================
+    {
+        const char* f_carriers[]{ "(I)I", "(J)J", "()V",
+                                  "(Ljava/lang/String;)Ljava/lang/String;" };
+        bool f_in_all_carriers{ true };
+        for (const char* d : f_carriers)
+        {
+            if (!contains(find_sig(d), "f")) { f_in_all_carriers = false; }
+        }
+        ctx.check("name_f_in_all_four_carrier_descriptors", f_in_all_carriers);
+        // `f` must NOT appear under any descriptor it does not declare.
+        const char* f_non_carriers[]{ "(II)I", "(I)J", "()I", "()J", "(D)I",
+                                      "([I)[I", "(Ljava/lang/Object;)Ljava/lang/Object;",
+                                      "(JD)V", "(F)I" };
+        bool f_in_no_other{ true };
+        for (const char* d : f_non_carriers)
+        {
+            if (contains(find_sig(d), "f")) { f_in_no_other = false; }
+        }
+        ctx.check("name_f_absent_from_non_carrier_descriptors", f_in_no_other);
+        // The total number of result sets containing `f` across ALL declared
+        // descriptors equals 4 (one per distinct descriptor `f` declares).
+        name_list distinct_descs{};
+        for (const std::pair<std::string, std::string>& m : all_methods)
+        {
+            if (std::find(distinct_descs.begin(), distinct_descs.end(), m.second)
+                == distinct_descs.end())
+            {
+                distinct_descs.push_back(m.second);
+            }
+        }
+        std::size_t sets_with_f{ 0 };
+        for (const std::string& d : distinct_descs)
+        {
+            if (contains(find_sig(d.c_str()), "f")) { ++sets_with_f; }
+        }
+        ctx.check("name_f_appears_in_exactly_4_sets", sets_with_f == 4);
+    }
+
+    // =====================================================================
+    //  5l. GLOBAL COMPLETENESS invariant: every declared method is reachable by
+    //      EXACTLY its own descriptor, and nothing is lost or double-counted.  The
+    //      sum over DISTINCT descriptors of find(d).size() must equal the total
+    //      declared-method count, and the union of all find results (as a multiset
+    //      of names) must equal the substrate's full name multiset.  This is the
+    //      strongest single statement that find is a faithful partition of
+    //      get_class_methods<W>() by descriptor.
+    // =====================================================================
+    {
+        name_list distinct_descs{};
+        for (const std::pair<std::string, std::string>& m : all_methods)
+        {
+            if (std::find(distinct_descs.begin(), distinct_descs.end(), m.second)
+                == distinct_descs.end())
+            {
+                distinct_descs.push_back(m.second);
+            }
+        }
+        std::size_t sum_of_sets{ 0 };
+        name_list union_names{};
+        for (const std::string& d : distinct_descs)
+        {
+            const name_list got{ find_sig(d.c_str()) };
+            sum_of_sets += got.size();
+            for (const std::string& nm : got) { union_names.push_back(nm); }
+        }
+        ctx.check("sum_of_descriptor_sets_equals_total",
+                  sum_of_sets == all_methods.size());
+        // The union of all find results must equal the substrate name multiset.
+        name_list substrate_names{};
+        substrate_names.reserve(all_methods.size());
+        for (const std::pair<std::string, std::string>& m : all_methods)
+        {
+            substrate_names.push_back(m.first);
+        }
+        ctx.check("union_of_find_results_equals_substrate_names",
+                  same_multiset(union_names, substrate_names));
+    }
+
+    // =====================================================================
     //  6. CONSISTENCY with the substrate: for EVERY descriptor we test, the
     //     find(...) size equals the descriptor's multiplicity in
     //     get_class_methods<W>(), and every returned NAME actually carries that
@@ -587,7 +804,13 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
             // reference (incl. the two SHARED sets ([J)[J and ([I)I):
             "([J)[J", "([D)[D", "([Z)[Z", "([B)[B", "([[[I)[[[I", "([I)I",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
-            "(Ljava/lang/String;Ljava/lang/Object;)V"
+            "(Ljava/lang/String;Ljava/lang/Object;)V",
+            // batch-20 shapes: 2-D ref array, interface ref, self ref, the narrow/
+            // wide no-arg returns, and the four-way (F)I set:
+            "([[Ljava/lang/String;)[[Ljava/lang/String;",
+            "(Ljava/lang/CharSequence;)Ljava/lang/CharSequence;",
+            "(Lvmhook/fixtures/FindMethodsBySig;)Lvmhook/fixtures/FindMethodsBySig;",
+            "()F", "()D", "()Z", "()B", "()C", "()S", "(F)I"
         };
         bool all_sizes_agree{ true };
         bool all_names_carry_descriptor{ true };
@@ -627,7 +850,11 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
                                    "(Ljava/lang/String;)Ljava/lang/Object;",
                                    "([J)[J", "([D)[D", "([[[I)[[[I", "([I)I",
                                    "(Ljava/lang/Object;)Ljava/lang/Object;",
-                                   "(Ljava/lang/String;Ljava/lang/Object;)V" };
+                                   "(Ljava/lang/String;Ljava/lang/Object;)V",
+                                   "(F)I", "()D", "()F",
+                                   "([[Ljava/lang/String;)[[Ljava/lang/String;",
+                                   "(Ljava/lang/CharSequence;)Ljava/lang/CharSequence;",
+                                   "(Lvmhook/fixtures/FindMethodsBySig;)Lvmhook/fixtures/FindMethodsBySig;" };
         bool every_name_real{ true };
         bool no_empty_name{ true };
         for (const char* d : probe_descs)
@@ -762,6 +989,17 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
         // dotted form of a reference ARRAY descriptor (internal form uses '/').
         ctx.check("dotted_array_form_empty",
                   find_sig("([Ljava.lang.String;)[Ljava.lang.String;").empty());
+        // a 1-D reference array where the declared method is 2-D ({arrStr2} is
+        // ([[Ljava/lang/String;)..), and the reverse, must both be absent.
+        ctx.check("refarr_2in_1out_empty",
+                  find_sig("([[Ljava/lang/String;)[Ljava/lang/String;").empty());
+        // CharSequence is declared as a scalar reference, not as an array element.
+        ctx.check("seq_as_array_empty",
+                  find_sig("([Ljava/lang/CharSequence;)[Ljava/lang/CharSequence;").empty());
+        // The self type carried as an ARRAY element is declared by nothing.
+        ctx.check("self_as_array_empty",
+                  find_sig("([Lvmhook/fixtures/FindMethodsBySig;)[Lvmhook/fixtures/FindMethodsBySig;")
+                      .empty());
 
         // (o) ARITY near-misses on the multi-arg shapes.  twoRef is
         //     (Ljava/lang/String;Ljava/lang/Object;)V; adding/removing a slot or
@@ -913,5 +1151,18 @@ VMHOOK_JVM_MODULE(find_methods_by_signature)
         ctx.check("by_name_vararg_count_is_2", count_descriptor(by_name, "([I)I") == 2);
         ctx.check("by_name_arr3_count_matches_find",
                   count_descriptor(by_name, "([[[I)[[[I") == find_sig("([[[I)[[[I").size());
+        // The four-way (F)I set is the strongest batch-20 by-name cross-check: the
+        // internal-name klass must report multiplicity 4 for (F)I, exactly matching
+        // what find returns through the registered wrapper.
+        ctx.check("by_name_FI_count_matches_find",
+                  count_descriptor(by_name, "(F)I") == find_sig("(F)I").size());
+        ctx.check("by_name_FI_count_is_4", count_descriptor(by_name, "(F)I") == 4);
+        // ...and the self-referential descriptor resolves identically by name.
+        ctx.check("by_name_self_count_matches_find",
+                  count_descriptor(by_name,
+                      "(Lvmhook/fixtures/FindMethodsBySig;)Lvmhook/fixtures/FindMethodsBySig;")
+                      == find_sig(
+                          "(Lvmhook/fixtures/FindMethodsBySig;)Lvmhook/fixtures/FindMethodsBySig;")
+                          .size());
     }
 }

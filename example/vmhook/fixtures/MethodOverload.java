@@ -122,6 +122,18 @@ public final class MethodOverload
     //   long+double adjacency — is owned by the method_call_wide_args module's
     //   jd/dj/addD/mixD methods; this overload exists so the RESOLVER's two-wide
     //   parameter walk is exercised in the overload-disambiguation module.)
+    public static final int RET_INT_DOUBLE  = 1028;  // pick(int,double)   "(ID)I"  — a
+    //   NARROW-then-WIDE pair: slot0 is one interpreter slot (int), slot1 is two
+    //   (double).  The resolver must select this over pick(int,long) "(IJ)I" (same
+    //   first slot, different second descriptor) AND over pick(long,double) "(JD)I"
+    //   (same second slot, different first descriptor) — proving each slot's
+    //   descriptor is matched independently when ONE slot is wide and the adjacent
+    //   one is not.
+    public static final int RET_DOUBLE_INT  = 1029;  // pick(double,int)   "(DI)I"  — the
+    //   WIDE-then-NARROW mirror of pick(int,double): slot0 is two slots (double),
+    //   slot1 one (int).  Shares the type multiset {double,int} with pick(int,double)
+    //   but differs by ORDER, so the resolver must tell (DI)I from (ID)I by slot,
+    //   never by the unordered set of parameter kinds.
     // Array overloads: descriptor "[I" / "[J" / "[C" — a leading '[' the matcher
     // must parse via next_argument_descriptor's array branch and treat as DISTINCT
     // from the scalar "I" / "J" / "C" overloads (array-vs-scalar disambiguation).
@@ -233,6 +245,16 @@ public final class MethodOverload
     // resolver selected this overload AND both wide values survived into their
     // (distinct, non-overlapping) slots.
     public int pick(final long a, final double b)           { lastArg2B = a; lastDoubleArg = b; return RET_LONG_DOUBLE; }
+    // NARROW-then-WIDE "(ID)I": slot0 int (one slot), slot1 double (two slots).
+    // Echo the int into lastArg2A and the double into lastDoubleArg so the native
+    // side proves BOTH the narrow slot0 and the adjacent wide slot1 survived and
+    // that the resolver did not collapse this onto (IJ)I or (JD)I.
+    public int pick(final int a, final double b)            { lastArg2A = a; lastDoubleArg = b; return RET_INT_DOUBLE; }
+    // WIDE-then-NARROW "(DI)I": slot0 double (two slots), slot1 int (one slot).
+    // The order mirror of pick(int,double); echo the int into lastArg2A and the
+    // double into lastDoubleArg.  Resolving (DI)I vs (ID)I forces per-slot
+    // descriptor matching when the wide/narrow ORDER is the only difference.
+    public int pick(final double a, final int b)            { lastArg2A = b; lastDoubleArg = a; return RET_DOUBLE_INT; }
 
     // Array overloads — a leading '[' in the descriptor ("[I" / "[J").  These
     // exist so the resolver's array-token parsing is exercised: scanning the
@@ -295,7 +317,16 @@ public final class MethodOverload
     public static int spick(final byte a)    { lastByteArg = a;   return RET_BYTE + SBIAS; }
     public static int spick(final short a)   { lastShortArg = a;  return RET_SHORT + SBIAS; }
     public static int spick(final char a)    { lastCharArg = a;   return RET_CHAR + SBIAS; }
+    // STATIC no-arg twin: spick() must be re-picked by an arg-less static call on
+    // the historically-broken static path (resolve_compatible_method deriving the
+    // klass from _pool_holder, fix #7), distinct from every arg-taking static.
+    public static int spick() { return RET_NOARG + SBIAS; }
     public static int spick(final int a, final int b) { lastArg2A = a; lastArg2B = b; return RET_INT_INT + SBIAS; }
+    // STATIC narrow-then-wide twin "(ID)I": an (int32_t,double) static call must
+    // select this, distinct from spick(long,double) "(JD)I" and from spick(int,int)
+    // "(II)I" — per-slot static descriptor matching with one wide and one narrow
+    // slot.  Echo the int into lastArg2A and the double into lastDoubleArg.
+    public static int spick(final int a, final double b) { lastArg2A = a; lastDoubleArg = b; return RET_INT_DOUBLE + SBIAS; }
     // STATIC reference overload twin (the historically-buggy path): a wrapper
     // registered as java/lang/Integer must re-pick THIS over spick(String).  Body
     // ignores `a` (same reason as pick(Integer)).

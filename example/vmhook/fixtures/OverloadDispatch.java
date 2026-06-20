@@ -158,6 +158,14 @@ public final class OverloadDispatch
     /** tick() invocation count — handshake proof the detour fired. */
     public static volatile int     tickCount;
 
+    /**
+     * The last nonce tick() actually received from Java.  The native detour also
+     * observes this same argument off the interpreter frame; the module
+     * cross-checks native-observed == Java-recorded so "the detour saw the right
+     * argument" is proven from BOTH sides, not just the native read.
+     */
+    public static volatile int     lastTickNonce;
+
     // ── Hook site ─────────────────────────────────────────────────────────────
     /**
      * The native module hooks this; inside the detour current_java_thread is live,
@@ -167,6 +175,7 @@ public final class OverloadDispatch
     public int tick(final int nonce)
     {
         tickCount++;
+        lastTickNonce = nonce;
         return nonce + 1;
     }
 

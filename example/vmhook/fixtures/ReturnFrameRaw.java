@@ -96,6 +96,48 @@ public final class ReturnFrameRaw
     // set_arg, the body echoes what it finally observed.
     public static final long   WIDE_RT_INJECT = 0x0BADF00DDEADBEEFL;
 
+    // Eight one-slot ints in a row (this@0, args@1..8).  Each value is a
+    // recognisable, non-colliding pattern so a one-off slot-walk drift deep into
+    // the array is caught (the existing instanceWide only reaches slot 6).  M5
+    // and M8 also serve as the in-method-range set_arg targets (a HIGH but VALID
+    // logical slot) the native side round-trips, and the body echoes M8 so the
+    // allow-through / set_arg readback is provable.
+    public static final int    MANY_1 = 0x11111111;
+    public static final int    MANY_2 = 0x22222222;
+    public static final int    MANY_3 = 0x33333333;
+    public static final int    MANY_4 = 0x44444444;
+    public static final int    MANY_5 = 0x55555555;
+    public static final int    MANY_6 = 0x66666666;
+    public static final int    MANY_7 = 0x77777777;
+    public static final int    MANY_8 = 0x7EEEEEEE;
+    // Native set_arg(5, this) overwrites M5 in-place; the body echoes the M5 slot
+    // AFTER any mutation so the high-slot write is provable through the body too.
+    public static final int    MANY_5_INJECT = 0x0AB1CD05;
+
+    // Static method with THREE consecutive two-slot args and NO this: the
+    // accumulator must add +2 each time from slot 0 onward (long@0(value@0),
+    // double@2(value@2), long@4(value@4), int@6).  The static counterpart of the
+    // instance two-slot model, which the instance-only instanceWide does not pin.
+    public static final long   SMW_L0 = 0x0A0A0A0A0B0B0B0BL;       // long  -> slots 0..1
+    public static final double SMW_D  = Double.longBitsToDouble(0x4005BF0995AAF790L); // double -> slots 2..3
+    public static final long   SMW_L1 = 0x0C0C0C0C0D0D0D0DL;       // long  -> slots 4..5
+    public static final int    SMW_T  = 0x0E0E0E0E;                // int   -> slot 6
+
+    // Instance method INTERLEAVING wide/narrow in a DIFFERENT order than
+    // instanceWide (which is int,long,double,int): here long,int,double,int.
+    // this@0, l@1(value@1->lower slot 2), i@3, d@4(value@4->lower slot 5),
+    // tail@6.  Catches an accumulator that only happens to work for the existing
+    // ordering.
+    public static final long   WTN_L    = 0x1314151617181920L;     // long   -> slots 1..2
+    public static final int    WTN_I    = 0x21222324;              // int    -> slot 3
+    public static final double WTN_D    = Double.longBitsToDouble(0x400921FB54442D18L); // double (2*PI) -> slots 4..5
+    public static final int    WTN_TAIL = 0x31323334;              // int    -> slot 6
+
+    // Narrow set_arg ZERO injection: writing 0 into a one-slot int local exercises
+    // the all-zero-slot write path (the store comment flags zero-slot writes as a
+    // historical corruption class).  The body echoes what it finally saw.
+    public static final int    ZERO_RT_INPUT = 0x1357ACE0;         // non-zero original
+
     // ---- Echoed observations (what each body actually received) -------------
     public static volatile int    simpleSeen   = 0;
     public static volatile int    wideASeen    = 0;
@@ -124,6 +166,20 @@ public final class ReturnFrameRaw
     public static volatile long   slfL0Seen = 0L;                // leading static long
     public static volatile int    slfTailSeen = 0;               // trailing static int
     public static volatile long   wideRoundTripSeen = 0L;        // long observed after set_arg
+
+    // Deepening batch-20 echoes.
+    public static volatile int    many5Seen = 0;                 // slot 5 observed AFTER set_arg(5,...)
+    public static volatile int    many8Seen = 0;                 // slot 8 (deepest one-slot arg)
+    public static volatile int    manySumSeen = 0;               // XOR of all eight, allow-through proof
+    public static volatile long   smwL0Seen = 0L;                // static wide arg0
+    public static volatile long   smwDBitsSeen = 0L;             // static wide double raw bits
+    public static volatile long   smwL1Seen = 0L;                // static wide arg2 (long)
+    public static volatile int    smwTSeen = 0;                  // static wide trailing int
+    public static volatile long   wtnLSeen = 0L;                 // interleaved long
+    public static volatile int    wtnISeen = 0;                  // interleaved int between the wides
+    public static volatile long   wtnDBitsSeen = 0L;             // interleaved double raw bits
+    public static volatile int    wtnTailSeen = 0;               // interleaved trailing int
+    public static volatile int    zeroRtSeen = 0;                // int observed after set_arg(1, 0)
 
     // ---- Hookable methods ---------------------------------------------------
 
@@ -241,6 +297,68 @@ public final class ReturnFrameRaw
         return value;
     }
 
+    /**
+     * Eight one-slot ints in a row: this@0, then args@1..8 with NO two-slot
+     * gaps.  Reaches deeper into the local array than any other method here, so
+     * a one-off slot-walk drift past slot 6 is caught.  The native hook also
+     * overwrites slot 5 via set_arg(5, ...) (a HIGH but in-range logical slot),
+     * so the body's m5 echo proves the high-slot write landed (allow-through).
+     *   slot 0 = this, slots 1..8 = a1..a8.
+     */
+    public int instanceManyLocals(final int a1, final int a2, final int a3,
+                                  final int a4, final int a5, final int a6,
+                                  final int a7, final int a8)
+    {
+        many5Seen   = a5;   // may be the injected value if the native hook wrote it
+        many8Seen   = a8;
+        manySumSeen = a1 ^ a2 ^ a3 ^ a4 ^ a6 ^ a7 ^ a8; // excludes a5 (mutated)
+        return a8;
+    }
+
+    /**
+     * Static method, NO this, THREE consecutive two-slot args then a tail int:
+     * long@slots0..1(value@0), double@slots2..3(value@2), long@slots4..5
+     * (value@4), int@slot6.  The slot accumulator must add +2 each time starting
+     * from slot 0 — the static multi-wide counterpart instanceWide lacks.
+     */
+    public static long staticManyWide(final long l0, final double d,
+                                      final long l1, final int tail)
+    {
+        smwL0Seen    = l0;
+        smwDBitsSeen = Double.doubleToRawLongBits(d);
+        smwL1Seen    = l1;
+        smwTSeen     = tail;
+        return l0 + (long) d + l1 + tail;
+    }
+
+    /**
+     * Instance method interleaving wide/narrow in a DIFFERENT order than
+     * instanceWide: long, int, double, int.  this@0, l@slots1..2(value@1), i@3,
+     * d@slots4..5(value@4), tail@6.  Catches a slot accumulator that only
+     * happens to work for the int,long,double,int ordering.
+     */
+    public long instanceWideThenNarrow(final long l, final int i,
+                                       final double d, final int tail)
+    {
+        wtnLSeen     = l;
+        wtnISeen     = i;
+        wtnDBitsSeen = Double.doubleToRawLongBits(d);
+        wtnTailSeen  = tail;
+        return l + i + (long) d + tail;
+    }
+
+    /**
+     * Narrow set_arg ZERO injection target: this@0, value@slot1.  The native
+     * hook writes 0 into slot 1 (the all-zero-slot write path) and the body
+     * echoes what it finally observed, proving a zero write neither corrupts an
+     * adjacent slot nor is silently dropped.
+     */
+    public int zeroRoundTrip(final int value)
+    {
+        zeroRtSeen = value;
+        return value;
+    }
+
     private void runAll()
     {
         // Each call is one real bytecode dispatch -> the matching interpreter
@@ -254,6 +372,11 @@ public final class ReturnFrameRaw
         this.instanceEdgeWide(EDGE_LMIN, EDGE_DNAN);
         staticLeadingLong(SLF_L0, SLF_TAIL);
         this.wideRoundTrip(11L);
+        this.instanceManyLocals(MANY_1, MANY_2, MANY_3, MANY_4,
+                                MANY_5, MANY_6, MANY_7, MANY_8);
+        staticManyWide(SMW_L0, SMW_D, SMW_L1, SMW_T);
+        this.instanceWideThenNarrow(WTN_L, WTN_I, WTN_D, WTN_TAIL);
+        this.zeroRoundTrip(ZERO_RT_INPUT);
         probeTicks++;
     }
 

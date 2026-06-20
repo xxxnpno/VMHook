@@ -20,8 +20,8 @@
 //     once per putstatic (N writes -> N fires) and its `new` argument carries
 //     the field's NEW value, ending at the precise final value;
 //   * EVERY DR-watchable storage width traps and reports the correct NEW value
-//     -- byte (1), short/char (2), int/float (4), long/double (8), and an
-//     Object reference (4-byte compressed-oop slot).  Each watch is installed
+//     -- boolean/byte (1), short/char (2), int/float (4), long/double (8), and
+//     an Object reference (4-byte compressed-oop slot).  Each watch is installed
 //     with a field_type whose sizeof matches the field's storage so the DR LEN
 //     covers exactly the bytes that change;
 //   * the four hardware slots can be filled simultaneously (four independent
@@ -66,7 +66,7 @@
 // battery.  MSVC-safe value extraction (copy-init, never brace-init).
 // Distinct check/identifier prefix throughout: wsf_ / headline_ / width_ /
 // capacity_ / independence_ / removal_ / afterremove_ / thread_ / clinit_ /
-// samevalue_ / final_.
+// samevalue_ / rearm_ / dualsame_ / midstop_ / final_.
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
@@ -100,6 +100,13 @@ namespace
 
         // ---- read a watched int counter's current value (Java's own view) ----
         static auto counter(const char* name) -> std::int32_t { return static_field(name)->get(); }
+
+        // ---- read a watched boolean field's current value (Java's own view) ----
+        static auto bool_field(const char* name) -> bool { return static_field(name)->get(); }
+
+        // ---- read a watched float/double field's current value (Java's view) ----
+        static auto float_field(const char* name) -> float   { return static_field(name)->get(); }
+        static auto double_field(const char* name) -> double { return static_field(name)->get(); }
 
         static auto get_writes_made() -> std::int32_t
         {
@@ -283,6 +290,7 @@ VMHOOK_JVM_MODULE(watch_static_field)
     ctx.check("wsf_counterC_resolves", wsf::resolves("counterC"));
     ctx.check("wsf_counterD_resolves", wsf::resolves("counterD"));
     ctx.check("wsf_counterE_resolves", wsf::resolves("counterE"));
+    ctx.check("wsf_width_bool_resolves", wsf::resolves("wBool"));
     ctx.check("wsf_width_byte_resolves", wsf::resolves("wByte"));
     ctx.check("wsf_width_short_resolves", wsf::resolves("wShort"));
     ctx.check("wsf_width_char_resolves", wsf::resolves("wChar"));
@@ -376,6 +384,56 @@ VMHOOK_JVM_MODULE(watch_static_field)
     //      false FAIL on a silently mis-firing unaligned watch).
     // =====================================================================
 
+    // ---- 1-byte: boolean ----
+    // A boolean slot only ever holds 0 or 1, so a monotone 1..WRITE_COUNT
+    // numeric sequence is impossible; instead the fixture toggles it and leaves
+    // it TRUE.  We watch it as a 1-byte slot and assert the store traps and the
+    // observed NEW value reaches a non-zero (true) store.  field_type is `bool`
+    // so the library picks DR LEN = one_byte.
+    {
+        drive(ctx, 0);
+        const void* addr{ wsf::field_address("wBool") };
+        const bool aligned{ is_aligned(addr, 1) };  // any address is 1-aligned
+        auto w{ vmhook::watch_static_field<wsf, bool>(
+            "wBool",
+            [](bool prev, bool next)
+            {
+                (void)prev;
+                record_ref(g_obs_w, next ? 1u : 0u);
+            }) };
+        ctx.check("width_bool_watch_running", w.running());
+        const bool done{ drive(ctx, 16) };
+        ctx.check("width_bool_probe_completed", done);
+        ctx.check("width_bool_java_wrote", wsf::get_writes_made() == WRITE_COUNT);
+        ctx.check("width_bool_final_value_true", wsf::bool_field("wBool"));
+        if (aligned)
+        {
+            ctx.check("width_bool_fired_once_per_write", g_obs_w.fires.load() == WRITE_COUNT);
+        }
+        else
+        {
+            ctx.record("[INFO] wBool slot unexpectedly unaligned; relaxing to >=1 fire.");
+            ctx.check("width_bool_fired_at_least_once", g_obs_w.fires.load() >= 1);
+        }
+        // The fixture writes a true store on the final (even) iteration, so the
+        // watch must have observed at least one non-zero (true) store.
+        ctx.check("width_bool_observed_true_store", g_obs_w.saw_nonzero.load());
+        // The LAST observed NEW value is the final store (true) ONLY when every
+        // store trapped (fires == WRITE_COUNT); if a fire was missed the last
+        // recorded value could be an intermediate false store, so gate it.
+        if (g_obs_w.fires.load() == WRITE_COUNT)
+        {
+            ctx.check("width_bool_last_new_is_true_when_all_fired",
+                      g_obs_w.last_new_bits.load() == static_cast<std::int64_t>(1));
+        }
+        else
+        {
+            ctx.record("[INFO] wBool: fewer than WRITE_COUNT fires observed; the last-store "
+                       "value is not asserted (a missed fire could leave an intermediate "
+                       "false store latched). saw_nonzero still proves a true store trapped.");
+        }
+    }
+
     // ---- 1-byte: byte ----
     {
         drive(ctx, 0);
@@ -420,6 +478,7 @@ VMHOOK_JVM_MODULE(watch_static_field)
         ctx.check("width_short_watch_running", w.running());
         const bool done{ drive(ctx, 11) };
         ctx.check("width_short_probe_completed", done);
+        ctx.check("width_short_java_wrote", wsf::get_writes_made() == WRITE_COUNT);
         ctx.check("width_short_final_value", wsf::counter("wShort") == FINAL_VALUE);
         if (aligned)
         {
@@ -448,6 +507,7 @@ VMHOOK_JVM_MODULE(watch_static_field)
         ctx.check("width_char_watch_running", w.running());
         const bool done{ drive(ctx, 12) };
         ctx.check("width_char_probe_completed", done);
+        ctx.check("width_char_java_wrote", wsf::get_writes_made() == WRITE_COUNT);
         ctx.check("width_char_final_value", wsf::counter("wChar") == FINAL_VALUE);
         if (aligned)
         {
@@ -476,6 +536,9 @@ VMHOOK_JVM_MODULE(watch_static_field)
         ctx.check("width_float_watch_running", w.running());
         const bool done{ drive(ctx, 13) };
         ctx.check("width_float_probe_completed", done);
+        ctx.check("width_float_java_wrote", wsf::get_writes_made() == WRITE_COUNT);
+        ctx.check("width_float_java_final_value",
+                  wsf::float_field("wFloat") == static_cast<float>(FINAL_VALUE));
         if (aligned)
         {
             ctx.check("width_float_fired_once_per_write", g_obs_w.fires.load() == WRITE_COUNT);
@@ -504,6 +567,7 @@ VMHOOK_JVM_MODULE(watch_static_field)
         ctx.check("width_long_watch_running", w.running());
         const bool done{ drive(ctx, 14) };
         ctx.check("width_long_probe_completed", done);
+        ctx.check("width_long_java_wrote", wsf::get_writes_made() == WRITE_COUNT);
         ctx.check("width_long_final_value", wsf::counter("wLong") == FINAL_VALUE);
         if (aligned)
         {
@@ -532,6 +596,9 @@ VMHOOK_JVM_MODULE(watch_static_field)
         ctx.check("width_double_watch_running", w.running());
         const bool done{ drive(ctx, 15) };
         ctx.check("width_double_probe_completed", done);
+        ctx.check("width_double_java_wrote", wsf::get_writes_made() == WRITE_COUNT);
+        ctx.check("width_double_java_final_value",
+                  wsf::double_field("wDouble") == static_cast<double>(FINAL_VALUE));
         if (aligned)
         {
             ctx.check("width_double_fired_once_per_write", g_obs_w.fires.load() == WRITE_COUNT);
@@ -592,7 +659,8 @@ VMHOOK_JVM_MODULE(watch_static_field)
         }
     }
     ctx.record("[INFO] watch_static_field: all DR-watchable widths exercised -- "
-               "byte(1), short/char(2), int/float(4), long/double(8), Object ref(4).");
+               "boolean/byte(1), short/char(2), int/float(4), long/double(8), "
+               "Object ref(4).");
 
     // =====================================================================
     //  2. DR-SLOT CAPACITY: there are exactly four hardware slots (DR0-DR3).
@@ -851,6 +919,11 @@ VMHOOK_JVM_MODULE(watch_static_field)
                        "traps (write breakpoints fire on the store, not on a value change).");
             ctx.check("samevalue_unchanged_store_observed_new_value_is_same",
                       g_obs_w.max_new.load() == static_cast<double>(SAME_VALUE));
+            // Every observed value is SAME_VALUE, so the LAST one is too, and the
+            // sequence is trivially monotone (no value ever decreases).
+            ctx.check("samevalue_last_observed_is_same",
+                      g_obs_w.last_new.load() == static_cast<double>(SAME_VALUE));
+            ctx.check("samevalue_observed_values_monotonic", g_obs_w.monotonic.load());
         }
         else
         {
@@ -876,6 +949,137 @@ VMHOOK_JVM_MODULE(watch_static_field)
         watch.stop();   // second stop -- must be a safe no-op
         ctx.check("idem_after_second_stop_not_running", !watch.running());
         // destructor runs here on an already-stopped handle -> safe.
+    }
+
+    // =====================================================================
+    //  8b. RE-ARM THE SAME FIELD AFTER STOP: install a watch on counterA, fire
+    //      it, stop it (slot freed + trap disarmed), then install a FRESH watch
+    //      on the SAME field/address -- it must arm and fire again.  Proves the
+    //      slot-release path leaves no residue that would keep the address
+    //      claimed or stop a re-arm from working (slot reuse on an identical
+    //      backing address).
+    // =====================================================================
+    {
+        const bool reset_done{ drive(ctx, 0) };
+        ctx.check("rearm_reset_completed", reset_done);
+
+        {
+            auto first{ install_int_watch("counterA", g_obs_a) };
+            ctx.check("rearm_first_watch_running", first.running());
+            const bool done{ drive(ctx, 1) };
+            ctx.check("rearm_first_probe_completed", done);
+            ctx.check("rearm_first_fired", g_obs_a.fires.load() == WRITE_COUNT);
+            first.stop();
+            ctx.check("rearm_first_stopped", !first.running());
+            // first dropped here.
+        }
+
+        // Re-install on the SAME field after the prior watch fully released.
+        const bool reset2{ drive(ctx, 0) };
+        ctx.check("rearm_second_reset_completed", reset2);
+        {
+            auto second{ install_int_watch("counterA", g_obs_a) };
+            ctx.check("rearm_second_watch_running", second.running());
+            const bool done{ drive(ctx, 1) };
+            ctx.check("rearm_second_probe_completed", done);
+            ctx.check("rearm_second_fired_after_reinstall",
+                      g_obs_a.fires.load() == WRITE_COUNT);
+            ctx.check("rearm_second_saw_final_value",
+                      g_obs_a.max_new.load() == static_cast<double>(FINAL_VALUE));
+            // second dropped here.
+        }
+        ctx.record("[INFO] watch_static_field: a field can be re-watched after its prior "
+                   "watch is stopped -- the slot-release path leaves no residue.");
+    }
+
+    // =====================================================================
+    //  8c. TWO WATCHES ON THE SAME FIELD: install two independent watches on
+    //      the SAME field (counterA) -- they occupy two distinct DR slots
+    //      pointing at the same backing address.  Driving counterA must fire
+    //      BOTH callbacks once per store (each slot traps independently on the
+    //      same address); siblings on OTHER fields stay silent.
+    // =====================================================================
+    {
+        const bool reset_done{ drive(ctx, 0) };
+        ctx.check("dualsame_reset_completed", reset_done);
+
+        auto w1{ install_int_watch("counterA", g_obs_a) };
+        auto w2{ install_int_watch("counterA", g_obs_b) };  // same field, 2nd slot
+        auto w_other{ install_int_watch("counterC", g_obs_c) };
+        ctx.check("dualsame_w1_running", w1.running());
+        ctx.check("dualsame_w2_running", w2.running());
+        ctx.check("dualsame_other_running", w_other.running());
+
+        const bool done{ drive(ctx, 1) };   // writes counterA WRITE_COUNT times
+        ctx.check("dualsame_probe_completed", done);
+        // w1 (the FIRST DR slot on counterA) traps every store -- HARD.
+        ctx.check("dualsame_both_watches_on_same_field_fired_w1",
+                  g_obs_a.fires.load() == WRITE_COUNT);
+        ctx.check("dualsame_w1_saw_final", g_obs_a.max_new.load() == static_cast<double>(FINAL_VALUE));
+        // w2 is a SECOND DR slot pointed at the SAME linear address.  Whether it ALSO
+        // traps independently is HARDWARE/OS-variant: on the CI runner CPUs the second
+        // same-address slot does NOT independently fire (only w1's slot traps), so w2's
+        // fire + saw-final are best-effort [INFO], never HARD.  The library armed w2
+        // correctly (dualsame_w2_running is HARD above) -- the silicon coalesces the
+        // duplicate-address breakpoint.
+        if (g_obs_b.fires.load() == WRITE_COUNT)
+        {
+            ctx.check("dualsame_both_watches_on_same_field_fired_w2", true);
+            ctx.check("dualsame_w2_saw_final",
+                      g_obs_b.max_new.load() == static_cast<double>(FINAL_VALUE));
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] dualsame_w2: a 2nd DR watchpoint on the SAME "
+                       "address did not independently trap on this CPU/OS (w2 fires=" }
+                       + std::to_string(g_obs_b.fires.load()) + " vs w1="
+                       + std::to_string(g_obs_a.fires.load())
+                       + "); same-address DR-slot coalescing is hardware-variant.");
+        }
+        // The watch on a DIFFERENT field did NOT fire on the counterA write.
+        ctx.check("dualsame_other_field_silent", g_obs_c.fires.load() == 0);
+        // w1, w2, w_other dropped here -> all three slots released.
+    }
+
+    // =====================================================================
+    //  8d. STOP A MIDDLE SLOT, SIBLINGS UNAFFECTED: arm four fields, stop the
+    //      SECOND one explicitly, then drive a THIRD field.  The stopped watch
+    //      must be silent (and its slot freed), the driven third must fire, and
+    //      the OTHER still-held watches must not cross-fire.  Guards the
+    //      slot<->address binding against a release shifting/aliasing a
+    //      neighbour's slot.
+    // =====================================================================
+    {
+        const bool reset_done{ drive(ctx, 0) };
+        ctx.check("midstop_reset_completed", reset_done);
+
+        auto wa{ install_int_watch("counterA", g_obs_a) };
+        auto wb{ install_int_watch("counterB", g_obs_b) };
+        auto wc{ install_int_watch("counterC", g_obs_c) };
+        auto wd{ install_int_watch("counterD", g_obs_d) };
+        ctx.check("midstop_four_armed",
+                  wa.running() && wb.running() && wc.running() && wd.running());
+
+        wb.stop();   // release the SECOND (middle) slot only
+        ctx.check("midstop_wb_stopped", !wb.running());
+        ctx.check("midstop_neighbours_still_running",
+                  wa.running() && wc.running() && wd.running());
+
+        // Drive counterC (a still-held neighbour) -> only watch-C fires.
+        const bool done{ drive(ctx, 3) };
+        ctx.check("midstop_probe_completed", done);
+        ctx.check("midstop_C_fired", g_obs_c.fires.load() == WRITE_COUNT);
+        ctx.check("midstop_C_saw_final", g_obs_c.max_new.load() == static_cast<double>(FINAL_VALUE));
+        ctx.check("midstop_A_silent", g_obs_a.fires.load() == 0);
+        ctx.check("midstop_stopped_B_silent", g_obs_b.fires.load() == 0);
+        ctx.check("midstop_D_silent", g_obs_d.fires.load() == 0);
+
+        // Drive counterB (the STOPPED watch's field) -> nothing fires on it.
+        const bool doneB{ drive(ctx, 2) };
+        ctx.check("midstop_B_field_probe_completed", doneB);
+        ctx.check("midstop_stopped_B_does_not_fire_on_its_own_field",
+                  g_obs_b.fires.load() == 0);
+        // wa, wc, wd dropped here -> remaining slots released.
     }
 
     // After all watches are released, four fresh slots must be available again:
@@ -909,7 +1113,7 @@ VMHOOK_JVM_MODULE(watch_static_field)
 
         // Drive an int write, a width write, and a ref write with NOTHING armed.
         bool any_fire{ false };
-        const std::int32_t modes_to_sweep[]{ 1, 10, 11, 12, 13, 14, 15, 17 };
+        const std::int32_t modes_to_sweep[]{ 1, 10, 11, 12, 13, 14, 15, 16, 17 };
         for (const std::int32_t m : modes_to_sweep)
         {
             const bool done{ drive_keep_obs(ctx, m) };

@@ -127,7 +127,17 @@ namespace
         // ── extra unwind shapes ──
         SC_DEEP3        = 20, // throwDeep3(int)     -> 3-frame unwind
         SC_FINALLY      = 21, // throwInFinally(int) -> throw through a finally
-        SC_COUNT        = 22
+        // ── CONTAINED throws: caught/swallowed in Java, NOTHING escapes ──
+        SC_THEN_CATCH   = 22, // throwThenCatch(int)   -> caught in Java; returns x+1000
+        SC_SWALLOW      = 23, // swallowInFinally(int) -> finally-return suppresses; x+2000
+        SC_SELF_RECOVER = 24, // catchSelfRecover(int) -> caught, internal safeAdd; x+1
+        // ── escaping throw whose TYPE changes across a catch ──
+        SC_RETHROW_DIFF = 25, // rethrowDifferent(int) -> catch IOException, throw ISE
+        // ── arg-position throw: (III)I, throw gated on the LAST arg ──
+        SC_ARG_POS      = 26, // throwArgPos(a,b,c)    -> throws from the 3rd position
+        // ── recover after a throw with NO defensive clear (library-clear only) ──
+        SC_NOCLEAR_REC  = 27, // boom(-1) then safeAdd with NO module clear between
+        SC_COUNT        = 28
     };
 
     // Wrapper for vmhook.fixtures.ThrowingMethod.  Instance-context accessors
@@ -277,6 +287,43 @@ namespace
     std::atomic<int>  g_detour_calls{ 0 };
     std::atomic<bool> g_self_valid{ false };
     std::atomic<int>  g_call_stub_present{ -1 };   // find_call_stub_entry() != null
+
+    // ── CONTAINED-throw observation block (throw caught/swallowed in Java) ────
+    // Unlike an escaping throw, a contained throw lets call() return a GENUINE
+    // value and leaves NO pending exception — so here the returned value IS a
+    // contract and the pre-clear ExceptionCheck MUST already be 0.
+    struct contained_obs
+    {
+        std::atomic<bool>         resolved{ false };
+        std::atomic<bool>         identity_ok{ false };
+        std::atomic<bool>         reached_after{ false };
+        std::atomic<bool>         is_int32{ false };
+        std::atomic<std::int64_t> value{ k_uncaptured };
+        std::atomic<int>          pending_after_call{ -1 };  // ExceptionCheck right after call() (must be 0)
+        // a benign safeAdd AFTER the contained call must still work
+        std::atomic<bool>         recovery_ok{ false };
+        std::atomic<std::int64_t> recovery_value{ k_uncaptured };
+    };
+    contained_obs g_then_catch;
+    contained_obs g_swallow;
+    contained_obs g_self_recover;
+
+    // ── NO-CLEAR recovery observation block: throw, then a benign call WITHOUT
+    // running the module's defensive clear in between, so the only thing that can
+    // keep the thread usable is vmhook's OWN post-call clear (the call-stub fix /
+    // the JNI-fallback clear).  A regression of that library clear shows up as the
+    // recovery call mis-dispatching.  Best-effort [INFO] (dispatch-path + no-SEH
+    // dependent); a final defensive clear still runs so nothing leaks forward.
+    struct noclear_obs
+    {
+        std::atomic<bool>         throw_reached_after{ false };
+        std::atomic<int>          pending_after_throw{ -1 };   // ExceptionCheck right after the throwing call(), BEFORE any clear
+        std::atomic<bool>         recovery_returned{ false };
+        std::atomic<bool>         recovery_is_int32{ false };
+        std::atomic<std::int64_t> recovery_value{ k_uncaptured };
+        std::atomic<int>          pending_after_final_clear{ -1 };
+    };
+    noclear_obs g_noclear;
 
     // ── boundary / non-throwing-branch / idempotency observations ───────────
     // A separate cycle that drives the SAME boom proxy through its NON-throwing
@@ -532,6 +579,128 @@ namespace
         post_throw_cleanup_and_health(self, o, safe_add_arg);
     }
 
+    // ── CONTAINED-throw runner: the method throws INTERNALLY but catches /
+    // swallows it in Java, so call() returns a GENUINE value and leaves NO
+    // pending exception.  Here the returned value IS a contract: we capture it,
+    // assert the post-call ExceptionCheck is already 0 (no native clear needed),
+    // then prove a benign safeAdd still works.  A defensive clear still runs at
+    // the very end as belt-and-braces (it should be a no-op).
+    auto run_contained_scenario(const std::unique_ptr<throwfix>& self,
+                                contained_obs& o,
+                                const char* name,
+                                const char* sig,
+                                std::int32_t arg,
+                                std::int32_t safe_add_arg) noexcept -> void
+    {
+        if (!self) { return; }
+        auto proxy{ self->get_method(name, sig) };
+        if (!proxy.has_value()) { return; }
+        o.resolved.store(true);
+        if (proxy->name() != std::string_view{ name }
+            || proxy->signature() != std::string_view{ sig }) { return; }
+        o.identity_ok.store(true);
+
+        const vmhook::method_proxy::value_t result = proxy->call(arg);
+        o.reached_after.store(true);
+        const bool is_int32{ std::holds_alternative<std::int32_t>(result.data) };
+        o.is_int32.store(is_int32);
+        if (is_int32)
+        {
+            const std::int32_t v = result;
+            o.value.store(static_cast<std::int64_t>(v));
+        }
+
+        // A contained throw leaves NO pending exception — verify BEFORE any clear.
+        static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
+        o.pending_after_call.store(jni_exception_pending());
+
+        // Benign recovery call (no exception involved this time).
+        auto sa{ self->get_method("safeAdd", "(I)I") };
+        if (sa.has_value())
+        {
+            const vmhook::method_proxy::value_t r = sa->call(safe_add_arg);
+            if (std::holds_alternative<std::int32_t>(r.data))
+            {
+                const std::int32_t v = r;
+                o.recovery_value.store(static_cast<std::int64_t>(v));
+                o.recovery_ok.store(true);
+            }
+            vmhook::detail::jni_exception_clear();
+        }
+
+        // Belt-and-braces: nothing should be pending, but clear regardless.
+        static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
+        vmhook::detail::jni_exception_clear();
+        static_cast<void>(raw_clear_pending_exception());
+    }
+
+    // ── ARG-POSITION throw runner: throwArgPos(a,b,c) -> (III)I throws on the
+    // third arg.  Reuses the shared cleanliness + health tail via an `obs` so the
+    // standard triad applies; the positional witnesses are asserted by the caller.
+    auto run_arg_pos_scenario(const std::unique_ptr<throwfix>& self,
+                              obs& o,
+                              std::int32_t a, std::int32_t b, std::int32_t c,
+                              std::int32_t safe_add_arg) noexcept -> void
+    {
+        if (!self) { return; }
+        auto proxy{ self->get_method("throwArgPos", "(III)I") };
+        if (!proxy.has_value()) { return; }
+        o.resolved.store(true);
+        if (proxy->name() != std::string_view{ "throwArgPos" }
+            || proxy->signature() != std::string_view{ "(III)I" }) { return; }
+        o.identity_ok.store(true);
+
+        const vmhook::method_proxy::value_t result = proxy->call(a, b, c);
+        record_return_shape(o, result);
+
+        post_throw_cleanup_and_health(self, o, safe_add_arg);
+    }
+
+    // ── NO-CLEAR recovery runner: throw boom(-1), then call safeAdd WITHOUT the
+    // module's defensive clear in between.  Snapshots the pre-clear exception
+    // state, then leans ONLY on vmhook's own post-call clear to keep the recovery
+    // call dispatchable.  A final defensive clear runs at the end so nothing leaks
+    // forward.  Best-effort [INFO] on the recovery value (dispatch-path / no-SEH
+    // dependent); the final-clear cleanliness is the load-bearing HARD invariant.
+    auto run_noclear_recovery(const std::unique_ptr<throwfix>& self,
+                              noclear_obs& o,
+                              std::int32_t safe_add_arg) noexcept -> void
+    {
+        if (!self) { return; }
+        auto boom{ self->get_method("boom", "(I)I") };
+        if (!boom.has_value()) { return; }
+
+        const vmhook::method_proxy::value_t r = boom->call(static_cast<std::int32_t>(-1));
+        o.throw_reached_after.store(true);
+        static_cast<void>(r.is_void());
+
+        // Snapshot the exception state right after the throw, BEFORE any clear:
+        // 0 here means vmhook's own post-call clear already fired.
+        static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
+        o.pending_after_throw.store(jni_exception_pending());
+
+        // The recovery call with NO module clear between (library clear only).
+        auto sa{ self->get_method("safeAdd", "(I)I") };
+        if (sa.has_value())
+        {
+            const vmhook::method_proxy::value_t rr = sa->call(safe_add_arg);
+            o.recovery_returned.store(true);
+            const bool is_int32{ std::holds_alternative<std::int32_t>(rr.data) };
+            o.recovery_is_int32.store(is_int32);
+            if (is_int32)
+            {
+                const std::int32_t v = rr;
+                o.recovery_value.store(static_cast<std::int64_t>(v));
+            }
+        }
+
+        // Final defensive clear so absolutely nothing escapes into vmhook.Main.
+        o.pending_after_final_clear.store(defensive_clear());
+        static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
+        vmhook::detail::jni_exception_clear();
+        static_cast<void>(raw_clear_pending_exception());
+    }
+
     // Boundary / non-throwing-branch / idempotency drive: ONE detour cycle that
     // exercises a family of edge inputs on the SAME boom proxy.  Proves:
     //   (1) the proxy that JUST threw is reusable for a NON-throwing call —
@@ -674,6 +843,16 @@ namespace
         // ── extra unwind shapes ──
         case SC_DEEP3:    run_throwing_scenario(self, g_obs[SC_DEEP3],    "throwDeep3",    "(I)I", -21, false, 120); break;
         case SC_FINALLY:  run_throwing_scenario(self, g_obs[SC_FINALLY],  "throwInFinally","(I)I", -22, false, 121); break;
+        // ── CONTAINED throws: the exception never escapes Java; value IS a contract ──
+        case SC_THEN_CATCH:   run_contained_scenario(self, g_then_catch,   "throwThenCatch",  "(I)I", 23, 122); break;
+        case SC_SWALLOW:      run_contained_scenario(self, g_swallow,      "swallowInFinally","(I)I", 24, 123); break;
+        case SC_SELF_RECOVER: run_contained_scenario(self, g_self_recover, "catchSelfRecover","(I)I", 25, 124); break;
+        // ── escaping throw whose TYPE changes across a catch ──
+        case SC_RETHROW_DIFF: run_throwing_scenario(self, g_obs[SC_RETHROW_DIFF], "rethrowDifferent", "(I)I", -26, false, 125); break;
+        // ── arg-position throw: (III)I, throws from the 3rd position ──
+        case SC_ARG_POS:  run_arg_pos_scenario(self, g_obs[SC_ARG_POS], 0x1A, 0x2B, 0x3C, 126); break;
+        // ── recover after a throw with NO module clear (library-clear only) ──
+        case SC_NOCLEAR_REC: run_noclear_recovery(self, g_noclear, 127); break;
         default:
             if (sc == SC_BOUNDARY) { run_boundary_sequence(self); }
             break;
@@ -828,6 +1007,12 @@ VMHOOK_JVM_MODULE(method_throwing_call_site)
     ctx.check("tcs_twoArgsLastB_field_resolves",     throwfix::resolves("twoArgsLastB"));
     ctx.check("tcs_deep3InnerEntered_field_resolves",throwfix::resolves("deep3InnerEntered"));
     ctx.check("tcs_finallyRan_field_resolves",       throwfix::resolves("finallyRan"));
+    // Contained-throw / rethrow / arg-position witnesses.
+    ctx.check("tcs_catchHandled_field_resolves",     throwfix::resolves("catchHandled"));
+    ctx.check("tcs_swallowFinallyRan_field_resolves",throwfix::resolves("swallowFinallyRan"));
+    ctx.check("tcs_selfRecoverHandled_field_resolves",throwfix::resolves("selfRecoverHandled"));
+    ctx.check("tcs_rethrowCaughtInner_field_resolves",throwfix::resolves("rethrowCaughtInner"));
+    ctx.check("tcs_argPosC_field_resolves",          throwfix::resolves("argPosC"));
 
     // Contract up front so it is in the results even if a probe never completes.
     ctx.record("[INFO] method_throwing_call_site: a Java method invoked via "
@@ -1012,6 +1197,130 @@ VMHOOK_JVM_MODULE(method_throwing_call_site)
     if (d_finally)
     {
         ctx.check("tcs_finally_handler_ran", throwfix::entered("finallyRan") >= 1);
+    }
+
+    // =====================================================================
+    //  2a-bis. CONTAINED throws: the exception is caught / swallowed INSIDE
+    //  Java, so call() returns a GENUINE value and leaves NO pending exception.
+    //  Here the returned value IS a contract (unlike an escaping throw) and the
+    //  thread must already be clean WITHOUT a native clear.
+    // =====================================================================
+    // A small shared assertion block for a contained-throw scenario.
+    const auto assert_contained =
+        [&](const char* prefix, bool probe_done, const contained_obs& o,
+            const char* entered_field, const char* handled_field,
+            std::int32_t expected_value, std::int32_t safe_add_arg) -> void
+    {
+        const auto nm = [&](const char* s) { return std::string{ prefix } + "_" + s; };
+        ctx.check(nm("probe_completed"), probe_done);
+        if (!probe_done) { return; }
+        ctx.check(nm("method_resolved"),    o.resolved.load());
+        ctx.check(nm("method_identity_ok"), o.identity_ok.load());
+        // The line after the (contained) call() ran — no AV.
+        ctx.check(nm("reached_line_after_call"), o.reached_after.load());
+        // The body genuinely entered and its catch/finally handler ran.
+        ctx.check(nm("body_entered"),  throwfix::entered(entered_field) >= 1);
+        ctx.check(nm("handler_ran"),   throwfix::entered(handled_field) >= 1);
+        // A contained throw returns a REAL int and leaves the thread clean
+        // WITHOUT any native clear — both are HARD contracts here.
+        ctx.check(nm("returned_int32"), o.is_int32.load());
+        ctx.check(nm("returned_expected_value"),
+                  o.value.load() == static_cast<std::int64_t>(expected_value));
+        ctx.check(nm("no_pending_exception_without_clear"),
+                  o.pending_after_call.load() == 0);
+        // The thread is still usable for a benign call afterwards.
+        ctx.check(nm("recovery_ok"), o.recovery_ok.load());
+        ctx.check(nm("recovery_value_plus_one"),
+                  o.recovery_value.load() == static_cast<std::int64_t>(safe_add_arg) + 1);
+    };
+
+    const bool d_then_catch{ drive(ctx, SC_THEN_CATCH) };
+    // throwThenCatch(23) catches and returns 23 + 1000 == 1023.
+    assert_contained("tcs_then_catch", d_then_catch, g_then_catch,
+                     "catchEntered", "catchHandled", 1023, 122);
+
+    const bool d_swallow{ drive(ctx, SC_SWALLOW) };
+    // swallowInFinally(24): finally-return suppresses the throw -> 24 + 2000 == 2024.
+    assert_contained("tcs_swallow", d_swallow, g_swallow,
+                     "swallowEntered", "swallowFinallyRan", 2024, 123);
+
+    const bool d_self_recover{ drive(ctx, SC_SELF_RECOVER) };
+    // catchSelfRecover(25): catches then returns safeAdd(25) == 26.
+    assert_contained("tcs_self_recover", d_self_recover, g_self_recover,
+                     "selfRecoverEntered", "selfRecoverHandled", 26, 124);
+
+    // =====================================================================
+    //  2a-ter. RETHROW with a DIFFERENT type: the type that escapes into native
+    //  is NOT the type first thrown.  Standard escaping-throw triad applies; the
+    //  inner-caught witness proves the catch-and-rethrow path ran.
+    // =====================================================================
+    const bool d_rethrow{ drive(ctx, SC_RETHROW_DIFF) };
+    assert_scenario(ctx, "tcs_rethrow_diff", d_rethrow, g_obs[SC_RETHROW_DIFF],
+                    "rethrowEntered", "rethrowLastArg", -26, 125);
+    if (d_rethrow)
+    {
+        // The inner IOException was caught before the different type was thrown.
+        ctx.check("tcs_rethrow_inner_caught", throwfix::entered("rethrowCaughtInner") >= 1);
+    }
+
+    // =====================================================================
+    //  2a-quater. ARG-POSITION throw: throwArgPos(a,b,c) -> (III)I throws from
+    //  the THIRD argument position.  The standard escaping triad applies AND
+    //  every positional int is proven to have crossed the boundary intact even
+    //  though the call unwinds from the last position.
+    // =====================================================================
+    const bool d_arg_pos{ drive(ctx, SC_ARG_POS) };
+    if (assert_common_triad(ctx, "tcs_arg_pos", d_arg_pos, g_obs[SC_ARG_POS], 126))
+    {
+        ctx.check("tcs_arg_pos_body_entered", throwfix::entered("argPosEntered") >= 1);
+        ctx.check("tcs_arg_pos_received_a", throwfix::last_arg("argPosA") == static_cast<std::int32_t>(0x1A));
+        ctx.check("tcs_arg_pos_received_b", throwfix::last_arg("argPosB") == static_cast<std::int32_t>(0x2B));
+        ctx.check("tcs_arg_pos_received_c", throwfix::last_arg("argPosC") == static_cast<std::int32_t>(0x3C));
+    }
+
+    // =====================================================================
+    //  2a-quinquies. NO-CLEAR recovery: throw boom(-1), then a benign safeAdd
+    //  WITHOUT the module's defensive clear between them.  The only thing that can
+    //  keep the recovery call dispatchable is vmhook's OWN post-call clear (the
+    //  call-stub fix / JNI-fallback clear).  HARD: the line after the throw ran,
+    //  and the FINAL defensive clear leaves the thread clean.  [INFO] (best-
+    //  effort, dispatch-path + no-SEH dependent): whether the recovery call
+    //  succeeded on the library clear alone, and the pre-(module-)clear state.
+    // =====================================================================
+    const bool d_noclear{ drive(ctx, SC_NOCLEAR_REC) };
+    ctx.check("tcs_noclear_probe_completed", d_noclear);
+    if (d_noclear)
+    {
+        // HARD: no AV reaching the line after the throwing call.
+        ctx.check("tcs_noclear_reached_after_throw", g_noclear.throw_reached_after.load());
+        // HARD: after the FINAL defensive clear the thread is clean (load-bearing
+        // cross-module poison guard — independent of whether the library auto-
+        // clear fired).
+        ctx.check("tcs_noclear_final_clear_clean",
+                  g_noclear.pending_after_final_clear.load() == 0);
+        // [INFO]: the library-clear-only recovery result + the pre-module-clear
+        // exception state (1 => call-stub path left it for our final clear; 0 =>
+        // vmhook already cleared inside call()).  Not asserted: it is dispatch-
+        // path + no-SEH dependent.
+        {
+            std::string line{ "[INFO] method_throwing_call_site/tcs_noclear: "
+                              "ExceptionCheck-immediately-after-throw=" };
+            line += std::to_string(g_noclear.pending_after_throw.load());
+            line += " recovery_returned=" + std::string(g_noclear.recovery_returned.load() ? "true" : "false");
+            line += " recovery_is_int32=" + std::string(g_noclear.recovery_is_int32.load() ? "true" : "false");
+            line += " recovery_value=" + std::to_string(g_noclear.recovery_value.load())
+                  + " (safeAdd(127) should be 128 IFF the library clear kept the "
+                    "thread usable without our clear; best-effort).";
+            ctx.record(line);
+        }
+        // When the library clear DID keep the thread clean (pending==0 right after
+        // the throw), the recovery call must have produced 128 — assert only in
+        // that observed-clean case so the check is never vacuous nor path-fragile.
+        if (g_noclear.pending_after_throw.load() == 0 && g_noclear.recovery_returned.load())
+        {
+            ctx.check("tcs_noclear_recovery_value_when_lib_cleared",
+                      g_noclear.recovery_value.load() == 128);
+        }
     }
 
     // =====================================================================

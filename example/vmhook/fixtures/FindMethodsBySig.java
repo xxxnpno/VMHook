@@ -243,6 +243,92 @@ public final class FindMethodsBySig
         return (a == null) ? new String[0] : a;
     }
 
+    /**
+     * ([[Ljava/lang/String;)[[Ljava/lang/String; -- 2-D REFERENCE array.  Proves
+     * a multi-dimensional reference array nests the '[' run AHEAD of the L...;
+     * element tag (i.e. [[L..; not [L..[;) and is distinct from the 1-D reference
+     * array ([Ljava/lang/String;).. {arrStr} and the 2-D PRIMITIVE ([[I).. {arr2}.
+     */
+    public String[][] arrStr2(final String[][] a)
+    {
+        return (a == null) ? new String[0][] : a;
+    }
+
+    /**
+     * (Ljava/lang/CharSequence;)Ljava/lang/CharSequence; -- an INTERFACE reference
+     * type.  The L...; tag matches the declared static type's internal name, so an
+     * interface-typed param/return is just another reference class name and must
+     * NOT be reachable by the concrete (Ljava/lang/String;).. or (..Object;)..
+     * descriptors even though String IS-A CharSequence at the Java level.
+     */
+    public CharSequence seq(final CharSequence cs)
+    {
+        return cs;
+    }
+
+    /**
+     * (Lvmhook/fixtures/FindMethodsBySig;)Lvmhook/fixtures/FindMethodsBySig; -- the
+     * class's OWN type as both arg and return.  Pins that the L...; tag is the exact
+     * internal (slashed) name of THIS class, a self-referential descriptor no JDK
+     * synthesizes, distinct from every java/lang/* reference descriptor.
+     */
+    public FindMethodsBySig self(final FindMethodsBySig other)
+    {
+        return (other == null) ? this : other;
+    }
+
+    /** ()F -- a no-arg FLOAT return (narrow-vs-wide no-arg return discrimination). */
+    public float retF()
+    {
+        return 1.0f;
+    }
+
+    /** ()D -- a no-arg DOUBLE return (wide no-arg return; distinct from ()F/()J). */
+    public double retD()
+    {
+        return 2.0;
+    }
+
+    /** ()Z -- a no-arg BOOLEAN return (single-byte tag Z, distinct from ()I). */
+    public boolean retZ()
+    {
+        return true;
+    }
+
+    /** ()B / ()C / ()S -- the three remaining narrow no-arg returns, each unique. */
+    public byte retB()
+    {
+        return (byte) 1;
+    }
+
+    public char retC()
+    {
+        return 'a';
+    }
+
+    public short retS()
+    {
+        return (short) 7;
+    }
+
+    /** (F)I -- instance member of the FOUR-WAY (F)I set { q1, q2, q3, q4 }. */
+    public int q1(final float x)
+    {
+        return (int) x;
+    }
+
+    /** (F)I -- instance member of the FOUR-WAY (F)I set. */
+    public int q2(final float x)
+    {
+        return (int) x + 1;
+    }
+
+    /** (F)I -- instance member of the FOUR-WAY (F)I set. */
+    public int q3(final float x)
+    {
+        return (int) x + 2;
+    }
+
     /** (JD)V -- two WIDE args (long+double, four slots) with a VOID return. */
     public void wideVoid(final long a, final double b)
     {
@@ -435,6 +521,16 @@ public final class FindMethodsBySig
     public static int tri3(final double x)
     {
         return (int) x + 2;
+    }
+
+    /**
+     * (F)I -- the STATIC fourth member of the (F)I set { q1, q2, q3, q4 }, pushing
+     * the headline full-match-set guarantee past N=3 to N=4 (three instance + one
+     * static), all co-enumerating on a single descriptor.
+     */
+    public static int q4(final float x)
+    {
+        return (int) x + 3;
     }
 
     // ---- Probe dispatch ---------------------------------------------------

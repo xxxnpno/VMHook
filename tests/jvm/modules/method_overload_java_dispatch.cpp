@@ -87,6 +87,12 @@ namespace
     constexpr std::int64_t H_LONG_ARG    = 7;
     constexpr std::int64_t H_LONG_EXPECT = 7007;    // 7 + 7000
 
+    // Matched widen-only family `w` (w(long)->+60000, w(double)->+70000.0).
+    constexpr std::int64_t W_LONG_ARG      = 13;
+    constexpr std::int64_t W_LONG_EXPECT   = 60013;     // 13 + 60000
+    constexpr double       W_DOUBLE_ARG    = 2.5;
+    constexpr double       W_DOUBLE_EXPECT = 70002.5;   // 2.5 + 70000.0
+
     // `g` family: distinct single-slot primitive descriptors (S/B/C/Z/F/I).
     constexpr std::int16_t  G_SHORT_ARG    = 12;
     constexpr std::int32_t  G_SHORT_EXPECT = 1012;  // 12 + 1000
@@ -133,6 +139,14 @@ namespace
     // Exact JVM descriptor of the `sf` single-String overload.
     constexpr const char* SIG_SF = "(Ljava/lang/String;)Ljava/lang/String;";
 
+    // Exact JVM descriptors of the primitive `h` overloads (matched wide-arg path).
+    constexpr const char* SIG_H_I = "(I)I";
+    constexpr const char* SIG_H_J = "(J)J";
+
+    // Exact JVM descriptors of the widen-only `w` overloads (matched path).
+    constexpr const char* SIG_W_J = "(J)J";
+    constexpr const char* SIG_W_D = "(D)D";
+
     // Sentinel for "this capture slot was never written" — distinct from any real
     // result so a body assertion can tell "detour did not run that call" apart
     // from a genuine 0 / empty value.
@@ -151,6 +165,7 @@ namespace
         static auto set_go(bool v) -> void { static_field("go")->set(v); }
         static auto get_done() -> bool      { return static_field("done")->get(); }
         static auto get_tick_count() -> std::int32_t { return static_field("tickCount")->get(); }
+        static auto last_tick_nonce() -> std::int32_t { return static_field("lastTickNonce")->get(); }
 
         // ── Java-recorded side effects (proof of WHICH overload body ran) ──
         static auto last_int_arg()    -> std::int32_t { return static_field("lastIntArg")->get(); }
@@ -228,6 +243,14 @@ namespace
     std::atomic<int>  g_detour_calls{ 0 };
     std::atomic<bool> g_detour_saw_self{ false };
     std::atomic<bool> g_call_stub_path{ false };
+
+    // The nonce value the detour observed off the hooked tick(int) frame, plus a
+    // sentinel meaning "never written".  The probe drives tick(NONCE) exactly once
+    // so this is a single deterministic observation (NOT a fire count) — proof the
+    // detour read the right ARGUMENT, cross-checkable against Java's lastTickNonce.
+    constexpr std::int32_t k_nonce_unset = static_cast<std::int32_t>(0x7FFFFFFF);
+    constexpr std::int32_t k_tick_nonce  = 11;   // matches the fixture probe's SINGLETON.tick(11)
+    std::atomic<std::int32_t> g_detour_nonce{ k_nonce_unset };
 
     // ── capture helpers: resolve, dispatch, record (all run in the detour) ─────
 
@@ -366,6 +389,136 @@ namespace
             r.is_void   = v.is_void();
             r.is_string = v.is_string();
             r.ival      = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // ── MATCHED wide-arg captures (`h` family) ────────────────────────────────
+    // The companion to the no-match double probe: drive each `h` overload by the
+    // EXACT C++ type that matches its descriptor.  h(int) is a single I slot;
+    // h(long) is a TWO-slot J wide arg — proving the wide-arg packing reaches the
+    // right body and the (widened-to-J) return decodes back.  Templated over the
+    // C++ arg type, name-only and explicit-signature spellings both covered.
+    template<typename arg_t>
+    auto cap_named_h_num(const overload_dispatch& self,
+                         const std::string&       key,
+                         arg_t                    a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("h") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.ival      = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    template<typename arg_t>
+    auto cap_sig_h_num(const overload_dispatch& self,
+                       const std::string&       key,
+                       const char*              sig,
+                       arg_t                    a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("h", sig) };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.ival      = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // ── MATCHED widen-only captures (`w` family) ──────────────────────────────
+    // The companion to the no-match int probe: drive w(long) with a C++ long and
+    // w(double) with a C++ double — the EXACT descriptors (J / D), proving both
+    // two-slot wide kinds dispatch their own body.  w(long) numeric result and
+    // w(double) floating result are both read back.
+    auto cap_named_w_long(const overload_dispatch& self,
+                          const std::string&       key,
+                          std::int64_t             a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("w") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.ival      = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    auto cap_named_w_double(const overload_dispatch& self,
+                            const std::string&       key,
+                            double                   a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("w") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.dval      = static_cast<double>(v);
+        }
+        put(key, r);
+    }
+
+    // ── EXPLICIT-SIGNATURE positional captures (`p` family) ───────────────────
+    // The pinned-descriptor companion to the typed positional calls: the proxy is
+    // built WITH (ILjava/lang/String;) / (Ljava/lang/String;I), so signature() IS
+    // the exact descriptor and the call honours it verbatim.
+    auto cap_sig_p_is(const overload_dispatch& self,
+                      const std::string&       key,
+                      const char*              sig,
+                      std::int32_t             n,
+                      const std::string&       s) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("p", sig) };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(n, s) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.sval      = v.as_string();
+        }
+        put(key, r);
+    }
+
+    auto cap_sig_p_si(const overload_dispatch& self,
+                      const std::string&       key,
+                      const char*              sig,
+                      const std::string&       s,
+                      std::int32_t             n) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("p", sig) };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(s, n) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.sval      = v.as_string();
         }
         put(key, r);
     }
@@ -619,7 +772,20 @@ namespace
         cap_sig_num_ii(s, "sig_dual", SIG_F_II, F_DUAL_A, F_DUAL_B);        // (II)I -> 5
 
         // ============================================================
+        //  MATCHED wide-arg dispatch (`h` family): int->(I)I, long->(J)J.
+        //  Driven BEFORE the no-match probe so the no-match fallback's
+        //  contribution to the `h` counters is a known +1 over the matched
+        //  baseline (4 matched dispatches: 2 per overload, typed + explicit-sig).
+        // ============================================================
+        cap_named_h_num<std::int32_t>(s, "h_int",  H_INT_ARG);              // h(int 4)  -> 44
+        cap_named_h_num<std::int64_t>(s, "h_long", H_LONG_ARG);            // h(long 7) -> 7007
+        cap_sig_h_num<std::int32_t>  (s, "h_int_sig",  SIG_H_I, H_INT_ARG);
+        cap_sig_h_num<std::int64_t>  (s, "h_long_sig", SIG_H_J, H_LONG_ARG);
+
+        // ============================================================
         //  No-match fallback (primitive-only `h`, called with a double).
+        //  Runs AFTER the matched `h` calls; it adds exactly +1 to whichever
+        //  primitive overload HotSpot orders first.
         // ============================================================
         cap_nomatch_h_double(s, "nomatch_h", 9.5);
 
@@ -661,10 +827,28 @@ namespace
         cap_named_p_is(s, "p_is", P_IS_INT, std::string{ P_IS_STR });
         cap_named_p_si(s, "p_si", std::string{ P_SI_STR }, P_SI_INT);
 
+        // (5b) EXPLICIT-SIGNATURE positional dispatch — the pinned descriptor must
+        // dispatch the SAME positional overload as the typed pack order.  Distinct
+        // args (so the explicit-sig echoes do not alias the typed ones) keep the
+        // per-overload hit counts unambiguous (each positional form: typed + sig).
+        cap_sig_p_is(s, "p_is_sig", SIG_P_IS, P_IS_INT, std::string{ P_IS_STR });
+        cap_sig_p_si(s, "p_si_sig", SIG_P_SI, std::string{ P_SI_STR }, P_SI_INT);
+
         // ============================================================
         //  (6) NO-WIDENING fallback (widen-only `w`, called with a C++ int).
+        //  Driven BEFORE the matched `w` calls so the no-match contribution is a
+        //  known +1 over the matched baseline (one matched dispatch per overload).
         // ============================================================
         cap_nomatch_w_int(s, "nomatch_w", 100);
+
+        // ============================================================
+        //  (6b) MATCHED widen-only dispatch (`w` family): long->(J)J, double->(D)D.
+        //  Proves the EXACT-width descriptors dispatch their own body (no widening
+        //  needed when the C++ type already matches) and both two-slot wide kinds
+        //  marshal + decode correctly (J numeric, D floating).
+        // ============================================================
+        cap_named_w_long  (s, "w_long",   W_LONG_ARG);     // w(long 13)  -> 60013
+        cap_named_w_double(s, "w_double", W_DOUBLE_ARG);   // w(double 2.5) -> 70002.5
     }
 }
 
@@ -677,10 +861,16 @@ VMHOOK_JVM_MODULE(method_overload_java_dispatch)
             "tick",
             [](vmhook::return_value&,
                const std::unique_ptr<overload_dispatch>& self,
-               std::int32_t /*nonce*/)
+               std::int32_t nonce)
             {
                 g_detour_calls.fetch_add(1, std::memory_order_relaxed);
                 g_detour_saw_self.store(self != nullptr, std::memory_order_relaxed);
+                // Record the nonce the detour observed off the hooked frame (only
+                // on the FIRST fire, so a JIT-inlined re-fire can't overwrite the
+                // cold-interpreter observation we assert on).
+                std::int32_t expected_unset{ k_nonce_unset };
+                g_detour_nonce.compare_exchange_strong(
+                    expected_unset, nonce, std::memory_order_relaxed);
                 g_call_stub_path.store(
                     vmhook::detail::find_call_stub_entry() != nullptr,
                     std::memory_order_relaxed);
@@ -702,6 +892,25 @@ VMHOOK_JVM_MODULE(method_overload_java_dispatch)
         ctx.record(std::string{ "[INFO] method_overload_java_dispatch dispatch path: " }
                    + (stub_path ? "call_stub fast path (resolve_compatible_method active)"
                                 : "call_jni fallback (resolve_compatible_method active)"));
+
+        // ===================================================================
+        //  DETOUR OBSERVED THE RIGHT ARGUMENT.  The probe drove SINGLETON.tick(11)
+        //  exactly once; the detour read the nonce off the hooked interpreter
+        //  frame (latched on the FIRST fire via compare_exchange, so a later
+        //  JIT-inlined re-fire cannot perturb it).  This is a single deterministic
+        //  ARGUMENT observation — NOT a fire count — so it is HARD-asserted:
+        //    * the detour saw a real (non-sentinel) nonce, AND it equals 11;
+        //    * Java's own tick() recorded the SAME nonce (cross-side agreement),
+        //  proving the hooked call site delivered the right argument both to the
+        //  detour's frame read and to the original Java body.
+        // ===================================================================
+        const std::int32_t observed_nonce{ g_detour_nonce.load(std::memory_order_relaxed) };
+        ctx.check("mojd_detour_nonce_observed", observed_nonce != k_nonce_unset);
+        ctx.check("mojd_detour_nonce_is_eleven", observed_nonce == k_tick_nonce);
+        ctx.check("mojd_java_recorded_same_nonce",
+                  overload_dispatch::last_tick_nonce() == k_tick_nonce);
+        ctx.check("mojd_detour_and_java_nonce_agree",
+                  observed_nonce == overload_dispatch::last_tick_nonce());
 
         // ===================================================================
         //  NAME-ONLY proxy signature() is the FIRST-BY-NAME overload — NOT the
@@ -857,20 +1066,59 @@ VMHOOK_JVM_MODULE(method_overload_java_dispatch)
                       + overload_dispatch::f_dual_hits() == 6);
 
         // ===================================================================
+        //  MATCHED WIDE-ARG DISPATCH — `h` family (h(int)->(I)I, h(long)->(J)J).
+        //
+        //  The companion to the no-match probe: each `h` overload is driven by the
+        //  EXACT C++ type that matches its descriptor.  h(int) packs ONE I slot;
+        //  h(long) packs a TWO-slot J wide arg.  Proving wide-arg marshalling
+        //  reaches the right body AND the (widened-to-J) return decodes back, via
+        //  BOTH the returned value and Java's per-overload echo.
+        // ===================================================================
+        {
+            const dispatch_result ri{ got("h_int") };
+            ctx.check("h_int_resolved", ri.resolved);
+            ctx.check("h_int_not_void", !ri.is_void);
+            ctx.check("h_int_not_string", !ri.is_string);
+            ctx.check("h_int_result_44", ri.ival == H_INT_EXPECT);
+
+            const dispatch_result rj{ got("h_long") };
+            ctx.check("h_long_resolved", rj.resolved);
+            ctx.check("h_long_not_void", !rj.is_void);
+            ctx.check("h_long_not_string", !rj.is_string);
+            ctx.check("h_long_result_7007", rj.ival == H_LONG_EXPECT);
+
+            // Explicit-signature spellings dispatch the SAME bodies with the same
+            // legacy values, and report the pinned descriptor verbatim.
+            const dispatch_result ris{ got("h_int_sig") };
+            ctx.check("h_int_sig_resolved", ris.resolved);
+            ctx.check("h_int_sig_is_I", ris.sig_text == SIG_H_I);
+            ctx.check("h_int_sig_result_44", ris.ival == H_INT_EXPECT);
+
+            const dispatch_result rjs{ got("h_long_sig") };
+            ctx.check("h_long_sig_resolved", rjs.resolved);
+            ctx.check("h_long_sig_is_J", rjs.sig_text == SIG_H_J);
+            ctx.check("h_long_sig_result_7007", rjs.ival == H_LONG_EXPECT);
+
+            // Typed and explicit-signature paths agree per overload.
+            ctx.check("h_int_paths_agree",  ri.ival == ris.ival);
+            ctx.check("h_long_paths_agree", rj.ival == rjs.ival);
+        }
+
+        // ===================================================================
         //  NO-MATCH FALLBACK (primitive-only `h` called with a C++ double).
         //
         //  resolve_compatible_method() walks the hierarchy, finds NO (D) overload,
         //  and returns the FIRST-by-name `h` (NOT monostate — the final
-        //  `return this->method`, vmhook.hpp:13765; no fail-safe refusal exists on
-        //  either call path, see 13128-13131 / 12521-12528).  Both `h` overloads
-        //  are primitive (no reference slot), so this is a SAFE dispatch.
+        //  `return this->method`; no fail-safe refusal exists on either call
+        //  path).  Both `h` overloads are primitive (no reference slot), so this
+        //  is a SAFE dispatch.
         //
         //  Which overload is "first" is HotSpot Symbol-ordering arbitrary across
         //  JDK/compiler builds, so we CHARACTERIZE the ACTUAL behaviour:
         //    * the call resolved + returned a real (non-monostate) value, proving
         //      the documented fall-back-to-first-by-name (NOT a refused no-op);
-        //    * the returned value is one of the two primitive overloads' results
-        //      for the corresponding overload's argument-truncation of the double;
+        //    * the no-match call added EXACTLY ONE dispatch on top of the 4 matched
+        //      `h` dispatches (2 per overload above), landing on first-by-name;
         //  and record the observed first-by-name choice as [INFO].
         // ===================================================================
         {
@@ -881,23 +1129,22 @@ VMHOOK_JVM_MODULE(method_overload_java_dispatch)
             ctx.check("nomatch_h_not_void_falls_back_to_first_by_name", !r.is_void);
             ctx.check("nomatch_h_not_string_primitive_family", !r.is_string);
 
-            // The fixture's `h` family ran exactly once total across the whole
-            // module (this single no-match probe), and exactly one of the two
-            // primitive overloads fired.
             const std::int32_t h_i{ overload_dispatch::h_int_hits() };
             const std::int32_t h_j{ overload_dispatch::h_long_hits() };
-            ctx.check("nomatch_h_exactly_one_overload_fired", (h_i + h_j) == 1);
+            // Each matched overload fired EXACTLY twice (typed + explicit-sig); the
+            // no-match probe added one more to whichever HotSpot orders first.
+            ctx.check("matched_h_int_hits_two_floor",  h_i >= 2);
+            ctx.check("matched_h_long_hits_two_floor", h_j >= 2);
+            // 4 matched + 1 no-match fallback = 5 total `h` dispatches, exactly.
+            ctx.check("h_total_dispatches_five", (h_i + h_j) == 5);
+            // The no-match added its +1 to exactly ONE overload (not both, not
+            // neither): the over-2 surplus is exactly 1.
+            ctx.check("nomatch_h_added_exactly_one",
+                      ((h_i - 2) + (h_j - 2)) == 1);
 
-            // Characterize WHICH first-by-name overload HotSpot ordered first and
-            // assert the returned value matches THAT overload's body applied to the
-            // double arg (9.5).  h(int): the double is packed bit-for-bit into the
-            // slot, so the int the body sees is implementation-defined — we do NOT
-            // pin h(int)'s numeric result; we DO pin h(long)'s, whose slot also
-            // receives raw bits.  The robust, portable assertions are: a real value
-            // came back (above) and exactly one primitive overload fired (above).
             const std::string which{
-                (h_i == 1) ? "h(int) [(I)I]"
-                           : (h_j == 1) ? "h(long) [(J)J]"
+                (h_i == 3) ? "h(int) [(I)I]"
+                           : (h_j == 3) ? "h(long) [(J)J]"
                                         : "<<none — UNEXPECTED>>" };
             ctx.record(std::string{ "[INFO] no-match h(double 9.5): falls back to first-by-name overload = " }
                        + which
@@ -905,19 +1152,11 @@ VMHOOK_JVM_MODULE(method_overload_java_dispatch)
                        + std::to_string(r.ival)
                        + ", is_void=" + (r.is_void ? "true" : "false")
                        + ".  resolve_compatible_method() returns this->method on no descriptor match "
-                         "(vmhook.hpp:13765) — NOT monostate; no call-path fail-safe refusal exists.");
-            ctx.record(std::string{ "[INFO] no-match observed hits: h(int)=" } + std::to_string(h_i)
+                         "— NOT monostate; no call-path fail-safe refusal exists.");
+            ctx.record(std::string{ "[INFO] h hits (matched x4 + no-match x1): h(int)=" } + std::to_string(h_i)
                        + " h(long)=" + std::to_string(h_j)
                        + "; lastHArg=" + std::to_string(overload_dispatch::last_h_arg())
                        + " lastHResult=" + std::to_string(overload_dispatch::last_h_result()));
-
-            // SUPPRESS-UNUSED for the legacy expectation constants that document
-            // the matched-path results of h (not asserted on the no-match path):
-            // referenced here only so a future matched-arg extension keeps them.
-            static_cast<void>(H_INT_ARG);
-            static_cast<void>(H_INT_EXPECT);
-            static_cast<void>(H_LONG_ARG);
-            static_cast<void>(H_LONG_EXPECT);
         }
 
         // ===================================================================
@@ -1097,11 +1336,37 @@ VMHOOK_JVM_MODULE(method_overload_java_dispatch)
 
             // The two results are DISTINCT — the ordering genuinely mattered.
             ctx.check("p_order_distinct", ris.sval != rsi.sval);
+
+            // EXPLICIT-SIGNATURE positional path: the pinned descriptor IS reported
+            // verbatim and dispatches the SAME positional overload as the typed pack
+            // order, returning the same value.
+            const dispatch_result risS{ got("p_is_sig") };
+            ctx.check("p_is_sig_resolved", risS.resolved);
+            ctx.check("p_is_sig_is_IS", risS.sig_text == SIG_P_IS);
+            ctx.check("p_is_sig_is_string", risS.is_string);
+            ctx.check("p_is_sig_result", risS.sval == P_IS_EXPECT);
+
+            const dispatch_result rsiS{ got("p_si_sig") };
+            ctx.check("p_si_sig_resolved", rsiS.resolved);
+            ctx.check("p_si_sig_is_SI", rsiS.sig_text == SIG_P_SI);
+            ctx.check("p_si_sig_is_string", rsiS.is_string);
+            ctx.check("p_si_sig_result", rsiS.sval == P_SI_EXPECT);
+
+            // Typed and explicit-signature positional paths agree per form, and the
+            // two forms remain distinct even on the pinned path.
+            ctx.check("p_is_paths_agree", ris.sval == risS.sval);
+            ctx.check("p_si_paths_agree", rsi.sval == rsiS.sval);
+            ctx.check("p_sig_order_distinct", risS.sval != rsiS.sval);
         }
-        // Java-side readback: each positional form fired EXACTLY once and no
-        // cross-firing (the int-first call did NOT hit p(String,int) etc.).
-        ctx.check("java_p_is_hits_one", overload_dispatch::p_is_hits() == 1);
-        ctx.check("java_p_si_hits_one", overload_dispatch::p_si_hits() == 1);
+        // Java-side readback: each positional form fired EXACTLY twice (typed +
+        // explicit-sig) and no cross-firing (the int-first calls did NOT hit
+        // p(String,int) etc.).  Total positional dispatches = 4, none leaked.
+        ctx.check("java_p_is_hits_two", overload_dispatch::p_is_hits() == 2);
+        ctx.check("java_p_si_hits_two", overload_dispatch::p_si_hits() == 2);
+        ctx.check("isolation_p_total_four",
+                  overload_dispatch::p_is_hits() + overload_dispatch::p_si_hits() == 4);
+        // The LAST `p` dispatch in run_all was the explicit-sig p(String,int), so
+        // Java's shared lastPResult ends as the SI form's formatted output.
         ctx.check("java_p_last_result_si",
                   overload_dispatch::last_p_result() == P_SI_EXPECT);
 
@@ -1125,18 +1390,17 @@ VMHOOK_JVM_MODULE(method_overload_java_dispatch)
 
             const std::int32_t w_l{ overload_dispatch::w_long_hits() };
             const std::int32_t w_d{ overload_dispatch::w_double_hits() };
-            // EXACTLY one of the two widen-only overloads fired — proving there was
-            // no widening (no I-overload exists to match) AND no double-dispatch.
-            ctx.check("nomatch_w_exactly_one_overload_fired", (w_l + w_d) == 1);
-            // The int (I) NEVER matched a widened (J/D) overload by descriptor —
-            // i.e. resolution did NOT silently widen; if it HAD widened it would
-            // still have fired one overload, so the discriminator is that the
-            // matched-path counter equals the fallback path: we cannot pin the
-            // numeric result (raw-bit reinterpretation per flaw #1), only that the
-            // family ran once total.
+            // Each matched widen-only overload fired EXACTLY once (matched block
+            // below); the no-match int probe added one more to whichever HotSpot
+            // orders first.  So the total is 3 and the no-match surplus over the
+            // matched baseline of 1-each is exactly 1 — proving NO Java widening
+            // (no I overload to match) AND no double-dispatch.
+            ctx.check("w_total_dispatches_three", (w_l + w_d) == 3);
+            ctx.check("nomatch_w_added_exactly_one",
+                      ((w_l - 1) + (w_d - 1)) == 1);
             const std::string which{
-                (w_l == 1) ? "w(long) [(J)J]"
-                           : (w_d == 1) ? "w(double) [(D)D]"
+                (w_l == 2) ? "w(long) [(J)J]"
+                           : (w_d == 2) ? "w(double) [(D)D]"
                                         : "<<none — UNEXPECTED>>" };
             ctx.record(std::string{ "[INFO] no-widening w(int 100): C++ int (I) matched NO widen-only "
                                     "overload (no Java int->long/double widening); fell back to "
@@ -1144,6 +1408,41 @@ VMHOOK_JVM_MODULE(method_overload_java_dispatch)
                        + " (HotSpot _methods Symbol-ordering arbitrary); returned value = "
                        + std::to_string(r.ival)
                        + ", lastWArg=" + std::to_string(overload_dispatch::last_w_arg()) + ".");
+        }
+
+        // ===================================================================
+        //  (6b) MATCHED widen-only dispatch — `w` family (long->(J)J, double->(D)D).
+        //  When the C++ type already matches the descriptor EXACTLY, no widening is
+        //  needed and resolution dispatches the own body.  Proves both TWO-slot
+        //  wide kinds marshal + decode: w(long) numeric (J) and w(double) floating
+        //  (D, via the value_t arithmetic operator -> double).
+        // ===================================================================
+        {
+            const dispatch_result rl{ got("w_long") };
+            ctx.check("w_long_resolved", rl.resolved);
+            ctx.check("w_long_not_void", !rl.is_void);
+            ctx.check("w_long_not_string", !rl.is_string);
+            ctx.check("w_long_result_60013", rl.ival == W_LONG_EXPECT);
+
+            const dispatch_result rd{ got("w_double") };
+            ctx.check("w_double_resolved", rd.resolved);
+            ctx.check("w_double_not_void", !rd.is_void);
+            ctx.check("w_double_not_string", !rd.is_string);
+            // D return decodes to double via the value_t arithmetic operator;
+            // W_DOUBLE_EXPECT (70002.5) is exactly representable, compare with a
+            // tiny epsilon to stay portable across FPU rounding modes.
+            ctx.check("w_double_result_70002_5",
+                      rd.dval > (W_DOUBLE_EXPECT - 0.01)
+                      && rd.dval < (W_DOUBLE_EXPECT + 0.01));
+
+            // Java-side readback: each matched widen-only overload fired at least
+            // once (its matched call) and at most twice (matched + the no-match +1).
+            // Both firing proves neither matched call leaked into the sibling
+            // descriptor; the exact total (3) and surplus (1) are pinned above.
+            const std::int32_t wl{ overload_dispatch::w_long_hits() };
+            const std::int32_t wd{ overload_dispatch::w_double_hits() };
+            ctx.check("java_w_long_matched_fired",  wl >= 1 && wl <= 2);
+            ctx.check("java_w_double_matched_fired", wd >= 1 && wd <= 2);
         }
     }
     // scoped_hook `handle` disarms here — NO hook left armed; shutdown_hooks()

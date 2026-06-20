@@ -88,6 +88,7 @@ namespace
         static auto get_last_over1_result() -> std::int32_t  { return static_field("lastOver1Result")->get(); }
         static auto get_last_over2_result() -> std::int32_t  { return static_field("lastOver2Result")->get(); }
         static auto get_caller_iterations() -> std::int32_t  { return static_field("callerIterations")->get(); }
+        static auto get_last_long_result() -> std::int64_t   { return static_field("lastLongResult")->get(); }
 
         // Reads this instance's own seed (proves `self` is the right object).
         auto seed() const -> std::int32_t { return get_field("seed")->get(); }
@@ -104,8 +105,15 @@ namespace
     constexpr std::int32_t N_REPEAT{ 64 };
     constexpr std::int32_t CALLER_CALLS{ 200000 };
 
+    // The WIDE (long-returning) hookable method.  LONG_BASE is deliberately above
+    // the 32-bit range so a truncated wide return is unmistakable; mirrors
+    // HookAfterJit.LONG_BASE exactly.
+    constexpr std::int64_t LONG_BASE{ 0x1'0000'0000LL + 5000LL };
+
     constexpr std::int32_t HOT_ORIGINAL{ SEED + HOT_DELTA };          // hot(HOT_DELTA) body result
     constexpr std::int32_t STATIC_ORIGINAL{ STATIC_BASE + HOT_DELTA };// hotStatic(HOT_DELTA) body result
+    constexpr std::int64_t LONG_ORIGINAL{ LONG_BASE + HOT_DELTA };    // hotLong(HOT_DELTA) body result
+    constexpr std::int64_t LONG_FORCED{ 0x7ABC'DEF0'1234'5678LL };    // wide value a cancelling detour forces
     constexpr std::int32_t OVER1_ORIGINAL{ HOT_DELTA + OVER1_ADD };   // over(HOT_DELTA)
     constexpr std::int32_t OVER2_ORIGINAL{ HOT_DELTA + HOT_DELTA + OVER2_ADD }; // over(HOT_DELTA,HOT_DELTA)
     constexpr std::int32_t FORCED_RETURN{ 0x5AFE5A };                 // value a cancelling detour forces
@@ -123,6 +131,8 @@ namespace
     constexpr const char* OVER_NAME{ "over" };
     constexpr const char* OVER1_SIG{ "(I)I" };       // over(int)
     constexpr const char* OVER2_SIG{ "(II)I" };      // over(int,int)
+    constexpr const char* LONG_NAME{ "hotLong" };
+    constexpr const char* LONG_SIG{ "(I)J" };        // hotLong(int) -> long
 
     // Budget to wait for HotSpot to publish Method::_code after a warm loop.
     // Compilation is asynchronous, so the nmethod may land shortly AFTER the warm
@@ -256,6 +266,48 @@ namespace
             });
     }
 
+    // WIDE-return observing detour on hotLong(I)J.  The Java return type (long) is
+    // inferred from the descriptor by vmhook; the detour decodes the int arg the
+    // same way as hot(I)I (instance method: self + delta).  Allow-through: the
+    // original wide body runs and Java observes LONG_ORIGINAL.
+    auto install_long_observer() -> bool
+    {
+        return vmhook::hook<haj_fixture>(
+            LONG_NAME, LONG_SIG,
+            [](vmhook::return_value&,
+               const std::unique_ptr<haj_fixture>& self,
+               std::int32_t delta)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                if (self != nullptr && self->seed() == SEED)
+                {
+                    g_self_ok_fires.fetch_add(1, std::memory_order_relaxed);
+                }
+                g_arg_xor.fetch_xor(delta, std::memory_order_relaxed);
+            });
+    }
+
+    // WIDE-return cancelling detour on hotLong(I)J: forces a 64-bit return value
+    // (proves force-return decodes/writes the full wide slot pair after the
+    // install-time deopt, not just a 32-bit int).
+    auto install_long_forcing() -> bool
+    {
+        return vmhook::hook<haj_fixture>(
+            LONG_NAME, LONG_SIG,
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<haj_fixture>& self,
+               std::int32_t delta)
+            {
+                g_fire_count.fetch_add(1, std::memory_order_relaxed);
+                if (self != nullptr && self->seed() == SEED)
+                {
+                    g_self_ok_fires.fetch_add(1, std::memory_order_relaxed);
+                }
+                g_arg_xor.fetch_xor(delta, std::memory_order_relaxed);
+                ret.set<std::int64_t>(LONG_FORCED);
+            });
+    }
+
     // Per-overload fire counters: prove EXACTLY the hooked descriptor fired.
     std::atomic<std::int32_t> g_over1_fires{ 0 };
     std::atomic<std::int32_t> g_over2_fires{ 0 };
@@ -368,6 +420,22 @@ namespace
             return nullptr;
         }
         return m->get_from_interpreted_entry();
+    }
+
+    // Reads Method::_from_compiled_entry through a validated pointer.  On the
+    // c2i-RECOVERABLE after-JIT install branch vmhook redirects this to the c2i
+    // adapter (vmhook.hpp:10367); get_from_compiled_entry() is itself fault-safe
+    // (reads through os::safe_read), so a cold/relocated slot yields nullptr
+    // rather than an AV.  nullptr therefore means "unreadable" here, NOT a
+    // semantic value, and callers must treat it as "cannot assert" rather than
+    // "redirect failed".
+    auto method_from_compiled(vmhook::hotspot::method* const m) -> void*
+    {
+        if (!m || !vmhook::hotspot::is_valid_pointer(m))
+        {
+            return nullptr;
+        }
+        return m->get_from_compiled_entry();
     }
 
     // True iff the method currently carries the NO_COMPILE inhibitor vmhook sets
@@ -551,6 +619,25 @@ VMHOOK_JVM_MODULE(hook_install_after_jit)
             }
             ctx.check("headline_install_armed_no_compile", no_compile_set(m));
 
+            // Method-scoped, not class-scoped: installing on hot(I)I must NOT arm
+            // the NO_COMPILE inhibitor on an UNRELATED sibling method declared in
+            // the very same class (hotStatic(I)I).  Proves the deopt touches only
+            // the targeted Method*, not every method of the klass.  Skipped as
+            // [INFO] only if the sibling can't be located.
+            {
+                vmhook::hotspot::method* const sibling{ find_method(STATIC_NAME, STATIC_SIG) };
+                if (sibling != nullptr && sibling != m)
+                {
+                    ctx.check("headline_sibling_method_not_no_compile_after_install",
+                              !no_compile_set(sibling));
+                }
+                else
+                {
+                    ctx.record("[INFO] hook_install_after_jit scenario 1: sibling hotStatic(I)I "
+                               "not locatable - method-scope isolation recorded as [INFO].");
+                }
+            }
+
             // Freshly installed on a JIT'd method -> no drift -> 0 repairs (settle:
             // an async recompile can transiently re-populate _code on this
             // just-compiled method; verify_hooks() repairs+re-arms and converges).
@@ -570,6 +657,11 @@ VMHOOK_JVM_MODULE(hook_install_after_jit)
             // Allow-through: the original (formerly-compiled) body ran unmodified.
             ctx.check("headline_allow_through_original_result",
                       haj_fixture::get_last_hot_result() == HOT_ORIGINAL);
+
+            // The JIT inhibitor survives the firing dispatch: an interpreter
+            // dispatch through the patched i2i must NOT clear NO_COMPILE, or
+            // HotSpot would be free to re-JIT and bypass the hook next time.
+            ctx.check("headline_no_compile_persists_after_fire", no_compile_set(m));
 
             // Still intact after firing (settle past any async recompile the firing
             // dispatch may have triggered on this formerly-compiled method).
@@ -836,9 +928,18 @@ VMHOOK_JVM_MODULE(hook_install_after_jit)
         {
             const bool warm{ warm_until_compiled(ctx, m) };
             void* const i2i_before{ method_i2i(m) };
+            // Snapshot the entry slots BEFORE install.  On a JIT-compiled method
+            // (_code != null) HotSpot has _from_interpreted_entry pointing at the
+            // i2c ADAPTER, NOT the i2i stub (vmhook.hpp:10339-10340) — that is the
+            // precise reason install must redirect it.  So when the method really
+            // was compiled, this before-pointer must differ from i2i; the install
+            // then makes it EQUAL i2i.
+            void* const from_interp_before{ method_from_interpreted(m) };
+            void* const from_compiled_before{ method_from_compiled(m) };
             ctx.check("entryredirect_install_returns_true", install_observer());
 
             void* const from_interp_after{ method_from_interpreted(m) };
+            void* const from_compiled_after{ method_from_compiled(m) };
             void* const i2i_after{ method_i2i(m) };
             ctx.record(std::string{ "[INFO] hook_install_after_jit scenario 6: i2i=" }
                        + (i2i_after == nullptr ? "null" : "set")
@@ -861,6 +962,53 @@ VMHOOK_JVM_MODULE(hook_install_after_jit)
             {
                 ctx.check("entryredirect_from_interpreted_points_at_i2i",
                           from_interp_after == i2i_after);
+
+                // The redirect must have actually CHANGED the slot when it was
+                // pointing somewhere OTHER than i2i pre-install (the compiled
+                // method's i2c adapter).  If the pre-install slot was unreadable
+                // (null) or already happened to equal i2i (degenerate / the JVM
+                // never moved it off i2i), there is nothing to prove the redirect
+                // by, so record [INFO] instead of a vacuous pass.
+                if (from_interp_before != nullptr && from_interp_before != i2i_after)
+                {
+                    ctx.check("entryredirect_install_changed_interp_entry_to_i2i",
+                              from_interp_after != from_interp_before
+                                  && from_interp_after == i2i_after);
+                }
+                else
+                {
+                    ctx.record(std::string{ "[INFO] hook_install_after_jit scenario 6: "
+                               "pre-install _from_interpreted_entry " }
+                               + (from_interp_before == nullptr ? "unreadable"
+                                                                : "already == i2i")
+                               + " - 'redirect changed the slot' recorded as [INFO].");
+                }
+
+                // The compiled entry: on the c2i-RECOVERABLE branch install points
+                // _from_compiled_entry at the c2i adapter, which (by construction in
+                // get_c2i_entry_from_adapter) is NOT the i2i interpreter stub.  The
+                // c2i adapter may be unrecoverable on some JDKs (the documented skip
+                // branch at vmhook.hpp:10387 leaves _from_compiled_entry untouched),
+                // and the slot is read fault-safe (may be null on a cold read), so
+                // this is best-effort: HARD only that, when the slot is readable, the
+                // compiled entry is NOT the i2i stub (compiled callers route via the
+                // c2i adapter, never directly into the interpreter i2i stub).
+                if (from_compiled_after != nullptr && i2i_after != nullptr)
+                {
+                    ctx.check("entryredirect_compiled_entry_not_i2i_stub",
+                              from_compiled_after != i2i_after);
+                    ctx.record(std::string{ "[INFO] hook_install_after_jit scenario 6: "
+                               "_from_compiled_entry " }
+                               + (from_compiled_after == from_compiled_before
+                                      ? "unchanged across install"
+                                      : "redirected across install")
+                               + " (c2i adapter; recoverable-branch effect).");
+                }
+                else
+                {
+                    ctx.record("[INFO] hook_install_after_jit scenario 6: _from_compiled_entry "
+                               "unreadable post-install - c2i-redirect assert recorded as [INFO].");
+                }
             }
             else
             {
@@ -875,6 +1023,27 @@ VMHOOK_JVM_MODULE(hook_install_after_jit)
             ctx.check("entryredirect_detour_fired_once", g_fire_count.load() == 1);
             ctx.check("entryredirect_allow_through",
                       haj_fixture::get_last_hot_result() == HOT_ORIGINAL);
+
+            // NO_COMPILE must STILL be armed after the firing dispatch — the
+            // interpreter dispatch does not clear the JIT inhibitor (the patch
+            // must keep biting on every subsequent dispatch, not just the first).
+            ctx.check("entryredirect_no_compile_persists_after_fire", no_compile_set(m));
+
+            // The interpreted entry is still the i2i stub after firing (the
+            // dispatch did not knock the redirect off its slot).  i2i may read
+            // null on a cold slot -> only assert when both readable.
+            void* const from_interp_postfire{ method_from_interpreted(m) };
+            void* const i2i_postfire{ method_i2i(m) };
+            if (from_interp_postfire != nullptr && i2i_postfire != nullptr)
+            {
+                ctx.check("entryredirect_interp_entry_still_i2i_after_fire",
+                          from_interp_postfire == i2i_postfire);
+            }
+            else
+            {
+                ctx.record("[INFO] hook_install_after_jit scenario 6: post-fire interp/i2i "
+                           "slot unreadable - 'still i2i after fire' recorded as [INFO].");
+            }
 
             vmhook::shutdown_hooks();   // clean up scenario 6
         }
@@ -986,6 +1155,10 @@ VMHOOK_JVM_MODULE(hook_install_after_jit)
             {
                 ctx.check("static_force_install_deopted_code_to_null", method_code(m) == nullptr);
             }
+            // The forcing install arms NO_COMPILE unconditionally (same install
+            // path as the observing variant) and the fresh hook reports no drift.
+            ctx.check("static_force_install_armed_no_compile", no_compile_set(m));
+            ctx.check("static_force_verify_zero_after_install", verify_settles_zero(12));
             const bool done_b{ drive(ctx, 6) };
             ctx.check("static_force_probe_completed", done_b);
             ctx.check("static_force_detour_fired_once", g_fire_count.load() == 1);
@@ -1122,9 +1295,26 @@ VMHOOK_JVM_MODULE(hook_install_after_jit)
                               + " (driver JIT-inlined hot() mid-probe) -- best-effort."); }
             ctx.check("continued_instance_self_ok_every_fire",
                       g_self_ok_fires.load() == fc_i);
+            // Per-fire arg decode is exact even though the fire-COUNT is variant:
+            // every dispatch that fired decoded HOT_DELTA, so the running XOR is
+            // HOT_DELTA folded fc_i times == (fc_i odd ? HOT_DELTA : 0).  A wrong
+            // decode on ANY fire (e.g. reading the wrong interpreter slot) breaks
+            // this regardless of how many fired.  static_cast guards value_t.
+            const std::int32_t expect_arg_xor_i{ (fc_i & 1) != 0 ? HOT_DELTA : 0 };
+            ctx.check("continued_instance_arg_xor_matches_fire_parity",
+                      static_cast<std::int32_t>(g_arg_xor.load()) == expect_arg_xor_i);
             // Allow-through: the last body result is the unmodified original.
             ctx.check("continued_instance_allow_through_last",
                       haj_fixture::get_last_hot_result() == HOT_ORIGINAL);
+            // Allow-through is total: EVERY one of the N_REPEAT calls returned the
+            // unmodified HOT_ORIGINAL, so the Java-side XOR of all N results is a
+            // deterministic 0 (N_REPEAT is even) — independent of how many fired
+            // or whether the driver inlined some.  This pins that NO call had its
+            // return value altered by the observing detour, not merely the last.
+            static_assert(N_REPEAT % 2 == 0,
+                          "hotResultXor==0 invariant needs an even N_REPEAT");
+            ctx.check("continued_instance_result_xor_all_originals_zero",
+                      static_cast<std::int64_t>(haj_fixture::get_hot_result_xor()) == 0);
             vmhook::shutdown_hooks();   // clean up 10a
         }
 
@@ -1146,8 +1336,19 @@ VMHOOK_JVM_MODULE(hook_install_after_jit)
             else { ctx.record("[INFO] continued_static_fired_exactly_n: fired "
                               + std::to_string(fc_s) + "/" + std::to_string(N_REPEAT)
                               + " (driver JIT-inlined hotStatic() mid-probe) -- best-effort."); }
+            // Per-fire arg decode parity on the static slot-0 path: each fire
+            // decoded HOT_DELTA, so the XOR is HOT_DELTA folded fc_s times.
+            const std::int32_t expect_arg_xor_s{ (fc_s & 1) != 0 ? HOT_DELTA : 0 };
+            ctx.check("continued_static_arg_xor_matches_fire_parity",
+                      static_cast<std::int32_t>(g_arg_xor.load()) == expect_arg_xor_s);
             ctx.check("continued_static_allow_through_last",
                       haj_fixture::get_last_static_result() == STATIC_ORIGINAL);
+            // Allow-through totality on the static path: all N_REPEAT calls
+            // returned STATIC_ORIGINAL, so their XOR (runStaticRepeat writes it to
+            // hotResultXor) is a deterministic 0 for even N_REPEAT, regardless of
+            // fire-count / inlining.
+            ctx.check("continued_static_result_xor_all_originals_zero",
+                      static_cast<std::int64_t>(haj_fixture::get_hot_result_xor()) == 0);
             vmhook::shutdown_hooks();   // clean up 10b
         }
     }
@@ -1297,6 +1498,97 @@ VMHOOK_JVM_MODULE(hook_install_after_jit)
             ctx.check("compiledcaller_postremoval_probe_completed", done_c);
             ctx.check("compiledcaller_postremoval_detour_did_not_fire",
                       g_fire_count.load() == 0);
+        }
+    }
+
+    // =====================================================================
+    // Scenario 13 — WIDE (long) RETURN install-after-JIT.  The deopt-on-install
+    //   path is descriptor-agnostic, but the detour decode + force-return must
+    //   handle a return value that spans TWO interpreter slots.  Warm hotLong(I)J
+    //   to _code != null, install an OBSERVING detour and assert allow-through
+    //   yields the full 64-bit LONG_ORIGINAL (no truncation); then re-warm and
+    //   install a CANCELLING detour and assert Java observes the forced 64-bit
+    //   value (proves the wide force-return survives the install-time deopt).
+    // =====================================================================
+    {
+        vmhook::hotspot::method* const m{ find_method(LONG_NAME, LONG_SIG) };
+        ctx.check("widereturn_located_live_method", m != nullptr);
+
+        if (m == nullptr)
+        {
+            ctx.record("[INFO] hook_install_after_jit scenario 13: could not locate live "
+                       "Method* for hotLong(I)J - skipping (no crash).");
+        }
+        else
+        {
+            // -- 13a: observing (allow-through) on the warm wide-return method --
+            const bool warm_a{ warm_until_compiled_mode(ctx, m, 13) };
+            if (warm_a)
+            {
+                ctx.check("widereturn_observe_compiled_before_install", method_code(m) != nullptr);
+            }
+            reset_observations();
+            ctx.check("widereturn_observe_install_returns_true", install_long_observer());
+            if (warm_a)
+            {
+                ctx.check("widereturn_observe_install_deopted_code_to_null", method_code(m) == nullptr);
+            }
+            ctx.check("widereturn_observe_install_armed_no_compile", no_compile_set(m));
+            ctx.check("widereturn_observe_verify_zero_after_install", verify_settles_zero(12));
+
+            const bool done_a{ drive(ctx, 14) };
+            ctx.check("widereturn_observe_probe_completed", done_a);
+            ctx.check("widereturn_observe_java_made_one_call",
+                      haj_fixture::get_hot_calls_made() == 1);
+            ctx.check("widereturn_observe_detour_fired_once", g_fire_count.load() == 1);
+            ctx.check("widereturn_observe_self_correct", g_self_ok_fires.load() == 1);
+            ctx.check("widereturn_observe_arg_decoded", g_arg_xor.load() == HOT_DELTA);
+            // Allow-through: the full 64-bit body result, untruncated.  value_t has
+            // no operator==(int), so compare a copy-init std::int64_t.
+            ctx.check("widereturn_observe_allow_through_full_64bit",
+                      static_cast<std::int64_t>(haj_fixture::get_last_long_result())
+                          == LONG_ORIGINAL);
+            // Sanity: LONG_ORIGINAL really is outside the 32-bit range, so a
+            // truncated decode (low 32 bits only) would NOT equal it.
+            ctx.check("widereturn_original_exceeds_32bit",
+                      LONG_ORIGINAL != static_cast<std::int64_t>(
+                                           static_cast<std::int32_t>(LONG_ORIGINAL)));
+
+            vmhook::shutdown_hooks();   // clean up 13a
+
+            // -- 13b: cancelling (force a 64-bit return) on the warm method -----
+            const bool warm_b{ warm_until_compiled_mode(ctx, m, 13) };
+            reset_observations();
+            ctx.check("widereturn_force_install_returns_true", install_long_forcing());
+            if (warm_b)
+            {
+                ctx.check("widereturn_force_install_deopted_code_to_null", method_code(m) == nullptr);
+            }
+            ctx.check("widereturn_force_install_armed_no_compile", no_compile_set(m));
+
+            const bool done_b{ drive(ctx, 14) };
+            ctx.check("widereturn_force_probe_completed", done_b);
+            ctx.check("widereturn_force_detour_fired_once", g_fire_count.load() == 1);
+            ctx.check("widereturn_force_self_correct", g_self_ok_fires.load() == 1);
+            ctx.check("widereturn_force_arg_decoded", g_arg_xor.load() == HOT_DELTA);
+            // The forced wide value flows back to Java in full, not truncated.
+            ctx.check("widereturn_force_return_overridden_full_64bit",
+                      static_cast<std::int64_t>(haj_fixture::get_last_long_result())
+                          == LONG_FORCED);
+            ctx.check("widereturn_force_return_not_original",
+                      static_cast<std::int64_t>(haj_fixture::get_last_long_result())
+                          != LONG_ORIGINAL);
+
+            vmhook::shutdown_hooks();   // clean up 13b
+
+            // Post-removal: the wide body runs normally again, detour silent.
+            reset_observations();
+            const bool done_c{ drive(ctx, 14) };
+            ctx.check("widereturn_postremoval_probe_completed", done_c);
+            ctx.check("widereturn_postremoval_detour_did_not_fire", g_fire_count.load() == 0);
+            ctx.check("widereturn_postremoval_original_restored",
+                      static_cast<std::int64_t>(haj_fixture::get_last_long_result())
+                          == LONG_ORIGINAL);
         }
     }
 

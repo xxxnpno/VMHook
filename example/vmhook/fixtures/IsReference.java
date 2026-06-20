@@ -173,6 +173,30 @@ public final class IsReference
     public int[][][][][] retInt5DArray() { return new int[1][0][0][0][0]; }
 
     // ======================================================================
+    //  INSTANCE: MORE reference return kinds whose descriptor combines '[' with
+    //  a NESTED reference element ('L...;') or a boxed/interface/user element —
+    //  every one still LEADS with '[' (or 'L'), so is_reference() is TRUE.  These
+    //  exercise the live resolution path over '[' + nested-'L' descriptors the
+    //  earlier sweeps only touched for String[][] and Box[].
+    // ======================================================================
+    // Interface-element array — '[Ljava/lang/CharSequence;'.
+    public CharSequence[] retInterfaceArray() { return new CharSequence[] { "iface" }; }
+    // Boxed-element array — '[Ljava/lang/Integer;'.
+    public Integer[]      retBoxedIntArray()  { return new Integer[] { Integer.valueOf(3) }; }
+    // Boxed-Void element array — '[Ljava/lang/Void;' (reference element + array).
+    public Void[]         retBoxedVoidArray() { return new Void[] { null }; }
+    // 2-D user-type array — '[[Lvmhook/fixtures/IsReference$Box;'.
+    public Box[][]        retBox2DArray()     { return new Box[][] { { BOX } }; }
+    // 3-D String array — '[[[Ljava/lang/String;' (deep '[' + nested 'L').
+    public String[][][]   retString3DArray()  { return new String[][][] { { { "x" } } }; }
+
+    // A reference PARAM with a reference RETURN — '(Ljava/lang/String;)Ljava/lang/Object;'.
+    // The RED-HERRING inverse: here the return IS a reference, so is_reference() is
+    // TRUE; pairing it with takesString (reference param, primitive return) proves
+    // is_reference() reads ONLY the return slot, independent of the param 'L'.
+    public Object refParamRefReturn(final String s) { return s; }
+
+    // ======================================================================
     //  STATIC twins of the array / collection / interface returns, so the
     //  static_method() path sees the SAME '[' / 'L' return descriptors as the
     //  instance path.  Identical descriptors prove is_reference() independent
@@ -190,6 +214,13 @@ public final class IsReference
     public static byte[][][] sRetByte3DArray() { return new byte[][][] { { { 1 } } }; }
     public static java.util.List<String> sRetList()      { return EMPTY_LIST; }
     public static CharSequence            sRetInterface() { return "siface"; }
+    // STATIC twins of the NEW nested-reference array kinds — same '[' + 'L'
+    // descriptors as their instance twins, so is_reference() is TRUE and the
+    // static_method() path is proven over them too.
+    public static CharSequence[] sRetInterfaceArray() { return new CharSequence[] { "siface" }; }
+    public static Integer[]      sRetBoxedIntArray()  { return new Integer[] { Integer.valueOf(-3) }; }
+    public static Box[][]        sRetBox2DArray()     { return new Box[][] { { BOX } }; }
+    public static String[][][]   sRetString3DArray()  { return new String[][][] { { { "s" } } }; }
 
     // ======================================================================
     //  PARAM-LIST RED HERRING: methods whose PARAMETER list contains 'L' / '['

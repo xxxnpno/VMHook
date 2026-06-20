@@ -86,6 +86,7 @@ public final class WatchStaticField
     //  (Object ref uses a sequence of distinct heap objects; its "value" is a
     //  compressed oop, asserted only as non-zero / changing by the module.)
     // =====================================================================
+    public static volatile boolean wBool;    // 1-byte width (boolean storage)
     public static volatile byte   wByte;     // 1-byte width
     public static volatile short  wShort;    // 2-byte width
     public static volatile char   wChar;     // 2-byte width
@@ -177,6 +178,7 @@ public final class WatchStaticField
         counterC = 0;
         counterD = 0;
         counterE = 0;
+        wBool = false;
         wByte = 0;
         wShort = 0;
         wChar = 0;
@@ -210,6 +212,27 @@ public final class WatchStaticField
                 case 4: counterE = counterE + 1; break;
                 default: break;
             }
+            made++;
+            sleep1();
+        }
+        writesMade = made;
+    }
+
+    /**
+     * Writes wBool WRITE_COUNT times (1-byte boolean storage).  A boolean slot
+     * only ever holds 0 or 1, so we toggle true/false each iteration and leave
+     * it TRUE on the last store (WRITE_COUNT is even, so the toggle below ends
+     * on true).  Each putstatic is an independent 1-byte store the DR watch
+     * fires on; the module asserts the final stored value is true (1) and the
+     * watch fired, but does NOT assert a monotone numeric sequence (a boolean
+     * cannot carry one).
+     */
+    private static void writeBoolField()
+    {
+        int made = 0;
+        for (int i = 1; i <= WRITE_COUNT; i++)
+        {
+            wBool = (i % 2 == 0);   // last iteration i==WRITE_COUNT (even) -> true
             made++;
             sleep1();
         }
@@ -448,6 +471,7 @@ public final class WatchStaticField
                     case 13: writeFloatField();          break; // 4-byte
                     case 14: writeLongField();           break; // 8-byte
                     case 15: writeDoubleField();         break; // 8-byte
+                    case 16: writeBoolField();           break; // 1-byte boolean
                     case 17: writeRefField();            break; // object ref (4)
                     case 18: writeSameValue();           break; // same-value
 

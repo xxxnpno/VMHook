@@ -156,6 +156,40 @@ public final class ThrowingMethod
     public static volatile int finallyRan;
     public static volatile int finallyLastArg;
 
+    // == CONTAINED-THROW witnesses (throw caught/swallowed INSIDE Java) ========
+    // These methods throw internally but the exception NEVER crosses back into
+    // native code, so call() returns a REAL value and leaves NO pending
+    // exception.  They prove the dispatcher distinguishes a contained throw from
+    // an escaping one: the native side asserts the returned value is the genuine
+    // Java sentinel (a contract here, unlike the escaping throws) and that the
+    // thread needs no defensive clear.
+    /** throwThenCatch(int): throws then CATCHES in Java; returns sentinel x+1000. */
+    public static volatile int catchEntered;
+    public static volatile int catchHandled;   // the catch block ran
+    public static volatile int catchLastArg;
+    /** swallowInFinally(int): throw SUPPRESSED by a return inside finally. */
+    public static volatile int swallowEntered;
+    public static volatile int swallowFinallyRan;
+    public static volatile int swallowLastArg;
+    /** catchSelfRecover(int): throw, catch, then call safeAdd() internally. */
+    public static volatile int selfRecoverEntered;
+    public static volatile int selfRecoverHandled;
+    public static volatile int selfRecoverLastArg;
+
+    // == RETHROW-DIFFERENT-TYPE witnesses (escaping throw, type changes) =======
+    /** rethrowDifferent(int): catches IOException, rethrows IllegalStateException. */
+    public static volatile int rethrowEntered;
+    public static volatile int rethrowCaughtInner;  // the inner type was caught
+    public static volatile int rethrowLastArg;
+
+    // == ARG-POSITION witnesses (throwArgPos: throw gated on a LATER arg) =======
+    /** throwArgPos(int,int,int): records each positional arg then throws on the
+     *  3rd, so the throw fires from a specific argument position. */
+    public static volatile int argPosEntered;
+    public static volatile int argPosA;
+    public static volatile int argPosB;
+    public static volatile int argPosC;
+
     /** Bumped every time the benign control method safeAdd() runs.  The native
      *  side calls safeAdd AFTER a throw, so a growing value proves the JVM/thread
      *  is still able to dispatch Java bytecode post-exception. */
@@ -482,6 +516,115 @@ public final class ThrowingMethod
         {
             finallyRan++; // committed side effect on the unwind path
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  CONTAINED throws: the exception is caught / swallowed INSIDE Java, so
+    //  call() returns a REAL value and leaves NO pending exception.  The native
+    //  side asserts the returned value here (it IS a contract for a non-escaping
+    //  call) and asserts the thread needs no clear.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** Throws internally, CATCHES it in Java, and returns a sentinel (x + 1000)
+     *  normally.  No exception crosses the native boundary, so call() yields a
+     *  genuine int and the thread stays clean without any native clear. */
+    public int throwThenCatch(final int x)
+    {
+        catchEntered++;
+        catchLastArg = x;
+        try
+        {
+            throw new IllegalStateException("then-catch:" + x);
+        }
+        catch (final IllegalStateException ise)
+        {
+            catchHandled++;
+            return x + 1000;
+        }
+    }
+
+    /** Throws inside a try whose finally RETURNS — the return in finally
+     *  SUPPRESSES the in-flight exception, so the method completes normally with
+     *  the finally's value (x + 2000).  Distinct from throwInFinally, which lets
+     *  the exception propagate. */
+    @SuppressWarnings("finally")
+    public int swallowInFinally(final int x)
+    {
+        swallowEntered++;
+        swallowLastArg = x;
+        try
+        {
+            throw new IllegalStateException("swallow:" + x);
+        }
+        finally
+        {
+            swallowFinallyRan++;
+            return x + 2000; // suppresses the throw above
+        }
+    }
+
+    /** Throws, catches, then performs a real recovery (safeAdd) INSIDE Java and
+     *  returns its result — proves a contained throw followed by further Java
+     *  work on the same frame is fine.  Returns safeAdd(x) == x + 1. */
+    public int catchSelfRecover(final int x)
+    {
+        selfRecoverEntered++;
+        selfRecoverLastArg = x;
+        try
+        {
+            throw new IllegalStateException("self-recover:" + x);
+        }
+        catch (final IllegalStateException ise)
+        {
+            selfRecoverHandled++;
+            return safeAdd(x); // x + 1, also bumps safeAddCalls
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  RETHROW with a DIFFERENT type: catch one Throwable type and throw a
+    //  different one, so the type that finally escapes into native code is NOT
+    //  the one originally thrown.  Escaping throw -> native must clear it.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** Catches a checked IOException and rethrows an unchecked
+     *  IllegalStateException, so the type crossing the boundary differs from the
+     *  type first thrown.  Descriptor stays (I)I. */
+    public int rethrowDifferent(final int x)
+    {
+        rethrowEntered++;
+        rethrowLastArg = x;
+        try
+        {
+            throw new java.io.IOException("inner-checked:" + x);
+        }
+        catch (final java.io.IOException ioe)
+        {
+            rethrowCaughtInner++;
+            throw new IllegalStateException("rethrown-different:" + x);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  ARG-POSITION throw: a multi-int method that records each positional arg
+    //  BEFORE throwing on the LAST one, so the throw fires from a specific
+    //  argument position and every earlier position is proven to have arrived.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** (III)I — records a, b, c in order, then throws.  The throw is gated on the
+     *  third argument so the native side proves all three positional ints crossed
+     *  the boundary intact even though the call unwinds from the last one. */
+    public int throwArgPos(final int a, final int b, final int c)
+    {
+        argPosEntered++;
+        argPosA = a;
+        argPosB = b;
+        argPosC = c;
+        if (c != 0)
+        {
+            throw new IllegalStateException("arg-pos:" + a + "/" + b + "/" + c);
+        }
+        return a + b + c;
     }
 
     // ── benign control method: the JVM-health witness after the throw ───────

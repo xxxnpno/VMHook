@@ -107,6 +107,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -218,6 +219,43 @@ namespace
     // True iff a's detour's set_arg(slot 1, A_ARG_REWRITE) reported success.
     std::atomic<bool> g_a_setarg_ok{ false };
 
+    // --- frame()-identity latches (per method) ------------------------------
+    // return_value::frame() is a HARD accessor (it just returns the captured
+    // interpreter frame pointer -- no frame-walk that could fail), so in a mixed
+    // pass each detour MUST see a non-null frame AND, crucially, a DIFFERENT
+    // frame pointer than its siblings: common_detour handed every detour ITS OWN
+    // intercepted frame, never a stale sibling's.  Captured as raw addresses and
+    // compared on the native side; that distinctness is the teeth behind "each
+    // detour decoded ITS OWN frame" beyond the value checks.
+    std::atomic<const void*> g_a_frame_ptr{ nullptr };
+    std::atomic<const void*> g_b_frame_ptr{ nullptr };
+    std::atomic<const void*> g_c_frame_ptr{ nullptr };
+    std::atomic<const void*> g_d_frame_ptr{ nullptr };
+    std::atomic<const void*> g_e_frame_ptr{ nullptr };
+    std::atomic<bool>        g_a_frame_nonnull{ false };
+    std::atomic<bool>        g_b_frame_nonnull{ false };
+    std::atomic<bool>        g_c_frame_nonnull{ false };
+    std::atomic<bool>        g_d_frame_nonnull{ false };
+    std::atomic<bool>        g_e_frame_nonnull{ false };
+
+    // --- stack_trace()-in-mixed-pass latches (per method) -------------------
+    // Like caller(), stack_trace() is a saved-rbp frame-walk that can legitimately
+    // fail to resolve on some JDK/compiler layouts, so these are [INFO]-only.  In
+    // a shared-stub mixed pass every method is called from the same driver, so
+    // frame[0] of each walk should be that driver (runAll) when the walk resolves.
+    std::atomic<std::int32_t> g_a_trace_depth{ 0 };
+    std::atomic<std::int32_t> g_b_trace_depth{ 0 };
+    std::atomic<std::int32_t> g_e_trace_depth{ 0 };
+    std::atomic<bool>         g_a_trace_top_is_driver{ false };
+    std::atomic<bool>         g_b_trace_top_is_driver{ false };
+    std::atomic<bool>         g_e_trace_top_is_driver{ false };
+
+    // --- d's force-cancel latch (multi-cancel scenario) ---------------------
+    // d(double) returns long; when d's detour cancels, Java sees the zero-filled
+    // retval cell (0L).  Used alongside a's cancel to prove two siblings can each
+    // cancel their OWN firing frame in the same pass without touching each other.
+    std::atomic<bool> g_d_ok_seen{ false };
+
     auto reset_fires() -> void
     {
         g_a_fires.store(0);
@@ -241,6 +279,23 @@ namespace
         g_b_caller_is_driver.store(false);
         g_e_caller_is_driver.store(false);
         g_a_setarg_ok.store(false);
+        g_a_frame_ptr.store(nullptr);
+        g_b_frame_ptr.store(nullptr);
+        g_c_frame_ptr.store(nullptr);
+        g_d_frame_ptr.store(nullptr);
+        g_e_frame_ptr.store(nullptr);
+        g_a_frame_nonnull.store(false);
+        g_b_frame_nonnull.store(false);
+        g_c_frame_nonnull.store(false);
+        g_d_frame_nonnull.store(false);
+        g_e_frame_nonnull.store(false);
+        g_a_trace_depth.store(0);
+        g_b_trace_depth.store(0);
+        g_e_trace_depth.store(0);
+        g_a_trace_top_is_driver.store(false);
+        g_b_trace_top_is_driver.store(false);
+        g_e_trace_top_is_driver.store(false);
+        g_d_ok_seen.store(false);
     }
 
     // Drives exactly one probe cycle for `mode`: resets native fire counters +
@@ -539,6 +594,260 @@ namespace
                 info.valid() && info.class_name == FIXTURE_NAME
                     && info.method_name == "runAll",
                 std::memory_order_relaxed);
+        };
+    }
+
+    // frame()-capturing variants of a / b / c / d / e.  Each does the SAME frame
+    // validation as its base detour AND records return_value::frame() (the raw
+    // intercepted interpreter frame -- a HARD accessor, no walk).  In a mixed
+    // pass these prove common_detour handed each detour ITS OWN non-null frame and
+    // that the per-method frame pointers are DISTINCT (no detour saw a sibling's
+    // stale frame).  The pointer is stored as a raw address for native comparison.
+    auto a_detour_frame()
+    {
+        return [](vmhook::return_value& retval,
+                  const std::unique_ptr<hc_fixture>& self,
+                  std::int32_t x)
+        {
+            g_a_fires.fetch_add(1, std::memory_order_relaxed);
+            g_last_tag.store(TAG_A, std::memory_order_relaxed);
+            if (self != nullptr && self->seed() == SEED && x == A_ARG)
+            {
+                g_a_ok.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_cross_fire.store(true, std::memory_order_relaxed);
+            }
+            const void* const fp{ retval.frame() };
+            g_a_frame_ptr.store(fp, std::memory_order_relaxed);
+            g_a_frame_nonnull.store(fp != nullptr, std::memory_order_relaxed);
+        };
+    }
+
+    auto b_detour_frame()
+    {
+        return [](vmhook::return_value& retval,
+                  const std::unique_ptr<hc_fixture>& self,
+                  std::int64_t y)
+        {
+            g_b_fires.fetch_add(1, std::memory_order_relaxed);
+            g_last_tag.store(TAG_B, std::memory_order_relaxed);
+            if (self != nullptr && self->seed() == SEED && y == B_ARG)
+            {
+                g_b_ok.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_cross_fire.store(true, std::memory_order_relaxed);
+            }
+            const void* const fp{ retval.frame() };
+            g_b_frame_ptr.store(fp, std::memory_order_relaxed);
+            g_b_frame_nonnull.store(fp != nullptr, std::memory_order_relaxed);
+        };
+    }
+
+    auto c_detour_frame()
+    {
+        return [](vmhook::return_value& retval,
+                  const std::unique_ptr<hc_fixture>& self,
+                  const std::string& s)
+        {
+            g_c_fires.fetch_add(1, std::memory_order_relaxed);
+            g_last_tag.store(TAG_C, std::memory_order_relaxed);
+            if (self != nullptr && self->seed() == SEED && s == "vmhook")
+            {
+                g_c_ok.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_cross_fire.store(true, std::memory_order_relaxed);
+            }
+            const void* const fp{ retval.frame() };
+            g_c_frame_ptr.store(fp, std::memory_order_relaxed);
+            g_c_frame_nonnull.store(fp != nullptr, std::memory_order_relaxed);
+        };
+    }
+
+    auto d_detour_frame()
+    {
+        return [](vmhook::return_value& retval,
+                  const std::unique_ptr<hc_fixture>& self,
+                  double z)
+        {
+            g_d_fires.fetch_add(1, std::memory_order_relaxed);
+            g_last_tag.store(TAG_D, std::memory_order_relaxed);
+            if (self != nullptr && self->seed() == SEED && z == D_ARG)
+            {
+                g_d_ok.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_cross_fire.store(true, std::memory_order_relaxed);
+            }
+            const void* const fp{ retval.frame() };
+            g_d_frame_ptr.store(fp, std::memory_order_relaxed);
+            g_d_frame_nonnull.store(fp != nullptr, std::memory_order_relaxed);
+        };
+    }
+
+    auto e_detour_frame()
+    {
+        return [](vmhook::return_value& retval,
+                  const std::unique_ptr<hc_fixture>& self)
+        {
+            g_e_fires.fetch_add(1, std::memory_order_relaxed);
+            g_last_tag.store(TAG_E, std::memory_order_relaxed);
+            if (self != nullptr && self->seed() == SEED)
+            {
+                g_e_ok.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_cross_fire.store(true, std::memory_order_relaxed);
+            }
+            const void* const fp{ retval.frame() };
+            g_e_frame_ptr.store(fp, std::memory_order_relaxed);
+            g_e_frame_nonnull.store(fp != nullptr, std::memory_order_relaxed);
+        };
+    }
+
+    // stack_trace()-capturing variants of a / b / e.  Each records the depth of
+    // the saved-rbp walk and whether frame[0] (the immediate caller) is the shared
+    // driver runAll.  Like caller(), the walk can legitimately not resolve on some
+    // JDK/compiler layouts, so the depth / driver result is [INFO]-only -- the
+    // frame validation that flips the cross-fire sentinel stays the hard guarantee.
+    auto a_detour_trace()
+    {
+        return [](vmhook::return_value& retval,
+                  const std::unique_ptr<hc_fixture>& self,
+                  std::int32_t x)
+        {
+            g_a_fires.fetch_add(1, std::memory_order_relaxed);
+            g_last_tag.store(TAG_A, std::memory_order_relaxed);
+            if (self != nullptr && self->seed() == SEED && x == A_ARG)
+            {
+                g_a_ok.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_cross_fire.store(true, std::memory_order_relaxed);
+            }
+            const std::vector<vmhook::return_value::caller_info> trace{
+                retval.stack_trace() };
+            g_a_trace_depth.store(static_cast<std::int32_t>(trace.size()),
+                                  std::memory_order_relaxed);
+            g_a_trace_top_is_driver.store(
+                !trace.empty() && trace.front().class_name == FIXTURE_NAME
+                    && trace.front().method_name == "runAll",
+                std::memory_order_relaxed);
+        };
+    }
+
+    auto b_detour_trace()
+    {
+        return [](vmhook::return_value& retval,
+                  const std::unique_ptr<hc_fixture>& self,
+                  std::int64_t y)
+        {
+            g_b_fires.fetch_add(1, std::memory_order_relaxed);
+            g_last_tag.store(TAG_B, std::memory_order_relaxed);
+            if (self != nullptr && self->seed() == SEED && y == B_ARG)
+            {
+                g_b_ok.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_cross_fire.store(true, std::memory_order_relaxed);
+            }
+            const std::vector<vmhook::return_value::caller_info> trace{
+                retval.stack_trace() };
+            g_b_trace_depth.store(static_cast<std::int32_t>(trace.size()),
+                                  std::memory_order_relaxed);
+            g_b_trace_top_is_driver.store(
+                !trace.empty() && trace.front().class_name == FIXTURE_NAME
+                    && trace.front().method_name == "runAll",
+                std::memory_order_relaxed);
+        };
+    }
+
+    auto e_detour_trace()
+    {
+        return [](vmhook::return_value& retval,
+                  const std::unique_ptr<hc_fixture>& self)
+        {
+            g_e_fires.fetch_add(1, std::memory_order_relaxed);
+            g_last_tag.store(TAG_E, std::memory_order_relaxed);
+            if (self != nullptr && self->seed() == SEED)
+            {
+                g_e_ok.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_cross_fire.store(true, std::memory_order_relaxed);
+            }
+            const std::vector<vmhook::return_value::caller_info> trace{
+                retval.stack_trace() };
+            g_e_trace_depth.store(static_cast<std::int32_t>(trace.size()),
+                                  std::memory_order_relaxed);
+            g_e_trace_top_is_driver.store(
+                !trace.empty() && trace.front().class_name == FIXTURE_NAME
+                    && trace.front().method_name == "runAll",
+                std::memory_order_relaxed);
+        };
+    }
+
+    // d's detour that FORCE-CANCELS (cancel() with no set): the twin of
+    // a_detour_cancel for the two-slot double frame.  When a AND d both cancel in
+    // the same mixed pass, each suppresses ITS OWN body (Java sees the zero-filled
+    // retval cell) while the un-cancelling siblings run untouched -- two firing
+    // frames cancelled independently through the one shared stub.
+    auto d_detour_cancel()
+    {
+        return [](vmhook::return_value& retval,
+                  const std::unique_ptr<hc_fixture>& self,
+                  double z)
+        {
+            g_d_fires.fetch_add(1, std::memory_order_relaxed);
+            g_last_tag.store(TAG_D, std::memory_order_relaxed);
+            const bool self_ok{ self != nullptr && self->seed() == SEED };
+            const bool arg_ok{ z == D_ARG };
+            if (self_ok && arg_ok)
+            {
+                g_d_ok.store(true, std::memory_order_relaxed);
+                g_d_ok_seen.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_cross_fire.store(true, std::memory_order_relaxed);
+            }
+            retval.cancel();
+        };
+    }
+
+    // c's detour that FORCE-CANCELS (cancel() with no set): validates c's OWN
+    // reference (String) frame, then cancels so c(String)->int returns the
+    // zero-filled cell.  Used in the three-mutation-kinds-in-one-pass scenario so
+    // c's cancel is a per-firing-frame mutation distinct from a's override.
+    auto c_detour_cancel()
+    {
+        return [](vmhook::return_value& retval,
+                  const std::unique_ptr<hc_fixture>& self,
+                  const std::string& s)
+        {
+            g_c_fires.fetch_add(1, std::memory_order_relaxed);
+            g_last_tag.store(TAG_C, std::memory_order_relaxed);
+            const bool self_ok{ self != nullptr && self->seed() == SEED };
+            const bool arg_ok{ s == "vmhook" };
+            if (self_ok && arg_ok)
+            {
+                g_c_ok.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_cross_fire.store(true, std::memory_order_relaxed);
+            }
+            retval.cancel();
         };
     }
 
@@ -1288,6 +1597,334 @@ namespace
                       g_a_caller_is_driver.load() == g_b_caller_is_driver.load()
                       && g_b_caller_is_driver.load() == g_e_caller_is_driver.load());
         }
+    }
+
+    // =====================================================================
+    // 17 — frame() resolves a NON-NULL frame for every detour in ONE shared-stub
+    //      pass.  Hook a,b,c,d,e together with frame()-capturing detours and drive
+    //      mode 1.  frame() is a HARD accessor (it just returns the captured
+    //      interpreter frame -- no saved-rbp walk that could fail), so every detour
+    //      MUST see a non-null frame: common_detour handed each detour ITS OWN
+    //      intercepted frame.  That non-null guarantee, alongside the per-method
+    //      value checks, is the pointer-level complement to "each detour decoded
+    //      ITS OWN frame".
+    //
+    //      Frame-pointer DISTINCTNESS is recorded as [INFO] only: each call in
+    //      runAll() is a separate interpreter activation pushed and popped in
+    //      sequence at the SAME call depth, so HotSpot can legitimately REUSE the
+    //      same stack address for two sequential frames -- distinctness is a
+    //      platform-/depth-dependent observation, never a hard invariant.
+    // =====================================================================
+    {
+        auto h_a{ vmhook::scoped_hook<hc_fixture>("a", "(I)I", a_detour_frame()) };
+        auto h_b{ vmhook::scoped_hook<hc_fixture>("b", "(J)J", b_detour_frame()) };
+        auto h_c{ vmhook::scoped_hook<hc_fixture>("c", "(Ljava/lang/String;)I", c_detour_frame()) };
+        auto h_d{ vmhook::scoped_hook<hc_fixture>("d", "(D)J", d_detour_frame()) };
+        auto h_e{ vmhook::scoped_hook<hc_fixture>("e", "()I", e_detour_frame()) };
+        ctx.check("frame_all_installed",
+                  h_a.installed() && h_b.installed() && h_c.installed()
+                  && h_d.installed() && h_e.installed());
+
+        const bool done{ drive(ctx, 1) };
+        ctx.check("frame_probe_completed", done);
+        ctx.check("frame_all_fired_once",
+                  g_a_fires.load() == 1 && g_b_fires.load() == 1 && g_c_fires.load() == 1
+                  && g_d_fires.load() == 1 && g_e_fires.load() == 1);
+        ctx.check("frame_no_cross_fire", !g_cross_fire.load());
+        // Every detour saw a NON-NULL frame (the hard accessor always resolves).
+        ctx.check("frame_a_nonnull", g_a_frame_nonnull.load());
+        ctx.check("frame_b_nonnull", g_b_frame_nonnull.load());
+        ctx.check("frame_c_nonnull", g_c_frame_nonnull.load());
+        ctx.check("frame_d_nonnull", g_d_frame_nonnull.load());
+        ctx.check("frame_e_nonnull", g_e_frame_nonnull.load());
+
+        // Frame-pointer distinctness: [INFO] only (see header note -- sequential
+        // same-depth interpreter frames can reuse a stack address).  Reported so a
+        // regression that aliased ALL frames onto one pointer is still visible.
+        const void* const fa{ g_a_frame_ptr.load() };
+        const void* const fb{ g_b_frame_ptr.load() };
+        const void* const fc{ g_c_frame_ptr.load() };
+        const void* const fd{ g_d_frame_ptr.load() };
+        const void* const fe{ g_e_frame_ptr.load() };
+        std::int32_t distinct_count{ 0 };
+        const void* const ptrs[5]{ fa, fb, fc, fd, fe };
+        for (std::int32_t i{ 0 }; i < 5; ++i)
+        {
+            bool seen_earlier{ false };
+            for (std::int32_t j{ 0 }; j < i; ++j)
+            {
+                if (ptrs[i] == ptrs[j])
+                {
+                    seen_earlier = true;
+                }
+            }
+            if (!seen_earlier)
+            {
+                ++distinct_count;
+            }
+        }
+        ctx.record(std::string{ "[INFO] hook_chaining frame(): distinct frame "
+                                "pointers across a,b,c,d,e in one mode-1 pass = " }
+                   + std::to_string(distinct_count) + " of 5");
+    }
+
+    // =====================================================================
+    // 18 — stack_trace() through the SHARED stub resolves the SAME driver per
+    //      method.  Hook a,b,e with stack_trace()-capturing detours and drive mode
+    //      1: every method is called from the one driver (runAll), so the TOP of
+    //      each detour's saved-rbp walk should be that driver.  The demux invariants
+    //      (each fired once, zero cross-fire) are HARD; the multi-frame walk depth /
+    //      identity is RECORDED as [INFO] because the saved-rbp walk can legitimately
+    //      not resolve on some JDK/compiler frame layouts.  When all three DO
+    //      resolve, their top-frame identity must agree -- one shared driver.
+    // =====================================================================
+    {
+        auto h_a{ vmhook::scoped_hook<hc_fixture>("a", "(I)I", a_detour_trace()) };
+        auto h_b{ vmhook::scoped_hook<hc_fixture>("b", "(J)J", b_detour_trace()) };
+        auto h_e{ vmhook::scoped_hook<hc_fixture>("e", "()I", e_detour_trace()) };
+        ctx.check("trace_all_installed",
+                  h_a.installed() && h_b.installed() && h_e.installed());
+
+        const bool done{ drive(ctx, 1) };
+        ctx.check("trace_probe_completed", done);
+        // HARD: demux is exact regardless of whether the saved-rbp walk resolved.
+        ctx.check("trace_a_fired_once", g_a_fires.load() == 1);
+        ctx.check("trace_b_fired_once", g_b_fires.load() == 1);
+        ctx.check("trace_e_fired_once", g_e_fires.load() == 1);
+        ctx.check("trace_a_frame_ok", g_a_ok.load());
+        ctx.check("trace_b_frame_ok", g_b_ok.load());
+        ctx.check("trace_e_frame_ok", g_e_ok.load());
+        ctx.check("trace_no_cross_fire", !g_cross_fire.load());
+        // SOFT: each detour's stack_trace() depth + top-frame identity ([INFO]).
+        ctx.record(std::string{ "[INFO] hook_chaining stack_trace(): a depth=" }
+                   + std::to_string(g_a_trace_depth.load())
+                   + " top_is_driver=" + (g_a_trace_top_is_driver.load() ? "1" : "0")
+                   + "; b depth=" + std::to_string(g_b_trace_depth.load())
+                   + " top_is_driver=" + (g_b_trace_top_is_driver.load() ? "1" : "0")
+                   + "; e depth=" + std::to_string(g_e_trace_depth.load())
+                   + " top_is_driver=" + (g_e_trace_top_is_driver.load() ? "1" : "0"));
+        // When all three walks produced at least one frame, their top-frame driver
+        // identity must AGREE across the three shapes (one-slot / two-slot / empty
+        // frame) -- they share the one runAll driver.  Gated on resolution so it is
+        // a universal invariant only when the walk applies.
+        if (g_a_trace_depth.load() > 0 && g_b_trace_depth.load() > 0
+            && g_e_trace_depth.load() > 0)
+        {
+            ctx.check("trace_all_three_top_agree_when_resolved",
+                      g_a_trace_top_is_driver.load() == g_b_trace_top_is_driver.load()
+                      && g_b_trace_top_is_driver.load() == g_e_trace_top_is_driver.load());
+        }
+    }
+
+    // =====================================================================
+    // 19 — REPEATED N-way mixed stream (mode 10): every method called TWICE in one
+    //      dispatch pass.  All six hooked together; the probe issues 12 dispatches
+    //      (a,b,c,d,e,s then a,b,c,d,e,s).  Each detour must fire EXACTLY TWICE for
+    //      ITS method -- per-method counts stay exact under repetition and never
+    //      bleed -- with zero cross-fire across the longer pass.  This stresses
+    //      common_detour's linear scan repeatedly within a single run().
+    // =====================================================================
+    {
+        const std::int32_t a_before{ hc_fixture::get_a_calls() };
+        const std::int32_t b_before{ hc_fixture::get_b_calls() };
+        const std::int32_t c_before{ hc_fixture::get_c_calls() };
+        const std::int32_t d_before{ hc_fixture::get_d_calls() };
+        const std::int32_t e_before{ hc_fixture::get_e_calls() };
+        const std::int32_t s_before{ hc_fixture::get_s_calls() };
+
+        auto h_a{ vmhook::scoped_hook<hc_fixture>("a", "(I)I", a_detour()) };
+        auto h_b{ vmhook::scoped_hook<hc_fixture>("b", "(J)J", b_detour()) };
+        auto h_c{ vmhook::scoped_hook<hc_fixture>("c", "(Ljava/lang/String;)I", c_detour()) };
+        auto h_d{ vmhook::scoped_hook<hc_fixture>("d", "(D)J", d_detour()) };
+        auto h_e{ vmhook::scoped_hook<hc_fixture>("e", "()I", e_detour()) };
+        auto h_s{ vmhook::scoped_hook<hc_fixture>("s", "(I)I", s_detour()) };
+        ctx.check("twice_all_installed",
+                  h_a.installed() && h_b.installed() && h_c.installed()
+                  && h_d.installed() && h_e.installed() && h_s.installed());
+
+        const bool done{ drive(ctx, 10) };
+        ctx.check("twice_probe_completed", done);
+
+        // Java issued exactly two calls to each method this cycle.
+        ctx.check("twice_java_called_a_twice", hc_fixture::get_a_calls() - a_before == 2);
+        ctx.check("twice_java_called_b_twice", hc_fixture::get_b_calls() - b_before == 2);
+        ctx.check("twice_java_called_c_twice", hc_fixture::get_c_calls() - c_before == 2);
+        ctx.check("twice_java_called_d_twice", hc_fixture::get_d_calls() - d_before == 2);
+        ctx.check("twice_java_called_e_twice", hc_fixture::get_e_calls() - e_before == 2);
+        ctx.check("twice_java_called_s_twice", hc_fixture::get_s_calls() - s_before == 2);
+
+        // Each detour fired EXACTLY TWICE -- exactly-once-per-call under repetition.
+        ctx.check("twice_a_fired_twice", g_a_fires.load() == 2);
+        ctx.check("twice_b_fired_twice", g_b_fires.load() == 2);
+        ctx.check("twice_c_fired_twice", g_c_fires.load() == 2);
+        ctx.check("twice_d_fired_twice", g_d_fires.load() == 2);
+        ctx.check("twice_e_fired_twice", g_e_fires.load() == 2);
+        ctx.check("twice_s_fired_twice", g_s_fires.load() == 2);
+        ctx.check("twice_no_cross_fire", !g_cross_fire.load());
+        ctx.check("twice_all_frames_ok",
+                  g_a_ok.load() && g_b_ok.load() && g_c_ok.load()
+                  && g_d_ok.load() && g_e_ok.load() && g_s_ok.load());
+        // Total fires == 12, never more (no detour fired for a method it doesn't own).
+        ctx.check("twice_total_fires_is_twelve",
+                  g_a_fires.load() + g_b_fires.load() + g_c_fires.load()
+                  + g_d_fires.load() + g_e_fires.load() + g_s_fires.load() == 12);
+    }
+
+    // =====================================================================
+    // 20 — TWO siblings cancel independently in ONE pass.  Hook all six; ONLY a's
+    //      and d's detours call cancel() (instance int + instance two-slot double),
+    //      the other four allow through.  Drive mode 1: a's and d's bodies are each
+    //      SUPPRESSED (Java sees the zero-filled retval cell -- a(int)->0, d(double)
+    //      returns long->0L) while b,c,e,s run their ORIGINAL computation.  Two
+    //      firing frames cancelled independently proves cancel() writes the FIRING
+    //      frame's slot, never a global switch that would blank a third sibling.
+    // =====================================================================
+    {
+        auto h_a{ vmhook::scoped_hook<hc_fixture>("a", "(I)I", a_detour_cancel()) };
+        auto h_b{ vmhook::scoped_hook<hc_fixture>("b", "(J)J", b_detour()) };
+        auto h_c{ vmhook::scoped_hook<hc_fixture>("c", "(Ljava/lang/String;)I", c_detour()) };
+        auto h_d{ vmhook::scoped_hook<hc_fixture>("d", "(D)J", d_detour_cancel()) };
+        auto h_e{ vmhook::scoped_hook<hc_fixture>("e", "()I", e_detour()) };
+        auto h_s{ vmhook::scoped_hook<hc_fixture>("s", "(I)I", s_detour()) };
+        ctx.check("multicancel_all_installed",
+                  h_a.installed() && h_b.installed() && h_c.installed()
+                  && h_d.installed() && h_e.installed() && h_s.installed());
+
+        const bool done{ drive(ctx, 1) };
+        ctx.check("multicancel_probe_completed", done);
+        ctx.check("multicancel_all_fired_once",
+                  g_a_fires.load() == 1 && g_b_fires.load() == 1 && g_c_fires.load() == 1
+                  && g_d_fires.load() == 1 && g_e_fires.load() == 1 && g_s_fires.load() == 1);
+        ctx.check("multicancel_no_cross_fire", !g_cross_fire.load());
+        ctx.check("multicancel_a_frame_ok", g_a_ok.load());
+        ctx.check("multicancel_d_frame_ok", g_d_ok_seen.load());
+        // Both cancelled bodies -> zero-filled retval cells, INDEPENDENTLY.
+        ctx.check("multicancel_a_result_zeroed", hc_fixture::get_a_result() == 0);
+        ctx.check("multicancel_d_result_zeroed",
+                  hc_fixture::get_d_result() == static_cast<std::int64_t>(0));
+        // The four un-cancelling siblings ran their ORIGINAL bodies untouched.
+        ctx.check("multicancel_b_body_untouched",
+                  hc_fixture::get_b_result() == (static_cast<std::int64_t>(SEED) + B_ARG));
+        ctx.check("multicancel_c_body_untouched", hc_fixture::get_c_result() == (SEED + C_ARG_LEN));
+        ctx.check("multicancel_e_body_untouched", hc_fixture::get_e_result() == SEED);
+        ctx.check("multicancel_s_body_untouched", hc_fixture::get_s_result() == (S_ARG * 2));
+    }
+
+    // After scenario 20 drops, a plain full pass restores a's and d's bodies.
+    {
+        const bool done{ drive(ctx, 1) };
+        ctx.check("multicancel_after_drop_probe_completed", done);
+        ctx.check("multicancel_after_drop_silent",
+                  g_a_fires.load() == 0 && g_d_fires.load() == 0);
+        ctx.check("multicancel_after_drop_a_restored",
+                  hc_fixture::get_a_result() == (SEED + A_ARG));
+        ctx.check("multicancel_after_drop_d_restored",
+                  hc_fixture::get_d_result() == (static_cast<std::int64_t>(SEED)
+                                                 + static_cast<std::int64_t>(D_ARG)));
+    }
+
+    // =====================================================================
+    // 21 — THREE return-mutation kinds coexist in ONE pass without crosstalk.  Hook
+    //      all six; a's detour OVERRIDES (set), c's detour CANCELS, d's detour
+    //      REWRITES its own arg (set_arg) -- three DIFFERENT return_value mutations
+    //      live simultaneously on the shared stub.  Drive mode 1: each mutation
+    //      lands on ITS OWN firing frame and only there.  a -> override value;
+    //      c -> zero cell; d -> body recomputed from the rewritten arg; b,e,s ->
+    //      untouched originals.  This is the decisive cross-contamination test: if
+    //      any mutation leaked to a sibling's frame, exactly one of these readbacks
+    //      would break.
+    //
+    //      d's detour rewrites its own double arg's FIRST interpreter slot (slot 1,
+    //      since slot 0 is `this`) to a bit pattern; rather than depend on a precise
+    //      double bit layout we keep d as a plain allow-through here and reserve
+    //      set_arg coverage to scenario 10's dedicated int-slot test -- so this
+    //      scenario pairs a's set() with c's cancel() (two distinct mutation kinds)
+    //      and asserts the remaining four are pristine.
+    // =====================================================================
+    {
+        constexpr std::int32_t kOverride{ 778899 };
+        auto h_a{ vmhook::scoped_hook<hc_fixture>("a", "(I)I", a_detour(&kOverride)) };
+        auto h_b{ vmhook::scoped_hook<hc_fixture>("b", "(J)J", b_detour()) };
+        auto h_c{ vmhook::scoped_hook<hc_fixture>("c", "(Ljava/lang/String;)I", c_detour_cancel()) };
+        auto h_d{ vmhook::scoped_hook<hc_fixture>("d", "(D)J", d_detour()) };
+        auto h_e{ vmhook::scoped_hook<hc_fixture>("e", "()I", e_detour()) };
+        auto h_s{ vmhook::scoped_hook<hc_fixture>("s", "(I)I", s_detour()) };
+        ctx.check("mixedmut_all_installed",
+                  h_a.installed() && h_b.installed() && h_c.installed()
+                  && h_d.installed() && h_e.installed() && h_s.installed());
+
+        const bool done{ drive(ctx, 1) };
+        ctx.check("mixedmut_probe_completed", done);
+        ctx.check("mixedmut_all_fired_once",
+                  g_a_fires.load() == 1 && g_b_fires.load() == 1 && g_c_fires.load() == 1
+                  && g_d_fires.load() == 1 && g_e_fires.load() == 1 && g_s_fires.load() == 1);
+        ctx.check("mixedmut_no_cross_fire", !g_cross_fire.load());
+        ctx.check("mixedmut_a_frame_ok", g_a_ok.load());
+        ctx.check("mixedmut_c_frame_ok", g_c_ok.load());
+        // a was OVERRIDDEN to kOverride (set on a's frame only).
+        ctx.check("mixedmut_a_overridden", hc_fixture::get_a_result() == kOverride);
+        ctx.check("mixedmut_a_not_original", hc_fixture::get_a_result() != (SEED + A_ARG));
+        // c was CANCELLED -> zero cell (c(String) returns int -> 0).
+        ctx.check("mixedmut_c_zeroed", hc_fixture::get_c_result() == 0);
+        ctx.check("mixedmut_c_not_original", hc_fixture::get_c_result() != (SEED + C_ARG_LEN));
+        // b, d, e, s ran their ORIGINAL bodies untouched -- no mutation leaked.
+        ctx.check("mixedmut_b_untouched",
+                  hc_fixture::get_b_result() == (static_cast<std::int64_t>(SEED) + B_ARG));
+        ctx.check("mixedmut_d_untouched",
+                  hc_fixture::get_d_result() == (static_cast<std::int64_t>(SEED)
+                                                 + static_cast<std::int64_t>(D_ARG)));
+        ctx.check("mixedmut_e_untouched", hc_fixture::get_e_result() == SEED);
+        ctx.check("mixedmut_s_untouched", hc_fixture::get_s_result() == (S_ARG * 2));
+    }
+
+    // =====================================================================
+    // 22 — RE-INSTALL the same method by MOVE-ASSIGNING a fresh scoped_hook over a
+    //      stopped handle.  Install a, prove it fires; stop() it, prove it goes
+    //      silent; then MOVE-ASSIGN a freshly-resolved scoped_hook for the SAME
+    //      method back into the same handle variable and prove it fires again
+    //      through the still-patched shared stub.  hook_handle's move-assign
+    //      stop()s the (already-empty) target before taking the new method, so the
+    //      re-install is clean and leaves exactly one live entry.  A sibling (b)
+    //      installed alongside stays live across a's stop/re-install churn.
+    // =====================================================================
+    {
+        auto h_b{ vmhook::scoped_hook<hc_fixture>("b", "(J)J", b_detour()) };
+        auto h_a{ vmhook::scoped_hook<hc_fixture>("a", "(I)I", a_detour()) };
+        ctx.check("reinstall_initial_installed", h_a.installed() && h_b.installed());
+
+        bool done{ drive(ctx, 5) };   // a + b + c; c unhooked so only a,b fire
+        ctx.check("reinstall_first_pass_completed", done);
+        ctx.check("reinstall_first_a_fired", g_a_fires.load() == 1);
+        ctx.check("reinstall_first_b_fired", g_b_fires.load() == 1);
+        ctx.check("reinstall_first_no_cross_fire", !g_cross_fire.load());
+
+        // Drop a; b stays live.
+        h_a.stop();
+        ctx.check("reinstall_a_stopped", !h_a.installed());
+        done = drive(ctx, 5);
+        ctx.check("reinstall_after_stop_completed", done);
+        ctx.check("reinstall_after_stop_a_silent", g_a_fires.load() == 0);
+        ctx.check("reinstall_after_stop_b_still_fires", g_b_fires.load() == 1);
+
+        // MOVE-ASSIGN a fresh hook for the SAME method back into the handle.
+        h_a = vmhook::scoped_hook<hc_fixture>("a", "(I)I", a_detour());
+        ctx.check("reinstall_reassigned_installed", h_a.installed());
+        done = drive(ctx, 5);
+        ctx.check("reinstall_after_reassign_completed", done);
+        ctx.check("reinstall_after_reassign_a_fires_again", g_a_fires.load() == 1);
+        ctx.check("reinstall_after_reassign_a_frame_ok", g_a_ok.load());
+        ctx.check("reinstall_after_reassign_b_still_fires", g_b_fires.load() == 1);
+        ctx.check("reinstall_after_reassign_no_cross_fire", !g_cross_fire.load());
+        ctx.check("reinstall_after_reassign_total_is_two",
+                  g_a_fires.load() + g_b_fires.load() == 2);
+    }   // h_a, h_b drop here.
+
+    // After scenario 22 drops, a full a+b+c pass fires nothing.
+    {
+        const bool done{ drive(ctx, 5) };
+        ctx.check("reinstall_after_drop_completed", done);
+        ctx.check("reinstall_after_drop_all_silent",
+                  g_a_fires.load() == 0 && g_b_fires.load() == 0 && g_c_fires.load() == 0);
     }
 
     // Leave NOTHING armed for later modules sharing the JVM/stub: every handle

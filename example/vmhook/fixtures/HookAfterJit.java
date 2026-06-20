@@ -79,6 +79,11 @@ public final class HookAfterJit
      *       re-JIT past the hook within a probe; native asserts fires == N_REPEAT).
      *  12 = call hotStatic() N_REPEAT times in one probe (same exact-count contract
      *       on the static path).
+     *  13 = WARM hotLong() WARM_CALLS times, NO hook installed yet (drives the JIT
+     *       on the WIDE long-returning method so the native side can install after
+     *       it is hot).
+     *  14 = call hotLong() ONCE with HOT_DELTA (post-install on the long-returning
+     *       method: detour must fire once; allow-through OR forced wide return).
      */
     public static volatile int mode;
 
@@ -150,6 +155,17 @@ public final class HookAfterJit
      */
     public static final int N_REPEAT = 64;
 
+    /**
+     * Base added by the WIDE (long-returning) hookable method; hotLong(delta)
+     * returns LONG_BASE + delta as a 64-bit long.  Chosen well outside the 32-bit
+     * range so a truncated or mis-decoded wide return is unmistakable on the
+     * native side.
+     */
+    public static final long LONG_BASE = 0x1_0000_0000L + 5000L;
+
+    /** Last value the original hotLong() body computed (allow-through proof). */
+    public static volatile long lastLongResult;
+
     // ---- Hookable method --------------------------------------------------
 
     /**
@@ -189,6 +205,17 @@ public final class HookAfterJit
     public int over(final int a, final int b)
     {
         return a + b + OVER2_ADD;
+    }
+
+    /**
+     * Hookable instance method with a WIDE (long) return.  Descriptor (I)J: the
+     * single int arg occupies interpreter slot 1 (slot 0 is this), and the return
+     * value occupies TWO stack slots.  Exercises the after-JIT deopt + force-return
+     * path on a return shape other than int.  Returns LONG_BASE + delta.
+     */
+    public long hotLong(final int delta)
+    {
+        return LONG_BASE + delta;
     }
 
     private static void runHotOnce(final int delta)
@@ -331,6 +358,35 @@ public final class HookAfterJit
         callerIterations = made;
     }
 
+    private static void runLongLoop(final int iterations)
+    {
+        final HookAfterJit obj = new HookAfterJit();
+        obj.seed = SEED;
+        int made = 0;
+        long acc = 0;
+        long last = 0;
+        for (int i = 0; i < iterations; ++i)
+        {
+            final int d = i & 0xFF;
+            last = obj.hotLong(d);
+            acc ^= last;
+            ++made;
+        }
+        lastLongResult = last;
+        hotResultXor = acc;
+        hotCallsMade = made;
+    }
+
+    private static void runLongOnce(final int delta)
+    {
+        final HookAfterJit obj = new HookAfterJit();
+        obj.seed = SEED;
+        final long r = obj.hotLong(delta);
+        lastLongResult = r;
+        hotResultXor = r;
+        hotCallsMade = 1;
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -381,6 +437,12 @@ public final class HookAfterJit
                         break;
                     case 12:
                         runStaticRepeat(N_REPEAT);
+                        break;
+                    case 13:
+                        runLongLoop(WARM_CALLS);
+                        break;
+                    case 14:
+                        runLongOnce(HOT_DELTA);
                         break;
                     default:
                         break;

@@ -133,6 +133,56 @@ namespace
         return signature[close + 1];
     }
 
+    // The trichotomy a future call()'s value_t would fall into, derived ONLY
+    // from the descriptor (no call(), no value_t).  EXACTLY ONE of these three
+    // is true for ANY descriptor, well-formed or not — they PARTITION the input:
+    //   reference  : char after ')' is 'L' or '['  (value_t would carry an oop)
+    //   primitive  : char after ')' is one of Z B S C I J F D (numeric value_t)
+    //   void       : EVERYTHING ELSE — the literal 'V', a malformed / empty
+    //                descriptor (no ')' / nothing after ')'), AND any unknown /
+    //                garbage return char.  A future call() of any such descriptor
+    //                produces value_t::is_void() (monostate), so "void" is the
+    //                catch-all that makes the partition exhaustive.
+    // These mirror, on the descriptor side, what value_t::is_reference() /
+    // (numeric) / is_void() would report after a real dispatch — asserted here
+    // WITHOUT calling, so the proxy is never call()'d.
+    auto oracle_is_primitive(std::string_view signature) -> bool
+    {
+        const std::size_t close{ signature.find(')') };
+        if (close == std::string_view::npos || close + 1 >= signature.size())
+        {
+            return false;
+        }
+        switch (signature[close + 1])
+        {
+        case 'Z': case 'B': case 'S': case 'C':
+        case 'I': case 'J': case 'F': case 'D':
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // void = neither reference nor primitive (the partition's catch-all, so the
+    // three legs are mutually exclusive AND exhaustive over EVERY descriptor).
+    auto oracle_is_void(std::string_view signature) -> bool
+    {
+        return !oracle_is_reference(signature) && !oracle_is_primitive(signature);
+    }
+
+    // Descriptor-side analogue of value_t::is_string(): the return type is
+    // EXACTLY java.lang.String.  A future call() of such a method would set
+    // value_t::is_string() true; we assert the descriptor shape WITHOUT calling.
+    auto oracle_returns_string(std::string_view signature) -> bool
+    {
+        const std::size_t close{ signature.find(')') };
+        if (close == std::string_view::npos)
+        {
+            return false;
+        }
+        return signature.substr(close + 1) == "Ljava/lang/String;";
+    }
+
     // One method's expectation: its name and the truth is_reference() must report.
     struct expectation
     {
@@ -269,6 +319,25 @@ namespace
         { "sRetTagIface", true },   // Lvmhook/fixtures/IsReference$Tag;
     };
 
+    // NESTED-reference array returns: '[' + a 'L...;' element (interface / boxed /
+    // boxed-Void / user / deep multi-dim-of-reference).  Every descriptor LEADS
+    // with '[' so is_reference() is TRUE — the gap the earlier array sweeps left
+    // (they covered primitive-element [Z..[D, Object[], String[], and one [[L).
+    constexpr expectation k_instance_nested_ref_arrays[]{
+        { "retInterfaceArray", true },   // [Ljava/lang/CharSequence;
+        { "retBoxedIntArray",  true },   // [Ljava/lang/Integer;
+        { "retBoxedVoidArray", true },   // [Ljava/lang/Void;
+        { "retBox2DArray",     true },   // [[Lvmhook/fixtures/IsReference$Box;
+        { "retString3DArray",  true },   // [[[Ljava/lang/String;
+    };
+
+    constexpr expectation k_static_nested_ref_arrays[]{
+        { "sRetInterfaceArray", true },   // [Ljava/lang/CharSequence;
+        { "sRetBoxedIntArray",  true },   // [Ljava/lang/Integer;
+        { "sRetBox2DArray",     true },   // [[Lvmhook/fixtures/IsReference$Box;
+        { "sRetString3DArray",  true },   // [[[Ljava/lang/String;
+    };
+
     // Resolved-proxy EXACT-descriptor pins for the array / multi-dim returns.
     // signature() must round-trip the canonical JVM descriptor the resolution
     // reported — a stronger invariant than truth+oracle alone (it pins the
@@ -290,9 +359,18 @@ namespace
         { "retInt2DArray",    "()[[I" },
         { "retByte3DArray",   "()[[[B" },
         { "retInt5DArray",    "()[[[[[I" },
-        { "retObjectArray",   "()[Ljava/lang/Object;" },
-        { "retStringArray",   "()[Ljava/lang/String;" },
-        { "retString2DArray", "()[[Ljava/lang/String;" },
+        { "retObjectArray",      "()[Ljava/lang/Object;" },
+        { "retStringArray",      "()[Ljava/lang/String;" },
+        { "retString2DArray",    "()[[Ljava/lang/String;" },
+        { "retString3DArray",    "()[[[Ljava/lang/String;" },
+        { "retInterfaceArray",   "()[Ljava/lang/CharSequence;" },
+        { "retBoxedIntArray",    "()[Ljava/lang/Integer;" },
+        { "retBoxedVoidArray",   "()[Ljava/lang/Void;" },
+        { "retBox2DArray",       "()[[Lvmhook/fixtures/IsReference$Box;" },
+        { "retInterface",        "()Ljava/lang/CharSequence;" },
+        { "retList",             "()Ljava/util/List;" },
+        { "retBox",              "()Lvmhook/fixtures/IsReference$Box;" },
+        { "retTagIface",         "()Lvmhook/fixtures/IsReference$Tag;" },
         { "retString",        "()Ljava/lang/String;" },
         { "retObject",        "()Ljava/lang/Object;" },
         { "retBoxedInt",      "()Ljava/lang/Integer;" },
@@ -331,6 +409,21 @@ namespace
                   is_ref == oracle_is_reference(sig));
         ctx.check(prefix + "_signature_oracle_expected_" + e.name,
                   oracle_is_reference(sig) == e.expect_reference);
+
+        // Predicate invariant (HARD): reference / void / primitive are mutually
+        // exclusive AND exhaustive for EVERY resolved descriptor.  is_reference()
+        // is the reference leg; the other two are derived purely from the
+        // descriptor.  Exactly one must be true.
+        const bool is_void_ret{ oracle_is_void(sig) };
+        const bool is_prim_ret{ oracle_is_primitive(sig) };
+        ctx.check(prefix + "_trichotomy_exactly_one_" + e.name,
+                  (is_ref ? 1 : 0) + (is_void_ret ? 1 : 0) + (is_prim_ret ? 1 : 0) == 1);
+        // is_reference() and "void" can never both hold.
+        ctx.check(prefix + "_reference_and_void_disjoint_" + e.name,
+                  !(is_ref && is_void_ret));
+        // is_reference() and "primitive" can never both hold.
+        ctx.check(prefix + "_reference_and_primitive_disjoint_" + e.name,
+                  !(is_ref && is_prim_ret));
 
         if (is_ref != e.expect_reference || is_ref != oracle_is_reference(sig))
         {
@@ -1043,6 +1136,11 @@ VMHOOK_JVM_MODULE(method_is_reference)
             { "retBox",         "sRetBox" },          // user nested class
             { "retBoxedInt",    "sRetBoxedInt" },     // Ljava/lang/Integer;
             { "retBoxedVoid",   "sRetBoxedVoid" },    // Ljava/lang/Void;
+            { "retInterfaceArray", "sRetInterfaceArray" }, // [Ljava/lang/CharSequence;
+            { "retBoxedIntArray",  "sRetBoxedIntArray" },  // [Ljava/lang/Integer;
+            { "retBox2DArray",     "sRetBox2DArray" },     // [[Lvmhook/.../$Box;
+            { "retString3DArray",  "sRetString3DArray" },  // [[[Ljava/lang/String;
+            { "retTagIface",       "sRetTagIface" },       // Ljava/lang/.../$Tag;
         };
         for (const twin& t : twins)
         {
@@ -1061,6 +1159,210 @@ VMHOOK_JVM_MODULE(method_is_reference)
                 const std::string ssig{ stat_mp->signature() };
                 ctx.check(std::string{ "arrparity_signatures_equal_" } + t.inst, isig == ssig);
             }
+        }
+    }
+
+    // =====================================================================
+    // 16. NESTED-reference array returns (instance + static): '[' + a 'L...;'
+    //     element — interface[], boxed[], boxed-Void[], user 2-D, deep
+    //     String[][][].  All TRUE.  The check_proxy() helper also fires the
+    //     trichotomy predicate-invariant on each (reference XOR void XOR
+    //     primitive), so these rows prove BOTH the array '[' verdict AND that
+    //     a nested 'L' element never flips a leg of the trichotomy.
+    // =====================================================================
+    if (singleton)
+    {
+        for (const expectation& e : k_instance_nested_ref_arrays)
+        {
+            const auto mp{ singleton->get_method(e.name) };
+            ctx.check(std::string{ "nestedarr_inst_resolves_" } + e.name, mp.has_value());
+            if (mp)
+            {
+                check_proxy(ctx, "nestedarr_inst", e, *mp);
+            }
+        }
+    }
+    for (const expectation& e : k_static_nested_ref_arrays)
+    {
+        const auto mp{ isref::static_proxy(e.name) };
+        ctx.check(std::string{ "nestedarr_static_resolves_" } + e.name, mp.has_value());
+        if (mp)
+        {
+            check_proxy(ctx, "nestedarr_static", e, *mp);
+        }
+    }
+
+    // =====================================================================
+    // 17. DESCRIPTOR-SIDE value_t SHAPE: without ANY call(), assert — straight
+    //     off signature() — the trichotomy a future call's value_t would land
+    //     in (reference / void / primitive) AND the is_string() shape (return
+    //     type EXACTLY java.lang.String).  These mirror value_t::is_reference()
+    //     / is_void() / is_string() on the descriptor side, the call-free way to
+    //     deepen "is_void()/is_string() on method returns".  Each row resolves a
+    //     real method and pins all three predicate legs + the String shape.
+    // =====================================================================
+    if (singleton)
+    {
+        struct shape_case
+        {
+            const char* name;       // instance method on the fixture
+            bool        reference;  // is_reference() truth
+            bool        is_void;    // return char is 'V'
+            bool        primitive;  // return char is a primitive
+            bool        is_string;  // return type is EXACTLY java/lang/String
+        };
+        const shape_case shapes[]{
+            //  name              ref    void   prim   string
+            { "retString",      true,  false, false, true  },  // the lone is_string TRUE
+            { "retObject",      true,  false, false, false },
+            { "retList",        true,  false, false, false },
+            { "retInterface",   true,  false, false, false },
+            { "retBox",         true,  false, false, false },
+            { "retBoxedInt",    true,  false, false, false },
+            { "retBoxedVoid",   true,  false, false, false },  // boxed Void: ref, NOT void
+            { "retStringArray", true,  false, false, false },  // [L..String; is NOT bare String
+            { "retIntArray",    true,  false, false, false },
+            { "retVoid",        false, true,  false, false },  // the lone is_void TRUE
+            { "retInt",         false, false, true,  false },
+            { "retBool",        false, false, true,  false },
+            { "retLong",        false, false, true,  false },
+            { "retDouble",      false, false, true,  false },
+            { "retChar",        false, false, true,  false },
+            { "takesString",    false, false, true,  false },  // (L..)I — primitive return
+            { "takesObjectArray", false, true, false, false }, // ([L..)V — void return
+        };
+
+        for (const shape_case& s : shapes)
+        {
+            // takesString / takesObjectArray are unique names; the rest are no-arg.
+            const auto mp{ singleton->get_method(s.name) };
+            ctx.check(std::string{ "shape_resolves_" } + s.name, mp.has_value());
+            if (!mp)
+            {
+                continue;
+            }
+            const std::string sig{ mp->signature() };
+            const bool        is_ref{ mp->is_reference() };
+
+            ctx.check(std::string{ "shape_reference_" } + s.name, is_ref == s.reference);
+            ctx.check(std::string{ "shape_void_" } + s.name, oracle_is_void(sig) == s.is_void);
+            ctx.check(std::string{ "shape_primitive_" } + s.name,
+                      oracle_is_primitive(sig) == s.primitive);
+            ctx.check(std::string{ "shape_is_string_" } + s.name,
+                      oracle_returns_string(sig) == s.is_string);
+
+            // HARD predicate invariant: exactly one of the three legs holds.
+            ctx.check(std::string{ "shape_trichotomy_exactly_one_" } + s.name,
+                      (is_ref ? 1 : 0) + (oracle_is_void(sig) ? 1 : 0)
+                          + (oracle_is_primitive(sig) ? 1 : 0) == 1);
+            // is_string() can ONLY be true when is_reference() is — a String
+            // return is a reference return; the converse need not hold.
+            ctx.check(std::string{ "shape_string_implies_reference_" } + s.name,
+                      !oracle_returns_string(sig) || is_ref);
+            // is_string() and is_void() are mutually exclusive.
+            ctx.check(std::string{ "shape_string_and_void_disjoint_" } + s.name,
+                      !(oracle_returns_string(sig) && oracle_is_void(sig)));
+        }
+
+        // The is_string() DISCRIMINATION crux: retString's return is exactly
+        // String (is_string TRUE) while retStringArray's is '[L..String;' (a
+        // reference, but is_string FALSE — the array is not a String).  Both are
+        // references, yet the String-shape predicate separates them.
+        const auto str_ret{ singleton->get_method("retString") };
+        const auto strarr_ret{ singleton->get_method("retStringArray") };
+        if (str_ret && strarr_ret)
+        {
+            const std::string s0{ str_ret->signature() };
+            const std::string s1{ strarr_ret->signature() };
+            ctx.check("shape_string_vs_stringarray_both_reference",
+                      str_ret->is_reference() == true && strarr_ret->is_reference() == true);
+            ctx.check("shape_string_only_first_is_string",
+                      oracle_returns_string(s0) == true && oracle_returns_string(s1) == false);
+        }
+    }
+
+    // =====================================================================
+    // 18. RED-HERRING INVERSE on a RESOLVED method: refParamRefReturn has a
+    //     reference PARAM and a reference RETURN — is_reference() must be TRUE
+    //     (it reads the return slot), while takesString (reference param,
+    //     primitive return) is FALSE.  Same param 'L', opposite verdict driven
+    //     ENTIRELY by the return char.  Pins that is_reference() never confuses
+    //     the param 'L' for the return 'L' in EITHER direction.
+    // =====================================================================
+    if (singleton)
+    {
+        const auto ref_ref{ singleton->get_method("refParamRefReturn",
+                                                   "(Ljava/lang/String;)Ljava/lang/Object;") };
+        const auto ref_prim{ singleton->get_method("takesString", "(Ljava/lang/String;)I") };
+        ctx.check("inverse_refParamRefReturn_resolves", ref_ref.has_value());
+        ctx.check("inverse_takesString_resolves", ref_prim.has_value());
+        if (ref_ref)
+        {
+            const std::string sig{ ref_ref->signature() };
+            ctx.check("inverse_refParamRefReturn_signature_exact",
+                      sig == "(Ljava/lang/String;)Ljava/lang/Object;");
+            ctx.check("inverse_refParamRefReturn_is_reference_true",
+                      ref_ref->is_reference() == true);
+            ctx.check("inverse_refParamRefReturn_oracle_true",
+                      oracle_is_reference(sig) == true);
+        }
+        if (ref_ref && ref_prim)
+        {
+            // SAME param descriptor (Ljava/lang/String;), opposite is_reference().
+            ctx.check("inverse_same_param_distinct_is_reference",
+                      ref_ref->is_reference() != ref_prim->is_reference());
+        }
+    }
+
+    // =====================================================================
+    // 19. MORE hand-built MALFORMED / EDGE return chars — no JVM.  Boundary
+    //     chars the section-10 sweep did not cover: ')' as the only char, ';'
+    //     immediately after ')', whitespace return chars (space / tab),
+    //     lowercase primitive-lookalikes (only UPPERCASE Z..D are primitives —
+    //     but the accessor only keys 'L'/'[' so lowercase is simply non-ref),
+    //     a '0' digit, and a leading '[' / 'L' as the FIRST char with no ')'.
+    //     is_reference() must NOT deref and must report the documented verdict;
+    //     the oracle must agree on every one.
+    // =====================================================================
+    {
+        struct edge_case
+        {
+            const char* sig;
+            bool        expect;
+            const char* label;
+        };
+        const edge_case edges[]{
+            { ")",                       false, "close_only" },          // close is last char
+            { "();",                     false, "semicolon_after_close" },// ';' is not L/[
+            { "() ",                     false, "space_after_close" },    // ' ' not L/[
+            { "()\t",                    false, "tab_after_close" },      // tab not L/[
+            { "()z",                     false, "lowercase_z_after" },    // lowercase != primitive marker, and != L
+            { "()b",                     false, "lowercase_b_after" },
+            { "()i",                     false, "lowercase_i_after" },
+            { "()0",                     false, "digit_after_close" },
+            { "()l",                     false, "lowercase_l_after" },    // only UPPER 'L' is reference
+            { "()(",                     false, "open_paren_after_close" },
+            { "()]",                     false, "close_bracket_after" },  // ']' not '['
+            { "[",                       false, "lead_bracket_no_paren" },// no ')' -> false
+            { "Ljava/lang/Object;",      false, "lead_L_no_paren" },      // no ')' -> false
+            { "()L",                     true,  "bare_L_after_close" },   // 'L' wins, no ';' needed
+            { "()[",                     true,  "bare_bracket_after_close" },
+        };
+
+        for (const edge_case& c : edges)
+        {
+            const vmhook::method_proxy mp{ nullptr, nullptr, std::string{ c.sig } };
+            ctx.check(std::string{ "edge_is_reference_" } + c.label,
+                      mp.is_reference() == c.expect);
+            ctx.check(std::string{ "edge_oracle_agree_" } + c.label,
+                      mp.is_reference() == oracle_is_reference(c.sig));
+            // Trichotomy holds even for ill-formed text: exactly one leg true.
+            ctx.check(std::string{ "edge_trichotomy_exactly_one_" } + c.label,
+                      (mp.is_reference() ? 1 : 0) + (oracle_is_void(c.sig) ? 1 : 0)
+                          + (oracle_is_primitive(c.sig) ? 1 : 0) == 1);
+            // is_reference() never touches the Method* — null here, must be safe.
+            ctx.check(std::string{ "edge_raw_method_null_" } + c.label,
+                      mp.raw_method() == nullptr);
         }
     }
 }

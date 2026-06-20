@@ -84,6 +84,17 @@ public final class MethodExplicitSig extends MethodExplicitSigBase
     /** smap(String) static executed. */
     public static volatile int smapStrHits;
 
+    /** cov() covariant override (returns String) executed; records the return. */
+    public static volatile String covStrSeen;
+    /** wide(JI)J executed; records a*1000 + b. */
+    public static volatile long wideJiSeen;
+    /** wide(DI)D executed; records the double result. */
+    public static volatile double wideDiSeen;
+    /** wide(JJ)J executed; records a - b. */
+    public static volatile long wideJjSeen;
+    /** sink(II)V executed (void-return WITH args); records a*1000 + b. */
+    public static volatile int sinkIiSeen;
+
     // The inherited base(I)I / base(II)I overloads record their side effects in
     // MethodExplicitSigBase.baseIntSeen / baseIntIntSeen (proof of hierarchy walk).
 
@@ -123,6 +134,18 @@ public final class MethodExplicitSig extends MethodExplicitSigBase
     public static final int    IFACE_ABS_ARG   = 80;    // ifaceAbstract(I)I -> 81
     public static final int    INIT_I_ARG      = 33;    // <init>(I) records 33
     public static final String INIT_S_ARG      = "ctor";// <init>(String) records "ctor"
+
+    // -- wide-mixed-arg + void-with-args family constants ----------------
+    public static final long   WIDE_JI_J_ARG   = 6L;    // wide(JI)J first arg (long)
+    public static final int    WIDE_JI_I_ARG   = 5;     // wide(JI)J second arg (int) -> 6005
+    public static final double WIDE_DI_D_ARG   = 2.5;   // wide(DI)D first arg (double)
+    public static final int    WIDE_DI_I_ARG   = 4;     // wide(DI)D second arg (int) -> 2.5+4 = 6.5
+    public static final long   WIDE_JJ_A_ARG   = 40L;   // wide(JJ)J first arg
+    public static final long   WIDE_JJ_B_ARG   = 9L;    // wide(JJ)J second arg -> 40-9 = 31
+    public static final int    SINK_II_A       = 12;
+    public static final int    SINK_II_B       = 34;    // sink(II)V -> 12034
+    public static final long   BASE_JI_A       = 8L;
+    public static final int    BASE_JI_B       = 3;      // base(JI)J -> 8003
 
     // ===================== Constructor overloads (<init>) ==================
     // Several <init> overloads with DISTINCT descriptors so the explicit-
@@ -320,6 +343,84 @@ public final class MethodExplicitSig extends MethodExplicitSigBase
         final int sum = a + b + c + d;
         MethodExplicitSigCounters.shapeFourArgSeen = sum;
         return sum;
+    }
+
+    // ===================== Covariant return override: cov ==================
+    // MethodExplicitSigBase declares  CharSequence cov().  This override narrows
+    // the return type to String (covariant), which is legal in Java.  javac emits
+    // BOTH the real override  cov()Ljava/lang/String;  AND a SYNTHETIC BRIDGE
+    // cov()Ljava/lang/CharSequence;  onto THIS leaf class so virtual dispatch
+    // through the supertype still works.  Hence the leaf _methods array holds two
+    // cov() entries that differ ONLY by return descriptor — the perfect probe that
+    // get_method(name,sig) keys on the FULL descriptor (return char included), not
+    // just the parameter list.  The real override records covStrSeen.
+
+    /** cov()Ljava/lang/String; — covariant override of base cov()CharSequence. */
+    @Override
+    public String cov()
+    {
+        covStrSeen = "leaf-cov";
+        return "leaf-cov";
+    }
+
+    // ===================== Wide-mixed-arg family: wide ======================
+    // Each overload interleaves a WIDE primitive (long/double — two interpreter
+    // slots) with a narrow one, so the explicit-signature lookup selects a
+    // multi-slot descriptor and the dispatch packs the slots correctly:
+    //   wide(JI)J   long then int,   returns a*1000 + b
+    //   wide(DI)D   double then int, returns a + b
+    //   wide(JJ)J   two longs,       returns a - b
+
+    /** wide(JI)J */
+    public long wide(final long a, final int b)
+    {
+        wideJiSeen = a * 1000L + b;
+        return a * 1000L + b;
+    }
+
+    /** wide(DI)D */
+    public double wide(final double a, final int b)
+    {
+        wideDiSeen = a + b;
+        return a + b;
+    }
+
+    /** wide(JJ)J */
+    public long wide(final long a, final long b)
+    {
+        wideJjSeen = a - b;
+        return a - b;
+    }
+
+    // ===================== Void-with-args: sink ============================
+    // sink(II)V — a VOID return that nevertheless takes parameters, distinct from
+    // process()V (no args).  Proves the void return descriptor 'V' is selected
+    // alongside a non-empty parameter list, and the wrong-arity/wrong-return
+    // twins miss.
+
+    /** sink(II)V */
+    public void sink(final int a, final int b)
+    {
+        sinkIiSeen = a * 1000 + b;
+    }
+
+    // ===================== Object-return family: makeObj/makeNum ===========
+    // Reference returns OTHER than java.lang.String, selected by exact descriptor.
+    // LOOKUP-ONLY on the native side (calling returns a wrapper, not the feature
+    // under test); the point is that ()Ljava/lang/Object; and ()Ljava/lang/Number;
+    // are distinct descriptors the exact compare keys on, and a wrong object
+    // return descriptor (e.g. ()Ljava/lang/String; on makeObj) misses.
+
+    /** makeObj()Ljava/lang/Object; */
+    public Object makeObj()
+    {
+        return new Object();
+    }
+
+    /** makeNum()Ljava/lang/Number; */
+    public Number makeNum()
+    {
+        return Integer.valueOf(7);
     }
 
     // ===================== ACC_STATIC orthogonality: dup* ==================

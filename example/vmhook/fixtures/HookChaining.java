@@ -68,6 +68,10 @@ public final class HookChaining
      *   8 = e() once + d(double) once   (no-arg frame + two-slot double)
      *   9 = a once + s(int) S_REPEAT times (static-method count fidelity; the
      *       instance sibling fires once while the static sibling fires many)
+     *  10 = ALL six methods, each TWICE, in ONE dispatch pass (a,b,c,d,e,s x2):
+     *       a modest "N-way, repeated" stream that stresses common_detour's linear
+     *       scan repeatedly within a single run() and proves every per-method count
+     *       stays exact (2 each) with zero cross-fire across a longer mixed pass
      */
     public static volatile int mode;
 
@@ -243,6 +247,30 @@ public final class HookChaining
         }
     }
 
+    /**
+     * All six methods, each TWICE, inside a SINGLE bytecode dispatch pass.
+     * Same one-pass shape as runAll() but with every method dispatched twice, so
+     * the native side can assert each per-method count is EXACTLY 2 with zero
+     * cross-fire -- a modest "N-way, repeated" mixed stream over the shared stub.
+     */
+    private static void runAllTwice()
+    {
+        final HookChaining obj = new HookChaining();
+        obj.seed = SEED;
+        aResult = obj.a(A_ARG);          aCalls += 1;
+        bResult = obj.b(B_ARG);          bCalls += 1;
+        cResult = obj.c(C_ARG);          cCalls += 1;
+        dResult = obj.d(D_ARG);          dCalls += 1;
+        eResult = obj.e();               eCalls += 1;
+        sResult = s(S_ARG);              sCalls += 1;
+        aResult = obj.a(A_ARG);          aCalls += 1;
+        bResult = obj.b(B_ARG);          bCalls += 1;
+        cResult = obj.c(C_ARG);          cCalls += 1;
+        dResult = obj.d(D_ARG);          dCalls += 1;
+        eResult = obj.e();               eCalls += 1;
+        sResult = s(S_ARG);              sCalls += 1;
+    }
+
     static
     {
         Harness.register(new Harness.Probe()
@@ -284,6 +312,9 @@ public final class HookChaining
                         break;
                     case 9:
                         runAAndStaticN();
+                        break;
+                    case 10:
+                        runAllTwice();
                         break;
                     default:
                         break;

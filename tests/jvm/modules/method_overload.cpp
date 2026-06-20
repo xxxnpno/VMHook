@@ -280,6 +280,8 @@ namespace
     constexpr std::int32_t RET_INT_STRING  = 1025;
     constexpr std::int32_t RET_STRING_INT  = 1026;  // pick(String,int) -> (Ljava/lang/String;I)I
     constexpr std::int32_t RET_LONG_DOUBLE = 1027;  // pick(long,double)-> (JD)I  (two wide slots)
+    constexpr std::int32_t RET_INT_DOUBLE  = 1028;  // pick(int,double) -> (ID)I  (narrow + wide)
+    constexpr std::int32_t RET_DOUBLE_INT  = 1029;  // pick(double,int) -> (DI)I  (wide + narrow)
     constexpr std::int32_t RET_INT_ARRAY   = 1031;  // pick(int[])  -> ([I)I
     constexpr std::int32_t RET_LONG_ARRAY  = 1032;  // pick(long[]) -> ([J)I
     constexpr std::int32_t RET_CHAR_ARRAY  = 1033;  // pick(char[]) -> ([C)I
@@ -326,12 +328,21 @@ namespace
     // C++ type by its TRAITS (sizeof / signedness / is_same_v), not by a single
     // fixed-width alias.  Each must land on the SAME overload as its sibling.
     std::atomic<std::int64_t> g_r_cstr{ k_unset };       // const char*      -> pick(String)
+    std::atomic<std::int64_t> g_r_mutable_cstr{ k_unset };// char* (non-const) -> pick(String)
     std::atomic<std::int64_t> g_r_string_view{ k_unset };// std::string_view -> pick(String)
     std::atomic<std::int64_t> g_r_char16{ k_unset };     // char16_t         -> pick(char)
     std::atomic<std::int64_t> g_r_uchar{ k_unset };      // unsigned char    -> pick(byte)
     std::atomic<std::int64_t> g_r_schar{ k_unset };      // signed char      -> pick(byte)
     std::atomic<std::int64_t> g_r_plainchar{ k_unset };  // (plain) char     -> pick(byte)
+    std::atomic<std::int64_t> g_r_uint8{ k_unset };      // std::uint8_t     -> pick(byte)
     std::atomic<std::int64_t> g_r_uint16_as_char{ k_unset };  // uint16_t -> pick(char) (NOT short)
+    // unsigned 4/8-byte integral types classify by sizeof, NOT by a signed alias:
+    // unsigned int -> I, unsigned long long -> J — must land on pick(int)/pick(long).
+    std::atomic<std::int64_t> g_r_uint32{ k_unset };     // unsigned int       -> pick(int)
+    std::atomic<std::int64_t> g_r_uint64{ k_unset };     // unsigned long long -> pick(long)
+    std::atomic<std::int64_t> g_echo_uint8{ k_unset };   // byte echo for the uint8 call
+    std::atomic<std::int64_t> g_echo_uint32{ k_unset };  // int echo for the uint32 call
+    std::atomic<std::int64_t> g_echo_uint64{ k_unset };  // long echo for the uint64 call
     // value echoes for the alternate-type calls (right value -> right slot)
     std::atomic<bool>         g_echo_cstr_ok{ false };
     std::atomic<bool>         g_echo_string_view_ok{ false };
@@ -398,6 +409,15 @@ namespace
     std::atomic<std::int64_t> g_r_long_double_boundary{ k_unset };
     std::atomic<std::int64_t> g_long_double_boundary_a{ k_unset };
     std::atomic<int>          g_long_double_boundary_b_ok{ -1 };
+    // mixed narrow/wide ORDER pair: pick(int,double) "(ID)I" vs pick(double,int) "(DI)I".
+    // Same {int,double} multiset, opposite slot order — each slot's descriptor (one
+    // narrow, one wide) must be matched independently and the two told apart.
+    std::atomic<std::int64_t> g_r_int_double{ k_unset };       // (ID)I
+    std::atomic<std::int64_t> g_int_double_a{ k_unset };       // echoed int (slot0)
+    std::atomic<int>          g_int_double_b_ok{ -1 };         // echoed double (slot1)==2.5 ?
+    std::atomic<std::int64_t> g_r_double_int{ k_unset };       // (DI)I
+    std::atomic<std::int64_t> g_double_int_a{ k_unset };       // echoed int (slot1)
+    std::atomic<int>          g_double_int_b_ok{ -1 };         // echoed double (slot0)==4.5 ?
 
     // explicit-signature fast-path resolution (bypasses hierarchy walk)
     std::atomic<std::int64_t> g_sig_int{ k_unset };
@@ -421,6 +441,8 @@ namespace
     std::atomic<std::int64_t> g_sig_int_string{ k_unset };
     std::atomic<std::int64_t> g_sig_string_int{ k_unset };
     std::atomic<std::int64_t> g_sig_long_double{ k_unset };
+    std::atomic<std::int64_t> g_sig_int_double{ k_unset };   // pinned "(ID)I"
+    std::atomic<std::int64_t> g_sig_double_int{ k_unset };   // pinned "(DI)I"
 
     // ── signature_pinned: an EXPLICIT sig must NOT be re-picked from the C++
     //    arg type (resolve_compatible_method bails on signature_pinned).  Pin
@@ -450,6 +472,8 @@ namespace
     std::atomic<std::int64_t> g_s_string{ k_unset };
     std::atomic<std::int64_t> g_s_integer{ k_unset };  // spick(Integer) by name (java/lang/Integer wrapper)
     std::atomic<std::int64_t> g_s_long_double{ k_unset };  // spick(long,double) by name (JD)I
+    std::atomic<std::int64_t> g_s_int_double{ k_unset };   // spick(int,double) by name (ID)I
+    std::atomic<std::int64_t> g_s_noarg{ k_unset };    // spick() by name ()I -> RET_NOARG+SBIAS
     std::atomic<std::int64_t> g_s_arity2{ k_unset };   // spick(int,int) by name
     // static argument echoes (right value -> right static slot)
     std::atomic<std::int64_t> g_s_echo_int{ k_unset };
@@ -468,6 +492,8 @@ namespace
     std::atomic<std::int64_t> g_s_sig_char{ k_unset };
     std::atomic<std::int64_t> g_s_sig_int_int{ k_unset };
     std::atomic<std::int64_t> g_s_sig_long_double{ k_unset };
+    std::atomic<std::int64_t> g_s_sig_noarg{ k_unset };       // static pinned "()I"
+    std::atomic<std::int64_t> g_s_sig_int_double{ k_unset };  // static pinned "(ID)I"
     // static name-only resolutions for the alternate C++ types (mirror instance).
     std::atomic<std::int64_t> g_s_cstr{ k_unset };       // const char*   -> spick(String)
     std::atomic<std::int64_t> g_s_char16{ k_unset };     // char16_t      -> spick(char)
@@ -584,6 +610,14 @@ namespace
         // const char* (string literal) -> Ljava/lang/String; -> pick(String).
         g_r_cstr.store(s.pick(static_cast<const char*>("cstr")));
         g_echo_cstr_ok.store(overload_fixture::last_string() == std::string{ "cstr" });
+        // char* (NON-const) -> Ljava/lang/String; -> pick(String).  The matcher has
+        // a DISTINCT is_same_v<clean_type, char*> branch alongside const char*; a
+        // mutable C string buffer must resolve to the SAME String overload (and the
+        // value must round-trip), proving the non-const pointer is classified too.
+        {
+            char mutable_buf[]{ 'm', 'u', 't', '\0' };
+            g_r_mutable_cstr.store(s.pick(static_cast<char*>(mutable_buf)));
+        }
         // std::string_view -> Ljava/lang/String; -> pick(String).
         g_r_string_view.store(s.pick(std::string_view{ "sview" }));
         g_echo_string_view_ok.store(overload_fixture::last_string() == std::string{ "sview" });
@@ -600,9 +634,22 @@ namespace
         // plain char -> B (integral, sizeof 1) -> pick(byte) (NOT pick(char): Java
         // char is uint16 'C'; a 1-byte C++ char is a Java BYTE).
         g_r_plainchar.store(s.pick(static_cast<char>(7)));
+        // std::uint8_t -> B (integral, sizeof 1) -> pick(byte).  A NAMED 1-byte
+        // unsigned alias (distinct from unsigned char) must also land on (B)I; the
+        // value 0xFE stored in a Java byte slot is the SIGNED -2.
+        g_r_uint8.store(s.pick(static_cast<std::uint8_t>(0xFE)));
+        g_echo_uint8.store(overload_fixture::last_byte());
         // uint16_t -> C, NOT S — re-prove with a value whose low bits would also
         // satisfy a short slot, to show the matcher refuses the 'S' descriptor.
         g_r_uint16_as_char.store(s.pick(static_cast<std::uint16_t>(0x00FF)));
+        // UNSIGNED 4/8-byte integrals classify by sizeof, NOT by a signed alias:
+        // unsigned int (sizeof 4) -> I -> pick(int); unsigned long long (sizeof 8)
+        // -> J -> pick(long).  Each must land on the SAME overload as its signed
+        // sibling, and the value must round-trip through the int/long slot.
+        g_r_uint32.store(s.pick(static_cast<unsigned int>(123u)));
+        g_echo_uint32.store(overload_fixture::last_int());
+        g_r_uint64.store(s.pick(static_cast<unsigned long long>(9000000000ull)));  // > 2^32, needs J
+        g_echo_uint64.store(overload_fixture::last_long());
 
         // ===== char / byte / short BOUNDARY round-trips =======================
         // char 0x0000 and 0xFFFF must both resolve to pick(char) and round-trip
@@ -669,6 +716,20 @@ namespace
         g_r_long_double_boundary.store(s.pick2(std::numeric_limits<std::int64_t>::min(), 0.125));
         g_long_double_boundary_a.store(overload_fixture::last_arg2b());
         g_long_double_boundary_b_ok.store(overload_fixture::last_double() == 0.125 ? 1 : 0);
+
+        // pick(int,double) "(ID)I" — a NARROW slot0 (int) adjacent to a WIDE slot1
+        // (double).  Must select (ID)I, NOT (IJ)I (same slot0, int64 second) and NOT
+        // (JD)I (same slot1, long first).  Echo int -> lastArg2A, double ->
+        // lastDoubleArg; read immediately (later (DD)/(JD) calls reuse the slots).
+        g_r_int_double.store(s.pick2(static_cast<std::int32_t>(17), 2.5));
+        g_int_double_a.store(overload_fixture::last_arg2a());
+        g_int_double_b_ok.store(overload_fixture::last_double() == 2.5 ? 1 : 0);
+        // pick(double,int) "(DI)I" — the WIDE-then-NARROW order mirror.  Same
+        // {double,int} multiset as (ID)I but opposite slot order; must resolve
+        // distinctly.  The fixture echoes the int -> lastArg2A, double -> lastDoubleArg.
+        g_r_double_int.store(s.pick2(4.5, static_cast<std::int32_t>(19)));
+        g_double_int_a.store(overload_fixture::last_arg2a());
+        g_double_int_b_ok.store(overload_fixture::last_double() == 4.5 ? 1 : 0);
 
         // ===== same-type two-arg overloads: per-slot descriptor + slot survival =
         // pick(double,double) "(DD)I" — two wide FP slots; both must survive and
@@ -760,6 +821,11 @@ namespace
                                            std::string{ "y" }, static_cast<std::int32_t>(2)));
         g_sig_long_double.store(s.pick2_sig("(JD)I",
                                             static_cast<std::int64_t>(1), 2.0));
+        // pinned mixed narrow/wide ORDER sigs — each reaches exactly its overload.
+        g_sig_int_double.store(s.pick2_sig("(ID)I",
+                                           static_cast<std::int32_t>(1), 2.0));
+        g_sig_double_int.store(s.pick2_sig("(DI)I",
+                                           2.0, static_cast<std::int32_t>(1)));
         // 3-arg pinned sig.
         g_sig_int_int_int.store(s.get_method("pick", "(III)I")->call(
             static_cast<std::int32_t>(1), static_cast<std::int32_t>(2), static_cast<std::int32_t>(3)));
@@ -845,6 +911,16 @@ namespace
         // Writes lastDoubleArg — placed AFTER the double echo was already captured.
         g_s_long_double.store(overload_fixture::static_method("spick")->call(
             static_cast<std::int64_t>(77LL), 9.5));
+        // STATIC narrow-then-wide twin: spick(int,double) "(ID)I" by name — must be
+        // re-picked over spick(long,double) "(JD)I" and spick(int,int) "(II)I" on
+        // the historically-broken static path (resolution by per-slot descriptor).
+        g_s_int_double.store(overload_fixture::static_method("spick")->call(
+            static_cast<std::int32_t>(50), 6.5));
+        // STATIC no-arg twin: spick() "()I" by name — the static resolver must
+        // re-pick the ARITY-0 overload (object==nullptr path, fix #7), distinct from
+        // every arg-taking static.  A name-only static call with NO args used to fall
+        // back to whatever get_method() latched first by name; the fix re-picks ()I.
+        g_s_noarg.store(overload_fixture::static_method("spick")->call());
         // STATIC arity disambiguation: spick(int,int) by name, distinct from the
         // single-arg spick(int).
         g_s_arity2.store(overload_fixture::static_method("spick")->call(
@@ -891,6 +967,12 @@ namespace
             static_cast<std::int32_t>(1), static_cast<std::int32_t>(2)));
         g_s_sig_long_double.store(overload_fixture::static_method("spick", "(JD)I")->call(
             static_cast<std::int64_t>(1), 2.0));
+        // static pinned "()I" (no args) and "(ID)I" — both BYPASS resolution
+        // (signature_pinned), proving the no-arg and narrow/wide static overloads
+        // exist and dispatch on this JDK independent of the static-resolution path.
+        g_s_sig_noarg.store(overload_fixture::static_method("spick", "()I")->call());
+        g_s_sig_int_double.store(overload_fixture::static_method("spick", "(ID)I")->call(
+            static_cast<std::int32_t>(1), 2.0));
 
         // ===== ARRAY-vs-scalar resolution ==================================
         // (1) The mere PRESENCE of pick(int[]) / pick(long[]) in the methods array
@@ -1069,8 +1151,11 @@ namespace
         //  is_same_v), not by a fixed-width alias — each lands on the SAME
         //  overload as its sibling.  Distinct C++ types, identical descriptor.
         // =====================================================================
-        // String family: const char* and std::string_view both -> pick(String).
+        // String family: const char*, char* (non-const) and std::string_view all
+        // -> pick(String).  The matcher has separate is_same_v branches for const
+        // char* and char*, so the mutable-pointer case is a distinct classification.
         ctx.check("mo_cstr_resolves_to_string_overload",        g_r_cstr.load()        == RET_STRING);
+        ctx.check("mo_mutable_cstr_resolves_to_string_overload", g_r_mutable_cstr.load() == RET_STRING);
         ctx.check("mo_string_view_resolves_to_string_overload", g_r_string_view.load() == RET_STRING);
         ctx.check("mo_cstr_arg_value_echoed",        g_echo_cstr_ok.load());
         ctx.check("mo_string_view_arg_value_echoed", g_echo_string_view_ok.load());
@@ -1078,13 +1163,25 @@ namespace
         ctx.check("mo_char16_resolves_to_char_overload",     g_r_char16.load()        == RET_CHAR);
         ctx.check("mo_uint16_resolves_to_char_not_short",    g_r_uint16_as_char.load() == RET_CHAR);
         ctx.check("mo_char16_arg_value_echoed",              g_echo_char16.load()     == 0x0041);
-        // unsigned char / signed char / plain char all -> pick(byte) (sizeof 1).
+        // unsigned char / signed char / plain char / std::uint8_t all -> pick(byte)
+        // (every integral of sizeof 1, signed or unsigned, named or builtin).
         ctx.check("mo_unsigned_char_resolves_to_byte_overload", g_r_uchar.load()     == RET_BYTE);
         ctx.check("mo_signed_char_resolves_to_byte_overload",   g_r_schar.load()     == RET_BYTE);
         ctx.check("mo_plain_char_resolves_to_byte_overload",    g_r_plainchar.load() == RET_BYTE);
+        ctx.check("mo_uint8_resolves_to_byte_overload",         g_r_uint8.load()     == RET_BYTE);
         // unsigned char 0xFE stored in a Java byte slot is the SIGNED value -2.
         ctx.check("mo_unsigned_char_arg_value_echoed", g_echo_uchar.load() == -2);
         ctx.check("mo_signed_char_arg_value_echoed",   g_echo_schar.load() == -3);
+        // std::uint8_t 0xFE likewise sign-narrows to -2 in the Java byte slot.
+        ctx.check("mo_uint8_arg_value_echoed",         g_echo_uint8.load() == -2);
+        // unsigned 4/8-byte integrals classify by sizeof: unsigned int -> pick(int),
+        // unsigned long long -> pick(long).  Distinct C++ types, SAME overload as
+        // their signed siblings (the matcher keys on sizeof, not signedness/alias).
+        ctx.check("mo_uint32_resolves_to_int_overload",  g_r_uint32.load() == RET_INT);
+        ctx.check("mo_uint64_resolves_to_long_overload", g_r_uint64.load() == RET_LONG);
+        // and the values round-trip through the int/long slot (123, 9000000000).
+        ctx.check("mo_uint32_arg_value_echoed", g_echo_uint32.load() == 123);
+        ctx.check("mo_uint64_arg_value_echoed", g_echo_uint64.load() == 9000000000LL);
 
         // =====================================================================
         //  Argument-VALUE fidelity: the right value reached the right slot.
@@ -1183,6 +1280,25 @@ namespace
                   g_long_double_boundary_a.load() == std::numeric_limits<std::int64_t>::min()
                   && g_long_double_boundary_b_ok.load() == 1);
 
+        // mixed narrow/wide ORDER: pick(int,double) "(ID)I" vs pick(double,int)
+        // "(DI)I".  Each slot's descriptor (one narrow, one wide) is matched
+        // independently, so (ID)I is told from (IJ)I/(JD)I, and the order mirror
+        // (DI)I is told from (ID)I despite the identical {int,double} multiset.
+        ctx.check("mo_int_double_resolves_int_double", g_r_int_double.load() == RET_INT_DOUBLE);
+        ctx.check("mo_double_int_resolves_double_int", g_r_double_int.load() == RET_DOUBLE_INT);
+        ctx.check("mo_int_double_vs_double_int_distinct",
+                  g_r_int_double.load() != g_r_double_int.load());
+        // (ID)I must NOT collapse onto the adjacent (IJ)I or (JD)I overloads —
+        // it shares slot0 with (IJ)I and slot1 with (JD)I but matches neither.
+        ctx.check("mo_int_double_distinct_from_int_long_and_long_double",
+                  g_r_int_double.load() != g_r_int_long.load()
+                  && g_r_int_double.load() != g_r_long_double.load());
+        // both slots survived: int slot==17, double slot==2.5 / 4.5.
+        ctx.check("mo_int_double_arg_slots",
+                  g_int_double_a.load() == 17 && g_int_double_b_ok.load() == 1);
+        ctx.check("mo_double_int_arg_slots",
+                  g_double_int_a.load() == 19 && g_double_int_b_ok.load() == 1);
+
         // =====================================================================
         //  Same-type two-arg overloads: per-slot descriptor disambiguation and
         //  independent survival of the two same-width slots.
@@ -1278,6 +1394,16 @@ namespace
         ctx.check("mo_sig_int_string_resolves_int_string",   g_sig_int_string.load()  == RET_INT_STRING);
         ctx.check("mo_sig_string_int_resolves_string_int",   g_sig_string_int.load()  == RET_STRING_INT);
         ctx.check("mo_sig_long_double_resolves_long_double", g_sig_long_double.load() == RET_LONG_DOUBLE);
+        // pinned mixed narrow/wide ORDER sigs reach exactly (ID)I / (DI)I and the
+        // pinned path agrees with the name-only path on both.
+        ctx.check("mo_sig_int_double_resolves_int_double", g_sig_int_double.load() == RET_INT_DOUBLE);
+        ctx.check("mo_sig_double_int_resolves_double_int", g_sig_double_int.load() == RET_DOUBLE_INT);
+        ctx.check("mo_sig_int_double_vs_double_int_distinct",
+                  g_sig_int_double.load() != g_sig_double_int.load());
+        ctx.check("mo_sig_path_agrees_with_nameonly_int_double",
+                  g_sig_int_double.load() == g_r_int_double.load());
+        ctx.check("mo_sig_path_agrees_with_nameonly_double_int",
+                  g_sig_double_int.load() == g_r_double_int.load());
         ctx.check("mo_sig_int_long_vs_long_int_distinct",
                   g_sig_int_long.load() != g_sig_long_int.load());
         // fast path and name-only path must agree on the SAME overload — extended
@@ -1398,6 +1524,21 @@ namespace
         ctx.check("mo_static_long_double_distinct_from_long_and_double",
                   g_s_long_double.load() != g_s_long.load()
                   && g_s_long_double.load() != g_s_double.load());
+        // STATIC narrow-then-wide overload: spick(int,double) "(ID)I" selected by a
+        // (int32_t,double) static call on the historically-broken static path,
+        // distinct from spick(long,double) "(JD)I" and spick(int,int) "(II)I".
+        ctx.check("mo_static_int_double_resolves_int_double",
+                  g_s_int_double.load() == RET_INT_DOUBLE + SBIAS);
+        ctx.check("mo_static_int_double_distinct_from_long_double_and_int_int",
+                  g_s_int_double.load() != g_s_long_double.load()
+                  && g_s_int_double.load() != g_s_arity2.load());
+        // STATIC no-arg overload: spick() "()I" re-picked by an arg-less static call
+        // (the ARITY-0 case of the fix-#7 static resolver), distinct from every
+        // arg-taking static.  A KNOWN-broken-before-fix path: a name-only static
+        // call with zero args used to dispatch the first-by-name overload.
+        ctx.check("mo_static_noarg_resolves_noarg", g_s_noarg.load() == RET_NOARG + SBIAS);
+        ctx.check("mo_static_noarg_distinct_from_int_and_arity2",
+                  g_s_noarg.load() != g_s_int.load() && g_s_noarg.load() != g_s_arity2.load());
         // STATIC arity disambiguation: spick(int,int) is told from spick(int).
         ctx.check("mo_static_arity2_resolves_int_int", g_s_arity2.load() == RET_INT_INT + SBIAS);
         ctx.check("mo_static_arity1_vs_arity2_distinct",
@@ -1435,6 +1576,10 @@ namespace
         ctx.check("mo_static_sig_int_int_exact", g_s_sig_int_int.load() == RET_INT_INT + SBIAS);
         ctx.check("mo_static_sig_long_double_exact",
                   g_s_sig_long_double.load() == RET_LONG_DOUBLE + SBIAS);
+        // static pinned no-arg "()I" and narrow/wide "(ID)I" dispatch exactly
+        // (resolution bypassed) — the static methods EXIST and dispatch on this JDK.
+        ctx.check("mo_static_sig_noarg_exact",      g_s_sig_noarg.load()      == RET_NOARG + SBIAS);
+        ctx.check("mo_static_sig_int_double_exact", g_s_sig_int_double.load() == RET_INT_DOUBLE + SBIAS);
         // STATIC name-only agreement across the extended set (each name-only static
         // resolution lands on the SAME overload as its explicit-sig twin).
         ctx.check("mo_static_nameonly_agrees_with_sig_long",
@@ -1453,6 +1598,12 @@ namespace
                   g_s_arity2.load() == g_s_sig_int_int.load());
         ctx.check("mo_static_nameonly_agrees_with_sig_long_double",
                   g_s_long_double.load() == g_s_sig_long_double.load());
+        // the new static twins: name-only resolution agrees with the explicit-sig
+        // dispatch for the no-arg ()I and the narrow/wide (ID)I overloads.
+        ctx.check("mo_static_nameonly_agrees_with_sig_noarg",
+                  g_s_noarg.load() == g_s_sig_noarg.load());
+        ctx.check("mo_static_nameonly_agrees_with_sig_int_double",
+                  g_s_int_double.load() == g_s_sig_int_double.load());
 
         // STATIC ALTERNATE C++ TYPES by name — the static resolver classifies by
         // traits just like the instance one: const char* -> spick(String),

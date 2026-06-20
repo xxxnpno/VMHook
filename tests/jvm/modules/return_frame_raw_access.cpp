@@ -94,6 +94,20 @@ namespace
         static auto get_slf_tail_seen()    -> std::int32_t { std::int32_t v = static_field("slfTailSeen")->get();     return v; }
         static auto get_wide_rt_seen()     -> std::int64_t { std::int64_t v = static_field("wideRoundTripSeen")->get(); return v; }
 
+        // Deepening batch-20 observations.
+        static auto get_many5_seen()       -> std::int32_t { std::int32_t v = static_field("many5Seen")->get();       return v; }
+        static auto get_many8_seen()       -> std::int32_t { std::int32_t v = static_field("many8Seen")->get();       return v; }
+        static auto get_many_sum_seen()    -> std::int32_t { std::int32_t v = static_field("manySumSeen")->get();     return v; }
+        static auto get_smw_l0_seen()      -> std::int64_t { std::int64_t v = static_field("smwL0Seen")->get();       return v; }
+        static auto get_smw_d_bits_seen()  -> std::int64_t { std::int64_t v = static_field("smwDBitsSeen")->get();    return v; }
+        static auto get_smw_l1_seen()      -> std::int64_t { std::int64_t v = static_field("smwL1Seen")->get();       return v; }
+        static auto get_smw_t_seen()       -> std::int32_t { std::int32_t v = static_field("smwTSeen")->get();        return v; }
+        static auto get_wtn_l_seen()       -> std::int64_t { std::int64_t v = static_field("wtnLSeen")->get();        return v; }
+        static auto get_wtn_i_seen()       -> std::int32_t { std::int32_t v = static_field("wtnISeen")->get();        return v; }
+        static auto get_wtn_d_bits_seen()  -> std::int64_t { std::int64_t v = static_field("wtnDBitsSeen")->get();    return v; }
+        static auto get_wtn_tail_seen()    -> std::int32_t { std::int32_t v = static_field("wtnTailSeen")->get();     return v; }
+        static auto get_zero_rt_seen()     -> std::int32_t { std::int32_t v = static_field("zeroRtSeen")->get();      return v; }
+
         // The receiver's per-instance fingerprint, read THROUGH whatever oop the
         // test recovered from local slot 0.  Proves slot 0 is the real receiver.
         auto tag() const -> std::int32_t { std::int32_t v = get_field("tag")->get(); return v; }
@@ -136,6 +150,41 @@ namespace
 
     // Wide set_arg round-trip injected value.
     constexpr std::int64_t WIDE_RT_INJECT{ 0x0BADF00DDEADBEEFLL };
+
+    // Eight one-slot ints (this@0, args@1..8).
+    constexpr std::int32_t MANY_1{ 0x11111111 };
+    constexpr std::int32_t MANY_2{ 0x22222222 };
+    constexpr std::int32_t MANY_3{ 0x33333333 };
+    constexpr std::int32_t MANY_4{ 0x44444444 };
+    constexpr std::int32_t MANY_5{ 0x55555555 };
+    constexpr std::int32_t MANY_6{ 0x66666666 };
+    constexpr std::int32_t MANY_7{ 0x77777777 };
+    constexpr std::int32_t MANY_8{ 0x7EEEEEEE };
+    constexpr std::int32_t MANY_5_INJECT{ 0x0AB1CD05 };
+
+    // The JVM max_locals boundary: get_argument / set_arg reject index > 0xFFFF.
+    // The first rejected index is exactly 0x10000 (max_jvm_locals + 1) — the
+    // off-by-one boundary the existing 0x7FFFFFFF test does not pin.
+    constexpr std::int32_t MAX_JVM_LOCALS{ 0xFFFF };
+    constexpr std::int32_t FIRST_OOB_SLOT{ MAX_JVM_LOCALS + 1 };   // 0x10000
+
+    // Static three-wides-then-int.  The double bit pattern mirrors the Java
+    // Double.longBitsToDouble(0x4005BF0995AAF790L); compared by raw bits, never
+    // by value, so the exact decimal is irrelevant.
+    constexpr std::int64_t SMW_L0{ 0x0A0A0A0A0B0B0B0BLL };
+    constexpr std::int64_t SMW_D_BITS{ 0x4005BF0995AAF790LL };
+    constexpr std::int64_t SMW_L1{ 0x0C0C0C0C0D0D0D0DLL };
+    constexpr std::int32_t SMW_T{ 0x0E0E0E0E };
+
+    // Instance long,int,double,int interleave.  The double is 2*PI; compared by
+    // raw bits (0x400921FB54442D18) to stay exact.
+    constexpr std::int64_t WTN_L{ 0x1314151617181920LL };
+    constexpr std::int32_t WTN_I{ 0x21222324 };
+    constexpr std::int64_t WTN_D_BITS{ 0x400921FB54442D18LL };
+    constexpr std::int32_t WTN_TAIL{ 0x31323334 };
+
+    // Narrow set_arg zero injection.
+    constexpr std::int32_t ZERO_RT_INPUT{ 0x1357ACE0 };
 
     // ── Raw-slot read helpers (every deref gated by is_valid_pointer) ─────────
 
@@ -294,6 +343,44 @@ namespace
     std::atomic<bool>         g_wrt_set_arg_ok{ false };
     std::atomic<bool>         g_wrt_raw_readback_ok{ false };
 
+    // instanceManyLocals: eight one-slot ints deep into the array + boundary
+    // set_arg cases (in-range high slot writes; first-OOB index rejected).
+    std::atomic<std::int32_t> g_many_calls{ 0 };
+    std::atomic<bool>         g_many_frame_nonnull{ false };
+    std::atomic<bool>         g_many_locals_nonnull{ false };
+    std::atomic<bool>         g_many_self_ok{ false };
+    std::atomic<bool>         g_many_raw_all_ok{ false };    // every raw slot 1..8 (except 5) matches
+    std::atomic<bool>         g_many_typed_all_ok{ false };  // typed get_arguments<oop,8x int>
+    std::atomic<bool>         g_many_high_set_arg_ok{ false }; // set_arg(5, in-range) returned true
+    std::atomic<bool>         g_many_high_readback_ok{ false };// raw slot 5 == injected
+    std::atomic<bool>         g_many_first_oob_rejected{ false }; // set_arg(0x10000) rejected
+    std::atomic<bool>         g_many_last_inrange_accepts{ false }; // set_arg(0xFFFF) NOT index-rejected
+
+    // staticManyWide: three consecutive two-slot args (no this).
+    std::atomic<std::int32_t> g_smw_calls{ 0 };
+    std::atomic<bool>         g_smw_frame_nonnull{ false };
+    std::atomic<bool>         g_smw_locals_nonnull{ false };
+    std::atomic<bool>         g_smw_raw_l0_ok{ false };
+    std::atomic<bool>         g_smw_raw_d_ok{ false };
+    std::atomic<bool>         g_smw_raw_l1_ok{ false };
+    std::atomic<bool>         g_smw_raw_t_ok{ false };
+    std::atomic<bool>         g_smw_typed_ok{ false };
+
+    // instanceWideThenNarrow: long,int,double,int interleave (instance, this@0).
+    std::atomic<std::int32_t> g_wtn_calls{ 0 };
+    std::atomic<bool>         g_wtn_frame_nonnull{ false };
+    std::atomic<bool>         g_wtn_locals_nonnull{ false };
+    std::atomic<bool>         g_wtn_raw_l_ok{ false };
+    std::atomic<bool>         g_wtn_raw_i_ok{ false };
+    std::atomic<bool>         g_wtn_raw_d_ok{ false };
+    std::atomic<bool>         g_wtn_raw_tail_ok{ false };
+    std::atomic<bool>         g_wtn_typed_ok{ false };
+
+    // zeroRoundTrip: set_arg(1, 0) — the all-zero one-slot write path.
+    std::atomic<std::int32_t> g_zrt_calls{ 0 };
+    std::atomic<bool>         g_zrt_set_arg_ok{ false };
+    std::atomic<bool>         g_zrt_raw_readback_ok{ false };
+
     auto reset_observations() -> void
     {
         g_simple_calls.store(0);
@@ -383,6 +470,39 @@ namespace
         g_wrt_calls.store(0);
         g_wrt_set_arg_ok.store(false);
         g_wrt_raw_readback_ok.store(false);
+
+        g_many_calls.store(0);
+        g_many_frame_nonnull.store(false);
+        g_many_locals_nonnull.store(false);
+        g_many_self_ok.store(false);
+        g_many_raw_all_ok.store(false);
+        g_many_typed_all_ok.store(false);
+        g_many_high_set_arg_ok.store(false);
+        g_many_high_readback_ok.store(false);
+        g_many_first_oob_rejected.store(false);
+        g_many_last_inrange_accepts.store(false);
+
+        g_smw_calls.store(0);
+        g_smw_frame_nonnull.store(false);
+        g_smw_locals_nonnull.store(false);
+        g_smw_raw_l0_ok.store(false);
+        g_smw_raw_d_ok.store(false);
+        g_smw_raw_l1_ok.store(false);
+        g_smw_raw_t_ok.store(false);
+        g_smw_typed_ok.store(false);
+
+        g_wtn_calls.store(0);
+        g_wtn_frame_nonnull.store(false);
+        g_wtn_locals_nonnull.store(false);
+        g_wtn_raw_l_ok.store(false);
+        g_wtn_raw_i_ok.store(false);
+        g_wtn_raw_d_ok.store(false);
+        g_wtn_raw_tail_ok.store(false);
+        g_wtn_typed_ok.store(false);
+
+        g_zrt_calls.store(0);
+        g_zrt_set_arg_ok.store(false);
+        g_zrt_raw_readback_ok.store(false);
     }
 }
 
@@ -1054,6 +1174,311 @@ VMHOOK_JVM_MODULE(return_frame_raw_access)
             }) };
         ctx.check("frame_wide_round_trip_hook_installed", h_wrt.installed());
 
+        // ── instanceManyLocals(8x int): deep one-slot walk + set_arg bounds ─
+        auto h_many{ vmhook::scoped_hook<frame_raw_fixture>(
+            "instanceManyLocals", "(IIIIIIII)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<frame_raw_fixture>& self,
+               std::int32_t /*a1*/, std::int32_t /*a2*/, std::int32_t /*a3*/,
+               std::int32_t /*a4*/, std::int32_t /*a5*/, std::int32_t /*a6*/,
+               std::int32_t /*a7*/, std::int32_t /*a8*/)
+            {
+                g_many_calls.fetch_add(1, std::memory_order_relaxed);
+
+                vmhook::hotspot::frame* const fr{ ret.frame() };
+                if (fr == nullptr || !vmhook::hotspot::is_valid_pointer(fr))
+                {
+                    return;
+                }
+                g_many_frame_nonnull.store(true, std::memory_order_relaxed);
+
+                void** const locals{ fr->get_locals() };
+                if (locals == nullptr)
+                {
+                    return;
+                }
+                g_many_locals_nonnull.store(true, std::memory_order_relaxed);
+
+                // this @ slot 0.
+                void* const slot0_oop{ decode_slot_oop(locals, 0) };
+                if (slot0_oop != nullptr && self != nullptr)
+                {
+                    g_many_self_ok.store(slot0_oop == self->get_instance(),
+                                         std::memory_order_relaxed);
+                }
+
+                // Eight one-slot ints at consecutive base slots 1..8 (no gaps).
+                // Slot 5 is excluded from the all-match aggregate because the
+                // set_arg(5, ...) below mutates it; it is verified separately by
+                // the high-slot readback.
+                const std::int32_t expect[]{
+                    MANY_1, MANY_2, MANY_3, MANY_4,
+                    MANY_5, MANY_6, MANY_7, MANY_8 };
+                bool all_ok{ true };
+                for (std::int32_t base = 1; base <= 8; ++base)
+                {
+                    if (base == 5)
+                    {
+                        continue;
+                    }
+                    std::uint64_t bits{ 0 };
+                    if (read_raw_slot(locals, base, bits))
+                    {
+                        if (static_cast<std::int32_t>(bits) != expect[base - 1])
+                        {
+                            all_ok = false;
+                        }
+                    }
+                    else
+                    {
+                        all_ok = false;
+                    }
+                }
+                g_many_raw_all_ok.store(all_ok, std::memory_order_relaxed);
+
+                // Typed cross-check: nine consecutive one-slot reads (oop + 8 int),
+                // each at its own base slot.  No long/double, so no accumulator
+                // shift — the receiver must still be the FIRST template parameter.
+                {
+                    auto t = fr->get_arguments<vmhook::oop_t,
+                                               std::int32_t, std::int32_t, std::int32_t,
+                                               std::int32_t, std::int32_t, std::int32_t,
+                                               std::int32_t, std::int32_t>();
+                    const bool typed_ok{
+                        std::get<1>(t) == MANY_1 && std::get<2>(t) == MANY_2 &&
+                        std::get<3>(t) == MANY_3 && std::get<4>(t) == MANY_4 &&
+                        std::get<6>(t) == MANY_6 && std::get<7>(t) == MANY_7 &&
+                        std::get<8>(t) == MANY_8 };
+                    g_many_typed_all_ok.store(typed_ok, std::memory_order_relaxed);
+                }
+
+                // set_arg at a HIGH but IN-RANGE logical slot (5).  This is a real
+                // local of this 8-arg method, so the write must succeed and the raw
+                // readback of locals[-5] must see the injected value — proving the
+                // bounds guard accepts high-but-valid indices, not just slot 0/1.
+                {
+                    const bool set_ok{ ret.set_arg(5, MANY_5_INJECT) };
+                    g_many_high_set_arg_ok.store(set_ok, std::memory_order_relaxed);
+                    std::uint64_t bits{ 0 };
+                    if (read_raw_slot(locals, 5, bits))
+                    {
+                        g_many_high_readback_ok.store(
+                            static_cast<std::int32_t>(bits) == MANY_5_INJECT,
+                            std::memory_order_relaxed);
+                    }
+                }
+
+                // Bounds off-by-one: the FIRST out-of-range index is exactly
+                // max_jvm_locals + 1 (0x10000).  set_arg shares get_argument's
+                // `index > 0xFFFF` guard, so this must be rejected (return false,
+                // no write, no crash) — the precise boundary the existing
+                // 0x7FFFFFFF test steps far past.
+                {
+                    const bool rejected{ !ret.set_arg(FIRST_OOB_SLOT,
+                                                      static_cast<std::int32_t>(0xBADBAD)) };
+                    g_many_first_oob_rejected.store(rejected, std::memory_order_relaxed);
+                }
+
+                // The LAST in-range index (0xFFFF) is NOT rejected by the index
+                // guard.  It is far past this method's real locals, so the write
+                // targets an out-of-bounds address that write_slot's
+                // is_readable_pointer / safe_write may legitimately refuse — hence
+                // the RESULT is platform-variant and NOT asserted.  The contract
+                // under test is only that the index guard itself does not reject
+                // 0xFFFF the way it rejects 0x10000, AND that the call does not
+                // crash.  We characterise the actual result via [INFO] below.
+                {
+                    const bool wrote{ ret.set_arg(MAX_JVM_LOCALS,
+                                                  static_cast<std::int32_t>(0)) };
+                    // "accepts" here means: reaching this line crash-free.  Whether
+                    // the underlying write succeeded is recorded, not asserted.
+                    g_many_last_inrange_accepts.store(true, std::memory_order_relaxed);
+                    (void)wrote;
+                }
+            }) };
+        ctx.check("frame_many_hook_installed", h_many.installed());
+
+        // ── staticManyWide(long,double,long,int): three two-slot args, no this ─
+        auto h_smw{ vmhook::scoped_hook<frame_raw_fixture>(
+            "staticManyWide", "(JDJI)J",
+            [](vmhook::return_value& ret,
+               std::int64_t /*l0*/, double /*d*/, std::int64_t /*l1*/, std::int32_t /*tail*/)
+            {
+                g_smw_calls.fetch_add(1, std::memory_order_relaxed);
+
+                vmhook::hotspot::frame* const fr{ ret.frame() };
+                if (fr == nullptr || !vmhook::hotspot::is_valid_pointer(fr))
+                {
+                    return;
+                }
+                g_smw_frame_nonnull.store(true, std::memory_order_relaxed);
+
+                void** const locals{ fr->get_locals() };
+                if (locals == nullptr)
+                {
+                    return;
+                }
+                g_smw_locals_nonnull.store(true, std::memory_order_relaxed);
+
+                // NO this.  Three consecutive two-slot args then a tail int:
+                //   l0 (long)   @ base slot 0 -> value@-(0+1) = locals[-1]
+                //   d  (double) @ base slot 2 -> value@-(2+1) = locals[-3]
+                //   l1 (long)   @ base slot 4 -> value@-(4+1) = locals[-5]
+                //   tail (int)  @ base slot 6 -> locals[-6]
+                {
+                    std::uint64_t bits{ 0 };
+                    if (read_raw_slot(locals, 1, bits))
+                    {
+                        g_smw_raw_l0_ok.store(static_cast<std::int64_t>(bits) == SMW_L0,
+                                              std::memory_order_relaxed);
+                    }
+                }
+                {
+                    std::uint64_t bits{ 0 };
+                    if (read_raw_slot(locals, 3, bits))
+                    {
+                        g_smw_raw_d_ok.store(static_cast<std::int64_t>(bits) == SMW_D_BITS,
+                                             std::memory_order_relaxed);
+                    }
+                }
+                {
+                    std::uint64_t bits{ 0 };
+                    if (read_raw_slot(locals, 5, bits))
+                    {
+                        g_smw_raw_l1_ok.store(static_cast<std::int64_t>(bits) == SMW_L1,
+                                              std::memory_order_relaxed);
+                    }
+                }
+                {
+                    std::uint64_t bits{ 0 };
+                    if (read_raw_slot(locals, 6, bits))
+                    {
+                        g_smw_raw_t_ok.store(static_cast<std::int32_t>(bits) == SMW_T,
+                                             std::memory_order_relaxed);
+                    }
+                }
+
+                // Typed cross-check: NO this -> long@0, double@2, long@4, int@6,
+                // the accumulator advancing +2 per wide from slot 0.
+                {
+                    auto [l0, d, l1, tail] =
+                        fr->get_arguments<std::int64_t, double, std::int64_t, std::int32_t>();
+                    std::int64_t d_bits{ 0 };
+                    std::memcpy(&d_bits, &d, sizeof(d_bits));
+                    g_smw_typed_ok.store(
+                        l0 == SMW_L0 && d_bits == SMW_D_BITS && l1 == SMW_L1 && tail == SMW_T,
+                        std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("frame_static_many_wide_hook_installed", h_smw.installed());
+
+        // ── instanceWideThenNarrow(long,int,double,int): interleave ─────────
+        auto h_wtn{ vmhook::scoped_hook<frame_raw_fixture>(
+            "instanceWideThenNarrow", "(JIDI)J",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<frame_raw_fixture>& /*self*/,
+               std::int64_t /*l*/, std::int32_t /*i*/, double /*d*/, std::int32_t /*tail*/)
+            {
+                g_wtn_calls.fetch_add(1, std::memory_order_relaxed);
+
+                vmhook::hotspot::frame* const fr{ ret.frame() };
+                if (fr == nullptr || !vmhook::hotspot::is_valid_pointer(fr))
+                {
+                    return;
+                }
+                g_wtn_frame_nonnull.store(true, std::memory_order_relaxed);
+
+                void** const locals{ fr->get_locals() };
+                if (locals == nullptr)
+                {
+                    return;
+                }
+                g_wtn_locals_nonnull.store(true, std::memory_order_relaxed);
+
+                // this@0, then: l (long) @ base slot 1 -> value@-2; i (int) @ slot
+                // 3; d (double) @ base slot 4 -> value@-5; tail (int) @ slot 6.
+                {
+                    std::uint64_t bits{ 0 };
+                    if (read_raw_slot(locals, 2, bits))
+                    {
+                        g_wtn_raw_l_ok.store(static_cast<std::int64_t>(bits) == WTN_L,
+                                             std::memory_order_relaxed);
+                    }
+                }
+                {
+                    std::uint64_t bits{ 0 };
+                    if (read_raw_slot(locals, 3, bits))
+                    {
+                        g_wtn_raw_i_ok.store(static_cast<std::int32_t>(bits) == WTN_I,
+                                             std::memory_order_relaxed);
+                    }
+                }
+                {
+                    std::uint64_t bits{ 0 };
+                    if (read_raw_slot(locals, 5, bits))
+                    {
+                        g_wtn_raw_d_ok.store(static_cast<std::int64_t>(bits) == WTN_D_BITS,
+                                             std::memory_order_relaxed);
+                    }
+                }
+                {
+                    std::uint64_t bits{ 0 };
+                    if (read_raw_slot(locals, 6, bits))
+                    {
+                        g_wtn_raw_tail_ok.store(static_cast<std::int32_t>(bits) == WTN_TAIL,
+                                                std::memory_order_relaxed);
+                    }
+                }
+
+                // Typed cross-check: this(oop)@0, long@1(+2), int@3, double@4(+2),
+                // int@6 — the accumulator must shift correctly across BOTH wides
+                // with a narrow int sandwiched between them.
+                {
+                    auto [self_unused, l, i, d, tail] =
+                        fr->get_arguments<vmhook::oop_t, std::int64_t, std::int32_t,
+                                          double, std::int32_t>();
+                    (void)self_unused;
+                    std::int64_t d_bits{ 0 };
+                    std::memcpy(&d_bits, &d, sizeof(d_bits));
+                    g_wtn_typed_ok.store(
+                        l == WTN_L && i == WTN_I && d_bits == WTN_D_BITS && tail == WTN_TAIL,
+                        std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("frame_wide_then_narrow_hook_installed", h_wtn.installed());
+
+        // ── zeroRoundTrip(int): set_arg(1, 0) — the all-zero one-slot write ──
+        auto h_zrt{ vmhook::scoped_hook<frame_raw_fixture>(
+            "zeroRoundTrip", "(I)I",
+            [](vmhook::return_value& ret,
+               const std::unique_ptr<frame_raw_fixture>& /*self*/,
+               std::int32_t /*value*/)
+            {
+                g_zrt_calls.fetch_add(1, std::memory_order_relaxed);
+
+                // Inject 0 into a slot whose original value (ZERO_RT_INPUT) is
+                // non-zero, so a dropped write is detectable both raw and via the
+                // body echo.  This is the all-zero-slot write the store path's
+                // comment flags as a historical corruption class.
+                const bool set_ok{ ret.set_arg(1, static_cast<std::int32_t>(0)) };
+                g_zrt_set_arg_ok.store(set_ok, std::memory_order_relaxed);
+
+                vmhook::hotspot::frame* const fr{ ret.frame() };
+                if (fr == nullptr || !vmhook::hotspot::is_valid_pointer(fr))
+                {
+                    return;
+                }
+                void** const locals{ fr->get_locals() };
+                std::uint64_t bits{ 0 };
+                if (read_raw_slot(locals, 1, bits))
+                {
+                    g_zrt_raw_readback_ok.store(
+                        static_cast<std::int32_t>(bits) == 0,
+                        std::memory_order_relaxed);
+                }
+            }) };
+        ctx.check("frame_zero_round_trip_hook_installed", h_zrt.installed());
+
         // ── Drive every method once (one real bytecode dispatch each) ───────
         const bool done{ ctx.run_probe(
             [](bool value) { frame_raw_fixture::set_go(value); },
@@ -1252,6 +1677,98 @@ VMHOOK_JVM_MODULE(return_frame_raw_access)
         ctx.check("frame_wide_round_trip_body_saw_injected",
                   frame_raw_fixture::get_wide_rt_seen() == WIDE_RT_INJECT);
 
+        // ═════════════════════ instanceManyLocals assertions ════════════════
+        ctx.check("frame_many_hook_fired", g_many_calls.load() == 1);
+        ctx.check("frame_many_frame_nonnull", g_many_frame_nonnull.load());
+        ctx.check("frame_many_get_locals_nonnull", g_many_locals_nonnull.load());
+        ctx.check("frame_many_slot0_oop_is_receiver", g_many_self_ok.load());
+        // Eight one-slot ints walked at consecutive base slots 1..8 (slot 5
+        // excluded — mutated below).  Deep no-gap one-slot indexing.
+        ctx.check("frame_many_raw_all_one_slot_ints_match", g_many_raw_all_ok.load());
+        ctx.check("frame_many_typed_nine_consecutive_slots", g_many_typed_all_ok.load());
+        // set_arg at a HIGH but IN-RANGE logical slot (5) succeeds and the raw
+        // readback of locals[-5] sees the injected value: the bounds guard accepts
+        // high-but-valid indices, not just slot 0/1.
+        ctx.check("frame_many_high_slot_set_arg_succeeded", g_many_high_set_arg_ok.load());
+        if (g_many_high_set_arg_ok.load())
+        {
+            ctx.check("frame_many_high_slot_raw_readback_sees_injected",
+                      g_many_high_readback_ok.load());
+            // Allow-through: the body's slot-5 echo is the injected value.
+            ctx.check("frame_many_body_saw_injected_m5",
+                      frame_raw_fixture::get_many5_seen() == MANY_5_INJECT);
+        }
+        else
+        {
+            ctx.record("[INFO] return_frame_raw_access: set_arg(5,...) on instanceManyLocals "
+                       "did not land on this run (cold/relocated frame -> safe no-op); "
+                       "high-slot readback and body echo gated.");
+        }
+        // Bounds off-by-one: 0x10000 (max_jvm_locals+1) is the FIRST rejected
+        // index — the precise boundary the 0x7FFFFFFF test steps far past.  HARD:
+        // the index guard is a fixed compile-time constant, not frame-dependent.
+        ctx.check("frame_many_first_oob_index_0x10000_rejected", g_many_first_oob_rejected.load());
+        // 0xFFFF is the LAST in-range index: the index guard does NOT reject it
+        // (only the address-level write may refuse).  HARD: reaching here proves
+        // the in-range path ran crash-free; the write RESULT is platform-variant.
+        ctx.check("frame_many_last_inrange_index_0xFFFF_no_crash", g_many_last_inrange_accepts.load());
+        // Allow-through on the un-mutated deep slots (XOR excludes slot 5).
+        ctx.check("frame_many_body_saw_m8", frame_raw_fixture::get_many8_seen() == MANY_8);
+        ctx.check("frame_many_body_xor_excluding_m5",
+                  frame_raw_fixture::get_many_sum_seen() ==
+                      (MANY_1 ^ MANY_2 ^ MANY_3 ^ MANY_4 ^ MANY_6 ^ MANY_7 ^ MANY_8));
+
+        // ═════════════════════ staticManyWide assertions ════════════════════
+        ctx.check("frame_smw_hook_fired", g_smw_calls.load() == 1);
+        ctx.check("frame_smw_frame_nonnull", g_smw_frame_nonnull.load());
+        ctx.check("frame_smw_get_locals_nonnull", g_smw_locals_nonnull.load());
+        // NO this: three consecutive two-slot args from slot 0, then a tail int.
+        ctx.check("frame_smw_raw_long0_value_at_slot0", g_smw_raw_l0_ok.load());
+        ctx.check("frame_smw_raw_double_value_at_slot2", g_smw_raw_d_ok.load());
+        ctx.check("frame_smw_raw_long1_value_at_slot4", g_smw_raw_l1_ok.load());
+        ctx.check("frame_smw_raw_tail_int_at_slot6", g_smw_raw_t_ok.load());
+        ctx.check("frame_smw_typed_three_wides_then_int", g_smw_typed_ok.load());
+        // Allow-through.
+        ctx.check("frame_smw_body_saw_l0", frame_raw_fixture::get_smw_l0_seen() == SMW_L0);
+        ctx.check("frame_smw_body_saw_d_bits", frame_raw_fixture::get_smw_d_bits_seen() == SMW_D_BITS);
+        ctx.check("frame_smw_body_saw_l1", frame_raw_fixture::get_smw_l1_seen() == SMW_L1);
+        ctx.check("frame_smw_body_saw_tail", frame_raw_fixture::get_smw_t_seen() == SMW_T);
+
+        // ═════════════════════ instanceWideThenNarrow assertions ════════════
+        ctx.check("frame_wtn_hook_fired", g_wtn_calls.load() == 1);
+        ctx.check("frame_wtn_frame_nonnull", g_wtn_frame_nonnull.load());
+        ctx.check("frame_wtn_get_locals_nonnull", g_wtn_locals_nonnull.load());
+        // long,int,double,int interleave (this@0): the accumulator must shift
+        // correctly across BOTH wides with a narrow int sandwiched between them.
+        ctx.check("frame_wtn_raw_long_value_at_lower_slot", g_wtn_raw_l_ok.load());
+        ctx.check("frame_wtn_raw_int_between_wides_slot3", g_wtn_raw_i_ok.load());
+        ctx.check("frame_wtn_raw_double_value_at_lower_slot", g_wtn_raw_d_ok.load());
+        ctx.check("frame_wtn_raw_tail_int_after_two_wides", g_wtn_raw_tail_ok.load());
+        ctx.check("frame_wtn_typed_interleaved_slot_model", g_wtn_typed_ok.load());
+        // Allow-through.
+        ctx.check("frame_wtn_body_saw_l", frame_raw_fixture::get_wtn_l_seen() == WTN_L);
+        ctx.check("frame_wtn_body_saw_i", frame_raw_fixture::get_wtn_i_seen() == WTN_I);
+        ctx.check("frame_wtn_body_saw_d_bits", frame_raw_fixture::get_wtn_d_bits_seen() == WTN_D_BITS);
+        ctx.check("frame_wtn_body_saw_tail", frame_raw_fixture::get_wtn_tail_seen() == WTN_TAIL);
+
+        // ═════════════════════ zeroRoundTrip assertions ═════════════════════
+        ctx.check("frame_zero_round_trip_hook_fired", g_zrt_calls.load() == 1);
+        ctx.check("frame_zero_round_trip_set_arg_returned_true", g_zrt_set_arg_ok.load());
+        if (g_zrt_set_arg_ok.load())
+        {
+            // The all-zero one-slot write landed: raw readback of locals[-1] is 0.
+            ctx.check("frame_zero_round_trip_raw_readback_is_zero", g_zrt_raw_readback_ok.load());
+            // And the body observed 0 (a zero write is neither dropped nor a no-op).
+            ctx.check("frame_zero_round_trip_body_saw_zero",
+                      frame_raw_fixture::get_zero_rt_seen() == 0);
+        }
+        else
+        {
+            ctx.record("[INFO] return_frame_raw_access: set_arg(1, 0) on zeroRoundTrip did not "
+                       "land on this run (cold/relocated frame -> safe no-op); zero-write "
+                       "readback and body echo gated.");
+        }
+
         // ── INFO: surface the live raw-frame state for the run log ──────────
         {
             std::ostringstream oss;
@@ -1264,7 +1781,27 @@ VMHOOK_JVM_MODULE(return_frame_raw_access)
                 << "; slot0==receiver(simple)="
                 << (g_simple_slot0_oop_matches_self.load() ? "yes" : "no")
                 << "; static-slot0-has-no-this="
-                << (g_static_slot0_is_first_int.load() ? "yes" : "no") << ".";
+                << (g_static_slot0_is_first_int.load() ? "yes" : "no")
+                << "; many-locals deep one-slot walk="
+                << (g_many_raw_all_ok.load() ? "yes" : "no")
+                << "; static three-wides="
+                << (g_smw_typed_ok.load() ? "yes" : "no")
+                << "; wide/narrow interleave="
+                << (g_wtn_typed_ok.load() ? "yes" : "no") << ".";
+            ctx.record(oss.str());
+        }
+
+        // INFO: characterise the platform-variant high-index write outcomes that
+        // are deliberately NOT asserted (only the index-guard boundary is HARD).
+        {
+            std::ostringstream oss;
+            oss << "[INFO] return_frame_raw_access bounds boundary: set_arg(0x10000) "
+                << "rejected=" << (g_many_first_oob_rejected.load() ? "yes" : "no")
+                << " (HARD); set_arg(0xFFFF) ran crash-free="
+                << (g_many_last_inrange_accepts.load() ? "yes" : "no")
+                << " (the write itself targets an out-of-bounds address whose "
+                   "is_readable_pointer/safe_write result is platform-variant and "
+                   "intentionally unasserted).";
             ctx.record(oss.str());
         }
     }
