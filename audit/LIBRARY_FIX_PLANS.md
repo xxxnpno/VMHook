@@ -10,7 +10,7 @@ Source-verified fix-plans from the 10-agent investigation wave (2026-06-20), one
 - **Test:** `field_arrays_primitive.cpp` — write wide-into-narrow → array + neighbor-sentinel unchanged (refused); matching-width still round-trips.
 - **Risk:** none on matching-width (guard false); only refuses the corrupting case. noexcept preserved.
 
-### 2. for_each_thread raw derefs — HIGH (#28 cold-fault, JVM-killing)
+### 2. for_each_thread raw derefs — HIGH (#28 cold-fault, JVM-killing) — DONE (9dcc6f2, full matrix green)
 - **Bug:** thread enumeration raw-derefs JavaThread/thread-list fields (sites 4761, 4804/4814, 4937, 8486-8506) gated only by `is_valid_pointer` (heuristic), on no-SEH legs (mingw/clang-cl) → AV tears down the JVM. for_each_instance routes all such reads through `safe_read`/`safe_read_pointer`.
 - **Fix:** 4 patches — replace each `*reinterpret_cast<T*>(addr)` with `safe_read_pointer`/`os::safe_read` into a local, keep the `is_valid_pointer` gate, ADD the missing `threads_array` is_valid_pointer gate at 8506 (the twin at 4998 has it). Also sweep get_thread_state/get_suspend_flags (4660-4720).
 - **Test:** `for_each_thread.cpp` non-regression on mingw×8-26 (warm path byte-identical; safe_read returns same bytes for mapped slots).
@@ -54,7 +54,7 @@ Source-verified fix-plans from the 10-agent investigation wave (2026-06-20), one
 - **Test:** method_entry_points_i2i_i2c already pins it (scenario 8 `null_bad_method_get_access_flags_did_not_crash`, characterized [INFO]); flip to HARD-returns-null after the fix.
 - **Risk:** nil.
 
-### 13. klass::find_field unbounded constant-pool index read — MEDIUM (AV hazard) — found batch-21
+### 13. klass::find_field unbounded constant-pool index read — MEDIUM (AV hazard) — DONE (084764c; shared resolve_constant_pool_symbol helper, find_field_in_stream +cp_length param)
 - **Bug:** `klass::find_field` (vmhook.hpp:4070, :4090) reads `constant_pool_base[name_index]` / `[sig_index]` (u2 indices from class metadata) with NO length bound and NO `is_readable_pointer(&base[index])` probe — straight to `is_valid_pointer(value)` which DEREFS the slot word before validating. This is the field-path twin of the method-path FIX-B that already closed exactly this (`:2483-2505` / `:2560-2582`); left open for fields. Secondary: the `data[field_slot_index*6 + k]` walk (:4062-4079) is bounded only by `array_length/6`, never against the Array<u2> page extent. Also get_length() (:2379) reads `_length` after only is_valid_pointer(this), no is_readable_pointer — fault-safety rests entirely on os::safe_read.
 - **Fix:** mirror the method-path FIX-B: bound the CP index against the pool length + route the slot read through os::safe_read / is_readable_pointer before the is_valid_pointer deref.
 - **Test:** const_method_bounds (no-JVM) pins the bound invariants; add a field-path negative.
