@@ -2732,9 +2732,15 @@ namespace vmhook
 
                 try
                 {
-                    if (!entry)
+                    // Guard `this` before computing this+offset, mirroring every sibling
+                    // accessor (get_flags 2948, get_i2i_entry, get_code, get_adapter, ...).
+                    // Without it, a stale/aliased Method* (the verify_hooks Mode-3 path)
+                    // returns a non-null WILD this+offset pointer instead of nullptr, and a
+                    // caller that derefs it faults UNCONTAINED on a no-SEH toolchain.
+                    if (!entry || !vmhook::hotspot::is_valid_pointer(this))
                     {
-                        throw vmhook::exception{ "Failed to find Method._access_flags entry." };
+                        throw vmhook::exception{ "Method._access_flags entry missing, or this is a "
+                                                 "stale/invalid Method* (is_valid_pointer failed)." };
                     }
 
                     return reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);

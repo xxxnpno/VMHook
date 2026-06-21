@@ -1042,20 +1042,12 @@ VMHOOK_JVM_MODULE(method_entry_points_i2i_i2c)
         // pointer -- never a wild address the watchdog's set_dont_inline() would
         // then WRITE to.  HARD.
         ctx.check("null_bad_method_get_flags_returns_null", bad->get_flags() == nullptr);
-        // get_access_flags() does NOT guard `this` (it only checks the VMStruct
-        // entry, vmhook.hpp:2728-2747): on a JDK that exports _access_flags it
-        // returns this+offset = a NON-null WILD pointer for a 0x1 Method*.  The
-        // call itself does not crash (it only computes an address, never derefs),
-        // which is the universal we assert; the wild-pointer return is the
-        // characterised hazard (a caller that DEREFERENCED it would fault -- but
-        // every real caller validates the Method* first).  We must NOT deref it.
+        // get_access_flags() now guards `this` with is_valid_pointer (library #12,
+        // vmhook.hpp:2731-2740), mirroring get_flags above: on the 0x1 bad Method*
+        // is_valid_pointer fails so it returns nullptr -- no WILD this+offset pointer
+        // for a caller to dereference and fault on.
         std::uint32_t* const bad_af{ bad->get_access_flags() };
-        ctx.check("null_bad_method_get_access_flags_did_not_crash", true);
-        ctx.record(std::string{ "[INFO] method_entry_points_i2i_i2c scenario 8: get_access_flags() on a "
-                   "0x1 Method* returned " } + (bad_af == nullptr ? "null (VMStruct not exported, or a "
-                   "future guard added)" : "a NON-null WILD pointer (no is_valid_pointer(this) guard -- "
-                   "vmhook.hpp:2728-2747; safe only because the address is never dereferenced here)")
-                   + "; the call did not crash.");
+        ctx.check("null_bad_method_get_access_flags_returns_null", bad_af == nullptr);
         // The setters on a bad Method* are silent no-ops (no crash); reaching the
         // assert after calling all three is the proof.
         bad->set_from_interpreted_entry(nullptr);

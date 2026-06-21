@@ -47,7 +47,7 @@ Source-verified fix-plans from the 10-agent investigation wave (2026-06-20), one
 - **Test:** the two reads are currently GATED [INFO] in field_inherited.cpp (resolution/signature/is_reference kept HARD). The fix flips the two value reads back to HARD `== "iface-const"` / `== "base-static-str"`.
 - **Risk:** unknown until root-caused — investigate FIRST; the read path is shared with the working direct-class + primitive cases, so a fix must not regress those. Add a field_static interface/grandparent reference-static cell to lock it.
 
-### 12. method::get_access_flags missing is_valid_pointer(this) guard — LOW (clean, additive) — found batch-21
+### 12. method::get_access_flags missing is_valid_pointer(this) guard — LOW — DONE (a5cbd74+)
 - **Bug:** `method::get_access_flags()` (vmhook.hpp:2728-2747) is the ONLY accessor in the entry cluster that does NOT guard `this` before computing `this + offset` — every sibling does: `get_i2i_entry` (2660), `get_from_interpreted_entry`/`get_from_compiled_entry` (3243), `get_code` (3129), `get_adapter` (3326), `get_flags` (2948) all `if (!entry || !is_valid_pointer(this)) return nullptr/0;`. On a freed/aliased Method* (the verify_hooks mode-3 path) it returns a non-null WILD `this+offset` pointer; a caller that derefs the returned `uint32*` faults uncontained on no-SEH.
 - **Fix:** add `if (!entry || !vmhook::hotspot::is_valid_pointer(this)) return nullptr;` at the top of get_access_flags, mirroring get_flags (2948). Trivial, additive, can't regress the warm path.
 - **Test:** method_entry_points_i2i_i2c already pins it (scenario 8 `null_bad_method_get_access_flags_did_not_crash`, characterized [INFO]); flip to HARD-returns-null after the fix.
