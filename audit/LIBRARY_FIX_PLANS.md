@@ -22,13 +22,14 @@ Source-verified fix-plans from the 10-agent investigation wave (2026-06-20), one
 - **Test:** `method_call_jni_fallback.cpp` + fixture — `int combo(int)` / `String combo(String)`, call both through ONE held proxy, both orders. Pre-fix the 2nd call returns wrong type.
 - **Risk:** ~nil — first/same-overload path unchanged (one string compare); signature-pinned proxies stable.
 
-### 4. static primitive set() stale field pointer post-GC — HIGH
+### 4. static primitive set() stale field pointer post-GC — HIGH — ATTEMPT-1 REVERTED (do NOT use safe_write on the set() hot path)
+- **ATTEMPT 1 (reverted 2026-06-21):** routed the 3 set() stores through a resolve_write_pointer() helper + `os::safe_write`. On Windows os::safe_write is `WriteProcessMemory` (a SYSCALL, not memcpy); on the HOT per-field-write path it CRASHED the suite on mingw java11/17/21/24 (java8 passed) — a cascading heap crash surfacing in for_each_instance / hook_chaining (no TOTAL line). Likely the GC card-table / write-barrier / page-protection interaction of WriteProcessMemory writing into a GC-managed heap field. LESSON: the set() write path is hot + GC-managed — do NOT WriteProcessMemory it. RETRY APPROACH: keep the re-resolve (resolve_write_pointer, GC-stable mirror) but write with plain memcpy (the re-resolve alone gives the stale-mirror safety; safe_write's fault-tolerance is what crashed). Validate re-resolve-only on mingw×11+ FIRST. Lower priority — narrow benefit (static write racing a mirror relocation), real hot-path risk.
 - **Bug:** `field_proxy::set()` primitive arm (15549/15582/15614) raw-`memcpy`s through cached `field_pointer` with NO re-resolve and NO safe_write — but the GET path (15328-15336) and `store_object_oop` (15799-15818) both re-resolve via `mirror_klass` + use safe_write. A relocating GC moves the static mirror → stale write (lost/AV).
 - **Fix:** add `resolve_write_pointer()` const helper (mirror store_object_oop), route the 3 primitive stores through it + `os::safe_write`. (Free fn `set_field` at 14012 already re-resolves; just swap memcpy→safe_write.)
 - **Test:** `field_static.cpp` — static set after forced System.gc + young churn, read back via Java getstatic (not native peek).
 - **Risk:** low — instance/legacy-ctor fields keep field_pointer verbatim (mirror_klass null); precedented by 3 sibling paths.
 
-### 5. find_class array names unresolvable — MEDIUM (correctness)
+### 5. find_class array names unresolvable — MEDIUM — DONE (jni FindClass branch + forward decls)
 - **Bug (A):** `find_class("[I")`/`"[Ljava/lang/String;"` → null on JDK8-17 (array klasses aren't in any Dictionary; the JNI fallback's loadClass rejects array names). FindClass accepts them; make_java_array already works around it.
 - **Fix (A):** after the empty-name guard in find_class (~8022), `if (class_name.front()=='[') { mirror=jni_find_class(name); klass=jni_klass_from_class_mirror; DeleteLocalRef; jni_exception_clear(); return klass; }`.
 - **(B) pending-exception leak:** REFUTED — already fixed (entry+boundary jni_exception_clear at 11979/12156/12168/12173/12188 + load_threw snapshot-then-clear). No action beyond the one clear inside (A).

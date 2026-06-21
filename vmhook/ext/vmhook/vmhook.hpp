@@ -7961,6 +7961,18 @@ namespace vmhook
         inline auto jni_find_class_with_context_loader(const std::string_view class_name) noexcept
             -> vmhook::hotspot::klass*;
 
+        // Forward declarations (defined after the JNI helper section) so find_class()
+        // can resolve ARRAY descriptors directly through JNIEnv::FindClass (library #5).
+        // Array klasses are not in any Dictionary and ClassLoader.loadClass rejects
+        // their names, so the loadClass-based context-loader fallback returns null for
+        // them; JNIEnv::FindClass DOES accept array descriptors (make_java_array already
+        // relies on this).  jni_delete_local_ref also has a later forward decl; a second
+        // identical declaration here is harmless and keeps find_class self-resolving.
+        inline auto jni_find_class(const std::string_view class_name) noexcept -> void*;
+        inline auto jni_klass_from_class_mirror(void* const class_handle) noexcept -> vmhook::hotspot::klass*;
+        inline auto jni_delete_local_ref(void* object_handle) noexcept -> void;
+        inline auto jni_exception_clear() noexcept -> void;
+
         /*
             @brief Remembers candidate as the host-application's class source.
             @details
@@ -8025,6 +8037,28 @@ namespace vmhook
         if (class_name.empty())
         {
             return nullptr;
+        }
+
+        // Array klasses ("[I", "[[J", "[Ljava/lang/String;") are not in any Dictionary
+        // / ClassLoaderDataGraph, and the loadClass-based context-loader fallback below
+        // rejects their descriptor names, so the normal resolution returns NULL for
+        // them.  JNIEnv::FindClass DOES accept array descriptors (make_java_array relies
+        // on this at 14203), so resolve them directly here: decode the returned class
+        // mirror to its Klass*, release the local ref, and ALWAYS clear any pending
+        // exception -- a '[' whose ELEMENT class is missing leaves a
+        // ClassNotFoundException pending that -Xcheck:jni would use to abort the next
+        // JNI call (the unconditional clear is a no-op on the success path).  Library #5.
+        if (class_name.front() == '[')
+        {
+            void* const array_mirror{ vmhook::detail::jni_find_class(class_name) };
+            vmhook::hotspot::klass* array_klass{ nullptr };
+            if (array_mirror)
+            {
+                array_klass = vmhook::detail::jni_klass_from_class_mirror(array_mirror);
+                vmhook::detail::jni_delete_local_ref(array_mirror);
+            }
+            vmhook::detail::jni_exception_clear();
+            return array_klass;
         }
 
         {
