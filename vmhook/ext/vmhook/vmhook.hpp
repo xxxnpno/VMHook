@@ -19719,6 +19719,45 @@ namespace vmhook
     }
 
     /*
+        @brief Fault-safe twin of read_compressed_oop_at for collection node walks.
+        @details
+        read_compressed_oop_at is strict-aliasing-safe but NOT fault-safe: it
+        still faults on a cold / GC-relocated / transiently-unmapped node page.
+        On the no-SEH toolchains (MinGW / clang-cl, no working SEH) such a fault
+        is UNCONTAINED and kills the JVM (library fix #14, the #28 lineage).  The
+        hash-map / tree-map node walks chase compressed-oop slots (table ref,
+        per-node key / value / next / left / right) off DECODED node oops, any of
+        which can point at a stale mirror that was just moved by the collector.
+
+        This reads the 4-byte narrow-oop slot through os::safe_read_fast (the
+        SEH-guarded memcpy that runs at memcpy-speed on real MSVC and delegates
+        to the kernel-validated safe_read everywhere else), returning 0 on a
+        faulting / unmapped slot.  decode_oop_pointer(0) yields nullptr, which
+        every walker below already treats as "empty slot / end of chain", so a
+        cold node cleanly TERMINATES the walk instead of faulting.
+
+        Warm-path byte-identical: on a mapped slot the bytes returned are exactly
+        what read_compressed_oop_at / the prior *reinterpret_cast load produced,
+        so a well-formed collection yields an identical result.
+
+        Complexity: O(1). Exception safety: noexcept.
+    */
+    inline auto read_compressed_oop_at_safe(const void* const holder_oop,
+                                            const std::size_t offset) noexcept
+        -> std::uint32_t
+    {
+        std::uint32_t compressed{ 0 };
+        if (!vmhook::os::safe_read_fast(
+                &compressed,
+                reinterpret_cast<const std::uint8_t*>(holder_oop) + offset,
+                sizeof(compressed)))
+        {
+            compressed = 0;
+        }
+        return compressed;
+    }
+
+    /*
         @brief Walks a LinkedList's first->next Node chain and appends items.
         @details
         Reads the Node klass once per node (HotSpot guarantees every node
@@ -19822,9 +19861,11 @@ namespace vmhook
         {
             return;
         }
+        // fault-safe slot read (see read_compressed_oop_at_safe): a cold/relocated
+        // `table` ref yields 0 -> decode_array_oop(0) is nullptr -> empty walk,
+        // never an uncontained fault on a no-SEH toolchain.
         const std::uint32_t table_compressed{
-            *reinterpret_cast<const std::uint32_t*>(
-                reinterpret_cast<const std::uint8_t*>(map_oop) + table_entry->offset) };
+            vmhook::read_compressed_oop_at_safe(map_oop, table_entry->offset) };
         void* const table_oop{ vmhook::decode_array_oop(table_compressed) };
         if (!table_oop || !vmhook::hotspot::is_valid_pointer(table_oop))
         {
@@ -19862,12 +19903,13 @@ namespace vmhook
                     break;
                 }
 
+                // fault-safe node slot reads (read_compressed_oop_at_safe): a cold/
+                // relocated node yields 0 here -> decode_oop_pointer(0) is nullptr ->
+                // null entry / chain ends, never an uncontained no-SEH fault.
                 const std::uint32_t key_compressed{
-                    *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(node_oop) + key_entry->offset) };
+                    vmhook::read_compressed_oop_at_safe(node_oop, key_entry->offset) };
                 const std::uint32_t value_compressed{
-                    *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(node_oop) + value_entry->offset) };
+                    vmhook::read_compressed_oop_at_safe(node_oop, value_entry->offset) };
 
                 void* const key_oop  { vmhook::hotspot::decode_oop_pointer(key_compressed) };
                 void* const value_oop{ vmhook::hotspot::decode_oop_pointer(value_compressed) };
@@ -19885,8 +19927,7 @@ namespace vmhook
                 out.emplace_back(std::move(k_ptr), std::move(v_ptr));
 
                 const std::uint32_t next_compressed{
-                    *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(node_oop) + next_entry->offset) };
+                    vmhook::read_compressed_oop_at_safe(node_oop, next_entry->offset) };
                 node_oop = vmhook::hotspot::decode_oop_pointer(next_compressed);
             }
         }
@@ -19913,9 +19954,11 @@ namespace vmhook
         {
             return;
         }
+        // fault-safe slot read (see read_compressed_oop_at_safe): a cold/relocated
+        // `table` ref yields 0 -> decode_array_oop(0) is nullptr -> empty walk,
+        // never an uncontained fault on a no-SEH toolchain.
         const std::uint32_t table_compressed{
-            *reinterpret_cast<const std::uint32_t*>(
-                reinterpret_cast<const std::uint8_t*>(map_oop) + table_entry->offset) };
+            vmhook::read_compressed_oop_at_safe(map_oop, table_entry->offset) };
         void* const table_oop{ vmhook::decode_array_oop(table_compressed) };
         if (!table_oop || !vmhook::hotspot::is_valid_pointer(table_oop))
         {
@@ -19948,9 +19991,11 @@ namespace vmhook
                 {
                     break;
                 }
+                // fault-safe node slot reads (read_compressed_oop_at_safe): a cold/
+                // relocated node yields 0 -> decode_oop_pointer(0) is nullptr -> null
+                // entry / chain ends, never an uncontained no-SEH fault.
                 const std::uint32_t key_compressed{
-                    *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(node_oop) + key_entry->offset) };
+                    vmhook::read_compressed_oop_at_safe(node_oop, key_entry->offset) };
                 void* const key_oop{ vmhook::hotspot::decode_oop_pointer(key_compressed) };
                 if (key_oop && vmhook::hotspot::is_valid_pointer(key_oop))
                 {
@@ -19962,8 +20007,7 @@ namespace vmhook
                 }
 
                 const std::uint32_t next_compressed{
-                    *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(node_oop) + next_entry->offset) };
+                    vmhook::read_compressed_oop_at_safe(node_oop, next_entry->offset) };
                 node_oop = vmhook::hotspot::decode_oop_pointer(next_compressed);
             }
         }
@@ -20002,9 +20046,11 @@ namespace vmhook
         {
             return;
         }
+        // fault-safe slot read (see read_compressed_oop_at_safe): a cold/relocated
+        // `root` ref yields 0 -> decode_oop_pointer(0) is nullptr -> empty walk,
+        // never an uncontained fault on a no-SEH toolchain.
         const std::uint32_t root_compressed{
-            *reinterpret_cast<const std::uint32_t*>(
-                reinterpret_cast<const std::uint8_t*>(map_oop) + root_entry->offset) };
+            vmhook::read_compressed_oop_at_safe(map_oop, root_entry->offset) };
         void* root_oop{ vmhook::hotspot::decode_oop_pointer(root_compressed) };
         if (!root_oop || !vmhook::hotspot::is_valid_pointer(root_oop))
         {
@@ -20043,9 +20089,11 @@ namespace vmhook
                     break;
                 }
                 stack.push_back(node_oop);
+                // fault-safe `left` slot read (read_compressed_oop_at_safe): a cold/
+                // relocated entry yields 0 -> decode_oop_pointer(0) is nullptr -> the
+                // descent ends, never an uncontained no-SEH fault.
                 const std::uint32_t left_compressed{
-                    *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(node_oop) + left_entry->offset) };
+                    vmhook::read_compressed_oop_at_safe(node_oop, left_entry->offset) };
                 node_oop = vmhook::hotspot::decode_oop_pointer(left_compressed);
             }
             if (stack.empty())
@@ -20068,12 +20116,13 @@ namespace vmhook
             {
                 break;
             }
+            // fault-safe node slot reads (read_compressed_oop_at_safe): a cold/
+            // relocated entry yields 0 -> decode_oop_pointer(0) is nullptr -> null
+            // member / right-subtree ends, never an uncontained no-SEH fault.
             const std::uint32_t key_compressed{
-                *reinterpret_cast<const std::uint32_t*>(
-                    reinterpret_cast<const std::uint8_t*>(node_oop) + key_entry->offset) };
+                vmhook::read_compressed_oop_at_safe(node_oop, key_entry->offset) };
             const std::uint32_t value_compressed{
-                *reinterpret_cast<const std::uint32_t*>(
-                    reinterpret_cast<const std::uint8_t*>(node_oop) + value_entry->offset) };
+                vmhook::read_compressed_oop_at_safe(node_oop, value_entry->offset) };
 
             void* const key_oop  { vmhook::hotspot::decode_oop_pointer(key_compressed) };
             void* const value_oop{ vmhook::hotspot::decode_oop_pointer(value_compressed) };
@@ -20091,8 +20140,7 @@ namespace vmhook
             out.emplace_back(std::move(k_ptr), std::move(v_ptr));
 
             const std::uint32_t right_compressed{
-                *reinterpret_cast<const std::uint32_t*>(
-                    reinterpret_cast<const std::uint8_t*>(node_oop) + right_entry->offset) };
+                vmhook::read_compressed_oop_at_safe(node_oop, right_entry->offset) };
             node_oop = vmhook::hotspot::decode_oop_pointer(right_compressed);
 
             // Safety cap matching the HashMap variant.
@@ -20129,9 +20177,11 @@ namespace vmhook
         {
             return;
         }
+        // fault-safe slot read (see read_compressed_oop_at_safe): a cold/relocated
+        // `root` ref yields 0 -> decode_oop_pointer(0) is nullptr -> empty walk,
+        // never an uncontained fault on a no-SEH toolchain.
         const std::uint32_t root_compressed{
-            *reinterpret_cast<const std::uint32_t*>(
-                reinterpret_cast<const std::uint8_t*>(map_oop) + root_entry->offset) };
+            vmhook::read_compressed_oop_at_safe(map_oop, root_entry->offset) };
         void* root_oop{ vmhook::hotspot::decode_oop_pointer(root_compressed) };
         if (!root_oop || !vmhook::hotspot::is_valid_pointer(root_oop))
         {
@@ -20167,9 +20217,11 @@ namespace vmhook
                     break;
                 }
                 stack.push_back(node_oop);
+                // fault-safe `left` slot read (read_compressed_oop_at_safe): a cold/
+                // relocated entry yields 0 -> decode_oop_pointer(0) is nullptr -> the
+                // descent ends, never an uncontained no-SEH fault.
                 const std::uint32_t left_compressed{
-                    *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(node_oop) + left_entry->offset) };
+                    vmhook::read_compressed_oop_at_safe(node_oop, left_entry->offset) };
                 node_oop = vmhook::hotspot::decode_oop_pointer(left_compressed);
             }
             if (stack.empty())
@@ -20191,9 +20243,11 @@ namespace vmhook
             {
                 break;
             }
+            // fault-safe node slot reads (read_compressed_oop_at_safe): a cold/
+            // relocated entry yields 0 -> decode_oop_pointer(0) is nullptr -> null
+            // key / right-subtree ends, never an uncontained no-SEH fault.
             const std::uint32_t key_compressed{
-                *reinterpret_cast<const std::uint32_t*>(
-                    reinterpret_cast<const std::uint8_t*>(node_oop) + key_entry->offset) };
+                vmhook::read_compressed_oop_at_safe(node_oop, key_entry->offset) };
             void* const key_oop{ vmhook::hotspot::decode_oop_pointer(key_compressed) };
             if (key_oop && vmhook::hotspot::is_valid_pointer(key_oop))
             {
@@ -20205,8 +20259,7 @@ namespace vmhook
             }
 
             const std::uint32_t right_compressed{
-                *reinterpret_cast<const std::uint32_t*>(
-                    reinterpret_cast<const std::uint8_t*>(node_oop) + right_entry->offset) };
+                vmhook::read_compressed_oop_at_safe(node_oop, right_entry->offset) };
             node_oop = vmhook::hotspot::decode_oop_pointer(right_compressed);
 
             if (++visited > (1 << 24))
