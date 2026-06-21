@@ -3871,6 +3871,54 @@ namespace vmhook
             }
 
             /*
+                @brief Resolves a constant-pool entry slot to a Symbol*, bounding
+                       the index and probing the slot before any dereference.
+                @details
+                The field-metadata paths (find_field / find_field_in_stream) take
+                a u2/UNSIGNED5 constant-pool index out of class metadata and read
+                constant_pool_base[index] to obtain a name/signature Symbol*.  A
+                corrupt or out-of-range index would otherwise read past the entry
+                array, and even an in-range index can land on a page that a
+                DEOPT/class-unload has unmapped — a raw load there is an access
+                violation that tears down the JVM uncontained on the no-SEH legs
+                (mingw / clang-cl) and on the detached POSIX watchdog thread.
+
+                This mirrors the method-path FIX-B (const_method::get_name /
+                get_signature): bound the index against ConstantPool::_length
+                (when the JDK exports it; cp_length < 0 means "unknown -> skip the
+                bound" so a stripped build degrades to the probe alone), verify
+                the specific slot is mapped (is_readable_pointer), then read the
+                slot fault-safe (cold_read_metadata_pointer -> os::safe_read) so a
+                cold page yields nullptr instead of faulting.  For a well-formed
+                class the in-range index on a mapped page returns the exact same
+                Symbol* the old raw load did; only corrupt/out-of-range/unmapped
+                inputs now return nullptr instead of crashing.  A metadata (not
+                frame) read, so no stk_ POSIX regression.
+            */
+            inline static auto resolve_constant_pool_symbol(void** const constant_pool_base, const std::uint32_t index, const std::int32_t cp_length) noexcept
+                -> vmhook::hotspot::symbol*
+            {
+                if (!index || !vmhook::hotspot::is_valid_pointer(constant_pool_base))
+                {
+                    return nullptr;
+                }
+                if (cp_length >= 0 && index >= static_cast<std::uint32_t>(cp_length))
+                {
+                    return nullptr;
+                }
+                if (!vmhook::hotspot::is_readable_pointer(&constant_pool_base[index]))
+                {
+                    return nullptr;
+                }
+                void* const entry_pointer{ vmhook::hotspot::cold_read_metadata_pointer(&constant_pool_base[index]) };
+                if (!entry_pointer || !vmhook::hotspot::is_valid_pointer(entry_pointer))
+                {
+                    return nullptr;
+                }
+                return reinterpret_cast<vmhook::hotspot::symbol*>(entry_pointer);
+            }
+
+            /*
                 @brief Looks up a field by name from an InstanceKlass._fieldinfo_stream
                        (JDK 21+ FieldInfoStream format, Array<u1>).
                 @details
@@ -3882,7 +3930,7 @@ namespace vmhook
                            [group        if field_flags & 0x10]
                 All integers encoded with UNSIGNED5 (see decode_u5).
             */
-            auto find_field_in_stream(const std::string_view name, void** constant_pool_base) const noexcept
+            auto find_field_in_stream(const std::string_view name, void** constant_pool_base, const std::int32_t cp_length) const noexcept
                 -> std::optional<vmhook::hotspot::field_entry_t>
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const fis_entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream") };
@@ -3954,20 +4002,22 @@ namespace vmhook
                     }
 
                     // Resolve the field name from the constant pool and compare.
-                    if (name_index && vmhook::hotspot::is_valid_pointer(constant_pool_base[name_index]))
+                    // FIX-B (field path): bound the CP index against the pool
+                    // length, probe the slot is mapped, and read it fault-safe
+                    // before any dereference (see resolve_constant_pool_symbol);
+                    // a well-formed in-range index returns the same Symbol* the
+                    // old raw load did.
+                    const vmhook::hotspot::symbol* const name_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, name_index, cp_length) };
+                    if (name_symbol)
                     {
-                        const vmhook::hotspot::symbol* const name_symbol{ reinterpret_cast<const vmhook::hotspot::symbol*>(constant_pool_base[name_index]) };
                         if (vmhook::hotspot::is_valid_pointer(name_symbol) && name_symbol->to_string() == name)
                         {
                             const bool is_static{ (access_flags & 0x0008u) != 0u };
                             std::string signature;
-                            if (sig_index && vmhook::hotspot::is_valid_pointer(constant_pool_base[sig_index]))
+                            const vmhook::hotspot::symbol* const signature_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, sig_index, cp_length) };
+                            if (vmhook::hotspot::is_valid_pointer(signature_symbol))
                             {
-                                const vmhook::hotspot::symbol* const signature_symbol{ reinterpret_cast<const vmhook::hotspot::symbol*>(constant_pool_base[sig_index]) };
-                                if (vmhook::hotspot::is_valid_pointer(signature_symbol))
-                                {
-                                    signature = signature_symbol->to_string();
-                                }
+                                signature = signature_symbol->to_string();
                             }
                             return vmhook::hotspot::field_entry_t{ field_offset, is_static, signature };
                         }
@@ -4020,10 +4070,17 @@ namespace vmhook
                     return std::nullopt;
                 }
 
+                // FIX-B (field path): the constant-pool length bounds every CP
+                // index read below.  -1 means the JDK does not export _length, in
+                // which case the per-slot is_readable_pointer probe in
+                // resolve_constant_pool_symbol is the sole guard (same degradation
+                // the method path uses).
+                const std::int32_t cp_length{ constant_pool_ptr->get_length() };
+
                 // -- JDK 21+ path: FieldInfoStream ----------------------------
                 if (fis_entry)
                 {
-                    return vmhook::hotspot::klass::find_field_in_stream(name, constant_pool_base);
+                    return this->find_field_in_stream(name, constant_pool_base, cp_length);
                 }
 
                 // -- JDK 8 through JDK 17 path: Array<u2> with 6-slot FieldInfo records --
@@ -4039,8 +4096,17 @@ namespace vmhook
                     return std::nullopt;
                 }
 
-                // Array<u2>: int32_t _length at +0, data at +8
-                const std::int32_t array_length{ *reinterpret_cast<const std::int32_t*>(fields_array) };
+                // Array<u2>: int32_t _length at +0, data at +8.
+                // FIX-B (field path): read _length fault-safe so the
+                // array_length / field_slots loop bound below is trustworthy even
+                // when fields_array passes is_valid_pointer yet sits on a page a
+                // DEOPT/class-unload has unmapped (raw load there faults the
+                // no-SEH legs); a bad page degrades to nullopt instead of crashing.
+                std::int32_t array_length{ 0 };
+                if (!vmhook::os::safe_read(&array_length, fields_array, sizeof(array_length)))
+                {
+                    return std::nullopt;
+                }
 
                 static const std::int32_t field_slots{ 6 };
 
@@ -4073,7 +4139,12 @@ namespace vmhook
                         continue;  // slot 1: name_index == 0 means VM-injected field, skip
                     }
 
-                    const vmhook::hotspot::symbol* const name_symbol{ reinterpret_cast<const vmhook::hotspot::symbol*>(constant_pool_base[name_index]) };
+                    // FIX-B (field path): bound name_index against the CP length,
+                    // probe the slot, and read it fault-safe before dereferencing
+                    // (resolve_constant_pool_symbol).  A well-formed in-range index
+                    // resolves to the same Symbol* the old raw load did; a corrupt
+                    // index or unmapped slot returns nullptr instead of faulting.
+                    const vmhook::hotspot::symbol* const name_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, name_index, cp_length) };
                     if (!vmhook::hotspot::is_valid_pointer(name_symbol) || name_symbol->to_string() != name)
                     {
                         continue;
@@ -4093,7 +4164,9 @@ namespace vmhook
 
                     const bool is_static{ (access_flags & 0x0008u) != 0u };
 
-                    const vmhook::hotspot::symbol* const signature_symbol{ reinterpret_cast<const vmhook::hotspot::symbol*>(constant_pool_base[sig_index]) };
+                    // FIX-B (field path): same bounded/probed/fault-safe slot read
+                    // for the signature index (resolve_constant_pool_symbol).
+                    const vmhook::hotspot::symbol* const signature_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, sig_index, cp_length) };
                     const std::string signature{ vmhook::hotspot::is_valid_pointer(signature_symbol) ? signature_symbol->to_string() : std::string{} };
 
                     return vmhook::hotspot::field_entry_t{ offset, is_static, signature };

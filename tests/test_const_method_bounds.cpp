@@ -1635,6 +1635,51 @@ int main()
                 check("flaw1_jdk8_trailing_count_walk_safe", true);
             }
         }
+
+        // (c) The APPLIED fix (resolve_constant_pool_symbol) now bounds the field
+        //     CP index exactly as the method path does, and ADDS an index==0
+        //     reject (slot 0 is the documented "unused" entry, so a name/sig of 0
+        //     can never name a real Symbol).  Model the helper's full accept
+        //     contract: a field symbol is read iff index != 0 AND the length bound
+        //     admits it.  Negative cases the fix MUST reject: index 0, index at
+        //     length, index past length; positive: a small in-range index, and any
+        //     index when length is the -1 "unknown" sentinel (probe-only regime).
+        auto helper_admits = [](std::uint32_t index, std::int32_t cp_length) -> bool
+        {
+            if (index == 0u) { return false; }
+            if (cp_length >= 0 && index >= static_cast<std::uint32_t>(cp_length)) { return false; }
+            return true;
+        };
+        check("fix_field_helper_rejects_index_zero",        !helper_admits(0u, 64));
+        check("fix_field_helper_rejects_index_at_length",   !helper_admits(64u, 64));
+        check("fix_field_helper_rejects_index_past_length", !helper_admits(0xFFFFu, 64));
+        check("fix_field_helper_admits_small_in_range",     helper_admits(1u, 64));
+        check("fix_field_helper_admits_last_valid",         helper_admits(63u, 64));
+        check("fix_field_helper_unknown_length_probe_only", helper_admits(0xFFFFu, -1));
+        // index 0 is rejected even when the length is unknown - the unused-slot
+        // reject does not depend on the bound being active.
+        check("fix_field_helper_rejects_zero_even_unknown_length", !helper_admits(0u, -1));
+        // The applied helper is STRICTER than the pre-fix model bound at exactly
+        // one point (index 0): the model admitted 0 < length, the fix rejects it.
+        // Pin that divergence so it is a deliberate, test-visible property.
+        check("fix_field_helper_stricter_than_model_at_zero",
+              field_symbol_index_in_range(0u, 64) && !helper_admits(0u, 64));
+        // Everywhere ELSE (index >= 1) the applied helper and the method bound
+        // agree exactly, over the dense matrix - one shared spec, no drift.
+        bool helper_matches_method_for_nonzero{ true };
+        for (const std::int32_t n : { -1, -3, 0, 1, 2, 16, 64, 1024, 0xFFFF })
+        {
+            for (std::uint32_t index : { 1u, 2u, 63u, 64u, 65u, 1023u, 0xFFFEu, 0xFFFFu })
+            {
+                if (helper_admits(index, n) == length_bound_rejects(static_cast<std::uint16_t>(index), n))
+                {
+                    // helper_admits == accept; length_bound_rejects == reject;
+                    // they must be opposite for every non-zero index.
+                    helper_matches_method_for_nonzero = false;
+                }
+            }
+        }
+        check("fix_field_helper_matches_method_bound_for_nonzero", helper_matches_method_for_nonzero);
     }
 
     // =====================================================================
