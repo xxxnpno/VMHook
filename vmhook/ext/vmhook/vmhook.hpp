@@ -4672,7 +4672,23 @@ namespace vmhook
                         throw vmhook::exception{ "Failed to find JavaThread._thread_state entry." };
                     }
 
-                    return *reinterpret_cast<java_thread_state*>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::java_thread*>(this)) + entry->offset);
+                    // Cold read: this JavaThread* may be a stale/relocated pointer that
+                    // passes the is_valid_pointer range heuristic but names an unmapped
+                    // page.  A raw deref would fault uncontained on the no-SEH legs
+                    // (mingw / clang-cl) and tear down the JVM, so route the field read
+                    // through os::safe_read (fault-safe on all platforms) and fall back
+                    // to the same _thread_uninitialized sentinel the catch returns.
+                    if (!vmhook::hotspot::is_valid_pointer(this))
+                    {
+                        return vmhook::hotspot::java_thread_state::_thread_uninitialized;
+                    }
+                    java_thread_state state{ vmhook::hotspot::java_thread_state::_thread_uninitialized };
+                    if (!vmhook::os::safe_read(&state, reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::java_thread*>(this)) + entry->offset, sizeof(state)))
+                    {
+                        VMHOOK_LOG("{} java_thread.get_thread_state() safe_read failed", vmhook::error_tag);
+                        return vmhook::hotspot::java_thread_state::_thread_uninitialized;
+                    }
+                    return state;
                 }
                 catch (const std::exception& exception)
                 {
@@ -4720,7 +4736,23 @@ namespace vmhook
                         throw vmhook::exception{ "Failed to find JavaThread._suspend_flags entry." };
                     }
 
-                    return *reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::java_thread*>(this)) + entry->offset);
+                    // Cold read: this JavaThread* may be a stale/relocated pointer that
+                    // passes the is_valid_pointer range heuristic but names an unmapped
+                    // page.  A raw deref would fault uncontained on the no-SEH legs
+                    // (mingw / clang-cl) and tear down the JVM, so route the field read
+                    // through os::safe_read (fault-safe on all platforms) and fall back
+                    // to the same 0 sentinel the catch returns.
+                    if (!vmhook::hotspot::is_valid_pointer(this))
+                    {
+                        return 0;
+                    }
+                    std::uint32_t flags{ 0 };
+                    if (!vmhook::os::safe_read(&flags, reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::java_thread*>(this)) + entry->offset, sizeof(flags)))
+                    {
+                        VMHOOK_LOG("{} java_thread.get_suspend_flags() safe_read failed", vmhook::error_tag);
+                        return 0;
+                    }
+                    return flags;
                 }
                 catch (const std::exception& exception)
                 {
@@ -4940,7 +4972,15 @@ namespace vmhook
                 return nullptr;
             }
 
-            vmhook::hotspot::java_thread* const head{ *reinterpret_cast<vmhook::hotspot::java_thread**>(thread_list_entry->address) };
+            // Cold read: the head slot of Threads::_thread_list may sit on an
+            // unmapped page on a torn-down / partially-initialised JVM.  Route
+            // through safe_read_pointer (fault-safe, returns nullptr on a bad
+            // page) instead of a raw deref so the no-SEH legs cannot fault, then
+            // keep the existing is_valid_pointer gate.
+            vmhook::hotspot::java_thread* const head{
+                const_cast<vmhook::hotspot::java_thread*>(
+                    reinterpret_cast<const vmhook::hotspot::java_thread*>(
+                        vmhook::hotspot::safe_read_pointer(thread_list_entry->address))) };
             return vmhook::hotspot::is_valid_pointer(head) ? head : nullptr;
         }
 
@@ -4994,13 +5034,24 @@ namespace vmhook
                 return nullptr;
             }
 
-            const std::int32_t length{ *reinterpret_cast<const std::int32_t*>(reinterpret_cast<const std::uint8_t*>(list) + length_entry->offset) };
+            // Cold reads: the ThreadsList _length / _threads slots may land on an
+            // unmapped page if the SMR snapshot was freed/relocated under us.
+            // Route both through the fault-safe helpers (no-SEH legs cannot fault)
+            // and keep the existing length-bound + is_valid_pointer gates.
+            std::int32_t length{ 0 };
+            if (!vmhook::os::safe_read(&length, reinterpret_cast<const std::uint8_t*>(list) + length_entry->offset, sizeof(length)))
+            {
+                return nullptr;
+            }
             if (length <= 0 || length > 4096)
             {
                 return nullptr;
             }
 
-            auto** const threads{ *reinterpret_cast<vmhook::hotspot::java_thread***>(reinterpret_cast<std::uint8_t*>(list) + threads_entry->offset) };
+            auto** const threads{
+                const_cast<vmhook::hotspot::java_thread**>(
+                    reinterpret_cast<vmhook::hotspot::java_thread* const*>(
+                        vmhook::hotspot::safe_read_pointer(reinterpret_cast<std::uint8_t*>(list) + threads_entry->offset))) };
             if (!threads || !vmhook::hotspot::is_valid_pointer(threads))
             {
                 return nullptr;
@@ -8530,20 +8581,37 @@ namespace vmhook
             return;
         }
 
-        const std::int32_t length{
-            *reinterpret_cast<const std::int32_t*>(
-                reinterpret_cast<const std::uint8_t*>(threads_list) + list_length_entry->offset) };
+        // Cold reads: the ThreadsList _length / _threads slots (and every
+        // element of the threads array) may sit on an unmapped page if the SMR
+        // snapshot was freed/relocated under us.  Route them through the
+        // fault-safe helpers so a bad page degrades to the existing
+        // empty/skip behaviour instead of faulting the no-SEH legs
+        // (mingw / clang-cl).  Add the is_valid_pointer(threads_array) gate
+        // that its twin in find_java_thread_by_os_thread_id already has.
+        std::int32_t length{ 0 };
+        if (!vmhook::os::safe_read(&length,
+                reinterpret_cast<const std::uint8_t*>(threads_list) + list_length_entry->offset,
+                sizeof(length)))
+        {
+            return;
+        }
         auto** const threads_array{
-            *reinterpret_cast<vmhook::hotspot::java_thread***>(
-                reinterpret_cast<std::uint8_t*>(threads_list) + list_threads_entry->offset) };
-        if (length <= 0 || length > 4096 || !threads_array)
+            const_cast<vmhook::hotspot::java_thread**>(
+                reinterpret_cast<vmhook::hotspot::java_thread* const*>(
+                    vmhook::hotspot::safe_read_pointer(
+                        reinterpret_cast<std::uint8_t*>(threads_list) + list_threads_entry->offset))) };
+        if (length <= 0 || length > 4096 || !threads_array || !vmhook::hotspot::is_valid_pointer(threads_array))
         {
             return;
         }
 
         for (std::int32_t i{ 0 }; i < length; ++i)
         {
-            invoke_visitor(threads_array[i]);
+            vmhook::hotspot::java_thread* const element{
+                const_cast<vmhook::hotspot::java_thread*>(
+                    reinterpret_cast<const vmhook::hotspot::java_thread*>(
+                        vmhook::hotspot::safe_read_pointer(&threads_array[i]))) };
+            invoke_visitor(element);
         }
     }
 
