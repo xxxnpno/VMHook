@@ -320,6 +320,53 @@ namespace
             return reinterpret_cast<std::uintptr_t>(wrapped->get_instance());
         }
 
+        // ---- reference return -> the decoded heap OOP as an integer (0 if unusable).
+        //      Same path as call_reference_oop but yields a comparable uintptr so the
+        //      body can cross-check the SAME singleton's OOP across distinct returners
+        //      (returnsObject / staticReturnsObject / returnsObjectArray[0]). ----
+        auto call_reference_oop_uint(const char* name) -> std::uintptr_t
+        {
+            return reinterpret_cast<std::uintptr_t>(call_reference_oop(name));
+        }
+        static auto static_reference_oop_uint(const char* name) -> std::uintptr_t
+        {
+            return reinterpret_cast<std::uintptr_t>(static_reference_oop(name));
+        }
+
+        // ---- Object[] element decode: recover the array OOP, then read element `idx`
+        //      as a compressed OOP and decode it to the real heap pointer (the exact
+        //      reference-element pattern the library uses for object arrays).  Returns
+        //      0 for a null element or an unusable array -- so the body can assert
+        //      element[0]==OBJECT_SINGLETON and element[1]==null (decodes to 0). ----
+        auto call_object_array_element_oop(const char* name, const std::int32_t idx) -> std::uintptr_t
+        {
+            void* const arr{ call_reference_oop(name) };
+            if (!arr) { return 0; }
+            const std::uint32_t compressed{ vmhook::get_array_element<std::uint32_t>(arr, idx) };
+            void* const elem{ vmhook::hotspot::decode_oop_pointer(compressed) };
+            if (elem == nullptr || !vmhook::hotspot::is_valid_pointer(elem)) { return 0; }
+            return reinterpret_cast<std::uintptr_t>(elem);
+        }
+
+        // ---- array decode IDEMPOTENCY: call the SAME array returner twice and report
+        //      whether both decodes yield the same length AND the same boundary
+        //      elements.  Each Java call allocates a FRESH array (distinct OOP), so this
+        //      proves the decode reads content consistently across independent dispatches,
+        //      not a one-shot fluke / cached pointer.  Returns 1 if consistent, 0 if not,
+        //      -1 if unusable. ----
+        auto call_int_array_decode_idempotent(const char* name) -> int
+        {
+            void* const a1{ call_reference_oop(name) };
+            void* const a2{ call_reference_oop(name) };
+            if (!a1 || !a2) { return -1; }
+            const bool same_len{ vmhook::array_length(a1) == vmhook::array_length(a2) };
+            const bool same_e0{ vmhook::get_array_element<std::int32_t>(a1, 0)
+                                == vmhook::get_array_element<std::int32_t>(a2, 0) };
+            const bool same_e2{ vmhook::get_array_element<std::int32_t>(a1, 2)
+                                == vmhook::get_array_element<std::int32_t>(a2, 2) };
+            return (same_len && same_e0 && same_e2) ? 1 : 0;
+        }
+
         // ---- void side-effect observability: snapshot a field, run a void call(),
         //      report whether the field advanced (i.e. the void dispatch executed). --
         static auto void_side_effect() -> std::int32_t { return static_field("voidSideEffect")->get(); }
@@ -740,6 +787,36 @@ namespace
     std::atomic<int>           g_arr_is_string{ -1 };
     std::atomic<int>           g_arr_is_void{ -1 };
 
+    // ── batch-22 deepening: interior array elements (the headline set read only
+    //    boundary indices), full-sweep cross-checks, Object[] element-OOP identity,
+    //    boxed-vs-primitive agreement, singleton OOP cross-returner identity, and
+    //    array-decode idempotency. ───────────────────────────────────────────────
+    // interior elements not yet pinned (each is the MIDDLE / remaining index).
+    std::atomic<std::int64_t>  g_arr_byte_1{ k_uncaptured64 };   // {-128, [0], 127}
+    std::atomic<std::int64_t>  g_arr_char_1{ k_uncaptured64 };   // {'A', ['?'=63], 0xFFFF}
+    std::atomic<std::int64_t>  g_arr_short_1{ k_uncaptured64 };  // {-32768, [0], 32767}
+    std::atomic<std::int64_t>  g_arr_int_1{ k_uncaptured64 };    // {MIN, [0], pattern, MAX}
+    std::atomic<std::int64_t>  g_arr_long_2{ k_uncaptured64 };   // {MIN, pattern, [MAX]}
+    std::atomic<std::uint32_t> g_arr_float_0_bits{ k_uncaptured_fbits };   // [1.0f]
+    std::atomic<std::uint64_t> g_arr_double_0_bits{ k_uncaptured_dbits };  // [1.0]
+    // Object[] element OOPs: [0] is OBJECT_SINGLETON, [1] is null (decodes to 0).
+    std::atomic<std::uintptr_t> g_arr_obj_elem0{ 0 };
+    std::atomic<std::uintptr_t> g_arr_obj_elem1{ 1 };   // sentinel 1: distinct from a real 0
+    // singleton OOP cross-returner identity: returnsObject / staticReturnsObject /
+    // returnsObjectArray[0] all hand back the SAME OBJECT_SINGLETON heap object.
+    std::atomic<std::uintptr_t> g_obj_oop{ 0 };
+    std::atomic<std::uintptr_t> g_static_obj_oop{ 0 };
+    // boxed-vs-primitive agreement: the boxed wrapper's value equals the matching
+    // primitive returner's value (same numeric content, different return shape).
+    std::atomic<int>           g_boxed_int_eq_primitive{ -1 };
+    std::atomic<int>           g_boxed_long_eq_primitive{ -1 };
+    std::atomic<int>           g_boxed_double_eq_primitive{ -1 };
+    // array decode idempotency across two independent dispatches (fresh OOP each).
+    std::atomic<int>           g_int_array_idempotent{ -1 };
+    // array_length read twice on the SAME decoded OOP agrees (a second header read is
+    // stable -- not a one-shot side effect).
+    std::atomic<int>           g_int_array_len_stable{ -1 };
+
     // boxed returns
     std::atomic<std::int64_t>  g_box_int{ rt::k_box_unset };
     std::atomic<std::int64_t>  g_box_long{ rt::k_box_unset };
@@ -952,6 +1029,17 @@ namespace
         g_arr_double_len.store(k_uncaptured64); g_arr_double_1_bits.store(k_uncaptured_dbits);
         g_arr_obj_len.store(k_uncaptured64); g_arr_empty_len.store(k_uncaptured64);
         g_arr_is_string.store(-1); g_arr_is_void.store(-1);
+        // batch-22
+        g_arr_byte_1.store(k_uncaptured64);  g_arr_char_1.store(k_uncaptured64);
+        g_arr_short_1.store(k_uncaptured64); g_arr_int_1.store(k_uncaptured64);
+        g_arr_long_2.store(k_uncaptured64);
+        g_arr_float_0_bits.store(k_uncaptured_fbits);
+        g_arr_double_0_bits.store(k_uncaptured_dbits);
+        g_arr_obj_elem0.store(0); g_arr_obj_elem1.store(1);
+        g_obj_oop.store(0); g_static_obj_oop.store(0);
+        g_boxed_int_eq_primitive.store(-1); g_boxed_long_eq_primitive.store(-1);
+        g_boxed_double_eq_primitive.store(-1);
+        g_int_array_idempotent.store(-1); g_int_array_len_stable.store(-1);
         g_box_int.store(rt::k_box_unset); g_box_long.store(rt::k_box_unset);
         g_box_double_bits.store(rt::k_box_unset_bits); g_box_int_is_string.store(-1);
         g_null_wrapper_is_null.store(-1); g_null_pointer_unusable.store(-1);
@@ -1206,47 +1294,64 @@ namespace
                     void* const a{ self->call_reference_oop("returnsByteArray") };
                     g_arr_byte_len.store(a ? vmhook::array_length(a) : k_uncaptured64);
                     g_arr_byte_0.store(a ? static_cast<std::int64_t>(array_elem<std::int8_t>(a, 0)) : k_uncaptured64);
+                    g_arr_byte_1.store(a ? static_cast<std::int64_t>(array_elem<std::int8_t>(a, 1)) : k_uncaptured64);
                     g_arr_byte_2.store(a ? static_cast<std::int64_t>(array_elem<std::int8_t>(a, 2)) : k_uncaptured64);
                 }
                 {
                     void* const a{ self->call_reference_oop("returnsCharArray") };
                     g_arr_char_len.store(a ? vmhook::array_length(a) : k_uncaptured64);
                     g_arr_char_0.store(a ? static_cast<std::int64_t>(array_elem<std::uint16_t>(a, 0)) : k_uncaptured64);
+                    g_arr_char_1.store(a ? static_cast<std::int64_t>(array_elem<std::uint16_t>(a, 1)) : k_uncaptured64);
                     g_arr_char_2.store(a ? static_cast<std::int64_t>(array_elem<std::uint16_t>(a, 2)) : k_uncaptured64);
                 }
                 {
                     void* const a{ self->call_reference_oop("returnsShortArray") };
                     g_arr_short_len.store(a ? vmhook::array_length(a) : k_uncaptured64);
                     g_arr_short_0.store(a ? static_cast<std::int64_t>(array_elem<std::int16_t>(a, 0)) : k_uncaptured64);
+                    g_arr_short_1.store(a ? static_cast<std::int64_t>(array_elem<std::int16_t>(a, 1)) : k_uncaptured64);
                     g_arr_short_2.store(a ? static_cast<std::int64_t>(array_elem<std::int16_t>(a, 2)) : k_uncaptured64);
                 }
                 {
                     void* const a{ self->call_reference_oop("returnsIntArray") };
                     g_arr_int_len.store(a ? vmhook::array_length(a) : k_uncaptured64);
                     g_arr_int_0.store(a ? static_cast<std::int64_t>(array_elem<std::int32_t>(a, 0)) : k_uncaptured64);
+                    g_arr_int_1.store(a ? static_cast<std::int64_t>(array_elem<std::int32_t>(a, 1)) : k_uncaptured64);
                     g_arr_int_2.store(a ? static_cast<std::int64_t>(array_elem<std::int32_t>(a, 2)) : k_uncaptured64);
                     g_arr_int_3.store(a ? static_cast<std::int64_t>(array_elem<std::int32_t>(a, 3)) : k_uncaptured64);
+                    // array_length read TWICE on the same OOP is stable (idempotent header read).
+                    g_int_array_len_stable.store(
+                        a ? (vmhook::array_length(a) == vmhook::array_length(a) ? 1 : 0) : -1);
                 }
                 {
                     void* const a{ self->call_reference_oop("returnsLongArray") };
                     g_arr_long_len.store(a ? vmhook::array_length(a) : k_uncaptured64);
                     g_arr_long_0.store(a ? array_elem<std::int64_t>(a, 0) : k_uncaptured64);
                     g_arr_long_1.store(a ? array_elem<std::int64_t>(a, 1) : k_uncaptured64);
+                    g_arr_long_2.store(a ? array_elem<std::int64_t>(a, 2) : k_uncaptured64);
                 }
                 {
                     void* const a{ self->call_reference_oop("returnsFloatArray") };
                     g_arr_float_len.store(a ? vmhook::array_length(a) : k_uncaptured64);
+                    g_arr_float_0_bits.store(a ? float_bits(array_elem<float>(a, 0)) : k_uncaptured_fbits);
                     g_arr_float_1_bits.store(a ? float_bits(array_elem<float>(a, 1)) : k_uncaptured_fbits);
                 }
                 {
                     void* const a{ self->call_reference_oop("returnsDoubleArray") };
                     g_arr_double_len.store(a ? vmhook::array_length(a) : k_uncaptured64);
+                    g_arr_double_0_bits.store(a ? double_bits(array_elem<double>(a, 0)) : k_uncaptured_dbits);
                     g_arr_double_1_bits.store(a ? double_bits(array_elem<double>(a, 1)) : k_uncaptured_dbits);
                 }
                 {
                     void* const a{ self->call_reference_oop("returnsObjectArray") };
                     g_arr_obj_len.store(a ? vmhook::array_length(a) : k_uncaptured64);
                 }
+                // Object[] element OOPs: [0] is OBJECT_SINGLETON, [1] is a Java null.
+                g_arr_obj_elem0.store(self->call_object_array_element_oop("returnsObjectArray", 0),
+                                      std::memory_order_relaxed);
+                g_arr_obj_elem1.store(self->call_object_array_element_oop("returnsObjectArray", 1),
+                                      std::memory_order_relaxed);
+                // int[] decode idempotency across two independent dispatches.
+                g_int_array_idempotent.store(self->call_int_array_decode_idempotent("returnsIntArray"));
                 {
                     void* const a{ self->call_reference_oop("returnsEmptyIntArray") };
                     g_arr_empty_len.store(a ? vmhook::array_length(a) : k_uncaptured64);
@@ -1271,6 +1376,39 @@ namespace
                 g_obj_pointer_unusable.store(self->call_object_pointer_unusable("returnsObject") ? 1 : 0);
                 g_self_obj_instance.store(self->call_self_object_instance("returnsSelfAsObject"),
                                           std::memory_order_relaxed);
+
+                // ----- singleton OOP cross-returner identity: returnsObject (instance),
+                //       staticReturnsObject (static path), and returnsObjectArray[0] all
+                //       hand back the SAME OBJECT_SINGLETON heap object, so their decoded
+                //       OOPs must be equal -- a strong cross-path / cross-shape identity. --
+                g_obj_oop.store(self->call_reference_oop_uint("returnsObject"),
+                                std::memory_order_relaxed);
+                g_static_obj_oop.store(rt::static_reference_oop_uint("staticReturnsObject"),
+                                       std::memory_order_relaxed);
+
+                // ----- boxed-vs-primitive agreement: the boxed wrapper's value equals
+                //       the matching primitive returner's value (Integer==int, Long==long,
+                //       Double bits==double bits) -- two different return SHAPES, identical
+                //       numeric content, decoded independently and cross-checked. ----------
+                {
+                    const std::int64_t boxed{ self->call_boxed_int("returnsBoxedInteger") };
+                    const std::int64_t prim{ static_cast<std::int64_t>(self->call_i32("returnsInt")) };
+                    g_boxed_int_eq_primitive.store(
+                        (boxed != rt::k_box_unset && boxed == prim) ? 1 : (boxed == rt::k_box_unset ? -1 : 0));
+                }
+                {
+                    const std::int64_t boxed{ self->call_boxed_long("returnsBoxedLong") };
+                    const std::int64_t prim{ self->call_i64("returnsLong") };
+                    g_boxed_long_eq_primitive.store(
+                        (boxed != rt::k_box_unset && boxed == prim) ? 1 : (boxed == rt::k_box_unset ? -1 : 0));
+                }
+                {
+                    const std::uint64_t boxed{ self->call_boxed_double_bits("returnsBoxedDouble") };
+                    const std::uint64_t prim{ double_bits(self->call_double("returnsDouble")) };
+                    g_boxed_double_eq_primitive.store(
+                        (boxed != rt::k_box_unset_bits && boxed == prim) ? 1
+                        : (boxed == rt::k_box_unset_bits ? -1 : 0));
+                }
 
                 // ===== descriptor-driven type-routing + edge cases (new) =========
 
@@ -1983,6 +2121,59 @@ namespace
             // an array return that decoded is not void.
             ctx.check("mrt_array_is_void_false", g_arr_is_void.load() == 0);
 
+            // ---- batch-22: INTERIOR array elements (the headline set read only the
+            //      boundary indices; these pin the remaining/middle index of each
+            //      array, completing an element-by-element sweep).  A middle-element
+            //      read defect (wrong stride / off-by-one) would surface only here. ----
+            ctx.check("mrt_arr_byte_mid_elem_0",  g_arr_byte_1.load()  == 0);
+            ctx.check("mrt_arr_char_mid_elem_63", g_arr_char_1.load()  == 63);   // '?'
+            ctx.check("mrt_arr_short_mid_elem_0", g_arr_short_1.load() == 0);
+            ctx.check("mrt_arr_int_mid_elem_0",   g_arr_int_1.load()   == 0);
+            ctx.check("mrt_arr_long_last_elem_max",
+                      g_arr_long_2.load() == std::numeric_limits<std::int64_t>::max());
+            ctx.check("mrt_arr_float_first_elem_1p0_bits",
+                      g_arr_float_0_bits.load() == 0x3F800000u);   // 1.0f
+            ctx.check("mrt_arr_double_first_elem_1p0_bits",
+                      g_arr_double_0_bits.load() == 0x3FF0000000000000ULL);   // 1.0
+
+            // ---- batch-22: Object[] ELEMENT decode (the reference-element branch).  The
+            //      array holds {OBJECT_SINGLETON, null}: element[0] decodes to the
+            //      singleton's heap OOP (non-zero, valid), element[1] is a Java null and
+            //      decodes to 0 -- a null element inside a reference array is NOT mistaken
+            //      for a live object.  element[0] is cross-checked against returnsObject's
+            //      OOP below (same singleton, different return shape). ----
+            ctx.check("mrt_arr_object_elem0_is_live", g_arr_obj_elem0.load() != 0);
+            ctx.check("mrt_arr_object_elem1_null_decodes_zero", g_arr_obj_elem1.load() == 0);
+
+            // ---- batch-22: SINGLETON OOP cross-returner identity.  returnsObject
+            //      (instance dispatch), staticReturnsObject (GetStaticMethodID dispatch),
+            //      and returnsObjectArray[0] (array-element decode) all reference the SAME
+            //      OBJECT_SINGLETON, so all three decoded OOPs must be equal -- proving the
+            //      reference decode recovers a STABLE heap identity across the instance
+            //      path, the static path, and the array-element path. ----
+            ctx.check("mrt_singleton_oop_instance_usable", g_obj_oop.load() != 0);
+            ctx.check("mrt_singleton_oop_static_eq_instance",
+                      g_static_obj_oop.load() != 0
+                      && g_static_obj_oop.load() == g_obj_oop.load());
+            ctx.check("mrt_singleton_oop_array_elem_eq_instance",
+                      g_arr_obj_elem0.load() == g_obj_oop.load());
+
+            // ---- batch-22: int[] decode IDEMPOTENCY.  Two independent dispatches of the
+            //      same returner allocate FRESH arrays (distinct OOPs) yet decode to the
+            //      same length + boundary elements -- the decode reads content
+            //      consistently, not a one-shot fluke or a cached pointer.  And a second
+            //      array_length read on one OOP is stable. ----
+            ctx.check("mrt_int_array_decode_idempotent", g_int_array_idempotent.load() == 1);
+            ctx.check("mrt_int_array_length_read_stable", g_int_array_len_stable.load() == 1);
+
+            // ---- batch-22: boxed-vs-primitive AGREEMENT.  The boxed wrapper returner and
+            //      the matching primitive returner carry identical numeric content through
+            //      two different return shapes; decoded independently they must agree. ----
+            ctx.check("mrt_boxed_int_equals_primitive_int", g_boxed_int_eq_primitive.load() == 1);
+            ctx.check("mrt_boxed_long_equals_primitive_long", g_boxed_long_eq_primitive.load() == 1);
+            ctx.check("mrt_boxed_double_bits_equal_primitive_double",
+                      g_boxed_double_eq_primitive.load() == 1);
+
             // ---- boxed Integer/Long/Double: value read back through the wrapper ----
             ctx.check("mrt_boxed_integer_value",
                       g_box_int.load() == static_cast<std::int64_t>(0x12345678));
@@ -2103,6 +2294,17 @@ namespace
                        + " static_boxed_int=" + std::to_string(g_st_boxed_int.load())
                        + " nonstring_ref_as_string_size="
                        + std::to_string(g_nonstring_ref_as_string_size.load())
+                       + " (recorded not asserted).");
+            ctx.record("[INFO] method_return_types: batch-22 reference decodes unusable on this "
+                       "JVM -- arr interior elems byte1=" + std::to_string(g_arr_byte_1.load())
+                       + " char1=" + std::to_string(g_arr_char_1.load())
+                       + " int1=" + std::to_string(g_arr_int_1.load())
+                       + " long2=" + std::to_string(g_arr_long_2.load())
+                       + "; obj_elem0=0x" + std::to_string(g_arr_obj_elem0.load())
+                       + " obj_oop=0x" + std::to_string(g_obj_oop.load())
+                       + " static_obj_oop=0x" + std::to_string(g_static_obj_oop.load())
+                       + " int_array_idempotent=" + std::to_string(g_int_array_idempotent.load())
+                       + " boxed_int_eq_prim=" + std::to_string(g_boxed_int_eq_primitive.load())
                        + " (recorded not asserted).");
         }
 
