@@ -14742,7 +14742,22 @@ namespace vmhook
             return 0;
         }
 
-        return *reinterpret_cast<const std::int32_t*>(reinterpret_cast<const std::uint8_t*>(array_oop) + 12);
+        // Cold read: the _length slot in the array header (array_oop + 12).  A
+        // detour can reach here with a stale / GC-relocated array oop that passes
+        // is_valid_pointer's range/alignment HEURISTIC yet sits on an unmapped
+        // page; a raw `*(array_oop + 12)` then FAULTS, and on the no-SEH
+        // toolchains (MinGW / clang-on-windows) that hardware AV is uncontained
+        // and tears the JVM down.  Route the header read through os::safe_read
+        // (kernel-validated — never faults), yielding the existing 0 fallback on
+        // a bad page; for a normally-mapped array the bytes are identical.  This
+        // is a HEAP-object header read, not a stack frame walk, so the documented
+        // POSIX frame-walk regression does not apply — cross-platform safe_read.
+        std::int32_t len{ 0 };
+        if (!vmhook::os::safe_read(&len, reinterpret_cast<const std::uint8_t*>(array_oop) + 12, sizeof(len)))
+        {
+            return 0;
+        }
+        return len;
     }
 
     /*
@@ -14776,7 +14791,20 @@ namespace vmhook
         // corrupted/relocated _length admitted a large in-bounds-claimed index
         // (e.g. index 0x10000000 at stride 8 -> INT_MIN), sign-extending to a wild
         // byte offset.  Widening the multiply keeps the address arithmetic honest.
-        std::memcpy(&result, reinterpret_cast<const std::uint8_t*>(array_oop) + 16 + static_cast<std::ptrdiff_t>(index) * static_cast<std::ptrdiff_t>(sizeof(element_type)), sizeof(element_type));
+        //
+        // Cold read: the element word lives on the array body page, which a
+        // stale / GC-relocated array oop (passing is_valid_pointer's heuristic
+        // but unmapped) makes faulting — on the no-SEH toolchains that AV is
+        // uncontained and tears the JVM down.  Route the element read through
+        // os::safe_read_fast (SEH-guarded memcpy on real MSVC — memcpy-speed, no
+        // syscall on the mapped path; delegates to kernel-validated safe_read
+        // everywhere else), yielding the existing element_type{} fallback on a
+        // bad page.  Hot per-element path (read_array_value / collection walks),
+        // hence _fast; for a normally-mapped element the bytes are identical.
+        if (!vmhook::os::safe_read_fast(&result, reinterpret_cast<const std::uint8_t*>(array_oop) + 16 + static_cast<std::ptrdiff_t>(index) * static_cast<std::ptrdiff_t>(sizeof(element_type)), sizeof(element_type)))
+        {
+            return element_type{};
+        }
         return result;
     }
 
@@ -17507,8 +17535,30 @@ namespace vmhook
                 return nullptr;
             }
 
+            // Cold read: the narrow-klass slot in the object header (oop + 8).  A
+            // detour can reach here with a stale / GC-relocated oop that passes
+            // is_valid_pointer's range/alignment HEURISTIC yet sits on an unmapped
+            // page; a raw `*(oop + 8)` then FAULTS, and on the no-SEH toolchains
+            // (MinGW / clang-on-windows) that hardware AV is uncontained and tears
+            // the JVM down.  Windows-gate the header read through os::safe_read
+            // (ReadProcessMemory — never faults), yielding a zeroed narrow klass
+            // (-> nullptr below) on a bad page.  POSIX keeps the raw read: a stray
+            // AV there is contained by the JVM's own signal handling and gating
+            // reads regressed other oop walks (see frame::get_method); for a
+            // normally-mapped oop the bytes are identical.  Verbatim twin of the
+            // klass_from_oop free function.
+#if defined(_WIN32)
+            std::uint32_t narrow_klass{ 0 };
+            if (!vmhook::os::safe_read(&narrow_klass,
+                                       reinterpret_cast<const std::uint8_t*>(oop) + 8,
+                                       sizeof(narrow_klass)))
+            {
+                return nullptr;
+            }
+#else
             const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
                 reinterpret_cast<const std::uint8_t*>(oop) + 8) };
+#endif
             void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
             if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
             {
