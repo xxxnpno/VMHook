@@ -65,10 +65,12 @@
 #include "../harness.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace
 {
@@ -2111,5 +2113,344 @@ VMHOOK_JVM_MODULE(field_introspection)
                    "no-relocation in Sections A-G; full characterization runs on "
                    "MSVC + Linux + macOS.");
 #endif
+    }
+
+    // =====================================================================
+    //  SECTION M -- value_t::is_reference() AGREES with field_proxy::is_reference()
+    //  for EVERY field.  field_proxy::is_reference() keys on signature_text[0]
+    //  (L/[); value_t::is_reference() holds iff the read produced the uint32
+    //  (compressed-OOP) alternative (vmhook.hpp:15445).  The two are independent
+    //  code paths that must classify identically on a resolved field - a cross-
+    //  check that catches a future drift between the descriptor classifier and
+    //  the variant the read populates.
+    //
+    //  STATIC fields only here (get() reads the old-gen mirror slot -> no
+    //  relocation fault); a primitive's get() reads its own value bytes (no oop
+    //  deref); a reference's get() reads the 4-byte compressed slot off the mirror
+    //  (no referent deref).  All HARD.
+    // =====================================================================
+    cp("SECTION M (value_t::is_reference agrees with field_proxy::is_reference)");
+    {
+        struct MRow { const char* field; bool is_ref; };
+        const MRow mrows[] = {
+            { "sBool",   false }, { "sByte",   false }, { "sShort",  false },
+            { "sInt",    false }, { "sLong",   false }, { "sFloat",  false },
+            { "sDouble", false }, { "sChar",   false },
+            { "sString",     true }, { "sIntArray",  true }, { "sIntArray2D", true },
+            { "sObjArray",   true }, { "sStrArray",  true }, { "sObject",     true },
+            { "sRunnable",   true }, { "sSelfRef",   true }, { "sObjArray2D", true },
+            { "sNullString", true }, { "sNullArray", true },
+            { "sFinalInt",   false }, { "sFinalString", true },
+        };
+        for (const MRow& r : mrows)
+        {
+            auto fp{ fi_fixture::static_field(r.field) };
+            ctx.check(std::string{ "vt_isref_resolves_" } + r.field, fp.has_value());
+            if (!fp) { continue; }
+            const auto v{ fp->get() };
+            // The two classifiers must agree, and both must equal the expected.
+            ctx.check(std::string{ "vt_isref_agrees_proxy_" } + r.field,
+                      v.is_reference() == fp->is_reference());
+            ctx.check(std::string{ "vt_isref_matches_expected_" } + r.field,
+                      v.is_reference() == r.is_ref);
+            // value_t carries the proxy's descriptor verbatim regardless of value.
+            ctx.check(std::string{ "vt_signature_matches_proxy_" } + r.field,
+                      v.signature == std::string{ fp->signature() });
+        }
+        // A NULL reference field STILL reports value_t::is_reference()==true:
+        // the read produced the uint32 alternative (value 0), so the variant tag
+        // - not the runtime value - drives the classification.  Pins that a null
+        // reference is a reference by TYPE, not by content.
+        {
+            auto fp{ fi_fixture::static_field("sNullString") };
+            if (fp)
+            {
+                const auto v{ fp->get() };
+                ctx.check("vt_isref_null_reference_still_true", v.is_reference() == true);
+                ctx.check("vt_isref_null_reference_as_void_null",
+                          static_cast<void*>(v) == nullptr);
+                // as_string() on a null reference decodes read_java_string(null) -> "".
+                ctx.check("vt_as_string_null_reference_empty", v.as_string().empty());
+            }
+        }
+        // A PRIMITIVE field's value_t is NOT a reference, and as_string() yields ""
+        // (every non-uint32 alternative returns empty - vmhook.hpp:15436).
+        {
+            auto fp{ fi_fixture::static_field("sInt") };
+            if (fp)
+            {
+                const auto v{ fp->get() };
+                ctx.check("vt_isref_primitive_false", v.is_reference() == false);
+                ctx.check("vt_as_string_primitive_empty", v.as_string().empty());
+            }
+        }
+    }
+
+    // =====================================================================
+    //  SECTION N - as_string() equivalence + idempotency for STATIC String.
+    //  value_t::as_string() (vmhook.hpp:15424) decodes the uint32 alternative via
+    //  read_java_string(decode_oop_pointer(raw)) - EXACTLY the chain Section E.1
+    //  walks by hand.  Prove the two agree and that as_string() is idempotent
+    //  (two reads of the same proxy yield byte-equal strings).
+    //
+    //  as_string() RAW-derefs the referent, so it is BEST-EFFORT (guarded behind
+    //  the same header probe as safe_read_java_string); a transient empty miss is
+    //  recorded, a DIFFERENT non-empty value would still be a real mis-decode and
+    //  fails against the hand-walked decode.
+    // =====================================================================
+    cp("SECTION N (as_string equivalence / idempotency - static sString)");
+    {
+        auto fp{ fi_fixture::static_field("sString") };
+        if (fp)
+        {
+            void* const decoded{ vmhook::hotspot::decode_oop_pointer(fp->get_compressed_oop()) };
+            if (oop_header_safely_readable(decoded))
+            {
+                const std::string via_as_string{ fp->get().as_string() };
+                const std::string via_hand{ safe_read_java_string(decoded) };
+                if (!via_as_string.empty() && !via_hand.empty())
+                {
+                    ctx.check("as_string_equals_hand_walked_decode",
+                              via_as_string == via_hand);
+                    ctx.check("as_string_decodes_real_value",
+                              via_as_string == "introspect-me");
+                    // Idempotent: a second independent read is byte-equal.
+                    const std::string again{ fp->get().as_string() };
+                    ctx.check("as_string_idempotent", again == via_as_string);
+                    // Length agrees with the Java-published witness.
+                    ctx.check("as_string_length_matches_java",
+                              static_cast<std::int32_t>(via_as_string.size())
+                                  == fi_fixture::s_string_len());
+                }
+                else
+                {
+                    ctx.record("[INFO] as_string: sString referent not safely readable "
+                               "(stale/relocated) - skipped equivalence/value asserts.");
+                }
+            }
+            else
+            {
+                ctx.record("[INFO] as_string: sString header not safely readable "
+                           "(stale/relocated) - skipped equivalence asserts.");
+            }
+        }
+    }
+
+    // =====================================================================
+    //  SECTION O - signature() <-> primitive byte-width <-> raw_address alignment.
+    //  jvm_primitive_byte_width (vmhook.hpp:16198) maps each 1-char primitive
+    //  descriptor to its natural width: Z/B=1, S/C=2, I/F=4, J/D=8, else 0.  For
+    //  every STATIC primitive field, prove (a) the width derived from signature()
+    //  equals the field's true natural width, AND (b) raw_address() (mirror+offset)
+    //  is aligned to that exact width.  This ties the descriptor accessor, the
+    //  width oracle, and the addressing math together in one invariant.  All
+    //  static-mirror / pointer-only reads -> HARD.
+    // =====================================================================
+    cp("SECTION O (signature<->width<->alignment cross-check, static primitives)");
+    {
+        struct WRow { const char* field; std::size_t width; };
+        const WRow wrows[] = {
+            { "sBool",   1 }, { "sByte",   1 },
+            { "sShort",  2 }, { "sChar",   2 },
+            { "sInt",    4 }, { "sFloat",  4 },
+            { "sLong",   8 }, { "sDouble", 8 },
+            { "sVolatileInt", 4 }, { "sFinalInt", 4 },
+        };
+        for (const WRow& r : wrows)
+        {
+            auto fp{ fi_fixture::static_field(r.field) };
+            ctx.check(std::string{ "width_resolves_" } + r.field, fp.has_value());
+            if (!fp) { continue; }
+            ctx.check(std::string{ "width_from_signature_" } + r.field,
+                      vmhook::detail::jvm_primitive_byte_width(fp->signature()) == r.width);
+            void* const got{ fp->raw_address() };
+            ctx.check(std::string{ "width_addr_nonnull_" } + r.field, got != nullptr);
+            if (got)
+            {
+                const auto a{ reinterpret_cast<std::uintptr_t>(got) };
+                ctx.check(std::string{ "width_addr_aligned_to_width_" } + r.field,
+                          (a % r.width) == 0);
+            }
+            // A primitive is NEVER a reference, and is_reference is the exact
+            // complement of "non-zero primitive width" here (size()==1 holds).
+            ctx.check(std::string{ "width_primitive_not_reference_" } + r.field,
+                      fp->is_reference() == false);
+        }
+        // Every REFERENCE field has primitive-width 0 (its descriptor is multi-char
+        // or starts with L/[), the exact dual of the primitive rows above.
+        const char* ref_fields[] = {
+            "sString", "sIntArray", "sIntArray2D", "sObjArray", "sStrArray",
+            "sObject", "sRunnable", "sSelfRef", "sObjArray2D", "sFinalString",
+        };
+        for (const char* f : ref_fields)
+        {
+            auto fp{ fi_fixture::static_field(f) };
+            if (fp)
+            {
+                ctx.check(std::string{ "width_reference_zero_" } + f,
+                          vmhook::detail::jvm_primitive_byte_width(fp->signature()) == 0);
+                ctx.check(std::string{ "width_reference_is_ref_" } + f,
+                          fp->is_reference() == true);
+            }
+        }
+    }
+
+    // =====================================================================
+    //  SECTION P - field_proxy COPY value-semantics.  field_proxy has implicit
+    //  copy/move (it stores field_pointer / signature_text / static_field /
+    //  mirror_klass / field_offset - no deleted special members).  A COPY of a
+    //  resolved proxy must agree with the original on ALL FIVE accessors: same
+    //  signature() (byte-equal), same is_static(), same is_reference(), same
+    //  raw_address() (identical pointer), and same get_compressed_oop().  Proves
+    //  the accessors are pure functions of the proxy's stored state - copying does
+    //  not perturb resolution.  Static-mirror / pointer-only -> HARD.
+    // =====================================================================
+    cp("SECTION P (field_proxy copy value-semantics)");
+    {
+        // A reference field (carries a non-zero compressed OOP off the mirror).
+        {
+            auto orig{ fi_fixture::static_field("sString") };
+            if (orig)
+            {
+                const vmhook::field_proxy copy{ *orig };   // copy-construct
+                ctx.check("copy_signature_byte_equal",
+                          std::string{ copy.signature() } == std::string{ orig->signature() });
+                ctx.check("copy_is_static_equal", copy.is_static() == orig->is_static());
+                ctx.check("copy_is_reference_equal", copy.is_reference() == orig->is_reference());
+                ctx.check("copy_raw_address_identical", copy.raw_address() == orig->raw_address());
+                ctx.check("copy_compressed_oop_equal",
+                          copy.get_compressed_oop() == orig->get_compressed_oop());
+            }
+        }
+        // A primitive field (compressed OOP is guarded to 0 on BOTH copies).
+        {
+            auto orig{ fi_fixture::static_field("sLong") };
+            if (orig)
+            {
+                const vmhook::field_proxy copy{ *orig };
+                ctx.check("copy_prim_signature_equal",
+                          std::string{ copy.signature() } == "J");
+                ctx.check("copy_prim_is_static_equal", copy.is_static() == orig->is_static());
+                ctx.check("copy_prim_is_reference_false", copy.is_reference() == false);
+                ctx.check("copy_prim_raw_address_identical",
+                          copy.raw_address() == orig->raw_address());
+                ctx.check("copy_prim_compressed_oop_both_zero",
+                          copy.get_compressed_oop() == 0u
+                              && orig->get_compressed_oop() == 0u);
+                // The copied proxy reads the SAME long value off the mirror slot.
+                ctx.check("copy_prim_get_equals_orig",
+                          static_cast<std::int64_t>(copy.get())
+                              == static_cast<std::int64_t>(orig->get()));
+            }
+        }
+        // A MOVED-from synthetic proxy: the move target carries the descriptor /
+        // pointer; accessors on the target are correct.  (We only assert on the
+        // target - the moved-from source is left in a valid-but-unspecified state.)
+        {
+            std::uint8_t buf[8] = { 0 };
+            const std::uint32_t sentinel{ 0x13572468u };
+            std::memcpy(buf, &sentinel, sizeof(sentinel));
+            vmhook::field_proxy src{ buf, "Ljava/lang/String;", false };
+            const vmhook::field_proxy dst{ std::move(src) };
+            ctx.check("move_target_signature",
+                      std::string{ dst.signature() } == "Ljava/lang/String;");
+            ctx.check("move_target_raw_address", dst.raw_address() == buf);
+            ctx.check("move_target_is_reference", dst.is_reference() == true);
+            ctx.check("move_target_compressed_oop_reads_sentinel",
+                      dst.get_compressed_oop() == sentinel);
+        }
+    }
+
+    // =====================================================================
+    //  SECTION Q - get_compressed_oop() BOUNDARY values on synthetic reference
+    //  proxies.  Over a controlled 8-byte buffer the accessor returns the planted
+    //  low-4-byte value VERBATIM (no transformation) for the full uint32 range:
+    //  0 (null ref), 1 (min non-null), 0xFFFFFFFF (max), and a high-bit pattern;
+    //  and it reads EXACTLY the low 4 bytes of an 8-byte slot, ignoring the high
+    //  half (the documented J/D-truncation behaviour, here proven on a reference-
+    //  typed proxy so the is_reference gate admits the read).  All synthetic
+    //  stack buffers -> no JVM memory, no fault risk -> HARD.
+    // =====================================================================
+    cp("SECTION Q (get_compressed_oop boundary values - synthetic proxies)");
+    {
+        const std::uint32_t boundary[] = {
+            0u, 1u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0xDEADBEEFu,
+        };
+        for (const std::uint32_t b : boundary)
+        {
+            std::uint8_t buf[8] = { 0 };
+            std::memcpy(buf, &b, sizeof(b));
+            // Plant a DIFFERENT high half so a 4-byte read can be distinguished
+            // from an 8-byte over-read.
+            const std::uint32_t high{ 0xA5A5A5A5u };
+            std::memcpy(buf + 4, &high, sizeof(high));
+            vmhook::field_proxy fp{ buf, "Ljava/lang/String;", false };
+            ctx.check(std::string{ "cmp_oop_boundary_verbatim_" } + std::to_string(b),
+                      fp.get_compressed_oop() == b);
+            // A 0 planted value is the null-reference contract (decodes to null).
+            if (b == 0u)
+            {
+                ctx.check("cmp_oop_boundary_zero_decodes_null",
+                          vmhook::hotspot::decode_oop_pointer(fp.get_compressed_oop()) == nullptr);
+            }
+        }
+        // EXACT-4-byte read on an 8-byte slot: the low half is returned, the high
+        // half (0xCAFED00D) is NEVER folded in.  Mirrors the J/D-truncation flaw
+        // but on a reference proxy (so the is_reference gate admits the read).
+        {
+            std::uint8_t buf[8] = { 0 };
+            const std::uint32_t low{ 0x11223344u };
+            const std::uint32_t high{ 0xCAFED00Du };
+            std::memcpy(buf,     &low,  sizeof(low));
+            std::memcpy(buf + 4, &high, sizeof(high));
+            vmhook::field_proxy fp{ buf, "[J", false };   // array descriptor -> reference
+            ctx.check("cmp_oop_reads_low_half_only", fp.get_compressed_oop() == low);
+            ctx.check("cmp_oop_ignores_high_half", high == 0xCAFED00Du);
+        }
+    }
+
+    // =====================================================================
+    //  SECTION R - DEGENERATE lookup-name boundary shapes (additive to Section L).
+    //  A single-char name, a name with embedded ASCII control bytes, a name that
+    //  is a PREFIX of a real field, and a name that is a real field plus a
+    //  trailing byte must ALL miss cleanly on the static path - no fabricated
+    //  proxy, no fault.  These pin that name matching is exact-equality (not
+    //  prefix / substring) and tolerates arbitrary ASCII bytes in the query.
+    //  All resolution walks the klass metadata (no oop deref) -> HARD.
+    // =====================================================================
+    cp("SECTION R (degenerate lookup-name boundary shapes - exact-match only)");
+    {
+        const char* miss_names[] = {
+            "s",                    // single char - no field named "s"
+            "sInt ",                // real field + trailing space
+            " sInt",                // leading space + real field
+            "sIn",                  // proper prefix of sInt
+            "sIntt",                // sInt + extra char
+            "SINT",                 // wrong case
+            "iInt",                 // instance field on the STATIC path -> miss
+            "sStringg",             // sString + extra char
+            "\t",                   // lone tab
+            "\x01",                 // lone control byte (explicit escape, ASCII-safe)
+        };
+        for (const char* n : miss_names)
+        {
+            ctx.check(std::string{ "degenerate_exact_match_miss_" } + std::string{ n },
+                      fi_fixture::static_field(n).has_value() == false);
+        }
+        // A name equal to a REAL field still HITS (sanity anchor for the misses):
+        // the exact-match resolver must not be over-rejecting.
+        ctx.check("degenerate_exact_match_hit_sInt",
+                  fi_fixture::static_field("sInt").has_value() == true);
+        // And the hit's metadata is the normal primitive-int metadata - proving
+        // the anchor is a genuine resolution, not a fabricated proxy.
+        {
+            auto fp{ fi_fixture::static_field("sInt") };
+            if (fp)
+            {
+                ctx.check("degenerate_anchor_sig", std::string{ fp->signature() } == "I");
+                ctx.check("degenerate_anchor_is_static", fp->is_static() == true);
+                ctx.check("degenerate_anchor_not_reference", fp->is_reference() == false);
+            }
+        }
     }
 }

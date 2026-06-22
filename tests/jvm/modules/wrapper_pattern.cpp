@@ -1049,6 +1049,44 @@ namespace
     }
 
     // =====================================================================
+    //  6e-bis. method_proxy::is_reference() over EVERY return-descriptor shape.
+    //      is_reference() reads the char after ')' and is true for 'L' OR '['
+    //      (vmhook.hpp:17463-17473).  The existing checks cover a primitive ()I /
+    //      ()J and an 'L' String return; this pins the THREE remaining shapes:
+    //        * an ARRAY return getNumbers()[I  -> is_reference()==true ('[');
+    //        * a VOID return  noOp()V          -> is_reference()==false (')V');
+    //        * the 'L' reference getLabel()    -> is_reference()==true (re-pinned
+    //          alongside the array so the L-vs-[ vs primitive trichotomy is one
+    //          contiguous battery).  Pure introspection (klass scan) -> HARD.
+    // =====================================================================
+    if (inst)
+    {
+        const auto arr_m{ inst->get_method("getNumbers") };
+        ctx.check("ret_getNumbers_resolves", arr_m.has_value());
+        if (arr_m)
+        {
+            ctx.check("ret_getNumbers_signature", std::string{ arr_m->signature() } == "()[I");
+            // Array return is a reference per is_reference() (the '[' branch).
+            ctx.check("ret_getNumbers_is_reference_array", arr_m->is_reference() == true);
+            ctx.check("ret_getNumbers_is_static_false", arr_m->is_static() == false);
+        }
+        const auto void_m{ inst->get_method("noOp") };
+        ctx.check("ret_noOp_resolves", void_m.has_value());
+        if (void_m)
+        {
+            ctx.check("ret_noOp_signature", std::string{ void_m->signature() } == "()V");
+            // Void return is NOT a reference (the char after ')' is 'V').
+            ctx.check("ret_noOp_is_reference_false", void_m->is_reference() == false);
+        }
+        const auto lbl_m{ inst->get_method("getLabel") };
+        if (lbl_m)
+        {
+            // 'L' reference return -> is_reference()==true (trichotomy: L true).
+            ctx.check("ret_getLabel_is_reference_L", lbl_m->is_reference() == true);
+        }
+    }
+
+    // =====================================================================
     //  6f. FIELD set() ROUND-TRIP through a wrapper (the instance + static
     //      WRITE path the run_probe never exercises natively).  Each scratch
     //      field is written through get_field("...")->set(v) then read back
@@ -1348,6 +1386,199 @@ namespace
         // A static field still resolves on the defaulted wrapper.
         ctx.check("default_wrapper_static_field_resolves",
                   defaulted.get_field("sTag").has_value());
+    }
+
+    // =====================================================================
+    //  9a. field_proxy::is_reference() + as_string() over EVERY field shape.
+    //      is_reference() is true iff signature() starts with 'L' or '['
+    //      (vmhook.hpp:15886-15895); as_string() yields the decoded String for a
+    //      reference/String field and "" for EVERY numeric/boolean alternative
+    //      (vmhook.hpp:15424-15439).  Cross-checks the existing per-width value
+    //      reads from the OTHER side of the proxy: a primitive field is NOT a
+    //      reference and its as_string() is "", an array field IS a reference,
+    //      and the value_t::is_reference() variant predicate agrees with the
+    //      field_proxy::is_reference() descriptor predicate.  Thread-free -> HARD.
+    // =====================================================================
+    if (inst)
+    {
+        // PRIMITIVE fields: is_reference()==false AND as_string()=="" (every
+        // numeric/boolean alternative yields the empty string).
+        struct prim_field { const char* field; const char* tag; };
+        const prim_field prims[]{
+            { "iId",     "iId" },     { "iValue", "iValue" },
+            { "iFlag",   "iFlag" },   { "iByte",  "iByte" },
+            { "iShort",  "iShort" },  { "iChar",  "iChar" },
+            { "iFloat",  "iFloat" },  { "iDouble","iDouble" },
+        };
+        for (const auto& pf : prims)
+        {
+            const auto p{ inst->get_field(pf.field) };
+            ctx.check(std::string{ "fieldref_" } + pf.tag + "_resolves", p.has_value());
+            if (p)
+            {
+                ctx.check(std::string{ "fieldref_" } + pf.tag + "_not_reference",
+                          p->is_reference() == false);
+                // as_string() on a numeric/boolean field is exactly "".
+                ctx.check(std::string{ "fieldref_" } + pf.tag + "_as_string_empty",
+                          p->get().as_string().empty());
+                // value_t::is_reference() (variant predicate) agrees with the
+                // field_proxy descriptor predicate: both false for a primitive.
+                ctx.check(std::string{ "fieldref_" } + pf.tag + "_value_t_not_reference",
+                          p->get().is_reference() == false);
+            }
+        }
+
+        // STRING reference field iLabel: is_reference()==true, value_t::is_reference()
+        // ==true, and as_string() decodes the live String (cross-checks section 2).
+        {
+            const auto p{ inst->get_field("iLabel") };
+            if (p)
+            {
+                ctx.check("fieldref_iLabel_is_reference_true", p->is_reference() == true);
+                ctx.check("fieldref_iLabel_value_t_is_reference_true",
+                          p->get().is_reference() == true);
+                ctx.check("fieldref_iLabel_as_string_value",
+                          p->get().as_string() == "wrapper-instance");
+            }
+        }
+
+        // ARRAY field numbers ([I): is_reference()==true (the '[' branch of the
+        // descriptor predicate) — an array field is a reference at the proxy layer.
+        {
+            const auto p{ inst->get_field("numbers") };
+            ctx.check("fieldref_numbers_resolves", p.has_value());
+            if (p)
+            {
+                ctx.check("fieldref_numbers_is_reference_array", p->is_reference() == true);
+                ctx.check("fieldref_numbers_value_t_is_reference_true",
+                          p->get().is_reference() == true);
+            }
+        }
+    }
+
+    // =====================================================================
+    //  9b. DEGENERATE reference-field values — empty String vs null reference.
+    //      iEmpty holds a present-but-length-0 String; iNull holds a genuine
+    //      null reference.  BOTH decode to "" through as_string() but for
+    //      DIFFERENT reasons (empty backing array vs a null compressed OOP that
+    //      read_java_string maps to ""), and BOTH report is_reference()==true
+    //      (the slot is a reference regardless of its content).  The decode of a
+    //      null compressed OOP to "" is library-defined; pin both with HARD
+    //      checks since read_java_string(decode_oop_pointer(0)) returning "" is
+    //      certain from the as_string() source (uint32 alternative -> decode ->
+    //      read_java_string, which returns "" for a null oop).  Thread-free -> HARD.
+    // =====================================================================
+    if (inst)
+    {
+        const auto pe{ inst->get_field("iEmpty") };
+        ctx.check("degenref_iEmpty_resolves", pe.has_value());
+        if (pe)
+        {
+            ctx.check("degenref_iEmpty_is_reference_true", pe->is_reference() == true);
+            ctx.check("degenref_iEmpty_signature_String",
+                      std::string{ pe->signature() } == "Ljava/lang/String;");
+            // A present, length-0 String decodes to the empty string.
+            ctx.check("degenref_iEmpty_as_string_empty", pe->get().as_string().empty());
+        }
+        const auto pn{ inst->get_field("iNull") };
+        ctx.check("degenref_iNull_resolves", pn.has_value());
+        if (pn)
+        {
+            ctx.check("degenref_iNull_is_reference_true", pn->is_reference() == true);
+            ctx.check("degenref_iNull_signature_String",
+                      std::string{ pn->signature() } == "Ljava/lang/String;");
+            // A null reference slot decodes to "" (null compressed OOP ->
+            // read_java_string -> ""), the same observable result as the empty
+            // String but reached via the null-oop path.
+            ctx.check("degenref_iNull_as_string_empty", pn->get().as_string().empty());
+            // The stored compressed OOP of a null reference is 0.
+            ctx.check("degenref_iNull_compressed_oop_zero",
+                      pn->get_compressed_oop() == 0u);
+        }
+        // A non-null String reference has a NON-zero compressed OOP (contrast).
+        const auto pl{ inst->get_field("iLabel") };
+        if (pl)
+        {
+            ctx.check("degenref_iLabel_compressed_oop_nonzero",
+                      pl->get_compressed_oop() != 0u);
+        }
+    }
+
+    // =====================================================================
+    //  9c. raw_address() cross-checks — the field slot pointer the proxy backs.
+    //      For an INSTANCE field, raw_address() is decoded_object + field_offset,
+    //      so the SAME field on the SAME live oop has a STABLE non-null address,
+    //      DIFFERENT fields on the same oop have DIFFERENT addresses, and the
+    //      SAME field on a DISTINCT instance has a DIFFERENT address.  For a
+    //      STATIC field, raw_address() is the (non-null) mirror+offset slot and is
+    //      stable across two resolutions.  Pointer identity only (never derefed),
+    //      and only over is_valid_pointer'd live oops -> HARD, no fault risk.
+    // =====================================================================
+    if (inst && instance_oop)
+    {
+        const auto p_id_a{ inst->get_field("iId") };
+        const auto p_id_b{ inst->get_field("iId") };
+        const auto p_val{ inst->get_field("iValue") };
+        if (p_id_a && p_id_b)
+        {
+            ctx.check("rawaddr_instance_field_nonnull", p_id_a->raw_address() != nullptr);
+            // Same field, same oop, resolved twice -> identical slot address.
+            ctx.check("rawaddr_same_field_same_oop_stable",
+                      p_id_a->raw_address() == p_id_b->raw_address());
+        }
+        if (p_id_a && p_val)
+        {
+            // Distinct fields on the same oop occupy distinct slots.
+            ctx.check("rawaddr_distinct_fields_distinct_address",
+                      p_id_a->raw_address() != p_val->raw_address());
+        }
+        // The same field on a DISTINCT instance has a different slot address.
+        const auto other{ wp::acquire("instance2") };
+        if (other && p_id_a
+            && vmhook::hotspot::is_valid_pointer(other->raw_oop()))
+        {
+            const auto p_other_id{ other->get_field("iId") };
+            if (p_other_id)
+            {
+                ctx.check("rawaddr_same_field_distinct_oop_differs",
+                          p_id_a->raw_address() != p_other_id->raw_address());
+            }
+        }
+        // STATIC field raw_address(): non-null + stable across two resolutions.
+        const auto ps_a{ wp::static_field("sTag") };
+        const auto ps_b{ wp::static_field("sTag") };
+        if (ps_a && ps_b)
+        {
+            ctx.check("rawaddr_static_field_nonnull", ps_a->raw_address() != nullptr);
+            ctx.check("rawaddr_static_field_stable",
+                      ps_a->raw_address() == ps_b->raw_address());
+        }
+    }
+
+    // =====================================================================
+    //  9d. signature() / name() idempotency — the introspection accessors are
+    //      pure reads of cached state, so calling them twice yields byte-identical
+    //      results (no mutation, no per-call recompute drift).  A cheap but real
+    //      invariant: a proxy's reported descriptor must not change between reads.
+    //      Thread-free -> HARD.
+    // =====================================================================
+    if (inst)
+    {
+        const auto p{ inst->get_field("iId") };
+        if (p)
+        {
+            ctx.check("idem_field_signature_stable",
+                      std::string{ p->signature() } == std::string{ p->signature() });
+        }
+        const auto m{ inst->get_method("getId") };
+        if (m)
+        {
+            ctx.check("idem_method_signature_stable",
+                      std::string{ m->signature() } == std::string{ m->signature() });
+            ctx.check("idem_method_name_stable", m->name() == m->name());
+            // name() matches the queried name exactly.
+            ctx.check("idem_method_name_equals_query", m->name() == "getId");
+        }
     }
 
     // =====================================================================

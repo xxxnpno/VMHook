@@ -85,10 +85,15 @@
 
 #include "../harness.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <iterator>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -1097,5 +1102,304 @@ VMHOOK_JVM_MODULE(for_each_loaded_class)
                                     "usability/identity not asserted (jdk8 or late class not "
                                     "surfaced post-load)" });
         }
+    }
+
+    // =====================================================================
+    // PART G — find_class DEGENERATE / BOUNDARY inputs (the cross-path oracle's
+    // own contract).  PASS 1 uses find_class as the "is this name resolvable"
+    // oracle for the enumeration; here we pin down what that oracle does at the
+    // EDGES so a later regression in find_class can't silently weaken every
+    // cross-path check above.  Every input here is constructed to be UNloadable
+    // (a name no class file could exist for), so the JNI fallback inside
+    // find_class cannot accidentally LOAD anything — the only correct answer is
+    // nullptr.  (Empty / odd-but-conceivably-loadable inputs are recorded
+    // [INFO], never hard-asserted, because their JNI-fallback behaviour is
+    // platform/JDK-variant per HARD RULE 3.)
+    // =====================================================================
+    {
+        // A garbage internal name no class file can match — must NOT resolve on
+        // any JDK (graph walk misses it; JNI loadClass throws -> null).
+        ctx.check("find_class_garbage_name_is_null",
+                  vmhook::find_class("zzz/nonexistent/Felc_Probe_NoSuchKlass_42") == nullptr);
+        // A second, structurally different garbage name (nested-looking) — same
+        // contract: unresolvable names yield null, never a torn pointer.
+        ctx.check("find_class_garbage_nested_name_is_null",
+                  vmhook::find_class("vmhook/fixtures/ForEachLoadedClass$NoSuchInner_felc")
+                      == nullptr);
+        // The DOTTED form of a name that only exists in '/'-internal form is not
+        // a valid internal name; the graph walk keys on '/'-form.  Its JNI
+        // fallback CAN accept dotted form on some JDKs, so this is characterized
+        // [INFO], not asserted (HARD RULE 3).
+        vmhook::hotspot::klass* const dotted_probe{
+            vmhook::find_class("zzz.nonexistent.Felc_Probe_NoSuchKlass_42") };
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: find_class(dotted garbage) -> " }
+                   + (dotted_probe ? "non-null (unexpected)" : "null"));
+        // Empty name: behaviour is JDK/JNI-variant (JNI FindClass("") is
+        // ill-defined) — record what we observe, never assert.
+        vmhook::hotspot::klass* const empty_probe{ vmhook::find_class("") };
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: find_class(\"\") -> " }
+                   + (empty_probe ? "non-null" : "null"));
+        // A bootstrap canary that PASS 1 already proved resolvable stays
+        // resolvable here (find_class is stateless / idempotent across calls) —
+        // the oracle did not get poisoned by the garbage lookups above.
+        ctx.check("find_class_object_still_resolvable_after_garbage",
+                  vmhook::find_class("java/lang/Object") != nullptr);
+    }
+
+    // =====================================================================
+    // PART H — BROADER universal-bootstrap SHAPE coverage.  PASS 1 checks the
+    // five canonical concrete classes + three primitive boxes.  Here we widen
+    // the net across distinct Klass SHAPES that every HotSpot loads before user
+    // code: an interface (java/lang/Runnable, java/util/Collection), an abstract
+    // class (java/lang/Number), the throwable hierarchy (Throwable/Exception),
+    // and core singletons (System/Math).  All ride gate_bootstrap_presence so
+    // they stay best-effort on the JDK8 SystemDictionary lottery, HARD on JDK 9+.
+    // =====================================================================
+    {
+        // Interface klasses (no super-of-Object in the bytecode sense, but still
+        // ordinary InstanceKlasses the walk must surface).
+        gate_bootstrap_presence("has_java_lang_Runnable",
+                                e1.names.contains("java/lang/Runnable"));
+        gate_bootstrap_presence("has_java_util_Collection",
+                                e1.names.contains("java/util/Collection"));
+        // Abstract class.
+        gate_bootstrap_presence("has_java_lang_Number",
+                                e1.names.contains("java/lang/Number"));
+        // Throwable hierarchy — the exception machinery is wired up before any
+        // user code on every JVM.
+        gate_bootstrap_presence("has_java_lang_Throwable",
+                                e1.names.contains("java/lang/Throwable"));
+        gate_bootstrap_presence("has_java_lang_Exception",
+                                e1.names.contains("java/lang/Exception"));
+        // Core utility singletons.
+        gate_bootstrap_presence("has_java_lang_System",
+                                e1.names.contains("java/lang/System"));
+        gate_bootstrap_presence("has_java_lang_Math",
+                                e1.names.contains("java/lang/Math"));
+        // java/util/ is, like java/lang/, fully populated before this module
+        // runs; a generous lower bound is a HARD portable floor (the bootstrap
+        // region is exactly what the JDK8 walk covers most reliably).
+        std::size_t java_util_prefix{ 0 };
+        for (const std::string& n : e1.names)
+        {
+            if (n.rfind("java/util/", 0) == 0)
+            {
+                ++java_util_prefix;
+            }
+        }
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: java/util/ prefix count=" }
+                   + std::to_string(java_util_prefix));
+        ctx.check("filter_java_util_prefix_over_10", java_util_prefix > 10);
+    }
+
+    // =====================================================================
+    // PART I — OWN-fixture klass DEEP USABILITY (beyond name round-trip).  PASS 1
+    // proves the enumerated klass* round-trips its _name; here, when the fixture
+    // was surfaced (JDK 9+ HARD; JDK8 enumeration-miss skipped), we drive the
+    // SAME klass* through the public klass accessors to prove it is a fully
+    // formed InstanceKlass, not just a pointer whose name decodes:
+    //   - get_super() returns java/lang/Object (the fixture is `final class
+    //     ForEachLoadedClass`, extends Object on EVERY JDK — a plain class's
+    //     super is always Object, no JDK variance, unlike array-klass super #32);
+    //   - find_field("sentinel") resolves (the fixture declares
+    //     `public static int sentinel`), proving constant-pool / field-stream
+    //     decode works through the enumerated pointer;
+    //   - find_field on a name the class does NOT declare returns nullopt
+    //     (negative control — the accessor is selective, not "always present").
+    // =====================================================================
+    {
+        if (e1.own_klass_ptr != nullptr
+            && vmhook::hotspot::is_valid_pointer(e1.own_klass_ptr))
+        {
+            // get_super() -> java/lang/Object.  No JDK variance for a plain final
+            // class; the enumerated pointer is a real InstanceKlass with a wired
+            // super-link.
+            vmhook::hotspot::klass* const super{ e1.own_klass_ptr->get_super() };
+            bool super_is_object{ false };
+            if (super != nullptr && vmhook::hotspot::is_valid_pointer(super))
+            {
+                const vmhook::hotspot::symbol* const super_name{ super->get_name() };
+                if (vmhook::hotspot::is_valid_pointer(super_name))
+                {
+                    super_is_object = (super_name->to_string() == "java/lang/Object");
+                }
+            }
+            gate_own_fixture("own_fixture_super_is_object", super_is_object, own_enumerated);
+
+            // find_field("sentinel") resolves the declared static int field.
+            const bool sentinel_found{
+                e1.own_klass_ptr->find_field("sentinel").has_value() };
+            gate_own_fixture("own_fixture_has_sentinel_field", sentinel_found, own_enumerated);
+
+            // Negative control: a field the class does not declare is absent.
+            const bool bogus_absent{
+                !e1.own_klass_ptr->find_field("felc_no_such_field_xyz").has_value() };
+            gate_own_fixture("own_fixture_bogus_field_absent", bogus_absent, own_enumerated);
+        }
+        else
+        {
+            ctx.record(std::string{ "[INFO] for_each_loaded_class: OWN-fixture deep "
+                                    "usability not asserted (fixture klass* not captured this "
+                                    "pass — JDK8 enumeration miss)" });
+        }
+    }
+
+    // =====================================================================
+    // PART J — SNAPSHOT-WIDE NAME-CHARSET invariants (every distinct name, not
+    // just the per-visit flag).  Internal names use only '/', '$', '[', 'L',
+    // ';', and the JVM identifier charset — NEVER a backslash, NEVER a NUL, and
+    // a ';' may appear ONLY in an array descriptor (object-array element
+    // terminator).  These are HARD on every JDK: a violation means symbol decode
+    // produced a malformed name regardless of which loader path surfaced it.
+    // =====================================================================
+    {
+        bool any_backslash{ false };
+        bool any_embedded_nul{ false };
+        bool semicolon_only_in_arrays{ true };
+        bool dollar_outer_wellformed{ true };
+        for (const std::string& n : e1.names)
+        {
+            if (n.find('\\') != std::string::npos)
+            {
+                any_backslash = true;
+            }
+            if (n.find('\0') != std::string::npos)
+            {
+                any_embedded_nul = true;
+            }
+            // ';' is legal ONLY as the terminator of an object-array descriptor
+            // (a name starting with '['); a non-array name carrying ';' is a torn
+            // symbol.
+            if (n.find(';') != std::string::npos && (n.empty() || n.front() != '['))
+            {
+                semicolon_only_in_arrays = false;
+            }
+            // For every nested ('$') name, the substring BEFORE the first '$' (the
+            // outer class name) is itself a non-empty well-formed internal name.
+            const std::size_t dollar{ n.find('$') };
+            if (dollar != std::string::npos)
+            {
+                const std::string outer{ n.substr(0, dollar) };
+                if (outer.empty() || !name_is_wellformed(outer))
+                {
+                    dollar_outer_wellformed = false;
+                }
+            }
+        }
+        ctx.check("no_backslash_in_any_name", !any_backslash);
+        ctx.check("no_embedded_nul_in_any_name", !any_embedded_nul);
+        ctx.check("semicolon_only_in_array_descriptors", semicolon_only_in_arrays);
+        ctx.check("nested_outer_prefix_wellformed", dollar_outer_wellformed);
+
+        // The bare primitive descriptors ("I", "Z", "J", ...) are NOT class
+        // names — a real enumeration never surfaces a single-tag primitive token
+        // as a Klass name (primitives have no Klass; only their array forms do).
+        const char* const prim_tags[]{ "I", "Z", "B", "C", "S", "J", "F", "D", "V" };
+        bool any_bare_primitive{ false };
+        for (const char* const tag : prim_tags)
+        {
+            if (e1.names.contains(tag))
+            {
+                any_bare_primitive = true;
+            }
+        }
+        ctx.check("no_bare_primitive_descriptor_name", !any_bare_primitive);
+
+        // Population-vs-total bookkeeping (arithmetic over our own tallies, HARD
+        // on every JDK): the prefix / array / nested sub-populations can never
+        // exceed the total distinct-name set.
+        ctx.check("array_population_le_names", e1.array_names <= e1.count);
+        ctx.check("nested_population_le_names", e1.dollar_names <= e1.count);
+        ctx.check("java_util_consistency", e1.java_lang_prefix <= e1.names.size());
+    }
+
+    // =====================================================================
+    // PART K — ENUMERATION value-semantics (copy / move) + idempotency.  The
+    // per-pass result struct is an ordinary value; copying or moving it must
+    // preserve every observable (the caller may stash a snapshot).  A copy
+    // compares equal field-by-field on the robust invariants; a move leaves the
+    // copy intact.  This is pure C++ value-semantics over our own struct — HARD
+    // on every JDK.
+    // =====================================================================
+    {
+        const enumeration original{ enumerate_once() };
+        const enumeration copied{ original };   // copy-init (MSVC-safe, RULE).
+        ctx.check("copy_preserves_count", copied.count == original.count);
+        ctx.check("copy_preserves_name_set", copied.names == original.names);
+        ctx.check("copy_preserves_ptr_set", copied.ptrs == original.ptrs);
+        ctx.check("copy_preserves_validity", copied.all_klass_valid == original.all_klass_valid);
+
+        // Move: the moved-from std::set members are left in a valid but
+        // unspecified state, so we only assert the moved-INTO value matches the
+        // pre-move snapshot's robust invariants.
+        const std::size_t pre_move_count{ original.count };
+        const std::size_t pre_move_names{ original.names.size() };
+        enumeration moved_src{ enumerate_once() };
+        const std::size_t src_count{ moved_src.count };
+        const std::size_t src_names{ moved_src.names.size() };
+        const enumeration moved_dst{ std::move(moved_src) };
+        ctx.check("move_preserves_count", moved_dst.count == src_count);
+        ctx.check("move_preserves_name_count", moved_dst.names.size() == src_names);
+        // Idempotency: two independent enumerations both clear the liveness floor
+        // and agree that the app loader was reached (robust, lottery-free).
+        ctx.check("idempotent_floor_original", pre_move_count > 100);
+        ctx.check("idempotent_floor_moved", moved_dst.count > 100);
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: value-semantics passes — "
+                                "orig.names=" }
+                   + std::to_string(pre_move_names) + " moved.names="
+                   + std::to_string(moved_dst.names.size()));
+    }
+
+    // =====================================================================
+    // PART L — CROSS-PASS NAME-SET stability (set algebra, not just counts).
+    // PASS 2 already checks counts drift within a band; here we prove the
+    // bootstrap CORE is a genuine STABLE SET: the java/lang/ names common to
+    // both passes are themselves numerous (the deterministic core never
+    // collapses to a handful), and the five canonical bootstrap names that BOTH
+    // passes agree on is non-empty.  Set-intersection floors are robust to the
+    // JDK8 per-entry lottery because the bootstrap region is what its walk
+    // covers most reliably.
+    // =====================================================================
+    {
+        // Intersection of the two passes' java/lang/ subsets.
+        std::vector<std::string> jl1{};
+        std::vector<std::string> jl2{};
+        for (const std::string& n : e1.names)
+        {
+            if (n.rfind("java/lang/", 0) == 0)
+            {
+                jl1.push_back(n);
+            }
+        }
+        for (const std::string& n : e2.names)
+        {
+            if (n.rfind("java/lang/", 0) == 0)
+            {
+                jl2.push_back(n);
+            }
+        }
+        std::vector<std::string> common{};
+        std::set_intersection(jl1.begin(), jl1.end(), jl2.begin(), jl2.end(),
+                              std::back_inserter(common));
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: java/lang/ common across "
+                                "passes=" }
+                   + std::to_string(common.size()));
+        // The deterministic bootstrap java/lang/ core shared by both passes is
+        // numerous — far more than a handful — on every JDK.
+        ctx.check("java_lang_common_across_passes_over_10", common.size() > 10);
+
+        // The whole-snapshot intersection is itself non-trivial: two back-to-back
+        // walks overwhelmingly agree (classes accrete, they do not churn).
+        std::vector<std::string> all_common{};
+        std::set_intersection(e1.names.begin(), e1.names.end(),
+                              e2.names.begin(), e2.names.end(),
+                              std::back_inserter(all_common));
+        ctx.record(std::string{ "[INFO] for_each_loaded_class: full-snapshot common across "
+                                "passes=" }
+                   + std::to_string(all_common.size()));
+        ctx.check("full_snapshot_common_over_100", all_common.size() > 100);
+        // The common set is bounded by each pass's own size (set-algebra sanity).
+        ctx.check("common_le_pass1", all_common.size() <= e1.names.size());
+        ctx.check("common_le_pass2", all_common.size() <= e2.names.size());
     }
 }

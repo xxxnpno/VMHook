@@ -1898,6 +1898,274 @@ namespace
         }
 
         // =====================================================================
+        // ADDED DEEPENING — CROSS-CONTAINER CONTENT AGREEMENT (small).  hashSmall,
+        // linkedSmall and hashtableSmall are built from the IDENTICAL recipe
+        // (k0..k2 -> Box(i,"v"+i)), yet decode through different klass layouts
+        // (HashMap.Node, LinkedHashMap.Node, Hashtable.Entry).  Their order-
+        // independent fingerprints must therefore be byte-for-byte equal — a
+        // strong native-vs-native cross-check that the three positive walkers
+        // agree on content regardless of layout/order.
+        // =====================================================================
+        {
+            const entry_stats hs{ fingerprint(coll_map_fixture::entries_of("hashSmall")) };
+            const entry_stats ls{ fingerprint(coll_map_fixture::entries_of("linkedSmall")) };
+            const entry_stats ht{ fingerprint(coll_map_fixture::entries_of("hashtableSmall")) };
+
+            ctx.check("cmap_xcontainer_small_counts_all_equal",
+                      hs.count == ls.count && ls.count == ht.count && hs.count == SMALL_N);
+            ctx.check("cmap_xcontainer_small_id_sum_all_equal",
+                      hs.id_sum == ls.id_sum && ls.id_sum == ht.id_sum);
+            ctx.check("cmap_xcontainer_small_id_xor_all_equal",
+                      hs.id_xor == ls.id_xor && ls.id_xor == ht.id_xor);
+            ctx.check("cmap_xcontainer_small_key_char_sum_all_equal",
+                      hs.key_char_sum == ls.key_char_sum && ls.key_char_sum == ht.key_char_sum);
+            // Triangulate against Java's published HashMap fingerprint too.
+            ctx.check("cmap_xcontainer_small_matches_java_hashsmall",
+                      hs.id_sum == coll_map_fixture::j_long("hashSmallIdSum")
+                          && ht.id_sum == coll_map_fixture::j_long("hashSmallIdSum")
+                          && ls.key_char_sum == coll_map_fixture::j_long("hashSmallKeyCharSum"));
+            // None of the three may surface a null key/value for this clean recipe.
+            ctx.check("cmap_xcontainer_small_no_nulls_anywhere",
+                      hs.null_keys == 0 && hs.null_values == 0
+                          && ls.null_keys == 0 && ls.null_values == 0
+                          && ht.null_keys == 0 && ht.null_values == 0);
+        }
+
+        // =====================================================================
+        // ADDED DEEPENING — CROSS-CONTAINER CONTENT AGREEMENT (MANY=1000).  The
+        // 1000-entry HashMap, LinkedHashMap and TreeMap are built from the same
+        // k0..k999 -> Box(i,"v"+i) recipe.  Across a hash table that has resized
+        // several times, a bucket-ordered linked table, and a deep red-black
+        // tree, the order-independent aggregates must STILL coincide and match
+        // the closed-form sum 0..999 == 499500.
+        // =====================================================================
+        {
+            const entry_stats hm{ fingerprint(coll_map_fixture::entries_of("hashMany")) };
+            const entry_stats lm{ fingerprint(coll_map_fixture::entries_of("linkedMany")) };
+            const entry_stats tm{ fingerprint(coll_map_fixture::entries_of("treeMany")) };
+            const std::int64_t closed{ (static_cast<std::int64_t>(MANY_N) * (MANY_N - 1)) / 2 };
+
+            ctx.check("cmap_xcontainer_many_counts_all_1000",
+                      hm.count == MANY_N && lm.count == MANY_N && tm.count == MANY_N);
+            ctx.check("cmap_xcontainer_many_id_sum_all_equal_closed_form",
+                      hm.id_sum == closed && lm.id_sum == closed && tm.id_sum == closed);
+            ctx.check("cmap_xcontainer_many_id_xor_hash_eq_linked",
+                      hm.id_xor == lm.id_xor);
+            // The tree carries the same value ids, so its xor matches too.
+            ctx.check("cmap_xcontainer_many_id_xor_tree_eq_hash",
+                      tm.id_xor == hm.id_xor);
+            ctx.check("cmap_xcontainer_many_key_char_sum_hash_eq_tree",
+                      hm.key_char_sum == tm.key_char_sum);
+            ctx.check("cmap_xcontainer_many_matches_java",
+                      hm.id_sum == coll_map_fixture::j_long("hashManyIdSum")
+                          && tm.id_sum == coll_map_fixture::j_long("treeManyIdSum"));
+        }
+
+        // =====================================================================
+        // ADDED DEEPENING — INSERTION ORDER FULLY ERASED BY THE TREE WALK.  The
+        // ascending-built treeSmall and the descending-built treeReverseInsert
+        // hold IDENTICAL content; the in-order red-black walk must emit BOTH as
+        // the exact same ascending key SEQUENCE (not merely the same set), so the
+        // decoded key vectors are element-for-element equal.
+        // =====================================================================
+        {
+            const auto e_asc{ coll_map_fixture::entries_of("treeSmall") };
+            const auto e_desc{ coll_map_fixture::entries_of("treeReverseInsert") };
+            const std::vector<std::string> k_asc{ keys_in_walk_order(e_asc) };
+            const std::vector<std::string> k_desc{ keys_in_walk_order(e_desc) };
+            ctx.check("cmap_tree_insert_order_erased_same_length",
+                      k_asc.size() == k_desc.size() && k_asc.size() == static_cast<std::size_t>(SMALL_N));
+            ctx.check("cmap_tree_insert_order_erased_identical_sequence",
+                      k_asc == k_desc);
+            ctx.check("cmap_tree_insert_order_erased_both_ascending",
+                      std::is_sorted(k_asc.begin(), k_asc.end())
+                          && std::is_sorted(k_desc.begin(), k_desc.end()));
+        }
+
+        // =====================================================================
+        // ADDED DEEPENING — vmhook::map WRAPPER size()/is_empty() ACROSS SHAPES.
+        // Extends the existing wrapper-surface block (hashSmall/treeSmall/empties)
+        // to the size-1 and MANY shapes, cross-checking the wrapper's own size()
+        // against Java size() and against the decoded entry count — a third,
+        // independent oracle (Java size vs wrapper size vs decoded count).
+        // =====================================================================
+        {
+            const auto h1{ coll_map_fixture::acquire_map("hashOne") };
+            ctx.check("cmap_wrapper_hashone_acquired", h1 != nullptr);
+            if (h1)
+            {
+                ctx.check("cmap_wrapper_hashone_size_is_1", h1->size() == 1);
+                ctx.check("cmap_wrapper_hashone_not_empty", h1->is_empty() == false);
+                ctx.check("cmap_wrapper_hashone_size_matches_java",
+                          h1->size() == coll_map_fixture::j_size("hashOneSize"));
+                ctx.check("cmap_wrapper_hashone_size_matches_decoded",
+                          h1->size() == static_cast<std::int32_t>(
+                                            h1->to_entries<string_key, box_value>().size()));
+            }
+
+            const auto t1{ coll_map_fixture::acquire_map("treeOne") };
+            ctx.check("cmap_wrapper_treeone_acquired", t1 != nullptr);
+            if (t1)
+            {
+                ctx.check("cmap_wrapper_treeone_size_is_1", t1->size() == 1);
+                ctx.check("cmap_wrapper_treeone_not_empty", t1->is_empty() == false);
+                ctx.check("cmap_wrapper_treeone_size_matches_java",
+                          t1->size() == coll_map_fixture::j_size("treeOneSize"));
+            }
+
+            const auto hmany{ coll_map_fixture::acquire_map("hashMany") };
+            ctx.check("cmap_wrapper_hashmany_acquired", hmany != nullptr);
+            if (hmany)
+            {
+                ctx.check("cmap_wrapper_hashmany_size_is_1000", hmany->size() == MANY_N);
+                ctx.check("cmap_wrapper_hashmany_size_matches_java",
+                          hmany->size() == coll_map_fixture::j_size("hashManySize"));
+                ctx.check("cmap_wrapper_hashmany_size_matches_decoded",
+                          hmany->size() == static_cast<std::int32_t>(
+                                               hmany->to_entries<string_key, box_value>().size()));
+            }
+
+            const auto tmany{ coll_map_fixture::acquire_map("treeMany") };
+            ctx.check("cmap_wrapper_treemany_acquired", tmany != nullptr);
+            if (tmany)
+            {
+                ctx.check("cmap_wrapper_treemany_size_is_1000", tmany->size() == MANY_N);
+                ctx.check("cmap_wrapper_treemany_size_matches_java",
+                          tmany->size() == coll_map_fixture::j_size("treeManySize"));
+            }
+        }
+
+        // =====================================================================
+        // ADDED DEEPENING — WRAPPER size() AND to_entries() DIVERGE FOR THE
+        // CHARACTERIZED-EMPTY CHM.  ConcurrentHashMap exposes a working Java
+        // size() (read via the wrapper) that is NON-zero, while to_entries reads
+        // EMPTY (its Node names the value field "val", not "value").  This pins
+        // the two surfaces explicitly disagreeing for the documented-gap shape:
+        // size()/is_empty() reflect Java truth, to_entries reflects the walk gap.
+        // =====================================================================
+        {
+            const auto chm{ coll_map_fixture::acquire_map("chmSmall") };
+            ctx.check("cmap_wrapper_chmsmall_acquired", chm != nullptr);
+            if (chm)
+            {
+                // Java size() through the wrapper IS non-zero (the map is populated)...
+                ctx.check("cmap_wrapper_chmsmall_size_is_3", chm->size() == SMALL_N);
+                ctx.check("cmap_wrapper_chmsmall_not_empty", chm->is_empty() == false);
+                // ...yet the heap walk yields EMPTY (the "val" field-name gap).
+                ctx.check("cmap_wrapper_chmsmall_to_entries_empty",
+                          chm->to_entries<string_key, box_value>().empty());
+                // Explicit divergence: size()>0 but decoded count==0.
+                ctx.check("cmap_wrapper_chmsmall_size_diverges_from_decoded",
+                          chm->size() > 0
+                              && chm->to_entries<string_key, box_value>().empty());
+            }
+        }
+
+        // =====================================================================
+        // ADDED DEEPENING — DECODED-VECTOR VALUE SEMANTICS (move + swap).  The
+        // returned std::vector of unique_ptr pairs is a plain owning value; a
+        // move must transfer ownership intact (source emptied, destination keeps
+        // the full fingerprint) and a std::swap round-trip must be identity.  The
+        // walk itself has no heap side effects, so a fresh decode after the moves
+        // reproduces the same fingerprint.
+        // =====================================================================
+        {
+            auto src{ coll_map_fixture::entries_of("hashSmall") };
+            const entry_stats before{ fingerprint(src) };
+            ctx.check("cmap_valuesem_before_count_is_3", before.count == SMALL_N);
+
+            // Move-construct: ownership transfers; source becomes empty.
+            auto moved{ std::move(src) };
+            const entry_stats after_move{ fingerprint(moved) };
+            ctx.check("cmap_valuesem_move_preserves_count", after_move.count == before.count);
+            ctx.check("cmap_valuesem_move_preserves_id_sum", after_move.id_sum == before.id_sum);
+            ctx.check("cmap_valuesem_move_preserves_key_char_sum",
+                      after_move.key_char_sum == before.key_char_sum);
+            ctx.check("cmap_valuesem_moved_from_source_is_empty", src.empty());
+
+            // swap round-trip with an empty vector is an identity for `moved`.
+            std::vector<std::pair<std::unique_ptr<string_key>, std::unique_ptr<box_value>>> sink;
+            std::swap(moved, sink);
+            ctx.check("cmap_valuesem_swap_moves_into_sink",
+                      moved.empty() && static_cast<std::int32_t>(sink.size()) == SMALL_N);
+            std::swap(moved, sink);
+            const entry_stats after_roundtrip{ fingerprint(moved) };
+            ctx.check("cmap_valuesem_swap_roundtrip_identity",
+                      after_roundtrip.count == before.count
+                          && after_roundtrip.id_sum == before.id_sum
+                          && after_roundtrip.key_char_sum == before.key_char_sum);
+
+            // A brand-new decode reproduces the same fingerprint (no side effects).
+            const entry_stats fresh{ fingerprint(coll_map_fixture::entries_of("hashSmall")) };
+            ctx.check("cmap_valuesem_fresh_decode_matches",
+                      fresh.count == before.count
+                          && fresh.id_sum == before.id_sum
+                          && fresh.key_char_sum == before.key_char_sum);
+        }
+
+        // =====================================================================
+        // ADDED DEEPENING — EVERY POPULATED MAP'S DECODED COUNT NEVER EXCEEDS ITS
+        // JAVA size() (a sweep of the no-over-read invariant across many shapes in
+        // one pass).  The per-shape blocks above already assert count==size for
+        // each; this is a compact belt-and-braces over the full positive-decode
+        // set, catching any future shape that silently over-reads past its size.
+        // =====================================================================
+        {
+            struct shape { const char* field; const char* size_field; };
+            const shape positive[] = {
+                { "hashOne",       "hashOneSize" },
+                { "hashTwo",       "hashTwoSize" },
+                { "hashSmall",     "hashSmallSize" },
+                { "hashMany",      "hashManySize" },
+                { "hashNullKey",   "hashNullKeySize" },
+                { "hashNullValue", "hashNullValueSize" },
+                { "hashEmptyStr",  "hashEmptyStrSize" },
+                { "hashTreeified", "hashTreeifiedSize" },
+                { "hashtableSmall","hashtableSmallSize" },
+                { "hashColl6",     "hashColl6Size" },
+                { "hashResize16",  "hashResize16Size" },
+                { "hashResize17",  "hashResize17Size" },
+                { "linkedSmall",   "linkedSmallSize" },
+                { "linkedMany",    "linkedManySize" },
+                { "treeOne",       "treeOneSize" },
+                { "treeTwo",       "treeTwoSize" },
+                { "treeSmall",     "treeSmallSize" },
+                { "treeMany",      "treeManySize" },
+            };
+            bool never_over_reads{ true };
+            bool always_exact{ true };
+            for (const auto& s : positive)
+            {
+                const std::int32_t decoded{
+                    static_cast<std::int32_t>(coll_map_fixture::entries_of(s.field).size()) };
+                const std::int32_t jsize{ coll_map_fixture::j_size(s.size_field) };
+                if (decoded > jsize) { never_over_reads = false; }
+                if (decoded != jsize) { always_exact = false; }
+            }
+            ctx.check("cmap_sweep_no_shape_over_reads", never_over_reads);
+            ctx.check("cmap_sweep_every_shape_count_eq_size", always_exact);
+        }
+
+        // =====================================================================
+        // ADDED DEEPENING — CHARACTERIZED-EMPTY SWEEP NEVER THROWS / ALWAYS EMPTY.
+        // A compact pass over every shape the audit characterizes as empty (the
+        // unmodifiable/singleton views, the layout-gap maps): each must decode to
+        // an empty vector with no throw, regardless of its (non-zero) Java size().
+        // =====================================================================
+        {
+            const char* empties[] = {
+                "emptyMapColl", "singletonMapColl", "unmodifiableHash", "unmodifiableTree",
+                "chmSmall", "chmMany", "weakSmall", "identitySmall", "enumSmall",
+            };
+            bool all_empty{ true };
+            for (const char* f : empties)
+            {
+                if (!coll_map_fixture::entries_of(f).empty()) { all_empty = false; }
+            }
+            ctx.check("cmap_sweep_characterized_empties_all_empty", all_empty);
+        }
+
+        // =====================================================================
         // Interpreter-hook proof (pilot-style): install a scoped_hook on touch(),
         // drive mode 1, confirm the detour fires on real bytecode dispatch with the
         // right self+arg and the original body runs (observed == seed+42 == 7042).

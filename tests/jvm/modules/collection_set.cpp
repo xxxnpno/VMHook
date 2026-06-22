@@ -140,6 +140,7 @@
 #include <memory>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace
@@ -1702,6 +1703,256 @@ namespace
             ctx.check("tree_many_reread_same_sequence", ta == tb);
             ctx.check("tree_many_reread_still_sorted",
                       std::is_sorted(tb.begin(), tb.end()));
+        }
+
+        // =====================================================================
+        // ADDITIVE DEEPENING — gaps the matrix above did not yet cover.  Every
+        // assertion below is either a pure C++ computation over an ALREADY-decoded
+        // vector or a cross-check against an EXISTING Java-published field; no new
+        // fixture field is introduced.  All are order-independent or assert an
+        // order the walk DEFINES (TreeSet in-order), so none are brittle.
+        // =====================================================================
+
+        // ---- treeReverse: id-sum / id-xor closed form (only ORDER was pinned) --
+        // The reverse-comparator TreeSet holds ids {0,1,2}; idSum/idXor are
+        // order-independent, so the closed form holds regardless of walk order.
+        {
+            const auto v{ coll_set_fixture::elems_of("treeReverse") };
+            const elem_stats st{ fingerprint(v) };
+            // sum 0+1+2 == 3, xor 0^1^2 == 3.
+            ctx.check("tree_reverse_id_sum_closed_form", st.id_sum == 3);
+            ctx.check("tree_reverse_id_xor_closed_form", st.id_xor == 3);
+            ctx.check("tree_reverse_all_distinct", st.distinct_oops);
+            ctx.check("tree_reverse_tags_round_trip", st.tags_consistent);
+            // Membership is order-free: ids {0,1,2} each exactly once.
+            const auto ids{ id_set(v) };
+            ctx.check("tree_reverse_membership_complete",
+                      ids.size() == static_cast<std::size_t>(SMALL_N)
+                      && ids.count(0) == 1 && ids.count(1) == 1 && ids.count(2) == 1);
+        }
+
+        // ---- treeMany: id-XOR closed form (only id-SUM was cross-checked) ------
+        // XOR of 0..TREE_MANY_N-1, computed the same way Java would; pins the
+        // bucket-independent xor fingerprint the TreeSet many-case lacked.
+        {
+            const auto v{ coll_set_fixture::elems_of("treeMany") };
+            const elem_stats st{ fingerprint(v) };
+            std::int64_t expect_xor{ 0 };
+            for (std::int32_t i{ 0 }; i < TREE_MANY_N; ++i) { expect_xor ^= i; }
+            ctx.check("tree_many_id_xor_closed_form", st.id_xor == expect_xor);
+            ctx.check("tree_many_distinct_count_equals_size",
+                      st.distinct_oops && st.count == TREE_MANY_N);
+            ctx.check("tree_many_tags_round_trip", st.tags_consistent);
+        }
+
+        // ---- hashIntegers: value-XOR closed form (only val-SUM had one) --------
+        {
+            const auto v{ coll_set_fixture::ints_of("hashIntegers") };
+            const int_stats st{ fingerprint_ints(v) };
+            std::int64_t expect_xor{ 0 };
+            for (std::int32_t i{ 0 }; i < INT_N; ++i) { expect_xor ^= i; }
+            ctx.check("hash_ints_val_xor_closed_form", st.val_xor == expect_xor);
+        }
+
+        // ---- treeStrings (forward): EXACT lexicographic triple ----------------
+        // The reverse String tree asserts the exact descending triple; the
+        // forward one only asserted is_sorted + endpoints.  Pin the exact
+        // ascending sequence ["apple","banana","cherry"] (TreeSet natural order).
+        {
+            const auto v{ coll_set_fixture::strings_of("treeStrings") };
+            std::vector<std::string> order;
+            order.reserve(v.size());
+            for (const auto& up : v) { order.push_back(up ? up->text() : std::string{}); }
+            ctx.check("tree_strings_exact_ascending_sequence",
+                      order.size() == 3 && order[0] == "apple"
+                      && order[1] == "banana" && order[2] == "cherry");
+        }
+
+        // ---- hashSingle / treeSingle: the element TAG round-trips exactly ------
+        // Each is "e0"; pins the reference-field readback on the single-element
+        // boundary for both walkers (a pure value check, order-free).
+        {
+            const auto hv{ coll_set_fixture::elems_of("hashSingle") };
+            ctx.check("hash_single_tag_is_e0",
+                      hv.size() == 1 && hv[0] != nullptr && hv[0]->tag() == "e0"
+                      && hv[0]->id() == 0);
+
+            const auto tv{ coll_set_fixture::elems_of("treeSingle") };
+            ctx.check("tree_single_tag_is_e0",
+                      tv.size() == 1 && tv[0] != nullptr && tv[0]->tag() == "e0"
+                      && tv[0]->id() == 0);
+        }
+
+        // ---- VALUE-SEMANTICS: move of a decoded vector preserves content ------
+        // to_vector returns by value; moving the result must transfer the
+        // unique_ptr slots intact (same count + same fingerprint) and leave the
+        // moved-from vector empty.  Proves the decode product is a well-behaved
+        // owning value, not a view over freed state.
+        {
+            auto src{ coll_set_fixture::elems_of("hashMany") };
+            const elem_stats before{ fingerprint(src) };
+            auto dst{ std::move(src) };
+            const elem_stats after{ fingerprint(dst) };
+            ctx.check("hash_many_move_preserves_count", after.count == before.count);
+            ctx.check("hash_many_move_preserves_id_sum", after.id_sum == before.id_sum);
+            ctx.check("hash_many_move_preserves_id_xor", after.id_xor == before.id_xor);
+            ctx.check("hash_many_move_preserves_distinct", after.distinct_oops);
+            // NOLINTNEXTLINE(bugprone-use-after-move) — intentionally inspecting
+            // the moved-from vector: a std::vector is guaranteed empty after move.
+            ctx.check("hash_many_moved_from_is_empty", src.empty());
+        }
+
+        // ---- TreeSet move preserves the EXACT in-order sequence ----------------
+        {
+            auto src{ coll_set_fixture::elems_of("treeSmall") };
+            const std::vector<std::int32_t> before{ ids_in_order(src) };
+            auto dst{ std::move(src) };
+            const std::vector<std::int32_t> after{ ids_in_order(dst) };
+            ctx.check("tree_small_move_preserves_sequence", after == before);
+            ctx.check("tree_small_move_sequence_is_012",
+                      after.size() == 3 && after[0] == 0 && after[1] == 1 && after[2] == 2);
+        }
+
+        // ---- IDEMPOTENCY across MORE shapes (only hashMany/treeMany re-read) ---
+        // Decoding the SAME field twice must yield identical order-free
+        // fingerprints — extends the re-read-stability proof to a HashSet<String>,
+        // the boxed-Integer set, and the SetFromMap(HashMap) FIXED path.
+        {
+            const string_stats a{ fingerprint_strings(coll_set_fixture::strings_of("hashStrings")) };
+            const string_stats b{ fingerprint_strings(coll_set_fixture::strings_of("hashStrings")) };
+            ctx.check("hash_strings_reread_same_count", a.count == b.count);
+            ctx.check("hash_strings_reread_same_char_sum", a.char_sum == b.char_sum);
+
+            const int_stats ia{ fingerprint_ints(coll_set_fixture::ints_of("hashIntegers")) };
+            const int_stats ib{ fingerprint_ints(coll_set_fixture::ints_of("hashIntegers")) };
+            ctx.check("hash_ints_reread_same_count", ia.count == ib.count);
+            ctx.check("hash_ints_reread_same_val_sum", ia.val_sum == ib.val_sum);
+            ctx.check("hash_ints_reread_same_val_xor", ia.val_xor == ib.val_xor);
+
+            const elem_stats sa{ fingerprint(coll_set_fixture::elems_of("setFromHashMap")) };
+            const elem_stats sb{ fingerprint(coll_set_fixture::elems_of("setFromHashMap")) };
+            ctx.check("setfrommap_reread_same_count", sa.count == sb.count);
+            ctx.check("setfrommap_reread_same_id_sum", sa.id_sum == sb.id_sum);
+            ctx.check("setfrommap_reread_stays_full",
+                      sa.count == SETFROMMAP_N && sb.count == SETFROMMAP_N);
+        }
+
+        // ---- setFromTreeMap re-read keeps the EXACT sorted sequence -----------
+        // The "m"->TreeMap klass-shape route must be deterministic across reads.
+        {
+            const std::vector<std::int32_t> a{ ids_in_order(coll_set_fixture::elems_of("setFromTreeMap")) };
+            const std::vector<std::int32_t> b{ ids_in_order(coll_set_fixture::elems_of("setFromTreeMap")) };
+            ctx.check("setfromtreemap_reread_same_sequence", a == b);
+            ctx.check("setfromtreemap_reread_still_sorted",
+                      std::is_sorted(b.begin(), b.end()));
+        }
+
+        // ---- CROSS-WALKER agreement: TreeSet vs HashSet over the SAME ids ------
+        // treeSmall (TreeSet) and a fresh order-free view of linkedSmall
+        // (LinkedHashSet) both hold ids {0,1,2}; their order-INDEPENDENT
+        // fingerprints (count, idSum, idXor, membership) must agree even though
+        // one walks a red-black tree and the other a bucket array.
+        {
+            const elem_stats ts{ fingerprint(coll_set_fixture::elems_of("treeSmall")) };
+            const elem_stats ls{ fingerprint(coll_set_fixture::elems_of("linkedSmall")) };
+            ctx.check("tree_vs_linked_same_count", ts.count == ls.count);
+            ctx.check("tree_vs_linked_same_id_sum", ts.id_sum == ls.id_sum);
+            ctx.check("tree_vs_linked_same_id_xor", ts.id_xor == ls.id_xor);
+            ctx.check("tree_vs_linked_both_three_distinct",
+                      ts.distinct_oops && ls.distinct_oops
+                      && ts.count == SMALL_N && ls.count == SMALL_N);
+        }
+
+        // ---- hashBig: id-XOR closed form (only the Java cross-check existed) ---
+        // XOR of 0..BIG_N-1 == 0 (BIG_N is a multiple of 4: x^(x+1)^(x+2)^(x+3)
+        // telescopes to 0 across each aligned quad, and 5000 % 4 == 0), giving an
+        // INDEPENDENT closed-form pin on the full bucket walk at scale.
+        {
+            const auto v{ coll_set_fixture::elems_of("hashBig") };
+            const elem_stats st{ fingerprint(v) };
+            std::int64_t expect_xor{ 0 };
+            for (std::int32_t i{ 0 }; i < BIG_N; ++i) { expect_xor ^= i; }
+            ctx.check("hash_big_id_xor_closed_form", st.id_xor == expect_xor);
+            ctx.check("hash_big_id_xor_is_zero", expect_xor == 0 && st.id_xor == 0);
+            ctx.check("hash_big_distinct_count_equals_size",
+                      st.distinct_oops
+                      && static_cast<std::int32_t>(id_set(v).size()) == BIG_N);
+        }
+
+        // ---- chmKeySet: id-sum closed form + membership distinctness ----------
+        // ids 600..600+CHM_N-1; sum == CHM_N*600 + (CHM_N*(CHM_N-1))/2.  An
+        // INDEPENDENT pin on the superclass-resolved 'map' CHM walk in addition to
+        // the Java cross-check.
+        {
+            const auto v{ coll_set_fixture::elems_of("chmKeySet") };
+            const elem_stats st{ fingerprint(v) };
+            const std::int64_t expect_sum{
+                static_cast<std::int64_t>(CHM_N) * 600
+                + (static_cast<std::int64_t>(CHM_N) * (CHM_N - 1)) / 2 };
+            ctx.check("chm_keyset_id_sum_closed_form", st.id_sum == expect_sum);
+            ctx.check("chm_keyset_distinct_count_equals_size",
+                      st.distinct_oops && st.count == CHM_N);
+        }
+
+        // ---- hashDup / treeDup: distinct-OOP count equals the deduped size -----
+        // Each duplicate add was a DISTINCT object absorbed by equals/compareTo;
+        // the surviving element count and OOP set must equal the deduped size, and
+        // each id appears exactly once (dedup survived the walk, no phantom slot).
+        {
+            const auto hd{ coll_set_fixture::elems_of("hashDup") };
+            const elem_stats hst{ fingerprint(hd) };
+            ctx.check("hash_dup_distinct_count_equals_deduped_size",
+                      hst.distinct_oops && hst.count == DUP_DISTINCT
+                      && static_cast<std::int32_t>(id_set(hd).size()) == DUP_DISTINCT);
+
+            const auto td{ coll_set_fixture::elems_of("treeDup") };
+            const elem_stats tst{ fingerprint(td) };
+            ctx.check("tree_dup_distinct_count_equals_deduped_size",
+                      tst.distinct_oops && tst.count == SMALL_N
+                      && static_cast<std::int32_t>(id_set(td).size()) == SMALL_N);
+        }
+
+        // ---- EMPTY-set family: every empty shape decodes to a vector that is
+        //      both empty AND fingerprints to an all-zero stat (no null slots, no
+        //      ids) — a uniform empty-decode contract across HashSet / LinkedHash
+        //      Set / TreeSet / ConcurrentHashMap.newKeySet().
+        {
+            const char* const empties[]{
+                "hashEmpty", "linkedEmpty", "treeEmpty", "chmKeySetEmpty" };
+            bool all_empty_clean{ true };
+            for (const char* f : empties)
+            {
+                const auto v{ coll_set_fixture::elems_of(f) };
+                const elem_stats st{ fingerprint(v) };
+                if (!v.empty() || st.count != 0 || st.null_count != 0
+                    || st.id_sum != 0 || st.id_xor != 0)
+                {
+                    all_empty_clean = false;
+                }
+            }
+            ctx.check("all_empty_shapes_decode_clean_zero", all_empty_clean);
+        }
+
+        // ---- hashBooleans: exactly the two-element boundary, fully partitioned -
+        // Re-decode and assert the {TRUE,FALSE} partition is exact AND the two
+        // element OOPs are distinct (TRUE and FALSE are the two cached singletons).
+        {
+            const auto v{ coll_set_fixture::bools_of("hashBooleans") };
+            std::int32_t count{ 0 };
+            std::int32_t true_count{ 0 };
+            std::int32_t false_count{ 0 };
+            std::unordered_set<const void*> seen;
+            for (const auto& up : v)
+            {
+                ++count;
+                if (up == nullptr) { continue; }
+                if (up->value()) { ++true_count; } else { ++false_count; }
+                seen.insert(static_cast<const void*>(up->get_instance()));
+            }
+            ctx.check("hash_bools_partition_is_one_each",
+                      count == TWO && true_count == 1 && false_count == 1);
+            ctx.check("hash_bools_two_distinct_oops",
+                      seen.size() == static_cast<std::size_t>(TWO));
         }
 
         // =====================================================================

@@ -63,12 +63,15 @@
 
 #include "../harness.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -2208,6 +2211,280 @@ namespace
                 ctx.check("guard_reject_clob_after_intact_by_overwide",
                           static_cast<std::int32_t>(pa->get()) == after_before);
             }
+        }
+    }
+
+    // =====================================================================
+    //  19. "C" WIDENING SHORTCUT across EVERY 1-byte arithmetic/enum value type.
+    //      The shortcut (vmhook.hpp ~15785-15793) fires for ANY trivially-
+    //      copyable value with sizeof==1 that is is_arithmetic_v OR is_enum_v --
+    //      not just C++ `char`.  Phases 6 / 6-inst drive only `char`; here we
+    //      drive `signed char`, `unsigned char`, std::int8_t, std::uint8_t,
+    //      std::byte (an ENUM -- static_cast-able but NOT implicitly convertible,
+    //      the case the header comment explicitly calls out) and a scoped
+    //      `enum class : unsigned char`.  Every one must land the FULL 2-byte
+    //      Java char with the high byte ZERO-extended via static_cast<unsigned
+    //      char> (a signed -1 byte must become 0x00FF, never 0xFFFF), proving the
+    //      shortcut is byte-kind-agnostic.  Self-restoring (Character.MAX final).
+    // =====================================================================
+    {
+        enum class one_byte_enum : unsigned char { lo = 0x5A, hi = 0xE9 };
+
+        const auto p{ fps::static_field("sC") };
+        if (p)
+        {
+            // signed char: 0x5A and a high-bit byte (0xE9) -> zero-extended.
+            p->set(static_cast<signed char>(0x5A));
+            ctx.check("C_shortcut_signed_char_005A", fps::get_u16("sC") == 0x005A);
+            p->set(static_cast<signed char>(0xE9)); // signed -23: must NOT sign-extend
+            ctx.check("C_shortcut_signed_char_zero_ext_00E9", fps::get_u16("sC") == 0x00E9);
+            p->set(static_cast<signed char>(0xFF)); // signed -1: must become 0x00FF
+            ctx.check("C_shortcut_signed_char_negone_00FF", fps::get_u16("sC") == 0x00FF);
+
+            // unsigned char: same widening, no sign question.
+            p->set(static_cast<unsigned char>(0x5A));
+            ctx.check("C_shortcut_unsigned_char_005A", fps::get_u16("sC") == 0x005A);
+            p->set(static_cast<unsigned char>(0xFF));
+            ctx.check("C_shortcut_unsigned_char_00FF", fps::get_u16("sC") == 0x00FF);
+
+            // std::int8_t / std::uint8_t explicit value types.
+            p->set(static_cast<std::int8_t>(0xE9)); // -23 -> zero-extended 0x00E9
+            ctx.check("C_shortcut_int8_zero_ext_00E9", fps::get_u16("sC") == 0x00E9);
+            p->set(static_cast<std::uint8_t>(0xAB));
+            ctx.check("C_shortcut_uint8_00AB", fps::get_u16("sC") == 0x00AB);
+
+            // std::byte: an ENUM (is_enum_v), static_cast-able but NOT implicitly
+            // convertible -- the exact case the header comment flags.  Must take
+            // the shortcut and zero-extend.
+            p->set(std::byte{ 0x5A });
+            ctx.check("C_shortcut_std_byte_005A", fps::get_u16("sC") == 0x005A);
+            p->set(std::byte{ 0xE9 });
+            ctx.check("C_shortcut_std_byte_zero_ext_00E9", fps::get_u16("sC") == 0x00E9);
+            p->set(std::byte{ 0xFF });
+            ctx.check("C_shortcut_std_byte_00FF", fps::get_u16("sC") == 0x00FF);
+
+            // scoped enum class : unsigned char -- 1-byte enum, also is_enum_v.
+            p->set(one_byte_enum::lo);
+            ctx.check("C_shortcut_scoped_enum_005A", fps::get_u16("sC") == 0x005A);
+            p->set(one_byte_enum::hi);
+            ctx.check("C_shortcut_scoped_enum_00E9", fps::get_u16("sC") == 0x00E9);
+
+            // Restore Character.MAX final for the (already-run) Java-observed phases.
+            p->set(static_cast<std::uint16_t>(0xFFFF));
+            ctx.check("C_shortcut_byte_kinds_restored_FFFF", fps::get_u16("sC") == 0xFFFF);
+        }
+    }
+
+    // =====================================================================
+    //  20. ENUM value at a NON-"C" width takes the trivially-copyable size-guard
+    //      path (NOT the "C" shortcut, which is sizeof==1 + sig=="C" only) and is
+    //      written by width like any other blob.  An enum whose underlying width
+    //      matches the slot lands its raw value; a mismatched-width enum is
+    //      REFUSED by the size guard.  Drives:
+    //        * enum : std::int32_t  (4B) into "I"  -> lands
+    //        * enum : std::int16_t  (2B) into "S"  -> lands
+    //        * enum : std::int64_t  (8B) into "J"  -> lands
+    //        * enum : std::int32_t  (4B) into "B"  -> REFUSED (4!=1), B unchanged
+    //      Every slot is restored to its documented final afterwards.
+    // =====================================================================
+    {
+        enum class e32 : std::int32_t { v = static_cast<std::int32_t>(0xC0FFEE99) };
+        enum class e16 : std::int16_t { v = static_cast<std::int16_t>(0x7ACE) };
+        enum class e64 : std::int64_t { v = static_cast<std::int64_t>(0x0F1E2D3C4B5A6978LL) };
+
+        if (const auto p{ fps::static_field("sI") })
+        {
+            p->set(e32::v); // 4B enum into 4B "I": width-matched -> lands as raw bits
+            ctx.check("enum_into_I_width_matched_lands",
+                      static_cast<std::uint32_t>(fps::get_i32("sI")) == 0xC0FFEE99u);
+            p->set(static_cast<std::int32_t>(0xDEADBEEF)); // restore documented final
+            ctx.check("enum_into_I_restored", fps::get_i32("sI") == static_cast<std::int32_t>(0xDEADBEEF));
+        }
+        if (const auto p{ fps::static_field("sS") })
+        {
+            p->set(e16::v); // 2B enum into 2B "S": lands
+            ctx.check("enum_into_S_width_matched_lands", fps::get_i16("sS") == static_cast<std::int16_t>(0x7ACE));
+            p->set(static_cast<std::int16_t>(0xBEEF)); // restore documented final
+            ctx.check("enum_into_S_restored", fps::get_i16("sS") == static_cast<std::int16_t>(0xBEEF));
+        }
+        if (const auto p{ fps::static_field("sJ") })
+        {
+            p->set(e64::v); // 8B enum into 8B "J": lands
+            ctx.check("enum_into_J_width_matched_lands",
+                      static_cast<std::uint64_t>(fps::get_i64("sJ")) == 0x0F1E2D3C4B5A6978ULL);
+            p->set(static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL)); // restore documented final
+            ctx.check("enum_into_J_restored",
+                      static_cast<std::uint64_t>(fps::get_i64("sJ")) == 0xDEADBEEFCAFEBABEULL);
+        }
+        if (const auto p{ fps::static_field("sB") })
+        {
+            p->set(static_cast<std::int8_t>(0xAB)); // seed the documented final
+            ctx.check("enum_guard_B_seed", fps::get_i8("sB") == static_cast<std::int8_t>(0xAB));
+            p->set(e32::v); // 4B enum into 1B "B": size mismatch -> REFUSED
+            ctx.check("enum_into_B_mismatch_refused", fps::get_i8("sB") == static_cast<std::int8_t>(0xAB));
+        }
+    }
+
+    // =====================================================================
+    //  21. PROXY ACCESSOR INVARIANTS for every primitive field this module
+    //      writes.  signature() returns the exact 1-char descriptor, is_static()
+    //      reflects the static/instance origin, is_reference() is false for every
+    //      primitive, and raw_address() is non-null for a resolvable slot AND
+    //      STABLE across re-resolution.  These are universal invariants the value
+    //      matrix never asserts directly; a regression in proxy construction
+    //      (wrong sig/flag/null pointer) would silently mis-route every set().
+    // =====================================================================
+    {
+        struct sig_case { const char* name; const char* sig; std::size_t width; };
+        const sig_case static_cases[] = {
+            { "sZ", "Z", 1 }, { "sB", "B", 1 }, { "sS", "S", 2 }, { "sC", "C", 2 },
+            { "sI", "I", 4 }, { "sJ", "J", 8 }, { "sF", "F", 4 }, { "sD", "D", 8 },
+        };
+        for (const auto& c : static_cases)
+        {
+            const auto p{ fps::static_field(c.name) };
+            ctx.check(std::string{ "proxy_static_resolves_" } + c.name, p.has_value());
+            if (!p) { continue; }
+            ctx.check(std::string{ "proxy_static_signature_" } + c.name, p->signature() == c.sig);
+            ctx.check(std::string{ "proxy_static_is_static_" } + c.name, p->is_static() == true);
+            ctx.check(std::string{ "proxy_static_not_reference_" } + c.name, p->is_reference() == false);
+            ctx.check(std::string{ "proxy_static_raw_address_nonnull_" } + c.name, p->raw_address() != nullptr);
+            // Re-resolving the same static field yields the same slot address.
+            const auto q{ fps::static_field(c.name) };
+            ctx.check(std::string{ "proxy_static_raw_address_stable_" } + c.name,
+                      q.has_value() && q->raw_address() == p->raw_address());
+            // jvm_primitive_byte_width oracle agrees with the descriptor.
+            ctx.check(std::string{ "proxy_static_width_oracle_" } + c.name,
+                      vmhook::detail::jvm_primitive_byte_width(c.sig) == c.width);
+        }
+
+        if (inst)
+        {
+            const char* inst_names[] = { "iZ", "iB", "iS", "iC", "iI", "iJ", "iF", "iD" };
+            const char* inst_sigs[]  = { "Z",  "B",  "S",  "C",  "I",  "J",  "F",  "D"  };
+            for (std::size_t k = 0; k < 8; ++k)
+            {
+                auto p{ inst->get_field(inst_names[k]) };
+                ctx.check(std::string{ "proxy_inst_resolves_" } + inst_names[k], p.has_value());
+                if (!p) { continue; }
+                ctx.check(std::string{ "proxy_inst_signature_" } + inst_names[k], p->signature() == inst_sigs[k]);
+                ctx.check(std::string{ "proxy_inst_is_static_false_" } + inst_names[k], p->is_static() == false);
+                ctx.check(std::string{ "proxy_inst_not_reference_" } + inst_names[k], p->is_reference() == false);
+                ctx.check(std::string{ "proxy_inst_raw_address_nonnull_" } + inst_names[k], p->raw_address() != nullptr);
+            }
+        }
+    }
+
+    // =====================================================================
+    //  22. PROXY COPY / MOVE VALUE-SEMANTICS.  field_proxy is a lightweight value
+    //      type (pointer + descriptor + flags); a COPY refers to the SAME slot, so
+    //      a write through the copy is observed through the original and vice
+    //      versa, and a MOVED-from-temporary copy writes the same slot too.  No
+    //      sibling pins this.  Self-restoring on sI (documented final 0xDEADBEEF).
+    // =====================================================================
+    {
+        const auto orig{ fps::static_field("sI") };
+        ctx.check("proxy_copy_orig_resolves", orig.has_value());
+        if (orig)
+        {
+            // Copy-construct a second proxy from the first; both must address the
+            // identical slot.
+            vmhook::field_proxy copy{ *orig };
+            ctx.check("proxy_copy_same_raw_address", copy.raw_address() == orig->raw_address());
+            ctx.check("proxy_copy_same_signature", copy.signature() == orig->signature());
+            ctx.check("proxy_copy_same_is_static", copy.is_static() == orig->is_static());
+
+            // Write through the COPY; read back through the ORIGINAL.
+            copy.set(std::int32_t{ 0x51C0DE77 });
+            ctx.check("proxy_copy_write_seen_by_orig",
+                      static_cast<std::uint32_t>(static_cast<std::int32_t>(orig->get())) == 0x51C0DE77u);
+            // Write through the ORIGINAL; read back through the COPY.
+            orig->set(std::int32_t{ 0x0DDBA11D });
+            ctx.check("proxy_orig_write_seen_by_copy",
+                      static_cast<std::uint32_t>(static_cast<std::int32_t>(copy.get())) == 0x0DDBA11Du);
+
+            // A move-constructed proxy from a fresh temporary still writes the slot.
+            vmhook::field_proxy moved{ std::move(*fps::static_field("sI")) };
+            moved.set(std::int32_t{ 0x42424242 });
+            ctx.check("proxy_moved_write_lands", fps::get_i32("sI") == 0x42424242);
+
+            // Restore the documented sI final for completeness (Java phases already ran).
+            orig->set(static_cast<std::int32_t>(0xDEADBEEF));
+            ctx.check("proxy_copy_restored_deadbeef", fps::get_i32("sI") == static_cast<std::int32_t>(0xDEADBEEF));
+        }
+    }
+
+    // =====================================================================
+    //  23. NATIVE-vs-JAVA-GETTER CROSS-CHECK on a FRESH value.  Phases 13/15/16
+    //      observed the documented finals; here we write a brand-new distinct
+    //      value to each primitive STATIC slot natively, then immediately pull it
+    //      back through Java's OWN getter bytecode (static_method->call()) and
+    //      assert native-write == Java-read for the SAME live value -- a direct
+    //      agreement check independent of the snapshot witnesses.  Each slot is
+    //      then restored to its documented final.  (Runs after all Java-observed
+    //      phases, so the transient values never disturb earlier observations.)
+    // =====================================================================
+    {
+        if (const auto p{ fps::static_field("sZ") })
+        {
+            p->set(false);
+            ctx.check("xchk_sZ_native_eq_java", fps::call_bool("getSZ") == false);
+            p->set(true); // restore final
+            ctx.check("xchk_sZ_restored", fps::call_bool("getSZ") == true);
+        }
+        if (const auto p{ fps::static_field("sB") })
+        {
+            p->set(static_cast<std::int8_t>(0x39));
+            ctx.check("xchk_sB_native_eq_java", fps::call_i8("getSB") == static_cast<std::int8_t>(0x39));
+            p->set(static_cast<std::int8_t>(0xAB)); // restore final
+            ctx.check("xchk_sB_restored", fps::call_i8("getSB") == static_cast<std::int8_t>(0xAB));
+        }
+        if (const auto p{ fps::static_field("sS") })
+        {
+            p->set(static_cast<std::int16_t>(0x3210));
+            ctx.check("xchk_sS_native_eq_java", fps::call_i16("getSS") == static_cast<std::int16_t>(0x3210));
+            p->set(static_cast<std::int16_t>(0xBEEF)); // restore final
+            ctx.check("xchk_sS_restored", fps::call_i16("getSS") == static_cast<std::int16_t>(0xBEEF));
+        }
+        if (const auto p{ fps::static_field("sC") })
+        {
+            p->set(static_cast<std::uint16_t>(0x4E2D)); // CJK code unit
+            ctx.check("xchk_sC_native_eq_java", fps::call_i32("getSC") == 0x4E2D); // char widened unsigned
+            p->set(static_cast<std::uint16_t>(0xFFFF)); // restore final
+            ctx.check("xchk_sC_restored", fps::call_i32("getSC") == 0xFFFF);
+        }
+        if (const auto p{ fps::static_field("sI") })
+        {
+            p->set(std::int32_t{ 0x13579BDF });
+            ctx.check("xchk_sI_native_eq_java", fps::call_i32("getSI") == 0x13579BDF);
+            p->set(static_cast<std::int32_t>(0xDEADBEEF)); // restore final
+            ctx.check("xchk_sI_restored", fps::call_i32("getSI") == static_cast<std::int32_t>(0xDEADBEEF));
+        }
+        if (const auto p{ fps::static_field("sJ") })
+        {
+            p->set(std::int64_t{ 0x1122334455667788LL });
+            ctx.check("xchk_sJ_native_eq_java", fps::call_i64("getSJ") == 0x1122334455667788LL);
+            p->set(static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL)); // restore final
+            ctx.check("xchk_sJ_restored",
+                      static_cast<std::uint64_t>(fps::call_i64("getSJ")) == 0xDEADBEEFCAFEBABEULL);
+        }
+        if (const auto p{ fps::static_field("sF") })
+        {
+            p->set(0.25F); // 0x3E800000
+            ctx.check("xchk_sF_native_eq_java",
+                      static_cast<std::uint32_t>(fps::call_i32("getSFBits")) == 0x3E800000u);
+            p->set(bits_to_float(0x7FC00000)); // restore canonical-NaN final
+            ctx.check("xchk_sF_restored",
+                      static_cast<std::uint32_t>(fps::call_i32("getSFBits")) == 0x7FC00000u);
+        }
+        if (const auto p{ fps::static_field("sD") })
+        {
+            p->set(0.25); // 0x3FD0000000000000
+            ctx.check("xchk_sD_native_eq_java",
+                      static_cast<std::uint64_t>(fps::call_i64("getSDBits")) == 0x3FD0000000000000ULL);
+            p->set(bits_to_double(0x7FF8000000000000ULL)); // restore canonical-NaN final
+            ctx.check("xchk_sD_restored",
+                      static_cast<std::uint64_t>(fps::call_i64("getSDBits")) == 0x7FF8000000000000ULL);
         }
     }
     }   // run_field_primitives_set_checks

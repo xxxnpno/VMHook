@@ -229,6 +229,14 @@ public final class WrapperPattern extends WrapperBase
     public float  iFloat  = 0.75f;                    // float (exact binary)
     public double iDouble = 3.5d;                     // double (exact binary)
 
+    // ---- DEGENERATE reference-field values (empty / null) ------------------
+    // An empty String (length 0) and a genuinely null String reference, so the
+    // native side can prove as_string() yields "" for BOTH the empty-but-present
+    // String and the null-reference slot (the two distinct "" cases), and that
+    // is_reference() is true for a reference field regardless of its content.
+    public String iEmpty = freshAscii("");            // present, length 0
+    public String iNull  = null;                      // null reference
+
     // ---- INSTANCE-field SET() round-trip scratch (per-published-object) -----
     // Dedicated fields the native side WRITES through a wrapper's get_field(
     // "...")->set(v) and reads back, then restores; isolated from every value
@@ -362,6 +370,15 @@ public final class WrapperPattern extends WrapperBase
     public char   getChar()   { return this.iChar; }
     public float  getFloat()  { return this.iFloat; }
     public double getDouble() { return this.iDouble; }
+
+    // ---- Methods whose RETURN descriptor is an ARRAY / a VOID ---------------
+    // getNumbers()[I returns an int[] so the native side can assert
+    // method_proxy::is_reference() is true for an ARRAY ('[') return descriptor
+    // (not just an 'L' reference); noOp()V returns void so is_reference() is
+    // false and the return descriptor is exactly ")V".  Neither is CALLED
+    // natively — only their RESOLUTION + descriptor introspection is asserted.
+    public int[] getNumbers() { return this.numbers; }
+    public void  noOp()       { /* no side effects */ }
 
     /**
      * Mutates the instance field iValue via genuine putfield bytecode and

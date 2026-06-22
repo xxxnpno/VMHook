@@ -45,6 +45,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace
 {
@@ -268,6 +269,7 @@ namespace
     constexpr std::int32_t L4_INT       { 0x0D4D0004 };   // declared on L4 (depth 0 / own)
     constexpr std::int32_t L2_REF_VAL   { 0x0E5E0005 };   // l2Ref's own l1Int
     constexpr std::int32_t L1_ARR_ELEM0 { 0x51510001 };   // l1Arr[0]
+    constexpr std::int32_t L1_ARR_ELEM1 { 0x51510002 };   // l1Arr[1] (boundary read)
     constexpr std::int32_t L1_ARR_LEN   { 2 };
     const     std::string  L1_STR_VALUE { "l1-inherited-string" };
 
@@ -1075,6 +1077,222 @@ VMHOOK_JVM_MODULE(poly_inherited_oop)
             ctx.check("java_polyBase_identity_nonzero",
                       pi_fixture::poly_base_identity() != 0);
         }
+    }
+
+    // =====================================================================
+    //  ADDITIVE EXHAUSTIVE DEEPENING (criterion 2): boundary/overflow on the
+    //  array decode, field_entry_t offset cross-checks (the walker's inherited
+    //  offset MUST equal the own-declared offset because an INSTANCE field's
+    //  offset is object-absolute -- vmhook.hpp:3413), find_field negative /
+    //  degenerate inputs, proxy value-semantics (copy/move idempotency),
+    //  primitive-field field_oop sanity, and name+signature parity on OWN
+    //  fields/methods.  All HARD facts are certain from the library source or
+    //  an already-passing check above; anything inferred is recorded [INFO].
+    // =====================================================================
+    {
+        // ---- find_field walker: the INHERITED protectedInt resolved through B
+        //      and A's OWN protectedInt share the SAME object-absolute offset
+        //      (instance-field offsets are cumulative from the super down, so the
+        //      walker reports the identical offset regardless of start klass).
+        //      Also: the declaring klass recorded for the inherited read is A,
+        //      not B (find_field stamps entry->declaring_klass = the hit klass). -
+        vmhook::hotspot::klass* const b_klass2{ vmhook::find_class(B_NAME) };
+        vmhook::hotspot::klass* const a_klass2{ vmhook::find_class(A_NAME) };
+        ctx.check("addl_b_klass_resolved", b_klass2 != nullptr);
+        ctx.check("addl_a_klass_resolved", a_klass2 != nullptr);
+        if (b_klass2 != nullptr && a_klass2 != nullptr)
+        {
+            const auto via_b_entry{ vmhook::find_field(b_klass2, "protectedInt") };
+            const auto via_a_entry{ vmhook::find_field(a_klass2, "protectedInt") };
+            ctx.check("addl_find_field_inherited_via_B_resolves", via_b_entry.has_value());
+            ctx.check("addl_find_field_own_via_A_resolves", via_a_entry.has_value());
+            if (via_b_entry.has_value() && via_a_entry.has_value())
+            {
+                // Object-absolute offset is identical whether started at B or A.
+                ctx.check("addl_inherited_and_own_offset_identical",
+                          via_b_entry->offset == via_a_entry->offset);
+                ctx.check("addl_inherited_field_not_static_entry",
+                          via_b_entry->is_static == false);
+                ctx.check("addl_inherited_field_signature_entry_I",
+                          via_b_entry->signature == "I");
+                // The walker stamps the DECLARING klass = A for the B-started
+                // inherited read; A's own read declares on A too.  Both are A.
+                ctx.check("addl_inherited_declaring_klass_is_A",
+                          via_b_entry->declaring_klass == a_klass2);
+                ctx.check("addl_own_declaring_klass_is_A",
+                          via_a_entry->declaring_klass == a_klass2);
+            }
+
+            // bInt is declared on B, so its declaring klass is B (depth 0) and
+            // its offset differs from protectedInt's (distinct slots on the oop).
+            const auto bint_entry{ vmhook::find_field(b_klass2, "bInt") };
+            ctx.check("addl_find_field_bInt_resolves", bint_entry.has_value());
+            if (bint_entry.has_value())
+            {
+                ctx.check("addl_bInt_declaring_klass_is_B",
+                          bint_entry->declaring_klass == b_klass2);
+                ctx.check("addl_bInt_not_static_entry", bint_entry->is_static == false);
+                ctx.check("addl_bInt_signature_entry_I", bint_entry->signature == "I");
+                if (via_b_entry.has_value())
+                {
+                    ctx.check("addl_bInt_and_protectedInt_distinct_offsets",
+                              bint_entry->offset != via_b_entry->offset);
+                }
+            }
+
+            // ---- find_field NEGATIVE / DEGENERATE inputs ------------------
+            ctx.check("addl_find_field_absent_name_nullopt",
+                      vmhook::find_field(b_klass2, "noSuchFieldXYZ").has_value() == false);
+            ctx.check("addl_find_field_empty_name_nullopt",
+                      vmhook::find_field(b_klass2, "").has_value() == false);
+            // A null klass pointer must fail closed (vmhook.hpp:14046 guard).
+            ctx.check("addl_find_field_null_klass_nullopt",
+                      vmhook::find_field(nullptr, "protectedInt").has_value() == false);
+        }
+    }
+
+    // ---- Wrapper raw_address vs find_field offset agreement: the B view's
+    //      proxy address for the inherited field MUST equal (instance + offset)
+    //      where offset is exactly the find_field entry offset.  Cross-checks the
+    //      wrapper's slot computation against the raw walker. ------------------
+    if (b_oop != nullptr && vmhook::hotspot::is_valid_pointer(b_oop))
+    {
+        pi_b b_view2{ b_oop };
+        vmhook::hotspot::klass* const b_klass3{ vmhook::find_class(B_NAME) };
+        std::optional<vmhook::hotspot::field_entry_t> entry{};
+        if (b_klass3 != nullptr)
+        {
+            entry = vmhook::find_field(b_klass3, "protectedInt");
+        }
+        auto fp{ b_view2.get_field("protectedInt") };
+        ctx.check("addl_wrapper_proxy_resolves", fp.has_value());
+        if (fp.has_value() && entry.has_value())
+        {
+            const auto* const base{ static_cast<const std::uint8_t*>(b_oop) };
+            const void* const expected{ base + entry->offset };
+            ctx.check("addl_wrapper_raw_address_is_instance_plus_offset",
+                      fp->raw_address() == expected);
+        }
+
+        // ---- field_proxy COPY / MOVE value-semantics (idempotency).  A copied
+        //      proxy and a moved-from-copy proxy must report the SAME slot,
+        //      signature, staticness and value as the original -- the proxy is a
+        //      cheap value handle over (address, signature, flags). -------------
+        if (fp.has_value())
+        {
+            const void* const orig_addr{ fp->raw_address() };
+            const std::string orig_sig{ fp->signature() };
+            const bool orig_static{ fp->is_static() };
+            const std::int32_t orig_val = fp->get();           // COPY-init
+
+            vmhook::field_proxy copy{ *fp };                   // copy-construct
+            ctx.check("addl_proxy_copy_same_address", copy.raw_address() == orig_addr);
+            ctx.check("addl_proxy_copy_same_signature",
+                      std::string{ copy.signature() } == orig_sig);
+            ctx.check("addl_proxy_copy_same_static", copy.is_static() == orig_static);
+            const std::int32_t copy_val = copy.get();          // COPY-init
+            ctx.check("addl_proxy_copy_same_value", copy_val == orig_val);
+            ctx.check("addl_proxy_copy_value_is_1337", copy_val == PROTECTED_INT);
+
+            vmhook::field_proxy moved{ std::move(copy) };      // move-construct
+            ctx.check("addl_proxy_move_same_address", moved.raw_address() == orig_addr);
+            const std::int32_t moved_val = moved.get();        // COPY-init
+            ctx.check("addl_proxy_move_same_value", moved_val == orig_val);
+        }
+
+        // ---- primitive-field field_oop sanity: a primitive ("I") field is NOT
+        //      a reference, so field_oop() (via get_compressed_oop's
+        //      is_reference guard, vmhook.hpp:15911) must yield nullptr -- never a
+        //      wild pointer from reinterpreting the int bytes as a compressed OOP.
+        {
+            auto prim_fp{ b_view2.get_field("bInt") };
+            ctx.check("addl_primitive_field_resolves", prim_fp.has_value());
+            if (prim_fp.has_value())
+            {
+                ctx.check("addl_primitive_field_not_reference",
+                          prim_fp->is_reference() == false);
+                ctx.check("addl_primitive_field_oop_is_null",
+                          vmhook::field_oop(*prim_fp) == nullptr);
+            }
+        }
+
+        // ---- OWN field bInt via the name+signature field path is NOT available
+        //      (get_field has no name+sig overload), but the method name+sig
+        //      parity is: protectedAdd("(I)I") on the OWN-method-free B wrapper
+        //      resolves the inherited method and is NOT a reference return. -----
+        {
+            auto mp{ b_view2.get_method("protectedAdd", "(I)I") };
+            ctx.check("addl_method_name_sig_resolves_again", mp.has_value());
+            if (mp.has_value())
+            {
+                ctx.check("addl_method_return_not_reference",
+                          mp->is_reference() == false);
+                ctx.check("addl_method_raw_method_nonnull",
+                          mp->raw_method() != nullptr);
+            }
+        }
+    }
+
+    // ---- ARRAY decode boundary / overflow on the inherited int[] (l1Arr).
+    //      array_length / get_array_element bounds are exercised at the edges:
+    //      index 1 (the SECOND element -- only [0] was checked above), negative,
+    //      ==len, and a huge index all clamp to T{} (vmhook.hpp:14783).  The
+    //      element/length asserts stay GATED behind the known length==2 because
+    //      the array header layout is JDK/heap-variant (mirrors the existing
+    //      l1Arr gating).  array_length on the L4 RECEIVER oop (not an array) is
+    //      a degenerate-input INFO characterization, never a HARD assert. -------
+    {
+        const vmhook::oop_t l4_oop2{ pi_fixture::get_l4_oop() };
+        if (l4_oop2 != nullptr && vmhook::hotspot::is_valid_pointer(l4_oop2))
+        {
+            poh_l4 l4_view2{ l4_oop2 };
+            auto arr_fp{ l4_view2.field("l1Arr") };
+            ctx.check("addl_l1Arr_resolves_again", arr_fp.has_value());
+            if (arr_fp.has_value())
+            {
+                void* const arr_oop{ vmhook::field_oop(*arr_fp) };
+                if (arr_oop != nullptr && vmhook::hotspot::is_valid_pointer(arr_oop))
+                {
+                    const std::int32_t len{ vmhook::array_length(arr_oop) };
+                    if (len == L1_ARR_LEN)
+                    {
+                        // Second element ([1]) -- never checked above.
+                        ctx.check("addl_l1Arr_elem1_value",
+                                  vmhook::get_array_element<std::int32_t>(arr_oop, 1) == L1_ARR_ELEM1);
+                        // Out-of-bounds indices clamp to 0 (T{}), never read OOB.
+                        ctx.check("addl_l1Arr_index_at_len_is_zero",
+                                  vmhook::get_array_element<std::int32_t>(arr_oop, L1_ARR_LEN) == 0);
+                        ctx.check("addl_l1Arr_index_negative_is_zero",
+                                  vmhook::get_array_element<std::int32_t>(arr_oop, -1) == 0);
+                        ctx.check("addl_l1Arr_index_huge_is_zero",
+                                  vmhook::get_array_element<std::int32_t>(
+                                      arr_oop, 0x7FFFFFFF) == 0);
+                        // Re-reading [0] is idempotent (same value as above).
+                        ctx.check("addl_l1Arr_elem0_idempotent",
+                                  vmhook::get_array_element<std::int32_t>(arr_oop, 0) == L1_ARR_ELEM0);
+                    }
+                    else
+                    {
+                        ctx.record(std::string{ "[INFO] poly_inherited_oop: addl l1Arr length read back as " }
+                                   + std::to_string(len) + " (expected 2); boundary element decode skipped");
+                    }
+                }
+
+                // array_length on the L4 RECEIVER oop is a degenerate input (it
+                // is an ordinary object, not an array): the +12 "length" slot is
+                // some header word, so the value is JDK/heap-variant -- INFO only.
+                const std::int32_t bogus_len{ vmhook::array_length(l4_oop2) };
+                ctx.record(std::string{ "[INFO] poly_inherited_oop: array_length on a "
+                           "non-array receiver oop returned " } + std::to_string(bogus_len)
+                           + " (header word, not a real length; degenerate input)");
+            }
+        }
+
+        // array_length on a null oop is a clean 0 (vmhook.hpp:14740 guard) -- HARD.
+        ctx.check("addl_array_length_null_is_zero",
+                  vmhook::array_length(nullptr) == 0);
+        ctx.check("addl_get_array_element_null_is_zero",
+                  vmhook::get_array_element<std::int32_t>(nullptr, 0) == 0);
     }
 
     // No hooks were armed by this module; nothing to unhook.

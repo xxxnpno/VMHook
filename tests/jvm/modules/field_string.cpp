@@ -52,9 +52,12 @@
 #include "../harness.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 
 namespace
 {
@@ -88,6 +91,46 @@ namespace
                 return {};
             }
             return vmhook::read_java_string(vmhook::field_oop(*proxy));
+        }
+
+        // ---- read a static String field via the EXPLICIT as_string() accessor
+        //      (the named extraction), distinct from the implicit value_t ->
+        //      std::string conversion used by read_static.  Both must agree.
+        static auto read_static_as_string(const char* name) -> std::string
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            return proxy->get().as_string();
+        }
+
+        // ---- field-metadata probes for a STATIC String field: resolution, the
+        //      JVM descriptor, and the is_reference / is_static classifications.
+        //      All are layout-independent invariants for a declared String slot.
+        static auto static_signature(const char* name) -> std::string
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            return std::string{ proxy->signature() };
+        }
+        static auto static_is_reference(const char* name) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            return proxy.has_value() && proxy->is_reference();
+        }
+        static auto static_is_static(const char* name) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            return proxy.has_value() && proxy->is_static();
+        }
+        static auto static_resolves(const char* name) -> bool
+        {
+            return static_field(name).has_value();
         }
 
         // ---- set a static String field.
@@ -972,6 +1015,187 @@ VMHOOK_JVM_MODULE(field_string)
     // the proxy path (both reuse the guarded read_java_string -> deterministic).
     ctx.check("fstr_non_string_object_direct_equals_proxy",
               field_string_fixture::read_static_direct("notAStringObj") == not_a_string);
+
+    // ======================================================================
+    // BATCH-22 GET DEEPENING (additive) -- accessor-parity, field-metadata
+    // invariants, C++ value-semantics, idempotency, and degenerate collapse.
+    // Every assertion below reuses ALREADY-PRESENT fixture fields (no fixture
+    // edit) and ALREADY-PROVEN library accessors; no new raw cold-oop read is
+    // introduced (as_string()/get()/signature()/is_* are all public wrappers).
+    // Each is a layout-uniform invariant (HARD) unless explicitly characterized.
+    // ======================================================================
+
+    // --- as_string() (EXPLICIT named extraction) must equal the IMPLICIT
+    //     value_t -> std::string conversion (read_static) for every decode
+    //     class.  Two distinct code paths into read_java_string; they must
+    //     produce byte-identical results.  Covers ASCII / Latin-1 / CJK / mixed
+    //     / embedded-NUL / empty / null / astral / all-256 / inherited-static. ---
+    ctx.check("fstr2_as_string_ascii_eq_implicit",
+              field_string_fixture::read_static_as_string("getAscii") == ascii);
+    ctx.check("fstr2_as_string_latin1_eq_implicit",
+              field_string_fixture::read_static_as_string("getLatin1") == latin1);
+    ctx.check("fstr2_as_string_cjk_eq_implicit",
+              field_string_fixture::read_static_as_string("getCjk") == cjk);
+    ctx.check("fstr2_as_string_mixed_eq_implicit",
+              field_string_fixture::read_static_as_string("getMixed") == mixed);
+    ctx.check("fstr2_as_string_embedded_nul_eq_implicit",
+              field_string_fixture::read_static_as_string("getEmbeddedNul") == embedded);
+    ctx.check("fstr2_as_string_astral_eq_implicit",
+              field_string_fixture::read_static_as_string("getAstral") == astral);
+    ctx.check("fstr2_as_string_all256_eq_implicit",
+              field_string_fixture::read_static_as_string("getAll256") == all256);
+    ctx.check("fstr2_as_string_static_inherited_eq_implicit",
+              field_string_fixture::read_static_as_string("sInheritedStr") == static_inherited);
+    // as_string() over an empty String field and an explicit-null String field
+    // both collapse to "" (the same length<=0 / null-oop guards the implicit
+    // path takes).  These are HARD: the guards are unconditional in the source.
+    ctx.check("fstr2_as_string_empty_is_empty",
+              field_string_fixture::read_static_as_string("getEmpty").empty());
+    ctx.check("fstr2_as_string_null_is_empty",
+              field_string_fixture::read_static_as_string("getNull").empty());
+
+    // --- FIELD-METADATA invariants for declared STATIC String slots: each
+    //     resolves, reports the exact JVM descriptor "Ljava/lang/String;", is a
+    //     reference (not primitive), and is static.  Layout-independent. ---
+    {
+        static const char* const string_static_fields[]{
+            "getAscii", "getOneChar", "getLatin1", "getCjk", "getMixed",
+            "getEmpty", "getInterned", "getEmbeddedNul", "getEmoji", "getAstral",
+            "getMaxBmp", "getAll256", "getFinalConst", "getControls",
+            "getMultiScript", "getEmojiRun", "sInheritedStr", "sInheritedCjk"
+        };
+        bool all_resolve{ true };
+        bool all_sig_ok{ true };
+        bool all_reference{ true };
+        bool all_static{ true };
+        for (const char* const f : string_static_fields)
+        {
+            all_resolve  = all_resolve  && field_string_fixture::static_resolves(f);
+            all_sig_ok   = all_sig_ok   && (field_string_fixture::static_signature(f)
+                                            == "Ljava/lang/String;");
+            all_reference = all_reference && field_string_fixture::static_is_reference(f);
+            all_static   = all_static   && field_string_fixture::static_is_static(f);
+        }
+        ctx.check("fstr2_all_string_static_fields_resolve", all_resolve);
+        ctx.check("fstr2_all_string_static_fields_signature_String", all_sig_ok);
+        ctx.check("fstr2_all_string_static_fields_is_reference", all_reference);
+        ctx.check("fstr2_all_string_static_fields_is_static", all_static);
+    }
+    // The explicit-null String field is STILL a declared String slot: its
+    // signature/reference/static classification holds even though its value is
+    // null (classification is from the declared descriptor, not the live value).
+    ctx.check("fstr2_null_field_signature_String",
+              field_string_fixture::static_signature("getNull") == "Ljava/lang/String;");
+    ctx.check("fstr2_null_field_is_reference", field_string_fixture::static_is_reference("getNull"));
+    ctx.check("fstr2_null_field_is_static", field_string_fixture::static_is_static("getNull"));
+
+    // --- The primitive guard target is NOT a reference and carries the "I"
+    //     descriptor -- the negative cross-check that the metadata probes above
+    //     are discriminating, not vacuously true for every field. ---
+    ctx.check("fstr2_int_field_signature_I",
+              field_string_fixture::static_signature("notAStringInt") == "I");
+    ctx.check("fstr2_int_field_is_not_reference",
+              field_string_fixture::static_is_reference("notAStringInt") == false);
+    ctx.check("fstr2_int_field_is_static", field_string_fixture::static_is_static("notAStringInt"));
+
+    // --- C++ VALUE-SEMANTICS of a decoded std::string: a copy and a move of the
+    //     CJK decode compare equal to the original bytes, size is preserved, and
+    //     the count-of-bytes matches .size() (the string is self-consistent).
+    //     This proves the decode result is an ordinary, copyable/movable value --
+    //     no hidden aliasing into JVM memory. ---
+    {
+        const std::string original{ cjk };
+        const std::string copied{ original };                 // copy
+        ctx.check("fstr2_value_copy_equals_original", copied == original);
+        ctx.check("fstr2_value_copy_size_preserved", copied.size() == original.size());
+        std::string movable{ original };
+        const std::string moved{ std::move(movable) };        // move
+        ctx.check("fstr2_value_move_equals_original", moved == original);
+        ctx.check("fstr2_value_move_size_9", moved.size() == 9u);
+        // count of bytes via manual walk == size() (no hidden NUL truncation: the
+        // CJK value has no interior NUL, so a strlen-style walk would equal size).
+        std::size_t walk{ 0 };
+        for (const char c : moved) { (void)c; ++walk; }
+        ctx.check("fstr2_value_byte_count_equals_size", walk == moved.size());
+    }
+    // Embedded-NUL value-semantics: a COPY of the interior-NUL decode keeps all 5
+    // bytes (no C-string truncation survives a std::string copy), and equals the
+    // original including the two NULs.  Guards against an accidental .c_str()-based
+    // round-trip in any future refactor of the accessor.
+    {
+        const std::string nul_copy{ embedded };
+        ctx.check("fstr2_embedded_nul_copy_len_5", nul_copy.size() == 5u);
+        ctx.check("fstr2_embedded_nul_copy_equals", nul_copy == embedded);
+        ctx.check("fstr2_embedded_nul_copy_interior_nuls",
+                  nul_copy.size() == 5 && nul_copy[1] == '\0' && nul_copy[3] == '\0');
+    }
+
+    // --- IDEMPOTENCY: re-reading the same field twice (side-effect-free GET)
+    //     yields byte-identical results, through BOTH the proxy and the direct
+    //     path, for a representative LATIN1 and a representative UTF-16 field. ---
+    ctx.check("fstr2_idempotent_ascii_proxy",
+              field_string_fixture::read_static("getAscii")
+              == field_string_fixture::read_static("getAscii"));
+    ctx.check("fstr2_idempotent_cjk_proxy",
+              field_string_fixture::read_static("getCjk")
+              == field_string_fixture::read_static("getCjk"));
+    ctx.check("fstr2_idempotent_all256_direct",
+              field_string_fixture::read_static_direct("getAll256")
+              == field_string_fixture::read_static_direct("getAll256"));
+    ctx.check("fstr2_idempotent_emoji_run_proxy",
+              field_string_fixture::read_static("getEmojiRun")
+              == field_string_fixture::read_static("getEmojiRun"));
+
+    // --- read_static_direct (raw backing OOP -> read_java_string) over the
+    //     null and empty fields also collapses to "", agreeing with the proxy
+    //     path: the null-oop / length<=0 guards fire identically regardless of
+    //     entry point.  (read_static_direct on getNull already asserted "" above;
+    //     here we additionally pin the empty field's direct path.) ---
+    ctx.check("fstr2_empty_direct_is_empty",
+              field_string_fixture::read_static_direct("getEmpty").empty());
+    ctx.check("fstr2_empty_direct_equals_proxy",
+              field_string_fixture::read_static_direct("getEmpty")
+              == field_string_fixture::read_static("getEmpty"));
+
+    // --- INSTANCE-field metadata + accessor parity through a live instance
+    //     proxy: a clean instance String reports is_static()==false, the String
+    //     descriptor and is_reference()==true, and its as_string() equals its
+    //     implicit conversion.  Reuses the never-written instGetOnly slot. ---
+    {
+        const auto self{ field_string_fixture::acquire_self() };
+        ctx.check("fstr2_self_acquired_for_meta", self != nullptr);
+        if (self)
+        {
+            const auto p{ self->get_field("instGetOnly") };
+            ctx.check("fstr2_instance_get_only_resolves", p.has_value());
+            if (p.has_value())
+            {
+                ctx.check("fstr2_instance_get_only_is_static_false", p->is_static() == false);
+                ctx.check("fstr2_instance_get_only_is_reference_true", p->is_reference());
+                ctx.check("fstr2_instance_get_only_signature_String",
+                          std::string{ p->signature() } == "Ljava/lang/String;");
+                const std::string as_str = p->get().as_string();
+                const std::string implicit = p->get();
+                ctx.check("fstr2_instance_get_only_as_string_eq_implicit", as_str == implicit);
+                ctx.check("fstr2_instance_get_only_value_is_instance_get", as_str == "instance-get");
+            }
+            // Inherited instance String (super-walk) also reports the String
+            // descriptor and reference/non-static classification via the child proxy.
+            const auto inh{ self->get_field("inheritedStr") };
+            if (inh.has_value())
+            {
+                ctx.check("fstr2_inherited_instance_is_static_false", inh->is_static() == false);
+                ctx.check("fstr2_inherited_instance_is_reference_true", inh->is_reference());
+                ctx.check("fstr2_inherited_instance_signature_String",
+                          std::string{ inh->signature() } == "Ljava/lang/String;");
+                // NOTE: for an INHERITED instance String the as_string()-vs-implicit
+                // equivalence is NOT hard-asserted -- the inherited/non-direct reference
+                // read is the roadmap-#11 fragile area; characterize the value instead.
+                ctx.record(std::string{ "[INFO] field_string: inherited-instance String as_string()='" }
+                           + inh->get().as_string() + "' (eq-implicit not hard-asserted; inherited-reference read).");
+            }
+        }
+    }
 
     // ----------------------------------------------------------------------
     // PHASE 2: install the interpreter hook and run the probe, which fires a

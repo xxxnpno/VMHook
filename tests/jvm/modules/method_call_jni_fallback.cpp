@@ -418,6 +418,73 @@ namespace
     std::atomic<std::uint32_t> g_flt_arr_e0_bits{ 0 };
     std::atomic<std::uint32_t> g_flt_arr_e1_bits{ 0 };
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  DEEPENING WAVE: additive cross-checks / value-semantics / type-tag /
+    //  decode-width-agreement / idempotency observations.  Every value below is
+    //  GROUNDED in behavior the existing passing checks already establish (the
+    //  same call, decoded again at a different width or queried for its variant
+    //  tag) — no new fixture method, no inferred edge behavior.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // (A) value_t TYPE-TAG discipline: a PRIMITIVE return is neither void nor a
+    //     String; a String return IS a string and is NOT void.  These pin the
+    //     variant-alternative classification the value_t conversion relies on.
+    std::atomic<int> g_int_not_void{ -1 };       // retInt()    -> !is_void()
+    std::atomic<int> g_int_not_string{ -1 };     // retInt()    -> !is_string()
+    std::atomic<int> g_bool_not_void{ -1 };      // retBoolTrue()-> !is_void()
+    std::atomic<int> g_bool_not_string{ -1 };    // retBoolTrue()-> !is_string()
+    std::atomic<int> g_long_not_void{ -1 };      // retLong()   -> !is_void()
+    std::atomic<int> g_double_not_string{ -1 };  // retDouble() -> !is_string()
+    std::atomic<int> g_str_inst_not_void{ -1 };  // retString() -> !is_void()
+    std::atomic<int> g_str_static_not_void{ -1 };// sRetString()-> !is_void()
+    std::atomic<int> g_loopstr_is_string{ -1 };  // loopString()-> is_string()
+
+    // (B) DECODE-WIDTH AGREEMENT: the SAME no-arg call decoded at two C++ widths
+    //     must agree under the documented sign/zero-extension rules.
+    //     retByte()  : as int8 == -7  and as int32 (sign-extended) == -7.
+    //     retChar()  : as uint16 == 90 and as int32 (zero-extended) == 90.
+    //     retCharMax(): as uint16 == 0xFFFF and as int32 == 65535 (zero-extend).
+    //     retShort() : as int16 == -12345 and as int32 (sign-extended) == -12345.
+    //     retLong()  : as int64 stable across two independent decodes.
+    std::atomic<std::int64_t> g_byte_as_int32{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_as_int32{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_as_int32{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_decode_a{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_decode_b{ k_uncaptured };
+
+    // (C) IDEMPOTENCY: a deterministic value-returning method called twice on the
+    //     same fresh proxy yields the identical value (no per-call drift / cache
+    //     poisoning between two reads).
+    std::atomic<std::int64_t> g_int_idem_a{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_idem_b{ k_uncaptured };
+    std::atomic<int>          g_retstr_idem_equal{ -1 };  // retString()==retString()
+    std::atomic<int>          g_retstr_idem_nonempty{ -1 };
+
+    // (D) value_t VALUE-SEMANTICS: copy and move of a captured value_t both
+    //     preserve the decoded result (the variant is regular).  Captured from
+    //     retString() (String alt) and echoInt(sentinel) (int32 alt).
+    std::atomic<int>          g_vt_copy_str_ok{ -1 };
+    std::atomic<int>          g_vt_move_str_ok{ -1 };
+    std::atomic<std::int64_t> g_vt_copy_int{ k_uncaptured };
+
+    // (E) String CROSS-CHECK: as_string() of retString() has the exact expected
+    //     length, and the empty-arg echo decodes to size()==0 (count==size).
+    std::atomic<std::int64_t> g_str_inst_len{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_empty_len{ k_uncaptured };
+
+    // (F) ZERO / ONE / -1 boundary RETURN of a single-arg echo: echoIntId(0)==0,
+    //     echoIntId(1)==1 round-trip exactly (smallest magnitudes through out.i).
+    std::atomic<std::int64_t> g_echo_one{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_one{ k_uncaptured };
+
+    // (G) SINGLE-element & boundary ARRAY-length agreement: array_length of every
+    //     captured array equals the fixture's literal element count (count==size
+    //     cross-checked against the per-element reads already asserted).  We also
+    //     re-read each array's length a SECOND time to prove array_length is a
+    //     pure read (idempotent, no mutation of the header).
+    std::atomic<std::int64_t> g_int_arr_len2{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_arr_len2{ k_uncaptured };
+
     // Sentinels (mirror the fixture's boundary values).
     constexpr std::int64_t k_int_ret    = 0x0BADF00DLL;            // 195948557
     constexpr std::int64_t k_long_ret   = static_cast<std::int64_t>(0x0123456789ABCDEFLL);
@@ -491,6 +558,173 @@ namespace
             if (p.has_value())
             {
                 g_void_is_void.store(p->call().is_void() ? 1 : 0);
+            }
+        }
+
+        // ───────── DEEPEN (A): value_t type-tag discipline ─────────
+        // A primitive return is neither void nor a String; a String return IS a
+        // string and is NOT void.  Each query is a fresh call so the variant tag
+        // is read off a genuine dispatch, not a cached one.
+        {
+            auto p{ s.get_method("retInt") };
+            if (p.has_value())
+            {
+                const auto v{ p->call() };
+                g_int_not_void.store(v.is_void() ? 0 : 1);
+                g_int_not_string.store(v.is_string() ? 0 : 1);
+            }
+        }
+        {
+            auto p{ s.get_method("retBoolTrue") };
+            if (p.has_value())
+            {
+                const auto v{ p->call() };
+                g_bool_not_void.store(v.is_void() ? 0 : 1);
+                g_bool_not_string.store(v.is_string() ? 0 : 1);
+            }
+        }
+        {
+            auto p{ s.get_method("retLong") };
+            if (p.has_value()) { g_long_not_void.store(p->call().is_void() ? 0 : 1); }
+        }
+        {
+            auto p{ s.get_method("retDouble") };
+            if (p.has_value()) { g_double_not_string.store(p->call().is_string() ? 0 : 1); }
+        }
+
+        // ───────── DEEPEN (B): decode-width agreement (same call, two widths) ─────────
+        // retByte() decoded as int32 must sign-extend to the same -7 the int8
+        // decode produced; retChar()/retCharMax() zero-extend; retShort() sign-
+        // extends; retLong() is stable across two independent decodes.
+        {
+            auto p{ s.get_method("retByte") };
+            if (p.has_value())
+            {
+                const std::int32_t as_int = p->call();
+                g_byte_as_int32.store(as_int);
+            }
+        }
+        {
+            auto p{ s.get_method("retShort") };
+            if (p.has_value())
+            {
+                const std::int32_t as_int = p->call();
+                g_short_as_int32.store(as_int);
+            }
+        }
+        {
+            auto p{ s.get_method("retChar") };
+            if (p.has_value())
+            {
+                const std::int32_t as_int = p->call();
+                g_char_as_int32.store(as_int);
+            }
+        }
+        {
+            auto p{ s.get_method("retLong") };
+            if (p.has_value())
+            {
+                g_long_decode_a.store(static_cast<std::int64_t>(p->call()));
+                g_long_decode_b.store(static_cast<std::int64_t>(p->call()));
+            }
+        }
+
+        // ───────── DEEPEN (C): idempotency of a deterministic value return ─────────
+        {
+            auto p{ s.get_method("retInt") };
+            if (p.has_value())
+            {
+                g_int_idem_a.store(static_cast<std::int32_t>(p->call()));
+                g_int_idem_b.store(static_cast<std::int32_t>(p->call()));
+            }
+        }
+        {
+            auto p{ s.get_method("retString") };
+            if (p.has_value())
+            {
+                const std::string a{ p->call().as_string() };
+                const std::string b{ p->call().as_string() };
+                g_retstr_idem_equal.store(a == b ? 1 : 0);
+                g_retstr_idem_nonempty.store(!a.empty() ? 1 : 0);
+            }
+        }
+
+        // ───────── DEEPEN (D): value_t copy/move value-semantics ─────────
+        // A captured value_t copies and moves while preserving the decode.
+        {
+            auto p{ s.get_method("retString") };
+            if (p.has_value())
+            {
+                const auto original{ p->call() };
+                const auto copied{ original };               // copy-construct
+                auto to_move{ original };                    // copy then move-from
+                const auto moved{ std::move(to_move) };      // move-construct
+                g_vt_copy_str_ok.store(copied.as_string() == original.as_string() ? 1 : 0);
+                g_vt_move_str_ok.store(moved.as_string() == original.as_string() ? 1 : 0);
+            }
+        }
+        {
+            auto p{ s.get_method("echoIntId") };
+            if (p.has_value())
+            {
+                const auto original{ p->call(k_echo_int) };
+                const auto copied{ original };
+                g_vt_copy_int.store(static_cast<std::int32_t>(copied));
+            }
+        }
+
+        // ───────── DEEPEN (E): String length cross-check (count == size) ─────────
+        {
+            auto p{ s.get_method("retString") };
+            if (p.has_value())
+            {
+                g_str_inst_len.store(static_cast<std::int64_t>(p->call().as_string().size()));
+            }
+        }
+        {
+            auto p{ s.get_method("echoString") };
+            if (p.has_value())
+            {
+                g_echo_empty_len.store(
+                    static_cast<std::int64_t>(p->call(std::string{}).as_string().size()));
+            }
+        }
+
+        // ───────── DEEPEN (F): smallest-magnitude echo boundaries (0/1) ─────────
+        {
+            auto p{ s.get_method("echoIntId") };
+            if (p.has_value())
+            {
+                g_echo_one.store(static_cast<std::int32_t>(p->call(static_cast<std::int32_t>(1))));
+            }
+        }
+        {
+            auto p{ s.get_method("echoLongId") };
+            if (p.has_value())
+            {
+                g_echo_long_one.store(static_cast<std::int64_t>(p->call(static_cast<std::int64_t>(1))));
+            }
+        }
+
+        // ───────── DEEPEN (G): loopString() is a String + re-read array lengths ─────────
+        {
+            auto p{ s.get_method("loopString") };
+            if (p.has_value()) { g_loopstr_is_string.store(p->call().is_string() ? 1 : 0); }
+        }
+        {
+            auto p{ s.get_method("retIntArray") };
+            if (p.has_value())
+            {
+                void* const arr{ static_cast<void*>(p->call()) };
+                if (arr != nullptr) { g_int_arr_len2.store(vmhook::array_length(arr)); }
+            }
+        }
+        {
+            auto p{ s.get_method("retLongArray") };
+            if (p.has_value())
+            {
+                void* const arr{ static_cast<void*>(p->call()) };
+                if (arr != nullptr) { g_long_arr_len2.store(vmhook::array_length(arr)); }
             }
         }
 
@@ -843,6 +1077,16 @@ namespace
             }
         }
         g_str_captured.store(true);
+
+        // ───────── DEEPEN (A cont.): String returns are NOT void ─────────
+        {
+            auto p{ s.get_method("retString") };
+            if (p.has_value()) { g_str_inst_not_void.store(p->call().is_void() ? 0 : 1); }
+        }
+        {
+            auto p{ method_call_jni::static_method("sRetString") };
+            if (p.has_value()) { g_str_static_not_void.store(p->call().is_void() ? 0 : 1); }
+        }
 
         // ───────── String-arg round-trips (echoString) ─────────
         {
@@ -1841,6 +2085,73 @@ VMHOOK_JVM_MODULE(method_call_jni_fallback)
         // (echoLong returns its argument; no lastEchoArg side effect.)
         ctx.check("mcj_svia_followup_instance_call_intact",
                   g_svia_followup_inst_echo.load() == k_svia_follow);
+
+        // ═════════════════════ DEEPEN (A): value_t type-tag discipline ════════
+        // A primitive return is neither void nor a String; a String return IS a
+        // string and is NOT void.  This pins the variant-alternative the value_t
+        // conversion + as_string()/is_void()/is_string() introspection depend on.
+        ctx.check("mcj_int_return_not_void", g_int_not_void.load() == 1);
+        ctx.check("mcj_int_return_not_string", g_int_not_string.load() == 1);
+        ctx.check("mcj_bool_return_not_void", g_bool_not_void.load() == 1);
+        ctx.check("mcj_bool_return_not_string", g_bool_not_string.load() == 1);
+        ctx.check("mcj_long_return_not_void", g_long_not_void.load() == 1);
+        ctx.check("mcj_double_return_not_string", g_double_not_string.load() == 1);
+        ctx.check("mcj_str_instance_not_void", g_str_inst_not_void.load() == 1);
+        ctx.check("mcj_str_static_not_void", g_str_static_not_void.load() == 1);
+        ctx.check("mcj_loopstring_is_string", g_loopstr_is_string.load() == 1);
+
+        // ═════════════════════ DEEPEN (B): decode-width agreement ═════════════
+        // retByte() decoded as int32 sign-extends to the SAME -7 the int8 decode
+        // (g_byte) produced; retChar()/retCharMax() zero-extend; retShort() sign-
+        // extends; retLong() is stable across two independent decodes.  Each new
+        // value is cross-checked against the already-passing narrow decode.
+        ctx.check("mcj_byte_as_int32_sign_extends", g_byte_as_int32.load() == -7);
+        ctx.check("mcj_byte_width_decode_agrees", g_byte_as_int32.load() == g_byte.load());
+        ctx.check("mcj_short_as_int32_sign_extends", g_short_as_int32.load() == -12345);
+        ctx.check("mcj_short_width_decode_agrees", g_short_as_int32.load() == g_short.load());
+        ctx.check("mcj_char_as_int32_zero_extends", g_char_as_int32.load() == 90);
+        ctx.check("mcj_char_width_decode_agrees", g_char_as_int32.load() == g_char.load());
+        ctx.check("mcj_long_decode_stable_a", g_long_decode_a.load() == k_long_ret);
+        ctx.check("mcj_long_decode_stable_b", g_long_decode_b.load() == k_long_ret);
+        ctx.check("mcj_long_decode_two_reads_agree",
+                  g_long_decode_a.load() == g_long_decode_b.load());
+
+        // ═════════════════════ DEEPEN (C): idempotency ════════════════════════
+        // A deterministic value-returning method called twice on one fresh proxy
+        // yields the identical value — no per-call drift / cache poisoning.
+        ctx.check("mcj_int_idempotent_first_correct", g_int_idem_a.load() == k_int_ret);
+        ctx.check("mcj_int_idempotent_two_reads_agree",
+                  g_int_idem_a.load() == g_int_idem_b.load());
+        ctx.check("mcj_retstring_idempotent_equal", g_retstr_idem_equal.load() == 1);
+        ctx.check("mcj_retstring_idempotent_nonempty", g_retstr_idem_nonempty.load() == 1);
+
+        // ═════════════════════ DEEPEN (D): value_t copy/move semantics ════════
+        // Copy- and move-construction of a captured value_t preserve the decode.
+        ctx.check("mcj_value_t_copy_preserves_string", g_vt_copy_str_ok.load() == 1);
+        ctx.check("mcj_value_t_move_preserves_string", g_vt_move_str_ok.load() == 1);
+        ctx.check("mcj_value_t_copy_preserves_int", g_vt_copy_int.load() == k_echo_int);
+
+        // ═════════════════════ DEEPEN (E): String length cross-check ══════════
+        // as_string() length equals the literal "jni-instance-hello" size, and an
+        // empty-string echo decodes to size()==0 (count == size).
+        ctx.check("mcj_str_instance_length_matches_literal",
+                  g_str_inst_len.load()
+                  == static_cast<std::int64_t>(std::string{ "jni-instance-hello" }.size()));
+        ctx.check("mcj_echo_empty_string_length_zero", g_echo_empty_len.load() == 0);
+
+        // ═════════════════════ DEEPEN (F): smallest-magnitude echo ════════════
+        ctx.check("mcj_echo_int_one", g_echo_one.load() == 1);
+        ctx.check("mcj_echo_long_one", g_echo_long_one.load() == 1);
+
+        // ═════════════════════ DEEPEN (G): array_length idempotency / count==size
+        // Re-reading each array's length yields the SAME literal element count the
+        // per-element value checks already proved (array_length is a pure read).
+        ctx.check("mcj_int_array_length_reread_3", g_int_arr_len2.load() == 3);
+        ctx.check("mcj_int_array_length_reread_agrees",
+                  g_int_arr_len2.load() == g_int_arr_len.load());
+        ctx.check("mcj_long_array_length_reread_4", g_long_arr_len2.load() == 4);
+        ctx.check("mcj_long_array_length_reread_agrees",
+                  g_long_arr_len2.load() == g_long_arr_len.load());
     }
 
     // UNCONDITIONAL teardown: the scoped_hook above is RAII, but on the no-SEH

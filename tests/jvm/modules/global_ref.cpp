@@ -67,7 +67,9 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -122,6 +124,42 @@ namespace
                   "global_ref::oop() must yield a vmhook::oop_t.");
     static_assert(std::is_same_v<decltype(std::declval<const gref&>().handle()), void*>,
                   "global_ref::handle() must yield the raw void* JNI handle.");
+
+    // ── batch-DW3 deepening: structural / layout invariants of the pin handle ────
+    // global_ref is `final` (vmhook.hpp:21650) — a JNI pin must not be subclassed
+    // (a subclass could add state the move/dtor never accounts for, leaking or
+    // double-freeing the handle).
+    static_assert(std::is_final_v<gref>,
+                  "global_ref must be final (no subclass may extend the owned-handle invariant).");
+    // The pin is a SINGLE raw void* handle and NOTHING else — this is load-bearing
+    // for the documented "lives inside std::unordered_map values" use: a fat pin
+    // (extra bookkeeping) would bloat every cached entry and break the cheap move.
+    static_assert(sizeof(gref) == sizeof(void*),
+                  "global_ref must be exactly one pointer wide (it owns only the JNI handle).");
+    static_assert(alignof(gref) == alignof(void*),
+                  "global_ref must align like a pointer (it IS a single pointer).");
+    static_assert(std::is_standard_layout_v<gref>,
+                  "global_ref must be standard-layout (a single private void* handle).");
+    // A pin owns a JNI handle, so it canNOT be trivially copyable / trivial — it
+    // has a user-declared destructor + move that issue NewGlobalRef/DeleteGlobalRef.
+    static_assert(!std::is_trivially_copyable_v<gref>,
+                  "global_ref must NOT be trivially copyable (owns a JNI handle with a real dtor).");
+    static_assert(!std::is_trivial_v<gref>,
+                  "global_ref must NOT be trivial (the OOP ctor issues NewGlobalRef).");
+    // Move-only RAII must be swappable (std::swap routes through the move ctor +
+    // two move-assigns) and that swap must not throw — snapshots/maps rely on it.
+    static_assert(std::is_swappable_v<gref>,
+                  "global_ref must be swappable (rebind two pins via std::swap).");
+    static_assert(std::is_nothrow_swappable_v<gref>,
+                  "global_ref swap must be noexcept (move ctor + move-assign are both noexcept).");
+    // The pin(oop_t) free-function overload is a noexcept observer handing back a
+    // pin by value (the by-value contract is asserted above; this pins noexcept).
+    // The pin(unique_ptr<T>&) overload's noexcept is asserted just after
+    // global_ref_fixture is declared (it names that wrapper type).
+    static_assert(noexcept(vmhook::pin(std::declval<vmhook::oop_t>())),
+                  "vmhook::pin(oop_t) must be noexcept.");
+    // NOTE: oop_t IS a raw pointer alias, so global_ref(oop_t) is constructible from
+    // a void* — there is no distinct strong-type barrier to assert here.
 
     // Sentinel value stamped into the pinned object's (I)V constructor and read
     // back through .oop() before and after GC.  Distinct, non-zero bit pattern so
@@ -182,6 +220,9 @@ namespace
     static_assert(
         std::is_same_v<decltype(vmhook::pin(std::declval<const std::unique_ptr<global_ref_fixture>&>())), gref>,
         "vmhook::pin(unique_ptr<T>&) must return a global_ref by value.");
+    static_assert(
+        noexcept(vmhook::pin(std::declval<const std::unique_ptr<global_ref_fixture>&>())),
+        "vmhook::pin(unique_ptr<T>&) must be noexcept.");
 
     // ── Hook observation ─────────────────────────────────────────────────────────
     std::atomic<int>  g_trigger_calls{ 0 };
@@ -361,6 +402,45 @@ namespace
     // The `tag` String reference field also survives relocation (an embedded OBJECT
     // reference, not just a primitive) — gated on attainability like the sentinel.
     std::atomic<bool> g_survive_tag_ok{ false };
+
+    // ── batch-DW3 deepening: std::swap exchanges ownership (move value-semantics) ──
+    // std::swap on a move-only type routes through the move ctor + two move-assigns,
+    // so swapping two DISTINCT held pins must exchange their handles wholesale: each
+    // pin ends up owning the OTHER's NewGlobalRef handle and reads the OTHER's
+    // sentinel.  No GC runs, so this is HARD: a swap that fresh-NewGlobalRef'd or
+    // dropped a handle would surface the wrong payload or a null.
+    std::atomic<bool> g_swap_exchanged_handles{ false };   // handles crossed over exactly
+    std::atomic<bool> g_swap_a_reads_b{ false };           // post-swap a reads b's sentinel
+    std::atomic<bool> g_swap_b_reads_a{ false };           // post-swap b reads a's sentinel
+    std::atomic<bool> g_swap_self_intact{ false };         // swapping a pin with itself is a no-op
+
+    // ── batch-DW3 deepening: BOUNDARY sentinel values round-trip through .oop() ────
+    // The (I)V ctor does a plain `this.sentinel = value` int store, so EVERY 32-bit
+    // value — 0, 1, -1, INT32_MIN, INT32_MAX — must read back byte-identical through
+    // a wrapper rebuilt from the pin's .oop().  Exercises the extremes the 0x….. bit
+    // patterns elsewhere never touch (sign bit, all-zero, all-ones boundaries).  No
+    // GC, so HARD when the address resolves; the count below cross-checks that EVERY
+    // boundary value was actually verified (count == size, no silent skip).
+    constexpr int k_boundary_count{ 5 };
+    std::atomic<int>  g_boundary_reads_ok{ 0 };            // how many boundary values read back
+    std::atomic<int>  g_boundary_values_matched{ 0 };      // ...and matched exactly
+
+    // ── batch-DW3 deepening: the masking in .oop() recovers the REAL slot ──────────
+    // .oop() masks the low 3 tag bits then derefs the slot (vmhook.hpp:21711).  A
+    // hand-recomputed `*(void**)(handle & ~7)` must equal .oop() EXACTLY (proving the
+    // documented mask is the 3-bit OopStorage-alignment mask), and pre-GC that slot
+    // contents must equal the freshly-decoded wrapper instance oop (cross-check
+    // against object_base::get_instance(), not a self-comparison).  Both guarded with
+    // is_valid_pointer before the hand deref so a bad handle records FAIL, never AVs.
+    std::atomic<bool> g_mask_matches_oop{ false };         // hand-masked slot deref == .oop()
+    std::atomic<bool> g_mask_slot_eq_instance{ false };    // ...and (pre-GC) == wrapper instance
+
+    // ── batch-DW3 deepening: N distinct pins => EXACTLY N distinct handles (set) ───
+    // The pairwise-distinct check above is O(n^2) booleans; this is the cardinality
+    // cross-check: the count of UNIQUE handle values across the 8 pins must equal 8
+    // (count == size).  A handle-table bug that recycled a slot would drop the
+    // unique count below k_many_pins even while some pairwise compares still passed.
+    std::atomic<int>  g_many_unique_handle_count{ 0 };
 
     // Resolves a pin's CURRENT address WITHOUT risking an access violation: the
     // library global_ref::oop() does a raw `*(void**)slot` dereference of the
@@ -841,6 +921,155 @@ VMHOOK_JVM_MODULE(global_ref)
                         // wpin destructs here -> one DeleteGlobalRef.
                     }
 
+                    // ── std::swap exchanges ownership (move value-semantics) ─────
+                    // std::swap on a move-only pin routes through the move ctor +
+                    // two move-assigns; swapping two DISTINCT held pins must cross
+                    // their handles over wholesale, so each ends up reading the
+                    // OTHER's sentinel.  No GC => HARD.
+                    if (auto made_sa{ vmhook::make_unique<global_ref_fixture>(0x0A0A) })
+                    {
+                        if (auto made_sb{ vmhook::make_unique<global_ref_fixture>(0x0B0B) })
+                        {
+                            vmhook::jni::global_ref sa{ vmhook::pin(made_sa) };
+                            vmhook::jni::global_ref sb{ vmhook::pin(made_sb) };
+                            void* const ha_pre{ sa.handle() };
+                            void* const hb_pre{ sb.handle() };
+                            std::swap(sa, sb);
+                            g_swap_exchanged_handles.store(
+                                ha_pre != nullptr && hb_pre != nullptr && ha_pre != hb_pre
+                                    && sa.handle() == hb_pre && sb.handle() == ha_pre,
+                                std::memory_order_relaxed);
+                            std::int32_t va{ -1 };
+                            std::int32_t vb{ -1 };
+                            if (read_sentinel_guarded(resolve_oop_guarded(sa), va))
+                            {
+                                g_swap_a_reads_b.store(va == 0x0B0B, std::memory_order_relaxed);
+                            }
+                            if (read_sentinel_guarded(resolve_oop_guarded(sb), vb))
+                            {
+                                g_swap_b_reads_a.store(vb == 0x0A0A, std::memory_order_relaxed);
+                            }
+                            // swap a pin with ITSELF: the move-assign self-guard makes
+                            // this a no-op (handle intact, still reads its own value).
+                            std::swap(sa, sa);
+                            std::int32_t vself{ -1 };
+                            if (static_cast<bool>(sa) && sa.handle() == hb_pre
+                                && read_sentinel_guarded(resolve_oop_guarded(sa), vself))
+                            {
+                                g_swap_self_intact.store(vself == 0x0B0B, std::memory_order_relaxed);
+                            }
+                            // sa / sb destruct here -> two DeleteGlobalRef.
+                        }
+                    }
+
+                    // ── BOUNDARY sentinel values round-trip through .oop() ───────
+                    // 0, 1, -1, INT32_MIN, INT32_MAX each stamped by the (I)V ctor,
+                    // pinned, and read back through a wrapper rebuilt from .oop().
+                    // No GC => HARD; the count cross-checks every value was verified.
+                    {
+                        const std::array<std::int32_t, k_boundary_count> boundary{
+                            std::int32_t{ 0 },
+                            std::int32_t{ 1 },
+                            std::int32_t{ -1 },
+                            (std::numeric_limits<std::int32_t>::min)(),
+                            (std::numeric_limits<std::int32_t>::max)() };
+                        int reads_ok{ 0 };
+                        int matched{ 0 };
+                        for (const std::int32_t want : boundary)
+                        {
+                            auto made_bv{ vmhook::make_unique<global_ref_fixture>(want) };
+                            if (!made_bv)
+                            {
+                                continue;
+                            }
+                            vmhook::jni::global_ref bp{ vmhook::pin(made_bv) };
+                            made_bv.reset();  // pin is the only keep-alive (no GC)
+                            std::int32_t got{ 0 };
+                            if (read_sentinel_guarded(resolve_oop_guarded(bp), got))
+                            {
+                                ++reads_ok;
+                                if (got == want)
+                                {
+                                    ++matched;
+                                }
+                            }
+                            // bp destructs here -> one DeleteGlobalRef.
+                        }
+                        g_boundary_reads_ok.store(reads_ok, std::memory_order_relaxed);
+                        g_boundary_values_matched.store(matched, std::memory_order_relaxed);
+                    }
+
+                    // ── .oop()'s low-3-bit mask recovers the REAL slot ───────────
+                    // Hand-recompute `*(void**)(handle & ~7)` and prove it equals
+                    // .oop() exactly (the documented mask), and pre-GC equals the
+                    // freshly-decoded wrapper instance oop (a genuine cross-check
+                    // against object_base::get_instance(), not a self-comparison).
+                    // Guarded with is_valid_pointer before the hand deref.
+                    if (auto made_mk{ vmhook::make_unique<global_ref_fixture>(0x4D4B) })
+                    {
+                        const vmhook::oop_t inst{ made_mk->vmhook::object_base::get_instance() };
+                        vmhook::jni::global_ref mk{ vmhook::pin(made_mk) };
+                        void* const h{ mk.handle() };
+                        if (h != nullptr && vmhook::hotspot::is_valid_pointer(h))
+                        {
+                            const std::uintptr_t slot{
+                                reinterpret_cast<std::uintptr_t>(h) & ~std::uintptr_t{ 0b111 } };
+                            if (vmhook::hotspot::is_valid_pointer(reinterpret_cast<void*>(slot)))
+                            {
+                                void* const hand{ *reinterpret_cast<void**>(slot) };
+                                const vmhook::oop_t via_oop{ mk.oop() };
+                                g_mask_matches_oop.store(
+                                    hand != nullptr && hand == via_oop,
+                                    std::memory_order_relaxed);
+                                g_mask_slot_eq_instance.store(
+                                    hand != nullptr && inst != nullptr
+                                        && hand == static_cast<void*>(inst),
+                                    std::memory_order_relaxed);
+                            }
+                        }
+                        // mk destructs here -> one DeleteGlobalRef.
+                    }
+
+                    // ── N distinct pins => EXACTLY N unique handle values (set) ──
+                    // Cardinality cross-check (count == size): 8 independent pins to
+                    // 8 fresh objects must yield 8 UNIQUE handle values.  No GC.
+                    {
+                        std::array<vmhook::jni::global_ref, k_many_pins> upins{};
+                        std::array<void*, k_many_pins> uhandles{};
+                        for (int i = 0; i < k_many_pins; ++i)
+                        {
+                            if (auto m{ vmhook::make_unique<global_ref_fixture>(0xD000 + i) })
+                            {
+                                upins[static_cast<std::size_t>(i)] = vmhook::pin(m);
+                            }
+                            uhandles[static_cast<std::size_t>(i)] =
+                                upins[static_cast<std::size_t>(i)].handle();
+                        }
+                        int unique{ 0 };
+                        for (int i = 0; i < k_many_pins; ++i)
+                        {
+                            void* const hi{ uhandles[static_cast<std::size_t>(i)] };
+                            if (hi == nullptr)
+                            {
+                                continue;
+                            }
+                            bool seen_earlier{ false };
+                            for (int j = 0; j < i; ++j)
+                            {
+                                if (uhandles[static_cast<std::size_t>(j)] == hi)
+                                {
+                                    seen_earlier = true;
+                                }
+                            }
+                            if (!seen_earlier)
+                            {
+                                ++unique;
+                            }
+                        }
+                        g_many_unique_handle_count.store(unique, std::memory_order_relaxed);
+                        // upins[] all destruct here -> k_many_pins DeleteGlobalRef.
+                    }
+
                     // ── distinct OBJECTS -> distinct identity, each reads its own ─
                     if (auto made_a{ vmhook::make_unique<global_ref_fixture>(0xAAAA) })
                     {
@@ -1198,6 +1427,41 @@ VMHOOK_JVM_MODULE(global_ref)
                   g_write_through_oop_ok.load(std::memory_order_relaxed));
         ctx.check("global_ref_oop_write_through_value_is_2020",
                   g_write_through_val.load(std::memory_order_relaxed) == 0x2020);
+
+        // std::swap exchanges ownership wholesale (move value-semantics)
+        ctx.check("global_ref_swap_exchanges_handles",
+                  g_swap_exchanged_handles.load(std::memory_order_relaxed));
+        ctx.check("global_ref_swap_a_reads_b_0B0B",
+                  g_swap_a_reads_b.load(std::memory_order_relaxed));
+        ctx.check("global_ref_swap_b_reads_a_0A0A",
+                  g_swap_b_reads_a.load(std::memory_order_relaxed));
+        ctx.check("global_ref_swap_self_is_noop",
+                  g_swap_self_intact.load(std::memory_order_relaxed));
+
+        // BOUNDARY sentinel values (0,1,-1,INT32_MIN,INT32_MAX) round-trip through .oop()
+        // count == size: every boundary value resolved AND matched exactly.
+        ctx.check("global_ref_boundary_all_resolved",
+                  g_boundary_reads_ok.load(std::memory_order_relaxed) == k_boundary_count);
+        ctx.check("global_ref_boundary_all_match",
+                  g_boundary_values_matched.load(std::memory_order_relaxed) == k_boundary_count);
+
+        // .oop()'s low-3-bit mask recovers the REAL slot: a hand-recomputed
+        // `*(void**)(handle & ~7)` equals .oop() exactly (HARD — pins the documented
+        // mask against an independent recomputation; a library mask regression to
+        // ~0xF / no-mask would diverge).  Whether that slot's CONTENTS equal the
+        // wrapper's decoded get_instance() oop pre-GC is recorded [INFO] only: it
+        // matches the existing oop_eq_instance_pre diagnostic, which the module has
+        // never hard-asserted (NewGlobalRef's stored oop form is not guaranteed by
+        // the library source to be byte-identical to get_instance() on every JDK).
+        ctx.check("global_ref_mask_matches_oop",
+                  g_mask_matches_oop.load(std::memory_order_relaxed));
+        ctx.record(std::string{ "[INFO] global_ref: masked-slot deref == wrapper "
+                                "get_instance() oop (pre-GC) observed=" }
+                   + (g_mask_slot_eq_instance.load(std::memory_order_relaxed) ? "true" : "false"));
+
+        // N distinct pins => EXACTLY N unique handle values (count == size cardinality)
+        ctx.check("global_ref_many_unique_handle_count_is_8",
+                  g_many_unique_handle_count.load(std::memory_order_relaxed) == k_many_pins);
 
         // distinct OBJECTS -> distinct identity, each reads its OWN sentinel
         ctx.check("global_ref_distinct_objects_distinct_handles",
