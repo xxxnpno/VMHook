@@ -87,6 +87,7 @@
 
 #include "../harness.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -194,6 +195,31 @@ namespace
         // ---- read a published Java cross-check witness (clean one-liner idiom) -
         static auto seen_int(const char* name) -> std::int32_t { return static_field(name)->get(); }
         static auto seen_bool(const char* name) -> bool { return static_field(name)->get(); }
+
+        // ---- THE PUBLIC FIELD-PROXY STRING-GETTER ROUTE ---------------------
+        // The library's CANONICAL user-facing way to read a String field is
+        // `static_field("x")->get().as_string()`: field_proxy::get() returns a
+        // value_t holding the field's compressed OOP, and value_t::as_string()
+        // decodes that OOP through vmhook::read_java_string (vmhook.hpp: the
+        // uint32 alternative -> decode_oop_pointer -> read_java_string).  This is
+        // a DIFFERENT entry into the same shared decode core than decode()'s
+        // manual static_field->get_compressed_oop()->decode_oop_pointer pipeline
+        // -- proving the two agree proves the field String getter funnels through
+        // read_java_string exactly.  Uses the clean documented one-liner idiom.
+        static auto decode_via_field_getter(const char* name) -> std::string
+        {
+            return static_field(name)->get().as_string();
+        }
+
+        // Presence + reference-kind PROBE of the field-proxy value_t: a String
+        // field's value is the compressed-OOP (uint32) alternative, so
+        // is_reference() is true; the witness int fields are primitives, so
+        // is_reference() is false.  Not a value read -- a structural probe.
+        static auto field_is_reference(const char* name) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            return proxy.has_value() && proxy->get().is_reference();
+        }
     };
 
     // Fixed, JDK-independent expected UTF-8 byte sequences for each subject.  A
@@ -1304,6 +1330,248 @@ namespace
         }
 
         // =================================================================
+        //  8. THE PUBLIC FIELD-PROXY STRING-GETTER ROUTE.
+        //     decode() above reached read_java_string through the MANUAL pipeline
+        //     (static_field->get_compressed_oop()->decode_oop_pointer).  The
+        //     library's CANONICAL user-facing route is instead
+        //     static_field("x")->get().as_string(): field_proxy::get() yields a
+        //     value_t holding the compressed OOP, and value_t::as_string() decodes
+        //     it via vmhook::read_java_string.  That is a DISTINCT entry into the
+        //     SAME shared decode core (the "field String getter" shared-core
+        //     caller).  Proving the two routes are byte-IDENTICAL on every coder
+        //     branch -- and that the getter agrees with the fixed JDK-independent
+        //     expected bytes -- proves the field getter funnels through
+        //     read_java_string exactly, with no second decode implementation.
+        // =================================================================
+        {
+            // A representative subject from EACH internal decode branch, so the
+            // getter route is exercised over the whole layout dispatch:
+            //   LATIN1 1-byte  : ascii          UTF16 BMP 3-byte : nihongo
+            //   LATIN1 2-byte  : cafe           UTF16 surrogate  : emoji (4-byte)
+            //   every byte 0..FF: all256        interior NUL     : nulLatin1
+            //   mixed-width pass: multiScript    long body        : longAscii
+            struct getter_case { const char* name; const std::string* expect; };
+            const getter_case getter_cases[]{
+                { "ascii",       &k_hello },
+                { "oneAscii",    &k_oneAscii },
+                { "cafe",        &k_cafe },
+                { "latin1Hi",    &k_latin1Hi },
+                { "nulLatin1",   &k_nulLatin1 },
+                { "all256",      nullptr },        // compared to manual decode only
+                { "oneCjk",      &k_oneCjk },
+                { "nihongo",     &k_nihongo },
+                { "mixed",       &k_mixed },
+                { "maxBmp",      &k_maxBmp },
+                { "nulUtf16",    &k_nulUtf16 },
+                { "emoji",       &k_emoji },
+                { "emojiMix",    &k_emojiMix },
+                { "firstAstral", &k_firstAstral },
+                { "maxAstral",   &k_maxAstral },
+                { "multiScript", &k_multiScript },
+                { "loneHigh",    &k_loneHigh },
+            };
+            for (const auto& gc : getter_cases)
+            {
+                const std::string via_getter{ rjs::decode_via_field_getter(gc.name) };
+                const std::string via_manual{ rjs::decode(gc.name) };
+                // The two library routes MUST agree byte-for-byte (same core).
+                ctx.check(std::string{ "fieldgetter_eq_manual_" } + gc.name,
+                          via_getter == via_manual);
+                // And, where we have a fixed JDK-independent oracle, the getter
+                // matches it directly (not just "agrees with the other route").
+                if (gc.expect != nullptr)
+                {
+                    ctx.check(std::string{ "fieldgetter_eq_expected_" } + gc.name,
+                              via_getter == *gc.expect);
+                }
+            }
+
+            // The getter route honours the guard paths too: a null String
+            // reference (compressed OOP 0) -> as_string() visits the uint32 0 ->
+            // decode_oop_pointer(0) -> nullptr -> read_java_string(nullptr) -> "".
+            ctx.check("fieldgetter_nullRef_is_empty",
+                      rjs::decode_via_field_getter("nullRef").empty());
+            // The empty String "" -> the getter yields "" (length-0 backing guard),
+            // identical to the manual route.
+            ctx.check("fieldgetter_empty_is_empty",
+                      rjs::decode_via_field_getter("empty").empty()
+                      && rjs::decode_via_field_getter("empty") == rjs::decode("empty"));
+            // A long body decodes IN FULL through the getter route too (not only
+            // the manual one) -- the getter does not impose a smaller ceiling.
+            ctx.check("fieldgetter_longAscii_full_1000",
+                      rjs::decode_via_field_getter("longAscii").size() == 1000);
+            ctx.check("fieldgetter_cap4097_full_4097",
+                      rjs::decode_via_field_getter("cap4097").size() == 4097);
+
+            // value_t structural probe: a String field's value_t holds the
+            // compressed-OOP alternative (is_reference() true); a primitive
+            // witness field (an "I") is NOT a reference.  This proves as_string()
+            // takes the uint32 -> read_java_string branch for String fields (and
+            // would correctly yield "" for a non-reference, not garbage).
+            ctx.check("fieldgetter_string_field_is_reference",
+                      rjs::field_is_reference("ascii"));
+            ctx.check("fieldgetter_int_witness_field_not_reference",
+                      !rjs::field_is_reference("jAsciiLen"));
+            // A null String REFERENCE field is still a reference (signature L...),
+            // even though its OOP is 0 -- is_reference() keys on the descriptor,
+            // and as_string() of its zero OOP still routes to "" (asserted above).
+            ctx.check("fieldgetter_nullRef_field_is_reference",
+                      rjs::field_is_reference("nullRef"));
+            ctx.record("[INFO] field-proxy getter route (get().as_string()) "
+                       "agrees byte-for-byte with the manual decode pipeline on "
+                       "every coder branch + guard path.");
+        }
+
+        // =================================================================
+        //  9. EXTENDED BOGUS-POINTER BATTERY into read_java_string directly.
+        //     Section 5 fed nullptr / 0x1 (odd) / 0x10 (low sentinel).  These
+        //     widen the no-crash + empty-result contract over MORE degenerate
+        //     raw addresses: every one must return "" via the internal
+        //     is_valid_pointer gate (range / 2-byte-alignment / poison heuristic)
+        //     WITHOUT dereferencing -- never a fault, never non-empty garbage.
+        // =================================================================
+        {
+            // Helper: a raw void* from a uintptr literal.
+            const auto P = [](std::uintptr_t v) -> void*
+            {
+                return reinterpret_cast<void*>(v);
+            };
+
+            // EVEN low sentinels below the user-address floor (the odd-address
+            // alignment reject canNOT be why these fail -- they are 2-aligned, so
+            // this exercises the RANGE-floor reject specifically).
+            ctx.check("rjs_ptr_0x2_even_low_is_empty",  vmhook::read_java_string(P(0x2)).empty());
+            ctx.check("rjs_ptr_0x4_even_low_is_empty",  vmhook::read_java_string(P(0x4)).empty());
+            ctx.check("rjs_ptr_0x8_even_low_is_empty",  vmhook::read_java_string(P(0x8)).empty());
+            ctx.check("rjs_ptr_0xE_even_low_is_empty",  vmhook::read_java_string(P(0xE)).empty());
+            ctx.check("rjs_ptr_0x100_even_low_is_empty", vmhook::read_java_string(P(0x100)).empty());
+            ctx.check("rjs_ptr_0xFFF_page_low_is_empty", vmhook::read_java_string(P(0xFFF)).empty());
+
+            // ODD addresses at varied magnitudes (alignment reject).
+            ctx.check("rjs_ptr_0x3_odd_is_empty",  vmhook::read_java_string(P(0x3)).empty());
+            ctx.check("rjs_ptr_0x7FF_odd_is_empty", vmhook::read_java_string(P(0x7FF)).empty());
+
+            // Top-of-address-space sentinels (kernel-space / non-canonical /
+            // all-ones): far above any heap, rejected by the range ceiling.  The
+            // all-ones value is also the classic "uninitialised/poison" pattern.
+            ctx.check("rjs_ptr_all_ones_is_empty",
+                      vmhook::read_java_string(P(~std::uintptr_t{ 0 })).empty());
+            ctx.check("rjs_ptr_all_ones_even_is_empty",
+                      vmhook::read_java_string(P(~std::uintptr_t{ 0 } & ~std::uintptr_t{ 1 })).empty());
+            ctx.check("rjs_ptr_high_canonical_is_empty",
+                      vmhook::read_java_string(P(std::uintptr_t{ 0xFFFF800000000000ull })).empty());
+
+            // Repeatability of the guard: the SAME bogus pointer returns "" every
+            // time (the guard is stateless / has no first-call side effect).
+            ctx.check("rjs_ptr_guard_repeatable",
+                      vmhook::read_java_string(P(0x2)).empty()
+                      && vmhook::read_java_string(P(0x2)).empty()
+                      && vmhook::read_java_string(nullptr).empty());
+            ctx.record("[INFO] extended bogus-pointer battery: even/odd low "
+                       "sentinels, page-floor, all-ones, and high-canonical "
+                       "addresses ALL return empty with no crash.");
+        }
+
+        // =================================================================
+        //  10. CROSS-CHECK INVARIANTS that tie the native byte output to Java's
+        //      own per-field view INDEPENDENTLY of the fixed expected literals:
+        //      the decoded UTF-8 BYTE count must equal what Java's code-point
+        //      data predicts, and same-content/different-coder fields must decode
+        //      to byte-identical output.  These are computed cross-checks, not
+        //      restatements of the hard-coded k_* sequences.
+        // =================================================================
+        {
+            // PURELY-NATIVE invariants (no Java witness dependency) -- HARD always.
+            // Same-content / different-coder + multi-route identical output (beyond
+            // the asciiPlain/asciiInUtf16 PREFIX check in section 2): ascii (LATIN1
+            // "hello"), interned (pooled "hello"), and the field-getter route ALL
+            // produce one byte-identical value.
+            const std::string a_ascii{ rjs::decode("ascii") };
+            ctx.check("xcheck_ascii_interned_getter_all_agree",
+                      a_ascii == rjs::decode("interned")
+                      && a_ascii == rjs::decode_via_field_getter("ascii")
+                      && a_ascii == k_hello);
+
+            // The all-NUL string is NON-empty (3 bytes) and distinct from the empty
+            // decode -- a length-driven, not NUL-terminated, cross-check that does
+            // not depend on any Java witness.
+            const std::string a_all_nul{ rjs::decode("allNul") };
+            ctx.check("xcheck_allNul_nonempty_len3_distinct_from_empty",
+                      a_all_nul.size() == 3 && a_all_nul != rjs::decode("empty"));
+
+            // capUtf2048: native byte count is EXACTLY 3x the char count (all 3-byte
+            // CJK) -- a count-vs-size invariant computed from the native decode alone
+            // (capUtf2048 length is a fixed 2048 in the fixture).
+            ctx.check("xcheck_capUtf2048_bytecount_is_3x_charcount",
+                      rjs::decode("capUtf2048").size() == 3u * 2048u);
+
+            // JAVA-WITNESS cross-checks: tie the native byte output to Java's own
+            // per-field code-point view INDEPENDENTLY of the fixed k_* literals.
+            // Gated on the probe having published (sentinel jNullIsNull, set true
+            // only inside the probe's run()): if the probe never ran these are
+            // diagnostic, not a FAIL (mirrors section 6's if(done) discipline).
+            if (rjs::seen_bool("jNullIsNull"))
+            {
+                // UTF-8 byte width of a single code point (the 1/2/3/4 split the
+                // library's append_utf8 uses), to predict a decode's byte size from
+                // Java's reported code points alone.
+                const auto utf8_width = [](std::int32_t cp) -> std::size_t
+                {
+                    if (cp < 0x80)    { return 1; }
+                    if (cp < 0x800)   { return 2; }
+                    if (cp < 0x10000) { return 3; }
+                    return 4;
+                };
+
+                // nihongo: predict 9 bytes from Java's three reported code points;
+                // assert the native size matches the prediction (and is 9).
+                const std::size_t pred_nihongo{
+                    utf8_width(rjs::seen_int("jNihongoCp0"))
+                    + utf8_width(rjs::seen_int("jNihongoCp1"))
+                    + utf8_width(rjs::seen_int("jNihongoCp2")) };
+                ctx.check("xcheck_nihongo_bytecount_matches_java_codepoints",
+                          rjs::decode("nihongo").size() == pred_nihongo && pred_nihongo == 9);
+
+                // emoji: one astral code point (Java cpCount 1) -> predicted width 4
+                // -> native size 4.  Ties the surrogate-combine result to Java's view.
+                ctx.check("xcheck_emoji_bytecount_is_4_for_1_astral_cp",
+                          rjs::seen_int("jEmojiCpCount") == 1
+                          && utf8_width(rjs::seen_int("jEmojiCp0")) == 4
+                          && rjs::decode("emoji").size() == 4);
+
+                // cafe: 3 ASCII (1 byte) + the last code point's width (U+00E9 -> 2)
+                // -> predict 5 -> native size 5.
+                ctx.check("xcheck_cafe_bytecount_matches_java",
+                          rjs::decode("cafe").size()
+                              == 3u + utf8_width(rjs::seen_int("jCafeCp3"))
+                          && rjs::decode("cafe").size() == 5);
+
+                // longAscii: native byte count == Java's char length (all ASCII).
+                ctx.check("xcheck_longAscii_bytecount_eq_java_len",
+                          rjs::decode("longAscii").size()
+                              == static_cast<std::size_t>(rjs::seen_int("jLongAsciiLen")));
+
+                // capUtf2048: native byte count == 3 * Java's reported char length.
+                ctx.check("xcheck_capUtf2048_bytecount_eq_3x_java_len",
+                          rjs::decode("capUtf2048").size()
+                              == 3u * static_cast<std::size_t>(rjs::seen_int("jCapUtf2048Len")));
+
+                // allNul: Java's reported char length agrees with the native size.
+                ctx.check("xcheck_allNul_bytecount_eq_java_len",
+                          a_all_nul.size()
+                              == static_cast<std::size_t>(rjs::seen_int("jAllNulLen")));
+            }
+            else
+            {
+                ctx.record("[INFO] cross-check: probe witnesses not published - "
+                           "Java-dependent byte-count invariants skipped (no FAIL).");
+            }
+            ctx.record("[INFO] cross-check invariants: native UTF-8 byte counts "
+                       "match Java code-point-predicted widths; multi-route "
+                       "same-content decodes agree.");
+        }
+
+        // =================================================================
         //  7. PURITY / REPEATABILITY: read_java_string is a pure reader.
         //     Decoding the same field twice yields identical bytes, and decoding
         //     it after the probe ran leaves the backing String content unchanged.
@@ -1336,6 +1604,18 @@ namespace
                       rjs::decode("multiScript") == k_multiScript);
             ctx.check("lowThenPair_unchanged_after_probe",
                       rjs::decode("lowThenPair") == k_lowThenPair);
+
+            // The PUBLIC field-getter route is pure too: decoding nihongo / emoji
+            // through get().as_string() twice (after the probe) yields identical
+            // bytes that still equal the manual route -- neither library path
+            // mutates the backing array.
+            ctx.check("fieldgetter_nihongo_repeatable_pure",
+                      rjs::decode_via_field_getter("nihongo")
+                          == rjs::decode_via_field_getter("nihongo")
+                      && rjs::decode_via_field_getter("nihongo") == k_nihongo);
+            ctx.check("fieldgetter_emoji_pure_eq_manual_after_probe",
+                      rjs::decode_via_field_getter("emoji") == rjs::decode("emoji")
+                      && rjs::decode_via_field_getter("emoji") == k_emoji);
         }
     }
 }

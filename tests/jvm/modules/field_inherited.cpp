@@ -1623,4 +1623,382 @@ VMHOOK_JVM_MODULE(field_inherited)
             }
         }
     }
+
+    // =====================================================================
+    //  field_entry_t::offset LAYOUT INVARIANTS through the walk.
+    //
+    //  For an INSTANCE field find_field's offset is OBJECT-ABSOLUTE (laid out
+    //  cumulatively from the super down — vmhook.hpp:3414).  That gives three
+    //  strong, value-independent structural invariants the module did not yet
+    //  pin, all read straight off the walk-produced field_entry_t:
+    //    1. A NON-shadowed inherited field has the SAME object-absolute offset
+    //       regardless of which start klass began the walk (child / mid / base).
+    //    2. A SHADOWED field's CHILD entry and BASE entry carry DIFFERENT
+    //       offsets (two physically distinct slots), and the child's slot is
+    //       laid out AFTER the base's (subclass fields follow super fields), so
+    //       the child offset is strictly GREATER than the base offset.
+    //    3. Every instance-field offset is non-zero (past the oop header) and
+    //       two distinct fields occupy two distinct offsets.
+    //  These are descriptor-/value-independent: a regression in the walk that
+    //  returned a divergent or aliased offset surfaces here even if the VALUE
+    //  happened to coincide.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const k_child{ vmhook::find_class(K_CHILD) };
+        vmhook::hotspot::klass* const k_mid  { vmhook::find_class(K_MID) };
+        vmhook::hotspot::klass* const k_base { vmhook::find_class(K_BASE) };
+        if (k_child && k_mid && k_base)
+        {
+            // (1) Non-shadowed inherited grandparent field: one object-absolute
+            //     offset, identical from all three start klasses.
+            const auto pc{ vmhook::find_field(k_child, "protectedInt") };
+            const auto pm{ vmhook::find_field(k_mid,   "protectedInt") };
+            const auto pb{ vmhook::find_field(k_base,  "protectedInt") };
+            ctx.check("offset_inherited_resolved_all_views",
+                      pc.has_value() && pm.has_value() && pb.has_value());
+            if (pc && pm && pb)
+            {
+                ctx.check("offset_inherited_same_across_views",
+                          pc->offset == pm->offset && pm->offset == pb->offset);
+                ctx.check("offset_inherited_nonzero", pc->offset != 0u);
+                ctx.check("offset_inherited_not_static",
+                          pc->is_static == false && pb->is_static == false);
+            }
+
+            // Depth-1 own (Mid) field: same object-absolute offset from child
+            // and from mid (the start klass does not move an absolute offset).
+            const auto mc{ vmhook::find_field(k_child, "midOwnInt") };
+            const auto mm{ vmhook::find_field(k_mid,   "midOwnInt") };
+            if (mc && mm)
+            {
+                ctx.check("offset_depth1_same_across_views", mc->offset == mm->offset);
+                ctx.check("offset_depth1_nonzero", mc->offset != 0u);
+            }
+
+            // (2) Shadowed int: child entry vs base entry — different offsets,
+            //     and the child slot is laid out AFTER the base slot.
+            const auto sc{ vmhook::find_field(k_child, "shadowedInt") };
+            const auto sb{ vmhook::find_field(k_base,  "shadowedInt") };
+            ctx.check("offset_shadow_resolved_both_views", sc.has_value() && sb.has_value());
+            if (sc && sb)
+            {
+                ctx.check("offset_shadow_child_base_differ", sc->offset != sb->offset);
+                ctx.check("offset_shadow_child_after_base", sc->offset > sb->offset);
+                ctx.check("offset_shadow_both_nonzero",
+                          sc->offset != 0u && sb->offset != 0u);
+                // The mid-typed view of a name Mid does NOT declare resolves the
+                // BASE slot, so its offset equals the base entry's, never the
+                // child entry's — the walk passes Mid through to Base.
+                const auto sm{ vmhook::find_field(k_mid, "shadowedInt") };
+                if (sm)
+                {
+                    ctx.check("offset_shadow_mid_view_equals_base",
+                              sm->offset == sb->offset && sm->offset != sc->offset);
+                }
+            }
+
+            // Shadowed wide (long) + narrow (byte): same child-after-base layout
+            // invariant holds at other widths, proving it is not int-specific.
+            const auto lc{ vmhook::find_field(k_child, "shadowedLong") };
+            const auto lb{ vmhook::find_field(k_base,  "shadowedLong") };
+            if (lc && lb)
+            {
+                ctx.check("offset_shadow_long_child_after_base", lc->offset > lb->offset);
+                ctx.check("offset_shadow_long_child_base_differ", lc->offset != lb->offset);
+            }
+            const auto bc{ vmhook::find_field(k_child, "shadowedByte") };
+            const auto bb{ vmhook::find_field(k_base,  "shadowedByte") };
+            if (bc && bb)
+            {
+                ctx.check("offset_shadow_byte_child_after_base", bc->offset > bb->offset);
+            }
+
+            // (3) Two DISTINCT fields occupy two DISTINCT object-absolute
+            //     offsets — the child's own field and an inherited base field
+            //     never collide in the layout.
+            const auto own{ vmhook::find_field(k_child, "childOwnInt") };
+            if (own && pc)
+            {
+                ctx.check("offset_distinct_fields_distinct_offsets",
+                          own->offset != pc->offset);
+                ctx.check("offset_own_field_nonzero", own->offset != 0u);
+            }
+        }
+    }
+
+    // =====================================================================
+    //  ENTRY-LEVEL IDEMPOTENCY / DETERMINISM through the walk + cache.
+    //
+    //  Two consecutive find_field resolutions of the SAME (start klass, name)
+    //  must agree on EVERY field of field_entry_t — offset, is_static,
+    //  signature AND declaring_klass — not merely on the proxy address the
+    //  existing cache block already checks.  The first call populates the
+    //  cache; the second is a pure cache hit; both must be byte-for-byte
+    //  equivalent.  Proven for an inherited instance field, a shadowed
+    //  instance field, and an inherited static (three cache shapes).
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const k_child{ vmhook::find_class(K_CHILD) };
+        vmhook::hotspot::klass* const k_base { vmhook::find_class(K_BASE) };
+        if (k_child)
+        {
+            const auto a{ vmhook::find_field(k_child, "protectedInt") };
+            const auto b{ vmhook::find_field(k_child, "protectedInt") };
+            ctx.check("idempotent_inherited_entry_equal",
+                      a.has_value() && b.has_value()
+                          && a->offset == b->offset
+                          && a->is_static == b->is_static
+                          && a->signature == b->signature
+                          && a->declaring_klass == b->declaring_klass);
+
+            const auto sa{ vmhook::find_field(k_child, "shadowedInt") };
+            const auto sb2{ vmhook::find_field(k_child, "shadowedInt") };
+            ctx.check("idempotent_shadow_entry_equal",
+                      sa.has_value() && sb2.has_value()
+                          && sa->offset == sb2->offset
+                          && sa->declaring_klass == sb2->declaring_klass
+                          && sa->declaring_klass == k_child);
+
+            const auto ta{ vmhook::find_field(k_child, "sProtected") };
+            const auto tb{ vmhook::find_field(k_child, "sProtected") };
+            ctx.check("idempotent_static_entry_equal",
+                      ta.has_value() && tb.has_value()
+                          && ta->offset == tb->offset
+                          && ta->is_static && tb->is_static
+                          && ta->signature == tb->signature
+                          && ta->declaring_klass == tb->declaring_klass
+                          && ta->declaring_klass == k_base);
+        }
+    }
+
+    // =====================================================================
+    //  value_t-LEVEL introspection through the walk.
+    //
+    //  field_proxy::get() returns a value_t that carries its OWN copy of the
+    //  JVM descriptor (value_t::signature, vmhook.hpp:14901) and an
+    //  is_reference() predicate independent of field_proxy::is_reference().
+    //  For a slot reached through the super walk the value-level descriptor
+    //  MUST agree with the proxy-level descriptor, the value-level reference
+    //  predicate MUST agree with the proxy-level one, and as_string() on the
+    //  value MUST decode the same String the implicit conversion does.  This
+    //  exercises the value object the walk produces, not just the proxy.
+    // =====================================================================
+    if (child)
+    {
+        // Inherited primitive (depth-2 J): value_t carries "J", not a reference.
+        {
+            auto fp{ child->get_field("baseLong") };
+            if (fp)
+            {
+                const auto v{ fp->get() };
+                ctx.check("value_signature_matches_proxy_long",
+                          v.signature == std::string{ fp->signature() }
+                              && v.signature == "J");
+                ctx.check("value_is_reference_false_for_primitive",
+                          v.is_reference() == false
+                              && v.is_reference() == fp->is_reference());
+            }
+        }
+        // Inherited reference (depth-2 String): value_t is a reference and its
+        // as_string() agrees with the implicit-conversion read.
+        {
+            auto fp{ child->get_field("baseStr") };
+            if (fp)
+            {
+                const auto v{ fp->get() };
+                ctx.check("value_signature_matches_proxy_string",
+                          v.signature == "Ljava/lang/String;"
+                              && v.signature == std::string{ fp->signature() });
+                ctx.check("value_is_reference_true_for_string",
+                          v.is_reference() == true
+                              && v.is_reference() == fp->is_reference());
+                const std::string viav{ v.as_string() };
+                ctx.check("value_as_string_value", viav == "base-str");
+            }
+        }
+        // Inherited array (depth-2 "[I"): value_t reports a reference (arrays are
+        // reference types) at the value level too.
+        {
+            auto fp{ child->get_field("baseIntArray") };
+            if (fp)
+            {
+                const auto v{ fp->get() };
+                ctx.check("value_signature_matches_proxy_array",
+                          v.signature == "[I" && v.signature == std::string{ fp->signature() });
+                ctx.check("value_is_reference_true_for_array", v.is_reference() == true);
+            }
+        }
+        // SHADOWED String at the value level: child-typed value as_string() ==
+        // "child", base-typed value as_string() == "base" — the value object
+        // produced by the walk is child-wins / base-unhidden respectively.
+        {
+            auto cs{ child->get_field("shadowedStr") };
+            fi_base sb{ child->vmhook::object_base::get_instance() };
+            auto bs{ sb.get_field("shadowedStr") };
+            if (cs && bs)
+            {
+                const std::string cv{ cs->get().as_string() };
+                const std::string bv{ bs->get().as_string() };
+                ctx.check("value_shadow_string_child_is_child", cv == "child");
+                ctx.check("value_shadow_string_base_is_base", bv == "base");
+                ctx.check("value_shadow_string_as_string_distinct", cv != bv);
+            }
+        }
+    }
+
+    // =====================================================================
+    //  STATIC field_entry_t::offset is DECLARING-MIRROR-RELATIVE.
+    //
+    //  Unlike an instance field's object-absolute offset, a static's offset is
+    //  relative to the DECLARING class's own java.lang.Class mirror
+    //  (vmhook.hpp:3416).  Two structural invariants the module did not yet
+    //  pin, read off the walk-produced entry:
+    //    1. The SAME inherited static, requested from child / mid / base start
+    //       klasses, yields the SAME declaring klass (Base) AND the SAME
+    //       mirror-relative offset (the offset belongs to the declaring mirror,
+    //       not the requesting klass) — even though the cache key differs.
+    //    2. The SHADOWED static's child entry and base entry have DIFFERENT
+    //       declaring klasses (child vs Base) and live on DIFFERENT mirrors, so
+    //       they are independently addressable (already proven by address; here
+    //       proven structurally via declaring_klass).
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const k_child{ vmhook::find_class(K_CHILD) };
+        vmhook::hotspot::klass* const k_mid  { vmhook::find_class(K_MID) };
+        vmhook::hotspot::klass* const k_base { vmhook::find_class(K_BASE) };
+        if (k_child && k_mid && k_base)
+        {
+            const auto pc{ vmhook::find_field(k_child, "sProtected") };
+            const auto pm{ vmhook::find_field(k_mid,   "sProtected") };
+            const auto pb{ vmhook::find_field(k_base,  "sProtected") };
+            if (pc && pm && pb)
+            {
+                ctx.check("static_offset_same_across_views",
+                          pc->offset == pm->offset && pm->offset == pb->offset);
+                ctx.check("static_declaring_same_across_views",
+                          pc->declaring_klass == k_base
+                              && pm->declaring_klass == k_base
+                              && pb->declaring_klass == k_base);
+                ctx.check("static_inherited_is_static_all_views",
+                          pc->is_static && pm->is_static && pb->is_static);
+            }
+
+            // Shadowed static: distinct declaring klasses for the two views, and
+            // the child entry declares on the CHILD klass (its own mirror slot).
+            const auto sc{ vmhook::find_field(k_child, "sShadow") };
+            const auto sb{ vmhook::find_field(k_base,  "sShadow") };
+            if (sc && sb)
+            {
+                ctx.check("static_shadow_distinct_declaring",
+                          sc->declaring_klass == k_child
+                              && sb->declaring_klass == k_base
+                              && sc->declaring_klass != sb->declaring_klass);
+                ctx.check("static_shadow_both_is_static",
+                          sc->is_static && sb->is_static);
+            }
+        }
+    }
+
+    // =====================================================================
+    //  NEGATIVE-path EXHAUSTIVENESS through the walk.
+    //
+    //  An absent name returns nullopt from EVERY start klass and EVERY layer:
+    //  the per-klass declared-only call, the super-walk free fn, and the
+    //  registered wrappers' instance + static accessors.  Two further edge
+    //  shapes the module did not yet pin: the empty string as a field name, and
+    //  a name that is a PREFIX of a real field (so a substring-matching bug
+    //  would wrongly resolve it).  All must be nullopt and none may crash.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const k_child{ vmhook::find_class(K_CHILD) };
+        vmhook::hotspot::klass* const k_mid  { vmhook::find_class(K_MID) };
+        vmhook::hotspot::klass* const k_base { vmhook::find_class(K_BASE) };
+        if (k_child && k_mid && k_base)
+        {
+            // Empty field name — degenerate input, nullopt at every chain length.
+            ctx.check("absent_empty_name_child", vmhook::find_field(k_child, "").has_value() == false);
+            ctx.check("absent_empty_name_mid",   vmhook::find_field(k_mid,   "").has_value() == false);
+            ctx.check("absent_empty_name_base",  vmhook::find_field(k_base,  "").has_value() == false);
+
+            // A PREFIX of a real field ("protected" of "protectedInt") and a
+            // SUFFIX ("Int") must NOT resolve — exact-match only, no substring.
+            ctx.check("absent_prefix_of_real_field",
+                      vmhook::find_field(k_child, "protected").has_value() == false);
+            ctx.check("absent_suffix_of_real_field",
+                      vmhook::find_field(k_child, "Int").has_value() == false);
+            // Case sensitivity: Java field names are case-sensitive, so a
+            // differently-cased spelling of a real field must not resolve.
+            ctx.check("absent_wrong_case_of_real_field",
+                      vmhook::find_field(k_child, "ProtectedInt").has_value() == false);
+
+            // A child-only name is invisible from the base/mid start klass (the
+            // walk only ascends), AND the declared-only per-klass call agrees at
+            // every level — exhaustive directionality of the walk.
+            ctx.check("absent_child_field_from_base_walk",
+                      vmhook::find_field(k_base, "childOwnInt").has_value() == false);
+            ctx.check("absent_child_field_from_mid_walk",
+                      vmhook::find_field(k_mid, "childOwnInt").has_value() == false);
+            ctx.check("absent_child_field_declared_only_on_base",
+                      k_base->find_field("childOwnInt").has_value() == false);
+            // A parent-only (Mid) name is invisible from the base start klass.
+            ctx.check("absent_parent_field_from_base_walk",
+                      vmhook::find_field(k_base, "midOwnInt").has_value() == false);
+        }
+    }
+
+    // =====================================================================
+    //  WIDTH/SIGN INTEGRITY of the value_t variant for inherited BOUNDARY
+    //  slots (depth-2 walk).  Beyond the already-checked scalar values, assert
+    //  the value the walk produces carries the CORRECT descriptor for each
+    //  width AND that round-tripping the extreme bit pattern through value_t
+    //  preserves it: the all-ones int reads -1 (signed), the unsigned char
+    //  0xFFFF reads 65535 (no sign extension), the signed byte 0xFF reads -1.
+    //  Cross-checks the descriptor carried by value_t against the literal
+    //  width — a wrong-width variant alternative would mismatch one of these.
+    // =====================================================================
+    if (child)
+    {
+        {
+            auto fp{ child->get_field("baseIntNeg") };
+            if (fp)
+            {
+                const auto v{ fp->get() };
+                ctx.check("boundary_int_neg_signature", v.signature == "I");
+                ctx.check("boundary_int_neg_value", static_cast<std::int32_t>(v) == -1);
+            }
+        }
+        {
+            auto fp{ child->get_field("baseCharMax") };
+            if (fp)
+            {
+                const auto v{ fp->get() };
+                ctx.check("boundary_char_max_signature", v.signature == "C");
+                // Unsigned 16-bit: 0xFFFF -> 65535, never -1.
+                ctx.check("boundary_char_max_unsigned_value",
+                          static_cast<std::uint16_t>(v) == 0xFFFFu
+                              && static_cast<std::int32_t>(v) == 65535);
+            }
+        }
+        {
+            auto fp{ child->get_field("baseByteNeg") };
+            if (fp)
+            {
+                const auto v{ fp->get() };
+                ctx.check("boundary_byte_neg_signature", v.signature == "B");
+                // Signed 8-bit: 0xFF -> -1.
+                ctx.check("boundary_byte_neg_signed_value",
+                          static_cast<std::int8_t>(v) == static_cast<std::int8_t>(-1));
+            }
+        }
+        {
+            auto fp{ child->get_field("baseLongMin") };
+            if (fp)
+            {
+                const auto v{ fp->get() };
+                ctx.check("boundary_long_min_signature", v.signature == "J");
+                ctx.check("boundary_long_min_value",
+                          static_cast<std::int64_t>(v) == BASE_LONG_MIN);
+            }
+        }
+    }
 }

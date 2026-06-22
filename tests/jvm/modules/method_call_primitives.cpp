@@ -156,6 +156,35 @@ namespace
         // value_t introspection probes (instance)
         auto is_void(const char* n) -> bool   { return get_method(n)->call().is_void(); }
         auto is_string(const char* n) -> bool { return get_method(n)->call().is_string(); }
+        // as_string() on a NON-string return (numeric or void) is spec'd to return
+        // an EMPTY std::string (the conversion operator / as_string() default leg
+        // for a numeric / monostate alternative), not a textual rendering of the
+        // number.  Proves as_string() never fabricates content from a primitive.
+        auto as_string_empty(const char* n) -> bool { return get_method(n)->call().as_string().empty(); }
+
+        // -- narrowing / cross-kind conversion legs the existing probes do not reach.
+        // Each resolves a primitive returner and converts the SAME value_t into a
+        // C++ target whose width is SMALLER than (or a different kind from) the
+        // stored alternative, driving operator target_type()'s static_cast leg
+        // through its TRUNCATING / reinterpreting path (char->int8 keeps the low
+        // byte with its sign, char->int16 reinterprets the low 16 bits as signed,
+        // char->char16_t is identity for the natural Java-char C++ type).
+        auto ret_char_as_i8(const char* n)  -> std::int8_t   { return get_method(n)->call(); }
+        auto ret_char_as_i16(const char* n) -> std::int16_t  { return get_method(n)->call(); }
+        auto ret_char_as_u8(const char* n)  -> unsigned char { return get_method(n)->call(); }
+        auto ret_char_as_char16(const char* n) -> char16_t   { return get_method(n)->call(); }
+        auto ret_char_as_char(const char* n) -> char         { return get_method(n)->call(); }
+        // bool value_t (the `bool` alternative) converted into every numeric width
+        // and the floating kinds — the Z static_cast leg the existing probes never
+        // exercise (they only read Z as bool or as int).
+        auto ret_bool_as_i8(const char* n)  -> std::int8_t  { return get_method(n)->call(); }
+        auto ret_bool_as_i16(const char* n) -> std::int16_t { return get_method(n)->call(); }
+        auto ret_bool_as_u16(const char* n) -> std::uint16_t{ return get_method(n)->call(); }
+        auto ret_bool_as_i64(const char* n) -> std::int64_t { return get_method(n)->call(); }
+        auto ret_bool_as_float(const char* n)  -> float     { return get_method(n)->call(); }
+        auto ret_bool_as_double(const char* n) -> double    { return get_method(n)->call(); }
+        // Any primitive kind read into bool: nonzero -> true, zero (incl -0.0) -> false.
+        auto ret_as_bool_kind(const char* n) -> bool { return get_method(n)->call(); }
 
         // -- static primitive returners (exercise CallStatic<T>MethodA slots) --
         static auto scall_bool(const char* n) -> bool        { return static_method(n)->call(); }
@@ -175,6 +204,8 @@ namespace
         // a populated, non-void, non-string value_t).
         static auto sis_void(const char* n) -> bool   { return static_method(n)->call().is_void(); }
         static auto sis_string(const char* n) -> bool { return static_method(n)->call().is_string(); }
+        // as_string() on a STATIC numeric/void return is likewise the empty string.
+        static auto sas_string_empty(const char* n) -> bool { return static_method(n)->call().as_string().empty(); }
 
         // -- narrow-primitive ARGUMENT echoes (static; CallStatic<T>MethodA) --
         static auto secho_bool(bool a) -> bool                  { return static_method("sEchoBool", "(Z)Z")->call(a); }
@@ -619,6 +650,55 @@ namespace
     std::atomic<std::int64_t> g_arg_short_widen_max{ k_uncaptured };   // 32767 -> 32767
     std::atomic<std::int64_t> g_arg_char_widen_a{ k_uncaptured };      // 'A' -> 65
 
+    // ---- batch-22 deepening: additional captures ----
+    // char (uint16) value_t NARROWED / reinterpreted into smaller / other-kind
+    // C++ targets — the truncating static_cast legs the existing widen-only probes
+    // never reach.
+    std::atomic<std::int64_t> g_char_max_as_i8{ k_uncaptured };      // 0xFFFF -> -1
+    std::atomic<std::int64_t> g_char_max_as_i16{ k_uncaptured };     // 0xFFFF -> -1
+    std::atomic<std::int64_t> g_char_max_as_u8{ k_uncaptured };      // 0xFFFF -> 255 (low byte)
+    std::atomic<std::int64_t> g_char_max_as_char16{ k_uncaptured };  // 0xFFFF -> 0xFFFF
+    std::atomic<std::int64_t> g_char_highbit_as_i16{ k_uncaptured }; // 0x8000 -> -32768
+    std::atomic<std::int64_t> g_char_highbit_as_i8{ k_uncaptured };  // 0x8000 -> 0 (low byte)
+    std::atomic<std::int64_t> g_char_255_as_i8{ k_uncaptured };      // 0x00FF -> -1
+    std::atomic<std::int64_t> g_char_a_as_char{ k_uncaptured };      // 'A' -> 65
+    // bool value_t (Z alternative) -> every numeric width + floating kind.
+    std::atomic<std::int64_t>  g_bool_true_as_i8{ k_uncaptured };    // 1
+    std::atomic<std::int64_t>  g_bool_true_as_i16{ k_uncaptured };   // 1
+    std::atomic<std::int64_t>  g_bool_true_as_u16{ k_uncaptured };   // 1
+    std::atomic<std::int64_t>  g_bool_true_as_i64{ k_uncaptured };   // 1
+    std::atomic<std::int64_t>  g_bool_false_as_i64{ k_uncaptured };  // 0
+    std::atomic<std::uint32_t> g_bool_true_as_float{ 0 };           // 1.0f
+    std::atomic<std::uint32_t> g_bool_false_as_float{ 0 };          // 0.0f
+    std::atomic<std::uint64_t> g_bool_true_as_double{ 0 };          // 1.0
+    std::atomic<std::uint64_t> g_bool_false_as_double{ 0 };         // 0.0
+    std::atomic<bool>          g_batch22_bool_captured{ false };
+    // EVERY primitive kind -> bool (the char/short/float/double truncation-to-bool
+    // legs the existing int/byte/long probes miss; both -0.0 phases prove false).
+    std::atomic<int> g_char_zero_as_bool{ -1 };
+    std::atomic<int> g_char_max_as_bool{ -1 };
+    std::atomic<int> g_short_zero_as_bool{ -1 };
+    std::atomic<int> g_short_min_as_bool{ -1 };
+    std::atomic<int> g_float_zero_as_bool{ -1 };
+    std::atomic<int> g_float_one_as_bool{ -1 };
+    std::atomic<int> g_float_negzero_as_bool{ -1 };
+    std::atomic<int> g_double_zero_as_bool{ -1 };
+    std::atomic<int> g_double_pi_as_bool{ -1 };
+    std::atomic<int> g_double_negzero_as_bool{ -1 };
+    // IDEMPOTENCY: the same returner called twice in one detour must agree.
+    std::atomic<std::int64_t>  g_idem_int_a{ k_uncaptured };
+    std::atomic<std::int64_t>  g_idem_int_b{ k_uncaptured };
+    std::atomic<std::int64_t>  g_idem_long_a{ k_uncaptured };
+    std::atomic<std::int64_t>  g_idem_long_b{ k_uncaptured };
+    std::atomic<std::uint32_t> g_idem_float_nan_a{ 0 };
+    std::atomic<std::uint32_t> g_idem_float_nan_b{ 0 };
+    // as_string() on a NON-string (numeric / void) return is the empty string.
+    std::atomic<int> g_as_string_int_empty{ -1 };
+    std::atomic<int> g_as_string_double_empty{ -1 };
+    std::atomic<int> g_as_string_sint_empty{ -1 };
+    std::atomic<int> g_as_string_svoid_empty{ -1 };
+    std::atomic<bool> g_batch22_misc_captured{ false };
+
     auto run_all_calls(const std::unique_ptr<method_primitives>& self) -> void
     {
         if (!self)
@@ -1045,6 +1125,86 @@ namespace
         g_arg_short_widen_zero.store(s.short_to_int(static_cast<std::int16_t>(0)));                         // 0
         g_arg_short_widen_max.store(s.short_pos_to_int(std::numeric_limits<std::int16_t>::max()));          // 32767
         g_arg_char_widen_a.store(s.char_to_int(static_cast<std::uint16_t>('A')));                           // 65
+        // ================================================================
+        //  batch-22 deepening captures
+        // ================================================================
+        // ---- char (uint16) value_t NARROWED into smaller / other-kind targets ----
+        // 0xFFFF read into int8 keeps the low byte AS A SIGNED int8 -> -1; into int16
+        // reinterprets the low 16 bits as signed -> -1; into char16_t / unsigned char
+        // is the natural identity / low-byte.  0x8000 read into int16 is INT16_MIN
+        // (-32768), into int8 is 0 (low byte clear); 0x00FF into int8 is -1.
+        g_char_max_as_i8.store(s.ret_char_as_i8("retCharMax"));          // 0xFFFF -> -1
+        g_char_max_as_i16.store(s.ret_char_as_i16("retCharMax"));        // 0xFFFF -> -1
+        g_char_max_as_u8.store(s.ret_char_as_u8("retCharMax"));          // 0xFFFF -> 255 (low byte)
+        g_char_max_as_char16.store(static_cast<std::uint16_t>(s.ret_char_as_char16("retCharMax"))); // -> 0xFFFF
+        g_char_highbit_as_i16.store(s.ret_char_as_i16("retCharHighBit"));// 0x8000 -> -32768
+        g_char_highbit_as_i8.store(s.ret_char_as_i8("retCharHighBit"));  // 0x8000 -> 0 (low byte)
+        g_char_255_as_i8.store(s.ret_char_as_i8("retChar255"));          // 0x00FF -> -1
+        g_char_a_as_char.store(static_cast<std::int32_t>(s.ret_char_as_char("retCharA"))); // 'A' -> 65
+
+        // ---- bool value_t (Z alternative) -> every numeric width / floating kind ----
+        // true promotes to 1 across int8/int16/uint16/int64/float/double; false to 0.
+        g_bool_true_as_i8.store(s.ret_bool_as_i8("retBoolTrue"));        // 1
+        g_bool_true_as_i16.store(s.ret_bool_as_i16("retBoolTrue"));      // 1
+        g_bool_true_as_u16.store(s.ret_bool_as_u16("retBoolTrue"));      // 1
+        g_bool_true_as_i64.store(s.ret_bool_as_i64("retBoolTrue"));      // 1
+        g_bool_false_as_i64.store(s.ret_bool_as_i64("retBoolFalse"));    // 0
+        g_bool_true_as_float.store(f2bits(s.ret_bool_as_float("retBoolTrue")));   // 1.0f
+        g_bool_false_as_float.store(f2bits(s.ret_bool_as_float("retBoolFalse"))); // 0.0f
+        g_bool_true_as_double.store(d2bits(s.ret_bool_as_double("retBoolTrue")));   // 1.0
+        g_bool_false_as_double.store(d2bits(s.ret_bool_as_double("retBoolFalse"))); // 0.0
+        g_batch22_bool_captured.store(true);
+
+        // ---- EVERY primitive kind -> bool (nonzero true, zero incl -0.0 false) ----
+        // The existing block covers only int/byte/long -> bool; these reach the
+        // char / short / float / double alternatives' truncation-to-bool leg, with
+        // BOTH the negative-zero floats proving -0.0 narrows to false (its value is
+        // zero, not its sign bit).
+        g_char_zero_as_bool.store(s.ret_as_bool_kind("retCharZero") ? 1 : 0);       // false
+        g_char_max_as_bool.store(s.ret_as_bool_kind("retCharMax") ? 1 : 0);         // true
+        g_short_zero_as_bool.store(s.ret_as_bool_kind("retShortZero") ? 1 : 0);     // false
+        g_short_min_as_bool.store(s.ret_as_bool_kind("retShortMin") ? 1 : 0);       // true
+        g_float_zero_as_bool.store(s.ret_as_bool_kind("retFloatZero") ? 1 : 0);     // false
+        g_float_one_as_bool.store(s.ret_as_bool_kind("retFloatOne") ? 1 : 0);       // true
+        g_float_negzero_as_bool.store(s.ret_as_bool_kind("retFloatNegZero") ? 1 : 0); // false
+        g_double_zero_as_bool.store(s.ret_as_bool_kind("retDoubleZero") ? 1 : 0);   // false
+        g_double_pi_as_bool.store(s.ret_as_bool_kind("retDoublePi") ? 1 : 0);       // true
+        g_double_negzero_as_bool.store(s.ret_as_bool_kind("retDoubleNegZero") ? 1 : 0); // false
+
+        // ---- IDEMPOTENCY: the SAME returner invoked twice in one detour yields the
+        // SAME value_t (call() carries no destructive per-call state; two reads of a
+        // distinct-byte int and an alternating-bit long must agree bit-for-bit). ----
+        {
+            const std::int64_t a = s.get_method("retIntPattern")->call();
+            const std::int64_t b = s.get_method("retIntPattern")->call();
+            g_idem_int_a.store(a);
+            g_idem_int_b.store(b);
+        }
+        {
+            const std::int64_t a = s.get_method("retLongAltNeg")->call();
+            const std::int64_t b = s.get_method("retLongAltNeg")->call();
+            g_idem_long_a.store(a);
+            g_idem_long_b.store(b);
+        }
+        // FLOAT idempotency on a special (NaN) — two reads yield identical raw bits.
+        {
+            const std::uint32_t a = f2bits(s.call_float("retFloatNaN"));
+            const std::uint32_t b = f2bits(s.call_float("retFloatNaN"));
+            g_idem_float_nan_a.store(a);
+            g_idem_float_nan_b.store(b);
+        }
+
+        // ---- as_string() on a NON-string return is the EMPTY string ----
+        // A numeric primitive return (instance + static) and a STATIC void return all
+        // yield "" from as_string() (the default leg never fabricates a number).  The
+        // void probe uses the STATIC void returner deliberately: the INSTANCE void
+        // counter is asserted EXACTLY == 1 elsewhere, so re-invoking the instance void
+        // here would corrupt that count, whereas the static counter is asserted >= 1.
+        g_as_string_int_empty.store(s.as_string_empty("retIntFortyTwo") ? 1 : 0);
+        g_as_string_double_empty.store(s.as_string_empty("retDoublePi") ? 1 : 0);
+        g_as_string_sint_empty.store(method_primitives::sas_string_empty("sRetIntFortyTwo") ? 1 : 0);
+        g_as_string_svoid_empty.store(method_primitives::sas_string_empty("sRetVoidBump") ? 1 : 0);
+        g_batch22_misc_captured.store(true);
     }
 }
 
@@ -1651,6 +1811,77 @@ namespace
         ctx.check("mcp_arg_short_widen_zero", g_arg_short_widen_zero.load() == 0);
         ctx.check("mcp_arg_short_widen_max_32767", g_arg_short_widen_max.load() == 32767);
         ctx.check("mcp_arg_char_widen_A_65", g_arg_char_widen_a.load() == 65);
+
+        // =====================================================================
+        //  BATCH-22 DEEPENING
+        // =====================================================================
+        // ---- char (uint16) value_t NARROWED / reinterpreted into smaller targets ----
+        // The existing char probes only WIDEN (uint16 -> int/i64/double).  These drive
+        // operator target_type()'s TRUNCATING / reinterpreting static_cast leg: 0xFFFF
+        // read as int8 is -1 (low byte, signed), as int16 is -1 (low 16 reinterpreted
+        // signed), as unsigned char is 255 (low byte), as char16_t is the full 0xFFFF.
+        ctx.check("mcp_conv_char_max_to_i8_truncates_neg1", g_char_max_as_i8.load() == -1);
+        ctx.check("mcp_conv_char_max_to_i16_reinterprets_neg1", g_char_max_as_i16.load() == -1);
+        ctx.check("mcp_conv_char_max_to_u8_low_byte_255", g_char_max_as_u8.load() == 255);
+        ctx.check("mcp_conv_char_max_to_char16_identity_65535", g_char_max_as_char16.load() == 65535);
+        // 0x8000 (only bit 15 set): as int16 it is INT16_MIN; as int8 it is 0 (low byte
+        // clear).  A sharper single-bit witness than 0xFFFF for the reinterpret leg.
+        ctx.check("mcp_conv_char_highbit_to_i16_neg32768", g_char_highbit_as_i16.load() == -32768);
+        ctx.check("mcp_conv_char_highbit_to_i8_low_byte_zero", g_char_highbit_as_i8.load() == 0);
+        // 0x00FF (low byte all-ones) read as int8 is -1 (the sign bit of the low byte).
+        ctx.check("mcp_conv_char_255_to_i8_neg1", g_char_255_as_i8.load() == -1);
+        // 'A' (65) read as plain `char` survives as 65.
+        ctx.check("mcp_conv_char_A_to_char_65", g_char_a_as_char.load() == 65);
+
+        // ---- bool value_t (Z alternative) -> every numeric width / floating kind ----
+        // The existing Z probes only read bool as bool or as int; these reach the
+        // int8/int16/uint16/int64/float/double static_cast legs (true -> 1, false -> 0).
+        ctx.check("mcp_batch22_bool_captured", g_batch22_bool_captured.load());
+        ctx.check("mcp_conv_bool_true_to_i8_1", g_bool_true_as_i8.load() == 1);
+        ctx.check("mcp_conv_bool_true_to_i16_1", g_bool_true_as_i16.load() == 1);
+        ctx.check("mcp_conv_bool_true_to_u16_1", g_bool_true_as_u16.load() == 1);
+        ctx.check("mcp_conv_bool_true_to_i64_1", g_bool_true_as_i64.load() == 1);
+        ctx.check("mcp_conv_bool_false_to_i64_0", g_bool_false_as_i64.load() == 0);
+        ctx.check("mcp_conv_bool_true_to_float_1", bits2f(g_bool_true_as_float.load()) == 1.0f);
+        ctx.check("mcp_conv_bool_false_to_float_0", bits2f(g_bool_false_as_float.load()) == 0.0f);
+        ctx.check("mcp_conv_bool_true_to_double_1", bits2d(g_bool_true_as_double.load()) == 1.0);
+        ctx.check("mcp_conv_bool_false_to_double_0", bits2d(g_bool_false_as_double.load()) == 0.0);
+
+        // ---- EVERY primitive kind -> bool (nonzero true, zero incl -0.0 false) ----
+        // Reaches the char / short / float / double truncation-to-bool legs the
+        // existing int/byte/long -> bool probes miss.  -0.0 -> false proves the bool
+        // conversion tests the VALUE (== 0), not the sign bit.
+        ctx.check("mcp_conv_char_zero_to_bool_false", g_char_zero_as_bool.load() == 0);
+        ctx.check("mcp_conv_char_max_to_bool_true", g_char_max_as_bool.load() == 1);
+        ctx.check("mcp_conv_short_zero_to_bool_false", g_short_zero_as_bool.load() == 0);
+        ctx.check("mcp_conv_short_min_to_bool_true", g_short_min_as_bool.load() == 1);
+        ctx.check("mcp_conv_float_zero_to_bool_false", g_float_zero_as_bool.load() == 0);
+        ctx.check("mcp_conv_float_one_to_bool_true", g_float_one_as_bool.load() == 1);
+        ctx.check("mcp_conv_float_negzero_to_bool_false", g_float_negzero_as_bool.load() == 0);
+        ctx.check("mcp_conv_double_zero_to_bool_false", g_double_zero_as_bool.load() == 0);
+        ctx.check("mcp_conv_double_pi_to_bool_true", g_double_pi_as_bool.load() == 1);
+        ctx.check("mcp_conv_double_negzero_to_bool_false", g_double_negzero_as_bool.load() == 0);
+
+        // ---- IDEMPOTENCY: two reads of the same returner in one detour agree ----
+        // call() carries no destructive per-call state: a distinct-byte int, an
+        // alternating-bit long, and a NaN float each read twice must be bit-identical,
+        // and the second read must equal the single-read value already asserted above.
+        ctx.check("mcp_idem_int_pattern_two_reads_agree", g_idem_int_a.load() == g_idem_int_b.load());
+        ctx.check("mcp_idem_int_pattern_value", g_idem_int_b.load() == 0x12345678LL);
+        ctx.check("mcp_idem_long_altneg_two_reads_agree", g_idem_long_a.load() == g_idem_long_b.load());
+        ctx.check("mcp_idem_long_altneg_value",
+                  g_idem_long_b.load() == static_cast<std::int64_t>(0xAAAAAAAAAAAAAAAAULL));
+        ctx.check("mcp_idem_float_nan_two_reads_agree", g_idem_float_nan_a.load() == g_idem_float_nan_b.load());
+        ctx.check("mcp_idem_float_nan_is_nan", std::isnan(bits2f(g_idem_float_nan_b.load())));
+
+        // ---- as_string() on a NON-string return is the EMPTY string ----
+        // A populated numeric value_t and a void value_t both yield "" from as_string()
+        // (the default leg never fabricates a textual number); instance + static.
+        ctx.check("mcp_batch22_misc_captured", g_batch22_misc_captured.load());
+        ctx.check("mcp_as_string_int_return_empty", g_as_string_int_empty.load() == 1);
+        ctx.check("mcp_as_string_double_return_empty", g_as_string_double_empty.load() == 1);
+        ctx.check("mcp_as_string_static_int_return_empty", g_as_string_sint_empty.load() == 1);
+        ctx.check("mcp_as_string_static_void_return_empty", g_as_string_svoid_empty.load() == 1);
         }
     }
 }

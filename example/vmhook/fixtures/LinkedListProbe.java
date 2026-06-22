@@ -170,6 +170,49 @@ public final class LinkedListProbe
      */
     public final LinkedList<String> orderList = new LinkedList<String>();
 
+    // ── UNICODE / boundary element-content shapes ───────────────────────────
+    // These exercise the read_java_string element-decode path itself, which is
+    // JDK-version-sensitive (JDK8 char[] value vs JDK9+ compact-string byte[]
+    // value + coder).  The native side reads each element's content and compares
+    // it byte-exactly against the UTF-8 the JVM stores, so an encoding regression
+    // in the compact-string branch surfaces here.  All built from char literals
+    // (never raw \\uXXXX in a comment) so javac never mis-parses the source.
+
+    /** The element count of {@link #unicodeList}. */
+    public static final int UNICODE_SIZE = 4;
+
+    /**
+     * The expected UTF-16 code units of {@link #unicodeList}'s elements, built
+     * programmatically so this fixture carries the ground truth the native side
+     * cross-checks against (each element's expected UTF-8 byte length is derived
+     * from these on the C++ side).  Index k is the k-th unicode element.
+     */
+    public static final String UNI0 = "caf\u00E9";        // accented e: LATIN1-incompatible -> UTF16 coder on JDK9+
+    public static final String UNI1 = "\u4E2D\u6587";       // CJK: two 3-byte UTF-8 chars
+    public static final String UNI2 = "a\u0000b";          // embedded NUL: decode must be length-driven, not NUL-terminated
+    public static final String UNI3 = "z";                  // pure-ASCII control (LATIN1 coder on JDK9+)
+
+    /**
+     * Unicode / embedded-NUL elements.  Proves read_java_string decodes the
+     * compact-string byte[]+coder (JDK9+) and the char[] (JDK8) branches
+     * identically for the native walk: accented LATIN1-incompatible text, CJK
+     * multi-byte text, an embedded-NUL string (which must NOT be truncated at the
+     * NUL), and a plain ASCII tail.
+     */
+    public final LinkedList<String> unicodeList = new LinkedList<String>();
+
+    // ── LARGER chain to stress the first->next traversal harder ─────────────
+    /** The element count of {@link #bigList}: longer than manyList. */
+    public static final int BIG_SIZE = 64;
+
+    /**
+     * A longer LinkedList: element k is the decimal string of k, k in
+     * [0, BIG_SIZE).  Exercises the node-chain walk over many more links than
+     * manyList while staying tiny on the heap (64 short ASCII strings).  Used to
+     * prove strict order + whole-chain distinctness over a long chain.
+     */
+    public final LinkedList<String> bigList = new LinkedList<String>();
+
     /** Java-side observed size of {@link #words}, republished each probe run. */
     public static volatile int observedSize;
 
@@ -183,6 +226,8 @@ public final class LinkedListProbe
     public static volatile int observedBoxedSize;
     public static volatile int observedNestedSize;
     public static volatile int observedOrderSize;
+    public static volatile int observedUnicodeSize;
+    public static volatile int observedBigSize;
 
     /** A nonce the trigger detour writes, guaranteeing fresh bytecode dispatch. */
     public static volatile int triggerNonce;
@@ -236,6 +281,16 @@ public final class LinkedListProbe
         orderList.add("mike");
         orderList.add("alpha");
 
+        unicodeList.add(UNI0);
+        unicodeList.add(UNI1);
+        unicodeList.add(UNI2);
+        unicodeList.add(UNI3);
+
+        for (int k = 0; k < BIG_SIZE; k++)
+        {
+            bigList.add(Integer.toString(k));
+        }
+
         populated = true;
     }
 
@@ -278,6 +333,8 @@ public final class LinkedListProbe
                 LinkedListProbe.observedBoxedSize = SINGLETON.boxedList.size();
                 LinkedListProbe.observedNestedSize = SINGLETON.nestedList.size();
                 LinkedListProbe.observedOrderSize = SINGLETON.orderList.size();
+                LinkedListProbe.observedUnicodeSize = SINGLETON.unicodeList.size();
+                LinkedListProbe.observedBigSize = SINGLETON.bigList.size();
                 // Real bytecode dispatch the native scoped_hook rides; the
                 // detour is where the native side does its LinkedList reads.
                 SINGLETON.trigger(7);

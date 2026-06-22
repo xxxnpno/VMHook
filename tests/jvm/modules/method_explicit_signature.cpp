@@ -895,6 +895,67 @@ namespace
         put(key, r);
     }
 
+    // IDEMPOTENCY probe: resolve the SAME (name,sig) TWICE and record whether the
+    // two independent lookups agree on every observable facet (resolved, sig_text,
+    // name, is_static).  A deterministic exact-match lookup must return the SAME
+    // overload each time; ival==1 iff both resolved AND all three facets matched.
+    // sig_text/name_text/is_static carry the FIRST resolution for the body to also
+    // assert the absolute value (not just self-agreement).
+    auto cap_idempotent(const method_explicit_sig& self,
+                        const std::string&         key,
+                        const char*                name,
+                        const char*                sig) -> void
+    {
+        probe_result r{};
+        auto p1{ self.get_method(name, sig) };
+        auto p2{ self.get_method(name, sig) };
+        const bool both{ p1.has_value() && p2.has_value() };
+        r.resolved = p1.has_value();
+        if (p1.has_value())
+        {
+            r.sig_text  = std::string{ p1->signature() };
+            r.name_text = p1->name();
+            r.is_static = p1->is_static();
+        }
+        bool agree{ both };
+        if (both)
+        {
+            agree = (std::string{ p1->signature() } == std::string{ p2->signature() })
+                 && (p1->name() == p2->name())
+                 && (p1->is_static() == p2->is_static());
+        }
+        r.ival = (both && agree) ? 1 : 0;
+        put(key, r);
+    }
+
+    // STATIC idempotency probe (static_method path): same as cap_idempotent but
+    // through the type_index static overload.
+    auto cap_idempotent_static(const std::string& key,
+                               const char*        name,
+                               const char*        sig) -> void
+    {
+        probe_result r{};
+        auto p1{ method_explicit_sig::static_method(name, sig) };
+        auto p2{ method_explicit_sig::static_method(name, sig) };
+        const bool both{ p1.has_value() && p2.has_value() };
+        r.resolved = p1.has_value();
+        if (p1.has_value())
+        {
+            r.sig_text  = std::string{ p1->signature() };
+            r.name_text = p1->name();
+            r.is_static = p1->is_static();
+        }
+        bool agree{ both };
+        if (both)
+        {
+            agree = (std::string{ p1->signature() } == std::string{ p2->signature() })
+                 && (p1->name() == p2->name())
+                 && (p1->is_static() == p2->is_static());
+        }
+        r.ival = (both && agree) ? 1 : 0;
+        put(key, r);
+    }
+
     // Run EVERY capture inside the detour against the live receiver.
     auto run_all(const std::unique_ptr<method_explicit_sig>& self) -> void
     {
@@ -1151,6 +1212,25 @@ namespace
             put_ival("snap_shape_Z",     method_explicit_sig_counters::shapeBoolSeen());
             put_dval("snap_shape_F",     static_cast<double>(method_explicit_sig_counters::shapeFloatSeen()));
             put_dval("snap_shape_D",     method_explicit_sig_counters::shapeDoubleSeen());
+            // -- additional canonical fields the DEEPENING boundary block (appended
+            //    at the very end of run_all) re-dispatches with extreme args.  The
+            //    body's side-effect / isolation checks for these read THIS snapshot
+            //    so they stay valid regardless of the extra boundary calls below.
+            put_ival("snap_base_I",      method_explicit_sig_base::baseIntSeen());
+            put_ival("snap_base_II",     method_explicit_sig_base::baseIntIntSeen());
+            put_ival("snap_base_JI",     method_explicit_sig_base::baseLongIntSeen());
+            put_ival("snap_dup_inst",    method_explicit_sig_counters::dupInstanceSeen());
+            put_ival("snap_dup_stat",    method_explicit_sig_counters::dupStaticSeen());
+            put_ival("snap_iface_def_I", method_explicit_sig_counters::ifaceDefaultIntSeen());
+            put_ival("snap_iface_def_J", method_explicit_sig_counters::ifaceDefaultLongSeen());
+            put_ival("snap_wide_JI",     method_explicit_sig::wideJiSeen());
+            put_dval("snap_wide_DI",     method_explicit_sig::wideDiSeen());
+            put_ival("snap_wide_JJ",     method_explicit_sig::wideJjSeen());
+            put_ival("snap_sink_IIV",    method_explicit_sig::sinkIiSeen());
+            put_ival("snap_smap_s_hits", method_explicit_sig::smapStrHits());
+            put_sval("snap_proc_SI_s",   method_explicit_sig::procStrIntS());
+            put_ival("snap_proc_SI_n",   method_explicit_sig::procStrIntN());
+            put_ival("snap_shape_4I",    method_explicit_sig_counters::shapeFourArgSeen());
         }
 
         // ============================================================
@@ -1244,6 +1324,157 @@ namespace
         // an INSTANCE dupInstance via static -> MISS (already covered above as
         // dup_inst_via_static; here a smap-family wrong NAME on the static path).
         cap_miss_static("miss_static_wrong_name", "smapz", SIG_SMAP_I);
+
+        // ============================================================
+        //  DEEPENING WAVE: every-possible-input coverage the family above lacks.
+        //  All of these RE-SELECT an existing overload by its EXACT descriptor (the
+        //  selection is descriptor-pinned and unchanged); the added value is the
+        //  end-to-end dispatch over the FULL value range of each remaining width,
+        //  plus sub-int sign/zero-extension proofs, idempotency cross-checks, and a
+        //  much wider strict-MISS net.  Everything reads back from a snapshot key
+        //  so a later last-write-wins field overwrite cannot corrupt the assertion.
+        // ============================================================
+
+        // ---- process(II)I boundary: a*100+b over the full int range (wraps). ----
+        cap_inst_num_ii(s, "bnd_proc_II_minmax", "process", SIG_PROC_II,
+                        (-2147483647 - 1), 2147483647);
+        cap_inst_num_ii(s, "bnd_proc_II_zero",   "process", SIG_PROC_II, 0, 0);
+        cap_inst_num_ii(s, "bnd_proc_II_maxmax", "process", SIG_PROC_II,
+                        2147483647, 2147483647);
+
+        // ---- process(J)J boundary: 0 / 1 / -1 (the +1000 transform). ----
+        cap_inst_num_j(s, "bnd_proc_J_zero", "process", SIG_PROC_J, 0);
+        cap_inst_num_j(s, "bnd_proc_J_one",  "process", SIG_PROC_J, 1);
+        cap_inst_num_j(s, "bnd_proc_J_neg",  "process", SIG_PROC_J, -1);
+
+        // ---- process(I)I idempotency + the +1 transform at +1. ----
+        cap_inst_num_i(s, "bnd_proc_I_one", "process", SIG_PROC_I, 1);
+
+        // ---- process(String,int)String boundary: empty string + INT_MIN/MAX n. --
+        //  Java renders the int via Integer.toString, so the joined result is
+        //  exactly s + "#" + (decimal n) — predictable at the extremes.
+        cap_inst_str_si(s, "bnd_proc_SI_emin", "process", SIG_PROC_SI,
+                        std::string{}, (-2147483647 - 1));
+        cap_inst_str_si(s, "bnd_proc_SI_nmax", "process", SIG_PROC_SI,
+                        std::string{ "x" }, 2147483647);
+
+        // ---- process(String)String with an embedded-NUL string round-trips the
+        //  bytes BEFORE the NUL ("S:" + arg).  std::string carries the NUL, but the
+        //  Java side prefixes "S:" and the C++ readback compares the full prefixed
+        //  std::string, so the assertion is exact regardless of NUL handling: we
+        //  build the EXPECTED value the same way and compare std::string==std::string.
+        cap_inst_str_s(s, "bnd_proc_S_nul", "process", SIG_PROC_S,
+                       std::string("a\0b", 3));
+
+        // ---- shapes(B)B sign-extension: -1 must come back as -1 (NOT 255).
+        //  shapes(B) returns (byte)(a*2); the value_t carries the SIGN-EXTENDED
+        //  byte, so -1*2 == -2.  Also 0 and 1.
+        cap_inst_byte_b(s, "bnd_shape_B_neg1", "shapes", SIG_SHAPE_B, static_cast<std::int8_t>(-1));
+        cap_inst_byte_b(s, "bnd_shape_B_zero", "shapes", SIG_SHAPE_B, static_cast<std::int8_t>(0));
+        cap_inst_byte_b(s, "bnd_shape_B_one",  "shapes", SIG_SHAPE_B, static_cast<std::int8_t>(1));
+
+        // ---- shapes(S)S sign-extension: -1*3 == -3 (sign preserved). ----
+        cap_inst_short_s(s, "bnd_shape_S_neg1", "shapes", SIG_SHAPE_S, static_cast<std::int16_t>(-1));
+        cap_inst_short_s(s, "bnd_shape_S_zero", "shapes", SIG_SHAPE_S, static_cast<std::int16_t>(0));
+
+        // ---- shapes(C)C ZERO-extension: char 0x8000 must NOT be negative.
+        //  (char)(0x8000 + 1) == 0x8001 == 33793, a POSITIVE value — proving char
+        //  is zero-extended (a sign-extended short there would read negative).
+        cap_inst_char_c(s, "bnd_shape_C_mid", "shapes", SIG_SHAPE_C, static_cast<char16_t>(0x8000));
+        cap_inst_char_c(s, "bnd_shape_C_one", "shapes", SIG_SHAPE_C, static_cast<char16_t>(0x0001));
+
+        // ---- shapes(F)F at small/large magnitudes the *2 transform is exact. ----
+        cap_inst_flt_f(s, "bnd_shape_F_one",   "shapes", SIG_SHAPE_F, 1.0f);
+        cap_inst_flt_f(s, "bnd_shape_F_large", "shapes", SIG_SHAPE_F, 1.0e7f);
+
+        // ---- shapes(D)D negative / zero / one (+3.25 exact). ----
+        cap_inst_dbl_d(s, "bnd_shape_D_neg",  "shapes", SIG_SHAPE_D, -10.5);
+        cap_inst_dbl_d(s, "bnd_shape_D_zero", "shapes", SIG_SHAPE_D, 0.0);
+
+        // ---- shapes(IIII)I with negatives + INT_MAX (sum wraps). ----
+        cap_inst_num_4i(s, "bnd_shape_4I_neg", "shapes", SIG_SHAPE_4I, -1, -2, -3, -4);
+        cap_inst_num_4i(s, "bnd_shape_4I_wrap", "shapes", SIG_SHAPE_4I,
+                        2147483647, 1, 0, 0);   // INT_MAX + 1 wraps to INT_MIN
+
+        // ---- wide(JI)J / (DI)D / (JJ)J boundary multi-slot packing. ----
+        //  wide(JI)J -> a*1000+b ; pick a=0 (slot zero) and b=INT_MAX-ish.
+        cap_inst_num_ji(s, "bnd_wide_JI_zero", "wide", SIG_WIDE_JI, 0, 0);
+        cap_inst_num_ji(s, "bnd_wide_JI_neg",  "wide", SIG_WIDE_JI, -1, -1);
+        //  wide(DI)D -> a+b ; negative double + negative int.
+        cap_inst_dbl_di(s, "bnd_wide_DI_neg",  "wide", SIG_WIDE_DI, -2.5, -3);
+        //  wide(JJ)J -> a-b ; LONG_MIN - 0 stays LONG_MIN; equal args -> 0.
+        cap_inst_num_jj(s, "bnd_wide_JJ_zero", "wide", SIG_WIDE_JJ, 5, 5);
+        cap_inst_num_jj(s, "bnd_wide_JJ_min",  "wide", SIG_WIDE_JJ,
+                        (-9223372036854775807LL - 1), 0);
+
+        // ---- sink(II)V boundary: a*1000+b void dispatch with negatives. ----
+        cap_inst_void_ii(s, "bnd_sink_neg", "sink", SIG_SINK_IIV, -2, -3);
+
+        // ---- smap(I)I (static) at 0 / 1 / -1 (the *2 transform). ----
+        cap_stat_num_i("bnd_smap_I_zero", "smap", SIG_SMAP_I, 0);
+        cap_stat_num_i("bnd_smap_I_one",  "smap", SIG_SMAP_I, 1);
+        cap_stat_num_i("bnd_smap_I_neg",  "smap", SIG_SMAP_I, -1);
+
+        // ---- base(I)I / (II)I / (JI)J inherited boundary (hierarchy walk holds). -
+        cap_inst_num_i (s, "bnd_base_I_neg",  "base", SIG_BASE_I,  -7);   // -7+7 == 0
+        cap_inst_num_ii(s, "bnd_base_II_eq",  "base", SIG_BASE_II, 5, 5); // 5-5 == 0
+        cap_inst_num_ji(s, "bnd_base_JI_zero","base", SIG_BASE_JI, 0, 0); // 0*1000+0 == 0
+
+        // ---- dupInstance(I)I (+1) / dupStatic(I)I (*2) boundary. ----
+        cap_inst_num_i(s, "bnd_dup_inst_neg",  "dupInstance", SIG_DUP_I, -1); // -1+1 == 0
+        cap_stat_num_i(   "bnd_dup_stat_zero", "dupStatic",   SIG_DUP_I, 0);  // 0*2 == 0
+
+        // ---- ifaceDefault(I)I (+3) / (J)J (+30) boundary via interface fallback. -
+        cap_inst_num_i(s, "bnd_iface_def_I_neg", "ifaceDefault", SIG_IFACE_DEF_I, -3); // -3+3==0
+        cap_inst_num_j(s, "bnd_iface_def_J_zero","ifaceDefault", SIG_IFACE_DEF_J, 0);  // 0+30==30
+
+        // ---- IDEMPOTENCY: resolving the same (name,sig) twice yields the SAME
+        //  overload on every facet.  Cover one of each kind: instance/process(J),
+        //  instance/combo(CS) (the discriminating case), inherited/base(JI),
+        //  interface-default/ifaceDefault(J), and static/smap(S).
+        cap_idempotent(s, "idem_proc_J",   "process",      SIG_PROC_J);
+        cap_idempotent(s, "idem_combo_CS", "combo",        SIG_COMBO_CS);
+        cap_idempotent(s, "idem_base_JI",  "base",         SIG_BASE_JI);
+        cap_idempotent(s, "idem_iface_J",  "ifaceDefault", SIG_IFACE_DEF_J);
+        cap_idempotent_static("idem_smap_S", "smap",       SIG_SMAP_S);
+
+        // ---- WIDER STRICT-MISS net: wrong primitive WIDTH on process(I).
+        //  process has only (I) among single-primitive overloads; asking for the
+        //  same VALUE shape with a different primitive token must MISS (no implicit
+        //  widening in the descriptor compare).  These also prove sub-int tokens
+        //  (B/S/C/Z/F) are distinct from I in the compare.
+        cap_miss(s, "miss_proc_byte_arg",  "process", "(B)I");
+        cap_miss(s, "miss_proc_short_arg", "process", "(S)I");
+        cap_miss(s, "miss_proc_char_arg",  "process", "(C)I");
+        cap_miss(s, "miss_proc_bool_arg",  "process", "(Z)I");
+        cap_miss(s, "miss_proc_float_arg", "process", "(F)I");
+        // shapes has no (I)I scalar overload (it has B/S/C/Z/F/D and [I/IIII), so a
+        // bare (I)I on shapes must MISS — proving (I) != (B)/(S)/(C) in the compare.
+        cap_miss(s, "miss_shape_int_scalar", "shapes", "(I)I");
+        // wide has (JI)/(DI)/(JJ) but no (IJ) or (JD); a long-array isn't an arg.
+        cap_miss(s, "miss_wide_jd",   "wide", "(JD)D");
+        cap_miss(s, "miss_wide_jjj",  "wide", "(JJJ)J");
+        // smap(String) has the String descriptor; CharSequence/Object miss.
+        cap_miss_static("miss_smap_cs",  "smap", "(Ljava/lang/CharSequence;)Ljava/lang/String;");
+        cap_miss_static("miss_smap_obj", "smap", "(Ljava/lang/Object;)Ljava/lang/String;");
+        // array-token confusion: shapes([I)I exists; [[I and [B and [Z miss; and a
+        // ref-array element type that isn't String (Object[]) misses.
+        cap_miss(s, "miss_shape_barr",   "shapes", "([B)I");
+        cap_miss(s, "miss_shape_zarr",   "shapes", "([Z)I");
+        cap_miss(s, "miss_shape_objarr", "shapes", "([Ljava/lang/Object;)I");
+        // tab / newline embedded whitespace in an otherwise-valid descriptor miss.
+        cap_miss(s, "miss_tab_in_sig",     "process", "(I)\tI");
+        cap_miss(s, "miss_newline_in_sig", "process", "(I)\nI");
+        // a descriptor truncated at an embedded NUL (the get_method(const char*)
+        // overload builds a string_view via strlen, so "(I\0)I" is seen as "(I",
+        // a params-only fragment with no return token) -> MISS.
+        cap_miss(s, "miss_embedded_nul_sig", "process", std::string("(I\0)I", 5).c_str());
+        // a single space (degenerate) and a lone primitive token miss.
+        cap_miss(s, "miss_single_space", "process", " ");
+        cap_miss(s, "miss_lone_I",       "process", "I");
+        // <init> with a reference arg that doesn't exist (only ()V/(I)V/(String)V).
+        cap_miss(s, "miss_init_obj",  "<init>", "(Ljava/lang/Object;)V");
+        cap_miss(s, "miss_init_two",  "<init>", "(ILjava/lang/String;)V");
     }
 }
 
@@ -1346,8 +1577,10 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("proc_SI_sig_is_exact", r.sig_text == SIG_PROC_SI);
             ctx.check("proc_SI_is_string", r.is_string);
             ctx.check("proc_SI_returns_joined", r.sval == "k#7");
-            ctx.check("proc_SI_side_effect_s", method_explicit_sig::procStrIntS() == "k");
-            ctx.check("proc_SI_side_effect_n", method_explicit_sig::procStrIntN() == PROC_SI_N);
+            // side effects read from SNAPSHOT (the deepening boundary block below
+            // re-dispatches process(String,int) with extreme args, last-write-wins).
+            ctx.check("proc_SI_side_effect_s", get("snap_proc_SI_s").sval == "k");
+            ctx.check("proc_SI_side_effect_n", get("snap_proc_SI_n").ival == PROC_SI_N);
         }
 
         // ===================================================================
@@ -1460,14 +1693,16 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("base_I_resolved", ri.resolved);
             ctx.check("base_I_sig_is_exact", ri.sig_text == SIG_BASE_I);
             ctx.check("base_I_returns_arg_plus_7", ri.ival == (BASE_I_ARG + 7));
-            ctx.check("base_I_side_effect", method_explicit_sig_base::baseIntSeen() == BASE_I_ARG);
+            // side effect read from SNAPSHOT (the deepening boundary block below
+            // re-dispatches base(I) with an extreme arg, last-write-wins).
+            ctx.check("base_I_side_effect", get("snap_base_I").ival == BASE_I_ARG);
 
             const probe_result rii{ get("base_II") };
             ctx.check("base_II_resolved", rii.resolved);
             ctx.check("base_II_sig_is_exact", rii.sig_text == SIG_BASE_II);
             ctx.check("base_II_returns_a_minus_b", rii.ival == (BASE_II_A - BASE_II_B));
             ctx.check("base_II_side_effect",
-                      method_explicit_sig_base::baseIntIntSeen() == (BASE_II_A * 1000 + BASE_II_B));
+                      get("snap_base_II").ival == (BASE_II_A * 1000 + BASE_II_B));
 
             // INHERITED wide-mixed-arg base(JI)J: hierarchy walk picked the
             // multi-slot descriptor, and the two interpreter slots (long+int)
@@ -1480,7 +1715,7 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("base_JI_returns_packed",
                       rji.ival == (BASE_JI_A * 1000 + BASE_JI_B));
             ctx.check("base_JI_side_effect",
-                      method_explicit_sig_base::baseLongIntSeen() == (BASE_JI_A * 1000 + BASE_JI_B));
+                      get("snap_base_JI").ival == (BASE_JI_A * 1000 + BASE_JI_B));
         }
 
         // ===================================================================
@@ -1542,8 +1777,10 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("wide_JI_name_is_wide", wji.name_text == "wide");
             ctx.check("wide_JI_returns_packed",
                       wji.ival == (WIDE_JI_J_ARG * 1000 + WIDE_JI_I_ARG));
+            // side effects read from SNAPSHOT (the deepening boundary block below
+            // re-dispatches each wide overload with extreme args, last-write-wins).
             ctx.check("wide_JI_side_effect",
-                      method_explicit_sig::wideJiSeen() == (WIDE_JI_J_ARG * 1000 + WIDE_JI_I_ARG));
+                      get("snap_wide_JI").ival == (WIDE_JI_J_ARG * 1000 + WIDE_JI_I_ARG));
 
             const probe_result wdi{ get("wide_DI") };
             ctx.check("wide_DI_resolved", wdi.resolved);
@@ -1551,7 +1788,7 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("wide_DI_returns_sum",
                       wdi.dval == (WIDE_DI_D_ARG + static_cast<double>(WIDE_DI_I_ARG)));
             ctx.check("wide_DI_side_effect",
-                      method_explicit_sig::wideDiSeen()
+                      get("snap_wide_DI").dval
                           == (WIDE_DI_D_ARG + static_cast<double>(WIDE_DI_I_ARG)));
 
             const probe_result wjj{ get("wide_JJ") };
@@ -1559,7 +1796,7 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("wide_JJ_sig_is_exact", wjj.sig_text == SIG_WIDE_JJ);
             ctx.check("wide_JJ_returns_diff", wjj.ival == (WIDE_JJ_A_ARG - WIDE_JJ_B_ARG));
             ctx.check("wide_JJ_side_effect",
-                      method_explicit_sig::wideJjSeen() == (WIDE_JJ_A_ARG - WIDE_JJ_B_ARG));
+                      get("snap_wide_JJ").ival == (WIDE_JJ_A_ARG - WIDE_JJ_B_ARG));
 
             // The three wide proxies carry three distinct descriptors.
             ctx.check("wide_three_distinct",
@@ -1586,8 +1823,10 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("sink_IIV_name_is_sink", sk.name_text == "sink");
             ctx.check("sink_IIV_is_void", sk.is_void);
             ctx.check("sink_IIV_is_not_string", !sk.is_string);
+            // side effect read from SNAPSHOT (the deepening boundary block below
+            // re-dispatches sink(II) with negative args, last-write-wins).
             ctx.check("sink_IIV_side_effect",
-                      method_explicit_sig::sinkIiSeen() == (SINK_II_A * 1000 + SINK_II_B));
+                      get("snap_sink_IIV").ival == (SINK_II_A * 1000 + SINK_II_B));
             // wrong-return / wrong-arity sink descriptors miss.
             ctx.check("miss_sink_ret_nullopt",   !get("miss_sink_ret").resolved);
             ctx.check("miss_sink_arity_nullopt", !get("miss_sink_arity").resolved);
@@ -1716,9 +1955,10 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("shape_4I_resolved", q.resolved);
             ctx.check("shape_4I_sig_is_exact", q.sig_text == SIG_SHAPE_4I);
             ctx.check("shape_4I_returns_sum", q.ival == (SHAPE_4A + SHAPE_4B + SHAPE_4C + SHAPE_4D));
+            // side effect read from SNAPSHOT (the deepening boundary block below
+            // re-dispatches shapes(IIII) with negative/wrap args, last-write-wins).
             ctx.check("shape_4I_side_effect",
-                      method_explicit_sig_counters::shapeFourArgSeen()
-                          == (SHAPE_4A + SHAPE_4B + SHAPE_4C + SHAPE_4D));
+                      get("snap_shape_4I").ival == (SHAPE_4A + SHAPE_4B + SHAPE_4C + SHAPE_4D));
 
             // Array shapes: LOOKUP-ONLY (resolve + exact descriptor; no dispatch
             // because C++ array args have no JNI marshalling).  Proves the
@@ -1774,8 +2014,10 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("dup_stat_via_static_name", ds.name_text == "dupStatic");
             ctx.check("dup_stat_via_static_is_static", ds.is_static);
             ctx.check("dup_stat_via_static_returns_double", ds.ival == (DUP_STAT_ARG * 2));
+            // side effect read from SNAPSHOT (the deepening boundary block below
+            // re-dispatches dupStatic with 0, last-write-wins).
             ctx.check("dup_stat_via_static_side_effect",
-                      method_explicit_sig_counters::dupStaticSeen() == DUP_STAT_ARG);
+                      get("snap_dup_stat").ival == DUP_STAT_ARG);
 
             // static_method REJECTS the instance-only dupInstance (ACC_STATIC gate).
             ctx.check("dup_inst_via_static_rejected", !get("dup_inst_via_static").resolved);
@@ -1787,8 +2029,10 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("dup_inst_via_inst_name", di.name_text == "dupInstance");
             ctx.check("dup_inst_via_inst_not_static", !di.is_static);
             ctx.check("dup_inst_via_inst_returns_arg_plus_1", di.ival == (DUP_INST_ARG + 1));
+            // side effect read from SNAPSHOT (the deepening boundary block below
+            // re-dispatches dupInstance with -1, last-write-wins).
             ctx.check("dup_inst_via_inst_side_effect",
-                      method_explicit_sig_counters::dupInstanceSeen() == DUP_INST_ARG);
+                      get("snap_dup_inst").ival == DUP_INST_ARG);
 
             // get_method (instance) ALSO resolves the STATIC dupStatic — the
             // instance overload has NO ACC_STATIC gate (FLAW 1).  We assert only
@@ -1821,15 +2065,17 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
             ctx.check("iface_def_I_resolved", di.resolved);
             ctx.check("iface_def_I_sig_is_exact", di.sig_text == SIG_IFACE_DEF_I);
             ctx.check("iface_def_I_returns_arg_plus_3", di.ival == (IFACE_DEF_I_ARG + 3));
+            // side effects read from SNAPSHOT (the deepening boundary block below
+            // re-dispatches both ifaceDefault overloads, last-write-wins).
             ctx.check("iface_def_I_side_effect",
-                      method_explicit_sig_counters::ifaceDefaultIntSeen() == IFACE_DEF_I_ARG);
+                      get("snap_iface_def_I").ival == IFACE_DEF_I_ARG);
 
             const probe_result dj{ get("iface_def_J") };
             ctx.check("iface_def_J_resolved", dj.resolved);
             ctx.check("iface_def_J_sig_is_exact", dj.sig_text == SIG_IFACE_DEF_J);
             ctx.check("iface_def_J_returns_arg_plus_30", dj.ival == (IFACE_DEF_J_ARG + 30));
             ctx.check("iface_def_J_side_effect",
-                      method_explicit_sig_counters::ifaceDefaultLongSeen() == IFACE_DEF_J_ARG);
+                      get("snap_iface_def_J").ival == IFACE_DEF_J_ARG);
 
             // The abstract interface method has a concrete class override; the
             // ordinary walk finds + dispatches it (the fallback skips abstracts).
@@ -2084,6 +2330,268 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
         }
 
         // ===================================================================
+        //  DEEPENING WAVE results — every-possible-input coverage.  Each probe
+        //  RE-SELECTED its overload by the SAME exact descriptor (still asserted)
+        //  and the assertion is over the call's RETURN value (captured at call time,
+        //  immune to later last-write-wins field overwrites), so these are dense,
+        //  non-vacuous HARD checks that do not depend on field-read ordering.
+        // ===================================================================
+        {
+            // -- process(II)I full-range a*100+b (2's-complement wrap). --
+            const probe_result iimm{ get("bnd_proc_II_minmax") };
+            ctx.check("bnd_proc_II_minmax_resolved", iimm.resolved);
+            ctx.check("bnd_proc_II_minmax_sig", iimm.sig_text == SIG_PROC_II);
+            // (INT_MIN*100 + INT_MAX) computed in well-defined unsigned-32 modular
+            // arithmetic, then reinterpreted as int32 and sign-extended to int64.
+            ctx.check("bnd_proc_II_minmax_wraps",
+                      iimm.ival == static_cast<std::int64_t>(static_cast<std::int32_t>(
+                          static_cast<std::uint32_t>(-2147483647 - 1) * 100u
+                          + static_cast<std::uint32_t>(2147483647))));
+            const probe_result iiz{ get("bnd_proc_II_zero") };
+            ctx.check("bnd_proc_II_zero_resolved", iiz.resolved);
+            ctx.check("bnd_proc_II_zero_result", iiz.ival == 0);
+            const probe_result iimx{ get("bnd_proc_II_maxmax") };
+            ctx.check("bnd_proc_II_maxmax_resolved", iimx.resolved);
+            ctx.check("bnd_proc_II_maxmax_wraps",
+                      iimx.ival == static_cast<std::int64_t>(static_cast<std::int32_t>(
+                          static_cast<std::uint32_t>(2147483647) * 100u
+                          + static_cast<std::uint32_t>(2147483647))));
+
+            // -- process(J)J at 0 / 1 / -1 (+1000). --
+            const probe_result jz{ get("bnd_proc_J_zero") };
+            ctx.check("bnd_proc_J_zero_resolved", jz.resolved);
+            ctx.check("bnd_proc_J_zero_sig", jz.sig_text == SIG_PROC_J);
+            ctx.check("bnd_proc_J_zero_result", jz.ival == 1000);
+            const probe_result jone{ get("bnd_proc_J_one") };
+            ctx.check("bnd_proc_J_one_resolved", jone.resolved);
+            ctx.check("bnd_proc_J_one_result", jone.ival == 1001);
+            const probe_result jn{ get("bnd_proc_J_neg") };
+            ctx.check("bnd_proc_J_neg_resolved", jn.resolved);
+            ctx.check("bnd_proc_J_neg_result", jn.ival == 999);   // -1 + 1000
+
+            // -- process(I)I at 1 (+1). --
+            const probe_result ione{ get("bnd_proc_I_one") };
+            ctx.check("bnd_proc_I_one_resolved", ione.resolved);
+            ctx.check("bnd_proc_I_one_sig", ione.sig_text == SIG_PROC_I);
+            ctx.check("bnd_proc_I_one_result", ione.ival == 2);
+
+            // -- process(String,int)String at empty+INT_MIN and "x"+INT_MAX. --
+            const probe_result siemin{ get("bnd_proc_SI_emin") };
+            ctx.check("bnd_proc_SI_emin_resolved", siemin.resolved);
+            ctx.check("bnd_proc_SI_emin_sig", siemin.sig_text == SIG_PROC_SI);
+            ctx.check("bnd_proc_SI_emin_is_string", siemin.is_string);
+            ctx.check("bnd_proc_SI_emin_result", siemin.sval == "#-2147483648");
+            const probe_result sinmax{ get("bnd_proc_SI_nmax") };
+            ctx.check("bnd_proc_SI_nmax_resolved", sinmax.resolved);
+            ctx.check("bnd_proc_SI_nmax_result", sinmax.sval == "x#2147483647");
+
+            // -- process(String)String with an embedded NUL.  The descriptor-exact
+            //    selection + String return are HARD (JDK-stable); the embedded-NUL
+            //    byte round-trip through the call-arg marshalling and Java '+'
+            //    concatenation is decoder-sensitive (modified-UTF-8 encodes NUL as
+            //    a 2-byte sequence; read_java_string vs GetStringUTFChars differ),
+            //    so the exact returned bytes are characterized [INFO], not HARD.
+            const probe_result snul{ get("bnd_proc_S_nul") };
+            ctx.check("bnd_proc_S_nul_resolved", snul.resolved);
+            ctx.check("bnd_proc_S_nul_sig", snul.sig_text == SIG_PROC_S);
+            ctx.check("bnd_proc_S_nul_is_string", snul.is_string);
+            // The "S:" prefix is pure ASCII and always survives; assert it HARD.
+            ctx.check("bnd_proc_S_nul_keeps_prefix",
+                      snul.sval.size() >= 2 && snul.sval[0] == 'S' && snul.sval[1] == ':');
+            ctx.record("[INFO] process(String) embedded-NUL round-trip: returned "
+                       + std::to_string(snul.sval.size()) + " bytes (decoder-sensitive "
+                       "NUL handling; ASCII prefix verified HARD).");
+
+            // -- shapes(B)B sign-extension: -1 -> -2, 0 -> 0, 1 -> 2. --
+            const probe_result bn1{ get("bnd_shape_B_neg1") };
+            ctx.check("bnd_shape_B_neg1_resolved", bn1.resolved);
+            ctx.check("bnd_shape_B_neg1_sig", bn1.sig_text == SIG_SHAPE_B);
+            ctx.check("bnd_shape_B_neg1_signext", bn1.ival == -2);
+            const probe_result bz{ get("bnd_shape_B_zero") };
+            ctx.check("bnd_shape_B_zero_resolved", bz.resolved);
+            ctx.check("bnd_shape_B_zero_result", bz.ival == 0);
+            const probe_result bo{ get("bnd_shape_B_one") };
+            ctx.check("bnd_shape_B_one_resolved", bo.resolved);
+            ctx.check("bnd_shape_B_one_result", bo.ival == 2);
+
+            // -- shapes(S)S sign-extension: -1 -> -3, 0 -> 0. --
+            const probe_result sn1{ get("bnd_shape_S_neg1") };
+            ctx.check("bnd_shape_S_neg1_resolved", sn1.resolved);
+            ctx.check("bnd_shape_S_neg1_sig", sn1.sig_text == SIG_SHAPE_S);
+            ctx.check("bnd_shape_S_neg1_signext", sn1.ival == -3);
+            const probe_result sz0{ get("bnd_shape_S_zero") };
+            ctx.check("bnd_shape_S_zero_resolved", sz0.resolved);
+            ctx.check("bnd_shape_S_zero_result", sz0.ival == 0);
+
+            // -- shapes(C)C ZERO-extension: 0x8000 -> 0x8001 (POSITIVE 33793).
+            //    A sign-extended short would read negative here; char must not.
+            const probe_result cmid{ get("bnd_shape_C_mid") };
+            ctx.check("bnd_shape_C_mid_resolved", cmid.resolved);
+            ctx.check("bnd_shape_C_mid_sig", cmid.sig_text == SIG_SHAPE_C);
+            ctx.check("bnd_shape_C_mid_zeroext", cmid.ival == 0x8001);
+            ctx.check("bnd_shape_C_mid_is_positive", cmid.ival > 0);
+            const probe_result cone{ get("bnd_shape_C_one") };
+            ctx.check("bnd_shape_C_one_resolved", cone.resolved);
+            ctx.check("bnd_shape_C_one_result", cone.ival == 2);
+
+            // -- shapes(F)F at 1.0 / 1e7 (the *2 transform exact). --
+            const probe_result fone{ get("bnd_shape_F_one") };
+            ctx.check("bnd_shape_F_one_resolved", fone.resolved);
+            ctx.check("bnd_shape_F_one_sig", fone.sig_text == SIG_SHAPE_F);
+            ctx.check("bnd_shape_F_one_result", fone.dval == static_cast<double>(2.0f));
+            const probe_result flg{ get("bnd_shape_F_large") };
+            ctx.check("bnd_shape_F_large_resolved", flg.resolved);
+            ctx.check("bnd_shape_F_large_result", flg.dval == static_cast<double>(1.0e7f * 2.0f));
+
+            // -- shapes(D)D negative / zero (+3.25 exact). --
+            const probe_result dn{ get("bnd_shape_D_neg") };
+            ctx.check("bnd_shape_D_neg_resolved", dn.resolved);
+            ctx.check("bnd_shape_D_neg_sig", dn.sig_text == SIG_SHAPE_D);
+            ctx.check("bnd_shape_D_neg_result", dn.dval == (-10.5 + 3.25));
+            const probe_result dz{ get("bnd_shape_D_zero") };
+            ctx.check("bnd_shape_D_zero_resolved", dz.resolved);
+            ctx.check("bnd_shape_D_zero_result", dz.dval == 3.25);
+
+            // -- shapes(IIII)I negatives + wrap. --
+            const probe_result q4n{ get("bnd_shape_4I_neg") };
+            ctx.check("bnd_shape_4I_neg_resolved", q4n.resolved);
+            ctx.check("bnd_shape_4I_neg_sig", q4n.sig_text == SIG_SHAPE_4I);
+            ctx.check("bnd_shape_4I_neg_result", q4n.ival == (-1 + -2 + -3 + -4));
+            const probe_result q4w{ get("bnd_shape_4I_wrap") };
+            ctx.check("bnd_shape_4I_wrap_resolved", q4w.resolved);
+            // INT_MAX + 1 + 0 + 0 wraps to INT_MIN.
+            ctx.check("bnd_shape_4I_wrap_wraps", q4w.ival == (-2147483647 - 1));
+
+            // -- wide(JI)J / (DI)D / (JJ)J boundary multi-slot packing. --
+            const probe_result wjz{ get("bnd_wide_JI_zero") };
+            ctx.check("bnd_wide_JI_zero_resolved", wjz.resolved);
+            ctx.check("bnd_wide_JI_zero_sig", wjz.sig_text == SIG_WIDE_JI);
+            ctx.check("bnd_wide_JI_zero_result", wjz.ival == 0);
+            const probe_result wjn{ get("bnd_wide_JI_neg") };
+            ctx.check("bnd_wide_JI_neg_resolved", wjn.resolved);
+            ctx.check("bnd_wide_JI_neg_result", wjn.ival == (-1 * 1000 + -1));  // -1001
+            const probe_result wdn{ get("bnd_wide_DI_neg") };
+            ctx.check("bnd_wide_DI_neg_resolved", wdn.resolved);
+            ctx.check("bnd_wide_DI_neg_sig", wdn.sig_text == SIG_WIDE_DI);
+            ctx.check("bnd_wide_DI_neg_result", wdn.dval == (-2.5 + static_cast<double>(-3)));
+            const probe_result wjjz{ get("bnd_wide_JJ_zero") };
+            ctx.check("bnd_wide_JJ_zero_resolved", wjjz.resolved);
+            ctx.check("bnd_wide_JJ_zero_sig", wjjz.sig_text == SIG_WIDE_JJ);
+            ctx.check("bnd_wide_JJ_zero_result", wjjz.ival == 0);   // 5 - 5
+            const probe_result wjjm{ get("bnd_wide_JJ_min") };
+            ctx.check("bnd_wide_JJ_min_resolved", wjjm.resolved);
+            ctx.check("bnd_wide_JJ_min_result", wjjm.ival == (-9223372036854775807LL - 1)); // MIN - 0
+
+            // -- sink(II)V negative-args void dispatch. --
+            const probe_result skn{ get("bnd_sink_neg") };
+            ctx.check("bnd_sink_neg_resolved", skn.resolved);
+            ctx.check("bnd_sink_neg_sig", skn.sig_text == SIG_SINK_IIV);
+            ctx.check("bnd_sink_neg_is_void", skn.is_void);
+
+            // -- smap(I)I (static) at 0 / 1 / -1 (*2). --
+            const probe_result smz{ get("bnd_smap_I_zero") };
+            ctx.check("bnd_smap_I_zero_resolved", smz.resolved);
+            ctx.check("bnd_smap_I_zero_is_static", smz.is_static);
+            ctx.check("bnd_smap_I_zero_result", smz.ival == 0);
+            const probe_result smo{ get("bnd_smap_I_one") };
+            ctx.check("bnd_smap_I_one_resolved", smo.resolved);
+            ctx.check("bnd_smap_I_one_result", smo.ival == 2);
+            const probe_result smn{ get("bnd_smap_I_neg") };
+            ctx.check("bnd_smap_I_neg_resolved", smn.resolved);
+            ctx.check("bnd_smap_I_neg_result", smn.ival == -2);
+
+            // -- base(I)/(II)/(JI) inherited boundary (hierarchy walk holds). --
+            const probe_result bin{ get("bnd_base_I_neg") };
+            ctx.check("bnd_base_I_neg_resolved", bin.resolved);
+            ctx.check("bnd_base_I_neg_sig", bin.sig_text == SIG_BASE_I);
+            ctx.check("bnd_base_I_neg_result", bin.ival == 0);   // -7 + 7
+            const probe_result biieq{ get("bnd_base_II_eq") };
+            ctx.check("bnd_base_II_eq_resolved", biieq.resolved);
+            ctx.check("bnd_base_II_eq_result", biieq.ival == 0); // 5 - 5
+            const probe_result bjiz{ get("bnd_base_JI_zero") };
+            ctx.check("bnd_base_JI_zero_resolved", bjiz.resolved);
+            ctx.check("bnd_base_JI_zero_sig", bjiz.sig_text == SIG_BASE_JI);
+            ctx.check("bnd_base_JI_zero_result", bjiz.ival == 0);
+
+            // -- dupInstance(I)I (+1) / dupStatic(I)I (*2) boundary. --
+            const probe_result din{ get("bnd_dup_inst_neg") };
+            ctx.check("bnd_dup_inst_neg_resolved", din.resolved);
+            ctx.check("bnd_dup_inst_neg_not_static", !din.is_static);
+            ctx.check("bnd_dup_inst_neg_result", din.ival == 0);  // -1 + 1
+            const probe_result dsz{ get("bnd_dup_stat_zero") };
+            ctx.check("bnd_dup_stat_zero_resolved", dsz.resolved);
+            ctx.check("bnd_dup_stat_zero_is_static", dsz.is_static);
+            ctx.check("bnd_dup_stat_zero_result", dsz.ival == 0); // 0 * 2
+
+            // -- ifaceDefault(I)I (+3) / (J)J (+30) boundary via interface fallback. -
+            const probe_result idin{ get("bnd_iface_def_I_neg") };
+            ctx.check("bnd_iface_def_I_neg_resolved", idin.resolved);
+            ctx.check("bnd_iface_def_I_neg_sig", idin.sig_text == SIG_IFACE_DEF_I);
+            ctx.check("bnd_iface_def_I_neg_result", idin.ival == 0);  // -3 + 3
+            const probe_result idjz{ get("bnd_iface_def_J_zero") };
+            ctx.check("bnd_iface_def_J_zero_resolved", idjz.resolved);
+            ctx.check("bnd_iface_def_J_zero_sig", idjz.sig_text == SIG_IFACE_DEF_J);
+            ctx.check("bnd_iface_def_J_zero_result", idjz.ival == 30); // 0 + 30
+
+            // -- IDEMPOTENCY: same (name,sig) twice agrees on every facet AND the
+            //    first resolution's absolute facets are exact. --
+            const probe_result idpj{ get("idem_proc_J") };
+            ctx.check("idem_proc_J_resolved", idpj.resolved);
+            ctx.check("idem_proc_J_agrees", idpj.ival == 1);
+            ctx.check("idem_proc_J_sig_exact", idpj.sig_text == SIG_PROC_J);
+            ctx.check("idem_proc_J_name", idpj.name_text == "process");
+            ctx.check("idem_proc_J_not_static", !idpj.is_static);
+            const probe_result idcs{ get("idem_combo_CS") };
+            ctx.check("idem_combo_CS_resolved", idcs.resolved);
+            ctx.check("idem_combo_CS_agrees", idcs.ival == 1);
+            ctx.check("idem_combo_CS_sig_exact", idcs.sig_text == SIG_COMBO_CS);
+            const probe_result idbji{ get("idem_base_JI") };
+            ctx.check("idem_base_JI_resolved", idbji.resolved);
+            ctx.check("idem_base_JI_agrees", idbji.ival == 1);
+            ctx.check("idem_base_JI_sig_exact", idbji.sig_text == SIG_BASE_JI);
+            ctx.check("idem_base_JI_name", idbji.name_text == "base");
+            const probe_result idij{ get("idem_iface_J") };
+            ctx.check("idem_iface_J_resolved", idij.resolved);
+            ctx.check("idem_iface_J_agrees", idij.ival == 1);
+            ctx.check("idem_iface_J_sig_exact", idij.sig_text == SIG_IFACE_DEF_J);
+            const probe_result idsm{ get("idem_smap_S") };
+            ctx.check("idem_smap_S_resolved", idsm.resolved);
+            ctx.check("idem_smap_S_agrees", idsm.ival == 1);
+            ctx.check("idem_smap_S_sig_exact", idsm.sig_text == SIG_SMAP_S);
+            ctx.check("idem_smap_S_is_static", idsm.is_static);
+            ctx.record("[INFO] explicit-signature lookup is idempotent: re-resolving "
+                       "the same (name,sig) returns the SAME overload (sig/name/static "
+                       "all agree) for instance, inherited, interface-default, the "
+                       "discriminating combo(CharSequence), and the static path.");
+
+            // -- WIDER STRICT-MISS net: wrong primitive width / token / array. --
+            ctx.check("miss_proc_byte_arg_nullopt",  !get("miss_proc_byte_arg").resolved);
+            ctx.check("miss_proc_short_arg_nullopt", !get("miss_proc_short_arg").resolved);
+            ctx.check("miss_proc_char_arg_nullopt",  !get("miss_proc_char_arg").resolved);
+            ctx.check("miss_proc_bool_arg_nullopt",  !get("miss_proc_bool_arg").resolved);
+            ctx.check("miss_proc_float_arg_nullopt", !get("miss_proc_float_arg").resolved);
+            ctx.check("miss_shape_int_scalar_nullopt", !get("miss_shape_int_scalar").resolved);
+            ctx.check("miss_wide_jd_nullopt",   !get("miss_wide_jd").resolved);
+            ctx.check("miss_wide_jjj_nullopt",  !get("miss_wide_jjj").resolved);
+            ctx.check("miss_smap_cs_nullopt",   !get("miss_smap_cs").resolved);
+            ctx.check("miss_smap_obj_nullopt",  !get("miss_smap_obj").resolved);
+            ctx.check("miss_shape_barr_nullopt",   !get("miss_shape_barr").resolved);
+            ctx.check("miss_shape_zarr_nullopt",   !get("miss_shape_zarr").resolved);
+            ctx.check("miss_shape_objarr_nullopt", !get("miss_shape_objarr").resolved);
+            ctx.check("miss_tab_in_sig_nullopt",     !get("miss_tab_in_sig").resolved);
+            ctx.check("miss_newline_in_sig_nullopt", !get("miss_newline_in_sig").resolved);
+            ctx.check("miss_embedded_nul_sig_nullopt", !get("miss_embedded_nul_sig").resolved);
+            ctx.check("miss_single_space_nullopt", !get("miss_single_space").resolved);
+            ctx.check("miss_lone_I_nullopt",       !get("miss_lone_I").resolved);
+            ctx.check("miss_init_obj_nullopt", !get("miss_init_obj").resolved);
+            ctx.check("miss_init_two_nullopt", !get("miss_init_two").resolved);
+            ctx.record("[INFO] strict descriptor compare rejects wrong primitive WIDTH "
+                       "(process(B)/(S)/(C)/(Z)/(F) all MISS vs the real (I)), wrong "
+                       "array element token ([B/[Z/[Ljava/lang/Object;), embedded "
+                       "tab/newline/NUL, and absent <init> reference overloads.");
+        }
+
+        // ===================================================================
         //  GLOBAL ISOLATION INVARIANTS across the whole run:
         //  every overload's side effect fired EXACTLY the expected number of
         //  times — no wrong-signature miss leaked into a real dispatch, and no
@@ -2124,30 +2632,34 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
         ctx.check("isolation_shape_B", get("snap_shape_B").ival == SHAPE_B_ARG);
         ctx.check("isolation_shape_S", get("snap_shape_S").ival == SHAPE_S_ARG);
         ctx.check("isolation_shape_4I",
-                  method_explicit_sig_counters::shapeFourArgSeen() == (SHAPE_4A + SHAPE_4B + SHAPE_4C + SHAPE_4D));
+                  get("snap_shape_4I").ival == (SHAPE_4A + SHAPE_4B + SHAPE_4C + SHAPE_4D));
         // dup* family: instance and static side effects each set by their own kind.
-        ctx.check("isolation_dup_inst", method_explicit_sig_counters::dupInstanceSeen() == DUP_INST_ARG);
-        ctx.check("isolation_dup_stat", method_explicit_sig_counters::dupStaticSeen() == DUP_STAT_ARG);
-        // interface default + abstract-override side effects intact.
-        ctx.check("isolation_iface_def_I", method_explicit_sig_counters::ifaceDefaultIntSeen() == IFACE_DEF_I_ARG);
-        ctx.check("isolation_iface_def_J", method_explicit_sig_counters::ifaceDefaultLongSeen() == IFACE_DEF_J_ARG);
+        //  (Read from SNAPSHOT: the deepening boundary block re-dispatched both.)
+        ctx.check("isolation_dup_inst", get("snap_dup_inst").ival == DUP_INST_ARG);
+        ctx.check("isolation_dup_stat", get("snap_dup_stat").ival == DUP_STAT_ARG);
+        // interface default + abstract-override side effects intact.  ifaceDefault
+        //  I/J read from SNAPSHOT (boundary re-dispatched); ifaceAbstract was not
+        //  re-dispatched, so its live read is canonical.
+        ctx.check("isolation_iface_def_I", get("snap_iface_def_I").ival == IFACE_DEF_I_ARG);
+        ctx.check("isolation_iface_def_J", get("snap_iface_def_J").ival == IFACE_DEF_J_ARG);
         ctx.check("isolation_iface_abs",   method_explicit_sig_counters::ifaceAbstractSeen() == IFACE_ABS_ARG);
         // constructors were lookup-only: NO ctor side effect fired.
         ctx.check("isolation_init_no_int_dispatch", method_explicit_sig_counters::initIntSeen() == 0);
         ctx.check("isolation_init_no_str_dispatch", method_explicit_sig_counters::initStrSeen().empty());
-        // inherited wide-mixed-arg base(JI)J dispatched once with its packed value
-        // (never re-dispatched by the boundary block -> live read is canonical).
-        ctx.check("isolation_base_JI", method_explicit_sig_base::baseLongIntSeen() == (BASE_JI_A * 1000 + BASE_JI_B));
+        // inherited wide-mixed-arg base(JI)J dispatched with its packed value
+        //  (read from SNAPSHOT: the deepening boundary block re-dispatched base(JI)).
+        ctx.check("isolation_base_JI", get("snap_base_JI").ival == (BASE_JI_A * 1000 + BASE_JI_B));
         // covariant: the leaf override ran exactly once; the base body never ran.
         ctx.check("isolation_cov_leaf", method_explicit_sig::covStrSeen() == "leaf-cov");
         ctx.check("isolation_cov_base_unran", method_explicit_sig_base::covBaseSeen() == 0);
-        // wide family side effects each set by their own overload (not re-dispatched).
-        ctx.check("isolation_wide_JI", method_explicit_sig::wideJiSeen() == (WIDE_JI_J_ARG * 1000 + WIDE_JI_I_ARG));
+        // wide family side effects each set by their own overload (read from
+        //  SNAPSHOT: the deepening boundary block re-dispatched all three).
+        ctx.check("isolation_wide_JI", get("snap_wide_JI").ival == (WIDE_JI_J_ARG * 1000 + WIDE_JI_I_ARG));
         ctx.check("isolation_wide_DI",
-                  method_explicit_sig::wideDiSeen() == (WIDE_DI_D_ARG + static_cast<double>(WIDE_DI_I_ARG)));
-        ctx.check("isolation_wide_JJ", method_explicit_sig::wideJjSeen() == (WIDE_JJ_A_ARG - WIDE_JJ_B_ARG));
-        // void-with-args sink(II)V dispatched once.
-        ctx.check("isolation_sink_IIV", method_explicit_sig::sinkIiSeen() == (SINK_II_A * 1000 + SINK_II_B));
+                  get("snap_wide_DI").dval == (WIDE_DI_D_ARG + static_cast<double>(WIDE_DI_I_ARG)));
+        ctx.check("isolation_wide_JJ", get("snap_wide_JJ").ival == (WIDE_JJ_A_ARG - WIDE_JJ_B_ARG));
+        // void-with-args sink(II)V dispatched once (read from SNAPSHOT: re-dispatched).
+        ctx.check("isolation_sink_IIV", get("snap_sink_IIV").ival == (SINK_II_A * 1000 + SINK_II_B));
         // object-return makeObj/makeNum were lookup-only: neither dispatched (no
         // observable side effect exists to leak; the proxies carried exact sigs).
     }

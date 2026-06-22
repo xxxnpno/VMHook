@@ -557,6 +557,56 @@ namespace
     // ── ambiguous unregistered-wrapper resolution (nondeterministic; [INFO]) ─
     std::atomic<std::int64_t> g_amb_unregistered{ k_unset };
 
+    // ── DEEPENING: degenerate / extra-boundary single-arg inputs ─────────────
+    // 0 / 1 / -1 are the canonical degenerate integral inputs that sit BETWEEN
+    // the MIN/MAX extremes already covered; each must still resolve to its own
+    // overload (resolution is type-driven, never value-driven) and round-trip.
+    std::atomic<std::int64_t> g_r_int_zero{ k_unset };
+    std::atomic<std::int64_t> g_r_int_one{ k_unset };
+    std::atomic<std::int64_t> g_r_int_neg1{ k_unset };
+    std::atomic<std::int64_t> g_echo_int_zero{ k_unset };
+    std::atomic<std::int64_t> g_echo_int_neg1{ k_unset };
+    std::atomic<std::int64_t> g_r_long_zero{ k_unset };
+    std::atomic<std::int64_t> g_r_long_neg1{ k_unset };
+    std::atomic<std::int64_t> g_echo_long_neg1{ k_unset };
+    // bool FALSE single-arg (only `true` was tested single-arg before).
+    std::atomic<std::int64_t> g_r_bool_false{ k_unset };
+    std::atomic<int>          g_echo_bool_false{ -1 };
+    // double 0.0 / negative; float single-arg VALUE echo (never checked before).
+    std::atomic<std::int64_t> g_r_double_zero{ k_unset };
+    std::atomic<std::int64_t> g_r_double_neg{ k_unset };
+    std::atomic<int>          g_echo_double_neg_ok{ -1 };   // last_double() == -2.5 ?
+    std::atomic<std::int64_t> g_r_float_value{ k_unset };
+    std::atomic<int>          g_echo_float_ok{ -1 };        // last_float() == 1.5f ?
+    // char16_t at the 16-bit ceiling 0xFFFF must resolve to char and echo UNSIGNED.
+    std::atomic<std::int64_t> g_r_char16_max{ k_unset };
+    std::atomic<std::int64_t> g_echo_char16_max{ k_unset };
+
+    // ── DEEPENING: degenerate / unicode / embedded-NUL STRING inputs ─────────
+    // empty "" is a real Java String (not Java null) -> pick(String), echoes "".
+    std::atomic<std::int64_t> g_r_string_empty{ k_unset };
+    std::atomic<int>          g_echo_string_empty_ok{ -1 };
+    // a CJK + astral-free unicode string round-trips through the counted-UTF-16
+    // encoder -> pick(String).  ASCII-comparable length proven via last_string().
+    std::atomic<std::int64_t> g_r_string_unicode{ k_unset };
+    std::atomic<int>          g_echo_string_unicode_ok{ -1 };
+    // embedded interior NUL ("a\0b"): the converter explicitly uses counted UTF-16
+    // (NOT NewStringUTF) to preserve interior NULs.  Must resolve to pick(String)
+    // AND the 3-char value (with the middle NUL) must round-trip intact.
+    std::atomic<std::int64_t> g_r_string_embedded_nul{ k_unset };
+    std::atomic<int>          g_echo_string_embedded_nul_ok{ -1 };
+    // a LARGE string (4096 'x') -> pick(String) + exact-length round-trip.
+    std::atomic<std::int64_t> g_r_string_large{ k_unset };
+    std::atomic<int>          g_echo_string_large_ok{ -1 };
+
+    // ── DEEPENING: idempotency — the SAME call resolves identically twice ─────
+    std::atomic<std::int64_t> g_r_int_again{ k_unset };
+    std::atomic<std::int64_t> g_echo_int_again{ k_unset };
+    std::atomic<std::int64_t> g_r_string_again{ k_unset };
+
+    // ── DEEPENING: a fresh int[] is zero-initialised (head element == 0) ──────
+    std::atomic<std::int64_t> g_arr_long_head_zero{ k_unset };
+
     auto run_all(const std::unique_ptr<overload_fixture>& self) -> void
     {
         if (!self)
@@ -601,6 +651,62 @@ namespace
         g_echo_short.store(overload_fixture::last_short());
         g_echo_char.store(overload_fixture::last_char());
         g_echo_string_ok.store(overload_fixture::last_string() == std::string{ "hello" });
+
+        // ===== DEEPENING: degenerate / extra-boundary single-arg inputs ========
+        // 0 / 1 / -1 sit BETWEEN the MIN/MAX extremes — resolution is by TYPE, so
+        // each still lands on (I)I / (J)I and round-trips its (signed) value.
+        g_r_int_zero.store(s.pick(static_cast<std::int32_t>(0)));
+        g_echo_int_zero.store(overload_fixture::last_int());
+        g_r_int_one.store(s.pick(static_cast<std::int32_t>(1)));
+        g_r_int_neg1.store(s.pick(static_cast<std::int32_t>(-1)));
+        g_echo_int_neg1.store(overload_fixture::last_int());
+        g_r_long_zero.store(s.pick(static_cast<std::int64_t>(0)));
+        g_r_long_neg1.store(s.pick(static_cast<std::int64_t>(-1)));
+        g_echo_long_neg1.store(overload_fixture::last_long());
+        // bool FALSE single-arg (the value-0 boolean) -> pick(boolean), echoes 0.
+        g_r_bool_false.store(s.pick(false));
+        g_echo_bool_false.store(overload_fixture::last_bool() ? 1 : 0);
+        // double 0.0 / -2.5 -> pick(double) (never the int overload); echo -2.5.
+        g_r_double_zero.store(s.pick(0.0));
+        g_r_double_neg.store(s.pick(-2.5));
+        g_echo_double_neg_ok.store(overload_fixture::last_double() == -2.5 ? 1 : 0);
+        // float single-arg VALUE round-trip (only the (FF)I pair echoed a float so far).
+        g_r_float_value.store(s.pick(1.5f));
+        g_echo_float_ok.store(overload_fixture::last_float() == 1.5f ? 1 : 0);
+        // char16_t 0xFFFF -> pick(char) and echoes UNSIGNED 0xFFFF (never -1).
+        g_r_char16_max.store(s.pick(static_cast<char16_t>(0xFFFF)));
+        g_echo_char16_max.store(overload_fixture::last_char());
+
+        // ===== DEEPENING: degenerate / unicode / embedded-NUL STRING inputs ====
+        // empty "" -> a real (non-null) Java String -> pick(String); echoes "".
+        g_r_string_empty.store(s.pick(std::string{}));
+        g_echo_string_empty_ok.store(overload_fixture::last_string().empty() ? 1 : 0);
+        // CJK unicode (ASCII-safe to compare via the round-tripped std::string).
+        {
+            const std::string cjk{ "\xE4\xBD\xA0\xE5\xA5\xBD" };  // U+4F60 U+597D ("nihao") in UTF-8
+            g_r_string_unicode.store(s.pick(cjk));
+            g_echo_string_unicode_ok.store(overload_fixture::last_string() == cjk ? 1 : 0);
+        }
+        // embedded interior NUL — the converter uses counted UTF-16 to preserve it.
+        {
+            const std::string with_nul{ std::string("a\0b", 3) };
+            g_r_string_embedded_nul.store(s.pick(with_nul));
+            g_echo_string_embedded_nul_ok.store(overload_fixture::last_string() == with_nul ? 1 : 0);
+        }
+        // a LARGE string: 4096 'x' must round-trip at full length (no truncation).
+        {
+            const std::string large(4096, 'x');
+            g_r_string_large.store(s.pick(large));
+            g_echo_string_large_ok.store(overload_fixture::last_string() == large ? 1 : 0);
+        }
+
+        // ===== DEEPENING: idempotency — same call, same resolution twice ========
+        // Re-issuing the identical typed call must produce the identical sentinel
+        // and identical echo (resolve_compatible_method is a pure function of the
+        // arg types + the klass; nothing latches/caches a WRONG overload).
+        g_r_int_again.store(s.pick(static_cast<std::int32_t>(42)));
+        g_echo_int_again.store(overload_fixture::last_int());
+        g_r_string_again.store(s.pick(std::string{ "hello" }));
 
         // ===== ALTERNATE C++ TYPES -> SAME descriptor as a tested sibling =====
         // The matcher/arg-packer classify by TRAITS, not by a fixed-width alias,
@@ -1007,6 +1113,10 @@ namespace
                 g_arr_long_sig.store(s.pick_sig("([J)I", std::make_unique<array_carrier>(long_arr)));
                 g_arr_long_len.store(overload_fixture::last_array_len());
                 g_arr_long_head.store(overload_fixture::last_array_head());
+                // A freshly TLAB-allocated primitive array is zero-initialised, so
+                // its head element reads back as 0 (cross-check of the array element
+                // accessor vs the JVM's zeroing contract).
+                g_arr_long_head_zero.store(overload_fixture::last_array_head());
             }
         }
         // char[] — a THIRD array element type "([C)I".  Java char is a 16-bit
@@ -1688,6 +1798,122 @@ namespace
             ctx.check("mo_int_array_vs_char_array_distinct",
                       g_arr_int_sig.load() != g_arr_char_sig.load());
         }
+
+        // a freshly TLAB-allocated long[] is zeroed -> head element reads 0.
+        if (g_arr_long_attempted.load() == 1)
+        {
+            ctx.check("mo_long_array_head_zero_initialised", g_arr_long_head_zero.load() == 0);
+        }
+        // char[] vs long[] are distinct array element types (only int-vs-long and
+        // int-vs-char were previously cross-checked).
+        if (g_arr_char_attempted.load() == 1 && g_arr_long_attempted.load() == 1)
+        {
+            ctx.check("mo_char_array_vs_long_array_distinct",
+                      g_arr_char_sig.load() != g_arr_long_sig.load());
+        }
+
+        // =====================================================================
+        //  DEEPENING: degenerate / extra-boundary single-arg inputs resolve by
+        //  TYPE (never by value) and round-trip.  0 / 1 / -1 sit between the
+        //  MIN/MAX extremes already covered; bool false / double 0.0 / negative
+        //  double / a float value / char 0xFFFF fill the remaining value corners.
+        // =====================================================================
+        ctx.check("mo_int_zero_resolves_int",   g_r_int_zero.load() == RET_INT);
+        ctx.check("mo_int_one_resolves_int",    g_r_int_one.load()  == RET_INT);
+        ctx.check("mo_int_neg1_resolves_int",   g_r_int_neg1.load() == RET_INT);
+        ctx.check("mo_int_zero_value_echoed",   g_echo_int_zero.load() == 0);
+        ctx.check("mo_int_neg1_value_echoed",   g_echo_int_neg1.load() == -1);
+        ctx.check("mo_long_zero_resolves_long", g_r_long_zero.load() == RET_LONG);
+        ctx.check("mo_long_neg1_resolves_long", g_r_long_neg1.load() == RET_LONG);
+        ctx.check("mo_long_neg1_value_echoed",  g_echo_long_neg1.load() == -1);
+        // bool false is a value-0 boolean -> pick(boolean), echoes 0 (distinct
+        // value from the `true` single-arg case, same overload).
+        ctx.check("mo_bool_false_resolves_boolean", g_r_bool_false.load() == RET_BOOLEAN);
+        ctx.check("mo_bool_false_value_echoed",     g_echo_bool_false.load() == 0);
+        // double 0.0 and -2.5 -> pick(double), NEVER the int overload (value, even
+        // a whole 0.0, never overrides the C++ double TYPE); -2.5 round-trips.
+        ctx.check("mo_double_zero_resolves_double", g_r_double_zero.load() == RET_DOUBLE);
+        ctx.check("mo_double_neg_resolves_double",  g_r_double_neg.load()  == RET_DOUBLE);
+        ctx.check("mo_double_neg_value_echoed",     g_echo_double_neg_ok.load() == 1);
+        // float single-arg VALUE fidelity (previously only the (FF)I pair echoed).
+        ctx.check("mo_float_value_resolves_float",  g_r_float_value.load() == RET_FLOAT);
+        ctx.check("mo_float_single_arg_value_echoed", g_echo_float_ok.load() == 1);
+        // char 0xFFFF -> pick(char) and echoes UNSIGNED 0xFFFF (== 65535, not -1).
+        ctx.check("mo_char16_max_resolves_char",    g_r_char16_max.load() == RET_CHAR);
+        ctx.check("mo_char16_max_value_echoed",     g_echo_char16_max.load() == 0xFFFF);
+
+        // =====================================================================
+        //  DEEPENING: degenerate / unicode / embedded-NUL / large STRING inputs.
+        //  All resolve to pick(String) (the descriptor is type-driven, not
+        //  content-driven), and the value round-trips through the counted-UTF-16
+        //  encoder — empty stays empty (a real String, not Java null), the interior
+        //  NUL survives (NewStringUTF would have truncated at it), the CJK code
+        //  points survive, and a 4096-char payload is not truncated.
+        // =====================================================================
+        ctx.check("mo_empty_string_resolves_string",        g_r_string_empty.load() == RET_STRING);
+        ctx.check("mo_empty_string_value_echoed",           g_echo_string_empty_ok.load() == 1);
+        ctx.check("mo_unicode_string_resolves_string",      g_r_string_unicode.load() == RET_STRING);
+        ctx.check("mo_unicode_string_value_round_trips",    g_echo_string_unicode_ok.load() == 1);
+        ctx.check("mo_embedded_nul_string_resolves_string", g_r_string_embedded_nul.load() == RET_STRING);
+        ctx.check("mo_embedded_nul_string_round_trips",     g_echo_string_embedded_nul_ok.load() == 1);
+        ctx.check("mo_large_string_resolves_string",        g_r_string_large.load() == RET_STRING);
+        ctx.check("mo_large_string_round_trips",            g_echo_string_large_ok.load() == 1);
+
+        // =====================================================================
+        //  DEEPENING: idempotency — the SAME typed call resolves identically on a
+        //  repeat (resolve_compatible_method is a pure function of arg types +
+        //  klass; nothing latches a stale/wrong overload between calls).
+        // =====================================================================
+        ctx.check("mo_int_resolution_idempotent",
+                  g_r_int_again.load() == RET_INT && g_r_int_again.load() == g_r_int.load());
+        ctx.check("mo_int_echo_idempotent", g_echo_int_again.load() == 42);
+        ctx.check("mo_string_resolution_idempotent",
+                  g_r_string_again.load() == RET_STRING && g_r_string_again.load() == g_r_string.load());
+
+        // =====================================================================
+        //  DEEPENING: INSTANCE <-> STATIC cross-resolution consistency.  For every
+        //  shape resolved BOTH name-only on `self` and name-only on the static
+        //  proxy, the static sentinel must equal the instance sentinel + SBIAS —
+        //  i.e. both resolvers (the object-header klass walk AND the _pool_holder
+        //  klass walk, fix #7) select the SAME overload SHAPE for the SAME C++ arg
+        //  type.  A single dense invariant tying the two resolution paths together.
+        // =====================================================================
+        ctx.check("mo_static_matches_instance_int",    g_s_int.load()    == g_r_int.load()    + SBIAS);
+        ctx.check("mo_static_matches_instance_long",   g_s_long.load()   == g_r_long.load()   + SBIAS);
+        ctx.check("mo_static_matches_instance_double", g_s_double.load() == g_r_double.load() + SBIAS);
+        ctx.check("mo_static_matches_instance_float",  g_s_float.load()  == g_r_float.load()  + SBIAS);
+        ctx.check("mo_static_matches_instance_bool",   g_s_bool.load()   == g_r_bool.load()   + SBIAS);
+        ctx.check("mo_static_matches_instance_byte",   g_s_byte.load()   == g_r_byte.load()   + SBIAS);
+        ctx.check("mo_static_matches_instance_short",  g_s_short.load()  == g_r_short.load()  + SBIAS);
+        ctx.check("mo_static_matches_instance_char",   g_s_char.load()   == g_r_char.load()   + SBIAS);
+        ctx.check("mo_static_matches_instance_string", g_s_string.load() == g_r_string.load() + SBIAS);
+        ctx.check("mo_static_matches_instance_integer",
+                  g_s_integer.load() == g_r_integer_registered.load() + SBIAS);
+        ctx.check("mo_static_matches_instance_arity0", g_s_noarg.load() == g_r_arity0.load() + SBIAS);
+        ctx.check("mo_static_matches_instance_arity2", g_s_arity2.load() == g_r_arity2.load() + SBIAS);
+        ctx.check("mo_static_matches_instance_int_double",
+                  g_s_int_double.load() == g_r_int_double.load() + SBIAS);
+        ctx.check("mo_static_matches_instance_long_double",
+                  g_s_long_double.load() == g_r_long_double.load() + SBIAS);
+        ctx.check("mo_static_matches_instance_int8", g_s_int8.load() == g_r_int8.load() + SBIAS);
+        // the alternate-type statics agree with their instance siblings too.
+        ctx.check("mo_static_matches_instance_cstr",   g_s_cstr.load()   == g_r_cstr.load()   + SBIAS);
+        ctx.check("mo_static_matches_instance_char16", g_s_char16.load() == g_r_char16.load() + SBIAS);
+        ctx.check("mo_static_matches_instance_uchar",  g_s_uchar.load()  == g_r_uchar.load()  + SBIAS);
+
+        // =====================================================================
+        //  DEEPENING: the STATIC narrow-integral set is mutually distinct — the
+        //  static mirror of the instance "no widening collapse" invariant (a
+        //  static byte/short/char must NEVER fall through to the wider int/long
+        //  static, exactly like the instance resolver).
+        // =====================================================================
+        ctx.check("mo_static_byte_short_char_int_long_no_widening_collapse",
+                  g_s_byte.load()  != g_s_short.load()
+                  && g_s_short.load() != g_s_char.load()
+                  && g_s_char.load()  != g_s_int.load()
+                  && g_s_int.load()   != g_s_long.load()
+                  && g_s_byte.load()  != g_s_int.load()
+                  && g_s_short.load() != g_s_int.load());
 
         // =====================================================================
         //  AMBIGUOUS unregistered-wrapper resolution — first-match-wins, no

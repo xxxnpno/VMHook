@@ -163,6 +163,26 @@ namespace
             const std::int32_t v = static_field("TYPED_SIZE")->get();
             return v;
         }
+        static auto get_observed_unicode_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedUnicodeSize")->get();
+            return v;
+        }
+        static auto get_unicode_size_const() -> std::int32_t
+        {
+            const std::int32_t v = static_field("UNICODE_SIZE")->get();
+            return v;
+        }
+        static auto get_observed_big_size() -> std::int32_t
+        {
+            const std::int32_t v = static_field("observedBigSize")->get();
+            return v;
+        }
+        static auto get_big_size_const() -> std::int32_t
+        {
+            const std::int32_t v = static_field("BIG_SIZE")->get();
+            return v;
+        }
 
         // ---- acquire the published SINGLETON instance wrapper ----
         static auto singleton() -> std::unique_ptr<llp> { return static_field("SINGLETON")->get(); }
@@ -254,6 +274,35 @@ namespace
                 return {};
             }
             return ll->to_vector<str_elem>();
+        }
+
+        // ---- the JVM type descriptor of an arbitrary field on this instance ----
+        // Lets the module assert a LinkedList field's signature is exactly
+        // "Ljava/util/LinkedList;" (the 'L' reference path value_t::to_vector and
+        // the unique_ptr<linked_list> conversion both require — FLAW B rejects a
+        // first-char != 'L' field).  Returns "" if the field does not resolve.
+        auto field_signature(const char* name) const -> std::string
+        {
+            const auto proxy{ this->get_field(name) };
+            if (!proxy.has_value())
+            {
+                return std::string{};
+            }
+            return std::string{ proxy->get().signature };
+        }
+
+        // ---- is_reference()/get_compressed_oop() of an arbitrary field ----
+        // The value_t carries the raw compressed OOP for a reference field; this
+        // surfaces it so the module can prove the field is a reference (not a
+        // primitive) and its compressed OOP decodes to the same list OOP.
+        auto field_compressed_oop(const char* name) const -> std::uint32_t
+        {
+            const auto proxy{ this->get_field(name) };
+            if (!proxy.has_value())
+            {
+                return 0u;
+            }
+            return static_cast<std::uint32_t>(proxy->get());
         }
 
         // ---- type-agnostic raw-OOP read of an arbitrary LinkedList field ----
@@ -1021,6 +1070,270 @@ VMHOOK_JVM_MODULE(collection_linked_list)
             const std::string tag{ o.field };
             ctx.check(tag + "_cascade_count_equals_java_size",
                       static_cast<std::int32_t>(vec.size()) == o.java_size);
+        }
+    }
+
+    // =====================================================================
+    //  22. FIELD-DESCRIPTOR / reference-shape proof (the 'L' path FLAW B fix).
+    //      value_t::to_vector and the unique_ptr<linked_list> conversion both
+    //      gate on the field signature's FIRST char being 'L' (a reference) — an
+    //      array field ('[') is rejected so it never yields a wild wrapper.  A
+    //      java.util.LinkedList field's descriptor is EXACTLY
+    //      "Ljava/util/LinkedList;", so it takes the reference path.  Assert that
+    //      exact descriptor and that its compressed OOP decodes to the SAME list
+    //      OOP the typed read produced — proving the proxy read the reference
+    //      slot, not a primitive's bytes.
+    // =====================================================================
+    {
+        const std::string sig{ inst->field_signature("words") };
+        ctx.check("words_signature_is_linkedlist_reference",
+                  sig == "Ljava/util/LinkedList;");
+        ctx.check("words_signature_first_char_is_L",
+                  !sig.empty() && sig.front() == 'L');
+
+        const std::uint32_t comp{ inst->field_compressed_oop("words") };
+        ctx.check("words_compressed_oop_nonzero", comp != 0u);
+        void* const decoded{ vmhook::hotspot::decode_oop_pointer(comp) };
+        ctx.check("words_compressed_oop_decodes_to_list_oop",
+                  decoded == list_oop
+                  && vmhook::hotspot::is_valid_pointer(decoded));
+
+        // Every LinkedList shape field carries the same reference descriptor.
+        const char* const sig_fields[]{
+            "emptyList", "singleList", "nullList", "dupList", "emptyStrList",
+            "manyList", "orderList", "unicodeList", "bigList" };
+        bool all_linkedlist_sig{ true };
+        for (const char* const f : sig_fields)
+        {
+            if (inst->field_signature(f) != "Ljava/util/LinkedList;")
+            {
+                all_linkedlist_sig = false;
+            }
+        }
+        ctx.check("all_string_shape_fields_are_linkedlist_reference",
+                  all_linkedlist_sig);
+    }
+
+    // =====================================================================
+    //  23. IDEMPOTENCY: re-reading the SAME list twice yields the SAME element
+    //      OOPs in the SAME order.  The Node-chain walk has no internal cursor
+    //      state, so two successive walks of `words` must produce element OOPs
+    //      that are pairwise IDENTICAL (same heap objects) and content-equal.
+    //      Guards against any hidden mutation / advancing-cursor bug across calls.
+    // =====================================================================
+    {
+        const auto a{ inst->words_via_value_to_vector() };
+        const auto b{ inst->words_via_value_to_vector() };
+        ctx.check("idempotent_same_size", a.size() == b.size() && a.size() == 3u);
+        if (a.size() == 3u && b.size() == 3u)
+        {
+            bool same_oops{ true };
+            bool same_content{ true };
+            for (std::size_t i{ 0 }; i < a.size(); ++i)
+            {
+                if (!a[i] || !b[i]
+                    || a[i]->get_instance() != b[i]->get_instance())
+                {
+                    same_oops = false;
+                }
+                if (slot_text(a[i]) != slot_text(b[i]))
+                {
+                    same_content = false;
+                }
+            }
+            ctx.check("idempotent_element_oops_identical", same_oops);
+            ctx.check("idempotent_element_content_identical", same_content);
+        }
+    }
+
+    // =====================================================================
+    //  24. UNICODE / EMBEDDED-NUL element content (read_java_string decode path).
+    //      The element-content path is JDK-version-sensitive (JDK8 char[] vs
+    //      JDK9+ compact-string byte[]+coder); read_java_string returns UTF-8 in
+    //      both cases, so the bytes must match REGARDLESS of JDK.  Asserts:
+    //        elem0 "café" (accented, LATIN1-incompatible -> UTF16 coder on 9+),
+    //        elem1 CJK "中文" (two 3-byte UTF-8 chars),
+    //        elem2 "a\0b"  (EMBEDDED NUL — decode must be LENGTH-driven, so the
+    //                       returned std::string has size 3, NOT truncated at NUL),
+    //        elem3 "z"     (plain ASCII / LATIN1 coder).
+    //      The embedded-NUL case is the key invariant: a NUL-terminated read would
+    //      return size 1 ("a"); a correct length-driven read returns size 3.
+    // =====================================================================
+    {
+        const std::int32_t uni_n{ llp::get_unicode_size_const() };
+        ctx.check("unicode_size_const_is_4", uni_n == 4);
+        ctx.check("unicode_java_observed_size_is_4",
+                  llp::get_observed_unicode_size() == 4);
+
+        // The exact UTF-8 byte sequences the JVM stores for the four elements.
+        const std::string e0{ "caf\xC3\xA9" };            // café
+        const std::string e1{ "\xE4\xB8\xAD\xE6\x96\x87" }; // 中文
+        const std::string e2{ std::string("a\0b", 3) };   // a<NUL>b  (length 3)
+        const std::string e3{ "z" };
+
+        const auto uv{ inst->via_value_to_vector("unicodeList") };
+        ctx.check("unicode_shape_size_is_4", uv.size() == 4u);
+        if (uv.size() == 4u)
+        {
+            bool all_live{ true };
+            for (const auto& e : uv)
+            {
+                if (!e || !vmhook::hotspot::is_valid_pointer(e->get_instance()))
+                {
+                    all_live = false;
+                }
+            }
+            ctx.check("unicode_all_elements_live", all_live);
+            if (all_live)
+            {
+                ctx.check("unicode_elem0_is_cafe_utf8", uv[0]->content() == e0);
+                ctx.check("unicode_elem1_is_cjk_utf8", uv[1]->content() == e1);
+                ctx.check("unicode_elem2_embedded_nul_len3",
+                          uv[2]->content().size() == 3u
+                          && uv[2]->content() == e2);
+                ctx.check("unicode_elem3_is_ascii_z", uv[3]->content() == e3);
+
+                // Byte-length spot checks (decoded UTF-8 widths) — these pin the
+                // multi-byte decode without relying on operator== alone.
+                ctx.check("unicode_elem0_utf8_len_is_5", uv[0]->content().size() == 5u);
+                ctx.check("unicode_elem1_utf8_len_is_6", uv[1]->content().size() == 6u);
+                ctx.check("unicode_elem3_utf8_len_is_1", uv[3]->content().size() == 1u);
+            }
+        }
+
+        // The same elements through the typed wrapper + direct walk must match.
+        const auto uw{ inst->via_linked_list_wrapper("unicodeList") };
+        ctx.check("unicode_wrapper_size_is_4", uw.size() == 4u);
+        if (uw.size() == 4u && uv.size() == 4u)
+        {
+            bool wrapper_matches{ true };
+            for (std::size_t i{ 0 }; i < uw.size(); ++i)
+            {
+                if (slot_text(uw[i]) != slot_text(uv[i]))
+                {
+                    wrapper_matches = false;
+                }
+            }
+            ctx.check("unicode_wrapper_matches_value_path", wrapper_matches);
+        }
+    }
+
+    // =====================================================================
+    //  25. LONG-CHAIN traversal (BIG_SIZE = 64 decimal-string elements 0..63).
+    //      A much longer chain than `words`/`manyList` so the first->next walk is
+    //      exercised over many links.  Proves order is preserved across the WHOLE
+    //      chain, every element decodes to its own DISTINCT String object, and the
+    //      cascade / wrapper / direct paths all agree on the long shape.
+    // =====================================================================
+    {
+        const std::int32_t big_n{ llp::get_big_size_const() };
+        ctx.check("big_size_const_is_64", big_n == 64);
+        ctx.check("big_java_observed_size_is_64", llp::get_observed_big_size() == 64);
+
+        std::vector<std::string> expected_big;
+        if (big_n > 0 && big_n <= 4096)
+        {
+            expected_big.reserve(static_cast<std::size_t>(big_n));
+            for (std::int32_t k{ 0 }; k < big_n; ++k)
+            {
+                expected_big.push_back(std::to_string(k));
+            }
+        }
+        check_shape_all_paths(ctx, *inst, "bigList", std::string{ "big" },
+                              expected_big, big_n);
+
+        // Whole-chain element-OOP distinctness: 64 distinct String objects, no
+        // two slots aliasing (a non-advancing `next` would re-emit one node).
+        const auto bv{ inst->raw_via_value_to_vector("bigList") };
+        check_raw_distinct(ctx, "big_raw", bv, big_n);
+
+        // Strict monotone content order over the whole chain (k-th == "k").
+        const auto bs{ inst->via_value_to_vector("bigList") };
+        ctx.check("big_shape_size_is_64",
+                  static_cast<std::int32_t>(bs.size()) == big_n);
+        if (static_cast<std::int32_t>(bs.size()) == big_n)
+        {
+            bool monotone{ true };
+            for (std::int32_t k{ 0 }; k < big_n; ++k)
+            {
+                if (slot_text(bs[static_cast<std::size_t>(k)]) != std::to_string(k))
+                {
+                    monotone = false;
+                }
+            }
+            ctx.check("big_chain_strict_decimal_order", monotone);
+        }
+    }
+
+    // =====================================================================
+    //  26. CROSS-SHAPE OOP NON-ALIASING: the distinct LinkedList field objects
+    //      decode to DISTINCT list OOPs (they are separate Java objects), and the
+    //      first Node of two different non-empty lists is never the same node.
+    //      Guards against a field-resolution bug that returned the same OOP for
+    //      different field names.
+    // =====================================================================
+    {
+        const char* const fields[]{
+            "words", "singleList", "nullList", "dupList", "emptyStrList",
+            "manyList", "orderList", "unicodeList", "bigList" };
+        std::vector<void*> oops;
+        for (const char* const f : fields)
+        {
+            void* const o{ inst->field_oop(f) };
+            if (o)
+            {
+                oops.push_back(o);
+            }
+        }
+        ctx.check("cross_shape_all_fields_decoded",
+                  oops.size() == (sizeof(fields) / sizeof(fields[0])));
+        bool all_distinct{ true };
+        for (std::size_t i{ 0 }; i < oops.size(); ++i)
+        {
+            for (std::size_t j{ i + 1 }; j < oops.size(); ++j)
+            {
+                if (oops[i] == oops[j])
+                {
+                    all_distinct = false;
+                }
+            }
+        }
+        ctx.check("cross_shape_list_oops_all_distinct", all_distinct);
+    }
+
+    // =====================================================================
+    //  27. CASCADE-vs-DIRECT element-OOP IDENTITY on a multi-element shape.
+    //      Sections above prove the three paths agree on COUNT and CONTENT; this
+    //      pins the cascade-dispatched read (collection::to_vector) and the direct
+    //      free-function walk to the SAME element OOPs on `dupList` (three
+    //      identical-content but distinct-object "dup" Strings) — so equal content
+    //      cannot mask a wrong-object read.  The three "dup" elements are distinct
+    //      String objects (each add() of the same literal interns to one constant
+    //      pool entry, so they may share — assert OOP identity BETWEEN paths, not
+    //      distinctness WITHIN a path, which dupList does not guarantee).
+    // =====================================================================
+    {
+        const auto casc{ inst->via_value_to_vector("dupList") };
+        void* const doop{ inst->field_oop("dupList") };
+        std::vector<std::unique_ptr<str_elem>> direct;
+        if (doop)
+        {
+            vmhook::linked_list_walk_items<str_elem>(doop, 3, direct);
+        }
+        ctx.check("dup_cascade_direct_same_size",
+                  casc.size() == direct.size() && casc.size() == 3u);
+        if (casc.size() == 3u && direct.size() == 3u)
+        {
+            bool same_oops{ true };
+            for (std::size_t i{ 0 }; i < casc.size(); ++i)
+            {
+                if (!casc[i] || !direct[i]
+                    || casc[i]->get_instance() != direct[i]->get_instance())
+                {
+                    same_oops = false;
+                }
+            }
+            ctx.check("dup_cascade_direct_element_oops_identical", same_oops);
         }
     }
 

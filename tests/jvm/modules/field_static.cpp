@@ -128,6 +128,78 @@ namespace
         static auto get_float(const char* name) -> float        { return static_field(name)->get(); }
         static auto get_double(const char* name) -> double      { return static_field(name)->get(); }
 
+        // ---- CROSS-WIDTH GET conversion readers: read a sub-int field at a
+        //      WIDER C++ type, exercising cast_for_variant's numeric arm
+        //      (static_cast<target_type>(stored_alt)).  A signed alternative
+        //      (int8/int16/int32) SIGN-extends; the char arm (uint16) ZERO-
+        //      extends.  The module elsewhere always reads at natural width, so
+        //      these are the only proofs of the extension semantics. ----
+        static auto get_as_i64(const char* name) -> std::int64_t  { const std::int64_t v = static_field(name)->get(); return v; }
+        static auto get_as_i32(const char* name) -> std::int32_t  { const std::int32_t v = static_field(name)->get(); return v; }
+        static auto get_as_double(const char* name) -> double      { const double v = static_field(name)->get(); return v; }
+        static auto get_as_u32(const char* name) -> std::uint32_t  { const std::uint32_t v = static_field(name)->get(); return v; }
+
+        // ---- read a static PRIMITIVE int[] field's elements through the value_t
+        //      vector conversion arm (read_array_value).  count == array_length()
+        //      is the cross-check; an element-width-mismatched request returns
+        //      empty (the read-side guard, symmetric with set's width guard). ----
+        static auto get_int_vector(const char* name) -> std::vector<std::int32_t>
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            std::vector<std::int32_t> v = proxy->get();
+            return v;
+        }
+        static auto get_int_vector_as_i64(const char* name) -> std::vector<std::int64_t>
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            std::vector<std::int64_t> v = proxy->get();   // [I -> vector<int64_t>: width mismatch -> empty
+            return v;
+        }
+        static auto get_str_vector(const char* name) -> std::vector<std::string>
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return {};
+            }
+            std::vector<std::string> v = proxy->get();
+            return v;
+        }
+
+        // ---- PRIMITIVE-GUARD probes for the non-primitive set() arms.  Writing a
+        //      std::vector / std::unique_ptr<wrapper> into a PRIMITIVE static slot
+        //      must be REFUSED by field_proxy::set (the same guard the string arm
+        //      hits), leaving the field byte-for-byte unchanged.  Each returns
+        //      false on an unresolved field so the call site stays a clean check. ----
+        static auto set_int_vector(const char* name, const std::vector<std::int32_t>& v) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return false;
+            }
+            proxy->set(v);   // vector arm; into a primitive field -> refused
+            return true;
+        }
+        static auto set_ref_into(const char* name, const std::unique_ptr<fs>& target) -> bool
+        {
+            const auto proxy{ static_field(name) };
+            if (!proxy.has_value())
+            {
+                return false;
+            }
+            proxy->set(target);   // unique_ptr arm; into a primitive field -> refused
+            return true;
+        }
+
         // ---- the field's value as a std::string via value_t::as_string() (the
         //      explicit-intent extraction).  For a reference/String field this
         //      decodes the OOP through read_java_string; for ANY primitive field
@@ -1474,6 +1546,194 @@ namespace
                 ctx.check("two_proxies_agree_latest", v2 == 0x600DC0DE);
             }
         }
+    }
+
+    // =====================================================================
+    //  20. CROSS-WIDTH GET CONVERSION (sign / zero extension).  Every read
+    //      above extracts a field at its NATURAL C++ width; this phase reads a
+    //      sub-int field through cast_for_variant's numeric arm
+    //      (static_cast<wider>(stored_alternative)) at a WIDER target type and
+    //      pins the extension semantics:
+    //        * a SIGNED alternative (int8 "B", int16 "S", int32 "I") SIGN-
+    //          extends when widened (a negative value stays negative);
+    //        * the CHAR alternative (uint16 "C") ZERO-extends (0xFFFF -> the
+    //          positive 0x0000FFFF, never the sign-extended -1).
+    //      This is the single distinguishing proof that the variant stores a
+    //      char as unsigned and a byte/short as signed.
+    // =====================================================================
+    {
+        // ---- byte field gBMin (-128) read as the wider int64/int32: SIGN-extend.
+        ctx.check("xwidth_gBMin_as_i64", fs::get_as_i64("gBMin") == static_cast<std::int64_t>(-128));
+        ctx.check("xwidth_gBMin_as_i32", fs::get_as_i32("gBMin") == static_cast<std::int32_t>(-128));
+        ctx.check("xwidth_gBNegOne_as_i64", fs::get_as_i64("gBNegOne") == static_cast<std::int64_t>(-1));
+        // ---- short field gSMin read as int64: SIGN-extend.
+        ctx.check("xwidth_gSMin_as_i64", fs::get_as_i64("gSMin") == static_cast<std::int64_t>(std::numeric_limits<std::int16_t>::min()));
+        ctx.check("xwidth_gSNegOne_as_i64", fs::get_as_i64("gSNegOne") == static_cast<std::int64_t>(-1));
+        // ---- int field gINegOne / gIMin read as int64: SIGN-extend.
+        ctx.check("xwidth_gINegOne_as_i64", fs::get_as_i64("gINegOne") == static_cast<std::int64_t>(-1));
+        ctx.check("xwidth_gIMin_as_i64", fs::get_as_i64("gIMin") == static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()));
+        // ---- char field gCMax (0xFFFF) read as the wider int32/int64: ZERO-extend.
+        //      The CRITICAL disambiguation: char widens to the POSITIVE 0x0000FFFF,
+        //      NOT the sign-extended 0xFFFFFFFF (-1) a signed alt would yield.
+        ctx.check("xwidth_gCMax_as_i32_zero_ext", fs::get_as_i32("gCMax") == static_cast<std::int32_t>(0x0000FFFF));
+        ctx.check("xwidth_gCMax_as_i64_zero_ext", fs::get_as_i64("gCMax") == static_cast<std::int64_t>(0x000000000000FFFFLL));
+        ctx.check("xwidth_gCA_as_i32", fs::get_as_i32("gCA") == 0x0041);
+        // ---- positive byte/short widen identically signed (0/1 corners).
+        ctx.check("xwidth_gBOne_as_i64", fs::get_as_i64("gBOne") == 1);
+        ctx.check("xwidth_gSOne_as_i64", fs::get_as_i64("gSOne") == 1);
+        ctx.check("xwidth_gIOne_as_i64", fs::get_as_i64("gIOne") == 1);
+        // ---- a long field read at its natural width through the wide reader (no
+        //      truncation: int64 -> int64 is identity, incl. the MIN/MAX corners).
+        ctx.check("xwidth_gJMin_as_i64", fs::get_as_i64("gJMin") == std::numeric_limits<std::int64_t>::min());
+        ctx.check("xwidth_gJMax_as_i64", fs::get_as_i64("gJMax") == std::numeric_limits<std::int64_t>::max());
+        // ---- an int field read as DOUBLE: cast_for_variant's static_cast widens
+        //      int32 -> double exactly (a small int is representable).  gIOne == 1.0.
+        ctx.check("xwidth_gIOne_as_double", double_bits(fs::get_as_double("gIOne")) == 0x3FF0000000000000ULL);
+        ctx.check("xwidth_gIZero_as_double", double_bits(fs::get_as_double("gIZero")) == 0x0000000000000000ULL);
+        ctx.record("[INFO] field_static: cross-width GET goes through "
+                   "cast_for_variant's static_cast<target>(stored_alt): a byte/short/"
+                   "int alternative SIGN-extends when widened, while the char "
+                   "alternative (uint16) ZERO-extends (0xFFFF -> 0x0000FFFF, never "
+                   "-1).  This pins that the variant stores char unsigned and the "
+                   "signed integrals signed (vmhook.hpp ~15360).");
+    }
+
+    // =====================================================================
+    //  21. NON-PRIMITIVE set() ARMS REFUSED ON A PRIMITIVE FIELD.  The size
+    //      guard (phase 3) covered the std::string arm; here the OTHER two
+    //      non-primitive arms -- std::vector and std::unique_ptr<wrapper> --
+    //      must ALSO be refused on a primitive slot (they would otherwise walk
+    //      set_prim_array / write a compressed OOP over the int's bytes, the
+    //      wild-heap hazard the guard at vmhook.hpp ~15689 closes).  guardInt is
+    //      restored to 0x11223344 by phase 3; assert it is byte-for-byte intact.
+    // =====================================================================
+    {
+        ctx.check("guard_int_pre_nonprim", fs::get_int("guardInt") == 0x11223344);
+        // (a) set(std::vector<int>) into an "I" field -> non-primitive -> refused.
+        ctx.check("guard_int_vector_set_resolved",
+                  fs::set_int_vector("guardInt", std::vector<std::int32_t>{ 1, 2, 3 }));
+        ctx.check("guard_int_vector_refused", fs::get_int("guardInt") == 0x11223344);
+        // (b) set(std::unique_ptr<wrapper>) into an "I" field -> non-primitive ->
+        //     refused.  Use a live objA wrapper so the unique_ptr is non-empty (a
+        //     genuine reference store attempt, not a null no-op).
+        {
+            const auto objA{ fs::acquire("objA") };
+            ctx.check("guard_int_ref_objA_acquired", objA != nullptr);
+            ctx.check("guard_int_ref_set_resolved", fs::set_ref_into("guardInt", objA));
+            ctx.check("guard_int_ref_refused", fs::get_int("guardInt") == 0x11223344);
+        }
+        // (c) the same two arms into a "J" field leave it intact too (8-byte slot).
+        ctx.check("guard_long_pre_nonprim", fs::get_long("guardLong") == 0x1122334455667788LL);
+        fs::set_int_vector("guardLong", std::vector<std::int32_t>{ 9 });
+        ctx.check("guard_long_vector_refused", fs::get_long("guardLong") == 0x1122334455667788LL);
+        // (d) and into a "C" field (2-byte) -- the vector/ref arms must not engage
+        //     the char-widening shortcut path either.  guardChar holds 0x00E9.
+        ctx.check("guard_char_pre_nonprim", fs::get_char("guardChar") == 0x00E9);
+        fs::set_int_vector("guardChar", std::vector<std::int32_t>{ 7 });
+        ctx.check("guard_char_vector_refused", fs::get_char("guardChar") == 0x00E9);
+        ctx.record("[INFO] field_static: field_proxy::set refuses ALL three "
+                   "non-primitive arms (std::string, std::vector, "
+                   "std::unique_ptr<wrapper>) on a primitive field via "
+                   "jvm_primitive_byte_width(sig) != 0 (vmhook.hpp ~15689); the "
+                   "primitive slot is left byte-for-byte unchanged rather than "
+                   "reinterpreting its bytes as a compressed OOP / array header.");
+    }
+
+    // =====================================================================
+    //  22. STATIC PRIMITIVE-ARRAY ELEMENT DECODE through the value_t vector arm.
+    //      A static "[I" / "[Ljava/lang/String;" field read into a
+    //      std::vector<T> goes through read_array_value: count == array_length()
+    //      (count-vs-size cross-check) and the elements match the fixture.  A
+    //      width-MISMATCHED request ([I -> vector<int64_t>) hits the read-side
+    //      element-width guard and returns EMPTY (symmetric with set's guard).
+    //      This is the field_static angle on element reads (whole-field vector
+    //      decode), distinct from field_arrays_*'s per-element get/set.
+    //      NOTE: runs BEFORE phase 16 replaces/nulls sIntArr, so sIntArr still
+    //      holds its <clinit> value {10,20,30}.
+    // =====================================================================
+    {
+        // ---- int[] elements: count == array_length, values == {10,20,30}. ----
+        const std::int32_t int_len{ fs::array_len("sIntArr") };
+        ctx.check("fstat_vecarr_int_len_3", int_len == 3);
+        const std::vector<std::int32_t> ints{ fs::get_int_vector("sIntArr") };
+        ctx.check("fstat_vecarr_int_count_eq_len",
+                  static_cast<std::int32_t>(ints.size()) == int_len);
+        ctx.check("fstat_vecarr_int_values",
+                  ints.size() == 3 && ints[0] == 10 && ints[1] == 20 && ints[2] == 30);
+        // ---- a width-MISMATCHED request ([I -> vector<int64_t>) returns EMPTY
+        //      (the read-side element-width guard at vmhook.hpp ~15027), NOT a
+        //      mis-strided over-read.  The clean field_static proof of that guard.
+        const std::vector<std::int64_t> wide{ fs::get_int_vector_as_i64("sIntArr") };
+        ctx.check("fstat_vecarr_int_width_mismatch_empty", wide.empty());
+        // ---- String[] elements: count == array_length, values == {"x","y"}. ----
+        const std::int32_t str_len{ fs::array_len("sStrArr") };
+        ctx.check("fstat_vecarr_str_len_2", str_len == 2);
+        const std::vector<std::string> strs{ fs::get_str_vector("sStrArr") };
+        ctx.check("fstat_vecarr_str_count_eq_len",
+                  static_cast<std::int32_t>(strs.size()) == str_len);
+        ctx.check("fstat_vecarr_str_values",
+                  strs.size() == 2 && strs[0] == "x" && strs[1] == "y");
+        // ---- a NULL static array decoded to a vector is EMPTY (no crash). ----
+        const std::vector<std::int32_t> nullvec{ fs::get_int_vector("sNullArr") };
+        ctx.check("fstat_vecarr_null_empty", nullvec.empty());
+        ctx.record("[INFO] field_static: a static primitive/String array field read "
+                   "into a std::vector<T> goes through value_t::read_array_value -- "
+                   "count agrees with array_length(), a width-mismatched element type "
+                   "is refused to EMPTY (not an over-read), and a null array yields an "
+                   "empty vector.  Whole-field vector decode; per-element get/set is "
+                   "field_arrays_*'s domain.");
+    }
+
+    // =====================================================================
+    //  23. SAME-WIDTH cross-TYPE primitive writes (the size guard is size-based,
+    //      not type-based -- characterized on guardLong/guardInt without
+    //      disturbing the phase-7/8 witnesses).  These prove the documented
+    //      contract that matching-width raw bits land for ANY trivially-copyable
+    //      same-width type, then restore the field exactly.
+    // =====================================================================
+    {
+        // (a) set(double bits) into a "J" field is same-width (8B==8B) -> writes
+        //     raw; the bits read back as the long pattern.  guardLong is restored.
+        const std::int64_t saved_long{ fs::get_long("guardLong") };
+        ctx.check("samewidth_guardLong_saved", saved_long == 0x1122334455667788LL);
+        fs::set_value<double>("guardLong", 1.0);   // 0x3FF0000000000000
+        ctx.check("samewidth_double_into_long_writes_raw",
+                  static_cast<std::uint64_t>(fs::get_long("guardLong")) == 0x3FF0000000000000ULL);
+        fs::set_value<std::int64_t>("guardLong", saved_long);   // restore
+        ctx.check("samewidth_guardLong_restored", fs::get_long("guardLong") == 0x1122334455667788LL);
+        // (b) set(float bits) into an "I" field is same-width (4B==4B) -> writes
+        //     raw; the bits read back as the int pattern.  guardInt restored.
+        const std::int32_t saved_int{ fs::get_int("guardInt") };
+        ctx.check("samewidth_guardInt_saved", saved_int == 0x11223344);
+        fs::set_value<float>("guardInt", 2.0f);   // 0x40000000
+        ctx.check("samewidth_float_into_int_writes_raw",
+                  static_cast<std::uint32_t>(fs::get_int("guardInt")) == 0x40000000u);
+        fs::set_value<std::int32_t>("guardInt", saved_int);   // restore
+        ctx.check("samewidth_guardInt_restored", fs::get_int("guardInt") == 0x11223344);
+    }
+
+    // =====================================================================
+    //  24. BOOLEAN write semantics + the bool/byte same-width family.  A "Z"
+    //      field is 1 byte; set(bool) lands a clean 0/1.  set(bool) into a "B"
+    //      field (also 1 byte) is same-width so it is NOT refused -- the raw
+    //      0/1 byte lands (size-based guard).  Restores the targets.
+    // =====================================================================
+    {
+        // set(bool true/false) on a "Z" field round-trips the boolean exactly.
+        ctx.check("bool_set_true_resolved", fs::set_value<bool>("setZ", true));
+        ctx.check("bool_set_true_reads_true", fs::get_bool("setZ") == true);
+        ctx.check("bool_set_false_resolved", fs::set_value<bool>("setZ", false));
+        ctx.check("bool_set_false_reads_false", fs::get_bool("setZ") == false);
+        // restore setZ to true (the value phase-7/8 snapshot expects).
+        ctx.check("bool_set_restore_true", fs::set_value<bool>("setZ", true));
+        ctx.check("bool_restore_reads_true", fs::get_bool("setZ") == true);
+        // set(bool) into a "B" field is same-width (1B==1B) -> NOT refused; the
+        // raw 0x01 byte lands and reads back as 1.  Use setBZero (native 0) then
+        // restore it to 0 for phase 8b's getBZero==0 expectation.
+        fs::set_value<bool>("setBZero", true);
+        ctx.check("bool_into_byte_same_width_writes_one", fs::get_byte("setBZero") == 1);
+        fs::set_value<std::int8_t>("setBZero", 0);   // restore phase-8b expectation
+        ctx.check("bool_into_byte_restored_zero", fs::get_byte("setBZero") == 0);
     }
 
     // #####################################################################

@@ -371,6 +371,41 @@ namespace
         static auto sWOctaDf() -> std::int32_t  { return static_field("sWOctaDf")->get(); }
         static auto sWOctaDg() -> std::int32_t  { return static_field("sWOctaDg")->get(); }
         static auto sWOctaDh() -> std::uint64_t { return d2bits_field("sWOctaDh"); }
+        // SUB-INT NEIGHBOUR witnesses.  byte -> int8_t, short -> int16_t, char ->
+        // uint16_t (zero-extended UTF-16 code unit), boolean -> bool.  Read back at
+        // their native widths so the extension semantics are preserved exactly (a
+        // sign-extend bug on a byte/short, or a stray high bit on a char, fails).
+        static auto wBalLong() -> std::int64_t { return static_field("wBalLong")->get(); }
+        static auto wBalByte() -> std::int8_t  { return static_field("wBalByte")->get(); }
+        static auto wSalLong()  -> std::int64_t { return static_field("wSalLong")->get(); }
+        static auto wSalShort() -> std::int16_t { return static_field("wSalShort")->get(); }
+        static auto wCalLong() -> std::int64_t  { return static_field("wCalLong")->get(); }
+        static auto wCalChar() -> std::uint16_t { return static_field("wCalChar")->get(); }
+        static auto wZalLong() -> std::int64_t { return static_field("wZalLong")->get(); }
+        static auto wZalBool() -> bool         { return static_field("wZalBool")->get(); }
+        static auto wCadDouble() -> std::uint64_t { return d2bits_field("wCadDouble"); }
+        static auto wCadChar()   -> std::uint16_t { return static_field("wCadChar")->get(); }
+        static auto wSadDouble() -> std::uint64_t { return d2bits_field("wSadDouble"); }
+        static auto wSadShort()  -> std::int16_t  { return static_field("wSadShort")->get(); }
+        static auto wBscB() -> std::int8_t  { return static_field("wBscB")->get(); }
+        static auto wBscL() -> std::int64_t { return static_field("wBscL")->get(); }
+        static auto wBscS() -> std::int16_t { return static_field("wBscS")->get(); }
+        static auto wZdcZ() -> bool         { return static_field("wZdcZ")->get(); }
+        static auto wZdcD() -> std::uint64_t { return d2bits_field("wZdcD"); }
+        static auto wZdcC() -> std::uint16_t { return static_field("wZdcC")->get(); }
+        static auto wClChar() -> std::uint16_t { return static_field("wClChar")->get(); }
+        static auto wClLong() -> std::int64_t  { return static_field("wClLong")->get(); }
+        static auto wBldcsB() -> std::int8_t   { return static_field("wBldcsB")->get(); }
+        static auto wBldcsL() -> std::int64_t  { return static_field("wBldcsL")->get(); }
+        static auto wBldcsD() -> std::uint64_t { return d2bits_field("wBldcsD"); }
+        static auto wBldcsC() -> std::uint16_t { return static_field("wBldcsC")->get(); }
+        static auto wBldcsS() -> std::int16_t  { return static_field("wBldcsS")->get(); }
+        static auto sWBalLong() -> std::int64_t { return static_field("sWBalLong")->get(); }
+        static auto sWBalByte() -> std::int8_t  { return static_field("sWBalByte")->get(); }
+        static auto sWCadDouble() -> std::uint64_t { return d2bits_field("sWCadDouble"); }
+        static auto sWCadChar()   -> std::uint16_t { return static_field("sWCadChar")->get(); }
+        static auto sWClChar() -> std::uint16_t { return static_field("sWClChar")->get(); }
+        static auto sWClLong() -> std::int64_t  { return static_field("sWClLong")->get(); }
     };
 
     // ---------------------------------------------------------------------
@@ -984,6 +1019,187 @@ namespace
         put(key, r);
     }
 
+    // ---- SUB-INT NEIGHBOUR capture helpers -----------------------------------
+    // Each returns the narrow value through value_t's int64 conversion (a byte /
+    // short widens with its sign, a char / boolean as an unsigned/0-1 small int);
+    // r.ival therefore holds the EXACT narrow value the callee returned, which is
+    // the same value it received (these methods just echo it).  The dedicated
+    // witness fields independently pin both the wide arg and the narrow neighbour.
+
+    // Instance, returns byte, (long,byte).
+    auto cap_byteAfterLong(const wide& self, const std::string& key,
+                           std::int64_t a, std::int8_t b) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("byteAfterLong") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns short, (long,short).
+    auto cap_shortAfterLong(const wide& self, const std::string& key,
+                            std::int64_t a, std::int16_t b) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("shortAfterLong") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns char, (long,char).  char passed/read as uint16_t.
+    auto cap_charAfterLong(const wide& self, const std::string& key,
+                           std::int64_t a, std::uint16_t b) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("charAfterLong") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns boolean, (long,boolean).
+    auto cap_boolAfterLong(const wide& self, const std::string& key,
+                           std::int64_t a, bool b) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("boolAfterLong") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns char, (double,char).
+    auto cap_charAfterDouble(const wide& self, const std::string& key,
+                             double a, std::uint16_t b) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("charAfterDouble") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns short, (double,short).
+    auto cap_shortAfterDouble(const wide& self, const std::string& key,
+                              double a, std::int16_t b) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("shortAfterDouble") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns long, (byte,long,short) — wide in the middle, B/S flanks.
+    auto cap_mixBSC(const wide& self, const std::string& key,
+                    std::int8_t a, std::int64_t b, std::int16_t c) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("mixBSC") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (boolean,double,char) — wide double in the middle.
+    auto cap_mixZDC(const wide& self, const std::string& key,
+                    bool a, double b, std::uint16_t c) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("mixZDC") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns long, (char,long) — leading char then wide long.
+    auto cap_charLong(const wide& self, const std::string& key,
+                      std::uint16_t a, std::int64_t b) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("charLong") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Instance, returns double, (byte,long,double,char,short) — all sub-int kinds
+    // interleaved around both wide kinds.
+    auto cap_bldcs(const wide& self, const std::string& key,
+                   std::int8_t a, std::int64_t b, double c,
+                   std::uint16_t d, std::int16_t e) -> void
+    {
+        probe_result r{};
+        auto px{ self.get_method("bldcs") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b, c, d, e);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            const double got = v;
+            r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
     // ---- STATIC capture helpers (no receiver) --------------------------------
     auto scap_long2(const std::string& key, const char* name,
                     std::int64_t a, std::int64_t b) -> void
@@ -1261,6 +1477,57 @@ namespace
             r.dispatched = !v.is_void();
             const double got = v;
             r.dbits      = d2bits(got);
+        }
+        put(key, r);
+    }
+
+    // Static, returns byte, (long,byte) — long at slot 0, byte at slot 2.
+    auto scap_byteAfterLong(const std::string& key,
+                            std::int64_t a, std::int8_t b) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sByteAfterLong") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Static, returns char, (double,char) — double at slot 0, char at slot 2.
+    auto scap_charAfterDouble(const std::string& key,
+                              double a, std::uint16_t b) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sCharAfterDouble") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Static, returns long, (char,long) — char at slot 0, long at slots 1..2.
+    auto scap_charLong(const std::string& key,
+                       std::uint16_t a, std::int64_t b) -> void
+    {
+        probe_result r{};
+        auto px{ wide::static_method("sCharLong") };
+        if (px.has_value())
+        {
+            r.resolved = true;
+            const vmhook::method_proxy::value_t v = px->call(a, b);
+            r.is_void    = v.is_void();
+            r.dispatched = !v.is_void();
+            r.ival       = static_cast<std::int64_t>(v);
         }
         put(key, r);
     }
@@ -1695,6 +1962,74 @@ namespace
                   static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
 
         // ============================================================
+        //  SUB-INT NEIGHBOURS OF A WIDE ARG (byte/short/char/boolean).  Each
+        //  sub-int is one slot like int but with a DIFFERENT descriptor and
+        //  extension rule; the existing int-flank shapes only exercise 'I'.  We
+        //  run two flavours per kind: the BOUNDARY value (MIN/MAX/-1/all-ones-as-
+        //  char) first, then the *_main value last so the LAST-call witnesses are
+        //  the ones the body asserts.  The leading wide arg uses a both-halves-set
+        //  pattern (worst case for a high-bits leak into the adjacent narrow).
+        // ============================================================
+        // byte after long — boundary (-128) then main (-1 == 0xFF as byte).
+        cap_byteAfterLong(s, "bal_min",
+                          static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL),
+                          std::numeric_limits<std::int8_t>::min());     // -128
+        cap_byteAfterLong(s, "bal_main",
+                          static_cast<std::int64_t>(0xFFFFFFFF00000000ULL), // high-half-only
+                          static_cast<std::int8_t>(-1));                // 0xFF
+        // short after long — boundary (SHRT_MIN) then main (-1).
+        cap_shortAfterLong(s, "sal_min",
+                           static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL),
+                           std::numeric_limits<std::int16_t>::min());   // -32768
+        cap_shortAfterLong(s, "sal_main",
+                           static_cast<std::int64_t>(0xFFFFFFFF00000000ULL),
+                           static_cast<std::int16_t>(-1));              // 0xFFFF
+        // char after long — boundary (0xFFFF, the max code unit; a sign-extend bug
+        // would turn it into -1) then main (a CJK code point U+4E2D).
+        cap_charAfterLong(s, "cal_max",
+                          static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL),
+                          static_cast<std::uint16_t>(0xFFFF));
+        cap_charAfterLong(s, "cal_main",
+                          static_cast<std::int64_t>(0xFFFFFFFF00000000ULL),
+                          static_cast<std::uint16_t>(0x4E2D));          // CJK 'zhong'
+        // boolean after long — false then true.
+        cap_boolAfterLong(s, "zal_false",
+                          static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL), false);
+        cap_boolAfterLong(s, "zal_main",
+                          static_cast<std::int64_t>(0xFFFFFFFF00000000ULL), true);
+        // char after double — boundary (0xFFFF) then main (U+00FF, the byte/char
+        // boundary; a sign-or-byte-truncation bug would corrupt the high zero byte).
+        cap_charAfterDouble(s, "cad_max", bits2d(0x7FEFFFFFFFFFFFFFULL), // MAX_VALUE
+                            static_cast<std::uint16_t>(0xFFFF));
+        cap_charAfterDouble(s, "cad_main", bits2d(0x400921FB54442D18ULL), // PI
+                            static_cast<std::uint16_t>(0x00FF));
+        // short after double — boundary (SHRT_MAX) then main (-12345).
+        cap_shortAfterDouble(s, "sad_max", bits2d(0x8000000000000000ULL), // -0.0
+                             std::numeric_limits<std::int16_t>::max());  // 32767
+        cap_shortAfterDouble(s, "sad_main", bits2d(0x400921FB54442D18ULL), // PI
+                             static_cast<std::int16_t>(-12345));
+        // wide long flanked by byte+short (both sign-extended); high-half-only long.
+        cap_mixBSC(s, "mixBSC_main",
+                   static_cast<std::int8_t>(-100),
+                   static_cast<std::int64_t>(0xFFFFFFFF00000000ULL),
+                   static_cast<std::int16_t>(-30000));
+        // wide double flanked by boolean+char.
+        cap_mixZDC(s, "mixZDC_main", true,
+                   bits2d(0x400921FB54442D18ULL),                       // PI
+                   static_cast<std::uint16_t>(0xBEEF));
+        // leading char then wide long — long must start one slot after the char.
+        cap_charLong(s, "charLong_main",
+                     static_cast<std::uint16_t>(0x4E2D),                 // CJK char
+                     static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL));
+        // every sub-int kind interleaved around both wide kinds.
+        cap_bldcs(s, "bldcs_main",
+                  static_cast<std::int8_t>(-7),
+                  static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL),
+                  bits2d(0x400921FB54442D18ULL),                        // PI
+                  static_cast<std::uint16_t>(0xABCD),
+                  static_cast<std::int16_t>(0x1234));
+
+        // ============================================================
         //  STATIC variants (no receiver; first wide arg at slot 0).
         // ============================================================
         scap_long2("s_addL_min_max", "sAddL",
@@ -1754,6 +2089,15 @@ namespace
         scap_octaD("s_octaD",
                    1, 2, 3, 4, 5, 6, std::numeric_limits<std::int32_t>::max(),
                    bits2d(0x400921FB54442D18ULL));                    // PI as 8th
+        // STATIC sub-int neighbour variants (no receiver; first arg at slot 0).
+        scap_byteAfterLong("s_bal",
+                           static_cast<std::int64_t>(0xFFFFFFFF00000000ULL),
+                           static_cast<std::int8_t>(-1));              // 0xFF
+        scap_charAfterDouble("s_cad", bits2d(0x400921FB54442D18ULL),   // PI
+                             static_cast<std::uint16_t>(0x4E2D));      // CJK char
+        scap_charLong("s_charLong",
+                      static_cast<std::uint16_t>(0xFFFF),              // max code unit
+                      std::numeric_limits<std::int64_t>::min());
     }
 
     // The entire test body, factored out so the VMHOOK_JVM_MODULE wrapper can run
@@ -2636,6 +2980,156 @@ namespace
         }
 
         // =====================================================================
+        //  SUB-INT NEIGHBOURS OF A WIDE ARG (byte/short/char/boolean).  These are
+        //  the descriptor kinds the existing 'I'/'F' flank methods never touch.  A
+        //  sub-int is one interpreter slot, but byte/short are SIGN-extended into
+        //  it, a char is ZERO-extended, and a boolean is 0/1 — so a wide arg whose
+        //  high word leaked into the adjacent narrow slot would corrupt the value
+        //  WITH ITS EXTENSION RULE.  Each typed return equals the value passed (the
+        //  methods echo), and the witnesses pin the wide arg AND the narrow exactly.
+        // =====================================================================
+        {
+            // byte after long: -1 (0xFF) must NOT pick up the long's high bits; the
+            // return is a signed byte (-1) and the witness equals -1 exactly.
+            const std::int8_t  b{ static_cast<std::int8_t>(-1) };
+            const std::int64_t a{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const probe_result r{ got("bal_main") };
+            ctx.check("bal_main_resolved", r.resolved);
+            ctx.check("bal_main_not_void", r.dispatched);
+            ctx.check("bal_main_return_is_byte", r.ival == static_cast<std::int64_t>(b));
+            ctx.check("bal_main_witness_long_exact", wide::wBalLong() == a);
+            ctx.check("bal_main_witness_byte_intact_after_wide", wide::wBalByte() == b);
+            // The boundary call (-128) returned the sign-extended minimum.
+            const probe_result rm{ got("bal_min") };
+            ctx.check("bal_min_return_is_byte",
+                      rm.ival == static_cast<std::int64_t>(std::numeric_limits<std::int8_t>::min()));
+        }
+        {
+            // short after long: -1 (0xFFFF), sign-extended.
+            const std::int16_t b{ static_cast<std::int16_t>(-1) };
+            const std::int64_t a{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const probe_result r{ got("sal_main") };
+            ctx.check("sal_main_resolved", r.resolved);
+            ctx.check("sal_main_return_is_short", r.ival == static_cast<std::int64_t>(b));
+            ctx.check("sal_main_witness_long_exact", wide::wSalLong() == a);
+            ctx.check("sal_main_witness_short_intact_after_wide", wide::wSalShort() == b);
+            const probe_result rm{ got("sal_min") };
+            ctx.check("sal_min_return_is_short",
+                      rm.ival == static_cast<std::int64_t>(std::numeric_limits<std::int16_t>::min()));
+        }
+        {
+            // char after long: a char is ZERO-extended, so 0x4E2D round-trips as a
+            // positive small int (NOT sign-extended like a short would be).
+            const std::uint16_t b{ 0x4E2D };
+            const std::int64_t  a{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const probe_result r{ got("cal_main") };
+            ctx.check("cal_main_resolved", r.resolved);
+            ctx.check("cal_main_return_is_char", r.ival == static_cast<std::int64_t>(b));
+            ctx.check("cal_main_witness_long_exact", wide::wCalLong() == a);
+            ctx.check("cal_main_witness_char_intact_after_wide", wide::wCalChar() == b);
+            // The 0xFFFF boundary: a char zero-extends to 65535, NOT -1 (a sign-
+            // extend bug on the 'C' slot would return -1 here).
+            const probe_result rmax{ got("cal_max") };
+            ctx.check("cal_max_return_is_unsigned_65535", rmax.ival == 0xFFFF);
+        }
+        {
+            // boolean after long: true round-trips as 1, false as 0.
+            const std::int64_t a{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const probe_result r{ got("zal_main") };
+            ctx.check("zal_main_resolved", r.resolved);
+            ctx.check("zal_main_return_is_true", r.ival == 1);
+            ctx.check("zal_main_witness_long_exact", wide::wZalLong() == a);
+            ctx.check("zal_main_witness_bool_true", wide::wZalBool() == true);
+            const probe_result rf{ got("zal_false") };
+            ctx.check("zal_false_return_is_false", rf.ival == 0);
+        }
+        {
+            // char after double: 0x00FF zero-extends; the double must not corrupt it.
+            const std::uint16_t b{ 0x00FF };
+            const probe_result r{ got("cad_main") };
+            ctx.check("cad_main_resolved", r.resolved);
+            ctx.check("cad_main_return_is_char", r.ival == static_cast<std::int64_t>(b));
+            ctx.check("cad_main_witness_double_bits", wide::wCadDouble() == 0x400921FB54442D18ULL);
+            ctx.check("cad_main_witness_char_intact_after_double", wide::wCadChar() == b);
+            const probe_result rmax{ got("cad_max") };
+            ctx.check("cad_max_return_is_unsigned_65535", rmax.ival == 0xFFFF);
+        }
+        {
+            // short after double: -12345 sign-extends; double bit-exact beside it.
+            const std::int16_t b{ static_cast<std::int16_t>(-12345) };
+            const probe_result r{ got("sad_main") };
+            ctx.check("sad_main_resolved", r.resolved);
+            ctx.check("sad_main_return_is_short", r.ival == static_cast<std::int64_t>(b));
+            ctx.check("sad_main_witness_double_bits", wide::wSadDouble() == 0x400921FB54442D18ULL);
+            ctx.check("sad_main_witness_short_intact_after_double", wide::wSadShort() == b);
+            const probe_result rmax{ got("sad_max") };
+            ctx.check("sad_max_return_is_short",
+                      rmax.ival == static_cast<std::int64_t>(std::numeric_limits<std::int16_t>::max()));
+        }
+        {
+            // wide long flanked by a byte and a short, both sign-extended kinds.
+            const std::int8_t  a{ static_cast<std::int8_t>(-100) };
+            const std::int64_t b{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const std::int16_t c{ static_cast<std::int16_t>(-30000) };
+            const probe_result r{ got("mixBSC_main") };
+            ctx.check("mixBSC_main_resolved", r.resolved);
+            ctx.check("mixBSC_main_not_void", r.dispatched);
+            ctx.check("mixBSC_main_return",
+                      r.ival == jadd(jadd(jmul(static_cast<std::int64_t>(a), 7LL),
+                                          jmul(b, 1000003LL)),
+                                     jmul(static_cast<std::int64_t>(c), 13LL)));
+            ctx.check("mixBSC_witness_byte_intact", wide::wBscB() == a);
+            ctx.check("mixBSC_witness_long_exact",  wide::wBscL() == b);
+            ctx.check("mixBSC_witness_short_intact_after_wide", wide::wBscS() == c);
+        }
+        {
+            // wide double flanked by a boolean and a char; return recomputed in the
+            // identical split-scale order the fixture uses (each its own step).
+            const bool          a{ true };
+            const double        b{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const std::uint16_t c{ 0xBEEF };
+            const double za{ (a ? 1.0 : 0.0) * 1024.0 };
+            const double cc{ static_cast<double>(c) * 16.0 };
+            const probe_result r{ got("mixZDC_main") };
+            ctx.check("mixZDC_main_resolved", r.resolved);
+            ctx.check("mixZDC_main_not_void", r.dispatched);
+            ctx.check("mixZDC_main_return_bits", r.dbits == d2bits(b + za + cc));
+            ctx.check("mixZDC_witness_bool_true", wide::wZdcZ() == a);
+            ctx.check("mixZDC_witness_double_bits", wide::wZdcD() == 0x400921FB54442D18ULL);
+            ctx.check("mixZDC_witness_char_intact_after_double", wide::wZdcC() == c);
+        }
+        {
+            // leading char then wide long: the long started one slot after the char.
+            const std::uint16_t a{ 0x4E2D };
+            const std::int64_t  b{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            const probe_result r{ got("charLong_main") };
+            ctx.check("charLong_main_resolved", r.resolved);
+            ctx.check("charLong_main_return_long_exact", r.ival == b);
+            ctx.check("charLong_witness_char_intact", wide::wClChar() == a);
+            ctx.check("charLong_witness_long_exact_after_char", wide::wClLong() == b);
+        }
+        {
+            // every sub-int kind interleaved around both wide kinds (nine slots).
+            const std::int8_t   a{ static_cast<std::int8_t>(-7) };
+            const std::int64_t  b{ static_cast<std::int64_t>(0xDEADBEEFCAFEBABEULL) };
+            const double        c{ bits2d(0x400921FB54442D18ULL) }; // PI
+            const std::uint16_t d{ 0xABCD };
+            const std::int16_t  e{ static_cast<std::int16_t>(0x1234) };
+            const probe_result r{ got("bldcs_main") };
+            ctx.check("bldcs_main_resolved", r.resolved);
+            ctx.check("bldcs_main_not_void", r.dispatched);
+            ctx.check("bldcs_main_return_bits",
+                      r.dbits == d2bits(static_cast<double>(a) + static_cast<double>(b)
+                                        + c + static_cast<double>(d)
+                                        + static_cast<double>(e)));
+            ctx.check("bldcs_witness_byte_intact",  wide::wBldcsB() == a);
+            ctx.check("bldcs_witness_long_exact",   wide::wBldcsL() == b);
+            ctx.check("bldcs_witness_double_bits",  wide::wBldcsD() == 0x400921FB54442D18ULL);
+            ctx.check("bldcs_witness_char_intact",  wide::wBldcsC() == d);
+            ctx.check("bldcs_witness_short_intact", wide::wBldcsS() == e);
+        }
+
+        // =====================================================================
         //  STATIC variants — first wide arg at slot 0 (no receiver).
         // =====================================================================
         {
@@ -2894,6 +3388,38 @@ namespace
             // The trailing wide double as the 8th argument is bit-exact.
             ctx.check("s_octaD_witness_h_double_bits_8th_arg",
                       wide::sWOctaDh() == 0x400921FB54442D18ULL);
+        }
+        {
+            // STATIC byte after long (long at slot 0, byte at slot 2).  -1 returns
+            // sign-extended; the long and byte witnesses are both exact.
+            const std::int64_t a{ static_cast<std::int64_t>(0xFFFFFFFF00000000ULL) };
+            const std::int8_t  b{ static_cast<std::int8_t>(-1) };
+            const probe_result r{ got("s_bal") };
+            ctx.check("s_bal_resolved", r.resolved);
+            ctx.check("s_bal_return_is_byte", r.ival == static_cast<std::int64_t>(b));
+            ctx.check("s_bal_witness_long_exact", wide::sWBalLong() == a);
+            ctx.check("s_bal_witness_byte_intact_after_wide", wide::sWBalByte() == b);
+        }
+        {
+            // STATIC char after double (double at slot 0, char at slot 2).  A CJK
+            // code unit zero-extends; the double is bit-exact beside it.
+            const std::uint16_t b{ 0x4E2D };
+            const probe_result r{ got("s_cad") };
+            ctx.check("s_cad_resolved", r.resolved);
+            ctx.check("s_cad_return_is_char", r.ival == static_cast<std::int64_t>(b));
+            ctx.check("s_cad_witness_double_bits", wide::sWCadDouble() == 0x400921FB54442D18ULL);
+            ctx.check("s_cad_witness_char_intact_after_double", wide::sWCadChar() == b);
+        }
+        {
+            // STATIC leading char then wide long (char at slot 0, long at slots
+            // 1..2).  LONG_MIN round-trips exact; the char (0xFFFF) zero-extends.
+            const std::uint16_t a{ 0xFFFF };
+            const std::int64_t  b{ std::numeric_limits<std::int64_t>::min() };
+            const probe_result r{ got("s_charLong") };
+            ctx.check("s_charLong_resolved", r.resolved);
+            ctx.check("s_charLong_return_long_exact", r.ival == b);
+            ctx.check("s_charLong_witness_char_intact", wide::sWClChar() == a);
+            ctx.check("s_charLong_witness_long_exact_after_char", wide::sWClLong() == b);
         }
 
         // =====================================================================

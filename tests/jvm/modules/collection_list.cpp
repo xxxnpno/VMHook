@@ -1099,6 +1099,89 @@ namespace
     std::int32_t g_arr_sublist_size_witness{ -1 };
     std::int32_t g_link_sublist_size_witness{ -1 };
 
+    // ── field_proxy::value_t SIGNATURE / is_reference() introspection ────────
+    // value_t carries the field's raw JVM type descriptor (the `signature`
+    // member) and exposes is_reference() (true iff the stored alternative is the
+    // compressed-OOP uint32_t — i.e. an 'L...;'/'[...' field).  Every List /
+    // array field MUST report is_reference()==true and a descriptor whose first
+    // char is 'L' (a List object) or '[' (the Elem[] array branch); a primitive
+    // size-witness int field MUST report is_reference()==false with descriptor
+    // "I".  These are recorded as booleans the assertion block checks HARD —
+    // they decode NOTHING (pure signature inspection), so they hold on every
+    // JDK and toolchain regardless of compressed-oops config.
+    bool g_sig_arr_many_is_ref{ false };       // arrMany value_t.is_reference()
+    bool g_sig_arr_many_first_L{ false };      // arrMany descriptor[0] == 'L'
+    std::string g_sig_arr_many_text;           // the verbatim arrMany descriptor
+    bool g_sig_link_big_is_ref{ false };       // linkBig (declared List) is_reference()
+    bool g_sig_link_big_first_L{ false };      // linkBig descriptor[0] == 'L'
+    std::string g_sig_link_big_text;
+    bool g_sig_elem_array_is_ref{ false };     // elemArray ('[L') is_reference()
+    bool g_sig_elem_array_first_bracket{ false }; // elemArray descriptor[0] == '['
+    std::string g_sig_elem_array_text;
+    bool g_sig_int_arr_is_ref{ false };        // intArrList is_reference()
+    bool g_sig_str_arr_is_ref{ false };        // strList is_reference()
+    bool g_sig_size_witness_not_ref{ false };  // arrManySize (int) is_reference()==false
+    bool g_sig_size_witness_is_I{ false };     // arrManySize descriptor == "I"
+    std::int32_t g_sig_size_witness_val{ -1 }; // arrManySize value via value_t::get()
+
+    // ── PUBLIC value_t::to_vector typed (non-Elem) decode cross-checks ───────
+    // The public field entry get_field(...)->get().to_vector<T>() was only
+    // exercised for Elem lists.  Drive it for the boxed-Integer / String / Long
+    // element lists too, proving the PUBLIC entry's 'L' branch is equally
+    // element-TYPE-agnostic and agrees element-for-element with the lower-level
+    // hand-walk on the SAME live lists.  Shape (size/non-null/distinct) is HARD;
+    // the per-element VALUE round-trip is best-effort (reference decode is
+    // compressed-oops-dependent), mirroring the hand-walk's typed handling.
+    list_obs g_pv_int_arr;
+    bool     g_pv_int_values_ok{ false };
+    list_obs g_pv_str_arr;
+    bool     g_pv_str_values_ok{ false };
+    list_obs g_pv_long_arr;
+    bool     g_pv_long_values_ok{ false };
+
+    // ── PUBLIC value_t::to_vector at scale + null-pattern (Elem) ─────────────
+    // Extend the public entry beyond the small/many lists already covered:
+    // a 1000-element ArrayList, the all-null and null-first ArrayLists, and the
+    // size-1 null-only ArrayList.  Each is fully reduced into a list_obs the
+    // assertion block checks with the standard dense / null bundles, and
+    // cross-checked against the hand-walk so the public entry is proven at scale
+    // and on every null pattern, not just the mid-null with-null case.
+    list_obs g_pv_arr_thousand;
+    list_obs g_pv_arr_all_null;
+    list_obs g_pv_arr_null_first;
+    list_obs g_pv_arr_single_null;
+
+    // ── to_vector IDEMPOTENCY / re-read stability ────────────────────────────
+    // Decoding the SAME live list twice (back-to-back) must yield byte-identical
+    // observations: same size, same first/last id, and the SAME element OOP
+    // sequence.  A decode that mutated shared state, advanced a cursor, or read
+    // torn memory would diverge on the second pass.  Recorded per family for the
+    // hand-walk (ArrayList + LinkedList) AND the library collection::to_vector.
+    bool g_idem_arr_many_size_stable{ false };
+    bool g_idem_arr_many_oops_stable{ false };
+    bool g_idem_link_many_size_stable{ false };
+    bool g_idem_link_many_oops_stable{ false };
+    bool g_idem_tv_arr_many_size_stable{ false };
+    bool g_idem_tv_arr_many_oops_stable{ false };
+
+    // ── elemArray bounds at the EXACT last valid index (length-1) ────────────
+    // The bounds probe covers index 0 / length / length+7 / -1; add the upper
+    // in-range boundary (length-1, the last valid slot) which MUST read a real
+    // non-zero compressed OOP, and confirm length == OBJ_ARR_LEN — closing the
+    // "last valid index still reads" gap between the in-range[0] and at-length[N]
+    // probes.
+    bool g_bounds_last_index_nonzero{ false };  // index length-1 of elemArray != 0
+    bool g_bounds_length_is_obj_arr_len{ false }; // array_length == OBJ_ARR_LEN
+
+    // ── collection::to_vector empty-vector for a wrong-shape / null OOP ───────
+    // The library's collection::to_vector must yield an EMPTY vector (never a
+    // crash) for a nullptr OOP and for a non-list (Elem) OOP — the library-side
+    // analogue of the hand-walk adversarial cases.  Recorded as decoded sizes the
+    // assertion block proves are 0 after the calls all returned.
+    std::int32_t g_tv_adv_null_size{ -1 };       // collection{nullptr}.to_vector
+    std::int32_t g_tv_adv_elem_size{ -1 };       // collection{Elem oop}.to_vector
+    bool         g_tv_adv_reached_end{ false };
+
     // Reduce a decoded vector into a list_obs: size, null pattern, ascending id
     // order (id == index for non-null slots), tag correctness, and OOP
     // distinctness (a cycle/duplicate walk would collapse this).
@@ -1409,6 +1492,23 @@ namespace
             if (!seen_oops.insert(oop).second) { return false; }
         }
         return true;
+    }
+
+    // Extract the per-slot element OOP sequence (nullptr for a null slot) from a
+    // decoded Elem vector — the raw identity signal used by the idempotency
+    // cross-checks: two back-to-back decodes of the same live list must produce
+    // the SAME ordered OOP sequence.
+    auto oop_sequence(const std::vector<std::unique_ptr<elem_object>>& v)
+        -> std::vector<const void*>
+    {
+        std::vector<const void*> seq;
+        seq.reserve(v.size());
+        for (const auto& up : v)
+        {
+            const elem_object* const e{ up.get() };
+            seq.push_back(e ? static_cast<const void*>(e->get_instance()) : nullptr);
+        }
+        return seq;
     }
 
     // ── Standard per-list assertion bundles ─────────────────────────────────
@@ -2137,6 +2237,177 @@ namespace
 
             // '[L...;' object-array branch (the documented Object[] entry point).
             observe(g_pv_elem_array, pub_to_vector("elemArray"),   true);
+
+            // ── value_t SIGNATURE / is_reference() introspection ────────────
+            // get_field(field)->get() yields a value_t carrying the field's raw
+            // JVM descriptor and an is_reference() predicate.  These inspect the
+            // descriptor WITHOUT decoding any element, so they are config- and
+            // JDK-agnostic HARD invariants: a List field is a reference whose
+            // descriptor starts with 'L', an Elem[] field is a reference whose
+            // descriptor starts with '[', and a primitive int witness field is
+            // NOT a reference and carries descriptor "I".
+            const auto value_of{ [&sw](const char* const field)
+                -> std::optional<vmhook::field_proxy::value_t>
+            {
+                const auto f{ sw.get_field(field) };
+                if (!f) { return std::nullopt; }
+                return f->get();
+            } };
+
+            if (const auto v{ value_of("arrMany") })
+            {
+                g_sig_arr_many_is_ref = v->is_reference();
+                g_sig_arr_many_text = v->signature;
+                g_sig_arr_many_first_L = !v->signature.empty() && v->signature.front() == 'L';
+            }
+            if (const auto v{ value_of("linkBig") })
+            {
+                g_sig_link_big_is_ref = v->is_reference();
+                g_sig_link_big_text = v->signature;
+                g_sig_link_big_first_L = !v->signature.empty() && v->signature.front() == 'L';
+            }
+            if (const auto v{ value_of("elemArray") })
+            {
+                g_sig_elem_array_is_ref = v->is_reference();
+                g_sig_elem_array_text = v->signature;
+                g_sig_elem_array_first_bracket =
+                    !v->signature.empty() && v->signature.front() == '[';
+            }
+            if (const auto v{ value_of("intArrList") })
+            {
+                g_sig_int_arr_is_ref = v->is_reference();
+            }
+            if (const auto v{ value_of("strList") })
+            {
+                g_sig_str_arr_is_ref = v->is_reference();
+            }
+            if (const auto v{ value_of("arrManySize") })
+            {
+                g_sig_size_witness_not_ref = !v->is_reference();
+                g_sig_size_witness_is_I = (v->signature == "I");
+                g_sig_size_witness_val = static_cast<std::int32_t>(*v);
+            }
+
+            // ── PUBLIC value_t::to_vector typed (non-Elem) decode ───────────
+            // Drive the public entry's 'L' branch for boxed-Integer / String /
+            // boxed-Long element lists, proving it is element-TYPE-agnostic
+            // exactly like the lower-level path.
+            {
+                const auto pf{ sw.get_field("intArrList") };
+                if (pf)
+                {
+                    observe_integers(g_pv_int_arr,
+                                     pf->get().to_vector<integer_object>(),
+                                     g_pv_int_values_ok);
+                }
+            }
+            {
+                const auto pf{ sw.get_field("strList") };
+                if (pf)
+                {
+                    observe_strings(g_pv_str_arr,
+                                    pf->get().to_vector<string_object>(),
+                                    g_pv_str_values_ok);
+                }
+            }
+            {
+                const auto pf{ sw.get_field("longArrList") };
+                if (pf)
+                {
+                    observe_longs(g_pv_long_arr,
+                                  pf->get().to_vector<long_object>(),
+                                  g_pv_long_values_ok);
+                }
+            }
+
+            // ── PUBLIC value_t::to_vector at scale + every null pattern ─────
+            observe(g_pv_arr_thousand,   pub_to_vector("arrThousand"),   true);
+            observe(g_pv_arr_all_null,   pub_to_vector("arrAllNull"),    true);
+            observe(g_pv_arr_null_first, pub_to_vector("arrNullFirst"),  true);
+            observe(g_pv_arr_single_null, pub_to_vector("arrSingleNull"), true);
+        }
+
+        // ── to_vector IDEMPOTENCY: decode the same live list twice ──────────
+        // Two back-to-back decodes of the SAME list must agree on size, first/
+        // last id, AND the exact ordered element-OOP sequence.  Covers the
+        // hand-walk (ArrayList + LinkedList) and the library collection::to_vector
+        // ArrayList fast path — a decode that advanced shared state or read torn
+        // memory would diverge on the second pass.
+        {
+            void* const arr_oop{ list_oop_of("arrMany") };
+            std::vector<std::unique_ptr<elem_object>> a1{ walk_arraylist(arr_oop) };
+            std::vector<std::unique_ptr<elem_object>> a2{ walk_arraylist(arr_oop) };
+            list_obs o1{}; list_obs o2{};
+            observe(o1, a1, false);
+            observe(o2, a2, false);
+            g_idem_arr_many_size_stable =
+                (o1.size == o2.size && o1.first_id == o2.first_id && o1.last_id == o2.last_id);
+            g_idem_arr_many_oops_stable = (oop_sequence(a1) == oop_sequence(a2));
+        }
+        {
+            void* const link_oop{ list_oop_of("linkMany") };
+            const std::int32_t n{ read_int_field(link_oop, "size", 0) };
+            std::vector<std::unique_ptr<elem_object>> a1{ walk_linkedlist(link_oop, n) };
+            std::vector<std::unique_ptr<elem_object>> a2{ walk_linkedlist(link_oop, n) };
+            list_obs o1{}; list_obs o2{};
+            observe(o1, a1, false);
+            observe(o2, a2, false);
+            g_idem_link_many_size_stable =
+                (o1.size == o2.size && o1.first_id == o2.first_id && o1.last_id == o2.last_id);
+            g_idem_link_many_oops_stable = (oop_sequence(a1) == oop_sequence(a2));
+        }
+        {
+            void* const arr_oop{ list_oop_of("arrMany") };
+            const auto tv{ [arr_oop]() -> std::vector<std::unique_ptr<elem_object>>
+            {
+                if (!arr_oop || !vmhook::hotspot::is_valid_pointer(arr_oop)) { return {}; }
+                return vmhook::collection{ static_cast<vmhook::oop_t>(arr_oop) }
+                    .to_vector<elem_object>();
+            } };
+            std::vector<std::unique_ptr<elem_object>> a1{ tv() };
+            std::vector<std::unique_ptr<elem_object>> a2{ tv() };
+            list_obs o1{}; list_obs o2{};
+            observe(o1, a1, false);
+            observe(o2, a2, false);
+            g_idem_tv_arr_many_size_stable =
+                (o1.size == o2.size && o1.first_id == o2.first_id && o1.last_id == o2.last_id);
+            g_idem_tv_arr_many_oops_stable = (oop_sequence(a1) == oop_sequence(a2));
+        }
+
+        // ── elemArray bounds at the EXACT last valid index (length-1) ───────
+        {
+            void* const arr{ list_oop_of("elemArray") };
+            if (arr && vmhook::hotspot::is_valid_pointer(arr))
+            {
+                const std::int32_t len{ vmhook::array_length(arr) };
+                g_bounds_length_is_obj_arr_len = (len == OBJ_ARR_LEN);
+                g_bounds_last_index_nonzero =
+                    (len > 0)
+                    && (vmhook::get_array_element<std::uint32_t>(arr, len - 1) != 0u);
+            }
+        }
+
+        // ── collection::to_vector empty-vector for null / wrong-shape OOP ───
+        {
+            g_tv_adv_null_size = static_cast<std::int32_t>(
+                vmhook::collection{ static_cast<vmhook::oop_t>(nullptr) }
+                    .to_vector<elem_object>().size());
+
+            std::vector<std::unique_ptr<elem_object>> one{
+                walk_arraylist(list_oop_of("arrSingle")) };
+            void* const elem_oop{ (!one.empty() && one[0]) ? one[0]->get_instance()
+                                                           : nullptr };
+            if (elem_oop && vmhook::hotspot::is_valid_pointer(elem_oop))
+            {
+                g_tv_adv_elem_size = static_cast<std::int32_t>(
+                    vmhook::collection{ static_cast<vmhook::oop_t>(elem_oop) }
+                        .to_vector<elem_object>().size());
+            }
+            else
+            {
+                g_tv_adv_elem_size = 0;
+            }
+            g_tv_adv_reached_end = true;
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -2742,6 +3013,140 @@ namespace
         ctx.check("public_to_vector_linkbig_matches_hand_walk",
                   g_pv_link_big.size == g_link_big.size
                   && g_pv_link_big.last_id == g_link_big.last_id);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  field_proxy::value_t SIGNATURE / is_reference() introspection.
+        //  These inspect the field's raw JVM descriptor WITHOUT decoding any
+        //  element, so they are HARD on every JDK and every compressed-oops
+        //  config: a List field is a reference whose descriptor starts with 'L';
+        //  the Elem[] field is a reference whose descriptor starts with '['; a
+        //  primitive int witness field is NOT a reference and carries "I".  This
+        //  exercises value_t::is_reference() + value_t::signature — a public API
+        //  surface the module did not previously touch.
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("value_t_arrMany_is_reference", g_sig_arr_many_is_ref);
+        ctx.check("value_t_arrMany_descriptor_starts_with_L", g_sig_arr_many_first_L);
+        ctx.record("[INFO] collection_list: arrMany field descriptor = \""
+                   + g_sig_arr_many_text + "\"");
+        // linkBig is DECLARED List (not LinkedList), so its STATIC field
+        // descriptor is the supertype Ljava/util/List; — proving the signature is
+        // the declared field type while the runtime fast-path dispatch (asserted
+        // above) keys off the runtime klass instead.
+        ctx.check("value_t_linkBig_is_reference", g_sig_link_big_is_ref);
+        ctx.check("value_t_linkBig_descriptor_starts_with_L", g_sig_link_big_first_L);
+        ctx.record("[INFO] collection_list: linkBig (declared List) field descriptor = \""
+                   + g_sig_link_big_text + "\"");
+        ctx.check("value_t_elemArray_is_reference", g_sig_elem_array_is_ref);
+        ctx.check("value_t_elemArray_descriptor_starts_with_bracket",
+                  g_sig_elem_array_first_bracket);
+        ctx.record("[INFO] collection_list: elemArray field descriptor = \""
+                   + g_sig_elem_array_text + "\"");
+        ctx.check("value_t_intArrList_is_reference", g_sig_int_arr_is_ref);
+        ctx.check("value_t_strList_is_reference", g_sig_str_arr_is_ref);
+        // The primitive size-witness int field is the NEGATIVE control: it must
+        // NOT be a reference, must carry descriptor "I", and its value reads back
+        // as the published arrMany size (MANY) through value_t's implicit
+        // conversion — proving is_reference() correctly discriminates primitive
+        // from reference fields and the int read is exact.
+        ctx.check("value_t_size_witness_not_reference", g_sig_size_witness_not_ref);
+        ctx.check("value_t_size_witness_descriptor_is_I", g_sig_size_witness_is_I);
+        ctx.check("value_t_size_witness_value_is_MANY", g_sig_size_witness_val == MANY);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  PUBLIC value_t::to_vector typed (non-Elem) decode: the public field
+        //  entry's 'L' branch is element-TYPE-agnostic — Integer / String / Long
+        //  element lists decode through get_field(...)->get().to_vector<T>()
+        //  exactly as the lower-level path does.  Shape HARD; the per-element
+        //  value round-trip is best-effort (reference decode is compressed-oops-
+        //  dependent), and the size/first/last must match the hand-walk.
+        // ════════════════════════════════════════════════════════════════════
+        check_typed_dense_shape(ctx, "public_to_vector_integer_arraylist",
+                                g_pv_int_arr, INT_LEN);
+        ctx.check("public_to_vector_integer_matches_hand_walk_size",
+                  g_pv_int_arr.size == g_int_arr.size);
+        check_or_info(ctx, "public_to_vector_integer_values_equal_index",
+                      g_pv_int_values_ok,
+                      "boxed Integer element values via the PUBLIC field entry did not all "
+                      "read back as index on this run (reference decode is compressed-oops-"
+                      "dependent); size/shape still checked hard.");
+
+        check_typed_dense_shape(ctx, "public_to_vector_string_arraylist",
+                                g_pv_str_arr, STR_LEN);
+        ctx.check("public_to_vector_string_matches_hand_walk_size",
+                  g_pv_str_arr.size == g_str_arr.size);
+        check_or_info(ctx, "public_to_vector_string_content_equals_s_index",
+                      g_pv_str_values_ok,
+                      "String element content via the PUBLIC field entry did not all read "
+                      "back as \"s<index>\" on this run (reference/String decode is "
+                      "compressed-oops-dependent); size/shape still checked hard.");
+
+        check_typed_dense_shape(ctx, "public_to_vector_long_arraylist",
+                                g_pv_long_arr, LONG_LEN);
+        ctx.check("public_to_vector_long_matches_hand_walk_size",
+                  g_pv_long_arr.size == g_long_arr.size);
+        check_or_info(ctx, "public_to_vector_long_values_full_width_above_2pow32",
+                      g_pv_long_values_ok,
+                      "boxed Long element values via the PUBLIC field entry did not all read "
+                      "back as LONG_BASE+index (> 2^32) on this run; a truncating 32-bit "
+                      "read would also land here. size/shape still checked hard.");
+
+        // ════════════════════════════════════════════════════════════════════
+        //  PUBLIC value_t::to_vector at scale + every null pattern (Elem).  The
+        //  public entry was previously proven only on small/many lists; here it
+        //  is exercised on a 1000-element list, an all-null list, a null-at-head
+        //  list, and the size-1 null-only list, each fully checked and cross-
+        //  checked against the hand-walk.
+        // ════════════════════════════════════════════════════════════════════
+        check_dense(ctx, "public_to_vector_arraylist_thousand", g_pv_arr_thousand, THOUSAND);
+        ctx.check("public_to_vector_thousand_matches_hand_walk_size",
+                  g_pv_arr_thousand.size == g_arr_thousand.size);
+        ctx.check("public_to_vector_thousand_matches_hand_walk_last_id",
+                  g_pv_arr_thousand.last_id == g_arr_thousand.last_id);
+        check_all_null(ctx, "public_to_vector_arraylist_all_null", g_pv_arr_all_null);
+        check_null_boundary(ctx, "public_to_vector_arraylist_null_first",
+                            g_pv_arr_null_first, 0);
+        ctx.check("public_to_vector_arraylist_single_null_size_is_1",
+                  g_pv_arr_single_null.size == 1);
+        ctx.check("public_to_vector_arraylist_single_null_one_null_slot",
+                  g_pv_arr_single_null.null_count == 1);
+        ctx.check("public_to_vector_arraylist_single_null_no_elements",
+                  g_pv_arr_single_null.non_null == 0);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  to_vector IDEMPOTENCY / re-read stability: decoding the SAME live list
+        //  twice (back-to-back) yields byte-identical observations — same size,
+        //  same first/last id, and the SAME ordered element-OOP sequence.  Proven
+        //  for the hand-walk (ArrayList + LinkedList) AND the library
+        //  collection::to_vector ArrayList fast path.  A decode that mutated
+        //  shared state, advanced a cursor, or read torn memory would diverge.
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("idempotent_arraylist_size_first_last_stable", g_idem_arr_many_size_stable);
+        ctx.check("idempotent_arraylist_oop_sequence_stable", g_idem_arr_many_oops_stable);
+        ctx.check("idempotent_linkedlist_size_first_last_stable", g_idem_link_many_size_stable);
+        ctx.check("idempotent_linkedlist_oop_sequence_stable", g_idem_link_many_oops_stable);
+        ctx.check("idempotent_to_vector_arraylist_size_first_last_stable",
+                  g_idem_tv_arr_many_size_stable);
+        ctx.check("idempotent_to_vector_arraylist_oop_sequence_stable",
+                  g_idem_tv_arr_many_oops_stable);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  elemArray bounds at the EXACT last valid index (length-1).  Closes the
+        //  in-range[0] / at-length[N] gap: the last valid slot (index length-1)
+        //  MUST read a real non-zero compressed OOP, and the backing length is
+        //  exactly OBJ_ARR_LEN.
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("get_array_element_length_is_obj_arr_len", g_bounds_length_is_obj_arr_len);
+        ctx.check("get_array_element_last_valid_index_nonzero", g_bounds_last_index_nonzero);
+
+        // ════════════════════════════════════════════════════════════════════
+        //  collection::to_vector empty-vector for null / wrong-shape OOP — the
+        //  library-side analogue of the hand-walk adversarial cases.  A nullptr
+        //  collection and a non-list (Elem) collection must each yield an EMPTY
+        //  vector (no crash); reaching g_tv_adv_reached_end proves both returned.
+        // ════════════════════════════════════════════════════════════════════
+        ctx.check("to_vector_adversarial_all_calls_returned_no_crash", g_tv_adv_reached_end);
+        ctx.check("to_vector_adversarial_null_collection_empty", g_tv_adv_null_size == 0);
+        ctx.check("to_vector_adversarial_elem_as_collection_empty", g_tv_adv_elem_size == 0);
     }   // run_collection_list_checks
 }   // anonymous namespace
 

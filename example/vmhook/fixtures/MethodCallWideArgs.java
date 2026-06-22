@@ -311,6 +311,69 @@ public final class MethodCallWideArgs
     public static volatile int    sWOctaDg = (int) SENTINEL;
     public static volatile double sWOctaDh = Double.NaN;
 
+    // ----------------------------------------------------------------------
+    //  SUB-INT NEIGHBOUR witnesses.  Every other module exercises byte / short
+    //  / char / boolean in ISOLATION; THIS feature's bug class is a sub-int
+    //  slot sitting NEXT TO a two-slot wide arg.  A sub-int occupies ONE
+    //  interpreter local exactly like an int, but the JVM sign-extends byte/short
+    //  and ZERO-extends char into that slot, and a boolean is 0/1.  If a wide
+    //  arg's high word leaked into — or its presence shifted — an adjacent
+    //  narrow sub-int slot, these witnesses (and the typed returns) catch it
+    //  with the extension semantics of the actual descriptor ('B'/'S'/'C'/'Z'),
+    //  which differ from the 'I' the existing int-flank methods use.
+    // ----------------------------------------------------------------------
+    // byteAfterLong(long,byte) — a sign-extended 'B' immediately after a wide J.
+    public static volatile long wBalLong = SENTINEL;
+    public static volatile byte wBalByte = (byte) SENTINEL;
+    // shortAfterLong(long,short) — a sign-extended 'S' after a wide J.
+    public static volatile long  wSalLong  = SENTINEL;
+    public static volatile short wSalShort = (short) SENTINEL;
+    // charAfterLong(long,char) — a ZERO-extended 'C' after a wide J.
+    public static volatile long wCalLong = SENTINEL;
+    public static volatile char wCalChar = (char) SENTINEL;
+    // boolAfterLong(long,boolean) — a 'Z' (0/1) after a wide J.
+    public static volatile long    wZalLong = SENTINEL;
+    public static volatile boolean wZalBool = true;
+    // charAfterDouble(double,char) — a ZERO-extended 'C' after a wide D (the
+    // 'D'-neighbour analogue; a packer that mis-expands the double against a 'C'
+    // slot would mangle this char).
+    public static volatile double wCadDouble = Double.NaN;
+    public static volatile char   wCadChar   = (char) SENTINEL;
+    // shortAfterDouble(double,short) — a sign-extended 'S' after a wide D.
+    public static volatile double wSadDouble = Double.NaN;
+    public static volatile short  wSadShort  = (short) SENTINEL;
+    // mixBSC(byte,long,short) — wide long in the MIDDLE flanked by a 'B' and an
+    // 'S', BOTH sign-extended kinds (distinct from mixA's two 'I' flanks).
+    public static volatile byte  wBscB = (byte) SENTINEL;
+    public static volatile long  wBscL = SENTINEL;
+    public static volatile short wBscS = (short) SENTINEL;
+    // mixZDC(boolean,double,char) — wide double in the MIDDLE flanked by a 'Z'
+    // and a ZERO-extended 'C'.
+    public static volatile boolean wZdcZ = false;
+    public static volatile double  wZdcD = Double.NaN;
+    public static volatile char    wZdcC = (char) SENTINEL;
+    // charLong(char,long) — a leading ZERO-extended 'C' then a wide J (the wide
+    // value must start exactly one slot after the single-slot char).
+    public static volatile char wClChar = (char) SENTINEL;
+    public static volatile long wClLong = SENTINEL;
+    // bldcs(byte,long,double,char,short) — an interleave of EVERY sub-int kind
+    // around BOTH wide kinds: byte, long, double, char, short (nine interpreter
+    // slots).  A one-slot drift anywhere fails a sub-int witness even if the sum
+    // coincided; each sub-int has a different extension rule so a generic slot
+    // bug shows up differently per neighbour.
+    public static volatile byte  wBldcsB = (byte) SENTINEL;
+    public static volatile long  wBldcsL = SENTINEL;
+    public static volatile double wBldcsD = Double.NaN;
+    public static volatile char  wBldcsC = (char) SENTINEL;
+    public static volatile short wBldcsS = (short) SENTINEL;
+    // STATIC sub-int neighbour witnesses (no receiver; first arg at slot 0).
+    public static volatile long sWBalLong = SENTINEL;
+    public static volatile byte sWBalByte = (byte) SENTINEL;
+    public static volatile double sWCadDouble = Double.NaN;
+    public static volatile char   sWCadChar   = (char) SENTINEL;
+    public static volatile char sWClChar = (char) SENTINEL;
+    public static volatile long sWClLong = SENTINEL;
+
     /** Held so the native side can build an instance wrapper for instance calls. */
     public static MethodCallWideArgs instance = new MethodCallWideArgs();
 
@@ -706,6 +769,116 @@ public final class MethodCallWideArgs
     }
 
     // ======================================================================
+    //  SUB-INT NEIGHBOURS OF A WIDE ARG.  byte/short/char/boolean each take ONE
+    //  interpreter slot like int, but carry a DIFFERENT descriptor ('B'/'S'/'C'/
+    //  'Z') and a different extension rule (byte/short sign-extend, char zero-
+    //  extends, boolean is 0/1).  The existing int-flank methods only exercise
+    //  'I'; these prove a wide arg neither truncates nor shifts when its
+    //  neighbour is one of these narrower kinds, with the exact value preserved.
+    //  Each returns the narrow value (typed) AND stamps both operands to
+    //  witnesses, so the native side can prove it two independent ways.
+    // ======================================================================
+
+    /** Sign-extended BYTE immediately after a wide long.  Returns the byte. */
+    public byte byteAfterLong(final long a, final byte b)
+    {
+        wBalLong = a;
+        wBalByte = b;
+        return b;
+    }
+
+    /** Sign-extended SHORT immediately after a wide long.  Returns the short. */
+    public short shortAfterLong(final long a, final short b)
+    {
+        wSalLong  = a;
+        wSalShort = b;
+        return b;
+    }
+
+    /** ZERO-extended CHAR immediately after a wide long.  Returns the char. */
+    public char charAfterLong(final long a, final char b)
+    {
+        wCalLong = a;
+        wCalChar = b;
+        return b;
+    }
+
+    /** BOOLEAN (0/1) immediately after a wide long.  Returns the boolean. */
+    public boolean boolAfterLong(final long a, final boolean b)
+    {
+        wZalLong = a;
+        wZalBool = b;
+        return b;
+    }
+
+    /** ZERO-extended CHAR immediately after a wide double.  Returns the char. */
+    public char charAfterDouble(final double a, final char b)
+    {
+        wCadDouble = a;
+        wCadChar   = b;
+        return b;
+    }
+
+    /** Sign-extended SHORT immediately after a wide double.  Returns the short. */
+    public short shortAfterDouble(final double a, final short b)
+    {
+        wSadDouble = a;
+        wSadShort  = b;
+        return b;
+    }
+
+    /** Wide long in the MIDDLE flanked by a BYTE and a SHORT (both sign-extended
+     *  kinds, distinct from mixA's two 'I' flanks).  Distinct multipliers catch a
+     *  swap; the full 64-bit long catches a truncation.  All three stamped. */
+    public long mixBSC(final byte a, final long b, final short c)
+    {
+        wBscB = a;
+        wBscL = b;
+        wBscS = c;
+        return ((long) a) * 7L + b * 1000003L + ((long) c) * 13L;
+    }
+
+    /** Wide double in the MIDDLE flanked by a BOOLEAN and a ZERO-extended CHAR.
+     *  Returns the double plus distinct exact-scaled contributions of the boolean
+     *  (0/1) and the char so a swap/shift changes the result; the boolean and char
+     *  are added as doubles in their own rounded steps to stay FMA-safe. */
+    public double mixZDC(final boolean a, final double b, final char c)
+    {
+        wZdcZ = a;
+        wZdcD = b;
+        wZdcC = c;
+        final double za = (a ? 1.0 : 0.0) * 1024.0;   // exact scale
+        final double cc = ((double) c) * 16.0;        // exact scale
+        return b + za + cc;
+    }
+
+    /** Leading ZERO-extended CHAR then a wide long: the long must START exactly
+     *  one slot after the single-slot char (slot 2 for instance). */
+    public long charLong(final char a, final long b)
+    {
+        wClChar = a;
+        wClLong = b;
+        return b;
+    }
+
+    /** Every sub-int kind interleaved around BOTH wide kinds: byte, long, double,
+     *  char, short — nine interpreter slots (1+2+2+1+1).  Pure left-to-right sum
+     *  (no FMA-contractible mul+add); every operand stamped so a one-slot drift
+     *  anywhere fails a witness even if the sum coincided.  byte/short sign-extend,
+     *  char zero-extends — so a generic adjacency bug manifests differently per
+     *  neighbour.  Two's-complement / IEEE order mirrored on the native side. */
+    public double bldcs(final byte a, final long b, final double c,
+                        final char d, final short e)
+    {
+        wBldcsB = a;
+        wBldcsL = b;
+        wBldcsD = c;
+        wBldcsC = d;
+        wBldcsS = e;
+        return (double) a + (double) b + c + (double) d + (double) e;
+    }
+
+    // ======================================================================
     //  Overload pair that ONLY differs by a wide-vs-narrow parameter kind, so
     //  resolve_compatible_method() must pick the long overload for a C++ int64
     //  arg and the int overload for a C++ int32 arg.  Distinct returns prove it.
@@ -904,6 +1077,34 @@ public final class MethodCallWideArgs
         sWOctaDh = h;
         return (double) a + (double) b + (double) c + (double) d
              + (double) e + (double) f + (double) g + h;
+    }
+
+    // ======================================================================
+    //  STATIC sub-int neighbour variants — no receiver, first arg at slot 0.
+    // ======================================================================
+
+    /** Static sign-extended BYTE after a wide long (long at slot 0). */
+    public static byte sByteAfterLong(final long a, final byte b)
+    {
+        sWBalLong = a;
+        sWBalByte = b;
+        return b;
+    }
+
+    /** Static ZERO-extended CHAR after a wide double (double at slot 0). */
+    public static char sCharAfterDouble(final double a, final char b)
+    {
+        sWCadDouble = a;
+        sWCadChar   = b;
+        return b;
+    }
+
+    /** Static leading CHAR then a wide long (char at slot 0, long at slots 1..2). */
+    public static long sCharLong(final char a, final long b)
+    {
+        sWClChar = a;
+        sWClLong = b;
+        return b;
     }
 
     static

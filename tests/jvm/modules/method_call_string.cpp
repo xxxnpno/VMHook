@@ -79,6 +79,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace
 {
@@ -128,6 +129,11 @@ namespace
     std::atomic<int>                   g_loop_iterations{ 0 };
     std::atomic<int>                   g_loop_distinct{ -1 };       // distinct results across the leak loop
 
+    // Extraction-API agreement witnesses (the module's raison d'etre): as_string()
+    // (the unambiguous accessor) must yield byte-identical results to the implicit
+    // `std::string s = call()` copy-init for every shape.  Captured under the mutex.
+    std::map<std::string, std::pair<std::string, std::string>> g_extract;  // key -> {as_string, implicit}
+
     // Record one value_t under `key`, capturing payload + variant tag.
     auto record_value(const std::string& key, const vmhook::method_proxy::value_t& v) -> void
     {
@@ -158,6 +164,30 @@ namespace
         {
             record_value(std::string{ "static:" } + method, proxy->call());
         }
+    }
+
+    // Capture BOTH extraction APIs for one no-arg INSTANCE String method: the
+    // unambiguous as_string() accessor AND the implicit `std::string s = call()`
+    // copy-init (which relies on overload resolution against the constrained
+    // conversion operator).  The contract is they are byte-identical; recorded so a
+    // check below can hard-assert agreement for ASCII, unicode, and interior-NUL.
+    auto capture_extract(const method_string_fixture& self, const char* method,
+                         const std::string& key) -> void
+    {
+        if (auto proxy{ self.get_method(method) })
+        {
+            const std::string via_accessor{ proxy->call().as_string() };
+            std::string       via_implicit = proxy->call();  // copy-init / overload-resolution path
+            std::lock_guard<std::mutex> lock{ g_mutex };
+            g_extract[key] = std::make_pair(via_accessor, via_implicit);
+        }
+    }
+
+    auto get_extract(const std::string& key) -> std::pair<std::string, std::string>
+    {
+        std::lock_guard<std::mutex> lock{ g_mutex };
+        const auto it{ g_extract.find(key) };
+        return (it != g_extract.end()) ? it->second : std::pair<std::string, std::string>{};
     }
 
     // Read back a recorded observation (default-constructed if missing).
@@ -596,6 +626,112 @@ namespace
                          proxy->call(std::string{ "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E" },
                                      static_cast<std::int32_t>(1)));
         }
+        // charAtOf on a STANDARD-4-byte emoji arg at index 0 -> the LONE HIGH
+        // surrogate U+D83D (a FRESH single-UTF-16-unit String).  The astral arg
+        // first arrives intact as the pair D83D DE00 (arg-encoder), then Java's
+        // charAt(0) slices out the high half, and the RETURN decoder emits the
+        // 3-byte CESU encoding of U+D83D on BOTH paths (ED A0 BD) — path-independent,
+        // and a sharp astral-half boundary (a naive encoder that mangled the arg to
+        // U+00F0 would return 'F0', not the high surrogate).
+        if (auto proxy{ self->get_method("charAtOf") })
+        {
+            record_value("charAtOf:emoji0",
+                         proxy->call(std::string{ "\xF0\x9F\x98\x80" },
+                                     static_cast<std::int32_t>(0)));
+        }
+        // charAtOf at index 1 of the same emoji arg -> the LONE LOW surrogate U+DE00
+        // (3-byte CESU ED B8 80 on both paths): proves index 1 reaches the SECOND
+        // UTF-16 unit of the pair (it would be out of range had the arg collapsed to
+        // a single unit).
+        if (auto proxy{ self->get_method("charAtOf") })
+        {
+            record_value("charAtOf:emoji1",
+                         proxy->call(std::string{ "\xF0\x9F\x98\x80" },
+                                     static_cast<std::int32_t>(1)));
+        }
+        // ---- FRESH-OOP astral slices via subOf (substring of a surrogate pair) ----
+        // subOf(emoji, 0, 1): a fresh single-unit String holding ONLY the high
+        // surrogate U+D83D -> 3-byte CESU on both paths.  subOf(emoji, 0, 2): a fresh
+        // String holding the FULL pair -> the standard 4-byte form on call_stub and
+        // the 6-byte CESU form on call_jni (path-divergent, same bytes as `emoji`).
+        // Proves a FRESH (non-interned) astral OOP — not just the interned constant —
+        // decodes correctly, including a sliced lone half.
+        if (auto proxy{ self->get_method("subOf") })
+        {
+            record_value("subOf:astral_high",
+                         proxy->call(std::string{ "\xF0\x9F\x98\x80" },
+                                     static_cast<std::int32_t>(0), static_cast<std::int32_t>(1)));
+        }
+        if (auto proxy{ self->get_method("subOf") })
+        {
+            record_value("subOf:astral_pair",
+                         proxy->call(std::string{ "\xF0\x9F\x98\x80" },
+                                     static_cast<std::int32_t>(0), static_cast<std::int32_t>(2)));
+        }
+        // concat of an astral arg + an ASCII arg -> a fresh BUILT String "<emoji>!"
+        // whose first scalar is supplementary.  Path-divergent on the astral half,
+        // ASCII tail identical: proves a multi-arg concat preserves a surrogate pair
+        // through the JAVA-side join and the return decoder re-encodes it correctly.
+        if (auto proxy{ self->get_method("concat") })
+        {
+            record_value("concat:astral_ascii",
+                         proxy->call(std::string{ "\xF0\x9F\x98\x80" }, std::string{ "!" }));
+        }
+
+        // ---- char* (MUTABLE) String-arg branch (distinct overload from const char*) -
+        // convert_jni_arg has `std::is_same_v<clean_t, char*>` alongside the const
+        // char* branch; the existing cases only drive const char*.  A mutable char*
+        // takes the SAME length-counted UTF-16 encoder, so an ASCII char* round-trips
+        // and a nullptr char* maps to Java null.  Build the buffer on the stack so the
+        // arg is a genuine `char*` (not a string literal, which is const char*).
+        {
+            char mutable_buf[] = "mutable-cstr";
+            if (auto proxy{ self->get_method("echo") })
+            {
+                record_value("echo:mutcstr_ascii", proxy->call(static_cast<char*>(mutable_buf)));
+            }
+            if (auto proxy{ self->get_method("lengthOf") })
+            {
+                record_value("lengthOf:mutcstr_ascii",
+                             proxy->call(static_cast<char*>(mutable_buf)));
+            }
+        }
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:mutcstr_null", proxy->call(static_cast<char*>(nullptr)));
+        }
+
+        // ---- ARG round-trips at the UTF-8 LENGTH boundaries (arg-encoder) --------
+        // The arg encoder (utf8_to_utf16) must decode a multi-byte arg byte sequence
+        // at each width transition exactly.  These shapes are RETURNED elsewhere but
+        // never SENT as args; send them so the arg decoder's 1/2-byte (U+007F/U+0080),
+        // 2/3-byte (U+07FF/U+0800), Latin-1 ceiling (U+00FF), and Unicode-whitespace
+        // boundaries are all proven on the ENCODE side too.  BMP -> path-independent.
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:asciiBoundary", proxy->call(std::string{ "\x7F\xC2\x80" }));
+        }
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:bmpBoundary",
+                         proxy->call(std::string{ "\xDF\xBF\xE0\xA0\x80" }));
+        }
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:latin1Hi", proxy->call(std::string{ "\xC3\xBF" }));
+        }
+        if (auto proxy{ self->get_method("echo") })
+        {
+            record_value("echo:unicodeWs",
+                         proxy->call(std::string{ "\xC2\xA0\xE2\x80\xA8\xE2\x80\xA9" }));
+        }
+        // Java-side length witness of the asciiBoundary arg: 2 UTF-16 units (U+007F +
+        // U+0080), decoder-independent — proves the arg encoder did NOT split the
+        // 2-byte C2 80 into two units.
+        if (auto proxy{ self->get_method("lengthOf") })
+        {
+            record_value("lengthOf:asciiBoundary", proxy->call(std::string{ "\x7F\xC2\x80" }));
+        }
 
         // ---- 16-bit length-boundary returns (no uint16 wraparound) ----------
         // bigString at 65535 / 65536 / 65537 — straddling the 16-bit boundary —
@@ -647,6 +783,18 @@ namespace
         {
             record_value("repeatA:5000", proxy->call(static_cast<std::int32_t>(5000)));
         }
+
+        // ---- as_string() vs implicit `std::string s = call()` agreement -------
+        // The module exists because as_string() is the UNAMBIGUOUS accessor (the
+        // implicit conversion is ambiguous against const char* on MSVC).  Prove the
+        // two extraction APIs return byte-identical results across the value-shape
+        // axis: ASCII, Latin-1 multibyte, CJK, and the interior-NUL case (the
+        // sharpest — a C-string-based implicit path would cut at the NUL).
+        capture_extract(*self, "regular",     "extract:regular");
+        capture_extract(*self, "cafe",        "extract:cafe");
+        capture_extract(*self, "cjk",         "extract:cjk");
+        capture_extract(*self, "interiorNul", "extract:interiorNul");
+        capture_extract(*self, "empty",       "extract:empty");
 
         // Leak / stability loop: call the same String method many times and prove
         // the result never changes (a starved JNI local-ref table — the failure
@@ -1439,6 +1587,65 @@ namespace
             ctx.check("subOf_empty_slice_value_empty", sub_empty.value.empty());
             ctx.check("subOf_empty_slice_len_0", sub_empty.byte_len == 0);
 
+            // ---- FRESH-OOP astral slices (substring of a surrogate pair) -----
+            // subOf(emoji, 0, 1): a FRESH single-unit String holding ONLY the high
+            // surrogate U+D83D -> 3-byte CESU ED A0 BD on BOTH paths (path-independent,
+            // both decoders CESU-encode a lone surrogate).  Proves a fresh non-interned
+            // OOP that is a single astral HALF decodes correctly.
+            const observation sub_astral_high{ get("subOf:astral_high") };
+            ctx.check("subOf_astral_high_captured", sub_astral_high.captured);
+            ctx.check("subOf_astral_high_cesu", sub_astral_high.value == "\xED\xA0\xBD");
+            ctx.check("subOf_astral_high_len_3", sub_astral_high.byte_len == 3);
+            // subOf(emoji, 0, 2): a FRESH String holding the FULL pair -> path-divergent
+            // (standard 4-byte on call_stub, 6-byte CESU on call_jni), same bytes as the
+            // interned `emoji` RETURN case but from a FRESH OOP.
+            const observation sub_astral_pair{ get("subOf:astral_pair") };
+            ctx.check("subOf_astral_pair_captured", sub_astral_pair.captured);
+            if (stub_path)
+            {
+                ctx.check("subOf_astral_pair_call_stub_4byte",
+                          sub_astral_pair.value == "\xF0\x9F\x98\x80");
+                ctx.check("subOf_astral_pair_call_stub_len4", sub_astral_pair.byte_len == 4);
+            }
+            else
+            {
+                ctx.check("subOf_astral_pair_call_jni_cesu8",
+                          sub_astral_pair.value == "\xED\xA0\xBD\xED\xB8\x80");
+                ctx.check("subOf_astral_pair_call_jni_len6", sub_astral_pair.byte_len == 6);
+            }
+
+            // ---- charAtOf of the emoji arg: lone surrogate HALVES --------------
+            // charAt(0) of the astral arg -> the LONE HIGH surrogate U+D83D (3-byte
+            // CESU ED A0 BD on both paths); charAt(1) -> the LONE LOW surrogate U+DE00
+            // (ED B8 80).  These prove the astral ARG arrived as a real surrogate PAIR
+            // (a collapsed-to-one-unit arg would make index 1 throw / out-of-range) and
+            // that a fresh single-surrogate String round-trips path-independently.
+            const observation char_emoji0{ get("charAtOf:emoji0") };
+            ctx.check("charAtOf_emoji0_high_surrogate", char_emoji0.value == "\xED\xA0\xBD");
+            ctx.check("charAtOf_emoji0_len_3", char_emoji0.byte_len == 3);
+            const observation char_emoji1{ get("charAtOf:emoji1") };
+            ctx.check("charAtOf_emoji1_low_surrogate", char_emoji1.value == "\xED\xB8\x80");
+            ctx.check("charAtOf_emoji1_len_3", char_emoji1.byte_len == 3);
+
+            // ---- concat(astral, ASCII) -> a fresh BUILT astral String ---------
+            // "<emoji>" + "!" joined on the Java side; the surrogate pair survives the
+            // join and the return decoder re-encodes it (path-divergent) with the ASCII
+            // '!' appended (1 byte, identical on both paths).
+            const observation concat_astral{ get("concat:astral_ascii") };
+            ctx.check("concat_astral_ascii_captured", concat_astral.captured);
+            if (stub_path)
+            {
+                ctx.check("concat_astral_ascii_call_stub",
+                          concat_astral.value == "\xF0\x9F\x98\x80!");
+                ctx.check("concat_astral_ascii_call_stub_len5", concat_astral.byte_len == 5);
+            }
+            else
+            {
+                ctx.check("concat_astral_ascii_call_jni",
+                          concat_astral.value == "\xED\xA0\xBD\xED\xB8\x80!");
+                ctx.check("concat_astral_ascii_call_jni_len7", concat_astral.byte_len == 7);
+            }
+
             // builtA(0): a fresh EMPTY String from a StringBuilder (not interned).
             const observation built0{ get("builtA:0") };
             ctx.check("builtA0_captured", built0.captured);
@@ -1536,6 +1743,77 @@ namespace
             const observation char_cjk{ get("charAtOf:cjk1") };
             ctx.check("charAtOf_cjk1_value",  char_cjk.value == "\xE6\x9C\xAC");
             ctx.check("charAtOf_cjk1_len_3",  char_cjk.byte_len == 3);
+
+            // ============ char* (MUTABLE) String-arg branch ==================
+            // convert_jni_arg matches `char*` in the SAME branch as const char* but
+            // it is a DISTINCT overload-resolution target; only const char* was
+            // exercised before.  An ASCII char* round-trips byte-for-byte, a nullptr
+            // char* -> Java null (echo(null) -> "" on both paths), and the Java-side
+            // length proves the non-null char* arrived as a real 12-char String.
+            const observation echo_mut{ get("echo:mutcstr_ascii") };
+            ctx.check("echo_mutcstr_ascii_exact",     echo_mut.value == "mutable-cstr");
+            ctx.check("echo_mutcstr_ascii_is_string", echo_mut.is_string);
+            const observation echo_mut_null{ get("echo:mutcstr_null") };
+            ctx.check("echo_mutcstr_null_value_empty", echo_mut_null.value.empty());
+            const observation len_mut{ get("lengthOf:mutcstr_ascii") };
+            ctx.check("lengthOf_mutcstr_ascii_12", len_mut.value == "len=12");
+
+            // ============ ARG round-trips at UTF-8 LENGTH boundaries ==========
+            // The arg encoder (utf8_to_utf16) must decode each width transition on the
+            // ENCODE side exactly.  BMP -> path-independent byte-exact round-trips.
+            const observation echo_ab{ get("echo:asciiBoundary") };
+            ctx.check("echo_asciiBoundary_round_trip", echo_ab.value == "\x7F\xC2\x80");
+            ctx.check("echo_asciiBoundary_len_3",      echo_ab.byte_len == 3);
+            const observation echo_bb{ get("echo:bmpBoundary") };
+            ctx.check("echo_bmpBoundary_round_trip", echo_bb.value == "\xDF\xBF\xE0\xA0\x80");
+            ctx.check("echo_bmpBoundary_len_5",      echo_bb.byte_len == 5);
+            const observation echo_l1{ get("echo:latin1Hi") };
+            ctx.check("echo_latin1Hi_round_trip", echo_l1.value == "\xC3\xBF");
+            ctx.check("echo_latin1Hi_len_2",      echo_l1.byte_len == 2);
+            const observation echo_uws{ get("echo:unicodeWs") };
+            ctx.check("echo_unicodeWs_round_trip",
+                      echo_uws.value == "\xC2\xA0\xE2\x80\xA8\xE2\x80\xA9");
+            ctx.check("echo_unicodeWs_len_8", echo_uws.byte_len == 8);
+            // Decoder-independent: the asciiBoundary arg arrived as 2 UTF-16 units
+            // (U+007F + U+0080), proving the 2-byte C2 80 was decoded as ONE scalar.
+            const observation len_ab{ get("lengthOf:asciiBoundary") };
+            ctx.check("lengthOf_asciiBoundary_two_units", len_ab.value == "len=2");
+
+            // ============ as_string() vs implicit-conversion AGREEMENT =======
+            // The module's reason for being: as_string() is the unambiguous accessor;
+            // prove it returns byte-identical results to the implicit `std::string s =
+            // call()` copy-init across the value-shape axis (ASCII / Latin-1 / CJK /
+            // interior-NUL / empty).  The interior-NUL case is the sharpest — a
+            // C-string-based implicit path would terminate at the NUL.
+            {
+                const auto ex_reg{ get_extract("extract:regular") };
+                ctx.check("extract_regular_apis_agree", ex_reg.first == ex_reg.second);
+                ctx.check("extract_regular_apis_value", ex_reg.first == "hello world");
+                const auto ex_cafe{ get_extract("extract:cafe") };
+                ctx.check("extract_cafe_apis_agree", ex_cafe.first == ex_cafe.second);
+                ctx.check("extract_cafe_apis_nonempty", !ex_cafe.first.empty());
+                const auto ex_cjk{ get_extract("extract:cjk") };
+                ctx.check("extract_cjk_apis_agree", ex_cjk.first == ex_cjk.second);
+                ctx.check("extract_cjk_apis_value",
+                          ex_cjk.first == "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E");
+                const auto ex_inul{ get_extract("extract:interiorNul") };
+                ctx.check("extract_interiorNul_apis_agree", ex_inul.first == ex_inul.second);
+                ctx.check("extract_interiorNul_apis_past_nul", ex_inul.first.size() >= 3);
+                const auto ex_empty{ get_extract("extract:empty") };
+                ctx.check("extract_empty_apis_agree", ex_empty.first == ex_empty.second);
+                ctx.check("extract_empty_apis_empty", ex_empty.first.empty());
+            }
+
+            // ============ CROSS-SOURCE EQUALITY: instance vs static ==========
+            // The same content returned by an INSTANCE method (GetObjectClass /
+            // CallObjectMethodA) and a STATIC method (FindClass / CallStaticObjectMethodA)
+            // must decode to byte-identical bytes — the two dispatch branches converge on
+            // one decoder result.  (cafe vs staticUnicode, cjk vs staticCjk, emoji vs
+            // staticEmoji, maxBmp vs staticMaxBmp.)
+            ctx.check("cross_cafe_eq_staticUnicode", cafe.value == s_unicode.value);
+            ctx.check("cross_cjk_eq_staticCjk",      cjk.value == s_cjk.value);
+            ctx.check("cross_emoji_eq_staticEmoji",  emoji.value == s_emoji.value);
+            ctx.check("cross_maxBmp_eq_staticMaxBmp", max_bmp.value == s_max_bmp.value);
 
             // ============ 16-bit length-boundary returns =====================
             // 65535 / 65537 'A's straddle the 16-bit boundary; pure ASCII so both
