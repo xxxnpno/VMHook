@@ -147,6 +147,11 @@ namespace
     constexpr const char* SIG_W_J = "(J)J";
     constexpr const char* SIG_W_D = "(D)D";
 
+    // Exact JVM descriptors of the boundary identity families.
+    constexpr const char* SIG_BI = "(I)I";
+    constexpr const char* SIG_BL = "(J)J";
+    constexpr const char* SIG_ES = "(Ljava/lang/String;)Ljava/lang/String;";
+
     // Sentinel for "this capture slot was never written" — distinct from any real
     // result so a body assertion can tell "detour did not run that call" apart
     // from a genuine 0 / empty value.
@@ -208,6 +213,15 @@ namespace
         static auto last_w_arg()    -> std::int64_t { return static_field("lastWArg")->get(); }
         static auto w_long_hits()   -> std::int32_t { return static_field("wLongHits")->get(); }
         static auto w_double_hits() -> std::int32_t { return static_field("wDoubleHits")->get(); }
+
+        // ── boundary identity families (every-possible-input edge coverage) ────
+        static auto last_bi_arg() -> std::int32_t { return static_field("lastBiArg")->get(); }
+        static auto bi_hits()     -> std::int32_t { return static_field("biHits")->get(); }
+        static auto last_bl_arg() -> std::int64_t { return static_field("lastBlArg")->get(); }
+        static auto bl_hits()     -> std::int32_t { return static_field("blHits")->get(); }
+        static auto last_es_arg() -> std::string  { return static_field("lastEsArg")->get(); }
+        static auto last_es_len() -> std::int32_t { return static_field("lastEsLen")->get(); }
+        static auto es_hits()     -> std::int32_t { return static_field("esHits")->get(); }
     };
 
     // ── One captured dispatch result, recorded inside the detour ──────────────
@@ -746,6 +760,89 @@ namespace
         put(key, r);
     }
 
+    // ── BOUNDARY identity captures (every-possible-input edge coverage) ───────
+    // bi(int) / bl(long) / es(String) return their argument unchanged.  Each
+    // capture records BOTH the native round-tripped value and (read back later)
+    // Java's per-call echo, so the module can cross-check native==Java==input for
+    // boundary / overflow / degenerate inputs.  Keyed per input so every edge
+    // value gets its own dispatch_result.
+
+    // C++-typed name-only bi(int): numeric round-trip of one I-slot arg.
+    auto cap_bi(const overload_dispatch& self,
+                const std::string&       key,
+                std::int32_t             a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("bi") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.ival      = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // Explicit-signature bi(int) — pinned (I)I, same round-trip.
+    auto cap_bi_sig(const overload_dispatch& self,
+                    const std::string&       key,
+                    std::int32_t             a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("bi", SIG_BI) };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.ival      = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // C++-typed name-only bl(long): numeric round-trip of one J wide arg.
+    auto cap_bl(const overload_dispatch& self,
+                const std::string&       key,
+                std::int64_t             a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("bl") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.ival      = static_cast<std::int64_t>(v);
+        }
+        put(key, r);
+    }
+
+    // C++-typed name-only es(String): String round-trip (identity).
+    auto cap_es(const overload_dispatch& self,
+                const std::string&       key,
+                const std::string&       a) -> void
+    {
+        dispatch_result r{};
+        auto proxy{ self.get_method("es") };
+        if (proxy.has_value())
+        {
+            r.resolved  = true;
+            r.sig_text  = std::string{ proxy->signature() };
+            const vmhook::method_proxy::value_t v{ proxy->call(a) };
+            r.is_void   = v.is_void();
+            r.is_string = v.is_string();
+            r.sval      = v.as_string();
+        }
+        put(key, r);
+    }
+
     // Run every capture inside the detour against the live receiver.
     auto run_all(const std::unique_ptr<overload_dispatch>& self) -> void
     {
@@ -849,6 +946,38 @@ namespace
         // ============================================================
         cap_named_w_long  (s, "w_long",   W_LONG_ARG);     // w(long 13)  -> 60013
         cap_named_w_double(s, "w_double", W_DOUBLE_ARG);   // w(double 2.5) -> 70002.5
+
+        // ============================================================
+        //  (7) BOUNDARY / OVERFLOW / DEGENERATE inputs through identity
+        //  overloads.  Each value must round-trip EXACTLY: native return ==
+        //  Java echo == input.  Driven LAST so the per-call recorders end on a
+        //  known final value; the hit counts are deterministic (see below).
+        //
+        //  bi(int): 7 typed inputs + 1 explicit-sig => 8 bi dispatches.
+        //  bl(long): 6 typed inputs => 6 bl dispatches.
+        //  es(String): 3 typed inputs (empty, single, large) => 3 es dispatches.
+        // ============================================================
+        cap_bi(s, "bi_zero",  0);
+        cap_bi(s, "bi_one",   1);
+        cap_bi(s, "bi_neg1", -1);
+        cap_bi(s, "bi_min",   static_cast<std::int32_t>(INT32_MIN));
+        cap_bi(s, "bi_max",   static_cast<std::int32_t>(INT32_MAX));
+        cap_bi(s, "bi_42",    42);
+        cap_bi(s, "bi_neg42",-42);
+        cap_bi_sig(s, "bi_max_sig", static_cast<std::int32_t>(INT32_MAX));
+
+        cap_bl(s, "bl_zero",  static_cast<std::int64_t>(0));
+        cap_bl(s, "bl_one",   static_cast<std::int64_t>(1));
+        cap_bl(s, "bl_neg1",  static_cast<std::int64_t>(-1));
+        cap_bl(s, "bl_min",   static_cast<std::int64_t>(INT64_MIN));
+        cap_bl(s, "bl_max",   static_cast<std::int64_t>(INT64_MAX));
+        // A value larger than INT32_MAX proves the J wide path is not truncated
+        // to a single 32-bit slot.
+        cap_bl(s, "bl_wide",  static_cast<std::int64_t>(0x0000'0001'0000'0000LL));
+
+        cap_es(s, "es_empty",  std::string{});                 // ""  (degenerate)
+        cap_es(s, "es_single", std::string{ "Q" });            // single char
+        cap_es(s, "es_large",  std::string(1024, 'z'));        // large (1024 chars)
     }
 }
 
@@ -1444,6 +1573,128 @@ VMHOOK_JVM_MODULE(method_overload_java_dispatch)
             ctx.check("java_w_long_matched_fired",  wl >= 1 && wl <= 2);
             ctx.check("java_w_double_matched_fired", wd >= 1 && wd <= 2);
         }
+
+        // ===================================================================
+        //  EXTRA CROSS-CHECKS on the EXISTING families (deterministic last-write
+        //  + native/Java agreement the prior blocks did not pin).
+        // ===================================================================
+        // The probe drove SINGLETON.tick(11) EXACTLY once, so the Java tick() body
+        // (which bumps tickCount) ran exactly once — a deterministic Java-side
+        // count, robust across i2i-vs-JIT (the body executes once per real call).
+        ctx.check("mojd_tick_count_exactly_one", overload_dispatch::get_tick_count() == 1);
+        // The NATIVE detour fire count is i2i-vs-JIT sensitive (a JIT-recompiled
+        // re-fire of the same single call could perturb it), so characterize it as
+        // [INFO] rather than hard-asserting an exact native fire count (HARD RULE:
+        // exact fire-count asserts are HARD only when robustly observed).
+        ctx.record(std::string{ "[INFO] native detour fire count for the single tick(11) call: " }
+                   + std::to_string(g_detour_calls.load(std::memory_order_relaxed)));
+
+        // `w` family: typed long/double round-trips agree with the int64 view of
+        // each result, and the LAST `w` dispatch in run_all was w(double 2.5), so
+        // Java's shared lastWArg ended as (long)2.5 == 2 (deterministic last-write).
+        {
+            const dispatch_result rl{ got("w_long") };
+            const dispatch_result rd{ got("w_double") };
+            // w(long) numeric result is ALSO reachable as int64 (same alternative).
+            ctx.check("w_long_ival_60013", rl.ival == W_LONG_EXPECT);
+            // w(double) double result truncates to int64 70002 via value_t's
+            // static_cast conversion (70002.5 -> 70002).
+            const std::int64_t wd_trunc{ static_cast<std::int64_t>(got("w_double").dval) };
+            ctx.check("w_double_truncates_to_70002", wd_trunc == 70002);
+            ctx.check("w_double_dval_positive_matches", rd.dval > 70002.0 && rd.dval < 70003.0);
+            // Last w body was w(double 2.5): lastWArg == (long)2.5 == 2.
+            ctx.check("java_last_w_arg_is_two", overload_dispatch::last_w_arg() == 2);
+        }
+
+        // `g` family: the LAST g dispatch in run_all was the explicit-sig g(float
+        // 2.5), whose body records lastGArg=(long)2.5==2 and lastGResult=
+        // (long)4002.75==4002 (deterministic last-write).
+        ctx.check("java_last_g_arg_is_two",     overload_dispatch::last_g_arg() == 2);
+        ctx.check("java_last_g_result_is_4002", overload_dispatch::last_g_result() == 4002);
+
+        // ===================================================================
+        //  (7) BOUNDARY / OVERFLOW / DEGENERATE inputs — identity overloads.
+        //  Each input must round-trip EXACTLY through native dispatch: the
+        //  returned value equals the input, and (cross-check) Java's recorded
+        //  echo equals the input too.  bi(int) covers 0/1/-1/INT_MIN/INT_MAX;
+        //  bl(long) covers 0/1/-1/LONG_MIN/LONG_MAX + a >32-bit value; es(String)
+        //  covers empty/single/large.  These are the "every possible input" edge
+        //  cases the legacy-value blocks (fixed inputs) could not reach.
+        // ===================================================================
+        {
+            // bi(int) boundary round-trips — native return == input.
+            const dispatch_result bz{ got("bi_zero") };
+            ctx.check("bi_zero_resolved", bz.resolved);
+            ctx.check("bi_zero_not_void", !bz.is_void);
+            ctx.check("bi_zero_not_string", !bz.is_string);
+            ctx.check("bi_zero_roundtrip", bz.ival == 0);
+
+            ctx.check("bi_one_roundtrip",  got("bi_one").ival  == 1);
+            ctx.check("bi_neg1_roundtrip", got("bi_neg1").ival == -1);
+            ctx.check("bi_min_roundtrip",
+                      got("bi_min").ival == static_cast<std::int64_t>(INT32_MIN));
+            ctx.check("bi_max_roundtrip",
+                      got("bi_max").ival == static_cast<std::int64_t>(INT32_MAX));
+            ctx.check("bi_42_roundtrip",    got("bi_42").ival    == 42);
+            ctx.check("bi_neg42_roundtrip", got("bi_neg42").ival == -42);
+
+            // Explicit-signature path reports the pinned (I)I and round-trips MAX.
+            const dispatch_result bms{ got("bi_max_sig") };
+            ctx.check("bi_max_sig_resolved", bms.resolved);
+            ctx.check("bi_max_sig_is_I", bms.sig_text == SIG_BI);
+            ctx.check("bi_max_sig_roundtrip",
+                      bms.ival == static_cast<std::int64_t>(INT32_MAX));
+            // Typed and explicit-sig agree on the MAX round-trip.
+            ctx.check("bi_max_paths_agree", got("bi_max").ival == bms.ival);
+
+            // bl(long) boundary round-trips — native return == input (J wide).
+            ctx.check("bl_zero_roundtrip", got("bl_zero").ival == 0);
+            ctx.check("bl_one_roundtrip",  got("bl_one").ival  == 1);
+            ctx.check("bl_neg1_roundtrip", got("bl_neg1").ival == -1);
+            ctx.check("bl_min_roundtrip",  got("bl_min").ival  == INT64_MIN);
+            ctx.check("bl_max_roundtrip",  got("bl_max").ival  == INT64_MAX);
+            // A value above INT32_MAX proves the wide arg is not truncated to 32 bits.
+            ctx.check("bl_wide_roundtrip",
+                      got("bl_wide").ival == static_cast<std::int64_t>(0x0000'0001'0000'0000LL));
+            ctx.check("bl_wide_not_void", !got("bl_wide").is_void);
+
+            // es(String) degenerate / large round-trips — identity returns the arg.
+            const dispatch_result ee{ got("es_empty") };
+            ctx.check("es_empty_resolved", ee.resolved);
+            ctx.check("es_empty_is_string", ee.is_string);
+            ctx.check("es_empty_roundtrip", ee.sval.empty());
+
+            const dispatch_result es1{ got("es_single") };
+            ctx.check("es_single_is_string", es1.is_string);
+            ctx.check("es_single_roundtrip", es1.sval == "Q");
+
+            const dispatch_result el{ got("es_large") };
+            ctx.check("es_large_is_string", el.is_string);
+            ctx.check("es_large_len_1024", el.sval.size() == 1024u);
+            ctx.check("es_large_roundtrip", el.sval == std::string(1024, 'z'));
+        }
+
+        // ── Boundary families: Java-side echo CROSS-CHECKS + exact hit counts ──
+        // Hit counts are deterministic: bi fired 8x (7 typed + 1 sig), bl 6x,
+        // es 3x.  The LAST call of each family pins Java's shared recorder.
+        ctx.check("java_bi_hits_eight", overload_dispatch::bi_hits() == 8);
+        ctx.check("java_bl_hits_six",   overload_dispatch::bl_hits() == 6);
+        ctx.check("java_es_hits_three", overload_dispatch::es_hits() == 3);
+        // Last bi dispatch was bi(INT32_MAX) (the explicit-sig call); last bl was
+        // bl(0x1_0000_0000); last es was es(1024 'z').  Java's echo must agree.
+        ctx.check("java_last_bi_arg_is_max",
+                  overload_dispatch::last_bi_arg() == static_cast<std::int32_t>(INT32_MAX));
+        ctx.check("java_last_bl_arg_is_wide",
+                  overload_dispatch::last_bl_arg() == static_cast<std::int64_t>(0x0000'0001'0000'0000LL));
+        ctx.check("java_last_es_len_1024", overload_dispatch::last_es_len() == 1024);
+        ctx.check("java_last_es_arg_large",
+                  overload_dispatch::last_es_arg() == std::string(1024, 'z'));
+        // Native round-tripped value AGREES with Java's recorded echo for the MAX
+        // boundary (native==Java==input — the full cross-check loop).
+        ctx.check("bi_max_native_equals_java_echo",
+                  got("bi_max").ival == static_cast<std::int64_t>(overload_dispatch::last_bi_arg()));
+        ctx.check("bl_wide_native_equals_java_echo",
+                  got("bl_wide").ival == overload_dispatch::last_bl_arg());
     }
     // scoped_hook `handle` disarms here — NO hook left armed; shutdown_hooks()
     // intentionally NOT called (other method_* modules share this JVM).

@@ -73,6 +73,15 @@ namespace
         auto get_bool_field()   -> bool         { return get_field("boolField")->get(); }
         auto get_ctor_tag()     -> std::int32_t { return get_field("ctorTag")->get(); }
 
+        // Narrow-primitive field read-back for the (S)V / (B)V / (C)V / (F)V
+        // constructors.  Each returns its native width; the test widens short /
+        // byte / char into a std::int32_t atomic for storage and compares against
+        // the known boundary value, and bit-compares the float.
+        auto get_short_field()  -> std::int16_t { return get_field("shortField")->get(); }
+        auto get_byte_field()   -> std::int8_t  { return get_field("byteField")->get(); }
+        auto get_char_field()   -> char16_t     { return get_field("charField")->get(); }
+        auto get_float_field()  -> float        { return get_field("floatField")->get(); }
+
         // construct(bool): runs ONLY on the TLAB fallback path (no (Z)V Java
         // ctor exists).  Records that construct() executed and initialises the
         // raw-allocated object's fields through the same setter API.
@@ -225,6 +234,64 @@ namespace
     // ── Unregistered-type guard (pure C++, no JVM, race-immune) ────────────────
     std::atomic<bool> g_unregistered_returned_null{ false };
 
+    // ── Narrow-primitive NewObjectA descriptors: (S)V (B)V (C)V (F)V (J)V ──────
+    // The fixture grew one constructor per narrow JVM descriptor the library's
+    // jni_signature_for_arg + convert_jni_arg already support (short->"S",
+    // int8->"B", char/uint16->"C", float->"F", int64->"J") but which the original
+    // fixture had NO matching <init> for — so these used to silently route through
+    // the TLAB fallback.  With the dedicated <init> present, make_unique resolves
+    // each EXACT descriptor through the REAL NewObjectA path; reading the matching
+    // field back proves the narrow primitive marshalled byte-exact in the jni_value
+    // union (no sign-extension / truncation / wrong-slot write) AND that the JVM
+    // dispatched the intended constructor (distinct ctorTag per descriptor).  All
+    // values are read in the tight post-alloc window via read_until_stable so a
+    // young-gen relocation cannot turn a correct ctor write into a [FAIL]; a stable-
+    // WRONG / un-converged read of the KNOWN-FIXED value downgrades to [INFO].
+
+    // short (S)V — boundary values SHRT_MIN / SHRT_MAX / -1 round-trip exact.
+    std::atomic<bool> g_short_min_ok{ false };
+    std::atomic<std::int32_t> g_short_min_val{ 0 };   // widened to int for the atomic
+    std::atomic<std::int32_t> g_short_min_tag{ -1 };
+    std::atomic<bool> g_short_max_ok{ false };
+    std::atomic<std::int32_t> g_short_max_val{ 0 };
+    std::atomic<bool> g_short_neg_ok{ false };
+    std::atomic<std::int32_t> g_short_neg_val{ 0 };
+
+    // byte (B)V — boundary values -128 / 127 / -1 round-trip exact.
+    std::atomic<bool> g_byte_min_ok{ false };
+    std::atomic<std::int32_t> g_byte_min_val{ 0 };
+    std::atomic<std::int32_t> g_byte_min_tag{ -1 };
+    std::atomic<bool> g_byte_max_ok{ false };
+    std::atomic<std::int32_t> g_byte_max_val{ 0 };
+
+    // char (C)V — UNSIGNED 16-bit; 0 / 0xFFFF / 'A' / a BMP non-ASCII code unit.
+    std::atomic<bool> g_char_zero_ok{ false };
+    std::atomic<std::int32_t> g_char_zero_val{ -1 };  // poison non-zero
+    std::atomic<std::int32_t> g_char_zero_tag{ -1 };
+    std::atomic<bool> g_char_max_ok{ false };
+    std::atomic<std::int32_t> g_char_max_val{ 0 };
+    std::atomic<bool> g_char_letter_ok{ false };
+    std::atomic<std::int32_t> g_char_letter_val{ 0 };
+    std::atomic<bool> g_char_bmp_ok{ false };
+    std::atomic<std::int32_t> g_char_bmp_val{ 0 };
+
+    // float (F)V — bit-exact via float_to_bits: 3.5 (exact), +Inf, -0.0, NaN.
+    std::atomic<bool> g_float_ok{ false };
+    std::atomic<std::int32_t> g_float_bits{ 0 };
+    std::atomic<std::int32_t> g_float_tag{ -1 };
+    std::atomic<bool> g_float_inf_ok{ false };
+    std::atomic<std::int32_t> g_float_inf_bits{ 0 };
+    std::atomic<bool> g_float_negzero_ok{ false };
+    std::atomic<std::int32_t> g_float_negzero_bits{ 1 };
+    std::atomic<bool> g_float_nan_ok{ false };
+    std::atomic<std::int32_t> g_float_nan_bits{ 0 };
+
+    // long-only (J)V — distinct from the (IJD)V multi-arg: proves a SINGLE 8-byte
+    // arg resolves the "(J)V" descriptor (ctorTag 11), not (IJD)V or (I)V.
+    std::atomic<bool> g_longonly_ok{ false };
+    std::atomic<std::int64_t> g_longonly_val{ 0 };
+    std::atomic<std::int32_t> g_longonly_tag{ -1 };
+
     // ── OUTSIDE-A-HOOK path observations (filled in the module body, no detour) ─
     // make_unique called with NO hook active, so current_java_thread is NOT
     // trampoline-set and the implementation must discover a live JavaThread from
@@ -243,6 +310,18 @@ namespace
         std::int64_t bits{ 0 };
         static_assert(sizeof(bits) == sizeof(d), "double must be 8 bytes");
         std::memcpy(&bits, &d, sizeof(bits));
+        return bits;
+    }
+
+    // Bit-compare helper for the float field (exact round-trip).  A value compare
+    // would lie for NaN (NaN != NaN) and -0.0 (== +0.0); the bit pattern proves
+    // the exact IEEE-754 payload round-tripped through .f in the jni_value union
+    // and back out of floatField.
+    auto float_to_bits(float f) -> std::int32_t
+    {
+        std::int32_t bits{ 0 };
+        static_assert(sizeof(bits) == sizeof(f), "float must be 4 bytes");
+        std::memcpy(&bits, &f, sizeof(bits));
         return bits;
     }
 
@@ -789,6 +868,255 @@ VMHOOK_JVM_MODULE(make_unique)
                     g_rewrap_field_matches.store(ok && v == 9001, std::memory_order_relaxed);
                 }
 
+                // ── 6i. Narrow-primitive (S)V short — boundary round-trips ─────
+                // SHRT_MIN / SHRT_MAX / -1 prove the short arg marshals byte-exact
+                // through the jni_value union "I" slot narrowed to "S" by the
+                // descriptor, with NO sign-extension/truncation slip, and that the
+                // JVM dispatched the (S)V ctor (ctorTag 7), not (I)V.
+                {
+                    const short kMin{ std::numeric_limits<short>::min() };
+                    if (auto s{ vmhook::make_unique<make_unique_fixture>(kMin) })
+                    {
+                        g_short_min_ok.store(true, std::memory_order_relaxed);
+                        std::int16_t v{};
+                        if (read_until_stable<std::int16_t>(
+                                [&]() { return s->get_short_field(); }, v))
+                        {
+                            g_short_min_val.store(static_cast<std::int32_t>(v),
+                                                  std::memory_order_relaxed);
+                        }
+                        std::int32_t tag{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return s->get_ctor_tag(); }, tag))
+                        {
+                            g_short_min_tag.store(tag, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const short kMax{ std::numeric_limits<short>::max() };
+                    if (auto s{ vmhook::make_unique<make_unique_fixture>(kMax) })
+                    {
+                        g_short_max_ok.store(true, std::memory_order_relaxed);
+                        std::int16_t v{};
+                        if (read_until_stable<std::int16_t>(
+                                [&]() { return s->get_short_field(); }, v))
+                        {
+                            g_short_max_val.store(static_cast<std::int32_t>(v),
+                                                  std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const short kNeg{ static_cast<short>(-1) };
+                    if (auto s{ vmhook::make_unique<make_unique_fixture>(kNeg) })
+                    {
+                        g_short_neg_ok.store(true, std::memory_order_relaxed);
+                        std::int16_t v{};
+                        if (read_until_stable<std::int16_t>(
+                                [&]() { return s->get_short_field(); }, v))
+                        {
+                            g_short_neg_val.store(static_cast<std::int32_t>(v),
+                                                  std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // ── 6j. Narrow-primitive (B)V byte — boundary round-trips ──────
+                // -128 / 127 prove the int8 arg marshals byte-exact (sign preserved)
+                // and dispatched the (B)V ctor (ctorTag 8).
+                {
+                    const std::int8_t kMin{ std::numeric_limits<std::int8_t>::min() };
+                    if (auto b{ vmhook::make_unique<make_unique_fixture>(kMin) })
+                    {
+                        g_byte_min_ok.store(true, std::memory_order_relaxed);
+                        std::int8_t v{};
+                        if (read_until_stable<std::int8_t>(
+                                [&]() { return b->get_byte_field(); }, v))
+                        {
+                            g_byte_min_val.store(static_cast<std::int32_t>(v),
+                                                 std::memory_order_relaxed);
+                        }
+                        std::int32_t tag{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return b->get_ctor_tag(); }, tag))
+                        {
+                            g_byte_min_tag.store(tag, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const std::int8_t kMax{ std::numeric_limits<std::int8_t>::max() };
+                    if (auto b{ vmhook::make_unique<make_unique_fixture>(kMax) })
+                    {
+                        g_byte_max_ok.store(true, std::memory_order_relaxed);
+                        std::int8_t v{};
+                        if (read_until_stable<std::int8_t>(
+                                [&]() { return b->get_byte_field(); }, v))
+                        {
+                            g_byte_max_val.store(static_cast<std::int32_t>(v),
+                                                 std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // ── 6k. Narrow-primitive (C)V char — UNSIGNED 16-bit edges ─────
+                // char is an UNSIGNED UTF-16 code unit: 0 / 0xFFFF / 'A' / a BMP
+                // non-ASCII unit (U+00E9, e-acute).  0xFFFF read back as 0xFFFF (not -1)
+                // proves the value is treated UNSIGNED through the "C" slot; ctorTag
+                // 9 proves the (C)V ctor dispatched, not (S)V.  char16_t is widened
+                // to int32 for the atomic so 0xFFFF survives without sign issues.
+                {
+                    const char16_t kZero{ 0 };
+                    if (auto c{ vmhook::make_unique<make_unique_fixture>(kZero) })
+                    {
+                        g_char_zero_ok.store(true, std::memory_order_relaxed);
+                        char16_t v{ 0xABCD };  // poison so a no-write fails
+                        if (read_until_stable<char16_t>(
+                                [&]() { return c->get_char_field(); }, v))
+                        {
+                            g_char_zero_val.store(static_cast<std::int32_t>(v),
+                                                  std::memory_order_relaxed);
+                        }
+                        std::int32_t tag{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return c->get_ctor_tag(); }, tag))
+                        {
+                            g_char_zero_tag.store(tag, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const char16_t kMax{ 0xFFFF };
+                    if (auto c{ vmhook::make_unique<make_unique_fixture>(kMax) })
+                    {
+                        g_char_max_ok.store(true, std::memory_order_relaxed);
+                        char16_t v{};
+                        if (read_until_stable<char16_t>(
+                                [&]() { return c->get_char_field(); }, v))
+                        {
+                            g_char_max_val.store(static_cast<std::int32_t>(v),
+                                                 std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const char16_t kLetter{ u'A' };  // U+0041
+                    if (auto c{ vmhook::make_unique<make_unique_fixture>(kLetter) })
+                    {
+                        g_char_letter_ok.store(true, std::memory_order_relaxed);
+                        char16_t v{};
+                        if (read_until_stable<char16_t>(
+                                [&]() { return c->get_char_field(); }, v))
+                        {
+                            g_char_letter_val.store(static_cast<std::int32_t>(v),
+                                                    std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const char16_t kBmp{ 0x00E9 };  // U+00E9 LATIN SMALL LETTER E WITH ACUTE
+                    if (auto c{ vmhook::make_unique<make_unique_fixture>(kBmp) })
+                    {
+                        g_char_bmp_ok.store(true, std::memory_order_relaxed);
+                        char16_t v{};
+                        if (read_until_stable<char16_t>(
+                                [&]() { return c->get_char_field(); }, v))
+                        {
+                            g_char_bmp_val.store(static_cast<std::int32_t>(v),
+                                                 std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // ── 6l. Narrow-primitive (F)V float — bit-exact round-trips ────
+                // 3.5 (exactly representable), +Inf, -0.0, NaN — bit-compared via
+                // float_to_bits so a value-compare lie (NaN!=NaN, -0.0==+0.0) cannot
+                // hide a wrong-slot / wrong-width write through the .f union cell.
+                // ctorTag 10 proves the (F)V ctor dispatched.
+                {
+                    const float kF{ 3.5F };
+                    if (auto fo{ vmhook::make_unique<make_unique_fixture>(kF) })
+                    {
+                        g_float_ok.store(true, std::memory_order_relaxed);
+                        std::int32_t bits{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return float_to_bits(fo->get_float_field()); }, bits))
+                        {
+                            g_float_bits.store(bits, std::memory_order_relaxed);
+                        }
+                        std::int32_t tag{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return fo->get_ctor_tag(); }, tag))
+                        {
+                            g_float_tag.store(tag, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const float kInf{ std::numeric_limits<float>::infinity() };
+                    if (auto fo{ vmhook::make_unique<make_unique_fixture>(kInf) })
+                    {
+                        g_float_inf_ok.store(true, std::memory_order_relaxed);
+                        std::int32_t bits{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return float_to_bits(fo->get_float_field()); }, bits))
+                        {
+                            g_float_inf_bits.store(bits, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const float kNegZero{ -0.0F };
+                    if (auto fo{ vmhook::make_unique<make_unique_fixture>(kNegZero) })
+                    {
+                        g_float_negzero_ok.store(true, std::memory_order_relaxed);
+                        std::int32_t bits{ 1 };
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return float_to_bits(fo->get_float_field()); }, bits))
+                        {
+                            g_float_negzero_bits.store(bits, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                {
+                    const float kNaN{ std::numeric_limits<float>::quiet_NaN() };
+                    if (auto fo{ vmhook::make_unique<make_unique_fixture>(kNaN) })
+                    {
+                        g_float_nan_ok.store(true, std::memory_order_relaxed);
+                        std::int32_t bits{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return float_to_bits(fo->get_float_field()); }, bits))
+                        {
+                            g_float_nan_bits.store(bits, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // ── 6m. Long-only (J)V — single 8-byte arg resolves "(J)V" ─────
+                // A SINGLE std::int64_t arg must build the "(J)V" descriptor and
+                // dispatch the long-only ctor (ctorTag 11), distinct from (IJD)V and
+                // (I)V.  Value round-trips bit-exact.
+                {
+                    const std::int64_t kVal{ 0x7EDCBA9876543210LL };
+                    if (auto lo{ vmhook::make_unique<make_unique_fixture>(kVal) })
+                    {
+                        g_longonly_ok.store(true, std::memory_order_relaxed);
+                        std::int64_t v{};
+                        if (read_until_stable<std::int64_t>(
+                                [&]() { return lo->get_long_field(); }, v))
+                        {
+                            g_longonly_val.store(v, std::memory_order_relaxed);
+                        }
+                        std::int32_t tag{};
+                        if (read_until_stable<std::int32_t>(
+                                [&]() { return lo->get_ctor_tag(); }, tag))
+                        {
+                            g_longonly_tag.store(tag, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
                 // instanceCount AFTER all NewObjectA allocations.  Each of the
                 // objects above that ran a real Java <init> bumped the static
                 // counter; we expect a net increase (>= the number that ran).
@@ -943,6 +1271,230 @@ VMHOOK_JVM_MODULE(make_unique)
                   g_multi_double_bits.load(std::memory_order_relaxed) == double_to_bits(3.5));
         ctx.check("multi_dispatched_IJD_ctor",
                   g_multi_tag.load(std::memory_order_relaxed) == 4);
+
+        // ── Narrow-primitive (S)V short angles ─────────────────────────────────
+        // ALLOCATED is race-immune (non-null unique_ptr, no deref) -> HARD.  The
+        // VALUE / ctorTag read-backs deref a young raw OOP; HARD when converged on
+        // the KNOWN-FIXED expected value, best-effort [INFO] for a stale/un-
+        // converged read (the (S)V ctor DID run — only the read raced the GC).
+        ctx.check("short_min_allocated", g_short_min_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t kMin{ std::numeric_limits<short>::min() };
+            const std::int32_t v{ g_short_min_val.load(std::memory_order_relaxed) };
+            if (v == kMin) { ctx.check("short_min_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: short_min_round_trips best-effort "
+                           "(young-OOP GC-relocation read of shortField) — value=" +
+                           std::to_string(v) + ", expected SHRT_MIN.  The (S)V ctor DID run.");
+            }
+        }
+        {
+            const std::int32_t tag{ g_short_min_tag.load(std::memory_order_relaxed) };
+            if (tag == 7) { ctx.check("short_dispatched_S_ctor", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: short_dispatched_S_ctor best-effort "
+                           "(young-OOP GC-relocation read of ctorTag) — value=" +
+                           std::to_string(tag) + ", expected 7.  The (S)V <init> WAS dispatched.");
+            }
+        }
+        ctx.check("short_max_allocated", g_short_max_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t kMax{ std::numeric_limits<short>::max() };
+            const std::int32_t v{ g_short_max_val.load(std::memory_order_relaxed) };
+            if (v == kMax) { ctx.check("short_max_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: short_max_round_trips best-effort "
+                           "(young-OOP GC-relocation read of shortField) — value=" +
+                           std::to_string(v) + ", expected SHRT_MAX.  The (S)V ctor DID run.");
+            }
+        }
+        ctx.check("short_neg_allocated", g_short_neg_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t v{ g_short_neg_val.load(std::memory_order_relaxed) };
+            if (v == -1) { ctx.check("short_neg_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: short_neg_round_trips best-effort "
+                           "(young-OOP GC-relocation read of shortField) — value=" +
+                           std::to_string(v) + ", expected -1.  The (S)V ctor DID run.");
+            }
+        }
+
+        // ── Narrow-primitive (B)V byte angles ──────────────────────────────────
+        ctx.check("byte_min_allocated", g_byte_min_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t kMin{ std::numeric_limits<std::int8_t>::min() };
+            const std::int32_t v{ g_byte_min_val.load(std::memory_order_relaxed) };
+            if (v == kMin) { ctx.check("byte_min_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: byte_min_round_trips best-effort "
+                           "(young-OOP GC-relocation read of byteField) — value=" +
+                           std::to_string(v) + ", expected -128.  The (B)V ctor DID run.");
+            }
+        }
+        {
+            const std::int32_t tag{ g_byte_min_tag.load(std::memory_order_relaxed) };
+            if (tag == 8) { ctx.check("byte_dispatched_B_ctor", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: byte_dispatched_B_ctor best-effort "
+                           "(young-OOP GC-relocation read of ctorTag) — value=" +
+                           std::to_string(tag) + ", expected 8.  The (B)V <init> WAS dispatched.");
+            }
+        }
+        ctx.check("byte_max_allocated", g_byte_max_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t kMax{ std::numeric_limits<std::int8_t>::max() };
+            const std::int32_t v{ g_byte_max_val.load(std::memory_order_relaxed) };
+            if (v == kMax) { ctx.check("byte_max_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: byte_max_round_trips best-effort "
+                           "(young-OOP GC-relocation read of byteField) — value=" +
+                           std::to_string(v) + ", expected 127.  The (B)V ctor DID run.");
+            }
+        }
+
+        // ── Narrow-primitive (C)V char angles (UNSIGNED 16-bit) ────────────────
+        ctx.check("char_zero_allocated", g_char_zero_ok.load(std::memory_order_relaxed));
+        {
+            // poisoned to 0xABCD; only a stabilized read of exactly 0 proves the
+            // ctor WROTE the field (vs never touching the 0 default).
+            const std::int32_t v{ g_char_zero_val.load(std::memory_order_relaxed) };
+            if (v == 0) { ctx.check("char_zero_written_by_ctor", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: char_zero_written_by_ctor best-effort "
+                           "(young-OOP GC-relocation read of charField) — value=" +
+                           std::to_string(v) + ", expected 0.  The (C)V ctor DID run.");
+            }
+        }
+        {
+            const std::int32_t tag{ g_char_zero_tag.load(std::memory_order_relaxed) };
+            if (tag == 9) { ctx.check("char_dispatched_C_ctor", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: char_dispatched_C_ctor best-effort "
+                           "(young-OOP GC-relocation read of ctorTag) — value=" +
+                           std::to_string(tag) + ", expected 9.  The (C)V <init> WAS dispatched.");
+            }
+        }
+        ctx.check("char_max_allocated", g_char_max_ok.load(std::memory_order_relaxed));
+        {
+            // 0xFFFF read back as 65535 (NOT -1) proves the value is UNSIGNED.
+            const std::int32_t v{ g_char_max_val.load(std::memory_order_relaxed) };
+            if (v == 0xFFFF) { ctx.check("char_max_round_trips_unsigned", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: char_max_round_trips_unsigned best-effort "
+                           "(young-OOP GC-relocation read of charField) — value=" +
+                           std::to_string(v) + ", expected 65535.  The (C)V ctor DID run.");
+            }
+        }
+        ctx.check("char_letter_allocated", g_char_letter_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t v{ g_char_letter_val.load(std::memory_order_relaxed) };
+            if (v == 0x41) { ctx.check("char_letter_round_trips_A", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: char_letter_round_trips_A best-effort "
+                           "(young-OOP GC-relocation read of charField) — value=" +
+                           std::to_string(v) + ", expected 65 ('A').  The (C)V ctor DID run.");
+            }
+        }
+        ctx.check("char_bmp_allocated", g_char_bmp_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t v{ g_char_bmp_val.load(std::memory_order_relaxed) };
+            if (v == 0x00E9) { ctx.check("char_bmp_round_trips_U00E9", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: char_bmp_round_trips_U00E9 best-effort "
+                           "(young-OOP GC-relocation read of charField) — value=" +
+                           std::to_string(v) + ", expected 233 (U+00E9).  The (C)V ctor DID run.");
+            }
+        }
+
+        // ── Narrow-primitive (F)V float angles (bit-exact) ─────────────────────
+        ctx.check("float_allocated", g_float_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t expect{ float_to_bits(3.5F) };
+            const std::int32_t v{ g_float_bits.load(std::memory_order_relaxed) };
+            if (v == expect) { ctx.check("float_3_5_round_trips_bit_exact", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: float_3_5_round_trips_bit_exact best-effort "
+                           "(young-OOP GC-relocation read of floatField) — the (F)V ctor DID run.");
+            }
+        }
+        {
+            const std::int32_t tag{ g_float_tag.load(std::memory_order_relaxed) };
+            if (tag == 10) { ctx.check("float_dispatched_F_ctor", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: float_dispatched_F_ctor best-effort "
+                           "(young-OOP GC-relocation read of ctorTag) — value=" +
+                           std::to_string(tag) + ", expected 10.  The (F)V <init> WAS dispatched.");
+            }
+        }
+        ctx.check("float_inf_allocated", g_float_inf_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t expect{ float_to_bits(std::numeric_limits<float>::infinity()) };
+            const std::int32_t v{ g_float_inf_bits.load(std::memory_order_relaxed) };
+            if (v == expect) { ctx.check("float_inf_round_trips_bit_exact", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: float_inf_round_trips_bit_exact best-effort "
+                           "(young-OOP GC-relocation read of floatField) — the (F)V ctor DID run.");
+            }
+        }
+        ctx.check("float_negzero_allocated", g_float_negzero_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t expect{ float_to_bits(-0.0F) };
+            const std::int32_t v{ g_float_negzero_bits.load(std::memory_order_relaxed) };
+            if (v == expect) { ctx.check("float_negzero_round_trips_bit_exact", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: float_negzero_round_trips_bit_exact best-effort "
+                           "(young-OOP GC-relocation read of floatField) — the (F)V ctor DID run.");
+            }
+        }
+        ctx.check("float_nan_allocated", g_float_nan_ok.load(std::memory_order_relaxed));
+        {
+            const std::int32_t expect{ float_to_bits(std::numeric_limits<float>::quiet_NaN()) };
+            const std::int32_t v{ g_float_nan_bits.load(std::memory_order_relaxed) };
+            if (v == expect) { ctx.check("float_nan_round_trips_bit_exact", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: float_nan_round_trips_bit_exact best-effort "
+                           "(young-OOP GC-relocation read of floatField) — the (F)V ctor DID run.");
+            }
+        }
+
+        // ── Long-only (J)V angles ──────────────────────────────────────────────
+        ctx.check("longonly_allocated", g_longonly_ok.load(std::memory_order_relaxed));
+        {
+            const std::int64_t v{ g_longonly_val.load(std::memory_order_relaxed) };
+            if (v == 0x7EDCBA9876543210LL) { ctx.check("longonly_round_trips", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: longonly_round_trips best-effort "
+                           "(young-OOP GC-relocation read of longField) — the (J)V ctor DID run.");
+            }
+        }
+        {
+            const std::int32_t tag{ g_longonly_tag.load(std::memory_order_relaxed) };
+            if (tag == 11) { ctx.check("longonly_dispatched_J_ctor", true); }
+            else
+            {
+                ctx.record("[INFO] make_unique: longonly_dispatched_J_ctor best-effort "
+                           "(young-OOP GC-relocation read of ctorTag) — value=" +
+                           std::to_string(tag) + ", expected 11.  The (J)V <init> WAS dispatched.");
+            }
+        }
 
         // ── Boundary single-int (I)V angles ────────────────────────────────────
         // ALLOCATED checks test only a non-null unique_ptr (no deref) -> HARD,

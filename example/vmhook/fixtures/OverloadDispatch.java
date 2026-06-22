@@ -155,6 +155,22 @@ public final class OverloadDispatch
     public static volatile int     wLongHits;        // w(long)   invocation count
     public static volatile int     wDoubleHits;      // w(double) invocation count
 
+    // ── Boundary identity families (every-possible-input edge coverage) ─────────
+    // bi(int), bl(long) and es(String) are IDENTITY overloads (return the argument
+    // unchanged) with PER-CALL recorders, so the native side can drive boundary /
+    // overflow / degenerate inputs (0, 1, -1, MIN/MAX, empty / single / large
+    // strings) and cross-check the returned value AND Java's recorded echo against
+    // the exact input — without disturbing the f/g/h/p/w/sf recorders that the
+    // legacy-value blocks above assert on.  Each is a single-descriptor family so
+    // resolution is unambiguous on both the typed and explicit-signature paths.
+    public static volatile int     lastBiArg;        // last bi(int) argument
+    public static volatile int     biHits;           // bi(int) invocation count
+    public static volatile long    lastBlArg;        // last bl(long) argument
+    public static volatile int     blHits;           // bl(long) invocation count
+    public static volatile String  lastEsArg;        // last es(String) argument
+    public static volatile int     lastEsLen;        // last es(String) arg length
+    public static volatile int     esHits;           // es(String) invocation count
+
     /** tick() invocation count — handshake proof the detour fired. */
     public static volatile int     tickCount;
 
@@ -349,6 +365,33 @@ public final class OverloadDispatch
         lastSfArg = s;
         sfHits++;
         return r;
+    }
+
+    // ── Boundary identity overloads (return arg unchanged; per-call recorders) ──
+
+    /** bi(I)I -> x (identity) — boundary int round-trip probe */
+    public int bi(final int x)
+    {
+        lastBiArg = x;
+        biHits++;
+        return x;
+    }
+
+    /** bl(J)J -> x (identity) — boundary long round-trip probe */
+    public long bl(final long x)
+    {
+        lastBlArg = x;
+        blHits++;
+        return x;
+    }
+
+    /** es(Ljava/lang/String;)Ljava/lang/String; -> s (identity) — boundary String probe */
+    public String es(final String s)
+    {
+        lastEsArg = s;
+        lastEsLen = (s == null) ? -1 : s.length();
+        esHits++;
+        return s;
     }
 
     static

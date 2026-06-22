@@ -54,6 +54,7 @@
 #include "../harness.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -793,5 +794,299 @@ VMHOOK_JVM_MODULE(find_class_fallback)
                    "ClassLoader.loadClass path cannot resolve array NAMES, but the graph "
                    "walk does once the array klass is loaded (PART B) — so array lookups "
                    "succeed end-to-end here.");
+    }
+
+    // =====================================================================
+    //  PART J - EXTENDED super-chain identity invariants.  find_class must
+    //  resolve BOTH ends of a stable, never-refactored hierarchy to klasses
+    //  whose _super pointers cross-agree.  These hold on EVERY JDK 8..26:
+    //    java/lang/Class       extends java/lang/Object
+    //    java/lang/Thread      extends java/lang/Object
+    //    java/util/ArrayList   extends java/util/AbstractList
+    //    java/util/HashMap     extends java/util/AbstractMap
+    //  Each is a CROSS-CLASS identity check (one klass's _super IS the klass
+    //  find_class returns for the parent name), not mere per-name resolution.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const k_object{ vmhook::find_class("java/lang/Object") };
+        vmhook::hotspot::klass* const k_class{ vmhook::find_class("java/lang/Class") };
+        vmhook::hotspot::klass* const k_thread{ vmhook::find_class("java/lang/Thread") };
+
+        if (k_class != nullptr && k_object != nullptr)
+        {
+            ctx.check("superchain_Class_super_is_Object", k_class->get_super() == k_object);
+        }
+        if (k_thread != nullptr && k_object != nullptr)
+        {
+            ctx.check("superchain_Thread_super_is_Object", k_thread->get_super() == k_object);
+        }
+
+        vmhook::hotspot::klass* const k_arraylist{ vmhook::find_class("java/util/ArrayList") };
+        vmhook::hotspot::klass* const k_abslist{ vmhook::find_class("java/util/AbstractList") };
+        if (k_arraylist != nullptr && k_abslist != nullptr)
+        {
+            ctx.check("superchain_ArrayList_super_is_AbstractList",
+                      k_arraylist->get_super() == k_abslist);
+            ctx.check("superchain_AbstractList_name_matches",
+                      klass_name(k_abslist) == "java/util/AbstractList");
+        }
+
+        vmhook::hotspot::klass* const k_hashmap{ vmhook::find_class("java/util/HashMap") };
+        vmhook::hotspot::klass* const k_absmap{ vmhook::find_class("java/util/AbstractMap") };
+        if (k_hashmap != nullptr && k_absmap != nullptr)
+        {
+            ctx.check("superchain_HashMap_super_is_AbstractMap",
+                      k_hashmap->get_super() == k_absmap);
+            ctx.check("superchain_AbstractMap_name_matches",
+                      klass_name(k_absmap) == "java/util/AbstractMap");
+        }
+
+        // Walk Integer's full super-chain up to the root and assert every link is
+        // the genuine klass find_class returns for that ancestor's name, and that
+        // the chain TERMINATES at Object whose _super is null - a multi-hop
+        // identity proof, universal across all JDKs.
+        vmhook::hotspot::klass* const k_integer{ vmhook::find_class("java/lang/Integer") };
+        vmhook::hotspot::klass* const k_number{ vmhook::find_class("java/lang/Number") };
+        if (k_integer != nullptr && k_number != nullptr && k_object != nullptr)
+        {
+            vmhook::hotspot::klass* const up1{ k_integer->get_super() };  // Number
+            ctx.check("superwalk_Integer_to_Number", up1 == k_number);
+            if (up1 != nullptr && vmhook::hotspot::is_valid_pointer(up1))
+            {
+                vmhook::hotspot::klass* const up2{ up1->get_super() };    // Object
+                ctx.check("superwalk_Number_to_Object", up2 == k_object);
+                if (up2 != nullptr && vmhook::hotspot::is_valid_pointer(up2))
+                {
+                    ctx.check("superwalk_terminates_at_Object_root",
+                              up2->get_super() == nullptr);
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    //  PART K - java.lang.Class MIRROR identity / idempotency cross-checks.
+    //  A klass's mirror is a stable per-klass object: the SAME klass yields
+    //  the SAME mirror pointer across repeated reads, and DISTINCT klasses
+    //  yield DISTINCT mirror pointers.  Every mirror deref is guarded.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const k_object{ vmhook::find_class("java/lang/Object") };
+        vmhook::hotspot::klass* const k_string{ vmhook::find_class("java/lang/String") };
+        vmhook::hotspot::klass* const k_integer{ vmhook::find_class("java/lang/Integer") };
+
+        if (k_object != nullptr && vmhook::hotspot::is_valid_pointer(k_object))
+        {
+            void* const m1{ k_object->get_java_mirror() };
+            void* const m2{ k_object->get_java_mirror() };
+            ctx.check("mirror_idempotent_same_klass", m1 != nullptr && m1 == m2);
+        }
+
+        if (k_object != nullptr && k_string != nullptr && k_integer != nullptr
+            && vmhook::hotspot::is_valid_pointer(k_object)
+            && vmhook::hotspot::is_valid_pointer(k_string)
+            && vmhook::hotspot::is_valid_pointer(k_integer))
+        {
+            void* const mo{ k_object->get_java_mirror() };
+            void* const ms{ k_string->get_java_mirror() };
+            void* const mi{ k_integer->get_java_mirror() };
+            if (mo != nullptr && ms != nullptr && mi != nullptr)
+            {
+                ctx.check("mirror_distinct_klasses_distinct_mirrors",
+                          mo != ms && ms != mi && mo != mi);
+            }
+        }
+
+        // The application klass's mirror is distinct from the bootstrap String's.
+        vmhook::hotspot::klass* const k_probe{ vmhook::find_class(PROBE_NAME) };
+        if (k_probe != nullptr && k_string != nullptr
+            && vmhook::hotspot::is_valid_pointer(k_probe)
+            && vmhook::hotspot::is_valid_pointer(k_string))
+        {
+            void* const mp{ k_probe->get_java_mirror() };
+            void* const ms{ k_string->get_java_mirror() };
+            if (mp != nullptr && ms != nullptr)
+            {
+                ctx.check("mirror_app_class_distinct_from_bootstrap", mp != ms);
+            }
+        }
+    }
+
+    // =====================================================================
+    //  PART L - get_instance_size() characterization for resolved klasses.
+    //  An ordinary, instantiable instance klass (java/lang/Object,
+    //  java/lang/Integer, the app fixture) has a POSITIVE instance size; an
+    //  array klass reports 0 (layout_helper <= 0).  The exact byte count is
+    //  JDK/oop-mode dependent, so the positive-size facts are HARD but the
+    //  numbers themselves are recorded as [INFO], never hard-asserted.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const k_object{ vmhook::find_class("java/lang/Object") };
+        vmhook::hotspot::klass* const k_integer{ vmhook::find_class("java/lang/Integer") };
+        vmhook::hotspot::klass* const k_probe{ vmhook::find_class(PROBE_NAME) };
+
+        if (k_object != nullptr && vmhook::hotspot::is_valid_pointer(k_object))
+        {
+            const std::size_t sz{ k_object->get_instance_size() };
+            ctx.check("instance_size_Object_positive", sz > 0);
+            ctx.record(std::string{ "[INFO] java/lang/Object instance_size bytes observed=" }
+                       + std::to_string(static_cast<std::uint64_t>(sz)));
+        }
+        if (k_integer != nullptr && vmhook::hotspot::is_valid_pointer(k_integer))
+        {
+            const std::size_t sz{ k_integer->get_instance_size() };
+            ctx.check("instance_size_Integer_positive", sz > 0);
+        }
+        if (k_probe != nullptr && vmhook::hotspot::is_valid_pointer(k_probe))
+        {
+            const std::size_t sz{ k_probe->get_instance_size() };
+            ctx.check("instance_size_app_class_positive", sz > 0);
+        }
+
+        // An array klass is NOT an instance klass: layout_helper <= 0 -> size 0.
+        // Only checked when the array klass actually resolves (JDK-variant per
+        // PART B); recorded otherwise so a non-resolving JDK never hard-fails.
+        vmhook::hotspot::klass* const k_int_arr{ vmhook::find_class("[I") };
+        if (k_int_arr != nullptr && vmhook::hotspot::is_valid_pointer(k_int_arr))
+        {
+            ctx.check("instance_size_array_klass_is_zero",
+                      k_int_arr->get_instance_size() == 0);
+        }
+        else
+        {
+            ctx.record("[INFO] array klass [I unresolved on this JDK; instance-size-zero check skipped");
+        }
+    }
+
+    // =====================================================================
+    //  PART M - MORE degenerate / boundary inputs, all SAFE (no crash) and
+    //  null where they cannot name a loaded class.  These widen PART E/G with
+    //  inputs the resolver must reject deterministically.
+    // =====================================================================
+    {
+        // A name that differs from a real class only by CASE is a different
+        // (nonexistent) class -> null.  Class names are case-sensitive.
+        ctx.check("case_mismatch_returns_null",
+                  vmhook::find_class("java/lang/object") == nullptr);
+        ctx.check("case_mismatch_upper_returns_null",
+                  vmhook::find_class("JAVA/LANG/STRING") == nullptr);
+
+        // NOTE: a mixed-separator name like "java/lang.String" is NOT a reliable
+        // null case -- find_class's JNI/loadClass fallback normalizes separators
+        // and resolves it, so it is intentionally NOT hard-asserted here.
+
+        // Double-slash (empty internal segment) -> null, no crash.
+        ctx.check("double_slash_returns_null",
+                  vmhook::find_class("java//lang//String") == nullptr);
+
+        // A lone '[' (malformed array descriptor, missing element) -> null,
+        // no crash.  The array fast-path calls JNI FindClass which rejects it
+        // and the exception is cleared internally.
+        ctx.check("lone_bracket_returns_null", vmhook::find_class("[") == nullptr);
+
+        // A bracket followed by a bogus primitive letter ([Q is not a valid
+        // descriptor) -> null, no crash.
+        ctx.check("bad_array_descriptor_returns_null",
+                  vmhook::find_class("[Q") == nullptr);
+
+        // An array of a nonexistent reference type -> null (element missing).
+        ctx.check("array_of_missing_element_returns_null",
+                  vmhook::find_class("[Lvmhook/fixtures/NoSuchElem_ZZZ;") == nullptr);
+
+        // After every degenerate input above (including the array fast-path that
+        // touches JNI + clears exceptions), the canonical lookups are intact.
+        vmhook::hotspot::klass* const k_string{ vmhook::find_class("java/lang/String") };
+        ctx.check("canonical_String_intact_after_partM", k_string != nullptr);
+        ctx.check("canonical_String_name_intact_after_partM",
+                  klass_name(k_string) == "java/lang/String");
+        ctx.check("canonical_app_intact_after_partM",
+                  vmhook::find_class(PROBE_NAME) != nullptr);
+    }
+
+    // =====================================================================
+    //  PART N - INTERLEAVED multi-name cache cross-check.  Resolving several
+    //  distinct names in a round-robin loop must keep each name pinned to its
+    //  OWN klass (no cross-name aliasing / single-slot stomping under churn),
+    //  and the per-name pointer must be IDENTICAL to the first resolution.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const a0{ vmhook::find_class("java/lang/Object") };
+        vmhook::hotspot::klass* const b0{ vmhook::find_class("java/lang/String") };
+        vmhook::hotspot::klass* const c0{ vmhook::find_class("java/lang/Integer") };
+        vmhook::hotspot::klass* const d0{ vmhook::find_class(PROBE_NAME) };
+
+        ctx.check("interleave_seed_all_nonnull",
+                  a0 != nullptr && b0 != nullptr && c0 != nullptr && d0 != nullptr);
+        ctx.check("interleave_seed_all_distinct",
+                  a0 != b0 && a0 != c0 && a0 != d0
+                  && b0 != c0 && b0 != d0 && c0 != d0);
+
+        bool stable{ true };
+        for (int i{ 0 }; i < 32 && stable; ++i)
+        {
+            if (vmhook::find_class("java/lang/Object") != a0) { stable = false; break; }
+            if (vmhook::find_class("java/lang/String") != b0) { stable = false; break; }
+            if (vmhook::find_class("java/lang/Integer") != c0) { stable = false; break; }
+            if (vmhook::find_class(PROBE_NAME) != d0)          { stable = false; break; }
+            // A missing name interleaved with the hits must stay null and must NOT
+            // perturb the cached successes.
+            if (vmhook::find_class("vmhook/fixtures/NoSuchInterleave_ZZZ") != nullptr)
+            {
+                stable = false;
+                break;
+            }
+        }
+        ctx.check("interleave_each_name_pinned_to_own_klass", stable);
+
+        // Names still pinned after the churn loop.
+        ctx.check("interleave_Object_still_pinned",
+                  vmhook::find_class("java/lang/Object") == a0);
+        ctx.check("interleave_app_still_pinned",
+                  vmhook::find_class(PROBE_NAME) == d0);
+    }
+
+    // =====================================================================
+    //  PART O - OVERRIDE to a CORRECTLY-named klass is honored, plus evict
+    //  cross-checks.  Unlike PART I (which proves wrong-named overrides are
+    //  rejected as stale), here we plant the GENUINE klass under its own name
+    //  via override_class_lookup and confirm find_class returns it; then evict
+    //  and confirm a clean re-walk yields the same klass.  Everything is left
+    //  reverted to the genuine resolution.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const k_string{ vmhook::find_class("java/lang/String") };
+        if (k_string != nullptr && vmhook::hotspot::is_valid_pointer(k_string))
+        {
+            // Plant the genuine String klass under its own (correct) name.  The
+            // cache-hit guard accepts it because the override's name matches the
+            // key, so the very next find_class returns exactly that pointer.
+            vmhook::override_class_lookup("java/lang/String", k_string);
+            ctx.check("override_correct_name_is_honored",
+                      vmhook::find_class("java/lang/String") == k_string);
+
+            // Evict, then a fresh walk must re-resolve the SAME genuine klass
+            // (resolution is deterministic for a loaded bootstrap class).
+            vmhook::evict_class_lookup("java/lang/String");
+            ctx.check("evict_then_rewalk_String_same",
+                      vmhook::find_class("java/lang/String") == k_string);
+
+            // Double-evict is a safe idempotent no-op; the name re-resolves fine.
+            vmhook::evict_class_lookup("java/lang/String");
+            vmhook::evict_class_lookup("java/lang/String");
+            ctx.check("double_evict_safe_and_resolvable",
+                      vmhook::find_class("java/lang/String") == k_string);
+        }
+
+        // Evicting a never-cached, nonexistent key is safe and leaves it absent.
+        vmhook::evict_class_lookup("vmhook/fixtures/NeverCached_ZZZ");
+        ctx.check("evict_never_cached_key_safe",
+                  vmhook::find_class("vmhook/fixtures/NeverCached_ZZZ") == nullptr);
+
+        // Final sanity: after all override/evict churn the app class and its
+        // sentinel are still resolvable + usable (cache not corrupted).
+        ctx.check("app_class_intact_after_override_churn",
+                  vmhook::find_class(PROBE_NAME) != nullptr);
+        ctx.check("app_sentinel_intact_after_override_churn",
+                  fcp::sentinel() == SENTINEL_VALUE);
     }
 }

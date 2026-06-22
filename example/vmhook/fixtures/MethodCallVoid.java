@@ -142,6 +142,11 @@ public final class MethodCallVoid extends MethodCallVoidBase
     public static volatile char    narrowArgChar;
     public static volatile float   narrowArgFloat;
 
+    // -- char-boundary void args (0x0000 and 0xFFFF) -------------------------
+    public static volatile boolean charBoundsCalled;
+    public static volatile char    charLo;
+    public static volatile char    charHi;
+
     // ── degenerate String arguments (empty + null) ──────────────────────────
 
     /** Length recorded by voidEmptyStringArg (must be 0 for the empty String). */
@@ -453,6 +458,33 @@ public final class MethodCallVoid extends MethodCallVoidBase
     public int retInt()
     {
         return 1337;
+    }
+
+    // -- CONTRAST across the ENTIRE return-type decode switch -----------------
+    // The existing contrast only proves is_void() is false for an int ('I')
+    // return.  These returners cover every OTHER decode case ('Z','B','S','C',
+    // 'J','F','D', and a 'Ljava/lang/String;' reference), so the native side
+    // can prove is_void() is false for ALL of them and is_string() is true for
+    // exactly the String one.  Each returns a distinct, exactly-representable
+    // sentinel so the decoded value is path-independent (call_stub == call_jni).
+    public boolean retBool()   { return true; }
+    public byte    retByte()   { return (byte)  -128;   }   // Byte.MIN_VALUE
+    public short   retShort()  { return (short) -32768; }   // Short.MIN_VALUE
+    public char    retChar()   { return (char)  0xFFFF; }   // Character.MAX_VALUE
+    public long    retLong()   { return 0x7EDCBA9876543210L; }
+    public float   retFloat()  { return 0.5f;   }           // exact in IEEE-754
+    public double  retDouble() { return -0.25;  }           // exact in IEEE-754
+    public String  retString() { return "void-contrast-return-string"; }
+
+    // -- void with CHAR-BOUNDARY args (char 0 and Character.MAX_VALUE) --------
+    // The narrow-arg test uses a mid-range char (0xBEEF); these are the two
+    // boundary code units a wrong-width / sign-extended char marshalling would
+    // most likely corrupt -- 0x0000 and 0xFFFF.  Recorded verbatim.
+    public void voidCharBounds(final char lo, final char hi)
+    {
+        charLo = lo;
+        charHi = hi;
+        charBoundsCalled = true;
     }
 
     // ── NON-CORRUPTION: a value-returning call performed right after a void

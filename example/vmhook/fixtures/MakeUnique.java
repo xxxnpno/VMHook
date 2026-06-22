@@ -53,6 +53,14 @@ public final class MakeUnique
     public boolean boolField;     // set by construct(boolean) on the TLAB fallback path
     public int    ctorTag;        // 0 default; each ctor stamps a distinct id
 
+    // Extra primitive-width fields the (S)V / (B)V / (C)V / (F)V constructors
+    // below write, so the native side can read each narrow primitive back and
+    // prove the jni_value union marshalled it byte-exact through NewObjectA.
+    public short  shortField;     // set by (S)V
+    public byte   byteField;      // set by (B)V
+    public char   charField;      // set by (C)V
+    public float  floatField;     // set by (F)V
+
     // ── Constructors: one per descriptor the native module exercises ───────────
 
     /** ()V — no-arg.  intField stays 0; ctorTag = 1. */
@@ -109,6 +117,57 @@ public final class MakeUnique
         this.intField = i;
         this.ctorTag = 6;
         lastCtor = "(Ljava/lang/String;I)V";
+    }
+
+    // ── Narrow-primitive constructors (each a distinct JVM descriptor) ──────────
+    // These exercise the S / B / C / F branches of jni_signature_for_arg +
+    // convert_jni_arg through the REAL NewObjectA <init> path: the native module
+    // passes a short / byte / char / float and reads the matching field back to
+    // prove the narrow primitive marshalled byte-exact in the jni_value union.
+
+    /** (S)V — single short.  ctorTag = 7. */
+    public MakeUnique(final short s)
+    {
+        instanceCount++;
+        this.shortField = s;
+        this.ctorTag = 7;
+        lastCtor = "(S)V";
+    }
+
+    /** (B)V — single byte.  ctorTag = 8. */
+    public MakeUnique(final byte b)
+    {
+        instanceCount++;
+        this.byteField = b;
+        this.ctorTag = 8;
+        lastCtor = "(B)V";
+    }
+
+    /** (C)V — single char (unsigned 16-bit UTF-16 code unit).  ctorTag = 9. */
+    public MakeUnique(final char c)
+    {
+        instanceCount++;
+        this.charField = c;
+        this.ctorTag = 9;
+        lastCtor = "(C)V";
+    }
+
+    /** (F)V — single float.  ctorTag = 10. */
+    public MakeUnique(final float f)
+    {
+        instanceCount++;
+        this.floatField = f;
+        this.ctorTag = 10;
+        lastCtor = "(F)V";
+    }
+
+    /** (J)V — single long (long-only, distinct from the (IJD)V multi-arg).  ctorTag = 11. */
+    public MakeUnique(final long j)
+    {
+        instanceCount++;
+        this.longField = j;
+        this.ctorTag = 11;
+        lastCtor = "(J)V";
     }
 
     // ── Probe self-registration ─────────────────────────────────────────────────

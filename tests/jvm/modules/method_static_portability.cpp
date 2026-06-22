@@ -260,6 +260,92 @@ namespace
     std::atomic<std::int64_t> g_num_float_nomatch{ k_uncaptured }; // sNum(float): no (F) overload
     std::atomic<int>  g_num_float_did_not_crash{ -1 };       // reached the line after the call
 
+    // ==================================================================
+    //  DEEPENING WAVE — additive-only coverage appended below.  Every
+    //  variable here is written exactly once inside run_all_calls and read
+    //  exactly once in the module body; nothing above is touched.
+    // ==================================================================
+
+    // -- (D1) name()/signature() accessors on the portable factory --
+    std::atomic<bool> g_meta_captured{ false };
+    std::string       g_name_int;          // static_method("sIntFortyTwo")->name()
+    std::string       g_sig_text_int;       // its signature()  == "()I"
+    std::string       g_name_echo;          // ("sEchoInt","(I)I")->name()
+    std::string       g_sig_text_echo;      // its signature()  == "(I)I"
+    std::string       g_name_str;           // sStringHello name
+    std::string       g_sig_text_str;       // its signature()  == "()Ljava/lang/String;"
+    std::string       g_sig_text_void;      // sVoid signature() == "()V"
+    std::string       g_sig_text_long;      // sLongBig signature() == "()J"
+    std::string       g_sig_text_double;    // sDoublePi signature() == "()D"
+
+    // -- (D2) is_reference() per return type --
+    std::atomic<int>  g_isref_void{ -1 };       // ()V        -> false
+    std::atomic<int>  g_isref_int{ -1 };        // ()I        -> false
+    std::atomic<int>  g_isref_long{ -1 };       // ()J        -> false
+    std::atomic<int>  g_isref_double{ -1 };     // ()D        -> false
+    std::atomic<int>  g_isref_string{ -1 };     // ()L...;    -> true
+    std::atomic<int>  g_isref_object{ -1 };     // ()L...;    -> true
+    std::atomic<int>  g_isref_echo_int{ -1 };   // (I)I       -> false
+
+    // -- (D3) is_void() is FALSE for every non-void return type --
+    std::atomic<int>  g_nonvoid_bool{ -1 };
+    std::atomic<int>  g_nonvoid_int{ -1 };
+    std::atomic<int>  g_nonvoid_long{ -1 };
+    std::atomic<int>  g_nonvoid_double{ -1 };
+    std::atomic<int>  g_nonvoid_string{ -1 };
+
+    // -- (D4) is_string() is FALSE for primitive/void returns --
+    std::atomic<int>  g_int_is_string{ -1 };    // ()I -> not a string
+    std::atomic<int>  g_void_is_string{ -1 };   // ()V -> not a string
+    std::atomic<int>  g_empty_is_string{ -1 };  // ()L...; ""  -> still IS a string
+    std::atomic<int>  g_null_is_string{ -1 };   // null String: as_string()=="" — characterize is_string()
+
+    // -- (D5) int-echo boundary sweep (slot-0 alignment at every edge) --
+    std::atomic<std::int64_t> g_echo_int_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_int_one{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_int_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_int_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_int_min{ k_uncaptured };
+
+    // -- (D6) long-echo boundary sweep (two-slot, every edge) --
+    std::atomic<std::int64_t> g_echo_long_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_one{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_min{ k_uncaptured };
+
+    // -- (D7) double-echo boundary sweep (two-slot, IEEE-exact bits) --
+    std::atomic<bool>          g_echo_double_edges_captured{ false };
+    std::atomic<std::uint64_t> g_echo_double_zero_bits{ 0 };
+    std::atomic<std::uint64_t> g_echo_double_negzero_bits{ 0 };
+    std::atomic<std::uint64_t> g_echo_double_one_bits{ 0 };
+    std::atomic<std::uint64_t> g_echo_double_max_bits{ 0 };
+    std::atomic<std::uint64_t> g_echo_double_min_bits{ 0 };
+
+    // -- (D8) bool-echo FALSE arm (the existing checks only cover true) --
+    std::atomic<int>  g_echo_bool_false_ret{ -1 };     // sEchoBool(false)->0
+    std::atomic<int>  g_echo_bool_false_field{ -1 };   // recordedBoolArg==false
+
+    // -- (D9) String-arg edge shapes (empty + ASCII round-trip) --
+    std::atomic<bool> g_echo_string_empty_ok{ false };
+    std::atomic<bool> g_echo_string_ascii_ok{ false };
+    std::atomic<int>  g_echo_string_empty_is_string{ -1 };
+
+    // -- (D10) idempotency / repeated dispatch through one proxy --
+    std::atomic<std::int64_t> g_idem_first{ k_uncaptured };
+    std::atomic<std::int64_t> g_idem_second{ k_uncaptured };
+    std::atomic<std::int64_t> g_idem_proxy_a{ k_uncaptured };  // same proxy, call #1
+    std::atomic<std::int64_t> g_idem_proxy_b{ k_uncaptured };  // same proxy, call #2
+    std::atomic<std::int64_t> g_idem_echo_a{ k_uncaptured };   // same echo proxy, two args
+    std::atomic<std::int64_t> g_idem_echo_b{ k_uncaptured };
+
+    // -- (D11) NUM sentinels mutually distinct (cross-check) --
+    // (recorded values already captured in g_num_*; just an extra cross-check)
+
+    // -- (D12) recorder-hit monotonicity snapshot --
+    std::atomic<std::int64_t> g_hits_before_void{ k_uncaptured };
+    std::atomic<std::int64_t> g_hits_after_void{ k_uncaptured };
+
     auto run_all_calls(const std::unique_ptr<msc>& self) -> void
     {
         // ============================== (1) RETURN TYPES =======================
@@ -517,6 +603,128 @@ namespace
             g_num_float_nomatch.store(v.is_void() ? k_uncaptured : static_cast<std::int64_t>(static_cast<std::int32_t>(v)));
             g_num_float_did_not_crash.store(1);
         }
+
+        // ============================ DEEPENING WAVE ===========================
+        // (D1) name()/signature() — the portable factory must hand back a proxy
+        //      whose identity matches the requested method + descriptor exactly.
+        {
+            if (auto p = msc::static_method("sIntFortyTwo"))
+            {
+                g_name_int     = p->name();
+                g_sig_text_int = std::string{ p->signature() };
+            }
+            if (auto p = msc::static_method("sEchoInt", "(I)I"))
+            {
+                g_name_echo     = p->name();
+                g_sig_text_echo = std::string{ p->signature() };
+            }
+            if (auto p = msc::static_method("sStringHello"))
+            {
+                g_name_str     = p->name();
+                g_sig_text_str = std::string{ p->signature() };
+            }
+            if (auto p = msc::static_method("sVoid"))    { g_sig_text_void   = std::string{ p->signature() }; }
+            if (auto p = msc::static_method("sLongBig")) { g_sig_text_long   = std::string{ p->signature() }; }
+            if (auto p = msc::static_method("sDoublePi")){ g_sig_text_double = std::string{ p->signature() }; }
+            g_meta_captured.store(true);
+        }
+
+        // (D2) is_reference(): true for L/[ returns, false for primitives/void.
+        g_isref_void.store(msc::static_method("sVoid")->is_reference() ? 1 : 0);
+        g_isref_int.store(msc::static_method("sIntFortyTwo")->is_reference() ? 1 : 0);
+        g_isref_long.store(msc::static_method("sLongBig")->is_reference() ? 1 : 0);
+        g_isref_double.store(msc::static_method("sDoublePi")->is_reference() ? 1 : 0);
+        g_isref_string.store(msc::static_method("sStringHello")->is_reference() ? 1 : 0);
+        g_isref_object.store(msc::static_method("sMakeChild")->is_reference() ? 1 : 0);
+        g_isref_echo_int.store(msc::static_method("sEchoInt")->is_reference() ? 1 : 0);
+
+        // (D3) is_void()==false for every non-void return type.
+        g_nonvoid_bool.store(msc::static_method("sBoolTrue")->call().is_void() ? 1 : 0);
+        g_nonvoid_int.store(msc::static_method("sIntFortyTwo")->call().is_void() ? 1 : 0);
+        g_nonvoid_long.store(msc::static_method("sLongBig")->call().is_void() ? 1 : 0);
+        g_nonvoid_double.store(msc::static_method("sDoublePi")->call().is_void() ? 1 : 0);
+        g_nonvoid_string.store(msc::static_method("sStringHello")->call().is_void() ? 1 : 0);
+
+        // (D4) is_string() routing: primitive/void are NOT strings; an empty
+        //      String IS a string; a null String is characterized (path/decode
+        //      dependent — recorded, not asserted to a specific is_string()).
+        g_int_is_string.store(msc::static_method("sIntFortyTwo")->call().is_string() ? 1 : 0);
+        g_void_is_string.store(msc::static_method("sVoid")->call().is_string() ? 1 : 0);
+        g_empty_is_string.store(msc::static_method("sStringEmpty")->call().is_string() ? 1 : 0);
+        g_null_is_string.store(msc::static_method("sStringNull")->call().is_string() ? 1 : 0);
+
+        // (D5) int-echo boundary sweep — slot-0 alignment holds at every edge.
+        g_echo_int_zero.store(static_cast<std::int32_t>(
+            msc::static_method("sEchoInt")->call(std::int32_t{ 0 })));
+        g_echo_int_one.store(static_cast<std::int32_t>(
+            msc::static_method("sEchoInt")->call(std::int32_t{ 1 })));
+        g_echo_int_negone.store(static_cast<std::int32_t>(
+            msc::static_method("sEchoInt")->call(std::int32_t{ -1 })));
+        g_echo_int_max.store(static_cast<std::int32_t>(
+            msc::static_method("sEchoInt")->call(std::numeric_limits<std::int32_t>::max())));
+        g_echo_int_min.store(static_cast<std::int32_t>(
+            msc::static_method("sEchoInt")->call(std::numeric_limits<std::int32_t>::min())));
+
+        // (D6) long-echo boundary sweep — two-slot alignment at every edge.
+        g_echo_long_zero.store(static_cast<std::int64_t>(
+            msc::static_method("sEchoLong")->call(std::int64_t{ 0 })));
+        g_echo_long_one.store(static_cast<std::int64_t>(
+            msc::static_method("sEchoLong")->call(std::int64_t{ 1 })));
+        g_echo_long_negone.store(static_cast<std::int64_t>(
+            msc::static_method("sEchoLong")->call(std::int64_t{ -1 })));
+        g_echo_long_max.store(static_cast<std::int64_t>(
+            msc::static_method("sEchoLong")->call(std::numeric_limits<std::int64_t>::max())));
+        g_echo_long_min.store(static_cast<std::int64_t>(
+            msc::static_method("sEchoLong")->call(std::numeric_limits<std::int64_t>::min())));
+
+        // (D7) double-echo boundary sweep — two-slot IEEE-exact bits at each edge.
+        g_echo_double_zero_bits.store(d2bits(
+            static_cast<double>(msc::static_method("sEchoDouble")->call(double{ 0.0 }))));
+        g_echo_double_negzero_bits.store(d2bits(
+            static_cast<double>(msc::static_method("sEchoDouble")->call(double{ -0.0 }))));
+        g_echo_double_one_bits.store(d2bits(
+            static_cast<double>(msc::static_method("sEchoDouble")->call(double{ 1.0 }))));
+        g_echo_double_max_bits.store(d2bits(
+            static_cast<double>(msc::static_method("sEchoDouble")->call(std::numeric_limits<double>::max()))));
+        g_echo_double_min_bits.store(d2bits(
+            static_cast<double>(msc::static_method("sEchoDouble")->call(std::numeric_limits<double>::min()))));
+        g_echo_double_edges_captured.store(true);
+
+        // (D8) bool-echo FALSE arm (the existing block only covers true).
+        g_echo_bool_false_ret.store(msc::static_method("sEchoBool")->call(false) ? 1 : 0);
+        g_echo_bool_false_field.store(msc::get_recorded_bool() ? 1 : 0);
+
+        // (D9) String-arg edges: empty + pure-ASCII both round-trip.
+        {
+            const auto v_empty = msc::static_method("sEchoString")->call(std::string{ "" });
+            g_echo_string_empty_ok.store(v_empty.as_string().empty());
+            g_echo_string_empty_is_string.store(v_empty.is_string() ? 1 : 0);
+
+            const auto v_ascii = msc::static_method("sEchoString")->call(std::string{ "plain-ascii-123" });
+            g_echo_string_ascii_ok.store(v_ascii.as_string() == "plain-ascii-123");
+        }
+
+        // (D10) idempotency: the same name dispatched twice yields the same
+        //       value; one proxy reused yields the same value; one echo proxy
+        //       reused with two args echoes each verbatim.
+        g_idem_first.store(static_cast<std::int32_t>(msc::static_method("sIntFortyTwo")->call()));
+        g_idem_second.store(static_cast<std::int32_t>(msc::static_method("sIntFortyTwo")->call()));
+        if (auto p = msc::static_method("sIntFortyTwo"))
+        {
+            g_idem_proxy_a.store(static_cast<std::int32_t>(p->call()));
+            g_idem_proxy_b.store(static_cast<std::int32_t>(p->call()));
+        }
+        if (auto p = msc::static_method("sEchoInt"))
+        {
+            g_idem_echo_a.store(static_cast<std::int32_t>(p->call(std::int32_t{ 111 })));
+            g_idem_echo_b.store(static_cast<std::int32_t>(p->call(std::int32_t{ 222 })));
+        }
+
+        // (D12) recorder-hit monotonicity: a void static call bumps the counter
+        //       by at least one (proves the no-receiver body actually executed).
+        g_hits_before_void.store(msc::get_static_recorder_hits());
+        msc::static_method("sVoid")->call();
+        g_hits_after_void.store(msc::get_static_recorder_hits());
 
         (void)self;
         g_all_calls_ran.store(true);
@@ -800,5 +1008,103 @@ VMHOOK_JVM_MODULE(method_static_portability)
                    + " NUM_LONG=" + std::to_string(NUM_LONG)
                    + " NUM_DOUBLE=" + std::to_string(NUM_DOUBLE)
                    + "); value not asserted — only the no-crash fact above is.");
+
+        // ==================================================================
+        //  DEEPENING WAVE — additive HARD assertions (criterion 2).
+        // ==================================================================
+
+        // (D1) name()/signature(): the portable factory returns a proxy whose
+        //      identity matches the requested method + descriptor verbatim.
+        ctx.check("msp_meta_captured", g_meta_captured.load());
+        ctx.check("msp_name_int_matches", g_name_int == "sIntFortyTwo");
+        ctx.check("msp_sig_int_text_is_paren_I", g_sig_text_int == "()I");
+        ctx.check("msp_name_echo_matches", g_name_echo == "sEchoInt");
+        ctx.check("msp_sig_echo_text_is_I_I", g_sig_text_echo == "(I)I");
+        ctx.check("msp_name_string_matches", g_name_str == "sStringHello");
+        ctx.check("msp_sig_string_text", g_sig_text_str == "()Ljava/lang/String;");
+        ctx.check("msp_sig_void_text", g_sig_text_void == "()V");
+        ctx.check("msp_sig_long_text", g_sig_text_long == "()J");
+        ctx.check("msp_sig_double_text", g_sig_text_double == "()D");
+
+        // (D2) is_reference(): true only for L/[ return types.
+        ctx.check("msp_isref_void_false", g_isref_void.load() == 0);
+        ctx.check("msp_isref_int_false", g_isref_int.load() == 0);
+        ctx.check("msp_isref_long_false", g_isref_long.load() == 0);
+        ctx.check("msp_isref_double_false", g_isref_double.load() == 0);
+        ctx.check("msp_isref_string_true", g_isref_string.load() == 1);
+        ctx.check("msp_isref_object_true", g_isref_object.load() == 1);
+        ctx.check("msp_isref_echo_int_false", g_isref_echo_int.load() == 0);
+
+        // (D3) is_void()==false for every NON-void return type.
+        ctx.check("msp_nonvoid_bool", g_nonvoid_bool.load() == 0);
+        ctx.check("msp_nonvoid_int", g_nonvoid_int.load() == 0);
+        ctx.check("msp_nonvoid_long", g_nonvoid_long.load() == 0);
+        ctx.check("msp_nonvoid_double", g_nonvoid_double.load() == 0);
+        ctx.check("msp_nonvoid_string", g_nonvoid_string.load() == 0);
+
+        // (D4) is_string() routing: primitive/void are NOT strings; a real
+        //      (empty) String IS.  A null String's is_string() is decode/path
+        //      dependent (as_string()=="" is the asserted invariant elsewhere),
+        //      so it is CHARACTERIZED here, never hard-asserted.
+        ctx.check("msp_int_not_string", g_int_is_string.load() == 0);
+        ctx.check("msp_void_not_string", g_void_is_string.load() == 0);
+        ctx.check("msp_empty_string_is_string", g_empty_is_string.load() == 1);
+        ctx.record(std::string{ "[INFO] msp null-String is_string() observed=" }
+                   + std::to_string(g_null_is_string.load())
+                   + " (as_string() emptiness is the asserted invariant; is_string() is decode-path dependent)");
+
+        // (D5) int-echo boundary sweep — slot-0 alignment at every edge.
+        ctx.check("msp_echo_int_zero", g_echo_int_zero.load() == 0);
+        ctx.check("msp_echo_int_one", g_echo_int_one.load() == 1);
+        ctx.check("msp_echo_int_negone", g_echo_int_negone.load() == -1);
+        ctx.check("msp_echo_int_max", g_echo_int_max.load() == std::numeric_limits<std::int32_t>::max());
+        ctx.check("msp_echo_int_min", g_echo_int_min.load() == std::numeric_limits<std::int32_t>::min());
+
+        // (D6) long-echo boundary sweep — two-slot alignment at every edge.
+        ctx.check("msp_echo_long_zero", g_echo_long_zero.load() == 0);
+        ctx.check("msp_echo_long_one", g_echo_long_one.load() == 1);
+        ctx.check("msp_echo_long_negone", g_echo_long_negone.load() == -1);
+        ctx.check("msp_echo_long_max", g_echo_long_max.load() == std::numeric_limits<std::int64_t>::max());
+        ctx.check("msp_echo_long_min", g_echo_long_min.load() == std::numeric_limits<std::int64_t>::min());
+
+        // (D7) double-echo boundary sweep — two-slot IEEE-exact bits at each edge.
+        ctx.check("msp_echo_double_edges_captured", g_echo_double_edges_captured.load());
+        ctx.check("msp_echo_double_zero", bits2d(g_echo_double_zero_bits.load()) == 0.0
+                  && !std::signbit(bits2d(g_echo_double_zero_bits.load())));
+        {
+            const double nz = bits2d(g_echo_double_negzero_bits.load());
+            ctx.check("msp_echo_double_negzero_value", nz == 0.0);
+            ctx.check("msp_echo_double_negzero_signbit", std::signbit(nz));
+        }
+        ctx.check("msp_echo_double_one", bits2d(g_echo_double_one_bits.load()) == 1.0);
+        ctx.check("msp_echo_double_max", bits2d(g_echo_double_max_bits.load()) == std::numeric_limits<double>::max());
+        ctx.check("msp_echo_double_min", bits2d(g_echo_double_min_bits.load()) == std::numeric_limits<double>::min());
+
+        // (D8) bool-echo FALSE arm: returns 0 and stamps the recorder field false.
+        ctx.check("msp_echo_bool_false_returns_zero", g_echo_bool_false_ret.load() == 0);
+        ctx.check("msp_echo_bool_false_recorded_field", g_echo_bool_false_field.load() == 0);
+
+        // (D9) String-arg edges: empty + pure-ASCII both round-trip exactly.
+        ctx.check("msp_echo_string_empty_round_trips", g_echo_string_empty_ok.load());
+        ctx.check("msp_echo_string_empty_is_string", g_echo_string_empty_is_string.load() == 1);
+        ctx.check("msp_echo_string_ascii_round_trips", g_echo_string_ascii_ok.load());
+
+        // (D10) idempotency: same name twice, same proxy twice, echo proxy reused.
+        ctx.check("msp_idem_same_name_twice", g_idem_first.load() == 42 && g_idem_second.load() == 42);
+        ctx.check("msp_idem_same_proxy_twice", g_idem_proxy_a.load() == 42 && g_idem_proxy_b.load() == 42);
+        ctx.check("msp_idem_echo_proxy_reuse_first", g_idem_echo_a.load() == 111);
+        ctx.check("msp_idem_echo_proxy_reuse_second", g_idem_echo_b.load() == 222);
+
+        // (D11) NUM overload sentinels are mutually distinct (no collision).
+        ctx.check("msp_num_sentinels_distinct",
+                  g_num_int.load() != g_num_long.load()
+                  && g_num_long.load() != g_num_double.load()
+                  && g_num_int.load() != g_num_double.load());
+
+        // (D12) recorder-hit monotonicity: a void static call bumps the counter.
+        ctx.check("msp_hits_monotonic_void_bumps",
+                  g_hits_after_void.load() != k_uncaptured
+                  && g_hits_before_void.load() != k_uncaptured
+                  && g_hits_after_void.load() >= g_hits_before_void.load() + 1);
     }
 }

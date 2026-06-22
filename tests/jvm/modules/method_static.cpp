@@ -493,6 +493,87 @@ namespace
     std::atomic<int> g_inherited_sig_is_static{ -1 };
     std::atomic<std::int64_t> g_inherited_sig_ret{ k_uncaptured };  // -> 0x5151
 
+    // ===================== mstat4_* DEEPER INPUT COVERAGE ====================
+    // Every capture below is from a PRIMITIVE / int / String return or a
+    // resolution / is_static() / get_compressed_oop() accessor — all
+    // PATH-INDEPENDENT, so all HARD-assertable on every JDK.  All reuse EXISTING
+    // fixture methods (no new fixture shape).
+
+    // (S) sRecordInt — the one no-receiver recorder the module never exercised:
+    //     stamps its int arg into recordedIntArg from parameter slot 0.
+    std::atomic<std::int64_t> g_record_int_field{ k_uncaptured };
+
+    // (T) sBoolXor full truth table completion (FF / FT in addition to TF / TT).
+    std::atomic<int> g_bool_xor_ff{ -1 };   // sBoolXor(false,false) -> 0
+    std::atomic<int> g_bool_xor_ft{ -1 };   // sBoolXor(false,true)  -> 1
+
+    // (U) sArrayLen(null) -> -1 (path-INDEPENDENT int return; distinct from the
+    //     fresh-alloc length echo, which the module already covers).
+    std::atomic<std::int64_t> g_array_len_null{ k_uncaptured };
+
+    // (V) sStringArgLen boundaries: empty -> 0, ASCII "abcde" -> 5.
+    std::atomic<std::int64_t> g_string_arg_len_empty{ k_uncaptured };
+    std::atomic<std::int64_t> g_string_arg_len_ascii{ k_uncaptured };
+
+    // (W) sEchoString ASCII round-trips (longer payload incl. digits/punct).
+    std::atomic<bool> g_echo_string_ascii_captured{ false };
+    std::string       g_echo_string_ascii;   // "Echo-123/!?" round-trip
+
+    // (X) sArgIdentity / sArgIdentity2 idempotency + agreement on the SAME oop.
+    std::atomic<int> g_identity_idempotent{ -1 };  // sArgIdentity(self)==sArgIdentity(self)
+    std::atomic<int> g_identity_two_methods_agree{ -1 }; // sArgIdentity(self)==sArgIdentity2(self)
+
+    // (Y) sSumII / sSumJJ boundary slot-order (path-INDEPENDENT digests).
+    std::atomic<std::int64_t> g_sum_ii_zero_negone{ k_uncaptured }; // sSumII(0,-1)
+    std::atomic<std::int64_t> g_sum_ii_min_max{ k_uncaptured };     // sSumII(MIN,MAX)
+    std::atomic<std::int64_t> g_sum_jj_zero_one{ k_uncaptured };    // sSumJJ(0,1) -> 1
+
+    // (Z) sEchoInt / sEchoInt2 agreement + extra small-int boundaries.
+    std::atomic<std::int64_t> g_echo_int_one{ k_uncaptured };       // sEchoInt(1)
+    std::atomic<std::int64_t> g_echo_int2_zero{ k_uncaptured };     // sEchoInt2(0)
+    std::atomic<int>          g_echo_int_methods_agree{ -1 };       // sEchoInt(7)==sEchoInt2(7)
+
+    // (AA) is_static() true + null-receiver-oop for MORE static methods.
+    std::atomic<int> g_isstatic_spoly{ -1 };
+    std::atomic<int> g_isstatic_ssumii{ -1 };
+    std::atomic<int> g_isstatic_sarraylen{ -1 };
+    std::atomic<int> g_isstatic_s8ints{ -1 };
+    std::atomic<int> g_isstatic_sargidentity{ -1 };
+    std::atomic<int> g_recv_oop_zero_poly{ -1 };
+    std::atomic<int> g_recv_oop_zero_sumii{ -1 };
+    std::atomic<int> g_recv_oop_zero_arraylen{ -1 };
+
+    // (AB) static_method(name, sig) is_static + null-receiver-oop for more sigs.
+    std::atomic<int> g_sig_sumii_is_static{ -1 };
+    std::atomic<int> g_sig_sumii_oop_zero{ -1 };
+    std::atomic<std::int64_t> g_sig_sumii_ret{ k_uncaptured };   // ("sSumII","(II)I")(3,4)
+    std::atomic<int> g_sig_echolong_is_static{ -1 };
+    std::atomic<std::int64_t> g_sig_echolong_ret{ k_uncaptured };// ("sEchoLong","(J)J")(big)
+
+    // (AC) sPoly by-TYPE vs by-SIGNATURE agreement cross-check (each overload).
+    std::atomic<int> g_poly_int_type_eq_sig{ -1 };
+    std::atomic<int> g_poly_long_type_eq_sig{ -1 };
+    std::atomic<int> g_poly_string_type_eq_sig{ -1 };
+    std::atomic<int> g_poly_float_type_eq_sig{ -1 };
+    std::atomic<int> g_poly_double_type_eq_sig{ -1 };
+    std::atomic<int> g_poly_intint_type_eq_sig{ -1 };
+    std::atomic<int> g_poly_intlong_type_eq_sig{ -1 };
+
+    // (AD) sEchoLong more boundaries (1, -1, alternating-bit pattern).
+    std::atomic<std::int64_t> g_echo_long_one{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_long_alt{ k_uncaptured };   // 0x5555555555555555
+
+    // (AE) sEchoChar more code-unit boundaries (1, surrogate-range 0xD800).
+    std::atomic<std::int64_t> g_echo_char_one{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_char_surrogate{ k_uncaptured }; // 0xD800 echoes exactly
+
+    // (AF) sEchoByte / sEchoShort extra interior boundaries (1, -1).
+    std::atomic<std::int64_t> g_echo_byte_one{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_byte_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_short_one{ k_uncaptured };
+    std::atomic<std::int64_t> g_echo_short_negone{ k_uncaptured };
+
     auto run_all_calls(const std::unique_ptr<method_static>& self) -> void
     {
         // ============================== PRIMITIVES ==============================
@@ -1113,6 +1194,170 @@ namespace
             }
         }
 
+        // ##################################################################
+        //  mstat4_* — DEEPER INPUT COVERAGE (all path-INDEPENDENT, HARD).
+        //  Every call below returns a primitive / int / String or only probes a
+        //  resolution / is_static() / get_compressed_oop() accessor, so the
+        //  capture is bit-identical on the call_stub and call_jni paths.  Every
+        //  fixture method used here already exists.
+        // ##################################################################
+
+        // ---- (S) sRecordInt: int arg lands at parameter slot 0, no receiver ----
+        method_static::static_method("sRecordInt")->call(std::int32_t{ 0x1234ABCD });
+        g_record_int_field.store(method_static::get_recorded_int_arg());
+
+        // ---- (T) sBoolXor full truth table (FF / FT) ----
+        g_bool_xor_ff.store(method_static::static_method("sBoolXor")->call(false, false) ? 1 : 0);
+        g_bool_xor_ft.store(method_static::static_method("sBoolXor")->call(false, true) ? 1 : 0);
+
+        // ---- (U) sArrayLen(null) -> -1 (path-independent int return) ----
+        {
+            std::unique_ptr<oop_carrier> none{};
+            g_array_len_null.store(static_cast<std::int32_t>(
+                method_static::static_method("sArrayLen")->call(std::move(none))));
+        }
+
+        // ---- (V) sStringArgLen empty / ASCII boundaries ----
+        g_string_arg_len_empty.store(static_cast<std::int32_t>(
+            method_static::static_method("sStringArgLen")->call(std::string{ "" })));
+        g_string_arg_len_ascii.store(static_cast<std::int32_t>(
+            method_static::static_method("sStringArgLen")->call(std::string{ "abcde" })));
+
+        // ---- (W) sEchoString longer ASCII round-trip (digits + punctuation) ----
+        {
+            g_echo_string_ascii =
+                method_static::static_method("sEchoString")->call(std::string{ "Echo-123/!?" }).as_string();
+            g_echo_string_ascii_captured.store(true);
+        }
+
+        // ---- (X) sArgIdentity / sArgIdentity2 idempotency + agreement ----
+        if (self)
+        {
+            const vmhook::oop_t self_oop{ self->get_instance() };
+            if (self_oop != nullptr)
+            {
+                auto c1{ std::make_unique<oop_carrier>(self_oop) };
+                const std::int32_t id_a = method_static::static_method("sArgIdentity")->call(std::move(c1));
+                auto c2{ std::make_unique<oop_carrier>(self_oop) };
+                const std::int32_t id_b = method_static::static_method("sArgIdentity")->call(std::move(c2));
+                g_identity_idempotent.store((id_a != 0 && id_a == id_b) ? 1 : 0);
+                auto c3{ std::make_unique<oop_carrier>(self_oop) };
+                const std::int32_t id_c = method_static::static_method("sArgIdentity2")->call(std::move(c3));
+                g_identity_two_methods_agree.store((id_a != 0 && id_a == id_c) ? 1 : 0);
+            }
+        }
+
+        // ---- (Y) sSumII / sSumJJ boundary slot-order digests ----
+        g_sum_ii_zero_negone.store(static_cast<std::int32_t>(
+            method_static::static_method("sSumII")->call(std::int32_t{ 0 }, std::int32_t{ -1 })));
+        g_sum_ii_min_max.store(static_cast<std::int32_t>(
+            method_static::static_method("sSumII")->call(
+                std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max())));
+        g_sum_jj_zero_one.store(static_cast<std::int64_t>(
+            method_static::static_method("sSumJJ")->call(std::int64_t{ 0 }, std::int64_t{ 1 })));
+
+        // ---- (Z) sEchoInt / sEchoInt2 agreement + small-int boundaries ----
+        g_echo_int_one.store(static_cast<std::int32_t>(
+            method_static::static_method("sEchoInt")->call(std::int32_t{ 1 })));
+        g_echo_int2_zero.store(static_cast<std::int32_t>(
+            method_static::static_method("sEchoInt2")->call(std::int32_t{ 0 })));
+        {
+            const std::int32_t a = method_static::static_method("sEchoInt")->call(std::int32_t{ 7 });
+            const std::int32_t b = method_static::static_method("sEchoInt2")->call(std::int32_t{ 7 });
+            g_echo_int_methods_agree.store((a == 7 && a == b) ? 1 : 0);
+        }
+
+        // ---- (AA) is_static() true + null-receiver-oop for more statics ----
+        g_isstatic_spoly.store(method_static::static_method("sPoly", "(I)I")->is_static() ? 1 : 0);
+        g_isstatic_ssumii.store(method_static::static_method("sSumII")->is_static() ? 1 : 0);
+        g_isstatic_sarraylen.store(method_static::static_method("sArrayLen")->is_static() ? 1 : 0);
+        g_isstatic_s8ints.store(method_static::static_method("s8Ints")->is_static() ? 1 : 0);
+        g_isstatic_sargidentity.store(method_static::static_method("sArgIdentity")->is_static() ? 1 : 0);
+        {
+            auto p_poly = method_static::static_method("sPoly", "(I)I");
+            g_recv_oop_zero_poly.store((p_poly && p_poly->get_compressed_oop() == 0u) ? 1 : 0);
+            auto p_sum = method_static::static_method("sSumII");
+            g_recv_oop_zero_sumii.store((p_sum && p_sum->get_compressed_oop() == 0u) ? 1 : 0);
+            auto p_arr = method_static::static_method("sArrayLen");
+            g_recv_oop_zero_arraylen.store((p_arr && p_arr->get_compressed_oop() == 0u) ? 1 : 0);
+        }
+
+        // ---- (AB) static_method(name, sig) is_static + null-oop for more sigs ----
+        {
+            auto p = method_static::static_method("sSumII", "(II)I");
+            if (p)
+            {
+                g_sig_sumii_is_static.store(p->is_static() ? 1 : 0);
+                g_sig_sumii_oop_zero.store(p->get_compressed_oop() == 0u ? 1 : 0);
+                g_sig_sumii_ret.store(static_cast<std::int32_t>(
+                    p->call(std::int32_t{ 3 }, std::int32_t{ 4 })));
+            }
+        }
+        {
+            auto p = method_static::static_method("sEchoLong", "(J)J");
+            if (p)
+            {
+                g_sig_echolong_is_static.store(p->is_static() ? 1 : 0);
+                g_sig_echolong_ret.store(static_cast<std::int64_t>(
+                    p->call(std::int64_t{ 0x0011223344556677LL })));
+            }
+        }
+
+        // ---- (AC) sPoly by-TYPE vs by-SIGNATURE agreement cross-check ----
+        {
+            const std::int32_t t_int = method_static::static_method("sPoly")->call(std::int32_t{ 1 });
+            const std::int32_t s_int = method_static::static_method("sPoly", "(I)I")->call(std::int32_t{ 1 });
+            g_poly_int_type_eq_sig.store((t_int == k_poly_int && t_int == s_int) ? 1 : 0);
+
+            const std::int32_t t_long = method_static::static_method("sPoly")->call(std::int64_t{ 2 });
+            const std::int32_t s_long = method_static::static_method("sPoly", "(J)I")->call(std::int64_t{ 2 });
+            g_poly_long_type_eq_sig.store((t_long == k_poly_long && t_long == s_long) ? 1 : 0);
+
+            const std::int32_t t_str = method_static::static_method("sPoly")->call(std::string{ "z" });
+            const std::int32_t s_str = method_static::static_method("sPoly", "(Ljava/lang/String;)I")->call(std::string{ "z" });
+            g_poly_string_type_eq_sig.store((t_str == k_poly_string && t_str == s_str) ? 1 : 0);
+
+            const std::int32_t t_flt = method_static::static_method("sPoly")->call(2.5f);
+            const std::int32_t s_flt = method_static::static_method("sPoly", "(F)I")->call(2.5f);
+            g_poly_float_type_eq_sig.store((t_flt == k_poly_float && t_flt == s_flt) ? 1 : 0);
+
+            const std::int32_t t_dbl = method_static::static_method("sPoly")->call(3.5);
+            const std::int32_t s_dbl = method_static::static_method("sPoly", "(D)I")->call(3.5);
+            g_poly_double_type_eq_sig.store((t_dbl == k_poly_double && t_dbl == s_dbl) ? 1 : 0);
+
+            const std::int32_t t_ii = method_static::static_method("sPoly")->call(std::int32_t{ 4 }, std::int32_t{ 5 });
+            const std::int32_t s_ii = method_static::static_method("sPoly", "(II)I")->call(std::int32_t{ 4 }, std::int32_t{ 5 });
+            g_poly_intint_type_eq_sig.store((t_ii == k_poly_int2 && t_ii == s_ii) ? 1 : 0);
+
+            const std::int32_t t_il = method_static::static_method("sPoly")->call(std::int32_t{ 1 }, std::int64_t{ 2 });
+            const std::int32_t s_il = method_static::static_method("sPoly", "(IJ)I")->call(std::int32_t{ 1 }, std::int64_t{ 2 });
+            g_poly_intlong_type_eq_sig.store((t_il == k_poly_intlong && t_il == s_il) ? 1 : 0);
+        }
+
+        // ---- (AD) sEchoLong more boundaries ----
+        g_echo_long_one.store(static_cast<std::int64_t>(
+            method_static::static_method("sEchoLong")->call(std::int64_t{ 1 })));
+        g_echo_long_negone.store(static_cast<std::int64_t>(
+            method_static::static_method("sEchoLong")->call(std::int64_t{ -1 })));
+        g_echo_long_alt.store(static_cast<std::int64_t>(
+            method_static::static_method("sEchoLong")->call(std::int64_t{ 0x5555555555555555LL })));
+
+        // ---- (AE) sEchoChar more code-unit boundaries (echo is exact) ----
+        g_echo_char_one.store(static_cast<std::uint16_t>(
+            method_static::static_method("sEchoChar")->call(std::uint16_t{ 1 })));
+        g_echo_char_surrogate.store(static_cast<std::uint16_t>(
+            method_static::static_method("sEchoChar")->call(std::uint16_t{ 0xD800 })));
+
+        // ---- (AF) sEchoByte / sEchoShort interior boundaries (1, -1) ----
+        g_echo_byte_one.store(static_cast<std::int8_t>(
+            method_static::static_method("sEchoByte")->call(std::int8_t{ 1 })));
+        g_echo_byte_negone.store(static_cast<std::int8_t>(
+            method_static::static_method("sEchoByte")->call(std::int8_t{ -1 })));
+        g_echo_short_one.store(static_cast<std::int16_t>(
+            method_static::static_method("sEchoShort")->call(std::int16_t{ 1 })));
+        g_echo_short_negone.store(static_cast<std::int16_t>(
+            method_static::static_method("sEchoShort")->call(std::int16_t{ -1 })));
+
         (void)self;
         g_all_calls_ran.store(true);
     }
@@ -1641,6 +1886,109 @@ VMHOOK_JVM_MODULE(method_static)
         ctx.check("mstat3_inherited_sig_is_static", g_inherited_sig_is_static.load() == 1);
         ctx.check("mstat3_inherited_sig_returns_super_value",
                   g_inherited_sig_ret.load() == k_base_static);
+
+        // ##################################################################
+        //  mstat4_* — DEEPER INPUT COVERAGE (all path-INDEPENDENT, HARD)
+        // ##################################################################
+
+        // ---- (S) sRecordInt: int arg landed intact at slot 0 (no receiver) ----
+        ctx.check("mstat4_record_int_slot0",
+                  g_record_int_field.load() == static_cast<std::int64_t>(0x1234ABCD));
+
+        // ---- (T) sBoolXor full truth table (FF -> 0, FT -> 1) ----
+        ctx.check("mstat4_bool_xor_false_false", g_bool_xor_ff.load() == 0);
+        ctx.check("mstat4_bool_xor_false_true", g_bool_xor_ft.load() == 1);
+
+        // ---- (U) sArrayLen(null) -> -1 (path-independent) ----
+        ctx.check("mstat4_array_len_null_neg1", g_array_len_null.load() == -1);
+
+        // ---- (V) sStringArgLen empty / ASCII boundaries ----
+        ctx.check("mstat4_string_arg_len_empty_zero", g_string_arg_len_empty.load() == 0);
+        ctx.check("mstat4_string_arg_len_ascii_5", g_string_arg_len_ascii.load() == 5);
+
+        // ---- (W) sEchoString longer ASCII round-trip ----
+        ctx.check("mstat4_echo_string_ascii_captured", g_echo_string_ascii_captured.load());
+        ctx.check("mstat4_echo_string_ascii_round_trip", g_echo_string_ascii == "Echo-123/!?");
+
+        // ---- (X) sArgIdentity idempotency + cross-method agreement ----
+        // Both probes need a live `self` oop; assert only when captured, record
+        // otherwise (no false-fail when the detour saw no receiver).
+        if (g_identity_idempotent.load() != -1)
+        {
+            ctx.check("mstat4_arg_identity_idempotent", g_identity_idempotent.load() == 1);
+            ctx.check("mstat4_arg_identity_two_methods_agree",
+                      g_identity_two_methods_agree.load() == 1);
+        }
+        else
+        {
+            ctx.record("[INFO] mstat4_arg_identity: no self oop captured this run — "
+                       "idempotency/agreement cross-check skipped (no crash).");
+        }
+
+        // ---- (Y) sSumII / sSumJJ boundary slot-order digests ----
+        // sSumII(0,-1)  = 0*1000003 + (-1)        = -1
+        ctx.check("mstat4_sum_ii_zero_negone", g_sum_ii_zero_negone.load() == -1);
+        {
+            // sSumII(MIN,MAX) in 32-bit Java int wraparound arithmetic
+            // (MIN*1000003 + MAX), recomputed with unsigned 32-bit wrapping then
+            // sign-cast — avoids signed-overflow UB in the expectation.
+            const std::uint32_t mn{ static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::min()) };
+            const std::uint32_t mx{ static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) };
+            const std::int32_t expected_minmax{ static_cast<std::int32_t>(mn * 1000003u + mx) };
+            ctx.check("mstat4_sum_ii_min_max", g_sum_ii_min_max.load() == expected_minmax);
+        }
+        ctx.check("mstat4_sum_jj_zero_one", g_sum_jj_zero_one.load() == 1);
+
+        // ---- (Z) sEchoInt / sEchoInt2 agreement + small-int boundaries ----
+        ctx.check("mstat4_echo_int_one", g_echo_int_one.load() == 1);
+        ctx.check("mstat4_echo_int2_zero", g_echo_int2_zero.load() == 0);
+        ctx.check("mstat4_echo_int_methods_agree", g_echo_int_methods_agree.load() == 1);
+
+        // ---- (AA) is_static() true + null-receiver-oop for more statics ----
+        ctx.check("mstat4_is_static_poly", g_isstatic_spoly.load() == 1);
+        ctx.check("mstat4_is_static_sumii", g_isstatic_ssumii.load() == 1);
+        ctx.check("mstat4_is_static_arraylen", g_isstatic_sarraylen.load() == 1);
+        ctx.check("mstat4_is_static_eight_ints", g_isstatic_s8ints.load() == 1);
+        ctx.check("mstat4_is_static_arg_identity", g_isstatic_sargidentity.load() == 1);
+        ctx.check("mstat4_recv_oop_zero_poly", g_recv_oop_zero_poly.load() == 1);
+        ctx.check("mstat4_recv_oop_zero_sumii", g_recv_oop_zero_sumii.load() == 1);
+        ctx.check("mstat4_recv_oop_zero_arraylen", g_recv_oop_zero_arraylen.load() == 1);
+
+        // ---- (AB) static_method(name, sig) is_static + null-oop for more sigs ---
+        ctx.check("mstat4_sig_sumii_is_static", g_sig_sumii_is_static.load() == 1);
+        ctx.check("mstat4_sig_sumii_oop_zero", g_sig_sumii_oop_zero.load() == 1);
+        // sSumII(3,4) = 3*1000003 + 4 = 3000013.
+        ctx.check("mstat4_sig_sumii_returns_digest", g_sig_sumii_ret.load() == 3000013);
+        ctx.check("mstat4_sig_echolong_is_static", g_sig_echolong_is_static.load() == 1);
+        ctx.check("mstat4_sig_echolong_echoes_arg",
+                  g_sig_echolong_ret.load() == static_cast<std::int64_t>(0x0011223344556677LL));
+
+        // ---- (AC) sPoly by-TYPE vs by-SIGNATURE agreement cross-check ----
+        ctx.check("mstat4_poly_int_type_eq_sig", g_poly_int_type_eq_sig.load() == 1);
+        ctx.check("mstat4_poly_long_type_eq_sig", g_poly_long_type_eq_sig.load() == 1);
+        ctx.check("mstat4_poly_string_type_eq_sig", g_poly_string_type_eq_sig.load() == 1);
+        ctx.check("mstat4_poly_float_type_eq_sig", g_poly_float_type_eq_sig.load() == 1);
+        ctx.check("mstat4_poly_double_type_eq_sig", g_poly_double_type_eq_sig.load() == 1);
+        ctx.check("mstat4_poly_intint_type_eq_sig", g_poly_intint_type_eq_sig.load() == 1);
+        ctx.check("mstat4_poly_intlong_type_eq_sig", g_poly_intlong_type_eq_sig.load() == 1);
+
+        // ---- (AD) sEchoLong more boundaries ----
+        ctx.check("mstat4_echo_long_one", g_echo_long_one.load() == 1);
+        ctx.check("mstat4_echo_long_negone", g_echo_long_negone.load() == -1);
+        ctx.check("mstat4_echo_long_alt_pattern",
+                  g_echo_long_alt.load() == static_cast<std::int64_t>(0x5555555555555555LL));
+
+        // ---- (AE) sEchoChar more code-unit boundaries (echo is exact) ----
+        ctx.check("mstat4_echo_char_one", g_echo_char_one.load() == 1);
+        // 0xD800 is a lone-surrogate code unit; a char echo preserves it verbatim
+        // (zero-extended unsigned 16-bit, no interpretation as a code point).
+        ctx.check("mstat4_echo_char_surrogate_exact", g_echo_char_surrogate.load() == 0xD800);
+
+        // ---- (AF) sEchoByte / sEchoShort interior boundaries (1, -1) ----
+        ctx.check("mstat4_echo_byte_one", g_echo_byte_one.load() == 1);
+        ctx.check("mstat4_echo_byte_negone", g_echo_byte_negone.load() == -1);
+        ctx.check("mstat4_echo_short_one", g_echo_short_one.load() == 1);
+        ctx.check("mstat4_echo_short_negone", g_echo_short_negone.load() == -1);
     }
 
     // Suite-safety: tear down any hook this module armed so ZERO stay installed

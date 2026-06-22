@@ -2000,4 +2000,686 @@ VMHOOK_JVM_MODULE(nested_classes)
         ctx.check("iface_inner_identity_published_nonzero", nc::get_int("ifaceInnerInnerIdentity") != 0);
         ctx.check("anno_member_identity_published_nonzero", nc::get_int("annoMemberIdentity") != 0);
     }
+
+    // =====================================================================
+    // 11. find_class BOUNDARY / NEGATIVE / DEGENERATE name inputs.  The
+    //     resolve-by-`$`-name premise of this whole module rests on find_class
+    //     returning a stable non-null klass for a present name and CLEANLY
+    //     nullptr (never a fabricated/garbage klass) for an absent or malformed
+    //     name.  All pure metadata — find_class does no oop deref — so HARD.
+    //       * "" (empty)            -> nullptr (the documented empty-name reject);
+    //       * a well-formed `$`-name for a class that does NOT exist -> nullptr
+    //         (a genuine ClassNotFound miss is cleared to null on every JDK —
+    //         the same contract the module's entry-guard already trusts);
+    //       * a trailing-`$` malformed name -> nullptr;
+    //       * IDEMPOTENCE: find_class(name) twice returns the SAME pointer (the
+    //         cache contract — a `$`-name hit must not mint a second klass).
+    // =====================================================================
+    {
+        // Empty internal name can never name a loaded class.
+        ctx.check("find_class_empty_name_is_null",
+                  vmhook::find_class("") == nullptr);
+
+        // A syntactically valid `$`-nested name that is NOT declared anywhere:
+        // there is no NestedClasses$Host$NoSuchNested, so resolution must miss.
+        ctx.check("find_class_absent_dollar_name_is_null",
+                  vmhook::find_class(
+                      "vmhook/fixtures/NestedClasses$Host$NoSuchNestedXYZ") == nullptr);
+        // An absent top-level name likewise misses (no `$` at all).
+        ctx.check("find_class_absent_top_level_is_null",
+                  vmhook::find_class("vmhook/fixtures/NoSuchClassAtAll") == nullptr);
+        // A malformed name ending in a bare `$` (a separator with no trailing
+        // segment) names nothing.
+        ctx.check("find_class_trailing_dollar_name_is_null",
+                  vmhook::find_class("vmhook/fixtures/NestedClasses$Host$") == nullptr);
+
+        // IDEMPOTENCE: every STABLE `$`-name resolves to the SAME klass object on
+        // a repeated call (the find_class cache returns the cached klass, never a
+        // freshly-allocated duplicate).  Pure pointer comparison -> HARD.
+        ctx.check("find_class_host_is_idempotent",
+                  vmhook::find_class(k_host_name) == host_klass);
+        ctx.check("find_class_inner_is_idempotent",
+                  vmhook::find_class(k_inner_name) == inner_klass);
+        ctx.check("find_class_inner_inner_is_idempotent",
+                  vmhook::find_class(k_inner_inner_name) == inner_inner_klass);
+        ctx.check("find_class_deep_is_idempotent",
+                  vmhook::find_class(k_deep_name) == deep_klass);
+        ctx.check("find_class_iface_inner_is_idempotent",
+                  vmhook::find_class(k_iface_inner_name) == iface_inner_klass);
+    }
+
+    // =====================================================================
+    // 12. field_proxy SHAPE accessors on EVERY acquired wrapper (signature() /
+    //     is_static() / is_reference()) — the descriptor-dispatch branch that
+    //     governs whether a field read goes down the primitive or the
+    //     compressed-oop path.  Pure proxy accessors over the cached descriptor
+    //     (no oop deref) -> HARD whenever the wrapper acquired.  Phase 7e only
+    //     covered Inner + GenericBox; this fans the same shape proof across the
+    //     remaining wrappers and adds the per-shape signature-string assertion.
+    // =====================================================================
+    {
+        auto proxy_is_int = [&](const char* tag, auto* wrapper, const char* fname)
+        {
+            if (!wrapper) { return; }
+            const auto p{ wrapper->get_field(fname) };
+            ctx.check(std::string{ tag } + "_resolves", p.has_value());
+            if (p.has_value())
+            {
+                ctx.check(std::string{ tag } + "_signature_is_I",
+                          std::string{ p->signature() } == std::string{ "I" });
+                ctx.check(std::string{ tag } + "_not_reference", !p->is_reference());
+                ctx.check(std::string{ tag } + "_not_static", !p->is_static());
+            }
+        };
+        proxy_is_int("proxy_host_outerField", host.get(), "outerField");
+        proxy_is_int("proxy_static_value", static_nested.get(), "value");
+        proxy_is_int("proxy_second_secondValue", second_inner.get(), "secondValue");
+        proxy_is_int("proxy_inner_inner_value", inner_inner.get(), "innerInnerValue");
+        proxy_is_int("proxy_deep_deepValue", deep_nested.get(), "deepValue");
+
+        // SecondInner's synthetic this$0 reports as a REFERENCE, NON-static field
+        // whose descriptor names the Host (mirrors phase 7e for the first Inner).
+        if (second_inner)
+        {
+            const auto si_p{ second_inner->get_field("this$0") };
+            ctx.check("proxy_second_this0_resolves", si_p.has_value());
+            if (si_p.has_value())
+            {
+                ctx.check("proxy_second_this0_is_reference", si_p->is_reference());
+                ctx.check("proxy_second_this0_not_static", !si_p->is_static());
+                ctx.check("proxy_second_this0_signature_names_host",
+                          std::string{ si_p->signature() } == std::string{ k_host_descriptor });
+            }
+        }
+        // InnerInner's this$1 proxy: reference, non-static, descriptor names Inner.
+        if (inner_inner)
+        {
+            const auto ii_p{ inner_inner->get_field("this$1") };
+            ctx.check("proxy_inner_inner_this1_resolves", ii_p.has_value());
+            if (ii_p.has_value())
+            {
+                ctx.check("proxy_inner_inner_this1_is_reference", ii_p->is_reference());
+                ctx.check("proxy_inner_inner_this1_not_static", !ii_p->is_static());
+                ctx.check("proxy_inner_inner_this1_signature_names_inner",
+                          std::string{ ii_p->signature() } == std::string{ k_inner_descriptor });
+            }
+        }
+        // GenericBox.boxed: reference field, NON-static, descriptor the erased Object.
+        if (generic_box)
+        {
+            const auto gb_p{ generic_box->get_field("boxed") };
+            if (gb_p.has_value())
+            {
+                ctx.check("proxy_generic_boxed_not_static", !gb_p->is_static());
+                ctx.check("proxy_generic_boxed_signature_is_erased_object",
+                          std::string{ gb_p->signature() } == std::string{ "Ljava/lang/Object;" });
+            }
+        }
+    }
+
+    // =====================================================================
+    // 13. find_field declaring_klass + OFFSET-DISTINCTNESS within ONE `$`-nested
+    //     klass.  For the Inner: outerField is NOT its field (it is Host's), but
+    //     innerValue and the synthetic this$0 ARE declared on the Inner — and
+    //     they must occupy DISTINCT object-absolute offsets (two different fields
+    //     can never share a slot).  declaring_klass for each is the Inner itself.
+    //     Pure field-metadata walk (no oop deref) -> HARD.
+    // =====================================================================
+    {
+        const auto innerval{ field_entry_for(inner_klass, "innerValue") };
+        const auto this0{ field_entry_for(inner_klass, "this$0") };
+        ctx.check("inner_innerValue_and_this0_both_resolve",
+                  innerval.has_value() && this0.has_value());
+        if (innerval.has_value() && this0.has_value())
+        {
+            // Two distinct fields of the same klass occupy distinct offsets.
+            ctx.check("inner_innerValue_offset_differs_from_this0_offset",
+                      innerval->offset != this0->offset);
+            // Both are declared directly ON the Inner klass (not inherited).
+            ctx.check("inner_innerValue_declared_by_inner_klass",
+                      innerval->declaring_klass == inner_klass);
+            ctx.check("inner_this0_declared_by_inner_klass_again",
+                      this0->declaring_klass == inner_klass);
+            // Both lie strictly past the oop header.
+            ctx.check("inner_innerValue_offset_past_header", innerval->offset > 0u);
+        }
+
+        // InnerInner: innerInnerValue and this$1 are distinct, both declared on it.
+        const auto iival{ field_entry_for(inner_inner_klass, "innerInnerValue") };
+        const auto ii_this1{ field_entry_for(inner_inner_klass, "this$1") };
+        ctx.check("inner_inner_value_and_this1_both_resolve",
+                  iival.has_value() && ii_this1.has_value());
+        if (iival.has_value() && ii_this1.has_value())
+        {
+            ctx.check("inner_inner_value_offset_differs_from_this1_offset",
+                      iival->offset != ii_this1->offset);
+            ctx.check("inner_inner_value_declared_by_inner_inner_klass",
+                      iival->declaring_klass == inner_inner_klass);
+            ctx.check("inner_inner_this1_declared_by_inner_inner_klass",
+                      ii_this1->declaring_klass == inner_inner_klass);
+        }
+    }
+
+    // =====================================================================
+    // 14. get_method WITH EXPLICIT SIGNATURE + name/signature echo on a LIVE
+    //     wrapper — the name+descriptor resolution path, cross-checked against
+    //     the method_proxy's OWN reported name() and signature() (they must echo
+    //     exactly what was asked, proving the proxy bound the right Method).  No
+    //     call is made (no receiver oop deref) -> HARD.  Extends phase 7g (which
+    //     only checked has_value()) with the proxy-accessor agreement.
+    // =====================================================================
+    {
+        auto method_echoes = [&](const char* tag, auto* wrapper,
+                                 const char* mname, const char* msig)
+        {
+            if (!wrapper) { return; }
+            const auto m{ wrapper->get_method(mname, msig) };
+            ctx.check(std::string{ tag } + "_resolves", m.has_value());
+            if (m.has_value())
+            {
+                ctx.check(std::string{ tag } + "_name_echoes",
+                          m->name() == std::string{ mname });
+                ctx.check(std::string{ tag } + "_signature_echoes",
+                          std::string{ m->signature() } == std::string{ msig });
+                // A no-arg int instance method is NON-static and returns a value
+                // (its signature ends in ")I", not ")V").
+                ctx.check(std::string{ tag } + "_is_instance_method", !m->is_static());
+            }
+        };
+        method_echoes("method_static_doubled", static_nested.get(), "doubled", "()I");
+        method_echoes("method_inner_outerPlusInner", inner.get(), "outerPlusInner", "()I");
+        method_echoes("method_second_outerPlusSecond", second_inner.get(),
+                      "outerPlusSecond", "()I");
+        method_echoes("method_inner_inner_sum", inner_inner.get(),
+                      "sumThroughBothOuters", "()I");
+        method_echoes("method_deep_deepDoubled", deep_nested.get(), "deepDoubled", "()I");
+    }
+
+    // =====================================================================
+    // 15. get_class_methods STRUCTURAL invariants on every nested shape — each
+    //     returned (name, descriptor) pair is non-degenerate: a non-empty name,
+    //     a descriptor that is a well-formed JVM method descriptor (starts with
+    //     '(', contains exactly one ')').  Every InstanceKlass has at least a
+    //     constructor, so the list is non-empty.  Pure _methods walk -> HARD.
+    // =====================================================================
+    {
+        auto methods_well_formed = [&](const char* tag, const char* class_name)
+        {
+            const auto methods{ vmhook::get_class_methods(class_name) };
+            ctx.check(std::string{ tag } + "_method_list_nonempty", !methods.empty());
+            bool all_named{ true };
+            bool all_descriptors_well_formed{ true };
+            bool has_clinit_or_init{ false };
+            for (const auto& m : methods)
+            {
+                if (m.first.empty()) { all_named = false; }
+                // A method descriptor has the shape "(params)ret": exactly one
+                // '(' at the front and exactly one ')'.
+                const auto open{ m.second.find('(') };
+                const auto close{ m.second.find(')') };
+                if (open != 0u || close == std::string::npos
+                    || m.second.rfind('(') != 0u
+                    || m.second.find(')', close + 1) != std::string::npos)
+                {
+                    all_descriptors_well_formed = false;
+                }
+                if (m.first == "<init>" || m.first == "<clinit>")
+                {
+                    has_clinit_or_init = true;
+                }
+            }
+            ctx.check(std::string{ tag } + "_all_methods_named", all_named);
+            ctx.check(std::string{ tag } + "_all_descriptors_well_formed",
+                      all_descriptors_well_formed);
+            ctx.check(std::string{ tag } + "_has_init_or_clinit", has_clinit_or_init);
+        };
+        methods_well_formed("methods_host", k_host_name);
+        methods_well_formed("methods_static_nested", k_static_name);
+        methods_well_formed("methods_inner", k_inner_name);
+        methods_well_formed("methods_second_inner", k_second_inner_name);
+        methods_well_formed("methods_inner_inner", k_inner_inner_name);
+        methods_well_formed("methods_deep_nested", k_deep_name);
+        methods_well_formed("methods_enum_static", k_enum_static_name);
+        methods_well_formed("methods_iface_member", k_iface_member_name);
+        methods_well_formed("methods_iface_inner", k_iface_inner_name);
+        methods_well_formed("methods_anno_member", k_anno_member_name);
+        // A nested INTERFACE has no <init>/<clinit> guarantee on every JDK (an
+        // interface with only abstract/default members may have neither), so its
+        // method-list non-emptiness is recorded [INFO] rather than asserted via
+        // the has_init_or_clinit branch.  The named/well-formed invariants still
+        // hold and are covered for the concrete classes above.
+        {
+            const auto im{ vmhook::get_class_methods(k_iface_name) };
+            ctx.record(std::string{ "[INFO] nested_classes: NestedIface method count=" }
+                       + std::to_string(im.size())
+                       + " (interface init/clinit presence is JDK-variant; not asserted).");
+        }
+    }
+
+    // =====================================================================
+    // 16. klass_from_oop CROSS-SHAPE DISTINCTNESS + IDEMPOTENCE.  Decoding the
+    //     klass off a singleton oop twice yields the SAME klass pointer, and the
+    //     klasses decoded off DIFFERENT singletons are mutually distinct — a
+    //     wrong/garbled narrow-klass decode would collapse two shapes onto one
+    //     klass or wobble between calls.  Each decode RAW-derefs oop+8, so probe
+    //     the header first; on a miss, [INFO] + skip (never fault, never vacuous).
+    // =====================================================================
+    {
+        if (host && inner && static_nested
+            && oop_header_safely_readable(host->get_instance())
+            && oop_header_safely_readable(inner->get_instance())
+            && oop_header_safely_readable(static_nested->get_instance()))
+        {
+            vmhook::hotspot::klass* const hk{ vmhook::klass_from_oop(host->get_instance()) };
+            vmhook::hotspot::klass* const hk2{ vmhook::klass_from_oop(host->get_instance()) };
+            vmhook::hotspot::klass* const ik{ vmhook::klass_from_oop(inner->get_instance()) };
+            vmhook::hotspot::klass* const sk{ vmhook::klass_from_oop(static_nested->get_instance()) };
+            // Idempotent: decoding the same oop twice gives the same klass.
+            ctx.check("klass_from_oop_idempotent_for_host", hk != nullptr && hk == hk2);
+            // Distinct shapes -> distinct klasses.
+            ctx.check("klass_from_oop_host_inner_static_distinct",
+                      hk != nullptr && ik != nullptr && sk != nullptr
+                      && hk != ik && hk != sk && ik != sk);
+        }
+        else
+        {
+            ctx.record("[INFO] nested_classes: one of host/inner/static headers not safely "
+                       "readable -- skipped klass_from_oop distinctness/idempotence.");
+        }
+    }
+
+    // =====================================================================
+    // 17. SUPER-CHAIN TOP + non-self invariants.  java.lang.Object is the root
+    //     of the super chain, so get_super() of Object is null; and NO nested
+    //     klass is its own super (a self-loop would hang any super walk).  Pure
+    //     metadata (get_super) -> HARD.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const object_klass{ vmhook::find_class(k_object_name) };
+        if (object_klass)
+        {
+            // Object sits at the top of the hierarchy: it has no super.
+            ctx.check("java_lang_Object_super_is_null",
+                      object_klass->get_super() == nullptr);
+        }
+        // No `$`-nested klass is its own superclass.
+        auto not_self_super = [&](const char* tag, vmhook::hotspot::klass* k)
+        {
+            if (k) { ctx.check(tag, k->get_super() != k); }
+        };
+        not_self_super("host_not_self_super", host_klass);
+        not_self_super("inner_not_self_super", inner_klass);
+        not_self_super("inner_inner_not_self_super", inner_inner_klass);
+        not_self_super("deep_not_self_super", deep_klass);
+        not_self_super("enum_not_self_super", enum_klass);
+        // The InnerInner's super is Object (NOT the enclosing Inner) — the inner's
+        // outer link is the synthetic this$1 field, never the superclass — the same
+        // dispel of confusion phase 7b makes for Inner-vs-Host, one level deeper.
+        ctx.check("inner_inner_super_is_not_inner_klass",
+                  inner_inner_klass != nullptr && inner_klass != nullptr
+                  && inner_inner_klass->get_super() != inner_klass);
+    }
+
+    // =====================================================================
+    // 18. NATIVE-vs-PROBE AGREEMENT cross-check.  When the call gate is present
+    //     AND the receiver header is readable, the natively-invoked no-arg int
+    //     method MUST agree with the value the mode probe published via real
+    //     bytecode (two independent paths to the same composite).  When the gate
+    //     is absent or the call degrades to monostate, record [INFO] — the probe
+    //     value already proven HARD in phase 9 stands alone.  Pointer/value
+    //     compare only -> HARD when the native value is available.
+    // =====================================================================
+    {
+        if (static_nested && call_gate_present
+            && oop_header_safely_readable(static_nested->get_instance()))
+        {
+            const vmhook::method_proxy::value_t dv{ static_nested->call_doubled() };
+            if (!dv.is_void())
+            {
+                const std::int32_t native_doubled = dv;
+                // The native doubled() must equal the probe-published doubledValue
+                // (both 84) — independent paths, same answer.
+                ctx.check("native_doubled_agrees_with_probe",
+                          native_doubled == nc::get_int("doubledValue"));
+            }
+            else
+            {
+                ctx.record("[INFO] nested_classes: native doubled() monostate -- native-vs-probe "
+                           "agreement deferred to the HARD probe assertion in phase 9.");
+            }
+        }
+        if (inner && call_gate_present
+            && oop_header_safely_readable(inner->get_instance()))
+        {
+            const vmhook::method_proxy::value_t ov{ inner->call_outer_plus_inner() };
+            if (!ov.is_void())
+            {
+                const std::int32_t native_opi = ov;
+                ctx.check("native_outerPlusInner_agrees_with_probe",
+                          native_opi == nc::get_int("outerPlusInnerValue"));
+            }
+            else
+            {
+                ctx.record("[INFO] nested_classes: native outerPlusInner() monostate -- native-vs-"
+                           "probe agreement deferred to the HARD probe assertion in phase 9.");
+            }
+        }
+    }
+
+    // =====================================================================
+    // 19. TYPED get_class_methods<T>() AGREEMENT with the by-NAME overload.
+    //     Phase 7f/15 only ever drove the by-name get_class_methods(name); the
+    //     TEMPLATE overload resolves the class through the wrapper's
+    //     register_class<T>() entry (a different lookup path: type_to_class_map
+    //     -> find_class), so the two MUST return the identical method set for a
+    //     `$`-nested wrapper.  Cross-check COUNT == COUNT and every (name,desc)
+    //     pair present in one is present in the other (set equality, order-free).
+    //     Pure _methods walk on both paths, NO oop deref -> HARD.
+    // =====================================================================
+    {
+        auto same_method_set = [&](const char* tag,
+                                   const std::vector<std::pair<std::string, std::string>>& by_type,
+                                   const std::vector<std::pair<std::string, std::string>>& by_name)
+        {
+            ctx.check(std::string{ tag } + "_count_agrees", by_type.size() == by_name.size());
+            // Every typed-path pair appears in the by-name path (and vice-versa via
+            // the equal counts + this one-directional containment).
+            bool every_typed_in_named{ true };
+            for (const auto& m : by_type)
+            {
+                bool found{ false };
+                for (const auto& n : by_name)
+                {
+                    if (n.first == m.first && n.second == m.second) { found = true; break; }
+                }
+                if (!found) { every_typed_in_named = false; }
+            }
+            ctx.check(std::string{ tag } + "_typed_subset_of_named", every_typed_in_named);
+            // And the by-name path is non-empty (every InstanceKlass has a ctor),
+            // so the agreement is non-vacuous.
+            ctx.check(std::string{ tag } + "_nonempty", !by_name.empty());
+        };
+        same_method_set("typed_methods_host",
+                        vmhook::get_class_methods<host_w>(), vmhook::get_class_methods(k_host_name));
+        same_method_set("typed_methods_static_nested",
+                        vmhook::get_class_methods<static_nested_w>(), vmhook::get_class_methods(k_static_name));
+        same_method_set("typed_methods_inner",
+                        vmhook::get_class_methods<inner_w>(), vmhook::get_class_methods(k_inner_name));
+        same_method_set("typed_methods_second_inner",
+                        vmhook::get_class_methods<second_inner_w>(), vmhook::get_class_methods(k_second_inner_name));
+        same_method_set("typed_methods_inner_inner",
+                        vmhook::get_class_methods<inner_inner_w>(), vmhook::get_class_methods(k_inner_inner_name));
+        same_method_set("typed_methods_deep_nested",
+                        vmhook::get_class_methods<deep_nested_w>(), vmhook::get_class_methods(k_deep_name));
+        same_method_set("typed_methods_enum_static",
+                        vmhook::get_class_methods<enum_static_w>(), vmhook::get_class_methods(k_enum_static_name));
+        same_method_set("typed_methods_iface_member",
+                        vmhook::get_class_methods<iface_member_w>(), vmhook::get_class_methods(k_iface_member_name));
+        same_method_set("typed_methods_iface_inner",
+                        vmhook::get_class_methods<iface_inner_w>(), vmhook::get_class_methods(k_iface_inner_name));
+        same_method_set("typed_methods_anno_member",
+                        vmhook::get_class_methods<anno_member_w>(), vmhook::get_class_methods(k_anno_member_name));
+    }
+
+    // =====================================================================
+    // 20. find_methods_by_signature<T> on the `$`-nested wrappers -- the
+    //     descriptor-keyed selector (the obfuscation-proof name-rotation-immune
+    //     resolution path).  Each declared no-arg int method MUST be found by its
+    //     "()I" descriptor and the returned name(s) MUST include the source name;
+    //     a descriptor that NO method on the klass carries returns the empty set
+    //     (negative).  Cross-check: every name returned for "()I" actually carries
+    //     "()I" in the get_class_methods substrate (count/agreement).  Pure
+    //     _methods walk, NO oop deref -> HARD.
+    // =====================================================================
+    {
+        auto sig_finds = [&](const char* tag, const std::vector<std::string>& names,
+                             const char* want_name, const char* class_name, const char* descriptor)
+        {
+            bool has_want{ false };
+            for (const auto& n : names) { if (n == want_name) { has_want = true; } }
+            ctx.check(std::string{ tag } + "_includes_source_name", has_want);
+            // Every name the descriptor-selector returned genuinely carries that
+            // descriptor in the substrate enumeration (no spurious matches).
+            const auto substrate{ vmhook::get_class_methods(class_name) };
+            bool every_name_carries_desc{ true };
+            for (const auto& n : names)
+            {
+                bool ok{ false };
+                for (const auto& m : substrate)
+                {
+                    if (m.first == n && m.second == descriptor) { ok = true; break; }
+                }
+                if (!ok) { every_name_carries_desc = false; }
+            }
+            ctx.check(std::string{ tag } + "_all_returned_names_carry_descriptor",
+                      every_name_carries_desc);
+        };
+        sig_finds("sig_static_doubled",
+                  vmhook::find_methods_by_signature<static_nested_w>("()I"),
+                  "doubled", k_static_name, "()I");
+        sig_finds("sig_inner_outerPlusInner",
+                  vmhook::find_methods_by_signature<inner_w>("()I"),
+                  "outerPlusInner", k_inner_name, "()I");
+        sig_finds("sig_second_outerPlusSecond",
+                  vmhook::find_methods_by_signature<second_inner_w>("()I"),
+                  "outerPlusSecond", k_second_inner_name, "()I");
+        sig_finds("sig_inner_inner_sum",
+                  vmhook::find_methods_by_signature<inner_inner_w>("()I"),
+                  "sumThroughBothOuters", k_inner_inner_name, "()I");
+        sig_finds("sig_deep_deepDoubled",
+                  vmhook::find_methods_by_signature<deep_nested_w>("()I"),
+                  "deepDoubled", k_deep_name, "()I");
+        sig_finds("sig_enum_static_tripled",
+                  vmhook::find_methods_by_signature<enum_static_w>("()I"),
+                  "tripled", k_enum_static_name, "()I");
+
+        // A descriptor that no method on StaticNested carries (a no-arg method
+        // returning a long) selects the EMPTY set -- the descriptor-key negative.
+        ctx.check("sig_static_no_long_noarg_method_empty",
+                  vmhook::find_methods_by_signature<static_nested_w>("()J").empty());
+        // A wildly-shaped descriptor likewise matches nothing on the Inner.
+        ctx.check("sig_inner_bogus_descriptor_empty",
+                  vmhook::find_methods_by_signature<inner_w>("(DDD)Ljava/lang/Void;").empty());
+    }
+
+    // =====================================================================
+    // 21. PER-KLASS klass::find_field (declared-only) vs the FREE super-walking
+    //     vmhook::find_field -- AGREEMENT on a declared field, DIVERGENCE on an
+    //     inherited-vs-declared boundary.  The synthetic this$0 and innerValue are
+    //     DECLARED directly on the Inner klass, so the declared-only per-klass walk
+    //     and the super-chain free walk MUST return the SAME offset/descriptor.
+    //     outerField is declared on Host (and Inner does NOT extend Host -- the
+    //     enclosing link is the synthetic field, never the superclass), so BOTH
+    //     walks MISS it on the Inner but the per-klass walk on HOST finds it.
+    //     This is the declared-vs-inherited contract for a `$`-nested klass.  Pure
+    //     field-metadata walks, NO oop deref -> HARD.
+    // =====================================================================
+    if (inner_klass)
+    {
+        // Declared-only per-klass walk finds the Inner's OWN this$0 + innerValue.
+        const auto pk_this0{ inner_klass->find_field("this$0") };
+        const auto pk_innerval{ inner_klass->find_field("innerValue") };
+        ctx.check("perklass_inner_this0_resolves", pk_this0.has_value());
+        ctx.check("perklass_inner_innerValue_resolves", pk_innerval.has_value());
+
+        const auto free_this0{ field_entry_for(inner_klass, "this$0") };
+        const auto free_innerval{ field_entry_for(inner_klass, "innerValue") };
+        if (pk_this0.has_value() && free_this0.has_value())
+        {
+            ctx.check("perklass_vs_free_inner_this0_offset_agrees",
+                      pk_this0->offset == free_this0->offset);
+            ctx.check("perklass_vs_free_inner_this0_descriptor_agrees",
+                      pk_this0->signature == free_this0->signature);
+            ctx.check("perklass_vs_free_inner_this0_storage_agrees",
+                      pk_this0->is_static == free_this0->is_static);
+        }
+        if (pk_innerval.has_value() && free_innerval.has_value())
+        {
+            ctx.check("perklass_vs_free_inner_innerValue_offset_agrees",
+                      pk_innerval->offset == free_innerval->offset);
+            ctx.check("perklass_vs_free_inner_innerValue_descriptor_agrees",
+                      pk_innerval->signature == free_innerval->signature);
+        }
+        // outerField is HOST's field; the Inner neither declares NOR inherits it
+        // (a non-static inner does not extend its enclosing class).  BOTH the
+        // declared-only AND the super-walking lookup MISS it on the Inner.
+        ctx.check("perklass_inner_does_not_declare_outerField",
+                  !inner_klass->find_field("outerField").has_value());
+        ctx.check("free_inner_does_not_inherit_outerField",
+                  !field_entry_for(inner_klass, "outerField").has_value());
+    }
+    if (host_klass)
+    {
+        // The per-klass declared-only walk on HOST finds outerField directly.
+        const auto pk_outer{ host_klass->find_field("outerField") };
+        ctx.check("perklass_host_outerField_resolves", pk_outer.has_value());
+        const auto free_outer{ field_entry_for(host_klass, "outerField") };
+        if (pk_outer.has_value() && free_outer.has_value())
+        {
+            ctx.check("perklass_vs_free_host_outerField_offset_agrees",
+                      pk_outer->offset == free_outer->offset);
+            ctx.check("perklass_vs_free_host_outerField_descriptor_is_int",
+                      pk_outer->signature == std::string{ "I" }
+                      && free_outer->signature == std::string{ "I" });
+        }
+    }
+
+    // =====================================================================
+    // 22. FREE get_field<int> at the metadata offset AGREES with the wrapper
+    //     read for every ordinary value field -- proves the object<T> get_field
+    //     path and the raw free get_field<value_type>(oop, klass, name) path land
+    //     on the SAME slot (same offset, same decoded value).  Each free read
+    //     RAW-memcpy's oop+offset, so probe the header first; on a miss [INFO] +
+    //     skip (never fault, never vacuous).  HARD on a readable header.
+    // =====================================================================
+    {
+        auto free_read_agrees = [&](const char* tag, void* oop, vmhook::hotspot::klass* k,
+                                    const char* fname, std::int32_t expected)
+        {
+            if (!oop || !k) { return; }
+            if (oop_header_safely_readable(oop))
+            {
+                const std::int32_t v{ vmhook::get_field<std::int32_t>(oop, k, fname) };
+                ctx.check(std::string{ tag } + "_free_read_matches_expected", v == expected);
+            }
+            else
+            {
+                ctx.record(std::string{ "[INFO] nested_classes: " } + tag
+                           + " header not safely readable -- skipped free get_field read.");
+            }
+        };
+        if (host)        { free_read_agrees("free_host_outerField", host->get_instance(), host_klass, "outerField", 7); }
+        if (static_nested){ free_read_agrees("free_static_value", static_nested->get_instance(), static_klass, "value", 42); }
+        if (inner)       { free_read_agrees("free_inner_innerValue", inner->get_instance(), inner_klass, "innerValue", 99); }
+        if (second_inner){ free_read_agrees("free_second_secondValue", second_inner->get_instance(), second_inner_klass, "secondValue", 55); }
+        if (inner_inner) { free_read_agrees("free_inner_inner_value", inner_inner->get_instance(), inner_inner_klass, "innerInnerValue", 11); }
+        if (deep_nested) { free_read_agrees("free_deep_deepValue", deep_nested->get_instance(), deep_klass, "deepValue", 1000); }
+    }
+
+    // =====================================================================
+    // 23. MORE find_class BOUNDARY / DEGENERATE name inputs + IDEMPOTENCE for
+    //     the remaining STABLE shapes.  Extends phase 11 with name forms the
+    //     `$`-name resolver must reject CLEANLY (never a fabricated klass):
+    //       * a slash-only / separator-only string names nothing;
+    //       * a name that is JUST the dollar separators names nothing;
+    //       * a present name with a TRAILING blank/space segment misses;
+    //       * a CASE-PERTURBED real `$`-name (lowercased leaf) misses (HotSpot
+    //         internal names are case-sensitive);
+    //       * a real prefix WITHOUT its final segment (the enclosing exists but
+    //         the requested deeper class does not) misses.
+    //     And the enum/iface/anno/host_color/enum_static/iface_member klasses each
+    //     resolve idempotently to the SAME pointer.  All pure metadata -> HARD.
+    // =====================================================================
+    {
+        ctx.check("find_class_slash_only_is_null", vmhook::find_class("/") == nullptr);
+        ctx.check("find_class_dollar_only_is_null", vmhook::find_class("$") == nullptr);
+        ctx.check("find_class_double_dollar_is_null", vmhook::find_class("$$") == nullptr);
+        ctx.check("find_class_space_name_is_null", vmhook::find_class("   ") == nullptr);
+        // A present enclosing chain whose requested LEAF does not exist.
+        ctx.check("find_class_inner_with_absent_leaf_is_null",
+                  vmhook::find_class("vmhook/fixtures/NestedClasses$Host$Inner$NoSuchInnerInner")
+                      == nullptr);
+        // Case sensitivity: the real leaf is "Inner"; "inner" is a different,
+        // non-existent class.
+        ctx.check("find_class_case_perturbed_leaf_is_null",
+                  vmhook::find_class("vmhook/fixtures/NestedClasses$Host$inner") == nullptr);
+        // A leading-`$` malformed name (separator with no leading segment).
+        ctx.check("find_class_leading_dollar_is_null",
+                  vmhook::find_class("$Host$Inner") == nullptr);
+
+        // Idempotence across the remaining STABLE shapes (the cache returns the
+        // cached klass, never a fresh duplicate).
+        ctx.check("find_class_static_is_idempotent",
+                  vmhook::find_class(k_static_name) == static_klass);
+        ctx.check("find_class_second_inner_is_idempotent",
+                  vmhook::find_class(k_second_inner_name) == second_inner_klass);
+        ctx.check("find_class_enum_is_idempotent",
+                  vmhook::find_class(k_enum_name) == enum_klass);
+        ctx.check("find_class_iface_is_idempotent",
+                  vmhook::find_class(k_iface_name) == iface_klass);
+        ctx.check("find_class_anno_is_idempotent",
+                  vmhook::find_class(k_anno_name) == anno_klass);
+        ctx.check("find_class_generic_is_idempotent",
+                  vmhook::find_class(k_generic_name) == generic_klass);
+        ctx.check("find_class_enum_static_is_idempotent",
+                  vmhook::find_class(k_enum_static_name) == enum_static_klass);
+        ctx.check("find_class_iface_member_is_idempotent",
+                  vmhook::find_class(k_iface_member_name) == iface_member_klass);
+        ctx.check("find_class_host_color_is_idempotent",
+                  vmhook::find_class(k_host_color_name) == host_color_klass);
+        ctx.check("find_class_anno_member_is_idempotent",
+                  vmhook::find_class(k_anno_member_name) == anno_member_klass);
+    }
+
+    // =====================================================================
+    // 24. SUPER-CHAIN LENGTH-TO-OBJECT + reachability for every nested INSTANCE
+    //     shape.  Walking get_super() repeatedly from any nested klass MUST reach
+    //     java.lang.Object in a BOUNDED number of steps (no cycle, no runaway) and
+    //     terminate there (Object's super is null).  For the instance classes that
+    //     extend Object DIRECTLY the chain length is exactly 1; the nested ENUM
+    //     reaches Object in exactly 2 (klass -> Enum -> Object).  Pure metadata
+    //     (get_super) walk, NO oop deref -> HARD.  A self-loop or a missing
+    //     terminator would either hang the walk or overshoot the bound.
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const object_klass{ vmhook::find_class(k_object_name) };
+        // Returns the number of get_super() hops from `k` to Object, or -1 if
+        // Object is not reached within a safe bound (cycle / broken chain).
+        auto hops_to_object = [&](vmhook::hotspot::klass* k) -> int
+        {
+            if (!object_klass) { return -1; }
+            int hops{ 0 };
+            for (vmhook::hotspot::klass* cur{ k };
+                 cur != nullptr && hops <= 64; cur = cur->get_super(), ++hops)
+            {
+                if (cur == object_klass) { return hops; }
+            }
+            return -1;
+        };
+        if (object_klass)
+        {
+            // Direct-Object instance shapes: exactly 1 hop.
+            ctx.check("host_super_chain_reaches_object_in_1", hops_to_object(host_klass) == 1);
+            ctx.check("static_super_chain_reaches_object_in_1", hops_to_object(static_klass) == 1);
+            ctx.check("inner_super_chain_reaches_object_in_1", hops_to_object(inner_klass) == 1);
+            ctx.check("second_inner_super_chain_reaches_object_in_1", hops_to_object(second_inner_klass) == 1);
+            ctx.check("inner_inner_super_chain_reaches_object_in_1", hops_to_object(inner_inner_klass) == 1);
+            ctx.check("deep_super_chain_reaches_object_in_1", hops_to_object(deep_klass) == 1);
+            ctx.check("generic_super_chain_reaches_object_in_1", hops_to_object(generic_klass) == 1);
+            ctx.check("enum_static_super_chain_reaches_object_in_1", hops_to_object(enum_static_klass) == 1);
+            ctx.check("iface_member_super_chain_reaches_object_in_1", hops_to_object(iface_member_klass) == 1);
+            ctx.check("iface_inner_super_chain_reaches_object_in_1", hops_to_object(iface_inner_klass) == 1);
+            ctx.check("anno_member_super_chain_reaches_object_in_1", hops_to_object(anno_member_klass) == 1);
+            // The nested enum + the Host-nested enum reach Object via Enum: 2 hops.
+            ctx.check("nested_enum_super_chain_reaches_object_in_2", hops_to_object(enum_klass) == 2);
+            ctx.check("host_color_super_chain_reaches_object_in_2", hops_to_object(host_color_klass) == 2);
+            // Object itself: 0 hops (it IS Object).
+            ctx.check("object_super_chain_reaches_object_in_0", hops_to_object(object_klass) == 0);
+        }
+        else
+        {
+            ctx.record("[INFO] nested_classes: java/lang/Object not resolvable -- skipped "
+                       "super-chain length checks.");
+        }
+    }
 }

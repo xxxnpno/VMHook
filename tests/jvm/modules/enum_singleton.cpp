@@ -1816,6 +1816,297 @@ namespace
             ctx.check("java_enumset_className_is_RegularEnumSet",
                       enum_holder::seen_str("warmColorsClassName") == "java.util.RegularEnumSet");
         }
+
+        // =====================================================================
+        // 19. DEEPENING (additive): dense CROSS-PATH / BOUNDARY / IDEMPOTENCY /
+        //     RELATIONAL invariants derived ENTIRELY from values already proven
+        //     exact above (so each is guaranteed correct on every JVM the prior
+        //     checks pass on).  No new fixture state; no native call gate needed.
+        // =====================================================================
+
+        // ---- 19a. CROSS-PATH RGB AGREEMENT: the three independent decode paths
+        //      (instance field favoriteColor, static field staticColor, the
+        //      enum's own constant statics RED/GREEN/BLUE) read IDENTICAL `rgb`
+        //      for the constant they alias.  Each side is already == its exact
+        //      packed value above, so equality between the paths is invariant. ----
+        if (live(favorite) && live(green))
+        {
+            ctx.check("xpath_favorite_rgb_equals_GREEN_constant_rgb",
+                      safe_rgb(favorite) == safe_rgb(green));
+        }
+        if (live(static_color) && live(blue))
+        {
+            ctx.check("xpath_static_rgb_equals_BLUE_constant_rgb",
+                      safe_rgb(static_color) == safe_rgb(blue));
+        }
+        // Idempotency: rgb read twice off the SAME wrapper yields the same int.
+        if (live(green))
+        {
+            ctx.check("idemp_GREEN_rgb_read_twice_identical",
+                      green->get_rgb() == green->get_rgb());
+        }
+        // The three constants' rgb are pairwise DISTINCT (distinct singletons
+        // carry distinct payloads) -- a content-level distinctness above the
+        // OOP-level distinctness already checked in section 4.
+        if (live(red) && live(green) && live(blue))
+        {
+            const std::int32_t rr{ safe_rgb(red) };
+            const std::int32_t rg{ safe_rgb(green) };
+            const std::int32_t rb{ safe_rgb(blue) };
+            ctx.check("rgb_values_pairwise_distinct",
+                      rr != rg && rg != rb && rr != rb);
+            // Each packed value occupies EXACTLY one 8-bit channel (the others 0).
+            ctx.check("RED_rgb_is_pure_red_channel",
+                      ((rr >> 16) & 0xFF) == 0xFF && ((rr >> 8) & 0xFF) == 0 && (rr & 0xFF) == 0);
+            ctx.check("GREEN_rgb_is_pure_green_channel",
+                      ((rg >> 16) & 0xFF) == 0 && ((rg >> 8) & 0xFF) == 0xFF && (rg & 0xFF) == 0);
+            ctx.check("BLUE_rgb_is_pure_blue_channel",
+                      ((rb >> 16) & 0xFF) == 0 && ((rb >> 8) & 0xFF) == 0 && (rb & 0xFF) == 0xFF);
+        }
+
+        // ---- 19b. brightness() == channel-sum, computed NATIVELY from the
+        //      already-verified `rgb` int (pure C++ arithmetic -- no JVM call).
+        //      This mirrors the fixture's brightness() exactly and proves the
+        //      0xFF witnesses are arithmetically consistent with the field read,
+        //      independent of any call gate. ----
+        const auto channel_sum = [](std::int32_t rgb) -> std::int32_t
+        {
+            return ((rgb >> 16) & 0xFF) + ((rgb >> 8) & 0xFF) + (rgb & 0xFF);
+        };
+        if (live(red) && live(green) && live(blue))
+        {
+            ctx.check("native_RED_channel_sum_is_0xFF",   channel_sum(safe_rgb(red))   == static_cast<std::int32_t>(0xFF));
+            ctx.check("native_GREEN_channel_sum_is_0xFF", channel_sum(safe_rgb(green)) == static_cast<std::int32_t>(0xFF));
+            ctx.check("native_BLUE_channel_sum_is_0xFF",  channel_sum(safe_rgb(blue))  == static_cast<std::int32_t>(0xFF));
+            // All three brightnesses are EQUAL (each is a single saturated channel).
+            ctx.check("native_brightness_all_equal_across_constants",
+                      channel_sum(safe_rgb(red)) == channel_sum(safe_rgb(green))
+                      && channel_sum(safe_rgb(green)) == channel_sum(safe_rgb(blue)));
+        }
+
+        // ---- 19c. Java brightness witnesses agree with the natively-computed
+        //      channel-sum AND with each other (the JVM-side value == the value
+        //      derived from the native field read). ----
+        if (done)
+        {
+            const std::int32_t fav_b{ enum_holder::seen_int("favoriteBrightnessSeen") };
+            const std::int32_t stat_b{ enum_holder::seen_int("staticBrightnessSeen") };
+            const std::int32_t red_b{ enum_holder::seen_int("redBrightnessSeen") };
+            ctx.check("java_brightness_all_three_equal", fav_b == stat_b && stat_b == red_b);
+            if (live(green))
+            {
+                ctx.check("java_GREEN_brightness_matches_native_channel_sum",
+                          fav_b == channel_sum(safe_rgb(green)));
+            }
+            if (live(blue))
+            {
+                ctx.check("java_BLUE_brightness_matches_native_channel_sum",
+                          stat_b == channel_sum(safe_rgb(blue)));
+            }
+            if (live(red))
+            {
+                ctx.check("java_RED_brightness_matches_native_channel_sum",
+                          red_b == channel_sum(safe_rgb(red)));
+            }
+        }
+
+        // ---- 19d. ORDINAL/NAME boundary + monotonicity invariants (all derived
+        //      from per-constant reads already asserted exact in section 5). ----
+        if (live(red) && live(green) && live(blue))
+        {
+            const std::int32_t o_red{ red->get_ordinal() };
+            const std::int32_t o_green{ green->get_ordinal() };
+            const std::int32_t o_blue{ blue->get_ordinal() };
+            // Ordinals are 0-based, contiguous, strictly increasing in
+            // declaration order, and span exactly [0, count-1].
+            ctx.check("ordinals_start_at_zero", o_red == 0);
+            ctx.check("ordinals_strictly_increasing", o_red < o_green && o_green < o_blue);
+            ctx.check("ordinals_contiguous", o_green == o_red + 1 && o_blue == o_green + 1);
+            ctx.check("ordinals_max_is_count_minus_one", o_blue == 3 - 1);
+            ctx.check("ordinals_pairwise_distinct",
+                      o_red != o_green && o_green != o_blue && o_red != o_blue);
+            // name() is non-empty for every constant and pairwise distinct.
+            const std::string n_red{ red->get_name() };
+            const std::string n_green{ green->get_name() };
+            const std::string n_blue{ blue->get_name() };
+            ctx.check("names_all_nonempty",
+                      !n_red.empty() && !n_green.empty() && !n_blue.empty());
+            ctx.check("names_pairwise_distinct",
+                      n_red != n_green && n_green != n_blue && n_red != n_blue);
+        }
+
+        // ---- 19e. $VALUES element OOPs read off the BARE element pointer agree
+        //      with the constant wrappers on rgb / ordinal / name (cross-path
+        //      content agreement -- array-element decode == constant-static
+        //      decode, value-for-value, not just OOP-for-OOP). ----
+        {
+            void* const array_oop{ enum_color::values_array_oop() };
+            if (array_oop && vmhook::hotspot::is_valid_pointer(array_oop))
+            {
+                const std::vector<void*> elems{ values_element_oops(array_oop) };
+                if (elems.size() == 3 && live(red) && live(green) && live(blue))
+                {
+                    ctx.check("xpath_values_elem_rgb_equals_constant_rgb",
+                              rgb_of_oop(elems[0]) == safe_rgb(red)
+                              && rgb_of_oop(elems[1]) == safe_rgb(green)
+                              && rgb_of_oop(elems[2]) == safe_rgb(blue));
+                    ctx.check("xpath_values_elem_ordinal_equals_index",
+                              ordinal_of_oop(elems[0]) == 0
+                              && ordinal_of_oop(elems[1]) == 1
+                              && ordinal_of_oop(elems[2]) == 2);
+                    ctx.check("xpath_values_elem_name_equals_constant_name",
+                              name_of_oop(elems[0]) == red->get_name()
+                              && name_of_oop(elems[1]) == green->get_name()
+                              && name_of_oop(elems[2]) == blue->get_name());
+                    // values() length read off the array == the enum constant count
+                    // == the highest ordinal + 1 (three independent counts agree).
+                    ctx.check("count_array_length_equals_max_ordinal_plus_one",
+                              vmhook::array_length(array_oop) == blue->get_ordinal() + 1);
+                }
+            }
+        }
+
+        // ---- 19f. Java IDENTITY witnesses: stronger relational invariants on the
+        //      published System.identityHashCode values (each already known
+        //      individually; here the cross-relations among them). ----
+        if (done)
+        {
+            const std::int32_t green_id{ enum_holder::seen_int("greenIdentity") };
+            const std::int32_t blue_id{ enum_holder::seen_int("blueIdentity") };
+            const std::int32_t red_id{ enum_holder::seen_int("redIdentity") };
+            const std::int32_t fav_id{ enum_holder::seen_int("favoriteIdentity") };
+            const std::int32_t stat_id{ enum_holder::seen_int("staticIdentity") };
+            const std::int32_t vb_id{ enum_holder::seen_int("valueOfBlueIdentity") };
+            // valueOf("BLUE") returns the SAME singleton as the static field AND
+            // the BLUE constant (one object, three name-paths to it).
+            ctx.check("java_valueOf_BLUE_identity_equals_static_identity", vb_id == stat_id);
+            ctx.check("java_valueOf_BLUE_identity_equals_blue_constant", vb_id == blue_id);
+            // favorite == green and static == blue chain transitively to distinct.
+            ctx.check("java_favorite_static_distinct_identity", fav_id != stat_id);
+            ctx.check("java_favorite_is_green_static_is_blue",
+                      fav_id == green_id && stat_id == blue_id);
+            // The three Color identities are all non-zero (live, hashed objects).
+            ctx.check("java_color_identities_all_nonzero",
+                      red_id != 0 && green_id != 0 && blue_id != 0);
+        }
+
+        // ---- 19g. Op (second enum) RELATIONAL invariants on the published
+        //      apply()/ordinal/identity witnesses (the exact 8/12/0/1 values are
+        //      already asserted; here the arithmetic + ordering relationships). ----
+        if (done)
+        {
+            const std::int32_t plus_apply{ enum_holder::seen_int("plusApplySeen") };
+            const std::int32_t times_apply{ enum_holder::seen_int("timesApplySeen") };
+            // The probe computes apply(6, 2): PLUS=6+2=8, TIMES=6*2=12.
+            ctx.check("java_op_PLUS_apply_is_sum_of_6_2", plus_apply == 6 + 2);
+            ctx.check("java_op_TIMES_apply_is_product_of_6_2", times_apply == 6 * 2);
+            // The constant-specific overrides DIFFER (distinct behaviour per body).
+            ctx.check("java_op_apply_results_differ", plus_apply != times_apply);
+            ctx.check("java_op_TIMES_apply_exceeds_PLUS", times_apply > plus_apply);
+            // Op ordinals: 0-based contiguous, PLUS before TIMES.
+            const std::int32_t plus_ord{ enum_holder::seen_int("plusOrdinal") };
+            const std::int32_t times_ord{ enum_holder::seen_int("timesOrdinal") };
+            ctx.check("java_op_ordinals_contiguous_from_zero",
+                      plus_ord == 0 && times_ord == 1);
+            ctx.check("java_op_ordinals_span_is_values_len_minus_one",
+                      times_ord == enum_holder::seen_int("opValuesLen") - 1);
+            // Op identities non-zero and distinct.
+            const std::int32_t plus_id{ enum_holder::seen_int("plusIdentity") };
+            const std::int32_t times_id{ enum_holder::seen_int("timesIdentity") };
+            ctx.check("java_op_identities_nonzero_and_distinct",
+                      plus_id != 0 && times_id != 0 && plus_id != times_id);
+            // The two enums have DIFFERENT constant counts (Color=3, Op=2).
+            ctx.check("java_color_and_op_have_different_constant_counts",
+                      enum_holder::seen_int("colorValuesLen") != enum_holder::seen_int("opValuesLen"));
+            // label() of each Op constant embeds its symbol with the "op:" prefix.
+            ctx.check("java_op_labels_distinct",
+                      enum_holder::seen_str("plusLabelSeen") != enum_holder::seen_str("timesLabelSeen"));
+        }
+
+        // ---- 19h. Op symbol (String enum-body field) cross-path agreement:
+        //      symbol read off the constant wrapper == symbol read off the
+        //      $VALUES element OOP == the "op:"-stripped suffix of label(). ----
+        if (op_registered)
+        {
+            auto plus{ op_enum::acquire_constant("PLUS") };
+            auto times{ op_enum::acquire_constant("TIMES") };
+            if (live(plus) && live(times))
+            {
+                // The two symbols are non-empty, single-char, and distinct.
+                const std::string sp{ plus->get_symbol() };
+                const std::string st{ times->get_symbol() };
+                ctx.check("op_symbols_nonempty_and_distinct",
+                          !sp.empty() && !st.empty() && sp != st);
+                ctx.check("op_symbols_are_single_char", sp.size() == 1 && st.size() == 1);
+                // name() pairwise distinct + non-empty (mirrors Color section).
+                ctx.check("op_names_nonempty_and_distinct",
+                          !plus->get_name().empty() && !times->get_name().empty()
+                          && plus->get_name() != times->get_name());
+                // label() suffix (after "op:") equals symbol, proven against the
+                // already-checked Java label witnesses (string slicing, no call).
+                if (done)
+                {
+                    const std::string plus_lbl{ enum_holder::seen_str("plusLabelSeen") };
+                    const std::string times_lbl{ enum_holder::seen_str("timesLabelSeen") };
+                    if (plus_lbl.size() >= 3 && times_lbl.size() >= 3)
+                    {
+                        ctx.check("op_PLUS_label_suffix_equals_symbol",
+                                  plus_lbl.substr(3) == sp);
+                        ctx.check("op_TIMES_label_suffix_equals_symbol",
+                                  times_lbl.substr(3) == st);
+                        ctx.check("op_labels_share_op_prefix",
+                                  plus_lbl.substr(0, 3) == "op:" && times_lbl.substr(0, 3) == "op:");
+                    }
+                }
+            }
+        }
+
+        // ---- 19i. EnumMap / EnumSet RELATIONAL invariants on the published
+        //      contents (sizes already exact; here the cross-relations). ----
+        if (done)
+        {
+            // EnumMap has one entry per Color constant; its size == the Color
+            // constant count == values().length.
+            ctx.check("java_enummap_size_equals_color_constant_count",
+                      enum_holder::seen_int("colorNamesSize") == enum_holder::seen_int("colorValuesLen"));
+            // EnumSet.of(RED) is a strict, non-empty SUBSET of the constants:
+            // size 1, contains exactly RED, smaller than the full enum.
+            ctx.check("java_enumset_is_strict_subset",
+                      enum_holder::seen_int("warmColorsSize") >= 1
+                      && enum_holder::seen_int("warmColorsSize") < enum_holder::seen_int("colorValuesLen"));
+            ctx.check("java_enumset_membership_is_exactly_RED",
+                      enum_holder::seen_bool("warmColorsHasRed")
+                      && !enum_holder::seen_bool("warmColorsHasGreen")
+                      && !enum_holder::seen_bool("warmColorsHasBlue"));
+            // The three EnumMap values are pairwise distinct single-char strings.
+            const std::string mr{ enum_holder::seen_str("colorNamesRed") };
+            const std::string mg{ enum_holder::seen_str("colorNamesGreen") };
+            const std::string mb{ enum_holder::seen_str("colorNamesBlue") };
+            ctx.check("java_enummap_values_pairwise_distinct",
+                      mr != mg && mg != mb && mr != mb);
+            ctx.check("java_enummap_values_single_char",
+                      mr.size() == 1 && mg.size() == 1 && mb.size() == 1);
+        }
+
+        // ---- 19j. Lonely (single-constant enum) BOUNDARY invariants: the
+        //      degenerate count==1 case.  values().length == 1, the sole ordinal
+        //      is 0, and tag == its sentinel -- all derived from already-proven
+        //      Java witnesses / native reads. ----
+        if (done)
+        {
+            ctx.check("java_lonely_count_is_minimal_one",
+                      enum_holder::seen_int("lonelyValuesLen") == 1);
+            // A single-constant enum's max ordinal is 0 (count-1 == 0).
+            ctx.check("java_lonely_sole_ordinal_is_zero_boundary",
+                      enum_holder::seen_int("lonelyValuesLen") - 1 == 0);
+            // Lonely identity is non-zero and DIFFERENT from every Color/Op
+            // identity (distinct enums -> distinct objects -> distinct hashes are
+            // overwhelmingly so; assert distinct from the BLUE/PLUS anchors only
+            // where a published value exists).
+            const std::int32_t lonely_id{ enum_holder::seen_int("lonelyInstanceIdentity") };
+            ctx.check("java_lonely_identity_distinct_from_classic",
+                      lonely_id != enum_holder::seen_int("classicInstanceIdentity"));
+        }
     }
 }
 

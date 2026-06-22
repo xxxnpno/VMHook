@@ -206,6 +206,17 @@ namespace
         auto resolves_speak()         const -> bool { return get_method("speak").has_value(); }
         auto resolves_fetch()         const -> bool { return get_method("fetch").has_value(); }
         auto resolves_default_greet() const -> bool { return get_method("defaultGreet").has_value(); }
+
+        // ADDITIVE: the JVM descriptor of a Dog-declared field, read off the
+        // resolved FieldInfo (field_proxy::signature()).  Self-guarding so a
+        // missing field yields "" (never an "L...;"/"I"/"Z" descriptor), keeping
+        // the descriptor call sites clean one-liners with no nullopt deref.
+        auto field_sig(const char* field_name) const -> std::string
+        {
+            const auto fp{ get_field(field_name) };
+            return fp.has_value() ? std::string{ fp->signature() } : std::string{};
+        }
+        auto field_present(const char* field_name) const -> bool { return get_field(field_name).has_value(); }
     };
 
     // ── Wrapper for CONCRETE implementation #2 (InterfacePoly$Cat) ──────────
@@ -220,6 +231,13 @@ namespace
         auto name()   const -> std::string  { return get_field("name")->get();   }
         auto indoor() const -> bool         { return get_field("indoor")->get(); }
         auto speak()  const -> std::string  { return get_method("speak")->call().as_string(); }
+
+        // ADDITIVE: descriptor of a Cat-declared field (indoor is a boolean -> "Z").
+        auto field_sig(const char* field_name) const -> std::string
+        {
+            const auto fp{ get_field(field_name) };
+            return fp.has_value() ? std::string{ fp->signature() } : std::string{};
+        }
 
         // INHERITED interface default (Cat does not override it) -- reached via the
         // interface-chain fallback, same as Dog.  Call-site-guarded by resolves_*().
@@ -262,6 +280,13 @@ namespace
 
         auto resolves_speak() const -> bool { return get_method("speak").has_value(); }
         auto resolves_who()   const -> bool { return get_method("who").has_value(); }
+
+        // ADDITIVE: descriptor of a Robot-declared field (id is a String -> "Ljava/lang/String;").
+        auto field_sig(const char* field_name) const -> std::string
+        {
+            const auto fp{ get_field(field_name) };
+            return fp.has_value() ? std::string{ fp->signature() } : std::string{};
+        }
     };
 
     // ── Wrapper for the CONCRETE subclass of the abstract base (Hamster) ────
@@ -280,6 +305,15 @@ namespace
         auto legs()     const -> std::int32_t { return get_field("legs")->get(); } // inherited field on AbstractPet
         auto sound()    const -> std::string  { return get_method("sound")->call().as_string(); }
         auto describe() const -> std::string  { return get_method("describe")->call().as_string(); }
+
+        // ADDITIVE: descriptor of a field reachable through the Hamster wrapper.
+        // `legs` is declared on the abstract base AbstractPet, so a non-empty
+        // descriptor here also proves find_field walks the super chain for the slot.
+        auto field_sig(const char* field_name) const -> std::string
+        {
+            const auto fp{ get_field(field_name) };
+            return fp.has_value() ? std::string{ fp->signature() } : std::string{};
+        }
 
         // sound() is on Hamster; describe() is on the ABSTRACT base (super walk).
         auto resolves_sound()    const -> bool { return get_method("sound").has_value(); }
@@ -368,6 +402,16 @@ namespace
 
         auto resolves_speak()         const -> bool { return get_method("speak").has_value(); }
         auto resolves_default_greet() const -> bool { return get_method("defaultGreet").has_value(); }
+
+        // ADDITIVE: descriptor of a field reachable through the GuardDog wrapper.
+        // onDuty is declared on GuardDog itself (-> "Z"); name is inherited from the
+        // Watcher superclass (-> "Ljava/lang/String;"), so a non-empty descriptor
+        // for `name` also proves the slot resolves through the superclass walk.
+        auto field_sig(const char* field_name) const -> std::string
+        {
+            const auto fp{ get_field(field_name) };
+            return fp.has_value() ? std::string{ fp->signature() } : std::string{};
+        }
     };
 
     // ── Wrapper for the non-final base class (InterfacePoly$Watcher) ────────
@@ -2483,6 +2527,248 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
         }
 
         // =================================================================
+        // 27. CONCRETE-FIELD JVM DESCRIPTORS (every field type the fixture uses).
+        //     The runtime-klass reads above prove the OBJECT's type; this proves
+        //     the SLOT's type for each concrete-declared field, straight off the
+        //     resolved FieldInfo via field_proxy::signature().  Descriptors are a
+        //     JVM language constant (universal on every JDK/platform), so these are
+        //     HARD reference / primitive / boolean coverage:
+        //       * reference field -> "Ljava/lang/String;"  (Dog.name/breed, Robot.id, ...)
+        //       * int primitive    -> "I"                  (Dog.age, AbstractPet.legs)
+        //       * boolean          -> "Z"                  (Cat.indoor, GuardDog.onDuty)
+        //     `legs` (on AbstractPet, reached through Hamster) and `name` (on
+        //     Watcher, reached through GuardDog) additionally prove the field-slot
+        //     resolves through the SUPERCLASS walk, with the right inherited type.
+        //     Each gated on the receiver header being readable (cold-relocation ->
+        //     [INFO]); field_sig() self-guards a missing slot to "" (never a valid
+        //     descriptor), so a resolution miss is a clean FAIL, not a nullopt deref.
+        // =================================================================
+        constexpr const char* k_string_desc{ "Ljava/lang/String;" };
+        if (pet_dog && oop_readable(pet_dog->get_instance()))
+        {
+            // Two String reference fields + one int primitive on the concrete Dog.
+            ctx.check("ipm_dog_name_field_descriptor_is_string",  pet_dog->field_sig("name")  == k_string_desc);
+            ctx.check("ipm_dog_breed_field_descriptor_is_string", pet_dog->field_sig("breed") == k_string_desc);
+            ctx.check("ipm_dog_age_field_descriptor_is_int",      pet_dog->field_sig("age")   == "I");
+        }
+        if (pet_cat && oop_readable(pet_cat->get_instance()))
+        {
+            ctx.check("ipm_cat_name_field_descriptor_is_string",   pet_cat->field_sig("name")   == k_string_desc);
+            // The BOOLEAN type descriptor (the only "Z" field the fixture declares).
+            ctx.check("ipm_cat_indoor_field_descriptor_is_boolean", pet_cat->field_sig("indoor") == "Z");
+        }
+        if (pet_robot && oop_readable(pet_robot->get_instance()))
+        {
+            ctx.check("ipm_robot_id_field_descriptor_is_string", pet_robot->field_sig("id") == k_string_desc);
+        }
+        if (pet_hamster && oop_readable(pet_hamster->get_instance()))
+        {
+            ctx.check("ipm_hamster_name_field_descriptor_is_string", pet_hamster->field_sig("name") == k_string_desc);
+            // `legs` lives on the ABSTRACT base AbstractPet -> a correct "I" here
+            // proves the field-slot resolves (with the right type) through the
+            // superclass walk, mirroring the value read asserted in scenario 4.
+            ctx.check("ipm_hamster_inherited_legs_field_descriptor_is_int", pet_hamster->field_sig("legs") == "I");
+        }
+        if (guard_dog && oop_readable(guard_dog->get_instance()))
+        {
+            // onDuty is on GuardDog itself; name is inherited from Watcher.  Both
+            // descriptors HARD (the boolean own-field + the inherited String field).
+            ctx.check("ipm_guarddog_onDuty_field_descriptor_is_boolean", guard_dog->field_sig("onDuty") == "Z");
+            ctx.check("ipm_guarddog_inherited_name_field_descriptor_is_string",
+                      guard_dog->field_sig("name") == k_string_desc);
+        }
+
+        // =================================================================
+        // 28. PER-CONCRETE-IMPL METHOD ENUMERATION (the OVERRIDE side of the
+        //     declaration shape).  Scenario 17 enumerated the INTERFACE / abstract
+        //     base / super-interface klasses; here we enumerate each CONCRETE
+        //     implementor's OWN _methods array and prove its overridden method is
+        //     present with the EXACT (name, descriptor) pair the JVM emits.  All the
+        //     overrides return String, so each carries the "()Ljava/lang/String;"
+        //     descriptor.  get_class_methods is a warm runtime-klass read (universal
+        //     across JDKs); an empty array (klass unresolvable on a cold run) records
+        //     [INFO] and skips.  This is the (name+descriptor) overload of the
+        //     enumeration the existing scenario 14 only ran for StringBox.
+        // =================================================================
+        {
+            // True iff `ms` contains the EXACT (name, descriptor) pair.
+            const auto declares_sig =
+                [](const std::vector<std::pair<std::string, std::string>>& ms,
+                   const char* method_name, const char* method_sig) -> bool
+            {
+                for (const auto& [m_name, m_sig] : ms)
+                {
+                    if (m_name == method_name && m_sig == method_sig)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            constexpr const char* k_str_ret{ "()Ljava/lang/String;" };
+
+            struct impl_method_case
+            {
+                const char* label;
+                const char* klass;
+                const char* method;
+            };
+            // Each impl's overridden String-returning method on its OWN klass.
+            const std::array<impl_method_case, 7> impl_cases{ {
+                { "dog",       k_dog_class,     "speak" },
+                { "cat",       k_cat_class,     "speak" },
+                { "snake",     k_snake_class,   "speak" },
+                { "robot",     k_robot_class,   "speak" },
+                { "wolf",      k_wolf_class,    "speak" },
+                { "gadget",    k_gadget_class,  "use"   },
+                { "hamster",   k_hamster_class, "sound" },
+            } };
+            for (const impl_method_case& mc : impl_cases)
+            {
+                const auto ms{ vmhook::get_class_methods(mc.klass) };
+                if (ms.empty())
+                {
+                    ctx.record(std::string("[INFO] interface_polymorphism: ") + mc.label
+                               + " _methods enumeration empty (klass unresolvable on this run); "
+                                 "skipped per-impl override-descriptor assertion.");
+                    continue;
+                }
+                ctx.check(std::string("ipm_") + mc.label + "_impl_declares_string_override",
+                          declares_sig(ms, mc.method, k_str_ret));
+            }
+            // Robot declares BOTH interface methods (Animal.speak + Named.who) on its
+            // OWN klass, each returning String -> both EXACT pairs present.
+            const auto robot_ms{ vmhook::get_class_methods(k_robot_class) };
+            if (!robot_ms.empty())
+            {
+                ctx.check("ipm_robot_impl_declares_who_string_override", declares_sig(robot_ms, "who", k_str_ret));
+            }
+            // Dog declares the Dog-ONLY fetch() (not on the Animal interface) too.
+            const auto dog_ms{ vmhook::get_class_methods(k_dog_class) };
+            if (!dog_ms.empty())
+            {
+                ctx.check("ipm_dog_impl_declares_fetch_string", declares_sig(dog_ms, "fetch", k_str_ret));
+            }
+            // Snake declares its OVERRIDDEN defaultGreet() on its own klass.
+            const auto snake_ms{ vmhook::get_class_methods(k_snake_class) };
+            if (!snake_ms.empty())
+            {
+                ctx.check("ipm_snake_impl_declares_overridden_default_greet",
+                          declares_sig(snake_ms, "defaultGreet", k_str_ret));
+            }
+        }
+
+        // =================================================================
+        // 29. DESCRIPTOR SELECTOR on CONCRETE impls (find_methods_by_signature).
+        //     Scenario 20 ran the selector only on StringBox.  Here the
+        //     "()Ljava/lang/String;" descriptor selects every String-returning
+        //     method on each impl's OWN klass:
+        //       * Cat declares exactly ONE such method (speak) -> size==1 + name.
+        //       * Hamster declares exactly ONE (sound) -> size==1 + name.
+        //       * Dog declares TWO (speak, fetch) and Robot TWO (speak, who), so we
+        //         assert the selector SET CONTAINS the expected names (size>=2),
+        //         never an exact-size that would over-fit the impl's method list.
+        //     Warm runtime-klass read; empty -> [INFO].
+        // =================================================================
+        {
+            const auto has_name = [](const std::vector<std::string>& v, const char* n) -> bool
+            {
+                for (const std::string& s : v) { if (s == n) { return true; } }
+                return false;
+            };
+            constexpr const char* k_str_ret{ "()Ljava/lang/String;" };
+
+            const auto cat_str{ vmhook::find_methods_by_signature<ifp_cat>(k_str_ret) };
+            if (!cat_str.empty())
+            {
+                // Cat overrides ONLY speak() with a String return -> unique selector.
+                ctx.check("ipm_cat_string_sig_selects_only_speak",
+                          cat_str.size() == 1 && cat_str.front() == "speak");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: Cat String-descriptor selector empty; skipped.");
+            }
+
+            const auto ham_str{ vmhook::find_methods_by_signature<ifp_hamster>(k_str_ret) };
+            if (!ham_str.empty())
+            {
+                // Hamster declares ONLY sound() with a String return on its own klass
+                // (describe() is on the abstract base, NOT on Hamster) -> unique.
+                ctx.check("ipm_hamster_string_sig_selects_only_sound",
+                          ham_str.size() == 1 && ham_str.front() == "sound");
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: Hamster String-descriptor selector empty; skipped.");
+            }
+
+            const auto dog_str{ vmhook::find_methods_by_signature<ifp_dog>(k_str_ret) };
+            if (!dog_str.empty())
+            {
+                // Dog: speak() AND fetch() both return String -> the SET contains both.
+                ctx.check("ipm_dog_string_sig_contains_speak",  has_name(dog_str, "speak"));
+                ctx.check("ipm_dog_string_sig_contains_fetch",  has_name(dog_str, "fetch"));
+                ctx.check("ipm_dog_string_sig_selects_at_least_two", dog_str.size() >= 2);
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: Dog String-descriptor selector empty; skipped.");
+            }
+
+            const auto robot_str{ vmhook::find_methods_by_signature<ifp_robot>(k_str_ret) };
+            if (!robot_str.empty())
+            {
+                // Robot: speak() (Animal) AND who() (Named) both return String.
+                ctx.check("ipm_robot_string_sig_contains_speak", has_name(robot_str, "speak"));
+                ctx.check("ipm_robot_string_sig_contains_who",   has_name(robot_str, "who"));
+                ctx.check("ipm_robot_string_sig_selects_at_least_two", robot_str.size() >= 2);
+            }
+            else
+            {
+                ctx.record("[INFO] interface_polymorphism: Robot String-descriptor selector empty; skipped.");
+            }
+        }
+
+        // =================================================================
+        // 30. DEGENERATE / NULL-INPUT BEHAVIOUR (the never-resolves edges).
+        //     Every documented "empty on miss" contract, asserted HARD because the
+        //     library guarantees it regardless of JDK:
+        //       * get_class_methods on an unloaded class name -> empty vector;
+        //       * find_methods_by_signature for a descriptor no method carries
+        //         -> empty (Dog has no "()V"-returning *named* String method, etc.);
+        //       * holder->field_resolves / field_signature on a non-existent field
+        //         -> false / "" (the self-guarding helper, never a nullopt deref);
+        //       * a concrete wrapper's field_sig on a bogus field -> "" too.
+        //     These pin the negative space the positive scenarios leave open.
+        // =================================================================
+        {
+            // An unloaded class name -> no methods (find_class returns null -> empty).
+            const auto ghost_methods{ vmhook::get_class_methods("vmhook/fixtures/InterfacePoly$NoSuchNested") };
+            ctx.check("ipm_unloaded_class_has_no_methods", ghost_methods.empty());
+
+            // A descriptor no Dog method carries: Dog declares no method returning a
+            // List, so the selector finds nothing.
+            const auto no_match{ vmhook::find_methods_by_signature<ifp_dog>("()Ljava/util/List;") };
+            ctx.check("ipm_dog_unmatched_descriptor_selects_nothing", no_match.empty());
+
+            // A non-existent field on the holder -> the self-guarding helper reports
+            // unresolved and yields an empty descriptor (never a valid "L...;").
+            ctx.check("ipm_holder_bogus_field_does_not_resolve", !holder->field_resolves("noSuchField"));
+            ctx.check("ipm_holder_bogus_field_signature_empty",
+                      holder->field_signature("noSuchField").empty());
+
+            // A non-existent field through a concrete wrapper -> "" (and a real one
+            // is non-empty), proving the empty result means "missing", not "always".
+            if (pet_dog)
+            {
+                ctx.check("ipm_dog_bogus_field_sig_empty", pet_dog->field_sig("noSuchField").empty());
+                ctx.check("ipm_dog_present_field_reports_present", pet_dog->field_present("name"));
+                ctx.check("ipm_dog_bogus_field_reports_absent", !pet_dog->field_present("noSuchField"));
+            }
+        }
+
+        // =================================================================
         //  8. JVM AGREEMENT: the probe runs the SAME observations Java-side and
         //     publishes per-impl witnesses.  Confirms the JVM itself sees each
         //     impl's distinct dispatch, and -- when the native call also returned
@@ -2646,6 +2932,49 @@ VMHOOK_JVM_MODULE(interface_polymorphism)
             if (!box_get.empty())
             {
                 ctx.check("native_and_java_box_get_agree", box_get == j_box);
+            }
+
+            // =============================================================
+            // 31. ADDITIONAL native-vs-Java agreement for impls whose native
+            //     result the earlier scenarios computed in temporaries and did not
+            //     retain.  Re-issue each as a FRESH best-effort native call here and
+            //     cross-check byte-for-byte against the Java witness the probe just
+            //     published.  Every native call is gated (header readable + empty ->
+            //     [INFO]), so a no-value JDK build never compares an empty string.
+            //     This widens the byte-for-byte agreement net to Robot.who()
+            //     (2nd-interface dispatch), Hamster.sound()/describe() (abstract-base
+            //     dispatch + inherited concrete method), and Snake's OVERRIDDEN
+            //     defaultGreet() -- angles the existing cross-checks left open.
+            // =============================================================
+            if (pet_robot && oop_readable(pet_robot->get_instance()))
+            {
+                const std::string n_who{ pet_robot->who() };
+                if (!n_who.empty())
+                {
+                    ctx.check("native_and_java_robot_who_agree", n_who == java_who);
+                }
+            }
+            if (pet_hamster && oop_readable(pet_hamster->get_instance()))
+            {
+                const std::string n_sound{ pet_hamster->sound() };
+                if (!n_sound.empty())
+                {
+                    ctx.check("native_and_java_hamster_sound_agree", n_sound == java_hsound);
+                }
+                const std::string n_desc{ pet_hamster->describe() };
+                if (!n_desc.empty())
+                {
+                    ctx.check("native_and_java_hamster_describe_agree", n_desc == java_hdesc);
+                }
+            }
+            if (pet_snake && pet_snake->resolves_default_greet()
+                && oop_readable(pet_snake->get_instance()))
+            {
+                const std::string n_sgreet{ pet_snake->default_greet() };
+                if (!n_sgreet.empty())
+                {
+                    ctx.check("native_and_java_snake_overridden_greet_agree", n_sgreet == java_sgreet);
+                }
             }
         }
 

@@ -58,10 +58,12 @@
 #include "../harness.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace
@@ -1363,6 +1365,389 @@ VMHOOK_JVM_MODULE(method_is_reference)
             // is_reference() never touches the Method* — null here, must be safe.
             ctx.check(std::string{ "edge_raw_method_null_" } + c.label,
                       mp.raw_method() == nullptr);
+        }
+    }
+
+    // =====================================================================
+    // 20. IDEMPOTENCY + VALUE-SEMANTIC STABILITY (hand-built, no JVM).
+    //     is_reference() is a pure const read of signature_text; calling it
+    //     repeatedly must return the SAME bool, and a COPY / a MOVE of the
+    //     proxy must preserve both is_reference() and signature() (the member
+    //     is a std::string carried by value).  name() of a null-Method* proxy
+    //     is the empty string (name() returns {} when there is no Method*).
+    // =====================================================================
+    {
+        struct idem_case
+        {
+            const char* sig;
+            bool        expect;
+            const char* label;
+        };
+        const idem_case idem[]{
+            { "()Ljava/lang/Object;",   true,  "object" },
+            { "()[I",                   true,  "intarray" },
+            { "()[[Ljava/lang/String;", true,  "string2d" },
+            { "()V",                    false, "void" },
+            { "()I",                    false, "int" },
+            { "(Ljava/lang/String;)J",  false, "param_L_ret_J" },
+            { "",                       false, "empty" },
+            { "(",                      false, "open_only" },
+            { "()",                     false, "nothing_after" },
+        };
+        for (const idem_case& c : idem)
+        {
+            const vmhook::method_proxy mp{ nullptr, nullptr, std::string{ c.sig } };
+
+            // (a) is_reference() is stable across repeated calls (no mutation).
+            const bool first{ mp.is_reference() };
+            const bool second{ mp.is_reference() };
+            const bool third{ mp.is_reference() };
+            ctx.check(std::string{ "idem_is_reference_repeat_stable_" } + c.label,
+                      first == second && second == third);
+            ctx.check(std::string{ "idem_is_reference_value_" } + c.label,
+                      first == c.expect);
+
+            // (b) signature() is stable across repeated calls (same text).
+            const std::string sig_a{ mp.signature() };
+            const std::string sig_b{ mp.signature() };
+            ctx.check(std::string{ "idem_signature_repeat_stable_" } + c.label,
+                      sig_a == sig_b);
+            ctx.check(std::string{ "idem_signature_roundtrip_" } + c.label,
+                      sig_a == c.sig);
+
+            // (c) a COPY preserves is_reference() AND signature().
+            const vmhook::method_proxy copy{ mp };
+            ctx.check(std::string{ "idem_copy_is_reference_agrees_" } + c.label,
+                      copy.is_reference() == first);
+            const std::string copy_sig{ copy.signature() };
+            ctx.check(std::string{ "idem_copy_signature_agrees_" } + c.label,
+                      copy_sig == sig_a);
+
+            // (d) a MOVE-constructed proxy carries the same descriptor verdict.
+            //     Build a fresh source so the original `mp` stays valid for later
+            //     rows; the moved-into proxy must report identically.
+            vmhook::method_proxy move_src{ nullptr, nullptr, std::string{ c.sig } };
+            const vmhook::method_proxy moved{ std::move(move_src) };
+            ctx.check(std::string{ "idem_move_is_reference_agrees_" } + c.label,
+                      moved.is_reference() == c.expect);
+            const std::string moved_sig{ moved.signature() };
+            ctx.check(std::string{ "idem_move_signature_agrees_" } + c.label,
+                      moved_sig == c.sig);
+
+            // (e) name() of a null-Method* proxy is empty (no Method* to read).
+            ctx.check(std::string{ "idem_null_method_name_empty_" } + c.label,
+                      mp.name().empty());
+            ctx.check(std::string{ "idem_null_method_raw_null_" } + c.label,
+                      mp.raw_method() == nullptr);
+        }
+    }
+
+    // =====================================================================
+    // 21. SELF-DESCRIPTION CONSISTENCY: is_reference() agrees with the oracle
+    //     run over the LIBRARY's OWN signature() return (a std::string built
+    //     from the returned string_view), not just the literal we constructed.
+    //     This closes the loop: the accessor and the descriptor it exposes
+    //     classify identically.  Also pins signature().size() == constructed
+    //     length (no truncation / no extra bytes for embedded characters).
+    // =====================================================================
+    {
+        const char* sigs[]{
+            "()Ljava/lang/Object;",
+            "()Ljava/lang/String;",
+            "()[Ljava/lang/Integer;",
+            "()[[[I",
+            "()V",
+            "()Z",
+            "()B",
+            "()S",
+            "()C",
+            "()I",
+            "()J",
+            "()F",
+            "()D",
+            "(Ljava/lang/String;[IJ)Z",
+            "([Ljava/lang/Object;)V",
+            "()Lvmhook/fixtures/IsReference$Box;",
+        };
+        for (const char* s : sigs)
+        {
+            const std::string built{ s };
+            const vmhook::method_proxy mp{ nullptr, nullptr, std::string{ s } };
+            const std::string viewed{ mp.signature() };
+
+            // signature() returns exactly what we constructed, byte-for-byte.
+            ctx.check(std::string{ "selfdesc_signature_size_" } + s,
+                      viewed.size() == built.size());
+            ctx.check(std::string{ "selfdesc_signature_equal_" } + s,
+                      viewed == built);
+
+            // is_reference() classifies the SAME way the oracle classifies the
+            // descriptor the library hands back via signature().
+            ctx.check(std::string{ "selfdesc_accessor_matches_own_signature_" } + s,
+                      mp.is_reference() == oracle_is_reference(viewed));
+
+            // And the trichotomy over the library-returned descriptor: exactly one.
+            ctx.check(std::string{ "selfdesc_trichotomy_over_own_signature_" } + s,
+                      (mp.is_reference() ? 1 : 0) + (oracle_is_void(viewed) ? 1 : 0)
+                          + (oracle_is_primitive(viewed) ? 1 : 0) == 1);
+        }
+    }
+
+    // =====================================================================
+    // 22. EXHAUSTIVE RETURN-CHAR DOMAIN SWEEP (every byte 1..127 after ')').
+    //     The single char following ')' is the WHOLE input domain of the
+    //     accessor's decision.  For EVERY printable/control byte c in [1,127]
+    //     build "()" + c and assert is_reference() is TRUE iff c is 'L' or '['
+    //     (and primitive iff c is one of Z B S C I J F D, with the two sets
+    //     disjoint).  This is the "every possible input" coverage for the
+    //     classification, programmatic so no byte is skipped.  Byte 0 (NUL) is
+    //     handled separately in section 23 (it cannot go in a const char*).
+    // =====================================================================
+    {
+        for (int ci = 1; ci <= 127; ++ci)
+        {
+            const char        c{ static_cast<char>(ci) };
+            std::string       sig{ "()" };
+            sig.push_back(c);
+            const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+
+            const bool expect_ref{ c == 'L' || c == '[' };
+            const bool is_ref{ mp.is_reference() };
+
+            // Build a stable, ASCII-only label from the byte value (NOT the raw
+            // char, which could be a control byte) so check names are printable.
+            const std::string label{ std::to_string(ci) };
+
+            ctx.check(std::string{ "domain_is_reference_byte_" } + label,
+                      is_ref == expect_ref);
+            ctx.check(std::string{ "domain_oracle_agree_byte_" } + label,
+                      is_ref == oracle_is_reference(sig));
+
+            // The primitive leg is exactly the eight JVM primitive descriptor
+            // chars; reference and primitive legs are disjoint over the domain.
+            const bool expect_prim{ c == 'Z' || c == 'B' || c == 'S' || c == 'C'
+                                    || c == 'I' || c == 'J' || c == 'F' || c == 'D' };
+            ctx.check(std::string{ "domain_primitive_byte_" } + label,
+                      oracle_is_primitive(sig) == expect_prim);
+            ctx.check(std::string{ "domain_ref_prim_disjoint_byte_" } + label,
+                      !(expect_ref && expect_prim));
+
+            // Trichotomy over the whole single-char domain: exactly one leg.
+            ctx.check(std::string{ "domain_trichotomy_byte_" } + label,
+                      (is_ref ? 1 : 0) + (oracle_is_void(sig) ? 1 : 0)
+                          + (oracle_is_primitive(sig) ? 1 : 0) == 1);
+        }
+    }
+
+    // =====================================================================
+    // 23. EMBEDDED-NUL descriptors (built with explicit \0 escapes + length-
+    //     aware std::string -- NEVER a raw NUL byte in this source).  A NUL
+    //     buried in signature_text must not break find(')') or the return-char
+    //     read.  The accessor keys ONLY on the FIRST char after the FIRST ')',
+    //     so a NUL AFTER that char is irrelevant, and a ')' before a NUL still
+    //     resolves the return char.  Each case is certain from the source
+    //     (std::string::find / operator[] are length-based, not C-string based).
+    // =====================================================================
+    {
+        // "()L\0junk" -- return char is 'L' (the NUL is AFTER it) -> reference.
+        {
+            std::string sig{ "()L" };
+            sig.push_back('\0');
+            sig += "junk";
+            const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+            ctx.check("nul_after_L_is_reference_true", mp.is_reference() == true);
+            ctx.check("nul_after_L_oracle_agree",
+                      mp.is_reference() == oracle_is_reference(sig));
+            // signature() preserves the full length INCLUDING the embedded NUL.
+            const std::string viewed{ mp.signature() };
+            ctx.check("nul_after_L_signature_length_preserved",
+                      viewed.size() == sig.size());
+        }
+        // "()V\0L" -- return char is 'V' (NUL then 'L' are after it) -> NOT ref.
+        // A naive C-string parse would stop at the NUL but still see 'V' first;
+        // either way the FIRST char after ')' is 'V', so the verdict is false.
+        {
+            std::string sig{ "()V" };
+            sig.push_back('\0');
+            sig.push_back('L');
+            const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+            ctx.check("nul_then_L_after_V_is_reference_false", mp.is_reference() == false);
+            ctx.check("nul_then_L_after_V_oracle_agree",
+                      mp.is_reference() == oracle_is_reference(sig));
+        }
+        // "()\0L" -- the FIRST char after ')' is the NUL itself (neither 'L' nor
+        // '[' nor a primitive) -> false.  This pins that a NUL return char is
+        // simply "not a reference", exactly like any other non-L/[ byte.
+        {
+            std::string sig{ "()" };
+            sig.push_back('\0');
+            sig.push_back('L');
+            const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+            ctx.check("nul_as_return_char_is_reference_false", mp.is_reference() == false);
+            ctx.check("nul_as_return_char_oracle_agree",
+                      mp.is_reference() == oracle_is_reference(sig));
+            ctx.check("nul_as_return_char_signature_length_preserved",
+                      std::string{ mp.signature() }.size() == sig.size());
+        }
+        // NUL BEFORE the ')' in the param area -- find(')') skips past it and the
+        // return char ('I') still decides -> false (a reference param NUL noise
+        // does not leak into the return verdict).
+        {
+            std::string sig{ "(" };
+            sig.push_back('\0');
+            sig += ")I";
+            const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+            ctx.check("nul_in_param_ret_I_is_reference_false", mp.is_reference() == false);
+            ctx.check("nul_in_param_ret_I_oracle_agree",
+                      mp.is_reference() == oracle_is_reference(sig));
+        }
+        // NUL before ')' with a reference RETURN -- still true (param noise inert).
+        {
+            std::string sig{ "(" };
+            sig.push_back('\0');
+            sig += ")Ljava/lang/Object;";
+            const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+            ctx.check("nul_in_param_ret_L_is_reference_true", mp.is_reference() == true);
+            ctx.check("nul_in_param_ret_L_oracle_agree",
+                      mp.is_reference() == oracle_is_reference(sig));
+        }
+        // A lone NUL descriptor: no ')' at all -> false (find == npos).
+        {
+            std::string sig;
+            sig.push_back('\0');
+            const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+            ctx.check("lone_nul_no_paren_is_reference_false", mp.is_reference() == false);
+            ctx.check("lone_nul_signature_length_one",
+                      std::string{ mp.signature() }.size() == 1);
+        }
+    }
+
+    // =====================================================================
+    // 24. EXTREME ARRAY-DEPTH + LONG-NAME BOUNDARIES (hand-built, no JVM).
+    //     The accessor keys on the FIRST char after ')', so a leading '[' makes
+    //     it a reference at ANY depth and for ANY (even absurdly long) element
+    //     name.  Sweep depths {1,2,3,16,32,64,255}; the verdict must stay TRUE.
+    //     Also a very long 'L...;' class name (1000 chars) -> TRUE, and the
+    //     degenerate "()" + '[' * N with NO element (just brackets) -> TRUE.
+    // =====================================================================
+    {
+        const int depths[]{ 1, 2, 3, 16, 32, 64, 255 };
+        for (int d : depths)
+        {
+            const std::string label{ std::to_string(d) };
+
+            // "()" + '['*d + "I"  -- primitive-element array of depth d.
+            {
+                std::string sig{ "()" };
+                sig.append(static_cast<std::size_t>(d), '[');
+                sig.push_back('I');
+                const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+                ctx.check(std::string{ "deep_prim_array_is_reference_true_d" } + label,
+                          mp.is_reference() == true);
+                ctx.check(std::string{ "deep_prim_array_oracle_agree_d" } + label,
+                          mp.is_reference() == oracle_is_reference(sig));
+                ctx.check(std::string{ "deep_prim_array_signature_size_d" } + label,
+                          std::string{ mp.signature() }.size() == sig.size());
+            }
+            // "()" + '['*d  -- brackets only, NO element char after them.  The
+            // FIRST char after ')' is still '[', so reference TRUE regardless of
+            // there being no element (accessor never scans past the return char).
+            {
+                std::string sig{ "()" };
+                sig.append(static_cast<std::size_t>(d), '[');
+                const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+                ctx.check(std::string{ "brackets_only_is_reference_true_d" } + label,
+                          mp.is_reference() == true);
+            }
+        }
+
+        // Very long reference class name: "()L" + 1000*'a' + ";" -> TRUE.
+        {
+            std::string sig{ "()L" };
+            sig.append(static_cast<std::size_t>(1000), 'a');
+            sig.push_back(';');
+            const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+            ctx.check("long_class_name_is_reference_true", mp.is_reference() == true);
+            ctx.check("long_class_name_oracle_agree",
+                      mp.is_reference() == oracle_is_reference(sig));
+            ctx.check("long_class_name_signature_size",
+                      std::string{ mp.signature() }.size() == sig.size());
+        }
+
+        // Very long PARAM area, primitive RETURN: "(" + 1000*'I' + ")J" -> FALSE.
+        // find(')') must locate the ')' after the long param run and read 'J'.
+        {
+            std::string sig{ "(" };
+            sig.append(static_cast<std::size_t>(1000), 'I');
+            sig += ")J";
+            const vmhook::method_proxy mp{ nullptr, nullptr, sig };
+            ctx.check("long_param_ret_J_is_reference_false", mp.is_reference() == false);
+            ctx.check("long_param_ret_J_oracle_agree",
+                      mp.is_reference() == oracle_is_reference(sig));
+        }
+    }
+
+    // =====================================================================
+    // 25. RESOLVED-PROXY IDEMPOTENCY + COPY (live JVM, no call()).  The same
+    //     stability invariants of section 20, but on PROXIES THE JVM RESOLVED:
+    //     repeated is_reference() agrees, a copy agrees, signature() is stable,
+    //     and name() is NON-empty for a resolved proxy (it has a real Method*),
+    //     in contrast to the empty name() of the hand-built proxies.
+    // =====================================================================
+    if (singleton)
+    {
+        struct resolved_case
+        {
+            const char* name;
+            bool        expect;
+        };
+        const resolved_case rc[]{
+            { "retObject", true  },
+            { "retString", true  },
+            { "retIntArray", true },
+            { "retInt",    false },
+            { "retVoid",   false },
+        };
+        for (const resolved_case& r : rc)
+        {
+            const auto mp{ singleton->get_method(r.name) };
+            ctx.check(std::string{ "resolved_idem_resolves_" } + r.name, mp.has_value());
+            if (!mp)
+            {
+                continue;
+            }
+
+            const bool first{ mp->is_reference() };
+            const bool second{ mp->is_reference() };
+            ctx.check(std::string{ "resolved_idem_repeat_stable_" } + r.name,
+                      first == second);
+            ctx.check(std::string{ "resolved_idem_value_" } + r.name, first == r.expect);
+
+            const std::string sig_a{ mp->signature() };
+            const std::string sig_b{ mp->signature() };
+            ctx.check(std::string{ "resolved_idem_signature_stable_" } + r.name,
+                      sig_a == sig_b);
+
+            // Copy preserves is_reference() and signature().
+            const vmhook::method_proxy copy{ *mp };
+            ctx.check(std::string{ "resolved_copy_is_reference_agrees_" } + r.name,
+                      copy.is_reference() == first);
+            ctx.check(std::string{ "resolved_copy_signature_agrees_" } + r.name,
+                      std::string{ copy.signature() } == sig_a);
+
+            // A resolved proxy has a real Method*, so name() is NON-empty and
+            // equals the requested method name -- the contrast against the
+            // empty name() of hand-built null-Method* proxies (section 20e).
+            ctx.check(std::string{ "resolved_name_nonempty_" } + r.name,
+                      !mp->name().empty());
+            ctx.check(std::string{ "resolved_name_matches_" } + r.name,
+                      mp->name() == r.name);
+
+            // is_reference() stays correct independent of the Method* identity:
+            // a valid Method* and a true/false verdict coexist with no deref.
+            vmhook::hotspot::method* const m{ mp->raw_method() };
+            ctx.check(std::string{ "resolved_raw_method_valid_" } + r.name,
+                      m != nullptr && vmhook::hotspot::is_valid_pointer(m));
         }
     }
 }

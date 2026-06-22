@@ -173,6 +173,11 @@ namespace
         static auto mixed_fp_called() -> bool   { return static_field("mixedFpCalled")->get(); }
         static auto mixed_fp_float()  -> float  { return static_field("mixedFpFloat")->get(); }
         static auto mixed_fp_double() -> double { return static_field("mixedFpDouble")->get(); }
+
+        // -- char-boundary void args (0x0000 / 0xFFFF) --
+        static auto char_bounds_called() -> bool         { return static_field("charBoundsCalled")->get(); }
+        static auto char_lo()            -> std::uint16_t { return static_field("charLo")->get(); }
+        static auto char_hi()            -> std::uint16_t { return static_field("charHi")->get(); }
     };
 
     // ------------------------------------------------------------------
@@ -264,6 +269,66 @@ namespace
     // the next dispatch to succeed (the strongest non-corruption witness).
     std::atomic<std::int64_t> g_post_throw_echo{ -1 };
 
+    // ------------------------------------------------------------------
+    //  EXTENDED void-conversion contract, captured from the first void
+    //  instance result.  A void value_t holds std::monostate, so its
+    //  operator target_type() returns a default-constructed T for EVERY
+    //  target and is_string() is false.  These cover the targets the
+    //  existing int/double/as_string trio does not.
+    // ------------------------------------------------------------------
+    std::atomic<int>          g_void_is_string{ -1 };   // must be 0 (not a String)
+    std::atomic<int>          g_void_cast_bool{ -1 };   // static_cast<bool>   -> false
+    std::atomic<std::int64_t> g_void_cast_i64{ -7 };    // static_cast<int64>  -> 0
+    std::atomic<int>          g_void_cast_i8{ -7 };      // static_cast<int8>   -> 0
+    std::atomic<int>          g_void_cast_i16{ -7 };     // static_cast<int16>  -> 0
+    std::atomic<int>          g_void_cast_u16{ -7 };     // static_cast<uint16> -> 0
+    std::atomic<std::int32_t> g_void_cast_float_bits{ -7 }; // static_cast<float> -> +0.0f
+
+    // ------------------------------------------------------------------
+    //  CONTRAST across the WHOLE return-type decode switch.  For every
+    //  non-void returner: is_void() must be FALSE; is_string() must be
+    //  TRUE only for the String returner; and the decoded value must be
+    //  the exact sentinel (path-independent for these exactly-encodable
+    //  values).  Captured in the detour, asserted in the module body.
+    // ------------------------------------------------------------------
+    std::atomic<int>          g_bool_is_void{ -1 };
+    std::atomic<int>          g_bool_is_string{ -1 };
+    std::atomic<int>          g_bool_value{ -1 };
+
+    std::atomic<int>          g_byte_is_void{ -1 };
+    std::atomic<int>          g_byte_is_string{ -1 };
+    std::atomic<int>          g_byte_value{ 0 };
+
+    std::atomic<int>          g_short_is_void{ -1 };
+    std::atomic<int>          g_short_is_string{ -1 };
+    std::atomic<int>          g_short_value{ 0 };
+
+    std::atomic<int>          g_char_is_void{ -1 };
+    std::atomic<int>          g_char_is_string{ -1 };
+    std::atomic<int>          g_char_value{ 0 };
+
+    std::atomic<int>          g_long_is_void{ -1 };
+    std::atomic<int>          g_long_is_string{ -1 };
+    std::atomic<std::int64_t> g_long_value{ 0 };
+
+    std::atomic<int>          g_float_is_void{ -1 };
+    std::atomic<int>          g_float_is_string{ -1 };
+    std::atomic<std::int32_t> g_float_bits{ 0 };
+
+    std::atomic<int>          g_double_is_void{ -1 };
+    std::atomic<int>          g_double_is_string{ -1 };
+    std::atomic<std::int64_t> g_double_bits{ 0 };
+
+    std::atomic<int>          g_string_is_void{ -1 };
+    std::atomic<int>          g_string_is_string{ -1 };
+
+    // is_void() for the char-boundary void scenario.
+    std::atomic<int>          g_void_char_bounds_is_void{ -1 };
+
+    // Captured String-return value (decoded eagerly via as_string()).
+    std::string               g_string_ret_value{};
+    std::atomic<bool>         g_string_ret_captured{ false };
+
     // Sentinel args the native side passes, mirrored by the Java assertions.
     constexpr std::int32_t k_prim_int    = 0x0BADF00D;            // 195948557
     constexpr std::int64_t k_prim_long   = static_cast<std::int64_t>(0x0123456789ABCDEFLL);
@@ -343,6 +408,22 @@ namespace
     // Mixed floating-point sentinels (float + double in one call).
     constexpr float        k_mixed_fp_f   = -1.4142135f;         // -sqrt(2), single
     constexpr double       k_mixed_fp_d   = 2.718281828459045;   // e, double
+
+    // Contrast-return sentinels -- must match the fixture's ret* bodies exactly.
+    // All exactly representable so the decoded value is byte-identical on the
+    // call_stub and call_jni paths.
+    constexpr bool          k_ret_bool   = true;
+    constexpr std::int8_t   k_ret_byte   = static_cast<std::int8_t>(-128);    // Byte.MIN
+    constexpr std::int16_t  k_ret_short  = static_cast<std::int16_t>(-32768); // Short.MIN
+    constexpr std::uint16_t k_ret_char   = static_cast<std::uint16_t>(0xFFFF); // Character.MAX
+    constexpr std::int64_t  k_ret_long   = static_cast<std::int64_t>(0x7EDCBA9876543210LL);
+    constexpr float         k_ret_float  = 0.5f;                  // exact in IEEE-754
+    constexpr double        k_ret_double = -0.25;                 // exact in IEEE-754
+    const std::string       k_ret_string = "void-contrast-return-string";
+
+    // char-boundary void-arg sentinels (the two extreme UTF-16 code units).
+    constexpr std::uint16_t k_char_lo    = static_cast<std::uint16_t>(0x0000);
+    constexpr std::uint16_t k_char_hi    = static_cast<std::uint16_t>(0xFFFF);
 }
 
 VMHOOK_JVM_MODULE(method_call_return_void)
@@ -387,6 +468,20 @@ VMHOOK_JVM_MODULE(method_call_return_void)
                         g_void_cast_double_bits.store(dbits, std::memory_order_relaxed);
                         g_void_as_string_empty.store(v.as_string().empty() ? 1 : 0,
                                                      std::memory_order_relaxed);
+
+                        // Extended conversion contract: a void (monostate) result
+                        // is NOT a String, and converts to a default-constructed
+                        // value for every remaining target width.
+                        g_void_is_string.store(v.is_string() ? 1 : 0, std::memory_order_relaxed);
+                        g_void_cast_bool.store(static_cast<bool>(v) ? 1 : 0, std::memory_order_relaxed);
+                        g_void_cast_i64.store(static_cast<std::int64_t>(v), std::memory_order_relaxed);
+                        g_void_cast_i8.store(static_cast<std::int8_t>(v), std::memory_order_relaxed);
+                        g_void_cast_i16.store(static_cast<std::int16_t>(v), std::memory_order_relaxed);
+                        g_void_cast_u16.store(static_cast<std::uint16_t>(v), std::memory_order_relaxed);
+                        const float fcast{ static_cast<float>(v) };
+                        std::int32_t fbits{ 0 };
+                        std::memcpy(&fbits, &fcast, sizeof(fbits));
+                        g_void_cast_float_bits.store(fbits, std::memory_order_relaxed);
                     }
                 }
 
@@ -785,6 +880,20 @@ VMHOOK_JVM_MODULE(method_call_return_void)
                     }
                 }
 
+                // ---- void with CHAR-BOUNDARY args (0x0000 and 0xFFFF) ----
+                {
+                    auto proxy{ self->get_method("voidCharBounds") };
+                    if (proxy.has_value())
+                    {
+                        // Java `char` params are descriptor "C"; a C++ uint16_t
+                        // arg maps to "C" (a plain `char` would map to "B" and
+                        // mis-match the (CC)V descriptor).
+                        const vmhook::method_proxy::value_t v{
+                            proxy->call(k_char_lo, k_char_hi) };
+                        g_void_char_bounds_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+
                 // ---- CONTRAST: int returner — is_void() FALSE, value correct ----
                 {
                     auto proxy{ self->get_method("retInt") };
@@ -794,6 +903,99 @@ VMHOOK_JVM_MODULE(method_call_return_void)
                         g_int_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
                         g_int_is_string.store(v.is_string() ? 1 : 0, std::memory_order_relaxed);
                         g_int_ret_value.store(static_cast<std::int32_t>(v), std::memory_order_relaxed);
+                    }
+                }
+
+                // ---- CONTRAST across the WHOLE return-type decode switch ----
+                // Every non-void returner: is_void() must be FALSE, is_string()
+                // TRUE only for the String returner, and the value exact.  Proves
+                // 'V' is the ONLY case that yields monostate (the void contract is
+                // not a fluke of a failed call that would also read monostate).
+                {
+                    auto proxy{ self->get_method("retBool") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_bool_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                        g_bool_is_string.store(v.is_string() ? 1 : 0, std::memory_order_relaxed);
+                        g_bool_value.store(static_cast<bool>(v) ? 1 : 0, std::memory_order_relaxed);
+                    }
+                }
+                {
+                    auto proxy{ self->get_method("retByte") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_byte_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                        g_byte_is_string.store(v.is_string() ? 1 : 0, std::memory_order_relaxed);
+                        g_byte_value.store(static_cast<std::int8_t>(v), std::memory_order_relaxed);
+                    }
+                }
+                {
+                    auto proxy{ self->get_method("retShort") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_short_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                        g_short_is_string.store(v.is_string() ? 1 : 0, std::memory_order_relaxed);
+                        g_short_value.store(static_cast<std::int16_t>(v), std::memory_order_relaxed);
+                    }
+                }
+                {
+                    auto proxy{ self->get_method("retChar") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_char_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                        g_char_is_string.store(v.is_string() ? 1 : 0, std::memory_order_relaxed);
+                        g_char_value.store(static_cast<std::uint16_t>(v), std::memory_order_relaxed);
+                    }
+                }
+                {
+                    auto proxy{ self->get_method("retLong") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_long_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                        g_long_is_string.store(v.is_string() ? 1 : 0, std::memory_order_relaxed);
+                        g_long_value.store(static_cast<std::int64_t>(v), std::memory_order_relaxed);
+                    }
+                }
+                {
+                    auto proxy{ self->get_method("retFloat") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_float_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                        g_float_is_string.store(v.is_string() ? 1 : 0, std::memory_order_relaxed);
+                        const float f{ static_cast<float>(v) };
+                        std::int32_t fbits{ 0 };
+                        std::memcpy(&fbits, &f, sizeof(fbits));
+                        g_float_bits.store(fbits, std::memory_order_relaxed);
+                    }
+                }
+                {
+                    auto proxy{ self->get_method("retDouble") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_double_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                        g_double_is_string.store(v.is_string() ? 1 : 0, std::memory_order_relaxed);
+                        const double d{ static_cast<double>(v) };
+                        std::int64_t dbits{ 0 };
+                        std::memcpy(&dbits, &d, sizeof(dbits));
+                        g_double_bits.store(dbits, std::memory_order_relaxed);
+                    }
+                }
+                {
+                    auto proxy{ self->get_method("retString") };
+                    if (proxy.has_value())
+                    {
+                        const vmhook::method_proxy::value_t v{ proxy->call() };
+                        g_string_is_void.store(v.is_void() ? 1 : 0, std::memory_order_relaxed);
+                        g_string_is_string.store(v.is_string() ? 1 : 0, std::memory_order_relaxed);
+                        g_string_ret_value = v.as_string();
+                        g_string_ret_captured.store(true, std::memory_order_relaxed);
                     }
                 }
 
@@ -1091,6 +1293,62 @@ VMHOOK_JVM_MODULE(method_call_return_void)
         ctx.check("mcrv_int_return_value_correct", g_int_ret_value.load() == 1337);
 
         // =====================================================================
+        //  CONTRAST across the WHOLE return-type decode switch
+        // =====================================================================
+        // 'V' is the ONLY decode case that yields monostate.  For every other
+        // return kind is_void() must be FALSE, is_string() must be TRUE only for
+        // the String returner, and the decoded value must equal the exact
+        // sentinel (path-independent for these exactly-representable values).
+        // boolean ('Z')
+        ctx.check("mcrv_contrast_bool_not_void", g_bool_is_void.load() == 0);
+        ctx.check("mcrv_contrast_bool_not_string", g_bool_is_string.load() == 0);
+        ctx.check("mcrv_contrast_bool_value", g_bool_value.load() == (k_ret_bool ? 1 : 0));
+        // byte ('B') -- Byte.MIN_VALUE, the high-bit-set boundary
+        ctx.check("mcrv_contrast_byte_not_void", g_byte_is_void.load() == 0);
+        ctx.check("mcrv_contrast_byte_not_string", g_byte_is_string.load() == 0);
+        ctx.check("mcrv_contrast_byte_value",
+                  g_byte_value.load() == static_cast<int>(k_ret_byte));
+        // short ('S') -- Short.MIN_VALUE
+        ctx.check("mcrv_contrast_short_not_void", g_short_is_void.load() == 0);
+        ctx.check("mcrv_contrast_short_not_string", g_short_is_string.load() == 0);
+        ctx.check("mcrv_contrast_short_value",
+                  g_short_value.load() == static_cast<int>(k_ret_short));
+        // char ('C') -- Character.MAX_VALUE (0xFFFF, unsigned)
+        ctx.check("mcrv_contrast_char_not_void", g_char_is_void.load() == 0);
+        ctx.check("mcrv_contrast_char_not_string", g_char_is_string.load() == 0);
+        ctx.check("mcrv_contrast_char_value",
+                  g_char_value.load() == static_cast<int>(k_ret_char));
+        // long ('J') -- full 64-bit pattern
+        ctx.check("mcrv_contrast_long_not_void", g_long_is_void.load() == 0);
+        ctx.check("mcrv_contrast_long_not_string", g_long_is_string.load() == 0);
+        ctx.check("mcrv_contrast_long_value", g_long_value.load() == k_ret_long);
+        // float ('F') -- bit-exact compare of an exactly-representable value
+        ctx.check("mcrv_contrast_float_not_void", g_float_is_void.load() == 0);
+        ctx.check("mcrv_contrast_float_not_string", g_float_is_string.load() == 0);
+        {
+            std::int32_t want_fbits{ 0 };
+            const float want_f{ k_ret_float };
+            std::memcpy(&want_fbits, &want_f, sizeof(want_fbits));
+            ctx.check("mcrv_contrast_float_value", g_float_bits.load() == want_fbits);
+        }
+        // double ('D') -- bit-exact compare of an exactly-representable value
+        ctx.check("mcrv_contrast_double_not_void", g_double_is_void.load() == 0);
+        ctx.check("mcrv_contrast_double_not_string", g_double_is_string.load() == 0);
+        {
+            std::int64_t want_dbits{ 0 };
+            const double want_d{ k_ret_double };
+            std::memcpy(&want_dbits, &want_d, sizeof(want_dbits));
+            ctx.check("mcrv_contrast_double_value", g_double_bits.load() == want_dbits);
+        }
+        // String ('Ljava/lang/String;') -- the ONE non-void returner whose
+        // is_string() must be TRUE; is_void() still FALSE; value round-trips.
+        ctx.check("mcrv_contrast_string_not_void", g_string_is_void.load() == 0);
+        ctx.check("mcrv_contrast_string_is_string", g_string_is_string.load() == 1);
+        ctx.check("mcrv_contrast_string_captured",
+                  g_string_ret_captured.load(std::memory_order_relaxed));
+        ctx.check("mcrv_contrast_string_value", g_string_ret_value == k_ret_string);
+
+        // =====================================================================
         //  void RETURN-VALUE CONVERSION CONTRACT (a void result is well-defined)
         // =====================================================================
         // The void value_t must convert to a default-constructed target: an int
@@ -1107,6 +1365,34 @@ VMHOOK_JVM_MODULE(method_call_return_void)
                       g_void_cast_double_bits.load() == want_bits);
         }
         ctx.check("mcrv_void_as_string_empty", g_void_as_string_empty.load() == 1);
+
+        // Extended conversion contract: a void result is NOT a String, and every
+        // remaining target width converts to a default-constructed (zero/false)
+        // value -- so a caller may read the void result through ANY conversion and
+        // get a well-defined default, never a stray bit from the result slot.
+        ctx.check("mcrv_void_is_not_string", g_void_is_string.load() == 0);
+        ctx.check("mcrv_void_cast_bool_false", g_void_cast_bool.load() == 0);
+        ctx.check("mcrv_void_cast_i64_zero", g_void_cast_i64.load() == 0);
+        ctx.check("mcrv_void_cast_i8_zero", g_void_cast_i8.load() == 0);
+        ctx.check("mcrv_void_cast_i16_zero", g_void_cast_i16.load() == 0);
+        ctx.check("mcrv_void_cast_u16_zero", g_void_cast_u16.load() == 0);
+        {
+            const float pos_zero_f{ 0.0f };
+            std::int32_t want_fbits{ 0 };
+            std::memcpy(&want_fbits, &pos_zero_f, sizeof(want_fbits));
+            ctx.check("mcrv_void_cast_float_zero_bits",
+                      g_void_cast_float_bits.load() == want_fbits);
+        }
+
+        // =====================================================================
+        //  void with CHAR-BOUNDARY args (0x0000 and 0xFFFF) -- extreme code units
+        // =====================================================================
+        ctx.check("mcrv_void_char_bounds_is_void", g_void_char_bounds_is_void.load() == 1);
+        ctx.check("mcrv_void_char_bounds_called", method_call_void::char_bounds_called());
+        ctx.check("mcrv_void_char_bounds_lo",
+                  method_call_void::char_lo() == k_char_lo);
+        ctx.check("mcrv_void_char_bounds_hi",
+                  method_call_void::char_hi() == k_char_hi);
 
         // =====================================================================
         //  void with EXACTLY 8 SLOTS (receiver + 7 ints) — full param block
