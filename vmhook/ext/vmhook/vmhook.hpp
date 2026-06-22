@@ -15149,16 +15149,27 @@ namespace vmhook
 
                 // (3) Read the live OOP's runtime klass from the narrow-klass slot at
                 // header offset 8 (UseCompressedClassPointers layout).  If it cannot be
-                // determined — fail open.  std::memcpy (NOT a reinterpret_cast read) so
-                // there is no strict-aliasing UB on the 4-byte narrow-klass load.
+                // determined — fail open.  os::safe_read_fast (NOT a reinterpret_cast
+                // read) so there is no strict-aliasing UB on the 4-byte narrow-klass
+                // load AND a cold / GC-relocated decoded oop whose header page is
+                // unmapped (passes is_valid_pointer's heuristic but faults) recovers
+                // the fail-open path instead of tearing the JVM down on the no-SEH
+                // toolchains.  SEH-guarded memcpy on real MSVC (memcpy-speed, no
+                // syscall on the mapped path); for a normally-mapped header the bytes
+                // are identical to the prior raw read.  A failed read fails OPEN
+                // (accept) — this is a defensive downcast guard, not a hard gate, so a
+                // transiently-unreadable header must not start rejecting valid wraps.
                 if (!decoded_oop || !vmhook::hotspot::is_valid_pointer(decoded_oop))
                 {
                     return true;
                 }
                 std::uint32_t narrow_klass{ 0u };
-                std::memcpy(&narrow_klass,
-                            reinterpret_cast<const std::uint8_t*>(decoded_oop) + 8,
-                            sizeof(narrow_klass));
+                if (!vmhook::os::safe_read_fast(&narrow_klass,
+                                                reinterpret_cast<const std::uint8_t*>(decoded_oop) + 8,
+                                                sizeof(narrow_klass)))
+                {
+                    return true;
+                }
                 void* const decoded_klass_raw{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
                 if (!decoded_klass_raw || !vmhook::hotspot::is_valid_pointer(decoded_klass_raw))
                 {
@@ -20711,8 +20722,20 @@ namespace vmhook
             return;
         }
 
+        // READ ONLY of the compressed "value" backing-array slot off the String
+        // oop header.  Routed through os::safe_read_fast (the strict-aliasing-safe,
+        // SEH-guarded memcpy that runs at memcpy-speed on real MSVC and delegates
+        // to kernel-validated safe_read elsewhere) so a cold / GC-relocated String
+        // oop whose header page is unmapped recovers the existing return-on-failure
+        // path instead of faulting uncontained on the no-SEH toolchains (lib fix
+        // #14).  Warm-path byte-identical: on a mapped slot the bytes are exactly
+        // what the prior raw memcpy produced.  A failed read leaves compressed == 0
+        // -> decode_array_oop(0) == nullptr -> early return, matching the prior
+        // read-of-zero semantics.  The element WRITES below are deliberately NOT
+        // routed through safe_write (#4 revert: WriteProcessMemory on the hot /
+        // GC-managed write path crashes); only this READ is hardened.
         std::uint32_t compressed{};
-        std::memcpy(&compressed, reinterpret_cast<const std::uint8_t*>(string_oop) + value_field->offset, sizeof(compressed));
+        vmhook::os::safe_read_fast(&compressed, reinterpret_cast<const std::uint8_t*>(string_oop) + value_field->offset, sizeof(compressed));
         void* const array_oop{ vmhook::decode_array_oop(compressed) };
         if (!array_oop)
         {
