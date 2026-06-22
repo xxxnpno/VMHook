@@ -1305,11 +1305,356 @@ static_assert(std::is_base_of_v<vmhook::object_base, vmhook::object<wrapper_clas
               "object<wrapper_class> derives from object_base");
 
 // =============================================================================
+// 24. DEEPEN -- value_t_convertible_target_v : closure of the classifier branches
+// =============================================================================
+// The trait body (vmhook.hpp) is a 3-way constexpr lambda over remove_cvref_t<T>:
+//   (a) clean == std::nullptr_t            -> false
+//   (b) is_pointer_v<clean>               -> is_void_v<remove_pointer_t<clean>>
+//   (c) everything else                   -> true
+// Sections 5c / 14 sampled (a)/(b)/(c) for the obvious cases.  This section drives
+// every UNCOVERED corner of those three branches to closure -- function pointers,
+// pointer-to-member, function references, arrays, enums, nested templates, and
+// every exotic-but-still-class/scalar target -- with the exact value the lambda
+// computes for each.  Pure source-derived; no JVM, no runtime.
+namespace ucs_deepen_trait
+{
+    using vmhook::detail::value_t_convertible_target_v;
+
+    enum plain_enum { pe0 };
+    enum class scoped_enum : std::int64_t { se0 };
+    struct some_pod { int x; };
+}
+
+// 24a. BRANCH (b) -- pointer targets.  Only void* (any cv) is admitted; EVERY
+// other pointer flavour the trait can see is excised because remove_pointer_t is
+// not `void`.  Function pointers and pointer-to-member are the subtle ones:
+//   - `void(*)()` IS is_pointer_v, remove_pointer_t = `void()` (a FUNCTION type),
+//     and is_void_v<function-type> is FALSE -> excised.
+//   - a pointer-to-MEMBER (`int C::*`, `void(C::*)()`) is NOT is_pointer_v, so it
+//     falls to branch (c) and is ADMITTED.
+static_assert(!ucs_deepen_trait::value_t_convertible_target_v<void(*)()>,
+              "trait: function pointer void(*)() is excised (remove_pointer is a function type, not void)");
+static_assert(!ucs_deepen_trait::value_t_convertible_target_v<int(*)(int)>,
+              "trait: function pointer int(*)(int) is excised");
+static_assert(!ucs_deepen_trait::value_t_convertible_target_v<void(**)()>,
+              "trait: pointer-to-(function-pointer) is excised (element is a pointer, not void)");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<int wrapper_class::*>,
+              "trait: pointer-to-data-member is NOT is_pointer_v -> branch (c) ADMITTED");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<void (wrapper_class::*)()>,
+              "trait: pointer-to-member-function is NOT is_pointer_v -> branch (c) ADMITTED");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<const volatile void*>,
+              "trait: const volatile void* -- pointee is void (cv) -> is_void_v true -> ADMITTED");
+static_assert(!ucs_deepen_trait::value_t_convertible_target_v<wrapper_class*>,
+              "trait: wrapper_class* (the CRTP type itself) excised as a non-void pointer");
+static_assert(!ucs_deepen_trait::value_t_convertible_target_v<std::string*>,
+              "trait: std::string* excised (non-void pointer)");
+static_assert(!ucs_deepen_trait::value_t_convertible_target_v<std::nullptr_t*>,
+              "trait: std::nullptr_t* excised (pointer whose element is nullptr_t, not void)");
+
+// 24b. BRANCH (a) -- std::nullptr_t under EVERY cv-ref combination (remove_cvref_t
+// strips to nullptr_t first, then matched).  Section 14e did const/&; close it.
+static_assert(!ucs_deepen_trait::value_t_convertible_target_v<volatile std::nullptr_t>,
+              "trait: volatile nullptr_t excised (cv stripped to nullptr_t)");
+static_assert(!ucs_deepen_trait::value_t_convertible_target_v<const volatile std::nullptr_t>,
+              "trait: const volatile nullptr_t excised");
+static_assert(!ucs_deepen_trait::value_t_convertible_target_v<std::nullptr_t&&>,
+              "trait: nullptr_t&& excised (rvalue ref stripped)");
+static_assert(!ucs_deepen_trait::value_t_convertible_target_v<const volatile std::nullptr_t&>,
+              "trait: const volatile nullptr_t& excised");
+
+// 24c. BRANCH (c) -- non-pointer, non-nullptr targets are UNIVERSALLY admitted.
+// Enums, arrays, references-to-arrays, function references, nested templates,
+// PODs -- the trait does not inspect them further, it returns true.
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<ucs_deepen_trait::plain_enum>,
+              "trait: unscoped enum admitted (branch c)");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<ucs_deepen_trait::scoped_enum>,
+              "trait: scoped enum admitted (branch c)");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<ucs_deepen_trait::some_pod>,
+              "trait: arbitrary POD admitted (branch c -- the trait gates SELECTION, not real convertibility)");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<int[3]>,
+              "trait: array type int[3] is not a pointer -> admitted (branch c)");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<int(&)[3]>,
+              "trait: reference-to-array int(&)[3] -- remove_cvref_t leaves int[3] -> admitted");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<void(&)()>,
+              "trait: function REFERENCE void(&)() -- remove_cvref_t leaves void() (not a pointer) -> admitted");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<std::vector<std::vector<int>>>,
+              "trait: nested vector admitted (branch c)");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<std::optional<int>>,
+              "trait: std::optional<int> admitted (branch c)");
+static_assert(ucs_deepen_trait::value_t_convertible_target_v<std::unique_ptr<int>>,
+              "trait: unique_ptr<int> (class type) admitted -- only RAW non-void pointers are excised");
+
+// =============================================================================
+// 25. DEEPEN -- variant ALTERNATIVE-TYPE map, by index, for BOTH value_ts
+// =============================================================================
+// The runtime lane (Section 23) checks the variant SIZES (9 / 11) and the
+// default ACTIVE index (0).  Here we pin every ALTERNATIVE TYPE by index against
+// the exact std::variant<...> declarations in vmhook.hpp:
+//   field value_t :  0 bool, 1 int8, 2 int16, 3 int32, 4 int64, 5 float,
+//                    6 double, 7 uint16, 8 uint32
+//   method value_t:  0 monostate, 1 bool, 2 int8, 3 int16, 4 int32, 5 int64,
+//                    6 float, 7 double, 8 uint16, 9 uint32, 10 std::string
+// A reorder/insertion in either variant (which would silently change the get()
+// fast-path indices and the default-state contract) breaks exactly here.
+namespace ucs_deepen_variant
+{
+    using fvar = std::remove_cvref_t<decltype(vmhook::field_proxy::value_t{}.data)>;
+    using mvar = std::remove_cvref_t<decltype(vmhook::method_proxy::value_t{}.data)>;
+
+    template<std::size_t I, typename var_t>
+    using alt = std::variant_alternative_t<I, var_t>;
+}
+
+// 25a. field value_t -- 9 alternatives, exact type per index.
+static_assert(std::variant_size_v<ucs_deepen_variant::fvar> == 9u,
+              "field value_t variant size is 9 (compile-time)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<0, ucs_deepen_variant::fvar>, bool>,
+              "field value_t[0] is bool (the value-initialised / null-proxy default)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<1, ucs_deepen_variant::fvar>, std::int8_t>,
+              "field value_t[1] is int8_t (Java byte slot)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<2, ucs_deepen_variant::fvar>, std::int16_t>,
+              "field value_t[2] is int16_t (Java short)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<3, ucs_deepen_variant::fvar>, std::int32_t>,
+              "field value_t[3] is int32_t (Java int)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<4, ucs_deepen_variant::fvar>, std::int64_t>,
+              "field value_t[4] is int64_t (Java long)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<5, ucs_deepen_variant::fvar>, float>,
+              "field value_t[5] is float (Java float)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<6, ucs_deepen_variant::fvar>, double>,
+              "field value_t[6] is double (Java double)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<7, ucs_deepen_variant::fvar>, std::uint16_t>,
+              "field value_t[7] is uint16_t (Java char)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<8, ucs_deepen_variant::fvar>, std::uint32_t>,
+              "field value_t[8] is uint32_t (reference / array compressed OOP -- the is_reference() alternative)");
+
+// 25b. method value_t -- 11 alternatives, monostate FIRST, std::string LAST.
+static_assert(std::variant_size_v<ucs_deepen_variant::mvar> == 11u,
+              "method value_t variant size is 11 (compile-time)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<0, ucs_deepen_variant::mvar>, std::monostate>,
+              "method value_t[0] is std::monostate (the is_void() / call-failed default)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<1, ucs_deepen_variant::mvar>, bool>,
+              "method value_t[1] is bool");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<2, ucs_deepen_variant::mvar>, std::int8_t>,
+              "method value_t[2] is int8_t");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<3, ucs_deepen_variant::mvar>, std::int16_t>,
+              "method value_t[3] is int16_t");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<4, ucs_deepen_variant::mvar>, std::int32_t>,
+              "method value_t[4] is int32_t");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<5, ucs_deepen_variant::mvar>, std::int64_t>,
+              "method value_t[5] is int64_t");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<6, ucs_deepen_variant::mvar>, float>,
+              "method value_t[6] is float");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<7, ucs_deepen_variant::mvar>, double>,
+              "method value_t[7] is double");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<8, ucs_deepen_variant::mvar>, std::uint16_t>,
+              "method value_t[8] is uint16_t");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<9, ucs_deepen_variant::mvar>, std::uint32_t>,
+              "method value_t[9] is uint32_t (reference compressed OOP)");
+static_assert(std::is_same_v<ucs_deepen_variant::alt<10, ucs_deepen_variant::mvar>, std::string>,
+              "method value_t[10] is std::string (eagerly-decoded String result)");
+
+// 25c. The field value_t carries a trailing `std::string signature{}` member;
+// the method value_t does NOT.  Pin that structural difference (the field proxy
+// needs the signature to interpret an array/reference field; the method value_t
+// gets its String eagerly as alternative 10).  Probed via member-access SFINAE.
+namespace ucs_deepen_members
+{
+    template<typename v_t>
+    concept has_signature_member =
+        requires(const v_t& v) { { v.signature } -> std::convertible_to<std::string>; };
+}
+static_assert(ucs_deepen_members::has_signature_member<vmhook::field_proxy::value_t>,
+              "field value_t has a `signature` member (used to interpret array/ref fields)");
+static_assert(!ucs_deepen_members::has_signature_member<vmhook::method_proxy::value_t>,
+              "method value_t has NO `signature` member (String is variant alternative 10)");
+
+// =============================================================================
+// 26. DEEPEN -- every value_t alternative type is itself a CONVERSION target
+// =============================================================================
+// Closing the loop between Section 25 (what the variant HOLDS) and Section 5/14
+// (what the constrained operator T() ADMITS): every alternative type a value_t
+// can hold must also be a legitimate conversion target, otherwise the value
+// could never be read back out as its own type.  uint32_t (the OOP alternative)
+// is admitted as a scalar; std::string (method alt 10) is admitted as a class;
+// std::monostate (method alt 0) is a class type and is therefore ALSO admitted
+// by the trait (branch c) -- characterising that the trait gates on pointer-ness,
+// not on "is this a sensible target".
+static_assert(vmhook::detail::value_t_convertible_target_v<bool>
+              && vmhook::detail::value_t_convertible_target_v<std::int8_t>
+              && vmhook::detail::value_t_convertible_target_v<std::int16_t>
+              && vmhook::detail::value_t_convertible_target_v<std::int32_t>
+              && vmhook::detail::value_t_convertible_target_v<std::int64_t>
+              && vmhook::detail::value_t_convertible_target_v<float>
+              && vmhook::detail::value_t_convertible_target_v<double>
+              && vmhook::detail::value_t_convertible_target_v<std::uint16_t>
+              && vmhook::detail::value_t_convertible_target_v<std::uint32_t>,
+              "every FIELD value_t alternative type is itself a legitimate conversion target");
+static_assert(vmhook::detail::value_t_convertible_target_v<std::monostate>,
+              "std::monostate (method value_t alt 0) is a class type -> trait branch (c) ADMITS it "
+              "(the trait gates pointer-ness, not target sensibility)");
+static_assert(vmhook::detail::value_t_convertible_target_v<std::string>,
+              "std::string (method value_t alt 10) is admitted");
+
+// =============================================================================
+// 27. DEEPEN -- gate-INVARIANT identity of the static accessors, and the gated
+//              same-name statics, return EXACTLY the proxy optionals for every
+//              name spelling (not just the literal sampled in Sections 3/11)
+// =============================================================================
+// static_field / static_method return-type closure across name spellings.
+static_assert(std::is_same_v<decltype(wrapper_class::static_field(std::string_view{ "a" })),
+                             std::optional<vmhook::field_proxy>>,
+              "static_field(string_view) returns optional<field_proxy>");
+static_assert(std::is_same_v<decltype(wrapper_class::static_method(std::string_view{ "m" })),
+                             std::optional<vmhook::method_proxy>>,
+              "static_method(string_view) returns optional<method_proxy>");
+static_assert(std::is_same_v<decltype(wrapper_class::static_method(std::string_view{ "m" },
+                                                                   std::string_view{ "()I" })),
+                             std::optional<vmhook::method_proxy>>,
+              "static_method(string_view, string_view) returns optional<method_proxy>");
+// The instance idiom and the portable static idiom land on the SAME value_t for
+// the name+signature method form too (Section 17 covered field + name-only).
+static_assert(std::is_same_v<
+                  decltype(std::declval<wrapper_class&>().get_method("m", "()I")->call()),
+                  decltype(wrapper_class::static_method("m", "()I")->call())>,
+              "instance get_method(name,sig)->call() and static_method(name,sig)->call() yield the same value_t");
+static_assert(std::is_same_v<
+                  decltype(std::declval<wrapper_class&>().get_field("a")->get()),
+                  decltype(wrapper_class::static_field("a")->get())>,
+              "instance get_field(name)->get() and static_field(name)->get() yield the same value_t");
+
+#if VMHOOK_HAS_DEDUCING_THIS
+// gate ON: the gated same-name static get_method (1-arg and 2-arg) and the
+// portable static_method return the SAME type -- their bodies are byte-identical
+// (both forward to object_base::get_method(typeid(derived), ...)).  Section 3b
+// pinned this for get_field; complete it for both get_method arities.
+static_assert(std::is_same_v<
+                  decltype(wrapper_class::get_method(std::string_view{ "m" })),
+                  decltype(wrapper_class::static_method(std::string_view{ "m" }))>,
+              "[gate ON] gated static get_method(name) and portable static_method(name) match");
+static_assert(std::is_same_v<
+                  decltype(wrapper_class::get_method(std::string_view{ "m" }, std::string_view{ "()I" })),
+                  decltype(wrapper_class::static_method(std::string_view{ "m" }, std::string_view{ "()I" }))>,
+              "[gate ON] gated static get_method(name,sig) and portable static_method(name,sig) match");
+#endif
+
+// =============================================================================
+// 28. DEEPEN -- NEGATIVE arity / wrong-arg closure on the accessors & proxies
+// =============================================================================
+// Section 18 hit the headline ill-formed shapes.  Close the arity/typing matrix:
+// a 2-arg static_field, a 4-arg static_method, get_method with zero args, and a
+// name argument of a pointer-to-non-void (e.g. int*) that has no conversion to
+// string_view / char const* -- all must be SFINAE-non-viable (never a hard error).
+namespace ucs_deepen_neg
+{
+    template<typename w>
+    concept static_field_two_arg =
+        requires(std::string_view a) { { w::static_field(a, a) }; };
+    template<typename w>
+    concept static_method_four_arg =
+        requires(std::string_view a) { { w::static_method(a, a, a, a) }; };
+    template<typename w>
+    concept static_method_zero_arg =
+        requires { { w::static_method() }; };
+    template<typename w>
+    concept inst_get_method_zero_arg =
+        requires { { std::declval<w&>().get_method() }; };
+    template<typename w>
+    concept static_field_ptr_name =
+        requires(int* p) { { w::static_field(p) }; };
+    template<typename w>
+    concept inst_get_field_double_name =
+        requires(double d) { { std::declval<w&>().get_field(d) }; };
+}
+static_assert(!ucs_deepen_neg::static_field_two_arg<wrapper_class>,
+              "static_field(name, sig) is ill-formed (fields have no signature accessor -- only static_method does)");
+static_assert(!ucs_deepen_neg::static_method_four_arg<wrapper_class>,
+              "static_method(a,b,c,d) is ill-formed (no 4-arg accessor)");
+static_assert(!ucs_deepen_neg::static_method_zero_arg<wrapper_class>,
+              "static_method() with no name is ill-formed");
+static_assert(!ucs_deepen_neg::inst_get_method_zero_arg<wrapper_class>,
+              "instance get_method() with no name is ill-formed");
+static_assert(!ucs_deepen_neg::static_field_ptr_name<wrapper_class>,
+              "static_field(int*) is ill-formed (a pointer is not a name spelling)");
+static_assert(!ucs_deepen_neg::inst_get_field_double_name<wrapper_class>,
+              "instance get_field(double) is ill-formed (a double is not a name spelling)");
+
+// =============================================================================
+// 29. DEEPEN -- proxy / value_t value-semantics & noexcept closure
+// =============================================================================
+// Section 21 pinned copy/move constructibility; close it with assignability,
+// destructibility, and the noexcept of the moves the optional<proxy> machinery
+// relies on, plus the optional<method_proxy>::operator-> target (Section 21 only
+// did field).  All derivable from the proxy/value_t declarations.
+static_assert(std::is_same_v<
+                  decltype(std::declval<std::optional<vmhook::method_proxy>&>().operator->()),
+                  vmhook::method_proxy*>,
+              "optional<method_proxy>::operator-> yields method_proxy* (the get_method idiom's deref target)");
+static_assert(std::is_copy_assignable_v<vmhook::field_proxy::value_t>,
+              "field value_t is copy-assignable (holds copyable variant alternatives)");
+static_assert(std::is_move_assignable_v<vmhook::method_proxy::value_t>,
+              "method value_t is move-assignable");
+static_assert(std::is_copy_constructible_v<vmhook::method_proxy::value_t>,
+              "method value_t is copy-constructible (held by value, returned from call())");
+static_assert(std::is_move_constructible_v<vmhook::field_proxy::value_t>,
+              "field value_t is move-constructible");
+static_assert(std::is_destructible_v<vmhook::field_proxy>
+              && std::is_destructible_v<vmhook::method_proxy>
+              && std::is_destructible_v<vmhook::field_proxy::value_t>
+              && std::is_destructible_v<vmhook::method_proxy::value_t>,
+              "all proxies and value_ts are destructible (held in std::optional / by value)");
+// The two value_ts are DISTINCT types (different variant arity / leading
+// alternative) -- the unified syntax keeps field and method results separate.
+static_assert(!std::is_same_v<vmhook::field_proxy::value_t, vmhook::method_proxy::value_t>,
+              "field value_t and method value_t are distinct types");
+static_assert(!std::is_same_v<vmhook::field_proxy, vmhook::method_proxy>,
+              "field_proxy and method_proxy are distinct types");
+
+// =============================================================================
+// 30. DEEPEN -- call() / set() reachable from BOTH idioms, additional shapes
+// =============================================================================
+// Section 4 swept call() shapes on a bare method_proxy.  Confirm the SAME shapes
+// remain viable when reached through the unified spellings (instance get_method
+// and portable static_method), and add a few uncovered argument categories.
+namespace ucs_deepen_call
+{
+    using inst_mp = decltype(*std::declval<wrapper_class&>().get_method("m"));
+    using stat_mp = decltype(*wrapper_class::static_method("m"));
+    static_assert(std::is_same_v<std::remove_cvref_t<inst_mp>, vmhook::method_proxy>,
+                  "deref of instance get_method optional is a method_proxy");
+    static_assert(std::is_same_v<std::remove_cvref_t<stat_mp>, vmhook::method_proxy>,
+                  "deref of static_method optional is a method_proxy");
+}
+// Additional call() argument-shape closure (mirrors Section 4 with uncovered
+// categories): long double, signed/unsigned char, wchar_t, and an empty pack via
+// the static idiom's proxy.
+static_assert(call_probe::call_ok<long double>,
+              "call(long double) must be viable (arithmetic, decays through convert_jni_arg)");
+static_assert(call_probe::call_ok<signed char>,
+              "call(signed char) must be viable (1-byte integral)");
+static_assert(call_probe::call_ok<unsigned char>,
+              "call(unsigned char) must be viable (1-byte integral)");
+static_assert(call_probe::call_ok<wchar_t>,
+              "call(wchar_t) must be viable (integral)");
+static_assert(call_probe::call_ok<std::int64_t&, const std::string&, double&&>,
+              "call(long&, const string&, double&&) mixed value categories must forward");
+// set() additional reference/cv closure beyond Sections 6/15.
+static_assert(set_probe::set_ok<const std::string_view&>,
+              "set(const string_view&) must be viable");
+static_assert(set_probe::set_ok<std::vector<std::uint8_t>>,
+              "set(vector<uint8_t>) must be viable (byte[] write)");
+static_assert(set_probe::set_ok<std::vector<std::int16_t>>,
+              "set(vector<int16_t>) must be viable (short[] write)");
+static_assert(set_probe::set_ok<std::vector<std::int32_t>>,
+              "set(vector<int32_t>) must be viable (int[] write)");
+static_assert(set_probe::set_ok<vmhook::method_proxy::value_t>,
+              "set(method_proxy::value_t) must be viable (set dispatches on the value template arg)");
+
+// =============================================================================
 // 23. Tiny DETERMINISTIC runtime lane
 // =============================================================================
 // Almost every fact above is compile-time.  A handful of facts are genuinely
 // runtime values (the variant active-index after a value-initialisation, the
-// printed gate value) — assert those through a deterministic check() harness so
+// printed gate value) -- assert those through a deterministic check() harness so
 // the executable does more than print "OK", while staying 100% JVM-free and
 // byte-identical across runs (no addresses, no time, no platform branches).
 namespace rt
@@ -1342,7 +1687,7 @@ int main()
               "VMHOOK_HAS_DEDUCING_THIS is 0 or 1 at runtime");
 
     // (2) A value-initialised field_proxy::value_t holds its FIRST alternative
-    // (bool) — the variant's value-initialised state the get() fast paths and
+    // (bool) -- the variant's value-initialised state the get() fast paths and
     // the as_string() "" fallback rely on.
     {
         const vmhook::field_proxy::value_t fv{};
@@ -1359,7 +1704,7 @@ int main()
     }
 
     // (3) A value-initialised method_proxy::value_t holds std::monostate
-    // (alternative 0) — i.e. it reports is_void()/!is_string(), the documented
+    // (alternative 0) -- i.e. it reports is_void()/!is_string(), the documented
     // "void return / call failed" state of call() before any JVM dispatch.
     {
         const vmhook::method_proxy::value_t mv{};

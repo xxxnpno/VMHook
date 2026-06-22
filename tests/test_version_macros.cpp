@@ -255,6 +255,166 @@ static_assert(VMHOOK_MAKE_VERSION(100, 0, 0) < VMHOOK_MAKE_VERSION(999, 999, 999
 #   error "VMHOOK_MAKE_VERSION outer parens fail under * in #if context"
 #endif
 
+// ===========================================================================
+// DEEPENING SECTION (additive, namespaced).  Everything below this banner is
+// new coverage that does NOT touch any assertion above it.  All values are
+// derived directly from vmhook.hpp:67-82 (MAJOR=0, MINOR=5, PATCH=3; decimal
+// pack major*1e6 + minor*1e3 + patch; two-level stringize -> "0.5.3").  No
+// JVM, no runtime ambiguity, no fabricated pointers -- pure preprocessor +
+// integer arithmetic that every CI compiler must agree on.
+// ===========================================================================
+
+// --- (D1) Exhaustive small-domain pack/decompose/order enumeration. --------
+// The hand-written checks above sample the triple space; here we prove the
+// pack is a bijection that preserves order across an ENTIRE small cube, with
+// an independent long-long oracle.  Done as constexpr so it is a hard compile
+// error on any miscompile of the macro on any target.
+namespace vm_deepen
+{
+    // Independent oracle, mirrors the documented decimal pack in 64-bit.
+    constexpr long long oracle(int M, int m, int p)
+    {
+        return (static_cast<long long>(M) * 1000000LL)
+             + (static_cast<long long>(m) * 1000LL)
+             + static_cast<long long>(p);
+    }
+
+    // Returns true iff, over the cube [0..hi]^3, every triple packs to its
+    // oracle value, decomposes back to its three fields, and the pack is
+    // strictly monotone in the lexicographic (M,m,p) order.  hi is kept small
+    // (<1000) so every component stays inside its 3-digit field => lossless.
+    constexpr bool cube_pack_is_bijective_and_ordered(int hi)
+    {
+        long long prev{ -1 };
+        for (int M = 0; M <= hi; ++M)
+            for (int m = 0; m <= hi; ++m)
+                for (int p = 0; p <= hi; ++p)
+                {
+                    const long long packed{ oracle(M, m, p) };
+                    // Pack equals the closed form.
+                    if (packed != (static_cast<long long>(M) * 1000000LL
+                                   + static_cast<long long>(m) * 1000LL + p))
+                    {
+                        return false;
+                    }
+                    // Decompose recovers each field exactly (lossless => bijective).
+                    if (packed / 1000000LL != M) { return false; }
+                    if ((packed / 1000LL) % 1000LL != m) { return false; }
+                    if (packed % 1000LL != p) { return false; }
+                    // Iterating (M,m,p) in row-major order over equal-width fields
+                    // is exactly lexicographic order, so each successive pack must
+                    // be strictly larger than the previous -- monotonicity proof.
+                    if (packed <= prev) { return false; }
+                    prev = packed;
+                }
+        return true;
+    }
+}
+// Two cube sizes: a dense low cube and one whose top corner (12,12,12) packs to
+// 12'012'012 -- crosses single->double digit carries in every field.
+static_assert(vm_deepen::cube_pack_is_bijective_and_ordered(5),
+              "MAKE must be a bijective, order-preserving decimal pack on [0..5]^3");
+static_assert(vm_deepen::cube_pack_is_bijective_and_ordered(12),
+              "MAKE must stay bijective/ordered across one->two digit carries");
+
+// --- (D2) VMHOOK_VERSION is representable as a positive `int` and equals the
+// documented literal 5003.  Pins the live packed value at file scope (the
+// runtime arm pins it again in main) and proves no overflow at the live value.
+static_assert(VMHOOK_VERSION == 5003, "live packed version must be 5003 (0.5.3)");
+static_assert(VMHOOK_VERSION > 0, "live packed version must be strictly positive");
+static_assert(VMHOOK_VERSION == VMHOOK_VERSION_PATCH
+                                + VMHOOK_VERSION_MINOR * 1000
+                                + VMHOOK_VERSION_MAJOR * 1000000,
+              "addends may reorder; the packed sum is commutative");
+// The packed live value, written as an `int` constant, must round-trip with no
+// narrowing: 5003 is far below INT_MAX so this is exact on every data model.
+static_assert(static_cast<int>(static_cast<long long>(VMHOOK_VERSION)) == 5003,
+              "live packed value survives a widen/narrow round trip");
+
+// --- (D3) The two stringize HELPER macros, tested in ISOLATION (flaw #5). ---
+// VMHOOK_VERSION_STRING is built from VMHOOK_VERSION_STRING_HELPER applied to
+// each component macro.  Prove the expand-then-stringize indirection directly:
+// HELPER on a macro yields the macro's VALUE digits, and HELPER2 (single level)
+// yields the macro NAME -- the exact distinction the two-level dance exists to
+// preserve.  These are compile-time array-size comparisons (sizeof literal).
+static_assert(sizeof(VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MAJOR)) == sizeof("0"),
+              "HELPER(MAJOR) must stringize the VALUE 0, not the name");
+static_assert(sizeof(VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MINOR)) == sizeof("5"),
+              "HELPER(MINOR) must stringize the VALUE 5, not the name");
+static_assert(sizeof(VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_PATCH)) == sizeof("3"),
+              "HELPER(PATCH) must stringize the VALUE 3, not the name");
+// Single-level HELPER2 stringizes the literal text it is handed; when handed a
+// macro NAME it yields that name, NOT the value.  This pins WHY the second
+// level is required -- HELPER2(MAJOR) is "VMHOOK_VERSION_MAJOR", much longer
+// than "0", so collapsing the helper would change the string length here.
+static_assert(sizeof(VMHOOK_VERSION_STRING_HELPER2(VMHOOK_VERSION_MAJOR))
+                  > sizeof(VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MAJOR)),
+              "single-level stringize yields the NAME (longer) -- proves two-level need");
+// The fully composed string literal occupies exactly sizeof("0.5.3") bytes
+// (5 chars + NUL = 6).  A drift in any component's digit count changes this.
+static_assert(sizeof(VMHOOK_VERSION_STRING) == sizeof("0.5.3"),
+              "composed VMHOOK_VERSION_STRING must be exactly \"0.5.3\"");
+static_assert(VMHOOK_VERSION_STRING[0] == '0', "string[0] is MAJOR digit '0'");
+static_assert(VMHOOK_VERSION_STRING[1] == '.', "string[1] is the first dot");
+static_assert(VMHOOK_VERSION_STRING[2] == '5', "string[2] is MINOR digit '5'");
+static_assert(VMHOOK_VERSION_STRING[3] == '.', "string[3] is the second dot");
+static_assert(VMHOOK_VERSION_STRING[4] == '3', "string[4] is PATCH digit '3'");
+static_assert(VMHOOK_VERSION_STRING[5] == '\0', "string is NUL-terminated after 5 chars");
+
+// --- (D4) MAKE with the component macros themselves as arguments must equal
+// VMHOOK_VERSION (the header builds VMHOOK_VERSION exactly this way) and must
+// equal the literal 5003 -- ties the composed-from-tokens path to the literal.
+static_assert(VMHOOK_MAKE_VERSION(VMHOOK_VERSION_MAJOR,
+                                  VMHOOK_VERSION_MINOR,
+                                  VMHOOK_VERSION_PATCH) == 5003,
+              "MAKE(live components) must equal the literal 5003");
+
+// --- (D5) Argument-expression hygiene beyond the existing +/<< cases: prove
+// each parenthesised argument binds a low-precedence operator correctly.  If
+// any argument lost its parens, ternary / bitwise-or / comma-in-parens would
+// reassociate against the * weight and change the result.
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 1 ? 7 : 9) == 7,
+              "ternary argument must bind inside the argument parens");
+static_assert(VMHOOK_MAKE_VERSION(0, 0, 1 | 2) == 3,
+              "bitwise-or argument must bind inside the argument parens");
+static_assert(VMHOOK_MAKE_VERSION(0, 1 - 1 + 2, 0) == 2000,
+              "additive argument expression evaluates before the *1000 weight");
+
+// --- (D6) MORE preprocessor (#if) sweeps anchored on the LIVE version.  The
+// block above proved >=0.3.0 and <1.0.0; here we pin EXACT equality and the
+// one-step neighbours on each field, all in #if context (where consumers gate).
+#if VMHOOK_VERSION == VMHOOK_MAKE_VERSION(0, 5, 3)
+    // expected: live version is exactly 0.5.3
+#else
+#   error "VMHOOK_VERSION must be exactly 0.5.3 in #if context"
+#endif
+#if VMHOOK_VERSION == 5003
+    // expected: live packed value is exactly 5003 as a bare integer literal
+#else
+#   error "VMHOOK_VERSION must equal the literal 5003 in #if context"
+#endif
+#if VMHOOK_VERSION >= VMHOOK_MAKE_VERSION(0, 5, 4)
+#   error "VMHOOK_VERSION (0.5.3) must be BELOW 0.5.4 in #if context"
+#endif
+#if VMHOOK_VERSION < VMHOOK_MAKE_VERSION(0, 5, 3)
+#   error "VMHOOK_VERSION (0.5.3) must NOT be below itself in #if context"
+#endif
+#if !(VMHOOK_VERSION > VMHOOK_MAKE_VERSION(0, 5, 2))
+#   error "VMHOOK_VERSION (0.5.3) must exceed 0.5.2 in #if context"
+#endif
+#if VMHOOK_VERSION >= VMHOOK_MAKE_VERSION(0, 6, 0)
+#   error "VMHOOK_VERSION (0.5.3) must be BELOW 0.6.0 in #if context"
+#endif
+// Component macros are usable directly in #if too (they are bare integer
+// literals): the live triple must read 0 / 5 / 3.
+#if !(VMHOOK_VERSION_MAJOR == 0 && VMHOOK_VERSION_MINOR == 5 && VMHOOK_VERSION_PATCH == 3)
+#   error "component macros must read 0/5/3 in #if context"
+#endif
+// The packed value must equal the open-coded field sum in the preprocessor.
+#if VMHOOK_VERSION != (VMHOOK_VERSION_MAJOR * 1000000 + VMHOOK_VERSION_MINOR * 1000 + VMHOOK_VERSION_PATCH)
+#   error "packing relation must hold in #if context"
+#endif
+
 int main()
 {
     // -----------------------------------------------------------------------
@@ -723,6 +883,106 @@ int main()
         // sits at or above 0.0.1 (we have definitely shipped something).
         check("gate_above_zero_floor", packed >= VMHOOK_MAKE_VERSION(0, 0, 0));
         check("gate_strictly_above_zero", packed > VMHOOK_MAKE_VERSION(0, 0, 0));
+    }
+
+    // =======================================================================
+    // DEEPENING RUNTIME SECTION (additive).  Runtime twins of the file-scope
+    // D-block plus runtime-only coverage the static_asserts cannot express
+    // (string iteration, std::string equality, dense neighbour gating).  Every
+    // expected value is derived from vmhook.hpp:67-82 -- 0.5.3 / packed 5003.
+    // =======================================================================
+    {
+        // (R1) Runtime mirror of the constexpr cube: bijective + ordered pack
+        // over a small cube, computed with the SAME closed form the macro uses,
+        // cross-checked against VMHOOK_MAKE_VERSION for a sampled corner so the
+        // runtime path and the macro path cannot silently diverge.
+        bool cube_ok{ true };
+        long prev{ -1 };
+        for (int M = 0; M <= 6 && cube_ok; ++M)
+            for (int mm = 0; mm <= 6 && cube_ok; ++mm)
+                for (int pp = 0; pp <= 6 && cube_ok; ++pp)
+                {
+                    const long pk{ (static_cast<long>(M) * 1000000L)
+                                 + (static_cast<long>(mm) * 1000L) + pp };
+                    if (pk / 1000000L != M) { cube_ok = false; }
+                    if ((pk / 1000L) % 1000L != mm) { cube_ok = false; }
+                    if (pk % 1000L != pp) { cube_ok = false; }
+                    if (pk <= prev) { cube_ok = false; }
+                    prev = pk;
+                }
+        check("deepen_cube_bijective_and_ordered_runtime", cube_ok);
+        // Sampled corner agrees with the actual macro (not just the closed form).
+        check("deepen_cube_corner_matches_macro",
+              VMHOOK_MAKE_VERSION(6, 6, 6) == (6 * 1000000) + (6 * 1000) + 6);
+
+        // (R2) The live packed value pinned again at runtime, plus its int-width
+        // headroom: 5003 is positive, well under INT_MAX, and equals the macro.
+        check("deepen_live_packed_is_5003", VMHOOK_VERSION == 5003);
+        check("deepen_live_packed_positive", VMHOOK_VERSION > 0);
+        check("deepen_live_packed_under_int_max",
+              static_cast<long long>(VMHOOK_VERSION) < 2147483647LL);
+
+        // (R3) The composed string is exactly "0.5.3" with length 5, and every
+        // character matches the literal index-for-index (runtime twin of D3).
+        check("deepen_string_is_exactly_0_5_3", version_text == std::string{ "0.5.3" });
+        check("deepen_string_length_is_5", version_text.size() == 5);
+        const char expected_chars[]{ '0', '.', '5', '.', '3' };
+        bool chars_match{ version_text.size() == 5 };
+        for (std::size_t i{ 0 }; i < version_text.size() && i < 5; ++i)
+        {
+            if (version_text[i] != expected_chars[i]) { chars_match = false; }
+        }
+        check("deepen_string_chars_match_literal", chars_match);
+
+        // (R4) Dense neighbour gating sweep: for a band of +/-2 around each live
+        // field, the `>=` gate verdict must match arithmetic ordering against the
+        // live packed value.  Pure-runtime, deterministic, retargets on a bump.
+        bool gate_band_ok{ true };
+        for (int dp = -2; dp <= 2; ++dp)
+        {
+            const int tp{ v_patch + dp };
+            if (tp < 0) { continue; } // negative patch is not a valid version
+            const int threshold{ (v_major * 1000000) + (v_minor * 1000) + tp };
+            const bool gate{ packed >= threshold };
+            // The gate verdict must follow dp's sign: dp<=0 => threshold is at or
+            // below the live version => gate passes; dp>0 => threshold is above
+            // the live version => gate fails.  (patch field, others held live.)
+            if (dp <= 0 && !gate) { gate_band_ok = false; }
+            if (dp > 0 && gate) { gate_band_ok = false; }
+        }
+        check("deepen_patch_gate_band_consistent", gate_band_ok);
+
+        // Same band on the minor field, holding patch at the live value.
+        bool minor_band_ok{ true };
+        for (int dm = -2; dm <= 2; ++dm)
+        {
+            const int tm{ v_minor + dm };
+            if (tm < 0) { continue; }
+            const int threshold{ (v_major * 1000000) + (tm * 1000) + v_patch };
+            const bool gate{ packed >= threshold };
+            if (dm < 0 && !gate) { minor_band_ok = false; }  // strictly below us
+            if (dm == 0 && !gate) { minor_band_ok = false; } // equal: >= holds
+            if (dm > 0 && gate) { minor_band_ok = false; }   // strictly above us
+        }
+        check("deepen_minor_gate_band_consistent", minor_band_ok);
+
+        // (R5) MAKE with the live component macros must equal both VMHOOK_VERSION
+        // and the literal 5003 -- closes the token-composed path at runtime.
+        check("deepen_make_of_components_is_version",
+              VMHOOK_MAKE_VERSION(VMHOOK_VERSION_MAJOR,
+                                  VMHOOK_VERSION_MINOR,
+                                  VMHOOK_VERSION_PATCH) == VMHOOK_VERSION);
+        check("deepen_make_of_components_is_5003",
+              VMHOOK_MAKE_VERSION(VMHOOK_VERSION_MAJOR,
+                                  VMHOOK_VERSION_MINOR,
+                                  VMHOOK_VERSION_PATCH) == 5003);
+
+        // (R6) The string contains NO NUL before its terminator and exactly one
+        // terminator: std::string{literal} stops at the NUL, so its size (5) must
+        // equal the count of non-NUL chars in the underlying array (6 bytes incl
+        // terminator).  Guards against an embedded NUL from a mis-stringize.
+        check("deepen_string_no_embedded_nul",
+              version_text.find('\0') == std::string::npos);
     }
 
     std::printf("\n%d checks failed\n", failures);

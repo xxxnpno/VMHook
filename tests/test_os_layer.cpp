@@ -1256,11 +1256,291 @@ static auto test_query_region_covers_allocation() -> void
     check("query_region_alloc_base_page_aligned", all_base_aligned);
 }
 
+// ===========================================================================
+// DEEPENING SECTION (additive; appended).  Pure-logic / OS-geometry deepening
+// of os_page_size_granularity: every value below is DERIVED FROM SOURCE
+// (vmhook.hpp page_size()/allocation_granularity()/protect()/query_region()
+// and the trampoline-allocator align_up/align_down masks).  No JVM, no
+// fabricated unmapped reads -- the only memory touched is REAL allocate_rwx
+// pages we own.  All assertions are HARD unless explicitly [INFO]-gated for a
+// genuinely platform-variable outcome.
+// ===========================================================================
+namespace deepen_os_geometry
+{
+
+// integer log2 of a power-of-two (caller guarantees v is a power of two > 0).
+static auto log2_pow2(std::uintptr_t v) noexcept -> unsigned
+{
+    unsigned n{ 0 };
+    while ((v & 1u) == 0u)
+    {
+        v >>= 1u;
+        ++n;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// 1. page/granularity: deeper algebra of the relationship, all derived from
+//    the source contract (both powers of two, gran a whole multiple of page,
+//    gran >= page).  These complement the existing invariant set without
+//    re-asserting any of its checks.
+// ---------------------------------------------------------------------------
+static auto test_relationship_algebra() -> void
+{
+    const std::uintptr_t page{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
+    const std::uintptr_t gran{ static_cast<std::uintptr_t>(vmhook::os::allocation_granularity()) };
+
+    // divmul round-trip: since gran % page == 0, (gran/page)*page reconstructs gran.
+    check("deep_gran_div_mul_page_reconstructs", (gran / page) * page == gran);
+    // and gran/page is exact (no remainder) -- the named "multiple" property.
+    check("deep_gran_mod_page_zero", (gran % page) == 0u);
+
+    // Both being powers of two, gran == page << (log2 gran - log2 page).
+    const unsigned lp{ log2_pow2(page) };
+    const unsigned lg{ log2_pow2(gran) };
+    check("deep_log2_gran_ge_log2_page", lg >= lp);
+    check("deep_gran_is_page_shifted", gran == (page << (lg - lp)));
+    check("deep_gran_over_page_equals_shift", (gran / page) == (static_cast<std::uintptr_t>(1) << (lg - lp)));
+
+    // Mask identity used everywhere in the library: for a power-of-two a, the
+    // clear-low-bits mask ~(a-1) equals the two's-complement negation (-a).
+    check("deep_page_mask_equals_neg",
+          (~(page - 1u)) == (static_cast<std::uintptr_t>(0) - page));
+    check("deep_gran_mask_equals_neg",
+          (~(gran - 1u)) == (static_cast<std::uintptr_t>(0) - gran));
+
+    // gran's low (log2 page) bits are clear because gran is a page multiple:
+    // i.e. aligning gran down to page is a fixed point.
+    check("deep_gran_is_page_aligned", (gran & (page - 1u)) == 0u);
+    // and page aligned down to itself is itself.
+    check("deep_page_is_self_aligned", (page & (page - 1u)) == 0u);
+
+    // Sanity ceiling: both are within the sane window the rest of the file
+    // assumed (>=4096 elsewhere; here pin the <= 2 MiB cap for granularity too).
+    check("deep_gran_at_most_2MiB", gran <= (2u * 1024u * 1024u));
+}
+
+// ---------------------------------------------------------------------------
+// 2. Power-of-two alignment ENUMERATION, host-independent.  The library's
+//    masks must hold for EVERY power-of-two alignment it could ever be handed
+//    (page_size / allocation_granularity always return one of these).  Sweep
+//    4096, 8192, ... up to 2 MiB and assert the masking form agrees with the
+//    independent divmul form, that masks are idempotent, and that the
+//    ordering/residue bounds hold -- across a fixed input grid.  This pins the
+//    alignment arithmetic itself, not any specific host page size.
+// ---------------------------------------------------------------------------
+static auto test_alignment_enumeration() -> void
+{
+    bool mask_matches_divmul{ true };
+    bool down_idempotent{ true };
+    bool up_idempotent{ true };
+    bool cross_idempotent{ true };
+    bool residue_bounded{ true };
+    bool ordering_ok{ true };
+    bool aligned_results{ true };
+
+    // Every power-of-two from 2^12 (4096) to 2^21 (2 MiB) inclusive.
+    for (unsigned shift{ 12 }; shift <= 21; ++shift)
+    {
+        const std::uintptr_t a{ static_cast<std::uintptr_t>(1) << shift };
+        const std::uintptr_t one_below_max{ ~static_cast<std::uintptr_t>(0) - a };
+
+        const std::uintptr_t inputs[]{
+            static_cast<std::uintptr_t>(0),
+            static_cast<std::uintptr_t>(1),
+            a - 1u,
+            a,
+            a + 1u,
+            2u * a,
+            2u * a + 1u,
+            7u * a - 1u,
+            static_cast<std::uintptr_t>(0x10000),
+            static_cast<std::uintptr_t>(vmhook::os::user_address_floor),
+            static_cast<std::uintptr_t>(vmhook::os::user_address_ceiling) & ~(a - 1u),
+            one_below_max,
+        };
+
+        for (const std::uintptr_t x : inputs)
+        {
+            const std::uintptr_t d{ mirror_align_down(x, a) };
+            const std::uintptr_t u{ mirror_align_up(x, a) };
+
+            if (d != ref_align_down(x, a)) { mask_matches_divmul = false; }
+            if (u != ref_align_up(x, a)) { mask_matches_divmul = false; }
+
+            if (mirror_align_down(d, a) != d) { down_idempotent = false; }
+            if (mirror_align_up(u, a) != u) { up_idempotent = false; }
+
+            // Cross-direction: down of an up-result, and up of a down-result,
+            // are both fixed points (both operands are already aligned).
+            if (mirror_align_down(u, a) != u) { cross_idempotent = false; }
+            if (mirror_align_up(d, a) != d) { cross_idempotent = false; }
+
+            // Residue bounds: the amount rounded in either direction is strictly
+            // less than one alignment unit.
+            if (!((x - d) < a)) { residue_bounded = false; }
+            if (!((u - x) < a)) { residue_bounded = false; }
+
+            if (!(d <= x && x <= u)) { ordering_ok = false; }
+
+            if ((d & (a - 1u)) != 0u) { aligned_results = false; }
+            if ((u & (a - 1u)) != 0u) { aligned_results = false; }
+        }
+    }
+
+    check("deep_enum_mask_matches_divmul", mask_matches_divmul);
+    check("deep_enum_align_down_idempotent", down_idempotent);
+    check("deep_enum_align_up_idempotent", up_idempotent);
+    check("deep_enum_cross_direction_fixed_point", cross_idempotent);
+    check("deep_enum_residue_below_one_unit", residue_bounded);
+    check("deep_enum_ordering_down_le_x_le_up", ordering_ok);
+    check("deep_enum_results_are_aligned", aligned_results);
+}
+
+// ---------------------------------------------------------------------------
+// 3. Tie the protect() page-rounding to the SAME align_down/align_up masks the
+//    rest of the file mirrors.  vmhook.hpp protect() computes
+//        base = addr & ~(ps-1);                       == align_down(addr, ps)
+//        size = (end - base + ps - 1) & ~(ps-1);      == align_up(end, ps) - base
+//    Assert that equivalence directly across a real address grid built from a
+//    just-allocated page (so the addresses are real, owned, page-aligned), then
+//    confirm the rounded mapping covers the request and is a whole number of
+//    pages.  No protect() syscall is issued here -- it is the arithmetic
+//    identity we pin (the live protect cycle is already covered in main()).
+// ---------------------------------------------------------------------------
+static auto test_protect_rounding_matches_align_masks() -> void
+{
+    const std::uintptr_t ps{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
+
+    // Real owned base so the synthesized addresses are genuine, not fabricated.
+    void* const blk{ vmhook::os::allocate_rwx(nullptr, ps * 4u) };
+    if (!blk)
+    {
+        check("deep_protect_rounding_skipped_alloc_failed", false);
+        return;
+    }
+    const std::uintptr_t origin{ reinterpret_cast<std::uintptr_t>(blk) };
+
+    const struct { std::uintptr_t off; std::uintptr_t len; } cases[]{
+        { 0u,         1u },
+        { 0u,         ps },
+        { 0u,         ps + 1u },
+        { 1u,         1u },
+        { ps - 1u,    1u },
+        { ps - 1u,    2u },
+        { ps / 2u,    ps },
+        { ps - 4u,    8u },
+        { 3u,         3u * ps },
+    };
+
+    bool base_equals_align_down{ true };
+    bool size_equals_up_minus_base{ true };
+    bool covers_request{ true };
+    bool size_is_page_multiple{ true };
+
+    for (const auto& c : cases)
+    {
+        const std::uintptr_t addr{ origin + c.off };
+        const std::uintptr_t end{ addr + c.len };
+
+        const std::uintptr_t base{ addr & ~(ps - 1u) };
+        const std::uintptr_t size{ (end - base + ps - 1u) & ~(ps - 1u) };
+
+        if (base != mirror_align_down(addr, ps)) { base_equals_align_down = false; }
+        if (size != (mirror_align_up(end, ps) - base)) { size_equals_up_minus_base = false; }
+        if (!(base + size >= end)) { covers_request = false; }
+        if ((size % ps) != 0u) { size_is_page_multiple = false; }
+    }
+
+    check("deep_protect_base_equals_align_down", base_equals_align_down);
+    check("deep_protect_size_equals_alignup_minus_base", size_equals_up_minus_base);
+    check("deep_protect_rounding_covers_request", covers_request);
+    check("deep_protect_rounding_size_page_multiple", size_is_page_multiple);
+
+    vmhook::os::release(blk, ps * 4u);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Per-platform geometry pins not already asserted.  The existing
+//    test_platform_specific_values() pins the literals; here we pin two derived
+//    relationships the source guarantees per branch:
+//      * Windows: gran / page == 16 (65536 / 4096) -- the 16x split this feature
+//        models (vmhook.hpp dwAllocationGranularity vs dwPageSize).
+//      * POSIX: gran / page == 1 (identity, allocation_granularity() returns
+//        page_size()).
+//      * iOS: query_region()'s fabricated stub reports size == page_size()
+//        (vmhook.hpp iOS branch).  We assert that relationship using a REAL
+//        owned page -- never a fabricated address -- so on iOS the stub's
+//        reported size equals page_size().  Other platforms skip this pin.
+// ---------------------------------------------------------------------------
+static auto test_platform_geometry_derived() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    const std::size_t gran{ vmhook::os::allocation_granularity() };
+
+#if VMHOOK_OS_WINDOWS
+    check("deep_windows_gran_over_page_is_16", (gran / page) == 16u);
+#else
+    check("deep_posix_gran_over_page_is_1", (gran / page) == 1u);
+#endif
+
+#if VMHOOK_OS_IOS
+    // iOS query_region stub fabricates size == page_size(); use a real page.
+    void* const blk{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (blk)
+    {
+        const auto info{ vmhook::os::query_region(blk) };
+        check("deep_ios_query_region_size_is_page", info.size == page);
+        vmhook::os::release(blk, page);
+    }
+    else
+    {
+        check("deep_ios_query_region_size_is_page_skipped_alloc", false);
+    }
+#else
+    (void)page;
+    (void)gran;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 5. The two primitives recomputed on every call (no caching, per source) must
+//    nonetheless be byte-identical across a burst of repeated calls -- a witness
+//    that the SYSTEM_INFO fill / sysconf path is deterministic and has no
+//    uninitialised-field hazard.  Stronger than the existing two-call check:
+//    we hammer each primitive many times and require a single distinct value.
+// ---------------------------------------------------------------------------
+static auto test_repeated_call_determinism() -> void
+{
+    const std::size_t page0{ vmhook::os::page_size() };
+    const std::size_t gran0{ vmhook::os::allocation_granularity() };
+
+    bool page_stable{ true };
+    bool gran_stable{ true };
+    for (int i{ 0 }; i < 256; ++i)
+    {
+        if (vmhook::os::page_size() != page0) { page_stable = false; }
+        if (vmhook::os::allocation_granularity() != gran0) { gran_stable = false; }
+    }
+    check("deep_page_size_deterministic_256x", page_stable);
+    check("deep_granularity_deterministic_256x", gran_stable);
+}
+
+} // namespace deepen_os_geometry
+
 int main()
 {
     // --- pure-logic, no side effects: the heart of this file ---------------
     test_page_and_granularity_invariants();
     test_page_and_granularity_thread_stable();
+
+    // --- deepening section (additive) --------------------------------------
+    deepen_os_geometry::test_relationship_algebra();
+    deepen_os_geometry::test_alignment_enumeration();
+    deepen_os_geometry::test_protect_rounding_matches_align_masks();
+    deepen_os_geometry::test_platform_geometry_derived();
+    deepen_os_geometry::test_repeated_call_determinism();
 
     const std::uintptr_t page_align{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
     const std::uintptr_t gran_align{ static_cast<std::uintptr_t>(vmhook::os::allocation_granularity()) };

@@ -2761,6 +2761,293 @@ static auto test_is_valid_pointer_sentinel_upper_half_exhaustive() -> void
     check("is_valid_pointer_alignment_gate_consistent", align_consistent);
 }
 
+// ---------------------------------------------------------------------------
+// E13. build_dr7 — DEEPENING (additive): per-field placement isolation, the
+//      counter-intuitive LEN encoding, OR-composability across slots, the
+//      cross-check against refresh_thread_drs's merge mask (single source of
+//      truth for the Intel layout), purity/determinism, and the caller-side
+//      sizeof()->LEN selection ladder.  Pure logic; every expected value is
+//      recomputed independently from the Intel-SDM formula the header documents
+//      (vmhook.hpp build_dr7 / refresh_thread_drs).  Windows + x86_64 only.
+//
+//      NOTE: build_dr7 is `inline ... noexcept` but NOT `constexpr` today, so
+//      its results cannot be static_assert-ed.  We assert determinism/purity at
+//      runtime instead; a future `constexpr` upgrade would let these become
+//      static_asserts (documented in the feature plan, angle 8).
+//
+//      DEFENSIVE / BOUNDARY: build_dr7 has no slot range guard today, so
+//      build_dr7(slot) with slot<0 or slot>3 is UNDEFINED BEHAVIOUR (shift
+//      count negative or >= 64).  We therefore DO NOT call it out of range —
+//      only slots 0..3 appear below.  If a guard is ever added (return 0 for
+//      out-of-range slot), add explicit ==0 assertions for -1/4/INT_MAX here.
+// ---------------------------------------------------------------------------
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+static auto test_build_dr7_deepening() -> void
+{
+    using namespace vmhook::os;
+    using namespace vmhook::os::detail_dr;
+
+    struct kind_entry { data_breakpoint_kind k; std::uint64_t bits; };
+    struct len_entry  { data_breakpoint_length l; std::uint64_t bits; };
+
+    const std::array<kind_entry, 2> kinds{
+        kind_entry{ data_breakpoint_kind::write,      0b01ull },
+        kind_entry{ data_breakpoint_kind::read_write, 0b11ull } };
+    const std::array<len_entry, 4> lengths{
+        len_entry{ data_breakpoint_length::one_byte,    0b00ull },
+        len_entry{ data_breakpoint_length::two_bytes,   0b01ull },
+        len_entry{ data_breakpoint_length::eight_bytes, 0b10ull },
+        len_entry{ data_breakpoint_length::four_bytes,  0b11ull } };
+
+    // --- (A) Hand-computed full constants for the slots/combos NOT spot-checked
+    // by the existing suites (existing covers slot0/1/3; these add slot 2 plus
+    // a slot-1 one-byte/two-byte case).  Derived bit-by-bit:
+    //
+    //   slot2 write 2B:  L2=1<<4=0x10  R/W2=0b01<<24=0x01000000  LEN2=0b01<<26=0x04000000
+    //                    => 0x05000010
+    check("build_dr7_deep_slot2_write_2bytes",
+          build_dr7(2, data_breakpoint_kind::write,
+                    data_breakpoint_length::two_bytes) == 0x05000010ull);
+    //   slot2 rw 4B:     L2=0x10  R/W2=0b11<<24=0x03000000  LEN2=0b11<<26=0x0C000000
+    //                    => 0x0F000010
+    check("build_dr7_deep_slot2_rw_4bytes",
+          build_dr7(2, data_breakpoint_kind::read_write,
+                    data_breakpoint_length::four_bytes) == 0x0F000010ull);
+    //   slot1 write 1B:  L1=1<<2=0x4  R/W1=0b01<<20=0x00100000  LEN1=0b00<<22=0
+    //                    => 0x00100004
+    check("build_dr7_deep_slot1_write_1byte",
+          build_dr7(1, data_breakpoint_kind::write,
+                    data_breakpoint_length::one_byte) == 0x00100004ull);
+    //   slot0 rw 8B:     L0=0x1  R/W0=0b11<<16=0x00030000  LEN0=0b10<<18=0x00080000
+    //                    => 0x000B0001
+    check("build_dr7_deep_slot0_rw_8bytes",
+          build_dr7(0, data_breakpoint_kind::read_write,
+                    data_breakpoint_length::eight_bytes) == 0x000B0001ull);
+
+    // --- (B) R/W FIELD PLACEMENT per slot (angle 2): the two bits extracted at
+    // (16 + slot*4) must equal the kind enum's numeric value, for ALL 4 slots x
+    // both kinds.  No existing test isolates the R/W field for slots 1 and 2.
+    bool rw_field_ok{ true };
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        for (const auto& ke : kinds)
+        {
+            const std::uint64_t dr7{ build_dr7(slot, ke.k,
+                                               data_breakpoint_length::one_byte) };
+            const std::uint64_t field{ (dr7 >> (16 + slot * 4)) & 0b11ull };
+            if (field != ke.bits)
+            {
+                rw_field_ok = false;
+            }
+        }
+    }
+    check("build_dr7_deep_rw_field_placement_all_slots", rw_field_ok);
+
+    // --- (C) LEN FIELD PLACEMENT per slot (angle 3): the two bits at
+    // (18 + slot*4) must equal the length enum's numeric value for ALL 4 slots
+    // x all 4 lengths -- EXPLICITLY pinning the Intel-counter-intuitive mapping
+    // eight_bytes->0b10 and four_bytes->0b11.  A "tidy-up" of the enum to a
+    // natural ascending order would flip these and fail loudly here.
+    bool len_field_ok{ true };
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        for (const auto& le : lengths)
+        {
+            const std::uint64_t dr7{ build_dr7(slot, data_breakpoint_kind::write,
+                                               le.l) };
+            const std::uint64_t field{ (dr7 >> (18 + slot * 4)) & 0b11ull };
+            if (field != le.bits)
+            {
+                len_field_ok = false;
+            }
+        }
+    }
+    check("build_dr7_deep_len_field_placement_all_slots", len_field_ok);
+
+    // The counter-intuitive mapping, asserted directly on the enum encodings so
+    // the intent is unmissable even reading just this line:
+    check("build_dr7_deep_len_eight_is_0b10",
+          static_cast<std::uint64_t>(data_breakpoint_length::eight_bytes) == 0b10ull);
+    check("build_dr7_deep_len_four_is_0b11",
+          static_cast<std::uint64_t>(data_breakpoint_length::four_bytes) == 0b11ull);
+    check("build_dr7_deep_len_one_is_0b00",
+          static_cast<std::uint64_t>(data_breakpoint_length::one_byte) == 0b00ull);
+    check("build_dr7_deep_len_two_is_0b01",
+          static_cast<std::uint64_t>(data_breakpoint_length::two_bytes) == 0b01ull);
+    check("build_dr7_deep_kind_write_is_0b01",
+          static_cast<std::uint64_t>(data_breakpoint_kind::write) == 0b01ull);
+    check("build_dr7_deep_kind_rw_is_0b11",
+          static_cast<std::uint64_t>(data_breakpoint_kind::read_write) == 0b11ull);
+
+    // --- (D) FULL EXACT-EQUALITY no-bleed (angle 4, strengthened): for every
+    // (slot, kind, len) the result must equal EXACTLY the OR of its three
+    // intended bit groups -- zero stray bits anywhere in the 64-bit word.
+    bool exact_equality{ true };
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        const std::uint64_t local_bit{ std::uint64_t{ 1 } << (slot * 2) };
+        for (const auto& ke : kinds)
+        {
+            for (const auto& le : lengths)
+            {
+                const std::uint64_t expected{
+                    local_bit
+                    | (ke.bits << (16 + slot * 4))
+                    | (le.bits << (18 + slot * 4)) };
+                if (build_dr7(slot, ke.k, le.l) != expected)
+                {
+                    exact_equality = false;
+                }
+            }
+        }
+    }
+    check("build_dr7_deep_exact_equality_no_stray_bits", exact_equality);
+
+    // --- (E) OR-COMPOSABILITY: any two DISTINCT slots produce results whose set
+    // bits never overlap (angle 5).  refresh_thread_drs relies on this when it
+    // merges one slot's bits without clobbering another's.  All 6 unordered
+    // pairs x worst-case (read_write, eight_bytes, maximally many bits set).
+    bool slots_disjoint{ true };
+    for (int a{ 0 }; a < 4; ++a)
+    {
+        for (int b{ a + 1 }; b < 4; ++b)
+        {
+            const std::uint64_t da{ build_dr7(a, data_breakpoint_kind::read_write,
+                                              data_breakpoint_length::eight_bytes) };
+            const std::uint64_t db{ build_dr7(b, data_breakpoint_kind::read_write,
+                                              data_breakpoint_length::eight_bytes) };
+            if ((da & db) != 0ull)
+            {
+                slots_disjoint = false;
+            }
+        }
+    }
+    check("build_dr7_deep_distinct_slots_bit_disjoint", slots_disjoint);
+
+    // Composing all four slots OR'd together must set exactly the union of each
+    // slot's bits (no carry / overlap collapses two distinct slots' bits).
+    {
+        const std::uint64_t combined{
+            build_dr7(0, data_breakpoint_kind::read_write, data_breakpoint_length::eight_bytes)
+            | build_dr7(1, data_breakpoint_kind::write, data_breakpoint_length::one_byte)
+            | build_dr7(2, data_breakpoint_kind::read_write, data_breakpoint_length::four_bytes)
+            | build_dr7(3, data_breakpoint_kind::write, data_breakpoint_length::two_bytes) };
+        // Independently: 0x000B0001 | 0x00100004 | 0x0F000010 | 0x40000040
+        //   slot3 write 2B: L3=1<<6=0x40 R/W3=0b01<<28=0x10000000 LEN3=0b01<<30=0x40000000
+        //                   => 0x50000040
+        // union = 0x000B0001 | 0x00100004 | 0x0F000010 | 0x50000040 = 0x5F1B0055
+        check("build_dr7_deep_four_slot_union_exact", combined == 0x5F1B0055ull);
+    }
+
+    // --- (F) CROSS-CHECK vs refresh_thread_drs MERGE MASK (angle 6, flaw #2):
+    // refresh_thread_drs merges build_dr7's output under
+    //   slot_mask_local = 0b11 << (slot*2)   (vmhook.hpp)
+    //   slot_mask_rwlen = 0xF  << (16+slot*4)
+    // If build_dr7 ever sets a bit OUTSIDE that mask, the applier would silently
+    // DISCARD it (wrong length/kind, mis-firing trap).  Assert the containment
+    // build_dr7(slot,...) & ~merge_mask == 0 for every slot x kind x len.  This
+    // is the single test that catches a future layout drift between the builder
+    // and the applier -- a duplicated copy of the Intel constant in two places.
+    bool within_merge_mask{ true };
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        // Reproduced EXACTLY from refresh_thread_drs/clear_thread_drs:
+        const std::uint64_t slot_mask_local{ std::uint64_t{ 0b11 } << (slot * 2) };
+        const std::uint64_t slot_mask_rwlen{ std::uint64_t{ 0xF }  << (16 + slot * 4) };
+        const std::uint64_t merge_mask{ slot_mask_local | slot_mask_rwlen };
+        for (const auto& ke : kinds)
+        {
+            for (const auto& le : lengths)
+            {
+                if ((build_dr7(slot, ke.k, le.l) & ~merge_mask) != 0ull)
+                {
+                    within_merge_mask = false;
+                }
+            }
+        }
+    }
+    check("build_dr7_deep_within_refresh_thread_drs_merge_mask", within_merge_mask);
+
+    // --- (G) PURITY / DETERMINISM (angle 8, runtime form): repeated calls with
+    // identical inputs yield identical outputs; the function is branch-free and
+    // depends only on its arguments.  No call ever returns 0 for a valid slot
+    // (the local-enable bit is ALWAYS set), documenting flaw #3's "no disabled
+    // mask" property.
+    bool pure{ true };
+    bool never_zero{ true };
+    for (int slot{ 0 }; slot < 4; ++slot)
+    {
+        for (const auto& ke : kinds)
+        {
+            for (const auto& le : lengths)
+            {
+                const std::uint64_t a{ build_dr7(slot, ke.k, le.l) };
+                const std::uint64_t b{ build_dr7(slot, ke.k, le.l) };
+                if (a != b)
+                {
+                    pure = false;
+                }
+                if (a == 0ull)
+                {
+                    never_zero = false;
+                }
+                // The local-enable bit specifically is always present.
+                if ((a & (std::uint64_t{ 1 } << (slot * 2))) == 0ull)
+                {
+                    never_zero = false;
+                }
+            }
+        }
+    }
+    check("build_dr7_deep_pure_deterministic", pure);
+    check("build_dr7_deep_never_zero_for_valid_slot", never_zero);
+
+    // --- (H) sizeof()->LEN SELECTION LADDER (angle 9, caller-side flaw #4):
+    // watch_static_field<> picks `length` from sizeof(field_type) via the ladder
+    //   1 -> one_byte, 2 -> two_bytes, 4 -> four_bytes, else -> eight_bytes.
+    // Replicated verbatim here as a constexpr lambda so the truth table is
+    // checked at compile time, documenting that EVERY non-1/2/4 size (3, 16,
+    // structs, ...) lossily coerces to eight_bytes.
+    {
+        const auto len_for_size{ [](std::size_t n) constexpr -> data_breakpoint_length
+        {
+            return n == 1 ? data_breakpoint_length::one_byte
+                 : n == 2 ? data_breakpoint_length::two_bytes
+                 : n == 4 ? data_breakpoint_length::four_bytes
+                          : data_breakpoint_length::eight_bytes;
+        } };
+
+        check("build_dr7_deep_ladder_int8_one_byte",
+              len_for_size(sizeof(std::int8_t)) == data_breakpoint_length::one_byte);
+        check("build_dr7_deep_ladder_int16_two_bytes",
+              len_for_size(sizeof(std::int16_t)) == data_breakpoint_length::two_bytes);
+        check("build_dr7_deep_ladder_int32_four_bytes",
+              len_for_size(sizeof(std::int32_t)) == data_breakpoint_length::four_bytes);
+        check("build_dr7_deep_ladder_float_four_bytes",
+              len_for_size(sizeof(float)) == data_breakpoint_length::four_bytes);
+        check("build_dr7_deep_ladder_int64_eight_bytes",
+              len_for_size(sizeof(std::int64_t)) == data_breakpoint_length::eight_bytes);
+        check("build_dr7_deep_ladder_double_eight_bytes",
+              len_for_size(sizeof(double)) == data_breakpoint_length::eight_bytes);
+        check("build_dr7_deep_ladder_voidptr_eight_bytes",
+              len_for_size(sizeof(void*)) == data_breakpoint_length::eight_bytes);
+        // Odd / oversized sizes lossily coerce to eight_bytes (the `else` arm).
+        check("build_dr7_deep_ladder_size3_coerces_eight",
+              len_for_size(3) == data_breakpoint_length::eight_bytes);
+        check("build_dr7_deep_ladder_size16_coerces_eight",
+              len_for_size(16) == data_breakpoint_length::eight_bytes);
+        check("build_dr7_deep_ladder_size0_coerces_eight",
+              len_for_size(0) == data_breakpoint_length::eight_bytes);
+
+        // End-to-end: the mask watch_static_field<int32_t> would program is the
+        // slot-0 write/4-byte value the existing suite hand-computed as 0xD0001.
+        check("build_dr7_deep_ladder_end_to_end_int32_slot0",
+              build_dr7(0, data_breakpoint_kind::write,
+                        len_for_size(sizeof(std::int32_t))) == 0xD0001ull);
+    }
+}
+#endif
+
 int main()
 {
     test_version_macros();
@@ -2804,6 +3091,7 @@ int main()
     test_memory_protection_enum_and_native_exhaustive();
 #if VMHOOK_HAS_HW_DATA_BREAKPOINTS
     test_build_dr7_exhaustive();
+    test_build_dr7_deepening();
 #endif
     test_factory_registry_roundtrip();
     test_jni_signature_for_arg_exhaustive();

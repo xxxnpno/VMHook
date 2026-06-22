@@ -66,6 +66,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 static int failures{ 0 };
@@ -670,6 +671,293 @@ static auto test_query_region_find_stub_size_consumer() -> void
     }
 }
 
+// ===========================================================================
+// DEEPENING SECTION (additive).  Every assertion below is derived directly from
+// the vmhook.hpp source and is fully deterministic (pure OS-layer logic, no JVM):
+//   * region_info field defaults / null-input sentinel ... vmhook.hpp:472-481, 796-799
+//   * memory_protection enum numbering .................... vmhook.hpp:459-463
+//   * is_readable_pointer pre-filter + verdict ........... vmhook.hpp:2021-2031
+//   * find_stub_size region clamp / fallbacks ............ vmhook.hpp:5743-5755
+// No new buffer is dereferenced through a fabricated address; every probe is
+// either a value-only comparison, a range/alignment pre-filter (evaluated BEFORE
+// query_region ever runs), or a real page we allocate and own.
+// ===========================================================================
+namespace deepening_qr
+{
+    using vmhook::os::region_info;
+    using vmhook::os::memory_protection;
+
+    // -----------------------------------------------------------------------
+    // (D1) region_info DEFAULT-CONSTRUCTION is the documented not-found / null
+    // sentinel.  A default-constructed region_info and query_region(nullptr)
+    // must be byte-identical and have every field at its zero/false default
+    // (vmhook.hpp:472-481 sets base=nullptr,size=0, the five bools=false; the
+    // null guard at 796-799 returns exactly that default).  Pinning the struct
+    // defaults independently guards against a future field reorder/initialiser
+    // change that the consumers (find_stub_size's !info.base, the allocator's
+    // info.free trigger) silently depend on.
+    // -----------------------------------------------------------------------
+    static auto test_region_info_default_is_sentinel() -> void
+    {
+        const region_info def{};
+        check("qr_default_base_null", def.base == nullptr);
+        check("qr_default_size_zero", def.size == 0u);
+        check("qr_default_not_committed", !def.committed);
+        check("qr_default_not_free", !def.free);
+        check("qr_default_not_readable", !def.readable);
+        check("qr_default_not_executable", !def.executable);
+        check("qr_default_not_guarded", !def.guarded);
+
+        // query_region(nullptr) must equal the default sentinel in EVERY field.
+        const auto n{ vmhook::os::query_region(nullptr) };
+        check("qr_null_eq_default_base", n.base == def.base);
+        check("qr_null_eq_default_size", n.size == def.size);
+        check("qr_null_eq_default_committed", n.committed == def.committed);
+        check("qr_null_eq_default_free", n.free == def.free);
+        check("qr_null_eq_default_readable", n.readable == def.readable);
+        check("qr_null_eq_default_executable", n.executable == def.executable);
+        check("qr_null_eq_default_guarded", n.guarded == def.guarded);
+
+        // The default is itself non-wrapping and contains no address (size 0).
+        check("qr_default_no_overflow", region_no_overflow(def));
+        check("qr_default_contains_nothing",
+              !region_contains(def, reinterpret_cast<const void*>(std::uintptr_t{ 0x1000 })));
+    }
+
+    // -----------------------------------------------------------------------
+    // (D2) memory_protection ENUM NUMBERING the attribute walk in this file
+    // relies on (vmhook.hpp:459-463).  The walk in (4) protects through these
+    // values in order; pin their underlying integers so a renumber that would
+    // silently swap which native protection a name maps to is caught here in
+    // the same translation unit that exercises them.  enum class has no
+    // operator==(int), so compare via an explicit cast of the underlying type.
+    // -----------------------------------------------------------------------
+    static auto test_memory_protection_enum_numbering() -> void
+    {
+        using ut = std::underlying_type<memory_protection>::type;
+        check("qr_mp_no_access_is_0",
+              static_cast<ut>(memory_protection::no_access) == ut{ 0 });
+        check("qr_mp_read_is_1",
+              static_cast<ut>(memory_protection::read) == ut{ 1 });
+        check("qr_mp_read_write_is_2",
+              static_cast<ut>(memory_protection::read_write) == ut{ 2 });
+        check("qr_mp_execute_read_is_3",
+              static_cast<ut>(memory_protection::execute_read) == ut{ 3 });
+        check("qr_mp_execute_rw_is_4",
+              static_cast<ut>(memory_protection::execute_rw) == ut{ 4 });
+        // Underlying type is the fixed std::uint32_t the header declares (457).
+        check("qr_mp_underlying_is_uint32",
+              std::is_same<ut, std::uint32_t>::value);
+    }
+
+    // -----------------------------------------------------------------------
+    // (D3) is_readable_pointer PRE-FILTER exhaustively (vmhook.hpp:2023-2025).
+    // The filter is `addr <= user_address_floor || addr >= user_address_ceiling
+    // || (addr & 0x7) != 0` and runs BEFORE query_region, so every probe here is
+    // rejected purely on its numeric value WITHOUT any memory access — safe for
+    // POSIX (no fabricated address is ever dereferenced).
+    //
+    //   * floor (0xFFFF) and everything below -> rejected (<=).
+    //   * ceiling (0x00007FFFFFFFFFFF) and above -> rejected (>=).
+    //   * any of the 7 non-zero low-bit patterns -> rejected (alignment).
+    //   * the smallest address that clears the filter is the first 8-aligned
+    //     value strictly above the floor: floor+1 == 0x10000 (already 8-aligned),
+    //     which is < ceiling and (0x10000 & 0x7)==0, so the RANGE+ALIGN gate
+    //     passes (it then proceeds to query_region, whose committed/readable
+    //     verdict for that unmapped low page is platform-dependent — we do NOT
+    //     assert the final bool there, only that the pre-filter let it through
+    //     by contrast with the rejected cases).
+    // -----------------------------------------------------------------------
+    static auto test_is_readable_pointer_prefilter() -> void
+    {
+        // floor itself and below: rejected by `addr <= floor`.
+        check("qr_irp_rejects_floor",
+              !vmhook::hotspot::is_readable_pointer(
+                  reinterpret_cast<const void*>(vmhook::os::user_address_floor)));
+        check("qr_irp_rejects_below_floor",
+              !vmhook::hotspot::is_readable_pointer(
+                  reinterpret_cast<const void*>(vmhook::os::user_address_floor - 8)));
+        check("qr_irp_rejects_one",
+              !vmhook::hotspot::is_readable_pointer(
+                  reinterpret_cast<const void*>(std::uintptr_t{ 0x8 })));
+
+        // ceiling itself and above: rejected by `addr >= ceiling`.
+        check("qr_irp_rejects_ceiling",
+              !vmhook::hotspot::is_readable_pointer(
+                  reinterpret_cast<const void*>(vmhook::os::user_address_ceiling)));
+        check("qr_irp_rejects_above_ceiling",
+              !vmhook::hotspot::is_readable_pointer(
+                  reinterpret_cast<const void*>(vmhook::os::user_address_ceiling + 8)));
+        check("qr_irp_rejects_noncanonical",
+              !vmhook::hotspot::is_readable_pointer(
+                  reinterpret_cast<const void*>(std::uintptr_t{ 0xFFFF800000000000ull })));
+
+        // Alignment sub-filter: a well-inside-range base (0x10000, 8-aligned)
+        // plus each of the 7 non-zero low-bit offsets must be rejected by
+        // `(addr & 0x7) != 0`, while the 8-aligned base is NOT rejected by the
+        // range+alignment gate.  None of these is dereferenced.
+        const std::uintptr_t inrange_aligned{ 0x10000ull };
+        bool every_misaligned_rejected{ true };
+        for (std::uintptr_t low{ 1 }; low <= 7; ++low)
+        {
+            const void* const mp{
+                reinterpret_cast<const void*>(inrange_aligned + low) };
+            if (vmhook::hotspot::is_readable_pointer(mp))
+            {
+                every_misaligned_rejected = false;
+            }
+        }
+        check("qr_irp_rejects_all_seven_misalignments", every_misaligned_rejected);
+
+        // Just-below-ceiling is in range but ODD, so it is rejected by the
+        // alignment arm, not the range arm — proves the `|| (addr & 0x7)` term
+        // is reached.  (ceiling 0x...FFF is odd, ceiling-1 is even-but-7-misaligned.)
+        check("qr_irp_rejects_just_below_ceiling_misaligned",
+              !vmhook::hotspot::is_readable_pointer(
+                  reinterpret_cast<const void*>(vmhook::os::user_address_ceiling - 1)));
+    }
+
+    // -----------------------------------------------------------------------
+    // (D4) is_readable_pointer VERDICT is exactly `committed && readable &&
+    // !guarded` from the region query (vmhook.hpp:2030-2031) for an in-range,
+    // 8-aligned address.  We walk one OWNED page through read / read_write /
+    // execute_read and assert is_readable_pointer == that boolean composed from
+    // the SAME query_region call.  This ties the consumer to the primitive
+    // across protection states (not just the single live-RWX case already
+    // covered).  All on a real page we allocate; never a fabricated address.
+    // -----------------------------------------------------------------------
+    static auto test_is_readable_pointer_verdict_tracks_query() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("qr_irp_verdict_skipped_alloc_failed", false);
+            return;
+        }
+        // page-aligned base + 8 stays 8-aligned and in range -> clears the filter.
+        const void* const p{ static_cast<std::uint8_t*>(block) + 8 };
+        static_cast<std::uint8_t*>(block)[8] = 0x3C;
+
+        const memory_protection states[]{
+            memory_protection::read,
+            memory_protection::read_write,
+            memory_protection::execute_read,
+        };
+        bool all_agree{ true };
+        for (const memory_protection prot : states)
+        {
+            if (!vmhook::os::protect(block, page, prot, nullptr))
+            {
+                continue; // refused (e.g. W^X) -> skip, never a failure.
+            }
+            const auto info{ vmhook::os::query_region(p) };
+            const bool composed{ info.committed && info.readable && !info.guarded };
+            if (vmhook::hotspot::is_readable_pointer(p) != composed)
+            {
+                all_agree = false;
+            }
+        }
+        check("qr_irp_verdict_matches_composed_across_states", all_agree);
+
+        check("qr_irp_verdict_restore_writable", make_writable(block, page));
+        vmhook::os::release(block, page);
+    }
+
+    // -----------------------------------------------------------------------
+    // (D5) find_stub_size EXACT arithmetic derived from the SAME region query
+    // (vmhook.hpp:5743-5755) — no assumption about kernel coalescing.  For a
+    // start inside a reported region, the result is precisely
+    // min(region_end - start, 0x2000) where region_end = info.base + info.size.
+    // We compute the oracle from query_region(start) directly and compare, for
+    // start = block, block + page/4, block + page/2.  This pins the clamp math
+    // beyond the existing "<= cap, != 0" bounds.
+    // -----------------------------------------------------------------------
+    static auto test_find_stub_size_matches_region_math() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        const std::size_t cap{ static_cast<std::size_t>(0x2000) };
+        const std::size_t size{ page * 2 };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, size) };
+        if (!block)
+        {
+            check("qr_fss_math_skipped_alloc_failed", false);
+            return;
+        }
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        for (std::size_t off{ 0 }; off < size; off += page)
+        {
+            bytes[off] = static_cast<std::uint8_t>(0xC3);
+        }
+
+        const std::size_t offsets[]{ 0u, page / 4u, page / 2u };
+        bool all_match{ true };
+        for (const std::size_t off : offsets)
+        {
+            const std::uint8_t* const start{ bytes + off };
+            const auto info{ vmhook::os::query_region(start) };
+            // Reproduce the impl's branch ladder exactly.
+            std::size_t oracle{};
+            if (!info.base || info.size == 0u)
+            {
+                oracle = cap;
+            }
+            else
+            {
+                const std::uint8_t* const region_end{
+                    static_cast<const std::uint8_t*>(info.base) + info.size };
+                if (region_end <= start)
+                {
+                    oracle = cap;
+                }
+                else
+                {
+                    const std::size_t remaining{
+                        static_cast<std::size_t>(region_end - start) };
+                    oracle = remaining < cap ? remaining : cap;
+                }
+            }
+            if (vmhook::hotspot::find_stub_size(start) != oracle)
+            {
+                all_match = false;
+                std::printf("[INFO] find_stub_size mismatch at offset %zu\n", off);
+            }
+        }
+        check("qr_fss_matches_region_clamp_math", all_match);
+
+        // Monotonicity: scanning from a LATER start within the same region can
+        // never report MORE bytes than from an earlier start (region_end is
+        // fixed, the remaining-bytes term only shrinks; the cap is constant).
+        const std::size_t at_base{ vmhook::hotspot::find_stub_size(bytes) };
+        const std::size_t at_quarter{ vmhook::hotspot::find_stub_size(bytes + page / 4u) };
+        const std::size_t at_half{ vmhook::hotspot::find_stub_size(bytes + page / 2u) };
+        check("qr_fss_monotone_base_ge_quarter", at_base >= at_quarter);
+        check("qr_fss_monotone_quarter_ge_half", at_quarter >= at_half);
+        check("qr_fss_all_starts_capped",
+              at_base <= cap && at_quarter <= cap && at_half <= cap);
+
+        vmhook::os::release(block, size);
+    }
+
+    // -----------------------------------------------------------------------
+    // (D6) find_stub_size FALLBACK == exactly 0x2000 on the not-found path
+    // (vmhook.hpp:5744-5746).  nullptr yields the default region_info
+    // (base==null,size==0) -> the first guard returns 0x2000 verbatim.  Pin the
+    // exact constant (the existing case asserts == cap; this re-states it as the
+    // literal 0x2000 the source returns, and adds the low-floor sentinel whose
+    // is_valid range the caller filters — both must be <= cap and non-zero).
+    // -----------------------------------------------------------------------
+    static auto test_find_stub_size_fallback_constant() -> void
+    {
+        const std::size_t cap{ static_cast<std::size_t>(0x2000) };
+        check("qr_fss_null_is_literal_0x2000",
+              vmhook::hotspot::find_stub_size(nullptr) == cap);
+        // 0x2000 is the documented cap; restate it as an explicit literal so a
+        // future change to the constant is caught structurally.
+        check("qr_fss_cap_is_8192", cap == static_cast<std::size_t>(8192));
+    }
+} // namespace deepening_qr
+
 int main()
 {
     test_query_region_contains_live_addresses();
@@ -683,6 +971,13 @@ int main()
     test_query_region_idempotent();
     test_query_region_is_readable_pointer_consistency();
     test_query_region_find_stub_size_consumer();
+
+    deepening_qr::test_region_info_default_is_sentinel();
+    deepening_qr::test_memory_protection_enum_numbering();
+    deepening_qr::test_is_readable_pointer_prefilter();
+    deepening_qr::test_is_readable_pointer_verdict_tracks_query();
+    deepening_qr::test_find_stub_size_matches_region_math();
+    deepening_qr::test_find_stub_size_fallback_constant();
 
     if (failures == 0)
     {

@@ -26,7 +26,15 @@
 #include <vmhook/vmhook.hpp>
 #include <cstdio>
 #include <cstdint>
+#include <cstddef>
+#include <cstring>
+#include <limits>
+#include <array>
+#include <utility>
+#include <bit>
+#include <type_traits>
 #include <string>
+#include <string_view>
 #include <vector>
 
 static int failures{ 0 };
@@ -942,6 +950,931 @@ static auto test_protect_cycle_then_release_lifecycle() -> void
     check("protect_cycle_release_of_rx_page_no_crash", true);
 }
 
+// ===========================================================================
+// DEEPENING WAVE-5 -- os_allocate_release: sizing primitives, multi-page /
+// granularity-sized writability, returned-pointer alignment, query_region size
+// agreement, allocate/release leak-loop, the OS size/base release asymmetry
+// (flaws #1/#2) pinned as no-crash, and the execute-bit positive control
+// (flaw #3) where the platform actually permits execution.
+//
+// ADDITIVE ONLY.  Every assertion below is a cross-platform INVARIANT derived
+// directly from vmhook.hpp:
+//   * page_size()              486-496  (Win dwPageSize / POSIX sysconf, 4096 fb)
+//   * allocation_granularity() 501-510  (Win dwAllocationGranularity / POSIX = ps)
+//   * allocate_rwx()           703-750  (size==0 -> nullptr; VirtualAlloc page-
+//                                        aligned base / mmap page-aligned base)
+//   * release()                774-786  (null|0 -> no kernel call; Win ignores
+//                                        size, POSIX munmap uses size)
+//   * query_region()           793-898  (committed+readable+size>=requested for
+//                                        an allocate_rwx block on every OS)
+// Platform-variable outcomes are reported via info(), never hard-asserted.
+// No fabricated unmapped addresses: every pointer touched is either a real
+// allocate_rwx block we own, a stack object, or an is_valid_pointer-rejected
+// low constant.
+// ===========================================================================
+namespace wave5_alloc_release
+{
+    // page_size() is a power of two (rule 419) so a strict alignment mask is
+    // exact: aligned <=> (p & (ps - 1)) == 0.
+    static auto is_page_aligned(const void* p, std::size_t ps) -> bool
+    {
+        return (reinterpret_cast<std::uintptr_t>(p) & (static_cast<std::uintptr_t>(ps) - 1u)) == 0u;
+    }
+
+    // -----------------------------------------------------------------------
+    // SIZING PRIMITIVES -- deepen the bit-pattern / cast contract beyond the
+    // existing non-zero / power-of-two / idempotent / >=4096 checks.
+    //   * page_size() must be one of the architecturally-valid page sizes
+    //     {4096, 16384, 65536}.  The POSIX fallback literal is 4096 (494); a
+    //     real 16 KiB (Apple arm64) or 64 KiB kernel reports those.  Anything
+    //     else means the DWORD->size_t cast (491) truncated or sysconf lied.
+    //   * The DWORD->size_t casts (491 / 506) must not truncate to zero: a
+    //     32-bit dwPageSize/dwAllocationGranularity always fits in a >=32-bit
+    //     size_t, so the post-cast value is non-zero (already implied, pinned
+    //     explicitly as a cast-safety contract).
+    //   * std::popcount == 1 is the same power-of-two predicate phrased via
+    //     <bit>, a second independent witness of the single-bit invariant.
+    // -----------------------------------------------------------------------
+    static auto test_sizing_primitive_bit_contract() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        const std::size_t gr{ vmhook::os::allocation_granularity() };
+
+        // Architecturally-valid page sizes.  4096 (x86 / most), 16384 (Apple
+        // arm64, some ARM), 65536 (some ppc64 / experimental).  The fallback
+        // literal at 494 is 4096, inside this set, so the contract holds even
+        // when sysconf fails.
+        const bool ps_is_valid_arch_size{ ps == 4096u || ps == 16384u || ps == 65536u };
+        check("wave5_page_size_is_valid_arch_size", ps_is_valid_arch_size);
+
+        // popcount==1 <=> exactly one bit set <=> power of two (and non-zero).
+        check("wave5_page_size_popcount_one", std::popcount(ps) == 1);
+        check("wave5_granularity_popcount_one", std::popcount(gr) == 1);
+
+        // The DWORD->size_t cast cannot have truncated to zero: a 32-bit field
+        // widened into size_t (>=32 bit on every supported ABI) is value-
+        // preserving, so a non-zero kernel value stays non-zero.
+        check("wave5_page_size_cast_nonzero", ps != 0u);
+        check("wave5_granularity_cast_nonzero", gr != 0u);
+
+        // Hard invariant the trampoline allocator's align_down(usable_end -
+        // size, granularity) math depends on (vmhook.hpp:4820): granularity is
+        // never SMALLER than a page.  A granularity < page would make the
+        // last-candidate rounding skip past valid pages.
+        check("wave5_granularity_ge_page_size", gr >= ps);
+        check("wave5_granularity_multiple_of_page_size", (gr % ps) == 0u);
+
+        // On POSIX allocation_granularity() returns page_size() verbatim (508):
+        // the relationship is then EQUALITY, not merely >=.  On Windows the two
+        // come from distinct SYSTEM_INFO fields and granularity is typically
+        // 64 KiB > page.  We can only hard-assert the >= / multiple invariants
+        // portably; the POSIX-equality refinement is reported as a witness.
+#if !VMHOOK_OS_WINDOWS
+        check("wave5_posix_granularity_equals_page_size", gr == ps);
+#else
+        info("wave5_windows_granularity_gt_page", gr > ps);
+#endif
+
+        // Both fit in size_t without sign issues: size_t is unsigned, so the
+        // top bit is never interpreted as negative.
+        static_assert(std::is_unsigned_v<std::size_t>);
+        check("wave5_page_size_fits_size_t", ps <= (std::numeric_limits<std::size_t>::max)());
+    }
+
+    // -----------------------------------------------------------------------
+    // RETURNED-POINTER ALIGNMENT.  No existing test pins this.  VirtualAlloc
+    // (709) returns a base aligned to the allocation granularity (>= page) and
+    // mmap (735) returns a page-aligned base; either way the base is page-
+    // aligned.  The trampoline allocator and protect() both assume base
+    // alignment, so freeze it for single-page, multi-page, granularity-sized,
+    // and sub-page requests.
+    // -----------------------------------------------------------------------
+    static auto test_returned_pointer_is_page_aligned() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        const std::size_t gr{ vmhook::os::allocation_granularity() };
+
+        const std::array<std::size_t, 5> sizes{ {
+            1u,             // sub-page -> rounded up, base still page-aligned
+            ps - 1u,        // just under a page
+            ps,             // exactly one page
+            ps * 4u,        // multi-page
+            gr,             // a full granularity unit (>= page)
+        } };
+
+        bool every_base_aligned{ true };
+        for (const std::size_t s : sizes)
+        {
+            void* const block{ vmhook::os::allocate_rwx(nullptr, s) };
+            if (!block)
+            {
+                every_base_aligned = false;
+                continue;
+            }
+            if (!is_page_aligned(block, ps))
+            {
+                every_base_aligned = false;
+            }
+            vmhook::os::release(block, s);
+        }
+        check("wave5_allocate_rwx_returns_page_aligned_base", every_base_aligned);
+    }
+
+    // -----------------------------------------------------------------------
+    // MULTI-PAGE / SUB-PAGE FULL-SPAN WRITABILITY across an exhaustive small
+    // domain of N.  The existing multipage test uses N==4 and stamps only the
+    // first byte of each page; here we sweep N in {1,4,17}, write a DISTINCT
+    // pattern across EVERY byte of EVERY page (not just the page head), read it
+    // ALL back, and confirm the full requested span is committed RW with no
+    // off-by-one at the tail.  A sub-page request (1 byte, ps-1 bytes) must
+    // still hand back a whole writable page.  Then release the exact size.
+    // -----------------------------------------------------------------------
+    static auto stamp_and_verify_full_span(void* block, std::size_t bytes_to_touch) -> bool
+    {
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        // Fill with a position-dependent pattern so any aliasing or short
+        // commit shows up as a mismatch on read-back.
+        for (std::size_t i{ 0 }; i < bytes_to_touch; ++i)
+        {
+            bytes[i] = static_cast<std::uint8_t>((i * 31u + 7u) & 0xFFu);
+        }
+        for (std::size_t i{ 0 }; i < bytes_to_touch; ++i)
+        {
+            if (bytes[i] != static_cast<std::uint8_t>((i * 31u + 7u) & 0xFFu))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static auto test_multipage_full_span_writable_sweep() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        const std::array<std::size_t, 3> counts{ { 1u, 4u, 17u } };
+
+        bool all_ok{ true };
+        for (const std::size_t n : counts)
+        {
+            const std::size_t size{ ps * n };
+            void* const block{ vmhook::os::allocate_rwx(nullptr, size) };
+            if (!block)
+            {
+                all_ok = false;
+                continue;
+            }
+            // Touch the ENTIRE requested span end-to-end, not just page heads.
+            if (!stamp_and_verify_full_span(block, size))
+            {
+                all_ok = false;
+            }
+            vmhook::os::release(block, size);
+        }
+        check("wave5_multipage_full_span_writable_N_1_4_17", all_ok);
+
+        // Sub-page requests: only the requested byte-count is the contract, but
+        // the kernel rounds the mapping up so the whole first page is usable.
+        // Touch exactly (ps - 1) and exactly 1 byte spans.
+        {
+            void* const a{ vmhook::os::allocate_rwx(nullptr, 1u) };
+            void* const b{ vmhook::os::allocate_rwx(nullptr, ps - 1u) };
+            bool ok{ a != nullptr && b != nullptr };
+            if (a) { ok = ok && stamp_and_verify_full_span(a, 1u); }
+            if (b) { ok = ok && stamp_and_verify_full_span(b, ps - 1u); }
+            vmhook::os::release(a, 1u);
+            vmhook::os::release(b, ps - 1u);
+            check("wave5_subpage_requests_fully_writable", ok);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // query_region() AGREEMENT with allocate_rwx.  For a freshly allocated
+    // block query_region must report committed && readable on every OS
+    // (Windows MEM_COMMIT + a readable PAGE_* flag, macOS committed=true +
+    // VM_PROT_READ, Linux maps perms[0]=='r').  Additionally the reported
+    // region size must COVER the request: Windows RegionSize, the macOS region
+    // size, and the Linux VMA all span at least the bytes we asked for.  We
+    // only assert size>=requested WHEN committed is reported (a split/free
+    // region has different size semantics).  Sweep single-page, multi-page,
+    // and granularity-sized.
+    // -----------------------------------------------------------------------
+    static auto test_query_region_covers_allocation() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        const std::array<std::size_t, 3> sizes{ { ps, ps * 4u, vmhook::os::allocation_granularity() } };
+
+        bool committed_all{ true };
+        bool readable_all{ true };
+        bool size_covers_all{ true };
+        for (const std::size_t s : sizes)
+        {
+            void* const block{ vmhook::os::allocate_rwx(nullptr, s) };
+            if (!block)
+            {
+                committed_all = false;
+                continue;
+            }
+            // Touch the first byte so the page is definitely resident before we
+            // query (does not change the committed/readable contract, but makes
+            // the region unambiguously live).
+            *static_cast<volatile std::uint8_t*>(block) = 0x5A;
+
+            const vmhook::os::region_info ri{ vmhook::os::query_region(block) };
+            if (!ri.committed) { committed_all = false; }
+            if (!ri.readable)  { readable_all = false; }
+            // size>=requested only meaningful when the region is committed.
+            if (ri.committed && ri.size < s) { size_covers_all = false; }
+            vmhook::os::release(block, s);
+        }
+        check("wave5_query_region_allocate_rwx_committed", committed_all);
+        check("wave5_query_region_allocate_rwx_readable", readable_all);
+        check("wave5_query_region_size_covers_request", size_covers_all);
+
+        // query_region of nullptr is the documented early-out: an all-default
+        // region_info (base null, size 0, every flag false).  Pin every field.
+        {
+            const vmhook::os::region_info ri{ vmhook::os::query_region(nullptr) };
+            check("wave5_query_region_null_base_null", ri.base == nullptr);
+            check("wave5_query_region_null_size_zero", ri.size == 0u);
+            check("wave5_query_region_null_not_committed", !ri.committed);
+            check("wave5_query_region_null_not_readable", !ri.readable);
+            check("wave5_query_region_null_not_executable", !ri.executable);
+            check("wave5_query_region_null_not_guarded", !ri.guarded);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // LEAK / STABILITY LOOP (flaws #1 / #2).  A release path that leaked would
+    // eventually fail to allocate.  Run a long round-trip loop: allocate one
+    // page, write+verify, release the EXACT size, 1000 times.  Every iteration
+    // must succeed.  This directly stresses that release() truly returns the
+    // reservation on both OSes (POSIX munmap with matching size, Windows
+    // VirtualFree of the base).  We do NOT assert address reuse (kernel-
+    // dependent); only that no monotone exhaustion betrays a leak.
+    // -----------------------------------------------------------------------
+    static auto test_round_trip_leak_loop() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        bool every_iter_ok{ true };
+        int completed{ 0 };
+        for (int i{ 0 }; i < 1000; ++i)
+        {
+            void* const block{ vmhook::os::allocate_rwx(nullptr, ps) };
+            if (!block)
+            {
+                every_iter_ok = false;
+                break;
+            }
+            auto* const cell{ static_cast<volatile std::uint8_t*>(block) };
+            const auto marker{ static_cast<std::uint8_t>(i & 0xFF) };
+            *cell = marker;
+            if (*cell != marker)
+            {
+                every_iter_ok = false;
+                vmhook::os::release(block, ps);
+                break;
+            }
+            vmhook::os::release(block, ps);
+            ++completed;
+        }
+        check("wave5_round_trip_leak_loop_1000_all_succeed", every_iter_ok);
+        check("wave5_round_trip_leak_loop_completed_full_count", completed == 1000);
+    }
+
+    // -----------------------------------------------------------------------
+    // NEGATIVE RELEASE CONTAINMENT (the gap behind flaws #1 and #2).  This is a
+    // BEHAVIOUR-PINNING test, not a "it works" test: release() is noexcept ->
+    // void and the kernel return is discarded, so a size/base mismatch is
+    // SILENTLY ignored rather than faulting.  We freeze that contract so a
+    // future change that adds a return value is a deliberate, visible break.
+    //
+    // SAFETY: we only ever pass addresses inside a block WE OWN, and sizes that
+    // stay WITHIN our own allocation, so no unrelated page is ever at risk.
+    //   * POSIX: release(base, ps-1)  -> munmap len rounds up to a page,
+    //            release(base+1, ps)  -> non-page-aligned base, munmap EINVAL.
+    //   * Windows: release(base+small_offset, size) -> interior pointer in the
+    //            first page rounds down to base and frees; a later-page
+    //            interior frees nothing.  Either way: no crash, return discarded.
+    // We allocate a generous multi-page block, run the mismatched releases on
+    // copies of derived pointers, then reclaim with a full-size release of the
+    // base.  Pure no-crash assertions.
+    // -----------------------------------------------------------------------
+    static auto test_negative_release_is_silently_contained() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        constexpr std::size_t pages{ 8 };
+
+        // Block A: undersized release of the correct base.
+        {
+            void* const block{ vmhook::os::allocate_rwx(nullptr, ps * pages) };
+            if (block)
+            {
+                auto* const bytes{ static_cast<std::uint8_t*>(block) };
+                bytes[0] = 0x11;
+                // size one short of a page: POSIX munmap rounds the length up
+                // to a page (frees page 0); Windows ignores size entirely.
+                vmhook::os::release(block, ps - 1u);
+                check("wave5_release_undersize_no_crash", true);
+                // Reclaim the full reservation.  On Windows the base was already
+                // freed (harmless re-free); on POSIX this unmaps the still-mapped
+                // tail.  No crash.
+                vmhook::os::release(block, ps * pages);
+            }
+            else
+            {
+                check("wave5_release_undersize_skipped_alloc_failed", false);
+            }
+        }
+
+        // Block B: unaligned interior base release.
+        {
+            void* const block{ vmhook::os::allocate_rwx(nullptr, ps * pages) };
+            if (block)
+            {
+                auto* const bytes{ static_cast<std::uint8_t*>(block) };
+                bytes[0] = 0x22;
+                // base + 1: NOT page-aligned.  POSIX munmap returns EINVAL and
+                // unmaps nothing (silent).  Windows VirtualFree rounds an
+                // interior pointer in the first page down to the base and frees.
+                void* const interior{ static_cast<void*>(bytes + 1) };
+                vmhook::os::release(interior, ps);
+                check("wave5_release_unaligned_interior_no_crash", true);
+                // Reclaim from the true base regardless of what the mismatch did.
+                vmhook::os::release(block, ps * pages);
+                check("wave5_release_after_mismatch_reclaim_no_crash", true);
+            }
+            else
+            {
+                check("wave5_release_unaligned_interior_skipped_alloc_failed", false);
+            }
+        }
+
+        // Block C: oversize release that stays WITHIN our own multi-page block
+        // (release a 3-page span of a 8-page block from the base).  POSIX
+        // unmaps exactly 3 pages; Windows frees the whole reservation.  Safe
+        // because 3*ps < 8*ps so no unrelated page is named.
+        {
+            void* const block{ vmhook::os::allocate_rwx(nullptr, ps * pages) };
+            if (block)
+            {
+                vmhook::os::release(block, ps * 3u);
+                check("wave5_release_partial_within_own_block_no_crash", true);
+                vmhook::os::release(block, ps * pages);
+            }
+            else
+            {
+                check("wave5_release_partial_within_own_block_skipped_alloc_failed", false);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HINT: occupied vs free.  allocate_rwx must NEVER return the occupied
+    // address as if fresh, and must return SOME usable RWX block either way
+    // (the hint is non-binding per vmhook.hpp:701; Windows even has a no-hint
+    // retry at 721-726 when the hinted range is taken).
+    //   * Occupied hint = the address of a real stack object we own.  The
+    //     returned block must differ from that address (the kernel cannot have
+    //     handed us our own live stack) and must be independently writable.
+    //   * Free hint = derived from a just-released block's base.  We do NOT
+    //     assert the hint is honoured (ASLR / rounding), only that a usable
+    //     block comes back.
+    // SAFETY: the stack object is real and owned; we never dereference the hint
+    // as if it were the returned block, and we never pass a fabricated unmapped
+    // address to any reader.
+    // -----------------------------------------------------------------------
+    static auto test_hint_occupied_and_free_never_corrupts() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+
+        // Occupied hint: a live stack buffer.  Use it ONLY as a numeric hint.
+        std::uint8_t occupied_obj[64]{};
+        occupied_obj[0] = 0xAB;
+        void* const occupied_hint{ static_cast<void*>(occupied_obj) };
+
+        void* const from_occupied{ vmhook::os::allocate_rwx(occupied_hint, ps) };
+        check("wave5_hint_occupied_returns_usable_block", from_occupied != nullptr);
+        if (from_occupied)
+        {
+            // The kernel must never have returned our own live stack region.
+            check("wave5_hint_occupied_not_the_stack_object",
+                  from_occupied != occupied_hint);
+            auto* const cell{ static_cast<volatile std::uint8_t*>(from_occupied) };
+            *cell = 0xC7;
+            check("wave5_hint_occupied_block_writable", *cell == 0xC7);
+            // The stack object must be untouched by the allocation.
+            check("wave5_hint_occupied_stack_object_intact", occupied_obj[0] == 0xAB);
+            vmhook::os::release(from_occupied, ps);
+        }
+
+        // Free hint: allocate, capture base, release, then hint at that base.
+        void* free_hint{ nullptr };
+        {
+            void* const seed{ vmhook::os::allocate_rwx(nullptr, ps) };
+            if (seed)
+            {
+                free_hint = seed;          // numeric value only; region is freed
+                vmhook::os::release(seed, ps);
+            }
+        }
+        void* const from_free{ vmhook::os::allocate_rwx(free_hint, ps) };
+        check("wave5_hint_free_returns_usable_block", from_free != nullptr);
+        if (from_free)
+        {
+            auto* const cell{ static_cast<volatile std::uint8_t*>(from_free) };
+            *cell = 0x3E;
+            check("wave5_hint_free_block_writable", *cell == 0x3E);
+            vmhook::os::release(from_free, ps);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // EXECUTE-BIT POSITIVE CONTROL (flaw #3).  The ONLY way to prove the X in
+    // _rwx actually holds.  Write a trivial RET into an allocate_rwx page and
+    // call it through a function pointer; a clean return proves the page is
+    // executable.  Gated to architectures where the RET encoding is known AND
+    // execution is permitted (NOT Apple, where the RWX->RW fallback at 738-747
+    // legitimately drops PROT_EXEC).  x86-64 RET = 0xC3; arm64 RET = D65F03C0
+    // (little-endian bytes C0 03 5F D6).  After writing the code we flip to
+    // execute_read via os::protect to satisfy any platform that separates W^X
+    // even when the initial RWX mapping succeeded; if that flip is refused we
+    // skip the call (best-effort), never failing.
+    // -----------------------------------------------------------------------
+#if (VMHOOK_ARCH_X86_64 || VMHOOK_ARCH_ARM64) && !VMHOOK_OS_APPLE
+    static auto test_execute_bit_positive_control() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps) };
+        if (!block)
+        {
+            check("wave5_execute_bit_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const code{ static_cast<std::uint8_t*>(block) };
+#if VMHOOK_ARCH_X86_64
+        code[0] = 0xC3; // ret
+        const std::size_t code_len{ 1u };
+#else // VMHOOK_ARCH_ARM64
+        // RET (x30): 0xD65F03C0, little-endian in memory.
+        code[0] = 0xC0;
+        code[1] = 0x03;
+        code[2] = 0x5F;
+        code[3] = 0xD6;
+        const std::size_t code_len{ 4u };
+#endif
+        (void)code_len;
+
+        // Move to execute_read so even a strict-W^X-but-non-Apple kernel will
+        // let us run it.  If refused, characterize and skip the call.
+        const bool rx{ vmhook::os::protect(block, ps,
+                                           vmhook::os::memory_protection::execute_read,
+                                           nullptr) };
+        if (!rx)
+        {
+            info("wave5_execute_bit_protect_rx_refused", true);
+            (void)make_writable(block, ps);
+            vmhook::os::release(block, ps);
+            return;
+        }
+
+        using fn_t = void (*)();
+        fn_t fn{};
+        std::memcpy(&fn, &block, sizeof(fn)); // avoid an ISO func<->object cast warning
+        fn();                                  // faults the process if NOT executable
+        check("wave5_execute_bit_call_returns_cleanly", true);
+
+        (void)make_writable(block, ps);
+        vmhook::os::release(block, ps);
+    }
+#endif
+
+    static auto run_all() -> void
+    {
+        test_sizing_primitive_bit_contract();
+        test_returned_pointer_is_page_aligned();
+        test_multipage_full_span_writable_sweep();
+        test_query_region_covers_allocation();
+        test_round_trip_leak_loop();
+        test_negative_release_is_silently_contained();
+        test_hint_occupied_and_free_never_corrupts();
+#if (VMHOOK_ARCH_X86_64 || VMHOOK_ARCH_ARM64) && !VMHOOK_OS_APPLE
+        test_execute_bit_positive_control();
+#endif
+    }
+} // namespace wave5_alloc_release
+
+// ===========================================================================
+// EXPANSION 2 (additive, namespaced) — pure-logic deepening of the
+// to_native_protect mapping, the protect() overflow-guard arithmetic boundary,
+// the POSIX page-rounding formula, and the old_prot SUCCESS-path contract.
+//
+// CHARTER SPLIT (no duplication of the sibling interaction file):
+//   * test_os_protect_interaction.cpp owns the LIVE behavioural matrix
+//     (mprotect/VirtualProtect transitions, safe_read probes, neighbour
+//     witnesses).  It can only assert the live OUTCOME, and on iOS / hardened
+//     hosts it must SKIP every no_access / W^X probe.
+//   * This block owns the COMPILE-/HAND-TRACEABLE side of the SAME primitive:
+//     the to_native_protect switch is a pure function of the enum, so its
+//     output is fully determined by source (vmhook.hpp:617-628 / 630-641) on
+//     EVERY platform with NO allocation and NO syscall -- it runs identically on
+//     iOS where the behavioural matrix is gated off.  The overflow-guard
+//     boundary (vmhook.hpp:665-671) and the POSIX rounding formula
+//     (vmhook.hpp:684-686) are likewise pure arithmetic, hand-traced here.
+//
+// Every value below is DERIVED FROM SOURCE; nothing is guessed.  No fabricated
+// unmapped address is ever read -- the only allocation used is a real
+// allocate_rwx page, and protect() is only ever handed sizes that are rejected
+// by the guard BEFORE any syscall (so the live page is never disturbed).
+// ===========================================================================
+namespace expansion2_protect_pure_logic
+{
+    using vmhook::os::memory_protection;
+    using vmhook::os::to_native_protect;
+
+    // -----------------------------------------------------------------------
+    // to_native_protect is a pure switch over the 5-state enum.  Pin EACH arm
+    // to the EXACT native constant the source returns, on both platforms, plus
+    // the out-of-range fallback.  The native constants come from the system
+    // headers vmhook.hpp already includes (PAGE_* on Windows, PROT_* on POSIX),
+    // so the comparison is against the real macro values, not a transcription.
+    //
+    // These run on EVERY OS including iOS (no allocation, no syscall) -- they are
+    // the only place the iOS build pins the no_access / execute_rw mapping at
+    // all, since the behavioural matrix is fully gated off there.
+    // -----------------------------------------------------------------------
+    static auto test_to_native_protect_every_arm() -> void
+    {
+#if VMHOOK_OS_WINDOWS
+        // to_native_protect returns DWORD; the PAGE_* macros are int literals.
+        // Cast the native constant to DWORD so the comparison is unsigned-vs-
+        // unsigned (no -Wsign-compare under the MSVC / clang-cl /W4 -Werror CI).
+        check("native_no_access_is_page_noaccess",
+              to_native_protect(memory_protection::no_access)
+                  == static_cast<DWORD>(PAGE_NOACCESS));
+        check("native_read_is_page_readonly",
+              to_native_protect(memory_protection::read)
+                  == static_cast<DWORD>(PAGE_READONLY));
+        check("native_read_write_is_page_readwrite",
+              to_native_protect(memory_protection::read_write)
+                  == static_cast<DWORD>(PAGE_READWRITE));
+        check("native_execute_read_is_page_execute_read",
+              to_native_protect(memory_protection::execute_read)
+                  == static_cast<DWORD>(PAGE_EXECUTE_READ));
+        check("native_execute_rw_is_page_execute_readwrite",
+              to_native_protect(memory_protection::execute_rw)
+                  == static_cast<DWORD>(PAGE_EXECUTE_READWRITE));
+
+        // Out-of-range cast falls through the default-less switch to the trailing
+        // `return PAGE_NOACCESS;` (vmhook.hpp:627).  Pin it so a refactor cannot
+        // silently turn the fallback into a PERMISSIVE mask.
+        check("native_oor_0xFF_falls_back_to_page_noaccess",
+              to_native_protect(static_cast<memory_protection>(0xFFu))
+                  == static_cast<DWORD>(PAGE_NOACCESS));
+        check("native_oor_5_falls_back_to_page_noaccess",
+              to_native_protect(static_cast<memory_protection>(5u))
+                  == static_cast<DWORD>(PAGE_NOACCESS));
+        check("native_oor_max_u32_falls_back_to_page_noaccess",
+              to_native_protect(static_cast<memory_protection>(
+                  std::numeric_limits<std::uint32_t>::max()))
+                  == static_cast<DWORD>(PAGE_NOACCESS));
+#else
+        check("native_no_access_is_prot_none",
+              to_native_protect(memory_protection::no_access) == PROT_NONE);
+        check("native_read_is_prot_read",
+              to_native_protect(memory_protection::read) == PROT_READ);
+        check("native_read_write_is_prot_read_write",
+              to_native_protect(memory_protection::read_write) == (PROT_READ | PROT_WRITE));
+        check("native_execute_read_is_prot_read_exec",
+              to_native_protect(memory_protection::execute_read) == (PROT_READ | PROT_EXEC));
+        check("native_execute_rw_is_prot_read_write_exec",
+              to_native_protect(memory_protection::execute_rw)
+                  == (PROT_READ | PROT_WRITE | PROT_EXEC));
+
+        // PROT_NONE is guaranteed 0 by POSIX, and the read-arm deliberately does
+        // NOT carry PROT_EXEC (vmhook.hpp:635) -- pin both so an accidental
+        // `read -> PROT_READ|PROT_EXEC` (collapsing read into execute_read) or a
+        // non-zero PROT_NONE would be caught.
+        check("native_prot_none_is_zero", PROT_NONE == 0);
+        check("native_read_has_no_exec_bit",
+              (to_native_protect(memory_protection::read) & PROT_EXEC) == 0);
+        check("native_read_write_has_no_exec_bit",
+              (to_native_protect(memory_protection::read_write) & PROT_EXEC) == 0);
+
+        // Out-of-range cast falls through to the trailing `return PROT_NONE;`
+        // (vmhook.hpp:640).  Pin the most-restrictive fallback.
+        check("native_oor_0xFF_falls_back_to_prot_none",
+              to_native_protect(static_cast<memory_protection>(0xFFu)) == PROT_NONE);
+        check("native_oor_5_falls_back_to_prot_none",
+              to_native_protect(static_cast<memory_protection>(5u)) == PROT_NONE);
+        check("native_oor_max_u32_falls_back_to_prot_none",
+              to_native_protect(static_cast<memory_protection>(
+                  std::numeric_limits<std::uint32_t>::max())) == PROT_NONE);
+#endif
+    }
+
+    // -----------------------------------------------------------------------
+    // The four NON-zero, IN-RANGE protections must each map to a DISTINCT native
+    // mask: the switch must not collapse two states (the exact regression the
+    // sibling behavioural matrix guards at runtime, pinned here as pure logic so
+    // it holds even on the iOS build).  read(R), execute_read(R+X),
+    // read_write(R+W), execute_rw(R+W+X) are all different; no two are equal.
+    // On POSIX we additionally pin the bit-superset relationships the masks must
+    // satisfy.
+    // -----------------------------------------------------------------------
+    static auto test_to_native_protect_arms_are_distinct() -> void
+    {
+        const auto n_none{ to_native_protect(memory_protection::no_access) };
+        const auto n_r{ to_native_protect(memory_protection::read) };
+        const auto n_rw{ to_native_protect(memory_protection::read_write) };
+        const auto n_rx{ to_native_protect(memory_protection::execute_read) };
+        const auto n_rwx{ to_native_protect(memory_protection::execute_rw) };
+
+        check("native_read_distinct_from_read_write", n_r != n_rw);
+        check("native_read_distinct_from_execute_read", n_r != n_rx);
+        check("native_read_distinct_from_execute_rw", n_r != n_rwx);
+        check("native_read_write_distinct_from_execute_read", n_rw != n_rx);
+        check("native_read_write_distinct_from_execute_rw", n_rw != n_rwx);
+        check("native_execute_read_distinct_from_execute_rw", n_rx != n_rwx);
+        check("native_no_access_distinct_from_read", n_none != n_r);
+        check("native_no_access_distinct_from_execute_rw", n_none != n_rwx);
+
+#if !VMHOOK_OS_WINDOWS
+        // POSIX bit-superset contract: execute_rw is the union of execute_read's
+        // exec bit and read_write's write bit, and every non-none mask contains
+        // PROT_READ.  Derived directly from the OR-expressions at 635-638.
+        check("native_posix_rw_is_superset_of_read", (n_rw & n_r) == n_r);
+        check("native_posix_rx_is_superset_of_read", (n_rx & n_r) == n_r);
+        check("native_posix_rwx_is_superset_of_rw", (n_rwx & n_rw) == n_rw);
+        check("native_posix_rwx_is_superset_of_rx", (n_rwx & n_rx) == n_rx);
+        check("native_posix_rwx_equals_rw_or_rx", n_rwx == (n_rw | n_rx));
+#endif
+    }
+
+    // -----------------------------------------------------------------------
+    // The overflow guard (vmhook.hpp:665-671) rejects exactly the sizes for
+    // which `size > UINTPTR_MAX - base`.  Equivalently: the LARGEST accepted
+    // size from a given base is `UINTPTR_MAX - base` (base + size ==
+    // UINTPTR_MAX, no wrap), and `+1` is the SMALLEST rejected size.  We verify
+    // the boundary as PURE ARITHMETIC against a real, live page so no syscall is
+    // ever issued with a wrapping size: a wrapping request is rejected BEFORE
+    // the kernel call, so the live page's protection is provably undisturbed.
+    //
+    // Both the largest-accepted (it reaches the kernel and the kernel almost
+    // certainly rejects the absurd length) and the smallest-rejected branches
+    // are exercised; only the GUARD's verdict is asserted hard on the rejected
+    // side (false), while the accepted side is no-crash only (the kernel outcome
+    // is platform-variable for an enormous length).
+    // -----------------------------------------------------------------------
+    static auto test_overflow_guard_boundary_is_exact() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("overflow_boundary_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0] = 0x5A;
+
+        const std::uintptr_t base{ reinterpret_cast<std::uintptr_t>(block) };
+        const std::uintptr_t umax{ std::numeric_limits<std::uintptr_t>::max() };
+        // Source guard: reject when size > (umax - base).  So:
+        const std::size_t largest_accepted{ static_cast<std::size_t>(umax - base) };
+        const std::size_t smallest_rejected{ largest_accepted + std::size_t{ 1 } };
+
+        // Sanity on the arithmetic itself (pure logic, no syscall): base is a
+        // real heap pointer, so base != 0 and base + largest_accepted == umax.
+        check("overflow_boundary_base_nonzero", base != 0u);
+        check("overflow_boundary_largest_accepted_no_wrap",
+              base + static_cast<std::uintptr_t>(largest_accepted) == umax);
+        // base + smallest_rejected = base + (umax - base + 1) = umax + 1 = 0
+        // (the wrap the guard exists to reject).
+        check("overflow_boundary_smallest_rejected_wraps",
+              base + static_cast<std::uintptr_t>(smallest_rejected) == std::uintptr_t{ 0 });
+
+        // smallest_rejected and everything above it -> guard returns false.
+        check("overflow_boundary_smallest_rejected_returns_false",
+              !vmhook::os::protect(block, smallest_rejected,
+                                   memory_protection::read, nullptr));
+        check("overflow_boundary_size_max_returns_false",
+              !vmhook::os::protect(block, SIZE_MAX,
+                                   memory_protection::read, nullptr));
+
+        // The largest NON-wrapping size is NOT rejected by the guard (it passes
+        // the guard and reaches the kernel, which is free to fail it for being
+        // absurd).  We only require no crash; the boolean is platform-variable.
+        (void)vmhook::os::protect(block, largest_accepted,
+                                  memory_protection::read, nullptr);
+        check("overflow_boundary_largest_accepted_no_crash", true);
+
+        // None of the rejected calls touched the kernel: page is still writable.
+        // (The largest_accepted call may have flipped the page read-only IF the
+        // kernel honoured it, so restore writable first before re-asserting.)
+        (void)make_writable(block, page);
+        bytes[0] = 0xA5;
+        check("overflow_boundary_page_untouched_still_writable", bytes[0] == 0xA5);
+
+        vmhook::os::release(block, page);
+    }
+
+    // -----------------------------------------------------------------------
+    // The POSIX page-rounding formula (vmhook.hpp:684-686) computed as PURE
+    // ARITHMETIC over a sweep of (interior-offset, size) pairs.  This does NOT
+    // call protect(); it reproduces the exact source expression and asserts the
+    // INVARIANTS the rounding must satisfy for every input, so the math is
+    // validated on every OS (Windows rounds kernel-side, but the formula's
+    // invariants are universal and the trampoline allocator relies on them):
+    //
+    //   base_down   = addr & ~(ps-1)
+    //   end         = addr + size
+    //   aligned     = (end - base_down + ps - 1) & ~(ps-1)
+    //
+    // Invariants pinned for each case:
+    //   * aligned is a whole multiple of ps;
+    //   * the rounded span [base_down, base_down+aligned) COVERS the requested
+    //     [addr, addr+size);
+    //   * aligned >= ps for any size >= 1 (never zero pages for a non-empty req);
+    //   * the rounded span does not extend more than (ps-1) past the request end
+    //     on the high side, nor start more than (ps-1) below addr.
+    // ps is a runtime power of two from page_size(); the cases are derived from
+    // it so they hold on 4K, 16K (Apple-silicon), and large-page hosts alike.
+    // -----------------------------------------------------------------------
+    static auto test_posix_rounding_formula_invariants() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        check("rounding_ps_is_power_of_two", (ps & (ps - 1)) == 0u);
+
+        // A fixed, page-aligned synthetic base far above the heap.  We NEVER
+        // dereference it -- this is pure integer arithmetic mirroring the source,
+        // not a memory access, so it is POSIX-safe (no read of an unmapped addr).
+        const std::uintptr_t aligned_base{ static_cast<std::uintptr_t>(ps) * 4096u };
+
+        // (interior offset within the first page, request size) pairs covering:
+        // exact page, page-1, page+1, sub-byte, multi-page, unaligned interior.
+        const std::array<std::pair<std::uintptr_t, std::size_t>, 9> cases{ {
+            { 0u,        std::size_t{ 1 } },
+            { 0u,        ps - 1 },
+            { 0u,        ps },
+            { 0u,        ps + 1 },
+            { 0u,        ps * 2 },
+            { 0u,        ps * 2 + 1 },
+            { ps / 3u,   std::size_t{ 1 } },
+            { ps - 1u,   std::size_t{ 1 } },  // 1 byte at the very top of the page -> still 1 page
+            { ps / 2u,   ps },                // unaligned interior spanning into next page
+        } };
+
+        bool all_multiple{ true };
+        bool all_cover{ true };
+        bool all_at_least_one_page{ true };
+        bool all_low_within_page{ true };
+        bool all_high_within_page{ true };
+
+        for (const auto& c : cases)
+        {
+            const std::uintptr_t addr{ aligned_base + c.first };
+            const std::size_t size{ c.second };
+
+            const std::uintptr_t end{ addr + size };
+            const std::uintptr_t base_down{ addr & ~(static_cast<std::uintptr_t>(ps) - 1u) };
+            const std::size_t aligned{
+                static_cast<std::size_t>(end - base_down + ps - 1) & ~(ps - 1) };
+
+            // aligned is a whole number of pages.
+            if ((aligned % ps) != 0u)
+            {
+                all_multiple = false;
+            }
+            // Covers the request: base_down <= addr and base_down+aligned >= end.
+            if (!(base_down <= addr
+                  && base_down + static_cast<std::uintptr_t>(aligned) >= end))
+            {
+                all_cover = false;
+            }
+            // Non-empty request -> at least one page.
+            if (aligned < ps)
+            {
+                all_at_least_one_page = false;
+            }
+            // Low edge: base_down is at most (ps-1) below addr.
+            if (addr - base_down > ps - 1u)
+            {
+                all_low_within_page = false;
+            }
+            // High edge: rounded end overshoots the request end by < ps.
+            if (base_down + static_cast<std::uintptr_t>(aligned) - end >= ps)
+            {
+                all_high_within_page = false;
+            }
+        }
+
+        check("rounding_aligned_is_page_multiple", all_multiple);
+        check("rounding_span_covers_request", all_cover);
+        check("rounding_nonempty_request_at_least_one_page", all_at_least_one_page);
+        check("rounding_low_edge_within_one_page", all_low_within_page);
+        check("rounding_high_edge_within_one_page", all_high_within_page);
+
+        // Spot-check the canonical boundary sizes EXACTLY from an aligned base
+        // (offset 0): size in [1..ps] -> 1 page; size in [ps+1..2ps] -> 2;
+        // size == 2ps -> 2.  Derived straight from the formula.
+        const auto rounded_pages{ [ps](std::size_t size) -> std::size_t {
+            const std::uintptr_t addr{ 0u };
+            const std::uintptr_t end{ addr + size };
+            const std::uintptr_t base_down{ addr & ~(static_cast<std::uintptr_t>(ps) - 1u) };
+            const std::size_t aligned{
+                static_cast<std::size_t>(end - base_down + ps - 1) & ~(ps - 1) };
+            return aligned / ps;
+        } };
+        check("rounding_size_1_is_one_page", rounded_pages(std::size_t{ 1 }) == 1u);
+        check("rounding_size_ps_minus_1_is_one_page", rounded_pages(ps - 1) == 1u);
+        check("rounding_size_ps_is_one_page", rounded_pages(ps) == 1u);
+        check("rounding_size_ps_plus_1_is_two_pages", rounded_pages(ps + 1) == 2u);
+        check("rounding_size_two_ps_is_two_pages", rounded_pages(ps * 2) == 2u);
+        check("rounding_size_two_ps_plus_1_is_three_pages",
+              rounded_pages(ps * 2 + 1) == 3u);
+    }
+
+    // -----------------------------------------------------------------------
+    // old_prot SUCCESS-path contract within THIS file's namespace.  The sibling
+    // interaction file owns the multi-flip chain; here we pin the corners the
+    // edges file is responsible for and that pair naturally with its existing
+    // FAILURE-path old_prot tests:
+    //   (a) a successful protect with old_prot == nullptr returns true and does
+    //       not crash (the `if (old_prot)` success guard at 675/688 exercised
+    //       with nullptr, complementing the failure-path nullptr cases above);
+    //   (b) the platform-asymmetric value on success: Windows writes a non-zero
+    //       PAGE_* bitmask, POSIX writes exactly 0 (vmhook.hpp:677 vs 690);
+    //   (c) the round-trip HAZARD: on POSIX the returned old_prot is 0, which
+    //       round-trips through the enum to memory_protection::no_access (the
+    //       static_assert at the top of this file pins no_access == 0).  We do
+    //       NOT actually restore with it (that would brick the page); we ASSERT
+    //       the hazard exists so a future "real previous flags on POSIX" change
+    //       is a deliberate, tested decision rather than a silent break.
+    // -----------------------------------------------------------------------
+    static auto test_old_prot_success_path_contract() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("old_prot_success_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0] = 0x11;
+
+        // (a) success with null old_prot -> true, no crash.
+        check("old_prot_success_null_old_prot_returns_true",
+              vmhook::os::protect(block, page, memory_protection::read, nullptr));
+
+        // (b) success WITH old_prot -> written (not the sentinel) and the
+        // platform-correct value.
+        constexpr std::uint32_t sentinel{ 0xDEADBEEFu };
+        {
+            std::uint32_t op{ sentinel };
+            const bool ok{ vmhook::os::protect(block, page,
+                                               memory_protection::read_write, &op) };
+            check("old_prot_success_with_ptr_returns_true", ok);
+            if (ok)
+            {
+                check("old_prot_success_value_written", op != sentinel);
+#if VMHOOK_OS_WINDOWS
+                // Prior state was PAGE_READONLY (from the read flip in (a)) -> a
+                // non-zero PAGE_* constant.
+                check("old_prot_success_windows_nonzero", op != 0u);
+#else
+                // POSIX writes 0 unconditionally (vmhook.hpp:690).
+                check("old_prot_success_posix_zero", op == 0u);
+
+                // (c) HAZARD: that 0 round-trips to memory_protection::no_access.
+                // We assert the hazard (op-as-enum == no_access) WITHOUT applying
+                // it, so a "save old / restore old" caller is provably unsafe on
+                // POSIX and a future change to real-flags would flip this.
+                check("old_prot_posix_roundtrips_to_no_access",
+                      static_cast<memory_protection>(op) == memory_protection::no_access);
+#endif
+            }
+        }
+
+        check("old_prot_success_restore_writable", make_writable(block, page));
+        bytes[0] = 0x22;
+        check("old_prot_success_byte_writable_after", bytes[0] == 0x22);
+        vmhook::os::release(block, page);
+    }
+
+    static auto run() -> void
+    {
+        test_to_native_protect_every_arm();
+        test_to_native_protect_arms_are_distinct();
+        test_overflow_guard_boundary_is_exact();
+        test_posix_rounding_formula_invariants();
+        test_old_prot_success_path_contract();
+    }
+} // namespace expansion2_protect_pure_logic
+
 int main()
 {
     test_release_zero_size_is_idempotent_noop();
@@ -966,6 +1899,14 @@ int main()
     test_protect_after_release_is_platform_variable();
     test_protect_overflow_guard_leaves_old_prot_untouched();
     test_protect_cycle_then_release_lifecycle();
+
+    // --- deepening wave-5: os_allocate_release sizing / span / leak-loop /
+    //     negative-release containment / execute-bit positive control ---
+    wave5_alloc_release::run_all();
+
+    // --- expansion 2: pure-logic to_native_protect mapping / overflow boundary
+    //     / POSIX rounding formula / old_prot success-path contract ---
+    expansion2_protect_pure_logic::run();
 
     if (failures == 0)
     {

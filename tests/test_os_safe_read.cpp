@@ -772,6 +772,341 @@ static auto test_is_readable_pointer_matches_safe_read() -> void
     vmhook::os::release(block, page);
 }
 
+// ===========================================================================
+// DEEPENING SECTION (additive only).  Pure-logic / OS-layer invariants whose
+// expected values are derived DIRECTLY from vmhook.hpp:
+//   * safe_read / safe_read_fast input-guard matrix          (hpp 957-960, 1140-1143)
+//   * the address-space-WRAP size guard                      (hpp 968-971)
+//   * safe_read_pointer's pure pre-filter + happy-path word  (hpp 2106-2130)
+//   * untag_pointer's bit math                               (hpp 2092-2097)
+//   * is_readable_pointer's pure pre-filter rejections       (hpp 2018-2028)
+//   * the named constants                                    (hpp 515,520)
+// POSIX-SAFETY: every memory READ goes through a REAL owned buffer.  The only
+// fabricated high/sentinel addresses handed to a function are handed to the
+// PURE-FILTER paths (safe_read_pointer / is_readable_pointer / untag_pointer)
+// or to safe_read's WRAP guard -- all of which return BEFORE any dereference, so
+// nothing wild is ever read.  No raw NUL / non-ASCII bytes; no rewrite of any
+// existing assertion.
+// ===========================================================================
+namespace deepen_os_safe_read
+{
+
+// ---------------------------------------------------------------------------
+// D1) safe_read input-guard matrix (hpp 957-960): a false on ANY of
+//     dst==null, src==null, size==0, independent of the other args, on EVERY
+//     platform (the guard is the first statement, pre-OS, pre-memcpy).  The
+//     existing protect-interaction file covers four entries; here we sweep the
+//     full cross-product against a real owned src/dst so non-iOS and iOS agree.
+// ---------------------------------------------------------------------------
+static auto test_guard_matrix_full() -> void
+{
+    alignas(std::uint64_t) std::uint8_t real[16];
+    fill_pattern(real, sizeof(real));
+    std::uint8_t out[16]{};
+
+    // dst==null with every size class (>0) and a valid src -> false.
+    bool null_dst_false{ true };
+    const std::size_t sizes[]{ std::size_t{ 1 }, std::size_t{ 7 },
+                               std::size_t{ 8 }, std::size_t{ 16 } };
+    for (const std::size_t s : sizes)
+    {
+        if (vmhook::os::safe_read(nullptr, real, s))
+        {
+            null_dst_false = false;
+        }
+    }
+    check("safe_read_null_dst_all_sizes_false", null_dst_false);
+
+    // src==null with every size class and a valid dst -> false.
+    bool null_src_false{ true };
+    for (const std::size_t s : sizes)
+    {
+        if (vmhook::os::safe_read(out, nullptr, s))
+        {
+            null_src_false = false;
+        }
+    }
+    check("safe_read_null_src_all_sizes_false", null_src_false);
+
+    // size==0 with all four null/non-null dst/src combinations -> false.
+    const bool z0{ vmhook::os::safe_read(out,     real,    0u) };
+    const bool z1{ vmhook::os::safe_read(out,     nullptr, 0u) };
+    const bool z2{ vmhook::os::safe_read(nullptr, real,    0u) };
+    const bool z3{ vmhook::os::safe_read(nullptr, nullptr, 0u) };
+    check("safe_read_size0_valid_both_false",     !z0);
+    check("safe_read_size0_null_src_false",       !z1);
+    check("safe_read_size0_null_dst_false",       !z2);
+    check("safe_read_size0_both_null_false",      !z3);
+
+    // The positive twin of the size==0 guard: size==1 with BOTH valid must
+    // succeed and copy exactly one byte (proves the guard is `==0`, not `<N`).
+    out[0] = 0xCC;
+    out[1] = 0xCC;
+    const bool one_ok{ vmhook::os::safe_read(out, real, 1u) };
+    check("safe_read_size1_valid_both_true", one_ok);
+    check("safe_read_size1_copies_one_byte",
+          one_ok && out[0] == real[0] && out[1] == 0xCC);
+}
+
+// ---------------------------------------------------------------------------
+// D2) safe_read_fast shares the IDENTICAL guard prefix (hpp 1140-1143) and is a
+//     byte-identical drop-in (hpp 1135-1136).  Pin that its guard matrix matches
+//     safe_read's exactly, and that the size==1 positive twin copies one byte.
+//     Runs on every platform (no faulting source involved).
+// ---------------------------------------------------------------------------
+static auto test_fast_guard_matrix() -> void
+{
+    alignas(std::uint64_t) std::uint8_t real[16];
+    fill_pattern(real, sizeof(real));
+    std::uint8_t out[16]{};
+
+    check("safe_read_fast_null_dst_false",  !vmhook::os::safe_read_fast(nullptr, real, 8u));
+    check("safe_read_fast_null_src_false",  !vmhook::os::safe_read_fast(out, nullptr, 8u));
+    check("safe_read_fast_size0_false",     !vmhook::os::safe_read_fast(out, real, 0u));
+    check("safe_read_fast_both_null_size0_false",
+          !vmhook::os::safe_read_fast(nullptr, nullptr, 0u));
+
+    out[0] = 0xCC;
+    out[1] = 0xCC;
+    const bool one_ok{ vmhook::os::safe_read_fast(out, real, 1u) };
+    check("safe_read_fast_size1_true", one_ok);
+    check("safe_read_fast_size1_copies_one_byte",
+          one_ok && out[0] == real[0] && out[1] == 0xCC);
+}
+
+// ---------------------------------------------------------------------------
+// D3) The address-space-WRAP size guard (hpp 968-971): when
+//     (uintptr)src + size < (uintptr)src the read can never name a mapped range,
+//     so safe_read returns false BEFORE any OS call / memcpy.  This is pure
+//     uintptr arithmetic -- identical on every platform.
+//
+//     POSIX-SAFE: the wrap-detected paths return at line 970 with NO read, so a
+//     sentinel src is never dereferenced.  We still anchor on a REAL owned src
+//     for the cases that wrap by a small amount, plus the all-ones-src case
+//     whose (~0 + 1 == 0 < ~0) wrap is rejected before any access.
+// ---------------------------------------------------------------------------
+static auto test_wrap_size_guard() -> void
+{
+    alignas(std::uint64_t) std::uint8_t real[64];
+    fill_pattern(real, sizeof(real));
+    std::uint8_t out[8]{};
+
+    const std::uintptr_t base{ reinterpret_cast<std::uintptr_t>(real) };
+    const std::uintptr_t top{ ~static_cast<std::uintptr_t>(0) };
+
+    // size exactly == (top - base) does NOT wrap (base + size == top, no carry),
+    // size == (top - base) + 1 DOES wrap (base + size == 0 < base).  We assert
+    // only the WRAPPING case here against the real base; the non-wrapping
+    // enormous read is the kernel's to reject (covered by the existing
+    // test_safe_read_huge_size_rejected) and we do not force a giant scan.
+    const std::size_t just_wraps{
+        static_cast<std::size_t>(top - base) + std::size_t{ 1 } };
+    check("safe_read_size_that_wraps_by_one_false",
+          !vmhook::os::safe_read(out, real, just_wraps));
+
+    // A src of all-ones with size==1: (~0 + 1) == 0 < ~0 -> wrap guard fires at
+    // hpp 968 and returns false WITHOUT touching the bogus address.  This is the
+    // one place a non-owned address is passed to safe_read and it is provably
+    // never read (the wrap branch returns first).
+    void* const all_ones{ reinterpret_cast<void*>(top) };
+    check("safe_read_all_ones_src_size1_wrap_false",
+          !vmhook::os::safe_read(out, all_ones, 1u));
+    // Same address via SIZE_MAX also wraps -> false, also pre-read.
+    check("safe_read_all_ones_src_sizemax_false",
+          !vmhook::os::safe_read(out, all_ones, SIZE_MAX));
+
+    // safe_read_fast delegates (cl.exe SEH path also funnels through safe_read on
+    // a fault, but the wrap guard lives in BOTH guard prefixes) so the wrap is
+    // rejected the same way.
+    check("safe_read_fast_all_ones_src_size1_wrap_false",
+          !vmhook::os::safe_read_fast(out, all_ones, 1u));
+}
+
+// ---------------------------------------------------------------------------
+// D4) safe_read_pointer's PURE pre-filter (hpp 2106-2130).  Every rejection is
+//     decided from the address alone BEFORE any os::safe_read, so passing
+//     sentinel / unmapped-shaped addresses here is POSIX-SAFE (no dereference):
+//       * null                                   -> nullptr (2109-2112)
+//       * addr <= user_address_floor (0xFFFF)    -> nullptr (2116)
+//       * addr >= user_address_ceiling           -> nullptr (2117)
+//       * (addr & 0x7) != 0  (mis-8-aligned)     -> nullptr (2118)
+//     The happy path (in-range, 8-aligned, owned, mapped) reads exactly one
+//     pointer-word and returns it verbatim.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_pointer_filter_and_happy_path() -> void
+{
+    using vmhook::hotspot::safe_read_pointer;
+
+    // --- pure-filter rejections (no read occurs) ---
+    check("srp_null_is_null", safe_read_pointer(nullptr) == nullptr);
+
+    // addr == floor (0xFFFF) is rejected by `<=`; addr == floor-? both below.
+    check("srp_floor_exact_is_null",
+          safe_read_pointer(reinterpret_cast<const void*>(vmhook::os::user_address_floor))
+              == nullptr);
+    check("srp_below_floor_is_null",
+          safe_read_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x8 }))
+              == nullptr);
+    check("srp_one_is_null",
+          safe_read_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x1 }))
+              == nullptr);
+
+    // addr == ceiling is rejected by `>=`; just below ceiling but unaligned is
+    // also rejected by the alignment clause, so it never reads either.
+    check("srp_ceiling_exact_is_null",
+          safe_read_pointer(reinterpret_cast<const void*>(vmhook::os::user_address_ceiling))
+              == nullptr);
+    check("srp_above_ceiling_is_null",
+          safe_read_pointer(reinterpret_cast<const void*>(
+              std::uintptr_t{ 0xFFFF800000000000ull })) == nullptr);
+
+    // Mis-aligned in-range addresses (low 3 bits set): each rejected pre-read.
+    bool misaligned_all_null{ true };
+    for (std::uintptr_t off{ 1 }; off <= 7; ++off)
+    {
+        // 0x100000 is comfortably in (floor, ceiling); +off makes it mis-8-aligned.
+        const std::uintptr_t a{ std::uintptr_t{ 0x100000ull } + off };
+        if (safe_read_pointer(reinterpret_cast<const void*>(a)) != nullptr)
+        {
+            misaligned_all_null = false;
+        }
+    }
+    check("srp_misaligned_in_range_all_null", misaligned_all_null);
+
+    // --- happy path: owned, in-range, 8-aligned slot holding a known word ---
+    alignas(std::uint64_t) std::uint64_t slot[2];
+    slot[0] = 0x0123456789ABCDEFull;
+    slot[1] = 0x00007FFEDCBA9876ull;  // a canonical user-space-shaped value
+    // The slot's own address is 8-aligned and in (floor, ceiling) on any real
+    // allocation; reading it yields slot[0] verbatim.
+    const void* const got{ safe_read_pointer(&slot[0]) };
+    check("srp_reads_stored_word",
+          reinterpret_cast<std::uintptr_t>(got) == 0x0123456789ABCDEFull);
+    const void* const got1{ safe_read_pointer(&slot[1]) };
+    check("srp_reads_second_stored_word",
+          reinterpret_cast<std::uintptr_t>(got1) == 0x00007FFEDCBA9876ull);
+
+    // safe_read_pointer is declared noexcept (cheap compile-time fact).
+    check("srp_is_noexcept", noexcept(safe_read_pointer(nullptr)));
+}
+
+// ---------------------------------------------------------------------------
+// D5) untag_pointer (hpp 2092-2097): result == (addr & user_address_ceiling),
+//     i.e. addr & 0x00007FFFFFFFFFFF.  Pure bit math; no read.  Enumerate the
+//     bit-pattern cases the masking must handle.
+// ---------------------------------------------------------------------------
+static auto test_untag_pointer_bit_math() -> void
+{
+    using vmhook::hotspot::untag_pointer;
+    constexpr std::uintptr_t mask{ 0x00007FFFFFFFFFFFull };  // == user_address_ceiling
+
+    const std::uintptr_t cases[]{
+        std::uintptr_t{ 0x0 },
+        std::uintptr_t{ 0x1 },
+        std::uintptr_t{ 0xFFFFull },
+        std::uintptr_t{ 0x100000ull },
+        std::uintptr_t{ 0x00007FFFFFFFFFFFull },        // == mask: unchanged
+        std::uintptr_t{ 0xFFFF800000000000ull },        // pure high tag -> 0
+        std::uintptr_t{ 0xFFFF7FFFFFFFFFFFull },         // high tag + low bits kept
+        ~std::uintptr_t{ 0 },                            // all ones -> mask
+        std::uintptr_t{ 0x8000000000000000ull },         // top bit only -> 0
+        std::uintptr_t{ 0x0000800000000000ull },         // bit 47 -> stripped (mask bit47=0)
+    };
+
+    bool all_match{ true };
+    for (const std::uintptr_t a : cases)
+    {
+        const std::uintptr_t expected{ a & mask };
+        const auto result{ reinterpret_cast<std::uintptr_t>(
+            untag_pointer(reinterpret_cast<const void*>(a))) };
+        if (result != expected)
+        {
+            all_match = false;
+        }
+    }
+    check("untag_pointer_masks_with_ceiling_all_cases", all_match);
+
+    // Spot the canonical examples explicitly so a regression names itself.
+    check("untag_pointer_strips_pure_high_tag",
+          untag_pointer(reinterpret_cast<const void*>(
+              std::uintptr_t{ 0xFFFF800000000000ull })) == nullptr);
+    check("untag_pointer_all_ones_is_ceiling",
+          reinterpret_cast<std::uintptr_t>(
+              untag_pointer(reinterpret_cast<const void*>(~std::uintptr_t{ 0 }))) == mask);
+    check("untag_pointer_in_range_unchanged",
+          reinterpret_cast<std::uintptr_t>(
+              untag_pointer(reinterpret_cast<const void*>(
+                  std::uintptr_t{ 0x100000ull }))) == std::uintptr_t{ 0x100000ull });
+    check("untag_pointer_is_noexcept",
+          noexcept(untag_pointer(nullptr)));
+}
+
+// ---------------------------------------------------------------------------
+// D6) is_readable_pointer's PURE pre-filter rejections (hpp 2021-2028).  These
+//     branches are decided from the address alone, BEFORE the os::query_region
+//     call, so the sentinel addresses are never read -- POSIX-SAFE.  The POSITIVE
+//     (mapped, aligned) case is already covered by
+//     test_is_readable_pointer_matches_safe_read above; here we exhaustively pin
+//     the FILTER side:
+//       * addr <= floor (0xFFFF)        -> false
+//       * addr >= ceiling               -> false
+//       * (addr & 0x7) != 0             -> false (the 8-byte-aligned requirement)
+//     and confirm the two named constants have their documented values.
+// ---------------------------------------------------------------------------
+static auto test_is_readable_pointer_pure_filter() -> void
+{
+    using vmhook::hotspot::is_readable_pointer;
+
+    // The named constants (hpp 515, 520) drive every gate; pin them.
+    check("user_address_floor_value",
+          vmhook::os::user_address_floor == std::uintptr_t{ 0xFFFFull });
+    check("user_address_ceiling_value",
+          vmhook::os::user_address_ceiling == std::uintptr_t{ 0x00007FFFFFFFFFFFull });
+
+    // <= floor: 0, 0x8, 0xFFFF (exact) all rejected by the `<=` clause.
+    bool below_floor_false{ true };
+    const std::uintptr_t low[]{ std::uintptr_t{ 0x0 }, std::uintptr_t{ 0x8 },
+                                std::uintptr_t{ 0x1000 },
+                                vmhook::os::user_address_floor };
+    for (const std::uintptr_t a : low)
+    {
+        if (is_readable_pointer(reinterpret_cast<const void*>(a)))
+        {
+            below_floor_false = false;
+        }
+    }
+    check("irp_at_or_below_floor_all_false", below_floor_false);
+
+    // >= ceiling: exact ceiling and a high non-canonical address rejected.
+    bool above_ceiling_false{ true };
+    const std::uintptr_t high[]{ vmhook::os::user_address_ceiling,
+                                 std::uintptr_t{ 0x0000800000000000ull },
+                                 std::uintptr_t{ 0xFFFF800000000000ull },
+                                 ~std::uintptr_t{ 0 } };
+    for (const std::uintptr_t a : high)
+    {
+        if (is_readable_pointer(reinterpret_cast<const void*>(a)))
+        {
+            above_ceiling_false = false;
+        }
+    }
+    check("irp_at_or_above_ceiling_all_false", above_ceiling_false);
+
+    // Mis-8-aligned in-range: low 3 bits set -> false (the alignment clause).
+    bool misaligned_false{ true };
+    for (std::uintptr_t off{ 1 }; off <= 7; ++off)
+    {
+        const std::uintptr_t a{ std::uintptr_t{ 0x200000ull } + off };
+        if (is_readable_pointer(reinterpret_cast<const void*>(a)))
+        {
+            misaligned_false = false;
+        }
+    }
+    check("irp_misaligned_in_range_all_false", misaligned_false);
+}
+
+} // namespace deepen_os_safe_read
+
 int main()
 {
     // Positive / parity (run on every platform, iOS included — these are valid
@@ -781,6 +1116,17 @@ int main()
     test_safe_read_overlapping_regions_defined();
     test_safe_read_huge_size_rejected();
     test_is_readable_pointer_matches_safe_read();
+
+    // Deepening (additive): pure-logic guard/filter/bit-math invariants derived
+    // straight from vmhook.hpp.  All use owned buffers or pre-read filter paths,
+    // so they are safe on every platform (iOS included) and never dereference a
+    // fabricated address.
+    deepen_os_safe_read::test_guard_matrix_full();
+    deepen_os_safe_read::test_fast_guard_matrix();
+    deepen_os_safe_read::test_wrap_size_guard();
+    deepen_os_safe_read::test_safe_read_pointer_filter_and_happy_path();
+    deepen_os_safe_read::test_untag_pointer_bit_math();
+    deepen_os_safe_read::test_is_readable_pointer_pure_filter();
 
     // Fault-safety cases that require the fault-safe read path — gated off iOS,
     // where safe_read is a raw memcpy and these would fault the process.

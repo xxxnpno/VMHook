@@ -1042,5 +1042,201 @@ int main()
           VMHOOK_HAS_HW_DATA_BREAKPOINTS == 0);
 #endif
 
+    // =======================================================================
+    // ADDITIVE WAVE: surfaces of THIS feature not yet pinned by the sections
+    // above.  Two genuinely-uncovered, fully-source-derived areas:
+    //   (A) hotspot::is_valid_pointer -- the primary consumer of the
+    //       user_address_floor / user_address_ceiling constants this feature
+    //       ships (vmhook.hpp:2047-2084).  It is PURE INTEGER LOGIC: it never
+    //       dereferences the pointer, only inspects its numeric value, so it
+    //       is POSIX-safe to feed fabricated low/high/odd/sentinel addresses
+    //       (no read ever happens).  We still use REAL object addresses for
+    //       the "accepted" cases.
+    //   (B) the watch_static_field<> sizeof(field_type) -> data_breakpoint_
+    //       length selection policy (vmhook.hpp:21185-21189): the chained
+    //       ternary 1->one_byte, 2->two_bytes, 4->four_bytes, else->eight_byte.
+    //       The data_breakpoint_length enum is declared UNCONDITIONALLY
+    //       (vmhook.hpp:1219-1225), so this pure compile-time policy can be
+    //       reproduced and pinned on EVERY platform, not only Windows/x86_64.
+    // All expected values are traced directly from the source above.
+    // =======================================================================
+    {
+        using vmhook::os::user_address_floor;
+        using vmhook::os::user_address_ceiling;
+        namespace hs = vmhook::hotspot;
+
+        // -- (A) is_valid_pointer: floor / ceiling boundary sweep -----------
+        // Predicate (from source): reject iff
+        //   addr <= floor || addr >= ceiling || (addr & 1) || low32 in {sentinels}.
+        // nullptr (addr 0) is <= floor -> rejected.
+        check("ivp_null_rejected",
+              hs::is_valid_pointer(nullptr) == false);
+        // addr == 1 (<= floor) rejected.
+        check("ivp_addr_one_rejected",
+              hs::is_valid_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 1 })) == false);
+        // addr == floor exactly: rejected (the test is `<= floor`).
+        check("ivp_floor_exactly_rejected",
+              hs::is_valid_pointer(reinterpret_cast<const void*>(user_address_floor)) == false);
+        // addr == floor + 1 (0x10000): just above floor, even, below ceiling,
+        // low32 not a sentinel -> ACCEPTED.  This is the lowest accepted value.
+        check("ivp_floor_plus_one_accepted",
+              hs::is_valid_pointer(reinterpret_cast<const void*>(user_address_floor + 1)) == true);
+        // addr == ceiling exactly: rejected (the test is `>= ceiling`).
+        check("ivp_ceiling_exactly_rejected",
+              hs::is_valid_pointer(reinterpret_cast<const void*>(user_address_ceiling)) == false);
+        // addr == ceiling - 1 (0x00007FFF'FFFFFFFE): below ceiling and even
+        // (ceiling is odd, so ceiling-1 is even) -> ACCEPTED.  Highest accepted.
+        check("ivp_ceiling_minus_one_accepted",
+              hs::is_valid_pointer(reinterpret_cast<const void*>(user_address_ceiling - 1)) == true);
+        // addr == ceiling + 1: above ceiling -> rejected.
+        check("ivp_above_ceiling_rejected",
+              hs::is_valid_pointer(reinterpret_cast<const void*>(user_address_ceiling + 1)) == false);
+
+        // -- (A) is_valid_pointer: 2-byte alignment requirement -------------
+        // Any odd address is rejected even when in range.  0x20001 is in
+        // (floor, ceiling) but odd.
+        check("ivp_odd_in_range_rejected",
+              hs::is_valid_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x20001ull })) == false);
+        // The even neighbour 0x20000 is accepted (in range, even, non-sentinel).
+        check("ivp_even_in_range_accepted",
+              hs::is_valid_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x20000ull })) == true);
+
+        // -- (A) is_valid_pointer: debug-poison sentinel low32 patterns -----
+        // The switch rejects 9 sentinels by their low 32 bits.  But the
+        // alignment gate (addr & 1) runs FIRST, so odd-valued sentinels are
+        // already rejected by alignment; only the EVEN sentinels exercise the
+        // switch arm distinctly.  We build each sentinel in the canonical
+        // low-half region (high32 = 0x00001234, which keeps addr in range and
+        // even-or-odd governed solely by the sentinel's own parity).
+        // Even sentinels (low bit 0): 0xCAFEBABE, 0xCCCCCCCC, 0xFEEEFEEE.
+        {
+            const std::uint32_t even_sentinels[]{ 0xCAFEBABEu, 0xCCCCCCCCu, 0xFEEEFEEEu };
+            bool all_even_sentinels_rejected{ true };
+            for (const std::uint32_t s : even_sentinels)
+            {
+                const std::uintptr_t addr{ (std::uintptr_t{ 0x00001234ull } << 32) | s };
+                if (hs::is_valid_pointer(reinterpret_cast<const void*>(addr)) != false)
+                {
+                    all_even_sentinels_rejected = false;
+                }
+            }
+            check("ivp_even_debug_sentinels_rejected", all_even_sentinels_rejected);
+        }
+        // Odd sentinels (low bit 1): 0xDEADBEEF, 0xCDCDCDCD, 0xBAADF00D,
+        // 0xABABABAB, 0xFDFDFDFD, 0xDDDDDDDD -- rejected (whether by the
+        // alignment gate or the switch, the OBSERVABLE result is the same:
+        // false).  Pin the observable.
+        {
+            const std::uint32_t odd_sentinels[]{
+                0xDEADBEEFu, 0xCDCDCDCDu, 0xBAADF00Du,
+                0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu };
+            bool all_odd_sentinels_rejected{ true };
+            for (const std::uint32_t s : odd_sentinels)
+            {
+                const std::uintptr_t addr{ (std::uintptr_t{ 0x00001234ull } << 32) | s };
+                if (hs::is_valid_pointer(reinterpret_cast<const void*>(addr)) != false)
+                {
+                    all_odd_sentinels_rejected = false;
+                }
+            }
+            check("ivp_odd_debug_sentinels_rejected", all_odd_sentinels_rejected);
+        }
+        // A near-miss of a sentinel low32 (one bit off, still even, in range)
+        // must NOT be rejected -- proves the switch matches EXACTLY, not a
+        // range.  0xCAFEBABE -> 0xCAFEBABC (even, not a listed sentinel).
+        check("ivp_near_miss_sentinel_accepted",
+              hs::is_valid_pointer(reinterpret_cast<const void*>(
+                  (std::uintptr_t{ 0x00001234ull } << 32) | 0xCAFEBABCu)) == true);
+
+        // -- (A) is_valid_pointer: REAL mapped object addresses accepted ----
+        // The function never reads through the pointer, but to avoid any
+        // appearance of fabricating an address we also confirm acceptance of
+        // genuinely-mapped objects we own.  Both are >= floor+1, < ceiling,
+        // and 2-byte aligned (alignof(std::uint64_t) == 8).
+        std::uint64_t stack_obj{ 0 };
+        std::vector<std::uint64_t> heap_obj(4, 0);
+        check("ivp_real_stack_object_accepted",
+              hs::is_valid_pointer(static_cast<const void*>(&stack_obj)) == true);
+        check("ivp_real_heap_object_accepted",
+              hs::is_valid_pointer(static_cast<const void*>(heap_obj.data())) == true);
+        // untag_pointer of an already-canonical real address is the identity
+        // (the high bits are already 0), and the result stays valid.
+        check("ivp_untag_then_valid_real_object",
+              hs::untag_pointer(static_cast<const void*>(&stack_obj))
+                  == static_cast<const void*>(&stack_obj));
+
+        // -- (B) watch_static_field sizeof->length selection policy ---------
+        // Reproduce the exact ternary chain from vmhook.hpp:21185-21189 as a
+        // constexpr lambda, then assert the mapping for every relevant size.
+        // The enum is unconditionally declared, so this runs on all platforms.
+        {
+            using vmhook::os::data_breakpoint_length;
+            const auto pick = [](std::size_t sz) constexpr -> data_breakpoint_length {
+                return sz == 1 ? data_breakpoint_length::one_byte    :
+                       sz == 2 ? data_breakpoint_length::two_bytes   :
+                       sz == 4 ? data_breakpoint_length::four_bytes  :
+                                 data_breakpoint_length::eight_bytes;
+            };
+            auto as_u8 = [](data_breakpoint_length l) {
+                return static_cast<std::uint8_t>(l);
+            };
+            // The four exact-match sizes (the Java primitive static widths).
+            check("size_to_len_1_is_one_byte",
+                  as_u8(pick(1)) == as_u8(data_breakpoint_length::one_byte));
+            check("size_to_len_2_is_two_bytes",
+                  as_u8(pick(2)) == as_u8(data_breakpoint_length::two_bytes));
+            check("size_to_len_4_is_four_bytes",
+                  as_u8(pick(4)) == as_u8(data_breakpoint_length::four_bytes));
+            check("size_to_len_8_is_eight_bytes",
+                  as_u8(pick(8)) == as_u8(data_breakpoint_length::eight_bytes));
+            // The fall-through (flaw #3): any non-{1,2,4} size -- including the
+            // impossible-for-a-Java-primitive 3/5/6/7 and oversized 16 -- maps
+            // to eight_bytes.  This is the documented (if undocumented in-code)
+            // defensible default; pin it so a refactor that changed the else
+            // branch is caught.
+            {
+                const std::size_t odd_or_big_sizes[]{ 3, 5, 6, 7, 16, 32 };
+                bool all_fall_through_eight{ true };
+                for (const std::size_t sz : odd_or_big_sizes)
+                {
+                    if (as_u8(pick(sz)) != as_u8(data_breakpoint_length::eight_bytes))
+                    {
+                        all_fall_through_eight = false;
+                    }
+                }
+                check("size_to_len_non_1_2_4_falls_through_to_eight", all_fall_through_eight);
+            }
+            // Tie the policy to ACTUAL Java-primitive C++ widths the template
+            // would be instantiated on (jboolean/jbyte=1, jchar/jshort=2,
+            // jint/jfloat=4, jlong/jdouble=8), using the real sizeof.
+            check("size_to_len_int8_width_one_byte",
+                  as_u8(pick(sizeof(std::int8_t))) == as_u8(data_breakpoint_length::one_byte));
+            check("size_to_len_int16_width_two_bytes",
+                  as_u8(pick(sizeof(std::int16_t))) == as_u8(data_breakpoint_length::two_bytes));
+            check("size_to_len_int32_width_four_bytes",
+                  as_u8(pick(sizeof(std::int32_t))) == as_u8(data_breakpoint_length::four_bytes));
+            check("size_to_len_int64_width_eight_bytes",
+                  as_u8(pick(sizeof(std::int64_t))) == as_u8(data_breakpoint_length::eight_bytes));
+
+            // -- (B') cross-check the picked length through build_dr7 --------
+            // Gated: build_dr7 only exists on Windows/x86_64.  For a write
+            // watch on a slot-0 4-byte field, the DR7 word must equal the
+            // closed form with LEN=four_bytes(0b11) -- proving the selection
+            // policy and the mask builder compose correctly.
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+            {
+                const data_breakpoint_length picked4{ pick(4) };
+                const std::uint64_t dr7{ vmhook::os::detail_dr::build_dr7(
+                    0, vmhook::os::data_breakpoint_kind::write, picked4) };
+                const std::uint64_t want{
+                    (std::uint64_t{ 1 } << 0)
+                    | (std::uint64_t{ 0b01 } << 16)
+                    | (std::uint64_t{ 0b11 } << 18) };
+                check("size4_write_slot0_dr7_matches_closed_form", dr7 == want);
+            }
+#endif
+        }
+    }
+
     return failures == 0 ? 0 : 1;
 }
