@@ -606,7 +606,62 @@ namespace
                           std::string{ "e\xCC\x81\xF0\x9F\x98\x80" },
                           std::string{ "e\xCC\x81\xF0\x9F\x98\x80" } });
 
+        // ── EXHAUSTIVE additions, wave 4 (mjs4_*): two well-formed content
+        //    classes the prior waves never isolated — a LEGITIMATE U+FFFD in the
+        //    input, and the Unicode BOM as ordinary content.  Both are valid UTF-8
+        //    (expected == input), and both are subtle because a naive decoder might
+        //    treat them specially. ──
+
+        // GENUINE U+FFFD (EF BF BD) supplied as well-formed input.  This is the
+        // SAME 3 bytes the malformed_* cases produce as a SUBSTITUTION, but here it
+        // arrives as legitimate input and must round-trip as itself — proving the
+        // decoder does NOT double-substitute or otherwise mangle a real replacement
+        // character.  One UTF16 unit (> 0xFF), 3 UTF-8 bytes back, byte-exact.
+        cases.push_back({ "replacement_char_literal_UFFFD",
+                          std::string{ "\xEF\xBF\xBD" }, std::string{ "\xEF\xBF\xBD" } });
+        // BYTE ORDER MARK U+FEFF (EF BB BF) as ORDINARY content (not a stream BOM).
+        // A made String must preserve it verbatim — it is a single zero-width code
+        // unit > 0xFF (UTF16 coder), NOT stripped, NOT normalised.  1 unit, 3 UTF-8
+        // bytes back, byte-exact.
+        cases.push_back({ "byte_order_mark_UFEFF",
+                          std::string{ "\xEF\xBB\xBF" }, std::string{ "\xEF\xBB\xBF" } });
+
         return cases;
+    }
+
+    // Independent UTF-8 byte-length oracle, used ONLY for body-side cross-checks:
+    // re-encodes the UTF-16 code units the library's own decoder
+    // (vmhook::detail::utf8_to_utf16) produces from `utf8` back into standard UTF-8
+    // (recombining surrogate pairs) and returns that byte count.  This is a
+    // SECOND, structurally-different oracle from cases[i].expected.size(): it is
+    // derived from the library's decode of the input rather than from the
+    // hard-coded expected literal, so agreement between the two cross-validates
+    // that the decoder, the expected literals, and the readback all describe the
+    // same string.  Pure native arithmetic over owned std::string/std::vector — no
+    // oop deref, no fabricated address.
+    auto utf16_units_to_utf8_byte_length(const std::string& utf8) -> std::size_t
+    {
+        const std::vector<std::uint16_t> units{ vmhook::detail::utf8_to_utf16(utf8) };
+        std::string reencoded;
+        for (std::size_t i{ 0 }; i < units.size(); ++i)
+        {
+            const std::uint16_t u{ units[i] };
+            if (u >= 0xD800u && u <= 0xDBFFu
+                && (i + 1) < units.size()
+                && units[i + 1] >= 0xDC00u && units[i + 1] <= 0xDFFFu)
+            {
+                const std::uint32_t cp{ 0x10000u
+                    + ((static_cast<std::uint32_t>(u) - 0xD800u) << 10)
+                    + (static_cast<std::uint32_t>(units[i + 1]) - 0xDC00u) };
+                append_utf8(reencoded, cp);
+                ++i;  // consumed the low surrogate
+            }
+            else
+            {
+                append_utf8(reencoded, static_cast<std::uint32_t>(u));
+            }
+        }
+        return reencoded.size();
     }
 
     // The lone-surrogate / over-cap cases are handled separately:
@@ -1614,6 +1669,45 @@ namespace
                 gate("mjs3_combining_plus_astral_roundtrips_7byte", g_rt_valid[i].load(),
                      g_rt_decoded_len[i].load() == 7 && g_rt_byte_exact[i].load());
             }
+            // ── EXHAUSTIVE wave-4 named property gates (mjs4_*). ──
+            else if (cases[i].label == "replacement_char_literal_UFFFD")
+            {
+                // A LEGITIMATE U+FFFD in the input: 1 unit, 3 UTF-8 bytes back,
+                // byte-exact — NOT double-substituted by the decoder.
+                gate("mjs4_replacement_char_literal_roundtrips_3byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 3 && g_rt_byte_exact[i].load());
+            }
+            else if (cases[i].label == "byte_order_mark_UFEFF")
+            {
+                // U+FEFF BOM as ordinary content: 1 unit, 3 UTF-8 bytes back,
+                // byte-exact — preserved verbatim, not stripped/normalised.
+                gate("mjs4_byte_order_mark_roundtrips_3byte", g_rt_valid[i].load(),
+                     g_rt_decoded_len[i].load() == 3 && g_rt_byte_exact[i].load());
+            }
+        }
+
+        // ── EXHAUSTIVE wave-4 body-side cross-checks: an INDEPENDENT byte-length
+        //    oracle over the SAME wide battery.  For every case whose made oop is
+        //    valid, the readback byte length (g_rt_decoded_len[i]) must equal the
+        //    length obtained by re-encoding the library decoder's UTF-16 units back
+        //    to UTF-8 (utf16_units_to_utf8_byte_length) — a second oracle derived
+        //    from the decode rather than the hard-coded expected literal.  This
+        //    cross-validates decoder, expected literal and readback against each
+        //    other in one pass; a divergence between any two reds CI.  Pure native
+        //    arithmetic over owned strings — no oop deref, no fabricated address.
+        //    Each check is uniquely named so a single-case regression is pinpointed.
+        for (std::size_t i{ 0 }; i < n && i < cases.size(); ++i)
+        {
+            const int rt_len{ g_rt_decoded_len[i].load() };
+            const int oracle_len{ static_cast<int>(utf16_units_to_utf8_byte_length(cases[i].input)) };
+            // The two oracles (decode-derived re-encode vs hard-coded expected) must
+            // ALSO agree with each other — a pure native invariant that holds on
+            // every JVM regardless of whether the made oop succeeded.
+            ctx.check(std::string{ "mjs4_oracle_matches_expected_len_" } + cases[i].label,
+                      oracle_len == static_cast<int>(cases[i].expected.size()));
+            // Where the make succeeded, the live readback must match the oracle too.
+            gate(std::string{ "mjs4_readback_matches_reencode_oracle_" } + cases[i].label,
+                 g_rt_valid[i].load(), rt_len == oracle_len);
         }
 
         // Lone surrogate: characterise the ACTUAL read-back (never forced).  The
@@ -1913,6 +2007,69 @@ namespace
             {
                 ctx.check("mjs_over_cap_100000_full_length_java",
                           mjs::get_int(ccf_len[7]) == 100000 && mjs::get_bool(ccf_null[7]) == false);
+            }
+
+            // ── EXHAUSTIVE wave-4 cross-surface AGREEMENT: the content-check
+            //    (call()) path and the canonical echo path BOTH observe the three
+            //    non-empty canonical strings (cc slots 0/1/2 == hello/cafe/cjk,
+            //    echo indices 0/1/2).  Where BOTH ran and saw a non-null equal
+            //    String, the length each independently reported MUST agree (and
+            //    equal the canonical length).  This cross-validates two distinct
+            //    make_java_string -> call() vehicles against each other, not just
+            //    each against a native expectation.  Gated on both having run +
+            //    matched, so a JDK-8 null or a call-path miss only [INFO]s. ──
+            for (std::size_t i{ 0 }; i < 3 && i < ncc; ++i)
+            {
+                const bool cc_ran{ g_cc_call_returned[i].load() && mjs::get_bool(ccf_called[i])
+                                   && mjs::get_bool(ccf_null[i]) == false };
+                const bool echo_ran{ g_echo_call_returned[i].load() && mjs::get_bool(efield_called[i])
+                                     && mjs::get_bool(efield_null[i]) == false };
+                const std::int32_t cc_len{ mjs::get_int(ccf_len[i]) };
+                const std::int32_t echo_len{ mjs::get_int(efield_len[i]) };
+                if (cc_ran && echo_ran)
+                {
+                    // The two independent call() surfaces agree on the length AND it
+                    // is the canonical length — a usable-String cross-check.
+                    ctx.check(std::string{ "mjs4_cc_vs_echo_length_agree_" } + k_canon_tag[i],
+                              cc_len == echo_len && cc_len == k_canon_len[i]);
+                }
+                else
+                {
+                    ctx.record(std::string{ "[INFO] mjs4_cc_vs_echo_length_agree_" } + k_canon_tag[i]
+                               + ": SKIPPED - one of the two call() surfaces did not run/observe a "
+                                 "non-null String this run (JDK-8 null or call-path miss); cc_len="
+                               + std::to_string(cc_len) + " echo_len=" + std::to_string(echo_len) + ".");
+                }
+            }
+
+            // ── EXHAUSTIVE wave-4 native<->Java length bridge for the three
+            //    non-empty canonical strings (cc slots 0/1/2).  The native readback
+            //    byte length is fixed and known per string (hello=5, cafe=5 [4 chars,
+            //    the U+00E9 is 2 UTF-8 bytes], cjk=6 [2 chars * 3 bytes]); the Java
+            //    char length is the canonical length.  Cross-check both against the
+            //    canonical native rt_case readback already captured, proving the
+            //    native byte length and the Java char length describe the same
+            //    string from two sides.  The canonical rt_cases are indices 0..3 of
+            //    build_rt_cases(), so g_rt_decoded_len[i] is the native byte length. ──
+            {
+                const std::array<int, 3> exp_native_bytes{ 5, 5, 6 };  // hello / cafe / cjk UTF-8 byte counts
+                for (std::size_t i{ 0 }; i < 3; ++i)
+                {
+                    // The native rt_case at the same index is the same canonical
+                    // string (build_rt_cases pushes hello/cafe/cjk/empty first).
+                    gate(std::string{ "mjs4_canon_native_byte_length_" } + k_canon_tag[i],
+                         g_rt_valid[i].load(),
+                         g_rt_decoded_len[i].load() == exp_native_bytes[i]);
+                    // And the Java content-check char length is the canonical length
+                    // (a different count for cafe/cjk than the native byte count —
+                    // proving the two views are consistent yet distinct).
+                    const bool cc_ran{ g_cc_call_returned[i].load() && mjs::get_bool(ccf_called[i]) };
+                    if (cc_ran)
+                    {
+                        ctx.check(std::string{ "mjs4_canon_java_char_length_" } + k_canon_tag[i],
+                                  mjs::get_int(ccf_len[i]) == k_canon_len[i]);
+                    }
+                }
             }
         }
 

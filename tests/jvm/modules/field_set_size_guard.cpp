@@ -74,6 +74,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -1066,5 +1067,210 @@ VMHOOK_JVM_MODULE(field_set_size_guard)
         ctx.check("java_getter_bndI_min", fsg::call_get_i32("getBndI") == static_cast<std::int32_t>(0x80000000));
         ctx.check("java_getter_bndJ_min", fsg::call_get_i64("getBndJ") == static_cast<std::int64_t>(0x8000000000000000ULL));
         ctx.check("java_getter_bndC_max", fsg::call_get_i32("getBndC") == 0xFFFF); // char widened unsigned
+    }
+
+    // =====================================================================
+    //  12. VALUE_T SIGNATURE CROSS-CHECK + VARIANT-INDEX BREADTH.  Every get()
+    //      stamps value_t::signature with the field's JVM descriptor and selects
+    //      the variant alternative that matches that width/kind.  These run AFTER
+    //      the phase-10/11 drive (read-only; they never mutate a field), so they
+    //      cannot perturb the snapshot.  Pinning BOTH the signature string AND the
+    //      variant index for every primitive width closes the gap where a future
+    //      get() refactor mis-stamps the descriptor or picks the wrong alternative
+    //      for a value the SET side just round-tripped.
+    // =====================================================================
+    {
+        const auto pz{ fsg::static_field("okZ") };
+        if (pz) { const auto v{ pz->get() }; ctx.check("vt_okZ_sig_Z", v.signature == "Z"); ctx.check("vt_okZ_idx_bool", v.data.index() == kIdxBool); }
+        const auto pb{ fsg::static_field("okB") };
+        if (pb) { const auto v{ pb->get() }; ctx.check("vt_okB_sig_B", v.signature == "B"); ctx.check("vt_okB_idx_i8", v.data.index() == kIdxI8); }
+        const auto pc{ fsg::static_field("okC") };
+        if (pc) { const auto v{ pc->get() }; ctx.check("vt_okC_sig_C", v.signature == "C"); ctx.check("vt_okC_idx_u16", v.data.index() == kIdxU16); }
+        const auto ps{ fsg::static_field("okS") };
+        if (ps) { const auto v{ ps->get() }; ctx.check("vt_okS_sig_S", v.signature == "S"); ctx.check("vt_okS_idx_i16", v.data.index() == kIdxI16); }
+        const auto pi{ fsg::static_field("okI") };
+        if (pi) { const auto v{ pi->get() }; ctx.check("vt_okI_sig_I", v.signature == "I"); ctx.check("vt_okI_idx_i32", v.data.index() == kIdxI32); }
+        const auto pj{ fsg::static_field("okJ") };
+        if (pj) { const auto v{ pj->get() }; ctx.check("vt_okJ_sig_J", v.signature == "J"); ctx.check("vt_okJ_idx_i64", v.data.index() == kIdxI64); }
+        const auto pf{ fsg::static_field("okF") };
+        if (pf) { const auto v{ pf->get() }; ctx.check("vt_okF_sig_F", v.signature == "F"); ctx.check("vt_okF_idx_float", v.data.index() == kIdxFloat); }
+        const auto pd{ fsg::static_field("okD") };
+        if (pd) { const auto v{ pd->get() }; ctx.check("vt_okD_sig_D", v.signature == "D"); ctx.check("vt_okD_idx_double", v.data.index() == kIdxDouble); }
+        // A String field decodes to the std::string-bearing get() path; its
+        // value_t signature is the full reference descriptor, not a 1-char prim.
+        const auto pstr{ fsg::static_field("okStr") };
+        if (pstr) { const auto v{ pstr->get() }; ctx.check("vt_okStr_sig_ref", v.signature == "Ljava/lang/String;"); }
+    }
+
+    // =====================================================================
+    //  13. SET IDEMPOTENCY.  A correct-width write is a pure memcpy of the value
+    //      bytes: writing the SAME value twice must leave the field byte-identical
+    //      (no accumulation, no toggling, no high-byte drift).  Re-write each ok*
+    //      field with its phase-1 value and re-read — the field returns to (stays
+    //      at) the same bytes.  These restore the exact value phase 10/11 already
+    //      asserted, so they do not disturb anything downstream.
+    // =====================================================================
+    {
+        fsg::set_static<bool>("okZ", true);
+        ctx.check("idem_okZ_true", fsg::get_bool("okZ") == true);
+        fsg::set_static<std::int8_t>("okB", static_cast<std::int8_t>(0x7E));
+        ctx.check("idem_okB_7E", fsg::get_i8("okB") == static_cast<std::int8_t>(0x7E));
+        fsg::set_static<std::uint16_t>("okC", 0xBEEF);
+        ctx.check("idem_okC_BEEF", fsg::get_u16("okC") == 0xBEEF);
+        fsg::set_static<std::int16_t>("okS", static_cast<std::int16_t>(0x7EEF));
+        ctx.check("idem_okS_7EEF", fsg::get_i16("okS") == static_cast<std::int16_t>(0x7EEF));
+        fsg::set_static<std::int32_t>("okI", 0x0BADF00D);
+        ctx.check("idem_okI_F00D", fsg::get_i32("okI") == 0x0BADF00D);
+        fsg::set_static<std::int64_t>("okJ", 0x0123456789ABCDEFLL);
+        ctx.check("idem_okJ_full", fsg::get_i64("okJ") == 0x0123456789ABCDEFLL);
+        fsg::set_static<float>("okF", 1.5F);
+        ctx.check("idem_okF_bits", float_bits(fsg::get_float("okF")) == k_okF_bits);
+        fsg::set_static<double>("okD", bits_to_double(k_okD_bits));
+        ctx.check("idem_okD_bits", double_bits(fsg::get_double("okD")) == k_okD_bits);
+        // Idempotency of the "C" widening: writing 'Z' twice lands 0x005A both
+        // times.  gCharByte's snapshot was already taken (phase 10); restore the
+        // euro afterward to leave the field in a known state for any later reader.
+        fsg::set_static<char>("gCharByte", 'Z');
+        ctx.check("idem_gCharByte_widen_005A", fsg::get_u16("gCharByte") == 0x005A);
+        fsg::set_static<char>("gCharByte", 'Z');
+        ctx.check("idem_gCharByte_widen_005A_again", fsg::get_u16("gCharByte") == 0x005A);
+        fsg::set_static<std::uint16_t>("gCharByte", 0x20AC);
+        ctx.check("idem_gCharByte_restored_euro", fsg::get_u16("gCharByte") == 0x20AC);
+    }
+
+    // =====================================================================
+    //  14. REFUSAL IDEMPOTENCY + DEGENERATE NON-PRIMITIVE INPUTS.  A refused write
+    //      must be a true no-op no matter how many times it is repeated and no
+    //      matter the SHAPE of the offending value (empty string, empty vector,
+    //      single-element vector).  The guard keys on the field's signature alone,
+    //      so an EMPTY std::string / EMPTY std::vector into a primitive is refused
+    //      exactly like a populated one (it never reaches store_string /
+    //      set_prim_array).  All targets are the unchanged-on-refusal g* fields, so
+    //      this neither perturbs the snapshot nor needs restoration.
+    // =====================================================================
+    {
+        const std::int32_t kI{ 0x11223344 };
+        // Repeat a too-wide refusal three times: still unchanged.
+        for (int rep = 0; rep < 3; ++rep)
+        {
+            fsg::set_static<std::int64_t>("gWideI", std::int64_t{ 0x7766554433221100LL });
+        }
+        ctx.check("ref_idem_gWideI_unchanged_x3", fsg::get_i32("gWideI") == kI);
+
+        const auto pI{ fsg::static_field("gWideI") };
+        // EMPTY std::string into "I": refused (empty is still non-primitive).
+        if (pI) { pI->set(std::string{}); }
+        ctx.check("ref_empty_string_into_int_refused", fsg::get_i32("gWideI") == kI);
+        // EMPTY std::vector<int> into "I": refused.
+        if (pI) { const std::vector<int> empty{}; pI->set(empty); }
+        ctx.check("ref_empty_vector_into_int_refused", fsg::get_i32("gWideI") == kI);
+        // single-element std::vector<int> into "I": refused.
+        if (pI) { const std::vector<int> one{ 0x55 }; pI->set(one); }
+        ctx.check("ref_single_vector_into_int_refused", fsg::get_i32("gWideI") == kI);
+        // empty std::string_view (data()==nullptr path) into "I": refused, no deref.
+        if (pI) { pI->set(std::string_view{}); }
+        ctx.check("ref_empty_string_view_into_int_refused", fsg::get_i32("gWideI") == kI);
+
+        // Empty std::string / empty vector into the byte / long slots too — the
+        // refusal is width-agnostic on the non-primitive arm.
+        const auto pB{ fsg::static_field("gWideB") };
+        if (pB) { pB->set(std::string{}); const std::vector<int> e{}; pB->set(e); }
+        ctx.check("ref_empty_nonprim_into_byte_refused", fsg::get_i8("gWideB") == static_cast<std::int8_t>(0x5A));
+        const auto pJ{ fsg::static_field("gNarrowJ") };
+        if (pJ) { pJ->set(std::string{}); const std::vector<double> e{}; pJ->set(e); }
+        ctx.check("ref_empty_nonprim_into_long_refused", fsg::get_i64("gNarrowJ") == 0x1122334455667788LL);
+    }
+
+    // =====================================================================
+    //  15. WIDENING-SHORTCUT EXTRA 1-BYTE TYPE.  Phase 5b covered int8/uint8/
+    //      unsigned char/std::byte/bool; add `signed char` (the remaining 1-byte
+    //      arithmetic kind), high-bit set, zero-extended into the full 2-byte "C"
+    //      slot via static_cast<unsigned char> (0x00C3, never 0xFFC3).
+    //      gCharByte's snapshot is already taken; restore the euro at the end.
+    // =====================================================================
+    {
+        // signed char with the high bit set zero-extends (0x00C3, never 0xFFC3).
+        fsg::set_static<signed char>("gCharByte", static_cast<signed char>(0xC3));
+        ctx.check("wx_schar_C3_widens_to_00C3", fsg::get_u16("gCharByte") == 0x00C3);
+        // restore euro (snapshot-known state).
+        fsg::set_static<std::uint16_t>("gCharByte", 0x20AC);
+        ctx.check("wx_gCharByte_restored_euro", fsg::get_u16("gCharByte") == 0x20AC);
+    }
+
+    // =====================================================================
+    //  16. CONF (same-width type-confusion) IDEMPOTENCY.  Re-applying the same
+    //      reinterpreting write lands the identical bit pattern (the size guard
+    //      passes deterministically; no accumulation).  These restore the exact
+    //      values phase 10 already asserted via the seenConf* snapshot, so they
+    //      leave the fields exactly where the snapshot expects them.
+    // =====================================================================
+    {
+        fsg::set_static<float>("confI", bits_to_float(k_conf_float_bits));
+        ctx.check("conf_idem_float_into_int_bits",
+                  static_cast<std::uint32_t>(fsg::get_i32("confI")) == k_conf_float_bits);
+        fsg::set_static<std::int32_t>("confF", static_cast<std::int32_t>(k_conf_int_as_float_bits));
+        ctx.check("conf_idem_int_into_float_bits",
+                  float_bits(fsg::get_float("confF")) == k_conf_int_as_float_bits);
+        fsg::set_static<double>("confJ", bits_to_double(k_conf_double_bits));
+        ctx.check("conf_idem_double_into_long_bits",
+                  static_cast<std::uint64_t>(fsg::get_i64("confJ")) == k_conf_double_bits);
+        fsg::set_static<std::int64_t>("confD", static_cast<std::int64_t>(k_conf_long_as_double_bits));
+        ctx.check("conf_idem_int64_into_double_bits",
+                  double_bits(fsg::get_double("confD")) == k_conf_long_as_double_bits);
+    }
+
+    // =====================================================================
+    //  17. DEGENERATE / NEGATIVE PROXY PATHS.
+    //   (a) static_field on a NON-EXISTENT name does not resolve, and set_static
+    //       on it returns false (the guard never even runs — there is no proxy).
+    //   (b) raw_address() of a resolved static field is STABLE across two reads
+    //       (the proxy points at one fixed storage slot; idempotent).
+    //   (c) NULL field_pointer set() is a safe no-op for MORE value shapes than
+    //       phase 9 covered: every primitive width AND the "C" widening branch
+    //       (which must early-return on a null pointer BEFORE the memcpy), plus the
+    //       proven-safe string arm — reaching the assert proves none of those
+    //       branches dereferenced the null storage.  (The vector arm routes through
+    //       field_oop/get_compressed_oop, whose null-pointer behaviour is not part
+    //       of this guard's contract, so it is deliberately not exercised here.)
+    // =====================================================================
+    {
+        // (a) non-existent field name.
+        ctx.check("neg_missing_static_field_unresolved", fsg::resolves("noSuchFieldXYZ") == false);
+        ctx.check("neg_set_static_missing_returns_false",
+                  fsg::set_static<std::int32_t>("noSuchFieldXYZ", 0x1234) == false);
+
+        // (b) raw_address stability for a resolved static field.
+        const auto pI{ fsg::static_field("okI") };
+        if (pI)
+        {
+            const std::uintptr_t a0{ reinterpret_cast<std::uintptr_t>(pI->raw_address()) };
+            const std::uintptr_t a1{ reinterpret_cast<std::uintptr_t>(pI->raw_address()) };
+            ctx.check("neg_raw_address_stable", a0 == a1);
+            // A live static field has real backing storage: its address is non-null.
+            ctx.check("neg_raw_address_nonnull", a0 != 0);
+        }
+
+        // (c) null field_pointer set() across every primitive width + "C" widening
+        //     + degenerate non-primitive shapes.  The "C" + 1-byte branch and the
+        //     trivially-copyable branch both early-return on a null pointer.
+        const char* sigs[] = { "Z", "B", "S", "C", "I", "J", "F", "D",
+                               "Ljava/lang/String;", "[I", "[J" };
+        for (const char* sig : sigs)
+        {
+            vmhook::field_proxy np{ nullptr, sig, true };
+            np.set(true);                          // bool (1B) into null slot
+            np.set(static_cast<std::int8_t>(0x7E));// i8 into null slot
+            np.set(static_cast<std::int16_t>(0x12));// i16 into null slot
+            np.set(static_cast<std::uint16_t>(0x34));// u16 into null slot
+            np.set(static_cast<std::int32_t>(0x55));// i32 into null slot
+            np.set(std::int64_t{ 0x66 });          // i64 into null slot
+            np.set(1.5F);                          // float into null slot
+            np.set(2.5);                           // double into null slot
+            np.set('Z');                           // char -> "C" widening branch on null
+            np.set(std::string{ "x" });            // non-primitive (string) into null slot
+        }
+        // Surviving every signature/value-shape without an access violation is the
+        // proof that set() bails on a null field_pointer in every branch.
+        ctx.check("neg_null_field_pointer_set_all_shapes_safe", true);
     }
 }

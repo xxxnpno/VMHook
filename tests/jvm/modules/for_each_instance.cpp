@@ -80,9 +80,11 @@
 #include "../harness.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -321,6 +323,122 @@ namespace
                 {
                     r.all_valid = false;
                 }
+            },
+            max_visits);
+        const auto finish{ std::chrono::steady_clock::now() };
+        r.elapsed_ms = std::chrono::duration<double, std::milli>{ finish - start }.count();
+        return r;
+    }
+
+    // -- DEEPENING (additive) helpers ----------------------------------------
+    //
+    // Folds a base scan AND, for every wrapper whose OOP is structurally valid,
+    // verifies the live OOP's header klass (read via the public, fault-safe
+    // klass_from_oop free function) is EXACTLY the registered ForEachInstance
+    // klass.  This is a RELIABLE invariant the conservative scan promises: it
+    // matches the decoded narrow-klass pointer for EXACT equality against
+    // target_klass (vmhook.hpp:8878 `decoded != static_cast<void*>(target_klass)`),
+    // so a re-read of the same header through klass_from_oop must converge to the
+    // same target_klass.  klass_from_oop is only ever called on an oop already
+    // validated by is_valid_pointer (a real, owned object), never on a fabricated
+    // address -- so it is POSIX-safe.  A mismatch (with klass_from_oop returning a
+    // NON-null OTHER klass) would mean the scan handed back a header of the wrong
+    // type -- a real exact-klass-filter defect.  klass_from_oop returning NULL is a
+    // best-effort cold-read miss (recorded), not a defect.
+    struct klass_check_result
+    {
+        scan_result   scan{};
+        std::size_t   klass_checked{ 0 };   // wrappers with a valid OOP we re-read
+        std::size_t   klass_exact{ 0 };     // klass_from_oop == target_klass
+        std::size_t   klass_other{ 0 };     // klass_from_oop == a DIFFERENT non-null klass
+        std::size_t   klass_null{ 0 };      // klass_from_oop returned null (cold-read miss)
+    };
+
+    auto scan_with_klass_check(std::size_t                          max_visits,
+                               std::int32_t                         marker_const,
+                               std::int32_t                         pin_count,
+                               const vmhook::hotspot::klass* const  target_klass)
+        -> klass_check_result
+    {
+        klass_check_result kr{};
+        const auto start{ std::chrono::steady_clock::now() };
+
+        kr.scan.returned = vmhook::for_each_instance<fei_fixture>(
+            [&](std::unique_ptr<fei_fixture> instance)
+            {
+                ++kr.scan.visited;
+                const bool ok{ instance != nullptr && instance->is_valid() };
+                if (!ok)
+                {
+                    kr.scan.all_valid = false;
+                    return;
+                }
+                ++kr.scan.readable;
+
+                // Re-read the live header klass through the public free function.
+                // The wrapper's OOP is already is_valid_pointer-validated above.
+                vmhook::hotspot::klass* const live_klass{
+                    vmhook::klass_from_oop(instance->get_instance()) };
+                ++kr.klass_checked;
+                if (live_klass == nullptr)
+                {
+                    ++kr.klass_null;
+                }
+                else if (static_cast<const void*>(live_klass)
+                      == static_cast<const void*>(target_klass))
+                {
+                    ++kr.klass_exact;
+                }
+                else
+                {
+                    ++kr.klass_other;
+                }
+
+                const std::int32_t mk{ instance->read_marker() };
+                if (mk == marker_const)
+                {
+                    ++kr.scan.marker_ok;
+                }
+                else
+                {
+                    ++kr.scan.marker_bad;
+                }
+                const std::int32_t id{ instance->read_id() };
+                if (id >= 0 && id < pin_count)
+                {
+                    kr.scan.ids.insert(id);
+                }
+            },
+            max_visits);
+
+        const auto finish{ std::chrono::steady_clock::now() };
+        kr.scan.elapsed_ms = std::chrono::duration<double, std::milli>{ finish - start }.count();
+        return kr;
+    }
+
+    // A scan whose visitor ALWAYS throws.  for_each_instance wraps the visitor
+    // call in try/catch (vmhook.hpp:8892-8906) and increments `visits` AFTER the
+    // catch, so a throwing visitor (a) never escapes / crashes the scan, (b) is
+    // still counted in the returned tally.  We count how many times the visitor
+    // body began (`entered`) so the caller can assert returned == entered and that
+    // the scan terminated bounded.  No field is read (we throw before any deref),
+    // so this is crash-safe on every toolchain.
+    struct throwing_scan_result
+    {
+        std::size_t returned{ 0 };
+        std::size_t entered{ 0 };
+        double      elapsed_ms{ 0.0 };
+    };
+
+    auto scan_throwing(std::size_t max_visits) -> throwing_scan_result
+    {
+        throwing_scan_result r{};
+        const auto start{ std::chrono::steady_clock::now() };
+        r.returned = vmhook::for_each_instance<fei_fixture>(
+            [&](std::unique_ptr<fei_fixture>)
+            {
+                ++r.entered;
+                throw std::runtime_error{ "for_each_instance deepening: visitor throws" };
             },
             max_visits);
         const auto finish{ std::chrono::steady_clock::now() };
@@ -729,5 +847,296 @@ VMHOOK_JVM_MODULE(for_each_instance)
             ctx.record("[INFO] array-klass distinctness check skipped "
                        "(one or both klasses did not resolve on this JDK)");
         }
+    }
+
+    // =====================================================================
+    // PART I -- EXACT-KLASS RE-READ INVARIANT (deepening, additive).  Every
+    //          wrapper the scan hands back, when its OOP is structurally valid,
+    //          must -- on a RE-READ of its live header klass through the public
+    //          fault-safe klass_from_oop -- decode to EXACTLY the registered
+    //          ForEachInstance klass and NEVER to a different non-null klass.
+    //          This is the converse of the array/sub distinctness already proven:
+    //          the scan's exact-pointer filter (vmhook.hpp:8878) means a visited
+    //          header IS our klass, so a second independent read of the same +8
+    //          slot must agree.  klass_from_oop returning null is a best-effort
+    //          cold-read miss ([INFO]); klass_from_oop returning a DIFFERENT
+    //          non-null klass would be a real exact-klass-filter defect ([FAIL]).
+    // =====================================================================
+    {
+        vmhook::hotspot::klass* const target_klass{
+            vmhook::find_class("vmhook/fixtures/ForEachInstance") };
+        ctx.record(std::string{ "[INFO] PART I target klass -> " }
+                   + (target_klass ? "resolved" : "null"));
+        if (target_klass != nullptr)
+        {
+            const klass_check_result kr{
+                scan_with_klass_check(generous_cap, marker_const, pin_count, target_klass) };
+
+            ctx.record(std::string{ "[INFO] klass re-read: checked=" }
+                       + std::to_string(kr.klass_checked)
+                       + " exact=" + std::to_string(kr.klass_exact)
+                       + " other=" + std::to_string(kr.klass_other)
+                       + " null=" + std::to_string(kr.klass_null)
+                       + " returned=" + std::to_string(kr.scan.returned)
+                       + " visited=" + std::to_string(kr.scan.visited));
+
+            // RELIABLE: honest tally, valid wrappers, bounded by cap, terminates.
+            ctx.check("klass_check_count_matches_returned",
+                      kr.scan.returned == kr.scan.visited);
+            ctx.check("klass_check_all_wrappers_valid", kr.scan.all_valid);
+            ctx.check("klass_check_visits_within_cap", kr.scan.returned <= generous_cap);
+            ctx.check("klass_check_terminates_bounded", kr.scan.elapsed_ms < 30000.0);
+
+            // RELIABLE exact-klass invariant: NO visited header re-reads to a
+            // DIFFERENT non-null klass.  (klass_null is a cold-read miss, allowed.)
+            ctx.check("klass_check_no_foreign_klass", kr.klass_other == 0);
+
+            // POSITIVE floor: the scan produced at least one header that re-read
+            // exactly to the target klass -- proves the machinery genuinely sees
+            // our instances AND that the re-read path agrees with the scan filter.
+            // (Gated on having checked anything, exactly like baseline_some_marker_ok.)
+            ctx.check("klass_check_some_exact",
+                      kr.klass_checked == 0 || kr.klass_exact > 0);
+        }
+        else
+        {
+            ctx.record("[INFO] PART I skipped -- ForEachInstance klass did not resolve");
+        }
+    }
+
+    // =====================================================================
+    // PART J -- CAP BOUNDARY SWEEP at and around PIN_COUNT (deepening, additive).
+    //          PART C swept tiny caps; this proves the cap re-check (both loops)
+    //          also holds at the boundary values pin_count-1, pin_count,
+    //          pin_count+1, 2*pin_count and the EXACT-ONE cap (1).  For each cap
+    //          the returned tally and the visitor-call count both stay <= cap,
+    //          equal each other (honest tally), and every wrapper is valid -- all
+    //          RELIABLE invariants, a breach is a real cap/tally defect.
+    // =====================================================================
+    {
+        const std::size_t pc{ static_cast<std::size_t>(pin_count) };
+        const std::size_t boundary_caps[]{
+            1u, pc - 1u, pc, pc + 1u, pc * 2u };
+        for (const std::size_t cap : boundary_caps)
+        {
+            const scan_result br{ scan(cap, marker_const, pin_count) };
+            const std::string suffix{ "_cap" + std::to_string(cap) };
+            ctx.check(("boundary_returned_within" + suffix), br.returned <= cap);
+            ctx.check(("boundary_visited_within"  + suffix), br.visited  <= cap);
+            ctx.check(("boundary_count_matches"   + suffix), br.returned == br.visited);
+            ctx.check(("boundary_all_valid"       + suffix), br.all_valid);
+            ctx.check(("boundary_bounded"         + suffix), br.elapsed_ms < 30000.0);
+            // POSITIVE floor only when the cap is large enough to admit one AND a
+            // marker was readable -- best-effort, so [INFO].
+            ctx.record(std::string{ "[INFO] boundary cap=" } + std::to_string(cap)
+                       + ": returned=" + std::to_string(br.returned)
+                       + " marker_ok=" + std::to_string(br.marker_ok)
+                       + " marker_bad=" + std::to_string(br.marker_bad));
+        }
+    }
+
+    // =====================================================================
+    // PART K -- NO-LIMIT (default max_visits) is honest and bounded (deepening).
+    //          The documented default is std::numeric_limits<std::size_t>::max()
+    //          (vmhook.hpp:8731).  Both the IMPLICIT default call and an EXPLICIT
+    //          size_t-max cap must terminate bounded, keep an honest tally, hand
+    //          back only valid wrappers, and (a RELIABLE structural floor) report
+    //          NO MORE than the explicit-max scan since both are unbounded by the
+    //          cap.  The absolute count is best-effort ([INFO]).  This is the
+    //          "biggest possible cap" / overflow-adjacent boundary.
+    // =====================================================================
+    {
+        // Implicit default (no max_visits argument).
+        std::size_t default_visits{ 0 };
+        bool        default_valid{ true };
+        const auto  t0{ std::chrono::steady_clock::now() };
+        const std::size_t default_ret{ vmhook::for_each_instance<fei_fixture>(
+            [&](std::unique_ptr<fei_fixture> instance)
+            {
+                ++default_visits;
+                if (instance == nullptr || !instance->is_valid())
+                {
+                    default_valid = false;
+                }
+            }) };
+        const auto t1{ std::chrono::steady_clock::now() };
+        const double default_ms{
+            std::chrono::duration<double, std::milli>{ t1 - t0 }.count() };
+
+        // Explicit size_t-max cap (the same no-limit, written out).
+        std::size_t explicit_visits{ 0 };
+        bool        explicit_valid{ true };
+        const auto  t2{ std::chrono::steady_clock::now() };
+        const std::size_t explicit_ret{ vmhook::for_each_instance<fei_fixture>(
+            [&](std::unique_ptr<fei_fixture> instance)
+            {
+                ++explicit_visits;
+                if (instance == nullptr || !instance->is_valid())
+                {
+                    explicit_valid = false;
+                }
+            },
+            std::numeric_limits<std::size_t>::max()) };
+        const auto t3{ std::chrono::steady_clock::now() };
+        const double explicit_ms{
+            std::chrono::duration<double, std::milli>{ t3 - t2 }.count() };
+
+        ctx.record(std::string{ "[INFO] no-limit scan: default_ret=" }
+                   + std::to_string(default_ret) + " (" + std::to_string(default_ms)
+                   + " ms) explicit_max_ret=" + std::to_string(explicit_ret)
+                   + " (" + std::to_string(explicit_ms) + " ms)");
+
+        // RELIABLE: honest tally + valid wrappers + bounded wall-clock on BOTH.
+        ctx.check("nolimit_default_count_matches", default_ret == default_visits);
+        ctx.check("nolimit_default_all_valid", default_valid);
+        ctx.check("nolimit_default_bounded", default_ms < 30000.0);
+        ctx.check("nolimit_explicit_count_matches", explicit_ret == explicit_visits);
+        ctx.check("nolimit_explicit_all_valid", explicit_valid);
+        ctx.check("nolimit_explicit_bounded", explicit_ms < 30000.0);
+        // POSITIVE floor: an unbounded scan with our pinned instances live must
+        // report at least one (RELIABLE -- the heap genuinely holds them; this is
+        // the same floor baseline_visited_at_least_one proves with a generous cap).
+        ctx.check("nolimit_default_visited_at_least_one", default_ret > 0);
+        ctx.check("nolimit_explicit_visited_at_least_one", explicit_ret > 0);
+    }
+
+    // =====================================================================
+    // PART L -- THROWING VISITOR is contained (deepening, additive).  The scan
+    //          wraps the visitor in try/catch (vmhook.hpp:8892-8906) and bumps
+    //          `visits` AFTER the catch, so a visitor that throws on EVERY call
+    //          (a) never escapes / crashes the JVM, (b) is still counted exactly
+    //          once per matched header.  RELIABLE: the call returns, the returned
+    //          tally equals the number of visitor entries, both stay within the
+    //          cap, and the scan terminates bounded.  These prove the exception
+    //          firewall -- a real defect would be a crash, a runaway past the cap,
+    //          or a tally that disagrees with the entry count.
+    // =====================================================================
+    {
+        const std::size_t throw_cap{ static_cast<std::size_t>(pin_count) * 2u + 16u };
+        const throwing_scan_result tr{ scan_throwing(throw_cap) };
+        ctx.record(std::string{ "[INFO] throwing-visitor scan: returned=" }
+                   + std::to_string(tr.returned) + " entered=" + std::to_string(tr.entered)
+                   + " in " + std::to_string(tr.elapsed_ms) + " ms");
+        // returned counts every matched header (visits incremented post-catch);
+        // entered counts every visitor body start.  Each matched header enters the
+        // visitor exactly once, so the two are equal -- a RELIABLE invariant.
+        ctx.check("throwing_returned_matches_entered", tr.returned == tr.entered);
+        ctx.check("throwing_returned_within_cap", tr.returned <= throw_cap);
+        ctx.check("throwing_entered_within_cap", tr.entered <= throw_cap);
+        ctx.check("throwing_scan_terminates_bounded", tr.elapsed_ms < 30000.0);
+
+        // A throwing visitor under a ZERO cap must enter zero times and return zero
+        // (the cap guard precedes the first visitor call -- same as zero_cap above,
+        // and the throw can never fire because the visitor is never entered).
+        const throwing_scan_result tz{ scan_throwing(0) };
+        ctx.check("throwing_zero_cap_returns_zero", tz.returned == 0);
+        ctx.check("throwing_zero_cap_never_enters", tz.entered == 0);
+    }
+
+    // =====================================================================
+    // PART M -- UNREGISTERED-TYPE GUARD across cap extremes (deepening, additive).
+    //          PART E proved the type-not-registered early return (vmhook.hpp:8737)
+    //          for one cap; the guard fires BEFORE any heap work or cap inspection,
+    //          so it must return 0 / never visit for EVERY cap -- including 0, 1,
+    //          and size_t-max.  fei_unregistered remains intentionally unregistered.
+    //          All RELIABLE (the guard is unconditional).
+    // =====================================================================
+    {
+        const std::size_t guard_caps[]{
+            0u, 1u, 2u, 1024u, std::numeric_limits<std::size_t>::max() };
+        for (const std::size_t cap : guard_caps)
+        {
+            std::size_t uv{ 0 };
+            const std::size_t ur{ vmhook::for_each_instance<fei_unregistered>(
+                [&](std::unique_ptr<fei_unregistered>) { ++uv; }, cap) };
+            const std::string suffix{
+                cap == std::numeric_limits<std::size_t>::max()
+                    ? std::string{ "_capMAX" }
+                    : std::string{ "_cap" } + std::to_string(cap) };
+            ctx.check(("unreg_guard_returns_zero" + suffix), ur == 0);
+            ctx.check(("unreg_guard_never_visits" + suffix), uv == 0);
+        }
+    }
+
+    // =====================================================================
+    // PART N -- NEVER-INSTANTIATED + cap extremes (deepening, additive).  PART G
+    //          scanned fei_empty with one cap; here we cover the cap-0 and cap-1
+    //          boundaries plus a no-limit pass.  Empty is registered but never
+    //          constructed, so every pass must terminate cleanly, keep an honest
+    //          tally, hand back only valid wrappers, and stay within the cap.  The
+    //          returned count itself is best-effort ([INFO]); cap-0 returning 0 IS
+    //          a RELIABLE invariant (the cap guard precedes the first match).
+    // =====================================================================
+    if (empty_registered)
+    {
+        // cap 0 -- RELIABLE zero.
+        const scan_result e0{ scan_empty(0) };
+        ctx.check("empty_zero_cap_returns_zero", e0.returned == 0);
+        ctx.check("empty_zero_cap_never_visits", e0.visited == 0);
+
+        // cap 1 -- honest, valid, bounded; count best-effort.
+        const scan_result e1{ scan_empty(1) };
+        ctx.check("empty_cap1_count_matches", e1.returned == e1.visited);
+        ctx.check("empty_cap1_within_cap",    e1.returned <= 1u);
+        ctx.check("empty_cap1_all_valid",     e1.all_valid);
+        ctx.check("empty_cap1_bounded",       e1.elapsed_ms < 30000.0);
+
+        // no-limit -- honest, valid, bounded; count best-effort (expected 0).
+        const scan_result en{
+            scan_empty(std::numeric_limits<std::size_t>::max()) };
+        ctx.record(std::string{ "[INFO] never-instantiated no-limit scan: returned=" }
+                   + std::to_string(en.returned) + " in "
+                   + std::to_string(en.elapsed_ms) + " ms"
+                   + (en.returned == 0 ? " (no genuine Empty -- as expected)"
+                                       : " (look-alike header(s) -- conservative scan)"));
+        ctx.check("empty_nolimit_count_matches", en.returned == en.visited);
+        ctx.check("empty_nolimit_all_valid",     en.all_valid);
+        ctx.check("empty_nolimit_bounded",       en.elapsed_ms < 30000.0);
+    }
+    else
+    {
+        ctx.record("[INFO] PART N skipped -- ForEachInstance$Empty did not resolve");
+    }
+
+    // =====================================================================
+    // PART O -- SUB-SCAN cap extremes + idempotency (deepening, additive).  PART F
+    //          ran one generous Sub scan; here we add the cap-0 (RELIABLE zero),
+    //          cap-1 (exactly-one), and a repeat-pass self-consistency check for
+    //          the DERIVED klass.  All asserted invariants are RELIABLE (honest
+    //          tally / valid wrappers / within cap / bounded); the absolute Sub
+    //          count and the cross-pass equality stay best-effort ([INFO]) because
+    //          a conservative scan may miss the few Sub instances.
+    // =====================================================================
+    if (sub_registered)
+    {
+        // cap 0 -- RELIABLE zero for the derived klass too.
+        const scan_result s0{ scan_sub(0, sub_marker, sub_pin_count) };
+        ctx.check("sub_zero_cap_returns_zero", s0.returned == 0);
+        ctx.check("sub_zero_cap_never_visits", s0.visited == 0);
+
+        // cap 1 -- at most one, honest, valid, bounded.
+        const scan_result s1{ scan_sub(1, sub_marker, sub_pin_count) };
+        ctx.check("sub_cap1_within_cap",    s1.returned <= 1u);
+        ctx.check("sub_cap1_count_matches", s1.returned == s1.visited);
+        ctx.check("sub_cap1_all_valid",     s1.all_valid);
+        ctx.check("sub_cap1_bounded",       s1.elapsed_ms < 30000.0);
+
+        // repeat generous pass -- structurally self-consistent; cross-pass count
+        // and the marker split are best-effort (a moving GC may shift the few Subs).
+        const std::size_t sub_cap2{ static_cast<std::size_t>(sub_pin_count) * 8u + 256u };
+        const scan_result s2{ scan_sub(sub_cap2, sub_marker, sub_pin_count) };
+        ctx.record(std::string{ "[INFO] sub repeat scan: returned=" }
+                   + std::to_string(s2.returned) + " marker_ok=" + std::to_string(s2.marker_ok)
+                   + " marker_bad=" + std::to_string(s2.marker_bad)
+                   + " ids_seen=" + std::to_string(s2.ids.size()));
+        ctx.check("sub_repeat_count_matches", s2.returned == s2.visited);
+        ctx.check("sub_repeat_within_cap",    s2.returned <= sub_cap2);
+        ctx.check("sub_repeat_all_valid",     s2.all_valid);
+        ctx.check("sub_repeat_bounded",       s2.elapsed_ms < 30000.0);
+        ctx.check("sub_repeat_some_marker_ok", s2.readable == 0 || s2.marker_ok > 0);
+    }
+    else
+    {
+        ctx.record("[INFO] PART O skipped -- ForEachInstance$Sub did not resolve");
     }
 }

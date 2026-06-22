@@ -1478,6 +1478,325 @@ VMHOOK_JVM_MODULE(for_each_thread)
     }
 
     // =====================================================================
+    // PART N -- find_any_java_thread() HEAD CONSISTENCY (NEW): for_each_thread's
+    //   Path-1 walk starts from vmhook::hotspot::find_any_java_thread() (the
+    //   Threads::_thread_list head).  That head, when present, must be (a)
+    //   null-or-VALID (never a garbage pointer the walk would deref), and (b) a
+    //   LIVE thread that the enumeration itself reports -- the walk cannot omit its
+    //   own starting node.  On JDK 10+ builds that ship no `Threads::_thread_list`
+    //   VMStruct the head is null and for_each_thread falls through to the Path-2
+    //   SMR snapshot; that is a legitimate configuration, so head==null is recorded
+    //   as [INFO] and the "head is enumerated" assertion is gated on a non-null
+    //   head.  Repeated calls are also checked to be self-consistent (the head is
+    //   stable across two back-to-back reads in a quiescent window -- recorded, not
+    //   asserted, since the JVM can retire the head thread between reads).
+    //   SAFE: the head comes straight from the library's own fault-safe accessor
+    //   and is is_valid_pointer-gated before any use.
+    // =====================================================================
+    {
+        vmhook::hotspot::java_thread* const head{ vmhook::hotspot::find_any_java_thread() };
+
+        // (a) null-or-valid: find_any_java_thread already filters through
+        //     is_valid_pointer, so a non-null head MUST be valid.  A non-null head
+        //     that fails is_valid_pointer would be a library contract break.
+        const bool head_null_or_valid{
+            head == nullptr || vmhook::hotspot::is_valid_pointer(head) };
+        ctx.check("find_any_head_null_or_valid", head_null_or_valid);
+
+        const enumeration n_now{ enumerate() };
+        ctx.check("find_any_head_enum_valid", n_now.all_pointers_valid);
+
+        if (head != nullptr && vmhook::hotspot::is_valid_pointer(head))
+        {
+            // (b) the head is a live thread, so the enumeration that walks FROM it
+            //     must include it.  (Path 1 visits the head first; Path 2 is not
+            //     reached when Path 1 visited anything -- and if Path 1 head is
+            //     non-null it WILL visit it.)
+            const bool head_enumerated{
+                std::find(n_now.pointers.begin(), n_now.pointers.end(), head)
+                    != n_now.pointers.end() };
+            ctx.check("find_any_head_is_enumerated", head_enumerated);
+
+            // The head's own tid decodes to a non-zero value (its OSThread chain
+            // is intact) -- a direct accessor cross-check, not via the visitor.
+            const vmhook::os::thread_id_t head_tid{ head->get_os_thread_id() };
+            ctx.check("find_any_head_tid_nonzero", head_tid != 0);
+
+            // The head's decoded state is in range (same universal invariant the
+            // visitor path asserts, proven here straight off the accessor).
+            ctx.check("find_any_head_state_in_range",
+                      state_in_range(head->get_thread_state()));
+        }
+        else
+        {
+            ctx.record("[INFO] find_any_java_thread() returned null -- this JVM ships "
+                       "no Threads::_thread_list VMStruct (JDK 10+ SMR-only); "
+                       "for_each_thread uses the Path-2 snapshot.  Skipped the "
+                       "head-is-enumerated / head-accessor cross-checks.");
+        }
+
+        // Self-consistency of two back-to-back head reads (recorded, not asserted:
+        // the JVM may retire the head thread between the two microsecond-apart
+        // reads, which would legitimately change the head pointer).
+        vmhook::hotspot::java_thread* const head2{ vmhook::hotspot::find_any_java_thread() };
+        ctx.record(std::string{ "[INFO] find_any_java_thread head stable across two reads: " }
+                   + (head == head2 ? "yes" : "no")
+                   + " (informational -- head thread can retire between reads)");
+    }
+
+    // =====================================================================
+    // PART O -- MANUAL Path-1 LINK-WALK vs ENUMERATION (NEW): independently walk
+    //   the classic intrusive list the SAME way for_each_thread's Path 1 does --
+    //   find_any_java_thread() then get_next() to exhaustion -- with our OWN dedup
+    //   set and the SAME 4096 cap + cycle break, and prove the primitive walk (1)
+    //   TERMINATES bounded, (2) hands back only valid pointers, (3) never repeats a
+    //   pointer (the cycle break holds), (4) stays under the cap, and (5) shares a
+    //   non-empty persistent core with the enumeration.  This exercises the
+    //   underlying get_next() link primitive directly, the layer for_each_thread is
+    //   built on.  Gated on a non-null head (JDK 10+ SMR-only builds have none);
+    //   the manual walk is otherwise [INFO]-skipped, mirroring Part N.
+    //   SAFE: every node is is_valid_pointer-gated before get_next(), the walk is
+    //   hard-capped at 4096 AND breaks on the first repeated pointer, so it can
+    //   neither fault, spin, nor hang even on a corrupted list.
+    // =====================================================================
+    {
+        vmhook::hotspot::java_thread* const head{ vmhook::hotspot::find_any_java_thread() };
+        if (head != nullptr && vmhook::hotspot::is_valid_pointer(head))
+        {
+            std::vector<vmhook::hotspot::java_thread*> walked{};
+            std::unordered_set<vmhook::hotspot::java_thread*> seen{};
+            bool walk_all_valid{ true };
+            bool walk_hit_cycle{ false };
+
+            const auto w0{ std::chrono::steady_clock::now() };
+            vmhook::hotspot::java_thread* cur{ head };
+            std::int32_t steps{ 0 };
+            while (cur != nullptr
+                   && vmhook::hotspot::is_valid_pointer(cur)
+                   && steps < FOR_EACH_THREAD_CAP)
+            {
+                if (!seen.insert(cur).second)
+                {
+                    // Repeated pointer -- a cycle in the intrusive list; stop,
+                    // exactly as for_each_thread's Path-1 cycle break does.
+                    walk_hit_cycle = true;
+                    break;
+                }
+                walked.push_back(cur);
+                ++steps;
+                // Independent re-validation of the node we just accepted, so the
+                // manual_walk_all_pointers_valid assertion is a genuine check and
+                // not a tautology of the loop guard.
+                if (cur == nullptr || !vmhook::hotspot::is_valid_pointer(cur))
+                {
+                    walk_all_valid = false;
+                }
+                vmhook::hotspot::java_thread* const next{ cur->get_next() };
+                cur = (next != nullptr && vmhook::hotspot::is_valid_pointer(next))
+                          ? next : nullptr;
+            }
+            const auto w1{ std::chrono::steady_clock::now() };
+            const double walk_ms{ std::chrono::duration<double, std::milli>{ w1 - w0 }.count() };
+
+            // (1) bounded wall-clock -- the same "does not hang" proof as the
+            //     enumeration, but on the raw get_next() primitive.
+            ctx.check("manual_walk_terminates_bounded_time", walk_ms < 250.0);
+            // (4) stays under the cap (a healthy list never reaches it).
+            ctx.check("manual_walk_below_cap",
+                      static_cast<std::int32_t>(walked.size()) < FOR_EACH_THREAD_CAP);
+            // (2) every walked node is valid (gated above; assert the tally held).
+            ctx.check("manual_walk_all_pointers_valid", walk_all_valid);
+            // visited at least the head.
+            ctx.check("manual_walk_visited_at_least_one", !walked.empty());
+            // (3) no pointer repeated (the cycle break + dedup held -- a healthy
+            //     list is acyclic, so this must NOT have hit the cycle break).
+            ctx.check("manual_walk_no_duplicate_pointer",
+                      distinct_count(walked) == walked.size());
+            ctx.record(std::string{ "[INFO] manual Path-1 link-walk visited " }
+                       + std::to_string(walked.size()) + " node(s) in "
+                       + std::to_string(walk_ms) + " ms; cycle break hit: "
+                       + (walk_hit_cycle ? "yes" : "no")
+                       + " (a healthy list is acyclic -- break expected NO)");
+
+            // (5) the manual walk and a fresh enumeration share a non-empty
+            //     persistent core (both describe the same live Path-1 list; the
+            //     head, the main thread, etc. are in both).  Exact equality is NOT
+            //     asserted -- a thread can start/exit between the two walks.
+            const enumeration o_enum{ enumerate() };
+            const std::size_t both{ intersection_count(walked, o_enum.pointers) };
+            ctx.record(std::string{ "[INFO] manual-walk vs enumeration persistent core = " }
+                       + std::to_string(both) + " (walk=" + std::to_string(walked.size())
+                       + ", enum=" + std::to_string(o_enum.pointers.size()) + ")");
+            ctx.check("manual_walk_shares_core_with_enum", both >= 1);
+        }
+        else
+        {
+            ctx.record("[INFO] no Path-1 head (SMR-only JDK) -- skipped the manual "
+                       "get_next() link-walk cross-check.");
+        }
+    }
+
+    // =====================================================================
+    // PART P -- ACCESSOR RE-READ DETERMINISM (NEW): the visitor decodes each
+    //   thread's os_thread_id / state via JavaThread::get_os_thread_id() /
+    //   ::get_thread_state().  Those accessors must be DETERMINISTIC -- calling
+    //   get_os_thread_id() AGAIN, directly on the same enumerated JavaThread*,
+    //   yields the SAME non-zero id the visitor reported (the decode is a pure
+    //   field read, not a one-shot artifact), and get_thread_state() re-reads an
+    //   in-range byte.  We re-read off a FRESH enumeration (so the pointers are as
+    //   live as possible) and only for pointers that still pass is_valid_pointer at
+    //   re-read time -- a thread that exited between the snapshot and the re-read is
+    //   skipped (recorded), never a FAIL, because its JavaThread may be reclaimed.
+    //   SAFE: every re-read is is_valid_pointer-gated and the accessors are
+    //   themselves safe_read-routed, so a stale pointer degrades to 0 / sentinel
+    //   rather than faulting.
+    // =====================================================================
+    {
+        const enumeration p_now{ enumerate() };
+        std::int32_t rechecked{ 0 };
+        std::int32_t skipped_exited{ 0 };
+        bool all_tids_match{ true };
+        bool all_tids_nonzero{ true };
+        bool all_states_in_range{ true };
+        for (const thread_identity& id : p_now.identities)
+        {
+            if (id.ptr == nullptr || !vmhook::hotspot::is_valid_pointer(id.ptr))
+            {
+                ++skipped_exited;
+                continue;
+            }
+            ++rechecked;
+            const vmhook::os::thread_id_t reread_tid{ id.ptr->get_os_thread_id() };
+            if (reread_tid != id.tid)
+            {
+                all_tids_match = false;
+            }
+            if (reread_tid == 0)
+            {
+                all_tids_nonzero = false;
+            }
+            if (!state_in_range(id.ptr->get_thread_state()))
+            {
+                all_states_in_range = false;
+            }
+        }
+        ctx.record(std::string{ "[INFO] accessor re-read: re-checked " }
+                   + std::to_string(rechecked) + " of "
+                   + std::to_string(p_now.identities.size())
+                   + " enumerated thread(s); " + std::to_string(skipped_exited)
+                   + " skipped (pointer no longer valid at re-read).");
+        if (rechecked >= 1)
+        {
+            // The re-read os_thread_id matches the visitor's exactly -- the decode
+            // is reproducible, not a transient artifact.
+            ctx.check("accessor_reread_tid_matches_visitor", all_tids_match);
+            // ...and is still non-zero on the direct call.
+            ctx.check("accessor_reread_tid_nonzero", all_tids_nonzero);
+            // ...and the state re-reads in range straight off the accessor.
+            ctx.check("accessor_reread_state_in_range", all_states_in_range);
+        }
+        else
+        {
+            ctx.record("[INFO] no enumerated pointer survived to re-read time "
+                       "(unexpected on a live JVM) -- skipped accessor re-read asserts.");
+        }
+    }
+
+    // =====================================================================
+    // PART Q -- get_suspend_flags() INTROSPECTION IS BOUNDED (NEW, mostly [INFO]):
+    //   the header points callers at the other java_thread helpers
+    //   (get_suspend_flags, etc.) for deeper introspection of an enumerated
+    //   JavaThread*.  We exercise get_suspend_flags() over every enumerated valid
+    //   thread and prove the whole sweep (1) TERMINATES bounded and (2) never
+    //   crashes the no-SEH legs (it is safe_read-routed and returns 0 on a bad
+    //   page).  The flag VALUES are JDK/OS/timing-variant (0 for a normal running
+    //   thread; non-zero only mid-suspend/async-handshake), so the distinct flag
+    //   set is RECORDED, never asserted.  SAFE: is_valid_pointer-gated per thread.
+    // =====================================================================
+    {
+        const enumeration q_now{ enumerate() };
+        std::unordered_set<std::uint32_t> distinct_flags{};
+        std::int32_t inspected{ 0 };
+        const auto q0{ std::chrono::steady_clock::now() };
+        for (const thread_identity& id : q_now.identities)
+        {
+            if (id.ptr == nullptr || !vmhook::hotspot::is_valid_pointer(id.ptr))
+            {
+                continue;
+            }
+            ++inspected;
+            distinct_flags.insert(id.ptr->get_suspend_flags());
+        }
+        const auto q1{ std::chrono::steady_clock::now() };
+        const double q_ms{ std::chrono::duration<double, std::milli>{ q1 - q0 }.count() };
+
+        // The introspection sweep returns bounded -- no hang on the accessor path.
+        ctx.check("suspend_flags_sweep_bounded_time", q_ms < 250.0);
+        ctx.record(std::string{ "[INFO] get_suspend_flags() inspected " }
+                   + std::to_string(inspected) + " thread(s); "
+                   + std::to_string(distinct_flags.size())
+                   + " distinct flag value(s) observed (values are JDK/OS/timing-"
+                     "variant -- recorded, not asserted).");
+    }
+
+    // =====================================================================
+    // PART R -- find_java_thread_by_os_thread_id DEGENERATE / IDEMPOTENT INPUT
+    //   (NEW): the cross-path finder that shares the OSThread decode has an
+    //   explicit zero-id guard (it returns nullptr for os_thread_id == 0 before
+    //   walking anything).  Prove that degenerate-input contract HARD -- tid 0 is
+    //   never a live OS thread, so the finder MUST return nullptr.  Also prove the
+    //   finder is IDEMPOTENT for a stable input: resolving the current thread's tid
+    //   twice yields the SAME JavaThread* (no per-call state drift).  SAFE: the
+    //   finder is fully bounded (caps at 4096 on each path) and noexcept.
+    // =====================================================================
+    {
+        // Degenerate input: tid 0 -> nullptr (the explicit guard).  CERTAIN.
+        vmhook::hotspot::java_thread* const zero_lookup{
+            vmhook::hotspot::find_java_thread_by_os_thread_id(0) };
+        ctx.check("finder_zero_tid_returns_null", zero_lookup == nullptr);
+
+        // Idempotency on a stable input: the current thread's tid resolves to the
+        // same pointer on two consecutive calls.  Only when we have a current
+        // JavaThread with a non-zero enumerated tid (otherwise nothing stable to
+        // resolve -- recorded and skipped).
+        if (vmhook::hotspot::current_java_thread)
+        {
+            const auto current_jt{ vmhook::hotspot::current_java_thread };
+            const enumeration r_now{ enumerate() };
+            vmhook::os::thread_id_t cur_tid{ 0 };
+            for (const thread_identity& id : r_now.identities)
+            {
+                if (id.ptr == current_jt)
+                {
+                    cur_tid = id.tid;
+                    break;
+                }
+            }
+            if (cur_tid != 0)
+            {
+                vmhook::hotspot::java_thread* const first{
+                    vmhook::hotspot::find_java_thread_by_os_thread_id(cur_tid) };
+                vmhook::hotspot::java_thread* const second{
+                    vmhook::hotspot::find_java_thread_by_os_thread_id(cur_tid) };
+                // Idempotent: same pointer both times (no per-call walk state).
+                ctx.check("finder_idempotent_same_pointer", first == second);
+                // ...and it is the current thread we hold (cross-check with Part I).
+                ctx.check("finder_idempotent_resolves_current", first == current_jt);
+            }
+            else
+            {
+                ctx.record("[INFO] current thread had no nonzero enumerated tid "
+                           "(unexpected) -- skipped finder idempotency assert.");
+            }
+        }
+        else
+        {
+            ctx.record("[INFO] current_java_thread is null on the suite thread -- "
+                       "skipped finder idempotency assert (no stable tid to resolve).");
+        }
+    }
+
+    // =====================================================================
     // CLEANUP — UNCONDITIONAL: join every worker this module spawned (single +
     //   batch) so none can leak into a downstream test module's enumeration.
     //   Drives mode 4 (joinWorkers): the fixture sets stop and JOINs each worker

@@ -89,6 +89,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace
 {
@@ -1209,6 +1210,273 @@ static void run_field_null_safety_checks(vmhook_test::context& ctx)
             }
         }
     }
+
+    // =====================================================================
+    //  20. NULL-proxy to_vector<T>() — the collection-decode entry point off the
+    //      int32-zero fallback.  to_vector() does static_cast<uint32_t>(*this)
+    //      (vmhook.hpp:20290) which on the int32-zero fallback yields 0, then
+    //      decode_oop_pointer(0) -> null -> the early "null or invalid" guard
+    //      (20292) returns an EMPTY vector.  No fabricated address is ever read:
+    //      the compressed OOP is literally 0, so this is POSIX-safe (decode_oop_
+    //      pointer(0) is null, never a wild deref).  Pinned for primitive, ref,
+    //      and array signatures — all collapse to an empty vector, no crash.
+    // =====================================================================
+    {
+        const char* sigs[] = {
+            "Ljava/util/ArrayList;", "Ljava/util/HashSet;",
+            "[Ljava/lang/String;", "[I", "I", "",
+        };
+        for (const char* sig : sigs)
+        {
+            vmhook::field_proxy fp{ nullptr, sig, false };
+            const auto v{ fp.get() };
+            const std::vector<std::unique_ptr<fns>> vec = v.to_vector<fns>();
+            const std::string tag{ sig };
+            ctx.check(std::string{ "null_to_vector_empty_" } + tag, vec.empty());
+        }
+    }
+    ctx.check("post_null_to_vector_okInt_intact", fns::get_ok_int() == 1234);
+
+    // =====================================================================
+    //  21. WILD (non-null but INVALID, 0x4) proxy — the NARROWER / UNSIGNED
+    //      conversion matrix off the wild fallback, completing phase 12 (which
+    //      only checked int32 / int64 / double).  The wild fallback is the SAME
+    //      int32-zero value_t as the null fallback (phase 12 proved the variant
+    //      is int32), so every narrow / unsigned / pointer conversion must
+    //      collapse to a zero / null value with NO read of the wild 0x4 address.
+    // =====================================================================
+    {
+        void* const wild{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x4)) };
+        vmhook::field_proxy fp{ wild, "Ljava/lang/String;", true };
+        const auto v{ fp.get() };
+        const std::int8_t as_i8 = v;
+        ctx.check("wild_get_int8_zero", as_i8 == 0);
+        const std::int16_t as_i16 = v;
+        ctx.check("wild_get_int16_zero", as_i16 == 0);
+        const std::uint16_t as_u16 = v;
+        ctx.check("wild_get_uint16_zero", as_u16 == 0u);
+        const char as_char = v;
+        ctx.check("wild_get_char_zero", as_char == '\0');
+        const std::uint32_t as_u32 = v;
+        ctx.check("wild_get_uint32_zero", as_u32 == 0u);
+        const float as_float = v;
+        ctx.check("wild_get_float_zero", as_float == 0.0F);
+        const bool as_bool = v;
+        ctx.check("wild_get_bool_false", as_bool == false);
+        // void* of the wild int32-zero fallback decodes a 0 compressed OOP -> null
+        // (no wild decode, no read of 0x4).
+        void* const as_ptr = v;
+        ctx.check("wild_get_voidptr_null", as_ptr == nullptr);
+        // to_vector() off the wild fallback is likewise empty (0 -> null -> {}).
+        const std::vector<std::unique_ptr<fns>> vec = v.to_vector<fns>();
+        ctx.check("wild_to_vector_empty", vec.empty());
+    }
+    ctx.check("post_wild_matrix_canary_intact", fns::get_canary() == kCanaryInt);
+
+    // =====================================================================
+    //  22. WRONG signature over the OTHER real >=2-byte primitive fields — phase
+    //      8 / 17 covered okInt / okLong / okDouble / okFloat / okStr / okByte;
+    //      this adds okShort / okChar (both 2-byte mirror slots) and the 1-byte
+    //      okBool / okByte read at their OWN width only.  Every reinterpretation
+    //      reads STRICTLY WITHIN the field's own slot width (low byte of a 2-byte
+    //      field, or the full 2 bytes), so the result is fully determined by the
+    //      field's value and little-endian byte order — NO adjacent / JDK-layout-
+    //      dependent bytes are pinned.  All reads are non-mutating (re-read after).
+    // =====================================================================
+    {
+        // okShort == 0x1234 (4660).  LE byte 0 == 0x34.
+        void* const ok_short_addr{ fns::raw_addr_of("okShort") };
+        if (ok_short_addr)
+        {
+            // Control "S" read.
+            { vmhook::field_proxy c{ ok_short_addr, "S", true };
+              const std::int16_t s = c.get();
+              ctx.check("wrongsig_okShort_control_S_1234", s == static_cast<std::int16_t>(0x1234)); }
+            // "C" reads the same 2 bytes unsigned -> 0x1234.
+            { vmhook::field_proxy w{ ok_short_addr, "C", true };
+              const auto v{ w.get() };
+              ctx.check("wrongsig_okShort_as_C_variant_uint16", v.data.index() == kIdxU16);
+              const std::uint16_t c = v;
+              ctx.check("wrongsig_okShort_as_C_value", c == 0x1234u); }
+            // "B" reads only the low byte -> 0x34 (52).
+            { vmhook::field_proxy w{ ok_short_addr, "B", true };
+              const std::int8_t b = w.get();
+              ctx.check("wrongsig_okShort_as_B_low_byte", b == static_cast<std::int8_t>(0x34)); }
+            // "Z" reads the low byte 0x34 != 0 -> true.
+            { vmhook::field_proxy w{ ok_short_addr, "Z", true };
+              const bool b = w.get();
+              ctx.check("wrongsig_okShort_as_Z_low_byte_true", b == true); }
+        }
+
+        // okChar == 0x00E9 (233).  LE byte 0 == 0xE9, byte 1 == 0x00.
+        void* const ok_char_addr{ fns::raw_addr_of("okChar") };
+        if (ok_char_addr)
+        {
+            // Control "C" read.
+            { vmhook::field_proxy c{ ok_char_addr, "C", true };
+              const auto v{ c.get() };
+              ctx.check("wrongsig_okChar_control_C_variant_uint16", v.data.index() == kIdxU16);
+              const std::uint16_t ch = v;
+              ctx.check("wrongsig_okChar_control_C_value_0x00E9", ch == 0x00E9u); }
+            // "S" reads the same 2 bytes signed -> 0x00E9 == 233 (positive).
+            { vmhook::field_proxy w{ ok_char_addr, "S", true };
+              const std::int16_t s = w.get();
+              ctx.check("wrongsig_okChar_as_S_value_233", s == static_cast<std::int16_t>(0x00E9)); }
+            // "B" reads the low byte -> 0xE9 == -23.
+            { vmhook::field_proxy w{ ok_char_addr, "B", true };
+              const std::int8_t b = w.get();
+              ctx.check("wrongsig_okChar_as_B_low_byte", b == static_cast<std::int8_t>(0xE9)); }
+            // "Z" reads the low byte 0xE9 != 0 -> true.
+            { vmhook::field_proxy w{ ok_char_addr, "Z", true };
+              const bool b = w.get();
+              ctx.check("wrongsig_okChar_as_Z_low_byte_true", b == true); }
+        }
+
+        // okBool == true (stored as a 1-byte 0x01).  Read at its OWN width only.
+        void* const ok_bool_addr{ fns::raw_addr_of("okBool") };
+        if (ok_bool_addr)
+        {
+            // Control "Z" read.
+            { vmhook::field_proxy c{ ok_bool_addr, "Z", true };
+              const bool b = c.get();
+              ctx.check("wrongsig_okBool_control_Z_true", b == true); }
+            // "B" reads the same 1 byte -> 0x01 == 1.
+            { vmhook::field_proxy w{ ok_bool_addr, "B", true };
+              const auto v{ w.get() };
+              ctx.check("wrongsig_okBool_as_B_variant_int8", v.data.index() == kIdxI8);
+              const std::int8_t b = v;
+              ctx.check("wrongsig_okBool_as_B_value_1", b == static_cast<std::int8_t>(1)); }
+        }
+
+        // okByte == 0x7B (123).  Read as "Z" -> low byte 0x7B != 0 -> true.
+        void* const ok_byte_addr2{ fns::raw_addr_of("okByte") };
+        if (ok_byte_addr2)
+        {
+            { vmhook::field_proxy w{ ok_byte_addr2, "Z", true };
+              const auto v{ w.get() };
+              ctx.check("wrongsig_okByte_as_Z_variant_bool", v.data.index() == kIdxBool);
+              const bool b = v;
+              ctx.check("wrongsig_okByte_as_Z_value_true", b == true); }
+            // Control "B" read.
+            { vmhook::field_proxy c{ ok_byte_addr2, "B", true };
+              const std::int8_t b = c.get();
+              ctx.check("wrongsig_okByte_control_B_0x7B", b == static_cast<std::int8_t>(0x7B)); }
+        }
+
+        // CONTRAST: every field re-reads its real value (all reads non-mutating).
+        {
+            const auto pS{ fns::static_field("okShort") };
+            if (pS) { const std::int16_t s = pS->get(); ctx.check("post_wrongsig_okShort_intact", s == static_cast<std::int16_t>(0x1234)); }
+            const auto pC{ fns::static_field("okChar") };
+            if (pC) { const std::uint16_t c = pC->get(); ctx.check("post_wrongsig_okChar_intact", c == 0x00E9u); }
+            const auto pB{ fns::static_field("okBool") };
+            if (pB) { const bool b = pB->get(); ctx.check("post_wrongsig_okBool_intact", b == true); }
+            const auto pY{ fns::static_field("okByte") };
+            if (pY) { const std::int8_t y = pY->get(); ctx.check("post_wrongsig_okByte_intact", y == static_cast<std::int8_t>(0x7B)); }
+        }
+        ctx.check("post_wrongsig_morewidth_okInt_intact", fns::get_ok_int() == 1234);
+    }
+
+    // =====================================================================
+    //  23. NULL-proxy get() signature ECHO is byte-exact for EVERY descriptor
+    //      shape, including empty / very-long / embedded-separator strings — the
+    //      fallback preserves the WHOLE signature verbatim (it is move-stored in
+    //      the ctor and copied into value_t::signature), never truncated at a
+    //      separator or NUL and never normalized.  Also pin signature() (the
+    //      proxy accessor) echoes the same string on a null proxy.
+    // =====================================================================
+    {
+        const std::string long_sig(1024, 'X');               // 1 KiB non-descriptor
+        const std::string sep_sig{ "Lfoo/bar/Baz;" };        // embedded '/' + ';'
+        const std::string sigs[] = {
+            std::string{ "" }, std::string{ "I" }, long_sig, sep_sig,
+            std::string{ "[[[[Ljava/lang/Object;" }, std::string{ "(I)V" },
+        };
+        for (const std::string& sig : sigs)
+        {
+            vmhook::field_proxy fp{ nullptr, sig, true };
+            const auto v{ fp.get() };
+            ctx.check(std::string{ "null_get_sig_echo_len_" } + std::to_string(sig.size()),
+                      v.signature == sig);
+            ctx.check(std::string{ "null_proxy_signature_echo_len_" } + std::to_string(sig.size()),
+                      std::string{ fp.signature() } == sig);
+            // The fallback variant is int32 for every one of these shapes.
+            ctx.check(std::string{ "null_get_sig_echo_variant_int32_len_" } + std::to_string(sig.size()),
+                      v.data.index() == kIdxI32);
+        }
+    }
+
+    // =====================================================================
+    //  24. A null-pointer proxy built with the 5-arg GC-stable ctor (a null
+    //      mirror_klass + a field_offset) STILL takes the null fallback — the
+    //      mirror re-resolve branch is skipped when mirror_klass is null, so
+    //      read_pointer stays null and get() returns int32-zero.  This pins that
+    //      the second (GC-stable) constructor does not change the null contract.
+    // =====================================================================
+    {
+        vmhook::field_proxy fp{ nullptr, "D", true,
+                                static_cast<vmhook::hotspot::klass*>(nullptr),
+                                std::size_t{ 16 } };
+        const auto v{ fp.get() };
+        ctx.check("null_5arg_ctor_variant_int32", v.data.index() == kIdxI32);
+        const double d = v;
+        ctx.check("null_5arg_ctor_double_zero", d == 0.0);
+        ctx.check("null_5arg_ctor_signature_D", v.signature == "D");
+        ctx.check("null_5arg_ctor_raw_address_null", fp.raw_address() == nullptr);
+        // set() on this proxy is still a safe no-op (null field_pointer).
+        fp.set(2.71828);
+        ctx.check("null_5arg_ctor_set_no_crash", true);
+    }
+    ctx.check("post_null_5arg_canary_intact", fns::get_canary() == kCanaryInt);
+
+    // =====================================================================
+    //  25. is_reference() boundary shapes on the field_proxy accessor (signature
+    //      front()-driven, pointer-independent) — complete the 'L'/'[' boundary:
+    //      a bare "L" (front 'L', no class body) and a bare "[" are references;
+    //      anything whose first char is not 'L'/'[' is not, regardless of what
+    //      follows.  All on null proxies (pointer-independent), no crash.
+    // =====================================================================
+    {
+        const char* ref_true[] = { "L", "[", "L;", "LL", "[[[[[[I" };
+        for (const char* sig : ref_true)
+        {
+            vmhook::field_proxy fp{ nullptr, sig, false };
+            ctx.check(std::string{ "boundary_is_reference_true_" } + sig, fp.is_reference() == true);
+        }
+        const char* ref_false[] = { "l", "{", "0", "9", ";", ")", "BI", "ZZ" };
+        for (const char* sig : ref_false)
+        {
+            vmhook::field_proxy fp{ nullptr, sig, false };
+            ctx.check(std::string{ "boundary_is_reference_false_" } + sig, fp.is_reference() == false);
+            // and its get_compressed_oop() is 0 (non-reference guard, no deref).
+            ctx.check(std::string{ "boundary_nonref_compressed_oop_zero_" } + sig,
+                      fp.get_compressed_oop() == 0u);
+        }
+    }
+
+    // =====================================================================
+    //  26. resolves() / static_field() IDEMPOTENCY — repeatedly resolving the
+    //      SAME real field yields a stable raw_address (find_field caches the
+    //      FOUND entry, 11038), and repeatedly resolving the SAME absent name
+    //      stays nullopt.  Interleaved, so a cache hit can never be turned into a
+    //      miss or vice-versa.  Pins that repeated lookups are deterministic.
+    // =====================================================================
+    {
+        void* first_addr{ fns::raw_addr_of("okInt") };
+        bool addr_stable{ true };
+        bool absent_stable{ true };
+        for (int i = 0; i < 32; ++i)
+        {
+            const void* a{ fns::raw_addr_of("okInt") };
+            addr_stable = addr_stable && (a == first_addr) && (a != nullptr);
+            absent_stable = absent_stable && (fns::resolves("stillNotAField") == false);
+        }
+        ctx.check("resolve_idempotent_okInt_addr_stable", addr_stable);
+        ctx.check("resolve_idempotent_absent_stays_nullopt", absent_stable);
+        // The signature of the repeatedly-resolved field is likewise stable.
+        ctx.check("resolve_idempotent_okInt_signature", fns::sig_of("okInt") == "I");
+    }
+    ctx.check("post_idempotency_okInt_value_1234", fns::get_ok_int() == 1234);
 
     // =====================================================================
     //  11. RUNTIME — drive the probe (genuine putstatic on okInt) and prove the

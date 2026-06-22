@@ -258,6 +258,61 @@ namespace
     std::atomic<bool> g_int_arr_valid{ false };
     std::atomic<bool> g_obj_arr_valid{ false };
 
+    // ── DEEPEN: more get_array_element width / boundary combinations on intArr.
+    //   Every read uses a real owned array oop (POSIX-safe).  All HARD universal
+    //   (the bounds guard + LE x64 layout do not depend on the compressed-oops
+    //   element decode). ──────────────────────────────────────────────────────
+    // Full-width unsigned read of a primitive int element equals the value.
+    std::atomic<bool> g_int_uint32_inbounds_ok{ false };   // (uint32)intArr[0]==1000
+    // bool read of byte +16 (low byte of 1000 == 232 != 0) -> true.
+    std::atomic<bool> g_int_bool_read_ok{ false };
+    // uint16 in-bounds read of intArr[0] low 2 bytes == 1000.
+    std::atomic<bool> g_int_uint16_read_ok{ false };
+    // Narrow-width OOB indices clamp to T{} regardless of element_type width
+    // (the index<0 / index>=length guard fires before the read).
+    std::atomic<bool> g_int_int16_neg1_clamped{ false };   // int16 @ -1
+    std::atomic<bool> g_int_int8_eqlen_clamped{ false };   // int8  @ len
+    std::atomic<bool> g_int_uint16_intmin_clamped{ false };// uint16 @ INT_MIN
+    std::atomic<bool> g_int_bool_eqlen_clamped{ false };   // bool @ len -> false
+    // array_length is stable across repeated reads (read-only, idempotent).
+    std::atomic<bool> g_int_arr_len_idempotent{ false };
+    std::atomic<bool> g_obj_arr_len_idempotent{ false };
+    // get_array_element on a real-but-narrow element_type at nullptr clamps too.
+    std::atomic<bool> g_getelem_null_int64_is_zero{ false };
+    std::atomic<bool> g_getelem_null_int16_is_zero{ false };
+
+    // ── DEEPEN: set_array_element OOB-WRITE rejection.  An OOB index is a no-op
+    //   (the index<0 / index>=length guard), so writing to OOB indices leaves the
+    //   shared fixture array byte-identical — proven by re-reading the real
+    //   in-bounds sentinels before AND after the rejected OOB writes.  NEVER an
+    //   in-bounds write (that would corrupt the fixture for later modules). ─────
+    std::atomic<bool> g_setelem_oob_neg_rejected{ false };    // write @ -1 ignored
+    std::atomic<bool> g_setelem_oob_eqlen_rejected{ false };  // write @ len ignored
+    std::atomic<bool> g_setelem_oob_intmin_rejected{ false }; // write @ INT_MIN ignored
+    std::atomic<bool> g_setelem_oob_null_no_crash{ false };   // write to nullptr no-op
+
+    // ── DEEPEN: value_t::to_vector on the raw fields directly. ────────────────
+    //   objArr is an Object[] of Elem -> hits the object-ARRAY special case in
+    //   value_t::to_vector (signature '[L...;'); intArr is a primitive '[I' array
+    //   -> falls through to collection::to_vector, finds no container fields, and
+    //   returns EMPTY without crashing (the documented degenerate-but-safe path).
+    walk_obs g_objarr_to_vector;        // Object[] -> 4 Elems (id 700..703)
+    walk_obs g_intarr_to_vector;        // primitive int[] -> empty, no crash
+    std::atomic<bool> g_objarr_to_vector_ids_ok{ false };  // every decoded id == 700+k
+
+    // ── DEEPEN: IDEMPOTENCY — a read-only walk re-run on the SAME field yields
+    //   the SAME count (no state mutated, no early stop the 2nd time).  Stored as
+    //   second-pass counts; HARD (count1==count2) only when the first decoded > 0.
+    std::atomic<std::int32_t> g_big_arraylist_count2{ -1 };
+    std::atomic<std::int32_t> g_big_linkedlist_count2{ -1 };
+    std::atomic<std::int32_t> g_oo_treeset_count2{ -1 };
+    std::atomic<std::int32_t> g_collide_hashset_count2{ -1 };
+    std::atomic<std::int32_t> g_big_hashmap_count2{ -1 };   // entries
+    std::atomic<std::int32_t> g_oo_treemap_count2{ -1 };    // entries
+
+    // ── DEEPEN: single-* maps have NO null keys (non_null == count == 1). ─────
+    //   (Stored via the existing walk_obs; asserted in the new section.)
+
     // ── Detour bookkeeping. ──────────────────────────────────────────────────
     std::atomic<int>  g_detour_calls{ 0 };
     std::atomic<bool> g_self_ok{ false };
@@ -659,6 +714,152 @@ namespace
                     g_getelem_nonarray_safe.store(v == 0, std::memory_order_relaxed);
                 }
             }
+        }
+
+        // ── DEEPEN: more get_array_element width / boundary combos + the bounds
+        //    primitive on degenerate oops at narrow widths.  All on real owned
+        //    arrays / nullptr (POSIX-safe). ────────────────────────────────────
+        {
+            void* const int_arr{ array_oop_of(*self, "intArr") };
+            if (int_arr)
+            {
+                // Full-width unsigned read of a primitive int element == 1000.
+                g_int_uint32_inbounds_ok.store(
+                    vmhook::get_array_element<std::uint32_t>(int_arr, 0)
+                        == static_cast<std::uint32_t>(1000),
+                    std::memory_order_relaxed);
+                // uint16 low-2-bytes of 1000 == 1000 (LE; 1000 < 65536).
+                g_int_uint16_read_ok.store(
+                    vmhook::get_array_element<std::uint16_t>(int_arr, 0)
+                        == static_cast<std::uint16_t>(1000),
+                    std::memory_order_relaxed);
+                // bool read of byte +16: low byte of 1000 == 232 (!= 0) -> true.
+                g_int_bool_read_ok.store(
+                    vmhook::get_array_element<bool>(int_arr, 0) == true,
+                    std::memory_order_relaxed);
+
+                // Narrow-width OOB indices clamp to T{} (guard fires before read).
+                g_int_int16_neg1_clamped.store(
+                    vmhook::get_array_element<std::int16_t>(int_arr, -1)
+                        == static_cast<std::int16_t>(0),
+                    std::memory_order_relaxed);
+                g_int_int8_eqlen_clamped.store(
+                    vmhook::get_array_element<std::int8_t>(int_arr, INT_ARR_LEN)
+                        == static_cast<std::int8_t>(0),
+                    std::memory_order_relaxed);
+                g_int_uint16_intmin_clamped.store(
+                    vmhook::get_array_element<std::uint16_t>(
+                        int_arr, std::numeric_limits<std::int32_t>::min())
+                        == static_cast<std::uint16_t>(0),
+                    std::memory_order_relaxed);
+                g_int_bool_eqlen_clamped.store(
+                    vmhook::get_array_element<bool>(int_arr, INT_ARR_LEN) == false,
+                    std::memory_order_relaxed);
+
+                // array_length is idempotent across repeated reads.
+                const std::int32_t l1{ vmhook::array_length(int_arr) };
+                const std::int32_t l2{ vmhook::array_length(int_arr) };
+                g_int_arr_len_idempotent.store(
+                    l1 == l2 && l1 == INT_ARR_LEN, std::memory_order_relaxed);
+
+                // set_array_element OOB-WRITE rejection.  Snapshot two real
+                // in-bounds sentinels, attempt OOB writes (all no-ops by the
+                // guard), then re-read: the array must be byte-identical.  NEVER
+                // an in-bounds write (that would corrupt the shared fixture).
+                const std::int32_t before0{ vmhook::get_array_element<std::int32_t>(int_arr, 0) };
+                const std::int32_t beforeN{ vmhook::get_array_element<std::int32_t>(int_arr, INT_ARR_LEN - 1) };
+                vmhook::set_array_element<std::int32_t>(int_arr, -1, 999999);
+                g_setelem_oob_neg_rejected.store(
+                    vmhook::get_array_element<std::int32_t>(int_arr, 0) == before0
+                        && vmhook::get_array_element<std::int32_t>(int_arr, INT_ARR_LEN - 1) == beforeN,
+                    std::memory_order_relaxed);
+                vmhook::set_array_element<std::int32_t>(int_arr, INT_ARR_LEN, 999999);
+                g_setelem_oob_eqlen_rejected.store(
+                    vmhook::get_array_element<std::int32_t>(int_arr, 0) == before0
+                        && vmhook::get_array_element<std::int32_t>(int_arr, INT_ARR_LEN - 1) == beforeN,
+                    std::memory_order_relaxed);
+                vmhook::set_array_element<std::int32_t>(
+                    int_arr, std::numeric_limits<std::int32_t>::min(), 999999);
+                g_setelem_oob_intmin_rejected.store(
+                    vmhook::get_array_element<std::int32_t>(int_arr, 0) == before0
+                        && vmhook::get_array_element<std::int32_t>(int_arr, INT_ARR_LEN - 1) == beforeN
+                        && before0 == 1000 && beforeN == 1000 + INT_ARR_LEN - 1,
+                    std::memory_order_relaxed);
+            }
+
+            void* const obj_arr{ array_oop_of(*self, "objArr") };
+            if (obj_arr)
+            {
+                const std::int32_t l1{ vmhook::array_length(obj_arr) };
+                const std::int32_t l2{ vmhook::array_length(obj_arr) };
+                g_obj_arr_len_idempotent.store(
+                    l1 == l2 && l1 == OBJ_ARR_LEN, std::memory_order_relaxed);
+            }
+
+            // Narrow-width reads at nullptr clamp to T{} (universal, no deref).
+            g_getelem_null_int64_is_zero.store(
+                vmhook::get_array_element<std::int64_t>(nullptr, 0)
+                    == static_cast<std::int64_t>(0),
+                std::memory_order_relaxed);
+            g_getelem_null_int16_is_zero.store(
+                vmhook::get_array_element<std::int16_t>(nullptr, 0)
+                    == static_cast<std::int16_t>(0),
+                std::memory_order_relaxed);
+            // set_array_element to nullptr is a no-op (guard); reaching the next
+            // store proves no crash.
+            vmhook::set_array_element<std::int32_t>(nullptr, 0, 123);
+            g_setelem_oob_null_no_crash.store(true, std::memory_order_relaxed);
+        }
+
+        // ── DEEPEN: value_t::to_vector directly on the raw array fields. ──────
+        //   objArr ('[Ljava/lang/Object;') hits the object-ARRAY special case;
+        //   intArr ('[I') falls through to collection::to_vector -> empty.
+        {
+            const auto ov{ vec_of<elem_object>(*self, "objArr") };
+            observe_vec(g_objarr_to_vector, ov);
+            {
+                bool ids_ok{ ov.size() == static_cast<std::size_t>(OBJ_ARR_LEN) };
+                if (ids_ok)
+                {
+                    for (std::int32_t k{ 0 }; k < OBJ_ARR_LEN; ++k)
+                    {
+                        const elem_object* const e{ ov[static_cast<std::size_t>(k)].get() };
+                        if (e == nullptr || e->id() != 700 + k)
+                        {
+                            ids_ok = false;
+                            break;
+                        }
+                    }
+                }
+                g_objarr_to_vector_ids_ok.store(ids_ok, std::memory_order_relaxed);
+            }
+
+            observe_vec(g_intarr_to_vector, vec_of<elem_object>(*self, "intArr"));
+        }
+
+        // ── DEEPEN: IDEMPOTENCY — re-walk the same fields; the second pass count
+        //    must equal the first (read-only, no early stop). ───────────────────
+        {
+            g_big_arraylist_count2.store(
+                static_cast<std::int32_t>(vec_of<elem_object>(*self, "bigArrayList").size()),
+                std::memory_order_relaxed);
+            g_big_linkedlist_count2.store(
+                static_cast<std::int32_t>(vec_of<elem_object>(*self, "bigLinkedList").size()),
+                std::memory_order_relaxed);
+            g_oo_treeset_count2.store(
+                static_cast<std::int32_t>(vec_of<elem_object>(*self, "outOfOrderTreeSet").size()),
+                std::memory_order_relaxed);
+            g_collide_hashset_count2.store(
+                static_cast<std::int32_t>(vec_of<string_element>(*self, "collideHashSet").size()),
+                std::memory_order_relaxed);
+            g_big_hashmap_count2.store(
+                static_cast<std::int32_t>(
+                    entries_of<elem_object, elem_object>(*self, "bigHashMap").size()),
+                std::memory_order_relaxed);
+            g_oo_treemap_count2.store(
+                static_cast<std::int32_t>(
+                    entries_of<elem_object, elem_object>(*self, "outOfOrderTreeMap").size()),
+                std::memory_order_relaxed);
         }
     }
 
@@ -1160,6 +1361,147 @@ namespace
         ctx.record("[INFO] collection_iteration_safety: null collection/map/list "
                    "fields and a non-existent field name all returned an empty "
                    "container without crashing (HARD, universal).");
+    }
+
+    // =====================================================================
+    //  13. DEEPEN — more get_array_element WIDTH / BOUNDARY combinations.
+    //      All on the real owned intArr / nullptr (POSIX-safe).  The bounds
+    //      guard + little-endian x64 layout are universal, so these are HARD
+    //      on every JDK regardless of the compressed-oops element decode.
+    // =====================================================================
+    {
+        // Full-width unsigned + narrow in-bounds reads of intArr[0] (== 1000).
+        ctx.check("array_intarr_uint32_inbounds_is_1000", g_int_uint32_inbounds_ok.load());
+        ctx.check("array_intarr_uint16_read_is_1000", g_int_uint16_read_ok.load());
+        ctx.check("array_intarr_bool_lowbyte_nonzero_true", g_int_bool_read_ok.load());
+
+        // Narrow-width OOB indices clamp to T{} (guard fires before any read).
+        ctx.check("array_intarr_int16_neg1_clamped", g_int_int16_neg1_clamped.load());
+        ctx.check("array_intarr_int8_eqlen_clamped", g_int_int8_eqlen_clamped.load());
+        ctx.check("array_intarr_uint16_intmin_clamped", g_int_uint16_intmin_clamped.load());
+        ctx.check("array_intarr_bool_eqlen_false", g_int_bool_eqlen_clamped.load());
+
+        // array_length is idempotent (read-only) on both arrays.
+        ctx.check("array_intarr_length_idempotent", g_int_arr_len_idempotent.load());
+        ctx.check("array_objarr_length_idempotent", g_obj_arr_len_idempotent.load());
+
+        // The bounds primitive clamps narrow-width reads at nullptr too.
+        ctx.check("array_getelem_null_int64_is_zero", g_getelem_null_int64_is_zero.load());
+        ctx.check("array_getelem_null_int16_is_zero", g_getelem_null_int16_is_zero.load());
+    }
+
+    // =====================================================================
+    //  14. DEEPEN — set_array_element OUT-OF-BOUNDS WRITE rejection.
+    //      An OOB index is a guard no-op, so every attempted OOB write left the
+    //      shared fixture array byte-identical (re-read of the real sentinels
+    //      1000 and 1000+len-1 confirms it).  We NEVER write an in-bounds index,
+    //      so later modules see an unperturbed array.  HARD, universal.
+    // =====================================================================
+    {
+        ctx.check("setelem_oob_neg_index_rejected", g_setelem_oob_neg_rejected.load());
+        ctx.check("setelem_oob_eqlen_index_rejected", g_setelem_oob_eqlen_rejected.load());
+        ctx.check("setelem_oob_intmin_index_rejected", g_setelem_oob_intmin_rejected.load());
+        ctx.check("setelem_null_target_no_crash", g_setelem_oob_null_no_crash.load());
+        ctx.record("[INFO] collection_iteration_safety: set_array_element rejected "
+                   "every OOB index as a no-op (sentinels 1000 / 1007 unchanged); no "
+                   "in-bounds write was ever issued, so the shared array is intact.");
+    }
+
+    // =====================================================================
+    //  15. DEEPEN — value_t::to_vector DIRECTLY on the raw array fields.
+    //      * objArr is an Object[] of Elem -> the object-ARRAY special case
+    //        (signature '[Ljava/lang/Object;'): count == OBJ_ARR_LEN.  The
+    //        array_length-driven count is HARD universal (no compressed-oops
+    //        dependency); the per-element decoded id is best-effort gated.
+    //      * intArr is a primitive '[I' array -> falls through to
+    //        collection::to_vector, finds NO container field, returns EMPTY —
+    //        the documented degenerate-but-safe path (HARD, universal).
+    // =====================================================================
+    {
+        ctx.check("objarr_to_vector_seen", g_objarr_to_vector.seen.load());
+        ctx.check("objarr_to_vector_count_is_4",
+                  g_objarr_to_vector.count.load() == OBJ_ARR_LEN);
+        ctx.check("objarr_to_vector_no_null_slots",
+                  g_objarr_to_vector.null_count.load() == 0);
+        ctx.check("objarr_to_vector_distinct_oops", g_objarr_to_vector.distinct_ok.load());
+        if (g_objarr_to_vector.non_null.load() == OBJ_ARR_LEN)
+        {
+            ctx.check("objarr_to_vector_ids_700_703", g_objarr_to_vector_ids_ok.load());
+        }
+        else
+        {
+            ctx.record("[INFO] objarr_to_vector_ids: SKIPPED — not every slot decoded "
+                       "to a non-null Elem on this JVM (compressed-oops dependency); "
+                       "the count==4 / no-null / distinct invariants stay HARD.");
+        }
+
+        // Primitive '[I' field routed through to_vector: empty, no crash.
+        ctx.check("intarr_to_vector_seen", g_intarr_to_vector.seen.load());
+        ctx.check("intarr_to_vector_empty",
+                  g_intarr_to_vector.count.load() == 0);
+        ctx.check("intarr_to_vector_no_null_slots",
+                  g_intarr_to_vector.null_count.load() == 0);
+        ctx.record("[INFO] collection_iteration_safety: a primitive int[] field "
+                   "routed through value_t::to_vector returns an empty vector "
+                   "(no container fields on the array klass) without crashing.");
+    }
+
+    // =====================================================================
+    //  16. DEEPEN — IDEMPOTENCY.  A read-only walk re-run on the SAME field
+    //      yields the SAME count (no state mutated, no early stop the 2nd time).
+    //      HARD only when the FIRST pass decoded > 0 (count1 == count2); the
+    //      compressed-oops gate is shared with the first-pass size-match.
+    // =====================================================================
+    {
+        const auto idempotent = [&ctx](const char* tag, walk_obs& first,
+                                       std::atomic<std::int32_t>& second_count) -> void
+        {
+            const std::int32_t c1{ first.count.load() };
+            const std::int32_t c2{ second_count.load() };
+            if (c1 > 0)
+            {
+                ctx.check(std::string{ "idempotent_count_stable_" } + tag, c1 == c2);
+            }
+            else
+            {
+                ctx.record(std::string{ "[INFO] idempotent_" } + tag
+                           + ": SKIPPED — first pass decoded 0 on this JVM "
+                             "(compressed-oops element decode).");
+            }
+        };
+        idempotent("big_arraylist",  g_big_arraylist,  g_big_arraylist_count2);
+        idempotent("big_linkedlist", g_big_linkedlist, g_big_linkedlist_count2);
+        idempotent("oo_treeset",     g_oo_treeset,     g_oo_treeset_count2);
+        idempotent("collide_hashset", g_collide_hashset, g_collide_hashset_count2);
+        idempotent("big_hashmap",    g_big_hashmap,    g_big_hashmap_count2);
+        idempotent("oo_treemap",     g_oo_treemap,     g_oo_treemap_count2);
+    }
+
+    // =====================================================================
+    //  17. DEEPEN — single-* MAPS have no null keys (entry non_null == count).
+    //      A one-entry HashMap / TreeMap decodes EXACTLY one non-null key (no
+    //      phantom null-key slot).  HARD when the entry decoded (count > 0);
+    //      [INFO] otherwise (compressed-oops gate, shared with section 9).
+    // =====================================================================
+    {
+        const auto map_nonnull = [&ctx](const char* tag, walk_obs& o) -> void
+        {
+            const std::int32_t c{ o.count.load() };
+            if (c > 0)
+            {
+                ctx.check(std::string{ "single_map_nonnull_eq_count_" } + tag,
+                          o.non_null.load() == c);
+                ctx.check(std::string{ "single_map_no_null_keys_" } + tag,
+                          o.null_count.load() == 0);
+            }
+            else
+            {
+                ctx.record(std::string{ "[INFO] single_map_nonnull_" } + tag
+                           + ": SKIPPED — decoded 0 of 1 on this JVM.");
+            }
+        };
+        map_nonnull("hashmap", g_single_hashmap);
+        map_nonnull("treemap", g_single_treemap);
     }
 
     // scoped_hook `handle` uninstalls here at scope exit — nothing left armed.

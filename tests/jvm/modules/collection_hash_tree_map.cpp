@@ -1305,6 +1305,281 @@ namespace
                 ctx.check("htm_null_oop_tree_wrapper_nullptr_is_safe", true);
             }
         }
+
+        // =====================================================================
+        // 30. is_empty() == false on EVERY populated wrapper.  is_empty() ==
+        //     (size()==0), and size() is a REAL Java call-gate dispatch — wholly
+        //     independent of the raw-OOP walk.  A populated map must report
+        //     not-empty; this is the wrapper-level dual of the count oracle and
+        //     stays HARD on every toolchain (no OOP decode involved).
+        // =====================================================================
+        {
+            static constexpr std::array<const char*, 14> populated_hash{
+                "hashMap", "hashOne", "hashEight", "hashNine", "hashSixteen",
+                "hashSeventeen", "hashResize13", "hashColl7", "hashColl8",
+                "hashTreeBin", "hashNullKey", "hashNullVal", "hashNullBoth",
+                "hashEmptyStr" };
+            for (const char* f : populated_hash)
+            {
+                const auto m{ htm::acquire_map(f) };
+                if (m)
+                {
+                    ctx.check(std::string{ "htm_is_empty_false_" } + f, m->is_empty() == false);
+                    ctx.check(std::string{ "htm_size_positive_" } + f, m->size() > 0);
+                }
+            }
+            static constexpr std::array<const char*, 7> populated_tree{
+                "treeMap", "treeOne", "treeEight", "treeSixtyFour",
+                "treeDescending", "treeNullVal", "treeOneNode" };
+            for (const char* f : populated_tree)
+            {
+                const auto m{ htm::acquire_map(f) };
+                if (m)
+                {
+                    ctx.check(std::string{ "htm_is_empty_false_" } + f, m->is_empty() == false);
+                    ctx.check(std::string{ "htm_size_positive_" } + f, m->size() > 0);
+                }
+            }
+        }
+
+        // =====================================================================
+        // 31. WRAPPER size() == Java size() witness on the full sweep.  Both
+        //     surfaces are Java-side (the wrapper's size() dispatches the real
+        //     Map.size(); the witness is the field the fixture stored from
+        //     map.size()), so equality is HARD irrespective of compressed-oops:
+        //     it never touches the structural walk.  Complements section 20,
+        //     which pinned size()==walk; this pins size()==Java-witness.
+        // =====================================================================
+        {
+            struct field_size { const char* field; const char* size_field; };
+            static constexpr std::array<field_size, 19> sweep{ {
+                { "hashMap", "hashMapSize" }, { "hashOne", "hashOneSize" },
+                { "hashEight", "hashEightSize" }, { "hashNine", "hashNineSize" },
+                { "hashSixteen", "hashSixteenSize" }, { "hashSeventeen", "hashSeventeenSize" },
+                { "hashResize13", "hashResize13Size" }, { "hashColl7", "hashColl7Size" },
+                { "hashColl8", "hashColl8Size" }, { "hashTreeBin", "hashTreeBinSize" },
+                { "hashNullKey", "hashNullKeySize" }, { "hashNullVal", "hashNullValSize" },
+                { "hashNullBoth", "hashNullBothSize" }, { "hashEmptyStr", "hashEmptyStrSize" },
+                { "treeMap", "treeMapSize" }, { "treeOne", "treeOneSize" },
+                { "treeEight", "treeEightSize" }, { "treeDescending", "treeDescendingSize" },
+                { "treeNullVal", "treeNullValSize" } } };
+            for (const auto& fs : sweep)
+            {
+                const auto m{ htm::acquire_map(fs.field) };
+                if (m)
+                {
+                    ctx.check(std::string{ "htm_wrapper_size_eq_java_" } + fs.field,
+                              m->size() == htm::j_size(fs.size_field));
+                }
+            }
+        }
+
+        // =====================================================================
+        // 32. IMPLICIT value_t::to_entries count == Java size() witness on the
+        //     full String->String sweep.  This pins the field-proxy convenience
+        //     path's decoded count directly against the Java witness (section 20
+        //     compared the WRAPPER walk to size(); this compares the IMPLICIT
+        //     path to the witness) — never an over-read, exactly the count.
+        // =====================================================================
+        {
+            static constexpr std::array<std::pair<const char*, const char*>, 16> sweep{ {
+                { "hashMap", "hashMapSize" }, { "hashOne", "hashOneSize" },
+                { "hashEight", "hashEightSize" }, { "hashNine", "hashNineSize" },
+                { "hashSixteen", "hashSixteenSize" }, { "hashSeventeen", "hashSeventeenSize" },
+                { "hashResize13", "hashResize13Size" }, { "hashColl7", "hashColl7Size" },
+                { "hashColl8", "hashColl8Size" }, { "hashTreeBin", "hashTreeBinSize" },
+                { "hashNullKey", "hashNullKeySize" }, { "hashNullVal", "hashNullValSize" },
+                { "treeMap", "treeMapSize" }, { "treeEight", "treeEightSize" },
+                { "treeSixtyFour", "treeSixtyFourSize" }, { "treeDescending", "treeDescendingSize" } } };
+            for (const auto& fs : sweep)
+            {
+                const auto e{ htm::entries_of<str_oop, str_oop>(fs.first) };
+                const std::int32_t decoded{ static_cast<std::int32_t>(e.size()) };
+                const std::int32_t java_size{ htm::j_size(fs.second) };
+                ctx.check(std::string{ "htm_implicit_count_eq_java_" } + fs.first,
+                          decoded == java_size);
+                ctx.check(std::string{ "htm_implicit_count_never_over_" } + fs.first,
+                          decoded <= java_size);
+            }
+        }
+
+        // =====================================================================
+        // 33. WRAPPER path vs IMPLICIT value_t path — IDENTICAL count on the full
+        //     sweep.  vmhook::map{oop}.to_entries and value_t::to_entries decode
+        //     the SAME OOP through the SAME walk (value_t delegates to the
+        //     wrapper), so the two counts must match exactly on every shape.
+        //     A divergence would expose a path inconsistency; HARD everywhere.
+        // =====================================================================
+        {
+            static constexpr std::array<const char*, 16> fields{
+                "hashMap", "hashOne", "hashEight", "hashNine", "hashSixteen",
+                "hashSeventeen", "hashResize13", "hashColl7", "hashColl8",
+                "hashTreeBin", "hashNullKey", "hashNullVal", "treeMap",
+                "treeEight", "treeSixtyFour", "treeDescending" };
+            for (const char* f : fields)
+            {
+                const auto m{ htm::acquire_map(f) };
+                if (m)
+                {
+                    const std::int32_t wrapper_count{
+                        static_cast<std::int32_t>(m->to_entries<str_oop, str_oop>().size()) };
+                    const std::int32_t implicit_count{
+                        static_cast<std::int32_t>(htm::entries_of<str_oop, str_oop>(f).size()) };
+                    ctx.check(std::string{ "htm_wrapper_implicit_count_agree_" } + f,
+                              wrapper_count == implicit_count);
+                }
+            }
+        }
+
+        // =====================================================================
+        // 34. WRAPPER vs IMPLICIT — IDENTICAL KEY MULTISET (not just count) on a
+        //     mid-scale map (hashSixtyFour).  Both paths must surface the same
+        //     keys with the same multiplicity; a bucket-order difference is
+        //     irrelevant because we compare sorted key vectors.  HARD on keys
+        //     (membership is decode-correct on every toolchain whenever the count
+        //     matched); the per-pair VALUE agreement is PASS-or-[INFO].
+        // =====================================================================
+        {
+            const auto m{ htm::acquire_map("hashSixtyFour") };
+            const auto e_impl{ htm::entries_of<str_oop, str_oop>("hashSixtyFour") };
+            if (m)
+            {
+                const auto e_wrap{ m->to_entries<str_oop, str_oop>() };
+                std::vector<std::string> kw, ki;
+                kw.reserve(e_wrap.size());
+                ki.reserve(e_impl.size());
+                for (const auto& kv : e_wrap) { if (kv.first) { kw.push_back(kv.first->text()); } }
+                for (const auto& kv : e_impl) { if (kv.first) { ki.push_back(kv.first->text()); } }
+                std::sort(kw.begin(), kw.end());
+                std::sort(ki.begin(), ki.end());
+                ctx.check("htm_wrapper_implicit_key_multiset_equal", kw == ki);
+            }
+        }
+
+        // =====================================================================
+        // 35. TreeMap RE-READ STABILITY — decoding the SAME tree twice yields the
+        //     same count (HARD) and the same key fingerprint (PASS-or-[INFO]).
+        //     Section 19 covered a HashMap; this covers the in-order tree walk on
+        //     both a small and a DEEP (1000-node) tree, proving the iterative
+        //     left-spine / pop / right traversal has no destructive side effect.
+        // =====================================================================
+        {
+            static constexpr std::array<const char*, 2> tree_fields{
+                "treeSixtyFour", "treeThousand" };
+            for (const char* f : tree_fields)
+            {
+                const auto a{ htm::entries_of<str_oop, str_oop>(f) };
+                const auto b{ htm::entries_of<str_oop, str_oop>(f) };
+                ctx.check(std::string{ "htm_tree_reread_same_count_" } + f, a.size() == b.size());
+                std::int64_t ca{ 0 }, cb{ 0 };
+                for (const auto& kv : a) { if (kv.first) { ca += code_unit_sum(kv.first->text()); } }
+                for (const auto& kv : b) { if (kv.first) { cb += code_unit_sum(kv.first->text()); } }
+                soft_value_check(ctx, std::string{ "htm_tree_reread_same_key_char_sum_" } + f,
+                                 ca == cb);
+            }
+        }
+
+        // =====================================================================
+        // 36. BIG-MAP distinct-OOP / no-cycle — hashThousand (1000-entry bucket
+        //     walk) and treeThousand (1000-node in-order walk).  Every decoded
+        //     key OOP is distinct: a chain/tree cycle or an over-read would
+        //     produce a repeated OOP and shrink the distinct set below the count.
+        //     HARD on both walkers at the largest scale the fixture builds.
+        // =====================================================================
+        {
+            const auto eh{ htm::entries_of<str_oop, str_oop>("hashThousand") };
+            const std::int32_t hcount{ static_cast<std::int32_t>(eh.size()) };
+            std::unordered_set<const void*> ho;
+            ho.reserve(static_cast<std::size_t>(hcount) * 2 + 1);
+            std::int32_t h_null{ 0 };
+            for (const auto& kv : eh)
+            {
+                if (!kv.first) { ++h_null; continue; }
+                void* const koop{ kv.first->get_instance() };
+                if (koop && vmhook::hotspot::is_valid_pointer(koop)) { ho.insert(koop); }
+            }
+            ctx.check("htm_hash_thousand_no_null_keys", h_null == 0);
+            ctx.check("htm_hash_thousand_all_oops_distinct_no_cycle",
+                      ho.size() == static_cast<std::size_t>(hcount));
+
+            const auto et{ htm::entries_of<str_oop, str_oop>("treeThousand") };
+            const std::int32_t tcount{ static_cast<std::int32_t>(et.size()) };
+            std::unordered_set<const void*> to;
+            to.reserve(static_cast<std::size_t>(tcount) * 2 + 1);
+            std::int32_t t_null{ 0 };
+            std::vector<std::string> tkeys;
+            tkeys.reserve(et.size());
+            for (const auto& kv : et)
+            {
+                if (!kv.first) { ++t_null; continue; }
+                void* const koop{ kv.first->get_instance() };
+                if (koop && vmhook::hotspot::is_valid_pointer(koop)) { to.insert(koop); }
+                tkeys.push_back(kv.first->text());
+            }
+            ctx.check("htm_tree_thousand_no_null_keys", t_null == 0);
+            ctx.check("htm_tree_thousand_all_oops_distinct_no_cycle",
+                      to.size() == static_cast<std::size_t>(tcount));
+            // The deep in-order walk is the defining contract: 1000 keys ascending.
+            ctx.check("htm_tree_thousand_keys_strictly_ascending",
+                      std::is_sorted(tkeys.begin(), tkeys.end()));
+        }
+
+        // =====================================================================
+        // 37. DEEP-TREE endpoints via the WRAPPER — treeThousand front/back from
+        //     to_entries() pinned against Java firstKey()/lastKey().  String
+        //     content, so PASS-or-[INFO] (compressed-oops-disabled regime); the
+        //     ORDERING that places them at front/back is itself HARD (section 14).
+        // =====================================================================
+        {
+            const auto tm{ htm::acquire_map("treeThousand") };
+            ctx.check("htm_tree_thousand_wrapper_acquired", tm != nullptr);
+            if (tm)
+            {
+                ctx.check("htm_tree_thousand_wrapper_size_is_1000", tm->size() == N1000);
+                const auto e{ tm->to_entries<str_oop, str_oop>() };
+                ctx.check("htm_tree_thousand_wrapper_entries_size_is_1000",
+                          static_cast<std::int32_t>(e.size()) == N1000);
+                if (!e.empty())
+                {
+                    const std::string first{ e.front().first ? e.front().first->text() : std::string{} };
+                    const std::string last{ e.back().first ? e.back().first->text() : std::string{} };
+                    soft_value_check(ctx, "htm_tree_thousand_front_matches_java",
+                                     first == htm::j_string("treeThousandFirstKey"));
+                    soft_value_check(ctx, "htm_tree_thousand_back_matches_java",
+                                     last == htm::j_string("treeThousandLastKey"));
+                }
+            }
+        }
+
+        // =====================================================================
+        // 38. SIZE-ORACLE idempotency — size() is a real Java dispatch; calling
+        //     it repeatedly on the same wrapper must return the identical value
+        //     (no per-call drift), and the to_entries() walk count must equal
+        //     that stable value across repeats.  HARD on a representative
+        //     HashMap, a treeified bin, and a TreeMap.
+        // =====================================================================
+        {
+            static constexpr std::array<const char*, 3> reps{
+                "hashSixtyFour", "hashTreeBin", "treeSixtyFour" };
+            for (const char* f : reps)
+            {
+                const auto m{ htm::acquire_map(f) };
+                if (m)
+                {
+                    const std::int32_t s1{ m->size() };
+                    const std::int32_t s2{ m->size() };
+                    const std::int32_t s3{ m->size() };
+                    ctx.check(std::string{ "htm_size_idempotent_" } + f,
+                              s1 == s2 && s2 == s3);
+                    const std::int32_t w1{
+                        static_cast<std::int32_t>(m->to_entries<str_oop, str_oop>().size()) };
+                    const std::int32_t w2{
+                        static_cast<std::int32_t>(m->to_entries<str_oop, str_oop>().size()) };
+                    ctx.check(std::string{ "htm_walk_count_idempotent_" } + f, w1 == w2);
+                    ctx.check(std::string{ "htm_walk_count_eq_stable_size_" } + f, w1 == s1);
+                }
+            }
+        }
     }   // run_checks
 }   // anonymous namespace
 

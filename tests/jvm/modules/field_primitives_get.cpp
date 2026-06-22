@@ -1581,6 +1581,537 @@ static void run_field_primitives_get_checks(vmhook_test::context& ctx)
             ctx.check("int_proxy_address_4_aligned", (addr % alignof(std::int32_t)) == 0);
         }
     }
+
+    // =====================================================================
+    //  DEEPEN WAVE 7 -- additive HARD coverage (no rewrite of anything above).
+    //  Every check below is over a REAL resolved field (or the documented
+    //  null-proxy contract); none fabricates an address, installs a hook, or
+    //  infers a JDK-variant result.  Distinct check-name prefix dw7_ keeps it
+    //  from colliding with any existing assertion.
+    // =====================================================================
+
+    // ---------------------------------------------------------------------
+    //  field_proxy::is_reference() (the SIGNATURE-based proxy method) vs
+    //  value_t::is_reference() (the VARIANT-based one already tested).  The
+    //  proxy method keys off signature_text.front() (L/[ only); for EVERY
+    //  primitive descriptor it must be false, and get_compressed_oop() must
+    //  return 0 (FLAW-C guard: a primitive holds no OOP).  This is a different
+    //  code path from the value_t predicate and was never exercised here.
+    // ---------------------------------------------------------------------
+    {
+        const char* prim_fields[] = {
+            "sBoolTrue", "sBoolFalse", "sByteMin", "sByteMax", "sByte0xFF",
+            "sShortMin", "sShortMax", "sIntMin", "sIntMax", "sLongMin",
+            "sLongMax", "sFloatPi", "sFloatNaN", "sDoublePi", "sDoubleNaN",
+            "sCharMax", "sCharNull"
+        };
+        for (const char* field : prim_fields)
+        {
+            auto fp{ fpg::static_field(field) };
+            ctx.check(std::string{ "dw7_proxy_resolves_" } + field, fp.has_value());
+            if (!fp) { continue; }
+            ctx.check(std::string{ "dw7_proxy_is_reference_false_" } + field,
+                      fp->is_reference() == false);
+            ctx.check(std::string{ "dw7_proxy_compressed_oop_zero_" } + field,
+                      fp->get_compressed_oop() == 0u);
+        }
+        // POSITIVE counterpart: the String field's proxy-level is_reference() is
+        // true and get_compressed_oop() is a NON-zero narrow OOP (the field holds
+        // a live String).  Degrades to [INFO] only if the field is absent.
+        {
+            auto fp{ fpg::static_field("sRefString") };
+            if (fp)
+            {
+                ctx.check("dw7_proxy_ref_is_reference_true", fp->is_reference() == true);
+                ctx.check("dw7_proxy_ref_compressed_oop_nonzero",
+                          fp->get_compressed_oop() != 0u);
+            }
+            else
+            {
+                ctx.record("[INFO] field_primitives_get dw7: sRefString absent; "
+                           "skipping proxy-level reference is_reference()/OOP checks.");
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  as_string() == "" for EVERY primitive descriptor (the negative-space
+    //  block above sampled 8 fields; here we pin it for a fresh set spanning
+    //  all 8 descriptors AND the two boolean states, since as_string() only
+    //  decodes the uint32 OOP alternative -- every primitive alternative must
+    //  yield empty).  Complements value_t::is_reference()==false.
+    // ---------------------------------------------------------------------
+    {
+        const char* fields[] = {
+            "sBoolTrue", "sBoolFalse", "sByte0xAA", "sShortBeef", "sIntDeadBeef",
+            "sLongDeadBeef", "sFloatNaNPay", "sDoubleNaNPay", "sChar0xAAAA"
+        };
+        for (const char* field : fields)
+        {
+            auto fp{ fpg::static_field(field) };
+            if (!fp) { continue; }
+            const auto v{ fp->get() };
+            ctx.check(std::string{ "dw7_as_string_empty_" } + field, v.as_string().empty());
+            ctx.check(std::string{ "dw7_value_is_reference_false_" } + field,
+                      v.is_reference() == false);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  NULL-proxy: extend the (buggy-by-design) int32-zero contract to EVERY
+    //  numeric target type the existing block omitted (it covered int / bool /
+    //  double only).  For a null field_proxy of ANY descriptor get() returns
+    //  value_t{int32_t{0}, sig}; converting that zero to int8/int16/int64/
+    //  uint16/uint32/float must all be the zero of that type, with no crash.
+    //  Also: as_string() is empty for the null proxy of a primitive descriptor.
+    // ---------------------------------------------------------------------
+    {
+        const char* sigs[] = { "Z", "B", "S", "I", "J", "F", "D", "C" };
+        for (const char* sig : sigs)
+        {
+            vmhook::field_proxy fp{ nullptr, sig, false };
+            const auto v{ fp.get() };
+            const std::int8_t  as_i8{ v };
+            const std::int16_t as_i16{ v };
+            const std::int64_t as_i64{ v };
+            const std::uint16_t as_u16{ v };
+            const std::uint32_t as_u32{ v };
+            const float        as_f{ v };
+            ctx.check(std::string{ "dw7_null_i8_zero_" } + sig,  as_i8  == 0);
+            ctx.check(std::string{ "dw7_null_i16_zero_" } + sig, as_i16 == 0);
+            ctx.check(std::string{ "dw7_null_i64_zero_" } + sig, as_i64 == 0);
+            ctx.check(std::string{ "dw7_null_u16_zero_" } + sig, as_u16 == 0u);
+            ctx.check(std::string{ "dw7_null_u32_zero_" } + sig, as_u32 == 0u);
+            ctx.check(std::string{ "dw7_null_float_zero_" } + sig, as_f == 0.0F);
+            ctx.check(std::string{ "dw7_null_as_string_empty_" } + sig, v.as_string().empty());
+            // The null proxy's signature-based predicate is false for a primitive
+            // descriptor and its compressed OOP is 0 (field_pointer is null).
+            ctx.check(std::string{ "dw7_null_proxy_is_reference_false_" } + sig,
+                      fp.is_reference() == false);
+            ctx.check(std::string{ "dw7_null_proxy_compressed_oop_zero_" } + sig,
+                      fp.get_compressed_oop() == 0u);
+        }
+        // A null proxy of a REFERENCE descriptor: is_reference() is true (signature
+        // starts with 'L'/'['), but get_compressed_oop() is 0 (null field_pointer),
+        // and get() STILL returns the int32-zero fallback (variant index 3).
+        {
+            vmhook::field_proxy fpL{ nullptr, "Ljava/lang/String;", false };
+            vmhook::field_proxy fpArr{ nullptr, "[I", false };
+            ctx.check("dw7_null_ref_proxy_is_reference_true",  fpL.is_reference() == true);
+            ctx.check("dw7_null_arr_proxy_is_reference_true",  fpArr.is_reference() == true);
+            ctx.check("dw7_null_ref_proxy_compressed_oop_zero", fpL.get_compressed_oop() == 0u);
+            ctx.check("dw7_null_arr_proxy_compressed_oop_zero", fpArr.get_compressed_oop() == 0u);
+            const auto vL{ fpL.get() };
+            ctx.check("dw7_null_ref_variant_is_int32", vL.data.index() == kIdxI32);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  FULL widening matrix for the signed integer descriptors (B/S/I) into
+    //  the wider signed types AND the unsigned masks.  The existing module
+    //  checks B->int, S->int, I->long; here we pin the COMPLETE ladder for a
+    //  negative and a positive representative of each, so every static_cast in
+    //  cast_for_variant's generic branch is exercised at a known value:
+    //    negative byte -1   widens to int16/int32/int64 == -1, masks to all-Fs;
+    //    positive byte 127  widens cleanly with no sign bits set.
+    // ---------------------------------------------------------------------
+    {
+        // byte -1 (0xFF) -- sign extends through every wider signed width.
+        if (auto fp{ fpg::static_field("sByteNegOne") })
+        {
+            const auto v{ fp->get() };
+            const std::int16_t s{ v };
+            const std::int32_t i{ v };
+            const std::int64_t l{ v };
+            const std::uint16_t u16{ v };
+            const std::uint64_t u64{ v };
+            ctx.check("dw7_byteNegOne_to_i16", s == -1);
+            ctx.check("dw7_byteNegOne_to_i32", i == -1);
+            ctx.check("dw7_byteNegOne_to_i64", l == -1);
+            ctx.check("dw7_byteNegOne_to_u16", u16 == 0xFFFFu);
+            ctx.check("dw7_byteNegOne_to_u64", u64 == 0xFFFFFFFFFFFFFFFFull);
+        }
+        // byte 127 (0x7F) -- positive, no sign extension anywhere.
+        if (auto fp{ fpg::static_field("sByte0x7F") })
+        {
+            const auto v{ fp->get() };
+            const std::int16_t s{ v };
+            const std::int64_t l{ v };
+            const std::uint32_t u32{ v };
+            ctx.check("dw7_byte7F_to_i16", s == 127);
+            ctx.check("dw7_byte7F_to_i64", l == 127);
+            ctx.check("dw7_byte7F_to_u32", u32 == 0x7Fu);
+        }
+        // short -1 -- sign extends to int/long, masks to all-Fs unsigned.
+        if (auto fp{ fpg::static_field("sShortNegOne") })
+        {
+            const auto v{ fp->get() };
+            const std::int32_t i{ v };
+            const std::int64_t l{ v };
+            const std::uint32_t u32{ v };
+            const std::uint64_t u64{ v };
+            ctx.check("dw7_shortNegOne_to_i32", i == -1);
+            ctx.check("dw7_shortNegOne_to_i64", l == -1);
+            ctx.check("dw7_shortNegOne_to_u32", u32 == 0xFFFFFFFFu);
+            ctx.check("dw7_shortNegOne_to_u64", u64 == 0xFFFFFFFFFFFFFFFFull);
+        }
+        // short Min (-32768, 0x8000) -- exact widen, low 16 bits preserved.
+        if (auto fp{ fpg::static_field("sShortMin") })
+        {
+            const auto v{ fp->get() };
+            const std::int32_t i{ v };
+            const std::uint16_t u16{ v };
+            ctx.check("dw7_shortMin_to_i32", i == -32768);
+            ctx.check("dw7_shortMin_to_u16", u16 == 0x8000u);
+        }
+        // int -1 -- sign extends to long, masks to 0xFFFFFFFF / all-Fs.
+        if (auto fp{ fpg::static_field("sIntNegOne") })
+        {
+            const auto v{ fp->get() };
+            const std::int64_t l{ v };
+            const std::uint32_t u32{ v };
+            const std::uint64_t u64{ v };
+            ctx.check("dw7_intNegOne_to_i64", l == -1);
+            ctx.check("dw7_intNegOne_to_u32", u32 == 0xFFFFFFFFu);
+            ctx.check("dw7_intNegOne_to_u64", u64 == 0xFFFFFFFFFFFFFFFFull);
+        }
+        // int Min -- exact widen to long, low 32 bits preserved unsigned.
+        if (auto fp{ fpg::static_field("sIntMin") })
+        {
+            const auto v{ fp->get() };
+            const std::int64_t l{ v };
+            const std::uint32_t u32{ v };
+            ctx.check("dw7_intMin_to_i64", l == static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()));
+            ctx.check("dw7_intMin_to_u32", u32 == 0x80000000u);
+        }
+        // long Min/HighBits -- round-trip through uint64 mask (no wider signed target).
+        if (auto fp{ fpg::static_field("sLongMin") })
+        {
+            const auto v{ fp->get() };
+            const std::uint64_t u64{ v };
+            ctx.check("dw7_longMin_to_u64", u64 == 0x8000000000000000ull);
+        }
+        if (auto fp{ fpg::static_field("sLongHighBits") })
+        {
+            const auto v{ fp->get() };
+            const std::int64_t l{ v };
+            const std::uint64_t u64{ v };
+            ctx.check("dw7_longHighBits_value", l == 0x00000000FFFFFFFFLL);
+            ctx.check("dw7_longHighBits_to_u64", u64 == 0x00000000FFFFFFFFull);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  CHAR widening/narrowing matrix.  char is the UNSIGNED 16-bit code unit,
+    //  so widening to int32/int64/uint32 is ALWAYS zero-extended (never
+    //  negative), even for 0xFFFF -- the converse of the signed-short case
+    //  above.  And the 1-byte targets (char / signed char / int8_t) all keep
+    //  exactly the low byte.  Pins both directions on the same field.
+    // ---------------------------------------------------------------------
+    {
+        if (auto fp{ fpg::static_field("sCharMax") }) // 0xFFFF
+        {
+            const auto v{ fp->get() };
+            const std::int32_t i{ v };
+            const std::int64_t l{ v };
+            const std::uint32_t u32{ v };
+            ctx.check("dw7_charMax_zero_extends_i32", i == 0xFFFF);
+            ctx.check("dw7_charMax_zero_extends_i64", l == 0xFFFF);
+            ctx.check("dw7_charMax_zero_extends_u32", u32 == 0xFFFFu);
+            // 1-byte targets keep the low byte 0xFF (signed char sees it as -1).
+            const signed char sc{ v };
+            const std::int8_t i8{ v };
+            ctx.check("dw7_charMax_signed_char_low_byte",
+                      static_cast<unsigned char>(sc) == 0xFFu);
+            ctx.check("dw7_charMax_int8_low_byte",
+                      static_cast<unsigned char>(i8) == 0xFFu);
+        }
+        if (auto fp{ fpg::static_field("sCharBmp") }) // 0x4E2D
+        {
+            const auto v{ fp->get() };
+            const std::int32_t i{ v };
+            const signed char sc{ v };
+            ctx.check("dw7_charBmp_zero_extends_i32", i == 0x4E2D);
+            // low byte 0x2D is positive in signed char (no sign bit).
+            ctx.check("dw7_charBmp_signed_char_low_byte",
+                      static_cast<unsigned char>(sc) == 0x2Du);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  Alternating-bit FLOAT/DOUBLE value classification.  The bit patterns
+    //  0x55555555 / 0xAAAAAAAA (and 64-bit analogues) are FINITE NORMAL
+    //  numbers -- not NaN, not Inf -- so isfinite() is true and isnan/isinf are
+    //  false.  The module bit-checks them but never asserted their value
+    //  class.  Pins that get() delivers a genuinely usable finite float here.
+    // ---------------------------------------------------------------------
+    {
+        const char* ff[] = { "sFloat0x55555555", "sFloat0xAAAAAAAA" };
+        for (const char* field : ff)
+        {
+            if (auto fp{ fpg::static_field(field) })
+            {
+                const float g{ fp->get() };
+                ctx.check(std::string{ "dw7_altfloat_finite_" } + field, std::isfinite(g));
+                ctx.check(std::string{ "dw7_altfloat_not_nan_" } + field, !std::isnan(g));
+                ctx.check(std::string{ "dw7_altfloat_not_inf_" } + field, !std::isinf(g));
+            }
+        }
+        const char* dd[] = { "sDouble0x5555555555555555", "sDouble0xAAAAAAAAAAAAAAAA" };
+        for (const char* field : dd)
+        {
+            if (auto fp{ fpg::static_field(field) })
+            {
+                const double g{ fp->get() };
+                ctx.check(std::string{ "dw7_altdouble_finite_" } + field, std::isfinite(g));
+                ctx.check(std::string{ "dw7_altdouble_not_nan_" } + field, !std::isnan(g));
+                ctx.check(std::string{ "dw7_altdouble_not_inf_" } + field, !std::isinf(g));
+            }
+        }
+        // 0x55555555 has the sign bit CLEAR (positive); 0xAAAAAAAA has it SET
+        // (negative).  signbit() round-trips the stored sign bit through get().
+        if (auto fp{ fpg::static_field("sFloat0x55555555") })
+        {
+            const float g{ fp->get() };
+            ctx.check("dw7_altfloat_55_positive", !std::signbit(g));
+        }
+        if (auto fp{ fpg::static_field("sFloat0xAAAAAAAA") })
+        {
+            const float g{ fp->get() };
+            ctx.check("dw7_altfloat_AA_negative", std::signbit(g));
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  FINITE FP -> WIDER-INT and UNSIGNED conversions (extends the existing
+    //  f2i/d2i block, which only checked int/long/bool).  2^20 / 2^24 are
+    //  exactly representable and FINITE, so the cast to uint32 / int64 / uint64
+    //  is well-defined.  Negative finite -1.5/-2.5 truncate toward zero to
+    //  -1/-2 in int64 too.  Only FINITE operands (never the UB non-finite case).
+    // ---------------------------------------------------------------------
+    {
+        if (auto fp{ fpg::static_field("sFloatBigExact") }) // 1048576.0
+        {
+            const auto v{ fp->get() };
+            const std::int64_t l{ v };
+            const std::uint32_t u32{ v };
+            ctx.check("dw7_floatBig_to_i64", l == 1048576LL);
+            ctx.check("dw7_floatBig_to_u32", u32 == 1048576u);
+        }
+        if (auto fp{ fpg::static_field("sDoubleBigExact") }) // 16777216.0
+        {
+            const auto v{ fp->get() };
+            const std::int64_t l{ v };
+            const std::uint32_t u32{ v };
+            ctx.check("dw7_doubleBig_to_i64", l == 16777216LL);
+            ctx.check("dw7_doubleBig_to_u32", u32 == 16777216u);
+        }
+        if (auto fp{ fpg::static_field("sFloatNegThreeHalf") }) // -1.5
+        {
+            const auto v{ fp->get() };
+            const std::int64_t l{ v };
+            ctx.check("dw7_floatNegThreeHalf_to_i64_truncs", l == -1LL);
+        }
+        if (auto fp{ fpg::static_field("sDoubleNegFiveHalf") }) // -2.5
+        {
+            const auto v{ fp->get() };
+            const std::int64_t l{ v };
+            ctx.check("dw7_doubleNegFiveHalf_to_i64_truncs", l == -2LL);
+        }
+        // +1.0 / -1.0 exact -> int 1 / -1 and bool true (nonzero).
+        if (auto fp{ fpg::static_field("sFloatOne") })
+        {
+            const auto v{ fp->get() };
+            const int i{ v };
+            const bool b{ v };
+            ctx.check("dw7_floatOne_to_int", i == 1);
+            ctx.check("dw7_floatOne_to_bool_true", b == true);
+        }
+        if (auto fp{ fpg::static_field("sDoubleNegOne") })
+        {
+            const auto v{ fp->get() };
+            const int i{ v };
+            const bool b{ v };
+            ctx.check("dw7_doubleNegOne_to_int", i == -1);
+            ctx.check("dw7_doubleNegOne_to_bool_true", b == true);
+        }
+        // +0.0 and -0.0 both convert to bool false and int 0 (negative-zero is
+        // numerically zero -- the bool conversion must NOT treat the sign bit as
+        // truthy).
+        if (auto fp{ fpg::static_field("sFloatNegZero") })
+        {
+            const auto v{ fp->get() };
+            const bool b{ v };
+            const int i{ v };
+            ctx.check("dw7_floatNegZero_to_bool_false", b == false);
+            ctx.check("dw7_floatNegZero_to_int_zero", i == 0);
+        }
+        if (auto fp{ fpg::static_field("sDoubleNegZero") })
+        {
+            const auto v{ fp->get() };
+            const bool b{ v };
+            const int i{ v };
+            ctx.check("dw7_doubleNegZero_to_bool_false", b == false);
+            ctx.check("dw7_doubleNegZero_to_int_zero", i == 0);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  Repeatability (purity) for the remaining descriptors.  The module
+    //  proves J/F/C are side-effect-free across two reads; extend to B/S/I/D
+    //  so EVERY primitive descriptor has a two-read idempotency witness (value
+    //  + variant alternative stable).
+    // ---------------------------------------------------------------------
+    {
+        auto pair_stable_int = [&](const char* field, const char* tag)
+        {
+            auto a{ fpg::static_field(field) };
+            auto b{ fpg::static_field(field) };
+            if (!a || !b) { return; }
+            const auto va{ a->get() };
+            const auto vb{ b->get() };
+            const std::int64_t la{ va };
+            const std::int64_t lb{ vb };
+            ctx.check(std::string{ "dw7_repeatable_value_" } + tag, la == lb);
+            ctx.check(std::string{ "dw7_repeatable_variant_" } + tag,
+                      va.data.index() == vb.data.index());
+        };
+        pair_stable_int("sByte0xAB", "B");
+        pair_stable_int("sShortBeef", "S");
+        pair_stable_int("sIntDeadBeef", "I");
+        // double: compare bit patterns so a NaN payload is a faithful witness.
+        {
+            auto a{ fpg::static_field("sDoubleNaNPay") };
+            auto b{ fpg::static_field("sDoubleNaNPay") };
+            if (a && b)
+            {
+                const auto va{ a->get() };
+                const auto vb{ b->get() };
+                const double da{ va };
+                const double db{ vb };
+                ctx.check("dw7_repeatable_value_D", double_bits(da) == double_bits(db));
+                ctx.check("dw7_repeatable_variant_D", va.data.index() == vb.data.index());
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  raw_address() is DISTINCT per field (offset correctness at the pointer
+    //  level): two different static fields resolve to two different addresses,
+    //  and the SAME field resolves to the SAME address twice (stable).  This
+    //  complements the value-level multi-offset block -- it pins the pointer
+    //  get() reads from is per-field, not a shared slot.
+    // ---------------------------------------------------------------------
+    {
+        auto a{ fpg::static_field("sIntZero") };
+        auto b{ fpg::static_field("sIntOne") };
+        if (a && b)
+        {
+            ctx.check("dw7_distinct_addr_two_fields",
+                      a->raw_address() != b->raw_address());
+        }
+        auto c1{ fpg::static_field("sIntZero") };
+        auto c2{ fpg::static_field("sIntZero") };
+        if (c1 && c2)
+        {
+            ctx.check("dw7_same_addr_same_field",
+                      c1->raw_address() == c2->raw_address());
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  Instance-proxy signature() METHOD + is_static()==false for EVERY
+    //  primitive descriptor (the existing batch-18 block covered the STATIC
+    //  proxy only).  Pins that the instance-dispatch proxy carries the right
+    //  descriptor and the correct (non-static) flag for each of Z B S I J F D C.
+    // ---------------------------------------------------------------------
+    {
+        const auto inst{ fpg::get_instance() };
+        if (inst)
+        {
+            struct sig_case { const char* field; const char* sig; };
+            const sig_case cases[] = {
+                { "iBool", "Z" },   { "iByte", "B" },  { "iShort", "S" },
+                { "iInt", "I" },    { "iLong", "J" },  { "iFloat", "F" },
+                { "iDouble", "D" }, { "iChar", "C" },
+            };
+            for (const auto& sc : cases)
+            {
+                auto fp{ inst->get_field(sc.field) };
+                if (!fp) { continue; }
+                ctx.check(std::string{ "dw7_inst_signature_method_" } + sc.field,
+                          std::string{ fp->signature() } == sc.sig);
+                ctx.check(std::string{ "dw7_inst_is_static_false_" } + sc.field,
+                          fp->is_static() == false);
+                ctx.check(std::string{ "dw7_inst_proxy_is_reference_false_" } + sc.field,
+                          fp->is_reference() == false);
+                ctx.check(std::string{ "dw7_inst_proxy_compressed_oop_zero_" } + sc.field,
+                          fp->get_compressed_oop() == 0u);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  Instance repeatability + distinct-address (offset correctness on the
+    //  instance-dispatch path).  Reading the same instance field twice yields
+    //  identical value + variant; two different instance fields have distinct
+    //  raw addresses.  A fresh handle keeps this self-contained.
+    // ---------------------------------------------------------------------
+    {
+        const auto inst{ fpg::get_instance() };
+        if (inst)
+        {
+            auto a{ inst->get_field("iLong") };
+            auto b{ inst->get_field("iLong") };
+            if (a && b)
+            {
+                const auto va{ a->get() };
+                const auto vb{ b->get() };
+                const std::int64_t la{ va };
+                const std::int64_t lb{ vb };
+                ctx.check("dw7_inst_repeatable_J_value", la == lb && la == 0x0123456789ABCDEFLL);
+                ctx.check("dw7_inst_repeatable_J_variant", va.data.index() == vb.data.index());
+            }
+            auto p{ inst->get_field("iInt") };
+            auto q{ inst->get_field("iLong") };
+            if (p && q)
+            {
+                ctx.check("dw7_inst_distinct_addr_two_fields",
+                          p->raw_address() != q->raw_address());
+                ctx.check("dw7_inst_addr_nonnull", p->raw_address() != nullptr);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  Boolean canonicalisation end-to-end (FLAW #1 witness on a real field):
+    //  reading the genuine true/false fields, the bool widened to int is
+    //  EXACTLY 1 or 0 (never some other byte), and the bool->uint32 conversion
+    //  is 1/0 too.  This is the canonical-bool contract the audit flagged get()
+    //  as the only sibling NOT to normalise; we pin the observable result.
+    // ---------------------------------------------------------------------
+    {
+        if (auto fp{ fpg::static_field("sBoolTrue") })
+        {
+            const auto v{ fp->get() };
+            const int i{ v };
+            const std::uint32_t u{ v };
+            const std::int64_t l{ v };
+            ctx.check("dw7_boolTrue_int_is_one", i == 1);
+            ctx.check("dw7_boolTrue_u32_is_one", u == 1u);
+            ctx.check("dw7_boolTrue_i64_is_one", l == 1);
+        }
+        if (auto fp{ fpg::static_field("sBoolFalse") })
+        {
+            const auto v{ fp->get() };
+            const int i{ v };
+            const std::uint32_t u{ v };
+            const float f{ v };
+            ctx.check("dw7_boolFalse_int_is_zero", i == 0);
+            ctx.check("dw7_boolFalse_u32_is_zero", u == 0u);
+            ctx.check("dw7_boolFalse_float_is_zero", f == 0.0F);
+        }
+    }
 }
 
 VMHOOK_JVM_MODULE(field_primitives_get)

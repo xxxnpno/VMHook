@@ -95,6 +95,8 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
+#include <variant>
 
 namespace
 {
@@ -352,6 +354,60 @@ namespace
         // A benign safeAdd AFTER the whole boundary sequence must still work.
         std::atomic<bool>         recovery_ok{ false };
         std::atomic<std::int64_t> recovery_value{ k_uncaptured };
+
+        // ── ADDITIVE deepening: proxy/field introspection + arithmetic edges ──
+        // All captured in the SAME boundary detour cycle (no new drive cycle, so
+        // the detour/trigger fire-count invariants are untouched).
+        // (A) boom proxy introspection: an instance (I)I method is NOT static and
+        //     NOT a reference return.
+        std::atomic<bool>         boom_is_static{ true };       // expect false
+        std::atomic<bool>         boom_is_reference{ true };    // expect false
+        std::atomic<bool>         boom_sig_ok{ false };         // signature()=="(I)I"
+        std::atomic<bool>         boom_name_ok{ false };        // name()=="boom"
+        // (B) sBoom proxy introspection: a static (I)I method IS static, NOT a ref.
+        std::atomic<bool>         sboom_resolved{ false };
+        std::atomic<bool>         sboom_is_static{ false };     // expect true
+        std::atomic<bool>         sboom_is_reference{ true };   // expect false
+        std::atomic<bool>         sboom_sig_ok{ false };
+        // (C) throwString proxy: (I)Ljava/lang/String; IS a reference return, NOT
+        //     static.
+        std::atomic<bool>         tstring_resolved{ false };
+        std::atomic<bool>         tstring_is_reference{ false };// expect true
+        std::atomic<bool>         tstring_is_static{ true };    // expect false
+        // (D) safeAdd proxy: instance (I)I, not static, not reference.
+        std::atomic<bool>         safeadd_resolved{ false };
+        std::atomic<bool>         safeadd_is_static{ true };    // expect false
+        std::atomic<bool>         safeadd_is_reference{ true }; // expect false
+        // (E) NEGATIVE resolution: an exact name+signature mismatch must NOT
+        //     resolve (pinned-overload resolution never falls back to a sibling).
+        std::atomic<bool>         neg_wrong_sig_resolved{ true };   // expect false: boom "(J)I"
+        std::atomic<bool>         neg_wrong_name_resolved{ true };  // expect false: nope "(I)I"
+        std::atomic<bool>         neg_probe_ran{ false };           // both negative probes attempted
+        // (F) field_proxy introspection on the health fields.
+        std::atomic<bool>         hf_probe_ran{ false };
+        std::atomic<bool>         hf_is_static{ true };         // healthField: expect false
+        std::atomic<bool>         hf_is_reference{ true };      // healthField: expect false
+        std::atomic<bool>         hf_sig_is_I{ false };         // healthField sig=="I"
+        std::atomic<bool>         shf_is_static{ false };       // staticHealthField: expect true
+        std::atomic<bool>         shf_sig_is_I{ false };        // staticHealthField sig=="I"
+        std::atomic<bool>         strfield_resolved{ false };
+        std::atomic<bool>         strfield_is_reference{ false };// stringArgLastValue: expect true
+        // (G) safeAdd arithmetic edges (well-defined Java int wraparound: x+1).
+        std::atomic<bool>         sa_zero_reached{ false };
+        std::atomic<std::int64_t> sa_neg_one_value{ k_uncaptured };   // safeAdd(-1)==0
+        std::atomic<std::int64_t> sa_int_max_value{ k_uncaptured };   // safeAdd(INT_MAX)==INT_MIN (wrap)
+        std::atomic<std::int64_t> sa_int_min_value{ k_uncaptured };   // safeAdd(INT_MIN)==INT_MIN+1
+        std::atomic<bool>         sa_edges_clean{ false };             // ExceptionCheck 0 after edges
+        // (H) extra non-throwing boom branch values (the SAME proxy that threw).
+        std::atomic<std::int64_t> nothrow_one_value{ k_uncaptured };  // boom(1)==1
+        std::atomic<std::int64_t> nothrow_big_value{ k_uncaptured };  // boom(0x600D)==0x600D
+        // (I) value_t self-consistency on a non-throwing int return: is_void()
+        //     false, is_string() false, variant index is the int32 alternative.
+        std::atomic<int>          nothrow_zero_variant{ -1 };
+        std::atomic<bool>         nothrow_zero_is_string{ true };  // expect false
+        // (J) is_void()/is_string() agree with the monostate/string variant on a
+        //     contained-throw style value is covered elsewhere; here only the
+        //     non-throwing int path is exercised.
     };
     boundary_obs g_boundary;
 
@@ -779,6 +835,157 @@ namespace
                 }
                 vmhook::detail::jni_exception_clear();
             }
+        }
+
+        // ── ADDITIVE deepening, all on this same boundary detour cycle ──────────
+
+        // (5) Proxy introspection on the boom proxy that just threw repeatedly:
+        // an instance (I)I method is NOT static and NOT a reference return, and its
+        // name/signature are exactly as resolved (pure Method* metadata reads — no
+        // JNI, no exception risk).
+        g_boundary.boom_is_static.store(boom->is_static());
+        g_boundary.boom_is_reference.store(boom->is_reference());
+        g_boundary.boom_name_ok.store(boom->name() == std::string_view{ "boom" });
+        g_boundary.boom_sig_ok.store(boom->signature() == std::string_view{ "(I)I" });
+
+        // (6) sBoom proxy introspection: a STATIC (I)I method IS static, NOT a ref.
+        {
+            auto sb{ throwfix::static_method("sBoom", "(I)I") };
+            if (sb.has_value())
+            {
+                g_boundary.sboom_resolved.store(true);
+                g_boundary.sboom_is_static.store(sb->is_static());
+                g_boundary.sboom_is_reference.store(sb->is_reference());
+                g_boundary.sboom_sig_ok.store(sb->signature() == std::string_view{ "(I)I" });
+            }
+        }
+
+        // (7) throwString proxy: (I)Ljava/lang/String; IS a reference return and is
+        // NOT static.  (We do NOT call it here — resolution + descriptor inspection
+        // only — so no extra throw is driven this cycle.)
+        {
+            auto ts{ self->get_method("throwString", "(I)Ljava/lang/String;") };
+            if (ts.has_value())
+            {
+                g_boundary.tstring_resolved.store(true);
+                g_boundary.tstring_is_reference.store(ts->is_reference());
+                g_boundary.tstring_is_static.store(ts->is_static());
+            }
+        }
+
+        // (8) safeAdd proxy introspection: instance (I)I, not static, not reference.
+        {
+            auto sa{ self->get_method("safeAdd", "(I)I") };
+            if (sa.has_value())
+            {
+                g_boundary.safeadd_resolved.store(true);
+                g_boundary.safeadd_is_static.store(sa->is_static());
+                g_boundary.safeadd_is_reference.store(sa->is_reference());
+            }
+        }
+
+        // (9) NEGATIVE resolution: an exact name+signature mismatch must NOT
+        // resolve.  get_method walks the hierarchy for an EXACT name+descriptor
+        // match and pins it; a wrong-descriptor or wrong-name lookup yields nullopt
+        // (never a sibling-overload fallback).  This is a pure metadata walk.
+        {
+            auto wrong_sig { self->get_method("boom", "(J)I") };           // no (J)I boom exists
+            auto wrong_name{ self->get_method("noSuchMethodXYZ", "(I)I") };// name absent entirely
+            g_boundary.neg_wrong_sig_resolved.store(wrong_sig.has_value());
+            g_boundary.neg_wrong_name_resolved.store(wrong_name.has_value());
+            g_boundary.neg_probe_ran.store(true);
+        }
+
+        // (10) field_proxy introspection on the health/witness fields (metadata
+        // only — get()/set() are NOT called here).
+        {
+            auto hf{ self->get_field("healthField") };
+            if (hf.has_value())
+            {
+                g_boundary.hf_probe_ran.store(true);
+                g_boundary.hf_is_static.store(hf->is_static());
+                g_boundary.hf_is_reference.store(hf->is_reference());
+                g_boundary.hf_sig_is_I.store(hf->signature() == std::string_view{ "I" });
+            }
+            auto shf{ throwfix::static_field("staticHealthField") };
+            if (shf.has_value())
+            {
+                g_boundary.shf_is_static.store(shf->is_static());
+                g_boundary.shf_sig_is_I.store(shf->signature() == std::string_view{ "I" });
+            }
+            auto strf{ throwfix::static_field("stringArgLastValue") };
+            if (strf.has_value())
+            {
+                g_boundary.strfield_resolved.store(true);
+                g_boundary.strfield_is_reference.store(strf->is_reference());
+            }
+        }
+
+        // (11) safeAdd arithmetic edges — Java int is 32-bit two's-complement with
+        // well-defined wraparound, so each result is CERTAIN: safeAdd(x) == x+1.
+        //   safeAdd(-1)       == 0
+        //   safeAdd(INT_MAX)  == INT_MIN   (0x7FFFFFFF + 1 wraps to 0x80000000)
+        //   safeAdd(INT_MIN)  == INT_MIN+1 (0x80000001)
+        {
+            auto sa{ self->get_method("safeAdd", "(I)I") };
+            if (sa.has_value())
+            {
+                g_boundary.sa_zero_reached.store(true);
+                {
+                    const vmhook::method_proxy::value_t r = sa->call(static_cast<std::int32_t>(-1));
+                    if (std::holds_alternative<std::int32_t>(r.data))
+                    {
+                        const std::int32_t v = r;
+                        g_boundary.sa_neg_one_value.store(static_cast<std::int64_t>(v));
+                    }
+                }
+                {
+                    const vmhook::method_proxy::value_t r = sa->call(k_int_max);
+                    if (std::holds_alternative<std::int32_t>(r.data))
+                    {
+                        const std::int32_t v = r;
+                        g_boundary.sa_int_max_value.store(static_cast<std::int64_t>(v));
+                    }
+                }
+                {
+                    const vmhook::method_proxy::value_t r = sa->call(k_int_min);
+                    if (std::holds_alternative<std::int32_t>(r.data))
+                    {
+                        const std::int32_t v = r;
+                        g_boundary.sa_int_min_value.store(static_cast<std::int64_t>(v));
+                    }
+                }
+                vmhook::detail::jni_exception_clear();
+                static_cast<void>(vmhook::hotspot::ensure_current_java_thread());
+                g_boundary.sa_edges_clean.store(jni_exception_pending() == 0);
+            }
+        }
+
+        // (12) Extra non-throwing boom branch values via the SAME proxy that threw.
+        // boom(x) returns x unchanged for x >= 0, so each is exact.
+        {
+            const vmhook::method_proxy::value_t r = boom->call(static_cast<std::int32_t>(1));
+            if (std::holds_alternative<std::int32_t>(r.data))
+            {
+                const std::int32_t v = r;
+                g_boundary.nothrow_one_value.store(static_cast<std::int64_t>(v));
+            }
+        }
+        {
+            const vmhook::method_proxy::value_t r = boom->call(static_cast<std::int32_t>(0x600D));
+            if (std::holds_alternative<std::int32_t>(r.data))
+            {
+                const std::int32_t v = r;
+                g_boundary.nothrow_big_value.store(static_cast<std::int64_t>(v));
+            }
+        }
+
+        // (13) value_t self-consistency on a non-throwing int return: is_string()
+        // is false and the live variant index equals the int32 alternative's index.
+        {
+            const vmhook::method_proxy::value_t r = boom->call(static_cast<std::int32_t>(0));
+            g_boundary.nothrow_zero_is_string.store(r.is_string());
+            g_boundary.nothrow_zero_variant.store(static_cast<int>(r.data.index()));
         }
 
         // Final clear so nothing escapes into vmhook.Main.
@@ -1362,6 +1569,111 @@ VMHOOK_JVM_MODULE(method_throwing_call_site)
         ctx.check("tcs_boundary_recovery_ok", g_boundary.recovery_ok.load());
         ctx.check("tcs_boundary_recovery_value_plus_one",
                   g_boundary.recovery_value.load() == static_cast<std::int64_t>(200));
+
+        // ── ADDITIVE deepening assertions (captured on the same boundary cycle) ──
+
+        // (5) boom proxy introspection: an instance (I)I method is NOT static and
+        //     NOT a reference return; name()/signature() are exactly as resolved.
+        ctx.check("tcs_boundary_boom_not_static",     !g_boundary.boom_is_static.load());
+        ctx.check("tcs_boundary_boom_not_reference",  !g_boundary.boom_is_reference.load());
+        ctx.check("tcs_boundary_boom_name_is_boom",   g_boundary.boom_name_ok.load());
+        ctx.check("tcs_boundary_boom_sig_is_int_int", g_boundary.boom_sig_ok.load());
+
+        // (6) sBoom proxy introspection: a STATIC (I)I method IS static, NOT a ref.
+        ctx.check("tcs_boundary_sboom_resolved",     g_boundary.sboom_resolved.load());
+        if (g_boundary.sboom_resolved.load())
+        {
+            ctx.check("tcs_boundary_sboom_is_static",     g_boundary.sboom_is_static.load());
+            ctx.check("tcs_boundary_sboom_not_reference", !g_boundary.sboom_is_reference.load());
+            ctx.check("tcs_boundary_sboom_sig_is_int_int", g_boundary.sboom_sig_ok.load());
+        }
+
+        // (7) throwString proxy: (I)Ljava/lang/String; IS a reference return and is
+        //     NOT static (descriptor introspection only — not called).
+        ctx.check("tcs_boundary_tstring_resolved", g_boundary.tstring_resolved.load());
+        if (g_boundary.tstring_resolved.load())
+        {
+            ctx.check("tcs_boundary_tstring_is_reference", g_boundary.tstring_is_reference.load());
+            ctx.check("tcs_boundary_tstring_not_static",   !g_boundary.tstring_is_static.load());
+        }
+
+        // (8) safeAdd proxy introspection: instance (I)I, not static, not reference.
+        ctx.check("tcs_boundary_safeadd_resolved", g_boundary.safeadd_resolved.load());
+        if (g_boundary.safeadd_resolved.load())
+        {
+            ctx.check("tcs_boundary_safeadd_not_static",    !g_boundary.safeadd_is_static.load());
+            ctx.check("tcs_boundary_safeadd_not_reference", !g_boundary.safeadd_is_reference.load());
+        }
+
+        // (9) NEGATIVE resolution: a wrong-descriptor or wrong-name lookup must NOT
+        //     resolve (pinned exact-match resolution; no sibling fallback).
+        ctx.check("tcs_boundary_neg_probe_ran", g_boundary.neg_probe_ran.load());
+        if (g_boundary.neg_probe_ran.load())
+        {
+            ctx.check("tcs_boundary_neg_wrong_sig_not_resolved",  !g_boundary.neg_wrong_sig_resolved.load());
+            ctx.check("tcs_boundary_neg_wrong_name_not_resolved", !g_boundary.neg_wrong_name_resolved.load());
+        }
+
+        // (10) field_proxy introspection: healthField is a non-static primitive int
+        //      field; staticHealthField is a static primitive int field;
+        //      stringArgLastValue is a reference field.
+        ctx.check("tcs_boundary_hf_probe_ran", g_boundary.hf_probe_ran.load());
+        if (g_boundary.hf_probe_ran.load())
+        {
+            ctx.check("tcs_boundary_healthField_not_static",    !g_boundary.hf_is_static.load());
+            ctx.check("tcs_boundary_healthField_not_reference", !g_boundary.hf_is_reference.load());
+            ctx.check("tcs_boundary_healthField_sig_is_I",      g_boundary.hf_sig_is_I.load());
+            ctx.check("tcs_boundary_staticHealthField_is_static", g_boundary.shf_is_static.load());
+            ctx.check("tcs_boundary_staticHealthField_sig_is_I",  g_boundary.shf_sig_is_I.load());
+        }
+        ctx.check("tcs_boundary_strfield_resolved", g_boundary.strfield_resolved.load());
+        if (g_boundary.strfield_resolved.load())
+        {
+            ctx.check("tcs_boundary_stringArgLastValue_is_reference",
+                      g_boundary.strfield_is_reference.load());
+        }
+
+        // (11) safeAdd arithmetic edges — Java int wraparound is well-defined, so
+        //      each result is certain (safeAdd(x) == x+1, 32-bit two's complement).
+        ctx.check("tcs_boundary_sa_edges_ran", g_boundary.sa_zero_reached.load());
+        if (g_boundary.sa_zero_reached.load())
+        {
+            ctx.check("tcs_boundary_safeAdd_neg_one_is_zero",
+                      g_boundary.sa_neg_one_value.load() == 0);
+            // INT_MAX + 1 wraps to INT_MIN.
+            ctx.check("tcs_boundary_safeAdd_int_max_wraps_to_int_min",
+                      g_boundary.sa_int_max_value.load() == static_cast<std::int64_t>(k_int_min));
+            // INT_MIN + 1 == 0x80000001.
+            ctx.check("tcs_boundary_safeAdd_int_min_plus_one",
+                      g_boundary.sa_int_min_value.load()
+                      == static_cast<std::int64_t>(static_cast<std::int32_t>(k_int_min + 1)));
+            ctx.check("tcs_boundary_safeAdd_edges_left_thread_clean",
+                      g_boundary.sa_edges_clean.load());
+        }
+
+        // (12) Extra non-throwing boom branch values via the SAME proxy that threw.
+        ctx.check("tcs_boundary_nothrow_one_value_is_one",
+                  g_boundary.nothrow_one_value.load() == 1);
+        ctx.check("tcs_boundary_nothrow_big_value_exact",
+                  g_boundary.nothrow_big_value.load() == static_cast<std::int64_t>(0x600D));
+
+        // (13) value_t self-consistency on a non-throwing int return: is_string()
+        //      is false, and the live variant index equals the int32 alternative's
+        //      index (derived from the variant type itself, so no magic number).
+        {
+            // Derive the int32 alternative's index from the variant type itself
+            // (a runtime probe, so no constexpr-variant toolchain edge cases) —
+            // value_t is an aggregate, so this brace-inits .data with the int32.
+            const vmhook::method_proxy::value_t int32_probe{ std::int32_t{ 0 } };
+            const int k_int32_variant_index{ static_cast<int>(int32_probe.data.index()) };
+            ctx.check("tcs_boundary_nothrow_zero_not_string", !g_boundary.nothrow_zero_is_string.load());
+            ctx.check("tcs_boundary_nothrow_zero_variant_is_int32",
+                      g_boundary.nothrow_zero_variant.load() == k_int32_variant_index);
+            // Cross-check: the variant index agrees with the earlier is_int32 flag.
+            ctx.check("tcs_boundary_nothrow_zero_variant_agrees_with_is_int32",
+                      (g_boundary.nothrow_zero_variant.load() == k_int32_variant_index)
+                      == g_boundary.nothrow_zero_is_int32.load());
+        }
     }
 
     // =====================================================================
