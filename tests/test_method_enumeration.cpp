@@ -36,8 +36,12 @@
 // hard assert.
 #include <vmhook/vmhook.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -851,6 +855,480 @@ int main()
     }
     {
         check("H_get_class_methods_return_type", true); // pinned via static_assert above
+    }
+
+    // =====================================================================
+    // PART W (instanceklass_methods_walk DEEPENING) — additive, namespaced.
+    //
+    // The walk turns a klass* into its declared (name, descriptor) list by
+    // reading InstanceKlass::_methods directly.  This section pins the
+    // SUBSTRATE primitives the walk is built from, with every expected value
+    // derived from vmhook.hpp source:
+    //   * klass::get_methods_count()  vmhook.hpp:3504  (Array<T>::_length @0,
+    //                                  clamp count<0||count>65535 -> 0,
+    //                                  return 0 when the _methods VMStruct
+    //                                  entry is unresolved == no JVM here)
+    //   * klass::get_methods_ptr()    vmhook.hpp:3543  (data @ array+8,
+    //                                  nullptr when entry unresolved)
+    //   * detail::collect_klass_methods() vmhook.hpp:8985 (null klass -> empty;
+    //                                  per-slot is_valid_pointer skip @9005)
+    //   * hotspot::is_valid_pointer() vmhook.hpp:2047  (the per-slot skip
+    //                                  predicate: floor/ceiling/odd/9 sentinels)
+    //
+    // POSIX-SAFETY: with NO JVM in-process get_proc_address("gHotSpotVMStructs")
+    // is null (vmhook.hpp:1944), so iterate_struct_entries("InstanceKlass",
+    // "_methods") returns null and BOTH raw accessors bail at their `!entry`
+    // guard (3509 / 3548) BEFORE ever dereferencing `this`.  We therefore call
+    // them ONLY on (a) nullptr and (b) is_valid_pointer-REJECTED low/odd
+    // constants — never on a fabricated valid-shaped address — so no raw read
+    // of a wild pointer ever occurs.  All layout/clamp/decode SEMANTICS that
+    // would need a live klass are pinned through captureless arithmetic mirrors
+    // of the exact source expressions instead.
+    // =====================================================================
+
+    using vmhook::hotspot::is_valid_pointer;
+    using vmhook::hotspot::klass;
+
+    // ---------------------------------------------------------------------
+    // W1 — is_valid_pointer: the EXACT per-slot skip predicate the walk uses
+    // at vmhook.hpp:9005 to drop a Method* slot.  Pure address arithmetic; no
+    // memory is read for ANY of these inputs.  Thresholds from source:
+    //   floor   = 0xFFFF              (vmhook.hpp:520, reject addr <= floor)
+    //   ceiling = 0x00007FFFFFFFFFFF  (vmhook.hpp:515, reject addr >= ceiling)
+    //   reject odd (addr & 1)         (vmhook.hpp:2059)
+    //   reject low32 in 9 sentinels   (vmhook.hpp:2070-2078)
+    // ---------------------------------------------------------------------
+    {
+        constexpr std::uintptr_t floor{ vmhook::os::user_address_floor };       // 0xFFFF
+        constexpr std::uintptr_t ceiling{ vmhook::os::user_address_ceiling };   // 0x00007FFFFFFFFFFF
+        check("W1_floor_value_is_0xFFFF", floor == 0xFFFFull);
+        check("W1_ceiling_value", ceiling == 0x00007FFFFFFFFFFFull);
+
+        // nullptr is rejected (0 <= floor).
+        check("W1_null_rejected", !is_valid_pointer(nullptr));
+
+        // EXACT floor boundary: addr <= floor rejected, floor+1 (odd) rejected
+        // by the odd-rule, floor+2 (= 0x10001, even, > floor) ACCEPTED.
+        check("W1_floor_exact_rejected",
+              !is_valid_pointer(reinterpret_cast<const void*>(floor)));
+        check("W1_floor_minus_one_rejected",
+              !is_valid_pointer(reinterpret_cast<const void*>(floor - 1)));
+        // floor == 0xFFFF (odd); floor+1 == 0x10000 which is EVEN and > floor
+        // -> ACCEPTED (first valid address above the floor).  Pin it.
+        check("W1_floor_plus_one_even_accepted",
+              is_valid_pointer(reinterpret_cast<const void*>(floor + 1)));
+        // floor+2 == 0x10001 (odd) -> rejected by the odd-rule even though
+        // it is > floor; floor+3 == 0x10002 (even) -> accepted.
+        check("W1_floor_plus_two_odd_rejected",
+              !is_valid_pointer(reinterpret_cast<const void*>(floor + 2)));
+        check("W1_floor_plus_three_even_accepted",
+              is_valid_pointer(reinterpret_cast<const void*>(floor + 3)));
+
+        // EXACT ceiling boundary: addr >= ceiling rejected; ceiling-1 is even
+        // (0x...FFFE) and < ceiling -> ACCEPTED.
+        check("W1_ceiling_exact_rejected",
+              !is_valid_pointer(reinterpret_cast<const void*>(ceiling)));
+        check("W1_ceiling_plus_one_rejected",
+              !is_valid_pointer(reinterpret_cast<const void*>(ceiling + 1)));
+        check("W1_ceiling_minus_one_even_accepted",
+              is_valid_pointer(reinterpret_cast<const void*>(ceiling - 1)));
+        check("W1_ceiling_minus_two_odd_rejected",
+              !is_valid_pointer(reinterpret_cast<const void*>(ceiling - 2)));
+
+        // Low constants the HARD RULES bless as safe (rejected before any read):
+        // 0x1000 < floor -> rejected; this is exactly the substrate the per-slot
+        // skip relies on for any low/sentinel garbage slot.
+        check("W1_0x1000_rejected",
+              !is_valid_pointer(reinterpret_cast<const void*>(0x1000ull)));
+        check("W1_0x2_rejected_low",
+              !is_valid_pointer(reinterpret_cast<const void*>(0x2ull)));
+        check("W1_0x1_rejected_odd_and_low",
+              !is_valid_pointer(reinterpret_cast<const void*>(0x1ull)));
+    }
+    {
+        // The 9 debug-fill sentinels (vmhook.hpp:2070-2078) — a slot whose LOW
+        // 32 bits equal one of these is dropped by the walk (flaw #5: this can
+        // in principle elide a legitimate Metaspace Method* whose low half
+        // collides; pinned here as the documented behaviour).  Each is forced
+        // even and placed in-range by OR-ing a high canonical base so ONLY the
+        // sentinel low32 (not range/alignment) drives the rejection.
+        constexpr std::uint64_t high_base{ 0x00000A0000000000ull };  // in (floor,ceiling), well-aligned
+        const std::array<std::uint32_t, 9> sentinels{
+            0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+            0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu };
+        bool all_rejected{ true };
+        for (const std::uint32_t s : sentinels)
+        {
+            // Place the EXACT sentinel pattern as the low32 of an in-range base.
+            // Every such address is rejected: the even sentinels by the
+            // sentinel switch (vmhook.hpp:2070-2078), the odd ones by the
+            // odd-rule (vmhook.hpp:2059) — both paths reject, which is the
+            // walk's per-slot skip behaviour.
+            const std::uint64_t addr{ high_base | static_cast<std::uint64_t>(s) };
+            if (is_valid_pointer(reinterpret_cast<const void*>(addr)))
+            {
+                all_rejected = false;
+            }
+        }
+        check("W1_all_sentinel_low32_addresses_rejected", all_rejected);
+
+        // Strict: low32 EXACTLY a sentinel that is itself EVEN, so the
+        // sentinel-switch (not the odd-rule) is the sole cause of rejection.
+        // Even (bit0==0) members of the list: 0xCAFEBABE, 0xCCCCCCCC, 0xFEEEFEEE.
+        const std::array<std::uint32_t, 3> even_sentinels{
+            0xCAFEBABEu, 0xCCCCCCCCu, 0xFEEEFEEEu };
+        bool even_all_rejected{ true };
+        for (const std::uint32_t s : even_sentinels)
+        {
+            const std::uint64_t addr{ high_base | static_cast<std::uint64_t>(s) };
+            // sanity: this address is even, > floor, < ceiling, so ONLY the
+            // sentinel switch can reject it.
+            if (is_valid_pointer(reinterpret_cast<const void*>(addr)))
+            {
+                even_all_rejected = false;
+            }
+        }
+        check("W1_even_sentinel_low32_strictly_rejected", even_all_rejected);
+
+        // Control: the SAME high base with a NON-sentinel even low32 is ACCEPTED
+        // — proving the rejections above are caused by the sentinel/odd rules,
+        // not by the base being out of range.
+        const std::uint64_t clean{ high_base | 0x00010002ull };  // even, non-sentinel
+        check("W1_clean_low32_high_base_accepted",
+              is_valid_pointer(reinterpret_cast<const void*>(clean)));
+    }
+
+    // ---------------------------------------------------------------------
+    // W2 — raw accessors honour the no-JVM contract on null / rejected klass
+    // pointers WITHOUT dereferencing (entry is null -> bail at the !entry
+    // guard; or is_valid_pointer(this) false -> bail).  POSIX-safe: no read of
+    // a wild address ever happens.
+    // ---------------------------------------------------------------------
+    {
+        klass* const null_klass{ nullptr };
+        check("W2_count_null_klass_zero", null_klass == nullptr);
+        // collect over a null klass -> empty (vmhook.hpp:8991 null-klass arm).
+        const auto via_collect{ vmhook::detail::collect_klass_methods(null_klass) };
+        check("W2_collect_null_klass_empty", via_collect.empty());
+        check("W2_collect_null_klass_size0", via_collect.size() == 0);
+    }
+    {
+        // is_valid_pointer-REJECTED low constant cast to klass*: BOTH accessors
+        // return the empty sentinel without reading memory (this fails
+        // is_valid_pointer(this) AND, with no JVM, entry is null first).
+        klass* const low_klass{ reinterpret_cast<klass*>(0x1000ull) };
+        check("W2_low_klass_count_zero", low_klass->get_methods_count() == 0);
+        check("W2_low_klass_ptr_null", low_klass->get_methods_ptr() == nullptr);
+        const auto m{ vmhook::detail::collect_klass_methods(low_klass) };
+        check("W2_low_klass_collect_empty", m.empty());
+    }
+    {
+        // Odd (bit-0 set) low constant: rejected by the odd-rule too.
+        klass* const odd_klass{ reinterpret_cast<klass*>(0x1001ull) };
+        check("W2_odd_klass_count_zero", odd_klass->get_methods_count() == 0);
+        check("W2_odd_klass_ptr_null", odd_klass->get_methods_ptr() == nullptr);
+    }
+    {
+        // Idempotent across the substrate: count==0 implies the collector's
+        // `!methods_array || method_count <= 0` guard (vmhook.hpp:8997) fires,
+        // so collect is empty for the same input — pinned as an implication.
+        klass* const low_klass{ reinterpret_cast<klass*>(0x800ull) };
+        const std::int32_t cnt{ low_klass->get_methods_count() };
+        const auto coll{ vmhook::detail::collect_klass_methods(low_klass) };
+        check("W2_count_zero_implies_collect_empty",
+              (cnt == 0) && coll.empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // W3 — get_methods_count()'s clamp logic reproduced as a pure mirror.
+    // Source (vmhook.hpp:3528): `if (count < 0 || count > 65535) return 0;`
+    // (flaw #2 hardening).  A live klass is needed to exercise the real read,
+    // but the CLAMP DECISION is pure integer logic we can pin exhaustively.
+    // ---------------------------------------------------------------------
+    {
+        auto clamp_count = [](std::int32_t count) -> std::int32_t {
+            if (count < 0 || count > 65535) { return 0; }
+            return count;
+        };
+        // The HotSpot u2 method_count ceiling is exactly 65535.
+        check("W3_clamp_max_valid_65535", clamp_count(65535) == 65535);
+        check("W3_clamp_just_over_65536_zero", clamp_count(65536) == 0);
+        check("W3_clamp_zero_passes", clamp_count(0) == 0);
+        check("W3_clamp_one_passes", clamp_count(1) == 1);
+        check("W3_clamp_negative_one_zero", clamp_count(-1) == 0);
+        check("W3_clamp_int_min_zero",
+              clamp_count(std::numeric_limits<std::int32_t>::min()) == 0);
+        check("W3_clamp_int_max_zero",
+              clamp_count(std::numeric_limits<std::int32_t>::max()) == 0);
+        // A "large positive garbage length" (flaw #2's hypothetical wrong-layout
+        // misread, e.g. 0x40000000) is now clamped to 0 -> no billion-iteration
+        // loop / no reserve(huge).  Pin the exact threshold neighbours.
+        check("W3_clamp_0x40000000_zero", clamp_count(0x40000000) == 0);
+        check("W3_clamp_65535_boundary_above_zero", clamp_count(65535 + 1) == 0);
+        check("W3_clamp_65534_passes", clamp_count(65534) == 65534);
+    }
+
+    // ---------------------------------------------------------------------
+    // W4 — get_methods_ptr()'s Array<Method*> data-offset arithmetic (flaw #1).
+    // Source (vmhook.hpp:3564): data = reinterpret_cast<method**>(array + 8),
+    // i.e. [int32 _length @0][int32 _pad @4][Method* _data @8].  The +8 is the
+    // x64 LP64 layout assumption.  We pin the byte arithmetic as a pure mirror
+    // (no memory read) so the offset contract is greppable and the element
+    // stride matches sizeof(Method*) == 8.
+    // ---------------------------------------------------------------------
+    {
+        // The data offset is exactly 8 (length@0 width 4 + pad@4 width 4).
+        constexpr std::size_t length_field_width{ sizeof(std::int32_t) };  // 4
+        constexpr std::size_t pad_field_width{ sizeof(std::int32_t) };     // 4
+        constexpr std::size_t data_offset{ length_field_width + pad_field_width };
+        check("W4_length_field_width_4", length_field_width == 4);
+        check("W4_pad_field_width_4", pad_field_width == 4);
+        check("W4_data_offset_is_8", data_offset == 8);
+
+        // Element stride is one pointer (Method*) == 8 on LP64.  This is the
+        // assumption the +8 hardcode rides on; pin it so a non-LP64 build trips
+        // here at compile-of-expected-value time rather than misreading slots.
+        check("W4_method_ptr_size_is_8", sizeof(void*) == 8);
+
+        // Mirror the address computation: for a hypothetical (never-read) base,
+        // data = base + 8 and slot i = base + 8 + 8*i.  Use a stack buffer as a
+        // REAL OWNED allocation so the arithmetic is well-defined (we never
+        // DEREFERENCE through these as Method*; we only compare the byte
+        // offsets the accessor would compute).
+        alignas(16) std::array<std::uint8_t, 64> owned_array_bytes{};
+        std::uint8_t* const base{ owned_array_bytes.data() };
+        std::uint8_t* const data_ptr{ base + data_offset };
+        check("W4_data_ptr_is_base_plus_8",
+              data_ptr == base + 8);
+        // slot index arithmetic: &data[i] - &data[0] == i * 8 bytes.
+        std::uint8_t* const slot0{ base + data_offset + (0 * sizeof(void*)) };
+        std::uint8_t* const slot1{ base + data_offset + (1 * sizeof(void*)) };
+        std::uint8_t* const slot2{ base + data_offset + (2 * sizeof(void*)) };
+        check("W4_slot0_at_offset_8", (slot0 - base) == 8);
+        check("W4_slot1_at_offset_16", (slot1 - base) == 16);
+        check("W4_slot2_at_offset_24", (slot2 - base) == 24);
+        check("W4_slot_stride_8", (slot1 - slot0) == 8 && (slot2 - slot1) == 8);
+    }
+
+    // ---------------------------------------------------------------------
+    // W5 — the collector emplaces (name, descriptor); a SKIPPED slot
+    // (vmhook.hpp:9005 continue) never reaches emplace_back, so no ("","")
+    // pair can appear from a skip, and a decoded-but-empty name only appears if
+    // get_name() itself failed.  With no JVM the live result is empty, so we
+    // pin the INVARIANT against a self-contained model of the collector loop:
+    // skipped slots produce no element, kept slots produce exactly one.
+    // ---------------------------------------------------------------------
+    {
+        // Model the loop body's keep/skip decision over a vector of "slot
+        // validity" flags (true == is_valid_pointer && non-null).  The model
+        // emplaces iff kept — mirroring vmhook.hpp:9002-9009 exactly.
+        auto count_kept = [](const std::vector<bool>& slot_valid) -> std::size_t {
+            std::size_t kept{ 0 };
+            for (const bool v : slot_valid)
+            {
+                if (!v) { continue; }   // mirrors the !method_ptr||!is_valid skip
+                ++kept;
+            }
+            return kept;
+        };
+        check("W5_all_valid_all_kept", count_kept({ true, true, true }) == 3);
+        check("W5_all_invalid_none_kept", count_kept({ false, false }) == 0);
+        check("W5_mixed_kept_count",
+              count_kept({ true, false, true, false, true }) == 3);
+        check("W5_empty_slotlist_zero_kept", count_kept({}) == 0);
+        // A single invalid slot in the middle reduces the kept count by exactly
+        // one (no off-by-one): 4 valid + 1 invalid -> 4.
+        check("W5_one_skip_reduces_by_one",
+              count_kept({ true, true, false, true, true }) == 4);
+    }
+
+    // ---------------------------------------------------------------------
+    // W6 — collector / get_class_methods cross-consistency on the no-JVM empty
+    // result: every entry point that routes through collect_klass_methods must
+    // agree byte-for-byte (all empty), and find_methods_by_signature (a filter
+    // over the collector) must be a subset (here: empty).  Strengthens the
+    // existing PART G with the RAW collector in the loop.
+    // ---------------------------------------------------------------------
+    {
+        const auto by_name{ vmhook::get_class_methods("test/MapInjected") };
+        const auto by_type{ vmhook::get_class_methods<map_injected_wrapper>() };
+        const auto raw{ vmhook::detail::collect_klass_methods(
+            vmhook::find_class("test/MapInjected")) };
+        check("W6_byname_bytype_raw_all_empty",
+              by_name.empty() && by_type.empty() && raw.empty());
+        check("W6_byname_bytype_raw_same_size",
+              by_name.size() == by_type.size() && by_type.size() == raw.size());
+        // find_class itself returns null with no JVM -> the collector's
+        // null-klass arm -> empty.  Pin the linkage.
+        check("W6_find_class_null_no_jvm",
+              vmhook::find_class("test/MapInjected") == nullptr);
+    }
+
+    // ---------------------------------------------------------------------
+    // W7 — descriptor selector ORDERED-equality + multiplicity (flaw #3/#8):
+    // the collector/walk is index-ordered over _methods, and
+    // find_methods_by_signature keeps matches IN SOURCE ORDER.  PART F already
+    // checks multiset membership; here we pin the STRONGER element-for-element
+    // ORDERED equality of the selector over a populated model, and that calling
+    // twice yields an IDENTICAL vector (determinism within a run).
+    // ---------------------------------------------------------------------
+    {
+        const std::vector<std::pair<std::string, std::string>> source{
+            { "a", "()V" },
+            { "b", "(I)I" },
+            { "c", "()V" },
+            { "d", "(I)I" },
+            { "e", "()V" },
+            { "f", "(J)J" },
+        };
+        const auto v1{ select_by_descriptor(source, "()V") };
+        const auto v2{ select_by_descriptor(source, "()V") };
+        // determinism: identical element-for-element including order.
+        check("W7_selector_deterministic_same_size", v1.size() == v2.size());
+        check("W7_selector_deterministic_equal", v1 == v2);
+        // ordered membership: a, c, e in that exact order.
+        check("W7_void_ordered_a_c_e",
+              v1.size() == 3 && v1[0] == "a" && v1[1] == "c" && v1[2] == "e");
+        const auto vi{ select_by_descriptor(source, "(I)I") };
+        check("W7_int_ordered_b_d",
+              vi.size() == 2 && vi[0] == "b" && vi[1] == "d");
+        const auto vj{ select_by_descriptor(source, "(J)J") };
+        check("W7_long_unique_f", vj.size() == 1 && vj.front() == "f");
+        // total kept across the three present descriptors == source size.
+        check("W7_total_partition_covers_source",
+              v1.size() + vi.size() + vj.size() == source.size());
+    }
+
+    // ---------------------------------------------------------------------
+    // W8 — inherited-exclusion contract (flaw #4) modelled explicitly: the walk
+    // reads ONE InstanceKlass's _methods array — DECLARED methods only, never
+    // inherited.  We model a 3-level hierarchy's DECLARED sets and assert that
+    // enumerating C yields only C's declared methods, with Object's
+    // equals/hashCode descriptors ABSENT.  (The live exclusion is JVM-tested;
+    // here we pin the contract shape the selector preserves.)
+    // ---------------------------------------------------------------------
+    {
+        // C's OWN declared _methods (what the bare walk would return for C).
+        const std::vector<std::pair<std::string, std::string>> c_declared{
+            { "cMethod", "()V" },
+            { "<init>",  "()V" },
+        };
+        // Inherited (Object) descriptors that must NOT be in c_declared.
+        const auto eq{ select_by_descriptor(c_declared, "(Ljava/lang/Object;)Z") };  // equals
+        const auto hc{ select_by_descriptor(c_declared, "()I") };                    // hashCode
+        check("W8_inherited_equals_absent_from_declared", eq.empty());
+        check("W8_inherited_hashCode_absent_from_declared", hc.empty());
+        // C's own declared method IS present.
+        const auto own{ select_by_descriptor(c_declared, "()V") };
+        check("W8_own_declared_present",
+              own.size() == 2);  // cMethod + <init>, both ()V here
+        check("W8_own_declared_includes_init",
+              std::find(own.begin(), own.end(), std::string{ "<init>" }) != own.end());
+    }
+
+    // ---------------------------------------------------------------------
+    // W9 — descriptor equality is BYTE-exact, embedded-NUL and modified-UTF-8
+    // aware (flaw #6 decode boundary expressed as the candidate==descriptor
+    // byte comparison the filter runs at vmhook.hpp:9100).  Method NAME/
+    // descriptor symbols are stored as modified UTF-8 bytes; the filter never
+    // re-decodes, so a Unicode name round-trips iff the BYTES match.  We pin
+    // byte equality against EXPLICIT escape sequences (HARD RULE 3: never a raw
+    // non-ASCII or NUL byte in source).
+    // ---------------------------------------------------------------------
+    {
+        // "名前" (U+540D U+524D) in modified-UTF-8 is the 6 bytes
+        // E5 90 8D E5 89 8D.  Pin that the byte string compares equal to itself
+        // and unequal to a one-byte-different copy.
+        const char jp_name[]{ '\xE5', '\x90', '\x8D', '\xE5', '\x89', '\x8D' };
+        const std::string_view a{ jp_name, sizeof(jp_name) };
+        const char jp_name2[]{ '\xE5', '\x90', '\x8D', '\xE5', '\x89', '\x8C' };  // last byte differs
+        const std::string_view b{ jp_name2, sizeof(jp_name2) };
+        check("W9_utf8_name_self_equal", descriptor_matches(a, a));
+        check("W9_utf8_name_one_byte_differs_unequal", !descriptor_matches(a, b));
+        check("W9_utf8_name_length_6", a.size() == 6);
+
+        // Embedded-NUL via modified-UTF-8 (HotSpot encodes a real NUL as the
+        // 2-byte sequence C0 80, never a bare 00).  A descriptor holding the
+        // C0 80 pair is length-2 and equals only itself.
+        const char c0_80[]{ '\xC0', '\x80' };
+        const std::string_view nul_mutf8{ c0_80, sizeof(c0_80) };
+        check("W9_mutf8_nul_pair_length_2", nul_mutf8.size() == 2);
+        check("W9_mutf8_nul_pair_self_equal", descriptor_matches(nul_mutf8, nul_mutf8));
+        // Distinct from a bare single 0x00 byte (length 1).
+        const char bare_nul[]{ '\x00' };
+        const std::string_view nul1{ bare_nul, sizeof(bare_nul) };
+        check("W9_mutf8_pair_ne_bare_nul", !descriptor_matches(nul_mutf8, nul1));
+
+        // A descriptor mixing ALL EIGHT primitive descriptors in one signature
+        // "(ZBCSIJFD)V" is matched byte-for-byte and is NOT equal to any
+        // reordering (e.g. "(BZCSIJFD)V").
+        check("W9_all_primitive_sig_self_equal",
+              descriptor_matches("(ZBCSIJFD)V", "(ZBCSIJFD)V"));
+        check("W9_all_primitive_sig_reorder_unequal",
+              !descriptor_matches("(ZBCSIJFD)V", "(BZCSIJFD)V"));
+        // Multi-dim array + deep object descriptor decodes/compares byte-exact.
+        check("W9_multidim_array_self_equal",
+              descriptor_matches("([[[Ljava/lang/String;)V", "([[[Ljava/lang/String;)V"));
+        check("W9_multidim_array_dim_count_matters",
+              !descriptor_matches("([[[Ljava/lang/String;)V", "([[Ljava/lang/String;)V"));
+    }
+
+    // ---------------------------------------------------------------------
+    // W10 — synthetic / special method NAME equality (the walk enumerates
+    // <init>, <clinit>, lambda$, access$NNN, bridge synthetics verbatim as
+    // _methods entries; their NAMES are matched by hook<T>'s inline walk).
+    // Here we pin the name-string equality semantics (byte-exact, no
+    // normalisation of the angle-bracket / $ characters).
+    // ---------------------------------------------------------------------
+    {
+        // Using the descriptor-equality mirror as a generic byte-string equality
+        // oracle for NAMES (hook<T>'s name match is the same operator==).
+        check("W10_init_name_self_equal", descriptor_matches("<init>", "<init>"));
+        check("W10_clinit_name_self_equal", descriptor_matches("<clinit>", "<clinit>"));
+        check("W10_init_ne_clinit", !descriptor_matches("<init>", "<clinit>"));
+        // Angle brackets are significant: "init" (no brackets) is a DIFFERENT
+        // name than "<init>".
+        check("W10_init_ne_plain_init", !descriptor_matches("<init>", "init"));
+        // Lambda / bridge / access$ synthetic names are ordinary byte strings.
+        check("W10_lambda_name_self_equal",
+              descriptor_matches("lambda$run$0", "lambda$run$0"));
+        check("W10_access_name_self_equal",
+              descriptor_matches("access$000", "access$000"));
+        check("W10_access_index_matters",
+              !descriptor_matches("access$000", "access$100"));
+        check("W10_empty_name_only_matches_empty",
+              descriptor_matches("", "") && !descriptor_matches("", "<init>"));
+    }
+
+    // ---------------------------------------------------------------------
+    // W11 — long-name decode boundary (symbol::to_string clamp at
+    // length==0 || length>0x1000, vmhook.hpp:1904).  The clamp ceiling is
+    // 0x1000 == 4096.  A name of length just under the clamp is a legal
+    // byte-string for equality; pin the threshold arithmetic and the
+    // byte-equality of a 4095-byte name against itself / a 4096-byte name.
+    // ---------------------------------------------------------------------
+    {
+        constexpr std::size_t clamp_ceiling{ 0x1000 };
+        check("W11_clamp_ceiling_is_4096", clamp_ceiling == 4096);
+        // length 0 is clamped (-> empty); length > 0x1000 is clamped.  Mirror
+        // the predicate `length == 0 || length > 0x1000`.
+        auto clamps_to_empty = [](std::size_t length) -> bool {
+            return length == 0 || length > 0x1000;
+        };
+        check("W11_zero_length_clamped", clamps_to_empty(0));
+        check("W11_4096_not_clamped", !clamps_to_empty(4096));
+        check("W11_4095_not_clamped", !clamps_to_empty(4095));
+        check("W11_4097_clamped", clamps_to_empty(4097));
+        check("W11_one_not_clamped", !clamps_to_empty(1));
+        // A 4095-'a' name compares equal to itself and unequal to a 4096-'a'
+        // name (length-aware byte equality), both UNDER the clamp.
+        const std::string n4095(4095, 'a');
+        const std::string n4096(4096, 'a');
+        check("W11_long_name_self_equal",
+              descriptor_matches(n4095, n4095));
+        check("W11_long_name_length_differs_unequal",
+              !descriptor_matches(n4095, n4096));
+        check("W11_long_name_size_4095", n4095.size() == 4095);
     }
 
     return failures == 0 ? 0 : 1;

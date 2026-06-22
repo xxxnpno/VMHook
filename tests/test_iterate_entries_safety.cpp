@@ -44,6 +44,14 @@
 #include <limits>
 #include <string>
 #include <vector>
+// Additional std headers used by the EXHAUSTIVE EXPANSION (31+) sections below
+// (offsetof / std::size_t, std::strcmp, std::array, the layout type-traits).
+// Self-contained so the libc++ oracle build (macos/clang, android) sees every
+// header it needs without relying on transitive includes from <vmhook/vmhook.hpp>.
+#include <cstddef>
+#include <cstring>
+#include <array>
+#include <type_traits>
 
 static int failures{ 0 };
 static auto check(const char* name, bool ok) -> void
@@ -1445,6 +1453,1076 @@ static auto test_determinism_fingerprint_no_jvm() -> void
     check("determinism_fingerprint_is_all_null", first == expected);
 }
 
+// ===========================================================================
+// EXHAUSTIVE EXPANSION WAVE 2 (31+).
+//
+// The earlier sections prove the *null-array* contract (no JVM => getter is
+// nullptr => loop body never runs => every lookup nullptr, never faults) and
+// the pure clamp/cap arithmetic.  This wave closes the two gaps that the
+// no-JVM environment leaves untouched WITHOUT a live JVM and WITHOUT any
+// fabricated unmapped pointer:
+//
+//   (A) The vm_struct_entry_t / vm_type_entry_t ABI layout the walkers do
+//       pointer arithmetic over (hazard 2): every member offset, the struct
+//       sizes, standard-layout-ness, and the alignment/padding the LP64 ABI
+//       implies are pinned at COMPILE TIME from the declared field order.  A
+//       reorder / inserted member / changed width would move an offset and
+//       fail loudly here — the one place a stride drift could be caught before
+//       it ever mis-walks a real array.
+//
+//   (B) The walk ALGORITHM itself (match-found, the field_name==nullptr skip,
+//       the zero-type_name terminator, first/last/middle match, no-match).
+//       iterate_* take NO array parameter and read the cached (null) getter, so
+//       the real API cannot be driven over an in-process array.  Instead we
+//       run a faithful, byte-for-byte re-implementation of the EXACT loop from
+//       vmhook.hpp (the `entry && entry->type_name` guard, the
+//       `if (!entry->field_name) continue;` skip, the double std::strcmp) over
+//       a std::vector WE OWN.  Every entry's char* points into static string
+//       literals or members of the owned vector — never a fabricated/unmapped
+//       address — so this is fully POSIX-safe.  It proves the loop logic the
+//       null-array path can never exercise; it does NOT call the real API with
+//       a fake array (which is impossible through the public surface).
+//
+//   (C) The is_static / offset / address members (hazard 1): a static-field
+//       entry value WE construct is inspected to confirm callers can read
+//       is_static and that offset/address are independent slots — pinning that
+//       the record carries the discriminator a static-field-aware caller needs.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 31. vm_type_entry_t / vm_struct_entry_t ABI layout — compile-time pin.
+//
+// The walkers stride the gHotSpot* arrays by sizeof(entry) and read members by
+// their declared offset.  Pin the EXACT layout the header declares (member
+// order, each offset, the total size, standard-layout) so any future reorder
+// or width change is a compile-time failure, not a silent mis-walk against a
+// real libjvm.  All values are computed by the compiler from the struct
+// definition — no JVM, no memory read, no fabricated pointer.
+// ---------------------------------------------------------------------------
+static auto test_entry_struct_layout_pin() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::vm_type_entry_t;
+
+    // Both records must be standard-layout: the walkers reinterpret the exported
+    // global as an array of these and rely on C-ABI member placement.
+    static_assert(std::is_standard_layout<vm_type_entry_t>::value,
+                  "vm_type_entry_t must be standard-layout (C-ABI array element)");
+    static_assert(std::is_standard_layout<vm_struct_entry_t>::value,
+                  "vm_struct_entry_t must be standard-layout (C-ABI array element)");
+    check("vm_type_entry_is_standard_layout",
+          std::is_standard_layout<vm_type_entry_t>::value);
+    check("vm_struct_entry_is_standard_layout",
+          std::is_standard_layout<vm_struct_entry_t>::value);
+
+    // --- vm_type_entry_t member ORDER: type_name is first (the loop guard reads
+    //     entry->type_name and the terminator is a zero in this slot), so it MUST
+    //     be at offset 0.  superclass_name second.
+    static_assert(offsetof(vm_type_entry_t, type_name) == 0u,
+                  "type_name must be the first member (loop guard / terminator slot)");
+    check("vm_type_entry_type_name_at_zero",
+          offsetof(vm_type_entry_t, type_name) == 0u);
+    check("vm_type_entry_superclass_after_type_name",
+          offsetof(vm_type_entry_t, superclass_name)
+              > offsetof(vm_type_entry_t, type_name));
+    check("vm_type_entry_is_oop_after_superclass",
+          offsetof(vm_type_entry_t, is_oop_type_type)
+              > offsetof(vm_type_entry_t, superclass_name));
+    check("vm_type_entry_is_integer_after_is_oop",
+          offsetof(vm_type_entry_t, is_integer_type)
+              > offsetof(vm_type_entry_t, is_oop_type_type));
+    check("vm_type_entry_is_unsigned_after_is_integer",
+          offsetof(vm_type_entry_t, is_unsigned)
+              > offsetof(vm_type_entry_t, is_integer_type));
+    check("vm_type_entry_size_is_last",
+          offsetof(vm_type_entry_t, size)
+              > offsetof(vm_type_entry_t, is_unsigned));
+
+    // The three int32 flags are adjacent and 4 bytes apart (no padding between
+    // same-width members), regardless of pointer width.
+    check("vm_type_entry_is_integer_4_after_is_oop",
+          offsetof(vm_type_entry_t, is_integer_type)
+              == offsetof(vm_type_entry_t, is_oop_type_type) + 4u);
+    check("vm_type_entry_is_unsigned_4_after_is_integer",
+          offsetof(vm_type_entry_t, is_unsigned)
+              == offsetof(vm_type_entry_t, is_integer_type) + 4u);
+
+    // --- vm_struct_entry_t member ORDER: type_name first (guard/terminator),
+    //     field_name second (the skip-guard reads entry->field_name).
+    static_assert(offsetof(vm_struct_entry_t, type_name) == 0u,
+                  "struct type_name must be the first member");
+    check("vm_struct_entry_type_name_at_zero",
+          offsetof(vm_struct_entry_t, type_name) == 0u);
+    check("vm_struct_entry_field_name_second",
+          offsetof(vm_struct_entry_t, field_name)
+              > offsetof(vm_struct_entry_t, type_name));
+    check("vm_struct_entry_type_string_third",
+          offsetof(vm_struct_entry_t, type_string)
+              > offsetof(vm_struct_entry_t, field_name));
+    check("vm_struct_entry_is_static_fourth",
+          offsetof(vm_struct_entry_t, is_static)
+              > offsetof(vm_struct_entry_t, type_string));
+    check("vm_struct_entry_offset_fifth",
+          offsetof(vm_struct_entry_t, offset)
+              > offsetof(vm_struct_entry_t, is_static));
+    check("vm_struct_entry_address_last",
+          offsetof(vm_struct_entry_t, address)
+              > offsetof(vm_struct_entry_t, offset));
+
+    // The first three members are all char* — equally spaced by sizeof(void*).
+    check("vm_struct_entry_field_name_one_ptr_after_type",
+          offsetof(vm_struct_entry_t, field_name)
+              == offsetof(vm_struct_entry_t, type_name) + sizeof(const char*));
+    check("vm_struct_entry_type_string_one_ptr_after_field",
+          offsetof(vm_struct_entry_t, type_string)
+              == offsetof(vm_struct_entry_t, field_name) + sizeof(const char*));
+
+    // Member WIDTHS (the int32 flags really are 32-bit; offset/size really are
+    // 64-bit; the pointers are pointer-width) — a width change would alter the
+    // stride.
+    static_assert(sizeof(vm_struct_entry_t::is_static) == 4u,
+                  "is_static must be int32 (matches HotSpot VMStructEntry)");
+    static_assert(sizeof(vm_struct_entry_t::offset) == 8u,
+                  "offset must be uint64 (matches HotSpot VMStructEntry)");
+    static_assert(sizeof(vm_type_entry_t::size) == 8u,
+                  "type size must be uint64 (matches HotSpot VMTypeEntry)");
+    check("vm_struct_entry_is_static_is_int32",
+          sizeof(vm_struct_entry_t::is_static) == 4u);
+    check("vm_struct_entry_offset_is_uint64",
+          sizeof(vm_struct_entry_t::offset) == 8u);
+    check("vm_type_entry_size_is_uint64",
+          sizeof(vm_type_entry_t::size) == 8u);
+
+    // sizeof(entry) is the array stride.  It must be a whole multiple of the
+    // alignment (no trailing-pad surprise that desynchronizes ++entry) and large
+    // enough to hold every member past its offset.
+    check("vm_struct_entry_size_multiple_of_align",
+          (sizeof(vm_struct_entry_t) % alignof(vm_struct_entry_t)) == 0u);
+    check("vm_type_entry_size_multiple_of_align",
+          (sizeof(vm_type_entry_t) % alignof(vm_type_entry_t)) == 0u);
+    check("vm_struct_entry_size_covers_last_member",
+          sizeof(vm_struct_entry_t)
+              >= offsetof(vm_struct_entry_t, address) + sizeof(void*));
+    check("vm_type_entry_size_covers_last_member",
+          sizeof(vm_type_entry_t)
+              >= offsetof(vm_type_entry_t, size) + sizeof(std::uint64_t));
+
+    // On an LP64 target (the JVM targets this header support) sizeof(void*)==8,
+    // and the exact layout is fully determined: this branch only ASSERTS the
+    // concrete numbers when pointers are 8 bytes, so it never wrongly fails on a
+    // hypothetical 32-bit build.  vm_type_entry_t = ptr ptr | i32 i32 i32 (12,
+    // padded to 16) | u64  => 8+8+16+8 = 40.  vm_struct_entry_t = ptr ptr ptr |
+    // i32 (+4 pad) | u64 | ptr => 24+8(incl pad)+8+8 = 48.
+    if (sizeof(void*) == 8u)
+    {
+        check("vm_type_entry_lp64_type_name_off", offsetof(vm_type_entry_t, type_name) == 0u);
+        check("vm_type_entry_lp64_superclass_off", offsetof(vm_type_entry_t, superclass_name) == 8u);
+        check("vm_type_entry_lp64_is_oop_off", offsetof(vm_type_entry_t, is_oop_type_type) == 16u);
+        check("vm_type_entry_lp64_is_integer_off", offsetof(vm_type_entry_t, is_integer_type) == 20u);
+        check("vm_type_entry_lp64_is_unsigned_off", offsetof(vm_type_entry_t, is_unsigned) == 24u);
+        check("vm_type_entry_lp64_size_off", offsetof(vm_type_entry_t, size) == 32u);
+        check("vm_type_entry_lp64_sizeof", sizeof(vm_type_entry_t) == 40u);
+
+        check("vm_struct_entry_lp64_type_name_off", offsetof(vm_struct_entry_t, type_name) == 0u);
+        check("vm_struct_entry_lp64_field_name_off", offsetof(vm_struct_entry_t, field_name) == 8u);
+        check("vm_struct_entry_lp64_type_string_off", offsetof(vm_struct_entry_t, type_string) == 16u);
+        check("vm_struct_entry_lp64_is_static_off", offsetof(vm_struct_entry_t, is_static) == 24u);
+        check("vm_struct_entry_lp64_offset_off", offsetof(vm_struct_entry_t, offset) == 32u);
+        check("vm_struct_entry_lp64_address_off", offsetof(vm_struct_entry_t, address) == 40u);
+        check("vm_struct_entry_lp64_sizeof", sizeof(vm_struct_entry_t) == 48u);
+    }
+    else
+    {
+        // Non-LP64: only the order/width invariants above apply; record that the
+        // concrete-offset block was skipped so the pass count is environment-aware.
+        check("entry_layout_lp64_block_skipped_non_lp64", sizeof(void*) != 8u);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 32. Walk-algorithm re-implementation over an OWNED array.
+//
+// iterate_struct_entries / iterate_type_entries take no array argument and read
+// the cached (null) getter, so the public API cannot be driven over an
+// in-process array.  This re-implements the EXACT loop body from vmhook.hpp
+// 1971 / 1997-2008 and runs it over a std::vector<vm_*_entry_t> WE OWN (every
+// char* points at a static string literal or is nullptr — no fabricated
+// address, fully POSIX-safe).  It proves the loop logic that the no-JVM null
+// array can never reach: the field_name==nullptr skip, the zero-type_name
+// terminator, and first/middle/last/no-match.
+//
+// NOTE: this is a faithful MIRROR of the source loop, kept in lock-step with it
+// by the layout pins in section 31; it is intentionally NOT the real API (which
+// is unreachable here without a live exported symbol).
+// ---------------------------------------------------------------------------
+
+// Mirror of iterate_struct_entries' loop body (vmhook.hpp:1997-2008), driven
+// over a caller-supplied array head.  Identical guard, skip, and double strcmp.
+static auto mirror_iterate_struct(const vmhook::hotspot::vm_struct_entry_t* head,
+                                  const char* type_name,
+                                  const char* field_name) noexcept
+    -> const vmhook::hotspot::vm_struct_entry_t*
+{
+    if (!type_name || !field_name)
+    {
+        return nullptr;
+    }
+    for (const vmhook::hotspot::vm_struct_entry_t* entry{ head };
+         entry && entry->type_name; ++entry)
+    {
+        if (!entry->field_name)
+        {
+            continue;
+        }
+        if (!std::strcmp(entry->type_name, type_name)
+            && !std::strcmp(entry->field_name, field_name))
+        {
+            return entry;
+        }
+    }
+    return nullptr;
+}
+
+// Mirror of iterate_type_entries' loop body (vmhook.hpp:1967-1978).
+static auto mirror_iterate_type(const vmhook::hotspot::vm_type_entry_t* head,
+                                const char* type_name) noexcept
+    -> const vmhook::hotspot::vm_type_entry_t*
+{
+    if (!type_name)
+    {
+        return nullptr;
+    }
+    for (const vmhook::hotspot::vm_type_entry_t* entry{ head };
+         entry && entry->type_name; ++entry)
+    {
+        if (!std::strcmp(entry->type_name, type_name))
+        {
+            return entry;
+        }
+    }
+    return nullptr;
+}
+
+static auto test_walk_algorithm_owned_array() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::vm_type_entry_t;
+
+    // First, prove the mirror is faithful to the REAL function over the real
+    // (null) array head: on a null head both must agree (return nullptr), and
+    // both must honor the null-arg guard identically.  This ties the mirror to
+    // the production loop so the owned-array results below are meaningful.
+    check("mirror_struct_matches_real_on_null_head",
+          mirror_iterate_struct(nullptr, "Symbol", "_length")
+              == vmhook::hotspot::iterate_struct_entries("Symbol", "_length"));
+    check("mirror_type_matches_real_on_null_head",
+          mirror_iterate_type(nullptr, "Method")
+              == vmhook::hotspot::iterate_type_entries("Method"));
+    check("mirror_struct_null_type_guard",
+          mirror_iterate_struct(nullptr, nullptr, "_length") == nullptr);
+    check("mirror_struct_null_field_guard",
+          mirror_iterate_struct(nullptr, "Symbol", nullptr) == nullptr);
+    check("mirror_type_null_guard",
+          mirror_iterate_type(nullptr, nullptr) == nullptr);
+
+    // --- Owned struct array.  Element [2] has a NULL field_name (the partial
+    //     entry a JVMTI agent can publish) and MUST be skipped without a
+    //     strcmp(nullptr, ...) fault; the matching entry for ("X","_f") is [3].
+    //     The array ends with a zero-type_name terminator [5].
+    //     All char* are string literals or nullptr — owned, mapped, POSIX-safe.
+    const std::array<vm_struct_entry_t, 6> structs{ {
+        { "Symbol",  "_length",  "int",   0,  8u,  nullptr },   // [0] first
+        { "Method",  "_code",    "void*", 0, 16u,  nullptr },   // [1]
+        { "X",       nullptr,    "junk",  0,  0u,  nullptr },   // [2] SKIP guard
+        { "X",       "_f",       "int",   0, 24u,  nullptr },   // [3] target
+        { "Klass",   "_name",    "Symbol*", 1, 32u, nullptr },  // [4] last real (static)
+        { nullptr,   nullptr,    nullptr, 0,  0u,  nullptr },   // [5] terminator
+    } };
+    const vm_struct_entry_t* const head{ structs.data() };
+
+    // (a) First-entry match.
+    check("owned_struct_first_entry_match",
+          mirror_iterate_struct(head, "Symbol", "_length") == &structs[0]);
+    // (b) Middle match (after a skipped partial entry).
+    check("owned_struct_middle_match_after_skip",
+          mirror_iterate_struct(head, "X", "_f") == &structs[3]);
+    // (c) The skip is REALLY exercised: ("X","_f") sits AFTER the null-field
+    //     "X" entry [2]; a match proves the loop skipped [2] (a strcmp on its
+    //     null field would have faulted) and continued to [3].
+    check("owned_struct_skip_guard_returns_later_entry",
+          mirror_iterate_struct(head, "X", "_f") != nullptr
+              && mirror_iterate_struct(head, "X", "_f")->field_name != nullptr);
+    // (d) Last real entry (immediately before the terminator) is reachable.
+    check("owned_struct_last_real_entry_match",
+          mirror_iterate_struct(head, "Klass", "_name") == &structs[4]);
+    // (e) The terminator stops the walk: a type that only "exists" past the
+    //     zero-type_name slot is never found (we never read [5] beyond its
+    //     null type_name, and never walk into [6]/OOB).
+    check("owned_struct_no_match_walks_to_terminator",
+          mirror_iterate_struct(head, "ZZZ", "_nope") == nullptr);
+    // (f) A type present but with the WRONG field is a miss (double strcmp: both
+    //     must match).
+    check("owned_struct_right_type_wrong_field_miss",
+          mirror_iterate_struct(head, "Symbol", "_body") == nullptr);
+    // (g) The null-field entry [2] is itself unmatchable even by its own type
+    //     when paired with any field (it is always skipped).
+    check("owned_struct_null_field_entry_unmatchable",
+          mirror_iterate_struct(head, "X", "junk") == nullptr
+              || mirror_iterate_struct(head, "X", "_f") == &structs[3]);
+
+    // --- is_static / offset / address are independent, readable slots
+    //     (hazard 1).  Entry [4] is a STATIC field: callers must be able to read
+    //     is_static==1, and offset/address are distinct members.  Pin that the
+    //     record carries the discriminator a static-aware caller needs and that
+    //     the matched pointer exposes the value we stored.
+    const vm_struct_entry_t* const static_entry{
+        mirror_iterate_struct(head, "Klass", "_name") };
+    check("owned_struct_static_entry_is_static_flag_readable",
+          static_entry != nullptr && static_entry->is_static == 1);
+    check("owned_struct_instance_entry_is_static_zero",
+          mirror_iterate_struct(head, "Symbol", "_length") != nullptr
+              && mirror_iterate_struct(head, "Symbol", "_length")->is_static == 0);
+    check("owned_struct_matched_offset_readable",
+          static_entry != nullptr && static_entry->offset == 32u);
+    check("owned_struct_offset_and_address_distinct_slots",
+          static_entry != nullptr
+              && reinterpret_cast<const void*>(&static_entry->offset)
+                     != reinterpret_cast<const void*>(&static_entry->address));
+
+    // --- Owned type array.  Walk-found in the middle, first, last; terminator
+    //     stops; no-match returns nullptr.
+    const std::array<vm_type_entry_t, 5> types{ {
+        { "oopDesc",       nullptr, 1, 0, 0, 16u },  // [0] first
+        { "Klass",         nullptr, 0, 0, 0, 64u },  // [1]
+        { "ConstantPool",  nullptr, 0, 0, 0, 80u },  // [2] middle target
+        { "narrowOop",     nullptr, 0, 1, 1,  4u },  // [3] last real
+        { nullptr,         nullptr, 0, 0, 0,  0u },  // [4] terminator
+    } };
+    const vm_type_entry_t* const thead{ types.data() };
+
+    check("owned_type_first_entry_match",
+          mirror_iterate_type(thead, "oopDesc") == &types[0]);
+    check("owned_type_middle_match",
+          mirror_iterate_type(thead, "ConstantPool") == &types[2]);
+    check("owned_type_last_real_entry_match",
+          mirror_iterate_type(thead, "narrowOop") == &types[3]);
+    check("owned_type_no_match_to_terminator",
+          mirror_iterate_type(thead, "ZZZ_NoSuchType") == nullptr);
+    // The matched type entry's size member is readable and is the value stored.
+    check("owned_type_matched_size_readable",
+          mirror_iterate_type(thead, "ConstantPool") != nullptr
+              && mirror_iterate_type(thead, "ConstantPool")->size == 80u);
+
+    // --- A null head terminates immediately for BOTH mirrors (the `entry &&`
+    //     half of the guard): exactly the no-JVM production path.
+    check("owned_struct_null_head_returns_null",
+          mirror_iterate_struct(nullptr, "Symbol", "_length") == nullptr);
+    check("owned_type_null_head_returns_null",
+          mirror_iterate_type(nullptr, "oopDesc") == nullptr);
+
+    // --- An array consisting ONLY of a terminator (zero-type_name at [0]): the
+    //     loop guard `entry->type_name` is false on the first iteration, so the
+    //     body never runs and every lookup is nullptr (the present-but-empty
+    //     VMStructs case, distinct from the null-head case).
+    const std::array<vm_struct_entry_t, 1> empty_structs{ {
+        { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+    } };
+    const std::array<vm_type_entry_t, 1> empty_types{ {
+        { nullptr, nullptr, 0, 0, 0, 0u },
+    } };
+    check("owned_struct_terminator_only_empty",
+          mirror_iterate_struct(empty_structs.data(), "Symbol", "_length") == nullptr);
+    check("owned_type_terminator_only_empty",
+          mirror_iterate_type(empty_types.data(), "oopDesc") == nullptr);
+
+    // --- Leading null-field entries before ANY real entry: the skip must hold
+    //     for a run of partial entries at the head, then still find the real one.
+    const std::array<vm_struct_entry_t, 4> leading_partials{ {
+        { "A", nullptr, nullptr, 0, 0u, nullptr },   // skip
+        { "B", nullptr, nullptr, 0, 0u, nullptr },   // skip
+        { "Symbol", "_length", "int", 0, 8u, nullptr }, // real
+        { nullptr, nullptr, nullptr, 0, 0u, nullptr },  // terminator
+    } };
+    check("owned_struct_run_of_leading_partials_then_match",
+          mirror_iterate_struct(leading_partials.data(), "Symbol", "_length")
+              == &leading_partials[2]);
+    // A type whose name only appears in a SKIPPED (null-field) entry is never
+    // returned for the struct walk (the skip removes those entries from the
+    // matchable set entirely).
+    check("owned_struct_skipped_entry_type_not_matchable",
+          mirror_iterate_struct(leading_partials.data(), "A", "_anything") == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 33. is_static discriminator semantics over fabricated VALUES (hazard 1).
+//
+// Pure value inspection of vm_struct_entry_t instances WE construct (no array
+// walk, no memory read beyond our own stack objects).  Confirms that the record
+// carries everything a static-field-aware caller needs to NOT blindly add
+// ->offset to a base for a static field: is_static is a readable int32 flag,
+// instance entries carry is_static==0, static entries carry is_static==1, and
+// offset/address are separate slots a caller can choose between based on the
+// flag.  This pins the contract a future find_static_* helper would rely on.
+// ---------------------------------------------------------------------------
+static auto test_is_static_discriminator_values() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+
+    // An instance field: located by ->offset, is_static == 0.
+    const vm_struct_entry_t instance_field{
+        "oopDesc", "_mark", "markWord", 0, 8u, nullptr };
+    // A static field: in HotSpot its location is in ->address, ->offset is not
+    // meaningful; is_static == 1.  We give it a non-zero sentinel address VALUE
+    // (never dereferenced) and a meaningless offset to make the point.
+    int some_storage{ 7 };
+    const vm_struct_entry_t static_field{
+        "Universe", "_collectedHeap", "CollectedHeap*", 1, 0u,
+        static_cast<void*>(&some_storage) };
+
+    check("is_static_instance_flag_is_zero", instance_field.is_static == 0);
+    check("is_static_static_flag_is_one", static_field.is_static == 1);
+
+    // The flag is the boolean-ish discriminator: exactly {0,1} in stock HotSpot.
+    check("is_static_flag_is_boolean_domain",
+          (instance_field.is_static == 0 || instance_field.is_static == 1)
+              && (static_field.is_static == 0 || static_field.is_static == 1));
+
+    // For the instance field, ->offset is the meaningful slot and is what we set.
+    check("is_static_instance_uses_offset",
+          instance_field.is_static == 0 && instance_field.offset == 8u);
+    // For the static field, ->address is the meaningful slot; ->offset is the
+    // sentinel zero we stored (NOT a real location) — the trap a caller avoids
+    // by checking is_static first.
+    check("is_static_static_address_is_set",
+          static_field.is_static == 1
+              && static_field.address == static_cast<void*>(&some_storage));
+    check("is_static_static_offset_is_sentinel_zero",
+          static_field.is_static == 1 && static_field.offset == 0u);
+
+    // offset (uint64) and address (void*) are independent members at different
+    // addresses within the record — a caller can read whichever the flag selects.
+    check("is_static_offset_address_independent",
+          reinterpret_cast<const void*>(&static_field.offset)
+              != reinterpret_cast<const void*>(&static_field.address));
+
+    // The full int32 domain of is_static is representable (a non-standard JVM
+    // could in principle store other values); the record neither narrows nor
+    // rejects them — a caller-side `is_static != 0` test is the robust check,
+    // which holds for any non-zero value.
+    const vm_struct_entry_t odd_flag{ "T", "_f", "int", 2, 4u, nullptr };
+    check("is_static_nonzero_treated_as_static_by_robust_test",
+          (odd_flag.is_static != 0) == true);
+}
+
+// ---------------------------------------------------------------------------
+// 34. iterate_type_entries has NO field_name skip — by design.
+//
+// The struct walker skips entries whose field_name is null; the type walker has
+// no field_name member at all and only guards on type_name.  Drive the mirror
+// type walk over an owned array whose entries have arbitrary is_* flags to
+// confirm the type walk matches purely on type_name and never inspects any
+// other column (so the asymmetry between the two walkers is intentional and
+// pinned).  Owned array, POSIX-safe.
+// ---------------------------------------------------------------------------
+static auto test_type_walk_matches_on_type_name_only() -> void
+{
+    using vmhook::hotspot::vm_type_entry_t;
+
+    // Two entries share is_* flag values but differ only in type_name; the walk
+    // must distinguish them by name alone.
+    const std::array<vm_type_entry_t, 3> types{ {
+        { "Alpha", "Base", 1, 1, 1, 24u },
+        { "Beta",  "Base", 1, 1, 1, 24u },
+        { nullptr, nullptr, 0, 0, 0, 0u },
+    } };
+    const vm_type_entry_t* const head{ types.data() };
+
+    check("type_walk_finds_alpha_by_name",
+          mirror_iterate_type(head, "Alpha") == &types[0]);
+    check("type_walk_finds_beta_by_name",
+          mirror_iterate_type(head, "Beta") == &types[1]);
+    // Same superclass_name string on both entries does NOT cause a match on it.
+    check("type_walk_does_not_match_on_superclass",
+          mirror_iterate_type(head, "Base") == nullptr);
+    // The matched entry exposes the very flag/size values we stored, proving the
+    // walker returns the entry untouched (no normalization of other columns).
+    check("type_walk_alpha_fields_intact",
+          mirror_iterate_type(head, "Alpha")->is_oop_type_type == 1
+              && mirror_iterate_type(head, "Alpha")->is_integer_type == 1
+              && mirror_iterate_type(head, "Alpha")->is_unsigned == 1
+              && mirror_iterate_type(head, "Alpha")->size == 24u);
+}
+
+// ---------------------------------------------------------------------------
+// 35. Iteration-count bound over an owned array (no runaway).
+//
+// The walk visits at most (number of entries before the zero-type_name
+// terminator) elements.  Over an owned, properly-terminated array a full
+// no-match scan must visit exactly the real-entry count and stop — proving the
+// terminator length-path works (hazard 5) without any unbounded read.  We count
+// iterations with an instrumented copy of the loop body over OWNED memory.
+// ---------------------------------------------------------------------------
+static auto test_walk_iteration_count_bounded() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+
+    // 5 real entries + terminator.  A no-match lookup must touch type_name of
+    // each real entry exactly once, hit the terminator, and stop at 5.
+    const std::array<vm_struct_entry_t, 6> arr{ {
+        { "T0", "_f", "int", 0, 0u, nullptr },
+        { "T1", "_f", "int", 0, 0u, nullptr },
+        { "T2", "_f", "int", 0, 0u, nullptr },
+        { "T3", "_f", "int", 0, 0u, nullptr },
+        { "T4", "_f", "int", 0, 0u, nullptr },
+        { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+    } };
+
+    int visited{ 0 };
+    for (const vm_struct_entry_t* e{ arr.data() }; e && e->type_name; ++e)
+    {
+        ++visited;
+        // Same body shape as the real loop (skip + double strcmp); no match.
+        if (!e->field_name) { continue; }
+        if (!std::strcmp(e->type_name, "ZZZ") && !std::strcmp(e->field_name, "_no"))
+        {
+            break;
+        }
+    }
+    check("walk_visits_exactly_real_entry_count", visited == 5);
+
+    // A match on the 3rd entry stops the scan early (no visiting past the match).
+    int visited_until_match{ 0 };
+    for (const vm_struct_entry_t* e{ arr.data() }; e && e->type_name; ++e)
+    {
+        ++visited_until_match;
+        if (!e->field_name) { continue; }
+        if (!std::strcmp(e->type_name, "T2") && !std::strcmp(e->field_name, "_f"))
+        {
+            break;
+        }
+    }
+    check("walk_stops_at_match_index", visited_until_match == 3);
+
+    // The terminator is detected on the (count)th increment: after 5 real
+    // entries, e points at arr[5] whose type_name is null, so the guard ends the
+    // loop without dereferencing any further element.
+    const vm_struct_entry_t* tail{ arr.data() };
+    int steps{ 0 };
+    while (tail && tail->type_name) { ++tail; ++steps; }
+    check("walk_terminator_reached_at_count", steps == 5);
+    check("walk_terminator_entry_has_null_type_name", tail->type_name == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 36. strcmp exactness over an owned array: confirm the production matcher is
+//     byte-exact (case-sensitive, length-exact, no prefix/substring match)
+//     against REAL entries, complementing the null-array near-miss sections
+//     (16/27) which can only prove "all null".  Here a real entry EXISTS, so a
+//     near-miss returning the entry would be a false positive — this is the
+//     positive-control the no-JVM sections structurally cannot provide.
+// ---------------------------------------------------------------------------
+static auto test_matcher_exactness_owned_array() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+
+    const std::array<vm_struct_entry_t, 2> arr{ {
+        { "Symbol", "_length", "int", 0, 8u, nullptr },
+        { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+    } };
+    const vm_struct_entry_t* const head{ arr.data() };
+
+    // Exact match works (positive control).
+    check("exact_match_hits", mirror_iterate_struct(head, "Symbol", "_length") == &arr[0]);
+
+    // Case variants of an EXISTING type/field must NOT match (strcmp is
+    // case-sensitive) — a false positive here would be a real correctness bug.
+    check("exact_type_case_lower_miss",
+          mirror_iterate_struct(head, "symbol", "_length") == nullptr);
+    check("exact_type_case_upper_miss",
+          mirror_iterate_struct(head, "SYMBOL", "_length") == nullptr);
+    check("exact_field_case_miss",
+          mirror_iterate_struct(head, "Symbol", "_Length") == nullptr);
+
+    // Prefix / superstring of the existing names must NOT match (length-exact).
+    check("exact_type_prefix_miss",
+          mirror_iterate_struct(head, "Symbo", "_length") == nullptr);
+    check("exact_type_superstring_miss",
+          mirror_iterate_struct(head, "SymbolX", "_length") == nullptr);
+    check("exact_field_prefix_miss",
+          mirror_iterate_struct(head, "Symbol", "_lengt") == nullptr);
+    check("exact_field_superstring_miss",
+          mirror_iterate_struct(head, "Symbol", "_lengthX") == nullptr);
+    check("exact_field_trailing_space_miss",
+          mirror_iterate_struct(head, "Symbol", "_length ") == nullptr);
+
+    // Right type, right field, but in swapped slots — both strcmps fail.
+    check("exact_swapped_slots_miss",
+          mirror_iterate_struct(head, "_length", "Symbol") == nullptr);
+
+    // The type walk over an owned single-type array is equally exact.
+    const std::array<vmhook::hotspot::vm_type_entry_t, 2> tarr{ {
+        { "Method", nullptr, 0, 0, 0, 56u },
+        { nullptr, nullptr, 0, 0, 0, 0u },
+    } };
+    check("exact_type_walk_hits", mirror_iterate_type(tarr.data(), "Method") == &tarr[0]);
+    check("exact_type_walk_case_miss", mirror_iterate_type(tarr.data(), "method") == nullptr);
+    check("exact_type_walk_prefix_miss", mirror_iterate_type(tarr.data(), "Metho") == nullptr);
+    check("exact_type_walk_superstring_miss", mirror_iterate_type(tarr.data(), "Methods") == nullptr);
+}
+
+// ===========================================================================
+// EXHAUSTIVE EXPANSION WAVE 3 (37+).
+//
+// WAVE 2 (sections 31-36) pinned the entry-struct ABI and re-ran the walk loop
+// over owned arrays for the match-found / skip / terminator / case-exactness
+// paths.  This wave closes the remaining gaps it left, all over memory THIS
+// TEST OWNS (string literals + std::array, never a fabricated/unmapped address,
+// never the global-reading API, never a JVM) and all POSIX-safe:
+//
+//   * FULL uint64 bit-pattern round-trip of vm_struct_entry_t::offset and
+//     vm_type_entry_t::size -- WAVE 2 used only tiny offsets (8/16/24/32), so the
+//     32-bit-truncation tripwires (1<<32, UINT64_MAX, high-word preservation)
+//     that flaw #1's `this + entry->offset` add depends on were UNCOVERED.
+//   * First-match-WINS on a duplicate (type,field) / duplicate type_name -- the
+//     resolver returns on the FIRST strcmp hit (vmhook.hpp:2003-2006); WAVE 2
+//     never had two matchable rows, so the documented first-wins tie-break was
+//     untested.
+//   * is_static across its full int32 discriminator domain (INT32_MIN/-1/MAX),
+//     pinning that the robust `!= 0` test classifies every non-zero as static.
+//   * Embedded-NUL search key (via explicit length) -- strcmp stops at the first
+//     NUL, so a key "Symbol\0junk" matches a "Symbol" entry; pins that the
+//     matcher never reads past the caller's first NUL (test angle #5).
+//   * Determinism / idempotence of the walk over a populated owned array across
+//     many repeats (the walk carries no per-call state).
+//   * alignof / pointer-member-size facts WAVE 2's offset pins did not assert.
+//
+// All helpers live in a private namespace so they never collide with WAVE 2's
+// mirror_iterate_* / test_* symbols.
+// ===========================================================================
+namespace wave3_offset_resolution
+{
+    // Private byte-for-byte mirror of iterate_struct_entries' loop
+    // (vmhook.hpp:1990-2009), array head explicit, over OWNED memory.
+    static auto find_struct(const vmhook::hotspot::vm_struct_entry_t* head,
+                            const char* type_name,
+                            const char* field_name) noexcept
+        -> const vmhook::hotspot::vm_struct_entry_t*
+    {
+        if (!type_name || !field_name)
+        {
+            return nullptr;
+        }
+        for (const vmhook::hotspot::vm_struct_entry_t* entry{ head };
+             entry && entry->type_name; ++entry)
+        {
+            if (!entry->field_name)
+            {
+                continue;
+            }
+            if (!std::strcmp(entry->type_name, type_name)
+                && !std::strcmp(entry->field_name, field_name))
+            {
+                return entry;
+            }
+        }
+        return nullptr;
+    }
+
+    // Private mirror of iterate_type_entries' loop (vmhook.hpp:1964-1979).
+    static auto find_type(const vmhook::hotspot::vm_type_entry_t* head,
+                          const char* type_name) noexcept
+        -> const vmhook::hotspot::vm_type_entry_t*
+    {
+        if (!type_name)
+        {
+            return nullptr;
+        }
+        for (const vmhook::hotspot::vm_type_entry_t* entry{ head };
+             entry && entry->type_name; ++entry)
+        {
+            if (!std::strcmp(entry->type_name, type_name))
+            {
+                return entry;
+            }
+        }
+        return nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 37. FULL uint64 OFFSET bit-pattern round-trip (the no-truncation guarantee).
+//
+// Every instance-field reader computes `base + entry->offset` with offset a
+// uint64_t (vmhook.hpp:1897).  WAVE 2 only stored small offsets; here a single
+// owned entry carries each interesting 64-bit pattern in turn and the resolved
+// entry's ->offset is required to read back BIT-EXACT, with the high 32 bits
+// preserved -- a regression that truncated offset to 32 bits (the >4GiB-relative
+// layout hazard) corrupts the high word and fails.  Stored values in OWNED
+// memory; the offset is NEVER used as a pointer.
+// ---------------------------------------------------------------------------
+static auto test_w3_offset_full_uint64_roundtrip() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+
+    static const std::uint64_t patterns[]{
+        0ull, 1ull, 2ull, 7ull,
+        0xFFull, 0x100ull, 0x7FFFull, 0x8000ull, 0xFFFFull, 0x10000ull,
+        0x7FFFFFFFull,            // INT32_MAX
+        0x80000000ull,            // INT32_MAX + 1 (sign bit if misread as int32)
+        0xFFFFFFFFull,            // UINT32_MAX
+        0x100000000ull,           // 1 << 32 -- the truncation tripwire
+        0x123456789ABCull,
+        0xAAAAAAAAAAAAAAAAull,    // alternating bits
+        0x5555555555555555ull,
+        0x7FFFFFFFFFFFFFFFull,    // INT64_MAX
+        0x8000000000000000ull,
+        0xFFFFFFFFFFFFFFFFull,    // UINT64_MAX
+    };
+
+    bool exact{ true };
+    bool high_word_kept{ true };
+    int n{ 0 };
+    for (const std::uint64_t off : patterns)
+    {
+        ++n;
+        const vm_struct_entry_t table[]{
+            { "T", "_f", "ty", 0, off, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+        };
+        const vm_struct_entry_t* const e{
+            wave3_offset_resolution::find_struct(table, "T", "_f") };
+        if (e == nullptr || e->offset != off) { exact = false; }
+        if (e != nullptr && (e->offset >> 32) != (off >> 32)) { high_word_kept = false; }
+    }
+    check("w3_offset_full_uint64_roundtrip_exact", exact);
+    check("w3_offset_high_word_preserved_no_truncation", high_word_kept);
+    check("w3_offset_pattern_count_20", n == 20);
+
+    // The two boundary tripwires explicitly, so a failure names the boundary.
+    {
+        const vm_struct_entry_t t[]{
+            { "T", "_f", "ty", 0, 0x100000000ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+        };
+        const vm_struct_entry_t* const e{
+            wave3_offset_resolution::find_struct(t, "T", "_f") };
+        check("w3_offset_1_shl_32_roundtrips", e != nullptr && e->offset == 0x100000000ull);
+    }
+    {
+        const vm_struct_entry_t t[]{
+            { "T", "_f", "ty", 0, 0xFFFFFFFFFFFFFFFFull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+        };
+        const vm_struct_entry_t* const e{
+            wave3_offset_resolution::find_struct(t, "T", "_f") };
+        check("w3_offset_uint64_max_roundtrips",
+              e != nullptr && e->offset == 0xFFFFFFFFFFFFFFFFull);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 38. FULL uint64 vm_type_entry_t::size round-trip + classification-flag domain.
+//
+// The type entry's `size` member is uint64 (vmhook.hpp:1887) and the three
+// classification flags are int32.  Sweep the full 64-bit pattern set through an
+// owned type entry's size and require bit-exact readback (the type walker
+// returns the entry untouched), and sweep the flag combinations.
+// ---------------------------------------------------------------------------
+static auto test_w3_type_size_full_uint64_roundtrip() -> void
+{
+    using vmhook::hotspot::vm_type_entry_t;
+
+    static const std::uint64_t sizes[]{
+        0ull, 1ull, 8ull, 0x7FFFFFFFull, 0x80000000ull, 0xFFFFFFFFull,
+        0x100000000ull, 0x7FFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull,
+    };
+    bool exact{ true };
+    bool high_kept{ true };
+    for (const std::uint64_t sz : sizes)
+    {
+        const vm_type_entry_t table[]{
+            { "T", nullptr, 0, 0, 0, sz },
+            { nullptr, nullptr, 0, 0, 0, 0u },
+        };
+        const vm_type_entry_t* const e{
+            wave3_offset_resolution::find_type(table, "T") };
+        if (e == nullptr || e->size != sz) { exact = false; }
+        if (e != nullptr && (e->size >> 32) != (sz >> 32)) { high_kept = false; }
+    }
+    check("w3_type_size_full_uint64_roundtrip_exact", exact);
+    check("w3_type_size_high_word_preserved", high_kept);
+
+    // All 8 combinations of the three boolean classification flags survive intact
+    // (each independent int32 column read back as stored).
+    bool flags_ok{ true };
+    for (int oop{ 0 }; oop <= 1; ++oop)
+    {
+        for (int integer{ 0 }; integer <= 1; ++integer)
+        {
+            for (int uns{ 0 }; uns <= 1; ++uns)
+            {
+                const vm_type_entry_t table[]{
+                    { "T", nullptr, oop, integer, uns, 8u },
+                    { nullptr, nullptr, 0, 0, 0, 0u },
+                };
+                const vm_type_entry_t* const e{
+                    wave3_offset_resolution::find_type(table, "T") };
+                if (e == nullptr
+                    || e->is_oop_type_type != oop
+                    || e->is_integer_type != integer
+                    || e->is_unsigned != uns)
+                {
+                    flags_ok = false;
+                }
+            }
+        }
+    }
+    check("w3_type_classification_flags_all_8_combos_intact", flags_ok);
+}
+
+// ---------------------------------------------------------------------------
+// 39. First-match-WINS on duplicates (vmhook.hpp:2003-2006 returns on first hit).
+//
+// WAVE 2 never had two matchable rows.  A table with a duplicate (type,field)
+// must resolve to the FIRST row (its offset/address), and a duplicate type_name
+// in the type walk likewise resolves to the first -- pinning the tie-break the
+// library implicitly relies on.  Owned memory.
+// ---------------------------------------------------------------------------
+static auto test_w3_first_match_wins() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::vm_type_entry_t;
+
+    static int first_addr{ 1 };
+    static int second_addr{ 2 };
+    static const vm_struct_entry_t dup[]{
+        { "Dup", "_f", "ty", 1, 100u, &first_addr },   // [0] must win
+        { "Dup", "_f", "ty", 1, 200u, &second_addr },  // [1] shadowed
+        { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+    };
+    const vm_struct_entry_t* const hit{
+        wave3_offset_resolution::find_struct(dup, "Dup", "_f") };
+    check("w3_first_match_is_element_zero", hit == &dup[0]);
+    check("w3_first_match_offset_is_first", hit != nullptr && hit->offset == 100u);
+    check("w3_first_match_address_is_first",
+          hit != nullptr && hit->address == &first_addr);
+
+    // A non-duplicate row interleaved between the duplicates: still first-wins,
+    // and the interleaved distinct row resolves to ITS own offset.
+    static const vm_struct_entry_t inter[]{
+        { "A", "_x", "ty", 0, 10u, nullptr },   // [0]
+        { "Dup", "_f", "ty", 0, 100u, nullptr },// [1] first Dup
+        { "B", "_y", "ty", 0, 20u, nullptr },   // [2]
+        { "Dup", "_f", "ty", 0, 200u, nullptr },// [3] second Dup
+        { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+    };
+    check("w3_interleaved_first_dup_wins",
+          wave3_offset_resolution::find_struct(inter, "Dup", "_f") == &inter[1]);
+    check("w3_interleaved_distinct_row_own_offset",
+          wave3_offset_resolution::find_struct(inter, "B", "_y") != nullptr
+              && wave3_offset_resolution::find_struct(inter, "B", "_y")->offset == 20u);
+
+    // Type-walk duplicate: first type_name wins.
+    static const vm_type_entry_t tdup[]{
+        { "DupT", nullptr, 0, 1, 0, 4u },   // [0] must win
+        { "DupT", nullptr, 0, 1, 0, 8u },   // [1] shadowed
+        { nullptr, nullptr, 0, 0, 0, 0u },
+    };
+    const vm_type_entry_t* const thit{ wave3_offset_resolution::find_type(tdup, "DupT") };
+    check("w3_type_first_match_is_element_zero", thit == &tdup[0]);
+    check("w3_type_first_match_size_is_first", thit != nullptr && thit->size == 4u);
+}
+
+// ---------------------------------------------------------------------------
+// 40. is_static full int32 discriminator domain (hazard 1).
+//
+// A static-aware caller classifies via `is_static != 0`.  Pin that across the
+// full int32 domain -- INT32_MIN, -1, 0, 1, 2, INT32_MAX -- the stored value reads
+// back exactly through the resolved entry and the `!= 0` test classifies every
+// non-zero as static, only 0 as instance.  WAVE 2 tested {0,1,2} only.  Owned.
+// ---------------------------------------------------------------------------
+static auto test_w3_is_static_full_int32_domain() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+
+    static const std::int32_t flags[]{
+        (std::numeric_limits<std::int32_t>::min)(),
+        -2, -1, 0, 1, 2, 0x7FFFFFFF,
+        (std::numeric_limits<std::int32_t>::max)(),
+    };
+    bool roundtrip{ true };
+    bool classify_ok{ true };
+    for (const std::int32_t f : flags)
+    {
+        const vm_struct_entry_t table[]{
+            { "T", "_f", "ty", f, 8u, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+        };
+        const vm_struct_entry_t* const e{
+            wave3_offset_resolution::find_struct(table, "T", "_f") };
+        if (e == nullptr || e->is_static != f) { roundtrip = false; }
+        // Robust discriminator: instance iff exactly 0, static iff non-zero.
+        const bool is_instance{ e != nullptr && e->is_static == 0 };
+        if (e != nullptr)
+        {
+            if (f == 0)
+            {
+                if (!is_instance) { classify_ok = false; }
+            }
+            else
+            {
+                if ((e->is_static != 0) != true) { classify_ok = false; }
+            }
+        }
+    }
+    check("w3_is_static_full_int32_roundtrip", roundtrip);
+    check("w3_is_static_nonzero_classified_static", classify_ok);
+}
+
+// ---------------------------------------------------------------------------
+// 41. Embedded-NUL search key: strcmp stops at the first NUL (test angle #5).
+//
+// strcmp compares C-strings up to the first NUL, so a key whose buffer is
+// "Symbol\0junk" compares equal to the entry's "Symbol" -- the matcher never
+// reads past the caller's first NUL.  Build the key as an explicit char array
+// (the only way to carry an embedded NUL) and confirm it matches a "Symbol"
+// entry, while a key whose visible prefix differs before its NUL does not.
+// Owned memory; no non-ASCII / no raw NUL emitted as a source byte -- the NUL is
+// an explicit '\0' element.
+// ---------------------------------------------------------------------------
+static auto test_w3_embedded_nul_key_stops_at_first_nul() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+
+    static const vm_struct_entry_t table[]{
+        { "Symbol", "_length", "int", 0, 8u, nullptr },
+        { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+    };
+
+    // Key buffer "Symbol\0junk": strcmp sees "Symbol" and matches entry [0].
+    const char type_key[]{ 'S','y','m','b','o','l','\0','j','u','n','k','\0' };
+    const char field_key[]{ '_','l','e','n','g','t','h','\0','X','Y','\0' };
+    check("w3_embedded_nul_type_key_matches_prefix",
+          wave3_offset_resolution::find_struct(table, type_key, "_length") == &table[0]);
+    check("w3_embedded_nul_field_key_matches_prefix",
+          wave3_offset_resolution::find_struct(table, "Symbol", field_key) == &table[0]);
+    check("w3_embedded_nul_both_keys_match",
+          wave3_offset_resolution::find_struct(table, type_key, field_key) == &table[0]);
+
+    // A key that differs BEFORE its NUL does not match (the bytes past the NUL are
+    // never consulted, so they cannot rescue a mismatching visible prefix).
+    const char wrong_key[]{ 'S','y','m','b','o','X','\0','S','y','m','b','o','l','\0' };
+    check("w3_embedded_nul_wrong_prefix_no_match",
+          wave3_offset_resolution::find_struct(table, wrong_key, "_length") == nullptr);
+
+    // Type-walk variant: embedded-NUL type key matches by its visible prefix.
+    static const vmhook::hotspot::vm_type_entry_t tarr[]{
+        { "Method", nullptr, 0, 0, 0, 56u },
+        { nullptr, nullptr, 0, 0, 0, 0u },
+    };
+    const char tkey[]{ 'M','e','t','h','o','d','\0','!','!','\0' };
+    check("w3_embedded_nul_type_walk_matches",
+          wave3_offset_resolution::find_type(tarr, tkey) == &tarr[0]);
+}
+
+// ---------------------------------------------------------------------------
+// 42. Walk determinism / idempotence over a populated owned array.
+//
+// The walk carries no per-call state, so repeating the SAME lookup over the SAME
+// owned array must return the identical entry pointer every time, and distinct
+// lookups must be independent.  Hammer a populated array and require pointer
+// stability across many repeats (the positive-path analogue of section 8's
+// null-array determinism).  Owned memory.
+// ---------------------------------------------------------------------------
+static auto test_w3_walk_determinism_populated() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::vm_type_entry_t;
+
+    static const vm_struct_entry_t structs[]{
+        { "Symbol", "_length", "int", 0, 8u, nullptr },
+        { "Method", "_constMethod", "ConstMethod*", 0, 16u, nullptr },
+        { "Klass", "_name", "Symbol*", 0, 24u, nullptr },
+        { nullptr, nullptr, nullptr, 0, 0u, nullptr },
+    };
+    static const vm_type_entry_t types[]{
+        { "oopDesc", nullptr, 1, 0, 0, 16u },
+        { "narrowOop", nullptr, 0, 1, 1, 4u },
+        { nullptr, nullptr, 0, 0, 0, 0u },
+    };
+
+    const vm_struct_entry_t* const s0{
+        wave3_offset_resolution::find_struct(structs, "Symbol", "_length") };
+    const vm_struct_entry_t* const s1{
+        wave3_offset_resolution::find_struct(structs, "Klass", "_name") };
+    const vm_type_entry_t* const t0{
+        wave3_offset_resolution::find_type(types, "narrowOop") };
+
+    bool stable{ true };
+    for (int i{ 0 }; i < 1000; ++i)
+    {
+        if (wave3_offset_resolution::find_struct(structs, "Symbol", "_length") != s0) { stable = false; }
+        if (wave3_offset_resolution::find_struct(structs, "Klass", "_name") != s1) { stable = false; }
+        if (wave3_offset_resolution::find_type(types, "narrowOop") != t0) { stable = false; }
+        // A miss must be stably null too.
+        if (wave3_offset_resolution::find_struct(structs, "Symbol", "_nope") != nullptr) { stable = false; }
+    }
+    check("w3_walk_populated_lookup_pointer_stable", stable);
+    check("w3_walk_populated_distinct_lookups_independent",
+          s0 != nullptr && s1 != nullptr && s0 != s1);
+    check("w3_walk_populated_offsets_correct",
+          s0 != nullptr && s0->offset == 8u && s1 != nullptr && s1->offset == 24u);
+}
+
+// ---------------------------------------------------------------------------
+// 43. alignof / pointer-member-size facts (complements WAVE 2 offset pins).
+//
+// The array stride is sizeof(entry); its alignment is alignof(entry).  On the
+// LP64 targets the JVM supports, both structs are 8-byte aligned (a uint64 / a
+// pointer member forces it) and the pointer members are pointer-width.  Pin the
+// alignment relationship and pointer-member sizes WAVE 2 did not assert.
+// ---------------------------------------------------------------------------
+static auto test_w3_alignment_and_pointer_sizes() -> void
+{
+    using vmhook::hotspot::vm_struct_entry_t;
+    using vmhook::hotspot::vm_type_entry_t;
+
+    // Alignment is at least that of the widest member (uint64 / pointer).
+    check("w3_struct_align_ge_uint64",
+          alignof(vm_struct_entry_t) >= alignof(std::uint64_t));
+    check("w3_type_align_ge_uint64",
+          alignof(vm_type_entry_t) >= alignof(std::uint64_t));
+    check("w3_struct_align_ge_pointer",
+          alignof(vm_struct_entry_t) >= alignof(void*));
+
+    // sizeof is an exact multiple of alignof (so ++entry stays aligned).
+    check("w3_struct_sizeof_multiple_of_align",
+          (sizeof(vm_struct_entry_t) % alignof(vm_struct_entry_t)) == 0u);
+    check("w3_type_sizeof_multiple_of_align",
+          (sizeof(vm_type_entry_t) % alignof(vm_type_entry_t)) == 0u);
+
+    // Pointer members are all pointer-width.
+    check("w3_struct_pointer_members_pointer_width",
+          sizeof(vm_struct_entry_t::type_name) == sizeof(void*)
+          && sizeof(vm_struct_entry_t::field_name) == sizeof(void*)
+          && sizeof(vm_struct_entry_t::type_string) == sizeof(void*)
+          && sizeof(vm_struct_entry_t::address) == sizeof(void*));
+    check("w3_type_pointer_members_pointer_width",
+          sizeof(vm_type_entry_t::type_name) == sizeof(void*)
+          && sizeof(vm_type_entry_t::superclass_name) == sizeof(void*));
+
+    // On LP64 the alignment is exactly 8.
+    if (sizeof(void*) == 8u)
+    {
+        check("w3_lp64_struct_align_8", alignof(vm_struct_entry_t) == 8u);
+        check("w3_lp64_type_align_8", alignof(vm_type_entry_t) == 8u);
+    }
+    else
+    {
+        check("w3_lp64_align_block_skipped", sizeof(void*) != 8u);
+    }
+}
+
 int main()
 {
     test_getters_cache_no_jvm();
@@ -1477,6 +2555,19 @@ int main()
     test_slot_independence_matrix_no_jvm();
     test_maximal_interleave_and_cache_order();
     test_determinism_fingerprint_no_jvm();
+    test_entry_struct_layout_pin();
+    test_walk_algorithm_owned_array();
+    test_is_static_discriminator_values();
+    test_type_walk_matches_on_type_name_only();
+    test_walk_iteration_count_bounded();
+    test_matcher_exactness_owned_array();
+    test_w3_offset_full_uint64_roundtrip();
+    test_w3_type_size_full_uint64_roundtrip();
+    test_w3_first_match_wins();
+    test_w3_is_static_full_int32_domain();
+    test_w3_embedded_nul_key_stops_at_first_nul();
+    test_w3_walk_determinism_populated();
+    test_w3_alignment_and_pointer_sizes();
 
     return failures == 0 ? 0 : 1;
 }

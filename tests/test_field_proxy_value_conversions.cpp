@@ -1915,5 +1915,354 @@ int main()
         }
     }
 
+    // =====================================================================
+    // WAVE-5 DEEPENING (additive — every expected value traced from
+    // field_proxy::value_t::cast_for_variant<> (vmhook.hpp ~15276-15368),
+    // get()'s per-descriptor dispatch (~15525-15652), as_string()
+    // (~15424-15439), and value_t::is_reference() (~15445-15448)).  Pure
+    // logic / no live JVM: only the compressed value 0 (decode_oop_pointer(0)
+    // -> nullptr, no VMStruct access) and pure-arithmetic alternatives are
+    // exercised; no fabricated unmapped address is decoded, no live oop is
+    // dereferenced.  Sections are numbered 43+ to avoid clashing with the
+    // existing 1-42.
+    // =====================================================================
+
+    // ---------------------------------------------------------------------
+    // 43. EXTRA-WIDTH integer conversion targets through cast_for_variant's
+    //     generic numeric arm (the `requires { static_cast<target>(value); }`
+    //     branch at ~15360-15363).  Earlier sections pin the fixed-width
+    //     std::intNN_t targets; here we drive the C++ builtin spellings
+    //     (long long / unsigned long long / unsigned int / short / signed
+    //     char / unsigned char) so a regression that narrowed the generic arm
+    //     to only the std::intNN_t set would be caught.  Every result is the
+    //     standard static_cast value from the stored alternative.
+    // ---------------------------------------------------------------------
+    {
+        // int32 source -12345 fans out across the builtin integer widths.
+        auto vi = read_back<std::int32_t>("I", std::int32_t{ -12345 });
+        check("i32_to_long_long_is_minus_12345", static_cast<long long>(vi) == -12345LL);
+        check("i32_to_short_is_minus_12345", static_cast<short>(vi) == static_cast<short>(-12345));
+        check("i32_to_signed_char_truncates",
+              static_cast<signed char>(vi) == static_cast<signed char>(static_cast<std::int32_t>(-12345)));
+        // -12345 as uint32 is 0xFFFFCFC7; as unsigned long long zero-extends THAT.
+        check("i32_minus_12345_to_unsigned_int_is_0xFFFFCFC7",
+              static_cast<unsigned int>(vi) == 0xFFFFCFC7u);
+
+        // int64 source large positive narrows / widens per static_cast.
+        auto vj = read_back<std::int64_t>("J", std::int64_t{ 5000000000LL });
+        check("i64_to_unsigned_long_long_is_5e9",
+              static_cast<unsigned long long>(vj) == 5000000000ULL);
+        // 5000000000 mod 2^32 == 705032704 (0x2A05F200) as a 32-bit unsigned.
+        check("i64_to_unsigned_int_wraps_to_705032704",
+              static_cast<unsigned int>(vj) == 705032704u);
+
+        // uint32 (reference) source -> builtin unsigned widths, pure arithmetic.
+        auto vu = read_back<std::uint32_t>("Ljava/lang/Object;", std::uint32_t{ 0xFFFFFFFFu });
+        check("u32_max_to_unsigned_long_long_is_4294967295",
+              static_cast<unsigned long long>(vu) == 4294967295ULL);
+        check("u32_max_to_long_long_zero_extends",
+              static_cast<long long>(vu) == 4294967295LL);
+
+        // bool source -> builtin widths: true == 1 everywhere.
+        auto vz = read_back<std::uint8_t>("Z", std::uint8_t{ 1 });
+        check("bool_true_to_long_long_is_1", static_cast<long long>(vz) == 1LL);
+        check("bool_true_to_unsigned_char_is_1",
+              static_cast<unsigned char>(vz) == static_cast<unsigned char>(1));
+    }
+
+    // ---------------------------------------------------------------------
+    // 44. std::vector<T> reject arm (~15294-15303) across MORE element types.
+    //     For any NON-uint32 source the vector arm returns `{}` (empty)
+    //     regardless of element_type; section 26 covered int/bool/string, here
+    //     we add float / double / int64_t / char / int16_t / uint32_t element
+    //     vectors, all driven through copy-init (the portable spelling — a
+    //     static_cast<vector<T>> stays ambiguous on MSVC, see section 26 note).
+    //     A zero compressed-OOP array source also yields empty (decode_array_oop
+    //     (0) == nullptr, no heap walk), which is JVM-free.
+    // ---------------------------------------------------------------------
+    {
+        std::vector<float> vf = read_back<std::int32_t>("I", 5);
+        check("vector_float_empty_for_int_alt", vf.empty());
+        std::vector<double> vd = read_back<double>("D", 2.5);
+        check("vector_double_empty_for_double_alt", vd.empty());
+        std::vector<std::int64_t> vl = read_back<std::int64_t>("J", std::int64_t{ 9 });
+        check("vector_int64_empty_for_long_alt", vl.empty());
+        std::vector<char> vc = read_back<std::uint16_t>("C", std::uint16_t{ 65 });
+        check("vector_char_empty_for_char_alt", vc.empty());
+        std::vector<std::int16_t> vs = read_back<std::int16_t>("S", std::int16_t{ 7 });
+        check("vector_int16_empty_for_short_alt", vs.empty());
+        std::vector<std::uint32_t> vu = read_back<std::uint8_t>("Z", std::uint8_t{ 1 });
+        check("vector_uint32_empty_for_bool_alt", vu.empty());
+
+        // Zero compressed-OOP array (uint32 alt) -> empty for each element type.
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0x00 });
+        vmhook::field_proxy arr_f{ storage.data(), "[F", false };
+        std::vector<float> zf = arr_f.get();
+        check("vector_float_empty_for_zero_oop_array", zf.empty());
+        vmhook::field_proxy arr_d{ storage.data(), "[D", false };
+        std::vector<double> zd = arr_d.get();
+        check("vector_double_empty_for_zero_oop_array", zd.empty());
+        vmhook::field_proxy arr_j{ storage.data(), "[J", false };
+        std::vector<std::int64_t> zl = arr_j.get();
+        check("vector_int64_empty_for_zero_oop_array", zl.empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // 45. value_t::is_reference() (~15445-15448 == holds_alternative<uint32_t>)
+    //     enumerated over EVERY directly-built primitive alternative -> false,
+    //     and the uint32 alternative -> true.  Section 19/33 cover this via
+    //     get() and one direct uint32; this isolates the predicate from get()
+    //     dispatch across all eight primitive alternatives via direct
+    //     construction (no proxy, no buffer).  Exhaustive small-domain sweep.
+    // ---------------------------------------------------------------------
+    {
+        check("direct_bool_is_reference_false", value_t{ true }.is_reference() == false);
+        check("direct_int8_is_reference_false", value_t{ std::int8_t{ -1 } }.is_reference() == false);
+        check("direct_int16_is_reference_false", value_t{ std::int16_t{ 1 } }.is_reference() == false);
+        check("direct_int32_is_reference_false", value_t{ std::int32_t{ 1 } }.is_reference() == false);
+        check("direct_int64_is_reference_false", value_t{ std::int64_t{ 1 } }.is_reference() == false);
+        check("direct_float_is_reference_false", value_t{ float{ 1.0f } }.is_reference() == false);
+        check("direct_double_is_reference_false", value_t{ double{ 1.0 } }.is_reference() == false);
+        check("direct_uint16_is_reference_false", value_t{ std::uint16_t{ 1 } }.is_reference() == false);
+        check("direct_uint32_zero_is_reference_true", value_t{ std::uint32_t{ 0u } }.is_reference() == true);
+        check("direct_uint32_nonzero_is_reference_true", value_t{ std::uint32_t{ 42u } }.is_reference() == true);
+
+        // The alternative index and is_reference() must agree for every primitive.
+        check("direct_bool_index_matches_alt", value_t{ true }.data.index() == idx::k_bool);
+        check("direct_int8_index_matches_alt", value_t{ std::int8_t{ 0 } }.data.index() == idx::k_i8);
+        check("direct_int16_index_matches_alt", value_t{ std::int16_t{ 0 } }.data.index() == idx::k_i16);
+        check("direct_int32_index_matches_alt", value_t{ std::int32_t{ 0 } }.data.index() == idx::k_i32);
+        check("direct_int64_index_matches_alt", value_t{ std::int64_t{ 0 } }.data.index() == idx::k_i64);
+        check("direct_float_index_matches_alt", value_t{ float{ 0 } }.data.index() == idx::k_float);
+        check("direct_double_index_matches_alt", value_t{ double{ 0 } }.data.index() == idx::k_double);
+        check("direct_uint16_index_matches_alt", value_t{ std::uint16_t{ 0 } }.data.index() == idx::k_u16);
+        check("direct_uint32_index_matches_alt", value_t{ std::uint32_t{ 0 } }.data.index() == idx::k_u32);
+    }
+
+    // ---------------------------------------------------------------------
+    // 46. as_string() == static_cast<std::string>() agreement across EVERY
+    //     alternative (both name the same uint32-only decode arm; ~15283-15293
+    //     and ~15424-15439).  All eight primitive alternatives -> "" on BOTH
+    //     spellings; a zero-OOP uint32 -> "" on both (decode_oop_pointer(0) ->
+    //     read_java_string(nullptr) -> "").  Driven via direct construction so
+    //     the agreement is pinned independently of get().  A non-zero uint32
+    //     would call decode_oop_pointer(nonzero) (JVM-only) so is NOT exercised.
+    // ---------------------------------------------------------------------
+    {
+        const value_t prims[]{
+            value_t{ true },
+            value_t{ std::int8_t{ -7 } },
+            value_t{ std::int16_t{ 1234 } },
+            value_t{ std::int32_t{ 999999 } },
+            value_t{ std::int64_t{ -5LL } },
+            value_t{ float{ 3.5f } },
+            value_t{ double{ 2.5 } },
+            value_t{ std::uint16_t{ 0x41 } },
+        };
+        bool all_empty_and_agree{ true };
+        for (const value_t& v : prims)
+        {
+            if (!v.as_string().empty()) { all_empty_and_agree = false; }
+            if (!static_cast<std::string>(v).empty()) { all_empty_and_agree = false; }
+            if (v.as_string() != static_cast<std::string>(v)) { all_empty_and_agree = false; }
+        }
+        check("as_string_eq_static_cast_empty_all_primitives", all_empty_and_agree);
+
+        // Zero-OOP uint32 (with a String signature): both yield "" and agree.
+        value_t zero_oop{ std::uint32_t{ 0u }, std::string{ "Ljava/lang/String;" } };
+        check("as_string_zero_oop_empty", zero_oop.as_string().empty());
+        check("static_cast_string_zero_oop_empty", static_cast<std::string>(zero_oop).empty());
+        check("as_string_eq_static_cast_zero_oop",
+              zero_oop.as_string() == static_cast<std::string>(zero_oop));
+
+        // Zero-OOP uint32 with an EMPTY signature still decodes through the
+        // uint32 arm (the arm keys on the ALTERNATIVE, not the signature) -> "".
+        value_t zero_oop_empty_sig{ std::uint32_t{ 0u } };
+        check("as_string_zero_oop_empty_sig_empty", zero_oop_empty_sig.as_string().empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // 47. void* decode keys on the ALTERNATIVE not the signature, mirrored for
+    //     the directly-built value_t.  cast_for_variant<void*> (~15348-15359)
+    //     decodes only when the stored alternative is uint32_t; a zero OOP ->
+    //     nullptr (decode_oop_pointer(0)).  A uint32 alt built with NO signature
+    //     still routes through the decode arm and yields nullptr for a zero OOP,
+    //     and every non-uint32 direct alternative -> nullptr via the else arm.
+    //     Pins that the signature does not gate the void* path.
+    // ---------------------------------------------------------------------
+    {
+        check("direct_uint32_zero_no_sig_to_void_ptr_null",
+              static_cast<void*>(value_t{ std::uint32_t{ 0u } }) == nullptr);
+        check("direct_int32_to_void_ptr_null",
+              static_cast<void*>(value_t{ std::int32_t{ 12345 } }) == nullptr);
+        check("direct_int64_to_void_ptr_null",
+              static_cast<void*>(value_t{ std::int64_t{ -1LL } }) == nullptr);
+        check("direct_double_to_void_ptr_null",
+              static_cast<void*>(value_t{ double{ 1.0 } }) == nullptr);
+        check("direct_bool_to_void_ptr_null",
+              static_cast<void*>(value_t{ true }) == nullptr);
+        check("direct_uint16_to_void_ptr_null",
+              static_cast<void*>(value_t{ std::uint16_t{ 0xFFFF } }) == nullptr);
+
+        // const void* (cv void* is the allowed cv-pointer target per the trait):
+        // a zero-OOP uint32 alt rides the generic static_cast arm and is nullptr.
+        const void* cvp = value_t{ std::uint32_t{ 0u } };
+        check("direct_uint32_zero_to_const_void_ptr_null", cvp == nullptr);
+    }
+
+    // ---------------------------------------------------------------------
+    // 48. unique_ptr<W> FLAW-B signature guard (~15317-15320) enumerated over a
+    //     directly-built uint32 ZERO alternative carrying each non-'L' signature
+    //     class: array "[I", array-of-objects "[Ljava/lang/Object;", primitive
+    //     "I", void "V", unknown "X", empty "", and a lone "[".  EVERY one
+    //     returns nullptr BEFORE any decode (the guard fires on
+    //     signature.empty() || front() != 'L'), so no JVM.  A 'L...;' signature
+    //     with a ZERO oop is ALSO nullptr but via the later `!decoded` arm
+    //     (~15322-15326) since decode_oop_pointer(0) == nullptr — still JVM-free.
+    // ---------------------------------------------------------------------
+    {
+        const char* const non_L_sigs[]{ "[I", "[Ljava/lang/Object;", "I", "V", "X", "", "[" };
+        bool all_null{ true };
+        for (const char* s : non_L_sigs)
+        {
+            value_t v{ std::uint32_t{ 0u }, std::string{ s } };
+            if (static_cast<std::unique_ptr<W>>(v) != nullptr) { all_null = false; }
+            // The alternative is genuinely uint32 (so the guard, not the
+            // non-uint32 else-arm, is what produced the nullptr).
+            if (v.data.index() != idx::k_u32) { all_null = false; }
+        }
+        check("unique_ptr_null_for_all_non_L_signatures_direct", all_null);
+
+        // 'L...;' signature with a ZERO oop -> nullptr via the !decoded arm
+        // (decode_oop_pointer(0) == nullptr), reached AFTER the front()=='L'
+        // guard passes — proves the guard is first-char only, JVM-free here.
+        value_t l_zero{ std::uint32_t{ 0u }, std::string{ "Ljava/lang/String;" } };
+        check("unique_ptr_null_for_L_sig_zero_oop",
+              static_cast<std::unique_ptr<W>>(l_zero) == nullptr);
+        check("unique_ptr_L_sig_zero_oop_alt_is_uint32",
+              l_zero.data.index() == idx::k_u32);
+    }
+
+    // ---------------------------------------------------------------------
+    // 49. get() dispatch: the eight primitive descriptors are CASE-SENSITIVE
+    //     and EXACT-LENGTH.  Each lowercase twin ("z","b","s","i","j","f","d",
+    //     "c") and each doubled form falls through to the uint32 reference arm
+    //     (~15648-15651), NOT the matching primitive, because the comparison is
+    //     `signature_text == "Z"` (a full std::string equality).  Exhaustive
+    //     over all eight primitive letters; pure logic, non-null buffer.
+    // ---------------------------------------------------------------------
+    {
+        const char* const lowercase[]{ "z", "b", "s", "i", "j", "f", "d", "c" };
+        bool all_uint32{ true };
+        for (const char* s : lowercase)
+        {
+            auto v = read_back<std::uint32_t>(s, std::uint32_t{ 0x01020304u });
+            if (v.data.index() != idx::k_u32) { all_uint32 = false; }
+            if (std::get<std::uint32_t>(v.data) != 0x01020304u) { all_uint32 = false; }
+        }
+        check("lowercase_primitive_letters_all_route_to_uint32", all_uint32);
+
+        // A primitive letter followed by a NUL-equivalent extra char (e.g.
+        // "I ") is a different std::string -> uint32 fall-through.
+        auto vspace = read_back<std::uint32_t>("I ", std::uint32_t{ 0xCAFEBABEu });
+        check("primitive_letter_with_trailing_space_routes_to_uint32",
+              vspace.data.index() == idx::k_u32);
+        check("primitive_letter_with_trailing_space_value_round_trips",
+              std::get<std::uint32_t>(vspace.data) == 0xCAFEBABEu);
+    }
+
+    // ---------------------------------------------------------------------
+    // 50. signature round-trips through value_t for EVERY descriptor get()
+    //     dispatches, and the carried signature equals the proxy's own.
+    //     get() builds value_t{ value, this->signature_text } on every arm
+    //     (~15603-15651), so value.signature must always equal the descriptor —
+    //     including the uint32 fall-through ("X", "", "[I").  Section 7 checks
+    //     proxy.signature(); this checks the value_t.signature member that the
+    //     unique_ptr/string/vector arms consult.
+    // ---------------------------------------------------------------------
+    {
+        const char* const descriptors[]{
+            "Z", "B", "S", "I", "J", "F", "D", "C",
+            "Ljava/lang/String;", "[I", "[Ljava/lang/Object;", "X", ""
+        };
+        bool all_match{ true };
+        for (const char* d : descriptors)
+        {
+            std::array<std::uint8_t, 16> storage{};
+            storage.fill(std::uint8_t{ 0x00 });
+            vmhook::field_proxy proxy{ storage.data(), d, false };
+            if (proxy.get().signature != std::string{ d }) { all_match = false; }
+        }
+        check("value_t_signature_round_trips_all_dispatched_descriptors", all_match);
+
+        // Null-proxy get() also preserves the signature on the int32 fallback
+        // arm (~15549) for a reference descriptor.
+        vmhook::field_proxy null_ref{ nullptr, "[Ljava/lang/Object;", false };
+        check("null_proxy_value_t_signature_preserved",
+              null_ref.get().signature == "[Ljava/lang/Object;");
+    }
+
+    // ---------------------------------------------------------------------
+    // 51. int64 ("J") full cross-cast sweep at the extremes through the generic
+    //     numeric arm: INT64_MIN/MAX narrowing to int32 keeps the LOW 32 bits
+    //     (static_cast truncation), and the documented widening/identity holds.
+    //     All pure two's-complement arithmetic, fully deterministic.
+    // ---------------------------------------------------------------------
+    {
+        // INT64_MIN low 32 bits are 0 -> int32 truncation == 0.
+        auto vmin = read_back<std::int64_t>("J", std::int64_t{ -9223372036854775807LL - 1 });
+        check("J_min_narrows_to_int32_zero", static_cast<std::int32_t>(vmin) == 0);
+        check("J_min_to_uint32_zero", static_cast<std::uint32_t>(vmin) == 0u);
+        check("J_min_identity_int64",
+              static_cast<std::int64_t>(vmin) == (std::int64_t{ -9223372036854775807LL } - 1));
+
+        // INT64_MAX low 32 bits are 0xFFFFFFFF -> int32 truncation == -1.
+        auto vmax = read_back<std::int64_t>("J", std::int64_t{ 9223372036854775807LL });
+        check("J_max_narrows_to_int32_minus_one", static_cast<std::int32_t>(vmax) == -1);
+        check("J_max_to_uint32_all_ones", static_cast<std::uint32_t>(vmax) == 0xFFFFFFFFu);
+
+        // A value with a known low/high split: 0x1122334455667788.
+        auto vsplit = read_back<std::int64_t>("J", static_cast<std::int64_t>(0x1122334455667788LL));
+        check("J_split_narrows_to_int32_low_word",
+              static_cast<std::int32_t>(vsplit) == static_cast<std::int32_t>(0x55667788u));
+        check("J_split_to_uint32_low_word",
+              static_cast<std::uint32_t>(vsplit) == 0x55667788u);
+        check("J_split_identity_int64",
+              static_cast<std::int64_t>(vsplit) == static_cast<std::int64_t>(0x1122334455667788LL));
+    }
+
+    // ---------------------------------------------------------------------
+    // 52. Implicit operator vs static_cast agreement for the EXTRA-WIDTH and
+    //     special targets added above (the two spellings route through the same
+    //     cast_for_variant, so they must never diverge).  Covers long long,
+    //     unsigned int, void* (zero OOP), and std::string (zero OOP) — the four
+    //     arm families (generic numeric, void* decode, string decode).
+    // ---------------------------------------------------------------------
+    {
+        auto vi = read_back<std::int32_t>("I", std::int32_t{ 123456 });
+        const long long imp_ll = vi;
+        check("i32_implicit_eq_static_cast_long_long",
+              imp_ll == static_cast<long long>(vi) && imp_ll == 123456LL);
+        const unsigned int imp_ui = vi;
+        check("i32_implicit_eq_static_cast_unsigned_int",
+              imp_ui == static_cast<unsigned int>(vi) && imp_ui == 123456u);
+
+        // void* zero-OOP: implicit and static_cast both nullptr.
+        std::array<std::uint8_t, 16> storage{};
+        storage.fill(std::uint8_t{ 0x00 });
+        vmhook::field_proxy ref{ storage.data(), "Ljava/lang/Object;", false };
+        auto vr = ref.get();
+        void* imp_vp = vr;
+        check("void_ptr_implicit_eq_static_cast_zero_oop_obj",
+              imp_vp == static_cast<void*>(vr) && imp_vp == nullptr);
+
+        // std::string zero-OOP: as_string drives the same decode; static_cast
+        // and as_string agree and are both empty.
+        std::string imp_s = vr.as_string();
+        check("string_as_string_eq_static_cast_zero_oop_obj",
+              imp_s == static_cast<std::string>(vr) && imp_s.empty());
+    }
+
     return failures == 0 ? 0 : 1;
 }

@@ -1735,6 +1735,585 @@ int main()
         check("size_field_0x10001_clamps_to_one", clamp_u2(0x1'0001u) == 1u);
     }
 
+    // =====================================================================
+    // T. (ADDITIVE, namespaced "T_" - deepens the POST-READ GUARD (3) in the
+    //    feature's own context.)  The terminal guard in get_name/get_signature
+    //    is  `!entry_pointer || !is_valid_pointer(entry_pointer)` (vmhook.hpp
+    //    :2501 / :2578).  is_valid_pointer (:2047-2084) rejects a slot VALUE on
+    //    FOUR independent grounds, each derived verbatim from source:
+    //       (i)   addr <= user_address_floor (0xFFFF)            -> reject
+    //       (ii)  addr >= user_address_ceiling (0x00007FFFFFFFFFFF)-> reject
+    //       (iii) (addr & 0x1) != 0  (bit-0 set / odd)           -> reject
+    //       (iv)  low-32-bits == any of NINE debug-poison tags   -> reject
+    //    Sections F/M only ever planted 0xCAFEBABE as a slot value; here we
+    //    plant EVERY rejection ground AND the load-bearing alignment
+    //    DIFFERENTIAL between the two gates: the slot-ADDRESS probe (2) requires
+    //    8-byte alignment (:2025, `addr & 0x7`), but the slot-VALUE guard (3)
+    //    only requires bit-0 clear (:2059, `addr & 0x1`).  A 4-byte-aligned
+    //    Symbol* VALUE is therefore ACCEPTED by guard (3) even though that same
+    //    bit pattern as a slot ADDRESS would be rejected by probe (2) - the two
+    //    gates apply different alignment rules by design, and that is pinned
+    //    here.  All slot VALUES are written into a REAL owned RWX page; we never
+    //    hand a fabricated unmapped/wild address to any reading helper (the
+    //    values are only passed to is_valid_pointer, which does NOT dereference).
+    // =====================================================================
+    {
+        // T0. The full NINE-pattern poison set, exactly as the is_valid_pointer
+        //     switch enumerates it (:2070-2078).  Each, planted as a slot VALUE,
+        //     must be rejected by guard (3) -> the getter returns nullptr.
+        const std::uint32_t poison_low32[]{
+            0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+            0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu,
+        };
+        check("T_poison_set_has_nine_patterns",
+              (sizeof(poison_low32) / sizeof(poison_low32[0])) == 9u);
+
+        // T1. Every poison low-32 pattern is rejected as a VALUE - both as a
+        //     bare low-32 value and (where it stays in user range) with high
+        //     bits set, proving the check is on the low 32 bits regardless of
+        //     the upper half.  These are PURE is_valid_pointer calls on
+        //     constants (no memory read), so they are POSIX-safe.
+        {
+            bool all_poison_low_rejected{ true };
+            bool all_poison_high_rejected{ true };
+            for (const std::uint32_t p : poison_low32)
+            {
+                // Bare low-32 form (high half zero): is_valid_pointer rejects.
+                if (is_valid_pointer(reinterpret_cast<void*>(
+                        static_cast<std::uintptr_t>(p))))
+                {
+                    all_poison_low_rejected = false;
+                }
+                // Same low 32 bits, a non-zero high half placed INSIDE the
+                // canonical user range (bit 44 set => 0x0000'1000'0000'0000,
+                // which is > floor and < ceiling).  is_valid_pointer must STILL
+                // reject it: the high bits do not rescue a value whose low 32
+                // bits are a poison tag (rejected via the low32 switch, :2067-
+                // 2079, or - for the odd patterns - via the bit-0 rule :2059).
+                // Either way the verdict is reject, which is what we assert.
+                const std::uintptr_t with_high{
+                    (std::uintptr_t{ 0x0000'1000'0000'0000ull })
+                    | static_cast<std::uintptr_t>(p) };
+                if (is_valid_pointer(reinterpret_cast<void*>(with_high)))
+                {
+                    all_poison_high_rejected = false;
+                }
+            }
+            check("T_poison_low32_values_rejected", all_poison_low_rejected);
+            check("T_poison_high_bits_set_still_rejected", all_poison_high_rejected);
+        }
+
+        // T2. Plant each rejection ground as a slot VALUE in a REAL owned page
+        //     and run the EXACT FIX B tail (probe (2) on the slot ADDRESS, then
+        //     guard (3) on the slot VALUE) with the length bound disabled
+        //     (cp_length == -1, so only (2) and (3) decide).  Every planted
+        //     bad value must drive the getter tail to nullptr; one good value
+        //     must drive it to non-null.
+        {
+            const std::size_t page{ vmhook::os::page_size() };
+            void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+            if (!block)
+            {
+                check("T_postread_skipped_alloc_failed", false);
+            }
+            else
+            {
+                *static_cast<volatile std::uint8_t*>(block) = 0x7E; // commit
+                void** const base{ static_cast<void**>(block) };
+
+                // The composite tail FIX B runs, expressed once (bound disabled).
+                auto getter_returns_symbol_at =
+                    [&](std::size_t i) -> bool
+                {
+                    const std::uint16_t index{ static_cast<std::uint16_t>(i & 0xFFFFu) };
+                    if (length_bound_rejects(index, -1)) { return false; } // (1) off
+                    if (!is_readable_pointer(&base[index])) { return false; } // (2)
+                    void* const v{ base[index] };
+                    return v != nullptr && is_valid_pointer(v);              // (3)
+                };
+
+                // Slot 0: null value -> guard (3) rejects (the `!entry_pointer`
+                // half of :2501).
+                base[0] = nullptr;
+                check("T_slot_null_value_returns_null", !getter_returns_symbol_at(0));
+
+                // Slot 1: floor value (== user_address_floor, 0xFFFF) -> guard
+                // rejects on `addr <= floor` (:2051).
+                base[1] = reinterpret_cast<void*>(vmhook::os::user_address_floor);
+                check("T_slot_floor_value_returns_null", !getter_returns_symbol_at(1));
+
+                // Slot 2: ceiling value -> guard rejects on `addr >= ceiling`.
+                base[2] = reinterpret_cast<void*>(vmhook::os::user_address_ceiling);
+                check("T_slot_ceiling_value_returns_null", !getter_returns_symbol_at(2));
+
+                // Slot 3: an ODD value (bit-0 set) in user range -> guard
+                // rejects on `(addr & 0x1) != 0` (:2059).  This is a value the
+                // 8-byte slot-address probe could never produce, but a corrupt
+                // entry slot CAN hold it; guard (3) is the catch.
+                base[3] = reinterpret_cast<void*>(
+                    std::uintptr_t{ 0x0000'2000'0000'0001ull });
+                check("T_slot_odd_value_returns_null", !getter_returns_symbol_at(3));
+
+                // Slots 4..: each of the nine poison patterns (low-32) planted in
+                // turn -> guard (3) rejects every one.  We reuse a single slot
+                // (index 4) and overwrite it per pattern.
+                {
+                    bool every_poison_value_returns_null{ true };
+                    for (const std::uint32_t p : poison_low32)
+                    {
+                        base[4] = reinterpret_cast<void*>(static_cast<std::uintptr_t>(p));
+                        if (getter_returns_symbol_at(4)) { every_poison_value_returns_null = false; }
+                    }
+                    check("T_slot_every_poison_value_returns_null", every_poison_value_returns_null);
+                }
+
+                // Slot 5: a REAL, valid, 8-byte-aligned value (a pointer into the
+                // page) -> guard (3) accepts -> getter returns a Symbol*.
+                base[5] = static_cast<void*>(&base[5]);
+                check("T_slot_real_aligned_value_returns_symbol", getter_returns_symbol_at(5));
+
+                // T3. The ALIGNMENT DIFFERENTIAL.  Construct a value that is
+                //     4-byte aligned but NOT 8-byte aligned and lies in user
+                //     range and is not poison: is_valid_pointer (guard (3)) must
+                //     ACCEPT it (only bit-0 matters, :2059), whereas the same
+                //     bit pattern as a slot ADDRESS would be REJECTED by the
+                //     probe (2)'s 8-byte rule (:2025).  We assert both directions
+                //     PURELY (is_readable_pointer/is_valid_pointer never read
+                //     through the value), so this is POSIX-safe.
+                const std::uintptr_t four_aligned_not_eight{ 0x0000'2000'0000'0004ull };
+                check("T_value_4aligned_accepted_by_post_read_guard",
+                      is_valid_pointer(reinterpret_cast<void*>(four_aligned_not_eight)));
+                check("T_addr_4aligned_rejected_by_slot_probe",
+                      !is_readable_pointer(reinterpret_cast<void*>(four_aligned_not_eight)));
+                // And the 2-vs-2 even base case: a 2-byte (bit-0 clear) value is
+                // accepted by guard (3); an odd value is not.  The guard's rule
+                // is exactly bit-0, nothing stricter.
+                check("T_value_2aligned_even_accepted_by_guard",
+                      is_valid_pointer(reinterpret_cast<void*>(
+                          std::uintptr_t{ 0x0000'2000'0000'0002ull })));
+                check("T_value_odd_rejected_by_guard",
+                      !is_valid_pointer(reinterpret_cast<void*>(
+                          std::uintptr_t{ 0x0000'2000'0000'0003ull })));
+
+                vmhook::os::release(block, page);
+            }
+        }
+
+        // T4. Boundary of the post-read guard's range check at the EXACT floor
+        //     and ceiling edges, derived from source constants (:515 / :520).
+        //     floor == 0xFFFF: `addr <= floor` is INCLUSIVE, so a VALUE of
+        //     exactly 0xFFFF rejects but floor+1 (0x10000, even, in range, not
+        //     poison) is accepted.  ceiling == 0x00007FFFFFFFFFFF: `addr >=
+        //     ceiling` is INCLUSIVE, so a VALUE of exactly ceiling rejects but
+        //     ceiling-1 is... odd (0x...FE is even though: ceiling ends ...FFFF,
+        //     so ceiling-1 == ...FFFE which is EVEN) -> accepted.  Pure
+        //     is_valid_pointer calls on constants -> POSIX-safe.
+        check("T_guard_floor_value_rejected",
+              !is_valid_pointer(reinterpret_cast<void*>(vmhook::os::user_address_floor)));
+        check("T_guard_floor_plus_1_value_accepted",
+              is_valid_pointer(reinterpret_cast<void*>(
+                  vmhook::os::user_address_floor + 1u)));  // 0x10000, even, in range
+        check("T_guard_ceiling_value_rejected",
+              !is_valid_pointer(reinterpret_cast<void*>(vmhook::os::user_address_ceiling)));
+        check("T_guard_ceiling_minus_1_value_accepted",
+              is_valid_pointer(reinterpret_cast<void*>(
+                  vmhook::os::user_address_ceiling - 1u))); // ...FFFE, even, < ceiling
+        // The floor is exactly 0xFFFF and the ceiling exactly 0x00007FFFFFFFFFFF
+        // (pin the constants the edges are derived from, so a future constant
+        // change reddens these named checks, not a mystery boundary drift).
+        check("T_user_address_floor_is_0xFFFF",
+              vmhook::os::user_address_floor == std::uintptr_t{ 0xFFFFull });
+        check("T_user_address_ceiling_is_0x00007FFFFFFFFFFF",
+              vmhook::os::user_address_ceiling == std::uintptr_t{ 0x00007FFFFFFFFFFFull });
+
+        // T5. The two gates' alignment masks are DISTINCT and that distinction
+        //     is the whole reason (2) and (3) are separate gates: probe (2)
+        //     masks 0x7 (8-byte), guard (3) masks 0x1 (2-byte).  Pin the masks
+        //     as compile-evident constants so a future edit that unifies them
+        //     (e.g. making the value guard also require 8-byte) is a visible,
+        //     deliberate change.  Witness values: 0x...2 and 0x...4 and 0x...6
+        //     are all bit-0-clear (guard accepts) but only 0x...8/0x...0 are
+        //     8-aligned (probe accepts).
+        {
+            const std::uintptr_t base_in_range{ 0x0000'2000'0000'0000ull };
+            // bit-0-clear but not 8-aligned: guard accepts, probe rejects.
+            const std::uintptr_t two_only{ base_in_range | 0x2ull };
+            const std::uintptr_t four_only{ base_in_range | 0x4ull };
+            const std::uintptr_t six_only{ base_in_range | 0x6ull };
+            bool guard_accepts_all_even{ true };
+            bool probe_rejects_all_non8{ true };
+            for (const std::uintptr_t a : { two_only, four_only, six_only })
+            {
+                if (!is_valid_pointer(reinterpret_cast<void*>(a))) { guard_accepts_all_even = false; }
+                if (is_readable_pointer(reinterpret_cast<void*>(a))) { probe_rejects_all_non8 = false; }
+            }
+            check("T_guard_accepts_all_even_non8_aligned", guard_accepts_all_even);
+            check("T_probe_rejects_all_even_non8_aligned", probe_rejects_all_non8);
+        }
+
+        // T6. Both gates are declared noexcept (the FIX B chain must never let
+        //     an exception escape from the guards); pin it for the value guard
+        //     alongside the probe (E pinned the probe).
+        check("T_is_valid_pointer_is_noexcept", noexcept(is_valid_pointer(nullptr)));
+    }
+
+    // =====================================================================
+    // DEEPEN-DT.  (ADDITIVE, "dt_" namespace.)  The APPLIED field-path fix
+    //    driven for REAL: invoke the actual library function
+    //    klass::resolve_constant_pool_symbol (vmhook.hpp :3898-3919) against an
+    //    OWNED, mapped void** block with planted slot VALUES, across index /
+    //    length regimes.  Sections R(c) / M only MODEL the helper; this section
+    //    exercises the real `inline static` entry point end-to-end (it is pure
+    //    pointer/arith + is_valid_pointer + is_readable_pointer +
+    //    cold_read_metadata_pointer -> os::safe_read, all JVM-independent and
+    //    fault-safe on every platform), so its four guards and the terminal
+    //    Symbol* return are pinned to the SOURCE, not a re-spec.
+    //
+    //    Source body (verified 2026-06-22):
+    //        if (!index || !is_valid_pointer(base)) return nullptr;            // (0)
+    //        if (cp_length >= 0 && index >= (uint32_t)cp_length) return null;  // (1)
+    //        if (!is_readable_pointer(&base[index])) return nullptr;           // (2)
+    //        void* e = cold_read_metadata_pointer(&base[index]);              // read
+    //        if (!e || !is_valid_pointer(e)) return nullptr;                  // (3)
+    //        return reinterpret_cast<symbol*>(e);
+    //    `index` is std::uint32_t (NOT u16 like the method path); the length
+    //    comparison is UNSIGNED.
+    //
+    //    POSIX-SAFETY: the base handed in is ONLY ever a real owned allocate_rwx
+    //    block whose slots we planted; DEEPEN-DU covers the rejected-base path.
+    //    No fabricated/wild/high "valid-shaped" base is ever read here.
+    // =====================================================================
+    {
+        using vmhook::hotspot::klass;
+        using vmhook::hotspot::symbol;
+
+        const std::size_t page{ vmhook::os::page_size() };
+        const std::size_t slots{ 64 };
+        const std::size_t bytes{ slots * sizeof(void*) };
+        const std::size_t alloc{ ((bytes + page - 1) / page) * page };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, alloc) };
+        if (!block)
+        {
+            check("dt_real_helper_skipped_alloc_failed", false);
+        }
+        else
+        {
+            *static_cast<volatile std::uint8_t*>(block) = 0x9C; // commit
+            void** const base{ static_cast<void**>(block) };
+
+            // Deterministic planted VALUES (same scheme as section M):
+            //   index % 3 == 0 -> a real, valid pointer (into the block)
+            //   index % 3 == 1 -> null
+            //   index % 3 == 2 -> a poison value is_valid_pointer rejects
+            for (std::size_t i{ 0 }; i < slots; ++i)
+            {
+                switch (i % 3u)
+                {
+                    case 0u: base[i] = static_cast<void*>(&base[i]); break;       // real & valid
+                    case 1u: base[i] = nullptr; break;                            // null
+                    default: base[i] = reinterpret_cast<void*>(
+                                 static_cast<std::uintptr_t>(0xCAFEBABEu)); break; // poison
+                }
+            }
+
+            // First-principles oracle for the REAL helper's return given the
+            // planted pattern.  index 0 is the unused-slot reject the applied
+            // fix ADDS (guard 0), distinct from the method path.
+            auto oracle_returns_symbol =
+                [&](std::uint32_t index, std::int32_t cp_length) -> bool
+            {
+                if (index == 0u) { return false; }                            // (0) unused slot
+                if (index >= slots) { return false; }                          // outside our block
+                if (cp_length >= 0
+                    && index >= static_cast<std::uint32_t>(cp_length)) { return false; } // (1)
+                const std::uint32_t k{ index % 3u };
+                if (k == 1u) { return false; }   // null value      (3)
+                if (k == 2u) { return false; }   // poison rejected  (3)
+                return true;                     // real & valid -> Symbol*
+            };
+
+            const std::int32_t length_regimes[]{ -1, -9, 0, 1, 7, 16, 33, 64 };
+            bool real_matches_oracle{ true };
+            std::size_t real_cases{ 0 };
+            for (const std::int32_t n : length_regimes)
+            {
+                for (std::uint32_t i{ 0u }; i < static_cast<std::uint32_t>(slots); ++i)
+                {
+                    symbol* const got{ klass::resolve_constant_pool_symbol(base, i, n) };
+                    const bool returned_symbol{ got != nullptr };
+                    if (returned_symbol != oracle_returns_symbol(i, n))
+                    {
+                        real_matches_oracle = false;
+                    }
+                    // When it DOES return a Symbol*, it is exactly the planted
+                    // slot value (guard 3 read returns base[i]).
+                    if (returned_symbol && reinterpret_cast<void*>(got) != base[i])
+                    {
+                        real_matches_oracle = false;
+                    }
+                    ++real_cases;
+                }
+            }
+            check("dt_real_helper_matches_oracle_full_sweep", real_matches_oracle);
+            check("dt_real_helper_sweep_is_dense", real_cases >= 8u * slots);
+
+            // Spelled-out witnesses on the disabled-bound regime (-1):
+            check("dt_real_helper_index0_unused_slot_null",
+                  klass::resolve_constant_pool_symbol(base, 0u, -1) == nullptr);
+            {
+                symbol* const s3{ klass::resolve_constant_pool_symbol(base, 3u, -1) };
+                check("dt_real_helper_index3_real_returns_planted_symbol",
+                      s3 != nullptr && reinterpret_cast<void*>(s3) == base[3]);
+            }
+            check("dt_real_helper_index1_null_value_returns_null",
+                  klass::resolve_constant_pool_symbol(base, 1u, -1) == nullptr);
+            check("dt_real_helper_index2_poison_value_returns_null",
+                  klass::resolve_constant_pool_symbol(base, 2u, -1) == nullptr);
+
+            // Guard (1) short-circuits BEFORE the value gate: index 3 holds a
+            // real ptr, but length 3 makes 3 >= 3 reject first.
+            check("dt_real_helper_length3_rejects_index3_before_value_gate",
+                  klass::resolve_constant_pool_symbol(base, 3u, 3) == nullptr);
+            // length 4 admits index 3 (3 < 4) -> the real planted Symbol*.
+            {
+                symbol* const s{ klass::resolve_constant_pool_symbol(base, 3u, 4) };
+                check("dt_real_helper_length4_admits_index3_real_symbol",
+                      s != nullptr && reinterpret_cast<void*>(s) == base[3]);
+            }
+            // length 0 (empty pool) rejects EVERY index, including a real-value
+            // slot (guard 1: any index >= 0).
+            check("dt_real_helper_length0_rejects_real_value_slot",
+                  klass::resolve_constant_pool_symbol(base, 3u, 0) == nullptr);
+
+            // The helper is declared noexcept; pin it on the real signature.
+            check("dt_real_helper_is_noexcept",
+                  noexcept(klass::resolve_constant_pool_symbol(base, 1u, -1)));
+
+            vmhook::os::release(block, alloc);
+        }
+    }
+
+    // =====================================================================
+    // DEEPEN-DU.  (ADDITIVE, "du_" namespace.)  The REAL helper's guard (0)
+    //    rejects on a bogus BASE pointer and on index == 0 WITHOUT performing
+    //    any slot read.  Driven ONLY with is_valid_pointer-REJECTED bases (the
+    //    low-floor constant 0x1000 and the nine debug-poison patterns) so the
+    //    function returns nullptr at its first branch before touching memory -
+    //    POSIX-safe by construction (is_valid_pointer rejects each in pure
+    //    arithmetic; nothing is dereferenced).  Pins guard (0) to the source:
+    //    the `!is_valid_pointer(constant_pool_base)` half and the `!index` half.
+    // =====================================================================
+    {
+        using vmhook::hotspot::klass;
+        using vmhook::hotspot::is_valid_pointer;
+
+        // Bases is_valid_pointer REJECTS (guard (0) short-circuits, NO read):
+        //   0x1000 (4096) <= user_address_floor (0xFFFF) -> rejected
+        //   each debug-poison low32 -> rejected by the poison switch (:2068-2079)
+        const std::uintptr_t rejected_bases[]{
+            std::uintptr_t{ 0x1000ull },
+            std::uintptr_t{ 0xDEADBEEFull },
+            std::uintptr_t{ 0xCAFEBABEull },
+            std::uintptr_t{ 0xCCCCCCCCull },
+            std::uintptr_t{ 0xCDCDCDCDull },
+            std::uintptr_t{ 0xBAADF00Dull },
+            std::uintptr_t{ 0xFEEEFEEEull },
+            std::uintptr_t{ 0xABABABABull },
+            std::uintptr_t{ 0xFDFDFDFDull },
+            std::uintptr_t{ 0xDDDDDDDDull },
+        };
+
+        // Confirm each base is genuinely is_valid_pointer-REJECTED, so the
+        // POSIX-safety premise (guard (0) short-circuits, no read) holds.
+        bool all_bases_rejected{ true };
+        for (const std::uintptr_t raw : rejected_bases)
+        {
+            if (is_valid_pointer(reinterpret_cast<void*>(raw))) { all_bases_rejected = false; }
+        }
+        check("du_real_helper_guard0_bases_are_all_invalid", all_bases_rejected);
+
+        // With a rejected base AND a perfectly in-range index/length, the helper
+        // STILL returns nullptr (guard 0 fires on the base half) and must not
+        // fault.  Reaching the check proves no read occurred.
+        bool bad_base_all_null{ true };
+        for (const std::uintptr_t raw : rejected_bases)
+        {
+            void** const base{ reinterpret_cast<void**>(raw) };
+            if (klass::resolve_constant_pool_symbol(base, 1u, -1) != nullptr) { bad_base_all_null = false; }
+            if (klass::resolve_constant_pool_symbol(base, 5u, 64) != nullptr) { bad_base_all_null = false; }
+        }
+        check("du_real_helper_bad_base_returns_null_no_fault", bad_base_all_null);
+
+        // The `!index` half of guard (0) fires first; even with a rejected base
+        // index 0 yields nullptr (no read either way).
+        check("du_real_helper_index0_with_bad_base_null",
+              klass::resolve_constant_pool_symbol(
+                  reinterpret_cast<void**>(std::uintptr_t{ 0x1000ull }), 0u, -1) == nullptr);
+    }
+
+    // =====================================================================
+    // DEEPEN-DV.  (ADDITIVE, "dv_" namespace.)  The FIELD-path index type is
+    //    std::uint32_t (vmhook.hpp :3898), NOT the std::uint16_t of the method
+    //    path - so the field helper can be handed indices ABOVE the u2 ceiling
+    //    (a decode_u5 over-read, feature flaw #1/#3).  The length comparison is
+    //    UNSIGNED (`index >= static_cast<std::uint32_t>(cp_length)`); a corrupt
+    //    huge index past a real length is correctly rejected by guard (1), and
+    //    there is no signed/unsigned hazard because the `cp_length >= 0` half
+    //    owns the negative case.  Sections A/J only reach 0xFFFF (the u16 method
+    //    domain); this models guard (1) across the full u32 index band.
+    // =====================================================================
+    {
+        // Faithful local re-implementation of the field helper's guard (1),
+        // mirroring the SOURCE exactly: uint32_t index, unsigned compare, with
+        // the cp_length>=0 gate owning negatives.
+        auto field_guard1_rejects = [](std::uint32_t index, std::int32_t cp_length) -> bool
+        {
+            return cp_length >= 0 && index >= static_cast<std::uint32_t>(cp_length);
+        };
+        // Independent wide oracle (int64, no unsigned subtlety).
+        auto field_guard1_oracle = [](std::uint32_t index, std::int32_t cp_length) -> bool
+        {
+            if (cp_length < 0) { return false; }
+            return static_cast<std::int64_t>(index) >= static_cast<std::int64_t>(cp_length);
+        };
+
+        // Indices that EXCEED the u2 ceiling - only reachable on the field path.
+        const std::uint32_t wide_indices[]{
+            0u, 1u, 0xFFFFu, 0x1'0000u, 0x1'0001u, 0x10'0000u,
+            0x7FFF'FFFEu, 0x7FFF'FFFFu, 0x8000'0000u, 0xFFFF'FFFEu, 0xFFFF'FFFFu,
+        };
+        const std::int32_t lens[]{
+            -1, -5, 0, 1, 256, 0xFFFF, 0x1'0000, 0x10'0000,
+            0x4000'0000, 0x7FFF'FFFE, std::numeric_limits<std::int32_t>::max(),
+        };
+        bool field_guard1_consistent{ true };
+        std::size_t field_guard1_cases{ 0 };
+        for (const std::int32_t n : lens)
+        {
+            for (const std::uint32_t i : wide_indices)
+            {
+                if (field_guard1_rejects(i, n) != field_guard1_oracle(i, n))
+                {
+                    field_guard1_consistent = false;
+                }
+                ++field_guard1_cases;
+            }
+        }
+        check("dv_field_guard1_unsigned_compare_matches_int64_oracle", field_guard1_consistent);
+        check("dv_field_guard1_wide_index_sweep_is_dense", field_guard1_cases >= 100);
+
+        // u32-domain witnesses the method path (u16) cannot express:
+        //   65536 vs 65536 -> reject
+        check("dv_field_guard1_index_above_u2_at_length_rejected",
+              field_guard1_rejects(0x1'0000u, 0x1'0000));
+        //   65536 vs 65537 -> admit
+        check("dv_field_guard1_index_above_u2_below_length_admitted",
+              !field_guard1_rejects(0x1'0000u, 0x1'0001));
+        //   0xFFFFFFFF (4294967295) >= 0x7FFFFFFF (2147483647) -> reject; the
+        //   cp_length widens to a non-negative u32 == 0x7FFFFFFF, no unsigned wrap.
+        check("dv_field_guard1_maxu32_index_ge_int32max_length_rejected",
+              field_guard1_rejects(0xFFFF'FFFFu, std::numeric_limits<std::int32_t>::max()));
+        //   huge index vs -1 sentinel: bound disabled -> admit (base/probe/value
+        //   guards then own the safety in the real fn).
+        check("dv_field_guard1_huge_index_unknown_length_admitted",
+              !field_guard1_rejects(0xFFFF'FFFFu, -1));
+        //   negative corrupt length disables the bound for a huge index too.
+        check("dv_field_guard1_huge_index_negative_length_admitted",
+              !field_guard1_rejects(0x8000'0000u, std::numeric_limits<std::int32_t>::min()));
+
+        // Cross-tie: for any index that FITS a u2, guard (1) agrees with the
+        // method path's length_bound_rejects (one shared spec, no drift).
+        bool field_and_method_agree_in_u2{ true };
+        for (const std::int32_t n : { -1, 0, 1, 7, 256, 0xFFFF, 0x1'0000 })
+        {
+            for (std::uint32_t i : { 0u, 1u, 6u, 7u, 8u, 255u, 256u, 0xFFFEu, 0xFFFFu })
+            {
+                if (field_guard1_rejects(i, n)
+                    != length_bound_rejects(static_cast<std::uint16_t>(i), n))
+                {
+                    field_and_method_agree_in_u2 = false;
+                }
+            }
+        }
+        check("dv_field_guard1_agrees_with_method_bound_in_u2_domain", field_and_method_agree_in_u2);
+    }
+
+    // =====================================================================
+    // DEEPEN-DW.  (ADDITIVE, "dw_" namespace.)  get_base() header-offset
+    //    arithmetic & the 1-based index-0 "unused slot" contract, pinned at the
+    //    arithmetic/type level from the SOURCE.  get_base() (vmhook.hpp
+    //    :2331-2350) returns reinterpret_cast<void**>((uint8_t*)this + size):
+    //    the entries array begins immediately AFTER the ConstantPool header,
+    //    indices are 1-based, slot 0 is the unused sentinel (doc :2325).  No
+    //    JVM, no fabricated read - only pure pointer arithmetic over an owned
+    //    buffer and synthetic aligned addresses (no deref).
+    // =====================================================================
+    {
+        constexpr std::size_t ptr_size{ sizeof(void*) };
+
+        // DW1. base = this + header_size, computed by hand against an OWNED
+        // buffer big enough for the header + a few entry slots, across header
+        // sizes spanning the JDK 8..26 ConstantPool-header growth range.
+        {
+            const std::size_t header_sizes[]{ 56, 64, 72, 80, 88, 96, 104, 112, 120, 128 };
+            bool header_offset_exact{ true };
+            bool slot0_is_base{ true };
+            std::vector<std::uint8_t> buf(128 + 8 * ptr_size, std::uint8_t{ 0 });
+            std::uint8_t* const self{ buf.data() };
+            for (const std::size_t H : header_sizes)
+            {
+                void** const base{ reinterpret_cast<void**>(self + H) }; // library expr
+                const std::uintptr_t base_addr{ reinterpret_cast<std::uintptr_t>(base) };
+                const std::uintptr_t self_addr{ reinterpret_cast<std::uintptr_t>(self) };
+                if (base_addr != self_addr + H) { header_offset_exact = false; }
+                if (reinterpret_cast<void**>(&base[0]) != base) { slot0_is_base = false; }
+                for (std::size_t i{ 0 }; i < 8; ++i)
+                {
+                    const std::uintptr_t lang{ reinterpret_cast<std::uintptr_t>(&base[i]) };
+                    const std::uintptr_t hand{ base_addr + i * ptr_size };
+                    if (lang != hand) { header_offset_exact = false; }
+                }
+            }
+            check("dw_getbase_entry_array_starts_after_header", header_offset_exact);
+            check("dw_getbase_slot0_equals_base", slot0_is_base);
+        }
+
+        // DW2. The 1-based contract, made test-visible (feature flaw #6's
+        // documented inconsistency between the two paths):
+        //   - method bound admits index 0 for any length >= 1 (relies on the
+        //     post-read is_valid_pointer(base[0]) guard for a zeroed index)
+        //   - field helper guard-0 rejects index 0 unconditionally
+        check("dw_contract_method_bound_admits_index0_len1", !length_bound_rejects(0u, 1));
+        check("dw_contract_method_bound_rejects_index0_only_when_len0",
+              length_bound_rejects(0u, 0));
+        auto field_helper_rejects_index0 = [](std::uint32_t index) -> bool { return index == 0u; };
+        check("dw_contract_field_helper_rejects_index0_any_length",
+              field_helper_rejects_index0(0u));
+        check("dw_contract_field_helper_admits_nonzero_index1",
+              !field_helper_rejects_index0(1u));
+
+        // DW3. An 8-aligned `this` plus an 8-multiple header yields 8-aligned
+        // entry slots, so the is_readable_pointer slot probe's 8-align gate
+        // (:2025) is satisfiable by the live layout.  Pure arithmetic, no deref.
+        {
+            const std::uintptr_t aligned_this{ 0x0000'2000'0000'0000ull }; // 8-aligned, in-range
+            const std::size_t eight_multiple_headers[]{ 56, 64, 72, 80, 88, 96, 104, 112 };
+            bool all_slots_8aligned{ true };
+            for (const std::size_t H : eight_multiple_headers)
+            {
+                const std::uintptr_t base_addr{ aligned_this + H };
+                for (std::uint32_t i{ 0u }; i <= 0xFFu; ++i)
+                {
+                    const std::uintptr_t slot{ base_addr + static_cast<std::uintptr_t>(i) * ptr_size };
+                    if ((slot & 0x7u) != 0u) { all_slots_8aligned = false; break; }
+                }
+                if (!all_slots_8aligned) { break; }
+            }
+            check("dw_getbase_8aligned_this_and_header_yields_8aligned_slots",
+                  ptr_size != 8u || all_slots_8aligned);
+        }
+    }
+
     if (failures == 0)
     {
         std::printf("vmhook const_method/ConstantPool bounds: OK\n");

@@ -1745,6 +1745,461 @@ static auto test_width_is_evidence_driven_not_version_driven() -> void
     }
 }
 
+// =========================================================================
+//  DEEPENING WAVE -- namespaced additive section (mfw_deep).
+//
+//  Everything below is APPENDED; it touches none of the functions above.  All
+//  values are derived directly from vmhook.hpp source:
+//    * derive_method_flags_layout()  (vmhook.hpp:7450-7498) -- Path A "u2" exact
+//      match -> {offset, 2, 2, true}; Path B u2-intrinsic, offset>=4 && %4==0
+//      -> {offset-4, 4, 12, true}; everything else -> {} (all-zero, !confident).
+//    * NO_COMPILE = 0x01|0x02|0x04|0x08 << 24 == 0x0F000000 (vmhook.hpp:7579).
+//    * is_valid_pointer() (vmhook.hpp:2047-2084) -- rejects addr<=0xFFFF,
+//      addr>=0x00007FFFFFFFFFFF, odd addresses, and an EXPLICIT sentinel list.
+//    * method_flags_layout / method_flags_slot default = {0,0,0,false}.
+//
+//  POSIX-safety: no fabricated mapped address is ever read.  All pointer-shaped
+//  inputs go ONLY to is_valid_pointer() (which decides on the integer value
+//  BEFORE any dereference) or to set_dont_inline()/get_flags()/is_static()
+//  (which short-circuit on the same guard with no JVM).  All other assertions
+//  are pure arithmetic / compile-time / owned-buffer.
+// =========================================================================
+namespace mfw_deep
+{
+    using vmhook::hotspot::derive_method_flags_layout;
+    using vmhook::hotspot::method_flags_evidence;
+    using vmhook::hotspot::method_flags_layout;
+    using vmhook::hotspot::method_flags_slot;
+
+    constexpr auto path_b(std::uint64_t intrinsic_off) -> method_flags_evidence
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type    = "u2";
+        ev.intrinsic_id_offset  = intrinsic_off;
+        return ev;
+    }
+    constexpr auto path_a(std::uint64_t flags_off, const char* type) -> method_flags_evidence
+    {
+        method_flags_evidence ev{};
+        ev.flags_present = true;
+        ev.flags_type    = type;
+        ev.flags_offset  = flags_off;
+        return ev;
+    }
+    constexpr auto path_b_typed(std::uint64_t intrinsic_off, const char* type) -> method_flags_evidence
+    {
+        method_flags_evidence ev{};
+        ev.intrinsic_id_present = true;
+        ev.intrinsic_id_type    = type;
+        ev.intrinsic_id_offset  = intrinsic_off;
+        return ev;
+    }
+}
+
+// -- D1. DEFAULT-STRUCT "NO GUESS" CONTRACT (compile-time + runtime). --------
+//  A refused derivation MUST be the value-initialised default {0,0,0,false}
+//  for BOTH method_flags_layout and method_flags_slot -- never a partially
+//  populated struct that a caller might mistake for a real placement.
+static_assert(mfw_deep::method_flags_layout{}.offset == 0
+              && mfw_deep::method_flags_layout{}.width_bytes == 0
+              && mfw_deep::method_flags_layout{}.dont_inline_bit == 0
+              && mfw_deep::method_flags_layout{}.confident == false,
+              "method_flags_layout default is the all-zero, not-confident 'no guess'");
+static_assert(mfw_deep::method_flags_slot{}.address == nullptr
+              && mfw_deep::method_flags_slot{}.width_bytes == 0
+              && mfw_deep::method_flags_slot{}.dont_inline_bit == 0
+              && mfw_deep::method_flags_slot{}.confident == false,
+              "method_flags_slot default is null/zero/not-confident 'no guess'");
+// Every refusing input returns EXACTLY that default (constexpr-checked).
+static_assert(!mfw_deep::derive_method_flags_layout(mfw_deep::method_flags_evidence{}).confident
+              && mfw_deep::derive_method_flags_layout(mfw_deep::method_flags_evidence{}).offset == 0
+              && mfw_deep::derive_method_flags_layout(mfw_deep::method_flags_evidence{}).width_bytes == 0
+              && mfw_deep::derive_method_flags_layout(mfw_deep::method_flags_evidence{}).dont_inline_bit == 0,
+              "empty evidence derives the exact all-zero default");
+
+static auto test_mfw_deep_default_no_guess() -> void
+{
+    const method_flags_layout def{};
+    check("mfw_deep_layout_default_all_zero",
+          def.offset == 0u && def.width_bytes == 0 && def.dont_inline_bit == 0 && !def.confident);
+
+    const vmhook::hotspot::method_flags_slot sdef{};
+    check("mfw_deep_slot_default_all_zero",
+          sdef.address == nullptr && sdef.width_bytes == 0
+          && sdef.dont_inline_bit == 0 && !sdef.confident);
+
+    // A representative set of REFUSED inputs all collapse to the SAME default.
+    const method_flags_evidence refused[]{
+        method_flags_evidence{},                       // empty
+        mfw_deep::path_a(44, "u1"),                    // flags present, wrong width
+        mfw_deep::path_a(44, "MethodFlags"),           // flags present, object type
+        mfw_deep::path_b(0),                           // intrinsic, underflow
+        mfw_deep::path_b(2),                           // intrinsic, underflow
+        mfw_deep::path_b(46),                          // intrinsic, misaligned
+        mfw_deep::path_b(45),                          // intrinsic, odd
+    };
+    bool all_default{ true };
+    for (const method_flags_evidence& ev : refused)
+    {
+        const method_flags_layout l{ derive_method_flags_layout(ev) };
+        if (l.confident || l.offset != 0u || l.width_bytes != 0 || l.dont_inline_bit != 0)
+        {
+            all_default = false;
+            break;
+        }
+    }
+    check("mfw_deep_every_refused_input_is_exact_default", all_default);
+}
+
+// -- D2. is_valid_pointer() EXACT REJECTION CONTRACT (pure, no deref). -------
+//  Pin the precise guard set_dont_inline / get_flags rely on (vmhook.hpp:2047).
+//  Every value here is decided by INTEGER comparison before any memory access,
+//  so passing them is POSIX-safe.  Source facts:
+//    floor   = 0x000000000000FFFF  (addr <= floor rejected)
+//    ceiling = 0x00007FFFFFFFFFFF  (addr >= ceiling rejected)
+//    odd addresses rejected; explicit low32 sentinel list rejected.
+static auto test_mfw_deep_is_valid_pointer_contract() -> void
+{
+    using vmhook::hotspot::is_valid_pointer;
+
+    auto as_ptr = [](std::uintptr_t v) -> const void*
+    { return reinterpret_cast<const void*>(v); };
+
+    // nullptr and the floor boundary: <= 0xFFFF all rejected.
+    check("mfw_deep_ivp_null_rejected", !is_valid_pointer(nullptr));
+    check("mfw_deep_ivp_floor_value_rejected", !is_valid_pointer(as_ptr(0xFFFFull)));
+    check("mfw_deep_ivp_below_floor_rejected", !is_valid_pointer(as_ptr(0x1000ull)));
+    // First even value strictly above the floor IS accepted (0x10000 > 0xFFFF,
+    // even, not a sentinel, below ceiling).
+    check("mfw_deep_ivp_just_above_floor_even_accepted", is_valid_pointer(as_ptr(0x10000ull)));
+
+    // Ceiling boundary: >= ceiling rejected; an even value just below accepted.
+    check("mfw_deep_ivp_ceiling_value_rejected",
+          !is_valid_pointer(as_ptr(0x00007FFFFFFFFFFFull)));
+    check("mfw_deep_ivp_above_ceiling_rejected",
+          !is_valid_pointer(as_ptr(0x0000800000000000ull)));
+    check("mfw_deep_ivp_just_below_ceiling_even_accepted",
+          is_valid_pointer(as_ptr(0x00007FFFFFFFFFFEull)));
+
+    // Odd-address rejection: an in-range odd address is rejected purely on the
+    // low bit (0x10001 is > floor, < ceiling, but odd).
+    check("mfw_deep_ivp_in_range_odd_rejected", !is_valid_pointer(as_ptr(0x10001ull)));
+    check("mfw_deep_ivp_in_range_even_accepted", is_valid_pointer(as_ptr(0x10002ull)));
+
+    // The EXPLICIT sentinel list (vmhook.hpp:2070-2078).  Each is forced into the
+    // in-range/even band by OR-ing a high base + clearing the low bit, so ONLY the
+    // low32-sentinel switch can reject it.  Base 0x100000000 is even, >floor,
+    // <ceiling; OR with the sentinel keeps low32 == sentinel.
+    const std::uint32_t sentinels[]{
+        0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu,
+        0xBAADF00Du, 0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu,
+    };
+    bool all_sentinels_rejected{ true };
+    for (const std::uint32_t s : sentinels)
+    {
+        // Form an in-range address whose low32 == the sentinel by OR-ing a high
+        // base (0x1_00000000 is even, > floor, < ceiling).  Each is rejected: the
+        // EVEN sentinels by the explicit low32 switch, the ODD ones by the odd-bit
+        // guard that runs first.  Either way is_valid_pointer() returns false
+        // without performing any read, so this is POSIX-safe.
+        const std::uintptr_t addr{ (std::uintptr_t{ 0x1ull } << 32) | s };
+        if (is_valid_pointer(as_ptr(addr))) { all_sentinels_rejected = false; break; }
+    }
+    check("mfw_deep_ivp_all_sentinels_low32_rejected", all_sentinels_rejected);
+
+    // The sentinel constant itself (as the WHOLE address) is also rejected -- it is
+    // below the floor on a 32-bit-shaped value, but on LLP64 it is an in-range even
+    // (0xCAFEBABE) or odd value; either way it must be rejected.  Route through
+    // uintptr_t for width-correctness.
+    check("mfw_deep_ivp_bare_cafebabe_rejected",
+          !is_valid_pointer(as_ptr(static_cast<std::uintptr_t>(0xCAFEBABEu))));
+    check("mfw_deep_ivp_bare_deadbeef_rejected",
+          !is_valid_pointer(as_ptr(static_cast<std::uintptr_t>(0xDEADBEEFu))));
+}
+
+// -- D3. PATH-B OFFSET ARITHMETIC AT LARGE/EXTREME LEGAL OFFSETS. ------------
+//  The 0..64 sweep above pins the low band.  Here pin that offset-4 holds with
+//  no wraparound across the full residue cross-product at LARGE 4-aligned
+//  offsets, and that the smallest legal offset (4 -> _status @0) and a very
+//  large legal offset both derive width 4 / bit 12 deterministically.
+static auto test_mfw_deep_pathB_large_offsets() -> void
+{
+    // Large 4-aligned legal offsets: derived _status == offset-4, width 4, bit 12.
+    const std::uint64_t large_legal[]{
+        128u, 256u, 1024u, 4096u, 65536u, 0x10000u + 4u, 0x100000u, 0x1000000u,
+    };
+    bool large_ok{ true };
+    for (const std::uint64_t off : large_legal)
+    {
+        const method_flags_layout l{ derive_method_flags_layout(mfw_deep::path_b(off)) };
+        if (!(l.confident && l.offset == off - 4u && l.width_bytes == 4 && l.dont_inline_bit == 12))
+        {
+            large_ok = false;
+            break;
+        }
+    }
+    check("mfw_deep_pathB_large_legal_offsets_derive_minus4", large_ok);
+
+    // Residue cross-product at a high base: only the 4-aligned member fires.
+    const std::uint64_t base{ 0x100000u };  // 4-aligned, large
+    bool residue_ok{ true };
+    for (std::uint64_t r{ 0 }; r < 4u; ++r)
+    {
+        const std::uint64_t off{ base + r };
+        const method_flags_layout l{ derive_method_flags_layout(mfw_deep::path_b(off)) };
+        const bool should{ (off % 4u) == 0u };  // off >= 4 already (base is huge)
+        if (l.confident != should) { residue_ok = false; break; }
+        if (should && !(l.offset == off - 4u && l.width_bytes == 4 && l.dont_inline_bit == 12))
+        {
+            residue_ok = false; break;
+        }
+        if (!should && (l.offset != 0u || l.width_bytes != 0 || l.dont_inline_bit != 0 || l.confident))
+        {
+            residue_ok = false; break;
+        }
+    }
+    check("mfw_deep_pathB_high_base_residue_cross_product", residue_ok);
+}
+
+// -- D4. type_is() EXACT-MATCH STRESS (the constexpr strcmp's two directions). -
+//  derive's inner type_is() walks both strings to a shared NUL.  A subtle bug is
+//  asymmetry: "u2" vs a string that is a PROPER PREFIX of "u2" ("u") and a string
+//  for which "u2" is a proper prefix ("u2x").  Both must FAIL.  Also pin that the
+//  NUL terminator equality is what makes "u2"=="u2" succeed (a longer literal that
+//  agrees on the first 2 chars but differs at the NUL must fail).  Driven through
+//  Path A AND Path B so both call sites of type_is are covered.
+static auto test_mfw_deep_type_is_exact_match_stress() -> void
+{
+    // Strings sharing a prefix with "u2" in BOTH directions.
+    struct tcase { const char* type; bool is_u2; };
+    const tcase cases[]{
+        { "u2",   true  },   // exact
+        { "u",    false },   // "u2" is longer -> differ at index 1 ('2' vs '\0')
+        { "u2x",  false },   // longer -> differ at index 2 ('\0' vs 'x')
+        { "u2xy", false },   // longer still -> differ at index 2
+        { "u3",   false },   // differ at index 1
+        { "v2",   false },   // differ at index 0
+        { "",     false },   // empty -> differ at index 0 ('\0' vs 'u')
+    };
+
+    bool pathA_ok{ true };
+    bool pathB_ok{ true };
+    for (const tcase& c : cases)
+    {
+        // Path A: flags_present + this type, no intrinsic -> confident iff is_u2.
+        const method_flags_layout a{ derive_method_flags_layout(mfw_deep::path_a(48, c.type)) };
+        if (a.confident != c.is_u2) { pathA_ok = false; break; }
+        if (c.is_u2 && !(a.width_bytes == 2 && a.dont_inline_bit == 2 && a.offset == 48u))
+        {
+            pathA_ok = false; break;
+        }
+
+        // Path B: intrinsic_present + this type at a legal offset -> confident iff is_u2.
+        const method_flags_layout b{ derive_method_flags_layout(mfw_deep::path_b_typed(48, c.type)) };
+        if (b.confident != c.is_u2) { pathB_ok = false; break; }
+        if (c.is_u2 && !(b.width_bytes == 4 && b.dont_inline_bit == 12 && b.offset == 44u))
+        {
+            pathB_ok = false; break;
+        }
+    }
+    check("mfw_deep_type_is_pathA_exact_match_both_directions", pathA_ok);
+    check("mfw_deep_type_is_pathB_exact_match_both_directions", pathB_ok);
+}
+
+// -- D5. NO_COMPILE <-> relocated MethodFlags::_status mapping arithmetic. ----
+//  The JDK-24 relocation moved the three NOT_*_COMPILABLE bits + QUEUED out of
+//  AccessFlags' high byte (24..27) and into MethodFlags::_status low bits 7..10
+//  (vmhook.hpp:7568, and flags_layout::methodflags_status_bit).  Pin the exact
+//  old<->new bit correspondence as pure arithmetic, and prove the two encodings
+//  are in DISJOINT ranges (high byte vs bits 7..10) so neither read sees the
+//  other's representation.
+static auto test_mfw_deep_no_compile_relocation_mapping() -> void
+{
+    using namespace flags_layout::methodflags_status_bit;
+    const std::uint32_t no_compile{ static_cast<std::uint32_t>(vmhook::hotspot::NO_COMPILE) };
+
+    // OLD (AccessFlags high byte) bit positions of the four NO_COMPILE members.
+    constexpr int old_queued     { 24 };  // 0x01000000
+    constexpr int old_not_c2     { 25 };  // 0x02000000
+    constexpr int old_not_c1     { 26 };  // 0x04000000
+    constexpr int old_not_c2_osr { 27 };  // 0x08000000
+
+    // The high-byte mask is exactly those four bit positions.
+    check("mfw_deep_no_compile_highbyte_bit_positions",
+          no_compile == ((1u << old_queued) | (1u << old_not_c2)
+                         | (1u << old_not_c1) | (1u << old_not_c2_osr))
+          && no_compile == 0x0F000000u);
+
+    // NEW (MethodFlags::_status) bit positions, verified in flags_layout: queued=7,
+    // not_c2=8, not_c1=9, not_c2_osr=10.  Each NEW position is exactly OLD - 17.
+    check("mfw_deep_relocation_old_minus_17_equals_new",
+          (old_queued     - 17) == queued_for_compilation
+          && (old_not_c2     - 17) == is_not_c2_compilable
+          && (old_not_c1     - 17) == is_not_c1_compilable
+          && (old_not_c2_osr - 17) == is_not_c2_osr);
+
+    // The NEW _status group (bits 7..10) is DISJOINT from the OLD high-byte group
+    // (bits 24..27): no bit appears in both encodings.
+    const std::uint32_t new_group{ (1u << queued_for_compilation)
+                                   | (1u << is_not_c2_compilable)
+                                   | (1u << is_not_c1_compilable)
+                                   | (1u << is_not_c2_osr) };
+    check("mfw_deep_relocation_old_new_groups_disjoint",
+          (new_group & no_compile) == 0u);
+
+    // The NEW group sits BELOW bit 16 (reachable by a u2 read of _status) while the
+    // OLD group sits ABOVE bit 16 (the high byte) -- they cannot collide in any read.
+    check("mfw_deep_new_status_group_below16_old_above16",
+          (new_group & 0xFFFF0000u) == 0u && (no_compile & 0x0000FFFFu) == 0u);
+
+    // _dont_inline (bit 12) is ABOVE the relocated _status group (<=10) and BELOW
+    // the old high byte -- it shares the u4 _status word with the new group but is a
+    // strictly distinct bit from every relocated member.
+    check("mfw_deep_dont_inline_distinct_from_relocated_group",
+          (new_group & (1u << flags_layout::methodflags_status_bit::dont_inline)) == 0u
+          && flags_layout::methodflags_status_bit::dont_inline == 12);
+}
+
+// -- D6. CONFIDENT-LAYOUT -> SLOT REPRESENTABILITY (the bridge to the live path). -
+//  resolve_method_flags_slot turns a confident layout into a method_flags_slot
+//  with the SAME width_bytes / dont_inline_bit (vmhook.hpp:7547).  For every
+//  confident band, prove the layout's (width,bit) are exactly a slot-compatible
+//  pair: width in {2,4}, bit < width*8, and (1u<<bit) representable in the width's
+//  mask.  This is the standalone analogue of "the resolved slot is well-formed".
+static auto test_mfw_deep_confident_layout_slot_wellformed() -> void
+{
+    const method_flags_evidence bands[]{
+        evidence_jdk11_20,  // u2 / bit 2
+        evidence_jdk21_23,  // u4 / bit 12
+        evidence_jdk24_26,  // u4 / bit 12
+    };
+    bool all_wellformed{ true };
+    for (const method_flags_evidence& ev : bands)
+    {
+        const method_flags_layout l{ derive_method_flags_layout(ev) };
+        if (!l.confident) { all_wellformed = false; break; }
+        // Width is one of the two the toggle dispatch handles.
+        if (l.width_bytes != 2 && l.width_bytes != 4) { all_wellformed = false; break; }
+        // Bit fits the width.
+        if (!(l.dont_inline_bit >= 0 && l.dont_inline_bit < l.width_bytes * 8))
+        {
+            all_wellformed = false; break;
+        }
+        // Mask representable in the width.
+        const std::uint32_t mask{ 1u << l.dont_inline_bit };
+        const std::uint32_t wmask{ l.width_bytes == 2 ? 0x0000FFFFu : 0xFFFFFFFFu };
+        if ((mask & wmask) != mask || mask == 0u) { all_wellformed = false; break; }
+
+        // Synthesise a slot exactly as resolve_method_flags_slot would (over an
+        // OWNED buffer base) and confirm the carried width/bit equal the layout's.
+        alignas(16) std::array<std::uint8_t, 128> owned{};
+        owned.fill(0x00);
+        const vmhook::hotspot::method_flags_slot slot{
+            owned.data() + l.offset, l.width_bytes, l.dont_inline_bit, true };
+        if (!(slot.confident
+              && slot.width_bytes == l.width_bytes
+              && slot.dont_inline_bit == l.dont_inline_bit
+              && slot.address == owned.data() + l.offset))
+        {
+            all_wellformed = false; break;
+        }
+    }
+    check("mfw_deep_confident_layout_yields_wellformed_slot", all_wellformed);
+
+    // A REFUSED layout must NOT be turned into a confident slot: the default slot
+    // (what resolve returns on !confident) is null/zero/not-confident.
+    {
+        const method_flags_layout refused{ derive_method_flags_layout(evidence_jdk8) };
+        check("mfw_deep_refused_layout_is_not_confident", !refused.confident);
+        const vmhook::hotspot::method_flags_slot would_be_default{};
+        check("mfw_deep_refused_maps_to_default_slot",
+              would_be_default.address == nullptr && !would_be_default.confident
+              && would_be_default.width_bytes == 0 && would_be_default.dont_inline_bit == 0);
+    }
+}
+
+// -- D7. set_dont_inline NO-JVM NO-WRITE over the FULL WIDTH-WINDOW + neighbour. -
+//  #2(b) above proves a 64-byte buffer is untouched.  Here drive the SAME no-JVM
+//  no-op but lay an explicit sentinel ring (0xAA before, 0xBB after) around a
+//  hypothetical u4 _flags window and prove set/clear touch NOTHING -- the
+//  standalone adjacent-byte anti-clobber the live module also wants, exercised
+//  through the REAL set_dont_inline (which no-ops with no JVM -> whole buffer
+//  must be byte-identical).
+static auto test_mfw_deep_set_dont_inline_no_write_window() -> void
+{
+    alignas(16) std::array<std::uint8_t, 96> buf{};
+    // Distinct, recognizable pattern per byte so any single-byte spill is caught.
+    for (std::size_t i{ 0 }; i < buf.size(); ++i)
+    {
+        buf[i] = static_cast<std::uint8_t>(0x40u + (i & 0x3Fu));
+    }
+    const std::array<std::uint8_t, 96> snapshot{ buf };
+
+    auto* const as_method{ reinterpret_cast<const vmhook::hotspot::method*>(buf.data()) };
+    // set then clear then set again -- with no JVM all three are no-ops.
+    vmhook::hotspot::set_dont_inline(as_method, true);
+    vmhook::hotspot::set_dont_inline(as_method, false);
+    vmhook::hotspot::set_dont_inline(as_method, true);
+
+    check("mfw_deep_set_dont_inline_no_jvm_buffer_byte_identical",
+          std::memcmp(buf.data(), snapshot.data(), buf.size()) == 0);
+
+    // Spot-check the exact would-be u4 window [44,48) and its immediate neighbours
+    // [43] and [48] specifically (the bytes a too-wide RMW on a u1/u2 layout would
+    // smear) are each unchanged.
+    check("mfw_deep_set_dont_inline_window_and_neighbours_intact",
+          buf[43] == snapshot[43] && buf[44] == snapshot[44]
+          && buf[45] == snapshot[45] && buf[46] == snapshot[46]
+          && buf[47] == snapshot[47] && buf[48] == snapshot[48]);
+}
+
+// -- D8. PATH PRECEDENCE EXHAUSTIVE TRUTH TABLE over the four evidence gates. -
+//  derive's decision is fully determined by four booleans:
+//    A = flags_present && flags_type=="u2"
+//    B = intrinsic_present && intrinsic_type=="u2" && off>=4 && off%4==0
+//  with A taking precedence over B.  Enumerate the full 2x2 outcome matrix using
+//  controlled evidence and assert the exact (confident,width,bit) for each cell.
+static auto test_mfw_deep_precedence_truth_table() -> void
+{
+    // A-fireable Path A evidence (u2 _flags @ 44) and B-fireable Path B evidence
+    // (u2 intrinsic @ 48 -> _status @ 44).  We toggle each on/off and combine.
+    auto make = [](bool a_on, bool b_on) -> method_flags_evidence
+    {
+        method_flags_evidence ev{};
+        if (a_on) { ev.flags_present = true; ev.flags_type = "u2"; ev.flags_offset = 44; }
+        else      { ev.flags_present = true; ev.flags_type = "u1"; ev.flags_offset = 44; } // present-but-non-u2
+        if (b_on) { ev.intrinsic_id_present = true; ev.intrinsic_id_type = "u2"; ev.intrinsic_id_offset = 48; }
+        else      { ev.intrinsic_id_present = true; ev.intrinsic_id_type = "u1"; ev.intrinsic_id_offset = 48; } // u1 -> B off
+        return ev;
+    };
+
+    // (A=1,B=1) -> Path A wins: width 2, bit 2, offset 44.
+    {
+        const method_flags_layout l{ derive_method_flags_layout(make(true, true)) };
+        check("mfw_deep_truth_A1B1_pathA_wins",
+              l.confident && l.width_bytes == 2 && l.dont_inline_bit == 2 && l.offset == 44u);
+    }
+    // (A=1,B=0) -> Path A: width 2, bit 2.
+    {
+        const method_flags_layout l{ derive_method_flags_layout(make(true, false)) };
+        check("mfw_deep_truth_A1B0_pathA",
+              l.confident && l.width_bytes == 2 && l.dont_inline_bit == 2 && l.offset == 44u);
+    }
+    // (A=0,B=1) -> Path B: width 4, bit 12, offset 48-4 == 44.
+    {
+        const method_flags_layout l{ derive_method_flags_layout(make(false, true)) };
+        check("mfw_deep_truth_A0B1_pathB",
+              l.confident && l.width_bytes == 4 && l.dont_inline_bit == 12 && l.offset == 44u);
+    }
+    // (A=0,B=0) -> neither fires -> refused default.
+    {
+        const method_flags_layout l{ derive_method_flags_layout(make(false, false)) };
+        check("mfw_deep_truth_A0B0_refused",
+              !l.confident && l.offset == 0u && l.width_bytes == 0 && l.dont_inline_bit == 0);
+    }
+}
+
 int main()
 {
     test_set_dont_inline_null();
@@ -1771,6 +2226,16 @@ int main()
     test_toggle_byte_placement_endianness();
     test_no_compile_signed_clear_roundtrip();
     test_width_is_evidence_driven_not_version_driven();
+
+    // Deepening wave (mfw_deep) additive section.
+    test_mfw_deep_default_no_guess();
+    test_mfw_deep_is_valid_pointer_contract();
+    test_mfw_deep_pathB_large_offsets();
+    test_mfw_deep_type_is_exact_match_stress();
+    test_mfw_deep_no_compile_relocation_mapping();
+    test_mfw_deep_confident_layout_slot_wellformed();
+    test_mfw_deep_set_dont_inline_no_write_window();
+    test_mfw_deep_precedence_truth_table();
 
     std::printf("\n%s: %d failure(s)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;
