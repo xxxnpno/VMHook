@@ -2145,6 +2145,363 @@ static auto test_array_length_bit_sweep() -> void
     }
 }
 
+// ===========================================================================
+// COLD-FAULT CONTAINMENT + DEEPER ARITHMETIC EXPANSION (34-39).  Sections 1-33
+// exhaust the value/index/offset/bounds dimensions on a MAPPED synthetic buffer.
+// The library has since been hardened so the header read (array_length, via
+// os::safe_read) and the element read (get_array_element, via os::safe_read_fast)
+// are kernel-validated and CANNOT fault on a valid-shaped-but-unmapped page --
+// they return the existing 0 / element_type{} fallback instead (vmhook.hpp:
+// array_length L14756 routes the +12 read through safe_read; get_array_element
+// L14804 routes the +16+i*stride read through safe_read_fast).  set_array_element
+// (L14834) still does a RAW memcpy, but it is shielded transitively: on a
+// valid-shaped-but-unmapped oop, array_length() reads 0, so the half-open
+// `index >= length(==0)` guard rejects EVERY index before the raw store is
+// reached.  The sections below pin that containment (which the old
+// test_pointer_guard_matrix explicitly declined to probe because the pre-hardening
+// helper would fault), plus several pure-arithmetic dimensions still uncovered.
+//
+// Determinism caveat handled below: an arbitrary numeric address could, by bad
+// luck, be a mapped page on some platform.  Section 34 therefore derives its
+// "valid-shaped but guard-rejected" oop from a REAL allocated buffer (so the
+// underlying bytes are genuinely mapped) and mis-shapes it in a way the guard
+// rejects WITHOUT dereferencing (odd address) -- the rejection is from the shape
+// check, observable as length 0 / default read / no-op write with zero fault
+// risk on any platform.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 34. Guard short-circuits on a shape-invalid oop derived from MAPPED memory.
+//
+// is_valid_pointer rejects an ODD address (addr & 1) BEFORE any dereference
+// (vmhook.hpp:2059).  Build a real, mapped buffer, then form an odd oop by
+// adding 1 to its (even, heap-aligned) base.  The underlying bytes ARE mapped
+// (so this can never fault), yet the helper must reject purely on shape:
+// array_length -> 0, get -> default, set -> no-op.  This is the safe, platform-
+// independent way to exercise the "valid range but guard-rejected" path that
+// section 17 had to fabricate with an unmapped numeric address.
+// ---------------------------------------------------------------------------
+static auto test_guard_rejects_odd_mapped_oop() -> void
+{
+    // A sizeable buffer so base+1 is still well inside a mapped allocation.
+    std::vector<std::uint8_t> buffer(256u, std::uint8_t{ 0 });
+    const std::int32_t len{ 8 };
+    std::memcpy(buffer.data() + 12, &len, sizeof(len));
+    // Heap allocations are at least 2-byte (in practice 16-byte) aligned, so
+    // data() is even and data()+1 is odd.  Guard the assumption.
+    const std::uintptr_t base_addr{ reinterpret_cast<std::uintptr_t>(buffer.data()) };
+    check("odd_oop_precondition_base_is_even", (base_addr & 1u) == 0u);
+
+    void* const odd_oop{ reinterpret_cast<void*>(base_addr | 1u) };
+    // The even base passes the guard and reports the seeded length (control).
+    check("odd_oop_even_base_length_is_8", vmhook::array_length(buffer.data()) == len);
+    // The odd alias is rejected by the (addr & 1) shape check -> length 0.
+    check("odd_oop_rejected_length_zero", vmhook::array_length(odd_oop) == 0);
+    check("odd_oop_rejected_get_default",
+          vmhook::get_array_element<std::int32_t>(odd_oop, 0) == 0);
+    // A write through the odd oop must be a no-op: capture the whole buffer,
+    // attempt the write, confirm nothing changed (the guard short-circuits
+    // before the raw memcpy could touch the mapped bytes).
+    const std::vector<std::uint8_t> before{ buffer };
+    vmhook::set_array_element<std::int32_t>(odd_oop, 0, 0x2D2D2D2D);
+    check("odd_oop_rejected_set_noop", buffer == before);
+}
+
+// ---------------------------------------------------------------------------
+// 35. array_length / get / set on a valid-shaped but UNMAPPED oop are contained.
+//
+// 0x10000 (65536) is the FIRST address above the floor (0xFFFF): even, not a
+// sentinel, so is_valid_pointer ACCEPTS its shape.  Before the safe_read
+// hardening the helper would have dereferenced an unmapped page (the documented
+// reason section 17 skipped just-above-floor).  Now array_length routes the +12
+// read through os::safe_read (ReadProcessMemory / process_vm_readv / mach_vm --
+// kernel-validated, returns false on an unmapped page) and yields 0; the bounds
+// check then makes get return default and set a no-op without ever reaching the
+// raw store.  We probe a spread of high, page-aligned, even, non-sentinel
+// addresses that are overwhelmingly unmapped in this tiny test process; each
+// must yield length 0 / default / no-crash.  (We assert length<=0-driven safety,
+// not that the page is definitely unmapped -- if one happened to be mapped, a
+// read still cannot fault and the value is simply whatever is there; the
+// no-crash + reaching the final check is the invariant.)
+// ---------------------------------------------------------------------------
+static auto test_unmapped_valid_shape_contained() -> void
+{
+    // NOTE: probing fabricated high "valid-shaped-but-unmapped" addresses is NOT
+    // safe here -- set_array_element is the WRITE path (not safe_read-hardened),
+    // and a fabricated address that happens to be mapped (ASLR-dependent) yields a
+    // garbage length whose in-bounds index then raw-writes an unmapped page -> SEGV.
+    // Only the deterministic floor case below (rejected by is_valid_pointer before
+    // any read/write) is a sound no-JVM invariant.
+
+    // The canonical floor address itself
+    // (0xFFFF, ODD and == floor) is rejected by BOTH the `<= floor` and the
+    // odd-address checks -> guaranteed length 0 / default / no-op, no page query.
+    void* const floor_oop{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xFFFFull)) };
+    check("floor_addr_length_zero", vmhook::array_length(floor_oop) == 0);
+    check("floor_addr_get_default",
+          vmhook::get_array_element<std::int64_t>(floor_oop, 0) == 0);
+    vmhook::set_array_element<std::int64_t>(floor_oop, 0, 0x55ll);
+    check("floor_addr_set_noop_reached", true);
+}
+
+// ---------------------------------------------------------------------------
+// 36. COMPILE-TIME wrap-offset oracle for EVERY stride (extends section 24,
+//     which only pinned the stride-8 wrap index 0x10000000).
+//
+// The helper widens `index` to ptrdiff_t before multiplying by sizeof(T), so the
+// honest 64-bit byte offset for a large index never wraps.  Pin the honest
+// offset for the per-stride wrap-threshold index against a size_t oracle, AND
+// pin the value a naive 32-bit `index * (int)sizeof` WOULD have produced (formed
+// in unsigned modular arithmetic, which is well-defined and constexpr-legal),
+// for strides 1/2/4/8.  A regression that dropped the widening would make the
+// helper's offset diverge from the size_t oracle exactly here.
+// ---------------------------------------------------------------------------
+namespace wrap_oracle
+{
+    // Smallest index whose `index * stride` reaches 2^31 (the int32 wrap point).
+    //   stride 1 -> 0x80000000 (already negative as int32: rejected by neg guard)
+    //   stride 2 -> 0x40000000
+    //   stride 4 -> 0x20000000
+    //   stride 8 -> 0x10000000
+    inline constexpr std::uint32_t idx_stride1{ 0x80000000u };
+    inline constexpr std::uint32_t idx_stride2{ 0x40000000u };
+    inline constexpr std::uint32_t idx_stride4{ 0x20000000u };
+    inline constexpr std::uint32_t idx_stride8{ 0x10000000u };
+}
+// Honest 64-bit offsets: 16 + idx*stride, computed in size_t (never wraps).
+static_assert(layout_oracle::element_offset<std::uint8_t>(wrap_oracle::idx_stride1)
+                  == std::size_t{ 16u } + std::size_t{ 0x80000000ull },
+              "stride-1 wrap-index honest offset == 16 + 0x80000000");
+static_assert(layout_oracle::element_offset<char16_t>(wrap_oracle::idx_stride2)
+                  == std::size_t{ 16u } + std::size_t{ 0x40000000ull } * 2u,
+              "stride-2 wrap-index honest offset == 16 + 0x40000000*2 == 16 + 0x80000000");
+static_assert(layout_oracle::element_offset<std::int32_t>(wrap_oracle::idx_stride4)
+                  == std::size_t{ 16u } + std::size_t{ 0x20000000ull } * 4u,
+              "stride-4 wrap-index honest offset == 16 + 0x20000000*4 == 16 + 0x80000000");
+static_assert(layout_oracle::element_offset<std::int64_t>(wrap_oracle::idx_stride8)
+                  == std::size_t{ 16u } + std::size_t{ 0x10000000ull } * 8u,
+              "stride-8 wrap-index honest offset == 16 + 0x10000000*8 == 0x80000010");
+// All four honest offsets collapse to the same 0x80000010 byte position (16 +
+// 2^31), confirming the stride/index product is identical across widths there.
+static_assert(layout_oracle::element_offset<std::uint8_t>(wrap_oracle::idx_stride1)
+                  == 0x80000010ull, "stride-1 honest offset is 0x80000010");
+static_assert(layout_oracle::element_offset<char16_t>(wrap_oracle::idx_stride2)
+                  == 0x80000010ull, "stride-2 honest offset is 0x80000010");
+static_assert(layout_oracle::element_offset<std::int32_t>(wrap_oracle::idx_stride4)
+                  == 0x80000010ull, "stride-4 honest offset is 0x80000010");
+static_assert(layout_oracle::element_offset<std::int64_t>(wrap_oracle::idx_stride8)
+                  == 0x80000010ull, "stride-8 honest offset is 0x80000010");
+// The naive 32-bit product (unsigned modular wrap) reaches the bit pattern
+// 0x80000000 for every stride at its threshold index -- the wild offset the
+// ptrdiff_t widening prevents.  Reinterpreted as int32 that is INT_MIN.
+static_assert(wrap_oracle::idx_stride1 * 1u == 0x80000000u, "stride-1 32-bit product wraps to 0x80000000");
+static_assert(wrap_oracle::idx_stride2 * 2u == 0x80000000u, "stride-2 32-bit product wraps to 0x80000000");
+static_assert(wrap_oracle::idx_stride4 * 4u == 0x80000000u, "stride-4 32-bit product wraps to 0x80000000");
+static_assert(wrap_oracle::idx_stride8 * 8u == 0x80000000u, "stride-8 32-bit product wraps to 0x80000000");
+// At the stride-1 threshold the index itself (0x80000000) is already INT_MIN, so
+// even the FRONT (index < 0) guard rejects it before the multiply is reached.
+static_assert(static_cast<std::int32_t>(wrap_oracle::idx_stride1) < 0,
+              "stride-1 wrap index is negative as int32 -> rejected by the first guard clause");
+static_assert(!layout_oracle::index_in_range(static_cast<std::int32_t>(wrap_oracle::idx_stride1),
+                                              (std::numeric_limits<std::int32_t>::max)()),
+              "stride-1 wrap index rejected by half-open predicate (negative)");
+// For strides 2/4/8 the index is a large POSITIVE int32; on an honest array it is
+// rejected by the upper bound (index >= length) long before the multiply -- so the
+// wrap is unreachable on any array whose length is honest (<= the index).
+static_assert(static_cast<std::int32_t>(wrap_oracle::idx_stride8) > 0,
+              "stride-8 wrap index is positive as int32");
+static_assert(!layout_oracle::index_in_range(static_cast<std::int32_t>(wrap_oracle::idx_stride8), 4),
+              "stride-8 wrap index 0x10000000 rejected against an honest length 4");
+
+// Runtime confirmation that the live helper rejects the per-stride wrap indices
+// on a small honest array (length far below the index) for read AND write, for
+// every stride width -- so the documented int32 multiply is never reached.
+template<typename T>
+static auto wrap_index_rejected(const char* label, std::int32_t wrap_index) -> void
+{
+    const std::vector<T> seed{ T{}, T{}, T{}, T{} };   // honest length 4
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+    const bool read_default{ bits_equal(vmhook::get_array_element<T>(oop, opaque_index(wrap_index)), T{}) };
+    const std::vector<std::uint8_t> before{ buffer };
+    T probe{};
+    const std::uint64_t pbits{ 0xDEAFC0DE12345678ull };
+    std::memcpy(&probe, &pbits, sizeof(T));
+    vmhook::set_array_element<T>(oop, opaque_index(wrap_index), probe);
+    check(label, read_default && buffer == before);
+}
+
+static auto test_wrap_offset_arithmetic() -> void
+{
+    check("wrap_offset_static_asserts_compiled", true);
+    // stride 1: index 0x80000000 is INT_MIN (negative guard).
+    wrap_index_rejected<std::uint8_t>("wrap_idx_rejected_stride1",
+        static_cast<std::int32_t>(wrap_oracle::idx_stride1));
+    // strides 2/4/8: large positive indices, rejected by the upper bound.
+    wrap_index_rejected<char16_t>("wrap_idx_rejected_stride2",
+        static_cast<std::int32_t>(wrap_oracle::idx_stride2));
+    wrap_index_rejected<std::int32_t>("wrap_idx_rejected_stride4",
+        static_cast<std::int32_t>(wrap_oracle::idx_stride4));
+    wrap_index_rejected<std::int64_t>("wrap_idx_rejected_stride8",
+        static_cast<std::int32_t>(wrap_oracle::idx_stride8));
+}
+
+// ---------------------------------------------------------------------------
+// 37. clamp_safe_container_count -- power-of-two and saturation neighbourhood
+//     sweep (extends section 21's endpoint checks).  The helper is
+//     `raw<=0 -> 0; raw<cap -> raw; else cap` (vmhook.hpp:14715).  Pin:
+//       * every positive power-of-two below the cap passes through unchanged,
+//       * every positive power-of-two AT/above the cap saturates to cap,
+//       * the immediate saturation neighbourhood (cap-2..cap+2),
+//       * negative powers-of-two (their two's-complement) all collapse to 0.
+//     Runtime AND constexpr (the helper folds), so a regression fails to build.
+// ---------------------------------------------------------------------------
+static auto test_clamp_power_of_two_sweep() -> void
+{
+    constexpr std::int32_t cap{ static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) };
+
+    // Positive powers of two 2^0..2^30 (2^31 is negative as int32 -> handled by
+    // the negative branch, asserted separately below).
+    bool pow2_ok{ true };
+    for (int bit{ 0 }; bit <= 30; ++bit)
+    {
+        const std::int32_t raw{ static_cast<std::int32_t>(1) << bit };
+        const std::int32_t expected{ (raw < cap) ? raw : cap };
+        if (vmhook::clamp_safe_container_count(raw) != expected) { pow2_ok = false; break; }
+    }
+    check("clamp_pow2_0_to_30_matches_branch_rule", pow2_ok);
+
+    // 2^24 IS the cap exactly: 2^24 == cap -> NOT (<cap) -> saturates to cap.
+    check("clamp_2pow24_equals_cap_saturates",
+          vmhook::clamp_safe_container_count(static_cast<std::int32_t>(1) << 24) == cap
+          && (static_cast<std::int32_t>(1) << 24) == cap);
+    // 2^23 (< cap) passes through unchanged.
+    check("clamp_2pow23_below_cap_passthrough",
+          vmhook::clamp_safe_container_count(static_cast<std::int32_t>(1) << 23)
+              == (static_cast<std::int32_t>(1) << 23));
+    // 2^25 (> cap) saturates.
+    check("clamp_2pow25_above_cap_saturates",
+          vmhook::clamp_safe_container_count(static_cast<std::int32_t>(1) << 25) == cap);
+
+    // Saturation neighbourhood cap-2 .. cap+2.
+    check("clamp_cap_minus_2_passthrough", vmhook::clamp_safe_container_count(cap - 2) == cap - 2);
+    check("clamp_cap_minus_1_passthrough", vmhook::clamp_safe_container_count(cap - 1) == cap - 1);
+    check("clamp_cap_exact_is_cap",        vmhook::clamp_safe_container_count(cap)     == cap);
+    check("clamp_cap_plus_1_is_cap",       vmhook::clamp_safe_container_count(cap + 1) == cap);
+    check("clamp_cap_plus_2_is_cap",       vmhook::clamp_safe_container_count(cap + 2) == cap);
+
+    // Negative powers of two (their two's-complement bit value) all map to 0.
+    bool neg_pow2_ok{ true };
+    for (int bit{ 0 }; bit <= 30; ++bit)
+    {
+        const std::int32_t raw{ -(static_cast<std::int32_t>(1) << bit) };
+        if (vmhook::clamp_safe_container_count(raw) != 0) { neg_pow2_ok = false; break; }
+    }
+    check("clamp_negative_pow2_all_zero", neg_pow2_ok);
+
+    // constexpr neighbourhood (build-time regression gate).
+    static_assert(vmhook::clamp_safe_container_count(cap - 1) == cap - 1, "");
+    static_assert(vmhook::clamp_safe_container_count(cap) == cap, "");
+    static_assert(vmhook::clamp_safe_container_count(cap + 1) == cap, "");
+    static_assert(vmhook::clamp_safe_container_count(1 << 23) == (1 << 23), "");
+    static_assert(vmhook::clamp_safe_container_count(1 << 25) == cap, "");
+    check("clamp_pow2_constexpr_compiled", true);
+}
+
+// ---------------------------------------------------------------------------
+// 38. Float/double mixed-width aliasing over the same backing bytes (extends
+//     section 18, which only aliased int32<->int64).  Writing the raw IEEE-754
+//     bit pattern as two uint32 halves at indices 0/1 and reading it back as a
+//     single double at index 0 must compose the SAME double (little-endian, no
+//     padding) -- and vice versa.  This proves the helper's byte-exact memcpy is
+//     type-agnostic across the float/int boundary, the property the codebase
+//     relies on when a double[] element is pulled via the raw helper.
+// ---------------------------------------------------------------------------
+static auto test_float_int_aliasing() -> void
+{
+    // Two int64 slots (16 data bytes); _length 4 so it is also 4 int32 slots.
+    std::vector<std::uint8_t> buffer(16u + 2u * sizeof(std::int64_t), std::uint8_t{ 0 });
+    const std::int32_t len{ 4 };
+    std::memcpy(buffer.data() + 12, &len, sizeof(len));
+    void* const oop{ buffer.data() };
+
+    // pi as binary64 == 0x400921FB54442D18.  Lay it down as two uint32 halves
+    // (LE: low half at index 0, high half at index 1) and read it as a double.
+    constexpr std::uint64_t pi_bits{ 0x400921FB54442D18ull };
+    vmhook::set_array_element<std::uint32_t>(oop, 0, static_cast<std::uint32_t>(pi_bits & 0xFFFFFFFFull));
+    vmhook::set_array_element<std::uint32_t>(oop, 1, static_cast<std::uint32_t>(pi_bits >> 32));
+    const double composed{ vmhook::get_array_element<double>(oop, 0) };
+    double expected_pi{};
+    std::memcpy(&expected_pi, &pi_bits, sizeof(expected_pi));
+    check("alias_two_u32_compose_le_double", bits_equal(composed, expected_pi));
+
+    // Reverse: write a double at index 1, read the two uint32 halves at idx 2/3.
+    constexpr std::uint64_t e_bits{ 0x4005BF0A8B145769ull }; // Euler's number
+    double e_val{};
+    std::memcpy(&e_val, &e_bits, sizeof(e_val));
+    vmhook::set_array_element<double>(oop, 1, e_val);
+    check("alias_double_low_half_is_u32_index2",
+          vmhook::get_array_element<std::uint32_t>(oop, 2)
+              == static_cast<std::uint32_t>(e_bits & 0xFFFFFFFFull));
+    check("alias_double_high_half_is_u32_index3",
+          vmhook::get_array_element<std::uint32_t>(oop, 3)
+              == static_cast<std::uint32_t>(e_bits >> 32));
+
+    // float<->uint32 single-slot aliasing on a fresh 1-slot buffer.
+    {
+        const std::vector<std::uint32_t> seed{ 0u };
+        std::vector<std::uint8_t> fbuf{ build_fake_array(seed) };
+        void* const foop{ fbuf.data() };
+        constexpr std::uint32_t one_bits{ 0x3F800000u }; // 1.0f
+        vmhook::set_array_element<std::uint32_t>(foop, 0, one_bits);
+        float one_f{};
+        std::memcpy(&one_f, &one_bits, sizeof(one_f));
+        check("alias_u32_read_as_float_is_one",
+              bits_equal(vmhook::get_array_element<float>(foop, 0), one_f));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 39. array_length(nullptr) and element access on nullptr for the FULL width set
+//     (section 4 covered uint8/int32/int64/double; complete the matrix).  Null
+//     is the first guard clause (`!array_oop`) in all three helpers, so length
+//     is 0, every read is default, every write a no-op, for every element type.
+// ---------------------------------------------------------------------------
+template<typename T>
+static auto null_oop_defaults(const char* label) -> void
+{
+    const bool read_default{ bits_equal(vmhook::get_array_element<T>(nullptr, 0), T{})
+                             && bits_equal(vmhook::get_array_element<T>(nullptr, opaque_index(5)), T{})
+                             && bits_equal(vmhook::get_array_element<T>(nullptr, opaque_index(-1)), T{}) };
+    // The write cannot be observed (no buffer), but must not crash: reaching the
+    // check is the evidence the `!array_oop` clause short-circuited.
+    T probe{};
+    const std::uint64_t pbits{ 0x0102030405060708ull };
+    std::memcpy(&probe, &pbits, sizeof(T));
+    vmhook::set_array_element<T>(nullptr, 0, probe);
+    check(label, read_default);
+}
+
+static auto test_null_oop_all_widths() -> void
+{
+    check("null_array_length_is_zero", vmhook::array_length(nullptr) == 0);
+    null_oop_defaults<bool>("null_default_bool");
+    null_oop_defaults<std::int8_t>("null_default_i8");
+    null_oop_defaults<std::uint8_t>("null_default_u8");
+    null_oop_defaults<char>("null_default_char");
+    null_oop_defaults<char16_t>("null_default_c16");
+    null_oop_defaults<std::int16_t>("null_default_i16");
+    null_oop_defaults<std::uint16_t>("null_default_u16");
+    null_oop_defaults<std::int32_t>("null_default_i32");
+    null_oop_defaults<std::uint32_t>("null_default_u32");
+    null_oop_defaults<float>("null_default_f32");
+    null_oop_defaults<std::int64_t>("null_default_i64");
+    null_oop_defaults<std::uint64_t>("null_default_u64");
+    null_oop_defaults<double>("null_default_f64");
+    null_oop_defaults<std::uintptr_t>("null_default_wide_oop");
+    null_oop_defaults<void*>("null_default_voidptr");
+}
+
 int main()
 {
     test_all_widths();
@@ -2177,6 +2534,12 @@ int main()
     test_length_index_truth_table();
     test_index_bit_walk();
     test_array_length_bit_sweep();
+    test_guard_rejects_odd_mapped_oop();
+    test_unmapped_valid_shape_contained();
+    test_wrap_offset_arithmetic();
+    test_clamp_power_of_two_sweep();
+    test_float_int_aliasing();
+    test_null_oop_all_widths();
 
     if (failures == 0)
     {

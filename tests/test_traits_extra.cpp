@@ -1661,6 +1661,306 @@ int main()
     static_assert(!has_tuple_tail<std::pair<int, int>>::value,
                   "tuple_tail::type_t must be absent for a non-tuple (std::pair)");
 
+    // =========================================================================
+    // WAVE: noexcept callable shapes — the four noexcept function_traits
+    // specialisations (vmhook.hpp:9329-9333 free-fn-ptr noexcept; 9367-9377
+    // member-ptr `const noexcept` and `noexcept`).  C++17 made `noexcept` part
+    // of the function type, so a noexcept detour is a DISTINCT type from its
+    // throwing twin and needs these dedicated specs; without them it would fall
+    // through to the undefined primary.  This block proves every noexcept shape
+    // (a) is accepted by the detector and (b) decomposes to the IDENTICAL method
+    // tuple as its throwing twin.  Pure type algebra; no JVM.
+    //
+    // Coverage matrix of which member-ptr qualifier shapes the trait reaches:
+    //   operator() const            -> 9348 (existing checks)
+    //   operator()                  -> 9354 (existing checks)
+    //   operator() const noexcept   -> 9368 (noexcept lambda / const noexcept functor)
+    //   operator() noexcept         -> 9374 (mutable noexcept lambda / noexcept functor)
+    // The ref-qualified (& / &&) and volatile member forms remain documented
+    // GAPS (intentionally NOT fed to the detector — they would hard-error, per
+    // the detectability-boundary note near has_args_tuple above).
+    // =========================================================================
+    {
+        // A noexcept-qualified plain lambda: operator() const noexcept (spec 9368).
+        auto ne_lambda = [](vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                            std::int64_t, std::int32_t) noexcept {};
+        // A mutable noexcept lambda: operator() noexcept (non-const, spec 9374).
+        auto ne_mutable = [x = 0](vmhook::return_value&, std::int32_t,
+                                  std::int64_t) mutable noexcept { ++x; };
+        using ne_method = method_args_of<decltype(ne_lambda)>;
+        using ne_mut_method = method_args_of<decltype(ne_mutable)>;
+
+        check("noexcept_lambda_has_args_tuple",
+              has_args_tuple<decltype(ne_lambda)>::value);
+        check("noexcept_mutable_lambda_has_args_tuple",
+              has_args_tuple<decltype(ne_mutable)>::value);
+        check("noexcept_lambda_full_arity_4",
+              std::tuple_size_v<all_args_of<decltype(ne_lambda)>> == 4);
+        check("noexcept_lambda_first_arg_is_return_value_ref",
+              std::is_same_v<std::tuple_element_t<0, all_args_of<decltype(ne_lambda)>>,
+                             vmhook::return_value&>);
+        check("noexcept_lambda_method_tuple_exact",
+              std::is_same_v<ne_method,
+                  std::tuple<std::unique_ptr<sample_wrapper>, std::int64_t, std::int32_t>>);
+        check("noexcept_mutable_lambda_method_tuple_exact",
+              std::is_same_v<ne_mut_method, std::tuple<std::int32_t, std::int64_t>>);
+        // The noexcept lambda's method tuple is BYTE-IDENTICAL to the throwing
+        // twin's: noexcept must not perturb the decomposition.
+        {
+            auto throwing_twin = [](vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                                    std::int64_t, std::int32_t) {};
+            check("noexcept_lambda_matches_throwing_twin_method_tuple",
+                  std::is_same_v<ne_method, method_args_of<decltype(throwing_twin)>>);
+        }
+        // End-to-end: (self, long, int) -> self@0, long@1(+2), int@3.
+        check("noexcept_lambda_slot_offsets_widen_trailing_int",
+              (vmhook::detail::java_slot_offsets<ne_method>::value
+               == std::array<std::int32_t, 3>{ 0, 1, 3 }));
+    }
+    // Explicit functors with const-noexcept and noexcept call operators (the
+    // two member-ptr noexcept specs reached via the void_t functor probe).
+    {
+        struct const_noexcept_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) const noexcept {}
+        };
+        struct noexcept_functor
+        {
+            void operator()(vmhook::return_value&, std::int32_t, std::int64_t) noexcept {}
+        };
+        check("const_noexcept_functor_has_args_tuple",
+              has_args_tuple<const_noexcept_functor>::value);
+        check("noexcept_functor_has_args_tuple",
+              has_args_tuple<noexcept_functor>::value);
+        check("const_noexcept_functor_method_tuple_int_long",
+              std::is_same_v<method_args_of<const_noexcept_functor>,
+                             std::tuple<std::int32_t, std::int64_t>>);
+        // const-noexcept and noexcept functors decompose identically to each
+        // other and to the plain const_call_functor declared at file scope.
+        check("noexcept_functor_matches_const_noexcept_functor",
+              std::is_same_v<method_args_of<noexcept_functor>,
+                             method_args_of<const_noexcept_functor>>);
+        check("const_noexcept_functor_matches_plain_const_functor",
+              std::is_same_v<method_args_of<const_noexcept_functor>,
+                             method_args_of<const_call_functor>>);
+    }
+    // The noexcept FREE-FUNCTION-POINTER spec (9330): a noexcept fn-ptr type must
+    // decompose to the same method tuple as the throwing fn-ptr.  (The detector
+    // presence is already pinned above; this pins the actual tuple value.)
+    {
+        using ne_fp_t = void(*)(vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                                std::int64_t, std::int32_t, double) noexcept;
+        check("noexcept_free_function_pointer_method_tuple_exact",
+              std::is_same_v<method_args_of<ne_fp_t>,
+                  std::tuple<std::unique_ptr<sample_wrapper>, std::int64_t,
+                             std::int32_t, double>>);
+        // Identical to the throwing free_detour_wide declared at file scope.
+        check("noexcept_free_function_pointer_matches_throwing_pointer",
+              std::is_same_v<method_args_of<ne_fp_t>,
+                             method_args_of<decltype(&free_detour_wide)>>);
+    }
+
+    // =========================================================================
+    // WAVE: java_slot_offsets — deep folds and all-J/D boundary sweeps.
+    //
+    // Each expected array is computed BY HAND from the fold (vmhook.hpp:9482-9492):
+    // record the running cursor for each element, then advance +2 if
+    // is_java_double_slot_v else +1.  These push the fold well past the small
+    // cases asserted earlier and exhaust the J/D-at-every-position space.
+    // =========================================================================
+    // Four consecutive two-slot args (double, long, uint64, double):
+    //   d@0(+2), l@2(+2), u64@4(+2), d@6  -> {0,2,4,6}.
+    check("jso_four_consecutive_two_slot",
+          (vmhook::detail::java_slot_offsets<
+               std::tuple<double, std::int64_t, std::uint64_t, double>>::value
+           == std::array<std::int32_t, 4>{ 0, 2, 4, 6 }));
+    // Ten single-slot ints: pure identity, exercising a long fold.
+    check("jso_ten_ints_identity",
+          (vmhook::detail::java_slot_offsets<
+               std::tuple<std::int32_t, std::int32_t, std::int32_t, std::int32_t,
+                          std::int32_t, std::int32_t, std::int32_t, std::int32_t,
+                          std::int32_t, std::int32_t>>::value
+           == std::array<std::int32_t, 10>{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }));
+    // Strict long/int alternation (long, int, long, int, long, int):
+    //   l@0(+2), i@2(+1), l@3(+2), i@5(+1), l@6(+2), i@8  -> {0,2,3,5,6,8}.
+    check("jso_long_int_alternation_six",
+          (vmhook::detail::java_slot_offsets<
+               std::tuple<std::int64_t, std::int32_t, std::int64_t, std::int32_t,
+                          std::int64_t, std::int32_t>>::value
+           == std::array<std::int32_t, 6>{ 0, 2, 3, 5, 6, 8 }));
+    // Two doubles back-to-back after a single-slot self (self, double, double, int):
+    //   p@0(+1), d@1(+2), d@3(+2), i@5  -> {0,1,3,5}.
+    check("jso_self_double_double_int",
+          (vmhook::detail::java_slot_offsets<
+               std::tuple<void*, double, double, std::int32_t>>::value
+           == std::array<std::int32_t, 4>{ 0, 1, 3, 5 }));
+    // float never widens even sandwiched among doubles (float, float, double, float, long):
+    //   f@0(+1), f@1(+1), d@2(+2), f@4(+1), l@5  -> {0,1,2,4,5}.
+    check("jso_float_float_double_float_long",
+          (vmhook::detail::java_slot_offsets<
+               std::tuple<float, float, double, float, std::int64_t>>::value
+           == std::array<std::int32_t, 5>{ 0, 1, 2, 4, 5 }));
+    // A leading uint64 then mixed widths (uint64, double, int, long):
+    //   u64@0(+2), d@2(+2), i@4(+1), l@5  -> {0,2,4,5}.
+    check("jso_uint64_double_int_long",
+          (vmhook::detail::java_slot_offsets<
+               std::tuple<std::uint64_t, double, std::int32_t, std::int64_t>>::value
+           == std::array<std::int32_t, 4>{ 0, 2, 4, 5 }));
+    // The computed table size always equals the tuple arity, even for an all-J/D
+    // tuple (one entry per ARG, not per SLOT).
+    check("jso_size_equals_arity_all_two_slot",
+          vmhook::detail::java_slot_offsets<
+              std::tuple<std::int64_t, double, std::uint64_t, std::int64_t>>::value.size() == 4);
+
+    // =========================================================================
+    // WAVE: full function_traits -> tuple_tail -> java_slot_offsets chain end to
+    // end for a noexcept instance detour and a max-shape detour, pinning the
+    // exact slot the k-th tuple_element is read from (the hook<T> instantiation
+    // at vmhook.hpp:10424-10426).
+    // =========================================================================
+    {
+        // A noexcept instance detour mixing every slot width:
+        // (return_value&, self, int, long, double, uint64, float, string).
+        auto detour = [](vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                         std::int32_t, std::int64_t, double, std::uint64_t,
+                         float, std::string) noexcept {};
+        using m = method_args_of<decltype(detour)>;
+        check("chain_noexcept_max_shape_method_arity_7",
+              std::tuple_size_v<m> == 7);
+        check("chain_noexcept_max_shape_element_types",
+              std::is_same_v<m,
+                  std::tuple<std::unique_ptr<sample_wrapper>, std::int32_t,
+                             std::int64_t, double, std::uint64_t, float, std::string>>);
+        // slots: self@0(+1), int@1(+1), long@2(+2), double@4(+2), uint64@6(+2),
+        //        float@8(+1), string@9.
+        check("chain_noexcept_max_shape_slot_offsets",
+              (vmhook::detail::java_slot_offsets<m>::value
+               == std::array<std::int32_t, 7>{ 0, 1, 2, 4, 6, 8, 9 }));
+        // Per-k tuple_element identity (the exact hook<T> read expression).
+        check("chain_noexcept_max_shape_k2_is_long_at_slot_2",
+              std::is_same_v<std::tuple_element_t<2, m>, std::int64_t>
+              && vmhook::detail::java_slot_offsets<m>::value[2] == 2);
+        check("chain_noexcept_max_shape_k4_is_uint64_at_slot_6",
+              std::is_same_v<std::tuple_element_t<4, m>, std::uint64_t>
+              && vmhook::detail::java_slot_offsets<m>::value[4] == 6);
+        check("chain_noexcept_max_shape_k6_is_string_at_slot_9",
+              std::is_same_v<std::tuple_element_t<6, m>, std::string>
+              && vmhook::detail::java_slot_offsets<m>::value[6] == 9);
+    }
+
+    // =========================================================================
+    // WAVE: tuple_tail compose / idempotence and degenerate strips.
+    //
+    // tuple_tail drops exactly one leading element (vmhook.hpp:9392-9395) and the
+    // empty-tuple base (9410-9412) makes a second strip of an emptied tuple
+    // well-formed.  Verify repeated application telescopes correctly down to (and
+    // stays at) the empty tuple, and that the type_t exists at every step.
+    // =========================================================================
+    {
+        using t0 = std::tuple<vmhook::return_value&, int, double, void*>;
+        using t1 = typename vmhook::detail::tuple_tail<t0>::type_t;       // (int, double, void*)
+        using t2 = typename vmhook::detail::tuple_tail<t1>::type_t;       // (double, void*)
+        using t3 = typename vmhook::detail::tuple_tail<t2>::type_t;       // (void*)
+        using t4 = typename vmhook::detail::tuple_tail<t3>::type_t;       // ()
+        using t5 = typename vmhook::detail::tuple_tail<t4>::type_t;       // () still
+        check("tuple_tail_compose_step1",
+              std::is_same_v<t1, std::tuple<int, double, void*>>);
+        check("tuple_tail_compose_step2",
+              std::is_same_v<t2, std::tuple<double, void*>>);
+        check("tuple_tail_compose_step3",
+              std::is_same_v<t3, std::tuple<void*>>);
+        check("tuple_tail_compose_step4_empty",
+              std::is_same_v<t4, std::tuple<>>);
+        check("tuple_tail_empty_is_idempotent",
+              std::is_same_v<t5, std::tuple<>>);
+        // type_t is present at every step including the two empty ones.
+        check("tuple_tail_compose_type_t_present_at_every_step",
+              has_tuple_tail<t0>::value && has_tuple_tail<t1>::value
+              && has_tuple_tail<t2>::value && has_tuple_tail<t3>::value
+              && has_tuple_tail<t4>::value);
+    }
+    // tuple_tail strips whatever is first, including a J/D leading element, and
+    // the surviving tail still feeds java_slot_offsets from a fresh cursor (the
+    // dropped element's width never leaks into the remainder).
+    {
+        using full = std::tuple<std::int64_t, std::int32_t, std::int64_t>;
+        using tail = typename vmhook::detail::tuple_tail<full>::type_t;   // (int, long)
+        check("tuple_tail_drops_leading_long",
+              std::is_same_v<tail, std::tuple<std::int32_t, std::int64_t>>);
+        // The tail (int, long) offsets from a fresh cursor: int@0(+1), long@1.
+        check("tuple_tail_remainder_offsets_from_fresh_cursor",
+              (vmhook::detail::java_slot_offsets<tail>::value
+               == std::array<std::int32_t, 2>{ 0, 1 }));
+    }
+
+    // =========================================================================
+    // WAVE: extract_frame_arg result-type collapse for the J/D and wide arg
+    // categories specifically (the value_type fed by tuple_element through the
+    // chain).  Result is always std::remove_cvref_t<value_type> (vmhook.hpp:9506).
+    // =========================================================================
+    check("efa_uint64_const_ref_to_uint64",
+          std::is_same_v<
+              decltype(vmhook::detail::extract_frame_arg<const std::uint64_t&>(nullptr, 0)),
+              std::uint64_t>);
+    check("efa_double_rvalue_ref_to_double",
+          std::is_same_v<
+              decltype(vmhook::detail::extract_frame_arg<double&&>(nullptr, 0)),
+              double>);
+    check("efa_float_const_to_float",
+          std::is_same_v<
+              decltype(vmhook::detail::extract_frame_arg<const float>(nullptr, 0)),
+              float>);
+    check("efa_int64_volatile_ref_to_int64",
+          std::is_same_v<
+              decltype(vmhook::detail::extract_frame_arg<volatile std::int64_t&>(nullptr, 0)),
+              std::int64_t>);
+    // A by-value uint64 and a const-ref uint64 decode to the same C++ type, so a
+    // detour may spell a Java-long param either way (the contract that makes the
+    // cv/ref preservation in args_tuple_t harmless downstream).
+    check("efa_byvalue_and_constref_uint64_agree",
+          std::is_same_v<
+              decltype(vmhook::detail::extract_frame_arg<std::uint64_t>(nullptr, 0)),
+              decltype(vmhook::detail::extract_frame_arg<const std::uint64_t&>(nullptr, 0))>);
+
+    // -------------------------------------------------------------------------
+    // Compile-time enforcement for the noexcept / deep-fold waves (build breaks
+    // before runtime on regression).  One load-bearing fact per new wave.
+    // -------------------------------------------------------------------------
+    static_assert(
+        has_args_tuple<void(*)(vmhook::return_value&, std::int32_t) noexcept>::value,
+        "function_traits must accept a noexcept free-function pointer (C++17 makes "
+        "noexcept part of the function type -> dedicated specialisation)");
+    static_assert(
+        std::is_same_v<
+            method_args_of<decltype([](vmhook::return_value&, std::unique_ptr<sample_wrapper>,
+                                       std::int64_t, std::int32_t) noexcept {})>,
+            std::tuple<std::unique_ptr<sample_wrapper>, std::int64_t, std::int32_t>>,
+        "a noexcept lambda must decompose to the same method tuple as its throwing twin "
+        "(noexcept member-ptr specialisations, vmhook.hpp:9368/9374)");
+    static_assert(
+        vmhook::detail::java_slot_offsets<
+            std::tuple<double, std::int64_t, std::uint64_t, double>>::value
+            == std::array<std::int32_t, 4>{ 0, 2, 4, 6 },
+        "four consecutive two-slot args advance the cursor by 2 each: {0,2,4,6}");
+    static_assert(
+        vmhook::detail::java_slot_offsets<
+            std::tuple<std::int64_t, std::int32_t, std::int64_t, std::int32_t,
+                       std::int64_t, std::int32_t>>::value
+            == std::array<std::int32_t, 6>{ 0, 2, 3, 5, 6, 8 },
+        "long/int alternation threads the +2 widening across the whole list");
+    static_assert(
+        std::is_same_v<
+            typename vmhook::detail::tuple_tail<
+                typename vmhook::detail::tuple_tail<std::tuple<int>>::type_t>::type_t,
+            std::tuple<>>,
+        "stripping past an emptied tuple stays at std::tuple<> (empty-tuple base, "
+        "vmhook.hpp:9410-9412)");
+    static_assert(
+        std::is_same_v<
+            decltype(vmhook::detail::extract_frame_arg<const std::uint64_t&>(nullptr, 0)),
+            std::uint64_t>,
+        "extract_frame_arg strips top-level cv/ref from a uint64_t Java-long arg");
+
     std::printf("vmhook traits-extra: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

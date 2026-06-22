@@ -2005,6 +2005,279 @@ static auto test_element_wrapper_contract() -> void
     check("element_wrapper_contract_static_asserts_held", true);
 }
 
+// ---------------------------------------------------------------------------
+// 16. vmhook::array_length() — the in-heap element-count oracle the value_t
+//     OBJECT-ARRAY branch and every collection walk read to bound their loop.
+//
+// Contract (header): returns 0 for a null OOP and for an invalid (out-of-range
+// / odd / sentinel) OOP — it short-circuits BEFORE any memory read on
+// `!array_oop || !is_valid_pointer(array_oop)`.  With no JVM we cannot supply a
+// real mapped array, but the null + invalid-low-pointer rejection is pure
+// address arithmetic and fully deterministic: every bogus OOP the rest of this
+// file uses (0x4 / 0x6 / 0x7) is below user_address_floor, so array_length must
+// report 0 — which is exactly why the object-array walk body is never entered
+// without a JVM.  Pin it directly so a regression that started dereferencing an
+// invalid pointer (instead of returning 0) would fail loudly here.
+// ---------------------------------------------------------------------------
+static auto test_array_length_null_and_invalid() -> void
+{
+    // Null -> 0 (the first short-circuit clause).
+    check("array_length_null_zero", vmhook::array_length(nullptr) == 0);
+
+    // Invalid LOW pointers (below user_address_floor 0xFFFF) -> 0 via the
+    // is_valid_pointer clause, before any +12 header read.  These mirror the
+    // 0x4 / 0x6 / 0x7 bogus oops the wrapper tests rely on.
+    const std::uintptr_t low_invalid[]{ 0x1u, 0x2u, 0x4u, 0x6u, 0x7u, 0x8u, 0xFFFFu, 0xFFFEu };
+    bool all_invalid_zero{ true };
+    for (const std::uintptr_t a : low_invalid)
+    {
+        if (vmhook::array_length(reinterpret_cast<vmhook::oop_t>(a)) != 0) { all_invalid_zero = false; }
+    }
+    check("array_length_low_invalid_all_zero", all_invalid_zero);
+
+    // An ODD in-range pointer is rejected by is_valid_pointer's alignment rule
+    // -> 0, again with no header read.  0x10001 is just above the floor + odd.
+    check("array_length_odd_pointer_zero",
+          vmhook::array_length(reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0x10001u))) == 0);
+
+    // array_length is documented noexcept (it runs on detour threads).
+    check("array_length_noexcept", noexcept(vmhook::array_length(nullptr)));
+
+    // The clamp the walks apply to array_length's result keeps a (here always 0)
+    // count a valid reserve/loop bound — 0 clamps to 0.
+    check("array_length_zero_clamps_to_zero",
+          vmhook::clamp_safe_container_count(vmhook::array_length(nullptr)) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// 17. vmhook::get_array_element<T>() — the per-element primitive read the
+//     value_t primitive-array path (append_array_value) sits on.
+//
+// Contract (header): returns T{} for a null OOP, an invalid OOP, and any index
+// < 0 or >= length.  Without a JVM array_length() is always 0, so EVERY index
+// is out of bounds -> T{} for every element type.  Plus the null/invalid OOP
+// guards fire before array_length is even consulted.  This is the element-level
+// never-fault guarantee underneath the object-array / primitive-array tags.
+// (T must be trivially copyable per the static_assert; we sweep the JVM
+//  primitive C++ element types the append_array_value overloads instantiate.)
+// ---------------------------------------------------------------------------
+static auto test_get_array_element_null_and_oob() -> void
+{
+    const vmhook::oop_t null_oop{ nullptr };
+    const vmhook::oop_t bogus_oop{ reinterpret_cast<vmhook::oop_t>(static_cast<std::uintptr_t>(0x7u)) };
+
+    // Null OOP -> default for every element type the walks use.
+    check("gae_null_bool_default",   vmhook::get_array_element<bool>(null_oop, 0) == false);
+    check("gae_null_i8_default",     vmhook::get_array_element<std::int8_t>(null_oop, 0) == 0);
+    check("gae_null_u8_default",     vmhook::get_array_element<std::uint8_t>(null_oop, 0) == 0);
+    check("gae_null_i16_default",    vmhook::get_array_element<std::int16_t>(null_oop, 0) == 0);
+    check("gae_null_u16_default",    vmhook::get_array_element<std::uint16_t>(null_oop, 0) == 0);
+    check("gae_null_i32_default",    vmhook::get_array_element<std::int32_t>(null_oop, 0) == 0);
+    check("gae_null_u32_default",    vmhook::get_array_element<std::uint32_t>(null_oop, 0) == 0u);
+    check("gae_null_i64_default",    vmhook::get_array_element<std::int64_t>(null_oop, 0) == 0);
+    check("gae_null_float_default",  vmhook::get_array_element<float>(null_oop, 0) == 0.0F);
+    check("gae_null_double_default", vmhook::get_array_element<double>(null_oop, 0) == 0.0);
+    check("gae_null_char_default",   vmhook::get_array_element<char>(null_oop, 0) == char{ 0 });
+
+    // Invalid OOP -> default (rejected before the length read).
+    check("gae_bogus_i32_default",  vmhook::get_array_element<std::int32_t>(bogus_oop, 0) == 0);
+    check("gae_bogus_u32_default",  vmhook::get_array_element<std::uint32_t>(bogus_oop, 0) == 0u);
+
+    // Negative and large indices on a null OOP are all default (the null guard
+    // dominates; the index guard is the secondary line of defence).  Sweep a
+    // representative index spread including the int32 extremes.
+    const std::int32_t indices[]{
+        (std::numeric_limits<std::int32_t>::min)(), -123456, -1, 0, 1, 1000,
+        (1 << 20), (std::numeric_limits<std::int32_t>::max)(),
+    };
+    bool all_default{ true };
+    for (const std::int32_t i : indices)
+    {
+        if (vmhook::get_array_element<std::int32_t>(null_oop, i) != 0) { all_default = false; }
+        if (vmhook::get_array_element<std::uint32_t>(bogus_oop, i) != 0u) { all_default = false; }
+    }
+    check("gae_index_sweep_all_default", all_default);
+
+    // The compressed-OOP element read (used by the String[] / Object[] element
+    // walks) is also default 0 on the null/invalid path -> decode_oop_pointer(0)
+    // is nullptr -> a nullptr element SLOT, never a wild wrapper.
+    check("gae_compressed_oop_element_zero_null_oop",
+          vmhook::get_array_element<std::uint32_t>(null_oop, 0) == 0u);
+    check("gae_compressed_oop_element_decodes_null",
+          vmhook::hotspot::decode_oop_pointer(
+              vmhook::get_array_element<std::uint32_t>(null_oop, 0)) == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 18. read_java_string() on a null / invalid OOP -> "" — the leaf the value_t
+//     uint32 as_string() path and the String[] element walk both decode through.
+//
+// Contract (header, read_java_string): returns "" for a null OOP and for an
+// invalid OOP (is_valid_pointer reject), each BEFORE any heap read.  With no
+// JVM every compressed OOP decodes to nullptr, so the String-decode leaf always
+// yields "".  This underpins the empty/never-throw guarantee whenever a wrapper
+// or value_t ends up reading a String reference, so pin it directly.
+// ---------------------------------------------------------------------------
+static auto test_read_java_string_null_and_invalid() -> void
+{
+    check("rjs_null_empty", vmhook::read_java_string(nullptr).empty());
+
+    const std::uintptr_t bogus[]{ 0x1u, 0x4u, 0x6u, 0x7u, 0xFFFFu, 0x10001u };
+    bool all_empty{ true };
+    for (const std::uintptr_t a : bogus)
+    {
+        if (!vmhook::read_java_string(reinterpret_cast<void*>(a)).empty()) { all_empty = false; }
+    }
+    check("rjs_invalid_pointers_all_empty", all_empty);
+
+    // Decoding the whole compressed range then reading as a String is "" (no JVM
+    // -> decode is nullptr -> read_java_string(nullptr) -> "").  This is the
+    // exact composition value_t::as_string() performs for a uint32 alternative.
+    const std::uint32_t oops[]{ 0u, 1u, 0x7u, 0x00800000u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu };
+    bool all_decode_empty{ true };
+    for (const std::uint32_t o : oops)
+    {
+        if (!vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(o)).empty())
+        {
+            all_decode_empty = false;
+        }
+    }
+    check("rjs_decoded_compressed_range_all_empty", all_decode_empty);
+}
+
+// ---------------------------------------------------------------------------
+// 19. value_t::as_string() over EVERY variant alternative, including the uint32
+//     REFERENCE alternative's TRUE branch (decode -> read_java_string).
+//
+// as_string() std::visits the variant: the uint32 alternative routes through
+// read_java_string(decode_oop_pointer(v)) (the if-constexpr TRUE branch); every
+// OTHER alternative returns "" verbatim (the else branch).  The existing suite
+// only ever exercised the else branch (non-reference alternatives) and a single
+// uint32{0}; this pins that the uint32 branch ALSO yields "" without a JVM for
+// the whole compressed range (decode -> nullptr -> read_java_string -> ""), so
+// BOTH constexpr arms of as_string() are covered and proven empty/never-throw.
+// ---------------------------------------------------------------------------
+static auto test_value_t_as_string_all_alternatives() -> void
+{
+    // (a) Non-reference alternatives -> "" (the else arm).
+    const value_t non_ref[]{
+        value_t{ false }, value_t{ true },
+        value_t{ std::int8_t{ -1 } }, value_t{ std::int16_t{ 1234 } },
+        value_t{ std::int32_t{ -123456 } }, value_t{ std::int64_t{ 0x1'0000'0001LL } },
+        value_t{ float{ 2.5F } }, value_t{ double{ 3.9 } },
+        value_t{ std::uint16_t{ 0xFFFF } },
+    };
+    bool all_non_ref_empty{ true };
+    for (const auto& v : non_ref)
+    {
+        if (!v.as_string().empty()) { all_non_ref_empty = false; }
+        // None of these is a reference field.
+        if (v.is_reference()) { all_non_ref_empty = false; }
+    }
+    check("as_string_non_reference_alternatives_all_empty", all_non_ref_empty);
+
+    // (b) The uint32 REFERENCE alternative -> the TRUE constexpr arm
+    //     (read_java_string(decode_oop_pointer(v))).  Without a JVM every value
+    //     decodes to nullptr -> "".  This is the arm the old suite never hit.
+    const std::uint32_t ref_oops[]{
+        0u, 1u, 2u, 0x7u, 0xFFu, 0xFFFFu, 0x00800000u, 0x7FFFFFFFu,
+        0x80000000u, 0xC0000000u, 0xFFFFFFFEu, 0xFFFFFFFFu,
+    };
+    bool all_ref_empty{ true };
+    for (const std::uint32_t o : ref_oops)
+    {
+        const value_t v{ std::uint32_t{ o }, std::string{ "Ljava/lang/String;" } };
+        if (!v.is_reference()) { all_ref_empty = false; }   // uint32 alt IS a reference
+        if (!v.as_string().empty()) { all_ref_empty = false; }
+    }
+    check("as_string_uint32_reference_alternative_all_empty", all_ref_empty);
+
+    // (c) as_string() is documented noexcept (a throwing field read in a detour
+    //     would escape into the JVM).  Measure on a prebuilt lvalue.
+    const value_t ref_v{ std::uint32_t{ 0x1234u }, std::string{ "Ljava/lang/String;" } };
+    check("as_string_noexcept", noexcept(ref_v.as_string()));
+
+    // (d) The signature does NOT affect as_string() (it decodes the OOP as a
+    //     String regardless): a uint32 alt with a List/Object/array signature
+    //     still yields "" without a JVM.
+    const char* const sigs[]{
+        "Ljava/lang/String;", "Ljava/util/List;", "Ljava/lang/Object;",
+        "[Ljava/lang/String;", "[I", "I", "",
+    };
+    bool sig_independent_empty{ true };
+    for (const char* s : sigs)
+    {
+        const value_t v{ std::uint32_t{ 0x7u }, std::string{ s } };
+        if (!v.as_string().empty()) { sig_independent_empty = false; }
+    }
+    check("as_string_signature_independent_all_empty", sig_independent_empty);
+}
+
+// ---------------------------------------------------------------------------
+// 20. value_t aggregate field semantics: signature is preserved VERBATIM
+//     (including embedded NUL / array / empty), and is_reference() depends ONLY
+//     on the variant alternative, never on the signature string.
+//
+// value_t is a plain aggregate { variant data; std::string signature{}; }.
+// to_vector's object-array gate reads `signature`, so the aggregate must hold it
+// byte-for-byte; is_reference() reads only `data`.  Pin both invariants so a
+// future change that normalised/truncated the signature or coupled
+// is_reference() to it would be caught — neither is permitted by the header.
+// ---------------------------------------------------------------------------
+static auto test_value_t_aggregate_field_semantics() -> void
+{
+    // signature preserved verbatim across representative shapes.
+    {
+        const value_t v{ std::uint32_t{ 0 }, std::string{ "[Ljava/lang/Object;" } };
+        check("agg_signature_array_preserved", v.signature == "[Ljava/lang/Object;");
+        check("agg_signature_array_size", v.signature.size() == 19u);
+    }
+    {
+        const value_t v{ std::uint32_t{ 0 }, std::string{} };
+        check("agg_signature_empty_preserved", v.signature.empty());
+    }
+    // Embedded NUL: the aggregate must keep all 5 bytes (std::string is length-
+    // prefixed; NUL is a normal element, not a terminator).
+    {
+        const std::string sig{ "[L\0X;", 5 };
+        const value_t v{ std::uint32_t{ 0 }, sig };
+        check("agg_signature_embedded_nul_size5", v.signature.size() == 5u);
+        check("agg_signature_embedded_nul_front_bracket", v.signature.front() == '[');
+        check("agg_signature_embedded_nul_equal", v.signature == sig);
+    }
+
+    // is_reference() is governed SOLELY by the stored alternative: the SAME
+    // signature over a uint32 alt is a reference, over any other alt is not.
+    {
+        const std::string list_sig{ "Ljava/util/List;" };
+        check("agg_isref_uint32_with_list_sig_true",
+              value_t{ std::uint32_t{ 0 }, list_sig }.is_reference());
+        check("agg_isref_int32_with_list_sig_false",
+              !value_t{ std::int32_t{ 0 }, list_sig }.is_reference());
+        check("agg_isref_bool_with_list_sig_false",
+              !value_t{ false, list_sig }.is_reference());
+        // And conversely: a uint32 alt is a reference for ANY signature, even a
+        // primitive descriptor or empty string.
+        check("agg_isref_uint32_with_scalar_sig_true",
+              value_t{ std::uint32_t{ 0 }, std::string{ "I" } }.is_reference());
+        check("agg_isref_uint32_with_empty_sig_true",
+              value_t{ std::uint32_t{ 0 }, std::string{} }.is_reference());
+    }
+
+    // Default-constructed aggregate: variant holds the FIRST alternative (bool
+    // false) and an empty signature — pins the documented default shape.
+    {
+        const value_t v{};
+        check("agg_default_holds_bool", std::holds_alternative<bool>(v.data));
+        check("agg_default_not_reference", !v.is_reference());
+        check("agg_default_signature_empty", v.signature.empty());
+        check("agg_default_uint32_cast_zero", static_cast<std::uint32_t>(v) == 0u);
+    }
+
+    // is_reference() is noexcept (introspection on a detour thread).
+    check("is_reference_noexcept", noexcept(value_t{ false }.is_reference()));
+}
+
 int main()
 {
     // Registering the element wrappers mirrors real usage; harmless with no JVM.
@@ -2041,6 +2314,11 @@ int main()
     test_clamp_safe_container_count();
     test_value_t_convertible_target_gate();
     test_element_wrapper_contract();
+    test_array_length_null_and_invalid();
+    test_get_array_element_null_and_oob();
+    test_read_java_string_null_and_invalid();
+    test_value_t_as_string_all_alternatives();
+    test_value_t_aggregate_field_semantics();
 
     return failures == 0 ? 0 : 1;
 }

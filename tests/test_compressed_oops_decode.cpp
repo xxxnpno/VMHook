@@ -974,6 +974,377 @@ int main()
     }
 
     // =====================================================================
+    // T. reinterpret_cast IDENTITY — narrow_decode(0, 0, c) must reproduce the
+    //    narrow value c VERBATIM as a pointer bit pattern.  narrow_decode's body
+    //    is `reinterpret_cast<void*>(base + (uint64(c) << shift))` (vmhook.hpp:
+    //    5463); with base 0 and shift 0 that is `reinterpret_cast<void*>(uint64(c))`,
+    //    so the round-tripped uintptr_t MUST equal c exactly for EVERY 32-bit c —
+    //    no truncation, no sign extension, no cast-perturbation.  This is the
+    //    cleanest possible pin that the cast itself is value-preserving and is
+    //    additive to sections D/E (which check the post-shift arithmetic) by
+    //    isolating the cast at shift 0.  Sweeps the full dense narrow domain.
+    // =====================================================================
+    {
+        bool cast_identity_ok{ true };
+        std::size_t cast_cases{ 0 };
+        for (const std::uint32_t c : build_dense_narrows())
+        {
+            if (as_uptr(narrow_decode(0u, 0u, c)) != static_cast<std::uintptr_t>(c))
+            {
+                cast_identity_ok = false;
+            }
+            ++cast_cases;
+        }
+        check("oop_decode_shift0_base0_is_cast_identity_all_c", cast_identity_ok);
+        check("oop_decode_cast_identity_sweep_is_dense", cast_cases >= 100);
+        // And the inverse at shift 0 / base 0: narrow_encode(0,0,c) returns the low
+        // 32 bits of c verbatim; for a value already <= 0xFFFFFFFF that IS c.
+        bool encode_cast_identity_ok{ true };
+        for (const std::uint32_t c : build_dense_narrows())
+        {
+            if (narrow_encode(0u, 0u, static_cast<std::uint64_t>(c)) != c)
+            {
+                encode_cast_identity_ok = false;
+            }
+        }
+        check("oop_encode_shift0_base0_is_low32_identity_all_c", encode_cast_identity_ok);
+    }
+
+    // =====================================================================
+    // U. ADDITIVITY of the base -- narrow_decode(base, shift, c) is EXACTLY
+    //    base + narrow_decode(0, shift, c) whenever the sum does not wrap 2^64.
+    //    The formula base + (uint64(c) << shift) is linear in base, so adding a
+    //    heap base merely translates the zero-based decode by `base`.  This pins
+    //    that the (base, shift) pair compose correctly -- a base bug or a shift
+    //    bug would break this for some (base, shift, c).  Sweeps every kMode base
+    //    against the full dense narrow set, recomputing the zero-based decode
+    //    independently and adding the mode's base.
+    // =====================================================================
+    {
+        bool additivity_ok{ true };
+        std::size_t add_cases{ 0 };
+        for (const oop_mode m : kModes)
+        {
+            for (const std::uint32_t c : build_dense_narrows())
+            {
+                const std::uintptr_t zero_based{ as_uptr(narrow_decode(0u, m.shift, c)) };
+                const std::uintptr_t based{ as_uptr(narrow_decode(m.base, m.shift, c)) };
+                if (based != static_cast<std::uintptr_t>(m.base) + zero_based)
+                {
+                    additivity_ok = false;
+                }
+                ++add_cases;
+            }
+        }
+        check("oop_decode_base_is_additive_all_modes", additivity_ok);
+        check("oop_decode_additivity_sweep_is_dense", add_cases >= 1000);
+    }
+
+    // =====================================================================
+    // V. INJECTIVITY -- within one (base, shift) mode, two DISTINCT narrow oops
+    //    decode to two DISTINCT pointers, and a larger narrow always decodes
+    //    above a smaller one (no aliasing / no base-shift mix-up between calls).
+    //    For any 32-bit c the product (uint64(c) << shift) never overflows 64
+    //    bits while shift <= 31, so the shift-add is strictly order-preserving
+    //    and injective.  This is the pure-logic analogue of the JVM "two distinct
+    //    live objects -> two distinct narrow oops" assertion (angle B.5).  We
+    //    compare every adjacent pair in a sorted dense narrow set across modes.
+    // =====================================================================
+    {
+        std::vector<std::uint32_t> sorted{ build_dense_narrows() };
+        // Insertion-free dedup+sort via a simple selection over a copy is
+        // overkill; the dense set is already monotone-friendly when we compare
+        // by VALUE rather than by position, so test all ordered pairs (c1 < c2).
+        bool injective_ok{ true };
+        bool order_preserving_ok{ true };
+        // Use a compact ascending probe set to keep the pair loop O(n^2) small
+        // while still hitting the structurally interesting magnitudes.
+        const std::uint32_t probe[]{
+            1u, 2u, 3u, 0x10u, 0xFFu, 0x100u, 0xFFFFu, 0x1'0000u,
+            0x00FF'FFFFu, 0x4000'0000u, 0x7FFF'FFFFu, 0x8000'0000u, 0xFFFF'FFFFu,
+        };
+        for (const oop_mode m : kModes)
+        {
+            for (std::size_t i{ 0 }; i < std::size(probe); ++i)
+            {
+                for (std::size_t j{ i + 1u }; j < std::size(probe); ++j)
+                {
+                    const std::uintptr_t a{ as_uptr(narrow_decode(m.base, m.shift, probe[i])) };
+                    const std::uintptr_t b{ as_uptr(narrow_decode(m.base, m.shift, probe[j])) };
+                    if (a == b) { injective_ok = false; }
+                    if (!(a < b)) { order_preserving_ok = false; }  // probe[i] < probe[j]
+                }
+            }
+        }
+        check("oop_decode_distinct_narrows_give_distinct_ptrs_all_modes", injective_ok);
+        check("oop_decode_larger_narrow_decodes_higher_all_modes", order_preserving_ok);
+    }
+
+    // =====================================================================
+    // W. TRUNCATION MATRIX (flaw #2, characterisation) -- the final
+    //    static_cast<uint32_t> in narrow_encode (vmhook.hpp:5484) SILENTLY drops
+    //    bits above bit 31 of `(addr - base) >> shift`.  Section L3 pins one
+    //    shift-0 case; here we pin the EXACT truncated value across shifts 0 and 3
+    //    for offsets that are representable in 33-35 bits, proving the high bit is
+    //    dropped (current buggy behaviour) so a future upper-bound guard is caught.
+    //      shift 0: offset 0x1'0000'0001 (33-bit) >> 0 -> uint32 == 0x0000'0001.
+    //      shift 0: offset 0x1'ABCD'1234 (33-bit) >> 0 -> uint32 == 0xABCD'1234.
+    //      shift 3: offset 0x8'0000'0000 (36-bit) >> 3 == 0x1'0000'0000 (33-bit)
+    //               -> uint32 == 0x0000'0000  (a non-zero offset encodes to NULL!).
+    //      shift 3: offset 0x8'0000'0008      >> 3 == 0x1'0000'0001 -> uint32 == 1.
+    //    All from base 0 so (addr - base) == addr; every expectation recomputed
+    //    from the documented formula.
+    // =====================================================================
+    {
+        check("oop_encode_trunc_shift0_33bit_drops_bit32",
+              narrow_encode(0u, 0u, std::uint64_t{ 0x1'0000'0001ull }) == 0x0000'0001u);
+        check("oop_encode_trunc_shift0_33bit_keeps_low32",
+              narrow_encode(0u, 0u, std::uint64_t{ 0x1'ABCD'1234ull }) == 0xABCD'1234u);
+        // The most dangerous case: a NON-ZERO offset whose >>shift result has only
+        // bit 32 set truncates to 0 -- i.e. encodes a real address as the NULL oop.
+        check("oop_encode_trunc_shift3_nonzero_offset_becomes_null",
+              narrow_encode(0u, 3u, std::uint64_t{ 0x8'0000'0000ull }) == 0u);
+        check("oop_encode_trunc_shift3_36bit_keeps_low32",
+              narrow_encode(0u, 3u, std::uint64_t{ 0x8'0000'0008ull }) == 0x0000'0001u);
+        // The truncated narrow does NOT round-trip back to the over-range addr.
+        check("oop_encode_trunc_shift3_roundtrip_is_broken",
+              as_uptr(narrow_decode(0u, 3u,
+                                    narrow_encode(0u, 3u, std::uint64_t{ 0x8'0000'0000ull })))
+                  != 0x8'0000'0000ull);
+
+        // The first offset whose >>shift result is exactly 2^32 (one past the
+        // narrow ceiling) at each shift, pinned as the precise truncation edge.
+        // shift 0: 2^32 -> uint32 0.   shift 3: (2^32 << 3) == 2^35 -> >>3 == 2^32
+        // -> uint32 0.   These are the smallest offsets that alias to the null oop.
+        check("oop_encode_first_over_ceiling_shift0_is_zero",
+              narrow_encode(0u, 0u, std::uint64_t{ 1ull } << 32) == 0u);
+        check("oop_encode_first_over_ceiling_shift3_is_zero",
+              narrow_encode(0u, 3u, (std::uint64_t{ 1ull } << 32) << 3) == 0u);
+        // One LESS than the ceiling offset at shift 0 still fits and is exact.
+        check("oop_encode_just_below_ceiling_shift0_exact",
+              narrow_encode(0u, 0u, std::uint64_t{ 0xFFFF'FFFFull }) == 0xFFFF'FFFFu);
+    }
+
+    // =====================================================================
+    // X. SINGLE-BIT ENCODE ROUND-TRIP across every narrow bit position 0..31 at
+    //    the two real HotSpot shifts (0 and 3) and both base regimes (0 / non-0).
+    //    For a single set bit `1<<bit`, decode is base + (1<<(bit+shift)) and
+    //    encode recovers exactly `1<<bit` (a 32-bit value that never overflows the
+    //    uint32 narrow), so the round-trip is exact for EVERY bit position.  This
+    //    sweeps the encode side per-bit (sections H/O sweep curated sets), giving
+    //    a clean "no bit is lost or aliased" proof on the actual HotSpot shifts.
+    // =====================================================================
+    {
+        const std::uint32_t shifts[]{ 0u, 3u };
+        const std::uint64_t bases[]{ 0u, std::uint64_t{ 0x8'0000'0000ull } };
+        bool single_bit_rt_ok{ true };
+        std::size_t bit_cases{ 0 };
+        for (const std::uint64_t base : bases)
+        {
+            for (const std::uint32_t sh : shifts)
+            {
+                for (unsigned bit{ 0u }; bit < 32u; ++bit)
+                {
+                    const std::uint32_t c{ static_cast<std::uint32_t>(1u) << bit };
+                    void* const decoded{ narrow_decode(base, sh, c) };
+                    const std::uint32_t re{ narrow_encode(
+                        base, sh, static_cast<std::uint64_t>(as_uptr(decoded))) };
+                    if (re != c) { single_bit_rt_ok = false; }
+                    ++bit_cases;
+                }
+            }
+        }
+        check("oop_single_bit_encode_roundtrip_real_shifts_both_bases", single_bit_rt_ok);
+        check("oop_single_bit_roundtrip_is_dense", bit_cases >= 100);
+    }
+
+    // =====================================================================
+    // Y. resolve_struct_entry -- DEEPER walker semantics for the OOP candidate
+    //    arrays (additive to section P, which pins the three OOP tiers resolve to
+    //    nullptr off-JVM).  Off-JVM iterate_struct_entries returns nullptr for
+    //    every (type, field), so resolve_struct_entry (vmhook.hpp:5431) walks the
+    //    WHOLE array and returns nullptr regardless of order, length, or content.
+    //    We pin: order-independence (a reordered OOP array still misses), a mixed
+    //    bogus+real array misses, an array padded with the klass tiers misses, and
+    //    a long (>3) array misses -- so the loop's `index < count` bound is honoured
+    //    for counts both below and above the real 3-tier length.
+    // =====================================================================
+    {
+        using vmhook::hotspot::resolve_struct_entry;
+        using vmhook::hotspot::struct_entry_candidate_t;
+
+        // The three OOP tiers, REORDERED (25+ first, then 8-16, then 17-24).
+        static constexpr struct_entry_candidate_t reordered_oop[]{
+            { "CompressedOops", "_base" },              // JDK 25+
+            { "Universe", "_narrow_oop._base" },        // JDK 8-16
+            { "CompressedOops", "_narrow_oop._base" },  // JDK 17-24
+        };
+        check("resolve_oop_reordered_tiers_no_jvm_is_null",
+              resolve_struct_entry(reordered_oop, std::size(reordered_oop)) == nullptr);
+
+        // Bogus entries interleaved with the real OOP names -- still misses off-JVM.
+        static constexpr struct_entry_candidate_t mixed[]{
+            { "ZZZ_NoType", "_z" },
+            { "CompressedOops", "_narrow_oop._base" },
+            { "QQQ_NoType", "_q" },
+            { "CompressedOops", "_base" },
+        };
+        check("resolve_oop_mixed_bogus_and_real_no_jvm_is_null",
+              resolve_struct_entry(mixed, std::size(mixed)) == nullptr);
+
+        // OOP tiers FOLLOWED by the klass tiers (a 6-long array): the loop must
+        // honour count==6 and still miss; pins the `index < count` upper bound
+        // beyond the real 3-tier length.
+        static constexpr struct_entry_candidate_t oop_then_klass[]{
+            { "CompressedOops", "_narrow_oop._base" },
+            { "CompressedOops", "_base" },
+            { "Universe", "_narrow_oop._base" },
+            { "CompressedKlassPointers", "_narrow_klass._base" },
+            { "CompressedKlassPointers", "_base" },
+            { "Universe", "_narrow_klass._base" },
+        };
+        check("resolve_oop_then_klass_6tiers_no_jvm_is_null",
+              resolve_struct_entry(oop_then_klass, std::size(oop_then_klass)) == nullptr);
+        // Every growing prefix of the 6-array also misses (loop bound honoured at
+        // each count 1..6, including the boundary counts 3 and 6).
+        bool all_prefixes_null{ true };
+        for (std::size_t take{ 1 }; take <= std::size(oop_then_klass); ++take)
+        {
+            if (resolve_struct_entry(oop_then_klass, take) != nullptr)
+            {
+                all_prefixes_null = false;
+            }
+        }
+        check("resolve_oop_then_klass_all_prefixes_null", all_prefixes_null);
+        // count one PAST the real array length is never reached because every
+        // in-range candidate misses anyway; the count==3 boundary (exactly the
+        // real OOP tier count) is pinned explicitly.
+        check("resolve_oop_exact_3tier_count_is_null",
+              resolve_struct_entry(reordered_oop, 3u) == nullptr);
+    }
+
+    // =====================================================================
+    // Z. KLASS-CODEC PARITY (angle D) -- decode_klass_pointer / encode_klass_pointer
+    //    share the EXACT structure of the OOP codec (null guard, triple-tier
+    //    resolve, below-base guard, delegate to narrow_decode/narrow_encode;
+    //    vmhook.hpp:5598-5691) but read CompressedKlassPointers, not CompressedOops.
+    //    Their no-JVM contract is therefore identical and fully determinable here.
+    //    Pinning it in this file catches copy-paste DRIFT between the two codecs
+    //    (e.g. a future edit that breaks the klass null guard or its delegation).
+    //    The klass codec's OWN dedicated file owns the deep arithmetic; here we
+    //    pin only the shared null/no-resolve contract + signatures, namespaced as
+    //    a cross-check of the OOP codec's sibling.
+    // =====================================================================
+    {
+        using vmhook::hotspot::decode_klass_pointer;
+        using vmhook::hotspot::encode_klass_pointer;
+
+        // Signature / noexcept / return-type pins, mirroring the OOP pins in 0.
+        static_assert(std::is_same_v<decltype(decode_klass_pointer(0u)), void*>,
+                      "decode_klass_pointer must return void*");
+        static_assert(std::is_same_v<decltype(encode_klass_pointer(nullptr)), std::uint32_t>,
+                      "encode_klass_pointer must return std::uint32_t");
+        static_assert(noexcept(decode_klass_pointer(0u)),
+                      "decode_klass_pointer must be noexcept");
+        static_assert(noexcept(encode_klass_pointer(nullptr)),
+                      "encode_klass_pointer must be noexcept");
+        check("klass_codec_signature_static_asserts_compiled", true);
+
+        // Null contract (klass null guard vmhook.hpp:5601 / 5654), identical to OOP.
+        check("decode_klass_zero_is_null", decode_klass_pointer(0u) == nullptr);
+        check("encode_klass_null_is_zero", encode_klass_pointer(nullptr) == 0u);
+        check("klass_roundtrip_decode_then_encode_null",
+              encode_klass_pointer(decode_klass_pointer(0u)) == 0u);
+        check("klass_roundtrip_encode_then_decode_null",
+              decode_klass_pointer(encode_klass_pointer(nullptr)) == nullptr);
+
+        // No-JVM fall-through: non-zero narrow decodes to nullptr, non-null ptr
+        // encodes to 0, both WITHOUT crashing (no-resolve guards 5626 / 5676), over
+        // a dense narrow set.  Same degrade-gracefully promise as the OOP codec.
+        bool klass_decode_all_null{ true };
+        for (const std::uint32_t c : build_dense_narrows())
+        {
+            if (c == 0u) { continue; }
+            if (decode_klass_pointer(c) != nullptr) { klass_decode_all_null = false; }
+        }
+        check("decode_klass_all_nonzero_no_jvm_are_null", klass_decode_all_null);
+        check("decode_klass_one_no_jvm_is_null", decode_klass_pointer(1u) == nullptr);
+        check("decode_klass_max_no_jvm_is_null", decode_klass_pointer(0xFFFF'FFFFu) == nullptr);
+        {
+            int stack_anchor{ 0 };
+            check("encode_klass_nonnull_no_jvm_is_zero",
+                  encode_klass_pointer(&stack_anchor) == 0u);
+        }
+        check("encode_klass_subbase_sentinel_no_jvm_is_zero",
+              encode_klass_pointer(reinterpret_cast<void*>(std::uintptr_t{ 1u })) == 0u);
+
+        // The klass codec's candidate TYPE is CompressedKlassPointers (the class
+        // space), NEVER CompressedOops (the heap) -- pins they read DIFFERENT
+        // VMStruct rows on a live JVM, so an OOP-codec edit cannot accidentally
+        // steer the klass codec at the heap base/shift (the copy-paste-drift risk).
+        using vmhook::hotspot::resolve_struct_entry;
+        using vmhook::hotspot::struct_entry_candidate_t;
+        static constexpr struct_entry_candidate_t klass_base_candidates[]{
+            { "CompressedKlassPointers", "_narrow_klass._base" },  // JDK 17-24
+            { "CompressedKlassPointers", "_base" },                // JDK 25+
+            { "Universe", "_narrow_klass._base" },                 // JDK 8-16
+        };
+        static constexpr struct_entry_candidate_t klass_shift_candidates[]{
+            { "CompressedKlassPointers", "_narrow_klass._shift" },
+            { "CompressedKlassPointers", "_shift" },
+            { "Universe", "_narrow_klass._shift" },
+        };
+        check("resolve_klass_base_candidates_no_jvm_is_null",
+              resolve_struct_entry(klass_base_candidates,
+                                   std::size(klass_base_candidates)) == nullptr);
+        check("resolve_klass_shift_candidates_no_jvm_is_null",
+              resolve_struct_entry(klass_shift_candidates,
+                                   std::size(klass_shift_candidates)) == nullptr);
+        check("klass_candidates_target_compressed_klass_pointers",
+              std::strcmp(klass_base_candidates[0].type_name,
+                          "CompressedKlassPointers") == 0
+                  && std::strcmp(klass_shift_candidates[0].type_name,
+                                 "CompressedKlassPointers") == 0);
+        // The klass type name is DISTINCT from the OOP type name -- the drift guard.
+        check("klass_type_differs_from_oop_type",
+              std::strcmp(klass_base_candidates[0].type_name, "CompressedOops") != 0);
+    }
+
+    // =====================================================================
+    // Z2. DENSE FULL-BIT ENCODE ROUND-TRIP at the two real HotSpot shifts over the
+    //    COMPLETE dense narrow sweep (build_dense_narrows: 0, small run, every
+    //    power-of-two +/-1, 32-bit extremes) and both base regimes.  Section H
+    //    already does encode(decode(c))==c across kModes; this re-pins it isolated
+    //    to shifts {0,3} (what HotSpot actually programs) with an explicit per-c
+    //    mismatch capture so a regression reports the offending narrow value.
+    // =====================================================================
+    {
+        const std::vector<std::uint32_t> narrows{ build_dense_narrows() };
+        const std::uint32_t shifts[]{ 0u, 3u };
+        const std::uint64_t bases[]{ 0u, std::uint64_t{ 0x8'0000'0000ull } };
+        bool rt_ok{ true };
+        std::uint32_t worst_c{ 0 };
+        std::size_t rt_cases{ 0 };
+        for (const std::uint64_t base : bases)
+        {
+            for (const std::uint32_t sh : shifts)
+            {
+                for (const std::uint32_t c : narrows)
+                {
+                    void* const decoded{ narrow_decode(base, sh, c) };
+                    const std::uint32_t re{ narrow_encode(
+                        base, sh, static_cast<std::uint64_t>(as_uptr(decoded))) };
+                    if (re != c) { rt_ok = false; worst_c = c; }
+                    ++rt_cases;
+                }
+            }
+        }
+        check("oop_full_bit_encode_roundtrip_real_shifts_both_bases", rt_ok);
+        check("oop_full_bit_roundtrip_is_dense", rt_cases >= 400);
+        check("oop_full_bit_roundtrip_no_mismatch_recorded", worst_c == 0u);
+    }
+
+    // =====================================================================
     // S. [INFO] Genuinely JVM-only OOP surface this no-JVM file CANNOT cover.
     //    Recorded explicitly so the report and the next maintainer know the
     //    boundary of what is proven here vs. what the JVM module must own.

@@ -2039,5 +2039,308 @@ int main()
               utf8_to_utf16(std::string_view{ "A\xF0\x9F\x98\x80" }).size() == 3);
     }
 
+    // =====================================================================
+    // SECTION T — jni_signature_for_arg GENERIC INTEGRAL LADDER (the library
+    // FIX for the brief's flaws #2/#3).  The descriptor builder no longer has
+    // only explicit fixed-width intN_t branches + a hard static_assert else;
+    // it now classifies ANY integral by sizeof after two special cases:
+    //   bool                       -> "Z"  (claimed first, before sizeof==1)
+    //   char16_t / std::uint16_t   -> "C"  (claimed before the sizeof==2 arm)
+    //   integral && sizeof==1      -> "B"
+    //   integral && sizeof==2      -> "S"
+    //   integral && sizeof==4      -> "I"
+    //   integral && sizeof==8      -> "J"
+    // (vmhook.hpp:12962-13002).  So plain char / signed char / unsigned char /
+    // char8_t -> "B"; wchar_t -> "S" or "I" (platform sizeof); char32_t -> "I";
+    // long / unsigned long / size_t / ptrdiff_t -> "J" or "I" (LP64 vs LLP64);
+    // long long / intmax_t / uintmax_t -> "J".  Section E pinned only the
+    // fixed-width spellings; these spellings had ZERO signature coverage.  All
+    // sizeof-dependent expectations are branched at compile time so the
+    // assertion is exact on every CI target.
+    // =====================================================================
+    {
+        // char-family of width 1 -> "B" (NOT special-cased; plain char's
+        // sign-ness is irrelevant to the descriptor, only its sizeof matters).
+        check("T_sig_char_B",        sig<char>() == "B");
+        check("T_sig_signed_char_B", sig<signed char>() == "B");
+        check("T_sig_unsigned_char_B", sig<unsigned char>() == "B");
+        check("T_sig_char8_B",       sig<char8_t>() == "B");
+
+        // char16_t -> "C" (special-cased before the generic sizeof==2 arm,
+        // exactly like std::uint16_t which Section E pinned).
+        check("T_sig_char16_C", sig<char16_t>() == "C");
+
+        // char32_t -> "I" (sizeof 4, integral, not a 16-bit char) — a UTF-32
+        // code unit is described as Java int, never jchar.
+        check("T_sig_char32_I", sig<char32_t>() == "I");
+
+        // wchar_t: sizeof varies (2 on Windows/MSVC-ABI -> "S"; 4 on most Unix
+        // -> "I").  It is integral and is NOT char16_t/uint16_t, so it falls to
+        // the generic ladder, NOT the "C" special case.
+        if constexpr (sizeof(wchar_t) == 2)
+        {
+            check("T_sig_wchar_S", sig<wchar_t>() == "S");
+        }
+        else
+        {
+            check("T_sig_wchar_I", sig<wchar_t>() == "I");
+        }
+
+        // 8-byte-or-platform integrals: long / unsigned long / size_t /
+        // ptrdiff_t describe by sizeof (LP64 Unix -> "J"; LLP64 Windows `long`
+        // is 4 bytes -> "I").  The brief's flaw #2 (these failing to compile)
+        // is resolved by the generic ladder; pin the descriptor either way.
+        if constexpr (sizeof(long) == 8)
+        {
+            check("T_sig_long_J",  sig<long>() == "J");
+            check("T_sig_ulong_J", sig<unsigned long>() == "J");
+        }
+        else
+        {
+            check("T_sig_long_I",  sig<long>() == "I");
+            check("T_sig_ulong_I", sig<unsigned long>() == "I");
+        }
+        if constexpr (sizeof(std::size_t) == 8)
+        {
+            check("T_sig_size_t_J", sig<std::size_t>() == "J");
+        }
+        else
+        {
+            check("T_sig_size_t_I", sig<std::size_t>() == "I");
+        }
+        if constexpr (sizeof(std::ptrdiff_t) == 8)
+        {
+            check("T_sig_ptrdiff_J", sig<std::ptrdiff_t>() == "J");
+        }
+        else
+        {
+            check("T_sig_ptrdiff_I", sig<std::ptrdiff_t>() == "I");
+        }
+
+        // long long / unsigned long long are 8 bytes on every CI target -> "J".
+        check("T_sig_longlong_J",  sig<long long>() == "J");
+        check("T_sig_ulonglong_J", sig<unsigned long long>() == "J");
+        // intmax_t / uintmax_t are 8 bytes on every CI target -> "J".
+        check("T_sig_intmax_J",  sig<std::intmax_t>() == "J");
+        check("T_sig_uintmax_J", sig<std::uintmax_t>() == "J");
+
+        // Re-pin the ORDER-DEPENDENT special cases against their generic-width
+        // neighbours, so a future reorder that dropped bool/uint16's priority
+        // would surface: bool (sizeof 1) is "Z" NOT "B"; uint16 is "C" NOT "S".
+        check("T_sig_bool_is_Z_not_B", sig<bool>() == "Z" && sig<bool>() != "B");
+        check("T_sig_uint16_is_C_not_S", sig<std::uint16_t>() == "C" && sig<std::uint16_t>() != "S");
+        // int16_t (sizeof 2, NOT uint16/char16) takes the generic "S" arm.
+        check("T_sig_int16_is_S", sig<std::int16_t>() == "S");
+
+        // cv/ref-qualified spellings of the new types decay to the same letter.
+        check("T_sig_decays_const_char_ref", sig<const char&>() == "B");
+        check("T_sig_decays_char32_rref",    sig<char32_t&&>() == "I");
+        check("T_sig_decays_const_longlong", sig<const long long&>() == "J");
+    }
+
+    // =====================================================================
+    // SECTION U — PAIRED signature/packer consistency for the char-family and
+    // platform-width integrals (the Section E pairing, extended to the types
+    // Section T newly describes).  For each: the descriptor letter (Section T)
+    // and the union member the packer writes (Section C / D) must agree about
+    // the Java width, and on little-endian the narrow union member reads back
+    // the truncated value the JVM would take from the slot via the descriptor.
+    // =====================================================================
+    {
+        vmhook::detail::jni_value v{};
+        void* storage{ nullptr };
+
+        // char -> "B" descriptor, packed into .i; .b low byte aliases the value
+        // (char's sign-ness is implementation-defined, so compare via the same
+        // static_cast<int32_t> the packer applies, and read .b for the byte).
+        {
+            const char src{ static_cast<char>('\x80') };
+            pack_one(src, v, storage);
+            check("U_char_packs_i_sig_B",
+                  sig<char>() == "B" && v.i == static_cast<std::int32_t>(src)
+                  && v.b == static_cast<std::int8_t>(src));
+        }
+
+        // char8_t -> "B" descriptor, packed into .i, zero-extended (unsigned);
+        // .b low byte holds the raw bit pattern.
+        {
+            const char8_t src{ char8_t{ 0xFF } };
+            pack_one(src, v, storage);
+            check("U_char8_packs_i_sig_B",
+                  sig<char8_t>() == "B" && v.i == 0xFF
+                  && v.b == static_cast<std::int8_t>(0xFF));
+        }
+
+        // char16_t -> "C" descriptor, packed into .i, zero-extended; .c (jchar
+        // member, also uint16) reads back the same code unit.
+        {
+            const char16_t src{ char16_t{ 0xABCD } };
+            pack_one(src, v, storage);
+            check("U_char16_packs_i_sig_C",
+                  sig<char16_t>() == "C" && v.i == 0xABCD
+                  && v.c == std::uint16_t{ 0xABCD });
+        }
+
+        // char32_t -> "I" descriptor, packed into .i verbatim (a >BMP value
+        // keeps its high bits — never masked to 16, never a surrogate here).
+        {
+            const char32_t src{ char32_t{ 0x1F600 } };
+            pack_one(src, v, storage);
+            check("U_char32_packs_i_sig_I",
+                  sig<char32_t>() == "I" && v.i == 0x1F600);
+        }
+
+        // long long -> "J" descriptor, packed into .j at full width.
+        {
+            const long long src{ static_cast<long long>(0x0123456789ABCDEFLL) };
+            pack_one(src, v, storage);
+            check("U_longlong_packs_j_sig_J",
+                  sig<long long>() == "J" && v.j == static_cast<std::int64_t>(src));
+        }
+
+        // wchar_t: the descriptor width (S/I) must match the member the packer
+        // used (.i for sizeof<=4 — always true for wchar_t).  L'Z' == 0x5A.
+        {
+            const wchar_t src{ L'Z' };
+            pack_one(src, v, storage);
+            check("U_wchar_packs_i", v.i == static_cast<std::int32_t>(src));
+            if constexpr (sizeof(wchar_t) == 2)
+            {
+                check("U_wchar_sig_S_matches_packed_i",
+                      sig<wchar_t>() == "S" && v.s == static_cast<std::int16_t>(src));
+            }
+            else
+            {
+                check("U_wchar_sig_I_matches_packed_i", sig<wchar_t>() == "I");
+            }
+        }
+
+        // long / size_t: the descriptor and the packed member agree about
+        // whether the value is 8-byte (.j / "J") or 4-byte (.i / "I").
+        {
+            const long src{ -123456789L };
+            pack_one(src, v, storage);
+            if constexpr (sizeof(long) == 8)
+            {
+                check("U_long_sig_J_packs_j",
+                      sig<long>() == "J" && v.j == static_cast<std::int64_t>(src));
+            }
+            else
+            {
+                check("U_long_sig_I_packs_i",
+                      sig<long>() == "I" && v.i == static_cast<std::int32_t>(src));
+            }
+        }
+    }
+
+    // =====================================================================
+    // SECTION V — utf8_to_utf16 CHARACTERIZATION of inputs the decoder accepts
+    // WITHOUT validation (overlong forms, surrogate-range scalars from 3-byte
+    // sequences, and the invalid lead bytes 0xC0/0xC1/0xF5..0xFF).  These pin
+    // the decoder's EXACT behaviour as derived from its body (vmhook.hpp:12762):
+    // it matches purely on the high-bit pattern + a following-byte length guard,
+    // then arithmetically combines the payload bits — it does NOT reject
+    // overlong encodings, surrogate code points, or scalars > U+10FFFF.  Every
+    // expected unit list is hand-derived from the masking/shift arithmetic.
+    // =====================================================================
+    {
+        using vmhook::detail::utf8_to_utf16;
+
+        // ---- OVERLONG 2-byte forms are decoded, not rejected --------------
+        // 0xC0 0x80 : (0x00<<6)|0x00 = 0x0000 -> single unit U+0000 (an overlong
+        // NUL — the modified-UTF-8 NUL encoding — decodes to a real 0 code unit).
+        check("V_overlong_C080_is_nul",
+              units_eq(utf8_to_utf16(std::string_view{ "\xC0\x80", 2 }), { 0x0000 }));
+        // 0xC1 0xBF : (0x01<<6)|0x3F = 0x7F -> overlong ASCII DEL, single unit.
+        check("V_overlong_C1BF_is_7F",
+              units_eq(utf8_to_utf16(std::string_view{ "\xC1\xBF" }), { 0x7F }));
+        // 0xC0 0xBF : (0x00<<6)|0x3F = 0x3F -> '?' as a single unit.
+        check("V_overlong_C0BF_is_3F",
+              units_eq(utf8_to_utf16(std::string_view{ "\xC0\xBF" }), { 0x3F }));
+
+        // ---- SURROGATE-range scalars from a 3-byte sequence are passed
+        // through as a single (ill-formed) UTF-16 unit, NOT split or replaced.
+        // 0xED 0xA0 0x80 : (0x0D<<12)|(0x20<<6)|0x00 = 0xD800 (lead surrogate).
+        check("V_3byte_EDA080_is_D800_unit",
+              units_eq(utf8_to_utf16(std::string_view{ "\xED\xA0\x80" }), { 0xD800 }));
+        // 0xED 0xBF 0xBF : (0x0D<<12)|(0x3F<<6)|0x3F = 0xDFFF (trail surrogate).
+        check("V_3byte_EDBFBF_is_DFFF_unit",
+              units_eq(utf8_to_utf16(std::string_view{ "\xED\xBF\xBF" }), { 0xDFFF }));
+        // It stays a SINGLE unit (cp < 0x10000 -> the no-surrogate-split arm).
+        check("V_surrogate_scalar_is_single_unit",
+              utf8_to_utf16(std::string_view{ "\xED\xA0\x80" }).size() == 1);
+
+        // ---- INVALID lead bytes that match no length pattern -> U+FFFD ------
+        // 0xC0/0xC1 with a NON-continuation follower still take the 2-byte arm
+        // (the decoder checks only the 0xE0-mask + a following byte EXISTS, not
+        // that it is a 0x80-0xBF continuation): 0xC0 0x41 -> (0)|(0x41&0x3F)=1.
+        check("V_C0_then_A_low6_masked",
+              units_eq(utf8_to_utf16(std::string_view{ "\xC0\x41" }), { 0x01 }));
+        // 0xF5..0xFF: 0xF5 has (0xF5 & 0xF8) == 0xF0, so with 3 trailing bytes it
+        // IS taken as a 4-byte lead -> (0x05<<18)|... .  0xF5 0x80 0x80 0x80 =
+        // (0x05<<18) = 0x140000, which is >= 0x10000 -> surrogate-pair split:
+        // cp-0x10000 = 0x130000; high = 0xD800 + (0x130000>>10)=0xD800+0x4C0 =
+        // 0xDCC0 ; low = 0xDC00 + (0x130000 & 0x3FF)=0xDC00.  Pins that the
+        // decoder does NOT clamp scalars above U+10FFFF.
+        check("V_F5_4byte_overmax_surrogate_pair",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF5\x80\x80\x80" }),
+                       { 0xDCC0, 0xDC00 }));
+        // 0xFF matches none of the masks (0xFF & 0xE0 == 0xE0 but 0xFF & 0xF0 ==
+        // 0xF0 and 0xFF & 0xF8 == 0xF8 != 0xF0; the 2-byte mask 0xFF & 0xE0 !=
+        // 0xC0) -> stays U+FFFD, advance 1.  (Already pinned in Section R for a
+        // lone 0xFF; here confirm it desyncs nothing: 0xFF then 'A'.)
+        check("V_FF_then_ascii_recovers",
+              units_eq(utf8_to_utf16(std::string_view{ "\xFF\x41" }), { 0xFFFD, 0x41 }));
+
+        // ---- a 3-byte lead whose third byte is MISSING at end-of-buffer:
+        // the (i+2)<size guard fails, so the lead falls through to U+FFFD and
+        // advances ONE byte; the surviving middle byte 0xA0 is then a lone
+        // continuation -> another U+FFFD.  (Distinct from Section R's E4 B8
+        // which used different continuation bytes; same structural outcome.)
+        check("V_3byte_missing_third_two_fffd",
+              units_eq(utf8_to_utf16(std::string_view{ "\xE0\xA0", 2 }), { 0xFFFD, 0xFFFD }));
+
+        // ---- BMP boundary just below astral: U+FFFF is a single unit, U+10000
+        // is the first that splits.  Pin the < / >= 0x10000 branch edge.
+        check("V_bmp_max_FFFF_single_unit",
+              utf8_to_utf16(std::string_view{ "\xEF\xBF\xBF" }).size() == 1);
+        check("V_astral_min_10000_two_units",
+              utf8_to_utf16(std::string_view{ "\xF0\x90\x80\x80" }).size() == 2);
+
+        // ---- reserve()/size relationship: an all-ASCII buffer of N bytes
+        // decodes to exactly N units (each byte one unit), so the count the
+        // packer hands NewString equals the byte length for ASCII.
+        check("V_ascii_count_equals_byte_count",
+              utf8_to_utf16(std::string_view{ "0123456789" }).size() == 10);
+    }
+
+    // =====================================================================
+    // SECTION W — extra compile-time acceptance for the char-family spellings
+    // exercised at runtime in Sections T/U but not asserted in Section O, plus
+    // a redundant cross-check that the descriptor builder accepts every type
+    // jni_arg_accepted_v reports as accepted (the two ladders share a domain).
+    // Pure static_asserts (zero runtime cost) + one visible PASS.
+    // =====================================================================
+    {
+        // char8_t / cv-qualified char spellings are accepted (integral arms).
+        static_assert(jni_arg_accepted_v<char8_t>, "char8_t accepted (integral, sizeof 1).");
+        static_assert(jni_arg_accepted_v<const char>, "const char decays -> accepted.");
+        static_assert(jni_arg_accepted_v<char16_t&>, "char16_t& decays -> accepted.");
+        static_assert(jni_arg_accepted_v<const char32_t&&>, "const char32_t&& decays -> accepted.");
+        static_assert(jni_arg_accepted_v<unsigned long>, "unsigned long accepted (integral).");
+        static_assert(jni_arg_accepted_v<long>, "long accepted (integral).");
+
+        // Negative: long double is the canonical NEITHER-float-nor-double type
+        // the descriptor builder's terminal static_assert rejects; the predicate
+        // must agree (already in O — re-affirm here next to its positive peers).
+        static_assert(!jni_arg_accepted_v<long double>, "long double rejected (not float/double).");
+        // char8_t* is a pointer, not one of the four string spellings -> reject.
+        static_assert(!jni_arg_accepted_v<char8_t*>, "char8_t* rejected (not const char*/char*).");
+        // const char32_t* (pointer-to-char32) is NOT a string spelling -> reject.
+        static_assert(!jni_arg_accepted_v<const char32_t*>, "const char32_t* rejected.");
+
+        check("W_compile_time_char_family_acceptance_holds", true);
+    }
+
     return failures == 0 ? 0 : 1;
 }

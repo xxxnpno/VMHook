@@ -1751,5 +1751,150 @@ int main()
         check("seq_three_5byte_values_then_end_marker", end == ~0u && pos == pos_before_end);
     }
 
+    // #####################################################################
+    // ##  EXHAUSTIVE WAVE 5 - input classes not yet pinned by waves 2-4:  ##
+    // ##   (X) End(0) at every position behind a NON-uniform continuation ##
+    // ##       prefix (prior End sweeps used only all-192 prefixes), and   ##
+    // ##       the explicit proof that the rewound cursor discards ALL     ##
+    // ##       accumulated `sum` regardless of the prefix digits.          ##
+    // ##   (Y) The full 2-D cross product of the position-0 continuation   ##
+    // ##       byte (192..255) AND the position-1 terminating low byte     ##
+    // ##       (1..191): 64*191 == 12224 distinct 2-byte sequences, each   ##
+    // ##       value == (b0-1) + (b1-1)*64, pos == 2.  Prior sweeps fixed   ##
+    // ##       b0==192 (section G) or swept b0 only with the minimal low    ##
+    // ##       follow byte (section Q); neither covered the joint space.    ##
+    // ##   (Z) "No over-read past the terminator": a complete low-          ##
+    // ##       terminated value of every length 1..5 followed immediately   ##
+    // ##       by an End(0) decodes to the same value with the 0 LEFT       ##
+    // ##       unconsumed (pos == len), proving the decoder stops at the    ##
+    // ##       low byte and never peeks the trailing sentinel.              ##
+    // ##  All expected values are hand-derived from the decode_u5 loop      ##
+    // ##  body (sum += (byte-1) << (6*pos); byte 0 at any position rewinds  ##
+    // ##  and returns ~0u; byte < 192 terminates; <= 5 bytes read) and use  ##
+    // ##  the decoder's own uint32 shift arithmetic.  All deterministic.    ##
+    // #####################################################################
+
+    // =====================================================================
+    // (X) END(0) BEHIND A NON-UNIFORM CONTINUATION PREFIX.  Section (E)
+    //     proved End(0) after N copies of 192 returns ~0u with pos == N.
+    //     Here the N leading continuation bytes are DISTINCT high bytes
+    //     (193,200,...,255) so the partial `sum` accumulated before the 0
+    //     differs from the all-192 case - yet the result is still exactly
+    //     ~0u and the cursor still parks at the 0 (index N).  This pins that
+    //     the End rewind discards whatever `sum` was accumulated, for every
+    //     prefix length N = 0..4.
+    // =====================================================================
+    {
+        // Distinct continuation bytes (all >= 192) used to build the prefix.
+        const std::uint8_t prefix_bytes[]{ 193u, 200u, 250u, 255u };
+        bool ok{ true };
+        int  first_bad{ -1 };
+        for (int n{ 0 }; n <= 4; ++n)
+        {
+            std::vector<std::uint8_t> bytes;
+            for (int i{ 0 }; i < n; ++i) { bytes.push_back(prefix_bytes[i]); }
+            bytes.push_back(0u);  // End marker at position n
+            int pos{ 0 };
+            const std::uint32_t v{ decode_at0(bytes, pos) };
+            if (v != ~0u || pos != n) { ok = false; if (first_bad < 0) first_bad = n; }
+        }
+        if (!ok) { std::printf("       (first failing non-uniform End prefix N = %d)\n", first_bad); }
+        check("end_marker_behind_nonuniform_continuation_prefix_returns_all_ones_and_parks", ok);
+    }
+    // Two prefixes of the SAME length but DIFFERENT digits both yield ~0u at
+    // the same cursor - the accumulated sum is provably irrelevant to End.
+    {
+        int p_a{ 0 };
+        const std::uint32_t a{ decode_at0({ 192u, 192u, 192u, 0u }, p_a) };  // sum would be 191+191*64+191*64^2
+        int p_b{ 0 };
+        const std::uint32_t b{ decode_at0({ 255u, 255u, 255u, 0u }, p_b) };  // sum would be 254+254*64+254*64^2
+        check("end_marker_independent_of_accumulated_sum_value", a == ~0u && b == ~0u);
+        check("end_marker_independent_of_accumulated_sum_cursor", p_a == 3 && p_b == 3);
+    }
+
+    // =====================================================================
+    // (Y) FULL 2-BYTE JOINT DOMAIN - every (b0 in 192..255) x (b1 in 1..191)
+    //     pair.  b0 is a continuation byte contributing (b0-1) at weight 1;
+    //     b1 is a terminating low byte contributing (b1-1) at weight 64.
+    //     decode_u5 must return exactly (b0-1) + (b1-1)*64 consuming 2 bytes,
+    //     for all 64*191 == 12224 combinations.  A trailing 200 (continuation)
+    //     is placed after the pair to confirm it is never read once b1
+    //     terminates.  This is the complete 2-byte sequence space (the only
+    //     length whose full cross product is small enough to enumerate).
+    // =====================================================================
+    {
+        bool value_ok{ true };
+        bool pos_ok{ true };
+        int  first_bad_b0{ -1 };
+        int  first_bad_b1{ -1 };
+        for (int b0{ 192 }; b0 <= 255; ++b0)
+        {
+            for (int b1{ 1 }; b1 <= 191; ++b1)
+            {
+                int pos{ 0 };
+                const std::uint32_t v{ decode_at0(
+                    { static_cast<std::uint8_t>(b0), static_cast<std::uint8_t>(b1), 200u }, pos) };
+                const std::uint32_t expected{
+                    static_cast<std::uint32_t>(b0 - 1)
+                  + (static_cast<std::uint32_t>(b1 - 1) << 6) };
+                if (v != expected) { value_ok = false; if (first_bad_b0 < 0) { first_bad_b0 = b0; first_bad_b1 = b1; } }
+                if (pos != 2)      { pos_ok = false;   if (first_bad_b0 < 0) { first_bad_b0 = b0; first_bad_b1 = b1; } }
+            }
+        }
+        if (!value_ok || !pos_ok)
+        {
+            std::printf("       (first failing 2-byte pair b0=%d b1=%d)\n", first_bad_b0, first_bad_b1);
+        }
+        check("full_2byte_joint_domain_192to255_x_1to191_decodes_exactly", value_ok);
+        check("full_2byte_joint_domain_192to255_x_1to191_consumes_two", pos_ok);
+    }
+
+    // =====================================================================
+    // (Z) NO OVER-READ PAST THE TERMINATING LOW BYTE.  For a complete value
+    //     of every canonical length 1..5, append an End(0) immediately after
+    //     the last byte.  The decoder must terminate ON the low byte (or at
+    //     the 5-byte cap) and NEVER advance onto the trailing 0, so the
+    //     decoded value equals the value alone and pos == len.  This pins the
+    //     property that decode_u5 reads exactly the bytes of one value and no
+    //     sentinel byte beyond it.  Lengths 1..4 end on a low byte; length 5
+    //     here uses a low-terminated 5-byte value (50864255) so the cap is
+    //     not what stops it - the low byte at position 4 is.
+    // =====================================================================
+    {
+        struct LenCase { const char* name; std::uint32_t value; std::size_t len; };
+        const LenCase cases[]{
+            { "len1_value_190",        190u,       1 },
+            { "len2_value_4096",       4096u,      2 },
+            { "len3_value_65535",      65535u,     3 },
+            { "len4_value_16777215",   16777215u,  4 },
+            { "len5_value_50864255",   50864255u,  5 },
+        };
+        for (const LenCase& c : cases)
+        {
+            std::vector<std::uint8_t> bytes{ u5_oracle::encode(c.value) };
+            bytes.push_back(0u);  // End sentinel immediately after the value
+            int pos{ 0 };
+            const std::uint32_t v{ decode_at0(bytes, pos) };
+            std::string lbl_v{ std::string{ "no_overread_" } + c.name + "_decodes_value" };
+            std::string lbl_p{ std::string{ "no_overread_" } + c.name + "_stops_before_sentinel" };
+            check(lbl_v.c_str(), v == c.value);
+            check(lbl_p.c_str(), static_cast<std::size_t>(pos) == c.len);
+        }
+        // The 5-byte CAP case: an all-continuation value followed by a 0 must
+        // STILL stop at exactly 5 (the cap), leaving the 0 at index 5 unread.
+        {
+            int pos{ 0 };
+            const std::uint32_t v{ decode_at0({ 192u, 192u, 192u, 192u, 192u, 0u }, pos) };
+            const std::uint32_t expected{
+                (static_cast<std::uint32_t>(191u) << 0)
+              + (static_cast<std::uint32_t>(191u) << 6)
+              + (static_cast<std::uint32_t>(191u) << 12)
+              + (static_cast<std::uint32_t>(191u) << 18)
+              + (static_cast<std::uint32_t>(191u) << 24) };
+            check("no_overread_5byte_cap_stops_at_five_value", v == expected);
+            check("no_overread_5byte_cap_leaves_trailing_zero_unread", pos == 5);
+        }
+    }
+
     return failures == 0 ? 0 : 1;
 }

@@ -1358,6 +1358,296 @@ int main()
             !captured.empty() && captured.back() == '\n');
     }
 
+    // =====================================================================
+    // DEEPENING WAVE (additive) — exhaustive bit-pattern / sign-boundary /
+    // spec-edge sweeps for detail::format_log, plus argument-forwarding and
+    // sink-byte invariants not yet covered above.  Every expected value is
+    // derived directly from the library source:
+    //   * format_log (VMHOOK_HAS_STD_FORMAT==1) == std::vformat(fmt, args)  ->
+    //     spellings here are all STANDARD-PINNED (no shortest-round-trip, no
+    //     locale, no implementation-defined NaN/hexfloat token), so they are
+    //     byte-identical on libstdc++ AND the MSVC STL.
+    //   * format_log (VMHOOK_HAS_STD_FORMAT==0) == std::string{ fmt }        ->
+    //     the verbatim fallback, asserted byte-for-byte for the same inputs.
+    // This section is namespaced by a distinct check-name prefix ("dw_") so it
+    // does not collide with any assertion above.
+    // =====================================================================
+#if VMHOOK_HAS_STD_FORMAT
+    // --- Signed-integer sign boundaries under a BASE spec. ----------------
+    // std::format renders a signed negative as '-' + magnitude-in-base (NOT
+    // printf two's-complement).  INT_MIN magnitude is 0x80000000.
+    check("dw_int_min_hex_signed_magnitude",
+        vmhook::detail::format_log("{:x}", INT_MIN) == "-80000000");
+    check("dw_int_max_hex",
+        vmhook::detail::format_log("{:x}", INT_MAX) == "7fffffff");
+    check("dw_int_min_octal_signed",
+        vmhook::detail::format_log("{:o}", INT_MIN) == "-20000000000");
+    check("dw_int_min_binary_signed",
+        vmhook::detail::format_log("{:b}", INT_MIN)
+            == "-10000000000000000000000000000000");
+    // 0x7F / 0x80 sign boundary at int8 width: 0x7F == 127, (signed char)0x80
+    // == -128, (unsigned char)0x80 == 128.
+    check("dw_int8_0x7F_is_127",
+        vmhook::detail::format_log("{}", static_cast<std::int8_t>(0x7F)) == "127");
+    check("dw_int8_0x80_is_minus_128",
+        vmhook::detail::format_log("{}", static_cast<std::int8_t>(
+            static_cast<std::int8_t>(-128))) == "-128");
+    check("dw_uint8_0x7F_is_127",
+        vmhook::detail::format_log("{}", static_cast<std::uint8_t>(0x7F)) == "127");
+    check("dw_uint8_0x80_is_128",
+        vmhook::detail::format_log("{}", static_cast<std::uint8_t>(0x80)) == "128");
+    // 0x7FFF / 0x8000 sign boundary at int16 width.
+    check("dw_int16_0x7FFF_is_32767",
+        vmhook::detail::format_log("{}", static_cast<std::int16_t>(0x7FFF)) == "32767");
+    check("dw_uint16_0x8000_is_32768",
+        vmhook::detail::format_log("{}", static_cast<std::uint16_t>(0x8000)) == "32768");
+    // 0x7FFFFFFF / 0x80000000 at uint32 width (unsigned -> no sign char).
+    check("dw_uint32_0x80000000_is_2147483648",
+        vmhook::detail::format_log("{}", static_cast<std::uint32_t>(0x80000000u))
+            == "2147483648");
+    check("dw_uint32_0x7FFFFFFF_is_2147483647",
+        vmhook::detail::format_log("{}", static_cast<std::uint32_t>(0x7FFFFFFFu))
+            == "2147483647");
+    // 0x8000000000000000 at uint64 width.
+    check("dw_uint64_high_bit_is_9223372036854775808",
+        vmhook::detail::format_log("{}",
+            static_cast<std::uint64_t>(0x8000000000000000ull))
+            == "9223372036854775808");
+    // -1 across signed widths: always "-1" by default (decimal magnitude).
+    check("dw_int8_minus1",
+        vmhook::detail::format_log("{}", static_cast<std::int8_t>(-1)) == "-1");
+    check("dw_int16_minus1",
+        vmhook::detail::format_log("{}", static_cast<std::int16_t>(-1)) == "-1");
+    check("dw_int64_minus1",
+        vmhook::detail::format_log("{}", static_cast<std::int64_t>(-1)) == "-1");
+    // -1 as an UNSIGNED width is the all-ones value (no sign).
+    check("dw_uint16_all_ones",
+        vmhook::detail::format_log("{}", static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(-1))) == "65535");
+    // +1 across widths.
+    check("dw_int_plus1",
+        vmhook::detail::format_log("{}", 1) == "1");
+
+    // --- Center / left / right alignment padding-split exactness. ---------
+    // Even padding splits evenly; ODD padding floors the LEFT side (pad 3 on a
+    // 2-char string in width 5 -> 1 left, 2 right).
+    check("dw_center_even_pad",
+        vmhook::detail::format_log("{:^6}", std::string{ "ab" }) == "  ab  ");
+    check("dw_center_odd_pad_floor_left",
+        vmhook::detail::format_log("{:^5}", std::string{ "ab" }) == " ab  ");
+    check("dw_center_pad_two",
+        vmhook::detail::format_log("{:^4}", std::string{ "ab" }) == " ab ");
+    // A large width emits exactly (width - len) fill chars.
+    check("dw_large_right_align_width",
+        vmhook::detail::format_log("{:>20}", 7)
+            == "                   7");          // 19 spaces + '7'
+    check("dw_large_left_align_width",
+        vmhook::detail::format_log("{:<20}", 7)
+            == "7                   ");          // '7' + 19 spaces
+
+    // --- Alt-form + zero-pad width COUNTING (prefix occupies columns). ----
+    // {:#010x} on 255: "0x" (2) + zero-fill + "ff" (2) == width 10 -> 6 zeros.
+    check("dw_alt_hex_zeropad_width_counts_prefix",
+        vmhook::detail::format_log("{:#010x}", 255) == "0x000000ff");
+    // {:08b} on 5: "101" zero-padded to width 8.
+    check("dw_binary_zeropad8",
+        vmhook::detail::format_log("{:08b}", 5) == "00000101");
+    // {:#06b} on 1: "0b" (2) + zero-fill + "1" -> width 6 -> 3 zeros.
+    check("dw_alt_binary_zeropad_prefix_counts",
+        vmhook::detail::format_log("{:#06b}", 1) == "0b0001");
+
+    // --- char value boundaries (glyph vs integer code). -------------------
+    // A char with value 0 formats as integer 0 under {:d}.
+    check("dw_char_nul_as_int",
+        vmhook::detail::format_log("{:d}", '\x00') == "0");
+    // The digit glyph '0' is code 48: glyph by default, 48 under {:d}.
+    check("dw_char_zero_glyph",
+        vmhook::detail::format_log("{}", '0') == "0");
+    check("dw_char_zero_as_int",
+        vmhook::detail::format_log("{:d}", '0') == "48");
+    // {:c} on code 32 yields a single space.
+    check("dw_int_as_char_space",
+        vmhook::detail::format_log("{:c}", 32) == " ");
+    // {:c} on code 126 yields '~' (last printable ASCII).
+    check("dw_int_as_char_tilde",
+        vmhook::detail::format_log("{:c}", 126) == "~");
+
+    // --- Scientific with zero precision (no half-rounding ambiguity). -----
+    check("dw_scientific_zero_precision",
+        vmhook::detail::format_log("{:.0e}", 1.0) == "1e+00");
+    check("dw_scientific_zero_precision_plus",
+        vmhook::detail::format_log("{:+.0e}", 1.0) == "+1e+00");
+    // Fixed with zero precision on an exact integer-valued double.
+    check("dw_fixed_zero_precision_exact",
+        vmhook::detail::format_log("{:.0f}", 3.0) == "3");
+
+    // --- Argument forwarding: rvalue and lvalue produce identical output. -
+    // format_log takes args_t&&...; make_format_args binds named lvalues.  An
+    // rvalue temporary and a named lvalue of the same value must format the
+    // same — guards the documented refactor hazard around the && forwarding.
+    {
+        const int lv{ 5 };
+        const std::string lv_s{ "fwd" };
+        check("dw_forward_rvalue_eq_lvalue_int",
+            vmhook::detail::format_log("{}", 5)
+                == vmhook::detail::format_log("{}", lv));
+        check("dw_forward_rvalue_eq_lvalue_string",
+            vmhook::detail::format_log("{}", std::string{ "fwd" })
+                == vmhook::detail::format_log("{}", lv_s));
+        check("dw_forward_lvalue_int_value", vmhook::detail::format_log("{}", lv) == "5");
+        check("dw_forward_lvalue_string_value",
+            vmhook::detail::format_log("{}", lv_s) == "fwd");
+        // A const lvalue (the common call-site shape: a const std::string&)
+        // also binds and formats correctly.
+        const std::string& cref{ lv_s };
+        check("dw_forward_const_ref_string",
+            vmhook::detail::format_log("[{}]", cref) == "[fwd]");
+    }
+
+    // --- Two-field tag idiom with EACH boundary integer (real call shape). -
+    // The ~70 internal call sites are "{} ...: {}", tag, value.  Exercise that
+    // exact two-field shape across the integer boundaries with each tag.
+    check("dw_tag_idiom_error_int_min",
+        vmhook::detail::format_log("{} v={}", vmhook::error_tag, INT_MIN)
+            == "[VMHook ERROR] v=-2147483648");
+    check("dw_tag_idiom_warning_ullong_max",
+        vmhook::detail::format_log("{} v={}", vmhook::warning_tag, ULLONG_MAX)
+            == "[VMHook WARNING] v=18446744073709551615");
+    check("dw_tag_idiom_info_hex",
+        vmhook::detail::format_log("{} addr=0x{:08X}", vmhook::info_tag, 0xBEEFu)
+            == "[VMHook INFO] addr=0x0000BEEF");
+
+    // --- Width applied to a NEGATIVE number: sign char counts toward width. -
+    // {:5} on -7: '-' + '7' is 2 chars, right-aligned (default for numbers) in
+    // width 5 -> 3 leading spaces.
+    check("dw_negative_width_right_default",
+        vmhook::detail::format_log("{:5}", -7) == "   -7");
+    // {:05} on -7: zero-pad places the sign FIRST, then zeros -> "-0007".
+    check("dw_negative_zeropad_sign_first",
+        vmhook::detail::format_log("{:05}", -7) == "-0007");
+    // {:+06} on 42: '+' first, then zero-fill to width 6 -> "+00042".
+    check("dw_positive_plus_zeropad",
+        vmhook::detail::format_log("{:+06}", 42) == "+00042");
+
+    // --- size_t / ptrdiff_t boundaries (logged at several call sites). -----
+    check("dw_size_t_zero",
+        vmhook::detail::format_log("{}", static_cast<std::size_t>(0)) == "0");
+    check("dw_size_t_max",
+        vmhook::detail::format_log("{}", (std::numeric_limits<std::size_t>::max)())
+            == (sizeof(std::size_t) == 8
+                ? "18446744073709551615"
+                : "4294967295"));
+    check("dw_ptrdiff_min",
+        vmhook::detail::format_log("{}", (std::numeric_limits<std::ptrdiff_t>::min)())
+            == (sizeof(std::ptrdiff_t) == 8
+                ? "-9223372036854775808"
+                : "-2147483648"));
+#else
+    // Fallback leg: every input above returns the format string verbatim,
+    // ignoring all arguments and specifiers.  Mirror the spec-bearing strings
+    // so the pre-std::format MinGW/Clang CI legs exercise the same surface.
+    check("dw_fb_int_min_hex_verbatim",
+        vmhook::detail::format_log("{:x}", INT_MIN) == "{:x}");
+    check("dw_fb_int_min_octal_verbatim",
+        vmhook::detail::format_log("{:o}", INT_MIN) == "{:o}");
+    check("dw_fb_int_min_binary_verbatim",
+        vmhook::detail::format_log("{:b}", INT_MIN) == "{:b}");
+    check("dw_fb_center_verbatim",
+        vmhook::detail::format_log("{:^5}", std::string{ "ab" }) == "{:^5}");
+    check("dw_fb_large_width_verbatim",
+        vmhook::detail::format_log("{:>20}", 7) == "{:>20}");
+    check("dw_fb_alt_hex_zeropad_verbatim",
+        vmhook::detail::format_log("{:#010x}", 255) == "{:#010x}");
+    check("dw_fb_binary_zeropad8_verbatim",
+        vmhook::detail::format_log("{:08b}", 5) == "{:08b}");
+    check("dw_fb_char_as_int_verbatim",
+        vmhook::detail::format_log("{:d}", '\x00') == "{:d}");
+    check("dw_fb_int_as_char_verbatim",
+        vmhook::detail::format_log("{:c}", 32) == "{:c}");
+    check("dw_fb_scientific_zero_prec_verbatim",
+        vmhook::detail::format_log("{:.0e}", 1.0) == "{:.0e}");
+    // Forwarding: even in the fallback, rvalue and lvalue calls yield the same
+    // verbatim format string (arguments never appear).
+    {
+        const int lv{ 5 };
+        check("dw_fb_forward_rvalue_eq_lvalue",
+            vmhook::detail::format_log("{}", 5)
+                == vmhook::detail::format_log("{}", lv));
+        check("dw_fb_forward_value_is_fmt",
+            vmhook::detail::format_log("{}", lv) == "{}");
+    }
+    check("dw_fb_tag_idiom_verbatim",
+        vmhook::detail::format_log("{} v={}", vmhook::error_tag, INT_MIN) == "{} v={}");
+    check("dw_fb_negative_zeropad_verbatim",
+        vmhook::detail::format_log("{:05}", -7) == "{:05}");
+    check("dw_fb_positive_plus_zeropad_verbatim",
+        vmhook::detail::format_log("{:+06}", 42) == "{:+06}");
+    check("dw_fb_size_t_max_verbatim",
+        vmhook::detail::format_log("{}",
+            (std::numeric_limits<std::size_t>::max)()) == "{}");
+#endif
+
+    // --- Cross-branch (toolchain-independent) sink + emit invariants. ------
+    // A payload containing ONLY a carriage return is written through verbatim
+    // with the appended '\n' (sink does no CR/LF normalization on cout).
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(std::string{ "a\rb" });
+            captured = cap.str();
+        }
+        check("dw_emit_carriage_return_verbatim", captured == "a\rb\n");
+    }
+    // A payload that already contains the appended-newline shape: emit appends
+    // exactly one '\n', so "x\ny" -> "x\ny\n" (3 LF-delimited segments).
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(std::string{ "x\ny" });
+            captured = cap.str();
+        }
+        check("dw_emit_interior_newline_then_appended",
+            captured == "x\ny\n");
+    }
+    // A long line (one byte under and at a power-of-two) emits byte-for-byte
+    // plus the single trailing '\n'.
+    {
+        std::string captured;
+        const std::string payload(1023u, 'Z');
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(payload);
+            captured = cap.str();
+        }
+        check("dw_emit_1023_byte_line_size",
+            captured.size() == payload.size() + 1u);
+        check("dw_emit_1023_byte_line_terminated",
+            !captured.empty() && captured.back() == '\n');
+        check("dw_emit_1023_byte_line_body",
+            captured.compare(0, payload.size(), payload) == 0);
+    }
+    // The full VMHOOK_LOG two-step (format_log -> emit_log_line) reproduced by
+    // hand through the captured sink, asserting the EXACT emitted bytes on the
+    // std::format leg and the verbatim-fmt leg respectively.
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(
+                vmhook::detail::format_log("{} step={}", vmhook::warning_tag, 3));
+            captured = cap.str();
+        }
+#if VMHOOK_HAS_STD_FORMAT
+        check("dw_format_then_emit_exact_bytes",
+            captured == "[VMHook WARNING] step=3\n");
+#else
+        check("dw_format_then_emit_exact_bytes",
+            captured == "{} step={}\n");
+#endif
+    }
+
     std::printf("\n%d checks failed\n", failures);
     return failures == 0 ? 0 : 1;
 }

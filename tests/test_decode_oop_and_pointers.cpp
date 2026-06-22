@@ -2149,5 +2149,455 @@ int main()
               as_uptr(narrow_decode(0u, 4u, 0x100u)) == 0x1000u);
     }
 
+    // ===================================================================
+    // JJ. safe_read_pointer - the FAULT-SAFE pointer reader's PURE-LOGIC gate
+    //     (vmhook.hpp:2106-2130).  This is a sibling of decode_oop_and_pointers
+    //     that NO existing section covers.  Before crossing the OS boundary it
+    //     applies, in order:
+    //        (1) !pointer                          -> nullptr   (:2109)
+    //        (2) addr <= user_address_floor        -> nullptr   (:2116)
+    //        (3) addr >= user_address_ceiling      -> nullptr   (:2117)
+    //        (4) (addr & 0x7) != 0  [8-byte align] -> nullptr   (:2118)
+    //     Only AFTER all four pass does it call os::safe_read and return the
+    //     POINTED-TO word (:2124-2129).  The four rejects above return BEFORE
+    //     any OS read, so they are fully deterministic with no JVM.  Note the
+    //     alignment rule here is 8-BYTE (& 0x7), strictly stronger than
+    //     is_valid_pointer's 2-byte (& 0x1) rule - the documented flaw-#2
+    //     mismatch, pinned end-to-end in section LL below.
+    // ===================================================================
+    using vmhook::hotspot::safe_read_pointer;
+    {
+        // (1) null in -> null out, before any OS read.
+        check("safe_read_pointer_null_is_null",
+              safe_read_pointer(nullptr) == nullptr);
+
+        // (2) exactly AT the floor (0xFFFF) is rejected (<=), as is below it.
+        check("safe_read_pointer_at_floor_is_null",
+              safe_read_pointer(reinterpret_cast<const void*>(floor)) == nullptr);
+        check("safe_read_pointer_below_floor_is_null",
+              safe_read_pointer(reinterpret_cast<const void*>(floor - 1)) == nullptr);
+        // 0x8 is 8-aligned and below the floor: still rejected by the range
+        // check (it is < floor), proving range runs and dominates here.
+        check("safe_read_pointer_low_aligned_below_floor_is_null",
+              safe_read_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x8u }))
+                  == nullptr);
+
+        // (3) exactly AT the ceiling is rejected (>=), as is above it.  Both
+        //     are chosen 8-aligned so the ONLY discriminator is the range gate;
+        //     ceiling 0x7FFF'FFFF'FFFF is odd, so use ceiling+1 (even) and a far
+        //     kernel-half 8-aligned address.
+        check("safe_read_pointer_above_ceiling_is_null",
+              safe_read_pointer(reinterpret_cast<const void*>(ceiling + 1)) == nullptr);
+        check("safe_read_pointer_kernel_half_aligned_is_null",
+              safe_read_pointer(reinterpret_cast<const void*>(
+                  std::uintptr_t{ 0x0000'8000'0000'0000ull })) == nullptr);
+
+        // (4) 8-byte alignment: an in-range address whose low 3 bits are set is
+        //     rejected BEFORE any OS read.  Sweep every non-zero residue mod 8
+        //     off an in-range, 8-aligned anchor: residues 1..7 are all rejected
+        //     purely on the alignment gate (the anchor itself is never read
+        //     because we only assert the misaligned offsets return nullptr).
+        {
+            constexpr std::uintptr_t anchor{ 0x0000'2000'0000'0000ull }; // in range, 8-aligned
+            bool misaligned_all_null{ true };
+            for (std::uintptr_t r{ 1 }; r < 8u; ++r)
+            {
+                if (safe_read_pointer(reinterpret_cast<const void*>(anchor + r)) != nullptr)
+                {
+                    misaligned_all_null = false;
+                }
+            }
+            check("safe_read_pointer_any_nonzero_residue_mod8_is_null",
+                  misaligned_all_null);
+        }
+
+        // The 2-byte- and 4-byte-aligned (but NOT 8-aligned) interior offsets of
+        // a real stack block are rejected by safe_read_pointer's 8-byte gate even
+        // though the memory is genuinely mapped - these are exactly the addresses
+        // is_valid_pointer ACCEPTS (section C), so this pins the flaw-#2 gap from
+        // the safe_read_pointer side.  (+2 and +4 are 2/4-aligned, never 8.)
+        {
+            std::int64_t block[4]{};
+            const std::uintptr_t b0{ reinterpret_cast<std::uintptr_t>(&block[0]) };
+            check("safe_read_pointer_plus2_not_8aligned_is_null",
+                  safe_read_pointer(reinterpret_cast<const void*>(b0 + 2)) == nullptr);
+            check("safe_read_pointer_plus4_not_8aligned_is_null",
+                  safe_read_pointer(reinterpret_cast<const void*>(b0 + 4)) == nullptr);
+        }
+
+        // (5) A real, mapped, 8-aligned slot holding a KNOWN pointer value:
+        //     safe_read_pointer reads the POINTED-TO word and returns it, NOT the
+        //     source address.  We stash a sentinel pointer in an 8-aligned stack
+        //     slot and require it back verbatim - confirming the OS read path
+        //     returns *slot, not &slot.  (A stack `void*` is 8-aligned on every
+        //     LP64/LLP64 target the suite builds for.)
+        {
+            int target{ 0 };
+            void* const sentinel{ &target };
+            void* slot{ sentinel };
+            // &slot must itself be 8-aligned and in range for the gate to pass.
+            const std::uintptr_t slot_addr{ reinterpret_cast<std::uintptr_t>(&slot) };
+            const bool slot_gate_ok{
+                slot_addr > floor && slot_addr < ceiling && (slot_addr & 0x7u) == 0u };
+            check("safe_read_pointer_slot_precondition_8aligned_in_range",
+                  slot_gate_ok);
+            check("safe_read_pointer_reads_pointed_to_value",
+                  safe_read_pointer(&slot) == sentinel);
+            // Reading a slot that holds nullptr returns nullptr (the value, not a
+            // gate rejection - &slot is a perfectly valid source).
+            void* null_slot{ nullptr };
+            check("safe_read_pointer_slot_holding_null_returns_null",
+                  safe_read_pointer(&null_slot) == nullptr);
+        }
+
+        // safe_read_pointer is declared noexcept (vmhook.hpp:2106) and returns a
+        // const void*; pin both so a future signature change is a build error.
+        check("safe_read_pointer_is_noexcept",
+              noexcept(safe_read_pointer(nullptr)));
+        check("safe_read_pointer_returns_const_void_ptr",
+              std::is_same_v<decltype(safe_read_pointer(nullptr)), const void*>);
+    }
+
+    // ===================================================================
+    // KK. is_readable_pointer - the OTHER sibling validator (vmhook.hpp:2018-
+    //     2032).  Its pure-logic gate is identical in shape to
+    //     safe_read_pointer's but it is the function the constant-pool / symbol
+    //     slot walkers use.  Pre-OS gate (all return false BEFORE the
+    //     os::query_region call at :2030):
+    //        addr <= user_address_floor   -> false
+    //        addr >= user_address_ceiling -> false
+    //        (addr & 0x7) != 0            -> false   [8-byte alignment]
+    //     The OS query only runs for a gate-passing address, so the rejects are
+    //     deterministic with no JVM.  We additionally confirm a genuinely
+    //     mapped, 8-aligned live address is reported readable (committed &&
+    //     readable && !guarded), matching section E's is_valid_pointer cases.
+    // ===================================================================
+    using vmhook::hotspot::is_readable_pointer;
+    {
+        // null / at-floor / below-floor: false via the range gate.
+        check("is_readable_pointer_null_rejected",
+              !is_readable_pointer(nullptr));
+        check("is_readable_pointer_at_floor_rejected",
+              !is_readable_pointer(reinterpret_cast<const void*>(floor)));
+        check("is_readable_pointer_below_floor_rejected",
+              !is_readable_pointer(reinterpret_cast<const void*>(floor - 1)));
+        // at-ceiling / above-ceiling: false via the range gate (ceiling+1 even).
+        check("is_readable_pointer_at_ceiling_rejected",
+              !is_readable_pointer(reinterpret_cast<const void*>(ceiling)));
+        check("is_readable_pointer_above_ceiling_rejected",
+              !is_readable_pointer(reinterpret_cast<const void*>(ceiling + 1)));
+        // kernel-half 8-aligned address: false via the range gate.
+        check("is_readable_pointer_kernel_half_rejected",
+              !is_readable_pointer(reinterpret_cast<const void*>(
+                  std::uintptr_t{ 0x0000'8000'0000'0000ull })));
+
+        // 8-byte alignment gate: every non-zero residue mod 8 off an in-range
+        // 8-aligned anchor is rejected BEFORE the OS query.  (The anchor is an
+        // unmapped synthetic address, but we only assert the MISALIGNED offsets,
+        // which never reach query_region.)
+        {
+            constexpr std::uintptr_t anchor{ 0x0000'3000'0000'0000ull };
+            bool misaligned_all_false{ true };
+            for (std::uintptr_t r{ 1 }; r < 8u; ++r)
+            {
+                if (is_readable_pointer(reinterpret_cast<const void*>(anchor + r)))
+                {
+                    misaligned_all_false = false;
+                }
+            }
+            check("is_readable_pointer_any_nonzero_residue_mod8_rejected",
+                  misaligned_all_false);
+        }
+
+        // A real, mapped, 8-aligned live object IS readable (committed, readable,
+        // not guarded).  A stack `std::int64_t` and a heap allocation both
+        // qualify; mirror section E so the positive contract is pinned too.
+        {
+            std::int64_t on_stack{ 0 };
+            check("is_readable_pointer_real_stack_8aligned_accepted",
+                  is_readable_pointer(&on_stack));
+        }
+        {
+            std::vector<std::uint64_t> heap_block(8, 0);
+            check("is_readable_pointer_real_heap_8aligned_accepted",
+                  is_readable_pointer(heap_block.data()));
+        }
+
+        // is_readable_pointer is noexcept and returns bool; pin both.
+        check("is_readable_pointer_is_noexcept",
+              noexcept(is_readable_pointer(nullptr)));
+        check("is_readable_pointer_returns_bool",
+              std::is_same_v<decltype(is_readable_pointer(nullptr)), bool>);
+    }
+
+    // ===================================================================
+    // LL. ALIGNMENT-RULE MISMATCH across the three sibling validators (flaw #2),
+    //     pinned end-to-end so a future "harmonisation" that silently changes
+    //     either rule is caught.  For an in-range address that is 2-byte- or
+    //     4-byte-aligned but NOT 8-byte-aligned:
+    //        is_valid_pointer      -> true   (only requires & 0x1 == 0)
+    //        safe_read_pointer     -> nullptr (requires & 0x7 == 0)
+    //        is_readable_pointer   -> false   (requires & 0x7 == 0)
+    //     We drive REAL stack memory so safe_read_pointer/is_readable_pointer
+    //     would otherwise have live bytes to read - the rejection is purely the
+    //     stricter alignment gate, not an unmapped page.
+    // ===================================================================
+    {
+        std::int64_t block[4]{};
+        const std::uintptr_t b0{ reinterpret_cast<std::uintptr_t>(&block[0]) };
+        const void* const plus2{ reinterpret_cast<const void*>(b0 + 2) }; // 2-aligned
+        const void* const plus4{ reinterpret_cast<const void*>(b0 + 4) }; // 4-aligned
+
+        // Premise: +2 and +4 are even (so is_valid_pointer accepts) yet NOT
+        // 8-aligned (so the safe/readable gates reject).  Guard it explicitly.
+        check("alignment_mismatch_premise_even_not_8aligned",
+              ((b0 + 2) & 0x1u) == 0u && ((b0 + 2) & 0x7u) != 0u
+              && ((b0 + 4) & 0x1u) == 0u && ((b0 + 4) & 0x7u) != 0u);
+
+        // is_valid_pointer accepts (2-byte rule).
+        check("alignment_mismatch_is_valid_accepts_plus2",
+              is_valid_pointer(const_cast<void*>(plus2)));
+        check("alignment_mismatch_is_valid_accepts_plus4",
+              is_valid_pointer(const_cast<void*>(plus4)));
+        // safe_read_pointer rejects (8-byte rule) - the SAME address.
+        check("alignment_mismatch_safe_read_rejects_plus2",
+              safe_read_pointer(plus2) == nullptr);
+        check("alignment_mismatch_safe_read_rejects_plus4",
+              safe_read_pointer(plus4) == nullptr);
+        // is_readable_pointer rejects (8-byte rule) - the SAME address.
+        check("alignment_mismatch_is_readable_rejects_plus2",
+              !is_readable_pointer(plus2));
+        check("alignment_mismatch_is_readable_rejects_plus4",
+              !is_readable_pointer(plus4));
+
+        // The 8-aligned base of the very same block is accepted by ALL THREE,
+        // proving the divergence above is purely the low-3-bit alignment rule.
+        const void* const b0p{ reinterpret_cast<const void*>(b0) };
+        check("alignment_mismatch_all_three_accept_8aligned_base",
+              is_valid_pointer(const_cast<void*>(b0p))
+              && is_readable_pointer(b0p)
+              && safe_read_pointer(&block[0]) != reinterpret_cast<const void*>(b0p));
+        // (safe_read_pointer(&block[0]) returns *(&block[0]) == 0 here, i.e. the
+        //  STORED value, not the source address - so it is != b0p; this both
+        //  exercises the read path on an 8-aligned slot AND re-confirms it returns
+        //  the pointed-to word.  block[0] is value-initialised to 0, so the read
+        //  yields nullptr, which is != the non-null source address b0p.)
+        check("alignment_mismatch_safe_read_8aligned_slot_reads_stored_zero",
+              safe_read_pointer(&block[0]) == nullptr);
+    }
+
+    // ===================================================================
+    // MM. os::safe_read - the OS-boundary building block behind safe_read_pointer
+    //     (vmhook.hpp:955-1020).  Its pre-OS argument validation is fully
+    //     deterministic on every platform:
+    //        !dst || !src || size == 0                  -> false   (:957-960)
+    //        reinterpret_cast<uintptr_t>(src) + size wraps -> false (:968-971)
+    //     And a copy of a genuinely mapped, in-process buffer succeeds and is
+    //     byte-exact (the warm path) on Windows / Linux / Android / macOS / iOS.
+    // ===================================================================
+    {
+        using vmhook::os::safe_read;
+
+        std::uint64_t out{ 0xAAAA'BBBB'CCCC'DDDDull };
+        const std::uint64_t in{ 0x0102'0304'0506'0708ull };
+
+        // Argument guards: any null operand or zero size -> false, no read.
+        check("os_safe_read_null_dst_is_false",
+              !safe_read(nullptr, &in, sizeof(in)));
+        check("os_safe_read_null_src_is_false",
+              !safe_read(&out, nullptr, sizeof(out)));
+        check("os_safe_read_zero_size_is_false",
+              !safe_read(&out, &in, 0));
+        // out must be untouched by the rejected calls above.
+        check("os_safe_read_rejected_calls_leave_dst_untouched",
+              out == 0xAAAA'BBBB'CCCC'DDDDull);
+
+        // Address-space-wrapping size guard: src + size overflowing uintptr ->
+        // false (deterministic cross-platform per the in-code contract :961-967).
+        {
+            const void* const top_src{
+                reinterpret_cast<const void*>(std::uintptr_t{ 0u } - std::uintptr_t{ 2u }) };
+            check("os_safe_read_size_wraps_address_space_is_false",
+                  !safe_read(&out, top_src, 16u));
+            // SIZE_MAX size from any non-null src also wraps -> false.
+            check("os_safe_read_sizemax_is_false",
+                  !safe_read(&out, &in, static_cast<std::size_t>(-1)));
+            check("os_safe_read_wrap_guard_leaves_dst_untouched",
+                  out == 0xAAAA'BBBB'CCCC'DDDDull);
+        }
+
+        // Warm path: a real in-process buffer copies byte-exactly and reports
+        // success.  This is the path safe_read_pointer relies on for a mapped
+        // slot; it holds on every platform the matrix builds (incl. the iOS
+        // unguarded-memcpy path, which still copies correct bytes for a mapped
+        // src).
+        {
+            std::uint64_t dst{ 0 };
+            const bool ok{ safe_read(&dst, &in, sizeof(in)) };
+            check("os_safe_read_mapped_buffer_succeeds", ok);
+            check("os_safe_read_mapped_buffer_is_byte_exact", dst == in);
+        }
+        // A partial-width read of the leading bytes of a larger object is also
+        // exact: read the first 4 bytes of `in` into a uint32 and compare to the
+        // low 32 bits (little-endian hosts - every platform the suite targets).
+        {
+            std::uint32_t dst32{ 0 };
+            const bool ok{ safe_read(&dst32, &in, sizeof(dst32)) };
+            check("os_safe_read_partial_width_succeeds", ok);
+            check("os_safe_read_partial_width_low_bytes",
+                  dst32 == static_cast<std::uint32_t>(in));
+        }
+
+        // os::safe_read is noexcept and returns bool; pin both.
+        check("os_safe_read_is_noexcept",
+              noexcept(safe_read(&out, &in, sizeof(in))));
+        check("os_safe_read_returns_bool",
+              std::is_same_v<decltype(safe_read(&out, &in, sizeof(in))), bool>);
+    }
+
+    // ===================================================================
+    // NN. untag_pointer - additional bit-exact / canonicalisation cases beyond
+    //     section H, including the flaw-#5 hazard (a kernel/non-canonical input
+    //     masks down INTO the canonical user range) so the documented behaviour
+    //     is regression-locked, and the mask-constant identity (untag == AND
+    //     with user_address_ceiling).
+    // ===================================================================
+    {
+        // (a) The mask constant IS user_address_ceiling: untag(p) for an all-ones
+        //     input equals exactly the ceiling (every low-47 bit kept, all higher
+        //     bits cleared).  This pins "tag-strip == canonicalize to <= ceiling".
+        check("untag_pointer_all_ones_yields_ceiling",
+              untag_pointer(reinterpret_cast<const void*>(
+                  std::uintptr_t{ 0xFFFF'FFFF'FFFF'FFFFull }))
+                  == reinterpret_cast<const void*>(ceiling));
+        // The masked result of ANY input never exceeds the ceiling (it is the
+        // AND of the input with the ceiling), for a representative bit-spread.
+        {
+            const std::uintptr_t inputs[]{
+                0x0u, 0x1u, 0xFFFFu, 0x1'0000u,
+                0x0000'7FFF'FFFF'FFFFull, 0x0000'8000'0000'0000ull,
+                0xFFFF'8000'0000'1234ull, 0xDEAD'BEEF'CAFE'BABEull,
+                0xFFFF'FFFF'FFFF'FFFFull,
+            };
+            bool never_above_ceiling{ true };
+            for (const std::uintptr_t v : inputs)
+            {
+                const std::uintptr_t masked{ reinterpret_cast<std::uintptr_t>(
+                    untag_pointer(reinterpret_cast<const void*>(v))) };
+                if (masked > ceiling) { never_above_ceiling = false; }
+                // And it equals the explicit AND, bit-for-bit.
+                if (masked != (v & ceiling)) { never_above_ceiling = false; }
+            }
+            check("untag_pointer_masked_never_exceeds_ceiling_and_equals_AND",
+                  never_above_ceiling);
+        }
+
+        // (b) Only the low 47 bits (bits 0..46) survive; bit 47 and up are tag
+        //     bits and are cleared.  A value with ONLY bit 46 set is kept; a value
+        //     with ONLY bit 47 set masks to 0.
+        check("untag_pointer_keeps_bit46",
+              untag_pointer(reinterpret_cast<const void*>(
+                  std::uintptr_t{ 1ull } << 46))
+                  == reinterpret_cast<const void*>(std::uintptr_t{ 1ull } << 46));
+        check("untag_pointer_clears_bit47_only",
+              untag_pointer(reinterpret_cast<const void*>(
+                  std::uintptr_t{ 1ull } << 47)) == nullptr);
+
+        // (c) flaw-#5 hazard, pinned as documented behaviour: a kernel-half /
+        //     non-canonical input (high bits set) is silently masked into a
+        //     PLAUSIBLE canonical user address - untag cannot tell a tag from
+        //     corruption.  Here a kernel-half word masks to a small in-range
+        //     address that THEN passes is_valid_pointer.  This is intentional to
+        //     document (and lock) the current contract, not an endorsement.
+        {
+            // Low 47 bits chosen ABOVE the floor (0xFFFF) and even so the masked
+            // result clears is_valid_pointer's range + alignment gates; 0x40'0000
+            // (4 MB) is comfortably in range, even, and not a poison low-32.
+            const std::uintptr_t kernel_half{ 0xFFFF'8000'0040'0000ull };
+            const void* const recovered{
+                untag_pointer(reinterpret_cast<const void*>(kernel_half)) };
+            check("untag_pointer_kernel_half_masks_into_range_flaw5",
+                  recovered == reinterpret_cast<const void*>(std::uintptr_t{ 0x40'0000u }));
+            // And the masked-down value is now accepted by is_valid_pointer -
+            // the precise hazard the flaw describes (garbage high word -> a
+            // "valid"-looking pointer).
+            check("untag_pointer_flaw5_result_passes_is_valid_pointer",
+                  is_valid_pointer(const_cast<void*>(recovered)));
+        }
+
+        // (d) Round-trip: tagging a real canonical address with arbitrary high
+        //     bits then untagging recovers the EXACT original (the tag occupies
+        //     only bits >= 47, which the original lacks).
+        {
+            const std::uintptr_t real{ 0x0000'1234'5678'9AB0ull }; // canonical, even
+            const std::uintptr_t tags[]{
+                0x0000'8000'0000'0000ull, 0xFFFF'0000'0000'0000ull,
+                0xABCD'0000'0000'0000ull, 0xFFFF'8000'0000'0000ull,
+            };
+            bool tag_then_untag_recovers{ true };
+            for (const std::uintptr_t tag : tags)
+            {
+                const std::uintptr_t tagged{ real | tag };
+                if (untag_pointer(reinterpret_cast<const void*>(tagged))
+                    != reinterpret_cast<const void*>(real))
+                {
+                    tag_then_untag_recovers = false;
+                }
+            }
+            check("untag_pointer_tag_then_untag_recovers_canonical",
+                  tag_then_untag_recovers);
+        }
+
+        // untag_pointer returns a const void* (pin the const-qualified return,
+        // complementing section H's noexcept pin).
+        check("untag_pointer_returns_const_void_ptr",
+              std::is_same_v<decltype(untag_pointer(nullptr)), const void*>);
+    }
+
+    // ===================================================================
+    // OO. CHAINED real-consumer contract: untag_pointer -> safe_read_pointer ->
+    //     is_valid_pointer, the exact composition the dictionary / symbol slot
+    //     walkers use (vmhook.hpp:3457, 4423-4443).  With no JVM we cannot supply
+    //     a real tagged dictionary entry, but we CAN prove the no-JVM-safe legs of
+    //     the chain are individually sound and compose without crashing:
+    //        - untag(nullptr) == nullptr, safe_read_pointer(nullptr) == nullptr,
+    //          is_valid_pointer(nullptr) == false  (the null short-circuit each
+    //          stage honours);
+    //        - untag of a tagged 8-aligned in-range SLOT address yields a still-
+    //          8-aligned in-range address that safe_read_pointer will accept at
+    //          its gate (the read itself needs a mapped page, exercised on a real
+    //          stack slot).
+    // ===================================================================
+    {
+        // The null leg: each stage maps null -> its own "stop" sentinel, and the
+        // full composition is a benign false (never a fault).
+        check("chain_untag_safe_read_valid_null_is_false",
+              !is_valid_pointer(const_cast<void*>(
+                  safe_read_pointer(untag_pointer(nullptr)))));
+
+        // A real tagged slot: take an 8-aligned stack slot holding a sentinel,
+        // OR in high tag bits to simulate a GC-tagged dictionary-bucket word,
+        // untag it back to the real slot address, then safe_read_pointer it and
+        // confirm we recover the stored sentinel - i.e. the untag+read pair is
+        // the identity on a correctly-tagged, mapped slot.
+        {
+            int target{ 0 };
+            void* const sentinel{ &target };
+            void* slot{ sentinel };
+            const std::uintptr_t slot_addr{ reinterpret_cast<std::uintptr_t>(&slot) };
+            // Simulate a tag in the high (>=47) bits; canonical user slot_addr has
+            // those bits clear, so untag must restore slot_addr exactly.
+            const std::uintptr_t tagged_slot{ slot_addr | 0xFFFF'0000'0000'0000ull };
+            const void* const recovered{
+                untag_pointer(reinterpret_cast<const void*>(tagged_slot)) };
+            check("chain_untag_restores_tagged_slot_address",
+                  recovered == reinterpret_cast<const void*>(slot_addr));
+            // The recovered slot address is 8-aligned + in range, so it clears
+            // safe_read_pointer's gate, and the read returns the stored sentinel.
+            check("chain_untag_then_safe_read_recovers_sentinel",
+                  safe_read_pointer(recovered) == sentinel);
+        }
+    }
+
     return failures == 0 ? 0 : 1;
 }

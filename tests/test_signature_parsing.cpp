@@ -2285,5 +2285,244 @@ int main()
               && m.return_basic == 12);
     }
 
+    // =====================================================================
+    // EXHAUSTIVE PASS 9 -- cross-helper ROUND-TRIPS (emit -> classify, emit ->
+    // measure-width) and the HEAP-vs-C++ width coupling (flaw #3), plus the last
+    // remaining single-helper boundary sweeps.  Every expected value is derived
+    // ONLY from the three confirmed tables in vmhook.hpp:
+    //   sig_char_to_basic_type   (vmhook.hpp:16163 -- Z4 C5 F6 D7 B8 S9 I10 J11
+    //                             L12 [13 V14, default 12)
+    //   jvm_primitive_byte_width (vmhook.hpp:16198 -- size!=1 ->0; Z/B1 S/C2 I/F4
+    //                             J/D8, default 0)
+    //   jni_signature_for_arg    (vmhook.hpp:12953 -- decay; String; bool->Z;
+    //                             char16_t|uint16_t->C; generic is_integral&&
+    //                             sizeof N=1->B 2->S 4->I 8->J; float->F double->D;
+    //                             unique_ptr<wrapper>/object_base -> class map
+    //                             L...; with Object fallback; else static_assert)
+    // These pins couple the three helpers to EACH OTHER (so a drift in any one is
+    // caught by the other two) and were not asserted together in passes 1-8.
+    // =====================================================================
+
+    // ---- emit -> measure-width round-trip for every FIXED-WIDTH primitive -----
+    // For each C++ primitive arg type whose descriptor is a single primitive
+    // letter, feeding that emitted descriptor BACK through jvm_primitive_byte_width
+    // yields the JVM heap width the table dictates.  This is the encode-then-size
+    // round-trip the field/ctor paths implicitly rely on.  Expected widths:
+    //   bool/int8/uint8 -> 1 ; uint16 -> 2 ; int16 -> 2 ; int32/uint32 -> 4 ;
+    //   int64/uint64 -> 8 ; float -> 4 ; double -> 8 .
+    {
+        struct emit_width { std::string sig; std::size_t width; };
+        const emit_width rows[]{
+            { vmhook::detail::jni_signature_for_arg<bool>(),          1 }, // Z
+            { vmhook::detail::jni_signature_for_arg<std::int8_t>(),   1 }, // B
+            { vmhook::detail::jni_signature_for_arg<std::uint8_t>(),  1 }, // B
+            { vmhook::detail::jni_signature_for_arg<std::int16_t>(),  2 }, // S
+            { vmhook::detail::jni_signature_for_arg<std::uint16_t>(), 2 }, // C
+            { vmhook::detail::jni_signature_for_arg<std::int32_t>(),  4 }, // I
+            { vmhook::detail::jni_signature_for_arg<std::uint32_t>(), 4 }, // I
+            { vmhook::detail::jni_signature_for_arg<std::int64_t>(),  8 }, // J
+            { vmhook::detail::jni_signature_for_arg<std::uint64_t>(), 8 }, // J
+            { vmhook::detail::jni_signature_for_arg<float>(),         4 }, // F
+            { vmhook::detail::jni_signature_for_arg<double>(),        8 }, // D
+        };
+        bool all_match{ true };
+        for (const emit_width& r : rows)
+        {
+            if (vmhook::detail::jvm_primitive_byte_width(r.sig) != r.width) { all_match = false; }
+        }
+        check("emit_to_width_roundtrip_every_fixed_width_primitive", all_match);
+    }
+    // The genuinely-new generic-ladder char rows (char / unsigned char / char8_t
+    // -> "B" width 1 ; char16_t -> "C" width 2) also round-trip to their heap
+    // width.  Pins that the descriptors the corrected ladder emits are sizeable.
+    check("emit_to_width_roundtrip_plain_char_is_1",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<char>()) == 1);
+    check("emit_to_width_roundtrip_unsigned_char_is_1",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<unsigned char>()) == 1);
+    check("emit_to_width_roundtrip_char8_t_is_1",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<char8_t>()) == 1);
+    check("emit_to_width_roundtrip_char16_t_is_2",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<char16_t>()) == 2);
+
+    // ---- heap-width vs C++ sizeof COUPLING (flaw #3), pinned both ways --------
+    // The helper reports the JVM HEAP width, which AGREES with the C++ sizeof for
+    // the fixed-width integral/float aliases that field_proxy::set lets through
+    // unchanged: bool/int8 (1), int16 (2), int32/float (4), int64/double (8).
+    check("width_agrees_with_cpp_sizeof_bool",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<bool>()) == sizeof(bool));
+    check("width_agrees_with_cpp_sizeof_int8",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<std::int8_t>()) == sizeof(std::int8_t));
+    check("width_agrees_with_cpp_sizeof_int16",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<std::int16_t>()) == sizeof(std::int16_t));
+    check("width_agrees_with_cpp_sizeof_int32",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<std::int32_t>()) == sizeof(std::int32_t));
+    check("width_agrees_with_cpp_sizeof_float",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<float>()) == sizeof(float));
+    check("width_agrees_with_cpp_sizeof_int64",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<std::int64_t>()) == sizeof(std::int64_t));
+    check("width_agrees_with_cpp_sizeof_double",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<double>()) == sizeof(double));
+    // The deliberate DISAGREEMENT flaw #3 warns about: a Java `char` ('C') field
+    // has heap width 2, but a C++ `char` is sizeof 1 -- so the heap width is NOT a
+    // safe size guard for a raw C++ `char` against a 'C' field (that is exactly
+    // why a separate char->C widening exists at the field_proxy::set call site,
+    // OUTSIDE this helper).  Pin the mismatch so the coupling hazard stays visible.
+    check("width_C_field_is_2_but_cpp_char_is_1_FLAW3",
+          vmhook::detail::jvm_primitive_byte_width("C") == 2 && sizeof(char) == 1);
+    // ...and the symmetric numeric case: a Java `short` ('S') field is also width
+    // 2, matching sizeof(std::int16_t)==2 -- so a 16-bit int value IS width-safe
+    // there, unlike a 1-byte char.  Pin both to make the partition explicit.
+    check("width_S_field_matches_int16_but_not_char",
+          vmhook::detail::jvm_primitive_byte_width("S") == sizeof(std::int16_t)
+          && vmhook::detail::jvm_primitive_byte_width("S") != sizeof(char));
+
+    // ---- full emit -> classify -> width triple round-trip ---------------------
+    // The three helpers must agree end-to-end for every fixed-width primitive arg:
+    // the descriptor jni_signature_for_arg emits classifies (sig_char_to_basic_type)
+    // to a primitive basic type in [4..11] AND measures (jvm_primitive_byte_width)
+    // to a non-zero width.  Couples all THREE tables in one assertion so no single
+    // helper can drift without tripping it.
+    {
+        struct triple { std::string sig; int basic; std::size_t width; };
+        const triple rows[]{
+            { vmhook::detail::jni_signature_for_arg<bool>(),          4,  1 }, // Z
+            { vmhook::detail::jni_signature_for_arg<std::uint16_t>(), 5,  2 }, // C
+            { vmhook::detail::jni_signature_for_arg<float>(),         6,  4 }, // F
+            { vmhook::detail::jni_signature_for_arg<double>(),        7,  8 }, // D
+            { vmhook::detail::jni_signature_for_arg<std::int8_t>(),   8,  1 }, // B
+            { vmhook::detail::jni_signature_for_arg<std::int16_t>(),  9,  2 }, // S
+            { vmhook::detail::jni_signature_for_arg<std::int32_t>(),  10, 4 }, // I
+            { vmhook::detail::jni_signature_for_arg<std::int64_t>(),  11, 8 }, // J
+        };
+        bool all_ok{ true };
+        for (const triple& r : rows)
+        {
+            if (r.sig.size() != 1) { all_ok = false; continue; }
+            const int basic{ vmhook::detail::sig_char_to_basic_type(r.sig[0]) };
+            const std::size_t width{ vmhook::detail::jvm_primitive_byte_width(r.sig) };
+            if (basic != r.basic || width != r.width
+                || !(basic >= 4 && basic <= 11) || width == 0)
+            {
+                all_ok = false;
+            }
+        }
+        check("triple_roundtrip_emit_classify_width_all_agree", all_ok);
+    }
+
+    // ---- String descriptor is NOT a primitive in EITHER reverse helper --------
+    // jni_signature_for_arg<std::string>() emits the multi-char "Ljava/lang/String;"
+    // descriptor; feeding it back, jvm_primitive_byte_width sees size()!=1 -> 0
+    // (so field_proxy::set skips its width guard and takes the OOP path), and
+    // sig_char_to_basic_type of its FIRST char 'L' is T_OBJECT(12).  Pins that the
+    // reference-type descriptor is correctly NON-primitive on both reverse paths.
+    check("string_descriptor_width_is_0_and_lead_is_object_12",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::detail::jni_signature_for_arg<std::string>()) == 0
+          && vmhook::detail::sig_char_to_basic_type(
+                 vmhook::detail::jni_signature_for_arg<std::string>()[0]) == 12);
+
+    // ---- the FOUR String-mapped C++ types all emit the IDENTICAL descriptor ---
+    // std::string, std::string_view, const char*, char* converge on exactly
+    // "Ljava/lang/String;" (the first branch of the ladder).  Pin equality across
+    // all four so the single shared branch can never split.
+    check("all_four_string_mapped_types_emit_identical_descriptor",
+             vmhook::detail::jni_signature_for_arg<std::string>()
+                 == vmhook::detail::jni_signature_for_arg<std::string_view>()
+          && vmhook::detail::jni_signature_for_arg<std::string_view>()
+                 == vmhook::detail::jni_signature_for_arg<const char*>()
+          && vmhook::detail::jni_signature_for_arg<const char*>()
+                 == vmhook::detail::jni_signature_for_arg<char*>()
+          && vmhook::detail::jni_signature_for_arg<char*>() == "Ljava/lang/String;");
+
+    // ---- every emitted primitive descriptor is exactly ONE byte long ----------
+    // The eight primitive arg types plus bool/uint16 emit single-character
+    // descriptors (length 1); only the String-mapped types and registered
+    // wrappers emit multi-byte L...; forms.  Pin the length so a stray extra byte
+    // in any primitive branch is caught (a length-2 primitive descriptor would
+    // silently make jvm_primitive_byte_width return 0 via the size!=1 gate).
+    {
+        const std::string prim_sigs[]{
+            vmhook::detail::jni_signature_for_arg<bool>(),
+            vmhook::detail::jni_signature_for_arg<std::int8_t>(),
+            vmhook::detail::jni_signature_for_arg<std::uint8_t>(),
+            vmhook::detail::jni_signature_for_arg<std::int16_t>(),
+            vmhook::detail::jni_signature_for_arg<std::uint16_t>(),
+            vmhook::detail::jni_signature_for_arg<std::int32_t>(),
+            vmhook::detail::jni_signature_for_arg<std::uint32_t>(),
+            vmhook::detail::jni_signature_for_arg<std::int64_t>(),
+            vmhook::detail::jni_signature_for_arg<std::uint64_t>(),
+            vmhook::detail::jni_signature_for_arg<float>(),
+            vmhook::detail::jni_signature_for_arg<double>(),
+            vmhook::detail::jni_signature_for_arg<char>(),
+            vmhook::detail::jni_signature_for_arg<char8_t>(),
+            vmhook::detail::jni_signature_for_arg<char16_t>(),
+        };
+        bool all_one_byte{ true };
+        for (const std::string& s : prim_sigs)
+        {
+            if (s.size() != 1) { all_one_byte = false; }
+        }
+        check("every_emitted_primitive_descriptor_is_single_byte", all_one_byte);
+    }
+
+    // ---- sig_char_to_basic_type / jvm_primitive_byte_width: the L,[,V trio -----
+    // The three NON-primitive descriptor letters whose basic type IS recognised by
+    // the classifier but whose width is 0 (they have no fixed in-heap primitive
+    // width): L (object, 12), [ (array, 13), V (void, 14).  Pin the "classified
+    // but width-zero" trio together -- this is precisely the set field_proxy::set
+    // routes to the OOP / skip-validation path (width==0) even though the basic
+    // type is known.
+    check("L_bracket_V_are_classified_nonzero_basic_but_width_zero",
+             vmhook::detail::sig_char_to_basic_type('L') == 12
+          && vmhook::detail::sig_char_to_basic_type('[') == 13
+          && vmhook::detail::sig_char_to_basic_type('V') == 14
+          && vmhook::detail::jvm_primitive_byte_width("L") == 0
+          && vmhook::detail::jvm_primitive_byte_width("[") == 0
+          && vmhook::detail::jvm_primitive_byte_width("V") == 0);
+
+    // ---- jvm_primitive_byte_width: the size()!=1 gate at the EMPTY boundary ----
+    // Length 0 (empty view, default-constructed view, and a view built from a 0
+    // length over a real buffer) all hit the size!=1 gate -> 0, never indexing
+    // signature[0].  Pins the lower length boundary distinctly from the >=2 cases.
+    check("byte_width_default_constructed_view_is_0",
+          vmhook::detail::jvm_primitive_byte_width(std::string_view{}) == 0);
+    {
+        const char buf[1]{ 'I' };
+        check("byte_width_zero_length_view_over_I_buffer_is_0",
+              vmhook::detail::jvm_primitive_byte_width(std::string_view{ buf, 0 }) == 0);
+    }
+
+    // ---- ctor signature: emit -> per-token width is sizeable for a wide pack ---
+    // The whole-constructor descriptor "(JD)V" assembled by the fold contains two
+    // primitive tokens 'J' and 'D' each of width 8 -- confirm by re-measuring the
+    // individual emitted tokens (not the whole string, which is multi-char -> 0).
+    check("ctor_JD_tokens_each_measure_width_8",
+          ctor_signature_of<std::int64_t, double>() == "(JD)V"
+          && vmhook::detail::jvm_primitive_byte_width("J") == 8
+          && vmhook::detail::jvm_primitive_byte_width("D") == 8);
+
+    // ---- public re-export parity: emit -> width agrees through BOTH entries ----
+    // jni::signature_for_arg and detail::jni_signature_for_arg emit byte-identical
+    // descriptors, so measuring either through jvm_primitive_byte_width gives the
+    // same width.  Pin the round-trip through the PUBLIC entry for a wide and a
+    // narrow type so the re-export is exercised end-to-end into the width helper.
+    check("public_export_emit_to_width_int64_is_8",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::jni::signature_for_arg<std::int64_t>()) == 8);
+    check("public_export_emit_to_width_uint16_C_is_2",
+          vmhook::detail::jvm_primitive_byte_width(
+              vmhook::jni::signature_for_arg<std::uint16_t>()) == 2);
+
     return failures == 0 ? 0 : 1;
 }
