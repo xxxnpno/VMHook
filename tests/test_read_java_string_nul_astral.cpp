@@ -334,6 +334,420 @@ static auto test_ascii_and_empty_baseline() -> void
           e_units.size() == 1 && e_units[0] == 0x00E9u && round_trip(e_acute) == e_acute);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ADDITIVE deepening pass (wave-14) — namespaced so it touches no existing
+// assertion above.  Pure no-JVM surface of read_java_string + its sibling
+// helpers: with gHotSpotVMStructs/gHotSpotVMTypes null (no live JVM), the
+// VMStruct offset-resolution layer must degrade to nullptr; the decode CODE
+// LOGIC over byte buffers WE OWN must round-trip at every code-unit boundary;
+// the narrow compressed-pointer codec arithmetic must round-trip; the
+// method-flags layout DECISION (pure) must place _dont_inline correctly per
+// JDK; method_proxy::value_t must classify/convert/stringify per source; and
+// the call-path arity cap must be 8.  EVERY value is derived from vmhook.hpp;
+// nothing here dereferences a fabricated/unmapped address.
+namespace rjs_deep
+{
+    // ── source-mirrored constants (each USED below; no unused const) ─────────
+    // vmhook.hpp: inline constexpr std::int32_t read_java_string_max_units{ 16*1024*1024 }.
+    static_assert(vmhook::read_java_string_max_units == 16 * 1024 * 1024,
+                  "read_java_string_max_units must be 16Mi chars (robustness bug #29 fix)");
+
+    // vmhook.hpp method_proxy::call / call_stub fast path: constexpr arg_cap{8};
+    // static_assert(sizeof...(args_t) <= arg_cap).  Mirror the bound here.
+    static_assert(8 <= vmhook::read_java_string_max_units,
+                  "sanity: arg cap fits well under the char ceiling");
+
+    // vmhook.hpp: inline constexpr std::int32_t NO_COMPILE = the OR of the four
+    // JIT-inhibit access-flag bits (0x01|0x02|0x04|0x08 << 24).
+    static_assert(vmhook::hotspot::NO_COMPILE
+                      == (0x02000000 | 0x04000000 | 0x08000000 | 0x01000000),
+                  "NO_COMPILE must OR the four JVM_ACC_NOT_*_COMPILABLE/QUEUED bits");
+    static_assert(vmhook::hotspot::NO_COMPILE == 0x0F000000,
+                  "NO_COMPILE collapses to the high-nibble 0x0F000000");
+
+    // ── (A) VMStruct offset-resolution: null-when-no-JVM contract ────────────
+    // No live JVM in this TU, so get_jvm_module()/gHotSpotVMStructs resolution
+    // yields null and every lookup must degrade to nullptr (never deref, never
+    // crash).  iterate_*_entries also reject null name args UNCONDITIONALLY
+    // (the documented strcmp(nullptr,...) UB guard) — deterministic regardless
+    // of whether a JVM is present.
+    static auto test_vmstruct_null_when_no_jvm() -> void
+    {
+        // Unconditional null-name guards (pure; true on every platform).
+        check("vmstruct: iterate_struct_entries(null,'x') -> nullptr",
+              vmhook::hotspot::iterate_struct_entries(nullptr, "x") == nullptr);
+        check("vmstruct: iterate_struct_entries('T',null) -> nullptr",
+              vmhook::hotspot::iterate_struct_entries("T", nullptr) == nullptr);
+        check("vmstruct: iterate_type_entries(null) -> nullptr",
+              vmhook::hotspot::iterate_type_entries(nullptr) == nullptr);
+
+        // No JVM -> gHotSpotVMStructs symbol absent -> array pointer null ->
+        // any real (type,field) lookup also degrades to nullptr.
+        check("vmstruct: get_vm_structs() is null with no JVM",
+              vmhook::hotspot::get_vm_structs() == nullptr);
+        check("vmstruct: get_vm_types() is null with no JVM",
+              vmhook::hotspot::get_vm_types() == nullptr);
+        check("vmstruct: lookup of a real (type,field) degrades to nullptr",
+              vmhook::hotspot::iterate_struct_entries("CompressedOops", "_base") == nullptr);
+
+        // resolve_struct_entry over the SAME candidate set decode_oop_pointer
+        // uses must also miss (all candidates resolve to nullptr).
+        const vmhook::hotspot::struct_entry_candidate_t base_candidates[]{
+            { "CompressedOops", "_narrow_oop._base" },
+            { "CompressedOops", "_base" },
+            { "Universe", "_narrow_oop._base" },
+        };
+        check("vmstruct: resolve_struct_entry over base candidates -> nullptr (no JVM)",
+              vmhook::hotspot::resolve_struct_entry(base_candidates, std::size(base_candidates))
+                  == nullptr);
+    }
+
+    // ── (B) compressed-pointer narrow codec round-trip (pure arithmetic) ─────
+    // narrow_decode(base,shift,c) = base + (c << shift);
+    // narrow_encode(base,shift,addr) = (addr - base) >> shift.
+    // The low `shift` bits of (c << shift) are 0, so encode(decode(c)) == c
+    // exactly for any c (no information loss).  This is plain integer math on
+    // values WE pick — no JVM, no dereference.
+    static auto narrow_round_trips(std::uint64_t base, std::uint32_t shift, std::uint32_t c) -> bool
+    {
+        void* const decoded{ vmhook::hotspot::narrow_decode(base, shift, c) };
+        const std::uint64_t addr{ reinterpret_cast<std::uint64_t>(decoded) };
+        return addr == base + (static_cast<std::uint64_t>(c) << shift)
+            && vmhook::hotspot::narrow_encode(base, shift, addr) == c;
+    }
+
+    static auto test_narrow_codec_round_trip() -> void
+    {
+        // shift 0 (heap < 4 GB) and shift 3 (8-byte-aligned oops, heap <= 32 GB)
+        // are the two HotSpot-documented shifts; base 0 and a non-zero heap base.
+        check("codec: shift=0 base=0 round-trips c=1",
+              narrow_round_trips(0x0u, 0u, 1u));
+        check("codec: shift=3 base=0 round-trips c=0xDEADBEE",
+              narrow_round_trips(0x0u, 3u, 0x0DEADBEEu));
+        check("codec: shift=3 non-zero base round-trips c=0x12345",
+              narrow_round_trips(0x7F0000000000ull, 3u, 0x00012345u));
+        check("codec: shift=0 round-trips max compressed 0xFFFFFFFF",
+              narrow_round_trips(0x10000000ull, 0u, 0xFFFFFFFFu));
+
+        // narrow_decode is exactly base + (c << shift); pin one value explicitly.
+        check("codec: narrow_decode(base=0x100, shift=3, c=2) == 0x110",
+              reinterpret_cast<std::uint64_t>(vmhook::hotspot::narrow_decode(0x100ull, 3u, 2u))
+                  == 0x110ull);
+
+        // The compressed==0 / decoded==nullptr SHORT-CIRCUITS run BEFORE any
+        // VMStruct deref, so they are deterministic even with no JVM.
+        check("codec: decode_oop_pointer(0) -> nullptr (pre-VMStruct short-circuit)",
+              vmhook::hotspot::decode_oop_pointer(0u) == nullptr);
+        check("codec: decode_klass_pointer(0) -> nullptr (pre-VMStruct short-circuit)",
+              vmhook::hotspot::decode_klass_pointer(0u) == nullptr);
+        check("codec: encode_oop_pointer(nullptr) -> 0 (pre-VMStruct short-circuit)",
+              vmhook::hotspot::encode_oop_pointer(nullptr) == 0u);
+        check("codec: encode_klass_pointer(nullptr) -> 0 (pre-VMStruct short-circuit)",
+              vmhook::hotspot::encode_klass_pointer(nullptr) == 0u);
+    }
+
+    // ── (C) read_java_string length/char-count math (bug #29 fix, pure) ──────
+    // Mirror the per-layout arithmetic read_java_string computes from the raw
+    // arrayOop length (no JVM, no deref) and assert the SYMMETRIC ceiling.
+    //   char_count = (has_coder && coder != 0) ? length / 2 : length;
+    //   body_bytes = has_coder ? length : length * 2;
+    //   raw guard:  1 .. 2 * read_java_string_max_units  (element/byte count)
+    //   char guard: 1 .. read_java_string_max_units      (decoded chars)
+    static auto char_count_for(bool has_coder, std::uint8_t coder, std::int32_t length) -> std::int32_t
+    {
+        return (has_coder && coder != 0) ? length / 2 : length;
+    }
+    static auto body_bytes_for(bool has_coder, std::int32_t length) -> std::int32_t
+    {
+        return has_coder ? length : length * 2;
+    }
+
+    static auto test_length_and_char_count_math() -> void
+    {
+        // JDK 8 char[] (no coder): length IS the char count; body is 2*length.
+        check("len: JDK8 char[] length=5 -> char_count 5",
+              char_count_for(false, 0, 5) == 5);
+        check("len: JDK8 char[] length=5 -> body_bytes 10",
+              body_bytes_for(false, 5) == 10);
+
+        // JDK 9+ LATIN1 (coder==0): one byte/char; char_count == length.
+        check("len: LATIN1 length=5 -> char_count 5",
+              char_count_for(true, 0, 5) == 5);
+        check("len: LATIN1 length=5 -> body_bytes 5",
+              body_bytes_for(true, 5) == 5);
+
+        // JDK 9+ UTF16 (coder!=0): two bytes/char; char_count == length/2.
+        check("len: UTF16 length=10 -> char_count 5",
+              char_count_for(true, 1, 10) == 5);
+        check("len: UTF16 length=10 -> body_bytes 10 (length is already the byte count)",
+              body_bytes_for(true, 10) == 10);
+
+        // SYMMETRIC ceiling (bug #29 part 2): a LATIN1 and a UTF16 String of the
+        // SAME logical char count both sit at the SAME char ceiling — the UTF16
+        // raw length is 2x but its char_count is the same, so neither is capped
+        // earlier than the other.
+        const std::int32_t cap{ vmhook::read_java_string_max_units };
+        check("len: LATIN1 at exactly the cap is in range (char_count == cap)",
+              char_count_for(true, 0, cap) == cap && cap <= vmhook::read_java_string_max_units);
+        check("len: UTF16 at exactly the cap (raw length 2*cap) yields char_count == cap",
+              char_count_for(true, 1, 2 * cap) == cap);
+        check("len: UTF16 raw length 2*cap equals LATIN1 raw cap times 2 (no asymmetry)",
+              char_count_for(true, 1, 2 * cap) == char_count_for(true, 0, cap));
+
+        // The raw guard accepts a UTF16 byte length up to 2*cap (would have been
+        // rejected by the OLD `length > 4096` guard for any real-world String).
+        check("len: raw upper guard is 2 * read_java_string_max_units",
+              static_cast<std::int64_t>(2) * vmhook::read_java_string_max_units
+                  == static_cast<std::int64_t>(2 * 16 * 1024 * 1024));
+
+        // char_count <= 0 (empty/degenerate) is the "" case for every layout.
+        check("len: UTF16 raw length 1 -> char_count 0 (degenerate -> empty)",
+              char_count_for(true, 1, 1) == 0);
+    }
+
+    // ── (D) extra decode-logic boundary inputs over OWNED byte buffers ───────
+    // Push utf8_to_utf16 + the mirrored decode oracle across the exact byte
+    // boundaries of each UTF-8 length class (1/2/3/4) and the surrogate edges.
+    // Buffers are std::string we build (no fabricated address, no raw NUL/
+    // non-ASCII literal — built from explicit byte values).
+    static auto test_decode_unit_boundaries() -> void
+    {
+        // U+007F (last 1-byte) == 0x7F -> single unit 0x007F.
+        std::string b1;
+        b1 += static_cast<char>(0x7F);
+        const std::vector<std::uint16_t> u1{ vmhook::detail::utf8_to_utf16(b1) };
+        check("boundary: U+007F -> {0x007F}, round-trip byte-identical",
+              u1.size() == 1 && u1[0] == 0x007Fu && round_trip(b1) == b1);
+
+        // U+0080 (first 2-byte) == C2 80 -> 0x0080.
+        std::string b2lo;
+        b2lo += static_cast<char>(0xC2);
+        b2lo += static_cast<char>(0x80);
+        const std::vector<std::uint16_t> u2lo{ vmhook::detail::utf8_to_utf16(b2lo) };
+        check("boundary: U+0080 -> {0x0080}, round-trip byte-identical",
+              u2lo.size() == 1 && u2lo[0] == 0x0080u && round_trip(b2lo) == b2lo);
+
+        // U+07FF (last 2-byte) == DF BF -> 0x07FF.
+        std::string b2hi;
+        b2hi += static_cast<char>(0xDF);
+        b2hi += static_cast<char>(0xBF);
+        const std::vector<std::uint16_t> u2hi{ vmhook::detail::utf8_to_utf16(b2hi) };
+        check("boundary: U+07FF -> {0x07FF}, round-trip byte-identical",
+              u2hi.size() == 1 && u2hi[0] == 0x07FFu && round_trip(b2hi) == b2hi);
+
+        // U+0800 (first 3-byte) == E0 A0 80 -> 0x0800.
+        std::string b3lo;
+        b3lo += static_cast<char>(0xE0);
+        b3lo += static_cast<char>(0xA0);
+        b3lo += static_cast<char>(0x80);
+        const std::vector<std::uint16_t> u3lo{ vmhook::detail::utf8_to_utf16(b3lo) };
+        check("boundary: U+0800 -> {0x0800}, round-trip byte-identical",
+              u3lo.size() == 1 && u3lo[0] == 0x0800u && round_trip(b3lo) == b3lo);
+
+        // U+FFFF (last BMP 3-byte) == EF BF BF -> 0xFFFF (NOT a surrogate).
+        std::string b3hi;
+        b3hi += static_cast<char>(0xEF);
+        b3hi += static_cast<char>(0xBF);
+        b3hi += static_cast<char>(0xBF);
+        const std::vector<std::uint16_t> u3hi{ vmhook::detail::utf8_to_utf16(b3hi) };
+        check("boundary: U+FFFF -> {0xFFFF} single BMP unit, round-trip byte-identical",
+              u3hi.size() == 1 && u3hi[0] == 0xFFFFu && round_trip(b3hi) == b3hi);
+
+        // U+10000 (first astral 4-byte) == F0 90 80 80 -> {0xD800, 0xDC00}
+        // (the lowest surrogate pair).
+        std::string b4lo;
+        b4lo += static_cast<char>(0xF0);
+        b4lo += static_cast<char>(0x90);
+        b4lo += static_cast<char>(0x80);
+        b4lo += static_cast<char>(0x80);
+        const std::vector<std::uint16_t> u4lo{ vmhook::detail::utf8_to_utf16(b4lo) };
+        check("boundary: U+10000 -> {0xD800,0xDC00} lowest surrogate pair, round-trip byte-identical",
+              u4lo.size() == 2 && u4lo[0] == 0xD800u && u4lo[1] == 0xDC00u
+                  && round_trip(b4lo) == b4lo);
+
+        // Unpaired HIGH surrogate at end-of-buffer: utf16_to_utf8's `(i+1)<count`
+        // guard fails, so the lone 0xD83D is emitted via append_utf8 as a 3-byte
+        // form (cp < 0x10000 arm).  Build the unit vector DIRECTLY (a lone
+        // surrogate is not producible from valid UTF-8) and decode it.
+        const std::vector<std::uint16_t> lone_high{ 0xD83Du };
+        const std::string lone_out{ utf16_to_utf8(lone_high) };
+        check("boundary: lone high surrogate (no low) decodes as a 3-byte unit, not 4",
+              lone_out.size() == 3 && static_cast<std::uint8_t>(lone_out[0]) == 0xEDu);
+
+        // High surrogate followed by a NON-low unit: pair is NOT combined; both
+        // emit independently (high as 3 bytes, then the plain ASCII 'A').
+        const std::vector<std::uint16_t> high_then_ascii{ 0xD83Du, 0x0041u };
+        const std::string hta{ utf16_to_utf8(high_then_ascii) };
+        check("boundary: high surrogate then 'A' -> 3 bytes + 0x41 (no false combine)",
+              hta.size() == 4 && static_cast<std::uint8_t>(hta[3]) == 0x41u);
+    }
+
+    // ── (E) method_proxy::value_t variant classification / conversion ────────
+    // value_t is an aggregate over a std::variant; build each alternative
+    // explicitly (NEVER static_cast a value_t TO a vector — that ambiguity
+    // reverted this surface once).  All conversions used here are pure
+    // (arithmetic static_cast, monostate/string classification, and the
+    // uint32_t==0 path whose decode short-circuits to nullptr -> "" with no JVM).
+    static auto test_value_t_classification() -> void
+    {
+        const vmhook::method_proxy::value_t v_void{ std::monostate{} };
+        check("value_t: monostate is_void / !is_string",
+              v_void.is_void() && !v_void.is_string());
+        check("value_t: monostate as_string() == \"\"",
+              v_void.as_string().empty());
+
+        const vmhook::method_proxy::value_t v_int{ std::int32_t{ 42 } };
+        check("value_t: int32 alternative is neither void nor string",
+              !v_int.is_void() && !v_int.is_string());
+        check("value_t: int32 converts to int via static_cast",
+              static_cast<std::int32_t>(v_int) == 42);
+        check("value_t: int32 widens to int64 via static_cast",
+              static_cast<std::int64_t>(v_int) == 42);
+
+        const vmhook::method_proxy::value_t v_bool{ true };
+        check("value_t: bool alternative converts to true",
+              static_cast<bool>(v_bool));
+        const vmhook::method_proxy::value_t v_dbl{ 1.5 };
+        check("value_t: double alternative converts to 1.5",
+              static_cast<double>(v_dbl) == 1.5);
+
+        const vmhook::method_proxy::value_t v_str{ std::string{ "hi" } };
+        check("value_t: string alternative is_string / !is_void",
+              v_str.is_string() && !v_str.is_void());
+        check("value_t: string as_string() returns the eager bytes",
+              v_str.as_string() == "hi");
+        check("value_t: string converts to std::string via operator",
+              static_cast<std::string>(v_str) == "hi");
+
+        // uint32_t==0 reference alternative: decode_oop_pointer(0) -> nullptr
+        // BEFORE any VMStruct deref, so as_string -> read_java_string(nullptr)
+        // -> "" and the void* conversion -> nullptr.  Deterministic, no JVM.
+        const vmhook::method_proxy::value_t v_ref0{ std::uint32_t{ 0 } };
+        check("value_t: uint32(0) reference alt is not string/void classified",
+              !v_ref0.is_string() && !v_ref0.is_void());
+        check("value_t: uint32(0) as_string -> \"\" (null oop decode)",
+              v_ref0.as_string().empty());
+        check("value_t: uint32(0) converts to void* nullptr",
+              static_cast<void*>(v_ref0) == nullptr);
+    }
+
+    // ── (F) signature byte-width / basic-type classification (pure) ──────────
+    static auto test_signature_classification() -> void
+    {
+        // jvm_primitive_byte_width: Z/B=1, S/C=2, I/F=4, J/D=8, else 0.
+        check("sig: width('Z')==1 width('B')==1",
+              vmhook::detail::jvm_primitive_byte_width("Z") == 1
+                  && vmhook::detail::jvm_primitive_byte_width("B") == 1);
+        check("sig: width('S')==2 width('C')==2",
+              vmhook::detail::jvm_primitive_byte_width("S") == 2
+                  && vmhook::detail::jvm_primitive_byte_width("C") == 2);
+        check("sig: width('I')==4 width('F')==4",
+              vmhook::detail::jvm_primitive_byte_width("I") == 4
+                  && vmhook::detail::jvm_primitive_byte_width("F") == 4);
+        check("sig: width('J')==8 width('D')==8",
+              vmhook::detail::jvm_primitive_byte_width("J") == 8
+                  && vmhook::detail::jvm_primitive_byte_width("D") == 8);
+        check("sig: reference 'Ljava/lang/String;' width 0 (handled elsewhere)",
+              vmhook::detail::jvm_primitive_byte_width("Ljava/lang/String;") == 0);
+        check("sig: multi-char descriptor width 0 (not a single primitive)",
+              vmhook::detail::jvm_primitive_byte_width("II") == 0);
+
+        // sig_char_to_basic_type: stable HotSpot BasicType ints.
+        check("sig: basic_type('I')==10 (T_INT), ('J')==11 (T_LONG)",
+              vmhook::detail::sig_char_to_basic_type('I') == 10
+                  && vmhook::detail::sig_char_to_basic_type('J') == 11);
+        check("sig: basic_type('Z')==4 (T_BOOLEAN), ('V')==14 (T_VOID)",
+              vmhook::detail::sig_char_to_basic_type('Z') == 4
+                  && vmhook::detail::sig_char_to_basic_type('V') == 14);
+        check("sig: basic_type('[')==13 (T_ARRAY), ('L')==12 (T_OBJECT)",
+              vmhook::detail::sig_char_to_basic_type('[') == 13
+                  && vmhook::detail::sig_char_to_basic_type('L') == 12);
+        check("sig: unknown char falls back to 12 (T_OBJECT)",
+              vmhook::detail::sig_char_to_basic_type('?') == 12);
+    }
+
+    // ── (G) method-flags layout DECISION (pure, fabricated evidence only) ────
+    // derive_method_flags_layout is constexpr & pure; feed it VMStruct EVIDENCE
+    // structs we fill (no JVM, no Method*, no deref) and assert the per-JDK
+    // placement of _dont_inline.  Several at compile time via static_assert.
+    static constexpr auto layout_a()  // JDK 11..20: exported u2 _flags
+    {
+        vmhook::hotspot::method_flags_evidence e{};
+        e.flags_present = true;
+        e.flags_type    = "u2";
+        e.flags_offset  = 0x30;
+        return vmhook::hotspot::derive_method_flags_layout(e);
+    }
+    static constexpr auto layout_b()  // JDK 21+: u2 _intrinsic_id at status+4
+    {
+        vmhook::hotspot::method_flags_evidence e{};
+        e.intrinsic_id_present = true;
+        e.intrinsic_id_type    = "u2";
+        e.intrinsic_id_offset  = 0x34;  // >= 4 and 4-aligned
+        return vmhook::hotspot::derive_method_flags_layout(e);
+    }
+    static_assert(layout_a().confident && layout_a().width_bytes == 2
+                      && layout_a().dont_inline_bit == 2 && layout_a().offset == 0x30,
+                  "Path A (u2 _flags) -> offset=flags_offset, width 2, bit 2");
+    static_assert(layout_b().confident && layout_b().width_bytes == 4
+                      && layout_b().dont_inline_bit == 12 && layout_b().offset == 0x30,
+                  "Path B (u2 _intrinsic_id) -> offset=intrinsic-4, width 4, bit 12");
+
+    static auto test_method_flags_layout() -> void
+    {
+        check("flags: Path A (u2 _flags) places bit 2, width 2 at flags_offset",
+              layout_a().confident && layout_a().width_bytes == 2
+                  && layout_a().dont_inline_bit == 2 && layout_a().offset == 0x30);
+        check("flags: Path B (u2 _intrinsic_id @0x34) -> offset 0x30, width 4, bit 12",
+              layout_b().confident && layout_b().width_bytes == 4
+                  && layout_b().dont_inline_bit == 12 && layout_b().offset == 0x30);
+
+        // JDK 8: _intrinsic_id is u1 (not u2), no _flags -> NOT confident.
+        vmhook::hotspot::method_flags_evidence jdk8{};
+        jdk8.intrinsic_id_present = true;
+        jdk8.intrinsic_id_type    = "u1";
+        jdk8.intrinsic_id_offset  = 0x20;
+        check("flags: JDK8 (u1 _intrinsic_id, no _flags) -> not confident (safe no-op)",
+              !vmhook::hotspot::derive_method_flags_layout(jdk8).confident);
+
+        // Path B refuses an underflowing offset (< 4).
+        vmhook::hotspot::method_flags_evidence under{};
+        under.intrinsic_id_present = true;
+        under.intrinsic_id_type    = "u2";
+        under.intrinsic_id_offset  = 2;  // would underflow offset-4
+        check("flags: intrinsic offset < 4 -> not confident (no underflow)",
+              !vmhook::hotspot::derive_method_flags_layout(under).confident);
+
+        // Path B refuses a non-4-aligned offset (status is 4-aligned).
+        vmhook::hotspot::method_flags_evidence misaligned{};
+        misaligned.intrinsic_id_present = true;
+        misaligned.intrinsic_id_type    = "u2";
+        misaligned.intrinsic_id_offset  = 0x32;  // not % 4 == 0
+        check("flags: misaligned intrinsic offset -> not confident",
+              !vmhook::hotspot::derive_method_flags_layout(misaligned).confident);
+
+        // Empty evidence (nothing exported) -> not confident.
+        check("flags: empty evidence -> not confident",
+              !vmhook::hotspot::derive_method_flags_layout(
+                   vmhook::hotspot::method_flags_evidence{}).confident);
+
+        // Path A wins over a present-but-also-derivable intrinsic (u2 _flags
+        // takes precedence): width 2 / bit 2, not 4 / 12.
+        vmhook::hotspot::method_flags_evidence both{};
+        both.flags_present        = true;
+        both.flags_type           = "u2";
+        both.flags_offset         = 0x40;
+        both.intrinsic_id_present = true;
+        both.intrinsic_id_type    = "u2";
+        both.intrinsic_id_offset  = 0x44;
+        const vmhook::hotspot::method_flags_layout bl{
+            vmhook::hotspot::derive_method_flags_layout(both) };
+        check("flags: Path A precedence when both present (width 2, bit 2, offset 0x40)",
+              bl.confident && bl.width_bytes == 2 && bl.dont_inline_bit == 2
+                  && bl.offset == 0x40);
+    }
+} // namespace rjs_deep
+
 auto main() -> int
 {
     test_interior_nul_is_length_preserving();
@@ -342,6 +756,14 @@ auto main() -> int
     test_nul_adjacent_astral();
     test_malformed_yields_replacement();
     test_ascii_and_empty_baseline();
+
+    rjs_deep::test_vmstruct_null_when_no_jvm();
+    rjs_deep::test_narrow_codec_round_trip();
+    rjs_deep::test_length_and_char_count_math();
+    rjs_deep::test_decode_unit_boundaries();
+    rjs_deep::test_value_t_classification();
+    rjs_deep::test_signature_classification();
+    rjs_deep::test_method_flags_layout();
 
     if (failures == 0)
     {

@@ -78,6 +78,9 @@ namespace
     using vmhook::hotspot::vm_type_entry_t;
     using vmhook::hotspot::resolve_struct_entry;
     using vmhook::hotspot::struct_entry_candidate_t;
+    using vmhook::hotspot::method_flags_evidence;
+    using vmhook::hotspot::method_flags_layout;
+    using vmhook::hotspot::derive_method_flags_layout;
 
     // A standalone re-implementation of the EXACT iterate_struct_entries walk
     // semantics (loop terminator `entry && entry->type_name`, the defensive
@@ -1109,6 +1112,268 @@ namespace
         check("partial_struct_entry_type_set_field_null",
               partial.type_name != nullptr && partial.field_name == nullptr);
     }
+
+    // -----------------------------------------------------------------------
+    // 17. VMStruct offset-resolution arithmetic feeding the Method-flags layout
+    //     DECISION (derive_method_flags_layout).  This is the resolver's
+    //     reason-to-exist exercised end-to-end on the no-JVM surface: a resolved
+    //     vm_struct_entry_t's ->type_string and ->offset are the ONLY inputs the
+    //     library reads out of gHotSpotVMStructs for the _dont_inline locator
+    //     (resolve_method_flags_slot, vmhook.hpp:7518-7536), which copies them
+    //     into a method_flags_evidence and runs the PURE derive_method_flags_layout
+    //     (vmhook.hpp:7450-7498) to pick (offset,width,bit,confident).  Here we
+    //     build the SAME evidence by walking a synthetic table with the in-file
+    //     walk_struct_table mirror (so a resolved ->offset / ->type_string drives
+    //     the decision exactly as the real resolver does — no live Method, no
+    //     fabricated address read, pure struct + integer math).  Every expected
+    //     value is read straight off vmhook.hpp's two decision paths and the
+    //     per-JDK analysis in its block comment (8 / 11-20 / 21+).
+    //
+    //     Path A (JDK 11..20): exported `mutable u2 Method::_flags`
+    //                          -> {offset = flags_offset, width 2, bit 2, confident}.
+    //     Path B (JDK 21+):    `_flags` absent/non-u2 BUT `_intrinsic_id` present
+    //                          as EXACTLY "u2" with offset >= 4 and 4-aligned
+    //                          -> {offset = intrinsic_id_offset - 4, width 4,
+    //                              bit 12, confident}.
+    //     JDK 8 / unrecognised: neither path -> default-constructed (not confident).
+    // -----------------------------------------------------------------------
+    auto build_method_flags_evidence(const vm_struct_entry_t* const head)
+        -> method_flags_evidence
+    {
+        // Mirror of resolve_method_flags_slot's evidence-gathering (7524-7536):
+        // resolve Method._flags / Method._intrinsic_id, copy type_string+offset.
+        method_flags_evidence evidence{};
+        const vm_struct_entry_t* const flags_entry{
+            walk_struct_table(head, "Method", "_flags") };
+        const vm_struct_entry_t* const intrinsic_entry{
+            walk_struct_table(head, "Method", "_intrinsic_id") };
+        if (flags_entry)
+        {
+            evidence.flags_present = true;
+            evidence.flags_type = flags_entry->type_string;
+            evidence.flags_offset = flags_entry->offset;
+        }
+        if (intrinsic_entry)
+        {
+            evidence.intrinsic_id_present = true;
+            evidence.intrinsic_id_type = intrinsic_entry->type_string;
+            evidence.intrinsic_id_offset = intrinsic_entry->offset;
+        }
+        return evidence;
+    }
+
+    auto test_method_flags_layout_from_resolved_offsets() -> void
+    {
+        // ---- ABI of the evidence / layout PODs the resolver fills and the pure
+        // decision returns.  Widths are load-bearing: flags_offset/intrinsic_id_
+        // offset mirror vm_struct_entry_t::offset (uint64), so the `- 4` derive
+        // and the `% 4` alignment gate never truncate; the layout offset is the
+        // same uint64 so `base + layout.offset` cannot 32-bit wrap.
+        static_assert(std::is_same_v<decltype(method_flags_evidence::flags_present), bool>,
+                      "flags_present must be bool");
+        static_assert(std::is_same_v<decltype(method_flags_evidence::flags_type), const char*>,
+                      "flags_type must be const char*");
+        static_assert(std::is_same_v<decltype(method_flags_evidence::flags_offset), std::uint64_t>,
+                      "flags_offset must be uint64 (mirrors VMStruct ->offset)");
+        static_assert(std::is_same_v<decltype(method_flags_evidence::intrinsic_id_present), bool>,
+                      "intrinsic_id_present must be bool");
+        static_assert(std::is_same_v<decltype(method_flags_evidence::intrinsic_id_type), const char*>,
+                      "intrinsic_id_type must be const char*");
+        static_assert(std::is_same_v<decltype(method_flags_evidence::intrinsic_id_offset), std::uint64_t>,
+                      "intrinsic_id_offset must be uint64 (mirrors VMStruct ->offset)");
+        static_assert(std::is_same_v<decltype(method_flags_layout::offset), std::uint64_t>,
+                      "layout offset must be uint64 (base+offset must not truncate)");
+        static_assert(std::is_same_v<decltype(method_flags_layout::width_bytes), int>,
+                      "layout width_bytes must be int");
+        static_assert(std::is_same_v<decltype(method_flags_layout::dont_inline_bit), int>,
+                      "layout dont_inline_bit must be int");
+        static_assert(std::is_same_v<decltype(method_flags_layout::confident), bool>,
+                      "layout confident must be bool");
+
+        // The decision is constexpr-evaluable on synthetic evidence: pin the
+        // three canonical layouts at COMPILE time so a drift in the pure decision
+        // is caught even where the runtime path is never reached.
+        {
+            constexpr method_flags_evidence path_a{ true, "u2", 64ull, true, "u2", 70ull };
+            constexpr method_flags_layout la{ derive_method_flags_layout(path_a) };
+            static_assert(la.confident, "path A must be confident");
+            static_assert(la.offset == 64ull, "path A offset == flags_offset");
+            static_assert(la.width_bytes == 2, "path A width 2");
+            static_assert(la.dont_inline_bit == 2, "path A bit 2");
+
+            constexpr method_flags_evidence path_b{ false, nullptr, 0ull, true, "u2", 48ull };
+            constexpr method_flags_layout lb{ derive_method_flags_layout(path_b) };
+            static_assert(lb.confident, "path B must be confident");
+            static_assert(lb.offset == 44ull, "path B offset == intrinsic_id_offset - 4");
+            static_assert(lb.width_bytes == 4, "path B width 4");
+            static_assert(lb.dont_inline_bit == 12, "path B bit 12");
+
+            constexpr method_flags_evidence jdk8{ false, nullptr, 0ull, true, "u1", 40ull };
+            constexpr method_flags_layout l8{ derive_method_flags_layout(jdk8) };
+            static_assert(!l8.confident, "JDK 8 u1 intrinsic_id -> not confident");
+            static_assert(l8.offset == 0ull && l8.width_bytes == 0 && l8.dont_inline_bit == 0,
+                          "non-confident layout is value-initialised");
+        }
+
+        // ---- Path A driven THROUGH the resolver mirror: a synthetic table that
+        // exports Method._flags as "u2" at offset 64.  walk_struct_table resolves
+        // it, build_method_flags_evidence copies ->type_string/->offset, and the
+        // pure decision yields {64, 2, 2, confident} — exactly Path A.
+        const vm_struct_entry_t path_a_table[]{
+            { "Method", "_flags", "u2", 0, 64ull, nullptr },
+            { "Method", "_intrinsic_id", "u2", 0, 72ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        const method_flags_layout la{
+            derive_method_flags_layout(build_method_flags_evidence(path_a_table)) };
+        check("flags_path_a_confident", la.confident);
+        check("flags_path_a_offset_is_flags_offset", la.offset == 64ull);
+        check("flags_path_a_width_2", la.width_bytes == 2);
+        check("flags_path_a_bit_2", la.dont_inline_bit == 2);
+
+        // ---- Path B: _flags ABSENT, _intrinsic_id exported as "u2" at offset 48
+        // (4-aligned, >= 4).  Derived flags-word offset is 48 - 4 == 44, width 4,
+        // bit 12.  This is the JDK 21+ MethodFlags::_status derivation, with the
+        // `_intrinsic_id_offset - 4` arithmetic done over the resolved uint64.
+        const vm_struct_entry_t path_b_table[]{
+            { "Method", "_intrinsic_id", "u2", 0, 48ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        const method_flags_layout lb{
+            derive_method_flags_layout(build_method_flags_evidence(path_b_table)) };
+        check("flags_path_b_confident", lb.confident);
+        check("flags_path_b_offset_minus_4", lb.offset == 44ull);
+        check("flags_path_b_width_4", lb.width_bytes == 4);
+        check("flags_path_b_bit_12", lb.dont_inline_bit == 12);
+
+        // ---- Path A WINS when BOTH are present and _flags is "u2": the decision
+        // checks Path A first, so a u2 _flags owns the layout even if a u2
+        // _intrinsic_id is also exported (mirrors the 11..20 layout where both
+        // members exist).  Offset must be the FLAGS offset, not intrinsic-4.
+        const vm_struct_entry_t both_table[]{
+            { "Method", "_flags", "u2", 0, 80ull, nullptr },
+            { "Method", "_intrinsic_id", "u2", 0, 96ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        const method_flags_layout lboth{
+            derive_method_flags_layout(build_method_flags_evidence(both_table)) };
+        check("flags_path_a_wins_over_b", lboth.confident
+              && lboth.offset == 80ull && lboth.width_bytes == 2
+              && lboth.dont_inline_bit == 2);
+
+        // ---- Rejection gates (each -> not confident -> caller no-ops).
+        // (a) JDK 8 shape: NOTHING exported (no _flags, no _intrinsic_id row).
+        const vm_struct_entry_t jdk8_table[]{
+            { "Method", "_constMethod", "ConstMethod*", 0, 16ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        const method_flags_layout l8{
+            derive_method_flags_layout(build_method_flags_evidence(jdk8_table)) };
+        check("flags_jdk8_nothing_exported_not_confident", !l8.confident);
+
+        // (b) _intrinsic_id present but as "u1" (JDK 8's actual width) -> Path B
+        // type-gate excludes it; with no u2 _flags either, not confident.
+        const vm_struct_entry_t u1_table[]{
+            { "Method", "_intrinsic_id", "u1", 0, 48ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        check("flags_intrinsic_u1_not_confident",
+              !derive_method_flags_layout(build_method_flags_evidence(u1_table)).confident);
+
+        // (c) _intrinsic_id u2 but offset < 4 -> underflow gate rejects.
+        const vm_struct_entry_t low_off_table[]{
+            { "Method", "_intrinsic_id", "u2", 0, 2ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        check("flags_intrinsic_offset_lt4_not_confident",
+              !derive_method_flags_layout(build_method_flags_evidence(low_off_table)).confident);
+
+        // (d) _intrinsic_id u2 but offset not 4-aligned (6) -> alignment gate
+        // rejects (the u4 _status it derives must be 4-aligned).
+        const vm_struct_entry_t misaligned_table[]{
+            { "Method", "_intrinsic_id", "u2", 0, 6ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        check("flags_intrinsic_misaligned_not_confident",
+              !derive_method_flags_layout(build_method_flags_evidence(misaligned_table)).confident);
+
+        // (e) _flags present but a NON-u2 type ("u4") with no usable _intrinsic_id
+        // -> Path A type-gate excludes it, Path B has no intrinsic -> not confident.
+        const vm_struct_entry_t u4_flags_table[]{
+            { "Method", "_flags", "u4", 0, 64ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        check("flags_u4_flags_no_intrinsic_not_confident",
+              !derive_method_flags_layout(build_method_flags_evidence(u4_flags_table)).confident);
+
+        // (f) _flags is "u4" (non-u2) AND a valid u2 _intrinsic_id IS present:
+        // Path A declines (not u2), Path B fires off the intrinsic offset.  This
+        // is the JDK 21+ shape where _flags exists but is the MethodFlags object,
+        // not the legacy u2 -> derived offset 100 - 4 == 96, width 4, bit 12.
+        const vm_struct_entry_t u4_flags_with_intrinsic[]{
+            { "Method", "_flags", "u4", 0, 90ull, nullptr },
+            { "Method", "_intrinsic_id", "u2", 0, 100ull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        const method_flags_layout lmix{
+            derive_method_flags_layout(build_method_flags_evidence(u4_flags_with_intrinsic)) };
+        check("flags_u4_flags_falls_through_to_path_b",
+              lmix.confident && lmix.offset == 96ull && lmix.width_bytes == 4
+              && lmix.dont_inline_bit == 12);
+
+        // ---- Large/aligned offset round-trips through the uint64 derive with no
+        // truncation: a 4-aligned _intrinsic_id offset just under 4 GiB derives
+        // offset-4 exactly (proves the `- 4` and `% 4` run on the full uint64).
+        const vm_struct_entry_t big_off_table[]{
+            { "Method", "_intrinsic_id", "u2", 0, 0xFFFFFFFCull, nullptr },
+            { nullptr, nullptr, nullptr, 0, 0ull, nullptr },
+        };
+        const method_flags_layout lbig{
+            derive_method_flags_layout(build_method_flags_evidence(big_off_table)) };
+        check("flags_big_offset_no_truncation",
+              lbig.confident && lbig.offset == 0xFFFFFFF8ull && lbig.width_bytes == 4);
+
+        // ---- Empty / no-JVM evidence (the shape resolve_method_flags_slot builds
+        // when iterate_struct_entries returns nullptr for both): default evidence
+        // -> not confident -> caller no-ops.  This is the live no-JVM contract.
+        check("flags_empty_evidence_not_confident",
+              !derive_method_flags_layout(method_flags_evidence{}).confident);
+
+        // The real resolver path with the live (null) global head produces exactly
+        // that empty evidence, so the live decision here must also be not-confident.
+        method_flags_evidence live_evidence{};
+        const vm_struct_entry_t* const live_flags{ iterate_struct_entries("Method", "_flags") };
+        const vm_struct_entry_t* const live_intr{ iterate_struct_entries("Method", "_intrinsic_id") };
+        if (live_flags)
+        {
+            live_evidence.flags_present = true;
+            live_evidence.flags_type = live_flags->type_string;
+            live_evidence.flags_offset = live_flags->offset;
+        }
+        if (live_intr)
+        {
+            live_evidence.intrinsic_id_present = true;
+            live_evidence.intrinsic_id_type = live_intr->type_string;
+            live_evidence.intrinsic_id_offset = live_intr->offset;
+        }
+        check("flags_live_no_jvm_evidence_empty",
+              !live_evidence.flags_present && !live_evidence.intrinsic_id_present);
+        check("flags_live_no_jvm_not_confident",
+              !derive_method_flags_layout(live_evidence).confident);
+
+        // Determinism: the pure decision is a function of its argument only.
+        bool stable{ true };
+        for (int i{ 0 }; i < 256; ++i)
+        {
+            const method_flags_layout a{
+                derive_method_flags_layout(build_method_flags_evidence(path_a_table)) };
+            const method_flags_layout b{
+                derive_method_flags_layout(build_method_flags_evidence(path_b_table)) };
+            if (!a.confident || a.offset != 64ull || a.width_bytes != 2) { stable = false; }
+            if (!b.confident || b.offset != 44ull || b.width_bytes != 4) { stable = false; }
+        }
+        check("flags_decision_deterministic", stable);
+    }
 }
 
 auto main() -> int
@@ -1135,6 +1400,7 @@ auto main() -> int
     test_struct_entry_abi_layout();
     test_type_entry_abi_layout();
     test_terminator_shape();
+    test_method_flags_layout_from_resolved_offsets();
 
     std::printf("=== %d checks, %d failure(s) ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

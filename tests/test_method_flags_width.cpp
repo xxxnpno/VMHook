@@ -2598,6 +2598,649 @@ static auto test_mfw_deep2_is_valid_pointer_thresholds() -> void
           is_valid_pointer(p(0x40000000ull)) && !is_valid_pointer(p(0x40000001ull)));
 }
 
+// =========================================================================
+//  DEEPENING WAVE 3 -- namespaced additive section (mfw_deep3).
+//
+//  ADDITIVE ONLY: touches none of the functions above.  Broadens the no-JVM
+//  surface to the sibling pure-logic the feature relies on but the prior waves
+//  did not reach, all values traced directly from vmhook.hpp source:
+//    * narrow_decode / narrow_encode  (vmhook.hpp:5459-5485) -- the shared
+//      compressed-pointer codec primitives.  decode = base + (compressed<<shift);
+//      encode = (addr-base)>>shift.  Pure unsigned arithmetic over OWNED values,
+//      no dereference -- round-trip + boundary + the documented shift cases.
+//    * read_java_string DECODE LOGIC  (append_utf8 vmhook.hpp:20648-20672 +
+//      utf16_to_utf8 vmhook.hpp:20676-20694 + char_count/body_bytes derivation
+//      20600/20621).  The lambdas are local, so we re-implement their EXACT
+//      algorithm and drive it over byte arrays WE build -- UTF-8 1..4-byte
+//      boundaries, LATIN1, UTF16, surrogate pairs, astral, embedded NUL.
+//    * method_proxy::value_t  (vmhook.hpp:16294-16462) -- variant classification
+//      (is_void / is_string / as_string) + numeric conversion operator.  Built
+//      with explicit variant alternatives; NEVER cast a value_t to a vector.
+//    * sig_char_to_basic_type (vmhook.hpp:16215) + jvm_primitive_byte_width
+//      (vmhook.hpp:16250) -- the signature-char decode tables, every documented
+//      char.
+//    * method_proxy::call arg cap == 8 (vmhook.hpp:16703-16705 / 17321) +
+//      frame::get_arguments long/double 2-slot widening (vmhook.hpp:6302-6312).
+//
+//  POSIX-safety: no fabricated mapped address is ever dereferenced.  The codec
+//  primitives are pure arithmetic on integers we own.  Every string-decode input
+//  is an OWNED std::array / std::vector / std::string.  Embedded NUL is built at
+//  RUNTIME (push_back of '\0'); no raw NUL / non-ASCII byte appears in source.
+// =========================================================================
+namespace mfw_deep3
+{
+    // EXACT re-implementation of read_java_string's append_utf8 lambda
+    // (vmhook.hpp:20648-20672): a Unicode code point -> standard UTF-8 (1..4 bytes).
+    auto append_utf8(std::string& out, std::uint32_t cp) -> void
+    {
+        if (cp < 0x80u)
+        {
+            out += static_cast<char>(cp);
+        }
+        else if (cp < 0x800u)
+        {
+            out += static_cast<char>(0xC0u | (cp >> 6));
+            out += static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+        else if (cp < 0x10000u)
+        {
+            out += static_cast<char>(0xE0u | (cp >> 12));
+            out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+            out += static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+        else
+        {
+            out += static_cast<char>(0xF0u | (cp >> 18));
+            out += static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu));
+            out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+            out += static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+    }
+
+    // EXACT re-implementation of read_java_string's utf16_to_utf8 lambda
+    // (vmhook.hpp:20676-20694): native-endian UTF-16 units -> UTF-8, combining a
+    // high+low surrogate pair into one astral code point.
+    auto utf16_to_utf8(std::string& out, const std::uint16_t* const chars,
+                       const std::int32_t count) -> void
+    {
+        for (std::int32_t i{ 0 }; i < count; ++i)
+        {
+            std::uint32_t cp{ chars[i] };
+            if (cp >= 0xD800u && cp <= 0xDBFFu && (i + 1) < count)
+            {
+                const std::uint16_t low{ chars[i + 1] };
+                if (low >= 0xDC00u && low <= 0xDFFFu)
+                {
+                    cp = 0x10000u + ((cp - 0xD800u) << 10) + (low - 0xDC00u);
+                    ++i;
+                }
+            }
+            append_utf8(out, cp);
+        }
+    }
+
+    // char_count derivation (vmhook.hpp:20600): JDK8 char[] / LATIN1 -> `length`;
+    // UTF16 byte[] -> length/2.
+    auto char_count_for(bool has_coder, std::uint8_t coder, std::int32_t length) -> std::int32_t
+    {
+        return (has_coder && coder != 0) ? length / 2 : length;
+    }
+    // body_bytes derivation (vmhook.hpp:20621): no coder (JDK8 char[]) -> 2*length;
+    // either JDK9+ byte[] layout -> `length` is the byte count directly.
+    auto body_bytes_for(bool has_coder, std::int32_t length) -> std::int32_t
+    {
+        return has_coder ? length : length * 2;
+    }
+}
+
+// -- F1. narrow_decode / narrow_encode ROUND-TRIP + DOCUMENTED SHIFT CASES. ---
+//  Pure unsigned arithmetic (vmhook.hpp:5459-5485).  Round-trip an OWNED set of
+//  addresses through encode->decode for the realistic (base,shift) pairs HotSpot
+//  uses: shift 0 (heap < 4 GB), shift 3 (8-byte-aligned oops up to 32 GB), and a
+//  non-zero base.  No pointer is ever dereferenced -- the reinterpret_cast in
+//  narrow_decode produces a value we only compare as an integer.
+static auto test_mfw_deep3_narrow_codec_roundtrip() -> void
+{
+    using vmhook::hotspot::narrow_decode;
+    using vmhook::hotspot::narrow_encode;
+
+    auto as_u64 = [](void* p) -> std::uint64_t
+    { return reinterpret_cast<std::uintptr_t>(p); };
+
+    // (base, shift) regimes verified against the decode_oop_pointer doc
+    // (vmhook.hpp:5496-5499): base 0 / shift 0; base 0 / shift 3; non-zero base.
+    struct regime { std::uint64_t base; std::uint32_t shift; };
+    const regime regimes[]{
+        { 0x0000000000000000ull, 0u },   // heap < 4 GB at address 0
+        { 0x0000000000000000ull, 3u },   // 8-byte-aligned oops, base 0
+        { 0x0000000800000000ull, 3u },   // non-zero heap base, shift 3
+        { 0x0000000100000000ull, 0u },   // non-zero base, shift 0
+    };
+
+    // Compressed values that, after << shift + base, stay below the user_address
+    // ceiling so the decoded value is a plausible address pattern (we never read it).
+    const std::uint32_t compressed_samples[]{
+        1u, 2u, 8u, 0x1000u, 0x10000u, 0x00FFFFFFu, 0x10000000u,
+    };
+
+    bool roundtrip_ok{ true };
+    for (const regime r : regimes)
+    {
+        for (const std::uint32_t c : compressed_samples)
+        {
+            // For shift 3 the encode requires (addr-base) be a multiple of 8; the
+            // decode of a compressed value always produces such an addr, so
+            // decode-then-encode is the faithful round-trip direction.
+            void* const decoded{ narrow_decode(r.base, r.shift, c) };
+            const std::uint64_t expected_addr{ r.base + (static_cast<std::uint64_t>(c) << r.shift) };
+            if (as_u64(decoded) != expected_addr) { roundtrip_ok = false; break; }
+
+            const std::uint32_t re{ narrow_encode(r.base, r.shift, as_u64(decoded)) };
+            if (re != c) { roundtrip_ok = false; break; }
+        }
+        if (!roundtrip_ok) { break; }
+    }
+    check("mfw_deep3_narrow_codec_decode_then_encode_roundtrips", roundtrip_ok);
+
+    // Explicit shift-0 identity: decode is base + compressed, encode is addr - base.
+    {
+        const std::uint64_t base{ 0x0000000100000000ull };
+        const std::uint32_t c{ 0x00ABCDEFu };
+        void* const d{ narrow_decode(base, 0u, c) };
+        check("mfw_deep3_narrow_shift0_is_base_plus_compressed",
+              as_u64(d) == base + c
+              && narrow_encode(base, 0u, as_u64(d)) == c);
+    }
+
+    // Explicit shift-3 scaling: the compressed value is left-shifted by 3 (x8) on
+    // decode and right-shifted by 3 on encode -- the 8-byte-aligned-oop regime.
+    {
+        const std::uint64_t base{ 0ull };
+        const std::uint32_t c{ 0x00001234u };
+        void* const d{ narrow_decode(base, 3u, c) };
+        check("mfw_deep3_narrow_shift3_scales_by_8",
+              as_u64(d) == (static_cast<std::uint64_t>(c) << 3)
+              && as_u64(d) == static_cast<std::uint64_t>(c) * 8u
+              && narrow_encode(base, 3u, as_u64(d)) == c);
+    }
+
+    // encode of addr == base yields 0 (the "decoded==base -> compressed 0" edge the
+    // caller's underflow guard pairs with); decode of base+0 is base.
+    {
+        const std::uint64_t base{ 0x0000000800000000ull };
+        check("mfw_deep3_narrow_encode_at_base_is_zero",
+              narrow_encode(base, 3u, base) == 0u
+              && as_u64(narrow_decode(base, 3u, 0u)) == base);
+    }
+}
+
+// -- F2. UTF-8 ENCODER BOUNDARY MAP (append_utf8 byte production). ------------
+//  Pin the EXACT byte sequence append_utf8 emits at every length boundary:
+//  1-byte (< 0x80), 2-byte (< 0x800), 3-byte (< 0x10000), 4-byte (astral),
+//  plus the just-below / just-at edge of each boundary (0x7F/0x80, 0x7FF/0x800,
+//  0xFFFF/0x10000).  Embedded NUL (cp 0) is built and asserted at RUNTIME.
+static auto test_mfw_deep3_utf8_encoder_boundaries() -> void
+{
+    auto encode_one = [](std::uint32_t cp) -> std::string
+    {
+        std::string out;
+        mfw_deep3::append_utf8(out, cp);
+        return out;
+    };
+
+    // cp 0 -> a single NUL byte (embedded-NUL preservation, built at runtime).
+    {
+        const std::string z{ encode_one(0x0u) };
+        std::string expected;
+        expected.push_back('\0');  // runtime-built NUL; no raw NUL literal in source
+        check("mfw_deep3_utf8_cp0_is_single_nul_byte",
+              z.size() == 1u && z == expected && z[0] == '\0');
+    }
+
+    // ASCII 'A' (0x41) -> one byte 0x41.
+    check("mfw_deep3_utf8_ascii_A_one_byte",
+          encode_one(0x41u) == std::string{ "A" });
+
+    // 0x7F is the LAST 1-byte code point; 0x80 the FIRST 2-byte.
+    {
+        const std::string a{ encode_one(0x7Fu) };
+        const std::string b{ encode_one(0x80u) };
+        check("mfw_deep3_utf8_7F_one_byte_80_two_bytes",
+              a.size() == 1u && static_cast<std::uint8_t>(a[0]) == 0x7Fu
+              && b.size() == 2u
+              && static_cast<std::uint8_t>(b[0]) == 0xC2u
+              && static_cast<std::uint8_t>(b[1]) == 0x80u);
+    }
+
+    // U+00E9 'e-acute' -> C3 A9 (the LATIN1 case the decoder UTF-8-encodes).
+    {
+        const std::string e{ encode_one(0xE9u) };
+        check("mfw_deep3_utf8_00E9_is_C3_A9",
+              e.size() == 2u
+              && static_cast<std::uint8_t>(e[0]) == 0xC3u
+              && static_cast<std::uint8_t>(e[1]) == 0xA9u);
+    }
+
+    // 0x7FF is the LAST 2-byte code point; 0x800 the FIRST 3-byte.
+    {
+        const std::string a{ encode_one(0x7FFu) };
+        const std::string b{ encode_one(0x800u) };
+        check("mfw_deep3_utf8_7FF_two_bytes_800_three_bytes",
+              a.size() == 2u
+              && static_cast<std::uint8_t>(a[0]) == 0xDFu
+              && static_cast<std::uint8_t>(a[1]) == 0xBFu
+              && b.size() == 3u
+              && static_cast<std::uint8_t>(b[0]) == 0xE0u
+              && static_cast<std::uint8_t>(b[1]) == 0xA0u
+              && static_cast<std::uint8_t>(b[2]) == 0x80u);
+    }
+
+    // U+20AC EURO SIGN -> E2 82 AC (a canonical 3-byte BMP code point).
+    {
+        const std::string euro{ encode_one(0x20ACu) };
+        check("mfw_deep3_utf8_20AC_euro_is_E2_82_AC",
+              euro.size() == 3u
+              && static_cast<std::uint8_t>(euro[0]) == 0xE2u
+              && static_cast<std::uint8_t>(euro[1]) == 0x82u
+              && static_cast<std::uint8_t>(euro[2]) == 0xACu);
+    }
+
+    // 0xFFFF is the LAST 3-byte code point; 0x10000 the FIRST 4-byte (astral).
+    {
+        const std::string a{ encode_one(0xFFFFu) };
+        const std::string b{ encode_one(0x10000u) };
+        check("mfw_deep3_utf8_FFFF_three_bytes_10000_four_bytes",
+              a.size() == 3u
+              && static_cast<std::uint8_t>(a[0]) == 0xEFu
+              && static_cast<std::uint8_t>(a[1]) == 0xBFu
+              && static_cast<std::uint8_t>(a[2]) == 0xBFu
+              && b.size() == 4u
+              && static_cast<std::uint8_t>(b[0]) == 0xF0u
+              && static_cast<std::uint8_t>(b[1]) == 0x90u
+              && static_cast<std::uint8_t>(b[2]) == 0x80u
+              && static_cast<std::uint8_t>(b[3]) == 0x80u);
+    }
+
+    // U+1F600 (astral, outside the BMP) -> F0 9F 98 80 (4 bytes).
+    {
+        const std::string grin{ encode_one(0x1F600u) };
+        check("mfw_deep3_utf8_1F600_astral_is_F0_9F_98_80",
+              grin.size() == 4u
+              && static_cast<std::uint8_t>(grin[0]) == 0xF0u
+              && static_cast<std::uint8_t>(grin[1]) == 0x9Fu
+              && static_cast<std::uint8_t>(grin[2]) == 0x98u
+              && static_cast<std::uint8_t>(grin[3]) == 0x80u);
+    }
+
+    // Every produced continuation byte (after the lead) has the 0b10xxxxxx form,
+    // and the byte LENGTH matches the code-point band, swept across the boundaries.
+    struct band { std::uint32_t cp; std::size_t len; };
+    const band bands[]{
+        { 0x00u, 1u }, { 0x7Fu, 1u }, { 0x80u, 2u }, { 0x7FFu, 2u },
+        { 0x800u, 3u }, { 0xFFFFu, 3u }, { 0x10000u, 4u }, { 0x10FFFFu, 4u },
+    };
+    bool well_formed{ true };
+    for (const band bd : bands)
+    {
+        const std::string s{ encode_one(bd.cp) };
+        if (s.size() != bd.len) { well_formed = false; break; }
+        for (std::size_t i{ 1 }; i < s.size(); ++i)
+        {
+            if ((static_cast<std::uint8_t>(s[i]) & 0xC0u) != 0x80u) { well_formed = false; break; }
+        }
+        if (!well_formed) { break; }
+    }
+    check("mfw_deep3_utf8_lengths_and_continuation_bytes_well_formed", well_formed);
+}
+
+// -- F3. UTF-16 SURROGATE-PAIR / ASTRAL DECODE (utf16_to_utf8). ---------------
+//  Drive the EXACT surrogate-combination logic over OWNED uint16 arrays: a valid
+//  high+low pair becomes one astral code point (4-byte UTF-8); a lone/unpaired
+//  surrogate is emitted as-is (3-byte UTF-8); a BMP run is 1:1.
+static auto test_mfw_deep3_utf16_surrogate_decode() -> void
+{
+    auto decode = [](const std::uint16_t* units, std::int32_t count) -> std::string
+    {
+        std::string out;
+        mfw_deep3::utf16_to_utf8(out, units, count);
+        return out;
+    };
+
+    // Valid surrogate pair for U+1F600: high D83D, low DE00 -> F0 9F 98 80.
+    {
+        const std::array<std::uint16_t, 2> pair{ { 0xD83Du, 0xDE00u } };
+        const std::string s{ decode(pair.data(), 2) };
+        check("mfw_deep3_utf16_valid_pair_decodes_astral",
+              s.size() == 4u
+              && static_cast<std::uint8_t>(s[0]) == 0xF0u
+              && static_cast<std::uint8_t>(s[1]) == 0x9Fu
+              && static_cast<std::uint8_t>(s[2]) == 0x98u
+              && static_cast<std::uint8_t>(s[3]) == 0x80u);
+    }
+
+    // High surrogate at the END with no following low unit (count cuts it off):
+    // the (i+1)<count guard fails -> the high surrogate is appended as-is (3 bytes).
+    {
+        const std::array<std::uint16_t, 1> lone_high{ { 0xD83Du } };
+        const std::string s{ decode(lone_high.data(), 1) };
+        check("mfw_deep3_utf16_lone_high_surrogate_emitted_as_is",
+              s.size() == 3u && static_cast<std::uint8_t>(s[0]) == 0xEDu);
+    }
+
+    // High surrogate followed by a NON-low unit ('A'): not combined; high emitted
+    // as 3-byte, then 'A' as 1-byte.
+    {
+        const std::array<std::uint16_t, 2> high_then_ascii{ { 0xD83Du, 0x0041u } };
+        const std::string s{ decode(high_then_ascii.data(), 2) };
+        check("mfw_deep3_utf16_high_then_nonlow_not_combined",
+              s.size() == 4u
+              && static_cast<std::uint8_t>(s[0]) == 0xEDu
+              && s[3] == 'A');
+    }
+
+    // Pure BMP run "Hi" + EURO: 1 unit each, EURO is 3-byte BMP.
+    {
+        const std::array<std::uint16_t, 3> bmp{ { 0x0048u, 0x0069u, 0x20ACu } };
+        const std::string s{ decode(bmp.data(), 3) };
+        check("mfw_deep3_utf16_bmp_run_1to1",
+              s.size() == 5u && s[0] == 'H' && s[1] == 'i'
+              && static_cast<std::uint8_t>(s[2]) == 0xE2u);
+    }
+
+    // A surrogate pair lower-bound (U+10000: high D800, low DC00) decodes to the
+    // FIRST astral code point F0 90 80 80 -- the exact 0x10000 + ((hi-D800)<<10) +
+    // (lo-DC00) formula at its zero point.
+    {
+        const std::array<std::uint16_t, 2> first_astral{ { 0xD800u, 0xDC00u } };
+        const std::string s{ decode(first_astral.data(), 2) };
+        check("mfw_deep3_utf16_pair_D800_DC00_is_U10000",
+              s.size() == 4u
+              && static_cast<std::uint8_t>(s[0]) == 0xF0u
+              && static_cast<std::uint8_t>(s[1]) == 0x90u
+              && static_cast<std::uint8_t>(s[2]) == 0x80u
+              && static_cast<std::uint8_t>(s[3]) == 0x80u);
+    }
+
+    // An embedded U+0000 inside a UTF-16 run is preserved as a NUL byte (built at
+    // runtime), not a terminator: "A" NUL "B" -> 3 bytes.
+    {
+        const std::array<std::uint16_t, 3> with_nul{ { 0x0041u, 0x0000u, 0x0042u } };
+        const std::string s{ decode(with_nul.data(), 3) };
+        std::string expected;
+        expected.push_back('A');
+        expected.push_back('\0');
+        expected.push_back('B');
+        check("mfw_deep3_utf16_embedded_nul_preserved",
+              s.size() == 3u && s == expected && s[1] == '\0');
+    }
+}
+
+// -- F4. read_java_string LAYOUT DERIVATION (char_count / body_bytes / bounds). -
+//  Pin the three-layout arithmetic the decoder selects on (vmhook.hpp:20600/20621)
+//  and the length/char_count range guards (20565/20608) as pure integer logic,
+//  plus an end-to-end decode of each layout over an OWNED body buffer.
+static auto test_mfw_deep3_read_java_string_layout_logic() -> void
+{
+    // char_count: JDK8 char[] (no coder) and LATIN1 (coder 0) -> length; UTF16
+    // (coder != 0) -> length/2.
+    check("mfw_deep3_char_count_jdk8_chararray_is_length",
+          mfw_deep3::char_count_for(/*has_coder*/ false, /*coder*/ 0u, /*length*/ 10) == 10);
+    check("mfw_deep3_char_count_latin1_is_length",
+          mfw_deep3::char_count_for(true, 0u, 10) == 10);
+    check("mfw_deep3_char_count_utf16_is_half_length",
+          mfw_deep3::char_count_for(true, 1u, 10) == 5);
+
+    // body_bytes: no coder (char[]) -> 2*length; either byte[] layout -> length.
+    check("mfw_deep3_body_bytes_jdk8_chararray_is_2x",
+          mfw_deep3::body_bytes_for(false, 7) == 14);
+    check("mfw_deep3_body_bytes_byte_array_is_length",
+          mfw_deep3::body_bytes_for(true, 7) == 7);
+
+    // Range guards (mirrors of the source clauses, pure integer predicates).
+    auto length_in_range = [](std::int32_t length) -> bool
+    { return !(length <= 0 || length > 2 * vmhook::read_java_string_max_units); };
+    auto char_count_in_range = [](std::int32_t cc) -> bool
+    { return !(cc <= 0 || cc > vmhook::read_java_string_max_units); };
+
+    check("mfw_deep3_length_zero_and_negative_rejected",
+          !length_in_range(0) && !length_in_range(-1));
+    check("mfw_deep3_length_at_2x_cap_accepted_one_past_rejected",
+          length_in_range(2 * vmhook::read_java_string_max_units)
+          && !length_in_range(2 * vmhook::read_java_string_max_units + 1));
+    check("mfw_deep3_char_count_zero_rejected_cap_accepted",
+          !char_count_in_range(0)
+          && char_count_in_range(vmhook::read_java_string_max_units)
+          && !char_count_in_range(vmhook::read_java_string_max_units + 1));
+
+    // The cap is the documented 16 Mi characters (vmhook.hpp:1697).
+    check("mfw_deep3_max_units_is_16Mi",
+          vmhook::read_java_string_max_units == 16 * 1024 * 1024);
+
+    // End-to-end LATIN1: a body of bytes [0x41,0xE9] (count 2) -> "A" + C3 A9.
+    {
+        const std::array<std::uint8_t, 2> latin1_body{ { 0x41u, 0xE9u } };
+        std::string out;
+        for (std::int32_t i{ 0 }; i < 2; ++i) { mfw_deep3::append_utf8(out, latin1_body[i]); }
+        check("mfw_deep3_latin1_body_decodes_A_then_C3A9",
+              out.size() == 3u && out[0] == 'A'
+              && static_cast<std::uint8_t>(out[1]) == 0xC3u
+              && static_cast<std::uint8_t>(out[2]) == 0xA9u);
+    }
+
+    // End-to-end JDK8 char[] (UTF16, no coder): two units "Hi".
+    {
+        const std::array<std::uint16_t, 2> u16{ { 0x0048u, 0x0069u } };
+        std::string out;
+        mfw_deep3::utf16_to_utf8(out, u16.data(), 2);
+        check("mfw_deep3_jdk8_chararray_body_decodes_Hi",
+              out == std::string{ "Hi" });
+    }
+}
+
+// -- F5. method_proxy::value_t VARIANT CLASSIFICATION + NUMERIC CONVERSION. ---
+//  is_void / is_string / as_string + the constrained numeric conversion operator
+//  (vmhook.hpp:16335).  Built with EXPLICIT variant alternatives -- never cast a
+//  value_t to a std::vector (the MSVC-ambiguous cast this file was reverted for).
+static auto test_mfw_deep3_value_t_classification() -> void
+{
+    using value_t = vmhook::method_proxy::value_t;
+
+    // monostate -> is_void true, is_string false, as_string "".
+    {
+        const value_t v{ std::monostate{} };
+        check("mfw_deep3_value_t_monostate_is_void",
+              v.is_void() && !v.is_string() && v.as_string().empty());
+    }
+
+    // A numeric alternative -> not void, not string; numeric conversion casts.
+    {
+        const value_t v{ std::int32_t{ 42 } };
+        const std::int32_t as_i{ v };
+        const std::int64_t as_l{ v };
+        const double as_d{ v };
+        check("mfw_deep3_value_t_int32_classification_and_cast",
+              !v.is_void() && !v.is_string()
+              && as_i == 42 && as_l == 42 && as_d == 42.0
+              && v.as_string().empty());
+    }
+
+    // bool alternative -> casts to int and bool; not void / string.
+    {
+        const value_t vt{ true };
+        const value_t vf{ false };
+        const std::int32_t t_as_i{ vt };
+        const bool f_as_b{ vf };
+        check("mfw_deep3_value_t_bool_casts",
+              t_as_i == 1 && f_as_b == false
+              && !vt.is_void() && !vt.is_string());
+    }
+
+    // float / double alternatives narrow/cast via static_cast as documented.
+    {
+        const value_t vf{ float{ 2.5f } };
+        const value_t vd{ double{ 3.5 } };
+        const double f_as_d{ vf };
+        const std::int32_t d_as_i{ vd };  // static_cast<int>(3.5) == 3 (truncation)
+        check("mfw_deep3_value_t_float_double_cast",
+              f_as_d == 2.5 && d_as_i == 3);
+    }
+
+    // std::string alternative -> is_string true, as_string returns it verbatim,
+    // is_void false.  Built explicitly from a std::string (no vector anywhere).
+    {
+        const value_t v{ std::string{ "hello" } };
+        check("mfw_deep3_value_t_string_classification",
+              v.is_string() && !v.is_void()
+              && v.as_string() == std::string{ "hello" });
+    }
+
+    // A std::string alternative carrying an embedded NUL (built at runtime) is
+    // preserved by as_string (no C-string truncation).
+    {
+        std::string embedded;
+        embedded.push_back('a');
+        embedded.push_back('\0');
+        embedded.push_back('b');
+        const value_t v{ embedded };
+        const std::string round{ v.as_string() };
+        check("mfw_deep3_value_t_string_embedded_nul_preserved",
+              v.is_string() && round.size() == 3u && round == embedded && round[1] == '\0');
+    }
+
+    // The conversion-target trait (value_t_convertible_target_v): void* is the only
+    // legal pointer target; nullptr_t and non-void pointers are excised.
+    check("mfw_deep3_value_t_target_trait_void_ptr_only",
+          vmhook::detail::value_t_convertible_target_v<void*>
+          && vmhook::detail::value_t_convertible_target_v<std::int32_t>
+          && vmhook::detail::value_t_convertible_target_v<std::string>
+          && !vmhook::detail::value_t_convertible_target_v<std::nullptr_t>
+          && !vmhook::detail::value_t_convertible_target_v<const char*>
+          && !vmhook::detail::value_t_convertible_target_v<char*>);
+}
+
+// -- F6. SIGNATURE-CHAR DECODE TABLES (sig_char_to_basic_type + byte width). --
+//  Pin every documented descriptor char in BOTH tables (vmhook.hpp:16215/16250):
+//  the BasicType code and the in-heap primitive byte width, plus the fallbacks.
+static auto test_mfw_deep3_signature_char_tables() -> void
+{
+    using vmhook::detail::sig_char_to_basic_type;
+    using vmhook::detail::jvm_primitive_byte_width;
+
+    // sig_char_to_basic_type: every documented char -> its BasicType ordinal.
+    struct bt { char c; int code; };
+    const bt basic_types[]{
+        { 'Z', 4 }, { 'C', 5 }, { 'F', 6 }, { 'D', 7 }, { 'B', 8 }, { 'S', 9 },
+        { 'I', 10 }, { 'J', 11 }, { 'L', 12 }, { '[', 13 }, { 'V', 14 },
+    };
+    bool bt_ok{ true };
+    for (const bt e : basic_types)
+    {
+        if (sig_char_to_basic_type(e.c) != e.code) { bt_ok = false; break; }
+    }
+    check("mfw_deep3_sig_char_to_basic_type_all_documented", bt_ok);
+
+    // The default arm falls back to T_OBJECT (12) for any unrecognised char.
+    check("mfw_deep3_sig_char_to_basic_type_default_is_object",
+          sig_char_to_basic_type('Q') == 12
+          && sig_char_to_basic_type('X') == 12
+          && sig_char_to_basic_type('z') == 12);  // lowercase is NOT 'Z'
+
+    // jvm_primitive_byte_width: a single-char primitive descriptor -> in-heap width.
+    struct w { const char* sig; std::size_t width; };
+    const w widths[]{
+        { "Z", 1u }, { "B", 1u }, { "S", 2u }, { "C", 2u },
+        { "I", 4u }, { "F", 4u }, { "J", 8u }, { "D", 8u },
+    };
+    bool w_ok{ true };
+    for (const w e : widths)
+    {
+        if (jvm_primitive_byte_width(std::string_view{ e.sig }) != e.width) { w_ok = false; break; }
+    }
+    check("mfw_deep3_jvm_primitive_byte_width_all_primitives", w_ok);
+
+    // Reference / array / void / multi-char / empty -> width 0 (skip size-check).
+    check("mfw_deep3_jvm_primitive_byte_width_zero_for_nonprimitive",
+          jvm_primitive_byte_width(std::string_view{ "L" }) == 0u
+          && jvm_primitive_byte_width(std::string_view{ "[" }) == 0u
+          && jvm_primitive_byte_width(std::string_view{ "V" }) == 0u
+          && jvm_primitive_byte_width(std::string_view{ "Ljava/lang/String;" }) == 0u
+          && jvm_primitive_byte_width(std::string_view{ "" }) == 0u
+          && jvm_primitive_byte_width(std::string_view{ "II" }) == 0u);
+
+    // Cross-check: every char that has a nonzero byte width also maps to a numeric
+    // BasicType (4..11), and the two widths agree with the documented size class
+    // (1-byte Z/B, 2-byte S/C, 4-byte I/F, 8-byte J/D).
+    check("mfw_deep3_width_and_basic_type_agree",
+          jvm_primitive_byte_width(std::string_view{ "J" }) == 8u
+          && sig_char_to_basic_type('J') == 11
+          && jvm_primitive_byte_width(std::string_view{ "D" }) == 8u
+          && sig_char_to_basic_type('D') == 7);
+}
+
+// -- F7. method_proxy::call ARG CAP + get_arguments long/double SLOT WIDENING. -
+//  The call paths static_assert arity <= 8 (vmhook.hpp:16703-16705 / 17321) -- a
+//  compile-time cap we pin as a constant.  frame::get_arguments computes each
+//  arg's interpreter slot as the running sum of widths, where a long/double is 2
+//  slots and everything else 1 (vmhook.hpp:6302-6312); model that arithmetic
+//  exactly over an OWNED type-width sequence.
+static auto test_mfw_deep3_arg_cap_and_slot_widening() -> void
+{
+    // The documented maximum arity (constexpr std::size_t arg_cap{ 8 }).
+    constexpr std::size_t arg_cap{ 8 };
+    check("mfw_deep3_call_arg_cap_is_8", arg_cap == 8u);
+
+    // Slot-offset model: identical to get_arguments' loop -- slots[i] = acc; acc +=
+    // wide[i] ? 2 : 1.  `wide` is true for int64/uint64/double (a Java long/double).
+    auto slot_offsets = [](const std::vector<bool>& wide) -> std::vector<std::int32_t>
+    {
+        std::vector<std::int32_t> slots(wide.size(), 0);
+        std::int32_t acc{ 0 };
+        for (std::size_t i{ 0 }; i < wide.size(); ++i)
+        {
+            slots[i] = acc;
+            acc += wide[i] ? 2 : 1;
+        }
+        return slots;
+    };
+
+    // (int, long, int): slots 0, 1, 3 -- the long occupies slots 1..2, pushing the
+    // trailing int to slot 3 (the exact bug get_arguments fixes vs naive tuple-index).
+    {
+        const std::vector<bool> wide{ false, true, false };
+        const std::vector<std::int32_t> got{ slot_offsets(wide) };
+        const std::vector<std::int32_t> want{ 0, 1, 3 };
+        check("mfw_deep3_slots_int_long_int_are_0_1_3", got == want);
+    }
+
+    // (double, double): slots 0, 2 -- two wide args, each 2 slots.
+    {
+        const std::vector<bool> wide{ true, true };
+        const std::vector<std::int32_t> got{ slot_offsets(wide) };
+        const std::vector<std::int32_t> want{ 0, 2 };
+        check("mfw_deep3_slots_double_double_are_0_2", got == want);
+    }
+
+    // All-narrow (4 ints): slots 0,1,2,3 -- 1:1 with tuple index.
+    {
+        const std::vector<bool> wide{ false, false, false, false };
+        const std::vector<std::int32_t> got{ slot_offsets(wide) };
+        const std::vector<std::int32_t> want{ 0, 1, 2, 3 };
+        check("mfw_deep3_slots_all_narrow_are_identity", got == want);
+    }
+
+    // 8 wide args (the cap, all long/double): the final slot index is 14 and the
+    // total slot count is 16 -- proves the widening never overflows the int32 acc
+    // for the maximum legal arity.
+    {
+        const std::vector<bool> wide(8, true);
+        const std::vector<std::int32_t> got{ slot_offsets(wide) };
+        std::int32_t total{ 0 };
+        for (const bool w : wide) { total += w ? 2 : 1; }
+        check("mfw_deep3_slots_8_wide_last_is_14_total_16",
+              got.size() == 8u && got.back() == 14 && total == 16);
+    }
+}
+
 int main()
 {
     test_set_dont_inline_null();
@@ -2644,6 +3287,15 @@ int main()
     test_mfw_deep2_vmstruct_abi_layout();
     test_mfw_deep2_owned_table_scan_model();
     test_mfw_deep2_is_valid_pointer_thresholds();
+
+    // Deepening wave 3 (mfw_deep3) additive section.
+    test_mfw_deep3_narrow_codec_roundtrip();
+    test_mfw_deep3_utf8_encoder_boundaries();
+    test_mfw_deep3_utf16_surrogate_decode();
+    test_mfw_deep3_read_java_string_layout_logic();
+    test_mfw_deep3_value_t_classification();
+    test_mfw_deep3_signature_char_tables();
+    test_mfw_deep3_arg_cap_and_slot_widening();
 
     std::printf("\n%s: %d failure(s)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;

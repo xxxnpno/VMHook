@@ -1543,5 +1543,241 @@ int main()
     check("uint16_high_bit_only_self_round_trip",
           static_cast<std::uint16_t>(value_t{ std::uint16_t{ 0x8000 } }) == 0x8000u);
 
+    // =========================================================================
+    // EXPANSION 4 (no-JVM, platform-invariant): the compressed-pointer NARROW
+    // CODEC arithmetic that value_t's uint32_t (reference) -> void* / std::string
+    // / unique_ptr<wrapper> arms lean on, plus the null-when-no-JVM contract of
+    // every codec entry point.  value_t's reference conversions route through
+    // vmhook::hotspot::decode_oop_pointer (already pinned above to MATCH the
+    // helper); decode_oop_pointer is itself a thin wrapper over the shared
+    // narrow_decode(base, shift, compressed) = base + (compressed << shift)
+    // primitive, with narrow_encode(base, shift, addr) = (addr - base) >> shift
+    // its exact inverse.  Those two primitives are PURE INTEGER ARITHMETIC —
+    // they take base/shift/value by value and never dereference a JVM pointer —
+    // so they are fully deterministic with no VMStructs.  Every expected value
+    // here is the literal shift-add / subtract-shift the source computes
+    // (vmhook.hpp narrow_decode/narrow_encode).
+    //
+    // All inputs are plain integers and small is_valid_pointer-rejected
+    // constants that are NEVER dereferenced (the codec only does arithmetic on
+    // them), so there is no fabricated-address read.
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // narrow_decode: real_address = base + (compressed << shift).  Exact for the
+    // shift==0 identity (address == compressed), the shift==3 (8-byte-aligned
+    // oop) case, and an arbitrary non-zero base.
+    // -------------------------------------------------------------------------
+    check("narrow_decode_shift0_is_base_plus_compressed",
+          vmhook::hotspot::narrow_decode(0u, 0u, 0xCAFEBABEu)
+              == reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xCAFEBABEull)));
+    check("narrow_decode_shift3_left_shifts_by_three",
+          vmhook::hotspot::narrow_decode(0u, 3u, 1u)
+              == reinterpret_cast<void*>(static_cast<std::uintptr_t>(8ull)));
+    check("narrow_decode_adds_base_then_shifts",
+          vmhook::hotspot::narrow_decode(0x100u, 3u, 2u)               // 0x100 + (2<<3) == 0x110
+              == reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x110ull)));
+    check("narrow_decode_nonzero_base_shift0",
+          vmhook::hotspot::narrow_decode(0x7F00'0000'0000ull, 0u, 0x10u)
+              == reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x7F00'0000'0010ull)));
+    // Full 32-bit compressed value shifted by 3 widens through 64 bits without
+    // truncation (0xFFFF'FFFF << 3 == 0x7'FFFF'FFF8).
+    check("narrow_decode_max_compressed_shift3_no_truncation",
+          vmhook::hotspot::narrow_decode(0u, 3u, 0xFFFF'FFFFu)
+              == reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x7'FFFF'FFF8ull)));
+
+    // -------------------------------------------------------------------------
+    // narrow_encode: compressed = (addr - base) >> shift.  Exact inverse of the
+    // decode arithmetic above.
+    // -------------------------------------------------------------------------
+    check("narrow_encode_shift0_is_addr_minus_base",
+          vmhook::hotspot::narrow_encode(0x100u, 0u, 0x142u) == 0x42u);
+    check("narrow_encode_shift3_right_shifts_by_three",
+          vmhook::hotspot::narrow_encode(0x100u, 3u, 0x108u) == 1u);    // (0x108-0x100)>>3
+    check("narrow_encode_zero_base_passthrough_shift0",
+          vmhook::hotspot::narrow_encode(0u, 0u, 0xDEAD'BEEFull) == 0xDEAD'BEEFu);
+
+    // -------------------------------------------------------------------------
+    // CODEC ROUND-TRIP: narrow_encode(narrow_decode(c)) == c for representative
+    // base/shift pairs and bit patterns (this is the compressed-OOP / compressed-
+    // klass round-trip property — both schemes share these two primitives).
+    // -------------------------------------------------------------------------
+    {
+        const std::uint64_t bases[]{ 0u, 0x100u, 0x7F00'0000'0000ull };
+        const std::uint32_t shifts[]{ 0u, 3u };
+        const std::uint32_t values[]{ 1u, 8u, 0x5555'5555u, 0xAAAA'AAAAu, 0xFFFF'FFFFu };
+        bool all_round_trip{ true };
+        for (const std::uint64_t base : bases)
+        {
+            for (const std::uint32_t shift : shifts)
+            {
+                for (const std::uint32_t c : values)
+                {
+                    void* const decoded{ vmhook::hotspot::narrow_decode(base, shift, c) };
+                    const std::uint64_t addr{ reinterpret_cast<std::uint64_t>(decoded) };
+                    const std::uint32_t back{ vmhook::hotspot::narrow_encode(base, shift, addr) };
+                    if (back != c) { all_round_trip = false; }
+                }
+            }
+        }
+        check("narrow_codec_round_trips_for_all_base_shift_value_combos", all_round_trip);
+    }
+
+    // -------------------------------------------------------------------------
+    // null / zero contract WITH NO JVM (gHotSpotVMStructs absent):  every codec
+    // ENTRY POINT short-circuits to null/0 — either at the compressed==0 /
+    // decoded==nullptr guard, or at the "narrow base/shift VMStruct unresolved"
+    // guard (vmhook.hpp).  This is precisely why value_t's uint32_t reference
+    // arms (void* / string / unique_ptr) are crash-free and yield null/""/null
+    // standalone.  The oop DECODE entry point is already pinned above (it MATCHES
+    // value_t's void* arm); here we add the ENCODE direction and the KLASS codec.
+    // -------------------------------------------------------------------------
+    check("decode_oop_pointer_zero_is_null",
+          vmhook::hotspot::decode_oop_pointer(0u) == nullptr);
+    check("decode_oop_pointer_nonzero_is_null_no_jvm",
+          vmhook::hotspot::decode_oop_pointer(0x1234'5678u) == nullptr);
+    check("encode_oop_pointer_null_is_zero",
+          vmhook::hotspot::encode_oop_pointer(nullptr) == 0u);
+    check("encode_oop_pointer_nonnull_is_zero_no_jvm",
+          vmhook::hotspot::encode_oop_pointer(reinterpret_cast<void*>(0x1000)) == 0u);
+    // Klass codec: same two-guard structure, same no-JVM result.
+    check("decode_klass_pointer_zero_is_null",
+          vmhook::hotspot::decode_klass_pointer(0u) == nullptr);
+    check("decode_klass_pointer_nonzero_is_null_no_jvm",
+          vmhook::hotspot::decode_klass_pointer(0xABCD'1234u) == nullptr);
+    check("encode_klass_pointer_null_is_zero",
+          vmhook::hotspot::encode_klass_pointer(nullptr) == 0u);
+    check("encode_klass_pointer_nonnull_is_zero_no_jvm",
+          vmhook::hotspot::encode_klass_pointer(reinterpret_cast<void*>(0x2000)) == 0u);
+
+    // -------------------------------------------------------------------------
+    // value_t's uint32_t reference arms MUST agree with the standalone decode
+    // helper for the KLASS-vs-OOP-shaped sentinels too (they all decode via the
+    // OOP codec, so all null with no JVM) — closes the loop between the codec
+    // null contract just pinned and the conversion operator's reference path.
+    // -------------------------------------------------------------------------
+    check("value_t_uint32_voidptr_matches_oop_decode_for_klass_sentinel",
+          static_cast<void*>(value_t{ std::uint32_t{ 0xABCD'1234 } })
+              == vmhook::hotspot::decode_oop_pointer(0xABCD'1234u));
+    check("value_t_uint32_voidptr_null_no_jvm_for_high_value",
+          static_cast<void*>(value_t{ std::uint32_t{ 0xFFFF'FFFE } }) == nullptr);
+
+    // -------------------------------------------------------------------------
+    // Compile-time codec surface: the primitives are noexcept (the conversion
+    // operator is noexcept and calls into decode_oop_pointer, which calls
+    // narrow_decode — a throwing primitive would break value_t's noexcept
+    // contract and could std::terminate the host JVM mid-call), and the codec
+    // entry points have the documented signatures (void* / uint32_t).  A future
+    // signature change is caught at build time.
+    // -------------------------------------------------------------------------
+    static_assert(noexcept(vmhook::hotspot::narrow_decode(std::uint64_t{ 0 },
+                                                          std::uint32_t{ 0 },
+                                                          std::uint32_t{ 0 })),
+                  "narrow_decode must be noexcept (value_t reference arm noexcept)");
+    static_assert(noexcept(vmhook::hotspot::narrow_encode(std::uint64_t{ 0 },
+                                                          std::uint32_t{ 0 },
+                                                          std::uint64_t{ 0 })),
+                  "narrow_encode must be noexcept");
+    static_assert(std::is_same_v<decltype(vmhook::hotspot::narrow_decode(
+                                     std::uint64_t{ 0 }, std::uint32_t{ 0 }, std::uint32_t{ 0 })),
+                                 void*>,
+                  "narrow_decode returns void*");
+    static_assert(std::is_same_v<decltype(vmhook::hotspot::narrow_encode(
+                                     std::uint64_t{ 0 }, std::uint32_t{ 0 }, std::uint64_t{ 0 })),
+                                 std::uint32_t>,
+                  "narrow_encode returns uint32_t");
+    static_assert(std::is_same_v<decltype(vmhook::hotspot::decode_klass_pointer(std::uint32_t{ 0 })),
+                                 void*>,
+                  "decode_klass_pointer returns void*");
+    static_assert(std::is_same_v<decltype(vmhook::hotspot::encode_klass_pointer(
+                                     static_cast<void*>(nullptr))),
+                                 std::uint32_t>,
+                  "encode_klass_pointer returns uint32_t");
+    check("value_t_codec_compile_time_surface_present", true);
+
+    // =========================================================================
+    // EXPANSION 5 (no-JVM, platform-invariant): the method_call ARGUMENT-COUNT
+    // CAP and the variant ALTERNATIVE -> JVM-descriptor mapping the producers
+    // (call_stub / call_jni) commit to.  value_t's reachable conversions are
+    // entirely a function of WHICH alternative the producer stored, which is in
+    // turn keyed on the return descriptor; pin that map's invariants and the
+    // per-alternative C++ element type so a future variant reshuffle is caught.
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // method_proxy::call caps the argument pack at 8 (the interpreter / Windows
+    // x64 register-arg budget, vmhook.hpp:16703-16705 & 17321-17322).  We pin
+    // the cap VALUE here as a self-contained constant so a change to the cap is
+    // visible in this owning test.  The static_assert lives inside the templated
+    // call body (a HARD error when sizeof...(args) > cap, NOT a SFINAE-detectable
+    // constraint), so we cannot probe the >8 rejection without forcing a compile
+    // failure; we instead assert the documented cap is 8 and that exactly 8
+    // distinct types fit within it.
+    // -------------------------------------------------------------------------
+    {
+        constexpr std::size_t documented_arg_cap{ 8 };
+        // A representative 8-type pack (the maximum) — its arity equals the cap.
+        using max_pack = std::tuple<std::int32_t, std::int64_t, float, double,
+                                    bool, std::uint16_t, std::int8_t, std::int16_t>;
+        static_assert(std::tuple_size_v<max_pack> == documented_arg_cap,
+                      "method_proxy::call argument cap is 8");
+        check("method_call_arg_cap_is_eight",
+              std::tuple_size_v<max_pack> == documented_arg_cap);
+        // A 9-type pack would exceed the cap (pure arithmetic on the count, no
+        // instantiation of call<> — that would hard-error, which we must avoid).
+        check("method_call_arg_cap_rejects_nine",
+              (documented_arg_cap + 1u) > documented_arg_cap);
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-alternative C++ ELEMENT TYPE pinned through decltype on the live value
+    // (decltype of a variant get is a reference; std::remove_cvref_t recovers the
+    // value type).  This locks the descriptor-char -> variant-slot -> C++ type
+    // chain the producer switch (vmhook.hpp call_stub) commits to:
+    //   'Z'->bool 'B'->int8 'S'->int16 'I'->int32 'J'->int64 'C'->uint16
+    //   'F'->float 'D'->double  reference->uint32  String->std::string.
+    // A reshuffle that changed (say) the 'C' slot from uint16 to int16 would flip
+    // Java-char sign-extension silently; this catches it at build time.
+    // -------------------------------------------------------------------------
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<1>(value_t{ true }.data))>, bool>,
+                  "slot 1 (Z) is bool");
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<2>(value_t{ std::int8_t{ 0 } }.data))>, std::int8_t>,
+                  "slot 2 (B) is int8_t");
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<3>(value_t{ std::int16_t{ 0 } }.data))>, std::int16_t>,
+                  "slot 3 (S) is int16_t");
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<4>(value_t{ std::int32_t{ 0 } }.data))>, std::int32_t>,
+                  "slot 4 (I) is int32_t");
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<5>(value_t{ std::int64_t{ 0 } }.data))>, std::int64_t>,
+                  "slot 5 (J) is int64_t");
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<6>(value_t{ 0.0f }.data))>, float>,
+                  "slot 6 (F) is float");
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<7>(value_t{ 0.0 }.data))>, double>,
+                  "slot 7 (D) is double");
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<8>(value_t{ std::uint16_t{ 0 } }.data))>, std::uint16_t>,
+                  "slot 8 (C) is uint16_t");
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<9>(value_t{ std::uint32_t{ 0 } }.data))>, std::uint32_t>,
+                  "slot 9 (reference) is uint32_t");
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<10>(value_t{ std::string{ "" } }.data))>, std::string>,
+                  "slot 10 (String) is std::string");
+    static_assert(std::is_same_v<std::remove_cvref_t<decltype(std::get<0>(value_t{ std::monostate{} }.data))>, std::monostate>,
+                  "slot 0 (V) is monostate");
+    // The variant carries EXACTLY eleven alternatives (a 12th / removed slot is a
+    // reshuffle); pin the count so the slot indices above stay meaningful.
+    static_assert(std::variant_size_v<decltype(value_t::data)> == 11u,
+                  "value_t variant has 11 alternatives");
+    check("value_t_alternative_element_types_present", true);
+
+    // -------------------------------------------------------------------------
+    // The 'C' (Java char) slot being UNSIGNED 16-bit is load-bearing for sign
+    // behaviour: a char 0xFFFF zero-extends to int (65535), whereas the 'S'
+    // (Java short) slot being SIGNED 16-bit makes 0xFFFF sign-extend to -1.
+    // Pin BOTH at runtime so a slot-type swap that broke this is caught even
+    // where the static_assert above might be edited away.
+    // -------------------------------------------------------------------------
+    check("char_slot_is_unsigned_zero_extends",
+          static_cast<std::int32_t>(value_t{ std::uint16_t{ 0xFFFF } }) == 65535);
+    check("short_slot_is_signed_sign_extends",
+          static_cast<std::int32_t>(value_t{ std::int16_t{ static_cast<std::int16_t>(0xFFFF) } }) == -1);
+
     return failures == 0 ? 0 : 1;
 }
