@@ -2278,6 +2278,232 @@ static auto test_value_t_aggregate_field_semantics() -> void
     check("is_reference_noexcept", noexcept(value_t{ false }.is_reference()));
 }
 
+// ---------------------------------------------------------------------------
+// 21. [ADDITIVE] vmhook::hotspot::narrow_decode / narrow_encode -- the PURE
+//     compressed-OOP codec ARITHMETIC primitive that decode_oop_pointer() /
+//     encode_oop_pointer() (and decode_klass_pointer / encode_klass_pointer)
+//     are built on.  Sections 7g / 9 pin that decode_oop_pointer() returns
+//     nullptr without a JVM (it needs the JVM-resolved base/shift), but the
+//     UNDERLYING shift-add / subtract-shift math is deterministic with NO JVM
+//     and NO memory read -- both are noexcept free functions taking the
+//     base/shift explicitly.  This section pins the codec's exact formula and
+//     its encode-then-decode identity round-trip over a representative bit-pattern
+//     matrix, which the file never exercised (it only ever observed the
+//     all-nullptr JVM-less decode result).
+//
+// Contract (header, vmhook.hpp narrow_decode / narrow_encode):
+//   narrow_decode(base, shift, c)   == (void*)( base + ((uint64_t)c << shift) )
+//   narrow_encode(base, shift, addr)== (uint32_t)( (addr - base) >> shift )
+// Both are PURE arithmetic on their arguments -- they never read *addr / *base,
+// so feeding them any integer base (even a "heap base"-looking constant) is
+// safe: nothing is dereferenced.  is_valid_pointer / klass_from_oop are NOT
+// involved here.  Every expected value below is computed by the SAME closed
+// form straight from the header, so a regression that altered the shift
+// direction, the base offset, or the unsigned widening fails loudly.
+//
+// ROUND-TRIP SOUNDNESS: encode(base,shift,decode(base,shift,c)) == c holds
+// EXACTLY when ((uint64_t)c << shift) does not overflow 64 bits.  c is 32-bit,
+// so the sweep restricts shift to [0,31] -- then c<<shift occupies at most
+// 63 bits, the low `shift` bits of (c<<shift) are zero, so subtracting base
+// and shifting right recovers c bit-for-bit.  Real HotSpot shifts are 0 or 3,
+// well inside that bound.
+// ---------------------------------------------------------------------------
+static auto test_narrow_codec_roundtrip() -> void
+{
+    using vmhook::hotspot::narrow_decode;
+    using vmhook::hotspot::narrow_encode;
+
+    // --- (c) narrow_encode closed-form: (addr - base) >> shift. ---
+    // narrow_encode takes addr as a std::uint64_t (NOT a pointer), so it is
+    // POINTER-WIDTH-INDEPENDENT -- these run identically on 32- and 64-bit
+    // pointer platforms.  Every expected value is the verbatim header formula.
+    {
+        bool enc_ok{ true };
+        const std::uint64_t bases[]{
+            0x0ull, 0x1000ull, 0x0000'7FF0'0000'0000ull, 0xFFFF'FFFF'0000'0000ull,
+        };
+        const std::uint32_t shifts[]{ 0u, 1u, 2u, 3u, 4u, 8u, 16u, 31u };
+        // addr values chosen as base + (c << shift) so the subtraction is exact.
+        const std::uint32_t comps[]{
+            0u, 1u, 5u, 0xFFu, 0x1234u, 0xFFFFu, 0x00AB'CDEFu,
+            0x7FFF'FFFFu, 0x8000'0000u, 0xFFFF'FFFFu,
+        };
+        for (const std::uint64_t base : bases)
+        {
+            for (const std::uint32_t shift : shifts)
+            {
+                for (const std::uint32_t c : comps)
+                {
+                    const std::uint64_t addr{ base + (static_cast<std::uint64_t>(c) << shift) };
+                    const std::uint32_t expected{
+                        static_cast<std::uint32_t>((addr - base) >> shift) };
+                    if (narrow_encode(base, shift, addr) != expected) { enc_ok = false; }
+                }
+            }
+        }
+        check("narrow_encode_matches_addr_minus_base_shifted", enc_ok);
+        // base==0, shift==0 is the identity for encode.
+        check("narrow_encode_base0_shift0_identity",
+              narrow_encode(0u, 0u, 0x1234'5678ull) == 0x1234'5678u);
+        // shift==0, non-zero base: encode is the exact inverse subtraction.
+        check("narrow_encode_shift0_is_addr_minus_base",
+              narrow_encode(0x0000'0007'0000'0000ull, 0u,
+                            0x0000'0007'0000'0000ull + 0xFFFFu) == 0xFFFFu);
+    }
+
+    // --- (d) ROUND-TRIP via the FORMULA addr: encode(base,shift, base+(c<<shift))
+    //         == c for the whole 32-bit compressed matrix with shift in [0,31]
+    //         (no top overflow).  POINTER-WIDTH-INDEPENDENT: the addr is built
+    //         from the closed form in 64-bit, never via the void* result, so the
+    //         inverse is pinned on every platform.  This is the encode-then-decode identity
+    //         identity expressed through the math the codec is specified by. ---
+    {
+        const std::uint64_t bases[]{
+            0x0ull, 0x1000ull, 0x0000'0007'0000'0000ull, 0xFFFF'FFFF'0000'0000ull,
+        };
+        const std::uint32_t shifts[]{ 0u, 1u, 3u, 4u, 8u, 16u, 31u };
+        const std::uint32_t comps[]{
+            0u, 1u, 2u, 3u, 7u, 8u, 0xFu, 0xFFu, 0x0100u, 0xFFFFu,
+            0x0001'0000u, 0x0080'0000u, 0x7FFF'FFFFu, 0x8000'0000u,
+            0xC000'0000u, 0xFFFF'FFFEu, 0xFFFF'FFFFu,
+        };
+        bool roundtrip_ok{ true };
+        for (const std::uint64_t base : bases)
+        {
+            for (const std::uint32_t shift : shifts)
+            {
+                for (const std::uint32_t c : comps)
+                {
+                    const std::uint64_t addr{ base + (static_cast<std::uint64_t>(c) << shift) };
+                    if (narrow_encode(base, shift, addr) != c) { roundtrip_ok = false; }
+                }
+            }
+        }
+        check("narrow_codec_encode_decode_roundtrip_is_identity", roundtrip_ok);
+    }
+
+    // --- (e) EXHAUSTIVE low-compressed round-trip 0..1023 at the real shifts
+    //         {0,3} over base 0 and a non-zero heap base -- small-domain sweep
+    //         proving the inverse is exact for every value in the range.  Uses
+    //         the formula addr (width-independent). ---
+    {
+        const std::uint64_t bases[]{ 0x0ull, 0x0000'0008'0000'0000ull };
+        const std::uint32_t shifts[]{ 0u, 3u };
+        bool exhaustive_ok{ true };
+        for (const std::uint64_t base : bases)
+        {
+            for (const std::uint32_t shift : shifts)
+            {
+                for (std::uint32_t c{ 0u }; c < 1024u; ++c)
+                {
+                    const std::uint64_t addr{ base + (static_cast<std::uint64_t>(c) << shift) };
+                    if (narrow_encode(base, shift, addr) != c) { exhaustive_ok = false; }
+                }
+            }
+        }
+        check("narrow_codec_exhaustive_low_range_roundtrip", exhaustive_ok);
+    }
+
+    // --- (a)+(b)+(f) narrow_decode POINTER output matches the closed form
+    //     base + (c << shift).  narrow_decode returns void*, so reading its bits
+    //     back via reinterpret_cast recovers the full address ONLY where pointers
+    //     are 64-bit (a 32-bit uintptr_t would truncate the high base/shift bits).
+    //     Guard the pointer-bit comparisons on the pointer width, mirroring the
+    //     file's existing `if constexpr (sizeof(void*) >= 8)` idiom -- nothing is
+    //     ever dereferenced; the function only computes base + shifted c. ---
+    if constexpr (sizeof(void*) >= 8)
+    {
+        auto decode_bits = [](std::uint64_t base, std::uint32_t shift,
+                              std::uint32_t c) noexcept -> std::uint64_t
+        {
+            return reinterpret_cast<std::uintptr_t>(narrow_decode(base, shift, c));
+        };
+
+        // (a) Exact closed-form across a base/shift/compressed matrix.
+        {
+            const std::uint64_t bases[]{
+                0x0ull, 0x1ull, 0x1000ull, 0x0000'0007'0000'0000ull,
+                0x0000'7FF0'0000'0000ull, 0xFFFF'FFFF'0000'0000ull,
+            };
+            const std::uint32_t shifts[]{ 0u, 1u, 2u, 3u, 4u, 8u, 16u, 31u };
+            const std::uint32_t comps[]{
+                0u, 1u, 2u, 3u, 7u, 0xFFu, 0xFFFFu, 0x0080'0000u,
+                0x0100'0000u, 0x7FFF'FFFFu, 0x8000'0000u, 0xFFFF'FFFFu,
+            };
+            bool all_formula_ok{ true };
+            for (const std::uint64_t base : bases)
+            {
+                for (const std::uint32_t shift : shifts)
+                {
+                    for (const std::uint32_t c : comps)
+                    {
+                        const std::uint64_t expected{
+                            base + (static_cast<std::uint64_t>(c) << shift) };
+                        if (decode_bits(base, shift, c) != expected) { all_formula_ok = false; }
+                    }
+                }
+            }
+            check("narrow_decode_matches_base_plus_shifted_compressed", all_formula_ok);
+        }
+
+        // (b) shift==0 special case: decode == base + c; full round-trip too.
+        {
+            bool shift0_ok{ true };
+            const std::uint64_t base{ 0x0000'0007'0000'0000ull };
+            const std::uint32_t comps[]{ 0u, 1u, 0xFFu, 0xFFFFu, 0x8000'0000u, 0xFFFF'FFFFu };
+            for (const std::uint32_t c : comps)
+            {
+                const std::uint64_t addr{ decode_bits(base, 0u, c) };
+                if (addr != base + c) { shift0_ok = false; }
+                if (narrow_encode(base, 0u, addr) != c) { shift0_ok = false; }
+            }
+            check("narrow_codec_shift0_decode_and_encode_exact", shift0_ok);
+            check("narrow_decode_base0_shift0_identity",
+                  decode_bits(0u, 0u, 0x1234'5678u) == 0x1234'5678ull);
+        }
+
+        // (f) shift moves bits LEFT by exactly `shift` positions (direction pin).
+        {
+            const std::uint32_t one{ 0x0000'0001u };
+            check("narrow_decode_shift0_is_c",  decode_bits(0u, 0u, one) == 0x1ull);
+            check("narrow_decode_shift1_is_2c", decode_bits(0u, 1u, one) == 0x2ull);
+            check("narrow_decode_shift3_is_8c", decode_bits(0u, 3u, one) == 0x8ull);
+            check("narrow_decode_shift4_is_16c",decode_bits(0u, 4u, one) == 0x10ull);
+            check("narrow_decode_multibit_shift3",
+                  decode_bits(0u, 3u, 0xABCDu) == (static_cast<std::uint64_t>(0xABCDu) << 3));
+            // FULL pointer-output round-trip closing the encode-then-decode identity loop
+            // through the ACTUAL void* result (not just the formula addr).
+            const std::uint64_t base{ 0x0000'0007'0000'0000ull };
+            bool ptr_roundtrip_ok{ true };
+            const std::uint32_t comps[]{ 0u, 1u, 0xFFFFu, 0x0080'0000u, 0xFFFF'FFFFu };
+            for (const std::uint32_t shift : { 0u, 3u, 16u })
+            {
+                for (const std::uint32_t c : comps)
+                {
+                    if (narrow_encode(base, shift, decode_bits(base, shift, c)) != c)
+                    {
+                        ptr_roundtrip_ok = false;
+                    }
+                }
+            }
+            check("narrow_codec_pointer_output_roundtrip_is_identity", ptr_roundtrip_ok);
+        }
+    }
+
+    // --- (g) Both primitives are noexcept (they run on detour threads via the
+    //         decode/encode wrappers that call them). ---
+    check("narrow_decode_noexcept", noexcept(narrow_decode(0u, 0u, 0u)));
+    check("narrow_encode_noexcept", noexcept(narrow_encode(0u, 0u, 0u)));
+
+    // --- (h) The PUBLIC decode_oop_pointer still returns nullptr without a JVM
+    //         even though the underlying arithmetic above is sound -- because the
+    //         base/shift are unresolvable here.  Ties this pure-math section back
+    //         to the JVM-less observable contract the rest of the file relies on:
+    //         a correct codec + an unresolved base == nullptr, never a wild ptr. ---
+    check("decode_oop_pointer_still_null_despite_sound_arithmetic",
+          vmhook::hotspot::decode_oop_pointer(0x0080'0000u) == nullptr);
+}
+
 int main()
 {
     // Registering the element wrappers mirrors real usage; harmless with no JVM.
@@ -2319,6 +2545,7 @@ int main()
     test_read_java_string_null_and_invalid();
     test_value_t_as_string_all_alternatives();
     test_value_t_aggregate_field_semantics();
+    test_narrow_codec_roundtrip();
 
     return failures == 0 ? 0 : 1;
 }

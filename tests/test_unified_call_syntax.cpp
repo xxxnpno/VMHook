@@ -1670,6 +1670,258 @@ namespace rt
     }
 }
 
+// =============================================================================
+// 31. DEEPEN -- LIVE value_t conversion / introspection over CONTROLLED, OWNED
+//              alternatives (pure std::visit + static_cast; NO memory reads)
+// =============================================================================
+// The runtime lane (Section 23) only exercised the DEFAULT-constructed value_t
+// (alternative 0).  The conversion operator (operator target_type() ->
+// std::visit + cast_for_variant) and the as_string()/is_*() introspectors fan
+// out over EVERY stored alternative, yet only the numeric/bool/string/monostate
+// alternatives are reachable WITHOUT touching the JVM: their cast_for_variant
+// branch is a plain `static_cast` (field/method value_t, vmhook.hpp), and
+// as_string()/is_reference()/is_void()/is_string() are pure
+// std::holds_alternative / static_cast over the variant.  The ONLY alternative
+// whose conversion reads memory is uint32_t (the compressed-OOP decode +
+// read_java_string / decode_array_oop path) -- which we DELIBERATELY never
+// populate here, so every check below is pure arithmetic over an OWNED value_t
+// we constructed on the stack.  Each expected value is derived directly from the
+// std::visit / static_cast logic in vmhook.hpp; C++20+ makes the
+// out-of-range integral narrowings used below well-defined (modulo 2^N).
+//
+// This is fully ADDITIVE: it routes through the EXISTING rt::check / rt::g_failures
+// harness via a namespace-scope object whose constructor runs before main(), so
+// main()'s existing failure-reporting picks the results up with no edits to main.
+namespace ucs_deepen_rt
+{
+    using fv_t = vmhook::field_proxy::value_t;
+    using mv_t = vmhook::method_proxy::value_t;
+
+    // Build an OWNED field value_t holding a chosen non-OOP alternative.
+    template<typename alt_t>
+    inline auto make_fv(const alt_t v) noexcept -> fv_t
+    {
+        fv_t out{};
+        out.data = v;
+        return out;
+    }
+    template<typename alt_t>
+    inline auto make_mv(const alt_t v) noexcept -> mv_t
+    {
+        mv_t out{};
+        out.data = v;
+        return out;
+    }
+
+    inline auto run() noexcept -> void
+    {
+        // ---- FIELD value_t : bool alternative (index 0) --------------------
+        {
+            const fv_t f{ make_fv<bool>(true) };
+            rt::check(f.data.index() == 0u,            "fv bool: active index 0");
+            rt::check(f.is_reference() == false,       "fv bool: is_reference() false");
+            rt::check(static_cast<int>(f) == 1,        "fv bool(true) -> int 1");
+            rt::check(static_cast<bool>(f) == true,    "fv bool(true) -> bool true");
+            rt::check(static_cast<std::int64_t>(f) == 1, "fv bool(true) -> int64 1");
+            rt::check(f.as_string().empty(),           "fv bool: as_string() empty (non-OOP)");
+        }
+        {
+            const fv_t f{ make_fv<bool>(false) };
+            rt::check(static_cast<int>(f) == 0,        "fv bool(false) -> int 0");
+            rt::check(static_cast<bool>(f) == false,   "fv bool(false) -> bool false");
+        }
+
+        // ---- FIELD value_t : int8_t alternative (index 1) ------------------
+        {
+            const fv_t f{ make_fv<std::int8_t>(static_cast<std::int8_t>(-1)) };
+            rt::check(f.data.index() == 1u,            "fv int8: active index 1");
+            rt::check(static_cast<int>(f) == -1,       "fv int8(-1) -> int -1 (sign-extended)");
+            rt::check(static_cast<std::int16_t>(f) == -1, "fv int8(-1) -> int16 -1");
+            rt::check(static_cast<std::int64_t>(f) == -1, "fv int8(-1) -> int64 -1");
+            rt::check(static_cast<bool>(f) == true,    "fv int8(-1) -> bool true (non-zero)");
+            rt::check(f.is_reference() == false,       "fv int8: is_reference() false");
+        }
+        {
+            const fv_t f{ make_fv<std::int8_t>(static_cast<std::int8_t>(127)) };
+            rt::check(f.data.index() == 1u,            "fv int8(127): active index 1");
+            rt::check(static_cast<int>(f) == 127,      "fv int8(127) -> int 127");
+        }
+
+        // ---- FIELD value_t : int16_t alternative (index 2) -----------------
+        {
+            const fv_t f{ make_fv<std::int16_t>(static_cast<std::int16_t>(-12345)) };
+            rt::check(f.data.index() == 2u,            "fv int16: active index 2");
+            rt::check(static_cast<int>(f) == -12345,   "fv int16(-12345) -> int -12345");
+            rt::check(static_cast<std::int64_t>(f) == -12345, "fv int16(-12345) -> int64 -12345");
+            rt::check(static_cast<bool>(f) == true,    "fv int16(-12345) -> bool true");
+        }
+
+        // ---- FIELD value_t : int32_t alternative (index 3) -----------------
+        {
+            const fv_t f{ make_fv<std::int32_t>(-7) };
+            rt::check(f.data.index() == 3u,            "fv int32: active index 3");
+            rt::check(static_cast<int>(f) == -7,       "fv int32(-7) -> int -7");
+            rt::check(static_cast<std::int64_t>(f) == -7, "fv int32(-7) -> int64 -7");
+            rt::check(static_cast<double>(f) == -7.0,  "fv int32(-7) -> double -7.0");
+            rt::check(static_cast<bool>(f) == true,    "fv int32(-7) -> bool true");
+            rt::check(f.as_string().empty(),           "fv int32: as_string() empty");
+        }
+        {
+            const fv_t f{ make_fv<std::int32_t>(0) };
+            rt::check(static_cast<int>(f) == 0,        "fv int32(0) -> int 0");
+            rt::check(static_cast<bool>(f) == false,   "fv int32(0) -> bool false");
+        }
+
+        // ---- FIELD value_t : int64_t alternative (index 4); C++20 narrowing
+        {
+            // 0x1'0000'0001 mod 2^32 == 1 (well-defined integral narrowing, C++20+).
+            const fv_t f{ make_fv<std::int64_t>(static_cast<std::int64_t>(0x100000001LL)) };
+            rt::check(f.data.index() == 4u,            "fv int64: active index 4");
+            rt::check(static_cast<std::int64_t>(f) == 0x100000001LL, "fv int64 round-trips to int64");
+            rt::check(static_cast<std::int32_t>(f) == 1, "fv int64(0x1_0000_0001) -> int32 1 (mod 2^32)");
+            rt::check(static_cast<bool>(f) == true,    "fv int64(non-zero) -> bool true");
+        }
+
+        // ---- FIELD value_t : float alternative (index 5); truncation-to-int
+        {
+            const fv_t f{ make_fv<float>(2.5f) };
+            rt::check(f.data.index() == 5u,            "fv float: active index 5");
+            rt::check(static_cast<int>(f) == 2,        "fv float(2.5) -> int 2 (truncates toward zero)");
+            rt::check(static_cast<double>(f) == 2.5,   "fv float(2.5) -> double 2.5 (exact in binary)");
+            rt::check(static_cast<bool>(f) == true,    "fv float(2.5) -> bool true");
+        }
+        {
+            const fv_t f{ make_fv<float>(0.0f) };
+            rt::check(static_cast<bool>(f) == false,   "fv float(0.0) -> bool false");
+        }
+
+        // ---- FIELD value_t : double alternative (index 6) ------------------
+        {
+            const fv_t f{ make_fv<double>(-3.75) };
+            rt::check(f.data.index() == 6u,            "fv double: active index 6");
+            rt::check(static_cast<int>(f) == -3,       "fv double(-3.75) -> int -3 (truncates toward zero)");
+            rt::check(static_cast<float>(f) == -3.75f, "fv double(-3.75) -> float -3.75 (exact in binary)");
+            rt::check(static_cast<bool>(f) == true,    "fv double(-3.75) -> bool true");
+        }
+
+        // ---- FIELD value_t : uint16_t alternative (index 7); Java char ------
+        {
+            const fv_t f{ make_fv<std::uint16_t>(static_cast<std::uint16_t>(65535u)) };
+            rt::check(f.data.index() == 7u,            "fv uint16: active index 7");
+            rt::check(static_cast<int>(f) == 65535,    "fv uint16(65535) -> int 65535 (zero-extended)");
+            rt::check(static_cast<std::int16_t>(f) == static_cast<std::int16_t>(-1),
+                      "fv uint16(65535) -> int16 -1 (mod 2^16, C++20)");
+            rt::check(static_cast<bool>(f) == true,    "fv uint16(65535) -> bool true");
+            rt::check(f.is_reference() == false,       "fv uint16: is_reference() false (NOT the uint32 OOP alt)");
+        }
+
+        // NOTE: the uint32_t alternative (index 8, is_reference()==true) is the
+        // OOP/array alternative; its conversion DECODES + reads memory, so it is
+        // intentionally NOT exercised here (would require a live OOP).  Section
+        // 25 already pins its TYPE at index 8 statically.
+
+        // ---- METHOD value_t : monostate (index 0) numeric fallbacks --------
+        {
+            const mv_t m{};   // default = monostate
+            rt::check(m.data.index() == 0u,            "mv default: active index 0 (monostate)");
+            rt::check(m.is_void() == true,             "mv monostate: is_void() true");
+            rt::check(m.is_string() == false,          "mv monostate: is_string() false");
+            rt::check(static_cast<std::int64_t>(m) == 0, "mv monostate -> int64 0 (no-cast fallback)");
+            rt::check(static_cast<double>(m) == 0.0,   "mv monostate -> double 0.0 (no-cast fallback)");
+            rt::check(static_cast<bool>(m) == false,   "mv monostate -> bool false (no-cast fallback)");
+        }
+
+        // ---- METHOD value_t : bool alternative (index 1) -------------------
+        {
+            const mv_t m{ make_mv<bool>(true) };
+            rt::check(m.data.index() == 1u,            "mv bool: active index 1");
+            rt::check(m.is_void() == false,            "mv bool: is_void() false");
+            rt::check(m.is_string() == false,          "mv bool: is_string() false");
+            rt::check(static_cast<int>(m) == 1,        "mv bool(true) -> int 1");
+            rt::check(m.as_string().empty(),           "mv bool: as_string() empty (non-string alt)");
+        }
+
+        // ---- METHOD value_t : int32_t alternative (index 4) ----------------
+        {
+            const mv_t m{ make_mv<std::int32_t>(5) };
+            rt::check(m.data.index() == 4u,            "mv int32: active index 4");
+            rt::check(static_cast<int>(m) == 5,        "mv int32(5) -> int 5");
+            rt::check(static_cast<std::int64_t>(m) == 5, "mv int32(5) -> int64 5");
+            rt::check(static_cast<double>(m) == 5.0,   "mv int32(5) -> double 5.0");
+            rt::check(m.is_void() == false,            "mv int32: is_void() false");
+            rt::check(m.as_string().empty(),           "mv int32: as_string() empty");
+        }
+
+        // ---- METHOD value_t : int64_t alternative (index 5) ----------------
+        {
+            const mv_t m{ make_mv<std::int64_t>(static_cast<std::int64_t>(-100)) };
+            rt::check(m.data.index() == 5u,            "mv int64: active index 5");
+            rt::check(static_cast<std::int64_t>(m) == -100, "mv int64(-100) round-trips");
+            rt::check(static_cast<int>(m) == -100,     "mv int64(-100) -> int -100 (in range)");
+        }
+
+        // ---- METHOD value_t : double alternative (index 7) -----------------
+        {
+            const mv_t m{ make_mv<double>(9.5) };
+            rt::check(m.data.index() == 7u,            "mv double: active index 7");
+            rt::check(static_cast<int>(m) == 9,        "mv double(9.5) -> int 9 (truncates)");
+            rt::check(static_cast<double>(m) == 9.5,   "mv double(9.5) -> double 9.5");
+        }
+
+        // ---- METHOD value_t : std::string alternative (index 10) -----------
+        // The std::string alternative is the eagerly-decoded String path; its
+        // conversion/as_string return the stored string DIRECTLY (no OOP decode,
+        // no memory read) -- the one class alternative safe to exercise here.
+        {
+            const mv_t m{ make_mv<std::string>(std::string{ "hi" }) };
+            rt::check(m.data.index() == 10u,           "mv string: active index 10");
+            rt::check(m.is_string() == true,           "mv string: is_string() true");
+            rt::check(m.is_void() == false,            "mv string: is_void() false");
+            rt::check(m.as_string() == "hi",           "mv string: as_string() returns the stored value");
+            rt::check(static_cast<std::string>(m) == "hi", "mv string -> std::string returns stored value");
+        }
+        {
+            const mv_t m{ make_mv<std::string>(std::string{}) };
+            rt::check(m.is_string() == true,           "mv empty-string: is_string() still true");
+            rt::check(m.as_string().empty(),           "mv empty-string: as_string() empty");
+        }
+
+        // ---- detail::jvm_primitive_byte_width : EXHAUSTIVE small-domain sweep
+        // The pure width classifier that gates read_array_value's element-width
+        // refusal (the value_t array-conversion substrate).  Pure string_view ->
+        // size_t, zero memory reads; every result is from the switch in vmhook.hpp.
+        {
+            using vmhook::detail::jvm_primitive_byte_width;
+            rt::check(jvm_primitive_byte_width("Z") == 1u, "byte_width('Z') == 1 (boolean)");
+            rt::check(jvm_primitive_byte_width("B") == 1u, "byte_width('B') == 1 (byte)");
+            rt::check(jvm_primitive_byte_width("S") == 2u, "byte_width('S') == 2 (short)");
+            rt::check(jvm_primitive_byte_width("C") == 2u, "byte_width('C') == 2 (char)");
+            rt::check(jvm_primitive_byte_width("I") == 4u, "byte_width('I') == 4 (int)");
+            rt::check(jvm_primitive_byte_width("F") == 4u, "byte_width('F') == 4 (float)");
+            rt::check(jvm_primitive_byte_width("J") == 8u, "byte_width('J') == 8 (long)");
+            rt::check(jvm_primitive_byte_width("D") == 8u, "byte_width('D') == 8 (double)");
+            // Object/array descriptors and unknown single chars -> 0.
+            rt::check(jvm_primitive_byte_width("L") == 0u, "byte_width('L') == 0 (object marker, not primitive)");
+            rt::check(jvm_primitive_byte_width("V") == 0u, "byte_width('V') == 0 (void, unknown)");
+            rt::check(jvm_primitive_byte_width("x") == 0u, "byte_width('x') == 0 (unknown char)");
+            // Wrong LENGTH (size != 1) -> 0, for every multi-char and empty case.
+            rt::check(jvm_primitive_byte_width("") == 0u,   "byte_width(\"\") == 0 (empty)");
+            rt::check(jvm_primitive_byte_width("II") == 0u, "byte_width(\"II\") == 0 (len 2)");
+            rt::check(jvm_primitive_byte_width("[I") == 0u, "byte_width(\"[I\") == 0 (array sig, len 2)");
+            rt::check(jvm_primitive_byte_width("Ljava/lang/String;") == 0u,
+                      "byte_width(object descriptor) == 0 (len > 1)");
+        }
+    }
+
+    // Namespace-scope object: its constructor runs run() BEFORE main(), feeding
+    // the EXISTING rt::g_failures counter so main()'s report covers these too.
+    struct runner_t
+    {
+        runner_t() noexcept { run(); }
+    };
+    const runner_t g_runner{};
+}
+
 // -----------------------------------------------------------------------------
 // main(): runs the small deterministic runtime lane, then reports.  All the
 // heavy coverage above is in static_asserts the compiler already evaluated.

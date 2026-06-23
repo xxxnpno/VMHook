@@ -2342,5 +2342,192 @@ int main()
         check("W_compile_time_char_family_acceptance_holds", true);
     }
 
+    // =====================================================================
+    // SECTION X -- ADDITIVE DEEPENING (this pass).  Four uncovered surfaces,
+    // every expected value traced directly from vmhook.hpp:
+    //   (X1) the PUBLIC re-export vmhook::jni::signature_for_arg<T>()
+    //        (vmhook.hpp:13711) -- a thin forward to detail::jni_signature_for_arg
+    //        the suite never touched; assert it returns the SAME descriptor as
+    //        the detail builder for a representative type of every category.
+    //   (X2) the ASSEMBLED ctor method-descriptor "(" + per-arg-sig... + ")V"
+    //        that jni_make_unique builds with the fold at vmhook.hpp:13481-13483.
+    //        The suite pins per-TYPE sigs (E/F/T) but never the concatenated
+    //        descriptor string the library actually feeds GetMethodID -- replicate
+    //        the exact fold here and pin the full string for several packs.
+    //   (X3) utf8_to_utf16 WIDTH-ADVANCE + over-max boundaries not in R/V:
+    //        2-byte / 3-byte forms FOLLOWED BY ASCII (proves adv lands the next
+    //        scalar correctly), back-to-back astral pairs (two adv=4 in a row),
+    //        a >U+10FFFF 4-byte form (0xF4 0x90 0x80 0x80 -> cp 0x110000, NOT
+    //        clamped), and a mid-range astral whose high-surrogate exercises the
+    //        cp>>10 boundary (U+24B62).
+    //   (X4) make_jni_args with an object at the FIRST and LAST slot of a pack
+    //        with a primitive + a string between -- a stricter ordering than K
+    //        (object at both ends), re-checking the reserve keeps the first
+    //        slot's .l stable to the end and the deref round-trips.
+    // No live JVM: all string arms stay .l==null/tag false (Section H); the
+    // UTF-16 DECODE is the pure function whose output the assertions pin.
+    // =====================================================================
+    {
+        // ---- (X1) public re-export parity (vmhook::jni::signature_for_arg) ----
+        // The public facade must forward verbatim to the detail builder for one
+        // representative of each descriptor category (bool/sub-int/int/long/fp/
+        // string/registered-object/unregistered-object-fallback).  registered_wrapper
+        // was inserted into type_to_class_map in Section F (runs earlier), so its
+        // L...; descriptor is resolvable here.
+        check("X1_pub_bool_Z",   vmhook::jni::signature_for_arg<bool>() == "Z");
+        check("X1_pub_int8_B",   vmhook::jni::signature_for_arg<std::int8_t>() == "B");
+        check("X1_pub_uint16_C", vmhook::jni::signature_for_arg<std::uint16_t>() == "C");
+        check("X1_pub_int16_S",  vmhook::jni::signature_for_arg<std::int16_t>() == "S");
+        check("X1_pub_int32_I",  vmhook::jni::signature_for_arg<std::int32_t>() == "I");
+        check("X1_pub_int64_J",  vmhook::jni::signature_for_arg<std::int64_t>() == "J");
+        check("X1_pub_float_F",  vmhook::jni::signature_for_arg<float>() == "F");
+        check("X1_pub_double_D", vmhook::jni::signature_for_arg<double>() == "D");
+        check("X1_pub_string_String",
+              vmhook::jni::signature_for_arg<std::string>() == "Ljava/lang/String;");
+        check("X1_pub_registered_object_Lname",
+              vmhook::jni::signature_for_arg<registered_wrapper>() == "Lcom/example/Widget;");
+        check("X1_pub_unregistered_object_fallback",
+              vmhook::jni::signature_for_arg<fake_object>() == "Ljava/lang/Object;");
+        // Public re-export must agree with the detail builder, not merely "look
+        // right": pin equality between the two for a decayed/cv-qualified spelling.
+        check("X1_pub_matches_detail_const_ref",
+              vmhook::jni::signature_for_arg<const std::int64_t&>()
+                  == sig<const std::int64_t&>());
+        check("X1_pub_matches_detail_char32",
+              vmhook::jni::signature_for_arg<char32_t>() == sig<char32_t>());
+
+        // ---- (X2) the assembled ctor descriptor "(" + sig... + ")V" ----------
+        // Replicate jni_make_unique's exact fold (vmhook.hpp:13481-13483):
+        //   std::string s{"("}; ((s += jni_signature_for_arg<remove_cvref_t<T>>()), ...); s += ")V";
+        // so the FULL descriptor string GetMethodID is handed is pinned, not just
+        // the per-type letters.  Each expected string is the in-order concatenation
+        // of the per-type descriptors derived from jni_signature_for_arg.
+        auto ctor_sig = [](auto... probes) -> std::string {
+            std::string s{ "(" };
+            ((s += vmhook::detail::jni_signature_for_arg<
+                       std::remove_cvref_t<decltype(probes)>>()), ...);
+            s += ")V";
+            return s;
+        };
+
+        // Empty ctor: "()V".
+        check("X2_empty_ctor_descriptor", ctor_sig() == "()V");
+
+        // (bool,int32,int64,float,double,std::string) -> "(ZIJFDLjava/lang/String;)V".
+        check("X2_mixed_primitive_string_descriptor",
+              ctor_sig(bool{ true }, std::int32_t{ 0 }, std::int64_t{ 0 },
+                       float{ 0.0f }, double{ 0.0 }, std::string{})
+                  == "(ZIJFDLjava/lang/String;)V");
+
+        // (int8,uint16,int16,registered_wrapper) -> "(BCSLcom/example/Widget;)V".
+        // Sub-int letters B/C/S in order, then the registered wrapper's L...;.
+        check("X2_subint_then_registered_object_descriptor",
+              ctor_sig(std::int8_t{ 0 }, std::uint16_t{ 0 }, std::int16_t{ 0 },
+                       registered_wrapper{})
+                  == "(BCSLcom/example/Widget;)V");
+
+        // Single-arg ctor: a char32_t arg -> "(I)V" (UTF-32 -> Java int).
+        check("X2_single_char32_descriptor",
+              ctor_sig(char32_t{ 0 }) == "(I)V");
+
+        // An unregistered object arg falls back to Ljava/lang/Object; inside the
+        // assembled descriptor exactly as in isolation (fake_object never mapped).
+        check("X2_unregistered_object_in_descriptor",
+              ctor_sig(std::int32_t{ 0 }, fake_object{ nullptr })
+                  == "(ILjava/lang/Object;)V");
+
+        // ---- (X3) utf8_to_utf16 width-advance + over-max boundaries ----------
+        using vmhook::detail::utf8_to_utf16;
+
+        // 2-byte form FOLLOWED by ASCII: U+00E9 (C3 A9, adv 2) then 'Z' (0x5A).
+        // A wrong adv would either drop 'Z' or mis-read A9 as a separate unit.
+        check("X3_2byte_then_ascii_advances",
+              units_eq(utf8_to_utf16(std::string_view{ "\xC3\xA9Z" }), { 0x00E9, 0x5A }));
+        // ASCII FOLLOWED by a 2-byte form that ends exactly at end-of-buffer:
+        // 'A' (i=0), then C3 A9 at i=1 with (i+1)=2 < 3 -> valid U+00E9.
+        check("X3_ascii_then_2byte_at_end",
+              units_eq(utf8_to_utf16(std::string_view{ "A\xC3\xA9" }), { 0x41, 0x00E9 }));
+        // 3-byte form FOLLOWED by ASCII: U+4E2D (E4 B8 AD, adv 3) then 'Z'.
+        check("X3_3byte_then_ascii_advances",
+              units_eq(utf8_to_utf16(std::string_view{ "\xE4\xB8\xADZ" }), { 0x4E2D, 0x5A }));
+
+        // Back-to-back ASTRAL: two emoji (each F0 9F 98 80, adv 4) -> FOUR units,
+        // two surrogate pairs in order.  Confirms adv=4 fires twice without drift.
+        check("X3_two_astral_pairs_back_to_back",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF0\x9F\x98\x80\xF0\x9F\x98\x80" }),
+                       { 0xD83D, 0xDE00, 0xD83D, 0xDE00 }));
+        check("X3_two_astral_decode_to_four_units",
+              utf8_to_utf16(std::string_view{ "\xF0\x9F\x98\x80\xF0\x9F\x98\x80" }).size() == 4);
+
+        // OVER-MAX 4-byte: F4 90 80 80 -> (0x04<<18)|(0x10<<12) = 0x110000, which
+        // is > U+10FFFF.  The decoder does NOT clamp: cp>=0x10000 so cp-=0x10000
+        // = 0x100000; high = 0xD800 + (0x100000>>10) = 0xD800 + 0x400 = 0xDC00;
+        // low = 0xDC00 + (0x100000 & 0x3FF) = 0xDC00.  Distinct over-max input
+        // from Section V's 0xF5 (different lead/payload, same no-clamp property).
+        check("X3_F4_overmax_4byte_surrogate_pair",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF4\x90\x80\x80" }),
+                       { 0xDC00, 0xDC00 }));
+
+        // Mid-range ASTRAL exercising the cp>>10 high-surrogate arithmetic with a
+        // NON-zero high remainder: U+24B62 (CJK-Ext-B, F0 A4 AD A2).  Payload =
+        // (0x24<<12)|(0x2D<<6)|0x22 = 0x24000|0xB40|0x22 = 0x24B62; cp-0x10000 =
+        // 0x14B62; high = 0xD800 + (0x14B62>>10)=0xD800+0x52=0xD852; low = 0xDC00
+        // + (0x14B62 & 0x3FF)=0xDC00+0x362=0xDF62.
+        check("X3_astral_24B62_surrogate_pair",
+              units_eq(utf8_to_utf16(std::string_view{ "\xF0\xA4\xAD\xA2" }),
+                       { 0xD852, 0xDF62 }));
+
+        // ---- (X4) make_jni_args object at FIRST and LAST of a mixed pack ------
+        // Stricter than K (which interleaved): an object at slot 0 AND the final
+        // slot, with a primitive + a string (null w/o JVM) between.  The reserve
+        // (= sizeof...(args)) must keep slot 0's re-homed .l valid through the
+        // push_back of the last object's handle.
+        {
+            std::vector<void*> object_handles{};
+            std::vector<char>  needs_release{};
+
+            fake_object first{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xF1F10000)) };
+            fake_object last{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xFAFA0000)) };
+
+            std::vector<vmhook::detail::jni_value> values{
+                vmhook::detail::make_jni_args(
+                    object_handles, needs_release,
+                    first,                               // 0 object (first)
+                    std::int32_t{ 0x0D0D0D0D },          // 1 primitive
+                    std::string{ "no_jvm" },             // 2 string -> .l null
+                    last) };                             // 3 object (last)
+
+            check("X4_value_count", values.size() == 4);
+            check("X4_handle_count", object_handles.size() == 2);
+
+            // Primitive + string untouched by the object re-homing.
+            check("X4_primitive_in_i", values[1].i == 0x0D0D0D0D);
+            check("X4_string_l_null", values[2].l == nullptr);
+
+            // Both object slots point at their OWN distinct handle cell, in order,
+            // and the cells hold the right instances.
+            check("X4_first_l_is_handle0",
+                  values[0].l == static_cast<void*>(&object_handles[0]));
+            check("X4_last_l_is_handle1",
+                  values[3].l == static_cast<void*>(&object_handles[1]));
+            check("X4_handle0_is_first", object_handles[0] == first.get_instance());
+            check("X4_handle1_is_last", object_handles[1] == last.get_instance());
+
+            // The FIRST object slot's .l (re-homed before the last push_back) still
+            // derefs to its instance -- proves the reserve kept it stable to the end.
+            check("X4_first_deref_is_instance",
+                  *static_cast<void**>(values[0].l) == first.get_instance());
+            check("X4_last_deref_is_instance",
+                  *static_cast<void**>(values[3].l) == last.get_instance());
+            // Distinct cells: a re-home bug pointing both at the same back() fails.
+            check("X4_object_cells_distinct", values[0].l != values[3].l);
+
+            // No local refs built (no JVM) -> every tag zero.
+            bool all_zero{ true };
+            for (const char tag : needs_release) { if (tag != 0) { all_zero = false; } }
+            check("X4_no_release_tags", all_zero);
+        }
+    }
+
     return failures == 0 ? 0 : 1;
 }

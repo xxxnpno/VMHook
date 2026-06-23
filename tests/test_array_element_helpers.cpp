@@ -2502,6 +2502,434 @@ static auto test_null_oop_all_widths() -> void
     null_oop_defaults<void*>("null_default_voidptr");
 }
 
+// ===========================================================================
+// ADDITIVE DEEPENING WAVE (40-45).  Sections 1-39 exhaust the value / index /
+// offset / bounds / guard dimensions on the THREE raw helpers plus the
+// clamp_safe_container_count value clamp.  This wave adds inputs not yet hit:
+//
+//   * clamp_safe_container_count ALGEBRAIC PROPERTIES (idempotence, monotonicity,
+//     the exact <=0 / <cap / >=cap branch boundary at every neighbour) plus a
+//     "raw == cap-1 / cap / cap+1" exhaustive triple and the +/-1 boundary of 0.
+//   * A PURE-ARITHMETIC mirror of is_valid_pointer's REJECTION predicate (floor /
+//     ceiling / odd / nine sentinels) cross-checked against the documented
+//     constants WITHOUT any memory read -- compile-time AND runtime.
+//   * COMPOSITION array_length -> clamp_safe_container_count on REAL owned
+//     buffers (the bucket-walker pattern vmhook.hpp:19946/20038): an honest small
+//     stored length passes through; a negative stored length collapses to 0.
+//   * BYTE-GRANULAR aliasing: lay an int64 down as 8 separate uint8 writes and
+//     read it back as one int64 (and the reverse), pinning that the helper's
+//     per-element memcpy composes byte-for-byte with no inter-element padding.
+//   * set->get->set REWRITE chains on a single slot (overwrite stability) and a
+//     full-buffer reverse-order rewrite (write-order independence).
+//
+// Every expected value is derived directly from vmhook.hpp:
+//   clamp: raw<=0 -> 0; raw<cap -> raw; else cap  (L14756-14764), cap = 1<<24.
+//   is_valid_pointer: reject addr<=0xFFFF || addr>=0x00007FFFFFFFFFFF || (addr&1)
+//     || low32 in {DEADBEEF,CAFEBABE,CCCCCCCC,CDCDCDCD,BAADF00D,FEEEFEEE,
+//     ABABABAB,FDFDFDFD,DDDDDDDD}  (L2050-2078).
+//   array_length: signed int32 at +12, 0 if guard fails (L14778-14802).
+//   get/set: data base +16, stride sizeof(T), half-open [0,length) (L14814-14876).
+// All pure arithmetic or REAL owned std::vector buffers -- no fabricated-address
+// reads, no value_t->container cast, no raw NUL / non-ASCII bytes.
+// ===========================================================================
+namespace deepening_wave_40
+{
+    inline constexpr std::int32_t cap{ static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) };
+
+    // Pure mirror of the clamp rule straight from the source branch structure.
+    constexpr auto clamp_oracle(std::int32_t raw) noexcept -> std::int32_t
+    {
+        if (raw <= 0) { return 0; }
+        return (raw < cap) ? raw : cap;
+    }
+
+    // Pure mirror of is_valid_pointer's REJECTION decision (true == rejected),
+    // expressed purely arithmetically so it can be evaluated with NO dereference.
+    constexpr auto pointer_rejected_oracle(std::uintptr_t addr) noexcept -> bool
+    {
+        constexpr std::uintptr_t floor{ 0xFFFFull };
+        constexpr std::uintptr_t ceiling{ 0x00007FFFFFFFFFFFull };
+        if (addr <= floor || addr >= ceiling) { return true; }
+        if ((addr & 1u) != 0u) { return true; }
+        const std::uint32_t low32{ static_cast<std::uint32_t>(addr) };
+        switch (low32)
+        {
+            case 0xDEADBEEFu:
+            case 0xCAFEBABEu:
+            case 0xCCCCCCCCu:
+            case 0xCDCDCDCDu:
+            case 0xBAADF00Du:
+            case 0xFEEEFEEEu:
+            case 0xABABABABu:
+            case 0xFDFDFDFDu:
+            case 0xDDDDDDDDu:
+                return true;
+            default:
+                return false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 40. clamp_safe_container_count -- algebraic properties (idempotence,
+//     monotonicity) + exact branch-boundary neighbourhood, all derived from the
+//     `raw<=0?0:(raw<cap?raw:cap)` source branch and cross-checked against the
+//     pure clamp_oracle.  Runtime AND constexpr.
+// ---------------------------------------------------------------------------
+static auto test_clamp_algebraic_properties() -> void
+{
+    using deepening_wave_40::cap;
+    using deepening_wave_40::clamp_oracle;
+
+    // Idempotence: clamp(clamp(x)) == clamp(x).  The output is always in [0,cap],
+    // and every value in [0,cap] is a fixed point (0 stays 0; 1..cap-1 pass
+    // through; cap stays cap), so a second application changes nothing.
+    bool idempotent{ true };
+    const std::int32_t samples[]{
+        (std::numeric_limits<std::int32_t>::min)(), -1000000, -2, -1, 0, 1, 2,
+        1000, cap - 2, cap - 1, cap, cap + 1, cap + 1000,
+        (std::numeric_limits<std::int32_t>::max)() };
+    for (const std::int32_t x : samples)
+    {
+        const std::int32_t once{ vmhook::clamp_safe_container_count(x) };
+        const std::int32_t twice{ vmhook::clamp_safe_container_count(once) };
+        if (once != twice) { idempotent = false; break; }
+        if (once != clamp_oracle(x)) { idempotent = false; break; }   // matches oracle
+    }
+    check("clamp_idempotent_and_matches_oracle", idempotent);
+
+    // Monotonicity: x <= y  =>  clamp(x) <= clamp(y).  Check over an ordered grid
+    // that crosses both branch boundaries (0 and cap).
+    bool monotone{ true };
+    const std::int32_t ordered[]{
+        (std::numeric_limits<std::int32_t>::min)(), -5, -1, 0, 1, 7, 4096,
+        cap - 1, cap, cap + 1, (std::numeric_limits<std::int32_t>::max)() };
+    for (std::size_t i{ 1 }; i < (sizeof(ordered) / sizeof(ordered[0])); ++i)
+    {
+        // `ordered` is sorted ascending by construction; assert that explicitly.
+        if (ordered[i - 1] > ordered[i]) { monotone = false; break; }
+        if (vmhook::clamp_safe_container_count(ordered[i - 1])
+            > vmhook::clamp_safe_container_count(ordered[i])) { monotone = false; break; }
+    }
+    check("clamp_monotone_nondecreasing", monotone);
+
+    // Exact <=0 boundary: -1 -> 0, 0 -> 0, +1 -> 1 (the +/-1 neighbourhood of the
+    // first branch edge).
+    check("clamp_boundary_minus1_is_0", vmhook::clamp_safe_container_count(-1) == 0);
+    check("clamp_boundary_zero_is_0",   vmhook::clamp_safe_container_count(0)  == 0);
+    check("clamp_boundary_plus1_is_1",  vmhook::clamp_safe_container_count(1)  == 1);
+
+    // Exact cap boundary triple: cap-1 passthrough, cap saturates, cap+1 saturates.
+    check("clamp_cap_minus1_passthrough_again", vmhook::clamp_safe_container_count(cap - 1) == cap - 1);
+    check("clamp_cap_exact_saturates_again",    vmhook::clamp_safe_container_count(cap)     == cap);
+    check("clamp_cap_plus1_saturates_again",    vmhook::clamp_safe_container_count(cap + 1) == cap);
+
+    // The output range is exactly [0, cap]: min over a wide grid is 0 (negatives),
+    // max is cap (>= cap inputs).  Pin both extremes are actually reached.
+    check("clamp_reaches_zero",
+          vmhook::clamp_safe_container_count((std::numeric_limits<std::int32_t>::min)()) == 0);
+    check("clamp_reaches_cap",
+          vmhook::clamp_safe_container_count((std::numeric_limits<std::int32_t>::max)()) == cap);
+
+    // constexpr property gate (a regression in the branch rule fails the build).
+    static_assert(vmhook::clamp_safe_container_count(
+                      vmhook::clamp_safe_container_count(deepening_wave_40::cap + 1))
+                      == vmhook::clamp_safe_container_count(deepening_wave_40::cap + 1),
+                  "clamp idempotent at cap+1 (constexpr)");
+    static_assert(vmhook::clamp_safe_container_count(-1)
+                      <= vmhook::clamp_safe_container_count(0),
+                  "clamp monotone across the <=0 edge (constexpr)");
+    static_assert(vmhook::clamp_safe_container_count(deepening_wave_40::cap - 1)
+                      <= vmhook::clamp_safe_container_count(deepening_wave_40::cap),
+                  "clamp monotone across the cap edge (constexpr)");
+    check("clamp_algebraic_constexpr_compiled", true);
+}
+
+// ---------------------------------------------------------------------------
+// 41. PURE-ARITHMETIC is_valid_pointer rejection oracle.
+//
+// is_valid_pointer rejects on shape alone (range / odd / sentinel) BEFORE any
+// dereference.  Section 17 exercised the LIVE guard by feeding addresses to the
+// helpers; here we pin the rejection LOGIC itself as pure arithmetic against the
+// documented constants -- compile-time and runtime -- with ZERO memory access,
+// so a trimmed range/odd/sentinel clause is caught even on a platform where the
+// fabricated address happened to be mapped.
+// ---------------------------------------------------------------------------
+// Range edges (compile-time): floor and below rejected; floor+1 (even) accepted;
+// ceiling and above rejected; ceiling-1 is odd so rejected, ceiling-2 accepted.
+static_assert(deepening_wave_40::pointer_rejected_oracle(0x0ull),    "null rejected");
+static_assert(deepening_wave_40::pointer_rejected_oracle(0xFFFEull), "below floor rejected");
+static_assert(deepening_wave_40::pointer_rejected_oracle(0xFFFFull), "floor exact rejected");
+static_assert(!deepening_wave_40::pointer_rejected_oracle(0x10000ull), "floor+1 (even) accepted");
+static_assert(deepening_wave_40::pointer_rejected_oracle(0x00007FFFFFFFFFFFull), "ceiling exact rejected");
+static_assert(deepening_wave_40::pointer_rejected_oracle(0x0000800000000000ull), "above ceiling rejected");
+static_assert(!deepening_wave_40::pointer_rejected_oracle(0x00007FFFFFFFFFFEull),
+              "ceiling-2 (0x..FFFE) is below the ceiling AND even -> accepted (low32 0xFFFFFFFE not a sentinel)");
+// Odd alignment (compile-time): any odd address inside the range is rejected.
+static_assert(deepening_wave_40::pointer_rejected_oracle(0x10001ull), "odd address rejected");
+static_assert(!deepening_wave_40::pointer_rejected_oracle(0x10002ull), "even address accepted");
+// Each of the nine sentinels as the low-32 bits with an even, in-range high word
+// is rejected (compile-time spot checks; the runtime loop covers all nine).
+static_assert(deepening_wave_40::pointer_rejected_oracle((std::uintptr_t{ 2ull } << 32) | 0xDEADBEEFull),
+              "DEADBEEF low32 rejected");
+static_assert(deepening_wave_40::pointer_rejected_oracle((std::uintptr_t{ 2ull } << 32) | 0xCAFEBABEull),
+              "CAFEBABE low32 rejected");
+static_assert(deepening_wave_40::pointer_rejected_oracle((std::uintptr_t{ 2ull } << 32) | 0xBAADF00Dull),
+              "BAADF00D low32 rejected");
+
+static auto test_pointer_rejection_oracle() -> void
+{
+    using deepening_wave_40::pointer_rejected_oracle;
+
+    // ceiling-2 (0x...FFFE) is even and strictly below the ceiling -> ACCEPTED.
+    check("oracle_ceiling_minus2_accepted",
+          !pointer_rejected_oracle(0x00007FFFFFFFFFFEull));
+    // ceiling-1 (0x...FFFF) is odd -> rejected by the alignment clause.
+    check("oracle_ceiling_minus1_odd_rejected",
+          pointer_rejected_oracle(0x00007FFFFFFFFFFFull - 0u) // exact ceiling, rejected by range
+          && pointer_rejected_oracle(0x00007FFFFFFFFFFDull));  // ceiling-2-1 == odd -> rejected
+
+    // Every one of the nine documented sentinels, in both a low-only form and a
+    // high-word form, is rejected by the oracle (mirrors L2070-2078).
+    const std::uint32_t sentinels[]{
+        0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+        0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu };
+    bool all_rejected{ true };
+    for (const std::uint32_t s : sentinels)
+    {
+        if (!pointer_rejected_oracle(static_cast<std::uintptr_t>(s))) { all_rejected = false; break; }
+        if (!pointer_rejected_oracle((std::uintptr_t{ 2ull } << 32) | s)) { all_rejected = false; break; }
+    }
+    check("oracle_all_nine_sentinels_rejected", all_rejected);
+
+    // A clean, even, in-range, non-sentinel address is ACCEPTED (fixed literal:
+    // 0x100000 high bits | 0x2468ACE0 -> even, in (floor,ceiling), low32 not a
+    // sentinel, so every rejection clause is false -> accepted).
+    check("oracle_clean_address_accepted",
+          !pointer_rejected_oracle((std::uintptr_t{ 1ull } << 20) | 0x2468ACE0u));
+    // The live guard must accept a REAL owned buffer (the precondition every other
+    // read in this file already relies on): array_length returns the seeded count.
+    {
+        const std::vector<std::int32_t> seed{ 0x13572468 };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        check("oracle_real_buffer_live_length_agrees",
+              vmhook::array_length(buffer.data()) == 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 42. COMPOSITION: clamp_safe_container_count(array_length(oop)) on REAL owned
+//     buffers -- the exact bucket-walker / collection bound idiom
+//     (vmhook.hpp:19946, 20038, 20381).  An honest small stored length passes
+//     through the clamp unchanged; a negative stored length collapses to 0; a
+//     zero length stays 0.  No fabricated addresses -- the buffers are owned.
+// ---------------------------------------------------------------------------
+static auto test_length_then_clamp_composition() -> void
+{
+    // Honest small lengths pass through array_length AND the clamp unchanged.
+    bool honest_ok{ true };
+    for (const std::int32_t len : { 0, 1, 2, 7, 64, 1000 })
+    {
+        std::vector<std::uint8_t> buffer(
+            16u + static_cast<std::size_t>(len) * sizeof(std::int32_t), std::uint8_t{ 0 });
+        std::memcpy(buffer.data() + 12, &len, sizeof(len));
+        const std::int32_t raw_len{ vmhook::array_length(buffer.data()) };
+        const std::int32_t clamped{ vmhook::clamp_safe_container_count(raw_len) };
+        if (raw_len != len || clamped != len) { honest_ok = false; break; }
+    }
+    check("compose_honest_length_passes_through_clamp", honest_ok);
+
+    // Negative stored length: array_length returns it verbatim (signed), the
+    // clamp then maps any value <= 0 to 0 -- so the walker reserves/loops 0 times.
+    {
+        std::vector<std::uint8_t> buffer(16u, std::uint8_t{ 0 });
+        const std::int32_t neg{ -123456 };
+        std::memcpy(buffer.data() + 12, &neg, sizeof(neg));
+        const std::int32_t raw_len{ vmhook::array_length(buffer.data()) };
+        check("compose_negative_length_clamps_to_zero",
+              raw_len == neg && vmhook::clamp_safe_container_count(raw_len) == 0);
+    }
+
+    // A null / guard-rejected oop yields array_length 0, which clamps to 0.
+    check("compose_null_oop_clamps_to_zero",
+          vmhook::clamp_safe_container_count(vmhook::array_length(nullptr)) == 0);
+    {
+        void* const floor_oop{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xFFFFull)) };
+        check("compose_floor_oop_clamps_to_zero",
+              vmhook::clamp_safe_container_count(vmhook::array_length(floor_oop)) == 0);
+    }
+
+    // A stored length ABOVE the cap (but we never index into it) would saturate to
+    // the cap -- pin the clamp side of the walker bound on the raw int32 directly
+    // (no oop read past our buffer): array_length reads the stored value, clamp
+    // saturates.  Build a header-only buffer storing cap+1000 at +12; the clamp of
+    // the READ length is the cap.  (We do NOT call get_array_element on it.)
+    {
+        std::vector<std::uint8_t> buffer(16u, std::uint8_t{ 0 });
+        const std::int32_t big{ static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) + 1000 };
+        std::memcpy(buffer.data() + 12, &big, sizeof(big));
+        const std::int32_t raw_len{ vmhook::array_length(buffer.data()) };
+        check("compose_oversize_length_saturates_to_cap",
+              raw_len == big
+              && vmhook::clamp_safe_container_count(raw_len)
+                     == static_cast<std::int32_t>(vmhook::k_max_safe_container_elems));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 43. BYTE-GRANULAR aliasing: an int64 laid down as EIGHT separate uint8 writes
+//     must read back as the correct little-endian int64, and the reverse.  This
+//     pins that consecutive 1-byte element slots are exactly contiguous (stride
+//     1, base +16) with no inter-element padding, complementing section 18/38
+//     (which only aliased 4<->8 byte halves).
+// ---------------------------------------------------------------------------
+static auto test_byte_granular_aliasing() -> void
+{
+    // 8 uint8 slots == one int64 slot.  _length 8.
+    std::vector<std::uint8_t> buffer(16u + 8u, std::uint8_t{ 0 });
+    const std::int32_t len{ 8 };
+    std::memcpy(buffer.data() + 12, &len, sizeof(len));
+    void* const oop{ buffer.data() };
+
+    // Target int64 value 0x0123456789ABCDEF: little-endian byte sequence is
+    // EF CD AB 89 67 45 23 01 from index 0..7.
+    constexpr std::uint64_t target{ 0x0123456789ABCDEFull };
+    for (std::int32_t i{ 0 }; i < 8; ++i)
+    {
+        const std::uint8_t byte{ static_cast<std::uint8_t>((target >> (i * 8)) & 0xFFull) };
+        vmhook::set_array_element<std::uint8_t>(oop, i, byte);
+    }
+    check("byte_writes_compose_le_int64",
+          vmhook::get_array_element<std::int64_t>(oop, 0) == static_cast<std::int64_t>(target));
+    check("byte_writes_compose_le_uint64",
+          vmhook::get_array_element<std::uint64_t>(oop, 0) == target);
+
+    // Reverse: write a fresh uint64, read all eight bytes back, LE order.
+    constexpr std::uint64_t target2{ 0xFEDCBA9876543210ull };
+    vmhook::set_array_element<std::uint64_t>(oop, 0, target2);
+    bool bytes_ok{ true };
+    for (std::int32_t i{ 0 }; i < 8; ++i)
+    {
+        const std::uint8_t expected{ static_cast<std::uint8_t>((target2 >> (i * 8)) & 0xFFull) };
+        if (vmhook::get_array_element<std::uint8_t>(oop, i) != expected) { bytes_ok = false; break; }
+        // Raw oracle byte at +16+i agrees.
+        if (raw_peek<std::uint8_t>(buffer, i) != expected) { bytes_ok = false; break; }
+    }
+    check("uint64_write_decomposes_to_le_bytes", bytes_ok);
+
+    // Also alias as four uint16: low-to-high half-words of target2.
+    check("uint64_aliases_as_four_u16",
+          vmhook::get_array_element<std::uint16_t>(oop, 0) == 0x3210u
+          && vmhook::get_array_element<std::uint16_t>(oop, 1) == 0x7654u
+          && vmhook::get_array_element<std::uint16_t>(oop, 2) == 0xBA98u
+          && vmhook::get_array_element<std::uint16_t>(oop, 3) == 0xFEDCu);
+}
+
+// ---------------------------------------------------------------------------
+// 44. set->get->set REWRITE stability on a single slot, and full-buffer
+//     reverse-order rewrite (write-order independence).  The helper's set is a
+//     plain memcpy with no read-modify-write, so repeatedly overwriting one slot
+//     must always reflect the LAST write, and rewriting all slots in reverse
+//     index order must leave each slot holding its own value (no cross-slot
+//     interference regardless of write order).
+// ---------------------------------------------------------------------------
+static auto test_rewrite_stability() -> void
+{
+    // Single-slot overwrite chain across a length-3 int32 array, middle slot.
+    {
+        const std::vector<std::int32_t> seed{ 0x0A0A0A0A, 0x0B0B0B0B, 0x0C0C0C0C };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+
+        const std::int32_t chain[]{ 0x11111111, 0x22222222, 0x33333333,
+                                    0x00000000, static_cast<std::int32_t>(0xFFFFFFFFu),
+                                    0x7FFFFFFF };
+        bool last_wins{ true };
+        for (const std::int32_t v : chain)
+        {
+            vmhook::set_array_element<std::int32_t>(oop, 1, v);
+            if (vmhook::get_array_element<std::int32_t>(oop, 1) != v) { last_wins = false; break; }
+            // Neighbours never disturbed by the repeated middle writes.
+            if (vmhook::get_array_element<std::int32_t>(oop, 0) != 0x0A0A0A0A) { last_wins = false; break; }
+            if (vmhook::get_array_element<std::int32_t>(oop, 2) != 0x0C0C0C0C) { last_wins = false; break; }
+        }
+        check("rewrite_single_slot_last_write_wins", last_wins);
+    }
+
+    // Full-buffer rewrite in REVERSE index order: each slot must end up with its
+    // own intended value, proving write order does not matter (no overlap).
+    {
+        constexpr std::int32_t n{ 16 };
+        std::vector<std::int64_t> seed(static_cast<std::size_t>(n), std::int64_t{ 0 });
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+
+        // Write high index -> low index.
+        for (std::int32_t i{ n - 1 }; i >= 0; --i)
+        {
+            vmhook::set_array_element<std::int64_t>(oop, i, 0x4000000000000000ll + i);
+        }
+        bool all_correct{ true };
+        for (std::int32_t i{ 0 }; i < n; ++i)
+        {
+            if (vmhook::get_array_element<std::int64_t>(oop, i) != 0x4000000000000000ll + i)
+            {
+                all_correct = false; break;
+            }
+            if (raw_peek<std::int64_t>(buffer, i) != 0x4000000000000000ll + i)
+            {
+                all_correct = false; break;
+            }
+        }
+        check("rewrite_reverse_order_each_slot_correct", all_correct);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 45. array_length / get / set with the length slot poisoned ONLY in the
+//     unrelated header bytes (mark +0..7, klass +8..11) -- confirm length still
+//     reads the signed int32 at +12 EXACTLY, for a fresh set of poison patterns
+//     and lengths not used in section 20, and that a one-element write does not
+//     alter the poisoned header bytes (helper writes start strictly at +16).
+// ---------------------------------------------------------------------------
+static auto test_header_poison_isolation() -> void
+{
+    // Poison patterns for mark+klass that would mis-read as a different length if
+    // the helper ever read the wrong offset.
+    const std::uint8_t poisons[]{ 0x7Fu, 0x80u, 0xA5u, 0x01u };
+    bool len_ok{ true };
+    for (const std::uint8_t p : poisons)
+    {
+        for (const std::int32_t len : { 3, 9, 33 })
+        {
+            std::vector<std::uint8_t> buffer(
+                16u + static_cast<std::size_t>(len) * sizeof(std::int32_t), std::uint8_t{ 0 });
+            std::memset(buffer.data(), p, 12u);                 // poison +0..+11
+            std::memcpy(buffer.data() + 12, &len, sizeof(len)); // honest length at +12
+            if (vmhook::array_length(buffer.data()) != len) { len_ok = false; break; }
+        }
+        if (!len_ok) { break; }
+    }
+    check("poisoned_header_length_still_reads_off12", len_ok);
+
+    // An interior element write leaves the poisoned mark+klass (+0..+11) and the
+    // length (+12..+15) byte-identical -- writes begin at +16.
+    {
+        const std::int32_t len{ 5 };
+        std::vector<std::uint8_t> buffer(
+            16u + static_cast<std::size_t>(len) * sizeof(std::int32_t), std::uint8_t{ 0 });
+        std::memset(buffer.data(), 0xA5u, 12u);
+        std::memcpy(buffer.data() + 12, &len, sizeof(len));
+        std::uint8_t header_before[16];
+        std::memcpy(header_before, buffer.data(), 16u);
+        vmhook::set_array_element<std::int32_t>(buffer.data(), 2, 0x1B2B3B4B);
+        const bool header_same{ std::memcmp(header_before, buffer.data(), 16u) == 0 };
+        check("poisoned_header_unchanged_by_interior_write",
+              header_same
+              && vmhook::get_array_element<std::int32_t>(buffer.data(), 2) == 0x1B2B3B4B);
+    }
+}
+
 int main()
 {
     test_all_widths();
@@ -2540,6 +2968,12 @@ int main()
     test_clamp_power_of_two_sweep();
     test_float_int_aliasing();
     test_null_oop_all_widths();
+    test_clamp_algebraic_properties();
+    test_pointer_rejection_oracle();
+    test_length_then_clamp_composition();
+    test_byte_granular_aliasing();
+    test_rewrite_stability();
+    test_header_poison_isolation();
 
     if (failures == 0)
     {

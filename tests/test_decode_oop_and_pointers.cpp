@@ -38,6 +38,7 @@
 // the encoder's below-base / no-resolve null behaviour incl. flaw #1 (BB), and
 // pin the widen-before-shift overflow safety of the OOP decode formula (EE).
 #include <vmhook/vmhook.hpp>
+#include <array>         // std::array -- owned fixed-size byte buffers (no vector resize trap)
 #include <bit>           // std::bit_cast — explicit (libc++ pulls nothing transitively)
 #include <cstdio>
 #include <cstdint>
@@ -2596,6 +2597,503 @@ int main()
             // safe_read_pointer's gate, and the read returns the stored sentinel.
             check("chain_untag_then_safe_read_recovers_sentinel",
                   safe_read_pointer(recovered) == sentinel);
+        }
+    }
+
+    // ===================================================================
+    // PP. (ADDITIVE deepening pass) Inputs the earlier sections do NOT reach.
+    //     Pure arithmetic only: every expected value is recomputed from the two
+    //     confirmed primitive bodies (vmhook.hpp:5459-5464 / :5480-5485):
+    //         narrow_decode(base, shift, c)    = base + (uint64(c) << shift)
+    //         narrow_encode(base, shift, addr) = uint32((addr - base) >> shift)
+    //     No memory reads of fabricated addresses, no value_t->container casts,
+    //     no std::vector byte-buffer resize (fixed C arrays / scalars only).
+    // ===================================================================
+
+    // -- PP1. INJECTIVITY of decode over a complete contiguous narrow domain.
+    //    Distinct narrow values must decode to distinct full pointers within a
+    //    mode (no aliasing / base-shift mix-up).  The decoded sequence over
+    //    [0, N] is also STRICTLY MONOTONIC INCREASING (each step adds exactly
+    //    1<<shift > 0), which both proves injectivity AND the ordering the
+    //    collection walkers rely on.  This is the no-JVM analogue of the live
+    //    "two distinct oops decode to two distinct pointers" assertion.
+    {
+        struct mode { std::uint64_t base; std::uint32_t shift; };
+        const mode modes[]{
+            { 0u, 0u }, { 0u, 1u }, { 0u, 3u }, { 0u, 4u },
+            { std::uint64_t{ 0x1'0000'0000ull }, 0u },
+            { std::uint64_t{ 0x8'0000'0000ull }, 3u },
+            { std::uint64_t{ 0x7FFF'C000'0000ull }, 4u },
+        };
+        bool strictly_increasing{ true };
+        bool step_is_exactly_pow2{ true };
+        for (const mode m : modes)
+        {
+            const std::uintptr_t expected_step{ std::uintptr_t{ 1u } << m.shift };
+            std::uintptr_t prev{ as_uptr(narrow_decode(m.base, m.shift, 0u)) };
+            for (std::uint32_t c{ 1u }; c <= 0x4000u; ++c)
+            {
+                const std::uintptr_t cur{ as_uptr(narrow_decode(m.base, m.shift, c)) };
+                if (!(cur > prev)) { strictly_increasing = false; }
+                if (cur - prev != expected_step) { step_is_exactly_pow2 = false; }
+                prev = cur;
+            }
+        }
+        check("narrow_decode_strictly_increasing_complete_run", strictly_increasing);
+        check("narrow_decode_step_exactly_pow2_complete_run", step_is_exactly_pow2);
+    }
+
+    // -- PP2. LOSSY-ENCODE FLOOR LAW, exhaustive over EVERY residue mod 2^shift.
+    //    Section Q pinned a single misaligned spot (+13 at shift 3).  Here, for
+    //    every shift 1..4 and every residue r in [0, (1<<shift)-1], an address
+    //    base + (c<<shift) + r encodes to exactly c (the residue r < 1<<shift is
+    //    shifted out), and decoding that back yields the GRID-FLOORED address
+    //    base + (c<<shift) -- i.e. encode floors any sub-grid offset down.  Pure
+    //    integer arithmetic; expected value is the documented >> truncation.
+    {
+        const std::uint32_t shifts[]{ 1u, 2u, 3u, 4u };
+        const std::uint64_t base{ 0x8'0000'0000ull };   // grid-aligned for all sh<=4
+        bool floor_to_c_ok{ true };
+        bool floored_decode_ok{ true };
+        for (const std::uint32_t sh : shifts)
+        {
+            const std::uint64_t grid{ std::uint64_t{ 1u } << sh };
+            const std::uint32_t c{ 0x1234u };
+            const std::uint64_t grid_addr{ base + (static_cast<std::uint64_t>(c) << sh) };
+            for (std::uint64_t r{ 0u }; r < grid; ++r)
+            {
+                const std::uint64_t addr{ grid_addr + r };
+                // encode floors: (addr - base) >> sh == c regardless of r < grid.
+                if (narrow_encode(base, sh, addr) != c) { floor_to_c_ok = false; }
+                // decode(encode(addr)) snaps addr back DOWN to the grid point.
+                const std::uintptr_t back{ as_uptr(narrow_decode(base, sh,
+                    narrow_encode(base, sh, addr))) };
+                if (back != static_cast<std::uintptr_t>(grid_addr)) { floored_decode_ok = false; }
+            }
+        }
+        check("narrow_encode_floors_every_residue_to_c", floor_to_c_ok);
+        check("narrow_decode_of_floored_encode_snaps_to_grid", floored_decode_ok);
+    }
+
+    // -- PP3. MODULAR UNDERFLOW of encode for addr < base, exhaustive over a run
+    //    of sub-base deltas.  Section Q1 pinned one (addr 0 vs base).  Here every
+    //    delta d in [1, 64] below a non-zero base produces the documented modular
+    //    wrap uint32((-(d) mod 2^64) >> shift); we recompute the SAME way so the
+    //    assertion is a spec of the corner, not a claim the input is valid.
+    {
+        const std::uint64_t base{ 0x1'0000'0000ull };
+        const std::uint32_t shifts[]{ 0u, 3u };
+        bool underflow_modular_ok{ true };
+        for (const std::uint32_t sh : shifts)
+        {
+            for (std::uint64_t d{ 1u }; d <= 64u; ++d)
+            {
+                const std::uint64_t addr{ base - d };           // strictly below base
+                const std::uint32_t got{ narrow_encode(base, sh, addr) };
+                const std::uint32_t want{
+                    static_cast<std::uint32_t>((addr - base) >> sh) }; // wraps mod 2^64
+                if (got != want) { underflow_modular_ok = false; }
+            }
+        }
+        check("narrow_encode_underflow_modular_exhaustive_run", underflow_modular_ok);
+    }
+
+    // -- PP4. TRUNCATION characterization (flaw #2): an offset whose >>shift
+    //    exceeds 32 bits is silently narrowed by the final uint32 cast.  Pinned
+    //    as DETERMINISTIC current behaviour (pure arithmetic), so a future guard
+    //    that makes it reject/throw is caught.  Each expected value is the exact
+    //    low-32 of the documented (addr-base)>>shift.
+    {
+        // (a) shift 0, base 0: an address just over 4 GB loses bit 32 on encode.
+        //     0x1'2345'6789 -> uint32 == 0x2345'6789.
+        check("narrow_encode_truncates_above_4G_shift0",
+              narrow_encode(0u, 0u, std::uint64_t{ 0x1'2345'6789ull }) == 0x2345'6789u);
+        // The truncated value decoded back is NOT the original (round-trip breaks
+        // exactly where the documentation says it can): decode(0x2345'6789) at
+        // (0,0) == 0x2345'6789 != 0x1'2345'6789.
+        check("narrow_encode_truncation_breaks_roundtrip_shift0",
+              as_uptr(narrow_decode(0u, 0u,
+                  narrow_encode(0u, 0u, std::uint64_t{ 0x1'2345'6789ull })))
+                  != static_cast<std::uintptr_t>(0x1'2345'6789ull));
+        // (b) shift 3, base 0: offset 0x8'0000'0000 >> 3 == 0x1'0000'0000, whose
+        //     low 32 bits are 0 -> encodes to 0 even though the input is non-null.
+        check("narrow_encode_truncates_to_zero_shift3",
+              narrow_encode(0u, 3u, std::uint64_t{ 0x8'0000'0000ull }) == 0u);
+        // (c) A general high offset at shift 3: (0xABCD'0000'0000 >> 3) ==
+        //     0x1579'A000'0000; uint32 low half == 0xA000'0000.
+        check("narrow_encode_high_offset_shift3_low32",
+              narrow_encode(0u, 3u, std::uint64_t{ 0xABCD'0000'0000ull })
+                  == 0xA000'0000u);
+    }
+
+    // -- PP5. EXHAUSTIVE high-16-bit narrow family: values k<<16 for ALL k in
+    //    [0, 0xFFFF] (the contiguous high half section U's low-16 sweep cannot
+    //    reach), across the canonical modes.  decode must equal base +
+    //    ((k<<16)<<shift) with the widen-before-shift preventing 32-bit overflow
+    //    even for the largest k at shift 4 (0xFFFF0000 << 4 == 0xF'FFF0'0000).
+    {
+        struct mode { std::uint64_t base; std::uint32_t shift; };
+        const mode modes[]{
+            { 0u, 0u }, { 0u, 3u }, { 0u, 4u },
+            { std::uint64_t{ 0x8'0000'0000ull }, 3u },
+        };
+        bool high16_ok{ true };
+        bool high16_roundtrip_ok{ true };
+        std::size_t high16_cases{ 0 };
+        for (const mode m : modes)
+        {
+            for (std::uint32_t k{ 0u }; k <= 0xFFFFu; ++k)
+            {
+                const std::uint32_t c{ k << 16 };           // high-half narrow value
+                const std::uintptr_t got{ as_uptr(narrow_decode(m.base, m.shift, c)) };
+                const std::uintptr_t want{ static_cast<std::uintptr_t>(
+                    m.base + (static_cast<std::uint64_t>(c) << m.shift)) };
+                if (got != want) { high16_ok = false; }
+                if (narrow_encode(m.base, m.shift,
+                        static_cast<std::uint64_t>(got)) != c) { high16_roundtrip_ok = false; }
+                ++high16_cases;
+            }
+        }
+        check("narrow_decode_exhaustive_high16_family", high16_ok);
+        check("narrow_roundtrip_exhaustive_high16_family", high16_roundtrip_ok);
+        check("narrow_decode_high16_sweep_is_complete",
+              high16_cases == static_cast<std::size_t>(4) * 0x1'0000u);
+        // Explicit largest-k pin at shift 4: 0xFFFF0000 << 4 must widen, not
+        // truncate, to 0xF'FFF0'0000 (above 4 GB).
+        check("narrow_decode_high16_max_k_shift4_widens",
+              as_uptr(narrow_decode(0u, 4u, 0xFFFF'0000u)) == 0xF'FFF0'0000ull);
+    }
+
+    // -- PP6. OOP/KLASS WRAPPER null-domain over the COMPLETE low-16-bit input
+    //    range with no JVM.  Sections AA/GG used a dense (not contiguous) sweep;
+    //    here EVERY value in [0, 0xFFFF] is fed to both public decoders and must
+    //    yield nullptr (c==0 via the early guard, c!=0 via the no-resolve guard),
+    //    and the OOP/KLASS decoders must AGREE on every one (shared null
+    //    contract).  No crashes, no fabricated reads -- the wrappers do their own
+    //    arithmetic only after a VMStruct resolve that never succeeds here.
+    {
+        bool oop_all_null{ true };
+        bool klass_all_null{ true };
+        bool oop_klass_agree{ true };
+        std::size_t wrapper_cases{ 0 };
+        for (std::uint32_t c{ 0u }; c <= 0xFFFFu; ++c)
+        {
+            void* const o{ decode_oop_pointer(c) };
+            void* const k{ decode_klass_pointer(c) };
+            if (o != nullptr) { oop_all_null = false; }
+            if (k != nullptr) { klass_all_null = false; }
+            if (o != k) { oop_klass_agree = false; }
+            ++wrapper_cases;
+        }
+        check("decode_oop_pointer_complete_low16_all_null_no_jvm", oop_all_null);
+        check("decode_klass_pointer_complete_low16_all_null_no_jvm", klass_all_null);
+        check("oop_klass_decode_agree_complete_low16_no_jvm", oop_klass_agree);
+        check("wrapper_complete_low16_sweep_is_complete",
+              wrapper_cases == static_cast<std::size_t>(0x1'0000u));
+    }
+
+    // -- PP7. EXACT human-readable decoded pointers for additional (base, shift)
+    //    points not spot-pinned earlier, so a regression yields a self-evident
+    //    wrong constant rather than only a failed loop flag.  Each value is the
+    //    closed form base + (c<<shift), computed by hand.
+    {
+        // shift 1 (2-byte step): zero-based 0x40 -> 0x80.
+        check("narrow_decode_shift1_0x40_is_0x80",
+              as_uptr(narrow_decode(0u, 1u, 0x40u)) == 0x80u);
+        // shift 2 (4-byte step): zero-based 0x40 -> 0x100.
+        check("narrow_decode_shift2_0x40_is_0x100",
+              as_uptr(narrow_decode(0u, 2u, 0x40u)) == 0x100u);
+        // based unscaled (shift 0), high base: base + c verbatim.
+        check("narrow_decode_high_base_shift0_adds_c",
+              as_uptr(narrow_decode(std::uint64_t{ 0x7F00'0000'0000ull }, 0u, 0xABCDu))
+                  == 0x7F00'0000'ABCDull);
+        // based scaled8 (shift 3): base + (0x2_0000 << 3) == base + 0x10_0000.
+        check("narrow_decode_based_shift3_0x20000_offset",
+              as_uptr(narrow_decode(std::uint64_t{ 0x8'0000'0000ull }, 3u, 0x2'0000u))
+                  == 0x8'0010'0000ull);
+        // The inverse of each, recovering the narrow value.
+        check("narrow_encode_high_base_shift0_recovers",
+              narrow_encode(std::uint64_t{ 0x7F00'0000'0000ull }, 0u,
+                  std::uint64_t{ 0x7F00'0000'ABCDull }) == 0xABCDu);
+        check("narrow_encode_based_shift3_recovers",
+              narrow_encode(std::uint64_t{ 0x8'0000'0000ull }, 3u,
+                  std::uint64_t{ 0x8'0010'0000ull }) == 0x2'0000u);
+    }
+
+    // -- PP8. WRAPPER noexcept / signature re-pin across the COMPLETE set of
+    //    public codec entry points in one place (additive: section A pinned the
+    //    OOP pair, R pinned the klass pair; this restates all four together as a
+    //    single closure so a future signature drift on ANY of them is caught
+    //    here too).  Compile-time traits + a runtime exercise of each.
+    {
+        int anchor{ 0 };
+        check("all_decoders_return_void_ptr",
+              std::is_same_v<decltype(decode_oop_pointer(0u)), void*>
+              && std::is_same_v<decltype(decode_klass_pointer(0u)), void*>);
+        check("all_encoders_return_uint32",
+              std::is_same_v<decltype(encode_oop_pointer(nullptr)), std::uint32_t>
+              && std::is_same_v<decltype(encode_klass_pointer(nullptr)), std::uint32_t>);
+        check("all_codecs_are_noexcept",
+              noexcept(decode_oop_pointer(0u)) && noexcept(encode_oop_pointer(&anchor))
+              && noexcept(decode_klass_pointer(0u)) && noexcept(encode_klass_pointer(&anchor)));
+    }
+
+    // ===================================================================
+    // QQ. (ADDITIVE deepening pass) safe_read_fast - the warm-path fault-safe
+    //     copy primitive (vmhook.hpp:1138-1159).  NO earlier section drives it:
+    //     section MM covers os::safe_read, but safe_read_fast is its caller-facing
+    //     sibling (MSVC-cl SEH fast path, else delegates to os::safe_read).  Its
+    //     argument guard is identical (!dst || !src || size == 0 -> false,
+    //     :1140-1143) and a copy of a genuinely OWNED in-process buffer must
+    //     succeed byte-exactly on EVERY platform/compiler the matrix builds (both
+    //     the SEH fast path and the os::safe_read fallback copy the same correct
+    //     bytes for a mapped src).  Uses ONLY owned std::array / scalars - NO
+    //     fabricated address, no vector byte-buffer resize.
+    // ===================================================================
+    {
+        using vmhook::os::safe_read_fast;
+
+        // Argument guards: any null operand or zero size -> false, no read, and
+        // the destination is left untouched.
+        std::uint64_t guard_dst{ 0x1111'2222'3333'4444ull };
+        const std::uint64_t guard_src{ 0x5566'7788'99AA'BBCCull };
+        check("safe_read_fast_null_dst_is_false",
+              !safe_read_fast(nullptr, &guard_src, sizeof(guard_src)));
+        check("safe_read_fast_null_src_is_false",
+              !safe_read_fast(&guard_dst, nullptr, sizeof(guard_dst)));
+        check("safe_read_fast_zero_size_is_false",
+              !safe_read_fast(&guard_dst, &guard_src, 0));
+        check("safe_read_fast_rejected_calls_leave_dst_untouched",
+              guard_dst == 0x1111'2222'3333'4444ull);
+
+        // Warm path on owned memory: copy a known scalar byte-exactly.
+        {
+            const std::uint64_t in{ 0x0102'0304'0506'0708ull };
+            std::uint64_t out{ 0 };
+            const bool ok{ safe_read_fast(&out, &in, sizeof(in)) };
+            check("safe_read_fast_owned_scalar_succeeds", ok);
+            check("safe_read_fast_owned_scalar_byte_exact", out == in);
+        }
+
+        // Warm path across a range of widths from an owned byte buffer.  Each
+        // prefix read reproduces exactly the first `width` bytes, and the bytes
+        // beyond it stay untouched (value-initialised 0).  Fixed std::array (no
+        // deduced-size-0 vector resize -Wstringop-overflow trap), explicit
+        // ASCII-range byte constants (no raw NUL / non-ASCII).
+        {
+            std::array<std::uint8_t, 16> src_bytes{ {
+                0x10u, 0x21u, 0x32u, 0x43u, 0x54u, 0x65u, 0x76u, 0x87u,
+                0x98u, 0xA9u, 0xBAu, 0xCBu, 0xDCu, 0xEDu, 0xFEu, 0x0Fu,
+            } };
+            const std::size_t widths[]{ 1u, 2u, 4u, 7u, 8u, 13u, 16u };
+            bool every_width_byte_exact{ true };
+            for (const std::size_t w : widths)
+            {
+                std::array<std::uint8_t, 16> dst_bytes{};   // all 0
+                const bool ok{ safe_read_fast(dst_bytes.data(), src_bytes.data(), w) };
+                if (!ok) { every_width_byte_exact = false; }
+                for (std::size_t i{ 0 }; i < w; ++i)
+                {
+                    if (dst_bytes[i] != src_bytes[i]) { every_width_byte_exact = false; }
+                }
+                for (std::size_t i{ w }; i < dst_bytes.size(); ++i)
+                {
+                    if (dst_bytes[i] != 0u) { every_width_byte_exact = false; }
+                }
+            }
+            check("safe_read_fast_all_widths_owned_buffer_byte_exact",
+                  every_width_byte_exact);
+        }
+
+        // safe_read_fast is noexcept and returns bool; pin both so a future
+        // signature change is a build error on every config.
+        {
+            std::uint64_t d{ 0 };
+            const std::uint64_t s{ 0 };
+            check("safe_read_fast_is_noexcept",
+                  noexcept(safe_read_fast(&d, &s, sizeof(s))));
+            check("safe_read_fast_returns_bool",
+                  std::is_same_v<decltype(safe_read_fast(&d, &s, sizeof(s))), bool>);
+        }
+    }
+
+    // ===================================================================
+    // RR. (ADDITIVE) untag_pointer - COMPLETE single-bit enumeration over all 64
+    //     bit positions (vmhook.hpp:2092-2097).  Section NN pinned bit 46 (kept)
+    //     and bit 47 (cleared) individually; this enumerates EVERY bit 0..63 in
+    //     isolation, deriving the expectation purely from the mask identity
+    //     untag(p) == p & user_address_ceiling (ceiling == 0x00007FFFFFFFFFFF,
+    //     i.e. bits 0..46 set, 47..63 clear):
+    //        - a value with ONLY bit b set, b in [0, 46], is returned unchanged;
+    //        - a value with ONLY bit b set, b in [47, 63], masks to 0.
+    //     One assertion family per bit, no gaps - the strongest "mask is exactly
+    //     bits 0..46" statement.  Pure bit arithmetic, no memory read.
+    // ===================================================================
+    {
+        bool low47_bits_kept{ true };
+        bool high17_bits_cleared{ true };
+        for (unsigned b{ 0u }; b < 64u; ++b)
+        {
+            const std::uintptr_t only_bit{ std::uintptr_t{ 1ull } << b };
+            const std::uintptr_t masked{ reinterpret_cast<std::uintptr_t>(
+                untag_pointer(reinterpret_cast<const void*>(only_bit))) };
+            const std::uintptr_t want{ only_bit & ceiling };   // mask identity
+            if (masked != want) { low47_bits_kept = false; high17_bits_cleared = false; }
+            if (b <= 46u)
+            {
+                if (masked != only_bit) { low47_bits_kept = false; }
+            }
+            else
+            {
+                if (masked != 0u) { high17_bits_cleared = false; }
+            }
+        }
+        check("untag_pointer_low_47_bits_each_kept", low47_bits_kept);
+        check("untag_pointer_high_17_bits_each_cleared", high17_bits_cleared);
+
+        // Endpoints recomputed from the identity bracket the enumeration:
+        // 0 -> 0 (already trivially), and all-ones -> ceiling.
+        check("untag_pointer_all_bits_set_is_ceiling_endpoint",
+              reinterpret_cast<std::uintptr_t>(
+                  untag_pointer(reinterpret_cast<const void*>(
+                      std::uintptr_t{ 0u } - std::uintptr_t{ 1u }))) == ceiling);
+
+        // Every two-adjacent-bit straddle of the 46/47 boundary: bits {45,46}
+        // are both kept (both <=46), bits {46,47} keep only 46, bits {47,48} keep
+        // nothing.  Pins the cut is precisely between bit 46 and bit 47.
+        check("untag_pointer_bits_45_46_both_kept",
+              reinterpret_cast<std::uintptr_t>(untag_pointer(
+                  reinterpret_cast<const void*>((std::uintptr_t{ 1ull } << 45)
+                                                | (std::uintptr_t{ 1ull } << 46))))
+                  == ((std::uintptr_t{ 1ull } << 45) | (std::uintptr_t{ 1ull } << 46)));
+        check("untag_pointer_bits_46_47_keeps_only_46",
+              reinterpret_cast<std::uintptr_t>(untag_pointer(
+                  reinterpret_cast<const void*>((std::uintptr_t{ 1ull } << 46)
+                                                | (std::uintptr_t{ 1ull } << 47))))
+                  == (std::uintptr_t{ 1ull } << 46));
+        check("untag_pointer_bits_47_48_keeps_nothing",
+              untag_pointer(reinterpret_cast<const void*>(
+                  (std::uintptr_t{ 1ull } << 47) | (std::uintptr_t{ 1ull } << 48)))
+                  == nullptr);
+    }
+
+    // ===================================================================
+    // SS. (ADDITIVE) is_valid_pointer - EXACT-MATCH neighbours of each EVEN poison
+    //     sentinel that actually reaches the switch (0xCAFEBABE, 0xCCCCCCCC,
+    //     0xFEEEFEEE - vmhook.hpp:2071/2072/2075).  Section D proved the even
+    //     sentinels are rejected and that ONE near-miss (0xDEADBEEE) is accepted;
+    //     this pins, PER even sentinel, that value-2 and value+2 (kept even so
+    //     they pass the alignment gate and genuinely reach the switch) are NOT in
+    //     the switch and are ACCEPTED under an in-range even high prefix - proving
+    //     the compare is an EXACT full low-32 match, not a range/near-pattern test.
+    //     (+/-2, not +/-1, so the neighbour stays even; an odd neighbour would be
+    //     rejected by alignment and mask the switch behaviour.)
+    // ===================================================================
+    {
+        constexpr std::uintptr_t prefix{ 0x0000'3300'0000'0000ull };  // in range, even
+        const std::uint32_t even_sentinels[]{
+            0xCAFEBABEu, 0xCCCCCCCCu, 0xFEEEFEEEu,
+        };
+        bool sentinel_rejected_neighbours_accepted{ true };
+        for (const std::uint32_t s : even_sentinels)
+        {
+            // The sentinel itself (in-range, even) is rejected by the switch.
+            if (is_valid_pointer(reinterpret_cast<void*>(prefix | s)))
+            {
+                sentinel_rejected_neighbours_accepted = false;
+            }
+            const std::uint32_t lower{ s - 2u };
+            const std::uint32_t upper{ s + 2u };
+            // Premise: both neighbours are even (so alignment passes and they
+            // reach the switch).
+            if ((lower & 0x1u) != 0u || (upper & 0x1u) != 0u)
+            {
+                sentinel_rejected_neighbours_accepted = false;
+            }
+            // Neither neighbour is a listed sentinel -> both accepted.
+            if (!is_valid_pointer(reinterpret_cast<void*>(prefix | lower)))
+            {
+                sentinel_rejected_neighbours_accepted = false;
+            }
+            if (!is_valid_pointer(reinterpret_cast<void*>(prefix | upper)))
+            {
+                sentinel_rejected_neighbours_accepted = false;
+            }
+        }
+        check("is_valid_pointer_even_sentinel_exact_match_neighbours_ok",
+              sentinel_rejected_neighbours_accepted);
+
+        // The high prefix alone (benign even low half) is accepted, so the
+        // rejections above are attributable solely to the sentinel low-32 value.
+        check("is_valid_pointer_ss_prefix_control_accepted",
+              is_valid_pointer(reinterpret_cast<void*>(prefix | 0x0000'2222u)));
+    }
+
+    // ===================================================================
+    // TT. (ADDITIVE) os::safe_read - wrap-guard BATTERY + non-wrapping owned
+    //     prefix-width sweep (vmhook.hpp:957-971).  Section MM pinned single
+    //     null/zero/wrap examples; this adds (1) a complete owned-buffer prefix
+    //     read where src+size does NOT wrap (the guard-NOT-taken branch, on real
+    //     memory) and (2) a battery of high synthetic src + size pairs, asserting
+    //     that EVERY pair for which the documented predicate `src + size < src`
+    //     holds is rejected at the guard BEFORE any OS read (so it never touches
+    //     the unmapped synthetic page and cannot fault on POSIX).  We feed only
+    //     pairs we have independently verified DO wrap.
+    // ===================================================================
+    {
+        using vmhook::os::safe_read;
+
+        // (TT1) Non-wrapping owned read of every prefix width succeeds and is
+        //       byte-exact (the "src + size >= src" branch on real memory).
+        {
+            std::array<std::uint8_t, 8> src_b{ {
+                0x01u, 0x23u, 0x45u, 0x67u, 0x89u, 0xABu, 0xCDu, 0xEFu } };
+            bool all_ok{ true };
+            for (std::size_t w{ 1u }; w <= src_b.size(); ++w)
+            {
+                std::array<std::uint8_t, 8> dst_b{};
+                if (!safe_read(dst_b.data(), src_b.data(), w)) { all_ok = false; }
+                for (std::size_t i{ 0 }; i < w; ++i)
+                {
+                    if (dst_b[i] != src_b[i]) { all_ok = false; }
+                }
+            }
+            check("os_safe_read_nonwrapping_owned_prefix_widths_succeed", all_ok);
+        }
+
+        // (TT2) Wrap-guard battery: every (high src, size) pair for which
+        //       (src + size) < src must be rejected; we skip non-wrapping pairs
+        //       (they would reach an unmapped OS read).  The predicate is
+        //       recomputed independently per pair.
+        {
+            std::uint64_t sink{ 0 };
+            const std::uintptr_t high_srcs[]{
+                std::uintptr_t{ 0u } - std::uintptr_t{ 1u },   // UINTPTR_MAX
+                std::uintptr_t{ 0u } - std::uintptr_t{ 2u },
+                std::uintptr_t{ 0u } - std::uintptr_t{ 8u },
+                std::uintptr_t{ 0u } - std::uintptr_t{ 16u },
+            };
+            const std::size_t sizes[]{ 2u, 8u, 16u, 64u,
+                                       static_cast<std::size_t>(-1) };
+            bool all_wrapping_rejected{ true };
+            std::size_t wrapping_cases{ 0 };
+            for (const std::uintptr_t s : high_srcs)
+            {
+                for (const std::size_t sz : sizes)
+                {
+                    const bool wraps{ (s + sz) < s };   // documented predicate
+                    if (!wraps) { continue; }
+                    ++wrapping_cases;
+                    if (safe_read(&sink, reinterpret_cast<const void*>(s), sz))
+                    {
+                        all_wrapping_rejected = false;
+                    }
+                }
+            }
+            check("os_safe_read_all_wrapping_pairs_rejected", all_wrapping_rejected);
+            check("os_safe_read_wrap_battery_nonempty", wrapping_cases >= 4);
+            // The destination is never written by a guard-rejected call.
+            check("os_safe_read_wrap_battery_left_sink_zero", sink == 0u);
         }
     }
 
