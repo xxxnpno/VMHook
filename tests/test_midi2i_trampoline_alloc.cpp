@@ -1013,6 +1013,13 @@ namespace tramp_layout
     static constexpr std::uint8_t kJeByte0{ 0x0Fu };
     static constexpr std::uint8_t kJeByte1{ 0x84u };
 
+    // je (jump-if-equal, near) is exactly the two-byte opcode 0F 84 + rel32, so
+    // kJeSize is 2 opcode bytes + 4 displacement bytes.  (Also anchors the two
+    // byte constants as a real contract — not just documentation.)
+    static_assert(kJeByte0 == 0x0Fu && kJeByte1 == 0x84u,
+                  "je near opcode is the two bytes 0F 84");
+    static_assert(kJeSize == 2 + 4, "je instruction = 2 opcode bytes + rel32 displacement");
+
     // --- Windows x64 ABI ---
     struct win
     {
