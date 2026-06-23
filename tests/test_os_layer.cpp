@@ -1529,6 +1529,381 @@ static auto test_repeated_call_determinism() -> void
 
 } // namespace deepen_os_geometry
 
+// ===========================================================================
+// SECOND DEEPENING SECTION (additive; appended after deepen_os_geometry).
+// Covers OS-layer surfaces the first deepening pass did not hit: the safe_read
+// input-guard / address-wrap-guard edges (vmhook.hpp safe_read lines 955-971),
+// the safe_write null/zero guards (lines 1050-1053), the protect() arm/enum and
+// address-wrap guard (lines 648-694), query_region FIELD invariants on a real
+// committed page (lines 793-898), and release()'s null/zero contained no-op
+// (lines 774-786).  Every value is traced from source; the ONLY memory touched
+// is real allocate_rwx pages we own (or pure arithmetic / is_valid_pointer-style
+// rejected low constants) -- NO fabricated/unmapped address is ever handed to a
+// reading helper.  All hard-asserted unless a genuinely platform-variable
+// outcome forces an [INFO] gate (Apple W^X execute arms, iOS safe_write).
+// ===========================================================================
+namespace deepen_os_seams
+{
+
+// ---------------------------------------------------------------------------
+// 6. safe_read INPUT GUARDS, exercised against a REAL OWNED page so the guard
+//    is provably reached before any raw read.  Per source (vmhook.hpp:957-960)
+//    safe_read returns false when dst==nullptr || src==nullptr || size==0 --
+//    these are checked first, so passing a valid owned src with size==0 or a
+//    null dst can NEVER fault.  We also pin the happy path: a full read of an
+//    owned page round-trips byte-for-byte, and a 1-byte read of the first byte
+//    succeeds.  No bogus address is read here (the bogus-rejection case already
+//    lives in main()).
+// ---------------------------------------------------------------------------
+static auto test_safe_read_input_guards() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deep_safe_read_guards_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0xC3;
+    bytes[1] = 0x90;
+
+    std::uint8_t dst[4]{ 0xEE, 0xEE, 0xEE, 0xEE };
+
+    // size == 0 is rejected BEFORE any read -- src is a real owned page, so even
+    // if the guard were absent this could not fault; the contract is "false".
+    check("deep_safe_read_zero_size_false",
+          !vmhook::os::safe_read(dst, block, 0));
+    // dst == nullptr rejected (src still valid+owned).
+    check("deep_safe_read_null_dst_false",
+          !vmhook::os::safe_read(nullptr, block, 1));
+    // src == nullptr rejected.
+    check("deep_safe_read_null_src_false",
+          !vmhook::os::safe_read(dst, nullptr, 1));
+
+    // Happy path: a single-byte read of the owned page returns the stored byte.
+    std::uint8_t one{ 0 };
+    const bool ok_one{ vmhook::os::safe_read(&one, block, 1) };
+    check("deep_safe_read_one_byte_ok", ok_one && one == 0xC3);
+
+    // Happy path: a 2-byte read returns both stored bytes.
+    std::uint8_t two[2]{ 0, 0 };
+    const bool ok_two{ vmhook::os::safe_read(two, block, 2) };
+    check("deep_safe_read_two_bytes_ok", ok_two && two[0] == 0xC3 && two[1] == 0x90);
+
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// 7. safe_read ADDRESS-WRAP guard (vmhook.hpp:968-970): a size so large that
+//    src + size wraps past UINTPTR_MAX is rejected uniformly with false, BEFORE
+//    any platform raw-read path runs.  We feed a REAL owned src plus a size that
+//    forces the wrap, so the guard fires on the arithmetic alone -- the page is
+//    never actually read past its end.  src + SIZE_MAX always wraps for any
+//    non-null src, so this is the canonical trigger; we also test a size exactly
+//    large enough to reach UINTPTR_MAX (no wrap -> guard does NOT fire on the
+//    wrap test, but the read itself fails because the range is unmapped -- so we
+//    only assert the WRAPPING sizes here, never an in-range huge read).
+// ---------------------------------------------------------------------------
+static auto test_safe_read_wrap_guard() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deep_safe_read_wrap_skipped_alloc_failed", false);
+        return;
+    }
+
+    std::uint8_t dst[2]{ 0, 0 };
+    const std::uintptr_t base{ reinterpret_cast<std::uintptr_t>(block) };
+    const std::size_t umax{ ~static_cast<std::size_t>(0) };
+
+    // size == SIZE_MAX: base + SIZE_MAX wraps for any non-null base -> rejected.
+    check("deep_safe_read_size_max_wraps_false",
+          !vmhook::os::safe_read(dst, block, umax));
+
+    // The smallest size that wraps for THIS base is (SIZE_MAX - base + 1):
+    // base + (umax - base + 1) == umax + 1 == 0 (mod 2^bits) -> wraps -> false.
+    // base is a real page address (well below SIZE_MAX) so this size is huge but
+    // the guard rejects it on arithmetic before touching memory.
+    const std::size_t just_wraps{ umax - static_cast<std::size_t>(base) + 1u };
+    check("deep_safe_read_minimal_wrapping_size_false",
+          !vmhook::os::safe_read(dst, block, just_wraps));
+
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// 8. safe_write NULL / ZERO guards (vmhook.hpp:1050-1053) -- pinned with PURE
+//    arguments (no memory dereferenced): dst==nullptr || src==nullptr ||
+//    size==0 each return false before any platform store.  We additionally pin
+//    the success path on a REAL owned page where the platform has a fault-safe
+//    write primitive (Windows/Linux/Android/macOS); iOS/unknown return false by
+//    source contract (no entitlement-free safe write) -- gated [INFO] there.
+// ---------------------------------------------------------------------------
+static auto test_safe_write_guards() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+
+    // Pure guard pins: a stack source byte, never dereferenced past the guard.
+    std::uint8_t srcbyte{ 0x7E };
+    std::uint8_t dstbyte{ 0x00 };
+    check("deep_safe_write_null_dst_false",
+          !vmhook::os::safe_write(nullptr, &srcbyte, 1));
+    check("deep_safe_write_null_src_false",
+          !vmhook::os::safe_write(&dstbyte, nullptr, 1));
+    check("deep_safe_write_zero_size_false",
+          !vmhook::os::safe_write(&dstbyte, &srcbyte, 0));
+
+    // Success path on a real owned RWX page.
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deep_safe_write_skipped_alloc_failed", false);
+        return;
+    }
+    const std::uint8_t payload[4]{ 0xDE, 0xAD, 0xBE, 0xEF };
+    const bool wrote{ vmhook::os::safe_write(block, payload, sizeof(payload)) };
+#if VMHOOK_OS_IOS
+    // iOS safe_write has no fault-safe primitive -> source returns false.
+    check("deep_safe_write_ios_returns_false", !wrote);
+#else
+    check("deep_safe_write_owned_page_ok", wrote);
+    if (wrote)
+    {
+        const auto* const v{ static_cast<const volatile std::uint8_t*>(block) };
+        check("deep_safe_write_payload_landed",
+              v[0] == 0xDE && v[1] == 0xAD && v[2] == 0xBE && v[3] == 0xEF);
+    }
+#endif
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// 9. protect() INPUT + WRAP guards (vmhook.hpp:651-671), all against a REAL
+//    owned page:
+//      * address==nullptr || size==0 -> false (checked first; no syscall).
+//      * size > UINTPTR_MAX - base    -> false (the address-space-wrap guard;
+//        a real base + SIZE_MAX wraps, so this fires on arithmetic alone and
+//        the page protection is never actually changed).
+//    These pin the degenerate-input contract that makes protect() safe to call
+//    with a hostile size without UB.
+// ---------------------------------------------------------------------------
+static auto test_protect_input_and_wrap_guards() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deep_protect_guards_skipped_alloc_failed", false);
+        return;
+    }
+
+    // Null address rejected (size valid).
+    check("deep_protect_null_addr_false",
+          !vmhook::os::protect(nullptr, page,
+                               vmhook::os::memory_protection::read_write, nullptr));
+    // Zero size rejected (address valid+owned).
+    check("deep_protect_zero_size_false",
+          !vmhook::os::protect(block, 0,
+                               vmhook::os::memory_protection::read_write, nullptr));
+
+    // Wrapping size rejected on arithmetic before any VirtualProtect/mprotect.
+    const std::size_t umax{ ~static_cast<std::size_t>(0) };
+    check("deep_protect_size_max_wraps_false",
+          !vmhook::os::protect(block, umax,
+                               vmhook::os::memory_protection::read_write, nullptr));
+
+    // The page is still untouched and writable (the guard fired before any
+    // protection change): a write+read must still work.
+    auto* const bytes{ static_cast<volatile std::uint8_t*>(block) };
+    bytes[0] = 0x5A;
+    check("deep_protect_page_unchanged_after_guarded_calls", bytes[0] == 0x5A);
+
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// 10. protect() ARM round-trip on a REAL owned page.  Each portable enum value
+//     maps to a native flag (to_native_protect, vmhook.hpp:617-642) and applies
+//     cleanly.  We only EXECUTE/READ the page while it is in a state we just set
+//     to allow it, and always restore read_write before touching bytes.  The
+//     non-executable arms (no_access, read, read_write) succeed on EVERY
+//     platform and are hard-asserted; the EXECUTE arms are entitlement-gated on
+//     Apple W^X, so their success is [INFO].  old_prot is captured on a flip and
+//     pinned non-fatally (Windows fills the previous PAGE_*, POSIX writes 0 per
+//     source line 690).
+// ---------------------------------------------------------------------------
+static auto test_protect_arm_mappings() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deep_protect_arms_skipped_alloc_failed", false);
+        return;
+    }
+    auto* const bytes{ static_cast<volatile std::uint8_t*>(block) };
+    bytes[0] = 0xA7; // sentinel set while writable (allocate_rwx returns RW(X))
+
+    using mp = vmhook::os::memory_protection;
+
+    // read_write -> read_write is a trivially-successful arm everywhere.
+    check("deep_protect_arm_read_write",
+          vmhook::os::protect(block, page, mp::read_write, nullptr));
+
+    // Flip to read-only, capture old_prot, then verify the byte is still
+    // READABLE (read protection permits loads) and restore RW.
+    std::uint32_t old_prot{ 0xFFFFFFFFu };
+    const bool to_ro{ vmhook::os::protect(block, page, mp::read, &old_prot) };
+    check("deep_protect_arm_read", to_ro);
+    if (to_ro)
+    {
+        // Sentinel survives the RW->RO transition (no mapping teardown).
+        check("deep_protect_arm_read_sentinel_readable", bytes[0] == 0xA7);
+    }
+    // Restore writable before any further store.
+    check("deep_protect_arm_restore_rw_after_read",
+          vmhook::os::protect(block, page, mp::read_write, nullptr));
+    // Now a store works again -- proves RO was genuinely lifted.
+    bytes[0] = 0x3B;
+    check("deep_protect_arm_rw_restored_writable", bytes[0] == 0x3B);
+
+    // no_access then back to read_write: the arm applies and lifts cleanly.
+    const bool to_na{ vmhook::os::protect(block, page, mp::no_access, nullptr) };
+    check("deep_protect_arm_no_access", to_na);
+    // Do NOT touch the page while no_access is in force.  Restore first.
+    check("deep_protect_arm_restore_rw_after_no_access",
+          vmhook::os::protect(block, page, mp::read_write, nullptr));
+    bytes[0] = 0x6C;
+    check("deep_protect_arm_rw_restored_after_no_access", bytes[0] == 0x6C);
+
+    // EXECUTE arms: refused under Apple W^X without the JIT entitlement, so
+    // success is [INFO], never a hard assert.  We never CALL the page here
+    // (the executable-call proof lives in test_allocate_rwx_executes_code).
+    const bool to_xr{ vmhook::os::protect(block, page, mp::execute_read, nullptr) };
+    if (to_xr)
+    {
+        check("deep_protect_arm_execute_read_when_allowed", true);
+    }
+    else
+    {
+        std::printf("[INFO] deep_protect_arm_execute_read: refused (Apple W^X / "
+                    "hardened policy)\n");
+    }
+    const bool to_xrw{ vmhook::os::protect(block, page, mp::execute_rw, nullptr) };
+    if (to_xrw)
+    {
+        check("deep_protect_arm_execute_rw_when_allowed", true);
+    }
+    else
+    {
+        std::printf("[INFO] deep_protect_arm_execute_rw: refused (Apple W^X / "
+                    "hardened policy)\n");
+    }
+
+    // Final restore to plain RW for a clean teardown (always succeeds).
+    check("deep_protect_arm_final_restore_rw",
+          vmhook::os::protect(block, page, mp::read_write, nullptr));
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// 11. query_region FIELD invariants on a REAL committed RWX page.  Per source
+//     every backend that locates the region sets base != null, committed=true,
+//     readable=true, free=false, and a size that covers at least one page.  We
+//     additionally pin the geometric facts the trampoline allocator relies on:
+//     the reported base is page-aligned, the reported size is a whole multiple
+//     of the page size (Windows RegionSize, POSIX end-begin, mach region size --
+//     all page-granular; the iOS stub reports exactly one page), and the queried
+//     address is CONTAINED in [base, base+size).  All on owned memory.
+// ---------------------------------------------------------------------------
+static auto test_query_region_field_invariants() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    const std::size_t size{ page * 3u };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, size) };
+    if (!block)
+    {
+        check("deep_query_region_fields_skipped_alloc_failed", false);
+        return;
+    }
+    // Commit the whole span so every backend reports it committed.
+    (void)write_read_whole_range(block, size, 0x42);
+
+    const auto info{ vmhook::os::query_region(block) };
+
+    check("deep_query_region_committed", info.committed);
+    check("deep_query_region_readable", info.readable);
+    check("deep_query_region_not_free", !info.free);
+    check("deep_query_region_base_nonnull", info.base != nullptr);
+
+    if (info.base)
+    {
+        const std::uintptr_t base{ reinterpret_cast<std::uintptr_t>(info.base) };
+        const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(block) };
+
+        check("deep_query_region_base_page_aligned", (base & (page - 1u)) == 0u);
+        check("deep_query_region_size_page_multiple",
+              info.size != 0 && (info.size % page) == 0u);
+        // Containment: base <= queried address < base + size.
+        check("deep_query_region_contains_address",
+              base <= addr && addr < base + info.size);
+        // The committed run covers at least the page the address sits in.
+        check("deep_query_region_size_at_least_one_page", info.size >= page);
+    }
+
+    vmhook::os::release(block, size);
+}
+
+// ---------------------------------------------------------------------------
+// 12. release() NULL / ZERO contained no-op (vmhook.hpp:776-778): release is
+//     noexcept -> void and returns immediately for a null address or zero size,
+//     issuing no syscall.  Pin "does not crash" with PURE arguments (no memory)
+//     and confirm a subsequent real alloc/release still works -- i.e. the
+//     degenerate calls left the allocator in a clean state.
+// ---------------------------------------------------------------------------
+static auto test_release_null_zero_noop() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+
+    // Null address: contained no-op.
+    vmhook::os::release(nullptr, page);
+    check("deep_release_null_addr_no_crash", true);
+
+    // Zero size with a (never-dereferenced) non-null pointer: contained no-op.
+    // We pass a real owned block but size 0 so munmap/VirtualFree is skipped by
+    // the early return; the block is then released correctly below.
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (block)
+    {
+        vmhook::os::release(block, 0);
+        check("deep_release_zero_size_no_crash", true);
+        // The early return means the block is STILL mapped -- write+read proves
+        // it, then we release it for real.
+        auto* const bytes{ static_cast<volatile std::uint8_t*>(block) };
+        bytes[0] = 0x4D;
+        check("deep_release_zero_size_block_still_mapped", bytes[0] == 0x4D);
+        vmhook::os::release(block, page);
+    }
+    else
+    {
+        check("deep_release_zero_size_skipped_alloc_failed", false);
+    }
+
+    // Allocator healthy after the degenerate calls.
+    void* const probe{ vmhook::os::allocate_rwx(nullptr, page) };
+    check("deep_release_null_zero_allocator_healthy", probe != nullptr);
+    if (probe)
+    {
+        vmhook::os::release(probe, page);
+    }
+}
+
+} // namespace deepen_os_seams
+
 int main()
 {
     // --- pure-logic, no side effects: the heart of this file ---------------
@@ -1541,6 +1916,16 @@ int main()
     deepen_os_geometry::test_protect_rounding_matches_align_masks();
     deepen_os_geometry::test_platform_geometry_derived();
     deepen_os_geometry::test_repeated_call_determinism();
+
+    // --- second deepening section (additive: safe_read/safe_write/protect/
+    //     query_region/release seams, all on real owned memory) --------------
+    deepen_os_seams::test_safe_read_input_guards();
+    deepen_os_seams::test_safe_read_wrap_guard();
+    deepen_os_seams::test_safe_write_guards();
+    deepen_os_seams::test_protect_input_and_wrap_guards();
+    deepen_os_seams::test_protect_arm_mappings();
+    deepen_os_seams::test_query_region_field_invariants();
+    deepen_os_seams::test_release_null_zero_noop();
 
     const std::uintptr_t page_align{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
     const std::uintptr_t gran_align{ static_cast<std::uintptr_t>(vmhook::os::allocation_granularity()) };

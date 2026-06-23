@@ -63,6 +63,7 @@
 // MinGW libstdc++, MSVC STL, and libc++ CI toolchains.
 #include <vmhook/vmhook.hpp>
 
+#include <array>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -958,6 +959,329 @@ namespace deepening_qr
     }
 } // namespace deepening_qr
 
+// ===========================================================================
+// DEEPENING SECTION 2 (additive, independent namespace).  Targets OS-layer
+// surfaces the prior passes did not hit: page-size / allocation-granularity
+// relations, the protect() / safe_read() input-guard + address-space-wrap
+// guards (all pure value checks evaluated BEFORE any memory access), the
+// to_native_protect() per-arm enum->native mapping, allocate_rwx / release
+// round-trips and a repeat (leak-free reuse) loop, query_region committed-vs-
+// free mutual-exclusivity / free<->!committed field invariants, and the
+// safe_read success-path + idempotency over the one-time signal-handler
+// install_once on POSIX.  Every probe is a value-only comparison, a guard
+// that returns BEFORE touching memory, or a page/buffer this code allocates
+// and owns — never a fabricated address handed to a reading helper.
+//
+// Source anchored (all certain):
+//   * page_size / allocation_granularity ........ vmhook.hpp:486-510
+//   * protect null/size/ wrap guards ............ vmhook.hpp:651-671
+//   * allocate_rwx size==0 / release guards ..... vmhook.hpp:703-786
+//   * query_region Win committed/free ........... vmhook.hpp:808-809
+//     query_region Linux committed-arm / free-arm  vmhook.hpp:882-896
+//   * to_native_protect Win / POSIX arms ........ vmhook.hpp:617-642
+//   * safe_read null/size==0 + wrap guard ....... vmhook.hpp:955-971
+// ===========================================================================
+namespace deepening_qr2
+{
+    using vmhook::os::memory_protection;
+
+    // -----------------------------------------------------------------------
+    // (E1) page_size() / allocation_granularity() RELATIONS (486-510).  Both
+    // are noexcept and return std::size_t.  page_size() is never zero (the
+    // POSIX arm hard-floors to 4096; Windows returns dwPageSize) and is a
+    // power of two on every supported host.  allocation_granularity() equals
+    // page_size() on every non-Windows arm (508 returns page_size()), and on
+    // Windows it is the dwAllocationGranularity, which is always a power of two
+    // >= the page size.  Two consecutive page_size() calls must agree
+    // (stateless GetSystemInfo / sysconf snapshot).
+    // -----------------------------------------------------------------------
+    static auto test_page_size_granularity_relations() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        const std::size_t gran{ vmhook::os::allocation_granularity() };
+
+        check("qr2_page_size_nonzero", ps != 0u);
+        check("qr2_page_size_power_of_two", (ps & (ps - 1u)) == 0u);
+        check("qr2_page_size_at_least_4096", ps >= static_cast<std::size_t>(4096));
+        check("qr2_page_size_deterministic", vmhook::os::page_size() == ps);
+
+        check("qr2_granularity_nonzero", gran != 0u);
+        check("qr2_granularity_power_of_two", (gran & (gran - 1u)) == 0u);
+        check("qr2_granularity_at_least_page", gran >= ps);
+#if VMHOOK_OS_WINDOWS
+        // Windows: granularity is a multiple of the page size (both powers of
+        // two with gran >= ps => ps divides gran exactly).
+        check("qr2_granularity_multiple_of_page", (gran % ps) == 0u);
+#else
+        // Every POSIX arm returns page_size() verbatim (508).
+        check("qr2_granularity_equals_page_on_posix", gran == ps);
+#endif
+    }
+
+    // -----------------------------------------------------------------------
+    // (E2) protect() INPUT + WRAP guards (651-671).  These return false BEFORE
+    // any native call, on a REAL owned page so the base pointer is genuine:
+    //   * null address    -> false (651).
+    //   * size == 0        -> false (651).
+    //   * size so large that base+size wraps the address space -> false (667).
+    // The wrap probe uses SIZE_MAX as the length against an owned base; the
+    // guard rejects it without ever calling VirtualProtect / mprotect, so no
+    // page is actually touched.  A normal protect() on the same page still
+    // succeeds afterwards (proving the guards did not corrupt anything).
+    // -----------------------------------------------------------------------
+    static auto test_protect_input_and_wrap_guards() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("qr2_protect_guards_skipped_alloc_failed", false);
+            return;
+        }
+        *static_cast<volatile std::uint8_t*>(block) = 0x01;
+
+        check("qr2_protect_null_addr_false",
+              !vmhook::os::protect(nullptr, page, memory_protection::read_write, nullptr));
+        check("qr2_protect_zero_size_false",
+              !vmhook::os::protect(block, 0u, memory_protection::read_write, nullptr));
+        // base + SIZE_MAX wraps for any non-null base -> rejected by the 667 guard.
+        check("qr2_protect_wrapping_size_false",
+              !vmhook::os::protect(block, ~std::size_t{ 0 },
+                                   memory_protection::read_write, nullptr));
+        // The page is untouched by the rejected calls: a real protect still works.
+        check("qr2_protect_real_call_still_succeeds",
+              vmhook::os::protect(block, page, memory_protection::read_write, nullptr));
+
+        check("qr2_protect_guards_restore_writable", make_writable(block, page));
+        vmhook::os::release(block, page);
+    }
+
+    // -----------------------------------------------------------------------
+    // (E3) to_native_protect() per-arm ENUM->NATIVE mapping (617-642).  Pinned
+    // per platform so a swap of two arms (the exact bug query_region's attribute
+    // decode would mirror) is caught.  Pure value comparisons — no memory.
+    // -----------------------------------------------------------------------
+    static auto test_to_native_protect_arms() -> void
+    {
+#if VMHOOK_OS_WINDOWS
+        check("qr2_tnp_no_access_PAGE_NOACCESS",
+              vmhook::os::to_native_protect(memory_protection::no_access) == PAGE_NOACCESS);
+        check("qr2_tnp_read_PAGE_READONLY",
+              vmhook::os::to_native_protect(memory_protection::read) == PAGE_READONLY);
+        check("qr2_tnp_read_write_PAGE_READWRITE",
+              vmhook::os::to_native_protect(memory_protection::read_write) == PAGE_READWRITE);
+        check("qr2_tnp_execute_read_PAGE_EXECUTE_READ",
+              vmhook::os::to_native_protect(memory_protection::execute_read) == PAGE_EXECUTE_READ);
+        check("qr2_tnp_execute_rw_PAGE_EXECUTE_READWRITE",
+              vmhook::os::to_native_protect(memory_protection::execute_rw) == PAGE_EXECUTE_READWRITE);
+#else
+        check("qr2_tnp_no_access_PROT_NONE",
+              vmhook::os::to_native_protect(memory_protection::no_access) == PROT_NONE);
+        check("qr2_tnp_read_PROT_READ",
+              vmhook::os::to_native_protect(memory_protection::read) == PROT_READ);
+        check("qr2_tnp_read_write_R_W",
+              vmhook::os::to_native_protect(memory_protection::read_write) == (PROT_READ | PROT_WRITE));
+        check("qr2_tnp_execute_read_R_X",
+              vmhook::os::to_native_protect(memory_protection::execute_read) == (PROT_READ | PROT_EXEC));
+        check("qr2_tnp_execute_rw_R_W_X",
+              vmhook::os::to_native_protect(memory_protection::execute_rw) == (PROT_READ | PROT_WRITE | PROT_EXEC));
+        // PROT_NONE is zero on every POSIX host; the read arm sets at least the
+        // read bit; the executable arms set the exec bit.  Relations, not values.
+        check("qr2_tnp_none_is_zero", PROT_NONE == 0);
+        check("qr2_tnp_exec_arms_carry_exec_bit",
+              (vmhook::os::to_native_protect(memory_protection::execute_read) & PROT_EXEC) != 0
+              && (vmhook::os::to_native_protect(memory_protection::execute_rw) & PROT_EXEC) != 0);
+        check("qr2_tnp_read_arm_has_no_exec",
+              (vmhook::os::to_native_protect(memory_protection::read) & PROT_EXEC) == 0);
+#endif
+    }
+
+    // -----------------------------------------------------------------------
+    // (E4) allocate_rwx / release ROUND-TRIP + REUSE LOOP (703-786).
+    //   * allocate_rwx(_, 0) -> nullptr (705).
+    //   * release(nullptr, n) and release(p, 0) are no-ops that must not crash
+    //     (776: early return on null/zero) — proving the guards before the
+    //     native free.
+    //   * a tight alloc/touch/query/release loop must hand back a fresh,
+    //     committed, readable, region-containing page every iteration and never
+    //     leak into a failure (validates the steady-state contract the
+    //     trampoline allocator depends on).
+    // -----------------------------------------------------------------------
+    static auto test_allocate_release_roundtrip_loop() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+
+        check("qr2_allocate_zero_is_null",
+              vmhook::os::allocate_rwx(nullptr, 0u) == nullptr);
+
+        // Guarded no-op releases: must return cleanly (void) without faulting.
+        vmhook::os::release(nullptr, page);
+        vmhook::os::release(nullptr, 0u);
+        check("qr2_release_null_is_noop_survives", true);
+
+        bool every_iter_ok{ true };
+        for (int i{ 0 }; i < 16; ++i)
+        {
+            void* const blk{ vmhook::os::allocate_rwx(nullptr, page) };
+            if (!blk)
+            {
+                every_iter_ok = false;
+                break;
+            }
+            *static_cast<volatile std::uint8_t*>(blk) =
+                static_cast<std::uint8_t>(0x40 + i);
+            const auto info{ vmhook::os::query_region(blk) };
+            if (!info.committed || !info.readable || info.size < page
+                || !region_contains(info, blk) || !region_no_overflow(info))
+            {
+                every_iter_ok = false;
+                vmhook::os::release(blk, page);
+                break;
+            }
+            // release(p, 0) must NOT free (POSIX munmap rejects 0; Windows
+            // discards size) — so we free with the true size right after to
+            // avoid a real leak.  We only assert the zero-size call survives.
+            vmhook::os::release(blk, 0u);
+            vmhook::os::release(blk, page);
+        }
+        check("qr2_alloc_release_reuse_loop_all_ok", every_iter_ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // (E5) query_region FIELD INVARIANTS that hold for ANY result (808-896).
+    // committed and free are produced by mutually exclusive branches on every
+    // platform: Windows sets committed=(State==MEM_COMMIT), free=(State==
+    // MEM_FREE) — a single State can be at most one; Linux sets committed in the
+    // containing-mapping arm and free in the two hole arms, never both.  Hence
+    // NO result may report committed && free simultaneously.  For a live OWNED
+    // committed page additionally: committed is true, free is false, and the
+    // executable bit, whatever it is, never contradicts size/containment.
+    // -----------------------------------------------------------------------
+    static auto test_query_region_field_invariants() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("qr2_field_invariants_skipped_alloc_failed", false);
+            return;
+        }
+        *static_cast<volatile std::uint8_t*>(block) = 0x5D;
+
+        const auto info{ vmhook::os::query_region(block) };
+        // The central invariant: committed and free are never both set.
+        check("qr2_committed_and_free_mutually_exclusive",
+              !(info.committed && info.free));
+        // A freshly committed owned page is committed and NOT free.
+        check("qr2_owned_page_committed", info.committed);
+        check("qr2_owned_page_not_free", !info.free);
+        check("qr2_owned_page_contains_block", region_contains(info, block));
+        check("qr2_owned_page_no_overflow", region_no_overflow(info));
+
+        // After release the mutual-exclusivity invariant must STILL hold (gated
+        // off iOS where the stub always claims committed and never free).
+        vmhook::os::release(block, page);
+#if !VMHOOK_OS_IOS
+        const auto freed{ vmhook::os::query_region(block) };
+        check("qr2_committed_and_free_mutually_exclusive_after_release",
+              !(freed.committed && freed.free));
+        check("qr2_freed_no_overflow", region_no_overflow(freed));
+#endif
+    }
+
+    // -----------------------------------------------------------------------
+    // (E6) safe_read() INPUT + WRAP guards and SUCCESS path (955-1020).  Every
+    // pointer used here is one of two stack buffers this function owns; the
+    // guard probes are rejected by the 957 / 968 value checks BEFORE any read,
+    // and the success path copies between the two owned buffers.  No fabricated
+    // address is ever passed to safe_read.
+    //   * dst null / src null / size 0 -> false (957).
+    //   * src + size wraps the address space -> false (968) — exercised with a
+    //     non-null owned src and SIZE_MAX length; the guard returns before the
+    //     native read, so the owned src is never actually read past its end.
+    //   * a real size-matched copy between owned buffers -> true and the bytes
+    //     are byte-identical (the all-or-nothing transferred==size contract).
+    // -----------------------------------------------------------------------
+    static auto test_safe_read_guards_and_success() -> void
+    {
+        std::array<std::uint8_t, 64> src{};
+        std::array<std::uint8_t, 64> dst{};
+        for (std::size_t i{ 0 }; i < src.size(); ++i)
+        {
+            src[i] = static_cast<std::uint8_t>(0x80 + i);
+        }
+
+        // Input guards (return false before touching memory).
+        check("qr2_safe_read_null_dst_false",
+              !vmhook::os::safe_read(nullptr, src.data(), src.size()));
+        check("qr2_safe_read_null_src_false",
+              !vmhook::os::safe_read(dst.data(), nullptr, dst.size()));
+        check("qr2_safe_read_zero_size_false",
+              !vmhook::os::safe_read(dst.data(), src.data(), 0u));
+        // Wrap guard: src is a real owned pointer, SIZE_MAX as length wraps
+        // src+size past UINTPTR_MAX -> rejected at 968 before any read.
+        check("qr2_safe_read_wrapping_size_false",
+              !vmhook::os::safe_read(dst.data(), src.data(), ~std::size_t{ 0 }));
+
+        // Success path: full size-matched copy of owned bytes.
+        const bool ok{ vmhook::os::safe_read(dst.data(), src.data(), src.size()) };
+        check("qr2_safe_read_owned_copy_succeeds", ok);
+        bool bytes_match{ ok };
+        for (std::size_t i{ 0 }; i < src.size() && bytes_match; ++i)
+        {
+            if (dst[i] != src[i])
+            {
+                bytes_match = false;
+            }
+        }
+        check("qr2_safe_read_owned_copy_bytes_identical", bytes_match);
+    }
+
+    // -----------------------------------------------------------------------
+    // (E7) safe_read DETERMINISM over the one-time signal-handler install_once
+    // (929-941, 1001).  On Linux/Android the SIGSEGV/SIGBUS fault guard is
+    // installed exactly once via a function-local static; repeated safe_read
+    // calls must keep returning the identical, correct result for the SAME
+    // owned source — proving install_once is idempotent and does not corrupt
+    // process signal state between calls.  Pure owned-memory reads; no fault is
+    // ever provoked (we never read an unmapped address).  Cross-platform: the
+    // determinism contract holds on Windows (ReadProcessMemory) and macOS
+    // (mach_vm_read_overwrite) too.
+    // -----------------------------------------------------------------------
+    static auto test_safe_read_repeat_is_stable() -> void
+    {
+        std::array<std::uint8_t, 32> src{};
+        for (std::size_t i{ 0 }; i < src.size(); ++i)
+        {
+            src[i] = static_cast<std::uint8_t>(i * 3u + 1u);
+        }
+
+        bool every_read_ok{ true };
+        bool every_read_matches{ true };
+        for (int rep{ 0 }; rep < 8; ++rep)
+        {
+            std::array<std::uint8_t, 32> dst{};
+            if (!vmhook::os::safe_read(dst.data(), src.data(), src.size()))
+            {
+                every_read_ok = false;
+                break;
+            }
+            for (std::size_t i{ 0 }; i < src.size(); ++i)
+            {
+                if (dst[i] != src[i])
+                {
+                    every_read_matches = false;
+                }
+            }
+        }
+        check("qr2_safe_read_repeat_all_succeed", every_read_ok);
+        check("qr2_safe_read_repeat_all_match", every_read_matches);
+        // The process surviving 8 repeated safe_read calls proves the one-time
+        // signal-handler install did not leave the process in a faulting state.
+        check("qr2_safe_read_repeat_process_survives", true);
+    }
+} // namespace deepening_qr2
+
 int main()
 {
     test_query_region_contains_live_addresses();
@@ -978,6 +1302,14 @@ int main()
     deepening_qr::test_is_readable_pointer_verdict_tracks_query();
     deepening_qr::test_find_stub_size_matches_region_math();
     deepening_qr::test_find_stub_size_fallback_constant();
+
+    deepening_qr2::test_page_size_granularity_relations();
+    deepening_qr2::test_protect_input_and_wrap_guards();
+    deepening_qr2::test_to_native_protect_arms();
+    deepening_qr2::test_allocate_release_roundtrip_loop();
+    deepening_qr2::test_query_region_field_invariants();
+    deepening_qr2::test_safe_read_guards_and_success();
+    deepening_qr2::test_safe_read_repeat_is_stable();
 
     if (failures == 0)
     {

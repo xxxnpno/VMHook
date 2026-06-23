@@ -1107,6 +1107,313 @@ static auto test_is_readable_pointer_pure_filter() -> void
 
 } // namespace deepen_os_safe_read
 
+// ===========================================================================
+// DEEPENING SECTION 2 (additive only).  Signal-handler install/disarm
+// contracts + the safe_write twin + cross-path parity — os-layer surface the
+// prior passes did not touch.  Every expected value is traced DIRECTLY from
+// vmhook.hpp:
+//   * detail_signal::probe_state default-init                 (hpp 907-912)
+//   * detail_signal::active_state thread_local + disarm        (hpp 914, 1006-1014)
+//   * detail_signal::install_once idempotent / returns true    (hpp 929-941)
+//   * safe_write guard prefix + per-platform fault-safe store  (hpp 1048-1075)
+//   * safe_read/safe_write round-trip agreement                (hpp 955-1075)
+// POSIX-SAFETY: every dereferenced/protected/written page is one ALLOCATED IN
+// THIS FILE (allocate_rwx) or a stack/array buffer.  No fabricated, unmapped,
+// or high address is ever handed to a reading/writing helper; the only
+// non-owned addresses go to the input-guard (null) paths, which return before
+// any access.  No raw NUL / non-ASCII bytes; no existing assertion is touched.
+// ===========================================================================
+namespace deepen_os_signal_handler
+{
+
+#if VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
+// ---------------------------------------------------------------------------
+// S1) detail_signal::probe_state default-construction contract (hpp 907-912).
+//     A freshly default-constructed probe_state must report active==false and
+//     fault==false — the disarmed state safe_read relies on before it arms.
+//     This is the struct the SIGSEGV/SIGBUS handler keys its recovery on; the
+//     header comment for this file only ever proxied it indirectly.  Pure,
+//     no signal raised, a stack-owned struct.
+// ---------------------------------------------------------------------------
+static auto test_probe_state_default_init() -> void
+{
+    vmhook::os::detail_signal::probe_state st{};
+    check("probe_state_default_active_false", st.active == false);
+    check("probe_state_default_fault_false",  st.fault == false);
+}
+
+// ---------------------------------------------------------------------------
+// S2) detail_signal::install_once (hpp 929-941) is a magic-static init-once:
+//     the FIRST call installs the SIGSEGV+SIGBUS sigaction and caches whether
+//     BOTH succeeded; every later call returns that SAME cached bool.  On a
+//     normal Linux/Android runner both sigaction calls succeed, so it returns
+//     true and is idempotent.  install_once is noexcept (hpp 929).  We only
+//     assert idempotence + noexcept unconditionally; the true-value assertion
+//     is the expected outcome on any non-sandboxed host (a sandbox that blocks
+//     sigaction would make it false, which we surface as [INFO] not [FAIL]).
+// ---------------------------------------------------------------------------
+static auto test_install_once_idempotent() -> void
+{
+    const bool a{ vmhook::os::detail_signal::install_once() };
+    const bool b{ vmhook::os::detail_signal::install_once() };
+    const bool c{ vmhook::os::detail_signal::install_once() };
+    // The cached magic-static must yield a byte-stable answer on every call.
+    check("install_once_idempotent", a == b && b == c);
+    check("install_once_is_noexcept",
+          noexcept(vmhook::os::detail_signal::install_once()));
+    if (a)
+    {
+        check("install_once_succeeds_on_host", true);
+    }
+    else
+    {
+        std::printf("[INFO] install_once returned false: sandbox blocked sigaction\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3) detail_signal::active_state is `thread_local` (hpp 914), so it is the
+//     per-thread "currently inside a protected memcpy" pointer.  Outside any
+//     safe_read it must be nullptr — both on the calling thread and on a fresh
+//     worker thread (proving the thread_local is zero-initialised per thread,
+//     the property that isolates concurrent probes).  No fault is raised.
+// ---------------------------------------------------------------------------
+static auto test_active_state_thread_local_null_at_rest() -> void
+{
+    check("active_state_null_on_main_at_rest",
+          vmhook::os::detail_signal::active_state == nullptr);
+
+    std::atomic<bool> worker_saw_null{ false };
+    std::thread worker{ [&] {
+        worker_saw_null.store(
+            vmhook::os::detail_signal::active_state == nullptr,
+            std::memory_order_relaxed);
+    } };
+    worker.join();
+    check("active_state_null_on_fresh_thread", worker_saw_null.load());
+}
+
+#if !VMHOOK_OS_IOS
+// ---------------------------------------------------------------------------
+// S4) The disarm contract (hpp 1006-1014): safe_read publishes
+//     active_state=&state before the probed memcpy and ALWAYS resets it to
+//     nullptr afterwards (line 1014), on BOTH the success and the fault path.
+//     After any safe_read returns, active_state must be nullptr again — a leak
+//     here would leave a stale jmp_buf armed for the next unrelated SIGSEGV.
+//     We assert it after a VALID read (owned page) and after a FAULTING read
+//     (owned no_access page, which drives the sigsetjmp fallback after
+//     process_vm_readv short-reads).  PROT_NONE-gated; off iOS.
+// ---------------------------------------------------------------------------
+static auto test_active_state_cleared_after_read() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("active_state_disarm_skipped_alloc_failed", false);
+        return;
+    }
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    fill_pattern(bytes, page);
+
+    // Valid read first: active_state must be null after it returns.
+    std::uint8_t dst[8]{};
+    const bool good{ vmhook::os::safe_read(dst, bytes, sizeof(dst)) };
+    check("disarm_valid_read_succeeds", good);
+    check("active_state_null_after_valid_read",
+          vmhook::os::detail_signal::active_state == nullptr);
+
+    // Now a faulting read through an owned no_access page.
+    const bool locked{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::no_access,
+                                           nullptr) };
+    if (locked)
+    {
+        const bool bad{ vmhook::os::safe_read(dst, block, sizeof(dst)) };
+        check("disarm_faulting_read_returns_false", !bad);
+        check("active_state_null_after_faulting_read",
+              vmhook::os::detail_signal::active_state == nullptr);
+        (void)vmhook::os::protect(block, page,
+                                  vmhook::os::memory_protection::read_write, nullptr);
+    }
+    else
+    {
+        std::printf("[INFO] disarm faulting-read case skipped: PROT_NONE refused\n");
+    }
+    vmhook::os::release(block, page);
+}
+#endif // !VMHOOK_OS_IOS
+#endif // VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
+
+// ---------------------------------------------------------------------------
+// S5) safe_write input-guard prefix (hpp 1050-1053) is byte-for-byte the same
+//     guard as safe_read's (dst==null || src==null || size==0 -> false), on
+//     every platform, before any OS call.  Pin the full guard matrix against a
+//     real owned src/dst so even iOS (where safe_write always returns false)
+//     agrees on the negative entries.
+// ---------------------------------------------------------------------------
+static auto test_safe_write_guard_matrix() -> void
+{
+    alignas(std::uint64_t) std::uint8_t src[16];
+    fill_pattern(src, sizeof(src));
+    alignas(std::uint64_t) std::uint8_t dst[16]{};
+
+    check("safe_write_null_dst_false",  !vmhook::os::safe_write(nullptr, src, 8u));
+    check("safe_write_null_src_false",  !vmhook::os::safe_write(dst, nullptr, 8u));
+    check("safe_write_size0_false",     !vmhook::os::safe_write(dst, src, 0u));
+    check("safe_write_both_null_size0_false",
+          !vmhook::os::safe_write(nullptr, nullptr, 0u));
+}
+
+#if !VMHOOK_OS_IOS
+// ---------------------------------------------------------------------------
+// S6) safe_write happy path + safe_read agreement (hpp 1048-1075).  On
+//     Windows/macOS/Linux/Android safe_write performs a kernel-validated store
+//     into a committed writable page; iOS/unknown refuse (return false) and so
+//     are gated out.  Write a known pattern into an OWNED page via safe_write,
+//     then read it back with BOTH a plain load and safe_read — every byte must
+//     match.  Proves the write twin lands exactly `size` bytes and that the
+//     read/write primitives round-trip through the same owned memory.
+// ---------------------------------------------------------------------------
+static auto test_safe_write_roundtrip_owned_page() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("safe_write_roundtrip_skipped_alloc_failed", false);
+        return;
+    }
+    auto* const target{ static_cast<std::uint8_t*>(block) };
+    std::memset(target, 0x00, page);
+
+    alignas(std::uint64_t) std::uint8_t pattern[32];
+    fill_pattern(pattern, sizeof(pattern));
+
+    const bool wrote{ vmhook::os::safe_write(target, pattern, sizeof(pattern)) };
+    check("safe_write_owned_page_succeeds", wrote);
+    // Direct load: every written byte present, and the byte just past the span
+    // untouched (still 0x00) — proves exactly sizeof(pattern) bytes landed.
+    check("safe_write_owned_page_exact_bytes",
+          wrote && std::memcmp(target, pattern, sizeof(pattern)) == 0
+              && target[sizeof(pattern)] == 0x00);
+
+    // safe_read of the just-written region must agree byte-for-byte.
+    std::uint8_t readback[32]{};
+    const bool read_ok{ vmhook::os::safe_read(readback, target, sizeof(readback)) };
+    check("safe_read_after_safe_write_succeeds", read_ok);
+    check("safe_read_after_safe_write_matches_pattern",
+          read_ok && std::memcmp(readback, pattern, sizeof(pattern)) == 0);
+
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// S7) safe_write of a no_access OWNED page must return false (kernel rejects
+//     the store), never fault, and must NOT have altered the original bytes
+//     once the page is made readable again.  The write counterpart of the
+//     no_access safe_read cases.  PROT_NONE-gated; off iOS.
+// ---------------------------------------------------------------------------
+static auto test_safe_write_no_access_page_false() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("safe_write_no_access_skipped_alloc_failed", false);
+        return;
+    }
+    auto* const target{ static_cast<std::uint8_t*>(block) };
+    // Known marker bytes so we can prove the refused write changed nothing.
+    fill_pattern(target, page);
+
+    const bool locked{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::no_access,
+                                           nullptr) };
+    if (!locked)
+    {
+        std::printf("[INFO] safe_write_no_access skipped: PROT_NONE refused\n");
+        (void)make_writable(block, page);
+        vmhook::os::release(block, page);
+        return;
+    }
+
+    alignas(std::uint64_t) std::uint8_t intruder[16];
+    std::memset(intruder, 0x5C, sizeof(intruder));
+    const bool wrote{ vmhook::os::safe_write(block, intruder, sizeof(intruder)) };
+    check("safe_write_no_access_returns_false", !wrote);
+
+    // Restore RW and confirm the first bytes are still the original pattern,
+    // i.e. the refused write was all-or-nothing (no partial corruption).
+    const bool restored{ make_writable(block, page) };
+    check("safe_write_no_access_restore_writable", restored);
+    if (restored)
+    {
+        bool unchanged{ true };
+        for (std::size_t i{ 0 }; i < sizeof(intruder); ++i)
+        {
+            if (target[i] != static_cast<std::uint8_t>((i * 31u + 7u) & 0xFFu))
+            {
+                unchanged = false;
+            }
+        }
+        check("safe_write_no_access_left_bytes_unchanged", unchanged);
+    }
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// S8) safe_read_fast vs safe_read parity on a NO_ACCESS owned page: both must
+//     return false (neither faults).  The positive-parity sweep is covered
+//     above; this pins that the fast twin's NEGATIVE result also matches the
+//     authoritative path on an unreadable page (on cl.exe the SEH copy faults
+//     then falls back to safe_read; everywhere else it delegates outright).
+//     PROT_NONE-gated; off iOS.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_fast_parity_on_no_access() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("fast_parity_no_access_skipped_alloc_failed", false);
+        return;
+    }
+    *static_cast<volatile std::uint8_t*>(block) = 0x7E;
+
+    const bool locked{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::no_access,
+                                           nullptr) };
+    if (!locked)
+    {
+        std::printf("[INFO] fast_parity_no_access skipped: PROT_NONE refused\n");
+        vmhook::os::release(block, page);
+        return;
+    }
+
+    bool all_match_false{ true };
+    const std::size_t widths[]{ std::size_t{ 1 }, std::size_t{ 4 },
+                                std::size_t{ 8 }, std::size_t{ 64 } };
+    std::uint8_t dst[64];
+    for (const std::size_t w : widths)
+    {
+        const bool slow{ vmhook::os::safe_read(dst, block, w) };
+        const bool fast{ vmhook::os::safe_read_fast(dst, block, w) };
+        if (slow != fast || slow)
+        {
+            all_match_false = false;
+        }
+    }
+    check("safe_read_fast_matches_safe_read_false_on_no_access", all_match_false);
+
+    (void)vmhook::os::protect(block, page,
+                              vmhook::os::memory_protection::read_write, nullptr);
+    vmhook::os::release(block, page);
+}
+#endif // !VMHOOK_OS_IOS
+
+} // namespace deepen_os_signal_handler
+
 int main()
 {
     // Positive / parity (run on every platform, iOS included — these are valid
@@ -1127,6 +1434,26 @@ int main()
     deepen_os_safe_read::test_safe_read_pointer_filter_and_happy_path();
     deepen_os_safe_read::test_untag_pointer_bit_math();
     deepen_os_safe_read::test_is_readable_pointer_pure_filter();
+
+    // Deepening 2 (additive): signal-handler install/disarm contracts + the
+    // safe_write twin + cross-path parity.  The signal-handler pieces are
+    // Linux/Android-only (detail_signal only exists there); the safe_write guard
+    // matrix runs on every platform; the safe_write/fast positive + no_access
+    // cases need the fault-safe path and are gated off iOS.
+#if VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
+    deepen_os_signal_handler::test_probe_state_default_init();
+    deepen_os_signal_handler::test_install_once_idempotent();
+    deepen_os_signal_handler::test_active_state_thread_local_null_at_rest();
+#if !VMHOOK_OS_IOS
+    deepen_os_signal_handler::test_active_state_cleared_after_read();
+#endif
+#endif
+    deepen_os_signal_handler::test_safe_write_guard_matrix();
+#if !VMHOOK_OS_IOS
+    deepen_os_signal_handler::test_safe_write_roundtrip_owned_page();
+    deepen_os_signal_handler::test_safe_write_no_access_page_false();
+    deepen_os_signal_handler::test_safe_read_fast_parity_on_no_access();
+#endif
 
     // Fault-safety cases that require the fault-safe read path — gated off iOS,
     // where safe_read is a raw memcpy and these would fault the process.

@@ -1697,6 +1697,281 @@ static auto test_protect_multibyte_safe_read_probe() -> void
 }
 #endif
 
+// ===========================================================================
+// ADDITIVE DEEPENING SECTION (namespaced to avoid colliding with the
+// first-party functions above).  Everything here is either PURE ARITHMETIC over
+// page_size()/allocation_granularity() or operates ONLY on memory THIS section
+// allocated itself (allocate_rwx) — never a fabricated/unmapped address handed
+// to a reading helper.  It targets os-layer relations the body above does not
+// yet pin:
+//   * page_size / allocation_granularity power-of-two + determinism + ratio
+//     invariants (the body only asserts gr>=ps and gr%ps==0);
+//   * query_region FIELD invariants on an owned, committed RWX page — address
+//     containment (base <= addr < base+size), size is a page multiple, base is
+//     page-aligned, committed XOR free, not guarded;
+//   * allocate_rwx / release round-trip + a repeated alloc/release "leak" loop
+//     across several sizes, each freshly writable and each released, proving no
+//     accumulation / crash;
+//   * the protect-arm mapping reflected back through query_region (execute_read
+//     -> region reports executable; read_write store sticks) on an owned page,
+//     plus the size==0 / null guards of release re-pinned as no-ops.
+// Mirrors the file's check() idiom and the make_writable / allocate-guard
+// patterns.  No <thread> / no value_t-cast / no vector-stringop trap / no raw
+// NUL.  Every OS-specific assertion is platform-gated.
+// ===========================================================================
+namespace deepen_os_protect
+{
+
+// Whether `v` is a power of two (and non-zero).  Pure bit math; both page_size
+// and allocation_granularity are required by every VM allocator to be powers of
+// two so the mask-based rounding (base &= ~(ps-1)) the wrapper uses is correct.
+static auto is_power_of_two(std::size_t v) -> bool
+{
+    return v != 0 && (v & (v - 1)) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Pure arithmetic: page_size() and allocation_granularity() must each be a
+// non-zero power of two, must be deterministic across repeated calls (they read
+// fixed SYSTEM_INFO / sysconf values), and the granularity/page ratio must be an
+// exact integer power-of-two multiple.  The body's test_granularity_relationship
+// only pins gr>=ps and gr%ps==0; these are the stronger structural invariants
+// the mask-rounding inside protect() actually depends on.
+// ---------------------------------------------------------------------------
+static auto test_page_and_granularity_pure_relations() -> void
+{
+    const std::size_t ps{ vmhook::os::page_size() };
+    const std::size_t gr{ vmhook::os::allocation_granularity() };
+
+    check("deepen_page_size_nonzero", ps != 0);
+    check("deepen_page_size_power_of_two", is_power_of_two(ps));
+    check("deepen_granularity_nonzero", gr != 0);
+    check("deepen_granularity_power_of_two", is_power_of_two(gr));
+
+    // Determinism: a second query returns the identical value (both are derived
+    // from immutable kernel-reported constants).
+    check("deepen_page_size_deterministic", vmhook::os::page_size() == ps);
+    check("deepen_granularity_deterministic",
+          vmhook::os::allocation_granularity() == gr);
+
+    // gr >= ps and gr % ps == 0 (already pinned elsewhere) imply an integer
+    // ratio; because both are powers of two the ratio is itself a power of two.
+    const std::size_t ratio{ gr / ps };
+    check("deepen_granularity_ratio_exact", ratio * ps == gr);
+    check("deepen_granularity_ratio_power_of_two", is_power_of_two(ratio));
+
+    // The page mask (ps - 1) selects exactly the low bits; ANDing it back with
+    // ps must be zero (ps has no low bits set) — the precondition for the
+    // POSIX rounding `base &= ~(ps-1)` to align to a page boundary.
+    check("deepen_page_mask_clears_to_zero", (ps & (ps - 1)) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// query_region FIELD invariants on a page WE own.  The body asserts committed /
+// readable / not-guarded / size>=page; here we pin the structural relationships
+// the trampoline allocator relies on: the returned region must CONTAIN the
+// queried address, its base must be page-aligned, its size a whole-page
+// multiple, and committed and free must be mutually exclusive for a live
+// mapping.  All against a real RWX allocation, restored writable before release.
+// ---------------------------------------------------------------------------
+static auto test_query_region_field_invariants_owned() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * 2) };
+    if (!block)
+    {
+        check("deepen_query_invariants_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    // Touch both pages so the whole allocation is unambiguously committed.
+    bytes[0]    = 0x10;
+    bytes[page] = 0x20;
+
+    // Query the SECOND page's interior so a non-trivial base/containment
+    // relationship is exercised (not just base==address).
+    const void* const probe{ bytes + page + 7 };
+    const auto info{ vmhook::os::query_region(probe) };
+
+    check("deepen_query_committed", info.committed);
+    check("deepen_query_not_free_when_committed", !(info.committed && info.free));
+    check("deepen_query_base_non_null", info.base != nullptr);
+    check("deepen_query_size_nonzero", info.size != 0);
+
+    // Containment: base <= probe < base + size.
+    const std::uintptr_t base_addr{ reinterpret_cast<std::uintptr_t>(info.base) };
+    const std::uintptr_t probe_addr{ reinterpret_cast<std::uintptr_t>(probe) };
+    check("deepen_query_base_at_or_below_probe", base_addr <= probe_addr);
+    check("deepen_query_probe_within_region",
+          probe_addr < base_addr + static_cast<std::uintptr_t>(info.size));
+
+    // Base must be page-aligned and size a whole-page multiple (a region the
+    // kernel reports is always page-granular on every supported platform).
+    check("deepen_query_base_page_aligned", (base_addr % page) == 0);
+    check("deepen_query_size_page_multiple", (info.size % page) == 0);
+
+    check("deepen_query_restore_writable", make_writable(block, page * 2));
+    vmhook::os::release(block, page * 2);
+}
+
+// ---------------------------------------------------------------------------
+// allocate_rwx / release round-trip across several sizes, plus a repeated
+// alloc/release loop.  Each allocation must be non-null, freshly writable (a
+// store sticks at offset 0 and at the last byte), and released cleanly.  The
+// loop pins that repeated reservation+release neither leaks into failure nor
+// crashes — exactly the churn a trampoline pool produces over a long session.
+// Sizes are page-relative (never hard-coded) so it holds on 16K-page Apple HW.
+// ---------------------------------------------------------------------------
+static auto test_alloc_release_roundtrip_and_loop() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+
+    const std::size_t sizes[]{
+        page,
+        page * 2,
+        page * 3,
+        page * 4 + 1, // intentionally not a page multiple: must round up internally
+    };
+
+    bool all_alloc_ok{ true };
+    bool all_writable{ true };
+    for (const std::size_t sz : sizes)
+    {
+        void* const block{ vmhook::os::allocate_rwx(nullptr, sz) };
+        if (!block)
+        {
+            all_alloc_ok = false;
+            continue;
+        }
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        // First and last requested byte must both be writable.
+        bytes[0]      = 0x5A;
+        bytes[sz - 1] = 0xA5;
+        if (!(bytes[0] == 0x5A && bytes[sz - 1] == 0xA5))
+        {
+            all_writable = false;
+        }
+        vmhook::os::release(block, sz);
+    }
+    check("deepen_alloc_all_sizes_succeed", all_alloc_ok);
+    check("deepen_alloc_all_sizes_writable_first_and_last", all_writable);
+
+    // Repeated single-page alloc/release loop: every iteration must succeed and
+    // be independently writable.  A leak or double-free regression surfaces as a
+    // failed allocation or a crash partway through.
+    bool loop_ok{ true };
+    for (int i{ 0 }; i < 64; ++i)
+    {
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            loop_ok = false;
+            break;
+        }
+        *static_cast<volatile std::uint8_t*>(block) = static_cast<std::uint8_t>(i);
+        vmhook::os::release(block, page);
+    }
+    check("deepen_alloc_release_loop_64_iterations_ok", loop_ok);
+}
+
+// ---------------------------------------------------------------------------
+// The protect-arm mapping, observed through query_region, on an owned page.
+// execute_read must set the region's executable flag (the X bit the trampoline
+// installer checks before treating a page as code); read_write must leave the
+// page writable (a store sticks).  The body's roundtrip test pins execute_read
+// -> executable in one fixed sequence; this re-pins it independently and adds
+// the read_write writability witness on the SAME page so a to_native_protect arm
+// that collapsed execute_read into read_write (dropping X) would fail here.
+// W^X / sandbox refusals are treated as [INFO] skips, never hard failures.
+// ---------------------------------------------------------------------------
+static auto test_protect_arm_mapping_via_query() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deepen_arm_mapping_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0] = 0x3C;
+
+    // execute_read -> region reports readable AND executable.
+    {
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::execute_read,
+                                           nullptr) };
+        if (ok)
+        {
+            const auto info{ vmhook::os::query_region(block) };
+            check("deepen_arm_execrx_region_readable", info.readable);
+            check("deepen_arm_execrx_region_executable", info.executable);
+        }
+        else
+        {
+            std::printf("[INFO] deepen_arm execute_read refused (W^X / sandbox)\n");
+        }
+    }
+
+    // read_write -> region readable and a real store sticks (proves the W bit
+    // came back and the X-only-or-not state did not strand writability).
+    {
+        const bool ok{ vmhook::os::protect(block, page,
+                                           vmhook::os::memory_protection::read_write,
+                                           nullptr) };
+        check("deepen_arm_rw_succeeds", ok);
+        if (ok)
+        {
+            const auto info{ vmhook::os::query_region(block) };
+            check("deepen_arm_rw_region_readable", info.readable);
+            bytes[0] = 0xD2;
+            check("deepen_arm_rw_store_sticks", bytes[0] == 0xD2);
+        }
+    }
+
+    check("deepen_arm_mapping_restore_writable", make_writable(block, page));
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// release() guard re-pin on an owned block: a null address, and a zero size with
+// a live base, must both be NO-OPS that neither crash nor disturb the live
+// mapping.  The body's input-guard test covers the null/zero-size cases; here we
+// additionally confirm the block stays fully usable (writable at offset 0 AND at
+// the last page byte) after the no-op release attempts, before the real release.
+// ---------------------------------------------------------------------------
+static auto test_release_guard_is_noop_on_owned_block() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deepen_release_noop_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[0]        = 0x11;
+    bytes[page - 1] = 0x22;
+
+    // No-op releases: null address (ignores size), and zero size on the real
+    // base (must NOT unmap the live block).
+    vmhook::os::release(nullptr, page);
+    vmhook::os::release(block, 0);
+
+    // The block must still be fully live and writable after the no-ops.
+    bytes[0]        = 0x33;
+    bytes[page - 1] = 0x44;
+    check("deepen_release_noop_first_byte_writable", bytes[0] == 0x33);
+    check("deepen_release_noop_last_byte_writable", bytes[page - 1] == 0x44);
+
+    vmhook::os::release(block, page); // the real release
+}
+
+} // namespace deepen_os_protect
+
 int main()
 {
     test_granularity_relationship();
@@ -1727,6 +2002,18 @@ int main()
     test_protect_no_access_recovery();
     test_protect_multibyte_safe_read_probe();
     test_query_region_reports_free_for_unallocated();
+#endif
+
+    deepen_os_protect::test_page_and_granularity_pure_relations();
+    deepen_os_protect::test_alloc_release_roundtrip_and_loop();
+    deepen_os_protect::test_protect_arm_mapping_via_query();
+    deepen_os_protect::test_release_guard_is_noop_on_owned_block();
+#if !VMHOOK_OS_IOS
+    // query_region's structural field invariants (page-aligned base, page-
+    // multiple size, true containment) require a real kernel region.  iOS
+    // returns a permissive stub (base == the queried address, size == one page),
+    // which deliberately does not satisfy those relationships, so gate it off.
+    deepen_os_protect::test_query_region_field_invariants_owned();
 #endif
 
     if (failures == 0)

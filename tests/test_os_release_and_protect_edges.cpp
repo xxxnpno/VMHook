@@ -1875,6 +1875,571 @@ namespace expansion2_protect_pure_logic
     }
 } // namespace expansion2_protect_pure_logic
 
+// ===========================================================================
+// EXPANSION 3 (additive, namespaced) -- os-layer inputs/behaviour not yet hit
+// anywhere in THIS file: the safe_read / safe_write INPUT + WRAP guards driven
+// against REAL OWNED pages, query_region FIELD INVARIANTS (containment,
+// committed/free mutual-exclusion, interior-pointer containment), and the
+// page_size()/allocation_granularity()/user-address-constant arithmetic
+// relations beyond the existing power-of-two / >= / multiple checks.
+//
+// CHARTER (no duplication):
+//   * test_os_safe_read.cpp owns the deep safe_read behavioural matrix; here we
+//     ONLY pin the three header-level guards that are PURE input validation --
+//     reachable identically on every OS and provably safe because each rejects
+//     BEFORE the platform read: the null/zero guard (vmhook.hpp:957) and the
+//     wrap guard `src + size < src` (vmhook.hpp:968).  The wrap case uses a REAL
+//     owned page as `src` with SIZE_MAX as `size`: the sum wraps and the guard
+//     returns false WITHOUT reading, so no fabricated/unmapped address is ever
+//     dereferenced.  A positive control (read of a byte we just wrote into an
+//     owned page) proves the guard is the only thing rejecting the edges.
+//   * test_os_query_region.cpp owns the region matrix; here we ONLY pin the
+//     STRUCTURAL invariants of region_info for a block WE allocated: the region
+//     must CONTAIN the queried address (base <= addr < base+size), committed and
+//     free are never both set, and an interior pointer resolves to a region
+//     whose base does not exceed it.  All derived from vmhook.hpp:806-897.
+//   * The sizing-constant relations extend (not repeat) the existing
+//     power-of-two / idempotent / >= / multiple checks with exact-division,
+//     page-alignment-via-mask, and the user_address_floor < ceiling ordering
+//     (vmhook.hpp:515/520).
+//
+// Every value is DERIVED FROM SOURCE.  Every pointer handed to a reader is a
+// real allocate_rwx page we own or a stack object; the only "bad" inputs are
+// nullptr and an is_valid-rejected wrap that short-circuits before any read.
+// ===========================================================================
+namespace expansion3_os_guards_and_region
+{
+    // -----------------------------------------------------------------------
+    // safe_read INPUT + WRAP guards.  vmhook.hpp:957 rejects null dst, null src,
+    // or size==0 before any platform read; vmhook.hpp:968 rejects a src+size
+    // that wraps the address space.  Positive control first (proves the path is
+    // live), then every guard edge -- all returning false, none faulting.
+    // -----------------------------------------------------------------------
+    static auto test_safe_read_input_and_wrap_guards() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps) };
+        if (!block)
+        {
+            check("exp3_safe_read_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0] = 0x7C;
+        bytes[1] = 0x3B;
+
+        // Positive control: a real read of two owned bytes must succeed and copy
+        // them verbatim.  This is the ONLY thing distinguishing the guard
+        // rejections below from a generally-dead path.
+        {
+            std::uint8_t sink[2]{ 0, 0 };
+            const bool ok{ vmhook::os::safe_read(sink, block, 2u) };
+            check("exp3_safe_read_owned_bytes_succeeds", ok);
+            check("exp3_safe_read_owned_bytes_copied",
+                  ok && sink[0] == 0x7C && sink[1] == 0x3B);
+        }
+
+        // Guard: null dst -> false (src is a real owned page, never read).
+        {
+            std::uint8_t sink{ 0 };
+            (void)sink;
+            check("exp3_safe_read_null_dst_returns_false",
+                  !vmhook::os::safe_read(nullptr, block, 1u));
+        }
+        // Guard: null src -> false.
+        {
+            std::uint8_t sink{ 0 };
+            check("exp3_safe_read_null_src_returns_false",
+                  !vmhook::os::safe_read(&sink, nullptr, 1u));
+        }
+        // Guard: size==0 -> false (both pointers real, nothing is read).
+        {
+            std::uint8_t sink{ 0 };
+            check("exp3_safe_read_zero_size_returns_false",
+                  !vmhook::os::safe_read(&sink, block, 0u));
+        }
+
+        // Wrap guard: src is a REAL owned page, size == SIZE_MAX.  src + SIZE_MAX
+        // wraps below src, so vmhook.hpp:968 returns false BEFORE the platform
+        // read -- the owned page is never actually read past its end, and no
+        // unmapped address is ever touched.
+        {
+            std::uint8_t sink{ 0 };
+            check("exp3_safe_read_wrap_size_max_returns_false",
+                  !vmhook::os::safe_read(&sink, block, SIZE_MAX));
+        }
+        // Wrap guard boundary: the smallest size that still wraps from this exact
+        // owned base is (UINTPTR_MAX - base) + 1.  Derived straight from the
+        // source predicate `src + size < src`.  Rejected before any read.
+        {
+            std::uint8_t sink{ 0 };
+            const std::uintptr_t base{ reinterpret_cast<std::uintptr_t>(block) };
+            const std::uintptr_t umax{ ~static_cast<std::uintptr_t>(0) };
+            const std::size_t smallest_wrapping{
+                static_cast<std::size_t>(umax - base) + std::size_t{ 1 } };
+            check("exp3_safe_read_wrap_boundary_returns_false",
+                  !vmhook::os::safe_read(&sink, block, smallest_wrapping));
+        }
+
+        vmhook::os::release(block, ps);
+    }
+
+    // -----------------------------------------------------------------------
+    // safe_write INPUT guards (vmhook.hpp:1050).  Same shape: positive control
+    // into an owned page, then null/zero rejections.  iOS / unknown refuse ALL
+    // writes (return false unconditionally), so the positive control is gated to
+    // the platforms that expose a fault-safe write primitive.
+    // -----------------------------------------------------------------------
+    static auto test_safe_write_input_guards() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps) };
+        if (!block)
+        {
+            check("exp3_safe_write_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0] = 0x00;
+
+#if VMHOOK_OS_WINDOWS || VMHOOK_OS_MACOS || VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
+        // Positive control: a real fault-safe write into the owned page lands.
+        {
+            const std::uint8_t payload[2]{ 0x4D, 0x5E };
+            const bool ok{ vmhook::os::safe_write(block, payload, 2u) };
+            check("exp3_safe_write_owned_page_succeeds", ok);
+            check("exp3_safe_write_owned_page_stored",
+                  ok && bytes[0] == 0x4D && bytes[1] == 0x5E);
+        }
+#else
+        // iOS / unknown: no fault-safe write API; the primitive refuses.  Pin the
+        // documented refusal so the contract is frozen on those platforms too.
+        {
+            const std::uint8_t payload[2]{ 0x4D, 0x5E };
+            check("exp3_safe_write_refused_on_ios_unknown",
+                  !vmhook::os::safe_write(block, payload, 2u));
+        }
+#endif
+
+        // Guard: null dst -> false (src is a real stack buffer, never read).
+        {
+            const std::uint8_t payload{ 0x11 };
+            check("exp3_safe_write_null_dst_returns_false",
+                  !vmhook::os::safe_write(nullptr, &payload, 1u));
+        }
+        // Guard: null src -> false (dst is a real owned page, never written).
+        check("exp3_safe_write_null_src_returns_false",
+              !vmhook::os::safe_write(block, nullptr, 1u));
+        // Guard: size==0 -> false (both pointers real, nothing transfers).
+        {
+            const std::uint8_t payload{ 0x22 };
+            check("exp3_safe_write_zero_size_returns_false",
+                  !vmhook::os::safe_write(block, &payload, 0u));
+        }
+
+        vmhook::os::release(block, ps);
+    }
+
+    // -----------------------------------------------------------------------
+    // query_region FIELD INVARIANTS for a block WE OWN.  Beyond the
+    // committed/readable/size>=request checks the wave-5 block already makes,
+    // pin the STRUCTURAL guarantees every backend (VirtualQuery / mach_vm_region
+    // / iOS stub / /proc maps) must satisfy:
+    //   * the region CONTAINS the queried address: base <= addr < base+size;
+    //   * committed and free are mutually exclusive (never both true);
+    //   * querying an INTERIOR pointer of the same block yields a region whose
+    //     base does not exceed that interior pointer (and on the page-granular
+    //     backends the interior still lands inside the reported region).
+    // All addresses are inside a real owned allocation; nothing fabricated.
+    // -----------------------------------------------------------------------
+    static auto test_query_region_field_invariants() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        constexpr std::size_t pages{ 4 };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps * pages) };
+        if (!block)
+        {
+            check("exp3_query_region_skipped_alloc_failed", false);
+            return;
+        }
+
+        // Make the whole span resident so every backend reports it live.
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        for (std::size_t p{ 0 }; p < pages; ++p)
+        {
+            bytes[p * ps] = static_cast<std::uint8_t>(0x60 + p);
+        }
+
+        const std::uintptr_t base_addr{ reinterpret_cast<std::uintptr_t>(block) };
+
+        // Query at the base.
+        const vmhook::os::region_info ri{ vmhook::os::query_region(block) };
+
+        // committed and free are never simultaneously true on any backend.
+        check("exp3_query_region_committed_xor_free",
+              !(ri.committed && ri.free));
+
+        // For a committed region, it must CONTAIN the queried base address:
+        // region_base <= addr < region_base + size.  (Only meaningful when
+        // committed; a free-region report has different base/size semantics.)
+        if (ri.committed)
+        {
+            const std::uintptr_t rb{ reinterpret_cast<std::uintptr_t>(ri.base) };
+            check("exp3_query_region_base_le_addr", rb <= base_addr);
+            check("exp3_query_region_addr_lt_base_plus_size",
+                  base_addr < rb + static_cast<std::uintptr_t>(ri.size));
+            // A committed region we just wrote to must be non-empty.
+            check("exp3_query_region_committed_size_nonzero", ri.size != 0u);
+        }
+        else
+        {
+            // A backend that cannot introspect (no committed flag) still must
+            // not crash; record the outcome rather than failing.
+            info("exp3_query_region_base_block_committed", ri.committed);
+        }
+
+        // Interior pointer inside the SECOND page (still our own memory): the
+        // reported region base must not exceed it.
+        {
+            void* const interior{ static_cast<void*>(bytes + ps + 7u) };
+            const std::uintptr_t ia{ reinterpret_cast<std::uintptr_t>(interior) };
+            const vmhook::os::region_info ir{ vmhook::os::query_region(interior) };
+            if (ir.committed)
+            {
+                const std::uintptr_t irb{ reinterpret_cast<std::uintptr_t>(ir.base) };
+                check("exp3_query_region_interior_base_le_addr", irb <= ia);
+                check("exp3_query_region_interior_addr_lt_base_plus_size",
+                      ia < irb + static_cast<std::uintptr_t>(ir.size));
+            }
+            else
+            {
+                info("exp3_query_region_interior_committed", ir.committed);
+            }
+            // committed/free mutual exclusion holds at the interior too.
+            check("exp3_query_region_interior_committed_xor_free",
+                  !(ir.committed && ir.free));
+        }
+
+        // Executable bit is platform-variable for a fresh RWX block (W^X on
+        // Apple drops PROT_EXEC; the Linux /proc backend reports perms[2]).
+        // Characterize, never assert.
+        info("exp3_query_region_fresh_rwx_executable", ri.executable);
+
+        vmhook::os::release(block, ps * pages);
+    }
+
+    // -----------------------------------------------------------------------
+    // SIZING-CONSTANT arithmetic relations beyond the existing checks.
+    //   * granularity / page_size is an EXACT integer (no remainder) and
+    //     multiplying back recovers granularity -- the divisor the trampoline
+    //     allocator uses must be lossless.
+    //   * granularity is page-aligned when masked with (ps-1): (gr & (ps-1))==0,
+    //     a second witness of "multiple of page" via bitmask rather than %.
+    //   * the user-address window is well-ordered and non-degenerate:
+    //     user_address_floor (0xFFFF) < user_address_ceiling (0x00007FFF'FFFFFFFF)
+    //     (vmhook.hpp:515/520), and both are exactly their documented literals.
+    //   * page_size fits well inside the user window (a single page never spans
+    //     the entire addressable user range) -- a sanity bound the allocator's
+    //     stride math implicitly assumes.
+    // -----------------------------------------------------------------------
+    static auto test_sizing_constant_relations() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        const std::size_t gr{ vmhook::os::allocation_granularity() };
+
+        // Exact, lossless division: gr is a whole number of pages and
+        // (gr/ps)*ps == gr with no truncation.
+        check("exp3_granularity_div_page_exact", (gr % ps) == 0u);
+        check("exp3_granularity_div_then_mul_recovers", (gr / ps) * ps == gr);
+        check("exp3_granularity_pages_at_least_one", (gr / ps) >= 1u);
+
+        // Bitmask witness of "multiple of page": since ps is a power of two,
+        // (gr & (ps-1)) == 0 is equivalent to (gr % ps) == 0.
+        check("exp3_granularity_page_aligned_via_mask",
+              (gr & (ps - 1u)) == 0u);
+
+        // User-address window: documented literals, well-ordered, non-empty.
+        check("exp3_user_floor_is_documented_literal",
+              vmhook::os::user_address_floor == static_cast<std::uintptr_t>(0xFFFFull));
+        check("exp3_user_ceiling_is_documented_literal",
+              vmhook::os::user_address_ceiling
+                  == static_cast<std::uintptr_t>(0x00007FFFFFFFFFFFull));
+        check("exp3_user_floor_below_ceiling",
+              vmhook::os::user_address_floor < vmhook::os::user_address_ceiling);
+
+        // A single page is far smaller than the user window -- one page can never
+        // span the whole addressable user range.
+        check("exp3_page_size_within_user_window",
+              static_cast<std::uintptr_t>(ps)
+                  < (vmhook::os::user_address_ceiling - vmhook::os::user_address_floor));
+
+        // granularity likewise fits comfortably under the ceiling.
+        check("exp3_granularity_within_user_window",
+              static_cast<std::uintptr_t>(gr)
+                  < (vmhook::os::user_address_ceiling - vmhook::os::user_address_floor));
+    }
+
+    static auto run() -> void
+    {
+        test_safe_read_input_and_wrap_guards();
+        test_safe_write_input_guards();
+        test_query_region_field_invariants();
+        test_sizing_constant_relations();
+    }
+} // namespace expansion3_os_guards_and_region
+
+// ===========================================================================
+// EXPANSION 4 (additive, namespaced) -- os-layer SURFACE that none of the
+// prior sections in this file (null/zero guards, lifecycle, wave-5 sizing,
+// expansion-2 pure-logic, expansion-3 guards/region) reach: the module-lookup
+// helpers, current_thread_id, safe_read_fast PARITY, the safe_write multi-byte
+// round-trip verified by reading it BACK, the flush_instruction_cache hint, and
+// the user_address_ceiling bit-identity.  Strictly cross-platform INVARIANTS;
+// every reader touches only a real allocate_rwx page we own, a stack object, or
+// an is_valid-rejected absent-module name.  Platform-variable outcomes -> info().
+//
+// CHARTER (no duplication of expansion-3 or the sibling files):
+//   * expansion-3 owns safe_read / safe_write INPUT + WRAP guards and the
+//     query_region STRUCTURAL invariants; this block touches NEITHER.  It owns:
+//     - find_loaded_module(nullptr) handle shape + idempotency + absent->null,
+//       and find_jvm_module() characterization (vmhook.hpp:529-576) -- distinct
+//       from the get_proc_address null-SYMBOL guard test earlier in the file;
+//     - current_thread_id() non-zero + idempotent (vmhook.hpp:601-614);
+//     - safe_read_fast PARITY with safe_read on an owned page + its own input
+//       guards (vmhook.hpp:1138-1159) -- safe_read_fast is untested anywhere here;
+//     - safe_write ROUND-TRIP (write N bytes, read them back via safe_read,
+//       compare) + direct-read visibility -- expansion-3 only does a 2-byte
+//       store positive-control, never a read-back equality;
+//     - flush_instruction_cache null/zero/real-range no-op (vmhook.hpp:1164-1177);
+//     - user_address_ceiling == 2^47 - 1 bit-identity + a real owned page above
+//       the floor (vmhook.hpp:515/520) -- a different angle than expansion-3's
+//       literal/ordering checks.
+// Every value DERIVED FROM SOURCE.
+// ===========================================================================
+namespace expansion4_os_layer_surface
+{
+    // -----------------------------------------------------------------------
+    // find_loaded_module(nullptr) returns a valid non-null handle on every
+    // supported platform (GetModuleHandleA(nullptr) -> the .exe handle;
+    // dlopen(nullptr, RTLD_LAZY|RTLD_NOLOAD) -> the global-scope handle), per
+    // vmhook.hpp:529-542.  Two calls yield the SAME handle (the result identity
+    // is stateless).  A nonsense leaf name no process links must resolve to
+    // nullptr (the negative half of the lookup).  find_jvm_module() is
+    // environment-variable in a no-JVM binary -> info(), never asserted.
+    // -----------------------------------------------------------------------
+    static auto test_module_lookup_self_and_absent() -> void
+    {
+        const vmhook::os::module_handle self1{ vmhook::os::find_loaded_module(nullptr) };
+        const vmhook::os::module_handle self2{ vmhook::os::find_loaded_module(nullptr) };
+        check("exp4_find_loaded_module_null_returns_handle", self1 != nullptr);
+        check("exp4_find_loaded_module_null_idempotent", self1 == self2);
+
+        // A leaf name certainly not loaded -> nullptr.
+        check("exp4_find_loaded_module_absent_returns_null",
+              vmhook::os::find_loaded_module("vmhook_absent_module_zzz.qqq") == nullptr);
+
+        // No-JVM build: normally no libjvm in scope.  Environment decides.
+        info("exp4_find_jvm_module_resolved_in_test_env",
+             vmhook::os::find_jvm_module() != nullptr);
+    }
+
+    // -----------------------------------------------------------------------
+    // current_thread_id() (vmhook.hpp:601-614): a genuine kernel/port id on
+    // Windows / Linux / Android / Apple (never 0 for a live thread), 0 on the
+    // unknown-platform fallback (614).  It is STABLE across calls within one
+    // thread.  Idempotency is universal; non-zero is asserted only where the
+    // source returns a real id, characterized elsewhere.
+    // -----------------------------------------------------------------------
+    static auto test_current_thread_id_stable_nonzero() -> void
+    {
+        const vmhook::os::thread_id_t a{ vmhook::os::current_thread_id() };
+        const vmhook::os::thread_id_t b{ vmhook::os::current_thread_id() };
+        check("exp4_current_thread_id_idempotent", a == b);
+#if VMHOOK_OS_WINDOWS || VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID || VMHOOK_OS_APPLE
+        check("exp4_current_thread_id_nonzero", a != vmhook::os::thread_id_t{ 0 });
+#else
+        info("exp4_current_thread_id_nonzero_on_unknown_platform",
+             a != vmhook::os::thread_id_t{ 0 });
+#endif
+    }
+
+    // -----------------------------------------------------------------------
+    // safe_read_fast is a drop-in for safe_read whose SUCCESS bytes are
+    // byte-identical (vmhook.hpp:1135-1137); on a mapped readable page both must
+    // succeed and return the same content.  Its input guards mirror safe_read's
+    // (1140-1143).  Pure owned memory; safe_read_fast is otherwise untested in
+    // this file.
+    // -----------------------------------------------------------------------
+    static auto test_safe_read_fast_parity_and_guards() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps) };
+        if (!block)
+        {
+            check("exp4_safe_read_fast_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        std::array<std::uint8_t, 16> pattern{};
+        for (std::size_t i{ 0 }; i < pattern.size(); ++i)
+        {
+            pattern[i] = static_cast<std::uint8_t>((i * 17u + 3u) & 0xFFu);
+            bytes[i] = pattern[i];
+        }
+        const std::size_t span{ pattern.size() };
+
+        std::array<std::uint8_t, 16> via_read{};
+        std::array<std::uint8_t, 16> via_fast{};
+        const bool read_ok{ vmhook::os::safe_read(via_read.data(), block, span) };
+        const bool fast_ok{ vmhook::os::safe_read_fast(via_fast.data(), block, span) };
+
+        check("exp4_safe_read_owned_span_ok", read_ok);
+        check("exp4_safe_read_fast_owned_span_ok", fast_ok);
+        check("exp4_safe_read_fast_matches_pattern",
+              !fast_ok || std::memcmp(via_fast.data(), pattern.data(), span) == 0);
+        // Parity: when both succeed they return identical bytes.
+        check("exp4_safe_read_fast_parity_with_safe_read",
+              !(read_ok && fast_ok)
+              || std::memcmp(via_read.data(), via_fast.data(), span) == 0);
+
+        // Input guards mirror safe_read's null/zero short-circuit.
+        std::uint8_t s{ 0 };
+        check("exp4_safe_read_fast_null_dst_false",
+              !vmhook::os::safe_read_fast(nullptr, block, 1u));
+        check("exp4_safe_read_fast_null_src_false",
+              !vmhook::os::safe_read_fast(&s, nullptr, 1u));
+        check("exp4_safe_read_fast_zero_size_false",
+              !vmhook::os::safe_read_fast(&s, block, 0u));
+
+        vmhook::os::release(block, ps);
+    }
+
+    // -----------------------------------------------------------------------
+    // safe_write ROUND-TRIP: write a multi-byte pattern into an owned writable
+    // page via safe_write, then read it BACK via safe_read and compare -- the
+    // read-back-equality angle expansion-3's 2-byte store positive-control does
+    // not cover.  The store must also be visible through a direct volatile read
+    // of our own page (it really landed, not just kernel-buffered).  Gated off
+    // iOS / unknown, where safe_write refuses (vmhook.hpp:1071-1074).  dst is a
+    // page WE allocated and keep writable -- never a fabricated/read-only target.
+    // -----------------------------------------------------------------------
+    static auto test_safe_write_round_trip_read_back() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps) };
+        if (!block)
+        {
+            check("exp4_safe_write_round_trip_skipped_alloc_failed", false);
+            return;
+        }
+        (void)make_writable(block, ps);
+
+#if VMHOOK_OS_WINDOWS || VMHOOK_OS_MACOS || VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
+        std::array<std::uint8_t, 12> payload{};
+        for (std::size_t i{ 0 }; i < payload.size(); ++i)
+        {
+            payload[i] = static_cast<std::uint8_t>((i * 23u + 9u) & 0xFFu);
+        }
+        const std::size_t span{ payload.size() };
+
+        const bool wrote{ vmhook::os::safe_write(block, payload.data(), span) };
+        check("exp4_safe_write_owned_span_ok", wrote);
+        if (wrote)
+        {
+            std::array<std::uint8_t, 12> back{};
+            const bool read_ok{ vmhook::os::safe_read(back.data(), block, span) };
+            check("exp4_safe_write_then_read_back_ok", read_ok);
+            check("exp4_safe_write_round_trip_matches",
+                  !read_ok || std::memcmp(back.data(), payload.data(), span) == 0);
+            check("exp4_safe_write_visible_through_direct_read",
+                  static_cast<volatile std::uint8_t*>(block)[0] == payload[0]);
+        }
+#else
+        info("exp4_safe_write_round_trip_skipped_no_fault_safe_write", true);
+#endif
+
+        vmhook::os::release(block, ps);
+    }
+
+    // -----------------------------------------------------------------------
+    // flush_instruction_cache (vmhook.hpp:1164-1177) is a best-effort void hint
+    // with a null/zero short-circuit (1166-1169); the only observable contract
+    // is "does not crash" and "never rewrites memory".  Pin the guard arms and a
+    // real-owned-page flush (the trampoline installer calls this after writing a
+    // JMP, so a real range must be accepted cleanly).
+    // -----------------------------------------------------------------------
+    static auto test_flush_instruction_cache_guards_and_real() -> void
+    {
+        const std::size_t ps{ vmhook::os::page_size() };
+
+        // Guard arms: no kernel call, no crash.
+        vmhook::os::flush_instruction_cache(nullptr, ps);
+        vmhook::os::flush_instruction_cache(nullptr, 0);
+        check("exp4_flush_icache_null_addr_no_crash", true);
+
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps) };
+        if (!block)
+        {
+            check("exp4_flush_icache_skipped_alloc_failed", false);
+            return;
+        }
+
+        auto* const bytes{ static_cast<std::uint8_t*>(block) };
+        bytes[0] = 0x90; // NOP -- realistic post-patch content
+
+        // Zero size on a real addr -> guarded no-op.
+        vmhook::os::flush_instruction_cache(block, 0);
+        check("exp4_flush_icache_zero_size_no_crash", true);
+
+        // Real range -> the live trampoline path: no crash, no byte rewrite.
+        vmhook::os::flush_instruction_cache(block, ps);
+        check("exp4_flush_icache_real_range_no_crash", true);
+        check("exp4_flush_icache_does_not_rewrite_bytes", bytes[0] == 0x90);
+
+        vmhook::os::release(block, ps);
+    }
+
+    // -----------------------------------------------------------------------
+    // user_address_ceiling bit-identity: the documented top is the canonical
+    // 47-bit user-space maximum, (2^47 - 1) == 0x00007FFF'FFFFFFFF (vmhook.hpp:515).
+    // A real owned page sits strictly above the 64 KiB floor on every host (a heap
+    // mapping is never in the bottom 64 KiB), which is the only half of the
+    // is_valid_pointer band check (vmhook.hpp:2023-2024) that is universal across
+    // 32/64-bit.  No fabricated address: the page is real and owned.
+    // -----------------------------------------------------------------------
+    static auto test_user_ceiling_bit_identity_and_owned_page() -> void
+    {
+        static_assert(vmhook::os::user_address_ceiling == ((std::uintptr_t{ 1 } << 47) - 1u));
+        check("exp4_user_ceiling_is_2_47_minus_1",
+              vmhook::os::user_address_ceiling == ((std::uintptr_t{ 1 } << 47) - 1u));
+
+        const std::size_t ps{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, ps) };
+        if (!block)
+        {
+            check("exp4_user_ceiling_owned_page_skipped_alloc_failed", false);
+            return;
+        }
+        const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(block) };
+        check("exp4_owned_page_above_user_floor",
+              addr > vmhook::os::user_address_floor);
+        vmhook::os::release(block, ps);
+    }
+
+    static auto run() -> void
+    {
+        test_module_lookup_self_and_absent();
+        test_current_thread_id_stable_nonzero();
+        test_safe_read_fast_parity_and_guards();
+        test_safe_write_round_trip_read_back();
+        test_flush_instruction_cache_guards_and_real();
+        test_user_ceiling_bit_identity_and_owned_page();
+    }
+} // namespace expansion4_os_layer_surface
+
 int main()
 {
     test_release_zero_size_is_idempotent_noop();
@@ -1907,6 +2472,15 @@ int main()
     // --- expansion 2: pure-logic to_native_protect mapping / overflow boundary
     //     / POSIX rounding formula / old_prot success-path contract ---
     expansion2_protect_pure_logic::run();
+
+    // --- expansion 3: safe_read/safe_write input+wrap guards (real owned
+    //     pages), query_region field invariants, sizing-constant relations ---
+    expansion3_os_guards_and_region::run();
+
+    // --- expansion 4: module lookup, current_thread_id, safe_read_fast parity,
+    //     safe_write round-trip read-back, flush_instruction_cache, ceiling
+    //     bit-identity ---
+    expansion4_os_layer_surface::run();
 
     if (failures == 0)
     {
