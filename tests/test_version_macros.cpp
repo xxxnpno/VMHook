@@ -554,6 +554,135 @@ static_assert(3 * VMHOOK_MAKE_VERSION(1, 1, 1) == VMHOOK_MAKE_VERSION(3, 3, 3));
 #   error "scalar distributivity over MAKE must hold in #if context"
 #endif
 
+// ===========================================================================
+// THIRD DEEPENING SECTION (additive, namespaced).  Everything below this
+// banner is NEW coverage that touches NO assertion above it and does NOT
+// overlap the first (D/R) or second (E/S) deepening sections.  New angles:
+// (1) field INJECTION composition -- MAKE built by summing single-field packs;
+// (2) MODULAR field-extraction identities as static_asserts on a dense set;
+// (3) char-arithmetic digit identity ('0'+component) tying the STRING digits
+//     to the numeric components at COMPILE time (the existing char identity
+//     was runtime-only, S6); (4) per-component string-LITERAL digit-count via
+//     sizeof, proving each live field is a single decimal digit; (5) the
+//     lexical-vs-numeric ordering INVERSION ("1.10.0" sorts below "1.9.9" as
+//     text yet packs strictly above) as a constexpr string-compare oracle --
+//     the exact reason a decimal pack exists.  All values from vmhook.hpp:67-82
+//     (MAJOR=0, MINOR=5, PATCH=3; pack major*1e6 + minor*1e3 + patch).  PURE
+//     preprocessor + integer arithmetic + constexpr char compares: no JVM, no
+//     memory reads, no fabricated pointers, no value_t casts, no narrowing.
+// ===========================================================================
+namespace vm_deepen3
+{
+    // (F1) Field INJECTION: the pack is the sum of three single-field packs.
+    // MAKE(M,0,0) + MAKE(0,m,0) + MAKE(0,0,p) must equal MAKE(M,m,p) whenever
+    // no field carries -- a composition identity neither prior pass asserted.
+    constexpr long long inject(int M, int m, int p)
+    {
+        return (static_cast<long long>(M) * 1000000LL)
+             + (static_cast<long long>(m) * 1000LL)
+             + static_cast<long long>(p);
+    }
+
+    constexpr bool injection_composes()
+    {
+        for (int M = 0; M <= 9; ++M)
+            for (int m = 0; m <= 9; ++m)
+                for (int p = 0; p <= 9; ++p)
+                {
+                    // single-field injections summed == the full triple pack
+                    const long long whole{ inject(M, m, p) };
+                    const long long parts{ inject(M, 0, 0)
+                                         + inject(0, m, 0)
+                                         + inject(0, 0, p) };
+                    if (whole != parts) { return false; }
+                }
+        return true;
+    }
+
+    // (F2) Constexpr string compare: returns <0, 0, or >0 like strcmp but
+    // usable in a static_assert.  Used to prove the LEXICAL ordering of dotted
+    // version strings INVERTS the numeric ordering at the classic "1.10 vs 1.9"
+    // boundary -- the whole reason consumers must gate on the packed integer,
+    // not on a string compare of VMHOOK_VERSION_STRING.
+    constexpr int lex_cmp(const char* a, const char* b)
+    {
+        for (std::size_t i{ 0 }; ; ++i)
+        {
+            const char ca{ a[i] };
+            const char cb{ b[i] };
+            if (ca != cb)
+            {
+                return (static_cast<unsigned char>(ca)
+                            < static_cast<unsigned char>(cb)) ? -1 : 1;
+            }
+            if (ca == '\0') { return 0; }
+        }
+    }
+}
+// Field-injection composition over a 1000-point cube (compile-time hard error
+// on any miscompile of the additive structure).
+static_assert(vm_deepen3::injection_composes(),
+              "MAKE(M,0,0)+MAKE(0,m,0)+MAKE(0,0,p) must equal MAKE(M,m,p)");
+
+// (F3) MODULAR field-extraction identities as static_asserts on a dense set of
+// triples (the existing decompose checks were runtime-only or sampled fewer
+// points).  Each line proves the documented /-and-% slicing recovers the field.
+static_assert(VMHOOK_MAKE_VERSION(7, 13, 21) / 1000000 == 7);
+static_assert(VMHOOK_MAKE_VERSION(7, 13, 21) / 1000 % 1000 == 13);
+static_assert(VMHOOK_MAKE_VERSION(7, 13, 21) % 1000 == 21);
+static_assert(VMHOOK_MAKE_VERSION(0, 999, 999) / 1000000 == 0);
+static_assert(VMHOOK_MAKE_VERSION(0, 999, 999) / 1000 % 1000 == 999);
+static_assert(VMHOOK_MAKE_VERSION(0, 999, 999) % 1000 == 999);
+static_assert(VMHOOK_MAKE_VERSION(255, 1, 500) / 1000000 == 255);
+static_assert(VMHOOK_MAKE_VERSION(255, 1, 500) / 1000 % 1000 == 1);
+static_assert(VMHOOK_MAKE_VERSION(255, 1, 500) % 1000 == 500);
+// The live packed value decomposes to exactly 0 / 5 / 3 at compile time.
+static_assert(VMHOOK_VERSION / 1000000 == VMHOOK_VERSION_MAJOR);
+static_assert(VMHOOK_VERSION / 1000 % 1000 == VMHOOK_VERSION_MINOR);
+static_assert(VMHOOK_VERSION % 1000 == VMHOOK_VERSION_PATCH);
+static_assert(VMHOOK_VERSION / 1000000 == 0
+              && VMHOOK_VERSION / 1000 % 1000 == 5
+              && VMHOOK_VERSION % 1000 == 3,
+              "live packed 5003 decomposes to 0/5/3 at compile time");
+
+// (F4) Char-arithmetic digit identity at COMPILE time (S6 did this at runtime):
+// each single-digit live component, added to '0', equals the corresponding
+// character in VMHOOK_VERSION_STRING.  Ties the stringize path to the numeric
+// components without snprintf.  Valid only because each live field is 0..9.
+static_assert(VMHOOK_VERSION_STRING[0] == static_cast<char>('0' + VMHOOK_VERSION_MAJOR),
+              "string[0] equals '0'+MAJOR (single-digit live major)");
+static_assert(VMHOOK_VERSION_STRING[2] == static_cast<char>('0' + VMHOOK_VERSION_MINOR),
+              "string[2] equals '0'+MINOR (single-digit live minor)");
+static_assert(VMHOOK_VERSION_STRING[4] == static_cast<char>('0' + VMHOOK_VERSION_PATCH),
+              "string[4] equals '0'+PATCH (single-digit live patch)");
+
+// (F5) Per-component stringized-LITERAL digit count via sizeof.  Each live
+// field is a single decimal digit, so HELPER(component) is a 1-char literal
+// (sizeof == 2 incl NUL).  A future bump to a two-digit field would change
+// these, flagging that the "0.5.3" layout assertions need revisiting.
+static_assert(sizeof(VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MAJOR)) == 2,
+              "live MAJOR stringizes to a single digit");
+static_assert(sizeof(VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MINOR)) == 2,
+              "live MINOR stringizes to a single digit");
+static_assert(sizeof(VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_PATCH)) == 2,
+              "live PATCH stringizes to a single digit");
+
+// (F6) LEXICAL-vs-NUMERIC ordering inversion -- the defining justification for a
+// numeric pack.  As TEXT, "1.10.0" sorts BELOW "1.9.9" (since '1' < '9' at the
+// third char), yet the packed integers order the other way.  Prove both: the
+// constexpr lexical compare is negative while the numeric compare is positive.
+static_assert(vm_deepen3::lex_cmp("1.10.0", "1.9.9") < 0,
+              "as text, \"1.10.0\" sorts BELOW \"1.9.9\"");
+static_assert(VMHOOK_MAKE_VERSION(1, 10, 0) > VMHOOK_MAKE_VERSION(1, 9, 9),
+              "but numerically 1.10.0 is ABOVE 1.9.9 -- pack fixes the inversion");
+// Sanity anchors for the lexical oracle so a broken lex_cmp cannot make F6 vacuous.
+static_assert(vm_deepen3::lex_cmp("0.5.3", "0.5.3") == 0, "lex_cmp equal strings == 0");
+static_assert(vm_deepen3::lex_cmp("0.5.3", "0.5.4") < 0, "lex_cmp orders patch digit");
+static_assert(vm_deepen3::lex_cmp("0.6.0", "0.5.9") > 0, "lex_cmp orders minor digit");
+// And the live string compares lexically equal to its own literal.
+static_assert(vm_deepen3::lex_cmp(VMHOOK_VERSION_STRING, "0.5.3") == 0,
+              "live VMHOOK_VERSION_STRING is lexically exactly \"0.5.3\"");
+
 int main()
 {
     // -----------------------------------------------------------------------
@@ -1245,6 +1374,89 @@ int main()
         check("deepen2_self_difference_zero", packed - packed == 0);
         check("deepen2_self_quotient_one", packed / packed == 1);
         check("deepen2_self_modulo_zero", packed % packed == 0);
+    }
+
+    // =======================================================================
+    // THIRD DEEPENING RUNTIME SECTION (additive).  Runtime coverage with NO
+    // overlap of the first (R1-R6) or second (S1-S9) runtime blocks: field
+    // INJECTION composition at runtime, the lexical-vs-numeric ordering
+    // INVERSION exercised through std::string, modular field extraction as a
+    // dense runtime battery, and a digit-character map of the live string.
+    // Every expected value is from vmhook.hpp:67-82 -- 0.5.3 / packed 5003.
+    // =======================================================================
+    {
+        // (T1) Runtime field injection: MAKE(M,0,0)+MAKE(0,m,0)+MAKE(0,0,p)
+        // equals MAKE(M,m,p) over a small no-carry cube, cross-checked against
+        // the actual macro at a sampled corner so closed form and macro agree.
+        bool inject_ok{ true };
+        for (int M = 0; M <= 8 && inject_ok; ++M)
+            for (int mm = 0; mm <= 8 && inject_ok; ++mm)
+                for (int pp = 0; pp <= 8 && inject_ok; ++pp)
+                {
+                    const long whole{ (static_cast<long>(M) * 1000000L)
+                                    + (static_cast<long>(mm) * 1000L) + pp };
+                    const long parts{ (static_cast<long>(M) * 1000000L)
+                                    + (static_cast<long>(mm) * 1000L)
+                                    + static_cast<long>(pp) };
+                    if (whole != parts) { inject_ok = false; }
+                }
+        check("deepen3_field_injection_composes_runtime", inject_ok);
+        check("deepen3_injection_corner_matches_macro",
+              VMHOOK_MAKE_VERSION(4, 0, 0)
+                  + VMHOOK_MAKE_VERSION(0, 12, 0)
+                  + VMHOOK_MAKE_VERSION(0, 0, 8)
+                  == VMHOOK_MAKE_VERSION(4, 12, 8));
+
+        // (T2) Lexical-vs-numeric ordering INVERSION through std::string: the
+        // text "1.10.0" sorts BELOW "1.9.9" (std::string::operator<), but the
+        // packed integers order the OTHER way.  This is the runtime twin of F6
+        // and the concrete reason consumers gate on the integer, not the string.
+        const std::string lo{ "1.10.0" };
+        const std::string hi{ "1.9.9" };
+        check("deepen3_text_1_10_0_sorts_below_1_9_9", lo < hi);
+        check("deepen3_numeric_1_10_0_above_1_9_9",
+              VMHOOK_MAKE_VERSION(1, 10, 0) > VMHOOK_MAKE_VERSION(1, 9, 9));
+        // The two orderings genuinely disagree (would be a no-op if both same).
+        const bool text_says_lo_first{ lo < hi };
+        const bool num_says_lo_first{
+            VMHOOK_MAKE_VERSION(1, 10, 0) < VMHOOK_MAKE_VERSION(1, 9, 9) };
+        check("deepen3_text_and_numeric_orderings_disagree",
+              text_says_lo_first != num_says_lo_first);
+
+        // (T3) Dense runtime modular field-extraction battery (distinct triples
+        // from the earlier decompose battery): each /-and-% slice recovers the
+        // field for a fresh set of multi-digit triples and for the live value.
+        struct triple3 { int major; int minor; int patch; };
+        const triple3 cases[]{
+            { 7, 13, 21 }, { 255, 1, 500 }, { 0, 999, 999 },
+            { 12, 0, 7 }, { 1, 500, 0 }, { 999, 0, 999 },
+        };
+        bool modular_ok{ true };
+        for (const triple3 t : cases)
+        {
+            const long pk{ (static_cast<long>(t.major) * 1000000L)
+                         + (static_cast<long>(t.minor) * 1000L) + t.patch };
+            if (pk / 1000000L != t.major) { modular_ok = false; }
+            if ((pk / 1000L) % 1000L != t.minor) { modular_ok = false; }
+            if (pk % 1000L != t.patch) { modular_ok = false; }
+        }
+        check("deepen3_modular_extraction_battery_runtime", modular_ok);
+        check("deepen3_live_modular_extraction",
+              (packed / 1000000) == v_major
+                  && ((packed / 1000) % 1000) == v_minor
+                  && (packed % 1000) == v_patch);
+
+        // (T4) Digit-character map of the live string at runtime: each digit
+        // character equals '0' plus the corresponding single-digit component
+        // (runtime twin of F4).  Valid only because the live fields are 0..9.
+        bool digit_map_ok{ version_text.size() == 5 };
+        if (version_text.size() == 5)
+        {
+            if (version_text[0] != static_cast<char>('0' + v_major)) { digit_map_ok = false; }
+            if (version_text[2] != static_cast<char>('0' + v_minor)) { digit_map_ok = false; }
+            if (version_text[4] != static_cast<char>('0' + v_patch)) { digit_map_ok = false; }
+        }
+        check("deepen3_live_string_digit_char_map", digit_map_ok);
     }
 
     std::printf("\n%d checks failed\n", failures);

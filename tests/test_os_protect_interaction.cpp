@@ -1972,6 +1972,431 @@ static auto test_release_guard_is_noop_on_owned_block() -> void
 
 } // namespace deepen_os_protect
 
+// ===========================================================================
+// ADDITIVE DEEPENING SECTION 2 (safe_read charter, namespaced).  Everything
+// here drives vmhook::os::safe_read against REAL allocations THIS section makes
+// itself (allocate_rwx + protect), never a fabricated/unmapped address handed to
+// a raw reader.  It targets the safe_read angles the body above does not yet
+// pin: the body asserts the 1-byte no_access refusal, the multibyte positive +
+// no_access-span refusal, and the null/zero input guards.  These add:
+//   * the POSITIVE round-trip across widths (1,2,4,8,16,page-1,page) byte-exact
+//     against a reference memcpy — the body's positive case is a single 8-byte
+//     span; this proves every width copies correctly;
+//   * a read that STRADDLES from a readable page INTO a no_access page must
+//     return false (the all-or-nothing contract; the readable prefix does not
+//     license success);
+//   * a read ending EXACTLY at the readable/no_access boundary (last 8 bytes of
+//     the readable page, none of the locked page) must SUCCEED and match — the
+//     off-by-one sibling proving the wrapper does not over-read by a byte;
+//   * a read STARTING exactly on the no_access page must be refused at widths 1
+//     and 8 — the readable->unreadable transition address;
+//   * safe_read from FREED / released memory must return false, never crash;
+//   * repeated fallback-path entry (many no_access reads in a row) must not
+//     wedge the process: a deliberate readable safe_read still succeeds and a
+//     normal in-process store still works afterwards (the closest pure-logic
+//     proxy for the signal-handler self-disarm + re-arm staying healthy);
+//   * size==1 with two valid pointers is the POSITIVE twin of the size==0 guard,
+//     proving the guard is exactly `size == 0`, not `size < something`;
+//   * an absurd / address-space-wrapping size (SIZE_MAX, and base+size wrapping
+//     past UINTPTR_MAX) from a real small buffer must be rejected with false and
+//     must NOT hang — the wrap-guard contract.
+// No-access probes stay behind !VMHOOK_OS_IOS (iOS safe_read is a raw memcpy
+// that cannot honour the no-fault contract) and keep the sandbox-skip pattern
+// (protect(no_access) refused -> [INFO] skip, never a hard fail).  Mirrors the
+// file's check() idiom and the make_writable / allocate-guard helpers above.
+// No <thread> / no value_t-cast / no vector-stringop / no narrowing / no raw NUL.
+// ===========================================================================
+namespace deepen_safe_read
+{
+
+// ---------------------------------------------------------------------------
+// POSITIVE width round-trip.  A good read must copy the exact bytes for every
+// width a caller hands safe_read.  We stamp a deterministic ramp into a real RWX
+// page, leave it readable, and assert safe_read(dst, src, w) for each width w
+// matches a reference std::memcpy of the same span byte-for-byte.  Widths are
+// page-relative at the top end (page-1, page) so the assertion holds on 16K-page
+// Apple hardware as well as 4K-page x86.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_positive_width_roundtrip() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deepen_sr_width_roundtrip_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    // Deterministic ramp across the whole page so every width samples distinct
+    // bytes (low byte of the index keeps it in range without a NUL run).
+    for (std::size_t i{ 0 }; i < page; ++i)
+    {
+        bytes[i] = static_cast<std::uint8_t>((i * 7u + 0x11u) & 0xFFu);
+    }
+
+    const std::size_t widths[]{
+        std::size_t{ 1 },
+        std::size_t{ 2 },
+        std::size_t{ 4 },
+        std::size_t{ 8 },
+        std::size_t{ 16 },
+        page - 1,
+        page,
+    };
+
+    // A separate full-page destination owned by this test; safe_read copies the
+    // requested width into it and we compare those bytes against the source page
+    // (the source IS the reference — safe_read copies straight from `bytes`).
+    void* const dst_block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!dst_block)
+    {
+        check("deepen_sr_width_roundtrip_skipped_dst_alloc_failed", false);
+        vmhook::os::release(block, page);
+        return;
+    }
+    auto* const dst_bytes{ static_cast<std::uint8_t*>(dst_block) };
+
+    bool all_ok{ true };
+    bool all_match{ true };
+    for (const std::size_t w : widths)
+    {
+        // Pre-fill the destination with a sentinel so a short copy would leave a
+        // detectable mismatch, then read exactly `w` bytes.
+        for (std::size_t i{ 0 }; i < page; ++i)
+        {
+            dst_bytes[i] = 0xFFu;
+        }
+        const bool ok{ vmhook::os::safe_read(dst_bytes, bytes, w) };
+        if (!ok)
+        {
+            all_ok = false;
+        }
+        else if (std::memcmp(dst_bytes, bytes, w) != 0)
+        {
+            all_match = false;
+        }
+    }
+    check("deepen_sr_width_roundtrip_all_succeed", all_ok);
+    check("deepen_sr_width_roundtrip_all_byte_exact", all_match);
+
+    vmhook::os::release(dst_block, page);
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// size==1 with two valid pointers is the POSITIVE twin of the size==0 guard:
+// the guard rejects exactly `size == 0`, so a 1-byte read of a real readable
+// byte must SUCCEED and copy that byte.  Proves the body's size==0 refusal is a
+// `== 0` test, not a `< something` test that would also swallow size==1.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_size_one_succeeds() -> void
+{
+    std::uint8_t src{ 0xC7 };
+    std::uint8_t dst{ 0x00 };
+    const bool ok{ vmhook::os::safe_read(&dst, &src, 1u) };
+    check("deepen_sr_size_one_succeeds", ok);
+    check("deepen_sr_size_one_copies_byte", dst == 0xC7);
+}
+
+#if !VMHOOK_OS_IOS
+// ---------------------------------------------------------------------------
+// STRADDLE: a read that begins in a readable page and crosses INTO a no_access
+// page must return false in its entirety.  Two pages: page 0 RWX (readable),
+// page 1 locked no_access.  A marker is stamped spanning the boundary while both
+// are writable; then page 1 is locked and safe_read reads 8 bytes starting 4
+// bytes before the boundary (so 4 readable + 4 unreadable).  The all-or-nothing
+// contract requires false — the readable prefix must NOT license success.
+// Skips when PROT_NONE is refused.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_straddle_into_no_access_refused() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * 2) };
+    if (!block)
+    {
+        check("deepen_sr_straddle_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    // Stamp a recognisable pattern across [page-4, page+4] while both writable.
+    for (std::size_t i{ 0 }; i < 8u; ++i)
+    {
+        bytes[page - 4u + i] = static_cast<std::uint8_t>(0x90u + i);
+    }
+
+    // Lock ONLY page 1 to no_access.
+    const bool locked{ vmhook::os::protect(bytes + page, page,
+                                           vmhook::os::memory_protection::no_access,
+                                           nullptr) };
+    if (!locked)
+    {
+        std::printf("[INFO] deepen_sr_straddle skipped: PROT_NONE refused\n");
+        vmhook::os::release(block, page * 2);
+        return;
+    }
+
+    // 8-byte read starting 4 bytes before the boundary: crosses into page 1.
+    std::uint8_t dst[8]{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    const bool read_ok{ vmhook::os::safe_read(dst, bytes + page - 4u, 8u) };
+    check("deepen_sr_straddle_into_no_access_refused", !read_ok);
+
+    // Restore writable before release so unmap sees no locked page.
+    (void)vmhook::os::protect(bytes + page, page,
+                              vmhook::os::memory_protection::read_write, nullptr);
+    vmhook::os::release(block, page * 2);
+}
+
+// ---------------------------------------------------------------------------
+// BOUNDARY (read side): a read ending EXACTLY at the readable/no_access boundary
+// — the last 8 bytes of the readable page, none of the locked page — must
+// SUCCEED and match.  This is the off-by-one sibling of the straddle test: it
+// proves the wrapper does not over-read even a single byte into the locked page.
+// Skips when PROT_NONE is refused.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_ending_at_boundary_succeeds() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * 2) };
+    if (!block)
+    {
+        check("deepen_sr_boundary_end_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    // Stamp the last 8 bytes of page 0 with a known pattern.
+    std::uint8_t pattern[8]{ 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18 };
+    for (std::size_t i{ 0 }; i < 8u; ++i)
+    {
+        bytes[page - 8u + i] = pattern[i];
+    }
+
+    const bool locked{ vmhook::os::protect(bytes + page, page,
+                                           vmhook::os::memory_protection::no_access,
+                                           nullptr) };
+    if (!locked)
+    {
+        std::printf("[INFO] deepen_sr_boundary_end skipped: PROT_NONE refused\n");
+        vmhook::os::release(block, page * 2);
+        return;
+    }
+
+    std::uint8_t dst[8]{};
+    const bool read_ok{ vmhook::os::safe_read(dst, bytes + page - 8u, 8u) };
+    check("deepen_sr_ending_at_boundary_succeeds", read_ok);
+    if (read_ok)
+    {
+        check("deepen_sr_ending_at_boundary_matches",
+              std::memcmp(dst, pattern, 8u) == 0);
+    }
+
+    (void)vmhook::os::protect(bytes + page, page,
+                              vmhook::os::memory_protection::read_write, nullptr);
+    vmhook::os::release(block, page * 2);
+}
+
+// ---------------------------------------------------------------------------
+// BOUNDARY (start side): a read STARTING exactly on the no_access page must be
+// refused at widths 1 AND 8.  The body's 1-byte refusal reads offset 0 of a
+// single locked page; this verifies the readable->unreadable transition address
+// (the first byte of the locked SECOND page) is itself refused.  Skips when
+// PROT_NONE is refused.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_starting_on_no_access_refused() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page * 2) };
+    if (!block)
+    {
+        check("deepen_sr_boundary_start_skipped_alloc_failed", false);
+        return;
+    }
+
+    auto* const bytes{ static_cast<std::uint8_t*>(block) };
+    bytes[page - 1u] = 0x5A; // last readable byte (page 0)
+    bytes[page]      = 0x6B; // first byte of the page we will lock
+
+    const bool locked{ vmhook::os::protect(bytes + page, page,
+                                           vmhook::os::memory_protection::no_access,
+                                           nullptr) };
+    if (!locked)
+    {
+        std::printf("[INFO] deepen_sr_boundary_start skipped: PROT_NONE refused\n");
+        vmhook::os::release(block, page * 2);
+        return;
+    }
+
+    std::uint8_t dst1{ 0xFF };
+    std::uint8_t dst8[8]{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    const bool one_ok{ vmhook::os::safe_read(&dst1, bytes + page, 1u) };
+    const bool eight_ok{ vmhook::os::safe_read(dst8, bytes + page, 8u) };
+    check("deepen_sr_starting_on_no_access_one_refused", !one_ok);
+    check("deepen_sr_starting_on_no_access_eight_refused", !eight_ok);
+
+    // The last readable byte of page 0 must STILL be readable (lock did not
+    // bleed backward).
+    std::uint8_t edge{ 0x00 };
+    const bool edge_ok{ vmhook::os::safe_read(&edge, bytes + page - 1u, 1u) };
+    check("deepen_sr_last_readable_byte_still_readable", edge_ok);
+    if (edge_ok)
+    {
+        check("deepen_sr_last_readable_byte_value", edge == 0x5A);
+    }
+
+    (void)vmhook::os::protect(bytes + page, page,
+                              vmhook::os::memory_protection::read_write, nullptr);
+    vmhook::os::release(block, page * 2);
+}
+
+// ---------------------------------------------------------------------------
+// safe_read from FREED / released memory must return false, never fault.  Mirror
+// of test_query_region_reports_free_for_unallocated for the read path: allocate,
+// touch, release, then safe_read the now-unmapped address.  On a kernel that
+// immediately re-maps the freed address with a readable region the read could
+// legitimately succeed, so we accept EITHER false (the expected unmapped case)
+// or a non-crashing true (re-mapped) — what we pin is "no fault".  Gated off iOS
+// (its safe_read is a raw memcpy that would fault on a truly unmapped address).
+// ---------------------------------------------------------------------------
+static auto test_safe_read_from_released_memory() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deepen_sr_freed_skipped_alloc_failed", false);
+        return;
+    }
+    *static_cast<volatile std::uint8_t*>(block) = 0x42;
+    vmhook::os::release(block, page);
+
+    std::uint8_t dst[8]{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    // The read itself must not fault.  We do not assert the bool (a re-mapped
+    // address may read true); reaching the next line proves fault-safety.
+    (void)vmhook::os::safe_read(dst, block, 8u);
+    check("deepen_sr_from_released_memory_no_fault", true);
+}
+
+// ---------------------------------------------------------------------------
+// Repeated fallback-path entry must not wedge the process.  On Linux/Android a
+// no_access safe_read that process_vm_readv cannot satisfy drops into the
+// SIGSEGV/SIGBUS-catching sigsetjmp probe; this hammers that path many times,
+// then asserts (a) a deliberate readable safe_read STILL succeeds and (b) a
+// normal in-process store STILL works — proving the handler self-disarm + re-arm
+// (the function-local static install) stayed healthy across hundreds of probes.
+// This is the closest pure-logic proxy for the signal-handler stability; it does
+// not assert handler chaining (that needs a real JVM).  Skips when PROT_NONE is
+// refused.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_repeated_fallback_stays_healthy() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const locked_block{ vmhook::os::allocate_rwx(nullptr, page) };
+    void* const good_block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!locked_block || !good_block)
+    {
+        check("deepen_sr_repeated_fallback_skipped_alloc_failed", false);
+        if (locked_block)
+        {
+            vmhook::os::release(locked_block, page);
+        }
+        if (good_block)
+        {
+            vmhook::os::release(good_block, page);
+        }
+        return;
+    }
+
+    auto* const good_bytes{ static_cast<std::uint8_t*>(good_block) };
+    good_bytes[0] = 0x3C;
+
+    const bool locked{ vmhook::os::protect(locked_block, page,
+                                           vmhook::os::memory_protection::no_access,
+                                           nullptr) };
+    if (!locked)
+    {
+        std::printf("[INFO] deepen_sr_repeated_fallback skipped: PROT_NONE refused\n");
+        vmhook::os::release(locked_block, page);
+        vmhook::os::release(good_block, page);
+        return;
+    }
+
+    // Hammer the no_access read; every call must report false with no fault.
+    bool all_refused{ true };
+    for (int i{ 0 }; i < 256; ++i)
+    {
+        std::uint8_t dst{ 0xFF };
+        if (vmhook::os::safe_read(&dst, locked_block, 1u))
+        {
+            all_refused = false;
+        }
+    }
+    check("deepen_sr_repeated_fallback_all_refused", all_refused);
+
+    // A deliberate readable read still succeeds after the hammering.
+    std::uint8_t good_dst{ 0x00 };
+    const bool good_ok{ vmhook::os::safe_read(&good_dst, good_block, 1u) };
+    check("deepen_sr_repeated_fallback_good_read_still_works", good_ok);
+    if (good_ok)
+    {
+        check("deepen_sr_repeated_fallback_good_read_value", good_dst == 0x3C);
+    }
+
+    // A normal in-process store still works (the host stayed healthy).
+    good_bytes[0] = 0xD2;
+    check("deepen_sr_repeated_fallback_store_still_sticks", good_bytes[0] == 0xD2);
+
+    (void)vmhook::os::protect(locked_block, page,
+                              vmhook::os::memory_protection::read_write, nullptr);
+    vmhook::os::release(locked_block, page);
+    vmhook::os::release(good_block, page);
+}
+#endif // !VMHOOK_OS_IOS
+
+// ---------------------------------------------------------------------------
+// Absurd / address-space-wrapping size must be rejected with false and must not
+// hang.  safe_read carries a `src + size` overflow guard that fires before any
+// kernel call / fallback memcpy.  From a real, live small buffer: SIZE_MAX wraps
+// for any non-null src, and a size tuned so base+size overflows past UINTPTR_MAX
+// by a few bytes is the smallest wrapping family.  Both must return false
+// promptly; the buffer is otherwise valid so this exercises the guard, not a bad
+// pointer.  Safe on every platform because the guard short-circuits before the
+// read.
+// ---------------------------------------------------------------------------
+static auto test_safe_read_wrapping_size_rejected() -> void
+{
+    std::uint8_t buffer[16]{};
+    std::uint8_t dst[16]{};
+    buffer[0] = 0x5A;
+
+    // SIZE_MAX from any non-null src wraps the address space.
+    check("deepen_sr_size_max_rejected",
+          !vmhook::os::safe_read(dst, buffer, SIZE_MAX));
+
+    // The smallest family of sizes that overflow: (UINTPTR_MAX - base) + k.
+    {
+        const std::uintptr_t base_addr{ reinterpret_cast<std::uintptr_t>(buffer) };
+        const std::uintptr_t max_addr{ ~static_cast<std::uintptr_t>(0) };
+        const std::size_t wrapping_size{
+            static_cast<std::size_t>(max_addr - base_addr) + std::size_t{ 8 } };
+        check("deepen_sr_base_plus_size_wrap_rejected",
+              !vmhook::os::safe_read(dst, buffer, wrapping_size));
+    }
+
+    // The buffer is untouched by the rejected calls — a real 1-byte read still
+    // succeeds and returns the seeded value.
+    std::uint8_t one{ 0x00 };
+    const bool ok{ vmhook::os::safe_read(&one, buffer, 1u) };
+    check("deepen_sr_after_reject_small_read_ok", ok);
+    if (ok)
+    {
+        check("deepen_sr_after_reject_buffer_intact", one == 0x5A);
+    }
+}
+
+} // namespace deepen_safe_read
+
 int main()
 {
     test_granularity_relationship();
@@ -2014,6 +2439,17 @@ int main()
     // returns a permissive stub (base == the queried address, size == one page),
     // which deliberately does not satisfy those relationships, so gate it off.
     deepen_os_protect::test_query_region_field_invariants_owned();
+#endif
+
+    deepen_safe_read::test_safe_read_positive_width_roundtrip();
+    deepen_safe_read::test_safe_read_size_one_succeeds();
+    deepen_safe_read::test_safe_read_wrapping_size_rejected();
+#if !VMHOOK_OS_IOS
+    deepen_safe_read::test_safe_read_straddle_into_no_access_refused();
+    deepen_safe_read::test_safe_read_ending_at_boundary_succeeds();
+    deepen_safe_read::test_safe_read_starting_on_no_access_refused();
+    deepen_safe_read::test_safe_read_from_released_memory();
+    deepen_safe_read::test_safe_read_repeated_fallback_stays_healthy();
 #endif
 
     if (failures == 0)

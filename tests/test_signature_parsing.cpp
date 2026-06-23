@@ -2846,5 +2846,247 @@ int main()
         check("recognised_alphabet_primitive_partition_classify_and_size", all_ok);
     }
 
+    // =====================================================================
+    // EXHAUSTIVE PASS 11 -- additive joint-relation, sizeof-keying, and the
+    // is_unique_ptr value_type_t / object_base coupling that earlier passes did
+    // not pin TOGETHER.  Every expected value is derived ONLY from the three
+    // confirmed tables + the is_unique_ptr trait in vmhook.hpp:
+    //   sig_char_to_basic_type   (vmhook.hpp:16215 -- Z4 C5 F6 D7 B8 S9 I10 J11
+    //                             L12 [13 V14, default 12)
+    //   jvm_primitive_byte_width (vmhook.hpp:16250 -- size!=1 ->0; Z/B1 S/C2 I/F4
+    //                             J/D8, default 0)
+    //   jni_signature_for_arg    (vmhook.hpp:12994 -- decay; String; bool->Z;
+    //                             char16_t|uint16_t->C; generic is_integral &&
+    //                             sizeof N=1->B 2->S 4->I 8->J; float->F double->D;
+    //                             unique_ptr<wrapper>/object_base -> "L"+map[T]+";"
+    //                             with Ljava/lang/Object; fallback; else assert)
+    //   is_unique_ptr<unique_ptr<W,Del>>::value_type_t == W (vmhook.hpp:1800-1804)
+    // NEW surfaces: the ladder is SIZEOF-keyed (two DISTINCT same-width C++ types
+    // emit the SAME tag, with no per-type branch); the field_proxy::set width
+    // decision table stated whole; the is_unique_ptr value_type_t extraction that
+    // names the wrapper the object_base static_assert checks; and a maximal-arity
+    // ctor fold proving no fixed ceiling.
+    // =====================================================================
+
+    // ---- the integral ladder is SIZEOF-keyed, not TYPEDEF-keyed --------------
+    // int8_t is `signed char` and `signed char` is int8_t on every CI target, but
+    // the ladder has no per-typedef branch: BOTH reach the generic sizeof==1 arm
+    // (after the bool/char16/uint16 special cases) and emit "B".  Likewise int and
+    // int32_t both route through sizeof==4 -> "I".  Pin that same-width distinct
+    // spellings converge, proving the keying is on width not on the std:: alias.
+    check("jni_sig_int8_and_signed_char_both_B_same_width_branch",
+             vmhook::detail::jni_signature_for_arg<std::int8_t>() == "B"
+          && vmhook::detail::jni_signature_for_arg<signed char>() == "B"
+          && vmhook::detail::jni_signature_for_arg<std::int8_t>()
+                 == vmhook::detail::jni_signature_for_arg<signed char>());
+    check("jni_sig_int_and_int32_both_I_same_width_branch",
+             vmhook::detail::jni_signature_for_arg<int>() == "I"
+          && vmhook::detail::jni_signature_for_arg<std::int32_t>() == "I"
+          && vmhook::detail::jni_signature_for_arg<int>()
+                 == vmhook::detail::jni_signature_for_arg<std::int32_t>());
+    // For a fixed width, the EMITTED descriptor's heap byte width equals that C++
+    // width for the numeric (non-Java-char) integrals: feeding int8/int16/int32/
+    // int64 back through jvm_primitive_byte_width reproduces sizeof exactly.  (The
+    // uint16->C row is deliberately EXCLUDED here -- its 'C' width 2 matches sizeof
+    // 2 numerically but is the Java-char asymmetry pinned separately in pass 9.)
+    {
+        struct width_keyed { std::string sig; std::size_t cpp_size; };
+        const width_keyed rows[]{
+            { vmhook::detail::jni_signature_for_arg<std::int8_t>(),  sizeof(std::int8_t)  },
+            { vmhook::detail::jni_signature_for_arg<std::int16_t>(), sizeof(std::int16_t) },
+            { vmhook::detail::jni_signature_for_arg<std::int32_t>(), sizeof(std::int32_t) },
+            { vmhook::detail::jni_signature_for_arg<std::int64_t>(), sizeof(std::int64_t) },
+        };
+        bool all_match{ true };
+        for (const width_keyed& r : rows)
+        {
+            if (vmhook::detail::jvm_primitive_byte_width(r.sig) != r.cpp_size) { all_match = false; }
+        }
+        check("jni_sig_numeric_integral_emit_width_equals_cpp_sizeof", all_match);
+    }
+
+    // ---- field_proxy::set width decision table, stated WHOLE -----------------
+    // jvm_primitive_byte_width drives field_proxy::set's two gates: a NON-zero
+    // width triggers the size-equality check (value_size != field_size rejects),
+    // and a ZERO width makes set() SKIP validation and take the OOP / reference
+    // path.  Pin the complete decision for all 8 primitives (size guard ACTIVE,
+    // with the exact expected width) plus L/[/V and an object descriptor (guard
+    // SKIPPED, width 0) in one table so the consumer contract is greppable whole.
+    {
+        struct set_gate { std::string_view sig; std::size_t width; bool guard_active; };
+        const set_gate gates[]{
+            { "Z", 1, true  }, { "B", 1, true  }, { "S", 2, true  }, { "C", 2, true  },
+            { "I", 4, true  }, { "F", 4, true  }, { "J", 8, true  }, { "D", 8, true  },
+            { "L", 0, false }, { "[", 0, false }, { "V", 0, false },
+            { "Ljava/lang/String;", 0, false }, { "[I", 0, false },
+        };
+        bool table_holds{ true };
+        for (const set_gate& g : gates)
+        {
+            const std::size_t w{ vmhook::detail::jvm_primitive_byte_width(g.sig) };
+            if (w != g.width) { table_holds = false; }
+            // guard_active iff width != 0 -- the load-bearing equivalence.
+            if ((w != 0) != g.guard_active) { table_holds = false; }
+        }
+        check("field_set_width_gate_active_iff_nonzero_width_whole_table", table_holds);
+    }
+
+    // ---- is_unique_ptr<...>::value_type_t names the WRAPPED type --------------
+    // The wrapper branch of jni_signature_for_arg extracts the pointee via
+    // is_unique_ptr<clean_t>::value_type_t (vmhook.hpp:13054) and static_asserts
+    // it derives from object_base.  Pin the trait member resolution directly: for
+    // unique_ptr<sig_wrapper> the value_type_t IS sig_wrapper (not the bool the
+    // member-name-collision note at 1790 warns against), and that wrapped type
+    // satisfies the object_base derivation the branch checks.  remove_cvref_t is
+    // used so a cv/ref-qualified unique_ptr resolves to the same wrapped type.
+    {
+        using uptr_t        = std::unique_ptr<sig_wrapper>;
+        using cv_uptr_t     = const std::unique_ptr<sig_wrapper>&;
+        using extracted_t   = vmhook::detail::is_unique_ptr<uptr_t>::value_type_t;
+        using extracted_cv  = vmhook::detail::is_unique_ptr<std::remove_cvref_t<cv_uptr_t>>::value_type_t;
+        static_assert(std::is_same_v<extracted_t, sig_wrapper>,
+                      "is_unique_ptr<unique_ptr<sig_wrapper>>::value_type_t must be sig_wrapper");
+        static_assert(!std::is_same_v<extracted_t, bool>,
+                      "value_type_t must NOT collapse to bool (the 1790 collision note)");
+        static_assert(std::is_same_v<extracted_cv, sig_wrapper>,
+                      "cv/ref-qualified unique_ptr must extract the same wrapped type after remove_cvref_t");
+        check("is_unique_ptr_value_type_t_is_wrapped_and_object_base_derived",
+              std::is_same_v<extracted_t, sig_wrapper>
+              && std::is_base_of_v<vmhook::object_base, extracted_t>
+              && !std::is_same_v<extracted_t, bool>);
+    }
+    // The by-value wrapper branch is gated on object_base derivation directly;
+    // pin that BOTH the value and the unique_ptr-wrapped forms see an
+    // object_base-derived target, while a primitive/string does not -- the exact
+    // predicate that selects the L...; branch over the static_assert.
+    check("object_base_derivation_gates_wrapper_branch",
+             std::is_base_of_v<vmhook::object_base, sig_wrapper>
+          && std::is_base_of_v<vmhook::object_base, sig_wrapper_unregistered>
+          && !std::is_base_of_v<vmhook::object_base, int>
+          && !std::is_base_of_v<vmhook::object_base, std::string>);
+
+    // ---- the FIRST byte of every NON-primitive emitted descriptor is T_OBJECT --
+    // Both reference-shaped emit branches (String and the registered/unregistered
+    // wrapper) produce descriptors whose leading byte 'L' classifies to
+    // T_OBJECT(12) and whose whole-string width is 0.  Pin the String case and the
+    // Object-fallback case together (no JVM, no registration needed for either:
+    // String is unconditional, the unregistered wrapper falls back to
+    // Ljava/lang/Object;).  Couples the emit side to BOTH reverse helpers for the
+    // reference family the way pass 9 did for primitives.
+    {
+        const std::string ref_sigs[]{
+            vmhook::detail::jni_signature_for_arg<std::string>(),
+            vmhook::detail::jni_signature_for_arg<std::string_view>(),
+            vmhook::detail::jni_signature_for_arg<const char*>(),
+            vmhook::detail::jni_signature_for_arg<std::unique_ptr<sig_wrapper_unregistered>>(),
+            vmhook::detail::jni_signature_for_arg<sig_wrapper_unregistered>(),
+        };
+        bool all_object_lead_zero_width{ true };
+        for (const std::string& s : ref_sigs)
+        {
+            if (s.empty()
+                || vmhook::detail::sig_char_to_basic_type(s[0]) != 12
+                || vmhook::detail::jvm_primitive_byte_width(s) != 0)
+            {
+                all_object_lead_zero_width = false;
+            }
+        }
+        check("every_reference_emit_lead_is_object_12_and_width_0", all_object_lead_zero_width);
+    }
+
+    // ---- maximal-arity ctor fold: the assembly has no fixed ceiling ----------
+    // jni_make_unique's fold "(" + concat(per-arg)... + ")V" must handle a wide
+    // pack with no arity limit (unlike method_proxy's params[8] marshalling slab).
+    // Build a 12-arg all-int pack and assert the descriptor is "(" + 12*'I' + ")V".
+    // Derived purely from int->"I" repeated; proves the variadic fold composes the
+    // token stream verbatim regardless of count.
+    {
+        const std::string twelve_ints{
+            ctor_signature_of<int, int, int, int, int, int,
+                              int, int, int, int, int, int>() };
+        std::string expected{ "(" };
+        expected.append(12, 'I');
+        expected += ")V";
+        check("ctor_sig_twelve_int_pack_no_arity_ceiling", twelve_ints == expected);
+    }
+    // A maximal MIXED-width pack interleaving every primitive tag plus a String,
+    // asserting the EXACT token order survives the fold across a long pack:
+    // Z B C S I J F D then String -> "(ZBCSIJFDLjava/lang/String;)V".  (The same
+    // eight primitives as pass 4's bare pack, here with a trailing reference token
+    // so the primitive/reference boundary inside the fold is exercised too.)
+    check("ctor_sig_all_primitives_then_string_token_order",
+          ctor_signature_of<bool, std::int8_t, std::uint16_t, std::int16_t,
+                            std::int32_t, std::int64_t, float, double, std::string>()
+              == "(ZBCSIJFDLjava/lang/String;)V");
+
+    // ---- public re-export: byte-identical across the WHOLE primitive set ------
+    // Pass 1/8 pinned jni::signature_for_arg parity on a spread; here pin it for
+    // EVERY primitive arg type at once so the two entry points cannot diverge on
+    // any single row.  remove_cvref_t is not needed -- these are already clean
+    // value types -- and each comparison is value-vs-value (no narrowing).
+    {
+        const bool parity_all{
+               vmhook::jni::signature_for_arg<bool>()          == vmhook::detail::jni_signature_for_arg<bool>()
+            && vmhook::jni::signature_for_arg<std::int8_t>()   == vmhook::detail::jni_signature_for_arg<std::int8_t>()
+            && vmhook::jni::signature_for_arg<std::uint8_t>()  == vmhook::detail::jni_signature_for_arg<std::uint8_t>()
+            && vmhook::jni::signature_for_arg<std::int16_t>()  == vmhook::detail::jni_signature_for_arg<std::int16_t>()
+            && vmhook::jni::signature_for_arg<std::uint16_t>() == vmhook::detail::jni_signature_for_arg<std::uint16_t>()
+            && vmhook::jni::signature_for_arg<std::int32_t>()  == vmhook::detail::jni_signature_for_arg<std::int32_t>()
+            && vmhook::jni::signature_for_arg<std::uint32_t>() == vmhook::detail::jni_signature_for_arg<std::uint32_t>()
+            && vmhook::jni::signature_for_arg<std::int64_t>()  == vmhook::detail::jni_signature_for_arg<std::int64_t>()
+            && vmhook::jni::signature_for_arg<std::uint64_t>() == vmhook::detail::jni_signature_for_arg<std::uint64_t>()
+            && vmhook::jni::signature_for_arg<float>()         == vmhook::detail::jni_signature_for_arg<float>()
+            && vmhook::jni::signature_for_arg<double>()        == vmhook::detail::jni_signature_for_arg<double>() };
+        check("signature_for_arg_parity_whole_primitive_set", parity_all);
+    }
+
+    // ---- sig_char_to_basic_type: the BasicType ints are CONTIGUOUS 4..14 ------
+    // The 11 recognised letters map onto the contiguous HotSpot BasicType range
+    // 4..14 with NO gaps and NO duplicates: {Z C F D B S I J} = {4..11},
+    // L=12, [=13, V=14.  Collect the basic types of all 11 letters, assert the
+    // set is exactly {4,5,6,7,8,9,10,11,12,13,14} -- so any renumber that
+    // introduced a gap, a duplicate, or an out-of-range value fails loudly.
+    {
+        const char recognised[]{ 'Z', 'C', 'F', 'D', 'B', 'S', 'I', 'J', 'L', '[', 'V' };
+        bool seen[15]{};   // indices 0..14; only 4..14 should ever be set
+        bool in_range_and_unique{ true };
+        for (const char c : recognised)
+        {
+            const int bt{ vmhook::detail::sig_char_to_basic_type(c) };
+            if (bt < 4 || bt > 14) { in_range_and_unique = false; continue; }
+            if (seen[bt]) { in_range_and_unique = false; }
+            seen[bt] = true;
+        }
+        bool full_4_to_14{ true };
+        for (int i{ 4 }; i <= 14; ++i) { if (!seen[i]) { full_4_to_14 = false; } }
+        // Nothing below 4 should be set (the loop only writes indices >=4 anyway,
+        // but assert the lower band stayed clear as a defensive sanity check).
+        bool lower_band_clear{ true };
+        for (int i{ 0 }; i < 4; ++i) { if (seen[i]) { lower_band_clear = false; } }
+        check("sig_char_recognised_letters_cover_contiguous_basic_types_4_to_14",
+              in_range_and_unique && full_4_to_14 && lower_band_clear);
+    }
+
+    // ---- jvm_primitive_byte_width: the non-zero widths are exactly {1,2,4,8} ---
+    // Powers of two, no other value ever returned for a single byte.  Collect the
+    // distinct non-zero widths over the full 0..255 single-byte domain and assert
+    // the set is precisely {1,2,4,8}.  Pins that no stray case yields e.g. 3 or 16.
+    {
+        bool width_seen[9]{};   // index by width value 0..8
+        bool only_expected_widths{ true };
+        for (int byte{ 0 }; byte <= 0xFF; ++byte)
+        {
+            const char one[1]{ static_cast<char>(byte) };
+            const std::size_t w{ vmhook::detail::jvm_primitive_byte_width(std::string_view{ one, 1 }) };
+            if (w > 8) { only_expected_widths = false; continue; }
+            width_seen[w] = true;
+        }
+        const bool exactly_1_2_4_8{
+               width_seen[1] && width_seen[2] && width_seen[4] && width_seen[8]
+            && !width_seen[3] && !width_seen[5] && !width_seen[6] && !width_seen[7] };
+        check("byte_width_distinct_nonzero_widths_are_exactly_1_2_4_8",
+              only_expected_widths && exactly_1_2_4_8);
+    }
+
     return failures == 0 ? 0 : 1;
 }

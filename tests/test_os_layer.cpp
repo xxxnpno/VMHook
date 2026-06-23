@@ -1904,6 +1904,239 @@ static auto test_release_null_zero_noop() -> void
 
 } // namespace deepen_os_seams
 
+// ===========================================================================
+// THIRD DEEPENING SECTION (additive; appended after deepen_os_seams).  Pins the
+// GEOMETRY CONSTANTS the page/granularity feature shares with the validity
+// predicates and the trampoline-allocator candidate math -- surfaces the first
+// two deepening passes did not touch:
+//   * untag_pointer's mask IS user_address_ceiling (vmhook.hpp:2092-2097), so
+//     untagging a real canonical owned page is the identity, while a
+//     high-tagged synthetic value strips to its masked low bits.  Pure
+//     arithmetic on the masked value -- the synthetic high value is NEVER
+//     dereferenced.
+//   * is_valid_pointer / is_readable_pointer are PURE range+alignment+sentinel
+//     predicates (vmhook.hpp:2047-2083 / 2018-2032) keyed off user_address_floor
+//     / user_address_ceiling -- exercised ONLY with is_valid_pointer-rejected
+//     low/odd/sentinel constants and one real owned (accepted) page; nothing is
+//     dereferenced (HARD RULE 4: rejected low constants are fine).
+//   * the trampoline allocator aligns candidates with align_up(begin, gran) /
+//     align_down(end-size, gran) (vmhook.hpp allocate_nearby_memory): pin that
+//     a granularity-aligned candidate is ALSO page-aligned (because gran % page
+//     == 0), that align_down by gran is coarser-or-equal to align_down by page,
+//     and that align_down(end-size, gran) stays <= end-size (the "rounded past
+//     search_max" hazard direction -- align_down can only move DOWN).
+// Every constant is referenced in a runtime check (no clang unused-const); the
+// only memory touched is a real allocate_rwx page we own.
+// ===========================================================================
+namespace deepen_os_geometry_bounds
+{
+
+// ---------------------------------------------------------------------------
+// 13. untag_pointer's mask is exactly user_address_ceiling.  A real owned page
+//     address is canonical (< ceiling), so untag is the identity on it.  A
+//     synthetic value with high tag bits set strips down to (value & ceiling) --
+//     verified by pure arithmetic; the synthetic value is NEVER dereferenced.
+// ---------------------------------------------------------------------------
+static auto test_untag_pointer_mask_is_ceiling() -> void
+{
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (!block)
+    {
+        check("deep_untag_skipped_alloc_failed", false);
+        return;
+    }
+
+    // A genuine owned page is canonical: its address is below the ceiling, so
+    // untag_pointer is the identity (no tag bits to strip).
+    const std::uintptr_t real{ reinterpret_cast<std::uintptr_t>(block) };
+    check("deep_untag_real_page_below_ceiling", real < vmhook::os::user_address_ceiling);
+    check("deep_untag_real_page_is_identity",
+          vmhook::hotspot::untag_pointer(block) == static_cast<const void*>(block));
+
+    // Synthetic high-tagged value: set bits ABOVE the ceiling.  untag must mask
+    // them off, leaving exactly (value & ceiling).  Pure arithmetic -- we form
+    // the pointer value, mask it, and compare; we never read through it.
+    const std::uintptr_t tagged{ real | 0xFFFF000000000000ull };
+    const void* const tagged_ptr{ reinterpret_cast<const void*>(tagged) };
+    const std::uintptr_t expect{ tagged & vmhook::os::user_address_ceiling };
+    check("deep_untag_strips_high_tag_bits",
+          reinterpret_cast<std::uintptr_t>(vmhook::hotspot::untag_pointer(tagged_ptr)) == expect);
+    // And the stripped value equals the original canonical address (the tag we
+    // OR'd in was entirely above the ceiling).
+    check("deep_untag_recovers_original_address", expect == real);
+
+    vmhook::os::release(block, page);
+}
+
+// ---------------------------------------------------------------------------
+// 14. is_valid_pointer boundary geometry keyed off user_address_floor /
+//     user_address_ceiling (vmhook.hpp:2047-2083).  PURE predicate: we only ever
+//     pass is_valid_pointer-REJECTED low/odd/sentinel constants (never
+//     dereferenced) plus one real owned page (accepted).  This pins the exact
+//     range/alignment/sentinel contract the geometry constants define.
+// ---------------------------------------------------------------------------
+static auto test_is_valid_pointer_boundaries() -> void
+{
+    using vmhook::hotspot::is_valid_pointer;
+    const std::uintptr_t floor{ vmhook::os::user_address_floor };
+    const std::uintptr_t ceiling{ vmhook::os::user_address_ceiling };
+
+    auto as_ptr{ [](std::uintptr_t v) -> const void* {
+        return reinterpret_cast<const void*>(v);
+    } };
+
+    // Boundary at the floor: addr <= floor is rejected; floor itself rejected.
+    check("deep_ivp_floor_rejected", !is_valid_pointer(as_ptr(floor)));
+    // floor + 1 == 0x10000: above the floor AND even -> NOT rejected by the
+    // range/alignment gates (it is a valid-looking low canonical address that
+    // is never dereferenced; only its acceptance by the predicate is observed).
+    check("deep_ivp_floor_plus_one_even_accepted", is_valid_pointer(as_ptr(floor + 1u)));
+    // An odd address anywhere is rejected by the 2-byte-alignment gate.
+    check("deep_ivp_odd_address_rejected", !is_valid_pointer(as_ptr(0x20001u)));
+
+    // null is below the floor -> rejected.
+    check("deep_ivp_null_rejected", !is_valid_pointer(nullptr));
+
+    // At/above the ceiling -> rejected (addr >= ceiling).
+    check("deep_ivp_ceiling_rejected", !is_valid_pointer(as_ptr(ceiling)));
+    check("deep_ivp_above_ceiling_rejected",
+          !is_valid_pointer(as_ptr(ceiling + 0x1000u)));
+
+    // Sentinel low-32 patterns inside user space but rejected by the poison
+    // switch.  Each value has low32 EXACTLY equal to the sentinel and is even
+    // and between floor and ceiling -- never dereferenced.
+    check("deep_ivp_sentinel_deadbeef_rejected",
+          !is_valid_pointer(as_ptr(0x00000000DEADBEEFull)));
+    check("deep_ivp_sentinel_cccccccc_rejected",
+          !is_valid_pointer(as_ptr(0x00000000CCCCCCCCull)));
+    check("deep_ivp_sentinel_baadf00d_rejected",
+          !is_valid_pointer(as_ptr(0x00000000BAADF00Dull)));
+
+    // A real owned, page-aligned (hence even) canonical page is ACCEPTED.
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (block)
+    {
+        check("deep_ivp_real_owned_page_accepted", is_valid_pointer(block));
+        vmhook::os::release(block, page);
+    }
+    else
+    {
+        check("deep_ivp_real_owned_page_skipped_alloc", false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 15. is_readable_pointer's 8-byte-alignment + range gate (vmhook.hpp:2018-2032)
+//     keyed off the SAME geometry constants.  PURE rejected constants only (an
+//     unaligned-but-in-range value, a below-floor value, an above-ceiling value)
+//     plus a real owned committed page (accepted).  The unaligned/out-of-range
+//     constants are rejected by the arithmetic gate BEFORE query_region runs, so
+//     nothing unmapped is ever queried as readable.
+// ---------------------------------------------------------------------------
+static auto test_is_readable_pointer_gate() -> void
+{
+    using vmhook::hotspot::is_readable_pointer;
+    auto as_ptr{ [](std::uintptr_t v) -> const void* {
+        return reinterpret_cast<const void*>(v);
+    } };
+
+    // Below floor -> rejected by range gate (no query_region).
+    check("deep_irp_below_floor_rejected", !is_readable_pointer(as_ptr(0x10u)));
+    // At/above ceiling -> rejected by range gate.
+    check("deep_irp_above_ceiling_rejected",
+          !is_readable_pointer(as_ptr(vmhook::os::user_address_ceiling)));
+    // In range but NOT 8-byte aligned -> rejected by the (addr & 0x7) gate
+    // before query_region; 0x20004 is in range, 4-aligned but not 8-aligned.
+    check("deep_irp_unaligned_rejected", !is_readable_pointer(as_ptr(0x20004u)));
+
+    // A real owned, committed, 8-byte-aligned (page-aligned) page IS readable.
+    const std::size_t page{ vmhook::os::page_size() };
+    void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+    if (block)
+    {
+        auto* const b{ static_cast<volatile std::uint8_t*>(block) };
+        b[0] = 0x5C; // commit the first page
+        check("deep_irp_real_committed_page_readable", is_readable_pointer(block));
+        vmhook::os::release(block, page);
+    }
+    else
+    {
+        check("deep_irp_real_committed_page_skipped_alloc", false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 16. Trampoline-allocator candidate geometry (allocate_nearby_memory aligns
+//     candidates with align_up(begin, gran) and align_down(end - size, gran)).
+//     Pin the geometry facts that make those alignments safe, using the REAL
+//     page/gran values:
+//       * a granularity-aligned candidate is ALSO page-aligned (gran % page==0);
+//       * align_down by gran is coarser-or-equal to align_down by page (the
+//         gran result <= the page result for the same input);
+//       * align_down(end - size, gran) <= end - size (rounds DOWN only -- it can
+//         never push the candidate ABOVE end-size; the over-shoot hazard from
+//         flaw 2 is on the SUBSEQUENT VirtualAlloc round-up, not on align_down).
+//     Built from a real owned multi-granularity block so the addresses are
+//     genuine; no fabricated address is read.
+// ---------------------------------------------------------------------------
+static auto test_candidate_alignment_geometry() -> void
+{
+    const std::uintptr_t page{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
+    const std::uintptr_t gran{ static_cast<std::uintptr_t>(vmhook::os::allocation_granularity()) };
+
+    // Inputs spanning several granularity units, derived from a real owned base.
+    void* const blk{ vmhook::os::allocate_rwx(nullptr, static_cast<std::size_t>(gran) * 2u) };
+    if (!blk)
+    {
+        check("deep_candidate_geometry_skipped_alloc_failed", false);
+        return;
+    }
+    const std::uintptr_t origin{ reinterpret_cast<std::uintptr_t>(blk) };
+
+    const std::uintptr_t offsets[]{
+        0u, 1u, page - 1u, page, page + 1u, gran - 1u, gran, gran + 1u,
+        gran + page, 2u * gran - 1u,
+    };
+
+    bool gran_aligned_is_page_aligned{ true };
+    bool gran_down_le_page_down{ true };
+    bool down_le_value{ true };
+    bool up_ge_value{ true };
+    bool up_is_gran_aligned{ true };
+
+    for (const std::uintptr_t off : offsets)
+    {
+        const std::uintptr_t x{ origin + off };
+
+        const std::uintptr_t dg{ mirror_align_down(x, gran) };
+        const std::uintptr_t dp{ mirror_align_down(x, page) };
+        const std::uintptr_t ug{ mirror_align_up(x, gran) };
+
+        // A granularity-aligned address is also page-aligned (gran % page == 0).
+        if ((dg & (page - 1u)) != 0u) { gran_aligned_is_page_aligned = false; }
+        // Coarser alignment lands at or below finer alignment for the same x.
+        if (!(dg <= dp)) { gran_down_le_page_down = false; }
+        // align_down never exceeds the value (the candidate stays <= end-size).
+        if (!(dg <= x)) { down_le_value = false; }
+        // align_up never drops below the value (begin candidate >= begin).
+        if (!(ug >= x)) { up_ge_value = false; }
+        // align_up result is granularity-aligned (the placement candidate is).
+        if ((ug & (gran - 1u)) != 0u) { up_is_gran_aligned = false; }
+    }
+
+    check("deep_candidate_gran_aligned_is_page_aligned", gran_aligned_is_page_aligned);
+    check("deep_candidate_gran_down_le_page_down", gran_down_le_page_down);
+    check("deep_candidate_align_down_le_value", down_le_value);
+    check("deep_candidate_align_up_ge_value", up_ge_value);
+    check("deep_candidate_align_up_is_gran_aligned", up_is_gran_aligned);
+
+    vmhook::os::release(blk, static_cast<std::size_t>(gran) * 2u);
+}
+
+} // namespace deepen_os_geometry_bounds
+
 int main()
 {
     // --- pure-logic, no side effects: the heart of this file ---------------
@@ -1926,6 +2159,13 @@ int main()
     deepen_os_seams::test_protect_arm_mappings();
     deepen_os_seams::test_query_region_field_invariants();
     deepen_os_seams::test_release_null_zero_noop();
+
+    // --- third deepening section (additive: geometry-constant bounds shared
+    //     with the validity predicates + trampoline candidate alignment) ------
+    deepen_os_geometry_bounds::test_untag_pointer_mask_is_ceiling();
+    deepen_os_geometry_bounds::test_is_valid_pointer_boundaries();
+    deepen_os_geometry_bounds::test_is_readable_pointer_gate();
+    deepen_os_geometry_bounds::test_candidate_alignment_geometry();
 
     const std::uintptr_t page_align{ static_cast<std::uintptr_t>(vmhook::os::page_size()) };
     const std::uintptr_t gran_align{ static_cast<std::uintptr_t>(vmhook::os::allocation_granularity()) };

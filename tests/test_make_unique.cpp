@@ -1346,5 +1346,205 @@ int main()
         check("G2_wrapper_value_semantics_no_throw", !threw);
     }
 
+    // =====================================================================
+    // SECTION H — EXTENDED / NATIVE INTEGRAL DESCRIPTOR LADDER (additive).
+    // Section D pins the FIXED-WIDTH std::intNN_t aliases only.  But make_unique's
+    // descriptor builder (jni_signature_for_arg, vmhook.hpp) also admits every
+    // *native* and *extended* integral type through a generic sizeof ladder, plus
+    // two explicit early branches:
+    //     bool                      -> "Z"   (claimed before the sizeof==1 byte arm)
+    //     char16_t | std::uint16_t  -> "C"   (claimed before the sizeof==2 arm)
+    //     integral, sizeof == 1     -> "B"
+    //     integral, sizeof == 2     -> "S"
+    //     integral, sizeof == 4     -> "I"
+    //     integral, sizeof == 8     -> "J"
+    // The header comment (vmhook.hpp jni_signature_for_arg) records that admitting
+    // plain `char` / `char8_t` / `wchar_t` / `char32_t` was a real fix: they used
+    // to hit the terminal dependent_false static_assert even though the overload
+    // selector already accepted them.  This section pins that whole ladder — the
+    // "every BasicType/descriptor" surface for make_unique's <init> assembly — at
+    // BOTH the compile-time descriptor layer and the no-JVM runtime null layer.
+    //
+    // EVERY expected letter is DERIVED FROM SOURCE (the sizeof ladder above), not
+    // hand-stamped: for the size-variant native types (long / wchar_t / etc.) the
+    // expected letter is COMPUTED from sizeof(T) the same way the library does, so
+    // the assertion is correct on LP64 (long==8 -> "J") AND LLP64/Windows
+    // (long==4 -> "I") AND for wchar_t (2 bytes Windows -> "S", 4 bytes POSIX ->
+    // "I").  No platform-variant letter is hard-coded.
+    // =====================================================================
+    {
+        // (a) FIXED-SIZE native/extended types whose letter is the SAME on every
+        // platform in the CI matrix (size is standard-mandated):
+        //   bool       -> "Z"   (explicit branch, before the byte arm)
+        //   char        -> "B"   (always sizeof 1, signedness ignored)
+        //   signed char -> "B"   unsigned char -> "B"   char8_t -> "B"
+        //   char16_t    -> "C"   (explicit char16_t|uint16_t branch)
+        //   char32_t    -> "I"   (always sizeof 4 -> ladder)
+        // These are byte-identical across gcc/clang/msvc, so a literal compare is
+        // certain.  char8_t is C++20; the test target is C++20+, so it is available.
+        check("H_native_bool_Z",        init_descriptor<bool>() == "(Z)V");
+        check("H_native_char_B",        init_descriptor<char>() == "(B)V");
+        check("H_native_schar_B",       init_descriptor<signed char>() == "(B)V");
+        check("H_native_uchar_B",       init_descriptor<unsigned char>() == "(B)V");
+        check("H_native_char8_B",       init_descriptor<char8_t>() == "(B)V");
+        check("H_native_char16_C",      init_descriptor<char16_t>() == "(C)V");
+        check("H_native_char32_I",      init_descriptor<char32_t>() == "(I)V");
+
+        // char16_t really resolves to 'C' (Java char), the SAME letter uint16_t
+        // gets and DISTINCT from the plain-2-byte 'S' arm — guards the explicit
+        // char16_t branch against being collapsed into the generic ladder.
+        check("H_char16_equals_uint16_C",
+              init_descriptor<char16_t>() == init_descriptor<std::uint16_t>());
+        check("H_char16_differs_from_int16_S",
+              init_descriptor<char16_t>() != init_descriptor<std::int16_t>());
+        // char / signed char / unsigned char / char8_t all collapse to 'B' (the
+        // byte arm is signedness- and spelling-blind).
+        check("H_all_byte_spellings_agree_B",
+              init_descriptor<char>() == init_descriptor<signed char>()
+                  && init_descriptor<signed char>() == init_descriptor<unsigned char>()
+                  && init_descriptor<unsigned char>() == init_descriptor<char8_t>()
+                  && init_descriptor<char8_t>() == init_descriptor<std::int8_t>());
+
+        // (b) SIZE-VARIANT native types: short / int / long / long long and their
+        // unsigned twins.  The expected letter must REPLICATE the library's exact
+        // branch ORDER, not just sizeof: jni_signature_for_arg claims
+        // char16_t|uint16_t -> "C" BEFORE the generic sizeof==2 -> "S" arm.  So a
+        // 2-byte type that is THE SAME TYPE as std::uint16_t (every mainstream
+        // platform aliases unsigned short == uint16_t) yields "C", NOT "S".  The
+        // `expected_native_letter<T>()` helper mirrors that ordered logic so every
+        // expectation is derived-from-source and platform-correct (long is "J" on
+        // LP64, "I" on LLP64; wchar_t "S" on Windows, "I" on POSIX; unsigned short
+        // "C" wherever it aliases uint16_t).  It is referenced by every check below
+        // (no unused-const).
+        constexpr auto expected_native_letter = []<typename T>() -> const char* {
+            if constexpr (std::is_same_v<T, char16_t> || std::is_same_v<T, std::uint16_t>)
+            {
+                return "(C)V"; // explicit early branch, claimed before the 'S' arm
+            }
+            else if constexpr (sizeof(T) == 1) { return "(B)V"; }
+            else if constexpr (sizeof(T) == 2) { return "(S)V"; }
+            else if constexpr (sizeof(T) == 4) { return "(I)V"; }
+            else if constexpr (sizeof(T) == 8) { return "(J)V"; }
+            else                               { return "(?)V"; } // unreachable here
+        };
+        check("H_short_by_size",
+              init_descriptor<short>() == expected_native_letter.template operator()<short>());
+        check("H_ushort_by_size",
+              init_descriptor<unsigned short>() == expected_native_letter.template operator()<unsigned short>());
+        check("H_int_by_size",
+              init_descriptor<int>() == expected_native_letter.template operator()<int>());
+        check("H_uint_by_size",
+              init_descriptor<unsigned int>() == expected_native_letter.template operator()<unsigned int>());
+        check("H_long_by_size",
+              init_descriptor<long>() == expected_native_letter.template operator()<long>());
+        check("H_ulong_by_size",
+              init_descriptor<unsigned long>() == expected_native_letter.template operator()<unsigned long>());
+        check("H_longlong_by_size",
+              init_descriptor<long long>() == expected_native_letter.template operator()<long long>());
+        check("H_ulonglong_by_size",
+              init_descriptor<unsigned long long>() == expected_native_letter.template operator()<unsigned long long>());
+        // wchar_t is NOT char16_t/uint16_t, so it falls through the generic ladder
+        // by its (platform-variant) size: 2 bytes on Windows -> "S", 4 on POSIX ->
+        // "I".  Derived from the same ordered helper.
+        check("H_wchar_by_size",
+              init_descriptor<wchar_t>() == expected_native_letter.template operator()<wchar_t>());
+
+        // long long is guaranteed >= 64 bits, so on every CI platform it is 8
+        // bytes -> "J" (this is the one size-variant type whose letter is in fact
+        // fixed by the standard's minimum-width rule).
+        check("H_longlong_is_J_on_all_platforms",
+              init_descriptor<long long>() == "(J)V");
+
+        // unsigned short aliasing uint16_t -> "C" is the signed/unsigned split at
+        // width 2 (the one place signedness flips the letter).  Pin that the
+        // unsigned 2-byte native type agrees with std::uint16_t, and a SIGNED
+        // 2-byte native type (short) agrees with std::int16_t -> "S".
+        check("H_ushort_agrees_with_uint16",
+              init_descriptor<unsigned short>() == init_descriptor<std::uint16_t>());
+        check("H_short_agrees_with_int16",
+              init_descriptor<short>() == init_descriptor<std::int16_t>());
+
+        // (c) DECAY / VALUE-CATEGORY INVARIANCE for the native ladder: every
+        // cv/ref spelling decays (remove_cvref_t) to the bare type's descriptor,
+        // exactly as make_unique assembles it.  Pin the strongest discriminators.
+        check("H_decay_char_const_ref",
+              init_descriptor<const char&>() == init_descriptor<char>());
+        check("H_decay_long_rref",
+              init_descriptor<long&&>() == init_descriptor<long>());
+        check("H_decay_char16_const_rref",
+              init_descriptor<const char16_t&&>() == init_descriptor<char16_t>());
+        check("H_decay_uint_lref",
+              init_descriptor<unsigned int&>() == init_descriptor<unsigned int>());
+
+        // (d) A MULTI-ARG <init> assembled purely from native/extended types, to
+        // prove the per-arg letters concatenate correctly in one "(...)V".  The
+        // expectation is assembled from the SAME per-arg builder make_unique uses
+        // (jni_signature_for_arg per arg), so the whole expected string is computed
+        // from source and platform-correct (int->"I", long long->"J", etc.).
+        const std::string native_pack_expected{
+            std::string{ "(" }
+            + vmhook::detail::jni_signature_for_arg<bool>()       // Z
+            + vmhook::detail::jni_signature_for_arg<char>()       // B
+            + vmhook::detail::jni_signature_for_arg<char16_t>()   // C
+            + vmhook::detail::jni_signature_for_arg<int>()        // I (4-byte)
+            + vmhook::detail::jni_signature_for_arg<long long>()  // J (8-byte)
+            + ")V" };
+        check("H_native_multi_arg_pack_assembly",
+              (init_descriptor<bool, char, char16_t, int, long long>() == native_pack_expected));
+        // The fixed-letter prefix of that pack is exactly "(ZBC" — bool/char/char16
+        // letters are platform-invariant — guarding the explicit early branches'
+        // ordering within the assembled descriptor.
+        check("H_native_pack_fixed_prefix",
+              native_pack_expected.compare(0, 4, "(ZBC") == 0);
+
+        // (e) NO-JVM RUNTIME NULL CONTRACT for the native/extended ladder: each
+        // type ACTUALLY INSTANTIATES make_unique's forwarding + descriptor +
+        // construct-detect machinery and must return a null unique_ptr without
+        // throwing (the ensure_current_java_thread guard wins first).  This proves
+        // no native-integral arg shape faults on the way to the guard.
+        {
+            char            c_arg{ 'a' };
+            signed char     sc_arg{ -1 };
+            unsigned char   uc_arg{ 1 };
+            char8_t         c8_arg{ u8'z' };
+            char16_t        c16_arg{ u'Q' };
+            char32_t        c32_arg{ U'R' };
+            wchar_t         wc_arg{ L'W' };
+            short           sh_arg{ -2 };
+            unsigned short  ush_arg{ 2 };
+            long            l_arg{ 3 };
+            unsigned long   ul_arg{ 4 };
+            long long       ll_arg{ 5 };
+            unsigned long long ull_arg{ 6 };
+            check("H_runtime_char",      make_unique_is_null_and_safe<plain_wrapper>(c_arg));
+            check("H_runtime_schar",     make_unique_is_null_and_safe<plain_wrapper>(sc_arg));
+            check("H_runtime_uchar",     make_unique_is_null_and_safe<plain_wrapper>(uc_arg));
+            check("H_runtime_char8",     make_unique_is_null_and_safe<plain_wrapper>(c8_arg));
+            check("H_runtime_char16",    make_unique_is_null_and_safe<plain_wrapper>(c16_arg));
+            check("H_runtime_char32",    make_unique_is_null_and_safe<plain_wrapper>(c32_arg));
+            check("H_runtime_wchar",     make_unique_is_null_and_safe<plain_wrapper>(wc_arg));
+            check("H_runtime_short",     make_unique_is_null_and_safe<plain_wrapper>(sh_arg));
+            check("H_runtime_ushort",    make_unique_is_null_and_safe<plain_wrapper>(ush_arg));
+            check("H_runtime_long",      make_unique_is_null_and_safe<plain_wrapper>(l_arg));
+            check("H_runtime_ulong",     make_unique_is_null_and_safe<plain_wrapper>(ul_arg));
+            check("H_runtime_longlong",  make_unique_is_null_and_safe<plain_wrapper>(ll_arg));
+            check("H_runtime_ulonglong", make_unique_is_null_and_safe<plain_wrapper>(ull_arg));
+            // A native-type multi-arg pack at runtime (every category present).
+            check("H_runtime_native_multi_arg",
+                  make_unique_is_null_and_safe<plain_wrapper>(true, c_arg, c16_arg, 7, ll_arg));
+        }
+
+        // (f) vmhook::jni::signature_for_arg<T>() (the public forwarding twin)
+        // routes to the SAME jni_signature_for_arg, so it MUST agree letter-for-
+        // letter on the native ladder — pin the equivalence so a future divergence
+        // of the two entry points is caught here, no JVM needed.
+        check("H_signature_for_arg_agrees_char",
+              vmhook::jni::signature_for_arg<char>() == vmhook::detail::jni_signature_for_arg<char>());
+        check("H_signature_for_arg_agrees_long",
+              vmhook::jni::signature_for_arg<long>() == vmhook::detail::jni_signature_for_arg<long>());
+        check("H_signature_for_arg_agrees_char16",
+              vmhook::jni::signature_for_arg<char16_t>() == vmhook::detail::jni_signature_for_arg<char16_t>());
+    }
+
     return failures == 0 ? 0 : 1;
 }

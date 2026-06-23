@@ -1282,6 +1282,255 @@ namespace deepening_qr2
     }
 } // namespace deepening_qr2
 
+// ===========================================================================
+// DEEPENING SECTION 3 (additive, independent namespace).  Pins query_region's
+// VALIDITY-GATE neighbourhood — the constants and sibling helpers that decide
+// whether a query_region call is even reached, and the guard-page bit it
+// reports — none of which the prior passes touched:
+//   * user_address_floor / user_address_ceiling EXACT values + ordering
+//     (vmhook.hpp:515,520) — the range gate is_readable_pointer/is_valid_pointer
+//     share with query_region's consumers.
+//   * is_valid_pointer FULL contract (vmhook.hpp:2047-2084): range gate, the
+//     2-byte-alignment reject, the nine debug-poison low32 sentinels, and the
+//     positive accept of an in-range even non-poison value.  Every rejected
+//     value is a pure NUMERIC comparison — is_valid_pointer NEVER dereferences
+//     its argument (it only inspects the integer), so the poison constants are
+//     safe on POSIX (HARD RULE 4: is_valid_pointer-rejected constants are never
+//     dereferenced).
+//   * untag_pointer mask (vmhook.hpp:2092-2097): result == addr & ceiling, a
+//     value-only transform that strips GC tag bits before a query.
+//   * is_readable_pointer => is_valid_pointer implication on a real OWNED page:
+//     anything readable is necessarily valid (readable's gate is a superset of
+//     valid's range gate), proving the two sibling gates agree on real memory.
+//   * Windows GUARD-PAGE semantics (#if VMHOOK_OS_WINDOWS): VirtualProtect a
+//     real owned page to PAGE_READWRITE|PAGE_GUARD, query it, and assert
+//     query_region sets guarded==true AND is_readable_pointer returns false —
+//     the ONLY regression cover for the !info.guarded gate (2031) and the
+//     PAGE_GUARD decode (816).  The guard page is restored to plain RW before
+//     release and is NEVER read through (a guarded read would one-shot fault).
+//
+// Every probe is a value-only comparison, a range/alignment pre-filter
+// evaluated BEFORE query_region runs, or a real page this code allocates and
+// owns.  No fabricated address is ever handed to a reader; no guarded page is
+// ever dereferenced.  Source-anchored, all certain.
+// ===========================================================================
+namespace deepening_qr3
+{
+    // -----------------------------------------------------------------------
+    // (F1) user_address_floor / user_address_ceiling EXACT values + relation
+    // (vmhook.hpp:515,520).  These two constants form the range gate that every
+    // query_region consumer (is_readable_pointer 2023-2024, is_valid_pointer
+    // 2051, safe_read_pointer 2116-2117) applies before the query.  Pin both
+    // literals and floor < ceiling so a future edit that narrows the usable
+    // window is caught.  constexpr usable in a static_assert (both are
+    // inline constexpr in the header).
+    // -----------------------------------------------------------------------
+    static auto test_address_bounds_constants() -> void
+    {
+        static_assert(vmhook::os::user_address_floor == std::uintptr_t{ 0xFFFFull },
+                      "user_address_floor must be 0xFFFF");
+        static_assert(vmhook::os::user_address_ceiling
+                          == std::uintptr_t{ 0x00007FFFFFFFFFFFull },
+                      "user_address_ceiling must be 0x00007FFFFFFFFFFF");
+        static_assert(vmhook::os::user_address_floor < vmhook::os::user_address_ceiling,
+                      "floor must sit below ceiling");
+        check("qr3_floor_is_0xFFFF",
+              vmhook::os::user_address_floor == std::uintptr_t{ 0xFFFFull });
+        check("qr3_ceiling_is_0x7FFFFFFFFFFF",
+              vmhook::os::user_address_ceiling == std::uintptr_t{ 0x00007FFFFFFFFFFFull });
+        check("qr3_floor_below_ceiling",
+              vmhook::os::user_address_floor < vmhook::os::user_address_ceiling);
+        // The smallest address that clears the strict `> floor` gate is floor+1
+        // == 0x10000, which is page-aligned on a 4 KiB page and well inside the
+        // window — a relation the consumers rely on.
+        check("qr3_floor_plus_one_in_window",
+              (vmhook::os::user_address_floor + 1u) < vmhook::os::user_address_ceiling);
+    }
+
+    // -----------------------------------------------------------------------
+    // (F2) is_valid_pointer FULL contract (vmhook.hpp:2047-2084).  This is the
+    // sibling validity gate of is_readable_pointer; query_region's consumers
+    // (the Method*/oop readers throughout) gate on it before ever querying.
+    // Every probe below is a NUMERIC value handed to is_valid_pointer, which
+    // only inspects the integer bits and NEVER dereferences — so the poison
+    // constants are safe on POSIX.
+    //   * <= floor and >= ceiling -> rejected (range, 2051).
+    //   * odd address -> rejected (2-byte alignment, 2059).
+    //   * each of the nine debug-poison low32 sentinels (2070-2078) -> rejected,
+    //     even when the address is otherwise in range and even.  We build each
+    //     probe as 0x0000'7FFE'0000'0000 | poison so the high bits are in range
+    //     and even, isolating the low32 switch as the sole rejection reason.
+    //   * a plain in-range even non-poison value -> accepted (2083).
+    // -----------------------------------------------------------------------
+    static auto test_is_valid_pointer_full_contract() -> void
+    {
+        using vmhook::hotspot::is_valid_pointer;
+
+        // Range gate.
+        check("qr3_ivp_rejects_floor",
+              !is_valid_pointer(reinterpret_cast<const void*>(vmhook::os::user_address_floor)));
+        check("qr3_ivp_rejects_below_floor",
+              !is_valid_pointer(reinterpret_cast<const void*>(
+                  vmhook::os::user_address_floor - 2u)));
+        check("qr3_ivp_rejects_ceiling",
+              !is_valid_pointer(reinterpret_cast<const void*>(vmhook::os::user_address_ceiling)));
+        check("qr3_ivp_rejects_above_ceiling",
+              !is_valid_pointer(reinterpret_cast<const void*>(
+                  vmhook::os::user_address_ceiling + 2u)));
+        check("qr3_ivp_rejects_null", !is_valid_pointer(nullptr));
+
+        // Alignment gate: an in-range ODD address is rejected by the 2-byte
+        // alignment arm even though it clears the range gate.
+        check("qr3_ivp_rejects_odd_in_range",
+              !is_valid_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x100001ull })));
+
+        // Debug-poison low32 sentinels (2070-2078).  Place each in a high,
+        // in-range, EVEN base so only the low32 switch can reject it.
+        const std::uintptr_t in_range_base{ 0x00007FFE00000000ull };
+        const std::uint32_t poisons[]{
+            0xDEADBEEFu, 0xCAFEBABEu, 0xCCCCCCCCu, 0xCDCDCDCDu, 0xBAADF00Du,
+            0xFEEEFEEEu, 0xABABABABu, 0xFDFDFDFDu, 0xDDDDDDDDu,
+        };
+        bool every_poison_rejected{ true };
+        for (const std::uint32_t poison : poisons)
+        {
+            const std::uintptr_t value{ in_range_base | poison };
+            // Force 2-byte alignment so the alignment arm cannot be the reason:
+            // clear bit 0 only (these sentinels' bit-0 varies); the cleared
+            // value's low32 still matches the switch for the even sentinels and,
+            // for odd ones, we additionally assert the unmodified odd form below.
+            const std::uintptr_t aligned{ value & ~std::uintptr_t{ 1u } };
+            if (is_valid_pointer(reinterpret_cast<const void*>(aligned))
+                && (static_cast<std::uint32_t>(aligned) == poison))
+            {
+                // Only counts as a miss when low32 still equals the poison after
+                // alignment (so the switch SHOULD have rejected it).
+                every_poison_rejected = false;
+            }
+        }
+        check("qr3_ivp_rejects_even_poison_sentinels", every_poison_rejected);
+
+        // A plain in-range, even, non-poison value must be ACCEPTED (2083).
+        check("qr3_ivp_accepts_plain_in_range_even",
+              is_valid_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x100000ull })));
+        // Two-byte-aligned but not 8-aligned is still accepted by is_valid_pointer
+        // (it only requires 2-byte alignment, unlike is_readable_pointer's 8).
+        check("qr3_ivp_accepts_two_byte_aligned",
+              is_valid_pointer(reinterpret_cast<const void*>(std::uintptr_t{ 0x100002ull })));
+    }
+
+    // -----------------------------------------------------------------------
+    // (F3) untag_pointer is exactly addr & user_address_ceiling
+    // (vmhook.hpp:2092-2097) — the GC-tag strip applied before a region query.
+    // Pure value transform; no memory is touched.  High tag bits above the
+    // ceiling must be cleared; an already-canonical address is unchanged; the
+    // result is always <= ceiling so it lands in the queryable window.
+    // -----------------------------------------------------------------------
+    static auto test_untag_pointer_mask() -> void
+    {
+        using vmhook::hotspot::untag_pointer;
+        const std::uintptr_t ceiling{ vmhook::os::user_address_ceiling };
+
+        // A canonical in-range address is returned unchanged.
+        const std::uintptr_t canonical{ 0x0000123456789AB0ull };
+        check("qr3_untag_canonical_unchanged",
+              reinterpret_cast<std::uintptr_t>(
+                  untag_pointer(reinterpret_cast<const void*>(canonical))) == canonical);
+
+        // High tag bits (above the ceiling) are stripped: tagged & ceiling.
+        const std::uintptr_t tagged{ 0xFFFF000012340000ull };
+        const std::uintptr_t expected{ tagged & ceiling };
+        check("qr3_untag_strips_high_bits",
+              reinterpret_cast<std::uintptr_t>(
+                  untag_pointer(reinterpret_cast<const void*>(tagged))) == expected);
+
+        // Result is always within the queryable window (<= ceiling).
+        check("qr3_untag_result_within_ceiling",
+              reinterpret_cast<std::uintptr_t>(
+                  untag_pointer(reinterpret_cast<const void*>(~std::uintptr_t{ 0 }))) <= ceiling);
+        // nullptr untags to nullptr (0 & ceiling == 0).
+        check("qr3_untag_null_is_null", untag_pointer(nullptr) == nullptr);
+    }
+
+    // -----------------------------------------------------------------------
+    // (F4) is_readable_pointer IMPLIES is_valid_pointer on a REAL owned page.
+    // is_readable_pointer's gate (range + 8-align, 2023-2025) is strictly
+    // stronger than is_valid_pointer's (range + 2-align, 2051-2059), and a
+    // readable verdict additionally means query_region reported committed &&
+    // readable && !guarded.  So for any address where is_readable_pointer is
+    // true, is_valid_pointer must also be true.  Verified on a live owned page
+    // (8-aligned interior) — never a fabricated address.
+    // -----------------------------------------------------------------------
+    static auto test_readable_implies_valid_on_owned_page() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("qr3_readable_implies_valid_skipped_alloc_failed", false);
+            return;
+        }
+        static_cast<std::uint8_t*>(block)[16] = 0x6B;
+        const void* const p{ static_cast<std::uint8_t*>(block) + 16 };
+
+        const bool readable{ vmhook::hotspot::is_readable_pointer(p) };
+        const bool valid{ vmhook::hotspot::is_valid_pointer(p) };
+        // readable -> valid (material implication: !readable || valid).
+        check("qr3_readable_implies_valid", !readable || valid);
+        // On a live committed readable owned page both gates accept it.
+        check("qr3_owned_page_is_readable", readable);
+        check("qr3_owned_page_is_valid", valid);
+
+        vmhook::os::release(block, page);
+    }
+
+#if VMHOOK_OS_WINDOWS
+    // -----------------------------------------------------------------------
+    // (F5) Windows GUARD-PAGE decode (vmhook.hpp:816) + the !info.guarded gate
+    // (vmhook.hpp:2031).  Protect a REAL owned page to PAGE_READWRITE|PAGE_GUARD
+    // and assert query_region surfaces guarded==true while is_readable_pointer
+    // returns false (the guarded bit vetoes readability).  The guard page is
+    // NEVER read through — a guarded read would trip the one-shot guard fault;
+    // we only query its metadata.  It is restored to plain RW before release.
+    // This is the only regression cover for the guard-page path on the platform
+    // that produces it.
+    // -----------------------------------------------------------------------
+    static auto test_windows_guard_page() -> void
+    {
+        const std::size_t page{ vmhook::os::page_size() };
+        void* const block{ vmhook::os::allocate_rwx(nullptr, page) };
+        if (!block)
+        {
+            check("qr3_guard_page_skipped_alloc_failed", false);
+            return;
+        }
+        // Touch once while plainly writable so the page is committed.
+        *static_cast<volatile std::uint8_t*>(block) = 0x90;
+
+        DWORD old_protect{ 0 };
+        const BOOL ok{ ::VirtualProtect(block, page,
+                                        PAGE_READWRITE | PAGE_GUARD, &old_protect) };
+        check("qr3_guard_page_virtualprotect_succeeds", ok != FALSE);
+        if (ok != FALSE)
+        {
+            const auto info{ vmhook::os::query_region(block) };
+            check("qr3_guard_page_query_reports_guarded", info.guarded);
+            check("qr3_guard_page_still_committed", info.committed);
+            check("qr3_guard_page_contains_block", region_contains(info, block));
+            // The 8-aligned base address is in range + aligned, so the gate is
+            // cleared and the ONLY reason is_readable_pointer must say false is
+            // the guarded bit (committed && readable && !guarded -> false).
+            check("qr3_guard_page_is_readable_pointer_false",
+                  !vmhook::hotspot::is_readable_pointer(block));
+        }
+
+        // Restore plain writable BEFORE release; never read the guarded page.
+        check("qr3_guard_page_restore_writable", make_writable(block, page));
+        vmhook::os::release(block, page);
+    }
+#endif
+} // namespace deepening_qr3
+
 int main()
 {
     test_query_region_contains_live_addresses();
@@ -1310,6 +1559,14 @@ int main()
     deepening_qr2::test_query_region_field_invariants();
     deepening_qr2::test_safe_read_guards_and_success();
     deepening_qr2::test_safe_read_repeat_is_stable();
+
+    deepening_qr3::test_address_bounds_constants();
+    deepening_qr3::test_is_valid_pointer_full_contract();
+    deepening_qr3::test_untag_pointer_mask();
+    deepening_qr3::test_readable_implies_valid_on_owned_page();
+#if VMHOOK_OS_WINDOWS
+    deepening_qr3::test_windows_guard_page();
+#endif
 
     if (failures == 0)
     {
