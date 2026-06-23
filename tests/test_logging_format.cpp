@@ -1937,6 +1937,283 @@ int main()
 #endif
     }
 
+    // =====================================================================
+    // DEEPENING WAVE 3 (additive) — a THIRD namespaced section ("dw3_")
+    // covering inputs the first two waves did NOT touch:
+    //   * tag *.size() / exact-length invariants derived from the source
+    //     literals (error/warning/info_tag at vmhook.hpp:408-410),
+    //   * std::string_view ARGUMENT (not fmt) carrying width/precision specs,
+    //   * alt-form (#) sign-placement on NEGATIVE base values,
+    //   * sign flags ('+'/' ') on floating ZERO / negative-zero,
+    //   * {:c} on the remaining control / boundary code points (tab 9, DEL 127),
+    //   * '0' fill that is NOT the zero-pad form (explicit-align '0' fill),
+    //   * empty / multi-NUL emit payloads and a third concurrent shape,
+    //   * the format_log result element-type (remove_cvref_t -> char string),
+    //   * the no-op/active VMHOOK_LOG seam via a second arg-evaluation probe.
+    // PURE LOGIC ONLY — no memory reads, no pointer fabrication, no value_t
+    // casts, no narrowing.  Every expected value is derived from source:
+    //   * VMHOOK_HAS_STD_FORMAT==1 -> format_log == std::vformat(fmt, args);
+    //     all spellings here are STANDARD-PINNED (no shortest-round-trip, no
+    //     locale, no impl-defined NaN/hexfloat token), byte-identical on
+    //     libstdc++ AND the MSVC STL.
+    //   * VMHOOK_HAS_STD_FORMAT==0 -> format_log == std::string{ fmt }.
+    // =====================================================================
+
+    // --- Tag exact sizes (derived from the literals at vmhook.hpp:408-410). -
+    // "[VMHook ERROR]" = 14 bytes, "[VMHook WARNING]" = 16, "[VMHook INFO]" = 13.
+    check("dw3_error_tag_size_14", vmhook::error_tag.size() == 14u);
+    check("dw3_warning_tag_size_16", vmhook::warning_tag.size() == 16u);
+    check("dw3_info_tag_size_13", vmhook::info_tag.size() == 13u);
+    // The bracketed body (strip '[' and ']') begins with the brand "VMHook ".
+    check("dw3_error_tag_body_after_bracket",
+        vmhook::error_tag.substr(1, 7) == "VMHook ");
+    check("dw3_warning_tag_body_after_bracket",
+        vmhook::warning_tag.substr(1, 7) == "VMHook ");
+    check("dw3_info_tag_body_after_bracket",
+        vmhook::info_tag.substr(1, 7) == "VMHook ");
+    // The severity word is exactly what the literal spells.
+    check("dw3_error_tag_severity_word",
+        vmhook::error_tag.substr(8, 5) == "ERROR");
+    check("dw3_warning_tag_severity_word",
+        vmhook::warning_tag.substr(8, 7) == "WARNING");
+    check("dw3_info_tag_severity_word",
+        vmhook::info_tag.substr(8, 4) == "INFO");
+    // Tags are constexpr string_views whose element type is `char` (so they
+    // compose with format_log's std::string output).  remove_cvref_t strips the
+    // reference/const that decltype(view[i]) would otherwise carry.
+    {
+        using elem_t =
+            std::remove_cvref_t<decltype(vmhook::error_tag[0])>;
+        check("dw3_tag_element_type_is_char",
+            std::is_same_v<elem_t, char>);
+    }
+
+#if VMHOOK_HAS_STD_FORMAT
+    // --- std::string_view as the ARGUMENT (not the fmt) with specs. --------
+    // The sv-formatter honours precision (truncate to N code units) and width,
+    // exactly like std::string/const char*.
+    {
+        std::string_view sv{ "abcdef" };
+        check("dw3_sv_arg_precision_truncates",
+            vmhook::detail::format_log("{:.4}", sv) == "abcd");
+        check("dw3_sv_arg_width_right_align",
+            vmhook::detail::format_log("{:>8}", sv) == "  abcdef");
+        check("dw3_sv_arg_precision_then_width",
+            vmhook::detail::format_log("{:>6.3}", sv) == "   abc");
+    }
+    // An EMPTY string_view argument renders as nothing; width still pads.
+    {
+        std::string_view empty_sv{};
+        check("dw3_sv_empty_arg_is_empty",
+            vmhook::detail::format_log("[{}]", empty_sv) == "[]");
+        check("dw3_sv_empty_arg_width_pads",
+            vmhook::detail::format_log("[{:>3}]", empty_sv) == "[   ]");
+    }
+
+    // --- Alt-form (#) sign placement on NEGATIVE base values. --------------
+    // The sign precedes the alt-form prefix: '-' then "0x" then magnitude.
+    check("dw3_neg_alt_hex_sign_first",
+        vmhook::detail::format_log("{:#x}", -255) == "-0xff");
+    check("dw3_neg_alt_binary_sign_first",
+        vmhook::detail::format_log("{:#b}", -5) == "-0b101");
+    check("dw3_neg_alt_octal_sign_first",
+        vmhook::detail::format_log("{:#o}", -8) == "-010");
+    // Negative alt-form hex with zero-pad: '-' "0x" zero-fill magnitude, the
+    // sign + prefix counting toward the field width (width 8 -> 3 fill zeros).
+    check("dw3_neg_alt_hex_zeropad_sign_prefix_count",
+        vmhook::detail::format_log("{:#08x}", -255) == "-0x000ff");
+
+    // --- Sign flags on floating ZERO / negative-zero. ---------------------
+    // '+' forces a leading '+' on +0.0; '-0.0' keeps its '-'.
+    check("dw3_plus_flag_pos_zero_fixed",
+        vmhook::detail::format_log("{:+.1f}", 0.0) == "+0.0");
+    check("dw3_minus_zero_fixed_keeps_sign",
+        vmhook::detail::format_log("{:.1f}", -0.0) == "-0.0");
+    // The space flag on +0.0 emits a leading space (not '+'); -0.0 keeps '-'.
+    check("dw3_space_flag_pos_zero_fixed",
+        vmhook::detail::format_log("{: .1f}", 0.0) == " 0.0");
+    check("dw3_space_flag_neg_zero_fixed",
+        vmhook::detail::format_log("{: .1f}", -0.0) == "-0.0");
+
+    // --- {:c} on the remaining boundary code points. ----------------------
+    // Code 9 is a horizontal tab; {:c} produces a single '\t' byte.
+    check("dw3_int_as_char_tab",
+        vmhook::detail::format_log("{:c}", 9) == "\t");
+    // Code 127 (DEL) is a single byte 0x7F.
+    {
+        const std::string del{ vmhook::detail::format_log("{:c}", 127) };
+        check("dw3_int_as_char_del_size", del.size() == 1u);
+        check("dw3_int_as_char_del_byte",
+            del.size() == 1u && static_cast<unsigned char>(del[0]) == 0x7Fu);
+    }
+    // Code 65 ('A') with a precision is rejected for a char presentation? No —
+    // {:c} ignores precision; width still applies (covered in dw2).  Here pin
+    // the plain glyph at the upper printable boundary code 126 again via {}.
+    check("dw3_char_value_126_glyph",
+        vmhook::detail::format_log("{}", static_cast<char>(126)) == "~");
+
+    // --- '0' as an explicit FILL char (distinct from the zero-pad form). ---
+    // "{:0>5}" uses '0' as the alignment fill (right-align), which for a
+    // NEGATIVE value pads with '0' AFTER the sign position is NOT special — the
+    // fill form treats the whole "-7" token as the content -> "000-7".  This is
+    // distinct from "{:05}" (zero-pad) which would yield "-0007".
+    check("dw3_zero_fill_align_negative_is_not_zeropad",
+        vmhook::detail::format_log("{:0>5}", -7) == "000-7");
+    check("dw3_zeropad_negative_for_contrast",
+        vmhook::detail::format_log("{:05}", -7) == "-0007");
+
+    // --- Width on a bracketed tag with LEFT align (pads on the right). -----
+    // info_tag is 13 chars; width 16 left-aligned -> 3 trailing spaces.
+    check("dw3_tag_left_aligned_width",
+        vmhook::detail::format_log("{:<16}", vmhook::info_tag)
+            == "[VMHook INFO]   ");
+    // Tag center-aligned in width 18 (13 chars -> 5 pad, floor-left 2 / right 3).
+    check("dw3_tag_center_aligned_width",
+        vmhook::detail::format_log("{:^18}", vmhook::info_tag)
+            == "  [VMHook INFO]   ");
+
+    // --- A char-typed ARGUMENT that is itself a brace is literal data. -----
+    // The arg value '{' is NOT a format field — it is emitted as the glyph.
+    check("dw3_char_arg_open_brace_is_glyph",
+        vmhook::detail::format_log("{}", '{') == "{");
+    check("dw3_char_arg_close_brace_is_glyph",
+        vmhook::detail::format_log("{}", '}') == "}");
+#else
+    // Fallback leg: every dw3_ std-format input above returns the fmt verbatim.
+    check("dw3_fb_sv_precision_verbatim",
+        vmhook::detail::format_log("{:.4}", std::string_view{ "abcdef" }) == "{:.4}");
+    check("dw3_fb_neg_alt_hex_verbatim",
+        vmhook::detail::format_log("{:#x}", -255) == "{:#x}");
+    check("dw3_fb_neg_alt_hex_zeropad_verbatim",
+        vmhook::detail::format_log("{:#08x}", -255) == "{:#08x}");
+    check("dw3_fb_plus_zero_fixed_verbatim",
+        vmhook::detail::format_log("{:+.1f}", 0.0) == "{:+.1f}");
+    check("dw3_fb_space_zero_fixed_verbatim",
+        vmhook::detail::format_log("{: .1f}", 0.0) == "{: .1f}");
+    check("dw3_fb_int_as_char_tab_verbatim",
+        vmhook::detail::format_log("{:c}", 9) == "{:c}");
+    check("dw3_fb_zero_fill_align_verbatim",
+        vmhook::detail::format_log("{:0>5}", -7) == "{:0>5}");
+    check("dw3_fb_tag_left_width_verbatim",
+        vmhook::detail::format_log("{:<16}", vmhook::info_tag) == "{:<16}");
+    check("dw3_fb_char_arg_brace_verbatim",
+        vmhook::detail::format_log("{}", '{') == "{}");
+#endif
+
+    // --- Cross-branch: format_log result element type is char (std::string).
+    // remove_cvref_t strips the reference decltype(str[i]) carries, so the
+    // element type is exactly `char` on either branch.
+    {
+        const std::string produced{ vmhook::detail::format_log("e", 1) };
+        using elem_t = std::remove_cvref_t<decltype(produced[0])>;
+        check("dw3_format_result_element_is_char",
+            std::is_same_v<elem_t, char> && !produced.empty());
+    }
+
+    // --- Cross-branch emit invariants not covered above. -------------------
+    // A payload of several NUL bytes is length-preserving; emit appends '\n'.
+    {
+        std::string captured;
+        std::string payload;
+        payload.push_back('\0');
+        payload.push_back('\0');
+        payload.push_back('\0');
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(payload);
+            captured = cap.str();
+        }
+        check("dw3_emit_multi_nul_length_preserved",
+            captured.size() == 4u && captured.back() == '\n');
+    }
+    // A single-space payload passes through verbatim plus the appended newline.
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(std::string{ " " });
+            captured = cap.str();
+        }
+        check("dw3_emit_single_space_verbatim", captured == " \n");
+    }
+    // Interleaved emit + format_log-then-emit in one capture preserves order.
+    {
+        std::string captured;
+        {
+            cout_capture cap;
+            vmhook::detail::emit_log_line(std::string{ "raw" });
+            vmhook::detail::emit_log_line(
+                vmhook::detail::format_log("fmt-noarg"));
+            captured = cap.str();
+        }
+        // "fmt-noarg" has no fields, so it round-trips verbatim on BOTH legs.
+        check("dw3_emit_raw_then_formatted_order",
+            captured == "raw\nfmt-noarg\n");
+    }
+    // A third concurrent interleaving shape: each line is "<tag-letter><i>" with
+    // a distinct per-thread letter, K*M intact newline-terminated lines result.
+    {
+        constexpr int K{ 4 };
+        constexpr int M{ 40 };
+        std::string captured;
+        {
+            cout_capture cap;
+            std::vector<std::thread> threads;
+            threads.reserve(K);
+            for (int t{ 0 }; t < K; ++t)
+            {
+                threads.emplace_back([t]()
+                {
+                    const char letter{ static_cast<char>('A' + t) };
+                    for (int i{ 0 }; i < M; ++i)
+                    {
+                        vmhook::detail::emit_log_line(
+                            std::string{ letter } + std::to_string(i));
+                    }
+                });
+            }
+            for (auto& th : threads) { th.join(); }
+            captured = cap.str();
+        }
+        int line_count{ 0 };
+        bool all_wellformed{ true };
+        {
+            std::istringstream iss{ captured };
+            std::string line;
+            while (std::getline(iss, line))
+            {
+                ++line_count;
+                // Each line starts with one of the per-thread letters [A..D]
+                // and is followed by at least one digit (no torn write).
+                if (line.size() < 2u
+                    || line.front() < 'A' || line.front() > 'D'
+                    || !std::isdigit(static_cast<unsigned char>(line[1])))
+                {
+                    all_wellformed = false;
+                }
+            }
+        }
+        check("dw3_emit_concurrent_letter_count_exact", line_count == K * M);
+        check("dw3_emit_concurrent_letter_no_torn_writes", all_wellformed);
+    }
+    // Second arg-evaluation probe through VMHOOK_LOG: an incrementing counter
+    // passed as the formatted value is evaluated exactly once in the active
+    // build and never in the no-op build (the sizeof-unevaluated seam).
+    {
+        std::atomic<int> calls{ 0 };
+        auto next = [&calls]() -> int { return calls.fetch_add(1) + 1; };
+        {
+            cout_capture cap;            // swallow any active-build output
+            VMHOOK_LOG("{} n={}", vmhook::warning_tag, next());
+            (void)cap;
+        }
+#if VMHOOK_DEBUG_LOGS
+        check("dw3_vmhook_log_active_evaluates_once", calls.load() == 1);
+#else
+        check("dw3_vmhook_log_noop_no_eval", calls.load() == 0);
+#endif
+    }
+
     std::printf("\n%d checks failed\n", failures);
     return failures == 0 ? 0 : 1;
 }

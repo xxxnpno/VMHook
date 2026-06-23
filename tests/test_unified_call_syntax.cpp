@@ -1650,6 +1650,60 @@ static_assert(set_probe::set_ok<vmhook::method_proxy::value_t>,
               "set(method_proxy::value_t) must be viable (set dispatches on the value template arg)");
 
 // =============================================================================
+// 32. DEEPEN (ADDITIVE) -- the COMPILE-TIME half of the width-gate surface the
+//      unified set/array path routes through, plus deducing-this overload
+//      receiver-slice identity.  (The width-gate DECISION TABLE itself is a
+//      RUNTIME fact -- jvm_primitive_byte_width is `inline` not `constexpr`, so
+//      it cannot appear in a static_assert; the table is evaluated in the runtime
+//      lane, Section 33.)  100% no-JVM, no memory reads.  Every value derived
+//      from vmhook.hpp:
+//        - field_proxy::value_t::read_array_value gate (~15064-15069) and
+//          field_proxy::set gate (~15862-15863): for a "[X" array signature the
+//          read/write is REFUSED iff
+//              field_element_width != 0 && sizeof(element_type) != field_element_width
+//          i.e. accepted iff the element width is 0 (object/unknown) OR matches.
+// =============================================================================
+
+// 32b. set() / read viability is INDEPENDENT of the runtime width gate (the gate
+// is a runtime refusal, not a compile-time rejection): every std::vector<T>
+// element type the gate reasons about must still be a viable set() argument and a
+// legitimate value_t conversion target, regardless of which array width it would
+// match.  Pin that the COMPILE surface admits them all (the refusal is purely a
+// runtime safety branch reached only with a live array_oop).
+static_assert(set_probe::set_ok<std::vector<std::int8_t>>
+              && set_probe::set_ok<std::vector<std::int16_t>>
+              && set_probe::set_ok<std::vector<std::uint16_t>>
+              && set_probe::set_ok<std::vector<std::int32_t>>
+              && set_probe::set_ok<std::vector<float>>
+              && set_probe::set_ok<std::vector<std::int64_t>>
+              && set_probe::set_ok<std::vector<double>>,
+              "every natural-width vector<T> is a viable set() arg (the width gate is a "
+              "RUNTIME refusal, never a compile-time rejection)");
+static_assert(vmhook::detail::value_t_convertible_target_v<std::vector<std::int8_t>>
+              && vmhook::detail::value_t_convertible_target_v<std::vector<std::int64_t>>
+              && vmhook::detail::value_t_convertible_target_v<std::vector<double>>,
+              "every natural-width vector<T> is a legitimate value_t conversion target");
+
+// 32c. The deducing-this receiver-slice identity (the half of the contract the
+// `this object_base const& self` parameter encodes).  Section 22 pinned that a
+// wrapper& converts to object_base const&; close it for the SECOND wrapper and
+// for the rvalue receiver, and pin that the slice does NOT change the proxy
+// optional return type -- the receiver category is irrelevant to the result.
+static_assert(std::is_convertible_v<other_wrapper&, const vmhook::object_base&>,
+              "other_wrapper& converts to object_base const& (deducing-this self slice)");
+static_assert(std::is_convertible_v<other_wrapper&&, const vmhook::object_base&>,
+              "other_wrapper&& converts to object_base const& (rvalue receiver self slice)");
+static_assert(std::is_same_v<
+                  decltype(std::declval<other_wrapper&>().get_field("a")),
+                  decltype(std::declval<const other_wrapper&>().get_field("a"))>,
+              "non-const and const receiver yield the SAME get_field optional type "
+              "(the const& self slice makes receiver constness irrelevant to the result)");
+static_assert(std::is_same_v<
+                  decltype(std::declval<other_wrapper&&>().get_method("m")),
+                  std::optional<vmhook::method_proxy>>,
+              "rvalue-receiver get_method still yields optional<method_proxy>");
+
+// =============================================================================
 // 23. Tiny DETERMINISTIC runtime lane
 // =============================================================================
 // Almost every fact above is compile-time.  A handful of facts are genuinely
@@ -1915,6 +1969,123 @@ namespace ucs_deepen_rt
 
     // Namespace-scope object: its constructor runs run() BEFORE main(), feeding
     // the EXISTING rt::g_failures counter so main()'s report covers these too.
+    struct runner_t
+    {
+        runner_t() noexcept { run(); }
+    };
+    const runner_t g_runner{};
+}
+
+// =============================================================================
+// 33. DEEPEN (ADDITIVE) -- runtime lane: the width-gate decision table evaluated
+//      at RUNTIME, the method value_t alternatives Section 31 skipped (int8 #2,
+//      int16 #3, uint16 #8), and uint32 is_reference() on a method value_t.  All
+//      pure arithmetic over an OWNED value_t we build on the stack + over
+//      jvm_primitive_byte_width -- NO memory read of any fabricated pointer, NO
+//      OOP decode (the field/method uint32 alternative's CONVERSION reads memory,
+//      so we only inspect is_reference()/index, never static_cast it).  Routes
+//      through the EXISTING rt::check / rt::g_failures via a pre-main runner.
+// =============================================================================
+namespace ucs_deepen_rt2
+{
+    using fv_t = vmhook::field_proxy::value_t;
+    using mv_t = vmhook::method_proxy::value_t;
+    using vmhook::detail::jvm_primitive_byte_width;
+
+    // The exact gate predicate from read_array_value / set (vmhook.hpp): given the
+    // JVM array element width for `prim` and the C++ element size `cpp_size`,
+    // returns true iff the library REFUSES the read/write.  Runtime, because
+    // jvm_primitive_byte_width is `inline` (not constexpr) -- see Section 32.
+    inline auto refuses(const std::string_view prim, const std::size_t cpp_size) noexcept -> bool
+    {
+        const std::size_t w{ jvm_primitive_byte_width(prim) };
+        return w != 0u && cpp_size != w;
+    }
+
+    template<typename alt_t>
+    inline auto make_mv(const alt_t v) noexcept -> mv_t
+    {
+        mv_t out{};
+        out.data = v;
+        return out;
+    }
+    template<typename alt_t>
+    inline auto make_fv(const alt_t v) noexcept -> fv_t
+    {
+        fv_t out{};
+        out.data = v;
+        return out;
+    }
+
+    inline auto run() noexcept -> void
+    {
+        // ---- width-gate decision table at RUNTIME (see Section 32) ---------
+        rt::check(refuses("I", sizeof(std::int32_t)) == false, "gate: [I/int32 accepted (4==4)");
+        rt::check(refuses("J", sizeof(std::int64_t)) == false, "gate: [J/int64 accepted (8==8)");
+        rt::check(refuses("B", sizeof(std::int8_t))  == false, "gate: [B/int8 accepted (1==1)");
+        rt::check(refuses("C", sizeof(std::uint16_t)) == false, "gate: [C/uint16 accepted (2==2)");
+        rt::check(refuses("J", sizeof(std::int32_t)) == true,  "gate: [J/int32 REFUSED (4!=8 mis-stride)");
+        rt::check(refuses("I", sizeof(std::int64_t)) == true,  "gate: [I/int64 REFUSED (8!=4 read-past)");
+        rt::check(refuses("B", sizeof(std::int32_t)) == true,  "gate: [B/int32 REFUSED (4!=1)");
+        rt::check(refuses("L", sizeof(std::int32_t)) == false, "gate: object width 0 -> never refuses");
+        rt::check(refuses("",  sizeof(std::int32_t)) == false, "gate: empty width 0 -> never refuses");
+
+        // ---- METHOD value_t : int8_t alternative (index 2) -----------------
+        {
+            const mv_t m{ make_mv<std::int8_t>(static_cast<std::int8_t>(-2)) };
+            rt::check(m.data.index() == 2u,            "mv int8: active index 2");
+            rt::check(static_cast<int>(m) == -2,       "mv int8(-2) -> int -2 (sign-extended)");
+            rt::check(static_cast<std::int64_t>(m) == -2, "mv int8(-2) -> int64 -2");
+            rt::check(m.is_void() == false,            "mv int8: is_void() false");
+            rt::check(m.is_string() == false,          "mv int8: is_string() false");
+            rt::check(m.as_string().empty(),           "mv int8: as_string() empty (non-string alt)");
+        }
+
+        // ---- METHOD value_t : int16_t alternative (index 3) ----------------
+        {
+            const mv_t m{ make_mv<std::int16_t>(static_cast<std::int16_t>(1000)) };
+            rt::check(m.data.index() == 3u,            "mv int16: active index 3");
+            rt::check(static_cast<int>(m) == 1000,     "mv int16(1000) -> int 1000");
+            rt::check(static_cast<double>(m) == 1000.0,"mv int16(1000) -> double 1000.0");
+            rt::check(static_cast<bool>(m) == true,    "mv int16(1000) -> bool true");
+        }
+
+        // ---- METHOD value_t : uint16_t alternative (index 8); Java char ----
+        {
+            const mv_t m{ make_mv<std::uint16_t>(static_cast<std::uint16_t>(40000u)) };
+            rt::check(m.data.index() == 8u,            "mv uint16: active index 8");
+            rt::check(static_cast<int>(m) == 40000,    "mv uint16(40000) -> int 40000 (zero-extended)");
+            rt::check(static_cast<std::int16_t>(m) == static_cast<std::int16_t>(-25536),
+                      "mv uint16(40000) -> int16 -25536 (mod 2^16, C++20)");
+            rt::check(static_cast<bool>(m) == true,    "mv uint16(40000) -> bool true");
+        }
+
+        // ---- METHOD value_t : float alternative (index 6) ------------------
+        {
+            const mv_t m{ make_mv<float>(-1.5f) };
+            rt::check(m.data.index() == 6u,            "mv float: active index 6");
+            rt::check(static_cast<int>(m) == -1,       "mv float(-1.5) -> int -1 (truncates toward zero)");
+            rt::check(static_cast<double>(m) == -1.5,  "mv float(-1.5) -> double -1.5 (exact in binary)");
+        }
+
+        // ---- uint32 alternative: is_reference()/index ONLY, NEVER converted -
+        // The uint32 alternative is the compressed-OOP/reference alternative whose
+        // static_cast DECODES + reads memory; we set it on an owned value_t and
+        // inspect ONLY is_reference()/index (pure std::holds_alternative) -- never
+        // static_cast it, so no memory is read.  (field=index 8, method=index 9.)
+        {
+            const fv_t f{ make_fv<std::uint32_t>(static_cast<std::uint32_t>(0u)) };
+            rt::check(f.data.index() == 8u,            "fv uint32: active index 8 (the OOP alternative)");
+            rt::check(f.is_reference() == true,        "fv uint32: is_reference() true (reference/array alt)");
+        }
+        {
+            const mv_t m{ make_mv<std::uint32_t>(static_cast<std::uint32_t>(0u)) };
+            rt::check(m.data.index() == 9u,            "mv uint32: active index 9 (the OOP alternative)");
+            rt::check(m.is_string() == false,          "mv uint32: is_string() false (not the string alt)");
+            rt::check(m.is_void() == false,            "mv uint32: is_void() false (not monostate)");
+        }
+    }
+
     struct runner_t
     {
         runner_t() noexcept { run(); }

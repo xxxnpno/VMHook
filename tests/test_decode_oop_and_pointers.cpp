@@ -3395,5 +3395,206 @@ int main()
               && !is_readable_pointer(dnull_klass));
     }
 
+    // ===================================================================
+    // VV. (ADDITIVE deepening pass) Pure-logic codec inputs the A..UU sections
+    //     do NOT reach.  Every expected value is recomputed from the two
+    //     confirmed primitive bodies (vmhook/ext/vmhook/vmhook.hpp:5459-5463
+    //     narrow_decode = base + (uint64(c) << shift); :5480-5484 narrow_encode
+    //     = uint32((addr - base) >> shift)) and the is_valid_pointer gate
+    //     (:2050-2083).  No memory read of any fabricated address (the array
+    //     helper drives a REAL owned std::array we allocate); no value_t ->
+    //     container cast; no std::vector byte-buffer resize (std::array /
+    //     scalars only); no signed/unsigned narrowing; no raw NUL / non-ASCII in
+    //     literals; every const below is referenced.
+    // ===================================================================
+
+    // -- VV1. COMPLETE byte-narrow domain [0, 0xFF] at EVERY shift 0..8, both
+    //    decode and the round-trip, for the four canonical bases.  Earlier
+    //    sweeps cap shift at 4 (the widest object alignment HotSpot uses); the
+    //    primitive is shift-agnostic, so this exercises shifts 5..8 that no prior
+    //    section reaches, with the widen-before-shift guaranteeing (c << 8) for
+    //    c == 0xFF still lands at exactly 0xFF00 (no truncation).  The expected
+    //    value is the documented closed form, recomputed in 64-bit.
+    {
+        struct mode { std::uint64_t base; std::uint32_t shift; };
+        const mode modes[]{
+            { 0u, 0u }, { 0u, 5u }, { 0u, 6u }, { 0u, 7u }, { 0u, 8u },
+            { std::uint64_t{ 0x1'0000'0000ull }, 5u },
+            { std::uint64_t{ 0x8'0000'0000ull }, 8u },
+            { std::uint64_t{ 0x7F00'0000'0000ull }, 7u },
+        };
+        bool byte_decode_ok{ true };
+        bool byte_roundtrip_ok{ true };
+        std::size_t byte_cases{ 0 };
+        for (const mode m : modes)
+        {
+            for (std::uint32_t c{ 0u }; c <= 0xFFu; ++c)
+            {
+                const std::uintptr_t got{ as_uptr(narrow_decode(m.base, m.shift, c)) };
+                const std::uintptr_t want{ static_cast<std::uintptr_t>(
+                    m.base + (static_cast<std::uint64_t>(c) << m.shift)) };
+                if (got != want) { byte_decode_ok = false; }
+                if (narrow_encode(m.base, m.shift,
+                        static_cast<std::uint64_t>(got)) != c) { byte_roundtrip_ok = false; }
+                ++byte_cases;
+            }
+        }
+        check("narrow_decode_complete_byte_domain_shifts_5_to_8", byte_decode_ok);
+        check("narrow_roundtrip_complete_byte_domain_shifts_5_to_8", byte_roundtrip_ok);
+        check("narrow_decode_byte_domain_sweep_is_complete",
+              byte_cases == static_cast<std::size_t>(8) * 0x100u);
+        // Explicit human-readable pin: 0xFF at shift 8 widens to exactly 0xFF00.
+        check("narrow_decode_0xFF_shift8_is_0xFF00",
+              as_uptr(narrow_decode(0u, 8u, 0xFFu)) == 0xFF00u);
+    }
+
+    // -- VV2. ENCODE single-bit OFFSET law: for an address that is base plus a
+    //    single set bit (1 << b) for every b in 0..62, encode yields exactly the
+    //    documented low-32 of ((1<<b) >> shift).  This isolates each bit of the
+    //    subtract-shift-narrow independently (the inverse of section X's decode
+    //    single-bit family), proving the >> and the final uint32 cast act on each
+    //    bit position exactly as the closed form says.  Pure arithmetic.
+    {
+        const std::uint32_t shifts[]{ 0u, 1u, 3u, 4u };
+        const std::uint64_t base{ 0x8'0000'0000ull };   // grid-aligned, in canonical range
+        bool single_bit_encode_ok{ true };
+        for (const std::uint32_t sh : shifts)
+        {
+            for (unsigned b{ 0u }; b < 63u; ++b)
+            {
+                const std::uint64_t offset{ std::uint64_t{ 1ull } << b };
+                const std::uint64_t addr{ base + offset };
+                const std::uint32_t got{ narrow_encode(base, sh, addr) };
+                const std::uint32_t want{
+                    static_cast<std::uint32_t>(offset >> sh) };   // documented low-32
+                if (got != want) { single_bit_encode_ok = false; }
+            }
+        }
+        check("narrow_encode_single_bit_offset_low32_all_shifts",
+              single_bit_encode_ok);
+    }
+
+    // -- VV3. is_valid_pointer over a REAL owned byte buffer: every interior byte
+    //    address of a std::array we allocate is classified purely by its low bit
+    //    (even accepted, odd rejected) -- none of these interior addresses can hit
+    //    a poison low-32 because they are real stack addresses whose low 32 bits
+    //    are an arbitrary live value, so the discriminator is the 2-byte alignment
+    //    rule alone.  We assert the parity law holds AND that at least one even and
+    //    one odd interior address were actually exercised (so the loop is not
+    //    vacuous).  REAL buffer -- no fabricated address is ever dereferenced (the
+    //    helper only inspects the address value, never reads through it).
+    {
+        std::array<std::uint8_t, 64> real_buf{};   // owned, mapped, never read through
+        const std::uintptr_t b0{ reinterpret_cast<std::uintptr_t>(real_buf.data()) };
+        bool parity_rule_holds{ true };
+        bool saw_even{ false };
+        bool saw_odd{ false };
+        for (std::size_t i{ 0 }; i < real_buf.size(); ++i)
+        {
+            const std::uintptr_t addr{ b0 + i };
+            // Guard: the buffer sits comfortably inside [floor, ceiling] (a real
+            // stack/heap object always does), so range never fires and alignment
+            // is the sole discriminator.  Skip if a low-32 happens to be a poison
+            // pattern (vanishingly unlikely for a live address, but keep the law
+            // exact by only asserting on non-poison even addresses).
+            const std::uint32_t low32{ static_cast<std::uint32_t>(addr) };
+            const bool is_poison{
+                low32 == 0xDEADBEEFu || low32 == 0xCAFEBABEu || low32 == 0xCCCCCCCCu
+                || low32 == 0xCDCDCDCDu || low32 == 0xBAADF00Du || low32 == 0xFEEEFEEEu
+                || low32 == 0xABABABABu || low32 == 0xFDFDFDFDu || low32 == 0xDDDDDDDDu };
+            const bool valid{ is_valid_pointer(reinterpret_cast<void*>(addr)) };
+            if ((addr & 0x1u) == 0u)
+            {
+                if (!is_poison)
+                {
+                    if (!valid) { parity_rule_holds = false; }
+                    saw_even = true;
+                }
+            }
+            else
+            {
+                if (valid) { parity_rule_holds = false; }
+                saw_odd = true;
+            }
+        }
+        check("is_valid_pointer_real_buffer_even_accept_odd_reject", parity_rule_holds);
+        check("is_valid_pointer_real_buffer_exercised_both_parities",
+              saw_even && saw_odd);
+    }
+
+    // -- VV4. PUBLIC-WRAPPER vs PRIMITIVE agreement on the null sentinel, plus a
+    //    real-buffer encode characterization.  With no JVM the wrappers cannot
+    //    resolve base/shift, so the ONLY thing observable is their sentinel
+    //    behaviour; pin that BOTH public decoders agree with the primitive's
+    //    "compressed 0 with base 0 decodes to base 0 == null" reading, and that
+    //    encoding a real owned buffer address through either public encoder yields
+    //    0 (no-resolve), while the primitive given an injected base would NOT --
+    //    locating the no-resolve null precisely in the wrapper, not the math.
+    {
+        // The primitive with base 0, shift 0, compressed 0 returns (void*)0 == the
+        // same null the public decoders short-circuit to -- so all three agree on
+        // the canonical null oop/klass reading.
+        check("primitive_zero_base_zero_matches_wrapper_null_oop",
+              narrow_decode(0u, 0u, 0u) == decode_oop_pointer(0u));
+        check("primitive_zero_base_zero_matches_wrapper_null_klass",
+              narrow_decode(0u, 0u, 0u) == decode_klass_pointer(0u));
+
+        // A real owned buffer address: both public encoders return 0 (no VMStruct
+        // resolve), confirming the wrapper swallows even a genuinely valid pointer.
+        std::array<std::uint64_t, 4> owned{};   // owned, 8-aligned, mapped
+        void* const owned_ptr{ owned.data() };
+        check("encode_oop_pointer_owned_buffer_zero_no_jvm",
+              encode_oop_pointer(owned_ptr) == 0u);
+        check("encode_klass_pointer_owned_buffer_zero_no_jvm",
+              encode_klass_pointer(owned_ptr) == 0u);
+        // The SAME owned address fed to the primitive with an injected non-zero
+        // base that is below it does NOT collapse to 0 -- it is the lossless
+        // index (addr - base) >> shift.  Recompute the expectation the same way so
+        // the assertion is a spec, and choose a base strictly below the address so
+        // there is no modular underflow.
+        {
+            const std::uintptr_t addr_u{ reinterpret_cast<std::uintptr_t>(owned_ptr) };
+            // A base 0x1000 below the (8-aligned) address: (addr - base) is a
+            // positive multiple-friendly delta; shift 0 keeps it lossless.
+            const std::uint64_t base{ static_cast<std::uint64_t>(addr_u) - 0x1000u };
+            const std::uint32_t got{ narrow_encode(base, 0u,
+                static_cast<std::uint64_t>(addr_u)) };
+            check("primitive_encode_owned_buffer_is_lossless_index_not_zero",
+                  got == 0x1000u);
+        }
+    }
+
+    // -- VV5. ENCODE/DECODE COMPOSITION is the identity on the COMPLETE byte index
+    //    domain for shifts the earlier exhaustive low-16 sweep does not cover
+    //    (5..8): for every c in [0, 0xFF] and every such shift, decode(encode(
+    //    base + (c<<shift))) reproduces base + (c<<shift) exactly (representable
+    //    grid points), and encode(decode(c)) reproduces c.  Both directions over a
+    //    full contiguous domain at the wider shifts.
+    {
+        const std::uint32_t shifts[]{ 5u, 6u, 7u, 8u };
+        const std::uint64_t base{ 0x8'0000'0000ull };
+        bool addr_id{ true };
+        bool comp_id{ true };
+        for (const std::uint32_t sh : shifts)
+        {
+            for (std::uint32_t c{ 0u }; c <= 0xFFu; ++c)
+            {
+                const std::uint64_t addr{ base + (static_cast<std::uint64_t>(c) << sh) };
+                const std::uint32_t enc{ narrow_encode(base, sh, addr) };
+                if (static_cast<std::uint64_t>(as_uptr(narrow_decode(base, sh, enc))) != addr)
+                {
+                    addr_id = false;
+                }
+                void* const dec{ narrow_decode(base, sh, c) };
+                if (narrow_encode(base, sh, static_cast<std::uint64_t>(as_uptr(dec))) != c)
+                {
+                    comp_id = false;
+                }
+            }
+        }
+        check("narrow_roundtrip_decode_encode_byte_domain_shifts_5_to_8", addr_id);
+        check("narrow_roundtrip_encode_decode_byte_domain_shifts_5_to_8", comp_id);
+    }
+
     return failures == 0 ? 0 : 1;
 }

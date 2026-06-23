@@ -2930,6 +2930,244 @@ static auto test_header_poison_isolation() -> void
     }
 }
 
+// ===========================================================================
+// ADDITIVE DEEPENING WAVE (46-48).  Sections 1-45 exhaust value / index /
+// offset / bounds / guard / clamp on the three helpers.  This wave adds three
+// inputs not yet pinned, all pure arithmetic or REAL owned std::vector buffers:
+//
+//   * 46 CONSTANT-STRIDE TILING invariant.  Sections 12/13/24/36 pin individual
+//     (width x index) offsets; none pins the GENERAL structural property that
+//     consecutive element byte ranges tile the data region with EXACTLY sizeof(T)
+//     between them -- no gap, no overlap -- for an exhaustive index run.  That is
+//     the true "no inter-element padding" contract the per-element memcpy relies
+//     on (element_offset<T>(i+1) - element_offset<T>(i) == sizeof(T), and slot i
+//     ends exactly where slot i+1 begins).  Compile-time AND runtime.
+//   * 47 CLAMP-NEVER-EXPANDS-RANGE walker safety invariant.  The bucket/collection
+//     walkers loop `index in [0, clamp_safe_container_count(array_length(oop)))`
+//     (vmhook.hpp:14953/19946/19950).  The safety contract is that the clamp never
+//     ADMITS an index the raw bounds check would reject: for any honest length,
+//     clamp(len) <= len, so every index in [0, clamp(len)) is also in [0, len) and
+//     therefore readable by get_array_element.  Pin that on real owned buffers.
+//   * 48 ELEMENT-TYPE IDENTITY via remove_cvref_t.  get_array_element<T> returns a
+//     prvalue of exactly T (not a reference, not cv-qualified): assert
+//     remove_cvref_t<decltype(get_array_element<T>(...))> is T for the width set,
+//     and that the helper's value category is a prvalue, so a future signature
+//     drift to a reference/cv return is a COMPILE failure.
+//
+// All expected values derived from vmhook.hpp: data base +16, stride sizeof(T)
+// (L14845/14875); clamp raw<=0->0, raw<cap->raw, else cap, cap=1<<24 (L14756-64);
+// array_length signed int32 at +12 (L14796-14801).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 46. Constant-stride tiling: consecutive element offsets differ by EXACTLY
+//     sizeof(T) and slot i's last byte is immediately before slot i+1's first
+//     byte (contiguous, no gap/overlap), proven as a general invariant over a
+//     dense index run, then confirmed on a real buffer by writing a unique value
+//     per slot and checking that the byte ranges do not bleed into each other.
+// ---------------------------------------------------------------------------
+// Compile-time: the per-step delta is the stride, and the data region tiles with
+// no gap for every stride (element_offset<T>(i+1) == element_offset<T>(i)+sizeof).
+template<typename T>
+constexpr auto stride_delta_is_sizeof(std::size_t i) noexcept -> bool
+{
+    return layout_oracle::element_offset<T>(i + 1u) - layout_oracle::element_offset<T>(i)
+           == sizeof(T);
+}
+static_assert(stride_delta_is_sizeof<std::uint8_t>(0u) && stride_delta_is_sizeof<std::uint8_t>(254u),
+              "1-byte slots tile with a 1-byte stride");
+static_assert(stride_delta_is_sizeof<char16_t>(0u) && stride_delta_is_sizeof<char16_t>(100u),
+              "2-byte slots tile with a 2-byte stride");
+static_assert(stride_delta_is_sizeof<std::int32_t>(0u) && stride_delta_is_sizeof<std::int32_t>(49u),
+              "4-byte slots tile with a 4-byte stride");
+static_assert(stride_delta_is_sizeof<float>(7u), "float slots tile with a 4-byte stride");
+static_assert(stride_delta_is_sizeof<std::int64_t>(0u) && stride_delta_is_sizeof<std::int64_t>(63u),
+              "8-byte slots tile with an 8-byte stride");
+static_assert(stride_delta_is_sizeof<double>(7u), "double slots tile with an 8-byte stride");
+static_assert(stride_delta_is_sizeof<std::uintptr_t>(2u), "wide-oop slots tile with an 8-byte stride");
+// Slot i's end == slot i+1's begin (the last byte of i is at begin(i+1)-1).
+static_assert(layout_oracle::element_offset<std::int32_t>(0u) + sizeof(std::int32_t)
+                  == layout_oracle::element_offset<std::int32_t>(1u),
+              "i32 slot 0 ends exactly where slot 1 begins");
+static_assert(layout_oracle::element_offset<std::int64_t>(4u) + sizeof(std::int64_t)
+                  == layout_oracle::element_offset<std::int64_t>(5u),
+              "i64 slot 4 ends exactly where slot 5 begins");
+
+template<typename T>
+static auto exercise_tiling(const char* label, std::int32_t count) -> void
+{
+    // Distinct, width-filling value per slot so any overlap/gap shows as a wrong
+    // byte at a slot boundary.
+    std::vector<T> seed(static_cast<std::size_t>(count), T{});
+    std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+    void* const oop{ buffer.data() };
+
+    bool ok{ vmhook::array_length(oop) == count };
+    for (std::int32_t i{ 0 }; i < count && ok; ++i)
+    {
+        // Runtime delta == sizeof(T) at every interior step.
+        if (i + 1 < count)
+        {
+            const std::size_t delta{ offset_of<T>(i + 1) - offset_of<T>(i) };
+            if (delta != sizeof(T)) { ok = false; break; }
+        }
+        // The byte immediately preceding slot i (its predecessor's last byte) is
+        // independent: write slot i, confirm slot i-1's last byte is untouched.
+        const std::uint64_t bits{ 0xBEEF000000000000ull ^ (static_cast<std::uint64_t>(i) * 0x9E3779B1ull) };
+        T value{};
+        std::memcpy(&value, &bits, sizeof(T));
+        vmhook::set_array_element<T>(oop, i, value);
+        if (!bits_equal(raw_peek<T>(buffer, i), value)) { ok = false; break; }
+    }
+    // After writing all slots, every slot still holds exactly its own value: no
+    // write tiled into a neighbour (the contiguous-no-overlap end-to-end check).
+    for (std::int32_t i{ 0 }; i < count && ok; ++i)
+    {
+        const std::uint64_t bits{ 0xBEEF000000000000ull ^ (static_cast<std::uint64_t>(i) * 0x9E3779B1ull) };
+        T value{};
+        std::memcpy(&value, &bits, sizeof(T));
+        if (!bits_equal(vmhook::get_array_element<T>(oop, i), value)) { ok = false; break; }
+    }
+    check(label, ok);
+}
+
+static auto test_constant_stride_tiling() -> void
+{
+    check("tiling_static_asserts_compiled", true);
+    exercise_tiling<std::uint8_t>("tiling_u8_dense", 80);
+    exercise_tiling<char16_t>("tiling_c16_dense", 60);
+    exercise_tiling<std::int32_t>("tiling_i32_dense", 50);
+    exercise_tiling<float>("tiling_f32_dense", 50);
+    exercise_tiling<std::int64_t>("tiling_i64_dense", 40);
+    exercise_tiling<double>("tiling_f64_dense", 40);
+    exercise_tiling<std::uintptr_t>("tiling_wideoop_dense", 40);
+}
+
+// ---------------------------------------------------------------------------
+// 47. clamp_safe_container_count(array_length(oop)) NEVER expands the readable
+//     range: for an honest array of length L (fully backed), clamp(L) <= L, so
+//     every index in [0, clamp(L)) is also a valid get_array_element index.  Pin
+//     that the walker bound is always a subset of the genuine bounds -- the
+//     loop can never read a slot get_array_element would reject.
+// ---------------------------------------------------------------------------
+static auto test_clamp_never_expands_range() -> void
+{
+    bool ok{ true };
+    for (const std::int32_t len : { 0, 1, 2, 5, 17, 64, 200 })
+    {
+        const std::vector<std::int32_t> seed(static_cast<std::size_t>(len), 0x5A5A5A5A);
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+
+        const std::int32_t raw_len{ vmhook::array_length(oop) };
+        const std::int32_t bound{ vmhook::clamp_safe_container_count(raw_len) };
+
+        // The walker bound never exceeds the genuine length (subset guarantee).
+        if (bound > raw_len) { ok = false; break; }
+        if (raw_len != len)  { ok = false; break; }
+
+        // Every index the walker would visit is readable (returns the seed, not
+        // the default), i.e. it is inside [0, length) for get_array_element too.
+        for (std::int32_t i{ 0 }; i < bound; ++i)
+        {
+            if (vmhook::get_array_element<std::int32_t>(oop, i) != 0x5A5A5A5A) { ok = false; break; }
+        }
+        if (!ok) { break; }
+
+        // And index == bound (== length here, since len < cap) is the first slot
+        // BOTH the walker bound and the raw bounds check exclude.
+        if (vmhook::get_array_element<std::int32_t>(oop, opaque_index(bound)) != 0) { ok = false; break; }
+    }
+    check("clamp_bound_is_subset_of_length_and_all_readable", ok);
+
+    // For every honest length below the cap, clamp is the IDENTITY on the length,
+    // so the walker visits exactly [0, length) -- the full, genuine range (the
+    // honest-container guarantee, restated at the composition level).
+    bool identity_below_cap{ true };
+    for (const std::int32_t len : { 0, 1, 9, 1000, (static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) - 1) })
+    {
+        if (vmhook::clamp_safe_container_count(len) != len) { identity_below_cap = false; break; }
+    }
+    check("clamp_is_identity_for_honest_subcap_lengths", identity_below_cap);
+}
+
+// ---------------------------------------------------------------------------
+// 48. Element-type identity: get_array_element<T> yields a prvalue of EXACTLY T
+//     (no reference, no cv-qualifier).  remove_cvref_t<decltype(...)> must equal
+//     T for every width, and the call expression must be a prvalue (an rvalue
+//     that is not an xvalue), so a signature drift to a reference/cv return fails
+//     to build.  Uses remove_cvref_t (decltype of the call is the return type;
+//     remove_cvref_t is the robust check regardless of any future ref/cv drift).
+// ---------------------------------------------------------------------------
+// decltype of a prvalue function call is the (unqualified) return type; pin it
+// equals T after remove_cvref_t for the full width set.
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                  vmhook::get_array_element<std::uint8_t>(nullptr, 0))>, std::uint8_t>,
+              "get_array_element<uint8_t> must return uint8_t");
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                  vmhook::get_array_element<std::int8_t>(nullptr, 0))>, std::int8_t>,
+              "get_array_element<int8_t> must return int8_t");
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                  vmhook::get_array_element<char16_t>(nullptr, 0))>, char16_t>,
+              "get_array_element<char16_t> must return char16_t");
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                  vmhook::get_array_element<std::int16_t>(nullptr, 0))>, std::int16_t>,
+              "get_array_element<int16_t> must return int16_t");
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                  vmhook::get_array_element<std::int32_t>(nullptr, 0))>, std::int32_t>,
+              "get_array_element<int32_t> must return int32_t");
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                  vmhook::get_array_element<std::uint32_t>(nullptr, 0))>, std::uint32_t>,
+              "get_array_element<uint32_t> must return uint32_t");
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                  vmhook::get_array_element<float>(nullptr, 0))>, float>,
+              "get_array_element<float> must return float");
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                  vmhook::get_array_element<std::int64_t>(nullptr, 0))>, std::int64_t>,
+              "get_array_element<int64_t> must return int64_t");
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                  vmhook::get_array_element<double>(nullptr, 0))>, double>,
+              "get_array_element<double> must return double");
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(
+                  vmhook::get_array_element<std::uintptr_t>(nullptr, 0))>, std::uintptr_t>,
+              "get_array_element<uintptr_t> must return uintptr_t");
+// The return type is exactly T already (not merely T after stripping): for a
+// value-returning helper decltype IS T, with no reference/cv to strip.
+static_assert(std::is_same_v<decltype(vmhook::get_array_element<std::int32_t>(nullptr, 0)), std::int32_t>,
+              "get_array_element<int32_t> decltype is exactly int32_t (a prvalue, not a reference)");
+static_assert(!std::is_reference_v<decltype(vmhook::get_array_element<double>(nullptr, 0))>,
+              "get_array_element must return by value, never by reference");
+static_assert(!std::is_const_v<decltype(vmhook::get_array_element<std::int64_t>(nullptr, 0))>,
+              "get_array_element prvalue return is not const-qualified");
+// array_length returns exactly int32 (the bounds oracle width the helpers compare
+// the index against).
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(vmhook::array_length(nullptr))>, std::int32_t>,
+              "array_length must return int32_t (the half-open bounds oracle width)");
+// clamp_safe_container_count returns int32 too (same loop-bound width).
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(vmhook::clamp_safe_container_count(0))>, std::int32_t>,
+              "clamp_safe_container_count must return int32_t");
+
+static auto test_element_type_identity() -> void
+{
+    // The static_asserts above fired at compile time; record that the TU built.
+    check("element_type_identity_static_asserts_compiled", true);
+
+    // Runtime confirmation that the deduced element type round-trips through a
+    // real buffer with no implicit width change: store T's max, read back the
+    // SAME-typed max bit-exact (a silent return-type widening would mismatch).
+    {
+        const std::vector<std::int32_t> seed{ 0 };
+        std::vector<std::uint8_t> buffer{ build_fake_array(seed) };
+        void* const oop{ buffer.data() };
+        const std::int32_t want{ (std::numeric_limits<std::int32_t>::max)() };
+        vmhook::set_array_element<std::int32_t>(oop, 0, want);
+        using got_t = std::remove_cvref_t<decltype(vmhook::get_array_element<std::int32_t>(oop, 0))>;
+        check("element_type_identity_runtime_i32",
+              std::is_same_v<got_t, std::int32_t>
+              && vmhook::get_array_element<std::int32_t>(oop, 0) == want);
+    }
+}
+
 int main()
 {
     test_all_widths();
@@ -2974,6 +3212,9 @@ int main()
     test_byte_granular_aliasing();
     test_rewrite_stability();
     test_header_poison_isolation();
+    test_constant_stride_tiling();
+    test_clamp_never_expands_range();
+    test_element_type_identity();
 
     if (failures == 0)
     {

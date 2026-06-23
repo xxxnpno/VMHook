@@ -1789,5 +1789,154 @@ int main()
         check("blob_array16_into_J_reject", rejected_into("J", a16));      // 16 != 8
     }
 
+    // ======================================================================
+    // SECTION 28 — COMPILE-TIME predicate decision table for the non-primitive
+    // guard's TYPE CLASSIFICATION (vmhook.hpp:15741-15744).  All previous
+    // sections drive the guard at RUNTIME; this section pins, purely at
+    // compile time (static_assert) with each result ALSO surfaced through
+    // check() for visibility, the exact boolean partition the guard's
+    // if-constexpr disjunction computes for clean_value_type:
+    //
+    //     string  ||  (string_view-convertible && !string)  ||
+    //     is_vector_v  ||  is_unique_ptr_v
+    //
+    // The four sub-predicates are the SAME traits the guard consults
+    // (vmhook::detail::is_vector_v / is_unique_ptr_v and the std::
+    // is_same_v / is_convertible_v tests), so a regression in either trait or
+    // in the disjunction's membership is caught here in pure logic with no JVM.
+    // ALL constexpr below are referenced in a static_assert; none is unused.
+    // ----------------------------------------------------------------------
+    {
+        // --- the guard's exact membership predicate, reproduced from source ---
+        // (clean_value_type is the cv-ref-stripped value_type; the guard tests
+        // is_convertible on the RAW value_type but is_convertible is ref-
+        // tolerant, so we model membership on the cleaned type here, then pin
+        // the ref-tolerance separately below.)
+        auto is_nonprimitive_guarded{ []<typename T>() constexpr -> bool
+        {
+            using clean = std::remove_cvref_t<T>;
+            return std::is_same_v<clean, std::string>
+                || (std::is_convertible_v<T, std::string_view> && !std::is_same_v<clean, std::string>)
+                || vmhook::detail::is_vector_v<clean>
+                || vmhook::detail::is_unique_ptr_v<clean>;
+        } };
+
+        // Types that MUST be in the guarded (non-primitive) set:
+        constexpr bool g_string{ is_nonprimitive_guarded.operator()<std::string>() };
+        constexpr bool g_cstr{ is_nonprimitive_guarded.operator()<const char*>() };
+        constexpr bool g_sview{ is_nonprimitive_guarded.operator()<std::string_view>() };
+        constexpr bool g_vec_int{ is_nonprimitive_guarded.operator()<std::vector<int>>() };
+        constexpr bool g_vec_bool{ is_nonprimitive_guarded.operator()<std::vector<bool>>() };
+        constexpr bool g_vec_str{ is_nonprimitive_guarded.operator()<std::vector<std::string>>() };
+        constexpr bool g_uptr{ is_nonprimitive_guarded.operator()<std::unique_ptr<test_wrapper>>() };
+        static_assert(g_string,  "std::string must be in the non-primitive guard set");
+        static_assert(g_cstr,    "const char* (string_view-convertible) must be guarded");
+        static_assert(g_sview,   "std::string_view must be guarded");
+        static_assert(g_vec_int, "std::vector<int> must be guarded");
+        static_assert(g_vec_bool,"std::vector<bool> must be guarded");
+        static_assert(g_vec_str, "std::vector<std::string> must be guarded");
+        static_assert(g_uptr,    "std::unique_ptr<wrapper> must be guarded");
+        check("guard_set_includes_string",   g_string);
+        check("guard_set_includes_cstr",     g_cstr);
+        check("guard_set_includes_sview",    g_sview);
+        check("guard_set_includes_vec_int",  g_vec_int);
+        check("guard_set_includes_vec_bool", g_vec_bool);
+        check("guard_set_includes_vec_str",  g_vec_str);
+        check("guard_set_includes_uptr",     g_uptr);
+
+        // Types that MUST NOT be in the guarded set (they route to the
+        // trivially-copyable arm and are width-checked, not type-refused):
+        constexpr bool ng_int32{ is_nonprimitive_guarded.operator()<std::int32_t>() };
+        constexpr bool ng_double{ is_nonprimitive_guarded.operator()<double>() };
+        constexpr bool ng_char{ is_nonprimitive_guarded.operator()<char>() };
+        constexpr bool ng_bool{ is_nonprimitive_guarded.operator()<bool>() };
+        constexpr bool ng_array_char{ is_nonprimitive_guarded.operator()<std::array<char, 4>>() };
+        constexpr bool ng_voidptr{ is_nonprimitive_guarded.operator()<void*>() };
+        static_assert(!ng_int32,      "int32 must NOT be guarded (trivially-copyable arm)");
+        static_assert(!ng_double,     "double must NOT be guarded");
+        static_assert(!ng_char,       "char must NOT be guarded");
+        static_assert(!ng_bool,       "bool must NOT be guarded");
+        static_assert(!ng_array_char, "std::array<char,4> must NOT be guarded (flaw #3 boundary)");
+        static_assert(!ng_voidptr,    "void* must NOT be guarded");
+        check("guard_set_excludes_int32",      !ng_int32);
+        check("guard_set_excludes_double",     !ng_double);
+        check("guard_set_excludes_char",       !ng_char);
+        check("guard_set_excludes_bool",       !ng_bool);
+        check("guard_set_excludes_array_char", !ng_array_char);
+        check("guard_set_excludes_voidptr",    !ng_voidptr);
+
+        // --- is_vector_v partition (the trait the vector sub-clause consults) ---
+        static_assert(vmhook::detail::is_vector_v<std::vector<int>>,         "vector<int> is_vector_v");
+        static_assert(vmhook::detail::is_vector_v<std::vector<std::string>>, "vector<string> is_vector_v");
+        static_assert(vmhook::detail::is_vector_v<std::vector<std::vector<int>>>, "nested vector is_vector_v");
+        static_assert(!vmhook::detail::is_vector_v<std::array<int, 4>>,      "std::array is NOT is_vector_v");
+        static_assert(!vmhook::detail::is_vector_v<std::string>,             "std::string is NOT is_vector_v");
+        static_assert(!vmhook::detail::is_vector_v<int>,                     "int is NOT is_vector_v");
+        // cv-ref tolerance: the trait strips cv-ref before testing.
+        static_assert(vmhook::detail::is_vector_v<const std::vector<int>&>,  "const vector& strips to is_vector_v");
+        static_assert(vmhook::detail::is_vector_v<std::vector<int>&&>,       "vector&& strips to is_vector_v");
+        // the trait's exported element type (value_type_t) for an "[I" routing.
+        static_assert(std::is_same_v<
+                          vmhook::detail::is_vector<std::vector<std::int64_t>>::value_type_t,
+                          std::int64_t>,
+                      "is_vector<...>::value_type_t exposes the element type");
+        check("trait_is_vector_partition", true);   // surfaces the static_assert block above
+
+        // --- is_unique_ptr_v partition (the trait the unique_ptr sub-clause uses) ---
+        static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<test_wrapper>>, "unique_ptr is_unique_ptr_v");
+        static_assert(!vmhook::detail::is_unique_ptr_v<test_wrapper*>,                "raw ptr is NOT is_unique_ptr_v");
+        static_assert(!vmhook::detail::is_unique_ptr_v<int>,                          "int is NOT is_unique_ptr_v");
+        static_assert(!vmhook::detail::is_unique_ptr_v<std::vector<int>>,             "vector is NOT is_unique_ptr_v");
+        static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<test_wrapper>&>,
+                      "const unique_ptr& strips to is_unique_ptr_v");
+        static_assert(std::is_same_v<
+                          vmhook::detail::is_unique_ptr<std::unique_ptr<test_wrapper>>::value_type_t,
+                          test_wrapper>,
+                      "is_unique_ptr<...>::value_type_t exposes the wrapped type");
+        check("trait_is_unique_ptr_partition", true);
+
+        // --- string_view-convertibility sub-clause (the first guard term) ---
+        // The guard tests is_convertible on the RAW value_type; pin that it is
+        // ref-tolerant (a const lvalue ref converts identically), so the
+        // value_type-vs-clean_value_type asymmetry noted in the audit (flaw #4)
+        // is benign for every realistic spelling.
+        static_assert(std::is_convertible_v<const char*, std::string_view>,        "const char* -> string_view");
+        static_assert(std::is_convertible_v<std::string&, std::string_view>,       "string& -> string_view");
+        static_assert(std::is_convertible_v<const std::string&, std::string_view>, "const string& -> string_view");
+        static_assert(std::is_convertible_v<std::string_view, std::string_view>,   "string_view -> string_view");
+        static_assert(!std::is_convertible_v<std::array<char, 4>, std::string_view>,
+                      "std::array<char,4> is NOT string_view-convertible (flaw #3)");
+        static_assert(!std::is_convertible_v<int, std::string_view>,               "int is NOT string_view-convertible");
+        static_assert(!std::is_convertible_v<std::vector<char>, std::string_view>, "vector<char> is NOT string_view-convertible");
+        check("trait_string_view_convertible_partition", true);
+
+        // --- the COMPLEMENT is exactly the trivially-copyable / blob arm ---
+        // Every type NOT in the guarded set that reaches set() must be
+        // trivially copyable (the only other supported arm besides the static_
+        // assert fallback).  Pin that the non-guarded carriers used throughout
+        // this file satisfy is_trivially_copyable_v, i.e. they legitimately
+        // reach the size-guarded arm rather than the static_assert dead-end.
+        static_assert(std::is_trivially_copyable_v<std::int32_t>, "int32 reaches the trivial arm");
+        static_assert(std::is_trivially_copyable_v<double>,       "double reaches the trivial arm");
+        static_assert(std::is_trivially_copyable_v<std::array<char, 4>>, "array<char,4> reaches the trivial arm");
+        static_assert(std::is_trivially_copyable_v<void*>,        "void* reaches the trivial arm");
+        static_assert(std::is_trivially_copyable_v<std::byte>,    "std::byte reaches the trivial arm");
+        check("trait_complement_is_trivially_copyable", true);
+
+        // --- a 1-byte-element vector still routes by the OUTER container: the
+        // guard's membership is is_vector_v on the OUTER type, independent of
+        // the element width, so a std::vector<std::int8_t> is refused into a
+        // width-1 "B" field exactly like vector<int> (NOT mistaken for a 1-byte
+        // primitive write).  Pins the "membership is by outer container" rule.
+        // (A vector-of-vector is_vector_v at compile time is already asserted
+        // above; it is NOT exercised at runtime because the inner element type
+        // is not trivially copyable, which set_prim_array rejects at compile
+        // time -- so the outer-container routing is pinned with a trivially-
+        // copyable element here instead.)
+        check("vec_int8_refuses_B_by_outer", rejected_into("B", std::vector<std::int8_t>{ 1, 2, 3 }));
+        check("vec_uint8_refuses_Z_by_outer", rejected_into("Z", std::vector<std::uint8_t>{ 0xFF }));
+        check("vec_char_refuses_C_by_outer", rejected_into("C", std::vector<char>{ 'a', 'b' }));
+    }
+
     return failures == 0 ? 0 : 1;
 }

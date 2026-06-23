@@ -335,6 +335,209 @@ namespace u5_ct
 static_assert(u5_ct::dense_roundtrips(0u, 4500u),
               "decode(encode(x))==x with canonical length for all x in [0,4500]");
 
+// ===========================================================================
+// COMPILE-TIME ASSERTION WALL — WAVE 6 (additive).  Waves 2-5 (runtime, in
+// main()) exhaustively pinned non-zero start positions (H/V), interior-End
+// rewind behind continuation prefixes (E/X), the 5-byte all-continuation cap
+// (T/Z), sequential back-to-back threading (W), and the digit-0 no-op
+// contribution implicitly (G).  NONE of those were lifted to COMPILE time:
+// the existing u5_ct decoder was only ever invoked from pos 0 (roundtrip /
+// decode_one).  This wave drives the SAME spec-faithful constexpr decoder
+// (u5_ct::decode, which models the shipped decode_u5 EXACTLY — including the
+// byte-0 rewind and the 5-byte cap) from non-zero offsets and across the
+// caller's threading pattern, so the cursor arithmetic and the cap/rewind
+// edges are proven at build time, not merely at runtime.  Every value below
+// is hand-derived from the loop body sum += (b-1) << (6*i); byte 0 rewinds
+// and returns ~0u; byte < 192 terminates; at most 5 bytes are read — and was
+// independently confirmed against a from-spec model.  Every constexpr helper
+// result is consumed by a static_assert (no unused const/constexpr).
+// ===========================================================================
+namespace u5_ct
+{
+    // Decode the SINGLE value whose canonical bytes sit at [start, start+len)
+    // in a fixed 16-byte buffer; everything before `start` is filler byte 1
+    // (each a complete 1-byte value 0, never read by this decode) and
+    // everything after the payload is 0 (End padding).  Returns the decoded
+    // value and the FINAL cursor (== start + consumed).  Pure: the result is
+    // a function only of the payload bytes and `start`.
+    struct OffsetDecoded { std::uint32_t value; int pos; int start; };
+    constexpr auto decode_at(std::uint32_t value, int start) -> OffsetDecoded
+    {
+        const Encoded e{ encode(value) };
+        std::array<std::uint8_t, 16> buf{};
+        for (int i{ 0 }; i < start; ++i) { buf[static_cast<std::size_t>(i)] = 1u; }
+        for (std::size_t i{ 0 }; i < e.len; ++i)
+        {
+            buf[static_cast<std::size_t>(start) + i] = e.bytes[i];
+        }
+        int pos{ start };
+        const std::uint32_t v{ decode(buf.data(), pos) };
+        return { v, pos, start };
+    }
+
+    // Decode three values back-to-back from one buffer, threading the cursor
+    // exactly as find_field_in_stream does, then read the trailing End(0).
+    // Reports all three values, the cursor after the third (before End), and
+    // the cursor after the End decode (must be unchanged == rewind).
+    struct ThreadDecoded
+    {
+        std::uint32_t v0, v1, v2, end;
+        int pos_after_three, pos_after_end;
+    };
+    constexpr auto decode_three_then_end(std::uint32_t a,
+                                         std::uint32_t b,
+                                         std::uint32_t c) -> ThreadDecoded
+    {
+        const Encoded ea{ encode(a) };
+        const Encoded eb{ encode(b) };
+        const Encoded ec{ encode(c) };
+        std::array<std::uint8_t, 24> buf{};  // <= 3*5 payload + End + padding
+        std::size_t w{ 0 };
+        for (std::size_t i{ 0 }; i < ea.len; ++i) { buf[w++] = ea.bytes[i]; }
+        for (std::size_t i{ 0 }; i < eb.len; ++i) { buf[w++] = eb.bytes[i]; }
+        for (std::size_t i{ 0 }; i < ec.len; ++i) { buf[w++] = ec.bytes[i]; }
+        buf[w] = 0u;  // End(0) sits exactly at the byte after the third value
+        int pos{ 0 };
+        const std::uint32_t r0{ decode(buf.data(), pos) };
+        const std::uint32_t r1{ decode(buf.data(), pos) };
+        const std::uint32_t r2{ decode(buf.data(), pos) };
+        const int after_three{ pos };
+        const std::uint32_t rend{ decode(buf.data(), pos) };
+        return { r0, r1, r2, rend, after_three, pos };
+    }
+
+    // Decode N leading continuation bytes (each the minimal 192) followed by
+    // an End(0) at index N.  Models the interior-End rewind: returns ~0u with
+    // the cursor parked at N regardless of the partial sum accumulated.
+    struct InteriorEnd { std::uint32_t value; int pos; };
+    constexpr auto continuations_then_end(int n) -> InteriorEnd
+    {
+        std::array<std::uint8_t, 8> buf{};
+        for (int i{ 0 }; i < n; ++i) { buf[static_cast<std::size_t>(i)] = 192u; }
+        // buf[n] is already 0 (End); remaining bytes are 0 padding.
+        int pos{ 0 };
+        const std::uint32_t v{ decode(buf.data(), pos) };
+        return { v, pos };
+    }
+
+    // Decode a value whose terminating low byte is the SMALLEST (1, digit 0)
+    // at position k, behind k minimal-continuation bytes.  The digit-0 byte
+    // contributes exactly 0, so the value equals the all-191 prefix sum and
+    // the cursor advances k+1.  Pins the (b-1)==0 no-op contribution per pos.
+    constexpr auto digit0_terminal_at(int k) -> InteriorEnd
+    {
+        std::array<std::uint8_t, 8> buf{};
+        for (int i{ 0 }; i < k; ++i) { buf[static_cast<std::size_t>(i)] = 192u; }
+        buf[static_cast<std::size_t>(k)] = 1u;  // digit 0 terminator at pos k
+        int pos{ 0 };
+        const std::uint32_t v{ decode(buf.data(), pos) };
+        return { v, pos };
+    }
+
+    // The all-191-prefix sum over k positions, using the decoder's own uint32
+    // shift arithmetic (so the wrapping at high positions is pinned exactly).
+    constexpr auto prefix191(int k) -> std::uint32_t
+    {
+        std::uint32_t s{ 0 };
+        for (int i{ 0 }; i < k; ++i)
+        {
+            s += static_cast<std::uint32_t>(191u) << (6 * i);
+        }
+        return s;
+    }
+
+    // The 5-byte all-continuation cap: five 192 bytes, no low terminator.  The
+    // loop runs out at position 5 and returns the wrapping partial sum without
+    // reading a sixth byte.  Buffer is exactly 5 bytes wide so any over-read
+    // past the window would be a compile-time out-of-bounds in constexpr.
+    constexpr auto cap_all_continuation() -> InteriorEnd
+    {
+        const std::array<std::uint8_t, 5> buf{ 192u, 192u, 192u, 192u, 192u };
+        int pos{ 0 };
+        const std::uint32_t v{ decode(buf.data(), pos) };
+        return { v, pos };
+    }
+}  // namespace u5_ct
+
+// --- Non-zero start position: decoding 4096 ({193,62}) at offset 3 yields
+//     4096 and advances the cursor to 3 + 2 == 5 (independent of the offset).
+static_assert(u5_ct::decode_at(4096u, 3).value == 4096u
+           && u5_ct::decode_at(4096u, 3).pos == 5, "decode at offset 3 -> 4096, pos 5");
+// The SAME value decoded at three different offsets gives the same result and
+// a cursor delta equal to the canonical length on each (offset only shifts it).
+static_assert(u5_ct::decode_at(65535u, 0).value == 65535u
+           && u5_ct::decode_at(65535u, 5).value == 65535u
+           && u5_ct::decode_at(65535u, 9).value == 65535u, "offset-invariant value (0xFFFF)");
+static_assert((u5_ct::decode_at(65535u, 0).pos - 0) == 3
+           && (u5_ct::decode_at(65535u, 5).pos - 5) == 3
+           && (u5_ct::decode_at(65535u, 9).pos - 9) == 3, "offset-invariant length (0xFFFF -> 3)");
+// A 5-byte value (UINT32_MAX) decoded mid-buffer at offset 7 still consumes 5.
+static_assert(u5_ct::decode_at(0xFFFFFFFFu, 7).value == 0xFFFFFFFFu
+           && (u5_ct::decode_at(0xFFFFFFFFu, 7).pos - u5_ct::decode_at(0xFFFFFFFFu, 7).start) == 5,
+           "UINT32_MAX at offset 7 consumes 5");
+
+// --- Sequential threading at compile time: 64 (1B), 4096 (2B), 12415 (3B),
+//     then End — the exact find_field_in_stream cursor walk.  Cursor after the
+//     three values is 1+2+3 == 6; the End decode returns ~0u and rewinds, so
+//     the cursor is UNCHANGED at 6.
+static_assert(u5_ct::decode_three_then_end(64u, 4096u, 12415u).v0 == 64u
+           && u5_ct::decode_three_then_end(64u, 4096u, 12415u).v1 == 4096u
+           && u5_ct::decode_three_then_end(64u, 4096u, 12415u).v2 == 12415u,
+           "threaded decode values 64/4096/12415");
+static_assert(u5_ct::decode_three_then_end(64u, 4096u, 12415u).pos_after_three == 6,
+              "threaded cursor after three values == 6");
+static_assert(u5_ct::decode_three_then_end(64u, 4096u, 12415u).end == ~0u
+           && u5_ct::decode_three_then_end(64u, 4096u, 12415u).pos_after_end == 6,
+           "threaded End returns ~0u and parks cursor at 6 (rewind)");
+// Threading three MAXIMAL-length (5-byte) values: cursor after three == 15,
+// End parks at 15.  Costliest per-field walk in the caller, pinned at compile.
+static_assert(u5_ct::decode_three_then_end(50864255u, 0xFFFFFFFFu, 3255312510u).v0 == 50864255u
+           && u5_ct::decode_three_then_end(50864255u, 0xFFFFFFFFu, 3255312510u).v1 == 0xFFFFFFFFu
+           && u5_ct::decode_three_then_end(50864255u, 0xFFFFFFFFu, 3255312510u).v2 == 3255312510u,
+           "threaded three 5-byte values");
+static_assert(u5_ct::decode_three_then_end(50864255u, 0xFFFFFFFFu, 3255312510u).pos_after_three == 15
+           && u5_ct::decode_three_then_end(50864255u, 0xFFFFFFFFu, 3255312510u).pos_after_end == 15,
+           "threaded three 5-byte values consume 15 and End parks at 15");
+
+// --- Interior End(0) rewind at every prefix length N = 0..4: returns ~0u with
+//     the cursor parked at N, irrespective of the accumulated partial sum.
+static_assert(u5_ct::continuations_then_end(0).value == ~0u && u5_ct::continuations_then_end(0).pos == 0, "End @ N=0");
+static_assert(u5_ct::continuations_then_end(1).value == ~0u && u5_ct::continuations_then_end(1).pos == 1, "End @ N=1");
+static_assert(u5_ct::continuations_then_end(2).value == ~0u && u5_ct::continuations_then_end(2).pos == 2, "End @ N=2");
+static_assert(u5_ct::continuations_then_end(3).value == ~0u && u5_ct::continuations_then_end(3).pos == 3, "End @ N=3");
+static_assert(u5_ct::continuations_then_end(4).value == ~0u && u5_ct::continuations_then_end(4).pos == 4, "End @ N=4");
+
+// --- Digit-0 terminator (byte 1, contributing 0) at every position k = 0..4:
+//     the value equals the all-191 prefix sum and the cursor advances k+1.
+//     This pins that (current_byte - 1) == 0 adds nothing at any weight.
+static_assert(u5_ct::digit0_terminal_at(0).value == u5_ct::prefix191(0)
+           && u5_ct::digit0_terminal_at(0).value == 0u
+           && u5_ct::digit0_terminal_at(0).pos == 1, "digit-0 @ pos 0 -> 0");
+static_assert(u5_ct::digit0_terminal_at(1).value == u5_ct::prefix191(1)
+           && u5_ct::digit0_terminal_at(1).value == 191u
+           && u5_ct::digit0_terminal_at(1).pos == 2, "digit-0 @ pos 1 -> 191");
+static_assert(u5_ct::digit0_terminal_at(2).value == u5_ct::prefix191(2)
+           && u5_ct::digit0_terminal_at(2).value == 12415u
+           && u5_ct::digit0_terminal_at(2).pos == 3, "digit-0 @ pos 2 -> 12415");
+static_assert(u5_ct::digit0_terminal_at(3).value == u5_ct::prefix191(3)
+           && u5_ct::digit0_terminal_at(3).value == 794751u
+           && u5_ct::digit0_terminal_at(3).pos == 4, "digit-0 @ pos 3 -> 794751");
+static_assert(u5_ct::digit0_terminal_at(4).value == u5_ct::prefix191(4)
+           && u5_ct::digit0_terminal_at(4).value == 50864255u
+           && u5_ct::digit0_terminal_at(4).pos == 5, "digit-0 @ pos 4 -> 50864255");
+
+// --- 5-byte all-continuation cap: returns the wrapping uint32 shift-sum of
+//     five digit-191 contributions and consumes exactly 5 (no sixth byte).
+//     The expected value is prefix191(5), the decoder's own wrapping sum.
+static_assert(u5_ct::cap_all_continuation().value == u5_ct::prefix191(5)
+           && u5_ct::cap_all_continuation().value == 3255312511u
+           && u5_ct::cap_all_continuation().pos == 5, "5-byte cap -> wrapping sum, pos 5");
+// The cap result has bit 31 set (the position-4 digit-191 contribution
+// 191<<24 == 0xBF000000 lands above bit 30), documenting the 32-bit truncation
+// region at compile time.
+static_assert((u5_ct::cap_all_continuation().value & 0x80000000u) != 0u,
+              "5-byte cap sum has bit 31 set");
+
 // Run vmhook's decode_u5 on the canonical encoding of `value` and report both
 // the decoded result and the bytes consumed.  Pads with trailing zeros so the
 // 5-byte peek window is always in-bounds.
@@ -1894,6 +2097,80 @@ int main()
             check("no_overread_5byte_cap_stops_at_five_value", v == expected);
             check("no_overread_5byte_cap_leaves_trailing_zero_unread", pos == 5);
         }
+    }
+
+    // #####################################################################
+    // ##  EXHAUSTIVE WAVE 6 (runtime mirror) — the SHIPPED decode_u5 must  ##
+    // ##  reproduce the compile-time u5_ct landmarks just proven above:    ##
+    // ##  non-zero start offsets, the threaded caller walk, the interior   ##
+    // ##  End rewind, the digit-0 no-op per position, and the 5-byte cap.  ##
+    // ##  Every expected value is the SAME one a from-spec model produced   ##
+    // ##  and the same one static_assert pinned, cross-validating the       ##
+    // ##  constexpr math and the live symbol against each other.            ##
+    // #####################################################################
+    {
+        // Non-zero start: enc(4096)={193,62} at offset 3 -> 4096, cursor -> 5.
+        std::array<std::uint8_t, 11> buf{ 1u, 1u, 1u, 193u, 62u, 0u, 0u, 0u, 0u, 0u, 0u };
+        int pos{ 3 };
+        const std::uint32_t v{ vmhook::hotspot::klass::decode_u5(buf.data(), pos) };
+        check("wave6_runtime_decode_at_offset_3_is_4096", v == 4096u && pos == 5);
+        // Matches the compile-time landmark exactly.
+        check("wave6_runtime_offset_matches_compiletime",
+              v == u5_ct::decode_at(4096u, 3).value
+           && pos == u5_ct::decode_at(4096u, 3).pos);
+    }
+    {
+        // Threaded caller walk: 64, 4096, 12415, then End — cursor parks at 6.
+        std::array<std::uint8_t, 10> buf{ 65u, 193u, 62u, 192u, 192u, 1u, 0u, 0u, 0u, 0u };
+        int pos{ 0 };
+        const std::uint32_t r0{ vmhook::hotspot::klass::decode_u5(buf.data(), pos) };
+        const std::uint32_t r1{ vmhook::hotspot::klass::decode_u5(buf.data(), pos) };
+        const std::uint32_t r2{ vmhook::hotspot::klass::decode_u5(buf.data(), pos) };
+        const int after_three{ pos };
+        const std::uint32_t rend{ vmhook::hotspot::klass::decode_u5(buf.data(), pos) };
+        const u5_ct::ThreadDecoded ct{ u5_ct::decode_three_then_end(64u, 4096u, 12415u) };
+        check("wave6_runtime_thread_values_match_compiletime",
+              r0 == ct.v0 && r1 == ct.v1 && r2 == ct.v2);
+        check("wave6_runtime_thread_cursor_matches_compiletime",
+              after_three == ct.pos_after_three && rend == ct.end && pos == ct.pos_after_end);
+    }
+    {
+        // Interior End rewind for N = 0..4 against the compile-time helper.
+        bool ok{ true };
+        for (int n{ 0 }; n <= 4; ++n)
+        {
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(n), 192u);
+            bytes.push_back(0u);
+            int pos{ 0 };
+            const std::uint32_t v{ decode_at0(bytes, pos) };
+            const u5_ct::InteriorEnd ct{ u5_ct::continuations_then_end(n) };
+            if (v != ct.value || pos != ct.pos || v != ~0u || pos != n) { ok = false; }
+        }
+        check("wave6_runtime_interior_end_matches_compiletime", ok);
+    }
+    {
+        // Digit-0 terminator at positions 0..4 against the compile-time helper.
+        bool ok{ true };
+        for (int k{ 0 }; k <= 4; ++k)
+        {
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(k), 192u);
+            bytes.push_back(1u);  // digit-0 terminator
+            int pos{ 0 };
+            const std::uint32_t v{ decode_at0(bytes, pos) };
+            const u5_ct::InteriorEnd ct{ u5_ct::digit0_terminal_at(k) };
+            if (v != ct.value || pos != ct.pos || v != u5_ct::prefix191(k) || pos != k + 1) { ok = false; }
+        }
+        check("wave6_runtime_digit0_terminal_matches_compiletime", ok);
+    }
+    {
+        // 5-byte all-continuation cap against the compile-time helper.
+        int pos{ 0 };
+        const std::uint32_t v{ decode_at0({ 192u, 192u, 192u, 192u, 192u }, pos) };
+        const u5_ct::InteriorEnd ct{ u5_ct::cap_all_continuation() };
+        check("wave6_runtime_cap_value_matches_compiletime",
+              v == ct.value && v == u5_ct::prefix191(5) && v == 3255312511u);
+        check("wave6_runtime_cap_pos_matches_compiletime", pos == ct.pos && pos == 5);
+        check("wave6_runtime_cap_sets_bit_31", (v & 0x80000000u) != 0u);
     }
 
     return failures == 0 ? 0 : 1;
