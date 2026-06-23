@@ -266,7 +266,7 @@ jobs:
           # any minor GC fires, widening the margin for the whole growing suite.
           $java = Start-Process `
             -FilePath "java" `
-            -ArgumentList "-Xmx4g", "-Xmn3g", "-cp", "out", "vmhook.Main" `
+            -ArgumentList "-Xmx6g", "-Xmn4g", "-cp", "out", "vmhook.Main" `
             -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput "java_stdout.txt" `
             -RedirectStandardError  "java_stderr.txt"
